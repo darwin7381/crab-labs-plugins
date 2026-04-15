@@ -1,0 +1,14 @@
+{
+  "name": "crab-labs-plugins",
+  "owner": {
+    "name": "Crab Labs",
+    "url": "https://github.com/darwin7381"
+  },
+  "plugins": [
+    {
+      "name": "media-alchemist",
+      "source": "./plugins/media-alchemist",
+      "description": "Complete media-to-notes toolkit: multi-provider transcription (Whisper/ElevenLabs/AssemblyAI + Gemini refine), video/audio processing (ffmpeg), multi-platform download routing, YouTube transcript extraction."
+    }
+  ]
+}

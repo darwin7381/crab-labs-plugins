@@ -1,0 +1,11 @@
+{
+  "name": "media-alchemist",
+  "description": "Complete media-to-notes toolkit: multi-provider transcription (Whisper/ElevenLabs/AssemblyAI + Gemini refine), video/audio processing (ffmpeg), multi-platform download routing (yt-dlp/gallery-dl/lux/MediaCrawler), and YouTube transcript extraction.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Joey / Crab Labs",
+    "url": "https://github.com/darwin7381"
+  },
+  "license": "MIT",
+  "keywords": ["media", "transcribe", "ffmpeg", "video", "audio", "stt", "elevenlabs", "assemblyai", "whisper", "youtube"]
+}
