@@ -27,7 +27,7 @@ description: >
 |---|---|---|---|---|
 | `yt-dlp` | 154K | **全平台影片主力** | YouTube/FB/IG/X/TikTok/抖音/B站/Vimeo/1000+站 | 系統 PATH |
 | `gallery-dl` | 17K | **西方平台圖文主力** | FB圖文/IG圖文/X圖文/Pinterest/Bluesky/Reddit/170+站 | 系統 PATH (`brew`) |
-| `MediaCrawler` | 47K | **中國平台全能主力** | 小紅書/抖音/微博/快手/B站/知乎/百度貼吧（影片+圖文+評論） | `~/Development/MediaCrawler/` (uv) |
+| `MediaCrawler` | 47K | **中國平台全能主力** | 小紅書/抖音/微博/快手/B站/知乎/百度貼吧（影片+圖文+評論） | See `.claude/media-alchemist.local.md` for path (uv) |
 | `lux` | 31K | **中國平台影片備援** | 小紅書/微博/快手/知乎/Threads/抖音/FB/IG | 系統 PATH (`brew`) |
 
 ### 處理工具層（分析/轉錄/提取）

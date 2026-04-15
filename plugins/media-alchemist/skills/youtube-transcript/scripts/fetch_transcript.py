@@ -2,6 +2,7 @@
 """Fetch YouTube transcript via residential IP (WireGuard VPN)."""
 
 import sys
+import os
 import json
 import subprocess
 import requests
@@ -9,8 +10,8 @@ from requests.adapters import HTTPAdapter
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
-VPN_INTERFACE = "wg0"
-VPN_SOURCE_IP = "10.100.0.2"
+VPN_INTERFACE = os.environ.get("VPN_INTERFACE", "wg0")
+VPN_SOURCE_IP = os.environ.get("VPN_SOURCE_IP", "10.0.0.2")
 LANGUAGES = ["en", "fr", "de", "es", "it", "pt", "nl"]
 
 

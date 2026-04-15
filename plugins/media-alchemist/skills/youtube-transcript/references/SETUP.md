@@ -1,98 +1,40 @@
-# YouTube Transcript - Setup Guide
+# YouTube Transcript — VPN Setup Guide
 
-## Why Residential IP?
+The `fetch_transcript.py` script routes requests through a residential IP to bypass YouTube's cloud IP blocks. This requires a VPN (WireGuard recommended).
 
-YouTube blocks cloud provider IPs (AWS, Hetzner, GCP, Azure, etc.) from accessing transcripts. Requests from these IPs get 403/429 errors or bot detection.
+## Configuration
 
-**Solution:** Route requests through a residential IP via WireGuard VPN to a home router.
+Set these in your `.claude/media-alchemist.local.md`:
 
-## Prerequisites
+```yaml
+---
+vpn_interface: wg0           # Your WireGuard interface name
+vpn_source_ip: 10.x.x.x     # Your VPS's WireGuard IP
+---
+```
 
-- Python 3.x installed
-- WireGuard installed on VPS
-- Access to a residential network (home router with WireGuard support)
-
-## 1. Install Python Dependencies
-
+Or set environment variables:
 ```bash
-pip3 install youtube-transcript-api requests
+export VPN_INTERFACE="wg0"
+export VPN_SOURCE_IP="10.x.x.x"
 ```
 
-## 2. Configure WireGuard VPN
+## Requirements
 
-You need a WireGuard server on a residential network (home router, NAS, etc.).
+- WireGuard installed on your VPS
+- A residential network endpoint (home router with WireGuard support)
+- Policy-based routing configured so VPN-bound traffic uses the residential IP
 
-### On Your Home Router (Server)
+## Setup Steps
 
-```bash
-# Generate keys
-wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
-
-# Configure interface (e.g., /etc/wireguard/wg0.conf or via LuCI/OpenWRT)
-[Interface]
-PrivateKey = <router_private_key>
-Address = 10.100.0.1/24
-ListenPort = 51820
-
-[Peer]
-PublicKey = <vps_public_key>
-AllowedIPs = 10.100.0.2/32
-```
-
-Enable masquerading/NAT so the VPS can route traffic through your home IP.
-
-### On Your VPS (Client)
-
-```bash
-# Generate keys
-wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
-
-# Configure /etc/wireguard/wg0.conf
-[Interface]
-PrivateKey = <vps_private_key>
-Address = 10.100.0.2/24
-Table = 51820
-
-[Peer]
-PublicKey = <router_public_key>
-Endpoint = <your-home-ip-or-ddns>:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-```
-
-### Bring Up VPN
-
-```bash
-wg-quick up wg0
-ip rule add from 10.100.0.2 table 51820
-```
-
-### Verify
-
-```bash
-curl --interface 10.100.0.2 ifconfig.me  # Should show your home IP
-```
-
-## 3. Configure Script (If Needed)
-
-Edit `scripts/fetch_transcript.py` and adjust:
-```python
-VPN_INTERFACE = "wg0"        # Your WireGuard interface name
-VPN_SOURCE_IP = "10.100.0.2" # Your VPS's WireGuard IP
-```
+1. Generate WireGuard keys on both ends (residential + VPS)
+2. Configure WireGuard interface on both ends
+3. Add policy routing on VPS: `ip rule add from <VPN_IP> table <TABLE_ID>`
+4. Verify: `curl --interface <VPN_IP> ifconfig.me` should show residential IP
+5. Set config in `.local.md` or env vars
 
 ## Troubleshooting
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| VPN not available | WireGuard down | Script auto-retries; check `wg show` |
-| Transcripts disabled | Creator disabled captions | No workaround |
-| No transcript found | No captions in requested languages | Try different language codes |
-| RequestBlocked | VPN not routing properly | Verify `curl --interface <VPN_IP> ifconfig.me` shows residential IP |
-
-## Alternatives to WireGuard
-
-If you can't set up WireGuard:
-- **SSH tunnel**: `ssh -D 1080 user@home-server` + configure SOCKS proxy
-- **Residential proxy service**: Bright Data, Oxylabs, SmartProxy (paid)
-- **Tailscale/ZeroTier**: Easier setup than raw WireGuard
+- If `fetch_transcript.py` errors with "VPN not available": check `wg show <interface>`
+- If YouTube still blocks: verify the source IP is residential, not datacenter
+- Alternative: run the script from a residential machine directly (no VPN needed)

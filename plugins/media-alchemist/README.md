@@ -26,8 +26,8 @@ brew install lux           # Chinese platform video download (Bilibili, Douyin, 
 
 # For Chinese social platforms (Xiaohongshu, Douyin, Weibo, etc.)
 # See: skills/media-to-notes-workflow/references/PLATFORM-SETUP-NOTES.md
-git clone https://github.com/NanmiCoder/MediaCrawler ~/Development/MediaCrawler
-cd ~/Development/MediaCrawler && uv sync && uv run playwright install chromium
+git clone https://github.com/NanmiCoder/MediaCrawler <your-preferred-path>
+cd <your-preferred-path> && uv sync && uv run playwright install chromium
 ```
 
 ## API Keys
@@ -90,3 +90,23 @@ MIT
 ## Author
 
 Joey / Crab Labs — https://github.com/darwin7381
+
+## User Configuration
+
+Create `.claude/media-alchemist.local.md` in your project root with your settings:
+
+```yaml
+---
+# MediaCrawler path (required for Chinese platform crawling)
+mediacrawler_path: ~/Development/MediaCrawler
+
+# VPN config (required for youtube-transcript on cloud VPS)
+vpn_interface: wg0
+vpn_source_ip: 10.x.x.x
+
+# Xiaohongshu domain override (for regions where xiaohongshu.com is blocked)
+xiaohongshu_domain: rednote.com
+---
+```
+
+This file is automatically gitignored (`.local` suffix). Your personal settings stay local.
