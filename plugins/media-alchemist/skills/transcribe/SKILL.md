@@ -7,14 +7,15 @@ description: >
   Outputs txt, srt, json. Optional: language hint, prompt hint, translate to English.
   Add --refine for LLM proofreading pass (requires GEMINI_API_KEY).
 metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "🎙️",
-        "requires": { "bins": ["curl"], "env": [] },
-        "optionalEnv": ["OPENAI_API_KEY", "GEMINI_API_KEY"],
-      },
-  }
+  openclaw:
+    emoji: "🎙️"
+    requires:
+      bins: ["curl"]
+    optionalEnv: ["OPENAI_API_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY", "ASSEMBLYAI_API_KEY"]
+  claude-code:
+    requires:
+      bins: ["curl", "ffmpeg"]
+    optionalEnv: ["OPENAI_API_KEY", "GEMINI_API_KEY", "ELEVENLABS_API_KEY", "ASSEMBLYAI_API_KEY"]
 ---
 
 # transcribe skill
@@ -181,19 +182,19 @@ Before transcribing audio, check if a faster path exists:
 
 ```bash
 # Basic transcription (Layer 1 only)
-{baseDir}/scripts/transcribe.sh /path/to/audio.m4a --format srt
+${CLAUDE_SKILL_DIR}/scripts/transcribe.sh /path/to/audio.m4a --format srt
 
 # With Gemini refinement (Layer 1 + 2), preserve all languages as spoken
-{baseDir}/scripts/transcribe.sh /path/to/audio.m4a --format srt --refine
+${CLAUDE_SKILL_DIR}/scripts/transcribe.sh /path/to/audio.m4a --format srt --refine
 
 # Refine + translate everything to Chinese
-{baseDir}/scripts/transcribe.sh /path/to/audio.m4a --format srt --refine --refine-mode zh
+${CLAUDE_SKILL_DIR}/scripts/transcribe.sh /path/to/audio.m4a --format srt --refine --refine-mode zh
 
 # Bilingual output (original + Chinese translation)
-{baseDir}/scripts/transcribe.sh /path/to/audio.m4a --format srt --refine --refine-mode bilingual-zh
+${CLAUDE_SKILL_DIR}/scripts/transcribe.sh /path/to/audio.m4a --format srt --refine --refine-mode bilingual-zh
 
 # Use refine.sh standalone on an existing SRT
-{baseDir}/scripts/refine.sh /path/to/audio.m4a /path/to/subtitles.srt --mode preserve
+${CLAUDE_SKILL_DIR}/scripts/refine.sh /path/to/audio.m4a /path/to/subtitles.srt --mode preserve
 ```
 
 ## All flags

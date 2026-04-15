@@ -6,18 +6,18 @@ description: >
   merge files, or any video/audio manipulation. Covers all common ffmpeg operations with
   ready-to-use scripts and direct commands.
 metadata:
-  {
-    "openclaw":
-      {
-        "emoji": "🎬",
-        "requires": { "bins": ["ffmpeg"] },
-      },
-  }
+  openclaw:
+    emoji: "🎬"
+    requires:
+      bins: ["ffmpeg"]
+  claude-code:
+    requires:
+      bins: ["ffmpeg"]
 ---
 
 # ffmpeg Toolkit
 
-Complete video and audio processing toolkit. All scripts are in `{baseDir}/scripts/`.
+Complete video and audio processing toolkit. All scripts are in `${CLAUDE_SKILL_DIR}/scripts/`.
 
 ---
 
@@ -26,13 +26,13 @@ Complete video and audio processing toolkit. All scripts are in `{baseDir}/scrip
 ### Single frame at timestamp
 
 ```bash
-{baseDir}/scripts/frame.sh video.mp4 --time 00:01:30 --out frame.jpg
+${CLAUDE_SKILL_DIR}/scripts/frame.sh video.mp4 --time 00:01:30 --out frame.jpg
 ```
 
 ### Single frame by index
 
 ```bash
-{baseDir}/scripts/frame.sh video.mp4 --index 0 --out first-frame.png
+${CLAUDE_SKILL_DIR}/scripts/frame.sh video.mp4 --index 0 --out first-frame.png
 ```
 
 ### Batch: one frame per second
