@@ -1,0 +1,26 @@
+# Bun / Node
+node_modules/
+*.log
+
+# Local env / secrets
+.env
+.env.local
+*.local.md
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Plugin runtime state (created at run time)
+**/.in_use/
+**/bot.lock
+**/bot.pid
+**/server.log
+**/launchd.out.log
+**/launchd.err.log
+
+# Backups
+*.bak
+*.bak.*

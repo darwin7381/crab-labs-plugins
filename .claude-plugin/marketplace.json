@@ -9,6 +9,11 @@
       "name": "media-alchemist",
       "source": "./plugins/media-alchemist",
       "description": "Complete media-to-notes toolkit: multi-provider transcription (Whisper/ElevenLabs/AssemblyAI + Gemini refine), video/audio processing (ffmpeg), multi-platform download routing, YouTube transcript extraction."
+    },
+    {
+      "name": "telegram-http",
+      "source": "./plugins/telegram-http",
+      "description": "Telegram channel for Claude Code — HTTP MCP daemon transport. Drop-in replacement for the official telegram plugin that decouples the bot daemon from claude TUI lifetime. Survives claude restarts; no more 2-3 min stdio death cycles."
     }
   ]
 }
