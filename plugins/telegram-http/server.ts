@@ -29,10 +29,11 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 
-// Plugin runs as a standalone HTTP MCP daemon. Claude connects via the
-// StreamableHTTPClientTransport at .mcp.json's `url`. This decouples plugin
-// lifetime from claude TUI lifetime — claude restarts no longer kill the
-// Telegram poller, and stale stdio pipes can't drag the daemon down.
+// Route B (2026-05-13): plugin runs as a standalone HTTP MCP daemon. Claude
+// connects via the StreamableHTTPClientTransport at .mcp.json's `url`. This
+// decouples plugin lifetime from claude TUI lifetime — claude restarts no
+// longer kill the Telegram poller, and stale stdio pipes can't drag the
+// daemon down. See https://md.blocktempo.ai/0EXKOeo-QRS6Plby7lUePQ.
 const HTTP_PORT = (() => {
   const v = process.env.TELEGRAM_HTTP_PORT
   if (!v) return null
@@ -71,25 +72,30 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const PID_FILE = join(STATE_DIR, 'bot.pid')
 const LOCK_FILE = join(STATE_DIR, 'bot.lock')
 const LOG_FILE = join(STATE_DIR, 'server.log')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
-// File-based logger. stderr alone is unreliable for a daemon that may be
-// launched by launchd / tmux / a parent that discards it; the log file is the
-// authoritative trace.
+// File-based logger — 2026-05-13 by Joey. Plugin's stderr is captured by the
+// parent claude process and not surfaced anywhere visible at runtime, which
+// made all prior debugging impossible. Mirror to stderr AND a persistent log.
+// See https://md.blocktempo.ai/7Q318gHJSdOV3BH2ub8fyg for the full analysis.
 function log(level: 'info' | 'warn' | 'error', msg: string): void {
   const line = `${new Date().toISOString()} [${level}] pid=${process.pid} ${msg}\n`
   try { appendFileSync(LOG_FILE, line) } catch {}
   try { process.stderr.write(line) } catch {}
 }
 
-// Advisory exclusive-create lock — guarantees at most one daemon per STATE_DIR.
-// If a live holder exists we refuse to start; a dead holder's lock is reclaimed.
-// Never SIGTERM another process — Telegram allows exactly one getUpdates poller
-// per token, so if two daemons share STATE_DIR/.env one will lose the 409
-// poll race; signaling each other would only escalate.
+// Advisory exclusive-create lock — 2026-05-13 by Joey, replaces the previous
+// "kill stale poller" approach. Prior code did `process.kill(stalePid, SIGTERM)`
+// based on the bot.pid file, which turned into a mutual-execution trap when two
+// instances accidentally shared STATE_DIR (e.g. swapped TELEGRAM_STATE_DIR env
+// vars or a user-scope plugin install reused for multiple bots). With this lock:
+//   - Each STATE_DIR has at most one live owner at a time
+//   - We never SIGTERM another process — if STATE_DIR is held, we exit cleanly
+//   - A dead holder's lock is reclaimed; a live holder's lock makes us refuse
 let lockFd: number | null = null
 try {
   lockFd = openSync(LOCK_FILE, 'wx') // O_EXCL — fails if exists
@@ -105,11 +111,14 @@ try {
     log('error', `STATE_DIR ${STATE_DIR} is locked by live pid=${holder} — refusing to start (another bot owns this state dir)`)
     process.exit(1)
   }
+  // Stale lock — owner is dead, reclaim it.
   log('warn', `removing stale lock from dead pid=${holder}`)
   try { rmSync(LOCK_FILE, { force: true }) } catch {}
   lockFd = openSync(LOCK_FILE, 'wx')
   writeFileSync(LOCK_FILE, String(process.pid))
 }
+// Best-effort bot.pid for any external observer (skill, ps grep).
+try { writeFileSync(PID_FILE, String(process.pid)) } catch {}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -120,13 +129,15 @@ process.on('uncaughtException', err => {
   log('error', `uncaught exception: ${err}`)
 })
 
-// SIGPIPE handler — without this, if anyone stops draining our stderr/stdout
-// the OS delivers SIGPIPE on the next write and bun's default action is to
-// exit silently. Ignoring it lets write() fail with EPIPE which log() swallows.
+// SIGPIPE handler — 2026-05-13 by Joey. Without this, if the parent claude
+// process stops draining our stderr/stdout, the OS will deliver SIGPIPE on the
+// next write and bun's default action is to exit silently. Ignoring it lets
+// write() fail with EPIPE which we can catch (or it's swallowed by log()).
 process.on('SIGPIPE' as NodeJS.Signals, () => log('warn', 'SIGPIPE received — ignored'))
 
-// Lifecycle observability — capture the last moments before exit so a daemon
-// death always leaves a trace in the log file.
+// Lifecycle observability — 2026-05-13 by Joey. These fire as the runtime
+// unwinds, capturing the last moments. Critical for diagnosing the "bun dies
+// every 2-3 minutes" mystery.
 process.on('beforeExit', code => {
   log('warn', `beforeExit code=${code} uptime=${process.uptime().toFixed(1)}s`)
 })
@@ -449,6 +460,87 @@ const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 // handler call per server instance), and answers are routed back through the
 // originating server so the right claude session resumes.
 const activeServers = new Set<Server>()
+const serverSessionId = new WeakMap<Server, string>()  // server → its session id
+const sseOpen = new Map<string, boolean>()             // session id → SSE GET stream open?
+const memQueue = new Map<string, Array<{ method: string; params: unknown }>>()  // session id → pending notifs while SSE not open
+
+// Disk-persistent replay queue — survives daemon restart and "0 active sessions"
+// gaps. New session's first GET handleRequest signals SSE is up; we then drain
+// disk pending to that session. Files are deleted on successful delivery.
+const PENDING_DIR = join(STATE_DIR, 'inbox', 'pending')
+mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
+let persistSeq = 0
+
+function persistInbound(notif: { method: string; params: unknown }): string | null {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-')
+    const seq = String(++persistSeq).padStart(4, '0')
+    const filename = `${ts}-${seq}.json`
+    const tmpPath = join(PENDING_DIR, filename + '.tmp')
+    const finalPath = join(PENDING_DIR, filename)
+    writeFileSync(tmpPath, JSON.stringify(notif), { mode: 0o600 })
+    renameSync(tmpPath, finalPath)  // atomic on POSIX
+    return finalPath
+  } catch (err) {
+    log('error', `persistInbound failed: ${err}`)
+    return null
+  }
+}
+
+async function replayPendingFromDisk(server: Server): Promise<number> {
+  let files: string[]
+  try { files = readdirSync(PENDING_DIR) } catch { return 0 }
+  const pending = files.filter(f => f.endsWith('.json')).sort()
+  let replayed = 0
+  for (const file of pending) {
+    const fullPath = join(PENDING_DIR, file)
+    let notif: { method: string; params: unknown }
+    try {
+      notif = JSON.parse(readFileSync(fullPath, 'utf8'))
+    } catch (err) {
+      log('warn', `pending unreadable, removing: ${file}: ${err}`)
+      try { rmSync(fullPath) } catch {}
+      continue
+    }
+    try {
+      await server.notification(notif as Parameters<Server['notification']>[0])
+      try { rmSync(fullPath) } catch {}
+      replayed++
+    } catch (err) {
+      log('warn', `disk-replay failed for ${file}: ${err} — keeping for retry`)
+      break  // preserve order; retry on next session
+    }
+  }
+  if (replayed > 0) log('info', `disk-replayed ${replayed} pending notification(s)`)
+  return replayed
+}
+
+function gcPendingDisk(): void {
+  const MAX_AGE_MS = 7 * 24 * 3600 * 1000
+  const MAX_FILES = 1000
+  let files: string[]
+  try { files = readdirSync(PENDING_DIR) } catch { return }
+  type Item = { f: string; mtime: number; path: string }
+  const items: Item[] = []
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue
+    const path = join(PENDING_DIR, f)
+    try { items.push({ f, mtime: statSync(path).mtimeMs, path }) } catch {}
+  }
+  const now = Date.now()
+  let pruned = 0
+  for (const it of items) {
+    if (now - it.mtime > MAX_AGE_MS) {
+      try { rmSync(it.path); pruned++ } catch {}
+    }
+  }
+  const fresh = items.filter(i => now - i.mtime <= MAX_AGE_MS).sort((a, b) => b.mtime - a.mtime)
+  for (const it of fresh.slice(MAX_FILES)) {
+    try { rmSync(it.path); pruned++ } catch {}
+  }
+  if (pruned > 0) log('info', `gc: pruned ${pruned} pending entries`)
+}
+setInterval(gcPendingDisk, 3600 * 1000).unref()
 
 // pendingPermissions tracks the originating server for each permission request
 // so the inline-button / yes-xxxxx reply path can route the answer back to the
@@ -734,6 +826,9 @@ function shutdown(reason: string): void {
   if (shuttingDown) return
   shuttingDown = true
   log('warn', `shutting down (reason: ${reason}) uptime=${process.uptime().toFixed(1)}s`)
+  try {
+    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+  } catch {}
   try { rmSync(LOCK_FILE, { force: true }) } catch {}
   if (lockFd !== null) { try { closeSync(lockFd) } catch {} }
   // bot.stop() signals the poll loop to end; the current getUpdates request
@@ -1082,21 +1177,39 @@ async function handleInbound(
   broadcastNotification(notification)
 }
 
-// Route B fan-out: deliver an inbound notification to every active claude
-// session connected via HTTP. If a session's transport throws, drop it from
-// the registry (the transport will also fire its onclose). When zero sessions
-// are active, log and continue — daemon survives. Telegram won't redeliver,
-// so the message is best-effort delivered to whoever happens to be connected.
+// Route B fan-out (replay-queue-aware):
+//   1. No active session → persist to disk; replay on next session's first GET
+//   2. Session active but SSE GET not yet open → queue in memory; flush when GET arrives
+//   3. Session active AND SSE open → deliver directly
+//   4. If no session had SSE open, also persist to disk as safety net (covers
+//      daemon restart between broadcast and SSE open)
 function broadcastNotification(notif: { method: string; params: unknown }): void {
   if (activeServers.size === 0) {
-    log('warn', `inbound dropped (no active claude session): ${notif.method}`)
+    log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
+    persistInbound(notif)
     return
   }
+  let anySseOpen = false
   for (const server of activeServers) {
-    void server.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
-      log('error', `notify session failed, removing from registry: ${err}`)
-      activeServers.delete(server)
-    })
+    const sid = serverSessionId.get(server)
+    if (sid && sseOpen.get(sid)) {
+      anySseOpen = true
+      void server.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
+        log('error', `notify session ${sid} failed, removing from registry: ${err}`)
+        activeServers.delete(server)
+      })
+    } else if (sid) {
+      const q = memQueue.get(sid) ?? []
+      q.push(notif)
+      memQueue.set(sid, q)
+      log('info', `queued for session ${sid} (SSE not yet open, queue=${q.length})`)
+    }
+  }
+  // Safety net: if NO session has SSE open, also write to disk so we recover
+  // across daemon restarts and any unforeseen handshake races.
+  if (!anySseOpen) {
+    log('warn', `no SSE-open session at broadcast — also persisting to disk: ${notif.method}`)
+    persistInbound(notif)
   }
 }
 
@@ -1106,12 +1219,18 @@ bot.catch(err => {
   log('error', `handler error (polling continues): ${err.error}`)
 })
 
-// Retry polling with backoff on any error. The inner loop is wrapped in an
-// outer try/catch so a sync throw in the IIFE itself (bun runtime quirks,
-// unhandled promise sneaking through) gets logged and retried instead of
-// silently terminating polling. 409 Conflict is treated as patient-wait, not
-// a fatal: the daemon is long-lived, and any conflicting poller will eventually
-// release its slot.
+// Retry polling with backoff on any error. Previously only 409 was retried —
+// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
+// returned, and polling stopped permanently while the process stayed alive
+// (MCP stdin keeps it running). Outbound tools kept working but the bot was
+// deaf to inbound messages until a full restart.
+//
+// 2026-05-13 by Joey:
+// - Wrapped inner loop in an outer try/catch so a sync throw in the IIFE itself
+//   (bun runtime quirks, unhandled promise sneaking through) gets logged and
+//   retried instead of silently terminating the loop.
+// - 409 Conflict exhaustion now calls shutdown() so we die cleanly and a
+//   supervisor (or claude itself) can restart, rather than going zombie.
 async function pollLoop(): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -1165,7 +1284,7 @@ void (async () => {
 })()
 
 // ============================================================================
-// HTTP MCP transport
+// HTTP MCP transport (Route B — 2026-05-13)
 // ----------------------------------------------------------------------------
 // Each POST that carries an `initialize` method spins up a fresh Server +
 // StreamableHTTPServerTransport pair and stores it keyed by the
@@ -1219,7 +1338,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: id => {
             transports.set(id, transport)
-            log('info', `MCP session opened: ${id} (active=${activeServers.size})`)
+            serverSessionId.set(server, id)
+            sseOpen.set(id, false)  // SSE not open until client does GET
+            log('info', `MCP session opened: ${id} (active=${activeServers.size}, SSE pending)`)
           },
         })
         const server = buildServer()
@@ -1229,10 +1350,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           activeServers.delete(server)
           if (transport.sessionId) {
             transports.delete(transport.sessionId)
+            sseOpen.delete(transport.sessionId)
+            memQueue.delete(transport.sessionId)  // discard mem queue; disk pending stays for next session
             log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
-            // Permission requests in flight from this session are orphaned —
-            // the answering chat reply will log "unknown request_id" when it
-            // can't find the originating server. Acceptable for now.
             for (const [reqId, p] of pendingPermissions) {
               if (p.server === server) pendingPermissions.delete(reqId)
             }
@@ -1256,7 +1376,55 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         res.writeHead(400, { 'content-type': 'text/plain' }).end('invalid or missing session id\n')
         return
       }
-      await transports.get(sessionId)!.handleRequest(req, res)
+      const transport = transports.get(sessionId)!
+
+      if (req.method === 'GET') {
+        // SSE GET: handleRequest sets up the SSE stream synchronously then
+        // blocks until the client disconnects. We can't await it, or the
+        // replay below would run AFTER claude is already gone. Strategy:
+        //   1. Preemptively mark sseOpen so subsequent broadcasts go direct
+        //   2. Start handleRequest (don't await) — SDK synchronously registers
+        //      the SSE stream in its internal map within this microtask
+        //   3. Yield briefly so the SDK finishes registering
+        //   4. Flush mem queue + disk pending — SDK now has the stream and
+        //      our server.notification calls reach claude
+        //   5. THEN await the long-lived SSE request lifecycle
+        sseOpen.set(sessionId, true)
+        const reqPromise = transport.handleRequest(req, res)
+        // Single-microtask yield is enough for the SDK's synchronous
+        // _streamMapping.set; we add a small extra delay as belt-and-suspenders
+        // for the Node↔Web adapter (@hono/node-server) to finish wiring.
+        await new Promise(r => setTimeout(r, 50))
+        let boundServer: Server | undefined
+        for (const s of activeServers) {
+          if (serverSessionId.get(s) === sessionId) { boundServer = s; break }
+        }
+        if (boundServer) {
+          const queued = memQueue.get(sessionId) ?? []
+          if (queued.length > 0) {
+            log('info', `flushing ${queued.length} mem-queued notif(s) for session ${sessionId}`)
+            for (const notif of queued) {
+              try {
+                await boundServer.notification(notif as Parameters<Server['notification']>[0])
+              } catch (err) {
+                log('error', `mem-flush failed: ${err}`)
+              }
+            }
+            memQueue.delete(sessionId)
+          }
+          // Disk-pending drain (covers daemon restart and "0 active session" gap).
+          // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
+          void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
+        }
+        // Now await the SSE request to keep the response open until client disconnects.
+        try { await reqPromise } finally {
+          sseOpen.set(sessionId, false)  // SSE closed; future broadcasts queue
+        }
+        return
+      }
+
+      // DELETE
+      await transport.handleRequest(req, res)
       return
     }
 
