@@ -15,13 +15,26 @@ This plugin replaces stdio with an **HTTP MCP daemon**:
 
 Same tools (`reply`, `react`, `edit_message`, `download_attachment`, `fetch_messages`), same access control, same `<channel source="discord">` notification format. Drop-in replacement.
 
+## Research history (where the receipts live)
+
+The investigation that produced this fix was driven by the Telegram plugin failures, but the architectural fix applies identically to Discord. Full evidence chain — logs, hypotheses, patches that didn't root-fix, root cause — is published as HedgeDoc reports under the sibling plugin:
+
+| Report | What's in it |
+|---|---|
+| [Telegram plugin 反覆死亡 debug 全紀錄](https://md.blocktempo.ai/0EXKOeo-QRS6Plby7lUePQ) | 4 rounds of hypothesis testing; 9 stdio-era patches that did NOT root-fix; root cause finally pinpointed via file-logging; Route A vs Route B comparison; final decision rationale |
+| [Earlier root-cause + patch design](https://md.blocktempo.ai/7Q318gHJSdOV3BH2ub8fyg) | 14-death-path audit; bug categorization; file-logger patch that made debugging possible |
+| [Route B 完成報告 (Telegram side)](https://md.blocktempo.ai/B_MVqPMbQsyLLxo7oGnTdg) | Deployment timeline, ironclad evidence (0 deaths vs 22-244s typical) — Telegram, but the architecture is what got mirrored here |
+| [Switchover SOP](https://md.blocktempo.ai/StFH9rUCT2OmGW5T2EM61g) | Step-by-step migration playbook (Scenario A vs B); applies to both channels |
+
+The Telegram and Discord plugins share the same upstream architecture (stdio child of claude TUI, with `process.stdin.on('end', shutdown)`) so they share the same architectural vulnerability. Discord just hadn't visibly broken yet in our deployment.
+
 ## Why we forked
 
 Identical motivation to the telegram-http fork: claude TUI periodically closes plugin stdio, the upstream `process.stdin.on('end', shutdown)` handler kills the bun process. With Discord's WebSocket gateway, the gateway connection is lost; with discord.js's reconnect logic gone (because the process is dead), the bot stops receiving messages until a manual restart.
 
-In practice the Discord plugin was less visibly broken than the Telegram one in our deployment — Discord's gateway uses a persistent WebSocket which interacts differently with claude's stdio close behavior, and the official Discord plugin lacks the bot.pid mutual-kill that compounded telegram's failures. But the **architectural vulnerability is identical** — same stdio.on('end') shutdown path, same potential to silently die.
+In practice the Discord plugin was less visibly broken than the Telegram one in our deployment — Discord's gateway uses a persistent WebSocket which interacts differently with claude's stdio close behavior, and the official Discord plugin lacks the bot.pid mutual-kill that compounded telegram's failures. The Discord daemon we observed survived 44+ minutes where Telegram daemons were dying every 22-244 seconds. But the **architectural vulnerability is identical** — same `stdio.on('end')` shutdown path, same potential to silently die.
 
-We forked prophylactically + to land the same fix consistently across both channels.
+We forked prophylactically + to land the same fix consistently across both channels. Better to fix it before the death pattern emerges than after.
 
 ## How it works
 

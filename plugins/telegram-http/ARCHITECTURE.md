@@ -15,6 +15,19 @@ This plugin replaces the stdio transport with an **HTTP MCP daemon**:
 
 Same tools, same access control, same `<channel source="telegram">` notification format. Drop-in replacement.
 
+## Research history (where the receipts live)
+
+This fork is the end product of four nights of debugging the upstream stdio plugin on a production Mac mini deployment. The full evidence chain — logs, hypotheses tested, patches applied, root cause analysis — is published as HedgeDoc reports:
+
+| Report | What's in it |
+|---|---|
+| [Telegram plugin 反覆死亡 debug 全紀錄](https://md.blocktempo.ai/0EXKOeo-QRS6Plby7lUePQ) | 4 rounds of hypothesis testing (watchdog, stdin EOF, ppid orphan, PID mutual-kill); 9 stdio-era patches that did NOT root-fix the bug; root cause finally pinpointed by file-logging the death moment; Route A vs Route B comparison table; final decision rationale |
+| [Earlier root-cause + patch design](https://md.blocktempo.ai/7Q318gHJSdOV3BH2ub8fyg) | Original 14-death-path audit of the upstream `server.ts`; A-class / B-class / C-class / D-class bug categorization; the file-logger patch that made the whole thing diagnosable |
+| [Route B 完成報告](https://md.blocktempo.ai/B_MVqPMbQsyLLxo7oGnTdg) | Deployment timeline (13:38→13:54 UTC, 16 min start-to-verify); architecture transformation diagram; ironclad evidence (0 deaths in 9m vs 22-244s typical death); lessons learned (5 items); per-bot daemon table |
+| [Switchover SOP](https://md.blocktempo.ai/StFH9rUCT2OmGW5T2EM61g) | Step-by-step migration playbook from the in-place patched cache plugin to this fork; Scenario A (no marketplace switch, just plist update) vs Scenario B (full plugin ID swap to `telegram-http@crab-labs-plugins`); wrapper rewrite rationale |
+
+If you are reading this because the plugin broke and you want to understand WHY this exists and not just WHAT it does, read [the death-loop report](https://md.blocktempo.ai/0EXKOeo-QRS6Plby7lUePQ) first — it's the canonical story.
+
 ## Why we forked: the stdio death cycle
 
 The official plugin's `server.ts` reads:
@@ -36,9 +49,24 @@ In practice, the parent's stdio gets closed for reasons other than parent death:
 
 Each of those triggered `shutdown()`, the plugin died, Grammy's in-flight `getUpdates` long-poll was abandoned, and the bun process exited within ~244 seconds typical, sometimes as short as 22 seconds. Telegram has no message replay for dropped pollers, so anything in flight at the death moment was lost.
 
-We tried patching individual death paths (file logging, stdin EOF grace window, ppid watchdog, advisory lock instead of mutual-kill). Each patch fixed one symptom but a new one surfaced — because **the architecture itself was the bug**: stdio coupling tied the bot's life to claude TUI's mood.
+### What didn't work (4 patch rounds, all dead ends)
 
-The fix is to detach. The daemon owns the bot, claude owns its own session, and they meet over HTTP.
+We tried patching individual death paths before realizing the architecture was the bug:
+
+| Round | Patch attempt | Why it failed |
+|---|---|---|
+| 1 | Polling retry loop with backoff | Plugin died before the retry kicked in (stdin EOF triggered `process.exit`, not a polling-loop exception) |
+| 2 | ppid watchdog with 15s grace period | claude TUI's PID didn't change when it closed stdio; ppid stayed correct |
+| 3 | stdin EOF grace window (10s before shutdown) | Reduced death frequency but didn't eliminate; eventually still triggered |
+| 4 | Advisory lock replacing PID mutual-kill | Fixed a different bug (two daemons killing each other) but didn't address the underlying stdio coupling |
+
+Each patch fixed one symptom but a new one surfaced. The key breakthrough was adding **file logging** (`$STATE_DIR/server.log`) — until then, deaths were invisible because claude TUI swallowed the plugin's stderr. With the file log, we could finally see "stdin EOF — parent likely closed stdio" in the death moment, which pointed at the actual cause: claude (not us) was closing the pipe.
+
+At that point the diagnosis was unambiguous: **stdio coupling tied the bot's life to claude TUI's mood**, and no amount of plugin-side defensive code could fix it.
+
+### The fix: detach
+
+The daemon owns the bot, claude owns its own session, and they meet over HTTP. Once they're connected by a network socket instead of a shared file descriptor pair, claude can do anything it wants to its stdio without killing the bot.
 
 ## How Route B works
 
