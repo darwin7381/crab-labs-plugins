@@ -139,6 +139,29 @@ Same `server.log` format as `telegram-http`, plus:
 ### Pairing
 Same `/discord:access` skill as the official plugin.
 
+## Health endpoint
+
+`GET /healthz` returns a JSON snapshot of daemon state for health probes / dashboards:
+
+```json
+{
+  "ok": true,
+  "plugin": "discord-http",
+  "bot_tag": "your-bot#1234",
+  "uptime_s": 3600,
+  "mem_rss_mb": 92,
+  "active_sessions": 1,
+  "ws_state": 0,
+  "ws_ready": true,
+  "pending_disk_count": 0,
+  "pid": 12345
+}
+```
+
+`ws_state` follows discord.js's `Client.ws.status` enum: 0=READY, 1=CONNECTING, 2=RECONNECTING, 3=IDLE, 4=NEARLY, 5=DISCONNECTED. Anything other than 0 means the gateway WebSocket isn't fully connected. `pending_disk_count > 0` means replay queue has unread messages.
+
+Cheap, unauthenticated; relies on `127.0.0.1` bind for security.
+
 ## Compatibility notes
 
 - The MCP server registers as `name: "discord"` (same as official). Don't run both plugins at once.

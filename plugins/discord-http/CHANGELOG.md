@@ -50,3 +50,8 @@ The official Discord plugin had no file logging, no heartbeat, no advisory lock 
 
 - `.mcp.json` is now `{ "type": "http", "url": "http://127.0.0.1:${DISCORD_HTTP_PORT}/mcp" }` instead of stdio command. Claude must have `DISCORD_HTTP_PORT` set in its env to load the plugin.
 - Claude no longer spawns the plugin as a child process — daemon must be running independently (launchd).
+
+## Unreleased
+
+### Added
+- `GET /healthz` endpoint — JSON snapshot of daemon state for supervisor health checks (bot username/tag, uptime, RSS, active session count, polling/ws state, pending disk count, pid).

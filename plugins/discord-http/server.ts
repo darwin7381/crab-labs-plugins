@@ -40,7 +40,7 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 
-// Plugin runs as a standalone HTTP MCP daemon. Claude TUI connects
+// Plugin runs as a standalone HTTP MCP daemon (Route B). Claude TUI connects
 // via StreamableHTTPClientTransport at .mcp.json's `url`, fully decoupled from
 // the daemon's lifetime.
 const HTTP_PORT = (() => {
@@ -511,7 +511,7 @@ function safeAttName(att: Attachment): string {
   return (att.name ?? att.id).replace(/[\[\]\r\n;]/g, '_')
 }
 
-// Active server registry — multi-session HTTP daemon. Each connected claude TUI
+// Active server registry — Route B multi-session. Each connected claude TUI
 // session gets its own Server bound to its StreamableHTTPServerTransport.
 // Inbound Discord messages are broadcast to all active servers. Permission
 // requests carry the originating server so answers route back to the right
@@ -652,7 +652,7 @@ function buildServer(): Server {
   }),
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
-    // Multi-session: track which server originated the request so the answer routes
+    // Route B: track which server originated the request so the answer routes
     // back to the right claude session (multi-session daemon).
     pendingPermissions.set(request_id, { tool_name, description, input_preview, server: mcp })
     const access = loadAccess()
@@ -893,7 +893,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 }
 // === end buildServer() ===
 
-// HTTP daemon: shutdown is driven by signals only. No stdin watchdog —
+// Route B daemon: shutdown is driven by signals only. No stdin watchdog —
 // daemon is independent of any single claude TUI's lifetime.
 let shuttingDown = false
 function shutdown(reason: string): void {
@@ -961,7 +961,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     return
   }
 
-  // Route the answer back to the specific server that asked.
+  // Route B: route the answer back to the specific server that asked.
   const pending = pendingPermissions.get(request_id)
   if (pending) {
     void pending.server.notification({
@@ -1071,7 +1071,7 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
-// Inbound fan-out (replay-queue-aware):
+// Route B fan-out (replay-queue-aware):
 //   1. No active session → persist to disk; replay on next session's first GET
 //   2. Session active but SSE GET not yet open → queue in memory; flush on GET
 //   3. Session active AND SSE open → deliver directly
@@ -1165,8 +1165,32 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
   try {
     if (!req.url) { res.writeHead(404).end('not found'); return }
     const u = new URL(req.url, `http://${HTTP_HOST}:${HTTP_PORT}`)
+
+    // /healthz — daemon health probe for supervisor. 200 + JSON. Cheap,
+    // unauthenticated; relies on 127.0.0.1 bind for security.
+    if (u.pathname === '/healthz') {
+      const body = {
+        ok: true,
+        plugin: 'discord-http',
+        bot_tag: client.user?.tag ?? null,
+        uptime_s: Math.floor(process.uptime()),
+        mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        active_sessions: activeServers.size,
+        ws_state: client.ws.status,  // 0=READY, 1=CONNECTING, 5=DISCONNECTED, etc.
+        ws_ready: client.ws.status === 0,
+        pending_disk_count: (() => {
+          try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length }
+          catch { return 0 }
+        })(),
+        pid: process.pid,
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body))
+      return
+    }
+
     if (u.pathname !== '/mcp') {
-      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found — POST to /mcp\n')
+      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found — POST to /mcp or GET /healthz\n')
       return
     }
 
