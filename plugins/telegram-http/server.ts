@@ -1318,8 +1318,32 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
   try {
     if (!req.url) { res.writeHead(404).end('not found'); return }
     const u = new URL(req.url, `http://${HTTP_HOST}:${HTTP_PORT}`)
+
+    // /healthz — daemon health probe for supervisor. Returns 200 + JSON. Cheap,
+    // unauthenticated; relies on 127.0.0.1 bind for security (LAN-firewalled).
+    if (u.pathname === '/healthz') {
+      const body = {
+        ok: true,
+        plugin: 'telegram-http',
+        bot_username: botUsername || null,
+        uptime_s: Math.floor(process.uptime()),
+        mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        active_sessions: activeServers.size,
+        last_update_id: lastUpdateId,
+        polling: botUsername !== '',  // grammy's onStart set this; falsy = polling not yet active
+        pending_disk_count: (() => {
+          try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length }
+          catch { return 0 }
+        })(),
+        pid: process.pid,
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body))
+      return
+    }
+
     if (u.pathname !== '/mcp') {
-      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found — POST to /mcp\n')
+      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found — POST to /mcp or GET /healthz\n')
       return
     }
 

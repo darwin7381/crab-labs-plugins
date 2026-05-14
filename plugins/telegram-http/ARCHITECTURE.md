@@ -184,6 +184,29 @@ The 50ms delay is belt-and-suspenders for the Node↔Web adapter (`@hono/node-se
 ### Pairing
 Same `/telegram:access` skill as the official plugin. First DM gets a 6-char code; run `/telegram:access pair <code>` in claude.
 
+## Health endpoint
+
+`GET /healthz` returns a JSON snapshot of daemon state for health probes / dashboards:
+
+```json
+{
+  "ok": true,
+  "plugin": "telegram-http",
+  "bot_username": "your_bot",
+  "uptime_s": 3600,
+  "mem_rss_mb": 78,
+  "active_sessions": 1,
+  "last_update_id": 12345,
+  "polling": true,
+  "pending_disk_count": 0,
+  "pid": 12345
+}
+```
+
+`polling: false` means Grammy hasn't successfully connected to the Telegram API yet (initial setup, invalid token, or network issue). `pending_disk_count > 0` means replay queue has unread messages waiting for a claude session.
+
+Cheap, unauthenticated; relies on `127.0.0.1` bind for security.
+
 ## Compatibility notes
 
 - The MCP server registers as `name: "telegram"` (same as official). Don't run both plugins at once — they collide on the server name and on the bot poll slot.
