@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1 — 2026-05-14
+
+Compatibility + docs release. No daemon code changes.
+
+### Fixed
+- **`.mcp.json` URL now distinguishable from upstream `discord@claude-plugins-official`** to avoid claude TUI's plugin MCP server dedup. Same root cause and fix pattern as [telegram-http 1.0.1](../telegram-http/CHANGELOG.md). Added `?v=crab-labs` query string + inner `mcpServers` key renamed to `discord-http`.
+
+### Added
+- [SETUP.md](./SETUP.md) — pointer to shared [telegram-http SETUP.md](../telegram-http/SETUP.md) (architecture identical, only env vars / paths differ; SETUP doc has a translation table).
+
+### Known issues
+- Same as telegram-http 1.0.1 — pin claude binary to 2.1.140 until 2.1.141 HTTP MCP transport regression is fixed upstream.
+
 ## 1.0.0 — 2026-05-14
 
 Initial release of `discord-http` as a Crab Labs fork of `discord@claude-plugins-official` v0.0.4.

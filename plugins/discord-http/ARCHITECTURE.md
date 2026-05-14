@@ -164,10 +164,11 @@ Cheap, unauthenticated; relies on `127.0.0.1` bind for security.
 
 ## Compatibility notes
 
-- The MCP server registers as `name: "discord"` (same as official). Don't run both plugins at once.
-- All tools have the same input schemas and semantics as official.
-- `/discord:access` skill is byte-identical to upstream (we copied unchanged).
-- Inbound `<channel source="discord" chat_id="..." ...>` block is identical to upstream.
+- The MCP server registers as `name: "discord-http"` (1.0.1+; was `"discord"` in 1.0.0). The `.mcp.json` URL is `…/mcp?v=crab-labs`. This differentiates from upstream's `name: "discord"` / `…/mcp` so claude TUI's URL-based plugin MCP server dedup doesn't suppress this fork. **You can safely enable both** `discord@claude-plugins-official` and `discord-http@crab-labs-plugins` in `enabledPlugins`.
+- One gateway connection per Discord bot token — don't run two daemons against the same token concurrently (Discord gateway rejects duplicate identifies).
+- All tools (`reply`, `react`, `edit_message`, `download_attachment`, `fetch_messages`) have the same input schemas and semantics as official.
+- `/discord:access` skill is byte-identical to upstream (we copied unchanged). Skill paths exposed as `/discord-http:access` and `/discord-http:configure`.
+- Inbound channel notifications render as `<channel source="discord-http" chat_id="..." ...>` (1.0.1+). Meta keys (`attachment_count`, `attachments`, etc.) are identical to upstream.
 
 ## Differences from upstream you should know about
 

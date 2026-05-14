@@ -4,6 +4,8 @@ Telegram channel for Claude Code — **HTTP MCP daemon** edition.
 
 Drop-in replacement for the official `telegram@claude-plugins-official` plugin. Same tools, same access control, same channel notification format. The only architectural change: the bot runs as a long-lived **HTTP MCP daemon** instead of a stdio child process of claude TUI.
 
+> ⚡ **Quick start (first-time setup)**: [SETUP.md](./SETUP.md) — end-to-end tutorial in Chinese covering plugin install → bot configure (ackReaction emoji principles, dmPolicy) → managed-settings.json policy → launchd daemon → claude TUI startup (with required 2.1.140 pin) → pairing → end-to-end test → troubleshooting.
+>
 > 📐 **Deep dive**: [ARCHITECTURE.md](./ARCHITECTURE.md) covers the design rationale, the upstream stdio death cycle, the replay queue, and debugging.
 >
 > 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
@@ -123,7 +125,11 @@ Running multiple bots = multiple daemons + multiple plists + multiple ports. cla
 
 ## Compatibility
 
-This plugin registers its MCP server as `name: "telegram"`, same as the official plugin, so claude's `<channel source="telegram">` notifications and all `/telegram:access` skill paths work unchanged. **Don't enable both `telegram@claude-plugins-official` and `telegram-http@crab-labs-plugins` simultaneously** — they will collide on the MCP server name and the bot token slot.
+This plugin registers its MCP server as `name: "telegram-http"` and uses URL `http://127.0.0.1:${TELEGRAM_HTTP_PORT}/mcp?v=crab-labs` — distinct from the official plugin's `name: "telegram"` / `…/mcp` — so claude TUI's plugin MCP server dedup (which signs by URL) doesn't collide. **You can enable both `telegram@claude-plugins-official` and `telegram-http@crab-labs-plugins` simultaneously** in `enabledPlugins`. Use `--channels plugin:telegram-http@crab-labs-plugins` to direct channel notifications to this fork.
+
+Inbound channel notifications in claude render as `<channel source="telegram-http" …>` (not `source="telegram"`) — the channel source name is whatever you put in --channels. Skill paths exposed are `/telegram-http:access` and `/telegram-http:configure`.
+
+If you want to share `$STATE_DIR` with the official plugin (same `access.json`, same bot token), point both `TELEGRAM_STATE_DIR` env vars at the same dir. But they cannot both poll the same Telegram bot simultaneously — only one daemon at a time, enforced by the advisory lock at `$STATE_DIR/bot.lock`.
 
 ## License
 

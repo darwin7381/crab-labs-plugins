@@ -209,10 +209,11 @@ Cheap, unauthenticated; relies on `127.0.0.1` bind for security.
 
 ## Compatibility notes
 
-- The MCP server registers as `name: "telegram"` (same as official). Don't run both plugins at once — they collide on the server name and on the bot poll slot.
+- The MCP server registers as `name: "telegram-http"` (1.0.1+; was `"telegram"` in 1.0.0). The `.mcp.json` URL is `…/mcp?v=crab-labs`. This differentiates from upstream's `name: "telegram"` / `…/mcp` so claude TUI's URL-based plugin MCP server dedup doesn't suppress this fork. **You can safely enable both** `telegram@claude-plugins-official` and `telegram-http@crab-labs-plugins` in `enabledPlugins`.
+- One bot poll slot per Telegram bot token though — don't run two daemons against the same token concurrently. Advisory lock at `$STATE_DIR/bot.lock` prevents same-STATE_DIR conflict.
 - All tools (`reply`, `react`, `download_attachment`, `edit_message`) have the same input schemas and semantics as official.
-- `/telegram:access` skill is byte-identical to upstream (we copied the `skills/` directory unchanged).
-- Inbound `<channel source="telegram" chat_id="..." ...>` block is identical, including `image_path` and `attachment_*` meta keys.
+- `/telegram:access` skill is byte-identical to upstream (we copied the `skills/` directory unchanged). Skill paths exposed as `/telegram-http:access` and `/telegram-http:configure` (claude prefixes skills by plugin name).
+- Inbound channel notifications render as `<channel source="telegram-http" chat_id="..." ...>` (1.0.1+; was `source="telegram"` when the plugin shared the inner mcpServers key). Meta keys (`image_path`, `attachment_*`, etc.) are identical to upstream.
 
 ## Differences from upstream you should know about
 
