@@ -4,6 +4,10 @@ Telegram channel for Claude Code — **HTTP MCP daemon** edition.
 
 Drop-in replacement for the official `telegram@claude-plugins-official` plugin. Same tools, same access control, same channel notification format. The only architectural change: the bot runs as a long-lived **HTTP MCP daemon** instead of a stdio child process of claude TUI.
 
+> 📐 **Deep dive**: [ARCHITECTURE.md](./ARCHITECTURE.md) covers the design rationale, the upstream stdio death cycle, the replay queue, and debugging.
+>
+> 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
+
 ## Why this fork
 
 The official plugin uses stdio transport: claude TUI spawns the bun process as a subprocess and pipes stdin/stdout. If claude closes the stdio (which it does periodically — observed every ~5 minutes in multi-channel setups), the plugin dies. With Grammy long-polling Telegram, every death drops messages and breaks reply flow.

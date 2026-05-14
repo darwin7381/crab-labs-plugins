@@ -4,6 +4,10 @@ Discord channel for Claude Code — **HTTP MCP daemon** edition.
 
 Drop-in replacement for the official `discord@claude-plugins-official` plugin. Same tools (`reply`, `react`, `edit_message`, `download_attachment`, `fetch_messages`), same access control, same channel notification format. The only architectural change: the bot runs as a long-lived **HTTP MCP daemon** instead of a stdio child process of claude TUI.
 
+> 📐 **Deep dive**: [ARCHITECTURE.md](./ARCHITECTURE.md) covers the design rationale, the upstream stdio coupling vulnerability, the replay queue, and debugging.
+>
+> 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
+
 ## Why this fork
 
 The official plugin uses stdio transport: claude TUI spawns the bun process as a subprocess and pipes stdin/stdout. If claude closes the stdio (which can happen periodically), the plugin dies. With the Discord gateway WebSocket holding state, every death drops messages and breaks reply flow.
