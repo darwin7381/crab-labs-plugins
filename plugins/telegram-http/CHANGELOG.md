@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1 — 2026-05-14
+
+Compatibility + docs release. No daemon code changes.
+
+### Fixed
+- **`.mcp.json` URL now distinguishable from upstream `telegram@claude-plugins-official`** to avoid claude TUI's plugin MCP server dedup. Claude TUI's `YjH(config)` function uses the URL as the dedup signature; with identical URLs, the second-loaded plugin is silently suppressed with `Suppressing plugin MCP server "..." duplicates earlier plugin server "..."` in the debug log. Added `?v=crab-labs` query string to the URL; the daemon routes by `u.pathname` so the query string is transparent to it. **Side effect**: the inner `mcpServers` key is now `"telegram-http"` (was `"telegram"`), so the registered MCP server name in claude TUI is `plugin:telegram-http:telegram-http` (was `plugin:telegram-http:telegram`).
+
+### Added
+- [SETUP.md](./SETUP.md) — end-to-end first-time setup tutorial in Chinese: plugin install, per-bot configure (ackReaction emoji principles, dmPolicy choices), managed-settings.json (`allowedChannelPlugins` allowlist), launchd plist, claude TUI startup (with mandatory 2.1.140 pin), pairing, end-to-end testing, supervisor.sh integration, troubleshooting.
+
+### Known issues
+- **Claude binary 2.1.141 has an HTTP MCP transport regression** — TUIs silently lose all TCP connections to the daemon over time (process alive, network dead). **Pin to 2.1.140** in supervisor manifests / direct invocations until upstream confirms a fix. See SETUP.md §11.2 and HedgeDoc [incident report](https://md.blocktempo.ai/TFkYzCibQheCDaV2fyoaBg).
+
 ## 1.0.0 — 2026-05-14
 
 Initial release of `telegram-http` as a Crab Labs fork of `telegram@claude-plugins-official` v0.0.6.

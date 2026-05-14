@@ -4,6 +4,8 @@ Discord channel for Claude Code — **HTTP MCP daemon** edition.
 
 Drop-in replacement for the official `discord@claude-plugins-official` plugin. Same tools (`reply`, `react`, `edit_message`, `download_attachment`, `fetch_messages`), same access control, same channel notification format. The only architectural change: the bot runs as a long-lived **HTTP MCP daemon** instead of a stdio child process of claude TUI.
 
+> ⚡ **Quick start (first-time setup)**: [SETUP.md](./SETUP.md) → points to shared [telegram-http/SETUP.md](../telegram-http/SETUP.md) with a Discord ↔ Telegram translation table.
+>
 > 📐 **Deep dive**: [ARCHITECTURE.md](./ARCHITECTURE.md) covers the design rationale, the upstream stdio coupling vulnerability, the replay queue, and debugging.
 >
 > 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
@@ -126,7 +128,11 @@ GC runs hourly: prunes pending older than 7 days, caps at 1000 newest entries.
 
 ## Compatibility
 
-This plugin registers its MCP server as `name: "discord"`, same as the official plugin, so claude's `<channel source="discord">` notifications and all `/discord:access` skill paths work unchanged. **Don't enable both `discord@claude-plugins-official` and `discord-http@crab-labs-plugins` simultaneously** — they will collide on the MCP server name and the bot gateway slot.
+This plugin registers its MCP server as `name: "discord-http"` and uses URL `http://127.0.0.1:${DISCORD_HTTP_PORT}/mcp?v=crab-labs` — distinct from the official plugin's `name: "discord"` / `…/mcp` — so claude TUI's plugin MCP server dedup (which signs by URL) doesn't collide. **You can enable both `discord@claude-plugins-official` and `discord-http@crab-labs-plugins` simultaneously** in `enabledPlugins`. Use `--channels plugin:discord-http@crab-labs-plugins` to direct channel notifications to this fork.
+
+Inbound channel notifications in claude render as `<channel source="discord-http" …>` (not `source="discord"`) — the channel source name is whatever you put in --channels. Skill paths exposed are `/discord-http:access` and `/discord-http:configure`.
+
+Note: Discord bots cannot share a gateway connection across daemons — only one daemon at a time per bot token (Discord gateway enforces this). Don't run the official and fork daemons against the same bot token simultaneously.
 
 ## License
 

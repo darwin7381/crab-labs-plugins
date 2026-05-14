@@ -554,7 +554,7 @@ const pendingPermissions = new Map<string, {
 
 function buildServer(): Server {
   const mcp = new Server(
-    { name: 'telegram', version: '1.0.0' },
+    { name: 'telegram-http', version: '1.0.0' },
     {
       capabilities: {
         tools: {},
