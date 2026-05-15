@@ -2,6 +2,17 @@
 
 > 從零開始把 Route B HTTP MCP Telegram / Discord plugin 跑起來。涵蓋 plugin install、bot 設定（含 ackReaction emoji 原則）、managed-settings.json 政策、launchd daemon、claude TUI 啟動、配對、測試、supervisor agent 整合、排錯。
 
+**Plugin repo**：https://github.com/darwin7381/crab-labs-plugins
+- `plugins/telegram-http/` — Telegram bridge plugin
+- `plugins/discord-http/` — Discord bridge plugin
+- 兩個 plugin 同 source / 同 architecture，只差 bot 平台
+
+**直接連結**：
+- [telegram-http/SETUP.md](https://github.com/darwin7381/crab-labs-plugins/blob/main/plugins/telegram-http/SETUP.md) — 本檔的 GitHub 版本
+- [telegram-http/README.md](https://github.com/darwin7381/crab-labs-plugins/blob/main/plugins/telegram-http/README.md) — 架構 + Quick start
+- [telegram-http/ARCHITECTURE.md](https://github.com/darwin7381/crab-labs-plugins/blob/main/plugins/telegram-http/ARCHITECTURE.md) — Route B 設計原理 + stdio death cycle 分析
+- [telegram-http/CHANGELOG.md](https://github.com/darwin7381/crab-labs-plugins/blob/main/plugins/telegram-http/CHANGELOG.md) — 版本變更
+
 ---
 
 ## 0. 這份 fork 解決什麼
@@ -509,6 +520,35 @@ tail ~/.claude/channels/telegram/launchd.err.log
 ### 11.6 「plugin not on approved channels allowlist」
 
 **修法**：§4 的 managed-settings.json 沒做 / 沒含這個 plugin。補上後 claude TUI 重啟。
+
+### 11.7 claude TUI 卡在 picker dialog（AskUserQuestion / ExitPlanMode）— **必踩雷**
+
+**現象**：你 TG DM bot 沒回，TUI process 還活著，daemon 收到訊息但 broadcast 全部 queue 在「SSE not yet open」。`tmux capture-pane` 看到 claude 在跑一個有 1/2/3 選項的 picker，下方寫「Enter to select · Tab/Arrow keys to navigate · Esc to cancel」。
+
+**原因**：[Anthropic GitHub issue #40644](https://github.com/anthropics/claude-code/issues/40644) — `AskUserQuestion` / `ExitPlanMode` 等需要 keyboard 的 picker 工具，在 `--channels` 模式底下**沒有被自動 disable**（明明 `claude -p` 模式有 disable 邏輯）。claude 跑到要決策的地方就直接 spawn picker → 鎖死 main thread → channel notification 不消化。
+
+**修法**：在 claude 啟動指令加 `--disallowedTools AskUserQuestion ExitPlanMode`：
+
+```
+claude --channels plugin:telegram-http@crab-labs-plugins \
+       --disallowedTools AskUserQuestion ExitPlanMode \
+       --dangerously-skip-permissions
+```
+
+claude 看到這些 tool 被 deny 就會 fallback 成 text question（直接在訊息裡用文字問「請選 1/2/3」），text 走正常 channel reply → TG 看得到 → TG 回答 → claude 處理。
+
+**已套用**：本 repo 內 5 個 supervisor agent manifest + channel bot wrapper 全部都加。等 Anthropic 修 #40644 之後可以拿掉。
+
+**如何救已經卡住的 session**：
+- 不能 TG 救（plugin 沒有 raw stdin 送鍵盤的能力）
+- SSH/Parsec 進 mac mini → `tmux attach -t <session>` → 按 picker
+- 或 kill claude TUI process，supervisor respawn 用新 flag
+
+**順便確認其他 tool 也安全**：
+- 普通 tool（`Bash`、`Edit`、`Read`、`Write`、`Grep`、`Glob`）— ✅ 不需要 keyboard
+- `--dangerously-skip-permissions` 已 cover permission prompt
+- `AskUserQuestion`、`ExitPlanMode` — ⚠️ disable
+- 之後 anthropic 加新的 keyboard tool 也要評估
 
 ---
 
