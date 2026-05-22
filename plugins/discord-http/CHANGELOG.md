@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.1.0 — 2026-05-23
+
+**Channel-bot TUI control plane** — Discord parity for the feature shipped in
+[telegram-http 1.1.0~1.2.1](../telegram-http/CHANGELOG.md). When the daemon
+is configured with `CHANNEL_BOT_TMUX_SESSION` (and friends), slash commands
+from Discord are intercepted and applied directly to the claude TUI via
+tmux send-keys / launchctl / pkill, instead of being forwarded as chat
+content. Functional list:
+
+- **tmux send-keys** (claude TUI alive, no restart):
+  - `/clear` `/help` `/agents` `/mcp` — claude native slashes
+  - `/model <name>` `/effort <level>` — switch model / effort
+  - `/sigint` — Ctrl+C, interrupt current turn
+- **system control** (launchctl / pkill):
+  - `/restart` — graceful claude TUI restart via wrapper kickstart
+  - `/kill_stuck` — `pkill -9` against claude TUI, wrapper respawns
+  - `/status` — daemon healthz + claude TUI pid
+- **session resume via picker** (1.5s inline-switch, same TUI process):
+  - `/resume_list` — list claude sessions (header shows current)
+  - `/resume <number|uuid>` — pick a session, picker drives via Down × N + Enter
+  - `/resume_previous` — walk back through session history one step at a time (chain semantics, no ping-pong)
+
+### Implementation
+- Added `channel-bot-control.ts` — a near-verbatim copy of
+  `telegram-http/channel-bot-control.ts` (only the `--channels` plugin
+  filter substring in `pkill`/`pgrep` differs). The two files must be
+  kept in sync; the file's docstring spells this out. Both daemons drive
+  the SAME claude TUI when configured with the same `CHANNEL_BOT_TMUX_SESSION`
+  and share `/tmp/channel-bot-resume-chain.json`, so `/resume_previous`
+  walk-back stays coherent across the Telegram and Discord entrypoints.
+- Wired into `handleInbound` between the permission-reply intercept and
+  the typing-indicator — when `msg.content.trim().startsWith('/')` and
+  control mode is enabled, `handleControlSlash` runs first.
+- Reply callback wraps `msg.reply()` so users see status updates in Discord
+  (the daemon's CLI log is invisible to them).
+
+### Required env vars (opt-in, same as telegram-http 1.1.0)
+
+| Var | Purpose |
+|---|---|
+| `CHANNEL_BOT_TMUX_SESSION` | tmux session name where claude TUI runs (enables the feature when set) |
+| `CHANNEL_BOT_PROJECTS_DIR` | claude's project dir for session listing |
+| `CHANNEL_BOT_WRAPPER_LABEL` | launchd label for graceful restart |
+| `CHANNEL_BOT_NEXT_ARGS_FILE` | path the wrapper reads for `--resume` overrides (1.1.0 only; 1.2.0+ inline-switches via picker) |
+| `CHANNEL_BOT_RESUME_CHAIN_FILE` | walk-back chain state (default `/tmp/channel-bot-resume-chain.json`) |
+
+### Security
+Slash interception runs AFTER the existing `gate()`/`access.allowFrom`
+check. Non-allowlisted senders never reach this code.
+
 ## 1.0.2 — 2026-05-22
 
 Dead-transport detection patch. Same architecture and rationale as [telegram-http 1.0.2](../telegram-http/CHANGELOG.md). Counters claude-code 2.1.141~2.1.148 silent HTTP MCP transport drop regression that leaves the daemon broadcasting forever to silently-dead claude TUI sessions.
