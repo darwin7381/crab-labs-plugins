@@ -95,13 +95,36 @@ async function tmuxSendCtrlKey(key: string): Promise<void> {
   }
 }
 
-/** kickstart-restart the wrapper (kills wrapper process; wrapper relaunches claude). */
-async function kickstartWrapper(): Promise<void> {
+/**
+ * Trigger claude TUI restart via the wrapper.
+ *
+ * Sequence:
+ *   1. tmux kill-session — wraps up the current claude TUI (it sees
+ *      SIGHUP from its parent shell dying). Wrapper's monitor loop
+ *      detects "session does not exist" on next check and triggers
+ *      start_claude() which reads $CHANNEL_BOT_NEXT_ARGS_FILE if present.
+ *   2. launchctl kickstart -k <wrapper> — restart the wrapper script
+ *      process itself (so it immediately re-enters monitor loop rather
+ *      than waiting up to 30s for the next poll cycle).
+ *
+ * NOTE: launchctl kickstart ALONE doesn't kill claude — it only restarts
+ * the wrapper script. The tmux session + claude TUI stay alive, so the
+ * new wrapper instance thinks everything is healthy and does nothing.
+ * This was a bug in v1.1.0 before this fix.
+ */
+async function restartClaudeTUI(): Promise<void> {
+  // Step 1: kill tmux session — this triggers wrapper's "session does
+  // not exist" branch and forces start_claude on next monitor tick.
+  const killResult = await runCommand(['tmux', 'kill-session', '-t', TMUX_SESSION])
+  // killResult.exitCode != 0 may just mean session was already gone — proceed regardless.
+
+  // Step 2: kickstart wrapper so it immediately re-enters monitor loop.
+  // (Without this, the next check is up to 30s away.)
   const target = `gui/${process.getuid?.() ?? 501}/${WRAPPER_LABEL}`
   const { exitCode, stderr } = await runCommand(['launchctl', 'kickstart', '-k', target])
   if (exitCode !== 0) {
     throw new Error(
-      `launchctl kickstart failed (${exitCode}): ${stderr.trim().slice(0, 200)}`,
+      `launchctl kickstart failed (${exitCode}): ${stderr.trim().slice(0, 200)} (tmux kill: ${killResult.exitCode})`,
     )
   }
 }
@@ -254,9 +277,9 @@ export async function handleControlSlash(
 
   // ---- Phase 2: system-level control ------------------------------------
   if (cmd === '/restart') {
-    await tryRun('launchctl kickstart wrapper', async () => {
-      await kickstartWrapper()
-      await replyToTg('🔁 restarting channel-bot wrapper — claude TUI will respawn within ~30s')
+    await tryRun('restart claude TUI', async () => {
+      await restartClaudeTUI()
+      await replyToTg('🔁 restarting channel-bot — tmux session killed + wrapper kickstarted. claude TUI back online ~25s.')
     })
     return true
   }
@@ -366,12 +389,12 @@ export async function handleControlSlash(
       return true
     }
     try {
-      await kickstartWrapper()
+      await restartClaudeTUI()
       await replyToTg(
-        `🔁 resuming claude TUI with session \`${targetId.slice(0, 8)}…\` — wrapper restart in progress, claude online ~25s.`,
+        `🔁 resuming claude TUI with session \`${targetId.slice(0, 8)}…\` — tmux killed + wrapper restarting. claude online ~25s with full history reloaded.`,
       )
     } catch (err) {
-      await replyToTg(`❌ kickstart failed: ${err instanceof Error ? err.message : err}\n\nrun \`launchctl kickstart -k gui/$(id -u)/${WRAPPER_LABEL}\` manually.`)
+      await replyToTg(`❌ restart failed: ${err instanceof Error ? err.message : err}\n\nrun \`tmux kill-session -t ${TMUX_SESSION} && launchctl kickstart -k gui/$(id -u)/${WRAPPER_LABEL}\` manually.`)
     }
     return true
   }
