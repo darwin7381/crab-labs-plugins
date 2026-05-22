@@ -28,7 +28,7 @@
  * this for an unauthenticated message.
  */
 
-import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
@@ -38,6 +38,8 @@ const TMUX_SESSION = process.env.CHANNEL_BOT_TMUX_SESSION ?? ''
 const PROJECTS_DIR = process.env.CHANNEL_BOT_PROJECTS_DIR ?? ''
 const WRAPPER_LABEL =
   process.env.CHANNEL_BOT_WRAPPER_LABEL ?? 'com.btai.channel-bot-wrapper'
+const RESUME_CHAIN_FILE =
+  process.env.CHANNEL_BOT_RESUME_CHAIN_FILE ?? '/tmp/channel-bot-resume-chain.json'
 // (CHANNEL_BOT_NEXT_ARGS_FILE was used in 1.1.0 to inject --resume on
 // wrapper restart. 1.2.0 inline-switches via the /resume picker instead,
 // so this is no longer needed. Wrapper script can still read it for other
@@ -251,6 +253,41 @@ async function resumePickerInlineSwitch(downCount: number): Promise<void> {
   await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Enter'])
 }
 
+// ---- /resume_previous chain (walk-back history) --------------------------
+//
+// Naive "previous = mtime-second-newest" causes ping-pong: after switching
+// A→B, mtime of B is now newest, A is second-newest, so next call goes
+// B→A. Forever.
+//
+// Chain semantics: track sessions visited via /resume_previous within a
+// single walk-back chain. Each call:
+//   1. If current matches chain[last] → still in chain; advance to next
+//      mtime-DESC session not yet visited.
+//   2. Otherwise (user did /resume <N>, sent a new message in a different
+//      session, etc.) → reset chain to [current].
+//
+// After K calls, chain.length = K+1; target picker index = chain.length-1
+// when picker re-sorts (because all K prior visits became newest mtimes
+// and now sit at picker indices 0..K-1).
+
+type ResumeChain = { ids: string[]; ts: number }
+
+function loadResumeChain(): ResumeChain {
+  try {
+    if (!existsSync(RESUME_CHAIN_FILE)) return { ids: [], ts: 0 }
+    const raw = readFileSync(RESUME_CHAIN_FILE, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed?.ids)) return { ids: [], ts: 0 }
+    return { ids: parsed.ids.filter((x: unknown) => typeof x === 'string'), ts: parsed.ts ?? 0 }
+  } catch { return { ids: [], ts: 0 } }
+}
+
+function saveResumeChain(chain: ResumeChain): void {
+  try {
+    writeFileSync(RESUME_CHAIN_FILE, JSON.stringify(chain), { mode: 0o644 })
+  } catch {}
+}
+
 // ---- daemon health (for /status) -----------------------------------------
 
 async function daemonStatus(httpPort: string): Promise<string> {
@@ -362,10 +399,19 @@ export async function handleControlSlash(
       return true
     }
     const cur = currentSessionId()
+    const curSession = sessions.find(s => s.id === cur) ?? sessions[0]
+    const curPreview = curSession.firstUserMessage ?? '(no preview)'
+    const chain = loadResumeChain()
+    const chainNote =
+      chain.ids.length > 1 && chain.ids[chain.ids.length - 1] === cur
+        ? `   walk-back chain depth: ${chain.ids.length} (next /resume_previous → step ${chain.ids.length + 1})`
+        : ''
     const lines = [
-      `claude TUI sessions (${sessions.length}, newest first — matches /resume picker):`,
-      '',
+      `📍 *current session*  \`${curSession.id}\``,
+      `   ${curPreview.slice(0, 80)}`,
     ]
+    if (chainNote) lines.push(chainNote)
+    lines.push('', `claude TUI sessions (${sessions.length}, newest first — matches /resume picker):`, '')
     sessions.forEach((s, i) => {
       const tag = s.id === cur ? '  ← current' : ''
       const updated = new Date(s.mtimeMs).toISOString().slice(0, 16)
@@ -382,12 +428,61 @@ export async function handleControlSlash(
     return true
   }
 
-  if (cmd === '/resume' || cmd === '/resume_previous') {
+  if (cmd === '/resume_previous') {
     if (!PROJECTS_DIR) {
       await replyToTg('CHANNEL_BOT_PROJECTS_DIR env var not set — cannot resume.')
       return true
     }
-    const sessions = listClaudeSessions(30)
+    const sessions = listClaudeSessions(50)
+    if (sessions.length < 2) {
+      await replyToTg(
+        sessions.length === 0
+          ? 'no claude TUI sessions found.'
+          : 'only one session exists — nothing to walk back to.',
+      )
+      return true
+    }
+    const cur = sessions[0].id  // picker top = mtime newest = current
+
+    // Chain semantics: if last chain entry == current, we're continuing the
+    // walk-back. Otherwise reset (user did /resume <N>, sent a new message,
+    // or some other action that moved us out of the chain).
+    const chain = loadResumeChain()
+    if (chain.ids[chain.ids.length - 1] !== cur) {
+      chain.ids = [cur]
+    }
+    // Pick the first session in mtime-DESC order that isn't already in chain.
+    const targetSession = sessions.find(s => !chain.ids.includes(s.id))
+    if (!targetSession) {
+      await replyToTg(
+        `walked back through all ${chain.ids.length} session(s) — no older history. use \`/resume_list\` to jump anywhere.`,
+      )
+      return true
+    }
+    // Picker re-sorts on each invocation; target's picker index equals
+    // chain.length because all chain.length prior visits now sit at the
+    // top of mtime-DESC order.
+    const targetPickerIdx = chain.ids.length
+    chain.ids.push(targetSession.id)
+    chain.ts = Date.now()
+
+    await tryRun('resume_previous (chain walk-back)', async () => {
+      await resumePickerInlineSwitch(targetPickerIdx)
+      saveResumeChain(chain)
+      const preview = targetSession.firstUserMessage?.slice(0, 50) ?? '(no preview)'
+      await replyToTg(
+        `↩️ walk-back step ${chain.ids.length - 1} → \`${targetSession.id.slice(0, 8)}…\`\n${preview}\n_(chain depth ${chain.ids.length}; \`/resume_previous\` again to go further back)_`,
+      )
+    })
+    return true
+  }
+
+  if (cmd === '/resume') {
+    if (!PROJECTS_DIR) {
+      await replyToTg('CHANNEL_BOT_PROJECTS_DIR env var not set — cannot resume.')
+      return true
+    }
+    const sessions = listClaudeSessions(50)
     if (sessions.length < 2) {
       await replyToTg(
         sessions.length === 0
@@ -396,53 +491,47 @@ export async function handleControlSlash(
       )
       return true
     }
-
-    let targetIdx = -1
-    if (cmd === '/resume_previous') {
-      // Picker shows current at index 0. "Previous" = index 1.
-      targetIdx = 1
-    } else {
-      if (!args) {
-        await replyToTg('usage: `/resume <number|session-id>` (see `/resume_list`) or `/resume_previous`.')
-        return true
-      }
-      if (/^\d+$/.test(args)) {
-        const i = parseInt(args, 10) - 1
-        if (i < 0 || i >= sessions.length) {
-          await replyToTg(`number out of range (1-${sessions.length}); use \`/resume_list\` to see ids.`)
-          return true
-        }
-        targetIdx = i
-      } else if (/^[0-9a-f-]{8,}$/i.test(args)) {
-        const matches = sessions
-          .map((s, i) => ({ s, i }))
-          .filter(({ s }) => s.id.startsWith(args.toLowerCase()))
-        if (matches.length === 0) {
-          await replyToTg(`no session matched prefix \`${args}\` — see \`/resume_list\``)
-          return true
-        }
-        if (matches.length > 1) {
-          await replyToTg(`prefix \`${args}\` ambiguous (matched ${matches.length}); use more chars or numeric index.`)
-          return true
-        }
-        targetIdx = matches[0].i
-      } else {
-        await replyToTg(`unrecognized session ref \`${args}\` — use number from /resume_list or a session-id prefix.`)
-        return true
-      }
+    if (!args) {
+      await replyToTg('usage: `/resume <number|session-id>` (see `/resume_list`) or `/resume_previous`.')
+      return true
     }
-
+    let targetIdx = -1
+    if (/^\d+$/.test(args)) {
+      const i = parseInt(args, 10) - 1
+      if (i < 0 || i >= sessions.length) {
+        await replyToTg(`number out of range (1-${sessions.length}); use \`/resume_list\` to see ids.`)
+        return true
+      }
+      targetIdx = i
+    } else if (/^[0-9a-f-]{8,}$/i.test(args)) {
+      const matches = sessions
+        .map((s, i) => ({ s, i }))
+        .filter(({ s }) => s.id.startsWith(args.toLowerCase()))
+      if (matches.length === 0) {
+        await replyToTg(`no session matched prefix \`${args}\` — see \`/resume_list\``)
+        return true
+      }
+      if (matches.length > 1) {
+        await replyToTg(`prefix \`${args}\` ambiguous (matched ${matches.length}); use more chars or numeric index.`)
+        return true
+      }
+      targetIdx = matches[0].i
+    } else {
+      await replyToTg(`unrecognized session ref \`${args}\` — use number from /resume_list or a session-id prefix.`)
+      return true
+    }
     if (targetIdx === 0) {
       await replyToTg('that is already the current session — nothing to do.')
       return true
     }
-
     const target = sessions[targetIdx]
     await tryRun('resume via picker (tmux inline-switch)', async () => {
       await resumePickerInlineSwitch(targetIdx)
+      // Explicit pick resets walk-back chain to start fresh from this session.
+      saveResumeChain({ ids: [target.id], ts: Date.now() })
       const preview = target.firstUserMessage?.slice(0, 50) ?? '(no preview)'
       await replyToTg(
-        `↩️ inline-switched to session #${targetIdx + 1} \`${target.id.slice(0, 8)}…\`\n${preview}\n_(same TUI process — no restart, no message loss)_`,
+        `↩️ inline-switched to session #${targetIdx + 1} \`${target.id.slice(0, 8)}…\`\n${preview}\n_(same TUI process — chain reset)_`,
       )
     })
     return true

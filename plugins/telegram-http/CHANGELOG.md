@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.1 — 2026-05-22
+
+### Fixed
+- **`/resume_previous` ping-pong bug** — 1.2.0 always went to "mtime-second-newest", so after switching A→B, the next call went B→A (mtime of B was now newest, A second-newest). Forever. Joey: 「resume previous 的邏輯…只會瘋狂的在倒數前兩個切換」.
+
+  New chain-walk semantics: state file `/tmp/channel-bot-resume-chain.json` tracks `{ids: [...], ts}`. Each `/resume_previous`:
+  1. If `chain[last] == currentSessionId` → still in chain; pick first mtime-DESC session NOT in chain → that's target. Target's picker index = `chain.length` (because all prior visits sit at picker indices 0..chain.length-1 after their mtime touches).
+  2. Otherwise (user did `/resume <N>`, sent a new message, etc.) → reset chain to `[current]` and proceed as step 1.
+
+  Result: `/resume_previous` walks back through history one step at a time, no ping-pong. After exhausting history, replies with "no older history; use /resume_list to jump anywhere".
+
+- **`/resume <N>` and `/resume <uuid>` reset chain** — explicit picks save chain as `[target]` so a subsequent `/resume_previous` walks back from there.
+
+- **`/resume_list` header** — now leads with `📍 current session  <full-uuid>` + preview text, plus chain depth note if user is mid walk-back. Per Joey: 「Resume list 打的時候不是第一行應該要先秀這是在哪個 session 嗎？」
+
+### Added
+- New env var `CHANNEL_BOT_RESUME_CHAIN_FILE` (default `/tmp/channel-bot-resume-chain.json`) for chain state persistence. /tmp keeps state across daemon restarts (within reboot).
+
+### Verified
+Simulated walk on workspace-telegram cwd (15 cli sessions):
+```
+step 0: cur=cc557b36 chain=[1]
+step 1: target=54a538c2 picker_idx=1
+step 2: target=62dd0ab1 picker_idx=2
+step 3: target=33844aaa picker_idx=3
+step 4: target=911a7999 picker_idx=4
+```
+
 ## 1.2.0 — 2026-05-22
 
 **`/resume` inline-switch via tmux picker navigation** — replaces 1.1.0's kill-tmux + wrapper-restart approach. Same TUI process (no pid change), no message loss, ~1.5s vs ~5-10s.
