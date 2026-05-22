@@ -14,11 +14,10 @@
  *         ↓
  *   handleControlSlash() — this file
  *     match against allowlist → dispatch:
- *       a. tmux send-keys (no restart, claude TUI alive)
- *       b. launchctl kickstart wrapper (graceful restart)
+ *       a. tmux send-keys for native claude slashes — incl. /resume picker
+ *          driven by Down + Enter for inline-switch (no restart, same pid)
+ *       b. launchctl kickstart wrapper (graceful claude restart)
  *       c. pkill -9 (force-kill stuck claude, wrapper respawns)
- *       d. write /tmp/channel-bot-next-args + kickstart wrapper (resume
- *          to specific session-id by relaunching with --resume <id>)
  *
  * Opt-in: requires CHANNEL_BOT_TMUX_SESSION env var. Without it, all
  * slash commands fall through to the normal claude-as-content forward
@@ -29,7 +28,7 @@
  * this for an unauthenticated message.
  */
 
-import { readdirSync, readFileSync, statSync, existsSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
@@ -39,8 +38,10 @@ const TMUX_SESSION = process.env.CHANNEL_BOT_TMUX_SESSION ?? ''
 const PROJECTS_DIR = process.env.CHANNEL_BOT_PROJECTS_DIR ?? ''
 const WRAPPER_LABEL =
   process.env.CHANNEL_BOT_WRAPPER_LABEL ?? 'com.btai.channel-bot-wrapper'
-const NEXT_ARGS_FILE =
-  process.env.CHANNEL_BOT_NEXT_ARGS_FILE ?? '/tmp/channel-bot-next-args'
+// (CHANNEL_BOT_NEXT_ARGS_FILE was used in 1.1.0 to inject --resume on
+// wrapper restart. 1.2.0 inline-switches via the /resume picker instead,
+// so this is no longer needed. Wrapper script can still read it for other
+// future overrides but daemon never writes to it.)
 
 /** Whether channel-bot control mode is enabled in this daemon. */
 export function isControlEnabled(): boolean {
@@ -148,9 +149,24 @@ type ClaudeSession = {
   id: string
   mtimeMs: number
   firstUserMessage?: string
+  entrypoint?: string
 }
 
-function listClaudeSessions(limit = 20): ClaudeSession[] {
+/**
+ * List claude sessions that match what claude TUI's `/resume` picker shows.
+ *
+ * Critical filter: `entrypoint === "cli"` only. Sessions created by
+ * `claude --print` / SDK headless calls have `entrypoint: "sdk-cli"`, and
+ * claude TUI's native picker hides them. We mirror that filter so our
+ * `/resume_list` numbering aligns 1:1 with the picker (= safe to drive the
+ * picker by Down-arrow count for inline-switch).
+ *
+ * For first-user-message preview: we DO include `<channel ...>` wrapped
+ * messages (they are the real user content for channel-bot deployments),
+ * stripped of their outer tag for readability. Only `<system>` framework
+ * injections are skipped.
+ */
+function listClaudeSessions(limit = 30): ClaudeSession[] {
   if (!PROJECTS_DIR || !existsSync(PROJECTS_DIR)) return []
   const out: ClaudeSession[] = []
   for (const name of readdirSync(PROJECTS_DIR)) {
@@ -161,44 +177,78 @@ function listClaudeSessions(limit = 20): ClaudeSession[] {
     if (!stat.isFile()) continue
     const id = name.replace(/\.jsonl$/, '')
     const session: ClaudeSession = { id, mtimeMs: stat.mtimeMs }
-    // Best-effort: read first 32 KiB and find the first user-message text.
     try {
       const chunk = readFileSync(full, 'utf8').slice(0, 32 * 1024)
       for (const line of chunk.split('\n')) {
         if (!line.startsWith('{')) continue
-        try {
-          const j = JSON.parse(line)
-          // claude jsonl varies: top-level may be {type, message, ...} or {role, content, ...}
+        let j
+        try { j = JSON.parse(line) } catch { continue }
+        if (!session.entrypoint && typeof j.entrypoint === 'string') {
+          session.entrypoint = j.entrypoint
+        }
+        if (!session.firstUserMessage) {
           const role = j.role ?? j.message?.role
-          if (role !== 'user') continue
-          const content = j.content ?? j.message?.content
-          let text = ''
-          if (typeof content === 'string') text = content
-          else if (Array.isArray(content)) {
-            for (const c of content) {
-              if (typeof c === 'string') { text += c; break }
-              if (c?.type === 'text' && typeof c.text === 'string') { text += c.text; break }
+          if (role === 'user') {
+            const content = j.content ?? j.message?.content
+            let text = ''
+            if (typeof content === 'string') text = content
+            else if (Array.isArray(content)) {
+              for (const c of content) {
+                if (typeof c === 'string') { text += c; break }
+                if (c?.type === 'text' && typeof c.text === 'string') { text += c.text; break }
+              }
+            }
+            text = text.trim()
+            if (text && !text.startsWith('<system')) {
+              const m = text.match(/^<channel\b[^>]*>([\s\S]*?)<\/channel>\s*$/)
+              if (m) text = m[1].trim()
+              session.firstUserMessage = text.slice(0, 100).replace(/\s+/g, ' ')
             }
           }
-          text = text.trim()
-          if (!text) continue
-          // Skip framework injection ("<channel>" wrappers / system prompts)
-          if (text.startsWith('<channel') || text.startsWith('<system')) continue
-          session.firstUserMessage = text.slice(0, 100).replace(/\n/g, ' ')
-          break
-        } catch {}
+        }
+        if (session.entrypoint && session.firstUserMessage) break
       }
     } catch {}
     out.push(session)
   }
-  out.sort((a, b) => b.mtimeMs - a.mtimeMs)
-  return out.slice(0, limit)
+  // Match claude TUI picker: only entrypoint=cli interactive sessions visible.
+  const filtered = out.filter(s => s.entrypoint === 'cli')
+  filtered.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return filtered.slice(0, limit)
 }
 
 /** "Current" session: the .jsonl most recently modified (= the running claude TUI's session). */
 function currentSessionId(): string | null {
   const sessions = listClaudeSessions(1)
   return sessions[0]?.id ?? null
+}
+
+/**
+ * Drive claude TUI's /resume picker via tmux send-keys to inline-switch
+ * (no process restart). Approach:
+ *
+ *   1. Send `/resume` to open picker
+ *   2. Wait for picker render
+ *   3. Press Down N times (picker starts highlighted on index 0 = current)
+ *   4. Press Enter to confirm
+ *
+ * Reliability requires our session list ordering to match claude picker's
+ * exactly — that's why listClaudeSessions filters by `entrypoint === "cli"`
+ * (same as picker) and sorts by mtime DESC (same as picker).
+ *
+ * Same-pid inline-switch verified 2026-05-22 in claude-tui-test env
+ * (pid 31042 → 31042 across switch). Daemon's MCP transport remains
+ * connected; in-flight messages don't drop.
+ */
+async function resumePickerInlineSwitch(downCount: number): Promise<void> {
+  await tmuxSendKeys('/resume')
+  await new Promise(r => setTimeout(r, 1500))  // picker render
+  for (let i = 0; i < downCount; i++) {
+    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Down'])
+    await new Promise(r => setTimeout(r, 100))
+  }
+  await new Promise(r => setTimeout(r, 200))
+  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Enter'])
 }
 
 // ---- daemon health (for /status) -----------------------------------------
@@ -300,38 +350,34 @@ export async function handleControlSlash(
     return true
   }
 
-  // ---- Phase 3: session resume (writes args file + kickstart) -----------
+  // ---- Phase 3: session resume (tmux picker inline-switch, no restart) --
   if (cmd === '/resume_list' || cmd === '/sessions' || cmd === '/list') {
     if (!PROJECTS_DIR) {
       await replyToTg('CHANNEL_BOT_PROJECTS_DIR env var not set — cannot list claude sessions.')
       return true
     }
-    // Pull 30 so we still have plenty after filtering out empty sessions.
-    const allSessions = listClaudeSessions(30)
-    // Filter out sessions with no first-user message (claude opens these
-    // for brief inspections that never get a prompt — they're noise).
-    const sessions = allSessions
-      .filter(s => s.firstUserMessage && s.firstUserMessage.length > 0)
-      .slice(0, 15)
+    const sessions = listClaudeSessions(15)
     if (sessions.length === 0) {
-      const skipped = allSessions.length
-      await replyToTg(
-        `no claude sessions with user messages found${skipped > 0 ? ` (${skipped} empty session(s) skipped)` : ''}.`,
-      )
+      await replyToTg('no claude TUI sessions in project dir (entrypoint=cli).')
       return true
     }
     const cur = currentSessionId()
-    const lines = [`claude TUI sessions (${sessions.length} shown, newest first; empty skipped):`, '']
+    const lines = [
+      `claude TUI sessions (${sessions.length}, newest first — matches /resume picker):`,
+      '',
+    ]
     sessions.forEach((s, i) => {
       const tag = s.id === cur ? '  ← current' : ''
       const updated = new Date(s.mtimeMs).toISOString().slice(0, 16)
-      const title = s.firstUserMessage ?? '(no user message)'
-      // Two-line format: header with number + title + timestamp; full
-      // UUID on its own line so it's selectable for copy-paste from TG.
+      const title = s.firstUserMessage ?? '(no preview)'
       lines.push(`${i + 1}. ${updated}  ${title.slice(0, 60)}${tag}`)
       lines.push(`   \`${s.id}\``)
     })
-    lines.push('', 'use `/resume <number>` (e.g. `/resume 2`), `/resume <session-id>`, or `/resume_previous`.')
+    lines.push(
+      '',
+      'use `/resume <number>` (e.g. `/resume 2`), `/resume <session-id>`, or `/resume_previous`.',
+      '_(inline-switch via picker — no restart, no message loss)_',
+    )
     await replyToTg(lines.join('\n'))
     return true
   }
@@ -341,82 +387,64 @@ export async function handleControlSlash(
       await replyToTg('CHANNEL_BOT_PROJECTS_DIR env var not set — cannot resume.')
       return true
     }
-    const allSessions = listClaudeSessions(30)
-    // Apply the same empty-session filter — /resume_previous would
-    // otherwise hop to an empty inspection session, which is useless
-    // (claude has nothing to reload). For /resume by id/number we
-    // also filter, but lookup still includes raw matches for users who
-    // explicitly typed a session-id we filtered out.
-    const sessions = allSessions.filter(s => s.firstUserMessage && s.firstUserMessage.length > 0)
-    if (sessions.length === 0) {
+    const sessions = listClaudeSessions(30)
+    if (sessions.length < 2) {
       await replyToTg(
-        `no claude sessions with user messages found${allSessions.length > 0 ? ` (${allSessions.length} empty session(s) skipped)` : ''}.`,
+        sessions.length === 0
+          ? 'no claude TUI sessions found.'
+          : 'only one session exists — nothing to switch to.',
       )
       return true
     }
-    const cur = currentSessionId()
 
-    let targetId: string | null = null
+    let targetIdx = -1
     if (cmd === '/resume_previous') {
-      // Find most-recent session that isn't current AND has actual content.
-      const candidate = sessions.find(s => s.id !== cur)
-      if (!candidate) {
-        await replyToTg('only one session with messages exists, or you are already at the most recent. use `/resume_list` to pick.')
-        return true
-      }
-      targetId = candidate.id
+      // Picker shows current at index 0. "Previous" = index 1.
+      targetIdx = 1
     } else {
       if (!args) {
-        await replyToTg(
-          'usage: `/resume <number|session-id>` (see `/resume_list`) or `/resume_previous`.',
-        )
+        await replyToTg('usage: `/resume <number|session-id>` (see `/resume_list`) or `/resume_previous`.')
         return true
       }
       if (/^\d+$/.test(args)) {
-        const idx = parseInt(args, 10) - 1
-        if (idx < 0 || idx >= sessions.length) {
+        const i = parseInt(args, 10) - 1
+        if (i < 0 || i >= sessions.length) {
           await replyToTg(`number out of range (1-${sessions.length}); use \`/resume_list\` to see ids.`)
           return true
         }
-        targetId = sessions[idx].id
+        targetIdx = i
       } else if (/^[0-9a-f-]{8,}$/i.test(args)) {
-        // Looks like a session UUID prefix — find unique match.
-        const matches = sessions.filter(s => s.id.startsWith(args.toLowerCase()))
+        const matches = sessions
+          .map((s, i) => ({ s, i }))
+          .filter(({ s }) => s.id.startsWith(args.toLowerCase()))
         if (matches.length === 0) {
           await replyToTg(`no session matched prefix \`${args}\` — see \`/resume_list\``)
           return true
         }
         if (matches.length > 1) {
-          await replyToTg(`prefix \`${args}\` ambiguous (matched ${matches.length}); use more characters or numeric index.`)
+          await replyToTg(`prefix \`${args}\` ambiguous (matched ${matches.length}); use more chars or numeric index.`)
           return true
         }
-        targetId = matches[0].id
+        targetIdx = matches[0].i
       } else {
         await replyToTg(`unrecognized session ref \`${args}\` — use number from /resume_list or a session-id prefix.`)
         return true
       }
     }
 
-    if (!targetId) {
-      await replyToTg('(internal error: target resolution failed)')
+    if (targetIdx === 0) {
+      await replyToTg('that is already the current session — nothing to do.')
       return true
     }
 
-    // Write the wrapper's next-args override + kickstart.
-    try {
-      writeFileSync(NEXT_ARGS_FILE, `--resume ${targetId}\n`, { mode: 0o644 })
-    } catch (err) {
-      await replyToTg(`❌ failed to write ${NEXT_ARGS_FILE}: ${err instanceof Error ? err.message : err}`)
-      return true
-    }
-    try {
-      await restartClaudeTUI()
+    const target = sessions[targetIdx]
+    await tryRun('resume via picker (tmux inline-switch)', async () => {
+      await resumePickerInlineSwitch(targetIdx)
+      const preview = target.firstUserMessage?.slice(0, 50) ?? '(no preview)'
       await replyToTg(
-        `🔁 resuming claude TUI with session \`${targetId.slice(0, 8)}…\` — tmux killed + wrapper restarting. claude online ~25s with full history reloaded.`,
+        `↩️ inline-switched to session #${targetIdx + 1} \`${target.id.slice(0, 8)}…\`\n${preview}\n_(same TUI process — no restart, no message loss)_`,
       )
-    } catch (err) {
-      await replyToTg(`❌ restart failed: ${err instanceof Error ? err.message : err}\n\nrun \`tmux kill-session -t ${TMUX_SESSION} && launchctl kickstart -k gui/$(id -u)/${WRAPPER_LABEL}\` manually.`)
-    }
+    })
     return true
   }
 
