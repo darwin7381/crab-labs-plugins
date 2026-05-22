@@ -193,6 +193,100 @@ claude TUI pid: 67890
 
 ---
 
+## 5.5 How Telegram's slash autocomplete is populated
+
+When you type `/` in a chat with the bot, Telegram shows an autocomplete
+menu. This menu is **registered by the bot itself** via Telegram's
+[`setMyCommands`](https://core.telegram.org/bots/api#setmycommands) Bot API
+call — the daemon does this automatically on boot:
+
+```ts
+// server.ts onStart callback, condensed
+const baseCommands = [
+  { command: 'start',  description: 'Welcome and setup guide' },
+  { command: 'help',   description: 'What this bot can do' },
+  { command: 'status', description: 'Check your pairing status' },
+]
+const controlCommands = controlCommandsForBotApi()
+//   12 items: clear, model, effort, agents, mcp, sigint, restart,
+//   kill_stuck, status, resume_list, resume, resume_previous
+//   (returns [] if CHANNEL_BOT_TMUX_SESSION not set)
+
+// Dedupe — control 'status' overrides baseline 'status' (richer description).
+const merged = [...baseCommands]
+for (const c of controlCommands) {
+  const idx = merged.findIndex(b => b.command === c.command)
+  if (idx >= 0) merged[idx] = c
+  else merged.push(c)
+}
+
+// ⭐ Critical: register to BOTH scopes
+bot.api.setMyCommands(merged)
+bot.api.setMyCommands(merged, { scope: { type: 'all_private_chats' } })
+```
+
+### Why dual-scope is required (BotFather placeholder gotcha)
+
+Telegram's `setMyCommands` supports multiple **scopes**: `default`,
+`all_private_chats`, `chat_member`, `chat_administrators`, etc. Resolution
+order: **specific scope wins over general**.
+
+If you (or any previous owner of the bot) ever ran `/setcommands` in
+[@BotFather](https://t.me/BotFather), even just dismissing the prompt with
+a placeholder, BotFather writes those commands to the **`all_private_chats`
+scope**. In a DM, Telegram shows that scope's commands and ignores our
+`default` scope entirely.
+
+**Symptom**: you type `/` in DM with the bot and see an old/wrong/empty
+menu. Our commands are in `default`, but `all_private_chats` overrides.
+
+**Fix**: register the SAME list to BOTH scopes on boot. This is what the
+daemon does (the two `setMyCommands` calls above). After daemon restart,
+the autocomplete updates within seconds.
+
+### Telegram setMyCommands limits
+
+- **Command name**: 1-32 chars, only lowercase `a-z`, digits `0-9`, and `_`
+  (no hyphens — that's why it's `/kill_stuck` not `/kill-stuck`)
+- **Description**: 3-256 chars
+- **Max commands per scope**: 100
+- **Scopes are independent** — modifying one doesn't affect others, so the
+  dual-write above is necessary every time you change the command list.
+
+### Verifying what's actually registered
+
+```bash
+TOKEN=$(grep TELEGRAM_BOT_TOKEN ~/.claude/channels/telegram/.env | cut -d= -f2)
+
+# Default scope
+curl -s "https://api.telegram.org/bot$TOKEN/getMyCommands" | jq
+
+# DM scope (the one users actually see in private chats)
+curl -s "https://api.telegram.org/bot$TOKEN/getMyCommands?scope=%7B%22type%22%3A%22all_private_chats%22%7D" | jq
+```
+
+Both should return the merged baseline + control list. If they differ,
+the daemon hasn't rebooted since you changed the command list (or one
+`setMyCommands` call failed silently — check daemon log for grammy errors).
+
+### Adding a new slash command
+
+To wire up a new slash command end-to-end:
+
+1. **`channel-bot-control.ts`** — add a new branch in `handleControlSlash`
+   that pattern-matches the command and executes the side-effect (tmux,
+   launchctl, fs, whatever)
+2. **`controlCommandsForBotApi()` in the same file** — append
+   `{ command: 'newcmd', description: '...' }` so it shows up in
+   Telegram's autocomplete
+3. **Restart the daemon** — `launchctl kickstart -k gui/$(id -u)/com.user.telegram-daemon.channel`. The next `onStart` re-calls `setMyCommands` with the new list.
+
+No DiscordJS slash-command analog is wired up yet; see the discord-http
+plugin's separate registration path (which uses Discord's `application
+commands` API).
+
+---
+
 ## 6. Smoke-test the control plane
 
 From Telegram:
