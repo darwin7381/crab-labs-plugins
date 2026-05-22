@@ -306,20 +306,32 @@ export async function handleControlSlash(
       await replyToTg('CHANNEL_BOT_PROJECTS_DIR env var not set — cannot list claude sessions.')
       return true
     }
-    const sessions = listClaudeSessions(15)
+    // Pull 30 so we still have plenty after filtering out empty sessions.
+    const allSessions = listClaudeSessions(30)
+    // Filter out sessions with no first-user message (claude opens these
+    // for brief inspections that never get a prompt — they're noise).
+    const sessions = allSessions
+      .filter(s => s.firstUserMessage && s.firstUserMessage.length > 0)
+      .slice(0, 15)
     if (sessions.length === 0) {
-      await replyToTg(`no claude sessions found in \`${PROJECTS_DIR}\``)
+      const skipped = allSessions.length
+      await replyToTg(
+        `no claude sessions with user messages found${skipped > 0 ? ` (${skipped} empty session(s) skipped)` : ''}.`,
+      )
       return true
     }
     const cur = currentSessionId()
-    const lines = [`claude TUI sessions (${sessions.length} shown, newest first):`, '']
+    const lines = [`claude TUI sessions (${sessions.length} shown, newest first; empty skipped):`, '']
     sessions.forEach((s, i) => {
       const tag = s.id === cur ? '  ← current' : ''
       const updated = new Date(s.mtimeMs).toISOString().slice(0, 16)
-      const title = s.firstUserMessage ?? '(no user message yet)'
-      lines.push(`${i + 1}. \`${s.id.slice(0, 8)}…\` ${updated}  ${title}${tag}`)
+      const title = s.firstUserMessage ?? '(no user message)'
+      // Two-line format: header with number + title + timestamp; full
+      // UUID on its own line so it's selectable for copy-paste from TG.
+      lines.push(`${i + 1}. ${updated}  ${title.slice(0, 60)}${tag}`)
+      lines.push(`   \`${s.id}\``)
     })
-    lines.push('', 'use `/resume <number>` (e.g. `/resume 2`) or `/resume_previous`.')
+    lines.push('', 'use `/resume <number>` (e.g. `/resume 2`), `/resume <session-id>`, or `/resume_previous`.')
     await replyToTg(lines.join('\n'))
     return true
   }
@@ -329,18 +341,27 @@ export async function handleControlSlash(
       await replyToTg('CHANNEL_BOT_PROJECTS_DIR env var not set — cannot resume.')
       return true
     }
-    const sessions = listClaudeSessions(20)
+    const allSessions = listClaudeSessions(30)
+    // Apply the same empty-session filter — /resume_previous would
+    // otherwise hop to an empty inspection session, which is useless
+    // (claude has nothing to reload). For /resume by id/number we
+    // also filter, but lookup still includes raw matches for users who
+    // explicitly typed a session-id we filtered out.
+    const sessions = allSessions.filter(s => s.firstUserMessage && s.firstUserMessage.length > 0)
     if (sessions.length === 0) {
-      await replyToTg('no claude sessions found.')
+      await replyToTg(
+        `no claude sessions with user messages found${allSessions.length > 0 ? ` (${allSessions.length} empty session(s) skipped)` : ''}.`,
+      )
       return true
     }
     const cur = currentSessionId()
 
     let targetId: string | null = null
     if (cmd === '/resume_previous') {
+      // Find most-recent session that isn't current AND has actual content.
       const candidate = sessions.find(s => s.id !== cur)
       if (!candidate) {
-        await replyToTg('only one session exists / you are already at the most recent. use `/resume_list` to pick.')
+        await replyToTg('only one session with messages exists, or you are already at the most recent. use `/resume_list` to pick.')
         return true
       }
       targetId = candidate.id
