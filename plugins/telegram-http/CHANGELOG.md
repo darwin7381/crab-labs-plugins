@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.1.0 — 2026-05-22
+
+**Channel-bot TUI control plane** — new feature. Opt-in via `CHANNEL_BOT_TMUX_SESSION` env var. When enabled, the daemon intercepts a curated set of slash commands before forwarding them as ordinary chat content to claude TUI. The handlers run side-effects directly against the channel-bot deployment:
+
+- **tmux send-keys** (claude TUI alive, no restart needed):
+  - `/clear` `/help` `/agents` `/mcp` — send claude's native slash directly
+  - `/model <name>` — switch model via claude's native /model
+  - `/effort <low|med|high|max>` — switch effort via claude's native /effort
+  - `/sigint` — send Ctrl+C, interrupt current turn
+
+- **system control** (launchctl / pkill):
+  - `/restart` — `launchctl kickstart -k <wrapper>`, claude TUI restarts ~30s
+  - `/kill_stuck` — `pkill -9` against claude TUI matching our channels flag; wrapper respawns
+  - `/status` — show daemon healthz + claude TUI pid
+
+- **session resume** (writes args-override file + kickstarts wrapper):
+  - `/resume_list` — scan `$CHANNEL_BOT_PROJECTS_DIR` for `*.jsonl`, output numbered list with first-user-message preview
+  - `/resume <number|session-id-prefix>` — resolve to full id, write `--resume <id>` to `$CHANNEL_BOT_NEXT_ARGS_FILE`, kickstart wrapper. The wrapper script reads the file on next start and appends to CLAUDE_CMD.
+  - `/resume_previous` — find most-recent session that ISN'T the current one (skip current), then same flow
+
+The control commands are registered with Telegram's setMyCommands (both `default` and `all_private_chats` scopes) so they show up in the `/` autocomplete menu.
+
+### Required environment variables (opt-in)
+
+| Var | Example | Purpose |
+|---|---|---|
+| `CHANNEL_BOT_TMUX_SESSION` | `Agent-Son-Claude-Telegram-Channel` | tmux session name where claude TUI runs (enables the feature when set) |
+| `CHANNEL_BOT_PROJECTS_DIR` | `/Users/btai/.claude/projects/-Users-btai--claude-workspace-telegram` | claude's project dir for session listing |
+| `CHANNEL_BOT_WRAPPER_LABEL` | `com.btai.channel-bot-wrapper` | launchd label for kickstart-style restart |
+| `CHANNEL_BOT_NEXT_ARGS_FILE` | `/tmp/channel-bot-next-args` | file the wrapper reads to inject `--resume <id>` on next start |
+
+### Required wrapper integration (for /resume to work)
+
+The wrapper script that launches claude TUI must support reading the next-args file:
+
+```sh
+NEXT_ARGS_FILE="/tmp/channel-bot-next-args"
+build_claude_cmd() {
+  local extra=""
+  if [ -f "$NEXT_ARGS_FILE" ]; then
+    extra=$(<"$NEXT_ARGS_FILE")
+    mv "$NEXT_ARGS_FILE" "$NEXT_ARGS_FILE.used.$(date +%s)" 2>/dev/null || rm -f "$NEXT_ARGS_FILE"
+  fi
+  CLAUDE_CMD="... $CLAUDE_BIN --channels ... $extra"
+}
+```
+
+Example wrapper in `~/.claude/workspace-telegram/scripts/restore-channel-bot.sh`.
+
+### Security note
+
+Slash interception runs AFTER the existing gate()/allowFrom authentication. Non-allowlisted senders never reach this code.
+
+### Why
+Joey asked: can we drive claude TUI from Telegram? Previously the user had to SSH into the Mac mini and attach tmux to type `/clear` `/resume` etc. in claude TUI directly. With this feature, all those operations work straight from TG DM. Particularly useful for `/restart` when claude TUI gets stuck — recovery is now possible without physical access.
+
 ## 1.0.2 — 2026-05-22
 
 Dead-transport detection patch. Counters claude-code 2.1.141~2.1.148 silent HTTP MCP transport drop regression — bot inbound silently stops arriving in claude TUI ~1 hour after claude restart, even though docs ([Claude Code MCP docs](https://code.claude.com/docs/en/mcp#automatic-reconnection)) promise 5-attempt exponential backoff auto-reconnect. In practice the transport gives up silently; verified via upstream issues [#21721](https://github.com/anthropics/claude-code/issues/21721) ("MCP HTTP transport fails after ~89 minutes without automatic reconnection"), [#60061](https://github.com/anthropics/claude-code/issues/60061) ("Claude Code 2.1.143 silently hangs MCP tool calls after SSE drop"), [#59956](https://github.com/anthropics/claude-code/issues/59956), [#36308](https://github.com/anthropics/claude-code/issues/36308), [#43177](https://github.com/anthropics/claude-code/issues/43177).
