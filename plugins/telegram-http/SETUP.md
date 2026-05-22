@@ -713,8 +713,10 @@ claude 看到這些 tool 被 deny 就會 fallback 成 text question（直接在�
 - 設計文件：[ARCHITECTURE.md](./ARCHITECTURE.md)
 - 變更紀錄：[CHANGELOG.md](./CHANGELOG.md)
 - Access 管理：[ACCESS.md](./ACCESS.md)
+- **🤖 進階：channel-bot TUI 控制台（1.1.0+）：[ADVANCED-SETUP.md](./ADVANCED-SETUP.md)** — 把 Telegram 變成你 claude TUI 的鍵盤（`/clear`、`/resume`、`/restart`、`/model` 等指令直接從手機操控）
 - 2026-05-14 事故報告（兩個 bug 修復全紀錄）：[HedgeDoc](https://md.blocktempo.ai/TFkYzCibQheCDaV2fyoaBg)
 - Route B HTTP daemon 改造記錄：[HedgeDoc](https://md.blocktempo.ai/B_MVqPMbQsyLLxo7oGnTdg)
 - Switchover SOP：[HedgeDoc](https://md.blocktempo.ai/StFH9rUCT2OmGW5T2EM61g)
+- 2026-05-22 TUI control plane 範式：[HedgeDoc](https://md.blocktempo.ai/cy8iIB95QPqgrBqI480kKg)
 
 License: Apache-2.0
