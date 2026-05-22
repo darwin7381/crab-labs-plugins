@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.2 — 2026-05-22
+
+Dead-transport detection patch. Counters claude-code 2.1.141~2.1.148 silent HTTP MCP transport drop regression — bot inbound silently stops arriving in claude TUI ~1 hour after claude restart, even though docs ([Claude Code MCP docs](https://code.claude.com/docs/en/mcp#automatic-reconnection)) promise 5-attempt exponential backoff auto-reconnect. In practice the transport gives up silently; verified via upstream issues [#21721](https://github.com/anthropics/claude-code/issues/21721) ("MCP HTTP transport fails after ~89 minutes without automatic reconnection"), [#60061](https://github.com/anthropics/claude-code/issues/60061) ("Claude Code 2.1.143 silently hangs MCP tool calls after SSE drop"), [#59956](https://github.com/anthropics/claude-code/issues/59956), [#36308](https://github.com/anthropics/claude-code/issues/36308), [#43177](https://github.com/anthropics/claude-code/issues/43177).
+
+### Added
+
+- **TCP socket keepalive on SSE GET handler** — `req.socket.setKeepAlive(true, 30000)` triggers kernel-level probes every 30s (vs macOS default ~2h). Detects dead peers in 30-90s.
+- **Application-level SSE keepalive comments** — `setInterval` writes `: keepalive <ts>\n\n` every 30s. SSE parsers ignore comment lines (RFC 6202) but the write exercises the socket end-to-end. If write fails (back-pressured buffer hit, socket destroyed), the daemon:
+  1. Marks the session `sseOpen=false`
+  2. Clears the keepalive timer
+  3. Force-destroys the socket → Node fires `res.close` → SDK fires `transport.onclose` → full session cleanup (registry slot removed, no more zombie accumulation)
+- **`res.once('close', ...)` defensive cleanup** — extra belt-and-suspenders to clear the keepalive timer if Node fires close before our explicit `finally`.
+
+### Why
+Symptom observed 2026-05-22 on @Sonn_Claude_bot channel-bot:
+- Daemon's `active_sessions` accumulated to **2269 zombies** (every prior claude TUI restart left a dead session); broadcasts logged `queued for session ... SSE not yet open, queue=N` for thousands of dead sessions.
+- New TG messages reached daemon (`last_update_id` incremented) but never appeared in claude TUI's `<channel>` tag.
+- `lsof -p <claude_pid> -i :17631` showed **zero ESTABLISHED** despite `--channels plugin:telegram-http@crab-labs-plugins` flag still set and claude process alive — confirms client-side TCP died silently per #60061.
+
+Post-patch verification: daemon restart wiped 2269 zombies, claude TUI restart re-handshaked, inbound messages now arrive in `<channel source="plugin:telegram-http:telegram-http">` tags within seconds.
+
+### Compatibility
+Backward-compatible with all MCP client versions. The SSE comment lines are part of the W3C EventSource spec; any conformant SSE client ignores them. No protocol-level changes.
+
 ## 1.0.1 — 2026-05-14
 
 Compatibility + docs release. No daemon code changes.

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.2 — 2026-05-22
+
+Dead-transport detection patch. Same architecture and rationale as [telegram-http 1.0.2](../telegram-http/CHANGELOG.md). Counters claude-code 2.1.141~2.1.148 silent HTTP MCP transport drop regression that leaves the daemon broadcasting forever to silently-dead claude TUI sessions.
+
+### Added
+
+- **TCP socket keepalive on SSE GET handler** — kernel probes every 30s.
+- **Application-level SSE keepalive comments** — `: keepalive <ts>\n\n` every 30s; on write failure the daemon marks the session dead, destroys the socket, and lets the SDK clean up.
+- **`res.once('close', ...)` defensive cleanup** — clears the keepalive timer if Node closes the response before our `finally`.
+
+### Verified concurrently with telegram-http 1.0.2
+
+Both daemons observed accumulating thousands of zombie sessions (Discord daemon had **2332** at the time of the patch). Discord daemon restart wiped them; post-patch new claude TUI re-handshaked and inbound channel messages flow normally.
+
 ## 1.0.1 — 2026-05-14
 
 Compatibility + docs release. No daemon code changes.

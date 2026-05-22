@@ -237,4 +237,65 @@ Cheap, unauthenticated; relies on `127.0.0.1` bind for security.
 | `STATE_DIR ... is locked by live pid=` | Another daemon already running for this STATE_DIR. Don't double-launch. |
 | `no active session — persisting to inbox/pending` | claude TUI is down. Wrapper should restart it. |
 | `disk-replayed N` after every claude restart | Replay queue working as intended. |
-| Memory growing without bound | session accumulation (zombie sessions from claude's 5min reconnect). Currently no in-daemon cleanup — restart daemon if RSS > 500MB. |
+| Memory growing without bound | session accumulation (zombie sessions from claude's 5min reconnect). Mostly self-limiting in 1.0.2+ thanks to dead-transport detection; if still growing, restart daemon. |
+| `SSE keepalive write failed for ... — marking dead` | Working as intended (1.0.2+). The patch caught a dead client; session entry will be cleaned up by SDK's `transport.onclose`. |
+
+## Dead-transport detection (1.0.2+)
+
+Counters a claude-code binary regression (2.1.141 through at least 2.1.148) where the HTTP MCP transport silently stops without sending FIN/RST when the kernel can't reach the server end. The official docs ([Automatic reconnection](https://code.claude.com/docs/en/mcp#automatic-reconnection)) promise 5-attempt exponential backoff reconnect; in practice the transport gives up silently after a short burst and never re-handshakes. See upstream issues [#21721](https://github.com/anthropics/claude-code/issues/21721), [#60061](https://github.com/anthropics/claude-code/issues/60061), [#59956](https://github.com/anthropics/claude-code/issues/59956), [#36308](https://github.com/anthropics/claude-code/issues/36308), [#43177](https://github.com/anthropics/claude-code/issues/43177) for the public symptom thread.
+
+### What goes wrong without the patch
+
+```
+   claude TUI 2.1.148                         daemon (this plugin)
+   ─────────────────                          ────────────────────
+   POST /mcp (init)         ────────────►     creates session UUID, transports.set()
+                            ◄────────────     sessionId in header
+   GET /mcp (SSE GET)       ────────────►     sseOpen.set(id, true)
+                                              await reqPromise  ← blocks forever
+   ...messages flow ok...
+
+   (some hours later, transient TCP blip)
+   ───── client TCP dies silently, no FIN sent ─────
+                                              (daemon's req object still "alive")
+                                              await reqPromise still blocked
+                                              broadcastNotification → server.notification(...)
+                                                writes to dead socket → buffered in kernel
+                                                until kernel detects timeout (~2h on macOS default)
+                                              sessions Map keeps growing forever
+```
+
+Symptom users see:
+- `daemon.active_sessions` grows monotonically; we observed **2269** zombies on a 1-week-old daemon.
+- Daemon's `last_update_id` keeps incrementing (bot polling is independent — that's healthy) but new TG/Discord messages never appear in claude TUI's `<channel>` tags.
+- `lsof -p <claude_pid> -iTCP:$PORT` shows **zero ESTABLISHED** despite claude process being alive and `/mcp` showing the server as connected.
+
+### What the patch adds
+
+Two independent layers, both inside the `GET /mcp` SSE request handler:
+
+**1. TCP socket keepalive.** Before starting `transport.handleRequest`, the daemon calls:
+```ts
+req.socket?.setKeepAlive(true, 30000)
+req.socket?.setTimeout(0)
+```
+This switches the underlying TCP socket to active keepalive mode with 30s probes (vs the macOS default of ~2 hours). When the client end dies silently, the OS detects the dead peer within ~30-90s and closes the socket; Node fires `'close'` on `req`/`res`; the MCP SDK fires `transport.onclose`; the existing cleanup code (`transports.delete`, `sseOpen.delete`, `memQueue.delete`) runs.
+
+**2. Application-level SSE comment keepalive.** A `setInterval` writes `: keepalive <ts>\n\n` to the response every 30 seconds. SSE parsers ignore comment lines (RFC 6202 §6.1) so this is a no-op for any conformant client, but the write exercises the socket end-to-end. If the write fails — because the response stream was destroyed, or because the kernel's TX buffer is back-pressured (a common symptom when the peer stopped ACK'ing) — the handler:
+
+```ts
+log('info', `SSE keepalive write failed for ${sessionId} — marking dead and forcing close: ...`)
+sseOpen.set(sessionId, false)
+clearInterval(keepaliveTimer)
+try { req.socket?.destroy() } catch {}
+```
+
+`socket.destroy()` is the fastest way to force Node to emit `'close'` on the response, which triggers the same cleanup path. Defensive: a `res.once('close', ...)` handler also clears the timer if Node closes the response before our `finally` block runs (e.g. the SDK closes the stream from inside `handleRequest`).
+
+### Why this is a fix, not a workaround
+
+The patch doesn't change the wire protocol or the MCP semantics — it adjusts socket-level liveness detection on the server side, which is where it belongs. SSE comment lines are a documented part of the spec (originally designed for exactly this purpose). When upstream claude-code fixes the client-side reconnect (issue #60061 et al.), the patch becomes a no-op: claude will re-handshake on its own, and the daemon's keepalive won't ever observe a failed write.
+
+### When 5 supervisor TUIs and 1 channel-bot share one daemon source
+
+All 6 telegram-http daemons in the canonical Mac mini layout run from the same `marketplaces/crab-labs-plugins/plugins/telegram-http/server.ts` source file (different env vars supply token + state dir + port). Editing the source affects all 6 the next time each restarts; a daemon already in memory keeps its old code until kickstart. The patch is backward-safe: daemons running the old code continue to work; daemons running the new code gain dead-transport detection.
