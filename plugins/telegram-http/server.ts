@@ -23,6 +23,11 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
+import {
+  handleControlSlash,
+  isControlEnabled,
+  controlCommandsForBotApi,
+} from './channel-bot-control.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1149,6 +1154,29 @@ async function handleInbound(
       .catch(() => {})
   }
 
+  // Channel-bot TUI control plane (opt-in via CHANNEL_BOT_TMUX_SESSION env).
+  // Intercepts slash commands like /clear /restart /resume_list /resume <id>
+  // and acts on the claude TUI directly (tmux send-keys / launchctl /
+  // pkill / wrapper-args-file + restart) — instead of forwarding the slash
+  // to claude as ordinary chat content.
+  if (isControlEnabled()) {
+    const handled = await handleControlSlash(
+      text,
+      String(HTTP_PORT),
+      async (msg: string) => {
+        try {
+          await bot.api.sendMessage(chat_id, msg)
+        } catch (err) {
+          log('warn', `channel-bot-control reply failed: ${err instanceof Error ? err.message : err}`)
+        }
+      },
+    )
+    if (handled) {
+      log('info', `channel-bot-control handled slash: ${text.slice(0, 60)}`)
+      return
+    }
+  }
+
   const imagePath = downloadImage ? await downloadImage() : undefined
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
@@ -1239,14 +1267,30 @@ async function pollLoop(): Promise<void> {
           attempt = 0
           botUsername = info.username
           log('info', `polling as @${info.username}`)
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
+          // Baseline commands (everyone gets these). Channel-bot mode
+          // appends the TUI-control commands so /resume_list, /restart,
+          // etc. appear in Telegram's autocomplete.
+          const baseCommands = [
+            { command: 'start', description: 'Welcome and setup guide' },
+            { command: 'help', description: 'What this bot can do' },
+            { command: 'status', description: 'Check your pairing status' },
+          ]
+          const controlCommands = controlCommandsForBotApi()
+          // De-dupe: control list may also contain 'status' (overrides baseline).
+          const merged = [...baseCommands]
+          for (const c of controlCommands) {
+            const idx = merged.findIndex(b => b.command === c.command)
+            if (idx >= 0) merged[idx] = c
+            else merged.push(c)
+          }
+          if (controlCommands.length > 0) {
+            log('info', `channel-bot control mode ON: registering ${controlCommands.length} TUI-control slash commands`)
+          }
+          // Register to both default and all_private_chats scopes so
+          // the autocomplete shows up in DMs regardless of any BotFather-
+          // era placeholder scope leftover.
+          void bot.api.setMyCommands(merged).catch(() => {})
+          void bot.api.setMyCommands(merged, { scope: { type: 'all_private_chats' } }).catch(() => {})
         },
       })
       return // bot.stop() was called — clean exit from the loop
