@@ -1,7 +1,7 @@
 {
   "name": "discord-http",
   "description": "Discord channel for Claude Code — HTTP MCP daemon transport. Drop-in replacement for the official discord plugin that decouples the bot daemon from claude TUI lifetime. Survives claude restarts; uses disk + memory replay queue to recover messages during any restart gap.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": {
     "name": "Joey / Crab Labs",
     "url": "https://github.com/darwin7381"
