@@ -194,3 +194,15 @@ Same as `telegram-http`'s debugging table, plus:
 | `client.login failed` looping | Bad token, or rate-limited by Discord. Wait + verify token. |
 | Bot online in Discord but doesn't see DMs | Check intents — `GatewayIntentBits.DirectMessages` + `MessageContent` + `Partials.Channel` must all be on (they are in our config). |
 | Inline buttons not responding | `interactionCreate` listener verifies sender is in `access.allowFrom`. Check pairing. |
+| `SSE keepalive write failed for ... — marking dead` | Working as intended (1.0.2+). The dead-transport patch caught a dead claude TUI; session will be GC'd by SDK's onclose. |
+
+## Dead-transport detection (1.0.2+)
+
+Same patch as [telegram-http 1.0.2](../telegram-http/ARCHITECTURE.md#dead-transport-detection-102). Counters claude-code 2.1.141~2.1.148 silent HTTP MCP transport drop regression: claude TUIs lose their HTTP/SSE connection without sending FIN/RST, and the daemon would otherwise broadcast to dead sessions forever (`active_sessions` accumulating zombies — we observed **2332** on a 1-week-old Discord daemon at the time of the patch).
+
+Two layers (both inside the `GET /mcp` SSE handler):
+
+1. **TCP socket keepalive** — `req.socket.setKeepAlive(true, 30000)` so the kernel probes every 30s instead of the macOS ~2h default. Dead peers detected in 30-90s.
+2. **SSE comment keepalive write** — `setInterval` writes `: keepalive <ts>\n\n` every 30s (parsers ignore comment lines per RFC 6202). On write failure → mark session dead, destroy socket, let `transport.onclose` GC the session entry.
+
+Verified concurrently with telegram-http 1.0.2 — Discord daemon went from 2332 zombie sessions to clean state after restart with the patch. See telegram-http ARCHITECTURE.md for full rationale and upstream issue links.

@@ -1414,6 +1414,56 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         //      our server.notification calls reach claude
         //   5. THEN await the long-lived SSE request lifecycle
         sseOpen.set(sessionId, true)
+
+        // 2026-05-22 — Dead-transport detection patch (belt + suspenders):
+        //
+        // Counters claude-code 2.1.141~2.1.148 silent HTTP MCP transport
+        // drop regression (docs claim 5-attempt exponential backoff
+        // reconnect, but in practice the transport gives up silently
+        // after a brief retry burst; verified via GitHub issues #21721
+        // #60061 #59956 etc). Without this patch, dead claude TUIs leave
+        // their SSE session in `sseOpen=true` state forever, daemon's
+        // server.notification() writes to the dead socket succeed at the
+        // kernel buffer level but never reach claude, and inbound TG
+        // messages accumulate in the SSE response stream until kernel
+        // backpressure (potentially hours).
+        //
+        // Two layers:
+        //   1. TCP keepalive — kernel probes every 30s. Detects dead
+        //      peers in ~30-90s (vs default 2h on macOS).
+        //   2. Application keepalive comment — write `: keepalive\n\n`
+        //      every 30s. SSE parsers ignore comment lines but writes
+        //      exercise the socket. If the write fails (back-pressured
+        //      buffer hit, socket destroyed), we mark the session dead,
+        //      destroy the socket, and let the SDK's transport.onclose
+        //      handler GC the session entry.
+        try {
+          req.socket?.setKeepAlive(true, 30000)
+          req.socket?.setTimeout(0)
+        } catch (err) {
+          log('warn', `setKeepAlive failed for ${sessionId}: ${err instanceof Error ? err.message : err}`)
+        }
+        const keepaliveTimer = setInterval(() => {
+          if (res.destroyed || res.writableEnded || !sseOpen.get(sessionId)) {
+            clearInterval(keepaliveTimer)
+            return
+          }
+          try {
+            res.write(`: keepalive ${Date.now()}\n\n`)
+          } catch (err) {
+            log('info', `SSE keepalive write failed for ${sessionId} — marking dead and forcing close: ${err instanceof Error ? err.message : err}`)
+            sseOpen.set(sessionId, false)
+            clearInterval(keepaliveTimer)
+            try { req.socket?.destroy() } catch {}
+          }
+        }, 30000)
+        // Defensive: ensure timer cleans up if Node fires 'close' before our finally
+        const onResClose = () => {
+          clearInterval(keepaliveTimer)
+          sseOpen.set(sessionId, false)
+        }
+        res.once('close', onResClose)
+
         const reqPromise = transport.handleRequest(req, res)
         // Single-microtask yield is enough for the SDK's synchronous
         // _streamMapping.set; we add a small extra delay as belt-and-suspenders
@@ -1443,6 +1493,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {
           sseOpen.set(sessionId, false)  // SSE closed; future broadcasts queue
+          clearInterval(keepaliveTimer)
+          res.off('close', onResClose)
         }
         return
       }
