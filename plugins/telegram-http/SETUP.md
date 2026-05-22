@@ -42,7 +42,11 @@
 | tmux | `brew install tmux` |
 | Joey 的 Telegram user ID | DM [@userinfobot](https://t.me/userinfobot) 取得 |
 
-### 🔴 STRONG RECOMMENDATION：版本鎖定 + 關閉自動更新（必做）
+### 🔴 必做：claude 版本鎖定 + 關閉自動更新
+
+> ⚠️ **不要被本 plugin 1.0.2 的 keepalive patch 誤導**：那個 patch 解的是 **daemon 端**「不知道客戶端死了、繼續廣播到死信箱」的問題。Plugin 1.0.2 + claude 2.1.148 一起跑 **bot 還是會壞** — 因為 claude TUI 端 transport 自己死掉之後**不會自動重連**（這是 client side bug、daemon 無能為力）。
+>
+> **Pin 到 2.1.140 是必做、不是 belt-and-suspenders、不是 optional**。 Plugin 1.0.2 是加保險、不是替代品。詳見 §11.2 problem A vs problem B 拆分。
 
 Anthropic claude-code 自帶 auto-updater，背景偷偷把 symlink 升到 npm latest（截至 2026-05-22 是 2.1.148）。**2.1.141~2.1.148 全部有 regression bug、會把你 bot 變成「看起來活但收不到訊息」**。
 
@@ -113,7 +117,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.btai.disable-autoupd
 
 Anthropic 官方 docs（[Automatic reconnection](https://code.claude.com/docs/en/mcp#automatic-reconnection)）承諾 5x exponential backoff reconnect、**實作沒做到**。
 
-Anthropic 修了之後（會出現在 2.1.149+ changelog 含 MCP / transport / SSE / reconnect 修補字眼）→ 跑 §12 升 pin SOP。
+Anthropic 修了之後（會出現在 2.1.149+ changelog 含 MCP / transport / SSE / reconnect 修補字眼）→ 跑 §11.2 升 pin SOP。
 
 ---
 
@@ -124,6 +128,39 @@ ls -la ~/.local/share/claude-pinned/2.1.140                     # 200MB 左右
 ~/.local/share/claude-pinned/2.1.140 --version                  # → 2.1.140 (Claude Code)
 launchctl getenv DISABLE_AUTOUPDATER                            # → 1
 ```
+
+### 🚫 多機器部署規則：每台一個 bot token（**禁止兩台 share token**）
+
+如果你的 Mac mini + MBP 都想跑 channel-bot daemon（兩台都 always-on），**絕對不能讓兩個 daemon 用同一個 Telegram bot token / Discord bot token**：
+
+```
+場景：兩台機器、同一個 @MyBot token
+  ↓
+兩個 daemon 同時 Telegram getUpdates long-poll
+  ↓
+Telegram 回 409 Conflict — 「another instance is polling」
+  ↓
+兩邊互相 race、訊息只給最後 poll 的那個、不一致 / 不可預期
+  ↓
+Discord gateway 同樣場景：兩個 discord.js client 用同 token connect
+  → 互相斷對方（gateway 只允許一條 active connection）
+```
+
+**正確做法 — 二選一**：
+
+| 方案 | 適用情境 |
+|---|---|
+| **A. 每台機器自己一個 bot 帳號**（不同 token） | 兩台都要 always-on、各自獨立識別、Joey 視為兩條 bot 切換 |
+| **B. 只有 Mac mini 跑 daemon、MBP SSH 進去用** | 主機是 Mac mini、MBP 是出門備援、不重複跑 |
+
+我們目前部署是 **方案 B**（Mac mini 在台灣家裡常駐、Joey 從日本 Parsec/SSH 過去）。如果要走方案 A，每台機器：
+- 另開一個 bot（BotFather `/newbot`）→ 拿不同 token
+- 不同 `STATE_DIR`（譬如 `~/.claude/channels/telegram-mbp/`）
+- 不同 launchd label（譬如 `com.btai.telegram-daemon.channel-mbp`）
+- 不同 HTTP port（譬如 17731 vs Mac mini 的 17631）
+- Joey TG client 同時看到兩條 bot 對話、切換時注意是哪台
+
+**Plugin 本身完全支援 multi-instance**（advisory lock + STATE_DIR 隔離），**限制在 Telegram / Discord API 那一邊 — 同 token 只能一個 poller**。
 
 ---
 
