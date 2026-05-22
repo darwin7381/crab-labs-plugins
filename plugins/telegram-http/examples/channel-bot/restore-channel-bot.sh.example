@@ -1,0 +1,182 @@
+#!/bin/zsh
+# Channel-bot wrapper — reference implementation
+# Place at: ~/path/to/your/workspace/scripts/restore-channel-bot.sh
+# Make executable: chmod +x restore-channel-bot.sh
+#
+# Purpose: keep a single long-running claude TUI alive inside a tmux session,
+# wired up to the telegram-http (and optionally discord-http) MCP daemons via
+# the --channels flag. When the TUI exits (e.g. user types /exit, channel-bot
+# calls /restart, or claude crashes), this wrapper relaunches it.
+#
+# Critical capability for the channel-bot TUI control plane (telegram-http
+# 1.1.0+): on each restart, this script reads ${NEXT_ARGS_FILE} and appends
+# its contents (typically `--resume <session-id>`) to the claude command,
+# letting the daemon force claude TUI to resume a specific session.
+# (Note: 1.2.0+ usually inline-switches via /resume picker without a restart,
+# but this mechanism stays as fallback for /restart and SSH-driven recovery.)
+#
+# Customise the four ALL_CAPS blocks below for your environment.
+
+set +e  # explicit error handling; do not exit on grep no-match etc.
+
+# ─── 1. ENVIRONMENT ────────────────────────────────────────────────────────
+export HOME="/Users/USERNAME"
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# ─── 2. SESSION + WORKDIR ──────────────────────────────────────────────────
+# tmux session name the wrapper manages. MUST match
+# `CHANNEL_BOT_TMUX_SESSION` env var in the daemon plist.
+SESSION="MyChannelBot"
+# cwd for claude TUI (the project / vault root you want claude to operate in)
+WORKDIR="$HOME/path/to/your/workspace"
+
+# ─── 3. PLUGIN PORTS ───────────────────────────────────────────────────────
+# Substituted into the patched .mcp.json ${TELEGRAM_HTTP_PORT} placeholder.
+# Must match the daemon plist's TELEGRAM_HTTP_PORT (and DISCORD_HTTP_PORT if
+# using the discord-http daemon too).
+TELEGRAM_HTTP_PORT="17631"
+DISCORD_HTTP_PORT="17641"  # omit this line + the flag below if not using discord
+
+# ─── 4. CLAUDE BINARY (pinned) ─────────────────────────────────────────────
+# Pin to a known-good version. As of 2026-05-22, 2.1.141~2.1.148 have a
+# silent HTTP MCP transport regression (see GitHub #21721). Pin to 2.1.140
+# until upstream fixes — copy the binary to a stable path that the
+# auto-updater won't touch:
+#   cp $(readlink ~/.local/bin/claude) ~/.local/share/claude-pinned/2.1.140
+CLAUDE_BIN="$HOME/.local/share/claude-pinned/2.1.140"
+
+# DISABLE_AUTOUPDATER=1 stops claude TUI's background update check (which
+# would silently upgrade the bare `claude` symlink to npm latest). Manual
+# `claude update` still works when you explicitly want to upgrade. Once you
+# confirm a new version is regression-free, replace the binary at $CLAUDE_BIN.
+
+# ─── 5. RESUME ARGS OVERRIDE (1.1.0+ TUI control plane) ────────────────────
+# The telegram-http daemon's /restart and 1.1.0-style /resume write to this
+# file. On each start_claude(), we consume the file and append its content
+# to the launch command. Path MUST match the daemon plist's
+# CHANNEL_BOT_NEXT_ARGS_FILE env var.
+NEXT_ARGS_FILE="/tmp/channel-bot-next-args"
+
+build_claude_cmd() {
+  local extra=""
+  if [ -f "$NEXT_ARGS_FILE" ]; then
+    extra=$(<"$NEXT_ARGS_FILE")
+    extra="${extra//$'\n'/ }"  # collapse newlines to spaces
+    log "found $NEXT_ARGS_FILE → appending: $extra"
+    mv "$NEXT_ARGS_FILE" "$NEXT_ARGS_FILE.used.$(date +%s)" 2>/dev/null || rm -f "$NEXT_ARGS_FILE"
+  fi
+  # NB: --disallowedTools AskUserQuestion ExitPlanMode is required for
+  # channel-bot mode — these picker-style tools deadlock when claude can't
+  # access the local keyboard. See upstream issue #40644.
+  CLAUDE_CMD="cd $WORKDIR && \
+TELEGRAM_HTTP_PORT=$TELEGRAM_HTTP_PORT \
+DISCORD_HTTP_PORT=$DISCORD_HTTP_PORT \
+DISABLE_AUTOUPDATER=1 \
+$CLAUDE_BIN \
+  --channels plugin:telegram-http@crab-labs-plugins \
+  --channels plugin:discord-http@crab-labs-plugins \
+  --disallowedTools AskUserQuestion ExitPlanMode \
+  --dangerously-skip-permissions \
+  $extra"
+}
+# Default; build_claude_cmd will rebuild on every start.
+build_claude_cmd
+
+# ─── LOGGING ───────────────────────────────────────────────────────────────
+LOG_DIR="$WORKDIR/logs"
+LOG="$LOG_DIR/channel-bot-wrapper.log"
+CRASH_DIR="$LOG_DIR/crashes"
+CRASH_KEEP=10
+MAX_FAILURES=3
+CHECK_INTERVAL=30
+STARTUP_WAIT=25
+
+mkdir -p "$CRASH_DIR"
+
+fail_count=0
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
+
+# Capture tmux pane scrollback before killing — so claude's last words survive
+# (handy for postmortem when claude crashes mid-task).
+snapshot_pane() {
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then return; fi
+  local crash_file="$CRASH_DIR/$(date '+%Y%m%d-%H%M%S').log"
+  if tmux capture-pane -pt "$SESSION:0.0" -S -5000 > "$crash_file" 2>/dev/null; then
+    log "captured pane scrollback to $crash_file"
+    ls -t "$CRASH_DIR"/*.log 2>/dev/null | tail -n +"$((CRASH_KEEP + 1))" | xargs rm -f 2>/dev/null || true
+  fi
+}
+
+start_claude() {
+  snapshot_pane
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  sleep 1
+  build_claude_cmd  # consume any pending --resume args
+  tmux new-session -d -s "$SESSION" -c "$WORKDIR"
+  sleep 2
+  tmux send-keys -t "$SESSION" "$CLAUDE_CMD" Enter
+  log "sent claude command (workdir: $WORKDIR, TELEGRAM_HTTP_PORT=$TELEGRAM_HTTP_PORT), waiting ${STARTUP_WAIT}s..."
+  sleep "$STARTUP_WAIT"
+
+  # First-run trust prompt (idempotent — skipped on subsequent restarts).
+  local pane_out
+  pane_out=$(tmux capture-pane -pt "$SESSION:0.0" 2>/dev/null || echo "")
+  if echo "$pane_out" | grep -q "trust this folder"; then
+    log "trust prompt detected, confirming..."
+    tmux send-keys -t "$SESSION" Enter
+    sleep 10
+  fi
+
+  log "started $SESSION"
+}
+
+is_claude_alive() {
+  # Check 1: tmux session exists
+  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    log "  check: session does not exist"
+    return 1
+  fi
+
+  # Check 2: active pane is running claude (not a shell)
+  local pane_cmd
+  pane_cmd=$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' 2>/dev/null || echo "unknown")
+  case "$pane_cmd" in
+    zsh|bash|fish|sh|login)
+      log "  check: pane running shell ($pane_cmd) = claude exited"
+      return 1
+      ;;
+  esac
+
+  # NB: we do NOT check whether the HTTP MCP daemon is reachable here.
+  # The daemon is managed by its own launchd job (KeepAlive=true). If it
+  # dies, launchd restarts it; if the network drops, claude's MCP transport
+  # surfaces the error. Don't double-supervise.
+
+  return 0
+}
+
+log "channel-bot wrapper starting, waiting 15s for network/launchd ordering..."
+sleep 15
+log "entering monitor loop (check every ${CHECK_INTERVAL}s, max ${MAX_FAILURES} consecutive failures before cooldown)"
+
+while true; do
+  if is_claude_alive; then
+    if (( fail_count > 0 )); then
+      log "claude recovered (was at attempt $fail_count)"
+    fi
+    fail_count=0
+  else
+    fail_count=$((fail_count + 1))
+    if (( fail_count > MAX_FAILURES )); then
+      log "COOLDOWN: $MAX_FAILURES consecutive failures, sleeping 1 hour before retry"
+      log "Manual restart: tmux new-session -d -s $SESSION -c $WORKDIR && tmux send-keys -t $SESSION '$CLAUDE_CMD' Enter"
+      sleep 3600
+      fail_count=0
+      log "cooldown over, resuming monitor"
+      continue
+    fi
+    start_claude
+    continue
+  fi
+  sleep "$CHECK_INTERVAL"
+done

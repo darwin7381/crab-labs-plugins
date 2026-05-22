@@ -6,9 +6,33 @@ Drop-in replacement for the official `telegram@claude-plugins-official` plugin. 
 
 > ⚡ **Quick start (first-time setup)**: [SETUP.md](./SETUP.md) — end-to-end tutorial in Chinese covering plugin install → bot configure (ackReaction emoji principles, dmPolicy) → managed-settings.json policy → launchd daemon → claude TUI startup (with required 2.1.140 pin) → pairing → end-to-end test → troubleshooting.
 >
+> 🤖 **Channel-bot mode** (1.1.0+): [ADVANCED-SETUP.md](./ADVANCED-SETUP.md) — drive a persistent claude TUI directly from Telegram with slash commands (`/clear`, `/resume`, `/model`, `/restart`, etc.). Same TUI process across switches, no message loss, fully remote-controllable from phone / iPad. Reference wrapper + plist templates in [`examples/channel-bot/`](./examples/channel-bot/).
+>
 > 📐 **Deep dive**: [ARCHITECTURE.md](./ARCHITECTURE.md) covers the design rationale, the upstream stdio death cycle, the replay queue, and debugging.
 >
 > 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
+
+## ✨ Highlights
+
+- **Stable HTTP MCP transport** — no stdio death cycle; survives claude TUI restarts; pending messages replay from disk.
+- **Multi-session broadcast** — one daemon serves many claude TUIs simultaneously.
+- **Daemon-side keepalive (1.0.2+)** — TCP + SSE keepalive detects dead peers in 30-90s; mitigates the 2.1.141~2.1.148 client-side regression.
+- **🆕 Channel-bot TUI control plane (1.1.0+)** — opt-in slash commands intercepted by the daemon and applied to claude TUI itself via tmux send-keys + launchctl. From your phone/iPad you can:
+
+  | Command | What it does |
+  |---|---|
+  | `/clear` | clear claude TUI context (same process, new session id) |
+  | `/model <name>` `/effort <level>` | switch model / effort level |
+  | `/agents` `/mcp` `/help` | open native claude pickers (read-only inspection) |
+  | `/sigint` | Ctrl+C — interrupt current claude turn |
+  | `/restart` | full claude TUI restart via wrapper (~25s) |
+  | `/kill_stuck` | `pkill -9` stuck claude + auto-respawn |
+  | `/status` | daemon health + claude TUI pid |
+  | `/resume_list` | list claude sessions (header shows current) |
+  | `/resume <N\|uuid>` | inline-switch to a session via picker (~1.5s, same TUI process) |
+  | `/resume_previous` | walk-back through session history one step at a time (chain semantics — no ping-pong) |
+
+  Setup: see [ADVANCED-SETUP.md](./ADVANCED-SETUP.md) + the templates in [`examples/channel-bot/`](./examples/channel-bot/).
 
 ## Why this fork
 

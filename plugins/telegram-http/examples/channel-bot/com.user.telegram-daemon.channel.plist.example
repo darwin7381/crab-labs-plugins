@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Telegram-http daemon launchd plist with channel-bot TUI control plane env
+  vars — reference template.
+
+  Place at: ~/Library/LaunchAgents/com.user.telegram-daemon.channel.plist
+  Load:     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.telegram-daemon.channel.plist
+  Restart:  launchctl kickstart -k gui/$(id -u)/com.user.telegram-daemon.channel
+
+  Required env vars for TUI control plane:
+  - CHANNEL_BOT_TMUX_SESSION    → must match SESSION in the wrapper script
+  - CHANNEL_BOT_PROJECTS_DIR    → claude's project dir for THIS cwd, derived
+                                  by replacing '/' with '-' in WORKDIR
+                                  (e.g. /Users/USERNAME/workspace →
+                                   ~/.claude/projects/-Users-USERNAME-workspace)
+  - CHANNEL_BOT_WRAPPER_LABEL   → must match Label in the wrapper plist
+  - CHANNEL_BOT_NEXT_ARGS_FILE  → /tmp/channel-bot-next-args (rarely changed)
+
+  Setting any of these enables the TUI control plane. Without them, the daemon
+  forwards all slash commands to claude as normal chat content (legacy
+  behavior for non-channel-bot deployments).
+
+  TELEGRAM_HTTP_PORT MUST match the wrapper's TELEGRAM_HTTP_PORT (substituted
+  into .mcp.json's ${TELEGRAM_HTTP_PORT} placeholder when claude TUI launches).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.telegram-daemon.channel</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/.bun/bin/bun</string>
+    <string>run</string>
+    <string>/Users/USERNAME/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/server.ts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/USERNAME/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/USERNAME/.bun/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/USERNAME</string>
+
+    <!-- Standard telegram-http daemon vars -->
+    <key>TELEGRAM_STATE_DIR</key>
+    <string>/Users/USERNAME/.claude/channels/telegram</string>
+    <key>TELEGRAM_HTTP_PORT</key>
+    <string>17631</string>
+    <key>TELEGRAM_HTTP_HOST</key>
+    <string>127.0.0.1</string>
+
+    <!-- Channel-bot TUI control plane (1.1.0+) -->
+    <key>CHANNEL_BOT_TMUX_SESSION</key>
+    <string>MyChannelBot</string>
+    <key>CHANNEL_BOT_PROJECTS_DIR</key>
+    <string>/Users/USERNAME/.claude/projects/-Users-USERNAME-path-to-your-workspace</string>
+    <key>CHANNEL_BOT_WRAPPER_LABEL</key>
+    <string>com.user.channel-bot-wrapper</string>
+    <key>CHANNEL_BOT_NEXT_ARGS_FILE</key>
+    <string>/tmp/channel-bot-next-args</string>
+    <!-- Optional: chain state file for /resume_previous walk-back (1.2.1+) -->
+    <key>CHANNEL_BOT_RESUME_CHAIN_FILE</key>
+    <string>/tmp/channel-bot-resume-chain.json</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/.claude/channels/telegram/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/.claude/channels/telegram/launchd.err.log</string>
+</dict>
+</plist>

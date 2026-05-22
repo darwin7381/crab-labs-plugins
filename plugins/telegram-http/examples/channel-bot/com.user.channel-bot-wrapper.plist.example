@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Channel-bot wrapper launchd plist — reference template.
+
+  Place at: ~/Library/LaunchAgents/com.user.channel-bot-wrapper.plist
+  Load:     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.channel-bot-wrapper.plist
+  Unload:   launchctl bootout    gui/$(id -u)/com.user.channel-bot-wrapper
+
+  The `Label` MUST match the `CHANNEL_BOT_WRAPPER_LABEL` env var in the
+  telegram-http daemon plist (the daemon calls `launchctl kickstart -k
+  gui/<uid>/<label>` for /restart and 1.1.0-style /resume).
+
+  Customise:
+  - Label (also update CHANNEL_BOT_WRAPPER_LABEL in daemon plist)
+  - ProgramArguments path (point to YOUR restore-channel-bot.sh)
+  - StandardOutPath / StandardErrorPath (log destinations)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.channel-bot-wrapper</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/USERNAME/path/to/your/workspace/scripts/restore-channel-bot.sh</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/path/to/your/workspace/logs/wrapper-launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/path/to/your/workspace/logs/wrapper-launchd.err.log</string>
+
+  <key>Comment</key>
+  <string>Channel-bot wrapper. Watches tmux session + claude TUI pane only; does NOT manage the HTTP MCP daemon (separate launchd job).</string>
+</dict>
+</plist>
