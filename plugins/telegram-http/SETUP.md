@@ -34,7 +34,7 @@
 | 需求 | 安裝 |
 |---|---|
 | macOS（測過）或 Linux | — |
-| **claude code 2.1.140** | ⚠️ **不能用 2.1.141**（HTTP MCP transport regression，連線斷掉不 reconnect）。詳見 §11 |
+| **claude code 2.1.140（pinned，不能跟 symlink）** | ⚠️ **2.1.141 ~ 2.1.148 全部有 HTTP MCP transport silent disconnect regression** — bot 看起來活但收不到訊息。詳見 §11.2 + 下方版本鎖定流程 |
 | [Bun](https://bun.sh/) | `curl -fsSL https://bun.sh/install \| bash` |
 | Telegram bot token | DM [@BotFather](https://t.me/BotFather) → `/newbot` |
 | Discord bot token（若要 discord） | [Discord Developer Portal](https://discord.com/developers/applications) → Bot → Reset Token |
@@ -42,17 +42,87 @@
 | tmux | `brew install tmux` |
 | Joey 的 Telegram user ID | DM [@userinfobot](https://t.me/userinfobot) 取得 |
 
-驗證 claude 路徑：
+### 🔴 STRONG RECOMMENDATION：版本鎖定 + 關閉自動更新（必做）
+
+Anthropic claude-code 自帶 auto-updater，背景偷偷把 symlink 升到 npm latest（截至 2026-05-22 是 2.1.148）。**2.1.141~2.1.148 全部有 regression bug、會把你 bot 變成「看起來活但收不到訊息」**。
+
+兩層防護必須做：
+
+**(a) Pin claude binary 到 2.1.140**（從 npm registry 拉、永久保存到 auto-updater 摸不到的位置）：
 
 ```bash
-ls /Users/$(whoami)/.local/share/claude/versions/
-# 應該看到至少 2.1.140
+# 1. 抓 2.1.140 binary（npm registry 還在保留所有歷史版本）
+cd /tmp && rm -rf claude-2.1.140 && mkdir claude-2.1.140 && cd claude-2.1.140
+npm pack @anthropic-ai/claude-code-darwin-arm64@2.1.140  # 或 linux-x64 / darwin-x64 ...
+tar xzf anthropic-ai-claude-code-darwin-arm64-2.1.140.tgz
+chmod +x package/claude
+./package/claude --version  # 應輸出: 2.1.140 (Claude Code)
+
+# 2. 保存到 auto-updater 摸不到的位置
+mkdir -p ~/.local/share/claude-pinned
+cp package/claude ~/.local/share/claude-pinned/2.1.140
+chmod +x ~/.local/share/claude-pinned/2.1.140
+
+# 後續所有 claude TUI / supervisor manifest / wrapper script 都指這個 explicit 路徑
+# 不要用 bare `claude` 指令、不要用 ~/.local/bin/claude symlink
 ```
 
-如果只有 2.1.141 沒有 2.1.140，先：
+**(b) 關閉 auto-updater**（只擋背景升、`claude update` 手動指令仍能用）：
 
 ```bash
-claude install 2.1.140   # 把 2.1.140 binary 拉下來
+# 1. launchctl 全域（活著的 launchd procs 立即生效）
+launchctl setenv DISABLE_AUTOUPDATER 1
+
+# 2. ~/.zshrc export（新 terminal 也有）
+echo "export DISABLE_AUTOUPDATER=1" >> ~/.zshrc
+
+# 3. LaunchAgent plist（重開機後自動再 setenv）
+cat > ~/Library/LaunchAgents/com.btai.disable-autoupdater.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.btai.disable-autoupdater</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/launchctl</string>
+    <string>setenv</string>
+    <string>DISABLE_AUTOUPDATER</string>
+    <string>1</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.btai.disable-autoupdater.plist
+```
+
+差別：
+- `DISABLE_AUTOUPDATER=1` 只擋背景、`claude update` 手動仍可用 — 適合「我們想自己決定何時升」的場景
+- `DISABLE_UPDATES=1` 兩個都擋（連手動 `claude update` 也擋）— 更激進
+
+### 📡 等待 Anthropic 修復這個 regression（最終解）
+
+追蹤上游看這條 issue：[anthropics/claude-code#60061](https://github.com/anthropics/claude-code/issues/60061)（2026-05-17 開、狀態 OPEN、最直接對應症狀）
+
+其他相關 issue（佐證 bug 嚴重性 / 跨多版本確認）：
+- [#21721](https://github.com/anthropics/claude-code/issues/21721) — "MCP HTTP transport fails after ~89 minutes without automatic reconnection"
+- [#59956](https://github.com/anthropics/claude-code/issues/59956) — "HTTP MCP servers working in 2.1.140 and broken in 2.1.142"
+- [#36308](https://github.com/anthropics/claude-code/issues/36308) — auto-reconnect feature request
+- [#43177](https://github.com/anthropics/claude-code/issues/43177) — stdio 同類問題
+
+Anthropic 官方 docs（[Automatic reconnection](https://code.claude.com/docs/en/mcp#automatic-reconnection)）承諾 5x exponential backoff reconnect、**實作沒做到**。
+
+Anthropic 修了之後（會出現在 2.1.149+ changelog 含 MCP / transport / SSE / reconnect 修補字眼）→ 跑 §12 升 pin SOP。
+
+---
+
+驗證 binary 已備好 + auto-updater 已關：
+
+```bash
+ls -la ~/.local/share/claude-pinned/2.1.140                     # 200MB 左右
+~/.local/share/claude-pinned/2.1.140 --version                  # → 2.1.140 (Claude Code)
+launchctl getenv DISABLE_AUTOUPDATER                            # → 1
 ```
 
 ---
@@ -466,21 +536,60 @@ done
 
 詳見 memory `project_plugin_url_dedup.md`。
 
-### 11.2 claude TUI 看似在 listen 但 `lsof -i :PORT` 顯示 0 ESTABLISHED
+### 11.2 claude TUI 看似在 listen 但 `lsof -i :PORT` 顯示 0 ESTABLISHED（**最常見 regression 症狀**）
 
-**現象**：claude pane 顯示 "Listening for channel messages from: ..."，但 daemon 都收到訊息了 claude 都不渲染。`lsof` 顯示 claude 跟 daemon 的 TCP 連線數 = 0。
+**現象**：
+- claude pane 顯示 "Listening for channel messages from: ..."
+- daemon 收到訊息（`lastUpdate` 在遞增、log 有 broadcast 嘗試）
+- 但 claude 端永遠不渲染
+- `lsof -p <claude_pid> -i :PORT` 顯示 0 ESTABLISHED（process 還在、network 死了）
 
-**原因**：claude 2.1.141 MCP HTTP transport regression — SDK 連線斷掉 retry 3 次後 give up，process 還在 network 死了。
+**根本原因**：**claude-code 2.1.141 ~ 2.1.148 全部有 HTTP MCP transport silent disconnect regression**（不是只有 2.1.141）。Anthropic docs（[Automatic reconnection](https://code.claude.com/docs/en/mcp#automatic-reconnection)）承諾 5x exponential backoff reconnect、實作沒做到 → SDK 連線斷掉短暫嘗試後 give up、process 還在 network 死了。
 
-**修法**：把所有 supervisor manifest + 啟動指令 pin 到 2.1.140：
+**已驗證的 GitHub issues**：
+- [#60061](https://github.com/anthropics/claude-code/issues/60061) — 2026-05-17 開、OPEN、Anthropic 還沒回。**watch this for the fix**。
+- [#21721](https://github.com/anthropics/claude-code/issues/21721) — "MCP HTTP transport fails after ~89 minutes without automatic reconnection"（時間跟症狀完全對得上）
+- [#59956](https://github.com/anthropics/claude-code/issues/59956) — "HTTP MCP servers working in 2.1.140 and broken in 2.1.142"（regression boundary 確認）
+- [#36308](https://github.com/anthropics/claude-code/issues/36308) / [#43177](https://github.com/anthropics/claude-code/issues/43177) — 其他相關
 
-```json
-"claude_command": "/Users/btai/.local/share/claude/versions/2.1.140 --channels plugin:telegram-http@crab-labs-plugins --dangerously-skip-permissions"
+**主要修法**：pin 到 2.1.140（不在 regression 範圍內、唯一已驗證 stable 的版本）。**參考 §1 的「STRONG RECOMMENDATION：版本鎖定 + 關閉自動更新」section**。`/Users/$(whoami)/.local/share/claude-pinned/2.1.140` 在所有 supervisor manifest / channel-bot wrapper / 任何 `claude --channels` 啟動指令都用 explicit 路徑、不要用 bare `claude`。
+
+**次要保險（daemon-side mitigation）**：plugin v1.0.2 加了 daemon dead-transport detection（TCP keepalive + SSE comment heartbeat）— daemon 30-90s 偵測死客戶端、清 zombie session、不再廣播到死信箱。**但這不解決「claude 端不重連」這個 root cause**，只解決 daemon side 殭屍累積問題（v1.0.1 daemon 1 週累積 2269 / 2332 殭屍 session、v1.0.2 daemon `active_sessions` 應穩定維持在小範圍）。詳見 CHANGELOG.md 1.0.2 章節 + ARCHITECTURE.md「Dead-transport detection」段。
+
+**怎麼知道 Anthropic 修了**：
+1. Watch [#60061](https://github.com/anthropics/claude-code/issues/60061) — closed + linked PR / mentioned version = 修了
+2. `npm view @anthropic-ai/claude-code version` 看到 2.1.149+ + 該版 changelog 含 MCP / HTTP / transport / SSE / reconnect 字眼
+3. 修了之後跑下面升 pin SOP
+
+**升 pin SOP（when Anthropic ships fix）**：
+
+```bash
+# 1. 假設新版是 2.1.149，從 npm 抓
+cd /tmp && rm -rf test-249 && mkdir test-249 && cd test-249
+npm pack @anthropic-ai/claude-code-darwin-arm64@2.1.149
+tar xzf anthropic-ai-claude-code-darwin-arm64-2.1.149.tgz
+chmod +x package/claude
+./package/claude --version  # 確認 2.1.149
+
+# 2. 1 小時 sandbox 測試（在一個非 production tmux 跑、確認 fix 真的修了）
+tmux new -d -s claude-test "cd /tmp && /tmp/test-249/package/claude --channels plugin:telegram-http@crab-labs-plugins --dangerously-skip-permissions"
+# 等 1+ 小時
+TUI_PID=$(pgrep -f "test-249/package/claude" | head -1)
+lsof -p $TUI_PID -i :17631 | grep -c ESTABLISHED  # 應 >= 1（沒掉到 0）
+
+# 3. fix 確認 → 升 pin（覆蓋同檔名最簡單）
+cp /tmp/test-249/package/claude ~/.local/share/claude-pinned/2.1.140
+# 或改用新檔名 + 改 wrapper（更乾淨）:
+# cp ... ~/.local/share/claude-pinned/2.1.149
+# sed -i '' 's|claude-pinned/2.1.140|claude-pinned/2.1.149|g' ~/.claude/workspace-telegram/scripts/restore-channel-bot.sh
+
+# 4. 重啟讓新 binary 上身
+launchctl kickstart -k gui/$(id -u)/com.btai.channel-bot-wrapper
 ```
 
-Kill 所有 stale 2.1.141 claude TUI，supervisor 自動 respawn。
+舊 pin（`/claude-pinned/2.1.140` 或舊版號）建議保留作 rollback。
 
-詳見 memory `project_claude_2141_transport_regression.md`。
+詳見 memory `project_claude_2141_transport_regression.md` + `project_plugin_keepalive_patch.md`。
 
 ### 11.3 「server X not in --channels list for this session」
 
