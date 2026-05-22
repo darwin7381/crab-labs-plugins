@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.2.0 — 2026-05-22
+
+**`/resume` inline-switch via tmux picker navigation** — replaces 1.1.0's kill-tmux + wrapper-restart approach. Same TUI process (no pid change), no message loss, ~1.5s vs ~5-10s.
+
+### Changed
+- `/resume <n|uuid>` and `/resume_previous` now drive claude TUI's native `/resume` picker via tmux send-keys: `/resume` → wait 1.5s → Down × N → Enter. Picker performs an inline conversation-history reload without process restart. Verified pid unchanged across switch in `claude-tui-test` env (2026-05-22).
+- **`listClaudeSessions` filter fix**: now filters by `entrypoint === "cli"` (matches claude TUI picker's actual hidden filter). Previously skipped `<channel>` wrapped messages as "framework injections" but they ARE the real user content for channel-bot deployments — that bug made `/resume_list` invert the picker's filter (showed `--print` SDK sessions, hid real channel-bot ones). Now numbering aligns 1:1 with picker → Down-arrow count is reliable.
+- `<channel ...>` outer wrapper is now stripped from session preview text in `/resume_list` for readability.
+
+### Why
+Joey's 2026-05-22 feedback after 1.1.0 deploy:
+> "Resume previous 會吃的很多空的，跟官方的 resume 還是有差…是否該重新思考 /resume 和 /resume_previous 根本不需要殺 tmux"
+
+Empirical testing (claude-tui-test env + workspace-telegram picker probe) confirmed:
+1. claude TUI's `/resume` picker filters `entrypoint=sdk-cli` sessions, NOT by content emptiness
+2. The picker supports full keyboard navigation via tmux send-keys (Down/Up arrows + Enter)
+3. Selecting via Enter performs inline conversation reload — same process, MCP transport remains connected, in-flight messages don't drop
+4. Picker order = mtime DESC, current session = index 0, "previous" = index 1
+
+### Removed
+- Daemon no longer writes to `$CHANNEL_BOT_NEXT_ARGS_FILE` for `/resume`. The wrapper script's `build_claude_cmd` reading that file is now dormant (kept for potential future overrides — restart of `/restart` still goes through the same wrapper path but doesn't inject `--resume`).
+
+### Risks / known limits
+- Picker driven by Down-count assumes our `listClaudeSessions` ordering matches picker order. We mirror mtime DESC + `entrypoint === "cli"` filter; verified on workspace-telegram cwd (18 jsonl files → 15 entries match picker exactly).
+- If claude TUI is mid-turn when `/resume` is sent, picker may queue or be ignored. Recovery: send `/sigint` first.
+- Cross-cwd resume is rejected by picker ("different directory, cd + --resume"). Not a regression — same in 1.1.0.
+
 ## 1.1.0 — 2026-05-22
 
 **Channel-bot TUI control plane** — new feature. Opt-in via `CHANNEL_BOT_TMUX_SESSION` env var. When enabled, the daemon intercepts a curated set of slash commands before forwarding them as ordinary chat content to claude TUI. The handlers run side-effects directly against the channel-bot deployment:
