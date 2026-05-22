@@ -23,34 +23,48 @@ set +e  # explicit error handling; do not exit on grep no-match etc.
 export HOME="/Users/USERNAME"
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# ─── 2. SESSION + WORKDIR ──────────────────────────────────────────────────
-# tmux session name the wrapper manages. MUST match
-# `CHANNEL_BOT_TMUX_SESSION` env var in the daemon plist.
-SESSION="MyChannelBot"
-# cwd for claude TUI (the project / vault root you want claude to operate in)
-WORKDIR="$HOME/path/to/your/workspace"
+# ─── 2. MANIFEST (SINGLE SOURCE OF TRUTH) ──────────────────────────────────
+# All agent config (tmux session, workspace dir, full claude command, ports)
+# lives in this .cc-agent.json manifest. Same file is consumed by:
+#   - this wrapper (reads to start claude)
+#   - supervisor.sh (reads to restart if applicable)
+#   - dashboard web-ui (reads to display + restart button)
+# Change in ONE place — all paths sync. See Obsidian:
+#   System Operation/Claude Code Global Config/Agent Manifest as Single Source of Truth.md
+MANIFEST="$HOME/path/to/your/workspace/.cc-agent.json"
 
-# ─── 3. PLUGIN PORTS ───────────────────────────────────────────────────────
-# Substituted into the patched .mcp.json ${TELEGRAM_HTTP_PORT} placeholder.
-# Must match the daemon plist's TELEGRAM_HTTP_PORT (and DISCORD_HTTP_PORT if
-# using the discord-http daemon too).
-TELEGRAM_HTTP_PORT="17631"
-DISCORD_HTTP_PORT="17641"  # omit this line + the flag below if not using discord
+if [ ! -f "$MANIFEST" ]; then
+  echo "FATAL: manifest not found at $MANIFEST" >&2
+  exit 1
+fi
 
-# ─── 4. CLAUDE BINARY (pinned) ─────────────────────────────────────────────
-# Pin to a known-good version. As of 2026-05-22, 2.1.141~2.1.148 have a
-# silent HTTP MCP transport regression (see GitHub #21721). Pin to 2.1.140
-# until upstream fixes — copy the binary to a stable path that the
-# auto-updater won't touch:
-#   cp $(readlink ~/.local/bin/claude) ~/.local/share/claude-pinned/2.1.140
-CLAUDE_BIN="$HOME/.local/share/claude-pinned/2.1.140"
+SESSION=$(jq -r '.tmux_session' "$MANIFEST")
+WORKDIR=$(jq -r '.workspace_dir' "$MANIFEST")
+CLAUDE_CMD_BASE=$(jq -r '.claude_command' "$MANIFEST")
+TELEGRAM_HTTP_PORT=$(jq -r '.channels.telegram.http_port // "17631"' "$MANIFEST")
+DISCORD_HTTP_PORT=$(jq -r '.channels.discord.http_port // "17641"' "$MANIFEST")
 
-# DISABLE_AUTOUPDATER=1 stops claude TUI's background update check (which
-# would silently upgrade the bare `claude` symlink to npm latest). Manual
-# `claude update` still works when you explicitly want to upgrade. Once you
-# confirm a new version is regression-free, replace the binary at $CLAUDE_BIN.
+# Sanity check — the wrapper depends on these three fields being present.
+for required in SESSION WORKDIR CLAUDE_CMD_BASE; do
+  if [ -z "${(P)required}" ] || [ "${(P)required}" = "null" ]; then
+    echo "FATAL: $required missing or null in manifest $MANIFEST" >&2
+    exit 1
+  fi
+done
 
-# ─── 5. RESUME ARGS OVERRIDE (1.1.0+ TUI control plane) ────────────────────
+# Notes on what `claude_command` MUST contain (verified at boot above — we
+# don't second-guess):
+#   - Full path to a pinned claude binary (NOT bare `claude`, which auto-updates)
+#     e.g.  /Users/USERNAME/.local/share/claude-pinned/2.1.140
+#     2.1.141~2.1.148 have a silent HTTP MCP transport regression (GitHub #21721)
+#   - All --channels flags for plugin loading (telegram-http + discord-http)
+#   - --disallowedTools AskUserQuestion ExitPlanMode (required for channel-bot;
+#     these picker tools deadlock without keyboard access — see upstream #40644)
+#   - --dangerously-skip-permissions
+# DO NOT add env vars (DISABLE_AUTOUPDATER, *_HTTP_PORT) here — they're added
+# at exec time below so the same value gets used by claude's .mcp.json subst.
+
+# ─── 3. RESUME ARGS OVERRIDE (1.1.0+ TUI control plane) ────────────────────
 # The telegram-http daemon's /restart and 1.1.0-style /resume write to this
 # file. On each start_claude(), we consume the file and append its content
 # to the launch command. Path MUST match the daemon plist's
@@ -65,19 +79,12 @@ build_claude_cmd() {
     log "found $NEXT_ARGS_FILE → appending: $extra"
     mv "$NEXT_ARGS_FILE" "$NEXT_ARGS_FILE.used.$(date +%s)" 2>/dev/null || rm -f "$NEXT_ARGS_FILE"
   fi
-  # NB: --disallowedTools AskUserQuestion ExitPlanMode is required for
-  # channel-bot mode — these picker-style tools deadlock when claude can't
-  # access the local keyboard. See upstream issue #40644.
   CLAUDE_CMD="cd $WORKDIR && \
 TELEGRAM_HTTP_PORT=$TELEGRAM_HTTP_PORT \
 DISCORD_HTTP_PORT=$DISCORD_HTTP_PORT \
 DISABLE_AUTOUPDATER=1 \
-$CLAUDE_BIN \
-  --channels plugin:telegram-http@crab-labs-plugins \
-  --channels plugin:discord-http@crab-labs-plugins \
-  --disallowedTools AskUserQuestion ExitPlanMode \
-  --dangerously-skip-permissions \
-  $extra"
+$CLAUDE_CMD_BASE \
+$extra"
 }
 # Default; build_claude_cmd will rebuild on every start.
 build_claude_cmd
