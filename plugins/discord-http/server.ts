@@ -34,6 +34,10 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
+import {
+  handleControlSlash,
+  isControlEnabled,
+} from './channel-bot-control.ts'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1029,6 +1033,24 @@ async function handleInbound(msg: Message): Promise<void> {
     const emoji = behavior === 'allow' ? '✅' : '❌'
     void msg.react(emoji).catch(() => {})
     return
+  }
+
+  // Channel-bot TUI control plane (opt-in via CHANNEL_BOT_TMUX_SESSION env).
+  // Intercept slash commands (/clear /resume /restart ...) BEFORE we broadcast
+  // them as ordinary chat content. The reply callback wraps msg.reply so the
+  // status update appears in Discord, not just in CLI logs.
+  if (isControlEnabled() && msg.content.trim().startsWith('/')) {
+    const replyToDc = async (text: string) => {
+      try { await msg.reply(text) }
+      catch (err) { log('error', `control-slash reply failed: ${err}`) }
+    }
+    try {
+      const handled = await handleControlSlash(msg.content, String(HTTP_PORT), replyToDc)
+      if (handled) return
+    } catch (err) {
+      log('error', `handleControlSlash failed: ${err}`)
+      // fall through — better to forward as chat than to drop silently
+    }
   }
 
   // Typing indicator — signals "processing" until we reply (or ~10s elapses).
