@@ -107,6 +107,31 @@ async function tmuxSendCtrlKey(key: string): Promise<void> {
   }
 }
 
+/** tmux capture-pane → returns plain text. */
+async function tmuxCapturePane(): Promise<string> {
+  const { exitCode, stdout } = await runCommand(
+    ['tmux', 'capture-pane', '-t', TMUX_SESSION, '-p'],
+  )
+  if (exitCode !== 0) return ''
+  return stdout
+}
+
+/** Is claude TUI's `/resume` picker overlay currently rendered? */
+async function isPickerOpen(): Promise<boolean> {
+  const pane = await tmuxCapturePane()
+  return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
+}
+
+/** Is claude TUI mid-tool-call / mid-turn? See telegram-http variant for
+ *  the 2026-05-24 claude-builder incident that motivated this guard. */
+async function isClaudeBusy(): Promise<boolean> {
+  const pane = await tmuxCapturePane()
+  const tail = pane.split('\n').slice(-15).join('\n')
+  if (!/❯\s/.test(tail)) return true
+  if (/Calling .*plugin|Bash\(|✻\s+\w+ed for|✢\s+\w+|⏺\s+\w+\(/.test(tail)) return true
+  return false
+}
+
 /**
  * Trigger claude TUI restart via the wrapper.
  *
@@ -340,14 +365,50 @@ function currentSessionId(): string | null {
  * connected; in-flight messages don't drop.
  */
 async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
+  // Step 1 — Pre-Escape: clear any pre-existing picker / partial input.
+  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+  await new Promise(r => setTimeout(r, 200))
+
+  // Step 2 — Busy guard: refuse picker driving when TUI is mid-tool-call.
+  // (See telegram-http variant for the 2026-05-24 incident details.)
+  if (await isClaudeBusy()) {
+    throw new Error(
+      'claude TUI is busy mid-turn — refusing to drive /resume picker. ' +
+      'Wait for the current turn to finish, then try again.'
+    )
+  }
+
+  // Step 3 — Open picker.
   await tmuxSendKeys('/resume')
-  await new Promise(r => setTimeout(r, 1500))  // picker render
+
+  // Step 4 — Poll for picker render (up to 3s) before sending Down.
+  let pickerOk = false
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await new Promise(r => setTimeout(r, 500))
+    if (await isPickerOpen()) { pickerOk = true; break }
+  }
+  if (!pickerOk) {
+    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+    throw new Error('picker failed to open after /resume (3s timeout) — Escape sent for safety')
+  }
+
+  // Step 5 — Navigate + confirm.
   for (let i = 0; i < pickerIdx; i++) {
     await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Down'])
     await new Promise(r => setTimeout(r, 100))
   }
   await new Promise(r => setTimeout(r, 200))
   await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Enter'])
+
+  // Step 6 — Post-verify: picker must close. If stuck, force-escape.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await new Promise(r => setTimeout(r, 500))
+    if (!(await isPickerOpen())) return
+  }
+  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+  throw new Error(
+    'picker still open 2s after Enter — sent Escape for cleanup. Resume may have not completed.'
+  )
 }
 
 // ---- /resume_previous chain (walk-back history) --------------------------
