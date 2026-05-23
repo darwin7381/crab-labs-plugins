@@ -227,7 +227,9 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst'; text: string 
     text.startsWith('<system') ||
     text.startsWith('<command-') ||
     text.startsWith('<local-command-') ||
-    text.startsWith('Caveat: The messages below')
+    text.startsWith('Caveat: The messages below') ||
+    text.startsWith('Continue from where you left off') ||
+    text.includes('<user-prompt-submit-hook')
   ) return null
   return {
     role: role === 'assistant' ? 'asst' : 'user',
@@ -292,15 +294,17 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
         if (session.entrypoint && session.firstUserMessage) break
       }
     } catch {}
-    // 40 records / 128KB window — walk past tool-heavy tail noise to
-    // find real conversational excerpts.
-    const tailRecs = readJsonlTail(full, 40, 128 * 1024)
-    const tailExcerpts: string[] = []
-    for (let i = tailRecs.length - 1; i >= 0 && tailExcerpts.length < 3; i--) {
+    // Tail: last 2 *user* messages only (assistant replies are long
+    // and generic; user questions are short and disambiguating).
+    // 200 records / 1MB window — one assistant turn can emit dozens
+    // of large tool blocks; smaller windows miss the prior user.
+    const tailRecs = readJsonlTail(full, 200, 1024 * 1024)
+    const userTail: string[] = []
+    for (let i = tailRecs.length - 1; i >= 0 && userTail.length < 2; i--) {
       const ex = extractMessageExcerpt(tailRecs[i])
-      if (ex) tailExcerpts.unshift(`${ex.role}: ${ex.text}`)
+      if (ex && ex.role === 'user') userTail.unshift(ex.text)
     }
-    if (tailExcerpts.length > 0) session.lastMessages = tailExcerpts
+    if (userTail.length > 0) session.lastMessages = userTail
     out.push(session)
   }
   // Match claude TUI picker: only entrypoint=cli interactive sessions visible.
@@ -394,7 +398,7 @@ function formatResumeReply(opts: {
     `started: ${(session.firstUserMessage ?? '(no preview)').slice(0, 100)}`,
   ]
   if (session.lastMessages?.length) {
-    lines.push('', 'last messages (tail of session):')
+    lines.push('', 'last user questions:')
     for (const m of session.lastMessages) lines.push(`  • ${m}`)
   }
   lines.push('', footer)
@@ -523,8 +527,8 @@ export async function handleControlSlash(
       `   started: ${(curSession.firstUserMessage ?? '(no preview)').slice(0, 90)}`,
     ]
     if (curSession.lastMessages?.length) {
-      lines.push(`   last:`)
-      for (const m of curSession.lastMessages.slice(-2)) lines.push(`     • ${m}`)
+      lines.push(`   last user questions:`)
+      for (const m of curSession.lastMessages) lines.push(`     • ${m}`)
     }
     if (chainNote) lines.push(chainNote)
     lines.push('', `claude TUI sessions (${sessions.length}, newest first — matches /resume picker):`, '')
@@ -535,8 +539,7 @@ export async function handleControlSlash(
       lines.push(`${i + 1}. ${updated}  ${title.slice(0, 60)}${tag}`)
       lines.push(`   \`${s.id}\``)
       if (s.lastMessages?.length) {
-        const last = s.lastMessages[s.lastMessages.length - 1]
-        lines.push(`   ↳ ${last}`)
+        for (const m of s.lastMessages) lines.push(`   ↳ ${m}`)
       }
     })
     lines.push(

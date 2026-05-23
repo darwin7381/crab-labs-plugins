@@ -227,7 +227,9 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst'; text: string 
     text.startsWith('<system') ||
     text.startsWith('<command-') ||
     text.startsWith('<local-command-') ||
-    text.startsWith('Caveat: The messages below')
+    text.startsWith('Caveat: The messages below') ||
+    text.startsWith('Continue from where you left off') ||
+    text.includes('<user-prompt-submit-hook')
   ) return null
   return {
     role: role === 'assistant' ? 'asst' : 'user',
@@ -292,18 +294,24 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
         if (session.entrypoint && session.firstUserMessage) break
       }
     } catch {}
-    // Tail: last few user/assistant excerpts so caller can see WHERE
-    // each session left off (key for /resume picker disambiguation).
-    // Read 40 records / 128KB window: long tool-heavy turns can fill
-    // the tail with [tool_use]/[tool_result] noise that extractExcerpt
-    // skips — we want to keep walking back until we find real prose.
-    const tailRecs = readJsonlTail(full, 40, 128 * 1024)
-    const tailExcerpts: string[] = []
-    for (let i = tailRecs.length - 1; i >= 0 && tailExcerpts.length < 3; i--) {
+    // Tail: last 2 *user* messages so caller can see WHERE each
+    // session left off. User messages disambiguate better than
+    // assistant messages: user questions are short and specific
+    // ("在嗎", "處理好了沒"), while assistant replies tend to be long
+    // and generic. Joey 2026-05-24: 「資訊還是不夠多，看到的還是很多
+    // 廢話 — 要多抓兩則我最後問的問題才行」.
+    //
+    // Read 200 records / 1MB window because a single assistant turn
+    // on a channel-bot session can emit dozens of large tool_use /
+    // tool_result records (Bash with big stdout, file reads, etc.)
+    // making the per-user-message footprint multi-hundred-KB.
+    const tailRecs = readJsonlTail(full, 200, 1024 * 1024)
+    const userTail: string[] = []
+    for (let i = tailRecs.length - 1; i >= 0 && userTail.length < 2; i--) {
       const ex = extractMessageExcerpt(tailRecs[i])
-      if (ex) tailExcerpts.unshift(`${ex.role}: ${ex.text}`)
+      if (ex && ex.role === 'user') userTail.unshift(ex.text)
     }
-    if (tailExcerpts.length > 0) session.lastMessages = tailExcerpts
+    if (userTail.length > 0) session.lastMessages = userTail
     out.push(session)
   }
   // Match claude TUI picker: only entrypoint=cli interactive sessions visible.
@@ -401,7 +409,7 @@ function formatResumeReply(opts: {
     `started: ${(session.firstUserMessage ?? '(no preview)').slice(0, 100)}`,
   ]
   if (session.lastMessages?.length) {
-    lines.push('', 'last messages (tail of session):')
+    lines.push('', 'last user questions:')
     for (const m of session.lastMessages) lines.push(`  • ${m}`)
   }
   lines.push('', footer)
@@ -530,8 +538,8 @@ export async function handleControlSlash(
       `   started: ${(curSession.firstUserMessage ?? '(no preview)').slice(0, 90)}`,
     ]
     if (curSession.lastMessages?.length) {
-      lines.push(`   last:`)
-      for (const m of curSession.lastMessages.slice(-2)) lines.push(`     • ${m}`)
+      lines.push(`   last user questions:`)
+      for (const m of curSession.lastMessages) lines.push(`     • ${m}`)
     }
     if (chainNote) lines.push(chainNote)
     lines.push('', `claude TUI sessions (${sessions.length}, newest first — matches /resume picker):`, '')
@@ -542,10 +550,9 @@ export async function handleControlSlash(
       lines.push(`${i + 1}. ${updated}  ${title.slice(0, 60)}${tag}`)
       lines.push(`   \`${s.id}\``)
       if (s.lastMessages?.length) {
-        // Just the last message — keep list compact (≤15 sessions ×
-        // 4 lines each fits in Telegram's 4096-char window).
-        const last = s.lastMessages[s.lastMessages.length - 1]
-        lines.push(`   ↳ ${last}`)
+        // 2 most recent user questions — disambiguates session even
+        // when first-user-msg ("在嗎") is identical across sessions.
+        for (const m of s.lastMessages) lines.push(`   ↳ ${m}`)
       }
     })
     lines.push(

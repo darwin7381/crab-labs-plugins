@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.4 — 2026-05-24
+
+### Changed
+- **Tail excerpts now show last 2 *user* questions only** (was: mixed user+assistant up to 3). Joey 2026-05-24: 「資訊還是不夠多，看到的還是很多廢話 — 要多抓兩則我最後問的問題才行」. Assistant replies tend to be long and generic, user questions are short and disambiguating (「在嗎」「處理好了沒」). Per-row format changed from `↳ user: ...` to `↳ ...` (role prefix dropped since all entries are user now).
+- `readJsonlTail` window widened from `(40 records, 128KB)` → `(200 records, 1MB)` — one channel-bot assistant turn can emit dozens of large tool blocks (Bash with big stdout, file reads), making per-user-message footprint multi-hundred-KB. Smaller windows were only finding the single most recent user msg on busy sessions.
+- `extractMessageExcerpt` also skips `Continue from where you left off` (auto-inserted by Anthropic harness on session restart) and `<user-prompt-submit-hook>` blocks — both were polluting the user-question list.
+
+### Format example
+
+`/resume_list` current-session header now reads:
+```
+📍 *current session*  `cc557b36-...`
+   started: 馬上進行 B 一次完成
+   last user questions:
+     • 什麼鬼怎麼寫在 Clinic？還有專案到底有記錄嗎？
+     • 你為何總是忘記該紀錄的所有位置？要多抓兩則我最後問的問題才行
+```
+
+Each session row also gains 2 `↳` lines (was: 1 mixed user/asst).
+
+### Synced
+- discord-http 1.1.3 ships the same change.
+
 ## 1.2.3 — 2026-05-24
 
 ### Fixed
