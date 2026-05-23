@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.3 — 2026-05-24
+
+Synced from [telegram-http 1.2.4](../telegram-http/CHANGELOG.md): tail excerpts now show last 2 *user* questions only (not mixed user+assistant), `readJsonlTail` window widened to 1MB / 200 records, also filter `Continue from where you left off` and `<user-prompt-submit-hook>` framework injections.
+
 ## 1.1.2 — 2026-05-24
 
 Synced from [telegram-http 1.2.3](../telegram-http/CHANGELOG.md): tail excerpts now skip pure tool_use / tool_result records and `<local-command-…>` / `Caveat:` framework injections, walking back through up to 40 records / 128KB so resume picker rows always show real prose, not `[tool_result]` noise.
