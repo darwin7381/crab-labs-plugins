@@ -28,7 +28,7 @@
  * this for an unauthenticated message.
  */
 
-import { readdirSync, readFileSync, statSync, existsSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 
@@ -151,7 +151,76 @@ type ClaudeSession = {
   id: string
   mtimeMs: number
   firstUserMessage?: string
+  /** Last ~3 user/assistant messages from the session tail, as
+   *  formatted "user: ..." / "asst: ..." lines. Each excerpt truncated
+   *  to ~120 chars. Lets Joey recognize WHICH session by its recent
+   *  conversation context rather than just session id prefix. */
+  lastMessages?: string[]
   entrypoint?: string
+}
+
+/**
+ * Read the last N complete JSON lines from a (potentially large) jsonl
+ * file by seeking near the end. Avoids loading multi-MB session files
+ * into memory just to grab the tail.
+ */
+function readJsonlTail(path: string, maxLines: number, bytesWindow = 64 * 1024): unknown[] {
+  let fd: number | null = null
+  try {
+    const stat = statSync(path)
+    if (stat.size === 0) return []
+    fd = openSync(path, 'r')
+    const window = Math.min(bytesWindow, stat.size)
+    const buf = Buffer.alloc(window)
+    readSync(fd, buf, 0, window, stat.size - window)
+    let text = buf.toString('utf8')
+    // If we started mid-line, drop the partial line at the front.
+    if (stat.size > window) {
+      const nl = text.indexOf('\n')
+      if (nl >= 0) text = text.slice(nl + 1)
+    }
+    const out: unknown[] = []
+    const lines = text.split('\n')
+    for (let i = lines.length - 1; i >= 0 && out.length < maxLines; i--) {
+      const line = lines[i]
+      if (!line.startsWith('{')) continue
+      try { out.unshift(JSON.parse(line)) } catch {}
+    }
+    return out
+  } catch {
+    return []
+  } finally {
+    if (fd !== null) { try { closeSync(fd) } catch {} }
+  }
+}
+
+/** Extract a flat-text excerpt from a claude jsonl message record. */
+function extractMessageExcerpt(rec: any): { role: 'user' | 'asst' | 'tool'; text: string } | null {
+  const role = rec?.role ?? rec?.message?.role
+  if (role !== 'user' && role !== 'assistant') return null
+  const content = rec?.content ?? rec?.message?.content
+  let text = ''
+  if (typeof content === 'string') {
+    text = content
+  } else if (Array.isArray(content)) {
+    for (const c of content) {
+      if (typeof c === 'string') { text += c + ' ' }
+      else if (c?.type === 'text' && typeof c.text === 'string') { text += c.text + ' ' }
+      else if (c?.type === 'tool_use') { text += `[tool: ${c.name ?? '?'}] ` }
+      else if (c?.type === 'tool_result') { text += `[tool_result] ` }
+    }
+  }
+  text = text.trim()
+  if (!text) return null
+  // Strip <channel ...>...</channel> framing for readability
+  const m = text.match(/^<channel\b[^>]*>([\s\S]*?)<\/channel>\s*$/)
+  if (m) text = m[1].trim()
+  // Skip pure system/hook injections
+  if (text.startsWith('<system') || text.startsWith('<command-')) return null
+  return {
+    role: role === 'assistant' ? 'asst' : 'user',
+    text: text.replace(/\s+/g, ' ').slice(0, 120),
+  }
 }
 
 /**
@@ -211,6 +280,15 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
         if (session.entrypoint && session.firstUserMessage) break
       }
     } catch {}
+    // Tail: last few user/assistant excerpts so caller can see WHERE
+    // each session left off (key for /resume picker disambiguation).
+    const tailRecs = readJsonlTail(full, 8)
+    const tailExcerpts: string[] = []
+    for (let i = tailRecs.length - 1; i >= 0 && tailExcerpts.length < 3; i--) {
+      const ex = extractMessageExcerpt(tailRecs[i])
+      if (ex) tailExcerpts.unshift(`${ex.role}: ${ex.text}`)
+    }
+    if (tailExcerpts.length > 0) session.lastMessages = tailExcerpts
     out.push(session)
   }
   // Match claude TUI picker: only entrypoint=cli interactive sessions visible.
@@ -286,6 +364,33 @@ function saveResumeChain(chain: ResumeChain): void {
   try {
     writeFileSync(RESUME_CHAIN_FILE, JSON.stringify(chain), { mode: 0o644 })
   } catch {}
+}
+
+/**
+ * Render a resume confirmation reply that shows enough context for Joey
+ * to recognize WHICH session he just switched to: id prefix, when it
+ * started (first user msg), and where it left off (last ~3 messages).
+ *
+ * Without `lastMessages`, the original reply only showed an 8-char id
+ * prefix + first msg — useless for picking up an old conversation
+ * mid-stream. Joey called this out 2026-05-24.
+ */
+function formatResumeReply(opts: {
+  header: string
+  session: ClaudeSession
+  footer: string
+}): string {
+  const { header, session, footer } = opts
+  const lines = [
+    `${header} → \`${session.id.slice(0, 8)}…\``,
+    `started: ${(session.firstUserMessage ?? '(no preview)').slice(0, 100)}`,
+  ]
+  if (session.lastMessages?.length) {
+    lines.push('', 'last messages (tail of session):')
+    for (const m of session.lastMessages) lines.push(`  • ${m}`)
+  }
+  lines.push('', footer)
+  return lines.join('\n')
 }
 
 // ---- daemon health (for /status) -----------------------------------------
@@ -400,7 +505,6 @@ export async function handleControlSlash(
     }
     const cur = currentSessionId()
     const curSession = sessions.find(s => s.id === cur) ?? sessions[0]
-    const curPreview = curSession.firstUserMessage ?? '(no preview)'
     const chain = loadResumeChain()
     const chainNote =
       chain.ids.length > 1 && chain.ids[chain.ids.length - 1] === cur
@@ -408,8 +512,12 @@ export async function handleControlSlash(
         : ''
     const lines = [
       `📍 *current session*  \`${curSession.id}\``,
-      `   ${curPreview.slice(0, 80)}`,
+      `   started: ${(curSession.firstUserMessage ?? '(no preview)').slice(0, 90)}`,
     ]
+    if (curSession.lastMessages?.length) {
+      lines.push(`   last:`)
+      for (const m of curSession.lastMessages.slice(-2)) lines.push(`     • ${m}`)
+    }
     if (chainNote) lines.push(chainNote)
     lines.push('', `claude TUI sessions (${sessions.length}, newest first — matches /resume picker):`, '')
     sessions.forEach((s, i) => {
@@ -418,6 +526,12 @@ export async function handleControlSlash(
       const title = s.firstUserMessage ?? '(no preview)'
       lines.push(`${i + 1}. ${updated}  ${title.slice(0, 60)}${tag}`)
       lines.push(`   \`${s.id}\``)
+      if (s.lastMessages?.length) {
+        // Just the last message — keep list compact (≤15 sessions ×
+        // 4 lines each fits in Telegram's 4096-char window).
+        const last = s.lastMessages[s.lastMessages.length - 1]
+        lines.push(`   ↳ ${last}`)
+      }
     })
     lines.push(
       '',
@@ -469,10 +583,11 @@ export async function handleControlSlash(
     await tryRun('resume_previous (chain walk-back)', async () => {
       await resumePickerInlineSwitch(targetPickerIdx)
       saveResumeChain(chain)
-      const preview = targetSession.firstUserMessage?.slice(0, 50) ?? '(no preview)'
-      await replyToTg(
-        `↩️ walk-back step ${chain.ids.length - 1} → \`${targetSession.id.slice(0, 8)}…\`\n${preview}\n_(chain depth ${chain.ids.length}; \`/resume_previous\` again to go further back)_`,
-      )
+      await replyToTg(formatResumeReply({
+        header: `↩️ walk-back step ${chain.ids.length - 1}`,
+        session: targetSession,
+        footer: `_(chain depth ${chain.ids.length}; \`/resume_previous\` again to go further back)_`,
+      }))
     })
     return true
   }
@@ -529,10 +644,11 @@ export async function handleControlSlash(
       await resumePickerInlineSwitch(targetIdx)
       // Explicit pick resets walk-back chain to start fresh from this session.
       saveResumeChain({ ids: [target.id], ts: Date.now() })
-      const preview = target.firstUserMessage?.slice(0, 50) ?? '(no preview)'
-      await replyToTg(
-        `↩️ inline-switched to session #${targetIdx + 1} \`${target.id.slice(0, 8)}…\`\n${preview}\n_(same TUI process — chain reset)_`,
-      )
+      await replyToTg(formatResumeReply({
+        header: `↩️ inline-switched to session #${targetIdx + 1}`,
+        session: target,
+        footer: '_(same TUI process — chain reset)_',
+      }))
     })
     return true
   }

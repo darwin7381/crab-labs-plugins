@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.2 — 2026-05-24
+
+### Fixed
+- **`/resume`, `/resume_previous`, `/resume_list` replies now include `last messages (tail of session)` excerpts** — previously the only context was an 8-char session-id prefix + the FIRST user message. Joey: 「現在這樣重啟後我根本看不出來他到底重啟到了哪個你懂嗎？還是要列一些對話，例如新的對話的結尾」(2026-05-23 screenshot showed `↩️ walk-back step 1 → 43261680…` with no recognizable conversation context).
+
+  Switched-to session reply now shows:
+  ```
+  ↩️ walk-back step 1 → `43261680…`
+  started: 你看看這是另一隻 agent 的建議 …
+  
+  last messages (tail of session):
+    • user: 我們要先做什麼比較好？
+    • asst: 建議先把 Cost panel 跑通 …
+    • user: 好，那就開工
+  
+  _(chain depth 2; `/resume_previous` again to go further back)_
+  ```
+
+  `/resume_list` per-session row gains a `↳ <last-msg>` line so Joey can disambiguate which session is which in the picker.
+
+### Added
+- `readJsonlTail(path, maxLines, bytesWindow=64KB)` — seeks to file end + reads back N lines without loading multi-MB session files into memory.
+- `extractMessageExcerpt(rec)` — flat-text extraction from claude jsonl records; handles `string | Array<text|tool_use|tool_result>`, strips `<channel>` framing, skips `<system>` and `<command-…>` injections, returns `{role: 'user'|'asst', text}` truncated to 120 chars.
+- `formatResumeReply({header, session, footer})` — shared renderer used by both `/resume` and `/resume_previous` so the format stays in sync.
+- `ClaudeSession.lastMessages?: string[]` — populated in `listClaudeSessions` from the tail of each jsonl. Each entry formatted as `user: ...` or `asst: ...`, max 3 per session.
+
+### Synced
+- discord-http 1.1.1 ships the same change (keep-in-sync rule between channel-bot-control.ts copies).
+
 ## 1.2.1 — 2026-05-22
 
 ### Fixed
