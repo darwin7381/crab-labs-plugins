@@ -10,6 +10,39 @@ Drop-in replacement for the official `discord@claude-plugins-official` plugin. S
 >
 > 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
 
+## ⚠️ MUST disable `discord@claude-plugins-official` before using this fork
+
+If you leave the official `discord` plugin enabled in `~/.claude/settings.json` `enabledPlugins`,
+every claude TUI session that starts will ALSO auto-spawn the official plugin's stdio child
+process — which connects to Discord gateway with whatever bot token sits in
+`~/.claude/channels/discord/.env`. Discord gateway **only allows ONE active WebSocket per bot
+token**, so the two clients will repeatedly kick each other off. Symptom: bot appears offline,
+messages don't reach claude, random disconnects.
+
+```bash
+# auto-fix in user-level settings.json (run once):
+python3 -c "
+import json
+p = '/Users/$(whoami)/.claude/settings.json'
+with open(p) as f: s = json.load(f)
+ep = s.setdefault('enabledPlugins', {})
+changed = False
+for k in ['telegram@claude-plugins-official', 'discord@claude-plugins-official']:
+    if ep.get(k) is True:
+        ep[k] = False
+        changed = True
+        print(f'disabled: {k}')
+if changed:
+    with open(p, 'w') as f: json.dump(s, f, indent=2)
+"
+```
+
+Restart any claude TUI already running. Migration history: 2026-05-13 we kept both enabled
+as Route B rollout fallback; 2026-05-23 a new agent (`claude-social-writer`) triggered the
+Telegram 409 + Discord gateway conflict simultaneously and we made disable mandatory.
+
+---
+
 ## Why this fork
 
 The official plugin uses stdio transport: claude TUI spawns the bun process as a subprocess and pipes stdin/stdout. If claude closes the stdio (which can happen periodically), the plugin dies. With the Discord gateway WebSocket holding state, every death drops messages and breaks reply flow.
