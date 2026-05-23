@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.4 — 2026-05-24
+
+Synced from [telegram-http 1.2.5](../telegram-http/CHANGELOG.md): fixes `/resume <N>` and `/resume_previous` off-by-one — picker excludes the current session, so array idx N maps to picker idx (N - 1).
+
 ## 1.1.3 — 2026-05-24
 
 Synced from [telegram-http 1.2.4](../telegram-http/CHANGELOG.md): tail excerpts now show last 2 *user* questions only (not mixed user+assistant), `readJsonlTail` window widened to 1MB / 200 records, also filter `Continue from where you left off` and `<user-prompt-submit-hook>` framework injections.

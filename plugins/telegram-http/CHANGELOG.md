@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.5 — 2026-05-24
+
+### Fixed
+- **`/resume <N>` and `/resume_previous` off-by-one** — claude TUI's `/resume` picker **excludes the current session** (you can't resume to yourself); our `listClaudeSessions` includes it at array idx 0. We were passing array idx as picker idx → every switch landed on the session BELOW the intended one. Joey 2026-05-24: 「我發現你現在輸入排列好嗎的 resume 功能是錯亂的欸，明明看好了結果起的卻是另一個」.
+
+  Verified empirically by capturing claude-research's `/resume` picker pane: 6 entries in picker vs 7 in listClaudeSessions (delta = current session, hidden by picker).
+
+### Changed
+- `resumePickerInlineSwitch` parameter renamed `downCount` → `pickerIdx`. Caller is now responsible for the array-idx → picker-idx conversion (subtract 1).
+- `/resume <N>`: `resumePickerInlineSwitch(targetIdx - 1)` (was `targetIdx`).
+- `/resume_previous`: `targetPickerIdx = chain.ids.length - 1` (was `chain.ids.length`).
+
+### Synced
+- discord-http 1.1.4 ships the same fix.
+
 ## 1.2.4 — 2026-05-24
 
 ### Changed
