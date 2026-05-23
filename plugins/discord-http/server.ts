@@ -36,7 +36,10 @@ import { join, sep } from 'path'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
 import {
   handleControlSlash,
+  handleCallbackData,
   isControlEnabled,
+  type InlineButton,
+  type ReplyOptions,
 } from './channel-bot-control.ts'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -475,6 +478,49 @@ async function fetchTextChannel(id: string) {
     throw new Error(`channel ${id} not found or not text-based`)
   }
   return ch
+}
+
+/**
+ * Send text + optional inline buttons to a Discord channel. Discord's
+ * ACTION_ROW supports max 5 buttons per row and max 5 rows = 25 buttons.
+ * Used by channel-bot-control.ts /resume_list → tap-friendly UUID buttons.
+ */
+async function sendTextWithMaybeButtons(
+  channelId: string,
+  text: string,
+  buttons?: InlineButton[][],
+): Promise<void> {
+  const chunks = chunk(text, 1900, 'newline')  // Discord cap 2000 chars
+  let components: ActionRowBuilder<ButtonBuilder>[] | undefined
+  if (buttons && buttons.length > 0) {
+    components = buttons.slice(0, 5).map(row => {
+      const ar = new ActionRowBuilder<ButtonBuilder>()
+      for (const b of row.slice(0, 5)) {
+        ar.addComponents(
+          new ButtonBuilder()
+            .setCustomId(b.callback_data.slice(0, 100))
+            .setLabel(b.text.slice(0, 80))
+            .setStyle(ButtonStyle.Secondary),
+        )
+      }
+      return ar
+    })
+  }
+  try {
+    const ch = await fetchTextChannel(channelId)
+    if (!('send' in ch) || typeof ch.send !== 'function') {
+      log('warn', `sendTextWithMaybeButtons: channel ${channelId} not sendable`)
+      return
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1
+      const payload: { content: string; components?: ActionRowBuilder<ButtonBuilder>[] } = { content: chunks[i] }
+      if (isLast && components) payload.components = components
+      await (ch as { send: (p: typeof payload) => Promise<unknown> }).send(payload)
+    }
+  } catch (err) {
+    log('warn', `sendTextWithMaybeButtons failed: ${err instanceof Error ? err.message : err}`)
+  }
 }
 
 // Outbound gate — tools can only target chats the inbound gate would deliver
@@ -922,6 +968,32 @@ client.on('error', err => {
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
+
+  // Channel-bot control buttons (`resume:<uuid_prefix>` from /resume_list).
+  // Routed before perm: regex so resume buttons keep working if we ever
+  // change the perm: format.
+  if (interaction.customId.startsWith('resume:')) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const chatId = interaction.channelId ?? interaction.user.id
+    const httpPort = String(process.env.DISCORD_HTTP_PORT ?? HTTP_PORT)
+    const replyToDc = async (msg: string, opts?: ReplyOptions) => {
+      await sendTextWithMaybeButtons(chatId, msg, opts?.keyboard)
+    }
+    try {
+      // Ack the interaction to dismiss the loading spinner; subsequent
+      // responses go via channel.send (the replyToDc above).
+      await interaction.deferUpdate().catch(() => {})
+      await handleCallbackData(interaction.customId, httpPort, replyToDc)
+    } catch (err) {
+      log('warn', `handleCallbackData failed: ${err instanceof Error ? err.message : err}`)
+    }
+    return
+  }
+
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
   const access = loadAccess()
@@ -1040,9 +1112,8 @@ async function handleInbound(msg: Message): Promise<void> {
   // them as ordinary chat content. The reply callback wraps msg.reply so the
   // status update appears in Discord, not just in CLI logs.
   if (isControlEnabled() && msg.content.trim().startsWith('/')) {
-    const replyToDc = async (text: string) => {
-      try { await msg.reply(text) }
-      catch (err) { log('error', `control-slash reply failed: ${err}`) }
+    const replyToDc = async (text: string, opts?: ReplyOptions) => {
+      await sendTextWithMaybeButtons(msg.channelId, text, opts?.keyboard)
     }
     try {
       const handled = await handleControlSlash(msg.content, String(HTTP_PORT), replyToDc)

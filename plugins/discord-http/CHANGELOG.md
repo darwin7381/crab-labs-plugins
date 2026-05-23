@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.0 — 2026-05-24
+
+Synced from [telegram-http 1.3.0](../telegram-http/CHANGELOG.md): `/resume_list` now renders sessions as Discord buttons (ACTION_ROW + ButtonBuilder, 3 buttons per row, max 5 rows). Click → `interactionCreate` → `handleCallbackData` → `/resume <uuid>` flow. Eliminates the list-idx → picker-idx mapping that caused the 1.2.5 off-by-one bug.
+
 ## 1.1.5 — 2026-05-24
 
 Synced from [telegram-http 1.2.6](../telegram-http/CHANGELOG.md): every Discord channel notification now has a trailing `[protocol] ...reply via mcp__plugin_discord-http_discord-http__reply...` reminder. Contextual companion to the Stop-hook infrastructure fix; addresses LLM attention dilution against the one-shot CLAUDE.md model.

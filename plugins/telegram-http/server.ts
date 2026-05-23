@@ -25,8 +25,11 @@ import { join, extname, sep } from 'path'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
 import {
   handleControlSlash,
+  handleCallbackData,
   isControlEnabled,
   controlCommandsForBotApi,
+  type InlineButton,
+  type ReplyOptions,
 } from './channel-bot-control.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -452,6 +455,41 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   }
   if (rest) out.push(rest)
   return out
+}
+
+/**
+ * Send a text message, optionally with an inline_keyboard. Splits long text
+ * across multiple messages (Telegram cap 4096 chars). The keyboard is
+ * attached to the LAST chunk only (where the action call-to-action lives).
+ *
+ * Used by channel-bot-control.ts to render /resume_list as a tap-friendly
+ * button list — passing UUID directly bypasses the list-idx → picker-idx
+ * mapping that caused the 1.2.5 off-by-one bug.
+ */
+async function sendTextWithMaybeKeyboard(
+  chatId: string,
+  text: string,
+  keyboardSpec?: InlineButton[][],
+): Promise<void> {
+  const chunks = chunk(text, 4000, 'newline')
+  const kb = keyboardSpec
+    ? (() => {
+        const k = new InlineKeyboard()
+        keyboardSpec.forEach((row, i) => {
+          if (i > 0) k.row()
+          for (const btn of row) k.text(btn.text, btn.callback_data)
+        })
+        return k
+      })()
+    : undefined
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1
+    try {
+      await bot.api.sendMessage(chatId, chunks[i], isLast && kb ? { reply_markup: kb } : {})
+    } catch (err) {
+      log('warn', `sendTextWithMaybeKeyboard failed: ${err instanceof Error ? err.message : err}`)
+    }
+  }
 }
 
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
@@ -915,6 +953,32 @@ bot.command('status', async ctx => {
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+
+  // Channel-bot control buttons (e.g. `resume:<uuid_prefix>` from /resume_list).
+  // Routed BEFORE the permission regex check so resume buttons work even if
+  // we ever change the perm: format. Security: only allowlisted senders can
+  // trigger these (gate() called below — replicate here).
+  if (data.startsWith('resume:')) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chatId = String(ctx.chat?.id ?? senderId)
+    const httpPort = String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT)
+    const replyToTg = async (msg: string, opts?: ReplyOptions) => {
+      await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard)
+    }
+    try {
+      await handleCallbackData(data, httpPort, replyToTg)
+    } catch (err) {
+      log('warn', `handleCallbackData failed: ${err instanceof Error ? err.message : err}`)
+    }
+    await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -1163,12 +1227,8 @@ async function handleInbound(
     const handled = await handleControlSlash(
       text,
       String(HTTP_PORT),
-      async (msg: string) => {
-        try {
-          await bot.api.sendMessage(chat_id, msg)
-        } catch (err) {
-          log('warn', `channel-bot-control reply failed: ${err instanceof Error ? err.message : err}`)
-        }
+      async (msg: string, opts?: ReplyOptions) => {
+        await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard)
       },
     )
     if (handled) {

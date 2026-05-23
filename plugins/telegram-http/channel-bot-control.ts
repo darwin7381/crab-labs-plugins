@@ -450,14 +450,36 @@ async function daemonStatus(httpPort: string): Promise<string> {
 // ---- main dispatch -------------------------------------------------------
 
 /**
+ * Inline-keyboard button spec for Telegram (TG) and Discord (DC).
+ * - text: visible label (TG ≤ 64 chars, DC ≤ 80)
+ * - callback_data: opaque payload sent back when user taps (TG ≤ 64 bytes,
+ *   DC custom_id ≤ 100 chars). Format we use: `resume:<8-char-uuid-prefix>`.
+ */
+export type InlineButton = { text: string; callback_data: string }
+
+export type ReplyOptions = {
+  /**
+   * Inline keyboard. Outer array = rows (TG max 100 rows; DC max 5 rows of 5).
+   * Inner array = buttons in that row. server.ts callers translate to the
+   * platform-native shape (Telegram reply_markup.inline_keyboard or Discord
+   * components ACTION_ROW).
+   */
+  keyboard?: InlineButton[][]
+}
+
+/**
  * Try to handle `text` as a channel-bot control slash command.
  * Returns true if it was handled (caller should NOT forward to claude),
  * false if not (caller continues with normal claude forward).
+ *
+ * `replyToTg` signature: (msg, opts?) where opts.keyboard is the inline
+ * keyboard. Caller is responsible for rendering it via Telegram/Discord
+ * native APIs. Pass undefined/omit opts for plain text replies.
  */
 export async function handleControlSlash(
   text: string,
   httpPort: string,
-  replyToTg: (msg: string) => Promise<void>,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
 ): Promise<boolean> {
   if (!isControlEnabled()) return false
   const trimmed = text.trim()
@@ -566,10 +588,22 @@ export async function handleControlSlash(
     })
     lines.push(
       '',
-      'use `/resume <number>` (e.g. `/resume 2`), `/resume <session-id>`, or `/resume_previous`.',
-      '_(inline-switch via picker — no restart, no message loss)_',
+      '👇 Tap a button to resume that session (UUID passed directly, no off-by-one risk).',
+      'Or use `/resume <number>`, `/resume <session-id>`, `/resume_previous`.',
     )
-    await replyToTg(lines.join('\n'))
+    // Inline keyboard: one button per session, labeled with #N + brief.
+    // callback_data = `resume:<8-char-uuid-prefix>` (reused by handleCallbackData).
+    // TG callback_data max 64 bytes; "resume:" + 8-char prefix = 15 bytes — fits.
+    const keyboard: InlineButton[][] = sessions.map((s, i) => {
+      const mark = s.id === cur ? '📍' : '↩️'
+      const title = (s.firstUserMessage ?? '(no preview)').slice(0, 40)
+      const date = new Date(s.mtimeMs).toISOString().slice(5, 16).replace('T', ' ')
+      return [{
+        text: `${mark} #${i + 1} ${date} ${title}`,
+        callback_data: `resume:${s.id.slice(0, 8)}`,
+      }]
+    })
+    await replyToTg(lines.join('\n'), { keyboard })
     return true
   }
 
@@ -692,6 +726,31 @@ export async function handleControlSlash(
   }
 
   return false
+}
+
+/**
+ * Handle a Telegram callback_query / Discord interaction.
+ * `data` is the `callback_data` (TG) or `custom_id` (DC) set by the button
+ * we emitted in /resume_list. Currently supported format:
+ *   `resume:<8-char-uuid-prefix>` — resume that session (UUID prefix passed
+ *   straight through; bypasses entire list-idx → picker-idx mapping that
+ *   caused the 1.2.5 off-by-one bug).
+ *
+ * Returns true if data was understood + dispatched, false otherwise.
+ */
+export async function handleCallbackData(
+  data: string,
+  httpPort: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  if (!data.startsWith('resume:')) return false
+  const uuidPrefix = data.slice('resume:'.length).trim()
+  if (!uuidPrefix) {
+    await replyToTg('❌ empty UUID prefix in callback data')
+    return true
+  }
+  // Reuse the `/resume <uuid>` path so we don't fork resume logic.
+  return handleControlSlash(`/resume ${uuidPrefix}`, httpPort, replyToTg)
 }
 
 // ---- For the bot menu (Telegram setMyCommands) ---------------------------

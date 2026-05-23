@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0 — 2026-05-24
+
+### Added
+- **Inline keyboard for `/resume_list`** — every session now appears as a Telegram inline button. Tap once → daemon receives `callback_query` with `resume:<uuid_prefix>` → routes through existing `/resume <uuid>` by-prefix handler → claude TUI inline-switches. **Bypasses the entire list-index → picker-index mapping** that caused the 1.2.5 off-by-one bug. Joey 2026-05-24: 「讓他直接產生出 telegram 選項按鈕讓我點哪個會更準不會歪掉」.
+
+### Changed
+- `handleControlSlash` `replyToTg` signature widened to `(msg, opts?: ReplyOptions)` where `opts.keyboard?: InlineButton[][]`. server.ts callers translate to Telegram `reply_markup.inline_keyboard`. Plain `/clear` `/status` etc. callers can still call without opts; only `/resume_list` populates the keyboard.
+- New exports from `channel-bot-control.ts`: `InlineButton`, `ReplyOptions`, `handleCallbackData`. The callback handler is wired in server.ts `bot.on('callback_query:data')` before the existing perm-button regex.
+- New server.ts helper `sendTextWithMaybeKeyboard(chatId, text, keyboard?)` — splits long text (4000-char chunks) and attaches keyboard to the LAST chunk only.
+
+### Synced
+- discord-http 1.2.0 ships the same feature using Discord ACTION_ROW + ButtonBuilder (max 5 per row × 5 rows = 25 buttons; we pack 3 per row).
+
 ## 1.2.6 — 2026-05-24
 
 ### Added
