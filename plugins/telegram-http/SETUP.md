@@ -131,6 +131,41 @@ launchctl getenv DISABLE_AUTOUPDATER                            # → 1
 
 ### 🚫 多機器部署規則：每台一個 bot token（**禁止兩台 share token**）
 
+### ⚠️ MUST: disable official `telegram@claude-plugins-official` plugin everywhere
+
+If you have BOTH the official `telegram` plugin AND this fork (`telegram-http`) enabled in
+`~/.claude/settings.json` `enabledPlugins`, **every claude TUI session that starts will spawn
+the official plugin's stdio child process** — which polls Telegram with whatever bot token sits
+in `~/.claude/channels/telegram/.env`. If the same token is being polled by your `telegram-http`
+HTTP daemon, you get **persistent `409 Conflict` from Telegram** and inbound messages stop
+reaching the daemon entirely. **This is independent of the bot-token-collision case below**;
+it happens with a SINGLE token too, because two callers (one in this machine alone) are
+polling the same token.
+
+```bash
+# Verify + auto-fix in user-level settings.json:
+python3 -c "
+import json
+p = '/Users/$(whoami)/.claude/settings.json'
+with open(p) as f: s = json.load(f)
+ep = s.setdefault('enabledPlugins', {})
+changed = False
+for k in ['telegram@claude-plugins-official', 'discord@claude-plugins-official']:
+    if ep.get(k) is True:
+        ep[k] = False
+        changed = True
+        print(f'disabled: {k}')
+if changed:
+    with open(p, 'w') as f: json.dump(s, f, indent=2)
+"
+```
+
+Restart any claude TUI that's already running so it doesn't keep its existing official-plugin
+child alive. Migration history: 2026-05-13 we kept both enabled as fallback during Route B
+rollout; 2026-05-23 a new agent triggered the 409 loop and we made disable mandatory.
+
+---
+
 如果你的 Mac mini + MBP 都想跑 channel-bot daemon（兩台都 always-on），**絕對不能讓兩個 daemon 用同一個 Telegram bot token / Discord bot token**：
 
 ```
