@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.6 — 2026-05-24
+
+### Added
+- **Trailing protocol reminder in every channel notification** — each inbound from Telegram now arrives with an appended `[protocol] You MUST respond via mcp__plugin_telegram-http_telegram-http__reply(chat_id="...") ...` hint inside the same `<channel>` block. Mitigates the "CLAUDE.md is one-shot at session start → attention dilutes as context grows → silent CLI reply" failure mode. Joey 2026-05-24: 「就連你都有幾乎 20% 的機率常常會忘了回覆結果就自己結束工作了」.
+
+This is the contextual companion to the infrastructure-level [check_tg_reply.py Stop hook](https://github.com/btai/dotfiles) fix shipped same day. Two-layer defense:
+1. **Stop hook** (infrastructure): blocks turn end if channel-turn lacked reply tool call
+2. **Per-inbound reminder** (contextual): every channel msg arrives with a fresh tool-call hint that the model sees in-context (not buried in CLAUDE.md from session start)
+
+The `[protocol]` prefix marks the line as system-injected meta-text so the model can distinguish it from user content. Allowlisted senders can forge the marker by typing it, but no privilege is conferred (only a reminder), so the forgery risk is null.
+
+### Synced
+- discord-http 1.1.5 ships the same reminder with the discord-http reply tool name.
+
 ## 1.2.5 — 2026-05-24
 
 ### Fixed

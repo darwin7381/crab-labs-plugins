@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.5 — 2026-05-24
+
+Synced from [telegram-http 1.2.6](../telegram-http/CHANGELOG.md): every Discord channel notification now has a trailing `[protocol] ...reply via mcp__plugin_discord-http_discord-http__reply...` reminder. Contextual companion to the Stop-hook infrastructure fix; addresses LLM attention dilution against the one-shot CLAUDE.md model.
+
 ## 1.1.4 — 2026-05-24
 
 Synced from [telegram-http 1.2.5](../telegram-http/CHANGELOG.md): fixes `/resume <N>` and `/resume_previous` off-by-one — picker excludes the current session, so array idx N maps to picker idx (N - 1).

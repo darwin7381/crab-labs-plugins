@@ -1077,10 +1077,22 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  // Trailing protocol reminder appended so the model sees it *every*
+  // inbound (not one-shot like CLAUDE.md). Highest-ROI mitigation for
+  // silent-reply failure mode — every channel turn arrives with a fresh
+  // tool-call hint in the same <channel> block being read. Joey
+  // 2026-05-24. See telegram-http server.ts for full rationale.
+  const PROTOCOL_REMINDER =
+    '[protocol] You MUST respond via mcp__plugin_discord-http_discord-http__reply ' +
+    `(chat_id="${chat_id}"). CLI markdown is invisible to the user — only the reply ` +
+    'tool reaches them. For multi-step work: open with reply, edit_message for ' +
+    'mid-progress, new reply on completion.'
+  const contentWithReminder = `${content}\n\n${PROTOCOL_REMINDER}`
+
   broadcastNotification({
     method: 'notifications/claude/channel',
     params: {
-      content,
+      content: contentWithReminder,
       meta: {
         chat_id,
         message_id: msg.id,
