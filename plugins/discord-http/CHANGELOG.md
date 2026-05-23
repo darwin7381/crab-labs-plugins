@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1 — 2026-05-24
+
+**Resume replies now show session-tail excerpts** — synced from
+[telegram-http 1.2.2](../telegram-http/CHANGELOG.md). `/resume`,
+`/resume_previous`, and `/resume_list` now include the last ~3 user/assistant
+messages of the target session so the user can recognize WHICH conversation
+they just switched to (id prefix + first message wasn't enough).
+
+Includes new helpers `readJsonlTail`, `extractMessageExcerpt`,
+`formatResumeReply`, and a `lastMessages?: string[]` field on `ClaudeSession`.
+
 ## 1.1.0 — 2026-05-23
 
 **Channel-bot TUI control plane** — Discord parity for the feature shipped in
