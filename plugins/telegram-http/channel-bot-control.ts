@@ -332,21 +332,30 @@ function currentSessionId(): string | null {
  *
  *   1. Send `/resume` to open picker
  *   2. Wait for picker render
- *   3. Press Down N times (picker starts highlighted on index 0 = current)
+ *   3. Press Down `pickerIdx` times (picker idx 0 highlighted by default)
  *   4. Press Enter to confirm
  *
- * Reliability requires our session list ordering to match claude picker's
- * exactly — that's why listClaudeSessions filters by `entrypoint === "cli"`
- * (same as picker) and sorts by mtime DESC (same as picker).
+ * CRITICAL — picker excludes the current session.
+ *   listClaudeSessions returns ALL cli sessions including current at
+ *   array idx 0. The TUI's /resume picker INSTEAD hides the current
+ *   session (you can't resume to yourself). So:
+ *     listClaudeSessions array idx N (for N ≥ 1) = picker idx (N - 1)
+ *   Caller is responsible for the -1 conversion before calling this.
+ *   Joey 2026-05-24: 「/resume 功能是錯亂的欸，明明看好了結果起的卻是
+ *   另一個」 — root cause was caller passing array idx instead of picker
+ *   idx, so every /resume was off-by-one (got the session below the
+ *   intended one). Empirically verified by capturing claude-research's
+ *   picker pane: 6 entries in picker vs 7 in listClaudeSessions (delta
+ *   = current session, excluded).
  *
  * Same-pid inline-switch verified 2026-05-22 in claude-tui-test env
  * (pid 31042 → 31042 across switch). Daemon's MCP transport remains
  * connected; in-flight messages don't drop.
  */
-async function resumePickerInlineSwitch(downCount: number): Promise<void> {
+async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
   await tmuxSendKeys('/resume')
   await new Promise(r => setTimeout(r, 1500))  // picker render
-  for (let i = 0; i < downCount; i++) {
+  for (let i = 0; i < pickerIdx; i++) {
     await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Down'])
     await new Promise(r => setTimeout(r, 100))
   }
@@ -596,9 +605,13 @@ export async function handleControlSlash(
       return true
     }
     // Picker re-sorts on each invocation; target's picker index equals
-    // chain.length because all chain.length prior visits now sit at the
-    // top of mtime-DESC order.
-    const targetPickerIdx = chain.ids.length
+    // chain.length - 1 because:
+    //   - all chain.length prior visits sit at the top of mtime-DESC
+    //   - BUT picker excludes the current session (= chain[last])
+    //   - so the remaining chain.length-1 prior visits occupy picker
+    //     indices 0..chain.length-2
+    //   - target = next non-visited = picker idx chain.length - 1
+    const targetPickerIdx = chain.ids.length - 1
     chain.ids.push(targetSession.id)
     chain.ts = Date.now()
 
@@ -663,7 +676,10 @@ export async function handleControlSlash(
     }
     const target = sessions[targetIdx]
     await tryRun('resume via picker (tmux inline-switch)', async () => {
-      await resumePickerInlineSwitch(targetIdx)
+      // Picker excludes current (= sessions[0]) → list idx N maps to
+      // picker idx (N - 1). targetIdx ≥ 1 guaranteed by the
+      // "already the current session" early-return above.
+      await resumePickerInlineSwitch(targetIdx - 1)
       // Explicit pick resets walk-back chain to start fresh from this session.
       saveResumeChain({ ids: [target.id], ts: Date.now() })
       await replyToTg(formatResumeReply({
