@@ -437,10 +437,14 @@ async function daemonStatus(httpPort: string): Promise<string> {
  * Returns true if it was handled (caller should NOT forward to claude),
  * false if not (caller continues with normal claude forward).
  */
+/** Inline button + reply-options types — see telegram-http variant for docs. */
+export type InlineButton = { text: string; callback_data: string }
+export type ReplyOptions = { keyboard?: InlineButton[][] }
+
 export async function handleControlSlash(
   text: string,
   httpPort: string,
-  replyToTg: (msg: string) => Promise<void>,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
 ): Promise<boolean> {
   if (!isControlEnabled()) return false
   const trimmed = text.trim()
@@ -547,10 +551,25 @@ export async function handleControlSlash(
     })
     lines.push(
       '',
-      'use `/resume <number>` (e.g. `/resume 2`), `/resume <session-id>`, or `/resume_previous`.',
-      '_(inline-switch via picker — no restart, no message loss)_',
+      '👇 Tap a button to resume that session (UUID passed directly, no off-by-one risk).',
+      'Or use `/resume <number>`, `/resume <session-id>`, `/resume_previous`.',
     )
-    await replyToTg(lines.join('\n'))
+    // Inline button row (Discord ACTION_ROW max 5 buttons per row, max 5 rows
+    // = 25 buttons total). For 15-session list we pack 3 per row → 5 rows.
+    const BUTTONS_PER_ROW = 3
+    const keyboard: InlineButton[][] = []
+    sessions.forEach((s, i) => {
+      const rowIdx = Math.floor(i / BUTTONS_PER_ROW)
+      if (!keyboard[rowIdx]) keyboard[rowIdx] = []
+      const mark = s.id === cur ? '📍' : '↩️'
+      const title = (s.firstUserMessage ?? '?').slice(0, 20)
+      const date = new Date(s.mtimeMs).toISOString().slice(5, 10)
+      keyboard[rowIdx].push({
+        text: `${mark} #${i + 1} ${date} ${title}`,
+        callback_data: `resume:${s.id.slice(0, 8)}`,
+      })
+    })
+    await replyToTg(lines.join('\n'), { keyboard })
     return true
   }
 
@@ -673,6 +692,25 @@ export async function handleControlSlash(
 }
 
 // ---- For Discord application command registration (if/when we wire it up).
+/**
+ * Handle a Discord button click `custom_id` payload. Format:
+ *   `resume:<8-char-uuid-prefix>` — resume that session (bypasses list-idx
+ *   → picker-idx mapping). Returns true if recognized + dispatched.
+ */
+export async function handleCallbackData(
+  data: string,
+  httpPort: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  if (!data.startsWith('resume:')) return false
+  const uuidPrefix = data.slice('resume:'.length).trim()
+  if (!uuidPrefix) {
+    await replyToTg('❌ empty UUID prefix in button payload')
+    return true
+  }
+  return handleControlSlash(`/resume ${uuidPrefix}`, httpPort, replyToTg)
+}
+
 // Discord doesn't auto-show the autocomplete the way Telegram setMyCommands
 // does — slash commands need to be registered to the Discord application
 // via the gateway, which the current daemon doesn't do. Exposed here for
