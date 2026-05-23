@@ -1242,27 +1242,18 @@ async function handleInbound(
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   //
-  // Trailing protocol reminder appended to content so the model sees it
-  // *every* inbound (not one-shot like CLAUDE.md or plugin `prompts/list`).
-  // This is the highest-ROI mitigation for the silent-reply failure mode:
-  // every channel turn arrives with a fresh tool-call hint in the same
-  // <channel> block the model is reading. Joey 2026-05-24: 「CLAUDE.md
-  // one-shot read at session start ... attention dilute ... 規則太多分散」.
-  // The `[protocol]` prefix marks it as system-injected meta-text so the
-  // model can distinguish it from user text. (Marker is forgeable by an
-  // allowlisted sender typing it, but no privilege is conferred — only a
-  // reminder — so the forgery risk is null.)
-  const PROTOCOL_REMINDER =
-    '[protocol] You MUST respond via mcp__plugin_telegram-http_telegram-http__reply ' +
-    `(chat_id="${chat_id}"). CLI markdown is invisible to the user — only the reply ` +
-    'tool reaches them. For multi-step work: open with reply, edit_message for ' +
-    'mid-progress, new reply on completion.'
-  const contentWithReminder = `${text}\n\n${PROTOCOL_REMINDER}`
-
+  // 1.2.7 REVERT: 1.2.6 appended a `[protocol] You MUST respond via ...` line
+  // to every inbound `content`. Idea was a contextual reminder vs CLAUDE.md
+  // one-shot reads. In practice: silent-reply rate spiked across ALL agents
+  // simultaneously after 1.2.6 ship (Joey 2026-05-24). Hypothesized cause:
+  // identical reminder appended every inbound → model treats it as boilerplate
+  // noise → attention bleeds onto reminder instead of user content → reply
+  // tool calls drop. Stop hook (infrastructure-level seatbelt) remains as the
+  // correct enforcement path; in-band content pollution is not.
   const notification = {
     method: 'notifications/claude/channel',
     params: {
-      content: contentWithReminder,
+      content: text,
       meta: {
         chat_id,
         ...(msgId != null ? { message_id: String(msgId) } : {}),
