@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.1 — 2026-05-24
+
+### Fixed
+- **Picker can no longer get stuck open** — `resumePickerInlineSwitch` was vulnerable to a race where rapid button taps or daemon restart mid-resume left the `/resume` picker overlay rendered with no Down/Enter ever completing it. While the picker was open, claude TUI ignored all inbound `<channel>` notifications → 3 silent message drops on claude-builder 2026-05-24.
+
+### Added — 4-step defensive picker driver
+1. **Pre-Escape** — always send Escape before opening picker (kills any prior open picker / partial input).
+2. **Busy guard** — `isClaudeBusy()` checks pane footer for `❯` prompt + spinners (`✻ Cooked for...`, `✢ Fiddle-faddling`, `⏺ Bash(...)`, `Calling ...plugin`); if TUI is mid-tool-call, refuse picker driving rather than racing keystrokes against the UI state machine.
+3. **Verify picker open** — poll `tmux capture-pane` for "Resume session" substring up to 3s (six 500ms ticks) before sending Down. Without this, Down can fire before picker renders → goes to main input → corrupts state.
+4. **Verify picker closed** — after Enter, poll up to 2s for picker to disappear. If still open, force-Escape + throw error to surface the failure to the user (instead of silently leaving picker stuck).
+
+New helpers `tmuxCapturePane()`, `isPickerOpen()`, `isClaudeBusy()`.
+
+### Synced
+- discord-http 1.2.1 ships the same fix.
+
 ## 1.3.0 — 2026-05-24
 
 ### Added

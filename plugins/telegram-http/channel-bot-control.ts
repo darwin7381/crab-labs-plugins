@@ -98,6 +98,39 @@ async function tmuxSendCtrlKey(key: string): Promise<void> {
   }
 }
 
+/** tmux capture-pane → returns plain text (with ANSI stripped). */
+async function tmuxCapturePane(): Promise<string> {
+  const { exitCode, stdout } = await runCommand(
+    ['tmux', 'capture-pane', '-t', TMUX_SESSION, '-p'],
+  )
+  if (exitCode !== 0) return ''
+  return stdout
+}
+
+/** Is claude TUI's `/resume` picker overlay currently rendered? */
+async function isPickerOpen(): Promise<boolean> {
+  const pane = await tmuxCapturePane()
+  // Picker header looks like: "  Resume session (1 of 7)" or "Resume session"
+  return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
+}
+
+/** Is claude TUI mid-tool-call / mid-turn (not at the idle ❯ prompt)?
+ *  Detects spinners and "Calling ..." / "Cooked for ..." footers. Used to
+ *  refuse picker driving when TUI is busy — keystrokes sent during a busy
+ *  turn race the model's UI state machine and can leave the picker stuck
+ *  open (2026-05-24 claude-builder incident — 3 inbound messages silently
+ *  dropped while a half-completed picker sat on screen). */
+async function isClaudeBusy(): Promise<boolean> {
+  const pane = await tmuxCapturePane()
+  // Look at last ~10 lines — busy indicators always live near footer
+  const tail = pane.split('\n').slice(-15).join('\n')
+  // Bottom always shows "❯ " input prompt when idle. If missing, busy.
+  if (!/❯\s/.test(tail)) return true
+  // Active tool call / streaming indicators
+  if (/Calling .*plugin|Bash\(|✻\s+\w+ed for|✢\s+\w+|⏺\s+\w+\(/.test(tail)) return true
+  return false
+}
+
 /**
  * Trigger claude TUI restart via the wrapper.
  *
@@ -353,14 +386,63 @@ function currentSessionId(): string | null {
  * connected; in-flight messages don't drop.
  */
 async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
+  // Step 1 — Pre-Escape: clear any pre-existing picker / partial input.
+  // Without this, /resume_list spam or a previous half-completed resume
+  // can leave a picker on screen; new /resume keystrokes then trigger
+  // weird interactions (selection becomes search-text input, etc.).
+  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+  await new Promise(r => setTimeout(r, 200))
+
+  // Step 2 — Busy guard: if TUI is mid-tool-call, refuse rather than
+  // racing keystrokes against the model's UI state machine.
+  // 2026-05-24 claude-builder incident: picker driving during an active
+  // tool call dropped Down/Enter into the wrong UI mode → picker stuck
+  // open → 3 subsequent Joey messages silently swallowed.
+  if (await isClaudeBusy()) {
+    throw new Error(
+      'claude TUI is busy mid-turn — refusing to drive /resume picker ' +
+      '(keystrokes race the UI state machine and can stick the picker). ' +
+      'Wait for the current turn to finish, then try again.'
+    )
+  }
+
+  // Step 3 — Open picker.
   await tmuxSendKeys('/resume')
-  await new Promise(r => setTimeout(r, 1500))  // picker render
+
+  // Step 4 — Wait + verify picker is actually rendered before sending Down.
+  //   Poll for up to 3s (six 500ms ticks). Without this, Down may fire
+  //   before picker exists → goes to main input → no-op or corrupts state.
+  let pickerOk = false
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await new Promise(r => setTimeout(r, 500))
+    if (await isPickerOpen()) { pickerOk = true; break }
+  }
+  if (!pickerOk) {
+    // Best-effort cleanup
+    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+    throw new Error('picker failed to open after /resume (3s timeout) — Escape sent for safety')
+  }
+
+  // Step 5 — Navigate + confirm.
   for (let i = 0; i < pickerIdx; i++) {
     await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Down'])
     await new Promise(r => setTimeout(r, 100))
   }
   await new Promise(r => setTimeout(r, 200))
   await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Enter'])
+
+  // Step 6 — Post-verify: picker should have closed. If it's still open
+  // (Enter didn't register or sent to wrong UI), force-escape so the next
+  // inbound channel notification isn't stuck behind the picker overlay.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await new Promise(r => setTimeout(r, 500))
+    if (!(await isPickerOpen())) return
+  }
+  // Picker stuck — clean up + warn.
+  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+  throw new Error(
+    'picker still open 2s after Enter — sent Escape for cleanup. Resume may have not completed.'
+  )
 }
 
 // ---- /resume_previous chain (walk-back history) --------------------------

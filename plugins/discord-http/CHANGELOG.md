@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1 — 2026-05-24
+
+Synced from [telegram-http 1.3.1](../telegram-http/CHANGELOG.md): 4-step defensive picker driver (Pre-Escape, busy guard, verify picker open, verify picker closed) prevents the `/resume` picker from getting stuck open when daemon-driven from rapid button taps or restart races. Fixes the 2026-05-24 claude-builder silent-drop incident.
+
 ## 1.2.0 — 2026-05-24
 
 Synced from [telegram-http 1.3.0](../telegram-http/CHANGELOG.md): `/resume_list` now renders sessions as Discord buttons (ACTION_ROW + ButtonBuilder, 3 buttons per row, max 5 rows). Click → `interactionCreate` → `handleCallbackData` → `/resume <uuid>` flow. Eliminates the list-idx → picker-idx mapping that caused the 1.2.5 off-by-one bug.
