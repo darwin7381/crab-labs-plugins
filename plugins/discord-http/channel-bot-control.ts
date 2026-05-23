@@ -202,8 +202,11 @@ function readJsonlTail(path: string, maxLines: number, bytesWindow = 64 * 1024):
   }
 }
 
-/** Extract a flat-text excerpt from a claude jsonl message record. */
-function extractMessageExcerpt(rec: any): { role: 'user' | 'asst' | 'tool'; text: string } | null {
+/** Extract a flat-text excerpt from a claude jsonl message record.
+ *  Returns null for records that carry no conversational content (pure
+ *  tool_use / tool_result blocks, system injections) so caller can walk
+ *  further back. */
+function extractMessageExcerpt(rec: any): { role: 'user' | 'asst'; text: string } | null {
   const role = rec?.role ?? rec?.message?.role
   if (role !== 'user' && role !== 'assistant') return null
   const content = rec?.content ?? rec?.message?.content
@@ -214,15 +217,18 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst' | 'tool'; text
     for (const c of content) {
       if (typeof c === 'string') { text += c + ' ' }
       else if (c?.type === 'text' && typeof c.text === 'string') { text += c.text + ' ' }
-      else if (c?.type === 'tool_use') { text += `[tool: ${c.name ?? '?'}] ` }
-      else if (c?.type === 'tool_result') { text += `[tool_result] ` }
     }
   }
   text = text.trim()
   if (!text) return null
   const m = text.match(/^<channel\b[^>]*>([\s\S]*?)<\/channel>\s*$/)
   if (m) text = m[1].trim()
-  if (text.startsWith('<system') || text.startsWith('<command-')) return null
+  if (
+    text.startsWith('<system') ||
+    text.startsWith('<command-') ||
+    text.startsWith('<local-command-') ||
+    text.startsWith('Caveat: The messages below')
+  ) return null
   return {
     role: role === 'assistant' ? 'asst' : 'user',
     text: text.replace(/\s+/g, ' ').slice(0, 120),
@@ -286,7 +292,9 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
         if (session.entrypoint && session.firstUserMessage) break
       }
     } catch {}
-    const tailRecs = readJsonlTail(full, 8)
+    // 40 records / 128KB window — walk past tool-heavy tail noise to
+    // find real conversational excerpts.
+    const tailRecs = readJsonlTail(full, 40, 128 * 1024)
     const tailExcerpts: string[] = []
     for (let i = tailRecs.length - 1; i >= 0 && tailExcerpts.length < 3; i--) {
       const ex = extractMessageExcerpt(tailRecs[i])

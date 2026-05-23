@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.3 — 2026-05-24
+
+### Fixed
+- **`extractMessageExcerpt` no longer emits `[tool_use]` / `[tool_result]` placeholder text** — those tags were Joey-facing noise in `/resume_list` rows. A turn whose `content` array is purely `tool_use` or `tool_result` blocks now returns null → caller walks further back in the session to find real prose. Joey 2026-05-24 screenshot: rows 4 and 5 showed `↳ user: [tool_result]` — useless for picker disambiguation.
+
+### Changed
+- `readJsonlTail` window widened from `(8 records, 64KB)` to `(40 records, 128KB)` so the walk-back can skip past tool-heavy tails (long agent turns can easily emit 10+ tool blocks before any text comment).
+- `extractMessageExcerpt` also skips records whose text starts with `<local-command-` or `Caveat: The messages below` (auto-injected by `/resume` itself — they were appearing as the "first user msg" of resumed sessions).
+
+### Synced
+- discord-http 1.1.2 ships the same fix.
+
 ## 1.2.2 — 2026-05-24
 
 ### Fixed
