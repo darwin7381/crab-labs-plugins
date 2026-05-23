@@ -194,8 +194,14 @@ function readJsonlTail(path: string, maxLines: number, bytesWindow = 64 * 1024):
   }
 }
 
-/** Extract a flat-text excerpt from a claude jsonl message record. */
-function extractMessageExcerpt(rec: any): { role: 'user' | 'asst' | 'tool'; text: string } | null {
+/** Extract a flat-text excerpt from a claude jsonl message record.
+ *  Returns null for records that carry no conversational content (pure
+ *  tool_use / tool_result blocks, system injections, empty messages) so
+ *  the caller can walk further back to find a real user/assistant
+ *  utterance. Joey 2026-05-24: `↳ user: [tool_result]` is noise — the
+ *  excerpt only counts if it's something a human said or claude said
+ *  to the human. */
+function extractMessageExcerpt(rec: any): { role: 'user' | 'asst'; text: string } | null {
   const role = rec?.role ?? rec?.message?.role
   if (role !== 'user' && role !== 'assistant') return null
   const content = rec?.content ?? rec?.message?.content
@@ -203,11 +209,11 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst' | 'tool'; text
   if (typeof content === 'string') {
     text = content
   } else if (Array.isArray(content)) {
+    // Only concat real text blocks; ignore tool_use/tool_result so a
+    // tool-only turn returns no text → caller skips it.
     for (const c of content) {
       if (typeof c === 'string') { text += c + ' ' }
       else if (c?.type === 'text' && typeof c.text === 'string') { text += c.text + ' ' }
-      else if (c?.type === 'tool_use') { text += `[tool: ${c.name ?? '?'}] ` }
-      else if (c?.type === 'tool_result') { text += `[tool_result] ` }
     }
   }
   text = text.trim()
@@ -215,8 +221,14 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst' | 'tool'; text
   // Strip <channel ...>...</channel> framing for readability
   const m = text.match(/^<channel\b[^>]*>([\s\S]*?)<\/channel>\s*$/)
   if (m) text = m[1].trim()
-  // Skip pure system/hook injections
-  if (text.startsWith('<system') || text.startsWith('<command-')) return null
+  // Skip pure system/hook injections and other framework wrappers that
+  // aren't real conversation
+  if (
+    text.startsWith('<system') ||
+    text.startsWith('<command-') ||
+    text.startsWith('<local-command-') ||
+    text.startsWith('Caveat: The messages below')
+  ) return null
   return {
     role: role === 'assistant' ? 'asst' : 'user',
     text: text.replace(/\s+/g, ' ').slice(0, 120),
@@ -282,7 +294,10 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
     } catch {}
     // Tail: last few user/assistant excerpts so caller can see WHERE
     // each session left off (key for /resume picker disambiguation).
-    const tailRecs = readJsonlTail(full, 8)
+    // Read 40 records / 128KB window: long tool-heavy turns can fill
+    // the tail with [tool_use]/[tool_result] noise that extractExcerpt
+    // skips — we want to keep walking back until we find real prose.
+    const tailRecs = readJsonlTail(full, 40, 128 * 1024)
     const tailExcerpts: string[] = []
     for (let i = tailRecs.length - 1; i >= 0 && tailExcerpts.length < 3; i--) {
       const ex = extractMessageExcerpt(tailRecs[i])

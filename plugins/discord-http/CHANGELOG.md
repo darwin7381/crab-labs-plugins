@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2 — 2026-05-24
+
+Synced from [telegram-http 1.2.3](../telegram-http/CHANGELOG.md): tail excerpts now skip pure tool_use / tool_result records and `<local-command-…>` / `Caveat:` framework injections, walking back through up to 40 records / 128KB so resume picker rows always show real prose, not `[tool_result]` noise.
+
 ## 1.1.1 — 2026-05-24
 
 **Resume replies now show session-tail excerpts** — synced from
