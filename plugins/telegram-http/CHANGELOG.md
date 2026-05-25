@@ -1,5 +1,187 @@
 # Changelog
 
+## 1.6.0 — 2026-05-25
+
+### Added — `/input` raw passthrough slash command
+
+`/input <text>` sends `<text>` as keystrokes into the channel-bot's tmux session
+(or, in roamer mode, the current target's session) with `Enter` at the end.
+
+**Why.** Some claude TUI slash commands (`/plugin marketplace add`, `/plugin install`,
+arbitrary multi-step setup) need to be typed at the TUI directly — but the existing
+channel-bot control plane intercepts known slashes (`/clear`, `/restart`, ...) before
+they reach the TUI. `/input` is the explicit "type this literally, do not interpret"
+escape hatch. Saves Joey from having to walk to the Mac mini to type setup commands.
+
+**Multi-line semantics.** Each newline-separated line in the payload is sent as its
+own `tmux send-keys ... Enter` call. Example:
+
+```
+/input /plugin marketplace add anthropics/skills
+/plugin install document-skills@anthropic-agent-skills
+```
+
+→ Two lines typed into the TUI, each with Enter, as if Joey had typed them at the
+Mac mini's keyboard.
+
+**Precedence.** `/input` is checked *first* in `forwardSharedTuiSlash`, before
+the existing verbatim-send and ctrl-key branches. This makes `/input /clear`
+type a literal `/clear` instead of being captured by the channel-bot's `/clear`
+handler.
+
+**Files touched.**
+- `channel-bot-control.ts` — added `forwardInputPassthrough()` + wired into
+  `forwardSharedTuiSlash`. `sharedTuiCommands()` and `controlCommandsForBotApi()`
+  now include `/input` for help text + Telegram autocomplete.
+
+**Joey 2026-05-25 (msg 1596)**: "打了後面就可以空一個繞過 tg 直接送 tmux 輸入" — exactly this.
+
+### Sync
+
+discord-http v1.6.0 ships the same `/input` command. KEEP IN SYNC.
+
+## 1.5.1 — 2026-05-25
+
+### Changed — picker driver: regex busy-detection → proactive interrupt
+
+Replaced `isClaudeBusy()` pre-flight check in `resumePickerInlineSwitch` with unconditional Escape + Ctrl-C before driving the picker.
+
+**Why.** Regex-based pane-text busy-detection was fragile:
+- claude TUI's completion-marker format `✻ Crunched for X` (past-tense) was historical / "turn finished" content but my regex matched it as if claude was still active. Result: 20s busy-poll timeout on `/resume_list` button clicks even when claude had been idle for an hour.
+- claude TUI strings shift between versions / locales — any regex over them ages fast.
+- User intent matters: clicking a `/resume` button is an explicit "switch now" signal. Any mid-turn response is acceptable collateral.
+
+**How.** `resumePickerInlineSwitch` now:
+1. Escape (dismiss any open picker/dialog overlay)
+2. Wait 200ms
+3. Ctrl-C (interrupt any active turn / streaming response)
+4. Wait 600ms (let claude TUI process the cancellation cleanly)
+5. Drive picker as before (send `/resume` → Down × N → Enter)
+
+`isClaudeBusy()` still exists for other call-sites that may want it, but the regex was narrowed to active-only indicators (`(esc to interrupt)`, `[✻✢] <verb>ing`, `Calling .*plugin`) — no more `\w+ed for` past-tense matches.
+
+**Joey 2026-05-25 (msg 1572)**: "他們會常常改字吧？為何不就把它打斷就好了？" — exactly the right call.
+
+### Sync
+
+- discord-http 1.5.1 ships identical change.
+
+## 1.5.0 — 2026-05-25
+
+### Added — Roamer parity with channel-bot + auto-discovery + history-aware takeover
+
+This release closes the feature gap between channel-bot mode and roamer mode: any command that worked on `@Sonn_Claude_bot` now works on roamer bots against the dynamically-selected target. Also adds cross-protocol coordination so TG and DC roamer bots can coexist without manual wiring.
+
+#### `channel-bot-control.ts` — shared TUI slash forwarder
+
+- New exported function `forwardSharedTuiSlash(text, tmuxName, replyTo)` — single source of truth for "send-keys to claude" commands across BOTH channel-bot and roamer modes. Channel-bot's `handleControlSlash` now delegates to it instead of keeping its own list.
+- New exported constants:
+  - `SHARED_TUI_SENDABLE` = `{/clear, /agents, /mcp, /resume, /help, /init, /compact}`
+  - `SHARED_TUI_SENDABLE_WITH_ARG` = `{/model, /effort}`
+  - `SHARED_TUI_CTRL_KEY` = `{/sigint: 'C-c', /cancel: 'C-c'}`
+- Adding a new TUI-forward command requires updating ONE place (these constants).
+
+#### `channel-bot-control.ts` — context-aware high-level helpers
+
+These were previously hardcoded to `CHANNEL_BOT_*` env vars; now accept optional override parameters so roamer can pass its `current_target` context:
+
+- `listClaudeSessions(limit?, projectsDirOverride?)` — now exported, accepts dir override
+- `currentSessionId(projectsDirOverride?)` — now exported, accepts dir override
+- `resumePickerInlineSwitch(pickerIdx, tmuxOverride?)` — now exported, accepts tmux override
+- `loadResumeChain(fileOverride?)` — exported, accepts file override
+- `saveResumeChain(chain, fileOverride?)` — exported, accepts file override
+- `formatResumeReply(opts)` — exported
+- Type exports: `ClaudeSession`, `ResumeChain`
+- Low-level helpers (`tmuxSendKeys`, `tmuxSendCtrlKey`, `tmuxCapturePane`, `isPickerOpen`, `isClaudeBusy`) now accept optional `tmuxName` param; default still env-based for backwards compat.
+
+#### `roamer-control.ts` — channel-bot command parity
+
+New `handleChannelBotCommandsForCurrentTarget` dispatcher inside `handleRoamerSlash` (calls the now-exported helpers with `current_target.tmux` / `current_target.cwd`'s project folder / per-bot resume-chain file). Supports:
+
+- `/resume_list /sessions /list` — list current target's project sessions with inline keyboard buttons
+- `/resume <n|prefix>` — drive current target's TUI picker
+- `/resume_previous` — walk-back chain (per-bot resume-chain file `/tmp/roamer-<bot>-resume-chain-<cwd-slug>.json`)
+- `/restart` — kill current target tmux + clear state (forces re-/roam to re-bridge)
+- `/kill_stuck` / `/kill-stuck` — SIGKILL current target's claude PID
+
+`handleRoamerCallback` extended to dispatch `resume:` prefix callbacks (clicking buttons from /resume_list in roamer mode drives the current target's picker).
+
+#### Cross-protocol auto-discovery
+
+- New shared registry `~/.claude/channels/roamer-daemons.json` — every roamer daemon self-registers on boot, unregisters on shutdown. Entry: `{protocol, bot, port, pid, registered_at}`.
+- New exports `registerSelfAsDaemon()` / `unregisterSelfAsDaemon()` wired into server.ts boot/exit.
+- Takeover spawn auto-picks a live partner-protocol daemon via deterministic order (lowest port). When a TG roamer takes over, the spawned claude is loaded with BOTH `--channels` flags (its own TG roamer + the discovered DC roamer) so the same claude is reachable from either side.
+- Fallback to single-`--channels` if no partner protocol daemon alive. Zero per-plist pairing wiring required.
+
+#### Cross-protocol independence in registry filter
+
+- `RoamerRegistryEntry` now carries `protocol: 'telegram' | 'discord'`.
+- `listRoamableSessions` only filters out claims from OTHER bots of the SAME protocol. Cross-protocol claims are visible and selectable (a TG roamer's list shows sessions claimed by DC roamers, and vice versa).
+
+#### History-aware takeover
+
+- `findLatestNonEmptySessionForCwd(cwd)` scans the project folder for the latest non-empty jsonl. Used as the `--resume <sid>` target when the live claude's session is empty (fresh screen-spawn with no turns).
+- Previous behavior took over the LIVE PID's session-id (which could be empty) and started fresh; new behavior prefers continuity with the user's real prior conversation in that project.
+- Notification varies:
+  - 📜 接回 live session ...
+  - 📜 live session 是空的，自動接回 project 最近有歷史的 session ...
+  - 📭 該 project 沒任何歷史 session，開新 claude (fresh) ...
+
+#### server.ts integration delta
+
+- Callback handler unifies `resume:` + `roam:` dispatch — in roamer mode, both go through `handleRoamerCallback`; in channel-bot mode, `resume:` goes through `handleCallbackData`.
+- `handleControlSlash` now delegates `/clear /agents /mcp /resume /help /init /compact /model /effort /sigint /cancel` to `forwardSharedTuiSlash` instead of its own dispatch.
+
+### Sync
+
+- discord-http 1.5.0 ships identical changes (mirror).
+
+### Migration notes
+
+- No breaking changes for channel-bot deployments. Existing `@Sonn_Claude_bot` env-based config keeps working — all overrides are optional parameters with env fallback.
+- New roamer deployments inherit auto-discovery automatically (just spawn the daemon, no manual port wiring).
+
+## 1.4.0 — 2026-05-25
+
+### Added — Roamer mode (claude session 漫遊)
+
+Lets a TG bot remote-control any local naked claude session on the machine. User picks via inline keyboard, daemon respawns the target claude with `--channels` so it joins the plugin's existing MCP bridge, then TG inbound routes to that specific claude (not broadcast).
+
+- **New file**: `roamer-control.ts` — all roamer-specific logic in one module, gated by `ROAMER_MODE=1` env. When unset, every export is a no-op (zero impact on channel-bot deployments).
+- **Discovery**: `listRoamableSessions()` wraps `claude agents --json`, filters out cc-workspaces / channel-bot / agy-workspaces / agy-tg-bridges, computes tmux membership for each PID via parent-chain walk + `tmux list-panes`.
+- **Takeover**: SIGINT naked claude (or kill existing non-bridged tmux) → spawn new tmux running `claude --channels plugin:telegram-http@crab-labs-plugins --resume <sid>` (drops `--resume` if session has no transcript). `TELEGRAM_HTTP_PORT` env is interpolated into the plugin's `.mcp.json` URL so the new claude connects to the same roamer daemon.
+- **MCP session ↔ tmux mapping**: takeover sets `pendingTakeoverTmux`. When server.ts's `onsessioninitialized` fires for a new MCP session, it calls `roamerOnNewMcpSession(id)` which claims it for the pending takeover. `tmuxToMcpSession` map is built up over time. `roamerOnMcpSessionClosed(id)` cleans up on disconnect.
+- **Routing**: in `handleInbound`, when `isRoamerEnabled()`, replaces `broadcastNotification` with `sendToMcpSession(currentTargetMcpSessionId, notif)` — TG inbound goes ONLY to the currently-selected target's claude, not all bridged claudes.
+- **Multi-roamer coordination**: shared registry at `~/.claude/channels/roamer-registry.json` keyed by bot username. Each entry: `{tmux, claude_pid, daemon_pid, session_id, cwd, updated_at}`. Read-time activeness check via `kill -0 <pid>` × 2 + `tmux has-session`. Stale entries auto-purged. Listings exclude sessions claimed by OTHER live roamers.
+- **Per-instance state**: `roamer-state.json` in `TELEGRAM_STATE_DIR` holds `{current_target: {tmux, claude_pid, session_id, cwd} | null}`.
+- **Slash commands**: `/roam` (list w/ inline buttons), `/roam_status` (show current target + registry).
+- **Callback handler**: `roam:<8-char-sid-prefix>` button data routes through `handleRoamerCallback` → `connectToSession`.
+
+### server.ts integration points
+
+- Imports from `roamer-control.ts`: `isRoamerEnabled`, `handleRoamerSlash`, `handleRoamerCallback`, `roamerCommandsForBotApi`, `onNewMcpSession`, `onMcpSessionClosed`, `getCurrentTargetMcpSessionId`.
+- `handleInbound`: roamer slash dispatcher BEFORE existing `handleControlSlash`; non-slash text routes via `sendToMcpSession` when roamer enabled.
+- `bot.on('callback_query:data')`: new `roam:` prefix handler alongside `resume:` (channel-bot) and `perm:` (permission relay).
+- `onsessioninitialized`: calls `roamerOnNewMcpSession(id)` (no-op if roamer disabled).
+- `transport.onclose`: calls `roamerOnMcpSessionClosed(sessionId)`.
+- `pollLoop` `onStart`: merges `roamerCommandsForBotApi()` into TG bot autocomplete.
+- New helper `sendToMcpSession(sessionId, notif)` — point-to-point variant of `broadcastNotification`; queues in `memQueue` if SSE not yet open.
+
+### Decision-log (kept short)
+
+Initial impl (rejected) used tmux send-keys + capture-pane + jsonl tailing for routing — duplicated work the plugin's MCP layer already handles, fragile, and broke on tool-using turns. Final impl uses the plugin's native MCP notification + reply tool pipeline; routing is just point-to-point send instead of broadcast. See agent memory `feedback_decision_logic_failure_patterns.md` for the meta-lessons.
+
+### Required env (roamer instance)
+
+- `ROAMER_MODE=1`
+- `ROAMER_BOT_NAME=<botname>` (matches `@<botname>_bot` on Telegram)
+- `ROAMER_STATE_FILE=<path>` (per-instance, holds current_target)
+- `TELEGRAM_HTTP_PORT=<port>`, `TELEGRAM_STATE_DIR=<path>` (standard plugin env)
+
+### Not affected
+
+Channel-bot mode (existing `@Sonn_Claude_bot` daemon): `ROAMER_MODE` unset → entire roamer module is no-op → routing falls through to existing `broadcastNotification`. Zero behavioral change.
+
 ## 1.3.1 — 2026-05-24
 
 ### Fixed

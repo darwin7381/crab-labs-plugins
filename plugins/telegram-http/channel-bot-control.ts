@@ -78,10 +78,16 @@ function runCommand(
   })
 }
 
-/** tmux send-keys with Enter at the end. */
-async function tmuxSendKeys(text: string): Promise<void> {
+/**
+ * tmux send-keys with Enter at the end.
+ *
+ * Accepts optional tmuxName so callers outside channel-bot context
+ * (e.g. roamer-control) can target a different pane. Default = the
+ * channel-bot's own TMUX_SESSION env.
+ */
+async function tmuxSendKeys(text: string, tmuxName: string = TMUX_SESSION): Promise<void> {
   const { exitCode, stderr } = await runCommand(
-    ['tmux', 'send-keys', '-t', TMUX_SESSION, text, 'Enter'],
+    ['tmux', 'send-keys', '-t', tmuxName, text, 'Enter'],
   )
   if (exitCode !== 0) {
     throw new Error(`tmux send-keys failed (${exitCode}): ${stderr.trim().slice(0, 200)}`)
@@ -89,9 +95,9 @@ async function tmuxSendKeys(text: string): Promise<void> {
 }
 
 /** tmux send a single control key like C-c (Ctrl+C). */
-async function tmuxSendCtrlKey(key: string): Promise<void> {
+async function tmuxSendCtrlKey(key: string, tmuxName: string = TMUX_SESSION): Promise<void> {
   const { exitCode, stderr } = await runCommand(
-    ['tmux', 'send-keys', '-t', TMUX_SESSION, key],
+    ['tmux', 'send-keys', '-t', tmuxName, key],
   )
   if (exitCode !== 0) {
     throw new Error(`tmux send-keys failed (${exitCode}): ${stderr.trim().slice(0, 200)}`)
@@ -99,35 +105,180 @@ async function tmuxSendCtrlKey(key: string): Promise<void> {
 }
 
 /** tmux capture-pane → returns plain text (with ANSI stripped). */
-async function tmuxCapturePane(): Promise<string> {
+async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string> {
   const { exitCode, stdout } = await runCommand(
-    ['tmux', 'capture-pane', '-t', TMUX_SESSION, '-p'],
+    ['tmux', 'capture-pane', '-t', tmuxName, '-p'],
   )
   if (exitCode !== 0) return ''
   return stdout
 }
 
 /** Is claude TUI's `/resume` picker overlay currently rendered? */
-async function isPickerOpen(): Promise<boolean> {
-  const pane = await tmuxCapturePane()
-  // Picker header looks like: "  Resume session (1 of 7)" or "Resume session"
+async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const pane = await tmuxCapturePane(tmuxName)
   return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
 }
 
-/** Is claude TUI mid-tool-call / mid-turn (not at the idle ❯ prompt)?
- *  Detects spinners and "Calling ..." / "Cooked for ..." footers. Used to
- *  refuse picker driving when TUI is busy — keystrokes sent during a busy
- *  turn race the model's UI state machine and can leave the picker stuck
- *  open (2026-05-24 claude-builder incident — 3 inbound messages silently
- *  dropped while a half-completed picker sat on screen). */
-async function isClaudeBusy(): Promise<boolean> {
-  const pane = await tmuxCapturePane()
-  // Look at last ~10 lines — busy indicators always live near footer
+/** Is claude TUI mid-tool-call / mid-turn (not at the idle ❯ prompt)? */
+async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-15).join('\n')
-  // Bottom always shows "❯ " input prompt when idle. If missing, busy.
+
+  // No prompt indicator at bottom → busy.
   if (!/❯\s/.test(tail)) return true
-  // Active tool call / streaming indicators
-  if (/Calling .*plugin|Bash\(|✻\s+\w+ed for|✢\s+\w+|⏺\s+\w+\(/.test(tail)) return true
+
+  // Active-only busy indicators:
+  //   - `(esc to interrupt)` — canonical "claude is actively processing" footer
+  //   - `✻ <verb>ing` — present continuous spinner (Crunching, Baking, Cooking...)
+  //   - `✢ <verb>ing` / `⏺ <tool>(` — alt spinner / active tool-call bracket
+  //   - `Calling .*plugin` — active plugin call
+  //   - `Bash\(` followed by no closing → mid-call
+  //
+  // Joey 2026-05-25 (msg 1570): previous regex matched `✻ Crunched for 1m 17s`
+  // (past-tense historical marker shown AFTER turn completes) as busy →
+  // /resume_list buttons failed even when claude was idle for an hour.
+  if (/\(esc to interrupt\)/.test(tail)) return true
+  if (/[✻✢]\s+\w+ing\b/.test(tail)) return true
+  if (/Calling .*plugin/.test(tail)) return true
+  return false
+}
+
+// ============================================================================
+// SHARED TUI slash forwarder — single source of truth for "send-keys to claude"
+// commands. Channel-bot and roamer both delegate here. Adding a new TUI-side
+// slash means updating ONLY the constants below.
+// ============================================================================
+
+const SHARED_TUI_SENDABLE = new Set([
+  '/clear', '/agents', '/mcp', '/resume', '/help', '/init', '/compact',
+])
+const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
+const SHARED_TUI_CTRL_KEY: Record<string, string> = {
+  '/sigint': 'C-c',
+  '/cancel': 'C-c',
+}
+
+/** Names of all shared TUI commands, for help text + roamer's unknown-command branch. */
+export function sharedTuiCommands(): string[] {
+  return ['/input', ...SHARED_TUI_SENDABLE, ...SHARED_TUI_SENDABLE_WITH_ARG, ...Object.keys(SHARED_TUI_CTRL_KEY)].sort()
+}
+
+/**
+ * /input — raw passthrough to tmux send-keys.
+ *
+ * `/input <text>` sends <text> as keystrokes to the tmux session with Enter at
+ * the end. Multi-line messages: each newline-separated line is sent as its own
+ * send-keys call (each gets its own Enter). Useful for typing slash commands
+ * the plugin would otherwise intercept (e.g. `/plugin install foo`) or for any
+ * literal input that should land in the claude TUI as if typed at the keyboard.
+ *
+ * Must run BEFORE the verbatim-send / ctrl-key branches in
+ * `forwardSharedTuiSlash`, otherwise `/input /clear` would be captured by the
+ * `/clear` handler instead of being typed literally.
+ *
+ * Returns true if handled.
+ */
+async function forwardInputPassthrough(
+  text: string,
+  tmuxName: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  // Match "/input" followed by whitespace (space, tab, newline) or end-of-string.
+  // Case-sensitive — `/Input` is a user typo, don't silently absorb it.
+  const m = /^\/input(\s|$)/.exec(text)
+  if (!m) return false
+
+  // Payload starts after the first separator char (space / tab / \n).
+  // If matched `$`, payload is empty.
+  const sepIdx = '/input'.length
+  const payload = m[1] === '' || sepIdx >= text.length ? '' : text.slice(sepIdx + 1)
+
+  if (!payload.trim()) {
+    await replyToTg(
+      'usage: `/input <text>` — sends text as keystrokes to the claude TUI ' +
+        '(multi-line supported, each line gets its own Enter). ' +
+        'Example:\n```\n/input /plugin marketplace add anthropics/skills\n' +
+        '/plugin install document-skills@anthropic-agent-skills\n```',
+    )
+    return true
+  }
+
+  const lines = payload.split('\n')
+  const failures: string[] = []
+  let sent = 0
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      await tmuxSendKeys(lines[i], tmuxName)
+      sent++
+    } catch (err) {
+      failures.push(`line ${i + 1}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  if (failures.length === 0) {
+    await replyToTg(`✅ /input — sent ${sent} line${sent === 1 ? '' : 's'} to ${tmuxName}`)
+  } else {
+    await replyToTg(
+      `⚠️ /input — sent ${sent}/${lines.length} lines to ${tmuxName}\nfailures:\n${failures.join('\n')}`,
+    )
+  }
+  return true
+}
+
+/**
+ * Try to handle text as one of the shared TUI commands. Sends keys to the
+ * given tmux pane. Returns true if handled (so caller skips further dispatch).
+ */
+export async function forwardSharedTuiSlash(
+  text: string,
+  tmuxName: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  // /input passthrough first — must beat the verbatim-send branches below so
+  // `/input /clear` types `/clear` literally into the TUI instead of being
+  // intercepted by the /clear handler.
+  if (await forwardInputPassthrough(text, tmuxName, replyToTg)) return true
+
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('/')) return false
+  const [rawCmd, ...rest] = trimmed.split(/\s+/)
+  const cmd = rawCmd.toLowerCase()
+  const args = rest.join(' ').trim()
+
+  if (cmd in SHARED_TUI_CTRL_KEY) {
+    try {
+      await tmuxSendCtrlKey(SHARED_TUI_CTRL_KEY[cmd], tmuxName)
+      await replyToTg(`✅ 已送 ${SHARED_TUI_CTRL_KEY[cmd]}（${cmd}）到 ${tmuxName}`)
+    } catch (err) {
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+    }
+    return true
+  }
+
+  if (SHARED_TUI_SENDABLE.has(cmd)) {
+    try {
+      await tmuxSendKeys(cmd, tmuxName)
+      await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
+    } catch (err) {
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+    }
+    return true
+  }
+
+  if (SHARED_TUI_SENDABLE_WITH_ARG.has(cmd)) {
+    if (!args) {
+      await replyToTg(`usage: \`${cmd} <value>\``)
+      return true
+    }
+    try {
+      await tmuxSendKeys(`${cmd} ${args}`, tmuxName)
+      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}`)
+    } catch (err) {
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+    }
+    return true
+  }
+
   return false
 }
 
@@ -284,12 +435,13 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst'; text: string 
  * stripped of their outer tag for readability. Only `<system>` framework
  * injections are skipped.
  */
-function listClaudeSessions(limit = 30): ClaudeSession[] {
-  if (!PROJECTS_DIR || !existsSync(PROJECTS_DIR)) return []
+export function listClaudeSessions(limit = 30, projectsDirOverride?: string): ClaudeSession[] {
+  const dir = projectsDirOverride ?? PROJECTS_DIR
+  if (!dir || !existsSync(dir)) return []
   const out: ClaudeSession[] = []
-  for (const name of readdirSync(PROJECTS_DIR)) {
+  for (const name of readdirSync(dir)) {
     if (!name.endsWith('.jsonl')) continue
-    const full = join(PROJECTS_DIR, name)
+    const full = join(dir, name)
     let stat
     try { stat = statSync(full) } catch { continue }
     if (!stat.isFile()) continue
@@ -353,9 +505,9 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
   return filtered.slice(0, limit)
 }
 
-/** "Current" session: the .jsonl most recently modified (= the running claude TUI's session). */
-function currentSessionId(): string | null {
-  const sessions = listClaudeSessions(1)
+/** "Current" session: the .jsonl most recently modified. */
+export function currentSessionId(projectsDirOverride?: string): string | null {
+  const sessions = listClaudeSessions(1, projectsDirOverride)
   return sessions[0]?.id ?? null
 }
 
@@ -385,61 +537,49 @@ function currentSessionId(): string | null {
  * (pid 31042 → 31042 across switch). Daemon's MCP transport remains
  * connected; in-flight messages don't drop.
  */
-async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
-  // Step 1 — Pre-Escape: clear any pre-existing picker / partial input.
-  // Without this, /resume_list spam or a previous half-completed resume
-  // can leave a picker on screen; new /resume keystrokes then trigger
-  // weird interactions (selection becomes search-text input, etc.).
-  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+export async function resumePickerInlineSwitch(pickerIdx: number, tmuxOverride?: string): Promise<void> {
+  const tmuxName = tmuxOverride ?? TMUX_SESSION
+
+  // Proactive cleanup instead of fragile pane-text busy-detection.
+  // Joey 2026-05-25 (msg 1572): "他們會常常改字吧？為何不就把它打斷就好了？"
+  // — busy-detection by regex on claude TUI output broke when claude
+  // changed its completion-marker format (`✻ Crunched for X` was past-tense
+  // history but my regex treated it as active). Cleaner approach: when the
+  // user clicks a /resume button they explicitly want to switch — interrupt
+  // whatever's in progress and drive the picker. Any mid-turn response is
+  // acceptable collateral; user can re-ask after switch.
+  //
+  // Sequence: Escape (dismiss any open dialog/picker) → wait → Ctrl-C
+  // (interrupt any active turn) → wait → drive picker.
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
   await new Promise(r => setTimeout(r, 200))
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-c'])
+  await new Promise(r => setTimeout(r, 600))
 
-  // Step 2 — Busy guard: if TUI is mid-tool-call, refuse rather than
-  // racing keystrokes against the model's UI state machine.
-  // 2026-05-24 claude-builder incident: picker driving during an active
-  // tool call dropped Down/Enter into the wrong UI mode → picker stuck
-  // open → 3 subsequent Joey messages silently swallowed.
-  if (await isClaudeBusy()) {
-    throw new Error(
-      'claude TUI is busy mid-turn — refusing to drive /resume picker ' +
-      '(keystrokes race the UI state machine and can stick the picker). ' +
-      'Wait for the current turn to finish, then try again.'
-    )
-  }
+  await tmuxSendKeys('/resume', tmuxName)
 
-  // Step 3 — Open picker.
-  await tmuxSendKeys('/resume')
-
-  // Step 4 — Wait + verify picker is actually rendered before sending Down.
-  //   Poll for up to 3s (six 500ms ticks). Without this, Down may fire
-  //   before picker exists → goes to main input → no-op or corrupts state.
   let pickerOk = false
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise(r => setTimeout(r, 500))
-    if (await isPickerOpen()) { pickerOk = true; break }
+    if (await isPickerOpen(tmuxName)) { pickerOk = true; break }
   }
   if (!pickerOk) {
-    // Best-effort cleanup
-    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
     throw new Error('picker failed to open after /resume (3s timeout) — Escape sent for safety')
   }
 
-  // Step 5 — Navigate + confirm.
   for (let i = 0; i < pickerIdx; i++) {
-    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Down'])
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Down'])
     await new Promise(r => setTimeout(r, 100))
   }
   await new Promise(r => setTimeout(r, 200))
-  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Enter'])
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Enter'])
 
-  // Step 6 — Post-verify: picker should have closed. If it's still open
-  // (Enter didn't register or sent to wrong UI), force-escape so the next
-  // inbound channel notification isn't stuck behind the picker overlay.
   for (let attempt = 0; attempt < 4; attempt++) {
     await new Promise(r => setTimeout(r, 500))
-    if (!(await isPickerOpen())) return
+    if (!(await isPickerOpen(tmuxName))) return
   }
-  // Picker stuck — clean up + warn.
-  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
   throw new Error(
     'picker still open 2s after Enter — sent Escape for cleanup. Resume may have not completed.'
   )
@@ -462,21 +602,28 @@ async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
 // when picker re-sorts (because all K prior visits became newest mtimes
 // and now sit at picker indices 0..K-1).
 
-type ResumeChain = { ids: string[]; ts: number }
+export type ResumeChain = { ids: string[]; ts: number }
+export type { ClaudeSession }
 
-function loadResumeChain(): ResumeChain {
+export function loadResumeChain(fileOverride?: string): ResumeChain {
+  const file = fileOverride ?? RESUME_CHAIN_FILE
   try {
-    if (!existsSync(RESUME_CHAIN_FILE)) return { ids: [], ts: 0 }
-    const raw = readFileSync(RESUME_CHAIN_FILE, 'utf8')
+    if (!existsSync(file)) return { ids: [], ts: 0 }
+    const raw = readFileSync(file, 'utf8')
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed?.ids)) return { ids: [], ts: 0 }
     return { ids: parsed.ids.filter((x: unknown) => typeof x === 'string'), ts: parsed.ts ?? 0 }
   } catch { return { ids: [], ts: 0 } }
 }
 
-function saveResumeChain(chain: ResumeChain): void {
+export function saveResumeChain(chain: ResumeChain, fileOverride?: string): void {
+  const RESUME_CHAIN_FILE_TARGET = fileOverride ?? RESUME_CHAIN_FILE
+  _saveResumeChainInternal(chain, RESUME_CHAIN_FILE_TARGET)
+}
+
+function _saveResumeChainInternal(chain: ResumeChain, file: string): void {
   try {
-    writeFileSync(RESUME_CHAIN_FILE, JSON.stringify(chain), { mode: 0o644 })
+    writeFileSync(file, JSON.stringify(chain), { mode: 0o644 })
   } catch {}
 }
 
@@ -489,7 +636,7 @@ function saveResumeChain(chain: ResumeChain): void {
  * prefix + first msg — useless for picking up an old conversation
  * mid-stream. Joey called this out 2026-05-24.
  */
-function formatResumeReply(opts: {
+export function formatResumeReply(opts: {
   header: string
   session: ClaudeSession
   footer: string
@@ -576,30 +723,11 @@ export async function handleControlSlash(
     }
   }
 
-  // ---- Phase 1: tmux send-keys (claude native slashes) -------------------
-  if (cmd === '/clear' || cmd === '/help' || cmd === '/agents' || cmd === '/mcp') {
-    await tryRun(`tmux send-keys ${cmd}`, async () => {
-      await tmuxSendKeys(cmd)
-      await replyToTg(`✅ sent \`${cmd}\` to claude TUI`)
-    })
-    return true
-  }
-  if (cmd === '/model' || cmd === '/effort') {
-    if (!args) {
-      await replyToTg(`usage: \`${cmd} <value>\``)
-      return true
-    }
-    await tryRun(`tmux send-keys ${cmd} ${args}`, async () => {
-      await tmuxSendKeys(`${cmd} ${args}`)
-      await replyToTg(`✅ sent \`${cmd} ${args}\``)
-    })
-    return true
-  }
-  if (cmd === '/sigint') {
-    await tryRun('tmux send-keys C-c', async () => {
-      await tmuxSendCtrlKey('C-c')
-      await replyToTg('✅ sent Ctrl+C — current turn interrupted')
-    })
+  // ---- Phase 1: shared TUI slash forward (delegates to single source of truth) -----
+  // This block handles /clear /agents /mcp /resume /help /init /compact /model /effort /sigint /cancel
+  // for BOTH channel-bot mode (here, with TMUX_SESSION) and roamer mode (which
+  // calls forwardSharedTuiSlash directly with its current_target tmux).
+  if (await forwardSharedTuiSlash(text, TMUX_SESSION, replyToTg)) {
     return true
   }
 
@@ -843,6 +971,7 @@ export function controlCommandsForBotApi(): Array<{
 }> {
   if (!isControlEnabled()) return []
   return [
+    { command: 'input', description: 'send raw text to tmux (multi-line, passthrough — bypasses plugin interception)' },
     { command: 'clear', description: 'clear claude TUI conversation (sends /clear via tmux)' },
     { command: 'model', description: 'switch claude model (/model <name>)' },
     { command: 'effort', description: 'switch claude effort level (/effort <low|med|high|max>)' },
