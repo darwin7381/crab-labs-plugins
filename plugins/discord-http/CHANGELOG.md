@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.6.0 — 2026-05-25
+
+Synced from [telegram-http 1.6.0](../telegram-http/CHANGELOG.md): adds `/input <text>` raw passthrough slash command. Sends text as keystrokes to the channel-bot's tmux session (multi-line supported, each line gets its own Enter). Lets the user type literal slash commands the plugin would otherwise intercept — e.g. `/input /plugin install foo`. See telegram-http CHANGELOG for full rationale.
+
+## 1.5.1 — 2026-05-25
+
+Synced from [telegram-http 1.5.1](../telegram-http/CHANGELOG.md): picker driver replaces regex-based busy-detection with proactive Escape + Ctrl-C before driving the picker. Eliminates `/resume_list` button-click false-positive "claude TUI busy" failures (Joey msg 1572).
+
+## 1.5.0 — 2026-05-25
+
+Synced from [telegram-http 1.5.0](../telegram-http/CHANGELOG.md). Identical feature set: shared TUI slash forwarder, context-aware high-level helpers, roamer parity with channel-bot commands (`/resume_list /resume /resume_previous /restart /kill_stuck`), cross-protocol auto-discovery via `roamer-daemons.json`, history-aware takeover (resume latest non-empty session in target's project), picker driver busy-guard now polls up to 20s instead of failing immediately.
+
+Version jump from 1.2.x → 1.5.0 to align with telegram-http (companion plugin sharing the same channel-bot-control + roamer-control architecture).
+
 ## 1.2.1 — 2026-05-24
 
 Synced from [telegram-http 1.3.1](../telegram-http/CHANGELOG.md): 4-step defensive picker driver (Pre-Escape, busy guard, verify picker open, verify picker closed) prevents the `/resume` picker from getting stuck open when daemon-driven from rapid button taps or restart races. Fixes the 2026-05-24 claude-builder silent-drop incident.

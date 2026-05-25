@@ -87,48 +87,178 @@ function runCommand(
   })
 }
 
-/** tmux send-keys with Enter at the end. */
-async function tmuxSendKeys(text: string): Promise<void> {
+/** tmux send-keys with Enter at the end (accepts optional tmuxName override). */
+async function tmuxSendKeys(text: string, tmuxName: string = TMUX_SESSION): Promise<void> {
   const { exitCode, stderr } = await runCommand(
-    ['tmux', 'send-keys', '-t', TMUX_SESSION, text, 'Enter'],
+    ['tmux', 'send-keys', '-t', tmuxName, text, 'Enter'],
   )
   if (exitCode !== 0) {
     throw new Error(`tmux send-keys failed (${exitCode}): ${stderr.trim().slice(0, 200)}`)
   }
 }
 
-/** tmux send a single control key like C-c (Ctrl+C). */
-async function tmuxSendCtrlKey(key: string): Promise<void> {
+async function tmuxSendCtrlKey(key: string, tmuxName: string = TMUX_SESSION): Promise<void> {
   const { exitCode, stderr } = await runCommand(
-    ['tmux', 'send-keys', '-t', TMUX_SESSION, key],
+    ['tmux', 'send-keys', '-t', tmuxName, key],
   )
   if (exitCode !== 0) {
     throw new Error(`tmux send-keys failed (${exitCode}): ${stderr.trim().slice(0, 200)}`)
   }
 }
 
-/** tmux capture-pane → returns plain text. */
-async function tmuxCapturePane(): Promise<string> {
+async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string> {
   const { exitCode, stdout } = await runCommand(
-    ['tmux', 'capture-pane', '-t', TMUX_SESSION, '-p'],
+    ['tmux', 'capture-pane', '-t', tmuxName, '-p'],
   )
   if (exitCode !== 0) return ''
   return stdout
 }
 
-/** Is claude TUI's `/resume` picker overlay currently rendered? */
-async function isPickerOpen(): Promise<boolean> {
-  const pane = await tmuxCapturePane()
+async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const pane = await tmuxCapturePane(tmuxName)
   return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
 }
 
-/** Is claude TUI mid-tool-call / mid-turn? See telegram-http variant for
- *  the 2026-05-24 claude-builder incident that motivated this guard. */
-async function isClaudeBusy(): Promise<boolean> {
-  const pane = await tmuxCapturePane()
+async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-15).join('\n')
+
   if (!/❯\s/.test(tail)) return true
-  if (/Calling .*plugin|Bash\(|✻\s+\w+ed for|✢\s+\w+|⏺\s+\w+\(/.test(tail)) return true
+
+  // Active-only indicators. Previous regex matched `✻ Crunched for ...`
+  // (past-tense completion marker) as busy → false positive after a turn.
+  if (/\(esc to interrupt\)/.test(tail)) return true
+  if (/[✻✢]\s+\w+ing\b/.test(tail)) return true
+  if (/Calling .*plugin/.test(tail)) return true
+  return false
+}
+
+// ============================================================================
+// SHARED TUI slash forwarder — single source of truth for "send-keys to claude"
+// commands. Channel-bot and roamer both delegate here.
+// ============================================================================
+
+const SHARED_TUI_SENDABLE = new Set([
+  '/clear', '/agents', '/mcp', '/resume', '/help', '/init', '/compact',
+])
+const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
+const SHARED_TUI_CTRL_KEY: Record<string, string> = {
+  '/sigint': 'C-c',
+  '/cancel': 'C-c',
+}
+
+export function sharedTuiCommands(): string[] {
+  return ['/input', ...SHARED_TUI_SENDABLE, ...SHARED_TUI_SENDABLE_WITH_ARG, ...Object.keys(SHARED_TUI_CTRL_KEY)].sort()
+}
+
+/**
+ * /input — raw passthrough to tmux send-keys.
+ *
+ * `/input <text>` sends <text> as keystrokes to the tmux session with Enter at
+ * the end. Multi-line messages: each newline-separated line is sent as its own
+ * send-keys call (each gets its own Enter). Useful for typing slash commands
+ * the plugin would otherwise intercept (e.g. `/plugin install foo`) or for any
+ * literal input that should land in the claude TUI as if typed at the keyboard.
+ *
+ * Must run BEFORE the verbatim-send / ctrl-key branches in
+ * `forwardSharedTuiSlash`, otherwise `/input /clear` would be captured by the
+ * `/clear` handler instead of being typed literally.
+ *
+ * KEEP IN SYNC with telegram-http/channel-bot-control.ts.
+ */
+async function forwardInputPassthrough(
+  text: string,
+  tmuxName: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  const m = /^\/input(\s|$)/.exec(text)
+  if (!m) return false
+
+  const sepIdx = '/input'.length
+  const payload = m[1] === '' || sepIdx >= text.length ? '' : text.slice(sepIdx + 1)
+
+  if (!payload.trim()) {
+    await replyToTg(
+      'usage: `/input <text>` — sends text as keystrokes to the claude TUI ' +
+        '(multi-line supported, each line gets its own Enter). ' +
+        'Example:\n```\n/input /plugin marketplace add anthropics/skills\n' +
+        '/plugin install document-skills@anthropic-agent-skills\n```',
+    )
+    return true
+  }
+
+  const lines = payload.split('\n')
+  const failures: string[] = []
+  let sent = 0
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      await tmuxSendKeys(lines[i], tmuxName)
+      sent++
+    } catch (err) {
+      failures.push(`line ${i + 1}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  if (failures.length === 0) {
+    await replyToTg(`✅ /input — sent ${sent} line${sent === 1 ? '' : 's'} to ${tmuxName}`)
+  } else {
+    await replyToTg(
+      `⚠️ /input — sent ${sent}/${lines.length} lines to ${tmuxName}\nfailures:\n${failures.join('\n')}`,
+    )
+  }
+  return true
+}
+
+export async function forwardSharedTuiSlash(
+  text: string,
+  tmuxName: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  // /input passthrough first — must beat the verbatim-send branches below so
+  // `/input /clear` types `/clear` literally into the TUI instead of being
+  // intercepted by the /clear handler.
+  if (await forwardInputPassthrough(text, tmuxName, replyToTg)) return true
+
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('/')) return false
+  const [rawCmd, ...rest] = trimmed.split(/\s+/)
+  const cmd = rawCmd.toLowerCase()
+  const args = rest.join(' ').trim()
+
+  if (cmd in SHARED_TUI_CTRL_KEY) {
+    try {
+      await tmuxSendCtrlKey(SHARED_TUI_CTRL_KEY[cmd], tmuxName)
+      await replyToTg(`✅ 已送 ${SHARED_TUI_CTRL_KEY[cmd]}（${cmd}）到 ${tmuxName}`)
+    } catch (err) {
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+    }
+    return true
+  }
+
+  if (SHARED_TUI_SENDABLE.has(cmd)) {
+    try {
+      await tmuxSendKeys(cmd, tmuxName)
+      await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
+    } catch (err) {
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+    }
+    return true
+  }
+
+  if (SHARED_TUI_SENDABLE_WITH_ARG.has(cmd)) {
+    if (!args) {
+      await replyToTg(`usage: \`${cmd} <value>\``)
+      return true
+    }
+    try {
+      await tmuxSendKeys(`${cmd} ${args}`, tmuxName)
+      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}`)
+    } catch (err) {
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+    }
+    return true
+  }
+
   return false
 }
 
@@ -276,12 +406,13 @@ function extractMessageExcerpt(rec: any): { role: 'user' | 'asst'; text: string 
  * stripped of their outer tag for readability. Only `<system>` framework
  * injections are skipped.
  */
-function listClaudeSessions(limit = 30): ClaudeSession[] {
-  if (!PROJECTS_DIR || !existsSync(PROJECTS_DIR)) return []
+export function listClaudeSessions(limit = 30, projectsDirOverride?: string): ClaudeSession[] {
+  const dir = projectsDirOverride ?? PROJECTS_DIR
+  if (!dir || !existsSync(dir)) return []
   const out: ClaudeSession[] = []
-  for (const name of readdirSync(PROJECTS_DIR)) {
+  for (const name of readdirSync(dir)) {
     if (!name.endsWith('.jsonl')) continue
-    const full = join(PROJECTS_DIR, name)
+    const full = join(dir, name)
     let stat
     try { stat = statSync(full) } catch { continue }
     if (!stat.isFile()) continue
@@ -339,8 +470,8 @@ function listClaudeSessions(limit = 30): ClaudeSession[] {
 }
 
 /** "Current" session: the .jsonl most recently modified (= the running claude TUI's session). */
-function currentSessionId(): string | null {
-  const sessions = listClaudeSessions(1)
+export function currentSessionId(projectsDirOverride?: string): string | null {
+  const sessions = listClaudeSessions(1, projectsDirOverride)
   return sessions[0]?.id ?? null
 }
 
@@ -364,48 +495,40 @@ function currentSessionId(): string | null {
  * (pid 31042 → 31042 across switch). Daemon's MCP transport remains
  * connected; in-flight messages don't drop.
  */
-async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
-  // Step 1 — Pre-Escape: clear any pre-existing picker / partial input.
-  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+export async function resumePickerInlineSwitch(pickerIdx: number, tmuxOverride?: string): Promise<void> {
+  const tmuxName = tmuxOverride ?? TMUX_SESSION
+
+  // Proactive cleanup — Escape + Ctrl-C instead of fragile busy-detection.
+  // See telegram-http variant for full rationale (msg 1572).
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
   await new Promise(r => setTimeout(r, 200))
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-c'])
+  await new Promise(r => setTimeout(r, 600))
 
-  // Step 2 — Busy guard: refuse picker driving when TUI is mid-tool-call.
-  // (See telegram-http variant for the 2026-05-24 incident details.)
-  if (await isClaudeBusy()) {
-    throw new Error(
-      'claude TUI is busy mid-turn — refusing to drive /resume picker. ' +
-      'Wait for the current turn to finish, then try again.'
-    )
-  }
+  await tmuxSendKeys('/resume', tmuxName)
 
-  // Step 3 — Open picker.
-  await tmuxSendKeys('/resume')
-
-  // Step 4 — Poll for picker render (up to 3s) before sending Down.
   let pickerOk = false
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise(r => setTimeout(r, 500))
-    if (await isPickerOpen()) { pickerOk = true; break }
+    if (await isPickerOpen(tmuxName)) { pickerOk = true; break }
   }
   if (!pickerOk) {
-    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
     throw new Error('picker failed to open after /resume (3s timeout) — Escape sent for safety')
   }
 
-  // Step 5 — Navigate + confirm.
   for (let i = 0; i < pickerIdx; i++) {
-    await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Down'])
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Down'])
     await new Promise(r => setTimeout(r, 100))
   }
   await new Promise(r => setTimeout(r, 200))
-  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Enter'])
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Enter'])
 
-  // Step 6 — Post-verify: picker must close. If stuck, force-escape.
   for (let attempt = 0; attempt < 4; attempt++) {
     await new Promise(r => setTimeout(r, 500))
-    if (!(await isPickerOpen())) return
+    if (!(await isPickerOpen(tmuxName))) return
   }
-  await runCommand(['tmux', 'send-keys', '-t', TMUX_SESSION, 'Escape'])
+  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
   throw new Error(
     'picker still open 2s after Enter — sent Escape for cleanup. Resume may have not completed.'
   )
@@ -428,21 +551,24 @@ async function resumePickerInlineSwitch(pickerIdx: number): Promise<void> {
 // when picker re-sorts (because all K prior visits became newest mtimes
 // and now sit at picker indices 0..K-1).
 
-type ResumeChain = { ids: string[]; ts: number }
+export type ResumeChain = { ids: string[]; ts: number }
+export type { ClaudeSession }
 
-function loadResumeChain(): ResumeChain {
+export function loadResumeChain(fileOverride?: string): ResumeChain {
+  const file = fileOverride ?? RESUME_CHAIN_FILE
   try {
-    if (!existsSync(RESUME_CHAIN_FILE)) return { ids: [], ts: 0 }
-    const raw = readFileSync(RESUME_CHAIN_FILE, 'utf8')
+    if (!existsSync(file)) return { ids: [], ts: 0 }
+    const raw = readFileSync(file, 'utf8')
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed?.ids)) return { ids: [], ts: 0 }
     return { ids: parsed.ids.filter((x: unknown) => typeof x === 'string'), ts: parsed.ts ?? 0 }
   } catch { return { ids: [], ts: 0 } }
 }
 
-function saveResumeChain(chain: ResumeChain): void {
+export function saveResumeChain(chain: ResumeChain, fileOverride?: string): void {
+  const file = fileOverride ?? RESUME_CHAIN_FILE
   try {
-    writeFileSync(RESUME_CHAIN_FILE, JSON.stringify(chain), { mode: 0o644 })
+    writeFileSync(file, JSON.stringify(chain), { mode: 0o644 })
   } catch {}
 }
 
@@ -451,7 +577,7 @@ function saveResumeChain(chain: ResumeChain): void {
  * to recognize WHICH session he just switched to: id prefix, when it
  * started (first user msg), and where it left off (last ~3 messages).
  */
-function formatResumeReply(opts: {
+export function formatResumeReply(opts: {
   header: string
   session: ClaudeSession
   footer: string
@@ -520,30 +646,8 @@ export async function handleControlSlash(
     }
   }
 
-  // ---- Phase 1: tmux send-keys (claude native slashes) -------------------
-  if (cmd === '/clear' || cmd === '/help' || cmd === '/agents' || cmd === '/mcp') {
-    await tryRun(`tmux send-keys ${cmd}`, async () => {
-      await tmuxSendKeys(cmd)
-      await replyToTg(`✅ sent \`${cmd}\` to claude TUI`)
-    })
-    return true
-  }
-  if (cmd === '/model' || cmd === '/effort') {
-    if (!args) {
-      await replyToTg(`usage: \`${cmd} <value>\``)
-      return true
-    }
-    await tryRun(`tmux send-keys ${cmd} ${args}`, async () => {
-      await tmuxSendKeys(`${cmd} ${args}`)
-      await replyToTg(`✅ sent \`${cmd} ${args}\``)
-    })
-    return true
-  }
-  if (cmd === '/sigint') {
-    await tryRun('tmux send-keys C-c', async () => {
-      await tmuxSendCtrlKey('C-c')
-      await replyToTg('✅ sent Ctrl+C — current turn interrupted')
-    })
+  // ---- Phase 1: shared TUI slash forward (delegates to single source of truth) -----
+  if (await forwardSharedTuiSlash(text, TMUX_SESSION, replyToTg)) {
     return true
   }
 
@@ -783,6 +887,7 @@ export function controlCommandsForBotApi(): Array<{
 }> {
   if (!isControlEnabled()) return []
   return [
+    { command: 'input', description: 'send raw text to tmux (multi-line, passthrough — bypasses plugin interception)' },
     { command: 'clear', description: 'clear claude TUI conversation (sends /clear via tmux)' },
     { command: 'model', description: 'switch claude model (/model <name>)' },
     { command: 'effort', description: 'switch claude effort level (/effort <low|med|high|max>)' },
