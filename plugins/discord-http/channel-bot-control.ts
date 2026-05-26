@@ -114,6 +114,26 @@ async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string>
   return stdout
 }
 
+// Yes/No confirmation picker detector + auto-confirm. KEEP IN SYNC with telegram-http.
+// Joey 2026-05-26 msg 1696/1700.
+async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const pane = await tmuxCapturePane(tmuxName)
+  const tail = pane.split('\n').slice(-25).join('\n')
+  if (/Resume session/.test(tail)) return false
+  return /❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail)
+}
+
+async function autoConfirmYesNoPicker(tmuxName: string): Promise<boolean> {
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 200))
+    if (await isYesNoConfirmPickerOpen(tmuxName)) {
+      await tmuxSendKeys('', tmuxName)
+      return true
+    }
+  }
+  return false
+}
+
 async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   const pane = await tmuxCapturePane(tmuxName)
   return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
@@ -255,7 +275,10 @@ export async function forwardSharedTuiSlash(
     }
     try {
       await tmuxSendKeys(`${cmd} ${args}`, tmuxName)
-      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}`)
+      // Auto-confirm Yes/No picker (see telegram-http). KEEP IN SYNC.
+      const confirmed = await autoConfirmYesNoPicker(tmuxName)
+      const suffix = confirmed ? ' (auto-confirmed picker)' : ''
+      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}${suffix}`)
     } catch (err) {
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }

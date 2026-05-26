@@ -113,6 +113,44 @@ async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string>
   return stdout
 }
 
+/**
+ * Detect a Yes/No confirmation picker (e.g. /effort, /model — TUI asks
+ * "Change effort level? ❯ 1. Yes, switch ... 2. No, go back"). Default cursor
+ * is "Yes" so a bare Enter confirms.
+ *
+ * Heuristic: pane contains "Yes" + "go back" near each other within the last
+ * 20 lines (typical picker footprint) AND a numbered "1." line marked with
+ * the cursor "❯". Excludes the /resume picker (already driven separately).
+ */
+async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const pane = await tmuxCapturePane(tmuxName)
+  const tail = pane.split('\n').slice(-25).join('\n')
+  if (/Resume session/.test(tail)) return false // handled separately
+  return /❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail)
+}
+
+/**
+ * After sending an arg-bearing TUI command (e.g. `/effort high`, `/model X`),
+ * Claude TUI opens a Yes/No confirmation picker with default cursor on "Yes".
+ * Without anyone pressing Enter the session is stuck. We poll briefly for the
+ * picker; if found, auto-confirm with Enter so TG users don't have to manually
+ * `/input 1`.
+ *
+ * Bounded: 15 × 200ms = 3s max wait. If picker never appears (cmd was a no-op
+ * or already in target state), we just return.
+ */
+async function autoConfirmYesNoPicker(tmuxName: string): Promise<boolean> {
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 200))
+    if (await isYesNoConfirmPickerOpen(tmuxName)) {
+      // bare Enter (tmuxSendKeys always appends Enter so passing '' = just Enter)
+      await tmuxSendKeys('', tmuxName)
+      return true
+    }
+  }
+  return false
+}
+
 /** Is claude TUI's `/resume` picker overlay currently rendered? */
 async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   const pane = await tmuxCapturePane(tmuxName)
@@ -279,7 +317,12 @@ export async function forwardSharedTuiSlash(
     }
     try {
       await tmuxSendKeys(`${cmd} ${args}`, tmuxName)
-      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}`)
+      // Claude TUI opens a Yes/No confirmation picker for /effort and /model
+      // arg-changes (default cursor on "Yes"). Without auto-confirm the session
+      // hangs because TG users can't press Enter. Joey 2026-05-26 msg 1696/1700.
+      const confirmed = await autoConfirmYesNoPicker(tmuxName)
+      const suffix = confirmed ? ' (auto-confirmed picker)' : ''
+      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}${suffix}`)
     } catch (err) {
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }
