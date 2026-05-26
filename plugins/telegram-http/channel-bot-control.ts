@@ -256,6 +256,13 @@ export async function forwardSharedTuiSlash(
   }
 
   if (SHARED_TUI_SENDABLE.has(cmd)) {
+    // /resume with an argument needs Phase-3's resumePickerInlineSwitch (which
+    // drives the picker by tmux arrow keys to reach a specific session).
+    // The bare send-keys path here only types the command literally — it can't
+    // navigate the picker and silently drops the UUID/number arg. Fall through
+    // so handleControlSlash's /resume <id> branch gets it. (Joey 2026-05-26 msg
+    // 1656/1657: inline-keyboard button clicks were a no-op because of this.)
+    if (cmd === '/resume' && args) return false
     try {
       await tmuxSendKeys(cmd, tmuxName)
       await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
