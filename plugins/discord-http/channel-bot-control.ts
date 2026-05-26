@@ -236,6 +236,9 @@ export async function forwardSharedTuiSlash(
   }
 
   if (SHARED_TUI_SENDABLE.has(cmd)) {
+    // /resume with an argument needs Phase-3's resumePickerInlineSwitch.
+    // KEEP IN SYNC with telegram-http. Joey 2026-05-26 msg 1656/1657.
+    if (cmd === '/resume' && args) return false
     try {
       await tmuxSendKeys(cmd, tmuxName)
       await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
