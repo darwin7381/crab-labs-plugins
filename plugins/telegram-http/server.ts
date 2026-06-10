@@ -31,6 +31,17 @@ import {
   type InlineButton,
   type ReplyOptions,
 } from './channel-bot-control.ts'
+import {
+  isRoamerEnabled,
+  handleRoamerSlash,
+  handleRoamerCallback,
+  roamerCommandsForBotApi,
+  onNewMcpSession as roamerOnNewMcpSession,
+  onMcpSessionClosed as roamerOnMcpSessionClosed,
+  getCurrentTargetMcpSessionId as roamerGetCurrentTargetMcpSessionId,
+  registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
+  unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
+} from './roamer-control.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -150,6 +161,9 @@ process.on('beforeExit', code => {
   log('warn', `beforeExit code=${code} uptime=${process.uptime().toFixed(1)}s`)
 })
 process.on('exit', code => {
+  // Roamer cross-protocol auto-discovery: drop our entry so partners stop trying
+  // to spawn claudes pointed at our (now-dead) port. Safe no-op if not enabled.
+  try { roamerUnregisterSelfAsDaemon() } catch {}
   // appendFileSync inside log() may not flush — write directly. No stderr (likely dead by here).
   try {
     appendFileSync(LOG_FILE, `${new Date().toISOString()} [exit] pid=${process.pid} code=${code} uptime=${process.uptime().toFixed(1)}s\n`)
@@ -506,6 +520,14 @@ const activeServers = new Set<Server>()
 const serverSessionId = new WeakMap<Server, string>()  // server → its session id
 const sseOpen = new Map<string, boolean>()             // session id → SSE GET stream open?
 const memQueue = new Map<string, Array<{ method: string; params: unknown }>>()  // session id → pending notifs while SSE not open
+// issue #3 fix: claude-code's MCP client churns sessions (each reconnect POSTs a
+// fresh `initialize`) but its dead SSE GET stream never triggers `transport.onclose`
+// on our side — so dead sessions accumulate forever (observed 25/2269/78 opens, 0
+// closes) and inbound broadcasts queue into their dead in-memory queue and are lost.
+// We track per-session last-activity and reap sessions whose SSE has been absent
+// past a grace window, regardless of onclose.
+const sessionLastActiveAt = new Map<string, number>() // session id → ms of session create / last confirmed SSE write
+const SESSION_GRACE_MS = 120_000                       // no open SSE for this long ⇒ zombie ⇒ evict
 
 // Disk-persistent replay queue — survives daemon restart and "0 active sessions"
 // gaps. New session's first GET handleRequest signals SSE is up; we then drain
@@ -954,11 +976,11 @@ bot.command('status', async ctx => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
-  // Channel-bot control buttons (e.g. `resume:<uuid_prefix>` from /resume_list).
-  // Routed BEFORE the permission regex check so resume buttons work even if
-  // we ever change the perm: format. Security: only allowlisted senders can
-  // trigger these (gate() called below — replicate here).
-  if (data.startsWith('resume:')) {
+  // resume: + roam: callback buttons. In roamer mode, both go through
+  // roamer handler (it knows how to drive picker against the dynamic
+  // current_target tmux). In channel-bot mode, resume: goes to
+  // channel-bot's handleCallbackData (fixed TMUX_SESSION).
+  if (data.startsWith('resume:') || data.startsWith('roam:')) {
     const access = loadAccess()
     const senderId = String(ctx.from.id)
     if (!access.allowFrom.includes(senderId)) {
@@ -971,14 +993,19 @@ bot.on('callback_query:data', async ctx => {
       await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard)
     }
     try {
-      await handleCallbackData(data, httpPort, replyToTg)
+      if (isRoamerEnabled()) {
+        await handleRoamerCallback(data, replyToTg)
+      } else if (data.startsWith('resume:')) {
+        await handleCallbackData(data, httpPort, replyToTg)
+      }
     } catch (err) {
-      log('warn', `handleCallbackData failed: ${err instanceof Error ? err.message : err}`)
+      log('warn', `callback dispatch failed: ${err instanceof Error ? err.message : err}`)
     }
     await ctx.answerCallbackQuery().catch(() => {})
     return
   }
 
+  // Roamer callback buttons (`roam:<sid_prefix>`).
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -1042,7 +1069,11 @@ bot.on('callback_query:data', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
+  // If this text (e.g. a reply that @mentions the bot) carries no file of its
+  // own but the message it replies to does, pull that attachment in — so
+  // "reply to a file message + tag me" delivers the file, not just the text.
+  const { attachment, downloadImage } = replyAttachment(ctx)
+  await handleInbound(ctx, ctx.message.text, downloadImage, attachment)
 })
 
 bot.on('message:photo', async ctx => {
@@ -1154,6 +1185,63 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// When a message replies to another message that carries a file (e.g. user
+// replies to an invoice PDF and @mentions the bot in the reply text), Telegram
+// keeps the file on the REPLIED-TO message, not the reply itself. The per-type
+// handlers above only read the current message's own attachment, so without
+// this the file would be lost. Pull the replied-to message's attachment so it
+// rides along. Photos need a deferred download closure (mirrors message:photo);
+// everything else carries a file_id we can hand straight to download_attachment.
+function replyAttachment(ctx: Context): {
+  attachment?: AttachmentMeta
+  downloadImage?: () => Promise<string | undefined>
+} {
+  const rt = ctx.message?.reply_to_message
+  if (!rt) return {}
+  if (rt.document) {
+    const d = rt.document
+    return { attachment: { kind: 'document', file_id: d.file_id, size: d.file_size, mime: d.mime_type, name: safeName(d.file_name) } }
+  }
+  if (rt.video) {
+    const v = rt.video
+    return { attachment: { kind: 'video', file_id: v.file_id, size: v.file_size, mime: v.mime_type, name: safeName(v.file_name) } }
+  }
+  if (rt.audio) {
+    const a = rt.audio
+    return { attachment: { kind: 'audio', file_id: a.file_id, size: a.file_size, mime: a.mime_type, name: safeName(a.file_name) } }
+  }
+  if (rt.voice) {
+    const vo = rt.voice
+    return { attachment: { kind: 'voice', file_id: vo.file_id, size: vo.file_size, mime: vo.mime_type } }
+  }
+  if (rt.video_note) {
+    const vn = rt.video_note
+    return { attachment: { kind: 'video_note', file_id: vn.file_id, size: vn.file_size } }
+  }
+  if (rt.photo && rt.photo.length > 0) {
+    const best = rt.photo[rt.photo.length - 1]
+    const downloadImage = async () => {
+      try {
+        const file = await ctx.api.getFile(best.file_id)
+        if (!file.file_path) return undefined
+        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+        const res = await fetch(url)
+        const buf = Buffer.from(await res.arrayBuffer())
+        const ext = file.file_path.split('.').pop() ?? 'jpg'
+        const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
+        mkdirSync(INBOX_DIR, { recursive: true })
+        writeFileSync(path, buf)
+        return path
+      } catch (err) {
+        log('error', `reply photo download failed: ${err}`)
+        return undefined
+      }
+    }
+    return { downloadImage }
+  }
+  return {}
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1237,6 +1325,25 @@ async function handleInbound(
     }
   }
 
+  // Roamer control plane (opt-in via ROAMER_MODE=1 env).
+  // /roam command handled inline. Non-slash text falls through to the
+  // standard broadcast → MCP notification path below, with one change:
+  // we don't broadcast to all connected sessions but only to the current
+  // roamer target's MCP session. That section is handled in the
+  // "build notification + broadcast" block below (see roamer routing).
+  if (isRoamerEnabled()) {
+    const replyToTg = async (msg: string, opts?: ReplyOptions) => {
+      await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard)
+    }
+    const handled = await handleRoamerSlash(text, replyToTg)
+    if (handled) {
+      log('info', `roamer handled slash: ${text.slice(0, 60)}`)
+      return
+    }
+    // Non-slash text falls through to the notification path below, which
+    // routes via roamerGetCurrentTargetMcpSessionId().
+  }
+
   const imagePath = downloadImage ? await downloadImage() : undefined
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
@@ -1271,6 +1378,24 @@ async function handleInbound(
       },
     },
   }
+  // In ROAMER_MODE, route to the current target's MCP session only,
+  // not broadcast. Each roamer keeps multiple bridged claudes alive
+  // (one per ever-claimed target) but TG inbound goes only to whichever
+  // is currently selected. Outside roamer mode, fall back to broadcast.
+  if (isRoamerEnabled()) {
+    const targetSid = roamerGetCurrentTargetMcpSessionId()
+    if (!targetSid) {
+      // No target chosen yet — prompt the user.
+      await sendTextWithMaybeKeyboard(
+        String(chat_id),
+        '⚠️ 尚未連線 target。打 /roam 選一個 session 再來。',
+      )
+      return
+    }
+    sendToMcpSession(targetSid, notification)
+    return
+  }
+
   broadcastNotification(notification)
 }
 
@@ -1286,27 +1411,100 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
     persistInbound(notif)
     return
   }
+  const now = Date.now()
   let anySseOpen = false
-  for (const server of activeServers) {
+  for (const server of [...activeServers]) {  // snapshot: evictZombieSession mutates activeServers
     const sid = serverSessionId.get(server)
-    if (sid && sseOpen.get(sid)) {
+    if (!sid) continue
+    if (sseOpen.get(sid)) {
       anySseOpen = true
       void server.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
         log('error', `notify session ${sid} failed, removing from registry: ${err}`)
         activeServers.delete(server)
       })
-    } else if (sid) {
-      const q = memQueue.get(sid) ?? []
-      q.push(notif)
-      memQueue.set(sid, q)
-      log('info', `queued for session ${sid} (SSE not yet open, queue=${q.length})`)
+    } else {
+      // SSE not open. issue #3: if it's been absent past the grace window this is a
+      // zombie (transport.onclose never fired) — evict it instead of queuing inbound
+      // into a dead session forever. Within grace, the SSE GET may still be in flight.
+      const last = sessionLastActiveAt.get(sid) ?? 0
+      if (now - last > SESSION_GRACE_MS) {
+        evictZombieSession(sid, `broadcast: no open SSE for ${Math.round((now - last) / 1000)}s`)
+      } else {
+        const q = memQueue.get(sid) ?? []
+        q.push(notif)
+        memQueue.set(sid, q)
+        log('info', `queued for session ${sid} (SSE not yet open, queue=${q.length})`)
+      }
     }
   }
-  // Safety net: if NO session has SSE open, also write to disk so we recover
-  // across daemon restarts and any unforeseen handshake races.
   if (!anySseOpen) {
     log('warn', `no SSE-open session at broadcast — also persisting to disk: ${notif.method}`)
     persistInbound(notif)
+  }
+}
+
+// issue #3 fix: remove a (zombie) session from every registry, regardless of
+// whether transport.onclose ever fired. Mirrors the onclose cleanup body.
+function evictZombieSession(sid: string, reason: string): void {
+  let srv: Server | undefined
+  for (const s of activeServers) { if (serverSessionId.get(s) === sid) { srv = s; break } }
+  if (srv) activeServers.delete(srv)
+  const transport = transports.get(sid)
+  transports.delete(sid)
+  sseOpen.delete(sid)
+  memQueue.delete(sid)
+  sessionLastActiveAt.delete(sid)
+  if (srv) {
+    for (const [reqId, p] of pendingPermissions) {
+      if (p.server === srv) pendingPermissions.delete(reqId)
+    }
+  }
+  log('info', `MCP session evicted by GC: ${sid} reason=${reason} (active=${activeServers.size})`)
+  try { transport?.close() } catch {}
+  try { if (isRoamerEnabled()) roamerOnMcpSessionClosed(sid) } catch {}
+}
+
+// issue #3 fix: reap zombie sessions on a timer. transport.onclose never fires for
+// claude-code's dead SSE streams, so without this they accumulate forever and inbound
+// broadcasts queue into their dead queues and are silently lost. Any session whose SSE
+// has not been open (or has dropped) for longer than the grace window is evicted.
+setInterval(() => {
+  const now = Date.now()
+  for (const sid of [...transports.keys()]) {
+    if (sseOpen.get(sid)) continue                      // SSE confirmed open ⇒ live
+    const last = sessionLastActiveAt.get(sid) ?? 0
+    if (now - last > SESSION_GRACE_MS) {
+      evictZombieSession(sid, `gc-timer: no open SSE for ${Math.round((now - last) / 1000)}s`)
+    }
+  }
+}, 30_000).unref()
+
+/**
+ * Send a notification to ONE specific MCP session (by sessionId).
+ * Used by ROAMER_MODE to deliver TG messages only to the currently-
+ * selected target's claude, not all bridged claudes.
+ */
+function sendToMcpSession(sessionId: string, notif: { method: string; params: unknown }): void {
+  let found: Server | null = null
+  for (const s of activeServers) {
+    if (serverSessionId.get(s) === sessionId) { found = s; break }
+  }
+  if (!found) {
+    log('warn', `roamer: target MCP session ${sessionId} not in activeServers — queueing`)
+    const q = memQueue.get(sessionId) ?? []
+    q.push(notif)
+    memQueue.set(sessionId, q)
+    return
+  }
+  if (sseOpen.get(sessionId)) {
+    void found.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
+      log('error', `roamer notify session ${sessionId} failed: ${err}`)
+    })
+  } else {
+    const q = memQueue.get(sessionId) ?? []
+    q.push(notif)
+    memQueue.set(sessionId, q)
+    log('info', `roamer: queued for session ${sessionId} (SSE not yet open, queue=${q.length})`)
   }
 }
 
@@ -1345,15 +1543,19 @@ async function pollLoop(): Promise<void> {
             { command: 'status', description: 'Check your pairing status' },
           ]
           const controlCommands = controlCommandsForBotApi()
-          // De-dupe: control list may also contain 'status' (overrides baseline).
+          const roamerCommands = roamerCommandsForBotApi()
+          // De-dupe: control / roamer lists may override baseline (e.g. 'status').
           const merged = [...baseCommands]
-          for (const c of controlCommands) {
+          for (const c of [...controlCommands, ...roamerCommands]) {
             const idx = merged.findIndex(b => b.command === c.command)
             if (idx >= 0) merged[idx] = c
             else merged.push(c)
           }
           if (controlCommands.length > 0) {
             log('info', `channel-bot control mode ON: registering ${controlCommands.length} TUI-control slash commands`)
+          }
+          if (roamerCommands.length > 0) {
+            log('info', `roamer mode ON: registering ${roamerCommands.length} roamer slash commands`)
           }
           // Register to both default and all_private_chats scopes so
           // the autocomplete shows up in DMs regardless of any BotFather-
@@ -1442,6 +1644,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         uptime_s: Math.floor(process.uptime()),
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         active_sessions: activeServers.size,
+        sessions_with_open_sse: [...sseOpen.values()].filter(Boolean).length,  // issue #3: live vs zombie
+        max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         polling: botUsername !== '',  // grammy's onStart set this; falsy = polling not yet active
         pending_disk_count: (() => {
@@ -1477,7 +1681,13 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             transports.set(id, transport)
             serverSessionId.set(server, id)
             sseOpen.set(id, false)  // SSE not open until client does GET
+            sessionLastActiveAt.set(id, Date.now())  // start the zombie-GC grace clock
             log('info', `MCP session opened: ${id} (active=${activeServers.size}, SSE pending)`)
+            // Roamer: if a takeover is pending, claim this new session for it.
+            if (isRoamerEnabled()) {
+              const claimed = roamerOnNewMcpSession(id)
+              if (claimed) log('info', `roamer: claimed MCP session ${id} for pending takeover`)
+            }
           },
         })
         const server = buildServer()
@@ -1488,10 +1698,14 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           if (transport.sessionId) {
             transports.delete(transport.sessionId)
             sseOpen.delete(transport.sessionId)
-            memQueue.delete(transport.sessionId)  // discard mem queue; disk pending stays for next session
+            memQueue.delete(transport.sessionId)
+            sessionLastActiveAt.delete(transport.sessionId)
             log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
             for (const [reqId, p] of pendingPermissions) {
               if (p.server === server) pendingPermissions.delete(reqId)
+            }
+            if (isRoamerEnabled()) {
+              roamerOnMcpSessionClosed(transport.sessionId)
             }
           }
         }
@@ -1527,6 +1741,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         //      our server.notification calls reach claude
         //   5. THEN await the long-lived SSE request lifecycle
         sseOpen.set(sessionId, true)
+        sessionLastActiveAt.set(sessionId, Date.now())  // SSE confirmed open ⇒ reset zombie-GC clock
 
         // 2026-05-22 — Dead-transport detection patch (belt + suspenders):
         //
@@ -1561,8 +1776,21 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             clearInterval(keepaliveTimer)
             return
           }
+          // issue #3 hardening: a half-dead socket accepts keepalive writes into the
+          // kernel buffer (so the write "succeeds") but the peer never drains them.
+          // If the unflushed buffer backs up past a threshold, claude isn't reading →
+          // treat as dead so the GC reaps it instead of trusting the buffered write.
+          const backlog = (res as any).writableLength ?? (req.socket as any)?.writableLength ?? 0
+          if (backlog > 1_000_000) {
+            log('info', `SSE backpressure for ${sessionId} (writableLength=${backlog}) — marking dead and forcing close`)
+            sseOpen.set(sessionId, false)
+            clearInterval(keepaliveTimer)
+            try { req.socket?.destroy() } catch {}
+            return
+          }
           try {
             res.write(`: keepalive ${Date.now()}\n\n`)
+            sessionLastActiveAt.set(sessionId, Date.now())  // write accepted ⇒ session still active
           } catch (err) {
             log('info', `SSE keepalive write failed for ${sessionId} — marking dead and forcing close: ${err instanceof Error ? err.message : err}`)
             sseOpen.set(sessionId, false)
@@ -1638,4 +1866,15 @@ httpServer.on('error', err => {
 
 httpServer.listen(HTTP_PORT!, HTTP_HOST, () => {
   log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
+  // Roamer cross-protocol auto-discovery: announce ourselves so partner-
+  // protocol roamer daemons can find us when they spawn target claudes.
+  // Safe no-op when ROAMER_MODE is unset (channel-bot deployments).
+  try {
+    roamerRegisterSelfAsDaemon()
+    if (isRoamerEnabled()) {
+      log('info', `roamer: registered self in roamer-daemons.json`)
+    }
+  } catch (err) {
+    log('warn', `roamer: registerSelfAsDaemon failed: ${err instanceof Error ? err.message : err}`)
+  }
 })

@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.6.3 — 2026-06-10
+
+### Fixed — zombie MCP session GC (silent inbound loss)
+
+Inbound notifications were broadcast into dead MCP sessions and silently lost
+("the agent talks but doesn't hear"). Root cause: claude-code's MCP client churns
+sessions on every reconnect, but a dead SSE GET stream never fires `transport.onclose`
+on our side, so dead sessions accumulate without bound (observed 25/2269/78 opens, 0
+closes) and the inbound broadcast queues into a zombie's dead in-memory queue forever.
+
+- **Broadcast** now evicts any session that has had no open SSE past a grace window
+  (`SESSION_GRACE_MS`, 120s) instead of queuing inbound into it.
+- **GC timer** (every 30s) reaps zombie sessions independently of `transport.onclose`,
+  tracking per-session `sessionLastActiveAt` (set on session create, SSE open, and each
+  successful keepalive write).
+- **Keepalive** hardened with a back-pressure check (`writableLength` threshold) to catch
+  half-dead sockets whose buffered writes "succeed" but never reach the peer.
+- **`/healthz`** now reports `sessions_with_open_sse` and `max_queue_depth` for fast diagnosis.
+
+Same fix applied to `discord-http`. Verified on the lab bot: a never-opened-SSE session
+is reaped after grace, a live open-SSE session is spared, and inbound delivery to the live
+session is unaffected. See GitHub issue #3.
+
 ## 1.6.0 — 2026-05-25
 
 ### Added — `/input` raw passthrough slash command

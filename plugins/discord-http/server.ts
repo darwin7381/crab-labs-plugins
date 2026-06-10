@@ -41,6 +41,17 @@ import {
   type InlineButton,
   type ReplyOptions,
 } from './channel-bot-control.ts'
+import {
+  isRoamerEnabled,
+  handleRoamerSlash,
+  handleRoamerCallback,
+  roamerCommandsForBotApi,
+  onNewMcpSession as roamerOnNewMcpSession,
+  onMcpSessionClosed as roamerOnMcpSessionClosed,
+  getCurrentTargetMcpSessionId as roamerGetCurrentTargetMcpSessionId,
+  registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
+  unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
+} from './roamer-control.ts'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -146,6 +157,7 @@ process.on('beforeExit', code => {
   log('warn', `beforeExit code=${code} uptime=${process.uptime().toFixed(1)}s`)
 })
 process.on('exit', code => {
+  try { roamerUnregisterSelfAsDaemon() } catch {}
   try {
     appendFileSync(LOG_FILE, `${new Date().toISOString()} [exit] pid=${process.pid} code=${code} uptime=${process.uptime().toFixed(1)}s\n`)
   } catch {}
@@ -570,6 +582,11 @@ const activeServers = new Set<Server>()
 const serverSessionId = new WeakMap<Server, string>()  // server → its session id
 const sseOpen = new Map<string, boolean>()             // session id → SSE GET open?
 const memQueue = new Map<string, Array<{ method: string; params: unknown }>>()  // session id → pending notifs while SSE not open
+// issue #3 fix: claude-code's MCP client churns sessions but its dead SSE GET stream
+// never triggers transport.onclose on our side — dead sessions accumulate forever and
+// inbound broadcasts queue into their dead queues and are lost. Reap by last-activity.
+const sessionLastActiveAt = new Map<string, number>() // session id → ms of session create / last confirmed SSE write
+const SESSION_GRACE_MS = 120_000                       // no open SSE for this long ⇒ zombie ⇒ evict
 
 // Disk-persistent replay queue — survives daemon restart and "0 active sessions"
 // gaps. New session's first GET handleRequest signals SSE is up; we then drain
@@ -969,10 +986,9 @@ client.on('error', err => {
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
 
-  // Channel-bot control buttons (`resume:<uuid_prefix>` from /resume_list).
-  // Routed before perm: regex so resume buttons keep working if we ever
-  // change the perm: format.
-  if (interaction.customId.startsWith('resume:')) {
+  // resume: + roam: callbacks. In roamer mode both go through roamer.
+  // In channel-bot mode resume: goes to channel-bot's handleCallbackData.
+  if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('roam:')) {
     const access = loadAccess()
     if (!access.allowFrom.includes(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
@@ -984,12 +1000,14 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       await sendTextWithMaybeButtons(chatId, msg, opts?.keyboard)
     }
     try {
-      // Ack the interaction to dismiss the loading spinner; subsequent
-      // responses go via channel.send (the replyToDc above).
       await interaction.deferUpdate().catch(() => {})
-      await handleCallbackData(interaction.customId, httpPort, replyToDc)
+      if (isRoamerEnabled()) {
+        await handleRoamerCallback(interaction.customId, replyToDc)
+      } else if (interaction.customId.startsWith('resume:')) {
+        await handleCallbackData(interaction.customId, httpPort, replyToDc)
+      }
     } catch (err) {
-      log('warn', `handleCallbackData failed: ${err instanceof Error ? err.message : err}`)
+      log('warn', `callback dispatch failed: ${err instanceof Error ? err.message : err}`)
     }
     return
   }
@@ -1124,6 +1142,19 @@ async function handleInbound(msg: Message): Promise<void> {
     }
   }
 
+  // Roamer control plane (opt-in via ROAMER_MODE=1 env).
+  if (isRoamerEnabled()) {
+    const replyToDc = async (text: string, opts?: ReplyOptions) => {
+      await sendTextWithMaybeButtons(msg.channelId, text, opts?.keyboard)
+    }
+    const handled = await handleRoamerSlash(msg.content, replyToDc)
+    if (handled) {
+      log('info', `roamer handled slash: ${msg.content.slice(0, 60)}`)
+      return
+    }
+    // Non-slash falls through to broadcast block below for current_target routing.
+  }
+
   // Typing indicator — signals "processing" until we reply (or ~10s elapses).
   if ('sendTyping' in msg.channel) {
     void msg.channel.sendTyping().catch(() => {})
@@ -1152,7 +1183,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // [protocol] reminder shipped in 1.1.5 caused silent-reply spike across
   // all agents (attention bleed). See telegram-http server.ts comment for
   // full rationale. Stop hook is the correct enforcement path.
-  broadcastNotification({
+  const notification = {
     method: 'notifications/claude/channel',
     params: {
       content,
@@ -1165,7 +1196,22 @@ async function handleInbound(msg: Message): Promise<void> {
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       },
     },
-  })
+  }
+
+  if (isRoamerEnabled()) {
+    const targetSid = roamerGetCurrentTargetMcpSessionId()
+    if (!targetSid) {
+      await sendTextWithMaybeButtons(
+        msg.channelId,
+        '⚠️ 尚未連線 target。打 /roam 選一個 session 再來。',
+      )
+      return
+    }
+    sendToMcpSession(targetSid, notification)
+    return
+  }
+
+  broadcastNotification(notification)
 }
 
 // Route B fan-out (replay-queue-aware):
@@ -1179,25 +1225,92 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
     persistInbound(notif)
     return
   }
+  const now = Date.now()
   let anySseOpen = false
-  for (const server of activeServers) {
+  for (const server of [...activeServers]) {  // snapshot: evictZombieSession mutates activeServers
     const sid = serverSessionId.get(server)
-    if (sid && sseOpen.get(sid)) {
+    if (!sid) continue
+    if (sseOpen.get(sid)) {
       anySseOpen = true
       void server.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
         log('error', `notify session ${sid} failed, removing from registry: ${err}`)
         activeServers.delete(server)
       })
-    } else if (sid) {
-      const q = memQueue.get(sid) ?? []
-      q.push(notif)
-      memQueue.set(sid, q)
-      log('info', `queued for session ${sid} (SSE not yet open, queue=${q.length})`)
+    } else {
+      // issue #3: past the grace window with no open SSE ⇒ zombie ⇒ evict, don't queue.
+      const last = sessionLastActiveAt.get(sid) ?? 0
+      if (now - last > SESSION_GRACE_MS) {
+        evictZombieSession(sid, `broadcast: no open SSE for ${Math.round((now - last) / 1000)}s`)
+      } else {
+        const q = memQueue.get(sid) ?? []
+        q.push(notif)
+        memQueue.set(sid, q)
+        log('info', `queued for session ${sid} (SSE not yet open, queue=${q.length})`)
+      }
     }
   }
   if (!anySseOpen) {
     log('warn', `no SSE-open session at broadcast — also persisting to disk: ${notif.method}`)
     persistInbound(notif)
+  }
+}
+
+// issue #3 fix: remove a (zombie) session from every registry, regardless of whether
+// transport.onclose ever fired. Mirrors the onclose cleanup body.
+function evictZombieSession(sid: string, reason: string): void {
+  let srv: Server | undefined
+  for (const s of activeServers) { if (serverSessionId.get(s) === sid) { srv = s; break } }
+  if (srv) activeServers.delete(srv)
+  const transport = transports.get(sid)
+  transports.delete(sid)
+  sseOpen.delete(sid)
+  memQueue.delete(sid)
+  sessionLastActiveAt.delete(sid)
+  if (srv) {
+    for (const [reqId, p] of pendingPermissions) {
+      if (p.server === srv) pendingPermissions.delete(reqId)
+    }
+  }
+  log('info', `MCP session evicted by GC: ${sid} reason=${reason} (active=${activeServers.size})`)
+  try { transport?.close() } catch {}
+  try { if (isRoamerEnabled()) roamerOnMcpSessionClosed(sid) } catch {}
+}
+
+// issue #3 fix: reap zombie sessions on a timer (transport.onclose never fires).
+setInterval(() => {
+  const now = Date.now()
+  for (const sid of [...transports.keys()]) {
+    if (sseOpen.get(sid)) continue
+    const last = sessionLastActiveAt.get(sid) ?? 0
+    if (now - last > SESSION_GRACE_MS) {
+      evictZombieSession(sid, `gc-timer: no open SSE for ${Math.round((now - last) / 1000)}s`)
+    }
+  }
+}, 30_000).unref()
+
+/** Point-to-point variant used by roamer mode to route DC inbound only
+ *  to the currently-selected target's MCP session. */
+function sendToMcpSession(sessionId: string, notif: { method: string; params: unknown }): void {
+  let found: Server | null = null
+  for (const s of activeServers) {
+    if (serverSessionId.get(s) === sessionId) { found = s; break }
+  }
+  if (!found) {
+    log('warn', `roamer: target MCP session ${sessionId} not in activeServers — queueing`)
+    const q = memQueue.get(sessionId) ?? []
+    q.push(notif)
+    memQueue.set(sessionId, q)
+    return
+  }
+  if (sseOpen.get(sessionId)) {
+    void found.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
+      log('error', `roamer notify session ${sessionId} failed: ${err}`)
+    })
+  } else {
+    const q = memQueue.get(sessionId) ?? []
+    q.push(notif)
+    memQueue.set(sessionId, q)
+    log('info', `roamer: queued for session ${sessionId} (SSE not yet open, queue=${q.length})`)
   }
 }
 
@@ -1273,6 +1386,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         uptime_s: Math.floor(process.uptime()),
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         active_sessions: activeServers.size,
+        sessions_with_open_sse: [...sseOpen.values()].filter(Boolean).length,  // issue #3: live vs zombie
+        max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         ws_state: client.ws.status,  // 0=READY, 1=CONNECTING, 5=DISCONNECTED, etc.
         ws_ready: client.ws.status === 0,
         pending_disk_count: (() => {
@@ -1308,7 +1423,12 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             transports.set(id, transport)
             serverSessionId.set(server, id)
             sseOpen.set(id, false)  // SSE not open until client does GET
+            sessionLastActiveAt.set(id, Date.now())  // start the zombie-GC grace clock
             log('info', `MCP session opened: ${id} (active=${activeServers.size}, SSE pending)`)
+            if (isRoamerEnabled()) {
+              const claimed = roamerOnNewMcpSession(id)
+              if (claimed) log('info', `roamer: claimed MCP session ${id} for pending takeover`)
+            }
           },
         })
         const server = buildServer()
@@ -1320,9 +1440,13 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             transports.delete(transport.sessionId)
             sseOpen.delete(transport.sessionId)
             memQueue.delete(transport.sessionId)
+            sessionLastActiveAt.delete(transport.sessionId)
             log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
             for (const [reqId, p] of pendingPermissions) {
               if (p.server === server) pendingPermissions.delete(reqId)
+            }
+            if (isRoamerEnabled()) {
+              roamerOnMcpSessionClosed(transport.sessionId)
             }
           }
         }
@@ -1350,6 +1474,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // SSE GET: handleRequest blocks until client disconnects. Set up
         // replay BEFORE awaiting. See telegram server.ts for full rationale.
         sseOpen.set(sessionId, true)
+        sessionLastActiveAt.set(sessionId, Date.now())  // SSE confirmed open ⇒ reset zombie-GC clock
 
         // 2026-05-22 — Dead-transport detection patch (belt + suspenders):
         //
@@ -1384,8 +1509,20 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             clearInterval(keepaliveTimer)
             return
           }
+          // issue #3 hardening: a half-dead socket accepts keepalive writes into the
+          // kernel buffer but the peer never drains them. If the unflushed buffer backs
+          // up past a threshold, claude isn't reading → treat as dead.
+          const backlog = (res as any).writableLength ?? (req.socket as any)?.writableLength ?? 0
+          if (backlog > 1_000_000) {
+            log('info', `SSE backpressure for ${sessionId} (writableLength=${backlog}) — marking dead and forcing close`)
+            sseOpen.set(sessionId, false)
+            clearInterval(keepaliveTimer)
+            try { req.socket?.destroy() } catch {}
+            return
+          }
           try {
             res.write(`: keepalive ${Date.now()}\n\n`)
+            sessionLastActiveAt.set(sessionId, Date.now())  // write accepted ⇒ session still active
           } catch (err) {
             log('info', `SSE keepalive write failed for ${sessionId} — marking dead and forcing close: ${err instanceof Error ? err.message : err}`)
             sseOpen.set(sessionId, false)
@@ -1454,4 +1591,12 @@ httpServer.on('error', err => {
 
 httpServer.listen(HTTP_PORT!, HTTP_HOST, () => {
   log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
+  try {
+    roamerRegisterSelfAsDaemon()
+    if (isRoamerEnabled()) {
+      log('info', `roamer: registered self in roamer-daemons.json`)
+    }
+  } catch (err) {
+    log('warn', `roamer: registerSelfAsDaemon failed: ${err instanceof Error ? err.message : err}`)
+  }
 })
