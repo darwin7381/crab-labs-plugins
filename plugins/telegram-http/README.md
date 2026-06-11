@@ -8,6 +8,8 @@ Drop-in replacement for the official `telegram@claude-plugins-official` plugin. 
 >
 > 🤖 **Channel-bot mode** (1.1.0+): [ADVANCED-SETUP.md](./ADVANCED-SETUP.md) — drive a persistent claude TUI directly from Telegram with slash commands (`/clear`, `/resume`, `/model`, `/restart`, etc.). Same TUI process across switches, no message loss, fully remote-controllable from phone / iPad. Reference wrapper + plist templates in [`examples/channel-bot/`](./examples/channel-bot/).
 >
+> 🛰️ **Roamer mode** (1.4.0+): [ROAMER.md](./ROAMER.md) — one bot that lists every live claude session on the machine and hops between them (`/roam` inline picker, takeover, per-target routing). Includes full new-machine setup (env vars, plist template) and pitfalls.
+>
 > 📐 **Deep dive**: [ARCHITECTURE.md](./ARCHITECTURE.md) covers the design rationale, the upstream stdio death cycle, the replay queue, and debugging.
 >
 > 📋 **What changed vs upstream**: [CHANGELOG.md](./CHANGELOG.md).
