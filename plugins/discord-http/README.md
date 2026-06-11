@@ -170,3 +170,5 @@ Note: Discord bots cannot share a gateway connection across daemons — only one
 ## License
 
 Apache-2.0. Derived from `claude-plugins-official/discord@0.0.4`.
+
+> 🛰️ **Roamer mode**: same feature exists here (env-gated). Full doc: [telegram-http/ROAMER.md](../telegram-http/ROAMER.md) — set `ROAMER_CHANNEL_PLUGIN=discord-http@crab-labs-plugins` and the `DISCORD_*` daemon env equivalents.
