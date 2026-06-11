@@ -106,9 +106,39 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 | `/telegram:access group rm -1001654782309` | Disable a group. |
 | `/telegram:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
 
+## Self-configuring as an agent (crab-labs Route B / cc-workspaces)
+
+If you ARE a Claude agent driven by this plugin (a cc-workspaces bot, not the human operator), you can configure your own access — no human edit needed. The server re-reads `access.json` on every inbound message, so edits take effect immediately, no restart.
+
+**Where YOUR `access.json` lives** depends on which bot you are:
+
+| You are | Path | Who edits |
+| --- | --- | --- |
+| The primary channel-bot | `~/.claude/channels/telegram/access.json` | Operator only, via `/telegram-http:access`. Agents must NOT edit it. |
+| A cc-workspaces agent | `$TELEGRAM_STATE_DIR/access.json` → `~/cc-workspaces/<your-workspace>/.telegram-state/access.json` | You may edit this file directly. Find your exact path in your `.cc-agent.json` → `.channels.telegram.state_dir`. |
+
+**Recipe — "only my owner can trigger me in a group"** (the most common ask):
+
+```json
+"groups": {
+  "<group_id>": { "requireMention": true, "allowFrom": ["<owner_user_id>"] }
+}
+```
+
+- `requireMention: true` → you respond only when @mentioned or replied-to, never to every group message.
+- `allowFrom: ["<owner_id>"]` → ONLY that user mentioning you triggers a reply; anyone else mentioning you is dropped. Leave `allowFrom: []` to let any member trigger you (still subject to `requireMention`).
+
+**Getting the `group_id` — IMPORTANT, there is NO auto-discovery for groups.** Unlike DMs (which have a pairing/pending flow), an un-allowlisted group is *silently dropped* and recorded nowhere. You cannot auto-learn a new group's id from logs or state. Obtain it one of these ways:
+
+- The owner tells you the numeric id (negative; supergroups are `-100…`).
+- The owner forwards any message from the group into your DM — the forwarded message's `forward_origin` carries the source chat id.
+- Temporarily add [@RawDataBot](https://t.me/RawDataBot) to the group; it prints the chat id.
+
+After adding the group entry, it's live on the next message — verify by having the owner @mention you in the group and confirming you reply.
+
 ## Config file
 
-`~/.claude/channels/telegram/access.json`. Absent file is equivalent to `pairing` policy with empty lists, so the first DM triggers pairing.
+For the channel-bot: `~/.claude/channels/telegram/access.json`. For a cc-workspaces agent: `$TELEGRAM_STATE_DIR/access.json` (see the self-configuration section above). Absent file is equivalent to `pairing` policy with empty lists, so the first DM triggers pairing.
 
 ```jsonc
 {
