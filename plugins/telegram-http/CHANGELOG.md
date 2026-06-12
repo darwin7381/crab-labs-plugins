@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.8.0 — 2026-06-12
+
+### Changed — system-alert primary layer is now the official OTel schema (no text matching)
+
+Joey msg 2221: string-matching jsonl text breaks the day Anthropic rewords an
+error. Claude Code's documented telemetry (code.claude.com/docs/en/monitoring-usage)
+emits structured `claude_code.api_error` / `api_refusal` / `api_retries_exhausted`
+events — that is the canonical injection point for these warnings.
+
+- Daemon now hosts an OTLP/HTTP JSON logs receiver at `POST /v1/logs`
+  (always 200s; forwards alert events only when `SYSTEM_ALERT_FORWARD=1`).
+- Launch the TUI with `CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_LOGS_EXPORTER=otlp
+  OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json
+  OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:<daemon port>/v1/logs`.
+  Event identity = structured `event.name` attribute; alert text is built from
+  `error` / `status_code` / `model` / `attempt` attributes. 401 adds a
+  "run /login" hint derived from status_code, not wording. ~5s latency.
+- jsonl tail demoted to FALLBACK (covers TUIs not yet restarted with OTel env);
+  both layers share one dedupe map, so double-detection still sends once.
+- Verified end-to-end with a real `claude -p` process exporting genuine OTLP
+  (forced api_error via bogus model; alert delivered to Telegram DM).
+
 ## 1.7.0 — 2026-06-12
 
 ### Added — system-alert forwarder (opt-in: `SYSTEM_ALERT_FORWARD=1`)
