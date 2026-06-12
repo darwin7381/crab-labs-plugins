@@ -42,6 +42,7 @@ import {
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
 } from './roamer-control.ts'
+import { isSystemAlertEnabled, startSystemAlertWatcher } from './system-alert.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -913,6 +914,24 @@ setInterval(() => {
   const mb = (process.memoryUsage().rss / 1024 / 1024).toFixed(0)
   log('info', `heartbeat uptime=${process.uptime().toFixed(0)}s mem=${mb}MB lastUpdate=${lastUpdateId} sessions=${activeServers.size}`)
 }, 30000).unref()
+
+// System-alert forwarder (opt-in: SYSTEM_ALERT_FORWARD=1) — tails the newest
+// session jsonl for non-AI warnings (401 login expiry, API internal errors,
+// refusals) and DMs them to everyone in allowFrom. Without this, TUI-level
+// API deaths are invisible on Telegram (Joey msg 2218).
+if (isSystemAlertEnabled()) {
+  startSystemAlertWatcher({
+    log,
+    notify: text => {
+      const access = loadAccess()
+      for (const chat_id of access.allowFrom) {
+        void bot.api.sendMessage(chat_id, text).catch(e => {
+          log('error', `system-alert send to ${chat_id} failed: ${e}`)
+        })
+      }
+    },
+  })
+}
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.7.0 — 2026-06-12
+
+### Added — system-alert forwarder (opt-in: `SYSTEM_ALERT_FORWARD=1`)
+
+Forwards claude TUI's own non-AI system warnings to Telegram. Without this,
+API-layer deaths render only in the tmux pane and the channel side goes
+silent (2026-06-11 trio: 401 login expiry, "API Error: Internal server error"
+turn kill, Usage-Policy refusal storm — Joey msg 2218).
+
+- New `system-alert.ts`: tails the newest session jsonl in
+  `CHANNEL_BOT_PROJECTS_DIR` (override: `SYSTEM_ALERT_PROJECTS_DIR`) every 20s;
+  detects `system/api_error` records, assistant-text `API Error*` /
+  `Please run /login`, and `stop_reason: refusal`; DMs every `allowFrom` chat.
+- Anti-spam: per-message dedupe (volatile ids stripped) with a 10-min window;
+  the next alert after the window carries a suppressed-count. Timestamp gate
+  skips records older than watcher start (no replay storms on daemon restart).
+- Inert unless the env flag is set — fleet daemons are unaffected until each
+  plist opts in.
+
 ## 1.6.3 — 2026-06-10
 
 ### Fixed — zombie MCP session GC (silent inbound loss)
