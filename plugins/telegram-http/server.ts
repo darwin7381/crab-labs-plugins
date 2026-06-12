@@ -42,7 +42,7 @@ import {
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
 } from './roamer-control.ts'
-import { isSystemAlertEnabled, startSystemAlertWatcher } from './system-alert.ts'
+import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1675,6 +1675,19 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify(body))
+      return
+    }
+
+    // /v1/logs — OTLP/HTTP JSON logs receiver (system-alert primary layer).
+    // Claude TUI exports telemetry events here when launched with
+    // OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:<port>/v1/logs.
+    // Always 200s (even when forwarding is off) so the TUI exporter never
+    // logs delivery errors; alert-worthy events forward only when enabled.
+    if (u.pathname === '/v1/logs' && req.method === 'POST') {
+      const body = await readJsonBody(req).catch(() => null)
+      if (isSystemAlertEnabled() && body) handleOtlpLogs(body)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{}')
       return
     }
 
