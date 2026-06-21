@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.9.0 — 2026-06-22
+
+### Added — native Rich Messages output (opt-in: `TELEGRAM_RICH_MESSAGES=1`)
+
+Telegram Bot API 10.1 (2026-06-11) added Rich Messages, whose `InputRichMessage`
+accepts a `markdown` field directly. When enabled, `reply` and `edit_message`
+send the caller's text as **normal GFM markdown** (pipe tables, **bold**, `code`,
+fenced blocks, links) rendered natively — NO MarkdownV2 escaping, no converter.
+
+- `reply`: unset `format` now defaults to `rich` when the flag is on. Sends via
+  raw `sendRichMessage` (grammy 1.41.x doesn't expose it yet). Chunks long text
+  on paragraph boundaries (`newline` mode) so pipe tables never split mid-block.
+  Inline keyboards (`reply_parameters`/threading) pass through.
+- `edit_message`: uses `editMessageText`'s new `rich_message` param for rich
+  progress edits.
+- `format` enum gains `rich`; `text` forces plain, `markdownv2` keeps legacy.
+- **Fallback-safe**: any rich send/edit failure falls back to plain `sendMessage`
+  so a message is never lost; the fallback is logged.
+- Verified: build + standalone boot + `tools/list` enum + live `sendRichMessage`
+  with table & inline keyboard + live `editMessageText` rich edit (all `ok:true`).
+
 ## 1.8.0 — 2026-06-12
 
 ### Changed — system-alert primary layer is now the official OTel schema (no text matching)
