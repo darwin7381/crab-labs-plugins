@@ -472,6 +472,30 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   return out
 }
 
+// ---- Rich Messages (Telegram Bot API 10.1, 2026-06-11) --------------------
+// Opt-in via TELEGRAM_RICH_MESSAGES=1. When on, `reply` / `edit_message` treat
+// their text as GFM markdown and send via sendRichMessage / editMessageText's
+// rich_message param, so callers write NORMAL markdown (tables, bold, code,
+// links) with ZERO MarkdownV2 escaping. grammy 1.41.x doesn't expose these
+// methods yet, so we POST the raw Bot API. Every rich send/edit falls back to
+// plain sendMessage on any failure, so a message is never lost.
+function isRichEnabled(): boolean {
+  return process.env.TELEGRAM_RICH_MESSAGES === '1'
+}
+
+const API_ROOT = process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org'
+
+async function callBotApi(method: string, payload: Record<string, unknown>): Promise<any> {
+  const res = await fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = (await res.json()) as { ok: boolean; result?: any; description?: string; error_code?: number }
+  if (!data.ok) throw new Error(`${method}: ${data.error_code ?? '?'} ${data.description ?? 'unknown error'}`)
+  return data.result
+}
+
 /**
  * Send a text message, optionally with an inline_keyboard. Splits long text
  * across multiple messages (Telegram cap 4096 chars). The keyboard is
@@ -681,7 +705,16 @@ function buildServer(): Server {
   },
 )
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+ const richOn = isRichEnabled()
+ const formatSchema = {
+   type: 'string' as const,
+   enum: richOn ? ['rich', 'text', 'markdownv2'] : ['text', 'markdownv2'],
+   description: richOn
+     ? "Rendering mode. Default 'rich': write NORMAL GFM markdown — tables (| a | b |), **bold**, *italic*, `code`, ```fenced```, [links](url) — rendered natively via Telegram Rich Messages with NO escaping. Use 'text' for plain unrendered output. 'markdownv2' = legacy escaped mode."
+     : "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+ }
+ return ({
   tools: [
     {
       name: 'reply',
@@ -701,11 +734,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: 'string' },
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
           },
-          format: {
-            type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
-          },
+          format: formatSchema,
         },
         required: ['chat_id', 'text'],
       },
@@ -743,17 +772,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: 'string' },
           message_id: { type: 'string' },
           text: { type: 'string' },
-          format: {
-            type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
-          },
+          format: formatSchema,
         },
         required: ['chat_id', 'message_id', 'text'],
       },
     },
   ],
-}))
+ })
+})
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
@@ -764,8 +790,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
+        // When Rich Messages is on, an unset format defaults to 'rich' (send
+        // GFM markdown natively). 'text' forces plain; 'markdownv2' = legacy.
+        const format = (args.format as string | undefined) ?? (isRichEnabled() ? 'rich' : 'text')
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const useRich = format === 'rich' && isRichEnabled()
 
         assertAllowedChat(chat_id)
 
@@ -779,7 +808,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
+        // Rich markdown chunks on paragraph boundaries so a pipe table is never
+        // split mid-block (which would break native table rendering).
+        const mode = useRich ? 'newline' : (access.chunkMode ?? 'length')
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
@@ -790,6 +821,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               reply_to != null &&
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
+            if (useRich) {
+              try {
+                const r = await callBotApi('sendRichMessage', {
+                  chat_id,
+                  rich_message: { markdown: chunks[i] },
+                  ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                })
+                sentIds.push(r.message_id)
+                continue
+              } catch (re) {
+                log('warn', `sendRichMessage failed, falling back to plain: ${re instanceof Error ? re.message : re}`)
+              }
+            }
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
@@ -853,8 +897,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
-        const editFormat = (args.format as string | undefined) ?? 'text'
+        const editFormat = (args.format as string | undefined) ?? (isRichEnabled() ? 'rich' : 'text')
         const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        if (editFormat === 'rich' && isRichEnabled()) {
+          try {
+            const r = await callBotApi('editMessageText', {
+              chat_id: args.chat_id as string,
+              message_id: Number(args.message_id),
+              rich_message: { markdown: args.text as string },
+            })
+            const rid = r && typeof r === 'object' ? r.message_id : args.message_id
+            return { content: [{ type: 'text', text: `edited (id: ${rid})` }] }
+          } catch (re) {
+            log('warn', `editMessageText rich failed, falling back to plain: ${re instanceof Error ? re.message : re}`)
+          }
+        }
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
