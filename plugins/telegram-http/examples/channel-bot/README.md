@@ -8,7 +8,7 @@ remotely controllable via the [TUI control plane](../../ADVANCED-SETUP.md).
 
 | File | Purpose | Install path |
 |---|---|---|
-| `restore-channel-bot.sh.example` | Wrapper script that keeps claude TUI alive inside a tmux session and consumes `--resume` args injected by the daemon | `~/path/to/your/workspace/scripts/restore-channel-bot.sh` |
+| `restore-channel-bot.sh.example` | Wrapper script that keeps claude TUI alive inside a tmux session. Defaults each restart to `claude --continue` (auto-resume most recent session — no context loss on crash); overrides via `/tmp/channel-bot-next-args` (`--resume <id>`) or `/tmp/channel-bot-fresh` (force a new session) | `~/path/to/your/workspace/scripts/restore-channel-bot.sh` |
 | `com.user.channel-bot-wrapper.plist.example` | launchd job that runs the wrapper at login + keeps it alive | `~/Library/LaunchAgents/com.user.channel-bot-wrapper.plist` |
 | `com.user.telegram-daemon.channel.plist.example` | launchd job for the telegram-http MCP daemon, with `CHANNEL_BOT_*` env vars enabling the control plane | `~/Library/LaunchAgents/com.user.telegram-daemon.channel.plist` |
 
