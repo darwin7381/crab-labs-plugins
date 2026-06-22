@@ -65,25 +65,41 @@ done
 # at exec time below so the same value gets used by claude's .mcp.json subst.
 
 # ─── 3. RESUME ARGS OVERRIDE (1.1.0+ TUI control plane) ────────────────────
-# The telegram-http daemon's /restart and 1.1.0-style /resume write to this
-# file. On each start_claude(), we consume the file and append its content
-# to the launch command. Path MUST match the daemon plist's
-# CHANNEL_BOT_NEXT_ARGS_FILE env var.
+# Restart-resume policy: DEFAULT to `claude --continue` so EVERY restart
+# (crash / launchd / /restart) auto-resumes the most recent session in
+# $WORKDIR — no session-id capture, no picker, no context loss. `--continue`
+# needs no id/search. Two overrides:
+#   * NEXT_ARGS_FILE (`/tmp/channel-bot-next-args`): explicit args (typically
+#     `--resume <id>` to land on a SPECIFIC, non-most-recent session). The
+#     daemon's /restart and 1.1.0-style /resume write here. Wins over --continue.
+#     Path MUST match the daemon plist's CHANNEL_BOT_NEXT_ARGS_FILE env var.
+#   * FRESH_SENTINEL (`/tmp/channel-bot-fresh`): start a brand-new empty session
+#     on purpose (a "/new"). Suppresses --continue for that one start.
+# NOTE: a wrapper that defaults to NEITHER --continue nor --resume opens a FRESH
+# empty session on every crash → silent context loss. Always default --continue.
 NEXT_ARGS_FILE="/tmp/channel-bot-next-args"
+FRESH_SENTINEL="/tmp/channel-bot-fresh"
 
 build_claude_cmd() {
   local extra=""
+  local resume="--continue"   # default: resume most recent session in $WORKDIR
   if [ -f "$NEXT_ARGS_FILE" ]; then
     extra=$(<"$NEXT_ARGS_FILE")
     extra="${extra//$'\n'/ }"  # collapse newlines to spaces
-    log "found $NEXT_ARGS_FILE → appending: $extra"
+    log "found $NEXT_ARGS_FILE → explicit args (override --continue): $extra"
     mv "$NEXT_ARGS_FILE" "$NEXT_ARGS_FILE.used.$(date +%s)" 2>/dev/null || rm -f "$NEXT_ARGS_FILE"
+    resume=""   # explicit args (e.g. --resume <id>) replace the default --continue
+  elif [ -f "$FRESH_SENTINEL" ]; then
+    log "found $FRESH_SENTINEL → FRESH session (suppress --continue)"
+    rm -f "$FRESH_SENTINEL"
+    resume=""   # intentional brand-new session
   fi
   CLAUDE_CMD="cd $WORKDIR && \
 TELEGRAM_HTTP_PORT=$TELEGRAM_HTTP_PORT \
 DISCORD_HTTP_PORT=$DISCORD_HTTP_PORT \
 DISABLE_AUTOUPDATER=1 \
 $CLAUDE_CMD_BASE \
+$resume \
 $extra"
 }
 # Default; build_claude_cmd will rebuild on every start.

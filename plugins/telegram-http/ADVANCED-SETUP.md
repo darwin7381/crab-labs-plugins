@@ -96,12 +96,29 @@ What it does on each loop tick (every 30s):
 3. If not alive →
    - `snapshot_pane` — capture last 5000 lines of tmux scrollback for postmortem
    - `tmux kill-session` (idempotent — session may already be gone)
-   - `build_claude_cmd` — read `$NEXT_ARGS_FILE` (consume + audit-rename) and append to CLAUDE_CMD
+   - `build_claude_cmd` — pick the resume mode (see callout) and build CLAUDE_CMD
    - `tmux new-session` + `send-keys CLAUDE_CMD Enter`
    - Detect + auto-confirm any "trust this folder" prompt
 
 After 3 consecutive failures, sleeps 1 hour (cooldown). Manual recovery
 instructions are printed to the log.
+
+> ⚠️ **Restart-resume policy — default to `--continue`.** `build_claude_cmd`
+> defaults the launch to `claude --continue`, so EVERY restart (crash / launchd
+> / `/restart`) auto-resumes the most recent session in `$WORKDIR` — no
+> session-id capture, no picker, no context loss. `--continue` needs no id or
+> search. Two overrides:
+> - **`/tmp/channel-bot-next-args`** — explicit args (typically `--resume <id>`)
+>   to land on a SPECIFIC, non-most-recent session. The daemon's `/restart` and
+>   1.1.0-style `/resume` write here. Wins over `--continue`. Path MUST match the
+>   daemon plist's `CHANNEL_BOT_NEXT_ARGS_FILE`.
+> - **`/tmp/channel-bot-fresh`** — touch this sentinel to start a brand-new empty
+>   session on purpose (a "/new"); it suppresses `--continue` for that one start.
+>
+> A wrapper that defaults to NEITHER `--continue` nor `--resume` opens a FRESH
+> empty session on every crash → **silent context loss**. Always default
+> `--continue`. (Supervisor-managed agents already carry `--continue` in their
+> manifests; this brings standalone channel-bot wrappers in line.)
 
 ### 3.2 Wrapper plist (`com.user.channel-bot-wrapper.plist`)
 
