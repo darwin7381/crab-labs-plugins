@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.10.0 — 2026-06-22
+
+### Changed — Rich Messages is now ON BY DEFAULT (no env flag needed)
+
+1.9.0 gated Rich Messages behind opt-in `TELEGRAM_RICH_MESSAGES=1`, which meant
+every machine had to edit each daemon plist + restart to get it. Unnecessary:
+Rich Messages is a server-side Telegram feature and rich sends already fall back
+to plain `sendMessage` on any failure, so defaulting it on is safe.
+
+- `reply` / `edit_message` now default to rich markdown with NO configuration —
+  other machines just `git pull` and it works; no per-daemon launch-command edits.
+- Opt OUT with `TELEGRAM_RICH_MESSAGES=0` (also `off`/`false`/`no`) only if a
+  deployment specifically needs the legacy plain/MarkdownV2 path.
+- Existing `TELEGRAM_RICH_MESSAGES=1` flags become harmless no-ops (still = on).
+
 ## 1.9.0 — 2026-06-22
 
 ### Added — native Rich Messages output (opt-in: `TELEGRAM_RICH_MESSAGES=1`)
