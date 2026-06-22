@@ -733,6 +733,56 @@ claude 看到這些 tool 被 deny 就會 fallback 成 text question（直接在�
 
 ---
 
+## 13. 升級既有部署 — Rich Messages（1.9.0）+ 系統警告轉發（1.7.0/1.8.0）
+
+> 給「已經在跑舊版、要更新到 1.9.0」的機器。程式碼 `git pull` 就會到位，但**啟用是本地設定**（env 旗標 + 重啟），不會跟著 pull 過去 — 每台機器要自己做。
+
+### 步驟（每台機器跑一次）
+
+**1. 拉最新 plugin 程式碼**
+```bash
+git -C ~/.claude/plugins/marketplaces/crab-labs-plugins pull --ff-only
+grep '"version"' ~/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/package.json   # 應 = 1.9.0
+```
+
+**2. 對「每一個」telegram daemon plist 加 env 旗標**（兩個功能各自 opt-in）
+
+| 功能 | 加在哪 | env |
+|---|---|---|
+| **Rich Messages**（reply/edit 直接吃正常 markdown，免跳脫） | daemon plist `EnvironmentVariables` | `TELEGRAM_RICH_MESSAGES=1` |
+| **系統警告轉發**（DM 401/API error/refusal 等非 AI 警告） | daemon plist `EnvironmentVariables` | `SYSTEM_ALERT_FORWARD=1` |
+| 系統警告的 **OTLP 主通道**（結構化、免文字比對；不加只剩 jsonl fallback） | claude TUI 啟動指令（wrapper / supervisor manifest `claude_command`） | `CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://127.0.0.1:<該 daemon 的 PORT>/v1/logs` |
+
+只要 Rich Messages 的話，**只需要** daemon plist 加 `TELEGRAM_RICH_MESSAGES=1`（純 daemon 端，TUI 不用改）。
+
+```bash
+P=~/Library/LaunchAgents/com.btai.telegram-daemon.<name>.plist
+cp "$P" "$P.bak.rich-$(date +%Y%m%d-%H%M%S)"
+plutil -replace EnvironmentVariables.TELEGRAM_RICH_MESSAGES -string 1 "$P" 2>/dev/null \
+  || plutil -insert EnvironmentVariables.TELEGRAM_RICH_MESSAGES -string 1 "$P"
+plutil -lint "$P"
+```
+
+**3. 重啟 daemon 載入新碼 + 新 env**（⚠️ `kickstart` 不會重讀 plist env，一定要 bootout+bootstrap）
+```bash
+launchctl bootout gui/$(id -u)/com.btai.telegram-daemon.<name> 2>/dev/null; sleep 2
+launchctl bootstrap gui/$(id -u) "$P"
+```
+
+**4. 重啟該 daemon 的 claude TUI** — daemon 換 pid 後舊 TUI 的 MCP 連線會斷且不會自動重連（已知 regression）。用該 agent 的 `--continue` / `--resume <session>` 拉回原本 session，別開空的。
+
+### 驗證
+```bash
+dpid=$(launchctl list | grep "telegram-daemon.<name>$" | awk '{print $1}')
+ps eww $dpid | tr ' ' '\n' | grep TELEGRAM_RICH_MESSAGES          # 應印 =1
+grep -c "pid=$dpid MCP session opened" <STATE_DIR>/server.log     # ≥1 = TUI 重連成功
+# 實測：發一則含 | 表格 | 的 markdown，看 Telegram 有沒有渲染成原生表格
+```
+
+rich 發送失敗會自動 fallback 純文字（log 有 `sendRichMessage failed`），訊息不會丟。
+
+---
+
 ## 12. 收尾 & References
 
 設定完之後：
