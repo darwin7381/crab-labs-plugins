@@ -473,14 +473,18 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 }
 
 // ---- Rich Messages (Telegram Bot API 10.1, 2026-06-11) --------------------
-// Opt-in via TELEGRAM_RICH_MESSAGES=1. When on, `reply` / `edit_message` treat
-// their text as GFM markdown and send via sendRichMessage / editMessageText's
-// rich_message param, so callers write NORMAL markdown (tables, bold, code,
-// links) with ZERO MarkdownV2 escaping. grammy 1.41.x doesn't expose these
-// methods yet, so we POST the raw Bot API. Every rich send/edit falls back to
-// plain sendMessage on any failure, so a message is never lost.
+// ON BY DEFAULT (1.10.0). `reply` / `edit_message` treat their text as GFM
+// markdown and send via sendRichMessage / editMessageText's rich_message param,
+// so callers write NORMAL markdown (tables, bold, code, links) with ZERO
+// MarkdownV2 escaping — no per-machine setup, just works after `git pull`.
+// grammy 1.41.x doesn't expose these methods yet, so we POST the raw Bot API.
+// Every rich send/edit falls back to plain sendMessage on any failure (Rich
+// Messages is server-side + the fallback is logged), so a message is never lost.
+// Opt OUT with TELEGRAM_RICH_MESSAGES=0 (or off/false/no) only if you need the
+// legacy plain/MarkdownV2 path.
 function isRichEnabled(): boolean {
-  return process.env.TELEGRAM_RICH_MESSAGES === '1'
+  const v = (process.env.TELEGRAM_RICH_MESSAGES ?? '').trim().toLowerCase()
+  return v !== '0' && v !== 'off' && v !== 'false' && v !== 'no'
 }
 
 const API_ROOT = process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org'
