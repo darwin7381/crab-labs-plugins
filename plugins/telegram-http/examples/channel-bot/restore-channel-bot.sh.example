@@ -119,6 +119,41 @@ mkdir -p "$CRASH_DIR"
 fail_count=0
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 
+# MCP-health (orphan) detection. claude can be process-alive but have its MCP
+# transport dead after the daemon restarts (claude doesn't reconnect → the
+# daemon's /healthz shows active_sessions=0 → inbound Telegram is silently
+# dropped). A liveness check that only looks at the process can't see this, so
+# the bot sits deaf indefinitely. We restart claude (default --continue) after a
+# grace period. ORPHAN_GRACE_TICKS guards the normal post-restart reconnect
+# window; ORPHAN_RESTART_MIN_INTERVAL rate-limits so a stuck agent can't churn.
+ORPHAN_GRACE_TICKS=${ORPHAN_GRACE_TICKS:-4}
+ORPHAN_RESTART_MIN_INTERVAL=${ORPHAN_RESTART_MIN_INTERVAL:-300}
+orphan_count=0
+orphan_last_restart=0
+# Returns 1 (and restarts claude) if orphaned past grace; else 0. No-op if
+# /healthz is unreachable (a daemon problem restarting the TUI wouldn't fix).
+check_mcp_orphan() {
+  local sessions
+  sessions=$(curl -s --max-time 3 "http://127.0.0.1:$TELEGRAM_HTTP_PORT/healthz" 2>/dev/null \
+    | grep -oE '"active_sessions"[: ]+[0-9]+' | grep -oE '[0-9]+$')
+  [ -z "$sessions" ] && { orphan_count=0; return 0; }
+  if (( sessions >= 1 )); then
+    (( orphan_count > 0 )) && log "MCP reconnected (orphan counter reset from $orphan_count)"
+    orphan_count=0; return 0
+  fi
+  orphan_count=$((orphan_count + 1))
+  log "MCP orphan check — daemon(:$TELEGRAM_HTTP_PORT) active_sessions=0 while claude alive [$orphan_count/$ORPHAN_GRACE_TICKS]"
+  (( orphan_count < ORPHAN_GRACE_TICKS )) && return 0
+  local now=$(date +%s)
+  if (( now - orphan_last_restart < ORPHAN_RESTART_MIN_INTERVAL )); then
+    log "MCP still orphaned but restarted $((now - orphan_last_restart))s ago — waiting"; return 0
+  fi
+  log "MCP orphaned $orphan_count consecutive checks → restarting claude to reconnect"
+  orphan_count=0; orphan_last_restart=$now
+  start_claude
+  return 1
+}
+
 # Capture tmux pane scrollback before killing — so claude's last words survive
 # (handy for postmortem when claude crashes mid-task).
 snapshot_pane() {
@@ -188,6 +223,9 @@ while true; do
       log "claude recovered (was at attempt $fail_count)"
     fi
     fail_count=0
+    # Process alive — also verify the MCP transport isn't orphaned (daemon
+    # active_sessions=0). Restarts claude if so; `continue` skips the sleep.
+    if ! check_mcp_orphan; then continue; fi
   else
     fail_count=$((fail_count + 1))
     if (( fail_count > MAX_FAILURES )); then
