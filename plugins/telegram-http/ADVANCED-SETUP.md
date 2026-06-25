@@ -382,11 +382,19 @@ non-allowlisted senders never reach it.
    for the same cwd would interfere with the `/resume` picker's view of
    "which session is current".
 
-6. **Daemon restart cuts MCP transport** — restarting the daemon kills
-   claude TUI's MCP transport. Per the regression, claude TUI may not
-   reconnect automatically. After a daemon `launchctl kickstart`, also
-   `tmux kill-session -t <session>` so the wrapper relaunches claude with
-   a fresh MCP connection.
+6. **Daemon restart cuts MCP transport — auto-healed by the wrapper** —
+   restarting the daemon kills claude TUI's MCP transport, and per the
+   regression claude TUI does NOT reconnect automatically: the daemon then
+   shows `active_sessions=0` and inbound messages are silently dropped while
+   the TUI process still looks alive. A process-only liveness check can't see
+   this. The example wrapper's `check_mcp_orphan()` closes the gap — it polls
+   the daemon's `/healthz` `active_sessions` each tick and, if 0 for
+   `ORPHAN_GRACE_TICKS` (default 4 × 30s ≈ 2min) while claude is alive,
+   restarts claude (default `--continue`) to reconnect. Rate-limited by
+   `ORPHAN_RESTART_MIN_INTERVAL` (default 300s). **This is essential** — without
+   it a single daemon restart can leave the bot deaf indefinitely (2026-06-25:
+   a mass daemon restart orphaned an entire fleet for 31h, undetected). The
+   same check belongs in any supervisor managing multiple agents.
 
 ---
 
