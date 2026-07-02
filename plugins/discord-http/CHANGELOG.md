@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.4 — 2026-07-03
+
+### Fixed — server.log self-rotation (prevents unbounded growth / disk-fill)
+
+server.log had no size cap and grew unbounded — one host's hit **14GB** and filled
+the disk (631MB free). Added in-plugin rename-rotation in `log()`: past 20MB the
+current log rotates to `.1`/`.2` (keeps 2 archives), checked every 200 log calls.
+Since `appendFileSync` reopens per-call there's no held fd, so plain rename is safe
+and the next write re-creates a fresh file. **In the plugin so every machine is
+protected** (git pull + daemon restart), not just one host's launchd job.
+
 ## 1.6.0 — 2026-05-25
 
 Synced from [telegram-http 1.6.0](../telegram-http/CHANGELOG.md): adds `/input <text>` raw passthrough slash command. Sends text as keystrokes to the channel-bot's tmux session (multi-line supported, each line gets its own Enter). Lets the user type literal slash commands the plugin would otherwise intercept — e.g. `/input /plugin install foo`. See telegram-http CHANGELOG for full rationale.

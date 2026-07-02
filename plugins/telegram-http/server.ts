@@ -102,8 +102,29 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 // parent claude process and not surfaced anywhere visible at runtime, which
 // made all prior debugging impossible. Mirror to stderr AND a persistent log.
 // See https://md.blocktempo.ai/7Q318gHJSdOV3BH2ub8fyg for the full analysis.
+// Self-rotation — 2026-07-03 after a server.log grew to 14GB and filled a host's
+// disk (631MB free). appendFileSync reopens per-call (no held fd), so a plain
+// rename-rotation is safe: rename the oversized file, next append creates a fresh
+// one. Keeps LOG_KEEP archives (.1, .2). Size checked every LOG_CHECK_EVERY calls
+// to avoid a statSync per line. This lives in the plugin so EVERY machine running
+// it is protected, not just one host's launchd job.
+const LOG_MAX_BYTES = 20 * 1024 * 1024   // rotate current log past 20MB
+const LOG_KEEP = 2                        // keep this many rotated archives
+const LOG_CHECK_EVERY = 200               // size-check cadence (log calls)
+let logCallsSinceCheck = 0
+function rotateLogIfNeeded(): void {
+  try {
+    if (statSync(LOG_FILE).size < LOG_MAX_BYTES) return
+    for (let i = LOG_KEEP - 1; i >= 1; i--) {
+      try { renameSync(`${LOG_FILE}.${i}`, `${LOG_FILE}.${i + 1}`) } catch {}
+    }
+    try { renameSync(LOG_FILE, `${LOG_FILE}.1`) } catch {}
+    // next appendFileSync() re-creates LOG_FILE fresh
+  } catch {}
+}
 function log(level: 'info' | 'warn' | 'error', msg: string): void {
   const line = `${new Date().toISOString()} [${level}] pid=${process.pid} ${msg}\n`
+  if (++logCallsSinceCheck >= LOG_CHECK_EVERY) { logCallsSinceCheck = 0; rotateLogIfNeeded() }
   try { appendFileSync(LOG_FILE, line) } catch {}
   try { process.stderr.write(line) } catch {}
 }
