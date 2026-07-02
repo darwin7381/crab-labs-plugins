@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.11.3 — 2026-07-03
+
+### Added — auto-reclaim pre-fix log bloat on daemon start (no manual script)
+
+1.11.1/1.6.4 capped FUTURE growth but a machine that already accumulated a giant
+server.log still had to be truncated by hand — which nobody would remember to do.
+Now `reclaimBloatedLogsOnStartup()` runs on every daemon start: it rotates an
+oversized live log and DELETES any archive far larger than a healthy rotation
+(a real archive is <= ~cap; a multi-GB one is pre-fix accumulation). So any machine
+just does `git pull` + daemon restart and the disk space comes back automatically.
+Verified: planted a 60MB server.log → daemon start → reclaimed to 4KB, no archives.
+
 ## 1.11.2 — 2026-07-03
 
 ### Fixed — /model (and /effort) control-slash getting stuck / not applying

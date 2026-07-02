@@ -129,6 +129,23 @@ function log(level: 'info' | 'warn' | 'error', msg: string): void {
   try { process.stderr.write(line) } catch {}
 }
 
+// Auto-reclaim pre-1.11.1 bloat on EVERY daemon start — so operators need NO manual
+// cleanup script (2026-07-03 Joey: "其他台機器都不用另外特別輸入腳本…否則哪有人會注意到").
+// Any machine that already accumulated a giant server.log just does `git pull` + daemon
+// restart and the disk space comes back on its own: rotate the oversized live log, then
+// DELETE any archive far larger than a healthy rotation (a real archive is <= ~cap; a
+// multi-GB one is pre-fix unbounded accumulation, not worth keeping).
+function reclaimBloatedLogsOnStartup(): void {
+  try {
+    rotateLogIfNeeded()  // if the live log is already over cap, move it to .1
+    for (let i = 1; i <= LOG_KEEP + 2; i++) {
+      const f = `${LOG_FILE}.${i}`
+      try { if (statSync(f).size > 2 * LOG_MAX_BYTES) rmSync(f) } catch {}
+    }
+  } catch {}
+}
+reclaimBloatedLogsOnStartup()
+
 // Advisory exclusive-create lock — 2026-05-13 by Joey, replaces the previous
 // "kill stale poller" approach. Prior code did `process.kill(stalePid, SIGTERM)`
 // based on the bot.pid file, which turned into a mutual-execution trap when two

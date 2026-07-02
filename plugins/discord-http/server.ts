@@ -129,6 +129,21 @@ function log(level: 'info' | 'warn' | 'error', msg: string): void {
   try { process.stderr.write(line) } catch {}
 }
 
+// Auto-reclaim pre-fix bloat on EVERY daemon start (matches telegram-http). Operators
+// need NO manual cleanup script: git pull + restart and the giant server.log's disk
+// space comes back — rotate the oversized live log, then delete any archive far larger
+// than a healthy rotation (multi-GB = pre-fix unbounded accumulation).
+function reclaimBloatedLogsOnStartup(): void {
+  try {
+    rotateLogIfNeeded()
+    for (let i = 1; i <= LOG_KEEP + 2; i++) {
+      const f = `${LOG_FILE}.${i}`
+      try { if (statSync(f).size > 2 * LOG_MAX_BYTES) rmSync(f) } catch {}
+    }
+  } catch {}
+}
+reclaimBloatedLogsOnStartup()
+
 // Advisory exclusive-create lock — guarantees at most one daemon per STATE_DIR.
 // Discord gateway, like Telegram polling, allows one consumer per bot token;
 // two daemons sharing a STATE_DIR would mean two bots fighting for the same
