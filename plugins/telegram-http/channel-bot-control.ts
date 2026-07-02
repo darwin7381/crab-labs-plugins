@@ -191,6 +191,35 @@ const SHARED_TUI_SENDABLE = new Set([
   '/clear', '/agents', '/mcp', '/resume', '/help', '/init', '/compact',
 ])
 const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
+
+/**
+ * Model options offered by the bare `/model` inline keyboard (Joey 2026-07-02
+ * msg 2434: typing exact model ids from memory is hostile UX — tap to pick).
+ * Override without a code change via CHANNEL_BOT_MODEL_CHOICES, format:
+ *   "Label=value|Label=value"  e.g. "Fable 5=claude-fable-5|Opus=claude-opus-4-8"
+ * Values are what gets typed after `/model ` in the claude TUI (alias or full id).
+ */
+const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
+  { label: '🌟 Fable 5', value: 'claude-fable-5' },
+  { label: '🏛️ Opus 4.8', value: 'claude-opus-4-8' },
+  { label: '🎼 Sonnet 5', value: 'claude-sonnet-5' },
+  { label: '⚡ Haiku 4.5', value: 'claude-haiku-4-5-20251001' },
+  { label: '↩️ Default（回 TUI 預設）', value: 'default' },
+]
+
+export function modelChoices(): Array<{ label: string; value: string }> {
+  const raw = process.env.CHANNEL_BOT_MODEL_CHOICES
+  if (!raw) return DEFAULT_MODEL_CHOICES
+  const parsed = raw
+    .split('|')
+    .map(pair => {
+      const eq = pair.indexOf('=')
+      if (eq <= 0) return null
+      return { label: pair.slice(0, eq).trim(), value: pair.slice(eq + 1).trim() }
+    })
+    .filter((x): x is { label: string; value: string } => !!x && !!x.label && !!x.value)
+  return parsed.length > 0 ? parsed : DEFAULT_MODEL_CHOICES
+}
 const SHARED_TUI_CTRL_KEY: Record<string, string> = {
   '/sigint': 'C-c',
   '/cancel': 'C-c',
@@ -312,6 +341,21 @@ export async function forwardSharedTuiSlash(
 
   if (SHARED_TUI_SENDABLE_WITH_ARG.has(cmd)) {
     if (!args) {
+      // Bare `/model` → tap-to-pick inline keyboard (Joey 2026-07-02 msg 2434:
+      // "我哪知道準確的代號是什麼"). Channel-bot mode only (fixed TMUX_SESSION):
+      // the `model:` callback routes through handleCallbackData → TMUX_SESSION,
+      // which would mis-target in roamer mode, so roamer keeps the usage text.
+      if (cmd === '/model' && tmuxName === TMUX_SESSION && isControlEnabled()) {
+        const keyboard: InlineButton[][] = modelChoices().map(c => [
+          { text: c.label, callback_data: `model:${c.value}` },
+        ])
+        await replyToTg(
+          '🎛️ 點一個模型切換（或手動 `/model <id>`）：\n' +
+            '⚠️ claude 2.1.198 的 /model 會把選擇存成「全域預設」— 這台機器所有 agent 下次重啟都會用它（有 --model pin 的除外）。',
+          { keyboard },
+        )
+        return true
+      }
       await replyToTg(`usage: \`${cmd} <value>\``)
       return true
     }
@@ -1003,6 +1047,22 @@ export async function handleCallbackData(
   httpPort: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
 ): Promise<boolean> {
+  // `model:<value>` — emitted by the bare-`/model` inline keyboard. Reuse the
+  // `/model <value>` slash path (send-keys + auto-confirm) so logic isn't forked.
+  if (data.startsWith('model:')) {
+    const value = data.slice('model:'.length).trim()
+    if (!value) {
+      await replyToTg('❌ empty model value in callback data')
+      return true
+    }
+    // Model ids/aliases only — defense against forged callback payloads
+    // (send-keys with shell-ish chars must never reach tmux).
+    if (!/^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)) {
+      await replyToTg(`❌ invalid model value in callback: \`${value.slice(0, 60)}\``)
+      return true
+    }
+    return handleControlSlash(`/model ${value}`, httpPort, replyToTg)
+  }
   if (!data.startsWith('resume:')) return false
   const uuidPrefix = data.slice('resume:'.length).trim()
   if (!uuidPrefix) {
@@ -1023,7 +1083,7 @@ export function controlCommandsForBotApi(): Array<{
   return [
     { command: 'input', description: 'send raw text to tmux (multi-line, passthrough — bypasses plugin interception)' },
     { command: 'clear', description: 'clear claude TUI conversation (sends /clear via tmux)' },
-    { command: 'model', description: 'switch claude model (/model <name>)' },
+    { command: 'model', description: 'switch claude model — tap-to-pick buttons, or /model <id>' },
     { command: 'effort', description: 'switch claude effort level (/effort <low|med|high|max>)' },
     { command: 'agents', description: 'open claude agents picker' },
     { command: 'mcp', description: 'show MCP servers status in claude' },

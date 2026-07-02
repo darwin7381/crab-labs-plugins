@@ -1056,11 +1056,12 @@ bot.command('status', async ctx => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
-  // resume: + roam: callback buttons. In roamer mode, both go through
-  // roamer handler (it knows how to drive picker against the dynamic
-  // current_target tmux). In channel-bot mode, resume: goes to
-  // channel-bot's handleCallbackData (fixed TMUX_SESSION).
-  if (data.startsWith('resume:') || data.startsWith('roam:')) {
+  // resume: + roam: + model: callback buttons. In roamer mode, resume:/roam:
+  // go through roamer handler (it knows how to drive picker against the
+  // dynamic current_target tmux). In channel-bot mode, resume:/model: go to
+  // channel-bot's handleCallbackData (fixed TMUX_SESSION). model: is only
+  // ever emitted in channel-bot mode (see forwardSharedTuiSlash guard).
+  if (data.startsWith('resume:') || data.startsWith('roam:') || data.startsWith('model:')) {
     const access = loadAccess()
     const senderId = String(ctx.from.id)
     if (!access.allowFrom.includes(senderId)) {
@@ -1073,9 +1074,9 @@ bot.on('callback_query:data', async ctx => {
       await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard)
     }
     try {
-      if (isRoamerEnabled()) {
+      if (isRoamerEnabled() && !data.startsWith('model:')) {
         await handleRoamerCallback(data, replyToTg)
-      } else if (data.startsWith('resume:')) {
+      } else if (data.startsWith('resume:') || data.startsWith('model:')) {
         await handleCallbackData(data, httpPort, replyToTg)
       }
     } catch (err) {
