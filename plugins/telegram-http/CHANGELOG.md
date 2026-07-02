@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.11.0 — 2026-07-02
+
+### Added — bare `/model` shows a tap-to-pick inline keyboard
+
+Typing exact model ids from a phone was hostile UX (Joey msg 2434: "我哪知道
+準確的代號是什麼"). Bare `/model` (no arg) now replies with an inline keyboard
+of model choices; tapping a button runs the existing `/model <id>` send-keys +
+auto-confirm path. Manual `/model <id>` unchanged; `/effort` unchanged.
+
+- Default choices: Fable 5 / Opus 4.8 / Sonnet 5 / Haiku 4.5 / Default.
+  Override per-daemon via `CHANNEL_BOT_MODEL_CHOICES="Label=value|Label=value"`.
+- Callback format `model:<value>` (validated against `[A-Za-z0-9._\[\]-]{1,48}`
+  before it can reach tmux send-keys).
+- Channel-bot mode only: roamer keeps the usage text (its dynamic tmux target
+  can't be routed through the `model:` callback).
+- Picker message warns that claude 2.1.198's `/model` persists the choice as the
+  machine-wide GLOBAL default (`~/.claude/settings.json` `model` key) — every
+  un-pinned agent's next restart inherits it.
+
 ## 1.10.0 — 2026-06-22
 
 ### Changed — Rich Messages is now ON BY DEFAULT (no env flag needed)
