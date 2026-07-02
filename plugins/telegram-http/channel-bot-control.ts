@@ -85,7 +85,19 @@ function runCommand(
  * (e.g. roamer-control) can target a different pane. Default = the
  * channel-bot's own TMUX_SESSION env.
  */
-async function tmuxSendKeys(text: string, tmuxName: string = TMUX_SESSION): Promise<void> {
+async function tmuxSendKeys(text: string, tmuxName: string = TMUX_SESSION, clearFirst = false): Promise<void> {
+  // clearFirst — 2026-07-03: a control slash (/model, /clear, ...) is typed AT THE
+  // CURSOR. If the user left a draft in the TUI input box, `send-keys "/model X"
+  // Enter` appends → the whole `<draft>/model X` line submits as a CHAT MESSAGE,
+  // the command never runs, and it looks stuck (Joey's report, reproduced on lab).
+  // Ctrl-U clears claude's input line (verified). MUST be its own send-keys call:
+  // `send-keys Escape C-u` merges into an escape SEQUENCE and does nothing, and
+  // Escape also risks interrupting a running turn — so C-u alone, on its own call.
+  // NOT used by /input (raw passthrough must stay verbatim).
+  if (clearFirst) {
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-u'])
+    await new Promise(r => setTimeout(r, 100))  // let the TUI apply the clear before typing
+  }
   const { exitCode, stderr } = await runCommand(
     ['tmux', 'send-keys', '-t', tmuxName, text, 'Enter'],
   )
@@ -136,12 +148,19 @@ async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION): Promis
  * picker; if found, auto-confirm with Enter so TG users don't have to manually
  * `/input 1`.
  *
- * Bounded: 15 × 200ms = 3s max wait. If picker never appears (cmd was a no-op
- * or already in target state), we just return.
+ * Bounded: ~25s window (100 × 250ms). 2026-07-03: the old 3s window was the root
+ * cause of Joey's "換 model 後卡住" bug — with conversation history, `/model X`
+ * (to a DIFFERENT model) opens a "Switch model? / 1. Yes / 2. No" picker, and if
+ * claude was busy when the command landed the picker appears SECONDS later, past
+ * the old 3s window → never confirmed → stuck forever. Reproduced + verified on
+ * the lab bot: a bare Enter confirms it; a long enough poll catches it even when
+ * it appears late. Caller must NOT await this (run in background) so the user's
+ * "✅ sent" reply is immediate; if no picker ever appears (fresh convo / same
+ * model) it just polls out harmlessly with no keystroke sent.
  */
 async function autoConfirmYesNoPicker(tmuxName: string): Promise<boolean> {
-  for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 200))
+  for (let i = 0; i < 100; i++) {
+    await new Promise(r => setTimeout(r, 250))
     if (await isYesNoConfirmPickerOpen(tmuxName)) {
       // bare Enter (tmuxSendKeys always appends Enter so passing '' = just Enter)
       await tmuxSendKeys('', tmuxName)
@@ -331,7 +350,7 @@ export async function forwardSharedTuiSlash(
     // 1656/1657: inline-keyboard button clicks were a no-op because of this.)
     if (cmd === '/resume' && args) return false
     try {
-      await tmuxSendKeys(cmd, tmuxName)
+      await tmuxSendKeys(cmd, tmuxName, true)  // clearFirst: drop any draft so the command isn't polluted
       await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
     } catch (err) {
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
@@ -360,13 +379,15 @@ export async function forwardSharedTuiSlash(
       return true
     }
     try {
-      await tmuxSendKeys(`${cmd} ${args}`, tmuxName)
-      // Claude TUI opens a Yes/No confirmation picker for /effort and /model
-      // arg-changes (default cursor on "Yes"). Without auto-confirm the session
-      // hangs because TG users can't press Enter. Joey 2026-05-26 msg 1696/1700.
-      const confirmed = await autoConfirmYesNoPicker(tmuxName)
-      const suffix = confirmed ? ' (auto-confirmed picker)' : ''
-      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}${suffix}`)
+      await tmuxSendKeys(`${cmd} ${args}`, tmuxName, true)  // clearFirst: drop draft so `/model X` isn't polluted
+      // Reply immediately, THEN confirm the picker in the background. Claude TUI
+      // opens a Yes/No picker for /effort and /model arg-changes (default cursor
+      // on "Yes"); with conversation history it can appear seconds later (if claude
+      // was busy when the command landed), so autoConfirmYesNoPicker polls ~25s.
+      // Awaiting it would stall this reply by up to 25s on the no-picker path, so
+      // we fire-and-forget. Joey 2026-05-26 msg 1696/1700; 2026-07-03 stuck-picker fix.
+      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}（若跳出切換確認會自動按 Enter）`)
+      void autoConfirmYesNoPicker(tmuxName).catch(() => {})
     } catch (err) {
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }

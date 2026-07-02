@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.11.2 — 2026-07-03
+
+### Fixed — /model (and /effort) control-slash getting stuck / not applying
+
+Two root causes behind "換 model 後不會 enter 導致 agent 卡住" (Joey), both reproduced
++ fixed + verified on the lab bot with a real test account tapping the buttons:
+
+1. **Confirm picker missed when it appears late.** With conversation history, `/model <id>`
+   (to a DIFFERENT model) opens a "Switch model? / 1. Yes / 2. No" picker. If claude was
+   busy when the command landed, the picker shows up SECONDS later — past the old 3s
+   autoConfirm window — so it was never Enter-confirmed and the session sat stuck forever.
+   Fix: `autoConfirmYesNoPicker` now polls ~25s, and the caller fires it in the BACKGROUND
+   (the "✅ sent" reply is immediate). Verified: claude busy 11s → picker appeared late →
+   auto-confirmed → model switched, no stuck.
+
+2. **Input-box pollution.** Control slashes are typed at the cursor; a leftover draft made
+   `send-keys "/model X" Enter` submit `<draft>/model X` as a CHAT MESSAGE — command never
+   ran, model unchanged. Fix: `clearFirst` sends Ctrl-U to clear the input line before the
+   command (own send-keys call — `Escape C-u` merges into an escape sequence and no-ops).
+   Verified: draft present → /model → draft cleared, model switched clean, no garbage sent.
+
 ## 1.11.1 — 2026-07-03
 
 ### Fixed — server.log self-rotation (prevents unbounded growth / disk-fill)
