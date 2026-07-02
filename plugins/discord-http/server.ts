@@ -106,8 +106,25 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
 // File-based logger. stderr alone is unreliable for a daemon launched by
 // launchd / tmux / a parent that may discard stderr.
+// Self-rotation — 2026-07-03 (matches telegram-http). Prevents server.log from
+// growing unbounded and filling the host disk. appendFileSync reopens per-call so
+// rename-rotation is safe. In-plugin so every machine is protected.
+const LOG_MAX_BYTES = 20 * 1024 * 1024
+const LOG_KEEP = 2
+const LOG_CHECK_EVERY = 200
+let logCallsSinceCheck = 0
+function rotateLogIfNeeded(): void {
+  try {
+    if (statSync(LOG_FILE).size < LOG_MAX_BYTES) return
+    for (let i = LOG_KEEP - 1; i >= 1; i--) {
+      try { renameSync(`${LOG_FILE}.${i}`, `${LOG_FILE}.${i + 1}`) } catch {}
+    }
+    try { renameSync(LOG_FILE, `${LOG_FILE}.1`) } catch {}
+  } catch {}
+}
 function log(level: 'info' | 'warn' | 'error', msg: string): void {
   const line = `${new Date().toISOString()} [${level}] pid=${process.pid} ${msg}\n`
+  if (++logCallsSinceCheck >= LOG_CHECK_EVERY) { logCallsSinceCheck = 0; rotateLogIfNeeded() }
   try { appendFileSync(LOG_FILE, line) } catch {}
   try { process.stderr.write(line) } catch {}
 }
