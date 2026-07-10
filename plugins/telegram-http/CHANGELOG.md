@@ -1,6 +1,40 @@
 # Changelog
 
-## 1.14.0 — 2026-07-10 (branch fix/tg-inbound)
+## 1.14.0 — 2026-07-10
+
+Merged release: inbound/media hardening (#2 #6 #12 #13) + orchestration/
+guardian hardening (#3 #4 #5 #7 #8 #9 #10 #15 #16), from the post-1.13.0
+imperfection roadmap.
+
+### Orchestration/guardian hardening — roadmap #3 #4 #5 #7 #8 #9 #10 #15 #16
+
+- **#3 login-expired pane watchdog** (channel-bot AND roamer targets): a
+  `Login expired` marker in a watched pane DMs the allowFrom users with the
+  /login → /restart recovery path; per-pane per-episode debounce so one
+  outage is one alert.
+- **#4 roamer argv capture/replay**: original claude argv is captured via
+  `ps` at takeover/discovery, whitelisted flags persist in state+registry
+  and are REPLAYED on takeover respawn and /restart — a `--model`-pinned or
+  custom-flagged target no longer loses its flags. Non-whitelisted flags
+  are ignored, logged, and surfaced in the TG notify.
+- **#5 EADDRINUSE bind retry** 10×1s before exit — fast daemon restarts no
+  longer die on the previous socket lingering (~1.3s window, hit live).
+- **#7 per-tmux switch lock**: a second `/model`/`/effort` during a running
+  orchestration is refused, naming the in-flight target.
+- **#8 /status fixed for paired users in control mode**: grammy's command
+  middleware preempted handleControlSlash so the daemon-health /status was
+  unreachable; paired /status now includes the daemon/TUI health block.
+- **#9 keyword-guarded auto-confirm**: the switch orchestrator only
+  auto-Enters a Yes/No picker whose pane text matches the command's keyword
+  (Switch model? / effort) — never blind-confirms an unrelated dialog.
+- **#10 `CHANNEL_BOT_MODEL_SCOPE=session`** (opt-in): after a confirmed
+  /model switch, the pre-switch global default is restored to
+  settings.json — in-TUI effect only, machine-wide default unpolluted.
+- **#15 stable idle detection**: idle = two consecutive clean pane samples;
+  busy markers extracted to a `BUSY_PANE_MARKERS` constant for easy
+  per-TUI-version updates.
+- **#16 pairing code TTL 30min** (was 1h): pairing prompt and /status show
+  remaining validity; periodic sweep prunes expired codes.
 
 ### Inbound/media hardening — roadmap #2 #6 #12 #13
 
