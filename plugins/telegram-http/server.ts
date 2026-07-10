@@ -705,6 +705,8 @@ function buildServer(): Server {
         '',
         'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
         '',
+        'Context attributes: reply_to_text/reply_to_user/reply_to_message_id describe the message being REPLIED TO (attachment_origin="reply" means the attachment/image came from that root message, not the reply itself); reply_quote is the passage the user specifically quoted. forward_origin/forward_from/forward_date identify the ORIGINAL author of a forwarded message — the outer user only forwarded it. Messages sharing one media_group_id are one album.',
+        '',
         'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
         '',
         "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
@@ -1192,7 +1194,7 @@ bot.on('message:text', async ctx => {
   // own but the message it replies to does, pull that attachment in — so
   // "reply to a file message + tag me" delivers the file, not just the text.
   const { attachment, downloadImage } = replyAttachment(ctx)
-  await handleInbound(ctx, ctx.message.text, downloadImage, attachment)
+  await handleInbound(ctx, ctx.message.text, downloadImage, attachment, true)
 })
 
 bot.on('message:photo', async ctx => {
@@ -1218,6 +1220,20 @@ bot.on('message:photo', async ctx => {
       log('error', `photo download failed: ${err}`)
       return undefined
     }
+  })
+})
+
+// NOTE: registered BEFORE message:document — Telegram animation messages also
+// carry a legacy `document` field, so the document handler would swallow them.
+bot.on('message:animation', async ctx => {
+  const anim = ctx.message.animation
+  const text = ctx.message.caption ?? '(animation)'
+  await handleInbound(ctx, text, undefined, {
+    kind: 'animation',
+    file_id: anim.file_id,
+    size: anim.file_size,
+    mime: anim.mime_type,
+    name: safeName(anim.file_name),
   })
 })
 
@@ -1289,6 +1305,22 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
+// Location / contact previously had NO handler — such messages were dropped
+// silently (no gate, no ack, nothing reached the agent). Rendered as text;
+// no attachment (there is no file to download).
+bot.on('message:location', async ctx => {
+  const loc = ctx.message.location
+  const venue = (ctx.message as any).venue
+  const venuePart = venue?.title ? ` — ${safeName(venue.title)}${venue.address ? `, ${safeName(venue.address)}` : ''}` : ''
+  await handleInbound(ctx, `(location: ${loc.latitude}, ${loc.longitude}${venuePart})`, undefined)
+})
+
+bot.on('message:contact', async ctx => {
+  const c = ctx.message.contact
+  const name = safeName([c.first_name, c.last_name].filter(Boolean).join(' ')) || 'contact'
+  await handleInbound(ctx, `(contact: ${name}, ${safeName(c.phone_number)})`, undefined)
+})
+
 type AttachmentMeta = {
   kind: string
   file_id: string
@@ -1302,6 +1334,103 @@ type AttachmentMeta = {
 // or forge a second meta entry.
 function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
+}
+
+/** Sanitized single-line excerpt for meta attributes (root-message text,
+ *  quotes). Sender-controlled → same sanitization as safeName, capped so a
+ *  long root message can't balloon the <channel> payload. */
+function metaExcerpt(s: string): string {
+  return (safeName(s.replace(/\s+/g, ' ').trim()) ?? '').slice(0, 200)
+}
+
+/** Human display name for a Telegram user object: @username > full name > id. */
+function displayName(u: { username?: string; first_name?: string; last_name?: string; id: number }): string {
+  return safeName(u.username ?? [u.first_name, u.last_name].filter(Boolean).join(' ')) || String(u.id)
+}
+
+/** One-word description of a message's media payload, for reply_to_text when
+ *  the replied-to message has no text/caption. */
+function mediaKindLabel(m: any): string | undefined {
+  if (m.photo) return '(photo)'
+  if (m.document) return `(document: ${safeName(m.document.file_name) ?? 'file'})`
+  if (m.video) return '(video)'
+  if (m.audio) return '(audio)'
+  if (m.voice) return '(voice message)'
+  if (m.video_note) return '(video note)'
+  if (m.sticker) return '(sticker)'
+  if (m.animation) return '(animation)'
+  if (m.location) return '(location)'
+  if (m.contact) return '(contact)'
+  return undefined
+}
+
+/**
+ * Reply / forward / album context for the <channel> meta (2026-07-10, Joey:
+ * "Reply 或 forward 的時候沒有帶有根訊息、檔案和發送者資訊?").
+ *
+ * Before this, the agent saw a reply as a bare standalone message (root
+ * message's text/sender lost; only its FILE was smuggled in by
+ * replyAttachment with no marker), and a forward as if the forwarder had
+ * authored it (origin lost entirely). Emitted attributes:
+ *
+ *  reply_to_message_id / reply_to_user / reply_to_user_id / reply_to_text —
+ *    the root message being replied to (text or media-kind label, ≤200 chars)
+ *  reply_quote — the partially-quoted text when the user quoted a specific
+ *    passage (Bot API TextQuote)
+ *  attachment_origin="reply" — marks that the attachment / image_path came
+ *    from the ROOT message, not the reply itself
+ *  forward_origin — user | hidden_user | chat | channel
+ *  forward_from / forward_from_id / forward_from_username — original author
+ *    (name only for hidden_user, per Telegram privacy)
+ *  forward_date — when the ORIGINAL message was sent (ISO)
+ *  forward_channel_message_id — original post id for channel forwards
+ *  media_group_id — album correlation id (each album item arrives as its own
+ *    message; same id ⇒ same album)
+ */
+function replyForwardMeta(ctx: Context, attachmentFromReply: boolean): Record<string, string> {
+  const out: Record<string, string> = {}
+  const m: any = ctx.message
+  if (!m) return out
+
+  const rt = m.reply_to_message
+  if (rt) {
+    out.reply_to_message_id = String(rt.message_id)
+    if (rt.from) {
+      out.reply_to_user = displayName(rt.from)
+      out.reply_to_user_id = String(rt.from.id)
+    } else if (rt.sender_chat) {
+      out.reply_to_user = safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)
+    }
+    const rootText = rt.text ?? rt.caption
+    const label = rootText ? metaExcerpt(rootText) : mediaKindLabel(rt)
+    if (label) out.reply_to_text = label
+    if (attachmentFromReply) out.attachment_origin = 'reply'
+  }
+  if (m.quote?.text) out.reply_quote = metaExcerpt(m.quote.text)
+
+  const fo = m.forward_origin
+  if (fo) {
+    out.forward_origin = String(fo.type)
+    if (fo.type === 'user' && fo.sender_user) {
+      out.forward_from = displayName(fo.sender_user)
+      out.forward_from_id = String(fo.sender_user.id)
+      if (fo.sender_user.username) out.forward_from_username = safeName(fo.sender_user.username)!
+    } else if (fo.type === 'hidden_user') {
+      out.forward_from = safeName(fo.sender_user_name) ?? 'hidden'
+    } else if (fo.type === 'chat' && fo.sender_chat) {
+      out.forward_from = safeName(fo.sender_chat.title ?? fo.sender_chat.username) || String(fo.sender_chat.id)
+      out.forward_from_id = String(fo.sender_chat.id)
+    } else if (fo.type === 'channel' && fo.chat) {
+      out.forward_from = safeName(fo.chat.title ?? fo.chat.username) || String(fo.chat.id)
+      out.forward_from_id = String(fo.chat.id)
+      if (fo.chat.username) out.forward_from_username = safeName(fo.chat.username)!
+      if (fo.message_id != null) out.forward_channel_message_id = String(fo.message_id)
+    }
+    if (fo.date) out.forward_date = new Date(fo.date * 1000).toISOString()
+  }
+
+  if (m.media_group_id) out.media_group_id = String(m.media_group_id)
+  return out
 }
 
 // When a message replies to another message that carries a file (e.g. user
@@ -1366,6 +1495,10 @@ async function handleInbound(
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
+  /** true when attachment/downloadImage were pulled off the replied-to
+   *  message (replyAttachment) rather than the message itself — emits
+   *  attachment_origin="reply" so the agent knows whose file this is. */
+  attachmentFromReply = false,
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -1494,6 +1627,11 @@ async function handleInbound(
           ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
           ...(attachment.name ? { attachment_name: attachment.name } : {}),
         } : {}),
+        // Reply-root / forward-origin / album context (2026-07-10) — see
+        // replyForwardMeta. Without these the agent couldn't tell WHAT was
+        // being replied to, WHO originally wrote a forwarded message, or
+        // that N album photos belong together.
+        ...replyForwardMeta(ctx, attachmentFromReply && !!(attachment || downloadImage)),
       },
     },
   }

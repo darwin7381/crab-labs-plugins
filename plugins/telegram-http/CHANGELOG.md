@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.13.0 — 2026-07-10
+
+### Added — reply / forward / album context in inbound <channel> meta
+
+Joey: "Reply 或 forward 的時候沒有帶有根訊息、檔案和發送者資訊?" — correct on
+all three counts. Before: a reply arrived as a bare standalone message (root
+message's text and sender lost; only its FILE was smuggled in by
+replyAttachment with no marker saying whose it was), a forward looked as if
+the forwarder authored it (origin lost entirely), album photos arrived as
+unrelated singles, and location/contact messages were dropped with no
+handler at all. New meta attributes (sanitized, excerpts capped at 200
+chars so payload can't balloon):
+
+- `reply_to_message_id` / `reply_to_user` / `reply_to_user_id` /
+  `reply_to_text` — the replied-to root message (text or media-kind label)
+- `reply_quote` — the specifically-quoted passage (Bot API TextQuote)
+- `attachment_origin="reply"` — attachment/image came from the ROOT message
+- `forward_origin` (user|hidden_user|chat|channel) + `forward_from` /
+  `forward_from_id` / `forward_from_username` / `forward_date` /
+  `forward_channel_message_id` — the ORIGINAL author of a forward
+- `media_group_id` — album correlation (same id ⇒ one album)
+
+### Added — animation / location / contact inbound handlers
+
+`message:animation` (registered BEFORE message:document — animation
+messages carry a legacy document field that would swallow them),
+`message:location` (venue title included), `message:contact`. Previously
+location/contact were silently dropped (no gate, no ack, nothing).
+
+All verified end-to-end on the lab bot (payloads read back from the lab
+TUI's session transcript): reply-to-own / reply-to-bot / reply-to-document
+(+origin marker) / user-forward / channel-forward (Telegram News, original
+post id + date) / 2-photo album (same media_group_id, both image_paths) /
+location / contact / gif-as-document / true MPEG4 animation / partial-quote
+reply.
+
 ## 1.12.0 — 2026-07-10
 
 ### Fixed — /model & /effort "幾乎都失敗" on claude 2.1.206 (P1)
