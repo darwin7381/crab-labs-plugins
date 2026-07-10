@@ -1,5 +1,72 @@
 # Changelog
 
+## 1.12.0 — 2026-07-10
+
+### Fixed — /model & /effort "幾乎都失敗" on claude 2.1.206 (P1)
+
+Root cause (reproduced on lab): a control slash typed while claude is MID-TURN
+is not executed — 2.1.206 puts it in the QUEUED MESSAGES buffer ("Press up to
+edit queued messages"). When the turn ends the queued command runs and (with
+history) opens the "Switch model?" confirm picker — but the old fire-and-forget
+25s autoConfirm window was long dead by then, so the picker sat open forever:
+session stuck, model unchanged. Production agents are almost always mid-turn ⇒
+"幾乎都失敗". Compounding it, `isClaudeBusy()` no longer recognized 2.1.206's
+busy markers (footer is `esc to interrupt` without parens; spinner glyph `✶`;
+new queued-state marker), so busy TUIs were treated as idle.
+
+Fix: `runTuiSwitchCommand` orchestrator replaces the fire-and-forget path —
+waits for idle BEFORE typing (≤10min; dismisses leftover confirm pickers),
+types with Ctrl-U draft-clear, Enter-confirms the picker whenever it appears,
+and VERIFIES the switch actually took effect. `isClaudeBusy()` updated for
+both TUI generations.
+
+### Added — real switch-outcome notification (P4)
+
+The immediate reply no longer claims "✅ 已送" success. It says sent/scheduled,
+and a follow-up message reports the VERIFIED outcome: ✅ with evidence
+(global settings.json `model` flip — claude persists /model there immediately —
+or the TUI's "Set model to …" line), or ⚠️ honest "sent but unconfirmed" with
+the pane tail (e.g. invalid model id). Confirmed /model switches also warn
+that the value became the machine-wide global default.
+
+### Added — /model picker marks the current model (P3)
+
+Bare `/model` keyboard now shows `✅ <label>（目前）` on the active model plus a
+`目前模型: <id>（source）` line. Detection, newest wins: last confirmed switch
+(state file) → newest assistant record's `message.model` in the current session
+jsonl → global settings.json default (labeled honestly as such).
+
+### Fixed — roamer takeover killed the target tmux & kicked attached humans (P2a)
+
+`/roam` takeover of an existing-but-unbridged tmux did `tmux kill-session`:
+the user's session died and any attached client was forcibly disconnected —
+iron-rule violation ("never touch attached sessions" — someone ELSE's
+session), reproduced on lab with an attached observer. Takeover now uses
+`tmux respawn-pane -k`: only the pane process is replaced; the session and
+attachments survive, and the relaunched claude joins the bridge with
+`--resume` continuity.
+
+### Changed — roamer /restart & /kill_stuck = full target restart with auto reconnect (P2b)
+
+Old /restart killed the target tmux, dropped the bridge, and demanded a
+fresh /roam; /kill_stuck's SIGKILL collapsed exec-pane sessions anyway.
+Now both do a FULL restart of the roamer-managed target from its persisted
+metadata (tmux name / cwd / session_id in the roamer state file): kill +
+recreate the SAME-NAMED tmux (per Joey — sometimes tmux itself is the wedged
+part, and a dead target must be rebuildable too), relaunch a bridged claude
+in the original workspace with `--resume`, auto re-bridge, keep chatting —
+the TG side never re-/roams. Recreating the roamer's OWN target is the
+feature; the never-kill-attached rule protects other people's sessions
+(takeover path above).
+
+### Added — /codexgate command (P5)
+
+`/codexgate` (TG commands can't carry a colon) types
+`/codex:setup --enable-review-gate` into the attached claude — channel-bot
+and roamer modes both. Same busy-safety as /model (wait-for-idle so it isn't
+queued as chat) and a verified follow-up notification (fresh pane-echo
+evidence vs a pre-type baseline).
+
 ## 1.11.3 — 2026-07-03
 
 ### Added — auto-reclaim pre-fix log bloat on daemon start (no manual script)
