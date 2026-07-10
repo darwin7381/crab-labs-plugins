@@ -134,12 +134,21 @@ async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string>
  * Heuristic: pane contains "Yes" + "go back" near each other within the last
  * 20 lines (typical picker footprint) AND a numbered "1." line marked with
  * the cursor "❯". Excludes the /resume picker (already driven separately).
+ *
+ * `requiredKeyword` (#9, 2026-07-10): callers about to AUTO-ENTER the picker
+ * must pass the keyword matching THEIR command (`Switch model?` for /model,
+ * `effort` for /effort). A generic Yes/No picker without the keyword (some
+ * other dialog that happened to open) then does NOT get blind-confirmed.
+ * Callers that only need "is any confirm picker blocking the pane" (leftover
+ * dismissal) omit it.
  */
-async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION, requiredKeyword?: RegExp): Promise<boolean> {
   const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-25).join('\n')
   if (/Resume session/.test(tail)) return false // handled separately
-  return /❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail)
+  if (!(/❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail))) return false
+  if (requiredKeyword && !requiredKeyword.test(tail)) return false
+  return true
 }
 
 // (autoConfirmYesNoPicker — the 1.11.2 fire-and-forget 25s picker poll — was
@@ -184,6 +193,41 @@ function readGlobalDefaultModel(): string | null {
     return typeof j?.model === 'string' && j.model ? j.model : null
   } catch { return null }
 }
+
+/**
+ * #10 (2026-07-10, opt-in): CHANNEL_BOT_MODEL_SCOPE=session — claude's /model
+ * always persists the choice as the MACHINE-WIDE default in ~/.claude/
+ * settings.json (side effect: every un-pinned agent inherits it on restart).
+ * With session scope, after a CONFIRMED switch we write the pre-switch value
+ * back, so the switch is effective inside the live TUI only and the global
+ * default stays unpolluted. Default (env unset) keeps today's behavior.
+ */
+function isModelScopeSession(): boolean {
+  return (process.env.CHANNEL_BOT_MODEL_SCOPE ?? '').trim().toLowerCase() === 'session'
+}
+
+/** Write `model` back into ~/.claude/settings.json (null ⇒ remove the key),
+ *  preserving every other key. Returns false on any error. */
+function restoreGlobalDefaultModel(prev: string | null): boolean {
+  try {
+    const p = join(homedir(), '.claude', 'settings.json')
+    const j = JSON.parse(readFileSync(p, 'utf8'))
+    if (prev === null) delete j.model
+    else j.model = prev
+    writeFileSync(p, JSON.stringify(j, null, 2) + '\n')
+    return true
+  } catch { return false }
+}
+
+/**
+ * #7 (2026-07-10): per-tmux switch-in-flight lock. runTuiSwitchCommand can
+ * legitimately run for MINUTES (waits out a busy turn before typing). A second
+ * /model fired during that window used to start a SECOND orchestrator against
+ * the same pane — two idle-waiters racing to type, double confirm-Enters, and
+ * interleaved notifications. Now the second command is refused immediately
+ * with the in-flight target named. Value = human-readable `cmd value` string.
+ */
+const switchInFlight = new Map<string, string>()  // tmuxName → "/model X"
 
 /** Where we remember the last CONFIRMED /model switch (per-daemon). */
 function lastSwitchStatePath(): string {
@@ -265,9 +309,14 @@ async function runTuiSwitchCommand(opts: {
   const { cmd, value, tmuxName, notify } = opts
   const t0 = Date.now()
   const full = `${cmd} ${value}`
+  // #9: the auto-Enter of the confirm picker requires the picker to carry the
+  // keyword of THIS command — never blind-confirm an unrelated Yes/No dialog.
+  const confirmKeyword = cmd === '/model' ? /Switch model\?/i : /effort/i
   try {
     // Phase 1 — wait for idle. Typing mid-turn queues the command as a chat
     // message (2.1.206) instead of executing it: the original P1 failure.
+    // #15: idle requires two consecutive clean samples (isClaudeIdleStable) —
+    // a single pane capture can land mid-repaint and read false-idle.
     let idleOk = false
     while (Date.now() - t0 < SWITCH_IDLE_WAIT_MS) {
       // A leftover Yes/No confirm picker from an earlier wedged switch blocks
@@ -277,7 +326,7 @@ async function runTuiSwitchCommand(opts: {
         await new Promise(r => setTimeout(r, 500))
         continue
       }
-      if (!(await isClaudeBusy(tmuxName))) { idleOk = true; break }
+      if (await isClaudeIdleStable(tmuxName)) { idleOk = true; break }
       await new Promise(r => setTimeout(r, 1000))
     }
     if (!idleOk) {
@@ -312,7 +361,10 @@ async function runTuiSwitchCommand(opts: {
     while (Date.now() < deadline && Date.now() - t0 < SWITCH_TOTAL_CAP_MS) {
       await new Promise(r => setTimeout(r, 400))
 
-      if (await isYesNoConfirmPickerOpen(tmuxName)) {
+      // #9: Enter ONLY when the picker carries this command's keyword
+      // (`Switch model?` / `effort`) — a keyword-less Yes/No dialog that
+      // happens to open mid-watch is NOT ours and must not be blind-confirmed.
+      if (await isYesNoConfirmPickerOpen(tmuxName, confirmKeyword)) {
         await tmuxSendKeys('', tmuxName)  // bare Enter — default cursor is on "Yes"
         confirmedPicker = true
         continue
@@ -344,9 +396,20 @@ async function runTuiSwitchCommand(opts: {
     }
 
     if (confirmed) {
+      // #10 — session scope: undo the global-default side effect BEFORE
+      // recording the confirmed switch, so detectCurrentModel's newest-
+      // timestamp-wins logic prefers the confirmed switch over the (older,
+      // restored) settings.json mtime.
+      let scopeNote = ''
+      if (isModel && value !== 'default' && isModelScopeSession()) {
+        const ok = restoreGlobalDefaultModel(prevModel)
+        scopeNote = ok
+          ? `\n🔒 scope=session：全域預設已還原為 \`${prevModel ?? '(未設定)'}\` — 本 TUI 內用 \`${value}\`，其他 agent 不受污染。`
+          : `\n⚠️ scope=session 還原全域預設失敗 — 請手動檢查 ~/.claude/settings.json（原值 \`${prevModel ?? '(未設定)'}\`）。`
+      }
       if (isModel) saveLastConfirmedSwitch(value)
-      await notify(`✅ \`${full}\` 已生效（${confirmed}${confirmedPicker ? '，切換確認已自動按 Enter' : ''}）`)
-      if (isModel && prevModel && normalizeModelId(prevModel) !== normalizeModelId(value) && value !== 'default') {
+      await notify(`✅ \`${full}\` 已生效（${confirmed}${confirmedPicker ? '，切換確認已自動按 Enter' : ''}）${scopeNote}`)
+      if (isModel && !isModelScopeSession() && prevModel && normalizeModelId(prevModel) !== normalizeModelId(value) && value !== 'default') {
         await notify(
           `⚠️ 注意：claude 的 /model 會把 \`${value}\` 存成整台機器的全域預設（原本是 \`${prevModel}\`）— ` +
           `其他未 pin --model 的 agent 下次重啟會繼承。`,
@@ -363,6 +426,9 @@ async function runTuiSwitchCommand(opts: {
     }
   } catch (err) {
     await notify(`❌ \`${full}\` 執行過程出錯: ${err instanceof Error ? err.message : err}`).catch(() => {})
+  } finally {
+    // #7: release the per-tmux in-flight lock no matter how we exited.
+    switchInFlight.delete(tmuxName)
   }
 }
 
@@ -383,7 +449,7 @@ async function runCodexGate(tmuxName: string, notify: (msg: string) => Promise<v
         await new Promise(r => setTimeout(r, 500))
         continue
       }
-      if (!(await isClaudeBusy(tmuxName))) { idleOk = true; break }
+      if (await isClaudeIdleStable(tmuxName)) { idleOk = true; break }  // #15 double-sample
       await new Promise(r => setTimeout(r, 1000))
     }
     if (!idleOk) {
@@ -429,6 +495,33 @@ async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
 }
 
+/**
+ * Busy-marker table (#15, 2026-07-10 — extracted to a constant so the marker
+ * set has ONE home; adding a new TUI-generation marker means one line here).
+ *
+ * Active-only busy indicators:
+ *   - `esc to interrupt` — canonical "claude is actively processing" footer.
+ *     2.1.198-era footers wrapped it in parens `(esc to interrupt)`; claude
+ *     2.1.206 renders it bare in the status bar (`… · esc to interrupt · …`).
+ *     Match WITHOUT parens so both generations register as busy (verified on
+ *     lab 2026-07-10 — the paren-only regex called a mid-turn 2.1.206 idle).
+ *   - `✻/✢/✶/✽ <verb>ing` — present-continuous spinner (Crunching, Creating…).
+ *     2.1.206 rotates through more spinner glyphs (✶ observed live).
+ *   - `Press up to edit queued messages` — input already queued behind an
+ *     active turn ⇒ definitely busy (2.1.206 queued-state marker).
+ *   - `Calling .*plugin` — active plugin call
+ *
+ * Joey 2026-05-25 (msg 1570): previous regex matched `✻ Crunched for 1m 17s`
+ * (past-tense historical marker shown AFTER turn completes) as busy →
+ * /resume_list buttons failed even when claude was idle for an hour.
+ */
+const BUSY_PANE_MARKERS: readonly RegExp[] = [
+  /esc to interrupt/,
+  /[✻✢✶✽✳✱∗]\s+\w+ing\b/,
+  /Press up to edit queued messages/,
+  /Calling .*plugin/,
+]
+
 /** Is claude TUI mid-tool-call / mid-turn (not at the idle ❯ prompt)? */
 async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   const pane = await tmuxCapturePane(tmuxName)
@@ -437,26 +530,24 @@ async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   // No prompt indicator at bottom → busy.
   if (!/❯\s/.test(tail)) return true
 
-  // Active-only busy indicators:
-  //   - `esc to interrupt` — canonical "claude is actively processing" footer.
-  //     2.1.198-era footers wrapped it in parens `(esc to interrupt)`; claude
-  //     2.1.206 renders it bare in the status bar (`… · esc to interrupt · …`).
-  //     Match WITHOUT parens so both generations register as busy (verified on
-  //     lab 2026-07-10 — the paren-only regex called a mid-turn 2.1.206 idle).
-  //   - `✻/✢/✶/✽ <verb>ing` — present-continuous spinner (Crunching, Creating…).
-  //     2.1.206 rotates through more spinner glyphs (✶ observed live).
-  //   - `Press up to edit queued messages` — input already queued behind an
-  //     active turn ⇒ definitely busy (2.1.206 queued-state marker).
-  //   - `Calling .*plugin` — active plugin call
-  //
-  // Joey 2026-05-25 (msg 1570): previous regex matched `✻ Crunched for 1m 17s`
-  // (past-tense historical marker shown AFTER turn completes) as busy →
-  // /resume_list buttons failed even when claude was idle for an hour.
-  if (/esc to interrupt/.test(tail)) return true
-  if (/[✻✢✶✽✳✱∗]\s+\w+ing\b/.test(tail)) return true
-  if (/Press up to edit queued messages/.test(tail)) return true
-  if (/Calling .*plugin/.test(tail)) return true
-  return false
+  return BUSY_PANE_MARKERS.some(re => re.test(tail))
+}
+
+// #15 (2026-07-10): single-sample idle checks race the TUI's render loop — a
+// pane captured mid-repaint (footer momentarily blank between spinner frames /
+// during a screen clear) reads as idle for one frame even though a turn is
+// running, and typing on that false-idle queues the command as chat. Require
+// TWO consecutive idle samples, a beat apart, before declaring idle.
+const IDLE_CONFIRM_SAMPLES = 2
+const IDLE_SAMPLE_GAP_MS = 500
+
+/** Idle only if `IDLE_CONFIRM_SAMPLES` consecutive samples all read idle. */
+async function isClaudeIdleStable(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  for (let i = 0; i < IDLE_CONFIRM_SAMPLES; i++) {
+    if (await isClaudeBusy(tmuxName)) return false
+    if (i < IDLE_CONFIRM_SAMPLES - 1) await new Promise(r => setTimeout(r, IDLE_SAMPLE_GAP_MS))
+  }
+  return true
 }
 
 // ============================================================================
@@ -668,6 +759,18 @@ export async function forwardSharedTuiSlash(
       return true
     }
     try {
+      // #7 (2026-07-10): one switch orchestration per tmux at a time. A second
+      // /model|/effort while one is still in flight (possibly minutes of
+      // idle-waiting) is refused with the in-flight target named — otherwise
+      // two orchestrators race the same pane (double type, double Enter).
+      const inFlight = switchInFlight.get(tmuxName)
+      if (inFlight) {
+        await replyToTg(
+          `⏳ 已有切換進行中（目標 \`${inFlight}\`）— 等它完成（成功/失敗都會通知）後再下 \`${cmd} ${args}\`。`,
+        )
+        return true
+      }
+      switchInFlight.set(tmuxName, `${cmd} ${args}`)
       // 2026-07-10 (P1/P4 rework): do NOT type immediately — claude 2.1.206
       // queues a mid-turn slash as a chat message instead of executing it, and
       // the confirm picker can appear only after the current turn ends (past
@@ -684,6 +787,7 @@ export async function forwardSharedTuiSlash(
       )
       void runTuiSwitchCommand({ cmd, value: args, tmuxName, notify: msg => replyToTg(msg) })
     } catch (err) {
+      switchInFlight.delete(tmuxName)  // don't leave a stale lock if the pre-flight reply threw
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }
     return true
@@ -1064,7 +1168,79 @@ export function formatResumeReply(opts: {
   return lines.join('\n')
 }
 
+// ---- #3: login-expired pane watchdog (2026-07-10) --------------------------
+//
+// When the TUI's OAuth credential dies, the agent goes silent on TG with no
+// signal (the jsonl/OTLP system-alert layers only fire if an API call is
+// attempted AND logged). This watchdog looks at the SOURCE of truth the human
+// would see — the tmux pane — for login-expiry wording, and DMs an alert with
+// the recovery path. Debounced per-pane: one alert per expiry EPISODE (marker
+// appearing after being absent); a persisting marker never re-fires, and the
+// state re-arms when the pane goes clean again (post-/login).
+
+export type WatchTarget = { label: string; tmux: string }
+
+/** Pane wordings that indicate the TUI lost its login/credential. Keep the
+ *  generic entries LAST — the match hit is reported in the alert. */
+const LOGIN_EXPIRED_PANE_MARKERS: readonly RegExp[] = [
+  /Please run \/login/i,
+  /OAuth token (has )?(expired|revoked)/i,
+  /Login expired/i,
+  /Invalid API key/i,
+  /authentication[_ ]error/i,
+]
+
+const LOGIN_WATCH_POLL_MS = 20_000
+
+/**
+ * Start the watchdog. `listTargets` is called each tick so dynamic targets
+ * (roamer's current_target) are re-resolved live. server.ts wires notify to
+ * a DM-all-allowFrom sender.
+ */
+export function startLoginExpiredWatchdog(opts: {
+  listTargets: () => Promise<WatchTarget[]>
+  notify: (msg: string) => void
+  log: (level: 'info' | 'warn' | 'error', msg: string) => void
+}): void {
+  const alerted = new Map<string, boolean>()  // tmux → alert already sent for the CURRENT expiry episode
+  const tick = async (): Promise<void> => {
+    let targets: WatchTarget[] = []
+    try { targets = await opts.listTargets() } catch { return }
+    for (const t of targets) {
+      const pane = await tmuxCapturePane(t.tmux)
+      if (!pane) continue  // capture failed (session gone / tmux hiccup) — keep episode state as-is
+      const hit = LOGIN_EXPIRED_PANE_MARKERS.find(re => re.test(pane))
+      if (hit) {
+        if (!alerted.get(t.tmux)) {
+          alerted.set(t.tmux, true)
+          opts.log('warn', `login-expired marker in pane ${t.tmux}: ${String(hit)}`)
+          opts.notify(
+            `🔐 登入疑似過期 — ${t.label}（tmux ${t.tmux}）畫面出現登入失效訊息（匹配 ${String(hit)}）。\n` +
+            `處理：在 TUI 跑 /login 重新登入（可從這裡用 \`/input /login\` 送），完成後可 /restart 重啟。\n` +
+            `（同一狀態不重複提醒；畫面恢復後若再過期會再通知）`,
+          )
+        }
+      } else if (alerted.get(t.tmux)) {
+        alerted.set(t.tmux, false)  // episode over — re-arm
+        opts.log('info', `login-expired marker cleared in pane ${t.tmux}`)
+      }
+    }
+  }
+  setInterval(() => { void tick() }, LOGIN_WATCH_POLL_MS).unref()
+  opts.log('info', `login-expired pane watchdog ON (poll=${LOGIN_WATCH_POLL_MS / 1000}s)`)
+}
+
 // ---- daemon health (for /status) -----------------------------------------
+
+/**
+ * #8 (2026-07-10): exported so server.ts's `bot.command('status')` (grammy
+ * command middleware runs BEFORE message:text, so /status NEVER reached
+ * handleControlSlash's /status branch) can merge the daemon/TUI health block
+ * into the paired-user reply in control mode.
+ */
+export async function controlStatusText(httpPort: string): Promise<string> {
+  return daemonStatus(httpPort)
+}
 
 async function daemonStatus(httpPort: string): Promise<string> {
   try {
