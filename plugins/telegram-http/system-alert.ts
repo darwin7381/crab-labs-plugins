@@ -67,7 +67,13 @@ export function extractSystemAlert(line: string): string | null {
   const hasLogin = line.includes('Please run /login')
   const hasRefusal = line.includes('"stop_reason":"refusal"')
   const hasApiErrText = line.includes('API Error') // assistant-text form, e.g. "API Error: Internal server error"
-  if (!hasApiErr && !hasLogin && !hasRefusal && !hasApiErrText) return null
+  // Claude's OWN human-readable API-error line (usage/rate-limit, credit
+  // exhaustion, etc.) rides on assistant records flagged isApiErrorMessage.
+  // e.g. "You've hit your weekly limit · resets Jun 9 at 6am (Asia/Taipei)".
+  // Surface THAT verbatim — never the raw provider "rate limit" string, which
+  // names the wrong problem (Joey 2026-07-10).
+  const hasApiErrFlag = line.includes('"isApiErrorMessage":true')
+  if (!hasApiErr && !hasLogin && !hasRefusal && !hasApiErrText && !hasApiErrFlag) return null
   try {
     const j: any = JSON.parse(line)
     if (j?.type === 'system' && j?.subtype === 'api_error') {
@@ -81,6 +87,9 @@ export function extractSystemAlert(line: string): string | null {
         for (const c of content) if (c?.type === 'text' && typeof c.text === 'string') text += c.text + ' '
       }
       text = text.trim()
+      // Claude's own human-readable API-error message — forward exactly as the
+      // TUI renders it (this is the usage-limit line the user actually sees).
+      if (j?.isApiErrorMessage === true && text) return text
       if (j?.message?.stop_reason === 'refusal') {
         return `Refusal (Usage Policy): ${text || '(no text)'}`
       }
@@ -161,6 +170,12 @@ export function handleOtlpLogs(payload: unknown): number {
           const bodyStr = typeof rec?.body?.stringValue === 'string' ? rec.body.stringValue : ''
           const eventName = (attrs['event.name'] ?? bodyStr.replace(/^claude_code\./, '')).trim()
           if (!OTLP_ALERT_EVENTS.has(eventName)) continue
+          // 429 = usage/rate limit. Claude's TUI writes its OWN human-readable
+          // line ("You've hit your weekly limit · resets …") as an assistant
+          // isApiErrorMessage record, which the jsonl-tail layer forwards.
+          // Suppress the raw provider "exceed your account's rate limit"
+          // string here — it names the wrong problem (Joey 2026-07-10).
+          if (eventName === 'api_error' && attrs['status_code'] === '429') continue
           found++
           const parts: string[] = []
           if (eventName === 'api_error') {
