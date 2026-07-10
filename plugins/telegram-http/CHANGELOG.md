@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.14.1
+
+- **system-alert: surface Claude's OWN human usage-limit message, not the raw provider 429 string.** When Claude hits a usage/rate limit it writes a human-readable assistant record (`isApiErrorMessage: true`, e.g. "You've hit your weekly limit · resets Jun 9 at 6am (Asia/Taipei)"). The jsonl-tail layer now forwards that verbatim, and the OTLP layer suppresses the raw HTTP 429 "exceed your account's rate limit" string (which named the wrong problem). Login/refusal/other-status api_error alerts unchanged. (Joey 2026-07-10)
+
 ## 1.14.0 — 2026-07-10
 
 Merged release: inbound/media hardening (#2 #6 #12 #13) + orchestration/
