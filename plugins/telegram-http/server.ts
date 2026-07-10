@@ -28,6 +28,9 @@ import {
   handleCallbackData,
   isControlEnabled,
   controlCommandsForBotApi,
+  controlStatusText,
+  startLoginExpiredWatchdog,
+  type WatchTarget,
   type InlineButton,
   type ReplyOptions,
 } from './channel-bot-control.ts'
@@ -36,6 +39,7 @@ import {
   handleRoamerSlash,
   handleRoamerCallback,
   roamerCommandsForBotApi,
+  getRoamerWatchTargets,
   onNewMcpSession as roamerOnNewMcpSession,
   onMcpSessionClosed as roamerOnMcpSessionClosed,
   getCurrentTargetMcpSessionId as roamerGetCurrentTargetMcpSessionId,
@@ -231,6 +235,13 @@ type PendingEntry = {
   replies: number
 }
 
+// #16 (2026-07-10): pairing codes live 30 minutes (was 1h). The pairing
+// prompt now shows the remaining validity so the human knows the code in an
+// old message may be dead; expired codes are pruned on every gate call AND
+// by a periodic sweep (so they clear even with zero traffic).
+const PAIRING_TTL_MS = 30 * 60 * 1000
+const PAIRING_PRUNE_INTERVAL_MS = 5 * 60 * 1000
+
 type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
@@ -357,7 +368,7 @@ function pruneExpired(a: Access): boolean {
 type GateResult =
   | { action: 'deliver'; access: Access }
   | { action: 'drop' }
-  | { action: 'pair'; code: string; isResend: boolean }
+  | { action: 'pair'; code: string; isResend: boolean; expiresAt: number }
 
 function gate(ctx: Context): GateResult {
   const access = loadAccess()
@@ -382,7 +393,7 @@ function gate(ctx: Context): GateResult {
         if ((p.replies ?? 1) >= 2) return { action: 'drop' }
         p.replies = (p.replies ?? 1) + 1
         saveAccess(access)
-        return { action: 'pair', code, isResend: true }
+        return { action: 'pair', code, isResend: true, expiresAt: p.expiresAt }
       }
     }
     // Cap pending at 3. Extra attempts are silently dropped.
@@ -390,15 +401,16 @@ function gate(ctx: Context): GateResult {
 
     const code = randomBytes(3).toString('hex') // 6 hex chars
     const now = Date.now()
+    const expiresAt = now + PAIRING_TTL_MS  // #16: 30min TTL
     access.pending[code] = {
       senderId,
       chatId: String(ctx.chat!.id),
       createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
+      expiresAt,
       replies: 1,
     }
     saveAccess(access)
-    return { action: 'pair', code, isResend: false }
+    return { action: 'pair', code, isResend: false, expiresAt }
   }
 
   if (chatType === 'group' || chatType === 'supergroup') {
@@ -485,6 +497,28 @@ function checkApprovals(): void {
 }
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
+
+// #16: sweep expired pairing codes even when no message traffic triggers a
+// gate() call — otherwise a dead code sits in access.json (and counts toward
+// the 3-pending cap) until the next inbound.
+if (!STATIC) {
+  setInterval(() => {
+    try {
+      const a = readAccessFile()
+      if (pruneExpired(a)) {
+        saveAccess(a)
+        log('info', 'pairing sweep: pruned expired pending code(s)')
+      }
+    } catch (err) {
+      log('warn', `pairing sweep failed: ${err instanceof Error ? err.message : err}`)
+    }
+  }, PAIRING_PRUNE_INTERVAL_MS).unref()
+}
+
+/** #16: human-readable remaining validity of a pairing code. */
+function pairingRemainingMin(expiresAt: number): number {
+  return Math.max(1, Math.ceil((expiresAt - Date.now()) / 60000))
+}
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -1034,6 +1068,36 @@ if (isSystemAlertEnabled()) {
   })
 }
 
+// #3 (2026-07-10) — login-expired pane watchdog, channel-bot AND roamer modes.
+// The jsonl/OTLP system-alert layers only fire when an API call gets attempted
+// and logged; an idle TUI sitting on "Please run /login" is invisible there.
+// This watches the tmux pane(s) directly and DMs allowFrom with the recovery
+// path (/login → /restart). Debounce lives inside the watchdog (one alert per
+// expiry episode per pane).
+if (isControlEnabled() || isRoamerEnabled()) {
+  startLoginExpiredWatchdog({
+    listTargets: async () => {
+      const targets: WatchTarget[] = []
+      if (isControlEnabled()) {
+        targets.push({ label: 'channel-bot', tmux: process.env.CHANNEL_BOT_TMUX_SESSION! })
+      }
+      if (isRoamerEnabled()) {
+        targets.push(...(await getRoamerWatchTargets()))
+      }
+      return targets
+    },
+    notify: text => {
+      const access = loadAccess()
+      for (const chat_id of access.allowFrom) {
+        void bot.api.sendMessage(chat_id, text).catch(e => {
+          log('error', `login-expired alert send to ${chat_id} failed: ${e}`)
+        })
+      }
+    },
+    log,
+  })
+}
+
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
 // groups, (3) spam channels the operator never approved. Silent drop matches
@@ -1074,14 +1138,24 @@ bot.command('status', async ctx => {
 
   if (access.allowFrom.includes(senderId)) {
     const name = ctx.from!.username ? `@${ctx.from!.username}` : senderId
-    await ctx.reply(`Paired as ${name}.`)
+    // #8 (2026-07-10): grammy command middleware runs BEFORE message:text, so
+    // /status never reached handleControlSlash's daemon-status branch — paired
+    // users in control mode only ever saw "Paired as X". Merge the daemon +
+    // claude TUI health block in here. Pairing flow (pending / not-paired
+    // branches below) is untouched.
+    if (isControlEnabled()) {
+      const s = await controlStatusText(String(HTTP_PORT))
+      await ctx.reply(`Paired as ${name}.\n\n📊 channel-bot status\n\n${s}`)
+    } else {
+      await ctx.reply(`Paired as ${name}.`)
+    }
     return
   }
 
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId === senderId) {
       await ctx.reply(
-        `Pending pairing — run in Claude Code:\n\n/telegram:access pair ${code}`
+        `Pending pairing (code expires in ~${pairingRemainingMin(p.expiresAt)} min) — run in Claude Code:\n\n/telegram:access pair ${code}`
       )
       return
     }
@@ -1506,8 +1580,11 @@ async function handleInbound(
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
+    // #16: show remaining validity so a stale code in scrollback is
+    // recognizably dead (30min TTL; expired codes are auto-pruned).
+    const mins = pairingRemainingMin(result.expiresAt)
     await ctx.reply(
-      `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}`,
+      `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}\n\n(code expires in ~${mins} min)`,
     )
     return
   }
@@ -2126,25 +2203,49 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
   }
 })
 
+// #5 (2026-07-10): port-in-use backoff. A daemon restart (launchd kickstart,
+// supervisor bounce) frequently races the OLD instance's death — its socket
+// can linger a few seconds (long-poll teardown / TIME_WAIT), and the previous
+// behavior (exit(1) on first EADDRINUSE) turned every fast restart into a
+// crash-loop lottery. Now: retry the bind up to BIND_MAX_ATTEMPTS times, 1s
+// apart, and only exit if the port is STILL held after all attempts (a real
+// second daemon owning the port).
+const BIND_MAX_ATTEMPTS = 10
+const BIND_RETRY_DELAY_MS = 1000
+let bindAttempts = 0
+
 httpServer.on('error', err => {
-  log('error', `http server error: ${err}`)
   if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-    log('error', `port ${HTTP_PORT} already in use — another daemon owns it; exiting`)
+    bindAttempts++
+    if (bindAttempts < BIND_MAX_ATTEMPTS) {
+      log('warn', `port ${HTTP_PORT} in use (bind attempt ${bindAttempts}/${BIND_MAX_ATTEMPTS}) — previous instance may still be releasing; retrying in ${BIND_RETRY_DELAY_MS / 1000}s`)
+      setTimeout(startListen, BIND_RETRY_DELAY_MS)
+      return
+    }
+    log('error', `port ${HTTP_PORT} still in use after ${BIND_MAX_ATTEMPTS} attempts — another daemon owns it; exiting`)
     process.exit(1)
   }
+  log('error', `http server error: ${err}`)
 })
 
-httpServer.listen(HTTP_PORT!, HTTP_HOST, () => {
-  log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
-  // Roamer cross-protocol auto-discovery: announce ourselves so partner-
-  // protocol roamer daemons can find us when they spawn target claudes.
-  // Safe no-op when ROAMER_MODE is unset (channel-bot deployments).
-  try {
-    roamerRegisterSelfAsDaemon()
-    if (isRoamerEnabled()) {
-      log('info', `roamer: registered self in roamer-daemons.json`)
+function startListen(): void {
+  httpServer.listen(HTTP_PORT!, HTTP_HOST, () => {
+    if (bindAttempts > 0) {
+      log('info', `port ${HTTP_PORT} acquired after ${bindAttempts} retry attempt(s)`)
     }
-  } catch (err) {
-    log('warn', `roamer: registerSelfAsDaemon failed: ${err instanceof Error ? err.message : err}`)
-  }
-})
+    log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
+    // Roamer cross-protocol auto-discovery: announce ourselves so partner-
+    // protocol roamer daemons can find us when they spawn target claudes.
+    // Safe no-op when ROAMER_MODE is unset (channel-bot deployments).
+    try {
+      roamerRegisterSelfAsDaemon()
+      if (isRoamerEnabled()) {
+        log('info', `roamer: registered self in roamer-daemons.json`)
+      }
+    } catch (err) {
+      log('warn', `roamer: registerSelfAsDaemon failed: ${err instanceof Error ? err.message : err}`)
+    }
+  })
+}
+
+startListen()

@@ -83,6 +83,8 @@ type RoamerRegistryEntry = {
    * bridges simultaneously since spawn loads both --channels).
    */
   protocol: 'telegram' | 'discord'
+  /** #4: whitelisted original-argv flags for this target (see RoamerState). */
+  argv_flags?: ReplayFlag[]
 }
 
 /** This module's bridge protocol — telegram-http. */
@@ -110,6 +112,9 @@ type RoamerState = {
     claude_pid: number
     session_id: string
     cwd: string
+    /** #4: whitelisted flags captured (via ps) from the ORIGINAL claude's argv
+     *  at takeover/discovery time — replayed on /restart respawn. */
+    argv_flags?: ReplayFlag[]
   } | null
 }
 
@@ -435,6 +440,87 @@ export async function listRoamableSessions(): Promise<DetectedSession[]> {
   return out
 }
 
+// ---- #4: original-argv capture + whitelisted flag replay (2026-07-10) ------
+//
+// Problem: roamer takeover / /restart respawns claude with a FIXED flag set —
+// any flags the human launched the original claude with (--model pin,
+// --allowedTools, ...) silently vanished across a respawn. Now: at takeover/
+// discovery we `ps` the original claude's argv, keep only WHITELISTED flags,
+// persist them in the roamer state + registry, and replay them on every
+// respawn (/restart included). Non-whitelisted flags are ignored AND logged
+// (daemon stderr + surfaced in the TG notify) so nothing disappears silently.
+
+export type ReplayFlag = { flag: string; value: string | null }
+
+const REPLAY_FLAGS_WITH_VALUE = new Set([
+  '--model', '--effort',
+  '--allowedTools', '--allowed-tools',
+  '--disallowedTools', '--disallowed-tools',
+  '--channels', '--resume',
+  '--permission-mode', '--add-dir',
+])
+const REPLAY_FLAGS_BOOLEAN = new Set([
+  '--dangerously-skip-permissions', '--continue',
+])
+
+/** stderr logger (lands in the daemon's captured output). */
+function rlog(msg: string): void {
+  try { process.stderr.write(`${new Date().toISOString()} [roamer] ${msg}\n`) } catch {}
+}
+
+/**
+ * Parse a `ps -o command=` line into whitelisted replay flags + ignored flag
+ * names. ps loses shell quoting, so this is best-effort whitespace
+ * tokenization: a flag's value = all tokens up to the next `--flag` (multi-
+ * word values like `--allowedTools Bash(git:*) Edit` survive as one value).
+ */
+export function parseReplayFlags(cmdline: string): { replay: ReplayFlag[]; ignored: string[] } {
+  const tokens = cmdline.split(/\s+/).filter(Boolean)
+  const replay: ReplayFlag[] = []
+  const ignored: string[] = []
+  let i = 0
+  while (i < tokens.length && !tokens[i].startsWith('--')) i++  // skip binary path / wrappers
+  while (i < tokens.length) {
+    const t = tokens[i]
+    if (!t.startsWith('--')) { i++; continue }
+    const eq = t.indexOf('=')
+    const flagName = eq > 0 ? t.slice(0, eq) : t
+    const inline = eq > 0 ? t.slice(eq + 1) : null
+    if (REPLAY_FLAGS_BOOLEAN.has(flagName)) { replay.push({ flag: flagName, value: null }); i++; continue }
+    const consumeValueTokens = (): string => {
+      const vals: string[] = []
+      let j = i + 1
+      while (j < tokens.length && !tokens[j].startsWith('--')) { vals.push(tokens[j]); j++ }
+      i = j
+      return vals.join(' ')
+    }
+    if (REPLAY_FLAGS_WITH_VALUE.has(flagName)) {
+      if (inline !== null) { replay.push({ flag: flagName, value: inline }); i++ }
+      else { const v = consumeValueTokens(); replay.push({ flag: flagName, value: v || null }) }
+      continue
+    }
+    ignored.push(flagName)
+    if (inline === null) consumeValueTokens()  // skip the unknown flag's value tokens too
+    else i++
+  }
+  return { replay, ignored }
+}
+
+/** `ps` the live pid and extract whitelisted replay flags. Null if ps fails. */
+async function captureClaudeArgvFlags(pid: number): Promise<{ replay: ReplayFlag[]; ignored: string[] } | null> {
+  if (!pid || pid < 2) return null
+  const r = await runCommand(['ps', '-o', 'command=', '-p', String(pid)], 3000)
+  if (r.exitCode !== 0) return null
+  const cmdline = r.stdout.trim().split('\n')[0] ?? ''
+  if (!cmdline) return null
+  const parsed = parseReplayFlags(cmdline)
+  if (parsed.ignored.length > 0) {
+    rlog(`argv capture pid=${pid}: ignoring non-whitelisted flag(s): ${parsed.ignored.join(' ')}`)
+  }
+  rlog(`argv capture pid=${pid}: replayable=[${parsed.replay.map(f => f.value === null ? f.flag : `${f.flag} ${f.value}`).join(', ')}]`)
+  return parsed
+}
+
 // ---- takeover (using --channels for native bridge) --------------------
 
 function shellQuote(s: string): string {
@@ -510,7 +596,8 @@ function findLatestNonEmptySessionForCwd(cwd: string): string | null {
 function buildChannelClaudeLaunch(
   cwd: string,
   sessionId: string,
-): { cmd: string; hasHistory: boolean; resumedSid: string | null } | null {
+  replayFlags?: ReplayFlag[],
+): { cmd: string; hasHistory: boolean; resumedSid: string | null; replayed: string[]; replaySkipped: string[] } | null {
   // Prefer the LATEST non-empty session in this project folder — gives
   // the user continuity with their most recent real conversation, instead
   // of force-fresh just because the live PID we took over was empty.
@@ -532,12 +619,40 @@ function buildChannelClaudeLaunch(
   const dcPort = findPartnerPort('discord')
   const loadDc = dcPort !== null
 
+  // #4: merge captured whitelisted flags into the launch. Builder-computed
+  // flags win where they overlap (bridge --channels, freshest --resume,
+  // --dangerously-skip-permissions); --disallowedTools values are MERGED so
+  // the builder's AskUserQuestion/ExitPlanMode floor is never lost; everything
+  // else (--model, --allowedTools, ...) is appended verbatim.
+  let mergedDisallowed = 'AskUserQuestion ExitPlanMode'
+  const extraFlagParts: string[] = []
+  const replayed: string[] = []
+  const replaySkipped: string[] = []
+  for (const f of replayFlags ?? []) {
+    const desc = f.value === null ? f.flag : `${f.flag} ${f.value}`
+    if (f.flag === '--disallowedTools' || f.flag === '--disallowed-tools') {
+      const have = new Set(mergedDisallowed.split(/\s+/))
+      const extras = (f.value ?? '').split(/\s+/).filter(v => v && !have.has(v))
+      if (extras.length > 0) { mergedDisallowed += ' ' + extras.join(' '); replayed.push(desc) }
+      else replaySkipped.push(`${desc}（builder 已含）`)
+      continue
+    }
+    if (f.flag === '--channels') { replaySkipped.push(`${desc}（builder 自管 bridge）`); continue }
+    if (f.flag === '--resume') { replaySkipped.push(`${desc}（builder 以最新歷史計算）`); continue }
+    if (f.flag === '--dangerously-skip-permissions') { replaySkipped.push(`${desc}（builder 已帶）`); continue }
+    extraFlagParts.push(f.value === null ? f.flag : `${f.flag} ${shellQuote(f.value)}`)
+    replayed.push(desc)
+  }
+  if (replayed.length > 0) rlog(`launch for ${cwd}: replaying flags: ${replayed.join(' | ')}`)
+  if (replaySkipped.length > 0) rlog(`launch for ${cwd}: skipped replay flags: ${replaySkipped.join(' | ')}`)
+
   const flags = [
     `--channels plugin:telegram-http@crab-labs-plugins`,
     loadDc ? `--channels plugin:discord-http@crab-labs-plugins` : '',
-    '--disallowedTools AskUserQuestion ExitPlanMode',
+    `--disallowedTools ${mergedDisallowed}`,
     '--dangerously-skip-permissions',
     resumeSid ? `--resume ${resumeSid}` : '',
+    ...extraFlagParts,
   ].filter(Boolean).join(' ')
 
   const envPart = loadDc
@@ -547,20 +662,32 @@ function buildChannelClaudeLaunch(
     cmd: `cd ${shellQuote(cwd)} && ${envPart} exec claude ${flags}`,
     hasHistory,
     resumedSid: resumeSid,
+    replayed,
+    replaySkipped,
   }
+}
+
+type SpawnResult = {
+  ok: boolean
+  hasHistory: boolean
+  resumedSid: string | null
+  /** #4: flags replayed from the original argv (human-readable). */
+  replayed: string[]
+  replaySkipped: string[]
 }
 
 async function spawnTmuxWithChannelClaude(
   tmuxName: string,
   cwd: string,
   sessionId: string,
-): Promise<{ ok: boolean; hasHistory: boolean; resumedSid: string | null }> {
-  const launch = buildChannelClaudeLaunch(cwd, sessionId)
-  if (!launch) return { ok: false, hasHistory: false, resumedSid: null }
+  replayFlags?: ReplayFlag[],
+): Promise<SpawnResult> {
+  const launch = buildChannelClaudeLaunch(cwd, sessionId, replayFlags)
+  if (!launch) return { ok: false, hasHistory: false, resumedSid: null, replayed: [], replaySkipped: [] }
   const newRes = await runCommand(['tmux', 'new-session', '-d', '-s', tmuxName], 5000)
-  if (newRes.exitCode !== 0) return { ok: false, hasHistory: launch.hasHistory, resumedSid: null }
+  if (newRes.exitCode !== 0) return { ok: false, hasHistory: launch.hasHistory, resumedSid: null, replayed: [], replaySkipped: [] }
   const sendRes = await runCommand(['tmux', 'send-keys', '-t', tmuxName, launch.cmd, 'Enter'], 5000)
-  return { ok: sendRes.exitCode === 0, hasHistory: launch.hasHistory, resumedSid: launch.resumedSid }
+  return { ok: sendRes.exitCode === 0, hasHistory: launch.hasHistory, resumedSid: launch.resumedSid, replayed: launch.replayed, replaySkipped: launch.replaySkipped }
 }
 
 /**
@@ -578,16 +705,17 @@ async function respawnPaneWithChannelClaude(
   tmuxName: string,
   cwd: string,
   sessionId: string,
-): Promise<{ ok: boolean; hasHistory: boolean; resumedSid: string | null }> {
-  const launch = buildChannelClaudeLaunch(cwd, sessionId)
-  if (!launch) return { ok: false, hasHistory: false, resumedSid: null }
+  replayFlags?: ReplayFlag[],
+): Promise<SpawnResult> {
+  const launch = buildChannelClaudeLaunch(cwd, sessionId, replayFlags)
+  if (!launch) return { ok: false, hasHistory: false, resumedSid: null, replayed: [], replaySkipped: [] }
   // Target the session's first pane (mirrors findClaudePidInTmux's assumption
   // that roamer targets are single-pane sessions).
   const panes = await runCommand(['tmux', 'list-panes', '-t', tmuxName, '-F', '#{pane_id}'], 3000)
   const paneId = panes.exitCode === 0 ? (panes.stdout.trim().split('\n')[0] ?? '') : ''
-  if (!paneId) return { ok: false, hasHistory: launch.hasHistory, resumedSid: null }
+  if (!paneId) return { ok: false, hasHistory: launch.hasHistory, resumedSid: null, replayed: [], replaySkipped: [] }
   const res = await runCommand(['tmux', 'respawn-pane', '-k', '-t', paneId, launch.cmd], 5000)
-  return { ok: res.exitCode === 0, hasHistory: launch.hasHistory, resumedSid: launch.resumedSid }
+  return { ok: res.exitCode === 0, hasHistory: launch.hasHistory, resumedSid: launch.resumedSid, replayed: launch.replayed, replaySkipped: launch.replaySkipped }
 }
 
 async function sigintWait(pid: number, timeoutMs = 4000): Promise<boolean> {
@@ -688,12 +816,16 @@ export async function connectToSession(
   if (session.tmuxName && tmuxToMcpSession.has(session.tmuxName)) {
     await notify(`🔗 該 session 已連在 bridge 上（${session.tmuxName}）— 純指針切換，零重啟`)
     const claudePid = await findClaudePidInTmux(session.tmuxName) ?? session.pid
+    // #4: capture the live claude's whitelisted argv flags so a later
+    // /restart can replay them (discovery counts, not just takeover).
+    const argvCap = await captureClaudeArgvFlags(claudePid)
     writeState({
       current_target: {
         tmux: session.tmuxName,
         claude_pid: claudePid,
         session_id: session.sessionId,
         cwd: session.cwd,
+        ...(argvCap ? { argv_flags: argvCap.replay } : {}),
       },
     })
     writeRegistryEntry(ROAMER_BOT_NAME, {
@@ -704,6 +836,7 @@ export async function connectToSession(
       cwd: session.cwd,
       updated_at: Date.now(),
       protocol: SELF_PROTOCOL,
+      ...(argvCap ? { argv_flags: argvCap.replay } : {}),
     })
     const m = `✅ 已切換到 ${session.projectName}（${session.cwd}）— 可以開始對話`
     await notify(m)
@@ -716,15 +849,19 @@ export async function connectToSession(
   //    fix — the old path did `tmux kill-session` here, destroying the
   //    session and kicking whoever was attached (Joey P2).
   //  - naked claude → stop it, spawn a fresh roam-* tmux as before.
+  // #4: capture the ORIGINAL claude's argv BEFORE we stop/replace it — this is
+  // the only moment its launch flags are still observable via ps.
+  const argvCap = await captureClaudeArgvFlags(session.pid)
+
   let tmuxName: string
-  let spawned: { ok: boolean; hasHistory: boolean; resumedSid: string | null }
+  let spawned: SpawnResult
   if (session.tmuxName) {
     tmuxName = session.tmuxName
     await notify(
       `🔄 ${session.projectName} 已在 tmux（${tmuxName}）但未掛 bridge — 原地重生 claude 接入 bridge（tmux session 與 attached 連線保留）`,
     )
     startTakeoverWait(tmuxName)
-    spawned = await respawnPaneWithChannelClaude(tmuxName, session.cwd, session.sessionId)
+    spawned = await respawnPaneWithChannelClaude(tmuxName, session.cwd, session.sessionId, argvCap?.replay)
   } else {
     await notify(`🛑 停止本機 claude（PID ${session.pid}）...`)
     const ok = await sigintWait(session.pid)
@@ -735,12 +872,18 @@ export async function connectToSession(
     }
     tmuxName = `roam-${ROAMER_BOT_NAME}-${session.sessionId.slice(0, 8)}`
     startTakeoverWait(tmuxName)
-    spawned = await spawnTmuxWithChannelClaude(tmuxName, session.cwd, session.sessionId)
+    spawned = await spawnTmuxWithChannelClaude(tmuxName, session.cwd, session.sessionId, argvCap?.replay)
   }
   if (!spawned.ok) {
     const m = `❌ 無法重生 claude（缺 TELEGRAM_HTTP_PORT env？tmux pane 異常？）`
     await notify(m)
     return { ok: false, message: m }
+  }
+  if (spawned.replayed.length > 0) {
+    await notify(`♻️ 已重放原 claude 白名單 flags：\`${spawned.replayed.join('`、`')}\``)
+  }
+  if (argvCap && argvCap.ignored.length > 0) {
+    await notify(`ℹ️ 原 claude 有白名單外 flags 未重放（已記 log）：\`${argvCap.ignored.join('`、`')}\``)
   }
 
   if (spawned.resumedSid) {
@@ -773,6 +916,7 @@ export async function connectToSession(
       claude_pid: claudePid,
       session_id: actualSid,
       cwd: session.cwd,
+      ...(argvCap ? { argv_flags: argvCap.replay } : {}),
     },
   })
   writeRegistryEntry(ROAMER_BOT_NAME, {
@@ -783,6 +927,7 @@ export async function connectToSession(
     cwd: session.cwd,
     updated_at: Date.now(),
     protocol: SELF_PROTOCOL,
+    ...(argvCap ? { argv_flags: argvCap.replay } : {}),
   })
 
   const finalMsg = `✅ 已連線到 ${session.projectName}（${session.cwd}）— 可以開始對話`
@@ -942,9 +1087,10 @@ async function handleChannelBotCommandsForCurrentTarget(
       startTakeoverWait(targetTmux)
       // Full recreate: kill the old session (exit code ignored — it may already
       // be dead), then spawn a fresh same-named session with a bridged claude.
+      // #4: replay the whitelisted argv flags captured at takeover/discovery.
       await runCommand(['tmux', 'kill-session', '-t', targetTmux], 3000)
       await new Promise(r => setTimeout(r, 500))
-      const spawned = await spawnTmuxWithChannelClaude(targetTmux, target.cwd, target.session_id)
+      const spawned = await spawnTmuxWithChannelClaude(targetTmux, target.cwd, target.session_id, target.argv_flags)
       if (!spawned.ok) {
         await replyToTg(`❌ tmux 重建 / claude 啟動失敗 — 用 /roam 重新接管。`)
         writeState({ current_target: null })
@@ -969,6 +1115,7 @@ async function handleChannelBotCommandsForCurrentTarget(
           claude_pid: claudePid,
           session_id: actualSid,
           cwd: target.cwd,
+          ...(target.argv_flags ? { argv_flags: target.argv_flags } : {}),
         },
       })
       writeRegistryEntry(ROAMER_BOT_NAME, {
@@ -979,10 +1126,12 @@ async function handleChannelBotCommandsForCurrentTarget(
         cwd: target.cwd,
         updated_at: Date.now(),
         protocol: SELF_PROTOCOL,
+        ...(target.argv_flags ? { argv_flags: target.argv_flags } : {}),
       })
       await replyToTg(
         `✅ ${isKillStuck ? 'kill_stuck' : 'restart'} 完成 — tmux ${targetTmux} 已重建、claude 已重啟並接上 bridge` +
-        `${spawned.resumedSid ? `（resume ${spawned.resumedSid.slice(0, 8)}… 對話脈絡保留）` : '（該 project 無歷史，fresh session）'}，直接繼續對話即可。` +
+        `${spawned.resumedSid ? `（resume ${spawned.resumedSid.slice(0, 8)}… 對話脈絡保留）` : '（該 project 無歷史，fresh session）'}` +
+        `${spawned.replayed.length > 0 ? `，重放原 flags：\`${spawned.replayed.join('`、`')}\`` : ''}，直接繼續對話即可。` +
         `（原本 attach 在舊 session 的終端需重新 attach 同名 session）`,
       )
     } catch (err) {
@@ -1201,6 +1350,20 @@ export async function handleRoamerCallback(
   }
 
   return false
+}
+
+/**
+ * #3: watch targets for the login-expired pane watchdog. Resolved live on
+ * every watchdog tick so switching /roam targets re-points the watch without
+ * any re-wiring. Only the CURRENT target is watched (that's the pane whose
+ * death the user would otherwise discover by silence).
+ */
+export async function getRoamerWatchTargets(): Promise<Array<{ label: string; tmux: string }>> {
+  if (!isRoamerEnabled()) return []
+  const state = readState()
+  if (!state.current_target) return []
+  if (!(await tmuxSessionExists(state.current_target.tmux))) return []
+  return [{ label: projectName(state.current_target.cwd), tmux: state.current_target.tmux }]
 }
 
 export function roamerCommandsForBotApi(): Array<{ command: string; description: string }> {
