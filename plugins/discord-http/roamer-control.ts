@@ -434,17 +434,15 @@ function findLatestNonEmptySessionForCwd(cwd: string): string | null {
 }
 
 /**
- * Spawn claude with BOTH telegram-http AND discord-http channels loaded.
- * See telegram-http/roamer-control.ts for full rationale.
+ * Build the shell command that launches a bridged claude for `cwd`, resuming
+ * the most meaningful session. Loads BOTH discord-http AND (when discovered)
+ * telegram-http channels. Returns null when DISCORD_HTTP_PORT is missing
+ * (can't bridge without our own port). KEEP IN SYNC with telegram-http.
  */
-async function spawnTmuxWithChannelClaude(
-  tmuxName: string,
+function buildChannelClaudeLaunch(
   cwd: string,
   sessionId: string,
-): Promise<{ ok: boolean; hasHistory: boolean; resumedSid: string | null }> {
-  const newRes = await runCommand(['tmux', 'new-session', '-d', '-s', tmuxName], 5000)
-  if (newRes.exitCode !== 0) return { ok: false, hasHistory: false, resumedSid: null }
-
+): { cmd: string; hasHistory: boolean; resumedSid: string | null } | null {
   // Prefer the LATEST non-empty session in this project folder.
   const liveJsonl = transcriptPath(cwd, sessionId)
   let resumeSid: string | null = null
@@ -455,7 +453,7 @@ async function spawnTmuxWithChannelClaude(
   const hasHistory = resumeSid !== null
 
   const ownPort = process.env.DISCORD_HTTP_PORT
-  if (!ownPort) return { ok: false, hasHistory, resumedSid: null }
+  if (!ownPort) return null
   // Cross-bridge: auto-discover a live TG roamer daemon via shared registry.
   const tgPort = findPartnerPort('telegram')
   const loadTg = tgPort !== null
@@ -471,9 +469,52 @@ async function spawnTmuxWithChannelClaude(
   const envPart = loadTg
     ? `TELEGRAM_HTTP_PORT=${tgPort} DISCORD_HTTP_PORT=${ownPort}`
     : `DISCORD_HTTP_PORT=${ownPort}`
-  const cmd = `cd ${shellQuote(cwd)} && ${envPart} exec claude ${flags}`
-  const sendRes = await runCommand(['tmux', 'send-keys', '-t', tmuxName, cmd, 'Enter'], 5000)
-  return { ok: sendRes.exitCode === 0, hasHistory, resumedSid: resumeSid }
+  return {
+    cmd: `cd ${shellQuote(cwd)} && ${envPart} exec claude ${flags}`,
+    hasHistory,
+    resumedSid: resumeSid,
+  }
+}
+
+async function spawnTmuxWithChannelClaude(
+  tmuxName: string,
+  cwd: string,
+  sessionId: string,
+): Promise<{ ok: boolean; hasHistory: boolean; resumedSid: string | null }> {
+  const launch = buildChannelClaudeLaunch(cwd, sessionId)
+  if (!launch) return { ok: false, hasHistory: false, resumedSid: null }
+  const newRes = await runCommand(['tmux', 'new-session', '-d', '-s', tmuxName], 5000)
+  if (newRes.exitCode !== 0) return { ok: false, hasHistory: launch.hasHistory, resumedSid: null }
+  const sendRes = await runCommand(['tmux', 'send-keys', '-t', tmuxName, launch.cmd, 'Enter'], 5000)
+  return { ok: sendRes.exitCode === 0, hasHistory: launch.hasHistory, resumedSid: launch.resumedSid }
+}
+
+/**
+ * Relaunch a bridged claude INSIDE an existing tmux session via
+ * `tmux respawn-pane -k` — the session (and any attached human client)
+ * survives; only the pane's process is replaced.
+ *
+ * 2026-07-10 (Joey P2, ported from telegram-http 1.12.0): the old
+ * takeover/restart paths did `tmux kill-session` on the target — which
+ * forcibly disconnected any human attached to that session and destroyed it
+ * (fleet iron rule violation: never kill a session someone is attached to).
+ * respawn-pane is the correct primitive: kill/replace the process, keep the
+ * session + attachment.
+ */
+async function respawnPaneWithChannelClaude(
+  tmuxName: string,
+  cwd: string,
+  sessionId: string,
+): Promise<{ ok: boolean; hasHistory: boolean; resumedSid: string | null }> {
+  const launch = buildChannelClaudeLaunch(cwd, sessionId)
+  if (!launch) return { ok: false, hasHistory: false, resumedSid: null }
+  // Target the session's first pane (mirrors findClaudePidInTmux's assumption
+  // that roamer targets are single-pane sessions).
+  const panes = await runCommand(['tmux', 'list-panes', '-t', tmuxName, '-F', '#{pane_id}'], 3000)
+  const paneId = panes.exitCode === 0 ? (panes.stdout.trim().split('\n')[0] ?? '') : ''
+  if (!paneId) return { ok: false, hasHistory: launch.hasHistory, resumedSid: null }
+  const res = await runCommand(['tmux', 'respawn-pane', '-k', '-t', paneId, launch.cmd], 5000)
+  return { ok: res.exitCode === 0, hasHistory: launch.hasHistory, resumedSid: launch.resumedSid }
 }
 
 async function sigintWait(pid: number, timeoutMs = 4000): Promise<boolean> {
@@ -581,10 +622,21 @@ export async function connectToSession(
     return { ok: true, message: m }
   }
 
+  // Need to relaunch claude with --channels so it joins our bridge.
+  //  - already in tmux → respawn the PANE in place (`tmux respawn-pane -k`):
+  //    the tmux session and any attached human client survive. 2026-07-10
+  //    fix — the old path did `tmux kill-session` here, destroying the
+  //    session and kicking whoever was attached (Joey P2).
+  //  - naked claude → stop it, spawn a fresh roam-* tmux as before.
+  let tmuxName: string
+  let spawned: { ok: boolean; hasHistory: boolean; resumedSid: string | null }
   if (session.tmuxName) {
-    await notify(`🔄 ${session.projectName} 已在 tmux 但未掛在 bridge — 重啟接入 bridge`)
-    await runCommand(['tmux', 'kill-session', '-t', session.tmuxName], 3000)
-    await new Promise(r => setTimeout(r, 500))
+    tmuxName = session.tmuxName
+    await notify(
+      `🔄 ${session.projectName} 已在 tmux（${tmuxName}）但未掛 bridge — 原地重生 claude 接入 bridge（tmux session 與 attached 連線保留）`,
+    )
+    startTakeoverWait(tmuxName)
+    spawned = await respawnPaneWithChannelClaude(tmuxName, session.cwd, session.sessionId)
   } else {
     await notify(`🛑 停止本機 claude（PID ${session.pid}）...`)
     const ok = await sigintWait(session.pid)
@@ -593,14 +645,12 @@ export async function connectToSession(
       await notify(m)
       return { ok: false, message: m }
     }
+    tmuxName = `roam-${ROAMER_BOT_NAME}-${session.sessionId.slice(0, 8)}`
+    startTakeoverWait(tmuxName)
+    spawned = await spawnTmuxWithChannelClaude(tmuxName, session.cwd, session.sessionId)
   }
-
-  const tmuxName = `roam-${ROAMER_BOT_NAME}-${session.sessionId.slice(0, 8)}`
-  startTakeoverWait(tmuxName)
-
-  const spawned = await spawnTmuxWithChannelClaude(tmuxName, session.cwd, session.sessionId)
   if (!spawned.ok) {
-    const m = `❌ 無法 spawn tmux + claude（缺 DISCORD_HTTP_PORT env？）`
+    const m = `❌ 無法重生 claude（缺 DISCORD_HTTP_PORT env？tmux pane 異常？）`
     await notify(m)
     return { ok: false, message: m }
   }
@@ -751,36 +801,92 @@ async function handleChannelBotCommandsForCurrentTarget(
   const targetProjectsDir = join(PROJECTS_ROOT, cwdSlug(target.cwd))
   const targetResumeChainFile = `/tmp/roamer-${ROAMER_BOT_NAME}-resume-chain-${cwdSlug(target.cwd).replace(/[^A-Za-z0-9-]/g, '_')}.json`
 
-  if (!(await tmuxSessionExists(targetTmux))) {
+  // /restart & /kill_stuck can rebuild a DEAD tmux from persisted metadata —
+  // don't early-out for them. Other commands need a live target.
+  if (!isRestart && !isKillStuck && !(await tmuxSessionExists(targetTmux))) {
     writeState({ current_target: null })
     deleteRegistryEntry(ROAMER_BOT_NAME)
-    await replyToTg('⚠️ 當前 target 的 tmux 已不存在。重新 /roam。')
+    await replyToTg('⚠️ 當前 target 的 tmux 已不存在。重新 /roam（或 /restart 重建）。')
     return 'handled'
   }
 
-  if (isRestart) {
+  // /restart & /kill_stuck — 2026-07-10 rework, semantics per Joey (ported
+  // from telegram-http 1.12.0):
+  //
+  // OLD behavior: /restart killed the target tmux and DROPPED the bridge —
+  // the user had to /roam again from scratch; /kill_stuck SIGKILLed the
+  // claude pid, which (exec panes) collapsed the session anyway.
+  //
+  // NEW behavior (both commands): a FULL restart of the roamer-managed
+  // target driven by the persisted target metadata (tmux name / cwd /
+  // session_id in ROAMER_STATE_FILE): kill + recreate the SAME-NAMED tmux
+  // session (sometimes tmux itself is the thing that's wedged — and a dead
+  // target is rebuildable too), relaunch a bridged claude in the original
+  // workspace with --resume for conversation continuity, auto re-bridge,
+  // keep chatting — no re-/roam. Recreating our OWN managed target is the
+  // feature; the never-kill-attached iron rule protects OTHER people's
+  // sessions (the takeover path therefore still uses in-place
+  // respawn-pane). A client attached to the old session must re-attach to
+  // the recreated same-named session.
+  if (isRestart || isKillStuck) {
     try {
+      await replyToTg(
+        (isKillStuck
+          ? `⛔ 強制重啟 target（原 claude PID ${target.claude_pid}）— `
+          : `🔁 重啟 target — `) +
+        `重建 tmux session (${targetTmux}) + 於 ${target.cwd} 重啟 claude（帶對話 resume），正在重新掛 bridge…`,
+      )
+      // Drop the stale tmux→MCP mapping first — otherwise waitForTakeoverMcpSession
+      // sees the OLD (dying) claude's entry and declares "bridged" instantly.
+      tmuxToMcpSession.delete(targetTmux)
+      startTakeoverWait(targetTmux)
+      // Full recreate: kill the old session (exit code ignored — it may already
+      // be dead), then spawn a fresh same-named session with a bridged claude.
       await runCommand(['tmux', 'kill-session', '-t', targetTmux], 3000)
-      writeState({ current_target: null })
-      deleteRegistryEntry(ROAMER_BOT_NAME)
-      onMcpSessionClosed(tmuxToMcpSession.get(targetTmux) ?? '')
-      await replyToTg(`🔁 已 kill 當前 target tmux (${targetTmux})。重新 /roam 選 session 再接管。`)
-    } catch (err) {
-      await replyToTg(`❌ restart 失敗: ${err instanceof Error ? err.message : err}`)
-    }
-    return 'handled'
-  }
-
-  if (isKillStuck) {
-    try {
-      if (target.claude_pid && pidAlive(target.claude_pid)) {
-        process.kill(target.claude_pid, 'SIGKILL')
-        await replyToTg(`⛔ 已 kill -9 當前 target claude (PID ${target.claude_pid})。`)
-      } else {
-        await replyToTg(`(當前 target claude PID ${target.claude_pid} 已不存在 — 重新 /roam）`)
+      await new Promise(r => setTimeout(r, 500))
+      const spawned = await spawnTmuxWithChannelClaude(targetTmux, target.cwd, target.session_id)
+      if (!spawned.ok) {
+        await replyToTg(`❌ tmux 重建 / claude 啟動失敗 — 用 /roam 重新接管。`)
+        writeState({ current_target: null })
+        deleteRegistryEntry(ROAMER_BOT_NAME)
+        return 'handled'
       }
+      const bridged = await waitForTakeoverMcpSession(targetTmux, 45_000)
+      if (!bridged) {
+        await replyToTg(
+          `⚠️ tmux ${targetTmux} 已重建、claude 已啟動，但 45s 內未接回 bridge — ` +
+          `稍等再傳訊息試試，或 /roam 重新接管。`,
+        )
+        return 'handled'
+      }
+      const claudePid = await findClaudePidInTmux(targetTmux) ?? 0
+      const actualSid = claudePid > 0
+        ? (await findSessionIdForPid(claudePid) ?? target.session_id)
+        : target.session_id
+      writeState({
+        current_target: {
+          tmux: targetTmux,
+          claude_pid: claudePid,
+          session_id: actualSid,
+          cwd: target.cwd,
+        },
+      })
+      writeRegistryEntry(ROAMER_BOT_NAME, {
+        tmux: targetTmux,
+        claude_pid: claudePid,
+        daemon_pid: process.pid,
+        session_id: actualSid,
+        cwd: target.cwd,
+        updated_at: Date.now(),
+        protocol: SELF_PROTOCOL,
+      })
+      await replyToTg(
+        `✅ ${isKillStuck ? 'kill_stuck' : 'restart'} 完成 — tmux ${targetTmux} 已重建、claude 已重啟並接上 bridge` +
+        `${spawned.resumedSid ? `（resume ${spawned.resumedSid.slice(0, 8)}… 對話脈絡保留）` : '（該 project 無歷史，fresh session）'}，直接繼續對話即可。` +
+        `（原本 attach 在舊 session 的終端需重新 attach 同名 session）`,
+      )
     } catch (err) {
-      await replyToTg(`❌ kill_stuck 失敗: ${err instanceof Error ? err.message : err}`)
+      await replyToTg(`❌ ${isKillStuck ? 'kill_stuck' : 'restart'} 失敗: ${err instanceof Error ? err.message : err}`)
     }
     return 'handled'
   }
@@ -974,8 +1080,8 @@ export function roamerCommandsForBotApi(): Array<{ command: string; description:
     { command: 'resume_list', description: 'list current target project\'s historical sessions' },
     { command: 'resume', description: 'switch current target to a historical session (/resume <n>)' },
     { command: 'resume_previous', description: 'walk back to previous session on current target' },
-    { command: 'restart', description: 'kill current target tmux (re-/roam to reconnect)' },
-    { command: 'kill_stuck', description: 'SIGKILL current target claude PID' },
+    { command: 'restart', description: 'rebuild target tmux + restart claude with resume, auto re-bridge' },
+    { command: 'kill_stuck', description: 'force rebuild target tmux + claude (resume kept), auto re-bridge' },
     { command: 'clear', description: 'clear current target claude TUI conversation' },
     { command: 'agents', description: 'open agents picker in current target' },
     { command: 'mcp', description: 'show MCP server status in current target' },
@@ -984,6 +1090,7 @@ export function roamerCommandsForBotApi(): Array<{ command: string; description:
     { command: 'compact', description: 'claude TUI /compact on current target' },
     { command: 'model', description: 'change current target model (/model <name>)' },
     { command: 'effort', description: 'change current target effort (/effort <level>)' },
+    { command: 'codexgate', description: 'enable Codex stop-time review gate on current target' },
     { command: 'sigint', description: 'send Ctrl+C to current target' },
   ]
 }
