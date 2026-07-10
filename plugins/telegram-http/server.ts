@@ -44,6 +44,7 @@ import {
   onNewMcpSession as roamerOnNewMcpSession,
   onMcpSessionClosed as roamerOnMcpSessionClosed,
   getCurrentTargetMcpSessionId as roamerGetCurrentTargetMcpSessionId,
+  resolveCurrentTargetMcpSession as roamerResolveCurrentTargetMcpSession,
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
 } from './roamer-control.ts'
@@ -1779,16 +1780,32 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
   // (one per ever-claimed target) but TG inbound goes only to whichever
   // is currently selected. Outside roamer mode, fall back to broadcast.
   if (isRoamerEnabled()) {
-    const targetSid = roamerGetCurrentTargetMcpSessionId()
-    if (!targetSid) {
-      // No target chosen yet — prompt the user.
-      await sendTextWithMaybeKeyboard(
-        String(chat_id),
-        '⚠️ 尚未連線 target。打 /roam 選一個 session 再來。',
-      )
+    // Resolve + self-repair the target mapping. The in-memory tmux→session map
+    // is emptied by any daemon restart while current_target persists on disk;
+    // resolveCurrentTargetMcpSession re-adopts the reconnected session instead
+    // of falsely warning "not connected" (Joey 2026-07-10). A live target whose
+    // bridge is mid-reconnect ('no-bridge') gets a brief retry before we speak.
+    const activeIds = (): string[] =>
+      [...activeServers].map(s => serverSessionId.get(s)).filter((x): x is string => !!x)
+    let res = await roamerResolveCurrentTargetMcpSession(activeIds())
+    for (let i = 0; res.status === 'no-bridge' && i < 6; i++) {
+      await new Promise(r => setTimeout(r, 500))
+      res = await roamerResolveCurrentTargetMcpSession(activeIds())
+    }
+    if (!res.sessionId) {
+      const msg =
+        res.status === 'target-dead'
+          ? '⚠️ 當前 roam target 的 claude 已結束。打 /roam 重新選一個 session。'
+          : res.status === 'no-target'
+            ? '⚠️ 尚未連線 target。打 /roam 選一個 session 再來。'
+            : '⏳ target 連線重整中（daemon 剛重啟或橋接重連），稍等幾秒再傳一次；若持續請 /roam 或 /restart。'
+      await sendTextWithMaybeKeyboard(String(chat_id), msg)
       return
     }
-    sendToMcpSession(targetSid, notification)
+    if (res.status === 'repaired') {
+      log('info', `roamer: re-adopted reconnected session ${res.sessionId} for current target — map was out of sync (daemon restart / plain reconnect)`)
+    }
+    sendToMcpSession(res.sessionId, notification)
     return
   }
 
