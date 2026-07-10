@@ -51,3 +51,30 @@ capture. Never gate a destructive/irreversible keystroke on one capture-pane rea
 
 `clearFirst` is opt-in and used only for the known control slashes. `/input` raw passthrough
 must NOT clear or alter the payload — it exists to type arbitrary keystrokes verbatim.
+
+## 6. (2.1.206) A slash typed MID-TURN is queued as a CHAT message, not executed
+
+Claude 2.1.206 puts input typed during an active turn into the queued-messages buffer
+(`Press up to edit queued messages`). The command executes only when the turn ends — and
+if it then opens the confirm picker, any short fire-and-forget confirm window is long dead
+⇒ picker stuck forever. This was the root cause of "換 model 幾乎都失敗" (production agents
+are almost always mid-turn). Since 1.12.0 `runTuiSwitchCommand` therefore waits for IDLE
+before typing, and keeps watching (extending the window while the queued-marker is visible)
+until it can verify the outcome.
+
+## 7. (2.1.206) Busy markers changed — keep `isClaudeBusy()` in sync
+
+The footer is now `esc to interrupt` WITHOUT parens, spinner glyphs rotate through more
+characters (`✶ ✳ ✻ ✢ …`), and the queued-state marker (`Press up to edit queued messages`)
+is itself a busy signal. The old paren-only regex judged a mid-turn 2.1.206 TUI "idle".
+New TUI versions keep adding spinner glyphs — when busy-detection misbehaves, capture a
+live busy pane first and diff the markers.
+
+## 8. Verify success against a PRE-TYPE baseline — stale scrollback false-confirms
+
+The pane may still show an IDENTICAL old command echo + its old `Set model to …` result
+from a previous switch. Anchoring on "the last occurrence of the command string" confirmed
+a switch that had not happened (bitten in lab 2026-07-10). Rules: count `Set model/effort`
+occurrences BEFORE typing and only accept an INCREASE as pane evidence; for `/model <id>`
+prefer the filesystem signal (`~/.claude/settings.json` `model` flips the moment the switch
+applies — claude persists the choice globally).

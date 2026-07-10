@@ -16,8 +16,11 @@ bot per workspace.
 TG message ──► roamer daemon (server.ts + roamer-control.ts, ROAMER_MODE=1)
                  │  /roam → list live claudes (claude agents --json, tmux-aware)
                  │  pick target → takeover:
-                 │    SIGINT naked claude (or reuse its tmux)
-                 │    respawn: claude --channels plugin:telegram-http@crab-labs-plugins --resume <sid>
+                 │    already in tmux → tmux respawn-pane -k IN PLACE (1.12.0 —
+                 │      session + any attached human client SURVIVE; only the
+                 │      pane process is replaced)
+                 │    naked claude → SIGINT + spawn a fresh roam-* tmux
+                 │    relaunch: claude --channels plugin:telegram-http@crab-labs-plugins --resume <sid>
                  │    (drops --resume if the session has no transcript)
                  ▼
                target claude joins the daemon's MCP bridge (new MCP session
@@ -50,8 +53,9 @@ Key implementation points (full detail in `roamer-control.ts` header + CHANGELOG
 | `/sessions` / `/resume_list` / `/list` | List the current target project's session history as buttons |
 | `/resume <uuid-prefix>` | Inline-switch the target to a specific past session |
 | `/resume_previous` | Step back along the resume chain |
-| `/restart` | Restart the target claude (preserving session via next-args) |
-| `/kill_stuck` | Force-kill a wedged target claude |
+| `/restart` | **Full target restart (1.12.0)**: kill + recreate the SAME-NAMED tmux from persisted metadata, relaunch claude in the original workspace with `--resume`, auto re-bridge — keep chatting, no re-`/roam`. Works even when the target tmux is already dead/wedged. A terminal attached to the old session re-attaches to the recreated same-named one. |
+| `/kill_stuck` | Same full rebuild as `/restart` (respawn is forceful — exactly what a wedged claude needs) |
+| `/model` `/effort` `/codexgate` `/clear` … | Shared TUI commands forwarded to the current target (same busy-safe + verified-notification behavior as channel-bot mode, 1.12.0) |
 | `/whoami` | Bot identity + mode sanity check |
 
 Non-slash text goes to the current target as a normal prompt.
