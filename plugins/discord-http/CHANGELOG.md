@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.13.0 — 2026-07-10
+
+DC adaptation of [telegram-http 1.13.0](../telegram-http/CHANGELOG.md)'s
+inbound-context work, mapped to Discord semantics. Attribute reference:
+[docs/inbound-message-context.md](docs/inbound-message-context.md).
+
+### Added — reply / forward context in inbound <channel> meta
+
+Same complaint as TG (Joey: "Reply 或 forward 的時候沒有帶有根訊息、檔案和發送
+者資訊?"), worse on DC: a reply arrived as a bare standalone message (root
+text/sender/files invisible), and a FORWARD arrived as a completely **empty**
+body — Discord puts forwarded content in `message_snapshots`, which the old
+handler never read. New meta (sanitized, excerpts capped 200 chars):
+
+- `reply_to_message_id` / `reply_to_user` / `reply_to_user_id` /
+  `reply_to_text` — the replied-to root (text or media label, via
+  `fetchReference()`; id alone survives a deleted root)
+- `reply_to_attachment_count` / `reply_to_attachments` — root files; agent
+  pulls them with `download_attachment(chat_id, reply_to_message_id)`
+  (pull-by-id replaces TG's `attachment_origin="reply"` smuggling)
+- `forward_origin` (user|bot|webhook|**unknown** — Discord snapshots omit
+  the original author by design; resolution is a best-effort source-message
+  fetch that works when the bot can read the source channel) +
+  `forward_from` / `forward_from_id` / `forward_channel` /
+  `forward_channel_id` / `forward_guild_id` / `forward_message_id` /
+  `forward_date` / `forward_attachment_count` / `forward_attachments`
+- forward body = snapshot content (or a media label) instead of ''
+- `download_attachment` falls through to snapshot attachments, so
+  downloading a forwarded file "just works" on the forward message id
+- No `reply_quote` (Discord has no partial-quote) and no `media_group_id`
+  (DC multi-attachment is natively one message) — documented in the doc.
+
+### Added — sticker / poll rendering (previously an empty body)
+
+Sticker-only and poll messages delivered `content=''` (nothing for the agent
+to see). Now rendered as `(sticker: <names>)` / `(poll: <question>)` bodies
+with trusted meta copies (`sticker_count`/`stickers`, `poll`) — an in-content
+label alone is forgeable. Voice-message/GIF uploads were already covered by
+the attachments list (no DC animation/location/contact message types exist).
+
+Verification: strict tsc clean + daemon smoke-boot; NOT lab-tested against a
+live Discord bot (no DC lab bot on this machine) — see the doc's verification
+note for the untested sub-shapes.
+
 ## 1.12.0 — 2026-07-10
 
 Ported from [telegram-http 1.12.0](../telegram-http/CHANGELOG.md) (version jump
