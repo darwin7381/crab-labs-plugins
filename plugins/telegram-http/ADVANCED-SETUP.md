@@ -342,10 +342,19 @@ poll Telegram → bot update
 
 `handleControlSlash` dispatches by command name:
 
-- **tmux send-keys family** (`/clear`, `/model`, `/effort`, `/agents`, `/mcp`, `/help`, `/sigint`)
+- **tmux send-keys family** (`/clear`, `/model`, `/effort`, `/codexgate`, `/agents`, `/mcp`, `/help`, `/sigint`)
   - Runs `tmux send-keys -t <session> <text> Enter` against the claude TUI
   - claude TUI handles it natively as if a human typed it
   - Status reply sent back to Telegram
+  - **1.12.0 — `/model` / `/effort` / `/codexgate` are busy-safe and verified**: typing
+    mid-turn would get QUEUED as a chat message on claude 2.1.206+ (the old cause of
+    "switch silently failed / picker stuck"), so the daemon now waits for the turn to
+    end (≤10 min), types, auto-Enters the confirm picker whenever it appears, verifies
+    the switch really applied (global `settings.json` flip or a fresh `Set model/effort`
+    line), and sends a follow-up ✅ confirmed / ⚠️ unconfirmed notification. Bare
+    `/model` shows a tap-to-pick keyboard with the current model marked
+    (`✅ …（目前）` + a `目前模型: <id>` status line). Full quirk history:
+    [docs/claude-tui-control-slash-quirks.md](./docs/claude-tui-control-slash-quirks.md)
 
 - **System control family** (`/restart`, `/kill_stuck`, `/status`)
   - `launchctl kickstart -k gui/<uid>/<wrapper-label>` or `pkill -9` or `curl /healthz`

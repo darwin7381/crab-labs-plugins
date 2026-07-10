@@ -19,12 +19,15 @@ Drop-in replacement for the official `telegram@claude-plugins-official` plugin. 
 - **Stable HTTP MCP transport** — no stdio death cycle; survives claude TUI restarts; pending messages replay from disk.
 - **Multi-session broadcast** — one daemon serves many claude TUIs simultaneously.
 - **Daemon-side keepalive (1.0.2+)** — TCP + SSE keepalive detects dead peers in 30-90s; mitigates the 2.1.141~2.1.148 client-side regression.
+- **🆕 Full inbound context (1.13.0)** — replies carry the root message's text/sender/file (`reply_to_*`, `attachment_origin`, `reply_quote`), forwards carry the original author (`forward_*`), albums carry `media_group_id`, and animation/location/contact messages are handled instead of dropped. Attribute reference + agent-side reading guide: [docs/inbound-message-context.md](./docs/inbound-message-context.md).
 - **🆕 Channel-bot TUI control plane (1.1.0+)** — opt-in slash commands intercepted by the daemon and applied to claude TUI itself via tmux send-keys + launchctl. From your phone/iPad you can:
 
   | Command | What it does |
   |---|---|
   | `/clear` | clear claude TUI context (same process, new session id) |
-  | `/model <name>` `/effort <level>` | switch model / effort level |
+  | `/model` | tap-to-pick model keyboard with the **current model marked** (1.12.0) |
+  | `/model <name>` `/effort <level>` | switch model / effort — **busy-safe** (waits for the turn to end instead of queueing), auto-confirms the switch picker, then sends a **verified ✅/⚠️ outcome notification** (1.12.0) |
+  | `/codexgate` | enable the Codex stop-time review gate (types `/codex:setup --enable-review-gate` into the TUI, busy-safe + verified) (1.12.0) |
   | `/agents` `/mcp` `/help` | open native claude pickers (read-only inspection) |
   | `/sigint` | Ctrl+C — interrupt current claude turn |
   | `/restart` | full claude TUI restart via wrapper (~25s) |
