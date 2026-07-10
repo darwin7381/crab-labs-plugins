@@ -1,5 +1,113 @@
 # Changelog
 
+## 1.13.0 — 2026-07-10
+
+DC adaptation of [telegram-http 1.13.0](../telegram-http/CHANGELOG.md)'s
+inbound-context work, mapped to Discord semantics. Attribute reference:
+[docs/inbound-message-context.md](docs/inbound-message-context.md).
+
+### Added — reply / forward context in inbound <channel> meta
+
+Same complaint as TG (Joey: "Reply 或 forward 的時候沒有帶有根訊息、檔案和發送
+者資訊?"), worse on DC: a reply arrived as a bare standalone message (root
+text/sender/files invisible), and a FORWARD arrived as a completely **empty**
+body — Discord puts forwarded content in `message_snapshots`, which the old
+handler never read. New meta (sanitized, excerpts capped 200 chars):
+
+- `reply_to_message_id` / `reply_to_user` / `reply_to_user_id` /
+  `reply_to_text` — the replied-to root (text or media label, via
+  `fetchReference()`; id alone survives a deleted root)
+- `reply_to_attachment_count` / `reply_to_attachments` — root files; agent
+  pulls them with `download_attachment(chat_id, reply_to_message_id)`
+  (pull-by-id replaces TG's `attachment_origin="reply"` smuggling)
+- `forward_origin` (user|bot|webhook|**unknown** — Discord snapshots omit
+  the original author by design; resolution is a best-effort source-message
+  fetch that works when the bot can read the source channel) +
+  `forward_from` / `forward_from_id` / `forward_channel` /
+  `forward_channel_id` / `forward_guild_id` / `forward_message_id` /
+  `forward_date` / `forward_attachment_count` / `forward_attachments`
+- forward body = snapshot content (or a media label) instead of ''
+- `download_attachment` falls through to snapshot attachments, so
+  downloading a forwarded file "just works" on the forward message id
+- No `reply_quote` (Discord has no partial-quote) and no `media_group_id`
+  (DC multi-attachment is natively one message) — documented in the doc.
+
+### Added — sticker / poll rendering (previously an empty body)
+
+Sticker-only and poll messages delivered `content=''` (nothing for the agent
+to see). Now rendered as `(sticker: <names>)` / `(poll: <question>)` bodies
+with trusted meta copies (`sticker_count`/`stickers`, `poll`) — an in-content
+label alone is forgeable. Voice-message/GIF uploads were already covered by
+the attachments list (no DC animation/location/contact message types exist).
+
+Verification: strict tsc clean + daemon smoke-boot; NOT lab-tested against a
+live Discord bot (no DC lab bot on this machine) — see the doc's verification
+note for the untested sub-shapes.
+
+## 1.12.0 — 2026-07-10
+
+Ported from [telegram-http 1.12.0](../telegram-http/CHANGELOG.md) (version jump
+1.6.x → 1.12.0 re-aligns with the companion plugin, same convention as the
+1.2.x → 1.5.0 jump). The TG side of this logic was reproduced + verified on
+lab bots 2026-07-10; the DC port is the same orchestration code verbatim
+(shared tmux/claude-TUI mechanics, protocol-independent), verified here by
+strict typecheck + unit tests + daemon smoke-boot — **not** re-tested against
+a live Discord bot (no DC lab bot exists on this machine).
+
+### Fixed — /model & /effort "幾乎都失敗" on claude 2.1.206
+
+A control slash typed while claude is MID-TURN is queued as a CHAT message
+("Press up to edit queued messages"); when the turn ends the queued command
+opens the "Switch model?" confirm picker after the old ~3s fire-and-forget
+auto-confirm window (DC's was even shorter than TG's 25s) is long dead →
+picker stuck forever. `runTuiSwitchCommand` now waits for idle BEFORE typing
+(≤10min; dismisses leftover confirm pickers), types with Ctrl-U draft-clear,
+Enter-confirms the picker whenever it appears, and VERIFIES the switch took
+effect. `isClaudeBusy()` updated for 2.1.206 markers (paren-less
+`esc to interrupt`, new spinner glyphs, queued-state marker).
+
+### Added — real switch-outcome notification
+
+Immediate reply only says sent/scheduled; a follow-up reports the VERIFIED
+outcome: ✅ with evidence (global settings.json `model` flip, or a fresh
+"Set model/effort …" pane line counted against a pre-type baseline so stale
+scrollback can't false-confirm), or ⚠️ "sent but unconfirmed" with pane tail.
+Confirmed /model switches also warn the value became the machine-wide global
+default.
+
+### Added — bare /model tap-to-pick buttons with current-model marker
+
+DC previously had NO bare-`/model` picker (usage text only). Ported the TG
+inline keyboard (`modelChoices()`, `CHANNEL_BOT_MODEL_CHOICES` env override)
+including the 1.12.0 current-model marker: `✅ <label>（目前）` on the active
+model + a `目前模型: <id>（source）` line. Detection, newest wins: last
+confirmed switch (state file, DISCORD_STATE_DIR first) → newest assistant
+record's `message.model` in the current session jsonl → global settings.json
+default. `model:<value>` button callbacks are validated (id-charset regex)
+and routed through the same busy-safe /model path.
+
+### Fixed — roamer takeover killed the target tmux & kicked attached humans
+
+`/roam` takeover of an existing-but-unbridged tmux did `tmux kill-session`
+(iron-rule violation: never touch attached sessions). Now uses
+`tmux respawn-pane -k` — only the pane process is replaced; the session and
+any attached client survive; relaunched claude joins the bridge with
+`--resume` continuity.
+
+### Changed — roamer /restart & /kill_stuck = full target restart with auto reconnect
+
+Both now do a FULL restart of the roamer-managed target from persisted
+metadata (tmux/cwd/session_id in the roamer state file): kill + recreate the
+SAME-NAMED tmux (tmux itself may be the wedged part; dead targets are
+rebuildable — no early-out on a missing tmux), relaunch a bridged claude with
+`--resume`, auto re-bridge, keep chatting — no re-/roam needed.
+
+### Added — /codexgate command
+
+`/codexgate` types `/codex:setup --enable-review-gate` into the attached
+claude — channel-bot and roamer modes. Same busy-safety as /model plus a
+verified follow-up (fresh pane-echo evidence vs a pre-type baseline).
+
 ## 1.6.5 — 2026-07-03
 
 ### Added — auto-reclaim pre-fix log bloat on daemon start (no manual script)
