@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.14.0 — 2026-07-10 (branch fix/tg-inbound)
+
+### Inbound/media hardening — roadmap #2 #6 #12 #13
+
+**#2 — photo download failure is no longer silent.** Before: a failed photo
+download produced a bare caption-only message (no image_path, no marker, no
+file_id — the agent answered as if it saw nothing). Now the meta carries
+`image_error="download failed"` plus `attachment_kind="photo"` +
+`attachment_file_id` (+ size) so the agent can retry via download_attachment,
+and the MCP instructions direct the agent to TELL the user the image didn't
+come through. Photo/file fetches also honor `TELEGRAM_API_ROOT` (was
+hard-coded), and photo downloads now check HTTP status instead of writing
+error pages to disk. Lab-verified with a real network failure
+(`TELEGRAM_API_ROOT=http://127.0.0.1:9`), no injected test code.
+
+**#6 — album aggregation.** Photos sharing a `media_group_id` are buffered
+~1.5s (timer resets per item) and delivered as ONE notification:
+`image_path` / `image_path_2` / … in album order, `media_group_count`,
+captions joined as the body (`(album: N photos)` when uncaptioned). Failed
+items keep their position as `image_error[_k]` + `attachment_file_id[_k]`.
+Single photos completely unaffected; non-photo album items unchanged.
+Lab-verified: 2-photo and 3-photo albums each arrived as one message.
+
+**#12 — opt-in voice transcription.** `CHANNEL_BOT_VOICE_TRANSCRIBE=1` makes
+the daemon download voice/audio attachments and run LOCAL whisper (CLI, CPU,
+`CHANNEL_BOT_WHISPER_MODEL` default "small"; `CHANNEL_BOT_WHISPER_BIN` to
+point at the binary; `CHANNEL_BOT_TRANSCRIBE_CMD` full override). Result
+rides in meta as `voice_transcript` (≤500 chars, sanitized, truncation
+marked). Failure never blocks: message still ships with its file_id (both
+paths lab-verified). Default OFF — zero behavior change. NOTE:
+media-alchemist's transcribe.sh was rejected as the backend — its forced-MPS
+local mode currently dies with SparseMPS NotImplementedError on modern torch
+(verified on the Mac mini with both small and large-v3).
+
+**#13 — truncation & sanitization markers.** `metaExcerpt` truncation now
+appends `…` (was a silent 200-char cut); media-kind labels flow through the
+same cap. `safeName` replaces delimiter chars with readable FULL-WIDTH
+lookalikes（`<>[];` → ＜＞［］；, CR/LF → space）instead of `_`, preserving
+meaning; quotes/parens untouched. Lab-verified: 261-char reply root rendered
+as 199 chars + `…`; document named `re[port]<v2>;final.txt` arrived as
+`re［port］＜v2＞；final.txt`.
+
 ## 1.13.0 — 2026-07-10
 
 ### Added — reply / forward / album context in inbound <channel> meta

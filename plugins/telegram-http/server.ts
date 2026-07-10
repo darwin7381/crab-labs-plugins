@@ -22,6 +22,7 @@ import { randomBytes, randomUUID } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { execFile } from 'child_process'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
 import {
   handleControlSlash,
@@ -737,9 +738,9 @@ function buildServer(): Server {
       instructions: [
         'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
         '',
-        'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+        'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has image_error, the photo could NOT be downloaded — tell the sender explicitly that the image did not come through (never silently answer as if you saw it); you can retry by calling download_attachment with the attachment_file_id on the same tag. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
         '',
-        'Context attributes: reply_to_text/reply_to_user/reply_to_message_id describe the message being REPLIED TO (attachment_origin="reply" means the attachment/image came from that root message, not the reply itself); reply_quote is the passage the user specifically quoted. forward_origin/forward_from/forward_date identify the ORIGINAL author of a forwarded message — the outer user only forwarded it. Messages sharing one media_group_id are one album.',
+        'Context attributes: reply_to_text/reply_to_user/reply_to_message_id describe the message being REPLIED TO (attachment_origin="reply" means the attachment/image came from that root message, not the reply itself); reply_quote is the passage the user specifically quoted. forward_origin/forward_from/forward_date identify the ORIGINAL author of a forwarded message — the outer user only forwarded it. A photo album arrives as ONE message with media_group_id + media_group_count and numbered paths (image_path, image_path_2, …) — Read them all. A voice_transcript attribute is a local speech-to-text of a voice/audio attachment (may be truncated, marked with a trailing …) — treat it as what the sender said, and download the audio only if you need the original.',
         '',
         'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
         '',
@@ -959,7 +960,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const file_id = args.file_id as string
         const file = await bot.api.getFile(file_id)
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+        const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
         const res = await fetch(url)
         if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
         const buf = Buffer.from(await res.arrayBuffer())
@@ -1267,33 +1268,38 @@ bot.on('message:text', async ctx => {
   // If this text (e.g. a reply that @mentions the bot) carries no file of its
   // own but the message it replies to does, pull that attachment in — so
   // "reply to a file message + tag me" delivers the file, not just the text.
-  const { attachment, downloadImage } = replyAttachment(ctx)
-  await handleInbound(ctx, ctx.message.text, downloadImage, attachment, true)
+  const { attachment, image } = replyAttachment(ctx)
+  await handleInbound(ctx, ctx.message.text, image, attachment, true)
 })
+
+// Download a Telegram photo (largest size) to the inbox. Shared by the
+// message:photo handler and replyAttachment. Throws on any failure so the
+// caller can mark image_error instead of silently losing the picture (#2).
+async function downloadPhotoToInbox(ctx: Context, best: { file_id: string; file_unique_id: string }): Promise<string> {
+  const file = await ctx.api.getFile(best.file_id)
+  if (!file.file_path) throw new Error('getFile returned no file_path')
+  const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const buf = Buffer.from(await res.arrayBuffer())
+  const ext = file.file_path.split('.').pop() ?? 'jpg'
+  const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
+  mkdirSync(INBOX_DIR, { recursive: true })
+  writeFileSync(path, buf)
+  return path
+}
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
   // Defer download until after the gate approves — any user can send photos,
   // and we don't want to burn API quota or fill the inbox for dropped messages.
-  await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
-    try {
-      const file = await ctx.api.getFile(best.file_id)
-      if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url)
-      const buf = Buffer.from(await res.arrayBuffer())
-      const ext = file.file_path.split('.').pop() ?? 'jpg'
-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, buf)
-      return path
-    } catch (err) {
-      log('error', `photo download failed: ${err}`)
-      return undefined
-    }
+  // Largest size is last in the array.
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
+  await handleInbound(ctx, caption, {
+    file_id: best.file_id,
+    size: best.file_size,
+    download: () => downloadPhotoToInbox(ctx, best),
   })
 })
 
@@ -1405,16 +1411,24 @@ type AttachmentMeta = {
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>
 // notification — delimiter chars would let the uploader break out of the tag
-// or forge a second meta entry.
+// or forge a second meta entry. Replaced with FULL-WIDTH lookalikes (not `_`)
+// so the name stays readable and keeps its meaning — `re[port]<v2>.txt`
+// becomes `re［port］＜v2＞.txt`, not `re_port__v2_.txt` (#13). Quote/paren
+// characters are safe and pass through untouched.
+const SAFE_CHAR_MAP: Record<string, string> = {
+  '<': '＜', '>': '＞', '[': '［', ']': '］', ';': '；', '\r': ' ', '\n': ' ',
+}
 function safeName(s: string | undefined): string | undefined {
-  return s?.replace(/[<>\[\]\r\n;]/g, '_')
+  return s?.replace(/[<>\[\]\r\n;]/g, ch => SAFE_CHAR_MAP[ch] ?? '_')
 }
 
 /** Sanitized single-line excerpt for meta attributes (root-message text,
- *  quotes). Sender-controlled → same sanitization as safeName, capped so a
- *  long root message can't balloon the <channel> payload. */
-function metaExcerpt(s: string): string {
-  return (safeName(s.replace(/\s+/g, ' ').trim()) ?? '').slice(0, 200)
+ *  quotes, transcripts). Sender-controlled → same sanitization as safeName,
+ *  capped so a long value can't balloon the <channel> payload. Truncation is
+ *  MARKED with a trailing `…` so the agent knows text was cut (#13). */
+function metaExcerpt(s: string, cap = 200): string {
+  const t = safeName(s.replace(/\s+/g, ' ').trim()) ?? ''
+  return t.length > cap ? t.slice(0, cap - 1) + '…' : t
 }
 
 /** Human display name for a Telegram user object: @username > full name > id. */
@@ -1476,8 +1490,10 @@ function replyForwardMeta(ctx: Context, attachmentFromReply: boolean): Record<st
       out.reply_to_user = safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)
     }
     const rootText = rt.text ?? rt.caption
-    const label = rootText ? metaExcerpt(rootText) : mediaKindLabel(rt)
-    if (label) out.reply_to_text = label
+    // Media-kind labels go through metaExcerpt too — a 255-char filename in
+    // `(document: …)` gets the same cap + … marker as plain text (#13).
+    const rawLabel = rootText ?? mediaKindLabel(rt)
+    if (rawLabel) out.reply_to_text = metaExcerpt(rawLabel)
     if (attachmentFromReply) out.attachment_origin = 'reply'
   }
   if (m.quote?.text) out.reply_quote = metaExcerpt(m.quote.text)
@@ -1507,6 +1523,14 @@ function replyForwardMeta(ctx: Context, attachmentFromReply: boolean): Record<st
   return out
 }
 
+/** A photo pending download: file_id/size survive a failed download so the
+ *  agent still gets attachment_file_id + image_error instead of silence (#2). */
+type ImageSource = {
+  file_id: string
+  size?: number
+  download: () => Promise<string>
+}
+
 // When a message replies to another message that carries a file (e.g. user
 // replies to an invoice PDF and @mentions the bot in the reply text), Telegram
 // keeps the file on the REPLIED-TO message, not the reply itself. The per-type
@@ -1516,7 +1540,7 @@ function replyForwardMeta(ctx: Context, attachmentFromReply: boolean): Record<st
 // everything else carries a file_id we can hand straight to download_attachment.
 function replyAttachment(ctx: Context): {
   attachment?: AttachmentMeta
-  downloadImage?: () => Promise<string | undefined>
+  image?: ImageSource
 } {
   const rt = ctx.message?.reply_to_message
   if (!rt) return {}
@@ -1542,24 +1566,13 @@ function replyAttachment(ctx: Context): {
   }
   if (rt.photo && rt.photo.length > 0) {
     const best = rt.photo[rt.photo.length - 1]
-    const downloadImage = async () => {
-      try {
-        const file = await ctx.api.getFile(best.file_id)
-        if (!file.file_path) return undefined
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
-        const buf = Buffer.from(await res.arrayBuffer())
-        const ext = file.file_path.split('.').pop() ?? 'jpg'
-        const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-        mkdirSync(INBOX_DIR, { recursive: true })
-        writeFileSync(path, buf)
-        return path
-      } catch (err) {
-        log('error', `reply photo download failed: ${err}`)
-        return undefined
-      }
+    return {
+      image: {
+        file_id: best.file_id,
+        size: best.file_size,
+        download: () => downloadPhotoToInbox(ctx, best),
+      },
     }
-    return { downloadImage }
   }
   return {}
 }
@@ -1567,9 +1580,9 @@ function replyAttachment(ctx: Context): {
 async function handleInbound(
   ctx: Context,
   text: string,
-  downloadImage: (() => Promise<string | undefined>) | undefined,
+  image: ImageSource | undefined,
   attachment?: AttachmentMeta,
-  /** true when attachment/downloadImage were pulled off the replied-to
+  /** true when attachment/image were pulled off the replied-to
    *  message (replyAttachment) rather than the message itself — emits
    *  attachment_origin="reply" so the agent knows whose file this is. */
   attachmentFromReply = false,
@@ -1673,7 +1686,23 @@ async function handleInbound(
     // routes via roamerGetCurrentTargetMcpSessionId().
   }
 
-  const imagePath = downloadImage ? await downloadImage() : undefined
+  // #2: a failed photo download used to vanish silently (no image_path, no
+  // marker, no file_id — the agent couldn't even tell a photo existed). Now
+  // the failure is MARKED (image_error) and the photo's file_id survives as
+  // attachment_file_id so the agent can retry via download_attachment.
+  let imagePath: string | undefined
+  let imageError: string | undefined
+  if (image) {
+    try {
+      imagePath = await image.download()
+    } catch (err) {
+      log('error', `photo download failed: ${err instanceof Error ? err.message : err}`)
+      imageError = 'download failed'
+    }
+  }
+
+  // #12 (opt-in): local whisper transcript for voice/audio attachments.
+  const voiceTranscript = await maybeTranscribeVoice(attachment)
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
@@ -1686,32 +1715,65 @@ async function handleInbound(
   // noise → attention bleeds onto reminder instead of user content → reply
   // tool calls drop. Stop hook (infrastructure-level seatbelt) remains as the
   // correct enforcement path; in-band content pollution is not.
-  const notification = {
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-        // Reply-root / forward-origin / album context (2026-07-10) — see
-        // replyForwardMeta. Without these the agent couldn't tell WHAT was
-        // being replied to, WHO originally wrote a forwarded message, or
-        // that N album photos belong together.
-        ...replyForwardMeta(ctx, attachmentFromReply && !!(attachment || downloadImage)),
-      },
-    },
+  const meta: Record<string, string> = {
+    chat_id,
+    ...(msgId != null ? { message_id: String(msgId) } : {}),
+    user: from.username ?? String(from.id),
+    user_id: String(from.id),
+    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    ...(imagePath ? { image_path: imagePath } : {}),
+    ...(imageError && image ? {
+      image_error: imageError,
+      // Don't collide with a real attachment (never the case today — photo
+      // messages carry no attachment param — but keep it defensive).
+      ...(attachment ? {} : {
+        attachment_kind: 'photo',
+        attachment_file_id: image.file_id,
+        ...(image.size != null ? { attachment_size: String(image.size) } : {}),
+      }),
+    } : {}),
+    ...(attachment ? {
+      attachment_kind: attachment.kind,
+      attachment_file_id: attachment.file_id,
+      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    } : {}),
+    ...(voiceTranscript ? { voice_transcript: voiceTranscript } : {}),
+    // Reply-root / forward-origin / album context (2026-07-10) — see
+    // replyForwardMeta. Without these the agent couldn't tell WHAT was
+    // being replied to, WHO originally wrote a forwarded message, or
+    // that N album photos belong together.
+    ...replyForwardMeta(ctx, attachmentFromReply && !!(attachment || image)),
   }
+
+  // #6: photos sharing a media_group_id are ONE album — buffer them briefly
+  // and deliver a SINGLE notification carrying image_path / image_path_2 / …
+  // instead of N disjoint messages. Single photos (no media_group_id) are
+  // completely unaffected. Reply-sourced images never aggregate (the album id
+  // belongs to the outer message, not the root's photo).
+  const mgid = ctx.message?.media_group_id
+  if (mgid && image && !attachmentFromReply) {
+    bufferAlbumItem(chat_id, String(mgid), {
+      caption: ctx.message?.caption,
+      imagePath,
+      fileId: image.file_id,
+      size: image.size,
+      meta,
+    })
+    return
+  }
+
+  await dispatchInbound(chat_id, {
+    method: 'notifications/claude/channel',
+    params: { content: text, meta },
+  })
+}
+
+// Route one inbound notification: roamer target session when ROAMER_MODE is
+// on, broadcast otherwise. Extracted from handleInbound so the album flush
+// timer (#6) dispatches through the exact same path.
+async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }): Promise<void> {
   // In ROAMER_MODE, route to the current target's MCP session only,
   // not broadcast. Each roamer keeps multiple bridged claudes alive
   // (one per ever-claimed target) but TG inbound goes only to whichever
@@ -1731,6 +1793,168 @@ async function handleInbound(
   }
 
   broadcastNotification(notification)
+}
+
+// ---- Album aggregation (#6) ------------------------------------------------
+// Telegram delivers an album as N separate photo messages sharing one
+// media_group_id, usually within a few hundred ms. Buffer them per
+// chat+album for ALBUM_WINDOW_MS after the LAST item (each new item resets
+// the timer) and flush as one notification:
+//   image_path / image_path_2 / … image_path_N  (album order)
+//   media_group_count                            (how many items aggregated)
+//   content = joined captions, or "(album: N photos)" when uncaptioned
+// A failed item keeps its position: image_error[_k] + attachment_file_id[_k].
+// Base meta (message_id/ts/reply/forward context) comes from the FIRST item.
+const ALBUM_WINDOW_MS = 1500
+
+type AlbumEntry = {
+  chatId: string
+  captions: string[]
+  items: Array<{ imagePath?: string; fileId: string; size?: number }>
+  baseMeta: Record<string, string>
+  timer: ReturnType<typeof setTimeout> | null
+}
+const albumBuffers = new Map<string, AlbumEntry>()
+
+function bufferAlbumItem(
+  chatId: string,
+  mgid: string,
+  item: { caption?: string; imagePath?: string; fileId: string; size?: number; meta: Record<string, string> },
+): void {
+  const key = `${chatId}:${mgid}`
+  let entry = albumBuffers.get(key)
+  if (!entry) {
+    entry = { chatId, captions: [], items: [], baseMeta: item.meta, timer: null }
+    albumBuffers.set(key, entry)
+  }
+  if (entry.timer) clearTimeout(entry.timer)
+  if (item.caption) entry.captions.push(item.caption)
+  entry.items.push({ imagePath: item.imagePath, fileId: item.fileId, size: item.size })
+  entry.timer = setTimeout(() => flushAlbum(key), ALBUM_WINDOW_MS)
+}
+
+function flushAlbum(key: string): void {
+  const entry = albumBuffers.get(key)
+  if (!entry) return
+  albumBuffers.delete(key)
+  const meta: Record<string, string> = { ...entry.baseMeta }
+  // Per-item image fields are rebuilt positionally below — drop the first
+  // item's own copies (incl. its failure markers) from the base.
+  delete meta.image_path
+  delete meta.image_error
+  delete meta.attachment_kind
+  delete meta.attachment_file_id
+  delete meta.attachment_size
+  meta.media_group_count = String(entry.items.length)
+  entry.items.forEach((it, i) => {
+    const suffix = i === 0 ? '' : `_${i + 1}`
+    if (it.imagePath) {
+      meta[`image_path${suffix}`] = it.imagePath
+    } else {
+      meta[`image_error${suffix}`] = 'download failed'
+      meta[`attachment_file_id${suffix}`] = it.fileId
+      if (it.size != null) meta[`attachment_size${suffix}`] = String(it.size)
+    }
+  })
+  const content = entry.captions.length > 0
+    ? entry.captions.join('\n')
+    : `(album: ${entry.items.length} photos)`
+  void dispatchInbound(entry.chatId, {
+    method: 'notifications/claude/channel',
+    params: { content, meta },
+  }).catch(err => log('error', `album flush dispatch failed: ${err}`))
+}
+
+// ---- Voice transcription (#12, opt-in) --------------------------------------
+// CHANNEL_BOT_VOICE_TRANSCRIBE=1 → voice/audio attachments are downloaded and
+// transcribed with LOCAL whisper; the text rides in meta as voice_transcript
+// (≤500 chars, metaExcerpt-sanitized). Default OFF — zero behavior change.
+// Failure never blocks delivery: the message still ships with its
+// attachment_file_id exactly as before, just without the transcript.
+//
+// Transcriber resolution (lightest WORKING path first):
+//   1. CHANNEL_BOT_TRANSCRIBE_CMD — executable taking the audio path as $1,
+//      printing the transcript to stdout (full operator override)
+//   2. local `whisper` CLI on CPU (CHANNEL_BOT_WHISPER_BIN to point at the
+//      binary if not on the daemon's PATH; CHANNEL_BOT_WHISPER_MODEL picks
+//      the model, default "small" — a voice note transcribes in seconds).
+// Why not media-alchemist's transcribe.sh: its local mode force-selects MPS
+// whenever torch reports it available, and current torch builds fail there
+// with SparseMPS NotImplementedError (whisper's sparse alignment_heads can't
+// .to("mps")) — verified broken 2026-07-10 on the Mac mini for both small and
+// large-v3. CPU whisper CLI is deterministic and fast enough for voice notes
+// (8s note → 7s wall with small).
+function isVoiceTranscribeEnabled(): boolean {
+  const v = (process.env.CHANNEL_BOT_VOICE_TRANSCRIBE ?? '').trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes'
+}
+
+const VOICE_TRANSCRIBE_TIMEOUT_MS = 240_000
+const VOICE_TRANSCRIPT_CAP = 500
+
+function execFileP(cmd: string, args: string[], timeout: number): Promise<{ stdout: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err)
+      else resolve({ stdout: String(stdout) })
+    })
+  })
+}
+
+async function transcribeVoiceFile(audioPath: string): Promise<string | undefined> {
+  const custom = (process.env.CHANNEL_BOT_TRANSCRIBE_CMD ?? '').trim()
+  if (custom) {
+    const { stdout } = await execFileP(custom, [audioPath], VOICE_TRANSCRIBE_TIMEOUT_MS)
+    return stdout.trim() || undefined
+  }
+  const whisperBin = (process.env.CHANNEL_BOT_WHISPER_BIN ?? '').trim() || 'whisper'
+  const model = (process.env.CHANNEL_BOT_WHISPER_MODEL ?? '').trim() || 'small'
+  const outDir = join(INBOX_DIR, 'transcripts')
+  mkdirSync(outDir, { recursive: true })
+  await execFileP(whisperBin, [
+    audioPath,
+    '--model', model,
+    '--device', 'cpu',
+    '--fp16', 'False',
+    '--output_format', 'txt',
+    '--output_dir', outDir,
+    '--verbose', 'False',
+  ], VOICE_TRANSCRIBE_TIMEOUT_MS)
+  // whisper writes <basename-without-ext>.txt into output_dir
+  const base = audioPath.split(sep).pop()!.replace(/\.[^.]+$/, '')
+  const outPath = join(outDir, `${base}.txt`)
+  try {
+    const text = readFileSync(outPath, 'utf8')
+    rmSync(outPath, { force: true })
+    return text.trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function maybeTranscribeVoice(attachment: AttachmentMeta | undefined): Promise<string | undefined> {
+  if (!attachment) return undefined
+  if (attachment.kind !== 'voice' && attachment.kind !== 'audio') return undefined
+  if (!isVoiceTranscribeEnabled()) return undefined
+  try {
+    const file = await bot.api.getFile(attachment.file_id)
+    if (!file.file_path) throw new Error('getFile returned no file_path')
+    const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const buf = Buffer.from(await res.arrayBuffer())
+    const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'oga'
+    const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'oga'
+    const audioPath = join(INBOX_DIR, `${Date.now()}-voice.${ext}`)
+    mkdirSync(INBOX_DIR, { recursive: true })
+    writeFileSync(audioPath, buf)
+    const raw = await transcribeVoiceFile(audioPath)
+    if (!raw) return undefined
+    return metaExcerpt(raw, VOICE_TRANSCRIPT_CAP)
+  } catch (err) {
+    log('warn', `voice transcribe failed (delivering without transcript): ${err instanceof Error ? err.message : err}`)
+    return undefined
+  }
 }
 
 // Route B fan-out (replay-queue-aware):
