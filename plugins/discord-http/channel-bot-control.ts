@@ -39,6 +39,7 @@
 
 import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 
 // ---- env-var configuration -----------------------------------------------
@@ -88,7 +89,19 @@ function runCommand(
 }
 
 /** tmux send-keys with Enter at the end (accepts optional tmuxName override). */
-async function tmuxSendKeys(text: string, tmuxName: string = TMUX_SESSION): Promise<void> {
+async function tmuxSendKeys(text: string, tmuxName: string = TMUX_SESSION, clearFirst = false): Promise<void> {
+  // clearFirst — 2026-07-03 (ported from telegram-http): a control slash
+  // (/model, /clear, ...) is typed AT THE CURSOR. If the user left a draft in
+  // the TUI input box, `send-keys "/model X" Enter` appends → the whole
+  // `<draft>/model X` line submits as a CHAT MESSAGE, the command never runs,
+  // and it looks stuck. Ctrl-U clears claude's input line. MUST be its own
+  // send-keys call: `send-keys Escape C-u` merges into an escape SEQUENCE and
+  // does nothing, and Escape also risks interrupting a running turn — so C-u
+  // alone, on its own call. NOT used by /input (raw passthrough stays verbatim).
+  if (clearFirst) {
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-u'])
+    await new Promise(r => setTimeout(r, 100))  // let the TUI apply the clear before typing
+  }
   const { exitCode, stderr } = await runCommand(
     ['tmux', 'send-keys', '-t', tmuxName, text, 'Enter'],
   )
@@ -123,15 +136,287 @@ async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION): Promis
   return /❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail)
 }
 
-async function autoConfirmYesNoPicker(tmuxName: string): Promise<boolean> {
-  for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 200))
-    if (await isYesNoConfirmPickerOpen(tmuxName)) {
-      await tmuxSendKeys('', tmuxName)
-      return true
+// (autoConfirmYesNoPicker — the old fire-and-forget picker poll — was removed
+// 2026-07-10, KEEP IN SYNC with telegram-http 1.12.0: subsumed by
+// runTuiSwitchCommand below, which waits for idle BEFORE typing and keeps
+// confirming/verifying until an honest outcome.)
+
+// ---- /model & /effort switch orchestration (ported from telegram-http 1.12.0) ----
+//
+// Root cause of Joey's "/model 幾乎都失敗" (reproduced on TG lab, claude 2.1.206):
+// a control slash typed while claude is MID-TURN is not executed — the TUI
+// puts it in the QUEUED MESSAGES buffer ("Press up to edit queued messages").
+// When the turn finally ends the queued command executes and (with enough
+// history) opens the "Switch model? / 1. Yes / 2. No, go back" picker — but by
+// then the old fire-and-forget auto-confirm window was long dead, so the
+// picker sat open forever and the session looked hung. Production agents are
+// almost always mid-turn when Joey sends /model ⇒ "幾乎都失敗".
+//
+// Fix: an orchestrator that (1) waits for idle BEFORE typing (no queueing),
+// (2) types the command, (3) watches for the confirm picker and Enters it
+// whenever it shows up (bounded but generous), (4) VERIFIES the switch took
+// effect (global settings.json for /model — claude 2.1.198+ persists the
+// choice there immediately; pane "Set model to …" line as fallback), and
+// (5) sends a follow-up Discord message reporting confirmed / unconfirmed
+// honestly. The immediate "已送" reply no longer claims success.
+
+/** How long we're willing to wait for claude to go idle before typing. */
+const SWITCH_IDLE_WAIT_MS = 10 * 60_000
+/** Post-type verification window (extended while the command sits queued). */
+const SWITCH_VERIFY_MS = 45_000
+/** Hard cap on the whole orchestration, idle-wait included. */
+const SWITCH_TOTAL_CAP_MS = 12 * 60_000
+
+/** Strip context-window suffixes like `[1m]` and lowercase, for comparisons. */
+function normalizeModelId(v: string): string {
+  return v.trim().toLowerCase().replace(/\[[0-9]+m\]$/, '')
+}
+
+/** `model` key of ~/.claude/settings.json — what claude TUI's /model persists. */
+function readGlobalDefaultModel(): string | null {
+  try {
+    const j = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
+    return typeof j?.model === 'string' && j.model ? j.model : null
+  } catch { return null }
+}
+
+/** Where we remember the last CONFIRMED /model switch (per-daemon). */
+function lastSwitchStatePath(): string {
+  const stateDir = process.env.DISCORD_STATE_DIR ?? process.env.TELEGRAM_STATE_DIR ?? ''
+  if (stateDir) return join(stateDir, 'last-model-switch.json')
+  return `/tmp/channel-bot-last-model-switch-${TMUX_SESSION || 'default'}.json`
+}
+
+function saveLastConfirmedSwitch(value: string): void {
+  try {
+    writeFileSync(lastSwitchStatePath(), JSON.stringify({ value, ts: Date.now() }), { mode: 0o644 })
+  } catch {}
+}
+
+function loadLastConfirmedSwitch(): { value: string; ts: number } | null {
+  try {
+    const j = JSON.parse(readFileSync(lastSwitchStatePath(), 'utf8'))
+    if (typeof j?.value === 'string' && typeof j?.ts === 'number') return j
+  } catch {}
+  return null
+}
+
+/**
+ * Best-effort "which model is this agent on right now" for the /model picker
+ * (Joey 2026-07-10: the picker must show the current model).
+ *
+ * Sources, newest-timestamp wins:
+ *  1. last CONFIRMED switch recorded by runTuiSwitchCommand (this daemon)
+ *  2. `message.model` of the newest assistant record in the current session
+ *     jsonl — the model that actually produced the agent's latest reply
+ *  3. global ~/.claude/settings.json `model` (what an un-pinned TUI inherits)
+ */
+export function detectCurrentModel(projectsDirOverride?: string): { id: string; source: string } | null {
+  let best: { id: string; source: string; ts: number } | null = null
+
+  const sw = loadLastConfirmedSwitch()
+  if (sw && sw.value !== 'default') best = { id: sw.value, source: '剛切換（TUI 已確認）', ts: sw.ts }
+
+  const dir = projectsDirOverride ?? PROJECTS_DIR
+  const sid = dir ? currentSessionId(dir) : null
+  if (dir && sid) {
+    const recs = readJsonlTail(join(dir, `${sid}.jsonl`), 80, 1024 * 1024)
+    for (let i = recs.length - 1; i >= 0; i--) {
+      const r: any = recs[i]
+      const model = r?.message?.model
+      if (r?.type === 'assistant' && typeof model === 'string' && model) {
+        const ts = Date.parse(r?.timestamp ?? '') || 0
+        if (!best || ts > best.ts) best = { id: model, source: '本 session 最近回覆實際使用', ts }
+        break
+      }
     }
   }
-  return false
+
+  // Global default competes by settings.json mtime: if the default changed
+  // AFTER this agent's last reply (another bot's /model, manual edit, or a
+  // restart-inheritance), it is the freshest signal. An un-pinned TUI adopts
+  // it on its next start, so label it honestly as the default, not a
+  // guarantee of the live TUI value.
+  const g = readGlobalDefaultModel()
+  if (g) {
+    let mtime = 0
+    try { mtime = statSync(join(homedir(), '.claude', 'settings.json')).mtimeMs } catch {}
+    if (!best || mtime > best.ts) best = { id: g, source: '全域預設（未 pin 的 TUI 重啟後採用）', ts: mtime }
+  }
+  return best ? { id: best.id, source: best.source } : null
+}
+
+/**
+ * Execute `/model X` or `/effort X` against the TUI reliably, then report the
+ * REAL outcome to the user. Designed to be run in the background (caller
+ * replies immediately). Never throws — all outcomes end in a notify().
+ */
+async function runTuiSwitchCommand(opts: {
+  cmd: string
+  value: string
+  tmuxName: string
+  notify: (msg: string) => Promise<void>
+}): Promise<void> {
+  const { cmd, value, tmuxName, notify } = opts
+  const t0 = Date.now()
+  const full = `${cmd} ${value}`
+  try {
+    // Phase 1 — wait for idle. Typing mid-turn queues the command as a chat
+    // message (2.1.206) instead of executing it: the original failure.
+    let idleOk = false
+    while (Date.now() - t0 < SWITCH_IDLE_WAIT_MS) {
+      // A leftover Yes/No confirm picker from an earlier wedged switch blocks
+      // everything — dismiss it (Escape = "No, go back": safe, non-destructive).
+      if (await isYesNoConfirmPickerOpen(tmuxName)) {
+        await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
+        await new Promise(r => setTimeout(r, 500))
+        continue
+      }
+      if (!(await isClaudeBusy(tmuxName))) { idleOk = true; break }
+      await new Promise(r => setTimeout(r, 1000))
+    }
+    if (!idleOk) {
+      await notify(
+        `❌ \`${full}\` 未執行 — claude 忙碌超過 ${Math.round(SWITCH_IDLE_WAIT_MS / 60000)} 分鐘，` +
+        `為避免指令被排進訊息佇列造成卡死，已放棄。等 turn 結束後再試一次。`,
+      )
+      return
+    }
+
+    // Phase 2 — snapshot + type (Ctrl-U clears any draft first).
+    // The pane-evidence BASELINE must be taken before typing: scrollback may
+    // already contain an identical old `/model X` + "Set model to …" from an
+    // earlier switch, and matching those would false-confirm (hit on TG lab
+    // 2026-07-10 — only evidence FRESHER than this baseline may count).
+    const setLineRe = /Set (model|effort)[^\n]*/g
+    const countSetLines = (pane: string): number => (pane.match(setLineRe) ?? []).length
+    const baselineSetLines = countSetLines(await tmuxCapturePane(tmuxName))
+    const prevModel = readGlobalDefaultModel()
+    await tmuxSendKeys(full, tmuxName, true)
+
+    // Phase 3 — watch for outcome. Confirm the Yes/No picker whenever it
+    // appears; verify via settings.json (/model) or a fresh "Set model/effort"
+    // pane line. If the command still ended up queued (race: a new inbound
+    // started a turn between the idle check and our keystroke), keep watching
+    // until the queue flushes, within the total cap.
+    const isModel = cmd === '/model'
+    const wantSettings = isModel && value !== 'default'
+    let deadline = Date.now() + SWITCH_VERIFY_MS
+    let confirmedPicker = false
+    let confirmed: string | null = null
+    while (Date.now() < deadline && Date.now() - t0 < SWITCH_TOTAL_CAP_MS) {
+      await new Promise(r => setTimeout(r, 400))
+
+      if (await isYesNoConfirmPickerOpen(tmuxName)) {
+        await tmuxSendKeys('', tmuxName)  // bare Enter — default cursor is on "Yes"
+        confirmedPicker = true
+        continue
+      }
+
+      if (wantSettings) {
+        // PRIMARY evidence for /model: claude persists the choice to global
+        // settings.json the moment the switch applies. Filesystem truth — no
+        // pane-parsing ambiguity.
+        const cur = readGlobalDefaultModel()
+        if (cur && normalizeModelId(cur) === normalizeModelId(value)) {
+          confirmed = `settings.json → \`${cur}\``
+          break
+        }
+      }
+      const pane = await tmuxCapturePane(tmuxName)
+      // Secondary evidence (and primary for /effort and `/model default`):
+      // a "Set model/effort …" line COUNT above the pre-type baseline — old
+      // identical lines in scrollback don't count.
+      if (countSetLines(pane) > baselineSetLines) {
+        const all = pane.match(setLineRe) ?? []
+        confirmed = `TUI:「${(all[all.length - 1] ?? '').trim().slice(0, 80)}」`
+        break
+      }
+      // Command got queued behind a racing turn — extend the watch window.
+      if (/Press up to edit queued messages/.test(pane)) {
+        deadline = Date.now() + SWITCH_VERIFY_MS
+      }
+    }
+
+    if (confirmed) {
+      if (isModel) saveLastConfirmedSwitch(value)
+      await notify(`✅ \`${full}\` 已生效（${confirmed}${confirmedPicker ? '，切換確認已自動按 Enter' : ''}）`)
+      if (isModel && prevModel && normalizeModelId(prevModel) !== normalizeModelId(value) && value !== 'default') {
+        await notify(
+          `⚠️ 注意：claude 的 /model 會把 \`${value}\` 存成整台機器的全域預設（原本是 \`${prevModel}\`）— ` +
+          `其他未 pin --model 的 agent 下次重啟會繼承。`,
+        )
+      }
+    } else {
+      const pane = await tmuxCapturePane(tmuxName)
+      const tail = pane.split('\n').map(l => l.trim()).filter(Boolean).slice(-3).join(' ⏎ ')
+      await notify(
+        `⚠️ \`${full}\` 已送出，但 ${Math.round((Date.now() - t0) / 1000)}s 內未觀察到生效證據` +
+        `（settings.json 未變、TUI 沒有 Set model/effort 回應）。可能 model id 無效或 TUI 狀態異常。\n` +
+        `pane 尾部：${tail.slice(0, 200)}`,
+      )
+    }
+  } catch (err) {
+    await notify(`❌ \`${full}\` 執行過程出錯: ${err instanceof Error ? err.message : err}`).catch(() => {})
+  }
+}
+
+/**
+ * /codexgate — type `/codex:setup --enable-review-gate` into the attached
+ * claude TUI (ported from telegram-http 1.12.0, Joey 2026-07-10 P5). Same
+ * busy-safety as runTuiSwitchCommand: wait for idle so the command isn't
+ * queued as a chat message, type it, then verify the TUI actually
+ * received/echoed it (fresh occurrence count vs a pre-type baseline — old
+ * scrollback doesn't count) and report honestly.
+ */
+async function runCodexGate(tmuxName: string, notify: (msg: string) => Promise<void>): Promise<void> {
+  const t0 = Date.now()
+  try {
+    let idleOk = false
+    while (Date.now() - t0 < SWITCH_IDLE_WAIT_MS) {
+      if (await isYesNoConfirmPickerOpen(tmuxName)) {
+        await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
+        await new Promise(r => setTimeout(r, 500))
+        continue
+      }
+      if (!(await isClaudeBusy(tmuxName))) { idleOk = true; break }
+      await new Promise(r => setTimeout(r, 1000))
+    }
+    if (!idleOk) {
+      await notify(
+        `❌ \`/codexgate\` 未執行 — claude 忙碌超過 ${Math.round(SWITCH_IDLE_WAIT_MS / 60000)} 分鐘，等 turn 結束後再試。`,
+      )
+      return
+    }
+
+    const countGateLines = (pane: string): number => (pane.match(/codex:setup/g) ?? []).length
+    const baseline = countGateLines(await tmuxCapturePane(tmuxName))
+    await tmuxSendKeys(CODEX_GATE_TUI_CMD, tmuxName, true)
+
+    let deadline = Date.now() + SWITCH_VERIFY_MS
+    let seen = false
+    while (Date.now() < deadline && Date.now() - t0 < SWITCH_TOTAL_CAP_MS) {
+      await new Promise(r => setTimeout(r, 400))
+      const pane = await tmuxCapturePane(tmuxName)
+      const queued = /Press up to edit queued messages/.test(pane)
+      if (queued) { deadline = Date.now() + SWITCH_VERIFY_MS; continue }
+      if (countGateLines(pane) > baseline) { seen = true; break }
+    }
+
+    if (seen) {
+      await notify(
+        `✅ \`/codexgate\` — 已在 ${tmuxName} 執行 \`${CODEX_GATE_TUI_CMD}\`（TUI 已收到，Codex stop-time review gate 開啟中）`,
+      )
+    } else {
+      const pane = await tmuxCapturePane(tmuxName)
+      const tail = pane.split('\n').map(l => l.trim()).filter(Boolean).slice(-3).join(' ⏎ ')
+      await notify(
+        `⚠️ \`${CODEX_GATE_TUI_CMD}\` 已送出但 ${Math.round((Date.now() - t0) / 1000)}s 內未在 TUI 觀察到執行痕跡。pane 尾部：${tail.slice(0, 200)}`,
+      )
+    }
+  } catch (err) {
+    await notify(`❌ /codexgate 執行過程出錯: ${err instanceof Error ? err.message : err}`).catch(() => {})
+  }
 }
 
 async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
@@ -145,10 +430,23 @@ async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
 
   if (!/❯\s/.test(tail)) return true
 
-  // Active-only indicators. Previous regex matched `✻ Crunched for ...`
-  // (past-tense completion marker) as busy → false positive after a turn.
-  if (/\(esc to interrupt\)/.test(tail)) return true
-  if (/[✻✢]\s+\w+ing\b/.test(tail)) return true
+  // Active-only busy indicators (KEEP IN SYNC with telegram-http 1.12.0):
+  //   - `esc to interrupt` — canonical "claude is actively processing" footer.
+  //     2.1.198-era footers wrapped it in parens `(esc to interrupt)`; claude
+  //     2.1.206 renders it bare in the status bar (`… · esc to interrupt · …`).
+  //     Match WITHOUT parens so both generations register as busy (verified on
+  //     TG lab 2026-07-10 — the paren-only regex called a mid-turn 2.1.206 idle).
+  //   - `✻/✢/✶/✽ <verb>ing` — present-continuous spinner (Crunching, Creating…).
+  //     2.1.206 rotates through more spinner glyphs (✶ observed live).
+  //   - `Press up to edit queued messages` — input already queued behind an
+  //     active turn ⇒ definitely busy (2.1.206 queued-state marker).
+  //   - `Calling .*plugin` — active plugin call
+  //
+  // Previous regex matched `✻ Crunched for ...` (past-tense completion marker)
+  // as busy → false positive after a turn.
+  if (/esc to interrupt/.test(tail)) return true
+  if (/[✻✢✶✽✳✱∗]\s+\w+ing\b/.test(tail)) return true
+  if (/Press up to edit queued messages/.test(tail)) return true
   if (/Calling .*plugin/.test(tail)) return true
   return false
 }
@@ -162,13 +460,51 @@ const SHARED_TUI_SENDABLE = new Set([
   '/clear', '/agents', '/mcp', '/resume', '/help', '/init', '/compact',
 ])
 const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
+
+/**
+ * Model options offered by the bare `/model` inline keyboard (ported from
+ * telegram-http; Joey 2026-07-02 msg 2434: typing exact model ids from memory
+ * is hostile UX — tap to pick). Override without a code change via
+ * CHANNEL_BOT_MODEL_CHOICES, format:
+ *   "Label=value|Label=value"  e.g. "Fable 5=claude-fable-5|Opus=claude-opus-4-8"
+ * Values are what gets typed after `/model ` in the claude TUI (alias or full id).
+ */
+const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
+  { label: '🌟 Fable 5', value: 'claude-fable-5' },
+  { label: '🏛️ Opus 4.8', value: 'claude-opus-4-8' },
+  { label: '🎼 Sonnet 5', value: 'claude-sonnet-5' },
+  { label: '⚡ Haiku 4.5', value: 'claude-haiku-4-5-20251001' },
+  { label: '↩️ Default（回 TUI 預設）', value: 'default' },
+]
+
+export function modelChoices(): Array<{ label: string; value: string }> {
+  const raw = process.env.CHANNEL_BOT_MODEL_CHOICES
+  if (!raw) return DEFAULT_MODEL_CHOICES
+  const parsed = raw
+    .split('|')
+    .map(pair => {
+      const eq = pair.indexOf('=')
+      if (eq <= 0) return null
+      return { label: pair.slice(0, eq).trim(), value: pair.slice(eq + 1).trim() }
+    })
+    .filter((x): x is { label: string; value: string } => !!x && !!x.label && !!x.value)
+  return parsed.length > 0 ? parsed : DEFAULT_MODEL_CHOICES
+}
+
 const SHARED_TUI_CTRL_KEY: Record<string, string> = {
   '/sigint': 'C-c',
   '/cancel': 'C-c',
 }
 
+/**
+ * /codexgate → types this into the attached claude TUI (Joey 2026-07-10 P5).
+ * Kept as an alias on Discord too (parity with TG, where bot commands can't
+ * contain a colon). Enables the codex plugin's stop-time review gate.
+ */
+const CODEX_GATE_TUI_CMD = '/codex:setup --enable-review-gate'
+
 export function sharedTuiCommands(): string[] {
-  return ['/input', ...SHARED_TUI_SENDABLE, ...SHARED_TUI_SENDABLE_WITH_ARG, ...Object.keys(SHARED_TUI_CTRL_KEY)].sort()
+  return ['/input', '/codexgate', ...SHARED_TUI_SENDABLE, ...SHARED_TUI_SENDABLE_WITH_ARG, ...Object.keys(SHARED_TUI_CTRL_KEY)].sort()
 }
 
 /**
@@ -245,6 +581,20 @@ export async function forwardSharedTuiSlash(
   const cmd = rawCmd.toLowerCase()
   const args = rest.join(' ').trim()
 
+  // /codexgate — enable the Codex stop-time review gate on the attached
+  // claude (types /codex:setup --enable-review-gate). Busy-safe + verified
+  // in the background like /model. KEEP IN SYNC with telegram-http 1.12.0.
+  if (cmd === '/codexgate') {
+    const busyNow = await isClaudeBusy(tmuxName)
+    await replyToTg(
+      busyNow
+        ? `🕐 claude 正在跑 turn — /codexgate 已排程，等 turn 結束後送 \`${CODEX_GATE_TUI_CMD}\`，結果會再通知`
+        : `📤 /codexgate — 正在送 \`${CODEX_GATE_TUI_CMD}\` 到 ${tmuxName}，結果稍後通知`,
+    )
+    void runCodexGate(tmuxName, msg => replyToTg(msg))
+    return true
+  }
+
   if (cmd in SHARED_TUI_CTRL_KEY) {
     try {
       await tmuxSendCtrlKey(SHARED_TUI_CTRL_KEY[cmd], tmuxName)
@@ -260,7 +610,7 @@ export async function forwardSharedTuiSlash(
     // KEEP IN SYNC with telegram-http. Joey 2026-05-26 msg 1656/1657.
     if (cmd === '/resume' && args) return false
     try {
-      await tmuxSendKeys(cmd, tmuxName)
+      await tmuxSendKeys(cmd, tmuxName, true)  // clearFirst: drop any draft so the command isn't polluted
       await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
     } catch (err) {
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
@@ -270,15 +620,50 @@ export async function forwardSharedTuiSlash(
 
   if (SHARED_TUI_SENDABLE_WITH_ARG.has(cmd)) {
     if (!args) {
+      // Bare `/model` → tap-to-pick inline buttons (Joey 2026-07-02 msg 2434:
+      // "我哪知道準確的代號是什麼"). Channel-bot mode only (fixed TMUX_SESSION):
+      // the `model:` callback routes through handleCallbackData → TMUX_SESSION,
+      // which would mis-target in roamer mode, so roamer keeps the usage text.
+      if (cmd === '/model' && tmuxName === TMUX_SESSION && isControlEnabled()) {
+        // Mark the current model on its button + a status line (Joey
+        // 2026-07-10: "選單要能看出目前是哪個模型").
+        const current = detectCurrentModel()
+        const curNorm = current ? normalizeModelId(current.id) : null
+        const keyboard: InlineButton[][] = modelChoices().map(c => {
+          const isCur = curNorm !== null && c.value !== 'default' && normalizeModelId(c.value) === curNorm
+          return [{ text: isCur ? `✅ ${c.label}（目前）` : c.label, callback_data: `model:${c.value}` }]
+        })
+        const curLine = current
+          ? `目前模型：\`${current.id}\`（${current.source}）\n`
+          : '目前模型：無法判定（尚無本 session 回覆紀錄）\n'
+        await replyToTg(
+          '🎛️ 點一個模型切換（或手動 `/model <id>`）：\n' +
+            curLine +
+            '⚠️ claude 的 /model 會把選擇存成「全域預設」— 這台機器所有 agent 下次重啟都會用它（有 --model pin 的除外）。',
+          { keyboard },
+        )
+        return true
+      }
       await replyToTg(`usage: \`${cmd} <value>\``)
       return true
     }
     try {
-      await tmuxSendKeys(`${cmd} ${args}`, tmuxName)
-      // Auto-confirm Yes/No picker (see telegram-http). KEEP IN SYNC.
-      const confirmed = await autoConfirmYesNoPicker(tmuxName)
-      const suffix = confirmed ? ' (auto-confirmed picker)' : ''
-      await replyToTg(`✅ 已送 \`${cmd} ${args}\` 到 ${tmuxName}${suffix}`)
+      // 2026-07-10 rework (KEEP IN SYNC with telegram-http 1.12.0): do NOT
+      // type immediately — claude 2.1.206 queues a mid-turn slash as a chat
+      // message instead of executing it, and the confirm picker can appear
+      // only after the current turn ends (past any short auto-confirm window)
+      // → stuck picker + "switch failed". runTuiSwitchCommand waits for idle,
+      // types, confirms the picker whenever it appears, VERIFIES the switch
+      // (settings.json / pane), and follows up with an honest ✅/⚠️
+      // notification. We reply immediately so the user knows the command was
+      // accepted (but no longer claim it was "sent").
+      const busyNow = await isClaudeBusy(tmuxName)
+      await replyToTg(
+        busyNow
+          ? `🕐 claude 正在跑 turn — \`${cmd} ${args}\` 已排程，等 turn 結束後執行（最多等 ${Math.round(SWITCH_IDLE_WAIT_MS / 60000)} 分鐘），結果會再通知`
+          : `📤 已送 \`${cmd} ${args}\` 到 ${tmuxName} — 生效與否稍後通知`,
+      )
+      void runTuiSwitchCommand({ cmd, value: args, tmuxName, notify: msg => replyToTg(msg) })
     } catch (err) {
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }
@@ -893,6 +1278,22 @@ export async function handleCallbackData(
   httpPort: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
 ): Promise<boolean> {
+  // `model:<value>` — emitted by the bare-`/model` inline buttons. Reuse the
+  // `/model <value>` slash path (busy-safe orchestration) so logic isn't forked.
+  if (data.startsWith('model:')) {
+    const value = data.slice('model:'.length).trim()
+    if (!value) {
+      await replyToTg('❌ empty model value in callback data')
+      return true
+    }
+    // Model ids/aliases only — defense against forged callback payloads
+    // (send-keys with shell-ish chars must never reach tmux).
+    if (!/^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)) {
+      await replyToTg(`❌ invalid model value in callback: \`${value.slice(0, 60)}\``)
+      return true
+    }
+    return handleControlSlash(`/model ${value}`, httpPort, replyToTg)
+  }
   if (!data.startsWith('resume:')) return false
   const uuidPrefix = data.slice('resume:'.length).trim()
   if (!uuidPrefix) {
@@ -915,7 +1316,8 @@ export function controlCommandsForBotApi(): Array<{
   return [
     { command: 'input', description: 'send raw text to tmux (multi-line, passthrough — bypasses plugin interception)' },
     { command: 'clear', description: 'clear claude TUI conversation (sends /clear via tmux)' },
-    { command: 'model', description: 'switch claude model (/model <name>)' },
+    { command: 'model', description: 'switch claude model — tap-to-pick buttons, or /model <id>' },
+    { command: 'codexgate', description: 'enable Codex stop-time review gate (/codex:setup --enable-review-gate)' },
     { command: 'effort', description: 'switch claude effort level (/effort <low|med|high|max>)' },
     { command: 'agents', description: 'open claude agents picker' },
     { command: 'mcp', description: 'show MCP servers status in claude' },

@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.12.0 — 2026-07-10
+
+Ported from [telegram-http 1.12.0](../telegram-http/CHANGELOG.md) (version jump
+1.6.x → 1.12.0 re-aligns with the companion plugin, same convention as the
+1.2.x → 1.5.0 jump). The TG side of this logic was reproduced + verified on
+lab bots 2026-07-10; the DC port is the same orchestration code verbatim
+(shared tmux/claude-TUI mechanics, protocol-independent), verified here by
+strict typecheck + unit tests + daemon smoke-boot — **not** re-tested against
+a live Discord bot (no DC lab bot exists on this machine).
+
+### Fixed — /model & /effort "幾乎都失敗" on claude 2.1.206
+
+A control slash typed while claude is MID-TURN is queued as a CHAT message
+("Press up to edit queued messages"); when the turn ends the queued command
+opens the "Switch model?" confirm picker after the old ~3s fire-and-forget
+auto-confirm window (DC's was even shorter than TG's 25s) is long dead →
+picker stuck forever. `runTuiSwitchCommand` now waits for idle BEFORE typing
+(≤10min; dismisses leftover confirm pickers), types with Ctrl-U draft-clear,
+Enter-confirms the picker whenever it appears, and VERIFIES the switch took
+effect. `isClaudeBusy()` updated for 2.1.206 markers (paren-less
+`esc to interrupt`, new spinner glyphs, queued-state marker).
+
+### Added — real switch-outcome notification
+
+Immediate reply only says sent/scheduled; a follow-up reports the VERIFIED
+outcome: ✅ with evidence (global settings.json `model` flip, or a fresh
+"Set model/effort …" pane line counted against a pre-type baseline so stale
+scrollback can't false-confirm), or ⚠️ "sent but unconfirmed" with pane tail.
+Confirmed /model switches also warn the value became the machine-wide global
+default.
+
+### Added — bare /model tap-to-pick buttons with current-model marker
+
+DC previously had NO bare-`/model` picker (usage text only). Ported the TG
+inline keyboard (`modelChoices()`, `CHANNEL_BOT_MODEL_CHOICES` env override)
+including the 1.12.0 current-model marker: `✅ <label>（目前）` on the active
+model + a `目前模型: <id>（source）` line. Detection, newest wins: last
+confirmed switch (state file, DISCORD_STATE_DIR first) → newest assistant
+record's `message.model` in the current session jsonl → global settings.json
+default. `model:<value>` button callbacks are validated (id-charset regex)
+and routed through the same busy-safe /model path.
+
+### Fixed — roamer takeover killed the target tmux & kicked attached humans
+
+`/roam` takeover of an existing-but-unbridged tmux did `tmux kill-session`
+(iron-rule violation: never touch attached sessions). Now uses
+`tmux respawn-pane -k` — only the pane process is replaced; the session and
+any attached client survive; relaunched claude joins the bridge with
+`--resume` continuity.
+
+### Changed — roamer /restart & /kill_stuck = full target restart with auto reconnect
+
+Both now do a FULL restart of the roamer-managed target from persisted
+metadata (tmux/cwd/session_id in the roamer state file): kill + recreate the
+SAME-NAMED tmux (tmux itself may be the wedged part; dead targets are
+rebuildable — no early-out on a missing tmux), relaunch a bridged claude with
+`--resume`, auto re-bridge, keep chatting — no re-/roam needed.
+
+### Added — /codexgate command
+
+`/codexgate` types `/codex:setup --enable-review-gate` into the attached
+claude — channel-bot and roamer modes. Same busy-safety as /model plus a
+verified follow-up (fresh pane-echo evidence vs a pre-type baseline).
+
 ## 1.6.5 — 2026-07-03
 
 ### Added — auto-reclaim pre-fix log bloat on daemon start (no manual script)

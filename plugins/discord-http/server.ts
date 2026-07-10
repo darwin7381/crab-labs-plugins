@@ -1018,9 +1018,12 @@ client.on('error', err => {
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
 
-  // resume: + roam: callbacks. In roamer mode both go through roamer.
-  // In channel-bot mode resume: goes to channel-bot's handleCallbackData.
-  if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('roam:')) {
+  // resume: + roam: + model: callbacks. In roamer mode, resume:/roam: go
+  // through the roamer handler (it drives the picker against the dynamic
+  // current_target tmux). In channel-bot mode, resume:/model: go to
+  // channel-bot's handleCallbackData (fixed TMUX_SESSION). model: is only
+  // ever emitted in channel-bot mode (see forwardSharedTuiSlash guard).
+  if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('roam:') || interaction.customId.startsWith('model:')) {
     const access = loadAccess()
     if (!access.allowFrom.includes(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
@@ -1033,9 +1036,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     }
     try {
       await interaction.deferUpdate().catch(() => {})
-      if (isRoamerEnabled()) {
+      if (isRoamerEnabled() && !interaction.customId.startsWith('model:')) {
         await handleRoamerCallback(interaction.customId, replyToDc)
-      } else if (interaction.customId.startsWith('resume:')) {
+      } else if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('model:')) {
         await handleCallbackData(interaction.customId, httpPort, replyToDc)
       }
     } catch (err) {
