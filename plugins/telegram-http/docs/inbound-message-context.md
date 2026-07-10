@@ -1,4 +1,4 @@
-# Inbound message context — reply / forward / album attributes (1.13.0+)
+# Inbound message context — reply / forward / album attributes (1.13.0+, hardened 1.14.0)
 
 Every Telegram message the daemon delivers to claude arrives as a
 `notifications/claude/channel` notification, rendered in the session as:
@@ -29,9 +29,11 @@ and which messages belong to one album.
 | Attribute | Meaning |
 |---|---|
 | `image_path` | photo already downloaded — just `Read` this path |
-| `attachment_kind` | `document` / `video` / `audio` / `voice` / `video_note` / `sticker` / `animation` |
+| `image_error="download failed"` (1.14.0) | the photo could NOT be downloaded. The tag also carries `attachment_kind="photo"` + `attachment_file_id` (+ `attachment_size`) so you can retry via `download_attachment`. **Tell the sender explicitly the image didn't come through — never answer as if you saw it.** |
+| `attachment_kind` | `photo` (only on download failure) / `document` / `video` / `audio` / `voice` / `video_note` / `sticker` / `animation` |
 | `attachment_file_id` | pass to the `download_attachment` tool, then `Read` the returned path (bot downloads cap at 20MB) |
 | `attachment_size` / `attachment_mime` / `attachment_name` | as reported by Telegram (name is sanitized) |
+| `voice_transcript` (1.14.0, opt-in) | local speech-to-text of a `voice`/`audio` attachment, ≤500 chars (truncation marked with a trailing `…`). Present only when the daemon runs with `CHANNEL_BOT_VOICE_TRANSCRIBE=1`. Treat it as what the sender said; download the audio only if you need the original. Transcription failure never blocks delivery — the message just arrives without the attribute. |
 
 ### Reply context (message is a Telegram reply)
 
@@ -55,9 +57,21 @@ and which messages belong to one album.
 
 ### Album context
 
+Since **1.14.0** a PHOTO album is aggregated daemon-side (items buffered
+~1.5s after the last one) and delivered as **ONE** `<channel>` message:
+
 | Attribute | Meaning |
 |---|---|
-| `media_group_id` | messages sharing this id are ONE album sent together. Each album item still arrives as its own `<channel>` message (own `message_id`, own `image_path`/`attachment_*`). |
+| `media_group_id` | Telegram's album correlation id |
+| `media_group_count` | how many photos were aggregated into this message |
+| `image_path`, `image_path_2`, … `image_path_N` | the downloaded photos, in album order — `Read` them all |
+| `image_error[_k]` + `attachment_file_id[_k]` | item k failed to download; its file_id is preserved for `download_attachment` retry |
+
+Body = the album's caption(s) joined, or `(album: N photos)` when uncaptioned.
+Base attributes (`message_id`, `ts`, reply/forward context) come from the
+FIRST item. Single photos (no `media_group_id`) are unaffected. Non-photo
+album items (e.g. video/document albums) still arrive as separate messages
+each carrying `media_group_id`, as in 1.13.0.
 
 ## How the agent should read these
 
@@ -87,9 +101,15 @@ silent MPEG4) is a proper attachment (`attachment_kind="animation"`).
 
 ## Integrity notes
 
-- All sender-controlled values (names, excerpts, quotes) are sanitized
-  (`<>[]\r\n;` stripped) so they cannot break out of the `<channel>` tag, and
-  excerpts are capped at 200 chars so payload size stays bounded.
+- All sender-controlled values (names, excerpts, quotes) are sanitized so
+  they cannot break out of the `<channel>` tag. Since 1.14.0 the delimiter
+  chars `<>[];` are replaced with readable FULL-WIDTH lookalikes（＜＞［］；）
+  instead of `_`, so `re[port]<v2>.txt` stays legible as
+  `re［port］＜v2＞.txt`; `\r\n` become spaces. Quote/paren characters pass
+  through untouched.
+- Excerpts (`reply_to_text`, `reply_quote`, media-kind labels) are capped at
+  200 chars; `voice_transcript` at 500. Since 1.14.0 a value that was
+  actually cut ends with `…` so truncation is visible.
 - Attributes appear only when applicable — absence of `forward_origin` means
   the message is not a forward.
 - Not independently verified in lab: `forward_origin="hidden_user"` and
