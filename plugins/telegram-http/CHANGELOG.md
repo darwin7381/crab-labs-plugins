@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.14.2 — 2026-07-10
+
+### Fixed — roamer falsely warns "尚未連線 target" while roam is actually connected
+
+Joey: "最近明明 roam 連著，但有時候我傳訊息他會彈出沒連叫我再一次 roam." Root cause:
+the target's MCP session is tracked in the in-memory `tmuxToMcpSession` map,
+which is written ONLY on the takeover path and is emptied by any daemon
+restart — while `current_target` is persisted on disk. So a daemon restart (we
+restarted 4–5× today deploying 1.12→1.14.1), or ANY plain MCP reconnect of an
+already-claimed target (SSE drop, zombie-GC eviction + reconnect), left the
+target alive and re-bridged but UNMAPPED in memory. `getCurrentTargetMcp
+SessionId()` returned null and `dispatchInbound` replied "尚未連線 target"
+persistently, until the next `/roam` re-claimed. Confirmed in the production
+time_travelers logs: across 4 daemon restarts the same target claude
+reconnected each time with NO "claimed for pending takeover" line — every
+message in those windows would have hit the false warning.
+
+Fix: `dispatchInbound` now resolves the target via
+`resolveCurrentTargetMcpSession(activeSessionIds)`, which self-repairs the map:
+if `current_target` is genuinely alive (tmux + claude pid) but unmapped, it
+re-adopts the reconnected MCP session (only when there's a single unambiguous
+unclaimed active session — never guesses between multiple bridged claudes) and
+routes normally. A live target whose bridge is still mid-reconnect gets an
+honest "連線重整中，稍等幾秒" reply (with a brief internal retry) instead of the
+misleading /roam prompt; only a genuinely-dead target is told to /roam.
+Lab-verified before/after on the same action (roam a target → restart daemon →
+send without re-/roam): pre-fix → false "尚未連線"; post-fix → message routes to
+the target and it replies (daemon logs "re-adopted reconnected session … map
+was out of sync"), mid-reconnect → honest "連線重整中".
+
 ## 1.14.1
 
 - **system-alert: surface Claude's OWN human usage-limit message, not the raw provider 429 string.** When Claude hits a usage/rate limit it writes a human-readable assistant record (`isApiErrorMessage: true`, e.g. "You've hit your weekly limit · resets Jun 9 at 6am (Asia/Taipei)"). The jsonl-tail layer now forwards that verbatim, and the OTLP layer suppresses the raw HTTP 429 "exceed your account's rate limit" string (which named the wrong problem). Login/refusal/other-status api_error alerts unchanged. (Joey 2026-07-10)

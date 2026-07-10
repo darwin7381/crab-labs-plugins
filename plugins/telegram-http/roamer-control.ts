@@ -391,6 +391,68 @@ export function getCurrentTargetMcpSessionId(): string | null {
   return tmuxToMcpSession.get(state.current_target.tmux) ?? null
 }
 
+export type TargetResolution =
+  | { sessionId: string; status: 'healthy' | 'repaired' }
+  | { sessionId: null; status: 'no-target' | 'target-dead' | 'no-bridge' }
+
+/**
+ * Resolve the MCP session to route TG inbound to, REPAIRING the in-memory
+ * `tmuxToMcpSession` map when it has fallen out of sync with the persisted
+ * `current_target` (Joey 2026-07-10: "明明 roam 連著… 卻彈出沒連叫我再 /roam").
+ *
+ * Root cause: the map is written ONLY on the takeover path (onNewMcpSession +
+ * pendingTakeover) and lives in daemon memory, while `current_target` is
+ * persisted on disk. So a daemon restart — or ANY plain MCP reconnect of an
+ * already-claimed target (SSE drop, zombie-GC eviction+reconnect) — leaves the
+ * target alive and bridged on disk but UNMAPPED in memory. `getCurrentTarget
+ * McpSessionId()` then returns null and dispatchInbound falsely warns "尚未連線",
+ * persistently, until the next /roam re-claims. Confirmed in production logs:
+ * across 4 daemon restarts the same target claude reconnected with NO
+ * "claimed for pending takeover" line each time.
+ *
+ * Fix: when the map misses but `current_target` is genuinely ALIVE (tmux +
+ * claude pid), re-adopt the reconnected session instead of warning. Only an
+ * unambiguous single unclaimed active session is adopted — never guess between
+ * multiple bridged claudes (that could misroute Joey's message to the wrong
+ * project); those fall through to a self-healing "reconnecting" reply.
+ *
+ * `activeSessionIds` = MCP sessions currently connected to this daemon
+ * (server.ts owns that set and passes it in).
+ */
+export async function resolveCurrentTargetMcpSession(
+  activeSessionIds: string[],
+): Promise<TargetResolution> {
+  const state = readState()
+  const t = state.current_target
+  if (!t) return { sessionId: null, status: 'no-target' }
+
+  // Healthy fast path: mapping exists and its session is still connected.
+  const mapped = tmuxToMcpSession.get(t.tmux)
+  if (mapped && activeSessionIds.includes(mapped)) {
+    return { sessionId: mapped, status: 'healthy' }
+  }
+  // Stale mapping (mapped session died / was evicted) — drop before repair so
+  // it doesn't shadow the reconnected one.
+  if (mapped) tmuxToMcpSession.delete(t.tmux)
+
+  // Is the target actually alive? A genuinely-gone target SHOULD warn.
+  const tmuxAlive = await tmuxSessionExists(t.tmux)
+  const claudeAlive = !!t.claude_pid && pidAlive(t.claude_pid)
+  if (!tmuxAlive && !claudeAlive) return { sessionId: null, status: 'target-dead' }
+
+  // Target alive but unmapped ⇒ a reconnect the takeover path never re-claimed.
+  // Adopt ONLY an unambiguous single unclaimed active session.
+  const claimed = new Set(tmuxToMcpSession.values())
+  const unclaimed = activeSessionIds.filter(id => !claimed.has(id))
+  if (unclaimed.length === 1) {
+    tmuxToMcpSession.set(t.tmux, unclaimed[0])
+    return { sessionId: unclaimed[0], status: 'repaired' }
+  }
+  // 0 unclaimed (bridge mid-reconnect) or >1 (ambiguous multi-target) — let the
+  // caller retry briefly / warn with a self-heal hint rather than misroute.
+  return { sessionId: null, status: 'no-bridge' }
+}
+
 async function waitForTakeoverMcpSession(tmuxName: string, timeoutMs = 45_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
