@@ -54,6 +54,7 @@ This fork moves the bot daemon out of claude's process tree:
 - **Restarts** of claude TUI drop its session; the daemon keeps the gateway connection; the next claude opens a fresh session
 - **Multi-session broadcast**: multiple claude TUIs can connect to one daemon
 - **Disk + memory replay queue**: any inbound that arrives during claude restart, SSE-handshake race, or daemon restart is persisted to `$DISCORD_STATE_DIR/inbox/pending/` and replayed when a new session's SSE GET stream is established
+- **Full inbound context** (1.13.0+): replies carry the root message's text/sender/files, forwards deliver the forwarded content + origin (previously an EMPTY body), stickers/polls render as labels — see [docs/inbound-message-context.md](docs/inbound-message-context.md) for the attribute reference
 
 All tools and inbound `notifications/claude/channel` semantics are preserved. The `/discord:access` skill works unchanged.
 

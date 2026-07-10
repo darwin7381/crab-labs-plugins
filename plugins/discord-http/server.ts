@@ -25,6 +25,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  MessageReferenceType,
   type Message,
   type Attachment,
   type Interaction,
@@ -598,11 +599,151 @@ async function downloadAttachment(att: Attachment): Promise<string> {
   return path
 }
 
+// Sender-controlled strings that land in <channel> META ATTRIBUTES or
+// newline-joined tool results — delimiter chars would let the sender break
+// out of the untrusted frame or forge the tag itself. Same charset as
+// telegram-http's safeName.
+function safeMeta(s: string): string {
+  return s.replace(/[<>\[\]\r\n;]/g, '_')
+}
+
+/** Sanitized single-line excerpt for meta attributes (reply-root text etc.).
+ *  Capped so a long root message can't balloon the <channel> payload. */
+function metaExcerpt(s: string): string {
+  return safeMeta(s.replace(/\s+/g, ' ').trim()).slice(0, 200)
+}
+
 // att.name is uploader-controlled. It lands inside a [...] annotation in the
 // notification body and inside a newline-joined tool result — both are places
 // where delimiter chars let the attacker break out of the untrusted frame.
 function safeAttName(att: Attachment): string {
-  return (att.name ?? att.id).replace(/[\[\]\r\n;]/g, '_')
+  return safeMeta(att.name ?? att.id)
+}
+
+/** "name (type, KB)" lines for a set of attachments — one shape everywhere
+ *  (top-level attachments meta, reply_to_attachments, forward_attachments). */
+function attachmentsSummary(atts: Iterable<Attachment>): string[] {
+  const out: string[] = []
+  for (const att of atts) {
+    const kb = (att.size / 1024).toFixed(0)
+    out.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
+  }
+  return out
+}
+
+/** One-line description of a message's non-text payload — used for
+ *  reply_to_text / forward body when there is no text. Accepts a full
+ *  Message or a forward MessageSnapshot (structurally). */
+function nonTextLabel(m: {
+  attachments: { size: number; first(): Attachment | undefined }
+  stickers: { size: number; map<T>(fn: (s: { name: string }) => T): T[] }
+  embeds: readonly unknown[]
+  poll?: { question: { text: string | null } } | null
+}): string | undefined {
+  if (m.attachments.size > 0) {
+    const first = m.attachments.first()
+    const extra = m.attachments.size > 1 ? `, +${m.attachments.size - 1} more` : ''
+    return `(${m.attachments.size} attachment${m.attachments.size === 1 ? '' : 's'}: ${first ? safeAttName(first) : '?'}${extra})`
+  }
+  if (m.stickers.size > 0) return `(sticker: ${m.stickers.map(s => safeMeta(s.name)).join(', ')})`
+  if (m.poll) return `(poll: ${metaExcerpt(m.poll.question.text ?? '')})`
+  if (m.embeds.length > 0) return '(embed)'
+  return undefined
+}
+
+/**
+ * Reply / forward context for the <channel> meta — DC analog of
+ * telegram-http 1.13.0's replyForwardMeta (2026-07-10, Joey: "Reply 或
+ * forward 的時候沒有帶有根訊息、檔案和發送者資訊?").
+ *
+ * Before this, the agent saw a Discord reply as a bare standalone message
+ * (root message's text/sender lost) and a FORWARD as an EMPTY message —
+ * Discord puts forwarded content in message_snapshots, not content, so the
+ * old handler delivered '' with no attributes at all. Emitted attributes:
+ *
+ *  reply_to_message_id / reply_to_user / reply_to_user_id / reply_to_text —
+ *    the root message being replied to (text or media label, ≤200 chars).
+ *    reply_to_user equal to the bot's own username ⇒ the user is replying
+ *    to one of YOUR messages.
+ *  reply_to_attachment_count / reply_to_attachments — files on the root.
+ *    Unlike Telegram (push: file_id rides along on the reply), Discord's
+ *    download_attachment is pull-by-message-id — the agent fetches root
+ *    files via download_attachment(chat_id, reply_to_message_id), so there
+ *    is no attachment_origin="reply" smuggling here.
+ *  forward_origin — user | bot | webhook | unknown. Discord's forward
+ *    payload (message snapshot) deliberately omits the original author;
+ *    we best-effort resolve it by fetching the source message (works when
+ *    this bot can read the source channel) and stay "unknown" otherwise.
+ *  forward_from / forward_from_id — original author when resolvable.
+ *  forward_channel / forward_channel_id / forward_guild_id /
+ *  forward_message_id — where the original message lives.
+ *  forward_date — when the ORIGINAL message was sent (snapshot timestamp).
+ *  forward_attachment_count / forward_attachments — files inside the
+ *    forward; download_attachment(chat_id, message_id) on the forward
+ *    message itself retrieves them (snapshot fall-through).
+ *
+ * No reply_quote (Discord has no partial-quote) and no media_group_id
+ * (Discord multi-attachment is one message natively) — those TG attributes
+ * have no DC equivalent.
+ */
+async function replyForwardContext(msg: Message): Promise<{ meta: Record<string, string>; forwardText?: string }> {
+  const meta: Record<string, string> = {}
+  const ref = msg.reference
+  if (!ref?.messageId) return { meta }
+
+  if (ref.type === MessageReferenceType.Forward) {
+    let forwardText: string | undefined
+    meta.forward_origin = 'unknown'
+    meta.forward_message_id = ref.messageId
+    meta.forward_channel_id = ref.channelId
+    if (ref.guildId) meta.forward_guild_id = ref.guildId
+
+    const snap = msg.messageSnapshots.first()
+    if (snap) {
+      if (snap.createdTimestamp) meta.forward_date = new Date(snap.createdTimestamp).toISOString()
+      const snapAtts = attachmentsSummary(snap.attachments.values())
+      if (snapAtts.length > 0) {
+        meta.forward_attachment_count = String(snapAtts.length)
+        meta.forward_attachments = snapAtts.join('; ')
+      }
+      forwardText = snap.content || nonTextLabel(snap) || '(forwarded message)'
+    }
+
+    try {
+      const srcCh = await client.channels.fetch(ref.channelId)
+      if (srcCh && srcCh.isTextBased() && 'messages' in srcCh) {
+        const src = await (srcCh as { messages: { fetch(id: string): Promise<Message> } }).messages.fetch(ref.messageId)
+        meta.forward_origin = src.webhookId ? 'webhook' : src.author.bot ? 'bot' : 'user'
+        meta.forward_from = safeMeta(src.author.username)
+        meta.forward_from_id = src.author.id
+        const chName = 'name' in srcCh && typeof (srcCh as { name?: unknown }).name === 'string'
+          ? (srcCh as { name: string }).name : null
+        if (chName) meta.forward_channel = safeMeta(chName)
+      }
+    } catch {
+      // Bot can't read the source channel (or message deleted) — origin
+      // stays "unknown"; the snapshot content above is still delivered.
+    }
+    return { meta, forwardText }
+  }
+
+  // Standard reply (MessageReferenceType.Default).
+  meta.reply_to_message_id = ref.messageId
+  try {
+    const root = await msg.fetchReference()
+    meta.reply_to_user = safeMeta(root.author.username)
+    meta.reply_to_user_id = root.author.id
+    const label = root.content ? metaExcerpt(root.content) : nonTextLabel(root)
+    if (label) meta.reply_to_text = label
+    const rootAtts = attachmentsSummary(root.attachments.values())
+    if (rootAtts.length > 0) {
+      meta.reply_to_attachment_count = String(rootAtts.length)
+      meta.reply_to_attachments = rootAtts.join('; ')
+    }
+  } catch {
+    // Root deleted or unreadable — the id alone still marks this as a reply.
+  }
+  return { meta }
 }
 
 // Active server registry — Route B multi-session. Each connected claude TUI
@@ -725,6 +866,8 @@ function buildServer(): Server {
       'The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
       'Messages from Discord arrive as <channel source="discord" chat_id="..." message_id="..." user="..." ts="...">. If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      '',
+      'Context attributes: reply_to_text/reply_to_user/reply_to_message_id describe the message being REPLIED TO; if it carried files, reply_to_attachments lists them — call download_attachment(chat_id, reply_to_message_id) to fetch those. forward_* attributes mean the message is a FORWARD: the visible text was written by the ORIGINAL author (forward_from when resolvable — Discord omits the author from forward payloads, so forward_origin may stay "unknown"), not by user, who only relayed it. download_attachment(chat_id, message_id) on the forwarded message retrieves forwarded files. Sticker and poll messages arrive with a "(sticker: …)" / "(poll: …)" body and matching meta attributes.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
@@ -960,11 +1103,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'download_attachment': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
-        if (msg.attachments.size === 0) {
+        // Forwarded messages carry their files inside the forward snapshot,
+        // not msg.attachments — fall through to those so "download the
+        // forwarded file" works (snapshot Attachment objects carry normal
+        // CDN URLs). DC analog of TG's reply-root file ride-along.
+        const attList = [...msg.attachments.values()]
+        if (attList.length === 0 && msg.messageSnapshots.size > 0) {
+          for (const snap of msg.messageSnapshots.values()) {
+            attList.push(...snap.attachments.values())
+          }
+        }
+        if (attList.length === 0) {
           return { content: [{ type: 'text', text: 'message has no attachments' }] }
         }
         const lines: string[] = []
-        for (const att of msg.attachments.values()) {
+        for (const att of attList) {
           const path = await downloadAttachment(att)
           const kb = (att.size / 1024).toFixed(0)
           lines.push(`  ${path}  (${safeAttName(att)}, ${att.contentType ?? 'unknown'}, ${kb}KB)`)
@@ -1018,9 +1171,12 @@ client.on('error', err => {
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
 
-  // resume: + roam: callbacks. In roamer mode both go through roamer.
-  // In channel-bot mode resume: goes to channel-bot's handleCallbackData.
-  if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('roam:')) {
+  // resume: + roam: + model: callbacks. In roamer mode, resume:/roam: go
+  // through the roamer handler (it drives the picker against the dynamic
+  // current_target tmux). In channel-bot mode, resume:/model: go to
+  // channel-bot's handleCallbackData (fixed TMUX_SESSION). model: is only
+  // ever emitted in channel-bot mode (see forwardSharedTuiSlash guard).
+  if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('roam:') || interaction.customId.startsWith('model:')) {
     const access = loadAccess()
     if (!access.allowFrom.includes(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
@@ -1033,9 +1189,9 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     }
     try {
       await interaction.deferUpdate().catch(() => {})
-      if (isRoamerEnabled()) {
+      if (isRoamerEnabled() && !interaction.customId.startsWith('model:')) {
         await handleRoamerCallback(interaction.customId, replyToDc)
-      } else if (interaction.customId.startsWith('resume:')) {
+      } else if (interaction.customId.startsWith('resume:') || interaction.customId.startsWith('model:')) {
         await handleCallbackData(interaction.customId, httpPort, replyToDc)
       }
     } catch (err) {
@@ -1201,15 +1357,28 @@ async function handleInbound(msg: Message): Promise<void> {
   // Attachments are listed (name/type/size) but not downloaded — the model
   // calls download_attachment when it wants them. Keeps the notification
   // fast and avoids filling inbox/ with images nobody looked at.
-  const atts: string[] = []
-  for (const att of msg.attachments.values()) {
-    const kb = (att.size / 1024).toFixed(0)
-    atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
-  }
+  const atts: string[] = attachmentsSummary(msg.attachments.values())
+
+  // Reply-root / forward-origin context (2026-07-10, DC analog of
+  // telegram-http 1.13.0) — see replyForwardContext. Without these the agent
+  // couldn't tell WHAT was being replied to, and a forwarded message arrived
+  // as an EMPTY body (content lives in message_snapshots).
+  const context = await replyForwardContext(msg)
+
+  // Sticker / poll messages previously delivered an EMPTY body (no content,
+  // no attachments → '') — rendered as text labels now, with the trusted
+  // copy in meta (an in-content label alone is forgeable by typing it).
+  const stickerNames = msg.stickers.map(s => safeMeta(s.name))
+  const pollQ = msg.poll?.question?.text ?? undefined
 
   // Attachment listing goes in meta only — an in-content annotation is
   // forgeable by any allowlisted sender typing that string.
-  const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+  const content =
+    msg.content
+    || context.forwardText
+    || (stickerNames.length > 0 ? `(sticker: ${stickerNames.join(', ')})` : '')
+    || (pollQ ? `(poll: ${pollQ})` : '')
+    || (atts.length > 0 ? '(attachment)' : '')
 
   // 1.1.6 REVERT: same revert as telegram-http 1.2.7 — the per-inbound
   // [protocol] reminder shipped in 1.1.5 caused silent-reply spike across
@@ -1226,6 +1395,9 @@ async function handleInbound(msg: Message): Promise<void> {
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        ...(stickerNames.length > 0 ? { sticker_count: String(stickerNames.length), stickers: stickerNames.join('; ') } : {}),
+        ...(pollQ ? { poll: metaExcerpt(pollQ) } : {}),
+        ...context.meta,
       },
     },
   }
