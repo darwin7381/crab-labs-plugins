@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.14.3 — 2026-07-11
+
+### Added — notify on silent model fallback
+
+Joey: "補plugin，如果被 failback 至少要通知我". Claude Code silently swaps the
+selected model for a stabler one when the primary errors/overloads — it lands
+in the session jsonl as an assistant content block
+`{type:"fallback", from:{model}, to:{model}}`. The user believes they're on
+model X but replies actually come from Y (e.g. a `--model claude-fable-5`
+session quietly running on `claude-opus-4-8` after 7 fallbacks). The
+system-alert jsonl-tail layer now detects this block and forwards a one-line
+notice: "⚠️ 模型自動退回：X → Y …". Requires SYSTEM_ALERT_FORWARD=1 (already on
+for channel-bot). Tested against real fallback lines; normal text/tool_use
+lines still return null (no false alerts).
+
 ## 1.14.2 — 2026-07-10
 
 ### Fixed — roamer falsely warns "尚未連線 target" while roam is actually connected

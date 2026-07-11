@@ -73,7 +73,13 @@ export function extractSystemAlert(line: string): string | null {
   // Surface THAT verbatim — never the raw provider "rate limit" string, which
   // names the wrong problem (Joey 2026-07-10).
   const hasApiErrFlag = line.includes('"isApiErrorMessage":true')
-  if (!hasApiErr && !hasLogin && !hasRefusal && !hasApiErrText && !hasApiErrFlag) return null
+  // Model fallback: Claude Code silently swaps the selected model for a stabler
+  // one when the primary errors/overloads. Rides on an assistant record as a
+  // content block {type:"fallback", from:{model}, to:{model}}. The user thinks
+  // they're on model X but replies are actually coming from Y — surface it
+  // (Joey 2026-07-11: "被 fallback 至少要通知我").
+  const hasFallback = line.includes('"type":"fallback"')
+  if (!hasApiErr && !hasLogin && !hasRefusal && !hasApiErrText && !hasApiErrFlag && !hasFallback) return null
   try {
     const j: any = JSON.parse(line)
     if (j?.type === 'system' && j?.subtype === 'api_error') {
@@ -84,7 +90,14 @@ export function extractSystemAlert(line: string): string | null {
       const content = j?.message?.content
       let text = ''
       if (Array.isArray(content)) {
-        for (const c of content) if (c?.type === 'text' && typeof c.text === 'string') text += c.text + ' '
+        for (const c of content) {
+          if (c?.type === 'text' && typeof c.text === 'string') text += c.text + ' '
+          if (c?.type === 'fallback') {
+            const from = c?.from?.model ?? '?'
+            const to = c?.to?.model ?? '?'
+            return `⚠️ 模型自動退回：${from} → ${to}（primary 報錯/過載，Claude Code 已切到備援模型；你以為在跑 ${from}，實際是 ${to}）`
+          }
+        }
       }
       text = text.trim()
       // Claude's own human-readable API-error message — forward exactly as the
