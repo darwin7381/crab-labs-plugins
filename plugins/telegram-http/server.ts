@@ -782,7 +782,7 @@ async function sendToAgent(to: string, text: string): Promise<string> {
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
       },
-      body: JSON.stringify({ text: `【${INBOX_SELF} → ${target}】${body}`, from: INBOX_SELF }),
+      body: JSON.stringify({ text: `【${INBOX_SELF} → ${target}】${body}`, from: INBOX_SELF, logged: true }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -2398,13 +2398,30 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         return
       }
       const body = (await readJsonBody(req).catch(() => null)) as
-        { text?: string; from?: string; chat_id?: string } | null
+        { text?: string; from?: string; chat_id?: string; logged?: boolean } | null
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
       if (!text) {
         res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
         return
       }
       const from = (typeof body?.from === 'string' && body.from ? body.from : 'local-inject').slice(0, 64)
+      // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
+      // delivery gets a BTCC row unless the sender declares logged:true (senders
+      // that already log with richer context: send_to_agent, BTCC /send, Argus wake).
+      if (INBOX_ONLY && body?.logged !== true) {
+        try {
+          const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
+          void fetch(`${base}/api/comms/log`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+            },
+            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind: 'message', body: text.slice(0, 4000), delivery: 'delivered' }),
+            signal: AbortSignal.timeout(6000),
+          }).catch(() => {})
+        } catch {}
+      }
       // Default chat_id = first allowFrom (the owner): if the agent finishes and
       // reports via the reply tool, the report lands with the boss per contract.
       const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
