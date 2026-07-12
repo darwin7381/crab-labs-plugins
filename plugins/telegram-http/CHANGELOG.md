@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.16.0 (2026-07-12)
+
+- **agent-inbox: full A2A mesh.** `CHANNEL_INBOX_ONLY=1` mode is now bidirectional:
+  a `send_to_agent` tool lets any agent message any fleet agent via the shared
+  registry (`~/.claude/agent-inbox/registry.json`); deliveries are durable and
+  auto-logged to the BTCC Comms console. New sibling plugin `agent-inbox` boots
+  this mode standalone (own process/port/state per agent, zero Telegram coupling).
+
 ## 1.15.1 (2026-07-12)
 
 ### Added — boot-time version self-report + freshness check (Joey rule: never silently run stale code)
