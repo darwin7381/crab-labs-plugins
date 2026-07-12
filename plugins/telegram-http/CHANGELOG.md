@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.15.1 (2026-07-12)
+
+### Added — boot-time version self-report + freshness check (Joey rule: never silently run stale code)
+- New `version-check.ts`: at every daemon boot, resolve the running copy's version (top CHANGELOG entry) + git short HEAD, `git fetch origin main`, and count commits behind. Fail-open (offline / non-git copies degrade to "freshness unknown"; boot never blocked).
+- Startup log now prints the version line; **stale copies log a loud ⚠️ with the exact fix commands** (`git -C <dir> pull` + `launchctl kickstart -k`).
+- `/healthz` gains `version` / `commit` / `behind_origin` — any machine's daemon freshness is now one `curl` away.
+- Roamer `/whoami` leads with the same version line.
+- Background: JL-machine incident — a roamer daemon ran a 1.1.0-era copy for weeks because its plist pointed at a frozen path and nothing ever verified freshness (issue #5 was the cache-key half; this closes the daemon half).
+
 ## 1.15.0 (2026-07-12)
 
 - **`POST /inject` — localhost agent-wake inbox.** Locally-originated messages (e.g. the
