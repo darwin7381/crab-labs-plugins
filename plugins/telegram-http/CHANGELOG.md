@@ -8,6 +8,13 @@
   auto-logged to the BTCC Comms console. New sibling plugin `agent-inbox` boots
   this mode standalone (own process/port/state per agent, zero Telegram coupling).
 
+## 1.15.2 (2026-07-12)
+
+### Fixed — roamer bare `/model` now opens the same tap-to-pick picker as channel-bot (issue #7)
+- The picker was deliberately gated to the fixed channel-bot session because a `model:` callback lost its target context and would mis-drive TMUX_SESSION in roamer mode. Dynamic targets now embed a 6-char tmux-name hash in the callback (`model:<value>@<hash6>`, ≤64 bytes verified); at tap time the roamer validates the hash against the CURRENT target — target switched in between ⇒ friendly refusal instead of driving the wrong session.
+- On match the tap reuses the proven `/model <value>` with-args path (send-keys + busy-safe auto-confirm) on the target tmux — no forked logic.
+- Roamer bot menu description updated to advertise the picker. Same-version UX between channel-bot and roamer eliminates the "deployment must be stale" misread (the actual trigger for 1.15.1's freshness self-report).
+
 ## 1.15.1 (2026-07-12)
 
 ### Added — boot-time version self-report + freshness check (Joey rule: never silently run stale code)
