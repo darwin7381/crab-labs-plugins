@@ -19,6 +19,11 @@
       "name": "discord-http",
       "source": "./plugins/discord-http",
       "description": "Discord channel for Claude Code — HTTP MCP daemon transport. Drop-in replacement for the official discord plugin that decouples the bot daemon (discord.js gateway) from claude TUI lifetime. Disk + memory replay queue recovers messages during any restart gap."
+    },
+    {
+      "name": "agent-inbox",
+      "source": "./plugins/agent-inbox",
+      "description": "Local durable mailbox channel for a Claude Code agent — agents, schedulers, and the BTCC Comms console deliver messages into the agent's session. Independent daemon per agent, decoupled from Telegram."
     }
   ]
 }
