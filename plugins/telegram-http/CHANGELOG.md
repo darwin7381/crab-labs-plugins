@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.15.0 (2026-07-12)
+
+- **`POST /inject` — localhost agent-wake inbox.** Locally-originated messages (e.g. the
+  Argus→Hephaestus on-call wake) now ride the SAME durable delivery path as Telegram
+  inbounds: memQueue + disk pending replay + delete-on-delivery. Replaces tmux send-keys
+  injection (fragile: TUI busy/menus, silent loss, shell-execution risk if the pane died
+  back to zsh). Optional `CHANNEL_INJECT_TOKEN` env gates it on top of the 127.0.0.1 bind.
+
 ## 1.14.3 — 2026-07-11
 
 ### Added — notify on silent model fallback

@@ -2247,6 +2247,42 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       return
     }
 
+    // /inject — localhost agent-wake inbox (2026-07-12, comms rethink after Joey 4554).
+    // Delivers a locally-originated message through the SAME durable channel path as a
+    // Telegram inbound (memQueue + disk pending replay + delete-on-delivery), replacing
+    // fragile tmux send-keys: survives TUI busy/menus/restarts, no shell-execution risk,
+    // and delivery is confirmed rather than fire-and-forget keystrokes.
+    // Caller: oncall-receiver (Argus wake). Auth: when CHANNEL_INJECT_TOKEN is set the
+    // X-Inject-Token header must match; the 127.0.0.1 bind is the outer wall either way.
+    if (u.pathname === '/inject' && req.method === 'POST') {
+      const tok = process.env.CHANNEL_INJECT_TOKEN
+      if (tok && (req.headers['x-inject-token'] as string | undefined) !== tok) {
+        res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
+        return
+      }
+      const body = (await readJsonBody(req).catch(() => null)) as
+        { text?: string; from?: string; chat_id?: string } | null
+      const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
+      if (!text) {
+        res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
+        return
+      }
+      const from = (typeof body?.from === 'string' && body.from ? body.from : 'local-inject').slice(0, 64)
+      // Default chat_id = first allowFrom (the owner): if the agent finishes and
+      // reports via the reply tool, the report lands with the boss per contract.
+      const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
+      await dispatchInbound(chatId, {
+        method: 'notifications/claude/channel',
+        params: {
+          content: text,
+          meta: { chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject' },
+        },
+      })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ injected: true, active_sessions: activeServers.size }))
+      return
+    }
+
     if (u.pathname !== '/mcp') {
       res.writeHead(404, { 'content-type': 'text/plain' }).end('not found — POST to /mcp or GET /healthz\n')
       return
