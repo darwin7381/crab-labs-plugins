@@ -47,6 +47,7 @@ import {
   resolveCurrentTargetMcpSession as roamerResolveCurrentTargetMcpSession,
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
+  handleModelCallbackForCurrentTarget,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
@@ -1291,6 +1292,14 @@ bot.on('callback_query:data', async ctx => {
       await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard)
     }
     try {
+      // Roamer /model picker taps carry `@<hash6>` — validate + drive the
+      // CURRENT target (issue #7). Plain model: stays on the channel-bot path.
+      if (isRoamerEnabled() && data.startsWith('model:') && data.includes('@')) {
+        const at = data.lastIndexOf('@')
+        const value = data.slice('model:'.length, at).trim()
+        const hash = data.slice(at + 1).trim()
+        if (await handleModelCallbackForCurrentTarget(value, hash, replyToTg)) return
+      }
       if (isRoamerEnabled() && !data.startsWith('model:')) {
         await handleRoamerCallback(data, replyToTg)
       } else if (data.startsWith('resume:') || data.startsWith('model:')) {

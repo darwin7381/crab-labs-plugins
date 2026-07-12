@@ -24,6 +24,7 @@ import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import {
   forwardSharedTuiSlash,
+  tmuxHash6,
   sharedTuiCommands,
   listClaudeSessions,
   currentSessionId,
@@ -1338,6 +1339,35 @@ async function handleChannelBotCommandsForCurrentTarget(
  * source of truth — any TUI commands added to forwardSharedTuiSlash are
  * automatically available in roamer mode (and vice versa).
  */
+/**
+ * `model:<value>@<hash6>` callback from a roamer-target /model picker (issue #7).
+ * Validates the hash against the CURRENT target's tmux at tap time — if the
+ * user switched targets between opening the picker and tapping, refuse instead
+ * of driving the wrong session. On match, reuse the proven `/model <value>`
+ * with-args path (send-keys + busy-safe auto-confirm) on that tmux.
+ */
+export async function handleModelCallbackForCurrentTarget(
+  value: string,
+  hash: string,
+  replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+): Promise<boolean> {
+  if (!/^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)) {
+    await replyToTg(`❌ invalid model value in callback: \`${value.slice(0, 60)}\``)
+    return true
+  }
+  const state = readState()
+  const target = state.current_target
+  if (!target) {
+    await replyToTg('❌ 沒有連線中的 target — 先 /roam 選一個，再重開 /model')
+    return true
+  }
+  if (tmuxHash6(target.tmux) !== hash) {
+    await replyToTg('⚠️ target 已切換，這個選單是舊 target 的 — 重打 /model 開新選單')
+    return true
+  }
+  return forwardSharedTuiSlash(`/model ${value}`, target.tmux, replyToTg)
+}
+
 async function handleTuiSlashForward(
   text: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
@@ -1449,7 +1479,7 @@ export function roamerCommandsForBotApi(): Array<{ command: string; description:
     { command: 'help', description: 'claude TUI /help on current target' },
     { command: 'init', description: 'claude TUI /init on current target' },
     { command: 'compact', description: 'claude TUI /compact on current target' },
-    { command: 'model', description: 'change current target model (/model <name>)' },
+    { command: 'model', description: 'switch target model — tap-to-pick buttons, or /model <id>' },
     { command: 'effort', description: 'change current target effort (/effort <level>)' },
     { command: 'codexgate', description: 'enable Codex stop-time review gate on current target' },
     { command: 'sigint', description: 'send Ctrl+C to current target' },

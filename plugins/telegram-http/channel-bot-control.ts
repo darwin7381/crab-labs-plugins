@@ -576,6 +576,16 @@ const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
   { label: '↩️ Default（回 TUI 預設）', value: 'default' },
 ]
 
+/** Short stable hash of a tmux name — embedded in model: callback_data so a
+ * roamer picker tap can be validated against the CURRENT target at tap time
+ * (guards the "opened picker for A, switched to B, tapped" mis-target case
+ * that originally kept the picker channel-bot-only — issue #7). */
+export function tmuxHash6(name: string): string {
+  let h = 5381
+  for (const c of name) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0
+  return h.toString(16).padStart(8, '0').slice(0, 6)
+}
+
 export function modelChoices(): Array<{ label: string; value: string }> {
   const raw = process.env.CHANNEL_BOT_MODEL_CHOICES
   if (!raw) return DEFAULT_MODEL_CHOICES
@@ -732,17 +742,20 @@ export async function forwardSharedTuiSlash(
   if (SHARED_TUI_SENDABLE_WITH_ARG.has(cmd)) {
     if (!args) {
       // Bare `/model` → tap-to-pick inline keyboard (Joey 2026-07-02 msg 2434:
-      // "我哪知道準確的代號是什麼"). Channel-bot mode only (fixed TMUX_SESSION):
-      // the `model:` callback routes through handleCallbackData → TMUX_SESSION,
-      // which would mis-target in roamer mode, so roamer keeps the usage text.
-      if (cmd === '/model' && tmuxName === TMUX_SESSION && isControlEnabled()) {
+      // "我哪知道準確的代號是什麼"). Works for BOTH the fixed channel-bot session
+      // and dynamic roamer targets (issue #7 — same-version UX was inconsistent
+      // and read as "old deployment"): dynamic targets embed a tmux-name hash in
+      // the callback so the tap is validated against the CURRENT target.
+      if (cmd === '/model' && isControlEnabled()) {
         // Mark the current model on its button + a status line (Joey
         // 2026-07-10: "選單要能看出目前是哪個模型").
+        const isFixed = tmuxName === TMUX_SESSION
+        const cbSuffix = isFixed ? '' : `@${tmuxHash6(tmuxName)}`
         const current = detectCurrentModel()
         const curNorm = current ? normalizeModelId(current.id) : null
         const keyboard: InlineButton[][] = modelChoices().map(c => {
           const isCur = curNorm !== null && c.value !== 'default' && normalizeModelId(c.value) === curNorm
-          return [{ text: isCur ? `✅ ${c.label}（目前）` : c.label, callback_data: `model:${c.value}` }]
+          return [{ text: isCur ? `✅ ${c.label}（目前）` : c.label, callback_data: `model:${c.value}${cbSuffix}` }]
         })
         const curLine = current
           ? `目前模型：\`${current.id}\`（${current.source}）\n`
