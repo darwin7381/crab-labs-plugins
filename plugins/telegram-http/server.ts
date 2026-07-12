@@ -749,6 +749,26 @@ async function sendToAgent(to: string, text: string): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim().slice(0, 3500)
   if (!body) return 'send failed: empty text'
+  // 'joey' is a log-only target: the boss has no inbox daemon — he reads the BTCC
+  // Messenger thread, so logging the message IS the delivery (fills his dm thread).
+  if (target === 'joey' || target === 'joey (btcc)') {
+    try {
+      const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
+      const r = await fetch(`${base}/api/comms/log`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+        },
+        body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered' }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use your Telegram reply tools instead."
+      return `send to joey FAILED (BTCC log ${r.status})`
+    } catch (e) {
+      return `send to joey FAILED (${e})`
+    }
+  }
   const reg = loadInboxRegistry()
   if (target === INBOX_SELF) return 'send failed: that is your own inbox'
   const entry = reg[target]
@@ -872,7 +892,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      {
        name: 'send_to_agent',
        description:
-         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). The delivery is logged to the BTCC Comms console. Registry of reachable agents: ' + inboxRegistryNames().join(', '),
+         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
        inputSchema: {
          type: 'object',
          properties: {
