@@ -33,6 +33,7 @@ import {
   formatResumeReply,
   type InlineButton as CBCInlineButton,
 } from './channel-bot-control.ts'
+import { versionLine } from './version-check.ts'
 
 // ---- env-var configuration -----------------------------------------------
 
@@ -1049,6 +1050,7 @@ export async function handleRoamerSlash(
     const state = readState()
     const registry = await readActiveRegistry()
     const lines = [
+      versionLine(),
       `bot: @${ROAMER_BOT_NAME}_bot`,
       `daemon pid: ${process.pid}`,
       `current target: ${state.current_target ? state.current_target.cwd : '(none)'}`,
