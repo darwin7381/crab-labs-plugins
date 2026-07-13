@@ -47,3 +47,32 @@ that can appear at startup or mid-run (model/effort confirm, resume picker,
 trust prompt, login) must be either driven automatically or surfaced to
 Telegram for the user to answer — never left to silently wedge. This is the
 same reason `--disallowedTools AskUserQuestion ExitPlanMode` is mandatory.
+
+## 3. Shared features must not assume a fixed session — thread the target, verify in roam
+
+The plugin runs in TWO modes: **channel-bot** (one fixed session, env
+`CHANNEL_BOT_TMUX_SESSION` → `TMUX_SESSION`) and **roamer** (no fixed session;
+the target moves per `/roam`, its tmux is `current_target.tmux`). Any feature
+that is meant to work in BOTH must be written target-agnostic:
+
+- **Never gate a shared feature on `isControlEnabled()` or `tmuxName === TMUX_SESSION`.**
+  `isControlEnabled()` is literally `TMUX_SESSION !== ''` — **always false in
+  roamer mode**. Gating a shared behaviour on it silently kills it for every
+  roamer while looking fine on channel-bot. Gate on the actual thing you need
+  (e.g. "is there a target session?" → `tmuxName !== ''`), not on the mode.
+- **Thread the explicit `tmuxName` through the whole call chain.** The tmux
+  helpers default their arg to `TMUX_SESSION` (`tmuxSendKeys`, `isClaudeBusy`,
+  `isPickerOpen`, `isYesNoConfirmPickerOpen`, `tmuxCapturePane`, …). A single
+  call that forgets to pass the roamer's target defaults to the empty fixed
+  session and drives the wrong (or no) pane. Pass the target everywhere.
+- **Don't key shared state on `TMUX_SESSION`.** For roamers it's `''`, so a
+  file like `…-${TMUX_SESSION || 'default'}.json` becomes ONE record shared
+  across every roam target → cross-target contamination (e.g. target A's model
+  switch mislabels target B's "current model"). Key per-target instead.
+
+**Verification rule:** a fix that claims to support roam is NOT done until it
+has been exercised **in roam mode**. #7 ("roamer bare /model gets the picker")
+and #8 shipped *broken in roam for weeks* because they were only ever checked on
+the fixed channel-bot session — the `isControlEnabled()` guard meant the picker
+never actually reached a roamer. "Builds + works on channel-bot" ≠ "works in
+roam." Test the roamer path, or it isn't fixed.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.6 (2026-07-13)
+
+### Fixed — /model "current model" line could show another roam target's model
+- The last-confirmed-switch record (`saveLastConfirmedSwitch`) stored only `{value, ts}` with no target identity. A roamer daemon keeps ONE record file (its `TELEGRAM_STATE_DIR/last-model-switch.json`) shared across all roam targets, so after switching model on target A, opening `/model` on target B would read A's record and mislabel B's "目前模型". Now the record carries `tmux` and `detectCurrentModel()` only honors it for the matching target (channel-bot passes its fixed `TMUX_SESSION`, unaffected; pre-existing record files without the field are ignored → fall through to the jsonl's real last-reply model). Part of a full sweep for roam-unaware "fixed-session" logic prompted by the 1.17.5 report; see PRINCIPLES.md §3. The rest of the shared path (`runTuiSwitchCommand`, `runCodexGate`, `/input`, ctrl-keys) was audited and already threads the target tmux correctly.
+
+### Docs
+- PRINCIPLES.md §3: "Shared features must not assume a fixed session — thread the target, verify in roam" — the discipline that would have caught #7/#8 shipping broken in roam.
+
 ## 1.17.5 (2026-07-13)
 
 ### Fixed — bare /model picker was dead in roamer mode (regression report 2026-07-13)
