@@ -782,7 +782,7 @@ async function sendToAgent(to: string, text: string): Promise<string> {
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
       },
-      body: JSON.stringify({ text: `【${INBOX_SELF} → ${target}】${body}`, from: INBOX_SELF, logged: true }),
+      body: JSON.stringify({ text: body, from: INBOX_SELF, logged: true }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -892,7 +892,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      {
        name: 'send_to_agent',
        description:
-         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
+         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). Write NATURAL message text — no 【sender → target】 prefixes or headers; your identity travels in the channel metadata automatically. The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
        inputSchema: {
          type: 'object',
          properties: {
@@ -2417,7 +2417,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
               'Content-Type': 'application/json',
               ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
             },
-            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind: 'message', body: text.slice(0, 4000), delivery: 'delivered' }),
+            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind: 'message', body: text.replace(/^【[^】]{1,60}】\s*/, '').slice(0, 4000), delivery: 'delivered' }),
             signal: AbortSignal.timeout(6000),
           }).catch(() => {})
         } catch {}
