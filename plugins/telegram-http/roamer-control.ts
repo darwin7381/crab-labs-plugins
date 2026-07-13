@@ -1470,11 +1470,16 @@ export async function getRoamerWatchTargets(): Promise<Array<{ label: string; tm
  * the jsonl fallback follows /roam target switches instead of a static env
  * (issue #6). Same cwdSlug/PROJECTS_ROOT derivation as transcriptPath.
  */
-export function roamerCurrentProjectsDir(): string | null {
+// Exact transcript jsonl of the roamer's CURRENT target — cwd + session_id
+// resolve to one file, so the system-alert fallback tails precisely that
+// session and never the merely-newest jsonl in the dir (a cwd can hold several
+// sessions; an idle target loses the newest-mtime race to a sibling and its
+// alerts would be attributed to the wrong session). Moves with /roam. (issue #6)
+export function roamerCurrentTranscript(): string | null {
   if (!isRoamerEnabled()) return null
   const state = readState()
   if (!state.current_target) return null
-  return join(PROJECTS_ROOT, cwdSlug(state.current_target.cwd))
+  return transcriptPath(state.current_target.cwd, state.current_target.session_id)
 }
 
 export function roamerCommandsForBotApi(): Array<{ command: string; description: string }> {
