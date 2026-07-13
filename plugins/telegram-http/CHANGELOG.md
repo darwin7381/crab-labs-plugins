@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.2 (2026-07-13)
+
+### Fixed — roamer bare `/model` picker's "current model" line no longer always "無法判定" (issue #8)
+- The picker called `detectCurrentModel()` with no projects-dir override, so in roamer mode it read the unset channel-bot `CHANNEL_BOT_PROJECTS_DIR` and never found the session jsonl → always "無法判定 / 尚無回覆紀錄" even on a busy target. `forwardSharedTuiSlash` now takes an optional `projectsDirOverride`; roamer derives it from `current_target.cwd` via the same `cwdSlug`/`PROJECTS_ROOT` used for `transcriptPath`, so the picker reads THIS target's history. Channel-bot mode unaffected (falls back to the env as before).
+
 ## 1.17.1 (2026-07-13)
 
 ### Fixed — startup-picker: a stale button tap can no longer drive the wrong TUI state

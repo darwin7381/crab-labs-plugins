@@ -1389,8 +1389,12 @@ async function handleTuiSlashForward(
     return true
   }
 
-  // Delegate to shared forwarder.
-  const handled = await forwardSharedTuiSlash(text, tmuxName, replyToTg)
+  // Delegate to shared forwarder. Pass the CURRENT target's projects dir
+  // (derived from its cwd via the same cwdSlug used for transcriptPath) so the
+  // bare-/model picker reads THIS target's session jsonl for its "current
+  // model" line instead of the unset channel-bot PROJECTS_DIR (issue #8).
+  const projectsDirOverride = join(PROJECTS_ROOT, cwdSlug(state.current_target.cwd))
+  const handled = await forwardSharedTuiSlash(text, tmuxName, replyToTg, projectsDirOverride)
   if (handled) return true
 
   // Not a known shared TUI command. Show available list.
