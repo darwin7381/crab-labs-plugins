@@ -8,6 +8,15 @@
   auto-logged to the BTCC Comms console. New sibling plugin `agent-inbox` boots
   this mode standalone (own process/port/state per agent, zero Telegram coupling).
 
+## 1.16.0 (2026-07-13)
+
+### Added — startup-picker interceptor: surface claude's boot-time blocking pickers to Telegram as tap-to-choose buttons
+- New `startup-picker.ts`: a pane watchdog (sibling of the login-expired watchdog) that detects claude's large-session resume menu — and any startup blocking picker — on the tmux pane, parses its REAL option labels, and surfaces them to the channel chat as inline buttons. A tap drives the keystroke (Down×idx + Enter) into the stuck TUI. The 1/2/3 is internal; the user taps a label.
+- Fixes the silent-wedge: a keyboard-less daemon-launched claude (channel-bot / roamer) that came up on the resume picker at restart / session-reopen sat blocked with nothing reaching Telegram. Now it's visible and one-tap answerable from the phone — the user also keeps the summary-vs-full choice (blind suppression would auto-pick full and waste usage on huge sessions).
+- Callback `spick:<tmuxHash6>:<idx>` pins the tap to the specific target (a stale button can't drive the wrong session). Wired into server.ts with a shared `paneWatchTargets` (dedups with the login watchdog) + a `spick:` callback branch.
+- Added `PRINCIPLES.md`: capabilities that belong to the plugin must be implemented IN the plugin, never scattered to machine env / boot plists / wrapper scripts (the wrong first-attempt fix for this exact bug); + keyboard-less launches must never block on an interactive prompt.
+- Supersedes issue #9's env-suppression stopgap (that was an out-of-plugin band-aid; this is the in-plugin fix).
+
 ## 1.15.2 (2026-07-12)
 
 ### Fixed — roamer bare `/model` now opens the same tap-to-pick picker as channel-bot (issue #7)

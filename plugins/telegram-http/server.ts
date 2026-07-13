@@ -50,6 +50,7 @@ import {
   handleModelCallbackForCurrentTarget,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
+import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -745,7 +746,7 @@ function inboxRegistryNames(): string[] {
   return Object.keys(loadInboxRegistry()).filter(n => n !== INBOX_SELF)
 }
 
-async function sendToAgent(to: string, text: string): Promise<string> {
+async function sendToAgent(to: string, text: string, replyTo?: number): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim().slice(0, 3500)
   if (!body) return 'send failed: empty text'
@@ -760,7 +761,7 @@ async function sendToAgent(to: string, text: string): Promise<string> {
           'Content-Type': 'application/json',
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
         },
-        body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered' }),
+        body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null }),
         signal: AbortSignal.timeout(8000),
       })
       if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use your Telegram reply tools instead."
@@ -773,6 +774,25 @@ async function sendToAgent(to: string, text: string): Promise<string> {
   if (target === INBOX_SELF) return 'send failed: that is your own inbox'
   const entry = reg[target]
   if (!entry?.url) return `send failed: unknown agent "${target}" — registry has: ${Object.keys(reg).join(', ') || '(empty)'}`
+  // log FIRST to mint the message id — it travels with the delivery so the
+  // receiver can quote-reply to this message (Telegram reply_to semantics)
+  let msgId: number | undefined
+  try {
+    const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
+    const lr = await fetch(`${base}/api/comms/log`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+      },
+      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null }),
+      signal: AbortSignal.timeout(6000),
+    }).catch(() => null)
+    if (lr?.ok) {
+      const j = await lr.json().catch(() => ({})) as { id?: number }
+      if (typeof j.id === 'number') msgId = j.id
+    }
+  } catch {}
   let delivery = 'failed'
   let detail = ''
   try {
@@ -782,7 +802,9 @@ async function sendToAgent(to: string, text: string): Promise<string> {
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
       },
-      body: JSON.stringify({ text: body, from: INBOX_SELF, logged: true }),
+      body: JSON.stringify({ text: body, from: INBOX_SELF, logged: msgId != null,
+        ...(msgId != null ? { msg_id: msgId } : {}),
+        ...(replyTo != null ? { reply_to_id: replyTo } : {}) }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -791,20 +813,21 @@ async function sendToAgent(to: string, text: string): Promise<string> {
   } catch (e) {
     detail = ` (${e})`
   }
-  // best-effort BTCC Comms log — the console shows fleet traffic; a log failure
-  // must never fail the message itself
-  try {
-    const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
-    void fetch(`${base}/api/comms/log`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-      },
-      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery }),
-      signal: AbortSignal.timeout(6000),
-    }).catch(() => {})
-  } catch {}
+  // settle the delivery status on the minted row (best effort)
+  if (msgId != null) {
+    try {
+      const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
+      void fetch(`${base}/api/comms/log-status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+        },
+        body: JSON.stringify({ id: msgId, delivery }),
+        signal: AbortSignal.timeout(6000),
+      }).catch(() => {})
+    } catch {}
+  }
   return delivery === 'delivered'
     ? `delivered to ${target}'s inbox (queued durably; logged to BTCC Comms)`
     : `send to ${target} FAILED${detail} — message NOT delivered`
@@ -898,6 +921,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
          properties: {
            to: { type: 'string', description: 'Target agent name from the fleet registry (e.g. "hephaestus", "sonn")' },
            text: { type: 'string', description: 'The message. Plain text; be specific — the receiver gets it as an inbox message with your name as sender.' },
+           reply_to: { type: 'string', description: 'Quote-reply: the btcc_msg_id from the meta of the message you are replying to. Use it whenever you answer a specific message so the thread shows what you are responding to.' },
          },
          required: ['to', 'text'],
        },
@@ -983,7 +1007,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     if (INBOX_ONLY && req.params.name === 'send_to_agent') {
-      const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''))
+      const replyTo = args.reply_to != null && String(args.reply_to).match(/^\d+$/) ? Number(args.reply_to) : undefined
+      const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo)
       return { content: [{ type: 'text', text: result }] }
     }
     switch (req.params.name) {
@@ -1198,18 +1223,38 @@ if (isSystemAlertEnabled()) {
 // This watches the tmux pane(s) directly and DMs allowFrom with the recovery
 // path (/login → /restart). Debounce lives inside the watchdog (one alert per
 // expiry episode per pane).
+// Shared pane-watch target list (channel-bot fixed session + roamer's live
+// current_target). Used by both the login-expired watchdog and the startup-
+// picker interceptor.
+async function paneWatchTargets(): Promise<WatchTarget[]> {
+  const targets: WatchTarget[] = []
+  if (isControlEnabled()) targets.push({ label: 'channel-bot', tmux: process.env.CHANNEL_BOT_TMUX_SESSION! })
+  if (isRoamerEnabled()) targets.push(...(await getRoamerWatchTargets()))
+  return targets
+}
+
+// Startup-picker interceptor (Joey 2026-07-13): surface claude's boot-time
+// blocking pickers (large-session resume menu, …) to TG as tap-to-choose
+// buttons so a keyboard-less daemon never wedges silently. Sends inline
+// buttons to every allowFrom chat; the tap drives the keystroke.
+if (isControlEnabled() || isRoamerEnabled()) {
+  startStartupPickerWatchdog({
+    listTargets: paneWatchTargets,
+    surface: ({ title, buttons }) => {
+      const access = loadAccess()
+      const keyboard = buttons.map(b => [b])
+      for (const chat_id of access.allowFrom) {
+        void sendTextWithMaybeKeyboard(chat_id, title, keyboard).catch(e =>
+          log('error', `startup-picker surface to ${chat_id} failed: ${e}`))
+      }
+    },
+    log,
+  })
+}
+
 if (isControlEnabled() || isRoamerEnabled()) {
   startLoginExpiredWatchdog({
-    listTargets: async () => {
-      const targets: WatchTarget[] = []
-      if (isControlEnabled()) {
-        targets.push({ label: 'channel-bot', tmux: process.env.CHANNEL_BOT_TMUX_SESSION! })
-      }
-      if (isRoamerEnabled()) {
-        targets.push(...(await getRoamerWatchTargets()))
-      }
-      return targets
-    },
+    listTargets: paneWatchTargets,
     notify: text => {
       const access = loadAccess()
       for (const chat_id of access.allowFrom) {
@@ -1299,6 +1344,21 @@ bot.on('callback_query:data', async ctx => {
   // dynamic current_target tmux). In channel-bot mode, resume:/model: go to
   // channel-bot's handleCallbackData (fixed TMUX_SESSION). model: is only
   // ever emitted in channel-bot mode (see forwardSharedTuiSlash guard).
+  if (data.startsWith('spick:')) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chatId = String(ctx.chat?.id ?? senderId)
+    const reply = async (msg: string) => { await sendTextWithMaybeKeyboard(chatId, msg) }
+    try { await handleStartupPickerCallback(data, paneWatchTargets, reply) }
+    catch (err) { log('warn', `startup-picker callback failed: ${err instanceof Error ? err.message : err}`) }
+    await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
   if (data.startsWith('resume:') || data.startsWith('roam:') || data.startsWith('model:')) {
     const access = loadAccess()
     const senderId = String(ctx.from.id)
@@ -2398,13 +2458,15 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         return
       }
       const body = (await readJsonBody(req).catch(() => null)) as
-        { text?: string; from?: string; chat_id?: string; logged?: boolean } | null
+        { text?: string; from?: string; chat_id?: string; logged?: boolean;
+          msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string } | null
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
       if (!text) {
         res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
         return
       }
       const from = (typeof body?.from === 'string' && body.from ? body.from : 'local-inject').slice(0, 64)
+      let btccMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
       // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
       // delivery gets a BTCC row unless the sender declares logged:true (senders
       // that already log with richer context: send_to_agent, BTCC /send, Argus wake).
@@ -2426,15 +2488,21 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         }
         try {
           const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
-          void fetch(`${base}/api/comms/log`, {
+          // awaited (not fire-and-forget): the minted row id travels in the channel
+          // meta as btcc_msg_id so the receiving agent can quote-reply to this message
+          const r = await fetch(`${base}/api/comms/log`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
             },
-            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered' }),
+            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null }),
             signal: AbortSignal.timeout(6000),
-          }).catch(() => {})
+          }).catch(() => null)
+          if (r?.ok) {
+            const j = await r.json().catch(() => ({})) as { id?: number }
+            if (typeof j.id === 'number') btccMsgId = j.id
+          }
         } catch {}
       }
       // Default chat_id = first allowFrom (the owner): if the agent finishes and
@@ -2444,7 +2512,13 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         method: 'notifications/claude/channel',
         params: {
           content: text,
-          meta: { chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject' },
+          meta: {
+            chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
+            ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
+            ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
+            ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
+            ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+          },
         },
       })
       res.writeHead(200, { 'content-type': 'application/json' })
