@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.3 (2026-07-13)
+
+### Fixed — roamer system-alert jsonl fallback now follows the moving target (issue #6)
+- The jsonl-tail fallback resolved its watch dir ONCE from a static env (`SYSTEM_ALERT_PROJECTS_DIR` / `CHANNEL_BOT_PROJECTS_DIR`), which roamer can't set (target moves per `/roam`) — so the fallback was disabled and API-death / login-expiry alerts never fired in roamer mode. `startSystemAlertWatcher` now takes an optional `resolveDir()` re-called each tick; roamer passes `roamerCurrentProjectsDir()` (current_target.cwd → same cwdSlug/PROJECTS_ROOT as transcriptPath). The existing newest-jsonl file-switch logic then follows target switches automatically (new dir → new file → offset reset to end, no replay). Channel-bot mode unchanged (static env dir).
+
 ## 1.17.2 (2026-07-13)
 
 ### Fixed — roamer bare `/model` picker's "current model" line no longer always "無法判定" (issue #8)
