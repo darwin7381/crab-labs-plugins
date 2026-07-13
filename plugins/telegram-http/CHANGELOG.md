@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.1 (2026-07-13)
+
+### Fixed — startup-picker: a stale button tap can no longer drive the wrong TUI state
+- The tap only validated the target session, not that the SAME picker was still on the pane. A stale tap (picker already answered elsewhere, timed out, or replaced by a different picker / the normal prompt) would blind-send Down/Enter into whatever was there. Now the callback carries a picker-key hash (`spick:<tmuxHash6>:<keyHash6>:<idx>`) and both the callback handler and `driveStartupPicker` re-capture the live pane and require the same picker (matching key, in-range idx) before sending ANY key — otherwise they abort untouched and tell the user the menu is gone.
+
 ## 1.17.0 (2026-07-13)
 
 ### Added — startup-picker interceptor: surface claude's boot-time blocking pickers to Telegram as tap-to-choose buttons

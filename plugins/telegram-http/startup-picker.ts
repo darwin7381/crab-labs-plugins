@@ -103,10 +103,28 @@ export function detectStartupPicker(pane: string): DetectedPicker | null {
   return null
 }
 
-/** Drive the picker: from the top-anchored cursor, Down × idx then Enter.
- *  (Same deterministic navigation resumePickerInlineSwitch uses.) Returns
- *  true if the picker cleared. */
-export async function driveStartupPicker(tmux: string, idx: number): Promise<boolean> {
+export type DriveResult = 'ok' | 'gone' | 'stuck'
+
+/**
+ * Drive the picker: from the top-anchored cursor, Down × idx then Enter.
+ * (Same deterministic navigation resumePickerInlineSwitch uses.)
+ *
+ * CRITICAL — re-verify the LIVE pane before sending ANY key (a tapped button
+ * can be stale: the picker may have been answered elsewhere, timed out, or been
+ * replaced by a different picker or the normal prompt). Sending Down/Enter into
+ * a non-picker pane submits garbage into claude's input; into a *different*
+ * picker it selects the wrong thing. So we require the SAME picker (matched by
+ * `expectKey`) with the option index still in range, captured now, or we abort
+ * without touching the pane. Returns:
+ *   'gone'  — no matching picker on the pane now (nothing sent)
+ *   'ok'    — drove it and the picker cleared
+ *   'stuck' — drove it but the picker is still up
+ */
+export async function driveStartupPicker(tmux: string, idx: number, expectKey: string): Promise<DriveResult> {
+  const { stdout: pane } = await runCommand(['tmux', 'capture-pane', '-t', tmux, '-p'])
+  const live = detectStartupPicker(pane)
+  if (!live || live.key !== expectKey || idx < 0 || idx >= live.options.length) return 'gone'
+
   for (let i = 0; i < idx; i++) {
     await runCommand(['tmux', 'send-keys', '-t', tmux, 'Down'])
     await new Promise((r) => setTimeout(r, 100))
@@ -116,15 +134,25 @@ export async function driveStartupPicker(tmux: string, idx: number): Promise<boo
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise((r) => setTimeout(r, 400))
     const { stdout } = await runCommand(['tmux', 'capture-pane', '-t', tmux, '-p'])
-    if (!detectStartupPicker(stdout)) return true
+    if (!detectStartupPicker(stdout)) return 'ok'
   }
-  return false
+  return 'stuck'
 }
 
-// callback_data = spick:<tmuxHash6>:<idx0>  (≤ ~20 bytes). The hash pins the
-// tap to a specific target so a stale button can't drive the wrong session.
-export function pickerCallback(tmux: string, idx: number): string {
-  return `spick:${tmuxHash6(tmux)}:${idx}`
+// A 6-char stable hash of a string (djb2) — used for both the tmux-name pin and
+// the picker-key pin embedded in callback_data.
+function hash6(s: string): string {
+  let h = 5381
+  for (const c of s) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0
+  return h.toString(16).padStart(8, '0').slice(0, 6)
+}
+
+// callback_data = spick:<tmuxHash6>:<keyHash6>:<idx0>  (≤ ~30 bytes). The tmux
+// hash pins the tap to a specific target; the key hash pins it to the SAME
+// picker that was surfaced, so a stale tap can't drive a different picker that
+// happens to be up now.
+export function pickerCallback(tmux: string, key: string, idx: number): string {
+  return `spick:${tmuxHash6(tmux)}:${hash6(key)}:${idx}`
 }
 
 export interface SurfaceSpec {
@@ -161,7 +189,7 @@ export function startStartupPickerWatchdog(opts: {
             title: `${picker.title}\n（${t.label}）點下面選項，我幫你選：`,
             buttons: picker.options.map((label, i) => ({
               text: `${i + 1}. ${label}`,
-              callback_data: pickerCallback(t.tmux, i),
+              callback_data: pickerCallback(t.tmux, picker.key, i),
             })),
           })
         }
@@ -176,9 +204,11 @@ export function startStartupPickerWatchdog(opts: {
 }
 
 /**
- * Handle a `spick:<hash>:<idx>` button tap. Resolves the target tmux by hash
- * against the live target list (so a tap can't drive a session that's gone or
- * a different one), drives the picker, and reports back.
+ * Handle a `spick:<tmuxHash>:<keyHash>:<idx>` button tap. Resolves the target
+ * tmux by hash against the live target list, then driveStartupPicker re-verifies
+ * the SAME picker (keyHash) is still on the pane before sending any key — so a
+ * stale tap (picker answered elsewhere / timed out / replaced) never drives the
+ * wrong TUI state. Reports the outcome.
  */
 export async function handleStartupPickerCallback(
   data: string,
@@ -186,13 +216,27 @@ export async function handleStartupPickerCallback(
   reply: (msg: string) => Promise<void>,
 ): Promise<boolean> {
   if (!data.startsWith('spick:')) return false
-  const [, hash, idxRaw] = data.split(':')
+  const [, tmuxHash, keyHash, idxRaw] = data.split(':')
   const idx = parseInt(idxRaw, 10)
-  if (!hash || Number.isNaN(idx)) { await reply('❌ 選單 callback 格式錯誤'); return true }
+  if (!tmuxHash || !keyHash || Number.isNaN(idx)) { await reply('❌ 選單 callback 格式錯誤'); return true }
   const targets = await listTargets().catch(() => [] as PickerTarget[])
-  const target = targets.find((t) => tmuxHash6(t.tmux) === hash)
+  const target = targets.find((t) => tmuxHash6(t.tmux) === tmuxHash)
   if (!target) { await reply('⚠️ 這個選單的 session 已經不在了（可能已重啟或換過 target）— 選項失效'); return true }
-  const ok = await driveStartupPicker(target.tmux, idx)
-  await reply(ok ? `✅ 已選好，claude 繼續了（${target.label}）` : `⚠️ 送出選擇了，但選單好像還在（${target.label}）— 可能要再點一次或看一下畫面`)
+
+  // Confirm the SAME picker is still on the pane (guards a stale tap driving a
+  // different picker or the normal prompt).
+  const { stdout: pane } = await runCommand(['tmux', 'capture-pane', '-t', target.tmux, '-p'])
+  const live = detectStartupPicker(pane)
+  if (!live || hash6(live.key) !== keyHash) {
+    await reply(`⚠️ 這個選單已經不在了（可能已在別處選過、逾時、或畫面已變）— 沒有動作。看一下 ${target.label} 現在的畫面`)
+    return true
+  }
+
+  const res = await driveStartupPicker(target.tmux, idx, live.key)
+  await reply(
+    res === 'ok' ? `✅ 已選好，claude 繼續了（${target.label}）`
+    : res === 'gone' ? `⚠️ 剛要選時選單已消失（可能同時在別處被選掉）— 沒有動作`
+    : `⚠️ 送出選擇了但選單還在（${target.label}）— 可能要再點一次或看一下畫面`,
+  )
   return true
 }
