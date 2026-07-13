@@ -686,6 +686,11 @@ export async function forwardSharedTuiSlash(
   text: string,
   tmuxName: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  // Roamer passes the CURRENT target's projects dir (derived from its cwd) so
+  // the bare-/model picker's "current model" line reads the right session's
+  // jsonl. Omitted in channel-bot mode → detectCurrentModel falls back to the
+  // fixed CHANNEL_BOT_PROJECTS_DIR env. (issue #8)
+  projectsDirOverride?: string,
 ): Promise<boolean> {
   // /input passthrough first — must beat the verbatim-send branches below so
   // `/input /clear` types `/clear` literally into the TUI instead of being
@@ -751,7 +756,7 @@ export async function forwardSharedTuiSlash(
         // 2026-07-10: "選單要能看出目前是哪個模型").
         const isFixed = tmuxName === TMUX_SESSION
         const cbSuffix = isFixed ? '' : `@${tmuxHash6(tmuxName)}`
-        const current = detectCurrentModel()
+        const current = detectCurrentModel(projectsDirOverride)
         const curNorm = current ? normalizeModelId(current.id) : null
         const keyboard: InlineButton[][] = modelChoices().map(c => {
           const isCur = curNorm !== null && c.value !== 'default' && normalizeModelId(c.value) === curNorm
