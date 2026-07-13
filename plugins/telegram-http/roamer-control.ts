@@ -1464,6 +1464,19 @@ export async function getRoamerWatchTargets(): Promise<Array<{ label: string; tm
   return [{ label: projectName(state.current_target.cwd), tmux: state.current_target.tmux }]
 }
 
+/**
+ * The CURRENT roamer target's claude projects dir (session jsonl live here),
+ * or null if no target. Re-resolved each tick by the system-alert watcher so
+ * the jsonl fallback follows /roam target switches instead of a static env
+ * (issue #6). Same cwdSlug/PROJECTS_ROOT derivation as transcriptPath.
+ */
+export function roamerCurrentProjectsDir(): string | null {
+  if (!isRoamerEnabled()) return null
+  const state = readState()
+  if (!state.current_target) return null
+  return join(PROJECTS_ROOT, cwdSlug(state.current_target.cwd))
+}
+
 export function roamerCommandsForBotApi(): Array<{ command: string; description: string }> {
   if (!isRoamerEnabled()) return []
   return [

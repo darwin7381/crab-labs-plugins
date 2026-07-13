@@ -213,12 +213,20 @@ export function handleOtlpLogs(payload: unknown): number {
 
 // ---- FALLBACK layer: session-jsonl tail ------------------------------------
 
-export function startSystemAlertWatcher(opts: { notify: Notify; log: Log }): void {
+export function startSystemAlertWatcher(opts: {
+  notify: Notify
+  log: Log
+  // Dynamic dir resolver — re-called EACH tick. Roamer passes its current
+  // target's projects dir (which moves with /roam); the fixed-dir file-switch
+  // logic below then follows the new target's newest jsonl automatically.
+  // Omitted → the static env dir (channel-bot). (issue #6)
+  resolveDir?: () => string | null
+}): void {
   _notify = opts.notify
   _log = opts.log
-  const dir = process.env.SYSTEM_ALERT_PROJECTS_DIR || process.env.CHANNEL_BOT_PROJECTS_DIR || ''
-  if (!dir) {
-    opts.log('warn', 'system-alert: no SYSTEM_ALERT_PROJECTS_DIR / CHANNEL_BOT_PROJECTS_DIR — jsonl fallback disabled (OTLP receiver still active)')
+  const staticDir = process.env.SYSTEM_ALERT_PROJECTS_DIR || process.env.CHANNEL_BOT_PROJECTS_DIR || ''
+  if (!staticDir && !opts.resolveDir) {
+    opts.log('warn', 'system-alert: no SYSTEM_ALERT_PROJECTS_DIR / CHANNEL_BOT_PROJECTS_DIR and no dynamic resolver — jsonl fallback disabled (OTLP receiver still active)')
     return
   }
   const startedAt = Date.now()
@@ -226,7 +234,7 @@ export function startSystemAlertWatcher(opts: { notify: Notify; log: Log }): voi
   let offset = 0
   let remainder = ''
 
-  const newestJsonl = (): { path: string; size: number } | null => {
+  const newestJsonl = (dir: string): { path: string; size: number } | null => {
     try {
       let best: string | null = null
       let bestM = 0
@@ -246,7 +254,9 @@ export function startSystemAlertWatcher(opts: { notify: Notify; log: Log }): voi
   }
 
   const tick = () => {
-    const cur = newestJsonl()
+    const dir = opts.resolveDir?.() || staticDir
+    if (!dir) return // roamer with no current target yet — nothing to tail
+    const cur = newestJsonl(dir)
     if (!cur) return
     if (cur.path !== watchedFile) {
       watchedFile = cur.path
@@ -287,5 +297,5 @@ export function startSystemAlertWatcher(opts: { notify: Notify; log: Log }): voi
   }
 
   setInterval(tick, POLL_MS).unref()
-  opts.log('info', `system-alert forwarder ON (otlp=/v1/logs primary; jsonl fallback dir=${dir}, poll=${POLL_MS / 1000}s, dedupe=${DEDUPE_WINDOW_MS / 60000}min)`)
+  opts.log('info', `system-alert forwarder ON (otlp=/v1/logs primary; jsonl fallback dir=${opts.resolveDir ? '(dynamic: roamer current target)' : staticDir}, poll=${POLL_MS / 1000}s, dedupe=${DEDUPE_WINDOW_MS / 60000}min)`)
 }
