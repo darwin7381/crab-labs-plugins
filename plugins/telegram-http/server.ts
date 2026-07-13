@@ -2409,6 +2409,21 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       // delivery gets a BTCC row unless the sender declares logged:true (senders
       // that already log with richer context: send_to_agent, BTCC /send, Argus wake).
       if (INBOX_ONLY && body?.logged !== true) {
+        // PARSE rather than strip (codex r3): wake handoffs keep their priority
+        // and get kind='wake' so BTCC history/UI retain the on-call semantics;
+        // only bare legacy identity prefixes (【a → b】) are dropped as noise.
+        let kind = 'message'
+        let logBody = text
+        const argusTpl = text.match(/^【Argus 值班轉交 ([A-Za-z0-9]{1,8})】\s*/)
+        const prioTag = text.match(/^\[[A-Za-z0-9]{1,8}\]\s/)
+        if (argusTpl) {
+          kind = 'wake'
+          logBody = `[${argusTpl[1]}] ` + text.slice(argusTpl[0].length).replace(/（詳見 xboard [^）]{0,80}）\s*$/, '')
+        } else if (prioTag) {
+          kind = 'wake'
+        } else {
+          logBody = text.replace(/^【[^】]{1,60}】\s*/, '')
+        }
         try {
           const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
           void fetch(`${base}/api/comms/log`, {
@@ -2417,7 +2432,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
               'Content-Type': 'application/json',
               ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
             },
-            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind: 'message', body: text.replace(/^【[^】]{1,60}】\s*/, '').slice(0, 4000), delivery: 'delivered' }),
+            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered' }),
             signal: AbortSignal.timeout(6000),
           }).catch(() => {})
         } catch {}
