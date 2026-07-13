@@ -1,7 +1,7 @@
 {
   "name": "telegram-http",
   "description": "Telegram channel for Claude Code — HTTP MCP daemon transport. Drop-in replacement for the official telegram plugin that decouples the bot daemon from claude TUI lifetime. Survives claude restarts; no more 2-3 min stdio death cycles.",
-  "version": "1.15.2",
+  "version": "1.16.0",
   "author": {
     "name": "Joey / Crab Labs",
     "url": "https://github.com/darwin7381"
