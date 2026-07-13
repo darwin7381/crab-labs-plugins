@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.4 (2026-07-13)
+
+### Fixed — roamer system-alert now tails the EXACT target session, not newest-in-dir (issue #6 follow-up)
+- The 1.17.3 fix resolved the right *directory* but still handed it to `newestJsonl(dir)` — and a single cwd can hold several session jsonls. When the roamer's current target sits idle while a sibling session in the same cwd is active, the sibling wins the newest-mtime race, so API-death / login-expiry alerts get tailed from (and attributed to) the WRONG session, and the real target's alerts are missed. The roamer already knows its target exactly (`current_target.cwd` + `session_id`), so the watcher now resolves that one transcript directly via a `resolveFile()` (was `resolveDir()`), bypassing the newest-jsonl guess. Follows `/roam` (null between targets; a 0-turn target with no jsonl yet is simply skipped until it writes). Channel-bot mode unchanged (static dir + newest-jsonl, one primary session per fixed dir). Caught by the Codex stop-gate review.
+
 ## 1.17.3 (2026-07-13)
 
 ### Fixed — roamer system-alert jsonl fallback now follows the moving target (issue #6)

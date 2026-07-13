@@ -48,7 +48,7 @@ import {
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
   handleModelCallbackForCurrentTarget,
-  roamerCurrentProjectsDir,
+  roamerCurrentTranscript,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
@@ -1207,9 +1207,9 @@ setInterval(() => {
 if (isSystemAlertEnabled()) {
   startSystemAlertWatcher({
     log,
-    // Roamer: follow the current target's jsonl dynamically (issue #6). Channel-
-    // bot: undefined → the static CHANNEL_BOT_PROJECTS_DIR env, unchanged.
-    resolveDir: isRoamerEnabled() ? roamerCurrentProjectsDir : undefined,
+    // Roamer: tail the current target's EXACT transcript, moving with /roam
+    // (issue #6). Channel-bot: undefined → static CHANNEL_BOT_PROJECTS_DIR env.
+    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : undefined,
     notify: text => {
       const access = loadAccess()
       for (const chat_id of access.allowFrom) {
