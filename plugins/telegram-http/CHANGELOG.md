@@ -1,14 +1,6 @@
 # Changelog
 
-## 1.16.0 (2026-07-12)
-
-- **agent-inbox: full A2A mesh.** `CHANNEL_INBOX_ONLY=1` mode is now bidirectional:
-  a `send_to_agent` tool lets any agent message any fleet agent via the shared
-  registry (`~/.claude/agent-inbox/registry.json`); deliveries are durable and
-  auto-logged to the BTCC Comms console. New sibling plugin `agent-inbox` boots
-  this mode standalone (own process/port/state per agent, zero Telegram coupling).
-
-## 1.16.0 (2026-07-13)
+## 1.17.0 (2026-07-13)
 
 ### Added — startup-picker interceptor: surface claude's boot-time blocking pickers to Telegram as tap-to-choose buttons
 - New `startup-picker.ts`: a pane watchdog (sibling of the login-expired watchdog) that detects claude's large-session resume menu — and any startup blocking picker — on the tmux pane, parses its REAL option labels, and surfaces them to the channel chat as inline buttons. A tap drives the keystroke (Down×idx + Enter) into the stuck TUI. The 1/2/3 is internal; the user taps a label.
@@ -16,6 +8,14 @@
 - Callback `spick:<tmuxHash6>:<idx>` pins the tap to the specific target (a stale button can't drive the wrong session). Wired into server.ts with a shared `paneWatchTargets` (dedups with the login watchdog) + a `spick:` callback branch.
 - Added `PRINCIPLES.md`: capabilities that belong to the plugin must be implemented IN the plugin, never scattered to machine env / boot plists / wrapper scripts (the wrong first-attempt fix for this exact bug); + keyboard-less launches must never block on an interactive prompt.
 - Supersedes issue #9's env-suppression stopgap (that was an out-of-plugin band-aid; this is the in-plugin fix).
+
+## 1.16.0 (2026-07-12)
+
+- **agent-inbox: full A2A mesh.** `CHANNEL_INBOX_ONLY=1` mode is now bidirectional:
+  a `send_to_agent` tool lets any agent message any fleet agent via the shared
+  registry (`~/.claude/agent-inbox/registry.json`); deliveries are durable and
+  auto-logged to the BTCC Comms console. New sibling plugin `agent-inbox` boots
+  this mode standalone (own process/port/state per agent, zero Telegram coupling).
 
 ## 1.15.2 (2026-07-12)
 
