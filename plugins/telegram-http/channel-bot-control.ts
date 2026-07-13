@@ -236,16 +236,24 @@ function lastSwitchStatePath(): string {
   return `/tmp/channel-bot-last-model-switch-${TMUX_SESSION || 'default'}.json`
 }
 
-function saveLastConfirmedSwitch(value: string): void {
+function saveLastConfirmedSwitch(value: string, tmux: string): void {
   try {
-    writeFileSync(lastSwitchStatePath(), JSON.stringify({ value, ts: Date.now() }), { mode: 0o644 })
+    writeFileSync(lastSwitchStatePath(), JSON.stringify({ value, ts: Date.now(), tmux }), { mode: 0o644 })
   } catch {}
 }
 
-function loadLastConfirmedSwitch(): { value: string; ts: number } | null {
+function loadLastConfirmedSwitch(tmux: string): { value: string; ts: number } | null {
   try {
     const j = JSON.parse(readFileSync(lastSwitchStatePath(), 'utf8'))
-    if (typeof j?.value === 'string' && typeof j?.ts === 'number') return j
+    // Per-target: a roamer daemon keeps ONE record file shared across all its
+    // roam targets, so only trust it for the SAME target it was recorded on —
+    // otherwise a switch on target A would mislabel target B's "current model".
+    // Records from before this field existed (no j.tmux) are ignored → the
+    // caller falls through to the jsonl's actual last-reply model. Channel-bot
+    // always passes its fixed TMUX_SESSION, so it matches and is unaffected.
+    if (typeof j?.value === 'string' && typeof j?.ts === 'number' && j?.tmux === tmux) {
+      return { value: j.value, ts: j.ts }
+    }
   } catch {}
   return null
 }
@@ -260,10 +268,13 @@ function loadLastConfirmedSwitch(): { value: string; ts: number } | null {
  *     jsonl — the model that actually produced the agent's latest reply
  *  3. global ~/.claude/settings.json `model` (what an un-pinned TUI inherits)
  */
-export function detectCurrentModel(projectsDirOverride?: string): { id: string; source: string } | null {
+export function detectCurrentModel(projectsDirOverride?: string, tmuxName?: string): { id: string; source: string } | null {
   let best: { id: string; source: string; ts: number } | null = null
 
-  const sw = loadLastConfirmedSwitch()
+  // Per-target record: only honor a recorded switch when we know which target
+  // we're reporting for (roamer passes its current target's tmux; channel-bot
+  // passes TMUX_SESSION). Without a tmux we skip it and rely on the jsonl.
+  const sw = tmuxName ? loadLastConfirmedSwitch(tmuxName) : null
   if (sw && sw.value !== 'default') best = { id: sw.value, source: '剛切換（TUI 已確認）', ts: sw.ts }
 
   const dir = projectsDirOverride ?? PROJECTS_DIR
@@ -407,7 +418,7 @@ async function runTuiSwitchCommand(opts: {
           ? `\n🔒 scope=session：全域預設已還原為 \`${prevModel ?? '(未設定)'}\` — 本 TUI 內用 \`${value}\`，其他 agent 不受污染。`
           : `\n⚠️ scope=session 還原全域預設失敗 — 請手動檢查 ~/.claude/settings.json（原值 \`${prevModel ?? '(未設定)'}\`）。`
       }
-      if (isModel) saveLastConfirmedSwitch(value)
+      if (isModel) saveLastConfirmedSwitch(value, tmuxName)
       await notify(`✅ \`${full}\` 已生效（${confirmed}${confirmedPicker ? '，切換確認已自動按 Enter' : ''}）${scopeNote}`)
       if (isModel && !isModelScopeSession() && prevModel && normalizeModelId(prevModel) !== normalizeModelId(value) && value !== 'default') {
         await notify(
@@ -763,7 +774,7 @@ export async function forwardSharedTuiSlash(
         // 2026-07-10: "選單要能看出目前是哪個模型").
         const isFixed = tmuxName === TMUX_SESSION
         const cbSuffix = isFixed ? '' : `@${tmuxHash6(tmuxName)}`
-        const current = detectCurrentModel(projectsDirOverride)
+        const current = detectCurrentModel(projectsDirOverride, tmuxName)
         const curNorm = current ? normalizeModelId(current.id) : null
         const keyboard: InlineButton[][] = modelChoices().map(c => {
           const isCur = curNorm !== null && c.value !== 'default' && normalizeModelId(c.value) === curNorm

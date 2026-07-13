@@ -1,6 +1,6 @@
 {
   "name": "crab-labs-channel-telegram-http",
-  "version": "1.17.5",
+  "version": "1.17.6",
   "license": "Apache-2.0",
   "type": "module",
   "bin": "./server.ts",
