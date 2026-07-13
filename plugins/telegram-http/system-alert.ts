@@ -213,6 +213,49 @@ export function handleOtlpLogs(payload: unknown): number {
 
 // ---- FALLBACK layer: session-jsonl tail ------------------------------------
 
+/** Newest `.jsonl` by mtime in `dir` (channel-bot: one primary session per
+ *  fixed dir, so newest == the one to tail). */
+export function newestJsonl(dir: string): { path: string; size: number } | null {
+  try {
+    let best: string | null = null
+    let bestM = 0
+    let bestSize = 0
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.jsonl')) continue
+      const full = join(dir, name)
+      try {
+        const st = statSync(full)
+        if (st.mtimeMs > bestM) { bestM = st.mtimeMs; best = full; bestSize = st.size }
+      } catch {}
+    }
+    return best ? { path: best, size: bestSize } : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Decide which jsonl the watcher tails this tick (issue #6).
+ * - Roamer (`resolveFile` present): its current target's EXACT transcript —
+ *   NOT the newest-in-dir. A cwd can hold several sessions; if the target is
+ *   idle a newer sibling would win the mtime race and we'd tail the wrong
+ *   session, missing the target's API/login alerts. null between /roam targets;
+ *   a 0-turn target whose jsonl doesn't exist yet is skipped (statSync throws).
+ * - Channel-bot (no `resolveFile`): newest jsonl in the static dir.
+ * Exported for tests.
+ */
+export function resolveWatchFile(
+  resolveFile: (() => string | null) | undefined,
+  staticDir: string,
+): { path: string; size: number } | null {
+  if (resolveFile) {
+    const f = resolveFile()
+    if (!f) return null
+    try { return { path: f, size: statSync(f).size } } catch { return null }
+  }
+  return newestJsonl(staticDir)
+}
+
 export function startSystemAlertWatcher(opts: {
   notify: Notify
   log: Log
@@ -237,36 +280,8 @@ export function startSystemAlertWatcher(opts: {
   let offset = 0
   let remainder = ''
 
-  const newestJsonl = (dir: string): { path: string; size: number } | null => {
-    try {
-      let best: string | null = null
-      let bestM = 0
-      let bestSize = 0
-      for (const name of readdirSync(dir)) {
-        if (!name.endsWith('.jsonl')) continue
-        const full = join(dir, name)
-        try {
-          const st = statSync(full)
-          if (st.mtimeMs > bestM) { bestM = st.mtimeMs; best = full; bestSize = st.size }
-        } catch {}
-      }
-      return best ? { path: best, size: bestSize } : null
-    } catch {
-      return null
-    }
-  }
-
   const tick = () => {
-    let cur: { path: string; size: number } | null
-    if (opts.resolveFile) {
-      // Roamer: tail the current target's EXACT transcript (no newest-jsonl
-      // guessing). null between targets; a 0-turn target has no jsonl yet.
-      const f = opts.resolveFile()
-      if (!f) return
-      try { cur = { path: f, size: statSync(f).size } } catch { return }
-    } else {
-      cur = newestJsonl(staticDir)
-    }
+    const cur = resolveWatchFile(opts.resolveFile, staticDir)
     if (!cur) return
     if (cur.path !== watchedFile) {
       watchedFile = cur.path
