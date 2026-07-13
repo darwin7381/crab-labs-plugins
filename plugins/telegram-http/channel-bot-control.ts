@@ -751,7 +751,14 @@ export async function forwardSharedTuiSlash(
       // and dynamic roamer targets (issue #7 — same-version UX was inconsistent
       // and read as "old deployment"): dynamic targets embed a tmux-name hash in
       // the callback so the tap is validated against the CURRENT target.
-      if (cmd === '/model' && isControlEnabled()) {
+      // Gate on having a target session, NOT isControlEnabled(): the latter is
+      // `TMUX_SESSION !== ''`, which is FALSE in roamer mode (no fixed session),
+      // so it silently killed the bare-/model picker for roamers — bare /model
+      // fell through to the `usage: /model <value>` error (regression report
+      // 2026-07-13). `tmuxName` is the actual target (fixed session OR the
+      // roam-<x> pane) and is non-empty in both modes; the branch below already
+      // handles dynamic roamer targets via the tmuxHash6 callback suffix.
+      if (cmd === '/model' && tmuxName !== '') {
         // Mark the current model on its button + a status line (Joey
         // 2026-07-10: "選單要能看出目前是哪個模型").
         const isFixed = tmuxName === TMUX_SESSION

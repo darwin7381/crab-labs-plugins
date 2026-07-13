@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.5 (2026-07-13)
+
+### Fixed — bare /model picker was dead in roamer mode (regression report 2026-07-13)
+- In a roam session, `/model` (no argument) returned `usage: /model <value>` instead of the tap-to-pick model keyboard. Root cause: the picker branch was gated on `isControlEnabled()`, which is `TMUX_SESSION !== ''` — always FALSE for a roamer daemon (no fixed channel-bot session). This has been broken since 1.15.2, whose "#7 roamer bare /model gets the picker" fix dropped the `tmuxName === TMUX_SESSION` half of the guard but kept `isControlEnabled()`, so the picker never actually reached roamers (the #7/#8 fixes were verified only against a fixed channel-bot). NOT caused by the 1.17.3/1.17.4 system-alert work. Fix: gate on `tmuxName !== ''` (the actual target — fixed session OR the roam-<x> pane, non-empty in both modes); the branch below already builds dynamic-target callbacks via the tmuxHash6 suffix, and the tap path (`handleModelCallbackForCurrentTarget`) already routes to the current target, so both display and selection now work in roam. `/model <value>` (with an explicit id) was unaffected throughout. Channel-bot mode unchanged (`tmuxName` = TMUX_SESSION).
+
 ## 1.17.4 (2026-07-13)
 
 ### Fixed — roamer system-alert now tails the EXACT target session, not newest-in-dir (issue #6 follow-up)
