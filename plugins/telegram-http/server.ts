@@ -685,6 +685,7 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
     }
     try {
       await server.notification(notif as Parameters<Server['notification']>[0])
+      maybeAutoAckScheduled(notif)
       try { rmSync(fullPath) } catch {}
       replayed++
     } catch (err) {
@@ -739,6 +740,34 @@ const pendingPermissions = new Map<string, {
 const INBOX_REGISTRY_PATH = process.env.AGENT_INBOX_REGISTRY
   ?? join(process.env.HOME ?? '', '.claude', 'agent-inbox', 'registry.json')
 const INBOX_SELF = process.env.AGENT_INBOX_SELF ?? 'unknown-agent'
+
+// ---- Scheduler daemon-level auto-ack (SCHEDULER-MODULE backlog #1) ----------
+// When a BTCC Scheduler wake-up ([scheduled][tag][run:N]) is CONFIRMED written
+// into a live session, the daemon acks the run machine-side — "開工回執" drops
+// from agent discipline to infrastructure, and stalled_no_ack becomes a pure
+// "session never received it" signal. complete stays with the agent (the
+// outcome summary must be authored). Inbox daemons only; fire-and-forget; the
+// ack endpoint 409s on repeats so multi-session broadcast double-acks are noise.
+const autoAckedRuns = new Set<string>()
+function maybeAutoAckScheduled(notif: { method: string; params: unknown }): void {
+  if (!INBOX_ONLY) return
+  try {
+    const content = (notif.params as { content?: unknown } | undefined)?.content
+    if (typeof content !== 'string') return
+    const m = content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)
+    if (!m) return
+    const rid = m[1]
+    if (autoAckedRuns.has(rid)) return
+    autoAckedRuns.add(rid)
+    if (autoAckedRuns.size > 500) autoAckedRuns.clear()  // unbounded-growth guard
+    const base = process.env.BTCC_API_BASE ?? 'https://btcc.blocktempo.ai'
+    void fetch(`${base}/api/scheduler/runs/${rid}/ack`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(6000),
+    }).then(r => log('info', `scheduler auto-ack run ${rid}: ${r.status}`))
+      .catch(err => log('warn', `scheduler auto-ack run ${rid} failed (agent can still ack manually): ${err}`))
+  } catch {}
+}
 
 function loadInboxRegistry(): Record<string, { url: string; desc?: string }> {
   try { return JSON.parse(readFileSync(INBOX_REGISTRY_PATH, 'utf8')) } catch { return {} }
@@ -2187,7 +2216,9 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
     if (!sid) continue
     if (sseOpen.get(sid)) {
       anySseOpen = true
-      void server.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
+      void server.notification(notif as Parameters<Server['notification']>[0]).then(() => {
+        maybeAutoAckScheduled(notif)
+      }).catch(err => {
         log('error', `notify session ${sid} failed, removing from registry: ${err}`)
         activeServers.delete(server)
       })
@@ -2692,6 +2723,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             for (const notif of queued) {
               try {
                 await boundServer.notification(notif as Parameters<Server['notification']>[0])
+                maybeAutoAckScheduled(notif)
               } catch (err) {
                 log('error', `mem-flush failed: ${err}`)
               }
