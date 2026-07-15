@@ -838,32 +838,51 @@ export async function forwardSharedTuiSlash(
  * Sequence:
  *   1. tmux kill-session — wraps up the current claude TUI (it sees
  *      SIGHUP from its parent shell dying). Wrapper's monitor loop
- *      detects "session does not exist" on next check and triggers
+ *      detects "session does not exist" on next check (≤30s) and triggers
  *      start_claude() which reads $CHANNEL_BOT_NEXT_ARGS_FILE if present.
- *   2. launchctl kickstart -k <wrapper> — restart the wrapper script
- *      process itself (so it immediately re-enters monitor loop rather
- *      than waiting up to 30s for the next poll cycle).
+ *      THIS ALONE is the restart — step 2 is only a health backstop.
+ *   2. launchctl print <wrapper> — verify the wrapper service is running.
+ *      Only if it is NOT running, plain `launchctl kickstart` (no -k)
+ *      starts it, with a timeout that rides out launchd's
+ *      ThrottleInterval spawn deferral.
  *
- * NOTE: launchctl kickstart ALONE doesn't kill claude — it only restarts
- * the wrapper script. The tmux session + claude TUI stay alive, so the
- * new wrapper instance thinks everything is healthy and does nothing.
- * This was a bug in v1.1.0 before this fix.
+ * 2026-07-16 rework — the old step 2 was `kickstart -k` (kill + respawn)
+ * to make the wrapper re-enter its loop immediately instead of ≤30s later.
+ * For supervisor-managed agents WRAPPER_LABEL is the SHARED
+ * com.btai.agent-supervisor, so every /restart bounced the fleet-wide
+ * watchdog; consecutive /restarts (Joey restarting several bots in a row)
+ * landed each kickstart inside the previous respawn's ThrottleInterval=10s
+ * window, `kickstart -k` blocks until the deferred respawn, runCommand's
+ * 8s default SIGKILLed it → exit 124 → "❌ restart failed" while the agent
+ * was in fact fine. The bounce also wiped supervisor in-memory state
+ * (fail counts / orphan tracking / cooldowns) and forced a slow serial
+ * first-pass heal of every TUI killed in the same window. Killing the
+ * kickstart also left the supervisor DOWN for the rest of the throttle
+ * window. Net: -k was strictly worse than letting the running wrapper's
+ * own tick pick up the dead session.
  */
-async function restartClaudeTUI(): Promise<void> {
+async function restartClaudeTUI(): Promise<string> {
   // Step 1: kill tmux session — this triggers wrapper's "session does
   // not exist" branch and forces start_claude on next monitor tick.
   const killResult = await runCommand(['tmux', 'kill-session', '-t', TMUX_SESSION])
   // killResult.exitCode != 0 may just mean session was already gone — proceed regardless.
 
-  // Step 2: kickstart wrapper so it immediately re-enters monitor loop.
-  // (Without this, the next check is up to 30s away.)
+  // Step 2: health backstop — never `kickstart -k` a healthy wrapper.
   const target = `gui/${process.getuid?.() ?? 501}/${WRAPPER_LABEL}`
-  const { exitCode, stderr } = await runCommand(['launchctl', 'kickstart', '-k', target])
-  if (exitCode !== 0) {
+  const probe = await runCommand(['launchctl', 'print', target], 5000)
+  if (probe.exitCode === 0 && /state = running/.test(probe.stdout)) {
+    return `wrapper (${WRAPPER_LABEL}) 健在，監控 tick 會自動重啟 TUI`
+  }
+  // Wrapper not running / not loaded → plain kickstart (no -k: nothing to
+  // kill). 25s timeout > ThrottleInterval=10s so a throttle-deferred spawn
+  // completes instead of being SIGKILLed into a fake 124.
+  const kick = await runCommand(['launchctl', 'kickstart', target], 25000)
+  if (kick.exitCode !== 0) {
     throw new Error(
-      `launchctl kickstart failed (${exitCode}): ${stderr.trim().slice(0, 200)} (tmux kill: ${killResult.exitCode})`,
+      `wrapper ${WRAPPER_LABEL} not running AND kickstart failed (${kick.exitCode}): ${kick.stderr.trim().slice(0, 200)} (tmux kill: ${killResult.exitCode})`,
     )
   }
+  return `wrapper (${WRAPPER_LABEL}) 剛才沒在跑，已重新拉起`
 }
 
 /** pkill -9 on claude TUI matching the channel-bot args. */
@@ -1356,8 +1375,8 @@ export async function handleControlSlash(
   // ---- Phase 2: system-level control ------------------------------------
   if (cmd === '/restart') {
     await tryRun('restart claude TUI', async () => {
-      await restartClaudeTUI()
-      await replyToTg('🔁 restarting channel-bot — tmux session killed + wrapper kickstarted. claude TUI back online ~25s.')
+      const how = await restartClaudeTUI()
+      await replyToTg(`🔁 restarting — tmux session 已砍，${how}。TUI 回線約 30–60s（監控 tick + 啟動等待）。`)
     })
     return true
   }

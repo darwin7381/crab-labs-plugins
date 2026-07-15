@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.18.1 (2026-07-16)
+
+### Fixed — /restart false-❌ 124 + fleet-wide supervisor bounce (Joey's recurring 2026-07-14/15 reports)
+- `/restart` replied `❌ restart claude TUI failed: launchctl kickstart failed (124)` while the agent actually came back fine. Root cause (log-verified on the 2026-07-15 16:07Z incident): supervisor-managed agents all share `CHANNEL_BOT_WRAPPER_LABEL=com.btai.agent-supervisor`, so step 2's `launchctl kickstart -k` bounced the ENTIRE fleet watchdog per /restart. Joey's real usage is several /restarts in a row (builder→elsa→athena→atlas within 35s); each kickstart after the first lands inside the previous respawn's `ThrottleInterval=10s` window, `kickstart -k` blocks until launchd's deferred respawn, and `runCommand`'s 8s default timeout SIGKILLed launchctl → exit 124 → false ❌. Even a solo /restart measured ~7s kill→respawn — 1s of margin. Side damage: every bounce wiped supervisor in-memory state (fail counts / orphan tracking) and the killed kickstart left the supervisor DOWN for the rest of the throttle window, so TUIs killed in the same window waited minutes for the fresh supervisor's serial first pass (builder took ~2.5min).
+- Rework: the tmux kill IS the restart (wrapper/supervisor tick ≤30s picks it up — same mechanism the supervisor's own `/api/restart` relies on). Step 2 is now a health backstop only: `launchctl print` (5s) verifies the wrapper service is running; only if NOT running, plain `kickstart` (no `-k`) starts it with a 25s timeout (> ThrottleInterval) so a throttle-deferred spawn completes instead of becoming a fake 124. `restartClaudeTUI()` returns which path it took and the TG reply states it honestly, with a realistic 30–60s estimate (old text promised "~25s" + claimed a kickstart that is no longer unconditional).
+- Uniform for both wrapper patterns (dedicated channel-bot-wrapper AND shared agent-supervisor) — no label-specific branching; the dedicated wrapper also polls every 30s, so semantics are identical.
+
 ## 1.17.6 (2026-07-13)
 
 ### Fixed — /model "current model" line could show another roam target's model
