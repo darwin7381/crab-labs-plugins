@@ -32,6 +32,7 @@ import {
 } from 'discord.js'
 import { randomBytes, randomUUID } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync } from 'fs'
+import { spawnSync } from 'child_process'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
@@ -149,25 +150,70 @@ reclaimBloatedLogsOnStartup()
 // Discord gateway, like Telegram polling, allows one consumer per bot token;
 // two daemons sharing a STATE_DIR would mean two bots fighting for the same
 // gateway slot. Refuse to start rather than escalate.
+//
+// Identity-aware since 1.13.1 (issue #10): a live pid alone is NOT proof the
+// bot is alive — the OS recycles a dead daemon's pid to unrelated processes,
+// which deadlocked MBP's daemons in a launchd crashloop for hours on
+// 2026-07-17 (lock "held" by an iOS Simulator agent). The lock now records the
+// holder's ps start time, and a holder only counts as live when pid AND start
+// time both match. A legacy bare-pid lock can't be identity-checked, so its
+// live holder must at least look like this channel engine (argv sniff) to keep
+// the lock.
+function psField(pid: number, field: 'lstart' | 'command'): string {
+  try {
+    const r = spawnSync('ps', ['-p', String(pid), '-o', `${field}=`], { encoding: 'utf8' })
+    if (r.status === 0) return (r.stdout || '').trim()
+  } catch {}
+  return ''
+}
+function writeLockRecord(): void {
+  writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, start: psField(process.pid, 'lstart') }))
+}
 let lockFd: number | null = null
 try {
   lockFd = openSync(LOCK_FILE, 'wx') // O_EXCL — fails if exists
-  writeFileSync(LOCK_FILE, String(process.pid))
+  writeLockRecord()
 } catch {
   let holder = 0
-  try { holder = parseInt(readFileSync(LOCK_FILE, 'utf8'), 10) } catch {}
+  let holderStart = ''
+  try {
+    const raw = readFileSync(LOCK_FILE, 'utf8')
+    let rec: unknown = null
+    try { rec = JSON.parse(raw) } catch {}
+    if (typeof rec === 'object' && rec !== null) {
+      holder = Number((rec as { pid?: unknown }).pid) || 0
+      const s = (rec as { start?: unknown }).start
+      holderStart = typeof s === 'string' ? s : ''
+    } else {
+      // Legacy bare-pid lock (pre-1.13.1). NOTE a bare "3974" parses as a JSON
+      // number, so "JSON.parse succeeded" alone must not select the new format.
+      holder = parseInt(raw, 10) || 0
+    }
+  } catch {}
   let alive = false
   try {
     if (holder > 1) { process.kill(holder, 0); alive = true }
   } catch {}
+  let ownerIsBot = false
   if (alive) {
+    if (holderStart) {
+      // Empty nowStart = lost a race against the holder exiting; treat as live
+      // this round — launchd's next retry sees a dead pid and reclaims.
+      const nowStart = psField(holder, 'lstart')
+      ownerIsBot = nowStart === '' || nowStart === holderStart
+    } else {
+      ownerIsBot = /server\.ts|telegram-http|discord-http|agent-inbox/.test(psField(holder, 'command'))
+    }
+  }
+  if (alive && ownerIsBot) {
     log('error', `STATE_DIR ${STATE_DIR} is locked by live pid=${holder} — refusing to start (another bot owns this state dir)`)
     process.exit(1)
   }
-  log('warn', `removing stale lock from dead pid=${holder}`)
+  if (alive) log('warn', `lock pid=${holder} is alive but not the bot that wrote the lock (pid reuse) — reclaiming`)
+  else log('warn', `removing stale lock from dead pid=${holder}`)
   try { rmSync(LOCK_FILE, { force: true }) } catch {}
   lockFd = openSync(LOCK_FILE, 'wx')
-  writeFileSync(LOCK_FILE, String(process.pid))
+  writeLockRecord()
 }
 
 // Last-resort safety net — without these the process dies silently on any
