@@ -1,3 +1,13 @@
+## 1.18.0 (2026-07-17)
+
+- **startup-picker: GENERIC blocking-menu relay (Joey 2026-07-17).** Previously each
+  new claude startup/blocking menu needed a hand-written `detect` RegExp in the
+  PICKERS table ("難道只能遇到一個建立一個嗎"). Now, after the specific patterns,
+  a generic fallback surfaces ANY menu where a live cursor (❯/›/●…) sits on a clean
+  1..N numbered option run — new menu shapes relay to TG automatically. Key = hash of
+  the option labels, so a stale tap can only ever drive the SAME menu (drive re-checks
+  key before any keystroke). Normal numbered prose (no cursor) does NOT false-positive.
+
 # Changelog
 
 ## 1.18.1 (2026-07-16)
