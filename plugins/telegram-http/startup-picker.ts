@@ -73,6 +73,29 @@ const PICKERS: ReadonlyArray<{
 // A numbered option line: optional cursor (❯/>/●), "N.", then the label.
 const OPTION_LINE = /^\s*[❯>●*]?\s*(\d+)\.\s+(.+?)\s*$/
 
+// A LIVE cursor sitting on a numbered option — the strong signal that the TUI is
+// parked at a selection (not just numbered prose). Only interactive pickers draw
+// these glyphs immediately before an option.
+const CURSOR_OPTION_LINE = /^\s*[❯›▶●○◉>]\s*\d+\.\s+\S/m
+
+function paneHasPickerCursor(pane: string): boolean {
+  return CURSOR_OPTION_LINE.test(pane)
+}
+
+// Best-effort human title: the non-empty line just above the first "1." option
+// (usually the question/prompt), else a generic label.
+function genericPickerTitle(pane: string): string {
+  const lines = pane.split('\n')
+  const firstOpt = lines.findIndex((l) => /^\s*[❯>●*]?\s*1\.\s+\S/.test(l))
+  for (let i = firstOpt - 1; i >= 0 && i >= firstOpt - 4; i--) {
+    const t = lines[i].replace(/[│╭╮╰╯─�< >]+/g, ' ').trim()
+    if (t && !/^\s*[❯>●*]?\s*\d+\./.test(lines[i]) && t.length > 3) {
+      return `🔀 claude 停在一個選單，請選擇：\n${t.slice(0, 200)}`
+    }
+  }
+  return '🔀 claude 停在一個選單，請選擇：'
+}
+
 function parseOptions(pane: string): string[] {
   const opts: { n: number; label: string }[] = []
   for (const line of pane.split('\n')) {
@@ -99,6 +122,19 @@ export function detectStartupPicker(pane: string): DetectedPicker | null {
     const options = parseOptions(pane)
     if (options.length < 2) return null // picker matched but options unreadable — don't surface a broken menu
     return { key: p.key, title: p.title(pane), options }
+  }
+  // GENERIC fallback (Joey 2026-07-17: "難道只能遇到一個建立一個嗎"): claude ships
+  // new startup/blocking menus constantly; we shouldn't need a hand-written detect
+  // RegExp per menu. When a LIVE cursor sits on a clean 1..N numbered option run,
+  // the TUI is parked at a selection — surface it. The key is a hash of the option
+  // LABELS so a stale tap can only ever drive the SAME menu (driveStartupPicker
+  // re-checks live.key === expectKey before sending a keystroke → wrong/changed
+  // menu = 'gone', nothing sent). New menu shapes now relay automatically.
+  if (paneHasPickerCursor(pane)) {
+    const options = parseOptions(pane)
+    if (options.length >= 2) {
+      return { key: `generic-${hash6(options.join('|'))}`, title: genericPickerTitle(pane), options }
+    }
   }
   return null
 }
