@@ -1236,9 +1236,16 @@ export function formatResumeReply(opts: {
 export type WatchTarget = { label: string; tmux: string }
 
 /** Pane wordings that indicate the TUI lost its login/credential. Keep the
- *  generic entries LAST — the match hit is reported in the alert. */
+ *  generic entries LAST — the match hit is reported in the alert.
+ *
+ *  ⚠️ The pane renders the CONVERSATION, so bare phrases like "Please run
+ *  /login" appear as quoted text whenever the agent documents or debugs a
+ *  login incident (2026-07-21: channel-bot's own post-mortem doc on screen
+ *  false-fired the alert, Joey msg 5384). Anchor on the TUI's real banner
+ *  format — `Please run /login · API Error: 401 …` — not the bare phrase. */
 const LOGIN_EXPIRED_PANE_MARKERS: readonly RegExp[] = [
-  /Please run \/login/i,
+  /Please run \/login\s*·\s*(API Error|401)/i,
+  /API Error:.{0,20}OAuth (access )?token (has )?(expired|been revoked|revoked)/i,
   /OAuth token (has )?(expired|revoked)/i,
   /Login expired/i,
   /Invalid API key/i,
