@@ -1288,7 +1288,10 @@ async function handleChannelBotCommandsForCurrentTarget(
       return 'handled'
     }
     let targetIdx = -1
-    if (/^\d+$/.test(args)) {
+    // Numeric ONLY for short args (list caps at 50 → ≤2 digits) — an 8-char
+    // all-digit UUID prefix from a resume: button tap must fall through to
+    // prefix matching, not be parsed as a list number (2026-07-21 bug).
+    if (/^\d+$/.test(args) && args.length <= 2) {
       const i = parseInt(args, 10) - 1
       if (i < 0 || i >= sessions.length) {
         await replyToTg(`number out of range (1-${sessions.length}); use /resume_list to see ids.`)
