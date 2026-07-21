@@ -1531,7 +1531,11 @@ export async function handleControlSlash(
       return true
     }
     let targetIdx = -1
-    if (/^\d+$/.test(args)) {
+    // Numeric ONLY for short args (list caps at 50 → ≤2 digits). An 8-char
+    // UUID prefix can be all digits (e.g. `11571718-…`) — resume: button taps
+    // send exactly that, and parsing it as a list number broke every tap on
+    // such sessions with "number out of range" (Joey 2026-07-21, msg 5365).
+    if (/^\d+$/.test(args) && args.length <= 2) {
       const i = parseInt(args, 10) - 1
       if (i < 0 || i >= sessions.length) {
         await replyToTg(`number out of range (1-${sessions.length}); use \`/resume_list\` to see ids.`)
