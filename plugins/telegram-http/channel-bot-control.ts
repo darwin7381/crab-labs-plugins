@@ -1238,19 +1238,74 @@ export type WatchTarget = { label: string; tmux: string }
 /** Pane wordings that indicate the TUI lost its login/credential. Keep the
  *  generic entries LAST — the match hit is reported in the alert.
  *
- *  ⚠️ The pane renders the CONVERSATION, so bare phrases like "Please run
- *  /login" appear as quoted text whenever the agent documents or debugs a
- *  login incident (2026-07-21: channel-bot's own post-mortem doc on screen
- *  false-fired the alert, Joey msg 5384). Anchor on the TUI's real banner
- *  format — `Please run /login · API Error: 401 …` — not the bare phrase. */
+ *  Kept deliberately BROAD (bare phrases) so an upstream rewording of the
+ *  banner can't blind us to a real login death (Joey 5387). The pane renders
+ *  the CONVERSATION though, so these phrases also appear as quoted prose when
+ *  an agent documents/debugs a login incident (2026-07-21 false alert, Joey
+ *  5384) — that's handled by probeAuthDead(): a marker hit is only ALERTED
+ *  after a live API probe of the machine's credential chain confirms (or
+ *  cannot rule out) that auth is really broken. */
 const LOGIN_EXPIRED_PANE_MARKERS: readonly RegExp[] = [
-  /Please run \/login\s*·\s*(API Error|401)/i,
-  /API Error:.{0,20}OAuth (access )?token (has )?(expired|been revoked|revoked)/i,
+  /Please run \/login/i,
   /OAuth token (has )?(expired|revoked)/i,
   /Login expired/i,
   /Invalid API key/i,
   /authentication[_ ]error/i,
 ]
+
+/**
+ * Ground-truth auth check (2026-07-21, Joey 5387: don't anchor on banner
+ * wording — verify). Resolves the credential the TUI would actually use,
+ * mirroring claude's own precedence: the shared Keychain account grant
+ * (claudeAiOauth.accessToken) is read BEFORE the settings.json env
+ * setup-token — exactly the shadow that killed atlas/hephaestus. Probes
+ * /v1/messages with 1 token:
+ *   'dead'       → HTTP 401/403 on the top-precedence credential
+ *   'alive'      → any non-auth response (200/400/429/…) — auth works
+ *   'unverified' → no credential found / network error — CANNOT rule out a
+ *                  real death, caller must still alert (fail toward alerting)
+ */
+async function probeAuthDead(): Promise<'dead' | 'alive' | 'unverified'> {
+  let token = ''
+  try {
+    const kc = await runCommand(['security', 'find-generic-password', '-w', '-s', 'Claude Code-credentials'])
+    if (kc.exitCode === 0) {
+      const cred = JSON.parse(kc.stdout.trim())
+      token = cred?.claudeAiOauth?.accessToken ?? ''
+    }
+  } catch { /* no keychain grant / unreadable — fall through to env token */ }
+  if (!token) {
+    try {
+      const settings = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
+      token = settings?.env?.CLAUDE_CODE_OAUTH_TOKEN ?? ''
+    } catch { /* no settings */ }
+  }
+  if (!token) return 'unverified'
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 15_000)
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    clearTimeout(timer)
+    if (r.status === 401 || r.status === 403) return 'dead'
+    return 'alive'
+  } catch {
+    return 'unverified'
+  }
+}
 
 const LOGIN_WATCH_POLL_MS = 20_000
 
@@ -1274,10 +1329,23 @@ export function startLoginExpiredWatchdog(opts: {
       const hit = LOGIN_EXPIRED_PANE_MARKERS.find(re => re.test(pane))
       if (hit) {
         if (!alerted.get(t.tmux)) {
+          // Episode is marked handled either way — a suppressed false positive
+          // must not re-probe every 20s while the quoted text stays on screen.
+          // Re-arms when the pane goes clean, same as the alert path.
           alerted.set(t.tmux, true)
-          opts.log('warn', `login-expired marker in pane ${t.tmux}: ${String(hit)}`)
+          const verdict = await probeAuthDead()
+          if (verdict === 'alive') {
+            opts.log('info',
+              `login-expired marker in pane ${t.tmux} (${String(hit)}) but API probe says auth ALIVE — ` +
+              `suppressed as conversation-text false positive`)
+            continue
+          }
+          const proof = verdict === 'dead'
+            ? '已用 API 實測確認：憑證真的失效（401/403）'
+            : 'API 驗證無法完成（無憑證可測或網路錯誤），保守通知'
+          opts.log('warn', `login-expired marker in pane ${t.tmux}: ${String(hit)} — probe=${verdict}`)
           opts.notify(
-            `🔐 登入疑似過期 — ${t.label}（tmux ${t.tmux}）畫面出現登入失效訊息（匹配 ${String(hit)}）。\n` +
+            `🔐 登入疑似過期 — ${t.label}（tmux ${t.tmux}）畫面出現登入失效訊息（匹配 ${String(hit)}；${proof}）。\n` +
             `處理：在 TUI 跑 /login 重新登入（可從這裡用 \`/input /login\` 送），完成後可 /restart 重啟。\n` +
             `（同一狀態不重複提醒；畫面恢復後若再過期會再通知）`,
           )
