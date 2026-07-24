@@ -1353,22 +1353,27 @@ export async function handleModelCallbackForCurrentTarget(
   value: string,
   hash: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  cmd: '/model' | '/effort' = '/model',
 ): Promise<boolean> {
-  if (!/^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)) {
-    await replyToTg(`❌ invalid model value in callback: \`${value.slice(0, 60)}\``)
+  // /effort gets a strict 5-level whitelist; /model keeps the id-shape check.
+  const ok = cmd === '/effort'
+    ? /^(low|medium|high|xhigh|max)$/.test(value)
+    : /^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)
+  if (!ok) {
+    await replyToTg(`❌ invalid ${cmd.slice(1)} value in callback: \`${value.slice(0, 60)}\``)
     return true
   }
   const state = readState()
   const target = state.current_target
   if (!target) {
-    await replyToTg('❌ 沒有連線中的 target — 先 /roam 選一個，再重開 /model')
+    await replyToTg(`❌ 沒有連線中的 target — 先 /roam 選一個，再重開 ${cmd}`)
     return true
   }
   if (tmuxHash6(target.tmux) !== hash) {
-    await replyToTg('⚠️ target 已切換，這個選單是舊 target 的 — 重打 /model 開新選單')
+    await replyToTg(`⚠️ target 已切換，這個選單是舊 target 的 — 重打 ${cmd} 開新選單`)
     return true
   }
-  return forwardSharedTuiSlash(`/model ${value}`, target.tmux, replyToTg)
+  return forwardSharedTuiSlash(`${cmd} ${value}`, target.tmux, replyToTg)
 }
 
 async function handleTuiSlashForward(
