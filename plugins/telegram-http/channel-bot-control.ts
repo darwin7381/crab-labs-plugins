@@ -597,6 +597,31 @@ export function tmuxHash6(name: string): string {
   return h.toString(16).padStart(8, '0').slice(0, 6)
 }
 
+/** Effort options for the bare `/effort` inline keyboard (Joey 2026-07-24 msg
+ * 5417: bare /effort answered `usage:` while bare /model gives a picker —
+ * inconsistent UX). Levels verified against the pinned CLI binary literal:
+ * `"level": "low" | "medium" | "high" | "xhigh" | "max"`. */
+const EFFORT_CHOICES: Array<{ label: string; value: string }> = [
+  { label: '🐢 low', value: 'low' },
+  { label: '⚖️ medium', value: 'medium' },
+  { label: '🚀 high', value: 'high' },
+  { label: '🔥 xhigh', value: 'xhigh' },
+  { label: '🏔️ max', value: 'max' },
+]
+const EFFORT_VALUE_RE = /^(low|medium|high|xhigh|max)$/
+
+/** Current effort for the picker's ✅ mark — claude's /effort persists to
+ * machine-global settings.json `effortLevel` (same pattern as /model). */
+function detectCurrentEffort(): { level: string; source: string } | null {
+  try {
+    const s = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
+    if (typeof s.effortLevel === 'string' && s.effortLevel) {
+      return { level: s.effortLevel, source: 'settings.json 全域' }
+    }
+  } catch { /* unreadable settings — picker still works, just no ✅ mark */ }
+  return null
+}
+
 export function modelChoices(): Array<{ label: string; value: string }> {
   const raw = process.env.CHANNEL_BOT_MODEL_CHOICES
   if (!raw) return DEFAULT_MODEL_CHOICES
@@ -787,6 +812,26 @@ export async function forwardSharedTuiSlash(
           '🎛️ 點一個模型切換（或手動 `/model <id>`）：\n' +
             curLine +
             '⚠️ claude 的 /model 會把選擇存成「全域預設」— 這台機器所有 agent 下次重啟都會用它（有 --model pin 的除外）。',
+          { keyboard },
+        )
+        return true
+      }
+      // Bare `/effort` → same tap-to-pick UX as bare /model (Joey 5417).
+      if (cmd === '/effort' && tmuxName !== '') {
+        const isFixed = tmuxName === TMUX_SESSION
+        const cbSuffix = isFixed ? '' : `@${tmuxHash6(tmuxName)}`
+        const cur = detectCurrentEffort()
+        const keyboard: InlineButton[][] = EFFORT_CHOICES.map(c => {
+          const isCur = cur !== null && c.value === cur.level
+          return [{ text: isCur ? `✅ ${c.label}（目前）` : c.label, callback_data: `effort:${c.value}${cbSuffix}` }]
+        })
+        const curLine = cur
+          ? `目前 effort：\`${cur.level}\`（${cur.source}）\n`
+          : '目前 effort：無法判定（settings.json 無 effortLevel）\n'
+        await replyToTg(
+          '🎚️ 點一個 effort 等級切換（或手動 `/effort <value>`）：\n' +
+            curLine +
+            '⚠️ claude 的 /effort 會存成整台機器的全域預設（下次重啟的 agent 都吃它）。',
           { keyboard },
         )
         return true
@@ -1688,6 +1733,16 @@ export async function handleCallbackData(
       return true
     }
     return handleControlSlash(`/model ${value}`, httpPort, replyToTg)
+  }
+  // `effort:<value>` — emitted by the bare-`/effort` inline keyboard. Strict
+  // whitelist (5 known levels) — forged callback payloads never reach tmux.
+  if (data.startsWith('effort:')) {
+    const value = data.slice('effort:'.length).trim()
+    if (!EFFORT_VALUE_RE.test(value)) {
+      await replyToTg(`❌ invalid effort value in callback: \`${value.slice(0, 30)}\``)
+      return true
+    }
+    return handleControlSlash(`/effort ${value}`, httpPort, replyToTg)
   }
   if (!data.startsWith('resume:')) return false
   const uuidPrefix = data.slice('resume:'.length).trim()

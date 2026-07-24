@@ -1436,7 +1436,7 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  if (data.startsWith('resume:') || data.startsWith('roam:') || data.startsWith('model:')) {
+  if (data.startsWith('resume:') || data.startsWith('roam:') || data.startsWith('model:') || data.startsWith('effort:')) {
     const access = loadAccess()
     const senderId = String(ctx.from.id)
     if (!access.allowFrom.includes(senderId)) {
@@ -1449,17 +1449,19 @@ bot.on('callback_query:data', async ctx => {
       await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard)
     }
     try {
-      // Roamer /model picker taps carry `@<hash6>` — validate + drive the
-      // CURRENT target (issue #7). Plain model: stays on the channel-bot path.
-      if (isRoamerEnabled() && data.startsWith('model:') && data.includes('@')) {
+      // Roamer /model + /effort picker taps carry `@<hash6>` — validate + drive
+      // the CURRENT target (issue #7). Plain model:/effort: stays channel-bot.
+      if (isRoamerEnabled() && (data.startsWith('model:') || data.startsWith('effort:')) && data.includes('@')) {
+        const prefix = data.startsWith('model:') ? 'model:' : 'effort:'
         const at = data.lastIndexOf('@')
-        const value = data.slice('model:'.length, at).trim()
+        const value = data.slice(prefix.length, at).trim()
         const hash = data.slice(at + 1).trim()
-        if (await handleModelCallbackForCurrentTarget(value, hash, replyToTg)) return
+        const cmd = prefix === 'model:' ? '/model' as const : '/effort' as const
+        if (await handleModelCallbackForCurrentTarget(value, hash, replyToTg, cmd)) return
       }
-      if (isRoamerEnabled() && !data.startsWith('model:')) {
+      if (isRoamerEnabled() && !data.startsWith('model:') && !data.startsWith('effort:')) {
         await handleRoamerCallback(data, replyToTg)
-      } else if (data.startsWith('resume:') || data.startsWith('model:')) {
+      } else if (data.startsWith('resume:') || data.startsWith('model:') || data.startsWith('effort:')) {
         await handleCallbackData(data, httpPort, replyToTg)
       }
     } catch (err) {
