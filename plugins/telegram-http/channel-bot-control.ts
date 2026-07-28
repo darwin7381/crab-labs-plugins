@@ -581,6 +581,7 @@ const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
  */
 const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
   { label: '🌟 Fable 5', value: 'claude-fable-5' },
+  { label: '🏺 Opus 5', value: 'claude-opus-5' },
   { label: '🏛️ Opus 4.8', value: 'claude-opus-4-8' },
   { label: '🎼 Sonnet 5', value: 'claude-sonnet-5' },
   { label: '⚡ Haiku 4.5', value: 'claude-haiku-4-5-20251001' },
