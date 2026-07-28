@@ -195,15 +195,18 @@ function readGlobalDefaultModel(): string | null {
 }
 
 /**
- * #10 (2026-07-10, opt-in): CHANNEL_BOT_MODEL_SCOPE=session — claude's /model
- * always persists the choice as the MACHINE-WIDE default in ~/.claude/
- * settings.json (side effect: every un-pinned agent inherits it on restart).
- * With session scope, after a CONFIRMED switch we write the pre-switch value
- * back, so the switch is effective inside the live TUI only and the global
- * default stays unpolluted. Default (env unset) keeps today's behavior.
+ * #10 (2026-07-10) — **session scope is now the DEFAULT (2026-07-28, Joey 5473)**.
+ * claude's /model always persists the choice as the MACHINE-WIDE default in
+ * ~/.claude/settings.json, so a single tap aimed at ONE agent silently
+ * re-defaults every un-pinned agent on its next restart. Joey tapped Opus 5 for
+ * one bot and got a fleet-wide default change — the button conflated two
+ * different intents. With session scope we write the pre-switch value back
+ * after a CONFIRMED switch: the switch applies to the live TUI only and the
+ * global default stays untouched. A warning was NOT enough; the safe behavior
+ * has to be the default. Opt out with CHANNEL_BOT_MODEL_SCOPE=global.
  */
 function isModelScopeSession(): boolean {
-  return (process.env.CHANNEL_BOT_MODEL_SCOPE ?? '').trim().toLowerCase() === 'session'
+  return (process.env.CHANNEL_BOT_MODEL_SCOPE ?? '').trim().toLowerCase() !== 'global'
 }
 
 /** Write `model` back into ~/.claude/settings.json (null ⇒ remove the key),
