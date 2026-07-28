@@ -280,30 +280,37 @@ export function detectCurrentModel(projectsDirOverride?: string, tmuxName?: stri
   const dir = projectsDirOverride ?? PROJECTS_DIR
   const sid = dir ? currentSessionId(dir) : null
   if (dir && sid) {
-    const recs = readJsonlTail(join(dir, `${sid}.jsonl`), 80, 1024 * 1024)
-    for (let i = recs.length - 1; i >= 0; i--) {
-      const r: any = recs[i]
-      const model = r?.message?.model
-      if (r?.type === 'assistant' && typeof model === 'string' && model) {
-        const ts = Date.parse(r?.timestamp ?? '') || 0
-        if (!best || ts > best.ts) best = { id: model, source: '本 session 最近回覆實際使用', ts }
-        break
+    // Widen the tail window until an assistant record with `model` appears.
+    // A fixed 80-line/1MB read can land entirely inside a run of huge
+    // tool-result lines on a long session and miss every assistant record —
+    // then the old code fell through to the global default and REPORTED IT AS
+    // CURRENT (2026-07-28: Joey's /model said fable-5 while the agent was
+    // actually running opus-4-8).
+    const path = join(dir, `${sid}.jsonl`)
+    outer: for (const [lines, bytes] of [[80, 1024 * 1024], [320, 4 * 1024 * 1024], [1280, 16 * 1024 * 1024], [5120, 64 * 1024 * 1024]] as const) {
+      const recs = readJsonlTail(path, lines, bytes)
+      for (let i = recs.length - 1; i >= 0; i--) {
+        const r: any = recs[i]
+        const model = r?.message?.model
+        if (r?.type === 'assistant' && typeof model === 'string' && model) {
+          const ts = Date.parse(r?.timestamp ?? '') || 0
+          if (!best || ts > best.ts) best = { id: model, source: '本 session 最近回覆實際使用', ts }
+          break outer
+        }
       }
     }
   }
 
-  // Global default competes by settings.json mtime: if the default changed
-  // AFTER this agent's last reply (another bot's /model, manual edit, or a
-  // restart-inheritance), it is the freshest signal. An un-pinned TUI adopts
-  // it on its next start, so label it honestly as the default, not a
-  // guarantee of the live TUI value.
+  // The global default NEVER competes with live evidence. The old
+  // settings.json-mtime race let a freshly-touched default (another bot's
+  // /model confirm, a guard write, a manual edit) outrank what the live TUI
+  // demonstrably ran — the exact "顯示 fable5、實跑 4.8" lie. A default only
+  // describes what an un-pinned TUI adopts on its NEXT restart, so it is
+  // reported only when there is no live evidence at all, labeled as such.
+  if (best) return { id: best.id, source: best.source }
   const g = readGlobalDefaultModel()
-  if (g) {
-    let mtime = 0
-    try { mtime = statSync(join(homedir(), '.claude', 'settings.json')).mtimeMs } catch {}
-    if (!best || mtime > best.ts) best = { id: g, source: '全域預設（未 pin 的 TUI 重啟後採用）', ts: mtime }
-  }
-  return best ? { id: best.id, source: best.source } : null
+  if (g) return { id: g, source: '全域預設（查無本 session 實跑紀錄，重啟後才保證生效）' }
+  return null
 }
 
 /**
