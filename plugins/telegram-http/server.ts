@@ -53,6 +53,7 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
+import { expandHiddenEntities } from './entities.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -820,7 +821,7 @@ function inboxRegistryNames(): string[] {
   return Object.keys(loadInboxRegistry()).filter(n => n !== INBOX_SELF)
 }
 
-async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean): Promise<string> {
+async function sendToAgent(to: string, text: string, replyTo?: number): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim().slice(0, 3500)
   if (!body) return 'send failed: empty text'
@@ -878,8 +879,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
       },
       body: JSON.stringify({ text: body, from: INBOX_SELF, logged: msgId != null,
         ...(msgId != null ? { msg_id: msgId } : {}),
-        ...(replyTo != null ? { reply_to_id: replyTo } : {}),
-        ...(noReply ? { no_reply: true } : {}) }),
+        ...(replyTo != null ? { reply_to_id: replyTo } : {}) }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -1004,7 +1004,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
            to: { type: 'string', description: 'Target agent name from the fleet registry (e.g. "hephaestus", "sonn")' },
            text: { type: 'string', description: 'The message. Plain text; be specific — the receiver gets it as an inbox message with your name as sender.' },
            reply_to: { type: 'string', description: 'Quote-reply: the btcc_msg_id from the meta of the message you are replying to. Use it whenever you answer a specific message so the thread shows what you are responding to.' },
-           no_reply: { type: 'boolean', description: 'Set true for a terminal ack / closing FYI that needs NO response — a pure "received, done" with nothing new to add. The delivery is tagged no_reply="true" so the receiver\'s turn closes WITHOUT being forced to reply, breaking the two-agent forced-ack loop. RULE: the side with nothing more to add sends no_reply:true to wrap up; the side that RECEIVES a no_reply message stays silent and does NOT reply. Leave false (default) for any substantive message — a request, task, decision, or progress update — so silence can never swallow real work.' },
          },
          required: ['to', 'text'],
        },
@@ -1091,8 +1090,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     if (INBOX_ONLY && req.params.name === 'send_to_agent') {
       const replyTo = args.reply_to != null && String(args.reply_to).match(/^\d+$/) ? Number(args.reply_to) : undefined
-      const noReply = args.no_reply === true || args.no_reply === 'true'
-      const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply)
+      const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo)
       return { content: [{ type: 'text', text: result }] }
     }
     switch (req.params.name) {
@@ -1867,6 +1865,14 @@ async function handleInbound(
    *  attachment_origin="reply" so the agent knows whose file this is. */
   attachmentFromReply = false,
 ): Promise<void> {
+  // Expand hidden-payload entities (text_link URLs etc. — see entities.ts) so
+  // the channel text is self-contained. Guarded by identity: only when the
+  // text we were handed IS the message text/caption — synthetic strings like
+  // '(video note)' or joined album captions must never be sliced with offsets
+  // that belong to a different string.
+  if (text === ctx.message?.text) text = expandHiddenEntities(text, ctx.message.entities)
+  else if (text === ctx.message?.caption) text = expandHiddenEntities(text, ctx.message.caption_entities)
+
   const result = gate(ctx)
 
   if (result.action === 'drop') return
@@ -2035,7 +2041,9 @@ async function handleInbound(
   const mgid = ctx.message?.media_group_id
   if (mgid && image && !attachmentFromReply) {
     bufferAlbumItem(chat_id, String(mgid), {
-      caption: ctx.message?.caption,
+      // When a real caption exists, `text` is its entity-expanded form (top of
+      // this function) — pass that so album captions keep their hidden URLs.
+      caption: ctx.message?.caption != null ? text : undefined,
       imagePath,
       fileId: image.file_id,
       size: image.size,
@@ -2550,8 +2558,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       }
       const body = (await readJsonBody(req).catch(() => null)) as
         { text?: string; from?: string; chat_id?: string; logged?: boolean;
-          msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
-          no_reply?: boolean } | null
+          msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string } | null
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
       if (!text) {
         res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
@@ -2607,10 +2614,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           meta: {
             chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
             ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
-            // Terminal-ack flag (Athena's a2a ack-loop fix): a no_reply delivery is
-            // tagged no_reply="true" so check_tg_reply lets the receiver's turn close
-            // WITHOUT forcing a reply — breaks the two-agent forced-ack loop at source.
-            ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
             ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
             ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
             ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),

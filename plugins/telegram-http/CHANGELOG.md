@@ -1,3 +1,18 @@
+## 1.19.0 (2026-08-10)
+
+### Fixed — inbound link entities (hidden URLs) were dropped from channel text (Joey live-hit, via Lily msg 1744)
+- TG-desktop pastes render links as display-text + hidden URL (`text_link` entity). The bridge
+  forwarded only `message.text` / `caption`, so the agent saw "PROPOSAL_給Joey.md" with no URL —
+  an 11-link document list arrived with zero links and the boss had to re-paste.
+- New `entities.ts`: `expandHiddenEntities()` expands hidden-payload entities inline as
+  `[label](url)`. Only `text_link` and `text_mention` (payload invisible in text) are expanded;
+  `url`/`mention`/formatting entities are untouched (their text already says everything).
+  Offsets are UTF-16 code units per Bot API spec = JS string indexing, so emoji/astral-safe.
+- Wired at the single choke point `handleInbound` (guarded by text↔entities identity so synthetic
+  strings like "(video note)" are never sliced with foreign offsets) + the album caption intake.
+- 13 unit tests (`entities.test.ts`): multi-link lists, adjacent links, emoji offsets, CJK,
+  overlap/malformed-offset safety, label==url dedup.
+
 ## 1.18.0 (2026-07-17)
 
 - **startup-picker: GENERIC blocking-menu relay (Joey 2026-07-17).** Previously each
