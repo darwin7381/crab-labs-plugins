@@ -1,0 +1,10 @@
+# Canary markers — pre-push guard against silent feature revert.
+# One line per canary:  <path>::<literal-string-that-must-exist-at-push-ref>
+# The file itself must exist at the push ref; a listed-but-missing file FAILS.
+# Class this prevents: a whole-file commit made from a stale working copy
+# wiping a sibling commit's feature (2026-08-11: telegram-http 1.19.0 commit
+# 8eb4997 silently removed c59a1f7's entire no_reply implementation).
+plugins/telegram-http/server.ts::no_reply
+plugins/telegram-http/server.ts::CHANNEL_INBOX_ONLY
+plugins/telegram-http/server.ts::expandHiddenEntities
+plugins/telegram-http/entities.ts::expandHiddenEntities
