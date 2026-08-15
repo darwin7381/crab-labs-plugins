@@ -19,9 +19,9 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, randomUUID } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync, existsSync } from 'fs'
 import { homedir } from 'os'
-import { join, extname, sep } from 'path'
+import { join, extname, sep, dirname } from 'path'
 import { execFile, spawnSync } from 'child_process'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
 import {
@@ -713,6 +713,70 @@ function persistInbound(notif: { method: string; params: unknown }): string | nu
   }
 }
 
+// ---- issue #13: delivery-consumption tracking (deferred auto-ack) ----------
+// A write into an SSE stream is NOT delivery: a half-dead socket accepts writes
+// and keepalives into the kernel buffer (run 149, 2026-08-15 — ack 200, message
+// reached no session), and a claude that enqueues then never drains its queue
+// (run 148) leaves the message dead inside a live-looking session. The only
+// consumption evidence the daemon can trust is the agent's own session
+// transcript ADVANCING after the delivery. So:
+//   - every SSE/flush/replay delivery is RECORDED, not immediately acked
+//   - a 30s sweep acks scheduler runs only once the workspace's newest
+//     transcript jsonl mtime moves past delivery+settle (the enqueue record
+//     itself lands within ~1-2s; a real turn keeps writing well after)
+//   - unconsumed after CONSUME_GRACE_MS → re-persisted to inbox/pending (the
+//     next live session replays it) and NEVER acked → the scheduler's
+//     stalled_no_ack chain fires instead of being lied to.
+// Known limit: consumption is workspace-level — a second delivery landing
+// mid-turn right before a crash can still be mis-read as consumed (bounded,
+// documented in issue #13; exactly-once needs client-side acks we don't have).
+// If the transcript dir can't be resolved (AGENT_WORKSPACE_DIR env override →
+// STATE_DIR-parent heuristic), falls back to legacy ack-on-write.
+const AGENT_WORKSPACE_DIR = process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR)
+const TRANSCRIPT_DIR = join(homedir(), '.claude', 'projects', AGENT_WORKSPACE_DIR.replace(/[/.]/g, '-'))
+const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
+const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 180_000)
+const CONSUME_SETTLE_MS = 5_000
+const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number }> = []
+
+function recordDelivery(notif: { method: string; params: unknown }): void {
+  if (!consumptionCheckAvailable) { maybeAutoAckScheduled(notif); return }
+  if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
+  recentDeliveries.push({ notif, at: Date.now() })
+  if (recentDeliveries.length > 200) recentDeliveries.shift()
+}
+
+function newestTranscriptMtime(): number {
+  try {
+    let newest = 0
+    for (const f of readdirSync(TRANSCRIPT_DIR)) {
+      if (!f.endsWith('.jsonl')) continue
+      try {
+        const m = statSync(join(TRANSCRIPT_DIR, f)).mtimeMs
+        if (m > newest) newest = m
+      } catch {}
+    }
+    return newest
+  } catch { return 0 }
+}
+
+function sweepDeliveries(): void {
+  if (!consumptionCheckAvailable || recentDeliveries.length === 0) return
+  const now = Date.now()
+  const newest = newestTranscriptMtime()
+  for (let i = recentDeliveries.length - 1; i >= 0; i--) {
+    const d = recentDeliveries[i]
+    if (newest > d.at + CONSUME_SETTLE_MS) {
+      maybeAutoAckScheduled(d.notif)  // transcript advanced after delivery ⇒ consumed
+      recentDeliveries.splice(i, 1)
+    } else if (now - d.at > CONSUME_GRACE_MS) {
+      log('warn', `delivery unconsumed for ${Math.round((now - d.at) / 1000)}s (no transcript progress) — re-persisting to inbox/pending, NOT acking (issue #13)`)
+      persistInbound(d.notif)
+      recentDeliveries.splice(i, 1)
+    }
+  }
+}
+
 async function replayPendingFromDisk(server: Server): Promise<number> {
   let files: string[]
   try { files = readdirSync(PENDING_DIR) } catch { return 0 }
@@ -730,7 +794,7 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
     }
     try {
       await server.notification(notif as Parameters<Server['notification']>[0])
-      maybeAutoAckScheduled(notif)
+      recordDelivery(notif)
       try { rmSync(fullPath) } catch {}
       replayed++
     } catch (err) {
@@ -2284,7 +2348,7 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
     if (sseOpen.get(sid)) {
       anySseOpen = true
       void server.notification(notif as Parameters<Server['notification']>[0]).then(() => {
-        maybeAutoAckScheduled(notif)
+        recordDelivery(notif)
       }).catch(err => {
         log('error', `notify session ${sid} failed, removing from registry: ${err}`)
         activeServers.delete(server)
@@ -2344,6 +2408,7 @@ setInterval(() => {
       evictZombieSession(sid, `gc-timer: no open SSE for ${Math.round((now - last) / 1000)}s`)
     }
   }
+  sweepDeliveries()  // issue #13: ack-on-consumption + orphan re-persist
 }, 30_000).unref()
 
 /**
@@ -2795,7 +2860,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             for (const notif of queued) {
               try {
                 await boundServer.notification(notif as Parameters<Server['notification']>[0])
-                maybeAutoAckScheduled(notif)
+                recordDelivery(notif)
               } catch (err) {
                 log('error', `mem-flush failed: ${err}`)
               }

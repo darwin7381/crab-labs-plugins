@@ -8,3 +8,4 @@ plugins/telegram-http/server.ts::no_reply
 plugins/telegram-http/server.ts::CHANNEL_INBOX_ONLY
 plugins/telegram-http/server.ts::expandHiddenEntities
 plugins/telegram-http/entities.ts::expandHiddenEntities
+plugins/telegram-http/server.ts::recordDelivery
