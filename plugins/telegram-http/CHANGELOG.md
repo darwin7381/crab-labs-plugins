@@ -1,3 +1,7 @@
+## 1.20.0 — 2026-08-15
+
+- **ack-on-consumption delivery tracking (issues #13/#12)**: an SSE write no longer counts as delivery. Deliveries are recorded; the 30s sweep auto-acks a scheduler run only after the agent workspace's newest transcript jsonl advances past delivery+5s (real consumption evidence). Unconsumed deliveries re-persist to `inbox/pending` after 3 min (replayed to the next live session) and are never acked, so `stalled_no_ack` fires truthfully instead of being silenced by a lying ack. Applies to all three delivery paths (broadcast / memQueue flush / disk replay). Workspace resolution: `AGENT_WORKSPACE_DIR` env → `STATE_DIR` parent; unresolvable ⇒ legacy ack-on-write. Tunable: `CONSUME_GRACE_MS` (default 180000).
+
 ## 1.19.0 (2026-08-10)
 
 ### Fixed — inbound link entities (hidden URLs) were dropped from channel text (Joey live-hit, via Lily msg 1744)
