@@ -1,11 +1,19 @@
 {
   "name": "agent-inbox",
   "description": "Local durable mailbox channel for a Claude Code agent — other agents, schedulers, and the BTCC Comms console deliver messages into the agent's session via POST /inject. Independent daemon per agent (own process/port/state/queue), decoupled from Telegram.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
     "name": "Joey / Crab Labs",
     "url": "https://github.com/darwin7381"
   },
   "license": "Apache-2.0",
-  "keywords": ["channel", "mcp", "http", "daemon", "inbox", "a2a", "agent-to-agent"]
+  "keywords": [
+    "channel",
+    "mcp",
+    "http",
+    "daemon",
+    "inbox",
+    "a2a",
+    "agent-to-agent"
+  ]
 }
