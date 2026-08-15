@@ -735,14 +735,20 @@ function persistInbound(notif: { method: string; params: unknown }): string | nu
 const AGENT_WORKSPACE_DIR = process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR)
 const TRANSCRIPT_DIR = join(homedir(), '.claude', 'projects', AGENT_WORKSPACE_DIR.replace(/[/.]/g, '-'))
 const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
-const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 180_000)
+// Grace must exceed a long single-response turn: claude appends the assistant
+// record only when a response COMPLETES, so the transcript can be silent for
+// minutes after the enqueue write (observed 4m+ on canary) — 180s produced a
+// false "unconsumed". 600s default; late consumption retracts the re-persisted
+// dup and still acks (records live RETAIN_MS).
+const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
 const CONSUME_SETTLE_MS = 5_000
-const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number }> = []
+const CONSUME_RETAIN_MS = 1_800_000
+const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null }> = []
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
   if (!consumptionCheckAvailable) { maybeAutoAckScheduled(notif); return }
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
-  recentDeliveries.push({ notif, at: Date.now() })
+  recentDeliveries.push({ notif, at: Date.now(), pendingPath: null })
   if (recentDeliveries.length > 200) recentDeliveries.shift()
 }
 
@@ -767,11 +773,18 @@ function sweepDeliveries(): void {
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
     if (newest > d.at + CONSUME_SETTLE_MS) {
-      maybeAutoAckScheduled(d.notif)  // transcript advanced after delivery ⇒ consumed
+      // transcript advanced after delivery ⇒ consumed. If we had already
+      // re-persisted a dup (long-turn false negative), retract it.
+      if (d.pendingPath) {
+        try { rmSync(d.pendingPath); log('info', `late consumption — retracted re-persisted dup ${d.pendingPath} (issue #13)`) } catch {}
+      }
+      maybeAutoAckScheduled(d.notif)
       recentDeliveries.splice(i, 1)
-    } else if (now - d.at > CONSUME_GRACE_MS) {
+    } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
       log('warn', `delivery unconsumed for ${Math.round((now - d.at) / 1000)}s (no transcript progress) — re-persisting to inbox/pending, NOT acking (issue #13)`)
-      persistInbound(d.notif)
+      d.pendingPath = persistInbound(d.notif)
+      if (!d.pendingPath) recentDeliveries.splice(i, 1)  // persist failed; nothing to track
+    } else if (now - d.at > CONSUME_RETAIN_MS) {
       recentDeliveries.splice(i, 1)
     }
   }
