@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, randomUUID } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync, readSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, dirname } from 'path'
 import { execFile, spawnSync } from 'child_process'
@@ -741,7 +741,6 @@ const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
 // false "unconsumed". 600s default; late consumption retracts the re-persisted
 // dup and still acks (records live RETAIN_MS).
 const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
-const CONSUME_SETTLE_MS = 5_000
 const CONSUME_RETAIN_MS = 1_800_000
 const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null }> = []
 
@@ -752,27 +751,78 @@ function recordDelivery(notif: { method: string; params: unknown }): void {
   if (recentDeliveries.length > 200) recentDeliveries.shift()
 }
 
-function newestTranscriptMtime(): number {
+// Consumption evidence = the newest GENUINE assistant record's own timestamp.
+//
+// It used to be the newest jsonl's mtime, which is a lie in two directions
+// (2026-08-18, Chiron rubric I6 — his own 5h Fable-quota blackout was auto-acked
+// as "working" while nothing ran):
+//   1. A quota / API-error turn WRITES to the transcript. The literal record:
+//        type=assistant  model=<synthetic>  stop_reason=stop_sequence
+//        isApiErrorMessage=true
+//        "You're out of usage credits. Run /usage-credits to keep using Fable 5…"
+//      mtime advances; ZERO work happened. Discriminate on `isApiErrorMessage`,
+//      a first-class boolean — NOT on stop_reason (stop_sequence is also a
+//      legitimate value for a real turn, so keying on it would misread real work
+//      as an error) and NOT on message text (breaks on any rewording, and misses
+//      non-quota API errors).
+//   2. The enqueue ITSELF writes `user` / `queue-operation` records — that is the
+//      delivery, not consumption of it. CONSUME_SETTLE_MS existed as a crude
+//      timing guard against this; anchoring on an `assistant` record removes the
+//      need, because claude only appends one when a response COMPLETES, which is
+//      exactly the event we mean by "consumed".
+// The `> deliveredAt` comparison is load-bearing, not an optimisation: without it
+// a tail-read would happily find an assistant record from BEFORE the delivery and
+// count it as evidence — false-ack resurrected by another route.
+const TRANSCRIPT_TAIL_BYTES = 64 * 1024
+function newestGenuineAssistantAt(): number {
   try {
-    let newest = 0
+    let newestFile = ''
+    let newestMtime = 0
     for (const f of readdirSync(TRANSCRIPT_DIR)) {
       if (!f.endsWith('.jsonl')) continue
       try {
         const m = statSync(join(TRANSCRIPT_DIR, f)).mtimeMs
-        if (m > newest) newest = m
+        if (m > newestMtime) { newestMtime = m; newestFile = f }
       } catch {}
     }
-    return newest
+    if (!newestFile) return 0
+    // Tail-read only: live transcripts run to tens of MB (23MB observed).
+    const path = join(TRANSCRIPT_DIR, newestFile)
+    const size = statSync(path).size
+    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES)
+    const len = size - start
+    if (len <= 0) return 0
+    const buf = Buffer.allocUnsafe(len)
+    const fd = openSync(path, 'r')
+    try { readSync(fd, buf, 0, len, start) } finally { closeSync(fd) }
+    let text = buf.toString('utf8')
+    if (start > 0) {
+      const nl = text.indexOf('\n')          // drop the partial first line
+      text = nl >= 0 ? text.slice(nl + 1) : ''
+    }
+    let newestTs = 0
+    for (const line of text.split('\n')) {
+      if (!line) continue
+      let r: { type?: string; isApiErrorMessage?: boolean; timestamp?: string }
+      try { r = JSON.parse(line) } catch { continue }
+      if (r?.type !== 'assistant') continue
+      if (r?.isApiErrorMessage) continue
+      const t = Date.parse(r?.timestamp ?? '')
+      if (Number.isFinite(t) && t > newestTs) newestTs = t
+    }
+    return newestTs
   } catch { return 0 }
 }
 
 function sweepDeliveries(): void {
   if (!consumptionCheckAvailable || recentDeliveries.length === 0) return
   const now = Date.now()
-  const newest = newestTranscriptMtime()
+  const newest = newestGenuineAssistantAt()
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
-    if (newest > d.at + CONSUME_SETTLE_MS) {
+    // Strictly after the delivery, and by a genuine (non-API-error) assistant
+    // record. An error record or a pre-delivery record is NOT consumption.
+    if (newest > d.at) {
       // transcript advanced after delivery ⇒ consumed. If we had already
       // re-persisted a dup (long-turn false negative), retract it.
       if (d.pendingPath) {
@@ -2957,4 +3007,12 @@ function startListen(): void {
   })
 }
 
-startListen()
+// Entry-point guard. The daemon is launched as `bun run …/server.ts`, so
+// import.meta.main is true and startup is unchanged (verified empirically, not
+// assumed). The guard exists so a test can import this module and exercise
+// newestGenuineAssistantAt() against fixture transcripts without booting a real
+// Telegram daemon — i.e. so the consumption predicate is testable on the REAL
+// code path rather than on a copy of it. Nothing else imports this file.
+if (import.meta.main) startListen()
+
+export { newestGenuineAssistantAt }
