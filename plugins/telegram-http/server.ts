@@ -841,6 +841,19 @@ function sweepDeliveries(): void {
 }
 
 async function replayPendingFromDisk(server: Server): Promise<number> {
+  // 🔴 SSE-open gate. `server.notification()` RESOLVES even when the SSE stream
+  // is not yet open — the write lands in a stream nobody is reading — and this
+  // function then rmSync's the durable file on that false success, destroying
+  // the message. The session-open handler calls us ~0.2s after "session opened
+  // (SSE pending)", i.e. squarely inside that window.
+  // Measured 2026-08-18 on the lab canary: a 6.5h-old parked delivery was
+  // "disk-replayed" at session-open+0.24s, the file was deleted, and the content
+  // never reached the agent's transcript — twice, on two separate session-opens.
+  // The same 30s later via the timer (which checks sseOpen) landed and was read.
+  // broadcastNotification has always gated on sseOpen; this path never did.
+  // If SSE isn't up yet, leave everything parked — the timer drain will take it.
+  const sid = serverSessionId.get(server)
+  if (!sid || !sseOpen.get(sid)) return 0
   let files: string[]
   try { files = readdirSync(PENDING_DIR) } catch { return 0 }
   const pending = files.filter(f => f.endsWith('.json')).sort()
