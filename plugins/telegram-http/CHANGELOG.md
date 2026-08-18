@@ -1,3 +1,11 @@
+## 1.22.0 — 2026-08-18
+
+- **parked deliveries now drain on a timer, and never park silently (rubric I9)**: until now the ONLY caller of `replayPendingFromDisk` was the SSE session-open handler, so a parked delivery waited on an event a healthy long-lived session never generates. Not theoretical — a message from the principal was delivered 4s after a session opened (too early to consume), parked 600s later, and then sat undelivered for 5.5h while every indicator read green: agent alive, daemon alive, queue depth 0, zero alerts. It had already missed its only drain opportunity at the moment it was parked, and a later restart consumed the durable copy without delivering it.
+  - `drainPendingIfLive()` runs in the existing 30s sweep: if anything is parked AND a session with an open SSE exists, replay it immediately. Removes the dependency on a session-open event entirely.
+  - Side benefit for the zombie-duplicate problem: replays are now at most ~grace+30s old instead of hours or days. A stale duplicate is dangerous mainly because the receiving agent can no longer tell it already handled it; a fresh one is recognisable.
+  - `PARK_ALERT_AFTER_MS` (default 900s): warn once per file when something stays parked past the threshold with no live session to drain into. Parking is acceptable; parking silently is not.
+  - Purely additive: one call in the existing timer plus a read-only scan, reusing the already-proven replay path. No change to the consumption predicate or grace from 1.21.0.
+
 ## 1.21.0 — 2026-08-18
 
 - **consumption evidence is now the newest GENUINE assistant record, not file mtime (Chiron rubric I6)**: the 1.20.0 sweep treated *any* transcript advancement as proof the agent consumed a delivery. A quota / API-error turn also writes to the transcript, so a blocked agent was auto-acked as "working" — observed live: claude-chiron's 5h Fable-credit blackout produced runs acked while nothing ran, i.e. the exact lie issue #13 exists to prevent, wearing a new skin. `newestTranscriptMtime()` → `newestGenuineAssistantAt()`, which tail-reads the newest jsonl (64KB; live transcripts reach 23MB+) and returns the timestamp of the newest record satisfying ALL of: `type === 'assistant'`, `timestamp > deliveredAt`, `isApiErrorMessage` falsy.

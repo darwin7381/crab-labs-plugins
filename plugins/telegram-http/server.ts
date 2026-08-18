@@ -869,6 +869,60 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
   return replayed
 }
 
+// ---- parked-delivery recovery: drain periodically, never silently -----------
+// Until 2026-08-18 the ONLY caller of replayPendingFromDisk was the SSE
+// session-open handler, so a parked delivery waited for an event that a healthy,
+// long-lived session never generates. That is not theoretical: a message from
+// the principal was delivered 4s after a session opened (too early to be
+// consumed), parked 600s later, and then sat undelivered for 5.5h while every
+// indicator read green — agent alive, daemon alive, queue depth 0, no alert. It
+// had already missed its only drain opportunity at the moment it was parked.
+// Draining on a timer instead removes the dependency on that event. It also
+// makes any zombie duplicate FRESHER (~grace+30s old rather than hours), which
+// is what makes a replay safe to act on — a stale duplicate is dangerous mainly
+// because the receiving agent can no longer tell it already handled it.
+const PARK_ALERT_AFTER_MS = Number(process.env.PARK_ALERT_AFTER_MS ?? 900_000)  // 15min
+let parkAlerted = new Set<string>()
+
+function liveSessionServer(): Server | null {
+  for (const server of activeServers) {
+    const sid = serverSessionId.get(server)
+    if (sid && sseOpen.get(sid)) return server
+  }
+  return null
+}
+
+async function drainPendingIfLive(): Promise<void> {
+  let files: string[]
+  try { files = readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')) } catch { return }
+  if (files.length === 0) { if (parkAlerted.size) parkAlerted = new Set(); return }
+
+  // Parking is acceptable; parking SILENTLY is not. Warn once per file so a
+  // stuck queue is visible without waiting for someone to stat the directory.
+  const now = Date.now()
+  for (const f of files) {
+    if (parkAlerted.has(f)) continue
+    let ageMs = 0
+    try { ageMs = now - statSync(join(PENDING_DIR, f)).mtimeMs } catch {}
+    if (ageMs > PARK_ALERT_AFTER_MS) {
+      parkAlerted.add(f)
+      log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
+    }
+  }
+
+  const server = liveSessionServer()
+  if (!server) return   // nothing to deliver into; the age warning above is the signal
+  try {
+    const n = await replayPendingFromDisk(server)
+    if (n > 0) {
+      log('info', `timer-drain replayed ${n} parked delivery(ies) into a live session`)
+      parkAlerted = new Set()
+    }
+  } catch (err) {
+    log('warn', `timer-drain failed: ${err}`)
+  }
+}
+
 function gcPendingDisk(): void {
   const MAX_AGE_MS = 7 * 24 * 3600 * 1000
   const MAX_FILES = 1000
@@ -2472,6 +2526,7 @@ setInterval(() => {
     }
   }
   sweepDeliveries()  // issue #13: ack-on-consumption + orphan re-persist
+  void drainPendingIfLive()  // recover parked deliveries without waiting for a session-open event
 }, 30_000).unref()
 
 /**
