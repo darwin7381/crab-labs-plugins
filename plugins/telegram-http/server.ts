@@ -744,11 +744,32 @@ const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
 const CONSUME_RETAIN_MS = 1_800_000
 const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null }> = []
 
+// Re-delivery cap. Consumption is inferred from transcript progress, so an agent
+// whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
+// to consume anything. Observed 2026-08-18: claude-financial-assist's transcript
+// froze at ~32MB while the agent kept completing turns — every delivery then read
+// as unconsumed, was re-persisted, and the 1.22.0 timer drain immediately
+// replayed it, so the same message re-delivered every ~10min forever. Before the
+// timer drain this merely parked silently; with it, it loops.
+// After MAX_REDELIVERIES the agent demonstrably HAS the message (it was pushed
+// that many times); looping again cannot help, so stop re-persisting and make the
+// condition loud instead. The agent's transcript is the thing that needs fixing.
+const MAX_REDELIVERIES = Number(process.env.MAX_REDELIVERIES ?? 3)
+const deliveryAttempts = new Map<string, number>()
+function deliveryKey(notif: { method: string; params: unknown }): string {
+  const c = (notif.params as { content?: unknown } | undefined)?.content
+  const s = typeof c === 'string' ? c : JSON.stringify(notif.params ?? '')
+  return `${notif.method} ${s.length} ${s.slice(0, 200)}`
+}
+
 function recordDelivery(notif: { method: string; params: unknown }): void {
   if (!consumptionCheckAvailable) { maybeAutoAckScheduled(notif); return }
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
   recentDeliveries.push({ notif, at: Date.now(), pendingPath: null })
   if (recentDeliveries.length > 200) recentDeliveries.shift()
+  const k = deliveryKey(notif)
+  deliveryAttempts.set(k, (deliveryAttempts.get(k) ?? 0) + 1)
+  if (deliveryAttempts.size > 500) deliveryAttempts.clear()  // unbounded-growth guard
 }
 
 // Consumption evidence = the newest GENUINE assistant record's own timestamp.
@@ -831,9 +852,18 @@ function sweepDeliveries(): void {
       maybeAutoAckScheduled(d.notif)
       recentDeliveries.splice(i, 1)
     } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
-      log('warn', `delivery unconsumed for ${Math.round((now - d.at) / 1000)}s (no transcript progress) — re-persisting to inbox/pending, NOT acking (issue #13)`)
-      d.pendingPath = persistInbound(d.notif)
-      if (!d.pendingPath) recentDeliveries.splice(i, 1)  // persist failed; nothing to track
+      const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
+      if (attempts >= MAX_REDELIVERIES) {
+        // Pushed this many times already ⇒ the agent has it; the transcript is
+        // what's broken, not the delivery. Re-persisting again would just feed
+        // the timer drain and loop forever. Stop, and say so loudly.
+        log('warn', `delivery still unconsumed after ${attempts} deliveries — NOT re-persisting again (would loop). Transcript is not advancing for this agent; investigate the SESSION, not the queue (issue #13 / 32MB-transcript class)`)
+        recentDeliveries.splice(i, 1)
+      } else {
+        log('warn', `delivery unconsumed for ${Math.round((now - d.at) / 1000)}s (no transcript progress, attempt ${attempts}/${MAX_REDELIVERIES}) — re-persisting to inbox/pending, NOT acking (issue #13)`)
+        d.pendingPath = persistInbound(d.notif)
+        if (!d.pendingPath) recentDeliveries.splice(i, 1)  // persist failed; nothing to track
+      }
     } else if (now - d.at > CONSUME_RETAIN_MS) {
       recentDeliveries.splice(i, 1)
     }

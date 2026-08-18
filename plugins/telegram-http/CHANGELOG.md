@@ -1,7 +1,6 @@
-## 1.22.2 — 2026-08-18
+## 1.22.3 — 2026-08-18
 
-- **ROOT CAUSE of the lost-message class: `replayPendingFromDisk` replayed into a session whose SSE was not yet open, then deleted the durable file.** `server.notification()` resolves even when the SSE stream is still pending — the write goes into a stream nobody is reading — and the replay treated that as success and `rmSync`'d the only durable copy. The session-open handler calls the replay ~0.2s after logging `MCP session opened (SSE pending)`, i.e. squarely inside the window.
-  - Measured on the lab canary: a 6.5h-old parked delivery was "disk-replayed" at session-open+0.24s on TWO separate session-opens; the file was deleted both times and the content never appeared in the agent's transcript. The identical payload delivered 30s later by the 1.22.0 timer drain (which gates on `sseOpen`) landed and was acknowledged by the agent.
-  - This is almost certainly what destroyed the principal's message on 2026-08-17: delivered 4s after a session opened, parked, then consumed by a later session-open replay without ever being delivered.
-  - Fix: `replayPendingFromDisk` now returns 0 unless the target session's SSE is confirmed open. Files stay parked and the timer drain picks them up once the stream is real. `broadcastNotification` has always gated on `sseOpen`; this path never did.
+- **cap re-delivery so a frozen transcript cannot loop forever.** Consumption is inferred from transcript progress, so an agent whose transcript stops advancing while it is otherwise alive can never be observed to consume anything. Observed live: `claude-financial-assist`'s transcript froze at ~32MB while the agent kept completing turns and replying — so every delivery read as unconsumed, was re-persisted, and 1.22.0's timer drain immediately replayed it. Same message re-delivered every ~10 minutes, indefinitely. Before the timer drain this merely parked silently; the drain converted a silent park into a loop.
+  - After `MAX_REDELIVERIES` (default 3) the agent demonstrably has the message — it was pushed that many times — so re-persisting again cannot help. Stop, drop it from tracking, and log loudly that the SESSION needs investigating, not the queue.
+  - This is the intended asymmetry preserved: still never a false ack, but bounded noise in the false-stall direction rather than an unbounded loop.
 
