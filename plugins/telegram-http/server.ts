@@ -3062,12 +3062,19 @@ function startListen(): void {
   })
 }
 
-// Entry-point guard. The daemon is launched as `bun run …/server.ts`, so
-// import.meta.main is true and startup is unchanged (verified empirically, not
-// assumed). The guard exists so a test can import this module and exercise
+// Entry-point guard, so a test can import this module and exercise
 // newestGenuineAssistantAt() against fixture transcripts without booting a real
-// Telegram daemon — i.e. so the consumption predicate is testable on the REAL
-// code path rather than on a copy of it. Nothing else imports this file.
-if (import.meta.main) startListen()
+// daemon — i.e. the consumption predicate is testable on the REAL code path
+// rather than on a copy of it.
+//
+// 🔴 CHANNEL_INBOX_ONLY is load-bearing here, do not drop it. This engine has a
+// SECOND legitimate entry point: plugins/agent-inbox/server.ts is a shim that
+// sets CHANNEL_INBOX_ONLY=1 and `await import`s this file ("獨立 = instance, not
+// codebase"). Under that import, import.meta.main is FALSE — so a bare
+// import.meta.main guard silently prevents every agent-inbox daemon in the fleet
+// from ever listening, taking down the whole mesh/wake path as daemons restart.
+// Shipped that way in 1.21.0 and caught on the lab canary in 1.22.0 (its
+// /healthz went dark) before it reached a second agent; blast radius one.
+if (import.meta.main || process.env.CHANNEL_INBOX_ONLY === '1') startListen()
 
 export { newestGenuineAssistantAt }
