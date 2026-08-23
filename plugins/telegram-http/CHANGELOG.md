@@ -1,3 +1,7 @@
+## 1.23.1 — 2026-08-23
+
+- **the consumption/liveness predicate is now a standalone module, `liveness.ts`** (`newestGenuineAssistantAtIn(transcriptDir)`) — side-effect-free import, parameterised per agent. server.ts keeps a thin env-bound wrapper; behaviour unchanged (4-case fixture suite re-passed against the extracted module). Motive (Chiron Task #11): the 7h channel-bot blackout was invisible to every detector because the in-daemon caller of this predicate is DELIVERY-triggered (`sweepDeliveries` returns immediately on an empty recentDeliveries — it never even ran). The coming active liveness poller in supervisor/wrapper must ask the same question ("when was the last GENUINE assistant turn?") — importing this module gives all three surfaces ONE implementation instead of drifting copies.
+
 ## 1.23.0 — 2026-08-23
 
 - **the delivery watchdogs now tell a human, not just the log (Chiron, after the channel-bot's 7h quota blackout)**: both "alive but not working" signals — `delivery still unconsumed after N deliveries` (transcript not advancing: quota block, frozen session) and `PARKED DELIVERY STUCK` (message parked with no live session to drain into) — detected that outage perfectly and said nothing, because both branches were log-only. They now route through the system-alert pipeline's new `sendOpsAlert()` export: same 10-min dedupe window (one ping + suppressed-count, never a stream), same 系統警告 framing, same allowFrom target.
