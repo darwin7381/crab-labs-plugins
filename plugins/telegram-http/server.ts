@@ -51,6 +51,7 @@ import {
   roamerCurrentTranscript,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
+import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
@@ -794,46 +795,14 @@ function recordDelivery(notif: { method: string; params: unknown }): void {
 // The `> deliveredAt` comparison is load-bearing, not an optimisation: without it
 // a tail-read would happily find an assistant record from BEFORE the delivery and
 // count it as evidence — false-ack resurrected by another route.
-const TRANSCRIPT_TAIL_BYTES = 64 * 1024
+// Consumption predicate now lives in liveness.ts (ONE shared implementation —
+// supervisor/wrapper import the same file; see that module's header for the
+// full rationale recorded here through 1.22.x). This wrapper just binds it to
+// this daemon's TRANSCRIPT_DIR.
 function newestGenuineAssistantAt(): number {
-  try {
-    let newestFile = ''
-    let newestMtime = 0
-    for (const f of readdirSync(TRANSCRIPT_DIR)) {
-      if (!f.endsWith('.jsonl')) continue
-      try {
-        const m = statSync(join(TRANSCRIPT_DIR, f)).mtimeMs
-        if (m > newestMtime) { newestMtime = m; newestFile = f }
-      } catch {}
-    }
-    if (!newestFile) return 0
-    // Tail-read only: live transcripts run to tens of MB (23MB observed).
-    const path = join(TRANSCRIPT_DIR, newestFile)
-    const size = statSync(path).size
-    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES)
-    const len = size - start
-    if (len <= 0) return 0
-    const buf = Buffer.allocUnsafe(len)
-    const fd = openSync(path, 'r')
-    try { readSync(fd, buf, 0, len, start) } finally { closeSync(fd) }
-    let text = buf.toString('utf8')
-    if (start > 0) {
-      const nl = text.indexOf('\n')          // drop the partial first line
-      text = nl >= 0 ? text.slice(nl + 1) : ''
-    }
-    let newestTs = 0
-    for (const line of text.split('\n')) {
-      if (!line) continue
-      let r: { type?: string; isApiErrorMessage?: boolean; timestamp?: string }
-      try { r = JSON.parse(line) } catch { continue }
-      if (r?.type !== 'assistant') continue
-      if (r?.isApiErrorMessage) continue
-      const t = Date.parse(r?.timestamp ?? '')
-      if (Number.isFinite(t) && t > newestTs) newestTs = t
-    }
-    return newestTs
-  } catch { return 0 }
+  return newestGenuineAssistantAtIn(TRANSCRIPT_DIR)
 }
+
 
 function sweepDeliveries(): void {
   if (!consumptionCheckAvailable || recentDeliveries.length === 0) return
