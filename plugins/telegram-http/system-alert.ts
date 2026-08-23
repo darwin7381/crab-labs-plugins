@@ -150,8 +150,14 @@ function sendAlert(msg: string, source: string): void {
  * Safe to call unconditionally: before startSystemAlertWatcher wires _notify
  * (SYSTEM_ALERT_FORWARD unset, or INBOX_ONLY daemons with no bot token) the
  * default notify is a no-op, so callers degrade to their own log line.
- * Added 2026-08-23: the "delivery still unconsumed" watchdog had detected the
- * channel-bot's 7h Fable-quota blackout perfectly — and told nobody (log-only).
+ * Added 2026-08-23 after two same-day incidents (originally conflated as one
+ * "7h channel-bot blackout" — that number was RETRACTED the same day; the
+ * provable channel-bot outage was ~1h, extended by the wrapper's flat
+ * sleep 3600, and its only detector was the wrapper): the "delivery still
+ * unconsumed" watchdog detected ATLAS's stuck session perfectly — and told
+ * nobody (log-only). For the channel-bot the watchdog never even ran
+ * (delivery-triggered, empty queue). Both shapes argued for the same fix:
+ * detection without notification is not detection.
  */
 export function sendOpsAlert(msg: string, source: string): void {
   sendAlert(msg, source)
