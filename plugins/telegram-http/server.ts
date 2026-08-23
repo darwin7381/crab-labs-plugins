@@ -1150,7 +1150,7 @@ function buildServer(): Server {
         '',
         'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has image_error, the photo could NOT be downloaded — tell the sender explicitly that the image did not come through (never silently answer as if you saw it); you can retry by calling download_attachment with the attachment_file_id on the same tag. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
         '',
-        'Context attributes: reply_to_text/reply_to_user/reply_to_message_id describe the message being REPLIED TO (attachment_origin="reply" means the attachment/image came from that root message, not the reply itself); reply_quote is the passage the user specifically quoted. forward_origin/forward_from/forward_date identify the ORIGINAL author of a forwarded message — the outer user only forwarded it. A photo album arrives as ONE message with media_group_id + media_group_count and numbered paths (image_path, image_path_2, …) — Read them all. A voice_transcript attribute is a local speech-to-text of a voice/audio attachment (may be truncated, marked with a trailing …) — treat it as what the sender said, and download the audio only if you need the original.',
+        'Context attributes: reply_to_text/reply_to_user/reply_to_message_id describe the message being REPLIED TO (attachment_origin="reply" means the attachment/image came from that root message, not the reply itself); reply_quote is the passage the user specifically quoted. forward_origin/forward_from/forward_date identify the ORIGINAL author of a forwarded message — the outer user only forwarded it. An album (photos AND/OR documents sharing one media_group_id) arrives as ONE message: media_group_count = total items; photos as numbered image_path/image_path_2/…, documents as numbered attachment_file_id/attachment_name (call download_attachment for EACH file id). If media_group_id is present but media_group_count is missing, treat the album as possibly INCOMPLETE and say so rather than silently proceeding. A voice_transcript attribute is a local speech-to-text of a voice/audio attachment (may be truncated, marked with a trailing …) — treat it as what the sender said, and download the audio only if you need the original.',
         '',
         'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
         '',
@@ -1568,6 +1568,18 @@ if (isControlEnabled() || isRoamerEnabled()) {
 // actually receiving updates (vs alive but stuck).
 bot.use(async (ctx, next) => {
   if (ctx.update?.update_id) lastUpdateId = ctx.update.update_id
+  // Minimal inbound trace (2026-08-23, Atlas's 2-of-3 album-documents loss):
+  // before this line the daemon logged NOTHING per inbound update, so a
+  // dropped file left zero evidence and the incident was unprovable after the
+  // fact. One line makes "did the update even arrive" a grep instead of an
+  // argument. Never log content — ids and shape only.
+  const m = ctx.update?.message
+  if (m) {
+    const kind = m.photo ? 'photo' : m.document ? 'document' : m.video ? 'video'
+      : m.voice ? 'voice' : m.audio ? 'audio' : m.animation ? 'animation'
+      : m.sticker ? 'sticker' : m.text != null ? 'text' : 'other'
+    log('info', `inbound u=${ctx.update.update_id} chat=${m.chat?.id} msg=${m.message_id} kind=${kind}${m.media_group_id ? ` mgid=${m.media_group_id}` : ''}${m.document?.file_name ? ` name=${safeName(m.document.file_name)}` : ''}`)
+  }
   await next()
 })
 
@@ -2246,14 +2258,20 @@ async function handleInbound(
   // completely unaffected. Reply-sourced images never aggregate (the album id
   // belongs to the outer message, not the root's photo).
   const mgid = ctx.message?.media_group_id
-  if (mgid && image && !attachmentFromReply) {
+  // Documents aggregate too (2026-08-23, Atlas lost 2 of 3 album statements):
+  // a document album previously fell through here one-by-one — each item got
+  // media_group_id in meta but never media_group_count/numbered fields, so the
+  // receiving agent had no way to know the album was incomplete. Silent was
+  // the only unacceptable option.
+  if (mgid && (image || attachment) && !attachmentFromReply) {
     bufferAlbumItem(chat_id, String(mgid), {
       // When a real caption exists, `text` is its entity-expanded form (top of
       // this function) — pass that so album captions keep their hidden URLs.
       caption: ctx.message?.caption != null ? text : undefined,
-      imagePath,
-      fileId: image.file_id,
-      size: image.size,
+      ...(image
+        ? { imagePath, fileId: image.file_id, size: image.size }
+        : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
+            docMime: attachment!.mime, docName: attachment!.name }),
       meta,
     })
     return
@@ -2321,7 +2339,8 @@ const ALBUM_WINDOW_MS = 1500
 type AlbumEntry = {
   chatId: string
   captions: string[]
-  items: Array<{ imagePath?: string; fileId: string; size?: number }>
+  items: Array<{ imagePath?: string; fileId: string; size?: number;
+                 docKind?: string; docMime?: string; docName?: string }>
   baseMeta: Record<string, string>
   timer: ReturnType<typeof setTimeout> | null
 }
@@ -2330,7 +2349,8 @@ const albumBuffers = new Map<string, AlbumEntry>()
 function bufferAlbumItem(
   chatId: string,
   mgid: string,
-  item: { caption?: string; imagePath?: string; fileId: string; size?: number; meta: Record<string, string> },
+  item: { caption?: string; imagePath?: string; fileId: string; size?: number;
+          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string> },
 ): void {
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
@@ -2340,7 +2360,8 @@ function bufferAlbumItem(
   }
   if (entry.timer) clearTimeout(entry.timer)
   if (item.caption) entry.captions.push(item.caption)
-  entry.items.push({ imagePath: item.imagePath, fileId: item.fileId, size: item.size })
+  entry.items.push({ imagePath: item.imagePath, fileId: item.fileId, size: item.size,
+                     docKind: item.docKind, docMime: item.docMime, docName: item.docName })
   entry.timer = setTimeout(() => flushAlbum(key), ALBUM_WINDOW_MS)
 }
 
@@ -2356,20 +2377,33 @@ function flushAlbum(key: string): void {
   delete meta.attachment_kind
   delete meta.attachment_file_id
   delete meta.attachment_size
+  delete meta.attachment_mime
+  delete meta.attachment_name
   meta.media_group_count = String(entry.items.length)
   entry.items.forEach((it, i) => {
     const suffix = i === 0 ? '' : `_${i + 1}`
     if (it.imagePath) {
       meta[`image_path${suffix}`] = it.imagePath
+    } else if (it.docKind) {
+      // Document album item — a real attachment, NOT a failed photo download.
+      meta[`attachment_kind${suffix}`] = it.docKind
+      meta[`attachment_file_id${suffix}`] = it.fileId
+      if (it.size != null) meta[`attachment_size${suffix}`] = String(it.size)
+      if (it.docMime) meta[`attachment_mime${suffix}`] = it.docMime
+      if (it.docName) meta[`attachment_name${suffix}`] = it.docName
     } else {
       meta[`image_error${suffix}`] = 'download failed'
       meta[`attachment_file_id${suffix}`] = it.fileId
       if (it.size != null) meta[`attachment_size${suffix}`] = String(it.size)
     }
   })
+  const docNames = entry.items.filter(it => it.docKind).map(it => it.docName ?? 'file')
+  const nPhotos = entry.items.filter(it => it.imagePath || !it.docKind).length
   const content = entry.captions.length > 0
     ? entry.captions.join('\n')
-    : `(album: ${entry.items.length} photos)`
+    : docNames.length > 0
+      ? `(album: ${entry.items.length} items — ${docNames.join(', ')}${nPhotos > 0 ? ` + ${nPhotos} photo(s)` : ''})`
+      : `(album: ${entry.items.length} photos)`
   void dispatchInbound(entry.chatId, {
     method: 'notifications/claude/channel',
     params: { content, meta },
