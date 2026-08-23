@@ -1,3 +1,9 @@
+## 1.23.0 — 2026-08-23
+
+- **the delivery watchdogs now tell a human, not just the log (Chiron, after the channel-bot's 7h quota blackout)**: both "alive but not working" signals — `delivery still unconsumed after N deliveries` (transcript not advancing: quota block, frozen session) and `PARKED DELIVERY STUCK` (message parked with no live session to drain into) — detected that outage perfectly and said nothing, because both branches were log-only. They now route through the system-alert pipeline's new `sendOpsAlert()` export: same 10-min dedupe window (one ping + suppressed-count, never a stream), same 系統警告 framing, same allowFrom target.
+  - Fail-safe by construction: before `startSystemAlertWatcher` wires the notifier (SYSTEM_ALERT_FORWARD unset, or INBOX_ONLY mesh daemons that have no bot token) the notify is a no-op and the log line remains the behaviour — no crash path added.
+  - KNOWN RESIDUAL: mesh-rail-only wedges still don't DM (INBOX_ONLY has no Telegram token). In practice the same agent's telegram daemon watches the same transcript and its own deliveries wedge alongside, so coverage is near-complete — near, not full. Structural close = routing mesh alerts via the sibling telegram daemon or BTCC; deliberately not in this change.
+
 ## 1.22.3 — 2026-08-18
 
 - **cap re-delivery so a frozen transcript cannot loop forever.** Consumption is inferred from transcript progress, so an agent whose transcript stops advancing while it is otherwise alive can never be observed to consume anything. Observed live: `claude-financial-assist`'s transcript froze at ~32MB while the agent kept completing turns and replying — so every delivery read as unconsumed, was re-persisted, and 1.22.0's timer drain immediately replayed it. Same message re-delivered every ~10 minutes, indefinitely. Before the timer drain this merely parked silently; the drain converted a silent park into a loop.

@@ -144,6 +144,19 @@ function sendAlert(msg: string, source: string): void {
   _log('info', `system-alert forwarded: ${key.slice(0, 80)}`)
 }
 
+/**
+ * Ops-alert entry point for OTHER modules (delivery watchdog etc.) — same
+ * dedupe window and allowFrom notify pipeline as the TUI-warning forwarders.
+ * Safe to call unconditionally: before startSystemAlertWatcher wires _notify
+ * (SYSTEM_ALERT_FORWARD unset, or INBOX_ONLY daemons with no bot token) the
+ * default notify is a no-op, so callers degrade to their own log line.
+ * Added 2026-08-23: the "delivery still unconsumed" watchdog had detected the
+ * channel-bot's 7h Fable-quota blackout perfectly — and told nobody (log-only).
+ */
+export function sendOpsAlert(msg: string, source: string): void {
+  sendAlert(msg, source)
+}
+
 // ---- PRIMARY layer: OTLP/HTTP JSON logs receiver ---------------------------
 
 /** Events worth waking the user for. Other telemetry events are ignored. */
