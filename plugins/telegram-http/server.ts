@@ -50,7 +50,7 @@ import {
   handleModelCallbackForCurrentTarget,
   roamerCurrentTranscript,
 } from './roamer-control.ts'
-import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
+import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
@@ -858,6 +858,12 @@ function sweepDeliveries(): void {
         // what's broken, not the delivery. Re-persisting again would just feed
         // the timer drain and loop forever. Stop, and say so loudly.
         log('warn', `delivery still unconsumed after ${attempts} deliveries — NOT re-persisting again (would loop). Transcript is not advancing for this agent; investigate the SESSION, not the queue (issue #13 / 32MB-transcript class)`)
+        // This is the "process alive but not actually working" signal — it
+        // detected the channel-bot's 7h quota blackout (2026-08-23) and said
+        // nothing. Route it to a human via the shared dedupe/notify pipeline.
+        sendOpsAlert(
+          `agent 疑似卡死（行程活著但沒在工作）：訊息推送 ${attempts} 次都未被消化，transcript 不再前進 — 常見原因：撞額度、session 凍結。需要人看 SESSION 本身。`,
+          'delivery-watchdog')
         recentDeliveries.splice(i, 1)
       } else {
         log('warn', `delivery unconsumed for ${Math.round((now - d.at) / 1000)}s (no transcript progress, attempt ${attempts}/${MAX_REDELIVERIES}) — re-persisting to inbox/pending, NOT acking (issue #13)`)
@@ -950,6 +956,11 @@ async function drainPendingIfLive(): Promise<void> {
     if (ageMs > PARK_ALERT_AFTER_MS) {
       parkAlerted.add(f)
       log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
+      // Parking is acceptable; parking SILENTLY is not (the prometheus lost-
+      // message incident). Same shared pipeline; dedupe keeps it to one ping.
+      sendOpsAlert(
+        `有訊息停放超過 ${Math.round(ageMs / 60000)} 分鐘未送達（無活 session 可 drain）：${f} — agent 的 session 可能沒起來。`,
+        'park-watchdog')
     }
   }
 
