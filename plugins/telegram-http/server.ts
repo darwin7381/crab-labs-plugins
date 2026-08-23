@@ -695,6 +695,12 @@ const SESSION_GRACE_MS = 120_000                       // no open SSE for this l
 // gaps. New session's first GET handleRequest signals SSE is up; we then drain
 // disk pending to that session. Files are deleted on successful delivery.
 const PENDING_DIR = join(STATE_DIR, 'inbox', 'pending')
+// Undeliverable quarantine (1.24.1): where a delivery goes after the
+// re-delivery cap gives up. NEVER auto-replayed (timer drain and session-open
+// replay read PENDING_DIR only) — the content is preserved for the recovered
+// agent or an operator instead of being destroyed. The cap alert names the
+// exact file.
+const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
 mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 let persistSeq = 0
 
@@ -823,15 +829,31 @@ function sweepDeliveries(): void {
     } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
       if (attempts >= MAX_REDELIVERIES) {
-        // Pushed this many times already ⇒ the agent has it; the transcript is
-        // what's broken, not the delivery. Re-persisting again would just feed
-        // the timer drain and loop forever. Stop, and say so loudly.
-        log('warn', `delivery still unconsumed after ${attempts} deliveries — NOT re-persisting again (would loop). Transcript is not advancing for this agent; investigate the SESSION, not the queue (issue #13 / 32MB-transcript class)`)
+        // Stop the loop — but do NOT destroy the message. The 1.22.3 wording
+        // here claimed "the agent demonstrably has it (it was pushed N times)";
+        // Chiron's SIGSTOP wedge (2026-08-23) disproved that: SSE writes to a
+        // stopped process sit unread in a socket buffer, and after the drain's
+        // rmSync no disk copy remained — his probe message was simply GONE,
+        // tombstoned only by the alert. Pushed ≠ received (the same lie-family
+        // as write≠delivery). Quarantine the payload instead: preserved on
+        // disk, never auto-replayed, named in the alert for whoever recovers
+        // the session.
+        let qpath: string | null = null
+        try {
+          mkdirSync(UNDELIVERABLE_DIR, { recursive: true })
+          const qname = `${new Date().toISOString().replace(/[:.]/g, '-')}-capped.json`
+          qpath = join(UNDELIVERABLE_DIR, qname)
+          writeFileSync(qpath, JSON.stringify(d.notif), { mode: 0o600 })
+        } catch (err) {
+          qpath = null
+          log('error', `quarantine write failed (content survives ONLY in this log line): ${err} :: ${JSON.stringify(d.notif).slice(0, 800)}`)
+        }
+        log('warn', `delivery still unconsumed after ${attempts} deliveries — quarantined to ${qpath ?? '(write failed, see error above)'} and NOT re-persisting (would loop). Transcript is not advancing for this agent; investigate the SESSION, not the queue (issue #13 / 32MB-transcript class)`)
         // This is the "process alive but not actually working" signal — it
         // detected the channel-bot's 7h quota blackout (2026-08-23) and said
         // nothing. Route it to a human via the shared dedupe/notify pipeline.
         sendOpsAlert(
-          `agent 疑似卡死（行程活著但沒在工作）：訊息推送 ${attempts} 次都未被消化，transcript 不再前進 — 常見原因：撞額度、session 凍結。需要人看 SESSION 本身。`,
+          `agent 疑似卡死（行程活著但沒在工作）：訊息推送 ${attempts} 次都未被消化，transcript 不再前進 — 常見原因：撞額度、session 凍結。需要人看 SESSION 本身。原訊息已保存於 inbox/undeliverable/（不會自動重投，處理完 session 後手動取回）。`,
           'delivery-watchdog')
         recentDeliveries.splice(i, 1)
       } else {
