@@ -1,3 +1,7 @@
+## 1.24.3 — 2026-09-04
+
+- **Fable 5 row removed from the /model picker (Joey 6392: 同價直升，舊版全面退場 — Fable 一律 5.1)**: same price, strictly better model → the legacy row only invites accidental downgrades. `/model claude-fable-5` still works typed manually.
+
 ## 1.24.2 — 2026-09-04
 
 - **/model picker offers Fable 5.1 (Joey 6383: picker still said Fable 5 only, day after the fleet moved to CLI 2.1.259)**: `DEFAULT_MODEL_CHOICES` was a hardcoded list frozen at Fable 5 — the CLI upgrade changed what the TUI can run but nothing updates the daemon's own picker. Added `claude-fable-5-1` (✨) at the top; requires CLI >=2.1.251, which the whole fleet has as of 2026-09-03. Current-model ✅ marking is unaffected (normalizeModelId only strips a `[1m]` suffix — no fable-5 / fable-5-1 collision).
