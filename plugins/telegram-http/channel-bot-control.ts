@@ -590,6 +590,8 @@ const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
  * Values are what gets typed after `/model ` in the claude TUI (alias or full id).
  */
 const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
+  // Fable 5.1 requires CLI >=2.1.251 (fleet on 2.1.259 since 2026-09-03).
+  { label: '✨ Fable 5.1', value: 'claude-fable-5-1' },
   { label: '🌟 Fable 5', value: 'claude-fable-5' },
   { label: '🏺 Opus 5', value: 'claude-opus-5' },
   // Opus 4.8 dropped from the picker (Joey 5461, superseded by Opus 5);

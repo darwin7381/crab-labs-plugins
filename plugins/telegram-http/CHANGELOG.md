@@ -1,3 +1,7 @@
+## 1.24.2 — 2026-09-04
+
+- **/model picker offers Fable 5.1 (Joey 6383: picker still said Fable 5 only, day after the fleet moved to CLI 2.1.259)**: `DEFAULT_MODEL_CHOICES` was a hardcoded list frozen at Fable 5 — the CLI upgrade changed what the TUI can run but nothing updates the daemon's own picker. Added `claude-fable-5-1` (✨) at the top; requires CLI >=2.1.251, which the whole fleet has as of 2026-09-03. Current-model ✅ marking is unaffected (normalizeModelId only strips a `[1m]` suffix — no fable-5 / fable-5-1 collision).
+
 ## 1.24.1 — 2026-08-23
 
 - **capped deliveries are quarantined, not destroyed (Chiron's SIGSTOP wedge disproved 1.22.3's assumption)**: the re-delivery cap claimed "the agent demonstrably has the message — it was pushed N times". False under a stopped process: SSE writes sit unread in a socket buffer, the drain's rmSync had already removed the last disk copy, and after cap the message existed nowhere — Chiron's `[SYNTHETIC WEDGE]` probe vanished with only the alert as tombstone. Pushed ≠ received (same lie-family as write ≠ delivery, third occurrence in this codebase). On cap the payload now moves to `inbox/undeliverable/` — preserved on disk, never auto-replayed (drain and session-open replay read `inbox/pending/` only), named in the ops alert for manual recovery after the session is fixed. If even the quarantine write fails, the payload is dumped into the error log line rather than lost silently.

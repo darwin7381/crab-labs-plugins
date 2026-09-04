@@ -470,8 +470,12 @@ const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
  * Values are what gets typed after `/model ` in the claude TUI (alias or full id).
  */
 const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
+  // Fable 5.1 requires CLI >=2.1.251 (fleet on 2.1.259 since 2026-09-03).
+  { label: '✨ Fable 5.1', value: 'claude-fable-5-1' },
   { label: '🌟 Fable 5', value: 'claude-fable-5' },
-  { label: '🏛️ Opus 4.8', value: 'claude-opus-4-8' },
+  // Opus 4.8 → Opus 5, aligned with telegram-http (Joey 5461 dropped 4.8
+  // from the picker; still selectable manually via `/model claude-opus-4-8`).
+  { label: '🏺 Opus 5', value: 'claude-opus-5' },
   { label: '🎼 Sonnet 5', value: 'claude-sonnet-5' },
   { label: '⚡ Haiku 4.5', value: 'claude-haiku-4-5-20251001' },
   { label: '↩️ Default（回 TUI 預設）', value: 'default' },
