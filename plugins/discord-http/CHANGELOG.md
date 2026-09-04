@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13.2 — 2026-09-04
+
+- **Fable 5 row removed from the /model picker (Joey 6392)**: mirror of telegram-http 1.24.3 — Fable 一律 5.1; `/model claude-fable-5` still reachable manually.
+
 ## 1.13.1 — 2026-09-04
 
 - **/model picker offers Fable 5.1 + Opus 4.8 row replaced by Opus 5 (Joey 6383)**: `DEFAULT_MODEL_CHOICES` was frozen at Fable 5 and still carried Opus 4.8, which telegram-http's picker dropped back when Opus 5 superseded it (Joey 5461) — the two pickers had drifted. Now aligned: ✨ Fable 5.1 (needs CLI >=2.1.251; fleet on 2.1.259 since 2026-09-03) on top, 🏺 Opus 5 replacing 4.8 (4.8 still reachable via `/model claude-opus-4-8`).

@@ -591,8 +591,9 @@ const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
  */
 const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
   // Fable 5.1 requires CLI >=2.1.251 (fleet on 2.1.259 since 2026-09-03).
+  // Fable 5 row REMOVED (Joey 6392: 同價直升、舊版全面退場 — Fable 一律 5.1);
+  // still manually reachable via `/model claude-fable-5` if ever needed.
   { label: '✨ Fable 5.1', value: 'claude-fable-5-1' },
-  { label: '🌟 Fable 5', value: 'claude-fable-5' },
   { label: '🏺 Opus 5', value: 'claude-opus-5' },
   // Opus 4.8 dropped from the picker (Joey 5461, superseded by Opus 5);
   // still selectable manually via `/model claude-opus-4-8`.
