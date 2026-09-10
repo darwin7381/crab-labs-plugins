@@ -1523,7 +1523,13 @@ if (isSystemAlertEnabled()) {
     notify: text => {
       const access = loadAccess()
       for (const chat_id of access.allowFrom) {
-        void bot.api.sendMessage(chat_id, text).catch(e => {
+        // Log the success too (2026-09-10, Hephaestus 3451): "forwarded" alone
+        // proved nothing about delivery — an audit of atlas's 38 usage-limit
+        // forwards found no per-send evidence either way. Success now leaves
+        // a line with the TG message id; failure keeps its own.
+        void bot.api.sendMessage(chat_id, text).then(m => {
+          log('info', `system-alert sent to ${chat_id} msg=${m?.message_id ?? '?'}`)
+        }).catch(e => {
           log('error', `system-alert send to ${chat_id} failed: ${e}`)
         })
       }

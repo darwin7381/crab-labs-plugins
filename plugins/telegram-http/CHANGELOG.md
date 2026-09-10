@@ -1,3 +1,7 @@
+## 1.24.4 — 2026-09-10
+
+- **system-alert forwarder logs successful DMs (Hephaestus 3451 audit of atlas's 63h-dead session)**: the sink was always a real `bot.api.sendMessage` to every `allowFrom` chat (server.ts notify), but only failures were logged — 38 hourly "forwarded" lines with no per-send line looked like a black hole. Success now logs `system-alert sent to <chat_id> msg=<id>`. No delivery-path change. Not yet deployed fleet-wide (staged for the next wave).
+
 ## 1.24.3 — 2026-09-04
 
 - **Fable 5 row removed from the /model picker (Joey 6392: 同價直升，舊版全面退場 — Fable 一律 5.1)**: same price, strictly better model → the legacy row only invites accidental downgrades. `/model claude-fable-5` still works typed manually.
