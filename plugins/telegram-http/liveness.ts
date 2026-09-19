@@ -50,10 +50,20 @@ export function newestGenuineAssistantAtIn(transcriptDir: string): number {
     let newestTs = 0
     for (const line of text.split('\n')) {
       if (!line) continue
-      let r: { type?: string; isApiErrorMessage?: boolean; timestamp?: string }
+      let r: { type?: string; isApiErrorMessage?: boolean; timestamp?: string; message?: { model?: string } }
       try { r = JSON.parse(line) } catch { continue }
       if (r?.type !== 'assistant') continue
       if (r?.isApiErrorMessage) continue
+      // 2026-09-19 (chiron 3779, verified on 3 transcripts): after a supervisor/
+      // wrapper restart the CLI answers the isMeta "Continue from where you left
+      // off." prompt with an assistant record that is model=<synthetic>, has no
+      // requestId, shares the user record's millisecond and reads "No response
+      // requested." — ZERO model calls. It is not an API error, so the check
+      // above let it through and a delivery landing just before the restart was
+      // marked consumed by a turn no model ever saw (same lie-family as the
+      // 2026-08-22 prometheus loss). Anything the CLI stamps <synthetic> is by
+      // definition not the agent reading anything.
+      if (r?.message?.model === '<synthetic>') continue
       const t = Date.parse(r?.timestamp ?? '')
       if (Number.isFinite(t) && t > newestTs) newestTs = t
     }
