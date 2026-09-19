@@ -1,3 +1,7 @@
+## 1.24.5 — 2026-09-19
+
+- **consumption predicate ignores `model=<synthetic>` records (chiron 3779, verified on 3 transcripts)**: after a supervisor/wrapper restart the CLI answers the isMeta "Continue from where you left off." prompt with an assistant record that is `<synthetic>`, requestId-less, same-millisecond, "No response requested." — zero model calls. `isApiErrorMessage` is false on it, so `newestGenuineAssistantAtIn` accepted it as genuine and a delivery landing just before a restart was acked by a turn no model saw (prometheus-loss family). Now any `<synthetic>` assistant record is skipped (covers the api-error synthetics too, belt and braces). Regression tests added (`liveness.test.ts`, 5 cases). Shared module: the supervisor/wrapper liveness consumers inherit on their next restart. Undeployed — rides the next wave with 1.24.4.
+
 ## 1.24.4 — 2026-09-10
 
 - **system-alert forwarder logs successful DMs (Hephaestus 3451 audit of atlas's 63h-dead session)**: the sink was always a real `bot.api.sendMessage` to every `allowFrom` chat (server.ts notify), but only failures were logged — 38 hourly "forwarded" lines with no per-send line looked like a black hole. Success now logs `system-alert sent to <chat_id> msg=<id>`. No delivery-path change. Not yet deployed fleet-wide (staged for the next wave).
