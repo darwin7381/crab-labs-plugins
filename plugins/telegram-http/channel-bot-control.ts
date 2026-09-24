@@ -594,7 +594,12 @@ const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
   // Fable 5 row REMOVED (Joey 6392: 同價直升、舊版全面退場 — Fable 一律 5.1);
   // still manually reachable via `/model claude-fable-5` if ever needed.
   { label: '✨ Fable 5.1', value: 'claude-fable-5-1' },
-  { label: '🏺 Opus 5', value: 'claude-opus-5' },
+  // Opus 5 row replaced by 5.5 (Joey 6414, official 2026-09-24 announcement:
+  // Fable-5.1-level on most work, ~30% faster, ~40% cheaper, limits stretch
+  // ~25% further — same "same price or better, retire the old row" logic he
+  // applied to Fable 5 in 6392). Requires CLI >=2.1.281; 2.1.259 has ZERO
+  // opus-5-5 strings. `/model claude-opus-5` still works typed manually.
+  { label: '🏺 Opus 5.5', value: 'claude-opus-5-5' },
   // Opus 4.8 dropped from the picker (Joey 5461, superseded by Opus 5);
   // still selectable manually via `/model claude-opus-4-8`.
   { label: '🎼 Sonnet 5', value: 'claude-sonnet-5' },

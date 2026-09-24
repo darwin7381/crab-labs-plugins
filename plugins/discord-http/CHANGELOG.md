@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13.3 — 2026-09-24
+
+- **/model picker: Opus 5 row → Opus 5.5 (Joey 6414)**: mirror of telegram-http 1.24.6; needs CLI ≥2.1.281.
+
 ## 1.13.2 — 2026-09-04
 
 - **Fable 5 row removed from the /model picker (Joey 6392)**: mirror of telegram-http 1.24.3 — Fable 一律 5.1; `/model claude-fable-5` still reachable manually.
