@@ -1,3 +1,7 @@
+## 1.24.6 — 2026-09-24
+
+- **/model picker: Opus 5 row → Opus 5.5 (Joey 6414)**: official announcement makes Opus 5.5 the Claude Code default on Max — Fable-5.1-level on most work, ~30% faster, ~40% cheaper per task, usage limits ~25% further. Same "strictly better at same-or-lower price ⇒ retire the legacy row" rule Joey set for Fable 5 (6392). Requires CLI **≥2.1.281** (2.1.259 binary contains ZERO `opus-5-5` strings; lab-verified served on our Max account: jsonl `model=claude-opus-5-5`, end_turn, no fallback). `/model claude-opus-5` still reachable manually.
+
 ## 1.24.5 — 2026-09-19
 
 - **consumption predicate ignores `model=<synthetic>` records (chiron 3779, verified on 3 transcripts)**: after a supervisor/wrapper restart the CLI answers the isMeta "Continue from where you left off." prompt with an assistant record that is `<synthetic>`, requestId-less, same-millisecond, "No response requested." — zero model calls. `isApiErrorMessage` is false on it, so `newestGenuineAssistantAtIn` accepted it as genuine and a delivery landing just before a restart was acked by a turn no model saw (prometheus-loss family). Now any `<synthetic>` assistant record is skipped (covers the api-error synthetics too, belt and braces). Regression tests added (`liveness.test.ts`, 5 cases). Shared module: the supervisor/wrapper liveness consumers inherit on their next restart. Undeployed — rides the next wave with 1.24.4.
