@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13.4 — 2026-10-04
+
+- **pending GC no longer destroys undelivered messages (chiron 3947)**: same fix as telegram-http 1.24.7 — entries older than 7 days or past the 1000-file cap move to `inbox/undeliverable/gc-<file>` with a `warn` log instead of a silent `rmSync`. (discord-http has no ops-alert pipeline; the warn line is the signal.)
+
 ## 1.13.3 — 2026-09-24
 
 - **/model picker: Opus 5 row → Opus 5.5 (Joey 6414)**: mirror of telegram-http 1.24.6; needs CLI ≥2.1.281.
