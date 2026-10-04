@@ -811,6 +811,9 @@ const SESSION_GRACE_MS = 120_000                       // no open SSE for this l
 // gaps. New session's first GET handleRequest signals SSE is up; we then drain
 // disk pending to that session. Files are deleted on successful delivery.
 const PENDING_DIR = join(STATE_DIR, 'inbox', 'pending')
+// Where gcPendingDisk moves entries no session ever consumed (never destroyed;
+// same rule as telegram-http's undeliverable quarantine).
+const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
 mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 let persistSeq = 0
 
@@ -871,17 +874,26 @@ function gcPendingDisk(): void {
     try { items.push({ f, mtime: statSync(path).mtimeMs, path }) } catch {}
   }
   const now = Date.now()
-  let pruned = 0
-  for (const it of items) {
-    if (now - it.mtime > MAX_AGE_MS) {
-      try { rmSync(it.path); pruned++ } catch {}
+  // Every entry here is a message NO session has consumed: quarantine, never
+  // rmSync (it used to delete them silently — chiron 3947).
+  const moved: string[] = []
+  const quarantine = (it: Item) => {
+    try {
+      mkdirSync(UNDELIVERABLE_DIR, { recursive: true })
+      renameSync(it.path, join(UNDELIVERABLE_DIR, `gc-${it.f}`))
+      moved.push(it.f)
+    } catch (err) {
+      log('error', `gc: could not quarantine ${it.f} (left in pending): ${err}`)
     }
   }
-  const fresh = items.filter(i => now - i.mtime <= MAX_AGE_MS).sort((a, b) => b.mtime - a.mtime)
-  for (const it of fresh.slice(MAX_FILES)) {
-    try { rmSync(it.path); pruned++ } catch {}
+  for (const it of items) {
+    if (now - it.mtime > MAX_AGE_MS) quarantine(it)
   }
-  if (pruned > 0) log('info', `gc: pruned ${pruned} pending entries`)
+  const fresh = items.filter(i => now - i.mtime <= MAX_AGE_MS).sort((a, b) => b.mtime - a.mtime)
+  for (const it of fresh.slice(MAX_FILES)) quarantine(it)
+  if (moved.length > 0) {
+    log('warn', `gc: ${moved.length} unconsumed pending entr${moved.length === 1 ? 'y' : 'ies'} (older than 7d or past the 1000-file cap) moved to inbox/undeliverable/: ${moved.slice(0, 5).join(', ')}${moved.length > 5 ? ' …' : ''}`)
+  }
 }
 setInterval(gcPendingDisk, 3600 * 1000).unref()
 

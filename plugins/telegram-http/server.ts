@@ -981,17 +981,31 @@ function gcPendingDisk(): void {
     try { items.push({ f, mtime: statSync(path).mtimeMs, path }) } catch {}
   }
   const now = Date.now()
-  let pruned = 0
-  for (const it of items) {
-    if (now - it.mtime > MAX_AGE_MS) {
-      try { rmSync(it.path); pruned++ } catch {}
+  // Every entry here is a message NO session has consumed. Same rule as the
+  // re-delivery cap (1.24.1): move it to inbox/undeliverable/ and say so —
+  // never destroy it. (This used to rmSync silently while BTCC Comms still
+  // showed the row as delivered; chiron 3947.)
+  const moved: string[] = []
+  const quarantine = (it: Item) => {
+    try {
+      mkdirSync(UNDELIVERABLE_DIR, { recursive: true })
+      renameSync(it.path, join(UNDELIVERABLE_DIR, `gc-${it.f}`))
+      moved.push(it.f)
+    } catch (err) {
+      log('error', `gc: could not quarantine ${it.f} (left in pending): ${err}`)
     }
   }
-  const fresh = items.filter(i => now - i.mtime <= MAX_AGE_MS).sort((a, b) => b.mtime - a.mtime)
-  for (const it of fresh.slice(MAX_FILES)) {
-    try { rmSync(it.path); pruned++ } catch {}
+  for (const it of items) {
+    if (now - it.mtime > MAX_AGE_MS) quarantine(it)
   }
-  if (pruned > 0) log('info', `gc: pruned ${pruned} pending entries`)
+  const fresh = items.filter(i => now - i.mtime <= MAX_AGE_MS).sort((a, b) => b.mtime - a.mtime)
+  for (const it of fresh.slice(MAX_FILES)) quarantine(it)
+  if (moved.length > 0) {
+    log('warn', `gc: ${moved.length} unconsumed pending entr${moved.length === 1 ? 'y' : 'ies'} (older than 7d or past the 1000-file cap) moved to inbox/undeliverable/: ${moved.slice(0, 5).join(', ')}${moved.length > 5 ? ' …' : ''}`)
+    sendOpsAlert(
+      `收件匣有 ${moved.length} 則訊息超過 7 天（或超過 1000 則上限）一直沒有 session 收下，已移到 inbox/undeliverable/ 保存，不會自動重投。這個 agent 的 session 可能長期沒起來；BTCC Comms 上這些訊息仍顯示已送達。`,
+      'pending-gc')
+  }
 }
 setInterval(gcPendingDisk, 3600 * 1000).unref()
 
@@ -1047,10 +1061,18 @@ function inboxRegistryNames(): string[] {
   return Object.keys(loadInboxRegistry()).filter(n => n !== INBOX_SELF)
 }
 
+const SEND_MAX_CHARS = 3500
+
 async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean): Promise<string> {
   const target = to.trim().toLowerCase()
-  const body = text.trim().slice(0, 3500)
+  const body = text.trim()
   if (!body) return 'send failed: empty text'
+  // Reject instead of truncating: slice(0, 3500) used to drop the tail and still
+  // report "delivered", so neither side knew (cadmus 4075/4077). Same cap as the
+  // receiver's /deliver and /relay.
+  if (body.length > SEND_MAX_CHARS) {
+    return `send failed: text is ${body.length} characters; the limit is ${SEND_MAX_CHARS}. Nothing was sent — split it into numbered parts and send each part.`
+  }
   // 'joey' is a log-only target: the boss has no inbox daemon — he reads the BTCC
   // Messenger thread, so logging the message IS the delivery (fills his dm thread).
   if (target === 'joey' || target === 'joey (btcc)') {
@@ -1224,7 +1246,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      {
        name: 'send_to_agent',
        description:
-         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). Write NATURAL message text — no 【sender → target】 prefixes or headers; your identity travels in the channel metadata automatically. The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
+         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). Write NATURAL message text — no 【sender → target】 prefixes or headers; your identity travels in the channel metadata automatically. The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). At most ' + SEND_MAX_CHARS + ' characters per message — longer text is rejected (nothing sent), so split it into numbered parts. Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
        inputSchema: {
          type: 'object',
          properties: {
