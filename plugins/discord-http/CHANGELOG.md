@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13.5 — 2026-10-04
+
+- **Dead SSE sessions reclaimed under Bun**: same `req.socket 'close'` bridge as telegram-http 1.24.8 (identical SSE handler; see that entry for the lab reproduction and evidence). Rides the same wave as 1.13.4.
+
 ## 1.13.4 — 2026-10-04
 
 - **pending GC no longer destroys undelivered messages (chiron 3947)**: same fix as telegram-http 1.24.7 — entries older than 7 days or past the 1000-file cap move to `inbox/undeliverable/gc-<file>` with a `warn` log instead of a silent `rmSync`. (discord-http has no ops-alert pipeline; the warn line is the signal.)
