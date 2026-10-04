@@ -1766,9 +1766,17 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         } catch (err) {
           log('warn', `setKeepAlive failed for ${sessionId}: ${err instanceof Error ? err.message : err}`)
         }
+        const sseSocket = req.socket
         const keepaliveTimer = setInterval(() => {
           if (res.destroyed || res.writableEnded || !sseOpen.get(sessionId)) {
             clearInterval(keepaliveTimer)
+            return
+          }
+          // Fallback for a missed socket 'close' (see onPeerGone below). Must run
+          // BEFORE the write: under Bun a write to a dead peer still "succeeds" and
+          // would refresh sessionLastActiveAt, hiding the zombie from the GC.
+          if (sseSocket?.destroyed) {
+            onPeerGone('keepalive: socket destroyed')
             return
           }
           // issue #3 hardening: a half-dead socket accepts keepalive writes into the
@@ -1798,6 +1806,24 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         }
         res.once('close', onResClose)
 
+        // Bun peer-death bridge — same fix as telegram-http 1.24.8 (see the full
+        // rationale there): under Bun, res never reports a dead SSE peer ('close'
+        // never fires, writes keep "succeeding"), so sessions stayed sseOpen=true
+        // forever. req.socket does emit 'close' on peer death: mark SSE closed (GC
+        // evicts after the grace window) and release the SDK's standalone stream.
+        let peerGone = false
+        function onPeerGone(why: string): void {
+          if (peerGone) return
+          peerGone = true
+          clearInterval(keepaliveTimer)
+          if (sseOpen.get(sessionId)) sseOpen.set(sessionId, false)
+          log('info', `SSE peer gone for ${sessionId} (${why}) — SSE marked closed; GC evicts after ${SESSION_GRACE_MS / 1000}s grace unless the client re-opens SSE`)
+          try { transport.closeStandaloneSSEStream() } catch {}
+        }
+        const onSocketClose = () => onPeerGone('socket close')
+        sseSocket?.once('close', onSocketClose)
+        if (sseSocket?.destroyed) onPeerGone('socket already closed at SSE open')
+
         const reqPromise = transport.handleRequest(req, res)
         await new Promise(r => setTimeout(r, 50))  // let SDK register stream
         let boundServer: Server | undefined
@@ -1823,6 +1849,10 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           sseOpen.set(sessionId, false)
           clearInterval(keepaliveTimer)
           res.off('close', onResClose)
+          // Disarm: a keep-alive socket can outlive this stream and be reused;
+          // its later 'close' must not touch this session.
+          peerGone = true
+          sseSocket?.off('close', onSocketClose)
         }
         return
       }

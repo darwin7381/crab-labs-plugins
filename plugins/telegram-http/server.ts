@@ -3035,9 +3035,17 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         } catch (err) {
           log('warn', `setKeepAlive failed for ${sessionId}: ${err instanceof Error ? err.message : err}`)
         }
+        const sseSocket = req.socket
         const keepaliveTimer = setInterval(() => {
           if (res.destroyed || res.writableEnded || !sseOpen.get(sessionId)) {
             clearInterval(keepaliveTimer)
+            return
+          }
+          // Fallback for a missed socket 'close' (see onPeerGone below). Must run
+          // BEFORE the write: under Bun a write to a dead peer still "succeeds" and
+          // would refresh sessionLastActiveAt, hiding the zombie from the GC.
+          if (sseSocket?.destroyed) {
+            onPeerGone('keepalive: socket destroyed')
             return
           }
           // issue #3 hardening: a half-dead socket accepts keepalive writes into the
@@ -3068,6 +3076,34 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           sseOpen.set(sessionId, false)
         }
         res.once('close', onResClose)
+
+        // Bun peer-death bridge (2026-10-04, reproduced in lab with a real claude
+        // client on bun 1.3.11): when the SSE peer dies, Bun's node:http reports
+        // NOTHING on `res` — no 'close', res.destroyed stays undefined, res.write()
+        // keeps returning true with writableLength 0 — so none of the checks above
+        // ever trip, each keepalive refreshes sessionLastActiveAt, @hono/node-server
+        // (which only listens for res 'close') never cancels the SDK stream,
+        // handleRequest never settles, and the dead session reads sseOpen=true
+        // forever: the N/N zombies in /healthz, and liveSessionServer() picking a
+        // zombie for parked-delivery drains. The socket DOES report it: req.socket
+        // emits 'close' (and .destroyed flips) the instant the peer goes away —
+        // kill -9, tmux kill-session, or claude's own MCP reconnect (which closes
+        // the old GET before initializing a new session). Bridge that signal: mark
+        // SSE closed (the normal grace-window GC then evicts unless the client
+        // re-opens SSE on this session) and release the SDK's standalone stream
+        // (settles handleRequest; otherwise a same-session GET re-open gets 409).
+        let peerGone = false
+        function onPeerGone(why: string): void {
+          if (peerGone) return
+          peerGone = true
+          clearInterval(keepaliveTimer)
+          if (sseOpen.get(sessionId)) sseOpen.set(sessionId, false)
+          log('info', `SSE peer gone for ${sessionId} (${why}) — SSE marked closed; GC evicts after ${SESSION_GRACE_MS / 1000}s grace unless the client re-opens SSE`)
+          try { transport.closeStandaloneSSEStream() } catch {}
+        }
+        const onSocketClose = () => onPeerGone('socket close')
+        sseSocket?.once('close', onSocketClose)
+        if (sseSocket?.destroyed) onPeerGone('socket already closed at SSE open')
 
         const reqPromise = transport.handleRequest(req, res)
         // Single-microtask yield is enough for the SDK's synchronous
@@ -3101,6 +3137,10 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           sseOpen.set(sessionId, false)  // SSE closed; future broadcasts queue
           clearInterval(keepaliveTimer)
           res.off('close', onResClose)
+          // Disarm: a keep-alive socket can outlive this stream (server-side end)
+          // and be reused; its later 'close' must not touch this session.
+          peerGone = true
+          sseSocket?.off('close', onSocketClose)
         }
         return
       }
