@@ -16,7 +16,8 @@
  *     match against allowlist → dispatch:
  *       a. tmux send-keys for native claude slashes — incl. /resume picker
  *          driven by Down + Enter for inline-switch (no restart, same pid)
- *       b. launchctl kickstart wrapper (graceful claude restart)
+ *       b. tmux kill-session; the wrapper respawns claude (launchd on macOS,
+ *          a systemd --user unit on Linux — see SERVICE_MANAGER)
  *       c. pkill -9 (force-kill stuck claude, wrapper respawns)
  *
  * Opt-in: requires CHANNEL_BOT_TMUX_SESSION env var. Without it, all
@@ -39,6 +40,17 @@ const TMUX_SESSION = process.env.CHANNEL_BOT_TMUX_SESSION ?? ''
 const PROJECTS_DIR = process.env.CHANNEL_BOT_PROJECTS_DIR ?? ''
 const WRAPPER_LABEL =
   process.env.CHANNEL_BOT_WRAPPER_LABEL ?? 'com.btai.channel-bot-wrapper'
+// What supervises the wrapper: launchd on macOS (every Mac mini / MBP agent),
+// a systemd --user unit on Linux (txmonster01's steropes, chiron 4643). On
+// systemd, CHANNEL_BOT_WRAPPER_LABEL is the unit name (e.g. claude-steropes.service).
+// Override with CHANNEL_BOT_SERVICE_MANAGER=launchd|systemd-user.
+const SERVICE_MANAGER = (process.env.CHANNEL_BOT_SERVICE_MANAGER
+  ?? (process.platform === 'linux' ? 'systemd-user' : 'launchd')).trim()
+// `systemctl --user` needs the user's runtime dir to find its manager; a daemon
+// started outside a login session may not inherit it.
+if (SERVICE_MANAGER === 'systemd-user' && !process.env.XDG_RUNTIME_DIR && process.getuid) {
+  process.env.XDG_RUNTIME_DIR = `/run/user/${process.getuid()}`
+}
 const RESUME_CHAIN_FILE =
   process.env.CHANNEL_BOT_RESUME_CHAIN_FILE ?? '/tmp/channel-bot-resume-chain.json'
 // (CHANNEL_BOT_NEXT_ARGS_FILE was used in 1.1.0 to inject --resume on
@@ -70,6 +82,15 @@ function runCommand(
     }, timeoutMs)
     proc.stdout?.on('data', (c: Buffer) => { stdout += c.toString() })
     proc.stderr?.on('data', (c: Buffer) => { stderr += c.toString() })
+    // A binary that doesn't exist on this OS (launchctl / security on Linux)
+    // emits 'error' (ENOENT), never 'exit' — unhandled, that error event can
+    // take the daemon down. Report it like a shell would: exit 127.
+    proc.on('error', err => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ exitCode: 127, stdout, stderr: stderr + `\n[spawn failed: ${err.message}]` })
+    })
     proc.on('exit', code => {
       if (settled) return
       settled = true
@@ -932,6 +953,8 @@ async function restartClaudeTUI(): Promise<string> {
   const killResult = await runCommand(['tmux', 'kill-session', '-t', TMUX_SESSION])
   // killResult.exitCode != 0 may just mean session was already gone — proceed regardless.
 
+  if (SERVICE_MANAGER === 'systemd-user') return ensureWrapperSystemd(killResult.exitCode)
+
   // Step 2: health backstop — never `kickstart -k` a healthy wrapper.
   const target = `gui/${process.getuid?.() ?? 501}/${WRAPPER_LABEL}`
   const probe = await runCommand(['launchctl', 'print', target], 5000)
@@ -948,6 +971,31 @@ async function restartClaudeTUI(): Promise<string> {
     )
   }
   return `wrapper (${WRAPPER_LABEL}) 剛才沒在跑，已重新拉起`
+}
+
+/**
+ * Linux (systemd --user) version of the backstop: same rule as launchd —
+ * the tmux kill above IS the restart; only start the wrapper unit if it is not
+ * active, never restart a healthy one.
+ */
+export async function ensureWrapperSystemd(killExit: number): Promise<string> {
+  if (!process.env.CHANNEL_BOT_WRAPPER_LABEL) {
+    // No unit configured → we cannot verify anything will respawn the TUI. Say so
+    // instead of reporting a restart that may not happen.
+    throw new Error(`TUI tmux session closed (tmux kill: ${killExit}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper unit to confirm a respawn`)
+  }
+  const unit = WRAPPER_LABEL
+  const probe = await runCommand(['systemctl', '--user', 'is-active', unit], 5000)
+  if (probe.exitCode === 0 && probe.stdout.trim() === 'active') {
+    return `wrapper (${unit}) 健在，監控 tick 會自動重啟 TUI`
+  }
+  const start = await runCommand(['systemctl', '--user', 'start', unit], 25000)
+  if (start.exitCode !== 0) {
+    throw new Error(
+      `wrapper ${unit} not active (${probe.stdout.trim() || probe.exitCode}) AND systemctl --user start failed (${start.exitCode}): ${start.stderr.trim().slice(0, 200)} (tmux kill: ${killExit})`,
+    )
+  }
+  return `wrapper (${unit}) 剛才沒在跑，已重新拉起`
 }
 
 /** pkill -9 on claude TUI matching the channel-bot args. */
@@ -1339,6 +1387,13 @@ async function probeAuthDead(): Promise<'dead' | 'alive' | 'unverified'> {
       token = cred?.claudeAiOauth?.accessToken ?? ''
     }
   } catch { /* no keychain grant / unreadable — fall through to env token */ }
+  if (!token && process.platform === 'linux') {
+    // Linux has no Keychain: claude keeps the account grant in this file instead.
+    try {
+      const cred = JSON.parse(readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8'))
+      token = cred?.claudeAiOauth?.accessToken ?? ''
+    } catch { /* no file — fall through to env token */ }
+  }
   if (!token) {
     try {
       const settings = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
