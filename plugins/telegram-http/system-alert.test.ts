@@ -82,3 +82,38 @@ test('roamer resolveFile pins the exact target session over a newer sibling (iss
   // a target whose jsonl doesn't exist yet (0-turn session) is skipped, not thrown
   expect(resolveWatchFile(() => join(dir, 'nope.jsonl'), dir)).toBeNull()
 })
+
+// research 4639: a sub-agent's failed request (WebFetch of a blocked domain →
+// API 400 "domains are not accessible to our user agent") is not the TUI dying.
+const otlp = (attrs: Record<string, string>) => ({ resourceLogs: [{ scopeLogs: [{ logRecords: [{
+  attributes: Object.entries(attrs).map(([key, v]) => ({ key, value: { stringValue: v } })),
+}] }] }] })
+
+test('OTLP layer does NOT forward a sub-agent api_error (query_source = sub-agent name)', () => {
+  const sent: string[] = []
+  startSystemAlertWatcher({ notify: (m) => sent.push(m), log: () => {} })
+  const n = handleOtlpLogs(otlp({ 'event.name': 'api_error', status_code: '400', query_source: 'general-purpose',
+    error: "The following domains are not accessible to our user agent: ['reddit.com']" }))
+  expect(n).toBe(0)
+  expect(sent.join('\n')).not.toContain('not accessible')
+})
+
+test('OTLP layer still forwards main-loop api_errors (repl_main_thread, sdk) and ones without query_source', () => {
+  const sent: string[] = []
+  startSystemAlertWatcher({ notify: (m) => sent.push(m), log: () => {} })
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_error', status_code: '529', query_source: 'repl_main_thread', error: 'Overloaded main' }))).toBe(1)
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_error', status_code: '502', query_source: 'sdk', error: 'Bad gateway sdk' }))).toBe(1)
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_error', status_code: '503', error: 'Unavailable legacy' }))).toBe(1)
+  expect(sent.join('\n')).toContain('Overloaded main')
+  expect(sent.join('\n')).toContain('Bad gateway sdk')
+  expect(sent.join('\n')).toContain('Unavailable legacy')
+})
+
+test('OTLP layer skips refusals the server already retried (server_fallback_hop=true), keeps final main-loop refusals', () => {
+  const sent: string[] = []
+  startSystemAlertWatcher({ notify: (m) => sent.push(m), log: () => {} })
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_refusal', query_source: 'repl_main_thread', server_fallback_hop: 'true' }))).toBe(0)
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_refusal', query_source: 'Explore', server_fallback_hop: 'false' }))).toBe(0)
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_refusal', query_source: 'repl_main_thread', server_fallback_hop: 'false', model: 'claude-x-refusal-test' }))).toBe(1)
+  expect(sent.join('\n')).toContain('claude-x-refusal-test')
+})

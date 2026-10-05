@@ -168,6 +168,22 @@ export function sendOpsAlert(msg: string, source: string): void {
 /** Events worth waking the user for. Other telemetry events are ignored. */
 const OTLP_ALERT_EVENTS = new Set(['api_error', 'api_refusal', 'api_retries_exhausted'])
 
+/**
+ * Was the failed request issued by the agent's MAIN loop? Only those mean "the
+ * TUI is dying at the API layer" — this forwarder's whole purpose. Documented
+ * `query_source` values: "repl_main_thread" (TUI; may carry a suffix), "sdk"
+ * (`claude -p`), "compact", or a sub-agent's name. A sub-agent's failed request
+ * (e.g. a WebFetch of a blocked domain → 400 "domains are not accessible to our
+ * user agent") reaches the main loop as a tool error and the session carries on,
+ * so it is not boss-worthy (research 4639: 2 such pushes in a week, both from
+ * sub-agents, both self-recovered). No query_source (older CLI) → treat as main,
+ * i.e. keep alerting as before.
+ */
+export function isMainLoopQuery(querySource: string | undefined): boolean {
+  if (!querySource) return true
+  return querySource.startsWith('repl_main_thread') || querySource === 'sdk' || querySource === 'compact'
+}
+
 /** Flatten an OTLP attribute list ([{key, value:{stringValue|intValue|...}}]) to a map. */
 function otlpAttrs(list: unknown): Record<string, string> {
   const out: Record<string, string> = {}
@@ -208,6 +224,13 @@ export function handleOtlpLogs(payload: unknown): number {
           // Suppress the raw provider "exceed your account's rate limit"
           // string here — it names the wrong problem (Joey 2026-07-10).
           if (eventName === 'api_error' && attrs['status_code'] === '429') continue
+          // The server already retried this refusal on another model, so the
+          // user never saw it (documented server_fallback_hop=true).
+          if (eventName === 'api_refusal' && attrs['server_fallback_hop'] === 'true') continue
+          if (!isMainLoopQuery(attrs['query_source'])) {
+            _log('info', `system-alert: not forwarded (${eventName} from query_source=${attrs['query_source']}, not the main loop): ${(attrs['error'] ?? '').slice(0, 160)}`)
+            continue
+          }
           found++
           const parts: string[] = []
           if (eventName === 'api_error') {
