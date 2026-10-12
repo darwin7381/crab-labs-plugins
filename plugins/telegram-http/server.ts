@@ -51,6 +51,7 @@ import {
   roamerCurrentTranscript,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
+import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
@@ -323,6 +324,9 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** Who gets ops traffic (system alerts, login-expired, startup pickers, permission prompts).
+   *  Unset = everyone in allowFrom. See ops-recipients.ts. */
+  alertTo?: string[]
 }
 
 function defaultAccess(): Access {
@@ -367,6 +371,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      alertTo: Array.isArray(parsed.alertTo) ? parsed.alertTo.map(String) : undefined,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -1230,7 +1235,7 @@ function buildServer(): Server {
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
-    for (const chat_id of access.allowFrom) {
+    for (const chat_id of opsRecipients(access)) {
       void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
         log('error', `permission_request send to ${chat_id} failed: ${e}`)
       })
@@ -1534,7 +1539,7 @@ setInterval(() => {
 
 // System-alert forwarder (opt-in: SYSTEM_ALERT_FORWARD=1) — tails the newest
 // session jsonl for non-AI warnings (401 login expiry, API internal errors,
-// refusals) and DMs them to everyone in allowFrom. Without this, TUI-level
+// refusals) and DMs them to opsRecipients (alertTo, else allowFrom). Without this, TUI-level
 // API deaths are invisible on Telegram (Joey msg 2218).
 if (isSystemAlertEnabled()) {
   startSystemAlertWatcher({
@@ -1544,7 +1549,7 @@ if (isSystemAlertEnabled()) {
     resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : undefined,
     notify: text => {
       const access = loadAccess()
-      for (const chat_id of access.allowFrom) {
+      for (const chat_id of opsRecipients(access)) {
         // Log the success too (2026-09-10, Hephaestus 3451): "forwarded" alone
         // proved nothing about delivery — an audit of atlas's 38 usage-limit
         // forwards found no per-send evidence either way. Success now leaves
@@ -1585,7 +1590,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
     surface: ({ title, buttons }) => {
       const access = loadAccess()
       const keyboard = buttons.map(b => [b])
-      for (const chat_id of access.allowFrom) {
+      for (const chat_id of opsRecipients(access)) {
         void sendTextWithMaybeKeyboard(chat_id, title, keyboard).catch(e =>
           log('error', `startup-picker surface to ${chat_id} failed: ${e}`))
       }
@@ -1599,7 +1604,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
     listTargets: paneWatchTargets,
     notify: text => {
       const access = loadAccess()
-      for (const chat_id of access.allowFrom) {
+      for (const chat_id of opsRecipients(access)) {
         void bot.api.sendMessage(chat_id, text).catch(e => {
           log('error', `login-expired alert send to ${chat_id} failed: ${e}`)
         })
