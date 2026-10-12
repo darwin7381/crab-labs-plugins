@@ -92,6 +92,12 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+**`alertTo`** limits who receives ops traffic: system alerts (usage limit, API errors), the login-expired watchdog, startup-picker buttons and permission prompts. Unset, all of it goes to everyone in `allowFrom`. Set it when `allowFrom` includes people who should be able to message the bot but not receive its warnings, for example a colleague who hands the agent information. Only ids that are also in `allowFrom` count; `[]` sends ops traffic to nobody.
+
+```
+/telegram:access set alertTo '["412587349"]'
+```
+
 ## Skill reference
 
 | Command | Effect |
@@ -104,7 +110,7 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 | `/telegram:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/telegram:access group add -1001654782309` | Enable a group. Flags: `--no-mention` (also requires disabling privacy mode), `--allow id1,id2`. |
 | `/telegram:access group rm -1001654782309` | Disable a group. |
-| `/telegram:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
+| `/telegram:access set ackReaction 👀` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `alertTo`. |
 
 ## Self-configuring as an agent (crab-labs Route B / cc-workspaces)
 
@@ -172,6 +178,10 @@ For the channel-bot: `~/.claude/channels/telegram/access.json`. For a cc-workspa
   "textChunkLimit": 4096,
 
   // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  "chunkMode": "newline",
+
+  // Who gets system alerts, login-expired notices, startup pickers and permission
+  // prompts. Must be ids in allowFrom. Omit = everyone in allowFrom.
+  "alertTo": ["412587349"]
 }
 ```

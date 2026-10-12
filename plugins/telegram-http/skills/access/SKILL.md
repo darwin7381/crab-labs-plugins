@@ -109,12 +109,13 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+`textChunkLimit`, `chunkMode`, `mentionPatterns`, `alertTo`. Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
 - `chunkMode`: `length` | `newline`
 - `mentionPatterns`: JSON array of regex strings
+- `alertTo`: JSON array of user ids that receive ops traffic (system alerts, login-expired, startup pickers, permission prompts). Must be ids already in `allowFrom`; others are ignored. Unset = everyone in `allowFrom`; `[]` = nobody. Use it when `allowFrom` includes people who should talk to the bot but not get its warnings.
 
 Read, set the key, write, confirm.
 

@@ -146,7 +146,8 @@ function sendAlert(msg: string, source: string): void {
 
 /**
  * Ops-alert entry point for OTHER modules (delivery watchdog etc.) — same
- * dedupe window and allowFrom notify pipeline as the TUI-warning forwarders.
+ * dedupe window and notify pipeline (opsRecipients: alertTo, else allowFrom) as
+ * the TUI-warning forwarders.
  * Safe to call unconditionally: before startSystemAlertWatcher wires _notify
  * (SYSTEM_ALERT_FORWARD unset, or INBOX_ONLY daemons with no bot token) the
  * default notify is a no-op, so callers degrade to their own log line.
