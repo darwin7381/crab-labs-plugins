@@ -83,29 +83,29 @@ URL 進來
 ├─ 判斷平台（domain matching）
 │
 ├── 中國平台（xiaohongshu/xhslink/douyin/weibo/kuaishou/bilibili/zhihu/tieba）
-│   → MediaCrawler（主）→ lux/yt-dlp（備）→ Playwright（終極備援）
+│   → MediaCrawler（主）→ lux/yt-dlp（備）→ 瀏覽器（終極備援）
 │
 ├── 西方平台 — 判斷內容類型
 │   ├── 影片（YouTube/TikTok/Vimeo/Reddit）
 │   │   → yt-dlp（主）→ lux（備）
 │   │
 │   ├── Facebook 圖文
-│   │   → Playwright headless（主，實測不需 cookies）→ gallery-dl+cookies（備）
+│   │   → 瀏覽器（主，實測不需 cookies）→ gallery-dl+cookies（備）
 │   │
 │   ├── 圖文（IG/X/Pinterest/Bluesky/Reddit）
-│   │   → gallery-dl（主）→ Playwright（備）
+│   │   → gallery-dl（主）→ 瀏覽器（備）
 │   │
 │   └── Threads
-│       → lux（主）→ Playwright（備）
+│       → lux（主）→ 瀏覽器（備）
 │
 └── 未知平台 / 全部失敗
-    → Playwright headless（萬能最終備援）
+    → 瀏覽器（萬能最終備援）
     → 仍失敗 → 報告魔王
 ```
 
-### Playwright 萬能備援
+### 瀏覽器萬能備援
 
-Playwright headless Chromium 已隨 MediaCrawler 安裝，位於 MediaCrawler 的 `.venv` 中。
+「瀏覽器」＝ macOS 用 **ego lite**（`browser-automation` → `ego-browser` skill；艦隊標準，Playwright／Chrome 在 macOS 不用）；Linux 用 MediaCrawler `.venv` 裡隨裝的 Playwright headless Chromium。
 
 **用法**：當 CLI 工具全部失敗時，啟動 headless browser 直接打開 URL，提取 DOM 內容。
 
