@@ -10,3 +10,4 @@ plugins/telegram-http/server.ts::expandHiddenEntities
 plugins/telegram-http/entities.ts::expandHiddenEntities
 plugins/telegram-http/server.ts::recordDelivery
 plugins/telegram-http/server.ts::Exception: disclosure and secrecy
+plugins/telegram-http/server.ts::never put a credential in a mesh message
