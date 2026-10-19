@@ -2661,6 +2661,7 @@ function evictZombieSession(sid: string, reason: string): void {
       if (p.server === srv) pendingPermissions.delete(reqId)
     }
   }
+  forgetIssuedSession(sid)
   log('info', `MCP session evicted by GC: ${sid} reason=${reason} (active=${activeServers.size})`)
   try { transport?.close() } catch {}
   try { if (isRoamerEnabled()) roamerOnMcpSessionClosed(sid) } catch {}
@@ -2821,6 +2822,94 @@ if (!INBOX_ONLY) {
 // originating server so answers route back to the right session.
 // ============================================================================
 const transports = new Map<string, StreamableHTTPServerTransport>()
+
+// WO-24 (2026-10-19 Epeius): session ids this daemon issued, persisted so a restarted daemon
+// can RESUME them. Claude Code's MCP client keeps its session id across a daemon restart: its
+// SSE stream reconnects to the same id and gives up on any error (it re-initializes only when
+// a tool call gets 404). A fast restart (launchctl kickstart -k, ~0.3s) therefore orphaned
+// busy TUIs for hours — inbound parked, outbound failing — until the TUI itself restarted.
+// Resuming the id this daemon issued makes the restart invisible to the client. Ids we never
+// issued still get 404 (spec), so a client with a truly dead session re-initializes.
+const ISSUED_SESSIONS_FILE = join(STATE_DIR, 'mcp-sessions.json')
+const ISSUED_MAX = 64
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const issuedSessions: Set<string> = (() => {
+  try {
+    const a = JSON.parse(readFileSync(ISSUED_SESSIONS_FILE, 'utf8'))
+    if (Array.isArray(a)) return new Set(a.filter((x: unknown) => typeof x === 'string' && SESSION_ID_RE.test(x)).slice(-ISSUED_MAX))
+  } catch {}
+  return new Set<string>()
+})()
+function saveIssuedSessions(): void {
+  try {
+    const tmp = ISSUED_SESSIONS_FILE + '.tmp'
+    writeFileSync(tmp, JSON.stringify([...issuedSessions].slice(-ISSUED_MAX)), { mode: 0o600 })
+    renameSync(tmp, ISSUED_SESSIONS_FILE)
+  } catch (err) {
+    log('warn', `could not persist issued MCP session ids: ${err}`)
+  }
+}
+function forgetIssuedSession(sid: string): void {
+  // a shutting-down daemon keeps the list: the next process resumes from it
+  if (shuttingDown || !issuedSessions.delete(sid)) return
+  saveIssuedSessions()
+}
+
+function registerSession(id: string, transport: StreamableHTTPServerTransport, server: Server, how: 'opened' | 'resumed'): void {
+  transports.set(id, transport)
+  serverSessionId.set(server, id)
+  sseOpen.set(id, false)  // SSE not open until client does GET
+  sessionLastActiveAt.set(id, Date.now())  // start the zombie-GC grace clock
+  issuedSessions.delete(id); issuedSessions.add(id)  // move to the end (newest)
+  saveIssuedSessions()
+  log('info', `MCP session ${how}: ${id} (active=${activeServers.size}, SSE pending)`)
+  // Roamer: if a takeover is pending, claim this new session for it.
+  if (isRoamerEnabled()) {
+    const claimed = roamerOnNewMcpSession(id)
+    if (claimed) log('info', `roamer: claimed MCP session ${id} for pending takeover`)
+  }
+}
+
+/**
+ * A new MCP session, or — with resumeId — the same session id a previous daemon process
+ * issued (WO-24). Resuming marks the SDK transport initialized under that id: the client
+ * already did initialize with the old process and won't again. Nothing this server does
+ * depends on the client's initialize params, so the resumed session behaves the same.
+ */
+async function openSession(resumeId?: string): Promise<StreamableHTTPServerTransport> {
+  const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => resumeId ?? randomUUID(),
+    onsessioninitialized: id => registerSession(id, transport, server, 'opened'),
+  })
+  const server = buildServer()
+  await server.connect(transport)
+  activeServers.add(server)
+  transport.onclose = () => {
+    activeServers.delete(server)
+    if (transport.sessionId) {
+      transports.delete(transport.sessionId)
+      sseOpen.delete(transport.sessionId)
+      memQueue.delete(transport.sessionId)
+      sessionLastActiveAt.delete(transport.sessionId)
+      forgetIssuedSession(transport.sessionId)
+      log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
+      for (const [reqId, p] of pendingPermissions) {
+        if (p.server === server) pendingPermissions.delete(reqId)
+      }
+      if (isRoamerEnabled()) {
+        roamerOnMcpSessionClosed(transport.sessionId)
+      }
+    }
+  }
+  if (resumeId) {
+    // SDK 1.27 keeps session state on the wrapped web-standard transport
+    const inner = (transport as unknown as { _webStandardTransport: { sessionId?: string; _initialized: boolean } })._webStandardTransport
+    inner.sessionId = resumeId
+    inner._initialized = true
+    registerSession(resumeId, transport, server, 'resumed')
+  }
+  return transport
+}
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
@@ -3009,56 +3098,41 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       }
 
       if (!sessionId && isInitializeRequest(body)) {
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: id => {
-            transports.set(id, transport)
-            serverSessionId.set(server, id)
-            sseOpen.set(id, false)  // SSE not open until client does GET
-            sessionLastActiveAt.set(id, Date.now())  // start the zombie-GC grace clock
-            log('info', `MCP session opened: ${id} (active=${activeServers.size}, SSE pending)`)
-            // Roamer: if a takeover is pending, claim this new session for it.
-            if (isRoamerEnabled()) {
-              const claimed = roamerOnNewMcpSession(id)
-              if (claimed) log('info', `roamer: claimed MCP session ${id} for pending takeover`)
-            }
-          },
-        })
-        const server = buildServer()
-        await server.connect(transport)
-        activeServers.add(server)
-        transport.onclose = () => {
-          activeServers.delete(server)
-          if (transport.sessionId) {
-            transports.delete(transport.sessionId)
-            sseOpen.delete(transport.sessionId)
-            memQueue.delete(transport.sessionId)
-            sessionLastActiveAt.delete(transport.sessionId)
-            log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
-            for (const [reqId, p] of pendingPermissions) {
-              if (p.server === server) pendingPermissions.delete(reqId)
-            }
-            if (isRoamerEnabled()) {
-              roamerOnMcpSessionClosed(transport.sessionId)
-            }
-          }
-        }
+        const transport = await openSession()
         await transport.handleRequest(req, res, body)
         return
       }
 
-      res.writeHead(400, { 'content-type': 'application/json' })
+      // WO-24: a session id this daemon issued before a restart — resume it in place
+      if (sessionId && issuedSessions.has(sessionId)) {
+        const transport = await openSession(sessionId)
+        await transport.handleRequest(req, res, body)
+        return
+      }
+
+      // MCP Streamable HTTP: an id we don't know MUST get 404 — that is the client's signal to
+      // start a new session (a 400 left it stuck). No id at all, and not initialize: 400.
+      res.writeHead(sessionId ? 404 : 400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
         jsonrpc: '2.0',
-        error: { code: -32000, message: 'Missing or invalid session id; not an initialize request' },
+        error: sessionId
+          ? { code: -32001, message: 'Session not found' }
+          : { code: -32000, message: 'Missing session id; not an initialize request' },
         id: null,
       }))
       return
     }
 
     if (req.method === 'GET' || req.method === 'DELETE') {
+      // WO-24: the client's SSE reconnect after a daemon restart lands here with the id this
+      // daemon issued — resume it, so the stream (and inbound delivery) just continues
+      if (req.method === 'GET' && sessionId && !transports.has(sessionId) && issuedSessions.has(sessionId)) {
+        await openSession(sessionId)
+      }
       if (!sessionId || !transports.has(sessionId)) {
-        res.writeHead(400, { 'content-type': 'text/plain' }).end('invalid or missing session id\n')
+        // 404 for an id we don't know (the client then re-initializes), 400 when none was sent
+        res.writeHead(sessionId ? 404 : 400, { 'content-type': 'text/plain' })
+          .end(sessionId ? 'session not found\n' : 'missing session id\n')
         return
       }
       const transport = transports.get(sessionId)!

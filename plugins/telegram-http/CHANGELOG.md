@@ -1,3 +1,18 @@
+## 1.25.2 — 2026-10-20
+
+- **A daemon restart no longer orphans a busy TUI (WO-24).**
+  - **Symptom:** after the 1.25.0 wave, 6 busy agents (chiron, elsa, epeius, hephaestus, pheme, prometheus) lost their inbox MCP session for up to ~9.5 h. Inbound messages parked as "PARKED DELIVERY STUCK", and `send_to_agent` failed with `-32000 Missing or invalid session id`. They recovered only when the TUI itself restarted.
+  - **Root cause, reproduced in a lab with a real `--channels` TUI:**
+    - Claude Code keeps its MCP session id across a daemon restart.
+    - After a **fast** restart (`launchctl kickstart -k`, ~0.3 s), its SSE reconnect reaches the new process with the old id. We answered **400**, and the client gives up for good: no re-initialize, nothing passive.
+    - With a ≥1 s gap the first retry is refused instead, the client re-initializes, and the problem stays hidden.
+  - **Fix 1: resume.** The daemon persists the session ids it issued (`<STATE_DIR>/mcp-sessions.json`, 600, newest 64). When a request or the SSE reconnect arrives with one of them after a restart, the daemon resumes that session in place: the SDK transport is marked initialized under the same id. The client never notices.
+    - Lab: fast restart, with no tool call, resumed in 0.6 s. Inbound delivery and `send_to_agent` both worked on the resumed session.
+  - **Fix 2: spec 404.** An id this daemon never issued now gets **404** (MCP Streamable HTTP), and a client receiving 404 re-initializes. Before, it got 400 and stayed stuck. No id at all is still 400.
+  - Ids are forgotten when a session closes or the zombie GC evicts it. A shutting-down daemon keeps the list for the next process.
+  - **Rollout note:** the daemons being replaced by this release never wrote the list. So for *this* wave, restart each daemon with a ≥2 s gap (bootout → sleep → bootstrap) so busy clients fully reconnect. From 1.25.2 on, fast restarts are safe.
+- Tests 42/42.
+
 ## 1.25.1 — 2026-10-19
 
 - **Drop forged injects by default; signed-only `/inject` switch (access design v1.1 §5.3; steropes 5831).** The attacker (156.240.236.28, Incident #94) kept reaching inboxes as `⚠️unverified:<agent>@ip` labels through the receiver relay, asking agents to exfiltrate id/uname/hostname; the only defence was each agent reading the tag. Now a `/inject` that resolves to `forged="true"` — unsigned, but claiming a name that already signs — is **dropped and logged, not delivered** (200 `{injected:false,dropped:"forged-unsigned"}`). This loses no legitimate task: a real such sender would have signed, so it is always impersonation, distinct from Joey TG 6231 which protects forged=false not-yet-migrated senders (still delivered+labelled). Revert with `MESH_ALLOW_FORGED=1`.
