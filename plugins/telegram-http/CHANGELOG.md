@@ -1,3 +1,10 @@
+## 1.25.1 — 2026-10-19
+
+- **Drop forged injects by default; signed-only `/inject` switch (access design v1.1 §5.3; steropes 5831).** The attacker (156.240.236.28, Incident #94) kept reaching inboxes as `⚠️unverified:<agent>@ip` labels through the receiver relay, asking agents to exfiltrate id/uname/hostname; the only defence was each agent reading the tag. Now a `/inject` that resolves to `forged="true"` — unsigned, but claiming a name that already signs — is **dropped and logged, not delivered** (200 `{injected:false,dropped:"forged-unsigned"}`). This loses no legitimate task: a real such sender would have signed, so it is always impersonation, distinct from Joey TG 6231 which protects forged=false not-yet-migrated senders (still delivered+labelled). Revert with `MESH_ALLOW_FORGED=1`.
+- **`MESH_REQUIRE_SIGNED=1`** (machine config): every `/inject` must carry a valid per-identity credential; the shared inject token alone is refused. Off by default; flip per the design once every sender signs.
+- The inbound shared-token check no longer accepts `CHANNEL_INJECT_TOKEN_PREV` — a rotation is a hard cutover (Joey TG 6743), never an overlap.
+- Tests 42/42; forged-drop verified live on a throwaway daemon (forged dropped; forged=false unsigned and signed both delivered).
+
 ## 1.25.0 — 2026-10-19
 
 - **Mesh sender identity: signed outbound, verified inbound (access design v1.1 §5.2–5.3; WO-22 contract with Epeius)**. Until now `from` on a mesh message was free text, so anyone holding the shared token — or any local process, on the TG/Discord daemons — could speak as any agent, Argus, the scheduler or Joey.

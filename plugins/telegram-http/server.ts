@@ -1088,19 +1088,18 @@ function inboxRegistryNames(): string[] {
   return Object.keys(loadInboxRegistry()).filter(n => n !== INBOX_SELF)
 }
 
-// Inbound /inject token: the current CHANNEL_INJECT_TOKEN or, while a rotation overlaps,
-// CHANNEL_INJECT_TOKEN_PREV. Constant-time so the comparison leaks nothing.
+// Inbound /inject shared token (legacy path; constant-time). One value only — a rotation
+// is a hard cutover, never an overlap.
 function injectTokenOk(presented: string | undefined): boolean {
-  if (!presented) return false
-  const got = Buffer.from(presented)
-  let ok = false
-  for (const t of [process.env.CHANNEL_INJECT_TOKEN, process.env.CHANNEL_INJECT_TOKEN_PREV]) {
-    if (!t) continue
-    const want = Buffer.from(t)
-    if (want.length === got.length && timingSafeEqual(want, got)) ok = true
-  }
-  return ok
+  const t = process.env.CHANNEL_INJECT_TOKEN
+  if (!presented || !t) return false
+  const got = Buffer.from(presented), want = Buffer.from(t)
+  return want.length === got.length && timingSafeEqual(want, got)
 }
+
+// MESH_REQUIRE_SIGNED=1 (machine config): every /inject must carry a valid per-identity
+// credential; the shared token alone is refused and nothing unsigned is delivered.
+const MESH_REQUIRE_SIGNED = process.env.MESH_REQUIRE_SIGNED === '1'
 
 const SEND_MAX_CHARS = 3500
 
@@ -2889,14 +2888,16 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     // Telegram inbound (memQueue + disk pending replay + delete-on-delivery), replacing
     // fragile tmux send-keys: survives TUI busy/menus/restarts, no shell-execution risk,
     // and delivery is confirmed rather than fire-and-forget keystrokes.
-    // Caller: oncall-receiver (Argus wake). Auth: when CHANNEL_INJECT_TOKEN is set the
-    // X-Inject-Token header must match it — or CHANNEL_INJECT_TOKEN_PREV during a rotation
-    // (accepted, never sent); the 127.0.0.1 bind is the outer wall either way.
+    // Callers: peers, oncall-receiver, BTCC, local system senders. Auth: with
+    // MESH_REQUIRE_SIGNED a valid per-identity credential is required; otherwise the shared
+    // X-Inject-Token (when CHANNEL_INJECT_TOKEN is set) or a valid credential. The
+    // 127.0.0.1 bind is the outer wall either way.
     if (u.pathname === '/inject' && req.method === 'POST') {
       const meshTable = loadTable()
       const authz = req.headers['authorization'] as string | undefined
-      if (process.env.CHANNEL_INJECT_TOKEN && !injectTokenOk(req.headers['x-inject-token'] as string | undefined)
-          && !bearerIdentity(authz, meshTable)) {
+      const signedCaller = bearerIdentity(authz, meshTable)
+      if (MESH_REQUIRE_SIGNED ? !signedCaller
+          : (process.env.CHANNEL_INJECT_TOKEN && !injectTokenOk(req.headers['x-inject-token'] as string | undefined) && !signedCaller)) {
         res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
         return
       }
@@ -2914,6 +2915,18 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       const verdict = resolveInbound(authz,
         typeof body?.from === 'string' ? body.from : undefined,
         typeof body?.verified_from === 'string' ? body.verified_from : undefined, meshTable)
+      // Forged = unsigned, but the claimed name is an identity that DOES sign. That can only
+      // be impersonation (the real sender would have signed), so it is never a legitimate
+      // not-yet-migrated sender — dropping it loses no task (distinct from Joey 6231, which
+      // protects forged=false unsigned senders). Default-drop so defence does not depend on
+      // every agent reading the tag (steropes 5831: attacker 156.240.236.28 kept reaching
+      // inboxes as ⚠️unverified labels). MESH_ALLOW_FORGED=1 reverts to deliver+label.
+      if (verdict.forged && process.env.MESH_ALLOW_FORGED !== '1') {
+        log('warn', `DROPPED forged inject: claimed=${verdict.sender} relay=${verdict.relay} text=${text.slice(0, 80)}`)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ injected: false, dropped: 'forged-unsigned' }))
+        return
+      }
       const from = verdict.sender
       let btccMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
       // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
