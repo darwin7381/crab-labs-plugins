@@ -1,3 +1,13 @@
+## 1.25.3 — 2026-10-20
+
+- **Refused mail is filed for Joey's review, not only logged (Joey TG 6772).** BTCC now has a suspicious-message mailbox (Messenger → 可疑訊息審核箱), and BTCC `/api/comms/send` holds unverified senders there instead of delivering them. The daemon now feeds the same mailbox:
+  - A **forged** `/inject` (unsigned, claiming an identity that signs) is still not delivered and still logged. It is also filed with `POST {BTCC_API_BASE}/api/comms/quarantine` under this daemon's own mesh credential (reason `forged-unsigned`), and the response gains `held: true`.
+  - Under **`MESH_REQUIRE_SIGNED=1`**, an *authorized* local caller (valid inject token) without a credential is now held and filed (reason `unsigned`) rather than refused with 403. A refusal would drop its task (Joey 6231). A caller with neither a token nor a credential is still refused.
+  - Filing is fire-and-forget (6 s timeout). With no BTCC or no credential, the refusal and its log line stand as before.
+  - Joey releases or discards in BTCC. A released message arrives as `⚠️released#<id>`, which names no identity, so it is never mistaken for a forgery.
+- **Relabelled and case-variant forgeries are caught.** `isSigning` now matches the identity a claim *names*: `⚠️unverified:<name>@<source>` → `<name>`, case-insensitive. The same normalization went into the oncall receiver (Hephaestus). `⚠️released#<id>` stays non-matching.
+- Tests 43/43 (mesh-identity +1: labelled, case-variant and release claims). Throwaway daemon + stub BTCC: forged label and case-variant claims dropped and filed (normalized name, original claim kept in the text); an unsigned non-signing sender and a `⚠️released#` message delivered; under MESH_REQUIRE_SIGNED a token-only caller held and filed (`unsigned`), no token and no credential 403, signed delivered.
+
 ## 1.25.2 — 2026-10-20
 
 - **A daemon restart no longer orphans a busy TUI (WO-24).**

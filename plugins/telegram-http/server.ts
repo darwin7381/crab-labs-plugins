@@ -58,7 +58,7 @@ import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
-import { bearerIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
+import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1100,6 +1100,27 @@ function injectTokenOk(presented: string | undefined): boolean {
 // MESH_REQUIRE_SIGNED=1 (machine config): every /inject must carry a valid per-identity
 // credential; the shared token alone is refused and nothing unsigned is delivered.
 const MESH_REQUIRE_SIGNED = process.env.MESH_REQUIRE_SIGNED === '1'
+
+// What this daemon refuses is filed in BTCC's suspicious-message mailbox for Joey's review
+// (Joey TG 6772: suspicious mail is collected, not silently dropped). Fire-and-forget with
+// this daemon's own credential; without BTCC or a credential the refusal and its log line
+// stand on their own.
+function fileHeld(claimed: string, relay: string, text: string, reason: string): void {
+  const auth = meshAuth()
+  if (!BTCC_API_BASE || !auth.Authorization) return
+  // the mailbox shows the identity the claim names; the claim as given, if different,
+  // stays visible at the top of the text
+  const named = claimedIdentity(claimed)
+  const shown = named === claimed ? text : `[claimed as: ${claimed.slice(0, 80)}]
+${text}`
+  void fetch(`${BTCC_API_BASE}/api/comms/quarantine`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...auth },
+    body: JSON.stringify({ to_agent: INBOX_SELF, claimed_from: named.slice(0, 64), text: shown.slice(0, 4000), reason, relay }),
+    signal: AbortSignal.timeout(6000),
+  }).then(r => { if (!r.ok) log('warn', `mailbox report refused: HTTP ${r.status}`) })
+    .catch(e => log('warn', `mailbox report failed: ${e}`))
+}
 
 const SEND_MAX_CHARS = 3500
 
@@ -2985,8 +3006,12 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       const meshTable = loadTable()
       const authz = req.headers['authorization'] as string | undefined
       const signedCaller = bearerIdentity(authz, meshTable)
-      if (MESH_REQUIRE_SIGNED ? !signedCaller
-          : (process.env.CHANNEL_INJECT_TOKEN && !injectTokenOk(req.headers['x-inject-token'] as string | undefined) && !signedCaller)) {
+      const tokenOk = !!process.env.CHANNEL_INJECT_TOKEN && injectTokenOk(req.headers['x-inject-token'] as string | undefined)
+      // An authorized local caller without a credential under MESH_REQUIRE_SIGNED is held
+      // for review below, not refused here (a refusal would drop its task, Joey 6231).
+      const holdUnsigned = MESH_REQUIRE_SIGNED && !signedCaller && tokenOk
+      if (MESH_REQUIRE_SIGNED ? (!signedCaller && !holdUnsigned)
+          : (process.env.CHANNEL_INJECT_TOKEN && !tokenOk && !signedCaller)) {
         res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
         return
       }
@@ -3011,9 +3036,17 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       // every agent reading the tag (steropes 5831: attacker 156.240.236.28 kept reaching
       // inboxes as ⚠️unverified labels). MESH_ALLOW_FORGED=1 reverts to deliver+label.
       if (verdict.forged && process.env.MESH_ALLOW_FORGED !== '1') {
-        log('warn', `DROPPED forged inject: claimed=${verdict.sender} relay=${verdict.relay} text=${text.slice(0, 80)}`)
+        log('warn', `DROPPED forged inject (filed for review): claimed=${verdict.sender} relay=${verdict.relay} text=${text.slice(0, 80)}`)
+        fileHeld(verdict.sender, verdict.relay, text, 'forged-unsigned')
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ injected: false, dropped: 'forged-unsigned' }))
+        res.end(JSON.stringify({ injected: false, dropped: 'forged-unsigned', held: true }))
+        return
+      }
+      if (holdUnsigned) {
+        log('warn', `HELD unsigned inject (MESH_REQUIRE_SIGNED): claimed=${verdict.sender} text=${text.slice(0, 80)}`)
+        fileHeld(verdict.sender, verdict.relay, text, 'unsigned')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ injected: false, held: true }))
         return
       }
       const from = verdict.sender

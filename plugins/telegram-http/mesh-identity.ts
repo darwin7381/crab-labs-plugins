@@ -84,7 +84,15 @@ export function bearerIdentity(authorization: string | undefined, table: MeshTab
   return table.hashes[sha256hex(m[1])] ?? null
 }
 
-const isSigning = (name: string, table: MeshTable | null) => !!table?.identities[name]?.signing
+/** The identity a claim names, case-insensitively. A BTCC/receiver label
+ *  ("⚠️unverified:<name>@<source>") still names <name>, so a relabelled forgery is caught
+ *  too. "⚠️released#<id>" (a message Joey released from the mailbox) names no identity. */
+export function claimedIdentity(claim: string): string {
+  const m = claim.match(/^⚠️unverified:(.+)@[^@]*$/u)
+  return (m ? m[1] : claim).trim().toLowerCase()
+}
+
+const isSigning = (name: string, table: MeshTable | null) => !!table?.identities[claimedIdentity(name)]?.signing
 
 /** Who sent this /inject. Body `from` is only ever a claim; the bearer decides. */
 export function resolveInbound(

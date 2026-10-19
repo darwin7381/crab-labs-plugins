@@ -20,3 +20,5 @@ plugins/telegram-http/mesh-identity.ts::FORWARDERS
 plugins/telegram-http/server.ts::verified="true|false"
 plugins/telegram-http/server.ts::forged-unsigned
 plugins/telegram-http/server.ts::MESH_REQUIRE_SIGNED
+plugins/telegram-http/server.ts::/api/comms/quarantine
+plugins/telegram-http/mesh-identity.ts::claimedIdentity

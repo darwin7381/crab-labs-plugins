@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { bearerIdentity, loadTable, parseTable, readOwnCredential, resolveInbound, sha256hex, verdictMeta, type MeshTable } from './mesh-identity.ts'
+import { bearerIdentity, claimedIdentity, loadTable, parseTable, readOwnCredential, resolveInbound, sha256hex, verdictMeta, type MeshTable } from './mesh-identity.ts'
 
 const A = 'mesh_' + 'a'.repeat(43)
 const B = 'mesh_' + 'b'.repeat(43)
@@ -34,6 +34,16 @@ describe('mesh identity', () => {
     expect(resolveInbound(undefined, 'bob', undefined, table)).toEqual({ sender: 'bob', verified: false, relay: 'none', forged: false })
     expect(resolveInbound('Bearer mesh_' + 'z'.repeat(43), 'alice', undefined, table)).toEqual({ sender: 'alice', verified: false, relay: 'none', forged: true })
     expect(resolveInbound(undefined, undefined, undefined, null)).toEqual({ sender: 'local-inject', verified: false, relay: 'none', forged: false })
+  })
+
+  test('labelled and case-variant claims of a signing identity are forged; a release is not', () => {
+    expect(resolveInbound(undefined, '⚠️unverified:alice@203.0.113.9', undefined, table).forged).toBe(true)
+    expect(resolveInbound(undefined, 'Alice', undefined, table).forged).toBe(true)
+    expect(resolveInbound(`Bearer ${BTCC}`, '⚠️unverified:alice@relay', undefined, table).forged).toBe(true)
+    expect(resolveInbound(`Bearer ${BTCC}`, '⚠️released#12', undefined, table).forged).toBe(false)
+    expect(resolveInbound(undefined, '⚠️unverified:bob@1.2.3.4', undefined, table).forged).toBe(false)
+    expect(claimedIdentity('⚠️unverified:daddy (mbp)@141.98.252.160')).toBe('daddy (mbp)')
+    expect(claimedIdentity('⚠️unverified@1.2.3.4')).toBe('⚠️unverified@1.2.3.4')
   })
 
   test('malformed bearers never match', () => {
