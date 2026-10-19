@@ -1,3 +1,7 @@
+## 1.24.15 — 2026-10-19
+
+- **Inbound `/inject` accepts a previous token during rotation (access design v1.1, phase 0)**: the fleet inject secret is being rotated. `/inject` now accepts `CHANNEL_INJECT_TOKEN` or `CHANNEL_INJECT_TOKEN_PREV` (accepted, never sent), so verifiers can take both values while senders switch over and no message is lost. The comparison is now constant-time (`timingSafeEqual`) instead of `!==`. Unset `CHANNEL_INJECT_TOKEN` keeps today's behaviour. `_PREV` can come from the machine config file (`~/.config/crab-labs-plugins/env`).
+
 ## 1.24.14 — 2026-10-19
 
 - **No deployment-specific defaults in the code (chiron 5630)**: this repo is public, and the BTCC control-plane URL was a hardcoded fallback (`BTCC_API_BASE ?? '<url>'`, five call sites) — which is how it became public. Deployment values now come only from the environment. New `fleet-config.ts` (imported first by `server.ts`, so every module-level env read sees it) loads a per-machine KEY=VALUE file, `~/.config/crab-labs-plugins/env` (path override `CRAB_LABS_PLUGINS_ENV`); a variable already set in the daemon's own plist/unit wins. The startup log names the keys it applied, never the values.

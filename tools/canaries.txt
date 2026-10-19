@@ -15,3 +15,4 @@ plugins/telegram-http/fleet-config.ts::applyFleetConfig
 plugins/telegram-http/server.ts::from './fleet-config.ts'
 plugins/discord-http/fleet-config.ts::applyFleetConfig
 plugins/discord-http/server.ts::from './fleet-config.ts'
+plugins/telegram-http/server.ts::CHANNEL_INJECT_TOKEN_PREV

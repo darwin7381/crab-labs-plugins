@@ -20,7 +20,7 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes, randomUUID } from 'crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync, readSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep, dirname } from 'path'
@@ -1070,6 +1070,20 @@ function loadInboxRegistry(): Record<string, { url: string; desc?: string }> {
 }
 function inboxRegistryNames(): string[] {
   return Object.keys(loadInboxRegistry()).filter(n => n !== INBOX_SELF)
+}
+
+// Inbound /inject token: the current CHANNEL_INJECT_TOKEN or, while a rotation overlaps,
+// CHANNEL_INJECT_TOKEN_PREV. Constant-time so the comparison leaks nothing.
+function injectTokenOk(presented: string | undefined): boolean {
+  if (!presented) return false
+  const got = Buffer.from(presented)
+  let ok = false
+  for (const t of [process.env.CHANNEL_INJECT_TOKEN, process.env.CHANNEL_INJECT_TOKEN_PREV]) {
+    if (!t) continue
+    const want = Buffer.from(t)
+    if (want.length === got.length && timingSafeEqual(want, got)) ok = true
+  }
+  return ok
 }
 
 const SEND_MAX_CHARS = 3500
@@ -2852,10 +2866,10 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     // fragile tmux send-keys: survives TUI busy/menus/restarts, no shell-execution risk,
     // and delivery is confirmed rather than fire-and-forget keystrokes.
     // Caller: oncall-receiver (Argus wake). Auth: when CHANNEL_INJECT_TOKEN is set the
-    // X-Inject-Token header must match; the 127.0.0.1 bind is the outer wall either way.
+    // X-Inject-Token header must match it — or CHANNEL_INJECT_TOKEN_PREV during a rotation
+    // (accepted, never sent); the 127.0.0.1 bind is the outer wall either way.
     if (u.pathname === '/inject' && req.method === 'POST') {
-      const tok = process.env.CHANNEL_INJECT_TOKEN
-      if (tok && (req.headers['x-inject-token'] as string | undefined) !== tok) {
+      if (process.env.CHANNEL_INJECT_TOKEN && !injectTokenOk(req.headers['x-inject-token'] as string | undefined)) {
         res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
         return
       }
