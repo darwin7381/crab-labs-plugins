@@ -10,9 +10,9 @@ describe('expandHiddenEntities', () => {
   test('single text_link expands inline', () => {
     expect(
       expandHiddenEntities('see the doc here', [
-        { type: 'text_link', offset: 8, length: 8, url: 'https://docs.example.com/x' },
+        { type: 'text_link', offset: 8, length: 8, url: 'https://docs.example.com/note' },
       ]),
-    ).toBe('see the [doc here](https://docs.example.com/x)')
+    ).toBe('see the [doc here](https://docs.example.com/note)')
   })
 
   test('multiple links — the Joey document-list case', () => {

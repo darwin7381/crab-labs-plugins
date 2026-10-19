@@ -46,8 +46,9 @@ import { spawn } from 'node:child_process'
 
 const TMUX_SESSION = process.env.CHANNEL_BOT_TMUX_SESSION ?? ''
 const PROJECTS_DIR = process.env.CHANNEL_BOT_PROJECTS_DIR ?? ''
-const WRAPPER_LABEL =
-  process.env.CHANNEL_BOT_WRAPPER_LABEL ?? 'com.example.channel-bot-wrapper'
+// No built-in default: the deployment names its wrapper (plist env, or the machine config —
+// see fleet-config.ts). Unset → /restart reports it cannot confirm a respawn.
+const WRAPPER_LABEL = process.env.CHANNEL_BOT_WRAPPER_LABEL ?? ''
 const RESUME_CHAIN_FILE =
   process.env.CHANNEL_BOT_RESUME_CHAIN_FILE ?? '/tmp/channel-bot-resume-chain.json'
 // (CHANNEL_BOT_NEXT_ARGS_FILE was used in 1.1.0 to inject --resume on
@@ -699,6 +700,9 @@ async function restartClaudeTUI(): Promise<void> {
   const killResult = await runCommand(['tmux', 'kill-session', '-t', TMUX_SESSION])
   // killResult.exitCode != 0 may just mean session was already gone — proceed regardless.
 
+  if (!WRAPPER_LABEL) {
+    throw new Error(`TUI tmux session closed (tmux kill: ${killResult.exitCode}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper service to confirm a respawn`)
+  }
   // Step 2: kickstart wrapper so it immediately re-enters monitor loop.
   // (Without this, the next check is up to 30s away.)
   const target = `gui/${process.getuid?.() ?? 501}/${WRAPPER_LABEL}`

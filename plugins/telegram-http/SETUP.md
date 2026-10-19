@@ -25,7 +25,7 @@
 - claude TUI 重啟 daemon 不動，重連即可
 - 訊息在 claude 斷線期間有 disk + memory **replay queue**，不掉資料
 
-詳細架構：[ARCHITECTURE.md](./ARCHITECTURE.md)。設計原理 + 為何官方 stdio 必死：HedgeDoc [Route B 完整記錄](https://docs.example.com/B_MVqPMbQsyLLxo7oGnTdg)。
+詳細架構：[ARCHITECTURE.md](./ARCHITECTURE.md)。設計原理 + 為何官方 stdio 必死：HedgeDoc Route B 完整記錄 (internal notes)。
 
 ---
 
@@ -554,7 +554,7 @@ You're not allowed yet. Run in Claude Code:
 
 ## 10. Supervisor 整合（cc-workspaces 多 agent 場景）
 
-如果你有多個 cc-agent（builder, research, video-master 等），用 [universal supervisor](https://docs.example.com/eru5V9HnSsi2pPpONaIK7A) 自動管理 claude TUI 生命週期。
+如果你有多個 cc-agent（builder, research, video-master 等），用 universal supervisor (internal notes) 自動管理 claude TUI 生命週期。
 
 每個 agent 寫一份 manifest `~/cc-workspaces/claude-<name>/.cc-agent.json`：
 
@@ -778,9 +778,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.telegram-dae
 - 變更紀錄：[CHANGELOG.md](./CHANGELOG.md)
 - Access 管理：[ACCESS.md](./ACCESS.md)
 - **🤖 進階：channel-bot TUI 控制台（1.1.0+）：[ADVANCED-SETUP.md](./ADVANCED-SETUP.md)** — 把 Telegram 變成你 claude TUI 的鍵盤（`/clear`、`/resume`、`/restart`、`/model` 等指令直接從手機操控）
-- 2026-05-14 事故報告（兩個 bug 修復全紀錄）：[HedgeDoc](https://docs.example.com/TFkYzCibQheCDaV2fyoaBg)
-- Route B HTTP daemon 改造記錄：[HedgeDoc](https://docs.example.com/B_MVqPMbQsyLLxo7oGnTdg)
-- Switchover SOP：[HedgeDoc](https://docs.example.com/StFH9rUCT2OmGW5T2EM61g)
-- 2026-05-22 TUI control plane 範式：[HedgeDoc](https://docs.example.com/cy8iIB95QPqgrBqI480kKg)
+- 2026-05-14 事故報告（兩個 bug 修復全紀錄）：internal notes
+- Route B HTTP daemon 改造記錄：internal notes
+- Switchover SOP：internal notes
+- 2026-05-22 TUI control plane 範式：internal notes
 
 License: Apache-2.0

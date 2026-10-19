@@ -9,6 +9,8 @@
  * Telegram's Bot API has no history or search. Reply-only tools.
  */
 
+// Must stay the FIRST import: loads the machine config into env before other modules read it.
+import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import {
@@ -66,7 +68,7 @@ const ENV_FILE = join(STATE_DIR, '.env')
 // connects via the StreamableHTTPClientTransport at .mcp.json's `url`. This
 // decouples plugin lifetime from claude TUI lifetime — claude restarts no
 // longer kill the Telegram poller, and stale stdio pipes can't drag the
-// daemon down. See https://docs.example.com/0EXKOeo-QRS6Plby7lUePQ.
+// daemon down.
 const HTTP_PORT = (() => {
   const v = process.env.TELEGRAM_HTTP_PORT
   if (!v) return null
@@ -121,7 +123,7 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 // File-based logger — 2026-05-13 by Joey. Plugin's stderr is captured by the
 // parent claude process and not surfaced anywhere visible at runtime, which
 // made all prior debugging impossible. Mirror to stderr AND a persistent log.
-// See https://docs.example.com/7Q318gHJSdOV3BH2ub8fyg for the full analysis.
+//
 // Self-rotation — 2026-07-03 after a server.log grew to 14GB and filled a host's
 // disk (631MB free). appendFileSync reopens per-call (no held fd), so a plain
 // rename-rotation is safe: rename the oversized file, next append creates a fresh
@@ -1030,6 +1032,10 @@ const pendingPermissions = new Map<string, {
 const INBOX_REGISTRY_PATH = process.env.AGENT_INBOX_REGISTRY
   ?? join(process.env.HOME ?? '', '.claude', 'agent-inbox', 'registry.json')
 const INBOX_SELF = process.env.AGENT_INBOX_SELF ?? 'unknown-agent'
+// BTCC control plane (Comms log, Scheduler run acks). Deliberately no built-in default:
+// the deployment sets BTCC_API_BASE (machine config, see fleet-config.ts). Unset = these
+// features are off; mesh delivery itself still works.
+const BTCC_API_BASE = (process.env.BTCC_API_BASE ?? '').trim().replace(/\/+$/, '')
 
 // ---- Scheduler daemon-level auto-ack (SCHEDULER-MODULE backlog #1) ----------
 // When a BTCC Scheduler wake-up ([scheduled][tag][run:N]) is CONFIRMED written
@@ -1047,11 +1053,11 @@ function maybeAutoAckScheduled(notif: { method: string; params: unknown }): void
     const m = content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)
     if (!m) return
     const rid = m[1]
+    if (!BTCC_API_BASE) return
     if (autoAckedRuns.has(rid)) return
     autoAckedRuns.add(rid)
     if (autoAckedRuns.size > 500) autoAckedRuns.clear()  // unbounded-growth guard
-    const base = process.env.BTCC_API_BASE ?? 'https://control-plane.example.com'
-    void fetch(`${base}/api/scheduler/runs/${rid}/ack`, {
+    void fetch(`${BTCC_API_BASE}/api/scheduler/runs/${rid}/ack`, {
       method: 'POST',
       signal: AbortSignal.timeout(6000),
     }).then(r => log('info', `scheduler auto-ack run ${rid}: ${r.status}`))
@@ -1081,9 +1087,9 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // 'joey' is a log-only target: the boss has no inbox daemon — he reads the BTCC
   // Messenger thread, so logging the message IS the delivery (fills his dm thread).
   if (target === 'joey' || target === 'joey (btcc)') {
+    if (!BTCC_API_BASE) return 'send to joey FAILED: "joey" is a log-only target and BTCC_API_BASE is not configured on this machine — nothing was sent. Use your Telegram reply tools.'
     try {
-      const base = process.env.BTCC_API_BASE ?? 'https://control-plane.example.com'
-      const r = await fetch(`${base}/api/comms/log`, {
+      const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1105,9 +1111,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // log FIRST to mint the message id — it travels with the delivery so the
   // receiver can quote-reply to this message (Telegram reply_to semantics)
   let msgId: number | undefined
-  try {
-    const base = process.env.BTCC_API_BASE ?? 'https://control-plane.example.com'
-    const lr = await fetch(`${base}/api/comms/log`, {
+  if (BTCC_API_BASE) try {
+    const lr = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1145,8 +1150,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // settle the delivery status on the minted row (best effort)
   if (msgId != null) {
     try {
-      const base = process.env.BTCC_API_BASE ?? 'https://control-plane.example.com'
-      void fetch(`${base}/api/comms/log-status`, {
+      void fetch(`${BTCC_API_BASE}/api/comms/log-status`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1158,7 +1162,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     } catch {}
   }
   return delivery === 'delivered'
-    ? `delivered to ${target}'s inbox (queued durably; logged to BTCC Comms)`
+    ? `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})`
     : `send to ${target} FAILED${detail} — message NOT delivered`
 }
 
@@ -2869,7 +2873,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
       // delivery gets a BTCC row unless the sender declares logged:true (senders
       // that already log with richer context: send_to_agent, BTCC /send, Argus wake).
-      if (INBOX_ONLY && body?.logged !== true) {
+      if (INBOX_ONLY && body?.logged !== true && BTCC_API_BASE) {
         // PARSE rather than strip (codex r3): wake handoffs keep their priority
         // and get kind='wake' so BTCC history/UI retain the on-call semantics;
         // only bare legacy identity prefixes (【a → b】) are dropped as noise.
@@ -2886,10 +2890,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           logBody = text.replace(/^【[^】]{1,60}】\s*/, '')
         }
         try {
-          const base = process.env.BTCC_API_BASE ?? 'https://control-plane.example.com'
           // awaited (not fire-and-forget): the minted row id travels in the channel
           // meta as btcc_msg_id so the receiving agent can quote-reply to this message
-          const r = await fetch(`${base}/api/comms/log`, {
+          const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -3198,6 +3201,7 @@ function startListen(): void {
       log('info', `port ${HTTP_PORT} acquired after ${bindAttempts} retry attempt(s)`)
     }
     log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
+    log('info', `machine config ${FLEET_CONFIG_PATH}: ${fleetConfigApplied.length ? 'applied ' + fleetConfigApplied.join(', ') : 'nothing applied (missing, or every key already set)'}`)
     // Joey rule 2026-07-12: never silently run stale code — self-report version
     // + freshness vs origin/main at every boot (fail-open, see version-check.ts).
     void checkVersion().then(() => log('info', versionLine())).catch(() => {})

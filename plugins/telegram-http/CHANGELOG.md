@@ -1,3 +1,11 @@
+## 1.24.14 — 2026-10-19
+
+- **No deployment-specific defaults in the code (chiron 5630)**: this repo is public, and the BTCC control-plane URL was a hardcoded fallback (`BTCC_API_BASE ?? '<url>'`, five call sites) — which is how it became public. Deployment values now come only from the environment. New `fleet-config.ts` (imported first by `server.ts`, so every module-level env read sees it) loads a per-machine KEY=VALUE file, `~/.config/crab-labs-plugins/env` (path override `CRAB_LABS_PLUGINS_ENV`); a variable already set in the daemon's own plist/unit wins. The startup log names the keys it applied, never the values.
+  - `BTCC_API_BASE` unset → Comms logging, the `joey` log-only target and Scheduler auto-acks are off (the `joey` target says so instead of failing silently); agent-to-agent delivery itself is unaffected, and its reply no longer claims "logged to BTCC Comms" when nothing was logged.
+  - `CHANNEL_BOT_WRAPPER_LABEL` lost its built-in default. Unset on launchd now gives the same honest ❌ the systemd path already gave, instead of kickstarting a guessed label.
+  - Docs, comments and tests no longer carry real chat ids, usernames, home paths, launchd labels, loopback ports or links to the internal notes host; examples use placeholders.
+  - Fleet: each machine already has the file with the previous defaults, so behaviour is unchanged. Tests: 3 new (fleet-config), 33/33.
+
 ## 1.24.13 — 2026-10-18
 
 - **agent-inbox: never send credentials over the mesh (chiron 5506)**: Chiron's mesh-history sweep found live credentials passed between agents in plaintext (a Binance password, a 2captcha password, a Predict.Fun key); mesh history is stored and has been readable from outside. The 1.24.12 disclosure bullet now ends: never put a credential in a mesh message yourself, even to a fleet agent who needs it — send the path of the file that holds it. Instructions text only; supersedes 1.24.12 in the same rollout (agents already restarted on 1.24.12 are restarted again).
@@ -670,7 +678,7 @@ Replaced `isClaudeBusy()` pre-flight check in `resumePickerInlineSwitch` with un
 
 ### Added — Roamer parity with channel-bot + auto-discovery + history-aware takeover
 
-This release closes the feature gap between channel-bot mode and roamer mode: any command that worked on `@channel_bot` now works on roamer bots against the dynamically-selected target. Also adds cross-protocol coordination so TG and DC roamer bots can coexist without manual wiring.
+This release closes the feature gap between channel-bot mode and roamer mode: any command that worked on the channel bot now works on roamer bots against the dynamically-selected target. Also adds cross-protocol coordination so TG and DC roamer bots can coexist without manual wiring.
 
 #### `channel-bot-control.ts` — shared TUI slash forwarder
 
@@ -738,7 +746,7 @@ New `handleChannelBotCommandsForCurrentTarget` dispatcher inside `handleRoamerSl
 
 ### Migration notes
 
-- No breaking changes for channel-bot deployments. Existing `@channel_bot` env-based config keeps working — all overrides are optional parameters with env fallback.
+- No breaking changes for channel-bot deployments. Existing the channel bot env-based config keeps working — all overrides are optional parameters with env fallback.
 - New roamer deployments inherit auto-discovery automatically (just spawn the daemon, no manual port wiring).
 
 ## 1.4.0 — 2026-05-25
@@ -780,7 +788,7 @@ Initial impl (rejected) used tmux send-keys + capture-pane + jsonl tailing for r
 
 ### Not affected
 
-Channel-bot mode (existing `@channel_bot` daemon): `ROAMER_MODE` unset → entire roamer module is no-op → routing falls through to existing `broadcastNotification`. Zero behavioral change.
+Channel-bot mode (existing the channel bot daemon): `ROAMER_MODE` unset → entire roamer module is no-op → routing falls through to existing `broadcastNotification`. Zero behavioral change.
 
 ## 1.3.1 — 2026-05-24
 
@@ -816,7 +824,7 @@ New helpers `tmuxCapturePane()`, `isPickerOpen()`, `isClaudeBusy()`.
 ### Added
 - **Trailing protocol reminder in every channel notification** — each inbound from Telegram now arrives with an appended `[protocol] You MUST respond via mcp__plugin_telegram-http_telegram-http__reply(chat_id="...") ...` hint inside the same `<channel>` block. Mitigates the "CLAUDE.md is one-shot at session start → attention dilutes as context grows → silent CLI reply" failure mode. Joey 2026-05-24: 「就連你都有幾乎 20% 的機率常常會忘了回覆結果就自己結束工作了」.
 
-This is the contextual companion to the infrastructure-level [check_tg_reply.py Stop hook](https://github.com/example/dotfiles) fix shipped same day. Two-layer defense:
+This is the contextual companion to the infrastructure-level check_tg_reply.py Stop hook fix shipped same day. Two-layer defense:
 1. **Stop hook** (infrastructure): blocks turn end if channel-turn lacked reply tool call
 2. **Per-inbound reminder** (contextual): every channel msg arrives with a fresh tool-call hint that the model sees in-context (not buried in CLAUDE.md from session start)
 
@@ -1029,7 +1037,7 @@ Dead-transport detection patch. Counters claude-code 2.1.141~2.1.148 silent HTTP
 - **`res.once('close', ...)` defensive cleanup** — extra belt-and-suspenders to clear the keepalive timer if Node fires close before our explicit `finally`.
 
 ### Why
-Symptom observed 2026-05-22 on @channel_bot channel-bot:
+Symptom observed 2026-05-22 on the channel bot channel-bot:
 - Daemon's `active_sessions` accumulated to **2269 zombies** (every prior claude TUI restart left a dead session); broadcasts logged `queued for session ... SSE not yet open, queue=N` for thousands of dead sessions.
 - New TG messages reached daemon (`last_update_id` incremented) but never appeared in claude TUI's `<channel>` tag.
 - `lsof -p <claude_pid> -i :17631` showed **zero ESTABLISHED** despite `--channels plugin:telegram-http@crab-labs-plugins` flag still set and claude process alive — confirms client-side TCP died silently per #60061.
@@ -1050,7 +1058,7 @@ Compatibility + docs release. No daemon code changes.
 - [SETUP.md](./SETUP.md) — end-to-end first-time setup tutorial in Chinese: plugin install, per-bot configure (ackReaction emoji principles, dmPolicy choices), managed-settings.json (`allowedChannelPlugins` allowlist), launchd plist, claude TUI startup (with mandatory 2.1.140 pin), pairing, end-to-end testing, supervisor.sh integration, troubleshooting.
 
 ### Known issues
-- **Claude binary 2.1.141 has an HTTP MCP transport regression** — TUIs silently lose all TCP connections to the daemon over time (process alive, network dead). **Pin to 2.1.140** in supervisor manifests / direct invocations until upstream confirms a fix. See SETUP.md §11.2 and HedgeDoc [incident report](https://docs.example.com/TFkYzCibQheCDaV2fyoaBg).
+- **Claude binary 2.1.141 has an HTTP MCP transport regression** — TUIs silently lose all TCP connections to the daemon over time (process alive, network dead). **Pin to 2.1.140** in supervisor manifests / direct invocations until upstream confirms a fix. See SETUP.md §11.2 and HedgeDoc incident report (internal notes).
 
 ## 1.0.0 — 2026-05-14
 

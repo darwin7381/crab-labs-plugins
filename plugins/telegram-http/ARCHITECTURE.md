@@ -21,12 +21,12 @@ This fork is the end product of four nights of debugging the upstream stdio plug
 
 | Report | What's in it |
 |---|---|
-| [Telegram plugin 反覆死亡 debug 全紀錄](https://docs.example.com/0EXKOeo-QRS6Plby7lUePQ) | 4 rounds of hypothesis testing (watchdog, stdin EOF, ppid orphan, PID mutual-kill); 9 stdio-era patches that did NOT root-fix the bug; root cause finally pinpointed by file-logging the death moment; Route A vs Route B comparison table; final decision rationale |
-| [Earlier root-cause + patch design](https://docs.example.com/7Q318gHJSdOV3BH2ub8fyg) | Original 14-death-path audit of the upstream `server.ts`; A-class / B-class / C-class / D-class bug categorization; the file-logger patch that made the whole thing diagnosable |
-| [Route B 完成報告](https://docs.example.com/B_MVqPMbQsyLLxo7oGnTdg) | Deployment timeline (13:38→13:54 UTC, 16 min start-to-verify); architecture transformation diagram; ironclad evidence (0 deaths in 9m vs 22-244s typical death); lessons learned (5 items); per-bot daemon table |
-| [Switchover SOP](https://docs.example.com/StFH9rUCT2OmGW5T2EM61g) | Step-by-step migration playbook from the in-place patched cache plugin to this fork; Scenario A (no marketplace switch, just plist update) vs Scenario B (full plugin ID swap to `telegram-http@crab-labs-plugins`); wrapper rewrite rationale |
+| Telegram plugin 反覆死亡 debug 全紀錄 (internal notes) | 4 rounds of hypothesis testing (watchdog, stdin EOF, ppid orphan, PID mutual-kill); 9 stdio-era patches that did NOT root-fix the bug; root cause finally pinpointed by file-logging the death moment; Route A vs Route B comparison table; final decision rationale |
+| Earlier root-cause + patch design (internal notes) | Original 14-death-path audit of the upstream `server.ts`; A-class / B-class / C-class / D-class bug categorization; the file-logger patch that made the whole thing diagnosable |
+| Route B 完成報告 (internal notes) | Deployment timeline (13:38→13:54 UTC, 16 min start-to-verify); architecture transformation diagram; ironclad evidence (0 deaths in 9m vs 22-244s typical death); lessons learned (5 items); per-bot daemon table |
+| Switchover SOP (internal notes) | Step-by-step migration playbook from the in-place patched cache plugin to this fork; Scenario A (no marketplace switch, just plist update) vs Scenario B (full plugin ID swap to `telegram-http@crab-labs-plugins`); wrapper rewrite rationale |
 
-If you are reading this because the plugin broke and you want to understand WHY this exists and not just WHAT it does, read [the death-loop report](https://docs.example.com/0EXKOeo-QRS6Plby7lUePQ) first — it's the canonical story.
+If you are reading this because the plugin broke and you want to understand WHY this exists and not just WHAT it does, read the death-loop report (internal notes) first — it's the canonical story.
 
 ## Why we forked: the stdio death cycle
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13.6 — 2026-10-19
+
+- **No deployment-specific defaults (chiron 5630)**: same machine-config loader as telegram-http 1.24.14 (`fleet-config.ts`, `~/.config/crab-labs-plugins/env`, plist env wins). `CHANNEL_BOT_WRAPPER_LABEL` has no built-in default any more; unset → `/restart` reports it cannot confirm a respawn instead of kickstarting a guessed label. Docs no longer carry internal links or launchd labels.
+
 ## 1.13.5 — 2026-10-04
 
 - **Dead SSE sessions reclaimed under Bun**: same `req.socket 'close'` bridge as telegram-http 1.24.8 (identical SSE handler; see that entry for the lab reproduction and evidence). Rides the same wave as 1.13.4.

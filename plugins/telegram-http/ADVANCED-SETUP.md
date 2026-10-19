@@ -384,7 +384,7 @@ non-allowlisted senders never reach it.
 
 4. **2.1.141~2.1.148 client-side regression** — must pin claude to 2.1.140
    until upstream fixes the silent HTTP MCP transport drop. See
-   [SETUP.md §11.2](./SETUP.md) and [Claude Clinic note](https://docs.example.com/B_MVqPMbQsyLLxo7oGnTdg).
+   [SETUP.md §11.2](./SETUP.md) and Claude Clinic note (internal notes).
 
 5. **Single channel-bot per cwd** — the projects dir is shared, so only one
    wrapper should manage one tmux session per WORKDIR. Multiple wrappers
@@ -420,5 +420,5 @@ control of one TUI.
 ## 10. Background reading
 
 - Plugin CHANGELOG sections **1.1.0** / **1.2.0** / **1.2.1** — detailed history of the control plane evolution
-- HedgeDoc report on the 2026-05-22 paradigm shift: <https://docs.example.com/cy8iIB95QPqgrBqI480kKg>
+- HedgeDoc report on the 2026-05-22 paradigm shift: (internal notes)
 - Claude Code GitHub issues #21721, #60061, #59956 — context on the transport regression that prompted the 2.1.140 pin

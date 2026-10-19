@@ -21,10 +21,10 @@ The investigation that produced this fix was driven by the Telegram plugin failu
 
 | Report | What's in it |
 |---|---|
-| [Telegram plugin 反覆死亡 debug 全紀錄](https://docs.example.com/0EXKOeo-QRS6Plby7lUePQ) | 4 rounds of hypothesis testing; 9 stdio-era patches that did NOT root-fix; root cause finally pinpointed via file-logging; Route A vs Route B comparison; final decision rationale |
-| [Earlier root-cause + patch design](https://docs.example.com/7Q318gHJSdOV3BH2ub8fyg) | 14-death-path audit; bug categorization; file-logger patch that made debugging possible |
-| [Route B 完成報告 (Telegram side)](https://docs.example.com/B_MVqPMbQsyLLxo7oGnTdg) | Deployment timeline, ironclad evidence (0 deaths vs 22-244s typical) — Telegram, but the architecture is what got mirrored here |
-| [Switchover SOP](https://docs.example.com/StFH9rUCT2OmGW5T2EM61g) | Step-by-step migration playbook (Scenario A vs B); applies to both channels |
+| Telegram plugin 反覆死亡 debug 全紀錄 (internal notes) | 4 rounds of hypothesis testing; 9 stdio-era patches that did NOT root-fix; root cause finally pinpointed via file-logging; Route A vs Route B comparison; final decision rationale |
+| Earlier root-cause + patch design (internal notes) | 14-death-path audit; bug categorization; file-logger patch that made debugging possible |
+| Route B 完成報告 (Telegram side) (internal notes) | Deployment timeline, ironclad evidence (0 deaths vs 22-244s typical) — Telegram, but the architecture is what got mirrored here |
+| Switchover SOP (internal notes) | Step-by-step migration playbook (Scenario A vs B); applies to both channels |
 
 The Telegram and Discord plugins share the same upstream architecture (stdio child of claude TUI, with `process.stdin.on('end', shutdown)`) so they share the same architectural vulnerability. Discord just hadn't visibly broken yet in our deployment.
 

@@ -10,6 +10,8 @@
  * lookback, and the instructions tell the model this.
  */
 
+// Must stay the FIRST import: loads the machine config into env before other modules read it.
+import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import {
@@ -1883,6 +1885,7 @@ httpServer.on('error', err => {
 
 httpServer.listen(HTTP_PORT!, HTTP_HOST, () => {
   log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
+  log('info', `machine config ${FLEET_CONFIG_PATH}: ${fleetConfigApplied.length ? 'applied ' + fleetConfigApplied.join(', ') : 'nothing applied (missing, or every key already set)'}`)
   try {
     roamerRegisterSelfAsDaemon()
     if (isRoamerEnabled()) {

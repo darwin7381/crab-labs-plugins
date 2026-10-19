@@ -38,8 +38,9 @@ import { spawn } from 'node:child_process'
 
 const TMUX_SESSION = process.env.CHANNEL_BOT_TMUX_SESSION ?? ''
 const PROJECTS_DIR = process.env.CHANNEL_BOT_PROJECTS_DIR ?? ''
-const WRAPPER_LABEL =
-  process.env.CHANNEL_BOT_WRAPPER_LABEL ?? 'com.example.channel-bot-wrapper'
+// No built-in default: the deployment names its wrapper (plist / unit env, or the machine
+// config — see fleet-config.ts). Unset → /restart reports it cannot confirm a respawn.
+const WRAPPER_LABEL = process.env.CHANNEL_BOT_WRAPPER_LABEL ?? ''
 // What supervises the wrapper: launchd on macOS (every Mac mini / MBP agent),
 // a systemd --user unit on Linux (txmonster01's steropes, chiron 4643). On
 // systemd, CHANNEL_BOT_WRAPPER_LABEL is the unit name (e.g. claude-steropes.service).
@@ -935,7 +936,7 @@ export async function forwardSharedTuiSlash(
  * 2026-07-16 rework — the old step 2 was `kickstart -k` (kill + respawn)
  * to make the wrapper re-enter its loop immediately instead of ≤30s later.
  * For supervisor-managed agents WRAPPER_LABEL is the SHARED
- * com.example.agent-supervisor, so every /restart bounced the fleet-wide
+ * agent-supervisor job, so every /restart bounced the fleet-wide
  * watchdog; consecutive /restarts (Joey restarting several bots in a row)
  * landed each kickstart inside the previous respawn's ThrottleInterval=10s
  * window, `kickstart -k` blocks until the deferred respawn, runCommand's
@@ -955,6 +956,9 @@ async function restartClaudeTUI(): Promise<string> {
 
   if (SERVICE_MANAGER === 'systemd-user') return ensureWrapperSystemd(killResult.exitCode)
 
+  if (!WRAPPER_LABEL) {
+    throw new Error(`TUI tmux session closed (tmux kill: ${killResult.exitCode}), but CHANNEL_BOT_WRAPPER_LABEL is not set, so there is no wrapper service to confirm a respawn`)
+  }
   // Step 2: health backstop — never `kickstart -k` a healthy wrapper.
   const target = `gui/${process.getuid?.() ?? 501}/${WRAPPER_LABEL}`
   const probe = await runCommand(['launchctl', 'print', target], 5000)
