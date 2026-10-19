@@ -58,6 +58,7 @@ import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
+import { bearerIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1037,6 +1038,20 @@ const INBOX_SELF = process.env.AGENT_INBOX_SELF ?? 'unknown-agent'
 // features are off; mesh delivery itself still works.
 const BTCC_API_BASE = (process.env.BTCC_API_BASE ?? '').trim().replace(/\/+$/, '')
 
+// This daemon's own mesh credential (`<STATE_DIR>/mesh-credential`, provisioned per identity;
+// access design v1.1). Re-read when the file changes, so provisioning or rotation needs no
+// restart. Absent → calls go out unsigned exactly as before (dual track).
+let ownCred: { mtimeMs: number; value: string | null } = { mtimeMs: -1, value: null }
+function meshAuth(): Record<string, string> {
+  let m = -2
+  try { m = statSync(join(STATE_DIR, 'mesh-credential')).mtimeMs } catch {}
+  if (m !== ownCred.mtimeMs) {
+    ownCred = { mtimeMs: m, value: m >= 0 ? readOwnCredential(STATE_DIR) : null }
+    log('info', `mesh credential: ${ownCred.value ? 'loaded (outbound calls are signed)' : 'none (outbound calls unsigned)'}`)
+  }
+  return ownCred.value ? { Authorization: `Bearer ${ownCred.value}` } : {}
+}
+
 // ---- Scheduler daemon-level auto-ack (SCHEDULER-MODULE backlog #1) ----------
 // When a BTCC Scheduler wake-up ([scheduled][tag][run:N]) is CONFIRMED written
 // into a live session, the daemon acks the run machine-side — "開工回執" drops
@@ -1059,6 +1074,7 @@ function maybeAutoAckScheduled(notif: { method: string; params: unknown }): void
     if (autoAckedRuns.size > 500) autoAckedRuns.clear()  // unbounded-growth guard
     void fetch(`${BTCC_API_BASE}/api/scheduler/runs/${rid}/ack`, {
       method: 'POST',
+      headers: meshAuth(),
       signal: AbortSignal.timeout(6000),
     }).then(r => log('info', `scheduler auto-ack run ${rid}: ${r.status}`))
       .catch(err => log('warn', `scheduler auto-ack run ${rid} failed (agent can still ack manually): ${err}`))
@@ -1108,6 +1124,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         headers: {
           'Content-Type': 'application/json',
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+          ...meshAuth(),
         },
         body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null }),
         signal: AbortSignal.timeout(8000),
@@ -1131,6 +1148,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
       headers: {
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+        ...meshAuth(),
       },
       body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null }),
       signal: AbortSignal.timeout(6000),
@@ -1148,6 +1166,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
       headers: {
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+        ...meshAuth(),
       },
       body: JSON.stringify({ text: body, from: INBOX_SELF, logged: msgId != null,
         ...(msgId != null ? { msg_id: msgId } : {}),
@@ -1169,6 +1188,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         headers: {
           'Content-Type': 'application/json',
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+          ...meshAuth(),
         },
         body: JSON.stringify({ id: msgId, delivery }),
         signal: AbortSignal.timeout(6000),
@@ -2869,12 +2889,15 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     // X-Inject-Token header must match it — or CHANNEL_INJECT_TOKEN_PREV during a rotation
     // (accepted, never sent); the 127.0.0.1 bind is the outer wall either way.
     if (u.pathname === '/inject' && req.method === 'POST') {
-      if (process.env.CHANNEL_INJECT_TOKEN && !injectTokenOk(req.headers['x-inject-token'] as string | undefined)) {
+      const meshTable = loadTable()
+      const authz = req.headers['authorization'] as string | undefined
+      if (process.env.CHANNEL_INJECT_TOKEN && !injectTokenOk(req.headers['x-inject-token'] as string | undefined)
+          && !bearerIdentity(authz, meshTable)) {
         res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
         return
       }
       const body = (await readJsonBody(req).catch(() => null)) as
-        { text?: string; from?: string; chat_id?: string; logged?: boolean;
+        { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
           msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
           no_reply?: boolean } | null
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
@@ -2882,7 +2905,12 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
         return
       }
-      const from = (typeof body?.from === 'string' && body.from ? body.from : 'local-inject').slice(0, 64)
+      // Who really sent it: decided by the presented credential, never by the body alone
+      // (access design v1.1 §5.3). Unsigned senders still deliver, marked verified=false.
+      const verdict = resolveInbound(authz,
+        typeof body?.from === 'string' ? body.from : undefined,
+        typeof body?.verified_from === 'string' ? body.verified_from : undefined, meshTable)
+      const from = verdict.sender
       let btccMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
       // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
       // delivery gets a BTCC row unless the sender declares logged:true (senders
@@ -2911,8 +2939,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             headers: {
               'Content-Type': 'application/json',
               ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+              ...meshAuth(),
             },
-            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null }),
+            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified }),
             signal: AbortSignal.timeout(6000),
           }).catch(() => null)
           if (r?.ok) {
@@ -2930,6 +2959,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           content: text,
           meta: {
             chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
+            ...verdictMeta(verdict),
             ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
             // Terminal-ack flag (Athena's a2a ack-loop fix): a no_reply delivery is
             // tagged no_reply="true" so check_tg_reply lets the receiver's turn close
