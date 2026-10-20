@@ -1,3 +1,12 @@
+## 1.27.0 — 2026-10-20
+
+- **`send_to_agent` takes an optional `op`: the board ops room (戰情室) the message belongs to (BTCC WO-35, Epeius).** Large cross-agent tasks now have an ops room on the K.Bro Board (`#/ops/<id>`), where each piece of work has one owner, evidence and a verifier. A message tagged `op` shows up in that op's timeline, which is how mesh traffic about the task lands next to the items.
+  - **Value:** `OP-3`, `3` or the op's slug. Charset `[A-Za-z0-9#-]`, at most 48 characters; anything else is refused before sending (nothing sent).
+  - **Sender side:** `op` goes into the `POST /api/comms/log` body (BTCC stores `agent_messages.op_id`) and into the `/inject` body. If BTCC does not know the op, the message is still delivered and stored untagged; the tool result appends BTCC's warning so the sender learns about the typo right away.
+  - **Receiver side:** `/inject` puts `op="OP-3"` in the channel meta, so the receiving agent sees which ops room the message is about and can reply with the same `op`. The receiver-side log (`logged:false` senders) carries it too.
+  - **Needs:** BTCC with WO-35 (`op` on `/api/comms/log`). An older BTCC ignores the field; delivery is unaffected.
+  - agent-inbox runs this same `server.ts`, so it gets the parameter too. The tool schema is served by the daemon, so no `claude plugin update` is needed; a TUI sees `op` after it reconnects (the rollout wave restarts TUIs).
+
 ## 1.26.0 — 2026-10-20
 
 - **Loopback MCP token on `/mcp` (Epeius btcc 5964, from Hephaestus's WO-22 confused-deputy point).**

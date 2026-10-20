@@ -1125,10 +1125,15 @@ ${text}`
 
 const SEND_MAX_CHARS = 3500
 
-async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean): Promise<string> {
+// Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
+const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
+
+async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim()
   if (!body) return 'send failed: empty text'
+  const opRef = op?.trim() || undefined
+  if (opRef && !OP_REF_RE.test(opRef)) return `send failed: op "${opRef.slice(0, 60)}" is not an ops-room reference (use OP-3, 3 or its slug). Nothing was sent.`
   // Reject instead of truncating: slice(0, 3500) used to drop the tail and still
   // report "delivered", so neither side knew (cadmus 4075/4077). Same cap as the
   // receiver's /deliver and /relay.
@@ -1147,7 +1152,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
           ...meshAuth(),
         },
-        body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null }),
+        body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
         signal: AbortSignal.timeout(8000),
       })
       if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use your Telegram reply tools instead."
@@ -1163,6 +1168,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // log FIRST to mint the message id — it travels with the delivery so the
   // receiver can quote-reply to this message (Telegram reply_to semantics)
   let msgId: number | undefined
+  let opWarn = ''
   if (BTCC_API_BASE) try {
     const lr = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
       method: 'POST',
@@ -1171,12 +1177,13 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
         ...meshAuth(),
       },
-      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null }),
+      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
       signal: AbortSignal.timeout(6000),
     }).catch(() => null)
     if (lr?.ok) {
-      const j = await lr.json().catch(() => ({})) as { id?: number }
+      const j = await lr.json().catch(() => ({})) as { id?: number; warning?: string }
       if (typeof j.id === 'number') msgId = j.id
+      if (opRef && typeof j.warning === 'string') opWarn = j.warning
     }
   } catch {}
   let delivery = 'failed'
@@ -1192,6 +1199,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
       body: JSON.stringify({ text: body, from: INBOX_SELF, logged: msgId != null,
         ...(msgId != null ? { msg_id: msgId } : {}),
         ...(replyTo != null ? { reply_to_id: replyTo } : {}),
+        ...(opRef ? { op: opRef } : {}),
         ...(noReply ? { no_reply: true } : {}) }),
       signal: AbortSignal.timeout(8000),
     })
@@ -1216,8 +1224,9 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
       }).catch(() => {})
     } catch {}
   }
+  const opNote = opWarn ? ` — ⚠ ${opWarn}` : ''
   return delivery === 'delivered'
-    ? `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})`
+    ? `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})${opNote}`
     : `send to ${target} FAILED${detail} — message NOT delivered`
 }
 
@@ -1322,6 +1331,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
            to: { type: 'string', description: 'Target agent name from the fleet registry (e.g. "hephaestus", "sonn")' },
            text: { type: 'string', description: 'The message. Plain text; be specific — the receiver gets it as an inbox message with your name as sender.' },
            reply_to: { type: 'string', description: 'Quote-reply: the btcc_msg_id from the meta of the message you are replying to. Use it whenever you answer a specific message so the thread shows what you are responding to.' },
+           op: { type: 'string', description: 'Optional: the board ops room (戰情室) this message belongs to — OP-3, 3 or its slug (op_list on the board MCP shows them). The message then appears in that op\'s timeline and the receiver sees op="…" on it. Use it for messages about a large cross-agent task that has an ops room; an unknown op still delivers, with a warning.' },
            no_reply: { type: 'boolean', description: 'Set true for a terminal ack / closing FYI that needs NO response — a pure "received, done" with nothing new to add. The delivery is tagged no_reply="true" so the receiver\'s turn closes WITHOUT being forced to reply, breaking the two-agent forced-ack loop. RULE: the side with nothing more to add sends no_reply:true to wrap up; the side that RECEIVES a no_reply message stays silent and does NOT reply. Leave false (default) for any substantive message — a request, task, decision, or progress update — so silence can never swallow real work.' },
          },
          required: ['to', 'text'],
@@ -1410,7 +1420,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     if (INBOX_ONLY && req.params.name === 'send_to_agent') {
       const replyTo = args.reply_to != null && String(args.reply_to).match(/^\d+$/) ? Number(args.reply_to) : undefined
       const noReply = args.no_reply === true || args.no_reply === 'true'
-      const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply)
+      const op = args.op != null && String(args.op).trim() ? String(args.op).trim() : undefined
+      const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op)
       return { content: [{ type: 'text', text: result }] }
     }
     switch (req.params.name) {
@@ -3028,8 +3039,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       const body = (await readJsonBody(req).catch(() => null)) as
         { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
           msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
-          no_reply?: boolean } | null
+          no_reply?: boolean; op?: string | number } | null
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
+      const opRef = body?.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
       if (!text) {
         res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
         return
@@ -3090,7 +3102,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
               ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
               ...meshAuth(),
             },
-            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified }),
+            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified, ...(opRef ? { op: opRef } : {}) }),
             signal: AbortSignal.timeout(6000),
           }).catch(() => null)
           if (r?.ok) {
@@ -3114,6 +3126,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             // tagged no_reply="true" so check_tg_reply lets the receiver's turn close
             // WITHOUT forcing a reply — breaks the two-agent forced-ack loop at source.
             ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
+            // ops room (BTCC WO-35): which 戰情室 this message belongs to; reply with the same op
+            ...(opRef ? { op: opRef } : {}),
             ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
             ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
             ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
