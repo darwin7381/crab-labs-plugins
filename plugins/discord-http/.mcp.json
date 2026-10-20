@@ -2,7 +2,8 @@
   "mcpServers": {
     "discord-http": {
       "type": "http",
-      "url": "http://127.0.0.1:${DISCORD_HTTP_PORT}/mcp?v=crab-labs"
+      "url": "http://127.0.0.1:${DISCORD_HTTP_PORT}/mcp?v=crab-labs",
+      "headersHelper": "\"${CLAUDE_PLUGIN_ROOT}/mcp-auth-header.sh\""
     }
   }
 }

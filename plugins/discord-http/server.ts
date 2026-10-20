@@ -12,6 +12,7 @@
 
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
+import { ensureToken, makeGate } from './mcp-auth.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import {
@@ -1635,6 +1636,14 @@ function isInitializeRequest(body: unknown): boolean {
   return (body as { method?: string }).method === 'initialize'
 }
 
+// Loopback MCP token (mcp-auth.ts). Report-first unless MCP_REQUIRE_TOKEN=1.
+const MCP_REQUIRE_TOKEN = process.env.MCP_REQUIRE_TOKEN === '1'
+let mcpToken = ''
+try { mcpToken = ensureToken(HTTP_PORT as number) } catch (e) {
+  log('error', `mcp token: could not create (${e}) — /mcp ${MCP_REQUIRE_TOKEN ? 'REFUSES every client' : 'stays open'}`)
+}
+const mcpGate = makeGate(mcpToken, MCP_REQUIRE_TOKEN, msg => log('warn', msg))
+log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
   try {
     if (!req.url) { res.writeHead(404).end('not found'); return }
@@ -1659,6 +1668,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           catch { return 0 }
         })(),
         pid: process.pid,
+        mcp_auth: mcpGate.stats,
       }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify(body))
@@ -1667,6 +1677,13 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
 
     if (u.pathname !== '/mcp') {
       res.writeHead(404, { 'content-type': 'text/plain' }).end('not found — POST to /mcp or GET /healthz\n')
+      return
+    }
+
+    // Loopback token (mcp-auth.ts): every /mcp method — initialize, SSE, DELETE, resumed ids.
+    if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?',
+                       req.headers['user-agent'] as string | undefined)) {
+      res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"loopback MCP token required"}')
       return
     }
 

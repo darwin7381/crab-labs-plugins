@@ -2,7 +2,8 @@
   "mcpServers": {
     "agent-inbox": {
       "type": "http",
-      "url": "http://127.0.0.1:${AGENT_INBOX_PORT}/mcp?v=agent-inbox"
+      "url": "http://127.0.0.1:${AGENT_INBOX_PORT}/mcp?v=agent-inbox",
+      "headersHelper": "\"${CLAUDE_PLUGIN_ROOT}/mcp-auth-header.sh\""
     }
   }
 }

@@ -1,3 +1,19 @@
+## 1.26.0 — 2026-10-20
+
+- **Loopback MCP token on `/mcp` (Epeius btcc 5964, from Hephaestus's WO-22 confused-deputy point).**
+  - **The gap.** The daemon binds 127.0.0.1, but on a shared host that isn't a boundary. Another local uid, or a container in the host's network namespace, could open `/mcp`. The daemon would then act as its agent: `send_to_agent` signed with the agent's mesh credential, replies sent as its bot. This was measured live: on txmonster, `homeassistant` and `hq-console` run with `network_mode: host` and reach steropes' daemons.
+  - **The token.** Each daemon keeps a token in `~/.claude/agent-inbox/mcp-tokens/<port>` (dir 0700, file 0600; override the location with `MCP_TOKEN_DIR`). It survives restarts, so live clients reconnect without trouble.
+  - **How the TUI presents it.** `.mcp.json` now has `headersHelper: ${CLAUDE_PLUGIN_ROOT}/mcp-auth-header.sh`. Claude Code runs the helper on every connect and reconnect, and again after a 401/403. The helper reads the token file for the port in `CLAUDE_CODE_MCP_SERVER_URL`. No manifest or env changes are needed.
+  - **Report-first by default.** `/mcp` without the token is still allowed, but it is counted in `/healthz` → `mcp_auth` (`unauthenticated`, `last_unauth_at`, `last_unauth_ua`) and logged at most once a minute.
+  - **`MCP_REQUIRE_TOKEN=1`** (machine config) refuses such requests with 403. If the token can't be created at all, every `/mcp` request is refused, with a loud error.
+  - **Scope.** `/inject` and `/healthz` are unchanged; they have their own auth.
+  - **Rollout.** Ship the plugin, then run `claude plugin update` on each machine; the TUI reads `.mcp.json` from the plugin cache. TUIs restart in the wave. Once `last_unauth_at` stays older than the wave on every daemon, flip `MCP_REQUIRE_TOKEN=1` per machine. Since 1.25.2 a fast daemon restart resumes sessions.
+- `plugin.json` version is aligned with `package.json` (1.26.0) so that `claude plugin update` refreshes the cached copy. The cache had been pinned at 1.0.0 since May.
+- Tests 48/48 (mcp-auth +5). Throwaway daemon checks:
+  - Report-first: a request without the token gets 200 and is counted; a request with the token from the helper gets 200.
+  - Required: no token → 403, wrong token → 403, helper token → 200, SSE GET without a token → 403, `/healthz` still 200.
+  - The token is reused across a restart.
+
 ## 1.25.3 — 2026-10-20
 
 - **Refused mail is filed for Joey's review, not only logged (Joey TG 6772).** BTCC now has a suspicious-message mailbox (Messenger → 可疑訊息審核箱), and BTCC `/api/comms/send` holds unverified senders there instead of delivering them. The daemon now feeds the same mailbox:

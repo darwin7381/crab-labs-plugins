@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.14.0 — 2026-10-20
+
+- **Loopback MCP token on `/mcp`.** Same mechanism as telegram-http 1.26.0 (see its changelog). A per-port token lives in `~/.claude/agent-inbox/mcp-tokens/<port>`. The TUI presents it through `headersHelper` (`mcp-auth-header.sh`). Mode is report-first unless `MCP_REQUIRE_TOKEN=1`, and `/healthz` gains `mcp_auth`. This closes the hole where another uid or a host-network container could reply as this Discord bot.
+- `plugin.json` version is aligned (1.14.0) so that `claude plugin update` refreshes the cached `.mcp.json`. Tests 8/8.
+
 ## 1.13.6 — 2026-10-19
 
 - **No deployment-specific defaults (chiron 5630)**: same machine-config loader as telegram-http 1.24.14 (`fleet-config.ts`, `~/.config/crab-labs-plugins/env`, plist env wins). `CHANNEL_BOT_WRAPPER_LABEL` has no built-in default any more; unset → `/restart` reports it cannot confirm a respawn instead of kickstarting a guessed label. Docs no longer carry internal links or launchd labels.
