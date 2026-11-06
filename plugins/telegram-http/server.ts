@@ -1169,6 +1169,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // receiver can quote-reply to this message (Telegram reply_to semantics)
   let msgId: number | undefined
   let opWarn = ''
+  let held = ''
   if (BTCC_API_BASE) try {
     const lr = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
       method: 'POST',
@@ -1176,6 +1177,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
         ...meshAuth(),
+        // one thing, one owner (Joey TG 970): we honour BTCC's hold, so BTCC may hold us (409)
+        'X-Mesh-Fanout': '1',
       },
       body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
       signal: AbortSignal.timeout(6000),
@@ -1184,8 +1187,14 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
       const j = await lr.json().catch(() => ({})) as { id?: number; warning?: string }
       if (typeof j.id === 'number') msgId = j.id
       if (opRef && typeof j.warning === 'string') opWarn = j.warning
+    } else if (lr?.status === 409) {
+      const j = await lr.json().catch(() => ({})) as { held?: string; detail?: string }
+      if (j.held === 'fanout') held = j.detail || 'held: the same thing already went to two agents — pick one owner.'
     }
   } catch {}
+  // BTCC held it (the same thing from you already reached two agents in the last 30 min): deliver nothing.
+  // BTCC unreachable is not a hold — delivery goes on as before.
+  if (held) return `send held — nothing was sent to ${target}. ${held}`
   let delivery = 'failed'
   let detail = ''
   try {

@@ -1,3 +1,11 @@
+## 1.27.2 — 2026-11-06
+
+- **`send_to_agent` honours BTCC's "one thing, one owner" hold (Joey TG 970; Chiron btcc 8525; Epeius).** Agents were broadcasting the same rule or task to the whole fleet, and simple tasks pulled in five or more agents (the LlamaCard mailing). BTCC now holds the same thing from one sender going to a third agent within 30 minutes. Same thing means character-trigram similarity ≥ 0.6, or the same `reply_to` thread. The sender is told to pick one owner.
+  - **Sender side:** the pre-delivery `POST /api/comms/log` now carries `X-Mesh-Fanout: 1` ("I honour a hold"). On `409 {"held":"fanout"}` nothing is delivered, and the tool result is `send held — nothing was sent to <agent>. <BTCC's note>`.
+  - **Fail-open:** BTCC unreachable, or any non-409 error, is not a hold; delivery goes on as before. Messages to Joey are never held, and neither are system identities.
+  - **Needs:** BTCC e524de0+ (`MESH_FANOUT_GATE`, default on; `dry` / `off` to stop it). An older BTCC ignores the header.
+  - agent-inbox runs this same `server.ts` (1.1.2). Tested end to end: a throwaway daemon with fake recipients against prod BTCC delivered two and held the third.
+
 ## 1.27.1 — 2026-11-06
 
 - **MCP server instructions fit Claude Code's 2048-character cap (Chiron btcc 8593/8594).** Claude Code keeps only the first 2048 characters of a server's `instructions` and drops the rest without an error. Both blocks were over it: the agent-inbox block (4,933 chars) cut off in the middle of the peer-override exception, so no agent ever received the disclosure/secrecy exception, the verified/forged trust levels, challenge-don't-defer or the no_reply closing rule; the Telegram block (2,793 chars) cut off at "for attach…", losing the react/edit_message notes, "edits don't push, send a new reply when a long task completes", the no-history note and the /telegram:access prompt-injection refusal.

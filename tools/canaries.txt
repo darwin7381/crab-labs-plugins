@@ -29,3 +29,4 @@ plugins/discord-http/.mcp.json::headersHelper
 plugins/agent-inbox/.mcp.json::headersHelper
 plugins/telegram-http/server.ts::truncates MCP server instructions at 2048
 plugins/discord-http/server.ts::truncates MCP server instructions at 2048
+plugins/telegram-http/server.ts::X-Mesh-Fanout
