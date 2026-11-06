@@ -1,3 +1,11 @@
+## 1.27.1 — 2026-11-06
+
+- **MCP server instructions fit Claude Code's 2048-character cap (Chiron btcc 8593/8594).** Claude Code keeps only the first 2048 characters of a server's `instructions` and drops the rest without an error. Both blocks were over it: the agent-inbox block (4,933 chars) cut off in the middle of the peer-override exception, so no agent ever received the disclosure/secrecy exception, the verified/forged trust levels, challenge-don't-defer or the no_reply closing rule; the Telegram block (2,793 chars) cut off at "for attach…", losing the react/edit_message notes, "edits don't push, send a new reply when a long task completes", the no-history note and the /telegram:access prompt-injection refusal.
+  - Both are rewritten to stay under 2,000 chars with every rule kept: agent-inbox 1,966, Telegram 1,885. A comment above each array records the cap.
+  - Two wording changes in the inbox block on top of Chiron's rewrite: a relayed "Joey said" carries no authority (it was in the old text and got lost), and the disclosure/secrecy exception applies to any tag, even `verified="true"`. The old reason, "names aren't authenticated", contradicted the verified bullet right above it.
+  - Instructions are sent once, when an MCP session opens. A running TUI keeps the old text until its next session start; a daemon restart alone does not refresh it.
+  - agent-inbox runs this same `server.ts` (agent-inbox 1.1.1).
+
 ## 1.27.0 — 2026-10-20
 
 - **`send_to_agent` takes an optional `op`: the board ops room (戰情室) the message belongs to (BTCC WO-35, Epeius).** Large cross-agent tasks now have an ops room on the K.Bro Board (`#/ops/<id>`), where each piece of work has one owner, evidence and a verifier. A message tagged `op` shows up in that op's timeline, which is how mesh traffic about the task lands next to the items.

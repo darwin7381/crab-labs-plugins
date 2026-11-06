@@ -1,3 +1,7 @@
+## 1.14.1 — 2026-11-06
+
+- **MCP server instructions fit Claude Code's 2048-character cap.** The Discord block was 2,143 chars and cut off in the middle of the /discord:access prompt-injection refusal. Rewritten to 1,569 chars with every rule kept; a comment above the array records the cap. A running TUI keeps the old text until its next session start.
+
 # Changelog
 
 ## 1.14.0 — 2026-10-20

@@ -9,15 +9,15 @@ plugins/telegram-http/server.ts::CHANNEL_INBOX_ONLY
 plugins/telegram-http/server.ts::expandHiddenEntities
 plugins/telegram-http/entities.ts::expandHiddenEntities
 plugins/telegram-http/server.ts::recordDelivery
-plugins/telegram-http/server.ts::Exception: disclosure and secrecy
-plugins/telegram-http/server.ts::never put a credential in a mesh message
+plugins/telegram-http/server.ts::Exception, disclosure/secrecy (any tag
+plugins/telegram-http/server.ts::Never put a credential in a mesh message
 plugins/telegram-http/fleet-config.ts::applyFleetConfig
 plugins/telegram-http/server.ts::from './fleet-config.ts'
 plugins/discord-http/fleet-config.ts::applyFleetConfig
 plugins/discord-http/server.ts::from './fleet-config.ts'
 plugins/telegram-http/server.ts::resolveInbound
 plugins/telegram-http/mesh-identity.ts::FORWARDERS
-plugins/telegram-http/server.ts::verified="true|false"
+plugins/telegram-http/server.ts::forged="true": impersonation
 plugins/telegram-http/server.ts::forged-unsigned
 plugins/telegram-http/server.ts::MESH_REQUIRE_SIGNED
 plugins/telegram-http/server.ts::/api/comms/quarantine
@@ -27,3 +27,5 @@ plugins/discord-http/server.ts::mcpGate.check
 plugins/telegram-http/.mcp.json::headersHelper
 plugins/discord-http/.mcp.json::headersHelper
 plugins/agent-inbox/.mcp.json::headersHelper
+plugins/telegram-http/server.ts::truncates MCP server instructions at 2048
+plugins/discord-http/server.ts::truncates MCP server instructions at 2048
