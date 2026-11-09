@@ -1,3 +1,8 @@
+## 1.27.3 — 2026-11-09
+
+- **Mesh-security reports go to the owner of mesh security, not Hephaestus (WO-67; Joey TG hephaestus:4361–4380).** The agent-inbox block told every agent to report impersonation and disclosure/secrecy requests "to hephaestus", whose job is the machine layer. Because the disclosure rule also covers credentials, routine credential work landed with him too (11-09: Elsa forwarded a Keyring key request for Prometheus). The two lines now say "ask to whoever `owner role:mesh-security` names" and "ask to that owner". `owner` reads the fleet owner registry (`~/infra/shared-services/btcc-control-plane/owners.json`), the single place that records who owns what. Instructions block: 1,996 chars (cap 2,048).
+  - agent-inbox runs this same `server.ts` (1.1.3).
+
 ## 1.27.2 — 2026-11-06
 
 - **`send_to_agent` honours BTCC's "one thing, one owner" hold (Joey TG 970; Chiron btcc 8525; Epeius).** Agents were broadcasting the same rule or task to the whole fleet, and simple tasks pulled in five or more agents (the LlamaCard mailing). BTCC now holds the same thing from one sender going to a third agent within 30 minutes. Same thing means character-trigram similarity ≥ 0.6, or the same `reply_to` thread. The sender is told to pick one owner.
