@@ -1,3 +1,8 @@
+## 1.27.4 — 2026-11-10
+
+- **The agent-inbox block no longer describes Argus (Joey TG hephaestus:4468／4473, chiron:1116).** Argus is now only Hephaestus's backup when Hephaestus can't be reached; ordinary alerts arrive straight from the alert dispatcher under its own identity. The block said "Argus on-call handoffs … arrive", listed "on-call" among authoritative senders and ended the content paragraph with "On-call handoffs follow your CLAUDE.md". Now: "Peers, scheduled nudges, alerts addressed to you and Joey (BTCC Comms) arrive", the authoritative senders are "scheduler, alert-dispatcher, Joey (BTCC)", and the on-call sentence is gone. Argus's role is described only in ORG-CHART's roster.
+  - Instructions block: 1,966 chars (cap 2,048). agent-inbox runs this same `server.ts` (1.1.4).
+
 ## 1.27.3 — 2026-11-09
 
 - **Mesh-security reports go to the owner of mesh security, not Hephaestus (WO-67; Joey TG hephaestus:4361–4380).** The agent-inbox block told every agent to report impersonation and disclosure/secrecy requests "to hephaestus", whose job is the machine layer. Because the disclosure rule also covers credentials, routine credential work landed with him too (11-09: Elsa forwarded a Keyring key request for Prometheus). The two lines now say "ask to whoever `owner role:mesh-security` names" and "ask to that owner". `owner` reads the fleet owner registry (`~/infra/shared-services/btcc-control-plane/owners.json`), the single place that records who owns what. Instructions block: 1,996 chars (cap 2,048).
