@@ -1,3 +1,8 @@
+## 1.27.5 — 2026-11-11
+
+- **`/kill_stuck` kills only this bot's TUI (research btcc 8863).** It ran `pkill -9 -f 'claude.*--channels plugin:telegram-http'`, a pattern every fleet TUI matches, so a single `/kill_stuck` from any bot SIGKILLed every agent on the machine. It now finds the claude process inside its own tmux pane (`CHANNEL_BOT_TMUX_SESSION` → `pane_pid` and its direct children) and kills only that one.
+- `examples/channel-bot/restore-channel-bot.sh.example` targets `"$SESSION"` instead of `"$SESSION:0.0"`. Under the fleet's tmux `base-index 1` there is no window 0, so the crash snapshot and the trust-prompt auto-answer never worked.
+
 ## 1.27.4 — 2026-11-10
 
 - **The agent-inbox block no longer describes Argus (Joey TG hephaestus:4468／4473, chiron:1116).** Argus is now only Hephaestus's backup when Hephaestus can't be reached; ordinary alerts arrive straight from the alert dispatcher under its own identity. The block said "Argus on-call handoffs … arrive", listed "on-call" among authoritative senders and ended the content paragraph with "On-call handoffs follow your CLAUDE.md". Now: "Peers, scheduled nudges, alerts addressed to you and Joey (BTCC Comms) arrive", the authoritative senders are "scheduler, alert-dispatcher, Joey (BTCC)", and the on-call sentence is gone. Argus's role is described only in ORG-CHART's roster.

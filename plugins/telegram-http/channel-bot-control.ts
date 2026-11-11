@@ -1002,17 +1002,28 @@ export async function ensureWrapperSystemd(killExit: number): Promise<string> {
   return `wrapper (${unit}) 剛才沒在跑，已重新拉起`
 }
 
-/** pkill -9 on claude TUI matching the channel-bot args. */
+/** kill -9 THIS bot's claude TUI only: the claude process in its own tmux pane.
+ *  2026-11-11 (research btcc 8863): this used `pkill -9 -f 'claude.*--channels plugin:telegram-http'`,
+ *  a pattern every fleet TUI matches, so one /kill_stuck SIGKILLed every agent on the machine. */
 async function killStuckClaude(): Promise<{ killed: number }> {
-  // Match only claude TUIs with our plugin name to avoid hitting unrelated.
-  const { exitCode } = await runCommand([
-    'pkill',
-    '-9',
-    '-f',
-    'claude.*--channels plugin:telegram-http',
-  ])
-  // pkill exit 0 = at least one match; 1 = no match (already dead); >1 = error.
-  return { killed: exitCode === 0 ? 1 : 0 }
+  if (!TMUX_SESSION) throw new Error('CHANNEL_BOT_TMUX_SESSION is not set — no TUI to target')
+  const panes = await runCommand(['tmux', 'list-panes', '-t', TMUX_SESSION, '-F', '#{pane_pid}'], 5000)
+  if (panes.exitCode !== 0) return { killed: 0 } // session gone: the wrapper is already respawning
+  const panePids = panes.stdout.split('\n').map((s) => s.trim()).filter(Boolean)
+  // claude is either the pane process itself or a direct child of the pane's shell
+  const candidates = [...panePids]
+  for (const p of panePids) {
+    const kids = await runCommand(['pgrep', '-P', p], 5000)
+    candidates.push(...kids.stdout.split('\n').map((s) => s.trim()).filter(Boolean))
+  }
+  let killed = 0
+  for (const pid of candidates) {
+    const ps = await runCommand(['ps', '-o', 'command=', '-p', pid], 5000)
+    if (!/claude/.test(ps.stdout)) continue
+    const k = await runCommand(['kill', '-9', pid], 5000)
+    if (k.exitCode === 0) killed++
+  }
+  return { killed }
 }
 
 // ---- claude session discovery (for /resume_list, /resume_previous) -------

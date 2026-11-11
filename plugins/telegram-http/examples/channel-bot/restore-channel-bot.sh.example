@@ -159,7 +159,7 @@ check_mcp_orphan() {
 snapshot_pane() {
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then return; fi
   local crash_file="$CRASH_DIR/$(date '+%Y%m%d-%H%M%S').log"
-  if tmux capture-pane -pt "$SESSION:0.0" -S -5000 > "$crash_file" 2>/dev/null; then
+  if tmux capture-pane -pt "$SESSION" -S -5000 > "$crash_file" 2>/dev/null; then
     log "captured pane scrollback to $crash_file"
     ls -t "$CRASH_DIR"/*.log 2>/dev/null | tail -n +"$((CRASH_KEEP + 1))" | xargs rm -f 2>/dev/null || true
   fi
@@ -178,7 +178,7 @@ start_claude() {
 
   # First-run trust prompt (idempotent — skipped on subsequent restarts).
   local pane_out
-  pane_out=$(tmux capture-pane -pt "$SESSION:0.0" 2>/dev/null || echo "")
+  pane_out=$(tmux capture-pane -pt "$SESSION" 2>/dev/null || echo "")
   if echo "$pane_out" | grep -q "trust this folder"; then
     log "trust prompt detected, confirming..."
     tmux send-keys -t "$SESSION" Enter
