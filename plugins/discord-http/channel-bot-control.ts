@@ -471,13 +471,16 @@ const SHARED_TUI_SENDABLE_WITH_ARG = new Set(['/model', '/effort'])
  * Values are what gets typed after `/model ` in the claude TUI (alias or full id).
  */
 const DEFAULT_MODEL_CHOICES: Array<{ label: string; value: string }> = [
-  // Fable 5.1 requires CLI >=2.1.251 (fleet on 2.1.259 since 2026-09-03).
-  // Fable 5 row REMOVED (Joey 6392: 同價直升、舊版全面退場 — Fable 一律 5.1).
-  { label: '✨ Fable 5.1', value: 'claude-fable-5-1' },
-  // Opus 5 → 5.5 (Joey 6414), mirror of telegram-http; needs CLI >=2.1.281.
+  // 2026-11-12 (Joey TG 7059 "Fable都出到5.2了"): the current line-up per
+  // platform.claude.com models overview = Fable 5.2 / Opus 5.5 / Sonnet 5.5 /
+  // Haiku 5.5, each row replacing its older version (Joey 6392/6414 logic).
+  // Fable 5.2 needs CLI >=2.1.321 (2.1.281 answers "unrecognized_model"),
+  // Haiku 5.5 >=2.1.293, Sonnet 5.5 >=2.1.284; fleet moved to 2.1.322.
+  // Older ids stay reachable by typing `/model <id>`.
+  { label: '✨ Fable 5.2', value: 'claude-fable-5-2' },
   { label: '🏺 Opus 5.5', value: 'claude-opus-5-5' },
-  { label: '🎼 Sonnet 5', value: 'claude-sonnet-5' },
-  { label: '⚡ Haiku 4.5', value: 'claude-haiku-4-5-20251001' },
+  { label: '🎼 Sonnet 5.5', value: 'claude-sonnet-5-5' },
+  { label: '⚡ Haiku 5.5', value: 'claude-haiku-5-5' },
   { label: '↩️ Default（回 TUI 預設）', value: 'default' },
 ]
 

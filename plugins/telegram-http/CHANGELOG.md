@@ -1,3 +1,7 @@
+## 1.27.6 — 2026-11-12
+
+- **`/model` picker shows the current models (Joey TG 7059 "Fable都出到5.2了").** The list was Fable 5.1 / Opus 5.5 / Sonnet 5 / Haiku 4.5. It is now **Fable 5.2 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5**, matching platform.claude.com's models overview, with each row replacing its older version. Fable 5.2 needs Claude Code ≥ 2.1.321: on 2.1.281 the TUI answers `unrecognized_model`. The fleet moved to 2.1.322 the same day. Older ids still work when typed as `/model <id>`.
+
 ## 1.27.5 — 2026-11-11
 
 - **`/kill_stuck` kills only this bot's TUI (research btcc 8863).** It ran `pkill -9 -f 'claude.*--channels plugin:telegram-http'`, a pattern every fleet TUI matches, so a single `/kill_stuck` from any bot SIGKILLed every agent on the machine. It now finds the claude process inside its own tmux pane (`CHANNEL_BOT_TMUX_SESSION` → `pane_pid` and its direct children) and kills only that one.

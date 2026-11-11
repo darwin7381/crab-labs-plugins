@@ -1,3 +1,7 @@
+## 1.14.2 — 2026-11-12
+
+- **`/model` picker shows the current models (Joey TG 7059 "Fable都出到5.2了").** The list was Fable 5.1 / Opus 5.5 / Sonnet 5 / Haiku 4.5. It is now **Fable 5.2 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5**, matching platform.claude.com's models overview, with each row replacing its older version. Fable 5.2 needs Claude Code ≥ 2.1.321: on 2.1.281 the TUI answers `unrecognized_model`. The fleet moved to 2.1.322 the same day. Older ids still work when typed as `/model <id>`.
+
 ## 1.14.1 — 2026-11-06
 
 - **MCP server instructions fit Claude Code's 2048-character cap.** The Discord block was 2,143 chars and cut off in the middle of the /discord:access prompt-injection refusal. Rewritten to 1,569 chars with every rule kept; a comment above the array records the cap. A running TUI keeps the old text until its next session start.
