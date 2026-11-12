@@ -1,3 +1,10 @@
+## 1.14.4 — 2026-11-13
+
+- **`/effort` no longer changes the effort of every other agent on the machine.** Same bug and same fix as telegram-http 1.27.8 (see its entry for the CLI evidence). claude's `/effort` saves the level in the global `~/.claude/settings.json` as `modelSettings["<model>"].effortLevel`, so every TUI on the machine running that model inherited it. With scope=session (the default; opt out with `CHANNEL_BOT_MODEL_SCOPE=global`), the plugin snapshots `effortLevel` and `modelSettings` before it types `/effort`, and writes the effort fields back after the switch: on ✅, and also when it is unconfirmed or errors. Entries the TUI created are removed again, not left as `{}`. Other keys are not touched. The write is atomic (temp file + rename, mode kept).
+  - This copy has never restored the global `model` after `/model` (telegram-http has since 1.12.x); that is unchanged here. Only `/effort` is scoped.
+  - **`/effort auto` is confirmed** from the transcript ("Effort level set to auto") instead of timing out after 45 s with the key deleted.
+  - Tests: `effort-scope.test.ts`, kept in sync with telegram-http's minus its picker cases (Discord has no bare-`/effort` picker). 32/32.
+
 ## 1.14.3 — 2026-11-12
 
 - **`/kill_stuck` kills only this bot's own TUI.** It ran `pkill -9 -f 'claude.*--channels plugin:discord-http'`: every TUI that loads discord-http matches that pattern, so one `/kill_stuck` from Discord could SIGKILL every such agent on the machine. telegram-http fixed the same bug in 1.27.5 (research btcc 8863); this copy was missed. It now kills only the claude process in its own tmux pane (`ownClaudePids()`, shared with `/status`).

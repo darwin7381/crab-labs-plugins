@@ -1,0 +1,40 @@
+{
+  "cleanupPeriodDays": 3650,
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
+  "skillListingBudgetFraction": 0.02,
+  "env": {
+    "EXAMPLE_FLAG": "1"
+  },
+  "model": "opus",
+  "hooks": {},
+  "statusLine": {
+    "type": "command",
+    "command": "echo status"
+  },
+  "enabledPlugins": {
+    "example@marketplace": true
+  },
+  "extraKnownMarketplaces": {},
+  "effortLevel": "xhigh",
+  "modelSettings": {
+    "claude-opus-5-5": {
+      "effortLevel": "xhigh"
+    },
+    "claude-fable-5-2": {
+      "effortLevel": "xhigh"
+    },
+    "claude-sonnet-5-5": {
+      "effortLevel": "xhigh"
+    },
+    "claude-haiku-5-5": {
+      "effortLevel": "xhigh"
+    }
+  },
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "switchModelsOnFlag": false,
+  "remoteControlAtStartup": false,
+  "agentPushNotifEnabled": true,
+  "autoUpdates": false
+}

@@ -59,3 +59,10 @@ test('transcript: /effort works the same way', () => {
   const recs = [cmdRec('2026-11-12T05:02:13.049Z', '/effort', 'high'), outRec('2026-11-12T05:02:13.049Z', 'Set effort level to high')]
   expect(transcriptConfirmsSwitch(recs, '/effort', 'high', 0)).toBe('Set effort level to high')
 })
+
+test('transcript: /effort auto ("Effort level set to auto") confirms; /model never takes that line', () => {
+  const recs = [cmdRec('2026-11-12T16:26:14.921Z', '/effort', 'auto'), outRec('2026-11-12T16:26:14.921Z', 'Effort level set to auto')]
+  expect(transcriptConfirmsSwitch(recs, '/effort', 'auto', 0)).toBe('Effort level set to auto')
+  const odd = [cmdRec('2026-11-12T16:26:14.921Z', '/model', 'auto'), outRec('2026-11-12T16:26:14.921Z', 'Effort level set to auto')]
+  expect(transcriptConfirmsSwitch(odd, '/model', 'auto', 0)).toBeNull()
+})

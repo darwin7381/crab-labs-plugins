@@ -78,3 +78,17 @@ a switch that had not happened (bitten in lab 2026-07-10). Rules: count `Set mod
 occurrences BEFORE typing and only accept an INCREASE as pane evidence; for `/model <id>`
 prefer the filesystem signal (`~/.claude/settings.json` `model` flips the moment the switch
 applies — claude persists the choice globally).
+
+## 9. (2.1.322) `/effort` saves a per-model default in the GLOBAL settings.json
+
+`/effort <level>` writes `modelSettings["<canonical model>"].effortLevel` in
+`~/.claude/settings.json`, which every TUI on the machine reads. A TUI on that model with no
+`/effort` of its own inherits the level on its next settings reload. `max` is session-only and
+writes nothing. `auto` deletes the key and leaves `"<model>": {}`. `/model <id>` writes only
+`model`. The level picked in a session lives in memory and survives a settings change until
+the model changes. Since 1.27.8 the plugin puts the effort fields back after the switch
+(scope=session); see CHANGELOG 1.27.8.
+
+The settings file therefore no longer says what a session runs. The effort a session actually
+sent is the `effort` field on its assistant records in the transcript. `/effort auto` answers
+`Effort level set to auto`, not a `Set …` line.

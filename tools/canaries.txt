@@ -36,3 +36,12 @@ plugins/discord-http/channel-bot-control.ts::for (const pid of await ownClaudePi
 plugins/telegram-http/channel-bot-control.ts::transcriptConfirmsSwitch(readJsonlTail(transcriptPath
 plugins/discord-http/channel-bot-control.ts::transcriptConfirmsSwitch(readJsonlTail(transcriptPath
 plugins/telegram-http/channel-bot-control.ts::setLineAfterEcho(pane2, full)
+# /effort session scope (telegram-http 1.27.8 / discord-http 1.14.4): snapshot before typing,
+# restore on confirm AND on the unconfirmed/error paths; the picker reads the transcript.
+plugins/telegram-http/channel-bot-control.ts::effortSnap = readGlobalEffortSnapshot()
+plugins/discord-http/channel-bot-control.ts::effortSnap = readGlobalEffortSnapshot()
+plugins/telegram-http/channel-bot-control.ts::scopeNote = effortScopeNote(restoreGlobalEffort(effortSnap), value)
+plugins/discord-http/channel-bot-control.ts::scopeNote = effortScopeNote(restoreGlobalEffort(effortSnap), value)
+plugins/telegram-http/channel-bot-control.ts::effortFailureNote(restoreGlobalEffort(effortSnap))
+plugins/discord-http/channel-bot-control.ts::effortFailureNote(restoreGlobalEffort(effortSnap))
+plugins/telegram-http/channel-bot-control.ts::await detectCurrentEffort(projectsDirOverride, tmuxName)

@@ -37,8 +37,11 @@
  * this for an unauthenticated message.
  */
 
-import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  readdirSync, readFileSync, statSync, existsSync, writeFileSync, openSync, readSync, closeSync,
+  writeSync, fsyncSync, renameSync, unlinkSync, realpathSync,
+} from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 
@@ -207,7 +210,10 @@ export function transcriptConfirmsSwitch(recs: unknown[], cmd: string, value: st
       continue
     }
     if (ts >= ranAt && t.includes('<local-command-stdout>')) {
-      const m = /Set (model|effort)[^<\n]*/.exec(t)
+      // `/effort auto` answers "Effort level set to auto", not a Set line (1.14.4, KEEP IN SYNC:
+      // unrecognised, it ran the full watch window — and kept the global effort key
+      // deleted — before reporting ⚠️ unconfirmed).
+      const m = /Set (model|effort)[^<\n]*/.exec(t) ?? (cmd === '/effort' ? /Effort level set to auto[^<\n]*/.exec(t) : null)
       if (m) return m[0].replace(/`/g, '')
       return null  // ran, but the output is not a Set line (e.g. kept the old model)
     }
@@ -251,12 +257,205 @@ function normalizeModelId(v: string): string {
   return v.trim().toLowerCase().replace(/\[[0-9]+m\]$/, '')
 }
 
+/** ~/.claude/settings.json: the user settings every claude TUI on this machine reads. */
+function globalSettingsPath(): string {
+  return join(homedir(), '.claude', 'settings.json')
+}
+
 /** `model` key of ~/.claude/settings.json — what claude TUI's /model persists. */
 function readGlobalDefaultModel(): string | null {
   try {
-    const j = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
+    const j = JSON.parse(readFileSync(globalSettingsPath(), 'utf8'))
     return typeof j?.model === 'string' && j.model ? j.model : null
   } catch { return null }
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/**
+ * Replace a JSON file atomically: write a temp file next to it, fsync, then
+ * rename over it, so another TUI's settings watcher (or claude's own writer)
+ * reads the old file or the new one, never half of one. A symlinked path is
+ * resolved and its target replaced (the link stays). The file mode is kept;
+ * settings.json is 0600 because it carries env secrets, and the temp file is
+ * created with that mode from the start. The format is claude's own
+ * (`JSON.stringify(x, null, 2)` + newline), so keys we did not touch stay
+ * byte-identical.
+ */
+export function writeJsonAtomic(path: string, value: unknown): void {
+  let target = path
+  try { target = realpathSync(path) } catch {}
+  let mode = 0o600
+  try { mode = statSync(target).mode & 0o777 } catch {}
+  const tmp = join(dirname(target), `.${basename(target)}.${process.pid}.${Date.now()}.tmp`)
+  let fd: number | null = null
+  try {
+    fd = openSync(tmp, 'wx', mode)
+    writeSync(fd, JSON.stringify(value, null, 2) + '\n')
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = null
+    renameSync(tmp, target)
+  } catch (err) {
+    if (fd !== null) { try { closeSync(fd) } catch {} }
+    try { unlinkSync(tmp) } catch {}
+    throw err
+  }
+}
+
+// ---- /effort session scope (1.14.4, KEEP IN SYNC with telegram-http 1.27.8) ----
+//
+// claude's /effort saves the level as a machine-wide default (CLI 2.1.322:
+// /effort → Gie → updateSettingsForSource("userSettings", {modelSettings:
+// {[canonical model]: {effortLevel}}}); "max" is session-only and not written,
+// and the top-level `effortLevel` is used only when the canonical model name is
+// an Object.prototype key). Every other TUI on the machine that runs that model
+// and never ran /effort itself then inherits the level. `/model <id>` writes
+// only `model` (sdt → X3t); only the interactive /model menu can write effort,
+// and the plugin never drives that menu.
+//
+// Session scope (the default, same switch as /model: CHANNEL_BOT_MODEL_SCOPE)
+// snapshots the effort fields before typing and writes them back once the
+// switch is confirmed, or on the failure path if the TUI already wrote. The
+// live session keeps its level: claude holds a picked level in memory
+// (sessionEffort kind "level") and drops it only when the model changes.
+
+/** The effort-bearing part of settings.json. `undefined` = the key was absent
+ *  (JSON has no undefined values). `topKeys` / the copied objects keep the key
+ *  order, so a re-added key goes back where it was. */
+export interface EffortSnapshot {
+  effortLevel: unknown
+  modelSettings: unknown
+  topKeys: string[]
+}
+
+export function effortSnapshotOf(settings: Record<string, unknown>): EffortSnapshot {
+  return {
+    effortLevel: Object.hasOwn(settings, 'effortLevel') ? settings.effortLevel : undefined,
+    modelSettings: Object.hasOwn(settings, 'modelSettings') ? structuredClone(settings.modelSettings) : undefined,
+    topKeys: Object.keys(settings),
+  }
+}
+
+/** Reorder `obj`'s keys in place: keys listed in `ref` first, in that order. */
+function reorderLike(obj: Record<string, unknown>, ref: string[]): void {
+  const keys = Object.keys(obj)
+  const ordered = [...ref.filter(k => keys.includes(k)), ...keys.filter(k => !ref.includes(k))]
+  if (ordered.every((k, i) => k === keys[i])) return
+  const vals: Record<string, unknown> = {}
+  for (const k of keys) { vals[k] = obj[k]; delete obj[k] }
+  for (const k of ordered) obj[k] = vals[k]
+}
+
+/** Set `obj[key]` to `want` (`undefined` ⇒ delete). Returns whether it changed. */
+function restoreKey(obj: Record<string, unknown>, key: string, want: unknown, refOrder: string[]): boolean {
+  const has = Object.hasOwn(obj, key)
+  if (want === undefined) {
+    if (!has) return false
+    delete obj[key]
+    return true
+  }
+  if (has && JSON.stringify(obj[key]) === JSON.stringify(want)) return false
+  obj[key] = structuredClone(want)
+  if (!has) reorderLike(obj, refOrder)
+  return true
+}
+
+const showEffort = (v: unknown): string => (v === undefined ? '(移除)' : String(v))
+
+/**
+ * Put every effort field of `settings` back to `snap`, in place. Only
+ * `effortLevel` keys are compared (top level and inside each modelSettings
+ * entry); other keys of an entry (maxEffortLevel, autoCompactWindow) and the
+ * rest of settings.json are left alone. An entry or a `modelSettings` map that
+ * did not exist in the snapshot is removed again once empty instead of being
+ * left as `{}`. Returns what changed, as "path → value" strings (empty = no-op).
+ */
+export function restoreEffortFields(settings: Record<string, unknown>, snap: EffortSnapshot): string[] {
+  const changed: string[] = []
+  if (restoreKey(settings, 'effortLevel', snap.effortLevel, snap.topKeys)) {
+    changed.push(`effortLevel → ${showEffort(snap.effortLevel)}`)
+  }
+  const before = isPlainObject(snap.modelSettings) ? snap.modelSettings : undefined
+  const wantFor = (k: string): unknown => {
+    const e = before?.[k]
+    return isPlainObject(e) && Object.hasOwn(e, 'effortLevel') ? e.effortLevel : undefined
+  }
+  const keys = new Set([
+    ...(isPlainObject(settings.modelSettings) ? Object.keys(settings.modelSettings) : []),
+    ...(before ? Object.keys(before) : []),
+  ])
+  for (const k of keys) {
+    const want = wantFor(k)
+    let ms: Record<string, unknown>
+    const curMs = settings.modelSettings
+    if (isPlainObject(curMs)) {
+      ms = curMs
+    } else {
+      // Only an effort field the snapshot had needs a map to live in; a
+      // non-object value is not ours to replace.
+      if (want === undefined || curMs !== undefined) continue
+      ms = {}
+      settings.modelSettings = ms
+      reorderLike(settings, snap.topKeys)
+    }
+    let entry: Record<string, unknown>
+    const curEntry = ms[k]
+    if (isPlainObject(curEntry)) {
+      entry = curEntry
+    } else {
+      if (want === undefined || curEntry !== undefined) continue
+      entry = {}
+      ms[k] = entry
+      reorderLike(ms, before ? Object.keys(before) : [])
+    }
+    const prevEntry = before?.[k]
+    const ref = isPlainObject(prevEntry) ? Object.keys(prevEntry) : []
+    if (restoreKey(entry, 'effortLevel', want, ref)) changed.push(`modelSettings.${k}.effortLevel → ${showEffort(want)}`)
+    if (Object.keys(entry).length === 0 && !(before && Object.hasOwn(before, k))) {
+      delete ms[k]
+      changed.push(`modelSettings.${k} → (移除空項)`)
+    }
+  }
+  const finalMs = settings.modelSettings
+  if (isPlainObject(finalMs) && Object.keys(finalMs).length === 0 && snap.modelSettings === undefined) {
+    delete settings.modelSettings
+    changed.push('modelSettings → (移除空項)')
+  }
+  return changed
+}
+
+/** Effort snapshot of the global settings.json. A missing file is an empty
+ *  snapshot; an unreadable or invalid one is null (then nothing is restored). */
+export function readGlobalEffortSnapshot(p: string = globalSettingsPath()): EffortSnapshot | null {
+  let raw: string
+  try {
+    raw = readFileSync(p, 'utf8')
+  } catch (err) {
+    return (err as { code?: string })?.code === 'ENOENT'
+      ? { effortLevel: undefined, modelSettings: undefined, topKeys: [] }
+      : null
+  }
+  try {
+    const j = JSON.parse(raw)
+    return isPlainObject(j) ? effortSnapshotOf(j) : null
+  } catch { return null }
+}
+
+/** Put the global effort fields back to `snap`; writes (atomically) only when
+ *  something differs. Never throws. */
+export function restoreGlobalEffort(snap: EffortSnapshot, p: string = globalSettingsPath()): { ok: boolean; changed: string[]; error?: string } {
+  try {
+    if (!existsSync(p)) return { ok: true, changed: [] }
+    const j = JSON.parse(readFileSync(p, 'utf8'))
+    if (!isPlainObject(j)) return { ok: false, changed: [], error: 'settings.json is not a JSON object' }
+    const changed = restoreEffortFields(j, snap)
+    if (changed.length > 0) writeJsonAtomic(p, j)
+    return { ok: true, changed }
+  } catch (err) {
+    return { ok: false, changed: [], error: err instanceof Error ? err.message : String(err) }
+  }
 }
 
 /** Where we remember the last CONFIRMED /model switch (per-daemon). */
@@ -326,6 +525,35 @@ export function detectCurrentModel(projectsDirOverride?: string): { id: string; 
 }
 
 /**
+ * Session scope for /effort (KEEP IN SYNC with telegram-http, where the same
+ * switch also scopes /model). Default: claude's global effort write is put back
+ * after the switch. Opt out with CHANNEL_BOT_MODEL_SCOPE=global. This Discord
+ * copy has never restored the global `model` after /model; only /effort is
+ * scoped here.
+ */
+function isModelScopeSession(): boolean {
+  return (process.env.CHANNEL_BOT_MODEL_SCOPE ?? '').trim().toLowerCase() !== 'global'
+}
+
+/** User-facing line for a confirmed /effort under session scope. */
+function effortScopeNote(r: { ok: boolean; changed: string[]; error?: string }, value: string): string {
+  if (!r.ok) {
+    return `\n⚠️ scope=session 還原全域 effort 失敗（${r.error ?? 'unknown'}）— 請手動檢查 ~/.claude/settings.json 的 effortLevel / modelSettings。`
+  }
+  if (r.changed.length === 0) {
+    return `\n🔒 scope=session：全域 settings.json 的 effort 沒有被改動 — \`${value}\` 只用在本 TUI 這個 session。`
+  }
+  return `\n🔒 scope=session：全域 effort 已還原（${r.changed.join('、')}）— 本 TUI 內用 \`${value}\`，其他 agent 不受影響。`
+}
+
+/** Extra line for a failed / unconfirmed /effort: whether we had to undo a write. */
+function effortFailureNote(r: { ok: boolean; changed: string[]; error?: string }): string {
+  if (!r.ok) return `\n⚠️ 還原全域 effort 失敗（${r.error ?? 'unknown'}）— 請手動檢查 ~/.claude/settings.json。`
+  if (r.changed.length === 0) return ''
+  return `\n🔒 TUI 已改了全域 effort，已還原（${r.changed.join('、')}）。`
+}
+
+/**
  * Execute `/model X` or `/effort X` against the TUI reliably, then report the
  * REAL outcome to the user. Designed to be run in the background (caller
  * replies immediately). Never throws — all outcomes end in a notify().
@@ -341,6 +569,10 @@ async function runTuiSwitchCommand(opts: {
   const confirmKeyword = cmd === '/model' ? /Switch model\?/i : /effort/i
   const t0 = Date.now()
   const full = `${cmd} ${value}`
+  // Effort fields of the global settings.json before we typed /effort (session
+  // scope, KEEP IN SYNC with telegram-http 1.27.8). Every exit path after
+  // phase 2 puts them back if the TUI changed them.
+  let effortSnap: EffortSnapshot | null = null
   try {
     // Phase 1 — wait for idle. Typing mid-turn queues the command as a chat
     // message (2.1.206) instead of executing it: the original failure.
@@ -376,6 +608,9 @@ async function runTuiSwitchCommand(opts: {
     // Primary evidence when available: the session transcript (see transcriptConfirmsSwitch).
     const tDir = await transcriptDirFor(tmuxName, projectsDir ?? PROJECTS_DIR)
     const transcriptPath = tDir ? newestJsonl(tDir) : null
+    // Last thing before typing, so the window another writer could fall into is
+    // as short as possible.
+    if (cmd === '/effort' && isModelScopeSession()) effortSnap = readGlobalEffortSnapshot()
     const typedAt = Date.now()
     await tmuxSendKeys(full, tmuxName, true)
 
@@ -458,25 +693,44 @@ async function runTuiSwitchCommand(opts: {
     }
 
     if (confirmed) {
+      let scopeNote = ''
+      if (effortSnap) {
+        scopeNote = effortScopeNote(restoreGlobalEffort(effortSnap), value)
+        effortSnap = null
+      } else if (cmd === '/effort' && isModelScopeSession()) {
+        scopeNote = '\n⚠️ scope=session：切換前讀不到 ~/.claude/settings.json，沒有快照可還原 — 請手動檢查 effortLevel / modelSettings。'
+      }
       if (isModel) saveLastConfirmedSwitch(value)
-      await notify(`✅ \`${full}\` 已生效（${confirmed}${confirmedPicker ? '，切換確認已自動按 Enter' : ''}）`)
+      await notify(`✅ \`${full}\` 已生效（${confirmed}${confirmedPicker ? '，切換確認已自動按 Enter' : ''}）${scopeNote}`)
       if (isModel && prevModel && normalizeModelId(prevModel) !== normalizeModelId(value) && value !== 'default') {
         await notify(
           `⚠️ 注意：claude 的 /model 會把 \`${value}\` 存成整台機器的全域預設（原本是 \`${prevModel}\`）— ` +
           `其他未 pin --model 的 agent 下次重啟會繼承。`,
         )
       }
+      if (cmd === '/effort' && !isModelScopeSession()) {
+        await notify(
+          `⚠️ 注意：CHANNEL_BOT_MODEL_SCOPE=global — claude 的 /effort 把 \`${value}\` 存進全域 settings.json` +
+          `（modelSettings.<model>.effortLevel），這台機器上跑同一模型、沒自己設過 effort 的 agent 都會跟著用。`,
+        )
+      }
     } else {
+      // The TUI may have run the switch (and written settings.json) even though
+      // no evidence reached us in time — put the effort fields back anyway.
+      const effortNote = effortSnap ? effortFailureNote(restoreGlobalEffort(effortSnap)) : ''
+      effortSnap = null
       const pane = await tmuxCapturePane(tmuxName)
       const tail = pane.split('\n').map(l => l.trim()).filter(Boolean).slice(-3).join(' ⏎ ')
       await notify(
         `⚠️ \`${full}\` 已送出，但 ${Math.round((Date.now() - t0) / 1000)}s 內未觀察到生效證據` +
         `（settings.json 未變、TUI 沒有 Set model/effort 回應）。可能 model id 無效或 TUI 狀態異常。\n` +
-        `pane 尾部：${tail.slice(0, 200)}`,
+        `pane 尾部：${tail.slice(0, 200)}${effortNote}`,
       )
     }
   } catch (err) {
-    await notify(`❌ \`${full}\` 執行過程出錯: ${err instanceof Error ? err.message : err}`).catch(() => {})
+    const effortNote = effortSnap ? effortFailureNote(restoreGlobalEffort(effortSnap)) : ''
+    effortSnap = null
+    await notify(`❌ \`${full}\` 執行過程出錯: ${err instanceof Error ? err.message : err}${effortNote}`).catch(() => {})
   }
 }
 
