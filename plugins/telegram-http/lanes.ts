@@ -713,7 +713,9 @@ function startRun(it: QItem): void {
     if (lane.kind === 'fork' && lane.runs === 0 && sessionSeen) {
       lane.session_id = sessionSeen; lane.transcript = join(D.transcriptDir, `${sessionSeen}.jsonl`)
     }
-    lane.runs += 1; lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
+    // a run that died before claude wrote its transcript leaves nothing to --resume: retry fresh
+    if (code === 0 || existsSync(lane.transcript)) lane.runs += 1
+    lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     if (S.threads[lane.thread]) S.threads[lane.thread].tokens += tin
     const names = tools.map(t => t.name.replace(/^mcp__lane__/, 'lane:'))

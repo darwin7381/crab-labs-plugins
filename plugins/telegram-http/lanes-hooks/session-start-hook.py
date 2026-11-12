@@ -47,9 +47,16 @@ def main():
     ok = out and all(v.get('accepted') for v in out.values())
     agent = os.environ.get('LANES_AGENT') or os.path.basename(os.getcwd())
     if ok:
-        ctx = (f'[lanes] 你是 {agent} 的主線（session {p.get("session_id")} 已登記）。'
-               'Telegram 與分流到主線的 mesh 訊息只會送到你這裡；例行警報、排程、別的 agent 的新話題由反射線處理，'
-               '結果在你閒下來時以 user="lanes" 的摘要送達。任務改變時更新焦點卡 .lanes/focus.md。')
+        # The architecture's main-only rules travel with the architecture (this hook), not in the
+        # persona files, so universe 002 runs on exactly the same inhabitant set as universe 001.
+        ctx = '\n'.join([
+            f'[lanes] 你是 {agent} 的主線（session {p.get("session_id")} 已登記）。以下是主線專用規則，車道不適用：',
+            '- Telegram 與分流到主線的 mesh 訊息只會送到你這裡。例行警報、排程、別的 agent 的新話題由反射線（headless 車道）處理；'
+            '它們做了什麼，會在你閒下來時以 user="lanes" 的摘要送達。看完，需要你決定的事就處理（必要時回報 Joey），其他不必回覆。',
+            '- 維護焦點卡 .lanes/focus.md：任務改變時更新，3 到 6 行，寫「目前在做什麼、關鍵限制、別碰什麼」。車道開機時會讀它。',
+            '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Telegram 話題的工作線；fork(task) 開一條帶著你目前脈絡的分身線。',
+            '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。',
+        ])
     else:
         reasons = '; '.join(f'{k}: {v.get("reason")}' for k, v in out.items())
         ctx = (f'[lanes] 注意：你不是 {agent} 的主線（{reasons}）。你不會收到 Telegram 或 mesh 訊息，'
