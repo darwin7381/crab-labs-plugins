@@ -31,4 +31,8 @@ plugins/telegram-http/server.ts::truncates MCP server instructions at 2048
 plugins/discord-http/server.ts::truncates MCP server instructions at 2048
 plugins/telegram-http/server.ts::X-Mesh-Fanout
 plugins/telegram-http/server.ts::owner role:mesh-security
-plugins/telegram-http/channel-bot-control.ts::'list-panes', '-t', TMUX_SESSION
+plugins/telegram-http/channel-bot-control.ts::for (const pid of await ownClaudePids(TMUX_SESSION))
+plugins/discord-http/channel-bot-control.ts::for (const pid of await ownClaudePids(TMUX_SESSION))
+plugins/telegram-http/channel-bot-control.ts::transcriptConfirmsSwitch(readJsonlTail(transcriptPath
+plugins/discord-http/channel-bot-control.ts::transcriptConfirmsSwitch(readJsonlTail(transcriptPath
+plugins/telegram-http/channel-bot-control.ts::setLineAfterEcho(pane2, full)

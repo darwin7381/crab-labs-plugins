@@ -1,3 +1,10 @@
+## 1.14.3 — 2026-11-12
+
+- **`/kill_stuck` kills only this bot's own TUI.** It ran `pkill -9 -f 'claude.*--channels plugin:discord-http'`: every TUI that loads discord-http matches that pattern, so one `/kill_stuck` from Discord could SIGKILL every such agent on the machine. telegram-http fixed the same bug in 1.27.5 (research btcc 8863); this copy was missed. It now kills only the claude process in its own tmux pane (`ownClaudePids()`, shared with `/status`).
+- **`/status` shows this bot's own TUI pid** instead of the first TUI `pgrep -f` listed.
+- **`/model` no longer reports ✅ for a switch that never ran (research btcc 9070).** Same bug and same fix as telegram-http 1.27.7: the session transcript is the primary evidence; the screen check re-checks the picker after 1.2 s and only accepts a Set line under this command's own echo; settings.json counts only when the switch changes it. The confirm picker is now Entered only when it carries this command's keyword (`Switch model?` / `effort`), as telegram-http has done since #9.
+  - Tests: `model-switch.test.ts`, kept in sync with telegram-http's.
+
 ## 1.14.2 — 2026-11-12
 
 - **`/model` picker shows the current models (Joey TG 7059 "Fable都出到5.2了").** The list was Fable 5.1 / Opus 5.5 / Sonnet 5 / Haiku 4.5. It is now **Fable 5.2 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5**, matching platform.claude.com's models overview, with each row replacing its older version. Fable 5.2 needs Claude Code ≥ 2.1.321: on 2.1.281 the TUI answers `unrecognized_model`. The fleet moved to 2.1.322 the same day. Older ids still work when typed as `/model <id>`.

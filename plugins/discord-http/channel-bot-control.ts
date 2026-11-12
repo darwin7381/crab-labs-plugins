@@ -130,11 +130,89 @@ async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string>
 
 // Yes/No confirmation picker detector + auto-confirm. KEEP IN SYNC with telegram-http.
 // Joey 2026-05-26 msg 1696/1700.
-async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION, requiredKeyword?: RegExp): Promise<boolean> {
   const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-25).join('\n')
   if (/Resume session/.test(tail)) return false
-  return /❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail)
+  if (!(/❯\s*1\.\s*Yes/i.test(tail) && /No,\s*go\s*back/i.test(tail))) return false
+  return requiredKeyword ? requiredKeyword.test(tail) : true
+}
+
+/** The "Set model/effort …" line printed under the echo of THIS command
+ *  (`❯ /model X`) in one capture, or null. A stale Set line that a redraw
+ *  brings back sits under an OLDER echo, so it never matches. */
+export function setLineAfterEcho(pane: string, full: string): string | null {
+  const lines = pane.split('\n')
+  let echo = -1
+  for (let i = lines.length - 1; i >= 0 && echo < 0; i--) {
+    if (lines[i].replace(/^\s*❯\s*/, '').trim() === full) echo = i
+  }
+  if (echo < 0) return null
+  for (let i = echo + 1; i < lines.length; i++) {
+    const m = /Set (model|effort)[^\n]*/.exec(lines[i])
+    if (m) return m[0]
+  }
+  return null
+}
+
+/** The projects dir holding the transcript of the claude TUI in `tmuxName`:
+ *  the explicit dir when the caller has one (channel-bot env / roamer target),
+ *  else derived from the pane's cwd the same way claude names project dirs. */
+export async function transcriptDirFor(tmuxName: string, explicitDir?: string): Promise<string | null> {
+  if (explicitDir && existsSync(explicitDir)) return explicitDir
+  if (!tmuxName) return null
+  const r = await runCommand(['tmux', 'display-message', '-p', '-t', `=${tmuxName}:`, '#{pane_current_path}'], 5000)
+  const cwd = r.exitCode === 0 ? r.stdout.trim() : ''
+  if (!cwd) return null
+  const dir = join(homedir(), '.claude', 'projects', cwd.replace(/[/.]/g, '-'))
+  return existsSync(dir) ? dir : null
+}
+
+/** Newest .jsonl in `dir` by mtime (stat only — no content reads). */
+export function newestJsonl(dir: string): string | null {
+  let best: string | null = null
+  let bestMtime = -1
+  try {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.jsonl')) continue
+      try {
+        const m = statSync(join(dir, name)).mtimeMs
+        if (m > bestMtime) { bestMtime = m; best = join(dir, name) }
+      } catch {}
+    }
+  } catch {}
+  return best
+}
+
+/** Ground truth for a TUI switch: claude records an executed local command in
+ *  the session transcript as `<command-name>/model</command-name>` +
+ *  `<command-args>X</command-args>`, followed by a `<local-command-stdout>` that
+ *  carries "Set model/effort …". Timestamps make it immune to screen redraws and
+ *  scrollback (the 2026-11-11 false ✅). Returns the Set text, or null. */
+export function transcriptConfirmsSwitch(recs: unknown[], cmd: string, value: string, sinceMs: number): string | null {
+  const text = (r: any): string => {
+    const c = r?.message?.content
+    if (typeof c === 'string') return c
+    if (Array.isArray(c)) return c.map((x: any) => (typeof x?.text === 'string' ? x.text : '')).join('\n')
+    return ''
+  }
+  let ranAt = -1
+  for (const r of recs as any[]) {
+    if (r?.type !== 'user') continue
+    const ts = Date.parse(r?.timestamp ?? '') || 0
+    if (ts < sinceMs) continue
+    const t = text(r)
+    if (ranAt < 0) {
+      if (t.includes(`<command-name>${cmd}</command-name>`) && t.includes(`<command-args>${value}</command-args>`)) ranAt = ts
+      continue
+    }
+    if (ts >= ranAt && t.includes('<local-command-stdout>')) {
+      const m = /Set (model|effort)[^<\n]*/.exec(t)
+      if (m) return m[0].replace(/`/g, '')
+      return null  // ran, but the output is not a Set line (e.g. kept the old model)
+    }
+  }
+  return null
 }
 
 // (autoConfirmYesNoPicker — the old fire-and-forget picker poll — was removed
@@ -257,8 +335,10 @@ async function runTuiSwitchCommand(opts: {
   value: string
   tmuxName: string
   notify: (msg: string) => Promise<void>
+  projectsDir?: string
 }): Promise<void> {
-  const { cmd, value, tmuxName, notify } = opts
+  const { cmd, value, tmuxName, notify, projectsDir } = opts
+  const confirmKeyword = cmd === '/model' ? /Switch model\?/i : /effort/i
   const t0 = Date.now()
   const full = `${cmd} ${value}`
   try {
@@ -291,8 +371,12 @@ async function runTuiSwitchCommand(opts: {
     // 2026-07-10 — only evidence FRESHER than this baseline may count).
     const setLineRe = /Set (model|effort)[^\n]*/g
     const countSetLines = (pane: string): number => (pane.match(setLineRe) ?? []).length
-    const baselineSetLines = countSetLines(await tmuxCapturePane(tmuxName))
+    let baselineSetLines = countSetLines(await tmuxCapturePane(tmuxName))
     const prevModel = readGlobalDefaultModel()
+    // Primary evidence when available: the session transcript (see transcriptConfirmsSwitch).
+    const tDir = await transcriptDirFor(tmuxName, projectsDir ?? PROJECTS_DIR)
+    const transcriptPath = tDir ? newestJsonl(tDir) : null
+    const typedAt = Date.now()
     await tmuxSendKeys(full, tmuxName, true)
 
     // Phase 3 — watch for outcome. Confirm the Yes/No picker whenever it
@@ -301,17 +385,29 @@ async function runTuiSwitchCommand(opts: {
     // started a turn between the idle check and our keystroke), keep watching
     // until the queue flushes, within the total cap.
     const isModel = cmd === '/model'
-    const wantSettings = isModel && value !== 'default'
+    // settings.json can only PROVE a switch when the switch changes it: if the global
+    // default already equals the target, it matches before the TUI has run anything.
+    const wantSettings = isModel && value !== 'default' &&
+      normalizeModelId(prevModel ?? '') !== normalizeModelId(value)
     let deadline = Date.now() + SWITCH_VERIFY_MS
     let confirmedPicker = false
     let confirmed: string | null = null
     while (Date.now() < deadline && Date.now() - t0 < SWITCH_TOTAL_CAP_MS) {
       await new Promise(r => setTimeout(r, 400))
 
-      if (await isYesNoConfirmPickerOpen(tmuxName)) {
+      // Enter ONLY when the picker carries this command's keyword (telegram-http #9).
+      if (await isYesNoConfirmPickerOpen(tmuxName, confirmKeyword)) {
         await tmuxSendKeys('', tmuxName)  // bare Enter — default cursor is on "Yes"
         confirmedPicker = true
         continue
+      }
+
+      if (transcriptPath) {
+        const hit = transcriptConfirmsSwitch(readJsonlTail(transcriptPath, 80, 1024 * 1024), cmd, value, typedAt - 1000)
+        if (hit) {
+          confirmed = `transcript：「${hit.trim().slice(0, 80)}」`
+          break
+        }
       }
 
       if (wantSettings) {
@@ -329,9 +425,31 @@ async function runTuiSwitchCommand(opts: {
       // a "Set model/effort …" line COUNT above the pre-type baseline — old
       // identical lines in scrollback don't count.
       if (countSetLines(pane) > baselineSetLines) {
-        const all = pane.match(setLineRe) ?? []
-        confirmed = `TUI:「${(all[all.length - 1] ?? '').trim().slice(0, 80)}」`
-        break
+        // KEEP IN SYNC with telegram-http 1.27.7 (research btcc 9070): the screen is the
+        // visible rows only; the redraw that opens the "Switch model?" picker can bring an
+        // OLD Set line back ~0.5s before the picker — a stale line that false-confirmed.
+        await new Promise(r => setTimeout(r, 1200))
+        if (await isYesNoConfirmPickerOpen(tmuxName, confirmKeyword)) {
+          baselineSetLines = countSetLines(await tmuxCapturePane(tmuxName))
+          await tmuxSendKeys('', tmuxName)
+          confirmedPicker = true
+          continue
+        }
+        if (wantSettings) {
+          const cur = readGlobalDefaultModel()
+          if (cur && normalizeModelId(cur) === normalizeModelId(value)) {
+            confirmed = `settings.json → \`${cur}\``
+            break
+          }
+        }
+        const pane2 = await tmuxCapturePane(tmuxName)
+        const fresh = setLineAfterEcho(pane2, full)
+        if (fresh && !/❯\s*1\.\s*Yes/i.test(pane2)) {
+          confirmed = `TUI:「${fresh.trim().slice(0, 80)}」`
+          break
+        }
+        baselineSetLines = countSetLines(pane2)  // stale Set line (redraw), not ours — absorb it, keep watching
+        continue
       }
       // Command got queued behind a racing turn — extend the watch window.
       if (/Press up to edit queued messages/.test(pane)) {
@@ -717,17 +835,40 @@ async function restartClaudeTUI(): Promise<void> {
   }
 }
 
-/** pkill -9 on claude TUI matching the channel-bot args. */
+/** pids of the claude process(es) running in tmux session `tmuxName` — the pane
+ *  process itself or a direct child of the pane's shell. `=name:` makes the target
+ *  an exact session name (without `=`, tmux prefix-matches: `claude-financial` →
+ *  `claude-financial-assist`; tmux 3.6a needs the trailing `:` for pane targets).
+ *  Empty when the session is gone. */
+export async function ownClaudePids(tmuxName: string): Promise<string[]> {
+  const panes = await runCommand(['tmux', 'list-panes', '-t', `=${tmuxName}:`, '-F', '#{pane_pid}'], 5000)
+  if (panes.exitCode !== 0) return []
+  const panePids = new Set(panes.stdout.split('\n').map((s) => s.trim()).filter(Boolean))
+  // One process-table read instead of `pgrep -P`: macOS pgrep silently drops its own
+  // ancestors, so it found nothing whenever the caller ran inside that agent's tree.
+  const ps = await runCommand(['ps', '-A', '-o', 'pid=,ppid=,command='], 5000)
+  const out: string[] = []
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)
+    if (!m) continue
+    const [, pid, ppid, command] = m
+    if ((panePids.has(pid) || panePids.has(ppid)) && /claude/.test(command)) out.push(pid)
+  }
+  return out
+}
+
+/** SIGKILL only this bot's own TUI (KEEP IN SYNC with telegram-http 1.27.5/1.27.7).
+ *  It was `pkill -9 -f 'claude.*--channels plugin:discord-http'`: every TUI that
+ *  loads discord-http matches that pattern, so one /kill_stuck could take down
+ *  every such agent on the machine. */
 async function killStuckClaude(): Promise<{ killed: number }> {
-  // Match only claude TUIs with our plugin name to avoid hitting unrelated.
-  const { exitCode } = await runCommand([
-    'pkill',
-    '-9',
-    '-f',
-    'claude.*--channels plugin:discord-http',
-  ])
-  // pkill exit 0 = at least one match; 1 = no match (already dead); >1 = error.
-  return { killed: exitCode === 0 ? 1 : 0 }
+  if (!TMUX_SESSION) throw new Error('CHANNEL_BOT_TMUX_SESSION is not set — no TUI to target')
+  let killed = 0
+  for (const pid of await ownClaudePids(TMUX_SESSION)) {
+    const k = await runCommand(['kill', '-9', pid], 5000)
+    if (k.exitCode === 0) killed++
+  }
+  return { killed }  // 0 when the session is gone: the wrapper is already respawning
 }
 
 // ---- claude session discovery (for /resume_list, /resume_previous) -------
@@ -1022,10 +1163,8 @@ async function daemonStatus(httpPort: string): Promise<string> {
   try {
     const r = await fetch(`http://127.0.0.1:${httpPort}/healthz`)
     const h: any = await r.json()
-    const tuiPid =
-      (
-        await runCommand(['pgrep', '-f', 'claude.*--channels plugin:discord-http'])
-      ).stdout.trim().split('\n')[0] || '?'
+    // This bot's own TUI, not the first fleet TUI `pgrep -f` happened to list.
+    const tuiPid = TMUX_SESSION ? ((await ownClaudePids(TMUX_SESSION))[0] ?? 'not running') : 'n/a (no fixed session)'
     return [
       `daemon: pid=${h.pid} uptime=${h.uptime_s}s sessions=${h.active_sessions}`,
       `bot: ${h.bot_username ?? '?'} polling=${h.polling}`,
