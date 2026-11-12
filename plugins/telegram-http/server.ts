@@ -2498,7 +2498,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
       reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.message_thread_id,
     }
     const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
-    if (!d || d.target === 'main') deliverToMain(notification)
+    if (!d || d.target === 'main') { deliverToMain(Lanes.notifWithDigest(notification, d)); void Lanes.ackDigest(d) }   // 002b: the pending digest rides along
     return
   }
   // In ROAMER_MODE, route to the current target's MCP session only,
@@ -3312,7 +3312,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           btcc_msg_id: btccMsgId != null ? String(btccMsgId) : undefined,
         }
         const d = await Lanes.routeRemote(ev)
-        if (!d || d.target === 'main') deliverToMain(notification)   // router unreachable → main (= today's behaviour)
+        if (!d || d.target === 'main') { deliverToMain(Lanes.notifWithDigest(notification, d)); void Lanes.ackDigest(d) }   // router unreachable → main (= today's behaviour); 002b: the pending digest rides along
         else if (d.target === 'lane') maybeAutoAckScheduled(notification)   // 開工回執: a lane took the scheduled run
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
