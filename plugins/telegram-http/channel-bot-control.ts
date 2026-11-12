@@ -702,7 +702,7 @@ const IDLE_CONFIRM_SAMPLES = 2
 const IDLE_SAMPLE_GAP_MS = 500
 
 /** Idle only if `IDLE_CONFIRM_SAMPLES` consecutive samples all read idle. */
-async function isClaudeIdleStable(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+export async function isClaudeIdleStable(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   for (let i = 0; i < IDLE_CONFIRM_SAMPLES; i++) {
     if (await isClaudeBusy(tmuxName)) return false
     if (i < IDLE_CONFIRM_SAMPLES - 1) await new Promise(r => setTimeout(r, IDLE_SAMPLE_GAP_MS))

@@ -55,7 +55,11 @@ import {
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
-import { newestGenuineAssistantAtIn } from './liveness.ts'
+import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
+// Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
+// (GENESIS_LANES=1); with it unset the daemon runs the 685e5b1 code paths unchanged.
+import * as Lanes from './lanes.ts'
+import { isClaudeIdleStable } from './channel-bot-control.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
@@ -819,6 +823,13 @@ function recordDelivery(notif: { method: string; params: unknown }): void {
 // full rationale recorded here through 1.22.x). This wrapper just binds it to
 // this daemon's TRANSCRIPT_DIR.
 function newestGenuineAssistantAt(): number {
+  // lanes (002): lanes write transcripts into the same project dir, so "newest jsonl" would
+  // count a lane's (or a stray second session's) turn as the main's consumption. Read ONLY
+  // the registered main's transcript (evidence #2/#3/#5).
+  if (Lanes.LANES_ON) {
+    const t = Lanes.mainTranscript()
+    return t ? genuineAssistantAtFile(t) : 0
+  }
   return newestGenuineAssistantAtIn(TRANSCRIPT_DIR)
 }
 
@@ -938,6 +949,12 @@ const PARK_ALERT_AFTER_MS = Number(process.env.PARK_ALERT_AFTER_MS ?? 900_000)  
 let parkAlerted = new Set<string>()
 
 function liveSessionServer(): Server | null {
+  if (Lanes.LANES_ON) {   // 002: parked deliveries drain ONLY into the registered main (evidence #4)
+    const sid = Lanes.mainMcpSession()
+    if (!sid || !sseOpen.get(sid)) return null
+    for (const server of activeServers) if (serverSessionId.get(server) === sid) return server
+    return null
+  }
   for (const server of activeServers) {
     const sid = serverSessionId.get(server)
     if (sid && sseOpen.get(sid)) return server
@@ -1132,7 +1149,14 @@ const SEND_MAX_CHARS = 3500
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
-async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string): Promise<string> {
+// `extra` is only ever passed with lanes on (002): thread / hop / sending-lane marker ride along
+// in the comms log and the /inject body, and `minted` reports the BTCC id + delivery outcome.
+type LaneSendExtra = { thread?: string; hop?: number; lane?: string; minted?: (id: number | undefined, delivered: boolean) => void }
+function laneFields(extra?: LaneSendExtra): Record<string, unknown> {
+  if (!extra) return {}
+  return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}) }
+}
+async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, extra?: LaneSendExtra): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim()
   if (!body) return 'send failed: empty text'
@@ -1184,7 +1208,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         // one thing, one owner (Joey TG 970): we honour BTCC's hold, so BTCC may hold us (409)
         'X-Mesh-Fanout': '1',
       },
-      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
+      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}), ...laneFields(extra) }),
       signal: AbortSignal.timeout(6000),
     }).catch(() => null)
     if (lr?.ok) {
@@ -1213,7 +1237,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         ...(msgId != null ? { msg_id: msgId } : {}),
         ...(replyTo != null ? { reply_to_id: replyTo } : {}),
         ...(opRef ? { op: opRef } : {}),
-        ...(noReply ? { no_reply: true } : {}) }),
+        ...(noReply ? { no_reply: true } : {}),
+        ...laneFields(extra) }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -1238,6 +1263,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     } catch {}
   }
   const opNote = opWarn ? ` — ⚠ ${opWarn}` : ''
+  extra?.minted?.(msgId, delivery === 'delivered')
   return delivery === 'delivered'
     ? `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})${opNote}`
     : `send to ${target} FAILED${detail} — message NOT delivered`
@@ -1349,6 +1375,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
            reply_to: { type: 'string', description: 'Quote-reply: the btcc_msg_id from the meta of the message you are replying to. Use it whenever you answer a specific message so the thread shows what you are responding to.' },
            op: { type: 'string', description: 'Optional: the board ops room (戰情室) this message belongs to — OP-3, 3 or its slug (op_list on the board MCP shows them). The message then appears in that op\'s timeline and the receiver sees op="…" on it. Use it for messages about a large cross-agent task that has an ops room; an unknown op still delivers, with a warning.' },
            no_reply: { type: 'boolean', description: 'Set true for a terminal ack / closing FYI that needs NO response — a pure "received, done" with nothing new to add. The delivery is tagged no_reply="true" so the receiver\'s turn closes WITHOUT being forced to reply, breaking the two-agent forced-ack loop. RULE: the side with nothing more to add sends no_reply:true to wrap up; the side that RECEIVES a no_reply message stays silent and does NOT reply. Leave false (default) for any substantive message — a request, task, decision, or progress update — so silence can never swallow real work.' },
+           ...(Lanes.LANES_ON ? {
+             thread: { type: 'string', description: 'Optional conversation id "<agent>#t-xxxx" (the thread="…" of the message you answer). Replies in a thread reach the exact lane that owns it. Filled in automatically when reply_to names a message that carried a thread.' },
+             hop: { type: 'number', description: 'Optional hop count; normally computed by the daemon. A thread stops at hop 6.' },
+           } : {}),
          },
          required: ['to', 'text'],
        },
@@ -1426,6 +1456,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    ...(Lanes.LANES_ON ? Lanes.mainToolDefs() : []),
   ],
  })
 })
@@ -1437,8 +1468,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const replyTo = args.reply_to != null && String(args.reply_to).match(/^\d+$/) ? Number(args.reply_to) : undefined
       const noReply = args.no_reply === true || args.no_reply === 'true'
       const op = args.op != null && String(args.op).trim() ? String(args.op).trim() : undefined
+      if (Lanes.LANES_ON) {
+        // 002: the main's sends carry thread/hop; a quote-reply continues the thread it answers
+        let thread = typeof args.thread === 'string' && args.thread.trim() ? args.thread.trim() : undefined
+        let hop = args.hop != null && Number(args.hop) > 0 ? Number(args.hop) : undefined
+        if (!thread) { const t = Lanes.threadForReply(replyTo); if (t) { thread = t.thread; hop = hop ?? t.hop + 1 } }
+        if (thread) {
+          const c = await Lanes.checkMainSend(thread, hop ?? 1)
+          if (!c.ok) return { content: [{ type: 'text', text: `send blocked — nothing was sent: ${c.why}. The thread is stopped; tell Joey instead of continuing it.` }] }
+          hop = c.hop
+        }
+        let minted: number | undefined
+        const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op,
+          { thread, hop, lane: `${INBOX_SELF}.main`, minted: id => { minted = id } })
+        await Lanes.noteMainOutbound(minted, thread, hop)
+        return { content: [{ type: 'text', text: result + (thread ? ` [thread ${thread} hop ${hop}]` : '') }] }
+      }
       const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op)
       return { content: [{ type: 'text', text: result }] }
+    }
+    if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.isMainTool(req.params.name)) {
+      const out = await Lanes.callMainTool(req.params.name, args, serverSessionId.get(mcp))
+      return { content: [{ type: 'text', text: out }] }
     }
     switch (req.params.name) {
       case 'reply': {
@@ -1637,7 +1688,8 @@ if (isSystemAlertEnabled()) {
     log,
     // Roamer: tail the current target's EXACT transcript, moving with /roam
     // (issue #6). Channel-bot: undefined → static CHANNEL_BOT_PROJECTS_DIR env.
-    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : undefined,
+    // 002: tail the registered main's transcript, not the newest jsonl (lanes share the dir; evidence #7)
+    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscript() : undefined),
     notify: text => {
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
@@ -2391,6 +2443,8 @@ async function handleInbound(
       ...(attachment.name ? { attachment_name: attachment.name } : {}),
     } : {}),
     ...(voiceTranscript ? { voice_transcript: voiceTranscript } : {}),
+    // 002: the topic a message was sent in (worker lanes are bound to topics)
+    ...(Lanes.LANES_ON && (ctx.message as any)?.message_thread_id != null ? { message_thread_id: String((ctx.message as any).message_thread_id) } : {}),
     // Reply-root / forward-origin / album context (2026-07-10) — see
     // replyForwardMeta. Without these the agent couldn't tell WHAT was
     // being replied to, WHO originally wrote a forwarded message, or
@@ -2433,6 +2487,20 @@ async function handleInbound(
 // on, broadcast otherwise. Extracted from handleInbound so the album flush
 // timer (#6) dispatches through the exact same path.
 async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }): Promise<void> {
+  // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
+  // everything else → the registered main only). Never a broadcast.
+  if (Lanes.LANES_ON) {
+    const p = notification.params as { content?: string; meta?: Record<string, string> }
+    const meta = p.meta ?? {}
+    const ev: Lanes.InEvent = {
+      id: `tg-${chat_id}-${meta.message_id ?? Date.now()}`, source: 'telegram', from: meta.user ?? 'joey',
+      text: String(p.content ?? ''), meta, notif: notification, verified: true,
+      reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.message_thread_id,
+    }
+    const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
+    if (!d || d.target === 'main') deliverToMain(notification)
+    return
+  }
   // In ROAMER_MODE, route to the current target's MCP session only,
   // not broadcast. Each roamer keeps multiple bridged claudes alive
   // (one per ever-claimed target) but TG inbound goes only to whichever
@@ -2654,7 +2722,32 @@ async function maybeTranscribeVoice(attachment: AttachmentMeta | undefined): Pro
 //   3. Session active AND SSE open → deliver directly
 //   4. If no session had SSE open, also persist to disk as safety net (covers
 //      daemon restart between broadcast and SSE open)
+// 002: single-target delivery to the registered main's MCP session (evidence #1/#3/#4). Not
+// connected → disk pending, which drains only into the main (liveSessionServer).
+function deliverToMain(notif: { method: string; params: unknown }): void {
+  const sid = Lanes.mainMcpSession()
+  let server: Server | undefined
+  if (sid) for (const s of activeServers) if (serverSessionId.get(s) === sid) { server = s; break }
+  if (!sid || !server) {
+    log('warn', `lanes: registered main not connected — parked in inbox/pending (other sessions get nothing): ${notif.method}`)
+    persistInbound(notif)
+    return
+  }
+  if (sseOpen.get(sid)) {
+    void server.notification(notif as Parameters<Server['notification']>[0]).then(() => recordDelivery(notif)).catch(err => {
+      log('error', `lanes: deliver to main ${sid} failed (${err}) — parked in inbox/pending`)
+      persistInbound(notif)
+    })
+  } else {
+    const q = memQueue.get(sid) ?? []
+    q.push(notif)
+    memQueue.set(sid, q)
+    log('info', `lanes: queued for main ${sid} (SSE not open yet, queue=${q.length})`)
+  }
+}
+
 function broadcastNotification(notif: { method: string; params: unknown }): void {
+  if (Lanes.LANES_ON) { deliverToMain(notif); return }
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
     persistInbound(notif)
@@ -2711,6 +2804,7 @@ function evictZombieSession(sid: string, reason: string): void {
     }
   }
   forgetIssuedSession(sid)
+  if (Lanes.LANES_ON) Lanes.forgetMcpSession(sid)
   log('info', `MCP session evicted by GC: ${sid} reason=${reason} (active=${activeServers.size})`)
   try { transport?.close() } catch {}
   try { if (isRoamerEnabled()) roamerOnMcpSessionClosed(sid) } catch {}
@@ -2941,6 +3035,7 @@ async function openSession(resumeId?: string): Promise<StreamableHTTPServerTrans
       memQueue.delete(transport.sessionId)
       sessionLastActiveAt.delete(transport.sessionId)
       forgetIssuedSession(transport.sessionId)
+      if (Lanes.LANES_ON) Lanes.forgetMcpSession(transport.sessionId)
       log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
       for (const [reqId, p] of pendingPermissions) {
         if (p.server === server) pendingPermissions.delete(reqId)
@@ -2982,6 +3077,56 @@ try { mcpToken = ensureToken(HTTP_PORT as number) } catch (e) {
   log('error', `mcp token: could not create (${e}) — /mcp ${MCP_REQUIRE_TOKEN ? 'REFUSES every client' : 'stays open'}`)
 }
 const mcpGate = makeGate(mcpToken, MCP_REQUIRE_TOKEN, msg => log('warn', msg))
+
+// 002 lanes wiring (inert unless GENESIS_LANES=1)
+if (Lanes.LANES_ON) {
+  const tokOk = (a: string | undefined) => {
+    if (!mcpToken || !a) return false
+    const got = Buffer.from(a), want = Buffer.from(`Bearer ${mcpToken}`)
+    return got.length === want.length && timingSafeEqual(got, want)
+  }
+  Lanes.lanesInit({
+    role: INBOX_ONLY ? 'inbox' : 'tg',
+    agent: process.env.LANES_AGENT ?? INBOX_SELF,
+    workspaceDir: AGENT_WORKSPACE_DIR,
+    transcriptDir: TRANSCRIPT_DIR,
+    httpPort: HTTP_PORT as number,
+    log,
+    deliverToMain,
+    authOk: tokOk,
+    registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
+    ...(INBOX_ONLY ? {
+      meshSend: async (to, text, replyTo, noReply, extra) => {
+        let msgId: number | undefined, delivered = false
+        const out = await sendToAgent(to, text, replyTo, noReply, undefined, { ...extra, minted: (id, ok) => { msgId = id; delivered = ok } })
+        return { text: out, msgId, delivered }
+      },
+      schedulerCall: async (runId, action, outcome, summary) => {
+        if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
+        try {
+          const r = await fetch(`${BTCC_API_BASE}/api/scheduler/runs/${runId}/${action}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() },
+            body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'done', ...(summary ? { summary } : {}) } : {}),
+            signal: AbortSignal.timeout(6000),
+          })
+          return `${action} run ${runId}: HTTP ${r.status}`
+        } catch (e) { return `${action} run ${runId} failed: ${e}` }
+      },
+    } : {
+      sendBot: async (chat, text, o) => {
+        const m = await bot.api.sendMessage(chat, text.slice(0, 4000), {
+          ...(o.silent ? { disable_notification: true } : {}),
+          ...(o.topic != null ? { message_thread_id: o.topic } : {}),
+          ...(o.replyTo ? { reply_parameters: { message_id: o.replyTo } } : {}),
+        })
+        return m.message_id
+      },
+      createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
+      joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
+      isMainIdle: () => isClaudeIdleStable(process.env.CHANNEL_BOT_TMUX_SESSION),
+    }),
+  })
+}
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
   try {
@@ -3011,11 +3156,15 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           catch { return 0 }
         })(),
         pid: process.pid,
+        // 002: health = "the registered main is connected", not "≥1 session" (evidence #8)
+        ...(Lanes.LANES_ON ? Lanes.lanesHealth() : {}),
       }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify(body))
       return
     }
+
+    if (Lanes.LANES_ON && await Lanes.handleLanesHttp(u, req, res)) return
 
     // /v1/logs — OTLP/HTTP JSON logs receiver (system-alert primary layer).
     // Claude TUI exports telemetry events here when launched with
@@ -3130,6 +3279,45 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       // Default chat_id = first allowFrom (the owner): if the agent finishes and
       // reports via the reply tool, the report lands with the boss per contract.
       const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
+      if (Lanes.LANES_ON) {
+        // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
+        // sender (it is stamped by the sender's own daemon, never by message text).
+        const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
+        const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
+        const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
+        const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
+        const notification = {
+          method: 'notifications/claude/channel',
+          params: {
+            content: text,
+            meta: {
+              chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
+              ...verdictMeta(verdict),
+              ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
+              ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
+              ...(opRef ? { op: opRef } : {}),
+              ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
+              ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
+              ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+              ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
+            },
+          },
+        }
+        Lanes.noteInboundThread(btccMsgId != null ? String(btccMsgId) : undefined, thread, hop)
+        const ev: Lanes.InEvent = {
+          id: `mesh-${btccMsgId ?? `${Date.now()}-${randomBytes(2).toString('hex')}`}`, source: 'mesh', from, text,
+          meta: notification.params.meta as Record<string, string>, notif: notification, verified: verdict.verified,
+          thread, hop, lane_marker: laneMarker, no_reply: body?.no_reply === true,
+          reply_to_id: body?.reply_to_id != null ? String(body.reply_to_id) : undefined,
+          btcc_msg_id: btccMsgId != null ? String(btccMsgId) : undefined,
+        }
+        const d = await Lanes.routeRemote(ev)
+        if (!d || d.target === 'main') deliverToMain(notification)   // router unreachable → main (= today's behaviour)
+        else if (d.target === 'lane') maybeAutoAckScheduled(notification)   // 開工回執: a lane took the scheduled run
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
+        return
+      }
       await dispatchInbound(chatId, {
         method: 'notifications/claude/channel',
         params: {
@@ -3230,6 +3418,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         //   5. THEN await the long-lived SSE request lifecycle
         sseOpen.set(sessionId, true)
         sessionLastActiveAt.set(sessionId, Date.now())  // SSE confirmed open ⇒ reset zombie-GC clock
+        // 002: which claude process owns this session (socket → pid); binds the registered main
+        if (Lanes.LANES_ON) { try { Lanes.noteMcpSocket(sessionId, req) } catch (e) { log('warn', `lanes: noteMcpSocket ${e}`) } }
 
         // 2026-05-22 — Dead-transport detection patch (belt + suspenders):
         //
@@ -3354,7 +3544,10 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           }
           // Disk-pending drain (covers daemon restart and "0 active session" gap).
           // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
-          void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
+          // 002: only the registered main may drain the (main-addressed) pending queue.
+          if (!Lanes.LANES_ON || Lanes.isMainMcpSession(sessionId)) {
+            void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
+          }
         }
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {

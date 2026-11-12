@@ -34,7 +34,14 @@ export function newestGenuineAssistantAtIn(transcriptDir: string): number {
       } catch {}
     }
     if (!newestFile) return 0
-    const path = join(transcriptDir, newestFile)
+    return genuineAssistantAtFile(join(transcriptDir, newestFile))
+  } catch { return 0 }
+}
+
+/** Same predicate for ONE known transcript file (lanes / 002: the registered main's
+ *  transcript, not the newest file in a directory that lanes also write to). */
+export function genuineAssistantAtFile(path: string): number {
+  try {
     const size = statSync(path).size
     const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES)
     const len = size - start
