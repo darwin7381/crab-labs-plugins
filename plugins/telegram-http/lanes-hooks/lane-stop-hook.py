@@ -2,9 +2,9 @@
 """Lane Stop hook (universe 002): never-silent for lanes.
 
 A lane turn may only end after it closed with one of the lane tools
-  notify_joey (delivered at the tier the router decides), reply_agent, receipt
-— the lane equivalents of the fleet rule "every woken turn reports". (A legacy tier=ledger argument
-alone is not a report.) High-frequency no-change routines close with receipt only (Joey msg 934).
+  notify_joey (the router alone decides its tier), reply_agent, receipt
+— the lane equivalents of the fleet rule "every woken turn reports". High-frequency no-change
+routines close with receipt only (Joey msg 934).
 Blocks at most MAX_BLOCKS times per turn; after that the daemon's exit check makes the silence
 loud (ledger escalation + bot message), so a stuck model cannot loop forever.
 """
@@ -12,7 +12,7 @@ import json
 import os
 import sys
 
-CLOSERS = ('mcp__lane__reply_agent', 'mcp__lane__receipt')
+CLOSERS = ('mcp__lane__notify_joey', 'mcp__lane__reply_agent', 'mcp__lane__receipt')
 MAX_BLOCKS = 2
 
 
@@ -60,7 +60,7 @@ def main():
             if not isinstance(c, dict) or c.get('type') != 'tool_use':
                 continue
             n = c.get('name', '')
-            if n in CLOSERS or (n == 'mcp__lane__notify_joey' and (c.get('input') or {}).get('tier') != 'ledger'):
+            if n in CLOSERS:
                 closed = True
     lanes_dir = os.environ.get('LANES_DIR', '')
     state_p = os.path.join(lanes_dir, 'run', 'stop-blocks.json') if lanes_dir else ''
@@ -84,8 +84,8 @@ def main():
             pass
     lane = os.environ.get('LANE_ID', 'this lane')
     print(json.dumps({'decision': 'block', 'reason': (
-        f'⛔ lane-stop-hook: {lane} has not reported yet. Close this turn with notify_joey '
-        '(any kind; the router decides the tier), reply_agent (answering the agent that asked), or receipt '
+        f'⛔ lane-stop-hook: {lane} has not reported yet. Close this turn with notify_joey'
+        ', reply_agent (answering the agent that asked), or receipt '
         '(scheduled routine; high-frequency no-change may leave only the receipt). '
         'Never end silent. If the decision belongs to the main, call escalate and then notify_joey.')}))
 
