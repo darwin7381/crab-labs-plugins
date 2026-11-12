@@ -290,7 +290,11 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // Inbox-only daemons never talk to Telegram: the Bot instance exists so shared
 // code paths typecheck, but polling never starts and no API call is ever made.
-const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!)
+// genesis lab: grammy must use the same API root as callBotApi/file downloads, so a
+// TELEGRAM_API_ROOT mock receives getUpdates/sendMessage too (upstream passes no client option).
+const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!, {
+  client: { apiRoot: process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org' },
+})
 let botUsername = ''
 
 type PendingEntry = {
