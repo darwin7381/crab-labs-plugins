@@ -834,11 +834,11 @@ async function callLaneTool(tok: { runId: string; lane: string; evId: string; cl
       const h = createHash('sha1').update(lane.thread + '|' + text).digest('hex').slice(0, 16)
       const dedupeMs = (routerCfg().notify?.limits?.dedupe_minutes ?? 10) * 60_000
       if (tier !== 'ledger' && S.dedupe[h] && Date.now() - S.dedupe[h] < dedupeMs) {
-        logos('lane.notify', { lane: lane.id, thread: lane.thread, event: tok.evId, trigger: tok.trigger, kind, tier: 'suppressed', tier_rule: 'dedupe' })
+        logos('lane.notify', { lane: lane.id, thread: lane.thread, event: tok.evId, trigger: tok.trigger, declared_kind: kind, tier: 'suppressed', tier_rule: 'dedupe' })
         return 'suppressed: the same text went to Joey from this thread recently'
       }
       if (tier === 'ledger') {
-        logos('lane.notify', { lane: lane.id, thread: lane.thread, event: tok.evId, trigger: tok.trigger, kind, tier, tier_rule: dec.rule })
+        logos('lane.notify', { lane: lane.id, thread: lane.thread, event: tok.evId, trigger: tok.trigger, declared_kind: kind, tier, tier_rule: dec.rule })
         return `recorded in the ledger (router tier for ${tok.trigger}/${kind}: ledger; nothing sent to Joey)`
       }
       S.dedupe[h] = Date.now()
@@ -846,7 +846,7 @@ async function callLaneTool(tok: { runId: string; lane: string; evId: string; cl
       if (id == null) throw new Error('send failed')
       if (tier === 'push') S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()]
       saveState()
-      logos('lane.notify', { lane: lane.id, thread: lane.thread, event: tok.evId, trigger: tok.trigger, kind, tier, tier_rule: dec.rule, message_id: id })
+      logos('lane.notify', { lane: lane.id, thread: lane.thread, event: tok.evId, trigger: tok.trigger, declared_kind: kind, tier, tier_rule: dec.rule, message_id: id })
       return `sent to Joey (router tier: ${tier} for ${tok.trigger}/${kind}; message_id ${id}${lane.topic ? `, topic ${lane.topic}` : ''})`
     }
     case 'reply_agent': {
