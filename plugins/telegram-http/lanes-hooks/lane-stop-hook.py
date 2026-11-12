@@ -2,9 +2,9 @@
 """Lane Stop hook (universe 002): never-silent for lanes.
 
 A lane turn may only end after it closed with one of the lane tools
-  notify_joey (tier push|silent), reply_agent, receipt
-— the lane equivalents of the fleet rule "every woken turn reports". tier=ledger alone is not
-a report. High-frequency no-change routines close with receipt only (Joey msg 934).
+  notify_joey (delivered at the tier the router decides), reply_agent, receipt
+— the lane equivalents of the fleet rule "every woken turn reports". (A legacy tier=ledger argument
+alone is not a report.) High-frequency no-change routines close with receipt only (Joey msg 934).
 Blocks at most MAX_BLOCKS times per turn; after that the daemon's exit check makes the silence
 loud (ledger escalation + bot message), so a stuck model cannot loop forever.
 """
@@ -85,7 +85,7 @@ def main():
     lane = os.environ.get('LANE_ID', 'this lane')
     print(json.dumps({'decision': 'block', 'reason': (
         f'⛔ lane-stop-hook: {lane} has not reported yet. Close this turn with notify_joey '
-        '(tier push or silent), reply_agent (answering the agent that asked), or receipt '
+        '(any kind; the router decides the tier), reply_agent (answering the agent that asked), or receipt '
         '(scheduled routine; high-frequency no-change may leave only the receipt). '
         'Never end silent. If the decision belongs to the main, call escalate and then notify_joey.')}))
 
