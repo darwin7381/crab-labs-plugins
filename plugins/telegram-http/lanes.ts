@@ -23,7 +23,7 @@
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
  * (main writes), digest.json, run/ (per-run MCP configs, stderr).
  */
-import { spawn, type ChildProcess } from 'child_process'
+import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { randomBytes, randomUUID, createHash } from 'crypto'
 import {
   appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync,
@@ -53,8 +53,14 @@ const LEASE_MS = Number(process.env.LANES_LEASE_MS ?? 120_000)
 const THREAD_BUDGET = Number(process.env.LANES_THREAD_BUDGET ?? 3_000_000)   // input-side tokens / thread
 const RESUME_MAX_AGE_MS = Number(process.env.LANES_RESUME_MAX_AGE_MS ?? 24 * 3600_000)
 const MODEL = process.env.LANES_MODEL ?? 'claude-opus-5-5'
-const CLAUDE_BIN = process.env.LANES_CLAUDE_BIN ?? 'claude'
+let CLAUDE_BIN = process.env.LANES_CLAUDE_BIN ?? 'claude'
 const MAX_ATTEMPTS = 3
+// 002f: a lane run the daemon SAW die is dispatched again after attempt × this (it used to wait for the 2-minute lease)
+let RETRY_BACKOFF_MS = Number(process.env.LANES_RETRY_BACKOFF_MS ?? 5_000)
+/** tests only */
+export const __setRetryBackoff = (ms: number): void => { RETRY_BACKOFF_MS = ms }
+/** tests only: the program started as a lane; returns the previous one */
+export const __setClaudeBin = (bin: string): string => { const was = CLAUDE_BIN; CLAUDE_BIN = bin; return was }
 const DIGEST_RETRY_MS = Number(process.env.LANES_DIGEST_RETRY_MS ?? 120_000)   // an un-acked digest take is taken again after this
 const WAKE_HOLD_MS = Number(process.env.LANES_WAKE_HOLD_MS ?? 90_000)          // a wake entry of a lane that is still running waits this long at most
 // 002d: a handoff the main has not received after this long is told to Joey once (never silent, never double)
@@ -125,6 +131,7 @@ export function lanesInit(deps: LanesDeps): void {
     loadState()
     writeLaneSettings()
     loadQueue()
+    setTimeout(sweepQueue, 2_000).unref()          // 002f: what the previous daemon left running is dispatched again now
     setInterval(sweepQueue, 10_000).unref()
     setInterval(followupTick, 1_000).unref()
     setInterval(() => { void digestTick() }, 10_000).unref()
@@ -460,8 +467,20 @@ function stopThread(ev: InEvent, t: Thread | null, why: string, laneId: string |
   if (t) t.stopped = why
   saveState()
   ledger({ lane: laneId ?? 'router', thread: t?.id ?? ev.thread ?? null, event: ev.id, kind: 'stop',
-    text: `停止投遞：${why}（thread ${t?.id ?? ev.thread ?? '-'}，寄件者 ${ev.from}）。內容：${ev.text.slice(0, 160)}`, notify_main: true })
+    text: `停止投遞：${why}（thread ${t?.id ?? ev.thread ?? '-'}，寄件者 ${ev.from}）。內容：${ev.text.slice(0, 160)}`
+      + `\n這條對話線已經關閉：對方之後在這條線上再傳的訊息只會記進帳本，不會再開車道，也不會再叫醒你。還需要跟對方談，就用 send_to_agent 另開一則新的（不要帶 reply_to）。`,
+    notify_main: true })
   return { rule: 'thread-gate', target: 'ledger', lane: laneId ?? undefined, note: why }
+}
+/** 002f: a stopped thread stays stopped. The stop itself was handed to the main once (kind=stop wakes it). What the peer sends on
+ *  that thread afterwards is recorded and rides along with the main's next digest; it opens no lane, wakes nobody and is not a
+ *  second stop (002e: every further message on a cut thread made a new stop entry and woke the main again). */
+function stoppedQuiet(ev: InEvent, t: Thread | null, laneId: string | null): Decision | null {
+  if (!t?.stopped || ev.source !== 'mesh') return null
+  t.hops = Math.max(ev.hop ?? 0, (t.hops ?? 0) + 1); t.last = nowIso(); saveState()
+  ledger({ lane: laneId ?? 'router', thread: t.id, event: ev.id, kind: 'fyi', notify_main: true,
+    text: `已關閉的對話線又收到 ${ev.from} 的訊息：沒有投遞，沒有回覆（當初關閉的原因：${t.stopped}）。內容：${ev.text.slice(0, 160)}` })
+  return { rule: 'thread-gate', target: 'ledger', lane: laneId ?? undefined, note: `already stopped (${t.stopped}): recorded, nobody woken` }
 }
 
 /** Trigger class of an event under rule r (router.json `trigger`; `<trigger>-critical` / `<trigger>-info`
@@ -513,6 +532,8 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       if (ev.thread || ev.reply_to_id) {
         const o = threadOwnerFor(ev)
         if (o?.owner === 'main' && o.thread) {
+          const quiet = stoppedQuiet(ev, S.threads[o.thread] ?? null, 'main')
+          if (quiet) return quiet
           const why = threadGate(S.threads[o.thread] ?? null, ev); saveState()
           if (why) return stopThread(ev, S.threads[o.thread] ?? null, why, 'main')
         }
@@ -540,6 +561,8 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
     case 'thread_owner': {
       const o = threadOwnerFor(ev)!
       const t = o.thread ? S.threads[o.thread] ?? null : null
+      const quiet = stoppedQuiet(ev, t, o.owner)
+      if (quiet) return quiet
       const why = threadGate(t, ev)
       if (why) return stopThread(ev, t, why, o.owner)
       if (o.owner === 'main') { saveState(); return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main` } }
@@ -609,7 +632,9 @@ function threadSummary(thread: string): string {
 }
 
 // ================================================================== lane queue + runner
-type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done' | 'failed'; lease_until: number; attempts: number; priority: number; summary?: string; enqueued: string }
+type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done' | 'failed'; lease_until: number; attempts: number; priority: number; summary?: string; enqueued: string
+  /** 002f: the process and run that hold the lease, so a restarted daemon can tell what it left behind */
+  pid?: number; run?: string }
 const queue = new Map<string, QItem>()          // event id → item
 const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval> }>()  // lane id → run
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string
@@ -621,14 +646,34 @@ const qPath = (id: string) => join(LANES_DIR, 'queue', `${id.replace(/[^A-Za-z0-
 
 function saveQ(it: QItem): void { try { writeJsonAtomic(qPath(it.ev.id), it) } catch (e) { D.log('error', `lanes: queue write ${e}`) } }
 function loadQueue(): void {
+  let cut = 0
   try {
     for (const f of readdirSync(join(LANES_DIR, 'queue'))) {
       if (!f.endsWith('.json')) continue
       const it = readJson<QItem | null>(join(LANES_DIR, 'queue', f), null)
-      if (it && (it.state === 'queued' || it.state === 'leased')) queue.set(it.ev.id, it)
+      if (!it || (it.state !== 'queued' && it.state !== 'leased')) continue
+      if (it.state === 'leased') {
+        // 002f: a leased item at boot was running under the previous daemon process. That run cannot report any more (its
+        // token died with that daemon), so whatever is left of it is stopped and the event is dispatched again by the first
+        // sweep, not when the old lease runs out (first bad-day run: a peer waited 4 minutes for a one-line answer).
+        reapOrphan(it)
+        it.lease_until = 0; saveQ(it)
+        cut++
+      }
+      queue.set(it.ev.id, it)
     }
   } catch {}
-  if (queue.size) D.log('info', `lanes: ${queue.size} queued/leased lane event(s) restored from disk (leased ones re-dispatch when their lease expires)`)
+  if (queue.size) D.log('info', `lanes: ${queue.size} lane event(s) restored from disk; ${cut} were running when the daemon stopped and are dispatched again now`)
+}
+/** a lane process left by the previous daemon: stop it if it is really that run (the pid may belong to something else by now) */
+function reapOrphan(it: QItem): void {
+  if (!it.pid || !it.run) return
+  try {
+    const cmd = spawnSync('ps', ['-p', String(it.pid), '-o', 'command='], { encoding: 'utf8' }).stdout ?? ''
+    if (!cmd.includes(`${it.run}.mcp.json`)) return
+    process.kill(it.pid, 'SIGKILL')
+    D.log('warn', `lanes: stopped lane process ${it.pid} (${it.run}) left by the previous daemon`)
+  } catch {}
 }
 function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string): void {
   const it: QItem = { ev, lane: laneId, state: 'queued', lease_until: 0, attempts: 0, priority, summary, enqueued: nowIso() }
@@ -671,7 +716,7 @@ export function followupTick(): void {
   if (changed) saveState()
 }
 
-function sweepQueue(): void {
+export function sweepQueue(): void {
   const now = Date.now()
   for (const it of queue.values()) {
     if (it.state !== 'leased' || it.lease_until > now || running.has(it.lane)) continue
@@ -681,7 +726,7 @@ function sweepQueue(): void {
       handoff(lane, it.ev.id, `車道連續 ${it.attempts} 次沒處理完這則事件，已放棄，請主線接手。寄件者 ${it.ev.from}，原文：${it.ev.text.slice(0, 400)}`, it.lane)
       continue
     }
-    D.log('warn', `lanes: lease expired for ${it.ev.id} on ${it.lane} (attempt ${it.attempts}) — re-dispatching`)
+    D.log('warn', `lanes: ${it.ev.id} on ${it.lane} did not finish (attempt ${it.attempts}) — dispatching again`)
     appendJsonl('routing.jsonl', { event: it.ev.id, rule: 'lease-expired', target: 'lane', lane: it.lane, note: `re-dispatch attempt ${it.attempts + 1}` })
     it.state = 'queued'; saveQ(it)
   }
@@ -767,6 +812,15 @@ function writeLaneSettings(): void {
   writeJsonAtomic(join(LANES_DIR, 'lane-settings.json'), settings, 0o644)
 }
 
+/** how a lane run attaches to its conversation. 002f: resume whenever the conversation is already on disk. The run counter
+ *  alone is not enough: a run cut off by a daemon restart never reached the exit handler, and starting the same session id
+ *  a second time fails at once (first bad-day run: one wasted attempt, two more minutes). */
+export function sessionArgs(lane: Lane): { resume: boolean; args: string[] } {
+  if (lane.kind === 'fork' && lane.runs === 0 && lane.fork_from) return { resume: true, args: ['--resume', lane.fork_from, '--fork-session'] }
+  if (lane.runs > 0 || (!!lane.transcript && existsSync(lane.transcript))) return { resume: true, args: ['--resume', lane.session_id] }
+  return { resume: false, args: ['--session-id', lane.session_id] }
+}
+
 function startRun(it: QItem): void {
   const lane = S.lanes[it.lane]
   if (!lane) { it.state = 'failed'; saveQ(it); queue.delete(it.ev.id); return }
@@ -786,11 +840,8 @@ function startRun(it: QItem): void {
   runTokens.set(token, tok)
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
-  const resume = lane.runs > 0 || (lane.kind === 'fork' && !!lane.fork_from)
-  const args = ['-p', renderEvent(it.ev), '--model', MODEL]
-  if (lane.kind === 'fork' && lane.runs === 0) args.push('--resume', lane.fork_from!, '--fork-session')
-  else if (resume) args.push('--resume', lane.session_id)
-  else args.push('--session-id', lane.session_id)
+  const { resume, args: sess } = sessionArgs(lane)
+  const args = ['-p', renderEvent(it.ev), '--model', MODEL, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt', identityCard(lane, it),
     '--settings', join(LANES_DIR, 'lane-settings.json'),
@@ -798,7 +849,7 @@ function startRun(it: QItem): void {
     '--dangerously-skip-permissions',
     '--disallowedTools', 'AskUserQuestion', 'ExitPlanMode')
   const child = spawn(CLAUDE_BIN, args, { cwd: D.workspaceDir, env: laneEnv(lane), stdio: ['ignore', 'pipe', 'pipe'] })
-  it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; saveQ(it)
+  it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
   const renew = setInterval(() => { it.lease_until = Date.now() + LEASE_MS; saveQ(it) }, 30_000)
   running.set(lane.id, { child, evId: it.ev.id, runId, renew })
   lane.status = 'running'; lane.last = nowIso(); saveState()
@@ -866,9 +917,18 @@ function startRun(it: QItem): void {
         ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action', notify_main: true,
           text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
       }
+    } else if (lane.status === 'closed') {
+      // the main closed this lane (lane_close stops its process): its event is not run again
+      it.state = 'done'; saveQ(it); queue.delete(it.ev.id)
+      try { rmSync(qPath(it.ev.id)) } catch {}
     } else {
-      // leave it leased; the sweeper re-dispatches when the lease (no longer renewed) expires
-      it.lease_until = Math.min(it.lease_until, Date.now() + LEASE_MS); saveQ(it)
+      // 002f: the daemon saw this run die, so there is nothing to wait for: the event is dispatched again after a short
+      // backoff, and after the last attempt it goes to the main at once. It used to sit until the 2-minute lease ran out
+      // (first bad-day run: a killed lane cost 2 minutes, three failures 6 minutes before the main heard of it). The lease
+      // now only covers what the daemon cannot see: its own restart (loadQueue) and a renewal that stopped.
+      it.lease_until = it.attempts >= MAX_ATTEMPTS ? 0 : Date.now() + RETRY_BACKOFF_MS * it.attempts
+      saveQ(it)
+      setTimeout(sweepQueue, Math.max(0, it.lease_until - Date.now()) + 20)
     }
     saveState()
     pump()

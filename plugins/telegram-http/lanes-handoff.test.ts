@@ -8,8 +8,8 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, LANE_TOOLS, __lanesState, __setMainConnected } from './lanes.ts'
-import { isWakeEntry, queryLedger, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
+import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected } from './lanes.ts'
+import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-handoff-'))
@@ -242,4 +242,49 @@ test('002e: what the main itself told another agent is a line of the activity li
   expect(lines[1]).toContain('交給主線：Eve 要 10 月可用率')
   expect(lines[1]).toContain('主線做了：send_to_agent → eve：整月數字給不出來')
   expect(lines[2]).toContain('send_to_agent → cain')
+})
+
+// ------------------------------------------------------------------ 002f
+test('002f: every time the main is shown is local (UTC+8) and the list says so; a time given back without a zone is read as local', () => {
+  expect(stamp('2026-11-13T04:50:12.000Z')).toBe('11-13 12:50')          // the 12:50 failure is shown as 12:50, not 04:50
+  expect(stamp('2026-11-12T18:05:00Z')).toBe('11-13 02:05')              // the date follows the local day
+  const out = queryLedger(DAY.join('\n'), {}, T0 + 600 * 60_000).split('\n')
+  expect(out[0]).toContain('時間為 UTC+8')
+  expect(out[1].startsWith('• 11-13 10:00｜')).toBe(true)                 // T0 = 02:00Z = 10:00 local
+  expect(queryLedger(DAY.join('\n'), { kind: 'notify' }, T0 + 600 * 60_000).split('\n')[0]).toContain('時間為 UTC+8')
+  expect(parseSince('2026-11-13 12:00', 0)).toBe(Date.parse('2026-11-13T04:00:00Z'))
+  expect(parseSince('2026-11-13T12:00:00+08:00', 0)).toBe(Date.parse('2026-11-13T04:00:00Z'))
+  expect(parseSince('2026-11-13T04:00:00Z', 0)).toBe(Date.parse('2026-11-13T04:00:00Z'))
+  expect(parseSince('2026-11-13', 0)).toBe(Date.parse('2026-11-12T16:00:00Z'))
+  expect(parseSince('昨天', 0)).toBe('bad')
+})
+
+test('002f: a stopped thread stays stopped: the stop wakes the main once, later messages on it are recorded and wake nobody', async () => {
+  reset()
+  const st = __lanesState()
+  st.lanes['adam.reflex.90'] = { id: 'adam.reflex.90', kind: 'reflex', n: 90, session_id: 's', thread: 'adam#t-loop', status: 'idle', created: '', last: '', transcript: '/x', runs: 1, tokens_in: 0, tokens_out: 0 } as any
+  st.threads['adam#t-loop'] = { id: 'adam#t-loop', lane: 'adam.reflex.90', peer: 'eve', hops: 6, tokens: 0, created: '', last: '' } as any
+  const msg = (hop: number, text: string) => ({ id: `mesh-loop-${hop}`, source: 'mesh', from: 'eve', text, meta: {}, thread: 'adam#t-loop', hop, verified: true,
+    notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } } }) as any
+  const d1 = await routeEvent(msg(7, '那再確認一次？'))                    // over the hop limit: the thread is cut
+  expect(d1.target).toBe('ledger')
+  expect(st.threads['adam#t-loop'].stopped).toBeTruthy()
+  let rows = ledgerRows()
+  expect(rows.filter(r => r.kind === 'stop').length).toBe(1)
+  expect(rows.filter(isWakeEntry).length).toBe(1)                         // the main is woken with the stop, once
+  expect(rows.find(r => r.kind === 'stop').text).toContain('不要帶 reply_to')
+  const wake = takePendingDigest(true, 'wake')!
+  ackDigest(wake.id)
+  const d2 = await routeEvent(msg(8, '還在嗎？'))                          // the peer keeps talking on the cut thread
+  const d3 = await routeEvent(msg(9, '哈囉？'))
+  expect(d2.target).toBe('ledger'); expect(d3.target).toBe('ledger')
+  expect(d2.note).toContain('already stopped')
+  rows = ledgerRows()
+  expect(rows.filter(r => r.kind === 'stop').length).toBe(1)              // no second stop
+  expect(rows.filter(r => r.kind === 'fyi' && r.thread === 'adam#t-loop').length).toBe(2)   // both are on the record
+  expect(rows.slice(-2).some(isWakeEntry)).toBe(false)                    // and neither wakes the main
+  expect(takePendingDigest(true, 'wake')).toBeNull()                      // nothing to wake it for
+  const ride = takePendingDigest(false, 'piggyback')!                     // they ride along with its next natural message
+  expect(ride.text).toContain('已關閉的對話線又收到 eve 的訊息')
+  expect(Object.values(st.lanes).filter((l: any) => l.thread === 'adam#t-loop' && l.status === 'running').length).toBe(0)   // no lane was started
 })

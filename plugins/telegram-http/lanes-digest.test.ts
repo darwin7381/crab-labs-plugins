@@ -271,7 +271,7 @@ const reportRec = (rep: any, o: Partial<LedgerRec> = {}) => L({ kind: 'receipt',
 test('structured digest: a thread that promised something shows all four parts with the lane\'s concrete facts', () => {
   const d = renderDigest([reportRec(report, { lane: 'adam.reflex.6', thread: 'adam#t-b30f47' })])!
   const lines = d.text.split('\n')
-  const i = lines.findIndex(l => l.startsWith('▸ adam.reflex.6｜adam#t-b30f47｜2026-11-13T'))
+  const i = lines.findIndex(l => l.startsWith('▸ adam.reflex.6｜adam#t-b30f47｜11-13 '))
   expect(i).toBeGreaterThan(0)
   expect(lines[i + 1]).toBe(`  發生：${report.happened}`)
   expect(lines[i + 2]).toBe(`  做了：${report.did}`)
@@ -412,7 +412,7 @@ test('ledger_query: newest last, capped at 30 entries, each text cut to 600 char
   expect(rows[0]).toContain('entry 15')                                              // oldest of the newest 30
   expect(rows[rows.length - 1].endsWith('…')).toBe(true)                             // newest last, truncated
   expect(rows[rows.length - 1].split('｜').pop()!.length).toBe(LEDGER_QUERY_TEXT_MAX)
-  expect(rows[0]).toMatch(/^2026-11-13T\d\d:\d\d:\d\dZ｜action｜adam\.reflex\.3｜adam#t-cc94ed｜entry 15$/)   // timestamp, kind, lane, thread, text
+  expect(rows[0]).toMatch(/^11-13 \d\d:\d\d｜action｜adam\.reflex\.3｜adam#t-cc94ed｜entry 15$/)   // timestamp, kind, lane, thread, text
 })
 
 test('ledger_query: missing / empty / damaged ledger is safe; bad arguments are explained, not thrown', () => {
