@@ -284,18 +284,50 @@ function maybeBindMain(sid: string): void {
 //   1. every delivery the transcript never answered is parked again at once, so the new process gets it when it connects;
 //   2. if the transcript shows the old process died in the middle of a turn, the main is told so and asked to carry on.
 
+/** the end of a file as text, whole lines only; null when it cannot be read */
+function tailText(path: string, max: number): string | null {
+  try {
+    const size = statSync(path).size, n = Math.min(size, max)
+    const fd = openSync(path, 'r'), buf = Buffer.alloc(n)
+    readSync(fd, buf, 0, n, size - n); closeSync(fd)
+    const text = buf.toString('utf8')
+    return n < size ? text.slice(text.indexOf('\n') + 1) : text
+  } catch { return null }
+}
+
+/** 002h: did the main's session take this notification in? Its own transcript says so: a message that became a prompt is a
+ *  `user` record, one that arrived mid-turn is recorded as absorbed. A message that is there only as "enqueue" was still
+ *  waiting inside the claude process when that process died: it never reached the model. (Bad-day run on 002g: Joey's
+ *  question arrived 5 s before the main was killed and was lost; the daemon's time-based rule read the tool calls that
+ *  followed the delivery as proof that it had been consumed.)
+ *  true = taken in, false = queued and lost, null = cannot tell (no id on it, or not in the part of the transcript read). */
+export function takenIn(notif: Notif): boolean | null {
+  const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
+  const key = meta.message_id ? `message_id="${meta.message_id}"` : meta.btcc_msg_id ? `btcc_msg_id="${meta.btcc_msg_id}"` : meta.ts ? `ts="${meta.ts}"` : null
+  const path = mainReg?.transcript_path
+  if (!key || !path) return null
+  const text = tailText(path, 2_000_000)
+  if (text == null) return null
+  const inJson = JSON.stringify(key).slice(1, -1)            // the key as it is written inside a JSON string
+  let queued = false
+  for (const line of text.split('\n')) {
+    if (!line.includes(inJson)) continue
+    let j: any; try { j = JSON.parse(line) } catch { continue }
+    if (j.type === 'user') return true
+    if (j.type === 'attachment' && j.attachment?.type === 'queued_command') return true
+    if (j.type !== 'queue-operation') continue
+    if (j.operation === 'remove' && j.reason === 'absorbed_mid_turn') return true
+    if (j.operation === 'enqueue') queued = true
+  }
+  return queued ? false : null
+}
+
 /** Did the session's last turn end, or was it cut off? Read from the end of its transcript: a completed turn ends with an
  *  assistant record that stopped by itself (or the harness's end-of-turn records); a turn that was cut off ends with a
  *  tool call, a tool result or a prompt. The "No response requested." record a resumed session writes is not a turn. */
 export function cutOffTurn(path: string): { cut: boolean; at?: string } {
-  let text = ''
-  try {
-    const size = statSync(path).size, n = Math.min(size, 400_000)
-    const fd = openSync(path, 'r'), buf = Buffer.alloc(n)
-    readSync(fd, buf, 0, n, size - n); closeSync(fd)
-    text = buf.toString('utf8')
-    if (n < size) text = text.slice(text.indexOf('\n') + 1)        // drop the line the read cut in two
-  } catch { return { cut: false } }
+  const text = tailText(path, 400_000)
+  if (text == null) return { cut: false }
   const lines = text.split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i]) continue
@@ -313,7 +345,7 @@ export function cutOffTurn(path: string): { cut: boolean; at?: string } {
 export function resumeNotice(at?: string): string {
   return `〔系統通知｜主線重新啟動〕你的 session 剛才被中斷${at ? `（${stamp(at)}，${TZ_LABEL}）` : ''}，現在已經重新啟動，對話紀錄都還在。\n`
     + '中斷時你那一回合還沒做完：先看中斷前做到哪一步，接著把它做完。跑到一半的指令不要當成已經完成，重新確認結果。\n'
-    + '中斷前收到、還沒處理的訊息會重新送來；已經回過的不用再回。\n'
+    + '中斷前送來、你還沒讀到的訊息會重新送來；已經回過的不用再回。\n'
     + '這是系統產生的通知，不用回覆任何 agent。'
 }
 function onMainReplaced(prevPid: number): void {

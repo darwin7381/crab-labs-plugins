@@ -767,6 +767,10 @@ const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
 const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
 const CONSUME_RETAIN_MS = 1_800_000
 const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null }> = []
+// lanes (002h): deliveries the sweep judged consumed, kept a while so that a main that is replaced right afterwards can
+// still be checked against its transcript (repersistUnconsumed)
+const ACKED_RETAIN_MS = 900_000
+const ackedRecently: Array<{ notif: { method: string; params: unknown }; at: number }> = []
 
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
 // whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
@@ -849,6 +853,10 @@ function sweepDeliveries(): void {
         try { rmSync(d.pendingPath); log('info', `late consumption — retracted re-persisted dup ${d.pendingPath} (issue #13)`) } catch {}
       }
       maybeAutoAckScheduled(d.notif)
+      if (Lanes.LANES_ON) {
+        ackedRecently.push({ notif: d.notif, at: d.at })
+        while (ackedRecently.length > 100 || (ackedRecently.length && now - ackedRecently[0].at > ACKED_RETAIN_MS)) ackedRecently.shift()
+      }
       recentDeliveries.splice(i, 1)
     } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
@@ -897,13 +905,26 @@ function sweepDeliveries(): void {
 function repersistUnconsumed(): number {
   if (!consumptionCheckAvailable) return 0
   const newest = newestGenuineAssistantAt()
+  const now = Date.now()
   let n = 0
-  for (const d of recentDeliveries) {
-    if (d.pendingPath || newest > d.at) continue
+  // 002h: the transcript says which deliveries the old process actually took in (Lanes.takenIn). One that was only queued
+  // inside that process is gone with it, whatever the time-based rule thinks: park it again, and drop its record so the
+  // sweep cannot "retract" it as consumed (tool calls that came after the delivery are not evidence that it was read).
+  for (let i = recentDeliveries.length - 1; i >= 0; i--) {
+    const d = recentDeliveries[i]
+    if (d.pendingPath) continue
+    const t = Lanes.takenIn(d.notif)
+    if (t === true) continue
+    if (t === false) { if (persistInbound(d.notif)) { n++; recentDeliveries.splice(i, 1) } continue }
+    if (newest > d.at) continue                                  // cannot tell from the transcript: the time rule, as before
     d.pendingPath = persistInbound(d.notif)
     if (d.pendingPath) n++
   }
-  if (n) log('info', `main replaced: ${n} unanswered delivery(ies) parked again for the new process`)
+  // the sweep may already have written a delivery off as consumed (it runs every 30 s): look at those too
+  for (const a of ackedRecently.splice(0)) {
+    if (now - a.at <= ACKED_RETAIN_MS && Lanes.takenIn(a.notif) === false && persistInbound(a.notif)) n++
+  }
+  if (n) log('info', `main replaced: ${n} delivery(ies) the old process never took in or answered parked again for the new one`)
   return n
 }
 

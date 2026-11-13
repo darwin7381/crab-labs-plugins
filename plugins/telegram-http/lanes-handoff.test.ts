@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
 import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected,
-  mainConnected, cutOffTurn, resumeNotice, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
+  mainConnected, cutOffTurn, resumeNotice, takenIn, mainTranscript, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
 import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -359,4 +359,28 @@ test('002g: was the last turn cut off? read from the end of the transcript', () 
   expect(cutOffTurn(join(dir, 'nope.jsonl')).cut).toBe(false)
   const n = resumeNotice('2026-11-13T02:03:02.000Z')
   expect(n).toContain('11-13 10:03'); expect(n).toContain('UTC+8'); expect(n).toContain('接著把它做完')
+})
+
+// ------------------------------------------------------------------ 002h: which deliveries did the main actually take in
+test('002h: a message that was only queued when the main died was never taken in; a prompt or a mid-turn message was', () => {
+  const p = mainTranscript()!
+  const rec = (o: object) => JSON.stringify(o) + '\n'
+  const tg = (id: number, text: string) => `<channel source="plugin:telegram-http:telegram-http" chat_id="990000001" message_id="${id}" user="joey_lab" ts="2026-11-13T02:03:02.000Z">\n${text}\n</channel>`
+  const n = (meta: Record<string, string>) => ({ method: 'notifications/claude/channel', params: { content: 'x', meta } }) as any
+  writeFileSync(p,
+    rec({ type: 'queue-operation', operation: 'enqueue', content: tg(1003, '開發工作') }) + rec({ type: 'queue-operation', operation: 'dequeue' })
+    + rec({ type: 'user', message: { content: tg(1003, '開發工作') } })                                                   // became a prompt
+    + rec({ type: 'queue-operation', operation: 'enqueue', content: tg(1006, '還收得到嗎') })
+    + rec({ type: 'queue-operation', operation: 'remove', content: tg(1006, '還收得到嗎'), reason: 'absorbed_mid_turn' })  // arrived mid-turn, absorbed
+    + rec({ type: 'assistant', message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
+    + rec({ type: 'queue-operation', operation: 'enqueue', content: tg(1008, '查 health') })                               // queued; then the process was killed
+    + rec({ type: 'assistant', message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
+    + rec({ type: 'queue-operation', operation: 'enqueue', content: '<channel source="plugin:agent-inbox:agent-inbox" user="eve" btcc_msg_id="50031">hi</channel>' }))
+  expect(takenIn(n({ message_id: '1003' }))).toBe(true)
+  expect(takenIn(n({ message_id: '1006' }))).toBe(true)
+  expect(takenIn(n({ message_id: '1008' }))).toBe(false)        // lost with the process: must be given again
+  expect(takenIn(n({ btcc_msg_id: '50031' }))).toBe(false)      // the same for a mesh message
+  expect(takenIn(n({ message_id: '999' }))).toBeNull()          // not in the transcript at all: cannot tell
+  expect(takenIn(n({}))).toBeNull()                             // nothing to recognise it by
+  writeFileSync(p, '')
 })
