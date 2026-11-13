@@ -231,26 +231,65 @@ function textMatcher(q: string): (hay: string) => boolean {
   return hay => hay.toLowerCase().includes(lower) || (re ? re.test(hay) : false)
 }
 
+export const LEDGER_KIND_HELP: Record<string, string> = {
+  action: 'what a lane did (a reply to a peer, a small fix)',
+  commitment: 'what a lane promised to whom and by when (who / what / by)',
+  escalation: 'things handed to the main',
+  memory_proposal: 'things a lane proposes for memory',
+  receipt: "each lane run's closing report (happened / did / promised / needs main)",
+  notify: 'messages sent to Joey, with their tier',
+  fyi: 'notice-only records',
+  stop: 'threads that were stopped',
+}
+export const LEDGER_QUERY_DESCRIPTION =
+  '[lanes · main only] Look up the live append-only ledger (what the lanes did, notified, promised, escalated). Use it BEFORE answering "what happened" / "what was promised": ' +
+  'the digest only lists highlights, and some facts (silent replies to peers, ledger-only notices) never enter a digest. ' +
+  'Valid kinds: ' + LEDGER_KINDS.map(k => `${k} (${LEDGER_KIND_HELP[k]})`).join('; ') + '. ' +
+  'Use kind=commitment for "what did you promise". `text` searches the text, lane, thread and refs of ALL kinds when kind is empty. ' +
+  'An unknown kind, or a kind with no entries, never returns an empty answer: you get the valid kinds with their counts plus a free-text match across all kinds. ' +
+  'Returns at most 30 matching entries, newest last, each text cut to 600 chars.'
+
+const LEDGER_FALLBACK_ROWS = 10
+
 /** The main's ledger lookup. `raw` = the live ledger.jsonl text (null / empty = no file yet). Newest last, at most
  *  LEDGER_QUERY_MAX entries, each text cut to LEDGER_QUERY_TEXT_MAX. since: ISO or "-4h"; kind: a ledger kind or empty;
- *  text: case-insensitive substring or regex over text, lane, thread and refs. */
+ *  text: case-insensitive substring or regex over text, lane, thread and refs (all kinds when kind is empty).
+ *  002c: never an empty answer. An unknown kind lists the valid kinds and falls back to a free-text match across all
+ *  kinds (text, else the unknown kind word itself); a known kind with no entries says so with the per-kind counts and
+ *  falls back the same way; as a last resort the newest entries are shown. */
 export function queryLedger(raw: string | null, q: { since?: unknown; kind?: unknown; text?: unknown }, now: number): string {
-  const kind = typeof q.kind === 'string' ? q.kind.trim().toLowerCase() : ''
-  if (kind && !(LEDGER_KINDS as readonly string[]).includes(kind)) return `kind 不認得：${kind}。可用：${LEDGER_KINDS.join(' | ')}，或留空。`
+  const kindIn = typeof q.kind === 'string' ? q.kind.trim().toLowerCase() : ''
+  const kindKnown = !kindIn || (LEDGER_KINDS as readonly string[]).includes(kindIn)
   const since = parseSince(q.since, now)
   if (since === 'bad') return `since 格式不對：${String(q.since)}。用 ISO 時間（2026-11-13T04:00:00Z）或相對時間（-4h、-30m、-2d）。`
   const text = typeof q.text === 'string' ? q.text.trim() : ''
-  const echo = `since=${typeof q.since === 'string' && q.since.trim() ? q.since.trim() : '-'} kind=${kind || '-'} text=${text ? clip(text, 80) : '-'}`
+  const echo = `since=${typeof q.since === 'string' && q.since.trim() ? q.since.trim() : '-'} kind=${kindIn || '-'} text=${text ? clip(text, 80) : '-'}`
   const all = (raw ?? '').split('\n').filter(Boolean).map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
   if (!all.length) return `帳本還沒有任何紀錄（ledger.jsonl 不存在或是空的）。${echo}`
-  const match = text ? textMatcher(text) : null
-  const hit = all.filter(r => {
-    if (kind && r.kind !== kind) return false
-    if (since !== null && !(Date.parse(r.ts) >= since)) return false
-    return !match || match(`${r.text} ${r.lane} ${r.thread ?? ''} ${r.refs ? JSON.stringify(r.refs) : ''}`)
-  })
-  if (!hit.length) return `帳本查詢：沒有符合的紀錄（帳本共 ${all.length} 筆）。${echo}`
+  const counts = LEDGER_KINDS.map(k => `${k} ${all.filter(r => r.kind === k).length}`).join('、')
+  const find = (kind: string, needle: string): LedgerRec[] => {
+    const match = needle ? textMatcher(needle) : null
+    return all.filter(r => {
+      if (kind && r.kind !== kind) return false
+      if (since !== null && !(Date.parse(r.ts) >= since)) return false
+      return !match || match(`${r.text} ${r.lane} ${r.thread ?? ''} ${r.refs ? JSON.stringify(r.refs) : ''}`)
+    })
+  }
+  const notes: string[] = []
+  let hit = find(kindKnown ? kindIn : '', text)
+  if (!kindKnown) {
+    notes.push(`kind「${kindIn}」不是帳本的種類。可用的種類：${LEDGER_KINDS.join(' | ')}（帳本現有筆數：${counts}）。已改成在全部種類裡做全文比對「${text || kindIn}」。`)
+    hit = find('', text || kindIn)
+  } else if (!hit.length && kindIn) {
+    notes.push(`帳本裡沒有符合的 kind=${kindIn} 紀錄。可用的種類：${LEDGER_KINDS.join(' | ')}（帳本現有筆數：${counts}）。已改成在全部種類裡比對${text ? `「${text}」` : '（不限內容）'}。`)
+    hit = find('', text)
+  }
+  if (!hit.length && kindIn) {            // a kind was asked for and nothing at all matched: show the newest entries, never an empty answer
+    notes.push(`在指定的範圍內沒有符合的紀錄（帳本共 ${all.length} 筆；各種類：${counts}）。改列帳本最新的 ${Math.min(LEDGER_FALLBACK_ROWS, all.length)} 筆。`)
+    hit = all.slice(-LEDGER_FALLBACK_ROWS)
+  }
+  if (!hit.length) return `帳本查詢：沒有符合的紀錄（帳本共 ${all.length} 筆；各種類現有筆數：${counts}）。${echo}`
   const shown = hit.slice(-LEDGER_QUERY_MAX)
   const rows = shown.map(r => `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`)
-  return [`帳本查詢：符合 ${hit.length} 筆${hit.length > shown.length ? `，只顯示最新 ${shown.length} 筆` : ''}（舊→新）。${echo}`, ...rows].join('\n')
+  return [...notes, `帳本查詢：符合 ${hit.length} 筆${hit.length > shown.length ? `，只顯示最新 ${shown.length} 筆` : ''}（舊→新）。${echo}`, ...rows].join('\n')
 }

@@ -357,7 +357,8 @@ test('lane receipt tool: four fields feed the digest (notify_main), a bare summa
   const rows = readFileSync(join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   expect(rows[0]).toMatchObject({ kind: 'receipt', notify_main: true, refs: { report } })
   expect(rows[0].text).toBe(`run -: done — ${report.happened}`)
-  expect(rows[1]).toMatchObject({ kind: 'receipt', notify_main: false, refs: null, text: 'run -: nothing-to-do — hourly-backup-check: 無變化' })
+  expect(rows[1]).toMatchObject({ kind: 'commitment', notify_main: false, refs: { who: '未指明', what: report.promised, from: 'receipt.promised' } })   // 002c: the receipt's promise gets its own kind
+  expect(rows[2]).toMatchObject({ kind: 'receipt', notify_main: false, refs: null, text: 'run -: nothing-to-do — hourly-backup-check: 無變化' })
   const t = takePendingDigest(false, 'piggyback')!
   expect(t.text).toContain(`發生：${report.happened}`)                                // lane report → digest, end to end
   expect(t.items).toBe(1)
@@ -394,7 +395,7 @@ test('ledger_query: filters — since (ISO and relative), kind, text (substring 
   expect(rowsOf(q({ since: '-4h' })).length).toBe(1)                                 // NOW - 240 min = minute 360: only the entry at 400
   expect(rowsOf(q({ since: new Date(T0 + 150 * 60_000).toISOString() })).length).toBe(3)
   expect(rowsOf(q({ since: '-11h', kind: 'receipt' })).length).toBe(1)               // NOW - 660 min is before minute 0
-  expect(rowsOf(q({ since: '-9h', kind: 'receipt' })).length).toBe(0)                // NOW - 540 min is after the receipt
+  expect(q({ since: '-9h', kind: 'receipt' })).toContain('沒有符合的 kind=receipt')    // NOW - 540 min is after the receipt: 002c says so and widens to all kinds (never empty)
   expect(q({ since: '-1m' })).toContain('沒有符合')
 })
 
@@ -415,7 +416,7 @@ test('ledger_query: missing / empty / damaged ledger is safe; bad arguments are 
   expect(queryLedger('', { text: 'x' }, NOW)).toContain('帳本還沒有任何紀錄')
   expect(queryLedger('not json\n{"also":"bad"\n', {}, NOW)).toContain('帳本還沒有任何紀錄')
   expect(rowsOf(queryLedger('garbage\n' + jl([lq(1)])[0] + '\n', {}, NOW)).length).toBe(1)   // a damaged line is skipped
-  expect(queryLedger(jl([lq(1)]).join('\n'), { kind: 'nope' }, NOW)).toContain('kind 不認得')
+  expect(queryLedger(jl([lq(1)]).join('\n'), { kind: 'nope' }, NOW)).toContain('不是帳本的種類')
   expect(queryLedger(jl([lq(1)]).join('\n'), { since: 'yesterday' }, NOW)).toContain('since 格式不對')
   expect(parseSince('-4h', 1_000_000_000)).toBe(1_000_000_000 - 4 * 3_600_000)
   expect(parseSince('30m', 1_000_000_000)).toBe(1_000_000_000 - 30 * 60_000)
