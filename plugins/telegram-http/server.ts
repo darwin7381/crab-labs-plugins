@@ -1481,7 +1481,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         let minted: number | undefined
         const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op,
           { thread, hop, lane: `${INBOX_SELF}.main`, minted: id => { minted = id } })
-        await Lanes.noteMainOutbound(minted, thread, hop)
+        await Lanes.noteMainOutbound(minted, thread, hop, String(args.to ?? ''), String(args.text ?? ''))
         return { content: [{ type: 'text', text: result + (thread ? ` [thread ${thread} hop ${hop}]` : '') }] }
       }
       const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op)

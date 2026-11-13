@@ -191,3 +191,55 @@ test('a filtered ledger_query always ends by saying what else exists and how to 
   expect(last).toContain('fyi 2')
   expect(last).toContain('ledger_query() 不帶參數')
 })
+
+// ------------------------------------------------------------------ 002e
+test('002e: what a follow-up run reports never rings again (all-clear = silent); if Joey must decide, ask_joey still rings', async () => {
+  reset()
+  const tok = { ...run('alert-critical', true), followup: true }
+  await callLaneTool(tok, 'notify_joey', { text: 'A-1103 已恢復：14:50 備份成功' })
+  expect(sent.length).toBe(1)
+  expect(sent[0].silent).toBe(true)
+  const row = ledgerRows()[0]
+  expect(row.refs.tier).toBe('silent')
+  expect(row.refs.tier_rule).toContain('followup-quiet')
+  const tok2 = { ...run('alert-critical', true), followup: true }
+  await callLaneTool(tok2, 'ask_joey', { text: '後續檢查：備份仍然失敗，要你決定是否改用備援 bucket' })
+  expect(sent[1].silent).toBe(false)
+  const first = run('alert-critical', true)                                             // the first run of the alert itself still rings
+  await callLaneTool(first, 'notify_joey', { text: 'P1：備份 upload 403' })
+  expect(sent[2].silent).toBe(false)
+})
+
+test('002e: the header Joey reads names the lane and carries no internal thread id', async () => {
+  reset()
+  await callLaneTool(run('scheduled'), 'notify_joey', { text: '例行回報' })
+  expect(sent[0].text.split('\n')[0]).toMatch(/^〔adam·反射線#\d+〕$/)
+  expect(sent[0].text).not.toContain('adam#t-')
+})
+
+test('002e: a wake digest puts the handed-over work first and marks the rest as "Joey already knows, do not retell"', async () => {
+  reset()
+  await callLaneTool(run('scheduled'), 'ask_joey', { text: '備份連續失敗，要你決定' })
+  await callLaneTool(run('peer'), 'handoff_main', { text: 'Eve 要 10 月可用率，請主線決定並回她' })
+  const dg = takePendingDigest(true, 'wake')!
+  const lines = dg.text.split('\n')
+  const iHand = lines.findIndex(l => l.includes('這件事交給你了'))
+  const iSep = lines.findIndex(l => l.includes('以下只是讓你知道'))
+  const iAsk = lines.findIndex(l => l.includes('已請 Joey 決定'))
+  expect(iHand).toBeGreaterThan(0)
+  expect(iSep).toBeGreaterThan(iHand)
+  expect(iAsk).toBeGreaterThan(iSep)
+})
+
+test('002e: what the main itself told another agent is a line of the activity list (next to the handoff it answers, or on its own)', () => {
+  const day = [
+    rec(40, { lane: 'adam.reflex.4', thread: 'adam#t-a4', kind: 'escalation', notify_main: true, text: 'Eve 要 10 月可用率；需要主線決定', refs: { handoff: 'ho-1' } }),
+    rec(41, { lane: 'main', thread: 'adam#t-a4', event: 'main-send-50010', kind: 'action', text: 'send_to_agent → eve：整月數字給不出來，只有 10-22 之後的取樣 99.13%' }),
+    rec(50, { lane: 'main', thread: null, event: 'main-send-50011', kind: 'action', text: 'send_to_agent → cain：請不要再發測試訊息' }),
+  ]
+  const lines = queryLedger(day.join('\n'), {}, T0 + 600 * 60_000).split('\n')
+  expect(lines[0]).toContain('活動清單：2 件事')
+  expect(lines[1]).toContain('交給主線：Eve 要 10 月可用率')
+  expect(lines[1]).toContain('主線做了：send_to_agent → eve：整月數字給不出來')
+  expect(lines[2]).toContain('send_to_agent → cain')
+})

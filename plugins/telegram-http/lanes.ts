@@ -613,7 +613,9 @@ type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done' | 
 const queue = new Map<string, QItem>()          // event id → item
 const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval> }>()  // lane id → run
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string
-  escalated: boolean; pushed: boolean; asked?: boolean; handed?: boolean; commitments?: number }
+  escalated: boolean; pushed: boolean; asked?: boolean; handed?: boolean; commitments?: number
+  /** 002e: this run is a follow-up the lane scheduled itself (event id ev-fu-…) */
+  followup?: boolean }
 const runTokens = new Map<string, RunTok>()
 const qPath = (id: string) => join(LANES_DIR, 'queue', `${id.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
 
@@ -780,7 +782,7 @@ function startRun(it: QItem): void {
   const critical = !!lane.critical
   const trigger = it.ev.trigger ?? (lane.kind === 'reflex' ? 'other' : lane.kind)   // main-opened worker / fork: their kind
   const tok: RunTok = { runId, lane: lane.id, evId: it.ev.id, closers: [], critical, trigger, cls: it.ev.cls ?? trigger,
-    escalated: false, pushed: false }
+    escalated: false, pushed: false, followup: it.ev.id.startsWith('ev-fu-') }
   runTokens.set(token, tok)
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
@@ -875,7 +877,7 @@ function startRun(it: QItem): void {
 
 async function pushJoey(lane: Lane | undefined, text: string, silent: boolean): Promise<number | null> {
   if (!D.sendBot || !D.joeyChatId) return null
-  const head = lane ? `〔${D.agent}·${laneLabel(lane)}｜${lane.thread}〕` : `〔${D.agent}·分流器〕`
+  const head = lane ? `〔${D.agent}·${laneLabel(lane)}〕` : `〔${D.agent}·分流器〕`
   try {
     const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { silent, topic: lane?.topic })
     if (lane) { S.botmsgs[String(id)] = lane.id; saveState() }
@@ -967,6 +969,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const text = String(a.text ?? '').trim()
       if (!text) throw new Error('empty text')
       const dec = notifyDecision(tok.cls, false, lane.thread)
+      // 002e: the event already rang (or did not) when it arrived. What a follow-up finds later is either an all-clear,
+      // which must not ring again, or something Joey has to decide, which is ask_joey's job.
+      if (tok.followup && dec.tier === 'push') { dec.tier = 'silent'; dec.rule += '+followup-quiet' }
       const tier = dec.tier
       const ignored = Object.keys(a ?? {}).filter(k => k !== 'text')
       const rec = { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, trigger: tok.trigger, escalated: false }
@@ -1345,9 +1350,10 @@ export async function routeRemote(ev: InEvent): Promise<Decision | null> {
   return r && r.target ? r as Decision : null
 }
 /** inbox role: tell the tg daemon about a mesh send made by the main (send_to_agent). */
-export async function noteMainOutbound(msgId: number | undefined, thread: string | undefined, hop: number | undefined): Promise<void> {
+export async function noteMainOutbound(msgId: number | undefined, thread: string | undefined, hop: number | undefined,
+  to?: string, text?: string): Promise<void> {
   if (msgId == null) return
-  await peerCall(TG_PORT, '/lanes/outbound', 'POST', { msgId, owner: 'main', thread: thread ?? null, hop: hop ?? null })
+  await peerCall(TG_PORT, '/lanes/outbound', 'POST', { msgId, owner: 'main', thread: thread ?? null, hop: hop ?? null, to: to ?? null, text: (text ?? '').slice(0, 400) })
 }
 /** inbox role: hop gate for a main send in a thread. */
 export async function checkMainSend(thread: string, hop: number): Promise<{ ok: boolean; hop: number; why?: string }> {
@@ -1383,6 +1389,11 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const b = await readBody(req)
       S.outbound[String(b.msgId)] = { owner: String(b.owner ?? 'main'), thread: b.thread ?? null }
       if (b.thread) { const t = ensureThread(String(b.thread), 'main', null, 0); if (b.hop) t.hops = Math.max(t.hops, Number(b.hop)) }
+      // 002e: what the main itself tells another agent is part of the day's activity (002d: only the lanes' sends were)
+      if (String(b.owner ?? 'main') === 'main' && b.to && b.text) {
+        ledger({ lane: 'main', thread: b.thread ?? null, event: `main-send-${b.msgId}`, kind: 'action', notify_main: false,
+          text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId } })
+      }
       saveState(); sendJson(res, 200, { ok: true }); return true
     }
     if (p === '/lanes/outbound-check' && req.method === 'POST') {
