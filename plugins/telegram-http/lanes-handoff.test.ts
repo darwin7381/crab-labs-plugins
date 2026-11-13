@@ -8,7 +8,9 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected } from './lanes.ts'
+import { spawnSync } from 'child_process'
+import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected,
+  mainConnected, cutOffTurn, resumeNotice, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
 import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -287,4 +289,74 @@ test('002f: a stopped thread stays stopped: the stop wakes the main once, later 
   const ride = takePendingDigest(false, 'piggyback')!                     // they ride along with its next natural message
   expect(ride.text).toContain('已關閉的對話線又收到 eve 的訊息')
   expect(Object.values(st.lanes).filter((l: any) => l.thread === 'adam#t-loop' && l.status === 'running').length).toBe(0)   // no lane was started
+})
+
+// ------------------------------------------------------------------ 002g: is the main there, and what happens when it is not
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+test('002g: a main whose process is gone is not "connected", whatever its MCP session says', () => {
+  reset()
+  expect(mainConnected()).toBe(true)
+  __setMainPid(spawnSync('true').pid!)                          // a pid that has just exited
+  expect(mainConnected()).toBe(false)
+  __setMainPid(1); __setMainConnected('mcp-main')
+  expect(mainConnected()).toBe(true)
+})
+
+test('002g: a main that just went away gets a grace period; when it is not back in time Joey is told, once', async () => {
+  reset()
+  __setHandoffDownGrace(120)
+  __setMainConnected(null, 0)                                   // its process died this instant
+  const out = await callLaneTool(run('peer'), 'handoff_main', { text: '主線剛離線時交過來的事' })
+  expect(out).not.toContain('Joey was told directly')
+  await sleep(20)
+  expect(sent.length).toBe(0)                                   // a restart takes seconds: not a reason to ring Joey
+  handoffTick(); await sleep(20)
+  expect(sent.length).toBe(0)
+  await sleep(140)
+  handoffTick(); await sleep(20)
+  expect(sent.length).toBe(1)
+  expect(sent[0].text).toContain('不在線')
+  expect(sent[0].text).toContain('主線剛離線時交過來的事')
+  handoffTick(); await sleep(20)
+  expect(sent.length).toBe(1)
+  __setHandoffDownGrace(60_000)
+})
+
+test('002g: a main that is back inside the grace period gets the handoff; Joey is not told', async () => {
+  reset()
+  __setHandoffDownGrace(150)
+  __setMainConnected(null, 0)
+  await callLaneTool(run('peer'), 'handoff_main', { text: '主線重啟中交過來的事' })
+  __setMainConnected('mcp-main')                                // back after a restart
+  await sleep(200)
+  handoffTick(); await sleep(20)
+  expect(sent.length).toBe(0)
+  expect(Object.values(__lanesState().handoffs)[0].state).toBe('pending')   // it waits for the main's next digest, like any handoff
+  expect(takePendingDigest(true, 'wake')).not.toBeNull()
+  __setHandoffDownGrace(60_000)
+})
+
+test('002g: was the last turn cut off? read from the end of the transcript', () => {
+  const p = join(dir, 'cut.jsonl')
+  const rec = (o: object) => JSON.stringify(o) + '\n'
+  const A = (stop: string, kinds: string[], model = 'claude-haiku-5-5') =>
+    rec({ type: 'assistant', timestamp: '2026-11-13T02:02:52.000Z', message: { model, stop_reason: stop, content: kinds.map(k => ({ type: k })) } })
+  const resumed = A('stop_sequence', ['text'], '<synthetic>')    // "No response requested." written by the new process
+  // killed while a tool call was out: its result, a Telegram message waiting in the queue, then the new process
+  writeFileSync(p, A('tool_use', ['tool_use']) + rec({ type: 'user', timestamp: '2026-11-13T02:02:52.500Z', message: { content: [{ type: 'tool_result' }] } })
+    + rec({ type: 'queue-operation', operation: 'enqueue', content: '<channel source="plugin:telegram-http:telegram-http">' }) + resumed)
+  expect(cutOffTurn(p)).toEqual({ cut: true, at: '2026-11-13T02:02:52.500Z' })
+  // killed while idle, after a turn that ended by itself
+  writeFileSync(p, A('end_turn', ['text']) + rec({ type: 'system', subtype: 'stop_hook_summary' }) + rec({ type: 'system', subtype: 'turn_duration' }) + resumed)
+  expect(cutOffTurn(p).cut).toBe(false)
+  writeFileSync(p, A('end_turn', ['text']) + resumed)
+  expect(cutOffTurn(p).cut).toBe(false)
+  writeFileSync(p, A('tool_use', ['thinking']) + A('tool_use', ['tool_use']) + resumed)
+  expect(cutOffTurn(p).cut).toBe(true)
+  writeFileSync(p, rec({ type: 'user', timestamp: 't', message: { content: 'a prompt nobody answered' } }) + resumed)
+  expect(cutOffTurn(p)).toEqual({ cut: true, at: 't' })
+  expect(cutOffTurn(join(dir, 'nope.jsonl')).cut).toBe(false)
+  const n = resumeNotice('2026-11-13T02:03:02.000Z')
+  expect(n).toContain('11-13 10:03'); expect(n).toContain('UTC+8'); expect(n).toContain('接著把它做完')
 })

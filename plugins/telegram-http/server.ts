@@ -891,6 +891,22 @@ function sweepDeliveries(): void {
   }
 }
 
+/** lanes (002g): the registered main was replaced by a new process. What was handed to the old one and never answered (no
+ *  genuine assistant record after it) will not be consumed by anyone: park it again now, so the new process gets it as soon
+ *  as its session is open, not after CONSUME_GRACE_MS. */
+function repersistUnconsumed(): number {
+  if (!consumptionCheckAvailable) return 0
+  const newest = newestGenuineAssistantAt()
+  let n = 0
+  for (const d of recentDeliveries) {
+    if (d.pendingPath || newest > d.at) continue
+    d.pendingPath = persistInbound(d.notif)
+    if (d.pendingPath) n++
+  }
+  if (n) log('info', `main replaced: ${n} unanswered delivery(ies) parked again for the new process`)
+  return n
+}
+
 async function replayPendingFromDisk(server: Server): Promise<number> {
   // 🔴 SSE-open gate. `server.notification()` RESOLVES even when the SSE stream
   // is not yet open — the write lands in a stream nobody is reading — and this
@@ -3094,6 +3110,7 @@ if (Lanes.LANES_ON) {
     log,
     deliverToMain,
     authOk: tokOk,
+    repersistUnconsumed,
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     ...(INBOX_ONLY ? {
       meshSend: async (to, text, replyTo, noReply, extra) => {
