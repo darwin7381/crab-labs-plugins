@@ -76,6 +76,15 @@ const HANDOFF_FALLBACK_MS = Number(process.env.LANES_HANDOFF_FALLBACK_MS ?? 300_
 let HANDOFF_DOWN_GRACE_MS = Number(process.env.LANES_HANDOFF_DOWN_GRACE_MS ?? 60_000)
 // 002g: how long after the main's process was replaced the "your turn was cut off, carry on" notice goes out
 const RESUME_NOTICE_DELAY_MS = Number(process.env.LANES_RESUME_NOTICE_DELAY_MS ?? 6_000)
+// 002i: a delivery that left no trace in the main's transcript after this long never arrived and is given again
+// (the same value is read by server.ts); after the main's process was replaced the check is run once this much later
+const ARRIVE_GRACE_MS = Number(process.env.LANES_ARRIVE_GRACE_MS ?? 20_000)
+// 002i: a critical alert reaches Joey within this long whatever its lane is doing. A lane that reports in time is the one
+// that rings (as before); when it has not, the router rings with the alert itself and the lane's findings follow quietly.
+// (T6-R 1.3 on 002h: the lane restarted the service, waited for it to settle and told Joey 6 minutes after the alert.)
+let CRITICAL_DEADLINE_MS = Number(process.env.LANES_CRITICAL_DEADLINE_MS ?? 60_000)
+/** tests only */
+export const __setCriticalDeadline = (ms: number): void => { CRITICAL_DEADLINE_MS = ms }
 const LOGOS_URL = (process.env.GENESIS_LOGOS_URL ?? '').replace(/\/+$/, '')
 
 export type Notif = { method: string; params: unknown }
@@ -104,6 +113,8 @@ export interface LanesDeps {
   authOk: (authz: string | undefined) => boolean
   /** 002g: park again, for the next session, every delivery the main's transcript never answered; returns how many */
   repersistUnconsumed?: () => number
+  /** 002i: run the delivery sweep and the drain of parked deliveries now */
+  sweepNow?: () => void
 }
 
 let D: LanesDeps
@@ -295,13 +306,19 @@ function tailText(path: string, max: number): string | null {
   } catch { return null }
 }
 
-/** 002h: did the main's session take this notification in? Its own transcript says so: a message that became a prompt is a
- *  `user` record, one that arrived mid-turn is recorded as absorbed. A message that is there only as "enqueue" was still
- *  waiting inside the claude process when that process died: it never reached the model. (Bad-day run on 002g: Joey's
- *  question arrived 5 s before the main was killed and was lost; the daemon's time-based rule read the tool calls that
- *  followed the delivery as proof that it had been consumed.)
- *  true = taken in, false = queued and lost, null = cannot tell (no id on it, or not in the part of the transcript read). */
-export function takenIn(notif: Notif): boolean | null {
+/** 002i: what became of ONE delivery to the main, read from the main's own transcript. A message that became a prompt is a
+ *  `user` record; one that arrived mid-turn is recorded as absorbed; one the client has received and not read yet is there
+ *  as "enqueue" only. Only records written at or after `sinceMs` count (the time this delivery was made): an older enqueue
+ *  belongs to an earlier attempt, usually to a claude process that has died since.
+ *    taken            the model has it
+ *    queued           the client has it and the model has not read it yet (fine while that process lives; lost if it dies)
+ *    neither          this delivery left no trace: it never arrived (a client that is still starting drops what it is sent)
+ *  null = cannot tell (nothing on the notification to recognise it by, or no transcript).
+ *  History: on 002g Joey's question was queued in a main that was then killed, and was lost: the daemon's rule "the
+ *  transcript advanced after the delivery" read the running turn's tool calls as consumption. On 002h it was parked again
+ *  for the new process, replayed 50 ms after that process connected, dropped by the starting client, and written off by
+ *  the same rule a second time. */
+export function intake(notif: Notif, sinceMs = 0): { taken: boolean; queued: boolean } | null {
   const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
   const key = meta.message_id ? `message_id="${meta.message_id}"` : meta.btcc_msg_id ? `btcc_msg_id="${meta.btcc_msg_id}"` : meta.ts ? `ts="${meta.ts}"` : null
   const path = mainReg?.transcript_path
@@ -309,17 +326,16 @@ export function takenIn(notif: Notif): boolean | null {
   const text = tailText(path, 2_000_000)
   if (text == null) return null
   const inJson = JSON.stringify(key).slice(1, -1)            // the key as it is written inside a JSON string
-  let queued = false
+  let taken = false, queued = false
   for (const line of text.split('\n')) {
     if (!line.includes(inJson)) continue
     let j: any; try { j = JSON.parse(line) } catch { continue }
-    if (j.type === 'user') return true
-    if (j.type === 'attachment' && j.attachment?.type === 'queued_command') return true
-    if (j.type !== 'queue-operation') continue
-    if (j.operation === 'remove' && j.reason === 'absorbed_mid_turn') return true
-    if (j.operation === 'enqueue') queued = true
+    if (sinceMs && !(Date.parse(j.timestamp ?? '') >= sinceMs - 3_000)) continue
+    if (j.type === 'user' || (j.type === 'attachment' && j.attachment?.type === 'queued_command')) taken = true
+    else if (j.type === 'queue-operation' && j.operation === 'remove' && j.reason === 'absorbed_mid_turn') taken = true
+    else if (j.type === 'queue-operation' && j.operation === 'enqueue') queued = true
   }
-  return queued ? false : null
+  return { taken, queued: queued && !taken }
 }
 
 /** Did the session's last turn end, or was it cut off? Read from the end of its transcript: a completed turn ends with an
@@ -352,6 +368,7 @@ function onMainReplaced(prevPid: number): void {
   const n = D.repersistUnconsumed?.() ?? 0
   D.log('info', `lanes: the main's process was replaced (${prevPid} → ${mainReg!.claude_pid}); ${n} unanswered delivery(ies) parked again for it`)
   logos('lane.main_replaced', { prev_pid: prevPid, pid: mainReg!.claude_pid, redelivered: n, role: D.role })
+  setTimeout(() => D.sweepNow?.(), ARRIVE_GRACE_MS + 5_000)      // 002i: what was replayed into the starting process and dropped is given again
   if (D.role !== 'tg') return
   const c = cutOffTurn(mainReg!.transcript_path)
   if (!c.cut) return
@@ -430,6 +447,7 @@ type State = {
   pushes: Record<string, number[]>                                     // thread → push times (frequency cap)
   followups: Record<string, Followup>                                  // 002c: scheduled follow-ups (due = simulated ms)
   handoffs: Record<string, Handoff>                                    // 002d: work handed to the main, until the main has it
+  deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
 }
 /** 002d: something a lane (or the router) handed to the main. pending → delivered (the main got the wake digest that
  *  carries it) | fallback (the main did not get it in time, or is not connected: Joey was told directly, once). */
@@ -439,7 +457,7 @@ let S: State
 const statePath = () => join(LANES_DIR, 'state.json')
 function loadState(): void {
   S = readJson<State>(statePath(), null as unknown as State) ?? ({} as State)
-  S.counters ??= {}; S.lanes ??= {}; S.threads ??= {}; S.outbound ??= {}; S.botmsgs ??= {}; S.topics ??= {}; S.tickets ??= {}; S.dedupe ??= {}; S.pushes ??= {}; S.followups ??= {}; S.handoffs ??= {}
+  S.counters ??= {}; S.lanes ??= {}; S.threads ??= {}; S.outbound ??= {}; S.botmsgs ??= {}; S.topics ??= {}; S.tickets ??= {}; S.dedupe ??= {}; S.pushes ??= {}; S.followups ??= {}; S.handoffs ??= {}; S.deadline_rang ??= {}
   for (const l of Object.values(S.lanes)) if (l.status === 'running') l.status = 'idle'   // processes died with the old daemon
 }
 function saveState(): void { try { writeJsonAtomic(statePath(), S) } catch (e) { D.log('error', `lanes: state save failed: ${e}`) } }
@@ -938,6 +956,26 @@ function writeLaneSettings(): void {
   writeJsonAtomic(join(LANES_DIR, 'lane-settings.json'), settings, 0o644)
 }
 
+const criticalTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const rangByLane = new Set<string>()             // events a lane has already rung Joey for (this daemon's lifetime)
+function armCriticalDeadline(it: QItem, lane: Lane): void {
+  const id = it.ev.id
+  if (criticalTimers.has(id) || rangByLane.has(id) || S.deadline_rang[id]) return
+  const left = Math.max(0, CRITICAL_DEADLINE_MS - (Date.now() - (Date.parse(it.enqueued) || Date.now())))
+  criticalTimers.set(id, setTimeout(() => {
+    criticalTimers.delete(id)
+    if (rangByLane.has(id) || S.deadline_rang[id]) return
+    S.deadline_rang[id] = Date.now(); saveState()
+    const text = `嚴重警報已收到，${laneLabel(lane)}正在查證，結果隨後補上（不再響鈴）。\n原文：${it.ev.text.slice(0, 400)}`
+    const cls = it.ev.cls ?? it.ev.trigger ?? 'alert-critical'
+    ledger({ lane: lane.id, thread: lane.thread, event: id, kind: 'notify', notify_main: true, text: `[push] ${text.slice(0, 400)}`,
+      refs: { class: cls, escalated: false, tier: 'push', tier_rule: 'critical-deadline' } })
+    void pushJoey(lane, text, false).then(mid => {
+      logos('lane.notify', { lane: lane.id, thread: lane.thread, event: id, class: cls, escalated: false, tier: 'push', tier_rule: 'critical-deadline', message_id: mid })
+    })
+  }, left))
+}
+
 /** how a lane run attaches to its conversation. 002f: resume whenever the conversation is already on disk. The run counter
  *  alone is not enough: a run cut off by a daemon restart never reached the exit handler, and starting the same session id
  *  a second time fails at once (first bad-day run: one wasted attempt, two more minutes). */
@@ -984,6 +1022,7 @@ function startRun(it: QItem): void {
     try { child.kill('SIGKILL') } catch {}
   }, LANE_MAX_RUN_MS)
   running.set(lane.id, { child, evId: it.ev.id, runId, renew })
+  if (critical && !tok.followup) armCriticalDeadline(it, lane)
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
@@ -1173,6 +1212,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // 002e: the event already rang (or did not) when it arrived. What a follow-up finds later is either an all-clear,
       // which must not ring again, or something Joey has to decide, which is ask_joey's job.
       if (tok.followup && dec.tier === 'push') { dec.tier = 'silent'; dec.rule += '+followup-quiet' }
+      // 002i: the router already rang for this event at the deadline: what the lane found follows quietly
+      if (S.deadline_rang[tok.evId] && dec.tier === 'push') { dec.tier = 'silent'; dec.rule += '+rang-at-deadline' }
       const tier = dec.tier
       const ignored = Object.keys(a ?? {}).filter(k => k !== 'text')
       const rec = { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, trigger: tok.trigger, escalated: false }
@@ -1192,7 +1233,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       S.dedupe[h] = Date.now()
       const id = await pushJoey(lane, text, tier === 'silent')
       if (id == null) throw new Error('send failed')
-      if (tier === 'push') { tok.pushed = true; S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
+      if (tier === 'push') { tok.pushed = true; rangByLane.add(tok.evId); S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
       saveState()
       logos('lane.notify', { ...rec, tier, tier_rule: dec.rule, message_id: id })
       return `sent to Joey (message_id ${id}${lane.topic ? `, topic ${lane.topic}` : ''})`
@@ -1265,7 +1306,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       const id = await pushJoey(lane, text, tier === 'silent')
       if (id == null) throw new Error('send failed')
-      if (tier === 'push') { tok.pushed = true; S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
+      if (tier === 'push') { tok.pushed = true; rangByLane.add(tok.evId); S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
       saveState()
       logos('lane.notify', { ...rec, tier, tier_rule: dec.rule, message_id: id })
       return `sent to Joey (message_id ${id}). The main will read it in its next digest; do not hand it to the main as well.`

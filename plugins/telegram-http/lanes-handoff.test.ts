@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
 import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected,
-  mainConnected, cutOffTurn, resumeNotice, takenIn, mainTranscript, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
+  mainConnected, cutOffTurn, resumeNotice, intake, mainTranscript, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
 import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -361,26 +361,32 @@ test('002g: was the last turn cut off? read from the end of the transcript', () 
   expect(n).toContain('11-13 10:03'); expect(n).toContain('UTC+8'); expect(n).toContain('接著把它做完')
 })
 
-// ------------------------------------------------------------------ 002h: which deliveries did the main actually take in
-test('002h: a message that was only queued when the main died was never taken in; a prompt or a mid-turn message was', () => {
+// ------------------------------------------------------------------ 002h/002i: what became of a delivery to the main
+test('002i: the transcript says what became of a delivery: taken in, waiting in the client, or never arrived', () => {
   const p = mainTranscript()!
   const rec = (o: object) => JSON.stringify(o) + '\n'
   const tg = (id: number, text: string) => `<channel source="plugin:telegram-http:telegram-http" chat_id="990000001" message_id="${id}" user="joey_lab" ts="2026-11-13T02:03:02.000Z">\n${text}\n</channel>`
   const n = (meta: Record<string, string>) => ({ method: 'notifications/claude/channel', params: { content: 'x', meta } }) as any
+  const T0 = Date.parse('2026-11-13T02:00:00.000Z'), at = (s: number) => new Date(T0 + s * 1000).toISOString()
   writeFileSync(p,
-    rec({ type: 'queue-operation', operation: 'enqueue', content: tg(1003, '開發工作') }) + rec({ type: 'queue-operation', operation: 'dequeue' })
-    + rec({ type: 'user', message: { content: tg(1003, '開發工作') } })                                                   // became a prompt
-    + rec({ type: 'queue-operation', operation: 'enqueue', content: tg(1006, '還收得到嗎') })
-    + rec({ type: 'queue-operation', operation: 'remove', content: tg(1006, '還收得到嗎'), reason: 'absorbed_mid_turn' })  // arrived mid-turn, absorbed
-    + rec({ type: 'assistant', message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
-    + rec({ type: 'queue-operation', operation: 'enqueue', content: tg(1008, '查 health') })                               // queued; then the process was killed
-    + rec({ type: 'assistant', message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
-    + rec({ type: 'queue-operation', operation: 'enqueue', content: '<channel source="plugin:agent-inbox:agent-inbox" user="eve" btcc_msg_id="50031">hi</channel>' }))
-  expect(takenIn(n({ message_id: '1003' }))).toBe(true)
-  expect(takenIn(n({ message_id: '1006' }))).toBe(true)
-  expect(takenIn(n({ message_id: '1008' }))).toBe(false)        // lost with the process: must be given again
-  expect(takenIn(n({ btcc_msg_id: '50031' }))).toBe(false)      // the same for a mesh message
-  expect(takenIn(n({ message_id: '999' }))).toBeNull()          // not in the transcript at all: cannot tell
-  expect(takenIn(n({}))).toBeNull()                             // nothing to recognise it by
+    rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(1), content: tg(1003, '開發工作') }) + rec({ type: 'queue-operation', operation: 'dequeue', timestamp: at(1) })
+    + rec({ type: 'user', timestamp: at(1), message: { content: tg(1003, '開發工作') } })                                                    // became a prompt
+    + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(60), content: tg(1006, '還收得到嗎') })
+    + rec({ type: 'queue-operation', operation: 'remove', timestamp: at(63), content: tg(1006, '還收得到嗎'), reason: 'absorbed_mid_turn' })   // arrived mid-turn, absorbed
+    + rec({ type: 'assistant', timestamp: at(64), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
+    + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(90), content: tg(1008, '查 health') })                               // queued; then the process was killed
+    + rec({ type: 'assistant', timestamp: at(92), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
+    + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(93), content: '<channel source="plugin:agent-inbox:agent-inbox" user="eve" btcc_msg_id="50031">hi</channel>' }))
+  expect(intake(n({ message_id: '1003' }), T0)).toEqual({ taken: true, queued: false })
+  expect(intake(n({ message_id: '1006' }), T0 + 60_000)).toEqual({ taken: true, queued: false })
+  expect(intake(n({ message_id: '1008' }), T0 + 90_000)).toEqual({ taken: false, queued: true })     // in the client's queue, not read
+  expect(intake(n({ btcc_msg_id: '50031' }), T0 + 93_000)).toEqual({ taken: false, queued: true })   // the same for a mesh message
+  // the same message given again to a NEW process at +100 s: the old enqueue is not evidence for this delivery
+  expect(intake(n({ message_id: '1008' }), T0 + 100_000)).toEqual({ taken: false, queued: false })   // no trace: it never arrived
+  writeFileSync(p, readFileSync(p, 'utf8') + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(125), content: tg(1008, '查 health') })
+    + rec({ type: 'queue-operation', operation: 'dequeue', timestamp: at(125) }) + rec({ type: 'user', timestamp: at(125), message: { content: tg(1008, '查 health') } }))
+  expect(intake(n({ message_id: '1008' }), T0 + 124_000)).toEqual({ taken: true, queued: false })    // the second copy was read
+  expect(intake(n({ message_id: '999' }), T0)).toEqual({ taken: false, queued: false })
+  expect(intake(n({}), T0)).toBeNull()                                                               // nothing to recognise it by
   writeFileSync(p, '')
 })

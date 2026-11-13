@@ -9,7 +9,7 @@ import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { lanesInit, routeEvent, sessionArgs, sweepQueue, __lanesState, __setMainConnected, __setRetryBackoff, __setClaudeBin, __setLaneMaxRun } from './lanes.ts'
+import { lanesInit, routeEvent, sessionArgs, sweepQueue, callLaneTool, __lanesState, __setMainConnected, __setRetryBackoff, __setClaudeBin, __setLaneMaxRun, __setCriticalDeadline } from './lanes.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-retry-'))
@@ -17,6 +17,7 @@ process.env.LANES_DIR = dir
 copyFileSync(ROUTER, join(dir, 'router.json'))
 writeFileSync(join(dir, 'main.json'), JSON.stringify({ session_id: 'a20fb7c0-f35a-4365-9a21-9e16e9f78fed', transcript_path: join(dir, 'main.jsonl'),
   claude_pid: 1, registered_at: new Date().toISOString() }))
+const sent: Array<{ text: string; silent: boolean }> = []
 const dying = join(dir, 'dying-lane.sh')
 writeFileSync(dying, '#!/bin/sh\nsleep 0.2\nexit 1\n'); chmodSync(dying, 0o755)
 
@@ -34,7 +35,7 @@ afterAll(() => { __setClaudeBin(restoreBin); __setRetryBackoff(5000) })
 
 lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {},
   deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
-  sendBot: async () => 1, joeyChatId: () => '1' } as any)
+  sendBot: async (_c: string, text: string, o: { silent?: boolean }) => { sent.push({ text, silent: !!o?.silent }); return 2000 + sent.length }, joeyChatId: () => '1' } as any)
 __setMainConnected('mcp-main')
 
 const rows = (name: string): any[] => { try { return readFileSync(join(dir, name), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
@@ -112,4 +113,57 @@ test('002g: a lane run that hangs is stopped at the time limit, run again, and a
     expect(lj.filter(r => r.kind === 'exit').every(r => r.signal === 'SIGKILL')).toBe(true)
     expect(lj.filter(r => r.kind === 'spawn').map(r => r.attempt)).toEqual([1, 2, 3])
   } finally { __setClaudeBin(was); __setLaneMaxRun(900_000) }
+})
+
+test('002i: a critical alert reaches Joey at the deadline when its lane has not reported; the lane then follows quietly', async () => {
+  const slow = join(dir, 'slow-lane.sh')
+  writeFileSync(slow, '#!/bin/sh\nexec sleep 2\n'); chmodSync(slow, 0o755)
+  const was = __setClaudeBin(slow)
+  __setCriticalDeadline(120)
+  sent.length = 0
+  try {
+    const d = await routeEvent({ id: 'mesh-crit1', source: 'mesh', from: 'alert-dispatcher', verified: true,
+      text: '[P1][critical] mock-api 錯誤率飆高：error_rate 0.08、p95 2.6s（alert A-1201）', meta: {},
+      notif: { method: 'notifications/claude/channel', params: { content: 'x', meta: {} } } } as any)
+    expect(d.target).toBe('lane')
+    expect(d.critical).toBe(true)
+    await sleep(60)
+    expect(sent.length).toBe(0)                                             // inside the deadline: the lane is the one that should ring
+    await until(() => sent.length > 0, 1500)
+    expect(sent.length).toBe(1)
+    expect(sent[0].silent).toBe(false)
+    expect(sent[0].text).toContain('嚴重警報已收到')
+    expect(sent[0].text).toContain('A-1201')
+    const st = __lanesState()
+    expect(st.deadline_rang['mesh-crit1']).toBeGreaterThan(0)
+    const lane = st.lanes[d.lane!]
+    const tok = { runId: `${lane.id}.r1`, lane: lane.id, evId: 'mesh-crit1', closers: [], critical: true, trigger: 'alert-critical', cls: 'alert-critical', escalated: false, pushed: false } as any
+    const out = await callLaneTool(tok, 'notify_joey', { text: 'A-1201 查證：10:05 起 error 0.08，已重啟，恢復。' })
+    expect(out).toContain('sent to Joey')
+    expect(sent.length).toBe(2)
+    expect(sent[1].silent).toBe(true)                                       // the findings do not ring a second time
+    expect(rows('ledger.jsonl').filter(r => r.event === 'mesh-crit1' && r.kind === 'notify').map(r => r.refs.tier_rule).join(' ')).toContain('rang-at-deadline')
+    st.lanes[d.lane!].status = 'closed'
+  } finally { __setClaudeBin(was); __setCriticalDeadline(60_000) }
+})
+
+test('002i: a lane that reports a critical alert in time rings itself; the router adds nothing', async () => {
+  const slow = join(dir, 'slow-lane.sh')
+  const was = __setClaudeBin(slow)
+  __setCriticalDeadline(250)
+  sent.length = 0
+  try {
+    const d = await routeEvent({ id: 'mesh-crit2', source: 'mesh', from: 'alert-dispatcher', verified: true,
+      text: '[P1][critical] mock-api 備份連續 2 次 upload 403（alert A-1103）', meta: {},
+      notif: { method: 'notifications/claude/channel', params: { content: 'x', meta: {} } } } as any)
+    const st = __lanesState(), lane = st.lanes[d.lane!]
+    const tok = { runId: `${lane.id}.r1`, lane: lane.id, evId: 'mesh-crit2', closers: [], critical: true, trigger: 'alert-critical', cls: 'alert-critical', escalated: false, pushed: false } as any
+    await callLaneTool(tok, 'notify_joey', { text: 'A-1103 查證：upload 403，權限問題，需要平台組。' })
+    expect(sent.length).toBe(1)
+    expect(sent[0].silent).toBe(false)
+    await sleep(400)
+    expect(sent.length).toBe(1)                                             // the deadline passed: nothing more
+    expect(st.deadline_rang['mesh-crit2']).toBeUndefined()
+    st.lanes[d.lane!].status = 'closed'
+  } finally { __setClaudeBin(was); __setCriticalDeadline(60_000) }
 })
