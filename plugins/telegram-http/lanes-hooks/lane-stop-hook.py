@@ -12,7 +12,7 @@ import json
 import os
 import sys
 
-CLOSERS = ('mcp__lane__notify_joey', 'mcp__lane__reply_agent', 'mcp__lane__receipt')
+CLOSERS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main', 'mcp__lane__reply_agent', 'mcp__lane__receipt')
 MAX_BLOCKS = 2
 
 
@@ -87,7 +87,7 @@ def main():
         f'⛔ lane-stop-hook: {lane} has not reported yet. Close this turn with notify_joey'
         ', reply_agent (answering the agent that asked), or receipt '
         '(scheduled routine; high-frequency no-change may leave only the receipt). '
-        'Never end silent. If the decision belongs to the main, call escalate and then notify_joey.')}))
+        'Never end silent. If Joey must decide, use ask_joey; if the main must do it, use handoff_main (one of them, not both).')}))
 
 
 if __name__ == '__main__':

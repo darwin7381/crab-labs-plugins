@@ -41,10 +41,11 @@ const escalatedPush = () => L({ lane: 'adam.reflex.5', thread: 'adam#t-04f200', 
 const NO_ID = { id: 'dg-test' }
 
 // ------------------------------------------------------------------ 1. wake entries: the only things that wake an idle main
-test('wake entries = escalation, stop, push-tier notice that is not the push of an escalated run; nothing else', () => {
+test('wake entries (002d) = work handed to the main (escalation) and a stopped thread; a message a lane already sent to Joey never wakes it', () => {
   expect(isWakeEntry(escalation())).toBe(true)
   expect(isWakeEntry(L({ kind: 'stop', text: '停止投遞：hop 7 > limit 6' }))).toBe(true)
-  expect(isWakeEntry(L({ kind: 'notify', refs: { tier: 'push', escalated: false }, text: '[push] P1 備份失敗' }))).toBe(true)
+  expect(isWakeEntry(L({ kind: 'notify', refs: { tier: 'push', escalated: false }, text: '[push] P1 備份失敗' }))).toBe(false)   // 002d: the lane told Joey; the main reads it in its digest
+  expect(isWakeEntry(L({ kind: 'notify', refs: { tier: 'push', escalated: true, ask: true }, text: '[push] 要你決定' }))).toBe(false)
   expect(isWakeEntry(escalatedPush())).toBe(false)                                   // duplicate of the escalation (Stage A: D4 + D5)
   for (const kind of ['fyi', 'receipt', 'action', 'commitment', 'memory_proposal']) expect(isWakeEntry(L({ kind, text: 'x' }))).toBe(false)
   expect(isWakeEntry(silentFyi('3'))).toBe(false)
@@ -309,7 +310,8 @@ test('structured digest: lane thread with an escalation is a block first (never 
   expect(iRoutine).toBeGreaterThan(iEsc)
   expect(lines[iEsc + 4]).toContain('需主線：【A-1103 升級｜mock-backup｜P1】upload 連續 403')
   expect(lines[iEsc + 3]).toBe('  承諾：無')
-  expect(lines[iEsc + 2]).toContain('已推播給 Joey')                                   // what the lane did, from its push
+  expect(lines[iEsc + 2]).toContain('已通知 Joey（已響鈴），不要重複通知他')              // what the lane did, from its push
+  expect(lines[iEsc + 5]).toContain('這件事交給你了')                                  // 002d: the handoff names its owner
   expect(d.wake).toBe(true)
 })
 
@@ -372,7 +374,7 @@ test('lane receipt tool: four fields feed the digest (notify_main), a bare summa
 // ------------------------------------------------------------------ 6. ledger_query
 const lq = (i: number, o: Partial<LedgerRec> = {}) => L({ ts: new Date(T0 + i * 60_000).toISOString(), kind: 'action', notify_main: false, text: `entry ${i}`, ...o })
 const NOW = T0 + 600 * 60_000
-const rowsOf = (out: string) => out.split('\n').slice(1)
+const rowsOf = (out: string) => out.split('\n').slice(1).filter(l => !l.startsWith('（'))   // 002d: the last line is a footer (what else exists)
 
 test('ledger_query: filters — since (ISO and relative), kind, text (substring and regex, case-insensitive)', () => {
   const raw = jl([
@@ -383,7 +385,9 @@ test('ledger_query: filters — since (ISO and relative), kind, text (substring 
     lq(400, { kind: 'notify', text: '[push] A-1103 mock-backup P1 回報' }),
   ]).join('\n')
   const q = (a: object) => queryLedger(raw, a, NOW)
-  expect(rowsOf(q({})).length).toBe(5)
+  expect(rowsOf(q({})).length).toBe(3)                                               // 002d: no filter = the activity list, one line per thread / threadless event
+  expect(q({}).split('\n')[0]).toContain('活動清單：3 件事')
+  expect(rowsOf(q({ kind: 'action' })).length).toBe(1)
   expect(rowsOf(q({ kind: 'escalation' })).length).toBe(1)
   expect(rowsOf(q({ kind: 'FYI' }))[0]).toContain('P-201')                           // kind is case-insensitive too
   expect(rowsOf(q({ text: 'a-1103' })).length).toBe(2)                               // case-insensitive substring, across kinds
@@ -393,15 +397,15 @@ test('ledger_query: filters — since (ISO and relative), kind, text (substring 
   expect(rowsOf(q({ text: '[unclosed' })).length).toBe(0)                            // invalid regex, no such substring: empty, not a crash
   expect(rowsOf(q({ text: 'adam#t-af248d' })).length).toBe(1)                        // thread is searchable
   expect(rowsOf(q({ since: '-4h' })).length).toBe(1)                                 // NOW - 240 min = minute 360: only the entry at 400
-  expect(rowsOf(q({ since: new Date(T0 + 150 * 60_000).toISOString() })).length).toBe(3)
+  expect(rowsOf(q({ since: new Date(T0 + 150 * 60_000).toISOString() })).length).toBe(2)   // activity list: the thread with entries 200+400, the notice at 300
   expect(rowsOf(q({ since: '-11h', kind: 'receipt' })).length).toBe(1)               // NOW - 660 min is before minute 0
   expect(q({ since: '-9h', kind: 'receipt' })).toContain('沒有符合的 kind=receipt')    // NOW - 540 min is after the receipt: 002c says so and widens to all kinds (never empty)
-  expect(q({ since: '-1m' })).toContain('沒有符合')
+  expect(q({ since: '-1m' })).toContain('這個範圍內沒有紀錄')
 })
 
 test('ledger_query: newest last, capped at 30 entries, each text cut to 600 chars, header says how many matched', () => {
   const raw = jl(Array.from({ length: 45 }, (_, i) => lq(i, { text: i === 44 ? 'x'.repeat(2000) : `entry ${i}` }))).join('\n')
-  const out = queryLedger(raw, {}, NOW)
+  const out = queryLedger(raw, { kind: 'action' }, NOW)
   const rows = rowsOf(out)
   expect(rows.length).toBe(LEDGER_QUERY_MAX)
   expect(out.split('\n')[0]).toContain('符合 45 筆，只顯示最新 30 筆')
@@ -453,8 +457,9 @@ const hookCtx = (fn: string, args: string): string => {
 
 test('main-only rule: the SessionStart context for the registered main tells it to ledger_query before answering what-happened / what-was-promised', () => {
   const ctx = hookCtx('main_context', `'adam', 'a20fb7c0-f35a-4365-9a21-9e16e9f78fed'`)
-  expect(ctx).toContain('ledger_query(since, kind, text)')
-  expect(ctx).toContain('被問「發生了什麼事」「答應過誰什麼」之前，先用 ledger_query')
+  expect(ctx).toContain('先呼叫一次 ledger_query()（不帶任何參數）')
+  expect(ctx).toContain('清單裡每一件都要交代到')
+  expect(ctx).toContain('不要重複通知他')                                             // 002d: what a lane already told Joey is not repeated
   expect(ctx.split('\n').filter(l => l.includes('ledger_query')).length).toBe(1)    // exactly one rule line
   expect(ctx).toContain('車道摘要')                                                   // the digest delivery rule now says it rides along
   expect(ctx).not.toContain('閒下來')                                                 // …and no longer promises an idle delivery
@@ -469,7 +474,7 @@ test('main-only rule: absent from a lane\'s identity card and from the "you are 
   expect(card).not.toContain('車道摘要')
   expect(card).toContain('happened')
   expect(card).toContain('needs_main')
-  expect(card).toContain('receipt 不能取代 notify_joey / reply_agent')
+  expect(card).toContain('receipt 不能取代 notify_joey / ask_joey / handoff_main / reply_agent')
   expect(hookCtx('not_main_context', `'adam', 'x: not the registered main'`)).not.toContain('ledger_query')
   const out = Bun.spawnSync([PY, HOOK], { stdin: new TextEncoder().encode(JSON.stringify({ session_id: 'x' })), env: { PATH: process.env.PATH ?? '', PYTHONIOENCODING: 'utf-8', PYTHONDONTWRITEBYTECODE: '1' } })
   const j = JSON.parse(out.stdout.toString())                                         // the hook itself still runs end to end (no daemon env → not the main)
