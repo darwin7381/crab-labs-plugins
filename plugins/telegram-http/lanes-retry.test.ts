@@ -9,7 +9,7 @@ import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { lanesInit, routeEvent, sessionArgs, sweepQueue, __lanesState, __setMainConnected, __setRetryBackoff, __setClaudeBin } from './lanes.ts'
+import { lanesInit, routeEvent, sessionArgs, sweepQueue, __lanesState, __setMainConnected, __setRetryBackoff, __setClaudeBin, __setLaneMaxRun } from './lanes.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-retry-'))
@@ -93,4 +93,23 @@ test('002f: a lane whose conversation is on disk is resumed, whatever the run co
   expect(sessionArgs({ ...base, transcript: join(dir, 'gone.jsonl'), runs: 2 } as any)).toEqual({ resume: true, args: ['--resume', 'sid-80'] })
   expect(sessionArgs({ ...base, kind: 'fork', fork_from: 'main-sid', transcript: t } as any)).toEqual({ resume: true, args: ['--resume', 'main-sid', '--fork-session'] })
   expect(sessionArgs({ ...base, kind: 'fork', fork_from: 'main-sid', transcript: t, runs: 1 } as any)).toEqual({ resume: true, args: ['--resume', 'sid-80'] })
+})
+
+test('002g: a lane run that hangs is stopped at the time limit, run again, and after three times the main gets the event', async () => {
+  const hang = join(dir, 'hanging-lane.sh')
+  writeFileSync(hang, '#!/bin/sh\nexec sleep 30\n'); chmodSync(hang, 0o755)
+  const was = __setClaudeBin(hang)
+  __setLaneMaxRun(120)
+  try {
+    const d = await routeEvent({ id: 'mesh-r3', source: 'mesh', from: 'scheduler', verified: true,
+      text: '[scheduled][api-health-check][run:88][normal][ops] 查 health', meta: {},
+      notif: { method: 'notifications/claude/channel', params: { content: 'x', meta: {} } } } as any)
+    expect(d.target).toBe('lane')
+    const gaveUp = await until(() => rows('ledger.jsonl').some(r => r.event === 'mesh-r3' && r.kind === 'escalation'), 5000)
+    expect(gaveUp).toBe(true)
+    const lj = rows('lanes.jsonl').filter(r => r.event === 'mesh-r3')
+    expect(lj.filter(r => r.kind === 'timeout').length).toBe(3)
+    expect(lj.filter(r => r.kind === 'exit').every(r => r.signal === 'SIGKILL')).toBe(true)
+    expect(lj.filter(r => r.kind === 'spawn').map(r => r.attempt)).toEqual([1, 2, 3])
+  } finally { __setClaudeBin(was); __setLaneMaxRun(900_000) }
 })

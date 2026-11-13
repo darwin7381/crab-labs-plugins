@@ -59,6 +59,12 @@ const MAX_ATTEMPTS = 3
 let RETRY_BACKOFF_MS = Number(process.env.LANES_RETRY_BACKOFF_MS ?? 5_000)
 /** tests only */
 export const __setRetryBackoff = (ms: number): void => { RETRY_BACKOFF_MS = ms }
+// 002g: a lane run may take this long, then it is stopped and counts as a failed attempt (run again, third time: the main).
+// A run that hangs (a stalled API call, a command that never returns) kept renewing its lease for ever: its event was
+// neither done nor handed on, and nobody heard of it.
+let LANE_MAX_RUN_MS = Number(process.env.LANES_MAX_RUN_MS ?? 900_000)
+/** tests only */
+export const __setLaneMaxRun = (ms: number): void => { LANE_MAX_RUN_MS = ms }
 /** tests only: the program started as a lane; returns the previous one */
 export const __setClaudeBin = (bin: string): string => { const was = CLAUDE_BIN; CLAUDE_BIN = bin; return was }
 const DIGEST_RETRY_MS = Number(process.env.LANES_DIGEST_RETRY_MS ?? 120_000)   // an un-acked digest take is taken again after this
@@ -939,6 +945,12 @@ function startRun(it: QItem): void {
   const child = spawn(CLAUDE_BIN, args, { cwd: D.workspaceDir, env: laneEnv(lane), stdio: ['ignore', 'pipe', 'pipe'] })
   it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
   const renew = setInterval(() => { it.lease_until = Date.now() + LEASE_MS; saveQ(it) }, 30_000)
+  const limit = setTimeout(() => {
+    D.log('warn', `lanes: ${runId} still running after ${Math.round(LANE_MAX_RUN_MS / 1000)}s — stopping it (attempt ${it.attempts} of ${MAX_ATTEMPTS})`)
+    appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'timeout', run: runId, event: it.ev.id, after_s: Math.round(LANE_MAX_RUN_MS / 1000) })
+    logos('lane.timeout', { lane: lane.id, run: runId, event: it.ev.id, after_s: Math.round(LANE_MAX_RUN_MS / 1000), attempt: it.attempts })
+    try { child.kill('SIGKILL') } catch {}
+  }, LANE_MAX_RUN_MS)
   running.set(lane.id, { child, evId: it.ev.id, runId, renew })
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
@@ -970,6 +982,7 @@ function startRun(it: QItem): void {
   child.stderr!.on('data', (c: Buffer) => { try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
   child.on('exit', (code, signal) => {
     clearInterval(renew)
+    clearTimeout(limit)
     running.delete(lane.id)
     runTokens.delete(token)
     try { rmSync(mcpCfg) } catch {}
