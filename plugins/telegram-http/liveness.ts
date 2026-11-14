@@ -323,3 +323,39 @@ export function lastAssistantFile(path: string): LastAssistant | null {
   }
   return out
 }
+
+export type OpenCall = { id: string; tool: string; input: string; since: number; queued: number }
+/** The main's tool call that has no result yet, if its turn is sitting in one (002k, design/stability SR3 「主線卡死」). Read from the end of
+ *  the transcript: the last assistant record with a tool_use whose id has no tool_result after it. queued = messages Claude Code put in the
+ *  session's input queue after that call started and has not handed to the model yet (enqueue without dequeue / remove). */
+export function openToolCallFile(path: string): OpenCall | null {
+  const text = tailText(path, 600_000)
+  if (!text) return null
+  const lines = text.split('\n')
+  const results = new Set<string>()
+  let enq = 0, deq = 0
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i]
+    if (!l) continue
+    let j: any
+    try { j = JSON.parse(l) } catch { continue }
+    if (j.type === 'queue-operation') { if (j.operation === 'enqueue') enq++; else deq++; continue }
+    if (j.type === 'system' && (j.subtype === 'turn_duration' || j.subtype === 'stop_hook_summary')) return null   // the turn ended
+    if (j.type === 'user' && Array.isArray(j.message?.content)) {
+      for (const c of j.message.content) if (c?.type === 'tool_result' && c.tool_use_id) results.add(String(c.tool_use_id))
+      continue
+    }
+    if (j.type === 'assistant' && j.message?.model !== '<synthetic>') {
+      const uses = (j.message?.content ?? []).filter((c: any) => c?.type === 'tool_use')
+      if (!uses.length) return null                          // the last thing the model did was text: not inside a tool call
+      const open = uses.find((c: any) => !results.has(String(c.id)))
+      if (!open) return null
+      const since = Date.parse(j.timestamp ?? '')
+      if (!Number.isFinite(since)) return null
+      const inp = open.input ?? {}
+      const input = String(inp.command ?? inp.description ?? inp.prompt ?? JSON.stringify(inp)).replace(/\s+/g, ' ').slice(0, 120)
+      return { id: String(open.id), tool: String(open.name ?? '?'), input, since, queued: Math.max(0, enq - deq) }
+    }
+  }
+  return null
+}

@@ -23,7 +23,7 @@
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
  * (main writes), digest.json, run/ (per-run MCP configs, stderr).
  */
-import { lastAssistantFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
+import { lastAssistantFile, openToolCallFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { triageOn, triageShadow } from './lanes-triage.ts'
 import { randomBytes, randomUUID, createHash } from 'crypto'
@@ -167,6 +167,7 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(handoffTick, 10_000).unref()
     setInterval(promiseTick, 10_000).unref()
     setInterval(mainWallTick, 15_000).unref()       // 002j: a main behind the model wall (its own transcript says so)
+    setInterval(mainStuckTick, 15_000).unref()      // 002k: a main sitting in one tool call (design/stability SR3)
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
     if (S.main_wall) { try { writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: S.main_wall.kind, text: S.main_wall.text })) } catch {}; armMainProbe(5_000) }
     else { try { rmSync(mainWallFile()) } catch {} }
@@ -513,6 +514,7 @@ type State = {
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
+  main_stuck?: { call: string; since: number; told_at: string; tool: string }   // 002k: the main has sat in one tool call past LANES_MAIN_STUCK_MS
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
 }
@@ -1940,6 +1942,38 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
   return `unknown tool ${name}`
 }
 
+// ================================================================== 002k: the main stuck in one tool call
+// design/stability SR3 「主線卡住時警報照樣有人處理，還能主動告訴你主線卡住了」. Lanes keep handling alerts and peers whatever the main does
+// (that part is the router). What was missing: nobody told Joey. A main whose turn has sat in ONE tool call for longer than
+// LANES_MAIN_STUCK_MS (default 10 minutes) is reported to him once, with what it is running, how long, and how many messages wait
+// behind it; when that call ends he is told once that it is free again. A long build is also "stuck" by this rule: the notice says
+// what it is running, it does not claim the main is broken. Liveness of the process is the keeper's job, not this one.
+let MAIN_STUCK_MS = Number(process.env.LANES_MAIN_STUCK_MS ?? 600_000)
+export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
+export function mainStuckTick(): void {
+  if (D?.role !== 'tg' || !S || !mainReg?.transcript_path || S.main_wall) return
+  const oc = pidAlive(mainReg.claude_pid) ? openToolCallFile(mainReg.transcript_path) : null
+  const was = S.main_stuck
+  if (was && (!oc || oc.id !== was.call)) {
+    delete S.main_stuck; saveState()
+    const mins = Math.max(1, Math.round((Date.now() - was.since) / 60_000))
+    const text = `主線的指令結束了（${was.tool}，卡了約 ${mins} 分鐘），它可以接著處理訊息了。`
+    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-unstuck', escalated: true } })
+    logos('lane.main_unstuck', { call: was.call, after_s: Math.round((Date.now() - was.since) / 1000) })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-unstuck', message_id: id }))
+    return
+  }
+  if (!oc || was || Date.now() - oc.since < MAIN_STUCK_MS) return
+  S.main_stuck = { call: oc.id, since: oc.since, told_at: nowIso(), tool: oc.tool }; saveState()
+  const mins = Math.max(1, Math.round((Date.now() - oc.since) / 60_000))
+  const text = `主線卡住了：從 ${stamp(new Date(oc.since).toISOString())}（${TZ_LABEL}）起在跑一個 ${oc.tool} 指令（${oc.input}），已經 ${mins} 分鐘沒有結果。`
+    + (oc.queued ? `有 ${oc.queued} 則訊息排在它後面，指令結束才會讀到。` : '')
+    + '警報和同事的事由車道照常處理。要停掉它可以用 /kill_stuck，或等它跑完；跑完我會再告訴你。'
+  ledger({ lane: 'router', kind: 'notify', notify_main: true, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-stuck', escalated: true } })
+  logos('lane.main_stuck', { call: oc.id, tool: oc.tool, input: oc.input, since: new Date(oc.since).toISOString(), queued: oc.queued })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-stuck', message_id: id }))
+}
+
 // ================================================================== 002k: /lanes — Joey sees and controls the lanes
 // design/stability SR11 「看不到、關不掉：每條線在控制台有一列…Telegram 可以列出與關閉。另有一個總開關」. The daemon answers the command
 // itself (no model): the lanes are the daemon's own state.
@@ -2246,7 +2280,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
 
 /** /healthz extras */
 export function lanesHealth(): Record<string, unknown> {
-  return { lanes_on: true, main_wall: wallHoldsMain(), main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
+  return { lanes_on: true, main_wall: wallHoldsMain(), main_stuck: !!S?.main_stuck, main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
     lanes_running: D?.role === 'tg' ? running.size : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
     handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined,
