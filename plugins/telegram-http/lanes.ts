@@ -1831,6 +1831,7 @@ function laneEnv(lane: Lane): Record<string, string> {
   env.LANE_THREAD = lane.thread
   env.LANE_KIND = lane.kind                       // 002k: the guard hook decides file and memory writes by kind
   env.LANES_MEMORY_DIR = memoryDir()
+  env.LANES_WORKSPACE = D.workspaceDir               // 002k (H6): the guard hook's workspace is the lane's start directory, not wherever its shell has wandered
   if (LOGOS_URL) env.LANES_LOGOS_URL = LOGOS_URL     // 002k (D13): the guard hook refuses a direct call to this host (the lanes' environment is otherwise minimal)
   return env
 }

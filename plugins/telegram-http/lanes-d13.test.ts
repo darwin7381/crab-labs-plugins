@@ -37,6 +37,7 @@ test('D13: direct calls to the service port are refused, with a message that say
     'bash -c "curl -s http://127.0.0.1:18900/svc/tickets"',
     'sudo timeout 5 curl http://127.0.0.1:18930/inject',                                     // another agent's port in the lab range
     'FOO=1 curl -s http://127.0.0.1:18900/svc/',
+    'GENESIS_ACTOR=x ./bin/svc GET mock-backup/status',                                     // 002k (H6): a lane does not set its own identity
   ]) denied(c)
   const r = verdict('curl -s http://127.0.0.1:18900/svc/mock-api/health')
   expect(r.reason).toContain('./bin/svc'); expect(r.reason).toContain('127.0.0.1:18900'); expect(r.reason).toContain('./bin/svc GET <path>'); expect(r.reason).toContain('catalog')
@@ -47,11 +48,10 @@ test('D13: ./bin/svc itself, other network use, and text that merely mentions an
     './bin/svc GET',
     './bin/svc GET mock-api/health',
     "./bin/svc POST tickets '{\"title\":\"p95 高\",\"body\":\"see curl http://127.0.0.1:18900/svc/ for the raw call\",\"priority\":\"P2\"}'",
-    'GENESIS_ACTOR=x ./bin/svc GET mock-backup/status',
     'curl -s https://example.com/status.json',
     'curl -s http://localhost:3000/health',                                                  // a local dev server of the lane's own work: not a service
     'curl -s http://127.0.0.1/',
-    'wget -q https://github.com/x/y/archive/main.tar.gz',
+    'wget -q -O /tmp/main.tar.gz https://github.com/x/y/archive/main.tar.gz',               // (a download with no -O would write into the workspace: H6 refuses that)
     'python3 -c "print(sum(range(10)))"',
     'node -e "console.log(1+1)"',
     'grep -rn "127.0.0.1:18900" docs/',                                                      // reading about the address
