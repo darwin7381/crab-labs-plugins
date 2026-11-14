@@ -51,7 +51,11 @@ export function isWakeEntry(r: LedgerRec): boolean {
 
 // ------------------------------------------------------------------ rendering
 const NONE_RE = /^(無|无|沒有|没有|無需|不需要|不用|none|nothing|n\/a|no|nil|-|—|–)[\s.。!！]*$/i
-export const isNone = (s?: string | null): boolean => !s || NONE_RE.test(s.trim())
+// 002k (B8): a lane wrote promised "無（只說了稍後回報）" and a false commitment was logged: the field says "none" and then explains. A none-WORD
+// followed by punctuation, a bracket or white space counts too. Not "no" or a dash alone ("No, I will send it tomorrow", "- 明天給 Eve"
+// are not "none"), and not a none-word that starts a longer word ("無法連線", "沒有人回覆", "nonetheless").
+const NONE_LEAD_RE = /^(?:無|无|沒有|没有|無需|不需要|不用|none|nothing|n\/a|nil)(?=[\s.,;:!?(\[{<\-—–~…/。，、；：！？（）【】「」『』〔〕《》～])/i
+export const isNone = (s?: string | null): boolean => !s || NONE_RE.test(s.trim()) || NONE_LEAD_RE.test(s.trim())
 export function clip(s: string, n: number): string {
   const t = String(s).replace(/\s+/g, ' ').trim()
   return t.length > n ? t.slice(0, n - 1) + '…' : t
