@@ -25,6 +25,7 @@
  */
 import { lastAssistantFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
+import { triageOn, triageShadow } from './lanes-triage.ts'
 import { randomBytes, randomUUID, createHash } from 'crypto'
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, renameSync,
@@ -657,6 +658,10 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: d.lane ?? null,
     thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null, class: cls, base_tier, text: ev.text.slice(0, 120) })
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ${d.target}${d.lane ? ' ' + d.lane : ''}${d.note ? ' — ' + d.note : ''}`)
+  // 002j (A5): the same event is shown to Jev AFTER the decision and both are written side by side (run/triage-shadow.jsonl).
+  // Not awaited and never read back: the table above is the only thing that routes.
+  if (D.role === 'tg' && triageOn() && !ev.synthetic) void triageShadow(LANES_DIR, { id: ev.id, source: ev.source, from: ev.from, text: ev.text, verified: ev.verified, thread: ev.thread ?? null },
+    { rule: d.rule, target: d.target, cls, base_tier })
   // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it
   if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
   return d
