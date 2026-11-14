@@ -81,7 +81,10 @@ def main():
         prompt_text = pc if isinstance(pc, str) else ' '.join(x.get('text', '') for x in pc if isinstance(x, dict))
     except Exception:
         pass
-    if not closed and used and used <= {'mcp__lane__receipt'} and '[high-frequency]' in prompt_text:
+    # 002k (B9): a follow-up run (its event text is the router's "後續檢查" message) always leaves its notify_joey line, even when the
+    # routine it belongs to is high-frequency: the follow-up text says so, and the receipt-only exception is for the scheduled run itself
+    followup = '[車道事件｜後續檢查' in prompt_text
+    if not closed and used and used <= {'mcp__lane__receipt'} and '[high-frequency]' in prompt_text and not followup:
         closed = True
     if closed:
         return
@@ -100,7 +103,7 @@ def main():
     print(json.dumps({'decision': 'block', 'reason': (
         f'⛔ lane-stop-hook: {lane} has not left Joey a line yet. Close this turn with notify_joey (one line; the router decides '
         'whether it rings, a peer matter is silent), also after answering a peer with reply_agent. '
-        'Only a high-frequency routine with no change may end with the receipt alone. '
+        'Only a high-frequency routine with no change may end with the receipt alone (a follow-up run never may). '
         'Never end silent. If Joey must decide, use ask_joey; if the main must do it, use handoff_main (one of them, not both).')}))
 
 

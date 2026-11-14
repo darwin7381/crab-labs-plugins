@@ -58,7 +58,7 @@ export function followupEventText(f: Followup, nowMs: number): string {
     `這是這條對話線先前排好的後續檢查，現在（模擬時間 ${simTime(nowMs)}）到時間了；排定時是 ${simTime(Date.parse(f.created))}，要求 ${f.after_minutes} 分鐘後再看。`,
     `當時留下的備註：${f.note}`,
     ...(f.run_id ? [`原排程回合的 run_id：${f.run_id}。收尾的 receipt 填這個 run_id。`] : []),
-    `照備註與 runbook 重新檢查現況：條件還成立，就做可逆的小處理並確認結果（不可逆的事仍然只能 escalate）；已經恢復，就回報恢復。真的還需要再等，可以再呼叫一次 followup。最後照常用 notify_joey 或 receipt 收尾，receipt 的 happened / did / promised / needs_main 寫具體的數字與時間。`,
+    `照備註與 runbook 重新檢查現況：條件還成立，就做可逆的小處理並確認結果（不可逆的事仍然只能 escalate）；已經恢復，就回報恢復。真的還需要再等，可以再呼叫一次 followup。最後一定先用 notify_joey 給 Joey 留一句（只一則；響不響由分流器決定，後續檢查通常是靜音），再呼叫 receipt 收尾；只留 receipt 不算收尾。receipt 的 happened / did / promised / needs_main 寫具體的數字與時間。`,
   ].join('\n')
 }
 

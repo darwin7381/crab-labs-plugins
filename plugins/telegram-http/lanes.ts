@@ -2278,7 +2278,7 @@ async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string):
 const TOLD = ['notify_joey', 'ask_joey', 'handoff_main', 'report_result', 'deliver_synthesis', 'curator_done']
 function neverSilentBackstop(lane: Lane, it: QItem, closers: string[], tools: Array<{ name: string; input: any }>, result: string): void {
   if (!closers.length || closers.some(c => TOLD.includes(c))) return
-  const hf = /\[high-frequency\]/.test(it.ev.text)
+  const hf = /\[high-frequency\]/.test(it.ev.text) && !it.ev.id.startsWith('ev-fu-')   // 002k (B9): a follow-up run always leaves its line
   if (hf && closers.every(c => c === 'receipt')) return
   const replies = tools.filter(t => t.name === 'mcp__lane__reply_agent').map(t => `回覆 ${t.input?.to ?? '?'}：${String(t.input?.text ?? '').replace(/\s+/g, ' ').slice(0, 300)}`)
   const rcpt = tools.filter(t => t.name === 'mcp__lane__receipt').map(t => String(t.input?.did ?? t.input?.summary ?? t.input?.happened ?? '').slice(0, 300)).filter(Boolean)
