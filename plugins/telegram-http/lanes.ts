@@ -2614,7 +2614,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       const note = a.summary ? stripMarkup(String(a.summary)).slice(0, 200) : rep?.happened.slice(0, 200)
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'receipt', notify_main: !!rep, text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}`,
-        ...(rep ? { refs: { report: rep } } : {}) })
+        ...(rep ? { refs: { report: rep, class: tok.cls } } : {}) })     // 002k (B15): the class lets the digest merge routine threads of one class
       if (rep && !(tok.commitments ?? 0)) {     // 002c: a promise that only lives in the receipt still gets its own ledger kind
         const cm = commitmentFromReport(rep.promised, queue.get(tok.evId)?.ev.from, th?.peer)
         if (cm) {

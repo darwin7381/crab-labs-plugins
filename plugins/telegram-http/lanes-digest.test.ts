@@ -273,10 +273,11 @@ test('structured digest: a thread that promised something shows all four parts w
   const lines = d.text.split('\n')
   const i = lines.findIndex(l => l.startsWith('▸ adam.reflex.6｜adam#t-b30f47｜11-13 '))
   expect(i).toBeGreaterThan(0)
-  expect(lines[i + 1]).toBe(`  發生：${report.happened}`)
-  expect(lines[i + 2]).toBe(`  做了：${report.did}`)
-  expect(lines[i + 3]).toBe(`  承諾：${report.promised}`)
-  expect(lines[i + 4]).toBe(`  需主線：${report.needs_main}`)
+  // 002k (B15): a heavy block is at most three lines
+  expect(lines[i]).toContain(`｜發生：${report.happened}`)
+  expect(lines[i + 1]).toBe(`  做了：${report.did}｜承諾：${report.promised}`)
+  expect(lines[i + 2]).toBe(`  需主線：${report.needs_main}`)
+  expect(lines[i + 3]).toContain('（只列這次新增的')
   expect(d.text).toContain('mesh-50008')
   expect(d.text).toContain('不承諾明天 10 點前')                                      // the exact text sent to the peer survives
   expect(d.wake).toBe(false)                                                         // a promise needs the main, but only escalate() wakes it
@@ -308,10 +309,10 @@ test('structured digest: lane thread with an escalation is a block first (never 
   const iRoutine = lines.findIndex(l => l.startsWith('• adam.reflex.7'))
   expect(iEsc).toBeGreaterThan(0)
   expect(iRoutine).toBeGreaterThan(iEsc)
-  expect(lines[iEsc + 4]).toContain('需主線：【A-1103 升級｜mock-backup｜P1】upload 連續 403')
-  expect(lines[iEsc + 3]).toBe('  承諾：無')
-  expect(lines[iEsc + 2]).toContain('已通知 Joey（已響鈴），不要重複通知他')              // what the lane did, from its push
-  expect(lines[iEsc + 5]).toContain('這件事交給你了')                                  // 002d: the handoff names its owner
+  expect(lines[iEsc + 2]).toContain('需主線：【A-1103 升級｜mock-backup｜P1】upload 連續 403')
+  expect(lines[iEsc + 1]).not.toContain('承諾')                                         // 002k (B15): a "none" part is left out
+  expect(lines[iEsc + 1]).toContain('已通知 Joey（已響鈴），不要重複通知他')              // what the lane did, from its push
+  expect(lines[iEsc + 2]).toContain('這件事交給你了')                                  // 002d: the handoff names its owner (on the 需主線 line: three lines in all)
   expect(d.wake).toBe(true)
 })
 
@@ -333,7 +334,7 @@ test('structured digest: an escalating old-style lane keeps its reply to the pee
   const sentToEve = L({ lane: 'adam.reflex.6', thread: 'adam#t-b30f47', kind: 'action', notify_main: false, text: 'reply_agent → eve（hop 2）：10 月可用率我還沒有數字，不承諾明天 10 點前' })
   const esc = L({ lane: 'adam.reflex.6', thread: 'adam#t-b30f47', kind: 'escalation', text: 'Eve 要 10 月可用率放進月報，限明天 10 點前；請主線決定誰算' })
   const d = renderDigest([esc, sentToEve])!
-  expect(d.text).toContain('  發生：升級主線（見「需主線」）')
+  expect(d.text).toContain('｜發生：升級主線（見「需主線」）')
   expect(d.text).toContain('  做了：reply_agent → eve（hop 2）：10 月可用率我還沒有數字，不承諾明天 10 點前')
   expect(d.text).toContain('  需主線：Eve 要 10 月可用率放進月報')
   const fork = renderDigest([L({ lane: 'adam.fork.1', thread: 'adam#t-f1', kind: 'action', text: '分身線結果：已查完 mock-api 10 月可用率 99.93%' })])!
@@ -341,7 +342,7 @@ test('structured digest: an escalating old-style lane keeps its reply to the pee
 })
 
 test('structured digest: capped and compact — at most DIGEST_MAX_ROUTINE routine lines, the rest counted; every line is short', () => {
-  const recs = Array.from({ length: 14 }, (_, i) => silentFyi(String(i + 10)))
+  const recs = Array.from({ length: 14 }, (_, i) => silentFyi(String(i + 10)))          // no class on them: none is merged with another (B15)
   const d = renderDigest(recs)!
   expect(d.text.split('\n').filter(l => l.startsWith('•')).length).toBe(DIGEST_MAX_ROUTINE)
   expect(d.text).toContain(`另有 ${14 - DIGEST_MAX_ROUTINE} 條線沒列出`)
