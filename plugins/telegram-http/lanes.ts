@@ -39,7 +39,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  ackState, cleanReport, planDigest, piggybackContent, queryLedger, releaseState,
+  ackState, cleanReport, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
   type DigestCursor, type DigestTake, type LedgerRec,
 } from './lanes-digest.ts'
 
@@ -1050,6 +1050,8 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   escalated: boolean; pushed: boolean; asked?: boolean; handed?: boolean; commitments?: number
   /** 002k (B11): notify_joey messages this run sent / whether the one-line nudge was already given / the receipt it filed */
   notified?: number; nudged?: boolean; receipt?: { outcome: string; text: string }
+  /** 002k (B21): a receipt with tag markup in a field was sent back once */
+  markupRefused?: boolean
   /** 002j: the router told this agent that the main decides and by when; the lane sends it nothing more about this event */
   interim?: string
   /** 002e: this run is a follow-up the lane scheduled itself (event id ev-fu-…) */
@@ -2120,9 +2122,14 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const outcome = String(a.outcome ?? 'done')
       // 002b: a receipt that carries the four-part report goes to the main's digest (notify_main); a bare one (old
       // `summary` style) stays ledger-only exactly as before
+      const bad = reportMarkup(a)
+      if (bad.length && !tok.markupRefused) {                          // 002k (B21): the model resends; the second time the markup is stripped
+        tok.markupRefused = true
+        throw new Error(`receipt refused: ${bad.join(', ')} contain${bad.length === 1 ? 's' : ''} tag markup (like <parameter> or </x>). Send happened, did, promised and needs_main each as its own argument, plain text without tags, and call receipt again.`)
+      }
       const rep = cleanReport(a)
       tok.receipt = { outcome, text: [a.summary, a.happened, a.did, a.promised, a.needs_main].filter(x => typeof x === 'string').join(' ') }
-      const note = a.summary ? String(a.summary).slice(0, 200) : rep?.happened.slice(0, 200)
+      const note = a.summary ? stripMarkup(String(a.summary)).slice(0, 200) : rep?.happened.slice(0, 200)
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'receipt', notify_main: !!rep, text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}`,
         ...(rep ? { refs: { report: rep } } : {}) })
       if (rep && !(tok.commitments ?? 0)) {     // 002c: a promise that only lives in the receipt still gets its own ledger kind
@@ -2318,7 +2325,7 @@ function neverSilentBackstop(lane: Lane, it: QItem, closers: string[], tools: Ar
   const hf = /\[high-frequency\]/.test(it.ev.text) && !it.ev.id.startsWith('ev-fu-')   // 002k (B9): a follow-up run always leaves its line
   if (hf && closers.every(c => c === 'receipt')) return
   const replies = tools.filter(t => t.name === 'mcp__lane__reply_agent').map(t => `回覆 ${t.input?.to ?? '?'}：${String(t.input?.text ?? '').replace(/\s+/g, ' ').slice(0, 300)}`)
-  const rcpt = tools.filter(t => t.name === 'mcp__lane__receipt').map(t => String(t.input?.did ?? t.input?.summary ?? t.input?.happened ?? '').slice(0, 300)).filter(Boolean)
+  const rcpt = tools.filter(t => t.name === 'mcp__lane__receipt').map(t => stripMarkup(String(t.input?.did ?? t.input?.summary ?? t.input?.happened ?? '')).slice(0, 300)).filter(Boolean)
   const body = replies.length ? replies.join('\n') : (rcpt[0] ?? result.slice(0, 300) ?? '')
   const cls = it.ev.cls ?? it.ev.trigger ?? 'peer'
   const dec = notifyDecision(cls, false, lane.thread)

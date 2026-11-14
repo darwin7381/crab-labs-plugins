@@ -27,13 +27,27 @@ export type LaneReport = { happened: string; did: string; promised: string; need
 const REPORT_FIELDS = ['happened', 'did', 'promised', 'needs_main'] as const
 export const REPORT_FIELD_MAX = 700
 
-/** The four-part report a lane hands in with its closing receipt; null when it gave none of the four. */
+// 002k (B21, 002j group B): Haiku put raw tool-call markup into receipt strings ("…</parameter>\n<parameter name="promised">無") and it reached the
+// main's digest. A field that matches tag markup is refused by the receipt tool (a tool error: send each field as its own argument);
+// if it arrives again anyway the markup is stripped, so it never reaches the ledger.
+export const MARKUP_RE = /<\/?[a-z_]+>|<parameter/i
+const REPORT_TEXT_FIELDS = [...REPORT_FIELDS, 'summary'] as const
+/** the names of the report fields (and summary) that contain tag markup */
+export function reportMarkup(a: unknown): string[] {
+  const o = (a ?? {}) as Record<string, unknown>
+  return REPORT_TEXT_FIELDS.filter(k => typeof o[k] === 'string' && MARKUP_RE.test(o[k] as string))
+}
+export function stripMarkup(s: string): string {
+  return s.replace(/<\/?parameter\b[^>]*>?/gi, ' ').replace(/<\/?[a-z_][a-z_0-9]*(?:\s[^<>]*)?>/gi, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** The four-part report a lane hands in with its closing receipt; null when it gave none of the four. Tag markup is stripped. */
 export function cleanReport(a: unknown): LaneReport | null {
   const o = (a ?? {}) as Record<string, unknown>
   const r: LaneReport = { happened: '', did: '', promised: '', needs_main: '' }
   let any = false
   for (const k of REPORT_FIELDS) {
-    const v = typeof o[k] === 'string' ? (o[k] as string).replace(/\s+/g, ' ').trim() : ''
+    const v = typeof o[k] === 'string' ? stripMarkup((o[k] as string).replace(/\s+/g, ' ').trim()) : ''
     if (v) { r[k] = v.slice(0, REPORT_FIELD_MAX); any = true }
   }
   return any ? r : null
