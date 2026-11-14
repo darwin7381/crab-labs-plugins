@@ -1821,11 +1821,20 @@ function startRun(it: QItem): void {
   })
 }
 
-async function pushJoey(lane: Lane | undefined, text: string, silent: boolean): Promise<number | null> {
+// 002k (E4, 002j group E): a lane's answer to Joey's quote reply was not sent as a reply to it. When the run was started by a Joey message (a
+// Telegram event with its message id, in Joey's own chat), what the lane tells Joey in that run (notify_joey, ask_joey, the never-silent line)
+// is sent as a Telegram reply to that message (reply_to_message_id). A follow-up, a peer's or an alert's run has no such message.
+function joeyReplyTo(ev: InEvent | undefined): number | undefined {
+  if (!ev || ev.source !== 'telegram' || !/^\d+$/.test(String(ev.meta?.message_id ?? ''))) return undefined
+  const chat = ev.meta?.chat_id
+  if (chat != null && D.joeyChatId && String(chat) !== String(D.joeyChatId())) return undefined
+  return Number(ev.meta.message_id)
+}
+async function pushJoey(lane: Lane | undefined, text: string, silent: boolean, replyTo?: number): Promise<number | null> {
   if (!D.sendBot || !D.joeyChatId) return null
   const head = lane ? `〔${D.agent}·${laneLabel(lane)}〕` : `〔${D.agent}·分流器〕`
   try {
-    const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { silent, topic: lane?.topic })
+    const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { silent, topic: lane?.topic, ...(replyTo ? { replyTo } : {}) })
     if (lane) { S.botmsgs[String(id)] = lane.id; saveState() }
     return id
   } catch (e) { D.log('error', `lanes: push to Joey failed: ${e}`); return null }
@@ -2125,7 +2134,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         return 'recorded in the ledger'
       }
       S.dedupe[h] = Date.now()
-      const id = await pushJoey(lane, text, tier === 'silent')
+      const id = await pushJoey(lane, text, tier === 'silent', joeyReplyTo(queue.get(tok.evId)?.ev))
       if (id == null) throw new Error('send failed')
       if (tier === 'push') { tok.pushed = true; rangByLane.add(tok.evId); S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
       saveState()
@@ -2222,7 +2231,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         logos('lane.notify', { ...rec, tier, tier_rule: dec.rule })
         return 'recorded in the ledger (this kind of notice never reaches Joey)'
       }
-      const id = await pushJoey(lane, text, tier === 'silent')
+      const id = await pushJoey(lane, text, tier === 'silent', joeyReplyTo(queue.get(tok.evId)?.ev))
       if (id == null) throw new Error('send failed')
       if (tier === 'push') { tok.pushed = true; rangByLane.add(tok.evId); S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
       saveState()
@@ -2520,7 +2529,7 @@ function neverSilentBackstop(lane: Lane, it: QItem, closers: string[], tools: Ar
     refs: { class: cls, escalated: false, tier: dec.tier, tier_rule: `${dec.rule}+never-silent-backstop` } })
   logos('lane.never_silent_backstop', { lane: lane.id, event: it.ev.id, closers, tier: dec.tier })
   if (dec.tier === 'ledger') return
-  void pushJoey(lane, text, dec.tier === 'silent').then(id => logos('lane.notify', { lane: lane.id, thread: lane.thread, event: it.ev.id, class: cls, escalated: false, tier: dec.tier, tier_rule: `${dec.rule}+never-silent-backstop`, message_id: id }))
+  void pushJoey(lane, text, dec.tier === 'silent', joeyReplyTo(it.ev)).then(id => logos('lane.notify', { lane: lane.id, thread: lane.thread, event: it.ev.id, class: cls, escalated: false, tier: dec.tier, tier_rule: `${dec.rule}+never-silent-backstop`, message_id: id }))
 }
 
 // ------------------------------------------------------------------ 002k: file claims, fan-out, curator

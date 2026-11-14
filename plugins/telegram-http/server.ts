@@ -3221,7 +3221,7 @@ if (Lanes.LANES_ON) {
         const m = await bot.api.sendMessage(chat, text.slice(0, 4000), {
           ...(o.silent ? { disable_notification: true } : {}),
           ...(o.topic != null ? { message_thread_id: o.topic } : {}),
-          ...(o.replyTo ? { reply_parameters: { message_id: o.replyTo } } : {}),
+          ...(o.replyTo ? { reply_parameters: { message_id: o.replyTo, allow_sending_without_reply: true } } : {}),   // 002k (E4): a deleted message must not lose the notice
         })
         return m.message_id
       },
