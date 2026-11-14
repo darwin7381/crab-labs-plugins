@@ -8,7 +8,9 @@ import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { lanesInit, routeEvent, walledResult, wallActive, __lanesState, __setMainConnected, __setRetryBackoff, __setClaudeBin, __setWallProbe } from './lanes.ts'
+// its own instance of the lane engine: the other lanes test files share one module (queue, timers, the lane binary), and a wall
+// test must not see their left-over events
+const { lanesInit, routeEvent, walledResult, wallActive, __lanesState, __setMainConnected, __setRetryBackoff, __setClaudeBin, __setWallProbe } = await import('./lanes.ts?wall-test') as typeof import('./lanes.ts')
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-wall-'))
