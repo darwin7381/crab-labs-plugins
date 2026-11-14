@@ -1032,7 +1032,8 @@ async function drainPendingIfLive(): Promise<void> {
     if (parkAlerted.has(f)) continue
     let ageMs = 0
     try { ageMs = now - statSync(join(PENDING_DIR, f)).mtimeMs } catch {}
-    if (ageMs > PARK_ALERT_AFTER_MS) {
+    // 002j: what was kept behind the model wall is being given right now; its age is the wall's, not a stuck queue's
+    if (ageMs > PARK_ALERT_AFTER_MS && !(Lanes.LANES_ON && Lanes.wallLiftedRecently())) {
       parkAlerted.add(f)
       log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
       // Parking is acceptable; parking SILENTLY is not (the prometheus lost-

@@ -139,6 +139,7 @@ test('probes that hit the wall change nothing; the first that gets through takes
   expect(notices[0].meta.kind).toBe('wall-resume'); expect(notices[0].content).toContain('做到一半'); expect(notices[0].content).toContain('5 則')
   expect(await until(() => sweeps > before, 3000)).toBe(true)                                    // what was kept is given
   expect(L.__lanesState().main_wall).toBeUndefined()
+  expect(L.wallLiftedRecently()).toBe(true); expect(L.wallLiftedRecently(0)).toBe(false)   // the stuck-queue alarm stays quiet about what is being given now
 })
 
 test('when the wall is down, the held delivery is given again', () => {

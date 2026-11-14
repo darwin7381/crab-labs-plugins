@@ -1009,6 +1009,14 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
 // The wall is one fact for both daemons of the agent (tg owns it, inbox holds the mesh messages for the main): a file.
 const mainWallFile = (): string => join(LANES_DIR, 'run', 'main-wall.json')
 export function wallHoldsMain(): boolean { return !!LANES_DIR && existsSync(mainWallFile()) }
+// What was kept behind the wall is as old as the wall. For a short while after it comes down, the daemon's "a parked
+// message has been waiting for N minutes" alarm stays quiet about those files: they are being given right now, and Joey
+// was told about the wall. (The time is written as text: the lab runs under a simulated clock, file times do not.)
+const mainWallLiftedFile = (): string => join(LANES_DIR, 'run', 'main-wall-lifted')
+export function wallLiftedRecently(withinMs = 180_000): boolean {
+  if (!LANES_DIR) return false
+  try { const t = Number(readFileSync(mainWallLiftedFile(), 'utf8')); return Number.isFinite(t) && Date.now() - t >= 0 && Date.now() - t < withinMs } catch { return false }
+}
 type MainWallEv = { kind: string; text: string; at: number; midTask: boolean; model: string }
 /** The main's last assistant record is a wall error written at or after `sinceMs` (transcript time). */
 export function mainWalled(sinceMs = 0): MainWallEv | null {
@@ -1123,6 +1131,7 @@ async function mainWallDown(by: string): Promise<void> {
   delete S.main_wall; saveState()
   if (mainProbeTimer) { clearTimeout(mainProbeTimer); mainProbeTimer = null }
   try { rmSync(mainWallFile()) } catch {}
+  try { writeFileSync(mainWallLiftedFile(), String(Date.now())) } catch {}
   // A main stopped in the middle of work is told to carry on, before what was kept reaches it. A main whose walled turn
   // was only a message it never answered needs no notice: that message is given again.
   let told: boolean | null = null
@@ -1556,7 +1565,8 @@ async function interimToPeer(lane: Lane, tok: RunTok, h: Handoff): Promise<strin
   if (!ev || ev.source !== 'mesh' || !ev.from || ev.no_reply) return null
   const from = ev.from.toLowerCase()
   // only another agent is waiting for an answer: a scheduled run or an alert is not
-  const isPeer = D.registryNames ? D.registryNames().map(n => n.toLowerCase()).includes(from) : tok.cls === 'peer'
+  const names = D.registryNames ? D.registryNames().map(n => n.toLowerCase()) : []
+  const isPeer = names.length ? names.includes(from) : tok.cls === 'peer'
   if (!isPeer) return null
   const th = S.threads[lane.thread]
   const hop = (th?.hops ?? 0) + 1
