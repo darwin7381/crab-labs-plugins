@@ -731,6 +731,13 @@ function threadOwnerFor(ev: InEvent): { owner: string; thread: string | null; vi
   return null
 }
 
+/** 002k (C7): an event that names a thread whose peer is somebody else (threadOwnerFor answers null for exactly this reason). No model:
+ *  the thread table says it. */
+function threadNotYours(ev: InEvent): Thread | null {
+  if (ev.source !== 'mesh' || !ev.thread) return null
+  const t = S.threads[ev.thread]
+  return t?.lane && t.peer && t.peer !== ev.from ? t : null
+}
 function matches(r: Rule, ev: InEvent, cfg: RouterCfg): boolean {
   const m = r.match
   if (m.source && m.source !== ev.source) return false
@@ -766,6 +773,14 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     break
   }
   if (off) d = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off!.by} at ${stamp(S.master_off!.since)}` }
+  // 002k (C7, 002j group C): a peer that writes into a thread that belongs to another peer. The rules already keep it out of that thread
+  // (only the thread's peer may speak in it); this records that it tried, for whoever reads the ledger. No model, no wake, not in the digest.
+  const notYours = D.role === 'tg' ? threadNotYours(ev) : null
+  if (notYours) {
+    ledger({ lane: 'router', thread: notYours.id, event: ev.id, kind: 'action', notify_main: false,
+      text: `${ev.from} 用了屬於 ${notYours.peer} 的對話線 ${notYours.id} 發訊息；分流器沒有把它投進那條線（只有那條線的對象能在裡面說話）。內容：${ev.text.slice(0, 160)}`,
+      refs: { flag: 'thread-not-yours', from: ev.from, owner_peer: notYours.peer, thread: notYours.id, verified: ev.verified === true, btcc_msg_id: ev.btcc_msg_id ?? null } })
+  }
   const pInstr = asked?.jev?.instructs_agent
   if (typeof pInstr === 'number' && pInstr >= SCREEN_P && d.target !== 'main' || (typeof pInstr === 'number' && pInstr >= SCREEN_P && d.target === 'main' && !d.warn)) {
     const was = `${d.rule}→${d.target}${d.lane ? ' ' + d.lane : ''}`
