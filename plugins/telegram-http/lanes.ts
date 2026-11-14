@@ -567,7 +567,7 @@ function genuineContextTokens(path: string): number {
 }
 
 // ================================================================== state (tg role)
-type LaneKind = 'reflex' | 'worker' | 'fork'
+type LaneKind = 'reflex' | 'worker' | 'fork' | 'curator' | 'synthesis'
 type Lane = {
   id: string; kind: LaneKind; n: number; session_id: string; thread: string
   status: 'new' | 'running' | 'idle' | 'closed'
@@ -578,6 +578,7 @@ type Lane = {
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
   ask_cls?: string }                                                   // event class of the lane run that last asked a peer here
 type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number }
+type Fanout = { id: string; brief: string; tasks: string[]; members: string[]; results: Record<string, string>; created: string; synthesis?: string; done?: string }
 type MainWall = { since: string; kind: string; text: string; model: string; err_at: number; mid_task: boolean; probes: number; acked_at?: number; held?: number }
 type State = {
   counters: Record<string, number>
@@ -598,6 +599,10 @@ type State = {
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
   main_stuck?: { call: string; since: number; told_at: string; tool: string }   // 002k: the main has sat in one tool call past LANES_MAIN_STUCK_MS
   renew?: { new_sid: string; old_sid: string; old_pid: number; at: string; by: string; old_tokens: number }   // 002k: /main renew in progress
+  claims?: Record<string, { lane: string; since: string; why: string }>   // 002k: file claims (claim_file), by real path
+  curator?: { lane: string; since: string; from_line: number; from_line_end?: number }   // 002k: the lane holding the memory write right
+  curator_line?: number                                                // 002k: ledger line up to which memory proposals were curated
+  fanouts?: Record<string, Fanout>                                     // 002k: fan_out bookkeeping
   main_gen?: number                                                    // 002k: how many times the main role was handed to a fresh session (+1)
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
@@ -666,6 +671,8 @@ export type InEvent = {
   reply_to_id?: string; btcc_msg_id?: string; no_reply?: boolean
   reply_to_message_id?: string; message_thread_id?: string; reply_to_text?: string
   synthetic?: string
+  /** 002k: this event is one task of a fan-out (main tool fan_out); its lane hands the result back with report_result */
+  fanout?: string
   /** trigger class set by the router (rule `trigger`, refined by critical_regex / info_regex) */
   trigger?: string
   /** event class used for the notify tier: = trigger, except a reply in a thread inherits the class of
@@ -955,7 +962,9 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   /** 002j: the router told this agent that the main decides and by when; the lane sends it nothing more about this event */
   interim?: string
   /** 002e: this run is a follow-up the lane scheduled itself (event id ev-fu-…) */
-  followup?: boolean }
+  followup?: boolean
+  /** 002k: the run is a fan-out member / the synthesis of a fan-out */
+  fanout?: string; synthesis?: string }
 const runTokens = new Map<string, RunTok>()
 const qPath = (id: string) => join(LANES_DIR, 'queue', `${id.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
 
@@ -1325,6 +1334,7 @@ export function sweepQueue(): void {
     if (it.attempts >= MAX_ATTEMPTS) {
       it.state = 'failed'; saveQ(it); queue.delete(it.ev.id)
       const lane = S.lanes[it.lane]
+      if (it.ev.fanout) { fanoutResult(it.ev.fanout, it.lane, `（這一塊連續 ${it.attempts} 次沒做完，沒有結果）`); continue }
       handoff(lane, it.ev.id, `車道連續 ${it.attempts} 次沒處理完這則事件，已放棄，請主線接手。寄件者 ${it.ev.from}，原文：${it.ev.text.slice(0, 400)}`, it.lane)
       continue
     }
@@ -1343,13 +1353,14 @@ function laneEnv(lane: Lane): Record<string, string> {
   env.LANES_DIR = LANES_DIR
   env.LANE_ID = lane.id
   env.LANE_THREAD = lane.thread
+  env.LANE_KIND = lane.kind                       // 002k: the guard hook decides file and memory writes by kind
   env.LANES_MEMORY_DIR = memoryDir()
   return env
 }
 export function memoryDir(): string { return join(D.transcriptDir, 'memory') }
 
 export function identityCard(lane: Lane, it: QItem): string {
-  const kindName = { reflex: '反射線', worker: '工作線', fork: '分身線' }[lane.kind]
+  const kindName = { reflex: '反射線', worker: '工作線', fork: '分身線', curator: '整理線', synthesis: '綜合線' }[lane.kind]
   const why = lane.kind === 'worker'
     ? `為「${lane.title ?? ''}」而開，綁定 Joey 私訊裡的話題 #${lane.topic ?? '-'}（Joey 在那個話題裡說的話會送到你這裡；你的 notify_joey 會自動發到那個話題）`
     : lane.kind === 'fork'
@@ -1380,6 +1391,7 @@ export function identityCard(lane: Lane, it: QItem): string {
     `# 焦點卡（主線寫的，你只能讀）`,
     focusCard(),
     ...(it.summary ? [``, `# 這個 thread 先前的帳本紀錄（原車道已結束太久，由你接手）`, it.summary] : []),
+    ...roleLines(lane, it),
   ].join('\n')
 }
 
@@ -1409,6 +1421,8 @@ function writeLaneSettings(): void {
     hooks: {
       Stop: [{ matcher: '', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-stop-hook.py')}`, timeout: 20 }] }],
       PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-guard-hook.py')}`, timeout: 10 }] }],
+      // 002k: the curator's memory writes are committed like the main's (the commit names the lane and thread)
+      PostToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'memory-commit-hook.py')}`, timeout: 20 }] }],
     },
   }
   writeJsonAtomic(join(LANES_DIR, 'lane-settings.json'), settings, 0o644)
@@ -1458,7 +1472,8 @@ function startRun(it: QItem): void {
   const critical = !!lane.critical
   const trigger = it.ev.trigger ?? (lane.kind === 'reflex' ? 'other' : lane.kind)   // main-opened worker / fork: their kind
   const tok: RunTok = { runId, lane: lane.id, evId: it.ev.id, closers: [], critical, trigger, cls: it.ev.cls ?? trigger,
-    escalated: false, pushed: false, followup: it.ev.id.startsWith('ev-fu-') }
+    escalated: false, pushed: false, followup: it.ev.id.startsWith('ev-fu-'),
+    fanout: lane.kind === 'synthesis' ? undefined : it.ev.fanout, synthesis: lane.kind === 'synthesis' ? it.ev.fanout : undefined }
   runTokens.set(token, tok)
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
@@ -1526,8 +1541,10 @@ function startRun(it: QItem): void {
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     if (S.threads[lane.thread]) S.threads[lane.thread].tokens += tin
+    releaseClaims(lane.id, 'run ended')
     const names = tools.map(t => t.name.replace(/^mcp__lane__/, 'lane:'))
-    const closers = tools.filter(t => ['mcp__lane__reply_agent', 'mcp__lane__receipt', 'mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main'].includes(t.name))
+    const closers = tools.filter(t => ['mcp__lane__reply_agent', 'mcp__lane__receipt', 'mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main',
+      'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done'].includes(t.name))
       .map(t => t.name.replace('mcp__lane__', ''))
     const ok = code === 0 && !signal
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: runId, event: it.ev.id, session_id: lane.session_id,
@@ -1584,7 +1601,7 @@ async function pushJoey(lane: Lane | undefined, text: string, silent: boolean): 
     return id
   } catch (e) { D.log('error', `lanes: push to Joey failed: ${e}`); return null }
 }
-function laneLabel(l: Lane): string { return `${{ reflex: '反射線', worker: '工作線', fork: '分身線' }[l.kind]}#${l.n}` }
+function laneLabel(l: Lane): string { return `${{ reflex: '反射線', worker: '工作線', fork: '分身線', curator: '整理線', synthesis: '綜合線' }[l.kind]}#${l.n}` }
 
 // ------------------------------------------------------------------ 002d: handoff to the main
 // One owner per event. A lane that needs JOEY tells Joey itself (ask_joey: one push; the main reads it in its next
@@ -1722,6 +1739,14 @@ export function promiseTick(): void {
 
 // ================================================================== lane tools (MCP for lanes)
 export const LANE_TOOLS = [
+  { name: 'claim_file', description: 'Before you edit a file in the workspace, claim it (path, why). If another lane holds it, you are told who and since when: wait for it or hand the change to the main. Claims are released when your run ends.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, why: { type: 'string' } }, required: ['path', 'why'] } },
+  { name: 'report_result', description: 'Fan-out tasks only: hand your result back to the synthesis (not to Joey). One call, the whole result.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'deliver_synthesis', description: 'Synthesis lane only: deliver the one conclusion to the main session. One call.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
+  { name: 'curator_done', description: 'Curator lane only: you are done with the memory proposals; the write right returns to the main. summary = what you wrote, what you left as 建議刪除.',
+    inputSchema: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } },
   { name: 'notify_joey', description: 'Report a result to Joey on Telegram. The router decides whether it rings (by the kind of event); you decide nothing about that. Your lane is prefixed automatically.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } },
   { name: 'reply_agent', description: 'Send a mesh message to another agent as this agent. thread and hop are attached automatically. reply_to = the btcc_msg_id of the message you answer.',
@@ -1893,8 +1918,96 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const r = runIdArg ? await inboxPost('/lanes/scheduler', { run_id: runIdArg, action: 'complete', outcome, summary: a.summary }) : null
       return `receipt recorded${r ? `; scheduler: ${r.text ?? JSON.stringify(r)}` : ''}`
     }
+    case 'claim_file': {
+      const path = String(a.path ?? '').trim(), why = String(a.why ?? '').trim()
+      if (!path) throw new Error('path required')
+      const key = resolvePath(D.workspaceDir, path)
+      S.claims ??= {}
+      const held = S.claims[key]
+      if (held && held.lane !== lane.id && (running.has(held.lane) || S.lanes[held.lane]?.status === 'running')) {   // a claim lives while its holder runs
+        ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'intent', notify_main: false, text: `想改 ${path}，但 ${held.lane} 自 ${stamp(held.since)} 起佔用（${held.why}）：等它`, refs: { path: key, waiting_for: held.lane } })
+        return `held: ${held.lane} claimed ${path} at ${stamp(held.since)} for "${held.why}". Do not edit it now: wait until that lane's run ends and claim again, or hand the change to the main with handoff_main.`
+      }
+      S.claims[key] = { lane: lane.id, since: nowIso(), why }; saveState()
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'intent', notify_main: false, text: `要改 ${path}：${why}`, refs: { path: key } })
+      return `claimed ${path}; it is yours until your run ends.`
+    }
+    case 'report_result': {
+      if (!tok.fanout) return 'refused: report_result is for fan-out tasks only; close with notify_joey, reply_agent or receipt.'
+      const text = String(a.text ?? '').trim()
+      if (!text) throw new Error('empty text')
+      fanoutResult(tok.fanout, lane.id, text)
+      return 'result handed to the synthesis. You are done; nothing goes to Joey from you.'
+    }
+    case 'deliver_synthesis': {
+      if (!tok.synthesis) return 'refused: deliver_synthesis is for the synthesis lane only.'
+      const text = String(a.text ?? '').trim()
+      if (!text) throw new Error('empty text')
+      const fo = S.fanouts?.[tok.synthesis]
+      if (fo) { fo.done = nowIso(); saveState() }
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', notify_main: false, text: `綜合結論交給主線：${text.slice(0, 300)}`, refs: { fanout: tok.synthesis } })
+      const ok = await digestIO.deliver(`〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`, { user: 'lanes', kind: 'synthesis', wake: 'true' })
+      logos('lane.synthesis', { fanout: tok.synthesis, lane: lane.id, delivered: ok, chars: text.length })
+      return ok ? 'delivered to the main.' : 'the main is not reachable now; your conclusion is in the ledger and reaches it in the next digest.'
+    }
+    case 'curator_done': {
+      if (lane.kind !== 'curator') return 'refused: curator_done is for the curator lane only.'
+      const summary = String(a.summary ?? '').trim()
+      curatorEnd(lane.id, 'done', summary)
+      return 'write right returned to the main.'
+    }
   }
   throw new Error(`unknown lane tool ${name}`)
+}
+
+// ------------------------------------------------------------------ 002k: file claims, fan-out, curator
+// design/stability SR6 「兩條線改同一個檔：動共用資源前先在帳本登記『我要動 X』；反射線預設不改檔」: claim_file records an intent in the ledger and
+// tells a second lane who holds the file; the guard hook refuses a lane's write to a workspace file it has not claimed (reflex lanes do
+// not edit workspace files at all). Claims end with the run.
+function releaseClaims(laneId: string, why: string): void {
+  if (!S.claims) return
+  let n = 0
+  for (const [k, c] of Object.entries(S.claims)) if (c.lane === laneId) { delete S.claims[k]; n++ }
+  if (n) { saveState(); appendJsonl('lanes.jsonl', { lane: laneId, kind: 'claims_released', n, why }) }
+}
+// design/merge MG3 「扇出再收攏：主線一次開出多條線各查一塊，指定一條綜合線讀完所有結果、交回一份結論」.
+function fanoutResult(id: string, laneId: string, text: string): void {
+  const fo = S.fanouts?.[id]
+  if (!fo || fo.results[laneId] != null) return
+  fo.results[laneId] = text.slice(0, 6000); saveState()
+  ledger({ lane: laneId, kind: 'action', notify_main: false, text: `扇出 ${id} 的一塊交回：${text.slice(0, 200)}`, refs: { fanout: id } })
+  if (fo.members.every(m => fo.results[m] != null) && !fo.synthesis) startSynthesis(fo)
+}
+function startSynthesis(fo: Fanout): void {
+  const lane = newLane('synthesis', {})
+  fo.synthesis = lane.id; saveState()
+  const parts = fo.members.map((m, i) => `## 第 ${i + 1} 塊：${fo.tasks[i]}\n${fo.results[m]}`).join('\n\n')
+  const ev: InEvent = { id: `ev-syn-${shortId()}`, source: 'mesh', from: 'main', text: fo.brief, meta: {}, notif: { method: '', params: {} }, fanout: fo.id,
+    synthetic: `[車道事件｜主線扇出｜綜合線]\n主線把一件事拆成 ${fo.members.length} 塊交給查詢線，結果都在下面。你是綜合線：讀完全部，整理成一份結論（每一塊的狀態，加一個整體判斷），用 deliver_synthesis 交給主線，一次。不要通知 Joey，不要再開線。\n\n主線的要求：${fo.brief}\n\n${parts}` }
+  enqueue(ev, lane.id, 2)
+  appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'fan_out-synthesis', target: 'lane', lane: lane.id, note: `fanout ${fo.id}` })
+}
+// design/memory 「主線閒下來時，可以把寫入權交給一條整理線…做完交還」, MM5 「整理線只整理提案，不刪主線寫的內容，只能標記『建議刪除』」.
+const memoryWriterFile = (): string => join(LANES_DIR, 'run', 'memory-writer')
+function curatorEnd(laneId: string, how: 'done' | 'revoked', summary: string): void {
+  const c = S.curator
+  if (!c || c.lane !== laneId) return
+  delete S.curator
+  S.curator_line = c.from_line_end ?? S.curator_line
+  saveState()
+  try { rmSync(memoryWriterFile()) } catch {}
+  appendJsonl('lanes.jsonl', { lane: laneId, kind: 'write_right', to: 'main', how })
+  ledger({ lane: how === 'done' ? laneId : 'main', kind: 'action', notify_main: true,
+    text: how === 'done' ? `整理線交回記憶寫入權：${summary.slice(0, 400)}` : `主線收回記憶寫入權（${laneId}）；還沒處理的記憶提案留在帳本，沒有丟。`, refs: { write_right: 'main', from: laneId } })
+  if (how === 'revoked') { const r = running.get(laneId); if (r) { try { r.child.kill('SIGTERM') } catch {} } }
+}
+function roleLines(lane: Lane, it: QItem): string[] {
+  if (lane.kind === 'curator') return ['', '# 你是整理線（例外規則，優先於上面的權限上限）',
+    `- 主線把長期記憶的寫入權暫時交給你。記憶目錄：${memoryDir()}。你可以直接改那裡的檔（每次寫入會自動提交，提交訊息帶你的車道與對話編號）。`,
+    '- 只整理記憶提案：把有根據的提案寫進記憶。不刪、不改寫主線寫的內容；提案跟主線寫的內容衝突時，不動那個檔，改用 ledger_write(kind=memory_proposal) 寫一筆「建議刪除：…（理由）」留給主線。',
+    '- 整理完用 curator_done(summary) 交回寫入權。主線隨時可以收回；收回後你寫不了記憶，沒處理的提案留在帳本。']
+  if (it?.ev?.fanout && lane.kind !== 'synthesis') return ['', '# 你是扇出查詢線', '- 只做交給你的這一塊。完成後用 report_result 把結果交回綜合線，不要用 notify_joey，不要開別的線。']
+  return []
 }
 
 const laneTransports = new Map<string, { transport: StreamableHTTPServerTransport; token: string }>()
@@ -1956,6 +2069,9 @@ export function mainToolDefs(): any[] {
     { name: 'fork', description: '[lanes · main only] Fork this session (full context so far) into a fork lane to work on a side task. Its result lands in the ledger and your next digest; it never merges back silently.',
       inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] } },
     { name: 'lanes_list', description: '[lanes · main only] List this agent\'s lanes (id, kind, thread, status, tokens).', inputSchema: { type: 'object', properties: {} } },
+    { name: 'fan_out', description: '[lanes · main only] Split a task into parts checked in parallel: one lane per part, then one synthesis lane reads all results and delivers ONE conclusion to you. You read one result, not N.', inputSchema: { type: 'object', properties: { tasks: { type: 'array', items: { type: 'string' } }, conclusion: { type: 'string', description: 'what the one conclusion must contain' } }, required: ['tasks', 'conclusion'] } },
+    { name: 'curate_memory', description: '[lanes · main only] Hand the memory write right to a curator lane that works through the memory proposals in the ledger. It never deletes what you wrote (it marks 建議刪除 instead) and returns the right when done.', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } },
+    { name: 'curate_stop', description: '[lanes · main only] Take the memory write right back from the curator lane now (it stops; unprocessed proposals stay in the ledger).', inputSchema: { type: 'object', properties: {} } },
     { name: 'lane_close', description: '[lanes · main only] Close a lane: it gets no further events (its thread falls back to a fresh reflex lane / main).', inputSchema: { type: 'object', properties: { lane_id: { type: 'string' } }, required: ['lane_id'] } },
     { name: 'ledger_query', description: LEDGER_QUERY_DESCRIPTION,
       inputSchema: { type: 'object', properties: {
@@ -1964,7 +2080,7 @@ export function mainToolDefs(): any[] {
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop'].includes(name) }
 
 async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   let topic: number | undefined
@@ -2012,6 +2128,51 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       return rows.join('\n') || '(no lanes)'
     }
     case 'ledger_query': return ledgerQueryTool(a)
+    case 'fan_out': {
+      const tasks = (Array.isArray(a.tasks) ? a.tasks : []).map((t: unknown) => String(t).trim()).filter(Boolean).slice(0, 8)
+      const brief = String(a.conclusion ?? '').trim()
+      if (tasks.length < 2 || !brief) return 'fan_out needs at least two tasks and the conclusion you want'
+      const id = `fo-${shortId()}`
+      const fo: Fanout = { id, brief, tasks, members: [], results: {}, created: nowIso() }
+      S.fanouts ??= {}; S.fanouts[id] = fo
+      tasks.forEach((t: string, i: number) => {
+        const lane = newLane('reflex', {})
+        fo.members.push(lane.id)
+        const ev: InEvent = { id: `ev-fo-${shortId()}`, source: 'mesh', from: 'main', text: t, meta: {}, notif: { method: '', params: {} }, fanout: id,
+          synthetic: `[車道事件｜主線扇出 ${id}｜第 ${i + 1}/${tasks.length} 塊]\n${t}\n\n只做這一塊，查完用 report_result 把結果交回（不要通知 Joey）。` }
+        enqueue(ev, lane.id, 2)
+        appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'fan_out', target: 'lane', lane: lane.id, note: `fanout ${id} part ${i + 1}/${tasks.length}` })
+      })
+      saveState()
+      ledger({ lane: 'main', kind: 'action', notify_main: false, text: `主線扇出 ${id}：${tasks.length} 塊（${tasks.map(t => t.slice(0, 30)).join('；')}），結論要求：${brief.slice(0, 200)}`, refs: { fanout: id } })
+      return `fan-out ${id}: ${tasks.length} lanes started (${fo.members.join(', ')}). One synthesis lane will deliver one conclusion to you when all are back. Tell Joey it is under way if he is waiting.`
+    }
+    case 'curate_memory': {
+      if (S.curator) return `a curator lane (${S.curator.lane}) already holds the write right`
+      const lines = readLedgerLines()
+      const from = S.curator_line ?? 0
+      const props = lines.slice(from).map(l => { try { return JSON.parse(l) } catch { return null } }).filter((r: any) => r && r.kind === 'memory_proposal')
+      if (!props.length) return 'no memory proposals waiting since the last curation'
+      const lane = newLane('curator', {})
+      S.curator = { lane: lane.id, since: nowIso(), from_line: from }
+      ;(S.curator as any).from_line_end = lines.length
+      saveState()
+      try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(memoryWriterFile(), lane.id) } catch {}
+      appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'write_right', to: lane.id, how: 'granted' })
+      const list = props.map((r: any, i: number) => `${i + 1}. ${stamp(r.ts)} ${r.lane}：${String(r.text).slice(0, 300)}`).join('\n')
+      const ev: InEvent = { id: `ev-cur-${shortId()}`, source: 'mesh', from: 'main', text: 'curate memory proposals', meta: {}, notif: { method: '', params: {} },
+        synthetic: `[車道事件｜主線交辦｜整理記憶提案]\n${String(a.note ?? '').trim() || '整理累積的記憶提案。'}\n\n待處理的記憶提案 ${props.length} 筆：\n${list}\n\n記憶目錄：${memoryDir()}。先讀相關的記憶檔，再決定每一筆：寫進去、或衝突時寫一筆「建議刪除」提案留給主線。做完用 curator_done 交回寫入權。` }
+      enqueue(ev, lane.id, 3)
+      appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'curate_memory', target: 'lane', lane: lane.id, note: `${props.length} proposals` })
+      ledger({ lane: 'main', kind: 'action', notify_main: false, text: `主線把記憶寫入權交給整理線 ${lane.id}（${props.length} 筆提案）`, refs: { write_right: lane.id } })
+      return `curator ${lane.id} holds the memory write right and works through ${props.length} proposal(s). curate_stop takes it back.`
+    }
+    case 'curate_stop': {
+      if (!S.curator) return 'no curator lane holds the write right; you have it'
+      const id = S.curator.lane
+      curatorEnd(id, 'revoked', '')
+      return `write right taken back from ${id}; its unprocessed proposals stay in the ledger.`
+    }
     case 'lane_close': {
       const l = S.lanes[String(a.lane_id ?? '')]
       if (!l) return 'no such lane'
@@ -2066,7 +2227,7 @@ export function mainStuckTick(): void {
 //                           to the ledger so the main can pick the work up
 //   /lanes off | on         the master switch
 //   /lanes notify default|tiered   the notify profile
-const KIND_EN: Record<string, string> = { reflex: 'reflex', worker: 'worker', fork: 'fork' }
+const KIND_EN: Record<string, string> = { reflex: 'reflex', worker: 'worker', fork: 'fork', curator: 'curator', synthesis: 'synthesis' }
 function openedBy(l: Lane): string {
   const r = readJsonl('routing.jsonl').find(x => x.lane === l.id)
   if (!r) return '?'
