@@ -229,12 +229,29 @@ def judge(msgs, outs):
     return verdict, a
 
 
+def memory_gate_reason(payload):
+    """main-memory-gate.py sits beside this file; it is called from here because this is the Stop hook the lab wires for the main.
+    Never raises: a missing or broken gate must not affect the answered check."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('main_memory_gate', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main-memory-gate.py'))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.reason(payload)
+    except Exception:
+        return None
+
+
 def main():
     try:
         p = json.load(sys.stdin)
     except Exception:
         return
     if (p.get('hook_event_name') or '') != 'Stop':
+        return
+    held = memory_gate_reason(p)                         # 002k (D1): a Joey-sourced memory proposal that is still undecided holds the turn once
+    if held:
+        print(json.dumps({'decision': 'block', 'reason': held}, ensure_ascii=False))
         return
     sid, d = p.get('session_id') or '', lanes_run_dir(p)
     msgs, outs = turn(p.get('transcript_path') or '')

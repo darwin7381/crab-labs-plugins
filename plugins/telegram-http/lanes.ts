@@ -39,7 +39,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  ackState, cleanReport, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
+  ackState, cleanReport, openJoeyProposals, parseLedgerLine, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
   type DigestCursor, type DigestTake, type LedgerRec,
 } from './lanes-digest.ts'
 
@@ -660,7 +660,7 @@ function newLane(kind: LaneKind, opts: Partial<Lane> & { thread?: string } = {})
 }
 
 // ================================================================== ledger / focus
-type LedgerKind = 'action' | 'commitment' | 'escalation' | 'memory_proposal' | 'receipt' | 'notify' | 'fyi' | 'stop'
+type LedgerKind = 'action' | 'commitment' | 'escalation' | 'memory_proposal' | 'memory_decision' | 'receipt' | 'notify' | 'fyi' | 'stop'
 function ledger(e: { lane: string; thread?: string | null; event?: string; kind: LedgerKind; text: string; notify_main: boolean; refs?: unknown; detail?: string }): void {
   appendJsonl('ledger.jsonl', { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, kind: e.kind, text: e.text,
     notify_main: e.notify_main, refs: e.refs ?? null, detail: e.detail ?? null })
@@ -2000,7 +2000,7 @@ export function promiseTick(): void {
 // ledger and writes nothing. The description is short on purpose: the lane tool schemas are loaded in every call of every lane.
 const LEDGER_QUERY_PROPS = {
   since: { type: 'string', description: 'ISO time (2026-11-13T04:00:00Z) or relative (-4h, -30m, -24h, -2d); empty = from the start' },
-  kind: { type: 'string', description: 'action | commitment | escalation | memory_proposal | receipt | notify | fyi | stop; empty = any kind. An unknown kind returns the valid kinds plus a free-text match.' },
+  kind: { type: 'string', description: 'action | commitment | escalation | memory_proposal | memory_decision | receipt | notify | fyi | stop; empty = any kind. An unknown kind returns the valid kinds plus a free-text match.' },
   text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } }
 export const LANE_LEDGER_QUERY_DESCRIPTION =
   "[read only] Look back in the agent's ledger (what the lanes handled, told Joey, promised, handed over). Use it to count or check history yourself, e.g. restarts of a service in the last 24 h: " +
@@ -2054,9 +2054,10 @@ function chainEnded(lane: Lane, tok: RunTok, why: 'cap' | 'no-change', runs: num
 // relay is the agent's word in Joey's name, a promise like any other, but it was recorded only as an action line. When a run triggered by a
 // Joey message sends reply_agent, the daemon writes kind commitment (who = the peer, what = the sent text, refs.from owner-relay,
 // refs.auto true), unless the lane already wrote a commitment in that run (its own commitment call, or the receipt's promised).
+/** the run was triggered by a Joey message (a Telegram event: a quoted lane message, a worker topic) */
+const byJoeyRun = (tok: RunTok): boolean => tok.trigger === 'joey' || tok.cls === 'joey' || queue.get(tok.evId)?.ev.source === 'telegram'
 function ownerRelay(lane: Lane, tok: RunTok, to: string, text: string, msgId: number | null): void {
-  const byJoey = tok.trigger === 'joey' || tok.cls === 'joey' || queue.get(tok.evId)?.ev.source === 'telegram'
-  if (!byJoey || (tok.commitments ?? 0) > 0) return
+  if (!byJoeyRun(tok) || (tok.commitments ?? 0) > 0) return
   const cm = commitmentFromReport(text, to, to) ?? { who: to, what: text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
   tok.commitments = 1
   ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'commitment', notify_main: false, text: commitmentText(cm),
@@ -2152,9 +2153,13 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const kind = String(a.kind ?? '')
       if (!['action', 'commitment', 'memory_proposal', 'receipt'].includes(kind)) throw new Error('bad kind: use handoff_main to hand work to the main, ask_joey to ask Joey')
       const review = kind === 'memory_proposal' ? await proposalReview(String(a.text ?? ''), queue.get(tok.evId)?.ev) : null
+      // 002k (D1): a memory proposal gets an id (the main decides it by id) and, set by the daemon from the event and never by the lane,
+      // where it came from: refs.joey = the run was triggered by a Joey message
+      const pid = kind === 'memory_proposal' ? `mp-${shortId()}` : null
+      const src = kind === 'memory_proposal' ? (() => { const ev = queue.get(tok.evId)?.ev; return { proposal_id: pid, source: ev?.source ?? null, from: ev?.from ?? null, joey: byJoeyRun(tok) } })() : {}
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: kind as LedgerKind, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : ''),
-        notify_main: ['commitment', 'memory_proposal'].includes(kind), refs: { ...(a.refs ?? {}), ...(review ? { review: review.refs } : {}) }, detail: lane.transcript })
-      return `ledger: ${kind} recorded`
+        notify_main: ['commitment', 'memory_proposal'].includes(kind), refs: { ...(a.refs ?? {}), ...(review ? { review: review.refs } : {}), ...src }, detail: lane.transcript })
+      return `ledger: ${kind} recorded${pid ? ` (id ${pid})` : ''}`
     }
     case 'commitment': {
       const chk = checkCommitmentArgs(a)
@@ -2519,6 +2524,16 @@ function curatorEnd(laneId: string, how: 'done' | 'revoked', summary: string): v
   appendJsonl('lanes.jsonl', { lane: laneId, kind: 'write_right', to: 'main', how })
   ledger({ lane: how === 'done' ? laneId : 'main', kind: 'action', notify_main: true,
     text: how === 'done' ? `整理線交回記憶寫入權：${summary.slice(0, 400)}` : `主線收回記憶寫入權（${laneId}）；還沒處理的記憶提案留在帳本，沒有丟。`, refs: { write_right: 'main', from: laneId } })
+  if (how === 'done') {          // 002k (D1): the curator went through the proposals it was given: the Joey-sourced ones are not left open for ever
+    const all = readLedgerLines().map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
+    const given = readLedgerLines().slice(c.from_line, c.from_line_end ?? undefined).map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
+    const open = new Set(openJoeyProposals(all).map(r => r.refs?.proposal_id))
+    for (const r of given) {
+      if (r.kind !== 'memory_proposal' || !open.has(r.refs?.proposal_id)) continue
+      ledger({ lane: laneId, thread: r.thread, event: r.event ?? undefined, kind: 'memory_decision', notify_main: false,
+        text: `記憶提案 ${r.refs.proposal_id}：由整理線 ${laneId} 處理過（見它交回的摘要）`, refs: { proposal_id: r.refs.proposal_id, decision: 'curated', reason: summary.slice(0, 300), writer: laneId, joey: true } })
+    }
+  }
   if (how === 'revoked') { const r = running.get(laneId); if (r) { try { r.child.kill('SIGTERM') } catch {} } }
 }
 function kindLines(kind: LaneKind): string[] {
@@ -2596,17 +2611,19 @@ export function mainToolDefs(): any[] {
     { name: 'fan_out', description: '[lanes · main only] Split a task into parts checked in parallel: one lane per part, then one synthesis lane reads all results and delivers ONE conclusion to you. You read one result, not N.', inputSchema: { type: 'object', properties: { tasks: { type: 'array', items: { type: 'string' } }, conclusion: { type: 'string', description: 'what the one conclusion must contain' } }, required: ['tasks', 'conclusion'] } },
     { name: 'curate_memory', description: '[lanes · main only] Hand the memory write right to a curator lane that works through the memory proposals in the ledger. It never deletes what you wrote (it marks 建議刪除 instead) and returns the right when done.', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } },
     { name: 'curate_stop', description: '[lanes · main only] Take the memory write right back from the curator lane now (it stops; unprocessed proposals stay in the ledger).', inputSchema: { type: 'object', properties: {} } },
+    { name: 'memory_decide', description: '[lanes · main only] Decide a memory proposal a lane filed (its id is in the digest and in ledger_query(kind=memory_proposal)): accept (write it as it is), rewrite (write `text` instead) or veto (do not write it). `reason` is required. accept and rewrite write the memory the normal way (a memory file, its line in MEMORY.md, a commit in your name); veto only records the decision. Records a ledger entry kind memory_decision. A proposal that came from a Joey message is listed in every digest, and your turn is held once, until it is decided.',
+      inputSchema: { type: 'object', properties: { proposal_id: { type: 'string', description: 'the id of the proposal, e.g. mp-1a2b3c' }, decision: { type: 'string', enum: ['accept', 'rewrite', 'veto'] }, reason: { type: 'string', description: 'why (one line)' }, text: { type: 'string', description: 'rewrite: the text to write; accept: optional, replaces the proposal text' } }, required: ['proposal_id', 'decision', 'reason'] } },
     { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those.',
       inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when (e.g. 明天 10:00 前); leave empty if no time was given' } }, required: ['who', 'what'] } },
     { name: 'lane_close', description: '[lanes · main only] Close a lane: it gets no further events (its thread falls back to a fresh reflex lane / main).', inputSchema: { type: 'object', properties: { lane_id: { type: 'string' } }, required: ['lane_id'] } },
     { name: 'ledger_query', description: LEDGER_QUERY_DESCRIPTION,
       inputSchema: { type: 'object', properties: {
         since: { type: 'string', description: 'ISO time (2026-11-13T04:00:00Z) or relative (-4h, -30m, -2d); empty = from the start' },
-        kind: { type: 'string', description: 'action | commitment | escalation | memory_proposal | receipt | notify | fyi | stop; empty = any kind. commitment = what lanes promised to whom. An unknown kind returns the valid kinds plus a free-text match.' },
+        kind: { type: 'string', description: 'action | commitment | escalation | memory_proposal | memory_decision | receipt | notify | fyi | stop; empty = any kind. commitment = what lanes promised to whom. An unknown kind returns the valid kinds plus a free-text match.' },
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'memory_decide'].includes(name) }
 
 async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   let topic: number | undefined
@@ -2624,6 +2641,55 @@ export function ledgerQueryTool(a: any): string {
   let raw: string | null = null
   try { raw = readFileSync(ledgerPath(), 'utf8') } catch { raw = null }
   return queryLedger(raw, { since: a?.since, kind: a?.kind, text: a?.text }, Date.now())
+}
+
+// ------------------------------------------------------------------ 002k (D1): the main decides memory proposals
+// 002j group D (D01): Joey said 記住, a worker filed the proposal, the digest showed it once, the main never wrote it and no record says why.
+// Code, not prompt text: memory_decide writes a ledger memory_decision (accept / rewrite / veto, with a reason); accept and rewrite write the
+// memory the way the main always does (a memory file with its frontmatter, a line in MEMORY.md, a git commit in the writer's name); the
+// digest lists every open Joey-sourced proposal again until a decision exists; the main's Stop hook (lanes-hooks/main-memory-gate.py) holds the
+// turn once while one is still open after a whole turn of the main.
+function stripReview(text: string): string { return String(text ?? '').split('\n〔Jev')[0].trim() }
+function writeMemoryFile(id: string, body: string, why: string, src: { lane: string; thread: string | null }, who: string): string {
+  const dir = memoryDir()
+  mkdirSync(dir, { recursive: true })
+  const file = `decision_${id}.md`
+  const desc = body.replace(/\s+/g, ' ').slice(0, 80)
+  writeFileSync(join(dir, file), `---\nname: ${id}\ndescription: ${desc}\nmetadata:\n  type: feedback\n---\n\n${body}\n\n**Why:** ${why}\n\n**Source:** 記憶提案 ${id}（${src.lane}，thread ${src.thread ?? '-'}），主線決定。\n`)
+  const idx = join(dir, 'MEMORY.md')
+  let cur = ''
+  try { cur = readFileSync(idx, 'utf8') } catch {}
+  appendFileSync(idx, `${cur && !cur.endsWith('\n') ? '\n' : ''}- [${id}](${file}) — ${desc}\n`)
+  const env = { ...process.env, GIT_AUTHOR_NAME: who, GIT_AUTHOR_EMAIL: `${who}@genesis.lab`, GIT_COMMITTER_NAME: who, GIT_COMMITTER_EMAIL: `${who}@genesis.lab` }
+  const g = (args: string[]) => spawnSync('git', ['-C', dir, ...args], { env, encoding: 'utf8' })
+  if (!existsSync(join(dir, '.git'))) g(['init', '-q'])
+  g(['add', '-A'])
+  g(['commit', '-q', '-m', `memory: ${file}\n\nlane=${who} thread=${src.thread ?? '-'} proposal=${id}`])
+  return file
+}
+function memoryDecide(a: any): string {
+  const id = String(a?.proposal_id ?? '').trim(), decision = String(a?.decision ?? '').trim().toLowerCase()
+  const reason = String(a?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 400), text = String(a?.text ?? '').trim()
+  if (!['accept', 'rewrite', 'veto'].includes(decision)) return 'memory_decide refused: decision must be accept, rewrite or veto.'
+  if (!id) return 'memory_decide refused: proposal_id is required (the digest and ledger_query(kind=memory_proposal) show it).'
+  if (!reason) return 'memory_decide refused: reason is required (one line: why).'
+  const recs = readLedgerLines().map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
+  const prop = recs.find(r => r.kind === 'memory_proposal' && r.refs?.proposal_id === id)
+  if (!prop) return `memory_decide refused: no memory proposal ${id} in the ledger. ledger_query(kind=memory_proposal) lists them.`
+  const done = recs.find(r => r.kind === 'memory_decision' && r.refs?.proposal_id === id)
+  if (done) return `memory_decide refused: ${id} was already decided (${done.refs?.decision}) at ${stamp(done.ts)}.`
+  if (decision === 'rewrite' && !text) return 'memory_decide refused: rewrite needs `text`, the text to write.'
+  if (decision !== 'veto' && S.curator) return `memory_decide refused: the curator lane ${S.curator.lane} holds the memory write right now; it is the writer until it hands the right back (curator_done) or you take it back (curate_stop). A veto can be recorded at any time.`
+  let file: string | null = null
+  const body = decision === 'rewrite' ? text : (text || stripReview(prop.text))
+  if (decision !== 'veto') {
+    try { file = writeMemoryFile(id, body, reason, { lane: prop.lane, thread: prop.thread }, `${D.agent}.main`) }
+    catch (e) { return `memory_decide failed: the memory write did not happen (${e instanceof Error ? e.message : e}); no decision was recorded.` }
+  }
+  ledger({ lane: 'main', thread: prop.thread, event: prop.event ?? undefined, kind: 'memory_decision', notify_main: false,
+    text: `記憶提案 ${id}：${{ accept: '採納', rewrite: '改寫後採納', veto: '否決' }[decision]}（${reason}）${file ? `；已寫入 ${file}` : ''}`,
+    refs: { proposal_id: id, decision, reason, writer: `${D.agent}.main`, file, joey: prop.refs?.joey === true, ...(decision === 'rewrite' ? { rewritten_from: stripReview(prop.text).slice(0, 300) } : {}) } })
+  return file ? `${decision === 'rewrite' ? 'rewritten and ' : ''}accepted: ${id} written to memory (${file}, committed as ${D.agent}.main); decision recorded.` : `vetoed: ${id}; nothing written; decision recorded.`
 }
 
 export async function callMainTool(name: string, a: any, mcpSid: string | undefined): Promise<string> {
@@ -2654,6 +2720,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       return rows.join('\n') || '(no lanes)'
     }
     case 'ledger_query': return ledgerQueryTool(a)
+    case 'memory_decide': return memoryDecide(a)                // 002k (D1)
     case 'commitment': {                                       // 002k (C1)
       const chk = checkCommitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
@@ -2862,7 +2929,9 @@ function planNow(onlyIfWake: boolean, commit: boolean): DigestTake | null {
   const cur = readJson<DigestCursor>(digestPath(), { line: 0 })
   // wake tick: an escalating lane that is still running is about to file its closing report — let the wake carry it
   const hold = onlyIfWake ? (r: LedgerRec) => !!r.lane && running.has(r.lane) && Date.now() - Date.parse(r.ts) < WAKE_HOLD_MS : undefined
-  const plan = planDigest(cur, readLedgerLines(), Date.now(), { id: `dg-${Date.now()}-${shortId()}`, onlyIfWake, retryMs: DIGEST_RETRY_MS, hold })
+  const lines = readLedgerLines()
+  const reopen = onlyIfWake ? [] : openJoeyProposals(lines.map(parseLedgerLine).filter((r): r is LedgerRec => !!r))      // 002k (D1)
+  const plan = planDigest(cur, lines, Date.now(), { id: `dg-${Date.now()}-${shortId()}`, onlyIfWake, retryMs: DIGEST_RETRY_MS, hold, reopen })
   if (commit || !plan.take) persistCursor(cur, plan.cursor)
   return plan.take
 }
