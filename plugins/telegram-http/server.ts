@@ -60,7 +60,7 @@ import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.t
 // (GENESIS_LANES=1); with it unset the daemon runs the 685e5b1 code paths unchanged.
 import * as Lanes from './lanes.ts'
 import { isClaudeIdleStable } from './channel-bot-control.ts'
-import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
+import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
@@ -877,6 +877,8 @@ function sweepDeliveries(): void {
     } else if (it?.queued) {
       // the live client has it and reads it at the next step of its running turn; if that process dies first,
       // repersistUnconsumed gives it to the next one
+      // 002k (G16b): ... unless nothing is running: alive, no open tool call, no new assistant record for a minute = not reading (a menu, or no turn)
+      if (Lanes.LANES_ON) void Lanes.noteMainDeaf(d.at)
     } else if (!d.pendingPath && now - (it?.taken ? Math.max(d.at, it.takenAt) : d.at) > (it && !it.taken ? ARRIVE_GRACE_MS : CONSUME_GRACE_MS)) {
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
       if (attempts >= MAX_REDELIVERIES) {
@@ -3198,6 +3200,13 @@ if (Lanes.LANES_ON) {
     authOk: tokOk,
     repersistUnconsumed,
     sweepNow: () => { sweepDeliveries(); void drainPendingIfLive() },
+    // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice
+    ...(process.env.CHANNEL_BOT_TMUX_SESSION ? { mainPicker: {
+      capture: () => capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
+      detect: detectStartupPicker,
+      drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key),
+      rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
+    } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     ...(INBOX_ONLY ? {
       meshSend: async (to, text, replyTo, noReply, extra) => {

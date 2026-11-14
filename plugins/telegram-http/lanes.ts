@@ -123,6 +123,16 @@ export interface LanesDeps {
   repersistUnconsumed?: () => number
   /** 002i: run the delivery sweep and the drain of parked deliveries now */
   sweepNow?: () => void
+  /** 002k (G16): the main's pane and the startup picker on it (server.ts builds it from startup-picker.ts when it knows the main's tmux target) */
+  mainPicker?: MainPicker
+}
+/** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
+ *  or put the menu in front of Joey again with a fresh debounce */
+export type MainPicker = {
+  capture: () => Promise<string>
+  detect: (pane: string) => { key: string; title: string; options: string[] } | null
+  drive: (idx: number, key: string) => Promise<'ok' | 'gone' | 'stuck'>
+  rearm: () => void
 }
 
 let D: LanesDeps
@@ -617,6 +627,7 @@ type State = {
   main_gen?: number                                                    // 002k: how many times the main role was handed to a fresh session (+1)
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
+  main_deaf?: { baseline: number; at: string }                         // 002k (G16b): the main was told to be deaf for the stretch of silence after this assistant record
 }
 /** 002d: something a lane (or the router) handed to the main. pending → delivered (the main got the wake digest that
  *  carries it) | fallback (the main did not get it in time, or is not connected: Joey was told directly, once). */
@@ -1399,6 +1410,79 @@ export function wallResumeNotice(w: { err_at: number; text: string }, held: numb
     + (held ? `這段期間保留的 ${held} 則訊息接著會送來；` : '') + '已經回過的不用再回。\n'
     + '這是系統產生的通知，不用回覆任何 agent。'
 }
+// ------------------------------------------------------------------ 002k (G16, 002j group G): a main parked on a menu reads nothing
+// After the wall lifted, the plugin told Joey the held messages were handed to the main. But a main parked on Claude Code's limit menu reads
+// nothing: no model call follows and the deliveries stay queued while the process is alive. Programs, not hope:
+//  (a) mainWallDown looks at the main's pane first. A menu there is driven (driveStartupPicker re-checks the live pane and the label hash before
+//      any key) to the option that CONTINUES or WAITS, never to one that spends money or changes the plan; with no safe option, or when it did
+//      not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
+//  (b) noteMainDeaf (called by the delivery sweep): a delivery that stays queued for MAIN_DEAF_MS with the main's process alive, no open tool call
+//      and no new assistant record gets one push to Joey and a lane.main_deaf record;
+//  (c) every menu found is logged with its real option labels (the picker log used to carry only the count).
+const NEVER_PICK = /upgrade|extra usage|switch|request more|add funds|purchase|\bbuy\b|billing|payment|\bpay\b|credit|[$€£¥]|\bplan\b|opus|sonnet|haiku|fable|\bmodel\b|don[’']?t continue|do not continue|never|exit|quit|trust|delete|remove/i
+const PICK_CONTINUE = /continue automatically|resume automatically|keep going|\bcontinue\b/i
+const PICK_WAIT = /stop and wait|wait here|wait for|^wait\b/i
+/** The option that continues or waits: "Wait here, then continue automatically at 3 PM" first, then "Stop and wait for limit to reset". An option that
+ *  upgrades, switches model or plan, buys usage or says do not continue is never picked. null = no safe option. */
+export function pickContinueOption(options: string[]): number | null {
+  const ok = (l: string): boolean => !NEVER_PICK.test(l)
+  let i = options.findIndex(l => ok(l) && PICK_CONTINUE.test(l))
+  if (i < 0) i = options.findIndex(l => ok(l) && PICK_WAIT.test(l))
+  return i >= 0 ? i : null
+}
+export type MenuResult = { key: string; options: string[]; chose?: { idx: number; label: string }; result?: 'ok' | 'gone' | 'stuck' | 'error'; resurfaced: boolean }
+/** Look at the main's pane. drive=true: drive the continue / wait option of a LIMIT menu (the pane must speak of a limit, so another menu that happens to
+ *  say "continue" is not touched). A menu that is not driven, or did not clear, is re-armed for Joey. null = no pane, or no menu on it. */
+async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult | null> {
+  const mp = D?.mainPicker
+  if (!mp) return null
+  let pane = ''
+  try { pane = await mp.capture() } catch (e) { D.log('warn', `lanes: main pane not readable (${why}): ${e}`); return null }
+  const pk = mp.detect(pane)
+  if (!pk) return null
+  const labels = pk.options.map((l, i) => `${i + 1}. ${l}`).join(' | ')
+  D.log('warn', `lanes: the main is parked on a menu '${pk.key}' (${why}): ${labels}`)
+  const res: MenuResult = { key: pk.key, options: pk.options, resurfaced: false }
+  const idx = drive && /limit|usage|reset/i.test(pane) ? pickContinueOption(pk.options) : null
+  if (idx != null) {
+    res.chose = { idx, label: pk.options[idx] }
+    try { res.result = await mp.drive(idx, pk.key) } catch (e) { res.result = 'error'; D.log('warn', `lanes: driving the main's menu failed: ${e}`) }
+    if (res.result === 'stuck' || res.result === 'error') { mp.rearm(); res.resurfaced = true }
+  } else { mp.rearm(); res.resurfaced = true }
+  logos('lane.main_menu', { why, key: pk.key, options: pk.options, chose: res.chose ?? null, result: res.result ?? null, resurfaced: res.resurfaced })
+  return res
+}
+function menuSentence(m: MenuResult): string {
+  const labels = m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')
+  if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，它繼續了。`
+  if (m.chose && m.result === 'gone') return `主線停在一個選單（${labels}），要選「${m.chose.label}」時選單已經不在了（可能別處已經選掉），沒有動作。`
+  if (m.chose) return `主線停在一個選單（${labels}），選了「${m.chose.label}」但選單還在，選項已再傳給你，請點一個。`
+  return `主線停在一個選單（${labels}），我挑不出一個安全的選項（不碰要付費或換方案的），選項已再傳給你，請點一個。`
+}
+const MAIN_DEAF_MS = (): number => Number(process.env.LANES_MAIN_DEAF_MS ?? 60_000)
+const deafSeen = new Set<number>()
+/** The delivery sweep found a delivery (handed to the main at deliveredAt) still queued. When it has been queued for MAIN_DEAF_MS, the main's process is
+ *  alive, no tool call is open and no genuine assistant record came after it: the main is not reading (a menu, or no turn). One push to Joey per
+ *  stretch of silence (until the main next answers), a lane.main_deaf record, and a menu on the pane is put in front of Joey. Not for a main behind the
+ *  model wall (that has its own notice). */
+export async function noteMainDeaf(deliveredAt: number, now = Date.now()): Promise<'noted' | 'no'> {
+  const path = mainReg?.transcript_path
+  if (D?.role !== 'tg' || !S || !path || now - deliveredAt <= MAIN_DEAF_MS() || deafSeen.has(deliveredAt)) return 'no'
+  if (S.main_wall || wallHoldsMain() || !pidAlive(mainReg!.claude_pid) || openToolCallFile(path)) return 'no'
+  const newest = genuineAssistantAtFile(path)
+  if (newest > deliveredAt) return 'no'
+  deafSeen.add(deliveredAt); if (deafSeen.size > 500) deafSeen.clear()
+  if (S.main_deaf && S.main_deaf.baseline === newest) return 'no'         // already told for this stretch of silence
+  S.main_deaf = { baseline: newest, at: nowIso() }; saveState()
+  const secs = Math.round((now - deliveredAt) / 1000)
+  const menu = await inspectMainMenu(false, 'main-deaf')
+  const text = `主線沒有在讀：有訊息交給它已經 ${secs} 秒了，它的 process 還活著，沒有進行中的工具呼叫，也沒有新的回覆（停在選單，或沒有開新回合）。`
+    + (menu ? `它停在一個選單：${menu.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。` : '')
+  ledger({ lane: 'router', kind: 'notify', notify_main: true, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-deaf', escalated: true } })
+  logos('lane.main_deaf', { queued_s: secs, pid: mainReg!.claude_pid, assistant_at: newest || null, menu: menu ? menu.options : null })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-deaf', message_id: id }))
+  return 'noted'
+}
 async function mainWallDown(by: string): Promise<void> {
   const w = S.main_wall
   if (!w) return
@@ -1406,6 +1490,7 @@ async function mainWallDown(by: string): Promise<void> {
   if (mainProbeTimer) { clearTimeout(mainProbeTimer); mainProbeTimer = null }
   try { rmSync(mainWallFile()) } catch {}
   try { writeFileSync(mainWallLiftedFile(), String(Date.now())) } catch {}
+  const menu = await inspectMainMenu(true, 'wall-down')        // 002k (G16a): a menu the main is parked on is dealt with BEFORE anything is handed to it
   // A main stopped in the middle of work is told to carry on, before what was kept reaches it. A main whose walled turn
   // was only a message it never answered needs no notice: that message is given again.
   let told: boolean | null = null
@@ -1417,8 +1502,9 @@ async function mainWallDown(by: string): Promise<void> {
   const text = `主線的模型恢復了（${stamp(w.since)} 起不能用，${TZ_LABEL}）。`
     + (w.held ? `這段期間保留的 ${w.held} 則訊息現在交給主線。` : '')
     + (told === true ? '主線有一回合做到一半被打斷，已經通知它接著做完。' : told === false ? '主線有一回合做到一半被打斷，但接續通知沒有送到（主線目前沒有連線）。' : '')
+    + (menu ? menuSentence(menu) : '')
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-down', escalated: true } })
-  logos('lane.main_wall_down', { since: w.since, probes: w.probes + 1, by, held: w.held ?? 0, resume_notice: told })
+  logos('lane.main_wall_down', { since: w.since, probes: w.probes + 1, by, held: w.held ?? 0, resume_notice: told, menu: menu ? { options: menu.options, chose: menu.chose?.label ?? null, result: menu.result ?? null } : null })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-down', message_id: id }))
 }
 export const __setDigestIO = (io: Partial<DigestIO>): void => { Object.assign(digestIO, io) }

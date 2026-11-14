@@ -45,6 +45,12 @@ function runCommand(argv: string[], timeoutMs = 8000): Promise<{ exitCode: numbe
 
 export type PickerTarget = { label: string; tmux: string }
 
+/** The text of a tmux pane now ('' when it cannot be read). */
+export async function capturePane(tmux: string): Promise<string> {
+  const { stdout } = await runCommand(['tmux', 'capture-pane', '-t', tmux, '-p'])
+  return stdout
+}
+
 export interface DetectedPicker {
   key: string           // pattern id (for logs)
   title: string         // human title line shown above the buttons
@@ -139,6 +145,12 @@ export function detectStartupPicker(pane: string): DetectedPicker | null {
   return null
 }
 
+/** The one-line description of a picker for logs and notices: its key AND the real option labels (002k G16: only the count was logged, so a
+ *  stuck limit menu left no record of what it offered). */
+export function describePicker(picker: DetectedPicker, tmux: string): string {
+  return `startup picker '${picker.key}' on pane ${tmux} (${picker.options.length} options: ${picker.options.map((l, i) => `${i + 1}. ${l}`).join(' | ')})`
+}
+
 export type DriveResult = 'ok' | 'gone' | 'stuck'
 
 /**
@@ -202,25 +214,32 @@ export interface SurfaceSpec {
  * episode), call `surface` with the title + one button per real option label.
  * Debounce clears when the picker leaves the pane (answered or dismissed).
  */
+// tmux → already surfaced this episode. Module level (002k G16) so a program that knows a picker is STILL up can re-arm it
+// (rearmStartupPicker): the next poll then surfaces it to Joey again, with a fresh debounce.
+const surfaced = new Map<string, boolean>()
+export function rearmStartupPicker(tmux: string): void { surfaced.set(tmux, false) }
+
 export function startStartupPickerWatchdog(opts: {
   listTargets: () => Promise<PickerTarget[]>
   surface: (spec: SurfaceSpec) => void
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
   pollMs?: number
+  /** tests: the pane reader */
+  capture?: (tmux: string) => Promise<string>
 }): void {
-  const surfaced = new Map<string, boolean>() // tmux → already surfaced this episode
   const pollMs = opts.pollMs ?? 8_000
+  const capture = opts.capture ?? capturePane
   const tick = async (): Promise<void> => {
     let targets: PickerTarget[] = []
     try { targets = await opts.listTargets() } catch { return }
     for (const t of targets) {
-      const { stdout: pane } = await runCommand(['tmux', 'capture-pane', '-t', t.tmux, '-p'])
+      const pane = await capture(t.tmux)
       if (!pane) continue
       const picker = detectStartupPicker(pane)
       if (picker) {
         if (!surfaced.get(t.tmux)) {
           surfaced.set(t.tmux, true)
-          opts.log('warn', `startup picker '${picker.key}' on pane ${t.tmux} (${picker.options.length} options) — surfacing to TG`)
+          opts.log('warn', `${describePicker(picker, t.tmux)} — surfacing to TG`)
           opts.surface({
             title: `${picker.title}\n（${t.label}）點下面選項，我幫你選：`,
             buttons: picker.options.map((label, i) => ({
