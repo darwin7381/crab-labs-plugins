@@ -39,7 +39,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  ackState, cleanReport, openJoeyProposals, parseLedgerLine, parseLocal, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
+  ackState, clip, cleanReport, openJoeyProposals, parseLedgerLine, parseLocal, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
   type DigestCursor, type DigestTake, type LedgerRec,
 } from './lanes-digest.ts'
 
@@ -173,6 +173,12 @@ export function lanesInit(deps: LanesDeps): void {
     loadState()
     writeLaneSettings()
     loadQueue()
+    for (const [id, list] of Object.entries(S.steering ?? {})) {                 // 002k (E18): messages that were with a run when the daemon stopped: that run is gone, they are the lane's next run
+      const lane = S.lanes[id]
+      if (lane) queueSteering(lane, list, 'was cut off when the daemon restarted')
+      for (const k of ['in', 'out'] as const) { try { rmSync(steerFile(id, k)) } catch {} }
+    }
+    if (S.steering) { S.steering = {}; saveState() }
     setTimeout(sweepQueue, 2_000).unref()          // 002f: what the previous daemon left running is dispatched again now
     setInterval(sweepQueue, 10_000).unref()
     setInterval(followupTick, 1_000).unref()
@@ -632,7 +638,10 @@ type State = {
   main_commitments?: Record<string, MainCommitment>                    // 002k (G10): what the main promised with its commitment tool (id -> state)
   flood?: Record<string, PeerFlood>                                    // 002k (H14): per-peer admission state, by peer name
   holds?: Record<string, PeerHold>                                     // 002k (H14): peers whose events are ledger-only (by the main or by Joey)
+  steering?: Record<string, SteerRec[]>                                // 002k (E18): Joey's messages handed to a running run, not yet seen delivered (lane id → list)
 }
+/** 002k (E18): a message of Joey's handed to the run in progress (run/steer/<lane>.in.jsonl) and what is known of it: when (ms, the daemon's clock) and for which run */
+type SteerRec = { ev: InEvent; sent: number; run: string }
 /** 002k (H14): a peer's admission state: a token bucket of new threads, the tokens its lane runs spent lately, and the flood episode in progress */
 type PeerFlood = { bucket: number; bucket_at: number; usage: Array<[number, number]>; admits?: number[]
   episode?: { start: string; last_at: number; count: number; first: string; last: string; samples: string[]; answered: number; reasons: Record<string, number>; replied_at: number } }
@@ -1223,6 +1232,104 @@ function noteAlert(ev: InEvent, thread: string): void {
   saveState()
 }
 
+// ------------------------------------------------------------------ 002k (E18): Joey's steering reaches a lane run that is in progress
+// 002j E04 / F01: a message of Joey's that routed to a lane whose run was in progress was queued behind that run (48 to 156 s). A `claude -p` lane has no
+// channel to receive a message on mid-run (the main gets one from the harness, which absorbs it into the turn: main-midturn-hook.py reads that from the
+// transcript), so the daemon does the equivalent through a file: the message is appended to run/steer/<lane>.in.jsonl and lane-steer-hook.py, a PostToolUse
+// hook every lane run carries, hands it to the model at its next tool boundary (lane-stop-hook.py hands it over when the run is about to end with it
+// undelivered). The hook marks what it handed over in run/steer/<lane>.out.jsonl; the daemon reads that, writes the delivery to the ledger, and when the run
+// ends with a message still undelivered (the run was inside one long tool call, or ended on its own) that message becomes the lane's next run at priority 0:
+// the same run Joey got before this change, minus the wait for runs that do reach a tool boundary. The message is never queued behind the run and never lost.
+// LANES_STEER_MIDTURN=0 turns it off (every Joey message queues behind the run again).
+const steerFile = (lane: string, k: 'in' | 'out'): string => join(LANES_DIR, 'run', 'steer', `${lane.replace(/[^A-Za-z0-9_.-]/g, '_')}.${k}.jsonl`)
+function steerable(ev: InEvent, lane: Lane): boolean {
+  return process.env.LANES_STEER_MIDTURN !== '0' && D.role === 'tg' && ev.source === 'telegram' && !ev.synthetic && !ev.fanout && !S.master_off
+    && lane.kind !== 'synthesis' && lane.kind !== 'curator' && running.has(lane.id)
+}
+function steerRun(ev: InEvent, lane: Lane, base: { rule: string; critical?: boolean }): Decision | null {
+  const run = running.get(lane.id)
+  if (!run) return null
+  try {
+    mkdirSync(join(LANES_DIR, 'run', 'steer'), { recursive: true, mode: 0o700 })
+    appendFileSync(steerFile(lane.id, 'in'), JSON.stringify({ id: ev.id, ts: nowIso(), from: ev.from, text: ev.text, message_id: ev.meta?.message_id ?? null,
+      quote: ev.reply_to_text ?? null, run: run.runId }) + '\n')
+  } catch (e) { D.log('warn', `lanes: steering ${ev.id} could not be written (${e}): it queues behind the run`); return null }
+  S.steering ??= {}
+  ;(S.steering[lane.id] ??= []).push({ ev, sent: Date.now(), run: run.runId })
+  saveState()
+  ledger({ lane: 'router', thread: lane.thread, event: ev.id, kind: 'action', notify_main: false,
+    text: `steering → ${lane.id}：${ev.from} 的訊息送進它正在跑的 ${run.runId}（下一個工具邊界交給它，不排在這一趟後面）：${clip(ev.text, 200)}`,
+    refs: { steer: 'sent', id: ev.id, run: run.runId, lane: lane.id, message_id: ev.meta?.message_id ?? null } })
+  logos('lane.steer', { lane: lane.id, thread: lane.thread, event: ev.id, run: run.runId, phase: 'sent' })
+  armSteerTimer()
+  return { ...base, target: 'lane', lane: lane.id, note: `steering: handed to the running ${run.runId}; delivered at its next tool boundary (not queued behind it)` }
+}
+function readJsonlFile(path: string): any[] {
+  try { return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean) } catch { return [] }
+}
+/** the messages the hook has handed over by now: each gets its ledger line (with the wait, on the daemon's clock) and leaves the pending list */
+function syncSteer(laneId: string): void {
+  const list = S?.steering?.[laneId]
+  if (!list?.length) return
+  const got = new Map(readJsonlFile(steerFile(laneId, 'out')).map(r => [String(r.id), r]))
+  const left: SteerRec[] = []
+  for (const s of list) {
+    const m = got.get(s.ev.id)
+    if (!m) { left.push(s); continue }
+    const waitMs = Date.now() - s.sent
+    ledger({ lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, kind: 'action', notify_main: false,
+      text: `steering delivered：${s.ev.from} 的訊息在 ${Math.round(waitMs / 100) / 10} 秒後交給 ${s.run} 正在跑的那一趟（${m.event === 'Stop' ? '它要結束時攔下來' : `工具 ${m.tool || '-'} 之後`}）：${clip(s.ev.text, 160)}`,
+      refs: { steer: 'delivered', id: s.ev.id, run: s.run, wait_ms: waitMs, via: m.event ?? null, tool: m.tool || null, message_id: s.ev.meta?.message_id ?? null } })
+    logos('lane.steer', { lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, run: s.run, phase: 'delivered', wait_ms: waitMs, via: m.event ?? null })
+    const r = running.get(laneId)
+    if (r && r.runId === s.run) (r.tok.steered ??= []).push(s.ev)
+  }
+  if (left.length !== list.length) { if (left.length) S.steering![laneId] = left; else delete S.steering![laneId]; saveState() }
+}
+/** the run is over: whatever the hook handed over is recorded, and what it did not is returned (the files are removed) */
+function settleSteering(lane: Lane): SteerRec[] {
+  syncSteer(lane.id)
+  const left = S.steering?.[lane.id] ?? []
+  if (S.steering?.[lane.id]) { delete S.steering[lane.id]; saveState() }
+  for (const k of ['in', 'out'] as const) { try { rmSync(steerFile(lane.id, k)) } catch {} }
+  return left
+}
+/** messages that were not delivered become the lane's next run, first in line (the first is the event, the rest ride along in it); no pump here: the caller's comes after its own bookkeeping */
+function queueSteering(lane: Lane, left: SteerRec[], why: string): void {
+  if (!left.length) return
+  if (lane.status === 'closed') {
+    for (const s of left) ledger({ lane: lane.id, thread: lane.thread, event: s.ev.id, kind: 'fyi', notify_main: true,
+      text: `${lane.id} 在 Joey 的訊息送到之前被關掉了（${why}），訊息沒有處理：${clip(s.ev.text, 200)}`, refs: { steer: 'lane-closed', id: s.ev.id, run: s.run } })
+    return
+  }
+  const [first, ...rest] = left
+  const it: QItem = { ev: first.ev, lane: lane.id, state: 'queued', lease_until: 0, attempts: 0, priority: 0, enqueued: nowIso(), ...(rest.length ? { extra: rest.map(r => r.ev) } : {}) }
+  queue.set(first.ev.id, it); saveQ(it)
+  for (const s of left) ledger({ lane: lane.id, thread: lane.thread, event: s.ev.id, kind: 'action', notify_main: false,
+    text: `steering not delivered：${s.run} ${why}，${s.ev.from} 的訊息沒有走到工具邊界；它成為 ${lane.id} 的下一趟，排在最前面：${clip(s.ev.text, 160)}`,
+    refs: { steer: 'requeued', id: s.ev.id, run: s.run, why, as: first.ev.id } })
+  logos('lane.steer', { lane: lane.id, thread: lane.thread, event: first.ev.id, phase: 'requeued', why, n: left.length })
+}
+let steerTimer: ReturnType<typeof setInterval> | null = null
+function armSteerTimer(): void {
+  if (steerTimer) return
+  steerTimer = setInterval(() => {
+    for (const id of Object.keys(S?.steering ?? {})) {
+      const lane = S.lanes[id]
+      if (lane && running.has(id)) syncSteer(id)
+      else if (lane) { queueSteering(lane, settleSteering(lane), 'ended'); pump() }      // nothing runs that could take it (should not happen: the exit handler settles it)
+      else delete S.steering![id]
+    }
+    if (!Object.keys(S?.steering ?? {}).length && steerTimer) { clearInterval(steerTimer); steerTimer = null }
+  }, 500)
+  steerTimer.unref?.()
+}
+/** what Joey wrote last into this run: its notify_joey and ask_joey answer THAT message (E4), not the one that started the run */
+function replyEventFor(tok: RunTok): InEvent | undefined {
+  syncSteer(tok.lane)
+  return tok.steered?.length ? tok.steered[tok.steered.length - 1] : queue.get(tok.evId)?.ev
+}
+
 function dispatch(ev: InEvent, lane: Lane | undefined, base: { rule: string; critical?: boolean }): Decision {
   if (!lane || lane.status === 'closed') return { ...base, target: 'main', note: 'lane missing/closed → main' }
   // C03: a lane idle for too long is not resumed; a fresh reflex lane gets the thread summary
@@ -1233,6 +1340,7 @@ function dispatch(ev: InEvent, lane: Lane | undefined, base: { rule: string; cri
     return { ...base, target: 'lane', lane: fresh.id, note: `${lane.id} too old → fresh lane with ledger summary` }
   }
   const busy = running.has(lane.id)
+  if (busy && steerable(ev, lane)) { const st = steerRun(ev, lane, base); if (st) return st }       // 002k (E18): Joey's message goes INTO the run in progress
   enqueue(ev, lane.id, base.critical ? 0 : 5)
   return { ...base, target: 'lane', lane: lane.id,
     note: busy ? `queued behind the running run; then resume ${lane.session_id}` : lane.runs > 0 ? `resume ${lane.session_id}` : `new session ${lane.session_id}` }
@@ -1257,7 +1365,7 @@ type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done' | 
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
   extra?: InEvent[] }
 const queue = new Map<string, QItem>()          // event id → item
-const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval> }>()  // lane id → run
+const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval>; tok: RunTok }>()  // lane id → run
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string
   escalated: boolean; pushed: boolean; asked?: boolean; handed?: boolean; commitments?: number
   /** 002k (B11): notify_joey messages this run sent / whether the one-line nudge was already given / the receipt it filed */
@@ -1272,6 +1380,8 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   interim?: string
   /** 002e: this run is a follow-up the lane scheduled itself (event id ev-fu-…) */
   followup?: boolean
+  /** 002k (E18): Joey's messages that reached this run while it was in progress and were handed to it at a tool boundary (the last one is what its notify_joey answers) */
+  steered?: InEvent[]
   /** 002k: the run is a fan-out member / the synthesis of a fan-out */
   fanout?: string; synthesis?: string }
 const runTokens = new Map<string, RunTok>()
@@ -1920,7 +2030,9 @@ function writeLaneSettings(): void {
       Stop: [{ matcher: '', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-stop-hook.py')}`, timeout: 20 }] }],
       PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-guard-hook.py')}`, timeout: 10 }] }],
       // 002k: the curator's memory writes are committed like the main's (the commit names the lane and thread)
-      PostToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'memory-commit-hook.py')}`, timeout: 20 }] }],
+      PostToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'memory-commit-hook.py')}`, timeout: 20 }] },
+        // 002k (E18): Joey's message that reached this run while it was in progress, handed over at the next tool boundary (lane-stop-hook.py hands it over at the end)
+        { matcher: '', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-steer-hook.py')}`, timeout: 10 }] }],
     },
   }
   writeJsonAtomic(join(LANES_DIR, 'lane-settings.json'), settings, 0o644)
@@ -2014,7 +2126,7 @@ function startRun(it: QItem): void {
     logos('lane.timeout', { lane: lane.id, run: runId, event: it.ev.id, after_s: Math.round(LANE_MAX_RUN_MS / 1000), attempt: it.attempts })
     try { child.kill('SIGKILL') } catch {}
   }, LANE_MAX_RUN_MS)
-  running.set(lane.id, { child, evId: it.ev.id, runId, renew })
+  running.set(lane.id, { child, evId: it.ev.id, runId, renew, tok })
   if (critical && !tok.followup) { armCriticalDeadline(it, lane); markMustKnow(it, lane) }
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
@@ -2059,9 +2171,11 @@ function startRun(it: QItem): void {
   child.on('exit', (code, signal) => {
     clearInterval(renew)
     clearTimeout(limit)
+    syncSteer(lane.id)                                                // 002k (E18): what the hook handed over is recorded while the run's entry still stands
     running.delete(lane.id)
     runTokens.delete(token)
     try { rmSync(mcpCfg) } catch {}
+    const steerLeft = settleSteering(lane)                            // 002k (E18): what it did not hand over is queued below, after the run's own bookkeeping
     let tin = 0, tout = 0
     for (const u of usage.values()) { tin += u.in; tout += u.out }
     if (lane.kind === 'fork' && lane.runs === 0 && sessionSeen) {
@@ -2071,6 +2185,7 @@ function startRun(it: QItem): void {
     if (code === 0 || existsSync(lane.transcript)) lane.runs += 1
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
+    queueSteering(lane, steerLeft, signal ? `was stopped (${signal})` : `ended (exit ${code})`)
     if (S.threads[lane.thread]) S.threads[lane.thread].tokens += tin
     noteFloodTokens(S.threads[lane.thread]?.peer ?? '', tin)         // 002k (H14): the peer's budget
     releaseClaims(lane.id, 'run ended')
@@ -2243,6 +2358,7 @@ export const __setPromiseMin = (m: number): void => { PROMISE_MIN = m }
 let meshSendHook: ((b: any) => Promise<any>) | null = null
 export const __setMeshSend = (f: ((b: any) => Promise<any>) | null): void => { meshSendHook = f }
 export const __putQueue = (it: any): void => { queue.set(it.ev.id, it) }
+export const __runTok = (laneId: string): RunTok | undefined => running.get(laneId)?.tok     // tests only (E18)
 const laneMeshSend = (b: unknown): Promise<any> => meshSendHook ? meshSendHook(b) : inboxPost('/lanes/send', b)
 export function interimText(due: number): string {
   return `這件事要 ${D.agent} 的主線決定。我是 ${D.agent} 的車道，不能代為答應或拒絕。已經交給主線，主線會在 ${simTime(due)} 前直接回你。`
@@ -2468,7 +2584,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         return 'recorded in the ledger'
       }
       S.dedupe[h] = Date.now()
-      const id = await pushJoey(lane, text, tier === 'silent', joeyReplyTo(queue.get(tok.evId)?.ev))
+      const id = await pushJoey(lane, text, tier === 'silent', joeyReplyTo(replyEventFor(tok)))
       if (id == null) throw new Error('send failed')
       if (tier === 'push') { tok.pushed = true; rangByLane.add(tok.evId); S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
       saveState()
@@ -2565,7 +2681,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         logos('lane.notify', { ...rec, tier, tier_rule: dec.rule })
         return 'recorded in the ledger (this kind of notice never reaches Joey)'
       }
-      const id = await pushJoey(lane, text, tier === 'silent', joeyReplyTo(queue.get(tok.evId)?.ev))
+      const id = await pushJoey(lane, text, tier === 'silent', joeyReplyTo(replyEventFor(tok)))
       if (id == null) throw new Error('send failed')
       if (tier === 'push') { tok.pushed = true; rangByLane.add(tok.evId); S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()] }
       saveState()
@@ -3607,5 +3723,6 @@ export function lanesHealth(): Record<string, unknown> {
     lanes_running: D?.role === 'tg' ? running.size : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
     handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined,
+    steering_pending: D?.role === 'tg' ? Object.values(S?.steering ?? {}).reduce((n, l) => n + l.length, 0) : undefined,
     wall: S?.wall ? { since: S.wall.since, kind: S.wall.kind, probes: S.wall.probes } : null }
 }

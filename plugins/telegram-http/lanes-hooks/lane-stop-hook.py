@@ -68,10 +68,26 @@ def save_state(state_p, st):
         return False
 
 
+def steering_text(p):
+    """002k (E18): a message from Joey that reached this lane while its run was in progress and was not handed over at a tool boundary (lane-steer-hook.py): hand it over now."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('lane_steer_hook', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lane-steer-hook.py'))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.deliver(p)
+    except Exception:
+        return ''
+
+
 def main():
     try:
         p = json.load(sys.stdin)
     except Exception:
+        return
+    steer = steering_text(p)
+    if steer:                                     # the run goes on with it: nothing else is checked on this Stop (the next Stop checks everything)
+        print(json.dumps({'decision': 'block', 'reason': '這一輪先不要結束。' + steer}, ensure_ascii=False))
         return
     tp = p.get('transcript_path') or ''
     sid = p.get('session_id', '')
