@@ -39,7 +39,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  ackState, cleanReport, openJoeyProposals, parseLedgerLine, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
+  ackState, cleanReport, openJoeyProposals, parseLedgerLine, parseLocal, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
   type DigestCursor, type DigestTake, type LedgerRec,
 } from './lanes-digest.ts'
 
@@ -628,7 +628,11 @@ type State = {
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
   main_deaf?: { baseline: number; at: string }                         // 002k (G16b): the main was told to be deaf for the stretch of silence after this assistant record
+  main_commitments?: Record<string, MainCommitment>                    // 002k (G10): what the main promised with its commitment tool (id -> state)
 }
+/** 002k (G10): a promise the main recorded with its own commitment tool. With a due time it rings Joey once when it is past due and not marked done. */
+type MainCommitment = { id: string; who: string; what: string; by: string; due: number | null; created: string; thread: string | null
+  state: 'open' | 'overdue' | 'done'; rung?: string; done?: string }
 /** 002d: something a lane (or the router) handed to the main. pending → delivered (the main got the wake digest that
  *  carries it) | fallback (the main did not get it in time, or is not connected: Joey was told directly, once). */
 type Handoff = { id: string; lane: string; thread: string | null; event: string; text: string; created: number
@@ -2107,9 +2111,18 @@ export async function mainSentTo(to: string, thread: string | null, replyTo?: st
   if (hit && hit.state !== 'kept') { keepPromise(hit, 'jev'); saveState() }
 }
 export function promiseTick(): void {
-  if (!S?.promises) return
+  if (!S) return
   const now = Date.now()
   let changed = false
+  // 002k (G10): a promise the main recorded with a due time rings Joey once when it is past due and not marked done (the main's reminder has a durable home)
+  for (const c of Object.values(S.main_commitments ?? {})) {
+    if (c.state !== 'open' || c.due == null || now < c.due) continue
+    c.state = 'overdue'; c.rung = nowIso(); changed = true
+    const text = `主線答應的事過了時限，還沒有標完成：答應 ${c.who}：${c.what}（時限 ${simTime(c.due)}；${c.id}）。做完了主線會用 commitment_done 標掉。`
+    ledger({ lane: 'router', thread: c.thread, kind: 'notify', notify_main: true, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'commitment-overdue', escalated: true, commitment: c.id, who: c.who } })
+    logos('lane.commitment.overdue', { commitment: c.id, who: c.who, due: new Date(c.due).toISOString() })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'commitment-overdue', message_id: id }))
+  }
   for (const pr of Object.values(S.promises)) {
     if (pr.state !== 'open' || now < pr.due) continue
     pr.state = 'overdue'; changed = true
@@ -2773,8 +2786,10 @@ export function mainToolDefs(): any[] {
     { name: 'curate_stop', description: '[lanes · main only] Take the memory write right back from the curator lane now (it stops; unprocessed proposals stay in the ledger).', inputSchema: { type: 'object', properties: {} } },
     { name: 'memory_decide', description: '[lanes · main only] Decide a memory proposal a lane filed (its id is in the digest and in ledger_query(kind=memory_proposal)): accept (write it as it is), rewrite (write `text` instead) or veto (do not write it). `reason` is required. accept and rewrite write the memory the normal way (a memory file, its line in MEMORY.md, a commit in your name); veto only records the decision. Records a ledger entry kind memory_decision. A proposal that came from a Joey message is listed in every digest, and your turn is held once, until it is decided.',
       inputSchema: { type: 'object', properties: { proposal_id: { type: 'string', description: 'the id of the proposal, e.g. mp-1a2b3c' }, decision: { type: 'string', enum: ['accept', 'rewrite', 'veto'] }, reason: { type: 'string', description: 'why (one line)' }, text: { type: 'string', description: 'rewrite: the text to write; accept: optional, replaces the proposal text' } }, required: ['proposal_id', 'decision', 'reason'] } },
-    { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those.',
-      inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when (e.g. 明天 10:00 前); leave empty if no time was given' } }, required: ['who', 'what'] } },
+    { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer, and returns its id. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those. With `due` (an ISO time) this is also a durable reminder: when it is past due and you have not marked it done (commitment_done), Joey is rung once.',
+      inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when, in words (e.g. 明天 10:00 前); filled from `due` when left empty' }, due: { type: 'string', description: 'optional: the due time as an ISO time (2026-11-15T10:00:00+08:00; without a zone it is read as the lab\'s local time). Past this time, and not done, Joey is rung once.' } }, required: ['who', 'what'] } },
+    { name: 'commitment_done', description: '[lanes · main only] Mark a promise of yours done (the id commitment returned). A done promise is not rung for.',
+      inputSchema: { type: 'object', properties: { commitment_id: { type: 'string' }, note: { type: 'string', description: 'what was done (one line, optional)' } }, required: ['commitment_id'] } },
     { name: 'lane_close', description: '[lanes · main only] Close a lane: it gets no further events (its thread falls back to a fresh reflex lane / main).', inputSchema: { type: 'object', properties: { lane_id: { type: 'string' } }, required: ['lane_id'] } },
     { name: 'ledger_query', description: LEDGER_QUERY_DESCRIPTION,
       inputSchema: { type: 'object', properties: {
@@ -2783,7 +2798,7 @@ export function mainToolDefs(): any[] {
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'memory_decide'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide'].includes(name) }
 
 async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   let topic: number | undefined
@@ -2881,12 +2896,33 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     }
     case 'ledger_query': return ledgerQueryTool(a)
     case 'memory_decide': return memoryDecide(a)                // 002k (D1)
-    case 'commitment': {                                       // 002k (C1)
+    case 'commitment': {                                       // 002k (C1, G10)
       const chk = checkCommitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
+      const dueRaw = String(a.due ?? '').trim()
+      const dueMs = dueRaw ? parseLocal(dueRaw) : null
+      if (dueRaw && (dueMs == null || Number.isNaN(dueMs))) return `commitment refused: due must be an ISO time such as 2026-11-15T10:00:00+08:00 (without a zone it is the lab's local time); got "${dueRaw.slice(0, 40)}". Nothing was recorded.`
+      if (dueMs != null && !a.by) chk.c.by = `${simTime(dueMs)} 前`
       const where = peerThread(chk.c.who)
-      ledger({ lane: 'main', thread: where.thread, kind: 'commitment', notify_main: false, text: commitmentText(chk.c), refs: { ...chk.c, from: 'main-tool', thread_from: where.from } })
-      return `ledger: commitment recorded (${chk.c.who}: ${chk.c.what}; by ${chk.c.by})`
+      const id = `cm-${shortId()}`
+      S.main_commitments ??= {}
+      S.main_commitments[id] = { id, who: chk.c.who, what: chk.c.what, by: chk.c.by, due: dueMs, created: nowIso(), thread: where.thread, state: 'open' }
+      saveState()
+      ledger({ lane: 'main', thread: where.thread, kind: 'commitment', notify_main: false, text: commitmentText(chk.c),
+        refs: { ...chk.c, id, from: 'main-tool', thread_from: where.from, ...(dueMs != null ? { due: new Date(dueMs).toISOString() } : {}) } })
+      return `ledger: commitment recorded (id ${id}; ${chk.c.who}: ${chk.c.what}; by ${chk.c.by})${dueMs != null ? `. Joey is rung once if it is past ${new Date(dueMs).toISOString()} and not marked done: mark it with commitment_done(${id}).` : ''}`
+    }
+    case 'commitment_done': {                                  // 002k (G10)
+      const id = String(a.commitment_id ?? '').trim()
+      const c = S.main_commitments?.[id]
+      if (!c) return `commitment_done refused: no commitment ${id || '(no id given)'} of yours. commitment returns the id.`
+      if (c.state === 'done') return `commitment_done refused: ${id} was already marked done (${c.done}).`
+      const late = c.state === 'overdue'
+      c.state = 'done'; c.done = nowIso(); saveState()
+      const note = String(a.note ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+      ledger({ lane: 'main', thread: c.thread, kind: 'action', notify_main: false, text: `承諾完成 ${id}：答應 ${c.who}：${c.what}${note ? `（${note}）` : ''}${late ? '；過了時限才完成' : ''}`,
+        refs: { commitment_done: id, late } })
+      return `commitment ${id} marked done${late ? ' (it was past due: Joey had been rung)' : ''}.`
     }
     case 'fan_out': {
       const tasks = (Array.isArray(a.tasks) ? a.tasks : []).map((t: unknown) => String(t).trim()).filter(Boolean).slice(0, 8)
