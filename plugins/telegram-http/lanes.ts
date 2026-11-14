@@ -60,6 +60,9 @@ const MAX_ATTEMPTS = 3
 let RETRY_BACKOFF_MS = Number(process.env.LANES_RETRY_BACKOFF_MS ?? 5_000)
 /** tests only */
 export const __setRetryBackoff = (ms: number): void => { RETRY_BACKOFF_MS = ms }
+// 002j: with the model wall up, one queued event is tried again this often as a probe
+let WALL_PROBE_MS = Number(process.env.LANES_WALL_PROBE_MS ?? 300_000)
+export const __setWallProbe = (ms: number): void => { WALL_PROBE_MS = ms }
 // 002g: a lane run may take this long, then it is stopped and counts as a failed attempt (run again, third time: the main).
 // A run that hangs (a stalled API call, a command that never returns) kept renewing its lease for ever: its event was
 // neither done nor handed on, and nobody heard of it.
@@ -483,6 +486,7 @@ type Lane = {
 }
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
   ask_cls?: string }                                                   // event class of the lane run that last asked a peer here
+type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number }
 type State = {
   counters: Record<string, number>
   lanes: Record<string, Lane>
@@ -496,6 +500,7 @@ type State = {
   followups: Record<string, Followup>                                  // 002c: scheduled follow-ups (due = simulated ms)
   handoffs: Record<string, Handoff>                                    // 002d: work handed to the main, until the main has it
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
+  wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
 }
 /** 002d: something a lane (or the router) handed to the main. pending → delivered (the main got the wake digest that
  *  carries it) | fallback (the main did not get it in time, or is not connected: Joey was told directly, once). */
@@ -870,9 +875,70 @@ function reapOrphan(it: QItem): void {
 function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string): void {
   const it: QItem = { ev, lane: laneId, state: 'queued', lease_until: 0, attempts: 0, priority, summary, enqueued: nowIso() }
   queue.set(ev.id, it); saveQ(it)
+  if (S.wall && S.lanes[laneId]?.critical) ringCriticalBehindWall(it, S.lanes[laneId])
   pump()
 }
+// ------------------------------------------------------------------ 002j: the model wall (usage limit, overload)
+// A lane run that ends with the API's limit or overload error did not fail: nothing was tried. Counting it as a failed
+// attempt sent every queued event round three times and then to the main, which sits behind the same wall, and each of
+// those to Joey (fleet history 2026-11: an agent at its weekly limit had every hourly wake-up delivered three times).
+// With the wall up: nothing is dispatched; Joey is told once; one queued event is tried again every WALL_PROBE_MS as a
+// probe; the first run that gets through takes the wall down, Joey is told once, and the queue runs. A critical alert
+// that arrives meanwhile is rung through at once, with the reason nobody can look into it.
+// All of it is code: the wall is recognised from the run's own result record (`is_error` + `api_error_status`), never guessed.
+export function wallActive(): boolean { return !!S?.wall }
+export function walledResult(j: any): { kind: string; text: string } | null {
+  if (!j || j.type !== 'result' || !j.is_error) return null
+  const st = Number(j.api_error_status ?? 0), text = String(j.result ?? '').slice(0, 200)
+  if (st === 429 || /hit your .{0,40}limit|usage limit/i.test(text)) return { kind: 'usage', text }
+  if (st === 529 || /overloaded/i.test(text)) return { kind: 'overload', text }
+  if (st >= 500) return { kind: 'error', text }
+  return null
+}
+const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯' }
+function wallUp(w: { kind: string; text: string }, by: string): void {
+  if (S.wall) {                                           // a probe hit the wall again
+    S.wall.probes += 1; S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
+    logos('lane.wall_probe', { ok: false, probes: S.wall.probes, by })
+    setTimeout(pump, WALL_PROBE_MS + 30)
+    return
+  }
+  S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0 }
+  saveState()
+  const waiting = [...queue.values()].filter(i => i.state === 'queued' || i.state === 'leased').length
+  const every = Math.max(1, Math.round(WALL_PROBE_MS / 60_000))
+  const text = `${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我每 ${every} 分鐘自動試一次，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
+  logos('lane.wall_up', { kind: w.kind, text: w.text, by, waiting })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
+  setTimeout(pump, WALL_PROBE_MS + 30)
+}
+function wallDown(by: string): void {
+  const w = S.wall
+  if (!w) return
+  delete S.wall; saveState()
+  const waiting = [...queue.values()].filter(i => i.state === 'queued').length
+  const text = `模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件現在開始處理。`
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
+  logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-down', message_id: id }))
+}
+/** a critical alert that arrives while the wall is up: no lane can look into it, so the router rings with the alert itself, once */
+function ringCriticalBehindWall(it: QItem, lane: Lane): void {
+  const id = it.ev.id
+  if (rangByLane.has(id) || S.deadline_rang[id]) return
+  S.deadline_rang[id] = Date.now(); saveState()
+  const text = `嚴重警報已收到，但${WALL_WORD[S.wall?.kind ?? ''] ?? '模型無法使用'}，現在沒有車道能查證。恢復後會補上查證結果（不再響鈴）。\n原文：${it.ev.text.slice(0, 400)}`
+  const cls = it.ev.cls ?? it.ev.trigger ?? 'alert-critical'
+  ledger({ lane: lane.id, thread: lane.thread, event: id, kind: 'notify', notify_main: true, text: `[push] ${text.slice(0, 400)}`,
+    refs: { class: cls, escalated: false, tier: 'push', tier_rule: 'critical-behind-wall' } })
+  void pushJoey(lane, text, false).then(mid => {
+    logos('lane.notify', { lane: lane.id, thread: lane.thread, event: id, class: cls, escalated: false, tier: 'push', tier_rule: 'critical-behind-wall', message_id: mid })
+  })
+}
+
 function pump(): void {
+  if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
@@ -880,6 +946,12 @@ function pump(): void {
     if (running.size >= MAX_RUNNING) {
       D.log('info', `lanes: cap ${MAX_RUNNING} reached — ${it.ev.id} for ${it.lane} waits in queue`)
       break
+    }
+    if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
+      if (running.size > 0) return
+      S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
+      startRun(it)
+      return
     }
     startRun(it)
   }
@@ -1081,6 +1153,7 @@ function startRun(it: QItem): void {
   const usage = new Map<string, { in: number; out: number }>()
   const tools: Array<{ name: string; input: any }> = []
   let result = '', sessionSeen = '', buf = ''
+  let walled: { kind: string; text: string } | null = null
   child.stdout!.setEncoding('utf8')
   child.stdout!.on('data', (chunk: string) => {
     buf += chunk
@@ -1095,7 +1168,7 @@ function startRun(it: QItem): void {
         usage.set(j.message.id ?? `m${usage.size}`, { in: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), out: u.output_tokens ?? 0 })
         for (const c of j.message.content ?? []) if (c?.type === 'tool_use') tools.push({ name: c.name, input: c.input })
       }
-      if (j.type === 'result') result = String(j.result ?? '')
+      if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j) }
     }
   })
   child.stderr!.on('data', (c: Buffer) => { try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
@@ -1125,6 +1198,15 @@ function startRun(it: QItem): void {
     logos('lane.exit', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
       exit_code: code, signal, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
     D.log('info', `lanes: exit ${runId} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
+    if (walled && lane.status !== 'closed') {
+      // 002j: the model wall. Nothing was tried, so this is not an attempt; the event goes back to the queue untouched.
+      it.attempts = Math.max(0, it.attempts - 1); it.state = 'queued'; it.lease_until = 0; saveQ(it)
+      appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'walled', run: runId, event: it.ev.id, wall: walled.kind, text: walled.text })
+      wallUp(walled, runId)
+      saveState()
+      return                                                // no pump: the probe timer starts the next run
+    }
+    if (ok && S.wall) wallDown(runId)
     if (ok) {
       it.state = 'done'; saveQ(it); queue.delete(it.ev.id)
       try { rmSync(qPath(it.ev.id)) } catch {}
@@ -1732,5 +1814,6 @@ export function lanesHealth(): Record<string, unknown> {
   return { lanes_on: true, main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
     lanes_running: D?.role === 'tg' ? running.size : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
-    handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined }
+    handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined,
+    wall: S?.wall ? { since: S.wall.since, kind: S.wall.kind, probes: S.wall.probes } : null }
 }
