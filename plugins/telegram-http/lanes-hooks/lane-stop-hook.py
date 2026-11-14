@@ -12,6 +12,7 @@ import json
 import os
 import sys
 
+TOLD = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main', 'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done')
 CLOSERS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main', 'mcp__lane__reply_agent', 'mcp__lane__receipt',
            'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done')   # 002k: fan-out, synthesis, curator
 MAX_BLOCKS = 2
@@ -49,7 +50,7 @@ def main():
         break
     if last_user is None:
         return
-    closed = False
+    closed, used = False, set()
     for line in lines[last_user + 1:]:
         try:
             j = json.loads(line)
@@ -61,8 +62,10 @@ def main():
             if not isinstance(c, dict) or c.get('type') != 'tool_use':
                 continue
             n = c.get('name', '')
-            if n in CLOSERS:
+            if n in TOLD:
                 closed = True
+            elif n in CLOSERS:
+                used.add(n)
     lanes_dir = os.environ.get('LANES_DIR', '')
     state_p = os.path.join(lanes_dir, 'run', 'stop-blocks.json') if lanes_dir else ''
     key = f'{sid}:{last_user}'
@@ -70,6 +73,16 @@ def main():
         st = json.load(open(state_p)) if state_p and os.path.exists(state_p) else {}
     except Exception:
         st = {}
+    # 002k (plan/decisions DC1): reply_agent or receipt alone is not a line for Joey. A high-frequency routine may end with the receipt
+    # alone (Joey msg 934): its tag is in the event text of this turn.
+    prompt_text = ''
+    try:
+        pj = json.loads(lines[last_user]); pc = pj.get('message', {}).get('content', '')
+        prompt_text = pc if isinstance(pc, str) else ' '.join(x.get('text', '') for x in pc if isinstance(x, dict))
+    except Exception:
+        pass
+    if not closed and used and used <= {'mcp__lane__receipt'} and '[high-frequency]' in prompt_text:
+        closed = True
     if closed:
         return
     n = int(st.get(key, 0))
@@ -85,9 +98,9 @@ def main():
             pass
     lane = os.environ.get('LANE_ID', 'this lane')
     print(json.dumps({'decision': 'block', 'reason': (
-        f'⛔ lane-stop-hook: {lane} has not reported yet. Close this turn with notify_joey'
-        ', reply_agent (answering the agent that asked), or receipt '
-        '(scheduled routine; high-frequency no-change may leave only the receipt). '
+        f'⛔ lane-stop-hook: {lane} has not left Joey a line yet. Close this turn with notify_joey (one line; the router decides '
+        'whether it rings, a peer matter is silent), also after answering a peer with reply_agent. '
+        'Only a high-frequency routine with no change may end with the receipt alone. '
         'Never end silent. If Joey must decide, use ask_joey; if the main must do it, use handoff_main (one of them, not both).')}))
 
 
