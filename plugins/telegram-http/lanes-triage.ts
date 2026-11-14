@@ -7,7 +7,7 @@
 // Program first: the sender, the channel and whether the sender is verified are facts the daemon has; they are given to
 // Jev as state, not asked. Jev answers narrow questions about the text only, all in one request, each on its own.
 // A failed call (no key, HTTP error, an HTML block page, a timeout) is recorded as an error and is never an answer.
-import { appendFileSync, readFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, readFileSync, mkdirSync, writeFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -15,6 +15,37 @@ const MODEL = process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-1.14.0'
 const api = (): string => (process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone'
 const TIMEOUT_MS = Number(process.env.LANES_TRIAGE_TIMEOUT_MS ?? 8000)
 export const triageOn = (): boolean => process.env.LANES_TRIAGE_SHADOW === '1'
+
+// ------------------------------------------------------------------ 002k: one log of every Jev call (run/jev-calls.jsonl)
+// Joey wants every Jev call logged with its time. Each call site keeps its own file (triage-shadow.jsonl, report-check.jsonl,
+// proposal-review.jsonl, main-commitment.jsonl, promise-match.jsonl, the hooks' gate files); this is the one file that has them all,
+// in the same shape: ts, site, question (the full question set sent), inputs (short excerpts or ids), answer (what Jev returned),
+// p (the number the site's rule thresholds on, null when there is none), ms, err. A failed call is logged too (answer null, err set).
+// The lab's collect_logs.py passes the file through as it is.
+/** The real wall clock, in ms. The lab's clock shim shifts every userspace wall-clock read of a lab process (Date, time(), `date`), so
+ *  Date.now() in a daemon is the SIMULATED time. The kernel's own file times are not shifted: a file written now carries the real
+ *  time as its mtime (measured on gpu-box with the shim at +3600 s: Date.now() - mtime = 3600.001 s, a clean `date` = the mtime).
+ *  Without the shim it is just the time. Falls back to Date.now() when the probe file cannot be written. */
+export function realNowMs(lanesDir: string): number {
+  try {
+    const p = join(lanesDir, 'run', '.clock-probe')
+    writeFileSync(p, 'x')
+    return statSync(p).mtimeMs
+  } catch { return Date.now() }
+}
+export type JevCall = { site: string; question: unknown; inputs?: unknown; answer?: unknown; p?: number | null; ms: number; err?: string | null }
+/** Appends one record to <lanesDir>/run/jev-calls.jsonl. ts = the real time; sim = the daemon's own clock (the simulated time under the
+ *  shim: what the ledger and the transcripts show), so a call can be matched to both. Never throws. */
+export function jevLog(lanesDir: string, rec: JevCall): void {
+  if (!lanesDir) return
+  try {
+    mkdirSync(join(lanesDir, 'run'), { recursive: true })
+    const line = { ts: new Date(realNowMs(lanesDir)).toISOString(), sim: new Date().toISOString(), site: rec.site, question: rec.question,
+      inputs: rec.inputs ?? null, answer: rec.answer ?? null, p: typeof rec.p === 'number' && Number.isFinite(rec.p) ? rec.p : null, ms: rec.ms, err: rec.err ?? null }
+    appendFileSync(join(lanesDir, 'run', 'jev-calls.jsonl'), JSON.stringify(line) + '\n')
+  } catch {}
+}
+const clip = (s: unknown, n = 200): string => String(s ?? '').slice(0, n)
 
 function loadKey(): string | null {
   const k = (process.env.TYPESAFE_API_KEY ?? '').trim()
@@ -70,9 +101,10 @@ export type TriageRec = { event: string; source: string; from: string; verified:
 
 export type TriageAsk = { jev?: Record<string, any>; error?: string; ms: number }
 /** 002k: ask Jev the triage questions about one event (no record written). Never throws. */
-export async function triageAsk(ev: TriageEvent, timeoutMs = TIMEOUT_MS): Promise<TriageAsk> {
+export async function triageAsk(ev: TriageEvent, timeoutMs = TIMEOUT_MS, lanesDir?: string): Promise<TriageAsk> {
   const t0 = Date.now()
   const out: TriageAsk = { ms: 0 }
+  let raw: any = null
   try {
     const key = loadKey()
     if (!key) throw new Error('no key')
@@ -87,6 +119,7 @@ export async function triageAsk(ev: TriageEvent, timeoutMs = TIMEOUT_MS): Promis
     let a: any
     try { a = JSON.parse(text).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
     if (!res.ok || !a || typeof a !== 'object') throw new Error(`HTTP ${res.status}, no answers`)
+    raw = a
     const p = (k: string) => typeof a[k]?.noul === 'number' ? a[k].noul : null
     out.jev = { kind: a.kind?.choice ?? null, kind_confidence: a.kind?.confidence ?? null, needs_action: p('needs_action'), needs_reply: p('needs_reply'),
       urgent: p('urgent'), continues: p('continues'), instructs_agent: p('instructs_agent') }
@@ -94,6 +127,8 @@ export async function triageAsk(ev: TriageEvent, timeoutMs = TIMEOUT_MS): Promis
     out.error = `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 200)
   }
   out.ms = Date.now() - t0
+  if (lanesDir) jevLog(lanesDir, { site: 'screen-A6', question: triageQuestions(), inputs: { event: ev.id, from: ev.from, verified: ev.verified === true, thread: ev.thread ?? null, text: clip(ev.text) },
+    answer: raw, p: out.jev ? (out.jev.instructs_agent as number | null) : null, ms: out.ms, err: out.error ?? null })
   return out
 }
 /** 002k: write the shadow record from answers already asked (the screen asked before routing). */
@@ -114,6 +149,7 @@ export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageR
   const t0 = Date.now()
   const kinds = routerKinds(ev, r)
   const rec: TriageRec = { event: ev.id, source: ev.source, from: ev.from, verified: ev.verified === true, router: { ...r, kinds }, ms: 0, model: MODEL }
+  let raw: any = null
   try {
     const key = loadKey()
     if (!key) throw new Error('no key')
@@ -128,6 +164,7 @@ export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageR
     let a: any
     try { a = JSON.parse(text).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }   // an HTML block page lands here
     if (!res.ok || !a || typeof a !== 'object') throw new Error(`HTTP ${res.status}, no answers`)
+    raw = a
     const p = (k: string) => typeof a[k]?.noul === 'number' ? a[k].noul : null
     rec.jev = { kind: a.kind?.choice ?? null, kind_confidence: a.kind?.confidence ?? null, needs_action: p('needs_action'), needs_reply: p('needs_reply'),
       urgent: p('urgent'), continues: p('continues'), instructs_agent: p('instructs_agent') }
@@ -136,6 +173,8 @@ export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageR
     rec.error = `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 200)
   }
   rec.ms = Date.now() - t0
+  jevLog(lanesDir, { site: 'triage-shadow', question: triageQuestions(), inputs: { event: ev.id, from: ev.from, verified: ev.verified === true, thread: ev.thread ?? null, text: clip(ev.text),
+    router: { rule: r.rule, target: r.target, cls: r.cls } }, answer: raw, p: rec.jev ? (rec.jev.instructs_agent as number | null) : null, ms: rec.ms, err: rec.error ?? null })
   try {
     mkdirSync(join(lanesDir, 'run'), { recursive: true })
     appendFileSync(join(lanesDir, 'run', 'triage-shadow.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...rec }) + '\n')
@@ -146,7 +185,17 @@ export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageR
 // ------------------------------------------------------------------ 002k (second batch, C1 C4 C8): narrow questions about one text
 /** One request to Jev with the given state and questions. Never throws: a failed call (no key, HTTP error, an HTML block page, a
  *  timeout) comes back as `error` and is never an answer. */
-export async function jevAsk(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs = TIMEOUT_MS): Promise<{ answers?: Record<string, any>; error?: string; ms: number }> {
+export type JevLogCtx = { dir: string; site: string; inputs?: unknown; p?: (answers: Record<string, any>) => number | null | undefined }
+export async function jevAsk(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs = TIMEOUT_MS, log?: JevLogCtx): Promise<{ answers?: Record<string, any>; error?: string; ms: number }> {
+  const r = await jevAskRaw(state, questions, ua, timeoutMs)
+  if (log?.dir) {                                             // 002k: every call is in run/jev-calls.jsonl, failures included
+    let p: number | null = null
+    try { if (r.answers) p = log.p?.(r.answers) ?? null } catch {}
+    jevLog(log.dir, { site: log.site, question: questions, inputs: log.inputs, answer: r.answers ?? null, p, ms: r.ms, err: r.error ?? null })
+  }
+  return r
+}
+async function jevAskRaw(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs: number): Promise<{ answers?: Record<string, any>; error?: string; ms: number }> {
   const t0 = Date.now()
   try {
     const key = loadKey()
@@ -164,12 +213,13 @@ export async function jevAsk(state: Record<string, unknown>, questions: Record<s
 }
 
 /** C1: does this message say its sender will do or deliver something later? One narrow question; p is Jev's probability. */
-export async function promiseAsk(text: string, to: string, timeoutMs = TIMEOUT_MS): Promise<{ p?: number; error?: string; ms: number }> {
+export async function promiseAsk(text: string, to: string, timeoutMs = TIMEOUT_MS, log?: { dir: string; ref?: unknown }): Promise<{ p?: number; error?: string; ms: number }> {
   const r = await jevAsk(
     { setting: 'An AI agent sent `message` to another AI agent. `recipient` is a fact established by the system.', message: { recipient: to, text: text.slice(0, 3000) } },
     { promises: { type: 'noul', instructions: 'Does `message` say that its sender will do or deliver something later?',
       criteria: { true: 'The sender says it will do, send, decide or answer something later or by a time (a promise or a deadline)', false: 'The message only informs, answers now, refuses, or asks; nothing is promised for later' } } },
-    'genesis-main-commitment/1', timeoutMs)
+    'genesis-main-commitment/1', timeoutMs,
+    log?.dir ? { dir: log.dir, site: 'main-commitment-C1', inputs: { to, btcc_msg_id: log.ref ?? null, text: clip(text) }, p: a => a.promises?.noul } : undefined)
   if (r.error || !r.answers) return { error: r.error ?? 'no answers', ms: r.ms }
   const p = r.answers.promises?.noul
   return typeof p === 'number' ? { p, ms: r.ms } : { error: 'no probability in the answer', ms: r.ms }

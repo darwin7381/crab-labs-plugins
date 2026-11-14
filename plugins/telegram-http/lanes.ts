@@ -25,7 +25,7 @@
  */
 import { lastAssistantFile, openToolCallFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
-import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, type TriageAsk } from './lanes-triage.ts'
+import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, type TriageAsk } from './lanes-triage.ts'
 import { randomBytes, randomUUID, createHash } from 'crypto'
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, renameSync,
@@ -766,7 +766,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   // sends the message to the main for checking, with the reason in front. It can only tighten: a low score changes nothing, a failed
   // call changes nothing, and the rules still decide everything else.
   const screen = D.role === 'tg' && screenOn() && ev.source === 'mesh' && !ev.synthetic && !['scheduler', 'alert-dispatcher', 'main'].includes(ev.from)
-  const asked: TriageAsk | null = screen ? await triageAsk({ id: ev.id, source: ev.source, from: ev.from, text: ev.text, verified: ev.verified, thread: ev.thread ?? null }, SCREEN_TIMEOUT_MS) : null
+  const asked: TriageAsk | null = screen ? await triageAsk({ id: ev.id, source: ev.source, from: ev.from, text: ev.text, verified: ev.verified, thread: ev.thread ?? null }, SCREEN_TIMEOUT_MS, LANES_DIR) : null
   for (const r of off ? [] : cfg.rules) {
     if (!matches(r, ev, cfg)) continue
     d = await applyRule(r, ev)
@@ -1947,7 +1947,8 @@ async function jevMatchPromise(open: Promise24[], peer: string, text: string): P
     { setting: `An AI agent sent \`message\` to the agent ${peer}. \`open_requests\` are requests from ${peer} that were told the agent's main session would answer them.`,
       message: { recipient: peer, text: text.slice(0, 3000) }, open_requests: open.map(p => ({ id: p.id, text: p.what })) },
     { which: { type: 'choice', instructions: 'Which item of `open_requests` does `message` answer?', criteria: { ...Object.fromEntries(open.map(p => [p.id, null])), none: 'It answers none of them (another topic)' } } },
-    'genesis-promise-match/1')
+    'genesis-promise-match/1', undefined,
+    { dir: LANES_DIR, site: 'promise-match-C4', inputs: { peer, text: text.slice(0, 200), open: open.map(p => ({ id: p.id, what: p.what.slice(0, 80) })) }, p: a => a.which?.confidence })
   const c = r.answers?.which?.choice, conf = Number(r.answers?.which?.confidence ?? 0)
   try { appendFileSync(join(LANES_DIR, 'run', 'promise-match.jsonl'), JSON.stringify({ ts: nowIso(), peer, open: open.map(p => p.id), choice: c ?? null, confidence: conf, error: r.error ?? null, ms: r.ms }) + '\n') } catch {}
   if (r.error || !r.answers) { D.log('warn', `lanes: promise match for the send to ${peer} failed (${r.error}); nothing closed`); return null }
@@ -2356,20 +2357,24 @@ async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ 
     overreach: { type: 'noul', instructions: 'Does `proposal` claim more than `message` says (a wider scope, a permanent rule from a one-off, a different value)?' },
   }
   if (mem.length) q.conflict = { type: 'choice', instructions: 'Which item of `memory` does `proposal` contradict?', criteria: { ...Object.fromEntries(mem.map(m => [m.id, null])), none: 'It contradicts none of them' } }
+  // 002k: the same call in the unified log (p = the conflict confidence, the one number the review thresholds on)
+  const jl = (err: string | null, answer?: unknown, p?: number | null) => jevLog(LANES_DIR, { site: 'proposal-A4', question: q,
+    inputs: { event: ev?.id ?? null, from: ev?.from ?? null, verified: ev?.verified === true, proposal: text.slice(0, 120), memory: mem.map(m => `${m.id} ${m.file}`) }, answer: answer ?? null, p: p ?? null, ms: Date.now() - t0, err })
   try {
     const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
-    if (!key) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: 'no key' }); return null }
+    if (!key) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: 'no key' }); jl('no key'); return null }
     const res = await fetch((process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone', { method: 'POST', signal: AbortSignal.timeout(8000),
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-proposal-review/1' },
       body: JSON.stringify({ model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-1.14.0', questions: q,
         state: { setting: 'An agent proposes adding `proposal` to its long-term memory. `message` is what it saw; `memory` are existing memory lines that may be related.',
           proposal: text.slice(0, 1500), message: { from: ev?.from ?? '?', verified: ev?.verified === true, text: (ev?.text ?? '').slice(0, 2000) }, memory: mem.length ? mem : '(no related lines)' } }) })
     const a = (await res.json().catch(() => null))?.answers
-    if (!res.ok || !a) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: res.ok ? `HTTP ${res.status}, no answers` : `HTTP ${res.status}` }); return null }
+    if (!res.ok || !a) { const err = res.ok ? `HTTP ${res.status}, no answers` : `HTTP ${res.status}`; logProposalReview({ event: ev?.id, ms: Date.now() - t0, err }); jl(err); return null }
     const backed = a.backed?.noul ?? null, over = a.overreach?.noul ?? null
     const c = a.conflict?.choice ?? null, cc = a.conflict?.confidence ?? null
     const hit = c && c !== 'none' && (cc ?? 0) >= 0.7 ? mem.find(m => m.id === c) : undefined
     logProposalReview({ event: ev?.id, ms: Date.now() - t0, backed, overreach: over, conflict: hit ? { file: hit.file, confidence: cc } : null, proposal: text.slice(0, 120) })
+    jl(null, a, typeof cc === 'number' ? cc : null)
     const parts = [
       typeof backed === 'number' ? (backed >= 0.7 ? '有依據' : backed <= 0.3 ? '依據不足' : '依據不明') : null,
       typeof over === 'number' && over >= 0.7 ? '可能說得比原話多' : null,
@@ -2377,7 +2382,7 @@ async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ 
       ev && ev.verified === false ? '寄件人未驗證' : null,
     ].filter(Boolean)
     return { note: `〔Jev 檢查：${parts.join('；') || '無意見'}〕`, refs: { backed, overreach: over, conflict: hit ? { file: hit.file, line: hit.line, confidence: cc } : null, sender_verified: ev?.verified === true } }
-  } catch (e) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: String(e).slice(0, 160) }); return null }
+  } catch (e) { const err = String(e).slice(0, 160); logProposalReview({ event: ev?.id, ms: Date.now() - t0, err }); jl(err); return null }
 }
 
 // ------------------------------------------------------------------ 002k: a lane's report is checked against its own tool results (Jev design A3)
@@ -2427,6 +2432,7 @@ async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string):
       says_nothing: 'The tool results do not address what the claim asserts' } } })
   const t0 = Date.now()
   let verdicts: Array<{ s: string; choice: string | null; conf: number }> = [], err: string | null = null
+  let rawAnswers: any = null
   try {
     const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
     if (!key) throw new Error('no key')
@@ -2437,9 +2443,13 @@ async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string):
     const body = await res.text()
     let a: any; try { a = JSON.parse(body).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
     if (!res.ok || !a) throw new Error(`HTTP ${res.status}`)
+    rawAnswers = a
     verdicts = sents.map((x, i) => ({ s: x, choice: a[`S${i + 1}`]?.choice ?? null, conf: Number(a[`S${i + 1}`]?.confidence ?? 0) }))
   } catch (e: any) { err = `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 160) }
   const bad = verdicts.filter(v => v.choice === 'contradicts' && v.conf >= REPORT_CONTRA)
+  const contra = verdicts.filter(v => v.choice === 'contradicts')
+  jevLog(LANES_DIR, { site: 'report-check-A3', question: q, inputs: { lane: lane.id, run: tok.runId, tool, tool_results: results.length, sentences: sents.map(x => x.slice(0, 80)) },
+    answer: rawAnswers, p: contra.length ? Math.max(...contra.map(v => v.conf)) : null, ms: Date.now() - t0, err })
   try { appendFileSync(join(LANES_DIR, 'run', 'report-check.jsonl'), JSON.stringify({ ts: nowIso(), lane: lane.id, run: tok.runId, tool, ms: Date.now() - t0, err, verdicts, sent_back: bad.length > 0 }) + '\n') } catch {}
   if (err || !bad.length) return null
   reportBacked.add(`${tok.runId}:${tool}`)
@@ -3004,7 +3014,7 @@ function logMainCommitment(rec: Record<string, unknown>): void {
 }
 export async function mainCommitmentCheck(m: { msgId: unknown; to: string; text: string; thread: { thread: string | null; from: string } }): Promise<'written' | 'no' | 'error' | 'off' | 'dup'> {
   if (!MAIN_COMMITMENTS()) return 'off'
-  const r = await promiseAsk(m.text, m.to)
+  const r = await promiseAsk(m.text, m.to, undefined, { dir: LANES_DIR, ref: m.msgId })
   if (r.error || typeof r.p !== 'number') {
     D.log('warn', `lanes: main commitment check for the send to ${m.to} failed (${r.error}); nothing written`)
     logMainCommitment({ to: m.to, btcc_msg_id: m.msgId, error: r.error, ms: r.ms })
