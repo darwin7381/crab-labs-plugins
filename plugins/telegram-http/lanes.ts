@@ -1834,6 +1834,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // the lane only says WHAT; the router alone decides HOW it reaches Joey: event class + escalated (spec v3)
       const text = String(a.text ?? '').trim()
       if (!text) throw new Error('empty text')
+      { const back = await reportCheck(lane, tok, 'notify_joey', text); if (back) return back }
       const dec = notifyDecision(tok.cls, false, lane.thread)
       // 002e: the event already rang (or did not) when it arrived. What a follow-up finds later is either an all-clear,
       // which must not ring again, or something Joey has to decide, which is ask_joey's job.
@@ -1868,6 +1869,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const to = String(a.to ?? '').trim().toLowerCase()
       const text = String(a.text ?? '').trim()
       if (!to || !text) throw new Error('to and text required')
+      { const back = await reportCheck(lane, tok, 'reply_agent', text); if (back) return back }
       // 002j: one answer per request. The router already told this agent that the main decides and by when.
       if (tok.interim && to === tok.interim) return `not sent: the router already told ${to} that the main decides this and by when. Send ${to} nothing more about it; close with receipt.`
       if (th?.stopped) return `blocked: thread ${lane.thread} was stopped (${th.stopped}). Escalate instead.`
@@ -1919,6 +1921,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // reach Joey). The main is not woken: the notice is an ordinary pending digest entry.
       const text = String(a.text ?? '').trim()
       if (!text) throw new Error('empty text')
+      { const back = await reportCheck(lane, tok, 'ask_joey', text); if (back) return back }
       if (tok.handed) return 'refused: you already handed this event to the main (handoff_main); the main reports to Joey. Do not also ask Joey.'
       if (tok.asked) return 'refused: you already asked Joey about this event; one ask per event. Put anything new in your receipt.'
       const dec = notifyDecision(tok.cls, true, lane.thread)
@@ -2013,6 +2016,73 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
     }
   }
   throw new Error(`unknown lane tool ${name}`)
+}
+
+// ------------------------------------------------------------------ 002k: a lane's report is checked against its own tool results (Jev design A3)
+// Program first: the tool calls and results of THIS run are read from the lane's transcript; Jev answers one Choice per sentence of
+// the outgoing text: do the results support it, contradict it, or say nothing about it. A sentence the results contradict (confidence
+// >= LANES_REPORT_CONTRA, default 0.8) sends the text back to the lane ONCE with those sentences named; the second attempt goes out
+// whatever it says. "Says nothing" never blocks (greetings, plans, opinions). A failed call sends the text as it is.
+const REPORT_CHECK = (): boolean => process.env.LANES_REPORT_CHECK === '1'
+let REPORT_CONTRA = Number(process.env.LANES_REPORT_CONTRA ?? 0.8)
+export const __setReportContra = (p: number): void => { REPORT_CONTRA = p }
+const reportBacked = new Set<string>()            // run id + tool: already sent back once
+function runToolResults(path: string): Array<{ call: string; result: string }> {
+  const text = tailText(path, 600_000) ?? ''
+  const lines = text.split('\n')
+  let start = 0
+  for (let i = lines.length - 1; i >= 0; i--) {                 // the prompt that started this run = the last user record that is not a tool result
+    if (!lines[i].includes('"user"')) continue
+    try {
+      const j = JSON.parse(lines[i]); const c = j.message?.content
+      if (j.type === 'user' && (typeof c === 'string' || (Array.isArray(c) && !c.some((x: any) => x?.type === 'tool_result')))) { start = i; break }
+    } catch {}
+  }
+  const calls = new Map<string, string>(), out: Array<{ call: string; result: string }> = []
+  for (const l of lines.slice(start)) {
+    let j: any; try { j = JSON.parse(l) } catch { continue }
+    for (const c of (Array.isArray(j.message?.content) ? j.message.content : [])) {
+      if (c?.type === 'tool_use' && !String(c.name ?? '').startsWith('mcp__lane__')) calls.set(String(c.id), `${c.name} ${JSON.stringify(c.input ?? {}).slice(0, 300)}`)
+      if (c?.type === 'tool_result' && calls.has(String(c.tool_use_id))) {
+        const r = Array.isArray(c.content) ? c.content.map((x: any) => x?.text ?? '').join(' ') : String(c.content ?? '')
+        out.push({ call: calls.get(String(c.tool_use_id))!, result: r.slice(0, 2500) })
+      }
+    }
+  }
+  return out.slice(-20)
+}
+function reportSentences(text: string): string[] {
+  return text.split(/(?<=[。！？!?])\s*|\n+/).map(x => x.trim()).filter(x => x.length >= 6 && /[0-9]|ok|degraded|failed|失敗|成功|正常|恢復|重啟|沒有|已/.test(x)).slice(0, 12)
+}
+async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string): Promise<string | null> {
+  if (!REPORT_CHECK() || reportBacked.has(`${tok.runId}:${tool}`)) return null
+  const results = runToolResults(lane.transcript)
+  const sents = reportSentences(text)
+  if (!results.length || !sents.length) return null
+  const q: Record<string, unknown> = {}
+  sents.forEach((x, i) => { q[`S${i + 1}`] = { type: 'choice', instructions: `How do \`tool_results\` relate to the claim in item S${i + 1} of \`report\`?`,
+    criteria: { supports: 'A tool result states the claim or directly implies it is true', contradicts: 'A tool result states the opposite or a different value',
+      says_nothing: 'The tool results do not address what the claim asserts' } } })
+  const t0 = Date.now()
+  let verdicts: Array<{ s: string; choice: string | null; conf: number }> = [], err: string | null = null
+  try {
+    const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
+    if (!key) throw new Error('no key')
+    const res = await fetch((process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone', { method: 'POST', signal: AbortSignal.timeout(8000),
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-report-check/1' },
+      body: JSON.stringify({ model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-1.14.0', questions: q,
+        state: { setting: 'An operations agent is about to send `report`. `tool_results` are the commands it ran in this turn and what they returned.', tool_results: results, report: sents.map((x, i) => ({ id: `S${i + 1}`, text: x })) } }) })
+    const body = await res.text()
+    let a: any; try { a = JSON.parse(body).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
+    if (!res.ok || !a) throw new Error(`HTTP ${res.status}`)
+    verdicts = sents.map((x, i) => ({ s: x, choice: a[`S${i + 1}`]?.choice ?? null, conf: Number(a[`S${i + 1}`]?.confidence ?? 0) }))
+  } catch (e: any) { err = `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 160) }
+  const bad = verdicts.filter(v => v.choice === 'contradicts' && v.conf >= REPORT_CONTRA)
+  try { appendFileSync(join(LANES_DIR, 'run', 'report-check.jsonl'), JSON.stringify({ ts: nowIso(), lane: lane.id, run: tok.runId, tool, ms: Date.now() - t0, err, verdicts, sent_back: bad.length > 0 }) + '\n') } catch {}
+  if (err || !bad.length) return null
+  reportBacked.add(`${tok.runId}:${tool}`)
+  logos('lane.report_check', { lane: lane.id, run: tok.runId, tool, contradicted: bad.length })
+  return `not sent: ${bad.length} sentence(s) disagree with what your own tools returned in this turn:\n${bad.map(b => `- 「${b.s}」`).join('\n')}\nCheck them against the results and call ${tool} again with the corrected text (it will be sent as you write it).`
 }
 
 // ------------------------------------------------------------------ 002k: every lane turn leaves Joey a line (plan/decisions DC1)
