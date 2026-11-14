@@ -124,7 +124,12 @@ function toldJoey(notes: LedgerRec[]): string {
   return real.some(r => r.refs?.tier === 'push') ? '已通知 Joey（已響鈴）' : '已通知 Joey（靜默）'
 }
 
-type Block = { lines: string[]; routine: boolean; escalated: boolean; first: string }
+type Block = { lines: string[]; routine: boolean; escalated: boolean; first: string; must?: boolean }
+/** 002k (B2): the mark of a critical alert (refs.must_know) and the router's dispatch-time line that carries it (tier_rule critical-mark) */
+export const MUST_KNOW_MARK = '【主線必須知道】'
+const isMarkLine = (r: LedgerRec): boolean => r.refs?.tier_rule === 'critical-mark'
+/** what a thread says when the mark line is all it has so far (the lane has not reported yet) */
+const markText = (recs: LedgerRec[]): string => recs.filter(isMarkLine).map(r => r.text.replace(/^【主線必須知道】\[ledger\]\s*/, ''))[0] ?? ''
 function buildBlock(v: View): Block {
   const by = (k: string) => v.recs.filter(r => r.kind === k)
   const rep = mergeReports(v.recs)
@@ -134,7 +139,7 @@ function buildBlock(v: View): Block {
     for (const p of pools) for (const t of p) if (!used.has(t)) { used.add(t); return t }
     return ''
   }
-  const notes = by('notify').map(r => stripTier(r.text))
+  const notes = by('notify').filter(r => !isMarkLine(r)).map(r => stripTier(r.text))
   const fyis = by('fyi').map(r => r.text)
   const oldReceipts = v.recs.filter(r => r.kind === 'receipt' && !r.refs?.report).map(r => r.text)   // old `summary` receipts
   const actions = by('action').map(r => r.text)
@@ -143,7 +148,7 @@ function buildBlock(v: View): Block {
   // (a) what happened  (b) what the lane did  (c) what was promised to whom, by when  (d) what still needs the main
   // an action is what the lane DID, so it only stands in for "what happened" when nothing else (a fork's result) does
   const happened = rep?.happened || pick(notes, fyis, oldReceipts)
-    || (esc.length ? '升級主線（見「需主線」）' : commits.length ? '車道記下一筆承諾（見「承諾」）' : pick(actions))
+    || (esc.length ? '升級主線（見「需主線」）' : commits.length ? '車道記下一筆承諾（見「承諾」）' : pick(actions)) || markText(v.recs)
   const restActions = actions.filter(t => !used.has(t))
   const did0 = rep?.did || (restActions.slice(0, 3).map(t => clip(t, 200)).join('；') + (restActions.length > 3 ? `；另 ${restActions.length - 3} 項` : ''))
   const told = toldJoey(by('notify'))
@@ -154,14 +159,15 @@ function buildBlock(v: View): Block {
   const needs = needsParts.join('；')
 
   const waking = v.recs.some(isWakeEntry)          // it woke (or would wake) the main: never shown as routine
-  const routine = !waking && !esc.length && isNone(promised) && isNone(needs)
-  const label = `${laneName(v.lane)}${v.thread ? `｜${v.thread}` : ''}`
+  const must = v.recs.some(r => r.refs?.must_know === true)   // 002k (B2): marked once per thread however many lines carry it
+  const routine = !waking && !esc.length && !must && isNone(promised) && isNone(needs)
+  const label = `${must ? MUST_KNOW_MARK : ''}${laneName(v.lane)}${v.thread ? `｜${v.thread}` : ''}`
   if (routine) {
     const line = `• ${label}｜例行：${clip(happened || '（沒有文字）', 220)}${did && !isNone(did) ? `；做了：${clip(did, 140)}` : ''}`
     return { lines: [line], routine: true, escalated: false, first: v.first }
   }
   return {
-    routine: false, escalated: waking, first: v.first,
+    routine: false, escalated: waking, first: v.first, must,
     lines: [
       `▸ ${label}｜${stamp(v.first)}`,
       `  發生：${clip(happened || '（沒有文字）', 300)}`,
@@ -186,7 +192,8 @@ export function renderDigest(recs: LedgerRec[]): RenderedDigest | null {
   const items = recs.filter(r => r.notify_main).length
   const blocks = views.map(buildBlock)
   const escB = blocks.filter(b => b.escalated)
-  const heavy = blocks.filter(b => !b.routine && !b.escalated)
+  const heavyAll = blocks.filter(b => !b.routine && !b.escalated)
+  const heavy = [...heavyAll.filter(b => b.must), ...heavyAll.filter(b => !b.must)]     // 002k (B2): a marked critical alert heads the digest
   const light = blocks.filter(b => b.routine)
   const shownHeavy = heavy.slice(0, Math.max(0, DIGEST_MAX_HEAVY - escB.length))
   const shownLight = light.slice(0, DIGEST_MAX_ROUTINE)
@@ -261,12 +268,12 @@ export const ACTIVITY_MAX = 40
 function activityLine(v: View): string {
   const by = (k: string) => v.recs.filter(r => r.kind === k)
   const rep = mergeReports(v.recs)
-  const notes = by('notify')
+  const notes = by('notify').filter(r => !isMarkLine(r))
   const actions = by('action').filter(r => r.lane !== 'main').map(r => r.text)
   const mainDid = by('action').filter(r => r.lane === 'main').map(r => clip(r.text, 200))
   const handed = [...by('escalation'), ...by('stop')]
   const happened = rep?.happened || by('fyi')[0]?.text || (notes[0] ? stripTier(notes[0].text) : '') || handed[0]?.text
-    || actions[0] || mainDid[0] || by('receipt')[0]?.text || '（沒有文字）'
+    || actions[0] || mainDid[0] || by('receipt')[0]?.text || markText(v.recs) || '（沒有文字）'
   const did = rep?.did || actions.slice(0, 3).map(t => clip(t, 160)).join('；')
   const promised = rep?.promised || by('commitment').map(r => clip(r.text, 160)).join('；')
   const needs = handed.map(r => clip(r.text, 260))

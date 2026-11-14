@@ -54,7 +54,8 @@ test('B19: the started processes get the same --append-system-prompt; the lane d
   expect(d2.target).toBe('lane')
   expect(d2.lane).not.toBe(d1.lane)
   expect(await until(() => argvs().length >= 2)).toBe(true)
-  const [x, y] = argvs()
+  const all = argvs()                                                              // the two processes start together: find each by its lane
+  const x = all.find(a => after(a, '-p').includes(d1.lane!))!, y = all.find(a => after(a, '-p').includes(d2.lane!))!
   expect(after(x, '--append-system-prompt')).toBe(after(y, '--append-system-prompt'))
   const px = after(x, '-p'), py = after(y, '-p')
   expect(px).toContain(d1.lane!); expect(px).toContain('QQ-1'); expect(px).not.toContain('分流器標記：嚴重警報')

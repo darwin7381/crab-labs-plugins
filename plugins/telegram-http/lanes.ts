@@ -594,6 +594,7 @@ type State = {
   handoffs: Record<string, Handoff>                                    // 002d: work handed to the main, until the main has it
   promises: Record<string, Promise24>                                  // 002j: "the main answers you by HH:MM", told to a peer by the router
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
+  must_marked?: Record<string, number>                                 // 002k (B2): events already marked 【主線必須知道】 (event id → ms): one mark per event
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
@@ -1517,6 +1518,23 @@ function writeLaneSettings(): void {
 
 const criticalTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const rangByLane = new Set<string>()             // events a lane has already rung Joey for (this daemon's lifetime)
+// 002k (B2, 002j group B finding Q2): the 【主線必須知道】 mark of a critical alert is written when its lane is started, not at the 60 s
+// deadline or at the lane's report (the check wants it within 30 s). One mark per event: the deadline ring and the lane's own notify
+// keep their lines (the ring still rings, the lane still reports) but do not mark the event again.
+const MUST_KNOW = '【主線必須知道】'
+function claimMustKnow(evId: string): boolean {
+  S.must_marked ??= {}
+  if (S.must_marked[evId]) return false
+  S.must_marked[evId] = Date.now(); saveState()
+  return true
+}
+function markMustKnow(it: QItem, lane: Lane): void {
+  if (!claimMustKnow(it.ev.id)) return                      // a retry of the same event, or already marked
+  const cls = it.ev.cls ?? it.ev.trigger ?? 'alert-critical'
+  ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'notify', notify_main: true,
+    text: `${MUST_KNOW}[ledger] 嚴重警報已派給${laneLabel(lane)}查證，還沒有結果；響鈴由車道的回報或時限決定，這一筆不響鈴。\n原文：${it.ev.text.slice(0, 300)}`,
+    refs: { class: cls, escalated: false, tier: 'ledger', tier_rule: 'critical-mark', must_know: true } })
+}
 function armCriticalDeadline(it: QItem, lane: Lane): void {
   const id = it.ev.id
   if (criticalTimers.has(id) || rangByLane.has(id) || S.deadline_rang[id]) return
@@ -1527,8 +1545,9 @@ function armCriticalDeadline(it: QItem, lane: Lane): void {
     S.deadline_rang[id] = Date.now(); saveState()
     const text = `嚴重警報已收到，${laneLabel(lane)}正在查證，結果隨後補上（不再響鈴）。\n原文：${it.ev.text.slice(0, 400)}`
     const cls = it.ev.cls ?? it.ev.trigger ?? 'alert-critical'
-    ledger({ lane: lane.id, thread: lane.thread, event: id, kind: 'notify', notify_main: true, text: `【主線必須知道】[push] ${text.slice(0, 400)}`,
-      refs: { class: cls, escalated: false, tier: 'push', tier_rule: 'critical-deadline', must_know: true } })
+    const mark = claimMustKnow(id)                            // normally false: the mark was written at dispatch
+    ledger({ lane: lane.id, thread: lane.thread, event: id, kind: 'notify', notify_main: true, text: `${mark ? MUST_KNOW : ''}[push] ${text.slice(0, 400)}`,
+      refs: { class: cls, escalated: false, tier: 'push', tier_rule: 'critical-deadline', ...(mark ? { must_know: true } : {}) } })
     void pushJoey(lane, text, false).then(mid => {
       logos('lane.notify', { lane: lane.id, thread: lane.thread, event: id, class: cls, escalated: false, tier: 'push', tier_rule: 'critical-deadline', message_id: mid })
     })
@@ -1583,7 +1602,7 @@ function startRun(it: QItem): void {
     try { child.kill('SIGKILL') } catch {}
   }, LANE_MAX_RUN_MS)
   running.set(lane.id, { child, evId: it.ev.id, runId, renew })
-  if (critical && !tok.followup) armCriticalDeadline(it, lane)
+  if (critical && !tok.followup) { armCriticalDeadline(it, lane); markMustKnow(it, lane) }
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
@@ -1878,8 +1897,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const tier = dec.tier
       const ignored = Object.keys(a ?? {}).filter(k => k !== 'text')
       const rec = { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, trigger: tok.trigger, escalated: false }
-      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'notify', notify_main: tier !== 'ledger', text: `${tok.critical ? '【主線必須知道】' : ''}[${tier}] ${text.slice(0, 400)}`,
-        refs: { class: tok.cls, trigger: tok.trigger, escalated: false, tier, tier_rule: dec.rule, ...(tok.critical ? { must_know: true } : {}), ...(ignored.length ? { ignored_args: ignored } : {}) },
+      const mark = tok.critical && claimMustKnow(tok.evId)     // 002k (B2): normally false: the event was marked at dispatch
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'notify', notify_main: tier !== 'ledger', text: `${mark ? MUST_KNOW : ''}[${tier}] ${text.slice(0, 400)}`,
+        refs: { class: tok.cls, trigger: tok.trigger, escalated: false, tier, tier_rule: dec.rule, ...(mark ? { must_know: true } : {}), ...(ignored.length ? { ignored_args: ignored } : {}) },
         detail: lane.transcript })
       const h = createHash('sha1').update(lane.thread + '|' + text).digest('hex').slice(0, 16)
       const dedupeMs = (routerCfg().notify?.limits?.dedupe_minutes ?? 10) * 60_000
