@@ -48,7 +48,7 @@ export const LANES_ON = process.env.GENESIS_LANES === '1'
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const HOP_LIMIT = Number(process.env.LANES_HOP_LIMIT ?? 6)
 import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp, renderActivity } from './lanes-digest.ts'
-import { type Followup, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, runIdOfText, simTime } from './lanes-followup.ts'
+import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, outcomeFingerprint, runIdOfText, sameOutcome, simTime } from './lanes-followup.ts'
 
 const MAX_RUNNING = Number(process.env.LANES_MAX ?? 4)
 const LEASE_MS = Number(process.env.LANES_LEASE_MS ?? 120_000)
@@ -577,6 +577,8 @@ type Lane = {
 }
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
   ask_cls?: string                                                     // event class of the lane run that last asked a peer here
+  /** 002k (C6): what the last receipt on this thread found (outcomeFingerprint): a follow-up run that finds the same ends the chain */
+  fu_fp?: string
   /** 002k (B12): repeats of this thread's alert that arrived while no run could take them; the next run of the thread starts with them (extra) */
   repeats?: InEvent[] }
 /** 002k (B12): the alert a thread was opened for, by fingerprint: sender + text with the digits masked */
@@ -1074,6 +1076,8 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   notified?: number; nudged?: boolean; receipt?: { outcome: string; text: string }
   /** 002k (B21): a receipt with tag markup in a field was sent back once */
   markupRefused?: boolean
+  /** 002k (C6): this follow-up run found what the previous run on the thread found / the chain's end was already written for this run */
+  unchanged?: boolean; chainEnded?: boolean
   /** 002j: the router told this agent that the main decides and by when; the lane sends it nothing more about this event */
   interim?: string
   /** 002e: this run is a follow-up the lane scheduled itself (event id ev-fu-…) */
@@ -2018,6 +2022,18 @@ export const LANE_TOOLS = [
       needs_main: { type: 'string', description: 'what still needs the main (or 無)' } }, required: ['outcome'] } },
 ]
 
+// 002k (C6): the chain ended by the cap or by the no-change rule: one ledger line (for the main's digest; nobody is woken, nobody is rung).
+function chainEnded(lane: Lane, tok: RunTok, why: 'cap' | 'no-change', runs: number): void {
+  if (tok.chainEnded) return
+  tok.chainEnded = true
+  const cap = FOLLOWUP_CHAIN_MAX()
+  const text = why === 'cap'
+    ? `對話線 ${lane.thread} 的後續檢查連續跑了 ${runs} 次，到上限（${cap}）：不再排下一次，這條線等新事件或 Joey。`
+    : `對話線 ${lane.thread} 的後續檢查這一次的結果跟上一次一樣（已跑 ${runs} 次後續檢查）：不再排下一次，這條線等新事件或 Joey。`
+  ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'fyi', notify_main: true, text, refs: { followup_chain_ended: why, runs, cap } })
+  logos('lane.followup.chain_end', { lane: lane.id, thread: lane.thread, event: tok.evId, why, runs, cap })
+}
+
 // 002k (C2, 002j group C): Joey tells the agent to pass something to a peer ("tell Eve it is Friday"); the lane relays it with reply_agent. The
 // relay is the agent's word in Joey's name, a promise like any other, but it was recorded only as an action line. When a run triggered by a
 // Joey message sends reply_agent, the daemon writes kind commitment (who = the peer, what = the sent text, refs.from owner-relay,
@@ -2135,11 +2151,23 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const pending = Object.values(S.followups).filter(f => f.thread === lane.thread && f.state === 'pending').length
       const chk = checkFollowupArgs(a, pending)
       if (!chk.ok) return `followup refused: ${chk.error}`
+      // 002k (C6): run cap and no-change rule of the chain
+      const parent = tok.followup ? Object.values(S.followups).find(x => x.fired_event === tok.evId) : undefined
+      const chain = tok.followup ? (parent?.chain ?? 1) + 1 : 1
+      const cap = FOLLOWUP_CHAIN_MAX()
+      if (tok.unchanged) {
+        chainEnded(lane, tok, 'no-change', chain - 1)
+        return 'followup refused: your outcome in this run is the same as the previous run\'s on this thread, so nothing new is being waited for. Do not schedule another check. Close this run (notify_joey with where it stands, then receipt); the thread waits for a new event or for Joey.'
+      }
+      if (chain > cap) {
+        chainEnded(lane, tok, 'cap', chain - 1)
+        return `followup refused: this thread\'s follow-up chain has already run ${chain - 1} follow-up runs (cap ${cap}) with nothing new in between. Do not schedule another. Close this run (notify_joey with where it stands and what you are waiting for, then receipt); the thread waits for a new event or for Joey.`
+      }
       const q = queue.get(tok.evId)
       const due = Date.now() + chk.after * 60_000
       const f: Followup = { id: `fu-${shortId()}`, thread: lane.thread, lane: lane.id, event: tok.evId, run_id: runIdOfText(q?.ev.text ?? ''),
         trigger: tok.trigger, cls: tok.cls, from: q?.ev.from ?? 'scheduler', after_minutes: chk.after, note: chk.note, created: nowIso(),
-        due, due_iso: new Date(due).toISOString(), state: 'pending' }
+        due, due_iso: new Date(due).toISOString(), state: 'pending', chain }
       S.followups[f.id] = f; saveState()
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', notify_main: false,
         text: `排了後續檢查 ${f.id}：${chk.after} 分鐘後（模擬時間 ${simTime(due)}）再查：${chk.note}`, refs: { followup: f.id, due: f.due_iso, after_minutes: chk.after } })
@@ -2199,6 +2227,19 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       const rep = cleanReport(a)
       tok.receipt = { outcome, text: [a.summary, a.happened, a.did, a.promised, a.needs_main].filter(x => typeof x === 'string').join(' ') }
+      // 002k (C6): a follow-up run that found what the run before it found ends the chain: the follow-up it scheduled is cancelled
+      let chainNote = ''
+      {
+        const fp = outcomeFingerprint(outcome, a), prev = th?.fu_fp
+        if (th) th.fu_fp = fp
+        if (tok.followup && prev && sameOutcome(prev, fp)) {
+          tok.unchanged = true
+          const dropped = Object.values(S.followups).filter(f => f.thread === lane.thread && f.state === 'pending' && f.event === tok.evId)
+          for (const f of dropped) { f.state = 'ended'; f.ended = 'no-change' }
+          if (dropped.length) { chainEnded(lane, tok, 'no-change', Math.max(...dropped.map(f => f.chain ?? 1)) - 1); chainNote = `; the follow-up you scheduled in this run was cancelled: your outcome is the same as the previous run's, so this thread now waits for a new event or Joey` }
+          saveState()
+        }
+      }
       const note = a.summary ? stripMarkup(String(a.summary)).slice(0, 200) : rep?.happened.slice(0, 200)
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'receipt', notify_main: !!rep, text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}`,
         ...(rep ? { refs: { report: rep } } : {}) })
@@ -2210,7 +2251,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         }
       }
       const r = runIdArg ? await inboxPost('/lanes/scheduler', { run_id: runIdArg, action: 'complete', outcome, summary: a.summary }) : null
-      return `receipt recorded${r ? `; scheduler: ${r.text ?? JSON.stringify(r)}` : ''}`
+      return `receipt recorded${r ? `; scheduler: ${r.text ?? JSON.stringify(r)}` : ''}${chainNote}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
     case 'claim_file': {

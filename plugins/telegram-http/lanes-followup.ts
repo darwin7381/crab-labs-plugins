@@ -19,7 +19,37 @@ export type Followup = {
   id: string; thread: string; lane: string; event: string; run_id: string | null
   trigger: string; cls: string; from: string
   after_minutes: number; note: string; created: string; due: number; due_iso: string
-  state: 'pending' | 'fired'; fired?: string; fired_event?: string
+  /** 'ended' (002k C6): cancelled because the run that scheduled it found nothing new */
+  state: 'pending' | 'fired' | 'ended'; fired?: string; fired_event?: string
+  /** 002k (C6): how many follow-up runs the chain has had once this one fires (1 = scheduled by an ordinary run); ended = why it was cancelled */
+  chain?: number; ended?: string
+}
+
+// ------------------------------------------------------------------ 002k (C6): a follow-up chain stops by program
+// 002j group C (C02): a follow-up chain on one thread re-polled for 9 simulated hours while it waited for Joey: 10 runs, 3.3M tokens, five
+// near-identical notes. Two rules, both code (a model that keeps polling is answered with a program, not with more prompt text):
+//   - a chain has a run cap: at most LANES_FOLLOWUP_CHAIN_MAX (default 4) follow-up runs after the ordinary run that started it; the
+//     follow-up that would be the next one is refused;
+//   - when a follow-up run's outcome is the same as the previous run's on that thread, the next follow-up is not scheduled (one the run
+//     already scheduled is cancelled): the thread waits for a new event or for Joey. A new event on the thread starts a new chain.
+export const FOLLOWUP_CHAIN_MAX = (): number => Math.max(1, Number(process.env.LANES_FOLLOWUP_CHAIN_MAX ?? 4) || 4)
+/** What a run found, as text to compare: the receipt's outcome plus its did (else summary, else happened). Clock times, dates and run or
+ *  follow-up ids are blanked (they differ in every run and say nothing); every other number is kept (a measurement that moved IS a change). */
+export function outcomeFingerprint(outcome: string, a: { did?: unknown; summary?: unknown; happened?: unknown }): string {
+  const pick = [a.did, a.summary, a.happened].find(x => typeof x === 'string' && x.trim()) as string | undefined
+  const text = (pick ?? '').replace(/\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}(?::\d{2})?|\b(?:fu|run|ev|mesh)-?[0-9a-f]{2,}\b/gi, '#').replace(/\s+/g, ' ').trim().toLowerCase()
+  return `${String(outcome ?? '').trim().toLowerCase()}|${text}`
+}
+const bigrams = (s: string): Set<string> => { const o = new Set<string>(); for (let i = 0; i < s.length - 1; i++) o.add(s.slice(i, i + 2)); return o }
+/** Same outcome word and (near) the same text (bigram overlap >= 0.85). No text on either side = no evidence of "unchanged" = false. */
+export function sameOutcome(x: string, y: string): boolean {
+  const [ox, ...rx] = x.split('|'), [oy, ...ry] = y.split('|')
+  const tx = rx.join('|'), ty = ry.join('|')
+  if (ox !== oy || !tx || !ty) return false
+  if (tx === ty) return true
+  const bx = bigrams(tx), by = bigrams(ty)
+  let inter = 0; for (const g of bx) if (by.has(g)) inter++
+  return inter / (bx.size + by.size - inter) >= 0.85
 }
 
 /** Simulated wall time as "YYYY-MM-DD HH:MM" in the lab's zone (UTC+8). */
