@@ -1861,6 +1861,15 @@ bot.command('help', async ctx => {
   )
 })
 
+// 002k: /lanes — list, close, master switch, notify profile (lanes.ts lanesCommand). Answered by the daemon, never forwarded to a session.
+bot.command('lanes', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  if (!Lanes.LANES_ON) { await ctx.reply('車道沒有開啟（這個 agent 是單一 session）。'); return }
+  const text = await Lanes.lanesCommand(ctx.message?.text ?? '/lanes', ctx.from?.username ?? gated.senderId)
+  await ctx.reply(text)
+})
+
 bot.command('status', async ctx => {
   const gated = dmCommandGate(ctx)
   if (!gated) return

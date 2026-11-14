@@ -511,6 +511,8 @@ type State = {
   promises: Record<string, Promise24>                                  // 002j: "the main answers you by HH:MM", told to a peer by the router
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
+  master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
+  notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
 }
@@ -644,11 +646,15 @@ function matches(r: Rule, ev: InEvent, cfg: RouterCfg): boolean {
 export async function routeEvent(ev: InEvent): Promise<Decision> {
   const cfg = routerCfg()
   let d: Decision = { rule: 'none', target: 'main' }
-  for (const r of cfg.rules) {
+  // 002k: the master switch (design/stability SR11, plan/decisions 「總開關關掉，就回到今天的樣子」). Off = today's single-session
+  // behaviour: every event goes to the main, no lane is started. Lanes already running finish their event and report.
+  const off = !!S?.master_off && D.role === 'tg'
+  for (const r of off ? [] : cfg.rules) {
     if (!matches(r, ev, cfg)) continue
     d = await applyRule(r, ev)
     break
   }
+  if (off) d = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off!.by} at ${stamp(S.master_off!.since)}` }
   // the tier this event's lane messages get unless the lane escalates (ledger target: the tier of the notice itself)
   const cls = d.target === 'main' ? null : (ev.cls ?? ev.trigger ?? null)
   const base_tier = d.target === 'ledger' ? (cls ? tierFor(cls, false).tier : 'ledger') : cls ? tierFor(cls, false).tier : null
@@ -710,11 +716,19 @@ export function triggerClass(r: Rule, ev: InEvent): string {
  *  `escalated` = this message is the lane's ask_joey (002d; earlier universes: the lane had escalated earlier in the run). Lanes declare nothing else. Unknown class →
  *  notify.default (push = today's behaviour). */
 export function tierFor(cls: string, escalated: boolean): { tier: Tier; rule: string } {
+  // 002k: the notify profile (design/notify 「要不要用靜音、哪些類別用，是你的選擇，預設是照現在的方式正常推播」). `default`: every lane message
+  // to Joey is an ordinary push, as before lanes; `tiered`: the router table below. Set by LANES_NOTIFY_PROFILE or /lanes notify.
+  if (notifyProfile() === 'default') return { tier: 'push', rule: 'profile.default' }
   const n = routerCfg().notify ?? {}
   const row = n.classes?.[cls]
   const r = row ?? n.default ?? { plain: 'push', escalated: 'push' }
   const col = escalated ? 'escalated' : 'plain'
   return { tier: r[col] ?? 'push', rule: `${row ? `classes.${cls}` : 'default'}.${col}` }
+}
+let NOTIFY_PROFILE_ENV = (process.env.LANES_NOTIFY_PROFILE ?? 'tiered').trim()
+export function notifyProfile(): 'default' | 'tiered' {
+  const p = (S as any)?.notify_profile ?? NOTIFY_PROFILE_ENV
+  return p === 'default' ? 'default' : 'tiered'
 }
 /** tierFor + the router's frequency cap (「分流器同時管頻率上限與去重」): a non-exempt push over
  *  limits.push_per_thread per window goes out at over_limit_tier. Escalated runs and cap_exempt_classes are exempt. */
@@ -1924,6 +1938,96 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     }
   }
   return `unknown tool ${name}`
+}
+
+// ================================================================== 002k: /lanes — Joey sees and controls the lanes
+// design/stability SR11 「看不到、關不掉：每條線在控制台有一列…Telegram 可以列出與關閉。另有一個總開關」. The daemon answers the command
+// itself (no model): the lanes are the daemon's own state.
+//   /lanes                  one line per lane that is not closed: label, id, kind, who opened it and why, status, runs, tokens, last activity
+//   /lanes close <lane>     close it (label like 工作線#1 / worker#1, the id, or the WO number of a worker); what it last reported is written
+//                           to the ledger so the main can pick the work up
+//   /lanes off | on         the master switch
+//   /lanes notify default|tiered   the notify profile
+const KIND_EN: Record<string, string> = { reflex: 'reflex', worker: 'worker', fork: 'fork' }
+function openedBy(l: Lane): string {
+  const r = readJsonl('routing.jsonl').find(x => x.lane === l.id)
+  if (!r) return '?'
+  if (r.rule === 'open_worker') return '主線開的'
+  if (r.rule === 'fork') return '主線分身'
+  return `分流器（${r.from ?? r.source ?? '?'}・${r.rule}）`
+}
+function readJsonl(name: string): any[] {
+  try { return readFileSync(join(LANES_DIR, name), 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean) } catch { return [] }
+}
+function findLane(arg: string): Lane | null {
+  const a = arg.trim().toLowerCase()
+  const all = Object.values(S.lanes)
+  const m = a.match(/^(reflex|worker|fork|反射線|工作線|分身線)\s*#?\s*(\d+)$/)
+  if (m) {
+    const kind = ({ 反射線: 'reflex', 工作線: 'worker', 分身線: 'fork' } as Record<string, string>)[m[1]] ?? m[1]
+    return all.find(l => l.kind === kind && l.n === Number(m[2])) ?? null
+  }
+  const wo = a.match(/^wo-?(\d+)$/)
+  if (wo) return all.filter(l => S.tickets[`WO-${wo[1]}`] === l.id || (l.title ?? '').toLowerCase().includes(`wo-${wo[1]}`)).pop() ?? null
+  return all.find(l => l.id.toLowerCase() === a) ?? null
+}
+function laneRow(l: Lane): string {
+  const kind = KIND_EN[l.kind] ?? l.kind
+  const what = l.title ? `「${l.title.slice(0, 40)}」` : `thread ${l.thread}`
+  const busy = running.has(l.id) ? '執行中' : l.status === 'idle' ? '閒置' : l.status
+  return `${laneLabel(l)}（${kind}，${l.id}）${what}｜${openedBy(l)}｜${busy}｜${l.runs} 趟｜${Math.round(l.tokens_in / 1000)}k token｜最後 ${stamp(l.last)}`
+}
+export async function lanesCommand(text: string, who: string): Promise<string> {
+  if (D?.role !== 'tg' || !S) return '這個 daemon 不管車道。'
+  const args = text.trim().split(/\s+/).slice(1)
+  const sub = (args[0] ?? '').toLowerCase()
+  if (!sub || sub === 'list') {
+    const open = Object.values(S.lanes).filter(l => l.status !== 'closed')
+    const head = S.master_off ? `總開關：關（${stamp(S.master_off.since)} 起，所有訊息進主線）` : '總開關：開'
+    const prof = `通知：${notifyProfile() === 'default' ? '全部照常推播' : '分級（依事件類別）'}`
+    logos('lane.command', { cmd: 'list', by: who, lanes: open.length })
+    return [head, prof, open.length ? `車道 ${open.length} 條：` : '目前沒有開著的車道。', ...open.map(laneRow)].join('\n')
+  }
+  if (sub === 'close') {
+    const l = args[1] ? findLane(args.slice(1).join(' ')) : null
+    if (!l) return `找不到這條車道：${args.slice(1).join(' ') || '(沒寫)'}。用 /lanes 看清單。`
+    if (l.status === 'closed') return `${laneLabel(l)} 已經關了。`
+    const last = readJsonl('ledger.jsonl').filter(r => r.lane === l.id).slice(-3).map(r => `${r.kind}：${String(r.text ?? '').slice(0, 200)}`)
+    const wasRunning = running.has(l.id)
+    l.status = 'closed'
+    for (const [k, v] of Object.entries(S.topics)) if (v === l.id) delete S.topics[k]
+    for (const [k, v] of Object.entries(S.tickets)) if (v === l.id) delete S.tickets[k]
+    saveState()
+    const r = running.get(l.id); if (r) { try { r.child.kill('SIGTERM') } catch {} }
+    appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: wasRunning, title: l.title ?? null })
+    ledger({ lane: 'router', thread: l.thread, kind: 'action', notify_main: true,
+      text: `Joey 用 /lanes close 關閉 ${laneLabel(l)}（${l.id}${l.title ? `，「${l.title}」` : ''}）${wasRunning ? '，當時正在執行' : ''}。它最後的紀錄：${last.join('；') || '（沒有）'}。這件事如果還沒做完，由主線決定要不要接手。`,
+      refs: { closed: l.id, by: who } })
+    logos('lane.command', { cmd: 'close', by: who, lane: l.id, was_running: wasRunning })
+    return `已關閉 ${laneLabel(l)}（${l.id}）${wasRunning ? '，當時正在執行的那一趟已停止' : ''}。它最後做到哪已寫進帳本，主線下一次摘要會看到。`
+  }
+  if (sub === 'off' || sub === 'on') {
+    if (sub === 'off') {
+      if (!S.master_off) S.master_off = { since: nowIso(), by: who }
+    } else delete S.master_off
+    saveState()
+    const n = running.size
+    ledger({ lane: 'router', kind: 'action', notify_main: true,
+      text: sub === 'off' ? `Joey 關掉車道總開關：之後所有訊息都直接進主線，不再開車道${n ? `；正在執行的 ${n} 條會做完手上那一件並回報` : ''}。` : 'Joey 打開車道總開關：分流規則恢復。' })
+    appendJsonl('routing.jsonl', { event: `master-${sub}-${Date.now()}`, source: 'joey', rule: `master-${sub}`, target: 'none', note: `by ${who}` })
+    logos('lane.command', { cmd: sub, by: who, running: n })
+    return sub === 'off'
+      ? `車道總開關已關閉。之後所有訊息都直接進主線，跟沒有車道時一樣${n ? `；正在執行的 ${n} 條會做完手上那一件並回報` : ''}。用 /lanes on 打開。`
+      : '車道總開關已打開，分流規則恢復。'
+  }
+  if (sub === 'notify') {
+    const want = (args[1] ?? '').toLowerCase()
+    if (want !== 'default' && want !== 'tiered') return '用法：/lanes notify default（全部照常推播）或 /lanes notify tiered（依事件類別分級）。'
+    ;(S as any).notify_profile = want; saveState()
+    logos('lane.command', { cmd: 'notify', by: who, profile: want })
+    return want === 'default' ? '通知改成全部照常推播。' : '通知改成分級：例行與同事的結果靜音，嚴重警報與要你決定的事照常推播。'
+  }
+  return '用法：/lanes（清單）、/lanes close <車道>、/lanes off、/lanes on、/lanes notify default|tiered'
 }
 
 // ================================================================== digest (tg role) — 002b
