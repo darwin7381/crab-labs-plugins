@@ -36,6 +36,16 @@ test('needles: mesh message = btcc_msg_id; scheduler wake-up = its run tag; noth
   expect(intakeNeedles({ params: undefined })).toBeNull()
 })
 
+test('002j: a delivery with no id of its own is recognised by the daemon\'s did', () => {
+  const sys = { params: { content: '〔系統通知〕', meta: { user: 'lanes', kind: 'resume', did: 'm1abc-1' } } }
+  expect(intakeNeedles(sys)).toEqual([' did=\\"m1abc-1\\"'])
+  const tagged = '<channel source="plugin:telegram-http:telegram-http" user="lanes" kind="resume" did="m1abc-1">\n〔系統通知〕\n</channel>'
+  const t = text({ type: 'queue-operation', operation: 'enqueue', timestamp: at(0), content: tagged }, { type: 'user', isMeta: true, timestamp: at(30), message: { role: 'user', content: tagged } })
+  expect(intakeInText(t, intakeNeedles(sys)!, T0)).toMatchObject({ taken: true, queued: false })
+  // a real id wins over did
+  expect(intakeNeedles({ params: { content: 'x', meta: { message_id: '9', chat_id: '1', did: 'zz' } } })).toEqual([' message_id=\\"9\\"', ' chat_id=\\"1\\"'])
+})
+
 // ── what became of it ───────────────────────────────────────────────────────
 test('became a prompt (enqueue + user record) = taken', () => {
   expect(intakeInText(text(enqueue('7235', 0), prompt('7235', 40)), needles('7235'), T0)).toMatchObject({ taken: true, queued: false })

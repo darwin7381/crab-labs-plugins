@@ -2789,7 +2789,22 @@ function deliverToMain(notif: { method: string; params: unknown }): void {
   }
 }
 
+// 002j: every delivery can be recognised in the transcript. Telegram messages carry message_id and mesh messages
+// btcc_msg_id; system notices, digests and locally injected messages carried nothing (fleet replay 2026-11-14: 337 of
+// about 4,500 deliveries), so the daemon could not tell whether they were read and fell back to the time rule. Those get
+// the daemon's own id, `did`, which Claude Code writes into the <channel> tag like any other meta key.
+let didSeq = 0
+function stampDid(notif: { method: string; params: unknown }): void {
+  try {
+    const p = notif.params as { meta?: Record<string, unknown> } | undefined
+    if (!p || typeof p !== 'object') return
+    const m = (p.meta ??= {})
+    if (m.message_id || m.btcc_msg_id || m.did) return
+    m.did = `${Date.now().toString(36)}-${(++didSeq).toString(36)}`
+  } catch {}
+}
 function broadcastNotification(notif: { method: string; params: unknown }): void {
+  stampDid(notif)
   if (Lanes.LANES_ON) { deliverToMain(notif); return }
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
