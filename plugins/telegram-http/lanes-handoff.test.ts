@@ -377,16 +377,16 @@ test('002i: the transcript says what became of a delivery: taken in, waiting in 
     + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(90), content: tg(1008, '查 health') })                               // queued; then the process was killed
     + rec({ type: 'assistant', timestamp: at(92), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use' }] } })
     + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(93), content: '<channel source="plugin:agent-inbox:agent-inbox" user="eve" btcc_msg_id="50031">hi</channel>' }))
-  expect(intake(n({ message_id: '1003' }), T0)).toEqual({ taken: true, queued: false })
-  expect(intake(n({ message_id: '1006' }), T0 + 60_000)).toEqual({ taken: true, queued: false })
-  expect(intake(n({ message_id: '1008' }), T0 + 90_000)).toEqual({ taken: false, queued: true })     // in the client's queue, not read
-  expect(intake(n({ btcc_msg_id: '50031' }), T0 + 93_000)).toEqual({ taken: false, queued: true })   // the same for a mesh message
+  expect(intake(n({ message_id: '1003' }), T0)).toMatchObject({ taken: true, queued: false })
+  expect(intake(n({ message_id: '1006' }), T0 + 60_000)).toMatchObject({ taken: true, queued: false })
+  expect(intake(n({ message_id: '1008' }), T0 + 90_000)).toMatchObject({ taken: false, queued: true })     // in the client's queue, not read
+  expect(intake(n({ btcc_msg_id: '50031' }), T0 + 93_000)).toMatchObject({ taken: false, queued: true })   // the same for a mesh message
   // the same message given again to a NEW process at +100 s: the old enqueue is not evidence for this delivery
-  expect(intake(n({ message_id: '1008' }), T0 + 100_000)).toEqual({ taken: false, queued: false })   // no trace: it never arrived
+  expect(intake(n({ message_id: '1008' }), T0 + 100_000)).toMatchObject({ taken: false, queued: false })   // no trace: it never arrived
   writeFileSync(p, readFileSync(p, 'utf8') + rec({ type: 'queue-operation', operation: 'enqueue', timestamp: at(125), content: tg(1008, '查 health') })
     + rec({ type: 'queue-operation', operation: 'dequeue', timestamp: at(125) }) + rec({ type: 'user', timestamp: at(125), message: { content: tg(1008, '查 health') } }))
-  expect(intake(n({ message_id: '1008' }), T0 + 124_000)).toEqual({ taken: true, queued: false })    // the second copy was read
-  expect(intake(n({ message_id: '999' }), T0)).toEqual({ taken: false, queued: false })
+  expect(intake(n({ message_id: '1008' }), T0 + 124_000)).toMatchObject({ taken: true, queued: false })    // the second copy was read
+  expect(intake(n({ message_id: '999' }), T0)).toMatchObject({ taken: false, queued: false })
   expect(intake(n({}), T0)).toBeNull()                                                               // nothing to recognise it by
   writeFileSync(p, '')
 })

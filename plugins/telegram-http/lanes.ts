@@ -23,6 +23,7 @@
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
  * (main writes), digest.json, run/ (per-run MCP configs, stderr).
  */
+import { intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { randomBytes, randomUUID, createHash } from 'crypto'
 import {
@@ -318,24 +319,19 @@ function tailText(path: string, max: number): string | null {
  *  transcript advanced after the delivery" read the running turn's tool calls as consumption. On 002h it was parked again
  *  for the new process, replayed 50 ms after that process connected, dropped by the starting client, and written off by
  *  the same rule a second time. */
-export function intake(notif: Notif, sinceMs = 0): { taken: boolean; queued: boolean } | null {
-  const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
-  const key = meta.message_id ? `message_id="${meta.message_id}"` : meta.btcc_msg_id ? `btcc_msg_id="${meta.btcc_msg_id}"` : meta.ts ? `ts="${meta.ts}"` : null
+export function intake(notif: Notif, sinceMs = 0): Intake | null {
+  // 002j: the recognition lives in liveness.ts (intakeNeedles / intakeInText): attributes keep their leading space, so
+  // `reply_to_message_id="7"` is not `message_id="7"`; a Telegram message is also matched on its chat; a tool result that
+  // prints the same tag is not the message being read; a delivery with no id of its own carries the daemon's `did`.
   const path = mainReg?.transcript_path
-  if (!key || !path) return null
-  const text = tailText(path, 2_000_000)
-  if (text == null) return null
-  const inJson = JSON.stringify(key).slice(1, -1)            // the key as it is written inside a JSON string
-  let taken = false, queued = false
-  for (const line of text.split('\n')) {
-    if (!line.includes(inJson)) continue
-    let j: any; try { j = JSON.parse(line) } catch { continue }
-    if (sinceMs && !(Date.parse(j.timestamp ?? '') >= sinceMs - 3_000)) continue
-    if (j.type === 'user' || (j.type === 'attachment' && j.attachment?.type === 'queued_command')) taken = true
-    else if (j.type === 'queue-operation' && j.operation === 'remove' && j.reason === 'absorbed_mid_turn') taken = true
-    else if (j.type === 'queue-operation' && j.operation === 'enqueue') queued = true
-  }
-  return { taken, queued: queued && !taken }
+  if (!path) return null
+  return intakeAtFile(path, notif, sinceMs)
+}
+/** 002j: has the main written a genuine assistant record after `ms`? "Taken in" alone is not consumption: an agent at
+ *  its usage limit takes a message in and answers with a synthetic API-error record (fleet replay 2026-11-14). */
+export function mainAnsweredAfter(ms: number): boolean {
+  const path = mainReg?.transcript_path
+  return !!path && genuineAssistantAtFile(path) > ms
 }
 
 /** Did the session's last turn end, or was it cut off? Read from the end of its transcript: a completed turn ends with an

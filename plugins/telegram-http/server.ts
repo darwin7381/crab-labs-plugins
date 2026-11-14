@@ -846,9 +846,13 @@ function sweepDeliveries(): void {
     // client's queue, or no trace at all. That replaces "the transcript advanced after the delivery" whenever the delivery
     // can be recognised: a main that is in the middle of a turn advances its transcript without having read anything.
     const it = Lanes.LANES_ON ? Lanes.intake(d.notif, d.at) : null
+    // 002j: "taken in" is not "consumed". Consumed = the model has it AND the main wrote a genuine assistant record after
+    // that moment. Until then the delivery stays open: a running turn answers soon; a usage-limit wall or a frozen
+    // session does not, and the delivery is parked again after the grace (counted from when it was taken in).
+    const answered = it?.taken ? Lanes.mainAnsweredAfter(it.takenAt) : false
     // Without that evidence: strictly after the delivery, and by a genuine (non-API-error) assistant
     // record. An error record or a pre-delivery record is NOT consumption.
-    if (it ? it.taken : newest > d.at) {
+    if (it ? answered : newest > d.at) {
       // transcript advanced after delivery ⇒ consumed. If we had already
       // re-persisted a dup (long-turn false negative), retract it.
       if (d.pendingPath) {
@@ -859,7 +863,7 @@ function sweepDeliveries(): void {
     } else if (it?.queued) {
       // the live client has it and reads it at the next step of its running turn; if that process dies first,
       // repersistUnconsumed gives it to the next one
-    } else if (!d.pendingPath && now - d.at > (it ? ARRIVE_GRACE_MS : CONSUME_GRACE_MS)) {
+    } else if (!d.pendingPath && now - (it?.taken ? Math.max(d.at, it.takenAt) : d.at) > (it && !it.taken ? ARRIVE_GRACE_MS : CONSUME_GRACE_MS)) {
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
       if (attempts >= MAX_REDELIVERIES) {
         // Stop the loop — but do NOT destroy the message. The 1.22.3 wording
@@ -921,7 +925,16 @@ function repersistUnconsumed(): number {
   return n
 }
 
+let replayRunning = false
 async function replayPendingFromDisk(server: Server): Promise<number> {
+  // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
+  // would each read the same parked file before either removed it: the same message delivered twice (fleet record
+  // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
+  if (replayRunning) return 0
+  replayRunning = true
+  try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
+}
+async function replayPendingFromDiskLocked(server: Server): Promise<number> {
   // 🔴 SSE-open gate. `server.notification()` RESOLVES even when the SSE stream
   // is not yet open — the write lands in a stream nobody is reading — and this
   // function then rmSync's the durable file on that false success, destroying
