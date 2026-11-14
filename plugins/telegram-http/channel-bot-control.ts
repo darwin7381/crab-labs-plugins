@@ -29,6 +29,7 @@
  * this for an unauthenticated message.
  */
 
+import { markDeliberateRestart } from './lanes.ts'
 import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -1709,6 +1710,7 @@ export async function handleControlSlash(
   // ---- Phase 2: system-level control ------------------------------------
   if (cmd === '/restart') {
     await tryRun('restart claude TUI', async () => {
+      markDeliberateRestart()
       const how = await restartClaudeTUI()
       await replyToTg(`🔁 restarting — tmux session 已砍，${how}。TUI 回線約 30–60s（監控 tick + 啟動等待）。`)
     })
@@ -1716,6 +1718,7 @@ export async function handleControlSlash(
   }
   if (cmd === '/kill-stuck' || cmd === '/kill_stuck') {
     await tryRun('pkill -9 claude TUI', async () => {
+      markDeliberateRestart()
       const r = await killStuckClaude()
       await replyToTg(
         r.killed > 0

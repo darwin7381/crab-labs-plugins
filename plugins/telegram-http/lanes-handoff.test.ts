@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
 import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected,
-  mainConnected, cutOffTurn, resumeNotice, intake, mainTranscript, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
+  mainConnected, cutOffTurn, resumeNotice, resumeDecision, intake, mainTranscript, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
 import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -359,6 +359,28 @@ test('002g: was the last turn cut off? read from the end of the transcript', () 
   expect(cutOffTurn(join(dir, 'nope.jsonl')).cut).toBe(false)
   const n = resumeNotice('2026-11-13T02:03:02.000Z')
   expect(n).toContain('11-13 10:03'); expect(n).toContain('UTC+8'); expect(n).toContain('接著把它做完')
+})
+
+test('002j: when a replaced main is NOT told to carry on: asked-for restart, usage-limit wall, the same cut point twice', () => {
+  const p = join(dir, 'cut2.jsonl')
+  const rec = (o: object) => JSON.stringify(o) + '\n'
+  const prompt = rec({ type: 'user', timestamp: '2026-11-14T01:00:00.000Z', message: { content: 'do the thing' } })
+  const wall = rec({ type: 'assistant', timestamp: '2026-11-14T01:00:01.000Z', isApiErrorMessage: true, message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: "You've hit your weekly limit" }] } })
+  const resumed = rec({ type: 'assistant', timestamp: '2026-11-14T01:05:00.000Z', message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: 'No response requested.' }] } })
+  // a prompt answered only by a usage-limit record: cut, and walled
+  writeFileSync(p, prompt + wall + resumed)
+  expect(cutOffTurn(p)).toEqual({ cut: true, at: '2026-11-14T01:00:00.000Z', walled: true })
+  // the same prompt with no error record: cut, not walled (the 002g shape, unchanged)
+  writeFileSync(p, prompt + resumed)
+  expect(cutOffTurn(p)).toEqual({ cut: true, at: '2026-11-14T01:00:00.000Z' })
+  const cut = { cut: true, at: 't1' }
+  expect(resumeDecision({ cut: false }, false, null)).toBe('none')
+  expect(resumeDecision(cut, false, null)).toBe('notice')
+  expect(resumeDecision(cut, false, 't0')).toBe('notice')            // a different cut point than last time
+  expect(resumeDecision(cut, true, null)).toBe('deliberate')         // /restart or /kill_stuck
+  expect(resumeDecision({ ...cut, walled: true }, false, null)).toBe('walled')
+  expect(resumeDecision(cut, false, 't1')).toBe('repeat')            // died again at the point it was resumed from
+  expect(resumeDecision({ ...cut, walled: true }, true, 't1')).toBe('deliberate')   // an asked-for restart wins
 })
 
 // ------------------------------------------------------------------ 002h/002i: what became of a delivery to the main

@@ -337,22 +337,56 @@ export function mainAnsweredAfter(ms: number): boolean {
 /** Did the session's last turn end, or was it cut off? Read from the end of its transcript: a completed turn ends with an
  *  assistant record that stopped by itself (or the harness's end-of-turn records); a turn that was cut off ends with a
  *  tool call, a tool result or a prompt. The "No response requested." record a resumed session writes is not a turn. */
-export function cutOffTurn(path: string): { cut: boolean; at?: string } {
+export function cutOffTurn(path: string): { cut: boolean; at?: string; walled?: boolean } {
   const text = tailText(path, 400_000)
   if (text == null) return { cut: false }
   const lines = text.split('\n')
+  // 002j: `walled` = the turn did not end and the last thing the harness wrote for it is an API-error record (usage
+  // limit, overload). That is a wall, not a crash: telling the main to carry on would only send it into the wall again.
+  let walled = false
+  const out = (at: string) => walled ? { cut: true, at, walled } : { cut: true, at }
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i]) continue
     let j: any; try { j = JSON.parse(lines[i]) } catch { continue }
     if (j.type === 'system' && (j.subtype === 'turn_duration' || j.subtype === 'stop_hook_summary')) return { cut: false }
     if (j.type === 'assistant') {
-      if (j.message?.model === '<synthetic>') continue
+      if (j.message?.model === '<synthetic>') { if (j.isApiErrorMessage) walled = true; continue }
       const tool = (j.message?.content ?? []).some((c: any) => c?.type === 'tool_use')
-      return j.message?.stop_reason === 'end_turn' && !tool ? { cut: false } : { cut: true, at: j.timestamp }
+      return j.message?.stop_reason === 'end_turn' && !tool ? { cut: false } : out(j.timestamp)
     }
-    if (j.type === 'user' && !j.isMeta) return { cut: true, at: j.timestamp }
+    if (j.type === 'user' && !j.isMeta) return out(j.timestamp)
   }
   return { cut: false }
+}
+
+// ------------------------------------------------------------------ 002j: when NOT to tell a replaced main to carry on
+// The resume notice (002g) was sent whenever the transcript ended mid-turn. Three cases where that is wrong:
+//   deliberate  the restart was asked for (/restart, /kill_stuck: someone judged the session stuck). Carrying on would
+//               walk it back into the thing it was stopped for.
+//   walled      the turn stopped at a usage-limit or API-error record. Carrying on hits the wall again.
+//   repeat      the same cut point was already resumed once and the process died there again. Joey is told; the main is
+//               not sent round a third time.
+export type ResumeDecision = 'none' | 'notice' | 'deliberate' | 'walled' | 'repeat'
+export function resumeDecision(c: { cut: boolean; at?: string; walled?: boolean }, deliberate: boolean, lastNoticeAt: string | null): ResumeDecision {
+  if (!c.cut) return 'none'
+  if (deliberate) return 'deliberate'
+  if (c.walled) return 'walled'
+  if (c.at && lastNoticeAt && c.at === lastNoticeAt) return 'repeat'
+  return 'notice'
+}
+const DELIBERATE_WINDOW_MS = 180_000
+const deliberateFile = (): string => join(LANES_DIR, 'run', 'deliberate-restart')
+const resumeFile = (): string => join(LANES_DIR, 'run', 'resume.json')
+/** called by the control commands that kill or restart the TUI on purpose (and by lab scenarios that play one) */
+export function markDeliberateRestart(): void {
+  if (!LANES_DIR) return
+  try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(deliberateFile(), new Date().toISOString()) } catch {}
+}
+function takeDeliberate(): boolean {
+  try { const m = statSync(deliberateFile()).mtimeMs; rmSync(deliberateFile()); return Date.now() - m < DELIBERATE_WINDOW_MS } catch { return false }
+}
+function lastResumeAt(): string | null {
+  try { return JSON.parse(readFileSync(resumeFile(), 'utf8')).at ?? null } catch { return null }
 }
 export function resumeNotice(at?: string): string {
   return `〔系統通知｜主線重新啟動〕你的 session 剛才被中斷${at ? `（${stamp(at)}，${TZ_LABEL}）` : ''}，現在已經重新啟動，對話紀錄都還在。\n`
@@ -367,8 +401,26 @@ function onMainReplaced(prevPid: number): void {
   setTimeout(() => D.sweepNow?.(), ARRIVE_GRACE_MS + 5_000)      // 002i: what was replayed into the starting process and dropped is given again
   if (D.role !== 'tg') return
   const c = cutOffTurn(mainReg!.transcript_path)
-  if (!c.cut) return
-  setTimeout(() => { void sendResumeNotice(c.at) }, RESUME_NOTICE_DELAY_MS)
+  const dec = resumeDecision(c, takeDeliberate(), lastResumeAt())
+  logos('lane.resume_decision', { decision: dec, cut_at: c.at ?? null, walled: !!c.walled })
+  if (dec === 'none') return
+  if (dec === 'notice') {
+    try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(resumeFile(), JSON.stringify({ at: c.at ?? null, sent: new Date().toISOString() })) } catch {}
+    setTimeout(() => { void sendResumeNotice(c.at) }, RESUME_NOTICE_DELAY_MS)
+    return
+  }
+  if (dec === 'repeat') {
+    ledger({ lane: 'router', kind: 'notify', notify_main: true,
+      text: `[push] 主線在同一個地方第二次被中斷（${c.at ? stamp(c.at) : '?'}），沒有再自動接續，已通知 Joey`,
+      refs: { tier: 'push', tier_rule: 'resume-repeat', escalated: true } })
+    void pushJoey(undefined, `主線在同一個地方第二次被中斷（中斷點 ${c.at ? stamp(c.at) : '?'}，${TZ_LABEL}）。我沒有再叫它自動接著做，免得它卡在同一步重複。它手上那一回合還沒做完，要不要繼續請你決定。`, false).then(id => {
+      logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'resume-repeat', message_id: id })
+    })
+    return
+  }
+  ledger({ lane: 'router', kind: 'fyi', notify_main: false,
+    text: dec === 'deliberate' ? '主線被指令重啟（/restart 或 /kill_stuck），中斷的那一回合不自動接續'
+      : '主線重啟時上一回合停在額度或連線錯誤，不自動接續' })
 }
 async function sendResumeNotice(at?: string): Promise<void> {
   let ok = false
