@@ -1530,7 +1530,11 @@ export function sweepQueue(): void {
  *  a workspace file (lane-guard-hook.py denies it), so it has no use for them; it can still write a scratch file through Bash. */
 export function laneBuiltinTools(kind: LaneKind): string {
   const edits = kind === 'worker' || kind === 'fork' || kind === 'curator'
-  return ['Bash', 'Read', ...(edits ? ['Write', 'Edit'] : []), 'ToolSearch'].join(',')
+  // 002k (E12, PREPARED, NOT SHIPPED: Joey has not decided): B1 took the Agent tool away from every lane, while the design pages say a lane may
+  // use native sub-agents (E06 / NT5 cannot be exercised). One switch gives it back to worker and fork lanes only, never to reflex, synthesis or
+  // curator lanes: LANES_WORKER_AGENT_TOOL=1. Default OFF.
+  const agent = process.env.LANES_WORKER_AGENT_TOOL === '1' && (kind === 'worker' || kind === 'fork')
+  return ['Bash', 'Read', ...(edits ? ['Write', 'Edit'] : []), ...(agent ? ['Agent'] : []), 'ToolSearch'].join(',')
 }
 function laneEnv(lane: Lane): Record<string, string> {
   const keep = ['PATH', 'LANG', 'LC_ALL', 'TERM', 'XDG_RUNTIME_DIR', 'USER', 'LOGNAME', 'SHELL']
