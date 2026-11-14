@@ -122,6 +122,34 @@ def load_key():
     return None
 
 
+def real_now(d):
+    """The real time. The lab's clock shim shifts time.time() (and Date, `date`); a file's mtime is the kernel's own clock, which it does
+    not touch (the same probe as lanes-triage.ts realNowMs). Falls back to time.time()."""
+    try:
+        p = os.path.join(d, '.clock-probe')
+        with open(p, 'w') as f:
+            f.write('x')
+        return os.stat(p).st_mtime
+    except OSError:
+        return time.time()
+
+
+def iso_utc(sec):
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(sec)) + '.%03dZ' % int((sec % 1) * 1000)
+
+
+def jev_log(d, site, question, inputs, answer, p, ms, err):
+    """One line in <run dir>/jev-calls.jsonl, in the shape of lanes-triage.ts jevLog: ts (real), sim (this process's clock), site, question,
+    inputs, answer, p, ms, err. The lab's collect_logs.py passes the file through. Never raises."""
+    try:
+        rec = {'ts': iso_utc(real_now(d)), 'sim': iso_utc(time.time()), 'site': site, 'question': question, 'inputs': inputs,
+               'answer': answer, 'p': p, 'ms': ms, 'err': err}
+        with open(os.path.join(d, 'jev-calls.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def full_items(text):
     """[(HH:MM, who, the whole line text)] for the lane-handled lines: what Jev reads (lane_items cuts `what` to 60 chars)."""
     out = []
@@ -132,12 +160,18 @@ def full_items(text):
     return out
 
 
-def jev_relations(reply, items):
-    """{index: (relation, confidence)} or None when Jev cannot be asked. Never raises."""
+def jev_relations(reply, items, info=None):
+    """{index: (relation, confidence)} or None when Jev cannot be asked. Never raises.
+    002k: `info` (a dict, optional) is filled with what the call was: question, answers, ms and, when it failed, error (the error text used
+    to be swallowed with the exception). Nothing is filled when there was nothing to ask."""
+    info = info if info is not None else {}
+    if not items:
+        return None
+    t0 = time.monotonic()
     try:
         key = load_key()
-        if not key or not items:
-            return None
+        if not key:
+            raise RuntimeError('no key')
         q = {}
         for i, (t, who, what) in enumerate(items[:25]):
             q[f'I{i}'] = {'type': 'choice',
@@ -145,15 +179,20 @@ def jev_relations(reply, items):
                           'criteria': {'stated': 'The reply reports this entry and what it says agrees with the entry',
                                        'different': 'The reply reports this entry but a fact differs from the entry: a time, a number, a result, or who did it',
                                        'not_mentioned': 'The reply does not report this entry'}}
+        info['question'] = q
         req = urllib.request.Request(API, data=json.dumps({'model': MODEL, 'state': {'reply': reply[:12000]}, 'questions': q}, ensure_ascii=False).encode('utf-8'),
                                      method='POST', headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'User-Agent': 'genesis-summary-gate/1'})
         with urllib.request.urlopen(req, timeout=float(os.environ.get('SUMMARY_GATE_TIMEOUT_S', '8'))) as r:
             a = json.loads(r.read().decode('utf-8')).get('answers')
+        info['answers'] = a if isinstance(a, dict) else None
         if not isinstance(a, dict):
-            return None
+            raise RuntimeError('no answers')
         return {i: ((a.get(f'I{i}') or {}).get('choice'), (a.get(f'I{i}') or {}).get('confidence') or 0) for i in range(len(items[:25]))}
-    except Exception:
+    except Exception as e:
+        info['error'] = f'{type(e).__name__}: {e}'[:200]
         return None
+    finally:
+        info['ms'] = int((time.monotonic() - t0) * 1000)
 
 
 def main():
@@ -171,7 +210,8 @@ def main():
     ld = os.environ.get('LANES_DIR') or os.path.join(p.get('cwd') or os.getcwd(), '.lanes')
     d = os.path.join(ld, 'run')
     if JEV:
-        rel = jev_relations(reply, full_items(text))
+        info = {}
+        rel = jev_relations(reply, full_items(text), info)
         if rel is not None and len(rel) == len(items):
             # stated without its time = not missing; stated with a different fact = inconsistent; unsure = the HH:MM test stands
             missing = [it for i, it in enumerate(items) if it[0] not in reply and not (rel[i][0] == 'stated' and rel[i][1] >= STATED_CONF)]
@@ -180,9 +220,14 @@ def main():
             with open(os.path.join(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate.jsonl'), 'a', encoding='utf-8') as f:
                 f.write(json.dumps({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'session': p.get('session_id', ''), 'items': len(items), 'jev': rel is not None,
                                     'relations': None if rel is None else [[items[i][0], rel[i][0], rel[i][1], items[i][0] in reply] for i in range(len(items)) if i in rel],
-                                    'missing': [it[0] for it in missing], 'different': [it[0] for it in different]}, ensure_ascii=False) + '\n')
+                                    'missing': [it[0] for it in missing], 'different': [it[0] for it in different],
+                                    'ms': info.get('ms'), **({'error': info['error']} if info.get('error') else {})}, ensure_ascii=False) + '\n')
         except OSError:
             pass
+        if 'ms' in info:                                  # 002k: the call is in the unified log too (p = the highest "different" confidence)
+            diff = [c for (r, c) in (rel or {}).values() if r == 'different']
+            jev_log(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate', info.get('question'),
+                    {'session': p.get('session_id', ''), 'items': len(items), 'reply': reply[:120]}, info.get('answers'), max(diff) if diff else None, info['ms'], info.get('error'))
     if not missing and not different:
         return
     sp = os.path.join(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate.json')

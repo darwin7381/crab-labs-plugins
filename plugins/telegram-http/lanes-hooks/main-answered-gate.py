@@ -56,6 +56,34 @@ def load_key():
     return None
 
 
+def real_now(d):
+    """The real time. The lab's clock shim shifts time.time() (and Date, `date`); a file's mtime is the kernel's own clock, which it does
+    not touch (the same probe as lanes-triage.ts realNowMs). Falls back to time.time()."""
+    try:
+        p = os.path.join(d, '.clock-probe')
+        with open(p, 'w') as f:
+            f.write('x')
+        return os.stat(p).st_mtime
+    except OSError:
+        return time.time()
+
+
+def iso_utc(sec):
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(sec)) + '.%03dZ' % int((sec % 1) * 1000)
+
+
+def jev_log(d, site, question, inputs, answer, p, ms, err):
+    """One line in <run dir>/jev-calls.jsonl, in the shape of lanes-triage.ts jevLog: ts (real), sim (this process's clock), site, question,
+    inputs, answer, p, ms, err. The lab's collect_logs.py passes the file through. Never raises."""
+    try:
+        rec = {'ts': iso_utc(real_now(d)), 'sim': iso_utc(time.time()), 'site': site, 'question': question, 'inputs': inputs,
+               'answer': answer, 'p': p, 'ms': ms, 'err': err}
+        with open(os.path.join(d, 'jev-calls.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def tail(path):
     try:
         size = os.path.getsize(path)
@@ -115,19 +143,32 @@ def turn(path):
     return msgs, outs
 
 
+CALL = {}                                          # 002k: what the last Jev call was (question, answers, ms, error), for the logs
+
+
 def ask(state, questions):
-    key = load_key()
-    if not key:
-        raise RuntimeError('no key')
-    req = urllib.request.Request(API, data=json.dumps({'model': MODEL, 'state': state, 'questions': questions}, ensure_ascii=False).encode('utf-8'),
-                                 method='POST', headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json',
-                                                         'User-Agent': 'genesis-answered-gate/1'})
-    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
-        body = r.read().decode('utf-8')
-    a = json.loads(body).get('answers')            # an HTML page (blocked request) fails here: treated as a failure
-    if not isinstance(a, dict):
-        raise RuntimeError('no answers')
-    return a
+    t0 = time.monotonic()
+    CALL.clear()
+    CALL['question'] = questions
+    try:
+        key = load_key()
+        if not key:
+            raise RuntimeError('no key')
+        req = urllib.request.Request(API, data=json.dumps({'model': MODEL, 'state': state, 'questions': questions}, ensure_ascii=False).encode('utf-8'),
+                                     method='POST', headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json',
+                                                             'User-Agent': 'genesis-answered-gate/1'})
+        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+            body = r.read().decode('utf-8')
+        a = json.loads(body).get('answers')            # an HTML page (blocked request) fails here: treated as a failure
+        CALL['answers'] = a if isinstance(a, dict) else None
+        if not isinstance(a, dict):
+            raise RuntimeError('no answers')
+        return a
+    except Exception as e:
+        CALL['error'] = f'{type(e).__name__}: {e}'[:200]
+        raise
+    finally:
+        CALL['ms'] = int((time.monotonic() - t0) * 1000)
 
 
 def lanes_run_dir(payload):
@@ -199,11 +240,17 @@ def main():
     msgs, outs = turn(p.get('transcript_path') or '')
     if len(msgs) < 2:                                   # a turn that took in one message is not checked
         return
+    def log_call():                                      # 002k: the call, when there was one, in the unified log too
+        if 'ms' in CALL:
+            jev_log(d, 'answered-gate', CALL.get('question'), {'session': sid, 'messages': [m['mid'] for m in msgs], 'outputs': len(outs)},
+                    CALL.get('answers'), None, CALL['ms'], CALL.get('error'))
     try:
         verdict, _raw = judge(msgs, outs)
     except Exception as e:                               # a failed call is an error, never a verdict
-        record(d, {'session': sid, 'error': f'{type(e).__name__}: {e}'[:200], 'messages': [m['mid'] for m in msgs]})
+        record(d, {'session': sid, 'error': f'{type(e).__name__}: {e}'[:200], 'ms': CALL.get('ms'), 'messages': [m['mid'] for m in msgs]})
+        log_call()
         return
+    log_call()
     sp = os.path.join(d, 'answered-gate.json')
     try:
         st = json.load(open(sp, encoding='utf-8'))
@@ -211,7 +258,7 @@ def main():
         st = {}
     missed = [m for m in msgs if verdict.get(m['mid']) == 'not_addressed' and f"{sid}:{m['mid']}" not in st]
     mode = os.environ.get('ANSWERED_GATE_MODE', 'enforce')
-    record(d, {'session': sid, 'mode': mode, 'outputs': len(outs), 'blocked': [m['mid'] for m in missed] if mode != 'shadow' else [],
+    record(d, {'session': sid, 'mode': mode, 'outputs': len(outs), 'ms': CALL.get('ms'), 'blocked': [m['mid'] for m in missed] if mode != 'shadow' else [],
                'messages': [{'mid': m['mid'], 'kind': m['kind'], 'absorbed': bool(m.get('absorbed')), 'verdict': verdict.get(m['mid']), 'p': m.get('p')} for m in msgs]})
     if not missed or mode == 'shadow':
         return
