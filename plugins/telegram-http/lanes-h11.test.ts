@@ -5,6 +5,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync } fro
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { isWakeEntry } from './lanes-digest.ts'
+process.env.LANES_FLOOD_CONTROL = '0'                                      // this file sends many new threads from one peer: the flood gate (H14) is not what it tests
 process.env.LANES_THREAD_BUDGET = '250000'                                   // read once at import: set it for this instance only
 const L = await import('./lanes.ts?h11-test') as typeof import('./lanes.ts')
 delete process.env.LANES_THREAD_BUDGET
@@ -38,7 +39,7 @@ else:
 `)
 chmodSync(bin, 0o755)
 const restore = L.__setClaudeBin(bin)
-afterAll(() => L.__setClaudeBin(restore))
+afterAll(() => { L.__setClaudeBin(restore); delete process.env.LANES_FLOOD_CONTROL })
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve'], sendBot: async () => 1, joeyChatId: () => '1' } as any)
 L.__setMainConnected('mcp-main')
 const st = L.__lanesState()

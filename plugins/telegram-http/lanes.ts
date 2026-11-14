@@ -179,6 +179,7 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(() => { void digestTick() }, 10_000).unref()
     setInterval(handoffTick, 10_000).unref()
     setInterval(promiseTick, 10_000).unref()
+    setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
     setInterval(mainWallTick, 15_000).unref()       // 002j: a main behind the model wall (its own transcript says so)
     setInterval(mainStuckTick, 15_000).unref()      // 002k: a main sitting in one tool call (design/stability SR3)
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
@@ -629,7 +630,13 @@ type State = {
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
   main_deaf?: { baseline: number; at: string }                         // 002k (G16b): the main was told to be deaf for the stretch of silence after this assistant record
   main_commitments?: Record<string, MainCommitment>                    // 002k (G10): what the main promised with its commitment tool (id -> state)
+  flood?: Record<string, PeerFlood>                                    // 002k (H14): per-peer admission state, by peer name
+  holds?: Record<string, PeerHold>                                     // 002k (H14): peers whose events are ledger-only (by the main or by Joey)
 }
+/** 002k (H14): a peer's admission state: a token bucket of new threads, the tokens its lane runs spent lately, and the flood episode in progress */
+type PeerFlood = { bucket: number; bucket_at: number; usage: Array<[number, number]>; admits?: number[]
+  episode?: { start: string; last_at: number; count: number; first: string; last: string; samples: string[]; answered: number; reasons: Record<string, number>; replied_at: number } }
+type PeerHold = { peer: string; since: string; until: number | null; reason: string; by: string; count: number; first?: string; last?: string; samples: string[] }
 /** 002k (G10): a promise the main recorded with its own commitment tool. With a due time it rings Joey once when it is past due and not marked done. */
 type MainCommitment = { id: string; who: string; what: string; by: string; due: number | null; created: string; thread: string | null
   state: 'open' | 'overdue' | 'done'; rung?: string; done?: string }
@@ -775,6 +782,17 @@ function matches(r: Rule, ev: InEvent, cfg: RouterCfg): boolean {
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
   const cfg = routerCfg()
+  // 002k (H14, H13): the peer's hold and the flood gate come first: before the rules, before any Jev screen, with no model. An event over the limit gets no lane.
+  if (D.role === 'tg' && S) {
+    const g = peerGate(ev)
+    if (g) {
+      appendJsonl('routing.jsonl', { event: ev.id, source: ev.source, from: ev.from, text: ev.text.slice(0, 100), rule: g.rule, target: 'ledger', lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note,
+        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null })
+      logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: g.rule, target: 'ledger', lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
+      D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${g.rule} → ledger — ${g.note}`)
+      return { rule: g.rule, target: 'ledger', note: g.note }
+    }
+  }
   let d: Decision = { rule: 'none', target: 'main' }
   // 002k: the master switch (design/stability SR11, plan/decisions 「總開關關掉，就回到今天的樣子」). Off = today's single-session
   // behaviour: every event goes to the main, no lane is started. Lanes already running finish their event and report.
@@ -1013,6 +1031,143 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
     default:
       return { ...base, target: 'main', note: `unknown target ${r.to} → main` }
   }
+}
+
+// ------------------------------------------------------------------ 002k (H14, H13): flood control and the peer hold
+// 002j group H (H06): one peer (Cain) sent 200 messages: 200 lanes, 61.8M tokens against a 1.5M budget, queue waits up to 834 s, Joey was never told, and the
+// main had told Joey it would not answer Cain while 192 lane replies went out anyway. In the router, before any model:
+//  - admission per peer: a token bucket of LANES_PEER_NEW_PER_MIN (5) NEW threads a minute, a cap of LANES_PEER_MAX_OPEN (8) on the peer's queued and running
+//    events, and a budget of LANES_PEER_BUDGET (1.5M) input-side tokens over LANES_PEER_BUDGET_WINDOW_MIN (60) minutes, summed over all the peer's threads;
+//  - an event over a limit gets NO lane (so no backstop line either). It is merged into the flood episode of the peer: a `flag` ledger row and ONE push to Joey
+//    when the flood starts; when the peer has been quiet for LANES_FLOOD_QUIET_S (120 s) ONE ledger row `peer_flood <peer>` (count, window, first and last id,
+//    3 sample texts) and ONE silent summary to Joey (count, answered, ledger-only, tokens avoided). The peer gets at most one rate-limit reply per
+//    LANES_FLOOD_REPLY_WINDOW_S (60 s), marked no_reply;
+//  - a hold (the main's peer_hold tool, Joey's /lanes hold <peer>) makes ALL of a peer's events ledger-only until it runs out or is released; it shows in the
+//    digest. LANES_FLOOD_CONTROL=0 switches the admission limits off (a hold still holds).
+const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
+const floodOn = (): boolean => process.env.LANES_FLOOD_CONTROL !== '0'
+const AUTOMATED_SENDERS = ['scheduler', 'alert-dispatcher', 'main']
+function isPeerEvent(ev: InEvent): boolean {
+  return ev.source === 'mesh' && !ev.synthetic && !ev.fanout && !!ev.from && !AUTOMATED_SENDERS.includes(ev.from) && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())
+}
+function peerTokens(f: PeerFlood, now: number): number {
+  const win = num('LANES_PEER_BUDGET_WINDOW_MIN', 60) * 60_000
+  f.usage = f.usage.filter(([t]) => now - t < win)
+  return f.usage.reduce((a, [, n]) => a + n, 0)
+}
+/** a lane run of one of the peer's threads ended: its tokens count against the peer's budget */
+export const __noteFloodTokens = (peer: string, tokens: number): void => noteFloodTokens(peer, tokens)     // tests only
+function noteFloodTokens(peer: string, tokens: number): void {
+  if (!peer || !tokens) return
+  S.flood ??= {}
+  const f = (S.flood[peer] ??= { bucket: num('LANES_PEER_NEW_PER_MIN', 5), bucket_at: Date.now(), usage: [] })
+  f.usage.push([Date.now(), tokens]); peerTokens(f, Date.now())
+}
+const tokensPerEvent = (peer: string): number => {
+  let tok = 0, runs = 0
+  for (const t of Object.values(S.threads)) if (t.peer === peer && t.lane && S.lanes[t.lane]) { tok += S.lanes[t.lane].tokens_in; runs += S.lanes[t.lane].runs }
+  return runs && tok ? Math.round(tok / runs) : num('LANES_FLOOD_TOKENS_PER_EVENT', 300_000)
+}
+const sampleOf = (arr: string[], ev: InEvent): void => { if (arr.length < 3) arr.push(ev.text.replace(/\s+/g, ' ').trim().slice(0, 160)) }
+function endHold(peer: string, how: string): PeerHold | null {
+  const h = S.holds?.[peer]
+  if (!h) return null
+  delete S.holds![peer]; saveState()
+  ledger({ lane: 'router', kind: 'fyi', notify_main: true,
+    text: `peer_hold ${peer} 結束（${how}）：暫停期間擋下 ${h.count} 則${h.first ? `（第一則 ${h.first}、最後一則 ${h.last}）` : ''}；樣本：${h.samples.join(' ｜ ') || '（沒有）'}。原因：${h.reason}`,
+    refs: { peer_hold: peer, ended: how, count: h.count, first: h.first ?? null, last: h.last ?? null, samples: h.samples, by: h.by } })
+  logos('lane.peer_hold_end', { peer, how, count: h.count })
+  return h
+}
+function startHold(peer: string, until: number | null, reason: string, by: string): PeerHold {
+  S.holds ??= {}
+  const h: PeerHold = { peer, since: nowIso(), until, reason, by, count: 0, samples: [] }
+  S.holds[peer] = h; saveState()
+  ledger({ lane: by === 'main' ? 'main' : 'router', kind: 'action', notify_main: true,
+    text: `${by === 'main' ? '主線' : 'Joey'}暫停 ${peer} 的所有事件（只進帳本，不開車道、不回覆）：${reason}（${until ? `到 ${stamp(new Date(until).toISOString())}` : '直到解除'}）`,
+    refs: { peer_hold: peer, by, until: until ? new Date(until).toISOString() : null, reason } })
+  logos('lane.peer_hold', { peer, by, until: until ? new Date(until).toISOString() : null, reason })
+  return h
+}
+export function holdLines(): string[] {
+  return Object.values(S?.holds ?? {}).map(h => `• ${h.peer}：${h.reason}（${stamp(h.since)} 起，${h.by === 'main' ? '主線' : 'Joey'}；${h.until ? `到 ${stamp(new Date(h.until).toISOString())}` : '直到解除'}；已擋下 ${h.count} 則）`)
+}
+function peerGate(ev: InEvent): { rule: string; note: string } | null {
+  if (!isPeerEvent(ev)) return null
+  const peer = ev.from.toLowerCase(), now = Date.now()
+  const h = S.holds?.[peer]
+  if (h) {
+    if (h.until != null && h.until <= now) endHold(peer, '時間到')
+    else {
+      h.count++; h.first ??= ev.id; h.last = ev.id; sampleOf(h.samples, ev)
+      if (h.count === 1) ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'fyi', notify_main: false, text: `${peer} 的第一則被暫停擋下的訊息（之後只計數，結束時一筆摘要）：${ev.text.slice(0, 160)}`, refs: { peer_hold: peer, held: true, btcc_msg_id: ev.btcc_msg_id ?? null } })
+      saveState()
+      return { rule: 'peer-hold', note: `${peer} is on hold (${h.reason}): ledger only` }
+    }
+  }
+  if (!floodOn()) return null
+  S.flood ??= {}
+  const perMin = num('LANES_PEER_NEW_PER_MIN', 5), maxOpen = num('LANES_PEER_MAX_OPEN', 8), budget = num('LANES_PEER_BUDGET', 1_500_000)
+  const f = (S.flood[peer] ??= { bucket: perMin, bucket_at: now, usage: [] })
+  f.bucket = Math.min(perMin, f.bucket + ((now - f.bucket_at) / 60_000) * perMin); f.bucket_at = now
+  const open = [...queue.values()].filter(i => (i.state === 'queued' || i.state === 'leased') && i.ev.source === 'mesh' && String(i.ev.from).toLowerCase() === peer).length
+  const newThread = !threadOwnerFor(ev)
+  const used = peerTokens(f, now)
+  const reason = open >= maxOpen ? 'queue' : used >= budget ? 'budget' : newThread && f.bucket < 1 ? 'rate' : null
+  const ep = f.episode
+  if (!reason) {
+    if (newThread) f.bucket -= 1
+    f.admits = [...(f.admits ?? []).filter(t => now - t < 120_000), now]
+    if (ep) { ep.answered++; ep.last_at = now }
+    return null
+  }
+  const limit = reason === 'queue' ? `同時排隊與執行的事件已有 ${open} 件（上限 ${maxOpen}）` : reason === 'budget' ? `這個同事的車道在最近 ${num('LANES_PEER_BUDGET_WINDOW_MIN', 60)} 分鐘用了 ${used} token（預算 ${budget}）` : `每分鐘新開的對話超過 ${perMin} 個`
+  let e = f.episode
+  if (!e) {
+    e = f.episode = { start: nowIso(), last_at: now, count: 0, first: ev.id, last: ev.id, samples: [], answered: (f.admits ?? []).filter(t => now - t < 60_000).length, reasons: {}, replied_at: 0 }   // answered: the burst's events that did get a lane
+    const text = `〔流量管制〕${peer} 在短時間內送來太多訊息（${limit}）。之後超過的訊息不再開車道，只合併記進帳本；它安靜下來之後我再給你一則摘要。`
+    ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'action', notify_main: false, text: `peer_flood ${peer} 開始：${limit}`, refs: { flag: 'peer-flood', peer, phase: 'start', reason } })
+    logos('lane.peer_flood', { peer, phase: 'start', reason, open, used })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'peer-flood', message_id: id }))
+  }
+  e.count++; e.last = ev.id; e.last_at = now; e.reasons[reason] = (e.reasons[reason] ?? 0) + 1; sampleOf(e.samples, ev)
+  if (now - e.replied_at >= num('LANES_FLOOD_REPLY_WINDOW_S', 60) * 1000) {
+    e.replied_at = now
+    void laneMeshSend({ to: peer, no_reply: true, text: `我這邊收到你太多訊息了（${limit}），先不處理後面的。請稍後再傳，或把要點合成一則。這是系統自動回覆，不用回。` }).catch(() => {})
+  }
+  saveState()
+  return { rule: 'peer-flood', note: `${peer}: over the limit (${reason}); merged into the flood record, no lane` }
+}
+/** a flood episode whose peer has been quiet is closed (one ledger row, one silent summary); a hold whose time is up ends */
+export function floodTick(now = Date.now()): void {
+  if (!S) return
+  for (const [peer, f] of Object.entries(S.flood ?? {})) {
+    const e = f.episode
+    if (!e || now - e.last_at < num('LANES_FLOOD_QUIET_S', 120) * 1000) continue
+    delete f.episode
+    const avoided = e.count * tokensPerEvent(peer), windowS = Math.max(1, Math.round((e.last_at - Date.parse(e.start)) / 1000))
+    ledger({ lane: 'router', kind: 'fyi', notify_main: true,
+      text: `peer_flood ${peer}：${e.count} 則超過限制的訊息被合併（${windowS} 秒內，${stamp(e.start)} 起），第一則 ${e.first}、最後一則 ${e.last}；樣本：${e.samples.join(' ｜ ')}。同一段時間有 ${e.answered} 則照常開了車道，${e.count} 則只進帳本，估計省下約 ${avoided} token。`,
+      refs: { peer_flood: peer, count: e.count, window_s: windowS, start: e.start, first: e.first, last: e.last, samples: e.samples, answered: e.answered, ledger_only: e.count, tokens_avoided: avoided, reasons: e.reasons } })
+    logos('lane.peer_flood', { peer, phase: 'end', count: e.count, answered: e.answered, tokens_avoided: avoided })
+    void pushJoey(undefined, `〔流量管制結束〕${peer} 安靜下來了：${windowS} 秒內共 ${e.count + e.answered} 則，${e.answered} 則開了車道回覆，${e.count} 則只進帳本，估計省下約 ${avoided} token。細節在帳本 peer_flood ${peer}。`, true)
+  }
+  for (const h of Object.values(S.holds ?? {})) if (h.until != null && h.until <= now) endHold(h.peer, '時間到')
+  saveState()
+}
+/** main tool peer_hold */
+function peerHoldTool(a: any): string {
+  const peer = String(a?.peer ?? '').trim().toLowerCase(), reason = String(a?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+  if (!peer) return 'peer_hold refused: peer is required (the name of the agent).'
+  if (!reason) return 'peer_hold refused: reason is required (one line: why).'
+  const lift = a?.minutes === 0 || a?.minutes === '0'
+  const forever = a?.until_lifted === true || a?.minutes === 'until_lifted'
+  const mins = Number(a?.minutes)
+  if (lift) { const h = endHold(peer, `主線解除：${reason}`); return h ? `hold on ${peer} lifted; it held ${h.count} event(s).` : `${peer} was not on hold.` }
+  if (!forever && !(Number.isFinite(mins) && mins > 0)) return 'peer_hold refused: minutes must be a number above 0, or until_lifted (true) to hold until it is lifted (minutes 0 lifts).'
+  if (!(D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(peer)) return `peer_hold refused: ${peer} is not a known agent.`
+  startHold(peer, forever ? null : Date.now() + mins * 60_000, reason, 'main')
+  return `${peer} is on hold ${forever ? 'until lifted (peer_hold with minutes 0, or Joey: /lanes release ' + peer + ')' : `for ${mins} minute(s)`}: all its events go to the ledger only; no lane, no reply. It shows in the digest.`
 }
 
 // ------------------------------------------------------------------ 002k (B12): alert dedupe
@@ -1915,6 +2070,7 @@ function startRun(it: QItem): void {
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     if (S.threads[lane.thread]) S.threads[lane.thread].tokens += tin
+    noteFloodTokens(S.threads[lane.thread]?.peer ?? '', tin)         // 002k (H14): the peer's budget
     releaseClaims(lane.id, 'run ended')
     const names = tools.map(t => t.name.replace(/^mcp__lane__/, 'lane:'))
     const closers = tools.filter(t => ['mcp__lane__reply_agent', 'mcp__lane__receipt', 'mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main',
@@ -2838,6 +2994,8 @@ export function mainToolDefs(): any[] {
       inputSchema: { type: 'object', properties: { proposal_id: { type: 'string', description: 'the id of the proposal, e.g. mp-1a2b3c' }, decision: { type: 'string', enum: ['accept', 'rewrite', 'veto'] }, reason: { type: 'string', description: 'why (one line)' }, text: { type: 'string', description: 'rewrite: the text to write; accept: optional, replaces the proposal text' } }, required: ['proposal_id', 'decision', 'reason'] } },
     { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer, and returns its id. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those. With `due` (an ISO time) this is also a durable reminder: when it is past due and you have not marked it done (commitment_done), Joey is rung once.',
       inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when, in words (e.g. 明天 10:00 前); filled from `due` when left empty' }, due: { type: 'string', description: 'optional: the due time as an ISO time (2026-11-15T10:00:00+08:00; without a zone it is read as the lab\'s local time). Past this time, and not done, Joey is rung once.' } }, required: ['who', 'what'] } },
+    { name: 'peer_hold', description: '[lanes · main only] Put a peer agent on hold: ALL its events go to the ledger only (no lane, no reply, nothing woken) until the time runs out or the hold is lifted. Use it when you have decided not to answer an agent. The hold shows in the digest. minutes: how long; until_lifted: true to hold until it is lifted (peer_hold again with minutes 0, or Joey /lanes release <peer>).',
+      inputSchema: { type: 'object', properties: { peer: { type: 'string', description: 'the agent name, e.g. cain' }, minutes: { type: 'number', description: 'minutes to hold; 0 lifts the hold' }, until_lifted: { type: 'boolean', description: 'true: hold until it is lifted' }, reason: { type: 'string', description: 'why (one line)' } }, required: ['peer', 'reason'] } },
     { name: 'commitment_done', description: '[lanes · main only] Mark a promise of yours done (the id commitment returned). A done promise is not rung for.',
       inputSchema: { type: 'object', properties: { commitment_id: { type: 'string' }, note: { type: 'string', description: 'what was done (one line, optional)' } }, required: ['commitment_id'] } },
     { name: 'lane_close', description: '[lanes · main only] Close a lane: it gets no further events (its thread falls back to a fresh reflex lane / main).', inputSchema: { type: 'object', properties: { lane_id: { type: 'string' } }, required: ['lane_id'] } },
@@ -2848,7 +3006,7 @@ export function mainToolDefs(): any[] {
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'peer_hold'].includes(name) }
 
 async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   let topic: number | undefined
@@ -2946,6 +3104,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     }
     case 'ledger_query': return ledgerQueryTool(a)
     case 'memory_decide': return memoryDecide(a)                // 002k (D1)
+    case 'peer_hold': return peerHoldTool(a)                    // 002k (H14)
     case 'commitment': {                                       // 002k (C1, G10)
       const chk = checkCommitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
@@ -3152,7 +3311,22 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
     logos('lane.command', { cmd: 'notify', by: who, profile: want })
     return want === 'default' ? '通知改成全部照常推播。' : '通知改成分級：例行與同事的結果靜音，嚴重警報與要你決定的事照常推播。'
   }
-  return '用法：/lanes（清單）、/lanes close <車道>、/lanes off、/lanes on、/lanes notify default|tiered'
+  if (sub === 'hold' || sub === 'release') {                // 002k (H14)
+    const peer = (args[1] ?? '').toLowerCase()
+    if (!peer) return `用法：/lanes hold <同事> [分鐘]（暫停它的所有事件：只進帳本，不開車道、不回覆）、/lanes release <同事>。`
+    if (sub === 'release') {
+      const h = endHold(peer, `Joey 解除（${who}）`)
+      logos('lane.command', { cmd: 'release', by: who, peer, held: h?.count ?? null })
+      return h ? `已解除 ${peer} 的暫停；暫停期間擋下 ${h.count} 則，摘要在帳本。` : `${peer} 沒有被暫停。`
+    }
+    if (!(D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(peer)) return `不認得這個同事：${peer}。`
+    const mins = args[2] ? Number(args[2]) : 0
+    if (args[2] && !(Number.isFinite(mins) && mins > 0)) return '分鐘要是大於 0 的數字；不寫就是直到 /lanes release。'
+    startHold(peer, mins ? Date.now() + mins * 60_000 : null, `Joey 用 /lanes hold 暫停（${who}）`, 'joey')
+    logos('lane.command', { cmd: 'hold', by: who, peer, minutes: mins || null })
+    return `已暫停 ${peer}：它的所有事件只進帳本，不開車道、不回覆${mins ? `，${mins} 分鐘後自動解除` : '，直到你用 /lanes release ' + peer}。主線下一次摘要會看到。`
+  }
+  return '用法：/lanes（清單）、/lanes close <車道>、/lanes off、/lanes on、/lanes notify default|tiered、/lanes hold <同事> [分鐘]、/lanes release <同事>'
 }
 
 // ================================================================== digest (tg role) — 002b
@@ -3177,7 +3351,7 @@ function planNow(onlyIfWake: boolean, commit: boolean): DigestTake | null {
   const hold = onlyIfWake ? (r: LedgerRec) => !!r.lane && running.has(r.lane) && Date.now() - Date.parse(r.ts) < WAKE_HOLD_MS : undefined
   const lines = readLedgerLines()
   const reopen = onlyIfWake ? [] : openJoeyProposals(lines.map(parseLedgerLine).filter((r): r is LedgerRec => !!r))      // 002k (D1)
-  const plan = planDigest(cur, lines, Date.now(), { id: `dg-${Date.now()}-${shortId()}`, onlyIfWake, retryMs: DIGEST_RETRY_MS, hold, reopen })
+  const plan = planDigest(cur, lines, Date.now(), { id: `dg-${Date.now()}-${shortId()}`, onlyIfWake, retryMs: DIGEST_RETRY_MS, hold, reopen, holds: holdLines() })
   if (commit || !plan.take) persistCursor(cur, plan.cursor)
   return plan.take
 }

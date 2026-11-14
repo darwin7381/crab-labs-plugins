@@ -204,7 +204,7 @@ export const DIGEST_MAX_ROUTINE = 10
 /** The structured digest of the ledger records in a range (all of them; only threads with a pending
  *  notify_main entry appear). Escalation blocks first and never dropped, then other threads that carry a
  *  promise / need, then routine threads at ONE line each. null = nothing pending. */
-export function renderDigest(recs: LedgerRec[], reopen: LedgerRec[] = []): RenderedDigest | null {
+export function renderDigest(recs: LedgerRec[], reopen: LedgerRec[] = [], holds: string[] = []): RenderedDigest | null {
   const views = groupByThread(recs)
   if (!views.length && !reopen.length) return null
   const items = recs.filter(r => r.notify_main).length + reopen.length
@@ -223,6 +223,7 @@ export function renderDigest(recs: LedgerRec[], reopen: LedgerRec[] = []): Rende
   if (escB.length && (shownHeavy.length || shownLight.length)) lines.push('〔以下只是讓你知道：不是交給你的事，車道已經處理或已經通知 Joey，回報 Joey 時不要再轉述〕')
   for (const b of [...shownHeavy, ...shownLight]) lines.push(...b.lines)
   if (hidden > 0) lines.push(`另有 ${hidden} 條線沒列出。`)
+  if (holds.length) lines.push('〔暫停中的同事（這些同事的訊息只進帳本，不開車道；用 /lanes release <名字> 或 peer_hold 解除）〕', ...holds)     // 002k (H14)
   if (reopen.length) {                                   // 002k (D1): what Joey said and is still undecided is listed again, every digest, until a decision exists
     lines.push(`〔還沒決定的記憶提案（Joey 說的話；用 memory_decide 決定：accept / rewrite / veto。決定之前，每份摘要都會再列一次）〕`)
     for (const r of reopen) lines.push(`• ${r.refs?.proposal_id ?? '-'}｜${laneName(r.lane)}｜${stamp(r.ts)}｜${clip(r.text.split('\n〔Jev')[0], 240)}`)
@@ -251,7 +252,7 @@ export const DIGEST_RETRY_MS = 120_000
  *  `hold(rec)` (wake tick only) = a wake entry whose lane run is still going does not wake yet: the run is about to
  *  hand in its closing report, and the wake should carry it. */
 export function planDigest(cur: DigestCursor, lines: string[], now: number,
-  o: { id: string; onlyIfWake?: boolean; retryMs?: number; hold?: (r: LedgerRec) => boolean; reopen?: LedgerRec[] }): { cursor: DigestCursor; take: DigestTake | null } {
+  o: { id: string; onlyIfWake?: boolean; retryMs?: number; hold?: (r: LedgerRec) => boolean; reopen?: LedgerRec[]; holds?: string[] }): { cursor: DigestCursor; take: DigestTake | null } {
   const retry = o.retryMs ?? DIGEST_RETRY_MS
   const inf = cur.inflight
   const stale = !!inf && now - inf.taken >= retry
@@ -268,7 +269,7 @@ export function planDigest(cur: DigestCursor, lines: string[], now: number,
   }
   const wake = recs.some(r => isWakeEntry(r) && !(o.hold && o.hold(r)))
   if (o.onlyIfWake && !wake) return { cursor: cur, take: null }
-  const d = renderDigest(recs, reopen)
+  const d = renderDigest(recs, reopen, o.onlyIfWake ? [] : (o.holds ?? []))
   if (!d) return { cursor: cur, take: null }
   // `from` keeps the oldest range not yet confirmed, so a failed hand-over re-takes everything from there
   const from = inf ? Math.min(inf.from, start) : start
