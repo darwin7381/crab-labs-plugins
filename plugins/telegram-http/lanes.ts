@@ -87,9 +87,12 @@ const ARRIVE_GRACE_MS = Number(process.env.LANES_ARRIVE_GRACE_MS ?? 20_000)
 // 002i: a critical alert reaches Joey within this long whatever its lane is doing. A lane that reports in time is the one
 // that rings (as before); when it has not, the router rings with the alert itself and the lane's findings follow quietly.
 // (T6-R 1.3 on 002h: the lane restarted the service, waited for it to settle and told Joey 6 minutes after the alert.)
-let CRITICAL_DEADLINE_MS = Number(process.env.LANES_CRITICAL_DEADLINE_MS ?? 60_000)
+// 002k (E1, 002j group E): 45 s, not 60. The promise to Joey is "within 60 s of the event", and a ring at exactly 60 s after enqueue is late by
+// the jitter (13 ms late in the 002j play): the ring has to come BEFORE the promise, not on it. Env LANES_CRITICAL_DEADLINE_MS overrides.
+let CRITICAL_DEADLINE_MS = Number(process.env.LANES_CRITICAL_DEADLINE_MS ?? 45_000)
 /** tests only */
 export const __setCriticalDeadline = (ms: number): void => { CRITICAL_DEADLINE_MS = ms }
+export const criticalDeadlineMs = (): number => CRITICAL_DEADLINE_MS
 const LOGOS_URL = (process.env.GENESIS_LOGOS_URL ?? '').replace(/\/+$/, '')
 
 export type Notif = { method: string; params: unknown }
