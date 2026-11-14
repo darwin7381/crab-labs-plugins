@@ -954,7 +954,9 @@ function threadSummary(thread: string): string {
 // ================================================================== lane queue + runner
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done' | 'failed'; lease_until: number; attempts: number; priority: number; summary?: string; enqueued: string
   /** 002f: the process and run that hold the lease, so a restarted daemon can tell what it left behind */
-  pid?: number; run?: string }
+  pid?: number; run?: string
+  /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
+  extra?: InEvent[] }
 const queue = new Map<string, QItem>()          // event id → item
 const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval> }>()  // lane id → run
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string
@@ -1300,8 +1302,37 @@ function pump(): void {
       startRun(it)
       return
     }
+    coalesce(it, waiting)
     startRun(it)
   }
+}
+// 002k (finding I1 of the first commandment pass, A05: three messages from Eve within 5 s on one thread became three runs and three
+// replies). Messages from the SAME peer that queued for this lane while it was busy go into its next run together: one run, one
+// answer. Only a peer's ordinary mesh messages: a scheduled run, an alert, a critical event, a fan-out part or a system event keeps
+// its own run (each has its own receipt, deadline or result).
+function coalescible(e: InEvent): boolean {
+  return e.source === 'mesh' && !e.synthetic && !e.fanout && !/^\s*\[scheduled\]/.test(e.text) && e.from !== 'alert-dispatcher' && e.from !== 'scheduler' && e.from !== 'main'
+}
+function coalesce(it: QItem, waiting: QItem[]): void {
+  if (!coalescible(it.ev) || it.attempts > 0) return
+  const lane = S.lanes[it.lane]
+  if (!lane || lane.critical) return
+  const more = waiting.filter(o => o !== it && o.lane === it.lane && o.state === 'queued' && o.attempts === 0 && o.ev.from === it.ev.from && coalescible(o.ev))
+  if (!more.length) return
+  it.extra = [...(it.extra ?? []), ...more.map(o => o.ev)]
+  saveQ(it)
+  for (const o of more) {
+    o.state = 'done'; queue.delete(o.ev.id)
+    try { rmSync(qPath(o.ev.id)) } catch {}
+    appendJsonl('routing.jsonl', { event: o.ev.id, source: o.ev.source, from: o.ev.from, rule: 'coalesced', target: 'lane', lane: it.lane, note: `handled in the same run as ${it.ev.id}` })
+  }
+  logos('lane.coalesced', { lane: it.lane, event: it.ev.id, with: more.map(o => o.ev.id) })
+}
+function runPrompt(it: QItem): string {
+  if (!it.extra?.length) return renderEvent(it.ev)
+  return [renderEvent(it.ev), '',
+    `〔同一個對話在你上一趟還在跑的時候，${it.ev.from} 又來了 ${it.extra.length} 則。下面一起處理，用一則回覆回答全部（reply_to 用最後一則的編號）。〕`, '',
+    ...it.extra.map(renderEvent)].join('\n')
 }
 /** 002c: start the follow-up lanes whose simulated due time has come (the daemon runs under the simulated clock; the
  *  runner jumps the clock to a due follow-up before the next event). Same thread = same conversation: dispatch() resumes
@@ -1478,7 +1509,7 @@ function startRun(it: QItem): void {
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
   const { resume, args: sess } = sessionArgs(lane)
-  const args = ['-p', renderEvent(it.ev), '--model', MODEL, ...sess]
+  const args = ['-p', runPrompt(it), '--model', MODEL, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt', identityCard(lane, it),
     '--settings', join(LANES_DIR, 'lane-settings.json'),
