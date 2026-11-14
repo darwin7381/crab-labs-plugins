@@ -142,3 +142,35 @@ export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageR
   } catch {}
   return rec
 }
+
+// ------------------------------------------------------------------ 002k (second batch, C1 C4 C8): narrow questions about one text
+/** One request to Jev with the given state and questions. Never throws: a failed call (no key, HTTP error, an HTML block page, a
+ *  timeout) comes back as `error` and is never an answer. */
+export async function jevAsk(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs = TIMEOUT_MS): Promise<{ answers?: Record<string, any>; error?: string; ms: number }> {
+  const t0 = Date.now()
+  try {
+    const key = loadKey()
+    if (!key) throw new Error('no key')
+    const res = await fetch(api(), { method: 'POST', signal: AbortSignal.timeout(timeoutMs),
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': ua }, body: JSON.stringify({ model: MODEL, state, questions }) })
+    const text = await res.text()
+    let a: any
+    try { a = JSON.parse(text).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
+    if (!res.ok || !a || typeof a !== 'object') throw new Error(`HTTP ${res.status}, no answers`)
+    return { answers: a, ms: Date.now() - t0 }
+  } catch (e: any) {
+    return { error: `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 200), ms: Date.now() - t0 }
+  }
+}
+
+/** C1: does this message say its sender will do or deliver something later? One narrow question; p is Jev's probability. */
+export async function promiseAsk(text: string, to: string, timeoutMs = TIMEOUT_MS): Promise<{ p?: number; error?: string; ms: number }> {
+  const r = await jevAsk(
+    { setting: 'An AI agent sent `message` to another AI agent. `recipient` is a fact established by the system.', message: { recipient: to, text: text.slice(0, 3000) } },
+    { promises: { type: 'noul', instructions: 'Does `message` say that its sender will do or deliver something later?',
+      criteria: { true: 'The sender says it will do, send, decide or answer something later or by a time (a promise or a deadline)', false: 'The message only informs, answers now, refuses, or asks; nothing is promised for later' } } },
+    'genesis-main-commitment/1', timeoutMs)
+  if (r.error || !r.answers) return { error: r.error ?? 'no answers', ms: r.ms }
+  const p = r.answers.promises?.noul
+  return typeof p === 'number' ? { p, ms: r.ms } : { error: 'no probability in the answer', ms: r.ms }
+}

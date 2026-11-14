@@ -25,7 +25,7 @@
  */
 import { lastAssistantFile, openToolCallFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
-import { triageOn, triageShadow, triageAsk, triageRecord, type TriageAsk } from './lanes-triage.ts'
+import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, type TriageAsk } from './lanes-triage.ts'
 import { randomBytes, randomUUID, createHash } from 'crypto'
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, renameSync,
@@ -2453,6 +2453,8 @@ export function mainToolDefs(): any[] {
     { name: 'fan_out', description: '[lanes · main only] Split a task into parts checked in parallel: one lane per part, then one synthesis lane reads all results and delivers ONE conclusion to you. You read one result, not N.', inputSchema: { type: 'object', properties: { tasks: { type: 'array', items: { type: 'string' } }, conclusion: { type: 'string', description: 'what the one conclusion must contain' } }, required: ['tasks', 'conclusion'] } },
     { name: 'curate_memory', description: '[lanes · main only] Hand the memory write right to a curator lane that works through the memory proposals in the ledger. It never deletes what you wrote (it marks 建議刪除 instead) and returns the right when done.', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } },
     { name: 'curate_stop', description: '[lanes · main only] Take the memory write right back from the curator lane now (it stops; unprocessed proposals stay in the ledger).', inputSchema: { type: 'object', properties: {} } },
+    { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those.',
+      inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when (e.g. 明天 10:00 前); leave empty if no time was given' } }, required: ['who', 'what'] } },
     { name: 'lane_close', description: '[lanes · main only] Close a lane: it gets no further events (its thread falls back to a fresh reflex lane / main).', inputSchema: { type: 'object', properties: { lane_id: { type: 'string' } }, required: ['lane_id'] } },
     { name: 'ledger_query', description: LEDGER_QUERY_DESCRIPTION,
       inputSchema: { type: 'object', properties: {
@@ -2461,7 +2463,7 @@ export function mainToolDefs(): any[] {
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment'].includes(name) }
 
 async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   let topic: number | undefined
@@ -2509,6 +2511,13 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       return rows.join('\n') || '(no lanes)'
     }
     case 'ledger_query': return ledgerQueryTool(a)
+    case 'commitment': {                                       // 002k (C1)
+      const chk = checkCommitmentArgs(a)
+      if (!chk.ok) return `commitment refused: ${chk.error}`
+      const where = peerThread(chk.c.who)
+      ledger({ lane: 'main', thread: where.thread, kind: 'commitment', notify_main: false, text: commitmentText(chk.c), refs: { ...chk.c, from: 'main-tool', thread_from: where.from } })
+      return `ledger: commitment recorded (${chk.c.who}: ${chk.c.what}; by ${chk.c.by})`
+    }
     case 'fan_out': {
       const tasks = (Array.isArray(a.tasks) ? a.tasks : []).map((t: unknown) => String(t).trim()).filter(Boolean).slice(0, 8)
       const brief = String(a.conclusion ?? '').trim()
@@ -2834,6 +2843,52 @@ export function threadForReply(replyTo: number | undefined): { thread: string; h
   return replyTo != null ? inboundThreads.get(String(replyTo)) ?? null : null
 }
 
+// ------------------------------------------------------------------ 002k (C1): what the main promises
+// Identity rule 5: what the agent promises is on the record. The lanes' promises were (commitment, or the receipt's promised field);
+// the main's were not: /lanes/outbound wrote only an `action` line for its send_to_agent. After that line Jev is asked ONE narrow
+// question about the sent text: does it say its sender will do or deliver something later? At p >= LANES_MAIN_COMMIT_P (0.7) the daemon
+// writes kind commitment, lane main, refs.auto true. A failed call is an error, never a verdict: nothing is written, and the failure is
+// logged (run/main-commitment.jsonl and the daemon log). LANES_MAIN_COMMITMENTS=0 switches it off (on by default in 002k).
+const MAIN_COMMITMENTS = (): boolean => process.env.LANES_MAIN_COMMITMENTS !== '0'
+const MAIN_COMMIT_P = (): number => Number(process.env.LANES_MAIN_COMMIT_P ?? 0.7)
+const MAIN_COMMIT_DEDUPE_MS = 180_000
+/** The thread a main-to-peer message belongs to, taken from the peer's OPEN request or promise (the send itself carries thread null):
+ *  the thread of the newest open promise the router made to that peer; else of the newest work handed to the main from that peer's
+ *  thread; else the peer's newest live thread. */
+export function peerThread(peer: string, sendThread?: string | null): { thread: string | null; from: string } {
+  if (sendThread) return { thread: sendThread, from: 'send' }
+  const p = String(peer ?? '').toLowerCase()
+  const promise = Object.values(S?.promises ?? {}).filter(x => x.peer === p && x.state !== 'kept' && x.thread).sort((a, b) => b.created - a.created)[0]
+  if (promise) return { thread: promise.thread, from: 'promise' }
+  const handoff = Object.values(S?.handoffs ?? {}).filter(h => h.thread && S.threads[h.thread]?.peer === p).sort((a, b) => b.created - a.created)[0]
+  if (handoff) return { thread: handoff.thread, from: 'handoff' }
+  const th = Object.values(S?.threads ?? {}).filter(t => t.peer === p && !t.stopped).sort((a, b) => b.last.localeCompare(a.last))[0]
+  return th ? { thread: th.id, from: 'peer-thread' } : { thread: null, from: 'none' }
+}
+function logMainCommitment(rec: Record<string, unknown>): void {
+  try { appendFileSync(join(LANES_DIR, 'run', 'main-commitment.jsonl'), JSON.stringify({ ts: nowIso(), ...rec }) + '\n') } catch {}
+}
+export async function mainCommitmentCheck(m: { msgId: unknown; to: string; text: string; thread: { thread: string | null; from: string } }): Promise<'written' | 'no' | 'error' | 'off' | 'dup'> {
+  if (!MAIN_COMMITMENTS()) return 'off'
+  const r = await promiseAsk(m.text, m.to)
+  if (r.error || typeof r.p !== 'number') {
+    D.log('warn', `lanes: main commitment check for the send to ${m.to} failed (${r.error}); nothing written`)
+    logMainCommitment({ to: m.to, btcc_msg_id: m.msgId, error: r.error, ms: r.ms })
+    return 'error'
+  }
+  const hit = r.p >= MAIN_COMMIT_P()
+  // a commitment the main wrote itself with the commitment tool a moment ago is the record: no second one for the same send
+  const own = hit && readLedgerLines().slice(-60).some(l => { try { const x = JSON.parse(l); return x.kind === 'commitment' && x.lane === 'main' && !x.refs?.auto && String(x.refs?.who ?? '').toLowerCase() === m.to.toLowerCase() && Date.now() - Date.parse(x.ts) < MAIN_COMMIT_DEDUPE_MS } catch { return false } })
+  logMainCommitment({ to: m.to, btcc_msg_id: m.msgId, p: r.p, hit, wrote: hit && !own, thread: m.thread.thread, thread_from: m.thread.from, ms: r.ms })
+  if (!hit) return 'no'
+  if (own) return 'dup'
+  const cm = commitmentFromReport(m.text, undefined, m.to) ?? { who: m.to, what: m.text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
+  ledger({ lane: 'main', thread: m.thread.thread, event: `main-send-${m.msgId}`, kind: 'commitment', notify_main: false, text: commitmentText(cm),
+    refs: { ...cm, from: 'main-send', auto: true, p: r.p, btcc_msg_id: m.msgId, thread_from: m.thread.from } })
+  logos('lane.main_commitment', { to: m.to, p: r.p, thread: m.thread.thread, btcc_msg_id: m.msgId })
+  return 'written'
+}
+
 // ================================================================== HTTP surface
 /** Returns true when the request was handled. Both roles; each endpoint checks its role. */
 export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
@@ -2862,7 +2917,9 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       if (String(b.owner ?? 'main') === 'main' && b.to && b.text) {
         ledger({ lane: 'main', thread: b.thread ?? null, event: `main-send-${b.msgId}`, kind: 'action', notify_main: false,
           text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId } })
+        const where = peerThread(String(b.to), b.thread ?? null)   // 002k (C1): before mainSentTo closes the promise this send answers
         mainSentTo(String(b.to), b.thread ?? null)             // 002j: a promise the router made in the main's name is kept
+        void mainCommitmentCheck({ msgId: b.msgId, to: String(b.to), text: String(b.text), thread: where })   // 002k (C1): not awaited: the send is long done
       }
       saveState(); sendJson(res, 200, { ok: true }); return true
     }
