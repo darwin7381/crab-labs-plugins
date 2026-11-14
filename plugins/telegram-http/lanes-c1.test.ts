@@ -50,7 +50,8 @@ test('C1: the main\'s send is an action line first, then a commitment (lane main
   const c = commitments()[0]
   expect(c).toMatchObject({ kind: 'commitment', lane: 'main', thread: 'adam#t-c1a', notify_main: false, refs: { auto: true, who: 'eve', from: 'main-send', thread_from: 'promise' } })
   expect(c.refs.p).toBeGreaterThanOrEqual(0.7); expect(c.refs.by).toContain('明天'); expect(c.text).toContain('答應 eve')
-  expect(st.promises['pr-c1'].state).toBe('kept')                                            // the same send answered the open promise
+  expect(st.promises['pr-c1'].state).toBe('open')                                            // 002k (C4): a send with no thread, no reply_to and no Jev match answers nothing in particular
+  st.promises['pr-c1'].state = 'kept'                                                        // (the rest of this file is about commitments, not promises)
 })
 
 test('C1: p below 0.7 writes nothing; exactly 0.7 does', async () => {

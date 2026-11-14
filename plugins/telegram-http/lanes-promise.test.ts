@@ -86,9 +86,11 @@ test('when the time comes and the main has sent nothing: Joey is told once, the 
   expect(over.length).toBe(1); expect(over[0].notify_main).toBe(true)
   L.promiseTick(); await sleep(30)
   expect(sent.length).toBe(1)                                                            // once
-  L.mainSentTo('CAIN', null)
   const pr = Object.values(L.__lanesState().promises).find(p => p.peer === 'cain')!
-  expect(pr).toMatchObject({ state: 'kept', matched: 'peer' })
+  await L.mainSentTo('CAIN', null)                                                       // 002k (C4): no thread, no reply_to, no text: it answers nothing in particular
+  expect(pr.state).toBe('overdue')
+  await L.mainSentTo('CAIN', pr.thread)
+  expect(pr).toMatchObject({ state: 'kept', matched: 'thread' })
   expect(rows().some(r => r.kind === 'fyi' && String(r.text).includes('過了時間才回'))).toBe(true)
   L.__setPromiseMin(30)
 })

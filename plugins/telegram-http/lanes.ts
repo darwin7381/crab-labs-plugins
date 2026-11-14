@@ -1853,7 +1853,9 @@ const digestTakenAt = new Map<string, number>()
 // has sent that agent a message it is kept; when the time comes and it has not, Joey is told once and the main sees it
 // in its digest. Whether the main's message really answers the request is the judge's question (Jev), not this rule's.
 type Promise24 = { id: string; peer: string; thread: string | null; event: string; what: string; created: number; due: number
-  state: 'open' | 'kept' | 'overdue'; handoff: string; done?: string; matched?: string }
+  state: 'open' | 'kept' | 'overdue'; handoff: string; done?: string; matched?: string
+  /** 002k (C4): the peer's request (its btcc_msg_id) and the router's interim message to it (its msg id): what the main's reply may quote */
+  req?: string; sent?: string }
 let PROMISE_MIN = Number(process.env.LANES_HANDOFF_REPLY_MIN ?? 30)
 export const __setPromiseMin = (m: number): void => { PROMISE_MIN = m }
 let meshSendHook: ((b: any) => Promise<any>) | null = null
@@ -1879,7 +1881,8 @@ async function interimToPeer(lane: Lane, tok: RunTok, h: Handoff): Promise<strin
   if (th) { th.hops = hop; th.last = nowIso(); if (!th.peer) th.peer = from }
   const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, thread: lane.thread, hop, lane: lane.id })
   if (r?.msgId != null) S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }
-  const pr: Promise24 = { id: `pr-${shortId()}`, peer: from, thread: lane.thread ?? null, event: tok.evId, what: h.text.slice(0, 160), created: Date.now(), due, state: 'open', handoff: h.id }
+  const pr: Promise24 = { id: `pr-${shortId()}`, peer: from, thread: lane.thread ?? null, event: tok.evId, what: h.text.slice(0, 160), created: Date.now(), due, state: 'open', handoff: h.id,
+    ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}), ...(r?.msgId != null ? { sent: String(r.msgId) } : {}) }
   S.promises[pr.id] = pr
   ledger({ lane: 'router', thread: lane.thread, event: tok.evId, kind: 'commitment', notify_main: true,
     text: commitmentText({ who: from, what: `主線直接回覆 ${from} 這件事（答應或拒絕）。分流器已經替車道回覆 ${from}：「${text}」`, by: `${simTime(due)} 前` }),
@@ -1889,18 +1892,48 @@ async function interimToPeer(lane: Lane, tok: RunTok, h: Handoff): Promise<strin
   saveState()
   return text
 }
-/** the main sent `to` a message (send_to_agent): what the router promised that agent in the main's name is kept */
-export function mainSentTo(to: string, thread: string | null): void {
-  let changed = false
-  for (const pr of Object.values(S?.promises ?? {})) {
-    if (pr.state === 'kept' || pr.peer !== String(to).toLowerCase()) continue
-    const late = pr.state === 'overdue'
-    pr.state = 'kept'; pr.done = nowIso(); pr.matched = thread && thread === pr.thread ? 'thread' : 'peer'; changed = true
-    ledger({ lane: 'router', thread: pr.thread, event: pr.event, kind: 'fyi', notify_main: false,
-      text: `主線已回覆 ${pr.peer}（系統告訴過對方 ${simTime(pr.due)} 前會回的那件事${late ? '；過了時間才回' : ''}）`, refs: { promise: pr.id, matched: pr.matched, late } })
-    logos('lane.promise.kept', { promise: pr.id, peer: pr.peer, late, matched: pr.matched })
+// 002k (C4, 002j group C): mainSentTo used to close EVERY open promise to the peer: one message from the main to Eve about another topic
+// closed two promises on other threads (fyi lines at 11:17:11.321Z, matched "peer"). Now a send answers a promise only when it says so:
+//   1. its thread is the promise's thread, or
+//   2. it quotes the peer's request or the router's interim message (reply_to), or, when neither matches,
+//   3. Jev chooses among the OPEN promises of that peer by their texts (one Choice; "none" is an allowed answer; confidence >= 0.7).
+// Anything unmatched stays open and promiseTick still rings at its due time. A failed Jev call is an error, never an answer: nothing is
+// closed, and it is logged. The thread / reply_to part runs at once (before the first await); only the Jev part is asynchronous.
+const PROMISE_MATCH_P = (): number => Number(process.env.LANES_PROMISE_MATCH_P ?? 0.7)
+async function jevMatchPromise(open: Promise24[], peer: string, text: string): Promise<Promise24 | null> {
+  const r = await jevAsk(
+    { setting: `An AI agent sent \`message\` to the agent ${peer}. \`open_requests\` are requests from ${peer} that were told the agent's main session would answer them.`,
+      message: { recipient: peer, text: text.slice(0, 3000) }, open_requests: open.map(p => ({ id: p.id, text: p.what })) },
+    { which: { type: 'choice', instructions: 'Which item of `open_requests` does `message` answer?', criteria: { ...Object.fromEntries(open.map(p => [p.id, null])), none: 'It answers none of them (another topic)' } } },
+    'genesis-promise-match/1')
+  const c = r.answers?.which?.choice, conf = Number(r.answers?.which?.confidence ?? 0)
+  try { appendFileSync(join(LANES_DIR, 'run', 'promise-match.jsonl'), JSON.stringify({ ts: nowIso(), peer, open: open.map(p => p.id), choice: c ?? null, confidence: conf, error: r.error ?? null, ms: r.ms }) + '\n') } catch {}
+  if (r.error || !r.answers) { D.log('warn', `lanes: promise match for the send to ${peer} failed (${r.error}); nothing closed`); return null }
+  return c && c !== 'none' && conf >= PROMISE_MATCH_P() ? open.find(p => p.id === c) ?? null : null
+}
+function keepPromise(pr: Promise24, how: string): void {
+  const late = pr.state === 'overdue'
+  pr.state = 'kept'; pr.done = nowIso(); pr.matched = how
+  ledger({ lane: 'router', thread: pr.thread, event: pr.event, kind: 'fyi', notify_main: false,
+    text: `主線已回覆 ${pr.peer}（系統告訴過對方 ${simTime(pr.due)} 前會回的那件事${late ? '；過了時間才回' : ''}）`, refs: { promise: pr.id, matched: how, late } })
+  logos('lane.promise.kept', { promise: pr.id, peer: pr.peer, late, matched: how })
+}
+/** the main sent `to` a message (send_to_agent): the promises the router made that agent in the main's name which this message answers are kept */
+export async function mainSentTo(to: string, thread: string | null, replyTo?: string | number | null, text?: string): Promise<void> {
+  const peer = String(to).toLowerCase()
+  const open = Object.values(S?.promises ?? {}).filter(pr => pr.state !== 'kept' && pr.peer === peer)
+  if (!open.length) return
+  const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
+  const byThread = thread ? open.filter(pr => pr.thread === thread) : []
+  const byReply = rt ? open.filter(pr => pr.req === rt || pr.sent === rt) : []
+  if (byThread.length || byReply.length) {
+    for (const pr of byThread) keepPromise(pr, 'thread')
+    for (const pr of byReply) if (pr.state !== 'kept') keepPromise(pr, 'reply_to')
+    saveState(); return
   }
-  if (changed) saveState()
+  if (!text?.trim()) return                                    // nothing says which request this answers: all stay open
+  const hit = await jevMatchPromise(open, peer, text)
+  if (hit && hit.state !== 'kept') { keepPromise(hit, 'jev'); saveState() }
 }
 export function promiseTick(): void {
   if (!S?.promises) return
@@ -2836,9 +2869,10 @@ export async function routeRemote(ev: InEvent): Promise<Decision | null> {
 }
 /** inbox role: tell the tg daemon about a mesh send made by the main (send_to_agent). */
 export async function noteMainOutbound(msgId: number | undefined, thread: string | undefined, hop: number | undefined,
-  to?: string, text?: string): Promise<void> {
+  to?: string, text?: string, replyTo?: number | string): Promise<void> {
   if (msgId == null) return
-  await peerCall(TG_PORT, '/lanes/outbound', 'POST', { msgId, owner: 'main', thread: thread ?? null, hop: hop ?? null, to: to ?? null, text: (text ?? '').slice(0, 400) })
+  await peerCall(TG_PORT, '/lanes/outbound', 'POST', { msgId, owner: 'main', thread: thread ?? null, hop: hop ?? null, to: to ?? null, text: (text ?? '').slice(0, 400),
+    reply_to: replyTo ?? null })    // 002k (C4): what the send quotes; with the thread it says which promise the send answers
 }
 /** inbox role: hop gate for a main send in a thread. */
 export async function checkMainSend(thread: string, hop: number): Promise<{ ok: boolean; hop: number; why?: string }> {
@@ -2932,7 +2966,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
         ledger({ lane: 'main', thread: b.thread ?? null, event: `main-send-${b.msgId}`, kind: 'action', notify_main: false,
           text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId } })
         const where = peerThread(String(b.to), b.thread ?? null)   // 002k (C1): before mainSentTo closes the promise this send answers
-        mainSentTo(String(b.to), b.thread ?? null)             // 002j: a promise the router made in the main's name is kept
+        void mainSentTo(String(b.to), b.thread ?? null, b.reply_to ?? null, String(b.text))   // 002j: a promise the router made in the main's name is kept (002k C4: only the ones this answers)
         void mainCommitmentCheck({ msgId: b.msgId, to: String(b.to), text: String(b.text), thread: where })   // 002k (C1): not awaited: the send is long done
       }
       saveState(); sendJson(res, 200, { ok: true }); return true
