@@ -280,3 +280,46 @@ export function intakeAtFile(path: string, notif: { params?: unknown }, sinceMs 
   if (t == null) return null
   return intakeInText(t, needles, sinceMs)
 }
+
+export type LastAssistant = { at: number; apiError: boolean; text: string; midTask: boolean; model: string }
+/** The last assistant record of a transcript: the model's own record, or an API-error record (usage limit, overload,
+ *  login). The harness writes such an error as a synthetic assistant record flagged isApiErrorMessage and then ends the
+ *  turn in the ordinary way (fleet transcripts, 40 days to 2026-11-14: all 462 limit records are followed by the
+ *  end-of-turn record), so "the turn was cut off" does not describe a session behind a model wall; its last assistant
+ *  record does. The "No response requested." record of a resumed session is skipped: it says nothing either way.
+ *  midTask = the error came in the middle of work (after a tool result or a record of the model's own), not as the only
+ *  answer to a prompt. model = the model of the newest genuine record: what a probe for this session has to call. */
+export function lastAssistantFile(path: string): LastAssistant | null {
+  const text = tailText(path, 400_000)
+  if (!text) return null
+  const lines = text.split('\n')
+  let out: LastAssistant | null = null, prevSeen = false
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i]
+    if (!l || (!l.includes('"assistant"') && !l.includes('"user"'))) continue
+    let j: any
+    try { j = JSON.parse(l) } catch { continue }
+    if (j.type === 'assistant') {
+      const synthetic = j.message?.model === '<synthetic>'
+      if (!out) {
+        if (synthetic && !j.isApiErrorMessage) continue
+        const at = Date.parse(j.timestamp ?? '')
+        if (!Number.isFinite(at)) continue
+        if (!j.isApiErrorMessage) return { at, apiError: false, text: '', midTask: false, model: String(j.message?.model ?? '') }
+        out = { at, apiError: true, midTask: false, model: '',
+          text: (Array.isArray(j.message?.content) ? j.message.content : []).map((c: any) => String(c?.text ?? '')).join(' ').slice(0, 200) }
+        continue
+      }
+      if (synthetic) continue                              // an earlier error record: the model is further back
+      if (!prevSeen) out.midTask = true
+      out.model = String(j.message?.model ?? '')
+      return out
+    }
+    if (j.type === 'user' && out && !prevSeen) {
+      const c = j.message?.content
+      out.midTask = Array.isArray(c) && c.some((b: any) => b?.type === 'tool_result')
+      prevSeen = true
+    }
+  }
+  return out
+}

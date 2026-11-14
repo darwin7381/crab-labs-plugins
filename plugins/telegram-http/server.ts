@@ -768,7 +768,7 @@ const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
 const CONSUME_RETAIN_MS = 1_800_000
 // lanes (002i): a delivery to the main that has left no trace in the main's transcript after this long never arrived
 const ARRIVE_GRACE_MS = Number(process.env.LANES_ARRIVE_GRACE_MS ?? 20_000)
-const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null }> = []
+const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null; walled?: boolean }> = []
 
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
 // whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
@@ -850,6 +850,20 @@ function sweepDeliveries(): void {
     // that moment. Until then the delivery stays open: a running turn answers soon; a usage-limit wall or a frozen
     // session does not, and the delivery is parked again after the grace (counted from when it was taken in).
     const answered = it?.taken ? Lanes.mainAnsweredAfter(it.takenAt) : false
+    // 002j: the main took it in and its transcript shows the API error as the last thing after it: the model wall, not a
+    // stuck agent. The delivery is neither acked nor sent round the grace/park/quarantine path (fleet history: an agent
+    // at its weekly limit had every wake-up delivered three times and then written off). It is kept as it is and given
+    // again when the wall comes down.
+    if (it?.taken && !answered && !d.pendingPath) {
+      const step = Lanes.walledStep(d, it.takenAt)
+      if (step === 'hold') continue
+      if (step === 'regive') {
+        d.pendingPath = persistInbound(d.notif)
+        log('info', 'model wall down: a delivery the main only answered with the API error is given again')
+        if (!d.pendingPath) recentDeliveries.splice(i, 1)
+        continue
+      }
+    }
     // Without that evidence: strictly after the delivery, and by a genuine (non-API-error) assistant
     // record. An error record or a pre-delivery record is NOT consumption.
     if (it ? answered : newest > d.at) {
@@ -1006,6 +1020,7 @@ function liveSessionServer(): Server | null {
 }
 
 async function drainPendingIfLive(): Promise<void> {
+  if (Lanes.LANES_ON && Lanes.wallHoldsMain()) return     // 002j: nothing is replayed into the wall; Joey was told when it came up
   let files: string[]
   try { files = readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')) } catch { return }
   if (files.length === 0) { if (parkAlerted.size) parkAlerted = new Set(); return }
@@ -2768,6 +2783,16 @@ async function maybeTranscribeVoice(attachment: AttachmentMeta | undefined): Pro
 // 002: single-target delivery to the registered main's MCP session (evidence #1/#3/#4). Not
 // connected → disk pending, which drains only into the main (liveSessionServer).
 function deliverToMain(notif: { method: string; params: unknown }): void {
+  // 002j: the main is behind the model wall (usage limit, overload, login): it would answer whatever it is handed with the
+  // same API error. The message is kept in inbox/pending and given when the wall comes down; Joey's own message gets a line
+  // back from the router at once (never silent).
+  if (Lanes.LANES_ON && Lanes.wallHoldsMain()) {
+    stampDid(notif)
+    persistInbound(notif)
+    Lanes.noteHeldForMain(notif)
+    log('info', 'main delivery kept behind the model wall (inbox/pending)')
+    return
+  }
   const sid = Lanes.mainMcpSession()
   let server: Server | undefined
   if (sid) for (const s of activeServers) if (serverSessionId.get(s) === sid) { server = s; break }

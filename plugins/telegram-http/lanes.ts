@@ -23,7 +23,7 @@
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
  * (main writes), digest.json, run/ (per-run MCP configs, stderr).
  */
-import { intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
+import { lastAssistantFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { randomBytes, randomUUID, createHash } from 'crypto'
 import {
@@ -164,6 +164,10 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(followupTick, 1_000).unref()
     setInterval(() => { void digestTick() }, 10_000).unref()
     setInterval(handoffTick, 10_000).unref()
+    setInterval(mainWallTick, 15_000).unref()       // 002j: a main behind the model wall (its own transcript says so)
+    if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
+    if (S.main_wall) { try { writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: S.main_wall.kind, text: S.main_wall.text })) } catch {}; armMainProbe(5_000) }
+    else { try { rmSync(mainWallFile()) } catch {} }
   }
   deps.log('info', `lanes: ON (role=${deps.role} agent=${deps.agent} dir=${LANES_DIR} model=${MODEL} cap=${MAX_RUNNING} hop_limit=${HOP_LIMIT})`)
 }
@@ -346,6 +350,8 @@ export function cutOffTurn(path: string): { cut: boolean; at?: string; walled?: 
   const lines = text.split('\n')
   // 002j: `walled` = the turn did not end and the last thing the harness wrote for it is an API-error record (usage
   // limit, overload). That is a wall, not a crash: telling the main to carry on would only send it into the wall again.
+  // (Real sessions end the turn normally after such a record, so this is only the short moment before that; the wall
+  // itself is read from the last assistant record: mainWalled / lastAssistantFile.)
   let walled = false
   const out = (at: string) => walled ? { cut: true, at, walled } : { cut: true, at }
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -487,6 +493,7 @@ type Lane = {
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
   ask_cls?: string }                                                   // event class of the lane run that last asked a peer here
 type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number }
+type MainWall = { since: string; kind: string; text: string; model: string; err_at: number; mid_task: boolean; probes: number; acked_at?: number; held?: number }
 type State = {
   counters: Record<string, number>
   lanes: Record<string, Lane>
@@ -501,6 +508,8 @@ type State = {
   handoffs: Record<string, Handoff>                                    // 002d: work handed to the main, until the main has it
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
+  main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
+  main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
 }
 /** 002d: something a lane (or the router) handed to the main. pending → delivered (the main got the wake digest that
  *  carries it) | fallback (the main did not get it in time, or is not connected: Joey was told directly, once). */
@@ -647,7 +656,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null, class: cls, base_tier, text: ev.text.slice(0, 120) })
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ${d.target}${d.lane ? ' ' + d.lane : ''}${d.note ? ' — ' + d.note : ''}`)
   // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it
-  if (d.target === 'main' && D.role === 'tg') { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
+  if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
   return d
 }
 
@@ -887,20 +896,32 @@ function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string
 // that arrives meanwhile is rung through at once, with the reason nobody can look into it.
 // All of it is code: the wall is recognised from the run's own result record (`is_error` + `api_error_status`), never guessed.
 export function wallActive(): boolean { return !!S?.wall }
-export function walledResult(j: any): { kind: string; text: string } | null {
-  if (!j || j.type !== 'result' || !j.is_error) return null
-  const st = Number(j.api_error_status ?? 0), text = String(j.result ?? '').slice(0, 200)
-  if (st === 429 || /hit your .{0,40}limit|usage limit/i.test(text)) return { kind: 'usage', text }
-  if (st === 529 || /overloaded/i.test(text)) return { kind: 'overload', text }
-  if (st >= 500) return { kind: 'error', text }
+/** Which wall an API error is, from its status and wording (wordings: fleet transcripts 2026-10/11). null = not a wall:
+ *  a refused request or a failed tool is the run's own outcome and comes back the same however long anyone waits. */
+export function wallKind(text: string, status = 0): string | null {
+  // the wording first: the server's own rate limiting says "(not your usage limit)" and comes with the same status as a
+  // usage limit, and a refusal ("violates our Usage Policy", "safety measures") must not read as a limit
+  if (/temporarily limiting requests|overloaded/i.test(text)) return 'overload'
+  if (/hit your .{0,40}limit|reached your .{0,40}limit|out of usage credits/i.test(text)) return 'usage'
+  if (/please run \/login|not logged in|login expired|has disabled claude/i.test(text)) return 'auth'
+  if (/can.t reach the api server|api error: 5\d\d/i.test(text)) return 'error'
+  if (status === 529) return 'overload'
+  if (status === 429) return 'usage'
+  if (status === 401 || status === 403) return 'auth'
+  if (status >= 500) return 'error'
   return null
 }
-const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯' }
+export function walledResult(j: any): { kind: string; text: string } | null {
+  if (!j || j.type !== 'result' || !j.is_error) return null
+  const text = String(j.result ?? '').slice(0, 200), kind = wallKind(text, Number(j.api_error_status ?? 0))
+  return kind ? { kind, text } : null
+}
+const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯', auth: '模型登入失效' }
 function wallUp(w: { kind: string; text: string }, by: string): void {
   if (S.wall) {                                           // a probe hit the wall again
     S.wall.probes += 1; S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
     logos('lane.wall_probe', { ok: false, probes: S.wall.probes, by })
-    setTimeout(pump, WALL_PROBE_MS + 30)
+    armProbe(WALL_PROBE_MS + 30)
     return
   }
   S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0 }
@@ -911,12 +932,211 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
   logos('lane.wall_up', { kind: w.kind, text: w.text, by, waiting })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
-  setTimeout(pump, WALL_PROBE_MS + 30)
+  armProbe(WALL_PROBE_MS + 30)
 }
+// One timer for the lanes' wall. (Each walled run used to arm its own: two runs in flight when the wall came up meant
+// two chains of probes for as long as it lasted.)
+let probeTimer: ReturnType<typeof setTimeout> | null = null
+function armProbe(ms: number): void {
+  if (probeTimer) clearTimeout(probeTimer)
+  probeTimer = setTimeout(() => { probeTimer = null; probeTick() }, ms)
+  ;(probeTimer as any).unref?.()
+}
+/** While the lanes' wall is up: a queued event is the probe when there is one (pump starts exactly one run); with an
+ *  empty queue a bare one-line run is. Without the second, a wall that came up on the last queued event stayed up until
+ *  the next event happened to arrive, and every critical alert until then was rung through as "no lane can look". */
+function probeTick(): void {
+  if (!S?.wall || D.role !== 'tg') return
+  if (running.size > 0) { armProbe(1000); return }        // a run is still out: its result is the probe
+  if ([...queue.values()].some(i => i.state === 'queued')) {
+    S.wall.probe_at = 0; pump()
+    if (running.size === 0) armProbe(WALL_PROBE_MS)        // nothing could start (lease, cap): look again later
+    return
+  }
+  S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
+  bareProbe(MODEL, `${D.agent}.probe`, (walled, ok) => {
+    if (!S?.wall) return
+    if (ok) { logos('lane.wall_probe', { ok: true, bare: true }); wallDown('probe') }
+    else wallUp(walled ?? { kind: S.wall.kind, text: S.wall.text }, 'probe')
+  })
+}
+/** A one-line run with no tools: does a model call get through at all? cb(walled, ok): ok = it does. */
+function bareProbe(model: string, actor: string, cb: (walled: { kind: string; text: string } | null, ok: boolean) => void): void {
+  let walled: { kind: string; text: string } | null = null, buf = '', done = false
+  const finish = (ok: boolean) => { if (!done) { done = true; cb(walled, ok && !walled) } }
+  let child: ChildProcess
+  try {
+    child = spawn(CLAUDE_BIN, ['-p', 'Reply with the single word OK.', '--model', model, '--output-format', 'stream-json', '--verbose'],
+      { cwd: join(LANES_DIR, 'run'), env: laneEnv({ id: actor, thread: '' } as Lane), stdio: ['ignore', 'pipe', 'ignore'] })
+  } catch { finish(false); return }
+  const limit = setTimeout(() => { try { child.kill('SIGKILL') } catch {} }, 120_000)
+  child.stdout!.setEncoding('utf8')
+  child.stdout!.on('data', (chunk: string) => {
+    buf += chunk
+    let i: number
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1)
+      try { const j = JSON.parse(line); if (j.type === 'result') walled = walledResult(j) } catch {}
+    }
+  })
+  child.on('error', () => { clearTimeout(limit); finish(false) })
+  child.on('exit', code => { clearTimeout(limit); finish(code === 0) })
+}
+
+// ------------------------------------------------------------------ 002j: the MAIN behind the model wall
+// The lanes' wall above is raised by a lane run's own result. The main is a different process and may be on a different
+// model with its own limit, so neither side is guessed from the other: the main's wall is raised only by the main's own
+// transcript, when its last assistant record is an API-error record of a wall kind (lastAssistantFile). Seen two ways:
+// the 15-second tick reads the transcript (a main that hit the wall in the middle of work, with nothing waiting for it),
+// and the delivery sweep finds a message the main took in and answered only with the error.
+// With the main's wall up:
+//   - what is meant for the main is kept in inbox/pending instead of being handed over (it would be answered with the
+//     same error); every message of Joey's that is kept gets a line back, so he is never left without an answer;
+//   - a message the main took in and answered with the error is kept as well and given again afterwards;
+//   - system notices (digests, hand-overs) are refused, so the hand-over fallback tells Joey directly, as when the main is away;
+//   - Joey is told once; a one-line run on the main's own model probes at an interval;
+//   - when a probe gets through: Joey is told once, a main that was stopped in the middle of work is told to carry on,
+//     and what was kept is given.
+// The wall is one fact for both daemons of the agent (tg owns it, inbox holds the mesh messages for the main): a file.
+const mainWallFile = (): string => join(LANES_DIR, 'run', 'main-wall.json')
+export function wallHoldsMain(): boolean { return !!LANES_DIR && existsSync(mainWallFile()) }
+type MainWallEv = { kind: string; text: string; at: number; midTask: boolean; model: string }
+/** The main's last assistant record is a wall error written at or after `sinceMs` (transcript time). */
+export function mainWalled(sinceMs = 0): MainWallEv | null {
+  const path = mainReg?.transcript_path
+  if (!path) return null
+  const a = lastAssistantFile(path)
+  if (!a?.apiError || a.at < sinceMs) return null
+  const kind = wallKind(a.text)
+  return kind ? { kind, text: a.text, at: a.at, midTask: a.midTask, model: a.model } : null
+}
+const isReal = (notif: Notif): { real: boolean; joey: boolean } => {
+  const meta = ((notif?.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
+  const real = !!meta.message_id || !!meta.btcc_msg_id
+  return { real, joey: !!meta.message_id && !meta.btcc_msg_id && !!D.joeyChatId && String(meta.chat_id) === String(D.joeyChatId()) }
+}
+/** server.ts sweep, for ONE delivery the main took in (at takenAt) and has not answered.
+ *  'hold' = the main is behind the wall, leave the delivery as it is; 'regive' = the wall is down and this one was only
+ *  ever answered with the error: park it again so that it is given now; 'pass' = no wall in this, the ordinary rules apply. */
+export function walledStep(d: { notif: Notif; walled?: boolean }, takenAt: number): 'pass' | 'hold' | 'regive' {
+  if (!d.walled) {
+    const e = mainWalled(takenAt)
+    if (!e) return 'pass'
+    d.walled = true
+    noteMainWalled(e, isReal(d.notif).real)
+    return 'hold'                                          // the other daemon may need a moment to raise it: look again at the next sweep
+  }
+  if (wallHoldsMain()) return 'hold'
+  d.walled = false
+  return 'regive'
+}
+export function noteMainWalled(e: MainWallEv, counts = false): void {
+  if (D.role !== 'tg') { void peerCall(TG_PORT, '/lanes/main-wall', 'POST', { ...e, counts }); return }
+  mainWallUp(e, 'delivery')
+  if (counts && S.main_wall) { S.main_wall.held = (S.main_wall.held ?? 0) + 1; saveState() }
+}
+/** server.ts kept a message for the main behind the wall instead of handing it over. */
+export function noteHeldForMain(notif: Notif): void {
+  const k = isReal(notif)
+  if (D.role !== 'tg') { if (k.real) void peerCall(TG_PORT, '/lanes/main-wall-held', 'POST', {}); return }
+  heldForMain(k.real, k.joey)
+}
+function heldForMain(real: boolean, joey: boolean): void {
+  const w = S?.main_wall
+  if (!w || !real) return
+  w.held = (w.held ?? 0) + 1
+  if (joey) {
+    // never silent: each kept message of Joey's gets a line. The first says why; the next ones inside ten minutes are short.
+    const first = Date.now() - (w.acked_at ?? 0) > 600_000
+    if (first) w.acked_at = Date.now()
+    const text = first
+      ? `收到。主線現在不能用模型：${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。這一則我先保留，不會丟；恢復後交給主線處理，到時候會告訴你。`
+      : `這一則也保留了。主線還在等模型恢復，目前保留 ${w.held} 則。`
+    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-held', escalated: true } })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-held', message_id: id }))
+  }
+  saveState()
+}
+/** tg role, every 15 s: a main that hit the wall with nothing waiting for it is seen here. */
+export function mainWallTick(): void {
+  if (D?.role !== 'tg' || !S) return
+  if (S.main_wall) { if (!mainProbeTimer) armMainProbe(mainProbeMs(S.main_wall.kind)); return }
+  const e = mainWalled(0)
+  if (e) mainWallUp(e, 'tick')
+}
+const mainProbeMs = (kind: string): number => kind === 'usage' || kind === 'auth' ? WALL_PROBE_MS : Math.min(WALL_PROBE_MS, 60_000)
+let mainProbeTimer: ReturnType<typeof setTimeout> | null = null
+function armMainProbe(ms: number): void {
+  if (mainProbeTimer) clearTimeout(mainProbeTimer)
+  mainProbeTimer = setTimeout(() => { mainProbeTimer = null; mainProbeTick() }, ms)
+  ;(mainProbeTimer as any).unref?.()
+}
+function mainWallUp(e: MainWallEv, by: string): void {
+  if (S.main_wall) return
+  if (e.at <= (S.main_wall_seen ?? 0)) return             // this error record was already acted on; the wall came down since
+  S.main_wall = { since: nowIso(), kind: e.kind, text: e.text, model: e.model, err_at: e.at, mid_task: !!e.midTask, probes: 0 }
+  S.main_wall_seen = e.at
+  saveState()
+  try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: e.kind, text: e.text })) } catch {}
+  const every = Math.max(1, Math.round(mainProbeMs(e.kind) / 60_000))
+  const text = `主線現在不能用模型：${WALL_WORD[e.kind] ?? '模型無法使用'}（原文：${e.text}）。`
+    + (e.midTask ? `它有一回合做到一半，停在 ${stamp(new Date(e.at).toISOString())}（${TZ_LABEL}）。` : '')
+    + `這段期間給主線的訊息我先保留，一則都不會丟。我每 ${every} 分鐘自動試一次，恢復後把保留的交給主線，並告訴你。`
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-up', escalated: true } })
+  logos('lane.main_wall_up', { kind: e.kind, text: e.text, by, mid_task: !!e.midTask, model: e.model, err_at: e.at })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-up', message_id: id }))
+  armMainProbe(mainProbeMs(e.kind))
+  setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, 0)   // mark what the main already took in, in both daemons
+}
+function mainProbeTick(): void {
+  const w = S?.main_wall
+  if (!w || D.role !== 'tg') return
+  bareProbe(w.model || MODEL, `${D.agent}.main`, (walled, ok) => {
+    const cur = S?.main_wall
+    if (!cur) return
+    if (ok) { logos('lane.main_wall_probe', { ok: true, probes: cur.probes + 1 }); void mainWallDown('probe'); return }
+    cur.probes += 1
+    if (walled) { cur.kind = walled.kind; cur.text = walled.text }
+    saveState()
+    logos('lane.main_wall_probe', { ok: false, probes: cur.probes, kind: cur.kind })
+    armMainProbe(mainProbeMs(cur.kind))
+  })
+}
+export function wallResumeNotice(w: { err_at: number; text: string }, held: number): string {
+  return `〔系統通知｜模型恢復〕你從 ${stamp(new Date(w.err_at).toISOString())}（${TZ_LABEL}）起不能用模型（${w.text}），現在恢復了。\n`
+    + '那時候你有一回合做到一半就停了：先看停在哪一步，接著把它做完。跑到一半的指令不要當成已經完成，重新確認結果。\n'
+    + (held ? `這段期間保留的 ${held} 則訊息接著會送來；` : '') + '已經回過的不用再回。\n'
+    + '這是系統產生的通知，不用回覆任何 agent。'
+}
+async function mainWallDown(by: string): Promise<void> {
+  const w = S.main_wall
+  if (!w) return
+  delete S.main_wall; saveState()
+  if (mainProbeTimer) { clearTimeout(mainProbeTimer); mainProbeTimer = null }
+  try { rmSync(mainWallFile()) } catch {}
+  // A main stopped in the middle of work is told to carry on, before what was kept reaches it. A main whose walled turn
+  // was only a message it never answered needs no notice: that message is given again.
+  let told: boolean | null = null
+  if (w.mid_task && mainWalled(0)) {
+    told = false
+    try { if (await digestIO.mainConnected()) told = await digestIO.deliver(wallResumeNotice(w, w.held ?? 0), { user: 'lanes', kind: 'wall-resume', no_reply: 'true', wake: 'true' }) } catch (e) { D.log('warn', `lanes: wall-resume notice failed: ${e}`) }
+  }
+  setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, told ? 1500 : 30)
+  const text = `主線的模型恢復了（${stamp(w.since)} 起不能用，${TZ_LABEL}）。`
+    + (w.held ? `這段期間保留的 ${w.held} 則訊息現在交給主線。` : '')
+    + (told === true ? '主線有一回合做到一半被打斷，已經通知它接著做完。' : told === false ? '主線有一回合做到一半被打斷，但接續通知沒有送到（主線目前沒有連線）。' : '')
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-down', escalated: true } })
+  logos('lane.main_wall_down', { since: w.since, probes: w.probes + 1, by, held: w.held ?? 0, resume_notice: told })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-down', message_id: id }))
+}
+export const __setDigestIO = (io: Partial<DigestIO>): void => { Object.assign(digestIO, io) }
+
 function wallDown(by: string): void {
   const w = S.wall
   if (!w) return
   delete S.wall; saveState()
+  if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
+  setTimeout(pump, 20)
   const waiting = [...queue.values()].filter(i => i.state === 'queued').length
   const text = `模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件現在開始處理。`
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
@@ -1757,6 +1977,13 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
   }
   if (D.role === 'tg') {
     if (p === '/lanes/route' && req.method === 'POST') { sendJson(res, 200, await routeEvent(await readBody(req) as InEvent)); return true }
+    if (p === '/lanes/main-wall' && req.method === 'POST') {            // 002j: the inbox daemon saw the main answer a mesh message with the API error
+      const b = await readBody(req)
+      const kind = wallKind(String(b.text ?? ''))
+      if (kind && Number.isFinite(Number(b.at))) noteMainWalled({ kind, text: String(b.text).slice(0, 200), at: Number(b.at), midTask: !!b.midTask, model: String(b.model ?? '') }, !!b.counts)
+      sendJson(res, 200, { up: !!S.main_wall }); return true
+    }
+    if (p === '/lanes/main-wall-held' && req.method === 'POST') { heldForMain(true, false); sendJson(res, 200, { held: S.main_wall?.held ?? 0 }); return true }
     if (p === '/lanes/outbound' && req.method === 'POST') {
       const b = await readBody(req)
       S.outbound[String(b.msgId)] = { owner: String(b.owner ?? 'main'), thread: b.thread ?? null }
@@ -1796,10 +2023,12 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (p === '/lanes/deliver-main' && req.method === 'POST') {
       const b = await readBody(req)
       if (!mainConnected()) { sendJson(res, 200, { delivered: false, why: 'main not connected' }); return true }
+      if (wallHoldsMain()) { sendJson(res, 200, { delivered: false, why: 'main behind the model wall' }); return true }   // 002j: the hand-over fallback tells Joey
       D.deliverToMain({ method: 'notifications/claude/channel', params: { content: String(b.content ?? ''),
         meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', ts: nowIso(), via: 'lanes', verified: 'true', relay: 'local', ...(b.meta ?? {}) } } })
       sendJson(res, 200, { delivered: true }); return true
     }
+    if (p === '/lanes/sweep' && req.method === 'POST') { D.sweepNow?.(); sendJson(res, 200, { ok: true }); return true }   // 002j: the wall went up or down
     if (p === '/lanes/scheduler' && req.method === 'POST') {
       const b = await readBody(req)
       const text = D.schedulerCall ? await D.schedulerCall(String(b.run_id), b.action === 'ack' ? 'ack' : 'complete', b.outcome, b.summary) : 'no scheduler'
@@ -1811,7 +2040,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
 
 /** /healthz extras */
 export function lanesHealth(): Record<string, unknown> {
-  return { lanes_on: true, main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
+  return { lanes_on: true, main_wall: wallHoldsMain(), main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
     lanes_running: D?.role === 'tg' ? running.size : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
     handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined,
