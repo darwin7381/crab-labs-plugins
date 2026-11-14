@@ -347,11 +347,13 @@ export const LEDGER_QUERY_DESCRIPTION =
   'Call it with NO arguments to get the ACTIVITY LIST: one line per event handled (what happened, what was done, what was promised, what was handed to you, whether Joey was told), ' +
   'including the routine events that never woke you. Do that BEFORE answering "what happened today / what did you handle / what is still open", and cover every line of the list in your answer, with its concrete numbers, times and names. ' +
   'Filters return the original entries: `text` (substring or regex, all kinds), `since` (ISO time or -4h), `kind`: ' + LEDGER_KINDS.map(k => `${k} (${LEDGER_KIND_HELP[k]})`).join('; ') + '. ' +
-  'Use kind=commitment for "what did you promise". A filtered answer always ends with the per-kind counts so you can see what else exists; ' +
+  'Use kind=commitment for "what did you promise": it lists the commitments AND, below them, what was told to peers in the same window (the reply_agent / send_to_agent actions), so a relay nobody recorded as a commitment still shows. A filtered answer always ends with the per-kind counts so you can see what else exists; ' +
   'an unknown kind, or a kind with no entries, falls back to a free-text match and never returns an empty answer. ' +
   'At most 30 entries (40 events in the activity list), newest last, each text cut to 600 chars.'
 
 const LEDGER_FALLBACK_ROWS = 10
+/** an action entry that is something said to a peer: a lane's reply_agent or the main's send_to_agent */
+const isTold = (r: LedgerRec): boolean => r.kind === 'action' && /^(reply_agent|send_to_agent)\s*→/.test(r.text)
 
 /** The main's ledger lookup. `raw` = the live ledger.jsonl text (null / empty = no file yet). Newest last, at most
  *  LEDGER_QUERY_MAX entries, each text cut to LEDGER_QUERY_TEXT_MAX. since: ISO or "-4h"; kind: a ledger kind or empty;
@@ -359,7 +361,7 @@ const LEDGER_FALLBACK_ROWS = 10
  *  002c: never an empty answer. An unknown kind lists the valid kinds and falls back to a free-text match across all
  *  kinds (text, else the unknown kind word itself); a known kind with no entries says so with the per-kind counts and
  *  falls back the same way; as a last resort the newest entries are shown. */
-export function queryLedger(raw: string | null, q: { since?: unknown; kind?: unknown; text?: unknown }, now: number): string {
+function queryLedgerBase(raw: string | null, q: { since?: unknown; kind?: unknown; text?: unknown }, now: number): string {
   const kindIn = typeof q.kind === 'string' ? q.kind.trim().toLowerCase() : ''
   const kindKnown = !kindIn || (LEDGER_KINDS as readonly string[]).includes(kindIn)
   const since = parseSince(q.since, now)
@@ -401,4 +403,24 @@ export function queryLedger(raw: string | null, q: { since?: unknown; kind?: unk
   const rows = shown.map(r => `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`)
   return [...notes, `帳本查詢：符合 ${hit.length} 筆${hit.length > shown.length ? `，只顯示最新 ${shown.length} 筆` : ''}（舊→新，時間為 ${TZ_LABEL}）。${echo}`, ...rows,
     `（以上只是符合條件的紀錄。帳本各種類現有筆數：${counts}。整天每件事一行的完整清單：ledger_query() 不帶參數。）`].join('\n')
+}
+
+/** The main's (and, read-only, a lane's) ledger lookup. 002k (C3): kind=commitment ALSO lists what was told to peers in the same window
+ *  (the action entries of reply_agent / send_to_agent), so a relay or an answer that was not recorded as a commitment still shows (group C:
+ *  Joey's "tell Eve" was only an action line). The window is `since`, the narrowing is `text`, as for the commitments above. */
+export function queryLedger(raw: string | null, q: { since?: unknown; kind?: unknown; text?: unknown }, now: number): string {
+  const base = queryLedgerBase(raw, q, now)
+  const kindIn = typeof q.kind === 'string' ? q.kind.trim().toLowerCase() : ''
+  const since = parseSince(q.since, now)
+  if (kindIn !== 'commitment' || since === 'bad') return base
+  const text = typeof q.text === 'string' ? q.text.trim() : ''
+  const match = text ? textMatcher(text) : null
+  const told = (raw ?? '').split('\n').filter(Boolean).map(parseLedgerLine).filter((r): r is LedgerRec => !!r && isTold(r))
+    .filter(r => (since === null || Date.parse(r.ts) >= since) && (!match || match(`${r.text} ${r.lane} ${r.thread ?? ''} ${r.refs ? JSON.stringify(r.refs) : ''}`)))
+  const shown = told.slice(-LEDGER_QUERY_MAX)
+  const rows = shown.map(r => `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`)
+  const fresh = rows.filter(r => !base.includes(r))                  // the widened answer above may already list some of them
+  return [base,
+    `〔窗口內對 peer 說過的話：${told.length} 筆${told.length > shown.length ? `，只顯示最新 ${shown.length} 筆` : ''}（reply_agent / send_to_agent 的 action 紀錄；沒有記成承諾的轉述或答應也在這裡，要自己看一眼；舊→新，時間為 ${TZ_LABEL}）〕`,
+    ...(fresh.length ? fresh : [rows.length ? '（都已列在上面）' : '（這個範圍內沒有）'])].join('\n')
 }
