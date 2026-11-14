@@ -9,7 +9,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, rmSync } from '
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
-import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected,
+import { lanesInit, callLaneTool, takePendingDigest, ackDigest, handoffTick, identityCard, laneContext, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected,
   mainConnected, cutOffTurn, resumeNotice, resumeDecision, intake, mainTranscript, __setMainPid, __setHandoffDownGrace } from './lanes.ts'
 import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
@@ -57,9 +57,12 @@ test('identity card: three ways out, one per event; a critical alert must reach 
   const card = identityCard(lane, { summary: undefined } as any)
   for (const w of ['notify_joey(text)', 'ask_joey(text)', 'handoff_main(text)', '同一件事只選一個']) expect(card).toContain(w)
   expect(card).not.toContain('escalate')
-  const crit = identityCard({ ...lane, critical: true }, { summary: undefined } as any)
-  expect(crit).toContain('這是嚴重警報')
-  expect(crit).toContain('不要為了「嚴重」而 handoff_main')
+  // 002k (B19): the card is the same for every lane of a kind; the critical flag is in the lane context at the head of the event prompt
+  expect(card).toContain('不要為了「嚴重」而 handoff_main')
+  expect(identityCard({ ...lane, critical: true })).toBe(card)
+  const crit = laneContext({ ...lane, critical: true }, { summary: undefined, ev: {} } as any)
+  expect(crit).toContain('分流器標記：嚴重警報')
+  expect(laneContext(lane, { summary: undefined, ev: {} } as any)).not.toContain('分流器標記：嚴重警報')
 })
 
 test('ask_joey: ONE push to Joey even for a routine class, the main is not woken, a second ask or a handoff of the same event is refused', async () => {
