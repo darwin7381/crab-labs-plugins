@@ -802,8 +802,30 @@ function threadGate(t: Thread | null, ev: InEvent): string | null {
   if (t && t.tokens >= THREAD_BUDGET) return `thread token budget ${t.tokens} ≥ ${THREAD_BUDGET}`
   return null
 }
+// 002k (C5, 002j group C04): a thread stop used to leave the events already queued for that thread's lane: one of them still got a run
+// (341k tokens) and a second handoff after the stop. When a thread is stopped, its queued peer events become one ledger fyi each (they ride
+// the main's next digest, nobody is woken) and get no run. startRun checks it too, for what is restored from disk or comes back from a retry.
+function dropQueued(it: QItem, thread: string, why: string): void {
+  it.state = 'done'; queue.delete(it.ev.id)
+  try { rmSync(qPath(it.ev.id)) } catch {}
+  const more = it.extra?.length ? `（連同同時排進來的另外 ${it.extra.length} 則）` : ''
+  ledger({ lane: S.lanes[it.lane]?.id ?? 'router', thread, event: it.ev.id, kind: 'fyi', notify_main: true,
+    text: `對話線 ${thread} 已經關閉（${why}），排隊中的 ${it.ev.from} 的訊息沒有處理，也沒有開車道${more}。內容：${it.ev.text.slice(0, 160)}`,
+    refs: { drained: true, stopped: why, btcc_msg_id: it.ev.btcc_msg_id ?? null } })
+  appendJsonl('routing.jsonl', { event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'thread-stopped-drain', target: 'ledger', lane: it.lane, thread, note: `thread stopped (${why}): queued event not run` })
+}
+const peerEventOf = (it: QItem): boolean => it.ev.source === 'mesh' && !it.ev.synthetic && !it.ev.fanout && it.ev.from !== 'main'
+export function drainStoppedThread(thread: string, why: string): number {
+  let n = 0
+  for (const it of [...queue.values()]) {
+    if (it.state !== 'queued' || !peerEventOf(it) || S.lanes[it.lane]?.thread !== thread) continue
+    dropQueued(it, thread, why); n++
+  }
+  if (n) saveState()
+  return n
+}
 function stopThread(ev: InEvent, t: Thread | null, why: string, laneId: string | null): Decision {
-  if (t) t.stopped = why
+  if (t) { t.stopped = why; drainStoppedThread(t.id, why) }
   saveState()
   ledger({ lane: laneId ?? 'router', thread: t?.id ?? ev.thread ?? null, event: ev.id, kind: 'stop',
     text: `停止投遞：${why}（thread ${t?.id ?? ev.thread ?? '-'}，寄件者 ${ev.from}）。內容：${ev.text.slice(0, 160)}`
@@ -1646,6 +1668,7 @@ function startRun(it: QItem): void {
       text: `thread ${lane.thread} 已用 ${th.tokens} token，超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。` })
     return
   }
+  if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
   const critical = !!lane.critical
@@ -2080,7 +2103,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (th?.stopped) return `blocked: thread ${lane.thread} was stopped (${th.stopped}). Escalate instead.`
       const hop = (th?.hops ?? 0) + 1
       if (hop > HOP_LIMIT) {
-        if (th) th.stopped = `hop ${hop} > ${HOP_LIMIT}`
+        if (th) { th.stopped = `hop ${hop} > ${HOP_LIMIT}`; drainStoppedThread(th.id, th.stopped) }
         saveState()
         ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'stop', notify_main: true, text: `reply_agent → ${to} 擋下：hop ${hop} 超過上限 ${HOP_LIMIT}。` })
         return `blocked: hop limit ${HOP_LIMIT} reached in thread ${lane.thread}; recorded and escalated to main. Do not retry.`
