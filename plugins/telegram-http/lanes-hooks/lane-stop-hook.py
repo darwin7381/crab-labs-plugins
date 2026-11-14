@@ -20,6 +20,13 @@ CLOSERS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_
 MAX_BLOCKS = 2
 # 002k (E3, 002j group E): a Joey-class run that ends by telling Joey it cannot do something, without ever looking at the service catalog.
 DECLINE_RE = re.compile(r"無法|沒辦法|can[’']t|cannot|unable", re.I)
+# 002k (H4, 002j group H): the same rule for a run a PEER's message started, and for a decline said with ask_joey or reply_agent (a lane told a peer it could not
+# verify a claim that one GET would have settled). The program output attached is `./bin/svc GET mock-api/config` and `GET mock-api/health` when the run is
+# about mock-api, the catalog when the subject is not known.
+SAID_TOOLS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__reply_agent')
+PEER_RUN = re.compile(r'來源 mesh｜寄件者 ([^\s（(｜]+)')
+AUTOMATED = ('scheduler', 'alert-dispatcher', 'main')
+API_SUBJECT = re.compile(r'mock-api|\bapi\b|config|health|p95|5xx|replica|log_level|maintenance|timeout|設定|維護|逾時|健康|延遲|錯誤率', re.I)
 
 
 def looked_at_catalog(cmd):
@@ -35,13 +42,18 @@ def looked_at_catalog(cmd):
     return False
 
 
-def catalog_output(cwd):
-    """What ./bin/svc prints (the catalog), run here by the program; '' when it cannot be run."""
+def svc_output(cwd, args=()):
+    """What ./bin/svc prints for these arguments, run here by the program; '' when it cannot be run."""
     try:
-        r = subprocess.run(['./bin/svc'], cwd=cwd or os.getcwd(), capture_output=True, text=True, timeout=8)
+        r = subprocess.run(['./bin/svc', *args], cwd=cwd or os.getcwd(), capture_output=True, text=True, timeout=8)
         return r.stdout.strip()[:3000] if r.returncode == 0 else ''
     except Exception:
         return ''
+
+
+def catalog_output(cwd):
+    """What ./bin/svc prints (the catalog), run here by the program; '' when it cannot be run."""
+    return svc_output(cwd)
 
 
 def save_state(state_p, st):
@@ -89,7 +101,7 @@ def main():
     if last_user is None:
         return
     closed, used = False, set()
-    notify_texts, looked = [], False
+    said, looked = {}, False
     for line in lines[last_user + 1:]:
         try:
             j = json.loads(line)
@@ -101,9 +113,9 @@ def main():
             if not isinstance(c, dict) or c.get('type') != 'tool_use':
                 continue
             n = c.get('name', '')
-            if n == 'mcp__lane__notify_joey':
-                notify_texts.append(str((c.get('input') or {}).get('text', '')))
-            elif n == 'Bash' and looked_at_catalog(str((c.get('input') or {}).get('command', ''))):
+            if n in SAID_TOOLS:
+                said[n] = str((c.get('input') or {}).get('text', ''))      # the LAST text of each of the three tools
+            if n == 'Bash' and looked_at_catalog(str((c.get('input') or {}).get('command', ''))):
                 looked = True
             if n in TOLD:
                 closed = True
@@ -131,17 +143,37 @@ def main():
         closed = True
     # 002k (E3): a run Joey's message started that ends with a notify_joey that declines, and that never called ./bin/svc for the catalog or a GET:
     # held once, with the output of ./bin/svc attached as program output (the hook ran it; it is not a new instruction)
-    if closed and not looked and '來源 Telegram｜Joey' in prompt_text and notify_texts:
-        m = DECLINE_RE.search(notify_texts[-1])
-        if m and int(st.get(key + ':decline', 0)) < 1:
-            out = catalog_output(p.get('cwd'))
-            if out:
+    joey_run = '來源 Telegram｜Joey' in prompt_text
+    pm = PEER_RUN.search(prompt_text)
+    peer_run = bool(pm) and pm.group(1) not in AUTOMATED
+    if closed and not looked and (joey_run or peer_run) and said and int(st.get(key + ':decline', 0)) < 1:
+        hit = None
+        for tool in SAID_TOOLS:                                  # notify_joey first (the E3 case), then ask_joey, then reply_agent
+            m = DECLINE_RE.search(said.get(tool, ''))
+            if m:
+                hit = (tool, m.group(0), said[tool])
+                break
+        if hit:
+            tool, word, said_text = hit
+            legacy = joey_run and tool == 'mcp__lane__notify_joey'          # E3 as it was: the catalog
+            if not legacy and API_SUBJECT.search(prompt_text + ' ' + said_text):
+                parts = [(a, svc_output(p.get('cwd'), a)) for a in (('GET', 'mock-api/config'), ('GET', 'mock-api/health'))]
+                parts = [(' '.join(('./bin/svc',) + a), o) for a, o in parts if o]
+            else:
+                parts = []
+            if not parts:
+                o = catalog_output(p.get('cwd'))
+                parts = [('./bin/svc', o)] if o else []
+            if parts:
                 st[key + ':decline'] = 1
                 if save_state(state_p, st):                      # cannot remember = could hold for ever: do not hold
                     lane = os.environ.get('LANE_ID', 'this lane')
+                    to = 'Joey' if tool != 'mcp__lane__reply_agent' else 'a peer'
+                    started = 'Joey' if joey_run else pm.group(1)
+                    body = '\n\n'.join(f'{cmd}:\n{o}' for cmd, o in parts)
                     print(json.dumps({'decision': 'block', 'reason': (
-                        f'⛔ lane-stop-hook: {lane} told Joey it cannot ({m.group(0)}), but this run never looked at the service catalog or made a GET call '
-                        f'(no ./bin/svc catalog or GET). Output of ./bin/svc, run by the hook just now (program output):\n{out}')}, ensure_ascii=False))
+                        f'⛔ lane-stop-hook: {lane} (started by {started}) told {to} it cannot ({word}) with {tool.replace("mcp__lane__", "")}, but this run never looked at '
+                        f'the service catalog or made a GET call (no ./bin/svc catalog or GET). Output of ./bin/svc, run by the hook just now (program output):\n{body}')}, ensure_ascii=False))
                     return
     if closed:
         return

@@ -56,11 +56,13 @@ test('E3: a catalog call or a GET call in the run means it looked: no hold. A PO
   }
 })
 
-test('E3: only a run Joey\'s message started; and only a notify_joey that declines', async () => {
-  expect(await hook(setup(prompt(PEER) + notify(DECLINE)))).toBeNull()                  // a peer's message: not this rule
-  expect(await hook(setup(prompt(JOEY) + tool('mcp__lane__ask_joey', { text: DECLINE })))).toBeNull()   // asking Joey is not declining
-  expect(await hook(setup(prompt(JOEY) + tool('mcp__lane__reply_agent', { to: 'eve', text: DECLINE })))).not.toMatchObject({ decision: 'block', reason: expect.stringContaining('program output') })
+test('E3: a run started by the scheduler or an alert is not covered; a message that does not decline is not held (peer runs and ask_joey / reply_agent are H4: lanes-h4.test.ts)', async () => {
+  const SCHED = '[車道事件 mesh-3｜來源 mesh｜寄件者 scheduler（verified=true）]\n[scheduled][hourly-backup-check][run:47][normal][ops] 查備份'
+  const ALERT = '[車道事件 mesh-4｜來源 mesh｜寄件者 alert-dispatcher（verified=true）]\n[P2][warning] mock-api p95 > 2s'
+  expect(await hook(setup(prompt(SCHED) + notify(DECLINE)))).toBeNull()
+  expect(await hook(setup(prompt(ALERT) + notify(DECLINE)))).toBeNull()
   expect(await hook(setup(prompt(JOEY) + notify('收到，我會查。')))).toBeNull()
+  expect(await hook(setup(prompt(PEER) + notify('收到，維護時段是每週三 02:00–03:00。')))).toBeNull()
 })
 
 test('E3: no catalog to attach (./bin/svc missing, failing or silent) = no hold; a hold needs its own state to be remembered', async () => {
