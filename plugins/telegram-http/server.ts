@@ -1862,6 +1862,15 @@ bot.command('help', async ctx => {
 })
 
 // 002k: /lanes — list, close, master switch, notify profile (lanes.ts lanesCommand). Answered by the daemon, never forwarded to a session.
+// 002k: /main renew — hand the main role to a fresh session (lanes.ts mainRenew). Answered by the daemon.
+bot.command('main', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const sub = (ctx.message?.text ?? '').trim().split(/\s+/)[1] ?? ''
+  if (!Lanes.LANES_ON || sub !== 'renew') { await ctx.reply('用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）'); return }
+  await ctx.reply(await Lanes.mainRenew(ctx.from?.username ?? gated.senderId))
+})
+
 bot.command('lanes', async ctx => {
   const gated = dmCommandGate(ctx)
   if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return

@@ -47,7 +47,7 @@ export const LANES_ON = process.env.GENESIS_LANES === '1'
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const HOP_LIMIT = Number(process.env.LANES_HOP_LIMIT ?? 6)
-import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp } from './lanes-digest.ts'
+import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp, renderActivity } from './lanes-digest.ts'
 import { type Followup, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, runIdOfText, simTime } from './lanes-followup.ts'
 
 const MAX_RUNNING = Number(process.env.LANES_MAX ?? 4)
@@ -455,10 +455,13 @@ function sendJson(res: ServerResponse, code: number, obj: unknown): void {
   res.end(JSON.stringify(obj))
 }
 
+let testCallerPid: number | null = null
+/** exported for tests: register as if the SessionStart hook of process `pid` had called */
+export function __registerMainForTest(sid: string, transcript: string, pid: number) { testCallerPid = pid; try { return registerMain({} as IncomingMessage, { session_id: sid, transcript_path: transcript }) } finally { testCallerPid = null } }
 function registerMain(req: IncomingMessage, b: any): { accepted: boolean; role: string; reason: string; main?: string } {
   const sid = String(b.session_id ?? '')
   if (!/^[0-9a-f-]{36}$/.test(sid)) return { accepted: false, role: 'unknown', reason: 'bad session_id' }
-  const pid = callerClaudePid(req)
+  const pid = testCallerPid ?? callerClaudePid(req)
   let expected = ''
   try { expected = readFileSync(join(LANES_DIR, 'main-expected'), 'utf8').trim() } catch {}
   let why = ''
@@ -481,7 +484,86 @@ function registerMain(req: IncomingMessage, b: any): { accepted: boolean; role: 
   appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'main', session: sid, pid, reason: why, role: D.role })
   logos('lane.register_main', { session_id: sid, pid, transcript: mainReg.transcript_path, role: D.role })
   if (prev && prev.session_id === sid && prev.claude_pid && prev.claude_pid !== pid) onMainReplaced(prev.claude_pid)
+  if (D.role === 'tg' && S?.renew && S.renew.new_sid === sid) void completeRenew()
   return { accepted: true, role: 'main', reason: why }
+}
+
+// ------------------------------------------------------------------ 002k: /main renew — the main role goes to a fresh session
+// design/main-role MR1 「主線本身就不必記得一切。它可以常常換新：新的主線讀焦點卡與最近的帳本，就接得上」 and runtime RU5 「『主』是一個角色…可以轉移」.
+// Joey asks for it (/main renew). The daemon writes the hand-over brief from what is ON DISK (focus card, open commitments, work handed
+// to the main and not settled, open lanes, the day's activity list), marks the new session id for the keeper (run/renew), stops the
+// old process; the keeper starts a fresh session with that id; when it registers, the brief is its first message, Joey is told, and
+// the old session is gone with its tools (only the registered main's MCP session gets them). Deliveries the old process never took in
+// are parked again for the new one.
+const renewFile = (): string => join(LANES_DIR, 'run', 'renew')
+export function handoverBrief(gen: number): string {
+  const recs = readJsonl('ledger.jsonl') as LedgerRec[]
+  const commitments = recs.filter(r => r.kind === 'commitment').slice(-12).map(r => `- ${String(r.text).slice(0, 240)}`)
+  const pend = Object.values(S.handoffs ?? {}).filter(h => h.state !== 'delivered' || Date.now() - h.created < 24 * 3600_000).slice(-8)
+    .map(h => `- ${h.state === 'fallback' ? '（已直接告訴 Joey）' : ''}${h.text.slice(0, 240)}`)
+  const promises = Object.values(S.promises ?? {}).filter(p => p.state !== 'kept').map(p => `- 系統替你告訴 ${p.peer}：${simTime(p.due)} 前回覆「${p.what.slice(0, 120)}」（${p.state === 'overdue' ? '已過時' : '未到期'}）`)
+  const lanes = Object.values(S.lanes).filter(l => l.status !== 'closed').map(l => `- ${laneLabel(l)}（${l.id}）${l.title ? `「${l.title}」` : ''} ${running.has(l.id) ? '執行中' : '閒置'}`)
+  const act = renderActivity(recs.filter(r => Date.now() - Date.parse(r.ts) < 24 * 3600_000))
+  return [
+    `〔系統通知｜主線交接〕你是 ${D.agent} 的主線（第 ${gen} 代）。Joey 要求把主線換成新的 session，你就是新的主線；上一代 session 已經結束，它的對話不在你的 context 裡。`,
+    '下面是交接內容，全部來自磁碟上的焦點卡與帳本。要細節用 ledger_query。先把焦點卡讀過，接著做手上的事；不用回覆這則通知。',
+    '', '## 焦點卡（上一代主線寫的）', focusCard(),
+    '', '## 答應過別人的事', commitments.length ? commitments.join('\n') : '（帳本裡沒有）',
+    ...(promises.length ? ['', '## 系統替你答應的回覆期限', promises.join('\n')] : []),
+    '', '## 交給主線、還要你處理的事', pend.length ? pend.join('\n') : '（沒有）',
+    '', '## 開著的車道', lanes.length ? lanes.join('\n') : '（沒有）',
+    '', '## 最近 24 小時的活動清單', act ? act.lines.join('\n') : '（沒有）',
+  ].join('\n')
+}
+export async function mainRenew(who: string): Promise<string> {
+  if (D?.role !== 'tg' || !S) return '這個 daemon 不管主線。'
+  if (!mainReg || !pidAlive(mainReg.claude_pid)) return '目前沒有登記中、活著的主線可以交接。'
+  if (S.renew && Date.now() - Date.parse(S.renew.at) < 300_000) return '主線交接已經在進行中。'
+  const newSid = randomUUID()
+  const tokens = genuineContextTokens(mainReg.transcript_path)
+  S.renew = { new_sid: newSid, old_sid: mainReg.session_id, old_pid: mainReg.claude_pid, at: nowIso(), by: who, old_tokens: tokens }
+  saveState()
+  try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(renewFile(), newSid + '\n') } catch (e) { delete S.renew; saveState(); return `交接失敗：寫不了交接標記（${e}）。` }
+  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_handover_start', from: mainReg.session_id, to: newSid, by: who, old_tokens: tokens })
+  logos('lane.main_renew', { from: mainReg.session_id, to: newSid, by: who, old_tokens: tokens })
+  const pid = mainReg.claude_pid
+  setTimeout(() => { try { process.kill(pid, 'SIGTERM') } catch {} }, 500)      // the keeper sees the session end and starts the fresh one
+  setTimeout(() => { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch {} }, 15_000)
+  return `主線換新中：舊 session ${mainReg.session_id.slice(0, 8)}（context 約 ${Math.round(tokens / 1000)}k token）會結束，新的主線接手後我再告訴你交接了什麼。`
+}
+async function completeRenew(): Promise<void> {
+  const r = S.renew
+  if (!r) return
+  S.main_gen = (S.main_gen ?? 1) + 1
+  const gen = S.main_gen
+  delete S.renew; saveState()
+  try { rmSync(renewFile()) } catch {}
+  const brief = handoverBrief(gen)
+  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_handover', note: 'main handover', from: r.old_sid, to: r.new_sid, gen, by: r.by })
+  ledger({ lane: 'router', kind: 'action', notify_main: false, text: `main handover：主線交接給新 session ${r.new_sid.slice(0, 8)}（第 ${gen} 代，上一代 ${r.old_sid.slice(0, 8)}，約 ${Math.round(r.old_tokens / 1000)}k token）`, refs: { from: r.old_sid, to: r.new_sid, gen } })
+  const n = D.repersistUnconsumed?.() ?? 0                       // what the old process never took in goes to the new one
+  let told = false
+  try {
+    for (let i = 0; i < 12 && !(await digestIO.mainConnected()); i++) await new Promise(res => setTimeout(res, 2_500))
+    told = await digestIO.deliver(brief, { user: 'lanes', kind: 'handover', no_reply: 'true', wake: 'true' })
+  } catch (e) { D.log('warn', `lanes: handover brief not delivered: ${e}`) }
+  logos('lane.main_handover', { from: r.old_sid, to: r.new_sid, gen, brief_delivered: told, redelivered: n, brief_chars: brief.length })
+  const text = `主線換新了：第 ${gen} 代 session ${r.new_sid.slice(0, 8)} 接手（上一代約 ${Math.round(r.old_tokens / 1000)}k token）。交接內容：焦點卡、答應過的事、待處理的交辦、開著的車道、最近 24 小時的活動清單${told ? '' : '（交接內容沒有送到新主線，請叫它用 ledger_query 補看）'}。`
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-renew', escalated: true } })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-renew', message_id: id }))
+}
+/** context size of a session's newest genuine call (input + cache read + cache creation) */
+function genuineContextTokens(path: string): number {
+  const text = tailText(path, 300_000) ?? ''
+  const lines = text.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes('"usage"')) continue
+    try {
+      const j = JSON.parse(lines[i]); const u = j.message?.usage
+      if (j.type === 'assistant' && u && j.message?.model !== '<synthetic>') return (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
+    } catch {}
+  }
+  return 0
 }
 
 // ================================================================== state (tg role)
@@ -515,6 +597,8 @@ type State = {
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
   main_stuck?: { call: string; since: number; told_at: string; tool: string }   // 002k: the main has sat in one tool call past LANES_MAIN_STUCK_MS
+  renew?: { new_sid: string; old_sid: string; old_pid: number; at: string; by: string; old_tokens: number }   // 002k: /main renew in progress
+  main_gen?: number                                                    // 002k: how many times the main role was handed to a fresh session (+1)
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
   main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
 }
