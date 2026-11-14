@@ -1890,8 +1890,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
     case 'ledger_write': {
       const kind = String(a.kind ?? '')
       if (!['action', 'commitment', 'memory_proposal', 'receipt'].includes(kind)) throw new Error('bad kind: use handoff_main to hand work to the main, ask_joey to ask Joey')
-      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: kind as LedgerKind, text: String(a.text ?? '').slice(0, 1000),
-        notify_main: ['commitment', 'memory_proposal'].includes(kind), refs: a.refs, detail: lane.transcript })
+      const review = kind === 'memory_proposal' ? await proposalReview(String(a.text ?? ''), queue.get(tok.evId)?.ev) : null
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: kind as LedgerKind, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : ''),
+        notify_main: ['commitment', 'memory_proposal'].includes(kind), refs: { ...(a.refs ?? {}), ...(review ? { review: review.refs } : {}) }, detail: lane.transcript })
       return `ledger: ${kind} recorded`
     }
     case 'commitment': {
@@ -2016,6 +2017,68 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
     }
   }
   throw new Error(`unknown lane tool ${name}`)
+}
+
+// ------------------------------------------------------------------ 002k: Jev review of a memory proposal (Jev design A4)
+// Memory has one writer (the main, or the curator while it holds the right); lanes only propose. Each proposal now carries a review
+// the writer reads with it: program first, the memory lines that share the most words with the proposal (at most 6, from the memory
+// directory); then Jev, three narrow questions: is it backed by the message the lane saw; does it claim more than that message
+// says; which memory line does it contradict, if any. Nothing is blocked or written here; a failed call adds no review.
+function memorySnippets(text: string, k = 6): Array<{ id: string; file: string; line: string }> {
+  const words = new Set((text.toLowerCase().match(/[a-z0-9_:\-]{3,}|[一-鿿]{2}/g) ?? []))
+  if (!words.size) return []
+  const scored: Array<{ file: string; line: string; score: number }> = []
+  const walk = (d: string, depth: number) => {
+    let names: string[] = []
+    try { names = readdirSync(d) } catch { return }
+    for (const n of names) {
+      if (n.startsWith('.')) continue
+      const fp = join(d, n)
+      try {
+        const st = statSync(fp)
+        if (st.isDirectory()) { if (depth < 2) walk(fp, depth + 1); continue }
+        if (!n.endsWith('.md') || st.size > 200_000) continue
+        for (const line of readFileSync(fp, 'utf8').split('\n')) {
+          const t = line.trim(); if (t.length < 8) continue
+          const lw = t.toLowerCase().match(/[a-z0-9_:\-]{3,}|[一-鿿]{2}/g) ?? []
+          let sc = 0; for (const w of new Set(lw)) if (words.has(w)) sc++
+          if (sc >= 2) scored.push({ file: fp.slice(memoryDir().length + 1), line: t.slice(0, 300), score: sc })
+        }
+      } catch {}
+    }
+  }
+  walk(memoryDir(), 0)
+  return scored.sort((a, b) => b.score - a.score).slice(0, k).map((x, i) => ({ id: `M${i + 1}`, file: x.file, line: x.line }))
+}
+async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ note: string; refs: Record<string, unknown> } | null> {
+  if (process.env.LANES_PROPOSAL_REVIEW !== '1' || !text.trim()) return null
+  const mem = memorySnippets(text)
+  const q: Record<string, unknown> = {
+    backed: { type: 'noul', instructions: 'Is `proposal` backed by `message` (the message the agent saw), rather than invented or assumed?' },
+    overreach: { type: 'noul', instructions: 'Does `proposal` claim more than `message` says (a wider scope, a permanent rule from a one-off, a different value)?' },
+  }
+  if (mem.length) q.conflict = { type: 'choice', instructions: 'Which item of `memory` does `proposal` contradict?', criteria: { ...Object.fromEntries(mem.map(m => [m.id, null])), none: 'It contradicts none of them' } }
+  try {
+    const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
+    if (!key) return null
+    const res = await fetch((process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone', { method: 'POST', signal: AbortSignal.timeout(8000),
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-proposal-review/1' },
+      body: JSON.stringify({ model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-1.14.0', questions: q,
+        state: { setting: 'An agent proposes adding `proposal` to its long-term memory. `message` is what it saw; `memory` are existing memory lines that may be related.',
+          proposal: text.slice(0, 1500), message: { from: ev?.from ?? '?', verified: ev?.verified === true, text: (ev?.text ?? '').slice(0, 2000) }, memory: mem.length ? mem : '(no related lines)' } }) })
+    const a = (await res.json().catch(() => null))?.answers
+    if (!res.ok || !a) return null
+    const backed = a.backed?.noul ?? null, over = a.overreach?.noul ?? null
+    const c = a.conflict?.choice ?? null, cc = a.conflict?.confidence ?? null
+    const hit = c && c !== 'none' && (cc ?? 0) >= 0.7 ? mem.find(m => m.id === c) : undefined
+    const parts = [
+      typeof backed === 'number' ? (backed >= 0.7 ? '有依據' : backed <= 0.3 ? '依據不足' : '依據不明') : null,
+      typeof over === 'number' && over >= 0.7 ? '可能說得比原話多' : null,
+      hit ? `跟記憶「${hit.file}：${hit.line.slice(0, 80)}」衝突` : null,
+      ev && ev.verified === false ? '寄件人未驗證' : null,
+    ].filter(Boolean)
+    return { note: `〔Jev 檢查：${parts.join('；') || '無意見'}〕`, refs: { backed, overreach: over, conflict: hit ? { file: hit.file, line: hit.line, confidence: cc } : null, sender_verified: ev?.verified === true } }
+  } catch { return null }
 }
 
 // ------------------------------------------------------------------ 002k: a lane's report is checked against its own tool results (Jev design A3)
