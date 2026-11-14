@@ -1400,10 +1400,24 @@ export function sweepQueue(): void {
   pump()
 }
 
+// 002k (B1): what a lane's `claude -p` starts with. Measured on gpu-box (claude 2.1.322, haiku-5-5, the real lane tool schemas, 3 API
+// calls per run): the first call is 57,530 tokens with the old flags; --disable-slash-commands alone 39,701 (the skill listing, ~17.8k);
+// plus --tools Bash,Read,ToolSearch 19,508 (the other tool schemas, the Agent/Skill tools and the agent listing, ~20.2k). The lane tools
+// (mcp__lane__*), the lane hooks and the lane card are all still there (receipt was called, the Stop hook ran, the card is in the prompt).
+// ENABLE_TOOL_SEARCH=false: the lane tools are loaded at once, no ToolSearch call: 2 API calls instead of 3, 41,952 tokens over the run
+// instead of 60,277, at +1.2k on the first call (20,745). LANES_TOOL_SEARCH=1 leaves tool search on.
+/** The built-in tools a lane of this kind gets. Write/Edit only for the kinds whose guard hook can let a write through: a worker or fork
+ *  (a workspace file it has claimed) and the curator (memory, while it holds the write right). A reflex or synthesis lane never edits
+ *  a workspace file (lane-guard-hook.py denies it), so it has no use for them; it can still write a scratch file through Bash. */
+export function laneBuiltinTools(kind: LaneKind): string {
+  const edits = kind === 'worker' || kind === 'fork' || kind === 'curator'
+  return ['Bash', 'Read', ...(edits ? ['Write', 'Edit'] : []), 'ToolSearch'].join(',')
+}
 function laneEnv(lane: Lane): Record<string, string> {
   const keep = ['PATH', 'LANG', 'LC_ALL', 'TERM', 'XDG_RUNTIME_DIR', 'USER', 'LOGNAME', 'SHELL']
   const env: Record<string, string> = { HOME: homedir() }
   for (const k of keep) if (process.env[k]) env[k] = process.env[k]!
+  if (process.env.LANES_TOOL_SEARCH !== '1') env.ENABLE_TOOL_SEARCH = 'false'   // 002k (B1): lane tools are loaded at once (see above)
   env.GENESIS_ACTOR = lane.id
   env.LANES_DIR = LANES_DIR
   env.LANE_ID = lane.id
@@ -1557,6 +1571,7 @@ function startRun(it: QItem): void {
     '--settings', join(LANES_DIR, 'lane-settings.json'),
     '--output-format', 'stream-json', '--verbose',
     '--dangerously-skip-permissions',
+    '--disable-slash-commands', '--tools', laneBuiltinTools(lane.kind),     // 002k (B1)
     '--disallowedTools', 'AskUserQuestion', 'ExitPlanMode')
   const child = spawn(CLAUDE_BIN, args, { cwd: D.workspaceDir, env: laneEnv(lane), stdio: ['ignore', 'pipe', 'pipe'] })
   it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
