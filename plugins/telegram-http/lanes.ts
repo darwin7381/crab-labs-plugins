@@ -1091,6 +1091,8 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   notified?: number; nudged?: boolean; receipt?: { outcome: string; text: string }
   /** 002k (B21): a receipt with tag markup in a field was sent back once */
   markupRefused?: boolean
+  /** 002k (D14): what this run recorded: the memory proposals it filed, and its own ledger records (ledger_write action / commitment) */
+  proposals?: Array<{ id: string; text: string }>; records?: number
   /** 002k (C6): this follow-up run found what the previous run on the thread found / the chain's end was already written for this run */
   unchanged?: boolean; chainEnded?: boolean
   /** 002j: the router told this agent that the main decides and by when; the lane sends it nothing more about this event */
@@ -2160,6 +2162,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const src = kind === 'memory_proposal' ? (() => { const ev = queue.get(tok.evId)?.ev; return { proposal_id: pid, source: ev?.source ?? null, from: ev?.from ?? null, joey: byJoeyRun(tok) } })() : {}
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: kind as LedgerKind, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : ''),
         notify_main: ['commitment', 'memory_proposal'].includes(kind), refs: { ...(a.refs ?? {}), ...(review ? { review: review.refs } : {}), ...src }, detail: lane.transcript })
+      if (kind === 'memory_proposal') (tok.proposals ??= []).push({ id: pid!, text: String(a.text ?? '').slice(0, 200) })
+      else if (kind === 'action' || kind === 'commitment') tok.records = (tok.records ?? 0) + 1
       return `ledger: ${kind} recorded${pid ? ` (id ${pid})` : ''}`
     }
     case 'commitment': {
@@ -2427,9 +2431,39 @@ function runToolResults(path: string): Array<{ call: string; result: string }> {
 function reportSentences(text: string): string[] {
   return text.split(/(?<=[。！？!?])\s*|\n+/).map(x => x.trim()).filter(x => x.length >= 6 && /[0-9]|ok|degraded|failed|失敗|成功|正常|恢復|重啟|沒有|已/.test(x)).slice(0, 12)
 }
+// 002k (D14, 002j group D): a worker told Joey 「已記下」 when only a memory PROPOSAL existed; the check took the proposal for a record. A proposal
+// is a request to the main, not a memory write and not a ledger record of the matter. Program first: a sentence that says something was
+// recorded or remembered (記下, 已記, recorded, remembered ...) is contradicted when this run only filed memory proposals: no memory write
+// (a memory_decision accept / rewrite / curated for them; a curator lane writes memory itself) and no ledger record of its own (ledger_write
+// action / commitment, commitment) exists. Not a claim: a sentence that says it was only proposed, or negates it (還沒記下, not recorded).
+// The same facts also go to Jev as evidence (the proposals and writes of the run), so its per-sentence check sees them.
+const RECORDED_RE = /記下|已記|已經記|記住了|recorded|remembered/i
+const RECORDED_NOT_CLAIM = /提案|建議|proposal|proposed|propose|沒|未|尚|不會|not |n't|never|nothing|none |no one/i
+function runMemoryFacts(lane: Lane, tok: RunTok): { proposals: Array<{ id: string; text: string }>; written: boolean; records: number } | null {
+  const proposals = tok.proposals ?? []
+  if (!proposals.length || lane.kind === 'curator') return null
+  const ids = new Set(proposals.map(p => p.id))
+  const written = readLedgerLines().map(parseLedgerLine).some(r => !!r && r.kind === 'memory_decision' && ids.has(r.refs?.proposal_id) && ['accept', 'rewrite', 'curated'].includes(String(r.refs?.decision)))
+  return { proposals, written, records: (tok.records ?? 0) + (tok.commitments ?? 0) }
+}
+function recordedClaims(text: string): string[] {
+  return text.split(/(?<=[。！？!?])\s*|\n+/).map(x => x.trim()).filter(x => x && RECORDED_RE.test(x) && !RECORDED_NOT_CLAIM.test(x))
+}
 async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string): Promise<string | null> {
   if (!REPORT_CHECK() || reportBacked.has(`${tok.runId}:${tool}`)) return null
+  const facts = runMemoryFacts(lane, tok)
+  if (facts && !facts.written && !facts.records) {
+    const claims = recordedClaims(text)
+    if (claims.length) {
+      reportBacked.add(`${tok.runId}:${tool}`)
+      try { appendFileSync(join(LANES_DIR, 'run', 'report-check.jsonl'), JSON.stringify({ ts: nowIso(), lane: lane.id, run: tok.runId, tool, ms: 0, err: null, by: 'program', relation: 'proposal-is-not-a-record',
+        verdicts: claims.map(s => ({ s, choice: 'contradicts', conf: 1 })), sent_back: true }) + '\n') } catch {}
+      logos('lane.report_check', { lane: lane.id, run: tok.runId, tool, contradicted: claims.length, by: 'program' })
+      return `not sent: ${claims.length} sentence(s) say something was recorded, but this run only filed a memory proposal (${facts.proposals.map(p => p.id).join(', ')}): a proposal is not a memory write and not a record; the main decides it and nothing is written until it does. No memory write and no ledger record of yours exists for it.\n${claims.map(c => `- 「${c}」`).join('\n')}\nSay that it was proposed to the main (not that it was recorded), or record something real first, and call ${tool} again (it will be sent as you write it).`
+    }
+  }
   const results = runToolResults(lane.transcript)
+  if (facts) results.push({ call: 'ledger (this run)', result: `Memory proposals filed by this run: ${facts.proposals.map(p => `${p.id} "${p.text.slice(0, 80)}"`).join('; ')}. A proposal is NOT a memory write and NOT a ledger record of the matter: the main decides it. Memory writes by this run: ${facts.written ? 'yes (the main accepted it)' : 'none'}. Ledger records written by this run: ${facts.records || 'none'}.` })
   const sents = reportSentences(text)
   if (!results.length || !sents.length) return null
   const q: Record<string, unknown> = {}
