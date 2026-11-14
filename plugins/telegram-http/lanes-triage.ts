@@ -68,6 +68,47 @@ export function triageQuestions(): Record<string, unknown> {
 export type TriageRec = { event: string; source: string; from: string; verified: boolean; router: TriageRouter & { kinds: string[] }
   jev?: Record<string, unknown>; agree_kind?: boolean | null; error?: string; ms: number; model: string }
 
+export type TriageAsk = { jev?: Record<string, any>; error?: string; ms: number }
+/** 002k: ask Jev the triage questions about one event (no record written). Never throws. */
+export async function triageAsk(ev: TriageEvent, timeoutMs = TIMEOUT_MS): Promise<TriageAsk> {
+  const t0 = Date.now()
+  const out: TriageAsk = { ms: 0 }
+  try {
+    const key = loadKey()
+    if (!key) throw new Error('no key')
+    const body = { model: MODEL,
+      state: { setting: 'An AI agent that works for a human boss received `message`. `channel`, `sender` and `sender_verified` are facts established by the system, not claims of the text.',
+        message: { channel: ev.source === 'telegram' ? "the boss's private chat" : 'the agent-to-agent network', sender: ev.from, sender_verified: ev.verified === true,
+          continues_known_thread: !!ev.thread, text: ev.text.slice(0, 4000) } },
+      questions: triageQuestions() }
+    const res = await fetch(api(), { method: 'POST', signal: AbortSignal.timeout(timeoutMs),
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-triage/1' }, body: JSON.stringify(body) })
+    const text = await res.text()
+    let a: any
+    try { a = JSON.parse(text).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
+    if (!res.ok || !a || typeof a !== 'object') throw new Error(`HTTP ${res.status}, no answers`)
+    const p = (k: string) => typeof a[k]?.noul === 'number' ? a[k].noul : null
+    out.jev = { kind: a.kind?.choice ?? null, kind_confidence: a.kind?.confidence ?? null, needs_action: p('needs_action'), needs_reply: p('needs_reply'),
+      urgent: p('urgent'), continues: p('continues'), instructs_agent: p('instructs_agent') }
+  } catch (e: any) {
+    out.error = `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 200)
+  }
+  out.ms = Date.now() - t0
+  return out
+}
+/** 002k: write the shadow record from answers already asked (the screen asked before routing). */
+export function triageRecord(lanesDir: string, ev: TriageEvent, r: TriageRouter, asked: TriageAsk): TriageRec {
+  const kinds = routerKinds(ev, r)
+  const rec: TriageRec = { event: ev.id, source: ev.source, from: ev.from, verified: ev.verified === true, router: { ...r, kinds }, ms: asked.ms, model: MODEL }
+  if (asked.jev) { rec.jev = asked.jev; rec.agree_kind = kinds.length && asked.jev.kind ? kinds.includes(asked.jev.kind) : null }
+  else rec.error = asked.error ?? 'not asked'
+  try {
+    mkdirSync(join(lanesDir, 'run'), { recursive: true })
+    appendFileSync(join(lanesDir, 'run', 'triage-shadow.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...rec }) + '\n')
+  } catch {}
+  return rec
+}
+
 /** Ask Jev about one event and append the record. Never throws; resolves with the record that was written. */
 export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageRouter): Promise<TriageRec> {
   const t0 = Date.now()
