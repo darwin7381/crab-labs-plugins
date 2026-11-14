@@ -663,7 +663,7 @@ function newLane(kind: LaneKind, opts: Partial<Lane> & { thread?: string } = {})
 }
 
 // ================================================================== ledger / focus
-type LedgerKind = 'action' | 'commitment' | 'escalation' | 'memory_proposal' | 'memory_decision' | 'receipt' | 'notify' | 'fyi' | 'stop'
+type LedgerKind = 'action' | 'commitment' | 'escalation' | 'memory_proposal' | 'memory_decision' | 'receipt' | 'notify' | 'fyi' | 'stop' | 'lane_lifecycle'
 function ledger(e: { lane: string; thread?: string | null; event?: string; kind: LedgerKind; text: string; notify_main: boolean; refs?: unknown; detail?: string }): void {
   appendJsonl('ledger.jsonl', { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, kind: e.kind, text: e.text,
     notify_main: e.notify_main, refs: e.refs ?? null, detail: e.detail ?? null })
@@ -1108,8 +1108,29 @@ const runTokens = new Map<string, RunTok>()
 const qPath = (id: string) => join(LANES_DIR, 'queue', `${id.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`)
 
 function saveQ(it: QItem): void { try { writeJsonAtomic(qPath(it.ev.id), it) } catch (e) { D.log('error', `lanes: queue write ${e}`) } }
+// 002k (G11, 002j group G): lane.runs is counted only when a run's exit is seen, so a run killed together with the daemon was never counted: the next
+// spawn reused its id (adam.worker.1.r1 spawned twice) and the dead attempt had no exit row. At boot, for each item that was RUNNING when the
+// daemon stopped (leased, and no exit row for its run in lanes.jsonl: a run that ended and waits for its retry already has one), the restore
+// writes the exit row the dead process never could (signal 'daemon-restart': the lab reads it as "crashed: killed by daemon-restart"), counts
+// the run when it left a conversation to resume (the same rule as the exit handler: no transcript = nothing to resume = not counted, so the
+// retry starts a fresh session instead of --resume of nothing), and adds a lane_lifecycle line to the ledger. Its tokens are lost with the daemon.
+function closeCutRun(it: QItem, exited: Set<string>): boolean {
+  const lane = S.lanes[it.lane]
+  if (!it.run || !lane || exited.has(it.run)) return false
+  const resumable = !!lane.transcript && existsSync(lane.transcript)
+  if (resumable) lane.runs += 1
+  exited.add(it.run)
+  appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: it.run, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
+    exit_code: null, signal: 'daemon-restart', duration_s: null, calls: 0, tokens_in: 0, tokens_out: 0, tools: [], closers: [], restored: true, counted: resumable })
+  logos('lane.exit', { lane: lane.id, run: it.run, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript, exit_code: null, signal: 'daemon-restart', calls: 0, tokens_in: 0, tokens_out: 0, closers: [] })
+  ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'lane_lifecycle', notify_main: false,
+    text: `lane ${lane.id} run ${it.run} crashed: daemon restarted (the run was cut off; its event ${it.ev.id} is run again)`,
+    refs: { run: it.run, signal: 'daemon-restart', counted: resumable, runs: lane.runs } })
+  return true
+}
 function loadQueue(): void {
-  let cut = 0
+  let cut = 0, closed = 0
+  const exited = new Set<string>(readJsonl('lanes.jsonl').filter(r => r.kind === 'exit' && r.run).map(r => String(r.run)))
   try {
     for (const f of readdirSync(join(LANES_DIR, 'queue'))) {
       if (!f.endsWith('.json')) continue
@@ -1120,13 +1141,15 @@ function loadQueue(): void {
         // token died with that daemon), so whatever is left of it is stopped and the event is dispatched again by the first
         // sweep, not when the old lease runs out (first bad-day run: a peer waited 4 minutes for a one-line answer).
         reapOrphan(it)
+        if (closeCutRun(it, exited)) closed++
         it.lease_until = 0; saveQ(it)
         cut++
       }
       queue.set(it.ev.id, it)
     }
   } catch {}
-  if (queue.size) D.log('info', `lanes: ${queue.size} lane event(s) restored from disk; ${cut} were running when the daemon stopped and are dispatched again now`)
+  if (closed) saveState()
+  if (queue.size) D.log('info', `lanes: ${queue.size} lane event(s) restored from disk; ${cut} were running when the daemon stopped (${closed} run(s) closed as crashed) and are dispatched again now`)
 }
 /** a lane process left by the previous daemon: stop it if it is really that run (the pid may belong to something else by now) */
 function reapOrphan(it: QItem): void {

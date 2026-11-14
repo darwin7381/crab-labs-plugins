@@ -13,7 +13,7 @@ export type LedgerRec = {
   ts: string; lane: string; thread: string | null; event?: string | null; kind: string; text: string
   notify_main: boolean; refs?: any; detail?: string | null
 }
-export const LEDGER_KINDS = ['action', 'commitment', 'escalation', 'memory_proposal', 'memory_decision', 'receipt', 'notify', 'fyi', 'stop'] as const
+export const LEDGER_KINDS = ['action', 'commitment', 'escalation', 'memory_proposal', 'memory_decision', 'receipt', 'notify', 'fyi', 'stop', 'lane_lifecycle'] as const
 
 export function parseLedgerLine(l: string): LedgerRec | null {
   try {
@@ -301,7 +301,7 @@ function activityLine(v: View): string {
   const mainDid = by('action').filter(r => r.lane === 'main').map(r => clip(r.text, 200))
   const handed = [...by('escalation'), ...by('stop')]
   const happened = rep?.happened || by('fyi')[0]?.text || (notes[0] ? stripTier(notes[0].text) : '') || handed[0]?.text
-    || actions[0] || mainDid[0] || by('receipt')[0]?.text || markText(v.recs) || '（沒有文字）'
+    || actions[0] || mainDid[0] || by('receipt')[0]?.text || markText(v.recs) || by('lane_lifecycle')[0]?.text || '（沒有文字）'
   const did = rep?.did || actions.slice(0, 3).map(t => clip(t, 160)).join('；')
   const promised = rep?.promised || by('commitment').map(r => clip(r.text, 160)).join('；')
   const needs = handed.map(r => clip(r.text, 260))
@@ -352,6 +352,7 @@ export const LEDGER_KIND_HELP: Record<string, string> = {
   notify: 'messages sent to Joey, with their tier',
   fyi: 'notice-only records',
   stop: 'threads that were stopped',
+  lane_lifecycle: 'what happened to a lane run (crashed: daemon restarted ...)',
 }
 export const LEDGER_QUERY_DESCRIPTION =
   "[lanes · main only] The agent's ledger: everything the lanes handled, told Joey, promised or handed over. " +
