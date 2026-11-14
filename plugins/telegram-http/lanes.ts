@@ -576,7 +576,11 @@ type Lane = {
   fork_from?: string
 }
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
-  ask_cls?: string }                                                   // event class of the lane run that last asked a peer here
+  ask_cls?: string                                                     // event class of the lane run that last asked a peer here
+  /** 002k (B12): repeats of this thread's alert that arrived while no run could take them; the next run of the thread starts with them (extra) */
+  repeats?: InEvent[] }
+/** 002k (B12): the alert a thread was opened for, by fingerprint: sender + text with the digits masked */
+type AlertFp = { thread: string; sev: string; repeats: number; first: string; last: string }
 type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number }
 type Fanout = { id: string; brief: string; tasks: string[]; members: string[]; results: Record<string, string>; created: string; synthesis?: string; done?: string }
 type MainWall = { since: string; kind: string; text: string; model: string; err_at: number; mid_task: boolean; probes: number; acked_at?: number; held?: number }
@@ -595,6 +599,7 @@ type State = {
   promises: Record<string, Promise24>                                  // 002j: "the main answers you by HH:MM", told to a peer by the router
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
   must_marked?: Record<string, number>                                 // 002k (B2): events already marked 【主線必須知道】 (event id → ms): one mark per event
+  alert_fp?: Record<string, AlertFp>                                   // 002k (B12): alert fingerprint → the thread that handles it
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
@@ -674,6 +679,8 @@ export type InEvent = {
   synthetic?: string
   /** 002k: this event is one task of a fan-out (main tool fan_out); its lane hands the result back with report_result */
   fanout?: string
+  /** 002k (B12): this event is a repeat of the alert of this thread; it rides along in that thread's next run (QItem.extra) */
+  repeat_of?: string
   /** trigger class set by the router (rule `trigger`, refined by critical_regex / info_regex) */
   trigger?: string
   /** event class used for the notify tier: = trigger, except a reply in a thread inherits the class of
@@ -925,6 +932,8 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
     }
     case 'reflex': {
       const critical = !!(r.critical_regex && new RegExp(r.critical_regex, 'i').test(ev.text))
+      const rep = alertRepeat(ev, critical)                  // 002k (B12): a repeat of an alert that is already being handled opens no lane
+      if (rep) return rep
       // a peer opening a conversation that already carries ITS thread id: bind our lane to it
       let t: Thread | null = null
       if (ev.thread && !S.threads[ev.thread]) {
@@ -933,6 +942,7 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
         t = ensureThread(ev.thread, null, ev.from, hopIn)
       }
       const lane = newLane('reflex', { thread: t?.id, critical })
+      noteAlert(ev, lane.thread)
       const th = S.threads[lane.thread]
       if (!t) {
         // a fresh local thread: its peer is the agent that opened it (alerts / scheduler have none)
@@ -946,6 +956,59 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
     default:
       return { ...base, target: 'main', note: `unknown target ${r.to} → main` }
   }
+}
+
+// ------------------------------------------------------------------ 002k (B12): alert dedupe
+// 002j group B (B08): 12 repeats of one alert ("（第 n 次偵測）") opened 12 lanes (5.9M tokens, 2.9M more in follow-ups); the design promises
+// dedupe (design/notify, identity rule 6) and the 002k coalescing leaves alerts out. An alert's fingerprint is its sender plus its text
+// with the digits masked. While the thread that handles an alert has a queued or running lane, a pending follow-up, or ended less than
+// LANES_ALERT_REPEAT_MINUTES ago, the same alert opens no lane: the router writes "repeat n of <thread>" to the ledger (not for the
+// main) and the text rides along in that thread's next run (QItem.extra). A critical alert keeps its own run (each is its own deadline,
+// ring and report), and so does a repeat whose severity changed (class or P-level).
+let ALERT_REPEAT_MIN = Number(process.env.LANES_ALERT_REPEAT_MINUTES ?? 10)
+/** tests only */
+export const __setAlertRepeatMin = (m: number): void => { ALERT_REPEAT_MIN = m }
+export function alertFingerprint(from: string, text: string): string {
+  return `${from}|${String(text ?? '').replace(/[0-9０-９]+/g, '#').replace(/\s+/g, ' ').trim().slice(0, 300)}`
+}
+const alertSeverity = (ev: InEvent): string => `${ev.trigger ?? ''}|${(ev.text.match(/\[P[0-4]\]/i)?.[0] ?? '').toUpperCase()}`
+const isAlertEvent = (ev: InEvent): boolean => ev.source === 'mesh' && !ev.synthetic && routerCfg().alert_senders.includes(ev.from)
+const lightEvent = (ev: InEvent, of: string): InEvent => ({ id: ev.id, source: ev.source, from: ev.from, text: ev.text, meta: {}, notif: { method: '', params: {} },
+  verified: ev.verified, btcc_msg_id: ev.btcc_msg_id, repeat_of: of })
+function alertRepeat(ev: InEvent, critical: boolean): Decision | null {
+  if (critical || !isAlertEvent(ev)) return null
+  const fp = alertFingerprint(ev.from, ev.text)
+  const rec = S.alert_fp?.[fp]
+  if (!rec || rec.sev !== alertSeverity(ev)) return null
+  const th = S.threads[rec.thread]
+  const owner = th?.lane ? S.lanes[th.lane] : undefined
+  if (!th || !owner || owner.status === 'closed') return null
+  const open = [...queue.values()].filter(i => i.lane === owner.id && (i.state === 'queued' || i.state === 'leased'))
+  const busy = open.length > 0 || running.has(owner.id) || owner.status === 'running'
+  const follow = Object.values(S.followups).some(f => f.thread === th.id && f.state === 'pending')
+  const recent = owner.runs > 0 && Date.now() - Date.parse(owner.last) < ALERT_REPEAT_MIN * 60_000
+  if (!busy && !follow && !recent) return null
+  rec.repeats += 1; rec.last = nowIso()
+  const n = rec.repeats
+  const light = lightEvent(ev, th.id)
+  const waiting = open.find(i => i.state === 'queued')            // the owner's next run is already queued: the repeat rides in it
+  if (waiting) { waiting.extra = [...(waiting.extra ?? []), light]; saveQ(waiting) }
+  else th.repeats = [...(th.repeats ?? []), light].slice(-20)    // otherwise it starts the thread's next run (a follow-up, or whatever comes)
+  saveState()
+  ledger({ lane: 'router', thread: th.id, event: ev.id, kind: 'action', notify_main: false,
+    text: `repeat ${n} of ${th.id}：同一個警報又來了，沒有另開車道（${busy ? '這條線還在處理' : follow ? '這條線有後續檢查排著' : `這條線 ${ALERT_REPEAT_MIN} 分鐘內才處理完`}），原文隨這條線的下一趟一起看。原文：${ev.text.slice(0, 300)}`,
+    refs: { fingerprint: fp, repeat: n, of: th.id, owner: owner.id, btcc_msg_id: ev.btcc_msg_id ?? null } })
+  return { rule: 'alert-repeat', target: 'ledger', lane: owner.id, note: `repeat ${n} of ${th.id}: no lane opened; handed to ${owner.id}'s next run` }
+}
+/** the alert a new lane's thread was opened for (so its repeats find it) */
+function noteAlert(ev: InEvent, thread: string): void {
+  if (!isAlertEvent(ev)) return
+  S.alert_fp ??= {}
+  const now = nowIso()
+  S.alert_fp[alertFingerprint(ev.from, ev.text)] = { thread, sev: alertSeverity(ev), repeats: 0, first: now, last: now }
+  const keys = Object.keys(S.alert_fp)
+  if (keys.length > 500) for (const k of keys.sort((a, b) => S.alert_fp![a].last.localeCompare(S.alert_fp![b].last)).slice(0, keys.length - 400)) delete S.alert_fp[k]
+  saveState()
 }
 
 function dispatch(ev: InEvent, lane: Lane | undefined, base: { rule: string; critical?: boolean }): Decision {
@@ -1027,6 +1090,9 @@ function reapOrphan(it: QItem): void {
 }
 function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string): void {
   const it: QItem = { ev, lane: laneId, state: 'queued', lease_until: 0, attempts: 0, priority, summary, enqueued: nowIso() }
+  // 002k (B12): alert repeats that came while this thread had no run to take them start its next run
+  const th = S.threads[S.lanes[laneId]?.thread ?? '']
+  if (th?.repeats?.length) { it.extra = [...th.repeats]; th.repeats = []; saveState() }
   queue.set(ev.id, it); saveQ(it)
   if (S.wall && S.lanes[laneId]?.critical) ringCriticalBehindWall(it, S.lanes[laneId])
   pump()
@@ -1355,9 +1421,11 @@ function coalesce(it: QItem, waiting: QItem[]): void {
 function runPrompt(it: QItem, lane: Lane): string {
   const head = laneContext(lane, it)
   if (!it.extra?.length) return `${head}\n${renderEvent(it.ev)}`
-  return [head, renderEvent(it.ev), '',
-    `〔同一個對話在你上一趟還在跑的時候，${it.ev.from} 又來了 ${it.extra.length} 則。下面一起處理，用一則回覆回答全部（reply_to 用最後一則的編號）。〕`, '',
-    ...it.extra.map(renderEvent)].join('\n')
+  const repeats = it.extra.filter(e => e.repeat_of), more = it.extra.filter(e => !e.repeat_of)
+  return [head, renderEvent(it.ev),
+    ...(more.length ? ['', `〔同一個對話在你上一趟還在跑的時候，${it.ev.from} 又來了 ${more.length} 則。下面一起處理，用一則回覆回答全部（reply_to 用最後一則的編號）。〕`, '', ...more.map(renderEvent)] : []),
+    ...(repeats.length ? ['', `〔同一個警報又來了 ${repeats.length} 次（指紋相同，只有數字不同），分流器沒有另開車道，交給這一趟一起看。次數與時間本身也是資訊；一起回報一次，不要為每一次各回報一次。〕`, '', ...repeats.map(renderEvent)] : []),
+  ].join('\n')
 }
 /** 002c: start the follow-up lanes whose simulated due time has come (the daemon runs under the simulated clock; the
  *  runner jumps the clock to a due follow-up before the next event). Same thread = same conversation: dispatch() resumes
