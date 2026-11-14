@@ -1917,7 +1917,19 @@ export function promiseTick(): void {
 }
 
 // ================================================================== lane tools (MCP for lanes)
+// 002k (B20): the same filters as the main's ledger_query, so a lane can look back itself (the runbook needs "restarts in the last 24 h":
+// three lanes handed a routine alert to the main for it and one asked Joey). Read only: it calls the same pure lookup on the live
+// ledger and writes nothing. The description is short on purpose: the lane tool schemas are loaded in every call of every lane.
+const LEDGER_QUERY_PROPS = {
+  since: { type: 'string', description: 'ISO time (2026-11-13T04:00:00Z) or relative (-4h, -30m, -24h, -2d); empty = from the start' },
+  kind: { type: 'string', description: 'action | commitment | escalation | memory_proposal | receipt | notify | fyi | stop; empty = any kind. An unknown kind returns the valid kinds plus a free-text match.' },
+  text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } }
+export const LANE_LEDGER_QUERY_DESCRIPTION =
+  "[read only] Look back in the agent's ledger (what the lanes handled, told Joey, promised, handed over). Use it to count or check history yourself, e.g. restarts of a service in the last 24 h: " +
+  'ledger_query(since="-24h", text="restart mock-api"). Filters: `text` (substring or regex), `since`, `kind`. No filter = the activity list (one line per event). ' +
+  'A filtered answer ends with the per-kind counts; at most 30 entries, newest last. It writes nothing.'
 export const LANE_TOOLS = [
+  { name: 'ledger_query', description: LANE_LEDGER_QUERY_DESCRIPTION, inputSchema: { type: 'object', properties: LEDGER_QUERY_PROPS } },
   { name: 'claim_file', description: 'Before you edit a file in the workspace, claim it (path, why). If another lane holds it, you are told who and since when: wait for it or hand the change to the main. Claims are released when your run ends.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, why: { type: 'string' } }, required: ['path', 'why'] } },
   { name: 'report_result', description: 'Fan-out tasks only: hand your result back to the synthesis (not to Joey). One call, the whole result.',
@@ -2123,6 +2135,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const r = runIdArg ? await inboxPost('/lanes/scheduler', { run_id: runIdArg, action: 'complete', outcome, summary: a.summary }) : null
       return `receipt recorded${r ? `; scheduler: ${r.text ?? JSON.stringify(r)}` : ''}`
     }
+    case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
     case 'claim_file': {
       const path = String(a.path ?? '').trim(), why = String(a.why ?? '').trim()
       if (!path) throw new Error('path required')

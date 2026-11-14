@@ -438,7 +438,7 @@ test('ledger_query tool reads the LIVE ledger at call time (a missing file = emp
   expect(rowsOf(ledgerQueryTool({ text: 'appended later' })).length).toBe(1)          // no cache: the append is visible
   expect(isMainTool('ledger_query')).toBe(true)
   expect(mainToolDefs().map((t: any) => t.name)).toContain('ledger_query')
-  expect(LANE_TOOLS.map(t => t.name)).not.toContain('ledger_query')                  // lanes never get it
+  expect(LANE_TOOLS.find(t => t.name === 'ledger_query')!.description).toContain('read only')   // 002k (B20): lanes get a read-only lookup; the main's tool stays main-only (below)
   expect(await callMainTool('ledger_query', {}, undefined)).toStartWith('refused:')    // a session that is not the registered main
   expect(await callMainTool('ledger_query', {}, 'some-other-session')).toStartWith('refused:')
   const def = mainToolDefs().find((t: any) => t.name === 'ledger_query')
