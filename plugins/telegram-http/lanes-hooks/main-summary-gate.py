@@ -13,12 +13,24 @@ in the reply (recognised by its HH:MM). If lines are missing, the reply is refus
 missing lines are named; the next reply passes whatever it says (so a partial answer on purpose is
 possible, and nothing can loop).
 State: <lanes dir>/run/summary-gate.json. Only in the main's settings; lanes never run it.
+
+Universe 002j (SUMMARY_GATE_JEV=1 in the hook's environment): the HH:MM test stays as the program's first pass, and Jev
+reads each lane-handled line against the reply: the reply states it and agrees / states it with a different fact (a time,
+a number, a result, who did it) / does not mention it. One request, one Choice per line; the line travels in the question
+and the reply is the state, so the lines cannot disturb one another. Then, in code:
+  - a line whose HH:MM is absent is still accepted when Jev says the reply states it (a summary may describe an event
+    without quoting its time);
+  - a line the reply states with a different fact is named as inconsistent (the HH:MM test could never see that);
+  - anything Jev is unsure about, and any failed call, falls back to the HH:MM test alone.
+Every decision is appended to run/summary-gate.jsonl.
 """
 import json
 import os
 import re
 import sys
 import tempfile
+import time
+import urllib.request
 
 TAIL_BYTES = 3_000_000
 ITEM = re.compile(r'^• (\d\d-\d\d) (\d\d:\d\d)｜([^｜]+)｜(.*)$')
@@ -87,6 +99,63 @@ def lane_items(text):
     return out
 
 
+JEV = os.environ.get('SUMMARY_GATE_JEV') == '1'
+MODEL = os.environ.get('TYPESAFE_DEFAULT_MODEL', 'jev-1.14.0')
+API = os.environ.get('TYPESAFE_BASE_URL', 'https://api.typesafe.ai').rstrip('/') + '/v1/systemone'
+KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE', os.path.expanduser('~/.genesis/typesafe.env'))
+STATED_CONF, CONTRA_CONF = 0.7, 0.8
+
+
+def load_key():
+    k = os.environ.get('TYPESAFE_API_KEY', '').strip()
+    if k:
+        return k
+    try:
+        for line in open(KEY_FILE, encoding='utf-8'):
+            line = line.strip()
+            if line.startswith('export '):
+                line = line[7:].strip()
+            if line.startswith('TYPESAFE_API_KEY='):
+                return line.split('=', 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        pass
+    return None
+
+
+def full_items(text):
+    """[(HH:MM, who, the whole line text)] for the lane-handled lines: what Jev reads (lane_items cuts `what` to 60 chars)."""
+    out = []
+    for line in text.splitlines():
+        m = ITEM.match(line.strip())
+        if m and m.group(3).strip() != 'main':
+            out.append((m.group(2), m.group(3).strip(), m.group(4).strip()[:400]))
+    return out
+
+
+def jev_relations(reply, items):
+    """{index: (relation, confidence)} or None when Jev cannot be asked. Never raises."""
+    try:
+        key = load_key()
+        if not key or not items:
+            return None
+        q = {}
+        for i, (t, who, what) in enumerate(items[:25]):
+            q[f'I{i}'] = {'type': 'choice',
+                          'instructions': {'question': 'How does `reply` treat this entry of the day\'s activity list?', 'entry': f'{t}｜{who}｜{what}'},
+                          'criteria': {'stated': 'The reply reports this entry and what it says agrees with the entry',
+                                       'different': 'The reply reports this entry but a fact differs from the entry: a time, a number, a result, or who did it',
+                                       'not_mentioned': 'The reply does not report this entry'}}
+        req = urllib.request.Request(API, data=json.dumps({'model': MODEL, 'state': {'reply': reply[:12000]}, 'questions': q}, ensure_ascii=False).encode('utf-8'),
+                                     method='POST', headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'User-Agent': 'genesis-summary-gate/1'})
+        with urllib.request.urlopen(req, timeout=float(os.environ.get('SUMMARY_GATE_TIMEOUT_S', '8'))) as r:
+            a = json.loads(r.read().decode('utf-8')).get('answers')
+        if not isinstance(a, dict):
+            return None
+        return {i: ((a.get(f'I{i}') or {}).get('choice'), (a.get(f'I{i}') or {}).get('confidence') or 0) for i in range(len(items[:25]))}
+    except Exception:
+        return None
+
+
 def main():
     try:
         p = json.load(sys.stdin)
@@ -96,11 +165,26 @@ def main():
     call, text = activity_list_of_this_turn(tail_records(p.get('transcript_path') or ''))
     if not call:
         return
-    missing = [it for it in lane_items(text) if it[0] not in reply]
-    if not missing:
-        return
+    items = lane_items(text)
+    missing = [it for it in items if it[0] not in reply]
+    different = []
     ld = os.environ.get('LANES_DIR') or os.path.join(p.get('cwd') or os.getcwd(), '.lanes')
     d = os.path.join(ld, 'run')
+    if JEV:
+        rel = jev_relations(reply, full_items(text))
+        if rel is not None and len(rel) == len(items):
+            # stated without its time = not missing; stated with a different fact = inconsistent; unsure = the HH:MM test stands
+            missing = [it for i, it in enumerate(items) if it[0] not in reply and not (rel[i][0] == 'stated' and rel[i][1] >= STATED_CONF)]
+            different = [it for i, it in enumerate(items) if rel[i][0] == 'different' and rel[i][1] >= CONTRA_CONF]
+        try:
+            with open(os.path.join(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate.jsonl'), 'a', encoding='utf-8') as f:
+                f.write(json.dumps({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'session': p.get('session_id', ''), 'items': len(items), 'jev': rel is not None,
+                                    'relations': None if rel is None else [[items[i][0], rel[i][0], rel[i][1], items[i][0] in reply] for i in range(len(items)) if i in rel],
+                                    'missing': [it[0] for it in missing], 'different': [it[0] for it in different]}, ensure_ascii=False) + '\n')
+        except OSError:
+            pass
+    if not missing and not different:
+        return
     sp = os.path.join(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate.json')
     try:
         st = json.load(open(sp, encoding='utf-8'))
@@ -109,7 +193,7 @@ def main():
     key = f"{p.get('session_id', '')}:{call}"
     if key in st:
         return                                        # refused once already for this list: let it through
-    st[key] = len(missing)
+    st[key] = len(missing) + len(different)
     try:
         tmp = f'{sp}.{os.getpid()}.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -118,8 +202,13 @@ def main():
     except OSError:
         return                                        # cannot remember = could refuse for ever: do not refuse
     lines = '\n'.join(f'• {t}｜{who}｜{what}' for t, who, what in missing)
-    reason = (f'這則整理先不送：活動清單裡有 {len(missing)} 件沒有出現在你的整理裡（以時間辨認）：\n{lines}\n'
-              '清單上每一件都要寫到：時間、發生什麼、結果（數字照清單寫）。補上後再送一次。'
+    reason = '這則整理先不送：'
+    if missing:
+        reason += f'活動清單裡有 {len(missing)} 件沒有出現在你的整理裡：\n{lines}\n'
+    if different:
+        reason += (f'有 {len(different)} 件你寫的跟清單不一致（時間、數字、結果或是誰做的），請對照清單改正：\n'
+                   + '\n'.join(f'• {t}｜{who}｜{what}' for t, who, what in different) + '\n')
+    reason += ('清單上每一件都要寫到：時間、發生什麼、結果（數字照清單寫）。補上後再送一次。'
               '如果 Joey 這次只問其中一部分，就在訊息裡寫明只回答哪一部分，再送一次即可。')
     print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                                              'permissionDecisionReason': reason}}, ensure_ascii=False))
