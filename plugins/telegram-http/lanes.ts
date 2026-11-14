@@ -164,6 +164,7 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(followupTick, 1_000).unref()
     setInterval(() => { void digestTick() }, 10_000).unref()
     setInterval(handoffTick, 10_000).unref()
+    setInterval(promiseTick, 10_000).unref()
     setInterval(mainWallTick, 15_000).unref()       // 002j: a main behind the model wall (its own transcript says so)
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
     if (S.main_wall) { try { writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: S.main_wall.kind, text: S.main_wall.text })) } catch {}; armMainProbe(5_000) }
@@ -506,6 +507,7 @@ type State = {
   pushes: Record<string, number[]>                                     // thread → push times (frequency cap)
   followups: Record<string, Followup>                                  // 002c: scheduled follow-ups (due = simulated ms)
   handoffs: Record<string, Handoff>                                    // 002d: work handed to the main, until the main has it
+  promises: Record<string, Promise24>                                  // 002j: "the main answers you by HH:MM", told to a peer by the router
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
   main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
@@ -519,7 +521,7 @@ let S: State
 const statePath = () => join(LANES_DIR, 'state.json')
 function loadState(): void {
   S = readJson<State>(statePath(), null as unknown as State) ?? ({} as State)
-  S.counters ??= {}; S.lanes ??= {}; S.threads ??= {}; S.outbound ??= {}; S.botmsgs ??= {}; S.topics ??= {}; S.tickets ??= {}; S.dedupe ??= {}; S.pushes ??= {}; S.followups ??= {}; S.handoffs ??= {}; S.deadline_rang ??= {}
+  S.counters ??= {}; S.lanes ??= {}; S.threads ??= {}; S.outbound ??= {}; S.botmsgs ??= {}; S.topics ??= {}; S.tickets ??= {}; S.dedupe ??= {}; S.pushes ??= {}; S.followups ??= {}; S.handoffs ??= {}; S.promises ??= {}; S.deadline_rang ??= {}
   for (const l of Object.values(S.lanes)) if (l.status === 'running') l.status = 'idle'   // processes died with the old daemon
 }
 function saveState(): void { try { writeJsonAtomic(statePath(), S) } catch (e) { D.log('error', `lanes: state save failed: ${e}`) } }
@@ -845,6 +847,8 @@ const queue = new Map<string, QItem>()          // event id → item
 const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval> }>()  // lane id → run
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string
   escalated: boolean; pushed: boolean; asked?: boolean; handed?: boolean; commitments?: number
+  /** 002j: the router told this agent that the main decides and by when; the lane sends it nothing more about this event */
+  interim?: string
   /** 002e: this run is a follow-up the lane scheduled itself (event id ev-fu-…) */
   followup?: boolean }
 const runTokens = new Map<string, RunTok>()
@@ -1524,6 +1528,78 @@ function handoffsDelivered(takenAt: number): void {
 }
 const digestTakenAt = new Map<string, number>()
 
+// ------------------------------------------------------------------ 002j: a request only the main can agree to (problem 24)
+// A lane cannot promise for the agent, so it hands such a request to the main. What the requester was told meanwhile
+// was left to the lane: in 5 of the 8 archived lane universes the other agent got an answer that neither agreed nor
+// refused nor said who decides or when. Now the router says it, in fixed words with a time, the moment the lane hands
+// the request over, and the lane sends that agent nothing more about it. The time is kept as a promise: once the main
+// has sent that agent a message it is kept; when the time comes and it has not, Joey is told once and the main sees it
+// in its digest. Whether the main's message really answers the request is the judge's question (Jev), not this rule's.
+type Promise24 = { id: string; peer: string; thread: string | null; event: string; what: string; created: number; due: number
+  state: 'open' | 'kept' | 'overdue'; handoff: string; done?: string; matched?: string }
+let PROMISE_MIN = Number(process.env.LANES_HANDOFF_REPLY_MIN ?? 30)
+export const __setPromiseMin = (m: number): void => { PROMISE_MIN = m }
+let meshSendHook: ((b: any) => Promise<any>) | null = null
+export const __setMeshSend = (f: ((b: any) => Promise<any>) | null): void => { meshSendHook = f }
+export const __putQueue = (it: any): void => { queue.set(it.ev.id, it) }
+const laneMeshSend = (b: unknown): Promise<any> => meshSendHook ? meshSendHook(b) : inboxPost('/lanes/send', b)
+export function interimText(due: number): string {
+  return `這件事要 ${D.agent} 的主線決定。我是 ${D.agent} 的車道，不能代為答應或拒絕。已經交給主線，主線會在 ${simTime(due)} 前直接回你。`
+}
+async function interimToPeer(lane: Lane, tok: RunTok, h: Handoff): Promise<string | null> {
+  const ev = queue.get(tok.evId)?.ev
+  if (!ev || ev.source !== 'mesh' || !ev.from || ev.no_reply) return null
+  const from = ev.from.toLowerCase()
+  // only another agent is waiting for an answer: a scheduled run or an alert is not
+  const isPeer = D.registryNames ? D.registryNames().map(n => n.toLowerCase()).includes(from) : tok.cls === 'peer'
+  if (!isPeer) return null
+  const th = S.threads[lane.thread]
+  const hop = (th?.hops ?? 0) + 1
+  if (th?.stopped || hop > HOP_LIMIT) return null
+  const due = Date.now() + PROMISE_MIN * 60_000
+  const text = interimText(due)
+  if (th) { th.hops = hop; th.last = nowIso(); if (!th.peer) th.peer = from }
+  const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, thread: lane.thread, hop, lane: lane.id })
+  if (r?.msgId != null) S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }
+  const pr: Promise24 = { id: `pr-${shortId()}`, peer: from, thread: lane.thread ?? null, event: tok.evId, what: h.text.slice(0, 160), created: Date.now(), due, state: 'open', handoff: h.id }
+  S.promises[pr.id] = pr
+  ledger({ lane: 'router', thread: lane.thread, event: tok.evId, kind: 'commitment', notify_main: true,
+    text: commitmentText({ who: from, what: `主線回覆（答應或拒絕）：${pr.what}`, by: `${simTime(due)} 前` }),
+    refs: { who: from, by: simTime(due), from: 'handoff-interim', promise: pr.id, due: new Date(due).toISOString(), btcc_msg_id: r?.msgId ?? null, sent: text } })
+  logos('lane.promise', { promise: pr.id, peer: from, thread: lane.thread, event: tok.evId, due: new Date(due).toISOString(), handoff: h.id, sent: r?.msgId != null })
+  tok.interim = from
+  saveState()
+  return text
+}
+/** the main sent `to` a message (send_to_agent): what the router promised that agent in the main's name is kept */
+export function mainSentTo(to: string, thread: string | null): void {
+  let changed = false
+  for (const pr of Object.values(S?.promises ?? {})) {
+    if (pr.state === 'kept' || pr.peer !== String(to).toLowerCase()) continue
+    const late = pr.state === 'overdue'
+    pr.state = 'kept'; pr.done = nowIso(); pr.matched = thread && thread === pr.thread ? 'thread' : 'peer'; changed = true
+    ledger({ lane: 'router', thread: pr.thread, event: pr.event, kind: 'fyi', notify_main: false,
+      text: `主線已回覆 ${pr.peer}（系統告訴過對方 ${simTime(pr.due)} 前會回的那件事${late ? '；過了時間才回' : ''}）`, refs: { promise: pr.id, matched: pr.matched, late } })
+    logos('lane.promise.kept', { promise: pr.id, peer: pr.peer, late, matched: pr.matched })
+  }
+  if (changed) saveState()
+}
+export function promiseTick(): void {
+  if (!S?.promises) return
+  const now = Date.now()
+  let changed = false
+  for (const pr of Object.values(S.promises)) {
+    if (pr.state !== 'open' || now < pr.due) continue
+    pr.state = 'overdue'; changed = true
+    const text = `${pr.peer} 在等主線回覆：「${pr.what}」。車道把這件事交給主線時，系統告訴過 ${pr.peer} 主線會在 ${simTime(pr.due)} 前回。時間到了，主線還沒有回 ${pr.peer}。`
+    ledger({ lane: 'router', thread: pr.thread, event: pr.event, kind: 'notify', notify_main: true, text: `[push] ${text}`,
+      refs: { tier: 'push', tier_rule: 'promise-overdue', escalated: true, promise: pr.id } })
+    logos('lane.promise.overdue', { promise: pr.id, peer: pr.peer, due: new Date(pr.due).toISOString() })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'promise-overdue', message_id: id }))
+  }
+  if (changed) saveState()
+}
+
 // ================================================================== lane tools (MCP for lanes)
 export const LANE_TOOLS = [
   { name: 'notify_joey', description: 'Report a result to Joey on Telegram. The router decides whether it rings (by the kind of event); you decide nothing about that. Your lane is prefixed automatically.',
@@ -1592,6 +1668,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const to = String(a.to ?? '').trim().toLowerCase()
       const text = String(a.text ?? '').trim()
       if (!to || !text) throw new Error('to and text required')
+      // 002j: one answer per request. The router already told this agent that the main decides and by when.
+      if (tok.interim && to === tok.interim) return `not sent: the router already told ${to} that the main decides this and by when. Send ${to} nothing more about it; close with receipt.`
       if (th?.stopped) return `blocked: thread ${lane.thread} was stopped (${th.stopped}). Escalate instead.`
       const hop = (th?.hops ?? 0) + 1
       if (hop > HOP_LIMIT) {
@@ -1602,7 +1680,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       if (th) { th.hops = hop; th.last = nowIso(); th.ask_cls = tok.cls; if (!th.peer) th.peer = to }
       saveState()
-      const r = await inboxPost('/lanes/send', { to, text, reply_to: a.reply_to, no_reply: a.no_reply === true, thread: lane.thread, hop, lane: lane.id })
+      const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: a.no_reply === true, thread: lane.thread, hop, lane: lane.id })
       if (r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', notify_main: false, text: `reply_agent → ${to}（hop ${hop}）：${text.slice(0, 200)}`, refs: { btcc_msg_id: r?.msgId ?? null } })
       return r?.text ?? 'send failed: inbox daemon unreachable'
@@ -1669,9 +1747,12 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const h = handoff(lane, tok.evId, text)
       tok.handed = true; tok.escalated = true
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: h.id, main_connected: mainConnected() })
-      return h.state === 'fallback'
+      // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words)
+      let told = ''
+      try { const t = await interimToPeer(lane, tok, h); if (t) told = ` The router told ${tok.interim}: "${t}" Send ${tok.interim} nothing more about this.` } catch (e) { D.log('warn', `lanes: interim reply failed: ${e}`) }
+      return (h.state === 'fallback'
         ? 'the main is not connected: Joey was told directly instead. Close with receipt.'
-        : 'handed to the main: it is woken with your text, takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.'
+        : 'handed to the main: it is woken with your text, takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.') + told
     }
     case 'receipt': {
       const runIdArg = String(a.run_id ?? '').replace(/\D/g, '')
@@ -1992,6 +2073,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       if (String(b.owner ?? 'main') === 'main' && b.to && b.text) {
         ledger({ lane: 'main', thread: b.thread ?? null, event: `main-send-${b.msgId}`, kind: 'action', notify_main: false,
           text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId } })
+        mainSentTo(String(b.to), b.thread ?? null)             // 002j: a promise the router made in the main's name is kept
       }
       saveState(); sendJson(res, 200, { ok: true }); return true
     }
