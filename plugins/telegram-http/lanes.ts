@@ -939,7 +939,7 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
   const every = Math.max(1, Math.round(WALL_PROBE_MS / 60_000))
   const text = `${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我每 ${every} 分鐘自動試一次，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
-  logos('lane.wall_up', { kind: w.kind, text: w.text, by, waiting })
+  logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
   armProbe(WALL_PROBE_MS + 30)
 }
@@ -1100,7 +1100,7 @@ function mainWallUp(e: MainWallEv, by: string): void {
     + (e.midTask ? `它有一回合做到一半，停在 ${stamp(new Date(e.at).toISOString())}（${TZ_LABEL}）。` : '')
     + `這段期間給主線的訊息我先保留，一則都不會丟。我每 ${every} 分鐘自動試一次，恢復後把保留的交給主線，並告訴你。`
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-up', escalated: true } })
-  logos('lane.main_wall_up', { kind: e.kind, text: e.text, by, mid_task: !!e.midTask, model: e.model, err_at: e.at })
+  logos('lane.main_wall_up', { wall: e.kind, text: e.text, by, mid_task: !!e.midTask, model: e.model, err_at: e.at })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-up', message_id: id }))
   armMainProbe(mainProbeMs(e.kind))
   setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, 0)   // mark what the main already took in, in both daemons
@@ -1115,7 +1115,7 @@ function mainProbeTick(): void {
     cur.probes += 1
     if (walled) { cur.kind = walled.kind; cur.text = walled.text }
     saveState()
-    logos('lane.main_wall_probe', { ok: false, probes: cur.probes, kind: cur.kind })
+    logos('lane.main_wall_probe', { ok: false, probes: cur.probes, wall: cur.kind })
     armMainProbe(mainProbeMs(cur.kind))
   })
 }
@@ -1501,10 +1501,14 @@ function handoff(lane: Lane | undefined, evId: string, text: string, laneId?: st
   // 002g: a main that only just went away gets HANDOFF_DOWN_GRACE_MS to come back (handoffTick); one that has been away
   // longer than that already is not waited for
   if (!up && Date.now() - mainDownSince >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, awayText())
+  else if (up && mainWalledFor() >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, walledText())
   saveState()
   return h
 }
 const awayText = (): string => `主線已經 ${Math.max(1, Math.round((Date.now() - mainDownSince) / 1000))} 秒不在線`
+// 002j: a main behind the model wall is connected and cannot act. For a hand-over it counts as away, with the same grace.
+const mainWalledFor = (): number => S?.main_wall ? Math.max(0, Date.now() - Date.parse(S.main_wall.since)) : 0
+const walledText = (): string => `主線已經 ${Math.max(1, Math.round(mainWalledFor() / 1000))} 秒不能用模型（${WALL_WORD[S.main_wall?.kind ?? ''] ?? '模型無法使用'}）`
 function handoffFallback(h: Handoff, why: string): void {
   h.state = 'fallback'; h.done = nowIso()
   const lane = S.lanes[h.lane]
@@ -1525,6 +1529,7 @@ export function handoffTick(): void {
   for (const h of Object.values(S.handoffs)) {
     if (h.state !== 'pending') continue
     if (!up && now - mainDownSince >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, awayText())
+    else if (up && mainWalledFor() >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, walledText())
     else if (now - h.created >= HANDOFF_FALLBACK_MS) handoffFallback(h, `已經 ${Math.round((now - h.created) / 60_000)} 分鐘，主線${up ? '還在忙' : '不在線'}`)
     else continue
     changed = true
@@ -1579,7 +1584,7 @@ async function interimToPeer(lane: Lane, tok: RunTok, h: Handoff): Promise<strin
   const pr: Promise24 = { id: `pr-${shortId()}`, peer: from, thread: lane.thread ?? null, event: tok.evId, what: h.text.slice(0, 160), created: Date.now(), due, state: 'open', handoff: h.id }
   S.promises[pr.id] = pr
   ledger({ lane: 'router', thread: lane.thread, event: tok.evId, kind: 'commitment', notify_main: true,
-    text: commitmentText({ who: from, what: `主線回覆（答應或拒絕）：${pr.what}`, by: `${simTime(due)} 前` }),
+    text: commitmentText({ who: from, what: `主線直接回覆 ${from} 這件事（答應或拒絕）。分流器已經替車道回覆 ${from}：「${text}」`, by: `${simTime(due)} 前` }),
     refs: { who: from, by: simTime(due), from: 'handoff-interim', promise: pr.id, due: new Date(due).toISOString(), btcc_msg_id: r?.msgId ?? null, sent: text } })
   logos('lane.promise', { promise: pr.id, peer: from, thread: lane.thread, event: tok.evId, due: new Date(due).toISOString(), handoff: h.id, sent: r?.msgId != null })
   tok.interim = from

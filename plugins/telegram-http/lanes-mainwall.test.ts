@@ -176,3 +176,31 @@ test('the wall is in the daemon\'s own records', () => {
   expect(rules.filter(r => r === 'main-wall-down').length).toBe(2)
   expect(rules.filter(r => r === 'main-wall-held').length).toBe(2)
 })
+
+test('work handed to a main behind the wall is told to Joey after the same grace as for a main that is away', async () => {
+  L.__setClaudeBin(WALLED)
+  const t = Date.now()
+  appendFileSync(T, prompt(t - 50, '520', '查一下') + apiErr(t - 20) + turnEnd(t - 10))
+  const n0 = sent.length                                                                         // before the tick: the wall-up push may land at once
+  L.mainWallTick()
+  expect(L.wallHoldsMain()).toBe(true)
+  expect(await until(() => sent.length === n0 + 1)).toBe(true)                                   // the wall-up message
+  const st = L.__lanesState()
+  st.lanes['adam.reflex.9'] = { id: 'adam.reflex.9', kind: 'reflex', n: 9, session_id: 's', thread: 'adam#t-w9', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
+  const tok: any = { runId: 'adam.reflex.9.r1', lane: 'adam.reflex.9', evId: 'ev-w9', closers: [], critical: false, trigger: 'scheduled', cls: 'scheduled', escalated: false, pushed: false }
+  // inside the grace: the hand-over waits (the wall may lift in a moment)
+  expect(await L.callLaneTool(tok, 'handoff_main', { text: '備份檢查連續失敗，需要主線決定要不要重跑。' })).toContain('handed to the main')
+  await sleep(40)
+  expect(sent.length).toBe(n0 + 1)
+  // past the grace: told to Joey directly, once
+  L.__setHandoffDownGrace(0)
+  L.handoffTick()
+  expect(await until(() => sent.length === n0 + 2)).toBe(true)
+  expect(sent[n0 + 1]).toContain('不能用模型'); expect(sent[n0 + 1]).toContain('備份檢查連續失敗')
+  expect(Object.values(st.handoffs).filter(h => h.event === 'ev-w9')[0].state).toBe('fallback')
+  L.handoffTick(); await sleep(40)
+  expect(sent.length).toBe(n0 + 2)
+  L.__setHandoffDownGrace(60_000)
+  L.__setClaudeBin(OK)
+  expect(await until(() => !L.wallHoldsMain(), 4000)).toBe(true)
+})

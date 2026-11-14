@@ -44,6 +44,7 @@ test('a peer\'s request handed to the main: the router tells the peer who decide
   const c = rows().find(r => r.kind === 'commitment')!
   expect(c.refs).toMatchObject({ who: 'eve', from: 'handoff-interim', promise: pr[0].id, btcc_msg_id: 60001 })
   expect(c.notify_main).toBe(true)                                                       // the main reads the deadline in the digest that wakes it
+  expect(c.text).toContain('分流器已經替車道回覆 eve'); expect(c.text).toContain('主線會在')            // and what the other agent was already told
   expect(sent.length).toBe(0)                                                            // Joey hears nothing: the main owns it
   // the lane's own second message to the same agent is not sent; another agent is unaffected
   expect(await L.callLaneTool(tok, 'reply_agent', { to: 'eve', text: '我再看看能不能幫你問' })).toContain('not sent')
