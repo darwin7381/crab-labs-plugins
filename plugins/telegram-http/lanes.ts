@@ -1649,6 +1649,22 @@ export function laneBuiltinTools(kind: LaneKind): string {
   const agent = process.env.LANES_WORKER_AGENT_TOOL === '1' && (kind === 'worker' || kind === 'fork')
   return ['Bash', 'Read', ...(edits ? ['Write', 'Edit'] : []), ...(agent ? ['Agent'] : []), 'ToolSearch'].join(',')
 }
+// 002k (H11, 002j group H): the thread budget was checked only BEFORE a run started: one run read 20 pages and used 14.4M tokens against a 150k budget.
+//  - in the run: after each assistant message of the run's stream the input-side tokens of the run so far are added to the thread's total; at the budget the
+//    run is stopped (SIGTERM) and a `stop` ledger row says so (notify_main = a wake, the text says 預算, and it carries the partial result);
+//  - backstops that stop a run that loops without spending tokens in an unusual way: --max-turns per kind and --max-budget-usd per kind (claude 2.1.322: both
+//    work with -p; --max-turns is a hidden flag, both are validated at parse time). A run that ends on either cap is a stop too, not a failure to retry.
+// Env: LANES_MAX_TURNS_<KIND> / LANES_MAX_BUDGET_USD_<KIND> (REFLEX WORKER FORK CURATOR SYNTHESIS); 0 = no flag.
+const MAX_TURNS_DEFAULT: Record<LaneKind, number> = { reflex: 12, synthesis: 8, curator: 30, worker: 40, fork: 40 }
+const MAX_USD_DEFAULT: Record<LaneKind, number> = { reflex: 5, synthesis: 5, curator: 8, worker: 20, fork: 20 }
+export function laneMaxTurns(kind: LaneKind): number {
+  const n = Number(process.env[`LANES_MAX_TURNS_${kind.toUpperCase()}`] ?? MAX_TURNS_DEFAULT[kind])
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+}
+export function laneMaxUsd(kind: LaneKind): number {
+  const n = Number(process.env[`LANES_MAX_BUDGET_USD_${kind.toUpperCase()}`] ?? MAX_USD_DEFAULT[kind])
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
 function laneEnv(lane: Lane): Record<string, string> {
   const keep = ['PATH', 'LANG', 'LC_ALL', 'TERM', 'XDG_RUNTIME_DIR', 'USER', 'LOGNAME', 'SHELL']
   const env: Record<string, string> = { HOME: homedir() }
@@ -1829,6 +1845,8 @@ function startRun(it: QItem): void {
     '--output-format', 'stream-json', '--verbose',
     '--dangerously-skip-permissions',
     '--disable-slash-commands', '--tools', laneBuiltinTools(lane.kind),     // 002k (B1)
+    ...(laneMaxTurns(lane.kind) ? ['--max-turns', String(laneMaxTurns(lane.kind))] : []),             // 002k (H11)
+    ...(laneMaxUsd(lane.kind) ? ['--max-budget-usd', String(laneMaxUsd(lane.kind))] : []),
     '--disallowedTools', 'AskUserQuestion', 'ExitPlanMode')
   const child = spawn(CLAUDE_BIN, args, { cwd: D.workspaceDir, env: laneEnv(lane), stdio: ['ignore', 'pipe', 'pipe'] })
   it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
@@ -1852,6 +1870,8 @@ function startRun(it: QItem): void {
   const tools: Array<{ name: string; input: any }> = []
   let result = '', sessionSeen = '', buf = ''
   let walled: { kind: string; text: string } | null = null
+  let lastText = '', resultSubtype = ''
+  let budgetStop: { total: number; at: number } | null = null          // 002k (H11): this run was stopped by the thread budget, in the run
   child.stdout!.setEncoding('utf8')
   child.stdout!.on('data', (chunk: string) => {
     buf += chunk
@@ -1864,9 +1884,18 @@ function startRun(it: QItem): void {
       if (j.type === 'assistant' && j.message) {
         const u = j.message.usage ?? {}
         usage.set(j.message.id ?? `m${usage.size}`, { in: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), out: u.output_tokens ?? 0 })
-        for (const c of j.message.content ?? []) if (c?.type === 'tool_use') tools.push({ name: c.name, input: c.input })
+        for (const c of j.message.content ?? []) {
+          if (c?.type === 'tool_use') tools.push({ name: c.name, input: c.input })
+          else if (c?.type === 'text' && String(c.text ?? '').trim()) lastText = String(c.text)
+        }
+        if (!budgetStop && THREAD_BUDGET > 0) {                          // 002k (H11): the budget is checked after every assistant turn, not only before the run
+          let sofar = 0
+          for (const u2 of usage.values()) sofar += u2.in
+          const total = (S.threads[lane.thread]?.tokens ?? 0) + sofar
+          if (total >= THREAD_BUDGET) { budgetStop = { total, at: Date.now() }; try { child.kill('SIGTERM') } catch {} }
+        }
       }
-      if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j) }
+      if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j); resultSubtype = String(j.subtype ?? '') }
     }
   })
   child.stderr!.on('data', (c: Buffer) => { try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
@@ -1905,6 +1934,27 @@ function startRun(it: QItem): void {
       wallUp(walled, runId)
       saveState()
       return                                                // no pump: the probe timer starts the next run
+    }
+    // 002k (H11): a run the thread budget stopped in the run, or one that ended on its --max-turns / --max-budget-usd cap, is a stop, not a failure to retry
+    const capped = budgetStop ? 'budget' : resultSubtype === 'error_max_budget_usd' ? 'usd' : resultSubtype === 'error_max_turns' ? 'turns' : ''
+    if (capped && lane.status !== 'closed') {
+      it.state = 'done'; saveQ(it); queue.delete(it.ev.id)
+      try { rmSync(qPath(it.ev.id)) } catch {}
+      const partial = (lastText || result || `（還沒有文字結果；用過 ${[...new Set(names)].join('、') || '沒有工具'}）`).replace(/\s+/g, ' ').trim().slice(0, 600)
+      const th2 = S.threads[lane.thread]
+      const why = capped === 'budget'
+        ? `預算：thread ${lane.thread} 在這一趟的途中用到 ${budgetStop!.total} token，達到預算 ${THREAD_BUDGET}，這一趟已經中止（${usage.size} 次呼叫之後）。`
+        : capped === 'usd' ? `預算：這一趟花到單趟的金額上限（--max-budget-usd ${laneMaxUsd(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
+        : `這一趟到了回合上限（--max-turns ${laneMaxTurns(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
+      ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', notify_main: true,
+        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}`,
+        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, thread_tokens: th2?.tokens ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
+      logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, thread_tokens: th2?.tokens ?? null, budget: THREAD_BUDGET })
+      D.log('warn', `lanes: ${runId} stopped (${capped}): ${why}`)
+      if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊被中止：${capped === 'turns' ? '回合上限' : '預算'}；結果到中止為止：${partial}）`)
+      saveState()
+      pump()
+      return
     }
     if (ok && S.wall) wallDown(runId)
     if (ok) {
