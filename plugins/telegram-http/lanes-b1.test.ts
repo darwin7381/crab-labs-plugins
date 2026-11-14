@@ -40,7 +40,8 @@ test('B1: a lane process starts without skills, with only the built-in tools lan
 test('B1: Write and Edit exactly for the kinds the guard hook can let write (worker, fork, curator)', () => {
   expect(L.laneBuiltinTools('reflex')).toBe('Bash,Read,ToolSearch')
   expect(L.laneBuiltinTools('synthesis')).toBe('Bash,Read,ToolSearch')
-  for (const k of ['worker', 'fork', 'curator'] as const) expect(L.laneBuiltinTools(k)).toBe('Bash,Read,Write,Edit,ToolSearch')
+  expect(L.laneBuiltinTools('curator')).toBe('Bash,Read,Write,Edit,ToolSearch')
+  for (const k of ['worker', 'fork'] as const) expect(L.laneBuiltinTools(k)).toBe('Bash,Read,Write,Edit,Agent,ToolSearch')      // 002k (K3): the Agent tool is on by default for these two
   // cross-check against the hook itself: a workspace write by a reflex / synthesis lane is refused outright (no claim helps),
   // a worker / fork write is allowed once it holds the claim, the curator writes memory while it holds the right
   const hook = join(import.meta.dir, 'lanes-hooks', 'lane-guard-hook.py')

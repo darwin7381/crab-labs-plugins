@@ -1906,12 +1906,45 @@ export function sweepQueue(): void {
 /** The built-in tools a lane of this kind gets. Write/Edit only for the kinds whose guard hook can let a write through: a worker or fork
  *  (a workspace file it has claimed) and the curator (memory, while it holds the write right). A reflex or synthesis lane never edits
  *  a workspace file (lane-guard-hook.py denies it), so it has no use for them; it can still write a scratch file through Bash. */
+// ------------------------------------------------------------------ 002k (K3): the sub-agents of a lane have no lane tools
+// A sub-agent (the Agent tool) inherits the parent's tools, MCP tools included, unless its definition says otherwise: in claude 2.1.322 a default
+// general-purpose sub-agent of a lane has mcp__lane__* (checked against the API request it sends, with a stand-in for the API: no model). A lane's sub-agent
+// must not hand work to the main, tell Joey, answer a peer or write the ledger: only the lane does. So the lane is started with --agents: one definition for
+// each agent type claude offers (these REPLACE the built-ins of the same name: the Agent tool then lists them as "All tools except mcp__lane, mcp__lane__*"),
+// each with disallowedTools naming the lane's MCP server (the server-level spec removes every tool of that server), and with Agent(fork) denied (a fork is
+// the lane itself: it would keep every tool). The agent types that plugins add (a dozen on this box) are not ours to redefine: lanes-hooks/lane-agent-hook.py
+// refuses them (the same names, LANE_AGENT_TYPES).
+export const LANE_AGENT_TYPES = ['general-purpose', 'claude', 'Explore', 'Plan', 'statusline-setup'] as const
+const LANE_MCP_DENY = ['mcp__lane', 'mcp__lane__*']
+const HELPER_PROMPT = 'You are a helper of a lane: a short-lived worker of an operations agent. Do exactly what the brief you were given asks, with your own tools. '
+  + 'You cannot tell Joey anything, answer other agents, hand work to the main agent or write its ledger: you have no tools for that, and your caller does it. '
+  + 'Do not ask questions back. Finish with a short factual result: ids, numbers, names, times, what you saw and what you did not check.'
+/** the --agents JSON of a lane that has the Agent tool */
+export function laneAgentsJson(): string {
+  const read = ['Agent', 'Edit', 'Write', 'NotebookEdit']          // what the built-in Explore and Plan never had
+  const def = (description: string, extra: Record<string, unknown> = {}, prompt = HELPER_PROMPT) => ({ description, prompt, disallowedTools: [...LANE_MCP_DENY], ...extra })
+  return JSON.stringify({
+    'general-purpose': def('General-purpose helper for researching a question, searching for code and doing a multi-step task.'),
+    claude: def('Catch-all helper for a task that does not fit a more specific one.'),
+    Explore: def('Read-only search helper: finds things across many files or services and reports what it found.', { disallowedTools: [...read, ...LANE_MCP_DENY] },
+      HELPER_PROMPT + ' You only read: you do not edit or write files.'),
+    Plan: def('Planning helper: reads what it needs and returns a step-by-step plan; it changes nothing.', { disallowedTools: [...read, ...LANE_MCP_DENY] },
+      HELPER_PROMPT + ' You only read and plan: you do not edit or write files.'),
+    'statusline-setup': def('Unused in a lane.', { tools: ['Read'], disallowedTools: undefined }),
+  })
+}
+/** the claude arguments that belong to the Agent tool of this kind: the definitions, and no fork */
+export function laneAgentArgs(kind: LaneKind): { agents: string[]; deny: string[] } {
+  return laneAgentOn(kind) ? { agents: ['--agents', laneAgentsJson()], deny: ['Agent(fork)'] } : { agents: [], deny: [] }
+}
+/** 002k (K3): does this kind get the native Agent tool (sub-agents)? Worker and fork lanes only, never reflex, synthesis or curator lanes.
+ *  Default ON (Recommendation 3B; E12 prepared it OFF); LANES_WORKER_AGENT_TOOL=0 takes it away again. */
+export const laneAgentOn = (kind: LaneKind): boolean => process.env.LANES_WORKER_AGENT_TOOL !== '0' && (kind === 'worker' || kind === 'fork')
 export function laneBuiltinTools(kind: LaneKind): string {
   const edits = kind === 'worker' || kind === 'fork' || kind === 'curator'
-  // 002k (E12, PREPARED, NOT SHIPPED: Joey has not decided): B1 took the Agent tool away from every lane, while the design pages say a lane may
-  // use native sub-agents (E06 / NT5 cannot be exercised). One switch gives it back to worker and fork lanes only, never to reflex, synthesis or
-  // curator lanes: LANES_WORKER_AGENT_TOOL=1. Default OFF.
-  const agent = process.env.LANES_WORKER_AGENT_TOOL === '1' && (kind === 'worker' || kind === 'fork')
+  // 002k (E12 -> K3): B1 took the Agent tool away from every lane, while the design pages say a lane may use native sub-agents (E06 / NT5). In claude 2.1.322
+  // the tool's name in `--tools` and in the API request is Agent (the init message lists it by its old name, Task, which is still accepted as an alias).
+  const agent = laneAgentOn(kind)
   return ['Bash', 'Read', ...(edits ? ['Write', 'Edit'] : []), ...(agent ? ['Agent'] : []), 'ToolSearch'].join(',')
 }
 // 002k (H11, 002j group H): the thread budget was checked only BEFORE a run started: one run read 20 pages and used 14.4M tokens against a 150k budget.
@@ -2028,7 +2061,9 @@ function writeLaneSettings(): void {
   const settings = {
     hooks: {
       Stop: [{ matcher: '', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-stop-hook.py')}`, timeout: 20 }] }],
-      PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-guard-hook.py')}`, timeout: 10 }] }],
+      PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-guard-hook.py')}`, timeout: 10 }] },
+        // 002k (K3): a lane's sub-agent is one of the types --agents redefined (LANE_AGENT_TYPES); a plugin's agent type would keep the lane's MCP tools
+        { matcher: 'Agent|Task', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-agent-hook.py')}`, timeout: 10 }] }],
       // 002k: the curator's memory writes are committed like the main's (the commit names the lane and thread)
       PostToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'memory-commit-hook.py')}`, timeout: 20 }] },
         // 002k (E18): Joey's message that reached this run while it was in progress, handed over at the next tool boundary (lane-stop-hook.py hands it over at the end)
@@ -2116,7 +2151,8 @@ function startRun(it: QItem): void {
     '--disable-slash-commands', '--tools', laneBuiltinTools(lane.kind),     // 002k (B1)
     ...(laneMaxTurns(lane.kind) ? ['--max-turns', String(laneMaxTurns(lane.kind))] : []),             // 002k (H11)
     ...(laneMaxUsd(lane.kind) ? ['--max-budget-usd', String(laneMaxUsd(lane.kind))] : []),
-    '--disallowedTools', 'AskUserQuestion', 'ExitPlanMode')
+    ...laneAgentArgs(lane.kind).agents,                                  // 002k (K3): before the variadic --disallowedTools
+    '--disallowedTools', 'AskUserQuestion', 'ExitPlanMode', ...laneAgentArgs(lane.kind).deny)
   const child = spawn(CLAUDE_BIN, args, { cwd: D.workspaceDir, env: laneEnv(lane), stdio: ['ignore', 'pipe', 'pipe'] })
   it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
   const renew = setInterval(() => { it.lease_until = Date.now() + LEASE_MS; saveQ(it) }, 30_000)
