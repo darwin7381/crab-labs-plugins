@@ -1538,6 +1538,7 @@ function laneEnv(lane: Lane): Record<string, string> {
   env.LANE_THREAD = lane.thread
   env.LANE_KIND = lane.kind                       // 002k: the guard hook decides file and memory writes by kind
   env.LANES_MEMORY_DIR = memoryDir()
+  if (LOGOS_URL) env.LANES_LOGOS_URL = LOGOS_URL     // 002k (D13): the guard hook refuses a direct call to this host (the lanes' environment is otherwise minimal)
   return env
 }
 export function memoryDir(): string { return join(D.transcriptDir, 'memory') }
