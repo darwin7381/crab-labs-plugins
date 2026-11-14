@@ -1962,6 +1962,19 @@ export const LANE_TOOLS = [
       needs_main: { type: 'string', description: 'what still needs the main (or 無)' } }, required: ['outcome'] } },
 ]
 
+// 002k (C2, 002j group C): Joey tells the agent to pass something to a peer ("tell Eve it is Friday"); the lane relays it with reply_agent. The
+// relay is the agent's word in Joey's name, a promise like any other, but it was recorded only as an action line. When a run triggered by a
+// Joey message sends reply_agent, the daemon writes kind commitment (who = the peer, what = the sent text, refs.from owner-relay,
+// refs.auto true), unless the lane already wrote a commitment in that run (its own commitment call, or the receipt's promised).
+function ownerRelay(lane: Lane, tok: RunTok, to: string, text: string, msgId: number | null): void {
+  const byJoey = tok.trigger === 'joey' || tok.cls === 'joey' || queue.get(tok.evId)?.ev.source === 'telegram'
+  if (!byJoey || (tok.commitments ?? 0) > 0) return
+  const cm = commitmentFromReport(text, to, to) ?? { who: to, what: text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
+  tok.commitments = 1
+  ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'commitment', notify_main: false, text: commitmentText(cm),
+    refs: { ...cm, from: 'owner-relay', auto: true, btcc_msg_id: msgId }, detail: lane.transcript })
+}
+
 // 002k (B11, 002j group B): a scheduled run with nothing to do sent 6 lines to Joey; another sent 4 messages in one run. The card says one
 // line; this is the program behind it (a model's bad reasoning is answered with a program, not with more prompt text).
 //   - a scheduled run sends AT MOST ONE notify_joey: a second one is a tool error that says why;
@@ -2044,6 +2057,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: a.no_reply === true, thread: lane.thread, hop, lane: lane.id })
       if (r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', notify_main: false, text: `reply_agent → ${to}（hop ${hop}）：${text.slice(0, 200)}`, refs: { btcc_msg_id: r?.msgId ?? null } })
+      if (r) ownerRelay(lane, tok, to, text, r.msgId ?? null)
       return r?.text ?? 'send failed: inbox daemon unreachable'
     }
     case 'ledger_write': {
