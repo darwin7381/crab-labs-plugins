@@ -2342,8 +2342,14 @@ function memorySnippets(text: string, k = 6): Array<{ id: string; file: string; 
   walk(memoryDir(), 0)
   return scored.sort((a, b) => b.score - a.score).slice(0, k).map((x, i) => ({ id: `M${i + 1}`, file: x.file, line: x.line }))
 }
+/** 002k: every A4 call leaves a line in run/proposal-review.jsonl, failures included (it used to return null and write nothing).
+ *  ts is the daemon's own clock (nowIso); the unified log run/jev-calls.jsonl has the real one. Never throws. */
+function logProposalReview(rec: Record<string, unknown>): void {
+  try { appendFileSync(join(LANES_DIR, 'run', 'proposal-review.jsonl'), JSON.stringify({ ts: nowIso(), ...rec }) + '\n') } catch {}
+}
 async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ note: string; refs: Record<string, unknown> } | null> {
   if (process.env.LANES_PROPOSAL_REVIEW !== '1' || !text.trim()) return null
+  const t0 = Date.now()
   const mem = memorySnippets(text)
   const q: Record<string, unknown> = {
     backed: { type: 'noul', instructions: 'Is `proposal` backed by `message` (the message the agent saw), rather than invented or assumed?' },
@@ -2352,17 +2358,18 @@ async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ 
   if (mem.length) q.conflict = { type: 'choice', instructions: 'Which item of `memory` does `proposal` contradict?', criteria: { ...Object.fromEntries(mem.map(m => [m.id, null])), none: 'It contradicts none of them' } }
   try {
     const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
-    if (!key) return null
+    if (!key) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: 'no key' }); return null }
     const res = await fetch((process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone', { method: 'POST', signal: AbortSignal.timeout(8000),
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-proposal-review/1' },
       body: JSON.stringify({ model: process.env.TYPESAFE_DEFAULT_MODEL ?? 'jev-1.14.0', questions: q,
         state: { setting: 'An agent proposes adding `proposal` to its long-term memory. `message` is what it saw; `memory` are existing memory lines that may be related.',
           proposal: text.slice(0, 1500), message: { from: ev?.from ?? '?', verified: ev?.verified === true, text: (ev?.text ?? '').slice(0, 2000) }, memory: mem.length ? mem : '(no related lines)' } }) })
     const a = (await res.json().catch(() => null))?.answers
-    if (!res.ok || !a) return null
+    if (!res.ok || !a) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: res.ok ? `HTTP ${res.status}, no answers` : `HTTP ${res.status}` }); return null }
     const backed = a.backed?.noul ?? null, over = a.overreach?.noul ?? null
     const c = a.conflict?.choice ?? null, cc = a.conflict?.confidence ?? null
     const hit = c && c !== 'none' && (cc ?? 0) >= 0.7 ? mem.find(m => m.id === c) : undefined
+    logProposalReview({ event: ev?.id, ms: Date.now() - t0, backed, overreach: over, conflict: hit ? { file: hit.file, confidence: cc } : null, proposal: text.slice(0, 120) })
     const parts = [
       typeof backed === 'number' ? (backed >= 0.7 ? '有依據' : backed <= 0.3 ? '依據不足' : '依據不明') : null,
       typeof over === 'number' && over >= 0.7 ? '可能說得比原話多' : null,
@@ -2370,7 +2377,7 @@ async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ 
       ev && ev.verified === false ? '寄件人未驗證' : null,
     ].filter(Boolean)
     return { note: `〔Jev 檢查：${parts.join('；') || '無意見'}〕`, refs: { backed, overreach: over, conflict: hit ? { file: hit.file, line: hit.line, confidence: cc } : null, sender_verified: ev?.verified === true } }
-  } catch { return null }
+  } catch (e) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: String(e).slice(0, 160) }); return null }
 }
 
 // ------------------------------------------------------------------ 002k: a lane's report is checked against its own tool results (Jev design A3)
