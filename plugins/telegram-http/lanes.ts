@@ -1953,7 +1953,6 @@ export function laneSlots(): number {
 function pump(): void {
   if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
   const slots = laneSlots()                               // 002l (D13)
-  sessScan = null                                         // 002l (S0 item 2): one /proc scan per pump pass
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
@@ -2346,7 +2345,7 @@ function runSession(lane: Lane): { sid: string; fork: boolean } {
   return { sid: i >= 0 ? args[i + 1] : j >= 0 ? args[j + 1] : lane.session_id, fork }
 }
 /** a live process (not this daemon) runs on session id `sid`, or null */
-export function sessionHolder(sid: string, cached = false): number | null {
+export function sessionHolder(sid: string, cached = false, scan = true): number | null {
   if (!sid) return null
   try {
     const pid = Number(readFileSync(sidLock(sid), 'utf8').trim())
@@ -2355,12 +2354,15 @@ export function sessionHolder(sid: string, cached = false): number | null {
       if (cmd.includes(sid)) return pid
     }
   } catch {}
-  return liveSessions(cached).get(sid) ?? null
+  if (!scan) return null
+  const p = liveSessions(cached).get(sid)
+  return p != null && pidAlive(p) ? p : null                          // a cached entry can only miss a newer process, never keep a dead one
 }
-/** session id → pid of every live process whose command line resumes or names it. cached: the scan of this pump pass (pump clears it at its start) */
+/** session id → pid of every live process whose command line resumes or names it. A /proc scan costs ~60 ms on a box with 3,700 processes, so the router's
+ *  own checks (cached) reuse one for 2 s; a direct call scans afresh. */
 let sessScan: { at: number; map: Map<string, number> } | null = null
 function liveSessions(cached: boolean): Map<string, number> {
-  if (cached && sessScan) return sessScan.map
+  if (cached && sessScan && Date.now() - sessScan.at < 2_000) return sessScan.map
   const map = new Map<string, number>()
   let pids: string[] = []
   try { pids = readdirSync('/proc').filter(x => /^\d+$/.test(x)) } catch { pids = [] }
@@ -2387,7 +2389,9 @@ function sessionBusy(it: QItem): boolean {
   if (!lane) return false
   const { sid, fork } = runSession(lane)
   if (fork) return false
-  const holder = sessionHolder(sid, true)
+  // a run that starts a NEW session (--session-id <fresh uuid>) cannot meet a foreign process on that id: only the lock is read. A resume is checked against
+  // every live process as well.
+  const holder = sessionHolder(sid, true, sessionArgs(lane).resume)
   if (holder == null) { busyNoted.delete(sid); return false }
   if (busyNoted.get(sid) !== holder) {
     busyNoted.set(sid, holder)
