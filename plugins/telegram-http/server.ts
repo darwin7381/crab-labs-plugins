@@ -1539,6 +1539,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (!c.ok) return { content: [{ type: 'text', text: `send blocked — nothing was sent: ${c.why}. The thread is stopped; tell Joey instead of continuing it.` }] }
           hop = c.hop
         }
+        { const refused = await Lanes.checkPeerSend('main', String(args.to ?? ''), String(args.text ?? '')); if (refused) return { content: [{ type: 'text', text: refused }], isError: true } }     // 002k (K2): disclosure check, as for a lane's reply_agent
         let minted: number | undefined
         const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op,
           { thread, hop, lane: `${INBOX_SELF}.main`, minted: id => { minted = id } })
