@@ -1,3 +1,7 @@
+## 1.29.1 — 2026-11-16
+
+- **Duty officer: tmux and `claude -p` output read on `close`, not `exit`.** On the first live canary (claude-epeius, 16:17Z) the daemon wrote its claims every tick but never logged a single screen. The same code run from a shell saw the test dialog and handled it. `exit` can fire before stdout has been read. An empty `display-message` then reads as "no pane", which was skipped without a word. A pane that cannot be read now leaves a `look_failed` line once an hour.
+
 ## 1.29.0 — 2026-11-16
 
 - **值班員 (duty officer) inside every Telegram daemon (BTCC WO-97).** This is the formal version of Chiron's interim `tools/menu_aide/duty_officer.py`. Each daemon watches its own agent's pane; roamers watch their current target. When a screen sits waiting for a key, the daemon gets it handled without going through any agent session. New `duty-officer.ts`; behaviour notes are in its header.

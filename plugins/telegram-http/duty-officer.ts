@@ -343,7 +343,8 @@ function run(argv: string[], timeoutMs = 8000): Promise<{ code: number; out: str
     const timer = setTimeout(() => { if (!done) { done = true; try { p.kill('SIGKILL') } catch {}; resolve({ code: 124, out }) } }, timeoutMs)
     p.stdout?.on('data', (c: Buffer) => { out += c.toString() })
     p.on('error', () => { if (!done) { done = true; clearTimeout(timer); resolve({ code: -1, out }) } })
-    p.on('exit', code => { if (!done) { done = true; clearTimeout(timer); resolve({ code: code ?? -1, out }) } })
+    // 'close', not 'exit': 'exit' can fire before stdout has been read, and an empty capture looks like no pane
+    p.on('close', code => { if (!done) { done = true; clearTimeout(timer); resolve({ code: code ?? -1, out }) } })
   })
 }
 export const realTmux: Tmux = {
@@ -585,7 +586,7 @@ export function askModelCli(bundle: Record<string, unknown>, systemPrompt: strin
     p.stdout?.on('data', (c: Buffer) => { out += c.toString() })
     p.stderr?.on('data', (c: Buffer) => { err += c.toString() })
     p.on('error', e => finish({ decision: null, meta: {}, fail: `could not run claude: ${String(e).slice(0, 120)}` }))
-    p.on('exit', code => {
+    p.on('close', code => { // 'close': all of stdout has been read
       const meta: Record<string, unknown> = { returncode: code }
       let envl: any
       try { envl = JSON.parse(out) } catch {
@@ -692,6 +693,7 @@ export class DutyOfficer {
   private readonly st = new Map<string, PaneState>()
   private readonly busy = new Set<string>()
   private readonly asks = new Map<string, Ask>()
+  private readonly lookFailed = new Map<string, number>()
   private cfgCache: { mtime: number; cfg: Config } = { mtime: -1, cfg: NO_CONFIG }
   private enabledNow = new Set<string>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -838,7 +840,12 @@ export class DutyOfficer {
         on.add(t.tmux)
         if (this.busy.has(t.tmux)) continue
         const lk = await this.look(t.tmux)
-        if (!lk) continue
+        if (!lk) {
+          // a pane we cannot read is said once an hour, never skipped silently
+          const last = this.lookFailed.get(t.tmux) ?? 0
+          if (now - last >= this.L.renotifyMs) { this.lookFailed.set(t.tmux, now); this.event('look_failed', { agent: t.label, tmux: t.tmux }) }
+          continue
+        }
         await this.step(t, lk, now)
       }
       for (const tmux of this.enabledNow) if (!on.has(tmux)) this.release(tmux)
