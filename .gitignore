@@ -24,3 +24,7 @@ node_modules/
 # Backups
 *.bak
 *.bak.*
+
+# Python bytecode (the hook tests run python3, which rewrites these; tracked copies dirtied the tree on every test run)
+__pycache__/
+*.pyc
