@@ -353,6 +353,31 @@ describe('officer', () => {
     expect(r.log().filter(e => e.event === 'decision').length).toBe(1)
   })
 
+  test('switched off while the model is thinking: no key is pressed, no message sent', async () => {
+    const r = rig({ model: () => {
+      writeFileSync(join(r.dir, 'config.json'), JSON.stringify({ enabled: [] }))
+      return { decision: decision(), meta: {}, fail: null }
+    } })
+    await r.advance(0)
+    await r.advance(9000)
+    await r.settle()
+    expect(r.calls()).toBe(1)
+    expect(r.keys).toEqual([])
+    expect(r.sent).toEqual([])
+    expect(r.log().find(e => e.event === 'aborted').why).toBe('switched off while judging')
+  })
+
+  test('switched off after the question went out: Joey\'s tap presses nothing', async () => {
+    const r = rig({ model: () => ({ decision: decision({ action: 'ask_joey' }), meta: {}, fail: null }) })
+    await r.advance(0)
+    await r.advance(9000)
+    await r.settle()
+    writeFileSync(join(r.dir, 'config.json'), JSON.stringify({ enabled: [] }))
+    expect(await r.o.onTap(r.sent[0].buttons[0][0].callback_data, 'Advac777')).toBe('值班員已經關掉，沒有按。')
+    expect(r.keys).toEqual([])
+    expect(r.mails).toEqual([])
+  })
+
   test('checkDo', () => {
     expect(checkDo(decision())).toEqual({ keys: ['Enter'] })
     expect(checkDo(decision({ choose: 'Maybe' }))).toEqual({ bad: "choose matches no option's button" })

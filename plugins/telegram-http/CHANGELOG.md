@@ -1,3 +1,7 @@
+## 1.29.4 — 2026-11-16
+
+- **Duty officer: switching it off now also stops a press that is already on its way** (stop-time review). The switch is re-read before judging, again after the model answers (no key, no message), and right before any key is pressed, Joey's tap included (toast: 「值班員已經關掉，沒有按。」). Before this, a judgement in flight when `enabled` was emptied still pressed its keys. That happened just as the claim lapsed and Chiron's interim loop took the pane back, so a pane could be handled twice. 2 new tests, 26 in `duty-officer.test.ts`.
+
 ## 1.29.3 — 2026-11-16
 
 - Duty officer: config key `claude_cmds`, extra foreground commands that count as Claude Code. `fake_dialog.py` runs as python, so after a press its fake idle footer was read as a follow-up dialog and cost one more model call. The model answered `none`, correctly.

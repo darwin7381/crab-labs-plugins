@@ -699,6 +699,7 @@ export class DutyOfficer {
   private readonly busy = new Set<string>()
   private readonly asks = new Map<string, Ask>()
   private readonly lookFailed = new Map<string, number>()
+  private readonly labels = new Map<string, string>()
   private cfgCache: { mtime: number; cfg: Config } = { mtime: -1, cfg: NO_CONFIG }
   private enabledNow = new Set<string>()
   private timer: ReturnType<typeof setInterval> | null = null
@@ -747,6 +748,14 @@ export class DutyOfficer {
   }
   private isEnabled(t: Target, cfg: Config): boolean {
     return cfg.enabled === '*' || cfg.enabled.includes(t.tmux) || cfg.enabled.includes(t.label)
+  }
+  /** The switch as it is right now (config.json re-read). Checked again before judging, after the model answers
+   *  and right before any key is pressed: switching off stops a press that is already on its way. */
+  stillOn(tmux: string): boolean {
+    const cfg = this.config()
+    if (Object.prototype.hasOwnProperty.call(cfg.test_targets, tmux)) return true
+    const label = this.labels.get(tmux)
+    return cfg.enabled === '*' || cfg.enabled.includes(tmux) || (!!label && cfg.enabled.includes(label))
   }
   /** True when this daemon's duty officer is watching that pane (the old startup-picker steps aside). */
   handles(tmux: string): boolean { return this.enabledNow.has(tmux) }
@@ -839,6 +848,7 @@ export class DutyOfficer {
       const now = this.now()
       const on = new Set<string>()
       for (const t of await this.targets(cfg)) {
+        this.labels.set(t.tmux, t.label)
         if (!this.isEnabled(t, cfg) && !t.test) {
           if (this.enabledNow.has(t.tmux)) this.release(t.tmux)
           continue
@@ -920,6 +930,11 @@ export class DutyOfficer {
   }
 
   private async judge(t: Target, lk: NonNullable<Look>, appeared: number, step: number): Promise<void> {
+    if (!this.stillOn(t.tmux)) {
+      this.event('aborted', { agent: t.label, tmux: t.tmux, step, why: 'switched off before judging', screen_hash: lk.hash })
+      this.setRec(t.tmux, lk.hash, null)
+      return
+    }
     const rules = this.rules()
     if (!rules) { await this.rawAsk(t, lk, 'aide_prompt.md / rulings.md not found'); return }
     const at = this.now()
@@ -938,6 +953,11 @@ export class DutyOfficer {
       return
     }
     const res = await this.d.model(bundle, rules.prompt, this.L.modelTimeoutMs)
+    if (!this.stillOn(t.tmux)) { // switched off while the model was thinking: no key, no message
+      this.event('aborted', { agent: t.label, tmux: t.tmux, step, why: 'switched off while judging', screen_hash: lk.hash, action: res.decision?.action ?? null })
+      this.setRec(t.tmux, lk.hash, null)
+      return
+    }
     const base = { agent: t.label, tmux: t.tmux, step, seconds: res.meta.seconds, cost: res.meta.cost,
       since_appeared_s: Math.round((this.now() - appeared) / 100) / 10, screen_hash: lk.hash, rules_dir: rules.dir }
     if (res.fail || !res.decision) {
@@ -967,7 +987,8 @@ export class DutyOfficer {
   }
 
   /** Press `keys` if the screen is still the one that was judged; returns the screen afterwards. */
-  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean): Promise<{ ok: false; now: Look } | { ok: true; after: Look; leftMode: boolean; at: number }> {
+  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean): Promise<{ ok: false; now: Look; off?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number }> {
+    if (!this.stillOn(tmux)) return { ok: false, now: null, off: true }
     const before = await this.look(tmux)
     if (!before || before.hash !== hash) return { ok: false, now: before }
     if (dry) return { ok: true, after: before, leftMode: false, at: this.now() }
@@ -986,6 +1007,11 @@ export class DutyOfficer {
     const dry = this.config().dry_keys
     const r = await this.pressKeys(t.tmux, lk.hash, keys, dry)
     const base = { agent: t.label, tmux: t.tmux, step, choose: d.choose, keys, screen_hash: lk.hash }
+    if (!r.ok && r.off) {
+      this.event('aborted', { ...base, why: 'switched off before pressing' })
+      this.setRec(t.tmux, lk.hash, null)
+      return
+    }
     if (!r.ok) {
       this.event('aborted', { ...base, why: 'screen changed before pressing', before_tail: lk.lines, now_tail: r.now?.lines ?? null })
       this.setRec(t.tmux, lk.hash, null) // the loop looks at whatever is showing now
@@ -1152,6 +1178,10 @@ export class DutyOfficer {
       const r = await this.pressKeys(a.tmux, a.hash, opt.keys, false)
       let result: string
       let afterTail = ''
+      if (!r.ok && r.off) {
+        this.event('joey_tap_off', { agent: a.label, tmux: a.tmux, ask: a.id, by, choice: opt.button })
+        return '值班員已經關掉，沒有按。'
+      }
       if (!r.ok) {
         result = '畫面已經變了，沒有按'
         afterTail = r.now ? r.now.lines.slice(-8).join('\n') : '（看不到畫面）'
