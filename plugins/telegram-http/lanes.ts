@@ -2079,6 +2079,7 @@ export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>): stri
     focusCard(),
     ...(it.summary ? [``, `# 這個 thread 先前的帳本紀錄（原車道已結束太久，由你接手）`, it.summary] : []),
     ...fanoutLines(lane, it),
+    ...limitLines(lane),
     `〔車道資訊結束；下面是事件〕`,
   ].join('\n')
 }
@@ -2226,6 +2227,8 @@ function startRun(it: QItem): void {
   let walled: { kind: string; text: string } | null = null
   let lastText = '', resultSubtype = ''
   let budgetStop: { total: number; at: number } | null = null          // 002k (H11): this run was stopped by the thread budget, in the run
+  let warnedTurns = false, warnedBudget = false                        // 002l (D8, N4): the limit notices of this run
+  const lastResults: string[] = []                                     // 002l (D8): the last tool results of the run, for the stop row's partial
   child.stdout!.setEncoding('utf8')
   child.stdout!.on('data', (chunk: string) => {
     buf += chunk
@@ -2247,6 +2250,22 @@ function startRun(it: QItem): void {
           for (const u2 of usage.values()) sofar += u2.fresh              // 002l (D7): fresh tokens only; the cache reads of a fork's context are not spent again
           const total = (S.threads[lane.thread]?.fresh ?? 0) + sofar
           if (total >= THREAD_BUDGET) { budgetStop = { total, at: Date.now() }; try { child.kill('SIGTERM') } catch {} }
+          else if (!warnedBudget && total >= THREAD_BUDGET * BUDGET_WARN_FRAC()) {
+            warnedBudget = true
+            steerSystem(lane, runId, 'budget', `這條對話線的 token 預算快用完了：已用 ${total}，預算 ${THREAD_BUDGET}（剩 ${THREAD_BUDGET - total}）。到預算這一趟會被中止。現在就收尾：還沒做完就用 handoff_main 交給主線（你查到什麼、你的做法、還剩什麼要做），做完了就 notify_joey 一句；最後 receipt。`)
+          }
+        }
+        const maxT = laneMaxTurns(lane.kind)                              // 002l (N4): two calls before the turn cap, the lane is told to close now
+        if (!warnedTurns && maxT > 2 && usage.size >= maxT - 2 && !budgetStop) {
+          warnedTurns = true
+          steerSystem(lane, runId, 'turns', `這一趟只剩 ${maxT - usage.size} 次模型呼叫（回合上限 ${maxT}）。現在就收尾，不要再查：做完了就 notify_joey 一句；還沒做完就 handoff_main 交給主線（你查到什麼、你的做法、還剩什麼）；最後 receipt。`)
+        }
+      }
+      if (j.type === 'user' && Array.isArray(j.message?.content)) {      // 002l (D8): tool results, for the partial of a run that is cut
+        for (const c of j.message.content) {
+          if (c?.type !== 'tool_result') continue
+          const body = typeof c.content === 'string' ? c.content : Array.isArray(c.content) ? c.content.map((x: any) => x?.text ?? '').join(' ') : ''
+          if (body.trim()) { lastResults.push(body.replace(/\s+/g, ' ').trim().slice(0, 300)); if (lastResults.length > 2) lastResults.shift() }
         }
       }
       if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j); resultSubtype = String(j.subtype ?? '') }
@@ -2297,18 +2316,23 @@ function startRun(it: QItem): void {
     if (capped && lane.status !== 'closed') {
       it.state = 'done'; saveQ(it); queue.delete(it.ev.id)
       try { rmSync(qPath(it.ev.id)) } catch {}
-      const partial = (lastText || result || `（還沒有文字結果；用過 ${[...new Set(names)].join('、') || '沒有工具'}）`).replace(/\s+/g, ' ').trim().slice(0, 600)
+      // 002l (D8): the partial keeps the last tool results too (002k kept only text: 「還沒有文字結果；用過 Bash」 for a lane that had counted the 5xx per page)
+      const said = (lastText || result || '').replace(/\s+/g, ' ').trim()
+      const partial = [said || `（還沒有文字結果；用過 ${[...new Set(names)].join('、') || '沒有工具'}）`,
+        ...(lastResults.length ? [`最後的工具結果：${lastResults.join(' ｜ ')}`] : [])].join(' ').slice(0, 900)
       const th2 = S.threads[lane.thread]
       const why = capped === 'budget'
         ? `預算：thread ${lane.thread} 在這一趟的途中用到 ${budgetStop!.total} token（新的輸入、快取寫入與輸出；快取重讀不算），達到預算 ${THREAD_BUDGET}，這一趟已經中止（${usage.size} 次呼叫之後）。`
         : capped === 'usd' ? `預算：這一趟花到單趟的金額上限（--max-budget-usd ${laneMaxUsd(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
         : `這一趟到了回合上限（--max-turns ${laneMaxTurns(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
+      const toldJoey = !it.ev.fanout && !closers.some(c => TOLD.includes(c))
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', notify_main: true,
-        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}`,
+        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}${toldJoey ? '。車道已經用它自己的標記告訴 Joey 這一趟被中止、由你接手；你接手做完再回報，不用重講中止的事。' : ''}`,
         refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
       logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET })
       D.log('warn', `lanes: ${runId} stopped (${capped}): ${why}`)
       if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊被中止：${capped === 'turns' ? '回合上限' : '預算'}；結果到中止為止：${partial}）`)
+      else if (!closers.some(c => TOLD.includes(c))) cappedNotice(lane, it, capped, partial)   // 002l (N4): the lane's own labelled line, never the main's unlabelled one
       saveState()
       pump()
       return
@@ -3123,6 +3147,19 @@ async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string):
 // when a run still ends without one, the daemon writes it: what the lane sent the peer (or its receipt), at the event class's tier
 // (a peer's matter is silent). Only a high-frequency routine with nothing to report may end with the receipt alone (Joey msg 934).
 const TOLD = ['notify_joey', 'ask_joey', 'handoff_main', 'report_result', 'deliver_synthesis', 'curator_done']
+/** 002l (N4): a run cut at a cap before it told anyone: its line to Joey goes out under the lane's own label at the event's tier (as a never-silent line), with
+ *  what it had found; the stop row has already handed the event to the main. */
+function cappedNotice(lane: Lane, it: QItem, capped: string, partial: string): void {
+  const cls = it.ev.cls ?? it.ev.trigger ?? 'other'
+  const dec = notifyDecision(cls, false, lane.thread)
+  const what = capped === 'turns' ? `到了回合上限（${laneMaxTurns(lane.kind)} 次呼叫）` : capped === 'usd' ? '花到單趟金額上限' : '用完這條對話線的 token 預算'
+  const text = `${it.ev.from} 的事我還沒做完：這一趟${what}被中止，已交給主線接手。中止前的結果：${partial}`
+  ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'notify', notify_main: dec.tier !== 'ledger', text: `[${dec.tier}] ${text.slice(0, 400)}`,
+    refs: { class: cls, escalated: false, tier: dec.tier, tier_rule: `${dec.rule}+capped-${capped}` } })
+  logos('lane.capped_notice', { lane: lane.id, event: it.ev.id, capped, tier: dec.tier })
+  if (dec.tier === 'ledger') return
+  void pushJoey(lane, text, dec.tier === 'silent', joeyReplyTo(it.ev)).then(id => logos('lane.notify', { lane: lane.id, thread: lane.thread, event: it.ev.id, class: cls, escalated: false, tier: dec.tier, tier_rule: `${dec.rule}+capped-${capped}`, message_id: id }))
+}
 function neverSilentBackstop(lane: Lane, it: QItem, closers: string[], tools: Array<{ name: string; input: any }>, result: string): void {
   if (!closers.length || closers.some(c => TOLD.includes(c))) return
   const hf = /\[high-frequency\]/.test(it.ev.text) && !it.ev.id.startsWith('ev-fu-')   // 002k (B9): a follow-up run always leaves its line
@@ -3197,6 +3234,34 @@ function kindLines(kind: LaneKind): string[] {
     '- 只整理記憶提案：把有根據的提案寫進記憶。不刪、不改寫主線寫的內容；提案跟主線寫的內容衝突時，不動那個檔，改用 ledger_write(kind=memory_proposal) 寫一筆「建議刪除：…（理由）」留給主線。',
     '- 整理完用 curator_done(summary) 交回寫入權。主線隨時可以收回；收回後你寫不了記憶，沒處理的提案留在帳本。']
   return []
+}
+// 002l (D8, N4): design/identity rule 6 「超過就停、升級主線」 and design/stability 「每個回合結束前要回報一句，做不到就擋下來」. 002k never told a lane its
+// --max-turns cap or the thread budget, and stopped it without warning: H05's lane had found the better way and the main got 「還沒有文字結果；用過 Bash」;
+// E02's lane hit 12 calls before any closer and Joey got an unlabelled report from the main. Now (1) the lane reads its limits in the per-run block,
+// (2) near a limit the daemon hands it a system notice at its next tool boundary (steerSystem: two calls before the turn cap, at
+// LANES_BUDGET_WARN_FRAC (0.8) of the thread budget) telling it to hand over now, (3) a run that is still cut keeps its last tool results in `partial`,
+// and when it told nobody, the lane's own labelled line goes to Joey at the event's tier (the stop row still wakes the main).
+const BUDGET_WARN_FRAC = (): number => { const n = Number(process.env.LANES_BUDGET_WARN_FRAC ?? 0.8); return Number.isFinite(n) && n > 0 && n < 1 ? n : 0.8 }
+function limitLines(lane: Lane): string[] {
+  const turns = laneMaxTurns(lane.kind), usd = laneMaxUsd(lane.kind)
+  const th = S?.threads?.[lane.thread], used = th?.fresh ?? 0
+  const parts: string[] = []
+  if (turns) parts.push(`這一趟最多 ${turns} 次模型呼叫（回合上限）`)
+  if (usd) parts.push(`單趟花費上限 ${usd} 美元`)
+  if (THREAD_BUDGET > 0) parts.push(`這條對話線的 token 預算還剩 ${Math.max(0, THREAD_BUDGET - used)}（共 ${THREAD_BUDGET}；算新的輸入、快取寫入與輸出，快取重讀不算）`)
+  if (!parts.length) return []
+  return ['', `# 這一趟的上限`, `- ${parts.join('；')}。到上限這一趟會被中止。`,
+    `- 快到上限時系統會在工具結果後面提醒你（〔系統通知｜車道上限〕）。一被提醒就收尾：還做不完就用 handoff_main 交給主線（寫清楚你查到什麼、你的做法、還剩什麼），做完了就 notify_joey 一句，最後 receipt。不要等到被中止。`]
+}
+/** 002l (D8, N4): a system notice handed to the running run at its next tool boundary (lane-steer-hook.py renders kind=system without the Joey frame). Not a
+ *  Joey message: it is not tracked in S.steering and never becomes a run of its own. */
+function steerSystem(lane: Lane, runId: string, key: string, text: string): void {
+  try {
+    mkdirSync(join(LANES_DIR, 'run', 'steer'), { recursive: true, mode: 0o700 })
+    appendFileSync(steerFile(lane.id, 'in'), JSON.stringify({ id: `sys-${runId}-${key}`, kind: 'system', ts: nowIso(), text, run: runId }) + '\n')
+    appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'limit_warning', run: runId, which: key })
+    logos('lane.limit_warning', { lane: lane.id, run: runId, which: key })
+  } catch (e) { D.log('warn', `lanes: limit warning for ${runId} not written: ${e}`) }
 }
 /** a fan-out member is a reflex lane for one event: the role depends on the event, so it is part of the lane context, not of the card */
 function fanoutLines(lane: Lane, it: Pick<QItem, 'ev'>): string[] {

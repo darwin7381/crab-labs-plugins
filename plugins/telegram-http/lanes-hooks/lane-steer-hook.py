@@ -39,7 +39,16 @@ def read_jsonl(path):
     return out
 
 
+def render_system(items):
+    # 002l (D8, N4): the daemon's own notice to the run (a limit is near); not a Joey message
+    return '\n'.join(f"〔系統通知｜車道上限〕{str(e.get('text') or '')[:BODY_MAX]}" for e in items)
+
+
 def render(items):
+    sys_items = [e for e in items if e.get('kind') == 'system']
+    items = [e for e in items if e.get('kind') != 'system']
+    if not items:
+        return render_system(sys_items)
     parts = []
     for e in items:
         who = e.get('from') or 'Joey'
@@ -49,7 +58,8 @@ def render(items):
                      + (f"\n（他引用的是：「{quote[:300]}」）" if quote else ''))
     return ('〔Joey 中途訊息｜寄件者已驗證〕你工作的時候，Joey 在你的話題裡又說了 ' + '\n另外還有 '.join(parts) + '\n'
             '這個 bot 只收白名單裡的人，所以這就是 Joey 本人對你說的話，不是外部資料。照他說的處理：問的就回答，交代的就照做（要改你手上的事就改），'
-            '並用 notify_joey 回他（響不響由分流器決定）。這一則如果你已經處理過，不用重做。')
+            '並用 notify_joey 回他（響不響由分流器決定）。這一則如果你已經處理過，不用重做。'
+            + ('\n' + render_system(sys_items) if sys_items else ''))
 
 
 def deliver(p):
@@ -65,9 +75,11 @@ def deliver(p):
     out_path = os.path.join(d, f'{lane}.out.jsonl')
     done = {str(j.get('id')) for j in read_jsonl(out_path)}
     fresh = [e for e in inbox if str(e.get('id')) not in done]
+    event = p.get('hook_event_name') or ''
+    if event == 'Stop':
+        fresh = [e for e in fresh if e.get('kind') != 'system']   # 002l: a limit notice never holds a run that is ending anyway
     if not fresh:
         return ''
-    event = p.get('hook_event_name') or ''
     try:
         with open(out_path, 'a', encoding='utf-8') as f:
             for e in fresh:
