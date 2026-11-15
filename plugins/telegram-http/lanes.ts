@@ -1915,14 +1915,45 @@ function ringCriticalBehindWall(it: QItem, lane: Lane): void {
   })
 }
 
+// ------------------------------------------------------------------ 002l (D13): lane slots follow the live quota
+// design/stability 「額度燒得更快」: 「名額要跟著即時額度調，我們已經有精確的額度輪詢可以接。」 (and 「每隻 agent…有同時在線的名額，額滿就排隊，不硬開」). 002k had only the
+// fixed LANES_MAX. The quota reading comes from whoever polls it (the fleet's quota poller; in the lab, the driver): env LANES_QUOTA_USED, or the file
+// LANES_QUOTA_FILE (default <lanes dir>/run/quota.json: {"used": 0.92} or {"weekly_used_pct": 92}, optional "at" ISO time; a plain number works too).
+// used >= LANES_QUOTA_ONE_SLOT_AT (0.9): one slot; >= LANES_QUOTA_HALF_AT (0.75): half the slots (rounded up); otherwise, or with no reading, or a
+// reading older than LANES_QUOTA_MAX_AGE_MIN (30): the fixed cap. Over the slots an event waits in the queue; nothing is dropped.
+const quotaFile = (): string => process.env.LANES_QUOTA_FILE ?? join(LANES_DIR, 'run', 'quota.json')
+const fracOf = (v: unknown): number | null => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? (n > 1 ? n / 100 : n) : null }
+export function quotaUsed(): number | null {
+  if (process.env.LANES_QUOTA_USED != null && process.env.LANES_QUOTA_USED !== '') return fracOf(process.env.LANES_QUOTA_USED)
+  let raw = ''
+  try { raw = readFileSync(quotaFile(), 'utf8').trim() } catch { return null }
+  if (!raw) return null
+  let j: any
+  try { j = JSON.parse(raw) } catch { return null }
+  if (typeof j === 'number') return fracOf(j)
+  const at = j?.at ? Date.parse(String(j.at)) : NaN
+  if (Number.isFinite(at) && Date.now() - at > num('LANES_QUOTA_MAX_AGE_MIN', 30) * 60_000) return null     // not a live reading any more
+  return fracOf(j?.used ?? j?.weekly_used ?? (j?.weekly_used_pct != null ? Number(j.weekly_used_pct) / 100 : j?.used_pct != null ? Number(j.used_pct) / 100 : undefined))
+}
+let lastSlots = -1
+export function laneSlots(): number {
+  const u = quotaUsed()
+  const n = u == null ? MAX_RUNNING : u >= num('LANES_QUOTA_ONE_SLOT_AT', 0.9) ? Math.min(1, MAX_RUNNING) : u >= num('LANES_QUOTA_HALF_AT', 0.75) ? Math.max(1, Math.ceil(MAX_RUNNING / 2)) : MAX_RUNNING
+  if (n !== lastSlots && LANES_DIR) {
+    if (lastSlots !== -1) { appendJsonl('lanes.jsonl', { lane: 'router', kind: 'slots', slots: n, quota_used: u, cap: MAX_RUNNING }); logos('lane.slots', { slots: n, quota_used: u, cap: MAX_RUNNING }) }
+    lastSlots = n
+  }
+  return n
+}
 function pump(): void {
   if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
+  const slots = laneSlots()                               // 002l (D13)
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
     if (running.has(it.lane)) continue                    // one process per lane; this event waits for it
-    if (running.size >= MAX_RUNNING) {
-      D.log('info', `lanes: cap ${MAX_RUNNING} reached — ${it.ev.id} for ${it.lane} waits in queue`)
+    if (running.size >= slots) {
+      D.log('info', `lanes: ${slots} slot(s) in use (cap ${MAX_RUNNING}${slots < MAX_RUNNING ? `, quota ${Math.round((quotaUsed() ?? 0) * 100)}%` : ''}) — ${it.ev.id} for ${it.lane} waits in queue`)
       break
     }
     if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
@@ -3724,7 +3755,8 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
   const sub = (args[0] ?? '').toLowerCase()
   if (!sub || sub === 'list') {
     const open = Object.values(S.lanes).filter(l => l.status !== 'closed')
-    const head = S.master_off ? `總開關：關（${stamp(S.master_off.since)} 起，所有訊息進主線）` : '總開關：開'
+    const head = (S.master_off ? `總開關：關（${stamp(S.master_off.since)} 起，所有訊息進主線）` : '總開關：開')
+      + `｜名額 ${laneSlots()}/${MAX_RUNNING}${quotaUsed() != null ? `（額度已用 ${Math.round(quotaUsed()! * 100)}%）` : ''}`
     const prof = `通知：${notifyProfile() === 'default' ? '全部照常推播' : '分級（依事件類別）'}`
     logos('lane.command', { cmd: 'list', by: who, lanes: open.length })
     return [head, prof, open.length ? `車道 ${open.length} 條：` : '目前沒有開著的車道。', ...open.map(laneRow)].join('\n')
@@ -4082,7 +4114,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
 /** /healthz extras */
 export function lanesHealth(): Record<string, unknown> {
   return { lanes_on: true, main_wall: wallHoldsMain(), main_stuck: !!S?.main_stuck, main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
-    lanes_running: D?.role === 'tg' ? running.size : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
+    lanes_running: D?.role === 'tg' ? running.size : undefined, lane_slots: D?.role === 'tg' && LANES_DIR ? laneSlots() : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
     handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined,
     steering_pending: D?.role === 'tg' ? Object.values(S?.steering ?? {}).reduce((n, l) => n + l.length, 0) : undefined,
