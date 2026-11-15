@@ -394,8 +394,18 @@ export function cutOffTurn(path: string): { cut: boolean; at?: string; walled?: 
       return j.message?.stop_reason === 'end_turn' && !tool ? { cut: false } : out(j.timestamp)
     }
     if (j.type === 'user' && !j.isMeta) return out(j.timestamp)
+    // 002l (N7): 002j 「有人下令重啟的，不再叫它接著做」 needs the cut to be seen first. This Claude Code writes every channel delivery as a user record
+    // with isMeta:true, so a turn cut right after it took in a channel message (T8-R K4: the take-in, an API request, then the kill) read "not cut" and
+    // resumeDecision returned 'none' before it looked at the deliberate-restart marker. A meta record that IS a channel message opens a turn; other meta
+    // records (reminders, hook companions) still do not.
+    if (j.type === 'user' && j.isMeta && /<channel[\s>]/.test(userText(j))) return out(j.timestamp)
   }
   return { cut: false }
+}
+function userText(j: any): string {
+  const c = j?.message?.content
+  if (typeof c === 'string') return c
+  return Array.isArray(c) ? c.map((x: any) => (typeof x === 'string' ? x : x?.text ?? '')).join('\n') : ''
 }
 
 // ------------------------------------------------------------------ 002j: when NOT to tell a replaced main to carry on
