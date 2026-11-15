@@ -674,7 +674,9 @@ type MainCommitment = { id: string; who: string; what: string; by: string; due: 
 /** 002d: something a lane (or the router) handed to the main. pending → delivered (the main got the wake digest that
  *  carries it) | fallback (the main did not get it in time, or is not connected: Joey was told directly, once). */
 type Handoff = { id: string; lane: string; thread: string | null; event: string; text: string; created: number
-  state: 'pending' | 'delivered' | 'fallback'; done?: string }
+  state: 'pending' | 'delivered' | 'fallback'; done?: string
+  /** 002l (D16): the class of the event a lane handed over with handoff_main (its tier is the tier of the main's report on it) */
+  cls?: string }
 let S: State
 const statePath = () => join(LANES_DIR, 'state.json')
 function loadState(): void {
@@ -837,6 +839,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
       class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
     logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
     D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=master-off → main`)
+    if (ev.source === 'telegram') joeyToMainAt = Date.now()
     if (!wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
     noteInbound(ev, d)
     return d
@@ -914,7 +917,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     if (asked) triageRecord(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier }, asked)
     else void triageShadow(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier })
   }
-  if (D.role === 'tg' && S) { noteAdmitted(ev, d); noteInbound(ev, d) }
+  if (D.role === 'tg' && S) { noteAdmitted(ev, d); noteInbound(ev, d); if (ev.source === 'telegram' && d.target === 'main') joeyToMainAt = Date.now() }
   // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it
   if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
   return d
@@ -2501,11 +2504,12 @@ function laneLabel(l: Lane): string { return `${{ reflex: '反射線', worker: '
 // digest and is not woken). A lane that needs the MAIN hands the work over (handoff_main): the main is woken with it
 // and reports to Joey itself; the lane and the router send Joey nothing. Only when the main does not get the handoff
 // (not connected, or still not delivered after HANDOFF_FALLBACK_MS) is Joey told directly, once.
-function handoff(lane: Lane | undefined, evId: string, text: string, laneId?: string): Handoff {
+function handoff(lane: Lane | undefined, evId: string, text: string, laneId?: string, cls?: string): Handoff {
   const h: Handoff = { id: `ho-${shortId()}`, lane: lane?.id ?? laneId ?? 'router', thread: lane?.thread ?? null, event: evId,
-    text: text.slice(0, 1000), created: Date.now(), state: 'pending' }
+    text: text.slice(0, 1000), created: Date.now(), state: 'pending', ...(cls ? { cls } : {}) }
   S.handoffs[h.id] = h
-  ledger({ lane: h.lane, thread: h.thread, event: evId, kind: 'escalation', notify_main: true, text: h.text, refs: { handoff: h.id }, detail: lane?.transcript })
+  // 002l (D16): the id leads the line, so the main can name it (reply handoff_id) when it reports on it
+  ledger({ lane: h.lane, thread: h.thread, event: evId, kind: 'escalation', notify_main: true, text: `〔${h.id}〕${h.text}`, refs: { handoff: h.id, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
   const up = mainConnected()
   logos('lane.handoff', { lane: h.lane, thread: h.thread, event: evId, handoff: h.id, main_connected: up })
   // 002g: a main that only just went away gets HANDOFF_DOWN_GRACE_MS to come back (handoffTick); one that has been away
@@ -2549,11 +2553,45 @@ export function handoffTick(): void {
 /** the main received a digest taken at `takenAt`: every handoff created up to then is in its hands */
 function handoffsDelivered(takenAt: number): void {
   let changed = false
+  const now: string[] = []
   for (const h of Object.values(S?.handoffs ?? {})) {
-    if (h.state === 'pending' && h.created <= takenAt) { h.state = 'delivered'; h.done = nowIso(); changed = true
-      logos('lane.handoff.delivered', { handoff: h.id, lane: h.lane, thread: h.thread, event: h.event, waited_s: Math.round((Date.now() - h.created) / 1000) }) }
+    if (h.state === 'pending' && h.created <= takenAt) { h.state = 'delivered'; h.done = nowIso(); changed = true; now.push(h.id)
+      logos('lane.handoff.delivered', { handoff: h.id, lane: h.lane, thread: h.thread, event: h.event, class: h.cls ?? null, waited_s: Math.round((Date.now() - h.created) / 1000) }) }
   }
+  if (now.length) handoffWake = { at: Date.now(), ids: now }
   if (changed) saveState()
+}
+// ------------------------------------------------------------------ 002l (D16): the main's report on a hand-over goes out at the event's tier
+// design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」. A lane hands a peer's request (silent tier) to the main; the main's reply
+// tool had no tier, so its report rang (T1-R E9 #1015 [push]; the same in 002h and 002j). The router decides it for the main's reply (server.ts):
+//   - reply with handoff_id = a hand-over's id (〔ho-…〕 leads its line in the digest): the plain tier of that event's class;
+//   - no id: when the main's last wake carried hand-overs only of silent-tier events and no Joey message has reached the main since, the reply that does
+//     not quote a Joey message is part of that report: silent. A Joey message, or a reply to one, is ordinary (push).
+// The notify profile still rules (profile default = everything rings, as before lanes); a hand-over the router made itself (a failed lane) has no class: push.
+let handoffWake: { at: number; ids: string[] } | null = null
+let joeyToMainAt = 0
+const HANDOFF_REPLY_WINDOW_MS = (): number => num('LANES_HANDOFF_REPLY_WINDOW_MIN', 15) * 60_000
+export function handoffReplyTier(a: { handoff_id?: unknown; reply_to?: unknown }): { silent: boolean; rule: string; handoff?: string } | null {
+  if (D?.role !== 'tg' || !S) return null
+  const tierOf = (h: Handoff | undefined) => h?.cls ? tierFor(h.cls, false) : null
+  const id = a.handoff_id != null ? String(a.handoff_id).trim().replace(/^〔|〕$/g, '') : ''
+  if (id) {
+    const t = tierOf(S.handoffs[id])
+    return t ? { silent: t.tier !== 'push', rule: `handoff ${id}: ${t.rule}`, handoff: id } : null
+  }
+  if (a.reply_to != null && String(a.reply_to) !== '') return null                  // quoting a message: an answer to Joey, ordinary
+  const w = handoffWake
+  if (!w || Date.now() - w.at > HANDOFF_REPLY_WINDOW_MS() || joeyToMainAt > w.at) return null
+  const tiers = w.ids.map(i => tierOf(S.handoffs[i]))
+  if (!tiers.length || tiers.some(t => !t || t.tier === 'push')) return null
+  return { silent: true, rule: `handoff-wake ${w.ids.join(',')}: ${tiers[0]!.rule}`, handoff: w.ids.join(',') }
+}
+/** server.ts: the main's reply went out with this tier (for the record) */
+export function noteMainReplyTier(t: { silent: boolean; rule: string; handoff?: string }, messageId: number | null): void {
+  if (D?.role !== 'tg' || !S) return
+  ledger({ lane: 'main', kind: 'notify', notify_main: false, text: `[${t.silent ? 'silent' : 'push'}] 主線回報交接的事（${t.handoff ?? '-'}）：分流器依那件事的類別${t.silent ? '靜音送出' : '照常推播'}`,
+    refs: { tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId } })
+  logos('lane.notify', { lane: 'main', tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId })
 }
 const digestTakenAt = new Map<string, number>()
 
@@ -2916,7 +2954,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!text) throw new Error('empty text')
       if (tok.asked) return 'refused: you already asked Joey about this event (ask_joey). One owner per event; do not also hand it to the main.'
       if (tok.handed) return 'refused: this event is already handed to the main.'
-      const h = handoff(lane, tok.evId, text)
+      const h = handoff(lane, tok.evId, text, undefined, tok.cls)        // 002l (D16): the event's class rides with the hand-over
       tok.handed = true; tok.escalated = true
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: h.id, main_connected: mainConnected() })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words)

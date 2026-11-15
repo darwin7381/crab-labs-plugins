@@ -1478,6 +1478,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
           },
           format: formatSchema,
+          ...(Lanes.LANES_ON ? { handoff_id: { type: 'string', description: 'lanes: when this reply reports on work a lane handed to you (the 〔ho-…〕 id in the digest), pass that id. The router then decides whether it rings, by the kind of that event.' } } : {}),
         },
         required: ['chat_id', 'text'],
       },
@@ -1569,6 +1570,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const useRich = format === 'rich' && isRichEnabled()
 
         assertAllowedChat(chat_id)
+        // 002l (D16): the report on a hand-over goes out at the tier the router gives that event (design/notify 「分級由分流器…決定」); otherwise as before
+        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.handoffReplyTier({ handoff_id: args.handoff_id, reply_to }) : null
+        const quiet = handoffTier?.silent ? { disable_notification: true } : {}
 
         for (const f of files) {
           assertSendable(f)
@@ -1599,6 +1603,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   chat_id,
                   rich_message: { markdown: chunks[i] },
                   ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                  ...quiet,
                 })
                 sentIds.push(r.message_id)
                 continue
@@ -1609,6 +1614,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...quiet,
             })
             sentIds.push(sent.message_id)
           }
@@ -1625,8 +1631,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
           const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+            ? { reply_parameters: { message_id: reply_to }, ...quiet }
+            : (handoffTier?.silent ? quiet : undefined)
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -1636,10 +1642,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        if (handoffTier) Lanes.noteMainReplyTier(handoffTier, sentIds[0] ?? null)
         const result =
-          sentIds.length === 1
+          (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (handoffTier ? ` (${handoffTier.silent ? 'silent' : 'push'}: the router's tier for the hand-over ${handoffTier.handoff})` : '')
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {

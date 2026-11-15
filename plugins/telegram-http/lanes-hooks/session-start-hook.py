@@ -55,6 +55,8 @@ def main_context(agent, session_id):
         '你讀的是一份綜合，不是 N 份全文。不要自己一塊一塊查。',
         '- 你答應了別人什麼（給 Joey 或別的 agent「我會…」「…前給你」）：用 commitment(who, what, by, due) 記下；有時限就填 due，到時沒標完成會提醒 Joey。做完用 commitment_done。',
         '- 帳本裡累積了好幾筆記憶提案、你又閒著：用 curate_memory 把寫入權交給一條整理線去整理，做完它自己交還（curate_stop 隨時收回）；單筆提案用 memory_decide 決定。',
+        # 002l (D16): design/notify 「分級由分流器依訊息類型決定」: the router gives the report on a hand-over the tier of the event that was handed over
+        '- 回報車道交給你的事（摘要裡以〔ho-…〕開頭的那一行）時，reply 帶 handoff_id=那個編號；響不響由分流器依那件事的類別決定（同事的事通常靜音），你不用自己判斷。',
         '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、open_worker、fork、peer_hold）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
         '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。',
     ])
