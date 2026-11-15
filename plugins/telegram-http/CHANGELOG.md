@@ -1,3 +1,7 @@
+## 1.29.3 — 2026-11-16
+
+- Duty officer: config key `claude_cmds`, extra foreground commands that count as Claude Code. `fake_dialog.py` runs as python, so after a press its fake idle footer was read as a follow-up dialog and cost one more model call. The model answered `none`, correctly.
+
 ## 1.29.2 — 2026-11-16
 
 - **Duty officer: every tmux call runs with `-u`. This is the real cause of the blind first canary; 1.29.1 named the wrong one.**

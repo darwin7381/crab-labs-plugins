@@ -674,8 +674,10 @@ interface Config {
   // acceptance tests: a scratch pane watched by the daemon that owns it; its questions go to test_recipients
   // (not Joey) and its rulings to test_rulings_to
   test_targets: Record<string, string>; test_recipients: string[]; test_rulings_to: string | null
+  // extra foreground commands that count as Claude Code (fake_dialog.py runs as python: its idle footer is idle)
+  claude_cmds: string[]
 }
-const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null }
+const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null, claude_cmds: [] }
 interface Rec { action: string; t: number; askId?: string; resolved?: boolean | null }
 interface PaneState { hash: string; state: State; since: number; rec: Rec | null }
 interface Ask {
@@ -735,6 +737,7 @@ export class DutyOfficer {
             test_targets: j.test_targets && typeof j.test_targets === 'object' ? j.test_targets : {},
             test_recipients: Array.isArray(j.test_recipients) ? j.test_recipients.map(String) : [],
             test_rulings_to: typeof j.test_rulings_to === 'string' && j.test_rulings_to.trim() ? j.test_rulings_to.trim() : null,
+            claude_cmds: Array.isArray(j.claude_cmds) ? j.claude_cmds.map(String) : [],
           }
         } catch (e) { this.d.log('warn', `duty-officer: config.json unreadable (${String(e).slice(0, 80)}) — off`) }
       }
@@ -807,7 +810,8 @@ export class DutyOfficer {
     const [info, pane] = await Promise.all([this.d.tmux.info(tmux), this.d.tmux.capture(tmux)])
     if (!info || pane == null) return null
     const lines = tailLines(pane)
-    return { state: classify(lines, info.cmd, this.extra), hash: thash(lines), lines, info, pane }
+    const extra = new Set([...this.extra, ...this.config().claude_cmds])
+    return { state: classify(lines, info.cmd, extra), hash: thash(lines), lines, info, pane }
   }
 
   private async targets(cfg: Config): Promise<Target[]> {
