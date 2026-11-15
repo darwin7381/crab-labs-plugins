@@ -482,3 +482,13 @@ test('main-only rule: absent from a lane\'s identity card and from the "you are 
   expect(j.hookSpecificOutput.additionalContext).toContain('你不是')
   expect(j.hookSpecificOutput.additionalContext).not.toContain('ledger_query')
 })
+
+test('002l D9: the main\'s SessionStart context names fan_out (with when to use it), commitment and curate_memory, and how to load a deferred lane tool', () => {
+  const ctx = hookCtx('main_context', `'adam', 'a20fb7c0-f35a-4365-9a21-9e16e9f78fed'`)
+  expect(ctx).toContain('fan_out(tasks, conclusion)'); expect(ctx).toContain('綜合線'); expect(ctx).toContain('不要自己一塊一塊查')
+  expect(ctx).toContain('commitment(who, what, by, due)'); expect(ctx).toContain('curate_memory'); expect(ctx).toContain('memory_decide')
+  expect(ctx).toContain('ToolSearch')
+  expect(ctx.split('\n').filter(l => l.includes('ledger_query')).length).toBe(1)    // still exactly one ledger_query rule line
+  const names = mainToolDefs().map((t: any) => t.name)
+  for (const n of ['fan_out', 'commitment', 'commitment_done', 'curate_memory', 'curate_stop', 'memory_decide', 'open_worker', 'fork', 'peer_hold']) expect(names).toContain(n)   // every tool it names exists
+})

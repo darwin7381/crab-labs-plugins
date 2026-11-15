@@ -49,6 +49,13 @@ def main_context(agent, session_id):
         '某一件的原文用 ledger_query(text=關鍵字)；答應過什麼也可以查 kind=commitment。',
         '- 維護焦點卡 .lanes/focus.md：任務改變時更新，3 到 6 行，寫「目前在做什麼、關鍵限制、別碰什麼」。車道開機時會讀它。',
         '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Telegram 話題的工作線；fork(task) 開一條帶著你目前脈絡的分身線。',
+        # 002l (D9): design/merge 「扇出再收攏：主線一次開出多條線各查一塊，指定一條綜合線讀完所有結果、交回一份結論」. 002k named only open_worker and fork here; fan_out was a
+        # deferred tool name the main never found (0 calls in every 002k run; F05 did three checks itself). The tools and when to use each:
+        '- 一件事可以拆成幾塊各自去查（例如三個服務各查一次、幾份紀錄各讀一份）：用 fan_out(tasks, conclusion)，每塊開一條查詢線，最後一條綜合線讀完全部、交回你一份結論；'
+        '你讀的是一份綜合，不是 N 份全文。不要自己一塊一塊查。',
+        '- 你答應了別人什麼（給 Joey 或別的 agent「我會…」「…前給你」）：用 commitment(who, what, by, due) 記下；有時限就填 due，到時沒標完成會提醒 Joey。做完用 commitment_done。',
+        '- 帳本裡累積了好幾筆記憶提案、你又閒著：用 curate_memory 把寫入權交給一條整理線去整理，做完它自己交還（curate_stop 隨時收回）；單筆提案用 memory_decide 決定。',
+        '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、open_worker、fork、peer_hold）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
         '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。',
     ])
 
