@@ -56,11 +56,11 @@ test('B19: the started processes get the same --append-system-prompt; the lane d
   expect(await until(() => argvs().length >= 2)).toBe(true)
   const all = argvs()                                                              // the two processes start together: find each by its lane
   const x = all.find(a => after(a, '-p').includes(d1.lane!))!, y = all.find(a => after(a, '-p').includes(d2.lane!))!
-  expect(after(x, '--append-system-prompt')).toBe(after(y, '--append-system-prompt'))
+  expect(after(x, '--append-system-prompt-file')).toBe(after(y, '--append-system-prompt-file'))   // 002l (D15): one file per kind
   const px = after(x, '-p'), py = after(y, '-p')
   expect(px).toContain(d1.lane!); expect(px).toContain('QQ-1'); expect(px).not.toContain('分流器標記：嚴重警報')
   expect(py).toContain(d2.lane!); expect(py).toContain('QQ-2'); expect(py).toContain('分流器標記：嚴重警報')
   expect(px.indexOf('QQ-1')).toBeLessThan(px.indexOf('/v2/orders'))                 // the lane data comes first, then the event
   expect(py.indexOf('分流器標記')).toBeLessThan(py.indexOf('全部回 5xx'))
-  for (const a of [x, y]) { expect(after(a, '--append-system-prompt')).not.toContain(d1.lane!); expect(after(a, '--append-system-prompt')).not.toContain(d2.lane!) }
+  for (const a of [x, y]) { const sp = readFileSync(after(a, '--append-system-prompt-file'), 'utf8'); expect(sp).not.toContain(d1.lane!); expect(sp).not.toContain(d2.lane!); expect(sp).toContain('你的身分') }
 })

@@ -2112,7 +2112,7 @@ export function laneMaxUsd(kind: LaneKind): number {
 }
 function laneEnv(lane: Lane): Record<string, string> {
   const keep = ['PATH', 'LANG', 'LC_ALL', 'TERM', 'XDG_RUNTIME_DIR', 'USER', 'LOGNAME', 'SHELL']
-  const env: Record<string, string> = { HOME: homedir() }
+  const env: Record<string, string> = { HOME: process.env.HOME || homedir() }
   for (const k of keep) if (process.env[k]) env[k] = process.env[k]!
   if (process.env.LANES_TOOL_SEARCH !== '1') env.ENABLE_TOOL_SEARCH = 'false'   // 002k (B1): lane tools are loaded at once (see above)
   env.GENESIS_ACTOR = lane.id
@@ -2123,10 +2123,65 @@ function laneEnv(lane: Lane): Record<string, string> {
   env.LANES_MEMORY_DIR = memoryDir()
   env.LANES_WORKSPACE = D.workspaceDir               // 002k (H6): the guard hook's workspace is the lane's start directory, not wherever its shell has wandered
   if (process.env.LANES_SVC_ALLOW) env.LANES_SVC_ALLOW = process.env.LANES_SVC_ALLOW   // 002k (H6): the guard's documented svc allowlist override reaches the hook (laneEnv drops the rest of the daemon's env)
+  // 002l (S0 item 1): a lane never writes auto-memory (design/memory 「其他線…不碰記憶檔」; S0: 3 sessions creating MEMORY.md at once lost 7 of 12 index lines).
+  // CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 (claude 2.1.322, the env behind the autoMemoryEnabled setting) takes the auto-memory section and the memory tools' path out
+  // of the lane's prompt; the lane reads the memory index in its stable system prompt instead (laneSystemPrompt) and still proposes through the ledger. Not
+  // --bare: it does not read the subscription login. The guard hook still refuses any write under the memory directory. LANES_LANE_AUTO_MEMORY=1 leaves it on.
+  if (laneAutoMemoryOff()) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+  // 002l (D15): the CLI's own CLAUDE.md discovery is off for a lane: those files are in the lane's stable system prompt (laneSystemPrompt), where the cache
+  // breakpoint after the system prompt covers them, instead of in the first user message before the per-run text. LANES_STABLE_PREFIX=0: as in 002k.
+  if (stablePrefixOn()) env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = '1'
   // 002k (K1): the lanes are not handed the service address: they have no reason to reach for curl. ./bin/svc has its address inside the wrapper.
   return env
 }
 export function memoryDir(): string { return join(D.transcriptDir, 'memory') }
+export const stablePrefixOn = (): boolean => process.env.LANES_STABLE_PREFIX !== '0'
+export const laneAutoMemoryOff = (): boolean => process.env.LANES_LANE_AUTO_MEMORY !== '1'
+// ------------------------------------------------------------------ 002l (D15): lanes of one kind share the cached prefix, CLAUDE.md context included
+// design/overview 「同資料夾的平行 session 還會共用前段的快取，所以人格與記憶那一段大多是打折價」. RV4 read the request shape of every 002k lane: claude puts the
+// CLAUDE.md files (and MEMORY.md) in the FIRST USER MESSAGE, in front of the run prompt, and its cache breakpoints sit at the end of the system prompt and
+// at the end of that message. So the identical ~21.6k of CLAUDE.md context sat after the last breakpoint the lanes shared (system + tools, ~9.9k), behind
+// per-run text, and every new lane wrote it to the cache again. Now the stable part is the system prompt: the instruction files the CLI would have loaded
+// (user, then project from the root down to the workspace, then the memory index), then the lane card of the kind, in one file per kind passed with
+// --append-system-prompt-file. claude's CLAUDE.md discovery is off for lanes (laneEnv), so nothing per run comes before the breakpoint at the end of the
+// system prompt; the run prompt (〔車道資訊〕 and the event) is after it. The file changes only when those files change.
+const INSTR_HEAD = 'Codebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.'
+function readText(p: string): string | null { try { const t = readFileSync(p, 'utf8'); return t.trim() ? t.replace(/\s+$/, '') : null } catch { return null } }
+/** the instruction files claude would load for a session in the workspace, in its order and with its labels (claude 2.1.322: user, project, auto-memory) */
+export function laneInstructionFiles(): Array<{ path: string; label: string; text: string }> {
+  const out: Array<{ path: string; label: string; text: string }> = []
+  const add = (path: string, label: string) => { const t = readText(path); if (t != null && !out.some(o => o.path === path)) out.push({ path, label, text: t }) }
+  if (stablePrefixOn()) {
+    add(join(process.env.HOME || homedir(), '.claude', 'CLAUDE.md'), "user's private global instructions for all projects")   // the HOME a lane runs with (laneEnv)
+    const dirs: string[] = []
+    for (let d = resolvePath(D.workspaceDir); ; d = dirname(d)) { dirs.unshift(d); if (dirname(d) === d) break }
+    for (const d of dirs) {
+      add(join(d, 'CLAUDE.md'), 'project instructions, checked into the codebase')
+      add(join(d, '.claude', 'CLAUDE.md'), 'project instructions, checked into the codebase')
+      add(join(d, 'CLAUDE.local.md'), "user's private project instructions, not checked in")
+    }
+  }
+  if (laneAutoMemoryOff() || stablePrefixOn()) add(join(memoryDir(), 'MEMORY.md'), "user's auto-memory, persists across conversations")
+  return out
+}
+/** 002l (D15): the whole stable system prompt of a lane of this kind: the instruction files, then the card. Byte-identical for every lane of the kind. */
+export function laneSystemPrompt(kind: LaneKind): string {
+  const files = laneInstructionFiles()
+  const instr = files.length ? [INSTR_HEAD, ...files.map(f => `Contents of ${f.path} (${f.label}):\n\n${f.text}`)].join('\n\n') : ''
+  return [instr, identityCard({ kind })].filter(Boolean).join('\n\n')
+}
+/** the per-kind file passed with --append-system-prompt-file (rewritten only when its text changed) */
+export function laneSystemPromptFile(kind: LaneKind): string {
+  const p = join(LANES_DIR, 'run', `system-${kind}.md`)
+  const text = laneSystemPrompt(kind)
+  if (readText(p) !== text.replace(/\s+$/, '')) { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(p, text) }
+  return p
+}
+/** 002l (S0 item 1): 「第一條車道開之前先建好索引」: with no MEMORY.md, sessions creating it at once overwrite each other's index lines. An empty index is
+ *  created (never overwritten) before a lane starts; the main stays its only writer. */
+export function ensureMemoryIndex(): void {
+  try { mkdirSync(memoryDir(), { recursive: true }); writeFileSync(join(memoryDir(), 'MEMORY.md'), '', { flag: 'wx' }) } catch {}
+}
 
 /** 002k (B19): the system prompt appended to a lane run. It depends on the lane KIND only: byte-identical for every lane of a kind, so
  *  the lanes of a kind share one cached prefix (it used to carry the lane id, thread, focus card and critical flag: no two lanes shared
@@ -2211,6 +2266,7 @@ function renderEvent(ev: InEvent): string {
 function writeLaneSettings(): void {
   const py = process.env.LANES_PYTHON ?? '/usr/bin/python3'
   const settings = {
+    ...(laneAutoMemoryOff() ? { autoMemoryEnabled: false } : {}),         // 002l (S0 item 1): with the env, the setting too
     hooks: {
       Stop: [{ matcher: '', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-stop-hook.py')}`, timeout: 20 }] }],
       PreToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|Bash', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-guard-hook.py')}`, timeout: 10 }] },
@@ -2293,10 +2349,11 @@ function startRun(it: QItem): void {
   runTokens.set(token, tok)
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
+  ensureMemoryIndex()                                                    // 002l (S0 item 1): the index exists before any lane starts
   const { resume, args: sess } = sessionArgs(lane)
   const args = ['-p', runPrompt(it, lane), '--model', MODEL, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
-    '--append-system-prompt', identityCard(lane),
+    '--append-system-prompt-file', laneSystemPromptFile(lane.kind),        // 002l (D15): card + CLAUDE.md context + memory index, one file per kind
     '--settings', join(LANES_DIR, 'lane-settings.json'),
     '--output-format', 'stream-json', '--verbose',
     '--dangerously-skip-permissions',

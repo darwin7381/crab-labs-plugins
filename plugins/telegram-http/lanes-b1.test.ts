@@ -33,7 +33,7 @@ test('B1: a lane process starts without skills, with only the built-in tools lan
   expect(tool_search).toBe('false')
   // what the lane needs is still there: the lane tools, the lane hooks, the card, the old denials
   expect(argv).toContain('--strict-mcp-config'); expect(argv).toContain('--mcp-config')
-  expect(argv).toContain('--settings'); expect(argv).toContain('--append-system-prompt')
+  expect(argv).toContain('--settings'); expect(argv).toContain('--append-system-prompt-file')
   expect(argv.slice(argv.indexOf('--disallowedTools'))).toEqual(['--disallowedTools', 'AskUserQuestion', 'ExitPlanMode'])   // last: it takes a list
 })
 
