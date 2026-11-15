@@ -1,0 +1,103 @@
+import { describe, expect, test } from 'bun:test'
+import { FLEET_INSTRUCTIONS, FLEET_TOOLS, handleFleetRpc, type FleetDeps } from './fleet-mail.ts'
+import { FLEET_TEXT } from './fleet-text.ts'
+
+function deps(over: Partial<FleetDeps> = {}) {
+  const calls: any[] = []
+  const btccCalls: any[] = []
+  const d: FleetDeps = {
+    call: async (to, text, replyTo, noReply, op) => { calls.push({ to, text, replyTo, noReply, op }); return `delivered to ${to}'s inbox` },
+    btcc: async (method, path, body) => { btccCalls.push({ method, path, body }); return { status: 200, json: {} } },
+    ...over,
+  }
+  return { d, calls, btccCalls }
+}
+const rpc = (method: string, params: any = {}, id: any = 1) => ({ jsonrpc: '2.0', id, method, params })
+const tool = (name: string, args: any = {}) => rpc('tools/call', { name, arguments: args })
+const out = (r: any) => r.result.content[0].text as string
+
+describe('fleet MCP server', () => {
+  test('instructions are the main text, verbatim, and fit the 2048-char budget', async () => {
+    const r = await handleFleetRpc(rpc('initialize', { protocolVersion: '2025-06-18' }), deps().d)
+    expect(r.result.instructions).toBe(FLEET_TEXT)
+    expect(FLEET_INSTRUCTIONS.length).toBeLessThan(2000)
+    expect(FLEET_TEXT.startsWith('艦隊怎麼傳遞事情')).toBe(true)
+    expect(r.result.protocolVersion).toBe('2025-06-18')
+    expect(r.result.capabilities.tools).toBeDefined()
+    expect(r.result.capabilities.experimental).toBeUndefined()   // never a channel
+  })
+  test('notifications get no response; unknown methods an error', async () => {
+    expect(await handleFleetRpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, deps().d)).toBeNull()
+    const r = await handleFleetRpc(rpc('server/discover'), deps().d)
+    expect(r.error.code).toBe(-32601)
+  })
+  test('tools/list', async () => {
+    const r = await handleFleetRpc(rpc('tools/list'), deps().d)
+    expect(r.result.tools.map((t: any) => t.name)).toEqual(
+      ['call', 'send_mail', 'mailbox_list', 'mailbox_open', 'mailbox_done', 'mailbox_defer', 'mail_sent'])
+    expect(FLEET_TOOLS.length).toBe(7)
+  })
+  test('call pushes; a reply to a call is no_reply automatically', async () => {
+    const { d, calls } = deps()
+    expect(out(await handleFleetRpc(tool('call', { to: 'pheme', text: '官網掛了' }), d))).toContain('delivered')
+    expect(calls[0]).toEqual({ to: 'pheme', text: '官網掛了', replyTo: undefined, noReply: false, op: undefined })
+    await handleFleetRpc(tool('call', { to: 'pheme', text: '已修', reply_to: '9123' }), d)
+    expect(calls[1].replyTo).toBe(9123)
+    expect(calls[1].noReply).toBe(true)
+  })
+  test('send_mail: title over 40 never leaves the daemon', async () => {
+    const { d, btccCalls } = deps()
+    const r = await handleFleetRpc(tool('send_mail', { to: 'chiron', title: '一'.repeat(41), body: 'b' }), d)
+    expect(r.result.isError).toBe(true)
+    expect(btccCalls.length).toBe(0)
+  })
+  test('send_mail: stored vs pushed vs refused', async () => {
+    let reply: any = { status: 200, json: { id: 7, stored: true } }
+    const { d, btccCalls } = deps({ btcc: async (m, p, b) => { btccCalls.push({ m, p, b }); return reply } })
+    expect(out(await handleFleetRpc(tool('send_mail', { to: 'chiron', title: 'Pheme：OG 圖換不換', body: 'b', deadline: '6', no_reply: true }), d)))
+      .toContain('已放進 chiron 的信箱（#7）')
+    expect(btccCalls[0].p).toBe('/api/mesh/mail/send')
+    expect(btccCalls[0].b).toEqual({ to: 'chiron', title: 'Pheme：OG 圖換不換', body: 'b', deadline: 6, no_reply: true, reply_to_id: null })
+    reply = { status: 200, json: { id: 8, stored: false, delivered: true } }
+    expect(out(await handleFleetRpc(tool('send_mail', { to: 'pheme', title: 't', body: 'b' }), d))).toContain('信箱還沒開')
+    reply = { status: 409, json: { detail: '沒送出：一件事一個 owner' } }
+    const r = await handleFleetRpc(tool('send_mail', { to: 'pheme', title: 't', body: 'b' }), d)
+    expect(r.result.isError).toBe(true)
+    expect(out(r)).toContain('一件事一個 owner')
+  })
+  test('mailbox_list: one line per mail, no body', async () => {
+    const { d } = deps({ btcc: async () => ({ status: 200, json: { open: [
+      { id: 11, from: 'pheme', title: 'Pheme：OG 圖換不換', deadline: '2026-11-16T04:00:00+00:00', waited: '40 分鐘', no_reply: false },
+      { id: 12, from: 'atlas', title: 'Atlas：BVI 已付', deadline: null, waited: '5 分鐘', no_reply: true }], deferred_later: 2 } }) })
+    const t = out(await handleFleetRpc(tool('mailbox_list'), d))
+    expect(t.split('\n')[0]).toBe('2 封待處理（另有 2 封延後中）：')
+    expect(t).toContain('#11｜pheme｜Pheme：OG 圖換不換｜期限 11-16 04:00Z｜等了 40 分鐘')
+    expect(t).toContain('#12｜atlas｜Atlas：BVI 已付｜期限 —｜等了 5 分鐘｜不用回')
+  })
+  test('mailbox_list empty', async () => {
+    const { d } = deps({ btcc: async () => ({ status: 200, json: { open: [], deferred_later: 0 } }) })
+    expect(out(await handleFleetRpc(tool('mailbox_list'), d))).toBe('信箱沒有待處理的信。')
+  })
+  test('done / defer / open route to BTCC and report back', async () => {
+    const seen: any[] = []
+    const { d } = deps({ btcc: async (m, p, b) => {
+      seen.push([m, p, b])
+      if (p.endsWith('/done')) return { status: 200, json: { id: 11, status: 'done', result_to_sender: { stored: true } } }
+      if (p.endsWith('/defer')) return { status: 200, json: { id: 11, status: 'deferred', until: '2026-11-15T09:00:00+00:00' } }
+      return { status: 200, json: { id: 11, from: 'pheme', title: 'T', body: '全文', deadline: null, waited: '1 分鐘', no_reply: false, status: 'pending' } }
+    } })
+    expect(out(await handleFleetRpc(tool('mailbox_open', { id: 11 }), d))).toContain('全文')
+    expect(out(await handleFleetRpc(tool('mailbox_done', { id: 11, result: '換了' }), d))).toContain('結果已寄回寄件者')
+    expect(out(await handleFleetRpc(tool('mailbox_defer', { id: '11', until: '3' }), d))).toContain('延後到 11-15 09:00Z')
+    expect(seen.map(x => x[1])).toEqual(['/api/mesh/mail/11', '/api/mesh/mail/11/done', '/api/mesh/mail/11/defer'])
+    expect(seen[2][2]).toEqual({ until: 3 })
+    const bad = await handleFleetRpc(tool('mailbox_done', { id: 11 }), d)
+    expect(bad.result.isError).toBe(true)
+  })
+  test('a BTCC error surfaces its detail', async () => {
+    const { d } = deps({ btcc: async () => ({ status: 409, json: { detail: 'mail #11 is not open (status done)' } }) })
+    const r = await handleFleetRpc(tool('mailbox_done', { id: 11, result: 'x' }), d)
+    expect(r.result.isError).toBe(true)
+    expect(out(r)).toContain('not open')
+  })
+})

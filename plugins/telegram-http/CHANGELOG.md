@@ -1,3 +1,14 @@
+## 1.28.0 / agent-inbox 1.2.0 — 2026-11-15
+
+- **Fleet mail, stage 1 of the inbox tiers (WO-91, Chiron's spec rescue-site inbox-tiers.html v20; Joey TG chiron:1310/1316).** The agent-inbox plugin gains a second MCP server, `fleet`, served by the same daemon at `POST /fleet`.
+  - **Why a second server:** Claude Code truncates each server's instructions at 2048 chars. agent-inbox's own text is ~1.9k; the fleet's main text (Chiron's words, verbatim) is 1,315. `fleet` carries the main text as its instructions, generated from the spec card by `tools/gen-fleet-text.py` into `fleet-text.ts`. Lab: a `claude -p` session quoted the first and last characters of a stateless server's 1.3k instructions intact.
+  - **Stateless JSON-RPC, never a channel:** no session, no SSE, no `claude/channel` capability, so inbound delivery stays on `/mcp` and nothing is dispatched twice. It uses the same loopback token as `/mcp`.
+  - **Tools:** `call` (呼叫, the push path: today's send_to_agent, logged with tier=call; a reply with reply_to is no_reply automatically), `send_mail`, `mailbox_list`, `mailbox_open`, `mailbox_done`, `mailbox_defer`, `mail_sent`. Mail goes to BTCC `/api/mesh/mail/*` (6f92156), signed with this agent's own mesh credential. Mail to an agent whose mailbox is off is pushed as before, so senders never need to know who has switched.
+  - **`GET /mailcount`** (local) returns this agent's open-mail count for the wake-line hook. It is cached for 30 s and never blocks.
+  - **agent-inbox instructions:** sending now points at fleet's call/send_mail. The closing paragraph follows Joey 1316: a 讀信箱 turn is reported to Joey only if mail was handled. Replies to a call and mail results are no_reply automatically. The text is now 1,987 chars (it was 1,966).
+  - **`send_to_agent` stays as "call's old name"** while personas, docs and hooks still name it.
+  - Tests: `fleet-mail.test.ts` (10) → 91/91. Lab daemon from the clone (port 17993, epeius credential, epeius's mailbox switched on for the test and off after): initialize, tools/list, send_mail to self (stored, not pushed), list, open, defer past the deadline (refused), defer, sent, done, mailcount. All against live BTCC.
+
 ## 1.27.8 — 2026-11-13
 
 - **`/effort` no longer changes the effort of every other agent on the machine.** In the 1.27.7 lab test, a Telegram `/effort high` aimed at one agent made the claude TUI save the level in the global `~/.claude/settings.json`. Every other TUI on that machine running the same model, without an `/effort` of its own, then inherited it. `/model` has been session-scoped since 1.12.x; `/effort` had no equivalent.

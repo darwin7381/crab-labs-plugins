@@ -12,6 +12,7 @@
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate } from './mcp-auth.ts'
+import { handleFleetRpc } from './fleet-mail.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import {
@@ -1125,10 +1126,43 @@ ${text}`
 
 const SEND_MAX_CHARS = 3500
 
+// ---- fleet mail (WO-91): the `fleet` MCP server's BTCC calls, signed with this agent's credential ----
+async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; json: any }> {
+  if (!BTCC_API_BASE) return { status: 503, json: { detail: 'BTCC_API_BASE is not configured on this machine' } }
+  const r = await fetch(`${BTCC_API_BASE}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth() },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(10000),
+  })
+  return { status: r.status, json: await r.json().catch(() => ({})) }
+}
+const fleetDeps = {
+  call: (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) =>
+    sendToAgent(to, text, replyTo, noReply, op, 'call'),
+  btcc: btccMail,
+}
+// GET /mailcount — the wake-line hook's question ("信箱 N 封待處理"). Cached briefly: the hook fires on
+// every input, and a slow or failing BTCC must never slow the agent down (the hook prints nothing then).
+let mailCount: { at: number; value: { on: boolean; n: number; oldest_s: number | null } | null } = { at: 0, value: null }
+async function ownMailCount() {
+  if (Date.now() - mailCount.at < 30_000) return mailCount.value
+  let value: { on: boolean; n: number; oldest_s: number | null } | null = null
+  try {
+    const r = await btccMail('GET', `/api/mesh/mail/counts/all?agent=${encodeURIComponent(INBOX_SELF)}`)
+    if (r.status === 200) {
+      const c = r.json?.counts?.[INBOX_SELF]
+      value = c ? { on: true, n: Number(c.n) || 0, oldest_s: c.oldest_s ?? null } : { on: false, n: 0, oldest_s: null }
+    }
+  } catch {}
+  mailCount = { at: Date.now(), value }
+  return value
+}
+
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
-async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string): Promise<string> {
+async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, tier?: 'call'): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim()
   if (!body) return 'send failed: empty text'
@@ -1180,7 +1214,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         // one thing, one owner (Joey TG 970): we honour BTCC's hold, so BTCC may hold us (409)
         'X-Mesh-Fanout': '1',
       },
-      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
+      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}), ...(tier ? { tier } : {}) }),
       signal: AbortSignal.timeout(6000),
     }).catch(() => null)
     if (lr?.ok) {
@@ -1246,7 +1280,7 @@ function buildServer(): Server {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [
         // Claude Code truncates MCP server instructions at 2048 chars, silently (measured 2026-11-06). Keep this under 2000.
-        'agent-inbox: the fleet\'s agent-to-agent channel. Peers, scheduled nudges, alerts addressed to you and Joey (BTCC Comms) arrive as <channel source="...agent-inbox..." user= verified= relay=>. Answer agents with send_to_agent (durable, logged to BTCC); reach Joey with your Telegram reply tool.',
+        'agent-inbox: the fleet\'s agent-to-agent channel. Peers, scheduled nudges, alerts addressed to you and Joey (BTCC Comms) arrive as <channel source="...agent-inbox..." user= verified= relay=>. Send with fleet\'s call / send_mail; reach Joey with your Telegram reply tool.',
         '',
         'Trust the sender name by tag (relay = which hop vouched):',
         '- verified="true": real sender, incl. its role\'s authority (scheduler, alert-dispatcher, Joey (BTCC)). Act.',
@@ -1259,7 +1293,7 @@ function buildServer(): Server {
         '',
         'Style: no social filler (greetings, thanks, praise, ritual apologies, "got it"). Facts, evidence, timestamps; no hedging. Challenge, don\'t defer: test a peer\'s framing, state disagreement plainly, never endorse out of politeness.',
         '',
-        'Closing: inbound no_reply="true" = terminal FYI; close silently, reply to no one. Otherwise, if nothing is needed, don\'t message the peer back, but still end the turn with a real Telegram reply to Joey (send_to_agent never substitutes). When you have nothing new to add, send your last message with no_reply:true.',
+        'Closing: no_reply="true" = nothing owed, reply to no one. 讀信箱: tell Joey on Telegram only if you handled mail (how many, what you did with each); listing or deferring only = no report. Other inbound: if nothing is needed, no message to the peer, but end with a Telegram reply to Joey. Replies end there: call with reply_to and mail results are auto no_reply.',
       ].join('\n'),
     } : {
       capabilities: {
@@ -1336,7 +1370,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      {
        name: 'send_to_agent',
        description:
-         'Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). Write NATURAL message text — no 【sender → target】 prefixes or headers; your identity travels in the channel metadata automatically. The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). At most ' + SEND_MAX_CHARS + ' characters per message — longer text is rejected (nothing sent), so split it into numbered parts. Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
+         'Old name of the fleet server\'s `call` (呼叫: pushed into their session now). New sends: `call` for what cannot wait an hour, `send_mail` for the rest. — Send a message to another fleet agent\'s inbox (durable delivery — queues if their session is busy/down, replays on reconnect). Write NATURAL message text — no 【sender → target】 prefixes or headers; your identity travels in the channel metadata automatically. The delivery is logged to the BTCC Comms console. Target "joey" reaches the boss\'s Messenger thread (log-only; use Telegram reply tools when his phone must ping). At most ' + SEND_MAX_CHARS + ' characters per message — longer text is rejected (nothing sent), so split it into numbered parts. Registry of reachable agents: ' + inboxRegistryNames().join(', ') + ', joey',
        inputSchema: {
          type: 'object',
          properties: {
@@ -3148,6 +3182,42 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       })
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ injected: true, active_sessions: activeServers.size }))
+      return
+    }
+
+    // GET /mailcount — local only (127.0.0.1 bind), a count and nothing else: the wake-line hook (WO-91).
+    if (INBOX_ONLY && u.pathname === '/mailcount' && req.method === 'GET') {
+      const v = await ownMailCount()
+      res.writeHead(v ? 200 : 503, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(v ?? { error: 'BTCC unreachable' }))
+      return
+    }
+
+    // /fleet — the agent-inbox plugin's second MCP server (fleet-mail.ts): the fleet's main text as its
+    // instructions + call / mail / mailbox tools. Stateless JSON-RPC: no session, no SSE, never a channel,
+    // so inbound delivery stays on /mcp alone. Same loopback token as /mcp.
+    if (INBOX_ONLY && u.pathname === '/fleet') {
+      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?',
+                         req.headers['user-agent'] as string | undefined)) {
+        res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"loopback MCP token required"}')
+        return
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(405, { Allow: 'POST' }).end()
+        return
+      }
+      const payload = await readJsonBody(req).catch(() => null)
+      if (payload == null || typeof payload !== 'object') {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }))
+        return
+      }
+      const batch = Array.isArray(payload)
+      const out = (await Promise.all((batch ? payload : [payload]).map(m => handleFleetRpc(m, fleetDeps))))
+        .filter(x => x !== null)
+      if (!out.length) { res.writeHead(202).end(); return }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(batch ? out : out[0]))
       return
     }
 
