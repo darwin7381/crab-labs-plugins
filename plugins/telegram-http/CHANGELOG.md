@@ -14,7 +14,13 @@
   - **Where mail goes:** BTCC `/api/mesh/mail/*` (8761526), signed with this agent's own mesh credential. Mail to an agent whose mailbox is off is pushed as before, so senders never need to know who has switched. Nothing is shown when an agent wakes: only the watchdog says there is mail (Joey 1327).
   - **agent-inbox instructions:** sending now points at fleet's call and send_mail. The closing paragraph follows Joey 1316: a 讀信箱 turn is reported to Joey only if mail was read and handled. Replies to calls and mail are no_reply automatically. The text is now 1,983 chars (it was 1,966).
   - **`send_to_agent` stays, as call's old name,** while personas, docs and hooks still name it.
-  - **Tests:** `fleet-mail.test.ts` (10), 91/91 overall. A lab daemon started from the clone was run against live BTCC.
+  - **Feed wall tools (WO-92, stage 2; spec #feed #t-feed).** The wall lives in Fleet Core (`https://core.kbro.ai/api/feed/*`, fleet-core 35208b7; override with `FLEET_CORE_BASE`) and is called with the same per-agent credential.
+    - `feed_post` (every agent): a short card plus the full text. The title is required (≤40 chars); `touches` holds up to 5 words; `ref` is one work id; `supersedes` names the post this one replaces. Posts are append-only, and nobody is notified.
+    - `feed_ask`: one sentence. Jev returns the related unread posts in full, and they count as read. It is listed only for agents on the wall's ask list, because the main text tells every agent to ask first and a refused tool would cost each of them a call per task. The daemon checks `/api/feed/me` with a 1.5 s timeout; if Fleet Core can't be reached, the tool is not listed.
+    - `feed_search`: lists cards, which do not count as read. `feed_open`: returns the full text, which does count as read.
+    - The wall never pushes; these tools are its only way to an agent. If Fleet Core can't be reached, `feed_ask` says to use search instead, and the other tools report the error. Nothing throws.
+  - The main text was regenerated from spec rev 4aef1e2 (1,327 chars): v23 changed two sentences (「一定有人讀到」, 「到期對方還沒讀」). `send_mail`'s deadline wording now matches.
+  - **Tests:** `fleet-mail.test.ts` (16), 97/97 overall. A lab daemon started from the clone was run against live BTCC (mail) and live Fleet Core (feed: search, open, the ask gate, a server-side refusal).
 
 ## 1.27.8 — 2026-11-13
 

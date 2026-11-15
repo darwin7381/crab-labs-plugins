@@ -1137,10 +1137,27 @@ async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): P
   })
   return { status: r.status, json: await r.json().catch(() => ({})) }
 }
+// ---- feed wall (WO-92): Fleet Core /api/feed/*, same credential. Never throws: an unreachable core is
+// a status the tools explain ("改用搜尋" for ask), not a tool crash.
+const FLEET_CORE_BASE = (process.env.FLEET_CORE_BASE ?? 'https://core.kbro.ai').replace(/\/+$/, '')
+async function coreFeed(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 10000): Promise<{ status: number; json: any }> {
+  try {
+    const r = await fetch(`${FLEET_CORE_BASE}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth() },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    return { status: r.status, json: await r.json().catch(() => ({})) }
+  } catch (e) {
+    return { status: 599, json: { detail: `艦隊核心連不上（${String(e).slice(0, 80)}）` } }
+  }
+}
 const fleetDeps = {
   call: (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) =>
     sendToAgent(to, text, replyTo, noReply, op, 'call'),
   btcc: btccMail,
+  core: coreFeed,
 }
 
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
