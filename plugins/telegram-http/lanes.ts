@@ -857,6 +857,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     if (asked) triageRecord(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier }, asked)
     else void triageShadow(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier })
   }
+  if (D.role === 'tg' && S) noteAdmitted(ev, d)
   // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it
   if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
   return d
@@ -1098,6 +1099,16 @@ function startHold(peer: string, until: number | null, reason: string, by: strin
 export function holdLines(): string[] {
   return Object.values(S?.holds ?? {}).map(h => `• ${h.peer}：${h.reason}（${stamp(h.since)} 起，${h.by === 'main' ? '主線' : 'Joey'}；${h.until ? `到 ${stamp(new Date(h.until).toISOString())}` : '直到解除'}；已擋下 ${h.count} 則）`)
 }
+/** 002l (D10): an admitted peer event that really opened (or went to) a lane: it counts as "answered" in the peer's flood episode. 002k counted every admit,
+ *  ledger-only ones included, and the summary said 「6 則開了車道回覆」 for FYIs that opened nothing. */
+function noteAdmitted(ev: InEvent, d: Decision): void {
+  if (d.target !== 'lane' || !isPeerEvent(ev) || ev.no_reply) return
+  const f = S.flood?.[ev.from.toLowerCase()]
+  if (!f) return
+  const now = Date.now()
+  f.admits = [...(f.admits ?? []).filter(t => now - t < 120_000), now]
+  if (f.episode) { f.episode.answered++; f.episode.last_at = now }
+}
 function peerGate(ev: InEvent): { rule: string; note: string } | null {
   if (!isPeerEvent(ev)) return null
   const peer = ev.from.toLowerCase(), now = Date.now()
@@ -1112,6 +1123,9 @@ function peerGate(ev: InEvent): { rule: string; note: string } | null {
     }
   }
   if (!floodOn()) return null
+  // 002l (D10): design/routing 「標了『不用回』的純通知 → 帳本：只記一行，不開任何 session。零 token」. A no_reply notice opens nothing, so it is no load to
+  // limit: it never touches the rate bucket, the queue count or the flood episode (G08: 40 FYIs started a flood, merged 34, rang Joey, auto-replied to Eve).
+  if (ev.no_reply) return null
   if (ev.reply_to_id && S.outbound[ev.reply_to_id]) return null        // 002l (D1): the answer to our own question goes to the asker, never gated (C02)
   S.flood ??= {}
   const perMin = num('LANES_PEER_NEW_PER_MIN', 5), maxOpen = num('LANES_PEER_MAX_OPEN', 8)
@@ -1124,9 +1138,8 @@ function peerGate(ev: InEvent): { rule: string; note: string } | null {
   const ep = f.episode
   if (!reason) {
     if (newThread) f.bucket -= 1
-    f.admits = [...(f.admits ?? []).filter(t => now - t < 120_000), now]
-    if (ep) { ep.answered++; ep.last_at = now }
-    return null
+    if (ep) ep.last_at = now
+    return null                                                       // 002l (D10): what counts as answered is decided after the rules (noteAdmitted): a lane opened
   }
   const limit = reason === 'queue' ? `同時排隊與執行的事件已有 ${open} 件（上限 ${maxOpen}）` : `每分鐘新開的對話超過 ${perMin} 個`
   let e = f.episode
