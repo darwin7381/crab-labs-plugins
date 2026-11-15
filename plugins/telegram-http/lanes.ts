@@ -2290,6 +2290,7 @@ function startRun(it: QItem): void {
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     queueSteering(lane, steerLeft, signal ? `was stopped (${signal})` : `ended (exit ${code})`)
+    closeRecord(lane, { runId, tools, lastText, lastResults, signal: signal ?? null })      // 002l (D3): a lane closed while this run ran: what it reached
     if (S.threads[lane.thread]) { S.threads[lane.thread].tokens += tin; S.threads[lane.thread].fresh = (S.threads[lane.thread].fresh ?? 0) + tfresh }   // 002l (D1, D7): the budget counts tfresh
     releaseClaims(lane.id, 'run ended')
     const names = tools.map(t => t.name.replace(/^mcp__lane__/, 'lane:'))
@@ -3522,12 +3523,9 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     case 'lane_close': {
       const l = S.lanes[String(a.lane_id ?? '')]
       if (!l) return 'no such lane'
-      l.status = 'closed'
-      for (const [k, v] of Object.entries(S.topics)) if (v === l.id) delete S.topics[k]
-      saveState()
-      const r = running.get(l.id); if (r) { try { r.child.kill('SIGTERM') } catch {} }
-      ledger({ lane: 'main', thread: l.thread, kind: 'action', notify_main: false, text: `主線關閉 ${l.id}` })
-      return `closed ${l.id}`
+      if (l.status === 'closed') return `${l.id} is already closed`
+      const r = closeLane(l, 'main', 'main')                    // 002l (D3): the same close as Joey's: a running run gets its grace to report
+      return r.running ? `closing ${l.id}: its running run has ${Math.round(CLOSE_GRACE_MS() / 1000)} s to report where it is, then it is stopped; what it reached goes to the ledger when it ends.` : `closed ${l.id}`
     }
   }
   return `unknown tool ${name}`
@@ -3573,6 +3571,52 @@ export function mainStuckTick(): void {
 //                           to the ledger so the main can pick the work up
 //   /lanes off | on         the master switch
 //   /lanes notify default|tiered   the notify profile
+// 002l (D3): design/stability 「看不到、關不掉」 → 「Telegram 可以列出與關閉」. 002k's close sent SIGTERM at once and wrote "its last records" from the ledger
+// only, then told Joey 「它最後做到哪已寫進帳本」: A07's worker died in the middle of its 1-5/20 progress notify, so the progress reached neither the ledger nor
+// Joey, and Joey was told it had. Now a lane that is not running is closed as before (its ledger records are what there is). A RUNNING lane is closed for new
+// events at once and its run gets LANES_CLOSE_GRACE_MS (30 s): a system notice at its next tool boundary asks it to tell Joey where it is and end; after the
+// grace it is stopped. The close row is written when the run has ended, with what the run reported in it, its last text and its last tool results. Joey is
+// told what will happen, never that something was recorded before it was.
+const CLOSE_GRACE_MS = (): number => num('LANES_CLOSE_GRACE_MS', 30_000)
+const closing = new Map<string, { by: string; via: 'joey' | 'main'; at: number; last: string[]; timer: ReturnType<typeof setTimeout> }>()
+function closeLane(l: Lane, who: string, via: 'joey' | 'main'): { running: boolean } {
+  const last = readJsonl('ledger.jsonl').filter(r => r.lane === l.id).slice(-3).map(r => `${r.kind}：${String(r.text ?? '').slice(0, 200)}`)
+  const run = running.get(l.id)
+  l.status = 'closed'
+  for (const [k, v] of Object.entries(S.topics)) if (v === l.id) delete S.topics[k]
+  for (const [k, v] of Object.entries(S.tickets)) if (v === l.id) delete S.tickets[k]
+  saveState()
+  appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: !!run, title: l.title ?? null, grace_ms: run ? CLOSE_GRACE_MS() : 0 })
+  const who2 = via === 'joey' ? 'Joey 用 /lanes close' : '主線用 lane_close'
+  if (!run) {
+    ledger({ lane: via === 'joey' ? 'router' : 'main', thread: l.thread, kind: 'action', notify_main: via === 'joey',
+      text: `${who2} 關閉 ${laneLabel(l)}（${l.id}${l.title ? `，「${l.title}」` : ''}），當時沒有在執行。它在帳本裡最後的紀錄：${last.join('；') || '（沒有）'}。這件事如果還沒做完，由主線決定要不要接手。`,
+      refs: { closed: l.id, by: who, was_running: false } })
+    return { running: false }
+  }
+  steerSystem(l, run.runId, 'close', `${via === 'joey' ? 'Joey' : '主線'}關閉了這條車道。現在停手，不要開始新的步驟：用 notify_joey 一句話說你做到哪（做完了什麼、還剩什麼、結果在哪裡），再 receipt，然後結束。${Math.round(CLOSE_GRACE_MS() / 1000)} 秒後這一趟會被停掉。`)
+  const timer = setTimeout(() => { const r = running.get(l.id); if (r && r.runId === run.runId) { try { r.child.kill('SIGTERM') } catch {} } }, CLOSE_GRACE_MS())
+  ;(timer as any).unref?.()
+  closing.set(l.id, { by: who, via, at: Date.now(), last, timer })
+  return { running: true }
+}
+/** the closed lane's run has ended: the close row says what it reached, from the run itself */
+function closeRecord(lane: Lane, run: { runId: string; tools: Array<{ name: string; input: any }>; lastText: string; lastResults: string[]; signal: string | null }): void {
+  const c = closing.get(lane.id)
+  if (!c) return
+  closing.delete(lane.id); clearTimeout(c.timer)
+  const reported = run.tools.filter(t => ['mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main', 'mcp__lane__receipt'].includes(t.name))
+    .map(t => `${t.name.replace('mcp__lane__', '')}：${String(t.input?.text ?? t.input?.did ?? t.input?.summary ?? '').replace(/\s+/g, ' ').slice(0, 240)}`)
+  const stopped = run.signal ? `寬限 ${Math.round(CLOSE_GRACE_MS() / 1000)} 秒到了還沒結束，已停掉（${run.signal}）` : '它自己收尾結束了'
+  const who2 = c.via === 'joey' ? 'Joey 用 /lanes close' : '主線用 lane_close'
+  ledger({ lane: c.via === 'joey' ? 'router' : 'main', thread: lane.thread, kind: 'action', notify_main: true,
+    text: `${who2} 關閉 ${laneLabel(lane)}（${lane.id}${lane.title ? `，「${lane.title}」` : ''}），當時正在執行 ${run.runId}；${stopped}。`
+      + `它在這一趟最後回報的：${reported.join('；') || '（沒有回報）'}。最後的文字：${run.lastText.replace(/\s+/g, ' ').slice(0, 240) || '（沒有）'}。`
+      + (run.lastResults.length ? `最後的工具結果：${run.lastResults.join(' ｜ ').slice(0, 400)}。` : '')
+      + `之前的帳本紀錄：${c.last.join('；') || '（沒有）'}。這件事如果還沒做完，由主線決定要不要接手。`,
+    refs: { closed: lane.id, by: c.by, was_running: true, run: run.runId, reported: reported.length, stopped: run.signal ?? null } })
+  logos('lane.closed', { lane: lane.id, run: run.runId, reported: reported.length, signal: run.signal ?? null, by: c.by })
+}
 const KIND_EN: Record<string, string> = { reflex: 'reflex', worker: 'worker', fork: 'fork', curator: 'curator', synthesis: 'synthesis' }
 function openedBy(l: Lane): string {
   const r = readJsonl('routing.jsonl').find(x => x.lane === l.id)
@@ -3617,19 +3661,11 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
     const l = args[1] ? findLane(args.slice(1).join(' ')) : null
     if (!l) return `找不到這條車道：${args.slice(1).join(' ') || '(沒寫)'}。用 /lanes 看清單。`
     if (l.status === 'closed') return `${laneLabel(l)} 已經關了。`
-    const last = readJsonl('ledger.jsonl').filter(r => r.lane === l.id).slice(-3).map(r => `${r.kind}：${String(r.text ?? '').slice(0, 200)}`)
-    const wasRunning = running.has(l.id)
-    l.status = 'closed'
-    for (const [k, v] of Object.entries(S.topics)) if (v === l.id) delete S.topics[k]
-    for (const [k, v] of Object.entries(S.tickets)) if (v === l.id) delete S.tickets[k]
-    saveState()
-    const r = running.get(l.id); if (r) { try { r.child.kill('SIGTERM') } catch {} }
-    appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: wasRunning, title: l.title ?? null })
-    ledger({ lane: 'router', thread: l.thread, kind: 'action', notify_main: true,
-      text: `Joey 用 /lanes close 關閉 ${laneLabel(l)}（${l.id}${l.title ? `，「${l.title}」` : ''}）${wasRunning ? '，當時正在執行' : ''}。它最後的紀錄：${last.join('；') || '（沒有）'}。這件事如果還沒做完，由主線決定要不要接手。`,
-      refs: { closed: l.id, by: who } })
-    logos('lane.command', { cmd: 'close', by: who, lane: l.id, was_running: wasRunning })
-    return `已關閉 ${laneLabel(l)}（${l.id}）${wasRunning ? '，當時正在執行的那一趟已停止' : ''}。它最後做到哪已寫進帳本，主線下一次摘要會看到。`
+    const r = closeLane(l, who, 'joey')
+    logos('lane.command', { cmd: 'close', by: who, lane: l.id, was_running: r.running })
+    return r.running
+      ? `正在關閉 ${laneLabel(l)}（${l.id}）：它正在跑的那一趟有 ${Math.round(CLOSE_GRACE_MS() / 1000)} 秒收尾，已請它先告訴你它做到哪，時間到還沒結束就停掉。它結束後，做到哪（它最後回報的、最後的工具結果）會寫進帳本，主線下一次摘要會看到。`
+      : `已關閉 ${laneLabel(l)}（${l.id}）。它沒有在執行；它在帳本裡最後的紀錄已附在給主線的那一筆裡。`
   }
   if (sub === 'off' || sub === 'on') {
     if (sub === 'off') {
