@@ -347,19 +347,22 @@ function run(argv: string[], timeoutMs = 8000): Promise<{ code: number; out: str
     p.on('close', code => { if (!done) { done = true; clearTimeout(timer); resolve({ code: code ?? -1, out }) } })
   })
 }
+// `-u` on every call: a launchd daemon has no UTF-8 locale, and without it tmux prints control characters as
+// '_' (the tab between display-message fields came back as "python3.12_0", so no pane ever parsed: 1.29.0
+// canary) and may do the same to non-ASCII screen text.
 export const realTmux: Tmux = {
   async capture(t, scrollback) {
-    const r = await run(['tmux', 'capture-pane', '-p', ...(scrollback ? ['-S', `-${scrollback}`] : []), '-t', t])
+    const r = await run(['tmux', '-u', 'capture-pane', '-p', ...(scrollback ? ['-S', `-${scrollback}`] : []), '-t', t])
     return r.code === 0 ? r.out : null
   },
   async info(t) {
-    const r = await run(['tmux', 'display-message', '-p', '-t', t, '#{pane_current_command}\t#{pane_in_mode}\t#{pane_current_path}'])
+    const r = await run(['tmux', '-u', 'display-message', '-p', '-t', t, '#{pane_current_command}\t#{pane_in_mode}\t#{pane_current_path}'])
     const p = r.out.replace(/\n$/, '').split('\t')
     if (r.code !== 0 || p.length !== 3) return null
     return { cmd: p[0], inMode: p[1] === '1', path: p[2] }
   },
-  async sendKey(t, key) { await run(['tmux', 'send-keys', '-t', t, key]) },
-  async cancelMode(t) { await run(['tmux', 'send-keys', '-t', t, '-X', 'cancel']) },
+  async sendKey(t, key) { await run(['tmux', '-u', 'send-keys', '-t', t, key]) },
+  async cancelMode(t) { await run(['tmux', '-u', 'send-keys', '-t', t, '-X', 'cancel']) },
 }
 
 // ---------------------------------------------------------------- evidence bundle (port of collect.py build)

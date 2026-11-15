@@ -1,3 +1,12 @@
+## 1.29.2 — 2026-11-16
+
+- **Duty officer: every tmux call runs with `-u`. This is the real cause of the blind first canary; 1.29.1 named the wrong one.**
+  - A launchd daemon has no UTF-8 locale. Without one, tmux prints control characters as `_`.
+  - So the tab-separated `display-message` came back as `python3.12_0`, and every pane failed to parse. 1.29.1's new `look_failed` line showed it.
+  - Reproduced with `env -i`: 30 of 30 null without `-u`, 0 of 30 with it.
+  - My design defect: I split on a tab and tested only from a shell inside tmux with a UTF-8 locale, never in the daemon's environment.
+  - 1.29.1's `close` change stays; it is correct on its own.
+
 ## 1.29.1 — 2026-11-16
 
 - **Duty officer: tmux and `claude -p` output read on `close`, not `exit`.** On the first live canary (claude-epeius, 16:17Z) the daemon wrote its claims every tick but never logged a single screen. The same code run from a shell saw the test dialog and handled it. `exit` can fire before stdout has been read. An empty `display-message` then reads as "no pane", which was skipped without a word. A pane that cannot be read now leaves a `look_failed` line once an hour.
