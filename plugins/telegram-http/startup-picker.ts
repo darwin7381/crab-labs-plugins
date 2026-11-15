@@ -207,6 +207,8 @@ export function startStartupPickerWatchdog(opts: {
   surface: (spec: SurfaceSpec) => void
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
   pollMs?: number
+  /** Panes someone else is handling now (the duty officer, WO-97): not looked at. */
+  skip?: (tmux: string) => boolean
 }): void {
   const surfaced = new Map<string, boolean>() // tmux → already surfaced this episode
   const pollMs = opts.pollMs ?? 8_000
@@ -214,6 +216,7 @@ export function startStartupPickerWatchdog(opts: {
     let targets: PickerTarget[] = []
     try { targets = await opts.listTargets() } catch { return }
     for (const t of targets) {
+      if (opts.skip?.(t.tmux)) continue
       const { stdout: pane } = await runCommand(['tmux', 'capture-pane', '-t', t.tmux, '-p'])
       if (!pane) continue
       const picker = detectStartupPicker(pane)

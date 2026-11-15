@@ -45,3 +45,6 @@ plugins/discord-http/channel-bot-control.ts::scopeNote = effortScopeNote(restore
 plugins/telegram-http/channel-bot-control.ts::effortFailureNote(restoreGlobalEffort(effortSnap))
 plugins/discord-http/channel-bot-control.ts::effortFailureNote(restoreGlobalEffort(effortSnap))
 plugins/telegram-http/channel-bot-control.ts::await detectCurrentEffort(projectsDirOverride, tmuxName)
+plugins/telegram-http/server.ts::new DutyOfficer(
+plugins/telegram-http/duty-officer.ts::export class DutyOfficer
+plugins/telegram-http/startup-picker.ts::opts.skip?.(t.tmux)

@@ -1,3 +1,23 @@
+## 1.29.0 — 2026-11-16
+
+- **值班員 (duty officer) inside every Telegram daemon (BTCC WO-97).** This is the formal version of Chiron's interim `tools/menu_aide/duty_officer.py`. Each daemon watches its own agent's pane; roamers watch their current target. When a screen sits waiting for a key, the daemon gets it handled without going through any agent session. New `duty-officer.ts`; behaviour notes are in its header.
+  - **Detect.** Every 3 s the last 12 lines are classified as WORKING / IDLE / STARTING / OTHER, using Chiron's rules: dialog hints win over the spinner and the footer. OTHER with the same screen for 8 s is a stall. One extra gate comes from the transcript: a screen with no key hint, while the agent's transcript or a sub-agent's is still being written, is not a stall yet.
+  - **Judge.** One headless `claude -p` (Opus 5.5, effort low, no tools, JSON schema, from an empty temp dir, 60 s timeout). The evidence bundle is a port of `collect.py`: screen, pending tool call (sub-agents included), recent messages, last Joey message, manifest model, redaction. Chiron's two files are re-read on every call and never copied: `aide_prompt.md` is the system prompt and `rulings.md` goes in the bundle. Lookup order: `DUTY_OFFICER_RULES_DIR`, then `~/Development/Joey-Crablabs-Skills/duty-officer/`, then Chiron's workspace copy.
+  - **Act.**
+    - `none` is logged.
+    - `do` presses only Up, Down, Left, Right, Enter, Esc, Tab or Space. The screen is re-captured and must be unchanged before pressing, and is looked at 2 s after. A follow-up dialog becomes the next step, up to 3.
+    - `ask_joey` sends Joey the duty officer's note from the agent's own bot, with one button per option. An option that needs typing gets no button. His tap reaches the same daemon, which re-checks the screen, presses, looks again, edits the message with the result and mails the ruling to Chiron. The rulings recipient is `DUTY_OFFICER_RULINGS_TO`. The sender is the new system identity `duty-officer`, from `~/.config/mesh/duty-officer.credential`; one per machine was minted by mesh-provision.
+    - A question whose screen leaves the menu on its own is edited to say so. One that is still open is re-sent once an hour.
+  - **Failure.** On a model error, the hourly budget (30 per machine, 6 per pane) or missing rule files, Joey gets the raw screen, with buttons when it is a plain numbered menu. That notice goes out once per machine per hour (Chiron btcc 9583); held panes are looked at again after the hour.
+  - **Rate-limit menu.** `/rate-limit-options` is never sent to the model. It stays with `com.btai.ratelimit-modal-guard` until that is merged here.
+- **Switch and hand-over: `~/.claude/duty-officer/config.json`, read every tick.**
+  - Keys: `{"enabled": "*" | [tmux or label …], "dry_keys": bool, "test_targets": {"dotest-1": "<owner tmux>"}, "test_recipients": [...], "test_rulings_to": "..."}`.
+  - No file, or a pane not listed, means off for that pane: the startup-picker keeps it exactly as before. It is skipped only while the duty officer handles that pane (new `skip` option).
+  - While on, the daemon touches `claims/<tmux>` every tick. Chiron's interim loop skips a pane with a fresh claim, so a pane passes over and back with no coordination.
+  - Log: `~/.claude/duty-officer/log.jsonl`. Questions: `ask/<id>.json` (a tap still works after a daemon restart).
+- `startup-picker.ts`: new optional `skip(tmux)`.
+- Tests: `duty-officer.test.ts`, 24 new. 123/123 overall.
+
 ## 1.28.1 — 2026-11-15
 
 - **Wording that still taught the old way of sending (Chiron, WO-95, btcc 9544).** `send_to_agent`'s `no_reply` parameter used to say "set true for a terminal ack / closing FYI". In practice that told agents to send FYIs as calls. Now it says:

@@ -58,6 +58,7 @@ import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsA
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
+import { DutyOfficer, askModelCli, isDutyCallback, realTmux } from './duty-officer.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
@@ -1702,13 +1703,72 @@ async function paneWatchTargets(): Promise<WatchTarget[]> {
   return targets
 }
 
+// Duty officer (值班員, BTCC WO-97): this daemon watches its own agent's pane for a screen waiting for a key
+// and has it judged (claude -p with Chiron's aide_prompt.md + rulings.md), pressed, or put to Joey through
+// THIS bot with one button per option. Switch: ~/.claude/duty-officer/config.json, read every tick; a pane
+// it is not switched on for stays with the startup-picker below, exactly as before.
+// Rulings Joey makes go by mail to DUTY_OFFICER_RULINGS_TO (default chiron) as the system sender
+// duty-officer (~/.config/mesh/duty-officer.credential); without it they are kept in rulings-unsent.jsonl.
+const DUTY_RULINGS_TO = (process.env.DUTY_OFFICER_RULINGS_TO ?? 'chiron').trim()
+const DUTY_CREDENTIAL = join(homedir(), '.config', 'mesh', 'duty-officer.credential')
+let dutyOfficer: DutyOfficer | null = null
+if (isControlEnabled() || isRoamerEnabled()) {
+  dutyOfficer = new DutyOfficer({
+    listTargets: async () => (await paneWatchTargets()).map(t => ({
+      ...t, projectsDir: isControlEnabled() && t.tmux === process.env.CHANNEL_BOT_TMUX_SESSION ? (process.env.CHANNEL_BOT_PROJECTS_DIR || null) : null,
+    })),
+    tmux: realTmux,
+    model: askModelCli,
+    recipients: () => opsRecipients(loadAccess()),
+    send: async (chats, text, buttons) => {
+      const kb = buttons ? (() => {
+        const k = new InlineKeyboard()
+        buttons.forEach((row, i) => { if (i > 0) k.row(); for (const b of row) k.text(b.text, b.callback_data) })
+        return k
+      })() : undefined
+      const out: { chat: string; msg: number }[] = []
+      for (const chat of chats) {
+        try {
+          const m = await bot.api.sendMessage(chat, text, kb ? { reply_markup: kb } : {})
+          out.push({ chat, msg: m.message_id })
+        } catch (e) { log('error', `duty-officer send to ${chat} failed: ${e}`) }
+      }
+      return out
+    },
+    edit: async (s, text) => {
+      try { await bot.api.editMessageText(s.chat, s.msg, text, { reply_markup: { inline_keyboard: [] } }) }
+      catch (e) { log('warn', `duty-officer edit ${s.chat}/${s.msg} failed: ${e}`) }
+    },
+    mail: async (title, body, to) => {
+      let cred = ''
+      try { cred = readFileSync(DUTY_CREDENTIAL, 'utf8').trim() } catch {}
+      if (!cred) return 'no duty-officer credential on this machine'
+      if (!BTCC_API_BASE) return 'BTCC_API_BASE is not configured on this machine'
+      try {
+        const r = await fetch(`${BTCC_API_BASE}/api/mesh/mail/send`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'User-Agent': 'duty-officer', Authorization: `Bearer ${cred}` },
+          body: JSON.stringify({ to: to || DUTY_RULINGS_TO, title, body, no_reply: true }),
+          signal: AbortSignal.timeout(10000),
+        })
+        const j: any = await r.json().catch(() => ({}))
+        return r.ok && j.id ? `#${j.id}` : `HTTP ${r.status} ${String(j.detail ?? '').slice(0, 120)}`
+      } catch (e) { return `failed: ${String(e).slice(0, 120)}` }
+    },
+    log,
+  })
+  dutyOfficer.start()
+}
+
 // Startup-picker interceptor (Joey 2026-07-13): surface claude's boot-time
 // blocking pickers (large-session resume menu, …) to TG as tap-to-choose
 // buttons so a keyboard-less daemon never wedges silently. Sends inline
 // buttons to every allowFrom chat; the tap drives the keystroke.
+// A pane the duty officer is watching is skipped (it handles startup menus too).
 if (isControlEnabled() || isRoamerEnabled()) {
   startStartupPickerWatchdog({
     listTargets: paneWatchTargets,
+    skip: tmux => dutyOfficer?.handles(tmux) ?? false,
     surface: ({ title, buttons }) => {
       const access = loadAccess()
       const keyboard = buttons.map(b => [b])
@@ -1825,6 +1885,21 @@ bot.on('callback_query:data', async ctx => {
   // dynamic current_target tmux). In channel-bot mode, resume:/model: go to
   // channel-bot's handleCallbackData (fixed TMUX_SESSION). model: is only
   // ever emitted in channel-bot mode (see forwardSharedTuiSlash guard).
+  // Duty officer question (WO-97): only the people this bot sends ops traffic to may answer it.
+  if (isDutyCallback(data)) {
+    const senderId = String(ctx.from.id)
+    if (!dutyOfficer || !dutyOfficer.mayAnswer(data, senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const who = ctx.from.username ? `@${ctx.from.username}` : senderId
+    let toast = ''
+    try { toast = await dutyOfficer.onTap(data, who) }
+    catch (err) { toast = '處理時出錯，沒有按'; log('warn', `duty-officer tap failed: ${err instanceof Error ? err.message : err}`) }
+    await ctx.answerCallbackQuery({ text: toast.slice(0, 190) }).catch(() => {})
+    return
+  }
+
   if (data.startsWith('spick:')) {
     const access = loadAccess()
     const senderId = String(ctx.from.id)
