@@ -2643,7 +2643,13 @@ function chainEnded(lane: Lane, tok: RunTok, why: 'cap' | 'no-change', runs: num
 // Joey message sends reply_agent, the daemon writes kind commitment (who = the peer, what = the sent text, refs.from owner-relay,
 // refs.auto true), unless the lane already wrote a commitment in that run (its own commitment call, or the receipt's promised).
 /** the run was triggered by a Joey message (a Telegram event: a quoted lane message, a worker topic) */
-const byJoeyRun = (tok: RunTok): boolean => tok.trigger === 'joey' || tok.cls === 'joey' || queue.get(tok.evId)?.ev.source === 'telegram'
+// 002l (D5): identity rule 5 「承諾必入帳」. A Joey message handed INTO a running run (E18 steering) makes the run Joey's as much as one he started: C08's worker
+// got Joey's tg-1033 by steer and relayed it to Eve, and no commitment was written because only the trigger event was looked at.
+const byJoeyRun = (tok: RunTok): boolean => {
+  if (tok.trigger === 'joey' || tok.cls === 'joey' || queue.get(tok.evId)?.ev.source === 'telegram') return true
+  syncSteer(tok.lane)                                                // what the hook has handed over by now is on tok.steered
+  return !!tok.steered?.some(e => e.source === 'telegram')
+}
 function ownerRelay(lane: Lane, tok: RunTok, to: string, text: string, msgId: number | null): void {
   if (!byJoeyRun(tok) || (tok.commitments ?? 0) > 0) return
   const cm = commitmentFromReport(text, to, to) ?? { who: to, what: text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
