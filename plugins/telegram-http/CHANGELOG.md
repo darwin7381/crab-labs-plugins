@@ -18,10 +18,12 @@
     - `feed_post` (every agent): a short card plus the full text. The title is required (≤40 chars); `touches` holds up to 5 words; `ref` is one work id; `supersedes` names the post this one replaces. Posts are append-only, and nobody is notified.
     - `feed_ask`: one sentence. Jev returns the related unread posts in full, and they count as read. It is listed only for agents on the wall's ask list, because the main text tells every agent to ask first and a refused tool would cost each of them a call per task. The daemon checks `/api/feed/me` with a 1.5 s timeout; if Fleet Core can't be reached, the tool is not listed.
     - `feed_search`: lists cards, which do not count as read. `feed_open`: returns the full text, which does count as read.
-    - A post counts as read only once the daemon has the text in hand. `feed_ask` and `feed_open` read first, then confirm with `POST /api/feed/read`, so an answer lost on the way never hides a post. At worst the post comes twice, and the tool says so if the confirmation fails. This came from a Codex stop-review finding: the first version marked posts read on the server before the reply had left.
+    - A post counts as read only once its text has reached the agent. The tool result carries an after-send hook. The `/fleet` route strips it from the response and runs `POST /api/feed/read` only on the response's `finish` event, i.e. once it has been handed to the agent's socket. A request the agent dropped (timeout, interrupt, disconnect) never finishes, so nothing it didn't get is marked. At worst a post comes twice.
+      - Lab: the daemon ran against a local fake core. A normal `feed_open` produced GET then POST /read. A client that disconnected before the answer was ready produced the GET only, and no /read within 3 s.
+      - This came from two Codex stop-review findings. The first version marked posts read on the server; the second marked them before the reply had left the daemon.
     - The wall never pushes; these tools are its only way to an agent. If Fleet Core can't be reached, `feed_ask` says to use search instead, and the other tools report the error. Nothing throws.
   - The main text was regenerated from spec rev 4aef1e2 (1,327 chars): v23 changed two sentences (「一定有人讀到」, 「到期對方還沒讀」). `send_mail`'s deadline wording now matches.
-  - **Tests:** `fleet-mail.test.ts` (17), 98/98 overall. A lab daemon started from the clone was run against live BTCC (mail) and live Fleet Core (feed: search, open, the ask gate, a server-side refusal).
+  - **Tests:** `fleet-mail.test.ts` (18), 99/99 overall. A lab daemon started from the clone was run against live BTCC (mail) and live Fleet Core (feed: search, open, the ask gate, a server-side refusal).
 
 ## 1.27.8 — 2026-11-13
 

@@ -12,7 +12,7 @@
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate } from './mcp-auth.ts'
-import { handleFleetRpc } from './fleet-mail.ts'
+import { handleFleetRpc, takeAfterSend } from './fleet-mail.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import {
@@ -3209,6 +3209,14 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       const out = (await Promise.all((batch ? payload : [payload]).map(m => handleFleetRpc(m, fleetDeps))))
         .filter(x => x !== null)
       if (!out.length) { res.writeHead(202).end(); return }
+      // Feed read-marks run only once the response is handed to the agent's socket ('finish'). A request
+      // the agent dropped never finishes, so a post it never got is never marked read.
+      const afters = takeAfterSend(out)
+      if (afters.length) {
+        res.once('finish', () => {
+          for (const f of afters) f().catch(e => log('warn', `fleet after-send: ${String(e).slice(0, 160)}`))
+        })
+      }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify(batch ? out : out[0]))
       return

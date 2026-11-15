@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { FLEET_INSTRUCTIONS, FLEET_TOOLS, handleFleetRpc, type FleetDeps } from './fleet-mail.ts'
+import { FLEET_INSTRUCTIONS, FLEET_TOOLS, handleFleetRpc, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { FLEET_TEXT } from './fleet-text.ts'
 
 function deps(over: Partial<FleetDeps> = {}) {
@@ -156,28 +156,44 @@ describe('feed wall tools (WO-92)', () => {
       return { status: 200, json: {
       candidates: 9, judged: 7, related: 3, more: 1, unjudged: 2, jev: 'partial',
       given: [{ ...post, body: 'ton 開頭的網域 DNS 已搬到 Cloudflare', links: ['https://x'], read: false }, { ...post, id: 6, body: '第二則', links: [], read: false }] } } } })
-    const t = out(await handleFleetRpc(tool('feed_ask', { about: '要改 ton 網域' }), d))
+    const res = await handleFleetRpc(tool('feed_ask', { about: '要改 ton 網域' }), d)
+    const t = out(res)
     expect(seen[0]).toEqual(['POST', '/api/feed/ask', { about: '要改 ton 網域' }, 20000])
     expect(t).toContain('跟這件事有關的 2 則')
     expect(t).toContain('#7｜11-15 07:52Z｜hephaestus｜Hephaestus：ton 網域改走 Cloudflare\n　動到：ton-dns、cloudflare　連動：WO-25\n\nton 開頭的網域 DNS 已搬到 Cloudflare\nhttps://x')
     expect(t).toContain('另有 1 則有關的，再問一次接著給。')
     expect(t).toContain('另外 2 則 Jev 沒判到，可以用 feed_search 找。')
-    expect(seen[1]).toEqual(['POST', '/api/feed/read', { ids: [7, 6], via: 'ask' }, undefined])   // read only after the text is in hand
-    expect(t).not.toContain('沒能記成讀過')
+    // nothing is marked while the answer is being built: only an after-send hook rides on the result
+    expect(seen.length).toBe(1)
+    const hooks = takeAfterSend([res])
+    expect(hooks.length).toBe(1)
+    expect(JSON.stringify(res)).not.toContain('_afterSend')
+    expect(res.result._afterSend).toBeUndefined()
+    await hooks[0]()
+    expect(seen[1]).toEqual(['POST', '/api/feed/read', { ids: [7, 6], via: 'ask' }, undefined])
   })
-  test('feed_ask / feed_open: a failed read-mark still delivers, and says the post may come again', async () => {
-    const { d } = deps({ core: async (m, p) => {
+  test('after-send hooks: a failed read-mark throws (the route logs it; the post stays unread and comes again)', async () => {
+    const seen: string[] = []
+    const { d } = deps({ core: async (m, p) => { seen.push(p)
       if (p === '/api/feed/read') return { status: 599, json: {} }
       if (p === '/api/feed/ask') return { status: 200, json: { candidates: 1, judged: 1, related: 1, more: 0, unjudged: 0, jev: 'ok',
         given: [{ ...post, body: '全文', links: [], read: false }] } }
       return { status: 200, json: { ...post, body: '打開的全文', links: [], read: false } } } })
     const a = await handleFleetRpc(tool('feed_ask', { about: 'x' }), d)
     expect(out(a)).toContain('全文')
-    expect(out(a)).toContain('沒能記成讀過')
     expect(a.result.isError).toBeUndefined()
     const o = await handleFleetRpc(tool('feed_open', { id: 7 }), d)
     expect(out(o)).toContain('打開的全文')
-    expect(out(o)).toContain('沒能記成讀過')
+    const hooks = takeAfterSend([a, o])
+    expect(hooks.length).toBe(2)
+    expect(seen).toEqual(['/api/feed/ask', '/api/feed/posts/7'])     // nothing marked before sending
+    await expect(hooks[0]()).rejects.toThrow('599')
+    await expect(hooks[1]()).rejects.toThrow('599')
+  })
+  test('feed_open of a post already read (or your own) carries no hook', async () => {
+    const { d } = deps({ core: async () => ({ status: 200, json: { ...post, body: 'b', links: [], read: true } }) })
+    const o = await handleFleetRpc(tool('feed_open', { id: 7 }), d)
+    expect(takeAfterSend([o]).length).toBe(0)
   })
   test('feed_ask: Jev not answering → use search; nothing unread; nothing related; not on the list', async () => {
     let reply: any = { status: 200, json: { candidates: 4, judged: 0, given: [], jev: 'timeout' } }
@@ -209,8 +225,10 @@ describe('feed wall tools (WO-92)', () => {
     expect(t).toContain('#7｜11-15 07:52Z｜hephaestus｜Hephaestus：ton 網域改走 Cloudflare｜讀過')
     expect(t).toContain('#5｜11-15 07:52Z｜hephaestus｜Hephaestus：ton 網域改走 Cloudflare｜已被 #7（cadmus）取代')
     expect(t).not.toContain('全文')
-    const o = out(await handleFleetRpc(tool('feed_open', { id: 7 }), d))
-    expect(o).toContain('全文在這')
+    const or = await handleFleetRpc(tool('feed_open', { id: 7 }), d)
+    expect(out(or)).toContain('全文在這')
+    expect(seen.slice(1)).toEqual(['/api/feed/posts/7'])
+    await takeAfterSend([or])[0]()
     expect(seen.slice(1)).toEqual(['/api/feed/posts/7', '/api/feed/read'])
   })
 })

@@ -179,14 +179,27 @@ function full(p: any): string {
 }
 
 const ASK_TIMEOUT_MS = 20000
-const ACK_FAILED = '（這幾則沒能記成讀過，下次問牆可能會再給一次。）'
+// A post counts as read only when its text reached the agent. The tool result carries an `_afterSend`
+// hook instead of marking anything; the /fleet route runs it only after the HTTP response has been
+// handed to the agent's socket ('finish'). A request the agent dropped (timeout, interrupt, disconnect)
+// never finishes, so nothing it did not get is marked; worst case a post is offered twice.
+export type AfterSend = () => Promise<void>
+function afterSendRead(deps: FleetDeps, ids: number[], via: 'ask' | 'open'): AfterSend {
+  return async () => {
+    const r = await deps.core('POST', '/api/feed/read', { ids, via })
+    if (r.status !== 200) throw new Error(`feed read-mark ${via} ${ids.join(',')}: ${r.status}`)
+  }
+}
+const withAfter = (result: any, after?: AfterSend) => (after ? Object.assign(result, { _afterSend: after }) : result)
 
-// The wall marks a post read only when this daemon says it received the text (POST /read after the
-// answer is in hand), so an answer lost on the way never hides a post: worst case it comes twice.
-async function ackRead(deps: FleetDeps, ids: number[], via: 'ask' | 'open'): Promise<boolean> {
-  if (!ids.length) return true
-  const r = await deps.core('POST', '/api/feed/read', { ids, via })
-  return r.status === 200
+/** Pull the after-send hooks out of RPC responses (so they never reach the wire). */
+export function takeAfterSend(responses: any[]): AfterSend[] {
+  const out: AfterSend[] = []
+  for (const r of responses) {
+    const f = r?.result?._afterSend
+    if (typeof f === 'function') { out.push(f); delete r.result._afterSend }
+  }
+  return out
 }
 
 export async function callTool(name: string, args: Record<string, unknown>, deps: FleetDeps) {
@@ -298,8 +311,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if (!j.given?.length) return text([`Jev 看了 ${j.judged} 則你還沒讀過的貼文，沒有跟這件事有關的。`, ...tail].join('\n'))
       const head = `跟這件事有關的 ${j.given.length} 則（全文，新的在前；給了就算讀過）：`
       const body = [head, ...j.given.map(full)].join('\n\n———\n\n') + (tail.length ? `\n\n${tail.join('\n')}` : '')
-      const acked = await ackRead(deps, j.given.map((g: any) => g.id), 'ask')
-      return text(acked ? body : `${body}\n${ACK_FAILED}`)
+      return withAfter(text(body), afterSendRead(deps, j.given.map((g: any) => g.id), 'ask'))
     }
     case 'feed_search': {
       const q = String(args.q ?? '').trim()
@@ -317,8 +329,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if (!id) return text('feed_open: id 要填貼文編號', true)
       const r = await deps.core('GET', `/api/feed/posts/${id}`)
       if (r.status !== 200) return text(coreErr(r), true)
-      const acked = r.json.read === true || await ackRead(deps, [id], 'open')
-      return text(acked ? full(r.json) : `${full(r.json)}\n${ACK_FAILED}`)
+      return withAfter(text(full(r.json)), r.json.read === true ? undefined : afterSendRead(deps, [id], 'open'))
     }
   }
   return text(`unknown tool: ${name}`, true)
