@@ -69,6 +69,14 @@ export const __setRetryBackoff = (ms: number): void => { RETRY_BACKOFF_MS = ms }
 // 002j: with the model wall up, one queued event is tried again this often as a probe
 let WALL_PROBE_MS = Number(process.env.LANES_WALL_PROBE_MS ?? 300_000)
 export const __setWallProbe = (ms: number): void => { WALL_PROBE_MS = ms }
+// 002l (S0 item 4): 「撞額度時要退避，不要每 47 秒重開」. V1-G hit the weekly limit and one alert was respawned 14 times, every ~45 s (the lab's probe interval),
+// for nothing. A usage or login wall does not lift in seconds: while it stays up the probe interval doubles after each failed probe, up to
+// LANES_WALL_PROBE_MAX_MS (30 min). An overload or API error is transient: it keeps the base interval (at most 60 s for the main, as before).
+export function wallBackoffMs(kind: string, probes: number, base = WALL_PROBE_MS): number {
+  if (kind !== 'usage' && kind !== 'auth') return base
+  const max = Math.max(base, Number(process.env.LANES_WALL_PROBE_MAX_MS ?? 1_800_000) || 1_800_000)
+  return Math.min(max, base * 2 ** Math.min(20, Math.max(0, probes)))
+}
 // 002g: a lane run may take this long, then it is stopped and counts as a failed attempt (run again, third time: the main).
 // A run that hangs (a stalled API call, a command that never returns) kept renewing its lease for ever: its event was
 // neither done nor handed on, and nobody heard of it.
@@ -1576,9 +1584,12 @@ export function walledResult(j: any): { kind: string; text: string } | null {
 const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯', auth: '模型登入失效' }
 function wallUp(w: { kind: string; text: string }, by: string): void {
   if (S.wall) {                                           // a probe hit the wall again
-    S.wall.probes += 1; S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
-    logos('lane.wall_probe', { ok: false, probes: S.wall.probes, by })
-    armProbe(WALL_PROBE_MS + 30)
+    S.wall.probes += 1
+    const next = wallBackoffMs(S.wall.kind, S.wall.probes)            // 002l (S0 item 4): back off while it stays up
+    S.wall.probe_at = Date.now() + next; saveState()
+    logos('lane.wall_probe', { ok: false, probes: S.wall.probes, by, next_ms: next })
+    appendJsonl('lanes.jsonl', { lane: 'router', kind: 'wall_probe', ok: false, probes: S.wall.probes, next_ms: next })
+    armProbe(next + 30)
     return
   }
   // 002l (D12): one wall, one notice. When the main's wall of the same kind is already up and Joey was told, the lanes' wall is recorded, not pushed again.
@@ -1587,7 +1598,8 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
   saveState()
   const waiting = [...queue.values()].filter(i => i.state === 'queued' || i.state === 'leased').length
   const every = Math.max(1, Math.round(WALL_PROBE_MS / 60_000))
-  const text = `車道${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我每 ${every} 分鐘自動試一次，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
+  const backoff = wallBackoffMs(w.kind, 1) > WALL_PROBE_MS ? `，還沒恢復就把間隔加倍（最多 ${Math.round(wallBackoffMs(w.kind, 99) / 60_000)} 分鐘）` : ''
+  const text = `車道${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我 ${every} 分鐘後自動試一次${backoff}，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
   logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting, told })
   if (!told) {
     ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}（主線撞到同一道牆時已經通知過 Joey，這一筆不再推播）`, refs: { tier: 'ledger', tier_rule: 'wall-up+deduped-main-wall', escalated: false } })
@@ -1616,7 +1628,7 @@ function probeTick(): void {
     if (running.size === 0) armProbe(WALL_PROBE_MS)        // nothing could start (lease, cap): look again later
     return
   }
-  S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
+  S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
   bareProbe(MODEL, `${D.agent}.probe`, (walled, ok) => {
     if (!S?.wall) return
     if (ok) { logos('lane.wall_probe', { ok: true, bare: true }); wallDown('probe') }
@@ -1735,7 +1747,7 @@ function heldForMain(real: boolean, joey: boolean): void {
 /** tg role, every 15 s: a main that hit the wall with nothing waiting for it is seen here. */
 export function mainWallTick(): void {
   if (D?.role !== 'tg' || !S) return
-  if (S.main_wall) { if (!mainProbeTimer) armMainProbe(mainProbeMs(S.main_wall.kind)); return }
+  if (S.main_wall) { if (!mainProbeTimer) armMainProbe(wallBackoffMs(S.main_wall.kind, S.main_wall.probes, mainProbeMs(S.main_wall.kind))); return }
   const e = mainWalled(0)
   if (e) mainWallUp(e, 'tick')
 }
@@ -1777,8 +1789,9 @@ function mainProbeTick(): void {
     cur.probes += 1
     if (walled) { cur.kind = walled.kind; cur.text = walled.text }
     saveState()
-    logos('lane.main_wall_probe', { ok: false, probes: cur.probes, wall: cur.kind })
-    armMainProbe(mainProbeMs(cur.kind))
+    const next = wallBackoffMs(cur.kind, cur.probes, mainProbeMs(cur.kind))     // 002l (S0 item 4): the main's probe backs off the same way
+    logos('lane.main_wall_probe', { ok: false, probes: cur.probes, wall: cur.kind, next_ms: next })
+    armMainProbe(next)
   })
 }
 export function wallResumeNotice(w: { err_at: number; text: string }, held: number): string {
@@ -1964,7 +1977,7 @@ function pump(): void {
     if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
     if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
       if (running.size > 0) return
-      S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
+      S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
       startRun(it)
       return
     }
