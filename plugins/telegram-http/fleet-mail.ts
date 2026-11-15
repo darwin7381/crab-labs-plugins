@@ -14,7 +14,8 @@
 import { FLEET_TEXT } from './fleet-text.ts'
 
 export const FLEET_INSTRUCTIONS = FLEET_TEXT
-const TITLE_MAX = 40
+const TITLE_MAX = 50   // Joey TG chiron:1407: 50, and longer is cut by the server, never refused
+const CUT_NOTE = `標題超過 ${TITLE_MAX} 字，已截短，完整標題在內容第一行。`
 
 export type BtccCall = (method: 'GET' | 'POST', path: string, body?: unknown) => Promise<{ status: number; json: any }>
 export type CoreCall = (method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number) => Promise<{ status: number; json: any }>
@@ -47,7 +48,7 @@ export const FLEET_TOOLS = [
       required: ['to', 'title', 'body'],
       properties: {
         to: { type: 'string', description: '給誰。也可以寄給自己' },
-        title: { type: 'string', description: `標題，${TITLE_MAX} 字內：誰、對什麼、要什麼。對方先看到的只有這一行。超過不收` },
+        title: { type: 'string', description: `標題，${TITLE_MAX} 字內：誰、對什麼、要什麼。對方先看到的只有這一行。超過會自動截短，完整標題放進內容第一行` },
         body: { type: 'string', description: '內容。最多 3500 字' },
         deadline: { type: 'string', description: '選填：期限，ISO-8601 時間或「幾小時後」的數字；沒填＝一天。到期對方還沒讀，你會收到一封信' },
         no_reply: { type: 'boolean', description: '只是要它知道（它不用做事、不用回答）就標 true' },
@@ -79,7 +80,7 @@ export const FLEET_TOOLS = [
       properties: {
         id: { type: 'integer', description: '要回的那封信的編號' },
         body: { type: 'string', description: '內容。最多 3500 字' },
-        title: { type: 'string', description: `選填：標題（${TITLE_MAX} 字內）；沒填是「回覆：原標題」` },
+        title: { type: 'string', description: `選填：標題（${TITLE_MAX} 字內，超過會自動截短）；沒填是「回覆：原標題」` },
       },
     },
   },
@@ -95,7 +96,7 @@ export const FLEET_TOOLS = [
       type: 'object',
       required: ['title', 'body'],
       properties: {
-        title: { type: 'string', description: `標題，${TITLE_MAX} 字內：誰、對什麼、做了什麼或什麼變了。別人和 Jev 先靠這一行判斷跟自己有沒有關。超過不收` },
+        title: { type: 'string', description: `標題，${TITLE_MAX} 字內：誰、對什麼、做了什麼或什麼變了。別人和 Jev 先靠這一行判斷跟自己有沒有關。超過會自動截短，完整標題放進全文第一行` },
         body: { type: 'string', description: '全文：內容、細節、數字。打開才讀得到' },
         touches: { type: 'array', items: { type: 'string' }, maxItems: TOUCH_MAX, description: `選填：動到什麼，最多 ${TOUCH_MAX} 個詞（機器、服務、網域、檔名）。搜尋和 Jev 最常靠這一欄對上` },
         ref: { type: 'string', description: '選填：連動的工作，一個編號（WO-n、OP-n 或警報編號）' },
@@ -219,16 +220,15 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const title = String(args.title ?? '').trim()
       const body = String(args.body ?? '').trim()
       if (!to || !title || !body) return text('send_mail: to、title、body 都要填', true)
-      if ([...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}：寫誰、對什麼、要什麼。沒有寄出。`, true)
       const r = await deps.btcc('POST', '/api/mesh/mail/send', {
         to, title, body, deadline: hoursOrIso(args.deadline), no_reply: args.no_reply === true,
         ...(args.op ? { op: String(args.op) } : {}),
       })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
       const j = r.json
-      const opNote = j.warning ? `（${j.warning}）` : ''
+      const opNote = (j.warning ? `（${j.warning}）` : '') + (j.title_truncated ? CUT_NOTE : '')
       if (j.stored) return text(`已放進 ${to} 的信箱（#${j.id}）。它一小時內會知道有信；讀了沒用 mail_sent 查。${opNote}`)
-      if (j.delivered) return text(`${to} 的信箱還沒開，這封照舊直接送進它的 session（#${j.id}）。`)
+      if (j.delivered) return text(`${to} 的信箱還沒開，這封照舊直接送進它的 session（#${j.id}）。${opNote}`)
       return text(`#${j.id} 記下了，但送不到 ${to}：${j.detail ?? '?'}`, true)
     }
     case 'mailbox_list': {
@@ -260,12 +260,12 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const body = String(args.body ?? '').trim()
       if (!id || !body) return text('mailbox_reply: id 和 body 都要填', true)
       const title = args.title ? String(args.title).trim() : undefined
-      if (title && [...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}。沒有寄出。`, true)
       const r = await deps.btcc('POST', `/api/mesh/mail/${id}/reply`, { body, ...(title ? { title } : {}) })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
       const j = r.json
-      if (j.stored) return text(`回信放進對方信箱了（#${j.id}，不用回）。`)
-      if (j.delivered) return text(`對方信箱還沒開，回信直接送進它的 session（#${j.id}，不用回）。`)
+      const cut = j.title_truncated ? CUT_NOTE : ''
+      if (j.stored) return text(`回信放進對方信箱了（#${j.id}，不用回）。${cut}`)
+      if (j.delivered) return text(`對方信箱還沒開，回信直接送進它的 session（#${j.id}，不用回）。${cut}`)
       return text(`回信 #${j.id} 記下了，但送不到對方：${j.detail ?? '?'}`, true)
     }
     case 'mail_sent': {
@@ -285,7 +285,6 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const title = String(args.title ?? '').trim()
       const body = String(args.body ?? '').trim()
       if (!title || !body) return text('feed_post: title 和 body 都要填', true)
-      if ([...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}：誰、對什麼、做了什麼或什麼變了。沒有貼出。`, true)
       const touches = Array.isArray(args.touches) ? (args.touches as unknown[]).map(String).filter(Boolean) : []
       if (touches.length > TOUCH_MAX) return text(`「動到什麼」最多 ${TOUCH_MAX} 個詞（現在 ${touches.length} 個）。沒有貼出。`, true)
       const supersedes = args.supersedes != null && args.supersedes !== '' ? intId(args.supersedes) : undefined
@@ -295,7 +294,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
         links: Array.isArray(args.links) ? (args.links as unknown[]).map(String) : [],
       })
       if (r.status !== 200) return text(r.json?.detail && String(r.json.detail).startsWith('沒貼出') ? r.json.detail : `沒有貼出：${coreErr(r)}`, true)
-      return text(`已貼出 #${r.json.id}${supersedes ? `（取代 #${supersedes}）` : ''}。不會通知任何人；之後處理相關事情的人問牆時找得到。`)
+      return text(`已貼出 #${r.json.id}${supersedes ? `（取代 #${supersedes}）` : ''}。不會通知任何人；之後處理相關事情的人問牆時找得到。${r.json.title_truncated ? CUT_NOTE : ''}`)
     }
     case 'feed_ask': {
       const about = String(args.about ?? '').trim()

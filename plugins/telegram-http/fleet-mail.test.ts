@@ -53,11 +53,13 @@ describe('fleet MCP server', () => {
     expect(calls[1].replyTo).toBe(9123)
     expect(calls[1].noReply).toBe(true)
   })
-  test('send_mail: title over 40 never leaves the daemon', async () => {
-    const { d, btccCalls } = deps()
-    const r = await handleFleetRpc(tool('send_mail', { to: 'chiron', title: '一'.repeat(41), body: 'b' }), d)
-    expect(r.result.isError).toBe(true)
-    expect(btccCalls.length).toBe(0)
+  test('send_mail: a title over 50 is not refused here — it goes to the server, which cuts it, and the sender is told (Joey TG chiron:1407)', async () => {
+    const seen: any[] = []
+    const { d } = deps({ btcc: async (m, p, b) => { seen.push(b); return { status: 200, json: { id: 5, stored: true, title_truncated: true } } } })
+    const r = await handleFleetRpc(tool('send_mail', { to: 'chiron', title: '一'.repeat(51), body: 'b' }), d)
+    expect(r.result.isError).toBeUndefined()
+    expect(seen[0].title).toBe('一'.repeat(51))
+    expect(out(r)).toContain('標題超過 50 字，已截短，完整標題在內容第一行')
   })
   test('send_mail: stored vs pushed vs refused', async () => {
     let reply: any = { status: 200, json: { id: 7, stored: true } }
@@ -112,8 +114,8 @@ describe('fleet MCP server', () => {
     expect(seen[2][2]).toEqual({ body: '換了' })
     const bad = await handleFleetRpc(tool('mailbox_reply', { id: 11 }), d)
     expect(bad.result.isError).toBe(true)
-    const long = await handleFleetRpc(tool('mailbox_reply', { id: 11, body: 'x', title: '一'.repeat(41) }), d)
-    expect(long.result.isError).toBe(true)
+    const long = await handleFleetRpc(tool('mailbox_reply', { id: 11, body: 'x', title: '一'.repeat(51) }), d)
+    expect(long.result.isError).toBeUndefined()      // the server cuts it (Joey 1407), nothing refused here
   })
   test('a reply that could not be delivered is an error, not a success', async () => {
     let reply: any = { status: 200, json: { id: 31, stored: false, delivered: false, detail: 'receiver 502' } }
@@ -137,12 +139,14 @@ describe('fleet MCP server', () => {
 describe('feed wall tools (WO-92)', () => {
   const post = { id: 7, time: '2026-11-15T07:52:00+00:00', author: 'hephaestus', title: 'Hephaestus：ton 網域改走 Cloudflare',
     touches: ['ton-dns', 'cloudflare'], ref: 'WO-25', supersedes: null, superseded_by: null, superseded_by_author: null }
-  test('feed_post: title over 40 and six touches never leave the daemon; posted → told nobody is notified', async () => {
+  test('feed_post: six touches never leave the daemon; a long title goes to the server; posted → told nobody is notified', async () => {
     const seen: any[] = []
     const { d } = deps({ core: async (m, p, b) => { seen.push([m, p, b]); return { status: 200, json: { id: 12 } } } })
-    expect((await handleFleetRpc(tool('feed_post', { title: '一'.repeat(41), body: 'b' }), d)).result.isError).toBe(true)
     expect((await handleFleetRpc(tool('feed_post', { title: 't', body: 'b', touches: ['a', 'b', 'c', 'd', 'e', 'f'] }), d)).result.isError).toBe(true)
     expect(seen.length).toBe(0)
+    const cutR = await handleFleetRpc(tool('feed_post', { title: '一'.repeat(51), body: 'b' }),
+      deps({ core: async () => ({ status: 200, json: { id: 13, title_truncated: true } }) }).d)
+    expect(out(cutR)).toContain('標題超過 50 字，已截短')
     const t = out(await handleFleetRpc(tool('feed_post', { title: 'Epeius：牆上線', body: '全文', touches: ['fleet-core'], ref: 'WO-92', supersedes: '3' }), d))
     expect(t).toContain('已貼出 #12（取代 #3）')
     expect(t).toContain('不會通知任何人')

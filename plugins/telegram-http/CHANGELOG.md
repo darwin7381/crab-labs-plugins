@@ -6,6 +6,7 @@
   - if one agent must know, mail it (`send_mail`, no_reply);
   - no_reply is only for answering a call with a call.
 - **`send_mail` takes `op`** (OP-3, 3 or a slug). A mail about a task site lands in that op's timeline, like a tagged call (collab-board RULES §6). BTCC resolves it; an unknown op is stored untagged and the tool reports the warning. A reply inherits the original mail's op on the server side.
+- **Titles: the limit is 50, and a longer title is cut, never refused** (Joey TG chiron:1407: 「標題超過40個字不該擋來讓她還要浪費重寄／應該是直接截斷…提高到50字」). `send_mail`, `mailbox_reply` and `feed_post` no longer reject a long title in the daemon. The server (BTCC 68e2186 / Fleet Core ce3fa26) cuts it to 50 with 「…」, puts the full title on the body's first line, and answers `title_truncated`. The tool then says 「標題超過 50 字，已截短，完整標題在內容第一行」. Tool descriptions say 50.
 - Tests: `fleet-mail.test.ts`, 99/99 overall.
 
 ## 1.28.0 / agent-inbox 1.2.0 — 2026-11-15
