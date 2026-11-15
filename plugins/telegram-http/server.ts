@@ -1714,9 +1714,12 @@ const DUTY_CREDENTIAL = join(homedir(), '.config', 'mesh', 'duty-officer.credent
 let dutyOfficer: DutyOfficer | null = null
 if (isControlEnabled() || isRoamerEnabled()) {
   dutyOfficer = new DutyOfficer({
-    listTargets: async () => (await paneWatchTargets()).map(t => ({
-      ...t, projectsDir: isControlEnabled() && t.tmux === process.env.CHANNEL_BOT_TMUX_SESSION ? (process.env.CHANNEL_BOT_PROJECTS_DIR || null) : null,
-    })),
+    // paneWatchTargets labels this daemon's own pane 'channel-bot' (it predates the fleet); the duty officer names
+    // a pane by its tmux session (claude-aegis, daddy-claude …) in its log, in Joey's messages and in rulings
+    listTargets: async () => (await paneWatchTargets()).map(t => {
+      const own = isControlEnabled() && t.tmux === process.env.CHANNEL_BOT_TMUX_SESSION
+      return { ...t, label: own ? t.tmux : t.label, projectsDir: own ? (process.env.CHANNEL_BOT_PROJECTS_DIR || null) : null }
+    }),
     tmux: realTmux,
     model: askModelCli,
     recipients: () => opsRecipients(loadAccess()),

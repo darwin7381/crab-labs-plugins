@@ -1,3 +1,7 @@
+## 1.29.6 — 2026-11-16
+
+- Duty officer: a daemon's own pane is named by its tmux session (claude-aegis, daddy-claude …), not `channel-bot`. That name comes from `paneWatchTargets`, which predates the fleet. Before this, every agent's log lines, Joey's messages (「值班員・channel-bot」) and ruling titles said channel-bot. A test pane that was closed no longer logs `look_failed`.
+
 ## 1.29.5 — 2026-11-16
 
 - **Duty officer: hands off while a person is at the terminal** (Chiron btcc 9592).
