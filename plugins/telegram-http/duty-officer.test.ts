@@ -129,7 +129,7 @@ function rig(opts: { model?: (n: number) => ModelResult; enabled?: unknown; onKe
   writeFileSync(join(rules, 'aide_prompt.md'), 'SYSTEM')
   writeFileSync(join(rules, 'rulings.md'), 'RULINGS')
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ enabled: opts.enabled ?? ['claude-x'] }))
-  const pane = { pane: DIALOG, cmd: '2.1.322', inMode: false, path: '/nowhere' }
+  const pane = { pane: DIALOG, cmd: '2.1.322', inMode: false, path: '/nowhere', activity: null as number | null }
   const keys: string[] = []
   const sent: Array<{ chats: string[]; text: string; buttons: any }> = []
   const edits: Array<{ s: Sent; text: string }> = []
@@ -138,6 +138,7 @@ function rig(opts: { model?: (n: number) => ModelResult; enabled?: unknown; onKe
   let clock = T0
   const tmux: Tmux = {
     capture: async () => pane.pane,
+    clientActivity: async () => pane.activity,
     info: async (): Promise<PaneInfo> => ({ cmd: pane.cmd, inMode: pane.inMode, path: pane.path }),
     sendKey: async (_t, k) => { keys.push(k); opts.onKey?.(k, pane) },
     cancelMode: async () => { pane.inMode = false },
@@ -158,7 +159,7 @@ function rig(opts: { model?: (n: number) => ModelResult; enabled?: unknown; onKe
   const advance = async (ms: number) => { clock += ms; await o.tick(); await new Promise(r => setTimeout(r, 0)) }
   const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0)) }
   const log = () => readFileSync(join(dir, 'log.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
-  return { o, dir, pane, keys, sent, edits, mails, advance, settle, log, calls: () => calls }
+  return { o, dir, pane, keys, sent, edits, mails, advance, settle, log, calls: () => calls, clock: () => clock }
 }
 
 describe('officer', () => {
@@ -376,6 +377,44 @@ describe('officer', () => {
     expect(await r.o.onTap(r.sent[0].buttons[0][0].callback_data, 'Advac777')).toBe('值班員已經關掉，沒有按。')
     expect(r.keys).toEqual([])
     expect(r.mails).toEqual([])
+  })
+
+  test('someone at the terminal: nothing judged, pressed or sent; handled once nobody has typed for 120 s', async () => {
+    const r = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = IDLE } })
+    r.pane.activity = r.clock() - 10_000 // an attached client pressed a key 10 s ago
+    await r.advance(0)
+    await r.advance(9000)
+    await r.advance(3000)
+    await r.settle()
+    expect(r.calls()).toBe(0)
+    expect(r.keys).toEqual([])
+    expect(r.sent).toEqual([])
+    expect(r.log().filter(e => e.event === 'attended').length).toBe(1)
+    await r.advance(110_000) // 129 s since the last key: the person left, the menu is still up
+    await r.settle()
+    expect(r.calls()).toBe(1)
+    expect(r.keys).toEqual(['Enter'])
+  })
+
+  test('a person starts typing while the model is thinking: no key, no message', async () => {
+    const r = rig({ model: () => { r.pane.activity = r.clock(); return { decision: decision(), meta: {}, fail: null } } })
+    await r.advance(0)
+    await r.advance(9000)
+    await r.settle()
+    expect(r.calls()).toBe(1)
+    expect(r.keys).toEqual([])
+    expect(r.sent).toEqual([])
+    expect(r.log().find(e => e.event === 'attended').why).toBe('a person started typing while judging')
+  })
+
+  test("Joey's tap is his decision: a client at the terminal does not hold it back", async () => {
+    const r = rig({ model: () => ({ decision: decision({ action: 'ask_joey' }), meta: {}, fail: null }), onKey: (k, p) => { if (k === 'Enter') p.pane = IDLE } })
+    await r.advance(0)
+    await r.advance(9000)
+    await r.settle()
+    r.pane.activity = r.clock()
+    expect(await r.o.onTap(r.sent[0].buttons[0][0].callback_data, 'Advac777')).toBe('按了，畫面已經往下走')
+    expect(r.keys).toEqual(['Enter'])
   })
 
   test('checkDo', () => {

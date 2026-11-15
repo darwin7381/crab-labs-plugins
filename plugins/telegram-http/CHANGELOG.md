@@ -1,3 +1,12 @@
+## 1.29.5 — 2026-11-16
+
+- **Duty officer: hands off while a person is at the terminal** (Chiron btcc 9592).
+  - Joey types directly into the MBP's daddy-claude and opens agents' terminals from his phone. A menu he opened himself (/model, /resume, /config, /mcp), or one he is reading, would otherwise be judged after 8 s and pressed a dozen seconds later.
+  - The signal is `tmux list-clients -t <session> -F '#{client_activity}'`. It is the last key pressed through an attached client; keys sent with `send-keys -t` (ours, the supervisor's) do not move it.
+  - While a client has pressed a key within 120 s, nothing is judged, pressed or sent, and one `attended` line is logged. After 120 s with no key, the menu is handled as usual: the person left and it is stuck. 120 s is the same grace modal-guard gives the model-switch menu.
+  - Also re-checked after the model answers and right before pressing. Joey's tap on a Telegram button is not held back, because that is his decision.
+  - New `Tmux.clientActivity`; 3 new tests, 29 in `duty-officer.test.ts`.
+
 ## 1.29.4 — 2026-11-16
 
 - **Duty officer: switching it off now also stops a press that is already on its way** (stop-time review). The switch is re-read before judging, again after the model answers (no key, no message), and right before any key is pressed, Joey's tap included (toast: 「值班員已經關掉，沒有按。」). Before this, a judgement in flight when `enabled` was emptied still pressed its keys. That happened just as the claim lapsed and Chiron's interim loop took the pane back, so a pane could be handled twice. 2 new tests, 26 in `duty-officer.test.ts`.

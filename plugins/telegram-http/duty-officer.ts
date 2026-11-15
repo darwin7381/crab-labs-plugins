@@ -66,12 +66,15 @@ const SCRUB_ENV = ['CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSI
 export interface Limits {
   pollMs: number; stallMs: number; modelTimeoutMs: number; callsPerHour: number; callsPerTargetHour: number
   renotifyMs: number; maxChain: number; keyGapMs: number; verifyAfterMs: number; settleMaxMs: number
-  claimFreshMs: number
+  claimFreshMs: number; attendedMs: number
 }
 export const DEFAULT_LIMITS: Limits = {
   pollMs: 3000, stallMs: 8000, modelTimeoutMs: 60_000, callsPerHour: 30, callsPerTargetHour: 6,
   renotifyMs: 3_600_000, maxChain: 3, keyGapMs: 200, verifyAfterMs: 2000, settleMaxMs: 30_000,
   claimFreshMs: 30_000,
+  // someone at the terminal (a tmux client pressed a key this recently): hands off. Same grace as modal-guard's
+  // model-switch menu (ratelimit-modal-guard.sh :74); Chiron btcc 9592
+  attendedMs: 120_000,
 }
 
 // ---------------------------------------------------------------- screen
@@ -331,6 +334,9 @@ export function transcriptMtime(projectsDir: string | null | undefined): number 
 export interface PaneInfo { cmd: string; inMode: boolean; path: string }
 export interface Tmux {
   capture(target: string, scrollback?: number): Promise<string | null>
+  /** Last key pressed by any attached tmux client, epoch ms; null = nobody attached. Keys sent with
+   *  `send-keys -t` (ours, the supervisor's) do not move it; keys typed through a client do. */
+  clientActivity(target: string): Promise<number | null>
   info(target: string): Promise<PaneInfo | null>
   sendKey(target: string, key: string): Promise<void>
   cancelMode(target: string): Promise<void>
@@ -360,6 +366,11 @@ export const realTmux: Tmux = {
     const p = r.out.replace(/\n$/, '').split('\t')
     if (r.code !== 0 || p.length !== 3) return null
     return { cmd: p[0], inMode: p[1] === '1', path: p[2] }
+  },
+  async clientActivity(t) {
+    const r = await run(['tmux', '-u', 'list-clients', '-t', t, '-F', '#{client_activity}'])
+    const ts = r.out.split('\n').map(x => parseInt(x, 10)).filter(n => n > 0)
+    return r.code === 0 && ts.length ? Math.max(...ts) * 1000 : null
   },
   async sendKey(t, key) { await run(['tmux', '-u', 'send-keys', '-t', t, key]) },
   async cancelMode(t) { await run(['tmux', '-u', 'send-keys', '-t', t, '-X', 'cancel']) },
@@ -679,7 +690,7 @@ interface Config {
 }
 const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null, claude_cmds: [] }
 interface Rec { action: string; t: number; askId?: string; resolved?: boolean | null }
-interface PaneState { hash: string; state: State; since: number; rec: Rec | null }
+interface PaneState { hash: string; state: State; since: number; rec: Rec | null; attendedLogged?: boolean }
 interface Ask {
   id: string; tmux: string; label: string; host: string; hash: string; created: string; kind: 'ask_joey' | 'unreadable'; test?: boolean
   reason: string; text: string; options: Array<{ button: string; keys: string[] | null; means?: string }>
@@ -756,6 +767,11 @@ export class DutyOfficer {
     if (Object.prototype.hasOwnProperty.call(cfg.test_targets, tmux)) return true
     const label = this.labels.get(tmux)
     return cfg.enabled === '*' || cfg.enabled.includes(tmux) || (!!label && cfg.enabled.includes(label))
+  }
+  /** Someone is at that terminal: an attached tmux client pressed a key within attendedMs. */
+  async attended(tmux: string): Promise<number | null> {
+    const a = await this.d.tmux.clientActivity(tmux).catch(() => null)
+    return a != null && this.now() - a < this.L.attendedMs ? a : null
   }
   /** True when this daemon's duty officer is watching that pane (the old startup-picker steps aside). */
   handles(tmux: string): boolean { return this.enabledNow.has(tmux) }
@@ -893,6 +909,16 @@ export class DutyOfficer {
       return
     }
     if (!s.rec) {
+      // a person at the terminal (Joey on the MBP, or on his phone) may have opened this menu himself or be
+      // reading it: not a stall. Nothing is judged, pressed or sent; once nobody has typed for attendedMs, it is.
+      const who = await this.attended(t.tmux)
+      if (who != null) {
+        if (!s.attendedLogged) {
+          s.attendedLogged = true
+          this.event('attended', { agent: t.label, tmux: t.tmux, screen_hash: hash, last_key_s_ago: Math.round((now - who) / 1000), tail: lines })
+        }
+        return
+      }
       if (!hasHints(lines)) {
         const m = transcriptMtime(t.projectsDir ?? (lk.info.path ? projectDirOf(this.home, lk.info.path) : null))
         if (m != null && Date.now() - m < this.L.stallMs) return // the agent is still writing: not a stall yet
@@ -958,6 +984,11 @@ export class DutyOfficer {
       this.setRec(t.tmux, lk.hash, null)
       return
     }
+    if (await this.attended(t.tmux) != null) { // someone sat down while the model was thinking
+      this.event('attended', { agent: t.label, tmux: t.tmux, step, why: 'a person started typing while judging', screen_hash: lk.hash, action: res.decision?.action ?? null })
+      this.setRec(t.tmux, lk.hash, null)
+      return
+    }
     const base = { agent: t.label, tmux: t.tmux, step, seconds: res.meta.seconds, cost: res.meta.cost,
       since_appeared_s: Math.round((this.now() - appeared) / 100) / 10, screen_hash: lk.hash, rules_dir: rules.dir }
     if (res.fail || !res.decision) {
@@ -987,8 +1018,10 @@ export class DutyOfficer {
   }
 
   /** Press `keys` if the screen is still the one that was judged; returns the screen afterwards. */
-  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean): Promise<{ ok: false; now: Look; off?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number }> {
+  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean, byJoey = false): Promise<{ ok: false; now: Look; off?: boolean; attended?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number }> {
     if (!this.stillOn(tmux)) return { ok: false, now: null, off: true }
+    // Joey's tap on a button is his decision, not the duty officer's: a person at the terminal does not hold it back
+    if (!byJoey && await this.attended(tmux) != null) return { ok: false, now: null, attended: true }
     const before = await this.look(tmux)
     if (!before || before.hash !== hash) return { ok: false, now: before }
     if (dry) return { ok: true, after: before, leftMode: false, at: this.now() }
@@ -1009,6 +1042,11 @@ export class DutyOfficer {
     const base = { agent: t.label, tmux: t.tmux, step, choose: d.choose, keys, screen_hash: lk.hash }
     if (!r.ok && r.off) {
       this.event('aborted', { ...base, why: 'switched off before pressing' })
+      this.setRec(t.tmux, lk.hash, null)
+      return
+    }
+    if (!r.ok && r.attended) {
+      this.event('attended', { ...base, why: 'a person started typing before pressing' })
       this.setRec(t.tmux, lk.hash, null)
       return
     }
@@ -1175,7 +1213,7 @@ export class DutyOfficer {
     if (this.busy.has(a.tmux)) return '值班員正在處理這個畫面，幾秒後再按一次。'
     this.busy.add(a.tmux)
     try {
-      const r = await this.pressKeys(a.tmux, a.hash, opt.keys, false)
+      const r = await this.pressKeys(a.tmux, a.hash, opt.keys, false, true)
       let result: string
       let afterTail = ''
       if (!r.ok && r.off) {
