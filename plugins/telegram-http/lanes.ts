@@ -1953,6 +1953,7 @@ export function laneSlots(): number {
 function pump(): void {
   if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
   const slots = laneSlots()                               // 002l (D13)
+  sessScan = null                                         // 002l (S0 item 2): one /proc scan per pump pass
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
@@ -1961,6 +1962,7 @@ function pump(): void {
       D.log('info', `lanes: ${slots} slot(s) in use (cap ${MAX_RUNNING}${slots < MAX_RUNNING ? `, quota ${Math.round((quotaUsed() ?? 0) * 100)}%` : ''}) — ${it.ev.id} for ${it.lane} waits in queue`)
       break
     }
+    if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
     if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
       if (running.size > 0) return
       S.wall.probe_at = Date.now() + WALL_PROBE_MS; saveState()
@@ -2328,6 +2330,74 @@ export function sessionArgs(lane: Lane): { resume: boolean; args: string[] } {
   return { resume: false, args: ['--session-id', lane.session_id] }
 }
 
+// ------------------------------------------------------------------ 002l (S0 item 2): one live process per session id
+// design/stability 「重啟時接錯 session」 and docs/en/sessions (quoted there): 「同一個 session id 同時在兩個行程接回，紀錄會交錯，沒有鎖」. S0 measured it: two
+// processes resuming one id both run, no error, and the history silently forks (one branch is lost to every later resume). The CLI has no lock, so the
+// router keeps one: run/sid/<session id>.pid while a lane process runs on that id, and before it starts a run on an id it also looks for ANY live process
+// whose command line resumes or names that id (/proc; a process this daemon did not start, a run left by a previous daemon, a person's `claude --resume`).
+// A busy id is not started: the event stays queued and is tried again in LANES_SESSION_BUSY_RETRY_MS (5 s). A fork (--resume <main> --fork-session) is a new
+// id by construction and is not held back by the main's live process.
+const sidLock = (sid: string): string => join(LANES_DIR, 'run', 'sid', `${sid.replace(/[^A-Za-z0-9_.-]/g, '_')}.pid`)
+/** the session id a run of this lane would continue or create, and whether it is a fork (a new id) */
+function runSession(lane: Lane): { sid: string; fork: boolean } {
+  const { args } = sessionArgs(lane)
+  const fork = args.includes('--fork-session')
+  const i = args.indexOf('--resume'), j = args.indexOf('--session-id')
+  return { sid: i >= 0 ? args[i + 1] : j >= 0 ? args[j + 1] : lane.session_id, fork }
+}
+/** a live process (not this daemon) runs on session id `sid`, or null */
+export function sessionHolder(sid: string, cached = false): number | null {
+  if (!sid) return null
+  try {
+    const pid = Number(readFileSync(sidLock(sid), 'utf8').trim())
+    if (pid && pid !== process.pid && pidAlive(pid)) {
+      const cmd = (() => { try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { return spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }).stdout ?? '' } })()
+      if (cmd.includes(sid)) return pid
+    }
+  } catch {}
+  return liveSessions(cached).get(sid) ?? null
+}
+/** session id → pid of every live process whose command line resumes or names it. cached: the scan of this pump pass (pump clears it at its start) */
+let sessScan: { at: number; map: Map<string, number> } | null = null
+function liveSessions(cached: boolean): Map<string, number> {
+  if (cached && sessScan) return sessScan.map
+  const map = new Map<string, number>()
+  let pids: string[] = []
+  try { pids = readdirSync('/proc').filter(x => /^\d+$/.test(x)) } catch { pids = [] }
+  for (const p of pids) {
+    if (Number(p) === process.pid) continue
+    let argv: string[]
+    try { argv = readFileSync(`/proc/${p}/cmdline`, 'utf8').split('\0') } catch { continue }
+    if (argv.includes('--fork-session')) continue
+    for (let k = 0; k < argv.length; k++) {
+      const a = argv[k]
+      if ((a === '--resume' || a === '-r' || a === '--session-id') && argv[k + 1]) map.set(argv[k + 1], Number(p))
+      else if (a.startsWith('--resume=') || a.startsWith('--session-id=')) map.set(a.slice(a.indexOf('=') + 1), Number(p))
+    }
+  }
+  sessScan = { at: Date.now(), map }
+  return map
+}
+const SESSION_BUSY_RETRY_MS = (): number => num('LANES_SESSION_BUSY_RETRY_MS', 5_000)
+let busyRetry: ReturnType<typeof setTimeout> | null = null
+const busyNoted = new Map<string, number>()
+/** true = the run must not start now (its session id is live in another process); the event stays queued */
+function sessionBusy(it: QItem): boolean {
+  const lane = S.lanes[it.lane]
+  if (!lane) return false
+  const { sid, fork } = runSession(lane)
+  if (fork) return false
+  const holder = sessionHolder(sid, true)
+  if (holder == null) { busyNoted.delete(sid); return false }
+  if (busyNoted.get(sid) !== holder) {
+    busyNoted.set(sid, holder)
+    appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'session_busy', event: it.ev.id, session_id: sid, holder })
+    logos('lane.session_busy', { lane: lane.id, event: it.ev.id, session_id: sid, holder })
+    D.log('warn', `lanes: session ${sid} of ${lane.id} is live in process ${holder}: ${it.ev.id} waits (two processes on one id fork its history)`)
+  }
+  if (!busyRetry) { busyRetry = setTimeout(() => { busyRetry = null; pump() }, SESSION_BUSY_RETRY_MS()); (busyRetry as any).unref?.() }
+  return true
+}
 function startRun(it: QItem): void {
   const lane = S.lanes[it.lane]
   if (!lane) { it.state = 'failed'; saveQ(it); queue.delete(it.ev.id); return }
@@ -2363,6 +2433,8 @@ function startRun(it: QItem): void {
     ...laneAgentArgs(lane.kind).agents,                                  // 002k (K3): before the variadic --disallowedTools
     '--disallowedTools', 'AskUserQuestion', 'ExitPlanMode', ...laneAgentArgs(lane.kind).deny)
   const child = spawn(CLAUDE_BIN, args, { cwd: D.workspaceDir, env: laneEnv(lane), stdio: ['ignore', 'pipe', 'pipe'] })
+  const lockSid = sess.includes('--fork-session') ? '' : sess.includes('--resume') ? sess[sess.indexOf('--resume') + 1] : lane.session_id   // 002l (S0 item 2)
+  if (lockSid && child.pid) { try { mkdirSync(join(LANES_DIR, 'run', 'sid'), { recursive: true }); writeFileSync(sidLock(lockSid), String(child.pid)) } catch {} }
   it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
   const renew = setInterval(() => { it.lease_until = Date.now() + LEASE_MS; saveQ(it) }, 30_000)
   const limit = setTimeout(() => {
@@ -2442,6 +2514,7 @@ function startRun(it: QItem): void {
     clearInterval(renew)
     clearTimeout(limit)
     syncSteer(lane.id)                                                // 002k (E18): what the hook handed over is recorded while the run's entry still stands
+    if (lockSid) { try { if (readFileSync(sidLock(lockSid), 'utf8').trim() === String(child.pid)) rmSync(sidLock(lockSid)) } catch {} }   // 002l (S0 item 2)
     running.delete(lane.id)
     runTokens.delete(token)
     try { rmSync(mcpCfg) } catch {}
