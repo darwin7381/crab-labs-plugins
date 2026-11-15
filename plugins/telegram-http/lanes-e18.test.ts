@@ -23,8 +23,13 @@ def hook(script, payload):
     r = subprocess.run(['python3', H + '/' + script], input=json.dumps(payload), capture_output=True, text=True, env=os.environ)
     if r.stdout.strip():
         open(D + '/hook-out.jsonl', 'a').write(json.dumps({'script': script, 'out': json.loads(r.stdout)}) + '\\n')
+# a test that fails before it releases the run must not leave this process behind: it ends when the test process is gone, or after 120 s
+P0 = os.getppid(); T0 = time.time()
+open(D + '/pids', 'a').write(str(os.getpid()) + '\\n')
 while not os.path.exists(D + '/release'):
     time.sleep(0.12)
+    if os.getppid() != P0 or time.time() - T0 > 120:
+        sys.exit(1)
     if mode == 'tool':
         hook('lane-steer-hook.py', {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'session_id': 's1'})
 if mode == 'stop':
@@ -35,7 +40,15 @@ print('{"type":"result","subtype":"success","is_error":false,"result":"ok"}')
 `)
 chmodSync(bin, 0o755)
 const restore = L.__setClaudeBin(bin)
-afterAll(() => { L.__setClaudeBin(restore); delete process.env.LANES_STEER_MIDTURN })
+/** every fake lane process this file started (it writes its pid) that is still running: stopped, so a failed test leaves nothing behind */
+function killFakes(d: string): void {
+  let pids: number[] = []; try { pids = readFileSync(join(d, 'pids'), 'utf8').split('\n').map(Number).filter(n => n > 1) } catch {}
+  for (const pid of pids) {
+    let cmd = ''; try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { continue }   // gone already
+    if (cmd.includes(d)) try { process.kill(pid, 'SIGKILL') } catch {}                              // only ours (a pid can be reused)
+  }
+}
+afterAll(() => { try { writeFileSync(join(dir, 'release'), '1') } catch {}; killFakes(dir); L.__setClaudeBin(restore); delete process.env.LANES_STEER_MIDTURN })
 const sent: Array<{ text: string; silent: boolean; replyTo?: number; topic?: number }> = []
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve'],
   sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo, topic: o?.topic }); return 9900 + sent.length }, joeyChatId: () => '1' } as any)
@@ -247,7 +260,7 @@ test('E18: a message that was with a run when the daemon stopped is the lane\'s 
   const saved = process.env.LANES_DIR
   process.env.LANES_DIR = d2
   const L2 = await import('./lanes.ts?e18-restart') as typeof import('./lanes.ts')
-  const bin2 = join(d2, 'lane.sh'); writeFileSync(bin2, '#!/bin/sh\nsleep 30\n'); chmodSync(bin2, 0o755)
+  const bin2 = join(d2, 'lane.sh'); writeFileSync(bin2, `#!/bin/sh\necho $$ >> '${d2}/pids'\nexec python3 -c 'import time; time.sleep(30)' '${d2}'\n`); chmodSync(bin2, 0o755)
   const was = L2.__setClaudeBin(bin2)
   try {
     L2.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: d2, transcriptDir: d2, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => [], sendBot: async () => 1, joeyChatId: () => '1' } as any)
@@ -258,5 +271,5 @@ test('E18: a message that was with a run when the daemon stopped is the lane\'s 
     expect(existsSync(join(d2, 'run', 'steer', 'adam.worker.1.in.jsonl'))).toBe(false)
     const led = readFileSync(join(d2, 'ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
     expect(led.find(r => r.refs?.steer === 'requeued')?.text).toContain('daemon restarted')
-  } finally { L2.__setClaudeBin(was) }
+  } finally { L2.__setClaudeBin(was); killFakes(d2) }
 })

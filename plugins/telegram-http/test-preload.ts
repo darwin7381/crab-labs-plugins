@@ -15,3 +15,6 @@ globalThis.fetch = Object.assign((input: any, init?: any) => {
   if (/^https?:\/\/([^/]*\.)?typesafe\.ai(\/|:|$)/i.test(url)) return Promise.reject(new Error('test: the real TypeSafe API is not called from tests'))
   return realFetch(input, init)
 }, realFetch) as typeof fetch
+// - No test starts the real claude. A lane run that a test did not give its own fake binary (__setClaudeBin) to, or one that starts after the file put the
+//   real one back in its afterAll, runs test-fixtures/no-claude.sh instead: a failed run at once, no model call, no process left behind.
+process.env.LANES_CLAUDE_BIN ??= `${import.meta.dir}/test-fixtures/no-claude.sh`
