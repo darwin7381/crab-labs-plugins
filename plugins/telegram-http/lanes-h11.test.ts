@@ -21,11 +21,16 @@ import sys, json, time
 argv = sys.argv[1:]
 open('${dir}/argv.jsonl', 'a').write(json.dumps(argv) + '\\n')
 mode = open('${dir}/mode').read().strip()
-def msg(i, text, inp=90000, tool=False):
+def msg(i, text, inp=90000, tool=False, reads=0):
     c = [{'type': 'text', 'text': text}]
     if tool: c.append({'type': 'tool_use', 'id': 't%d' % i, 'name': 'Bash', 'input': {'command': 'curl-free read page %d' % i}})
-    print(json.dumps({'type': 'assistant', 'message': {'id': 'm%d' % i, 'content': c, 'usage': {'input_tokens': 10, 'cache_read_input_tokens': inp, 'cache_creation_input_tokens': 0, 'output_tokens': 5}}}), flush=True)
-if mode == 'loop':
+    # 002l (D7): the budget counts fresh tokens (input + cache writes + output); cache reads are given separately
+    print(json.dumps({'type': 'assistant', 'message': {'id': 'm%d' % i, 'content': c, 'usage': {'input_tokens': 10, 'cache_read_input_tokens': reads, 'cache_creation_input_tokens': inp, 'output_tokens': 5}}}), flush=True)
+if mode == 'reads':
+    for i in range(1, 6):
+        msg(i, 'fork call %d' % i, inp=1000, reads=620000, tool=True)
+    print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'done'}), flush=True)
+elif mode == 'loop':
     for i in range(1, 40):
         msg(i, '第 %d 頁讀完了，繼續下一頁' % i, tool=True)
         time.sleep(0.15)
@@ -61,12 +66,12 @@ test('H11: a run that reaches the thread budget in the run is stopped (SIGTERM),
   const s = stops('mesh-h1')[0]
   expect(s).toMatchObject({ kind: 'stop', notify_main: true, lane: d.lane, refs: { capped: 'budget', in_run: true, budget: 250000 } })
   expect(s.text).toContain('預算'); expect(s.text).toContain('250000'); expect(s.text).toContain('這一趟已經中止')
-  expect(s.text).toContain('中止前的結果：第 3 頁讀完了，繼續下一頁')                    // the last text of the run when it was stopped (3 x 90,010 >= 250,000)
+  expect(s.text).toContain('第 3 頁讀完了，繼續下一頁')                                   // the last text of the run when it was stopped (3 x 90,015 >= 250,000)
   expect(isWakeEntry(s)).toBe(true)                                                       // the main is woken
   const exit = rows('lanes.jsonl').find(r => r.kind === 'exit' && r.lane === d.lane)!
   expect(exit.signal).toBe('SIGTERM'); expect(exit.tokens_in).toBeGreaterThanOrEqual(250000); expect(exit.tokens_in).toBeLessThan(450000)   // stopped within a turn or two of the budget, not at 20 pages
   const th = st.threads[st.lanes[d.lane!].thread]
-  expect(th.tokens).toBe(exit.tokens_in)                                                  // the run's tokens are in the thread
+  expect(th.fresh).toBe(exit.tokens_fresh)                                                // the run's fresh tokens are in the thread (002l D7)
   await sleep(300)
   expect(spawns(d.lane!).length).toBe(1)                                                  // a stop is not a failure: no retry
   expect(rows('queue.jsonl').length).toBe(0)
@@ -77,12 +82,12 @@ test('H11: the tokens of the thread\'s earlier runs count: a thread already at 2
   const lane = st.lanes[d.lane!]
   await until(() => stops('mesh-h2').length === 1)
   const th = st.threads[lane.thread]
-  th.tokens = 0                                                                           // a thread that has spent 200k in earlier runs
+  th.fresh = 0                                                                            // a thread that has spent 200k in earlier runs
   const th2 = await L.routeEvent(ev('mesh-h3', { thread: lane.thread, hop: 2, reply_to_id: 'x', from: 'eve' }))
   expect(th2.target).toBe('lane')
   expect(await until(() => stops('mesh-h3').length === 1)).toBe(true)
   const after = rows('lanes.jsonl').filter(r => r.kind === 'exit' && r.event === 'mesh-h3').at(-1)!
-  expect(th.tokens).toBeGreaterThanOrEqual(250000)
+  expect(th.fresh).toBeGreaterThanOrEqual(250000)
   // now over budget: the NEXT event never starts a run (the router's own thread gate, which was there before) and the thread is stopped
   const n = spawns(d.lane!).length
   await L.routeEvent(ev('mesh-h4', { thread: lane.thread, hop: 3, reply_to_id: 'x' }))
@@ -131,4 +136,23 @@ test('H11: an ordinary run is not touched', async () => {
   const d = await L.routeEvent(ev('mesh-h8'))
   expect(await until(() => rows('lanes.jsonl').some(r => r.kind === 'exit' && r.lane === d.lane))).toBe(true)
   expect(stops('mesh-h8').length).toBe(0); expect(rows('lanes.jsonl').find(r => r.kind === 'exit' && r.lane === d.lane)!.signal).toBeNull()
+})
+
+test('002l D7: cache reads do not count against the thread budget: a fork-like run that re-reads 620k per call five times (3.1M of reads) is not stopped', async () => {
+  setMode('reads')
+  const d = await L.routeEvent(ev('mesh-h9'))
+  expect(d.target).toBe('lane')
+  expect(await until(() => rows('lanes.jsonl').some(r => r.kind === 'exit' && r.event === 'mesh-h9'))).toBe(true)
+  const exit = rows('lanes.jsonl').find(r => r.kind === 'exit' && r.event === 'mesh-h9')!
+  expect(exit.signal).toBeNull(); expect(exit.calls).toBe(5)
+  expect(exit.tokens_in).toBeGreaterThan(3_000_000)                                      // the input-side total is still recorded
+  expect(exit.tokens_fresh).toBe(5 * 1015)                                               // what the budget counts: 10 input + 1000 cache writes + 5 output per call
+  expect(stops('mesh-h9').length).toBe(0)
+  expect(st.threads[st.lanes[d.lane!].thread].fresh).toBe(5 * 1015)
+})
+
+test('002l D1/D7: freshTokens counts uncached input, cache writes and output, never cache reads', () => {
+  expect(L.freshTokens({ input_tokens: 3, cache_read_input_tokens: 600000, cache_creation_input_tokens: 21000, output_tokens: 400 })).toBe(21403)
+  expect(L.freshTokens({ cache_read_input_tokens: 9902 })).toBe(0)
+  expect(L.freshTokens(undefined)).toBe(0)
 })

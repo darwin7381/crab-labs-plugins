@@ -100,19 +100,33 @@ test('H14: the queue cap counts the peer\'s queued and running events, also for 
   await until(() => rows('lanes.jsonl').filter(x => x.kind === 'exit').length >= 8, 12000)
 })
 
-test('H14: the per-peer token budget over all the peer\'s threads (what its lane runs really spent) refuses new events', async () => {
+test('002l D1: there is no per-peer token budget (the design\'s budget is per conversation): a peer whose lanes re-read 600k still gets a lane for its next new conversation, whatever LANES_PEER_BUDGET says', async () => {
   writeFileSync(join(dir, 'mode'), 'tokens')
   process.env.LANES_PEER_BUDGET = '500000'
   const d1 = await L.routeEvent(ev('mesh-bgus-1', 'gus', '請讀完 docs 全部 20 頁'))
   expect(d1.target).toBe('lane')
   expect(await until(() => rows('lanes.jsonl').some(r => r.kind === 'exit' && r.event === 'mesh-bgus-1'))).toBe(true)
-  const d2 = await L.routeEvent(ev('mesh-bgus-2', 'gus', '再讀一遍'))                      // a new thread: the first run spent 600k against 500k
-  expect(d2.rule).toBe('peer-flood'); expect(d2.target).toBe('ledger')
-  expect(st.flood!.gus.episode!.reasons).toEqual({ budget: 1 })
-  expect(rows('ledger.jsonl').find(r => r.refs?.flag === 'peer-flood' && r.refs.peer === 'gus')!.refs.reason).toBe('budget')
-  expect(pushes(/流量管制〕gus/)[0].text).toContain('預算 500000')
-  delete process.env.LANES_PEER_BUDGET; writeFileSync(join(dir, 'mode'), 'sleep')
+  const d2 = await L.routeEvent(ev('mesh-bgus-2', 'gus', '再讀一遍'))                      // a new thread: the first run read 600k (cache reads), more than the old 500k peer budget
+  expect(d2.target).toBe('lane'); expect(d2.rule).not.toBe('peer-flood')
+  expect(st.flood?.gus?.episode).toBeUndefined()
+  expect(rows('ledger.jsonl').some(r => r.refs?.flag === 'peer-flood' && r.refs.peer === 'gus')).toBe(false)
+  delete process.env.LANES_PEER_BUDGET
+  await until(() => rows('lanes.jsonl').some(r => r.kind === 'exit' && r.event === 'mesh-bgus-2'))
+  writeFileSync(join(dir, 'mode'), 'sleep')
 })
+
+test('002l D1: the answer to a question WE asked (reply_to = our outbound message) is never flood-gated, even with the peer over its rate and queue limits', async () => {
+  process.env.LANES_PEER_NEW_PER_MIN = '1'; process.env.LANES_PEER_MAX_OPEN = '1'
+  const a = await L.routeEvent(ev('mesh-rgus-1', 'gus', '第一個新話題'))
+  expect(a.target).toBe('lane')
+  const b = await L.routeEvent(ev('mesh-rgus-2', 'gus', '第二個新話題'))                   // over the queue cap and the rate: gated
+  expect(b.rule).toBe('peer-flood')
+  st.outbound['77001'] = { owner: a.lane!, thread: st.lanes[a.lane!].thread }               // Adam asked gus something (msg 77001)
+  const c = await L.routeEvent(ev('mesh-rgus-3', 'gus', '回答你的問題：是 42', { reply_to_id: '77001' }))
+  expect(c.rule).not.toBe('peer-flood'); expect(c.target).toBe('lane'); expect(c.lane).toBe(a.lane)
+  delete process.env.LANES_PEER_NEW_PER_MIN; delete process.env.LANES_PEER_MAX_OPEN
+  await until(() => rows('lanes.jsonl').filter(r => r.kind === 'exit' && String(r.event).startsWith('mesh-rgus')).length >= 2, 12000)
+}, 20000)
 
 test('H14: the main\'s peer_hold: all of the peer\'s events are ledger-only (no lane, no reply, no push), it shows in the digest, it ends with one summary', async () => {
   const hold = (a: object) => L.callMainTool('peer_hold', a, 'mcp-main')

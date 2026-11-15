@@ -52,7 +52,12 @@ import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupAr
 
 const MAX_RUNNING = Number(process.env.LANES_MAX ?? 4)
 const LEASE_MS = Number(process.env.LANES_LEASE_MS ?? 120_000)
-const THREAD_BUDGET = Number(process.env.LANES_THREAD_BUDGET ?? 3_000_000)   // input-side tokens / thread
+// 002l (D1, D7): design/identity rule 6 「每個對話有轉手次數上限與 token 預算，超過就停、升級主線」: the budget is per conversation (thread) and counts the
+// tokens a thread's runs really cost: fresh input, cache writes and output (freshTokens). Cache reads are not counted: a fork carries the main's 600k context
+// by design and re-reads it on every call (design/stability 「省的來源是每件事的 context 變小」), and 002k's input-side count killed it after 4 calls.
+const THREAD_BUDGET = Number(process.env.LANES_THREAD_BUDGET ?? 1_000_000)   // fresh tokens / thread (freshTokens)
+/** 002l (D1, D7): the tokens of one API call that count against a budget: uncached input + cache creation + output. Never the cache reads. */
+export function freshTokens(u: any): number { return (Number(u?.input_tokens) || 0) + (Number(u?.cache_creation_input_tokens) || 0) + (Number(u?.output_tokens) || 0) }
 const RESUME_MAX_AGE_MS = Number(process.env.LANES_RESUME_MAX_AGE_MS ?? 24 * 3600_000)
 const MODEL = process.env.LANES_MODEL ?? 'claude-opus-5-5'
 let CLAUDE_BIN = process.env.LANES_CLAUDE_BIN ?? 'claude'
@@ -596,6 +601,8 @@ type Lane = {
   fork_from?: string
 }
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
+  /** 002l (D1, D7): fresh tokens (freshTokens) the thread's runs spent: what the thread budget counts. `tokens` stays the input-side total, for the record. */
+  fresh?: number
   ask_cls?: string                                                     // event class of the lane run that last asked a peer here
   /** 002k (C6): what the last receipt on this thread found (outcomeFingerprint): a follow-up run that finds the same ends the chain */
   fu_fp?: string
@@ -861,7 +868,7 @@ function threadGate(t: Thread | null, ev: InEvent): string | null {
   const hopIn = Math.max(ev.hop ?? 0, (t?.hops ?? 0) + 1)
   if (t) { t.hops = hopIn; t.last = nowIso() }
   if (hopIn > HOP_LIMIT) return `hop ${hopIn} > limit ${HOP_LIMIT}`
-  if (t && t.tokens >= THREAD_BUDGET) return `thread token budget ${t.tokens} ≥ ${THREAD_BUDGET}`
+  if (t && (t.fresh ?? 0) >= THREAD_BUDGET) return `thread token budget ${t.fresh} ≥ ${THREAD_BUDGET} (fresh tokens, cache reads not counted)`
   return null
 }
 // 002k (C5, 002j group C04): a thread stop used to leave the events already queued for that thread's lane: one of them still got a run
@@ -1045,8 +1052,11 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
 // ------------------------------------------------------------------ 002k (H14, H13): flood control and the peer hold
 // 002j group H (H06): one peer (Cain) sent 200 messages: 200 lanes, 61.8M tokens against a 1.5M budget, queue waits up to 834 s, Joey was never told, and the
 // main had told Joey it would not answer Cain while 192 lane replies went out anyway. In the router, before any model:
-//  - admission per peer: a token bucket of LANES_PEER_NEW_PER_MIN (5) NEW threads a minute, a cap of LANES_PEER_MAX_OPEN (8) on the peer's queued and running
-//    events, and a budget of LANES_PEER_BUDGET (1.5M) input-side tokens over LANES_PEER_BUDGET_WINDOW_MIN (60) minutes, summed over all the peer's threads;
+//  - admission per peer: a token bucket of LANES_PEER_NEW_PER_MIN (5) NEW threads a minute and a cap of LANES_PEER_MAX_OPEN (8) on the peer's queued and running
+//    events (the router's frequency limit, design/notify 「分流器同時管頻率上限與去重」). 002l (D1): there is no per-peer TOKEN budget any more. The design's
+//    budget is per conversation (identity rule 6 「每個對話有轉手次數上限與 token 預算」: the thread budget, THREAD_BUDGET); the 002k per-peer budget summed
+//    cache reads and a board work order charged to the peer, and blocked Eve's 4th ordinary message (A03, A05, C02-C07). LANES_PEER_BUDGET is no longer read.
+//    An answer to a question WE asked (reply_to = one of our outbound messages) is never gated (routing 「別的 agent 回覆某個對話 → 那個對話的主人」);
 //  - an event over a limit gets NO lane (so no backstop line either). It is merged into the flood episode of the peer: a `flag` ledger row and ONE push to Joey
 //    when the flood starts; when the peer has been quiet for LANES_FLOOD_QUIET_S (120 s) ONE ledger row `peer_flood <peer>` (count, window, first and last id,
 //    3 sample texts) and ONE silent summary to Joey (count, answered, ledger-only, tokens avoided). The peer gets at most one rate-limit reply per
@@ -1058,19 +1068,6 @@ const floodOn = (): boolean => process.env.LANES_FLOOD_CONTROL !== '0'
 const AUTOMATED_SENDERS = ['scheduler', 'alert-dispatcher', 'main']
 function isPeerEvent(ev: InEvent): boolean {
   return ev.source === 'mesh' && !ev.synthetic && !ev.fanout && !!ev.from && !AUTOMATED_SENDERS.includes(ev.from) && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())
-}
-function peerTokens(f: PeerFlood, now: number): number {
-  const win = num('LANES_PEER_BUDGET_WINDOW_MIN', 60) * 60_000
-  f.usage = f.usage.filter(([t]) => now - t < win)
-  return f.usage.reduce((a, [, n]) => a + n, 0)
-}
-/** a lane run of one of the peer's threads ended: its tokens count against the peer's budget */
-export const __noteFloodTokens = (peer: string, tokens: number): void => noteFloodTokens(peer, tokens)     // tests only
-function noteFloodTokens(peer: string, tokens: number): void {
-  if (!peer || !tokens) return
-  S.flood ??= {}
-  const f = (S.flood[peer] ??= { bucket: num('LANES_PEER_NEW_PER_MIN', 5), bucket_at: Date.now(), usage: [] })
-  f.usage.push([Date.now(), tokens]); peerTokens(f, Date.now())
 }
 const tokensPerEvent = (peer: string): number => {
   let tok = 0, runs = 0
@@ -1115,14 +1112,15 @@ function peerGate(ev: InEvent): { rule: string; note: string } | null {
     }
   }
   if (!floodOn()) return null
+  if (ev.reply_to_id && S.outbound[ev.reply_to_id]) return null        // 002l (D1): the answer to our own question goes to the asker, never gated (C02)
   S.flood ??= {}
-  const perMin = num('LANES_PEER_NEW_PER_MIN', 5), maxOpen = num('LANES_PEER_MAX_OPEN', 8), budget = num('LANES_PEER_BUDGET', 1_500_000)
+  const perMin = num('LANES_PEER_NEW_PER_MIN', 5), maxOpen = num('LANES_PEER_MAX_OPEN', 8)
   const f = (S.flood[peer] ??= { bucket: perMin, bucket_at: now, usage: [] })
+  if (f.usage?.length) f.usage = []                                   // 002l (D1): the old per-peer token tally is not used any more
   f.bucket = Math.min(perMin, f.bucket + ((now - f.bucket_at) / 60_000) * perMin); f.bucket_at = now
   const open = [...queue.values()].filter(i => (i.state === 'queued' || i.state === 'leased') && i.ev.source === 'mesh' && String(i.ev.from).toLowerCase() === peer).length
   const newThread = !threadOwnerFor(ev)
-  const used = peerTokens(f, now)
-  const reason = open >= maxOpen ? 'queue' : used >= budget ? 'budget' : newThread && f.bucket < 1 ? 'rate' : null
+  const reason = open >= maxOpen ? 'queue' : newThread && f.bucket < 1 ? 'rate' : null
   const ep = f.episode
   if (!reason) {
     if (newThread) f.bucket -= 1
@@ -1130,13 +1128,13 @@ function peerGate(ev: InEvent): { rule: string; note: string } | null {
     if (ep) { ep.answered++; ep.last_at = now }
     return null
   }
-  const limit = reason === 'queue' ? `同時排隊與執行的事件已有 ${open} 件（上限 ${maxOpen}）` : reason === 'budget' ? `這個同事的車道在最近 ${num('LANES_PEER_BUDGET_WINDOW_MIN', 60)} 分鐘用了 ${used} token（預算 ${budget}）` : `每分鐘新開的對話超過 ${perMin} 個`
+  const limit = reason === 'queue' ? `同時排隊與執行的事件已有 ${open} 件（上限 ${maxOpen}）` : `每分鐘新開的對話超過 ${perMin} 個`
   let e = f.episode
   if (!e) {
     e = f.episode = { start: nowIso(), last_at: now, count: 0, first: ev.id, last: ev.id, samples: [], answered: (f.admits ?? []).filter(t => now - t < 60_000).length, reasons: {}, replied_at: 0 }   // answered: the burst's events that did get a lane
     const text = `〔流量管制〕${peer} 在短時間內送來太多訊息（${limit}）。之後超過的訊息不再開車道，只合併記進帳本；它安靜下來之後我再給你一則摘要。`
     ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'action', notify_main: false, text: `peer_flood ${peer} 開始：${limit}`, refs: { flag: 'peer-flood', peer, phase: 'start', reason } })
-    logos('lane.peer_flood', { peer, phase: 'start', reason, open, used })
+    logos('lane.peer_flood', { peer, phase: 'start', reason, open })
     void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'peer-flood', message_id: id }))
   }
   e.count++; e.last = ev.id; e.last_at = now; e.reasons[reason] = (e.reasons[reason] ?? 0) + 1; sampleOf(e.samples, ev)
@@ -2125,10 +2123,10 @@ function startRun(it: QItem): void {
   const lane = S.lanes[it.lane]
   if (!lane) { it.state = 'failed'; saveQ(it); queue.delete(it.ev.id); return }
   const th = S.threads[lane.thread]
-  if (th && th.tokens >= THREAD_BUDGET) {
+  if (th && (th.fresh ?? 0) >= THREAD_BUDGET) {
     it.state = 'done'; saveQ(it); queue.delete(it.ev.id)
     ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', notify_main: true,
-      text: `thread ${lane.thread} 已用 ${th.tokens} token，超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。` })
+      text: `thread ${lane.thread} 已用 ${th.fresh} token（新的輸入、快取寫入與輸出；快取重讀不算），超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。` })
     return
   }
   if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
@@ -2172,7 +2170,7 @@ function startRun(it: QItem): void {
   logos('lane.spawn', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript, pid: child.pid, resume, attempt: it.attempts })
   D.log('info', `lanes: spawn ${runId} pid=${child.pid} ${resume ? 'resume' : 'new'} session=${lane.session_id} event=${it.ev.id}`)
 
-  const usage = new Map<string, { in: number; out: number }>()
+  const usage = new Map<string, { in: number; out: number; fresh: number }>()
   const tools: Array<{ name: string; input: any }> = []
   let result = '', sessionSeen = '', buf = ''
   let walled: { kind: string; text: string } | null = null
@@ -2189,15 +2187,15 @@ function startRun(it: QItem): void {
       if (j.type === 'system' && j.subtype === 'init' && j.session_id) sessionSeen = j.session_id
       if (j.type === 'assistant' && j.message) {
         const u = j.message.usage ?? {}
-        usage.set(j.message.id ?? `m${usage.size}`, { in: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), out: u.output_tokens ?? 0 })
+        usage.set(j.message.id ?? `m${usage.size}`, { in: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), out: u.output_tokens ?? 0, fresh: freshTokens(u) })
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') tools.push({ name: c.name, input: c.input })
           else if (c?.type === 'text' && String(c.text ?? '').trim()) lastText = String(c.text)
         }
         if (!budgetStop && THREAD_BUDGET > 0) {                          // 002k (H11): the budget is checked after every assistant turn, not only before the run
           let sofar = 0
-          for (const u2 of usage.values()) sofar += u2.in
-          const total = (S.threads[lane.thread]?.tokens ?? 0) + sofar
+          for (const u2 of usage.values()) sofar += u2.fresh              // 002l (D7): fresh tokens only; the cache reads of a fork's context are not spent again
+          const total = (S.threads[lane.thread]?.fresh ?? 0) + sofar
           if (total >= THREAD_BUDGET) { budgetStop = { total, at: Date.now() }; try { child.kill('SIGTERM') } catch {} }
         }
       }
@@ -2213,8 +2211,8 @@ function startRun(it: QItem): void {
     runTokens.delete(token)
     try { rmSync(mcpCfg) } catch {}
     const steerLeft = settleSteering(lane)                            // 002k (E18): what it did not hand over is queued below, after the run's own bookkeeping
-    let tin = 0, tout = 0
-    for (const u of usage.values()) { tin += u.in; tout += u.out }
+    let tin = 0, tout = 0, tfresh = 0
+    for (const u of usage.values()) { tin += u.in; tout += u.out; tfresh += u.fresh }
     if (lane.kind === 'fork' && lane.runs === 0 && sessionSeen) {
       lane.session_id = sessionSeen; lane.transcript = join(D.transcriptDir, `${sessionSeen}.jsonl`)
     }
@@ -2223,8 +2221,7 @@ function startRun(it: QItem): void {
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     queueSteering(lane, steerLeft, signal ? `was stopped (${signal})` : `ended (exit ${code})`)
-    if (S.threads[lane.thread]) S.threads[lane.thread].tokens += tin
-    noteFloodTokens(S.threads[lane.thread]?.peer ?? '', tin)         // 002k (H14): the peer's budget
+    if (S.threads[lane.thread]) { S.threads[lane.thread].tokens += tin; S.threads[lane.thread].fresh = (S.threads[lane.thread].fresh ?? 0) + tfresh }   // 002l (D1, D7): the budget counts tfresh
     releaseClaims(lane.id, 'run ended')
     const names = tools.map(t => t.name.replace(/^mcp__lane__/, 'lane:'))
     const closers = tools.filter(t => ['mcp__lane__reply_agent', 'mcp__lane__receipt', 'mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main',
@@ -2233,7 +2230,7 @@ function startRun(it: QItem): void {
     const ok = code === 0 && !signal
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: runId, event: it.ev.id, session_id: lane.session_id,
       transcript: lane.transcript, exit_code: code, signal, duration_s: Math.round((Date.now() - started) / 100) / 10,
-      calls: usage.size, tokens_in: tin, tokens_out: tout, tools: names, closers })
+      calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers })
     logos('lane.exit', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
       exit_code: code, signal, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
     D.log('info', `lanes: exit ${runId} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
@@ -2253,13 +2250,13 @@ function startRun(it: QItem): void {
       const partial = (lastText || result || `（還沒有文字結果；用過 ${[...new Set(names)].join('、') || '沒有工具'}）`).replace(/\s+/g, ' ').trim().slice(0, 600)
       const th2 = S.threads[lane.thread]
       const why = capped === 'budget'
-        ? `預算：thread ${lane.thread} 在這一趟的途中用到 ${budgetStop!.total} token，達到預算 ${THREAD_BUDGET}，這一趟已經中止（${usage.size} 次呼叫之後）。`
+        ? `預算：thread ${lane.thread} 在這一趟的途中用到 ${budgetStop!.total} token（新的輸入、快取寫入與輸出；快取重讀不算），達到預算 ${THREAD_BUDGET}，這一趟已經中止（${usage.size} 次呼叫之後）。`
         : capped === 'usd' ? `預算：這一趟花到單趟的金額上限（--max-budget-usd ${laneMaxUsd(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
         : `這一趟到了回合上限（--max-turns ${laneMaxTurns(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', notify_main: true,
         text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}`,
-        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, thread_tokens: th2?.tokens ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
-      logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, thread_tokens: th2?.tokens ?? null, budget: THREAD_BUDGET })
+        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
+      logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET })
       D.log('warn', `lanes: ${runId} stopped (${capped}): ${why}`)
       if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊被中止：${capped === 'turns' ? '回合上限' : '預算'}；結果到中止為止：${partial}）`)
       saveState()
