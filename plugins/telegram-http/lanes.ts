@@ -646,6 +646,7 @@ type State = {
   flood?: Record<string, PeerFlood>                                    // 002k (H14): per-peer admission state, by peer name
   holds?: Record<string, PeerHold>                                     // 002k (H14): peers whose events are ledger-only (by the main or by Joey)
   steering?: Record<string, SteerRec[]>                                // 002k (E18): Joey's messages handed to a running run, not yet seen delivered (lane id → list)
+  inbound?: Record<string, { peer: string; thread: string | null; at: string }>   // 002l (D4): a peer's mesh message (btcc id) → the conversation it was routed into
 }
 /** 002k (E18): a message of Joey's handed to the run in progress (run/steer/<lane>.in.jsonl) and what is known of it: when (ms, the daemon's clock) and for which run */
 type SteerRec = { ev: InEvent; sent: number; run: string }
@@ -797,6 +798,17 @@ function matches(r: Rule, ev: InEvent, cfg: RouterCfg): boolean {
   return true
 }
 
+/** 002l (D4): which conversation a peer's message went into (by its btcc id), so that a later main send that quotes it is filed there */
+function noteInbound(ev: InEvent, d: Decision): void {
+  if (D.role !== 'tg' || !S || ev.source !== 'mesh' || !ev.btcc_msg_id || ev.synthetic) return
+  const thread = d.lane ? S.lanes[d.lane]?.thread ?? null : ev.thread && S.threads[ev.thread] ? ev.thread
+    : ev.reply_to_id && S.outbound[ev.reply_to_id] ? S.outbound[ev.reply_to_id].thread : null
+  S.inbound ??= {}
+  S.inbound[String(ev.btcc_msg_id)] = { peer: String(ev.from ?? '').toLowerCase(), thread, at: nowIso() }
+  const keys = Object.keys(S.inbound)
+  if (keys.length > 3000) for (const k of keys.slice(0, keys.length - 2000)) delete S.inbound[k]
+  saveState()
+}
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
   const cfg = routerCfg()
@@ -810,6 +822,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
     D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=master-off → main`)
     if (!wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
+    noteInbound(ev, d)
     return d
   }
   // 002k (H14, H13): the peer's hold and the flood gate come first: before the rules, before any Jev screen, with no model. An event over the limit gets no lane.
@@ -820,6 +833,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
         class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null })
       logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: g.rule, target: 'ledger', lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
       D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${g.rule} → ledger — ${g.note}`)
+      noteInbound(ev, { rule: g.rule, target: 'ledger' })
       return { rule: g.rule, target: 'ledger', note: g.note }
     }
   }
@@ -884,7 +898,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     if (asked) triageRecord(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier }, asked)
     else void triageShadow(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier })
   }
-  if (D.role === 'tg' && S) noteAdmitted(ev, d)
+  if (D.role === 'tg' && S) { noteAdmitted(ev, d); noteInbound(ev, d) }
   // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it
   if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
   return d
@@ -3871,9 +3885,28 @@ const MAIN_COMMIT_DEDUPE_MS = 180_000
 /** The thread a main-to-peer message belongs to, taken from the peer's OPEN request or promise (the send itself carries thread null):
  *  the thread of the newest open promise the router made to that peer; else of the newest work handed to the main from that peer's
  *  thread; else the peer's newest live thread. */
-export function peerThread(peer: string, sendThread?: string | null): { thread: string | null; from: string } {
+export function peerThread(peer: string, sendThread?: string | null, replyTo?: string | number | null): { thread: string | null; from: string } {
   if (sendThread) return { thread: sendThread, from: 'send' }
   const p = String(peer ?? '').toLowerCase()
+  // 002l (D4): identity rule 5 「承諾必入帳…主線下一次摘要一定看到」: a main send that quotes a message (reply_to) answers THAT message, so its commitment is filed
+  // on that message's conversation. 002k ignored reply_to and took the peer's newest live thread: C07's promise to Eve (reply_to a flood-blocked message
+  // that had no thread) was filed on WO-27's thread. A quoted message that has no conversation of its own gets a new one, owned by the main; the newest
+  // live thread is never guessed when the send says what it answers.
+  const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
+  if (rt) {
+    const inb = S?.inbound?.[rt]
+    if (inb?.thread) return { thread: inb.thread, from: 'reply_to' }
+    const pr = Object.values(S?.promises ?? {}).find(x => x.peer === p && (x.req === rt || x.sent === rt) && x.thread)
+    if (pr) return { thread: pr.thread, from: 'reply_to-promise' }
+    const out = S?.outbound?.[rt]
+    if (out?.thread) return { thread: out.thread, from: 'reply_to-outbound' }
+    if (!S) return { thread: null, from: 'none' }
+    const t = ensureThread(newThreadId(), 'main', p, 1)
+    if (inb) inb.thread = t.id
+    else { S.inbound ??= {}; S.inbound[rt] = { peer: p, thread: t.id, at: nowIso() } }
+    saveState()
+    return { thread: t.id, from: 'reply_to-new' }
+  }
   const promise = Object.values(S?.promises ?? {}).filter(x => x.peer === p && x.state !== 'kept' && x.thread).sort((a, b) => b.created - a.created)[0]
   if (promise) return { thread: promise.thread, from: 'promise' }
   const handoff = Object.values(S?.handoffs ?? {}).filter(h => h.thread && S.threads[h.thread]?.peer === p).sort((a, b) => b.created - a.created)[0]
@@ -3931,9 +3964,10 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       if (b.thread) { const t = ensureThread(String(b.thread), 'main', null, 0); if (b.hop) t.hops = Math.max(t.hops, Number(b.hop)) }
       // 002e: what the main itself tells another agent is part of the day's activity (002d: only the lanes' sends were)
       if (String(b.owner ?? 'main') === 'main' && b.to && b.text) {
-        ledger({ lane: 'main', thread: b.thread ?? null, event: `main-send-${b.msgId}`, kind: 'action', notify_main: false,
-          text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId } })
-        const where = peerThread(String(b.to), b.thread ?? null)   // 002k (C1): before mainSentTo closes the promise this send answers
+        const where = peerThread(String(b.to), b.thread ?? null, b.reply_to ?? null)   // 002k (C1): before mainSentTo closes the promise this send answers; 002l (D4): the quoted message's conversation
+        if (where.thread && !b.thread && where.from.startsWith('reply_to')) S.outbound[String(b.msgId)] = { owner: 'main', thread: where.thread }
+        ledger({ lane: 'main', thread: b.thread ?? (where.from.startsWith('reply_to') ? where.thread : null), event: `main-send-${b.msgId}`, kind: 'action', notify_main: false,
+          text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId, ...(b.reply_to != null ? { reply_to: String(b.reply_to) } : {}) } })
         void mainSentTo(String(b.to), b.thread ?? null, b.reply_to ?? null, String(b.text))   // 002j: a promise the router made in the main's name is kept (002k C4: only the ones this answers)
         void mainCommitmentCheck({ msgId: b.msgId, to: String(b.to), text: String(b.text), thread: where })   // 002k (C1): not awaited: the send is long done
       }
