@@ -417,6 +417,30 @@ describe('officer', () => {
     expect(r.keys).toEqual(['Enter'])
   })
 
+  test('a safeguards refusal is retried once with the fallback model; with none set, Joey gets the raw screen', async () => {
+    const models: Array<string | undefined> = []
+    const refused = { decision: null, meta: { refused: true, model: 'claude-opus-5-5' }, fail: "refused by claude-opus-5-5's safeguards" }
+    const r = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = IDLE } })
+    ;(r.o as any).d.model = async (_b: any, _p: any, _t: any, m?: string) => { models.push(m); return m ? { decision: decision(), meta: { model: m }, fail: null } : refused }
+    await r.advance(0)
+    await r.advance(9000)
+    await r.settle()
+    expect(models).toEqual([undefined, 'claude-sonnet-5-5'])
+    expect(r.keys).toEqual(['Enter'])
+    expect(r.log().find(e => e.event === 'model_refused').retry_with).toBe('claude-sonnet-5-5')
+
+    const r2 = rig()
+    writeFileSync(join(r2.dir, 'config.json'), JSON.stringify({ enabled: ['claude-x'], fallback_model: null }))
+    const models2: Array<string | undefined> = []
+    ;(r2.o as any).d.model = async (_b: any, _p: any, _t: any, m?: string) => { models2.push(m); return refused }
+    await r2.advance(0)
+    await r2.advance(9000)
+    await r2.settle()
+    expect(models2).toEqual([undefined])
+    expect(r2.keys).toEqual([])
+    expect(r2.sent[0].text).toContain('safeguards')
+  })
+
   test('checkDo', () => {
     expect(checkDo(decision())).toEqual({ keys: ['Enter'] })
     expect(checkDo(decision({ choose: 'Maybe' }))).toEqual({ bad: "choose matches no option's button" })

@@ -41,6 +41,9 @@ import { join } from 'node:path'
 
 // ---------------------------------------------------------------- constants (Chiron's interim values)
 export const MODEL = 'claude-opus-5-5'
+// used only when MODEL refuses a judgement on its safeguards (an AUP false flag: Opus 5.5 refused a permission
+// prompt to `rm -rf` its own scratch dir at 23:01Z that it had judged fine four times earlier). config: fallback_model
+export const FALLBACK_MODEL = 'claude-sonnet-5-5'
 export const EFFORT = 'low'
 export const KEYMAP: Readonly<Record<string, string>> = {
   Up: 'Up', Down: 'Down', Left: 'Left', Right: 'Right', Enter: 'Enter', Esc: 'Escape', Tab: 'Tab', Space: 'Space',
@@ -560,14 +563,14 @@ export function claudeBin(home = homedir()): string {
   const p = join(home, '.local', 'bin', 'claude')
   return existsSync(p) ? p : 'claude'
 }
-export function modelArgs(systemPrompt: string): string[] {
-  return ['-p', '--model', MODEL, '--tools', '', '--system-prompt', systemPrompt, '--output-format', 'json',
+export function modelArgs(systemPrompt: string, model = MODEL): string[] {
+  return ['-p', '--model', model, '--tools', '', '--system-prompt', systemPrompt, '--output-format', 'json',
     '--safe-mode', '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence',
     '--max-budget-usd', '5', '--effort', EFFORT, '--json-schema', JSON.stringify(SCHEMA)]
 }
 
 /** One headless `claude -p` from a fresh empty directory; the bundle goes on stdin. */
-export function askModelCli(bundle: Record<string, unknown>, systemPrompt: string, timeoutMs: number): Promise<ModelResult> {
+export function askModelCli(bundle: Record<string, unknown>, systemPrompt: string, timeoutMs: number, model = MODEL): Promise<ModelResult> {
   const sent = Object.fromEntries(Object.entries(bundle).filter(([k]) => !k.startsWith('_')))
   const env: Record<string, string> = {}
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !SCRUB_ENV.includes(k)) env[k] = v
@@ -588,7 +591,7 @@ export function askModelCli(bundle: Record<string, unknown>, systemPrompt: strin
     }
     let p: ReturnType<typeof spawn>
     try {
-      p = spawn(claudeBin(), modelArgs(systemPrompt), { cwd: scratch, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] })
+      p = spawn(claudeBin(), modelArgs(systemPrompt, model), { cwd: scratch, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] })
     } catch (e) {
       resolve({ decision: null, meta: {}, fail: `could not run claude: ${String(e).slice(0, 120)}` })
       return
@@ -601,7 +604,7 @@ export function askModelCli(bundle: Record<string, unknown>, systemPrompt: strin
     p.stderr?.on('data', (c: Buffer) => { err += c.toString() })
     p.on('error', e => finish({ decision: null, meta: {}, fail: `could not run claude: ${String(e).slice(0, 120)}` }))
     p.on('close', code => { // 'close': all of stdout has been read
-      const meta: Record<string, unknown> = { returncode: code }
+      const meta: Record<string, unknown> = { returncode: code, model }
       let envl: any
       try { envl = JSON.parse(out) } catch {
         meta.stderr_head = redact(err.slice(0, 300))
@@ -616,6 +619,11 @@ export function askModelCli(bundle: Record<string, unknown>, systemPrompt: strin
       meta.json_how = how
       if (!validDecision(d)) {
         meta.result_head = redact(String(envl.result).slice(0, 300))
+        if (envl.is_error && /safeguards|usage polic|legal\/aup/i.test(String(envl.result))) {
+          meta.refused = true
+          finish({ decision: null, meta, fail: `refused by ${model}'s safeguards` })
+          return
+        }
         finish({ decision: null, meta, fail: 'invalid JSON from the duty officer' })
         return
       }
@@ -667,7 +675,7 @@ export interface Sent { chat: string; msg: number }
 export interface OfficerDeps {
   listTargets(): Promise<Target[]>
   tmux: Tmux
-  model(bundle: Record<string, unknown>, systemPrompt: string, timeoutMs: number): Promise<ModelResult>
+  model(bundle: Record<string, unknown>, systemPrompt: string, timeoutMs: number, model?: string): Promise<ModelResult>
   send(chats: string[], text: string, buttons: Button[][] | null): Promise<Sent[]>
   edit(s: Sent, text: string): Promise<void>
   /** `to` is set only for a test target (config test_rulings_to); otherwise the daemon's rulings recipient. */
@@ -687,8 +695,10 @@ interface Config {
   test_targets: Record<string, string>; test_recipients: string[]; test_rulings_to: string | null
   // extra foreground commands that count as Claude Code (fake_dialog.py runs as python: its idle footer is idle)
   claude_cmds: string[]
+  // model asked when MODEL refuses on its safeguards; null = no second try (Joey gets the raw screen)
+  fallback_model: string | null
 }
-const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null, claude_cmds: [] }
+const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null, claude_cmds: [], fallback_model: FALLBACK_MODEL }
 interface Rec { action: string; t: number; askId?: string; resolved?: boolean | null }
 interface PaneState { hash: string; state: State; since: number; rec: Rec | null; attendedLogged?: boolean }
 interface Ask {
@@ -750,6 +760,8 @@ export class DutyOfficer {
             test_recipients: Array.isArray(j.test_recipients) ? j.test_recipients.map(String) : [],
             test_rulings_to: typeof j.test_rulings_to === 'string' && j.test_rulings_to.trim() ? j.test_rulings_to.trim() : null,
             claude_cmds: Array.isArray(j.claude_cmds) ? j.claude_cmds.map(String) : [],
+            fallback_model: j.fallback_model === null || j.fallback_model === '' ? null
+              : typeof j.fallback_model === 'string' ? j.fallback_model : FALLBACK_MODEL,
           }
         } catch (e) { this.d.log('warn', `duty-officer: config.json unreadable (${String(e).slice(0, 80)}) — off`) }
       }
@@ -979,7 +991,13 @@ export class DutyOfficer {
       await this.rawAsk(t, lk, 'over the hourly budget', bundle)
       return
     }
-    const res = await this.d.model(bundle, rules.prompt, this.L.modelTimeoutMs)
+    let res = await this.d.model(bundle, rules.prompt, this.L.modelTimeoutMs)
+    const fb = this.config().fallback_model
+    if (res.meta.refused && fb && this.stillOn(t.tmux)) {
+      this.event('model_refused', { agent: t.label, tmux: t.tmux, step, model: res.meta.model ?? MODEL, retry_with: fb, result_head: res.meta.result_head })
+      if (this.budgetOk(t.tmux)) res = await this.d.model(bundle, rules.prompt, this.L.modelTimeoutMs, fb)
+      else res = { decision: null, meta: { ...res.meta }, fail: `${res.fail}; no budget left for ${fb}` }
+    }
     if (!this.stillOn(t.tmux)) { // switched off while the model was thinking: no key, no message
       this.event('aborted', { agent: t.label, tmux: t.tmux, step, why: 'switched off while judging', screen_hash: lk.hash, action: res.decision?.action ?? null })
       this.setRec(t.tmux, lk.hash, null)

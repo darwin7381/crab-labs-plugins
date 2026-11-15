@@ -1,3 +1,11 @@
+## 1.29.7 — 2026-11-16
+
+- **Duty officer: a safeguards refusal is retried once with Sonnet 5.5.**
+  - At 23:01Z and 23:02Z Opus 5.5 refused two judgements with "safeguards flagged this session (AUP)". Both were permission prompts for `rm -rf` of the agent's own scratch directory. Opus had judged the same prompt fine four times earlier, and accepted it again at 23:04Z, so the flag is intermittent.
+  - Permission prompts with `rm` are exactly the ones Claude Code shows. A refusal left Joey with a raw screen instead of a judgement.
+  - Now a refusal (`is_error` plus a safeguards/AUP message) is logged as `model_refused` and asked once more of `fallback_model` (default `claude-sonnet-5-5`; `null` in config.json turns this off). The retry counts against the same budget. If it fails too, Joey gets the raw screen as before.
+  - `askModelCli` takes the model. 1 new test, 30 in `duty-officer.test.ts`.
+
 ## 1.29.6 — 2026-11-16
 
 - Duty officer: a daemon's own pane is named by its tmux session (claude-aegis, daddy-claude …), not `channel-bot`. That name comes from `paneWatchTargets`, which predates the fleet. Before this, every agent's log lines, Joey's messages (「值班員・channel-bot」) and ruling titles said channel-bot. A test pane that was closed no longer logs `look_failed`. (d72ef4a, pushed with a syntax error, never deployed: a `//` comment put mid-line cut off the rest of it; my commit chain did not stop on the failing test. Fixed in the next commit, which only went out after every test file passed and `bun build` succeeded.)
