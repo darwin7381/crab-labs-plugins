@@ -50,9 +50,22 @@ test('B12: the B08 burst of twelve repeats opens ONE lane; eleven "repeat n of <
   expect(await until(() => exits() >= 1)).toBe(true)
   await sleep(300)
   expect(rows('lanes.jsonl').filter(r => r.kind === 'spawn').length).toBe(1)          // one process for twelve alerts
-  // the lane has ended, no follow-up: a repeat within the window is still a repeat (12th and beyond), no new lane
+  // the lane has ended, no follow-up: a repeat within the window opens no new lane. 002l (RV1 alertRepeat): it is not parked unseen either: the owner lane runs
+  // again on its own thread, with this repeat and the eleven parked while it ran
+  const before = prompts().length
   const d13 = await L.routeEvent(alert('mesh-b13', burst(13)))
-  expect(d13.rule).toBe('alert-repeat'); expect(lanes().filter(l => l.kind === 'reflex').length).toBe(1)
+  expect(d13.rule).toBe('alert-repeat'); expect(d13.target).toBe('lane'); expect(d13.lane).toBe(decisions[0].lane)
+  expect(lanes().filter(l => l.kind === 'reflex').length).toBe(1)
+  expect(await until(() => prompts().length > before)).toBe(true)
+  const p = prompts()[before]
+  expect(p).toContain('（第 13 次偵測）'); expect(p).toContain('分流器標記：同一個警報在這條線處理完之後又來了')
+  expect(p).toContain('同一個警報又來了 11 次'); expect(p).toContain('（第 2 次偵測）')
+  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13')!.refs.rerun).toBe(true)
+  expect(await until(() => exits() >= 2)).toBe(true)
+  // one such run per window: the next repeat after it is folded again, and told to the main's digest (nothing on the thread will run soon)
+  const d14 = await L.routeEvent(alert('mesh-b13b', burst(13)))
+  expect(d14.target).toBe('ledger')
+  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13b')!.notify_main).toBe(true)
 })
 
 test('B12: the repeats start the thread\'s next run (a pending follow-up) together, through extra', async () => {
@@ -70,10 +83,10 @@ test('B12: the repeats start the thread\'s next run (a pending follow-up) togeth
   expect(await until(() => prompts().length > before)).toBe(true)
   const p = prompts()[before]
   expect(p).toContain('後續檢查')                                                      // it is the follow-up run
-  expect(p).toContain('同一個警報又來了 13 次')
-  for (const n of [2, 6, 12, 13, 14]) expect(p).toContain(`（第 ${n} 次偵測）`)       // every repeat's text, in this one prompt
+  expect(p).toContain('同一個警報又來了 2 次')                                          // the two that came since the owner's last run (002l: the rest were in that run)
+  expect(p).toContain('（第 14 次偵測）')
   expect(st.threads[lane.thread].repeats?.length ?? 0).toBe(0)                        // handed over once
-  expect(await until(() => exits() >= 2)).toBe(true)
+  expect(await until(() => exits() >= 3)).toBe(true)
 })
 
 test('B12: a repeat that comes while the thread\'s next run is already queued rides in that queued run', async () => {
@@ -89,7 +102,7 @@ test('B12: a repeat that comes while the thread\'s next run is already queued ri
   const before = prompts().length
   const d2 = await L.routeEvent(alert('mesh-q2', mk(2)))
   expect(d2.rule).toBe('alert-repeat')
-  expect(await until(() => prompts().length >= before + 1 && exits() >= 4)).toBe(true)
+  expect(await until(() => prompts().length >= before + 1 && exits() >= 5)).toBe(true)
   const second = prompts().find(p => p.includes('再查一次 queue-depth'))!
   expect(second).toContain('同一個警報又來了 1 次'); expect(second).toContain('（第 2 次）')
 })
@@ -109,7 +122,7 @@ test('B12: a critical alert keeps its own run; so does a repeat whose severity c
   const e1 = await L.routeEvent(alert('mesh-e1', '請問 mock-api 的逾時是多少？', 'eve')), e2 = await L.routeEvent(alert('mesh-e2', '請問 mock-api 的逾時是多少？', 'eve'))
   expect(e1.target).toBe('lane'); expect(e2.rule).not.toBe('alert-repeat')                // a peer's message is not an alert
   expect(lanes().length).toBeGreaterThan(lanesBefore)
-  expect(await until(() => exits() >= 9, 15000)).toBe(true)
+  expect(await until(() => exits() >= 10, 15000)).toBe(true)
 })
 
 test('B12: after the window (and with nothing queued, running or scheduled) the same alert opens a new lane', async () => {
@@ -118,8 +131,9 @@ test('B12: after the window (and with nothing queued, running or scheduled) the 
   const a = await L.routeEvent(alert('mesh-t1', text))
   expect(a.target).toBe('lane')
   expect(await until(() => lanes().find(l => l.id === a.lane)?.status === 'idle' && (lanes().find(l => l.id === a.lane)?.runs ?? 0) > 0)).toBe(true)
-  const b = await L.routeEvent(alert('mesh-t2', text.replace('第 1', '第 2')))        // within 10 minutes of its end: a repeat
-  expect(b.rule).toBe('alert-repeat')
+  const b = await L.routeEvent(alert('mesh-t2', text.replace('第 1', '第 2')))        // within 10 minutes of its end: a repeat (002l: the owner runs again)
+  expect(b.rule).toBe('alert-repeat'); expect(b.lane).toBe(a.lane)
+  expect(await until(() => lanes().find(l => l.id === a.lane)?.status === 'idle' && (lanes().find(l => l.id === a.lane)?.runs ?? 0) > 1)).toBe(true)
   L.__setAlertRepeatMin(0)                                                              // the window is over
   const c = await L.routeEvent(alert('mesh-t3', text.replace('第 1', '第 3')))
   expect(c.target).toBe('lane'); expect(c.lane).not.toBe(a.lane)
