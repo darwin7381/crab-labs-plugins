@@ -68,6 +68,11 @@ describe('fleet MCP server', () => {
     expect(btccCalls[0].b).toEqual({ to: 'chiron', title: 'Pheme：OG 圖換不換', body: 'b', deadline: 6, no_reply: true })
     reply = { status: 200, json: { id: 8, stored: false, delivered: true } }
     expect(out(await handleFleetRpc(tool('send_mail', { to: 'pheme', title: 't', body: 'b' }), d))).toContain('信箱還沒開')
+    reply = { status: 200, json: { id: 9, stored: true, op_id: 3 } }
+    await handleFleetRpc(tool('send_mail', { to: 'chiron', title: 't', body: 'b', op: 'OP-3' }), d)
+    expect(btccCalls.at(-1).b).toEqual({ to: 'chiron', title: 't', body: 'b', deadline: undefined, no_reply: false, op: 'OP-3' })
+    reply = { status: 200, json: { id: 10, stored: true, warning: "unknown op 'OP-99'" } }
+    expect(out(await handleFleetRpc(tool('send_mail', { to: 'chiron', title: 't', body: 'b', op: 'OP-99' }), d))).toContain("unknown op 'OP-99'")
     reply = { status: 409, json: { detail: '沒送出：一件事一個 owner' } }
     const r = await handleFleetRpc(tool('send_mail', { to: 'pheme', title: 't', body: 'b' }), d)
     expect(r.result.isError).toBe(true)

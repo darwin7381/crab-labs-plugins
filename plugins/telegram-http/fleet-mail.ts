@@ -51,6 +51,7 @@ export const FLEET_TOOLS = [
         body: { type: 'string', description: '內容。最多 3500 字' },
         deadline: { type: 'string', description: '選填：期限，ISO-8601 時間或「幾小時後」的數字；沒填＝一天。到期對方還沒讀，你會收到一封信' },
         no_reply: { type: 'boolean', description: '只是要它知道（它不用做事、不用回答）就標 true' },
+        op: { type: 'string', description: '選填：跟任務站有關的信帶它的編號（OP-3、3 或 slug），信會出現在那個任務站的時間軸上' },
       },
     },
   },
@@ -221,10 +222,12 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if ([...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}：寫誰、對什麼、要什麼。沒有寄出。`, true)
       const r = await deps.btcc('POST', '/api/mesh/mail/send', {
         to, title, body, deadline: hoursOrIso(args.deadline), no_reply: args.no_reply === true,
+        ...(args.op ? { op: String(args.op) } : {}),
       })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
       const j = r.json
-      if (j.stored) return text(`已放進 ${to} 的信箱（#${j.id}）。它一小時內會知道有信；讀了沒用 mail_sent 查。`)
+      const opNote = j.warning ? `（${j.warning}）` : ''
+      if (j.stored) return text(`已放進 ${to} 的信箱（#${j.id}）。它一小時內會知道有信；讀了沒用 mail_sent 查。${opNote}`)
       if (j.delivered) return text(`${to} 的信箱還沒開，這封照舊直接送進它的 session（#${j.id}）。`)
       return text(`#${j.id} 記下了，但送不到 ${to}：${j.detail ?? '?'}`, true)
     }

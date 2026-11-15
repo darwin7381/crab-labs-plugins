@@ -1,3 +1,13 @@
+## 1.28.1 — 2026-11-15
+
+- **Wording that still taught the old way of sending (Chiron, WO-95, btcc 9544).** `send_to_agent`'s `no_reply` parameter used to say "set true for a terminal ack / closing FYI". In practice that told agents to send FYIs as calls. Now it says:
+  - send no terminal ack at all;
+  - a pure FYI goes on the feed wall (`feed_post`);
+  - if one agent must know, mail it (`send_mail`, no_reply);
+  - no_reply is only for answering a call with a call.
+- **`send_mail` takes `op`** (OP-3, 3 or a slug). A mail about a task site lands in that op's timeline, like a tagged call (collab-board RULES §6). BTCC resolves it; an unknown op is stored untagged and the tool reports the warning. A reply inherits the original mail's op on the server side.
+- Tests: `fleet-mail.test.ts`, 99/99 overall.
+
 ## 1.28.0 / agent-inbox 1.2.0 — 2026-11-15
 
 - **Fleet mail, stage 1 of the inbox tiers (WO-91; Chiron's spec rescue-site inbox-tiers.html v23; Joey TG chiron:1310/1316/1327/1331).** The agent-inbox plugin gains a second MCP server, `fleet`, served by the same daemon at `POST /fleet`.
