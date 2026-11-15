@@ -179,6 +179,15 @@ function full(p: any): string {
 }
 
 const ASK_TIMEOUT_MS = 20000
+const ACK_FAILED = '（這幾則沒能記成讀過，下次問牆可能會再給一次。）'
+
+// The wall marks a post read only when this daemon says it received the text (POST /read after the
+// answer is in hand), so an answer lost on the way never hides a post: worst case it comes twice.
+async function ackRead(deps: FleetDeps, ids: number[], via: 'ask' | 'open'): Promise<boolean> {
+  if (!ids.length) return true
+  const r = await deps.core('POST', '/api/feed/read', { ids, via })
+  return r.status === 200
+}
 
 export async function callTool(name: string, args: Record<string, unknown>, deps: FleetDeps) {
   switch (name) {
@@ -288,7 +297,9 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if (j.unjudged) tail.push(`另外 ${j.unjudged} 則 Jev 沒判到，可以用 feed_search 找。`)
       if (!j.given?.length) return text([`Jev 看了 ${j.judged} 則你還沒讀過的貼文，沒有跟這件事有關的。`, ...tail].join('\n'))
       const head = `跟這件事有關的 ${j.given.length} 則（全文，新的在前；給了就算讀過）：`
-      return text([head, ...j.given.map(full)].join('\n\n———\n\n') + (tail.length ? `\n\n${tail.join('\n')}` : ''))
+      const body = [head, ...j.given.map(full)].join('\n\n———\n\n') + (tail.length ? `\n\n${tail.join('\n')}` : '')
+      const acked = await ackRead(deps, j.given.map((g: any) => g.id), 'ask')
+      return text(acked ? body : `${body}\n${ACK_FAILED}`)
     }
     case 'feed_search': {
       const q = String(args.q ?? '').trim()
@@ -306,7 +317,8 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if (!id) return text('feed_open: id 要填貼文編號', true)
       const r = await deps.core('GET', `/api/feed/posts/${id}`)
       if (r.status !== 200) return text(coreErr(r), true)
-      return text(full(r.json))
+      const acked = r.json.read === true || await ackRead(deps, [id], 'open')
+      return text(acked ? full(r.json) : `${full(r.json)}\n${ACK_FAILED}`)
     }
   }
   return text(`unknown tool: ${name}`, true)

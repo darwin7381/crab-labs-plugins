@@ -151,15 +151,33 @@ describe('feed wall tools (WO-92)', () => {
   })
   test('feed_ask: related posts come back in full; more and unjudged are counted', async () => {
     const seen: any[] = []
-    const { d } = deps({ core: async (m, p, b, t) => { seen.push([m, p, b, t]); return { status: 200, json: {
+    const { d } = deps({ core: async (m, p, b, t) => { seen.push([m, p, b, t])
+      if (p === '/api/feed/read') return { status: 200, json: { marked: 2 } }
+      return { status: 200, json: {
       candidates: 9, judged: 7, related: 3, more: 1, unjudged: 2, jev: 'partial',
-      given: [{ ...post, body: 'ton 開頭的網域 DNS 已搬到 Cloudflare', links: ['https://x'], read: true }, { ...post, id: 6, body: '第二則', links: [], read: true }] } } } })
+      given: [{ ...post, body: 'ton 開頭的網域 DNS 已搬到 Cloudflare', links: ['https://x'], read: false }, { ...post, id: 6, body: '第二則', links: [], read: false }] } } } })
     const t = out(await handleFleetRpc(tool('feed_ask', { about: '要改 ton 網域' }), d))
     expect(seen[0]).toEqual(['POST', '/api/feed/ask', { about: '要改 ton 網域' }, 20000])
     expect(t).toContain('跟這件事有關的 2 則')
     expect(t).toContain('#7｜11-15 07:52Z｜hephaestus｜Hephaestus：ton 網域改走 Cloudflare\n　動到：ton-dns、cloudflare　連動：WO-25\n\nton 開頭的網域 DNS 已搬到 Cloudflare\nhttps://x')
     expect(t).toContain('另有 1 則有關的，再問一次接著給。')
     expect(t).toContain('另外 2 則 Jev 沒判到，可以用 feed_search 找。')
+    expect(seen[1]).toEqual(['POST', '/api/feed/read', { ids: [7, 6], via: 'ask' }, undefined])   // read only after the text is in hand
+    expect(t).not.toContain('沒能記成讀過')
+  })
+  test('feed_ask / feed_open: a failed read-mark still delivers, and says the post may come again', async () => {
+    const { d } = deps({ core: async (m, p) => {
+      if (p === '/api/feed/read') return { status: 599, json: {} }
+      if (p === '/api/feed/ask') return { status: 200, json: { candidates: 1, judged: 1, related: 1, more: 0, unjudged: 0, jev: 'ok',
+        given: [{ ...post, body: '全文', links: [], read: false }] } }
+      return { status: 200, json: { ...post, body: '打開的全文', links: [], read: false } } } })
+    const a = await handleFleetRpc(tool('feed_ask', { about: 'x' }), d)
+    expect(out(a)).toContain('全文')
+    expect(out(a)).toContain('沒能記成讀過')
+    expect(a.result.isError).toBeUndefined()
+    const o = await handleFleetRpc(tool('feed_open', { id: 7 }), d)
+    expect(out(o)).toContain('打開的全文')
+    expect(out(o)).toContain('沒能記成讀過')
   })
   test('feed_ask: Jev not answering → use search; nothing unread; nothing related; not on the list', async () => {
     let reply: any = { status: 200, json: { candidates: 4, judged: 0, given: [], jev: 'timeout' } }
@@ -183,7 +201,8 @@ describe('feed wall tools (WO-92)', () => {
     const { d } = deps({ core: async (m, p) => { seen.push(p)
       if (p.startsWith('/api/feed/search')) return { status: 200, json: { total: 3, cards: [
         { ...post, read: true }, { ...post, id: 5, superseded_by: 7, superseded_by_author: 'cadmus', touches: [], ref: null, read: false }] } }
-      return { status: 200, json: { ...post, body: '全文在這', links: [], read: true } } } })
+      if (p === '/api/feed/read') return { status: 200, json: { marked: 1 } }
+      return { status: 200, json: { ...post, body: '全文在這', links: [], read: false } } } })
     const t = out(await handleFleetRpc(tool('feed_search', { q: 'ton 網域', limit: 99 }), d))
     expect(seen[0]).toBe('/api/feed/search?q=ton%20%E7%B6%B2%E5%9F%9F&limit=50')
     expect(t).toContain('3 則對上，列出最新的 2 則：')
@@ -192,6 +211,6 @@ describe('feed wall tools (WO-92)', () => {
     expect(t).not.toContain('全文')
     const o = out(await handleFleetRpc(tool('feed_open', { id: 7 }), d))
     expect(o).toContain('全文在這')
-    expect(seen[1]).toBe('/api/feed/posts/7')
+    expect(seen.slice(1)).toEqual(['/api/feed/posts/7', '/api/feed/read'])
   })
 })
