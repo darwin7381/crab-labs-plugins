@@ -144,6 +144,21 @@ function sendAlert(msg: string, source: string): void {
   _log('info', `system-alert forwarded: ${key.slice(0, 80)}`)
 }
 
+// 002l (D12): design/notify 「同一件事不會連發」. With lanes on, the daemon tells Joey about a model wall itself, once, naming the session that hit it
+// (lanes.ts mainWallUp / wallUp). The TUI relay of the same usage-limit line was a third notice for one wall (G07: #1053 relay, #1055 main wall,
+// #1056 lanes wall). A relayed TUI line that the defer function claims is not sent (and logged); everything else is relayed as before.
+let _defer: ((msg: string) => boolean) | null = null
+export function setSystemAlertDefer(f: ((msg: string) => boolean) | null): void { _defer = f }
+/** the TUI-output layers (jsonl / OTLP) relay through here; ops alerts (sendOpsAlert) never defer */
+export function relayTuiAlert(msg: string, source: string): void {
+  if (_defer) {
+    let skip = false
+    try { skip = _defer(msg) } catch {}
+    if (skip) { _log('info', `system-alert deferred to the lanes wall notice: ${dedupeKey(msg).slice(0, 80)} (${source})`); return }
+  }
+  sendAlert(msg, source)
+}
+
 /**
  * Ops-alert entry point for OTHER modules (delivery watchdog etc.) — same
  * dedupe window and notify pipeline (opsRecipients: alertTo, else allowFrom) as
@@ -244,7 +259,7 @@ export function handleOtlpLogs(payload: unknown): number {
             parts.push('API retries exhausted — 該請求重試耗盡後失敗')
           }
           if (attrs['model']) parts.push(`model=${attrs['model']}`)
-          sendAlert(parts.join('\n'), `otel:${eventName}`)
+          relayTuiAlert(parts.join('\n'), `otel:${eventName}`)
         }
       }
     }
@@ -302,6 +317,8 @@ export function resolveWatchFile(
 export function startSystemAlertWatcher(opts: {
   notify: Notify
   log: Log
+  /** 002l (D12): a relayed TUI line this returns true for is told by someone else (the lanes wall notice) and is not sent */
+  defer?: (msg: string) => boolean
   // Exact session-jsonl resolver — re-called EACH tick. Roamer returns its
   // current target's EXACT transcript (cwd + session_id → one file), so the
   // watcher tails precisely that session and NOT merely the newest jsonl in the
@@ -313,6 +330,7 @@ export function startSystemAlertWatcher(opts: {
 }): void {
   _notify = opts.notify
   _log = opts.log
+  if (opts.defer) _defer = opts.defer
   const staticDir = process.env.SYSTEM_ALERT_PROJECTS_DIR || process.env.CHANNEL_BOT_PROJECTS_DIR || ''
   if (!staticDir && !opts.resolveFile) {
     opts.log('warn', 'system-alert: no SYSTEM_ALERT_PROJECTS_DIR / CHANNEL_BOT_PROJECTS_DIR and no dynamic resolver — jsonl fallback disabled (OTLP receiver still active)')
@@ -355,7 +373,7 @@ export function startSystemAlertWatcher(opts: {
         // prevents replaying yesterday's errors on daemon restart.
         const ts = lineTimestampMs(line)
         if (ts !== null && ts < startedAt - 120_000) continue
-        sendAlert(alert, `jsonl session ${watchedFile.split('/').pop()?.slice(0, 8) ?? '?'}…`)
+        relayTuiAlert(alert, `jsonl session ${watchedFile.split('/').pop()?.slice(0, 8) ?? '?'}…`)
       }
     } catch (err) {
       opts.log('warn', `system-alert: read failed: ${err instanceof Error ? err.message : err}`)

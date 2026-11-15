@@ -1752,6 +1752,9 @@ if (isSystemAlertEnabled()) {
     // (issue #6). Channel-bot: undefined → static CHANNEL_BOT_PROJECTS_DIR env.
     // 002: tail the registered main's transcript, not the newest jsonl (lanes share the dir; evidence #7)
     resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscript() : undefined),
+    // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
+    // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
+    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => Lanes.wallKind(msg) != null : undefined,
     notify: text => {
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {

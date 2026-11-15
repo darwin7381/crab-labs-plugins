@@ -612,9 +612,9 @@ type Thread = { id: string; lane: string | null; peer: string | null; hops: numb
 type AlertFp = { thread: string; sev: string; repeats: number; first: string; last: string
   /** 002l (alertRepeat): when a repeat last made the finished owner lane run again (one such run per window) */
   rerun_at?: string }
-type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number }
+type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number; told?: boolean }
 type Fanout = { id: string; brief: string; tasks: string[]; members: string[]; results: Record<string, string>; created: string; synthesis?: string; done?: string }
-type MainWall = { since: string; kind: string; text: string; model: string; err_at: number; mid_task: boolean; probes: number; acked_at?: number; held?: number }
+type MainWall = { since: string; kind: string; text: string; model: string; err_at: number; mid_task: boolean; probes: number; acked_at?: number; held?: number; told?: boolean }
 type State = {
   counters: Record<string, number>
   lanes: Record<string, Lane>
@@ -1564,14 +1564,20 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
     armProbe(WALL_PROBE_MS + 30)
     return
   }
-  S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0 }
+  // 002l (D12): one wall, one notice. When the main's wall of the same kind is already up and Joey was told, the lanes' wall is recorded, not pushed again.
+  const told = !(S.main_wall?.told && S.main_wall.kind === w.kind)
+  S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0, told }
   saveState()
   const waiting = [...queue.values()].filter(i => i.state === 'queued' || i.state === 'leased').length
   const every = Math.max(1, Math.round(WALL_PROBE_MS / 60_000))
-  const text = `${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我每 ${every} 分鐘自動試一次，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
-  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
-  logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
+  const text = `車道${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我每 ${every} 分鐘自動試一次，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
+  logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting, told })
+  if (!told) {
+    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}（主線撞到同一道牆時已經通知過 Joey，這一筆不再推播）`, refs: { tier: 'ledger', tier_rule: 'wall-up+deduped-main-wall', escalated: false } })
+  } else {
+    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
+  }
   armProbe(WALL_PROBE_MS + 30)
 }
 // One timer for the lanes' wall. (Each walled run used to arm its own: two runs in flight when the wall came up meant
@@ -1722,7 +1728,9 @@ function armMainProbe(ms: number): void {
 function mainWallUp(e: MainWallEv, by: string): void {
   if (S.main_wall) return
   if (e.at <= (S.main_wall_seen ?? 0)) return             // this error record was already acted on; the wall came down since
-  S.main_wall = { since: nowIso(), kind: e.kind, text: e.text, model: e.model, err_at: e.at, mid_task: !!e.midTask, probes: 0 }
+  // 002l (D12): one wall, one notice: when the lanes' wall of the same kind is up and Joey was told, the main's wall is recorded, not pushed again
+  const told = !(S.wall?.told !== false && S.wall && S.wall.kind === e.kind)
+  S.main_wall = { since: nowIso(), kind: e.kind, text: e.text, model: e.model, err_at: e.at, mid_task: !!e.midTask, probes: 0, told }
   S.main_wall_seen = e.at
   saveState()
   try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: e.kind, text: e.text })) } catch {}
@@ -1730,9 +1738,11 @@ function mainWallUp(e: MainWallEv, by: string): void {
   const text = `主線現在不能用模型：${WALL_WORD[e.kind] ?? '模型無法使用'}（原文：${e.text}）。`
     + (e.midTask ? `它有一回合做到一半，停在 ${stamp(new Date(e.at).toISOString())}（${TZ_LABEL}）。` : '')
     + `這段期間給主線的訊息我先保留，一則都不會丟。我每 ${every} 分鐘自動試一次，恢復後把保留的交給主線，並告訴你。`
-  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-up', escalated: true } })
-  logos('lane.main_wall_up', { wall: e.kind, text: e.text, by, mid_task: !!e.midTask, model: e.model, err_at: e.at })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-up', message_id: id }))
+  logos('lane.main_wall_up', { wall: e.kind, text: e.text, by, mid_task: !!e.midTask, model: e.model, err_at: e.at, told })
+  if (told) {
+    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-up', escalated: true } })
+    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-up', message_id: id }))
+  } else ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}（車道撞到同一道牆時已經通知過 Joey，這一筆不再推播；主線恢復時會再說）`, refs: { tier: 'ledger', tier_rule: 'main-wall-up+deduped-lanes-wall', escalated: false } })
   armMainProbe(mainProbeMs(e.kind))
   setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, 0)   // mark what the main already took in, in both daemons
 }
@@ -1862,9 +1872,13 @@ function wallDown(by: string): void {
   if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
   setTimeout(pump, 20)
   const waiting = [...queue.values()].filter(i => i.state === 'queued').length
-  const text = `模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件現在開始處理。`
-  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
+  const text = `車道的模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件現在開始處理。`
   logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting })
+  if (w.told === false) {                                  // 002l (D12): Joey heard of this wall only through the main's notice: no separate push
+    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}`, refs: { tier: 'ledger', tier_rule: 'wall-down+deduped', escalated: false } })
+    return
+  }
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-down', message_id: id }))
 }
 /** a critical alert that arrives while the wall is up: no lane can look into it, so the router rings with the alert itself, once */
