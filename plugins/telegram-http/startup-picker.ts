@@ -82,10 +82,31 @@ const OPTION_LINE = /^\s*[❯>●*]?\s*(\d+)\.\s+(.+?)\s*$/
 // A LIVE cursor sitting on a numbered option — the strong signal that the TUI is
 // parked at a selection (not just numbered prose). Only interactive pickers draw
 // these glyphs immediately before an option.
-const CURSOR_OPTION_LINE = /^\s*[❯›▶●○◉>]\s*\d+\.\s+\S/m
+// 002l (D11): design/notify 「同一件事不會連發」. ● ○ ◉ are NOT cursor glyphs: ● is the TUI's own bullet in front of every assistant
+// message, so the main's numbered summary (● 1. …) read as a menu and was sent to Joey three times (G07, #1054/#1059/#1064). The cursor must
+// also be on an option line near the bottom of the pane (a parked menu is the last thing drawn), with no input box below it.
+const CURSOR_OPTION_LINE = /^\s*[❯›▶>]\s*(\d+)\.\s+\S/
+const MENU_TAIL_LINES = 15
+const RULE_LINE = /^\s*[╭╰│]?[─━═]{10,}/          // the input box's border / the prompt's horizontal rules
+const EMPTY_PROMPT = /^\s*[│|]?\s*[>❯]\s*[│|]?\s*$/
+
+/** 002l (D11): the generic menu, read from the bottom of the pane only: the cursor line among the last MENU_TAIL_LINES non-blank lines, nothing below it
+ *  that is the input box (an empty prompt or a box border), and a clean 1..N option run around it. null = not a parked menu. */
+function genericMenu(pane: string): string[] | null {
+  const lines = pane.split('\n').filter(l => l.trim())
+  const tail = lines.slice(-MENU_TAIL_LINES)
+  let cur = -1
+  for (let i = tail.length - 1; i >= 0; i--) if (CURSOR_OPTION_LINE.test(tail[i])) { cur = i; break }
+  if (cur < 0) return null
+  if (tail.slice(cur + 1).some(l => RULE_LINE.test(l) || EMPTY_PROMPT.test(l))) return null     // the input box is below: the TUI is at its prompt
+  if (cur > 0 && RULE_LINE.test(tail[cur - 1])) return null                                     // the "cursor" is the prompt line itself
+  const options = parseOptions(tail.join('\n'))
+  const n = Number(tail[cur].match(CURSOR_OPTION_LINE)![1])
+  return options.length >= 2 && n >= 1 && n <= options.length ? options : null
+}
 
 function paneHasPickerCursor(pane: string): boolean {
-  return CURSOR_OPTION_LINE.test(pane)
+  return genericMenu(pane) != null
 }
 
 // Best-effort human title: the non-empty line just above the first "1." option
@@ -136,12 +157,8 @@ export function detectStartupPicker(pane: string): DetectedPicker | null {
   // LABELS so a stale tap can only ever drive the SAME menu (driveStartupPicker
   // re-checks live.key === expectKey before sending a keystroke → wrong/changed
   // menu = 'gone', nothing sent). New menu shapes now relay automatically.
-  if (paneHasPickerCursor(pane)) {
-    const options = parseOptions(pane)
-    if (options.length >= 2) {
-      return { key: `generic-${hash6(options.join('|'))}`, title: genericPickerTitle(pane), options }
-    }
-  }
+  const options = genericMenu(pane)                                     // 002l (D11): the bottom of the pane only, cursor on an option, no input box below
+  if (options) return { key: `generic-${hash6(options.join('|'))}`, title: genericPickerTitle(pane), options }
   return null
 }
 
@@ -217,7 +234,11 @@ export interface SurfaceSpec {
 // tmux → already surfaced this episode. Module level (002k G16) so a program that knows a picker is STILL up can re-arm it
 // (rearmStartupPicker): the next poll then surfaces it to Joey again, with a fresh debounce.
 const surfaced = new Map<string, boolean>()
-export function rearmStartupPicker(tmux: string): void { surfaced.set(tmux, false) }
+// 002l (D11): a generic menu (same labels = same key) is sent to Joey once per pane for the daemon's life; it coming and going on the pane (scrolling
+// prose, a redraw) is not a new menu. Only a program that knows the menu is still up asks for it again (rearmStartupPicker).
+const sentGeneric = new Map<string, Set<string>>()
+const forced = new Set<string>()
+export function rearmStartupPicker(tmux: string): void { surfaced.set(tmux, false); forced.add(tmux) }
 
 export function startStartupPickerWatchdog(opts: {
   listTargets: () => Promise<PickerTarget[]>
@@ -239,6 +260,13 @@ export function startStartupPickerWatchdog(opts: {
       if (picker) {
         if (!surfaced.get(t.tmux)) {
           surfaced.set(t.tmux, true)
+          const seen = sentGeneric.get(t.tmux) ?? new Set<string>()
+          if (picker.key.startsWith('generic-') && seen.has(picker.key) && !forced.has(t.tmux)) {
+            opts.log('info', `${describePicker(picker, t.tmux)} — already sent to TG once on this pane; not sent again`)
+            continue
+          }
+          forced.delete(t.tmux)
+          if (picker.key.startsWith('generic-')) { seen.add(picker.key); if (seen.size > 200) seen.clear(); sentGeneric.set(t.tmux, seen) }
           opts.log('warn', `${describePicker(picker, t.tmux)} — surfacing to TG`)
           opts.surface({
             title: `${picker.title}\n（${t.label}）點下面選項，我幫你選：`,
