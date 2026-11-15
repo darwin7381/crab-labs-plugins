@@ -128,6 +128,8 @@ export interface LanesDeps {
   repersistUnconsumed?: () => number
   /** 002i: run the delivery sweep and the drain of parked deliveries now */
   sweepNow?: () => void
+  /** 002l (N6): how many deliveries are parked for the main right now (server.ts: inbox/pending) */
+  pendingCount?: () => number
   /** 002k (G16): the main's pane and the startup picker on it (server.ts builds it from startup-picker.ts when it knows the main's tmux target) */
   mainPicker?: MainPicker
 }
@@ -1646,6 +1648,10 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
 // The wall is one fact for both daemons of the agent (tg owns it, inbox holds the mesh messages for the main): a file.
 const mainWallFile = (): string => join(LANES_DIR, 'run', 'main-wall.json')
 export function wallHoldsMain(): boolean { return !!LANES_DIR && existsSync(mainWallFile()) }
+/** 002l (N6): may parked deliveries be handed to the main now? Not while the main is behind the model wall (002j: 「主線撞到額度：給主線的訊息先保留」).
+ *  server.ts asks it on EVERY replay path: the timer drain had the gate, the session-open replay did not, so a main process replaced behind the wall
+ *  (T7-R t 390.9) was handed both held messages 44 s before the wall came down. */
+export function replayAllowed(): boolean { return !(LANES_ON && wallHoldsMain()) }
 // What was kept behind the wall is as old as the wall. For a short while after it comes down, the daemon's "a parked
 // message has been waiting for N minutes" alarm stays quiet about those files: they are being given right now, and Joey
 // was told about the wall. (The time is written as text: the lab runs under a simulated clock, file times do not.)
@@ -1849,18 +1855,22 @@ async function mainWallDown(by: string): Promise<void> {
   const menu = await inspectMainMenu(true, 'wall-down')        // 002k (G16a): a menu the main is parked on is dealt with BEFORE anything is handed to it
   // A main stopped in the middle of work is told to carry on, before what was kept reaches it. A main whose walled turn
   // was only a message it never answered needs no notice: that message is given again.
+  // 002l (N6): the carry-on notice is decided from the wall's own record (it cut a turn: mid_task) and from what is still owed to the main (parked
+  // deliveries), not from the transcript's last record alone: a main process replaced behind the wall writes new records, and T7-R's notice was
+  // dropped (told null) while Joey was told the held messages were being handed over.
+  const parked = D.pendingCount ? D.pendingCount() : (w.held ?? 0)
   let told: boolean | null = null
-  if (w.mid_task && mainWalled(0)) {
+  if (w.mid_task && (mainWalled(0) || parked > 0)) {
     told = false
-    try { if (await digestIO.mainConnected()) told = await digestIO.deliver(wallResumeNotice(w, w.held ?? 0), { user: 'lanes', kind: 'wall-resume', no_reply: 'true', wake: 'true' }) } catch (e) { D.log('warn', `lanes: wall-resume notice failed: ${e}`) }
+    try { if (await digestIO.mainConnected()) told = await digestIO.deliver(wallResumeNotice(w, parked), { user: 'lanes', kind: 'wall-resume', no_reply: 'true', wake: 'true' }) } catch (e) { D.log('warn', `lanes: wall-resume notice failed: ${e}`) }
   }
   setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, told ? 1500 : 30)
   const text = `主線的模型恢復了（${stamp(w.since)} 起不能用，${TZ_LABEL}）。`
-    + (w.held ? `這段期間保留的 ${w.held} 則訊息現在交給主線。` : '')
+    + (w.held && parked ? `這段期間保留的 ${parked} 則訊息現在交給主線。` : w.held ? `這段期間保留的訊息已經都交給主線了。` : '')
     + (told === true ? '主線有一回合做到一半被打斷，已經通知它接著做完。' : told === false ? '主線有一回合做到一半被打斷，但接續通知沒有送到（主線目前沒有連線）。' : '')
     + (menu ? menuSentence(menu) : '')
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-down', escalated: true } })
-  logos('lane.main_wall_down', { since: w.since, probes: w.probes + 1, by, held: w.held ?? 0, resume_notice: told, menu: menu ? { options: menu.options, chose: menu.chose?.label ?? null, result: menu.result ?? null } : null })
+  logos('lane.main_wall_down', { since: w.since, probes: w.probes + 1, by, held: w.held ?? 0, parked, resume_notice: told, menu: menu ? { options: menu.options, chose: menu.chose?.label ?? null, result: menu.result ?? null } : null })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-down', message_id: id }))
 }
 export const __setDigestIO = (io: Partial<DigestIO>): void => { Object.assign(digestIO, io) }

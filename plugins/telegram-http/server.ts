@@ -947,6 +947,9 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
   // would each read the same parked file before either removed it: the same message delivered twice (fleet record
   // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
   if (replayRunning) return 0
+  // 002l (N6): the main's model wall gates EVERY replay, the session-open one included (002j: 「主線撞到額度：給主線的訊息先保留」). The timer drain and
+  // the delivery path had the gate; this path did not, and a main process replaced behind the wall got the held messages (T7-R #9 #12 #13 #15).
+  if (!Lanes.replayAllowed()) return 0
   replayRunning = true
   try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
 }
@@ -1022,7 +1025,7 @@ function liveSessionServer(): Server | null {
 }
 
 async function drainPendingIfLive(): Promise<void> {
-  if (Lanes.LANES_ON && Lanes.wallHoldsMain()) return     // 002j: nothing is replayed into the wall; Joey was told when it came up
+  if (!Lanes.replayAllowed()) return     // 002j: nothing is replayed into the wall; Joey was told when it came up
   let files: string[]
   try { files = readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')) } catch { return }
   if (files.length === 0) { if (parkAlerted.size) parkAlerted = new Set(); return }
@@ -3203,6 +3206,7 @@ if (Lanes.LANES_ON) {
     deliverToMain,
     authOk: tokOk,
     repersistUnconsumed,
+    pendingCount: () => { try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length } catch { return 0 } },   // 002l (N6)
     sweepNow: () => { sweepDeliveries(); void drainPendingIfLive() },
     // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice
     ...(process.env.CHANNEL_BOT_TMUX_SESSION ? { mainPicker: {
