@@ -1975,6 +1975,7 @@ function laneEnv(lane: Lane): Record<string, string> {
   env.LANE_KIND = lane.kind                       // 002k: the guard hook decides file and memory writes by kind
   env.LANES_MEMORY_DIR = memoryDir()
   env.LANES_WORKSPACE = D.workspaceDir               // 002k (H6): the guard hook's workspace is the lane's start directory, not wherever its shell has wandered
+  if (process.env.LANES_SVC_ALLOW) env.LANES_SVC_ALLOW = process.env.LANES_SVC_ALLOW   // 002k (H6): the guard's documented svc allowlist override reaches the hook (laneEnv drops the rest of the daemon's env)
   // 002k (K1): the lanes are not handed the service address: they have no reason to reach for curl. ./bin/svc has its address inside the wrapper.
   return env
 }

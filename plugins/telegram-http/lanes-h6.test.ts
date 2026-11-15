@@ -145,7 +145,7 @@ test('H6: the workspace is the lane\'s start directory (LANES_WORKSPACE), not wh
   expect(verdict('echo x >> notes.txt', 'reflex', {}, join(ws, 'out')).v).toBe('allow')                                           // out/notes.txt
 })
 
-test('H6: the lane process gets LANES_WORKSPACE (the workspace the guard measures against)', async () => {
+test('H6: the lane process gets LANES_WORKSPACE (the workspace the guard measures against) and the daemon\'s LANES_SVC_ALLOW', async () => {
   const { mkdtempSync: mk, copyFileSync, readFileSync, chmodSync } = await import('fs')
   const L = await import('./lanes.ts?h6-env') as typeof import('./lanes.ts')
   const dir = mk(join(tmpdir(), 'lanes-h6env-'))
@@ -154,13 +154,16 @@ test('H6: the lane process gets LANES_WORKSPACE (the workspace the guard measure
   writeFileSync(join(dir, 'main.json'), JSON.stringify({ session_id: 'a20fb7c0-f35a-4365-9a21-9e16e9f78fed', transcript_path: join(dir, 'main.jsonl'), claude_pid: 1, registered_at: new Date().toISOString() }))
   mkdirSync(join(dir, 'workspace'))
   const bin = join(dir, 'lane.py')
-  writeFileSync(bin, `#!/usr/bin/env python3\nimport os\nopen('${dir}/env.txt', 'w').write(os.environ.get('LANES_WORKSPACE', '') + '|' + os.environ.get('LANE_KIND', ''))\nprint('{"type":"result","subtype":"success","is_error":false,"result":"ok"}')\n`)
+  writeFileSync(bin, `#!/usr/bin/env python3\nimport os\nopen('${dir}/env.txt', 'w').write(os.environ.get('LANES_WORKSPACE', '') + '|' + os.environ.get('LANE_KIND', '') + '|' + os.environ.get('LANES_SVC_ALLOW', '-'))\nprint('{"type":"result","subtype":"success","is_error":false,"result":"ok"}')\n`)
   chmodSync(bin, 0o755)
   const restore = L.__setClaudeBin(bin)
   L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: join(dir, 'workspace'), transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve'], sendBot: async () => 1, joeyChatId: () => '1' } as any)
   L.__setMainConnected('mcp-main')
+  const svcAllowWas = process.env.LANES_SVC_ALLOW
+  process.env.LANES_SVC_ALLOW = 'POST:api/restart,POST:api/reload'
   await L.routeEvent({ id: 'mesh-h6e', source: 'mesh', from: 'eve', verified: true, text: 'hi', meta: {}, notif: { method: '', params: {} } } as any)
   for (let i = 0; i < 100; i++) { try { readFileSync(join(dir, 'env.txt'), 'utf8'); break } catch { await new Promise(r => setTimeout(r, 30)) } }
-  expect(readFileSync(join(dir, 'env.txt'), 'utf8')).toBe(`${join(dir, 'workspace')}|reflex`)
+  if (svcAllowWas === undefined) delete process.env.LANES_SVC_ALLOW; else process.env.LANES_SVC_ALLOW = svcAllowWas
+  expect(readFileSync(join(dir, 'env.txt'), 'utf8')).toBe(`${join(dir, 'workspace')}|reflex|POST:api/restart,POST:api/reload`)
   L.__setClaudeBin(restore)
 })
