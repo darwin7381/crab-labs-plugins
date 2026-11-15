@@ -876,7 +876,8 @@ export class DutyOfficer {
         if (!lk) {
           // a pane we cannot read is said once an hour, never skipped silently
           const last = this.lookFailed.get(t.tmux) ?? 0
-          if (!t.test && now - last >= this.L.renotifyMs) { // a test pane that was closed is normal this.lookFailed.set(t.tmux, now); this.event('look_failed', { agent: t.label, tmux: t.tmux }) }
+          // (a test pane that was closed is normal: not logged)
+          if (!t.test && now - last >= this.L.renotifyMs) { this.lookFailed.set(t.tmux, now); this.event('look_failed', { agent: t.label, tmux: t.tmux }) }
           continue
         }
         await this.step(t, lk, now)

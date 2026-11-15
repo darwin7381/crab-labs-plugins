@@ -1,6 +1,6 @@
 ## 1.29.6 — 2026-11-16
 
-- Duty officer: a daemon's own pane is named by its tmux session (claude-aegis, daddy-claude …), not `channel-bot`. That name comes from `paneWatchTargets`, which predates the fleet. Before this, every agent's log lines, Joey's messages (「值班員・channel-bot」) and ruling titles said channel-bot. A test pane that was closed no longer logs `look_failed`.
+- Duty officer: a daemon's own pane is named by its tmux session (claude-aegis, daddy-claude …), not `channel-bot`. That name comes from `paneWatchTargets`, which predates the fleet. Before this, every agent's log lines, Joey's messages (「值班員・channel-bot」) and ruling titles said channel-bot. A test pane that was closed no longer logs `look_failed`. (d72ef4a, pushed with a syntax error, never deployed: a `//` comment put mid-line cut off the rest of it; my commit chain did not stop on the failing test. Fixed in the next commit, which only went out after every test file passed and `bun build` succeeded.)
 
 ## 1.29.5 — 2026-11-16
 
