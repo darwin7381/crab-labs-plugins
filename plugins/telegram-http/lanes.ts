@@ -798,6 +798,18 @@ function matches(r: Rule, ev: InEvent, cfg: RouterCfg): boolean {
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
   const cfg = routerCfg()
+  // 002l (D2): the master switch comes FIRST. design/stability 「另有一個總開關，關掉就整個退回現在的單線模式」: off = today's single-session behaviour,
+  // where every event reaches the main. Nothing of the lane machinery decides any more: no hold, no flood gate (002k ran peerGate before it, and Eve's
+  // message after /lanes off went to the ledger: A07 e6), no Jev screen, no rule. Lanes already running finish their event and report.
+  if (D.role === 'tg' && S?.master_off) {
+    let d: Decision = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off.by} at ${stamp(S.master_off.since)}` }
+    appendJsonl('routing.jsonl', { event: ev.id, source: ev.source, from: ev.from, text: ev.text.slice(0, 100), rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note,
+      class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
+    logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
+    D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=master-off → main`)
+    if (!wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
+    return d
+  }
   // 002k (H14, H13): the peer's hold and the flood gate come first: before the rules, before any Jev screen, with no model. An event over the limit gets no lane.
   if (D.role === 'tg' && S) {
     const g = peerGate(ev)
@@ -810,21 +822,17 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     }
   }
   let d: Decision = { rule: 'none', target: 'main' }
-  // 002k: the master switch (design/stability SR11, plan/decisions 「總開關關掉，就回到今天的樣子」). Off = today's single-session
-  // behaviour: every event goes to the main, no lane is started. Lanes already running finish their event and report.
-  const off = !!S?.master_off && D.role === 'tg'
   // 002k (Jev design A6): a peer's message is shown to Jev BEFORE routing, with the triage questions (the shadow record reuses the
   // answers). Text that tries to change the agent's rules or identity, to get keys or tokens, or to hide something from the boss
   // sends the message to the main for checking, with the reason in front. It can only tighten: a low score changes nothing, a failed
   // call changes nothing, and the rules still decide everything else.
   const screen = D.role === 'tg' && screenOn() && ev.source === 'mesh' && !ev.synthetic && !['scheduler', 'alert-dispatcher', 'main'].includes(ev.from)
   const asked: TriageAsk | null = screen ? await triageAsk({ id: ev.id, source: ev.source, from: ev.from, text: ev.text, verified: ev.verified, thread: ev.thread ?? null }, SCREEN_TIMEOUT_MS, LANES_DIR) : null
-  for (const r of off ? [] : cfg.rules) {
+  for (const r of cfg.rules) {
     if (!matches(r, ev, cfg)) continue
     d = await applyRule(r, ev)
     break
   }
-  if (off) d = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off!.by} at ${stamp(S.master_off!.since)}` }
   // 002k (C7, 002j group C): a peer that writes into a thread that belongs to another peer. The rules already keep it out of that thread
   // (only the thread's peer may speak in it); this records that it tried, for whoever reads the ledger. No model, no wake, not in the digest.
   const notYours = D.role === 'tg' ? threadNotYours(ev) : null
