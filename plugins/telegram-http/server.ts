@@ -1142,22 +1142,6 @@ const fleetDeps = {
     sendToAgent(to, text, replyTo, noReply, op, 'call'),
   btcc: btccMail,
 }
-// GET /mailcount — the wake-line hook's question ("信箱 N 封待處理"). Cached briefly: the hook fires on
-// every input, and a slow or failing BTCC must never slow the agent down (the hook prints nothing then).
-let mailCount: { at: number; value: { on: boolean; n: number; oldest_s: number | null } | null } = { at: 0, value: null }
-async function ownMailCount() {
-  if (Date.now() - mailCount.at < 30_000) return mailCount.value
-  let value: { on: boolean; n: number; oldest_s: number | null } | null = null
-  try {
-    const r = await btccMail('GET', `/api/mesh/mail/counts/all?agent=${encodeURIComponent(INBOX_SELF)}`)
-    if (r.status === 200) {
-      const c = r.json?.counts?.[INBOX_SELF]
-      value = c ? { on: true, n: Number(c.n) || 0, oldest_s: c.oldest_s ?? null } : { on: false, n: 0, oldest_s: null }
-    }
-  } catch {}
-  mailCount = { at: Date.now(), value }
-  return value
-}
 
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
@@ -1293,7 +1277,7 @@ function buildServer(): Server {
         '',
         'Style: no social filler (greetings, thanks, praise, ritual apologies, "got it"). Facts, evidence, timestamps; no hedging. Challenge, don\'t defer: test a peer\'s framing, state disagreement plainly, never endorse out of politeness.',
         '',
-        'Closing: no_reply="true" = nothing owed, reply to no one. 讀信箱: tell Joey on Telegram only if you handled mail (how many, what you did with each); listing or deferring only = no report. Other inbound: if nothing is needed, no message to the peer, but end with a Telegram reply to Joey. Replies end there: call with reply_to and mail results are auto no_reply.',
+        'Closing: no_reply="true" = nothing owed, reply to no one. 讀信箱: tell Joey on Telegram only if you read and handled mail (how many, what you did with each); listing only = no report. Other inbound: if nothing is needed, no message to the peer, but end with a Telegram reply to Joey. Replies end there: call with reply_to and mail replies are auto no_reply.',
       ].join('\n'),
     } : {
       capabilities: {
@@ -3182,14 +3166,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       })
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ injected: true, active_sessions: activeServers.size }))
-      return
-    }
-
-    // GET /mailcount — local only (127.0.0.1 bind), a count and nothing else: the wake-line hook (WO-91).
-    if (INBOX_ONLY && u.pathname === '/mailcount' && req.method === 'GET') {
-      const v = await ownMailCount()
-      res.writeHead(v ? 200 : 503, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(v ?? { error: 'BTCC unreachable' }))
       return
     }
 

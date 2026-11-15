@@ -37,7 +37,7 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'send_mail',
-    description: `寄信（Mail）：放進對方的信箱，不打斷它手上的事；它一小時內會知道有信，自己排時間讀，每封信一定有一個結果寄回你的信箱。大部分的事是信，拿不準就寄信。${SEND_FLOW} 對方的信箱還沒開時，這封會照舊直接送進它的 session，你不用管。`,
+    description: `寄信（Mail）：放進對方的信箱，不打斷它手上的事；它一小時內會知道有信，自己排時間讀；它打開時你查得到已讀。大部分的事是信，拿不準就寄信。${SEND_FLOW} 對方的信箱還沒開時，這封會照舊直接送進它的 session，你不用管。`,
     inputSchema: {
       type: 'object',
       required: ['to', 'title', 'body'],
@@ -46,42 +46,41 @@ export const FLEET_TOOLS = [
         title: { type: 'string', description: `標題，${TITLE_MAX} 字內：誰、對什麼、要什麼。對方先看到的只有這一行。超過不收` },
         body: { type: 'string', description: '內容。最多 3500 字' },
         deadline: { type: 'string', description: '選填：期限，ISO-8601 時間或「幾小時後」的數字；沒填＝一天。到期還沒處理，你會收到一封信' },
-        no_reply: { type: 'boolean', description: '只是要它知道（它不用做事、不用回答）就標 true：它完成時結果只記著，不寄回給你' },
-        reply_to: { type: 'string', description: '選填：這封是在回哪一封信或哪一則訊息（編號）' },
+        no_reply: { type: 'boolean', description: '只是要它知道（它不用做事、不用回答）就標 true' },
       },
     },
   },
   {
     name: 'mailbox_list',
-    description: '看信箱清單：待處理的信一封一行（編號｜誰寄的｜標題｜期限｜等了多久），不含內容。被提醒「讀信箱」時先看這個，再決定什麼時候讀。看過不等於處理了：每封信只有完成或延後兩種結局。',
+    description: '看信箱清單：未讀的和已讀還沒勾掉的信，一封一行（編號｜誰寄的｜標題｜期限｜等了多久｜未讀或已讀），不含內容。看清單不算讀。被提醒「讀信箱」時先看這個，再決定什麼時候讀。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'mailbox_open',
-    description: '打開一封信，讀全文。',
+    description: '打開一封信，讀全文。打開就算已讀：寄的人看得到已讀和時間，之後不再提醒這封。',
     inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'integer', description: '信的編號' } } },
   },
   {
-    name: 'mailbox_done',
-    description: '完成一封信，附一句結果給寄的人：做好了、答案是什麼、做不了、或不是你的事該找誰，都寫在這一句。結果寄回寄件者的信箱，自動標不用回。',
-    inputSchema: {
-      type: 'object',
-      required: ['id', 'result'],
-      properties: { id: { type: 'integer' }, result: { type: 'string', description: '一句結果' } },
-    },
+    name: 'mailbox_check',
+    description: '勾掉一封信：這封不用再留在信箱清單裡（回過信了、去工作板開了單、或看了沒事要做）。勾掉不代表事情做完；要追做完沒的，開工作板的單。',
+    inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'integer' } } },
   },
   {
-    name: 'mailbox_defer',
-    description: '延後一封信到你會處理的時間；要做很久的，延到你預計做完的時候。不能超過這封信的期限。時間到它回到待處理，下一次提醒會再列出來。',
+    name: 'mailbox_reply',
+    description: '回信：寄一封信給原來寄的人，自動連到原信、自動標不用回，它讀了就結束。回信不是必填。',
     inputSchema: {
       type: 'object',
-      required: ['id', 'until'],
-      properties: { id: { type: 'integer' }, until: { type: 'string', description: 'ISO-8601 時間，或「幾小時後」的數字' } },
+      required: ['id', 'body'],
+      properties: {
+        id: { type: 'integer', description: '要回的那封信的編號' },
+        body: { type: 'string', description: '內容。最多 3500 字' },
+        title: { type: 'string', description: `選填：標題（${TITLE_MAX} 字內）；沒填是「回覆：原標題」` },
+      },
     },
   },
   {
     name: 'mail_sent',
-    description: '查自己寄出的信現在怎樣：待處理、延後到何時、完成和那一句結果。',
+    description: '查自己寄出的信：對方讀了沒、什麼時候讀的、勾掉了沒。',
     inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } } },
   },
 ]
@@ -132,22 +131,21 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if ([...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}：寫誰、對什麼、要什麼。沒有寄出。`, true)
       const r = await deps.btcc('POST', '/api/mesh/mail/send', {
         to, title, body, deadline: hoursOrIso(args.deadline), no_reply: args.no_reply === true,
-        reply_to_id: intId(args.reply_to),
       })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
       const j = r.json
-      if (j.stored) return text(`已放進 ${to} 的信箱（#${j.id}）。它一小時內會知道有信；完成時那一句結果會寄回你的信箱。`)
+      if (j.stored) return text(`已放進 ${to} 的信箱（#${j.id}）。它一小時內會知道有信；讀了沒用 mail_sent 查。`)
       if (j.delivered) return text(`${to} 的信箱還沒開，這封照舊直接送進它的 session（#${j.id}）。`)
       return text(`#${j.id} 記下了，但送不到 ${to}：${j.detail ?? '?'}`, true)
     }
     case 'mailbox_list': {
       const r = await deps.btcc('GET', '/api/mesh/mail/list')
       if (r.status !== 200) return text(`讀不到信箱：${errText(r)}`, true)
-      const open = (r.json.open ?? []) as any[]
-      const later = r.json.deferred_later ? `（另有 ${r.json.deferred_later} 封延後中）` : ''
-      if (!open.length) return text(`信箱沒有待處理的信${later}。`)
-      const lines = open.map(m => `#${m.id}｜${m.from}｜${m.title}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}`)
-      return text(`${open.length} 封待處理${later}：\n${lines.join('\n')}`)
+      const mail = (r.json.mail ?? []) as any[]
+      if (!mail.length) return text('信箱是空的。')
+      const unread = mail.filter(m => m.status === 'unread').length
+      const lines = mail.map(m => `#${m.id}｜${m.from}｜${m.title}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${m.status === 'unread' ? '未讀' : '已讀'}${m.no_reply ? '｜不用回' : ''}`)
+      return text(`${unread} 封未讀、${mail.length - unread} 封已讀還沒勾掉：\n${lines.join('\n')}`)
     }
     case 'mailbox_open': {
       const id = intId(args.id)
@@ -155,24 +153,24 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const r = await deps.btcc('GET', `/api/mesh/mail/${id}`)
       if (r.status !== 200) return text(errText(r), true)
       const m = r.json
-      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.status && m.status !== 'pending' ? `｜狀態 ${m.status}` : ''}\n\n${m.body}`)
+      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}\n\n${m.body}`)
     }
-    case 'mailbox_done': {
+    case 'mailbox_check': {
       const id = intId(args.id)
-      const result = String(args.result ?? '').trim()
-      if (!id || !result) return text('mailbox_done: id 和 result（一句結果）都要填', true)
-      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/done`, { result })
+      if (!id) return text('mailbox_check: id 要填信的編號', true)
+      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/check`, {})
       if (r.status !== 200) return text(errText(r), true)
-      const back = r.json.result_to_sender
-      return text(back ? `#${id} 完成，結果已寄回寄件者。` : `#${id} 完成。結果只記著（原信標了不用回，或是寄給你自己的）。`)
+      return text(`#${id} 勾掉了，不在清單上了。${r.json.was === 'unread' ? '（它還沒打開過，寄的人看到的是未讀。）' : ''}`)
     }
-    case 'mailbox_defer': {
+    case 'mailbox_reply': {
       const id = intId(args.id)
-      const until = hoursOrIso(args.until)
-      if (!id || until === undefined) return text('mailbox_defer: id 和 until 都要填', true)
-      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/defer`, { until })
-      if (r.status !== 200) return text(errText(r), true)
-      return text(`#${id} 延後到 ${hm(r.json.until)}。到時候它回到待處理。`)
+      const body = String(args.body ?? '').trim()
+      if (!id || !body) return text('mailbox_reply: id 和 body 都要填', true)
+      const title = args.title ? String(args.title).trim() : undefined
+      if (title && [...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}。沒有寄出。`, true)
+      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/reply`, { body, ...(title ? { title } : {}) })
+      if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
+      return text(r.json.stored ? `回信放進對方信箱了（#${r.json.id}，不用回）。` : `對方信箱還沒開，回信直接送進它的 session（#${r.json.id}，不用回）。`)
     }
     case 'mail_sent': {
       const lim = intId(args.limit) ?? 20
@@ -181,8 +179,9 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const rows = (r.json.sent ?? []) as any[]
       if (!rows.length) return text('你還沒有寄出過信。')
       return text(rows.map(m => {
-        const st = m.status === 'done' ? `完成：${m.result ?? ''}` : m.status === 'deferred' ? `延後到 ${hm(m.deferred_until)}`
-          : m.status === 'pending' ? '待處理' : m.status === 'pushed' ? '已直接送進 session（對方信箱沒開）' : String(m.status)
+        const st = m.status === 'unread' ? '未讀' : m.status === 'read' ? `已讀 ${hm(m.read_at)}`
+          : m.status === 'checked' ? `勾掉了${m.read_at ? `（已讀 ${hm(m.read_at)}）` : '（沒打開過）'}`
+          : m.status === 'pushed' ? '已直接送進 session（對方信箱沒開）' : String(m.status)
         return `#${m.id}｜給 ${m.to}｜${m.title}｜期限 ${hm(m.deadline)}｜${st}`
       }).join('\n'))
     }
