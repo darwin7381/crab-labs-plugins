@@ -32,19 +32,20 @@ test('G10: the main\'s commitment tool has an optional due; commitment_done exis
 })
 
 test('G10: a commitment with a due time: the id comes back, the ledger line carries refs.id and refs.due, "by" is filled from the due time', async () => {
-  const due = '2026-11-15T10:00:00+08:00'
+  // a due time that stays in the future: these commitments must not be past due when the later tests run promiseTick (a fixed 2026-11-15 went off on that day)
+  const due = '2099-11-15T10:00:00+08:00'
   const out = await commit({ who: 'Joey', what: '10 點前提醒他查 mock-backup 的保留設定', due })
   const id = idOf(out)
   expect(out).toContain('commitment recorded'); expect(out).toContain('rung once'); expect(out).toContain(`commitment_done(${id})`)
   const r = rows().filter(x => x.kind === 'commitment').at(-1)
-  expect(r).toMatchObject({ lane: 'main', notify_main: false, refs: { id, who: 'Joey', from: 'main-tool', due: '2026-11-15T02:00:00.000Z' } })
-  expect(r.refs.by).toBe('2026-11-15 10:00 前'); expect(r.text).toContain('時限：2026-11-15 10:00 前')                    // the lab's local time (UTC+8)
+  expect(r).toMatchObject({ lane: 'main', notify_main: false, refs: { id, who: 'Joey', from: 'main-tool', due: '2099-11-15T02:00:00.000Z' } })
+  expect(r.refs.by).toBe('2099-11-15 10:00 前'); expect(r.text).toContain('時限：2099-11-15 10:00 前')                    // the lab's local time (UTC+8)
   expect(st.main_commitments![id]).toMatchObject({ state: 'open', who: 'Joey', due: Date.parse(due) })
   expect(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).main_commitments[id].state).toBe('open')           // durable: in state.json
   const w = await commit({ who: 'Joey', what: '寫 runbook', by: '今天下班前', due })                                    // an explicit "by" is kept
   expect(rows().filter(x => x.kind === 'commitment').at(-1).refs.by).toBe('今天下班前'); expect(idOf(w)).not.toBe(id)
-  await commit({ who: 'Joey', what: '一個沒有時區的時間', due: '2026-11-15T10:00:00' })                                   // no zone: the lab's local time
-  expect(rows().filter(x => x.kind === 'commitment').at(-1).refs.due).toBe('2026-11-15T02:00:00.000Z')
+  await commit({ who: 'Joey', what: '一個沒有時區的時間', due: '2099-11-15T10:00:00' })                                   // no zone: the lab's local time
+  expect(rows().filter(x => x.kind === 'commitment').at(-1).refs.due).toBe('2099-11-15T02:00:00.000Z')
 })
 
 test('G10: an unreadable due is refused and nothing is recorded; a commitment without a due behaves as before and is never rung for', async () => {
