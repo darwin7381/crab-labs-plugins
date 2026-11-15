@@ -57,8 +57,10 @@ def main_context(agent, session_id):
         '- 帳本裡累積了好幾筆記憶提案、你又閒著：用 curate_memory 把寫入權交給一條整理線去整理，做完它自己交還（curate_stop 隨時收回）；單筆提案用 memory_decide 決定。',
         # 002l (D16): design/notify 「分級由分流器依訊息類型決定」: the router gives the report on a hand-over the tier of the event that was handed over
         '- 回報車道交給你的事（摘要裡以〔ho-…〕開頭的那一行）時，reply 帶 handoff_id=那個編號；響不響由分流器依那件事的類別決定（同事的事通常靜音），你不用自己判斷。',
-        '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、open_worker、fork、peer_hold）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
-        '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。',
+        '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、memory_history、memory_revert、open_worker、fork、peer_hold）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
+        '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。'
+        # 002l (N2): design/memory 「改壞了能退回」「主線隨時可以…退回任何一次改動」
+        '記憶目錄是 git：memory_history 看誰在什麼時候改了什麼；要退回某一次改動，用 memory_revert(sha, reason)，不要手動改回去。',
     ])
 
 

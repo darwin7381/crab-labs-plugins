@@ -3497,6 +3497,10 @@ export function mainToolDefs(): any[] {
     { name: 'curate_stop', description: '[lanes · main only] Take the memory write right back from the curator lane now (it stops; unprocessed proposals stay in the ledger).', inputSchema: { type: 'object', properties: {} } },
     { name: 'memory_decide', description: '[lanes · main only] Decide a memory proposal a lane filed (its id is in the digest and in ledger_query(kind=memory_proposal)): accept (write it as it is), rewrite (write `text` instead) or veto (do not write it). `reason` is required. accept and rewrite write the memory the normal way (a memory file, its line in MEMORY.md, a commit in your name); veto only records the decision. Records a ledger entry kind memory_decision. A proposal that came from a Joey message is listed in every digest, and your turn is held once, until it is decided.',
       inputSchema: { type: 'object', properties: { proposal_id: { type: 'string', description: 'the id of the proposal, e.g. mp-1a2b3c' }, decision: { type: 'string', enum: ['accept', 'rewrite', 'veto'] }, reason: { type: 'string', description: 'why (one line)' }, text: { type: 'string', description: 'rewrite: the text to write; accept: optional, replaces the proposal text' } }, required: ['proposal_id', 'decision', 'reason'] } },
+    { name: 'memory_history', description: '[lanes · main only] The memory directory is a git repo (every write is committed, naming the lane and thread). List the latest changes: sha, when, who (lane), thread, files. Optional `file` limits it to one memory file.',
+      inputSchema: { type: 'object', properties: { limit: { type: 'number', description: 'how many (default 15, max 50)' }, file: { type: 'string', description: 'a memory file name, e.g. MEMORY.md' } } } },
+    { name: 'memory_revert', description: '[lanes · main only] Undo one memory change: a real revert commit in your name (the files go back to what they were before that commit). Use it for "undo that memory write"; do not rewrite the file by hand. `sha` from memory_history (or the commit id you were told after a write).',
+      inputSchema: { type: 'object', properties: { sha: { type: 'string' }, reason: { type: 'string', description: 'why (one line)' } }, required: ['sha', 'reason'] } },
     { name: 'commitment', description: '[lanes · main only] Record a promise YOU made (to a peer agent or to Joey): who, what, by when. Bookkeeping, like the lanes\' commitment tool: it lands in the ledger as kind commitment, lane main, on the open thread of that peer, and returns its id. The daemon also checks what you send with send_to_agent and records a promise it finds there; you do not need to call this for those. With `due` (an ISO time) this is also a durable reminder: when it is past due and you have not marked it done (commitment_done), Joey is rung once.',
       inputSchema: { type: 'object', properties: { who: { type: 'string', description: 'to whom (name)' }, what: { type: 'string', description: 'what was promised' }, by: { type: 'string', description: 'by when, in words (e.g. 明天 10:00 前); filled from `due` when left empty' }, due: { type: 'string', description: 'optional: the due time as an ISO time (2026-11-15T10:00:00+08:00; without a zone it is read as the lab\'s local time). Past this time, and not done, Joey is rung once.' } }, required: ['who', 'what'] } },
     { name: 'peer_hold', description: '[lanes · main only] Put a peer agent on hold: ALL its events go to the ledger only (no lane, no reply, nothing woken) until the time runs out or the hold is lifted. Use it when you have decided not to answer an agent. The hold shows in the digest. minutes: how long; until_lifted: true to hold until it is lifted (peer_hold again with minutes 0, or Joey /lanes release <peer>).',
@@ -3511,7 +3515,7 @@ export function mainToolDefs(): any[] {
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'peer_hold'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'memory_history', 'memory_revert', 'peer_hold'].includes(name) }
 
 async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   let topic: number | undefined
@@ -3580,6 +3584,46 @@ function memoryDecide(a: any): string {
   return file ? `${decision === 'rewrite' ? 'rewritten and ' : ''}accepted: ${id} written to memory (${file}, committed as ${D.agent}.main); decision recorded.` : `vetoed: ${id}; nothing written; decision recorded.`
 }
 
+// ------------------------------------------------------------------ 002l (N2): the main sees the memory history and can undo a change
+// design/memory 「版控：要，但不是拿來合併…看得到哪條線在什麼時候改了什麼。改壞了能退回。整理線動過之後，主線可以整批檢視」 and the rule 「主線…隨時可以…退回任何一次改動」.
+// The memory directory was a git repo with an auto-commit per write, but nothing showed it to the main: D05's "undo that change" became a hand rewrite
+// (1efa2f8). memory_history lists the commits (who: the lane, thread, file, when); memory_revert makes a real revert commit in the main's name.
+function memGit(args: string[], who?: string): { code: number; out: string; err: string } {
+  const env = who ? { ...process.env, GIT_AUTHOR_NAME: who, GIT_AUTHOR_EMAIL: `${who}@genesis.lab`, GIT_COMMITTER_NAME: who, GIT_COMMITTER_EMAIL: `${who}@genesis.lab` } : process.env
+  const r = spawnSync('git', ['-C', memoryDir(), ...args], { env, encoding: 'utf8' })
+  return { code: r.status ?? 1, out: String(r.stdout ?? ''), err: String(r.stderr ?? '') }
+}
+export function memoryHistory(a: any): string {
+  if (!existsSync(join(memoryDir(), '.git'))) return 'the memory directory has no history yet (nothing has been written since it was put under version control).'
+  const n = Math.max(1, Math.min(50, Number(a?.limit) || 15))
+  const file = String(a?.file ?? '').trim()
+  const r = memGit(['log', `-n${n}`, '--date=iso-strict', '--name-only', '--format=%x1e%h%x1f%ad%x1f%an%x1f%s%x1f%b', ...(file ? ['--', file] : [])])
+  if (r.code !== 0) return `memory_history failed: ${r.err.trim().slice(0, 200) || 'git log failed'}`
+  const rows = r.out.split('\x1e').map(x => x.trim()).filter(Boolean).map(rec => {
+    const [head, ...files] = rec.split('\n')
+    const [sha, at, author, subject, body = ''] = head.split('\x1f')
+    const thread = (body.match(/thread=(\S+)/) ?? [])[1] ?? '-'
+    return `${sha} ${stamp(at)} ${author}（thread ${thread}）${subject}${files.filter(Boolean).length ? `：${files.filter(Boolean).join(', ')}` : ''}`
+  })
+  return rows.length ? `memory history, newest first (undo one with memory_revert(sha, reason)):\n${rows.join('\n')}` : 'no memory changes recorded.'
+}
+export function memoryRevert(a: any): string {
+  const sha = String(a?.sha ?? '').trim(), reason = String(a?.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+  if (!/^[0-9a-f]{4,40}$/i.test(sha)) return 'memory_revert refused: sha must be a commit id from memory_history (hex).'
+  if (!reason) return 'memory_revert refused: reason is required (one line: why).'
+  if (S.curator) return `memory_revert refused: the curator lane ${S.curator.lane} holds the memory write right now; take it back first (curate_stop).`
+  if (!existsSync(join(memoryDir(), '.git')) || memGit(['cat-file', '-e', `${sha}^{commit}`]).code !== 0) return `memory_revert refused: no commit ${sha} in the memory history (memory_history lists them).`
+  const who = `${D.agent}.main`
+  const subj = memGit(['log', '-1', '--format=%s', sha]).out.trim()
+  const r = memGit(['revert', '--no-commit', sha], who)
+  if (r.code !== 0) { memGit(['revert', '--abort']); return `memory_revert failed: ${sha} does not undo cleanly (a later change touched the same lines): ${r.err.trim().slice(0, 200)}. Nothing was changed; edit it by hand if you must.` }
+  const c = memGit(['commit', '-q', '-m', `memory: revert ${sha} (${subj})\n\nlane=${who} thread=- reverts=${sha} reason=${reason}`], who)
+  if (c.code !== 0) { memGit(['revert', '--abort']); return `memory_revert failed: the revert could not be committed (${c.err.trim().slice(0, 200) || 'nothing to revert'}). Nothing was changed.` }
+  const nsha = memGit(['rev-parse', '--short', 'HEAD']).out.trim()
+  ledger({ lane: 'main', kind: 'action', notify_main: false, text: `主線退回記憶改動 ${sha}（${subj}）：${reason}；退回的提交 ${nsha}`, refs: { memory_revert: sha, commit: nsha, reason } })
+  logos('lane.memory_revert', { sha, commit: nsha })
+  return `reverted ${sha} (${subj}) with commit ${nsha} in your name; the memory files are back to what they were before it.`
+}
 export async function callMainTool(name: string, a: any, mcpSid: string | undefined): Promise<string> {
   if (!isMainMcpSession(mcpSid)) return `refused: ${name} is only available to ${D.agent}'s registered main session (you are not it).`
   switch (name) {
@@ -3609,6 +3653,8 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     }
     case 'ledger_query': return ledgerQueryTool(a)
     case 'memory_decide': return memoryDecide(a)                // 002k (D1)
+    case 'memory_history': return memoryHistory(a)              // 002l (N2)
+    case 'memory_revert': return memoryRevert(a)                // 002l (N2)
     case 'peer_hold': return peerHoldTool(a)                    // 002k (H14)
     case 'commitment': {                                       // 002k (C1, G10)
       const chk = checkCommitmentArgs(a)
