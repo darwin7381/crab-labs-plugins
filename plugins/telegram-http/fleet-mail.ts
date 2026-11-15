@@ -170,7 +170,10 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if (title && [...title].length > TITLE_MAX) return text(`標題 ${[...title].length} 字，上限 ${TITLE_MAX}。沒有寄出。`, true)
       const r = await deps.btcc('POST', `/api/mesh/mail/${id}/reply`, { body, ...(title ? { title } : {}) })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
-      return text(r.json.stored ? `回信放進對方信箱了（#${r.json.id}，不用回）。` : `對方信箱還沒開，回信直接送進它的 session（#${r.json.id}，不用回）。`)
+      const j = r.json
+      if (j.stored) return text(`回信放進對方信箱了（#${j.id}，不用回）。`)
+      if (j.delivered) return text(`對方信箱還沒開，回信直接送進它的 session（#${j.id}，不用回）。`)
+      return text(`回信 #${j.id} 記下了，但送不到對方：${j.detail ?? '?'}`, true)
     }
     case 'mail_sent': {
       const lim = intId(args.limit) ?? 20

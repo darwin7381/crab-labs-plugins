@@ -102,6 +102,17 @@ describe('fleet MCP server', () => {
     const long = await handleFleetRpc(tool('mailbox_reply', { id: 11, body: 'x', title: '一'.repeat(41) }), d)
     expect(long.result.isError).toBe(true)
   })
+  test('a reply that could not be delivered is an error, not a success', async () => {
+    let reply: any = { status: 200, json: { id: 31, stored: false, delivered: false, detail: 'receiver 502' } }
+    const { d } = deps({ btcc: async () => reply })
+    const r = await handleFleetRpc(tool('mailbox_reply', { id: 11, body: 'x' }), d)
+    expect(r.result.isError).toBe(true)
+    expect(out(r)).toContain('送不到對方：receiver 502')
+    reply = { status: 200, json: { id: 32, stored: false, delivered: true } }
+    const ok = await handleFleetRpc(tool('mailbox_reply', { id: 11, body: 'x' }), d)
+    expect(ok.result.isError).toBeUndefined()
+    expect(out(ok)).toContain('直接送進它的 session（#32')
+  })
   test('a BTCC error surfaces its detail', async () => {
     const { d } = deps({ btcc: async () => ({ status: 409, json: { detail: 'mail #11 is already checked off' } }) })
     const r = await handleFleetRpc(tool('mailbox_check', { id: 11 }), d)
