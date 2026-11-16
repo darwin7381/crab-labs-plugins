@@ -2641,6 +2641,7 @@ function startRun(it: QItem): void {
   let warnedTurns = false, warnedBudget = false                        // 002l (D8, N4): the limit notices of this run
   const lastResults: string[] = []                                     // 002l (D8): the last tool results of the run, for the stop row's partial
   const cliReceipts = new Map<string, string>()                         // 002l (D14): tool_use id of a Bash `btcc-receipt complete N` → N
+  const restarts = new Map<string, { svc: string; cmd: string }>()       // 002m (L6B1): tool_use id of a Bash restart → the service
   child.stdout!.setEncoding('utf8')
   child.stdout!.on('data', (chunk: string) => {
     buf += chunk
@@ -2658,6 +2659,8 @@ function startRun(it: QItem): void {
             tools.push({ name: c.name, input: c.input })
             const rid = c.name === 'Bash' ? cliReceiptRun(String(c.input?.command ?? '')) : null       // 002l (D14): the card's receipt CLI, completed by the lane itself
             if (rid && c.id) cliReceipts.set(String(c.id), rid)
+            const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
+            if (rs && c.id) restarts.set(String(c.id), { svc: rs, cmd: String(c.input?.command ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) })
           }
           else if (c?.type === 'text' && String(c.text ?? '').trim()) lastText = String(c.text)
         }
@@ -2683,6 +2686,18 @@ function startRun(it: QItem): void {
           const body = typeof c.content === 'string' ? c.content : Array.isArray(c.content) ? c.content.map((x: any) => x?.text ?? '').join(' ') : ''
           const rid = cliReceipts.get(String(c.tool_use_id ?? ''))
           if (rid && !c.is_error && (/"state"\s*:\s*"completed"/.test(body) || !/error|not found|denied|refused|失敗|錯誤|usage:/i.test(body))) { (tok.completedRuns ??= []).push(rid); markSchedDone(rid, lane.id, runId, 'cli') }   // 002l (D14): it went through
+          const rst = restarts.get(String(c.tool_use_id ?? ''))
+          if (rst) {
+            // 002m (L6B1): runbook §4 counts the restarts of the last 24 h (a third one needs Joey first), and lanes count them with ledger_query. The count
+            // read free text (「./bin/svc POST mock-api/restart」, 「重啟」), and the tool's own example `text="restart mock-api"` matched none (B r3). Every restart
+            // a lane runs is one structured action: text 「restart <service>…」, refs.restart = <service>.
+            restarts.delete(String(c.tool_use_id ?? ''))
+            const ok = !c.is_error && !/"error"|blocked|not found|denied|refused|失敗|錯誤|failed|curl: \(\d+\)/i.test(body)
+            ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action', notify_main: false,
+              text: `restart ${rst.svc}${ok ? '' : '（沒有成功）'}：${lane.id} 執行 ${rst.cmd}${ok ? '' : `；結果：${body.replace(/\s+/g, ' ').trim().slice(0, 160)}`}`,
+              refs: { restart: rst.svc, ok, cmd: rst.cmd, run: runId } })
+            logos('lane.restart', { lane: lane.id, run: runId, event: it.ev.id, svc: rst.svc, ok })
+          }
           if (body.trim()) { lastResults.push(body.replace(/\s+/g, ' ').trim().slice(0, 300)); if (lastResults.length > 2) lastResults.shift() }
         }
       }
@@ -3038,7 +3053,8 @@ const LEDGER_QUERY_PROPS = {
   text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } }
 export const LANE_LEDGER_QUERY_DESCRIPTION =
   "[read only] Look back in the agent's ledger (what the lanes handled, told Joey, promised, handed over). Use it to count or check history yourself, e.g. restarts of a service in the last 24 h: " +
-  'ledger_query(since="-24h", text="restart mock-api"). Filters: `text` (substring or regex), `since`, `kind`. No filter = the activity list (one line per event). ' +
+  'ledger_query(since="-24h", text="restart mock-api") lists one "restart mock-api" action for every restart a lane ran (the router writes it when the restart command returns; a failed one says 沒有成功); ' +
+  'restarts done by the main or by hand are not in it, so also read the notices it lists. Filters: `text` (substring or regex), `since`, `kind`. No filter = the activity list (one line per event). ' +
   'A filtered answer ends with the per-kind counts; at most 30 entries, newest last. It writes nothing.'
 export const LANE_TOOLS = [
   { name: 'ledger_query', description: LANE_LEDGER_QUERY_DESCRIPTION, inputSchema: { type: 'object', properties: LEDGER_QUERY_PROPS } },
@@ -3765,6 +3781,16 @@ function markSchedDone(rid: string, lane: string, run: string, by: 'receipt' | '
   saveState()
 }
 /** 002l (D14): the scheduler run a Bash command completes with the workspace's receipt CLI (./bin/btcc-receipt complete <run> …), or null */
+/** 002m (L6B1): the service a Bash command restarts, or null: the workspace's `svc POST <service>/restart` (any path to svc), `systemctl restart <unit>`,
+ *  `docker restart <name>`, `kubectl rollout restart <kind>/<name>` */
+export function restartCommand(cmd: string): string | null {
+  const c = String(cmd ?? '')
+  let m = c.match(/(?:^|[\s/;&|(])svc\s+POST\s+['"]?\/?([A-Za-z0-9._-]+)\/restart\b/i)
+  if (m) return m[1]
+  m = c.match(/\bsystemctl\s+(?:--\S+\s+)*restart\s+([A-Za-z0-9@._-]+)/) ?? c.match(/\bdocker\s+(?:compose\s+)?restart\s+([A-Za-z0-9._-]+)/)
+    ?? c.match(/\bkubectl\s+(?:\S+\s+)*?rollout\s+restart\s+(?:[a-z]+\/)?([A-Za-z0-9._-]+)/)
+  return m ? m[1].replace(/\.service$/, '') : null
+}
 export function cliReceiptRun(cmd: string): string | null {
   const m = String(cmd ?? '').match(/btcc-receipt\b[^\n;&|]*?\bcomplete\b[^\n;&|]*?(?:--run(?:-id)?[ =]|run[:=]|\s)(\d+)\b/i)
   return m ? m[1] : null
