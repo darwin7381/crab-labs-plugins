@@ -1,3 +1,18 @@
+## 1.31.0 — 2026-11-16
+
+- **Communication texts on the new frame (WO-99; Joey TG chiron:1483).**
+  - Joey: 「Harness 的重點在產生認知有對的高層框架理解後面才是寫其他細則」.
+  - Measured over 20 h on 36 agents: mail overused, 12 of 25 sampled calls should have been mail, almost no wall posts, `send_to_agent` still used 10 times. The fleet text told everyone 「大部分的事是信，拿不準就寄信」.
+  - The new frame: how to choose a tier is written in ONE place, the fleet server's instructions. It opens with the frame: 「艦隊通訊：一個工具，三級」, every send is judged, a tier higher than needed is abuse. Nothing else repeats it.
+  - Texts are Chiron's (`knowledge/a2a-rewrite-20261116/`), used verbatim:
+    - `fleet-text.ts` (805 chars, was 1,327);
+    - the agent-inbox server instructions (841, was 1,983);
+    - one sentence per fleet tool. The 「寄之前①②③」 guide that `call`, `send_mail` and `feed_post` each carried is gone.
+  - **`send_to_agent` removed.** The agent-inbox server exposes no tools; sending lives on the fleet server. `sendToAgent()` stays, because the fleet `call` uses it. A stale caller gets "unknown tool".
+  - Canaries now point at the new wording: three replaced, none dropped.
+  - Sessions read the new texts after a restart (one fleet-wide wave).
+- Tests: `fleet-mail.test.ts` checks the new first line; all files pass.
+
 ## 1.30.0 — 2026-11-16
 
 - **The agent-inbox daemon sends 保溫 and 讀信箱 itself, for agents the Mac mini watchdog cannot see** (MBP daddy-claude, txmonster monster-steropes). Joey TG chiron:1483: 「我要求的是全面動起來，為何…有兩台機器沒上？」; Chiron btcc 9639.
