@@ -15,7 +15,7 @@ const bin = join(dir, 'lane.py')
 writeFileSync(bin, `#!/usr/bin/env python3\nimport sys, json, time\nargv = sys.argv[1:]\nopen('${dir}/prompts.jsonl', 'a').write(json.dumps({'prompt': argv[argv.index('-p') + 1]}) + '\\n')\ntime.sleep(float(open('${dir}/sleep').read()))\nprint('{"type":"result","subtype":"success","is_error":false,"result":"ok"}')\n`)
 chmodSync(bin, 0o755)
 const restore = L.__setClaudeBin(bin)
-afterAll(() => { L.__setClaudeBin(restore); L.__setAlertRepeatMin(10) })
+afterAll(() => { L.__setClaudeBin(restore); L.__setAlertRepeatMin(10); L.__setAlertRerunGap(300_000) })
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {},
   deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'], sendBot: async () => 1, joeyChatId: () => '1' } as any)
 L.__setMainConnected('mcp-main')
@@ -50,22 +50,51 @@ test('B12: the B08 burst of twelve repeats opens ONE lane; eleven "repeat n of <
   expect(await until(() => exits() >= 1)).toBe(true)
   await sleep(300)
   expect(rows('lanes.jsonl').filter(r => r.kind === 'spawn').length).toBe(1)          // one process for twelve alerts
-  // the lane has ended, no follow-up: a repeat within the window opens no new lane. 002l (RV1 alertRepeat): it is not parked unseen either: the owner lane runs
-  // again on its own thread, with this repeat and the eleven parked while it ran
+  // the lane has ended, no follow-up: a repeat within the window opens no new lane. 002m (LACDE1): the same values (only the 「第 n 次」 counter moved) make
+  // no run and no line for anybody (002l reran the owner here and Joey got 「numbers not worse, no restart」)
   const before = prompts().length
   const d13 = await L.routeEvent(alert('mesh-b13', burst(13)))
-  expect(d13.rule).toBe('alert-repeat'); expect(d13.target).toBe('lane'); expect(d13.lane).toBe(decisions[0].lane)
+  expect(d13.rule).toBe('alert-repeat'); expect(d13.target).toBe('ledger'); expect(d13.lane).toBe(decisions[0].lane)
+  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13')!.notify_main).toBe(false)
+  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13')!.text).toContain('數字沒有比')
+  // worse (p95 > 2s → > 3s) but the owner finished moments ago (the gap): no run yet; the main's digest has it
+  const worse = '[P2][warning] mock-api p95 > 3s（第 13 次偵測）'
+  expect(L.alertFingerprint('alert-dispatcher', worse)).toBe(L.alertFingerprint('alert-dispatcher', burst(1)))
+  const dg = await L.routeEvent(alert('mesh-b13g', worse))
+  expect(dg.target).toBe('ledger')
+  const rg = rows('ledger.jsonl').find(r => r.event === 'mesh-b13g')!
+  expect(rg.notify_main).toBe(true); expect(rg.refs.worse).toBe('2 → 3')
+  await sleep(300)
+  expect(prompts().length).toBe(before)
+  // after the gap, a worse repeat makes the owner lane run again on its own thread, with the repeats parked before it
+  L.__setAlertRerunGap(0)
+  const dw = await L.routeEvent(alert('mesh-b13w', worse))
+  expect(dw.target).toBe('lane'); expect(dw.lane).toBe(decisions[0].lane)
   expect(lanes().filter(l => l.kind === 'reflex').length).toBe(1)
   expect(await until(() => prompts().length > before)).toBe(true)
   const p = prompts()[before]
-  expect(p).toContain('（第 13 次偵測）'); expect(p).toContain('分流器標記：同一個警報在這條線處理完之後又來了')
-  expect(p).toContain('同一個警報又來了 11 次'); expect(p).toContain('（第 2 次偵測）')
-  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13')!.refs.rerun).toBe(true)
+  expect(p).toContain('p95 > 3s（第 13 次偵測）'); expect(p).toContain('分流器標記：同一個警報在這條線處理完之後又來了，而且數字比你上一趟看到的更糟（2 → 3）')
+  expect(p).toContain('同一個警報又來了 13 次'); expect(p).toContain('（第 2 次偵測）')
+  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13w')!.refs).toMatchObject({ rerun: true, worse: '2 → 3' })
   expect(await until(() => exits() >= 2)).toBe(true)
-  // one such run per window: the next repeat after it is folded again, and told to the main's digest (nothing on the thread will run soon)
-  const d14 = await L.routeEvent(alert('mesh-b13b', burst(13)))
+  // the owner has now seen 3s: the same again is unchanged (for nobody), even with no gap
+  const d14 = await L.routeEvent(alert('mesh-b13b', worse))
   expect(d14.target).toBe('ledger')
-  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13b')!.notify_main).toBe(true)
+  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13b')!.notify_main).toBe(false)
+  L.__setAlertRerunGap(300_000)
+})
+
+test('LACDE1: the values compared are the measurements the fingerprint masks: not identifiers, times, dates or the dispatcher\'s counter; lower is worse for what is left', () => {
+  const v = (t: string) => L.alertValues(t).map(x => x?.raw ?? null)
+  expect(v('[P2][warning] mock-api p95 > 2s（第 3 次偵測）')).toEqual([null, null, '2', null])
+  expect(v('[P2] error_rate 4.5% at 2026-11-15 12:50:03 run:47 #12')).toEqual([null, '4.5', null, null, null, null, null, null, null, null])
+  const a = L.alertValues('mock-api error rate 4.0%，可用副本 3 個'), b = L.alertValues('mock-api error rate 4.2%，可用副本 3 個')
+  expect(L.alertWorse(a, b)).toBe('')                                                    // +5%: noise, not worse
+  expect(L.alertWorse(a, L.alertValues('mock-api error rate 9.0%，可用副本 3 個'))).toBe('4.0 → 9.0')
+  expect(L.alertWorse(a, L.alertValues('mock-api error rate 4.0%，可用副本 1 個'))).toBe('3 → 1')   // fewer replicas is worse
+  expect(L.alertWorse(a, L.alertValues('mock-api error rate 1.0%，可用副本 5 個'))).toBe('')        // better is not worse
+  expect(L.alertWorse(L.alertValues('5xx 0 次'), L.alertValues('5xx 3 次'))).toBe('0 → 3')
+  expect(L.alertWorse(undefined, b)).toBe('')
 })
 
 test('B12: the repeats start the thread\'s next run (a pending follow-up) together, through extra', async () => {
@@ -131,9 +160,10 @@ test('B12: after the window (and with nothing queued, running or scheduled) the 
   const a = await L.routeEvent(alert('mesh-t1', text))
   expect(a.target).toBe('lane')
   expect(await until(() => lanes().find(l => l.id === a.lane)?.status === 'idle' && (lanes().find(l => l.id === a.lane)?.runs ?? 0) > 0)).toBe(true)
-  const b = await L.routeEvent(alert('mesh-t2', text.replace('第 1', '第 2')))        // within 10 minutes of its end: a repeat (002l: the owner runs again)
-  expect(b.rule).toBe('alert-repeat'); expect(b.lane).toBe(a.lane)
-  expect(await until(() => lanes().find(l => l.id === a.lane)?.status === 'idle' && (lanes().find(l => l.id === a.lane)?.runs ?? 0) > 1)).toBe(true)
+  const b = await L.routeEvent(alert('mesh-t2', text.replace('第 1', '第 2')))        // within 10 minutes of its end: a repeat (002m: unchanged, so no run)
+  expect(b.rule).toBe('alert-repeat'); expect(b.lane).toBe(a.lane); expect(b.target).toBe('ledger')
+  await sleep(400)
+  expect(lanes().find(l => l.id === a.lane)?.runs).toBe(1)
   L.__setAlertRepeatMin(0)                                                              // the window is over
   const c = await L.routeEvent(alert('mesh-t3', text.replace('第 1', '第 3')))
   expect(c.target).toBe('lane'); expect(c.lane).not.toBe(a.lane)
