@@ -1370,7 +1370,7 @@ function buildServer(): Server {
       ].join('\n'),
     } : {
       capabilities: {
-        tools: {},
+        tools: { listChanged: true },     // 002m (LG1): a session found not to be the main is told to list its tools again
         experimental: {
           'claude/channel': {},
           // Permission-relay opt-in (anthropics/claude-cli-internal#23061).
@@ -1436,6 +1436,9 @@ function buildServer(): Server {
 )
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+ // 002m (LG1): a claude process that is not the registered main (its register-main was refused, or a live main holds the role)
+ // gets none of the main's Telegram or lane tools (runtime RU5 「只有持有「主」的那一個，拿得到你主對話的回覆工具」).
+ if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.sessionNotMain(serverSessionId.get(mcp))) return { tools: [] }
  if (INBOX_ONLY) {
    // A2A mesh (Joey 4564): the inbox is bidirectional — every agent can message
    // every other agent in the fleet registry. Deliveries auto-log to BTCC Comms.
@@ -1565,6 +1568,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op)
       return { content: [{ type: 'text', text: result }] }
+    }
+    if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name) && Lanes.sessionNotMain(serverSessionId.get(mcp))) {
+      log('warn', `lanes: ${req.params.name} refused for MCP session ${serverSessionId.get(mcp)} (not the registered main)`)      // 002m (LG1)
+      return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
     }
     if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.isMainTool(req.params.name)) {
       const out = await Lanes.callMainTool(req.params.name, args, serverSessionId.get(mcp))
@@ -3238,6 +3245,11 @@ if (Lanes.LANES_ON) {
     deliverToMain,
     authOk: tokOk,
     repersistUnconsumed,
+    toolsChanged: (sid: string) => {      // 002m (LG1)
+      for (const s of activeServers) if (serverSessionId.get(s) === sid && sseOpen.get(sid)) {
+        void s.sendToolListChanged().catch(err => log('warn', `lanes: tools/list_changed to ${sid} failed: ${err}`))
+      }
+    },
     pendingCount: () => { try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length } catch { return 0 } },   // 002l (N6)
     sweepNow: () => { sweepDeliveries(); void drainPendingIfLive() },
     // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice

@@ -138,6 +138,8 @@ export interface LanesDeps {
   sweepNow?: () => void
   /** 002l (N6): how many deliveries are parked for the main right now (server.ts: inbox/pending) */
   pendingCount?: () => number
+  /** 002m (LG1): tell one MCP session that its tool list changed (server.ts: notifications/tools/list_changed), so it lists again */
+  toolsChanged?: (mcpSid: string) => void
   /** 002k (G16): the main's pane and the startup picker on it (server.ts builds it from startup-picker.ts when it knows the main's tmux target) */
   mainPicker?: MainPicker
 }
@@ -228,6 +230,28 @@ function restoreMain(): void {
 }
 export function mainRegistration(): MainReg | null { return mainReg }
 export function mainMcpSession(): string | null { return mainMcpSid }
+// ------------------------------------------------------------------ 002m (LG1): a session that is not the main has no Telegram tools
+// runtime RU5 「只有持有「主」的那一個，拿得到你主對話的回覆工具」 and RU4 「沒有發的工具，就是不能做的事。搞錯身份也做不出主線的事」; RT11 (a second claude
+// started in the folder is never the main). G01 (002l r1-r3): the refused second session still listed and could call reply, react and edit_message.
+const refusedPids = new Map<number, number>()          // claude pid → when its register-main was refused
+/** true when this MCP session belongs to a claude process that is NOT the main: its registration was refused, or a live main is
+ *  registered and bound to another session. A session whose process is not known yet, or any session while no live main is
+ *  bound (a main that is starting or being replaced), is not judged here. */
+export function sessionNotMain(mcpSid: string | undefined): boolean {
+  if (D?.role !== 'tg' || !mcpSid || mcpSid === mainMcpSid) return false
+  const pid = mcpSessionPid.get(mcpSid)
+  if (!pid) return false
+  if (refusedPids.has(pid) && pid !== mainReg?.claude_pid) return true
+  return !!(mainReg && mainMcpSid && pid !== mainReg.claude_pid && pidAlive(mainReg.claude_pid))
+}
+/** the Telegram tools only the main gets (server.ts), besides the main-only lane tools (isMainTool) */
+export const MAIN_TELEGRAM_TOOLS = ['reply', 'react', 'edit_message', 'download_attachment']
+export function notMainRefusal(name: string): string {
+  return `refused: ${name} is only available to ${D?.agent ?? 'this agent'}'s registered main session. This claude process is not the main (a second session in the same folder never is); nothing was sent.`
+}
+function toolsChangedForPid(pid: number): void {
+  for (const [s, p] of mcpSessionPid) if (p === pid) { try { D.toolsChanged?.(s) } catch {} }
+}
 export function isMainMcpSession(sid: string | undefined): boolean { return !!sid && sid === mainMcpSid }
 let mainDownSince = 0          // 002g: when the main was first seen gone; 0 = it is there
 function pidAlive(pid: number | null | undefined): boolean {
@@ -316,6 +340,7 @@ export function noteMcpSocket(sid: string, req: IncomingMessage): void {
   if (pid) mcpSessionPid.set(sid, pid)
   D.log('info', `lanes: MCP session ${sid} owned by claude pid ${pid ?? '?'}${mainReg && pid === mainReg.claude_pid ? ' (registered main)' : ''}`)
   maybeBindMain(sid)
+  if (sessionNotMain(sid)) { try { D.toolsChanged?.(sid) } catch {} }      // 002m (LG1): it listed its tools before it could be told apart; it lists again
 }
 export function forgetMcpSession(sid: string): void {
   mcpSessionPid.delete(sid)
@@ -566,8 +591,10 @@ function registerMain(req: IncomingMessage, b: any): { accepted: boolean; role: 
     D.log('warn', `lanes: register-main REFUSED session=${sid} pid=${pid ?? '?'}: ${reason}`)
     appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })
     logos('lane.register_refused', { session_id: sid, pid, reason, role: D.role })
+    if (pid) { refusedPids.set(pid, Date.now()); toolsChangedForPid(pid) }          // 002m (LG1)
     return { accepted: false, role: 'not-main', reason, main: mainReg?.session_id }
   }
+  refusedPids.delete(pid)
   const prev = mainReg
   mainReg = { session_id: sid, transcript_path: String(b.transcript_path ?? ''), claude_pid: pid, registered_at: nowIso(), source: b.source }
   if (D.role === 'tg') writeJsonAtomic(join(LANES_DIR, 'main.json'), mainReg)
@@ -744,6 +771,8 @@ function saveState(): void { try { writeJsonAtomic(statePath(), S) } catch (e) {
 /** tests only: the live state object */
 export const __lanesState = (): State => S
 /** tests only: pretend the registered main's MCP session is (not) connected; "not" = gone for a long time unless downForMs says otherwise */
+/** test: an MCP session owned by claude pid `pid` opened its stream (what noteMcpSocket learns from the socket) */
+export const __noteMcpPid = (sid: string, pid: number): void => { mcpSessionPid.set(sid, pid); maybeBindMain(sid); if (sessionNotMain(sid)) { try { D.toolsChanged?.(sid) } catch {} } }
 export const __setMainConnected = (sid: string | null, downForMs = 3_600_000): void => { mainMcpSid = sid; mainDownSince = sid ? 0 : Date.now() - downForMs }
 /** tests only */
 export const __setMainPid = (pid: number): void => { if (mainReg) mainReg.claude_pid = pid }
