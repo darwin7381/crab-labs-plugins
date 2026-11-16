@@ -59,6 +59,8 @@ import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { DutyOfficer, askModelCli, isDutyCallback, realTmux } from './duty-officer.ts'
+import { LocalKeepwarm } from './keepwarm-local.ts'
+import { parseFleetConfig } from './fleet-config.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
@@ -1711,6 +1713,45 @@ async function paneWatchTargets(): Promise<WatchTarget[]> {
 // duty-officer (~/.config/mesh/duty-officer.credential); without it they are kept in rulings-unsent.jsonl.
 const DUTY_RULINGS_TO = (process.env.DUTY_OFFICER_RULINGS_TO ?? 'chiron').trim()
 const DUTY_CREDENTIAL = join(homedir(), '.config', 'mesh', 'duty-officer.credential')
+// 保溫 / 讀信箱 from this agent-inbox daemon itself, for agents the Mac mini watchdog cannot see (MBP, txmonster;
+// Joey TG chiron:1483). Switch KEEPWARM_LOCAL (live | dry | off) in the machine config, re-read every pass, so
+// setting it to off stops it without a restart. The Mac mini never sets it (its agents are the watchdog's).
+function keepwarmMode(): 'live' | 'dry' | 'off' {
+  let v = process.env.KEEPWARM_LOCAL ?? ''
+  try { v = parseFleetConfig(readFileSync(FLEET_CONFIG_PATH, 'utf8')).KEEPWARM_LOCAL ?? v } catch {}
+  v = v.trim()
+  return v === 'live' || v === 'dry' ? v : 'off'
+}
+if (INBOX_ONLY && keepwarmMode() !== 'off') {
+  new LocalKeepwarm({
+    name: INBOX_SELF,
+    stateDir: STATE_DIR,
+    mode: keepwarmMode,
+    projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
+    // this agent's own unread count, with its own credential (an agent may read only its own row)
+    mail: async () => {
+      try {
+        const r = await btccMail('GET', '/api/mesh/mail/counts/all')
+        if (r.status !== 200) return null
+        const mine = (r.json?.counts ?? {})[INBOX_SELF]
+        return mine ? { on: true, n: Number(mine.n ?? 0), oldestS: mine.oldest_s ?? null } : { on: false, n: 0, oldestS: null }
+      } catch { return null }
+    },
+    // the same line the Mac mini watchdog sends through /inject: sender fleet-watchdog, no_reply
+    deliver: async (text) => {
+      if (activeServers.size === 0) return false
+      const chatId = String(loadAccess().allowFrom[0] ?? 'local-inject')
+      await dispatchInbound(chatId, {
+        method: 'notifications/claude/channel',
+        params: { content: text, meta: { chat_id: chatId, user: 'fleet-watchdog', user_id: 'local-inject',
+          ts: new Date().toISOString(), via: 'local-inject', verified: 'true', relay: 'daemon', no_reply: 'true' } },
+      })
+      return true
+    },
+    log,
+  }).start()
+}
+
 let dutyOfficer: DutyOfficer | null = null
 if (isControlEnabled() || isRoamerEnabled()) {
   dutyOfficer = new DutyOfficer({
