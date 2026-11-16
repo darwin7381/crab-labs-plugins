@@ -5,7 +5,7 @@ import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { renderDigest, parseLedgerLine, DIGEST_MAX_HEAVY, DIGEST_MAX_ROUTINE, MUST_KNOW_MARK, type LedgerRec } from './lanes-digest.ts'
+import { renderDigest, parseLedgerLine, DIGEST_MAX_HEAVY, DIGEST_MAX_ROUTINE, DIGEST_MAX_LINES, digestContentLines, MUST_KNOW_MARK, type LedgerRec } from './lanes-digest.ts'
 const L0 = await import('./lanes.ts?b15-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-b15-'))
@@ -100,8 +100,11 @@ test('B15: what the caps never cut: escalations, critical marks and Joey-sourced
   for (const n of [6, 7, 8, 9]) expect(d.text).toContain(`${MUST_KNOW_MARK}adam.reflex.${n}｜adam#t-m${n}`)
   for (const n of [10, 11, 12]) expect(d.text).toContain(`adam#t-j${n}`)
   for (const n of [13, 14, 15, 16]) expect(d.text).not.toContain(`adam#t-h${n}`)      // over the cap: the 3 are used up by the never-cut blocks
-  expect(d.text).toContain('另有 4 條線沒列出')
-  expect(d.text).toContain('adam#t-r20')
+  // 002m (L6B5): twelve blocks that may not be dropped do not fit the design's 8 lines: they get a line each while there is room, the rest are named on one
+  // line (every one is still in the text), and the threads left out are counted on it (the 4 promises and the routine r20)
+  expect(d.text).toContain('另有 5 條線沒列出')
+  expect(d.text).not.toContain('adam#t-r20｜例行')
+  expect(digestContentLines(d.text).length).toBe(DIGEST_MAX_LINES)
   // with room, the ordinary heavy blocks are shown up to the cap
   const roomy = renderDigest([escalationOf(1), ...[13, 14, 15, 16].map(n => heavy(n))])!
   expect(lines(roomy).filter(l => l.startsWith('▸')).length).toBe(DIGEST_MAX_HEAVY)    // 1 escalation + 2 of the 4
