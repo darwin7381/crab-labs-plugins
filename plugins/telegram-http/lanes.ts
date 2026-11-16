@@ -249,6 +249,19 @@ export const MAIN_TELEGRAM_TOOLS = ['reply', 'react', 'edit_message', 'download_
 export function notMainRefusal(name: string): string {
   return `refused: ${name} is only available to ${D?.agent ?? 'this agent'}'s registered main session. This claude process is not the main (a second session in the same folder never is); nothing was sent.`
 }
+// 002m (LG2): a refused registration is told to Joey once, at once (G01: within 120 s). stability SR3 「主線卡死…還能主動告訴你」 and notify
+// 「要你馬上知道的 → 正常推播：…嚴重警報」: a second claude claiming the main role is a health alert; until 002l it was only logged.
+const refusedTold = new Set<string>()
+function tellRefused(sid: string, pid: number | null, reason: string): void {
+  if (D?.role !== 'tg' || refusedTold.has(sid)) return
+  refusedTold.add(sid)
+  const main = mainReg?.session_id
+  const text = `有另一個 claude session 想登記成 ${D.agent} 的主線，被我拒絕了（session ${sid.slice(0, 8)}${pid ? `，行程 ${pid}` : ''}）。`
+    + (main ? `主線還是 session ${main.slice(0, 8)}，照常運作；那個 session 拿不到 Telegram 的回覆工具。` : '目前沒有登記中的主線；那個 session 拿不到 Telegram 的回覆工具。')
+    + '如果不是你開的，請把它關掉；要換主線請用 /main renew。'
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'register-refused', escalated: true, session: sid, pid, reason } })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'register-refused', message_id: id, session: sid }))
+}
 function toolsChangedForPid(pid: number): void {
   for (const [s, p] of mcpSessionPid) if (p === pid) { try { D.toolsChanged?.(s) } catch {} }
 }
@@ -592,6 +605,7 @@ function registerMain(req: IncomingMessage, b: any): { accepted: boolean; role: 
     appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })
     logos('lane.register_refused', { session_id: sid, pid, reason, role: D.role })
     if (pid) { refusedPids.set(pid, Date.now()); toolsChangedForPid(pid) }          // 002m (LG1)
+    tellRefused(sid, pid, reason)                                                       // 002m (LG2)
     return { accepted: false, role: 'not-main', reason, main: mainReg?.session_id }
   }
   refusedPids.delete(pid)
