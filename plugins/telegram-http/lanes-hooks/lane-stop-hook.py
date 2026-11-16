@@ -28,6 +28,7 @@ DECLINE_RE = re.compile(r"無法|沒辦法|can[’']t|cannot|unable", re.I)
 SAID_TOOLS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__reply_agent')
 PEER_RUN = re.compile(r'來源 mesh｜寄件者 ([^\s（(｜]+)')
 AUTOMATED = ('scheduler', 'alert-dispatcher', 'main')
+SCHEDULED_RUN = re.compile(r'\[車道事件[^\]]*寄件者 scheduler')                # 002n: the event block of a scheduled run (sent by the scheduler)
 API_SUBJECT = re.compile(r'mock-api|\bapi\b|config|health|p95|5xx|replica|log_level|maintenance|timeout|設定|維護|逾時|健康|延遲|錯誤率', re.I)
 
 
@@ -234,10 +235,16 @@ def main():
     said, looked = {}, False
     sent = []                                     # 002m aid (b): every message the run sent to a peer or to Joey, in order
     names_used = set()
+    ids, failed = {}, set()                      # 002n: tool_use id -> name, and the ids whose result was an error
     for line in lines[last_user + 1:]:
         try:
             j = json.loads(line)
         except Exception:
+            continue
+        if j.get('type') == 'user':
+            for c in j.get('message', {}).get('content', []) or []:
+                if isinstance(c, dict) and c.get('type') == 'tool_result' and c.get('is_error'):
+                    failed.add(c.get('tool_use_id'))
             continue
         if j.get('type') != 'assistant':
             continue
@@ -245,6 +252,7 @@ def main():
             if not isinstance(c, dict) or c.get('type') != 'tool_use':
                 continue
             n = c.get('name', '')
+            ids[c.get('id')] = n
             if n in SAID_TOOLS:
                 said[n] = str((c.get('input') or {}).get('text', ''))      # the LAST text of each of the three tools
             if n in ('mcp__lane__reply_agent', 'mcp__lane__notify_joey'):
@@ -327,11 +335,22 @@ def main():
                     except Exception:
                         pass
                 said_lines = '\n'.join(f'- to {to} ({t.replace("mcp__lane__", "")}): 「{snt[:200]}」' for t, to, snt, _ in hits[:4])
+                # 002n: a scheduled run that already sent Joey its one message cannot ask_joey (L6B3, card 「每個排程回合最多一次 notify_joey」; the
+                # refusal itself says: hand it to the main). Telling it to call ask_joey led B06 r1 to a refused ask, a hand-over and a second receipt
+                # (「排程回執只送一次」). Such a run is told the way that works, and that its receipt is already recorded.
+                notified = any(nm == 'mcp__lane__notify_joey' and i not in failed for i, nm in ids.items())
+                receipted = any(nm == 'mcp__lane__receipt' and i not in failed for i, nm in ids.items())
+                if SCHEDULED_RUN.search(prompt_text) and notified:
+                    todo = ('This is a scheduled run and it already sent Joey its one message (notify_joey), so ask_joey will be refused. If Joey has to decide, '
+                            'call handoff_main with what he has to decide (the main asks him); if neither Joey nor the main has to do anything, end without a '
+                            'correction.' + (' Your receipt for this run is already recorded: do not send another receipt.' if receipted else ''))
+                else:
+                    todo = ('Before ending, do one of these: if Joey has to decide, call ask_joey (one message; it rings); if the main has to act, call '
+                            'handoff_main; if neither is true, send a correction to whoever you told (reply_agent to the peer, notify_joey to Joey) that says '
+                            'who actually handles it.')
                 print(json.dumps({'decision': 'block', 'reason': (
                     f'⛔ lane-stop-hook: {lane} said the matter was (or will be) passed to Joey or the main:\n{said_lines}\n'
-                    'but this run called neither ask_joey nor handoff_main, so nobody has it. Before ending, do one of these: if Joey has to decide, call ask_joey '
-                    '(one message; it rings); if the main has to act, call handoff_main; if neither is true, send a correction to whoever you told '
-                    '(reply_agent to the peer, notify_joey to Joey) that says who actually handles it.')}, ensure_ascii=False))
+                    'but this run called neither ask_joey nor handoff_main, so nobody has it. ' + todo)}, ensure_ascii=False))
                 return
     if closed:
         return
