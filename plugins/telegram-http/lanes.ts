@@ -2805,9 +2805,16 @@ function startRun(it: QItem): void {
         : capped === 'usd' ? `預算：這一趟花到單趟的金額上限（--max-budget-usd ${laneMaxUsd(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
         : `這一趟到了回合上限（--max-turns ${laneMaxTurns(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
       const toldJoey = !it.ev.fanout && !closers.some(c => TOLD.includes(c))
+      // 002m (L6B6): DC1, one report per event. A run that already asked Joey (ask_joey: the event is his to decide) or already handed the event to the
+      // main (handoff_main: that wake carries it) and is then cut by its cap does not wake the main a second time (B r1: closers notify, ask, receipt;
+      // turns 12; the stop woke the main and it sent #1027, the same question as ask #1026). The stop still goes to the main's next digest.
+      const owned = it.ev.fanout ? undefined : closers.find(c => c === 'ask_joey' || c === 'handoff_main')
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', notify_main: true,
-        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}${toldJoey ? '。車道已經用它自己的標記告訴 Joey 這一趟被中止、由你接手；你接手做完再回報，不用重講中止的事。' : ''}`,
-        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
+        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}${toldJoey ? '。車道已經用它自己的標記告訴 Joey 這一趟被中止、由你接手；你接手做完再回報，不用重講中止的事。' : ''}`
+          + (owned === 'ask_joey' ? '。這一趟在中止前已經用 ask_joey 問過 Joey，這件事等他決定：這一筆只是讓你知道，不要再向 Joey 回報或重問。'
+            : owned === 'handoff_main' ? '。這一趟在中止前已經用 handoff_main 把這件事交給你（看那一筆交辦）；這一筆只是讓你知道它被中止，不用另外回報。' : ''),
+        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial,
+          ...(owned ? { wake: false, owned_by: owned } : {}) } })
       logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET })
       D.log('warn', `lanes: ${runId} stopped (${capped}): ${why}`)
       if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊被中止：${capped === 'turns' ? '回合上限' : '預算'}；結果到中止為止：${partial}）`)

@@ -60,7 +60,8 @@ export function cleanReport(a: unknown): LaneReport | null {
 export function isWakeEntry(r: LedgerRec): boolean {
   // 002d: only work that was handed to the main wakes it (a lane's handoff_main, a lane that failed, a stopped thread).
   // A message a lane already sent to Joey, ringing or not, is a line in the main's next digest and wakes nobody.
-  return !!r.notify_main && (r.kind === 'escalation' || r.kind === 'stop')
+  // 002m (L6B6): a stop of a run that had already asked Joey or handed the event over says wake: false (one report per event)
+  return !!r.notify_main && (r.kind === 'escalation' || r.kind === 'stop') && r.refs?.wake !== false
 }
 
 // ------------------------------------------------------------------ rendering
