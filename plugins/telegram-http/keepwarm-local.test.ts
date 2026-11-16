@@ -93,7 +93,7 @@ describe('decideMail', () => {
     expect(decideMail(s, st, idle51 + 3700, 1, 7000, false)[0]).toBe('remind')
   })
   test('the reminder text names the first step', () => {
-    expect(remindText(1, 2400)).toBe('讀信箱（1 封未讀，最舊的等了 40 分鐘）：先用 mailbox_list（mcp__plugin_agent-inbox_fleet__mailbox_list）看清單')
+    expect(remindText(1, 2400)).toBe('讀信箱（1 封未讀，最舊的等了 40 分鐘）：先用 mailbox_list（mcp__plugin_agent-inbox_agent-inbox__mailbox_list）看清單')
     expect(remindText(3, 7500)).toContain('2 小時 5 分')
   })
 })

@@ -1,3 +1,21 @@
+## 1.32.0 / agent-inbox 1.3.0 — 2026-11-16
+
+- **One sending tool again: `send_to_agent`, with three lines under it** (WO-99 v3). Joey TG chiron:1503: 「怎麼可以把他們跟其他的工具混再一起？…溝通工具整個的認知和注意力就會爆掉啊／應該跟原本一樣叫 send to agent 啊…只是這下面從一條線變成三條支線，並且有正確的寫法說明啊」.
+  - **`line` is required:** `feed` | `mail` | `call`.
+    - `mail` requires `ask` (what the recipient should do, answer or decide).
+    - `call` requires `because` (what breaks in an hour, or who is waiting); a reply with `reply_to` does not need it.
+    - Missing one, nothing is sent and the tool answers with Chiron's sentence, which points at the next line down.
+    - The two judgements live on the form itself.
+  - **The receiving side:** the mailbox list and an opened mail show the sender's `ask` (「要你：…」). A call carries `because` as its first line (「因為：…」).
+  - `call`, `send_mail` and `feed_post` are folded into it.
+  - **One server:** the `fleet` server is gone from the agent-inbox plugin's `.mcp.json`. Its receiving tools (`mailbox_*`, `mail_sent`, `feed_*`) are now on `agent-inbox`. Their full names are `mcp__plugin_agent-inbox_agent-inbox__*`; the 讀信箱 line names the new one.
+  - **One text:** Chiron's v3 instructions, verbatim (`inbox-text.ts`, 1,763 chars). The first half covers the three lines, the second how to read what arrives. The old note about a 2,048-char cap is gone: the measured cap is 4,096.
+  - **Transition:** `A2A_LEGACY`, on until the whole fleet has restarted.
+    - A session started before this version still holds the old tools. The daemon still takes the old `send_to_agent` (no `line`, sent as a call), `call`, `send_mail`, `feed_post`, and the `/fleet` route.
+    - `A2A_LEGACY=0` in the machine config turns them off.
+  - `op` (task site) stays an optional field of `send_to_agent`.
+- Tests: `fleet-mail.test.ts` +7 (three lines, the three sentences, legacy on/off, ask shown). Canaries follow the text into `inbox-text.ts`.
+
 ## 1.31.0 — 2026-11-16
 
 - **Communication texts on the new frame (WO-99; Joey TG chiron:1483).**

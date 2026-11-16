@@ -220,6 +220,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       if (!to || !title || !body) return text('send_mail: to、title、body 都要填', true)
       const r = await deps.btcc('POST', '/api/mesh/mail/send', {
         to, title, body, deadline: hoursOrIso(args.deadline), no_reply: args.no_reply === true,
+        ...(args.ask ? { ask: String(args.ask).trim() } : {}),
         ...(args.op ? { op: String(args.op) } : {}),
       })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
@@ -235,7 +236,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const mail = (r.json.mail ?? []) as any[]
       if (!mail.length) return text('信箱是空的。')
       const unread = mail.filter(m => m.status === 'unread').length
-      const lines = mail.map(m => `#${m.id}｜${m.from}｜${m.title}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${m.status === 'unread' ? '未讀' : '已讀'}${m.no_reply ? '｜不用回' : ''}`)
+      const lines = mail.map(m => `#${m.id}｜${m.from}｜${m.title}${m.ask ? `｜要你：${m.ask}` : ''}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${m.status === 'unread' ? '未讀' : '已讀'}${m.no_reply ? '｜不用回' : ''}`)
       return text(`${unread} 封未讀、${mail.length - unread} 封已讀還沒勾掉：\n${lines.join('\n')}`)
     }
     case 'mailbox_open': {
@@ -244,7 +245,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const r = await deps.btcc('GET', `/api/mesh/mail/${id}`)
       if (r.status !== 200) return text(errText(r), true)
       const m = r.json
-      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}\n\n${m.body}`)
+      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}\n\n${m.body}`)
     }
     case 'mailbox_check': {
       const id = intId(args.id)
@@ -332,6 +333,93 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       return withAfter(text(full(r.json)), r.json.read === true ? undefined : afterSendRead(deps, [id], 'open'))
     }
   }
+  return text(`unknown tool: ${name}`, true)
+}
+
+// ── agent-inbox server tools (WO-99 v3, Joey TG chiron:1503) ─────────────────────────────────────────────────
+// 「應該跟原本一樣叫 send to agent…只是這下面從一條線變成三條支線」: ONE sending tool, send_to_agent, whose
+// required `line` picks feed / mail / call; mail must say what it asks for (ask), a call why it can't wait (because).
+// The receiving tools stay, on the same server. Texts: Chiron's knowledge/a2a-rewrite-20261116/v3/, verbatim.
+// The fleet server (/fleet, FLEET_TOOLS above) stays only for sessions started before this version (transition).
+export const LINE_MISSING = '先填 line：這件事要不要某一隻動手、回答或決定？等一小時會不會壞？不需要誰動＝feed；要某一隻動、等得起＝mail；現在就要動＝call'
+export const ASK_MISSING = '信要填 ask：要它做什麼、回答什麼、或決定什麼。填不出來，這一則是動態（line=feed）'
+export const BECAUSE_MISSING = '呼叫要填 because：晚一小時什麼會壞，或誰正在等。填不出來，這一則是信（line=mail）'
+
+export const SEND_TOOL = {
+  name: 'send_to_agent',
+  description: [
+    '找別隻 agent 的唯一工具。每一次都要先填 line，走三條線的哪一條；怎麼判寫在 agent-inbox 的說明裡。',
+    '- line=feed 動態：貼到牆上，不通知任何人。填 title（50 字內）、text；可填 touches（動到什麼，最多 5 個詞）、ref（連動的工單）、supersedes（取代哪一則）。貼了不能改，寫錯就再貼一則並填 supersedes。',
+    '- line=mail 信：放進對方信箱，它一小時內會讀。填 to、title（50 字內：誰、對什麼、要它做什麼）、ask（要它做什麼、回答什麼、或決定什麼，一句）、text。可填 deadline（沒填是一天，到期它還沒讀你會收到一封信）、no_reply（它照做就好、不用回）。',
+    '- line=call 呼叫：立刻送進對方的 session，它會放下手上的事先看。填 to、because（晚一小時什麼會壞，或誰正在等，一句）、text。回一則呼叫時帶 reply_to，回覆自動標不用回。',
+  ].join('\n'),
+  inputSchema: {
+    type: 'object',
+    required: ['line', 'text'],
+    properties: {
+      line: { type: 'string', enum: ['feed', 'mail', 'call'], description: '必填，feed｜mail｜call。' },
+      to: { type: 'string', description: 'mail、call 必填；feed 不填。' },
+      title: { type: 'string', description: 'feed、mail 必填，50 字內，超過自動截短。' },
+      text: { type: 'string', description: '必填。' },
+      ask: { type: 'string', description: 'mail 必填（一句）。' },
+      because: { type: 'string', description: 'call 必填（一句）；帶 reply_to 的回覆不用填。' },
+      deadline: { type: 'string', description: 'mail 選填。' },
+      no_reply: { type: 'boolean', description: 'mail 選填。' },
+      touches: { type: 'array', items: { type: 'string' }, maxItems: TOUCH_MAX, description: 'feed 選填。' },
+      ref: { type: 'string', description: 'feed 選填。' },
+      supersedes: { type: 'integer', description: 'feed 選填。' },
+      reply_to: { type: 'string', description: 'call 選填。' },
+      op: { type: 'string', description: '選填：任務站（OP-3、3 或 slug）。' },
+    },
+  },
+}
+const RECEIVE_NAMES = ['mailbox_list', 'mailbox_open', 'mailbox_check', 'mailbox_reply', 'mail_sent', 'feed_ask', 'feed_search', 'feed_open']
+export const INBOX_TOOLS = [
+  SEND_TOOL,
+  ...FLEET_TOOLS.filter(t => RECEIVE_NAMES.includes(t.name)).map(t => t.name === 'mailbox_open'
+    ? { ...t, description: '打開一封信讀全文；打開就算已讀，寄的人看得到。信的開頭顯示寄件人填的 ask。' } : t),
+]
+
+const has = (v: unknown) => v != null && String(v).trim() !== ''
+
+/** send_to_agent: one tool, three lines. legacy = sessions started before WO-99 v3 are still around. */
+export async function sendToAgent(args: Record<string, unknown>, deps: FleetDeps, legacy: boolean) {
+  const line = String(args.line ?? '').trim()
+  if (!line) {
+    // a session started before this version holds the old send_to_agent (to, text, no_reply): a call, as before
+    if (legacy && has(args.to) && has(args.text)) {
+      const replyTo = intId(args.reply_to) ?? undefined
+      const r = await deps.call(String(args.to).trim(), String(args.text).trim(), replyTo,
+        args.no_reply === true || replyTo != null, args.op ? String(args.op) : undefined)
+      return text(r, !/^delivered/.test(r))
+    }
+    return text(LINE_MISSING, true)
+  }
+  if (line === 'feed') {
+    if (!has(args.title) || !has(args.text)) return text('line=feed 要填 title 和 text。', true)
+    return callTool('feed_post', { title: args.title, body: args.text, touches: args.touches, ref: args.ref, supersedes: args.supersedes, links: args.links }, deps)
+  }
+  if (line === 'mail') {
+    if (!has(args.ask)) return text(ASK_MISSING, true)
+    if (!has(args.to) || !has(args.title) || !has(args.text)) return text('line=mail 要填 to、title、ask、text。', true)
+    return callTool('send_mail', { to: args.to, title: args.title, body: args.text, ask: args.ask, deadline: args.deadline, no_reply: args.no_reply, op: args.op }, deps)
+  }
+  if (line === 'call') {
+    const replyTo = intId(args.reply_to)
+    if (!has(args.because) && replyTo == null) return text(BECAUSE_MISSING, true)
+    if (!has(args.to) || !has(args.text)) return text('line=call 要填 to、because、text。', true)
+    // the receiver reads why it can't wait before anything else: one line ahead of the text
+    const body = has(args.because) ? `因為：${String(args.because).trim()}\n${String(args.text).trim()}` : String(args.text).trim()
+    return callTool('call', { to: args.to, text: body, reply_to: args.reply_to, op: args.op }, deps)
+  }
+  return text(LINE_MISSING, true)
+}
+
+/** The agent-inbox server's tools/call. Old names (call, send_mail, feed_post) only while legacy is on. */
+export async function callInboxTool(name: string, args: Record<string, unknown>, deps: FleetDeps, legacy: boolean) {
+  if (name === 'send_to_agent') return sendToAgent(args, deps, legacy)
+  if (RECEIVE_NAMES.includes(name)) return callTool(name, args, deps)
+  if (legacy && (name === 'call' || name === 'send_mail' || name === 'feed_post')) return callTool(name, args, deps)
   return text(`unknown tool: ${name}`, true)
 }
 

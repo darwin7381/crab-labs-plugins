@@ -33,7 +33,7 @@ export const JOEY_RECENT_S = 3600
 export const MARK = '[保溫]'
 export const SENDER = 'fleet-watchdog'
 export const POKE_TEXT = `${MARK} 你閒了 50 分鐘，這一則只是為了不讓對話過期、不被壓縮。沒有事要做：回一個句點就結束，不用工具、不發任何訊息。`
-const MAILBOX_LIST_TOOL = 'mcp__plugin_agent-inbox_fleet__mailbox_list'
+const MAILBOX_LIST_TOOL = 'mcp__plugin_agent-inbox_agent-inbox__mailbox_list'  // WO-99 v3: the fleet server is gone
 const JOEY_TG_ID = '1828173984'
 
 export function remindText(n: number, oldestS: number | null): string {

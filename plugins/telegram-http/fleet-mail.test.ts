@@ -241,3 +241,71 @@ describe('feed wall tools (WO-92)', () => {
     expect(seen.slice(1)).toEqual(['/api/feed/posts/7', '/api/feed/read'])
   })
 })
+
+// ── WO-99 v3: send_to_agent, one tool, three lines (Joey TG chiron:1503) ──
+import { ASK_MISSING, BECAUSE_MISSING, INBOX_TOOLS, LINE_MISSING, callInboxTool, sendToAgent } from './fleet-mail.ts'
+import { INBOX_TEXT } from './inbox-text.ts'
+
+describe('send_to_agent (three lines)', () => {
+  const coreCalls: any[] = []
+  const mk = () => {
+    const r = deps({ core: async (method, path, body) => { coreCalls.push({ method, path, body }); return { status: 200, json: { id: 47 } } } })
+    r.d.btcc = async (method, path, body) => { r.btccCalls.push({ method, path, body }); return { status: 200, json: { id: 9, stored: true } } }
+    return r
+  }
+  const msg = (r: any) => r.content[0].text as string
+
+  test('the tools: send_to_agent plus the receiving ones; no call / send_mail / feed_post', () => {
+    const names = INBOX_TOOLS.map(t => t.name)
+    expect(names[0]).toBe('send_to_agent')
+    expect(names).toEqual(['send_to_agent', 'mailbox_list', 'mailbox_open', 'mailbox_check', 'mailbox_reply', 'mail_sent', 'feed_ask', 'feed_search', 'feed_open'])
+    expect((INBOX_TOOLS[0] as any).inputSchema.required).toEqual(['line', 'text'])
+    expect(INBOX_TEXT.split('\n')[0]).toBe('send_to_agent：找別隻 agent 只有這一個工具，底下三條線')
+  })
+  test('no line: the spec\'s sentence (old shape is a call only while legacy is on)', async () => {
+    const r = mk()
+    expect(msg(await sendToAgent({ to: 'chiron', text: 'x' }, r.d, false))).toBe(LINE_MISSING)
+    expect(r.calls).toEqual([])
+    await sendToAgent({ to: 'chiron', text: 'x', no_reply: true }, r.d, true)
+    expect(r.calls).toEqual([{ to: 'chiron', text: 'x', replyTo: undefined, noReply: true, op: undefined }])
+    expect(msg(await sendToAgent({ text: 'x' }, r.d, true))).toBe(LINE_MISSING)
+  })
+  test('mail: ask required; sent with ask, text as the body', async () => {
+    const r = mk()
+    const out = await sendToAgent({ line: 'mail', to: 'chiron', title: 't', text: 'body' }, r.d, true)
+    expect(msg(out)).toBe(ASK_MISSING)
+    expect(r.btccCalls).toEqual([])
+    await sendToAgent({ line: 'mail', to: 'chiron', title: 't', ask: '決定 A 或 B', text: 'body', no_reply: true }, r.d, true)
+    expect(r.btccCalls[0].path).toBe('/api/mesh/mail/send')
+    expect(r.btccCalls[0].body).toMatchObject({ to: 'chiron', title: 't', body: 'body', ask: '決定 A 或 B', no_reply: true })
+  })
+  test('call: because required unless it answers a call; because goes first in the text', async () => {
+    const r = mk()
+    expect(msg(await sendToAgent({ line: 'call', to: 'chiron', text: 'x' }, r.d, true))).toBe(BECAUSE_MISSING)
+    expect(r.calls).toEqual([])
+    await sendToAgent({ line: 'call', to: 'chiron', because: 'Joey 在等', text: '看一下' }, r.d, true)
+    expect(r.calls[0].text).toBe('因為：Joey 在等\n看一下')
+    await sendToAgent({ line: 'call', to: 'chiron', reply_to: '9651', text: '好了' }, r.d, true)
+    expect(r.calls[1]).toMatchObject({ text: '好了', replyTo: 9651, noReply: true })
+  })
+  test('feed: a wall post, text as the body', async () => {
+    const r = mk()
+    coreCalls.length = 0
+    await sendToAgent({ line: 'feed', title: '做完了', text: '細節', touches: ['a'] }, r.d, true)
+    expect(coreCalls[0]).toMatchObject({ method: 'POST', path: '/api/feed/posts', body: { title: '做完了', body: '細節', touches: ['a'] } })
+  })
+  test('old tool names only while legacy is on', async () => {
+    const r = mk()
+    expect(msg(await callInboxTool('call', { to: 'chiron', text: 'x' }, r.d, false))).toBe('unknown tool: call')
+    await callInboxTool('call', { to: 'chiron', text: 'x' }, r.d, true)
+    expect(r.calls.length).toBe(1)
+  })
+  test('the mailbox shows what the sender asks for', async () => {
+    const r = mk()
+    r.d.btcc = async (_m, path) => path.endsWith('/list')
+      ? { status: 200, json: { mail: [{ id: 3, from: 'chiron', title: 't', ask: '回答 X', deadline: null, waited: '1 分鐘', status: 'unread' }] } }
+      : { status: 200, json: { id: 3, from: 'chiron', title: 't', ask: '回答 X', deadline: null, waited: '1 分鐘', body: 'b' } }
+    expect(msg(await callInboxTool('mailbox_list', {}, r.d, true))).toContain('｜要你：回答 X｜')
+    expect(msg(await callInboxTool('mailbox_open', { id: 3 }, r.d, true))).toContain('\n要你：回答 X\n')
+  })
+})
