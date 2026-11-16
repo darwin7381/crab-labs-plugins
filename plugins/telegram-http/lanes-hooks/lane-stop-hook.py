@@ -13,6 +13,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.request
 
 TOLD = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main', 'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done')
 CLOSERS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main', 'mcp__lane__reply_agent', 'mcp__lane__receipt',
@@ -27,6 +29,118 @@ SAID_TOOLS = ('mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__reply
 PEER_RUN = re.compile(r'來源 mesh｜寄件者 ([^\s（(｜]+)')
 AUTOMATED = ('scheduler', 'alert-dispatcher', 'main')
 API_SUBJECT = re.compile(r'mock-api|\bapi\b|config|health|p95|5xx|replica|log_level|maintenance|timeout|設定|維護|逾時|健康|延遲|錯誤率', re.I)
+
+
+# 002m model aid (b): a claim of a hand-over or an escalation that the run did not make. H03 r1/r2 (told Eve 「轉給 Joey」, used a silent notify_joey), C03 r2
+# (「已請 Joey 決定」, a silent notify_joey), B09 (handoff_main where Joey had to decide). identity rule 4 「要承諾…就升級主線」, routing 「需要主線的才升級」, notify
+# 「誰可以對你發訊息」: what reaches Joey for a decision is ask_joey, what reaches the main is handoff_main. A run whose message to a peer or to Joey says the
+# matter was (or will be) passed to Joey or the main, with neither tool called in the run, is held ONCE: do it now, or correct the claim.
+# Program first: clear claims and clear negations are read here; only a sentence that names Joey or the main without a clear claim goes to Jev (one Noul
+# per sentence, p >= LANES_CLAIM_JEV_P, default 0.8), as A3 does. No key or a failed call: the program's answer stands.
+WHO = r'(?:Joey|joey|老闆|主線|主\s*agent|主\s*session|主腦|the main(?: agent| session)?)'
+CLAIM_RE = [
+    re.compile(r'(?:轉給|轉交|轉交給|交給|交由|上報給?|升級給|升級到|呈報|請示|丟給|轉達給)\s*' + WHO),
+    re.compile(r'(?:請|讓|由)\s*' + WHO + r'\s*(?:來)?(?:決定|定奪|處理|確認|判斷|裁決|拍板|核准|批准|同意|接手)'),
+    re.compile(r'(?:等|待|等待)\s*' + WHO + r'\s*(?:的)?(?:決定|回覆|確認|核准|批准|定奪|裁決)'),
+    re.compile(WHO + r'\s*(?:會|將|那邊會|之後會)\s*(?:來)?(?:決定|定奪|處理|確認|裁決|回覆|接手)'),
+    re.compile(r'已(?:經)?升級|升級(?:處理|主線)'),
+    re.compile(r'\b(?:passed|forwarded|escalated|handed(?: it| this)?(?: over)?|referred|sent)\s+(?:it\s+|this\s+)?(?:on\s+|up\s+)?to\s+(?:Joey|the main)', re.I),
+    re.compile(r'\b(?:Joey|the main(?: agent)?)\s+(?:will|is going to|to)\s+(?:decide|handle|confirm|approve|take (?:it|this) over)', re.I),
+]
+# said to Joey himself with a silent notice: "you decide" is a question for Joey, which is ask_joey's job
+ASK_JOEY_RE = re.compile(r'(?:請你|要你|需要你|等你|由你|你來)\s*(?:決定|定奪|確認|核准|批准|同意|拍板|裁決)')
+NEG_RE = re.compile(r'不(?:會|用|必|需要?)\s*(?:再)?(?:轉|交|請|升級|麻煩|打擾|驚動)|沒有(?:轉|交|請|升級)|還沒|尚未|無需|不需要|no need to|won\'t|will not|did not|didn\'t|not (?:yet )?(?:escalat|pass|forward|hand)', re.I)
+LOOSE_RE = re.compile(WHO + r'|escalat|上級|主管|上面', re.I)
+CLAIM_JEV_P = float(os.environ.get('LANES_CLAIM_JEV_P', '0.8'))
+JEV_MODEL = os.environ.get('TYPESAFE_DEFAULT_MODEL', 'jev-1.14.0')
+
+
+def sentences(text):
+    return [x.strip() for x in re.split(r'(?<=[。！？!?；;])\s*|\n+', text or '') if x.strip()]
+
+
+def claim_kind(sentence, to_joey):
+    """'claim' (a clear claim of a hand-over/escalation), 'loose' (names Joey or the main, no clear claim: Jev decides), or None."""
+    if NEG_RE.search(sentence):
+        return None
+    if any(r.search(sentence) for r in CLAIM_RE) or (to_joey and ASK_JOEY_RE.search(sentence)):
+        return 'claim'
+    return 'loose' if LOOSE_RE.search(sentence) else None
+
+
+def load_key():
+    k = os.environ.get('TYPESAFE_API_KEY', '').strip()
+    if k:
+        return k
+    try:
+        for line in open(os.environ.get('TYPESAFE_KEY_FILE', os.path.expanduser('~/.genesis/typesafe.env')), encoding='utf-8'):
+            line = line.strip()
+            if line.startswith('export '):
+                line = line[7:].strip()
+            if line.startswith('TYPESAFE_API_KEY='):
+                return line.split('=', 1)[1].strip().strip('"').strip("'") or None
+    except OSError:
+        pass
+    return None
+
+
+def jev_claims(items, run_dir):
+    """For the loose sentences [(to, sentence)]: the indexes Jev reads as a claim that the matter was or will be passed to Joey or the main (p >= CLAIM_JEV_P).
+    One request, one Noul per sentence. Logged to <run>/jev-calls.jsonl (site lane-claim-check). [] on no key or any failure."""
+    key = load_key()
+    if not key or not items:
+        return []
+    q = {f'S{i + 1}': {'type': 'noul', 'instructions': f'Does item S{i + 1} of `messages` tell its reader that this matter has been passed, or will be passed, to Joey or to the main agent to decide or to handle?',
+                       'criteria': {'true': 'It says Joey or the main agent has been asked, was handed the matter, or will decide or handle it',
+                                    'false': 'It does not say that (it only mentions them, reports facts, or says they are not needed)'}} for i in range(len(items))}
+    state = {'setting': 'An operations agent\'s helper lane sent these messages in one run. The helper cannot decide for Joey; asking Joey and handing work to the main agent are separate steps it takes with its tools.',
+             'messages': [{'id': f'S{i + 1}', 'to': to, 'text': snt[:400]} for i, (to, snt) in enumerate(items)]}
+    t0, ans, err = time.monotonic(), None, None
+    try:
+        req = urllib.request.Request(os.environ.get('TYPESAFE_BASE_URL', 'https://api.typesafe.ai').rstrip('/') + '/v1/systemone',
+                                     data=json.dumps({'model': JEV_MODEL, 'state': state, 'questions': q}, ensure_ascii=False).encode('utf-8'), method='POST',
+                                     headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'User-Agent': 'genesis-lane-claim-check/1'})
+        with urllib.request.urlopen(req, timeout=float(os.environ.get('LANES_CLAIM_JEV_TIMEOUT_S', '8'))) as r:
+            ans = json.loads(r.read().decode('utf-8')).get('answers')
+        if not isinstance(ans, dict):
+            raise RuntimeError('no answers')
+    except Exception as e:
+        err = f'{type(e).__name__}: {e}'[:160]
+    hits = []
+    if ans:
+        for i in range(len(items)):
+            try:
+                if float((ans.get(f'S{i + 1}') or {}).get('noul', 0)) >= CLAIM_JEV_P:
+                    hits.append(i)
+            except Exception:
+                pass
+    if run_dir:
+        try:
+            ps = [float((ans.get(f'S{i + 1}') or {}).get('noul', 0)) for i in range(len(items))] if ans else []
+            with open(os.path.join(run_dir, 'jev-calls.jsonl'), 'a', encoding='utf-8') as f:
+                f.write(json.dumps({'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'site': 'lane-claim-check', 'question': q,
+                                    'inputs': {'lane': os.environ.get('LANE_ID', ''), 'sentences': [s[:80] for _, s in items]}, 'answer': ans,
+                                    'p': max(ps) if ps else None, 'ms': int((time.monotonic() - t0) * 1000), 'err': err}, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+    return hits
+
+
+def unbacked_claims(sent, run_dir):
+    """[(tool, to, sentence, by)] for the claims in what the run sent: by 'program' or 'jev'."""
+    clear, loose = [], []
+    for tool, to, text in sent:
+        for snt in sentences(text):
+            k = claim_kind(snt, tool == 'mcp__lane__notify_joey')
+            if k == 'claim':
+                clear.append((tool, to, snt, 'program'))
+            elif k == 'loose':
+                loose.append((tool, to, snt))
+    if clear:
+        return clear
+    if os.environ.get('LANES_CLAIM_JEV', '1') == '0':
+        return []
+    return [(loose[i][0], loose[i][1], loose[i][2], 'jev') for i in jev_claims([(to, snt) for _, to, snt in loose][:8], run_dir)]
 
 
 def looked_at_catalog(cmd):
@@ -118,6 +232,8 @@ def main():
         return
     closed, used = False, set()
     said, looked = {}, False
+    sent = []                                     # 002m aid (b): every message the run sent to a peer or to Joey, in order
+    names_used = set()
     for line in lines[last_user + 1:]:
         try:
             j = json.loads(line)
@@ -131,8 +247,12 @@ def main():
             n = c.get('name', '')
             if n in SAID_TOOLS:
                 said[n] = str((c.get('input') or {}).get('text', ''))      # the LAST text of each of the three tools
+            if n in ('mcp__lane__reply_agent', 'mcp__lane__notify_joey'):
+                inp = c.get('input') or {}
+                sent.append((n, str(inp.get('to', 'a peer')) if n == 'mcp__lane__reply_agent' else 'Joey', str(inp.get('text', ''))))
             if n == 'Bash' and looked_at_catalog(str((c.get('input') or {}).get('command', ''))):
                 looked = True
+            names_used.add(n)
             if n in TOLD:
                 closed = True
             elif n in CLOSERS:
@@ -191,6 +311,28 @@ def main():
                         f'⛔ lane-stop-hook: {lane} (started by {started}) told {to} it cannot ({word}) with {tool.replace("mcp__lane__", "")}, but this run never looked at '
                         f'the service catalog or made a GET call (no ./bin/svc catalog or GET). Output of ./bin/svc, run by the hook just now (program output):\n{body}')}, ensure_ascii=False))
                     return
+    # 002m aid (b): a hand-over or escalation claimed in a message, with neither ask_joey nor handoff_main in the run: held once
+    if sent and not ({'mcp__lane__ask_joey', 'mcp__lane__handoff_main'} & names_used) and int(st.get(key + ':claim', 0)) < 1 \
+            and os.environ.get('LANES_CLAIM_CHECK', '1') != '0':
+        hits = unbacked_claims(sent, os.path.join(lanes_dir, 'run') if lanes_dir else '')
+        if hits:
+            st[key + ':claim'] = 1
+            if save_state(state_p, st):                          # cannot remember = could hold for ever: do not hold
+                lane = os.environ.get('LANE_ID', 'this lane')
+                if lanes_dir:
+                    try:
+                        with open(os.path.join(lanes_dir, 'run', 'claim-check.jsonl'), 'a', encoding='utf-8') as f:
+                            f.write(json.dumps({'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'lane': lane, 'session': sid,
+                                                'claims': [{'tool': t, 'to': to, 's': snt[:200], 'by': by} for t, to, snt, by in hits]}, ensure_ascii=False) + '\n')
+                    except Exception:
+                        pass
+                said_lines = '\n'.join(f'- to {to} ({t.replace("mcp__lane__", "")}): 「{snt[:200]}」' for t, to, snt, _ in hits[:4])
+                print(json.dumps({'decision': 'block', 'reason': (
+                    f'⛔ lane-stop-hook: {lane} said the matter was (or will be) passed to Joey or the main:\n{said_lines}\n'
+                    'but this run called neither ask_joey nor handoff_main, so nobody has it. Before ending, do one of these: if Joey has to decide, call ask_joey '
+                    '(one message; it rings); if the main has to act, call handoff_main; if neither is true, send a correction to whoever you told '
+                    '(reply_agent to the peer, notify_joey to Joey) that says who actually handles it.')}, ensure_ascii=False))
+                return
     if closed:
         return
     n = int(st.get(key, 0))
