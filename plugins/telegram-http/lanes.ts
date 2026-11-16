@@ -773,7 +773,6 @@ type State = {
   promises: Record<string, Promise24>                                  // 002j: "the main answers you by HH:MM", told to a peer by the router
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
   must_marked?: Record<string, number>                                 // 002k (B2): events already marked 【主線必須知道】 (event id → ms): one mark per event
-  digest_held_at?: number                                               // 002m aid (c): a digest was kept off Joey's message at this time; it goes at the turn's end
   sched_done?: Record<string, { at: string; lane: string; run: string; by: 'receipt' | 'cli' }>   // 002m (L6B4): scheduler run id → its one completion
   alert_fp?: Record<string, AlertFp>                                   // 002k (B12): alert fingerprint → the thread that handles it
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
@@ -1055,22 +1054,13 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     else void triageShadow(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier })
   }
   if (D.role === 'tg' && S) { noteAdmitted(ev, d); noteInbound(ev, d); if (ev.source === 'telegram' && d.target === 'main') joeyToMainAt = Date.now() }
-  // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it.
-  // 002m aid (c): not on Joey's own message. main-role 「主線是被告知，不是被打斷」 and merge 「摘要只在主線的回合邊界送」: a digest prepended to Joey's message
-  // put the lanes' machine events in front of his question, and the main folded them into its answer (T3-R #8, r1-r3). While his message is the turn's
-  // trigger the digest is kept, and digestTickWith hands it over at that turn's end.
-  if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) {
-    if (ev.source === 'telegram' && JOEY_DIGEST_HOLD()) holdDigestForJoey(ev.id)
-    else { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
-  }
+  // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it. Joey's message included (B5: the digest goes at
+  // the main's next natural turn; an idle main is never woken for it). 002n: 002m's aid (c) held it off Joey's message and woke the idle main with it at
+  // that turn's end, against merge 「主線在自己的回合邊界收到…用的是現有的 hook 注入機制，不是打斷」 and main-role 「主線是被告知，不是被打斷」 (A06 and C03:
+  // a wake turn that told Joey nothing). What T3-R #8 needed (no unasked digest item relayed in the answer to Joey) is now the main's reply hook's
+  // job (lanes-hooks/main-summary-gate.py, digest relay check).
+  if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
   return d
-}
-const JOEY_DIGEST_HOLD = (): boolean => process.env.LANES_JOEY_DIGEST_HOLD !== '0'
-function holdDigestForJoey(evId: string): void {
-  if (!planNow(false, false)) return                                  // nothing pending (a peek: nothing is taken)
-  S.digest_held_at = Date.now(); saveState()
-  appendJsonl('routing.jsonl', { event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest-held', target: 'main', note: `kept off Joey's message ${evId}; handed over at that turn's end` })
-  logos('lane.digest_held', { event: evId })
 }
 
 /** Hop / budget gate for a mesh event entering a thread. Returns a stop note or null. */
@@ -4403,7 +4393,7 @@ function planNow(onlyIfWake: boolean, commit: boolean): DigestTake | null {
   if (commit || !plan.take) persistCursor(cur, plan.cursor)
   return plan.take
 }
-export function takePendingDigest(onlyIfWake: boolean, mode: 'piggyback' | 'wake' | 'boundary'): DigestTake | null {
+export function takePendingDigest(onlyIfWake: boolean, mode: 'piggyback' | 'wake'): DigestTake | null {
   if (D?.role !== 'tg') return null
   const t = planNow(onlyIfWake, true)
   if (t) {
@@ -4457,19 +4447,6 @@ export async function digestTickWith(io: DigestIO): Promise<string> {
   if (!mainReg) return 'no-main'
   digestBusy = true
   try {
-    // 002m aid (c): a digest kept off Joey's message goes when the turn his message opened has ended (a turn-end record after it) and the main is idle
-    // (until then the wake rule below still applies: it only delivers to an idle main, never into Joey's turn)
-    if (S?.digest_held_at && turnEndedAfterFile(mainReg.transcript_path, S.digest_held_at)) {
-      if (!(await io.mainConnected())) return 'main-not-connected'
-      if (!(await io.mainIdle())) return 'main-busy'
-      delete S.digest_held_at; saveState()
-      const t = takePendingDigest(false, 'boundary')
-      if (!t) return 'held-nothing-left'                               // a later delivery to the main carried it meanwhile
-      const ok = await io.deliver(t.text, { user: 'lanes', kind: 'digest', items: String(t.items), no_reply: 'true', wake: 'true' })
-      if (ok) { ackDigestLocal(t.id); return 'delivered-at-boundary' }
-      releaseDigestLocal(t.id)
-      return 'deliver-failed'
-    }
     if (!planNow(true, false)) return 'no-wake-entry'
     if (!(await io.mainConnected())) return 'main-not-connected'
     if (!(await io.mainIdle())) return 'main-busy'

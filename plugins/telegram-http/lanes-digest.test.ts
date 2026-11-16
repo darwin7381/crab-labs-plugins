@@ -105,9 +105,7 @@ const unsignedAlert = (text: string) => ({ id: `mesh-${Math.random()}`, source: 
   notif: { method: 'notifications/claude/channel', params: { content: text, meta: { user: 'alert-dispatcher' } } }, verified: false }) as any
 const cursorOnDisk = () => JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8'))
 
-// 002m aid (c): by default a digest is kept off Joey's own message (lanes-pl2-aidc.test.ts); the two tests below run the 002b piggyback with that switched off
 test('router: a Joey message routed to the main carries the pending digest once; the delivered notification has it prepended', async () => {
-  process.env.LANES_JOEY_DIGEST_HOLD = '0'
   reset(jl([silentFyi('3'), silentFyi('4')]))
   const ev = joeyMsg('今天的報告呢？')
   const d = await routeEvent(ev)
@@ -124,7 +122,6 @@ test('router: a Joey message routed to the main carries the pending digest once;
   const d2 = await routeEvent(joeyMsg('還在嗎？'))                                    // the next inbound: nothing pending → plain
   expect(d2.digest).toBeUndefined()
   expect(notifWithDigest(joeyMsg('x').notif, d2).params).toMatchObject({ content: 'x' })
-  delete process.env.LANES_JOEY_DIGEST_HOLD
 })
 
 test('router: any event the router routes to the main (unsigned alert via the default rule) takes the pending digest; events NOT routed to the main do not', async () => {
@@ -222,7 +219,6 @@ test('digestTickWith: escalation + idle main → delivered once with kind=digest
 })
 
 test('digestTickWith: main mid-turn → nothing taken (existing absorption rules); a Joey message then carries it and the tick has nothing left', async () => {
-  process.env.LANES_JOEY_DIGEST_HOLD = '0'
   reset(jl([escalation()]))
   let delivers = 0
   const busy = { mainConnected: async () => true, mainIdle: async () => false, deliver: async () => { delivers++; return true } }
@@ -233,7 +229,6 @@ test('digestTickWith: main mid-turn → nothing taken (existing absorption rules
   await ackDigest(d)
   expect(await digestTickWith({ ...busy, mainIdle: async () => true })).toBe('no-wake-entry')
   expect(delivers).toBe(0)                                                           // never delivered twice
-  delete process.env.LANES_JOEY_DIGEST_HOLD
 })
 
 test('digestTickWith: delivery failure puts the range back (next tick retries); main not connected leaves it pending', async () => {

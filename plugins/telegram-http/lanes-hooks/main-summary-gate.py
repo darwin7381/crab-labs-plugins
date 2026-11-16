@@ -33,6 +33,10 @@ sends the reply back ONCE per turn: the sentence, and the tool result that contr
 the turn's last results are attached). The next attempt goes out whatever it says. "Says nothing" never blocks (greetings, plans, an earlier turn's work);
 no claim sentence, no tool result, no Jev key, a failed or slow call: the reply goes out as written. On when SUMMARY_GATE_JEV=1 or MAIN_REPLY_CHECK=1;
 MAIN_REPLY_CHECK=0 turns it off. Every decision is appended to run/reply-check.jsonl and every Jev call to run/jev-calls.jsonl.
+
+Universe 002n (model aid c, T3-R #8): when this turn's Telegram message from Joey carried the lane digest (002b piggyback), the reply must not relay
+digest items his message did not ask about. Code first (the item's ids, a verbatim run of its text, its salient tokens), then one Jev question; sent back
+once per turn at p >= 0.8 (MAIN_DIGEST_RELAY_P). See digest_relay_check. MAIN_DIGEST_RELAY_CHECK=0 turns it off; decisions in run/digest-relay.jsonl.
 """
 import json
 import os
@@ -384,6 +388,213 @@ def reply_check(p, reply, d):
 
 
 
+# ---- 002n (model aid c, T3-R #8): the main does not relay digest items Joey did not ask about into its answer to him
+# The lane digest rides on the main's next natural turn, Joey's message included (002b; merge 「摘要：主線在自己的回合邊界收到…用的是現有的 hook 注入機制，
+# 不是打斷」; main-role 「主線是被告知，不是被打斷」; Joey's B5: an idle main is never woken for it). 002m held it off his message and woke the idle main with
+# it instead (A06, C03: a wake turn that told Joey nothing); 002n takes that out and checks the reply instead. When this turn's Telegram message carried a
+# digest (the 〔以上是系統附上的車道摘要…〕 mark) and the main now replies to Joey:
+#   1. code first. The digest's items are read; an item handed to the main (需主線) is the main's to report and is not checked. An item counts as touched
+#      when the reply carries one of its ids (mesh-…, ho-…, a lane or thread id, a ticket) that Joey's message does not, a verbatim run of its text
+#      (12 characters), or a salient token of it (an ASCII token with a digit or a dash, a 4-character CJK run) that Joey's message does not. No item touched:
+#      the reply goes out, no model.
+#   2. Jev, one narrow question: does this reply report digest items the user's message did not ask about? At p >= 0.8 (MAIN_DIGEST_RELAY_P) the reply is
+#      sent back ONCE per turn, naming the touched items; the next attempt goes out as written. A failed or slow call lets the reply through and is logged.
+# Every decision is in run/digest-relay.jsonl and every Jev call in run/jev-calls.jsonl (site digest-relay-T3R8). MAIN_DIGEST_RELAY_CHECK=0 turns it off.
+DIGEST_CHECK = os.environ.get('MAIN_DIGEST_RELAY_CHECK', '1') == '1'
+DIGEST_P = float(os.environ.get('MAIN_DIGEST_RELAY_P', '0.8'))
+DIGEST_MARK = '〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕'
+DIGEST_HEAD = '〔車道摘要｜'
+JOEY_SOURCE = 'source="plugin:telegram-http'
+SKIP_SECTIONS = ('〔暫停中的同事', '〔還沒決定的記憶提案')
+NOTE_LINE = re.compile(r'^\s*(〔[^〕]*〕|（[^）]*）)\s*$')
+DIGEST_ID = re.compile(r'[A-Za-z][\w-]*#t-[0-9A-Za-z]{3,}|\b[a-z][\w-]*\.(?:reflex|worker|synth|cron)\.\d+\b|\b(?:mesh|ho|fu|pr|ev|mp|dg)-[0-9A-Za-z]{4,}\b|\b[A-Z]{1,3}-\d{3,}\b|\b\d{5,}\b')
+ASCII_TOK = re.compile(r'[A-Za-z0-9][A-Za-z0-9_./:%-]{2,}')
+CJK_RUN = re.compile(r'[㐀-鿿]{4,}')
+VERBATIM = 12
+
+
+def _text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(str(x.get('text', '')) for x in content if isinstance(x, dict) and x.get('type') == 'text')
+    return ''
+
+
+def digest_turn(path):
+    """(marker, [(digest text, Joey's own text)]) for the Telegram messages of the current turn that carried a digest; marker identifies the turn."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            if size > TAIL_BYTES:
+                f.seek(size - TAIL_BYTES)
+                f.readline()
+            data = f.read().decode('utf-8', errors='replace')
+    except OSError:
+        return 'start', []
+    recs = []
+    for line in data.splitlines():
+        if not line or not ('turn_duration' in line or '以上是系統附上的車道摘要' in line):
+            continue
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            pass
+    start, marker = 0, 'start'
+    for i, j in enumerate(recs):
+        if j.get('type') == 'system' and j.get('subtype') == 'turn_duration':
+            start, marker = i + 1, str(j.get('uuid') or j.get('timestamp') or i)
+    out = []
+    for j in recs[start:]:
+        if j.get('type') != 'user':
+            continue
+        t = _text_of((j.get('message') or {}).get('content'))
+        if DIGEST_MARK not in t or JOEY_SOURCE not in t.split(DIGEST_HEAD, 1)[0]:
+            continue
+        head, joey = t.split(DIGEST_MARK, 1)
+        k = head.find(DIGEST_HEAD)
+        out.append((head[k:] if k >= 0 else head, joey.replace('</channel>', '').strip()))
+    return marker, out
+
+
+def digest_items(digest):
+    """[(label, text)] for the digest's items that are the lanes' own: what the main was told, not handed to it. Items with 需主線 (handed to the main,
+    which reports them once), the held-peer list and the open memory proposals are left out."""
+    items, cur, skip = [], None, False
+    for line in digest.splitlines():
+        if not line.strip() or line.startswith(DIGEST_HEAD):
+            continue
+        if NOTE_LINE.match(line):
+            skip = line.strip().startswith(SKIP_SECTIONS)
+            cur = None
+            continue
+        if line.startswith(('▸ ', '• ')):
+            cur = None
+            if skip:
+                continue
+            cur = [line[2:].strip()]
+            items.append(cur)
+        elif line.startswith('  ') and cur is not None:
+            cur.append(line.strip())
+        else:
+            cur = None                                    # 另有 N 條… / a line the router wrote: not an item
+    out = []
+    for parts in items:
+        text = '\n'.join(parts)
+        if '需主線' in text:
+            continue
+        out.append(('｜'.join(parts[0].split('｜')[:2]), text))
+    return out
+
+
+def _norm(s):
+    return re.sub(r'\s+', '', s or '')
+
+
+def touched(item_text, reply, joey):
+    """What of the item the reply carries that Joey's message does not: {'ids': [...], 'verbatim': '…' or None, 'tokens': [...]}."""
+    rn, jn = _norm(reply), _norm(joey)
+    ids = sorted({m for m in DIGEST_ID.findall(item_text) if m in reply and m not in joey})
+    body = item_text.split('發生：', 1)[1] if '發生：' in item_text else item_text
+    bn, verb = _norm(body), None
+    for i in range(0, max(0, len(bn) - VERBATIM) + 1):
+        w = bn[i:i + VERBATIM]
+        if len(w) == VERBATIM and w in rn and w not in jn:
+            verb = w
+            break
+    toks = set()
+    for m in ASCII_TOK.findall(body):
+        if (re.search(r'\d', m) or '-' in m or '/' in m) and m.lower() in reply.lower() and m.lower() not in joey.lower():
+            toks.add(m)
+    for run in CJK_RUN.findall(body):
+        for i in range(len(run) - 3):
+            g = run[i:i + 4]
+            if g in rn and g not in jn:
+                toks.add(g)
+    return {'ids': ids, 'verbatim': verb, 'tokens': sorted(toks)[:12]}
+
+
+DIGEST_Q = {'relay': {'type': 'noul', 'instructions': 'Does `reply` report items of `digest` that `user_message` did not ask about?',
+                      'criteria': {'true': 'The reply tells the user about one or more `digest` items (work the agent\'s background helpers did, given to the agent for its own '
+                                           'information) that the user\'s message did not ask about',
+                                   'false': 'Every `digest` item the reply mentions is one the user\'s message asked about (directly, about the same matter, or by asking '
+                                            'for news or what happened), or the reply mentions no `digest` item'}}}
+
+
+def digest_relay_check(p, reply, d):
+    """T3-R #8: the deny reason for a reply to Joey that relays digest items his message did not ask about, or ''."""
+    if not DIGEST_CHECK or not reply.strip():
+        return ''
+    marker, carried = digest_turn(p.get('transcript_path') or '')
+    if not carried:
+        return ''
+    rd = d if os.path.isdir(d) else tempfile.gettempdir()
+    joey = '\n'.join(j for _, j in carried)
+    items = [it for dg, _ in carried for it in digest_items(dg)]
+    rec = {'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'session': p.get('session_id', ''), 'turn': marker, 'items': len(items)}
+
+    def log(**kw):
+        try:
+            with open(os.path.join(rd, 'digest-relay.jsonl'), 'a', encoding='utf-8') as f:
+                f.write(json.dumps({**rec, **kw}, ensure_ascii=False) + '\n')
+        except OSError:
+            pass
+    if not items:
+        log(decision='pass', why='no lane item in the digest (only items handed to the main, or none)')
+        return ''
+    sp = os.path.join(rd, 'summary-gate.json')
+    try:
+        st = json.load(open(sp, encoding='utf-8'))
+    except Exception:
+        st = {}
+    key = f"{p.get('session_id', '')}:digest:{marker}"
+    if key in st:
+        log(decision='pass', why='sent back once already in this turn')
+        return ''
+    hits = []
+    for i, (label, text) in enumerate(items):
+        t = touched(text, reply, joey)
+        if t['ids'] or t['verbatim'] or t['tokens']:
+            hits.append((i, label, t))
+    if not hits:
+        log(decision='pass', why='code: the reply carries nothing of the digest items')
+        return ''
+    state = {'setting': 'An AI agent got `user_message` from its owner. The system attached `digest` to that message: what the agent\'s background helpers did, '
+                        'for the agent\'s own information; the helpers already handled those items or told the owner themselves. `reply` is the agent\'s answer to the owner.',
+             'user_message': joey[:3000], 'digest': [{'id': f'D{i + 1}', 'text': text[:600]} for i, (_, text) in enumerate(items[:20])], 'reply': reply[:6000]}
+    t0, err, a = time.monotonic(), None, None
+    try:
+        a = jev_post(DIGEST_Q, state)
+    except Exception as e:
+        err = f'{type(e).__name__}: {e}'[:200]
+    ms = int((time.monotonic() - t0) * 1000)
+    pr = ((a or {}).get('relay') or {}).get('noul')
+    pr = float(pr) if isinstance(pr, (int, float)) else None
+    jev_log(rd, 'digest-relay-T3R8', DIGEST_Q, {'session': p.get('session_id', ''), 'items': len(items), 'touched': [h[1] for h in hits], 'reply': reply[:120]}, a, pr, ms, err)
+    code = [{'item': h[1], **h[2]} for h in hits]
+    if err or pr is None:
+        log(decision='pass', why='Jev failed: the reply goes out', err=err or 'no probability', ms=ms, code=code)
+        return ''
+    if pr < DIGEST_P:
+        log(decision='pass', p=pr, ms=ms, code=code)
+        return ''
+    st[key] = len(hits)
+    try:
+        tmp = f'{sp}.{os.getpid()}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(dict(list(st.items())[-300:]), f)
+        os.replace(tmp, sp)
+    except OSError:
+        log(decision='pass', why='cannot remember the send-back: not sending back', p=pr, ms=ms, code=code)
+        return ''
+    log(decision='sent_back', p=pr, ms=ms, code=code)
+    names = '\n'.join(f"• {h[1]}" + (f"（你寫到 {'、'.join((h[2]['ids'] + ([h[2]['verbatim']] if h[2]['verbatim'] else []))[:3])}）" if h[2]['ids'] or h[2]['verbatim'] else '') for h in hits[:6])
+    return ('這則回覆先不送：這一輪 Joey 的訊息前面附了車道摘要，你的回覆把其中他沒問到的事也轉述給他了。可能是這幾件：\n' + names + '\n'
+            '車道摘要是給你知道的，不是要你轉告 Joey：那些事車道已經處理，或已經直接通知過他。只回答他問的，把他沒問到的拿掉再送一次。'
+            '如果他其實問到了（例如問「有什麼新消息」），照原樣再送一次即可。（這一次會照你寫的送出。）')
+
+
+
 def main():
     try:
         p = json.load(sys.stdin)
@@ -394,6 +605,10 @@ def main():
     contra = reply_check(p, reply, os.path.join(ld0, 'run'))          # 002k (C16): what the reply says the main did, against its own tool results
     if contra:
         print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': contra}}, ensure_ascii=False))
+        return
+    relay = digest_relay_check(p, reply, os.path.join(ld0, 'run'))  # 002n (aid c, T3-R #8): digest items Joey did not ask about, relayed to him
+    if relay:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': relay}}, ensure_ascii=False))
         return
     call, text = activity_list_of_this_turn(tail_records(p.get('transcript_path') or ''))
     if not call:
