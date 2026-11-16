@@ -742,6 +742,7 @@ type State = {
   promises: Record<string, Promise24>                                  // 002j: "the main answers you by HH:MM", told to a peer by the router
   deadline_rang: Record<string, number>                                // 002i: critical events the router rang for at the deadline
   must_marked?: Record<string, number>                                 // 002k (B2): events already marked 【主線必須知道】 (event id → ms): one mark per event
+  sched_done?: Record<string, { at: string; lane: string; run: string; by: 'receipt' | 'cli' }>   // 002m (L6B4): scheduler run id → its one completion
   alert_fp?: Record<string, AlertFp>                                   // 002k (B12): alert fingerprint → the thread that handles it
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
@@ -2681,7 +2682,7 @@ function startRun(it: QItem): void {
           if (c?.type !== 'tool_result') continue
           const body = typeof c.content === 'string' ? c.content : Array.isArray(c.content) ? c.content.map((x: any) => x?.text ?? '').join(' ') : ''
           const rid = cliReceipts.get(String(c.tool_use_id ?? ''))
-          if (rid && !c.is_error && (/"state"\s*:\s*"completed"/.test(body) || !/error|not found|denied|refused|失敗|錯誤|usage:/i.test(body))) (tok.completedRuns ??= []).push(rid)   // 002l (D14): it went through
+          if (rid && !c.is_error && (/"state"\s*:\s*"completed"/.test(body) || !/error|not found|denied|refused|失敗|錯誤|usage:/i.test(body))) { (tok.completedRuns ??= []).push(rid); markSchedDone(rid, lane.id, runId, 'cli') }   // 002l (D14): it went through
           if (body.trim()) { lastResults.push(body.replace(/\s+/g, ' ').trim().slice(0, 300)); if (lastResults.length > 2) lastResults.shift() }
         }
       }
@@ -3317,12 +3318,16 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // 002l (D14 = RV2 N5): design/stability 「每則訊息只租給一條線」 and one owner per event: one completion per scheduled run. The card's CLI
       // (./bin/btcc-receipt complete N) and this tool both completed the run (T2-R runs 51-53 / 92-94, T6-R, T7-R). When this run already completed
       // run_id (the CLI went through, or an earlier receipt call), the receipt is recorded and the scheduler is not called again.
-      if (runIdArg && tok.completedRuns?.includes(runIdArg)) {
-        logos('lane.receipt_dup', { lane: lane.id, run: tok.runId, run_id: runIdArg })
-        return `receipt recorded; scheduler: run ${runIdArg} was already completed in this run (by ./bin/btcc-receipt or an earlier receipt), so it was not completed again. Do not complete it a second time.${chainNote}`
+      // 002m (L6B4): one completion per scheduled run across ALL lane runs, not per lane-run token: a follow-up run's receipt(run_id) completed the
+      // scheduled run a second time (B r1/r2, T2-R r3 run 7: btcc.scheduler.complete ×2). The completion is kept in the daemon's state.
+      const done = runIdArg ? S.sched_done?.[runIdArg] : undefined
+      if (runIdArg && (tok.completedRuns?.includes(runIdArg) || done)) {
+        logos('lane.receipt_dup', { lane: lane.id, run: tok.runId, run_id: runIdArg, completed_by: done?.run ?? tok.runId })
+        const where = !done || done.run === tok.runId ? 'in this run (by ./bin/btcc-receipt or an earlier receipt)' : `by ${done.run} at ${stamp(done.at)}`
+        return `receipt recorded; scheduler: run ${runIdArg} was already completed ${where}, so it was not completed again. Do not complete it a second time.${chainNote}`
       }
       const r = runIdArg ? await inboxPost('/lanes/scheduler', { run_id: runIdArg, action: 'complete', outcome, summary: a.summary }) : null
-      if (runIdArg) (tok.completedRuns ??= []).push(runIdArg)
+      if (runIdArg) { (tok.completedRuns ??= []).push(runIdArg); markSchedDone(runIdArg, lane.id, tok.runId, 'receipt') }
       return `receipt recorded${r ? `; scheduler: ${r.text ?? JSON.stringify(r)}` : ''}${chainNote}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
@@ -3726,6 +3731,15 @@ function limitLines(lane: Lane): string[] {
   if (!parts.length) return []
   return ['', `# 這一趟的上限`, `- ${parts.join('；')}。到上限這一趟會被中止。`,
     `- 快到上限時系統會在工具結果後面提醒你（〔系統通知｜車道上限〕）。一被提醒就收尾：還做不完就用 handoff_main 交給主線（寫清楚你查到什麼、你的做法、還剩什麼），做完了就 notify_joey 一句，最後 receipt。不要等到被中止。`]
+}
+/** 002m (L6B4): record the one completion of a scheduled run (kept 7 days, at most 2000) */
+function markSchedDone(rid: string, lane: string, run: string, by: 'receipt' | 'cli'): void {
+  const m = (S.sched_done ??= {})
+  if (!m[rid]) m[rid] = { at: nowIso(), lane, run, by }
+  const keys = Object.keys(m)
+  if (keys.length > 2000) for (const k of keys.sort((a, b) => m[a].at.localeCompare(m[b].at)).slice(0, keys.length - 2000)) delete m[k]
+  for (const k of keys) if (m[k] && Date.now() - Date.parse(m[k].at) > 7 * 86400_000) delete m[k]
+  saveState()
 }
 /** 002l (D14): the scheduler run a Bash command completes with the workspace's receipt CLI (./bin/btcc-receipt complete <run> …), or null */
 export function cliReceiptRun(cmd: string): string | null {

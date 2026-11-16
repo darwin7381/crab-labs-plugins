@@ -20,9 +20,11 @@ const bin = join(dir, 'lane.py')
 writeFileSync(bin, `#!/usr/bin/env python3
 import json, time
 mode = open('${dir}/mode').read().strip()
+import os
+rid = open('${dir}/rid').read().strip() if os.path.exists('${dir}/rid') else '51'
 if mode in ('cli', 'cli-fail'):
-    print(json.dumps({'type': 'assistant', 'message': {'id': 'm1', 'content': [{'type': 'tool_use', 'id': 'tu-r', 'name': 'Bash', 'input': {'command': './bin/btcc-receipt complete 51 --outcome failed --note "p95 260"'}}], 'usage': {'input_tokens': 5, 'output_tokens': 5}}}), flush=True)
-    res = {'type': 'tool_result', 'tool_use_id': 'tu-r', 'content': '{"run_id": 51, "state": "completed", "outcome": "failed"}'} if mode == 'cli' else {'type': 'tool_result', 'tool_use_id': 'tu-r', 'is_error': True, 'content': 'btcc-receipt: scheduler unreachable'}
+    print(json.dumps({'type': 'assistant', 'message': {'id': 'm1', 'content': [{'type': 'tool_use', 'id': 'tu-r', 'name': 'Bash', 'input': {'command': './bin/btcc-receipt complete ' + rid + ' --outcome failed --note "p95 260"'}}], 'usage': {'input_tokens': 5, 'output_tokens': 5}}}), flush=True)
+    res = {'type': 'tool_result', 'tool_use_id': 'tu-r', 'content': '{"run_id": ' + rid + ', "state": "completed", "outcome": "failed"}'} if mode == 'cli' else {'type': 'tool_result', 'tool_use_id': 'tu-r', 'is_error': True, 'content': 'btcc-receipt: scheduler unreachable'}
     print(json.dumps({'type': 'user', 'message': {'content': [res]}}), flush=True)
 time.sleep(2)
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'ok'}), flush=True)
@@ -63,14 +65,32 @@ test('D14: without the CLI the receipt completes the run once; a second receipt 
 })
 
 test('D14: a CLI call that failed does not count: the receipt completes the run', async () => {
-  writeFileSync(join(dir, 'mode'), 'cli-fail')
-  const d = await L.routeEvent(sched('mesh-s53', 51))
+  writeFileSync(join(dir, 'mode'), 'cli-fail'); writeFileSync(join(dir, 'rid'), '54')      // 002m: its own run (51 was completed for real above)
+  const d = await L.routeEvent(sched('mesh-s53', 54))
   expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
   await sleep(300)
   expect(L.__runTok(d.lane!)!.completedRuns ?? []).toEqual([])
-  await receipt(L.__runTok(d.lane!)!, '51')
-  expect(completes.filter(c => String(c.run_id) === '51').length).toBe(1)
+  await receipt(L.__runTok(d.lane!)!, '54')
+  expect(completes.filter(c => String(c.run_id) === '54').length).toBe(1)
   await until(() => !L.__runTok(d.lane!), 5000)
+  writeFileSync(join(dir, 'rid'), '51')
+})
+
+test('L6B4 (002m): a later lane run of the same thread (a follow-up) that files receipt(run_id) for a scheduled run completed earlier does not complete it again', async () => {
+  writeFileSync(join(dir, 'mode'), 'plain')
+  const d = await L.routeEvent(sched('mesh-s60', 60))
+  expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
+  expect(await receipt(L.__runTok(d.lane!)!, '60')).toContain('scheduler: run 60 completed')
+  const first = L.__runTok(d.lane!)!.runId
+  expect(await until(() => !L.__runTok(d.lane!), 5000)).toBe(true)
+  // the follow-up run: a new lane-run token, the same scheduled run
+  const tok2 = { runId: `${d.lane}.r9`, lane: d.lane, evId: 'mesh-s60-fu', closers: [], critical: false, trigger: 'followup', cls: 'routine', escalated: false, pushed: false, followup: 'fu-1' } as any
+  const out = await receipt(tok2, '60')
+  expect(out).toContain(`already completed by ${first}`)
+  expect(completes.filter(c => String(c.run_id) === '60').length).toBe(1)
+  expect(L.__lanesState().sched_done?.['60']).toMatchObject({ run: first, by: 'receipt' })
+  // a CLI completion is recorded the same way (run 51, test 2)
+  expect(L.__lanesState().sched_done?.['51']).toMatchObject({ by: 'cli' })
 })
 
 test('D14: the card maps ./bin/btcc-receipt to receipt and says not to use both', () => {
