@@ -3198,6 +3198,11 @@ export function failureSaid(text: string): boolean {
   })
   t = t.replace(/[A-Za-z0-9]*(?:[_.][A-Za-z0-9]+)+/g, m => /fail|error/i.test(m) ? ' ' : m)                           // identifiers: failed_step, error_rate, http.errors
   t = t.replace(/\b(errors?|fail(?:ure)?s?)[ -]?(rate|ratio)\s*[:=]?\s*[\d.]+\s*%?|(錯誤|错误|失敗|失败)(率|比例)\s*[:=：]?\s*[\d.]+\s*%?/gi, ' ')   // 002m: a named rate with its value is a metric
+  // 002n (aid (a) on B01): a failure word with a percentage or a fraction is a measured rate ("error 1%", "error 0.001", 錯誤 1%), and a word inside a path
+  // or a slash list is a name (performance/api-error, /v2/errors): B01 r1's three 4-6-line routine notices said 「error 1%」 and 「performance/api-error 類」
+  // and were exempted from the one-line gate as failure reports. A count (errors=3, 3 errors) still says something failed.
+  t = t.replace(/\b(errors?|fail(?:ure)?s?)\s*[:=：]?\s*(?:\d+(?:\.\d+)?\s*%|0?\.\d+)(?![\d.])|(錯誤|错误|失敗|失败)\s*[:=：]?\s*\d+(?:\.\d+)?\s*%/gi, ' ')
+  t = t.replace(/[A-Za-z0-9_.-]*\/[A-Za-z0-9_./-]+/g, m => /fail|error/i.test(m) ? ' ' : m)
   t = t.replace(/(無|沒有|没有|未見|未发现|未發現|沒|没|未|不見|零)\s*(任何)?\s*(失敗|失败|異常|异常|錯誤|错误)/g, ' ')
   t = t.replace(/\b(no|zero|without|0)\s+(errors?|failures?|failed)\b/gi, ' ')
   return FAILURE_WORDS.test(t)
