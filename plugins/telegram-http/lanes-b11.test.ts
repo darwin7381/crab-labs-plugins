@@ -65,12 +65,13 @@ test('B11: a receipt that already says failed lets the full report through; two 
   expect(await L.callLaneTool(two, 'notify_joey', { text: '備份檢查完成。\n最新備份 03:00，正常。' })).toContain('sent to Joey'); expect(sent.length).toBe(k + 1)
 })
 
-test('B11: a follow-up of a scheduled routine is a scheduled run too; a peer\'s run and an ask_joey are not limited', async () => {
+test('B11: a follow-up of a scheduled routine is a scheduled run too; a peer\'s run is not limited; 002m (L6B3): an ask_joey after the one message is', async () => {
   const f = run('scheduled', { followup: true })
   await expect(L.callLaneTool(f, 'notify_joey', { text: SIX })).rejects.toThrow(/ONE line/)
   const peer = run('peer'), k = sent.length
   await L.callLaneTool(peer, 'notify_joey', { text: SIX }); await L.callLaneTool(peer, 'notify_joey', { text: SIX + '\n（補充）' })
   expect(sent.length).toBe(k + 2)
   const s = run('scheduled'); await L.callLaneTool(s, 'notify_joey', { text: '一行。' })
-  expect(await L.callLaneTool(s, 'ask_joey', { text: '備份連續失敗，要你決定。' })).toContain('sent to Joey')
+  await expect(L.callLaneTool(s, 'ask_joey', { text: '備份連續失敗，要你決定。' })).rejects.toThrow(/ask_joey refused: a scheduled run sends at most ONE message/)
+  expect(await L.callLaneTool(run('scheduled'), 'ask_joey', { text: '備份連續失敗，要你決定。' })).toContain('sent to Joey')   // an ask as the run's one message goes out
 })

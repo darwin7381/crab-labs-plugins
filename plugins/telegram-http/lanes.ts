@@ -3133,6 +3133,8 @@ export function failureSaid(text: string): boolean {
 export function scheduledNotifyGate(tok: RunTok, text: string): void {
   if (tok.trigger !== 'scheduled') return
   if ((tok.notified ?? 0) >= 1) throw new Error('notify_joey refused: a scheduled run sends at most ONE message to Joey and this run already sent it. Put anything more in your receipt (did / needs_main); do not send another.')
+  // 002m (L6B3): ask_joey is a message to Joey too (B r1/r2: a notify and an ask from one scheduled run, in either order)
+  if (tok.asked) throw new Error('notify_joey refused: a scheduled run sends at most ONE message to Joey and this run already sent it with ask_joey. Put anything more in your receipt (did / needs_main); do not send another.')
   const lines = text.split('\n').filter(l => l.trim()).length
   const failed = failureSaid(text) || tok.receipt?.outcome === 'failed' || failureSaid(tok.receipt?.text ?? '')
   if (lines > 2 && !failed && !tok.nudged) {
@@ -3266,6 +3268,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       { const back = await reportCheck(lane, tok, 'ask_joey', text); if (back) return back }
       if (tok.handed) return 'refused: you already handed this event to the main (handoff_main); the main reports to Joey. Do not also ask Joey.'
       if (tok.asked) return 'refused: you already asked Joey about this event; one ask per event. Put anything new in your receipt.'
+      // 002m (L6B3): card 「每個排程回合最多一次 notify_joey」 and the gate's own words, "at most ONE message to Joey": the ask counts as that message
+      if (tok.trigger === 'scheduled' && (tok.notified ?? 0) >= 1) throw new Error('ask_joey refused: a scheduled run sends at most ONE message to Joey and this run already sent it with notify_joey. If Joey has to decide something, hand it to the main with handoff_main (the main asks him); otherwise put it in your receipt (needs_main). Do not send Joey another message.')
       const dec = notifyDecision(tok.cls, true, lane.thread)
       const tier = dec.tier
       const rec = { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, trigger: tok.trigger, escalated: true, ask: true }
