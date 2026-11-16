@@ -58,6 +58,37 @@ const LEASE_MS = Number(process.env.LANES_LEASE_MS ?? 120_000)
 const THREAD_BUDGET = Number(process.env.LANES_THREAD_BUDGET ?? 1_000_000)   // fresh tokens / thread (freshTokens)
 /** 002l (D1, D7): the tokens of one API call that count against a budget: uncached input + cache creation + output. Never the cache reads. */
 export function freshTokens(u: any): number { return (Number(u?.input_tokens) || 0) + (Number(u?.cache_creation_input_tokens) || 0) + (Number(u?.output_tokens) || 0) }
+// 002m (L6CEH1): a stream-json `assistant` event carries the usage snapshot of its message's START (output_tokens: a few), and the run's final numbers
+// are in the transcript (each message's record) and in the `result` event. The budget counted those snapshots: tokens_out 27 against 16,597 in the
+// transcript (H2 r2), so a thread was stopped late by its whole output share. Usage per message is now the larger of what the stream said and what the
+// transcript says, read when the next call starts (the previous one has completed by then) and at the end of the run.
+export type CallUsage = { in: number; out: number; fresh: number }
+export function callUsage(u: any): CallUsage {
+  return { in: (u?.input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0), out: u?.output_tokens ?? 0, fresh: freshTokens(u) }
+}
+export function maxUsage(a: CallUsage | undefined, b: CallUsage): CallUsage {
+  return a ? { in: Math.max(a.in, b.in), out: Math.max(a.out, b.out), fresh: Math.max(a.fresh, b.fresh) } : b
+}
+/** the usage of the given messages as the transcript records them (message id → usage); messages it does not have are left out */
+export function transcriptUsage(path: string, ids: Iterable<string>): Map<string, CallUsage> {
+  const want = new Set(ids), out = new Map<string, CallUsage>()
+  if (!want.size || !path) return out
+  let text = ''
+  try {
+    const size = statSync(path).size, n = Math.min(size, 4_000_000)
+    const fd = openSync(path, 'r'), buf = Buffer.alloc(n)
+    readSync(fd, buf, 0, n, size - n); closeSync(fd)
+    text = buf.toString('utf8')
+  } catch { return out }
+  for (const l of text.split('\n')) {
+    if (!l.includes('"usage"')) continue
+    let j: any; try { j = JSON.parse(l) } catch { continue }
+    const id = j?.message?.id
+    if (j?.type !== 'assistant' || !id || !want.has(id) || !j.message.usage) continue
+    out.set(id, maxUsage(out.get(id), callUsage(j.message.usage)))
+  }
+  return out
+}
 const RESUME_MAX_AGE_MS = Number(process.env.LANES_RESUME_MAX_AGE_MS ?? 24 * 3600_000)
 const MODEL = process.env.LANES_MODEL ?? 'claude-opus-5-5'
 let CLAUDE_BIN = process.env.LANES_CLAUDE_BIN ?? 'claude'
@@ -2640,6 +2671,11 @@ function startRun(it: QItem): void {
   let budgetStop: { total: number; at: number } | null = null          // 002k (H11): this run was stopped by the thread budget, in the run
   let warnedTurns = false, warnedBudget = false                        // 002l (D8, N4): the limit notices of this run
   const lastResults: string[] = []                                     // 002l (D8): the last tool results of the run, for the stop row's partial
+  let resultUsage: any = null                                           // 002m (L6CEH1): the run's own totals, from its result event
+  const runTranscript = (): string => sessionSeen ? join(D.transcriptDir, `${sessionSeen}.jsonl`) : lane.transcript
+  const settleUsage = (): void => {                                      // 002m (L6CEH1): the stream's snapshots, corrected by the transcript
+    for (const [id, u] of transcriptUsage(runTranscript(), [...usage.keys()])) usage.set(id, maxUsage(usage.get(id), u))
+  }
   const cliReceipts = new Map<string, string>()                         // 002l (D14): tool_use id of a Bash `btcc-receipt complete N` → N
   const restarts = new Map<string, { svc: string; cmd: string }>()       // 002m (L6B1): tool_use id of a Bash restart → the service
   child.stdout!.setEncoding('utf8')
@@ -2653,7 +2689,9 @@ function startRun(it: QItem): void {
       if (j.type === 'system' && j.subtype === 'init' && j.session_id) sessionSeen = j.session_id
       if (j.type === 'assistant' && j.message) {
         const u = j.message.usage ?? {}
-        usage.set(j.message.id ?? `m${usage.size}`, { in: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), out: u.output_tokens ?? 0, fresh: freshTokens(u) })
+        const mid = j.message.id ?? `m${usage.size}`
+        if (!usage.has(mid) && usage.size) settleUsage()                  // 002m (L6CEH1): a new call: the previous ones are complete in the transcript
+        usage.set(mid, maxUsage(usage.get(mid), callUsage(u)))
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') {
             tools.push({ name: c.name, input: c.input })
@@ -2701,7 +2739,7 @@ function startRun(it: QItem): void {
           if (body.trim()) { lastResults.push(body.replace(/\s+/g, ' ').trim().slice(0, 300)); if (lastResults.length > 2) lastResults.shift() }
         }
       }
-      if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j); resultSubtype = String(j.subtype ?? '') }
+      if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j); resultSubtype = String(j.subtype ?? ''); resultUsage = j.usage ?? null }
     }
   })
   child.stderr!.on('data', (c: Buffer) => { errTail = (errTail + c.toString('utf8')).slice(-600); try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
@@ -2714,8 +2752,14 @@ function startRun(it: QItem): void {
     runTokens.delete(token)
     try { rmSync(mcpCfg) } catch {}
     const steerLeft = settleSteering(lane)                            // 002k (E18): what it did not hand over is queued below, after the run's own bookkeeping
+    settleUsage()                                                     // 002m (L6CEH1): the final numbers of every call of the run
     let tin = 0, tout = 0, tfresh = 0
     for (const u of usage.values()) { tin += u.in; tout += u.out; tfresh += u.fresh }
+    if (resultUsage) {                                                // and the run's own totals, where they are larger (a call the transcript does not have yet)
+      const r = callUsage(resultUsage)
+      if (r.out > tout) { tfresh += r.out - tout; tout = r.out }
+      if (r.in > tin) tin = r.in
+    }
     if (lane.kind === 'fork' && lane.runs === 0 && sessionSeen) {
       lane.session_id = sessionSeen; lane.transcript = join(D.transcriptDir, `${sessionSeen}.jsonl`)
     }
