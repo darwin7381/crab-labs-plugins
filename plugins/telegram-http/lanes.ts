@@ -378,6 +378,54 @@ export function mainAnsweredAfter(ms: number): boolean {
   const path = mainReg?.transcript_path
   return !!path && genuineAssistantAtFile(path) > ms
 }
+/** 002m (L6G1, L6T1): did a turn of the session END after `ms`? A turn ends with an assistant record that stopped by itself
+ *  (end_turn, no tool call) or the harness's end-of-turn record. A tool call is not an end: a turn that was cut in the
+ *  middle of its tool work never finished the message it was working on. */
+export function turnEndedAfterFile(path: string, ms: number): boolean {
+  const text = tailText(path, 400_000)
+  if (!text) return false
+  for (const l of text.split('\n')) {
+    if (!l || !l.includes('"timestamp"')) continue
+    let j: any; try { j = JSON.parse(l) } catch { continue }
+    const t = Date.parse(j?.timestamp ?? '')
+    if (!Number.isFinite(t) || t <= ms) continue
+    if (j.type === 'system' && (j.subtype === 'turn_duration' || j.subtype === 'stop_hook_summary')) return true
+    if (j.type !== 'assistant' || j.isApiErrorMessage || j.message?.model === '<synthetic>') continue
+    const tool = (j.message?.content ?? []).some((c: any) => c?.type === 'tool_use')
+    if (j.message?.stop_reason === 'end_turn' && !tool) return true
+  }
+  return false
+}
+/** 002m (L6G1, L6T1): what became of one delivery to the main, for the consumption sweep and for a main replacement.
+ *  stability SR2 「訊息掉了沒人處理（磁碟佇列與重送）」: a delivery is kept (in the delivery record, or parked on disk) until a live main
+ *  has CONSUMED it, i.e. took it in and then finished a turn. A cut turn's own tool calls are not consumption.
+ *    consumed  taken in, and a turn ended after that
+ *    working   taken in, the main wrote its own records after it, and no turn has ended yet (a running turn, or a cut one)
+ *    taken     taken in, nothing genuine after it yet (a wall, or the model has not answered yet)
+ *    queued    in the client's queue, not read
+ *    none      no trace in the transcript
+ *  null = the delivery cannot be recognised (the caller falls back to "the transcript advanced"). */
+export type DeliveryFate = 'consumed' | 'working' | 'taken' | 'queued' | 'none'
+export function deliveryFate(notif: Notif, at: number): { fate: DeliveryFate; takenAt?: number } | null {
+  const path = mainReg?.transcript_path
+  const it = intake(notif, at)
+  if (!it || !path) return null
+  if (it.taken) {
+    if (turnEndedAfterFile(path, it.takenAt)) return { fate: 'consumed', takenAt: it.takenAt }
+    return { fate: genuineAssistantAtFile(path) > it.takenAt ? 'working' : 'taken', takenAt: it.takenAt }
+  }
+  return { fate: it.queued ? 'queued' : 'none' }
+}
+/** 002m (L6G1, L6T1): when the main's process is replaced, what becomes of one open delivery record.
+ *    keep        consumed (a turn ended after the take-in), or an unrecognisable delivery the transcript advanced after
+ *    park        never taken in (queued in the dead process, or no trace): parked again; the record stays so a late read retracts the copy
+ *    park-close  taken in by the old process and never finished: parked again, and the record is closed (the dead process cannot read it) */
+export function replacementAction(notif: Notif, at: number, newest: number): 'keep' | 'park' | 'park-close' {
+  const f = deliveryFate(notif, at)
+  if (!f) return newest > at ? 'keep' : 'park'
+  if (f.fate === 'consumed') return 'keep'
+  return f.fate === 'working' || f.fate === 'taken' ? 'park-close' : 'park'
+}
 
 /** Did the session's last turn end, or was it cut off? Read from the end of its transcript: a completed turn ends with an
  *  assistant record that stopped by itself (or the harness's end-of-turn records); a turn that was cut off ends with a

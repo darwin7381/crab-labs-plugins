@@ -845,11 +845,14 @@ function sweepDeliveries(): void {
     // lanes (002i): the main's own transcript says what became of THIS delivery (Lanes.intake): taken in, waiting in the
     // client's queue, or no trace at all. That replaces "the transcript advanced after the delivery" whenever the delivery
     // can be recognised: a main that is in the middle of a turn advances its transcript without having read anything.
-    const it = Lanes.LANES_ON ? Lanes.intake(d.notif, d.at) : null
-    // 002j: "taken in" is not "consumed". Consumed = the model has it AND the main wrote a genuine assistant record after
-    // that moment. Until then the delivery stays open: a running turn answers soon; a usage-limit wall or a frozen
-    // session does not, and the delivery is parked again after the grace (counted from when it was taken in).
-    const answered = it?.taken ? Lanes.mainAnsweredAfter(it.takenAt) : false
+    // 002m (L6G1, L6T1): consumed = the main took it in AND a turn ended after that (Lanes.deliveryFate). A genuine record
+    // after the take-in is not enough: the running turn's own tool calls are not consumption, and a main killed in the
+    // middle of that turn never finished the message (T8-R r3: killed 0.46 s after the C4 tool call, answered after 1019 s).
+    const fate = Lanes.LANES_ON ? Lanes.deliveryFate(d.notif, d.at) : null
+    const it = fate ? { taken: fate.fate === 'consumed' || fate.fate === 'working' || fate.fate === 'taken', queued: fate.fate === 'queued', takenAt: fate.takenAt ?? 0 } : null
+    // 002j: "taken in" is not "consumed". Until then the delivery stays open: a running turn answers soon; a usage-limit
+    // wall or a frozen session does not, and the delivery is parked again after the grace (counted from when it was taken in).
+    const answered = fate?.fate === 'consumed'
     // 002j: the main took it in and its transcript shows the API error as the last thing after it: the model wall, not a
     // stuck agent. The delivery is neither acked nor sent round the grace/park/quarantine path (fleet history: an agent
     // at its weekly limit had every wake-up delivered three times and then written off). It is kept as it is and given
@@ -864,6 +867,9 @@ function sweepDeliveries(): void {
         continue
       }
     }
+    // 002m: the main is working on it (its own records follow the take-in, the turn has not ended): kept as it is. If the
+    // process dies before the turn ends, repersistUnconsumed gives it to the next one; it is never parked into a live turn.
+    if (fate?.fate === 'working') continue
     // Without that evidence: strictly after the delivery, and by a genuine (non-API-error) assistant
     // record. An error record or a pre-delivery record is NOT consumption.
     if (it ? answered : newest > d.at) {
@@ -930,14 +936,21 @@ function repersistUnconsumed(): number {
   // What the old process did not take in is given to the new one: a delivery that was only queued inside it is gone with
   // it, and one that left no trace never arrived. The record stays (with its parked copy) so that the sweep can still
   // retract the copy if the transcript later shows the first one was read after all.
-  for (const d of recentDeliveries) {
+  // 002m (L6G1, L6T1): what the old process took in but never finished (no turn ended after the take-in: the turn was cut,
+  // its own tool calls are not consumption) is given to the new one as well. The dead process cannot read it any more, so
+  // that record is closed and the parked copy is the delivery from now on (the replay records it again).
+  const closed = new Set<object>()
+  for (const d of recentDeliveries) {                       // in delivery order: the parked files replay in that order
     if (d.pendingPath) continue
-    const it = Lanes.intake(d.notif, d.at)
-    if (it ? it.taken : newest > d.at) continue
+    const act = Lanes.LANES_ON ? Lanes.replacementAction(d.notif, d.at, newest) : (newest > d.at ? 'keep' : 'park')
+    if (act === 'keep') continue
     d.pendingPath = persistInbound(d.notif)
-    if (d.pendingPath) n++
+    if (!d.pendingPath) continue
+    n++
+    if (act === 'park-close') closed.add(d)
   }
-  if (n) log('info', `main replaced: ${n} delivery(ies) the old process never took in parked again for the new one`)
+  for (let i = recentDeliveries.length - 1; i >= 0; i--) if (closed.has(recentDeliveries[i])) recentDeliveries.splice(i, 1)
+  if (n) log('info', `main replaced: ${n} delivery(ies) the old process never took in or never finished parked again for the new one`)
   return n
 }
 
@@ -2842,10 +2855,12 @@ function deliverToMain(notif: { method: string; params: unknown }): void {
       persistInbound(notif)
     })
   } else {
-    const q = memQueue.get(sid) ?? []
-    q.push(notif)
-    memQueue.set(sid, q)
-    log('info', `lanes: queued for main ${sid} (SSE not open yet, queue=${q.length})`)
+    // 002m (L6G1): never into the session's memory queue. A main killed a moment ago still has its MCP session here with
+    // the SSE stream closed; its memory queue died with it (the GC eviction deletes it) and no delivery record pointed at
+    // it (G r2/r3: Joey's message 0.05-0.2 s after the kill was lost). On disk it drains into whichever main opens its
+    // stream next, the same session reconnecting or its replacement (stability SR2 「沿用現有的磁碟佇列與重送」).
+    persistInbound(notif)
+    log('info', `lanes: main ${sid} has no open stream — parked in inbox/pending until a live main opens one`)
   }
 }
 
@@ -2905,6 +2920,16 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
   }
 }
 
+// 002m (L6G1): a session's memory queue is never just dropped with the session. In lanes mode everything in it was
+// addressed to the main, so it is parked on disk for the next live main.
+function parkMemQueue(sid: string): void {
+  const q = memQueue.get(sid)
+  memQueue.delete(sid)
+  if (!Lanes.LANES_ON || !q?.length) return
+  for (const notif of q) persistInbound(notif)
+  log('warn', `session ${sid} closed with ${q.length} undelivered notif(s) — parked in inbox/pending`)
+}
+
 // issue #3 fix: remove a (zombie) session from every registry, regardless of
 // whether transport.onclose ever fired. Mirrors the onclose cleanup body.
 function evictZombieSession(sid: string, reason: string): void {
@@ -2914,7 +2939,7 @@ function evictZombieSession(sid: string, reason: string): void {
   const transport = transports.get(sid)
   transports.delete(sid)
   sseOpen.delete(sid)
-  memQueue.delete(sid)
+  parkMemQueue(sid)
   sessionLastActiveAt.delete(sid)
   if (srv) {
     for (const [reqId, p] of pendingPermissions) {
@@ -3150,7 +3175,7 @@ async function openSession(resumeId?: string): Promise<StreamableHTTPServerTrans
     if (transport.sessionId) {
       transports.delete(transport.sessionId)
       sseOpen.delete(transport.sessionId)
-      memQueue.delete(transport.sessionId)
+      parkMemQueue(transport.sessionId)
       sessionLastActiveAt.delete(transport.sessionId)
       forgetIssuedSession(transport.sessionId)
       if (Lanes.LANES_ON) Lanes.forgetMcpSession(transport.sessionId)
