@@ -1554,7 +1554,30 @@ type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done' | 
   /** 002f: the process and run that hold the lease, so a restarted daemon can tell what it left behind */
   pid?: number; run?: string
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
-  extra?: InEvent[] }
+  extra?: InEvent[]
+  /** 002m (G06): where each failed attempt died, for the hand-over after the last one */
+  deaths?: RunDeath[] }
+type RunDeath = { run: string; how: string; after_s: number; calls: number; last_tool?: string; last_result?: string; last_text?: string; stderr?: string }
+/** 002m (G06): one attempt's death, as the hand-over says it. stability SR2 「反射線連續失敗就升級主線」 (H15: the main is told where each run died) */
+export function deathLine(d: RunDeath, n: number): string {
+  return `第 ${n} 次（${d.run}）：${d.how}，跑了 ${d.after_s} 秒、${d.calls} 次模型呼叫`
+    + (d.last_tool ? `；死前最後的工具呼叫 ${d.last_tool}` : '；沒有呼叫任何工具')
+    + (d.last_result ? `；最後的工具結果：${d.last_result}` : '')
+    + (d.last_text ? `；最後寫的字：${d.last_text}` : '')
+    + (d.stderr ? `；錯誤輸出：${d.stderr}` : '')
+}
+function toolBrief(t: { name: string; input: any } | undefined): string | undefined {
+  if (!t) return undefined
+  const name = t.name.replace(/^mcp__lane__/, 'lane:')
+  const arg = t.input?.command ?? t.input?.file_path ?? t.input?.query ?? t.input?.text ?? (t.input && Object.keys(t.input).length ? JSON.stringify(t.input) : '')
+  return `${name}${arg ? ` \`${String(arg).replace(/\s+/g, ' ').slice(0, 120)}\`` : ''}`
+}
+export function failedHandoffText(it: { attempts: number; ev: { from: string; text: string }; deaths?: RunDeath[] }): string {
+  const deaths = it.deaths ?? []
+  return `車道連續 ${it.attempts} 次沒處理完這則事件，已放棄，請主線接手。寄件者 ${it.ev.from}，原文：${it.ev.text.slice(0, 400)}`
+    + `\n每一次死在哪裡：\n${deaths.length ? deaths.map((d, i) => `- ${deathLine(d, i + 1)}`).join('\n') : '- （沒有紀錄：這幾次都沒有被 daemon 看到結束）'}`
+    + (deaths.length && deaths.length < it.attempts ? `\n- 其餘 ${it.attempts - deaths.length} 次沒有被 daemon 看到結束（daemon 重啟或租約到期）` : '')
+}
 const queue = new Map<string, QItem>()          // event id → item
 const running = new Map<string, { child: ChildProcess; evId: string; runId: string; renew: ReturnType<typeof setInterval>; tok: RunTok }>()  // lane id → run
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string
@@ -2139,10 +2162,11 @@ export function sweepQueue(): void {
       it.state = 'failed'; saveQ(it); queue.delete(it.ev.id)
       const lane = S.lanes[it.lane]
       if (it.ev.fanout) { fanoutResult(it.ev.fanout, it.lane, `（這一塊連續 ${it.attempts} 次沒做完，沒有結果）`); continue }
-      handoff(lane, it.ev.id, `車道連續 ${it.attempts} 次沒處理完這則事件，已放棄，請主線接手。寄件者 ${it.ev.from}，原文：${it.ev.text.slice(0, 400)}`, it.lane)
+      handoff(lane, it.ev.id, failedHandoffText(it), it.lane, undefined, 3000)   // 002m (G06): with where each run died (up to three lines of its own)
       continue
     }
     D.log('warn', `lanes: ${it.ev.id} on ${it.lane} did not finish (attempt ${it.attempts}) — dispatching again`)
+    if ((it.deaths?.length ?? 0) < it.attempts) (it.deaths ??= []).push({ run: it.run ?? '?', how: '租約到期，daemon 沒有看到這一趟結束（daemon 重啟，或行程失聯）', after_s: 0, calls: 0 })   // 002m (G06)
     appendJsonl('routing.jsonl', { event: it.ev.id, rule: 'lease-expired', target: 'lane', lane: it.lane, note: `re-dispatch attempt ${it.attempts + 1}` })
     it.state = 'queued'; saveQ(it)
   }
@@ -2545,7 +2569,9 @@ function startRun(it: QItem): void {
   if (lockSid && child.pid) { try { mkdirSync(join(LANES_DIR, 'run', 'sid'), { recursive: true }); writeFileSync(sidLock(lockSid), String(child.pid)) } catch {} }
   it.state = 'leased'; it.attempts += 1; it.lease_until = Date.now() + LEASE_MS; it.pid = child.pid; it.run = runId; saveQ(it)
   const renew = setInterval(() => { it.lease_until = Date.now() + LEASE_MS; saveQ(it) }, 30_000)
+  let timedOut = false, errTail = ''                                   // 002m (G06)
   const limit = setTimeout(() => {
+    timedOut = true
     D.log('warn', `lanes: ${runId} still running after ${Math.round(LANE_MAX_RUN_MS / 1000)}s — stopping it (attempt ${it.attempts} of ${MAX_ATTEMPTS})`)
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'timeout', run: runId, event: it.ev.id, after_s: Math.round(LANE_MAX_RUN_MS / 1000) })
     logos('lane.timeout', { lane: lane.id, run: runId, event: it.ev.id, after_s: Math.round(LANE_MAX_RUN_MS / 1000), attempt: it.attempts })
@@ -2617,7 +2643,7 @@ function startRun(it: QItem): void {
       if (j.type === 'result') { result = String(j.result ?? ''); walled = walledResult(j); resultSubtype = String(j.subtype ?? '') }
     }
   })
-  child.stderr!.on('data', (c: Buffer) => { try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
+  child.stderr!.on('data', (c: Buffer) => { errTail = (errTail + c.toString('utf8')).slice(-600); try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
   child.on('exit', (code, signal) => {
     clearInterval(renew)
     clearTimeout(limit)
@@ -2709,6 +2735,12 @@ function startRun(it: QItem): void {
       // (first bad-day run: a killed lane cost 2 minutes, three failures 6 minutes before the main heard of it). The lease
       // now only covers what the daemon cannot see: its own restart (loadQueue) and a renewal that stopped.
       it.lease_until = it.attempts >= MAX_ATTEMPTS ? 0 : Date.now() + RETRY_BACKOFF_MS * it.attempts
+      const one = (x: string | undefined, n: number) => x ? x.replace(/\s+/g, ' ').trim().slice(0, n) || undefined : undefined
+      ;(it.deaths ??= []).push({ run: runId,                              // 002m (G06): where this attempt died
+        how: timedOut ? `超過 ${Math.round(LANE_MAX_RUN_MS / 1000)} 秒還沒結束，被 daemon 停下（${signal ?? 'SIGKILL'}）` : signal ? `行程被訊號 ${signal} 結束` : `行程以 exit ${code} 結束${resultSubtype ? `（${resultSubtype}）` : ''}`,
+        after_s: Math.round((Date.now() - started) / 100) / 10, calls: usage.size,
+        last_tool: toolBrief(tools[tools.length - 1]), last_result: one(lastResults[lastResults.length - 1], 160),
+        last_text: one(lastText || result, 120), stderr: one(errTail.split('\n').filter(l => l.trim()).slice(-2).join(' '), 160) })
       saveQ(it)
       setTimeout(sweepQueue, Math.max(0, it.lease_until - Date.now()) + 20)
     }
@@ -2742,9 +2774,9 @@ function laneLabel(l: Lane): string { return `${{ reflex: '反射線', worker: '
 // digest and is not woken). A lane that needs the MAIN hands the work over (handoff_main): the main is woken with it
 // and reports to Joey itself; the lane and the router send Joey nothing. Only when the main does not get the handoff
 // (not connected, or still not delivered after HANDOFF_FALLBACK_MS) is Joey told directly, once.
-function handoff(lane: Lane | undefined, evId: string, text: string, laneId?: string, cls?: string): Handoff {
+function handoff(lane: Lane | undefined, evId: string, text: string, laneId?: string, cls?: string, max = 1000): Handoff {
   const h: Handoff = { id: `ho-${shortId()}`, lane: lane?.id ?? laneId ?? 'router', thread: lane?.thread ?? null, event: evId,
-    text: text.slice(0, 1000), created: Date.now(), state: 'pending', ...(cls ? { cls } : {}) }
+    text: text.slice(0, max), created: Date.now(), state: 'pending', ...(cls ? { cls } : {}) }
   S.handoffs[h.id] = h
   // 002l (D16): the id leads the line, so the main can name it (reply handoff_id) when it reports on it
   ledger({ lane: h.lane, thread: h.thread, event: evId, kind: 'escalation', notify_main: true, text: `〔${h.id}〕${h.text}`, refs: { handoff: h.id, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
