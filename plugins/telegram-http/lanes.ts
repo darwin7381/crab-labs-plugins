@@ -3110,12 +3110,31 @@ function ownerRelay(lane: Lane, tok: RunTok, to: string, text: string, msgId: nu
 //   - the first one, when it is longer than two lines and nothing in it (or in the receipt the run already filed) says it failed, is
 //     sent back ONCE with the request for one line; sending the full report again after that goes out (a change gets the full report).
 // It sits in notify_joey, not in the stop hook: the hook runs after the message is already out, and the card has the receipt come last.
-export const FAILURE_WORDS = /失敗|失败|異常|异常|failed|error/i
+export const FAILURE_WORDS = /失敗|失败|異常|异常|錯誤|错误|failed|failure|error/i
+/** 002m (L6B2): does the text SAY something failed? The card 「沒有變化就只留一行」 (002k B11) needs the gate to tell a failure report from a success
+ *  report, and a success report names its fields: failed_step=null, error_rate 0.1%, errors: 0, 無異常 (B r2/r3 #1027, #1025: 5- and 4-line success
+ *  reports went out as failures). Identifiers (a word joined by _ or .), a failure field set to nothing, and a negated failure word say nothing failed. */
+export function failureSaid(text: string): boolean {
+  let t = String(text ?? '')
+  // a field named for failure: set to nothing, or a measured rate, says nothing failed; a count above 0 or a value (failed_step=upload) does
+  t = t.replace(/([A-Za-z][\w.]*)\s*[=:]\s*("[^"]*"|[^\s,;，；)）]+)/g, (m, k: string, v: string) => {
+    if (!/fail|error/i.test(k)) return m
+    const val = v.replace(/^"|"$/g, '').trim()
+    if (/^(null|none|nil|0|0\.0*%?|false|-|n\/a|\[\]|\{\}|無|沒有|没有|ok)?$/i.test(val)) return ' '
+    if (/rate|ratio|pct|percent/i.test(k)) return ' '
+    if (/^[\d.]+%?$/.test(val)) return /count|^errors?$|^failures?$|^failed$/i.test(k) ? ' failed ' : ' '
+    return ' failed '
+  })
+  t = t.replace(/[A-Za-z0-9]*(?:[_.][A-Za-z0-9]+)+/g, m => /fail|error/i.test(m) ? ' ' : m)                           // identifiers: failed_step, error_rate, http.errors
+  t = t.replace(/(無|沒有|没有|未見|未发现|未發現|沒|没|未|不見|零)\s*(任何)?\s*(失敗|失败|異常|异常|錯誤|错误)/g, ' ')
+  t = t.replace(/\b(no|zero|without|0)\s+(errors?|failures?|failed)\b/gi, ' ')
+  return FAILURE_WORDS.test(t)
+}
 export function scheduledNotifyGate(tok: RunTok, text: string): void {
   if (tok.trigger !== 'scheduled') return
   if ((tok.notified ?? 0) >= 1) throw new Error('notify_joey refused: a scheduled run sends at most ONE message to Joey and this run already sent it. Put anything more in your receipt (did / needs_main); do not send another.')
   const lines = text.split('\n').filter(l => l.trim()).length
-  const failed = FAILURE_WORDS.test(text) || tok.receipt?.outcome === 'failed' || FAILURE_WORDS.test(tok.receipt?.text ?? '')
+  const failed = failureSaid(text) || tok.receipt?.outcome === 'failed' || failureSaid(tok.receipt?.text ?? '')
   if (lines > 2 && !failed && !tok.nudged) {
     tok.nudged = true
     throw new Error(`notify_joey not sent: this is a scheduled run and nothing in your message says it failed or changed, but it is ${lines} lines long. A routine with no change leaves ONE line for Joey: what you did and the result. Send that one line now. If something did change or fail, send the full report again and it will go out (this check happens once).`)
