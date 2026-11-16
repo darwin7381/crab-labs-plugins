@@ -1,3 +1,18 @@
+## 1.30.0 — 2026-11-16
+
+- **The agent-inbox daemon sends 保溫 and 讀信箱 itself, for agents the Mac mini watchdog cannot see** (MBP daddy-claude, txmonster monster-steropes). Joey TG chiron:1483: 「我要求的是全面動起來，為何…有兩台機器沒上？」; Chiron btcc 9639.
+  - The delivery watchdog runs on the Mac mini and reads only Mac mini transcripts. Those two agents had the fleet tools but no mailbox, no reminders and no keep-warm.
+  - New `keepwarm-local.ts` ports `monitors/delivery-watchdog/keepwarm.py` rule for rule:
+    - keep-warm poke at 50 min idle; not while a turn runs, when already cold, at a usage wall, on a 5-minute cache or after 24 h without real work; stops after a poke that came back cold;
+    - 讀信箱 when idle with unread mail, sent again after an hour if it produced no turn; one line an hour while busy with mail waiting an hour; held while Joey spoke within the hour.
+    - Parity on 6 real transcripts: 42 scan fields, 0 differences.
+  - The daemon reads its own agent's transcript and asks BTCC for its own unread count (`/api/mesh/mail/counts/all`, own credential, own row only). It hands the line to its own session as `fleet-watchdog`, `no_reply`, the same sender the watchdog uses, so both tell a poke from real work the same way.
+  - No other machine is involved.
+  - Switch: `KEEPWARM_LOCAL=live|dry|off` in the machine config (`~/.config/crab-labs-plugins/env`). It is re-read every pass, so `off` stops it at once; turning it on needs a daemon restart. The Mac mini never sets it, so no agent is poked twice.
+  - `KEEPWARM_PROJECTS_DIR`: the session's transcript folder, for when the daemon's default (next to its state dir) is wrong. On the MBP it is: the inbox daemon keeps its state in `~/.claude`.
+  - Log: `<state dir>/keepwarm-local.log`, plus the daemon log.
+- Tests: `keepwarm-local.test.ts`, 20 new.
+
 ## 1.29.7 — 2026-11-16
 
 - **Duty officer: a safeguards refusal is retried once with Sonnet 5.5.**
