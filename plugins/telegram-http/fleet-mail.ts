@@ -1,8 +1,8 @@
 // fleet — the second MCP server of the agent-inbox plugin (WO-91 收件分級第一段).
 //
 // Why a second server: Claude Code silently truncates each MCP server's instructions at 2048 chars
-// (measured 2026-11-06; see server.ts). agent-inbox's own instructions (trust, disclosure, closing) are
-// ~1.9k already, and the fleet's main text (FLEET_TEXT, Chiron's words, verbatim) is ~1.3k. Each server
+// (measured 2026-11-06; see server.ts). agent-inbox's own instructions (trust, disclosure, closing) were
+// ~1.9k when this server was split off, and the fleet's main text (FLEET_TEXT, Chiron's words, verbatim) ~1.3k. Each server
 // gets its own budget, so the main text rides here, with the tools it talks about: call, mail, mailbox.
 //
 // Stateless streamable HTTP with JSON responses (POST /fleet on the agent-inbox daemon): no session,
@@ -23,12 +23,10 @@ export type CallFn = (to: string, text: string, replyTo?: number, noReply?: bool
 export interface FleetDeps { call: CallFn; btcc: BtccCall; core: CoreCall }
 const TOUCH_MAX = 5
 
-const SEND_FLOW = '寄之前：① 晚一小時會壞事，或有人正在等結果 → 呼叫（call）。② 對方要做事、回答、決定，或一定要它知道（拿不準算是）→ 寄信（send_mail）。③ 沒有哪一隻非知道不可、之後碰到的人查得到就好 → 貼動態（feed_post）。'
-
 export const FLEET_TOOLS = [
   {
     name: 'call',
-    description: `呼叫（Call）：內容立刻送進對方的 session，它會放下手上的事先看。只用在晚一小時會壞事，或有人正在等結果（Joey、客戶、讀者）。${SEND_FLOW} 回一個呼叫也用 call 並帶 reply_to：回覆自動標不用回，到此為止。`,
+    description: '呼叫。內容立刻送進對方的 session，它會放下手上的事先看。回一則呼叫時帶 reply_to，回覆自動標不用回。',
     inputSchema: {
       type: 'object',
       required: ['to', 'text'],
@@ -42,7 +40,7 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'send_mail',
-    description: `寄信（Mail）：放進對方的信箱，不打斷它手上的事；它一小時內會知道有信，自己排時間讀；它打開時你查得到已讀。大部分的事是信，拿不準就寄信。${SEND_FLOW} 對方的信箱還沒開時，這封會照舊直接送進它的 session，你不用管。`,
+    description: '寄信。放進對方的信箱，它一小時內會讀；它打開時你查得到已讀。標題 50 字內（誰、對什麼、要它做什麼），超過自動截短。沒填期限是一天，到期它還沒讀你會收到一封信。對方信箱還沒開時會直接送進它的 session。',
     inputSchema: {
       type: 'object',
       required: ['to', 'title', 'body'],
@@ -58,22 +56,22 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'mailbox_list',
-    description: '看信箱清單：未讀的和已讀還沒勾掉的信，一封一行（編號｜誰寄的｜標題｜期限｜等了多久｜未讀或已讀），不含內容。看清單不算讀。被提醒「讀信箱」時先看這個，再決定什麼時候讀。',
+    description: '看信箱清單，一封一行，不含內容；看清單不算讀。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'mailbox_open',
-    description: '打開一封信，讀全文。打開就算已讀：寄的人看得到已讀和時間，之後不再提醒這封。',
+    description: '打開一封信讀全文；打開就算已讀，寄的人看得到。',
     inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'integer', description: '信的編號' } } },
   },
   {
     name: 'mailbox_check',
-    description: '勾掉一封信：這封不用再留在信箱清單裡（回過信了、去工作板開了單、或看了沒事要做）。勾掉不代表事情做完；要追做完沒的，開工作板的單。',
+    description: '勾掉一封信，從清單收起來；不代表事情做完。',
     inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'integer' } } },
   },
   {
     name: 'mailbox_reply',
-    description: '回信：寄一封信給原來寄的人，自動連到原信、自動標不用回，它讀了就結束。回信不是必填。',
+    description: '回信給原寄件人，自動連到原信、自動標不用回。',
     inputSchema: {
       type: 'object',
       required: ['id', 'body'],
@@ -86,12 +84,12 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'mail_sent',
-    description: '查自己寄出的信：對方讀了沒、什麼時候讀的、勾掉了沒。',
+    description: '查自己寄出的信對方讀了沒。',
     inputSchema: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } } },
   },
   {
     name: 'feed_post',
-    description: `貼動態（Feed）：貼到艦隊的動態牆，不通知任何人、不佔任何人的時間；之後要處理相關事情的人問牆時找得到。適合「做完了什麼、改了什麼、什麼狀態變了」。${SEND_FLOW} 貼了不能改；寫錯或事情又變了，就再貼一則並填 supersedes。`,
+    description: '貼動態。貼到牆上，不通知任何人。填標題（50 字內）、動到什麼（touches，最多 5 個詞）、連動的工單（ref）、取代哪一則（supersedes）。貼了不能改，寫錯就再貼一則並填 supersedes。',
     inputSchema: {
       type: 'object',
       required: ['title', 'body'],
@@ -107,7 +105,7 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'feed_ask',
-    description: '問牆：要處理一件事的時候先問一次，用一句話寫你要處理什麼。Jev 會從你還沒讀過的貼文裡挑出跟這件事有關的，全文直接給你，給了就算讀過。沒有人會提醒你來問。Jev 沒回時，工具會叫你改用 feed_search。',
+    description: '問牆。一句話寫你要處理什麼；跟它有關、你還沒讀過的貼文全文直接給你，給了就算讀過。',
     inputSchema: {
       type: 'object',
       required: ['about'],
@@ -116,7 +114,7 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'feed_search',
-    description: '搜尋動態牆：給一到幾個詞，搜全文加短卡，回短卡清單（編號｜時間｜誰貼的｜標題，加動到什麼、連動），新的在前。列出短卡不算讀；要讀用 feed_open。Jev 沒回時用它；查已經讀過的、查很久以前的也用它。',
+    description: '搜尋牆。',
     inputSchema: {
       type: 'object',
       required: ['q'],
@@ -128,7 +126,7 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'feed_open',
-    description: '打開一則動態，讀全文。打開就算讀過。',
+    description: '打開一則。',
     inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'integer', description: '貼文編號' } } },
   },
 ]

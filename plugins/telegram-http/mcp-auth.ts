@@ -1,8 +1,8 @@
 // Loopback MCP token (Epeius btcc 5964, from Hephaestus's WO-22 confused-deputy point).
 //
 // The daemon binds 127.0.0.1, but on a shared host that is no boundary: another local uid,
-// or a container in the host's network namespace, could open /mcp and have this daemon act
-// as its agent — send_to_agent signed with the agent's mesh credential, replies as its bot.
+// or a container in the host's network namespace, could open /mcp (or /fleet) and have this daemon act
+// as its agent — fleet calls and mail signed with the agent's mesh credential, replies as its bot.
 // Each daemon therefore keeps a token in <dir>/<port> (dir 0700, file 0600; kept across
 // restarts so live clients reconnect), and the TUI presents it through the plugin's
 // headersHelper (mcp-auth-header.sh), which reads the same file. Same-uid processes can read

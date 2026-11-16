@@ -22,7 +22,7 @@ describe('fleet MCP server', () => {
     const r = await handleFleetRpc(rpc('initialize', { protocolVersion: '2025-06-18' }), deps().d)
     expect(r.result.instructions).toBe(FLEET_TEXT)
     expect(FLEET_INSTRUCTIONS.length).toBeLessThan(2000)
-    expect(FLEET_TEXT.startsWith('艦隊怎麼傳遞事情')).toBe(true)
+    expect(FLEET_TEXT.startsWith('艦隊通訊：一個工具，三級')).toBe(true)
     expect(r.result.protocolVersion).toBe('2025-06-18')
     expect(r.result.capabilities.tools).toBeDefined()
     expect(r.result.capabilities.experimental).toBeUndefined()   // never a channel
