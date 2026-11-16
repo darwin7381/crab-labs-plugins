@@ -3193,6 +3193,7 @@ export function failureSaid(text: string): boolean {
     return ' failed '
   })
   t = t.replace(/[A-Za-z0-9]*(?:[_.][A-Za-z0-9]+)+/g, m => /fail|error/i.test(m) ? ' ' : m)                           // identifiers: failed_step, error_rate, http.errors
+  t = t.replace(/\b(errors?|fail(?:ure)?s?)[ -]?(rate|ratio)\s*[:=]?\s*[\d.]+\s*%?|(錯誤|错误|失敗|失败)(率|比例)\s*[:=：]?\s*[\d.]+\s*%?/gi, ' ')   // 002m: a named rate with its value is a metric
   t = t.replace(/(無|沒有|没有|未見|未发现|未發現|沒|没|未|不見|零)\s*(任何)?\s*(失敗|失败|異常|异常|錯誤|错误)/g, ' ')
   t = t.replace(/\b(no|zero|without|0)\s+(errors?|failures?|failed)\b/gi, ' ')
   return FAILURE_WORDS.test(t)
@@ -3210,6 +3211,22 @@ export function scheduledNotifyGate(tok: RunTok, text: string): void {
   }
 }
 
+// 002m aid (a), the routine-notice length gate. A model fault answered by a program (002k B11's rule), not by more prompt text. design/routing 「每個回合都要
+// 回報一句」 and notify 「不重要但要通知的 → 靜音訊息…小提醒、例行工作完成」: a reflex lane's routine notice to Joey is ONE line. B01 (002l r1-r3, 0/3): 5-7-line
+// notices for a 「一句話」 report. Like the scheduled gate: a notice of a reflex lane's run that is not Joey's own conversation, not critical and not a
+// failure report, longer than one line (or one very long line), is sent back ONCE with the request for one line; the same text again goes out.
+export const ROUTINE_NOTICE_MAX_CHARS = Number(process.env.LANES_ROUTINE_NOTICE_MAX_CHARS ?? 240)
+export function routineNoticeGate(tok: RunTok, lane: { kind: string }, text: string): void {
+  if (process.env.LANES_ROUTINE_NOTICE_GATE === '0') return
+  if (tok.trigger === 'scheduled' || lane.kind !== 'reflex' || tok.critical || tok.fanout || tok.nudged || byJoeyRun(tok)) return
+  const lines = text.split('\n').filter(l => l.trim()).length
+  if (lines <= 1 && text.length <= ROUTINE_NOTICE_MAX_CHARS) return
+  if (failureSaid(text) || tok.receipt?.outcome === 'failed') return
+  tok.nudged = true
+  throw new Error(`notify_joey not sent: a routine notice to Joey is ONE line: what happened, how it is now, and whether Joey needs to do anything. Yours is ${lines > 1 ? `${lines} lines` : `${text.length} characters on one line`}. `
+    + 'Send that one line now; the details belong in your receipt (happened / did), where the main and ledger_query see them. If this is a failure or something Joey must act on, send it again as it is and it will go out.')
+}
+
 /** exported for tests */
 export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<string> {
   const lane = S.lanes[tok.lane]
@@ -3221,6 +3238,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const text = String(a.text ?? '').trim()
       if (!text) throw new Error('empty text')
       scheduledNotifyGate(tok, text)                                    // 002k (B11): throws a tool error when the run must not send this
+      routineNoticeGate(tok, lane, text)                                // 002m aid (a): a routine notice is one line
       { const back = await reportCheck(lane, tok, 'notify_joey', text); if (back) return back }
       tok.notified = (tok.notified ?? 0) + 1
       const dec = notifyDecision(tok.cls, false, lane.thread)

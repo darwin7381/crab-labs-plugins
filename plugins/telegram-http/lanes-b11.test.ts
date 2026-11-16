@@ -69,7 +69,8 @@ test('B11: a follow-up of a scheduled routine is a scheduled run too; a peer\'s 
   const f = run('scheduled', { followup: true })
   await expect(L.callLaneTool(f, 'notify_joey', { text: SIX })).rejects.toThrow(/ONE line/)
   const peer = run('peer'), k = sent.length
-  await L.callLaneTool(peer, 'notify_joey', { text: SIX }); await L.callLaneTool(peer, 'notify_joey', { text: SIX + '\n（補充）' })
+  await expect(L.callLaneTool(peer, 'notify_joey', { text: SIX })).rejects.toThrow(/a routine notice to Joey is ONE line/)   // 002m aid (a): sent back once for one line
+  await L.callLaneTool(peer, 'notify_joey', { text: SIX }); await L.callLaneTool(peer, 'notify_joey', { text: SIX + '\n（補充）' })      // no count limit outside scheduled runs
   expect(sent.length).toBe(k + 2)
   const s = run('scheduled'); await L.callLaneTool(s, 'notify_joey', { text: '一行。' })
   await expect(L.callLaneTool(s, 'ask_joey', { text: '備份連續失敗，要你決定。' })).rejects.toThrow(/ask_joey refused: a scheduled run sends at most ONE message/)
