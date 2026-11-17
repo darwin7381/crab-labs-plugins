@@ -1,3 +1,16 @@
+## 1.32.1 — 2026-11-17
+
+- **A request without an `Authorization` header now gets 503, not 403** (`/mcp` and `/fleet`; `refusal()` in `mcp-auth.ts`). A header with the wrong token still gets 403.
+  - **Why:** on 11-16 at 16:50Z the whole Mac mini fleet restarted at once. One TUI ran its headersHelper while shutting down, the helper died, and the request reached the agent-inbox daemon with no header. The daemon answered 403.
+  - **What Claude Code does with that** (2.1.322 bundle, lab-confirmed): a 401 or 403 to a request with no `Authorization` header writes `plugin:agent-inbox:agent-inbox` into `~/.claude/mcp-needs-auth-cache.json`.
+    - That cache is shared by every session on the machine and keyed by server name. The entry lasts 15 min for a plugin server with a headersHelper.
+    - A session that starts while the entry is fresh skips the server for its whole life: no request, no retry, needs-auth.
+    - 33 sessions ran 17 h without agent-inbox: no scheduled wakes, calls, BTCC messages or keep-warm.
+  - **Why 503:** it is never cached. It is retried after 0.5, 1.5 and 4 s, and each retry re-runs the headersHelper; in the lab, the retry connected about 0.6 s later. It is not a 4xx, so there is no legacy-SSE probe.
+  - **Why not 401:** it starts OAuth discovery and stores state in the login keychain.
+  - The body is a JSON-RPC error (`-32001`).
+  - Tests: `mcp-auth.test.ts` adds the refusal cases (159/0). Dev daemon check: no header 503, wrong token 403, right token 200, `/fleet` without a header 503.
+
 ## 1.32.0 / agent-inbox 1.3.0 — 2026-11-16
 
 - **One sending tool again: `send_to_agent`, with three lines under it** (WO-99 v3). Joey TG chiron:1503: 「怎麼可以把他們跟其他的工具混再一起？…溝通工具整個的認知和注意力就會爆掉啊／應該跟原本一樣叫 send to agent 啊…只是這下面從一條線變成三條支線，並且有正確的寫法說明啊」.

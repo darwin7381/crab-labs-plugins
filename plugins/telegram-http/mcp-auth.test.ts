@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { bearerMatches, ensureToken, makeGate, TOKEN_RE } from './mcp-auth.ts'
+import { bearerMatches, ensureToken, makeGate, refusal, TOKEN_RE } from './mcp-auth.ts'
 
 describe('loopback MCP token', () => {
   test('created once with 0600 in a 0700 dir, then reused across restarts', () => {
@@ -54,5 +54,26 @@ describe('loopback MCP token', () => {
     const broken = makeGate('', true, () => {})
     expect(broken.check(`Bearer ${'t'.repeat(43)}`, 'POST', undefined)).toBe(false)
     expect(broken.stats.token_ready).toBe(false)
+  })
+})
+
+// 2026-11-17: Claude Code caches "needs auth" machine-wide (by server name) on a 401/403 to a request
+// WITHOUT an Authorization header; 33 sessions then skipped agent-inbox for 17 h. Never answer that with 401/403.
+describe('refusal status', () => {
+  test('no Authorization header → 503 with a JSON-RPC error (never cached, retried)', () => {
+    for (const h of [undefined, '', '   ']) {
+      const r = refusal(h)
+      expect(r.status).toBe(503)
+      const b = JSON.parse(r.body)
+      expect(b.jsonrpc).toBe('2.0')
+      expect(b.error.code).toBe(-32001)
+    }
+  })
+  test('a header with the wrong token → 403 (client reports HEADERS_HELPER_AUTH_REJECTED, no cache write)', () => {
+    expect(refusal('Bearer wrong').status).toBe(403)
+    expect(refusal('Basic abc').status).toBe(403)
+  })
+  test('never 401', () => {
+    for (const h of [undefined, '', 'Bearer x', 'junk']) expect(refusal(h).status).not.toBe(401)
   })
 })

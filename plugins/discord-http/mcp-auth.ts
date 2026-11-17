@@ -59,6 +59,26 @@ export type McpAuthStats = {
   last_unauth_ua: string | null
 }
 
+/** Status and body for a request the gate refused.
+ *
+ *  No Authorization header at all → 503. Claude Code (2.1.322 bundle, lab-confirmed 2026-11-17) writes
+ *  ~/.claude/mcp-needs-auth-cache.json when a request WITHOUT an Authorization header gets 401 or 403.
+ *  That cache is shared by every session on the machine and keyed by server name (15 min for a plugin
+ *  server with a headersHelper); a session that starts while the key is there skips the server for its
+ *  whole life, no request, no retry. 11-16 16:50Z: one TUI shutting down ran its headersHelper too late,
+ *  got 403 here, and 33 Mac mini sessions started without agent-inbox for 17 h. 503 is never cached and
+ *  is retried (0.5 / 1.5 / 4 s), re-running the headersHelper; it is not a 4xx, so no legacy-SSE probe.
+ *  A header with the wrong token → 403: with auth sent the client reports HEADERS_HELPER_AUTH_REJECTED
+ *  and caches nothing. Never 401 (it starts OAuth discovery and stores state in the login keychain). */
+export function refusal(authorization: string | undefined): { status: number; body: string } {
+  if ((authorization ?? '').trim()) return { status: 403, body: '{"error":"loopback MCP token required"}' }
+  return {
+    status: 503,
+    body: JSON.stringify({ jsonrpc: '2.0', id: null,
+      error: { code: -32001, message: 'loopback MCP token required (no Authorization header; headersHelper not run yet?)' } }),
+  }
+}
+
 /** The /mcp gate: true = let the request through. Counts and (rate-limited) logs every
  *  request without the token; refuses it only when `required`. */
 export function makeGate(token: string, required: boolean, log: (msg: string) => void, now = () => Date.now()) {

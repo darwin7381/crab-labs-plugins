@@ -11,7 +11,7 @@
 
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
-import { ensureToken, makeGate } from './mcp-auth.ts'
+import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend } from './fleet-mail.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -3295,7 +3295,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     if (INBOX_ONLY && u.pathname === '/fleet') {
       if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?',
                          req.headers['user-agent'] as string | undefined)) {
-        res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"loopback MCP token required"}')
+        const r = refusal(req.headers['authorization'] as string | undefined)
+        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
         return
       }
       if (req.method !== 'POST') {
@@ -3333,7 +3334,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     // Loopback token (mcp-auth.ts): every /mcp method — initialize, SSE, DELETE, resumed ids.
     if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?',
                        req.headers['user-agent'] as string | undefined)) {
-      res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"loopback MCP token required"}')
+      const r = refusal(req.headers['authorization'] as string | undefined)   // 503 when no header: see mcp-auth.ts
+      res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
       return
     }
 

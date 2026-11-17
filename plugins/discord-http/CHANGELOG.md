@@ -1,3 +1,7 @@
+## 1.14.5 — 2026-11-17
+
+- **A request without an `Authorization` header now gets 503, not 403.** Same fix as telegram-http 1.32.1 (see its entry): a token-less 401 or 403 makes Claude Code cache "needs auth" machine-wide under the server name, and sessions started within 15 min then skip the server. A wrong token still gets 403. Tests 35/0.
+
 ## 1.14.4 — 2026-11-13
 
 - **`/effort` no longer changes the effort of every other agent on the machine.** Same bug and same fix as telegram-http 1.27.8 (see its entry for the CLI evidence). claude's `/effort` saves the level in the global `~/.claude/settings.json` as `modelSettings["<model>"].effortLevel`, so every TUI on the machine running that model inherited it. With scope=session (the default; opt out with `CHANNEL_BOT_MODEL_SCOPE=global`), the plugin snapshots `effortLevel` and `modelSettings` before it types `/effort`, and writes the effort fields back after the switch: on ✅, and also when it is unconfirmed or errors. Entries the TUI created are removed again, not left as `{}`. Other keys are not touched. The write is atomic (temp file + rename, mode kept).
