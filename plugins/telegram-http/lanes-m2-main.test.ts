@@ -103,7 +103,7 @@ test('002f: a SIGKILLed main (no SessionEnd) is gone within one tick of kill -0;
   expect(M().mainPhase()).toBe('idle')
   await M().tick()
   expect(M().mainPhase()).toBe('gone'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'gone', end_reason: 'killed' })
-  expect(M().awaySince()).toBeGreaterThan(0)                                                 // a hand-over's grace counts from here
+  expect(M().currentGen()).toBeNull()                                                        // PL3: nothing else follows from it (no away grace rewrites a due time)
   open.delete(g.mcp)
 })
 

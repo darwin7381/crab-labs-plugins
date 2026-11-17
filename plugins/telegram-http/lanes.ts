@@ -580,8 +580,10 @@ export type InEvent = {
   reply_to_id?: string; btcc_msg_id?: string; no_reply?: boolean
   reply_to_message_id?: string; message_thread_id?: string; reply_to_text?: string
   synthetic?: string
-  /** M3: the event class the router (or the follow-up scheduler) gives it; when unset it is derived from the routing rule's trigger (evClassOf) */
+  /** M3: the event class the router gives it; when unset it is derived from the routing rule's trigger (evClassOf) */
   klass?: EvClass
+  /** PL3: this run of the event is follow-up `fu-…` (a follow-up is another run on its origin event, not a new event) */
+  followup?: string
   /** 002k: this event is one task of a fan-out (main tool fan_out); its lane hands the result back with report_result */
   fanout?: string
   /** 002k (B12): this event is a repeat of the alert of this thread; it rides along in that thread's next run (QItem.extra) */
@@ -1411,8 +1413,8 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   proposals?: Array<{ id: string; text: string }>; records?: number
   /** 002k (C6): this follow-up run found what the previous run on the thread found / the chain's end was already written for this run */
   unchanged?: boolean; chainEnded?: boolean
-  /** the run's event is a follow-up (its class, set by the follow-up scheduler) */
-  followup?: boolean
+  /** PL3: this run is a follow-up run (followupId) of its origin event */
+  followup?: boolean; followupId?: string
   /** 002k (E18): Joey's messages that reached this run while it was in progress and were handed to it at a tool boundary (the last one is what its notify_joey answers) */
   steered?: InEvent[]
   /** 002k: the run is a fan-out member / the synthesis of a fan-out */
@@ -1761,15 +1763,17 @@ export function followupTick(): void {
   const now = Date.now()
   let changed = false
   for (const f of duePending(S.followups, now)) {
-    f.state = 'fired'; f.fired = nowIso(); changed = true
+    // PL3: a follow-up is another run on its ORIGIN event's record (its line is a raise or it is refused, M3), not a new matter
+    if (queue.has(f.event)) continue                                         // that event has a run queued or running: the follow-up waits for it
+    f.state = 'fired'; f.fired = nowIso(); f.fired_event = f.event; changed = true
     const th = S.threads[f.thread]
     let lane = th?.lane ? S.lanes[th.lane] : undefined
     if (!lane || lane.status === 'closed') lane = newLane('reflex', { thread: f.thread })
-    const ev: InEvent = { id: `ev-fu-${shortId()}`, source: 'mesh', from: f.from, text: f.note, meta: {}, notif: { method: '', params: {} },
-      thread: f.thread, trigger: f.trigger, cls: f.cls, klass: 'followup', synthetic: followupEventText(f, now) }
-    f.fired_event = ev.id
-    appendJsonl('routing.jsonl', { event: ev.id, source: 'followup', from: f.from, rule: 'followup', target: 'lane', lane: lane.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` })
-    logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: ev.id, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
+    const rec = events?.get(f.event)
+    const ev: InEvent = { id: f.event, source: 'mesh', from: f.from, text: String(rec?.text ?? f.note), meta: {}, notif: { method: '', params: {} },
+      thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id, synthetic: followupEventText(f, now) }
+    appendJsonl('routing.jsonl', { event: f.event, source: 'followup', from: f.from, rule: 'followup', target: 'lane', lane: lane.id, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` })
+    logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: f.event, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
     const d = dispatch(ev, lane, { rule: 'followup' })
     D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
   }
@@ -2141,7 +2145,7 @@ function startRun(it: QItem): void {
   const critical = !!lane.critical
   const trigger = it.ev.trigger ?? (lane.kind === 'reflex' ? 'other' : lane.kind)   // main-opened worker / fork: their kind
   const tok: RunTok = { runId, lane: lane.id, evId: it.ev.id, closers: [], critical, trigger, cls: it.ev.cls ?? trigger,
-    followup: it.ev.klass === 'followup',
+    followup: !!it.ev.followup, followupId: it.ev.followup,
     fanout: lane.kind === 'synthesis' ? undefined : it.ev.fanout, synthesis: lane.kind === 'synthesis' ? it.ev.fanout : undefined }
   runTokens.set(token, tok)
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
@@ -2443,8 +2447,8 @@ function ownerOf(evId: string): string | undefined {
   const lane = S?.lanes?.[String(e.owner ?? '')]
   return lane ? laneLabel(lane) : undefined
 }
-// the due times of the obligations the router acts on (M3's one sweep): a hand-over the main has not finished (002d: 300 s); a main away (gone or
-// walled) makes it due after AWAY_GRACE_MS (002g: 60 s); a critical alert's line (CRITICAL_DEADLINE_MS, 002k E1: 45 s); the main's promised answer to a peer
+// the due times of the obligations the router acts on (M3's one sweep), each set when the obligation is created: a hand-over the main has not finished
+// (002d: 300 s); a critical alert's line (CRITICAL_DEADLINE_MS, 002k E1: 45 s); the main's promised answer to a peer
 // (PROMISE_MIN, 002j: 30 min). They are due times on explicit state, not windows over a transcript.
 const HANDOFF_DUE_MS = (): number => num('LANES_HANDOFF_FALLBACK_MS', 300_000)
 /** M3 → M4 → M1: the event is handed to the main. ONE transition for every hand-over (handoff_main, the exit rule, the thread stop): events.handOver
@@ -2620,14 +2624,10 @@ export async function mainSentTo(to: string, thread: string | null, replyTo?: st
 }
 
 /** the due sweep (every second): what nobody met by its due time, the router does. This one sweep replaces the critical ring (45 s), the hand-over
- *  fallback and its down grace, the promise due and the commitment due. */
-const AWAY_GRACE_MS = (): number => num('LANES_HANDOFF_DOWN_GRACE_MS', 60_000)
+ *  fallback, the promise due and the commitment due. PL3: it acts only on the due_at an obligation got when it was created; nothing rewrites one
+ *  (the main being away is M1's business: what it was given waits for it, and the wall / stuck notice already told Joey once). */
 export function dueTick(now = Date.now()): void {
   if (!events || !S) return
-  const away = main.awaySince() ? now - main.awaySince() : 0
-  // a hand-over the main cannot take (gone or walled past the grace) is due now
-  if (away >= AWAY_GRACE_MS()) for (const e of events.rows(r => r.state === 'open')) for (const o of (e.obligations ?? []) as Ob[])
-    if (o.kind === 'main' && o.state === 'open' && !o.told && (o.due_at ?? Infinity) > now) events.set(e.id, o.id, { due_at: now })
   for (const { e, o } of events.due(now)) {
     const lane = S.lanes[String(e.lane ?? '')]
     if (o.kind === 'joey' && o.ring) {
@@ -2641,7 +2641,7 @@ export function dueTick(now = Date.now()): void {
     }
     events.set(e.id, o.id, { told: true }, { tool: 'router' })
     const text = o.kind === 'main'
-      ? `這件事原本交給主線處理（${o.handoff ?? o.id}），但${away >= AWAY_GRACE_MS() ? `主線已經 ${Math.max(1, Math.round(away / 1000))} 秒${main.mainPhase() === 'walled' ? `不能用模型（${WALL_WORD[S.wall?.kind ?? ''] ?? '模型無法使用'}）` : '不在線'}` : `已經 ${Math.round((now - Date.parse(e.ts)) / 60_000)} 分鐘，主線還沒處理完`}，先直接讓你知道：\n${String(o.what ?? e.text ?? '').slice(0, 600)}`
+      ? `這件事原本交給主線處理（${o.handoff ?? o.id}），${Math.max(1, Math.round((now - (o.due_at! - HANDOFF_DUE_MS())) / 60_000))} 分鐘了主線還沒處理完${main.mainPhase() === 'walled' ? '（主線現在不能用模型）' : main.mainPhase() === 'gone' ? '（主線現在不在線）' : ''}，先直接讓你知道：\n${String(o.what ?? e.text ?? '').slice(0, 600)}`
       : o.level === 'commitment' ? `主線答應的事過了時限，還沒有標完成：答應 ${o.to}：${o.what}（時限 ${simTime(o.due_at!)}；${e.id}）。做完了主線會用 commitment_done 標掉。`
       : `${o.to} 在等主線回覆：「${o.what ?? ''}」。車道把這件事交給主線時，系統告訴過 ${o.to} 主線會在 ${simTime(o.due_at!)} 前回。時間到了，主線還沒有回 ${o.to}。`
     const rule = o.kind === 'main' ? 'handoff-due' : o.level === 'commitment' ? 'commitment-due' : 'promise-due'
@@ -2741,7 +2741,7 @@ function outcomeArg(a: any): Outcome | undefined { const o = String(a?.outcome ?
 function joeyRendering(e: Row | undefined, tok: RunTok, lane: Lane, level: 'line' | 'decision', ob: Ob | undefined, text: string, outcome: Outcome): { tier: Tier; rule: string; body: string } {
   const dec = notifyDecision(tok.cls, level === 'decision', lane.thread)
   let { tier, rule } = dec
-  if (level === 'line' && tier === 'push' && (ob?.rang || e?.class === 'followup' || tok.followup)) { tier = 'silent'; rule += ob?.rang ? '+rang-at-due' : '+followup-quiet' }
+  if (level === 'line' && tier === 'push' && (ob?.rang || tok.followup)) { tier = 'silent'; rule += ob?.rang ? '+rang-at-due' : '+followup-quiet' }
   const routine = level === 'line' && outcome === 'normal' && ROUTINE_CLASSES.includes(String(e?.class)) && !tok.critical
   const first = text.split('\n').map(l => l.trim()).find(Boolean) ?? text
   return { tier, rule: routine && first !== text.trim() ? `${rule}+one-line` : rule, body: routine ? first.slice(0, 400) : text }
@@ -2850,7 +2850,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const chk = checkFollowupArgs(a, pending)
       if (!chk.ok) return `followup refused: ${chk.error}`
       // 002k (C6): run cap and no-change rule of the chain
-      const parent = tok.followup ? Object.values(S.followups).find(x => x.fired_event === tok.evId) : undefined
+      const parent = tok.followupId ? S.followups[tok.followupId] : undefined
       const chain = tok.followup ? (parent?.chain ?? 1) + 1 : 1
       const cap = FOLLOWUP_CHAIN_MAX()
       if (tok.unchanged) {
@@ -2863,7 +2863,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       const q = queue.get(tok.evId)
       const due = Date.now() + chk.after * 60_000
-      const f: Followup = { id: `fu-${shortId()}`, thread: lane.thread, lane: lane.id, event: tok.evId, run_id: runIdOfText(q?.ev.text ?? ''),
+      const f: Followup = { id: `fu-${shortId()}`, thread: lane.thread, lane: lane.id, event: tok.evId, run: tok.runId,
+        run_id: ((events.get(tok.evId)?.obligations ?? []) as Ob[]).find(o => o.kind === 'receipt')?.run_id ?? null,
         trigger: tok.trigger, cls: tok.cls, from: q?.ev.from ?? 'scheduler', after_minutes: chk.after, note: chk.note, created: nowIso(),
         due, due_iso: new Date(due).toISOString(), state: 'pending', chain }
       S.followups[f.id] = f; saveState()
@@ -2920,7 +2921,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         if (th) th.fu_fp = fp
         if (tok.followup && prev && sameOutcome(prev, fp)) {
           tok.unchanged = true
-          const dropped = Object.values(S.followups).filter(f => f.thread === lane.thread && f.state === 'pending' && f.event === tok.evId)
+          const dropped = Object.values(S.followups).filter(f => f.thread === lane.thread && f.state === 'pending' && f.run === tok.runId)
           for (const f of dropped) { f.state = 'ended'; f.ended = 'no-change' }
           if (dropped.length) { chainEnded(lane, tok, 'no-change', Math.max(...dropped.map(f => f.chain ?? 1)) - 1); chainNote = `; the follow-up you scheduled in this run was cancelled: your outcome is the same as the previous run's, so this thread now waits for a new event or Joey` }
           saveState()

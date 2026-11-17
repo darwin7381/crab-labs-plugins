@@ -247,10 +247,18 @@ test('the due sweep: a promised answer past its due time tells Joey once; a hand
   const q = await start(mk('cain', '幫我看一下 ticket 12'))
   await call(q.tok, 'handoff_main', { text: 'cain 要看 ticket 12，要主線' })
   await end(q.lane)
-  // no live main (gone since the start of this file): past the 60 s grace the hand-over is due now (002g, 002j)
-  const m = sent.length
+  // PL3 (T7-R, T6-R, T8-R, G03): no live main is no reason to make anything due early: the sweep acts on the due time set when the hand-over was made
+  const m = sent.length, qd = ob(q.id, 'main').due_at
   L.dueTick(Date.now() + 61_000); await sleep(20)
-  expect(sent.slice(m).some(s => s.text.includes('cain 要看 ticket 12') && s.text.includes('不在線'))).toBe(true)
+  expect(sent.slice(m).some(s => s.text.includes('cain 要看 ticket 12'))).toBe(false); expect(ob(q.id, 'main').due_at).toBe(qd)
+  L.dueTick(qd + 1); await sleep(20)
+  expect(sent.slice(m).filter(s => s.text.includes('cain 要看 ticket 12') && s.text.includes('不在線')).length).toBe(1)   // at its own due time, once
+  // Joey's own messages to the main carry no due time: the sweep never pushes them back to him (T7-R: 4 echoes)
+  const meta = { chat_id: '1', message_id: '3001', user: 'joey_lab' }
+  await L.routeEvent({ id: 'tg-1-3001', source: 'telegram', from: 'joey', text: '主線在嗎？', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '主線在嗎？', meta } } } as any)
+  expect(ob('tg-1-3001', 'main').due_at).toBeUndefined()
+  L.dueTick(Date.now() + 86_400_000); await sleep(20)
+  expect(sent.slice(m).some(s => s.text.includes('主線在嗎？'))).toBe(false)
 })
 
 test('002k E1, 002i: a critical alert whose lane has not reported by its due time is rung by the router, once; the lane\'s later line goes out silent; a lane that reports in time rings itself', async () => {
@@ -659,4 +667,31 @@ test('PL2 P5 (C04, H04, B08, G07): a drained or coalesced event is dropped / mer
   await call(first.tok, 'reply_agent', { to: 'eve', text: '答' }); await call(first.tok, 'notify_joey', { text: '答了 eve' }); await end(first.lane)
   const info = await L.routeEvent(mk('eve', 'FYI 只是說一聲', { no_reply: true }))
   expect(info.target).toBe('ledger'); expect(E().get(`mesh-m3-${n}`)).toMatchObject({ state: 'closed', obligations: [] })
+})
+
+// ------------------------------------------------------------------ PL3 (AUD): the due sweep acts only on what is due; a follow-up is another run of its origin event
+test('PL3 P10 (B08 1015/1016, T3-R E4, A05, G03): a follow-up is a run of its ORIGIN event: no new event, no fresh Joey line; the same outcome is refused, a changed one is a raise', async () => {
+  const s = await start(sched(81))
+  await call(s.tok, 'notify_joey', { text: 'mock-api degraded，5 分鐘後再看', outcome: 'changed' })
+  expect(await call(s.tok, 'followup', { after_minutes: 5, note: '再看 mock-api 是否恢復' })).toContain('scheduled')
+  await call(s.tok, 'receipt', { outcome: 'done', run_id: '81' })
+  await end(s.lane)
+  const st = L.__lanesState(), f = Object.values(st.followups).find(x => x.event === s.id)!
+  expect(f).toMatchObject({ state: 'pending', run: s.tok.runId, run_id: '81' })
+  const nEvents = E().rows().length
+  f.due = Date.now() - 1; L.followupTick()
+  expect(await until(() => !!L.__runTok(s.lane))).toBe(true)
+  const fu = L.__runTok(s.lane)!
+  expect(fu).toMatchObject({ evId: s.id, followup: true, followupId: f.id })                    // the origin's record, no ev-fu-*
+  expect(E().rows().length).toBe(nEvents); expect(E().rows(e => String(e.id).startsWith('ev-fu-')).length).toBe(0)
+  expect(rows('routing.jsonl').find(r => r.rule === 'followup' && r.followup === f.id)).toMatchObject({ event: s.id })
+  expect(await call(fu, 'notify_joey', { text: '還是 degraded', outcome: 'changed' })).toContain('Joey already has his line for this event (outcome changed)')   // the same matter, said again: refused
+  const k = sent.length
+  expect(await call(fu, 'notify_joey', { text: 'mock-api 已自行恢復', outcome: 'normal' })).toContain('sent to Joey')                                           // the outcome changed: a raise
+  expect(sent.length).toBe(k + 1); expect(sent.at(-1)!.silent).toBe(true)                      // a follow-up line never rings
+  expect(ob(s.id, 'joey')).toMatchObject({ state: 'met', outcome: 'normal' })
+  expect(await call(fu, 'receipt', { outcome: 'done', run_id: '81' })).toContain('already completed (by this event)')
+  expect(L.laneStop(fu)).toBeNull()                                                              // nothing new is owed: the origin's obligations stand
+  await end(s.lane)
+  expect(handed(s.id).length).toBe(0)
 })

@@ -16,7 +16,8 @@ export const FOLLOWUP_MAX_MINUTES = 240
 export const FOLLOWUP_MAX_PER_THREAD = 3
 
 export type Followup = {
-  id: string; thread: string; lane: string; event: string; run_id: string | null
+  /** event: the ORIGIN event (a follow-up is another run of it, PL3); run: the lane run that scheduled it */
+  id: string; thread: string; lane: string; event: string; run?: string; run_id: string | null
   trigger: string; cls: string; from: string
   after_minutes: number; note: string; created: string; due: number; due_iso: string
   /** 'ended' (002k C6): cancelled because the run that scheduled it found nothing new */
@@ -87,8 +88,8 @@ export function followupEventText(f: Followup, nowMs: number): string {
     `[車道事件｜後續檢查 ${f.id}｜thread ${f.thread}｜原事件 ${f.event}]`,
     `這是這條對話線先前排好的後續檢查，現在（模擬時間 ${simTime(nowMs)}）到時間了；排定時是 ${simTime(Date.parse(f.created))}，要求 ${f.after_minutes} 分鐘後再看。`,
     `當時留下的備註：${f.note}`,
-    ...(f.run_id ? [`原排程回合的 run_id：${f.run_id}。收尾的 receipt 填這個 run_id。`] : []),
-    `照備註與 runbook 重新檢查現況：條件還成立，就做可逆的小處理並確認結果（不可逆的事仍然只能 escalate）；已經恢復，就回報恢復。真的還需要再等，可以再呼叫一次 followup。最後一定先用 notify_joey 給 Joey 留一句（只一則；響不響由分流器決定，後續檢查通常是靜音），再呼叫 receipt 收尾；只留 receipt 不算收尾。receipt 的 happened / did / promised / needs_main 寫具體的數字與時間。`,
+    `這是同一件事的再一趟，不是新的事：Joey 已經有這件事的那一句。照備註與 runbook 重新檢查現況：條件還成立，就做可逆的小處理並確認結果（不可逆的事仍然只能 escalate）；真的還需要再等，可以再呼叫一次 followup。`,
+    `結果跟上一趟不同（outcome 變了：例如從 changed 變成恢復的 normal，或變成 failed）才用 notify_joey 告訴 Joey，並填 outcome；一樣的結果分流器會拒絕，不必再說。最後呼叫 receipt 收尾（不用再填 run_id：回執上一趟已送），happened / did / promised / needs_main 寫具體的數字與時間。`,
   ].join('\n')
 }
 

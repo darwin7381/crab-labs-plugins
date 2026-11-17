@@ -80,11 +80,12 @@ test('due selection: only pending ones whose simulated due time has come, earlie
   expect(duePending({}, NOW)).toEqual([])
 })
 
-test('follow-up message: note, simulated time, run_id; it does not repeat the original event text', () => {
+test('follow-up message: note, simulated time, a run of the same matter; it does not repeat the original event text', () => {
   const t = followupEventText(fu({}), NOW)
   expect(t).toContain('後續檢查 fu-1')
   expect(t).toContain('p95 仍高於 2 秒就重啟一次')
-  expect(t).toContain('run_id：88')
+  expect(t).not.toContain('run_id：88'); expect(t).toContain('不用再填 run_id')                    // PL3: the receipt of the run went with the origin's first run
+  expect(t).toContain('同一件事的再一趟'); expect(t).toContain('outcome 變了')                    // its Joey line is a raise or it is refused
   expect(t).toContain(simTime(NOW))
   expect(t).not.toContain('[scheduled]')
   expect(runIdOfText('[scheduled][api-health-check][run:88][normal] x')).toBe('88')

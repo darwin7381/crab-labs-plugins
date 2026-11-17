@@ -23,13 +23,16 @@ function thread(): { id: string; lane: string; run: (ev: string, followup: boole
   st.threads[id] = { id, lane, peer: null, hops: 0, tokens: 0, created: '', last: '' } as any
   // every run's event has its M3 record (the router opens it); this stands in for the router
   const rec = (ev: string) => { if (!L.__events().get(ev)) L.__events().open(ev, { class: 'scheduled', owner: lane, lane, thread: id, obligations: [] }); return ev }
-  return { id, lane, run: (ev, followup) => ({ runId: `${lane}.r1`, lane, evId: rec(ev), closers: [], critical: false, trigger: 'scheduled', cls: 'scheduled', escalated: false, pushed: false, followup }) }
+  // PL3: a follow-up run is another run of the ORIGIN event (fire() names the follow-up); each run has its own run id
+  let r = 0
+  return { id, lane, run: (ev, followup) => { const f = ev.startsWith('fu:') ? st.followups[ev.slice(3)] : undefined
+    return { runId: `${lane}.r${++r}`, lane, evId: rec(f ? f.event : ev), closers: [], critical: false, trigger: 'scheduled', cls: 'scheduled', escalated: false, pushed: false, followup, followupId: f?.id } } }
 }
-/** fire the pending follow-up of a thread as the router would: it becomes event ev-fu-<k> */
-function fire(thr: string, k: string): string {
+/** fire the pending follow-up of a thread as the router would: PL3, it is another run of its origin event (`fu:<id>` for run()) */
+function fire(thr: string, _k: string): string {
   const f = Object.values(st.followups).find(x => x.thread === thr && x.state === 'pending')!
-  f.state = 'fired'; f.fired_event = `ev-fu-${k}`
-  return f.fired_event
+  f.state = 'fired'; f.fired_event = f.event
+  return `fu:${f.id}`
 }
 const note = (i: number) => `重查 health：仍無 Joey 決定就不重啟（第 ${i} 輪）`
 
@@ -51,7 +54,7 @@ test('C6: the chain cap: the ordinary run and four follow-up runs; the fifth fol
     const out = await L.callLaneTool(tok, 'followup', { after_minutes: 10, note: note(i) })
     expect(out).toContain('scheduled')
     expect(Object.values(st.followups).filter(f => f.thread === t.id).at(-1)!.chain).toBe(i)
-    tok = t.run(fire(t.id, `a${i}`), true)                                              // the follow-up run: evId = the fired event
+    tok = t.run(fire(t.id, `a${i}`), true)                                              // the follow-up run: evId = the origin event (PL3)
   }
   const out = await L.callLaneTool(tok, 'followup', { after_minutes: 10, note: note(5) })
   expect(out).toContain('followup refused'); expect(out).toContain('cap 4'); expect(out).toContain('waits for a new event or for Joey')

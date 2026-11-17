@@ -113,8 +113,12 @@ record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no 
 | `closed` | nothing is owed (every obligation is `met`, `handed`, `dropped` or `merged`; an event with no obligations is closed at once) |
 
 Fields:
-- `class`: `scheduled`, `followup`, `peer`, `joey`, `alert` or `critical`. The router writes it from the routing rule's trigger, or the follow-up
-  scheduler does. No hook parses prompt text for it.
+- `class`: `scheduled`, `peer`, `joey`, `alert` or `critical` (`followup` is no longer written). The router writes it from the routing rule's
+  trigger. No hook parses prompt text for it.
+- **A follow-up is another run of its origin event**, not a new event: the follow-up scheduler queues a run of the origin event (the run's queued
+  line carries `ev.followup` = the follow-up id; the routing row has `event` = the origin and `followup`). Its Joey line is the origin's: a line
+  with a different `outcome` is a raise, the same outcome is refused; the origin's receipt is already met. A follow-up whose origin still has a run
+  queued or running waits for it.
 - `owner`: the lane id, `main`, or `router`: information nobody handles (it has no obligations).
 - `outcome`: `normal`, `changed` or `failed`. It is the worst outcome any call reported (a structured field of `notify_joey`, `ask_joey` and `receipt`).
 - `tool`: the call that changed the record. `refused`: the reason, when that call was refused.
@@ -184,8 +188,9 @@ about the event goes out silent: a lane line (tier rule `+rang-at-due`) and the 
 - a critical line: the router rings once (`rang`), unless a line that rang reached Joey first;
 - a hand-over, a promised answer, a commitment: Joey is told once (`told`).
 
-A `main` obligation is due 300 s after the hand-over (`LANES_HANDOFF_FALLBACK_MS`), or at once when the main has been away (gone or walled) for
-60 s (`LANES_HANDOFF_DOWN_GRACE_MS`).
+A `main` obligation is due 300 s after the hand-over (`LANES_HANDOFF_FALLBACK_MS`). The sweep acts only on the `due_at` an obligation got when it was
+created: nothing rewrites it, so a main that is away makes nothing due early (what was given to it waits; the wall or stuck notice told Joey once),
+and Joey's own messages to the main have no `due_at` at all.
 
 ### `wake` (M4): a decision, logged
 

@@ -78,7 +78,6 @@ export function createMain(E: MainEnv) {
   let stuck: { gen: string; prompt: string | null; at: number } | null = null
   let offering = false
   let seq = 0
-  const bootAt = Date.now()
 
   const J = (): Journal => E.journal
   /** boot: fold done by the caller (journal.load); pick the live gen */
@@ -98,14 +97,6 @@ export function createMain(E: MainEnv) {
   function mainPhase(): MainPhase { return (currentGen()?.state as MainPhase) ?? 'gone' }
   /** the main is there: a live gen that is not walled */
   function mainUp(): boolean { const p = mainPhase(); return p === 'idle' || p === 'in_turn' || p === 'starting' }
-  /** since when the main has been away (gone or walled), ms; 0 = it is there */
-  function awaySince(): number {
-    const g = currentGen()
-    if (g && g.state === 'walled') return Date.parse(g.ts)
-    if (g) return 0
-    const last = J().rows('main').pop()
-    return last ? Date.parse(last.ts) : bootAt                // no main has registered since this daemon started
-  }
   function mainSession(): { session_id: string; pid: number; transcript_path: string } | null {
     const g = currentGen()
     return g ? { session_id: String(g.session_id ?? ''), pid: Number(g.pid), transcript_path: String(g.transcript_path ?? '') } : null
@@ -367,7 +358,7 @@ export function createMain(E: MainEnv) {
   }
 
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, awaySince, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, wallRaised, wallLifted, tick,
+  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, wallRaised, wallLifted, tick,
     items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 
