@@ -185,6 +185,13 @@ function appendJsonl(name: string, rec: Record<string, unknown>): void {
   }
 }
 const ledgerPath = () => join(LANES_DIR, 'ledger.jsonl')
+/** PL6: the ONE writer of a route record: routing.jsonl and its Logos mirror (lane.route) get the same row. `thread` is the owner's thread (the
+ *  conversation the event belongs to after routing); `peer_thread` is the thread the sender supplied. */
+function routeRow(r: Record<string, unknown> & { event: string; rule: string }): void {
+  const row = { ...r, ...(typeof r.text === 'string' ? { text: r.text.slice(0, 120) } : {}) }
+  appendJsonl('routing.jsonl', row)
+  logos('lane.route', row)
+}
 function logos(kind: string, rec: Record<string, unknown>): void {
   if (!LOGOS_URL) return
   void fetch(`${LOGOS_URL}/logos/record`, {
@@ -252,7 +259,7 @@ function mainEnv() {
     },
     pidAlive,
     refused: (sid: string, pid: number | null, reason: string) => {
-      appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })
+      routeRow({ event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })
       logos('lane.register_refused', { session_id: sid, pid, reason, role: D.role })
       if (pid) { refusedPids.set(pid, Date.now()); toolsChangedForPid(pid) }          // 002m (LG1)
       tellRefused(sid, pid, reason)                                                       // 002m (LG2)
@@ -687,9 +694,8 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   // message after /lanes off went to the ledger: A07 e6), no Jev screen, no rule. Lanes already running finish their event and report.
   if (D.role === 'tg' && S?.master_off) {
     let d: Decision = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off.by} at ${stamp(S.master_off.since)}` }
-    appendJsonl('routing.jsonl', { event: ev.id, source: ev.source, from: ev.from, text: ev.text.slice(0, 100), rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note,
+    routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note,
       class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
-    logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
     D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=master-off → main`)
     noteInbound(ev, d)
     toMain(ev, d)
@@ -699,9 +705,8 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   if (D.role === 'tg' && S) {
     const g = peerGate(ev)
     if (g) {
-      appendJsonl('routing.jsonl', { event: ev.id, source: ev.source, from: ev.from, text: ev.text.slice(0, 100), rule: g.rule, target: 'ledger', lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note,
+      routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: g.rule, target: 'ledger', lane: null, thread: null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note, episode: g.episode,
         class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null })
-      logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: g.rule, target: 'ledger', lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
       D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${g.rule} → ledger — ${g.note}`)
       noteInbound(ev, { rule: g.rule, target: 'ledger' })
       // M3 (PL1): a gated message has its record too: information (no obligations), riding on its episode's head, which carries the episode
@@ -760,11 +765,9 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   // the tier this event's lane messages get unless the lane escalates (ledger target: the tier of the notice itself)
   const cls = d.target === 'main' ? null : (ev.cls ?? ev.trigger ?? null)
   const base_tier = d.target === 'ledger' ? (cls ? tierFor(cls, false).tier : 'ledger') : cls ? tierFor(cls, false).tier : null
-  appendJsonl('routing.jsonl', { event: ev.id, source: ev.source, from: ev.from, text: ev.text.slice(0, 100), rule: d.rule,
-    target: d.target, lane: d.lane ?? null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null,
+  routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: d.lane ?? null,
+    thread: d.thread ?? (d.lane ? S.lanes[d.lane]?.thread : null) ?? null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null,
     class: cls, base_tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
-  logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: d.lane ?? null,
-    thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null, class: cls, base_tier, text: ev.text.slice(0, 120) })
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ${d.target}${d.lane ? ' ' + d.lane : ''}${d.note ? ' — ' + d.note : ''}`)
   // 002j (A5): the same event is shown to Jev AFTER the decision and both are written side by side (run/triage-shadow.jsonl).
   // Not awaited and never read back: the table above is the only thing that routes.
@@ -815,7 +818,7 @@ function dropQueued(it: QItem, thread: string, why: string): void {
   ledger({ lane: S.lanes[it.lane]?.id ?? 'router', thread, event: it.ev.id, kind: 'fyi',
     text: `對話線 ${thread} 已經關閉（${why}），排隊中的 ${it.ev.from} 的訊息沒有處理，也沒有開車道${more}。內容：${it.ev.text.slice(0, 160)}`,
     refs: { drained: true, stopped: why, btcc_msg_id: it.ev.btcc_msg_id ?? null } })
-  appendJsonl('routing.jsonl', { event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'thread-stopped-drain', target: 'ledger', lane: it.lane, thread, note: `thread stopped (${why}): queued event not run` })
+  routeRow({ event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'thread-stopped-drain', target: 'ledger', lane: it.lane, thread, note: `thread stopped (${why}): queued event not run` })
 }
 const peerEventOf = (it: QItem): boolean => it.ev.source === 'mesh' && !it.ev.synthetic && !it.ev.fanout && it.ev.from !== 'main'
 export function drainStoppedThread(thread: string, why: string): number {
@@ -920,6 +923,7 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
           if (quiet) return quiet
           const gate = threadGate(S.threads[o.thread] ?? null, ev); saveState()
           if (gate) return stopThread(ev, S.threads[o.thread] ?? null, gate, 'main')
+          return { ...base, target: 'main', thread: o.thread }
         }
       }
       return { ...base, target: 'main' }
@@ -951,7 +955,7 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       if (quiet) return quiet
       const gate = threadGate(t, ev)
       if (gate) return stopThread(ev, t, gate, o.owner)
-      if (o.owner === 'main') { saveState(); return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main` } }
+      if (o.owner === 'main') { saveState(); return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main`, thread: o.thread ?? undefined } }
       ev.cls = effectiveClass(ev.trigger, o.cls)
       return dispatch(ev, S.lanes[o.owner], base)
     }
@@ -1737,7 +1741,7 @@ function coalesce(it: QItem, waiting: QItem[]): void {
   for (const o of more) {
     endRun(o, 'merged', { into: it.ev.id })
     events?.settleUnrun(o.ev.id, 'merged', `coalesced into ${it.ev.id}`, it.ev.id)       // PL2: merged into the run that answers it, not met
-    appendJsonl('routing.jsonl', { event: o.ev.id, source: o.ev.source, from: o.ev.from, rule: 'coalesced', target: 'lane', lane: it.lane, note: `handled in the same run as ${it.ev.id}` })
+    routeRow({ event: o.ev.id, source: o.ev.source, from: o.ev.from, rule: 'coalesced', target: 'lane', lane: it.lane, thread: S.lanes[it.lane]?.thread ?? null, into: it.ev.id, note: `handled in the same run as ${it.ev.id}` })
   }
   logos('lane.coalesced', { lane: it.lane, event: it.ev.id, with: more.map(o => o.ev.id) })
 }
@@ -1768,7 +1772,7 @@ export function followupTick(): void {
     const rec = events?.get(f.event)
     const ev: InEvent = { id: f.event, source: 'mesh', from: f.from, text: String(rec?.text ?? f.note), meta: {}, notif: { method: '', params: {} },
       thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id, synthetic: followupEventText(f, now) }
-    appendJsonl('routing.jsonl', { event: f.event, source: 'followup', from: f.from, rule: 'followup', target: 'lane', lane: lane.id, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` })
+    routeRow({ event: f.event, source: 'followup', from: f.from, rule: 'followup', target: 'lane', lane: lane.id, thread: f.thread, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` })
     logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: f.event, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
     const d = dispatch(ev, lane, { rule: 'followup' })
     D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
@@ -3326,7 +3330,7 @@ function startSynthesis(fo: Fanout): void {
   const ev: InEvent = { id: `ev-syn-${shortId()}`, source: 'mesh', from: 'main', text: fo.brief, meta: {}, notif: { method: '', params: {} }, fanout: fo.id,
     synthetic: `[車道事件｜主線扇出｜綜合線]\n主線把一件事拆成 ${fo.members.length} 塊交給查詢線，結果都在下面。你是綜合線：讀完全部，整理成一份結論（每一塊的狀態，加一個整體判斷），用 deliver_synthesis 交給主線，一次。不要通知 Joey，不要再開線。\n\n主線的要求：${fo.brief}\n\n${parts}` }
   enqueue(ev, lane.id, 2)
-  appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'fan_out-synthesis', target: 'lane', lane: lane.id, note: `fanout ${fo.id}` })
+  routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fan_out-synthesis', target: 'lane', lane: lane.id, thread: lane.thread, note: `fanout ${fo.id}` })
 }
 // design/memory 「主線閒下來時，可以把寫入權交給一條整理線…做完交還」, MM5 「整理線只整理提案，不刪主線寫的內容，只能標記『建議刪除』」.
 const memoryWriterFile = (): string => join(LANES_DIR, 'run', 'memory-writer')
@@ -3627,7 +3631,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: brief, meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線交辦｜工作線開啟]\n任務標題：${title}\n主線的簡報：\n${brief}\n\n先在話題裡用 notify_joey 跟 Joey 打個招呼並說明你接下來要做什麼，然後開始做。` }
       enqueue(ev, lane.id, 3)
-      appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'open_worker', target: 'lane', lane: lane.id, note: `topic ${lane.topic}` })
+      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'open_worker', target: 'lane', lane: lane.id, thread: lane.thread, note: `topic ${lane.topic}` })
       return `worker ${lane.id} opened in topic #${lane.topic} (“${title}”); thread ${lane.thread}. Joey can talk to it inside that topic.`
     }
     case 'fork': {
@@ -3638,7 +3642,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: task, meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線開分身線]\n你現在是分身線（不是主線）。任務：\n${task}\n\n完成後用 ledger_write(kind=action) 寫結論，並用 notify_joey 收尾。` }
       enqueue(ev, lane.id, 3)
-      appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'fork', target: 'lane', lane: lane.id, note: `fork of ${mainReg.session_id}` })
+      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fork', target: 'lane', lane: lane.id, thread: lane.thread, note: `fork of ${mainReg.session_id}` })
       return `fork ${lane.id} started from your session ${mainReg.session_id}; its result arrives in your digest.`
     }
     case 'lanes_list': {
@@ -3692,7 +3696,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
         const ev: InEvent = { id: `ev-fo-${shortId()}`, source: 'mesh', from: 'main', text: t, meta: {}, notif: { method: '', params: {} }, fanout: id,
           synthetic: `[車道事件｜主線扇出 ${id}｜第 ${i + 1}/${tasks.length} 塊]\n${t}\n\n只做這一塊，查完用 report_result 把結果交回（不要通知 Joey）。` }
         enqueue(ev, lane.id, 2)
-        appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'fan_out', target: 'lane', lane: lane.id, note: `fanout ${id} part ${i + 1}/${tasks.length}` })
+        routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fan_out', target: 'lane', lane: lane.id, thread: lane.thread, note: `fanout ${id} part ${i + 1}/${tasks.length}` })
       })
       saveState()
       ledger({ lane: 'main', kind: 'action', text: `主線扇出 ${id}：${tasks.length} 塊（${tasks.map(t => t.slice(0, 30)).join('；')}），結論要求：${brief.slice(0, 200)}`, refs: { fanout: id } })
@@ -3712,7 +3716,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const ev: InEvent = { id: evId, source: 'mesh', from: 'main', text: 'curate memory proposals', meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線交辦｜整理記憶提案]\n${String(a.note ?? '').trim() || '整理累積的記憶提案。'}\n\n待處理的記憶提案 ${props.length} 筆：\n${list}\n\n記憶目錄：${memoryDir()}。先讀相關的記憶檔，再決定每一筆：寫進去、或衝突時寫一筆「建議刪除」提案留給主線。做完用 curator_done 交回寫入權。` }
       enqueue(ev, lane.id, 3)
-      appendJsonl('routing.jsonl', { event: ev.id, source: 'main', from: 'main', rule: 'curate_memory', target: 'lane', lane: lane.id, note: `${props.length} proposals` })
+      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'curate_memory', target: 'lane', lane: lane.id, thread: lane.thread, note: `${props.length} proposals` })
       ledger({ lane: 'main', kind: 'action', text: `主線把記憶寫入權交給整理線 ${lane.id}（${props.length} 筆提案）`, refs: { write_right: lane.id } })
       return `curator ${lane.id} holds the memory write right and works through ${props.length} proposal(s). curate_stop takes it back.`
     }
@@ -3853,7 +3857,7 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
       fields: { did: sub === 'off' ? `Joey 關掉車道總開關：之後所有訊息都直接進主線${n ? `（正在執行的 ${n} 條做完手上那一件）` : ''}` : 'Joey 打開車道總開關：分流規則恢復' } })
     ledger({ lane: 'router', kind: 'action',
       text: sub === 'off' ? `Joey 關掉車道總開關：之後所有訊息都直接進主線，不再開車道${n ? `；正在執行的 ${n} 條會做完手上那一件並回報` : ''}。` : 'Joey 打開車道總開關：分流規則恢復。' })
-    appendJsonl('routing.jsonl', { event: `master-${sub}-${Date.now()}`, source: 'joey', rule: `master-${sub}`, target: 'none', note: `by ${who}` })
+    routeRow({ event: `master-${sub}-${Date.now()}`, source: 'joey', rule: `master-${sub}`, target: 'none', note: `by ${who}` })
     logos('lane.command', { cmd: sub, by: who, running: n })
     return sub === 'off'
       ? `車道總開關已關閉。之後所有訊息都直接進主線，跟沒有車道時一樣${n ? `；正在執行的 ${n} 條會做完手上那一件並回報` : ''}。用 /lanes on 打開。`
@@ -3897,7 +3901,7 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   if (!changed.length && !standing.proposals.length) return null                  // a hold alone is not news: it rides with something that is
   const d = renderEvents(changed.map(digestLine), [...standing.proposals, ...standing.holds], 'digest')
   if (!d) return null
-  appendJsonl('routing.jsonl', { event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
+  routeRow({ event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
   return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items } }
 }

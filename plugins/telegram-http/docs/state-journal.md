@@ -248,6 +248,15 @@ What happens next:
 
 **Busy** is "the lane has a queued, leased or running record" (`laneBusy`). The journal is the queue: there are no queue files.
 
+## The route record
+
+One function (lanes.ts `routeRow`) writes every route record: a line of `<lanes dir>/routing.jsonl` and the same row to Logos as `lane.route`. That
+holds for every rule: the router's own decisions, and the follow-up, coalesced, thread-stopped-drain, fan_out, fan_out-synthesis, open_worker,
+fork, curate_memory, master-on/off, digest and registration rows. A row has `event`, `rule`, `target`, `lane`, `note`, and:
+- `thread`: the owner's thread, i.e. the conversation the event belongs to after routing (the lane's thread, the thread a stop closed, the main's
+  thread); `peer_thread`: the thread the sender supplied;
+- `followup` on a follow-up row (its `event` is the origin event), `into` on a coalesced row, `episode` on a gated row.
+
 ## The digest and the activity list: one renderer over M3
 
 The digest is information that rides an M1 offer or pull. It is never offered alone.
