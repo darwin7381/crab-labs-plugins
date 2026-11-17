@@ -54,6 +54,9 @@ export type MainEnv = {
   menu?: (drive?: boolean) => Promise<string | null>
   /** the registration context an accepted main gets */
   context: (agent: string, sid: string) => string
+  /** PL7 (M4): an item is owed to the main (offered, pulled; the wake) only while it carries an open M3 main obligation (lanes.ts). Without it: every
+   *  item but the digest (a unit of M1 alone) */
+  owed?: (item: Row) => boolean
   /** the memory gate's facts (M3): the open Joey-sourced proposals, and whether a curator lane holds the write right */
   memory?: () => { proposals: Array<{ id: string; ts: string; lane: string; text: string }>; curator: boolean }
 }
@@ -135,7 +138,7 @@ export function createMain(E: MainEnv) {
     if (kind !== 'digest') void pump()
     return id
   }
-  const owed = (r: Row): boolean => r.kind !== 'digest'
+  const owed = (r: Row): boolean => E.owed ? E.owed(r) : r.kind !== 'digest'
   const forGen = (r: Row, g: Row): boolean => !r.target || r.target === g.session_id
   /** the digest that rides this delivery: the one queued digest item, refreshed, or a new one; null = nothing to tell */
   function attachInfo(): Row | null {

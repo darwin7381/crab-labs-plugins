@@ -119,7 +119,7 @@ test('002n (3 s skew), 002m G r2/r3: an item offered to a process that dies befo
 test('002j: two offers at once (two replay paths in the old code) offer an item once: one writer, one transition', async () => {
   const g = await startMain()
   const k = offers.length
-  const a = M().enqueue('joey', { method: 'notifications/claude/channel', params: { content: 'x', meta: {} } }, { via: 'tg' })
+  const a = await joey('x')                                                             // an item owed to the main (PL7: its event owes it)
   await Promise.all([M().pump(), M().pump(), M().pump()])
   expect(offers.length).toBe(k + 1); expect(linesOf('msg', a).filter(l => l.state === 'offered').length).toBe(1)
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [a] }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })

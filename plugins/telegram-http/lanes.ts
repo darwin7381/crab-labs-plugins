@@ -271,6 +271,8 @@ function mainEnv() {
     },
     menu: async (drive = false) => { const m = await inspectMainMenu(drive, drive ? 'main-probe' : 'main-stuck'); return m ? (drive ? menuSentence(m) : `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。`) : null },
     context: mainContext,
+    // PL7 (M4): an item is owed to the main (offered, pulled, wakes) only while its event carries an open main obligation
+    owed: (r: Row): boolean => r.kind !== 'digest' && !!r.event && ((events?.get(String(r.event))?.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === r.id)),
     // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
     memory: () => ({ proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text })), curator: !!S?.curator }),
   }
@@ -448,7 +450,8 @@ export async function mainRenew(who: string): Promise<string> {
   try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(renewFile(), newSid + '\n') } catch (e) { delete S.renew; saveState(); return `交接失敗：寫不了交接標記（${e}）。` }
   appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_handover_start', from: m.session_id, to: newSid, by: who })
   logos('lane.main_renew', { from: m.session_id, to: newSid, by: who })
-  main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: handoverBrief(S.main_gen), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handover', no_reply: 'true' } } }, { target: newSid })
+  oweMain(`renew-${Date.now().toString(36)}`, 'carry', { method: 'notifications/claude/channel', params: { content: handoverBrief(S.main_gen), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handover', no_reply: 'true' } } },
+    { cls: 'joey', from: who, text: `/main renew → ${newSid}`, target: newSid })
   ledger({ lane: 'router', kind: 'action', text: `main handover：主線交接給新 session ${newSid.slice(0, 8)}（第 ${S.main_gen} 代，上一代 ${m.session_id.slice(0, 8)}），交接內容排給新的主線`, refs: { from: m.session_id, to: newSid, gen: S.main_gen } })
   main.markEnd('replaced')
   const pid = m.pid
@@ -796,7 +799,9 @@ function toMain(ev: InEvent, d: Decision): void {
 /** server.ts: the router could not decide (it threw); the event still goes to the main, as the router's fallback does */
 export function toMainDirect(notif: Notif, source: 'telegram' | 'mesh'): void {
   if (D?.role !== 'tg' || !main) return
-  main.enqueue(source === 'telegram' ? 'joey' : 'peer', notif, { via: source === 'telegram' ? 'tg' : 'inbox' })
+  const p = (notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
+  oweMain(`direct-${Date.now().toString(36)}${shortId()}`, source === 'telegram' ? 'joey' : 'peer', notif,
+    { cls: source === 'telegram' ? 'joey' : 'peer', from: String(p.meta?.user ?? source), text: String(p.content ?? ''), via: source === 'telegram' ? 'tg' : 'inbox' })
 }
 
 /** Hop / budget gate for a mesh event entering a thread. Returns a stop note or null. */
@@ -1324,9 +1329,11 @@ function settleSteering(lane: Lane): SteerRec[] {
 /** messages that were not delivered become the lane's next run, first in line (the first is the event, the rest ride along in it); no pump here: the caller's comes after its own bookkeeping */
 function queueSteering(lane: Lane, left: SteerRec[], why: string): void {
   if (!left.length) return
-  if (lane.status === 'closed') {
-    for (const s of left) ledger({ lane: lane.id, thread: lane.thread, event: s.ev.id, kind: 'fyi',
-      text: `${lane.id} 在 Joey 的訊息送到之前被關掉了（${why}），訊息沒有處理：${clip(s.ev.text, 200)}`, refs: { steer: 'lane-closed', id: s.ev.id, run: s.run } })
+  if (lane.status === 'closed') {                                          // PL7 (P21): the lane was closed: Joey's message goes to the main (the one hand-over), never only to the ledger
+    for (const s of left) {
+      ledger({ lane: lane.id, thread: lane.thread, event: s.ev.id, kind: 'fyi', text: `${lane.id} 在 Joey 的訊息送到之前被關掉了（${why}），訊息交給主線：${clip(s.ev.text, 200)}`, refs: { steer: 'lane-closed', id: s.ev.id, run: s.run } })
+      if (events.openObs(s.ev.id).length) handToMain(s.ev.id, lane, `${lane.id} 在 Joey 的訊息送到之前被關掉了，這則沒有處理：${s.ev.text}`, undefined, s.ev.cls ?? s.ev.trigger)
+    }
     return
   }
   const [first, ...rest] = left
@@ -2140,6 +2147,11 @@ function startRun(it: QItem): void {
     return
   }
   if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
+  if (lane.status === 'closed') {                                          // PL7 (P21): its lane was closed while it waited: closed, and the exit rule
+    endRun(it, 'closed', { why: 'its lane was closed before it ran' })
+    exitRule(lane, it, `${lane.id} 在這件事開始處理之前被關閉了`)
+    saveState(); return
+  }
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
   const critical = !!lane.critical
@@ -2293,7 +2305,8 @@ function startRun(it: QItem): void {
     const closers = tools.filter(t => ['mcp__lane__reply_agent', 'mcp__lane__receipt', 'mcp__lane__notify_joey', 'mcp__lane__ask_joey', 'mcp__lane__handoff_main',
       'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done'].includes(t.name))
       .map(t => t.name.replace('mcp__lane__', ''))
-    const reason = exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
+    // PL7 (P21): a run whose lane was closed while it ran ends `closed`, an exit reason like the others: the exit rule below handles it
+    const reason = lane.status === 'closed' ? 'closed' : exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: runId, event: it.ev.id, session_id: lane.session_id,
       transcript: lane.transcript, exit_code: code, signal, reason, duration_s: Math.round((Date.now() - started) / 100) / 10,
       calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers })
@@ -2302,7 +2315,10 @@ function startRun(it: QItem): void {
     D.log('info', `lanes: exit ${runId} ${reason} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
     const wall = reason.startsWith('wall:') ? reason.slice(5) : null
     endRun(it, reason, { exit_code: code, signal: signal ?? null, run: runId, tokens: { in: tin, out: tout, fresh: tfresh, calls: usage.size }, budget: budgetOf(lane.thread) })
-    if (lane.status === 'closed') { saveState(); pump(); return }          // the main or Joey closed this lane (lane_close stops its process): not run again
+    if (reason === 'closed') {                                             // the main or Joey closed this lane: not run again; what its event still owes goes to the main
+      exitRule(lane, it, `${lane.id} 在執行中被關閉（${laneLabel(lane)}）${lastText || result ? `，最後寫的是：${(lastText || result).replace(/\s+/g, ' ').slice(0, 300)}` : ''}`, 1000, tok.steered)
+      saveState(); pump(); return
+    }
     if (wall) {
       // 002j: the model wall. Nothing was tried, so this is not an attempt: the event is queued again as it was; the probe timer starts the next run
       it.attempts = Math.max(0, it.attempts - 1); queueRun(it)
@@ -2456,18 +2472,27 @@ const HANDOFF_DUE_MS = (): number => num('LANES_HANDOFF_FALLBACK_MS', 300_000)
  *  adds the main obligation (due HANDOFF_DUE_MS, set now and never rewritten) and moves what the lane still owed to `handed`; then one M1 item carries
  *  it. M1 offers it when the main is idle (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop.
  *  An event already handed (an open main obligation) keeps that hand-over: no second item. */
-function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true): string {
+function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true, carry?: { content: string; meta: Record<string, string> }): string {
   const body = text.slice(0, max)
   const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}) })
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
   if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
-  const item = main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）`,
-    meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
+  const item = carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
+    : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）`,
+      meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, o => o.id === hid, { item })
   journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `owed to the main (${hid})${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
   logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase() })
   return hid
+}
+/** PL7 (M4): what the main is given with no inbound event of its own (a /main renew brief, the router's fallback) is an M3 record owed to the main
+ *  (owner main, one main obligation) and the M1 item that carries it: the one wake rule sees it like any hand-over */
+function oweMain(id: string, kind: ItemKind, notif: Notif, o: { cls: EvClass; from: string; text: string; via?: Via; target?: string }): string {
+  events.open(id, { class: o.cls, owner: 'main', from: o.from, text: o.text, obligations: [{ kind: 'main', level: 'handed', owner: 'main', handoff: id }] })
+  const item = main.enqueue(kind, notif, { via: o.via ?? 'tg', event: id, ...(o.target ? { target: o.target } : {}) })
+  events.set(id, x => x.kind === 'main', { item })
+  return item
 }
 /** M1 told us an item is done: the main obligation it carried is met */
 const metBy = (it: Row): string => `main (item ${it.id} done)`
@@ -2973,8 +2998,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const fo = S.fanouts?.[tok.synthesis]
       if (fo) { fo.done = nowIso(); saveState() }
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: `綜合結論交給主線：${text.slice(0, 300)}`, refs: { fanout: tok.synthesis } })
-      main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: `〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`,
-        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } } }, { event: tok.evId })
+      // PL7: the conclusion is owed to the main: the one hand-over of the synthesis event, carried by a carry item
+      handToMain(tok.evId, lane, `扇出 ${tok.synthesis} 的綜合結論`, `syn-${shortId()}`, undefined, 1000, false, { content: `〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`,
+        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } })
       logos('lane.synthesis', { fanout: tok.synthesis, lane: lane.id, queued: true, chars: text.length })
       return 'queued for the main: it gets your conclusion when it is free (at once if it is idle).'
     }

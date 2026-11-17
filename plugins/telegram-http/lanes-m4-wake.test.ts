@@ -132,14 +132,34 @@ test('inv C(4), PL4: a walled main (its own wall) gets nothing owed until its re
   expect(M().mainPhase()).toBe('idle')
 })
 
-test('the fan-out synthesis is owed to the main: offered when it is idle, never alone with only information pending', async () => {
+test('PL7 P20: the fan-out synthesis is owed to the main through its M3 hand-over: offered when it is idle; an item whose event owes the main nothing is never offered; information never alone', async () => {
   const k = offers.length
-  M().enqueue('carry', { method: 'notifications/claude/channel', params: { content: '〔扇出結果〕三塊都好', meta: { user: 'lanes', kind: 'synthesis' } } })
+  M().enqueue('carry', { method: 'notifications/claude/channel', params: { content: '〔孤兒〕沒有任何義務', meta: { user: 'lanes' } } })   // no M3 obligation: not owed (P20)
+  M().enqueue('joey', { method: 'notifications/claude/channel', params: { content: '沒有記錄的訊息', meta: {} } }, { event: 'ev-m4-none' })
+  await M().pump(); await M().tick()
+  expect(offers.length).toBe(k)
+  const st = L.__lanesState(), syn = 'adam.synthesis.7'
+  st.lanes[syn] = { id: syn, kind: 'synthesis', n: 7, session_id: 's', thread: 'adam#t-syn7', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
+  st.fanouts = { 'fo-m4': { id: 'fo-m4', brief: '三塊', tasks: ['a', 'b', 'c'], members: [], results: {}, created: '' } } as any
+  L.__events().open('ev-syn-m4', { class: 'joey', owner: syn, lane: syn, from: 'main', text: '三塊', obligations: [] })   // the router recorded the synthesis event
+  expect(await L.callLaneTool({ runId: `${syn}.r1`, lane: syn, evId: 'ev-syn-m4', closers: [], critical: false, trigger: 'synthesis', cls: 'synthesis', synthesis: 'fo-m4' } as any, 'deliver_synthesis', { text: '三塊都好' })).toContain('queued for the main')
   await sleep(10)
-  expect(offers.length).toBe(k + 1)
+  expect(offers.length).toBe(k + 1); expect(offers.at(-1).params.content).toContain('三塊都好')
   await mainTurn()
   const m = offers.length
   M().enqueue('digest', { method: 'notifications/claude/channel', params: { content: '〔車道摘要〕只有資訊', meta: {} } })
   await M().pump(); await M().tick()
   expect(offers.length).toBe(m)                                                              // information alone wakes nobody
+})
+
+test('PL7 P20: the router\'s fallback (the router threw) gives the main an M3 record with a main obligation; its item is owed like any hand-over, done meets it', async () => {
+  const k = offers.length
+  L.toMainDirect({ method: 'notifications/claude/channel', params: { content: '路由器壞掉時的訊息', meta: { user: 'joey_lab', message_id: '4040' } } }, 'telegram')
+  await sleep(10)
+  expect(offers.length).toBe(k + 1)
+  const item = M().items(r => r.state === 'offered').at(-1)!
+  const ev = L.__events().get(String(item.event))!
+  expect(ev).toMatchObject({ owner: 'main', class: 'joey' }); expect(String(ev.id)).toStartWith('direct-')
+  await mainTurn()
+  expect((L.__events().get(ev.id)!.obligations as any[])[0]).toMatchObject({ kind: 'main', state: 'met' })
 })

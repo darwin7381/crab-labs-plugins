@@ -719,3 +719,26 @@ test('PL5 P15 (B08 [run:40] ×4, WD6): each scheduled event\'s receipt is its me
   expect(obs(n0.id).some(o => o.kind === 'receipt')).toBe(false)                              // no meta, no run id: nothing is guessed from the text
   await call(n0.tok, 'notify_joey', { text: 'x' }); await end(n0.lane)
 })
+
+// ------------------------------------------------------------------ PL7 (AUD P21): `closed` is an exit reason like the others: the exit rule runs
+test('PL7 P21: a lane closed while its run runs: the run ends `closed` and what its event still owes goes to the main; a queued run of a closed lane is closed the same way', async () => {
+  process.env.LANES_CLOSE_GRACE_MS = '150'
+  const p = await start(mk('eve', '幫我查 ticket 77 的狀態'))
+  expect(await L.lanesCommand(`/lanes close ${p.lane}`, 'joey_lab')).toContain('正在關閉')
+  expect(await until(() => !L.__runTok(p.lane))).toBe(true); await sleep(50)
+  const exit = journal().filter(l => l.rec === 'run' && l.event === p.id && l.state === 'exited').at(-1)
+  expect(exit.reason).toBe('closed')
+  expect(obs(p.id).map(o => `${o.kind}:${o.state}`).sort()).toEqual(['joey:handed', 'main:open', 'peer:handed'])   // 002o: open forever, only a ledger line
+  expect(handed(p.id).length).toBe(1)
+  expect(E().get(p.id)!.lane_closed).toMatchObject({ run: p.tok.runId })
+  // a run queued for a lane that is closed before it starts
+  const st = L.__lanesState(), id = 'adam.reflex.88'
+  st.lanes[id] = { id, kind: 'reflex', n: 88, session_id: 's88', thread: 'adam#t-88', status: 'closed', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
+  st.threads['adam#t-88'] = { id: 'adam#t-88', lane: id, peer: 'eve', hops: 1, tokens: 0, created: '', last: '' } as any
+  const q = mk('eve', '排在被關掉的車道後面')
+  L.__putQueue({ ev: q, lane: id, state: 'queued', priority: 5, enqueued: new Date().toISOString() })
+  L.sweepQueue(); await sleep(50)
+  expect(journal().filter(l => l.rec === 'run' && l.event === q.id).at(-1)).toMatchObject({ state: 'exited', reason: 'closed' })
+  expect(handed(q.id).length).toBe(1); expect(L.__runTok(id)).toBeUndefined()
+  delete process.env.LANES_CLOSE_GRACE_MS
+})

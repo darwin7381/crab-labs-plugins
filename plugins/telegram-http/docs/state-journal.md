@@ -60,6 +60,9 @@ answers: a main whose user settings carry their own Stop hook (the fleet's `chec
 - The turn's `reply` / `send_to_agent` calls (what the answered gate checks) are kept for the prompt across the continuation.
 
 How items move:
+- **Owed** (M4's one wake rule): an item is owed to the main only while its event carries an open `main` obligation (`toMain`'s record, a hand-over,
+  the synthesis's hand-over, a renew brief's `renew-…` record, the router fallback's `direct-…` record). An item with no such obligation is never
+  offered or pulled; the digest never is.
 - **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main, with the digest riding on it.
   An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
   the SDK drops a notification without an error when it has no GET stream). If no such stream exists, the item stays `queued` and nothing is
@@ -71,7 +74,8 @@ How items move:
 
 Fields:
 - `kind`: `joey`, `peer`, `alert`, `digest`, `handoff` or `carry`.
-  - `carry` is a note for the main: a `/main renew` brief, which has `target` = the new session id, or a fan-out synthesis.
+  - `carry` is a note for the main: a `/main renew` brief, which has `target` = the new session id, or a fan-out synthesis. Each is owed through
+    an M3 main obligation like any hand-over.
   - `digest` is information. It is never offered alone; it rides the next offer or pull.
 - `via`: `tg` or `inbox`, the daemon whose MCP stream carries the offer.
 - `event`: the inbound event id, when there is one.
@@ -229,7 +233,9 @@ starts (`exited(budget)` with no `running`) carries the `budget` that refused it
 
 `reason` is one of:
 - `normal`, `cap_turns`, `cap_usd`, `budget`, `wall:<kind>`, `died`, `timeout`: how the run ended;
-- `merged` (coalesced into another run), `dropped` (its thread was stopped) or `closed` (its lane was closed): a queued run that never started.
+- `merged` (coalesced into another run) or `dropped` (its thread was stopped): a queued run that never started;
+- `closed`: its lane was closed, while it ran (the daemon's own decision, like `timeout`) or before it started. The exit rule then runs like for
+  any other reason: what the event still owes goes to the main (Joey's messages steered into a closed lane that it never got too).
 
 How the reason is decided (exitReason):
 - From the result JSON: `terminal_reason` `max_turns` / `subtype` `error_max_turns` is `cap_turns`; `error_max_budget_usd` is `cap_usd`;

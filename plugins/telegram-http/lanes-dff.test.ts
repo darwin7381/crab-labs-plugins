@@ -68,10 +68,12 @@ test('fan_out: one lane per part, results go to a synthesis lane, ONE conclusion
   for (const [i, m] of fo.members.entries()) await L.callLaneTool(tok(m, { fanout: fo.id }), 'report_result', { text: `第 ${i + 1} 塊：正常` })
   expect(fo.synthesis).toBeTruthy()
   expect(st.lanes[fo.synthesis!].kind).toBe('synthesis')
-  const r = await L.callLaneTool(tok(fo.synthesis!, { synthesis: fo.id }), 'deliver_synthesis', { text: 'mock-api 兩次延遲；mock-backup 一次失敗已重跑成功；mock-tickets 正常。整體：可接受。' })
+  const synEv = L.__events().rows(e => e.lane === fo.synthesis)[0].id                    // the synthesis run's own event (the router recorded it)
+  const r = await L.callLaneTool(tok(fo.synthesis!, { synthesis: fo.id, evId: synEv }), 'deliver_synthesis', { text: 'mock-api 兩次延遲；mock-backup 一次失敗已重跑成功；mock-tickets 正常。整體：可接受。' })
   expect(r).toContain('queued for the main')
   const carry = L.__main().items(x => x.kind === 'carry')                              // M1: one item for the main, offered when it is idle
   expect(carry.length).toBe(1); expect(carry[0].notif.params.meta.kind).toBe('synthesis'); expect(carry[0].notif.params.content).toContain('mock-backup')
+  expect((L.__events().get(synEv)!.obligations as any[]).find(o => o.kind === 'main')).toMatchObject({ state: 'open', item: carry[0].id })   // PL7: owed through M3
   expect(sent.length).toBe(0)                                                          // nothing to Joey from the lanes
 })
 
