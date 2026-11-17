@@ -104,7 +104,7 @@ Fields:
 
 | kind | levels | met by |
 |---|---|---|
-| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted). A critical alert's line has `ring` and `due_at`: when the due sweep rings, it sets `rang`. |
+| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted). A critical alert's line has `ring` and `due_at`: see "The ring" below. |
 | `peer` | `answer`, `interim`, `commitment` | `reply_agent` to that peer. `interim` is met by the router when a lane hands the request to the main; a new `answer` then opens with `owner: main` and a `due_at`. `commitment` is the main's own commitment tool, met by `commitment_done`. |
 | `receipt` | `run` (`run_id`) | `receipt(run_id)`, once per scheduler run across every event |
 | `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
@@ -119,8 +119,13 @@ is `LANES_HTTP_PORT`, set by the daemon in the lane's environment). The daemon b
 
 **The exit rule.** When a run ends, at whatever reason, its open obligations become one `main` obligation, plus one M1 item.
 
+**The ring.** A critical event rings Joey once. The first line about it that reaches Joey with a ring meets the ring: the lane's `notify_joey` or
+`ask_joey` (the obligation is `met`), or the main's report on the event's hand-over (`rang`, `by: main`). If none has by `due_at`, the due sweep
+rings (`rang`). Handing the event to the main, by `handoff_main` or by the exit rule, does not take the ring away from the router. Every later line
+about the event goes out silent: a lane line (tier rule `+rang-at-due`) and the main's report (`+rang`).
+
 **The due sweep** runs every second. It acts on open obligations past `due_at`:
-- a critical line: the router rings once (`rang`);
+- a critical line: the router rings once (`rang`), unless a line that rang reached Joey first;
 - a hand-over, a promised answer, a commitment: Joey is told once (`told`).
 
 A `main` obligation is due 300 s after the hand-over (`LANES_HANDOFF_FALLBACK_MS`), or at once when the main has been away (gone or walled) for

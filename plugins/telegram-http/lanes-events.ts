@@ -118,11 +118,11 @@ export function createEvents(J: Journal) {
   }
   /** a field on the record (what the lane did, for the digest), no obligation changes */
   function note(id: string, f: Record<string, unknown>): void { const e = get(id); if (e) write(e, obsOf(e), f) }
-  /** obligations past their due time, not met, not acted on yet */
+  /** obligations past their due time, not met, not acted on yet. A ring is Joey's, not the lane's: handing the event to the main does not take it away. */
   function due(now: number): Array<{ e: Row; o: Ob }> {
     const out: Array<{ e: Row; o: Ob }> = []
     for (const e of J.rows('event', r => r.state === 'open')) for (const o of (e.obligations ?? []) as Ob[]) {
-      if (o.state !== 'open' || o.due_at == null || now < o.due_at) continue
+      if (o.state === 'met' || (o.state === 'handed' && !o.ring) || o.due_at == null || now < o.due_at) continue
       if (o.ring ? o.rang : o.told) continue
       out.push({ e, o })
     }

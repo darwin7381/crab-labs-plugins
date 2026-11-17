@@ -347,3 +347,78 @@ test('002l D16: the main\'s report on a hand-over takes the tier of the event\'s
   expect(ob(p.id, 'main').state).toBe('met')
   proc.kill('SIGKILL')
 })
+
+// ------------------------------------------------------------------ the due ring (basics B3): one ring per critical event, from whoever reaches Joey first
+// A critical event's Joey line carries `ring` + `due_at`. A line that reaches Joey with a ring before due (the lane's notify_joey, or the main's report on
+// the event's hand-over) meets it; if none has by due, the router's own one-second sweep rings once (`rang`). Every later line about the event is silent.
+// These use the real sweep timer (lanesInit's setInterval), not a hand-driven dueTick.
+const rings = (from: number) => sent.slice(from).filter(s => s.text.includes('嚴重警報已收到'))
+async function pastDue(id: string): Promise<void> { const due = ob(id, 'joey').due_at; while (Date.now() < due + 1_300) await sleep(50) }   // one sweep after due, and then some
+
+test('B3: a critical alert whose lane stays silent (still running at due): the router rings once at due by its own sweep; the lane\'s later line goes out silent', async () => {
+  L.__setCriticalDeadline(1_200)
+  const k = sent.length
+  const a = await start(mk('alert-dispatcher', '[P1][critical] mock-api 全部 5xx'))
+  expect(ob(a.id, 'joey')).toMatchObject({ ring: true, state: 'open' })
+  expect(await until(() => rings(k).length > 0, 5_000)).toBe(true)
+  await pastDue(a.id); await sleep(1_100)                                                   // more sweeps: still one
+  expect(rings(k).length).toBe(1); expect(rings(k)[0].silent).toBe(false)
+  expect(ob(a.id, 'joey')).toMatchObject({ rang: true, state: 'open' })                      // rung for; the lane still owes its line
+  await call(a.tok, 'notify_joey', { text: '查到了：上游 DB 連線池滿了，已重啟' })
+  expect(sent.at(-1)!.text).toContain('連線池'); expect(sent.at(-1)!.silent).toBe(true)
+  expect(sent.slice(k).filter(s => !s.silent).length).toBe(1)                               // one ring in total
+  await end(a.lane)
+  L.__setCriticalDeadline(45_000)
+})
+
+test('B3: the lane calls nothing and ends before due: the exit rule hands it to the main, the ring stays the router\'s: one ring at due; the main\'s report on that hand-over is then silent', async () => {
+  L.__setCriticalDeadline(1_200)
+  const k = sent.length
+  const a = await start(mk('alert-dispatcher', '[P1][critical] mock-api 全部 5xx（第二次）'))
+  await end(a.lane)                                                                          // no tool call at all
+  const hid = ob(a.id, 'main')?.handoff
+  expect(hid).toBeTruthy()                                                                   // the exit rule: the open line went to the main
+  expect(ob(a.id, 'joey')).toMatchObject({ ring: true })
+  expect(rings(k).length).toBe(0)                                                            // not before due
+  await pastDue(a.id); await sleep(1_100)
+  expect(rings(k).length).toBe(1); expect(rings(k)[0].text).toContain('已交給主線處理')
+  const t = L.handoffReplyTier({ handoff_id: hid })!
+  expect(t).toMatchObject({ silent: true }); expect(t.rule).toContain('rang')                // the main's report follows the ring quietly
+  expect(sent.slice(k).filter(s => !s.silent).length).toBe(1)
+  L.__setCriticalDeadline(45_000)
+})
+
+test('B3: a lane line before due meets the ring obligation: that line rings, the router does not ring at due', async () => {
+  L.__setCriticalDeadline(1_200)
+  const k = sent.length
+  const a = await start(mk('alert-dispatcher', '[P0] mock-api 全掛（第三次）'))
+  await call(a.tok, 'notify_joey', { text: 'mock-api 已重啟恢復' })
+  expect(sent.at(-1)!.silent).toBe(false)
+  expect(ob(a.id, 'joey')).toMatchObject({ state: 'met' })
+  await pastDue(a.id); await sleep(1_100)
+  expect(rings(k).length).toBe(0)
+  expect(sent.slice(k).filter(s => !s.silent).length).toBe(1)
+  await end(a.lane)
+  L.__setCriticalDeadline(45_000)
+})
+
+test('B3: the lane hands the critical alert to the main before due: a ringing report of the main meets the ring (no router ring); with no report by due, the router rings once', async () => {
+  L.__setCriticalDeadline(1_500)
+  const k = sent.length
+  const a = await start(mk('alert-dispatcher', '[P1][critical] backup 全部失敗（交主線）'))
+  await call(a.tok, 'handoff_main', { text: '備份全失敗，要主線決定要不要停寫入' })
+  await end(a.lane)
+  const ha = ob(a.id, 'main').handoff
+  const t = L.handoffReplyTier({ handoff_id: ha })!
+  expect(t.silent).toBe(false)                                                               // nothing rang yet: the main's report is the ring
+  L.noteMainReplyTier(t, 4242)
+  expect(ob(a.id, 'joey').rang).toBe(true)
+  const b = await start(mk('alert-dispatcher', '[P1][critical] backup 全部失敗（交主線，主線沒回）'))
+  await call(b.tok, 'handoff_main', { text: '同上，主線還沒回' })
+  await end(b.lane)
+  await pastDue(a.id); await pastDue(b.id); await sleep(1_100)
+  expect(rings(k).length).toBe(1)                                                            // b's, by the router; a's was the main's report
+  expect(rings(k)[0].text).toContain('主線沒回')
+  expect(L.handoffReplyTier({ handoff_id: ob(b.id, 'main').handoff })!.silent).toBe(true)
+  L.__setCriticalDeadline(45_000)
+})

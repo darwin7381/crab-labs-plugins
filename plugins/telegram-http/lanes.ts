@@ -2413,10 +2413,14 @@ function itemDone(it: Row): void {
 //   - no id, not quoting a message: when every item of the main's current turn (M1: bound to its prompt) is a hand-over of a silent-tier event, the
 //     reply is that report: silent. A Joey message in the turn, or a reply that quotes one, is ordinary (push).
 // The notify profile still rules (profile default = everything rings); a hand-over the router made itself (a failed lane) has no class: push.
-const mainObOf = (hid: string): Ob | undefined => { for (const e of events.rows()) for (const o of (e.obligations ?? []) as Ob[]) if (o.kind === 'main' && o.handoff === hid) return o; return undefined }
+// A critical event rings Joey once (its Joey line's `ring`): the main's report on its hand-over is a line about that event like any other. It rings only
+// while the ring is still owed, and a report that rings meets it (noteMainReplyTier sets `rang`); after the router's ring at due it is silent.
+const mainObOf = (hid: string): { e: Row; o: Ob } | undefined => { for (const e of events.rows()) for (const o of (e.obligations ?? []) as Ob[]) if (o.kind === 'main' && o.handoff === hid) return { e, o }; return undefined }
+const ringOf = (e: Row | undefined): Ob | undefined => ((e?.obligations ?? []) as Ob[]).find(o => o.kind === 'joey' && o.ring)
+const rung = (e: Row | undefined): boolean => { const r = ringOf(e); return !!r && (!!r.rang || r.state === 'met') }
 export function handoffReplyTier(a: { handoff_id?: unknown; reply_to?: unknown }): { silent: boolean; rule: string; handoff?: string } | null {
   if (D?.role !== 'tg' || !S || !events) return null
-  const tierOf = (o: Ob | undefined) => o?.cls ? tierFor(o.cls, false) : null
+  const tierOf = (x: { e: Row; o: Ob } | undefined) => { const t = x?.o.cls ? tierFor(x.o.cls, false) : null; return t && t.tier === 'push' && rung(x!.e) ? { tier: 'silent' as Tier, rule: `${t.rule}+rang` } : t }
   const id = a.handoff_id != null ? String(a.handoff_id).trim().replace(/^〔|〕$/g, '') : ''
   if (id) { const t = tierOf(mainObOf(id)); return t ? { silent: t.tier !== 'push', rule: `handoff ${id}: ${t.rule}`, handoff: id } : null }
   if (a.reply_to != null && String(a.reply_to) !== '') return null                  // quoting a message: an answer to Joey, ordinary
@@ -2431,6 +2435,10 @@ export function handoffReplyTier(a: { handoff_id?: unknown; reply_to?: unknown }
 /** server.ts: the main's reply went out with this tier (for the record) */
 export function noteMainReplyTier(t: { silent: boolean; rule: string; handoff?: string }, messageId: number | null): void {
   if (D?.role !== 'tg' || !S) return
+  if (!t.silent) for (const hid of String(t.handoff ?? '').split(',').filter(Boolean)) {      // a report that rang meets the ring of its event
+    const x = mainObOf(hid), r = ringOf(x?.e)
+    if (x && r && !r.rang) events.set(x.e.id, r.id, { rang: true, by: 'main' }, { tool: 'reply' })
+  }
   ledger({ lane: 'main', kind: 'notify', notify_main: false, text: `[${t.silent ? 'silent' : 'push'}] 主線回報交接的事（${t.handoff ?? '-'}）：分流器依那件事的類別${t.silent ? '靜音送出' : '照常推播'}`,
     refs: { tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId } })
   logos('lane.notify', { lane: 'main', tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId })
@@ -2530,7 +2538,7 @@ export function dueTick(now = Date.now()): void {
     if (o.kind === 'joey' && o.ring) {
       events.set(e.id, o.id, { rang: true }, { tool: 'router' })
       const text = S.wall ? `嚴重警報已收到，但${WALL_WORD[S.wall.kind] ?? '模型無法使用'}，現在沒有車道能查證。恢復後會補上查證結果（不再響鈴）。\n原文：${String(e.text ?? '').slice(0, 400)}`
-        : `嚴重警報已收到，${lane ? laneLabel(lane) : '車道'}正在查證，結果隨後補上（不再響鈴）。\n原文：${String(e.text ?? '').slice(0, 400)}`
+        : `嚴重警報已收到，${(e.obligations ?? []).some((x: Ob) => x.kind === 'main') ? '已交給主線處理' : `${lane ? laneLabel(lane) : '車道'}正在查證`}，結果隨後補上（不再響鈴）。\n原文：${String(e.text ?? '').slice(0, 400)}`
       ledger({ lane: lane?.id ?? 'router', thread: e.thread ?? null, event: e.id, kind: 'notify', notify_main: true, text: `[push] ${text.slice(0, 400)}`,
         refs: { class: e.class, escalated: false, tier: 'push', tier_rule: S.wall ? 'critical-due+wall' : 'critical-due' } })
       void pushJoey(lane, text, false).then(mid => logos('lane.notify', { lane: lane?.id ?? null, event: e.id, escalated: false, tier: 'push', tier_rule: 'critical-due', message_id: mid }))
