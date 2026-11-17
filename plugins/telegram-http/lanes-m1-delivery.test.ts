@@ -194,10 +194,13 @@ test('information never travels alone: a digest with nothing owed to the main is
   expect(o.params.content.endsWith('今天怎樣？')).toBe(true)
   const [first, dg] = String(o.params.meta.did).split(',')
   expect(first).toBe(id); expect(M().items(r => r.id === dg)[0].kind).toBe('digest')
+  const v = L.__events().get('ev-m1-9')!.version
+  expect(M().items(r => r.id === dg)[0]).toMatchObject({ events: { 'ev-m1-9': v }, items: 1 })                // the event records it shows, at their versions; how many lines
+  expect(M().items(r => r.id === dg)[0].covers).toBeUndefined()
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [o.params.meta.did] })
   expect(state(dg)).toBe('bound')
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
-  expect(state(dg)).toBe('done'); expect(JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).seen['ev-m1-9']).toBeTruthy()
+  expect(state(dg)).toBe('done'); expect(JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).seen['ev-m1-9']).toBe(v)
   expect(L.__digest()).toBeNull()                                                       // nothing changed since the done digest
   await kill(g)
 })

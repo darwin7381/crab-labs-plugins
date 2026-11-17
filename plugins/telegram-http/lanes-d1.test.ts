@@ -99,7 +99,7 @@ test('D1: the digest lists every open Joey-sourced proposal again (no new activi
   const e = run('mesh', 'eve', 'peer', 'reflex')
   const eid = idOf(await L.callLaneTool(e, 'ledger_write', { kind: 'memory_proposal', text: 'Eve 的稿件排程一律 10:00' }))
   // the digest is M1 information (L.__digest: what rides the next delivery); an open Joey proposal is a line owed to the main in every digest until decided
-  const ack = (t: any) => { if (t) writeFileSync(join(dir, 'digest.json'), JSON.stringify({ seen: t.fields.covers })) }
+  const ack = (t: any) => { if (t) writeFileSync(join(dir, 'digest.json'), JSON.stringify({ seen: t.fields.events })) }
   const t1 = L.__digest()!
   expect(t1.text).toContain(`記憶提案 ${pid}｜`); expect(t1.text).toContain('還沒決定（Joey 說的話）'); expect(t1.text).toContain('需主線：用 memory_decide 決定'); expect(t1.text).toContain('一律 09:00')
   expect(t1.text).not.toContain(eid)                                                                       // Eve's was not said by Joey: not re-listed

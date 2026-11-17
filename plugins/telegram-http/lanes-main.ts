@@ -26,7 +26,7 @@ export type MainEnv = {
   offer: (notif: Notif, via: Via, pid: number) => Promise<boolean>
   /** the tg daemon has an open MCP stream of process `pid` (an offer can be written) */
   streamOpen: (pid: number) => boolean
-  /** the information that rides a delivery (the digest): its text and the fields that say what it covers; null = nothing new */
+  /** the information that rides a delivery (the digest): its text and its item fields (`events`: event id → the record version shown; `items`); null = nothing new */
   info: () => { text: string; fields: Record<string, unknown> } | null
   /** an item reached done */
   done: (item: Row) => void

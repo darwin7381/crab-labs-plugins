@@ -5,7 +5,8 @@
  * mechanisms is one line:
  *   {"ts": ISO-8601 with ms, "rec": "msg|main|event|run|wake", "id": ..., "state": <new state>, ...fields}
  * The journal IS the persisted state: at boot the daemon folds it (load) and continues from there. A record's current state is
- * the merge of its lines in file order (a later line's fields replace earlier ones; a field written as null clears it).
+ * the merge of its lines in file order (a later line's fields replace earlier ones; a field written as null clears it). The fold also counts them:
+ * `version` = how many lines the record has, so "changed since version v" is exact (a timestamp is not: two lines can share a millisecond).
  * `wake` lines (M4) are a log of decisions, not a record: they are not folded.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs'
@@ -14,7 +15,7 @@ import { dirname } from 'path'
 export type RecKind = 'msg' | 'main' | 'event' | 'run' | 'wake'
 type Table = Exclude<RecKind, 'wake'>
 /** a folded record: its last state and every field its lines carried (created = the ts of its first line, n = creation order) */
-export type Row = { ts: string; rec: RecKind; id: string; state: string; created: string; n: number; [k: string]: any }
+export type Row = { ts: string; rec: RecKind; id: string; state: string; created: string; n: number; version: number; [k: string]: any }
 
 export class Journal {
   readonly t: Record<Table, Map<string, Row>> = { msg: new Map(), main: new Map(), event: new Map(), run: new Map() }
@@ -47,8 +48,9 @@ export class Journal {
     if (line.rec === 'wake' || !(line.rec in this.t)) return null
     const tab = this.t[line.rec as Table]
     let row = tab.get(line.id)
-    if (!row) { row = { created: line.ts, n: ++this.n } as Row; tab.set(line.id, row) }
-    for (const [k, v] of Object.entries(line)) { if (v === null) delete row[k]; else row[k] = v }
+    if (!row) { row = { created: line.ts, n: ++this.n, version: 0 } as Row; tab.set(line.id, row) }
+    for (const [k, v] of Object.entries(line)) { if (k === 'version') continue; if (v === null) delete row[k]; else row[k] = v }
+    row.version++
     return row
   }
 

@@ -26,10 +26,12 @@ No mechanism reads a transcript to learn a state.
 
 - **The journal is the state.** At boot the daemon folds the file and goes on from there.
   - A record's current value is the merge of its lines in file order: a later field replaces an earlier one, and a field written as `null` is cleared.
+  - The fold also counts each record's lines: `version` (1 for a new record, +1 per line). It is not written in the lines; `GET /lanes/state` serves it.
+    "Changed since" compares versions, never timestamps (two lines can share a millisecond).
   - Folding never offers anything. Items left `queued` are offered when M1 next finds an idle gen. Items left `offered` or `bound` stay with the gen they
     belonged to; if that process is gone, `kill -0` ends the gen and puts them back to `queued`. So a daemon restart re-offers each queued item exactly once.
 - **`GET /lanes/state`** on the tg daemon's HTTP port (loopback token, like every `/lanes/` route) serves the folded state:
-  `{current_gen, wall, msg: [...], main: [...], event: [...], run: [...]}`. Each record has its fields plus `created` (the ts of its first line).
+  `{current_gen, wall, msg: [...], main: [...], event: [...], run: [...]}`. Each record has its fields plus `created` (the ts of its first line) and `version`.
 
 ### `msg` (M1): one item for the main
 
@@ -61,7 +63,9 @@ Fields:
 - `reason`, when the item returns to `queued`: `stop_failure:<error>`, `gen_end`, `interrupted` (a new prompt came with no Stop), `session_start`
   (the same process started a new session mid-turn), or `offer_unanswered` (see special case 1 below).
 - `done` may carry `reason: asked_restart` (special case 2 below).
-- Digest items also have `from`, `upto` and `items`: the ledger range they cover and how many entries.
+- Digest items also have `events` and `items`:
+  - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
+  - `items`: how many entries the digest lists (event lines plus the standing lines: open Joey memory proposals and peer holds).
 
 ### `main` (M2): one record per main process
 
@@ -159,8 +163,8 @@ What happens next:
 ## The digest: a renderer over M3
 
 The digest is information that rides an M1 offer or pull. It is never offered alone.
-- One line per event that changed since the last digest that was done. `.lanes/digest.json` `{seen: {event id: ts}}` is updated when a digest
-  item reaches `done`.
+- One line per event record whose `version` is past what the digests showed: `.lanes/digest.json` `{seen: {<event id>: <version>}}`, merged from a
+  digest item's `events` when it reaches `done`, and the `events` of a digest item still `offered` or `bound`.
 - At most 8 lines, in this order: owed to the main (`需主線`), waiting on Joey's decision, the rest. The overflow is named on one line.
 - An open Joey memory proposal and an active peer hold are lines of every digest while they last.
 

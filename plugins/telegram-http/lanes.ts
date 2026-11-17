@@ -2401,9 +2401,9 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
 }
 /** M1 told us an item is done: the main obligation it carried is met */
 function itemDone(it: Row): void {
-  if (it.kind === 'digest' && it.covers) {                                         // what the done digest showed: changed since then = newer than this
-    const cur = readJson<{ seen?: Record<string, string> }>(digestPath(), {})
-    writeJsonAtomic(digestPath(), { seen: { ...(cur.seen ?? {}), ...it.covers } })
+  if (it.kind === 'digest' && it.events) {                                         // what the done digest showed: an event changed since then has a later version
+    const cur = readJson<{ seen?: Record<string, number> }>(digestPath(), {})
+    writeJsonAtomic(digestPath(), { seen: { ...(cur.seen ?? {}), ...it.events } })
   }
   if (it.event && events.get(it.event)) events.set(String(it.event), o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === it.id), { state: 'met', by: `main (item ${it.id} done)` })
 }
@@ -3748,17 +3748,17 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
 }
 
 // ================================================================== digest (tg role)
-// The digest is information: it is never offered alone; M1 attaches it to whatever it offers or the main's hook pulls (lanes-main.ts). It covers the
-// ledger lines past the digest cursor (.lanes/digest.json: the end of the last digest that was DONE) and past what a live digest item already covers.
+// The digest is information: it is never offered alone; M1 attaches it to whatever it offers or the main's hook pulls (lanes-main.ts). It shows each event
+// record whose version is past what a done digest showed (.lanes/digest.json `seen`) and past what a live (offered or bound) digest item shows (its `events`).
 const digestPath = () => join(LANES_DIR, 'digest.json')
 function readLedgerLines(): string[] {
   try { return readFileSync(ledgerPath(), 'utf8').split('\n').filter(Boolean) } catch { return [] }
 }
 function digestInfo(): { text: string; fields: Record<string, unknown> } | null {
-  const seen: Record<string, string> = readJson<{ seen?: Record<string, string> }>(digestPath(), {}).seen ?? {}
+  const seen: Record<string, number> = readJson<{ seen?: Record<string, number> }>(digestPath(), {}).seen ?? {}
   const live = main.items(r => r.kind === 'digest' && (r.state === 'offered' || r.state === 'bound'))
-  const covered: Record<string, string> = Object.assign({}, seen, ...live.map(r => r.covers ?? {}))
-  const changed = events.rows(e => e.owner !== 'main' && !!e.lane && String(e.ts) > (covered[e.id] ?? ''))
+  const shown: Record<string, number> = Object.assign({}, seen, ...live.map(r => r.events ?? {}))
+  const changed = events.rows(e => e.owner !== 'main' && !!e.lane && e.version > (Number(shown[e.id]) || 0))
   const lines = readLedgerLines().map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
   const reopen = openJoeyProposals(lines).map(r => `• 記憶提案 ${r.refs?.proposal_id ?? '-'}｜${laneLabelOf(r.lane)}｜${stamp(r.ts)}｜還沒決定（Joey 說的話）；需主線：用 memory_decide 決定：${clip(r.text.split('\n〔Jev')[0], 200)}`)   // 002k (D1)
   if (!changed.length && !reopen.length) return null
@@ -3766,7 +3766,7 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   if (!d) return null
   appendJsonl('routing.jsonl', { event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
-  return { text: d.text, fields: { covers: Object.fromEntries(changed.map(e => [e.id, String(e.ts)])), items: d.items } }
+  return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items } }
 }
 const laneLabelOf = (id: string): string => S.lanes[id] ? laneLabel(S.lanes[id]) : id === 'router' ? '分流器' : id
 /** one event, one line: who handled it, what happened, and where each obligation stands (M3) */

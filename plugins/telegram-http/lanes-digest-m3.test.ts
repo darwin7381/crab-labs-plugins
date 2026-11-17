@@ -2,7 +2,7 @@
 // owed to the main, waiting on Joey's decision, the rest; the overflow named on one line. The failures of class F (002e separator, 002k B15, 002m L6B5,
 // inv F(2) 8-line limit exceeded, F(3) open proposals dropped, F(4) the separator lies, F(5) two "happened" chains) are played on the event records.
 import { test, expect } from 'bun:test'
-import { mkdtempSync, copyFileSync, writeFileSync } from 'fs'
+import { mkdtempSync, copyFileSync, writeFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { renderEventDigest, DIGEST_MAX_LINES } from './lanes-digest.ts'
@@ -26,7 +26,8 @@ function event(o: { from?: string; text: string; obligations: any[]; cls?: any; 
   return id
 }
 const content = (text: string) => text.split('\n').slice(1, -1)                                  // without the header and the footnote
-const done = (t: any) => writeFileSync(join(dir, 'digest.json'), JSON.stringify({ seen: t.fields.covers }))
+const seen = (): Record<string, number> => { try { return JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).seen ?? {} } catch { return {} } }
+const done = (t: any) => writeFileSync(join(dir, 'digest.json'), JSON.stringify({ seen: { ...seen(), ...t.fields.events } }))   // as itemDone: merged
 
 test('one line per event, from its record: who handled it, what happened, where each obligation stands; the main\'s own events are not in it', () => {
   const a = event({ text: '下週維護幾點？', did: '回覆 Eve：週三 02:00', obligations: [{ kind: 'joey', level: 'line', state: 'met' }, { kind: 'peer', level: 'answer', to: 'eve', state: 'met' }] })
@@ -46,6 +47,14 @@ test('one line per event, from its record: who handled it, what happened, where 
   done(L.__digest())
 })
 
+test('a change in the same millisecond as the digest is still a change: the digest compares record versions, not timestamps', () => {
+  const a = event({ text: '同一毫秒', obligations: [{ kind: 'joey', level: 'line', state: 'met' }] })
+  const d = L.__digest()!; done(d)
+  for (let i = 0; i < 50; i++) { E().note(a, { did: `第 ${i} 次` }); expect(content(L.__digest()!.text)[0]).toContain(`第 ${i} 次`); done(L.__digest()) }
+  expect(E().get(a)!.version).toBe(1 + 50)                                                        // the fold counts the record's lines
+  expect(seen()[a]).toBe(51)
+})
+
 test('002k B15, 002m L6B5, inv F(2): at most 8 lines however many events changed; the order is owed to the main, waiting on Joey, the rest; the overflow is named on one line', () => {
   const ids: string[] = []
   for (let i = 0; i < 9; i++) ids.push(event({ text: `例行 ${i}`, cls: 'scheduled', obligations: [{ kind: 'joey', level: 'line', state: 'met' }] }))
@@ -59,7 +68,7 @@ test('002k B15, 002m L6B5, inv F(2): at most 8 lines however many events changed
   expect(lines.at(-1)).toMatch(/^另有 \d+ 件沒列出：/)
   expect(lines.filter(l => l.startsWith('•')).length).toBe(DIGEST_MAX_LINES - 1)
   done(d)
-  for (const id of [...ids, ask, hand]) expect(d.fields.covers[id]).toBeTruthy()
+  for (const id of [...ids, ask, hand]) expect(d.fields.events[id]).toBe(E().get(id)!.version)
 })
 
 test('inv F(3): an open proposal from Joey is a line owed to the main in every digest until it is decided, and is never the line that is cut', () => {
