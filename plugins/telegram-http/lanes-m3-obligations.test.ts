@@ -7,8 +7,15 @@ import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { createServer } from 'http'
 process.env.LANES_FLOOD_CONTROL = '0'
+// the scheduler, as the inbox daemon reaches it (POST /lanes/scheduler): every completion is counted here
+const schedCalls: any[] = []
+const schedSrv = createServer((req, res) => { let b = ''; req.on('data', c => b += c); req.on('end', () => { schedCalls.push({ path: req.url, ...JSON.parse(b || '{}') }); res.end(JSON.stringify({ text: '{"state":"completed"}' })) }) })
+await new Promise<void>(r => schedSrv.listen(0, '127.0.0.1', () => r()))
+process.env.LANES_INBOX_PORT = String((schedSrv.address() as any).port)
 const L = await import('./lanes.ts?m3-test') as typeof import('./lanes.ts')
+delete process.env.LANES_INBOX_PORT
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-m3-'))
 process.env.LANES_DIR = dir
@@ -36,7 +43,10 @@ const sent: Array<{ text: string; silent: boolean; replyTo?: number }> = [], mes
 L.__setMeshSend(async b => { mesh.push(b); return { text: `sent to ${b.to}`, msgId: 70000 + mesh.length, delivered: true } })
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
   sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo }); return 9000 + sent.length }, joeyChatId: () => '1' } as any)
-afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
+afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; schedSrv.close(); laneSrv.close(); L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
+// the daemon's lane routes (/lane-stop, /lane-receipt) on a real port, for the lane hooks run as processes
+const laneSrv = createServer(async (req, res) => { if (!(await L.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res))) res.writeHead(404).end() })
+await new Promise<void>(r => laneSrv.listen(0, '127.0.0.1', () => r()))
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
 const rows = (n = 'ledger.jsonl'): any[] => { try { return readFileSync(join(dir, n), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
@@ -421,4 +431,60 @@ test('B3: the lane hands the critical alert to the main before due: a ringing re
   expect(rings(k)[0].text).toContain('主線沒回')
   expect(L.handoffReplyTier({ handoff_id: ob(b.id, 'main').handoff })!.silent).toBe(true)
   L.__setCriticalDeadline(45_000)
+})
+
+// ------------------------------------------------------------------ the scheduler receipt: one obligation, one path to the scheduler
+// A lane can ask for a run's completion two ways: the receipt tool, or the scheduler card's ./bin/btcc-receipt complete N (a Bash call). The guard hook
+// (a real process here) hands the CLI's request to POST /lane-receipt; lanes.ts completeRun meets the event's receipt obligation and calls the scheduler,
+// or refuses. The CLI itself never runs.
+async function cli(tok: any, command: string): Promise<{ deny: string | null }> {
+  const p = Bun.spawn(['python3', join(import.meta.dir, 'lanes-hooks', 'lane-guard-hook.py')], { stdin: 'pipe', stdout: 'pipe',
+    env: { PATH: process.env.PATH ?? '', LANES_HTTP_PORT: String((laneSrv.address() as any).port), LANE_RUN_TOKEN: L.__runToken(tok)!, LANE_KIND: 'reflex', LANES_DIR: dir } })
+  p.stdin.write(JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: dir })); p.stdin.end()
+  const out = await new Response(p.stdout).text(); await p.exited
+  return { deny: out.trim() ? JSON.parse(out).hookSpecificOutput.permissionDecisionReason : null }
+}
+const completions = (run: string) => schedCalls.filter(c => c.path === '/lanes/scheduler' && c.action === 'complete' && c.run_id === run)
+
+test('scheduler receipt: the receipt tool first, then ./bin/btcc-receipt complete for the same run: the CLI does not run and is refused; one completion', async () => {
+  const s = await start(sched(61))
+  await call(s.tok, 'notify_joey', { text: 'run 61 正常' })
+  expect(await call(s.tok, 'receipt', { outcome: 'done', run_id: '61' })).toContain('scheduler: {"state":"completed"}')
+  const r = await cli(s.tok, './bin/btcc-receipt complete 61 --outcome done')
+  expect(r.deny).toContain('This command was not run'); expect(r.deny).toContain('run 61 not completed'); expect(r.deny).toContain('already completed (by this event)')
+  expect(completions('61').length).toBe(1)
+  expect(ob(s.id, 'receipt')).toMatchObject({ state: 'met', by: 'receipt' })
+  await end(s.lane)
+})
+
+test('scheduler receipt: ./bin/btcc-receipt complete first meets the obligation through the router (the stop hook asks for nothing); the receipt tool after it is refused; one completion', async () => {
+  const s = await start(sched(62))
+  await call(s.tok, 'notify_joey', { text: 'run 62 正常' })
+  const r = await cli(s.tok, "cd . && ./bin/btcc-receipt complete 62 --outcome nothing-to-do --note '照例，無事'")
+  expect(r.deny).toContain('run 62 completed'); expect(r.deny).toContain('"state":"completed"')
+  expect(ob(s.id, 'receipt')).toMatchObject({ state: 'met', by: 'btcc-receipt' })
+  expect(completions('62')).toMatchObject([{ outcome: 'nothing-to-do', summary: '照例，無事' }])
+  expect(L.laneStop(s.tok)).toBeNull()                                                       // nothing is open: the CLI met it
+  expect(await call(s.tok, 'receipt', { outcome: 'done', run_id: '62' })).toContain('scheduler run 62 was already completed (by this event)')
+  expect((await cli(s.tok, "bash -c './bin/btcc-receipt complete 62'")).deny).toContain('run 62 not completed')   // also inside bash -c
+  expect(completions('62').length).toBe(1)
+  expect(rows().filter(x => x.event === s.id && x.kind === 'receipt' && x.text.includes('btcc-receipt')).length).toBe(1)
+  await end(s.lane)
+})
+
+test('scheduler receipt: across events: a follow-up run\'s CLI for a run another event completed is refused; ack is not a completion and runs; no token, no completion', async () => {
+  const s = await start(sched(63))
+  expect((await cli(s.tok, './bin/btcc-receipt complete 63')).deny).toContain('run 63 completed')
+  await call(s.tok, 'notify_joey', { text: 'run 63 正常' })
+  await end(s.lane)
+  const f = await start(mk('scheduler', '[scheduled][backup-check][run:63] 後續檢查', { klass: 'followup' }))
+  expect((await cli(f.tok, './bin/btcc-receipt complete 63')).deny).toContain(`already completed (by ${s.id})`)
+  expect((await cli(f.tok, './bin/btcc-receipt ack 63')).deny).toBeNull()                    // ack is the scheduler's own business: the command runs
+  const p = Bun.spawn(['python3', join(import.meta.dir, 'lanes-hooks', 'lane-guard-hook.py')], { stdin: 'pipe', stdout: 'pipe', env: { PATH: process.env.PATH ?? '', LANE_KIND: 'reflex' } })
+  p.stdin.write(JSON.stringify({ tool_name: 'Bash', tool_input: { command: './bin/btcc-receipt complete 64' }, cwd: dir })); p.stdin.end()
+  expect(await new Response(p.stdout).text()).toContain('not completed: call receipt(run_id=64')       // never straight to the scheduler
+  await p.exited
+  expect(completions('63').length).toBe(1); expect(completions('64').length).toBe(0)
+  await call(f.tok, 'notify_joey', { text: '後續：一樣' })
+  await end(f.lane)
 })

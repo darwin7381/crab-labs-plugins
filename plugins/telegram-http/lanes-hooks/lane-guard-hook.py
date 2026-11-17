@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import sys
+import urllib.request
 
 WRITE_TOOLS = ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
 WRITE_HINTS = re.compile(r'(>>?|\btee\b|\brm\b|\bmv\b|\bcp\b|sed\s+-i|\btruncate\b|\bgit\b|\btouch\b|\bln\b|python3?\s+-c)')
@@ -599,6 +600,52 @@ def write_policy(cmd, cwd, kind, depth=0):
     return ''
 
 
+# ---- M3: a scheduler run is completed in one place (lanes.ts completeRun), whichever way the lane asks for it
+# The scheduler card tells the agent to run ./bin/btcc-receipt complete N; a lane also has the receipt tool. Both are the same request: meet the event's
+# receipt obligation for run N, once. The guard hands the CLI's request to the daemon (POST /lane-receipt with the run's token), which completes the run
+# there (or refuses it: already completed), and the command itself does not run. So nothing but the daemon completes a run at the scheduler.
+RECEIPT_CLI = 'btcc-receipt'
+
+
+def receipt_cli_calls(cmd, depth=0):
+    """[{run_id, outcome, note}] of the `btcc-receipt complete N` commands in a Bash command line (also inside bash -c '...')"""
+    out = []
+    cmds, _ = commands(cmd)
+    for words, _r in cmds:
+        prog, args, _w = command_word(words)
+        if prog in SHELLS and depth < 3:
+            inner = option_value(args, ('-c',))
+            if inner:
+                out += receipt_cli_calls(inner, depth + 1)
+            continue
+        if prog == RECEIPT_CLI and args[:1] == ['complete']:
+            pos = positionals(args[1:], skip_next=('--outcome', '--note'))
+            out.append({'run_id': pos[0] if pos else '', 'outcome': option_value(args, ('--outcome',)) or 'done', 'note': option_value(args, ('--note',)) or ''})
+    return out
+
+
+def complete_through_daemon(calls):
+    """the deny reason: what the daemon did with each completion the command asked for"""
+    port, tok = os.environ.get('LANES_HTTP_PORT'), os.environ.get('LANE_RUN_TOKEN')
+    said = []
+    for c in calls:
+        text = ''
+        if port and tok:
+            req = urllib.request.Request(f'http://127.0.0.1:{port}/lane-receipt', data=json.dumps(c).encode(), method='POST',
+                                         headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {tok}'})
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    a = json.loads(r.read() or b'{}') or {}
+                text = ('completed: ' if a.get('ok') else 'not completed: ') + str(a.get('text', ''))
+            except Exception as e:
+                text = f'not completed: the router could not be reached ({type(e).__name__}); call receipt(run_id={c["run_id"]}, outcome=...)'
+        else:
+            text = f'not completed: call receipt(run_id={c["run_id"]}, outcome=...)'
+        said.append(f'run {c["run_id"] or "?"} {text}')
+    return ('This command was not run: a lane completes a scheduler run through the router, the same request as the receipt tool, once per run. '
+            + ' | '.join(said) + ' Do not run ./bin/btcc-receipt complete again; run any other part of the command on its own.')
+
+
 def bash_policy(cmd, cwd, kind):
     """The refusal for a lane's Bash command, or ''."""
     if actor_tamper(cmd):
@@ -652,6 +699,10 @@ def main():
         return
     if tool == 'Bash':
         cmd = str(ti.get('command', ''))
+        calls = receipt_cli_calls(cmd)
+        if calls:
+            deny(complete_through_daemon(calls))
+            return
         why = bash_policy(cmd, cwd, os.environ.get('LANE_KIND') or '')       # 002k (D13, H6): identity, ./bin/svc methods, direct service calls, write targets
         if why:
             deny(why)

@@ -106,13 +106,20 @@ Fields:
 |---|---|---|
 | `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted). A critical alert's line has `ring` and `due_at`: see "The ring" below. |
 | `peer` | `answer`, `interim`, `commitment` | `reply_agent` to that peer. `interim` is met by the router when a lane hands the request to the main; a new `answer` then opens with `owner: main` and a `due_at`. `commitment` is the main's own commitment tool, met by `commitment_done`. |
-| `receipt` | `run` (`run_id`) | `receipt(run_id)`, once per scheduler run across every event |
+| `receipt` | `run` (`run_id`) | the run's completion at the scheduler, once per scheduler run across every event: `receipt(run_id)`, or the lane's `./bin/btcc-receipt complete N` (`by: btcc-receipt`), whichever comes first. See "The scheduler receipt" below. |
 | `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
 
 The one rule: a lane's outbound call asks to meet an obligation of its event.
 - Meeting an open one is accepted. Raising one (line → decision) is accepted.
 - Repeating a met one is refused, and the refusal names what is still open.
 - Handing an event to the main moves its open `joey` and `peer` obligations to `handed`.
+
+**The scheduler receipt.** A lane has two ways to complete scheduler run N: the receipt tool, and the scheduler card's CLI
+`./bin/btcc-receipt complete N`. Both are one request, handled in one place (lanes.ts `completeRun`): meet the event's `receipt` obligation for run N,
+then call the scheduler. The lane guard hook (lane-guard-hook.py, PreToolUse on Bash) does not let the CLI run: it posts the request to
+`POST /lane-receipt` with the run's token and denies the Bash call with the daemon's answer. The first request completes the run; any later one, by
+either path and from any event, is refused ("already completed"). `./bin/btcc-receipt ack` is not a completion and runs as it is. Without the daemon
+the hook still denies the CLI. So the daemon is the only thing that completes a run at the scheduler.
 
 **The lane stop.** The lane's Stop hook (lanes-hooks/lane-stop-hook.py) posts to `POST /lane-stop` with its run token (`LANE_RUN_TOKEN`; the port
 is `LANES_HTTP_PORT`, set by the daemon in the lane's environment). The daemon blocks once with the open obligations, or lets the run end.
