@@ -60,11 +60,6 @@ export function simTime(ms: number): string {
   return `${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}`
 }
 
-export function runIdOfText(text: string): string | null {
-  const m = /\[run:(\d+)\]/.exec(text ?? '')
-  return m ? m[1] : null
-}
-
 export function checkFollowupArgs(a: unknown, pendingInThread: number): { ok: true; after: number; note: string } | { ok: false; error: string } {
   const o = (a ?? {}) as Record<string, unknown>
   const after = Number(o.after_minutes)

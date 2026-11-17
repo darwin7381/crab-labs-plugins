@@ -34,12 +34,12 @@ async function spawnHook(hook: string, payload: object, e: Record<string, string
 const rec = (o: object) => JSON.stringify(o) + '\n'
 const LIST = '活動清單（今天）\n• 11-13 10:03｜adam.reflex.1｜發生：Eve 問維護時段｜回覆每週三 02:00–03:00\n• 11-13 12:55｜adam.reflex.4｜發生：備份連續失敗 A-1103｜重跑一次仍 403，已升級\n• 11-13 09:00｜main｜事故偵測工具開工'
 const MAIN_ONLY = '活動清單（今天）\n• 11-13 09:00｜main｜事故偵測工具開工'
-const transcript = (list: string) => rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', input: {} }] } })
-  + rec({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: list }] } })
 async function summary(reply: string, e: Record<string, string> = {}, list = LIST, shim?: Record<string, string>) {
   const d = mkdtempSync(join(tmpdir(), 'sgate-jl-')); const run = join(d, '.lanes', 'run'); mkdirSync(run, { recursive: true })
-  const tp = join(d, 't.jsonl'); writeFileSync(tp, transcript(list))
-  await spawnHook(SUMMARY, { hook_event_name: 'PreToolUse', session_id: 's1', transcript_path: tp, cwd: d, tool_input: { text: reply } }, env({ LANES_DIR: join(d, '.lanes'), SUMMARY_GATE_JEV: '1', ...e, ...shim }))
+  const tp = join(d, 't.jsonl'); writeFileSync(tp, '')
+  const turn = { prompt_id: 'p1', started_at: '2026-11-13T03:00:00.000Z', prev_started_at: null, items: [],                 // 002p: the daemon's turn (no transcript is read)
+    calls: [{ name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', input: {}, result: list, error: false }] }
+  await spawnHook(SUMMARY, { hook_event_name: 'PreToolUse', session_id: 's1', transcript_path: tp, cwd: d, tool_input: { text: reply }, turn }, env({ LANES_DIR: join(d, '.lanes'), SUMMARY_GATE_JEV: '1', ...e, ...shim }))
   return { gate: jsonl(join(run, 'summary-gate.jsonl')), calls: jsonl(join(run, 'jev-calls.jsonl')) }
 }
 const GOOD = '10:03 回了 Eve 維護時段；12:55 備份連續失敗，重跑仍 403，已升級。'

@@ -70,7 +70,7 @@ async function mainTurn(): Promise<void> {
 test('002m aid (c) 1fb35ef, 002b, A06/C03: lane events that end with their obligations met never wake an idle main; the next Joey message carries them', async () => {
   expect(M().mainPhase()).toBe('idle')
   const k = offers.length
-  const a = await laneDoes(mk('scheduler', '[scheduled][backup-check][run:61][P3][routine] 查備份'), async t => {
+  const a = await laneDoes({ ...mk('scheduler', '[scheduled][backup-check][run:61][P3][routine] 查備份'), meta: { run_id: '61' } }, async t => {
     await L.callLaneTool(t, 'notify_joey', { text: '備份正常' }); await L.callLaneTool(t, 'receipt', { outcome: 'done', run_id: '61', happened: '備份檢查', did: '一切正常', promised: '無', needs_main: '無' }) })
   const b = await laneDoes(mk('eve', '維護幾點？'), async t => {
     await L.callLaneTool(t, 'reply_agent', { to: 'eve', text: '02:00' }); await L.callLaneTool(t, 'notify_joey', { text: 'Eve 問維護，回 02:00' }) })

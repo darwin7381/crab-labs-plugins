@@ -403,3 +403,28 @@ test('main-hook.py: one script for every event; with no daemon it holds nothing 
   }
   expect(readFileSync(HOOK, 'utf8')).not.toContain("open(p.get('transcript_path')")
 })
+
+// PL5 (AUD P16): the main's aids get the turn from M1/M2 (main-hook.py hands it on); nothing reads the transcript
+test('PL5 P16: PreToolUse of the reply tool answers the turn (prompt, starts, bound items with the digest, every tool call with its result); Stop check answers the memory facts', async () => {
+  await drained()
+  const g = await startMain()
+  const p0 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p0 }); await hook(g, 'Stop', { prompt_id: p0, phase: 'final' })
+  await sleep(5)
+  const id = await joey('今天發生了什麼？')
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__lane__ledger_query' })
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', tool_input: {}, tool_response: '活動清單：1 件事', tool_error: false })
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash', tool_input: { command: 'false' }, tool_response: 'exit 1', tool_error: true })
+  const r = await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply' })
+  expect(r.turn).toMatchObject({ prompt_id: p, items: [expect.objectContaining({ id, kind: 'joey', content: '今天發生了什麼？' })],
+    calls: [{ name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', input: {}, result: '活動清單：1 件事', error: false }, { name: 'Bash', input: { command: 'false' }, result: 'exit 1', error: true }] })
+  expect(Date.parse(r.turn.started_at)).toBeGreaterThan(Date.parse(r.turn.prev_started_at))   // the turn before it (p0) started earlier
+  expect((await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })).turn).toBeUndefined()   // only the reply tool is judged
+  const s = await hook(g, 'Stop', { prompt_id: p })
+  expect(s.turn.prompt_id).toBe(p); expect(Array.isArray(s.proposals)).toBe(true); expect(s.curator).toBe(false)
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2 })
+  expect((await hook(g, 'PreToolUse', { prompt_id: p2, tool_name: 'mcp__x__reply' })).turn.calls).toEqual([])   // a new turn starts empty
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  await killed(g)
+})

@@ -27,12 +27,17 @@ Every decision is appended to run/summary-gate.jsonl.
 Universe 002k (C16, 002j group C): the same hook also checks what the reply CLAIMS the main did (the A3 contradiction check, which covers lanes in
 lanes.ts, applied to the main). 002j C16: the main told Joey "I replied to Eve" one second after send_to_agent returned "send blocked, nothing was
 sent". Program first: the sentences of the reply that claim an action in the first person (我已…, 我回了…, I sent / replied / did …) and the tool
-calls and results of THIS turn (the transcript since the last turn_duration record; the main's own Telegram replies are not evidence). Jev answers
+calls and results of THIS turn (turn.calls, given by the daemon; the main's own Telegram replies are not evidence). Jev answers
 one Choice per claim sentence: do the results support it / contradict it / say nothing about it. A contradiction at confidence >= 0.8 (MAIN_REPLY_CONTRA)
 sends the reply back ONCE per turn: the sentence, and the tool result that contradicts it (a second, narrow Jev question picks which result; if it cannot,
 the turn's last results are attached). The next attempt goes out whatever it says. "Says nothing" never blocks (greetings, plans, an earlier turn's work);
 no claim sentence, no tool result, no Jev key, a failed or slow call: the reply goes out as written. On when SUMMARY_GATE_JEV=1 or MAIN_REPLY_CHECK=1;
 MAIN_REPLY_CHECK=0 turns it off. Every decision is appended to run/reply-check.jsonl and every Jev call to run/jev-calls.jsonl.
+
+Universe 002p: this file reads no transcript. main-hook.py (the main's one hook) calls reason(p, turn) on the PreToolUse of the reply tool with the
+`turn` the daemon answered (/lanes/main-event): prompt_id (the turn marker and once-per-turn key), started_at, prev_started_at, items (the turn's bound
+items: joey / digest / ...) and calls (this turn's tool calls with their results, oldest first). Run on its own, the script does nothing unless its stdin
+carries "turn".
 
 Universe 002n (model aid c, T3-R #8): when this turn's Telegram message from Joey carried the lane digest (002b piggyback), the reply must not relay
 digest items his message did not ask about. Code first (the item's ids, a verbatim run of its text, its salient tokens), then one Jev question; sent back
@@ -46,58 +51,21 @@ import tempfile
 import time
 import urllib.request
 
-TAIL_BYTES = 3_000_000
 ITEM = re.compile(r'^• (\d\d-\d\d) (\d\d:\d\d)｜([^｜]+)｜(.*)$')
 
 
-def tail_records(path):
-    try:
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            if size > TAIL_BYTES:
-                f.seek(size - TAIL_BYTES)
-                f.readline()
-            data = f.read().decode('utf-8', errors='replace')
-    except OSError:
-        return []
-    out = []
-    for line in data.splitlines():
-        if not line or not ('ledger_query' in line or 'tool_result' in line or 'turn_duration' in line):
-            continue
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            pass
-    return out
-
-
-def activity_list_of_this_turn(recs):
-    """(tool_use id, list text) of the last no-argument ledger_query in the current turn, or (None, None)."""
-    start = 0
-    for i, j in enumerate(recs):                      # the current turn starts after the last end-of-turn record
-        if j.get('type') == 'system' and j.get('subtype') == 'turn_duration':
-            start = i + 1
-    call = None
-    results = {}
-    for j in recs[start:]:
-        c = (j.get('message') or {}).get('content')
-        if not isinstance(c, list):
-            continue
-        for x in c:
-            if not isinstance(x, dict):
-                continue
-            if x.get('type') == 'tool_use' and str(x.get('name', '')).endswith('ledger_query'):
-                inp = x.get('input') or {}
-                if not any(str(v or '').strip() for v in inp.values()):
-                    call = x.get('id')
-            elif x.get('type') == 'tool_result':
-                r = x.get('content')
-                text = r if isinstance(r, str) else ''.join(y.get('text', '') for y in (r or []) if isinstance(y, dict))
-                results[x.get('tool_use_id')] = text
-    text = results.get(call) if call else None
-    if not text or not text.lstrip().startswith('活動清單'):
-        return None, None
-    return call, text
+def activity_list_of_this_turn(turn):
+    """(call id, list text) of the last no-argument ledger_query of this turn whose result is the activity list, or (None, None).
+    The call id is f"{prompt_id}:{index of the call in turn.calls}"."""
+    calls = turn.get('calls') or []
+    for i in range(len(calls) - 1, -1, -1):
+        c = calls[i] if isinstance(calls[i], dict) else {}
+        inp = c.get('input') if isinstance(c.get('input'), dict) else {}
+        text = str(c.get('result') or '')
+        if str(c.get('name', '')).endswith('ledger_query') and not any(str(v or '').strip() for v in inp.values()) \
+                and text.lstrip().startswith('活動清單'):
+            return f"{turn.get('prompt_id', '')}:{i}", text
+    return None, None
 
 
 def lane_items(text):
@@ -236,52 +204,19 @@ def claim_sentences(reply):
     return [x for x in parts if len(x) >= 4 and not QUESTION.search(x) and (ZH_CLAIM.search(x) or EN_CLAIM.search(x))][:12]
 
 
-def turn_records(path):
-    """The records of the transcript's tail that matter for "this turn": tool calls, tool results and the end-of-turn markers."""
-    try:
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            if size > TAIL_BYTES:
-                f.seek(size - TAIL_BYTES)
-                f.readline()
-            data = f.read().decode('utf-8', errors='replace')
-    except OSError:
-        return []
+def turn_tool_results(turn):
+    """([{id, call, result, error}], marker): this turn's calls (turn.calls, given by the daemon) with their results, oldest first, last 20;
+    marker = the turn's prompt_id. The main's own Telegram / Discord tools are left out."""
     out = []
-    for line in data.splitlines():
-        if not line or not ('tool_use' in line or 'tool_result' in line or 'turn_duration' in line):
+    for i, c in enumerate(turn.get('calls') or []):
+        if not isinstance(c, dict):
             continue
-        try:
-            out.append(json.loads(line))
-        except ValueError:
-            pass
-    return out
-
-
-def turn_tool_results(recs):
-    """([{id, call, result, error}], marker): the calls of the current turn (after the last turn_duration record) with their results, oldest first, last 20;
-    marker = what identifies this turn. The main's own Telegram / Discord tools are left out."""
-    start, marker = 0, 'start'
-    for i, j in enumerate(recs):
-        if j.get('type') == 'system' and j.get('subtype') == 'turn_duration':
-            start, marker = i + 1, str(j.get('uuid') or j.get('timestamp') or i)
-    calls, out = {}, []
-    for j in recs[start:]:
-        c = (j.get('message') or {}).get('content')
-        if not isinstance(c, list):
+        name = str(c.get('name', ''))
+        if name.startswith(OWN_TOOLS):
             continue
-        for x in c:
-            if not isinstance(x, dict):
-                continue
-            if x.get('type') == 'tool_use':
-                name = str(x.get('name', ''))
-                if not name.startswith(OWN_TOOLS):
-                    calls[x.get('id')] = f"{name} {json.dumps(x.get('input') or {}, ensure_ascii=False)[:300]}"
-            elif x.get('type') == 'tool_result' and x.get('tool_use_id') in calls:
-                r = x.get('content')
-                text = r if isinstance(r, str) else ' '.join(y.get('text', '') for y in (r or []) if isinstance(y, dict))
-                out.append({'id': x.get('tool_use_id'), 'call': calls[x.get('tool_use_id')], 'result': text[:1500], 'error': bool(x.get('is_error'))})
-    return out[-20:], marker
+        out.append({'id': f"{turn.get('prompt_id', '')}:{i}", 'call': f"{name} {json.dumps(c.get('input') or {}, ensure_ascii=False)[:300]}",
+                    'result': str(c.get('result') or '')[:1500], 'error': bool(c.get('error'))})
+    return out[-20:], str(turn.get('prompt_id', ''))
 
 
 def jev_post(questions, state, timeout=None):
@@ -322,14 +257,14 @@ def which_result(sentence, results, rd):
     return None
 
 
-def reply_check(p, reply, d):
+def reply_check(p, reply, d, turn):
     """C16: the deny reason for a reply that says the main did something its own tool results of this turn say it did not, or ''."""
     if not REPLY_CHECK:
         return ''
     sents = claim_sentences(reply)
     if not sents:
         return ''
-    results, marker = turn_tool_results(turn_records(p.get('transcript_path') or ''))
+    results, marker = turn_tool_results(turn)
     if not results:
         return ''
     rd = d if os.path.isdir(d) else tempfile.gettempdir()
@@ -392,7 +327,7 @@ def reply_check(p, reply, d):
 # The lane digest rides on the main's next natural turn, Joey's message included (002b; merge 「摘要：主線在自己的回合邊界收到…用的是現有的 hook 注入機制，
 # 不是打斷」; main-role 「主線是被告知，不是被打斷」; Joey's B5: an idle main is never woken for it). 002m held it off his message and woke the idle main with
 # it instead (A06, C03: a wake turn that told Joey nothing); 002n takes that out and checks the reply instead. When this turn's Telegram message carried a
-# digest (the 〔以上是系統附上的車道摘要…〕 mark) and the main now replies to Joey:
+# digest (002p: the turn has a digest item and a Joey item) and the main now replies to Joey:
 #   1. code first. The digest's items are read; an item handed to the main (需主線) is the main's to report and is not checked. An item counts as touched
 #      when the reply carries one of its ids (mesh-…, ho-…, a lane or thread id, a ticket) that Joey's message does not, a verbatim run of its text
 #      (12 characters), or a salient token of it (an ASCII token with a digit or a dash, a 4-character CJK run) that Joey's message does not. No item touched:
@@ -402,9 +337,7 @@ def reply_check(p, reply, d):
 # Every decision is in run/digest-relay.jsonl and every Jev call in run/jev-calls.jsonl (site digest-relay-T3R8). MAIN_DIGEST_RELAY_CHECK=0 turns it off.
 DIGEST_CHECK = os.environ.get('MAIN_DIGEST_RELAY_CHECK', '1') == '1'
 DIGEST_P = float(os.environ.get('MAIN_DIGEST_RELAY_P', '0.8'))
-DIGEST_MARK = '〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕'
 DIGEST_HEAD = '〔車道摘要｜'
-JOEY_SOURCE = 'source="plugin:telegram-http'
 SKIP_SECTIONS = ('〔暫停中的同事', '〔還沒決定的記憶提案')
 NOTE_LINE = re.compile(r'^\s*(〔[^〕]*〕|（[^）]*）)\s*$')
 DIGEST_ID = re.compile(r'[A-Za-z][\w-]*#t-[0-9A-Za-z]{3,}|\b[a-z][\w-]*\.(?:reflex|worker|synth|cron)\.\d+\b|\b(?:mesh|ho|fu|pr|ev|mp|dg)-[0-9A-Za-z]{4,}\b|\b[A-Z]{1,3}-\d{3,}\b|\b\d{5,}\b')
@@ -413,48 +346,15 @@ CJK_RUN = re.compile(r'[㐀-鿿]{4,}')
 VERBATIM = 12
 
 
-def _text_of(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return '\n'.join(str(x.get('text', '')) for x in content if isinstance(x, dict) and x.get('type') == 'text')
-    return ''
-
-
-def digest_turn(path):
-    """(marker, [(digest text, Joey's own text)]) for the Telegram messages of the current turn that carried a digest; marker identifies the turn."""
-    try:
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            if size > TAIL_BYTES:
-                f.seek(size - TAIL_BYTES)
-                f.readline()
-            data = f.read().decode('utf-8', errors='replace')
-    except OSError:
-        return 'start', []
-    recs = []
-    for line in data.splitlines():
-        if not line or not ('turn_duration' in line or '以上是系統附上的車道摘要' in line):
-            continue
-        try:
-            recs.append(json.loads(line))
-        except ValueError:
-            pass
-    start, marker = 0, 'start'
-    for i, j in enumerate(recs):
-        if j.get('type') == 'system' and j.get('subtype') == 'turn_duration':
-            start, marker = i + 1, str(j.get('uuid') or j.get('timestamp') or i)
-    out = []
-    for j in recs[start:]:
-        if j.get('type') != 'user':
-            continue
-        t = _text_of((j.get('message') or {}).get('content'))
-        if DIGEST_MARK not in t or JOEY_SOURCE not in t.split(DIGEST_HEAD, 1)[0]:
-            continue
-        head, joey = t.split(DIGEST_MARK, 1)
-        k = head.find(DIGEST_HEAD)
-        out.append((head[k:] if k >= 0 else head, joey.replace('</channel>', '').strip()))
-    return marker, out
+def digest_turn(turn):
+    """(marker, [(digest text, Joey's own text)]) for this turn: each digest item with the joined text of the turn's Joey items; none when
+    the turn has no Joey item or no digest item. marker = the turn's prompt_id."""
+    items = [x for x in (turn.get('items') or []) if isinstance(x, dict)]
+    joey = '\n'.join(str(x.get('content') or '') for x in items if x.get('kind') == 'joey')
+    digests = [str(x.get('content') or '') for x in items if x.get('kind') == 'digest']
+    if not any(x.get('kind') == 'joey' for x in items) or not digests:
+        return str(turn.get('prompt_id', '')), []
+    return str(turn.get('prompt_id', '')), [(dg, joey) for dg in digests]
 
 
 def digest_items(digest):
@@ -521,11 +421,11 @@ DIGEST_Q = {'relay': {'type': 'noul', 'instructions': 'Does `reply` report items
                                             'for news or what happened), or the reply mentions no `digest` item'}}}
 
 
-def digest_relay_check(p, reply, d):
+def digest_relay_check(p, reply, d, turn):
     """T3-R #8: the deny reason for a reply to Joey that relays digest items his message did not ask about, or ''."""
     if not DIGEST_CHECK or not reply.strip():
         return ''
-    marker, carried = digest_turn(p.get('transcript_path') or '')
+    marker, carried = digest_turn(turn)
     if not carried:
         return ''
     rd = d if os.path.isdir(d) else tempfile.gettempdir()
@@ -595,24 +495,21 @@ def digest_relay_check(p, reply, d):
 
 
 
-def main():
-    try:
-        p = json.load(sys.stdin)
-    except Exception:
-        return
+def reason(p, turn):
+    """The deny reason for the reply in p (the PreToolUse payload), or None. Every input about this turn comes from `turn` (the daemon's answer to
+    /lanes/main-event): prompt_id, started_at, prev_started_at, items, calls. No transcript is read."""
+    turn = turn if isinstance(turn, dict) else {}
     reply = str((p.get('tool_input') or {}).get('text') or '')
     ld0 = os.environ.get('LANES_DIR') or os.path.join(p.get('cwd') or os.getcwd(), '.lanes')
-    contra = reply_check(p, reply, os.path.join(ld0, 'run'))          # 002k (C16): what the reply says the main did, against its own tool results
+    contra = reply_check(p, reply, os.path.join(ld0, 'run'), turn)    # 002k (C16): what the reply says the main did, against its own tool results
     if contra:
-        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': contra}}, ensure_ascii=False))
-        return
-    relay = digest_relay_check(p, reply, os.path.join(ld0, 'run'))  # 002n (aid c, T3-R #8): digest items Joey did not ask about, relayed to him
+        return contra
+    relay = digest_relay_check(p, reply, os.path.join(ld0, 'run'), turn)  # 002n (aid c, T3-R #8): digest items Joey did not ask about, relayed to him
     if relay:
-        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': relay}}, ensure_ascii=False))
-        return
-    call, text = activity_list_of_this_turn(tail_records(p.get('transcript_path') or ''))
+        return relay
+    call, text = activity_list_of_this_turn(turn)
     if not call:
-        return
+        return None
     items = lane_items(text)
     missing = [it for it in items if it[0] not in reply]
     different = []
@@ -638,7 +535,7 @@ def main():
             jev_log(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate', info.get('question'),
                     {'session': p.get('session_id', ''), 'items': len(items), 'reply': reply[:120]}, info.get('answers'), max(diff) if diff else None, info['ms'], info.get('error'))
     if not missing and not different:
-        return
+        return None
     sp = os.path.join(d if os.path.isdir(d) else tempfile.gettempdir(), 'summary-gate.json')
     try:
         st = json.load(open(sp, encoding='utf-8'))
@@ -646,7 +543,7 @@ def main():
         st = {}
     key = f"{p.get('session_id', '')}:{call}"
     if key in st:
-        return                                        # refused once already for this list: let it through
+        return None                                   # refused once already for this list: let it through
     st[key] = len(missing) + len(different)
     try:
         tmp = f'{sp}.{os.getpid()}.tmp'
@@ -654,18 +551,31 @@ def main():
             json.dump(dict(list(st.items())[-300:]), f)
         os.replace(tmp, sp)
     except OSError:
-        return                                        # cannot remember = could refuse for ever: do not refuse
+        return None                                   # cannot remember = could refuse for ever: do not refuse
     lines = '\n'.join(f'• {t}｜{who}｜{what}' for t, who, what in missing)
-    reason = '這則整理先不送：'
+    out = '這則整理先不送：'
     if missing:
-        reason += f'活動清單裡有 {len(missing)} 件沒有出現在你的整理裡：\n{lines}\n'
+        out += f'活動清單裡有 {len(missing)} 件沒有出現在你的整理裡：\n{lines}\n'
     if different:
-        reason += (f'有 {len(different)} 件你寫的跟清單不一致（時間、數字、結果或是誰做的），請對照清單改正：\n'
+        out += (f'有 {len(different)} 件你寫的跟清單不一致（時間、數字、結果或是誰做的），請對照清單改正：\n'
                    + '\n'.join(f'• {t}｜{who}｜{what}' for t, who, what in different) + '\n')
-    reason += ('清單上每一件都要寫到：時間、發生什麼、結果（數字照清單寫）。補上後再送一次。'
+    out += ('清單上每一件都要寫到：時間、發生什麼、結果（數字照清單寫）。補上後再送一次。'
               '如果 Joey 這次只問其中一部分，就在訊息裡寫明只回答哪一部分，再送一次即可。')
-    print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
-                                             'permissionDecisionReason': reason}}, ensure_ascii=False))
+    return out
+
+
+def main():
+    """Standalone: a no-op unless stdin carries "turn" (the old PreToolUse registration may still sit in a slot's settings; main-hook.py calls reason())."""
+    try:
+        p = json.load(sys.stdin)
+    except Exception:
+        return
+    if not isinstance(p, dict) or 'turn' not in p:
+        return
+    turn = p.pop('turn')
+    r = reason(p, turn)
+    if r:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': r}}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

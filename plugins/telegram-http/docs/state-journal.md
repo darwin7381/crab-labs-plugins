@@ -126,6 +126,8 @@ record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no 
 Fields:
 - `class`: `scheduled`, `peer`, `joey`, `alert` or `critical` (`followup` is no longer written). The router writes it from the routing rule's
   trigger. No hook parses prompt text for it.
+- A scheduled event's receipt obligation takes its `run_id` from the event's meta (`meta.run_id`), and `meta.frequency: high` drops its Joey line.
+  Both come from structured fields of the `/inject` body (`run_id`, `frequency`); nothing parses `[run:N]` or `[high-frequency]` from the text.
 - **A follow-up is another run of its origin event**, not a new event: the follow-up scheduler queues a run of the origin event (the run's queued
   line carries `ev.followup` = the follow-up id; the routing row has `event` = the origin and `followup`). Its Joey line is the origin's: a line
   with a different `outcome` is a raise, the same outcome is refused; the origin's receipt is already met. A follow-up whose origin still has a run
@@ -266,8 +268,9 @@ the audit log (its lines no longer carry `notify_main`).
 
 ## The main's hook
 
-One script handles every event: `lanes-hooks/main-hook.py`. It replaces session-start-hook.py and main-midturn-hook.py, and it is the only Stop hook
-the main needs: it calls main-memory-gate.py and main-answered-gate.py itself.
+One script handles every event: `lanes-hooks/main-hook.py`. It replaces session-start-hook.py and main-midturn-hook.py, and it is the only hook the
+main needs: it calls the model aids itself (main-summary-gate.py at the PreToolUse of the Telegram `reply` tool; main-memory-gate.py and
+main-answered-gate.py at Stop), with the turn the daemon answers. No aid reads the transcript or the ledger.
 
 The main session's settings must carry:
 
@@ -276,7 +279,7 @@ The main session's settings must carry:
   "hooks": {
     "SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 15 }] }],
     "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 15 }] }],
-    "PreToolUse":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 15 }] }],
+    "PreToolUse":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 30 }] }],
     "PostToolUse":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 15 }] }],
     "Stop":             [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 30 }] }],
     "StopFailure":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 <plugin>/lanes-hooks/main-hook.py", "timeout": 15 }] }],
@@ -285,11 +288,11 @@ The main session's settings must carry:
 }
 ```
 
-The model aids keep their own registrations:
-- main-summary-gate.py: PreToolUse on the Telegram `reply` tool.
-- memory-commit-hook.py: PostToolUse on Write and Edit.
+memory-commit-hook.py keeps its own registration (PostToolUse on Write and Edit). The PreToolUse timeout is 30 s because the summary gate's Jev
+calls (`SUMMARY_GATE_JEV`, `MAIN_REPLY_CHECK`, `TYPESAFE_*` must be in main-hook.py's environment) run inside it.
 
-Do not register main-answered-gate.py or main-memory-gate.py as hooks of their own. main-hook.py runs them at Stop, after it has asked the daemon
+Do not register main-summary-gate.py, main-answered-gate.py or main-memory-gate.py as hooks of their own (run alone, the first two do nothing
+unless their input carries `turn`). main-hook.py runs them at Stop, after it has asked the daemon
 to pull. That way a Stop that some aid holds is never counted as the end of the turn. A Stop hook the plugin does not own (the user's) can still
 block a Stop main-hook.py let through: the daemon re-opens that turn at its next event ("A turn ends at its last Stop").
 
@@ -301,12 +304,19 @@ Environment the hook needs. The keeper already sets these for the main:
 What the hook sends to `POST /lanes/main-event`:
 - always: `{event, session_id, prompt_id, pid, transcript_path, source, tool_name, error}`;
 - UserPromptSubmit: `dids`, the `did="..."` values in the prompt;
-- PostToolUse of `reply` or `send_to_agent`: `tool_input` (`to`, `reply_to`, `text`);
+- PostToolUse of every tool: `tool_input` (each string cut to 3000 characters; `to`, `reply_to`, `text` for reply / send_to_agent), `tool_response`
+  (as text, cut to 20000) and `tool_error`. The daemon keeps the running turn's calls (the last 40) for the summary gate;
 - StopFailure: `reason`, which is `last_assistant_message`;
 - Stop: `phase: "check"` first, then `phase: "final"` when nothing holds the turn.
 
+What the daemon answers besides:
+- PreToolUse of the `reply` tool and the Stop check: `turn` = `{prompt_id, started_at, prev_started_at, items, calls}`: the running turn's prompt,
+  when it and the main's previous turn started (M2), the items bound to it (`{id, kind, content, user}`; a digest item's content is the digest),
+  and its tool calls with their results. The Stop check also answers `proposals` (the open Joey-sourced memory proposals, from M3) and `curator`.
+
 What the hook prints, from the daemon's answer:
 - SessionStart: `additionalContext`. That is the main-only rules for the accepted main, or "you are not the main".
+- PreToolUse of `reply`: the summary gate's `deny`, when it has one.
 - PostToolUse: `additionalContext` with the items pulled into this turn.
 - Stop: `decision: block` with the items pulled, or with an aid's reason.
 

@@ -54,13 +54,19 @@ export type MainEnv = {
   menu?: (drive?: boolean) => Promise<string | null>
   /** the registration context an accepted main gets */
   context: (agent: string, sid: string) => string
+  /** the memory gate's facts (M3): the open Joey-sourced proposals, and whether a curator lane holds the write right */
+  memory?: () => { proposals: Array<{ id: string; ts: string; lane: string; text: string }>; curator: boolean }
 }
 
 export type MainEvent = {
   event: string; session_id?: string; prompt_id?: string; pid?: number; transcript_path?: string; source?: string
-  error?: string; tool_name?: string; tool_input?: any; dids?: string[]; phase?: 'check' | 'final'; reason?: string
+  error?: string; tool_name?: string; tool_input?: any; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
 }
-export type MainReply = { accepted?: boolean; additionalContext?: string; block?: string
+/** PL5: the turn the main's aids judge, from M1/M2 (they read no transcript): its prompt, when it and the turn before it started, the items bound to
+ *  it (the digest's content is the digest), and its tool calls with their results (main-hook.py posts every PostToolUse) */
+export type Turn = { prompt_id: string; started_at: string | null; prev_started_at: string | null
+  items: Array<{ id: string; kind: string; content: string; user: string }>; calls: Array<{ name: string; input: any; result: string; error: boolean }> }
+export type MainReply = { accepted?: boolean; additionalContext?: string; block?: string; turn?: Turn; proposals?: unknown[]; curator?: boolean
   items?: Array<{ mid: string; kind: string; user: string; no_reply: boolean; system: boolean; body: string }>; outputs?: Output[] }
 type Output = { to: string; reply_to: string; text: string }
 
@@ -80,6 +86,8 @@ export function createMain(E: MainEnv) {
   const lastEventAt = new Map<string, number>()          // gen → ms of its last hook event (silence = the stuck rule)
   const pendingEnd = new Map<string, EndReason>()        // gen → why it is about to end (asked: /restart; replaced: /main renew)
   const outputs = new Map<string, Output[]>()            // prompt id → the reply / send_to_agent calls of that turn (answered gate)
+  const calls = new Map<string, Turn['calls']>()          // prompt id → every tool call of that turn with its result (the summary gate)
+  const starts = new Map<string, { prompt: string; at: string; prev: string | null }>()   // gen → its running turn's start, and the start of the turn before
   let stuck: { gen: string; prompt: string | null; at: number } | null = null
   let offering = false
   let seq = 0
@@ -88,7 +96,7 @@ export function createMain(E: MainEnv) {
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
     cur = null; stuck = null; offering = false
-    lastEventAt.clear(); pendingEnd.clear(); outputs.clear()
+    lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
     const g = live[live.length - 1]
@@ -144,6 +152,13 @@ export function createMain(E: MainEnv) {
     return J().get('msg', id)!
   }
   function contentOf(r: Row): string { return String((r.notif?.params as any)?.content ?? '') }
+  /** the turn of prompt `p` of gen `g`, for the main's aids */
+  function turnOf(g: Row, p: string): Turn {
+    const st = starts.get(g.id)
+    return { prompt_id: p, started_at: st?.prompt === p ? st.at : null, prev_started_at: st?.prompt === p ? st.prev : null,
+      items: items(r => (r.state === 'bound' || r.state === 'done') && r.gen === g.id && r.prompt_id === p).map(r => ({ id: r.id, kind: String(r.kind), content: contentOf(r), user: String(metaOf(r.notif).user ?? '') })),
+      calls: calls.get(p) ?? [] }
+  }
 
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
   async function pump(): Promise<void> {
@@ -236,7 +251,8 @@ export function createMain(E: MainEnv) {
     if (g.prompt_id === prompt) return
     if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
     if (g.prompt_id) requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted')       // a turn that never got Stop or StopFailure
-    outputs.clear()                                                                                  // the answered gate looks at this prompt's calls only
+    outputs.clear(); calls.clear()                                                                   // the aids look at this prompt's calls only
+    starts.set(g.id, { prompt, at: new Date().toISOString(), prev: starts.get(g.id)?.at ?? null })
     setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
     const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
     // what the prompt names (its did="…"), and whatever was offered to this gen: one offer opens one turn, so it is this turn's
@@ -268,13 +284,18 @@ export function createMain(E: MainEnv) {
     const p = String(b.prompt_id ?? '')
     switch (ev) {
       case 'UserPromptSubmit': if (p) beginTurn(g, p, b.dids); return {}
-      case 'PreToolUse': if (p) { beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') }) } return {}
+      case 'PreToolUse': {
+        if (!p) return {}
+        beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
+        return /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p) } : {}   // PL5: the summary gate judges the reply against this turn
+      }
       case 'PostToolUse': {
         if (!p) return {}
         beginTurn(g, p)
         const n = String(b.tool_name ?? '')
         if (/(__reply|__send_to_agent)$/.test(n) && b.tool_input?.text) (outputs.get(p) ?? outputs.set(p, []).get(p)!).push({
           to: String(b.tool_input.to ?? (n.endsWith('__reply') ? 'Joey' : '')), reply_to: String(b.tool_input.reply_to ?? ''), text: String(b.tool_input.text) })
+        { const list = calls.get(p) ?? calls.set(p, []).get(p)!; list.push({ name: n, input: b.tool_input ?? {}, result: String(b.tool_response ?? ''), error: !!b.tool_error }); if (list.length > 40) list.shift() }
         setMain(J().get('main', g.id)!, 'in_turn', { tool_open: null })
         const got = pull(J().get('main', g.id)!, p)
         return got.length ? { additionalContext: renderPulled(got) } : {}
@@ -287,7 +308,8 @@ export function createMain(E: MainEnv) {
           if (got.length) return { block: '這一輪先不要結束。' + renderPulled(got) }
           const bound = items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === p && r.kind !== 'digest')
           return { items: bound.map(r => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
-            user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }), outputs: outputs.get(p) ?? [] }
+            user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }), outputs: outputs.get(p) ?? [],
+            turn: turnOf(J().get('main', g.id)!, p), ...(E.memory ? E.memory() : { proposals: [], curator: false }) }   // PL5: the memory gate's facts
         }
         finish(r => r.gen === g.id && r.prompt_id === p)
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop

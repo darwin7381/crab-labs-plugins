@@ -19,17 +19,17 @@ beforeAll(() => {
 })
 afterAll(() => server.stop(true))
 
-const rec = (o: object) => JSON.stringify(o) + '\n'
 const LIST = '活動清單（今天）\n• 11-13 10:03｜adam.reflex.1｜發生：Eve 問維護時段｜回覆每週三 02:00–03:00\n• 11-13 12:55｜adam.reflex.4｜發生：備份連續失敗 A-1103｜重跑一次仍 403，已升級\n• 11-13 09:00｜main｜事故偵測工具開工'
-const transcript = rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', input: {} }] } })
-  + rec({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: LIST }] } })
+// 002p: the turn the daemon hands the gate (the gate reads no transcript): this turn took the activity list
+const turn = { prompt_id: 'p1', started_at: '2026-11-13T06:00:00.000Z', prev_started_at: null, items: [],
+  calls: [{ name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', input: {}, result: LIST, error: false }] }
 
 async function run(reply: string, env: Record<string, string> = {}) {
   const d = mkdtempSync(join(tmpdir(), 'sgate-')); mkdirSync(join(d, '.lanes', 'run'), { recursive: true })
-  const tp = join(d, 't.jsonl'); writeFileSync(tp, transcript)
+  const tp = join(d, 't.jsonl'); writeFileSync(tp, '')
   const p = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     env: { ...process.env, LANES_DIR: join(d, '.lanes'), SUMMARY_GATE_JEV: '1', TYPESAFE_BASE_URL: `http://127.0.0.1:${server.port}`, TYPESAFE_API_KEY: 'test-key', ...env } })
-  p.stdin.write(JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 's1', transcript_path: tp, cwd: d, tool_input: { text: reply } })); p.stdin.end()
+  p.stdin.write(JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 's1', transcript_path: tp, cwd: d, tool_input: { text: reply }, turn })); p.stdin.end()
   const out = (await new Response(p.stdout).text()).trim(); await p.exited
   const lp = join(d, '.lanes', 'run', 'summary-gate.jsonl')
   return { reason: out ? JSON.parse(out).hookSpecificOutput.permissionDecisionReason as string : null, log: existsSync(lp) ? JSON.parse(readFileSync(lp, 'utf8').trim().split('\n')[0]) : null }

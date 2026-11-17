@@ -8,7 +8,7 @@ import { LEDGER_KINDS, LEDGER_QUERY_DESCRIPTION, queryLedger } from './lanes-dig
 import { LANE_TOOLS, mainToolDefs } from './lanes.ts'
 import {
   FOLLOWUP_MAX_MINUTES, FOLLOWUP_MAX_PER_THREAD, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText,
-  duePending, followupEventText, runIdOfText, simTime, type Followup,
+  duePending, followupEventText, simTime, type Followup,
 } from './lanes-followup.ts'
 
 const NOW = Date.parse('2026-11-13T09:00:00Z')
@@ -88,8 +88,6 @@ test('follow-up message: note, simulated time, a run of the same matter; it does
   expect(t).toContain('同一件事的再一趟'); expect(t).toContain('outcome 變了')                    // its Joey line is a raise or it is refused
   expect(t).toContain(simTime(NOW))
   expect(t).not.toContain('[scheduled]')
-  expect(runIdOfText('[scheduled][api-health-check][run:88][normal] x')).toBe('88')
-  expect(runIdOfText('no run here')).toBeNull()
   expect(simTime(Date.parse('2026-11-13T02:55:00Z'))).toBe('2026-11-13 10:55')
 })
 

@@ -56,7 +56,9 @@ const obs = (id: string): any[] => E().get(id)?.obligations ?? []
 const ob = (id: string, kind: string) => obs(id).find(o => o.kind === kind)
 let n = 0
 const mk = (from: string, text: string, extra: object = {}) => ({ id: `mesh-m3-${++n}`, source: 'mesh', from, verified: true, text, meta: {}, notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } }, ...extra } as any)
-const sched = (run: number, what = 'backup-check', tags = '') => mk('scheduler', `[scheduled][${what}]${tags}[run:${run}][P3][routine] ${what}：照例檢查`)
+// PL5: the scheduler's run id and frequency travel as event meta (the inject body's run_id / frequency), not text tags
+const sched = (run: number, what = 'backup-check', tags = '') => { const e = mk('scheduler', `[scheduled][${what}]${tags}[run:${run}][P3][routine] ${what}：照例檢查`)
+  e.meta = { run_id: String(run), ...(tags.includes('[high-frequency]') ? { frequency: 'high' } : {}) }; return e }
 /** route an event, wait until its lane run is in progress, return its run token */
 async function start(ev: any): Promise<{ id: string; lane: string; tok: any }> {
   const d = await L.routeEvent(ev)
@@ -694,4 +696,26 @@ test('PL3 P10 (B08 1015/1016, T3-R E4, A05, G03): a follow-up is a run of its OR
   expect(L.laneStop(fu)).toBeNull()                                                              // nothing new is owed: the origin's obligations stand
   await end(s.lane)
   expect(handed(s.id).length).toBe(0)
+})
+
+// ------------------------------------------------------------------ PL5 (AUD P15): the scheduler's run id and frequency are event meta; no text is parsed for them
+test('PL5 P15 (B08 [run:40] ×4, WD6): each scheduled event\'s receipt is its meta run id, whatever the text says; the frequency is meta too', async () => {
+  const mkS = (text: string, meta: Record<string, string>) => { const e = mk('scheduler', text); e.meta = meta; return e }
+  const ids: string[] = []
+  for (const run of ['91', '92', '93', '94']) {                                               // four checks whose texts all say [run:40]
+    const s = await start(mkS('[scheduled][api-check][run:40][P3][routine] 檢查 mock-api', { run_id: run }))
+    expect(ob(s.id, 'receipt')).toMatchObject({ run_id: run, state: 'open' })
+    expect(await call(s.tok, 'receipt', { outcome: 'done', run_id: run })).toContain('scheduler: {"state":"completed"}')
+    await call(s.tok, 'notify_joey', { text: `run ${run} 正常` }); await end(s.lane); ids.push(s.id)
+  }
+  for (const id of ids) expect(ob(id, 'receipt').state).toBe('met')                         // 002o: receipts #2-#4 were refused
+  const t = await start(mkS('[scheduled][heartbeat][run:95][P3][routine][high-frequency] 心跳', { run_id: '95' }))
+  expect(obs(t.id).map(o => o.kind).sort()).toEqual(['joey', 'receipt'])                     // the tag in the text decides nothing
+  await call(t.tok, 'receipt', { outcome: 'done', run_id: '95' }); await call(t.tok, 'notify_joey', { text: '心跳正常' }); await end(t.lane)
+  const h = await start(mkS('[scheduled][heartbeat] 心跳', { run_id: '96', frequency: 'high' }))
+  expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])                                     // frequency high (meta): no Joey line
+  await call(h.tok, 'receipt', { outcome: 'done', run_id: '96' }); await end(h.lane)
+  const n0 = await start(mkS('[scheduled][x][run:97] 沒有 meta 的排程', {}))
+  expect(obs(n0.id).some(o => o.kind === 'receipt')).toBe(false)                              // no meta, no run id: nothing is guessed from the text
+  await call(n0.tok, 'notify_joey', { text: 'x' }); await end(n0.lane)
 })

@@ -787,7 +787,7 @@ function deliveryKey(notif: { method: string; params: unknown }): string {
 }
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
-  if (!consumptionCheckAvailable) { maybeAutoAckScheduled(notif); return }
+  if (!consumptionCheckAvailable) { maybeAutoAckScheduled(fleetRunId(notif)); return }
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
   recentDeliveries.push({ notif, at: Date.now(), pendingPath: null })
   if (recentDeliveries.length > 200) recentDeliveries.shift()
@@ -839,7 +839,7 @@ function sweepDeliveries(): void {
       if (d.pendingPath) {
         try { rmSync(d.pendingPath); log('info', `late consumption — retracted re-persisted dup ${d.pendingPath} (issue #13)`) } catch {}
       }
-      maybeAutoAckScheduled(d.notif)
+      maybeAutoAckScheduled(fleetRunId(d.notif))
       recentDeliveries.splice(i, 1)
     } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
@@ -1076,14 +1076,17 @@ function meshAuth(): Record<string, string> {
 // outcome summary must be authored). Inbox daemons only; fire-and-forget; the
 // ack endpoint 409s on repeats so multi-session broadcast double-acks are noise.
 const autoAckedRuns = new Set<string>()
-function maybeAutoAckScheduled(notif: { method: string; params: unknown }): void {
+/** the fleet's single-session path (not lanes; unchanged): the run id of a scheduler wake-up, from its meta or its [scheduled][tag][run:N] head */
+function fleetRunId(notif: { method: string; params: unknown }): string | undefined {
+  const p = (notif?.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
+  if (p.meta?.run_id) return String(p.meta.run_id)
+  return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
+}
+function maybeAutoAckScheduled(runId: string | undefined): void {
   if (!INBOX_ONLY) return
   try {
-    const content = (notif.params as { content?: unknown } | undefined)?.content
-    if (typeof content !== 'string') return
-    const m = content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)
-    if (!m) return
-    const rid = m[1]
+    if (!runId || !/^\d+$/.test(runId)) return
+    const rid = runId
     if (!BTCC_API_BASE) return
     if (autoAckedRuns.has(rid)) return
     autoAckedRuns.add(rid)
@@ -3350,6 +3353,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
               ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
               ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
               ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
+              // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
+              ...(body?.run_id != null && /^\d+$/.test(String(body.run_id)) ? { run_id: String(body.run_id) } : {}),
+              ...(typeof body?.frequency === 'string' && body.frequency ? { frequency: String(body.frequency).slice(0, 16) } : {}),
             },
           },
         }
@@ -3363,7 +3369,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         }
         const d = await Lanes.routeRemote(ev)                            // target main: the tg daemon queued it for the main (M1)
         if (!d) broadcastNotification(notification)                       // router unreachable: the fleet path (any open session of this agent)
-        else if (d.target === 'lane') maybeAutoAckScheduled(notification)   // 開工回執: a lane took the scheduled run
+        else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)   // 開工回執: a lane took the scheduled run (its run id from the meta)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
         return

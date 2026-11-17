@@ -47,7 +47,7 @@ export const LANES_ON = process.env.GENESIS_LANES === '1'
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const HOP_LIMIT = Number(process.env.LANES_HOP_LIMIT ?? 6)
 import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp } from './lanes-digest.ts'
-import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, outcomeFingerprint, runIdOfText, sameOutcome, simTime } from './lanes-followup.ts'
+import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, outcomeFingerprint, sameOutcome, simTime } from './lanes-followup.ts'
 
 const MAX_RUNNING = Number(process.env.LANES_MAX ?? 4)
 // 002l (D1, D7): design/identity rule 6 「每個對話有轉手次數上限與 token 預算，超過就停、升級主線」: the budget is per conversation (thread) and counts the
@@ -264,6 +264,8 @@ function mainEnv() {
     },
     menu: async (drive = false) => { const m = await inspectMainMenu(drive, drive ? 'main-probe' : 'main-stuck'); return m ? (drive ? menuSentence(m) : `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。`) : null },
     context: mainContext,
+    // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
+    memory: () => ({ proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text })), curator: !!S?.curator }),
   }
 }
 
@@ -1722,7 +1724,7 @@ function pump(): void {
 // answer. Only a peer's ordinary mesh messages: a scheduled run, an alert, a critical event, a fan-out part or a system event keeps
 // its own run (each has its own receipt, deadline or result).
 function coalescible(e: InEvent): boolean {
-  return e.source === 'mesh' && !e.synthetic && !e.fanout && !/^\s*\[scheduled\]/.test(e.text) && e.from !== 'alert-dispatcher' && e.from !== 'scheduler' && e.from !== 'main'
+  return e.source === 'mesh' && !e.synthetic && !e.fanout && !e.meta?.run_id && e.from !== 'alert-dispatcher' && e.from !== 'scheduler' && e.from !== 'main'
 }
 function coalesce(it: QItem, waiting: QItem[]): void {
   if (!coalescible(it.ev) || it.attempts > 0) return
@@ -2417,10 +2419,11 @@ function openLaneEvent(ev: InEvent, lane: Lane): void {
   const cls = evClassOf(ev, lane)
   const obs: any[] = []
   const task = !!ev.fanout || lane.kind === 'curator' || lane.kind === 'synthesis'     // a fan-out part reports to its synthesis, a curator to the main: policy, not Joey
-  const hf = cls === 'scheduled' && /^\s*\[scheduled\](?:\[[^\]]*\])*\[high-frequency\]/i.test(ev.text)   // the scheduler's own tag (router table field)
+  // PL5: the scheduler's run id and frequency travel as event meta (the /inject body's run_id and frequency): no text is parsed for them
+  const hf = cls === 'scheduled' && String(ev.meta?.frequency ?? '').toLowerCase() === 'high'
   if (!task && !hf) obs.push({ kind: 'joey', level: 'line', ...(cls === 'critical' ? { ring: true, due_at: Date.now() + (S.wall ? 0 : CRITICAL_DEADLINE_MS) } : {}) })
   if (ev.source === 'mesh' && cls === 'peer' && !ev.no_reply && !ev.synthetic && ev.from && ev.from !== 'main') obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase() })
-  const run = cls === 'scheduled' ? runIdOfText(ev.text) : null
+  const run = cls === 'scheduled' && ev.meta?.run_id ? String(ev.meta.run_id) : null
   if (run) obs.push({ kind: 'receipt', level: 'run', run_id: run })
   // 002k (B2), PL1: a critical alert is marked for the main once, when its event opens: `must_know` is a field of its record (the digest renders the mark)
   events.open(ev.id, { class: cls, owner: lane.id, obligations: obs, thread: lane.thread, lane: lane.id, from: ev.from, text: ev.text,
