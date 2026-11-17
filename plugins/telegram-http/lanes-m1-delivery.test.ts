@@ -51,7 +51,7 @@ async function joey(text: string): Promise<string> {
 const state = (id: string) => M().items(r => r.id === id)[0]?.state
 const P = () => `p-${++np}`
 
-test('002n: a turn that ends in StopFailure never makes its item done: back to queued, the gen walled, nothing offered behind the wall; after the wall: offered once, done on Stop', async () => {
+test('002n, PL4: a turn that ends in StopFailure never makes its item done: back to queued, the gen walled (its own wall), nothing offered before its retry time; then offered once (the probe), done on Stop', async () => {
   const g = await startMain()
   const id = await joey('發票 4471 付了嗎？')
   expect(state(id)).toBe('offered'); expect(offers.at(-1)!.notif.params.meta.did).toContain(id)
@@ -61,13 +61,14 @@ test('002n: a turn that ends in StopFailure never makes its item done: back to q
   await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: "API Error: Request rejected (429) · You've hit your weekly limit" })
   expect(state(id)).toBe('queued')
   expect(linesOf('msg', id).at(-1)).toMatchObject({ state: 'queued', reason: 'stop_failure:rate_limit' })
-  expect(M().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(true)
+  expect(M().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(false)              // PL4: the main's wall is its own record, not the lanes'
   const k = offers.length
   await M().pump(); await M().tick()
-  expect(offers.length).toBe(k)                                                          // a walled gen is offered nothing
-  expect(sent.filter(s => s.includes('額度')).length).toBe(1)                            // Joey: one line for the wall
-  await L.__wallDown()
+  expect(offers.length).toBe(k)                                                          // a walled gen is offered nothing before its retry time
   await sleep(20)
+  expect(sent.filter(s => s.includes('額度')).length).toBe(1)                            // Joey: one line for the wall
+  L.__journal().write('main', String(g.pid), 'walled', { retry_at: Date.now() - 1 })      // its retry time comes
+  await M().tick()
   expect(offers.length).toBe(k + 1); expect(offers.at(-1)!.notif.params.meta.did).toContain(id)    // offered again, once
   const p2 = P()
   await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] })
@@ -144,13 +145,14 @@ test('002h/002i: an offer is written only into a stream that can take it: no str
   await kill(g)
 })
 
-test('002l N6: behind the wall a new gen is walled from its SessionStart: the session-open replay of the old code has no counterpart; offered after the wall', async () => {
+test('002l N6, PL4: a new gen is a new main signal: behind the lanes\' wall it starts idle and is offered once (the old session-open replay has no counterpart)', async () => {
   L.__wallUp('rate_limit', 'weekly limit')
   const id = await joey('週報好了嗎')
+  expect(state(id)).toBe('queued')                                                       // no main yet
   const g = await startMain()
-  expect(M().mainPhase()).toBe('walled'); expect(state(id)).toBe('queued')
+  expect(M().mainPhase()).toBe('idle'); expect(state(id)).toBe('offered')
   await L.__wallDown(); await sleep(20)
-  expect(state(id)).toBe('offered')
+  expect(state(id)).toBe('offered')                                                      // once
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
   await kill(g)
 })
@@ -255,7 +257,8 @@ test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the sa
   expect(state(id)).toBe('queued'); expect(linesOf('msg', id).at(-1)).toMatchObject({ reason: 'stop_failure:server_error' })
   expect(ob().state).toBe('open')
   expect(linesOf('msg', id).map(l => l.state)).toEqual(['queued', 'offered', 'bound', 'done', 'bound', 'queued'])
-  await L.__wallDown(); await sleep(20)
+  expect(M().mainPhase()).toBe('idle')                                                      // PL4 P12: a 529 is not a wall: the gen is idle, the next offer is the retry
+  await M().tick()
   expect(state(id)).toBe('offered')
   const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
   expect(state(id)).toBe('done'); expect(ob().state).toBe('met')

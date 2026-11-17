@@ -240,11 +240,11 @@ function mainEnv() {
     done: itemDone,
     undone: itemUndone,
     tellJoey: (text: string, rule: string) => {
+      if (rule === 'main-wall-up' || rule === 'main-wall-down') { const g = main?.currentGen(); logos(`lane.${rule.replace(/-/g, '_')}`, { gen: g?.id ?? null, kind: g?.kind ?? null, since: g?.wall_since ?? null }) }   // PL4: the main's own wall
       ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
       void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
     },
-    wallUp: (kind: string, text: string, by: string) => wallUp({ kind, text }, by),
-    wallActive: () => !!S?.wall,
+    wallBackoff: (kind: string, probes: number) => wallBackoffMs(kind, probes),
     expectedSession: (): string[] => {
       let expected = ''
       try { expected = readFileSync(join(LANES_DIR, 'main-expected'), 'utf8').trim() } catch {}
@@ -262,7 +262,7 @@ function mainEnv() {
       for (const [s] of mcpSessionPid) { try { D.toolsChanged?.(s) } catch {} }
       logos('lane.main_gen', { pid, role: D.role })
     },
-    menu: async () => { const m = await inspectMainMenu(false, 'main-stuck'); return m ? `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。` : null },
+    menu: async (drive = false) => { const m = await inspectMainMenu(drive, drive ? 'main-probe' : 'main-stuck'); return m ? (drive ? menuSentence(m) : `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。`) : null },
     context: mainContext,
   }
 }
@@ -1544,15 +1544,13 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
     armProbe(next + 30)
     return
   }
-  // one wall for the account: the lanes and the main share it (M2 walled), one notice up and one down
+  // PL4: the LANES' wall (the main's is its own M2 record, moved only by the main's hooks): one notice up and one down
   S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0, told: true }
   saveState()
-  if (!by.startsWith('main')) main?.wallRaised(w.kind)            // M2: the main shares the account's wall
   const waiting = [...queue.values()].filter(i => i.state === 'queued' || i.state === 'leased').length
   const every = Math.max(1, Math.round(WALL_PROBE_MS / 60_000))
   const backoff = wallBackoffMs(w.kind, 1) > WALL_PROBE_MS ? `，還沒恢復就把間隔加倍（最多 ${Math.round(wallBackoffMs(w.kind, 99) / 60_000)} 分鐘）` : ''
-  const who = by.startsWith('main') ? '主線' : '車道'
-  const text = `${who}${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工（排隊 ${waiting} 件），給主線的訊息也先保留，一件都沒有丟。我 ${every} 分鐘後自動試一次${backoff}，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
+  const text = `車道${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工（排隊 ${waiting} 件），一件都沒有丟。我 ${every} 分鐘後自動試一次${backoff}，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
   logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting })
   ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
@@ -1609,7 +1607,7 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
 
 // ------------------------------------------------------------------ 002k (G16, 002j group G): a main parked on a menu reads nothing
 // The limit menu is a TUI state no hook reports, so it stays one pane read:
-//  (a) when the shared wall comes down and the main was walled, the main's pane is looked at before anything is offered to it. A menu there is driven
+//  (a) before the walled main's probe offer (M1, PL4), the main's pane is looked at, before anything is offered to it. A menu there is driven
 //      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that CONTINUES or WAITS, never to one that spends money
 //      or changes the plan; with no safe option, or when it did not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
 //  (b) an idle main that does not take its offer is the M2 stuck rule (lanes-main.ts); the pane is read for that notice;
@@ -1660,13 +1658,9 @@ async function wallDown(by: string): Promise<void> {
   delete S.wall; saveState()
   if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
   setTimeout(pump, 20)
-  const walledMain = main?.mainPhase() === 'walled'
-  const menu = walledMain ? await inspectMainMenu(true, 'wall-down') : null       // 002k (G16a): a menu the main is parked on is dealt with BEFORE anything is offered to it
-  main?.wallLifted()                                                                // M2: walled → idle; M1 offers what was queued
   const waiting = [...queue.values()].filter(i => i.state === 'queued').length
-  const owed = main ? main.items(r => r.state === 'queued' && r.kind !== 'digest').length : 0
-  const text = `模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件車道事件現在開始處理${owed ? `，等主線的 ${owed} 則交給主線` : ''}。${menu ? menuSentence(menu) : ''}`
-  logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting, main_items: owed, menu: menu ? { options: menu.options, chose: menu.chose?.label ?? null, result: menu.result ?? null } : null })
+  const text = `車道的模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件車道事件現在開始處理。`
+  logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting })
   ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-down', message_id: id }))
 }

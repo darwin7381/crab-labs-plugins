@@ -94,11 +94,22 @@ Fields:
 | `starting` | `SessionStart` accepted; the tg daemon has no open MCP stream of this process yet (the main moves to `idle` when the SDK holds its GET stream) |
 | `idle` | can be offered one item |
 | `in_turn` | inside a turn: `prompt_id`; `tool_open` is set between PreToolUse and PostToolUse |
-| `walled` | the account's model wall is up: `kind` is the StopFailure error (`rate_limit`, `server_error`, ...), or the kind of the lane wall |
+| `walled` | the MAIN's own wall: its turn ended in a StopFailure of an account kind (`kind`: `rate_limit`, `billing_error`, `account_on_hold`, `authentication_failed`, `oauth_org_not_allowed`, `cloud_credential_error`) |
 | `gone` | `end_reason`: `asked` (/restart, /kill_stuck), `killed` (`kill -0` failed), `exited` (SessionEnd), or `replaced` (another process took the role, or /main renew) |
 
 Other fields: `pid`, `session_id`, `transcript_path` (recorded, never read for state), `source`, `error`, and `stopped_prompt` on an `idle` gen: the
 prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop").
+
+**The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
+- An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once
+  (`main-wall-up`). Any other StopFailure (`server_error`, an overload, `unknown`) does not wall: the turn's items queue again, the gen is `idle`
+  with `error`, and the next offer is the retry.
+- At `retry_at` M1 offers the walled gen one item: its probe (a limit menu on its pane is driven first, and Joey is told what was chosen,
+  `main-menu`). The gen leaves `walled` only on its own next hook event (the probe's UserPromptSubmit, or a SessionStart). A StopFailure in that
+  turn is the same episode: `probes` + 1, a longer `retry_at`, no new notice. The episode ends at the gen's next final Stop: `wall_since`,
+  `probes` and `retry_at` are cleared and Joey is told once (`main-wall-down`).
+- A new gen starts `idle` or `starting`, whatever the lanes' wall says.
+- `turn_started` is not used; the turn's start is the `in_turn` line's `ts`.
 
 ### `event` (M3): one record per inbound event
 
@@ -331,8 +342,9 @@ Stop").
 
 ## Stuck (疑似卡死)
 
-This is M2 only. The tg daemon checks every 5 s. A gen owes a hook event while a turn is open (`in_turn`) or while an item offered to it is not
-bound yet (`idle` with an `offered` item). It is stuck when it owes one and has sent none for `LANES_MAIN_STUCK_MS` (default 600 s); the silence counts
+This is M2 only. The tg daemon checks every 5 s. A gen owes a hook event while a turn is open with no tool running (`in_turn`, no `tool_open`) or
+while an item offered to it is not bound yet (`idle` or `walled` with an `offered` item). An open tool call is work, not silence (P14): its
+PostToolUse is the event the gen owes when the tool ends, and Claude Code bounds a tool by its own timeout. It is stuck when it owes one and has sent none for `LANES_MAIN_STUCK_MS` (default 600 s); the silence counts
 from its last hook event, or from the offer when that came later.
 - One alarm per episode. For an idle gen the limit-menu pane read says whether a menu is the reason.
 - The next hook event of the gen clears it, and Joey is told once. A later silence is a new episode.

@@ -4,6 +4,9 @@
  * M2. The main is one record per process ("gen", id = its pid): starting | idle | in_turn(prompt_id, tool_open) | walled(kind) | gone(end_reason).
  *     It moves only on the main's own hook events (lanes-hooks/main-hook.py posts every one of them to /lanes/main-event) and on one
  *     `kill -0` of its pid (SIGKILL fires no hook). Nothing reads the transcript.
+ *     The main's wall is ITS record (PL4): an account-kind StopFailure walls it and starts a wall episode (wall_since); it leaves `walled` only on its
+ *     own next hook event, and the episode ends at its next Stop. The lanes' wall (lanes.ts S.wall) is another record and never moves this one.
+ *     A walled gen is offered one item when its retry time comes (its probe): that offer is how the main's own hook events resume.
  * M1. One record per item meant for the main: queued → offered(gen) → bound(gen, prompt_id) → done.
  *     The one rule: an item is done only when the turn it was bound to ends with Stop. StopFailure, or the end of its gen, puts it back
  *     to queued for the next idle gen. A turn of a prompt ends at its LAST Stop: other Stop hooks (the user's, run in parallel with ours)
@@ -37,9 +40,8 @@ export type MainEnv = {
   undone: (item: Row) => void
   /** a line to Joey from the router (push), with the rule that sent it */
   tellJoey: (text: string, rule: string) => void
-  /** the shared model wall (one record for the lanes and the main) */
-  wallUp: (kind: string, text: string, by: string) => void
-  wallActive: () => boolean
+  /** the backoff before the walled main's next probe offer (ms), after `probes` failed ones */
+  wallBackoff?: (kind: string, probes: number) => number
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
   pidAlive: (pid: number) => boolean
@@ -47,8 +49,9 @@ export type MainEnv = {
   refused: (sid: string, pid: number | null, reason: string) => void
   /** the main process changed (the MCP sessions of the old one lose the main's tools) */
   genChanged: (pid: number | null) => void
-  /** the limit-menu pane read (a TUI state no hook reports): a sentence for Joey, or null */
-  menu?: () => Promise<string | null>
+  /** the limit-menu pane read (a TUI state no hook reports): a sentence for Joey, or null. drive = choose the option that waits or continues (the
+   *  walled main's probe: a menu it is parked on is dealt with before anything is offered to it) */
+  menu?: (drive?: boolean) => Promise<string | null>
   /** the registration context an accepted main gets */
   context: (agent: string, sid: string) => string
 }
@@ -66,6 +69,8 @@ const num = (k: string, d: number): number => { const n = Number(process.env[k] 
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
 export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
 const BODY_MAX = 4000
+const WALL_WORD: Record<string, string> = { rate_limit: '模型額度用完了', authentication_failed: '模型登入失效', billing_error: '模型帳務出錯', account_on_hold: '模型帳號被暫停',
+  oauth_org_not_allowed: '模型帳號不被允許', cloud_credential_error: '模型憑證出錯' }
 
 
 export type MainApi = ReturnType<typeof createMain>
@@ -148,10 +153,20 @@ export function createMain(E: MainEnv) {
   }
   async function offerNext(): Promise<void> {
     const g = currentGen()
-    if (!g || g.state !== 'idle') return
+    if (!g) return
+    // PL4: a walled gen is offered one item when its retry time comes: its probe. Its own hook events then take it out of `walled` (and a
+    // StopFailure walls it again, with a longer backoff). A limit menu it is parked on is driven first (002k G16a).
+    const probe = g.state === 'walled' && Date.now() >= Number(g.retry_at ?? Infinity)
+    if (g.state !== 'idle' && !probe) return
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     const it = items(r => r.state === 'queued' && owed(r) && forGen(r, g))[0]
     if (!it) return
+    if (probe) {
+      const menu = E.menu ? await E.menu(true).catch(() => null) : null
+      if (menu) E.tellJoey(menu, 'main-menu')                                         // what was chosen (or that Joey must choose), once per probe that found a menu
+      const w = J().get('main', g.id)!
+      setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)) })   // one probe offer per retry time
+    }
     const dg = attachInfo()
     const ids = [it.id, ...(dg ? [dg.id] : [])]
     const p = (it.notif?.params ?? {}) as Record<string, any>
@@ -165,7 +180,7 @@ export function createMain(E: MainEnv) {
       return
     }
     for (const id of ids) J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
-    J().write('wake', it.id, 'wake', { reason: `main idle (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
+    J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
   }
 
   /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary */
@@ -236,7 +251,10 @@ export function createMain(E: MainEnv) {
     for (const r of back) { J().write('msg', r.id, 'bound', { reason: 'turn_continued' }); try { E.undone(J().get('msg', r.id)!) } catch (e) { E.log('warn', `lanes: undone hook ${r.id}: ${e}`) } }
     E.log('info', `lanes: main gen ${g.id}: turn ${prompt} went on after its Stop (another Stop hook held it); ${back.length} item(s) bound again`)
   }
-  const wallErrors = new Set(['rate_limit', 'authentication_failed', 'billing_error', 'oauth_org_not_allowed', 'account_on_hold', 'server_error', 'cloud_credential_error'])
+  /** PL4: the StopFailure kinds that wall the main: the account cannot be used (quota, billing, hold, login). Any other error (server_error, an
+   *  overload, unknown) ends the turn: its items queue again and the gen is idle; the next offer is the retry. */
+  const ACCOUNT_WALL = new Set(['rate_limit', 'billing_error', 'account_on_hold', 'authentication_failed', 'oauth_org_not_allowed', 'cloud_credential_error'])
+  const backoff = (kind: string, probes: number): number => E.wallBackoff ? E.wallBackoff(kind, probes) : Math.min(1_800_000, 300_000 * 2 ** Math.min(20, probes))
 
   /** /lanes/main-event: every hook event of the main. The reply is what the hook prints. */
   async function mainEvent(b: MainEvent): Promise<MainReply> {
@@ -273,7 +291,9 @@ export function createMain(E: MainEnv) {
         }
         finish(r => r.gen === g.id && r.prompt_id === p)
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
-        setMain(J().get('main', g.id)!, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p })
+        const was = J().get('main', g.id)!, since = was.wall_since as string | undefined
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, probes: null, retry_at: null, kind: null } : {}) })
+        if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
         void pump()
         return {}
       }
@@ -282,9 +302,13 @@ export function createMain(E: MainEnv) {
         const err = String(b.error ?? 'unknown')
         const back = requeue(r => r.gen === g.id && (!p || r.prompt_id === p), `stop_failure:${err}`)
         if (p) outputs.delete(p)
-        // every API error ends the turn without Stop; a wall kind holds the main until the shared probe gets through
-        setMain(J().get('main', g.id)!, 'walled', { kind: wallErrors.has(err) ? err : 'error', error: err, prompt_id: null, tool_open: null, stopped_prompt: null })
-        E.wallUp(wallErrors.has(err) ? err : 'error', String(b.reason ?? err).slice(0, 200), `main:${back.length}`)
+        const cur = J().get('main', g.id)!
+        if (!ACCOUNT_WALL.has(err)) { setMain(cur, 'idle', { error: err, prompt_id: null, tool_open: null, stopped_prompt: null }); return {} }   // not a wall: idle, the item is offered again
+        // the main's own wall: one episode (wall_since) until its next Stop; each failed probe backs off
+        const first = !cur.wall_since, probes = first ? 0 : Number(cur.probes ?? 0) + 1
+        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), probes,
+          retry_at: Date.now() + backoff(err, probes) })
+        if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}
       }
       case 'SessionEnd': endGen(g, pendingEnd.get(g.id) ?? 'exited'); return {}
@@ -306,7 +330,7 @@ export function createMain(E: MainEnv) {
     const same = currentGen()
     if (same && same.state === 'in_turn' && same.prompt_id) requeue(r => r.gen === same.id && r.prompt_id === same.prompt_id, 'session_start')
     const id = String(pid)
-    J().write('main', id, E.wallActive() ? 'walled' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null })
+    J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null })
     cur = id
     lastEventAt.set(id, Date.now())
     E.log('info', `lanes: main gen ${id} (session ${sid}, ${b.source ?? 'startup'})`)
@@ -320,18 +344,6 @@ export function createMain(E: MainEnv) {
     if (g && Number(g.pid) === pid && g.state === 'starting') setMain(g, 'idle')
     void pump()
   }
-  /** the shared wall went up (a lane run hit it): an idle main is walled too (same account); a main in a turn meets it itself (StopFailure) */
-  function wallRaised(kind: string): void {
-    const g = currentGen()
-    if (g && (g.state === 'idle' || g.state === 'starting')) setMain(g, 'walled', { kind, error: null })
-  }
-  /** the shared wall came down: a walled main is idle again */
-  function wallLifted(): void {
-    const g = currentGen()
-    if (g && g.state === 'walled') setMain(g, E.streamOpen(Number(g.pid)) ? 'idle' : 'starting', { kind: null, error: null })
-    void pump()
-  }
-
   /** every few seconds: kill -0 (SIGKILL fires no hook), the stuck rule, and a pump (an item no stream could take is still queued) */
   async function tick(now = Date.now()): Promise<void> {
     if (!E) return
@@ -342,15 +354,18 @@ export function createMain(E: MainEnv) {
       // from its last hook event, or from the offer when that came later. One alarm per episode; the next hook event clears it (mainEvent).
       const offered = items(r => r.state === 'offered' && r.gen === g.id)
       const offeredAt = offered.length ? Math.min(...offered.map(r => Date.parse(r.ts))) : 0
-      const owes = g.state === 'in_turn' || (g.state === 'idle' && offered.length > 0)
+      // P14 (decided in PL4): an open tool call is work, not silence: its PostToolUse is the event the gen owes when the tool ends (Claude Code bounds a
+      // tool by its own timeout; a dead process is kill -0's). Silence counts while the model owes the next event: a turn with no tool open, or an
+      // offer not taken (idle, or walled with its probe offer)
+      const owes = (g.state === 'in_turn' && !g.tool_open) || ((g.state === 'idle' || g.state === 'walled') && offered.length > 0)
       const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt)
       if (owes && now - since > MAIN_STUCK_MS) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         const queued = items(r => r.state === 'queued' && owed(r)).length + offered.length
-        const menu = g.state === 'idle' && E.menu ? await E.menu().catch(() => null) : null
+        const menu = g.state !== 'in_turn' && E.menu ? await E.menu(false).catch(() => null) : null
         const mins = Math.max(1, Math.round((now - since) / 60_000))
         E.tellJoey(g.state === 'in_turn'
-          ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜${g.tool_open ? `（停在工具 ${g.tool_open}）` : ''}。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
+          ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
           : `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它。`, 'main-stuck')
       }
     }
@@ -358,7 +373,7 @@ export function createMain(E: MainEnv) {
   }
 
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, wallRaised, wallLifted, tick,
+  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick,
     items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

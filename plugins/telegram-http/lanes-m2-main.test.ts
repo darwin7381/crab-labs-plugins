@@ -157,36 +157,74 @@ test('002l N7: a turn cut right after it took a channel message in (before any t
   expect(state(id)).toBe('queued')
 })
 
-test('002l N6 / D12: the main\'s StopFailure and a lane run behind the same limit are ONE wall and ONE notice; one notice when it comes down', async () => {
-  const g = await startMain()
-  const k = sent.length
-  const p = P()
-  await hook(g, 'UserPromptSubmit', { prompt_id: p })
-  await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: 'API Error: Request rejected (429)' })
-  expect(M().mainPhase()).toBe('walled'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', kind: 'rate_limit', error: 'rate_limit' })
-  L.__wallUp('usage', 'lane result 429', 'adam.reflex.3.r1')                                   // a lane run hits the same wall: a probe, not a second notice
-  await sleep(10)
-  expect(sent.slice(k).filter(s => s.includes('額度')).length).toBe(1)
-  await L.__wallDown(); await sleep(10)
-  expect(M().mainPhase()).toBe('idle')
-  expect(sent.slice(k).filter(s => s.includes('模型恢復了')).length).toBe(1)
-  await killed(g)
-})
-
-test('a lane run that hits the wall walls an idle main as well (one account): nothing is offered to it until the wall comes down', async () => {
+// PL4 (AUD P11/P13/P12, T7-R, T6-R, T8-R, G07): the main's wall and the lanes' wall are two records. M2's moves only on the main's own hook events.
+const wallLines = (g: Gen) => mainLines(g.pid).filter(l => l.state === 'walled')
+test('PL4 P11/P13 (T7-R 1247.3): the lanes\' wall going up or down never moves the main: a walled main stays walled, an idle main stays idle', async () => {
   await drained()
   const g = await startMain()
-  L.__wallUp('rate_limit', 'lane 429', 'adam.reflex.4.r1')
-  expect(M().mainPhase()).toBe('walled')
+  const k = sent.length
+  L.__wallUp('rate_limit', 'lane 429', 'adam.reflex.4.r1')                                   // P13: a lane's wall does not wall an idle main
+  expect(M().mainPhase()).toBe('idle')
   const id = await joey('有空嗎')
-  expect(state(id)).toBe('queued')
-  await L.__wallDown(); await sleep(10)
-  expect(state(id)).toBe('offered')
-  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(id)).toBe('offered')                                                           // it is offered: the main has its own wall, and none
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: 'API Error: Request rejected (429)' })
+  expect(M().mainPhase()).toBe('walled'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', kind: 'rate_limit', probes: 0 })
+  expect(mainLines(g.pid).at(-1).wall_since).toBeTruthy(); expect(state(id)).toBe('queued')
+  await L.__wallDown('adam.reflex.4.r1'); await sleep(20)                                      // P11: a lane run gets through: the LANES' wall comes down ...
+  expect(M().mainPhase()).toBe('walled'); expect(state(id)).toBe('queued')                    // ... and the main is not taken out of its own (no main signal)
+  expect(sent.slice(k).filter(s => s.includes('主線額度') || s.includes('主線模型額度')).length).toBe(1)   // one main-wall-up notice
+  expect(sent.slice(k).filter(s => s.includes('主線恢復')).length).toBe(0)
   await killed(g)
 })
 
-test('002k G03 / SR3: a turn with no hook event for MAIN_STUCK_MS is 疑似卡死: one alarm (it names the open tool), cleared by the next event', async () => {
+test('PL4: the walled main is offered one item at its retry time (its probe); it leaves walled on its own hook event; a second StopFailure is the same episode (no notice, longer backoff); its Stop ends the episode with one notice', async () => {
+  await drained()
+  L.__setWallProbe(40)
+  const g = await startMain()
+  const k = sent.length
+  const id = await joey('今天的報告呢？')
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: '429' })
+  expect(state(id)).toBe('queued')
+  await M().pump(); expect(state(id)).toBe('queued')                                           // not before its retry time
+  await sleep(60); await M().tick()
+  expect(state(id)).toBe('offered'); expect(M().mainPhase()).toBe('walled')                  // the probe offer: still walled until the main itself moves
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] })
+  expect(M().mainPhase()).toBe('in_turn')                                                     // its own hook event
+  await hook(g, 'StopFailure', { prompt_id: p2, error: 'rate_limit', reason: '429' })
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', probes: 1 })
+  expect(mainLines(g.pid).at(-1).retry_at - Date.now()).toBeGreaterThan(40)                  // backed off
+  await sleep(120); await M().tick()
+  expect(state(id)).toBe('offered')
+  const p3 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p3, dids: [id] }); await hook(g, 'Stop', { prompt_id: p3, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(M().mainPhase()).toBe('idle')
+  expect(mainLines(g.pid).at(-1).wall_since).toBeNull()                                         // the episode is over (cleared)
+  await sleep(20)
+  expect(sent.slice(k).filter(s => s.startsWith('〔adam·分流器〕\n主線模型額度用完了')).length).toBe(1)   // one up ...
+  expect(sent.slice(k).filter(s => s.includes('主線恢復了')).length).toBe(1)                  // ... one down, for one episode
+  L.__setWallProbe(3_600_000)
+  await killed(g)
+})
+
+test('PL4 P12: a StopFailure that is not an account kind (server_error, unknown) does not wall the main: the items queue again, the gen is idle, the next offer is the retry; no wall notice', async () => {
+  await drained()
+  const g = await startMain()
+  const k = sent.length
+  const id = await joey('幫我查一下')
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'server_error', reason: '529 overloaded' })
+  expect(M().mainPhase()).toBe('idle'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'idle', error: 'server_error' })
+  expect(state(id)).toBe('queued')
+  await M().tick(); expect(state(id)).toBe('offered')
+  expect(L.wallActive()).toBe(false)                                                          // nor does it raise the lanes' wall
+  expect(sent.slice(k).some(s => s.includes('額度') || s.includes('無法使用'))).toBe(false)
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done')
+  await killed(g)
+})
+
+test('002k G03 / SR3, P14: a turn with no hook event for MAIN_STUCK_MS is 疑似卡死: one alarm, cleared by the next event; an open tool call is work, not silence', async () => {
   __setMainStuckMs(40)
   const g = await startMain()
   const p = P()
@@ -195,9 +233,12 @@ test('002k G03 / SR3: a turn with no hook event for MAIN_STUCK_MS is 疑似卡�
   expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'in_turn', tool_open: 'Bash' })
   const k = sent.length
   await sleep(60); await M().tick(); await M().tick()
-  await sleep(10)
-  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1); expect(sent.slice(k).find(s => s.includes('疑似卡死'))).toContain('Bash')
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(0)                   // P14 (G02 r1: a 2-minute Bash): no alarm while the tool runs
   await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
+  await sleep(60); await M().tick(); await M().tick()
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(1)
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Read' })
   await sleep(10)
   expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
   __setMainStuckMs(stuck0)
@@ -262,9 +303,9 @@ test('D3, a second episode: after the alarm cleared, a new silence with an open 
   await hook(g, 'UserPromptSubmit', { prompt_id: p })
   const k = sent.length
   g.proc.kill('SIGSTOP'); await sleep(60); await M().tick(); await M().tick()
-  g.proc.kill('SIGCONT'); await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
-  g.proc.kill('SIGSTOP'); await sleep(60); await M().tick(); await M().tick()
-  g.proc.kill('SIGCONT'); await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
+  g.proc.kill('SIGCONT'); await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' }); await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
+  g.proc.kill('SIGSTOP'); await sleep(60); await M().tick(); await M().tick()                // a new silence with no tool open (P14)
+  g.proc.kill('SIGCONT'); await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Read' })
   await sleep(10)
   expect(sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(2)
   expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(2)

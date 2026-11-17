@@ -36,6 +36,7 @@ const NORMAL = '\n ╭───────────────╮\n │ > \
 const SAFE = ['Wait here, then continue automatically at 5:48 PM', 'Upgrade your plan', 'Don’t continue automatically']
 const state = { pane: NORMAL, drives: [] as Array<{ idx: number; key: string }>, rearms: 0, driveResult: 'ok' as 'ok' | 'gone' | 'stuck', clears: true }
 const deps: any = { role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve'],
+  notifySession: async () => { order.push('offer'); return true }, streamOpen: () => true,                       // the main's MCP stream (PL4: the probe is an offer)
   sweepNow: () => { sweeps++; order.push('sweep') }, sendBot: async (_c: string, text: string) => { sent.push(text); return 7000 + sent.length }, joeyChatId: () => '1',
   mainPicker: { capture: async () => state.pane, detect: detectStartupPicker,
     drive: async (idx: number, key: string) => { state.drives.push({ idx, key }); order.push('drive'); if (state.driveResult === 'ok' && state.clears) state.pane = NORMAL; return state.driveResult },
@@ -52,21 +53,25 @@ const apiErr = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), isAp
 const turnEnd = (ms: number) => rec({ type: 'system', subtype: 'turn_duration', timestamp: iso(ms) })
 const genuine = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'end_turn', content: [{ type: 'text', text: '好' }] } })
 const toolUse = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'tuX', name: 'Bash', input: { command: 'make report' } }] } })
-/** wall up (a newer error record in the main's transcript), then the probe gets through: returns the Joey notice that follows */
-/** M2: the main's turn ends in StopFailure rate_limit (the shared wall goes up), then the probe gets through and the wall comes down */
+/** PL4: the main's turn ends in StopFailure rate_limit (ITS wall: the lanes' wall is another record); at its retry time the probe offer comes, and a menu
+ *  on its pane is dealt with BEFORE that offer; the main takes the offer and its Stop ends the episode. Returns what Joey was told meanwhile. */
+let cyc = 0
 async function wallCycle(): Promise<string> {
   const k = sent.length
-  L.__setClaudeBin(WALLED)
   const pid = L.__main().mainPid()!, p = `p-${Math.random().toString(36).slice(2)}`
-  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p })
+  const meta = { chat_id: '1', message_id: String(5000 + ++cyc), user: 'joey_lab' }
+  await L.routeEvent({ id: `tg-1-${meta.message_id}`, source: 'telegram', from: 'joey', text: '在嗎', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '在嗎', meta } } } as any)
+  const item = L.__main().items(r => r.event === `tg-1-${meta.message_id}`)[0]
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p, dids: [item.id] })
   await L.__mainEvent({ event: 'StopFailure', pid, prompt_id: p, error: 'rate_limit', reason: LIMIT })
-  expect(L.__main().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(true)
+  expect(L.__main().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(false)                // its own wall, not the lanes'
   state.drives = []; state.rearms = 0; order.length = 0
-  L.__setClaudeBin(OK)
-  expect(await until(() => !L.wallActive())).toBe(true)
-  expect(await until(() => sent.some((s, i) => i >= k && s.includes('模型恢復了')))).toBe(true)
-  expect(L.__main().mainPhase()).not.toBe('walled')                                        // M2: walled → idle when the wall is down
-  return sent.slice(k).find(s => s.includes('模型恢復了'))!
+  expect(await until(() => { void L.__main().tick(); return L.__main().items(r => r.id === item.id)[0].state === 'offered' })).toBe(true)   // the probe offer
+  const p2 = `p-${Math.random().toString(36).slice(2)}`
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p2, dids: [item.id] }); await L.__mainEvent({ event: 'Stop', pid, prompt_id: p2, phase: 'final' })
+  expect(L.__main().mainPhase()).toBe('idle')
+  expect(await until(() => sent.some((s, i) => i >= k && s.includes('主線恢復了')))).toBe(true)
+  return sent.slice(k).join('\n')
 }
 
 test('G16c: a picker is described with its real option labels, not only the count; the generic detector finds the limit menu', () => {
@@ -112,16 +117,15 @@ function resetMain(body: string, pid = process.pid) {
 }
 const quiet = async (deliveredAt: number, now = Date.now()) => L.noteMainDeaf(deliveredAt, now)
 
-test('G16a: wall down with the main on its limit menu: the continue option is driven BEFORE anything is handed to the main, and Joey is told what was chosen', async () => {
+test('G16a, PL4: the walled main\'s probe with the main on its limit menu: the continue option is driven BEFORE anything is offered to it, and Joey is told what was chosen', async () => {
   state.pane = LIMIT_PANE(SAFE); state.driveResult = 'ok'
   const notice = await wallCycle()
   expect(state.drives.length).toBe(1); expect(state.drives[0].idx).toBe(0); expect(state.drives[0].key).toStartWith('generic-')
   expect(notice).toContain('主線停在一個選單'); expect(notice).toContain('2. Upgrade your plan'); expect(notice).toContain('已選「Wait here, then continue automatically at 5:48 PM」'); expect(notice).toContain('它繼續了')
   expect(state.rearms).toBe(0)
   const m = logos.filter(r => r.kind === 'lane.main_menu').at(-1)
-  expect(m).toMatchObject({ why: 'wall-down', chose: { idx: 0 }, result: 'ok', resurfaced: false }); expect(m.options).toEqual(SAFE)   // the labels are in the daemon's record
-  expect(await until(() => !!logos.filter(r => r.kind === 'lane.wall_down').at(-1)?.menu)).toBe(true)
-  expect(logos.filter(r => r.kind === 'lane.wall_down').at(-1).menu).toMatchObject({ chose: 'Wait here, then continue automatically at 5:48 PM', result: 'ok' })
+  expect(m).toMatchObject({ why: 'main-probe', chose: { idx: 0 }, result: 'ok', resurfaced: false }); expect(m.options).toEqual(SAFE)   // the labels are in the daemon's record
+  expect(order[0]).toBe('drive')                                                                   // before the offer
 })
 
 test('G16a: no safe option, a menu that is not about the limit, or a drive that did not take: nothing unsafe is pressed and the menu is put in front of Joey again', async () => {
@@ -140,7 +144,7 @@ test('G16a: no safe option, a menu that is not about the limit, or a drive that 
   expect(state.drives.length).toBe(1); expect(state.rearms).toBe(0); expect(notice).toContain('選單已經不在了')    // answered somewhere else meanwhile: no action, nothing to re-arm
 })
 
-test('G16a: no menu on the pane (or no pane): the wall-down notice is as before', async () => {
+test('G16a: no menu on the pane (or no pane): the main\'s wall notices are as before', async () => {
   state.pane = NORMAL
   let notice = await wallCycle()
   expect(state.drives.length).toBe(0); expect(state.rearms).toBe(0); expect(notice).not.toContain('選單')

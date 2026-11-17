@@ -111,20 +111,25 @@ test('C2: handoff_main while the main is idle is offered at once (one wake); whi
   for (const id of [a, b]) expect((L.__events().get(id)!.obligations as any[]).find(o => o.kind === 'main').state).toBe('met')
 })
 
-test('inv C(4): a walled main gets nothing owed until the wall comes down; then the wake is the offer, once', async () => {
-  L.__wallUp('rate_limit', '429')
+test('inv C(4), PL4: a walled main (its own wall) gets nothing owed until its retry time; then the wake is the probe offer, once; the lanes\' wall never wakes it', async () => {
+  const p0 = P(); await hook('UserPromptSubmit', { prompt_id: p0 }); await hook('StopFailure', { prompt_id: p0, error: 'rate_limit', reason: '429' })
   expect(M().mainPhase()).toBe('walled')
   const k = offers.length
-  const st = L.__lanesState()                                                                 // no lane can run behind the wall: a run that was already going hands over
+  const st = L.__lanesState()                                                                 // a lane run that was already going hands over
   st.lanes['adam.reflex.99'] = { id: 'adam.reflex.99', kind: 'reflex', n: 99, session_id: 's', thread: 'adam#t-99', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   const a = 'ev-m4-walled'
   L.__events().open(a, { class: 'peer', owner: 'adam.reflex.99', lane: 'adam.reflex.99', from: 'eve', text: 'Eve 要權限', obligations: [{ kind: 'peer', level: 'answer', to: 'eve' }] })   // the router recorded it
   await L.callLaneTool({ runId: 'adam.reflex.99.r1', lane: 'adam.reflex.99', evId: a, closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any, 'handoff_main', { text: 'Eve 要權限' })
   expect(offers.length).toBe(k)
   expect(journal().some(l => l.rec === 'wake' && l.id === a && l.state === 'no_wake' && /walled/.test(l.reason))).toBe(true)
-  await L.__wallDown(); await sleep(20)
+  L.__wallUp('rate_limit', 'lane 429'); await L.__wallDown(); await sleep(20)                // the lanes' wall up and down: not the main's signal
+  expect(offers.length).toBe(k); expect(M().mainPhase()).toBe('walled')
+  L.__journal().write('main', String(g.pid), 'walled', { retry_at: Date.now() - 1 })          // its retry time comes
+  await M().tick()
   expect(offers.length).toBe(k + 1); expect(offers.at(-1).params.content).toContain('Eve 要權限')
+  await M().tick(); expect(offers.length).toBe(k + 1)                                         // once
   await mainTurn()
+  expect(M().mainPhase()).toBe('idle')
 })
 
 test('the fan-out synthesis is owed to the main: offered when it is idle, never alone with only information pending', async () => {
