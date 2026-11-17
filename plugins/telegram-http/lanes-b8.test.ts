@@ -3,7 +3,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { isNone, cleanReport, renderDigest } from './lanes-digest.ts'
+import { isNone, cleanReport } from './lanes-digest.ts'
 import { commitmentFromReport } from './lanes-followup.ts'
 const L = await import('./lanes.ts?b8-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -28,14 +28,11 @@ test('B8: no commitment is derived from "無（…）"; a real promise still is'
   expect(commitmentFromReport('答應 Eve 明天 10:00 前回覆逾時設定', 'eve', 'eve')).toMatchObject({ who: 'eve', by: expect.stringContaining('10:00') })
 })
 
-test('B8: a receipt with promised "無（…）" logs no commitment; the digest treats it as no promise', async () => {
+test('B8: a receipt with promised "無（…）" logs no commitment', async () => {
   const st = L.__lanesState()
   st.lanes['adam.reflex.1'] = { id: 'adam.reflex.1', kind: 'reflex', n: 1, session_id: 's', thread: 'adam#t-b8', status: 'running', created: '', last: '', transcript: '', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   st.threads['adam#t-b8'] = { id: 'adam#t-b8', lane: 'adam.reflex.1', peer: 'eve', hops: 1, tokens: 0, created: '', last: '' } as any
   const tok = { runId: 'adam.reflex.1.r1', lane: 'adam.reflex.1', evId: 'ev-b8', closers: [], critical: false, trigger: 'peer', cls: 'peer', escalated: false, pushed: false } as any
   await L.callLaneTool(tok, 'receipt', { outcome: 'done', happened: 'eve 問逾時', did: '回覆 eve：30 秒', promised: '無（只說了「有需要再問」，沒有約時間）', needs_main: '無（不需要主線）' })
   expect(rows().filter(r => r.kind === 'commitment').length).toBe(0)
-  const d = renderDigest(rows() as any)!
-  expect(d.text).toContain('例行')                                  // a routine line: nothing promised, nothing needed
-  expect(d.text).not.toContain('承諾：無（')
 })

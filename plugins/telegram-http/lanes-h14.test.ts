@@ -149,9 +149,8 @@ test('H14: the main\'s peer_hold: all of the peer\'s events are ledger-only (no 
   expect(L.holdLines().join('\n')).toContain('fay：Joey 說不理 fay'); expect(L.holdLines()[0]).toContain('已擋下 30 則')
   // 002m (L6B5): the digest from the hold on (from line 0 it also carried the fourteen escalations earlier tests in this file left, and the 8-line cap
   // counts this row among the threads not listed)
-  writeFileSync(join(dir, 'digest.json'), JSON.stringify({ line: rows('ledger.jsonl').findIndex(r => r.lane === 'main' && String(r.text).includes('主線暫停 fay')) }))
-  const d = L.__digest()!
-  expect(d.text).toContain('暫停中的同事'); expect(d.text).toContain('fay'); expect(d.text).toContain('主線暫停 fay')
+  const d = L.__digest()!                                                                     // the hold is a line of every digest while it lasts
+  expect(d.text).toContain('• fay：Joey 說不理 fay')
   expect(L.__main().items(r => r.kind === 'handoff' && /fay/.test(String(r.notif?.params?.content))).length).toBe(0)   // a hold never wakes the main
   L.floodTick(Date.now() + 40 * 60_000)                                                    // 30 minutes are up
   const end = rows('ledger.jsonl').find(r => r.refs?.peer_hold === 'fay' && r.refs.ended)!

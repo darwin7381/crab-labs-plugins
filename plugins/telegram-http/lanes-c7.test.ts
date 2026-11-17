@@ -39,12 +39,3 @@ test('C7: nothing is flagged for the thread\'s own peer, an unknown thread, a th
   await L.routeEvent(mev('mesh-n5', 'cain', '問個問題：備份保留幾天？'))
   expect(flags().length).toBe(n)
 })
-
-test('C7: the flag does not reach the main\'s digest (notify_main false) and a second try is a second line', async () => {
-  const { renderDigest } = await import('./lanes-digest.ts')
-  await L.routeEvent(mev('mesh-n6', 'cain', '又來', { thread: 'adam#t-eve1', hop: 2 }))
-  expect(flags().length).toBe(2)
-  expect(flags().every(r => r.notify_main === false)).toBe(true)
-  const d = renderDigest(flags() as any)
-  expect(d).toBeNull()                                                       // nothing for the main in these lines alone
-})

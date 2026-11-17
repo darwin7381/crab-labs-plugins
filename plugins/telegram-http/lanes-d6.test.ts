@@ -53,7 +53,7 @@ test('D6: a screened peer message never gets a lane: no spawn, no queue item, no
   await sleep(300)
   expect(Object.keys(st.lanes).length).toBe(lanes0); expect(Object.keys(st.threads).length).toBe(threads0)
   expect(rows('lanes.jsonl').filter(r => r.kind === 'spawn' && r.event === 'mesh-h01').length).toBe(0)
-  expect(readdirSync(join(dir, 'queue')).filter(f => f.includes('mesh-h01')).length).toBe(0)
+  expect(L.__journal().rows('run', r => r.event === 'mesh-h01').length).toBe(0)              // M5: no run record (the journal is the queue)
   const r = rows('routing.jsonl').find(x => x.event === 'mesh-h01')!
   expect(r).toMatchObject({ rule: 'screen-instructions', target: 'main', lane: null })
 })

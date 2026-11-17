@@ -124,13 +124,45 @@ A `main` obligation is due 300 s after the hand-over (`LANES_HANDOFF_FALLBACK_MS
 `id` is an item id or an event id. `state` is `wake` (M1 offers the item: the main was idle and something is owed to it) or `no_wake`. `reason` says
 which: information, the main in a turn (the item is pulled at its next boundary), the main walled or gone, or the event owes nothing.
 
-### `run` (M5)
+### `run` (M5): one record per lane run
 
-| rec | id | states | fields |
-|---|---|---|---|
-| `run` | run id | `queued`, `leased`, `running`, `exited` | `event`, `reason`, `exit_code` |
+| state | meaning |
+|---|---|
+| `queued` | waiting for a slot. Fields: `ev` (the event, without its channel payload), `priority`, `summary`, `enqueued`, `extra` (messages riding in it), `deaths`, `not_before` (the backoff after a death) |
+| `leased` | picked: `run` (the lane run id, e.g. `adam.reflex.3.r2`) |
+| `running` | spawned: `pid` |
+| `exited` | `reason`, `exit_code`, `signal` |
 
-Written from step 3 of the rebuild on.
+Every line also has `event`, `lane` and `attempt`.
+
+`reason` is one of:
+- `normal`, `cap_turns`, `cap_usd`, `budget`, `wall:<kind>`, `died`, `timeout`: how the run ended;
+- `merged` (coalesced into another run), `dropped` (its thread was stopped) or `closed` (its lane was closed): a queued run that never started.
+
+How the reason is decided (exitReason):
+- From the result JSON: `terminal_reason` `max_turns` / `subtype` `error_max_turns` is `cap_turns`; `error_max_budget_usd` is `cap_usd`;
+  `is_error` with `terminal_reason: api_error` gives `wall:<kind>`, where the kind comes from `api_error_status`: 429 is `rate_limit`, 401/403 is
+  `authentication_failed`, 5xx is `server_error`, anything else is `api_error`.
+- From the daemon's own decisions: `timeout` (it stopped the run at `LANES_MAX_RUN_MS`) and `budget` (it stopped the run at the thread budget).
+- Otherwise from the exit code: exit 0 with no signal is `normal`, anything else is `died`.
+- Never from the error text.
+
+What happens next:
+- A wall is not an attempt: the event is queued again as it was, and the shared wall goes up.
+- A death or a timeout is run again after `attempt × LANES_RETRY_BACKOFF_MS`, while the event still owes something. After 3 attempts, the exit
+  rule hands what is open to the main.
+- At boot, a run left `leased` or `running` died with the daemon. It gets `exited(died, signal daemon-restart)`, its lanes.jsonl exit row and a
+  lane_lifecycle ledger line, and its event runs again.
+
+**Busy** is "the lane has a queued, leased or running record" (`laneBusy`). The journal is the queue: there are no queue files.
+
+## The digest: a renderer over M3
+
+The digest is information that rides an M1 offer or pull. It is never offered alone.
+- One line per event that changed since the last digest that was done. `.lanes/digest.json` `{seen: {event id: ts}}` is updated when a digest
+  item reaches `done`.
+- At most 8 lines, in this order: owed to the main (`需主線`), waiting on Joey's decision, the rest. The overflow is named on one line.
+- An open Joey memory proposal and an active peer hold are lines of every digest while they last.
 
 ## The main's hook
 
@@ -187,6 +219,10 @@ How the main is registered:
 The daemon writes the lane settings into `.lanes/lane-settings.json`. The lane Stop hook is lane-stop-hook.py. A slot carries nothing for lanes.
 
 ## Special cases kept (marked `SPECIAL CASE` in the code)
+
+3. **The TUI relay's wall line** (`wallKind`). The relay (system-alert.ts, fleet code that stays) forwards the CLI's own error line from the
+   main's pane or transcript. Deferring it to the one wall notice (002l D12) means recognising that line; no signal carries it. This is
+   wallKind's only use: a lane's wall kind comes from its result status, the main's from StopFailure.
 
 1. **The offer retry** (`LANES_OFFER_RETRY_MS`, default 20 s).
    - An offer written into a client that is still starting can be dropped by it (002h, 002i).

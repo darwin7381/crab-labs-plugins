@@ -55,7 +55,7 @@ export function createEvents(J: Journal) {
   }
 
   /** THE rule: a lane's outbound call asks to meet an obligation of its event */
-  function request(id: string, tool: string, want: Want, outcome?: Outcome, dry = false): Verdict {
+  function request(id: string, tool: string, want: Want, outcome?: Outcome, dry = false, f: Record<string, unknown> = {}): Verdict {
     const e = get(id)
     if (!e) return { ok: true }                                    // an event the router did not record (a main-tool task): nothing to check
     const obs = obsOf(e)
@@ -95,7 +95,7 @@ export function createEvents(J: Journal) {
     }
     if (dry) return refused ? { ok: false, why: `refused: ${refused}. ${openText(id)}`, ob } : { ok: true, ob }   // what it would say: nothing is written
     const out: Outcome = outcome && SEV[outcome] > SEV[(e.outcome as Outcome) ?? 'normal'] ? outcome : (e.outcome ?? 'normal')
-    const row = write(e, obs, { tool, refused: refused || null, outcome: out })
+    const row = write(e, obs, { tool, refused: refused || null, outcome: out, ...(refused ? {} : f) })
     if (refused) return { ok: false, why: `refused: ${refused}. ${openText(id)}`, ob, event: row }
     return { ok: true, ob, raised, event: row }
   }
@@ -116,6 +116,8 @@ export function createEvents(J: Journal) {
     write(e, [...obsOf(e), ob], f)
     return ob
   }
+  /** a field on the record (what the lane did, for the digest), no obligation changes */
+  function note(id: string, f: Record<string, unknown>): void { const e = get(id); if (e) write(e, obsOf(e), f) }
   /** obligations past their due time, not met, not acted on yet */
   function due(now: number): Array<{ e: Row; o: Ob }> {
     const out: Array<{ e: Row; o: Ob }> = []
@@ -126,6 +128,6 @@ export function createEvents(J: Journal) {
     }
     return out
   }
-  return { open, get, obsOf, openObs, openText, request, set, add, due, receiptMet,
+  return { open, get, obsOf, openObs, openText, request, set, add, note, due, receiptMet,
     rows: (pred: (r: Row) => boolean = () => true) => J.rows('event', pred) }
 }

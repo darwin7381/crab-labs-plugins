@@ -3,7 +3,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { cleanReport, reportMarkup, stripMarkup, MARKUP_RE, renderDigest } from './lanes-digest.ts'
+import { cleanReport, reportMarkup, stripMarkup, MARKUP_RE } from './lanes-digest.ts'
 const L = await import('./lanes.ts?b21-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-b21-'))

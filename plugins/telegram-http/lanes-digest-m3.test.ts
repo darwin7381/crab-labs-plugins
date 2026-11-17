@@ -1,0 +1,85 @@
+// The digest: a renderer over M3, not a mechanism. One line per event changed since the last digest that was done; at most 8 lines, in this order:
+// owed to the main, waiting on Joey's decision, the rest; the overflow named on one line. The failures of class F (002e separator, 002k B15, 002m L6B5,
+// inv F(2) 8-line limit exceeded, F(3) open proposals dropped, F(4) the separator lies, F(5) two "happened" chains) are played on the event records.
+import { test, expect } from 'bun:test'
+import { mkdtempSync, copyFileSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { renderEventDigest, DIGEST_MAX_LINES } from './lanes-digest.ts'
+const L = await import('./lanes.ts?digest-m3-test') as typeof import('./lanes.ts')
+const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
+const dir = mkdtempSync(join(tmpdir(), 'lanes-digest-m3-'))
+process.env.LANES_DIR = dir
+copyFileSync(ROUTER, join(dir, 'router.json'))
+L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve'] } as any)
+const st = L.__lanesState(), E = () => L.__events()
+let n = 0
+function lane(): string {
+  const id = `adam.reflex.${++n}`
+  st.lanes[id] = { id, kind: 'reflex', n, session_id: 's', thread: `adam#t-${n}`, status: 'idle', created: '', last: '', transcript: '/x', runs: 1, tokens_in: 0, tokens_out: 0 } as any
+  return id
+}
+function event(o: { from?: string; text: string; obligations: any[]; cls?: any; did?: string }): string {
+  const l = lane(), id = `ev-dg-${n}`
+  E().open(id, { class: o.cls ?? 'peer', owner: l, lane: l, from: o.from ?? 'eve', text: o.text, obligations: o.obligations })
+  if (o.did) E().note(id, { did: o.did })
+  return id
+}
+const content = (text: string) => text.split('\n').slice(1, -1)                                  // without the header and the footnote
+const done = (t: any) => writeFileSync(join(dir, 'digest.json'), JSON.stringify({ seen: t.fields.covers }))
+
+test('one line per event, from its record: who handled it, what happened, where each obligation stands; the main\'s own events are not in it', () => {
+  const a = event({ text: '下週維護幾點？', did: '回覆 Eve：週三 02:00', obligations: [{ kind: 'joey', level: 'line', state: 'met' }, { kind: 'peer', level: 'answer', to: 'eve', state: 'met' }] })
+  E().note(a, { joey_tier: 'silent', answered: '週三 02:00' })
+  E().note(a, { said: 'Eve 問維護，回 02:00' })                                                  // several writes on one event: still one line (F(5))
+  E().open('ev-dg-main', { class: 'joey', owner: 'main', from: 'joey', text: 'Joey 問主線的事', obligations: [{ kind: 'main', level: 'handed', owner: 'main' }] })
+  const d = L.__digest()!
+  const lines = content(d.text)
+  expect(lines.length).toBe(1)
+  expect(lines[0]).toStartWith('• 反射線#'); expect(lines[0]).toContain('回覆 Eve：週三 02:00')
+  expect(lines[0]).toContain('已通知 Joey（靜默），不要重複通知他'); expect(lines[0]).toContain('已回 eve')
+  expect(d.text).not.toContain('Joey 問主線的事')
+  done(d)
+  expect(L.__digest()).toBeNull()                                                                   // done: not shown again until it changes
+  E().note(a, { did: '又問了一次，同樣回 02:00' })
+  expect(content(L.__digest()!.text)[0]).toContain('又問了一次')
+  done(L.__digest())
+})
+
+test('002k B15, 002m L6B5, inv F(2): at most 8 lines however many events changed; the order is owed to the main, waiting on Joey, the rest; the overflow is named on one line', () => {
+  const ids: string[] = []
+  for (let i = 0; i < 9; i++) ids.push(event({ text: `例行 ${i}`, cls: 'scheduled', obligations: [{ kind: 'joey', level: 'line', state: 'met' }] }))
+  const ask = event({ text: '憑證要續約嗎？', cls: 'scheduled', obligations: [{ kind: 'joey', level: 'decision', state: 'met' }] })
+  const hand = event({ text: 'Eve 要主線答應週五', obligations: [{ kind: 'main', level: 'handed', owner: 'main', state: 'open', handoff: 'ho-abc', what: 'Eve 要主線答應週五交報告' }] })
+  const d = L.__digest()!
+  const lines = content(d.text)
+  expect(lines.length).toBe(DIGEST_MAX_LINES)
+  expect(lines[0]).toContain('需主線：〔ho-abc〕Eve 要主線答應週五交報告')
+  expect(lines[1]).toContain('已請 Joey 決定，不要重複通知他')
+  expect(lines.at(-1)).toMatch(/^另有 \d+ 件沒列出：/)
+  expect(lines.filter(l => l.startsWith('•')).length).toBe(DIGEST_MAX_LINES - 1)
+  done(d)
+  for (const id of [...ids, ask, hand]) expect(d.fields.covers[id]).toBeTruthy()
+})
+
+test('inv F(3): an open proposal from Joey is a line owed to the main in every digest until it is decided, and is never the line that is cut', () => {
+  writeFileSync(join(dir, 'ledger.jsonl'), JSON.stringify({ ts: new Date().toISOString(), lane: 'adam.worker.1', thread: 'adam#t-w', kind: 'memory_proposal', text: '記住：週報一律 09:00',
+    notify_main: true, refs: { proposal_id: 'mp-f3', joey: true } }) + '\n')
+  for (let i = 0; i < 12; i++) event({ text: `事件 ${i}`, obligations: [] })
+  const d = L.__digest()!
+  const lines = content(d.text)
+  expect(lines.length).toBe(DIGEST_MAX_LINES)
+  expect(lines.some(l => l.includes('記憶提案 mp-f3') && l.includes('需主線'))).toBe(true)
+  done(d)
+  expect(L.__digest()!.text).toContain('mp-f3')                                                     // still listed with nothing else new
+  writeFileSync(join(dir, 'ledger.jsonl'), '')
+})
+
+test('002e, inv F(4): no separator that can lie: what is the main\'s says 需主線 on its own line, the rest says what Joey already has; the summary gate\'s parser reads the items', () => {
+  const r = renderEventDigest([{ id: 'a', group: 2, label: 'x', line: '• 反射線#1｜eve｜...｜已通知 Joey（靜默），不要重複通知他' }, { id: 'b', group: 0, label: 'y', line: '• 反射線#2｜eve｜...｜需主線：〔ho-1〕答應 Eve' }])!
+  expect(r.text).not.toContain('以下只是讓你知道')
+  expect(r.text.split('\n')[1]).toContain('需主線'); expect(r.text.split('\n')[0]).toStartWith('〔車道摘要｜')
+  const py = `import importlib.util,sys\nspec=importlib.util.spec_from_file_location('g','${join(import.meta.dir, 'lanes-hooks', 'main-summary-gate.py')}')\nm=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\nprint(len(m.digest_items(sys.stdin.read())))`
+  const out = Bun.spawnSync(['python3', '-c', py], { stdin: new TextEncoder().encode(r.text), env: { PATH: process.env.PATH ?? '', PYTHONIOENCODING: 'utf-8' } })
+  expect(out.stdout.toString().trim()).toBe('1')                                                    // the lanes' own item; the 需主線 one is the main's to report
+})

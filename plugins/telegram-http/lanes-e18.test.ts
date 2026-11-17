@@ -81,7 +81,7 @@ async function drain() {
   for (let i = 0; i < 80; i++) {
     if (existsSync(f('started')) && !existsSync(f('release'))) writeFileSync(f('release'), '1')
     await sleep(100)
-    if (!existsSync(f('started')) && !existsSync(f('release')) && st.lanes[LANE].status !== 'running' && readdirSync(join(dir, 'queue')).filter(n => n.endsWith('.json')).length === 0) return
+    if (!existsSync(f('started')) && !existsSync(f('release')) && st.lanes[LANE].status !== 'running' && !L.laneBusy(LANE)) return
   }
 }
 async function finish(n: number) { writeFileSync(f('release'), '1'); expect(await until(() => exits() >= n)).toBe(true) }
@@ -92,7 +92,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   const d = await L.routeEvent(tg('tg-e18-2', '先只看 /v2/payments 的請求。', '2001'))
   expect(d.target).toBe('lane'); expect(d.lane).toBe(LANE); expect(d.rule).toBe('tg-worker-topic')
   expect(d.note).toContain('steering'); expect(d.note).not.toContain('queued behind the running run')
-  expect(existsSync(join(dir, 'queue', 'tg-e18-2.json'))).toBe(false)                       // no queue item: it is not waiting for the run to end
+  expect(L.__journal().rows('run', r => r.event === 'tg-e18-2').length).toBe(0)              // no run record: it is not waiting for the run to end
   expect(L.lanesHealth().steering_pending).toBe(1)
   expect(steerRows('sent').length).toBe(1)
   expect(steerRows('sent')[0]).toMatchObject({ lane: 'router', thread: 'adam#t-w1', event: 'tg-e18-2', notify_main: false, kind: 'action', refs: { steer: 'sent', run: 'adam.worker.1.r1', message_id: '2001' } })
@@ -168,7 +168,7 @@ test('E18: LANES_STEER_MIDTURN=0 puts it back: the message queues behind the run
   const d = await L.routeEvent(tg('tg-e18-8', '進度如何？', '2301'))
   delete process.env.LANES_STEER_MIDTURN
   expect(d.note).toContain('queued behind the running run')
-  expect(existsSync(join(dir, 'queue', 'tg-e18-8.json'))).toBe(true)
+  expect(L.__journal().rows('run', r => r.event === 'tg-e18-8' && r.state === 'queued').length).toBe(1)   // M5: queued behind the run
   expect(steerRows('sent').length).toBe(sent0)
   expect(existsSync(join(dir, 'run', 'steer', `${LANE}.in.jsonl`))).toBe(false)
   writeFileSync(f('release'), '1')
@@ -265,8 +265,8 @@ test('E18: a message that was with a run when the daemon stopped is the lane\'s 
   try {
     L2.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: d2, transcriptDir: d2, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => [], sendBot: async () => 1, joeyChatId: () => '1' } as any)
     process.env.LANES_DIR = saved
-    const q = JSON.parse(readFileSync(join(d2, 'queue', 'tg-e18-r1.json'), 'utf8'))
-    expect(q).toMatchObject({ lane: 'adam.worker.1', state: 'queued', priority: 0 }); expect(q.ev.text).toContain('改查 5xx')
+    const q = L2.__journal().rows('run', r => r.event === 'tg-e18-r1')[0]                       // M5: the run record (the journal is the queue)
+    expect(q).toMatchObject({ lane: 'adam.worker.1', priority: 0 }); expect(q.ev.text).toContain('改查 5xx')
     expect(L2.__lanesState().steering ?? {}).toEqual({})
     expect(existsSync(join(d2, 'run', 'steer', 'adam.worker.1.in.jsonl'))).toBe(false)
     const led = readFileSync(join(d2, 'ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))

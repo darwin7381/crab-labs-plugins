@@ -180,23 +180,25 @@ test('a busy main is never pushed to: three messages are pulled at the next tool
   await kill(g2)
 })
 
-test('information never travels alone: a digest with nothing owed to the main is not offered; it rides the next item and is done with it (the cursor moves)', async () => {
+test('information never travels alone: a digest with nothing owed to the main is not offered; it rides the next item and is done with it (what it showed is not shown again)', async () => {
   const g = await startMain()
   const k = offers.length
-  writeFileSync(join(dir, 'ledger.jsonl'), JSON.stringify({ ts: new Date().toISOString(), lane: 'adam.reflex.9', thread: 'adam#t-9', event: 'ev-9', kind: 'notify', text: '[silent] mock-api 正常', notify_main: true, refs: { tier: 'silent' } }) + '\n')
-  writeFileSync(join(dir, 'digest.json'), JSON.stringify({ line: 0 }))
+  L.__lanesState().lanes['adam.reflex.9'] = { id: 'adam.reflex.9', kind: 'reflex', n: 9, session_id: 's', thread: 'adam#t-9', status: 'idle', created: '', last: '', transcript: '/x', runs: 1, tokens_in: 0, tokens_out: 0 } as any
+  L.__events().open('ev-m1-9', { class: 'alert', owner: 'adam.reflex.9', lane: 'adam.reflex.9', thread: 'adam#t-9', from: 'alert-dispatcher', text: 'mock-api p95 > 2s',
+    obligations: [{ kind: 'joey', level: 'line', state: 'met', by: 'notify_joey' }] })
   await M().pump(); await M().tick()
   expect(offers.length).toBe(k)                                                         // an idle main is never woken for a digest
   const id = await joey('今天怎樣？')
   const o = offers.at(-1)!.notif
-  expect(o.params.content).toContain('〔車道摘要'); expect(o.params.content).toContain('只附這一次'); expect(o.params.content.endsWith('今天怎樣？')).toBe(true)
-  const [main, dg] = String(o.params.meta.did).split(',')
-  expect(main).toBe(id); expect(M().items(r => r.id === dg)[0].kind).toBe('digest')
+  expect(o.params.content).toContain('〔車道摘要'); expect(o.params.content).toContain('mock-api p95'); expect(o.params.content).toContain('只附這一次')
+  expect(o.params.content.endsWith('今天怎樣？')).toBe(true)
+  const [first, dg] = String(o.params.meta.did).split(',')
+  expect(first).toBe(id); expect(M().items(r => r.id === dg)[0].kind).toBe('digest')
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [o.params.meta.did] })
   expect(state(dg)).toBe('bound')
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
-  expect(state(dg)).toBe('done'); expect(JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).line).toBe(1)
-  expect(L.__digest()).toBeNull()                                                       // nothing new since the done digest
+  expect(state(dg)).toBe('done'); expect(JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).seen['ev-m1-9']).toBeTruthy()
+  expect(L.__digest()).toBeNull()                                                       // nothing changed since the done digest
   await kill(g)
 })
 
