@@ -12,6 +12,7 @@
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
+import { receiptKeys, receivedIn, recentReceiptLines } from './receipt.ts'
 import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend } from './fleet-mail.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -696,6 +697,17 @@ const activeServers = new Set<Server>()
 const serverSessionId = new WeakMap<Server, string>()  // server → its session id
 const sseOpen = new Map<string, boolean>()             // session id → SSE GET stream open?
 const memQueue = new Map<string, Array<{ method: string; params: unknown }>>()  // session id → pending notifs while SSE not open
+// SSE open ≠ ready (2026-11-17, Atlas btcc 9738): Claude Code registers its channel-notification handler
+// ~0.7-1 s AFTER the stream opens (atlas: connected 10:17:12.172, "Channel notifications registered"
+// 10:17:12.888). A notification pushed in between is silently dropped by the client; the old 50 ms wait
+// replayed 35 parked deliveries at +0.16 s and every one was lost. Deliver only once READY_DELAY_MS has
+// passed since the stream opened; until then pushes wait in memQueue. Receipt is still verified per
+// delivery (RECEIPT_GRACE_MS below), so a client slower than this delay costs a redelivery, not a loss.
+const READY_DELAY_MS = Number(process.env.MCP_READY_DELAY_MS ?? 2500)
+const sseReadyAt = new Map<string, number>()          // session id → ms when pushes may start
+function sseReady(sid: string): boolean {
+  return !!sseOpen.get(sid) && Date.now() >= (sseReadyAt.get(sid) ?? Infinity)
+}
 // issue #3 fix: claude-code's MCP client churns sessions (each reconnect POSTs a
 // fresh `initialize`) but its dead SSE GET stream never triggers `transport.onclose`
 // on our side — so dead sessions accumulate forever (observed 25/2269/78 opens, 0
@@ -755,7 +767,14 @@ function persistInbound(notif: { method: string; params: unknown }): string | nu
 // STATE_DIR-parent heuristic), falls back to legacy ack-on-write.
 const AGENT_WORKSPACE_DIR = process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR)
 const TRANSCRIPT_DIR = join(homedir(), '.claude', 'projects', AGENT_WORKSPACE_DIR.replace(/[/.]/g, '-'))
-const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
+// Evaluated per use, cached once true: a brand-new workspace has no transcript dir until Claude Code takes its
+// first input, and a startup-only check left tracking (and receipt verification) off for the daemon's whole life
+// (11-17 lab). A dir that never exists (channel bot: STATE_DIR's parent isn't a workspace) stays off, as before.
+let transcriptDirSeen = false
+function consumptionCheckAvailable(): boolean {
+  if (!transcriptDirSeen) transcriptDirSeen = existsSync(TRANSCRIPT_DIR)
+  return transcriptDirSeen
+}
 // Grace must exceed a long single-response turn: claude appends the assistant
 // record only when a response COMPLETES, so the transcript can be silent for
 // minutes after the enqueue write (observed 4m+ on canary) — 180s produced a
@@ -763,7 +782,16 @@ const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
 // dup and still acks (records live RETAIN_MS).
 const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
 const CONSUME_RETAIN_MS = 1_800_000
-const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null }> = []
+const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null;
+  keys: string[] | null; received: boolean }> = []
+
+// Receipt verification per delivery: receipt.ts (2026-11-17, Atlas btcc 9738). Not received within
+// RECEIPT_GRACE_MS → re-persisted for redelivery and never acked; no meta.ts → old behaviour.
+const RECEIPT_GRACE_MS = Number(process.env.RECEIPT_GRACE_MS ?? 90_000)
+// Stop switch: RECEIPT_CHECK=0 (e.g. in ~/.config/crab-labs-plugins/env, no release needed) turns receipt off and
+// restores the 1.32.1 consumption rule. Needed if a Claude Code release renders the <channel> tag differently:
+// then nothing would ever read as received and every delivery would be re-sent up to MAX_REDELIVERIES times.
+const RECEIPT_CHECK = process.env.RECEIPT_CHECK !== '0'
 
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
 // whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
@@ -784,9 +812,9 @@ function deliveryKey(notif: { method: string; params: unknown }): string {
 }
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
-  if (!consumptionCheckAvailable) { maybeAutoAckScheduled(notif); return }
+  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(notif); return }
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
-  recentDeliveries.push({ notif, at: Date.now(), pendingPath: null })
+  recentDeliveries.push({ notif, at: Date.now(), pendingPath: null, keys: RECEIPT_CHECK ? receiptKeys(notif) : null, received: false })
   if (recentDeliveries.length > 200) recentDeliveries.shift()
   const k = deliveryKey(notif)
   deliveryAttempts.set(k, (deliveryAttempts.get(k) ?? 0) + 1)
@@ -825,14 +853,20 @@ function newestGenuineAssistantAt(): number {
 
 
 function sweepDeliveries(): void {
-  if (!consumptionCheckAvailable || recentDeliveries.length === 0) return
+  if (!consumptionCheckAvailable() || recentDeliveries.length === 0) return
   const now = Date.now()
   const newest = newestGenuineAssistantAt()
+  // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
+  const unseen = recentDeliveries.filter(d => d.keys && !d.received)
+  const lines = unseen.length ? recentReceiptLines(TRANSCRIPT_DIR, Math.min(...unseen.map(d => d.at))) : []
+  for (const d of unseen) if (receivedIn(lines, d.keys!)) d.received = true
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
-    // Strictly after the delivery, and by a genuine (non-API-error) assistant
-    // record. An error record or a pre-delivery record is NOT consumption.
-    if (newest > d.at) {
+    const notReceived = !!d.keys && !d.received
+    // Consumed = the client took THIS delivery (receipt; skipped when it has no meta.ts) and then a
+    // genuine (non-API-error) assistant record came strictly after it. An assistant record alone is not
+    // enough: on 11-17 it acked 35 deliveries the client had dropped (Atlas btcc 9738).
+    if (!notReceived && newest > d.at) {
       // transcript advanced after delivery ⇒ consumed. If we had already
       // re-persisted a dup (long-turn false negative), retract it.
       if (d.pendingPath) {
@@ -840,7 +874,11 @@ function sweepDeliveries(): void {
       }
       maybeAutoAckScheduled(d.notif)
       recentDeliveries.splice(i, 1)
-    } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
+    } else if (!d.pendingPath && now - d.at > (notReceived ? RECEIPT_GRACE_MS : CONSUME_GRACE_MS)) {
+      if (notReceived) {
+        log('warn', `delivery not received: no transcript record of ${d.keys![0]} ${Math.round((now - d.at) / 1000)}s ` +
+          `after the push (the client dropped it?) — handled as unconsumed below, NOT acked`)
+      }
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
       if (attempts >= MAX_REDELIVERIES) {
         // Stop the loop — but do NOT destroy the message. The 1.22.3 wording
@@ -894,7 +932,7 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
   // broadcastNotification has always gated on sseOpen; this path never did.
   // If SSE isn't up yet, leave everything parked — the timer drain will take it.
   const sid = serverSessionId.get(server)
-  if (!sid || !sseOpen.get(sid)) return 0
+  if (!sid || !sseReady(sid)) return 0    // open AND past the client-ready delay (READY_DELAY_MS)
   let files: string[]
   try { files = readdirSync(PENDING_DIR) } catch { return 0 }
   const pending = files.filter(f => f.endsWith('.json')).sort()
@@ -941,7 +979,7 @@ let parkAlerted = new Set<string>()
 function liveSessionServer(): Server | null {
   for (const server of activeServers) {
     const sid = serverSessionId.get(server)
-    if (sid && sseOpen.get(sid)) return server
+    if (sid && sseReady(sid)) return server
   }
   return null
 }
@@ -2796,10 +2834,20 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
   }
   const now = Date.now()
   let anySseOpen = false
+  let parkedForReady = false
   for (const server of [...activeServers]) {  // snapshot: evictZombieSession mutates activeServers
     const sid = serverSessionId.get(server)
     if (!sid) continue
-    if (sseOpen.get(sid)) {
+    if (sseOpen.get(sid) && !sseReady(sid)) {
+      // Stream open, client handler not registered yet (READY_DELAY_MS). Park on DISK, not memQueue: the
+      // ready-time replay delivers it in order, and it survives the session closing before ready
+      // (onclose deletes memQueue). Persist once even if several sessions are in this state.
+      if (!parkedForReady) {
+        parkedForReady = true
+        persistInbound(notif)
+        log('info', `parked for session ${sid} (SSE open, client not ready yet) — replayed at ready`)
+      }
+    } else if (sseOpen.get(sid)) {
       anySseOpen = true
       void server.notification(notif as Parameters<Server['notification']>[0]).then(() => {
         recordDelivery(notif)
@@ -2822,7 +2870,7 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
       }
     }
   }
-  if (!anySseOpen) {
+  if (!anySseOpen && !parkedForReady) {
     log('warn', `no SSE-open session at broadcast — also persisting to disk: ${notif.method}`)
     persistInbound(notif)
   }
@@ -2837,6 +2885,7 @@ function evictZombieSession(sid: string, reason: string): void {
   const transport = transports.get(sid)
   transports.delete(sid)
   sseOpen.delete(sid)
+  sseReadyAt.delete(sid)
   memQueue.delete(sid)
   sessionLastActiveAt.delete(sid)
   if (srv) {
@@ -3072,6 +3121,7 @@ async function openSession(resumeId?: string): Promise<StreamableHTTPServerTrans
     if (transport.sessionId) {
       transports.delete(transport.sessionId)
       sseOpen.delete(transport.sessionId)
+      sseReadyAt.delete(transport.sessionId)
       memQueue.delete(transport.sessionId)
       sessionLastActiveAt.delete(transport.sessionId)
       forgetIssuedSession(transport.sessionId)
@@ -3401,6 +3451,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         //      our server.notification calls reach claude
         //   5. THEN await the long-lived SSE request lifecycle
         sseOpen.set(sessionId, true)
+        sseReadyAt.set(sessionId, Date.now() + READY_DELAY_MS)   // pushes wait for the client handler
         sessionLastActiveAt.set(sessionId, Date.now())  // SSE confirmed open ⇒ reset zombie-GC clock
 
         // 2026-05-22 — Dead-transport detection patch (belt + suspenders):
@@ -3451,7 +3502,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           const backlog = (res as any).writableLength ?? (req.socket as any)?.writableLength ?? 0
           if (backlog > 1_000_000) {
             log('info', `SSE backpressure for ${sessionId} (writableLength=${backlog}) — marking dead and forcing close`)
-            sseOpen.set(sessionId, false)
+            sseOpen.set(sessionId, false); sseReadyAt.delete(sessionId)
             clearInterval(keepaliveTimer)
             try { req.socket?.destroy() } catch {}
             return
@@ -3461,7 +3512,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             sessionLastActiveAt.set(sessionId, Date.now())  // write accepted ⇒ session still active
           } catch (err) {
             log('info', `SSE keepalive write failed for ${sessionId} — marking dead and forcing close: ${err instanceof Error ? err.message : err}`)
-            sseOpen.set(sessionId, false)
+            sseOpen.set(sessionId, false); sseReadyAt.delete(sessionId)
             clearInterval(keepaliveTimer)
             try { req.socket?.destroy() } catch {}
           }
@@ -3469,7 +3520,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // Defensive: ensure timer cleans up if Node fires 'close' before our finally
         const onResClose = () => {
           clearInterval(keepaliveTimer)
-          sseOpen.set(sessionId, false)
+          sseOpen.set(sessionId, false); sseReadyAt.delete(sessionId)
         }
         res.once('close', onResClose)
 
@@ -3493,7 +3544,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           if (peerGone) return
           peerGone = true
           clearInterval(keepaliveTimer)
-          if (sseOpen.get(sessionId)) sseOpen.set(sessionId, false)
+          if (sseOpen.get(sessionId)) sseOpen.set(sessionId, false); sseReadyAt.delete(sessionId)
           log('info', `SSE peer gone for ${sessionId} (${why}) — SSE marked closed; GC evicts after ${SESSION_GRACE_MS / 1000}s grace unless the client re-opens SSE`)
           try { transport.closeStandaloneSSEStream() } catch {}
         }
@@ -3502,16 +3553,18 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         if (sseSocket?.destroyed) onPeerGone('socket already closed at SSE open')
 
         const reqPromise = transport.handleRequest(req, res)
-        // Single-microtask yield is enough for the SDK's synchronous
-        // _streamMapping.set; we add a small extra delay as belt-and-suspenders
-        // for the Node↔Web adapter (@hono/node-server) to finish wiring.
-        await new Promise(r => setTimeout(r, 50))
+        // Wait until the CLIENT is ready, not just the SDK stream: Claude Code registers its channel
+        // handler ~0.7-1 s after the stream opens and drops anything pushed before that (READY_DELAY_MS;
+        // the old 50 ms here lost 35 replayed deliveries for atlas on 11-17, and the same for every agent
+        // reconnected that day). Receipt is verified per delivery afterwards (RECEIPT_GRACE_MS).
+        await new Promise(r => setTimeout(r, Math.max(50, (sseReadyAt.get(sessionId) ?? 0) - Date.now())))
         let boundServer: Server | undefined
         for (const s of activeServers) {
           if (serverSessionId.get(s) === sessionId) { boundServer = s; break }
         }
-        if (boundServer) {
+        if (boundServer && sseOpen.get(sessionId)) {    // closed during the wait → leave it all parked
           const queued = memQueue.get(sessionId) ?? []
+          memQueue.delete(sessionId)                    // take ownership before the first await
           if (queued.length > 0) {
             log('info', `flushing ${queued.length} mem-queued notif(s) for session ${sessionId}`)
             for (const notif of queued) {
@@ -3522,7 +3575,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
                 log('error', `mem-flush failed: ${err}`)
               }
             }
-            memQueue.delete(sessionId)
           }
           // Disk-pending drain (covers daemon restart and "0 active session" gap).
           // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
@@ -3530,7 +3582,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         }
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {
-          sseOpen.set(sessionId, false)  // SSE closed; future broadcasts queue
+          sseOpen.set(sessionId, false); sseReadyAt.delete(sessionId)  // SSE closed; future broadcasts queue
           clearInterval(keepaliveTimer)
           res.off('close', onResClose)
           // Disarm: a keep-alive socket can outlive this stream (server-side end)

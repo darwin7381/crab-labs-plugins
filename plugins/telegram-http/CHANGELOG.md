@@ -1,3 +1,20 @@
+## 1.32.2 — 2026-11-17
+
+- **Parked deliveries are no longer pushed before the client can take them, and a delivery counts only once the client has it** (Atlas btcc 9738).
+  - **What was lost:** on 11-17, when the sessions detached since 11-16 16:50Z were reconnected, the daemon replayed each agent's parked deliveries 50 ms after the SSE stream opened.
+    - Claude Code registers its channel-notification handler about 0.7–1 s after the stream opens (atlas: connected 10:17:12.172, registered 10:17:12.888) and silently drops anything pushed before that.
+    - For 11 agents the consumption check then saw nothing for 600 s, re-parked and replayed them, so they arrived 10–30 min late.
+    - For atlas an unrelated turn (the 6157 stall-nudge) satisfied "a genuine assistant record after the delivery". All 35 were counted consumed and 17 scheduler runs auto-acked; the open-looking run 6150 then made schedule 87 overlap-skip 11:07Z and 12:07Z.
+  - **Readiness:** a session can take pushes only after `MCP_READY_DELAY_MS` (2.5 s) from SSE open. The session-open replay, the mem-queue flush and the timer drain all wait for it. A broadcast in that window is parked on disk (not memQueue, which a close would discard) and replayed in order at ready.
+  - **Receipt** (`receipt.ts`): Claude Code writes a `queue-operation` enqueue record the moment it takes a channel notification, with our meta rendered into the `<channel>` tag. A delivery counts as received only when a transcript line holds its `ts`, plus `chat_id` and `message_id` when present. Not received within `RECEIPT_GRACE_MS` (90 s) → re-persisted for redelivery, never acked. A scheduler run is auto-acked only after receipt plus a genuine assistant record. A delivery without `meta.ts` keeps the old behaviour.
+  - **Switches** (env, or `~/.config/crab-labs-plugins/env` with no release): `RECEIPT_CHECK=0` turns receipt off and restores the 1.32.1 rule. Use it if a Claude Code release renders the `<channel>` tag differently: then nothing would read as received, and every delivery would be re-sent up to `MAX_REDELIVERIES` times. `MCP_READY_DELAY_MS` and `RECEIPT_GRACE_MS` are tunable.
+  - **Consumption tracking** checks for the transcript dir at each use (cached once seen), not once at boot: a brand-new workspace's dir only appears after Claude Code takes its first input. Daemons whose state dir isn't inside a workspace (channel bots, roamers) still have tracking off, as before.
+  - **Lab, real Claude Code 2.1.322 client** with 5 parked deliveries at connect:
+    - 1.32.1: replayed at +0.09 s, handler registered at +1.04 s, 0 of 5 received.
+    - This version: replayed at +2.54 s, 5 of 5 in the transcript.
+    - Fake client that takes the stream but records nothing: "delivery not received … NOT acked" at 54 s, re-persisted, replayed by the timer drain.
+  - Tests: `receipt.test.ts` 9/0; full suite 168/0.
+
 ## 1.32.1 — 2026-11-17
 
 - **A request without an `Authorization` header now gets 503, not 403** (`/mcp` and `/fleet`; `refusal()` in `mcp-auth.ts`). A header with the wrong token still gets 403.
