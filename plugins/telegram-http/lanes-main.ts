@@ -22,9 +22,9 @@ export type MainEnv = {
   journal: Journal
   agent: string
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
-  /** write one notification into the open MCP stream of main process `pid` on daemon `via`; true = written */
+  /** write one notification into the MCP stream of main process `pid` on daemon `via`; true = written into a stream the SDK holds (false: no such stream, nothing offered) */
   offer: (notif: Notif, via: Via, pid: number) => Promise<boolean>
-  /** the tg daemon has an open MCP stream of process `pid` (an offer can be written) */
+  /** the tg daemon's SDK transport holds a GET stream of process `pid` (an offer can be written): the one signal that a starting gen can take input */
   streamOpen: (pid: number) => boolean
   /** the information that rides a delivery (the digest): its text and its item fields (`events`: event id → the record version shown; `items`); null = nothing new */
   info: () => { text: string; fields: Record<string, unknown> } | null
@@ -57,13 +57,9 @@ export type MainReply = { accepted?: boolean; additionalContext?: string; block?
 type Output = { to: string; reply_to: string; text: string }
 
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
-/** 疑似卡死: a gen in a turn with no hook event for this long, or idle with an offer it never took */
+/** 疑似卡死: a gen that owes a hook event (a turn open, or an offer unbound) has sent none for this long */
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
 export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
-// SPECIAL CASE (kept, see RBP report): an offer written into a client that is still starting can be dropped by it (002h/002i: 50 ms after connect).
-// An unbound item has had no effect, so the same item is offered again to the same idle gen when no hook event at all came after the offer.
-export let OFFER_RETRY_MS = num('LANES_OFFER_RETRY_MS', 20_000)
-export const __setOfferRetryMs = (ms: number): void => { OFFER_RETRY_MS = ms }
 const BODY_MAX = 4000
 
 
@@ -330,28 +326,26 @@ export function createMain(E: MainEnv) {
     void pump()
   }
 
-  /** every few seconds: kill -0 (SIGKILL fires no hook), the stuck rule, the offer retry, and a pump */
+  /** every few seconds: kill -0 (SIGKILL fires no hook), the stuck rule, and a pump (an item no stream could take is still queued) */
   async function tick(now = Date.now()): Promise<void> {
     if (!E) return
     const g = currentGen()
     if (g && !E.pidAlive(Number(g.pid))) { endGen(g, pendingEnd.get(g.id) ?? 'killed'); return }
-    if (g) {
-      const last = lastEventAt.get(g.id) ?? now
+    if (g && !stuck) {
+      // 疑似卡死, on M2 alone: the gen owes a hook event (a turn is open, or an offer is unbound) and has sent none for MAIN_STUCK_MS. The silence counts
+      // from its last hook event, or from the offer when that came later. One alarm per episode; the next hook event clears it (mainEvent).
       const offered = items(r => r.state === 'offered' && r.gen === g.id)
       const offeredAt = offered.length ? Math.min(...offered.map(r => Date.parse(r.ts))) : 0
-      if (!stuck && ((g.state === 'in_turn' && now - last > MAIN_STUCK_MS) || (g.state === 'idle' && offeredAt && now - offeredAt > MAIN_STUCK_MS && last <= offeredAt))) {
+      const owes = g.state === 'in_turn' || (g.state === 'idle' && offered.length > 0)
+      const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt)
+      if (owes && now - since > MAIN_STUCK_MS) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         const queued = items(r => r.state === 'queued' && owed(r)).length + offered.length
         const menu = g.state === 'idle' && E.menu ? await E.menu().catch(() => null) : null
-        const mins = Math.max(1, Math.round((now - (g.state === 'idle' ? offeredAt : last)) / 60_000))
+        const mins = Math.max(1, Math.round((now - since) / 60_000))
         E.tellJoey(g.state === 'in_turn'
           ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜${g.tool_open ? `（停在工具 ${g.tool_open}）` : ''}。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
           : `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它。`, 'main-stuck')
-      }
-      // SPECIAL CASE (kept): an offer that left no hook event at all is written again (see OFFER_RETRY_MS)
-      if (g.state === 'idle' && offered.length && now - offeredAt > OFFER_RETRY_MS && last <= offeredAt) {
-        for (const r of offered) J().write('msg', r.id, 'queued', { reason: 'offer_unanswered', gen: null })
-        J().write('wake', offered[0].id, 'no_wake', { reason: `offer to gen ${g.id} left no hook event in ${Math.round(OFFER_RETRY_MS / 1000)} s: offered again` })
       }
     }
     await pump()

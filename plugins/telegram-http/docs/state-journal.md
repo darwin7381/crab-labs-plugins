@@ -46,6 +46,9 @@ The one rule: an item is `done` only when its turn ends with `Stop`. `StopFailur
 
 How items move:
 - **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main, with the digest riding on it.
+  An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
+  the SDK drops a notification without an error when it has no GET stream). If no such stream exists, the item stays `queued` and nothing is
+  offered; the next pump (the stream opening, a Stop, the 5-second tick) tries again. An item is offered to a gen once: an offer is never written again.
 - **Bind.** At the first hook event with a new `prompt_id`, the daemon binds to that turn every item offered to this gen, plus any queued item the
   prompt names (`did="..."`).
 - **Pull.** A busy gen is never offered anything. At its next PostToolUse, or at its Stop, every queued item is bound to the running prompt and
@@ -61,8 +64,8 @@ Fields:
   `meta.did = "<item id>,<digest id>"`.
 - `gen` and `prompt_id`, while `offered` or `bound`. `via_pull: true` means the item was pulled at a tool boundary or at `Stop`.
 - `reason`, when the item returns to `queued`: `stop_failure:<error>`, `gen_end`, `interrupted` (a new prompt came with no Stop), `session_start`
-  (the same process started a new session mid-turn), or `offer_unanswered` (see special case 1 below).
-- `done` may carry `reason: asked_restart` (special case 2 below).
+  (the same process started a new session mid-turn).
+- `done` may carry `reason: asked_restart` (special case 1 below).
 - Digest items also have `events` and `items`:
   - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
   - `items`: how many entries the digest lists (event lines plus the standing lines: open Joey memory proposals and peer holds).
@@ -73,7 +76,7 @@ Fields:
 
 | state | meaning |
 |---|---|
-| `starting` | `SessionStart` accepted; the tg daemon has no open MCP stream of this process yet |
+| `starting` | `SessionStart` accepted; the tg daemon has no open MCP stream of this process yet (the main moves to `idle` when the SDK holds its GET stream) |
 | `idle` | can be offered one item |
 | `in_turn` | inside a turn: `prompt_id`; `tool_open` is set between PreToolUse and PostToolUse |
 | `walled` | the account's model wall is up: `kind` is the StopFailure error (`rate_limit`, `server_error`, ...), or the kind of the lane wall |
@@ -224,21 +227,18 @@ The daemon writes the lane settings into `.lanes/lane-settings.json`. The lane S
 
 ## Special cases kept (marked `SPECIAL CASE` in the code)
 
-3. **The TUI relay's wall line** (`wallKind`). The relay (system-alert.ts, fleet code that stays) forwards the CLI's own error line from the
+1. **An asked restart** (`/restart`, `/kill_stuck`): the items of the cut turn end `done` with `reason: asked_restart`, and Joey gets one line. They are
+   not re-given. This is the owner's decision (002j, 5018d39), kept as data.
+
+2. **The TUI relay's wall line** (`wallKind`). The relay (system-alert.ts, fleet code that stays) forwards the CLI's own error line from the
    main's pane or transcript. Deferring it to the one wall notice (002l D12) means recognising that line; no signal carries it. This is
    wallKind's only use: a lane's wall kind comes from its result status, the main's from StopFailure.
 
-1. **The offer retry** (`LANES_OFFER_RETRY_MS`, default 20 s).
-   - An offer written into a client that is still starting can be dropped by it (002h, 002i).
-   - If no hook event at all comes from the idle gen after an offer, the item goes back to `queued` with `reason: offer_unanswered` and is offered again.
-   - An unbound item has had no effect, so this is safe. No hook signals that a client is ready for input.
-2. **An asked restart** (`/restart`, `/kill_stuck`): the items of the cut turn end `done` with `reason: asked_restart`, and Joey gets one line. They are
-   not re-given. This is the owner's decision (002j, 5018d39), kept as data.
-
 ## Stuck (疑似卡死)
 
-This is M2 only. The tg daemon checks every 5 s, and raises one alert per episode in either of two cases:
-- a gen `in_turn` with no hook event for `LANES_MAIN_STUCK_MS` (default 600 s);
-- an `idle` gen with an item offered and no hook event since then, for the same time. The limit-menu pane read says whether a menu is the reason.
-
-The alert clears with the next hook event.
+This is M2 only. The tg daemon checks every 5 s. A gen owes a hook event while a turn is open (`in_turn`) or while an item offered to it is not
+bound yet (`idle` with an `offered` item). It is stuck when it owes one and has sent none for `LANES_MAIN_STUCK_MS` (default 600 s); the silence counts
+from its last hook event, or from the offer when that came later.
+- One alarm per episode. For an idle gen the limit-menu pane read says whether a menu is the reason.
+- The next hook event of the gen clears it, and Joey is told once. A later silence is a new episode.
+- Nothing else moves this clock: an offer is written once, so a frozen main (SIGSTOP) is alarmed once and gets its offer when it runs again.

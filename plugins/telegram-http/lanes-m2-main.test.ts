@@ -6,7 +6,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } fr
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { __setMainStuckMs, MAIN_STUCK_MS, __setOfferRetryMs, OFFER_RETRY_MS, mainContext, notMainContext } from './lanes-main.ts'
+import { __setMainStuckMs, MAIN_STUCK_MS, mainContext, notMainContext } from './lanes-main.ts'
 const L = await import('./lanes.ts?m2-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-m2-'))
@@ -22,8 +22,8 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
     drive: async () => { pane.drives++; return 'ok' as const }, rearm: () => {} } } as any)
 L.__setWallProbe(3_600_000)
 const procs: any[] = []
-const stuck0 = MAIN_STUCK_MS, retry0 = OFFER_RETRY_MS
-afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } __setMainStuckMs(stuck0); __setOfferRetryMs(retry0); L.__setWallProbe(300_000) })
+const stuck0 = MAIN_STUCK_MS
+afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } __setMainStuckMs(stuck0); L.__setWallProbe(300_000) })
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
 const mainLines = (pid: number) => journal().filter(l => l.rec === 'main' && l.id === String(pid))
@@ -223,9 +223,66 @@ test('fleet #13 / SIGSTOP wedge: a stopped main sends no hook event; the stuck r
   await killed(g)
 })
 
+test('D3 (basics): the main frozen with SIGSTOP while items are offered: exactly one 疑似卡死, nothing offered twice, no clock reset; SIGCONT and its next hook event clear it', async () => {
+  await drained()
+  __setMainStuckMs(80)
+  const g = await startMain()
+  g.proc.kill('SIGSTOP')                                                                    // frozen first, then the offers are written into it
+  const k = sent.length, o = offers.length
+  const a = await joey('D3 第一則'), b = await joey('D3 第二則')
+  expect(state(a)).toBe('offered'); expect(state(b)).toBe('queued')                         // one offer opens one turn
+  for (let i = 0; i < 12; i++) { await sleep(25); await M().tick() }                        // ~3.5 × MAIN_STUCK_MS of silence, a tick every 25 ms
+  await sleep(10)
+  expect(M().mainPhase()).toBe('idle')                                                      // kill -0 answers a stopped process: the gen is not gone
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1)
+  expect(sent.slice(k).find(s => s.includes('疑似卡死'))).toContain('沒有被接手')
+  expect(offers.length).toBe(o + 1)                                                         // the offer was written once; nothing rewrote it
+  expect(journal().filter(l => l.rec === 'msg' && l.id === a).map(l => l.state)).toEqual(['queued', 'offered'])
+  expect(journal().some(l => l.reason === 'offer_unanswered')).toBe(false)
+  g.proc.kill('SIGCONT')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [a] })                            // the stopped client takes what was written into it
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
+  expect(state(a)).toBe('bound')
+  await hook(g, 'Stop', { prompt_id: p })                                                   // the second one is pulled at Stop
+  expect(state(b)).toBe('bound')
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(a)).toBe('done'); expect(state(b)).toBe('done')
+  for (let i = 0; i < 4; i++) { await sleep(25); await M().tick() }                         // idle with nothing offered owes nothing: no second alarm
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(1)
+  __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('D3, a second episode: after the alarm cleared, a new silence with an open turn is a new episode and alarms once more', async () => {
+  __setMainStuckMs(40)
+  const g = await startMain()
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p })
+  const k = sent.length
+  g.proc.kill('SIGSTOP'); await sleep(60); await M().tick(); await M().tick()
+  g.proc.kill('SIGCONT'); await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
+  g.proc.kill('SIGSTOP'); await sleep(60); await M().tick(); await M().tick()
+  g.proc.kill('SIGCONT'); await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(2)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(2)
+  __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('the stream the offer needs: the SDK transport keeps its GET stream where server.ts streamLive looks (an SDK upgrade that moves it fails here)', async () => {
+  const { StreamableHTTPServerTransport } = await import('@modelcontextprotocol/sdk/server/streamableHttp.js')
+  const t: any = new StreamableHTTPServerTransport({ sessionIdGenerator: () => 'x' })
+  expect(t._webStandardTransport?._streamMapping instanceof Map).toBe(true)
+  expect(t._webStandardTransport._standaloneSseStreamId).toBe('_GET_stream')
+  expect(readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')).toContain("_webStandardTransport?._streamMapping?.has?.('_GET_stream')")
+})
+
 test('002k G16b: an idle main that never takes its offer (a menu on its pane) is the same rule: one alarm, with the pane read', async () => {
   await drained()
-  __setMainStuckMs(40); __setOfferRetryMs(3_600_000)
+  __setMainStuckMs(40)
   const g = await startMain()
   pane.text = "You've hit your weekly limit\n 1. Wait here, then continue automatically\n 2. Upgrade your plan"
   const id = await joey('哈囉')
@@ -236,7 +293,7 @@ test('002k G16b: an idle main that never takes its offer (a menu on its pane) is
   expect(alarm).toContain('沒有被接手'); expect(alarm).toContain('Upgrade your plan')
   expect(pane.drives).toBe(0)                                                               // read, never pressed here
   pane.text = ''
-  __setMainStuckMs(stuck0); __setOfferRetryMs(retry0)
+  __setMainStuckMs(stuck0)
   await hook(g, 'UserPromptSubmit', { prompt_id: P(), dids: [id] })
   await killed(g)
 })

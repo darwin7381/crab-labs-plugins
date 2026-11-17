@@ -3022,6 +3022,13 @@ function forgetIssuedSession(sid: string): void {
   saveIssuedSessions()
 }
 
+/** the session's GET stream is open AND the SDK transport holds it: a notification written now reaches the client's stream. The SDK's send() returns
+ *  without error when it has no GET stream (before handleRequest mapped it, or after the client cancelled it), so sseOpen alone does not say this. */
+function streamLive(sid: string): boolean {
+  const t = transports.get(sid) as any
+  return !!sseOpen.get(sid) && !!t?._webStandardTransport?._streamMapping?.has?.('_GET_stream')
+}
+
 function registerSession(id: string, transport: StreamableHTTPServerTransport, server: Server, how: 'opened' | 'resumed'): void {
   transports.set(id, transport)
   serverSessionId.set(server, id)
@@ -3118,13 +3125,13 @@ if (Lanes.LANES_ON) {
     log,
     stateDir: STATE_DIR,
     notifySession: async (sid: string, notif: { method: string; params: unknown }): Promise<boolean> => {
-      if (!sseOpen.get(sid)) return false
+      if (!streamLive(sid)) return false                     // the SDK drops a notification silently when it has no GET stream: not written = not offered
       for (const s of activeServers) if (serverSessionId.get(s) === sid) {
         try { await s.notification(notif as Parameters<Server['notification']>[0]); return true } catch (err) { log('warn', `lanes: offer to ${sid} failed: ${err}`); return false }
       }
       return false
     },
-    streamOpen: (sid: string) => !!sseOpen.get(sid),
+    streamOpen: streamLive,
     authOk: tokOk,
     toolsChanged: (sid: string) => {      // 002m (LG1)
       for (const s of activeServers) if (serverSessionId.get(s) === sid && sseOpen.get(sid)) {
@@ -3461,8 +3468,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         //   5. THEN await the long-lived SSE request lifecycle
         sseOpen.set(sessionId, true)
         sessionLastActiveAt.set(sessionId, Date.now())  // SSE confirmed open ⇒ reset zombie-GC clock
-        // 002: which claude process owns this session (socket → pid); binds the registered main
-        if (Lanes.LANES_ON) { try { Lanes.noteMcpSocket(sessionId, req) } catch (e) { log('warn', `lanes: noteMcpSocket ${e}`) } }
 
         // 2026-05-22 — Dead-transport detection patch (belt + suspenders):
         //
@@ -3567,6 +3572,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // _streamMapping.set; we add a small extra delay as belt-and-suspenders
         // for the Node↔Web adapter (@hono/node-server) to finish wiring.
         await new Promise(r => setTimeout(r, 50))
+        // lanes: which claude process owns this session (socket → pid). Told only now that the SDK holds the stream (streamLive): a starting main becomes
+        // offerable at this point and not before, so its first offer is never written into a stream the SDK does not have yet (it would drop it silently).
+        if (Lanes.LANES_ON) { try { Lanes.noteMcpSocket(sessionId, req) } catch (e) { log('warn', `lanes: noteMcpSocket ${e}`) } }
         let boundServer: Server | undefined
         for (const s of activeServers) {
           if (serverSessionId.get(s) === sessionId) { boundServer = s; break }

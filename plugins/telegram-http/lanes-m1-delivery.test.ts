@@ -6,7 +6,6 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } fr
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { __setOfferRetryMs, OFFER_RETRY_MS } from './lanes-main.ts'
 const L = await import('./lanes.ts?m1-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-m1-'))
@@ -19,8 +18,7 @@ const deps: any = { role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir:
 L.lanesInit(deps)
 L.__setWallProbe(3_600_000)                                   // the probe never fires by itself here: tests take the wall down
 const procs: any[] = []
-const retry0 = OFFER_RETRY_MS
-afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } __setOfferRetryMs(retry0); L.__setWallProbe(300_000) })
+afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setWallProbe(300_000) })
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
 const linesOf = (rec: string, id: string) => journal().filter(l => l.rec === rec && l.id === id)
@@ -127,17 +125,22 @@ test('002j: two offers at once (two replay paths in the old code) offer an item 
   await kill(g)
 })
 
-test('002h/002i (SPECIAL CASE kept): an offer the starting client dropped leaves no hook event; it is offered again after the retry window, and done once', async () => {
-  __setOfferRetryMs(60)
+test('002h/002i: an offer is written only into a stream that can take it: no stream = still queued (no offer, no retry); the stream opening offers it once, done once', async () => {
   const g = await startMain()
+  open.delete(g.mcp)                                                                   // the SDK has no GET stream of this process (yet, or any more)
   const id = await joey('剛開機就送的訊息')
+  expect(state(id)).toBe('queued')
+  expect(linesOf('msg', id).filter(l => l.state === 'offered').length).toBe(0)
   const k = offers.length
-  await sleep(90); await M().tick()                                                    // no hook event since the offer
-  expect(linesOf('msg', id).some(l => l.reason === 'offer_unanswered')).toBe(true)
+  await M().tick(); await M().tick()
+  expect(offers.length).toBe(k); expect(state(id)).toBe('queued')
+  open.add(g.mcp); L.__noteMcpPid(g.mcp, g.pid); await sleep(10)                       // the stream is there: the one offer
   expect(offers.length).toBe(k + 1); expect(state(id)).toBe('offered')
+  await M().tick(); await M().tick()
+  expect(offers.length).toBe(k + 1)                                                    // an offer is never written again to the same gen
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
   expect(state(id)).toBe('done')
-  __setOfferRetryMs(retry0)
+  expect(journal().some(l => l.reason === 'offer_unanswered')).toBe(false)
   await kill(g)
 })
 
