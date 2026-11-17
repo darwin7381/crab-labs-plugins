@@ -149,10 +149,16 @@ which: information, the main in a turn (the item is pulled at its next boundary)
 |---|---|
 | `queued` | waiting for a slot. Fields: `ev` (the event, without its channel payload), `priority`, `summary`, `enqueued`, `extra` (messages riding in it), `deaths`, `not_before` (the backoff after a death) |
 | `leased` | picked: `run` (the lane run id, e.g. `adam.reflex.3.r2`) |
-| `running` | spawned: `pid` |
-| `exited` | `reason`, `exit_code`, `signal` |
+| `running` | spawned: `pid`, `budget` (the thread's budget state as the run starts) |
+| `exited` | `reason`, `exit_code`, `signal`, `tokens` (what this run used), `budget` (the thread's budget state after it) |
 
 Every line also has `event`, `lane` and `attempt`.
+
+`tokens` is `{in, out, fresh, calls}`: the run's input-side tokens (uncached input, cache reads and cache writes), its output tokens, its fresh
+tokens (uncached input, cache writes and output: what the thread budget counts, `freshTokens`) and its API calls. `budget` is
+`{thread, used, limit}`: the thread, the fresh tokens its runs have spent, and the thread budget (`LANES_THREAD_BUDGET`). Both come from the
+budget accounting itself (the same numbers the in-run budget check and the lanes.jsonl exit row use). A queued run refused at the budget before it
+starts (`exited(budget)` with no `running`) carries the `budget` that refused it.
 
 `reason` is one of:
 - `normal`, `cap_turns`, `cap_usd`, `budget`, `wall:<kind>`, `died`, `timeout`: how the run ended;

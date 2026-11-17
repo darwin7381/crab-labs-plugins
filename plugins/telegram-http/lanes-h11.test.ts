@@ -155,3 +155,21 @@ test('002l D1/D7: freshTokens counts uncached input, cache writes and output, ne
   expect(L.freshTokens({ cache_read_input_tokens: 9902 })).toBe(0)
   expect(L.freshTokens(undefined)).toBe(0)
 })
+
+test('H05: the run record carries what the budget accounting holds: running has the thread budget before the run, exited the run\'s tokens and the budget after it', () => {
+  const runs = (event: string) => rows('lanes/state.jsonl').filter(l => l.rec === 'run' && l.event === event)
+  const thread = (e: string) => st.lanes[runs(e).find(l => l.lane)!.lane].thread
+  // mesh-h1: a fresh thread, stopped in the run at the budget
+  const r1 = runs('mesh-h1'), run1 = r1.find(l => l.state === 'running')!, end1 = r1.find(l => l.state === 'exited')!
+  expect(run1.budget).toEqual({ thread: thread('mesh-h1'), used: 0, limit: 250000 })
+  const exit1 = rows('lanes.jsonl').find(r => r.kind === 'exit' && r.event === 'mesh-h1')!
+  expect(end1).toMatchObject({ reason: 'budget', tokens: { in: exit1.tokens_in, out: exit1.tokens_out, fresh: exit1.tokens_fresh, calls: exit1.calls } })
+  expect(end1.budget.limit).toBe(250000); expect(end1.budget.used).toBeGreaterThanOrEqual(250000)
+  // mesh-h3: a later run of a thread that already spent tokens starts with them; its end adds its own
+  const run3 = runs('mesh-h3').find(l => l.state === 'running')!, end3 = runs('mesh-h3').find(l => l.state === 'exited')!
+  expect(run3.budget.used).toBe(0)                                                       // the test set the thread back to 0 before it
+  expect(end3.budget.used).toBe(end3.tokens.fresh)
+  // mesh-h8: an ordinary run in its own thread: used after = the run's fresh tokens, under the limit
+  const end8 = runs('mesh-h8').find(l => l.state === 'exited')!
+  expect(end8.reason).toBe('normal'); expect(end8.tokens.fresh).toBe(1015); expect(end8.budget).toMatchObject({ used: 1015, limit: 250000 })
+})

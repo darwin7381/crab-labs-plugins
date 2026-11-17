@@ -1425,6 +1425,9 @@ function queueRun(it: QItem): void {
   runRec(it, 'queued', { ev: lightEv(it.ev), priority: it.priority, summary: it.summary ?? null, enqueued: it.enqueued, extra: it.extra?.map(lightEv) ?? null,
     deaths: it.deaths ?? null, not_before: it.not_before ?? null })
 }
+/** H05: the thread's budget state as the budget accounting holds it: the fresh tokens its runs spent (freshTokens) and the limit (THREAD_BUDGET) */
+const budgetOf = (thread: string | undefined): { thread: string | null; used: number; limit: number } =>
+  ({ thread: thread ?? null, used: (thread && S.threads[thread]?.fresh) || 0, limit: THREAD_BUDGET })
 /** the run is over (or a queued one will never start) */
 function endRun(it: QItem, reason: string, f: Record<string, unknown> = {}): void {
   if (it.rid) runRec(it, 'exited', { reason, ...f })
@@ -2084,7 +2087,7 @@ function startRun(it: QItem): void {
   if (!lane) { endRun(it, 'died', { why: 'lane gone' }); return }
   const th = S.threads[lane.thread]
   if (th && (th.fresh ?? 0) >= THREAD_BUDGET) {
-    endRun(it, 'budget', { why: 'thread budget spent before the run' })
+    endRun(it, 'budget', { why: 'thread budget spent before the run', budget: budgetOf(lane.thread) })
     const text = `thread ${lane.thread} 已用 ${th.fresh} token（新的輸入、快取寫入與輸出；快取重讀不算），超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。`
     ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', notify_main: true, text })
     exitRule(lane, it, text)
@@ -2120,7 +2123,7 @@ function startRun(it: QItem): void {
   const lockSid = sess.includes('--fork-session') ? '' : sess.includes('--resume') ? sess[sess.indexOf('--resume') + 1] : lane.session_id   // 002l (S0 item 2)
   if (lockSid && child.pid) { try { mkdirSync(join(LANES_DIR, 'run', 'sid'), { recursive: true }); writeFileSync(sidLock(lockSid), String(child.pid)) } catch {} }
   it.pid = child.pid
-  runRec(it, 'running', { run: runId, pid: child.pid ?? null })
+  runRec(it, 'running', { run: runId, pid: child.pid ?? null, budget: budgetOf(lane.thread) })
   let timedOut = false, errTail = ''                                   // 002m (G06)
   const limit = setTimeout(() => {
     timedOut = true
@@ -2252,7 +2255,7 @@ function startRun(it: QItem): void {
       exit_code: code, signal, reason, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
     D.log('info', `lanes: exit ${runId} ${reason} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
     const wall = reason.startsWith('wall:') ? reason.slice(5) : null
-    endRun(it, reason, { exit_code: code, signal: signal ?? null, run: runId })
+    endRun(it, reason, { exit_code: code, signal: signal ?? null, run: runId, tokens: { in: tin, out: tout, fresh: tfresh, calls: usage.size }, budget: budgetOf(lane.thread) })
     if (lane.status === 'closed') { saveState(); pump(); return }          // the main or Joey closed this lane (lane_close stops its process): not run again
     if (wall) {
       // 002j: the model wall. Nothing was tried, so this is not an attempt: the event is queued again as it was; the probe timer starts the next run
