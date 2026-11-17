@@ -1,3 +1,39 @@
+## 1.33.0 — 2026-11-17
+
+- **Mailbox (信箱), receiving side: agent-inbox daemons fetch their messages from the hub and tell it what they took** (mailbox spec v3, Epeius `knowledge/delivery-ledger-spec-phase1.md`).
+  - **Why:** on 11-17, deliveries were lost or doubled between the sender and the session, and nobody could tell which (35 replays dropped for atlas; content-keyed redelivery counters; in-flight tracking held only in memory). Joey TG 447: 「寄件人知道自己寄出的東西有在郵局他就不用特別管了／收件人部分的接收程式同理自己跟中樞對好就好啊」. TG 455: mailbox only, nothing else.
+  - **How it works** (`hub-sync.ts`):
+    - The daemon asks the hub what is for it and not yet taken: `GET ${BTCC_API_BASE}/api/mesh/inbox/pending`, signed with the daemon's mesh credential (`meshAuth()`).
+    - It pushes each row's `payload` into a ready session, with `meta.msg_id = <id>`. Only sessions past `MCP_READY_DELAY_MS` get pushes.
+    - The message counts as seen once a transcript line holds ` msg_id="<id>"` (leading space, because `btcc_msg_id="…"` is also rendered).
+    - Seen ids are reported with `POST /api/mesh/inbox/taken {msg_ids}`, in batches of 200. A failed report is retried at the next sync, with one log line per change of reason.
+    - A pushed id not seen within `RECEIPT_GRACE_MS` is pushed again. Pushes are capped at `MAX_REDELIVERIES` per id; at the cap the daemon logs once and stops pushing. The hub keeps the id untaken, and that is the record. No alert.
+    - When it syncs: at boot, when a session becomes ready, on every `/inject` doorbell, and every 30 s. Syncs that overlap are merged.
+    - Agent-inbox daemons only. A Telegram daemon syncing the same identity would push every message twice into the same session.
+  - **`/inject` with a sender-assigned `msg_id` is a doorbell plus dedupe.**
+    - The daemon answers at once (the receiver allows `/inject` 8 s) and decides asynchronously. If the hub lists the id with a payload, hub sync delivers it, so it never also goes down the old path. A duplicate doorbell for an id already pushed, held, taken or delivered on the old path pushes nothing.
+    - The 1.32.2 path delivers it instead, unchanged, when the hub is unreachable, answers 404 (BTCC not deployed yet; then 5 min backoff), refuses the credential (401/403), or doesn't list that id. That id is remembered (`old_path`), so a later hub listing never pushes it again. Once the old path's receipt sees it, it is reported taken.
+    - A doorbell waiting for the sync is kept in `STATE_DIR/hub-doorbell/<id>.json`, so a restart in that window loses nothing.
+    - An id the daemon minted itself (receiver-side logging, `logged:false`) goes down the old path. The hub excludes those rows.
+    - The response keeps its fields and adds `hub: true|false`: whether hub sync is expected to deliver this id. A held doorbell that falls back still says `true`, and the log records the fallback.
+  - **Already delivered:** a row never pushed from the hub whose ` btcc_msg_id="<id>"` is already in the transcript is not pushed. It is reported taken. This covers messages delivered by 1.32.2 before this version, and a lost state file. The check reads only the tail of the 3 newest transcripts.
+  - **Local state** `STATE_DIR/hub-sync.json` = `{id: {pushes, last_push_at, seen_at, taken_at, old_path?}}`, written atomically, mode 0600. It holds push timing, the cap and restart safety; the hub is the source of truth. An entry is dropped 24 h after `taken`, or 48 h after its last activity if never taken.
+  - **`/healthz`** gains `hub: {enabled, credential, last_sync_at, last_sync_ok, status, pending_from_hub, pushed_unseen, to_confirm, capped, held_doorbells, without_payload}`; when off, `{enabled:false, why}`. `pending_disk_count` still counts the old path's disk only. Hub rows waiting while detached show up as `hub.pending_from_hub`.
+  - **Unchanged:** everything without a hub row: scheduler wakes, alerts, keep-warm, 讀信箱, board pushes, Telegram inbound and roamers (`sendToMcpSession`). Nothing was removed: the 1.32.2 path (memQueue, disk pending, replay, receipt, cap, quarantine) is still the fallback.
+  - **Switches** (env, or `~/.config/crab-labs-plugins/env`, read at boot):
+    - `HUB_SYNC=0` turns hub sync off and restores 1.32.2 delivery. Doorbells held by a previous process go down the old path at boot.
+    - `RECEIPT_CHECK=0` as before: a hub push counts as seen when written, and the already-delivered check is skipped.
+  - **Rollout order:** the daemons first, then BTCC's payload writers. Messages delivered by 1.32.2 and never reported taken would otherwise be pushed again on upgrade, unless the transcript tail still shows them (see "Already delivered").
+  - Tests: `hub-sync.test.ts` 24/0 (reconcile, cap, restart mid-flight, the doorbell paths, 404/unreachable, taken batching and backoff, GC, `HUB_SYNC=0` leftovers, the leading-space key); full suite 192/0.
+  - Dev daemon (`env -i`, port 18980, a mock hub, a fake MCP client in place of claude). Each case passed:
+    - hub rows while detached were pushed at ready (+2.5 s), seen and taken;
+    - a listed doorbell was delivered once by the hub, and its duplicate pushed nothing;
+    - an unlisted doorbell went down the old path and was reported taken;
+    - a client that never records got 3 pushes, then the cap line, with the hub still untaken;
+    - after a restart mid-flight, the state survived and the next push was 3/3;
+    - with hub 404 or the hub down, doorbells went down the old path;
+    - with `HUB_SYNC=0`, the hub got 0 requests.
+
 ## 1.32.2 — 2026-11-17
 
 - **Parked deliveries are no longer pushed before the client can take them, and a delivery counts only once the client has it** (Atlas btcc 9738).

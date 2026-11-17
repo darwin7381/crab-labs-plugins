@@ -13,6 +13,7 @@
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines } from './receipt.ts'
+import { HubSync, drainLeftoverDoorbells, hubSyncMode } from './hub-sync.ts'
 import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend } from './fleet-mail.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -793,6 +794,11 @@ const RECEIPT_GRACE_MS = Number(process.env.RECEIPT_GRACE_MS ?? 90_000)
 // then nothing would ever read as received and every delivery would be re-sent up to MAX_REDELIVERIES times.
 const RECEIPT_CHECK = process.env.RECEIPT_CHECK !== '0'
 
+// Hub sync (1.33.0, mailbox spec v3; hub-sync.ts): messages that have a hub row with a payload are pulled from BTCC
+// and pushed from there; the old path below reports the hub ids it delivered as taken. Set further down, once
+// meshAuth and the session registry exist; null = off (HUB_SYNC=0, not agent-inbox, no BTCC_API_BASE) = 1.32.2.
+let hub: HubSync | null = null
+
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
 // whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
 // to consume anything. Observed 2026-08-18: claude-financial-assist's transcript
@@ -812,7 +818,8 @@ function deliveryKey(notif: { method: string; params: unknown }): string {
 }
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
-  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(notif); return }
+  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(notif); hub?.oldPathSeen(notif); return }
+  if (!RECEIPT_CHECK) hub?.oldPathSeen(notif)  // receipt off: pushed = seen (the 1.32.1 rule)
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
   recentDeliveries.push({ notif, at: Date.now(), pendingPath: null, keys: RECEIPT_CHECK ? receiptKeys(notif) : null, received: false })
   if (recentDeliveries.length > 200) recentDeliveries.shift()
@@ -859,7 +866,7 @@ function sweepDeliveries(): void {
   // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
   const unseen = recentDeliveries.filter(d => d.keys && !d.received)
   const lines = unseen.length ? recentReceiptLines(TRANSCRIPT_DIR, Math.min(...unseen.map(d => d.at))) : []
-  for (const d of unseen) if (receivedIn(lines, d.keys!)) d.received = true
+  for (const d of unseen) if (receivedIn(lines, d.keys!)) { d.received = true; hub?.oldPathSeen(d.notif) }
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
     const notReceived = !!d.keys && !d.received
@@ -1123,6 +1130,44 @@ function maybeAutoAckScheduled(notif: { method: string; params: unknown }): void
     }).then(r => log('info', `scheduler auto-ack run ${rid}: ${r.status}`))
       .catch(err => log('warn', `scheduler auto-ack run ${rid} failed (agent can still ack manually): ${err}`))
   } catch {}
+}
+
+// Hub sync wiring (1.33.0; the logic is in hub-sync.ts). Pushes go only into READY sessions (READY_DELAY_MS), never
+// through recordDelivery: the hub path tracks its own receipt (` msg_id="<id>"`) and cap, so the old path's
+// re-persist/replay never doubles a hub row. Agent-inbox daemons only (hubSyncMode). Started from startListen().
+const HUB_PUSH_TIMEOUT_MS = 5000
+async function pushToReadySessions(notif: { method: string; params: unknown }): Promise<number> {
+  let n = 0
+  for (const server of [...activeServers]) {
+    const sid = serverSessionId.get(server)
+    if (!sid || !sseReady(sid)) continue
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        server.notification(notif as Parameters<Server['notification']>[0]),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timed out')), HUB_PUSH_TIMEOUT_MS) }),
+      ])
+      n++
+    } catch (err) {
+      log('error', `hub push into session ${sid} failed: ${err}`)
+      if (!(err instanceof Error && err.message === 'timed out')) activeServers.delete(server)  // as broadcastNotification
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+  return n
+}
+const hubMode = hubSyncMode(process.env, INBOX_ONLY, BTCC_API_BASE)
+if (hubMode.on) {
+  hub = new HubSync({
+    base: BTCC_API_BASE,
+    auth: meshAuth,
+    push: pushToReadySessions,
+    seenLines: since => consumptionCheckAvailable() ? recentReceiptLines(TRANSCRIPT_DIR, since) : [],
+    dispatchOld: (chatId, notif) => dispatchInbound(chatId, notif),
+    defaultChatId: () => String(loadAccess().allowFrom[0] ?? 'local-inject'),
+    log,
+  }, { stateDir: STATE_DIR, receiptCheck: RECEIPT_CHECK, graceMs: RECEIPT_GRACE_MS, maxPushes: MAX_REDELIVERIES })
 }
 
 function loadInboxRegistry(): Record<string, { url: string; desc?: string }> {
@@ -2914,6 +2959,7 @@ setInterval(() => {
   }
   sweepDeliveries()  // issue #13: ack-on-consumption + orphan re-persist
   void drainPendingIfLive()  // recover parked deliveries without waiting for a session-open event
+  void hub?.kick('timer')  // hub sync: pull untaken rows, re-push the unseen past grace, confirm taken
 }, 30_000).unref()
 
 /**
@@ -3194,6 +3240,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length }
           catch { return 0 }
         })(),
+        hub: hub ? hub.health() : { enabled: false, why: hubMode.why },
         pid: process.pid,
       }
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -3272,7 +3319,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         return
       }
       const from = verdict.sender
-      let btccMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
+      // The sender's hub id (BTCC mesh push / Comms console / a peer that logged first): the doorbell for hub sync.
+      const senderMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
+      let btccMsgId: number | undefined = senderMsgId
       // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
       // delivery gets a BTCC row unless the sender declares logged:true (senders
       // that already log with richer context: fleet call, BTCC /send, Argus wake).
@@ -3314,7 +3363,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       // Default chat_id = first allowFrom (the owner): if the agent finishes and
       // reports via the reply tool, the report lands with the boss per contract.
       const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
-      await dispatchInbound(chatId, {
+      const notif = {
         method: 'notifications/claude/channel',
         params: {
           content: text,
@@ -3333,9 +3382,15 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
           },
         },
-      })
+      }
+      // Hub doorbell (1.33.0): a sender-assigned hub id is delivered by hub sync when the hub lists it with a
+      // payload; decided asynchronously (the receiver gives /inject 8 s), falling back to this old path otherwise.
+      // An id this daemon minted itself (logged:false above) is excluded from the hub's pending list: old path.
+      const route = hub && senderMsgId != null && btccMsgId === senderMsgId
+        ? hub.doorbell(senderMsgId, chatId, notif) : 'old'
+      if (route === 'old') await dispatchInbound(chatId, notif)
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ injected: true, active_sessions: activeServers.size }))
+      res.end(JSON.stringify({ injected: true, active_sessions: activeServers.size, hub: route === 'hub' || route === 'dup-hub' }))
       return
     }
 
@@ -3579,6 +3634,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           // Disk-pending drain (covers daemon restart and "0 active session" gap).
           // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
           void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
+          void hub?.kick('session-ready')   // hub rows that waited while detached
         }
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {
@@ -3644,6 +3700,13 @@ function startListen(): void {
     // Joey rule 2026-07-12: never silently run stale code — self-report version
     // + freshness vs origin/main at every boot (fail-open, see version-check.ts).
     void checkVersion().then(() => log('info', versionLine())).catch(() => {})
+    // Hub sync (1.33.0): boot sync. Off → hand any doorbell a previous process held to the old path, so turning
+    // HUB_SYNC off never strands one.
+    if (hub) void hub.start()
+    else {
+      if (INBOX_ONLY) log('info', `hub sync: off (${hubMode.why}) — 1.32.2 delivery path only`)
+      void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)
+    }
     // Roamer cross-protocol auto-discovery: announce ourselves so partner-
     // protocol roamer daemons can find us when they spawn target claudes.
     // Safe no-op when ROAMER_MODE is unset (channel-bot deployments).
