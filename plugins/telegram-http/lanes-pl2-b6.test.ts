@@ -44,8 +44,8 @@ test('L6B6: cut by --max-turns after ask_joey: the stop is in the digest, marked
   expect(stop.notify_main).toBe(true)
   expect(stop.refs).toMatchObject({ capped: 'turns', wake: false, owned_by: 'ask_joey' })
   expect(stop.text).toContain('已經用 ask_joey 問過 Joey')
-  expect(L.takePendingDigest(true, 'wake')).toBeNull()                        // nothing wakes the main
-  const d = L.takePendingDigest(false, 'piggyback')!
+  expect(L.__main().items(r => r.kind === 'handoff' && r.event === 'mesh-b6a').length).toBe(0)   // nothing wakes the main
+  const d = L.__digest()!
   expect(d.text).toContain('mesh-b6a')                                         // it rides in the next digest
   await sleep(100)
   expect(sent.length).toBe(s0)                                                 // and Joey hears nothing more from the router
@@ -66,6 +66,5 @@ test('L6B6: cut after only a notify_joey: the main is woken to take over, as bef
   expect(await until(() => rows().some(r => r.kind === 'stop' && r.event === 'mesh-b6c'))).toBe(true)
   const stop = rows().find(r => r.kind === 'stop' && r.event === 'mesh-b6c')
   expect(stop.refs.wake).toBeUndefined()
-  const w = L.takePendingDigest(true, 'wake')
-  expect(w).not.toBeNull(); expect(w!.wake).toBe(true)
+  expect(L.__main().items(r => r.kind === 'handoff' && r.event === 'mesh-b6c').length).toBe(1)   // one item for the main
 })

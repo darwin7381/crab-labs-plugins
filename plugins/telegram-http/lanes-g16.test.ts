@@ -42,7 +42,6 @@ const deps: any = { role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir:
     rearm: () => { state.rearms++ } } }
 L.lanesInit(deps)
 L.__setMainConnected('mcp-main')
-L.__setDigestIO({ mainConnected: async () => true, deliver: async () => true })
 const st = L.__lanesState()
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 6000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
@@ -54,19 +53,20 @@ const turnEnd = (ms: number) => rec({ type: 'system', subtype: 'turn_duration', 
 const genuine = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'end_turn', content: [{ type: 'text', text: '好' }] } })
 const toolUse = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'tuX', name: 'Bash', input: { command: 'make report' } }] } })
 /** wall up (a newer error record in the main's transcript), then the probe gets through: returns the Joey notice that follows */
+/** M2: the main's turn ends in StopFailure rate_limit (the shared wall goes up), then the probe gets through and the wall comes down */
 async function wallCycle(): Promise<string> {
   const k = sent.length
   L.__setClaudeBin(WALLED)
-  const t = Date.now()
-  appendFileSync(T, apiErr(t - 20) + turnEnd(t - 10))
-  L.mainWallTick()
-  expect(await until(() => L.wallHoldsMain())).toBe(true)
-  await sleep(80)                                                                            // the wall going up has its own sweep (setTimeout 0): let it pass
+  const pid = L.__main().mainPid()!, p = `p-${Math.random().toString(36).slice(2)}`
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p })
+  await L.__mainEvent({ event: 'StopFailure', pid, prompt_id: p, error: 'rate_limit', reason: LIMIT })
+  expect(L.__main().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(true)
   state.drives = []; state.rearms = 0; order.length = 0
   L.__setClaudeBin(OK)
-  expect(await until(() => !L.wallHoldsMain())).toBe(true)
-  expect(await until(() => sent.some((s, i) => i >= k && s.includes('主線的模型恢復了')))).toBe(true)
-  return sent.slice(k).find(s => s.includes('主線的模型恢復了'))!
+  expect(await until(() => !L.wallActive())).toBe(true)
+  expect(await until(() => sent.some((s, i) => i >= k && s.includes('模型恢復了')))).toBe(true)
+  expect(L.__main().mainPhase()).not.toBe('walled')                                        // M2: walled → idle when the wall is down
+  return sent.slice(k).find(s => s.includes('模型恢復了'))!
 }
 
 test('G16c: a picker is described with its real option labels, not only the count; the generic detector finds the limit menu', () => {
@@ -101,17 +101,27 @@ test('G16a: pickContinueOption picks the option that continues or waits, and nev
   expect(L.pickContinueOption([])).toBeNull()
 })
 
+// ------------------------------------------------------------------ (b) the deaf main
+const T0 = Date.now() - 600_000
+function resetMain(body: string, pid = process.pid) {
+  writeFileSync(T, body)
+  deps.mainPicker = deps.mainPicker
+  ;(L as any).__setMainPid(pid)
+  delete st.main_wall; delete (st as any).main_deaf
+  state.pane = NORMAL; state.drives = []; state.rearms = 0
+}
+const quiet = async (deliveredAt: number, now = Date.now()) => L.noteMainDeaf(deliveredAt, now)
+
 test('G16a: wall down with the main on its limit menu: the continue option is driven BEFORE anything is handed to the main, and Joey is told what was chosen', async () => {
   state.pane = LIMIT_PANE(SAFE); state.driveResult = 'ok'
   const notice = await wallCycle()
   expect(state.drives.length).toBe(1); expect(state.drives[0].idx).toBe(0); expect(state.drives[0].key).toStartWith('generic-')
   expect(notice).toContain('主線停在一個選單'); expect(notice).toContain('2. Upgrade your plan'); expect(notice).toContain('已選「Wait here, then continue automatically at 5:48 PM」'); expect(notice).toContain('它繼續了')
   expect(state.rearms).toBe(0)
-  expect(await until(() => order.includes('sweep'))).toBe(true)
-  expect(order.indexOf('drive')).toBeLessThan(order.indexOf('sweep'))                        // the menu first, then what was kept is given
   const m = logos.filter(r => r.kind === 'lane.main_menu').at(-1)
   expect(m).toMatchObject({ why: 'wall-down', chose: { idx: 0 }, result: 'ok', resurfaced: false }); expect(m.options).toEqual(SAFE)   // the labels are in the daemon's record
-  expect(logos.filter(r => r.kind === 'lane.main_wall_down').at(-1).menu).toMatchObject({ chose: 'Wait here, then continue automatically at 5:48 PM', result: 'ok' })
+  expect(await until(() => !!logos.filter(r => r.kind === 'lane.wall_down').at(-1)?.menu)).toBe(true)
+  expect(logos.filter(r => r.kind === 'lane.wall_down').at(-1).menu).toMatchObject({ chose: 'Wait here, then continue automatically at 5:48 PM', result: 'ok' })
 })
 
 test('G16a: no safe option, a menu that is not about the limit, or a drive that did not take: nothing unsafe is pressed and the menu is put in front of Joey again', async () => {
@@ -139,60 +149,4 @@ test('G16a: no menu on the pane (or no pane): the wall-down notice is as before'
   deps.mainPicker = { ...was, capture: async () => { throw new Error('no tmux') } }
   notice = await wallCycle(); expect(notice).not.toContain('選單')
   deps.mainPicker = was
-})
-
-// ------------------------------------------------------------------ (b) the deaf main
-const T0 = Date.now() - 600_000
-function resetMain(body: string, pid = process.pid) {
-  writeFileSync(T, body)
-  deps.mainPicker = deps.mainPicker
-  ;(L as any).__setMainPid(pid)
-  delete st.main_wall; delete (st as any).main_deaf
-  state.pane = NORMAL; state.drives = []; state.rearms = 0
-}
-const quiet = async (deliveredAt: number, now = Date.now()) => L.noteMainDeaf(deliveredAt, now)
-
-test('G16b: a delivery queued for over a minute with the main alive, no open tool call and no new assistant record: one push, a ledger line, a lane.main_deaf record', async () => {
-  const d0 = Date.now() - 90_000
-  resetMain(genuine(T0) + turnEnd(T0 + 5))
-  const k = sent.length
-  expect(await quiet(d0)).toBe('noted')
-  expect(sent.length).toBe(k + 1); expect(sent[k]).toContain('主線沒有在讀'); expect(sent[k]).toContain('已經 90 秒'); expect(sent[k]).toContain('停在選單，或沒有開新回合')
-  expect(sent[k]).not.toContain('它停在一個選單')                                             // no menu on the pane: no menu sentence
-  const led = await import('fs').then(f => f.readFileSync(join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(r => r.refs?.tier_rule === 'main-deaf'))
-  expect(led.length).toBe(1); expect(led[0]).toMatchObject({ kind: 'notify', notify_main: true, refs: { tier: 'push', escalated: true } })
-  await sleep(50)
-  const r = logos.filter(x => x.kind === 'lane.main_deaf').at(-1)
-  expect(r).toMatchObject({ queued_s: 90, pid: process.pid, menu: null }); expect(r.assistant_at).toBeGreaterThan(0)
-  expect(await quiet(d0 + 1_000)).toBe('no'); expect(await quiet(d0 - 5_000)).toBe('no')   // other deliveries of the same silence: no second push
-  expect(sent.length).toBe(k + 1)
-})
-
-test('G16b: a new stretch of silence (the main answered in between) is told again', async () => {
-  const k = sent.length
-  const answeredAt = Date.now() - 50_000
-  appendFileSync(T, genuine(answeredAt) + turnEnd(answeredAt + 5))
-  const d1 = answeredAt + 10_000                                                             // handed to the main after it answered, and nothing came of it
-  expect(await quiet(d1, d1 + 75_000)).toBe('noted'); expect(sent.length).toBe(k + 1)
-})
-
-test('G16b: not deaf: under a minute, a tool call in progress, a process that is gone, a model wall, an assistant record after the delivery', async () => {
-  const d = Date.now() - 90_000, base = genuine(T0) + turnEnd(T0 + 5), k = sent.length
-  resetMain(base); expect(await quiet(Date.now() - 30_000)).toBe('no')                      // only 30 s
-  resetMain(base + toolUse(Date.now() - 80_000)); expect(await quiet(d)).toBe('no')           // a tool call is open: the main is busy, mainStuckTick's business
-  resetMain(base, 999_999); expect(await quiet(d)).toBe('no')                                // the process is gone: not "alive but not reading"
-  resetMain(base); st.main_wall = { since: new Date().toISOString(), kind: 'usage', text: 'x', model: '', err_at: 0, mid_task: false, probes: 0 } as any
-  expect(await quiet(d)).toBe('no'); delete st.main_wall                                     // behind the model wall: its own notice
-  resetMain(base + genuine(d + 20_000)); expect(await quiet(d)).toBe('no')                   // it answered after the delivery
-  expect(sent.length).toBe(k)
-})
-
-test('G16b: when the main sits on a menu, the push says which and the menu is put in front of Joey (no key is pressed)', async () => {
-  resetMain(genuine(T0) + turnEnd(T0 + 5)); state.pane = LIMIT_PANE(SAFE)
-  const k = sent.length
-  expect(await quiet(Date.now() - 100_000)).toBe('noted')
-  expect(sent[k]).toContain('主線沒有在讀'); expect(sent[k]).toContain('它停在一個選單'); expect(sent[k]).toContain('1. Wait here, then continue automatically at 5:48 PM'); expect(sent[k]).toContain('選項已再傳給你')
-  expect(state.drives.length).toBe(0); expect(state.rearms).toBe(1)
-  await sleep(50)
-  expect(logos.filter(x => x.kind === 'lane.main_deaf').at(-1).menu).toEqual(SAFE)
 })

@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """End-of-turn check of the MAIN (universe 002j): every message taken in during this turn is answered or deferred.
 
-Problem (problems list, item 9): a message that arrives while the main is working is absorbed into the running turn. A model
+Problem (problems list, item 9): a message that reaches the main while it is working is pulled into the running turn. A model
 may fold it into the task at hand and end the turn without ever answering it (seen live on 2026-11-14 with Haiku, with no
-fault injected). main-midturn-hook.py hands such a message back once; this hook checks the OUTCOME when the turn is about to end.
-
-Program first, Jev for the narrow remainder (site: /genesis/jev-design, rule 1). From the session's own transcript the hook
-establishes, in code:
-  - the turn: everything after the last end-of-turn record;
-  - the messages taken in during it: the prompt that started it and every message absorbed mid-turn, with their ids;
-  - the outputs: the reply / send_to_agent tool calls of the turn, with their reply_to ids.
+fault injected). This aid checks the OUTCOME when the turn is about to end. It is called by lanes-hooks/main-hook.py (the
+main's Stop hook), which hands it what the daemon knows, no transcript is read:
+  - the messages of the turn: exactly the items M1 bound to this prompt (the one that opened it and the ones pulled into it);
+  - the outputs: the reply / send_to_agent calls of the turn (the main hook reports them at PostToolUse), with their reply_to ids.
 A turn that took in one message is not checked. A message that an output replies to BY ID is answered: no question is asked.
 For the others Jev is asked three narrow questions per message, all in one request: does it need a reply; does any output
 address it; does any output say it will be handled later. A message that needs a reply and has neither is listed back to
@@ -22,22 +19,17 @@ ANSWERED_GATE_MODE=shadow records what it would have done (run/answered-gate.jso
 """
 import json
 import os
-import re
 import sys
 import tempfile
 import time
 import urllib.request
 
-TAIL_BYTES = 3_000_000
 BODY_MAX, OUT_MAX = 1500, 2000
 YES, NO = 0.7, 0.35                      # starting points (official cookbooks); calibrate on run/answered-gate.jsonl
 MODEL = os.environ.get('TYPESAFE_DEFAULT_MODEL', 'jev-1.14.0')
 API = os.environ.get('TYPESAFE_BASE_URL', 'https://api.typesafe.ai').rstrip('/') + '/v1/systemone'
 KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE', os.path.expanduser('~/.genesis/typesafe.env'))
 TIMEOUT_S = float(os.environ.get('ANSWERED_GATE_TIMEOUT_S', '6'))
-CH = re.compile(r'<channel ([^>]*)>\n?(.*?)\n?</channel>', re.S)
-ATTR = re.compile(r'(\w+)="([^"]*)"')
-REPLY_TOOLS = ('__reply', '__send_to_agent')
 
 
 def load_key():
@@ -82,65 +74,6 @@ def jev_log(d, site, question, inputs, answer, p, ms, err):
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
     except Exception:
         pass
-
-
-def tail(path):
-    try:
-        size = os.path.getsize(path)
-        with open(path, 'rb') as f:
-            if size > TAIL_BYTES:
-                f.seek(size - TAIL_BYTES)
-                f.readline()
-            return f.read().decode('utf-8', errors='replace')
-    except OSError:
-        return ''
-
-
-def channel_messages(text):
-    out = []
-    for m in CH.finditer(text or ''):
-        a = dict(ATTR.findall(m.group(1)))
-        mid = a.get('message_id') or a.get('btcc_msg_id') or a.get('did')
-        if not mid:
-            continue
-        out.append({'mid': mid, 'kind': 'tg' if a.get('message_id') else 'mesh' if a.get('btcc_msg_id') else 'sys',
-                    'user': a.get('user', ''), 'no_reply': a.get('no_reply') == 'true', 'system': a.get('user') == 'lanes' or bool(a.get('kind')),
-                    'body': m.group(2).strip()})
-    return out
-
-
-def turn(path):
-    """-> (messages taken in during the current turn, outputs of the turn), both in transcript order."""
-    msgs, outs, seen = [], [], set()
-    for line in tail(path).splitlines():
-        if not line:
-            continue
-        try:
-            j = json.loads(line)
-        except ValueError:
-            continue
-        t = j.get('type')
-        if t == 'system' and j.get('subtype') in ('turn_duration', 'stop_hook_summary'):
-            msgs, outs, seen = [], [], set()            # a turn ended here: what follows is the next turn
-            continue
-        found = []
-        if t == 'user' and isinstance((j.get('message') or {}).get('content'), str):
-            found = channel_messages(j['message']['content'])
-        elif t == 'queue-operation' and j.get('operation') == 'remove' and j.get('reason') == 'absorbed_mid_turn':
-            found = channel_messages(str(j.get('content') or ''))
-            for f in found:
-                f['absorbed'] = True
-        for f in found:
-            if f['mid'] not in seen:
-                seen.add(f['mid']); msgs.append(f)
-        if t == 'assistant':
-            for c in (j.get('message') or {}).get('content') or []:
-                if isinstance(c, dict) and c.get('type') == 'tool_use' and str(c.get('name', '')).endswith(REPLY_TOOLS):
-                    i = c.get('input') or {}
-                    if i.get('text'):
-                        outs.append({'to': str(i.get('to') or ('Joey' if str(c.get('name')).endswith('__reply') else '')),
-                                     'reply_to': str(i.get('reply_to') or ''), 'text': str(i['text'])})
-    return msgs, outs
 
 
 CALL = {}                                          # 002k: what the last Jev call was (question, answers, ms, error), for the logs
@@ -229,34 +162,19 @@ def judge(msgs, outs):
     return verdict, a
 
 
-def memory_gate_reason(payload):
-    """main-memory-gate.py sits beside this file; it is called from here because this is the Stop hook the lab wires for the main.
-    Never raises: a missing or broken gate must not affect the answered check."""
+def reason(p, msgs, outs):
+    """The block reason for a turn whose bound messages were not addressed, or None. msgs: [{mid, kind, user, no_reply, system, body}] (M1);
+    outs: [{to, reply_to, text}]. Never raises."""
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location('main_memory_gate', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main-memory-gate.py'))
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
-        return m.reason(payload)
+        return _reason(p, list(msgs or []), list(outs or []))
     except Exception:
         return None
 
 
-def main():
-    try:
-        p = json.load(sys.stdin)
-    except Exception:
-        return
-    if (p.get('hook_event_name') or '') != 'Stop':
-        return
-    held = memory_gate_reason(p)                         # 002k (D1): a Joey-sourced memory proposal that is still undecided holds the turn once
-    if held:
-        print(json.dumps({'decision': 'block', 'reason': held}, ensure_ascii=False))
-        return
+def _reason(p, msgs, outs):
     sid, d = p.get('session_id') or '', lanes_run_dir(p)
-    msgs, outs = turn(p.get('transcript_path') or '')
     if len(msgs) < 2:                                   # a turn that took in one message is not checked
-        return
+        return None
     def log_call():                                      # 002k: the call, when there was one, in the unified log too
         if 'ms' in CALL:
             jev_log(d, 'answered-gate', CALL.get('question'), {'session': sid, 'messages': [m['mid'] for m in msgs], 'outputs': len(outs)},
@@ -266,7 +184,7 @@ def main():
     except Exception as e:                               # a failed call is an error, never a verdict
         record(d, {'session': sid, 'error': f'{type(e).__name__}: {e}'[:200], 'ms': CALL.get('ms'), 'messages': [m['mid'] for m in msgs]})
         log_call()
-        return
+        return None
     log_call()
     sp = os.path.join(d, 'answered-gate.json')
     try:
@@ -276,9 +194,9 @@ def main():
     missed = [m for m in msgs if verdict.get(m['mid']) == 'not_addressed' and f"{sid}:{m['mid']}" not in st]
     mode = os.environ.get('ANSWERED_GATE_MODE', 'enforce')
     record(d, {'session': sid, 'mode': mode, 'outputs': len(outs), 'ms': CALL.get('ms'), 'blocked': [m['mid'] for m in missed] if mode != 'shadow' else [],
-               'messages': [{'mid': m['mid'], 'kind': m['kind'], 'absorbed': bool(m.get('absorbed')), 'verdict': verdict.get(m['mid']), 'p': m.get('p')} for m in msgs]})
+               'messages': [{'mid': m['mid'], 'kind': m['kind'], 'verdict': verdict.get(m['mid']), 'p': m.get('p')} for m in msgs]})
     if not missed or mode == 'shadow':
-        return
+        return None
     for m in missed:
         st[f"{sid}:{m['mid']}"] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
     try:
@@ -287,10 +205,22 @@ def main():
             json.dump(dict(list(st.items())[-500:]), f)
         os.replace(tmp, sp)
     except OSError:
-        return                                           # cannot remember = would repeat on every stop: say nothing instead
+        return None                                      # cannot remember = would repeat on every stop: say nothing instead
     lines = '\n'.join(f"- {m['user'] or '寄件者'}（{'Telegram' if m['kind'] == 'tg' else 'mesh'} {m['mid']}）：「{m['body'][:300]}」" for m in missed)
-    print(json.dumps({'decision': 'block', 'reason': '這一輪先不要結束。你這一回合收到的下面這幾則訊息，到現在沒有回應，也沒有交代什麼時候處理：\n' + lines +
-                      '\n請現在回應；如果要晚一點才處理，也回一句讓對方知道。已經回過的不用重回。'}, ensure_ascii=False))
+    return ('這一輪先不要結束。你這一回合收到的下面這幾則訊息，到現在沒有回應，也沒有交代什麼時候處理：\n' + lines +
+            '\n請現在回應；如果要晚一點才處理，也回一句讓對方知道。已經回過的不用重回。')
+
+
+def main():
+    """Standalone (tests): stdin = the Stop payload plus `lanes_turn` {items, outputs}, as main-hook.py passes them."""
+    try:
+        p = json.load(sys.stdin)
+    except Exception:
+        return
+    t = p.get('lanes_turn') or {}
+    r = reason(p, t.get('items') or [], t.get('outputs') or [])
+    if r:
+        print(json.dumps({'decision': 'block', 'reason': r}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

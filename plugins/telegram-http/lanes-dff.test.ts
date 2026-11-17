@@ -19,7 +19,6 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
   deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
   sendBot: async (_c: string, text: string) => { sent.push(text); return 9100 + sent.length }, joeyChatId: () => '1' } as any)
 L.__setMainConnected('mcp-main')
-L.__setDigestIO({ mainConnected: async () => true, deliver: async (content: string, meta: any) => { delivered.push({ content, meta }); return true } })
 afterAll(() => { L.__setClaudeBin(restore); spawnSync('pkill', ['-f', bin]) })
 const st = L.__lanesState()
 const led = (): any[] => { try { return readFileSync(join(dir, '.lanes', 'ledger.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
@@ -70,8 +69,9 @@ test('fan_out: one lane per part, results go to a synthesis lane, ONE conclusion
   expect(fo.synthesis).toBeTruthy()
   expect(st.lanes[fo.synthesis!].kind).toBe('synthesis')
   const r = await L.callLaneTool(tok(fo.synthesis!, { synthesis: fo.id }), 'deliver_synthesis', { text: 'mock-api 兩次延遲；mock-backup 一次失敗已重跑成功；mock-tickets 正常。整體：可接受。' })
-  expect(r).toContain('delivered')
-  expect(delivered.length).toBe(1); expect(delivered[0].meta.kind).toBe('synthesis'); expect(delivered[0].content).toContain('mock-backup')
+  expect(r).toContain('queued for the main')
+  const carry = L.__main().items(x => x.kind === 'carry')                              // M1: one item for the main, offered when it is idle
+  expect(carry.length).toBe(1); expect(carry[0].notif.params.meta.kind).toBe('synthesis'); expect(carry[0].notif.params.content).toContain('mock-backup')
   expect(sent.length).toBe(0)                                                          // nothing to Joey from the lanes
 })
 

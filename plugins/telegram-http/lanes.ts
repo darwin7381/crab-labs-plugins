@@ -11,19 +11,18 @@
  *         lane_close, ledger_query).
  *   inbox (agent-inbox daemon): forwards every mesh inbound to the tg router (/lanes/route);
  *         performs mesh sends for lanes (/lanes/send — it holds the agent's mesh credential);
- *         delivers the escalation wake digest to the registered main (/lanes/deliver-main).
- *   002b: a digest never wakes an idle main. It rides along with the main's next naturally triggered turn
- *         (the router attaches it to a decision that targets the main: Decision.digest → notifWithDigest);
- *         only an escalation / stopped thread / push-tier notice still wakes it (digestTickWith).
- * Both daemons: main registration (/lanes/register-main, called by the main TUI's SessionStart
- * hook) and single-target delivery to the registered main's MCP session.
+ *         writes into its own MCP stream of the main what the tg daemon offers it (/lanes/offer).
+ * The tg daemon is the one writer of the lanes state (lanes-state.ts: the journal <state dir>/lanes/state.jsonl).
+ * M1 + M2 (lanes-main.ts): what is delivered to the main and whether it was consumed; the main's own record, moved only by
+ * its hook events (lanes-hooks/main-hook.py → /lanes/main-event) and kill -0.
  *
  * Files live in <workspace>/.lanes/ (LANES_DIR): router.json, main.json, main-expected,
  * ledger.jsonl (append-only), routing.jsonl, lanes.jsonl (lane lifecycle + tokens), state.json
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
  * (main writes), digest.json, run/ (per-run MCP configs, stderr).
  */
-import { lastAssistantFile, openToolCallFile, intakeAtFile, genuineAssistantAtFile, type Intake } from './liveness.ts'
+import { Journal, type Row } from './lanes-state.ts'
+import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, type TriageAsk } from './lanes-triage.ts'
 import { randomBytes, randomUUID, createHash } from 'crypto'
@@ -39,8 +38,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  ackState, clip, cleanReport, openJoeyProposals, parseLedgerLine, parseLocal, planDigest, piggybackContent, queryLedger, releaseState, reportMarkup, stripMarkup,
-  type DigestCursor, type DigestTake, type LedgerRec,
+  clip, cleanReport, isWakeEntry, openJoeyProposals, parseLedgerLine, parseLocal, queryLedger, renderDigest, reportMarkup, stripMarkup, type LedgerRec,
 } from './lanes-digest.ts'
 
 export const LANES_ON = process.env.GENESIS_LANES === '1'
@@ -116,18 +114,11 @@ let LANE_MAX_RUN_MS = Number(process.env.LANES_MAX_RUN_MS ?? 900_000)
 export const __setLaneMaxRun = (ms: number): void => { LANE_MAX_RUN_MS = ms }
 /** tests only: the program started as a lane; returns the previous one */
 export const __setClaudeBin = (bin: string): string => { const was = CLAUDE_BIN; CLAUDE_BIN = bin; return was }
-const DIGEST_RETRY_MS = Number(process.env.LANES_DIGEST_RETRY_MS ?? 120_000)   // an un-acked digest take is taken again after this
-const WAKE_HOLD_MS = Number(process.env.LANES_WAKE_HOLD_MS ?? 90_000)          // a wake entry of a lane that is still running waits this long at most
 // 002d: a handoff the main has not received after this long is told to Joey once (never silent, never double)
 const HANDOFF_FALLBACK_MS = Number(process.env.LANES_HANDOFF_FALLBACK_MS ?? 300_000)
 // 002g: a main that is away (its process is gone) gets this long to come back before Joey is told about work handed to it.
 // A restart takes seconds; a push for every blip would be noise, 5 silent minutes for a dead main is too long.
 let HANDOFF_DOWN_GRACE_MS = Number(process.env.LANES_HANDOFF_DOWN_GRACE_MS ?? 60_000)
-// 002g: how long after the main's process was replaced the "your turn was cut off, carry on" notice goes out
-const RESUME_NOTICE_DELAY_MS = Number(process.env.LANES_RESUME_NOTICE_DELAY_MS ?? 6_000)
-// 002i: a delivery that left no trace in the main's transcript after this long never arrived and is given again
-// (the same value is read by server.ts); after the main's process was replaced the check is run once this much later
-const ARRIVE_GRACE_MS = Number(process.env.LANES_ARRIVE_GRACE_MS ?? 20_000)
 // 002i: a critical alert reaches Joey within this long whatever its lane is doing. A lane that reports in time is the one
 // that rings (as before); when it has not, the router rings with the alert itself and the lane's findings follow quietly.
 // (T6-R 1.3 on 002h: the lane restarted the service, waited for it to settle and told Joey 6 minutes after the alert.)
@@ -149,13 +140,16 @@ export interface LanesDeps {
   transcriptDir: string
   httpPort: number
   log: Log
-  /** single-target delivery into the registered main's MCP session (server.ts) */
-  deliverToMain: (notif: Notif) => void
+  /** the daemon's state dir: the journal is <stateDir>/lanes/state.jsonl (default: the lanes dir) */
+  stateDir?: string
+  /** write a notification into MCP session `sid` when its stream is open (server.ts); false = not written */
+  notifySession?: (sid: string, notif: Notif) => Promise<boolean>
+  /** MCP session `sid` has its stream open */
+  streamOpen?: (sid: string) => boolean
   /** tg role: bot calls */
   sendBot?: (chat_id: string, text: string, opts: { silent?: boolean; topic?: number; replyTo?: number }) => Promise<number>
   createTopic?: (chat_id: string, name: string) => Promise<number>
   joeyChatId?: () => string
-  isMainIdle?: () => Promise<boolean>
   /** inbox role: mesh send with lane extras; resolves the minted btcc id */
   meshSend?: (to: string, text: string, replyTo: number | undefined, noReply: boolean,
               extra: { thread?: string; hop?: number; lane?: string }) => Promise<{ text: string; msgId?: number; delivered: boolean }>
@@ -163,12 +157,6 @@ export interface LanesDeps {
   registryNames?: () => string[]
   /** loopback MCP token check (mcp-auth gate) */
   authOk: (authz: string | undefined) => boolean
-  /** 002g: park again, for the next session, every delivery the main's transcript never answered; returns how many */
-  repersistUnconsumed?: () => number
-  /** 002i: run the delivery sweep and the drain of parked deliveries now */
-  sweepNow?: () => void
-  /** 002l (N6): how many deliveries are parked for the main right now (server.ts: inbox/pending) */
-  pendingCount?: () => number
   /** 002m (LG1): tell one MCP session that its tool list changed (server.ts: notifications/tools/list_changed), so it lists again */
   toolsChanged?: (mcpSid: string) => void
   /** 002k (G16): the main's pane and the startup picker on it (server.ts builds it from startup-picker.ts when it knows the main's tmux target) */
@@ -216,9 +204,12 @@ export function lanesInit(deps: LanesDeps): void {
   D = deps
   LANES_DIR = process.env.LANES_DIR ?? join(deps.workspaceDir, '.lanes')
   for (const d of ['', 'queue', 'run']) mkdirSync(join(LANES_DIR, d), { recursive: true, mode: 0o700 })
-  restoreMain()
   if (deps.role === 'tg') {
     loadState()
+    journal = new Journal(join(deps.stateDir ?? LANES_DIR, 'lanes', 'state.jsonl'))
+    journal.load()
+    main = createMain(mainEnv())
+    main.initMain()
     writeLaneSettings()
     loadQueue()
     for (const [id, list] of Object.entries(S.steering ?? {})) {                 // 002k (E18): messages that were with a run when the daemon stopped: that run is gone, they are the lane's next run
@@ -230,50 +221,82 @@ export function lanesInit(deps: LanesDeps): void {
     setTimeout(sweepQueue, 2_000).unref()          // 002f: what the previous daemon left running is dispatched again now
     setInterval(sweepQueue, 10_000).unref()
     setInterval(followupTick, 1_000).unref()
-    setInterval(() => { void digestTick() }, 10_000).unref()
+    setInterval(() => { void main.tick() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
     setInterval(handoffTick, 10_000).unref()
     setInterval(promiseTick, 10_000).unref()
     setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
-    setInterval(mainWallTick, 15_000).unref()       // 002j: a main behind the model wall (its own transcript says so)
-    setInterval(mainStuckTick, 15_000).unref()      // 002k: a main sitting in one tool call (design/stability SR3)
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
-    if (S.main_wall) { try { writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: S.main_wall.kind, text: S.main_wall.text })) } catch {}; armMainProbe(5_000) }
-    else { try { rmSync(mainWallFile()) } catch {} }
   }
   deps.log('info', `lanes: ON (role=${deps.role} agent=${deps.agent} dir=${LANES_DIR} model=${MODEL} cap=${MAX_RUNNING} hop_limit=${HOP_LIMIT})`)
 }
-
-// ================================================================== main registration
-// The main TUI's SessionStart hook POSTs {session_id, transcript_path} to /lanes/register-main.
-// The daemon identifies the CALLER by its TCP socket (Linux /proc) and walks up to the claude
-// process that ran the hook; that claude pid is what binds an MCP session to "the main".
-// Accepted when session_id == .lanes/main-expected (written by the keeper that launched it) or
-// when the same claude process re-registers (e.g. /clear). Anything else is refused — a second
-// claude started in the folder is never the main.
-type MainReg = { session_id: string; transcript_path: string; claude_pid: number; registered_at: string; source?: string }
-let mainReg: MainReg | null = null
-let mainMcpSid: string | null = null
-const mcpSessionPid = new Map<string, number>()   // MCP session id → owning claude pid
-
-function restoreMain(): void {
-  const m = readJson<MainReg | null>(join(LANES_DIR, 'main.json'), null)
-  if (m?.session_id) mainReg = m
+let journal: Journal
+let main: MainApi
+/** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
+function mainEnv() {
+  return {
+    journal, agent: D.agent, log: D.log,
+    offer: async (notif: Notif, via: Via, pid: number): Promise<boolean> => {
+      if (via === 'inbox') return !!(await inboxPost('/lanes/offer', { pid, notif }))?.offered
+      const sid = sessionOfPid(pid)
+      return !!sid && !!D.notifySession && await D.notifySession(sid, notif)
+    },
+    streamOpen: (pid: number): boolean => { const sid = sessionOfPid(pid); return !!sid && !!D.streamOpen?.(sid) },
+    info: digestInfo,
+    done: itemDone,
+    tellJoey: (text: string, rule: string) => {
+      ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
+      void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
+    },
+    wallUp: (kind: string, text: string, by: string) => wallUp({ kind, text }, by),
+    wallActive: () => !!S?.wall,
+    expectedSession: (): string[] => {
+      let expected = ''
+      try { expected = readFileSync(join(LANES_DIR, 'main-expected'), 'utf8').trim() } catch {}
+      return [expected, S?.renew?.new_sid ?? ''].filter(Boolean)
+    },
+    pidAlive,
+    refused: (sid: string, pid: number | null, reason: string) => {
+      appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })
+      logos('lane.register_refused', { session_id: sid, pid, reason, role: D.role })
+      if (pid) { refusedPids.set(pid, Date.now()); toolsChangedForPid(pid) }          // 002m (LG1)
+      tellRefused(sid, pid, reason)                                                       // 002m (LG2)
+    },
+    genChanged: (pid: number | null) => {
+      if (pid) { refusedPids.delete(pid); if (S?.renew) { delete S.renew; saveState(); try { rmSync(renewFile()) } catch {} } }
+      for (const [s] of mcpSessionPid) { try { D.toolsChanged?.(s) } catch {} }
+      logos('lane.main_gen', { pid, role: D.role })
+    },
+    menu: async () => { const m = await inspectMainMenu(false, 'main-stuck'); return m ? `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。` : null },
+    context: mainContext,
+  }
 }
-export function mainRegistration(): MainReg | null { return mainReg }
-export function mainMcpSession(): string | null { return mainMcpSid }
+
+// ================================================================== the main (M2 lives in lanes-main.ts; these are its uses here)
+// The main's hook (lanes-hooks/main-hook.py) posts every event to /lanes/main-event; SessionStart is the registration: accepted when its session id is
+// .lanes/main-expected (written by the keeper that launched it), the session of a /main renew, or the same process as the live main.
+// The daemon still tells MCP sessions apart by their socket (/proc): the session owned by the main's pid is the main's; any other is not (LG1).
+const mcpSessionPid = new Map<string, number>()   // MCP session id → owning claude pid
+/** the MCP session (of this daemon) owned by process `pid` whose stream is open, else any it owns */
+function sessionOfPid(pid: number): string | null {
+  let any: string | null = null
+  for (const [s, p] of mcpSessionPid) if (p === pid) { if (D.streamOpen?.(s)) return s; any = s }
+  return any
+}
+export function mainRegistration(): { session_id: string; pid: number; transcript_path: string } | null { return D?.role === 'tg' && main ? main.mainSession() : null }
+export function mainMcpSession(): string | null { const pid = main?.mainPid(); return pid ? sessionOfPid(pid) : null }
 // ------------------------------------------------------------------ 002m (LG1): a session that is not the main has no Telegram tools
 // runtime RU5 「只有持有「主」的那一個，拿得到你主對話的回覆工具」 and RU4 「沒有發的工具，就是不能做的事。搞錯身份也做不出主線的事」; RT11 (a second claude
 // started in the folder is never the main). G01 (002l r1-r3): the refused second session still listed and could call reply, react and edit_message.
-const refusedPids = new Map<number, number>()          // claude pid → when its register-main was refused
-/** true when this MCP session belongs to a claude process that is NOT the main: its registration was refused, or a live main is
- *  registered and bound to another session. A session whose process is not known yet, or any session while no live main is
- *  bound (a main that is starting or being replaced), is not judged here. */
+const refusedPids = new Map<number, number>()          // claude pid → when its SessionStart was refused
+/** true when this MCP session belongs to a claude process that is NOT the main: its SessionStart was refused, or a live main exists and
+ *  this is another process. A session whose process is not known yet, or any session while there is no live main, is not judged here. */
 export function sessionNotMain(mcpSid: string | undefined): boolean {
-  if (D?.role !== 'tg' || !mcpSid || mcpSid === mainMcpSid) return false
+  if (D?.role !== 'tg' || !mcpSid) return false
   const pid = mcpSessionPid.get(mcpSid)
   if (!pid) return false
-  if (refusedPids.has(pid) && pid !== mainReg?.claude_pid) return true
-  return !!(mainReg && mainMcpSid && pid !== mainReg.claude_pid && pidAlive(mainReg.claude_pid))
+  const mp = main?.mainPid() ?? null
+  if (refusedPids.has(pid) && pid !== mp) return true
+  return !!mp && pid !== mp
 }
 /** the Telegram tools only the main gets (server.ts), besides the main-only lane tools (isMainTool) */
 export const MAIN_TELEGRAM_TOOLS = ['reply', 'react', 'edit_message', 'download_attachment']
@@ -286,9 +309,9 @@ const refusedTold = new Set<string>()
 function tellRefused(sid: string, pid: number | null, reason: string): void {
   if (D?.role !== 'tg' || refusedTold.has(sid)) return
   refusedTold.add(sid)
-  const main = mainReg?.session_id
+  const m = main?.mainSession()?.session_id
   const text = `有另一個 claude session 想登記成 ${D.agent} 的主線，被我拒絕了（session ${sid.slice(0, 8)}${pid ? `，行程 ${pid}` : ''}）。`
-    + (main ? `主線還是 session ${main.slice(0, 8)}，照常運作；那個 session 拿不到 Telegram 的回覆工具。` : '目前沒有登記中的主線；那個 session 拿不到 Telegram 的回覆工具。')
+    + (m ? `主線還是 session ${m.slice(0, 8)}，照常運作；那個 session 拿不到 Telegram 的回覆工具。` : '目前沒有登記中的主線；那個 session 拿不到 Telegram 的回覆工具。')
     + '如果不是你開的，請把它關掉；要換主線請用 /main renew。'
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'register-refused', escalated: true, session: sid, pid, reason } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'register-refused', message_id: id, session: sid }))
@@ -296,25 +319,14 @@ function tellRefused(sid: string, pid: number | null, reason: string): void {
 function toolsChangedForPid(pid: number): void {
   for (const [s, p] of mcpSessionPid) if (p === pid) { try { D.toolsChanged?.(s) } catch {} }
 }
-export function isMainMcpSession(sid: string | undefined): boolean { return !!sid && sid === mainMcpSid }
-let mainDownSince = 0          // 002g: when the main was first seen gone; 0 = it is there
+export function isMainMcpSession(sid: string | undefined): boolean { const pid = main?.mainPid(); return !!sid && !!pid && mcpSessionPid.get(sid) === pid }
 function pidAlive(pid: number | null | undefined): boolean {
   if (!pid) return false
   try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' }
 }
-/** 002g: the registered main is there = its process is alive AND its MCP session is bound. The session id alone is not
- *  enough: a killed claude leaves it behind (bad-day run on 002f: work handed over 22 s into a 93 s outage was logged
- *  main_connected: true and simply waited for the main, instead of going to Joey). */
-export function mainConnected(): boolean {
-  if (mainMcpSid && mainReg && !pidAlive(mainReg.claude_pid)) {
-    D.log('warn', `lanes: the registered main's process ${mainReg.claude_pid} is gone — main-bound traffic parks until it is back`)
-    mcpSessionPid.delete(mainMcpSid); mainMcpSid = null
-  }
-  if (mainMcpSid) { mainDownSince = 0; return true }
-  if (!mainDownSince) mainDownSince = Date.now()
-  return false
-}
-export function mainTranscript(): string | null { return mainReg?.transcript_path ?? null }
+export function mainTranscript(): string | null { return main?.mainSession()?.transcript_path || null }
+/** called by the control commands that kill or restart the TUI on purpose (/restart, /kill_stuck): the gen ends `asked` */
+export function markDeliberateRestart(): void { main?.markEnd('asked') }
 
 function hexPort(p: number): string { return p.toString(16).toUpperCase().padStart(4, '0') }
 
@@ -379,232 +391,13 @@ function callerClaudePid(req: IncomingMessage): number | null {
 
 /** server.ts calls this when an MCP session's SSE stream opens (req = that GET). */
 export function noteMcpSocket(sid: string, req: IncomingMessage): void {
-  if (mcpSessionPid.has(sid)) { maybeBindMain(sid); return }
-  const pid = callerClaudePid(req)
+  const pid = mcpSessionPid.get(sid) ?? callerClaudePid(req)
   if (pid) mcpSessionPid.set(sid, pid)
-  D.log('info', `lanes: MCP session ${sid} owned by claude pid ${pid ?? '?'}${mainReg && pid === mainReg.claude_pid ? ' (registered main)' : ''}`)
-  maybeBindMain(sid)
+  D.log('info', `lanes: MCP session ${sid} owned by claude pid ${pid ?? '?'}${pid && pid === main?.mainPid() ? ' (the main)' : ''}`)
+  if (pid && D.role === 'tg') main.streamOpened(pid)
   if (sessionNotMain(sid)) { try { D.toolsChanged?.(sid) } catch {} }      // 002m (LG1): it listed its tools before it could be told apart; it lists again
 }
-export function forgetMcpSession(sid: string): void {
-  mcpSessionPid.delete(sid)
-  if (mainMcpSid === sid) {
-    mainMcpSid = null
-    D.log('warn', `lanes: main MCP session ${sid} closed — main-bound traffic parks until the registered main reconnects`)
-  }
-}
-function maybeBindMain(sid: string): void {
-  if (!mainReg) return
-  if (mcpSessionPid.get(sid) === mainReg.claude_pid && mainMcpSid !== sid) {
-    mainMcpSid = sid
-    D.log('info', `lanes: main bound → MCP session ${sid} (claude pid ${mainReg.claude_pid}, session ${mainReg.session_id})`)
-    logos('lane.main_bound', { mcp_session: sid, session_id: mainReg.session_id, pid: mainReg.claude_pid, role: D.role })
-  }
-}
-
-// ------------------------------------------------------------------ 002g: the main's process was replaced
-// The keeper brings a dead main back in seconds, on the same session. Until 002f that was all: the new process sat idle. The
-// message it had been handed was only given again after the daemon's 10-minute consumption grace, and nothing told it that
-// its turn had been cut off (bad-day run on 002f: main back after 3.5 s, Joey's question answered 10 minutes later).
-// Now, when the same session registers from a new process:
-//   1. every delivery the transcript never answered is parked again at once, so the new process gets it when it connects;
-//   2. if the transcript shows the old process died in the middle of a turn, the main is told so and asked to carry on.
-
-/** the end of a file as text, whole lines only; null when it cannot be read */
-function tailText(path: string, max: number): string | null {
-  try {
-    const size = statSync(path).size, n = Math.min(size, max)
-    const fd = openSync(path, 'r'), buf = Buffer.alloc(n)
-    readSync(fd, buf, 0, n, size - n); closeSync(fd)
-    const text = buf.toString('utf8')
-    return n < size ? text.slice(text.indexOf('\n') + 1) : text
-  } catch { return null }
-}
-
-/** 002i: what became of ONE delivery to the main, read from the main's own transcript. A message that became a prompt is a
- *  `user` record; one that arrived mid-turn is recorded as absorbed; one the client has received and not read yet is there
- *  as "enqueue" only. Only records written at or after `sinceMs` count (the time this delivery was made): an older enqueue
- *  belongs to an earlier attempt, usually to a claude process that has died since.
- *    taken            the model has it
- *    queued           the client has it and the model has not read it yet (fine while that process lives; lost if it dies)
- *    neither          this delivery left no trace: it never arrived (a client that is still starting drops what it is sent)
- *  null = cannot tell (nothing on the notification to recognise it by, or no transcript).
- *  History: on 002g Joey's question was queued in a main that was then killed, and was lost: the daemon's rule "the
- *  transcript advanced after the delivery" read the running turn's tool calls as consumption. On 002h it was parked again
- *  for the new process, replayed 50 ms after that process connected, dropped by the starting client, and written off by
- *  the same rule a second time. */
-export function intake(notif: Notif, sinceMs = 0): Intake | null {
-  // 002j: the recognition lives in liveness.ts (intakeNeedles / intakeInText): attributes keep their leading space, so
-  // `reply_to_message_id="7"` is not `message_id="7"`; a Telegram message is also matched on its chat; a tool result that
-  // prints the same tag is not the message being read; a delivery with no id of its own carries the daemon's `did`.
-  const path = mainReg?.transcript_path
-  if (!path) return null
-  return intakeAtFile(path, notif, sinceMs)
-}
-/** 002j: has the main written a genuine assistant record after `ms`? "Taken in" alone is not consumption: an agent at
- *  its usage limit takes a message in and answers with a synthetic API-error record (fleet replay 2026-11-14). */
-export function mainAnsweredAfter(ms: number): boolean {
-  const path = mainReg?.transcript_path
-  return !!path && genuineAssistantAtFile(path) > ms
-}
-/** 002m (L6G1, L6T1): did a turn of the session END after `ms`? A turn ends with an assistant record that stopped by itself
- *  (end_turn, no tool call) or the harness's end-of-turn record. A tool call is not an end: a turn that was cut in the
- *  middle of its tool work never finished the message it was working on. */
-export function turnEndedAfterFile(path: string, ms: number): boolean {
-  const text = tailText(path, 400_000)
-  if (!text) return false
-  for (const l of text.split('\n')) {
-    if (!l || !l.includes('"timestamp"')) continue
-    let j: any; try { j = JSON.parse(l) } catch { continue }
-    const t = Date.parse(j?.timestamp ?? '')
-    if (!Number.isFinite(t) || t <= ms) continue
-    if (j.type === 'system' && (j.subtype === 'turn_duration' || j.subtype === 'stop_hook_summary')) return true
-    if (j.type !== 'assistant' || j.isApiErrorMessage || j.message?.model === '<synthetic>') continue
-    const tool = (j.message?.content ?? []).some((c: any) => c?.type === 'tool_use')
-    if (j.message?.stop_reason === 'end_turn' && !tool) return true
-  }
-  return false
-}
-/** 002m (L6G1, L6T1): what became of one delivery to the main, for the consumption sweep and for a main replacement.
- *  stability SR2 「訊息掉了沒人處理（磁碟佇列與重送）」: a delivery is kept (in the delivery record, or parked on disk) until a live main
- *  has CONSUMED it, i.e. took it in and then finished a turn. A cut turn's own tool calls are not consumption.
- *    consumed  taken in, and a turn ended after that
- *    working   taken in, the main wrote its own records after it, and no turn has ended yet (a running turn, or a cut one)
- *    taken     taken in, nothing genuine after it yet (a wall, or the model has not answered yet)
- *    queued    in the client's queue, not read
- *    none      no trace in the transcript
- *  null = the delivery cannot be recognised (the caller falls back to "the transcript advanced"). */
-export type DeliveryFate = 'consumed' | 'working' | 'taken' | 'queued' | 'none'
-export function deliveryFate(notif: Notif, at: number): { fate: DeliveryFate; takenAt?: number } | null {
-  const path = mainReg?.transcript_path
-  const it = intake(notif, at)
-  if (!it || !path) return null
-  if (it.taken) {
-    if (turnEndedAfterFile(path, it.takenAt)) return { fate: 'consumed', takenAt: it.takenAt }
-    return { fate: genuineAssistantAtFile(path) > it.takenAt ? 'working' : 'taken', takenAt: it.takenAt }
-  }
-  return { fate: it.queued ? 'queued' : 'none' }
-}
-/** 002m (L6G1, L6T1): when the main's process is replaced, what becomes of one open delivery record.
- *    keep        consumed (a turn ended after the take-in), or an unrecognisable delivery the transcript advanced after
- *    park        never taken in (queued in the dead process, or no trace): parked again; the record stays so a late read retracts the copy
- *    park-close  taken in by the old process and never finished: parked again, and the record is closed (the dead process cannot read it) */
-export function replacementAction(notif: Notif, at: number, newest: number): 'keep' | 'park' | 'park-close' {
-  const f = deliveryFate(notif, at)
-  if (!f) return newest > at ? 'keep' : 'park'
-  if (f.fate === 'consumed') return 'keep'
-  return f.fate === 'working' || f.fate === 'taken' ? 'park-close' : 'park'
-}
-
-/** Did the session's last turn end, or was it cut off? Read from the end of its transcript: a completed turn ends with an
- *  assistant record that stopped by itself (or the harness's end-of-turn records); a turn that was cut off ends with a
- *  tool call, a tool result or a prompt. The "No response requested." record a resumed session writes is not a turn. */
-export function cutOffTurn(path: string): { cut: boolean; at?: string; walled?: boolean } {
-  const text = tailText(path, 400_000)
-  if (text == null) return { cut: false }
-  const lines = text.split('\n')
-  // 002j: `walled` = the turn did not end and the last thing the harness wrote for it is an API-error record (usage
-  // limit, overload). That is a wall, not a crash: telling the main to carry on would only send it into the wall again.
-  // (Real sessions end the turn normally after such a record, so this is only the short moment before that; the wall
-  // itself is read from the last assistant record: mainWalled / lastAssistantFile.)
-  let walled = false
-  const out = (at: string) => walled ? { cut: true, at, walled } : { cut: true, at }
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i]) continue
-    let j: any; try { j = JSON.parse(lines[i]) } catch { continue }
-    if (j.type === 'system' && (j.subtype === 'turn_duration' || j.subtype === 'stop_hook_summary')) return { cut: false }
-    if (j.type === 'assistant') {
-      if (j.message?.model === '<synthetic>') { if (j.isApiErrorMessage) walled = true; continue }
-      const tool = (j.message?.content ?? []).some((c: any) => c?.type === 'tool_use')
-      return j.message?.stop_reason === 'end_turn' && !tool ? { cut: false } : out(j.timestamp)
-    }
-    if (j.type === 'user' && !j.isMeta) return out(j.timestamp)
-    // 002l (N7): 002j 「有人下令重啟的，不再叫它接著做」 needs the cut to be seen first. This Claude Code writes every channel delivery as a user record
-    // with isMeta:true, so a turn cut right after it took in a channel message (T8-R K4: the take-in, an API request, then the kill) read "not cut" and
-    // resumeDecision returned 'none' before it looked at the deliberate-restart marker. A meta record that IS a channel message opens a turn; other meta
-    // records (reminders, hook companions) still do not.
-    if (j.type === 'user' && j.isMeta && /<channel[\s>]/.test(userText(j))) return out(j.timestamp)
-  }
-  return { cut: false }
-}
-function userText(j: any): string {
-  const c = j?.message?.content
-  if (typeof c === 'string') return c
-  return Array.isArray(c) ? c.map((x: any) => (typeof x === 'string' ? x : x?.text ?? '')).join('\n') : ''
-}
-
-// ------------------------------------------------------------------ 002j: when NOT to tell a replaced main to carry on
-// The resume notice (002g) was sent whenever the transcript ended mid-turn. Three cases where that is wrong:
-//   deliberate  the restart was asked for (/restart, /kill_stuck: someone judged the session stuck). Carrying on would
-//               walk it back into the thing it was stopped for.
-//   walled      the turn stopped at a usage-limit or API-error record. Carrying on hits the wall again.
-//   repeat      the same cut point was already resumed once and the process died there again. Joey is told; the main is
-//               not sent round a third time.
-export type ResumeDecision = 'none' | 'notice' | 'deliberate' | 'walled' | 'repeat'
-export function resumeDecision(c: { cut: boolean; at?: string; walled?: boolean }, deliberate: boolean, lastNoticeAt: string | null): ResumeDecision {
-  if (!c.cut) return 'none'
-  if (deliberate) return 'deliberate'
-  if (c.walled) return 'walled'
-  if (c.at && lastNoticeAt && c.at === lastNoticeAt) return 'repeat'
-  return 'notice'
-}
-const DELIBERATE_WINDOW_MS = 180_000
-const deliberateFile = (): string => join(LANES_DIR, 'run', 'deliberate-restart')
-const resumeFile = (): string => join(LANES_DIR, 'run', 'resume.json')
-/** called by the control commands that kill or restart the TUI on purpose (and by lab scenarios that play one) */
-export function markDeliberateRestart(): void {
-  if (!LANES_DIR) return
-  try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(deliberateFile(), new Date().toISOString()) } catch {}
-}
-function takeDeliberate(): boolean {
-  try { const m = statSync(deliberateFile()).mtimeMs; rmSync(deliberateFile()); return Date.now() - m < DELIBERATE_WINDOW_MS } catch { return false }
-}
-function lastResumeAt(): string | null {
-  try { return JSON.parse(readFileSync(resumeFile(), 'utf8')).at ?? null } catch { return null }
-}
-export function resumeNotice(at?: string): string {
-  return `〔系統通知｜主線重新啟動〕你的 session 剛才被中斷${at ? `（${stamp(at)}，${TZ_LABEL}）` : ''}，現在已經重新啟動，對話紀錄都還在。\n`
-    + '中斷時你那一回合還沒做完：先看中斷前做到哪一步，接著把它做完。跑到一半的指令不要當成已經完成，重新確認結果。\n'
-    + '中斷前送來、你還沒讀到的訊息會重新送來；已經回過的不用再回。\n'
-    + '這是系統產生的通知，不用回覆任何 agent。'
-}
-function onMainReplaced(prevPid: number): void {
-  const n = D.repersistUnconsumed?.() ?? 0
-  D.log('info', `lanes: the main's process was replaced (${prevPid} → ${mainReg!.claude_pid}); ${n} unanswered delivery(ies) parked again for it`)
-  logos('lane.main_replaced', { prev_pid: prevPid, pid: mainReg!.claude_pid, redelivered: n, role: D.role })
-  setTimeout(() => D.sweepNow?.(), ARRIVE_GRACE_MS + 5_000)      // 002i: what was replayed into the starting process and dropped is given again
-  if (D.role !== 'tg') return
-  const c = cutOffTurn(mainReg!.transcript_path)
-  const dec = resumeDecision(c, takeDeliberate(), lastResumeAt())
-  logos('lane.resume_decision', { decision: dec, cut_at: c.at ?? null, walled: !!c.walled })
-  if (dec === 'none') return
-  if (dec === 'notice') {
-    try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(resumeFile(), JSON.stringify({ at: c.at ?? null, sent: new Date().toISOString() })) } catch {}
-    setTimeout(() => { void sendResumeNotice(c.at) }, RESUME_NOTICE_DELAY_MS)
-    return
-  }
-  if (dec === 'repeat') {
-    ledger({ lane: 'router', kind: 'notify', notify_main: true,
-      text: `[push] 主線在同一個地方第二次被中斷（${c.at ? stamp(c.at) : '?'}），沒有再自動接續，已通知 Joey`,
-      refs: { tier: 'push', tier_rule: 'resume-repeat', escalated: true } })
-    void pushJoey(undefined, `主線在同一個地方第二次被中斷（中斷點 ${c.at ? stamp(c.at) : '?'}，${TZ_LABEL}）。我沒有再叫它自動接著做，免得它卡在同一步重複。它手上那一回合還沒做完，要不要繼續請你決定。`, false).then(id => {
-      logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'resume-repeat', message_id: id })
-    })
-    return
-  }
-  ledger({ lane: 'router', kind: 'fyi', notify_main: false,
-    text: dec === 'deliberate' ? '主線被指令重啟（/restart 或 /kill_stuck），中斷的那一回合不自動接續'
-      : '主線重啟時上一回合停在額度或連線錯誤，不自動接續' })
-}
-async function sendResumeNotice(at?: string): Promise<void> {
-  let ok = false
-  try {
-    for (let i = 0; i < 12 && !(await digestIO.mainConnected()); i++) await new Promise(r => setTimeout(r, 2_500))   // the new process needs a moment to connect
-    ok = await digestIO.deliver(resumeNotice(at), { user: 'lanes', kind: 'resume', no_reply: 'true', wake: 'true' })
-  } catch (e) { D.log('warn', `lanes: resume notice failed: ${e}`) }
-  ledger({ lane: 'router', kind: 'fyi', notify_main: false, text: `主線的行程重新啟動，中斷時回合還沒結束：${ok ? '已通知主線接著做' : '通知沒有送到主線'}` })
-  logos('lane.resume_notice', { delivered: ok, cut_at: at ?? null })
-}
+export function forgetMcpSession(sid: string): void { mcpSessionPid.delete(sid) }
 
 async function readBody(req: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = []
@@ -617,49 +410,11 @@ function sendJson(res: ServerResponse, code: number, obj: unknown): void {
   res.end(JSON.stringify(obj))
 }
 
-let testCallerPid: number | null = null
-/** exported for tests: register as if the SessionStart hook of process `pid` had called */
-export function __registerMainForTest(sid: string, transcript: string, pid: number) { testCallerPid = pid; try { return registerMain({} as IncomingMessage, { session_id: sid, transcript_path: transcript }) } finally { testCallerPid = null } }
-function registerMain(req: IncomingMessage, b: any): { accepted: boolean; role: string; reason: string; main?: string } {
-  const sid = String(b.session_id ?? '')
-  if (!/^[0-9a-f-]{36}$/.test(sid)) return { accepted: false, role: 'unknown', reason: 'bad session_id' }
-  const pid = testCallerPid ?? callerClaudePid(req)
-  let expected = ''
-  try { expected = readFileSync(join(LANES_DIR, 'main-expected'), 'utf8').trim() } catch {}
-  let why = ''
-  if (expected && expected === sid) why = 'matches main-expected (keeper-launched)'
-  else if (mainReg && pid && pid === mainReg.claude_pid) why = 'same claude process as the registered main'
-  if (!why || !pid) {
-    const reason = !pid ? 'caller claude process not identifiable' :
-      `not the registered main (expected ${expected || '(none)'}; registered ${mainReg?.session_id ?? '(none)'})`
-    D.log('warn', `lanes: register-main REFUSED session=${sid} pid=${pid ?? '?'}: ${reason}`)
-    appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })
-    logos('lane.register_refused', { session_id: sid, pid, reason, role: D.role })
-    if (pid) { refusedPids.set(pid, Date.now()); toolsChangedForPid(pid) }          // 002m (LG1)
-    tellRefused(sid, pid, reason)                                                       // 002m (LG2)
-    return { accepted: false, role: 'not-main', reason, main: mainReg?.session_id }
-  }
-  refusedPids.delete(pid)
-  const prev = mainReg
-  mainReg = { session_id: sid, transcript_path: String(b.transcript_path ?? ''), claude_pid: pid, registered_at: nowIso(), source: b.source }
-  if (D.role === 'tg') writeJsonAtomic(join(LANES_DIR, 'main.json'), mainReg)
-  mainMcpSid = null
-  for (const [s, p] of mcpSessionPid) if (p === pid) mainMcpSid = s
-  D.log('info', `lanes: main REGISTERED session=${sid} pid=${pid} (${why}); bound MCP session ${mainMcpSid ?? '(none yet)'}`)
-  appendJsonl('routing.jsonl', { event: 'register-main', rule: 'registration', target: 'main', session: sid, pid, reason: why, role: D.role })
-  logos('lane.register_main', { session_id: sid, pid, transcript: mainReg.transcript_path, role: D.role })
-  if (prev && prev.session_id === sid && prev.claude_pid && prev.claude_pid !== pid) onMainReplaced(prev.claude_pid)
-  if (D.role === 'tg' && S?.renew && S.renew.new_sid === sid) void completeRenew()
-  return { accepted: true, role: 'main', reason: why }
-}
-
 // ------------------------------------------------------------------ 002k: /main renew — the main role goes to a fresh session
 // design/main-role MR1 「主線本身就不必記得一切。它可以常常換新：新的主線讀焦點卡與最近的帳本，就接得上」 and runtime RU5 「『主』是一個角色…可以轉移」.
-// Joey asks for it (/main renew). The daemon writes the hand-over brief from what is ON DISK (focus card, open commitments, work handed
-// to the main and not settled, open lanes, the day's activity list), marks the new session id for the keeper (run/renew), stops the
-// old process; the keeper starts a fresh session with that id; when it registers, the brief is its first message, Joey is told, and
-// the old session is gone with its tools (only the registered main's MCP session gets them). Deliveries the old process never took in
-// are parked again for the new one.
+// Joey asks for it (/main renew). The daemon writes the hand-over brief from what is ON DISK (focus card, open commitments, work handed to the main and not
+// settled, open lanes, the day's activity list) as an M1 item for the NEW session only, marks the new session id for the keeper (run/renew) and stops the old
+// process (its gen ends `replaced`; M1 queues again whatever it had). When the new session's SessionStart comes, the brief is offered to it like any item.
 const renewFile = (): string => join(LANES_DIR, 'run', 'renew')
 export function handoverBrief(gen: number): string {
   const recs = readJsonl('ledger.jsonl') as LedgerRec[]
@@ -682,53 +437,23 @@ export function handoverBrief(gen: number): string {
 }
 export async function mainRenew(who: string): Promise<string> {
   if (D?.role !== 'tg' || !S) return '這個 daemon 不管主線。'
-  if (!mainReg || !pidAlive(mainReg.claude_pid)) return '目前沒有登記中、活著的主線可以交接。'
-  if (S.renew && Date.now() - Date.parse(S.renew.at) < 300_000) return '主線交接已經在進行中。'
+  const m = main.mainSession()
+  if (!m || !pidAlive(m.pid)) return '目前沒有登記中、活著的主線可以交接。'
+  if (S.renew) return '主線交接已經在進行中。'
   const newSid = randomUUID()
-  const tokens = genuineContextTokens(mainReg.transcript_path)
-  S.renew = { new_sid: newSid, old_sid: mainReg.session_id, old_pid: mainReg.claude_pid, at: nowIso(), by: who, old_tokens: tokens }
+  S.main_gen = (S.main_gen ?? 1) + 1
+  S.renew = { new_sid: newSid, old_sid: m.session_id, old_pid: m.pid, at: nowIso(), by: who, old_tokens: 0 }
   saveState()
   try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(renewFile(), newSid + '\n') } catch (e) { delete S.renew; saveState(); return `交接失敗：寫不了交接標記（${e}）。` }
-  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_handover_start', from: mainReg.session_id, to: newSid, by: who, old_tokens: tokens })
-  logos('lane.main_renew', { from: mainReg.session_id, to: newSid, by: who, old_tokens: tokens })
-  const pid = mainReg.claude_pid
+  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_handover_start', from: m.session_id, to: newSid, by: who })
+  logos('lane.main_renew', { from: m.session_id, to: newSid, by: who })
+  main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: handoverBrief(S.main_gen), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handover', no_reply: 'true' } } }, { target: newSid })
+  ledger({ lane: 'router', kind: 'action', notify_main: false, text: `main handover：主線交接給新 session ${newSid.slice(0, 8)}（第 ${S.main_gen} 代，上一代 ${m.session_id.slice(0, 8)}），交接內容排給新的主線`, refs: { from: m.session_id, to: newSid, gen: S.main_gen } })
+  main.markEnd('replaced')
+  const pid = m.pid
   setTimeout(() => { try { process.kill(pid, 'SIGTERM') } catch {} }, 500)      // the keeper sees the session end and starts the fresh one
   setTimeout(() => { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL') } catch {} }, 15_000)
-  return `主線換新中：舊 session ${mainReg.session_id.slice(0, 8)}（context 約 ${Math.round(tokens / 1000)}k token）會結束，新的主線接手後我再告訴你交接了什麼。`
-}
-async function completeRenew(): Promise<void> {
-  const r = S.renew
-  if (!r) return
-  S.main_gen = (S.main_gen ?? 1) + 1
-  const gen = S.main_gen
-  delete S.renew; saveState()
-  try { rmSync(renewFile()) } catch {}
-  const brief = handoverBrief(gen)
-  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_handover', note: 'main handover', from: r.old_sid, to: r.new_sid, gen, by: r.by })
-  ledger({ lane: 'router', kind: 'action', notify_main: false, text: `main handover：主線交接給新 session ${r.new_sid.slice(0, 8)}（第 ${gen} 代，上一代 ${r.old_sid.slice(0, 8)}，約 ${Math.round(r.old_tokens / 1000)}k token）`, refs: { from: r.old_sid, to: r.new_sid, gen } })
-  const n = D.repersistUnconsumed?.() ?? 0                       // what the old process never took in goes to the new one
-  let told = false
-  try {
-    for (let i = 0; i < 12 && !(await digestIO.mainConnected()); i++) await new Promise(res => setTimeout(res, 2_500))
-    told = await digestIO.deliver(brief, { user: 'lanes', kind: 'handover', no_reply: 'true', wake: 'true' })
-  } catch (e) { D.log('warn', `lanes: handover brief not delivered: ${e}`) }
-  logos('lane.main_handover', { from: r.old_sid, to: r.new_sid, gen, brief_delivered: told, redelivered: n, brief_chars: brief.length })
-  const text = `主線換新了：第 ${gen} 代 session ${r.new_sid.slice(0, 8)} 接手（上一代約 ${Math.round(r.old_tokens / 1000)}k token）。交接內容：焦點卡、答應過的事、待處理的交辦、開著的車道、最近 24 小時的活動清單${told ? '' : '（交接內容沒有送到新主線，請叫它用 ledger_query 補看）'}。`
-  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-renew', escalated: true } })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-renew', message_id: id }))
-}
-/** context size of a session's newest genuine call (input + cache read + cache creation) */
-function genuineContextTokens(path: string): number {
-  const text = tailText(path, 300_000) ?? ''
-  const lines = text.split('\n')
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i].includes('"usage"')) continue
-    try {
-      const j = JSON.parse(lines[i]); const u = j.message?.usage
-      if (j.type === 'assistant' && u && j.message?.model !== '<synthetic>') return (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
-    } catch {}
-  }
-  return 0
+  return `主線換新中：舊 session ${m.session_id.slice(0, 8)} 會結束，新的主線接手時會先收到交接內容（焦點卡、答應過的事、待處理的交辦、開著的車道、最近 24 小時的活動清單）。`
 }
 
 // ================================================================== state (tg role)
@@ -757,7 +482,6 @@ type AlertFp = { thread: string; sev: string; repeats: number; first: string; la
 type AlertVal = { v: number; low: boolean; raw: string } | null
 type Wall = { since: string; kind: string; text: string; probe_at: number; probes: number; told?: boolean }
 type Fanout = { id: string; brief: string; tasks: string[]; members: string[]; results: Record<string, string>; created: string; synthesis?: string; done?: string }
-type MainWall = { since: string; kind: string; text: string; model: string; err_at: number; mid_task: boolean; probes: number; acked_at?: number; held?: number; told?: boolean }
 type State = {
   counters: Record<string, number>
   lanes: Record<string, Lane>
@@ -778,16 +502,12 @@ type State = {
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
-  main_stuck?: { call: string; since: number; told_at: string; tool: string }   // 002k: the main has sat in one tool call past LANES_MAIN_STUCK_MS
   renew?: { new_sid: string; old_sid: string; old_pid: number; at: string; by: string; old_tokens: number }   // 002k: /main renew in progress
   claims?: Record<string, { lane: string; since: string; why: string }>   // 002k: file claims (claim_file), by real path
   curator?: { lane: string; since: string; from_line: number; from_line_end?: number }   // 002k: the lane holding the memory write right
   curator_line?: number                                                // 002k: ledger line up to which memory proposals were curated
   fanouts?: Record<string, Fanout>                                     // 002k: fan_out bookkeeping
   main_gen?: number                                                    // 002k: how many times the main role was handed to a fresh session (+1)
-  main_wall?: MainWall                                                 // 002j: the MAIN cannot use the model (its own transcript says so)
-  main_wall_seen?: number                                              // 002j: newest API-error record of the main already acted on (ms)
-  main_deaf?: { baseline: number; at: string }                         // 002k (G16b): the main was told to be deaf for the stretch of silence after this assistant record
   main_commitments?: Record<string, MainCommitment>                    // 002k (G10): what the main promised with its commitment tool (id -> state)
   flood?: Record<string, PeerFlood>                                    // 002k (H14): per-peer admission state, by peer name
   holds?: Record<string, PeerHold>                                     // 002k (H14): peers whose events are ledger-only (by the main or by Joey)
@@ -819,12 +539,25 @@ function loadState(): void {
 function saveState(): void { try { writeJsonAtomic(statePath(), S) } catch (e) { D.log('error', `lanes: state save failed: ${e}`) } }
 /** tests only: the live state object */
 export const __lanesState = (): State => S
-/** tests only: pretend the registered main's MCP session is (not) connected; "not" = gone for a long time unless downForMs says otherwise */
-/** test: an MCP session owned by claude pid `pid` opened its stream (what noteMcpSocket learns from the socket) */
-export const __noteMcpPid = (sid: string, pid: number): void => { mcpSessionPid.set(sid, pid); maybeBindMain(sid); if (sessionNotMain(sid)) { try { D.toolsChanged?.(sid) } catch {} } }
-export const __setMainConnected = (sid: string | null, downForMs = 3_600_000): void => { mainMcpSid = sid; mainDownSince = sid ? 0 : Date.now() - downForMs }
-/** tests only */
-export const __setMainPid = (pid: number): void => { if (mainReg) mainReg.claude_pid = pid }
+/** tests only: an MCP session owned by claude pid `pid` opened its stream (what noteMcpSocket learns from the socket) */
+export const __noteMcpPid = (sid: string, pid: number): void => { mcpSessionPid.set(sid, pid); main?.streamOpened(pid); if (sessionNotMain(sid)) { try { D.toolsChanged?.(sid) } catch {} } }
+/** tests only: one event of the main's hook, as /lanes/main-event receives it */
+export const __mainEvent = (b: any) => main.mainEvent(b)
+/** tests only: this lanes instance's M1 + M2 and journal */
+export const __main = (): MainApi => main
+export const __journal = (): Journal => journal
+/** tests only: the shared wall goes up / comes down (as a walled run or a probe would make it) */
+export const __wallUp = (kind: string, text: string, by = 'test'): void => wallUp({ kind, text }, by)
+export const __wallDown = (by = 'test'): Promise<void> => wallDown(by)
+/** tests only: the digest that would ride the next delivery now (M1 info) */
+export const __digest = () => digestInfo()
+/** tests only: a live main (this test process, idle, its MCP session `sid`), or none: the gen ends killed */
+export const __setMainConnected = (sid: string | null): void => {
+  if (!sid) { const g = main.currentGen(); if (g) { main.markEnd('killed'); void main.mainEvent({ event: 'SessionEnd', pid: Number(g.pid) }) } return }
+  mcpSessionPid.set(sid, process.pid)
+  if (main.mainPid() !== process.pid) { try { writeFileSync(join(LANES_DIR, 'main-expected'), '00000000-0000-4000-8000-000000000001') } catch {}
+    void main.mainEvent({ event: 'SessionStart', pid: process.pid, session_id: '00000000-0000-4000-8000-000000000001' }) }
+}
 export const __setHandoffDownGrace = (ms: number): void => { HANDOFF_DOWN_GRACE_MS = ms }
 
 function newThreadId(): string { return `${D.agent}#t-${shortId()}` }
@@ -854,9 +587,16 @@ function newLane(kind: LaneKind, opts: Partial<Lane> & { thread?: string } = {})
 // ================================================================== ledger / focus
 type LedgerKind = 'action' | 'commitment' | 'escalation' | 'memory_proposal' | 'memory_decision' | 'receipt' | 'notify' | 'fyi' | 'stop' | 'lane_lifecycle'
 function ledger(e: { lane: string; thread?: string | null; event?: string; kind: LedgerKind; text: string; notify_main: boolean; refs?: unknown; detail?: string }): void {
-  appendJsonl('ledger.jsonl', { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, kind: e.kind, text: e.text,
-    notify_main: e.notify_main, refs: e.refs ?? null, detail: e.detail ?? null })
+  const rec = { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, kind: e.kind, text: e.text, notify_main: e.notify_main, refs: e.refs ?? null, detail: e.detail ?? null }
+  appendJsonl('ledger.jsonl', rec)
   logos('lane.ledger', { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, ledger_kind: e.kind, text: e.text.slice(0, 300), notify_main: e.notify_main })
+  // work handed to the main (a hand-over, a stopped thread) is an M1 item for it; what it settles is in `handoffs`
+  // (step 1 of the rebuild keeps the 002d wake set; step 2 replaces it with the M3 obligation owed to the main)
+  if (D?.role === 'tg' && main && isWakeEntry({ ...rec, ts: nowIso() } as LedgerRec)) {
+    const ho = (rec.refs as any)?.handoff
+    main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線〕${e.text}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: e.kind } } },
+      { event: e.event ?? null, fields: { handoffs: ho ? [ho] : [] } })
+  }
 }
 function focusCard(): string {
   try { const t = readFileSync(join(LANES_DIR, 'focus.md'), 'utf8').trim(); if (t) return t } catch {}
@@ -889,9 +629,7 @@ export type InEvent = {
 }
 export type Decision = { rule: string; target: 'main' | 'ledger' | 'lane'; lane?: string; note?: string; critical?: boolean
   /** 002k (A6): a line the main reads before the message: why the router sent it there for checking */
-  warn?: string
-  /** 002b: the pending digest, attached to a decision that targets the main (tg role); the deliverer prepends it to the message */
-  digest?: DigestTake }
+  warn?: string }
 
 type Rule = { id: string; match: Record<string, unknown>; to: string; critical_regex?: string; info_regex?: string; trigger?: string; note?: string }
 type Tier = 'push' | 'silent' | 'ledger'
@@ -976,8 +714,8 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     logos('lane.route', { event: ev.id, source: ev.source, from: ev.from, rule: d.rule, target: d.target, lane: null, thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note, class: null, base_tier: null, text: ev.text.slice(0, 120) })
     D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=master-off → main`)
     if (ev.source === 'telegram') joeyToMainAt = Date.now()
-    if (!wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
     noteInbound(ev, d)
+    toMain(ev, d)
     return d
   }
   // 002k (H14, H13): the peer's hold and the flood gate come first: before the rules, before any Jev screen, with no model. An event over the limit gets no lane.
@@ -1054,13 +792,23 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     else void triageShadow(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier })
   }
   if (D.role === 'tg' && S) { noteAdmitted(ev, d); noteInbound(ev, d); if (ev.source === 'telegram' && d.target === 'main') joeyToMainAt = Date.now() }
-  // 002b: an event routed to the main is a naturally triggered turn: the pending digest rides along with it. Joey's message included (B5: the digest goes at
-  // the main's next natural turn; an idle main is never woken for it). 002n: 002m's aid (c) held it off Joey's message and woke the idle main with it at
-  // that turn's end, against merge 「主線在自己的回合邊界收到…用的是現有的 hook 注入機制，不是打斷」 and main-role 「主線是被告知，不是被打斷」 (A06 and C03:
-  // a wake turn that told Joey nothing). What T3-R #8 needed (no unasked digest item relayed in the answer to Joey) is now the main's reply hook's
-  // job (lanes-hooks/main-summary-gate.py, digest relay check).
-  if (d.target === 'main' && D.role === 'tg' && !wallHoldsMain()) { const dg = takePendingDigest(false, 'piggyback'); if (dg) d = { ...d, digest: dg } }
+  toMain(ev, d)
   return d
+}
+/** M1: an event the router gives the main is an item for it (the screen's warning in front). The digest is not attached here: it rides whatever M1
+ *  offers or the main's hook pulls next (lanes-main.ts). */
+function toMain(ev: InEvent, d: Decision): void {
+  if (d.target !== 'main' || D.role !== 'tg' || !main) return
+  const p = (ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
+  const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
+    : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text), meta: { ...(p.meta ?? {}) } } }
+  const kind: ItemKind = ev.source === 'telegram' ? 'joey' : routerCfg().alert_senders.includes(ev.from) ? 'alert' : 'peer'
+  main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id })
+}
+/** server.ts: the router could not decide (it threw); the event still goes to the main, as the router's fallback does */
+export function toMainDirect(notif: Notif, source: 'telegram' | 'mesh'): void {
+  if (D?.role !== 'tg' || !main) return
+  main.enqueue(source === 'telegram' ? 'joey' : 'peer', notif, { via: source === 'telegram' ? 'tg' : 'inbox' })
 }
 
 /** Hop / budget gate for a mesh event entering a thread. Returns a stop note or null. */
@@ -1776,7 +1524,8 @@ export function walledResult(j: any): { kind: string; text: string } | null {
   const text = String(j.result ?? '').slice(0, 200), kind = wallKind(text, Number(j.api_error_status ?? 0))
   return kind ? { kind, text } : null
 }
-const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯', auth: '模型登入失效' }
+const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯', auth: '模型登入失效',
+  rate_limit: '模型額度用完了', authentication_failed: '模型登入失效', billing_error: '模型帳務出錯', server_error: '模型服務出錯', account_on_hold: '模型帳號被暫停' }
 function wallUp(w: { kind: string; text: string }, by: string): void {
   if (S.wall) {                                           // a probe hit the wall again
     S.wall.probes += 1
@@ -1787,21 +1536,18 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
     armProbe(next + 30)
     return
   }
-  // 002l (D12): one wall, one notice. When the main's wall of the same kind is already up and Joey was told, the lanes' wall is recorded, not pushed again.
-  const told = !(S.main_wall?.told && S.main_wall.kind === w.kind)
-  S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0, told }
+  // one wall for the account: the lanes and the main share it (M2 walled), one notice up and one down
+  S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: Date.now() + WALL_PROBE_MS, probes: 0, told: true }
   saveState()
+  if (!by.startsWith('main')) main?.wallRaised(w.kind)            // M2: the main shares the account's wall
   const waiting = [...queue.values()].filter(i => i.state === 'queued' || i.state === 'leased').length
   const every = Math.max(1, Math.round(WALL_PROBE_MS / 60_000))
   const backoff = wallBackoffMs(w.kind, 1) > WALL_PROBE_MS ? `，還沒恢復就把間隔加倍（最多 ${Math.round(wallBackoffMs(w.kind, 99) / 60_000)} 分鐘）` : ''
-  const text = `車道${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工，現在排隊 ${waiting} 件，一件都沒有丟。我 ${every} 分鐘後自動試一次${backoff}，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
-  logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting, told })
-  if (!told) {
-    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}（主線撞到同一道牆時已經通知過 Joey，這一筆不再推播）`, refs: { tier: 'ledger', tier_rule: 'wall-up+deduped-main-wall', escalated: false } })
-  } else {
-    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
-    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
-  }
+  const who = by.startsWith('main') ? '主線' : '車道'
+  const text = `${who}${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工（排隊 ${waiting} 件），給主線的訊息也先保留，一件都沒有丟。我 ${every} 分鐘後自動試一次${backoff}，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
+  logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting })
+  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
   armProbe(WALL_PROBE_MS + 30)
 }
 // One timer for the lanes' wall. (Each walled run used to arm its own: two runs in flight when the wall came up meant
@@ -1853,156 +1599,12 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
   child.on('exit', code => { clearTimeout(limit); finish(code === 0) })
 }
 
-// ------------------------------------------------------------------ 002j: the MAIN behind the model wall
-// The lanes' wall above is raised by a lane run's own result. The main is a different process and may be on a different
-// model with its own limit, so neither side is guessed from the other: the main's wall is raised only by the main's own
-// transcript, when its last assistant record is an API-error record of a wall kind (lastAssistantFile). Seen two ways:
-// the 15-second tick reads the transcript (a main that hit the wall in the middle of work, with nothing waiting for it),
-// and the delivery sweep finds a message the main took in and answered only with the error.
-// With the main's wall up:
-//   - what is meant for the main is kept in inbox/pending instead of being handed over (it would be answered with the
-//     same error); every message of Joey's that is kept gets a line back, so he is never left without an answer;
-//   - a message the main took in and answered with the error is kept as well and given again afterwards;
-//   - system notices (digests, hand-overs) are refused, so the hand-over fallback tells Joey directly, as when the main is away;
-//   - Joey is told once; a one-line run on the main's own model probes at an interval;
-//   - when a probe gets through: Joey is told once, a main that was stopped in the middle of work is told to carry on,
-//     and what was kept is given.
-// The wall is one fact for both daemons of the agent (tg owns it, inbox holds the mesh messages for the main): a file.
-const mainWallFile = (): string => join(LANES_DIR, 'run', 'main-wall.json')
-export function wallHoldsMain(): boolean { return !!LANES_DIR && existsSync(mainWallFile()) }
-/** 002l (N6): may parked deliveries be handed to the main now? Not while the main is behind the model wall (002j: 「主線撞到額度：給主線的訊息先保留」).
- *  server.ts asks it on EVERY replay path: the timer drain had the gate, the session-open replay did not, so a main process replaced behind the wall
- *  (T7-R t 390.9) was handed both held messages 44 s before the wall came down. */
-export function replayAllowed(): boolean { return !(LANES_ON && wallHoldsMain()) }
-// What was kept behind the wall is as old as the wall. For a short while after it comes down, the daemon's "a parked
-// message has been waiting for N minutes" alarm stays quiet about those files: they are being given right now, and Joey
-// was told about the wall. (The time is written as text: the lab runs under a simulated clock, file times do not.)
-const mainWallLiftedFile = (): string => join(LANES_DIR, 'run', 'main-wall-lifted')
-export function wallLiftedRecently(withinMs = 180_000): boolean {
-  if (!LANES_DIR) return false
-  try { const t = Number(readFileSync(mainWallLiftedFile(), 'utf8')); return Number.isFinite(t) && Date.now() - t >= 0 && Date.now() - t < withinMs } catch { return false }
-}
-type MainWallEv = { kind: string; text: string; at: number; midTask: boolean; model: string }
-/** The main's last assistant record is a wall error written at or after `sinceMs` (transcript time). */
-export function mainWalled(sinceMs = 0): MainWallEv | null {
-  const path = mainReg?.transcript_path
-  if (!path) return null
-  const a = lastAssistantFile(path)
-  if (!a?.apiError || a.at < sinceMs) return null
-  const kind = wallKind(a.text)
-  return kind ? { kind, text: a.text, at: a.at, midTask: a.midTask, model: a.model } : null
-}
-const isReal = (notif: Notif): { real: boolean; joey: boolean } => {
-  const meta = ((notif?.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
-  const real = !!meta.message_id || !!meta.btcc_msg_id
-  return { real, joey: !!meta.message_id && !meta.btcc_msg_id && !!D.joeyChatId && String(meta.chat_id) === String(D.joeyChatId()) }
-}
-/** server.ts sweep, for ONE delivery the main took in (at takenAt) and has not answered.
- *  'hold' = the main is behind the wall, leave the delivery as it is; 'regive' = the wall is down and this one was only
- *  ever answered with the error: park it again so that it is given now; 'pass' = no wall in this, the ordinary rules apply. */
-export function walledStep(d: { notif: Notif; walled?: boolean }, takenAt: number): 'pass' | 'hold' | 'regive' {
-  if (!d.walled) {
-    const e = mainWalled(takenAt)
-    if (!e) return 'pass'
-    d.walled = true
-    noteMainWalled(e, isReal(d.notif).real)
-    return 'hold'                                          // the other daemon may need a moment to raise it: look again at the next sweep
-  }
-  if (wallHoldsMain()) return 'hold'
-  d.walled = false
-  return 'regive'
-}
-export function noteMainWalled(e: MainWallEv, counts = false): void {
-  if (D.role !== 'tg') { void peerCall(TG_PORT, '/lanes/main-wall', 'POST', { ...e, counts }); return }
-  mainWallUp(e, 'delivery')
-  if (counts && S.main_wall) { S.main_wall.held = (S.main_wall.held ?? 0) + 1; saveState() }
-}
-/** server.ts kept a message for the main behind the wall instead of handing it over. */
-export function noteHeldForMain(notif: Notif): void {
-  const k = isReal(notif)
-  if (D.role !== 'tg') { if (k.real) void peerCall(TG_PORT, '/lanes/main-wall-held', 'POST', {}); return }
-  heldForMain(k.real, k.joey)
-}
-function heldForMain(real: boolean, joey: boolean): void {
-  const w = S?.main_wall
-  if (!w || !real) return
-  w.held = (w.held ?? 0) + 1
-  if (joey) {
-    // never silent: each kept message of Joey's gets a line. The first says why; the next ones inside ten minutes are short.
-    const first = Date.now() - (w.acked_at ?? 0) > 600_000
-    if (first) w.acked_at = Date.now()
-    const text = first
-      ? `收到。主線現在不能用模型：${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。這一則我先保留，不會丟；恢復後交給主線處理，到時候會告訴你。`
-      : `這一則也保留了。主線還在等模型恢復，目前保留 ${w.held} 則。`
-    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-held', escalated: true } })
-    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-held', message_id: id }))
-  }
-  saveState()
-}
-/** tg role, every 15 s: a main that hit the wall with nothing waiting for it is seen here. */
-export function mainWallTick(): void {
-  if (D?.role !== 'tg' || !S) return
-  if (S.main_wall) { if (!mainProbeTimer) armMainProbe(wallBackoffMs(S.main_wall.kind, S.main_wall.probes, mainProbeMs(S.main_wall.kind))); return }
-  const e = mainWalled(0)
-  if (e) mainWallUp(e, 'tick')
-}
-const mainProbeMs = (kind: string): number => kind === 'usage' || kind === 'auth' ? WALL_PROBE_MS : Math.min(WALL_PROBE_MS, 60_000)
-let mainProbeTimer: ReturnType<typeof setTimeout> | null = null
-function armMainProbe(ms: number): void {
-  if (mainProbeTimer) clearTimeout(mainProbeTimer)
-  mainProbeTimer = setTimeout(() => { mainProbeTimer = null; mainProbeTick() }, ms)
-  ;(mainProbeTimer as any).unref?.()
-}
-function mainWallUp(e: MainWallEv, by: string): void {
-  if (S.main_wall) return
-  if (e.at <= (S.main_wall_seen ?? 0)) return             // this error record was already acted on; the wall came down since
-  // 002l (D12): one wall, one notice: when the lanes' wall of the same kind is up and Joey was told, the main's wall is recorded, not pushed again
-  const told = !(S.wall?.told !== false && S.wall && S.wall.kind === e.kind)
-  S.main_wall = { since: nowIso(), kind: e.kind, text: e.text, model: e.model, err_at: e.at, mid_task: !!e.midTask, probes: 0, told }
-  S.main_wall_seen = e.at
-  saveState()
-  try { mkdirSync(join(LANES_DIR, 'run'), { recursive: true }); writeFileSync(mainWallFile(), JSON.stringify({ since: S.main_wall.since, kind: e.kind, text: e.text })) } catch {}
-  const every = Math.max(1, Math.round(mainProbeMs(e.kind) / 60_000))
-  const text = `主線現在不能用模型：${WALL_WORD[e.kind] ?? '模型無法使用'}（原文：${e.text}）。`
-    + (e.midTask ? `它有一回合做到一半，停在 ${stamp(new Date(e.at).toISOString())}（${TZ_LABEL}）。` : '')
-    + `這段期間給主線的訊息我先保留，一則都不會丟。我每 ${every} 分鐘自動試一次，恢復後把保留的交給主線，並告訴你。`
-  logos('lane.main_wall_up', { wall: e.kind, text: e.text, by, mid_task: !!e.midTask, model: e.model, err_at: e.at, told })
-  if (told) {
-    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-up', escalated: true } })
-    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-up', message_id: id }))
-  } else ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}（車道撞到同一道牆時已經通知過 Joey，這一筆不再推播；主線恢復時會再說）`, refs: { tier: 'ledger', tier_rule: 'main-wall-up+deduped-lanes-wall', escalated: false } })
-  armMainProbe(mainProbeMs(e.kind))
-  setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, 0)   // mark what the main already took in, in both daemons
-}
-function mainProbeTick(): void {
-  const w = S?.main_wall
-  if (!w || D.role !== 'tg') return
-  bareProbe(w.model || MODEL, `${D.agent}.main`, (walled, ok) => {
-    const cur = S?.main_wall
-    if (!cur) return
-    if (ok) { logos('lane.main_wall_probe', { ok: true, probes: cur.probes + 1 }); void mainWallDown('probe'); return }
-    cur.probes += 1
-    if (walled) { cur.kind = walled.kind; cur.text = walled.text }
-    saveState()
-    const next = wallBackoffMs(cur.kind, cur.probes, mainProbeMs(cur.kind))     // 002l (S0 item 4): the main's probe backs off the same way
-    logos('lane.main_wall_probe', { ok: false, probes: cur.probes, wall: cur.kind, next_ms: next })
-    armMainProbe(next)
-  })
-}
-export function wallResumeNotice(w: { err_at: number; text: string }, held: number): string {
-  return `〔系統通知｜模型恢復〕你從 ${stamp(new Date(w.err_at).toISOString())}（${TZ_LABEL}）起不能用模型（${w.text}），現在恢復了。\n`
-    + '那時候你有一回合做到一半就停了：先看停在哪一步，接著把它做完。跑到一半的指令不要當成已經完成，重新確認結果。\n'
-    + (held ? `這段期間保留的 ${held} 則訊息接著會送來；` : '') + '已經回過的不用再回。\n'
-    + '這是系統產生的通知，不用回覆任何 agent。'
-}
 // ------------------------------------------------------------------ 002k (G16, 002j group G): a main parked on a menu reads nothing
-// After the wall lifted, the plugin told Joey the held messages were handed to the main. But a main parked on Claude Code's limit menu reads
-// nothing: no model call follows and the deliveries stay queued while the process is alive. Programs, not hope:
-//  (a) mainWallDown looks at the main's pane first. A menu there is driven (driveStartupPicker re-checks the live pane and the label hash before
-//      any key) to the option that CONTINUES or WAITS, never to one that spends money or changes the plan; with no safe option, or when it did
-//      not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
-//  (b) noteMainDeaf (called by the delivery sweep): a delivery that stays queued for MAIN_DEAF_MS with the main's process alive, no open tool call
-//      and no new assistant record gets one push to Joey and a lane.main_deaf record;
+// The limit menu is a TUI state no hook reports, so it stays one pane read:
+//  (a) when the shared wall comes down and the main was walled, the main's pane is looked at before anything is offered to it. A menu there is driven
+//      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that CONTINUES or WAITS, never to one that spends money
+//      or changes the plan; with no safe option, or when it did not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
+//  (b) an idle main that does not take its offer is the M2 stuck rule (lanes-main.ts); the pane is read for that notice;
 //  (c) every menu found is logged with its real option labels (the picker log used to carry only the count).
 const NEVER_PICK = /upgrade|extra usage|switch|request more|add funds|purchase|\bbuy\b|billing|payment|\bpay\b|credit|[$€£¥]|\bplan\b|opus|sonnet|haiku|fable|\bmodel\b|don[’']?t continue|do not continue|never|exit|quit|trust|delete|remove/i
 const PICK_CONTINUE = /continue automatically|resume automatically|keep going|\bcontinue\b/i
@@ -2044,73 +1646,19 @@ function menuSentence(m: MenuResult): string {
   if (m.chose) return `主線停在一個選單（${labels}），選了「${m.chose.label}」但選單還在，選項已再傳給你，請點一個。`
   return `主線停在一個選單（${labels}），我挑不出一個安全的選項（不碰要付費或換方案的），選項已再傳給你，請點一個。`
 }
-const MAIN_DEAF_MS = (): number => Number(process.env.LANES_MAIN_DEAF_MS ?? 60_000)
-const deafSeen = new Set<number>()
-/** The delivery sweep found a delivery (handed to the main at deliveredAt) still queued. When it has been queued for MAIN_DEAF_MS, the main's process is
- *  alive, no tool call is open and no genuine assistant record came after it: the main is not reading (a menu, or no turn). One push to Joey per
- *  stretch of silence (until the main next answers), a lane.main_deaf record, and a menu on the pane is put in front of Joey. Not for a main behind the
- *  model wall (that has its own notice). */
-export async function noteMainDeaf(deliveredAt: number, now = Date.now()): Promise<'noted' | 'no'> {
-  const path = mainReg?.transcript_path
-  if (D?.role !== 'tg' || !S || !path || now - deliveredAt <= MAIN_DEAF_MS() || deafSeen.has(deliveredAt)) return 'no'
-  if (S.main_wall || wallHoldsMain() || !pidAlive(mainReg!.claude_pid) || openToolCallFile(path)) return 'no'
-  const newest = genuineAssistantAtFile(path)
-  if (newest > deliveredAt) return 'no'
-  deafSeen.add(deliveredAt); if (deafSeen.size > 500) deafSeen.clear()
-  if (S.main_deaf && S.main_deaf.baseline === newest) return 'no'         // already told for this stretch of silence
-  S.main_deaf = { baseline: newest, at: nowIso() }; saveState()
-  const secs = Math.round((now - deliveredAt) / 1000)
-  const menu = await inspectMainMenu(false, 'main-deaf')
-  const text = `主線沒有在讀：有訊息交給它已經 ${secs} 秒了，它的 process 還活著，沒有進行中的工具呼叫，也沒有新的回覆（停在選單，或沒有開新回合）。`
-    + (menu ? `它停在一個選單：${menu.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。` : '')
-  ledger({ lane: 'router', kind: 'notify', notify_main: true, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-deaf', escalated: true } })
-  logos('lane.main_deaf', { queued_s: secs, pid: mainReg!.claude_pid, assistant_at: newest || null, menu: menu ? menu.options : null })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-deaf', message_id: id }))
-  return 'noted'
-}
-async function mainWallDown(by: string): Promise<void> {
-  const w = S.main_wall
-  if (!w) return
-  delete S.main_wall; saveState()
-  if (mainProbeTimer) { clearTimeout(mainProbeTimer); mainProbeTimer = null }
-  try { rmSync(mainWallFile()) } catch {}
-  try { writeFileSync(mainWallLiftedFile(), String(Date.now())) } catch {}
-  const menu = await inspectMainMenu(true, 'wall-down')        // 002k (G16a): a menu the main is parked on is dealt with BEFORE anything is handed to it
-  // A main stopped in the middle of work is told to carry on, before what was kept reaches it. A main whose walled turn
-  // was only a message it never answered needs no notice: that message is given again.
-  // 002l (N6): the carry-on notice is decided from the wall's own record (it cut a turn: mid_task) and from what is still owed to the main (parked
-  // deliveries), not from the transcript's last record alone: a main process replaced behind the wall writes new records, and T7-R's notice was
-  // dropped (told null) while Joey was told the held messages were being handed over.
-  const parked = D.pendingCount ? D.pendingCount() : (w.held ?? 0)
-  let told: boolean | null = null
-  if (w.mid_task && (mainWalled(0) || parked > 0)) {
-    told = false
-    try { if (await digestIO.mainConnected()) told = await digestIO.deliver(wallResumeNotice(w, parked), { user: 'lanes', kind: 'wall-resume', no_reply: 'true', wake: 'true' }) } catch (e) { D.log('warn', `lanes: wall-resume notice failed: ${e}`) }
-  }
-  setTimeout(() => { D.sweepNow?.(); void inboxPost('/lanes/sweep', {}) }, told ? 1500 : 30)
-  const text = `主線的模型恢復了（${stamp(w.since)} 起不能用，${TZ_LABEL}）。`
-    + (w.held && parked ? `這段期間保留的 ${parked} 則訊息現在交給主線。` : w.held ? `這段期間保留的訊息已經都交給主線了。` : '')
-    + (told === true ? '主線有一回合做到一半被打斷，已經通知它接著做完。' : told === false ? '主線有一回合做到一半被打斷，但接續通知沒有送到（主線目前沒有連線）。' : '')
-    + (menu ? menuSentence(menu) : '')
-  ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-wall-down', escalated: true } })
-  logos('lane.main_wall_down', { since: w.since, probes: w.probes + 1, by, held: w.held ?? 0, parked, resume_notice: told, menu: menu ? { options: menu.options, chose: menu.chose?.label ?? null, result: menu.result ?? null } : null })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-wall-down', message_id: id }))
-}
-export const __setDigestIO = (io: Partial<DigestIO>): void => { Object.assign(digestIO, io) }
-
-function wallDown(by: string): void {
+async function wallDown(by: string): Promise<void> {
   const w = S.wall
   if (!w) return
   delete S.wall; saveState()
   if (probeTimer) { clearTimeout(probeTimer); probeTimer = null }
   setTimeout(pump, 20)
+  const walledMain = main?.mainPhase() === 'walled'
+  const menu = walledMain ? await inspectMainMenu(true, 'wall-down') : null       // 002k (G16a): a menu the main is parked on is dealt with BEFORE anything is offered to it
+  main?.wallLifted()                                                                // M2: walled → idle; M1 offers what was queued
   const waiting = [...queue.values()].filter(i => i.state === 'queued').length
-  const text = `車道的模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件現在開始處理。`
-  logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting })
-  if (w.told === false) {                                  // 002l (D12): Joey heard of this wall only through the main's notice: no separate push
-    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[ledger] ${text}`, refs: { tier: 'ledger', tier_rule: 'wall-down+deduped', escalated: false } })
-    return
-  }
+  const owed = main ? main.items(r => r.state === 'queued' && r.kind !== 'digest').length : 0
+  const text = `模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件車道事件現在開始處理${owed ? `，等主線的 ${owed} 則交給主線` : ''}。${menu ? menuSentence(menu) : ''}`
+  logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting, main_items: owed, menu: menu ? { options: menu.options, chose: menu.chose?.label ?? null, result: menu.result ?? null } : null })
   ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
   void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-down', message_id: id }))
 }
@@ -2896,19 +2444,16 @@ function handoff(lane: Lane | undefined, evId: string, text: string, laneId?: st
   S.handoffs[h.id] = h
   // 002l (D16): the id leads the line, so the main can name it (reply handoff_id) when it reports on it
   ledger({ lane: h.lane, thread: h.thread, event: evId, kind: 'escalation', notify_main: true, text: `〔${h.id}〕${h.text}`, refs: { handoff: h.id, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
-  const up = mainConnected()
-  logos('lane.handoff', { lane: h.lane, thread: h.thread, event: evId, handoff: h.id, main_connected: up })
-  // 002g: a main that only just went away gets HANDOFF_DOWN_GRACE_MS to come back (handoffTick); one that has been away
-  // longer than that already is not waited for
-  if (!up && Date.now() - mainDownSince >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, awayText())
-  else if (up && mainWalledFor() >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, walledText())
+  const away = awayFor()
+  logos('lane.handoff', { lane: h.lane, thread: h.thread, event: evId, handoff: h.id, main_phase: main?.mainPhase() ?? null })
+  // 002g: a main that only just went away gets HANDOFF_DOWN_GRACE_MS to come back (handoffTick); one that has been away longer than that already is not waited for
+  if (away >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, awayText())
   saveState()
   return h
 }
-const awayText = (): string => `主線已經 ${Math.max(1, Math.round((Date.now() - mainDownSince) / 1000))} 秒不在線`
-// 002j: a main behind the model wall is connected and cannot act. For a hand-over it counts as away, with the same grace.
-const mainWalledFor = (): number => S?.main_wall ? Math.max(0, Date.now() - Date.parse(S.main_wall.since)) : 0
-const walledText = (): string => `主線已經 ${Math.max(1, Math.round(mainWalledFor() / 1000))} 秒不能用模型（${WALL_WORD[S.main_wall?.kind ?? ''] ?? '模型無法使用'}）`
+/** M2: how long the main has been away (gone, or walled: a walled main cannot act), ms; 0 = it is there */
+const awayFor = (): number => { const t = main?.awaySince() ?? 0; return t ? Math.max(0, Date.now() - t) : 0 }
+const awayText = (): string => `主線已經 ${Math.max(1, Math.round(awayFor() / 1000))} 秒${main?.mainPhase() === 'walled' ? `不能用模型（${WALL_WORD[S.wall?.kind ?? ''] ?? '模型無法使用'}）` : '不在線'}`
 function handoffFallback(h: Handoff, why: string): void {
   h.state = 'fallback'; h.done = nowIso()
   const lane = S.lanes[h.lane]
@@ -2924,28 +2469,32 @@ function handoffFallback(h: Handoff, why: string): void {
 export function handoffTick(): void {
   if (!S?.handoffs) return
   const now = Date.now()
-  const up = mainConnected()
+  const away = awayFor()
   let changed = false
   for (const h of Object.values(S.handoffs)) {
     if (h.state !== 'pending') continue
-    if (!up && now - mainDownSince >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, awayText())
-    else if (up && mainWalledFor() >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, walledText())
-    else if (now - h.created >= HANDOFF_FALLBACK_MS) handoffFallback(h, `已經 ${Math.round((now - h.created) / 60_000)} 分鐘，主線${up ? '還在忙' : '不在線'}`)
+    if (away >= HANDOFF_DOWN_GRACE_MS) handoffFallback(h, awayText())
+    else if (now - h.created >= HANDOFF_FALLBACK_MS) handoffFallback(h, `已經 ${Math.round((now - h.created) / 60_000)} 分鐘，主線${main?.mainUp() ? '還在忙' : '不在線'}`)
     else continue
     changed = true
   }
   if (changed) saveState()
 }
-/** the main received a digest taken at `takenAt`: every handoff created up to then is in its hands */
-function handoffsDelivered(takenAt: number): void {
-  let changed = false
-  const now: string[] = []
-  for (const h of Object.values(S?.handoffs ?? {})) {
-    if (h.state === 'pending' && h.created <= takenAt) { h.state = 'delivered'; h.done = nowIso(); changed = true; now.push(h.id)
-      logos('lane.handoff.delivered', { handoff: h.id, lane: h.lane, thread: h.thread, event: h.event, class: h.cls ?? null, waited_s: Math.round((Date.now() - h.created) / 1000) }) }
+/** M1: an item reached done (its turn ended with Stop). A digest moves the digest cursor; a hand-over item settles its hand-overs. */
+function itemDone(it: Row): void {
+  if (it.kind === 'digest' && typeof it.upto === 'number') {
+    const cur = readJson<{ line: number }>(digestPath(), { line: 0 })
+    if (it.upto > cur.line) writeJsonAtomic(digestPath(), { line: it.upto })
   }
-  if (now.length) handoffWake = { at: Date.now(), ids: now }
-  if (changed) saveState()
+  const ids: string[] = Array.isArray(it.handoffs) ? it.handoffs : []
+  const now: string[] = []
+  for (const id of ids) {
+    const h = S?.handoffs?.[id]
+    if (!h || h.state !== 'pending') continue
+    h.state = 'delivered'; h.done = nowIso(); now.push(h.id)
+    logos('lane.handoff.delivered', { handoff: h.id, lane: h.lane, thread: h.thread, event: h.event, class: h.cls ?? null, waited_s: Math.round((Date.now() - h.created) / 1000) })
+  }
+  if (now.length) { handoffWake = { at: Date.now(), ids: now }; saveState() }
 }
 // ------------------------------------------------------------------ 002l (D16): the main's report on a hand-over goes out at the event's tier
 // design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」. A lane hands a peer's request (silent tier) to the main; the main's reply
@@ -2979,7 +2528,6 @@ export function noteMainReplyTier(t: { silent: boolean; rule: string; handoff?: 
     refs: { tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId } })
   logos('lane.notify', { lane: 'main', tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId })
 }
-const digestTakenAt = new Map<string, number>()
 
 // ------------------------------------------------------------------ 002j: a request only the main can agree to (problem 24)
 // A lane cannot promise for the agent, so it hands such a request to the main. What the requester was told meanwhile
@@ -3389,7 +2937,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (tok.handed) return 'refused: this event is already handed to the main.'
       const h = handoff(lane, tok.evId, text, undefined, tok.cls)        // 002l (D16): the event's class rides with the hand-over
       tok.handed = true; tok.escalated = true
-      logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: h.id, main_connected: mainConnected() })
+      logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: h.id, main_phase: main?.mainPhase() ?? null })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words)
       let told = ''
       try { const t = await interimToPeer(lane, tok, h); if (t) told = ` The router told ${tok.interim}: "${t}" Send ${tok.interim} nothing more about this.` } catch (e) { D.log('warn', `lanes: interim reply failed: ${e}`) }
@@ -3476,9 +3024,10 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const fo = S.fanouts?.[tok.synthesis]
       if (fo) { fo.done = nowIso(); saveState() }
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', notify_main: false, text: `綜合結論交給主線：${text.slice(0, 300)}`, refs: { fanout: tok.synthesis } })
-      const ok = await digestIO.deliver(`〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`, { user: 'lanes', kind: 'synthesis', wake: 'true' })
-      logos('lane.synthesis', { fanout: tok.synthesis, lane: lane.id, delivered: ok, chars: text.length })
-      return ok ? 'delivered to the main.' : 'the main is not reachable now; your conclusion is in the ledger and reaches it in the next digest.'
+      main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: `〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`,
+        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } } }, { event: tok.evId })
+      logos('lane.synthesis', { fanout: tok.synthesis, lane: lane.id, queued: true, chars: text.length })
+      return 'queued for the main: it gets your conclusion when it is free (at once if it is idle).'
     }
     case 'curator_done': {
       if (lane.kind !== 'curator') return 'refused: curator_done is for the curator lane only.'
@@ -3644,6 +3193,16 @@ const REPORT_CHECK = (): boolean => process.env.LANES_REPORT_CHECK === '1'
 let REPORT_CONTRA = Number(process.env.LANES_REPORT_CONTRA ?? 0.8)
 export const __setReportContra = (p: number): void => { REPORT_CONTRA = p }
 const reportBacked = new Set<string>()            // run id + tool: already sent back once
+/** the end of a file as text, whole lines only; null when it cannot be read (the A3 model aid reads the lane run's own tool results) */
+function tailText(path: string, max: number): string | null {
+  try {
+    const size = statSync(path).size, n = Math.min(size, max)
+    const fd = openSync(path, 'r'), buf = Buffer.alloc(n)
+    readSync(fd, buf, 0, n, size - n); closeSync(fd)
+    const text = buf.toString('utf8')
+    return n < size ? text.slice(text.indexOf('\n') + 1) : text
+  } catch { return null }
+}
 function runToolResults(path: string): Array<{ call: string; result: string }> {
   const text = tailText(path, 600_000) ?? ''
   const lines = text.split('\n')
@@ -4095,6 +3654,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     }
     case 'fork': {
       const task = String(a.task ?? '').trim()
+      const mainReg = main.mainSession()
       if (!task || !mainReg) return 'fork needs a task and a registered main'
       const lane = newLane('fork', { fork_from: mainReg.session_id })
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: task, meta: {}, notif: { method: '', params: {} },
@@ -4194,38 +3754,6 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
     }
   }
   return `unknown tool ${name}`
-}
-
-// ================================================================== 002k: the main stuck in one tool call
-// design/stability SR3 「主線卡住時警報照樣有人處理，還能主動告訴你主線卡住了」. Lanes keep handling alerts and peers whatever the main does
-// (that part is the router). What was missing: nobody told Joey. A main whose turn has sat in ONE tool call for longer than
-// LANES_MAIN_STUCK_MS (default 10 minutes) is reported to him once, with what it is running, how long, and how many messages wait
-// behind it; when that call ends he is told once that it is free again. A long build is also "stuck" by this rule: the notice says
-// what it is running, it does not claim the main is broken. Liveness of the process is the keeper's job, not this one.
-let MAIN_STUCK_MS = Number(process.env.LANES_MAIN_STUCK_MS ?? 600_000)
-export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
-export function mainStuckTick(): void {
-  if (D?.role !== 'tg' || !S || !mainReg?.transcript_path || S.main_wall) return
-  const oc = pidAlive(mainReg.claude_pid) ? openToolCallFile(mainReg.transcript_path) : null
-  const was = S.main_stuck
-  if (was && (!oc || oc.id !== was.call)) {
-    delete S.main_stuck; saveState()
-    const mins = Math.max(1, Math.round((Date.now() - was.since) / 60_000))
-    const text = `主線的指令結束了（${was.tool}，卡了約 ${mins} 分鐘），它可以接著處理訊息了。`
-    ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-unstuck', escalated: true } })
-    logos('lane.main_unstuck', { call: was.call, after_s: Math.round((Date.now() - was.since) / 1000) })
-    void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-unstuck', message_id: id }))
-    return
-  }
-  if (!oc || was || Date.now() - oc.since < MAIN_STUCK_MS) return
-  S.main_stuck = { call: oc.id, since: oc.since, told_at: nowIso(), tool: oc.tool }; saveState()
-  const mins = Math.max(1, Math.round((Date.now() - oc.since) / 60_000))
-  const text = `主線卡住了：從 ${stamp(new Date(oc.since).toISOString())}（${TZ_LABEL}）起在跑一個 ${oc.tool} 指令（${oc.input}），已經 ${mins} 分鐘沒有結果。`
-    + (oc.queued ? `有 ${oc.queued} 則訊息排在它後面，指令結束才會讀到。` : '')
-    + '警報和同事的事由車道照常處理。要停掉它可以用 /kill_stuck，或等它跑完；跑完我會再告訴你。'
-  ledger({ lane: 'router', kind: 'notify', notify_main: true, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'main-stuck', escalated: true } })
-  logos('lane.main_stuck', { call: oc.id, tool: oc.tool, input: oc.input, since: new Date(oc.since).toISOString(), queued: oc.queued })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'main-stuck', message_id: id }))
 }
 
 // ================================================================== 002k: /lanes — Joey sees and controls the lanes
@@ -4372,106 +3900,27 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
   return '用法：/lanes（清單）、/lanes close <車道>、/lanes off、/lanes on、/lanes notify default|tiered、/lanes hold <同事> [分鐘]、/lanes release <同事>'
 }
 
-// ================================================================== digest (tg role) — 002b
-// The pending digest = ledger entries with notify_main past the cursor in .lanes/digest.json. It is TAKEN exactly once:
-//   - piggyback: routeEvent attaches it to any decision that targets the main (a Joey message, an escalation reply,
-//     a mesh event the router hands to the main); the deliverer prepends it to that same channel message
-//     (notifWithDigest) and acks (ackDigest) — no extra turn exists, nothing wakes the main;
-//   - wake: digestTickWith takes it alone only when a pending entry is a wake entry (escalation / stop / push-tier
-//     notice) and the main is idle — as 002 did for everything — and it carries ALL pending entries.
-// The cursor is persisted at the take; an un-acked take is taken again after DIGEST_RETRY_MS (never lost).
+// ================================================================== digest (tg role)
+// The digest is information: it is never offered alone; M1 attaches it to whatever it offers or the main's hook pulls (lanes-main.ts). It covers the
+// ledger lines past the digest cursor (.lanes/digest.json: the end of the last digest that was DONE) and past what a live digest item already covers.
 const digestPath = () => join(LANES_DIR, 'digest.json')
 function readLedgerLines(): string[] {
   try { return readFileSync(ledgerPath(), 'utf8').split('\n').filter(Boolean) } catch { return [] }
 }
-function persistCursor(was: DigestCursor, next: DigestCursor): void {
-  if (JSON.stringify(was) !== JSON.stringify(next)) writeJsonAtomic(digestPath(), next)
-}
-/** tg role. commit=false is a peek: nothing but moving the cursor past entries that are not for the main. */
-function planNow(onlyIfWake: boolean, commit: boolean): DigestTake | null {
-  const cur = readJson<DigestCursor>(digestPath(), { line: 0 })
-  // wake tick: an escalating lane that is still running is about to file its closing report — let the wake carry it
-  const hold = onlyIfWake ? (r: LedgerRec) => !!r.lane && running.has(r.lane) && Date.now() - Date.parse(r.ts) < WAKE_HOLD_MS : undefined
+function digestInfo(): { text: string; fields: Record<string, unknown> } | null {
   const lines = readLedgerLines()
-  const reopen = onlyIfWake ? [] : openJoeyProposals(lines.map(parseLedgerLine).filter((r): r is LedgerRec => !!r))      // 002k (D1)
-  const plan = planDigest(cur, lines, Date.now(), { id: `dg-${Date.now()}-${shortId()}`, onlyIfWake, retryMs: DIGEST_RETRY_MS, hold, reopen, holds: holdLines() })
-  if (commit || !plan.take) persistCursor(cur, plan.cursor)
-  return plan.take
+  const live = main.items(r => r.kind === 'digest' && (r.state === 'offered' || r.state === 'bound'))
+  const start = Math.max(readJson<{ line: number }>(digestPath(), { line: 0 }).line, ...live.map(r => Number(r.upto) || 0))
+  const recs = lines.slice(start).map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
+  const inRange = new Set(recs.filter(r => r.kind === 'memory_proposal').map(r => r.refs?.proposal_id))
+  const reopen = openJoeyProposals(lines.map(parseLedgerLine).filter((r): r is LedgerRec => !!r)).filter(r => !inRange.has(r.refs?.proposal_id))   // 002k (D1)
+  if (!recs.some(r => r.notify_main) && !reopen.length) return null
+  const d = renderDigest(recs, reopen, holdLines())
+  if (!d) return null
+  appendJsonl('routing.jsonl', { event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${d.items} item(s), ${d.threads} thread(s)` })
+  logos('lane.digest', { items: d.items, threads: d.threads, text: d.text })
+  return { text: d.text, fields: { from: start, upto: lines.length, items: d.items } }
 }
-export function takePendingDigest(onlyIfWake: boolean, mode: 'piggyback' | 'wake'): DigestTake | null {
-  if (D?.role !== 'tg') return null
-  const t = planNow(onlyIfWake, true)
-  if (t) {
-    digestTakenAt.set(t.id, Date.now())
-    appendJsonl('routing.jsonl', { event: `digest-${Date.now()}`, source: 'ledger', rule: `digest-${mode}`, target: 'main', note: `${t.items} item(s), ${t.threads} thread(s)${t.wake ? ', wake entry' : ''}`, digest_id: t.id })
-    logos('lane.digest', { mode, items: t.items, threads: t.threads, wake: t.wake, text: t.text })
-    D.log('info', `lanes: digest taken (${mode}; ${t.items} items, ${t.threads} threads${t.wake ? ', has wake entry' : ''})`)
-  }
-  return t
-}
-function ackDigestLocal(id: string): void {
-  const cur = readJson<DigestCursor>(digestPath(), { line: 0 }); persistCursor(cur, ackState(cur, id))
-  const at = digestTakenAt.get(id)
-  if (at != null) { digestTakenAt.delete(id); handoffsDelivered(at) }
-}
-function releaseDigestLocal(id: string): void {
-  const cur = readJson<DigestCursor>(digestPath(), { line: 0 }); persistCursor(cur, releaseState(cur, id))
-}
-
-/** The notification to hand to the main: the decision's digest prepended inside the SAME channel message
- *  (no second message, so no extra turn). No digest on the decision = the notification unchanged. */
-export function notifWithDigest(notif: Notif, d: { digest?: DigestTake; warn?: string } | null | undefined): Notif {
-  const dg = d?.digest
-  const warned = (n: Notif): Notif => {
-    if (!d?.warn) return n
-    const p = (n.params ?? {}) as { content?: string; meta?: Record<string, string> }
-    return { method: n.method, params: { ...p, content: `${d.warn}\n\n${String(p.content ?? '')}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
-  }
-  if (!dg) return warned(notif)
-  const p = (notif.params ?? {}) as { content?: string; meta?: Record<string, string> }
-  return warned({ method: notif.method, params: { ...p, content: piggybackContent(dg.text, String(p.content ?? '')),
-    meta: { ...(p.meta ?? {}), lane_digest: 'piggyback', lane_digest_items: String(dg.items) } } })
-}
-/** Call after the notification was handed to deliverToMain: settles the take (inbox role: tells the tg daemon). */
-export async function ackDigest(d: { digest?: DigestTake } | null | undefined): Promise<void> {
-  const id = d?.digest?.id
-  if (!id || !D) return
-  if (D.role === 'tg') { ackDigestLocal(id); return }
-  await peerCall(TG_PORT, '/lanes/digest-ack', 'POST', { id })
-}
-
-export type DigestIO = {
-  mainConnected: () => Promise<boolean>
-  mainIdle: () => Promise<boolean>
-  deliver: (content: string, meta: Record<string, string>) => Promise<boolean>
-}
-let digestBusy = false
-/** The idle-wake tick (every 10 s). Delivers ONLY when something pending is a wake entry, the main is connected and idle. */
-export async function digestTickWith(io: DigestIO): Promise<string> {
-  if (digestBusy) return 'busy'
-  if (!mainReg) return 'no-main'
-  digestBusy = true
-  try {
-    if (!planNow(true, false)) return 'no-wake-entry'
-    if (!(await io.mainConnected())) return 'main-not-connected'
-    if (!(await io.mainIdle())) return 'main-busy'
-    const t = takePendingDigest(true, 'wake')        // re-decided at the take: a piggyback may have taken it meanwhile
-    if (!t) return 'taken-elsewhere'
-    const ok = await io.deliver(t.text, { user: 'lanes', kind: 'digest', items: String(t.items), no_reply: 'true', wake: 'true' })
-    if (ok) { ackDigestLocal(t.id); return 'delivered' }
-    releaseDigestLocal(t.id)
-    return 'deliver-failed'
-  } catch (e) {
-    D.log('warn', `lanes: digest tick failed: ${e}`)
-    return 'error'
-  } finally { digestBusy = false }
-}
-const digestIO: DigestIO = {
-  mainConnected: async () => !!(await inboxGet('/lanes/main-status'))?.main_connected,
-  mainIdle: async () => !D.isMainIdle || await D.isMainIdle(),
-  deliver: async (content, meta) => !!(await inboxPost('/lanes/deliver-main', { content, meta }))?.delivered,
-}
-async function digestTick(): Promise<void> { await digestTickWith(digestIO) }
 
 // ================================================================== cross-daemon calls
 function tokenFor(port: number): string {
@@ -4597,19 +4046,16 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
   if (!u.pathname.startsWith('/lanes/')) return false
   if (!D.authOk(req.headers['authorization'] as string | undefined)) { sendJson(res, 403, { error: 'loopback token required' }); return true }
   const p = u.pathname
-  if (p === '/lanes/register-main' && req.method === 'POST') { sendJson(res, 200, registerMain(req, await readBody(req))); return true }
-  if (p === '/lanes/main-status') {
-    sendJson(res, 200, { main: mainReg, main_connected: mainConnected(), main_mcp_session: mainMcpSid }); return true
-  }
   if (D.role === 'tg') {
     if (p === '/lanes/route' && req.method === 'POST') { sendJson(res, 200, await routeEvent(await readBody(req) as InEvent)); return true }
-    if (p === '/lanes/main-wall' && req.method === 'POST') {            // 002j: the inbox daemon saw the main answer a mesh message with the API error
+    // M2/M1: every hook event of the main (lanes-hooks/main-hook.py); the reply is what the hook prints
+    if (p === '/lanes/main-event' && req.method === 'POST') {
       const b = await readBody(req)
-      const kind = wallKind(String(b.text ?? ''))
-      if (kind && Number.isFinite(Number(b.at))) noteMainWalled({ kind, text: String(b.text).slice(0, 200), at: Number(b.at), midTask: !!b.midTask, model: String(b.model ?? '') }, !!b.counts)
-      sendJson(res, 200, { up: !!S.main_wall }); return true
+      if (!b.pid && b.event === 'SessionStart') b.pid = callerClaudePid(req)       // a hook without CLAUDE_PID: the caller's socket says which claude it is
+      sendJson(res, 200, await main.mainEvent(b)); return true
     }
-    if (p === '/lanes/main-wall-held' && req.method === 'POST') { heldForMain(true, false); sendJson(res, 200, { held: S.main_wall?.held ?? 0 }); return true }
+    // the state journal, folded: the interface the lab reads
+    if (p === '/lanes/state' && req.method === 'GET') { sendJson(res, 200, journal.snapshot({ current_gen: main.currentGen()?.id ?? null, wall: S.wall ?? null })); return true }
     if (p === '/lanes/outbound' && req.method === 'POST') {
       const b = await readBody(req)
       S.outbound[String(b.msgId)] = { owner: String(b.owner ?? 'main'), thread: b.thread ?? null }
@@ -4639,11 +4085,8 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       if (t) { t.hops = hop; t.last = nowIso(); saveState() }
       sendJson(res, 200, { ok: true, hop }); return true
     }
-    if (p === '/lanes/digest-ack' && req.method === 'POST') {
-      ackDigestLocal(String((await readBody(req)).id ?? '')); sendJson(res, 200, { ok: true }); return true
-    }
     if (p === '/lanes/status') {
-      sendJson(res, 200, { main: mainReg, main_connected: mainConnected(), running: [...running.keys()], queued: [...queue.values()].map(i => ({ ev: i.ev.id, lane: i.lane, state: i.state, attempts: i.attempts })),
+      sendJson(res, 200, { main: main.currentGen() ?? null, running: [...running.keys()], queued: [...queue.values()].map(i => ({ ev: i.ev.id, lane: i.lane, state: i.state, attempts: i.attempts })),
         lanes: S.lanes, threads: S.threads }); return true
     }
   }
@@ -4655,15 +4098,13 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
         { thread: b.thread, hop: Number(b.hop) || undefined, lane: b.lane })
       sendJson(res, 200, r); return true
     }
-    if (p === '/lanes/deliver-main' && req.method === 'POST') {
+    // M1 transport: the tg daemon offers an item that came in by mesh; it goes out through this daemon's MCP stream of the main process (pid)
+    if (p === '/lanes/offer' && req.method === 'POST') {
       const b = await readBody(req)
-      if (!mainConnected()) { sendJson(res, 200, { delivered: false, why: 'main not connected' }); return true }
-      if (wallHoldsMain()) { sendJson(res, 200, { delivered: false, why: 'main behind the model wall' }); return true }   // 002j: the hand-over fallback tells Joey
-      D.deliverToMain({ method: 'notifications/claude/channel', params: { content: String(b.content ?? ''),
-        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', ts: nowIso(), via: 'lanes', verified: 'true', relay: 'local', ...(b.meta ?? {}) } } })
-      sendJson(res, 200, { delivered: true }); return true
+      const sid = sessionOfPid(Number(b.pid))
+      const offered = !!sid && !!b.notif && !!D.notifySession && await D.notifySession(sid, b.notif)
+      sendJson(res, 200, { offered }); return true
     }
-    if (p === '/lanes/sweep' && req.method === 'POST') { D.sweepNow?.(); sendJson(res, 200, { ok: true }); return true }   // 002j: the wall went up or down
     if (p === '/lanes/scheduler' && req.method === 'POST') {
       const b = await readBody(req)
       const text = D.schedulerCall ? await D.schedulerCall(String(b.run_id), b.action === 'ack' ? 'ack' : 'complete', b.outcome, b.summary) : 'no scheduler'
@@ -4675,7 +4116,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
 
 /** /healthz extras */
 export function lanesHealth(): Record<string, unknown> {
-  return { lanes_on: true, main_wall: wallHoldsMain(), main_stuck: !!S?.main_stuck, main_session: mainReg?.session_id ?? null, main_connected: mainConnected(),
+  return { lanes_on: true, main_phase: D?.role === 'tg' ? main?.mainPhase() : undefined, main_session: D?.role === 'tg' ? main?.mainSession()?.session_id ?? null : undefined,
     lanes_running: D?.role === 'tg' ? running.size : undefined, lane_slots: D?.role === 'tg' && LANES_DIR ? laneSlots() : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
     handoffs_pending: D?.role === 'tg' ? Object.values(S?.handoffs ?? {}).filter(h => h.state === 'pending').length : undefined,

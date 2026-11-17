@@ -55,11 +55,11 @@ import {
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
-import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
+import { newestGenuineAssistantAtIn } from './liveness.ts'
 // Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
-// (GENESIS_LANES=1); with it unset the daemon runs the 685e5b1 code paths unchanged.
+// (GENESIS_LANES=1); with it unset the daemon runs the 685e5b1 code paths unchanged. In lanes mode nothing here delivers to
+// the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
 import * as Lanes from './lanes.ts'
-import { isClaudeIdleStable } from './channel-bot-control.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
@@ -766,8 +766,6 @@ const consumptionCheckAvailable = existsSync(TRANSCRIPT_DIR)
 // dup and still acks (records live RETAIN_MS).
 const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
 const CONSUME_RETAIN_MS = 1_800_000
-// lanes (002i): a delivery to the main that has left no trace in the main's transcript after this long never arrived
-const ARRIVE_GRACE_MS = Number(process.env.LANES_ARRIVE_GRACE_MS ?? 20_000)
 const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null; walled?: boolean }> = []
 
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
@@ -825,13 +823,6 @@ function recordDelivery(notif: { method: string; params: unknown }): void {
 // full rationale recorded here through 1.22.x). This wrapper just binds it to
 // this daemon's TRANSCRIPT_DIR.
 function newestGenuineAssistantAt(): number {
-  // lanes (002): lanes write transcripts into the same project dir, so "newest jsonl" would
-  // count a lane's (or a stray second session's) turn as the main's consumption. Read ONLY
-  // the registered main's transcript (evidence #2/#3/#5).
-  if (Lanes.LANES_ON) {
-    const t = Lanes.mainTranscript()
-    return t ? genuineAssistantAtFile(t) : 0
-  }
   return newestGenuineAssistantAtIn(TRANSCRIPT_DIR)
 }
 
@@ -842,37 +833,7 @@ function sweepDeliveries(): void {
   const newest = newestGenuineAssistantAt()
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
-    // lanes (002i): the main's own transcript says what became of THIS delivery (Lanes.intake): taken in, waiting in the
-    // client's queue, or no trace at all. That replaces "the transcript advanced after the delivery" whenever the delivery
-    // can be recognised: a main that is in the middle of a turn advances its transcript without having read anything.
-    // 002m (L6G1, L6T1): consumed = the main took it in AND a turn ended after that (Lanes.deliveryFate). A genuine record
-    // after the take-in is not enough: the running turn's own tool calls are not consumption, and a main killed in the
-    // middle of that turn never finished the message (T8-R r3: killed 0.46 s after the C4 tool call, answered after 1019 s).
-    const fate = Lanes.LANES_ON ? Lanes.deliveryFate(d.notif, d.at) : null
-    const it = fate ? { taken: fate.fate === 'consumed' || fate.fate === 'working' || fate.fate === 'taken', queued: fate.fate === 'queued', takenAt: fate.takenAt ?? 0 } : null
-    // 002j: "taken in" is not "consumed". Until then the delivery stays open: a running turn answers soon; a usage-limit
-    // wall or a frozen session does not, and the delivery is parked again after the grace (counted from when it was taken in).
-    const answered = fate?.fate === 'consumed'
-    // 002j: the main took it in and its transcript shows the API error as the last thing after it: the model wall, not a
-    // stuck agent. The delivery is neither acked nor sent round the grace/park/quarantine path (fleet history: an agent
-    // at its weekly limit had every wake-up delivered three times and then written off). It is kept as it is and given
-    // again when the wall comes down.
-    if (it?.taken && !answered && !d.pendingPath) {
-      const step = Lanes.walledStep(d, it.takenAt)
-      if (step === 'hold') continue
-      if (step === 'regive') {
-        d.pendingPath = persistInbound(d.notif)
-        log('info', 'model wall down: a delivery the main only answered with the API error is given again')
-        if (!d.pendingPath) recentDeliveries.splice(i, 1)
-        continue
-      }
-    }
-    // 002m: the main is working on it (its own records follow the take-in, the turn has not ended): kept as it is. If the
-    // process dies before the turn ends, repersistUnconsumed gives it to the next one; it is never parked into a live turn.
-    if (fate?.fate === 'working') continue
-    // Without that evidence: strictly after the delivery, and by a genuine (non-API-error) assistant
-    // record. An error record or a pre-delivery record is NOT consumption.
-    if (it ? answered : newest > d.at) {
+    if (newest > d.at) {
       // transcript advanced after delivery ⇒ consumed. If we had already
       // re-persisted a dup (long-turn false negative), retract it.
       if (d.pendingPath) {
@@ -880,12 +841,7 @@ function sweepDeliveries(): void {
       }
       maybeAutoAckScheduled(d.notif)
       recentDeliveries.splice(i, 1)
-    } else if (it?.queued) {
-      // the live client has it and reads it at the next step of its running turn; if that process dies first,
-      // repersistUnconsumed gives it to the next one
-      // 002k (G16b): ... unless nothing is running: alive, no open tool call, no new assistant record for a minute = not reading (a menu, or no turn)
-      if (Lanes.LANES_ON) void Lanes.noteMainDeaf(d.at)
-    } else if (!d.pendingPath && now - (it?.taken ? Math.max(d.at, it.takenAt) : d.at) > (it && !it.taken ? ARRIVE_GRACE_MS : CONSUME_GRACE_MS)) {
+    } else if (!d.pendingPath && now - d.at > CONSUME_GRACE_MS) {
       const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
       if (attempts >= MAX_REDELIVERIES) {
         // Stop the loop — but do NOT destroy the message. The 1.22.3 wording
@@ -926,43 +882,12 @@ function sweepDeliveries(): void {
   }
 }
 
-/** lanes (002g): the registered main was replaced by a new process. What was handed to the old one and never answered (no
- *  genuine assistant record after it) will not be consumed by anyone: park it again now, so the new process gets it as soon
- *  as its session is open, not after CONSUME_GRACE_MS. */
-function repersistUnconsumed(): number {
-  if (!consumptionCheckAvailable) return 0
-  const newest = newestGenuineAssistantAt()
-  let n = 0
-  // What the old process did not take in is given to the new one: a delivery that was only queued inside it is gone with
-  // it, and one that left no trace never arrived. The record stays (with its parked copy) so that the sweep can still
-  // retract the copy if the transcript later shows the first one was read after all.
-  // 002m (L6G1, L6T1): what the old process took in but never finished (no turn ended after the take-in: the turn was cut,
-  // its own tool calls are not consumption) is given to the new one as well. The dead process cannot read it any more, so
-  // that record is closed and the parked copy is the delivery from now on (the replay records it again).
-  const closed = new Set<object>()
-  for (const d of recentDeliveries) {                       // in delivery order: the parked files replay in that order
-    if (d.pendingPath) continue
-    const act = Lanes.LANES_ON ? Lanes.replacementAction(d.notif, d.at, newest) : (newest > d.at ? 'keep' : 'park')
-    if (act === 'keep') continue
-    d.pendingPath = persistInbound(d.notif)
-    if (!d.pendingPath) continue
-    n++
-    if (act === 'park-close') closed.add(d)
-  }
-  for (let i = recentDeliveries.length - 1; i >= 0; i--) if (closed.has(recentDeliveries[i])) recentDeliveries.splice(i, 1)
-  if (n) log('info', `main replaced: ${n} delivery(ies) the old process never took in or never finished parked again for the new one`)
-  return n
-}
-
 let replayRunning = false
 async function replayPendingFromDisk(server: Server): Promise<number> {
   // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
   // would each read the same parked file before either removed it: the same message delivered twice (fleet record
   // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
   if (replayRunning) return 0
-  // 002l (N6): the main's model wall gates EVERY replay, the session-open one included (002j: 「主線撞到額度：給主線的訊息先保留」). The timer drain and
-  // the delivery path had the gate; this path did not, and a main process replaced behind the wall got the held messages (T7-R #9 #12 #13 #15).
-  if (!Lanes.replayAllowed()) return 0
   replayRunning = true
   try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
 }
@@ -1024,12 +949,6 @@ const PARK_ALERT_AFTER_MS = Number(process.env.PARK_ALERT_AFTER_MS ?? 900_000)  
 let parkAlerted = new Set<string>()
 
 function liveSessionServer(): Server | null {
-  if (Lanes.LANES_ON) {   // 002: parked deliveries drain ONLY into the registered main (evidence #4)
-    const sid = Lanes.mainMcpSession()
-    if (!sid || !sseOpen.get(sid)) return null
-    for (const server of activeServers) if (serverSessionId.get(server) === sid) return server
-    return null
-  }
   for (const server of activeServers) {
     const sid = serverSessionId.get(server)
     if (sid && sseOpen.get(sid)) return server
@@ -1038,7 +957,6 @@ function liveSessionServer(): Server | null {
 }
 
 async function drainPendingIfLive(): Promise<void> {
-  if (!Lanes.replayAllowed()) return     // 002j: nothing is replayed into the wall; Joey was told when it came up
   let files: string[]
   try { files = readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')) } catch { return }
   if (files.length === 0) { if (parkAlerted.size) parkAlerted = new Set(); return }
@@ -1050,8 +968,7 @@ async function drainPendingIfLive(): Promise<void> {
     if (parkAlerted.has(f)) continue
     let ageMs = 0
     try { ageMs = now - statSync(join(PENDING_DIR, f)).mtimeMs } catch {}
-    // 002j: what was kept behind the model wall is being given right now; its age is the wall's, not a stuck queue's
-    if (ageMs > PARK_ALERT_AFTER_MS && !(Lanes.LANES_ON && Lanes.wallLiftedRecently())) {
+    if (ageMs > PARK_ALERT_AFTER_MS) {
       parkAlerted.add(f)
       log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
       // Parking is acceptable; parking SILENTLY is not (the prometheus lost-
@@ -2611,7 +2528,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
       reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.message_thread_id,
     }
     const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
-    if (!d || d.target === 'main') { deliverToMain(Lanes.notifWithDigest(notification, d)); void Lanes.ackDigest(d) }   // 002b: the pending digest rides along
+    if (!d) Lanes.toMainDirect(notification, 'telegram')                 // the router decided nothing: the main's delivery ledger takes it
     return
   }
   // In ROAMER_MODE, route to the current target's MCP session only,
@@ -2835,42 +2752,6 @@ async function maybeTranscribeVoice(attachment: AttachmentMeta | undefined): Pro
 //   3. Session active AND SSE open → deliver directly
 //   4. If no session had SSE open, also persist to disk as safety net (covers
 //      daemon restart between broadcast and SSE open)
-// 002: single-target delivery to the registered main's MCP session (evidence #1/#3/#4). Not
-// connected → disk pending, which drains only into the main (liveSessionServer).
-function deliverToMain(notif: { method: string; params: unknown }): void {
-  // 002j: the main is behind the model wall (usage limit, overload, login): it would answer whatever it is handed with the
-  // same API error. The message is kept in inbox/pending and given when the wall comes down; Joey's own message gets a line
-  // back from the router at once (never silent).
-  if (Lanes.LANES_ON && Lanes.wallHoldsMain()) {
-    stampDid(notif)
-    persistInbound(notif)
-    Lanes.noteHeldForMain(notif)
-    log('info', 'main delivery kept behind the model wall (inbox/pending)')
-    return
-  }
-  const sid = Lanes.mainMcpSession()
-  let server: Server | undefined
-  if (sid) for (const s of activeServers) if (serverSessionId.get(s) === sid) { server = s; break }
-  if (!sid || !server) {
-    log('warn', `lanes: registered main not connected — parked in inbox/pending (other sessions get nothing): ${notif.method}`)
-    persistInbound(notif)
-    return
-  }
-  if (sseOpen.get(sid)) {
-    void server.notification(notif as Parameters<Server['notification']>[0]).then(() => recordDelivery(notif)).catch(err => {
-      log('error', `lanes: deliver to main ${sid} failed (${err}) — parked in inbox/pending`)
-      persistInbound(notif)
-    })
-  } else {
-    // 002m (L6G1): never into the session's memory queue. A main killed a moment ago still has its MCP session here with
-    // the SSE stream closed; its memory queue died with it (the GC eviction deletes it) and no delivery record pointed at
-    // it (G r2/r3: Joey's message 0.05-0.2 s after the kill was lost). On disk it drains into whichever main opens its
-    // stream next, the same session reconnecting or its replacement (stability SR2 「沿用現有的磁碟佇列與重送」).
-    persistInbound(notif)
-    log('info', `lanes: main ${sid} has no open stream — parked in inbox/pending until a live main opens one`)
-  }
-}
-
 // 002j: every delivery can be recognised in the transcript. Telegram messages carry message_id and mesh messages
 // btcc_msg_id; system notices, digests and locally injected messages carried nothing (fleet replay 2026-11-14: 337 of
 // about 4,500 deliveries), so the daemon could not tell whether they were read and fell back to the time rule. Those get
@@ -2887,7 +2768,6 @@ function stampDid(notif: { method: string; params: unknown }): void {
 }
 function broadcastNotification(notif: { method: string; params: unknown }): void {
   stampDid(notif)
-  if (Lanes.LANES_ON) { deliverToMain(notif); return }
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
     persistInbound(notif)
@@ -2927,14 +2807,8 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
   }
 }
 
-// 002m (L6G1): a session's memory queue is never just dropped with the session. In lanes mode everything in it was
-// addressed to the main, so it is parked on disk for the next live main.
 function parkMemQueue(sid: string): void {
-  const q = memQueue.get(sid)
   memQueue.delete(sid)
-  if (!Lanes.LANES_ON || !q?.length) return
-  for (const notif of q) persistInbound(notif)
-  log('warn', `session ${sid} closed with ${q.length} undelivered notif(s) — parked in inbox/pending`)
 }
 
 // issue #3 fix: remove a (zombie) session from every registry, regardless of
@@ -3242,16 +3116,21 @@ if (Lanes.LANES_ON) {
     transcriptDir: TRANSCRIPT_DIR,
     httpPort: HTTP_PORT as number,
     log,
-    deliverToMain,
+    stateDir: STATE_DIR,
+    notifySession: async (sid: string, notif: { method: string; params: unknown }): Promise<boolean> => {
+      if (!sseOpen.get(sid)) return false
+      for (const s of activeServers) if (serverSessionId.get(s) === sid) {
+        try { await s.notification(notif as Parameters<Server['notification']>[0]); return true } catch (err) { log('warn', `lanes: offer to ${sid} failed: ${err}`); return false }
+      }
+      return false
+    },
+    streamOpen: (sid: string) => !!sseOpen.get(sid),
     authOk: tokOk,
-    repersistUnconsumed,
     toolsChanged: (sid: string) => {      // 002m (LG1)
       for (const s of activeServers) if (serverSessionId.get(s) === sid && sseOpen.get(sid)) {
         void s.sendToolListChanged().catch(err => log('warn', `lanes: tools/list_changed to ${sid} failed: ${err}`))
       }
     },
-    pendingCount: () => { try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length } catch { return 0 } },   // 002l (N6)
-    sweepNow: () => { sweepDeliveries(); void drainPendingIfLive() },
     // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice
     ...(process.env.CHANNEL_BOT_TMUX_SESSION ? { mainPicker: {
       capture: () => capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
@@ -3288,7 +3167,6 @@ if (Lanes.LANES_ON) {
       },
       createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
       joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
-      isMainIdle: () => isClaudeIdleStable(process.env.CHANNEL_BOT_TMUX_SESSION),
     }),
   })
 }
@@ -3476,8 +3354,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           reply_to_id: body?.reply_to_id != null ? String(body.reply_to_id) : undefined,
           btcc_msg_id: btccMsgId != null ? String(btccMsgId) : undefined,
         }
-        const d = await Lanes.routeRemote(ev)
-        if (!d || d.target === 'main') { deliverToMain(Lanes.notifWithDigest(notification, d)); void Lanes.ackDigest(d) }   // router unreachable → main (= today's behaviour); 002b: the pending digest rides along
+        const d = await Lanes.routeRemote(ev)                            // target main: the tg daemon queued it for the main (M1)
+        if (!d) broadcastNotification(notification)                       // router unreachable: the fleet path (any open session of this agent)
         else if (d.target === 'lane') maybeAutoAckScheduled(notification)   // 開工回執: a lane took the scheduled run
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
@@ -3709,8 +3587,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           }
           // Disk-pending drain (covers daemon restart and "0 active session" gap).
           // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
-          // 002: only the registered main may drain the (main-addressed) pending queue.
-          if (!Lanes.LANES_ON || Lanes.isMainMcpSession(sessionId)) {
+          // lanes: nothing is parked for the main here (the tg daemon's delivery ledger holds it)
+          if (!Lanes.LANES_ON) {
             void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
           }
         }

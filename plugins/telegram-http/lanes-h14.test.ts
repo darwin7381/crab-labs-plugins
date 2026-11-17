@@ -150,9 +150,9 @@ test('H14: the main\'s peer_hold: all of the peer\'s events are ledger-only (no 
   // 002m (L6B5): the digest from the hold on (from line 0 it also carried the fourteen escalations earlier tests in this file left, and the 8-line cap
   // counts this row among the threads not listed)
   writeFileSync(join(dir, 'digest.json'), JSON.stringify({ line: rows('ledger.jsonl').findIndex(r => r.lane === 'main' && String(r.text).includes('主線暫停 fay')) }))
-  const d = L.takePendingDigest(false, 'piggyback')!
+  const d = L.__digest()!
   expect(d.text).toContain('暫停中的同事'); expect(d.text).toContain('fay'); expect(d.text).toContain('主線暫停 fay')
-  expect(L.takePendingDigest(true, 'wake')).toBeNull()                                    // a hold never wakes the main
+  expect(L.__main().items(r => r.kind === 'handoff' && /fay/.test(String(r.notif?.params?.content))).length).toBe(0)   // a hold never wakes the main
   L.floodTick(Date.now() + 40 * 60_000)                                                    // 30 minutes are up
   const end = rows('ledger.jsonl').find(r => r.refs?.peer_hold === 'fay' && r.refs.ended)!
   expect(end).toMatchObject({ kind: 'fyi', notify_main: true, refs: { count: 30, first: 'mesh-hfay-1', last: 'mesh-hfay-30' } }); expect(end.refs.samples.length).toBe(3); expect(end.text).toContain('時間到')

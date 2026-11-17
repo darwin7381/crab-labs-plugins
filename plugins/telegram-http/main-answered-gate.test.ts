@@ -1,6 +1,6 @@
 // Universe 002j: the main's end-of-turn check (lanes-hooks/main-answered-gate.py).
-// The hook is run as Claude Code runs it (stdin payload, stdout decision) against fixture transcripts in the record shapes
-// claude 2.1.x writes, with a local stand-in for the Jev endpoint. No network, no model.
+// The aid is run standalone (stdin payload with `lanes_turn`, stdout decision), as main-hook.py calls it at Stop with the items M1 bound to the turn and
+// the turn's reply / send_to_agent calls; the fixtures are written in transcript record shapes and converted (asTurn). A local stand-in for Jev.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
@@ -33,6 +33,24 @@ const absorbed = (id: string, text: string) => rec({ type: 'queue-operation', op
 const reply = (text: string, reply_to?: string) => rec({ type: 'assistant', timestamp: 't', message: { model: 'claude-haiku-5-5', content: [
   { type: 'tool_use', name: 'mcp__plugin_telegram-http_telegram-http__reply', input: { chat_id: '990000001', text, ...(reply_to ? { reply_to } : {}) } }] } })
 const turnEnd = rec({ type: 'system', subtype: 'turn_duration' })
+/** the turn as main-hook.py hands it to the aid: the items M1 bound to the prompt and the reply / send_to_agent calls of the turn. The fixtures
+ *  are written in the record shapes of a transcript (prompt, a message pulled into the turn, a reply); this turns them into those two lists. */
+function asTurn(t: string): { items: any[]; outputs: any[] } {
+  let items: any[] = [], outputs: any[] = []
+  for (const l of t.split('\n').filter(Boolean)) {
+    const j = JSON.parse(l)
+    if (j.type === 'system' && j.subtype === 'turn_duration') { items = []; outputs = []; continue }
+    const content = j.type === 'user' ? String(j.message?.content ?? '') : j.type === 'queue-operation' ? String(j.content ?? '') : ''
+    for (const m of content.matchAll(/<channel ([^>]*)>\n?([\s\S]*?)\n?<\/channel>/g)) {
+      const a = Object.fromEntries([...m[1].matchAll(/(\w+)="([^"]*)"/g)].map(x => [x[1], x[2]]))
+      items.push({ mid: a.message_id || a.btcc_msg_id || a.did, kind: a.message_id ? 'tg' : a.btcc_msg_id ? 'mesh' : 'sys', user: a.user ?? '', no_reply: a.no_reply === 'true',
+        system: a.user === 'lanes' || !!a.kind, body: m[2].trim() })
+    }
+    for (const c of (j.type === 'assistant' ? j.message?.content ?? [] : [])) if (c?.type === 'tool_use' && /(__reply|__send_to_agent)$/.test(c.name) && c.input?.text)
+      outputs.push({ to: String(c.input.to ?? (String(c.name).endsWith('__reply') ? 'Joey' : '')), reply_to: String(c.input.reply_to ?? ''), text: String(c.input.text) })
+  }
+  return { items, outputs }
+}
 
 async function run(transcript: string, env: Record<string, string> = {}, dir?: string) {
   const d = dir ?? mkdtempSync(join(tmpdir(), 'gate-'))
@@ -40,7 +58,7 @@ async function run(transcript: string, env: Record<string, string> = {}, dir?: s
   const tp = join(d, 't.jsonl'); writeFileSync(tp, transcript)
   const p = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     env: { ...process.env, LANES_DIR: join(d, '.lanes'), TYPESAFE_BASE_URL: `http://127.0.0.1:${server.port}`, TYPESAFE_API_KEY: 'test-key', ...env } })
-  p.stdin.write(JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', transcript_path: tp, cwd: d })); p.stdin.end()
+  p.stdin.write(JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', transcript_path: tp, cwd: d, lanes_turn: asTurn(transcript) })); p.stdin.end()
   const out = (await new Response(p.stdout).text()).trim(); await p.exited
   const logp = join(d, '.lanes', 'run', 'answered-gate.jsonl')
   return { out: out ? JSON.parse(out) : null, dir: d, log: existsSync(logp) ? readFileSync(logp, 'utf8').trim().split('\n').map(l => JSON.parse(l)) : [] }
@@ -88,12 +106,6 @@ test('shadow mode records what it would have done and never blocks', async () =>
   calls = []; mode = 'missed'
   const r = await run(prompt('100', '開始做報告') + absorbed('101', '發票 4471 付了嗎？') + reply('報告做完了', '100'), { ANSWERED_GATE_MODE: 'shadow' })
   expect(r.out).toBeNull(); expect(r.log[0].mode).toBe('shadow'); expect(r.log[0].messages[1].verdict).toBe('not_addressed'); expect(r.log[0].blocked).toEqual([])
-})
-
-test('only the current turn counts: messages before the last end-of-turn record are not checked again', async () => {
-  calls = []; mode = 'missed'
-  const r = await run(prompt('90', '舊的問題') + absorbed('91', '舊的第二則') + reply('答了', '90') + turnEnd + prompt('100', '開始做報告') + reply('報告做完了'))
-  expect(r.out).toBeNull(); expect(calls.length).toBe(0)
 })
 
 test('a message marked no_reply, and a system notice, never need a reply', async () => {

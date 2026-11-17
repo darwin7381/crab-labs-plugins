@@ -5,7 +5,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } fr
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
-import { openJoeyProposals, renderDigest, planDigest, LEDGER_KINDS, type LedgerRec } from './lanes-digest.ts'
+import { openJoeyProposals, renderDigest, LEDGER_KINDS, type LedgerRec } from './lanes-digest.ts'
 const L = await import('./lanes.ts?d1-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-d1-'))
@@ -98,34 +98,30 @@ test('D1: the digest lists every open Joey-sourced proposal again (no new activi
   const pid = idOf(await L.callLaneTool(j, 'ledger_write', { kind: 'memory_proposal', text: RULE }))
   const e = run('mesh', 'eve', 'peer', 'reflex')
   const eid = idOf(await L.callLaneTool(e, 'ledger_write', { kind: 'memory_proposal', text: 'Eve 的稿件排程一律 10:00' }))
-  const t1 = L.takePendingDigest(false, 'piggyback')!
+  // the digest is M1 information: what rides the next delivery (L.__digest); its item done moves the cursor to what it covered (ack below)
+  const ack = (t: any) => { if (t) writeFileSync(join(dir, 'digest.json'), JSON.stringify({ line: t.fields.upto })) }
+  const t1 = L.__digest()!
   expect(t1.text).toContain(`記憶提案 ${pid}（Joey 說的）`); expect(t1.text).toContain(`記憶提案 ${eid}：`); expect(t1.text).not.toContain('（Joey 說的）：Eve')   // the id is in the block, the Joey mark only on Joey's
   expect(t1.text).not.toContain('還沒決定的記憶提案')                                                       // the proposal is new in this range: listed once, not twice
-  await L.ackDigest({ digest: t1 })
-  expect(L.takePendingDigest(true, 'wake')).toBeNull()                                                     // a wake tick: nothing (a proposal never wakes the main)
-  const t2 = L.takePendingDigest(false, 'piggyback')!                                                      // nothing new, but the next turn gets it again
-  expect(t2).not.toBeNull(); expect(t2.wake).toBe(false)
+  ack(t1)
+  expect(L.__main().items(r => r.kind !== 'digest').length).toBe(0)                                        // nothing is owed to the main: a proposal never wakes it
+  const t2 = L.__digest()!                                                                                 // nothing new, but the next delivery carries it again
+  expect(t2).not.toBeNull()
   expect(t2.text).toContain('沒有新的動靜'); expect(t2.text).toContain('還沒決定的記憶提案（Joey 說的話'); expect(t2.text).toContain(`• ${pid}｜adam.worker.`); expect(t2.text).toContain('一律 09:00')
   expect(t2.text).not.toContain(eid)                                                                       // Eve's was not said by Joey
-  await L.ackDigest({ digest: t2 })
-  expect(L.takePendingDigest(false, 'piggyback')!.text).toContain(pid)                                     // and again
+  ack(t2)
+  expect(L.__digest()!.text).toContain(pid)                                                                // and again
   await decide({ proposal_id: pid, decision: 'veto', reason: '先不記' })
-  await L.ackDigest({ digest: L.takePendingDigest(false, 'piggyback') ?? undefined })
-  expect(L.takePendingDigest(false, 'piggyback')).toBeNull()                                               // decided: gone, and a quiet ledger gives no digest
+  ack(L.__digest())
+  expect(L.__digest()).toBeNull()                                                                          // decided: gone, and a quiet ledger gives no digest
 })
 
-test('D1: planDigest / renderDigest in isolation: the reopen list alone makes a digest; the wake tick makes none; one in the range is not listed twice', () => {
+test('D1: renderDigest in isolation: the reopen list alone makes a digest', () => {
   const prop = (id: string, ts: string): LedgerRec => ({ ts, lane: 'adam.worker.1', thread: 'adam#t-x', kind: 'memory_proposal', text: '記住 09:00\n〔Jev 檢查：有依據〕', notify_main: true, refs: { proposal_id: id, joey: true } })
   const old = prop('mp-old', '2026-11-13T02:00:00.000Z')
   expect(renderDigest([], [])).toBeNull()
   const d = renderDigest([], [old])!
   expect(d.text).toContain('• mp-old｜adam.worker.1'); expect(d.text).not.toContain('Jev 檢查'); expect(d.wake).toBe(false); expect(d.items).toBe(1)
-  expect(planDigest({ line: 0 }, [], 1, { id: 'a', reopen: [old] }).take!.text).toContain('mp-old')
-  expect(planDigest({ line: 0 }, [], 1, { id: 'a', reopen: [old], onlyIfWake: true }).take).toBeNull()
-  const line = JSON.stringify(old)
-  const inRange = planDigest({ line: 0 }, [line], 1, { id: 'a', reopen: [old] }).take!
-  expect(inRange.text.split('mp-old').length - 1).toBe(1)                                                  // listed in its block only
-  expect(inRange.text).not.toContain('還沒決定的記憶提案')
 })
 
 test('D1: while the curator holds the write right accept is refused and veto is not; when it hands the right back, the Joey-sourced proposals it was given are closed as curated', async () => {

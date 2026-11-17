@@ -89,10 +89,28 @@ const prompt = (id: string, text: string) => rec({ type: 'user', isMeta: true, t
 const absorbed = (id: string, text: string) => rec({ type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', timestamp: 't', content: tg(id, text) })
 const reply = (text: string, reply_to?: string) => rec({ type: 'assistant', timestamp: 't', message: { model: 'claude-haiku-5-5', content: [
   { type: 'tool_use', name: 'mcp__plugin_telegram-http_telegram-http__reply', input: { chat_id: '990000001', text, ...(reply_to ? { reply_to } : {}) } }] } })
+/** the turn as main-hook.py hands it to the aid: the items M1 bound to the prompt and the reply / send_to_agent calls of the turn. The fixtures
+ *  are written in the record shapes of a transcript (prompt, a message pulled into the turn, a reply); this turns them into those two lists. */
+function asTurn(t: string): { items: any[]; outputs: any[] } {
+  let items: any[] = [], outputs: any[] = []
+  for (const l of t.split('\n').filter(Boolean)) {
+    const j = JSON.parse(l)
+    if (j.type === 'system' && j.subtype === 'turn_duration') { items = []; outputs = []; continue }
+    const content = j.type === 'user' ? String(j.message?.content ?? '') : j.type === 'queue-operation' ? String(j.content ?? '') : ''
+    for (const m of content.matchAll(/<channel ([^>]*)>\n?([\s\S]*?)\n?<\/channel>/g)) {
+      const a = Object.fromEntries([...m[1].matchAll(/(\w+)="([^"]*)"/g)].map(x => [x[1], x[2]]))
+      items.push({ mid: a.message_id || a.btcc_msg_id || a.did, kind: a.message_id ? 'tg' : a.btcc_msg_id ? 'mesh' : 'sys', user: a.user ?? '', no_reply: a.no_reply === 'true',
+        system: a.user === 'lanes' || !!a.kind, body: m[2].trim() })
+    }
+    for (const c of (j.type === 'assistant' ? j.message?.content ?? [] : [])) if (c?.type === 'tool_use' && /(__reply|__send_to_agent)$/.test(c.name) && c.input?.text)
+      outputs.push({ to: String(c.input.to ?? (String(c.name).endsWith('__reply') ? 'Joey' : '')), reply_to: String(c.input.reply_to ?? ''), text: String(c.input.text) })
+  }
+  return { items, outputs }
+}
 async function answered(t: string, e: Record<string, string> = {}, shim?: Record<string, string>) {
   const d = mkdtempSync(join(tmpdir(), 'agate-jl-')); const run = join(d, '.lanes', 'run'); mkdirSync(run, { recursive: true })
   const tp = join(d, 't.jsonl'); writeFileSync(tp, t)
-  await spawnHook(ANSWERED, { hook_event_name: 'Stop', session_id: 's1', transcript_path: tp, cwd: d }, env({ LANES_DIR: join(d, '.lanes'), ...e, ...shim }))
+  await spawnHook(ANSWERED, { hook_event_name: 'Stop', session_id: 's1', transcript_path: tp, cwd: d, lanes_turn: asTurn(t) }, env({ LANES_DIR: join(d, '.lanes'), ...e, ...shim }))
   return { gate: jsonl(join(run, 'answered-gate.jsonl')), calls: jsonl(join(run, 'jev-calls.jsonl')) }
 }
 const TWO_UNANSWERED = prompt('100', '開始做報告') + absorbed('101', '發票 4471 付了嗎？') + reply('報告做完了', '100')

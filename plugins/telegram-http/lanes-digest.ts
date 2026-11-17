@@ -3,9 +3,8 @@
  * rendering, and the ledger lookup the main uses. PURE: no module state, no fs, no network. lanes.ts does the
  * file IO and the delivery; this file decides what is pending, what it says, and what a ledger query returns.
  *
- * Why (Stage A of 002): every digest woke the idle main (650k context re-read per wake); 4 of 7 were silent FYIs.
- * Now a digest rides along with the main's next naturally triggered turn (piggybackContent), and only a wake entry
- * (isWakeEntry: escalation / stopped thread / push-tier notice) still wakes it, carrying everything pending.
+ * The digest is information: lanes-main.ts (M1) attaches it to whatever it offers the main or the main's hook pulls; it never
+ * wakes the main by itself.
  */
 
 // ------------------------------------------------------------------ ledger records
@@ -295,63 +294,6 @@ export function renderDigest(recs: LedgerRec[], reopen: LedgerRec[] = [], holds:
   }
   lines.push('（只列這次新增的。整天每件事一行的完整清單：ledger_query() 不帶參數；某一件的原文：ledger_query(text=關鍵字)。）')
   return { text: lines.join('\n'), items, threads: blocks.length, wake: recs.some(isWakeEntry) }
-}
-
-/** Main-side delivery format when the digest rides along: prepended inside the SAME channel message,
- *  so no extra turn / wake exists. */
-export function piggybackContent(digestText: string, original: string): string {
-  return `${digestText}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${original}`
-}
-
-// ------------------------------------------------------------------ pending set: cursor, take, ack
-/** An un-acked take stays here: the taker (an inbox daemon asking over HTTP) confirms with ack after it handed the
- *  digest to the main's session. Un-acked after DIGEST_RETRY_MS → the range is taken again (never lost). */
-export type Inflight = { id: string; from: number; upto: number; taken: number }
-export type DigestCursor = { line: number; inflight?: Inflight }
-export type DigestTake = { id: string; text: string; items: number; threads: number; wake: boolean }
-export const DIGEST_RETRY_MS = 120_000
-
-/** Pure: given the cursor and the ledger's non-empty lines, what is pending and what is the cursor afterwards.
- *  The cursor in the result must be persisted when `take` is non-null (that is what makes a take exactly-once);
- *  `onlyIfWake` = the idle-wake tick: take only when something pending is a wake entry, else leave everything.
- *  `hold(rec)` (wake tick only) = a wake entry whose lane run is still going does not wake yet: the run is about to
- *  hand in its closing report, and the wake should carry it. */
-export function planDigest(cur: DigestCursor, lines: string[], now: number,
-  o: { id: string; onlyIfWake?: boolean; retryMs?: number; hold?: (r: LedgerRec) => boolean; reopen?: LedgerRec[]; holds?: string[] }): { cursor: DigestCursor; take: DigestTake | null } {
-  const retry = o.retryMs ?? DIGEST_RETRY_MS
-  const inf = cur.inflight
-  const stale = !!inf && now - inf.taken >= retry
-  const start = stale ? Math.min(cur.line, inf!.from) : cur.line
-  // 002k (D1): the open Joey-sourced memory proposals ride in every digest that is taken for the main (a piggyback), whether or not anything
-  // else is new; they never make a wake (the wake tick passes onlyIfWake, and only `recs` can wake)
-  const recs = lines.length > start ? lines.slice(start).map(parseLedgerLine).filter((r): r is LedgerRec => !!r) : []
-  const inRange = new Set(recs.filter(r => r.kind === 'memory_proposal').map(r => r.refs?.proposal_id))
-  const reopen = o.onlyIfWake ? [] : (o.reopen ?? []).filter(r => !inRange.has(r.refs?.proposal_id))
-  if (lines.length <= start && !reopen.length) return { cursor: stale ? { line: cur.line } : cur, take: null }
-  if (!recs.some(r => r.notify_main) && !reopen.length) {
-    // nothing here is for the main: move past it (an in-transit take keeps its record)
-    return { cursor: { line: lines.length, ...(inf && !stale ? { inflight: inf } : {}) }, take: null }
-  }
-  const wake = recs.some(r => isWakeEntry(r) && !(o.hold && o.hold(r)))
-  if (o.onlyIfWake && !wake) return { cursor: cur, take: null }
-  const d = renderDigest(recs, reopen, o.onlyIfWake ? [] : (o.holds ?? []))
-  if (!d) return { cursor: cur, take: null }
-  // `from` keeps the oldest range not yet confirmed, so a failed hand-over re-takes everything from there
-  const from = inf ? Math.min(inf.from, start) : start
-  return {
-    cursor: { line: lines.length, inflight: { id: o.id, from, upto: lines.length, taken: now } },
-    take: { id: o.id, text: d.text, items: d.items, threads: d.threads, wake: d.wake },
-  }
-}
-/** The taker handed the digest to the main: the take is settled. An id that is not the current take is ignored. */
-export function ackState(cur: DigestCursor, id: string): DigestCursor {
-  if (!cur.inflight || cur.inflight.id !== id) return cur
-  return { line: cur.line }
-}
-/** The taker could not hand it over: put the range back so the next take has it. */
-export function releaseState(cur: DigestCursor, id: string): DigestCursor {
-  if (!cur.inflight || cur.inflight.id !== id) return cur
-  return { line: Math.min(cur.line, cur.inflight.from) }
 }
 
 // ------------------------------------------------------------------ activity list (002d)

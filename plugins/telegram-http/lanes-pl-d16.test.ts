@@ -20,6 +20,12 @@ const rows = (): any[] => { try { return readFileSync(join(dir, 'ledger.jsonl'),
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 4000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
 let hid = ''
+/** the main takes these M1 items into a turn and the turn ends with Stop (its hook events, as main-hook.py posts them) */
+async function mainTakes(ids: string[]): Promise<void> {
+  const pid = L.__main().mainPid()!, p = `p-${Math.random().toString(36).slice(2)}`
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p, dids: ids })
+  await L.__mainEvent({ event: 'Stop', pid, prompt_id: p, phase: 'final' })
+}
 
 test('D16: a lane hands a peer\'s request to the main; once the main got it, its report (no Joey message since, not quoting one) goes out silent', async () => {
   const d = await L.routeEvent({ id: 'mesh-e9', source: 'mesh', from: 'eve', verified: true, btcc_msg_id: '50008', text: '可以答應我週五前給 10 月可用率嗎？', meta: {}, notif: { method: '', params: {} } } as any)
@@ -31,9 +37,9 @@ test('D16: a lane hands a peer\'s request to the main; once the main got it, its
   hid = esc.refs.handoff
   expect(esc.text.startsWith(`〔${hid}〕`)).toBe(true); expect(esc.refs.class).toBe(tok.cls)
   expect(L.handoffReplyTier({})).toBeNull()                                               // not delivered yet: nothing to answer
-  const t = L.takePendingDigest(false, 'piggyback')!                                     // (the lane still runs: the wake tick would wait for its closing report)
-  expect(t.text).toContain(hid)                                                           // the main reads the id in its digest
-  await L.ackDigest({ digest: t })
+  const item = L.__main().items(r => r.kind === 'handoff' && (r.handoffs ?? []).includes(hid))[0]   // M1: the hand-over is an item for the main
+  expect(String(item.notif.params.content)).toContain(hid)                                // the main reads the id
+  await mainTakes([item.id])                                                              // its turn ends with Stop: done
   expect(L.handoffReplyTier({})).toMatchObject({ silent: true, handoff: hid })
   expect(L.handoffReplyTier({ reply_to: 1030 })).toBeNull()                               // quoting a message of Joey's: an ordinary answer
   expect(L.handoffReplyTier({ handoff_id: hid })).toMatchObject({ silent: true })

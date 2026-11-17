@@ -33,49 +33,6 @@ function reset(n: number[]): void {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const io = (got: unknown[], idle = true) => ({ mainConnected: async () => true, mainIdle: async () => idle, deliver: async (c: string, m: Record<string, string>) => { got.push({ c, m }); return true } })
 
-test('aid (c) 002n: Joey\'s message carries the pending digest (002b piggyback, his message last), and the switch of 002m is gone', async () => {
-  reset([1, 2])
-  process.env.LANES_JOEY_DIGEST_HOLD = '1'                                     // 002m's switch: no longer read
-  const ev = joey('副本現在幾個？')
-  const d = await L.routeEvent(ev)
-  delete process.env.LANES_JOEY_DIGEST_HOLD
-  expect(d.target).toBe('main')
-  expect(d.digest?.items).toBe(2)
-  const n = L.notifWithDigest(ev.notif, d) as any
-  expect(n.params.content).toContain('A-141'); expect(n.params.content).toContain('A-142')
-  expect(n.params.content.endsWith('副本現在幾個？')).toBe(true)
-  expect(n.params.meta).toMatchObject({ lane_digest: 'piggyback', lane_digest_items: '2' })
-  await L.ackDigest(d)
-  const routing = readFileSync(join(dir, 'routing.jsonl'), 'utf8')
-  expect(routing).toContain('"rule":"digest-piggyback"'); expect(routing).not.toContain('digest-held')
-  expect((L.__lanesState() as any).digest_held_at).toBeUndefined()
-})
-
-test('aid (c) 002n: an idle main is never woken for a digest: after Joey\'s turn ends, FYI items wait for the next natural turn (no boundary delivery)', async () => {
-  reset([])
-  await L.routeEvent(joey('在嗎？'))                                          // nothing pending yet
-  appendFileSync(join(dir, 'ledger.jsonl'), fyi(3) + fyi(4))                  // lanes report while Joey's turn runs
-  await sleep(10); appendFileSync(T, turnEnd())
-  const got: unknown[] = []
-  expect(await L.digestTickWith(io(got))).toBe('no-wake-entry')
-  expect(await L.digestTickWith(io(got))).toBe('no-wake-entry')
-  expect(got.length).toBe(0)
-  const d = await L.routeEvent(joey('有什麼新消息？'))                        // his next message is the next natural turn: it carries them
-  expect(d.digest?.items).toBe(2)
-  await L.ackDigest(d)
-  expect(await L.digestTickWith(io(got))).toBe('no-wake-entry'); expect(got.length).toBe(0)
-})
-
-test('aid (c) 002n: a state file written by 002m (digest_held_at set) wakes nobody', async () => {
-  reset([5])
-  ;(L.__lanesState() as any).digest_held_at = Date.now() - 60_000
-  await sleep(10); appendFileSync(T, turnEnd())
-  const got: unknown[] = []
-  expect(await L.digestTickWith(io(got))).toBe('no-wake-entry')
-  expect(got.length).toBe(0)
-  delete (L.__lanesState() as any).digest_held_at
-})
-
 // ------------------------------------------------------------------ (ii) the main's reply hook: digest items Joey did not ask about
 const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-summary-gate.py')
 const REPLY = 'mcp__plugin_telegram-http_telegram-http__reply'

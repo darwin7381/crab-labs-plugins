@@ -1,0 +1,288 @@
+// M2, the main record (lanes-main.ts): one gen per main process, starting | idle | in_turn | walled | gone(end_reason), moved only by the main's hook
+// events (/lanes/main-event) and one kill -0. The failures of class D (and the main half of L) of 002f–002n are played through those signals, with real
+// processes standing in for the main. The registration context (the main-only rules) is checked here too. No transcript, no model, no network.
+import { test, expect, afterAll } from 'bun:test'
+import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { randomUUID } from 'crypto'
+import { __setMainStuckMs, MAIN_STUCK_MS, __setOfferRetryMs, OFFER_RETRY_MS, mainContext, notMainContext } from './lanes-main.ts'
+const L = await import('./lanes.ts?m2-test') as typeof import('./lanes.ts')
+const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
+const dir = mkdtempSync(join(tmpdir(), 'lanes-m2-'))
+process.env.LANES_DIR = dir
+copyFileSync(ROUTER, join(dir, 'router.json'))
+const offers: Array<{ sid: string; notif: any }> = [], open = new Set<string>(), sent: string[] = [], toolsChanged: string[] = []
+const pane = { text: '', drives: 0 }
+L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve'],
+  notifySession: async (sid: string, notif: any) => { if (!open.has(sid)) return false; offers.push({ sid, notif }); return true },
+  streamOpen: (sid: string) => open.has(sid), toolsChanged: (sid: string) => { toolsChanged.push(sid) },
+  sendBot: async (_c: string, text: string) => { sent.push(text); return 300 + sent.length }, joeyChatId: () => '1',
+  mainPicker: { capture: async () => pane.text, detect: (p: string) => /limit/.test(p) ? { key: 'generic-1', title: 'limit', options: ['Wait here, then continue automatically', 'Upgrade your plan'] } : null,
+    drive: async () => { pane.drives++; return 'ok' as const }, rearm: () => {} } } as any)
+L.__setWallProbe(3_600_000)
+const procs: any[] = []
+const stuck0 = MAIN_STUCK_MS, retry0 = OFFER_RETRY_MS
+afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } __setMainStuckMs(stuck0); __setOfferRetryMs(retry0); L.__setWallProbe(300_000) })
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+const mainLines = (pid: number) => journal().filter(l => l.rec === 'main' && l.id === String(pid))
+const M = () => L.__main()
+type Gen = { pid: number; sid: string; proc: any; mcp: string }
+function proc(): { proc: any; pid: number } { const p = Bun.spawn(['sleep', '600']); procs.push(p); return { proc: p, pid: p.pid } }
+async function startMain(sid = randomUUID(), expected = true): Promise<Gen & { r: any }> {
+  const { proc: p, pid } = proc()
+  if (expected) writeFileSync(join(dir, 'main-expected'), sid)
+  const g = { pid, sid, proc: p, mcp: `mcp-${pid}` }
+  open.add(g.mcp); L.__noteMcpPid(g.mcp, pid)
+  const r = await L.__mainEvent({ event: 'SessionStart', pid, session_id: sid, source: 'startup' })
+  await M().pump()
+  return { ...g, r }
+}
+const hook = (g: Gen, event: string, o: object = {}) => L.__mainEvent({ event, pid: g.pid, session_id: g.sid, ...o })
+async function killed(g: Gen): Promise<void> { g.proc.kill('SIGKILL'); await g.proc.exited; open.delete(g.mcp); await M().tick() }
+let nj = 0
+async function joey(text: string): Promise<string> {
+  const id = ++nj + 500, meta = { chat_id: '1', message_id: String(id), user: 'joey_lab' }
+  await L.routeEvent({ id: `tg-1-${id}`, source: 'telegram', from: 'joey', text, meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: text, meta } } } as any)
+  await M().pump()
+  return M().items(r => r.event === `tg-1-${id}`)[0].id
+}
+const state = (id: string) => M().items(r => r.id === id)[0]?.state
+let np = 0
+const P = () => `p2-${++np}`
+/** what earlier tests left queued is taken by a gen of its own and finished, so that a test starts with an empty ledger (M1 is FIFO) */
+async function drained(): Promise<void> {
+  if (!M().items(r => r.state !== 'done' && r.kind !== 'digest').length) return
+  const g = await startMain()
+  for (let i = 0; i < 20; i++) {
+    const offered = M().items(r => r.state === 'offered' && r.gen === String(g.pid))
+    if (!offered.length) break
+    const p = P()
+    await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: offered.map(r => r.id) })
+    await hook(g, 'Stop', { prompt_id: p })                                                  // pulls the rest
+    await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+    await M().pump()
+  }
+  await killed(g)
+}
+
+test('registration: the keeper\'s session is the main (starting until its stream opens, then idle); the main-only rules come back as the SessionStart context', async () => {
+  const sid = randomUUID(), { proc: p, pid } = proc()
+  writeFileSync(join(dir, 'main-expected'), sid)
+  const r = await L.__mainEvent({ event: 'SessionStart', pid, session_id: sid, source: 'startup' })
+  expect(r.accepted).toBe(true); expect(r.additionalContext).toContain('你是 adam 的主線')
+  expect(M().mainPhase()).toBe('starting')                                                  // no MCP stream of it yet: nothing can be offered
+  open.add(`mcp-${pid}`); L.__noteMcpPid(`mcp-${pid}`, pid)
+  expect(M().mainPhase()).toBe('idle')
+  expect(mainLines(pid).map(l => l.state)).toEqual(['starting', 'idle'])
+  expect(L.isMainMcpSession(`mcp-${pid}`)).toBe(true)
+  await killed({ pid, sid, proc: p, mcp: `mcp-${pid}` })
+})
+
+test('002m LG1 / LG2: a second claude in the folder is refused: told it is not the main, its sessions get no Telegram tools, Joey is told once', async () => {
+  const g = await startMain()
+  const k = sent.length
+  const { proc: p2, pid: pid2 } = proc()
+  L.__noteMcpPid('mcp-second', pid2)
+  const r = await L.__mainEvent({ event: 'SessionStart', pid: pid2, session_id: randomUUID(), source: 'startup' })
+  expect(r.accepted).toBe(false); expect(r.additionalContext).toContain('你不是 adam 的主線')
+  expect(L.sessionNotMain('mcp-second')).toBe(true); expect(L.sessionNotMain(g.mcp)).toBe(false)
+  expect(toolsChanged).toContain('mcp-second')
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('想登記成 adam 的主線')).length).toBe(1)
+  await L.__mainEvent({ event: 'SessionStart', pid: pid2, session_id: (r as any).sid ?? randomUUID(), source: 'resume' })
+  expect(M().mainPid()).toBe(g.pid)                                                          // the main is unchanged
+  expect(L.notMainRefusal('reply')).toContain('not the main')
+  p2.kill('SIGKILL'); await killed(g)
+})
+
+test('002f: a SIGKILLed main (no SessionEnd) is gone within one tick of kill -0; its MCP session says nothing about it', async () => {
+  const g = await startMain()
+  g.proc.kill('SIGKILL'); await g.proc.exited                                                // the stream stays "open" in the daemon's view
+  expect(M().mainPhase()).toBe('idle')
+  await M().tick()
+  expect(M().mainPhase()).toBe('gone'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'gone', end_reason: 'killed' })
+  expect(M().awaySince()).toBeGreaterThan(0)                                                 // a hand-over's grace counts from here
+  open.delete(g.mcp)
+})
+
+test('SessionEnd: gone, exited; the items of its open turn are queued again at once (no grace)', async () => {
+  const g = await startMain()
+  const id = await joey('第一個問題')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'SessionEnd', { reason: 'other' })
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'gone', end_reason: 'exited' })
+  expect(state(id)).toBe('queued')
+  await killed(g)
+})
+
+test('002g/002h: back in 3.5 s on the same session: the new process is a new gen; what the old one had is offered to it at once, with no carry-on notice', async () => {
+  await drained()
+  const sid = randomUUID()
+  const g = await startMain(sid)
+  const id = await joey('那份報告呢？')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  const g2 = await startMain(sid)                                                            // the keeper brought it back on the same session id
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'gone', end_reason: 'replaced' })
+  expect(M().mainPid()).toBe(g2.pid)
+  expect(state(id)).toBe('offered'); expect(M().items(r => r.id === id)[0].gen).toBe(String(g2.pid))
+  expect(offers.at(-1)!.notif.params.content).toBe('那份報告呢？')                              // the message itself: no 〔系統通知｜主線重新啟動〕
+  expect(M().items(r => r.kind === 'carry').length).toBe(0)
+  await killed(g); await killed(g2)
+})
+
+test('002j 5018d39 (kept as data): /restart mid-turn ends the gen `asked`; the cut turn\'s items are not given again, Joey gets one line', async () => {
+  const g = await startMain()
+  const id = await joey('重跑一次部署')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  const k = sent.length
+  L.markDeliberateRestart()
+  await hook(g, 'SessionEnd', { reason: 'other' })
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'gone', end_reason: 'asked' })
+  expect(M().items(r => r.id === id)[0]).toMatchObject({ state: 'done', reason: 'asked_restart' })
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('主線被指令重啟')).length).toBe(1)
+  await killed(g)
+})
+
+test('002l N7: a turn cut right after it took a channel message in (before any tool): bound with no Stop → queued; no regex decides it', async () => {
+  const g = await startMain()
+  const id = await joey('剛收到就被砍')
+  await hook(g, 'UserPromptSubmit', { prompt_id: P(), dids: [id] })
+  await killed(g)
+  expect(state(id)).toBe('queued')
+})
+
+test('002l N6 / D12: the main\'s StopFailure and a lane run behind the same limit are ONE wall and ONE notice; one notice when it comes down', async () => {
+  const g = await startMain()
+  const k = sent.length
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p })
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: 'API Error: Request rejected (429)' })
+  expect(M().mainPhase()).toBe('walled'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', kind: 'rate_limit', error: 'rate_limit' })
+  L.__wallUp('usage', 'lane result 429', 'adam.reflex.3.r1')                                   // a lane run hits the same wall: a probe, not a second notice
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('額度')).length).toBe(1)
+  await L.__wallDown(); await sleep(10)
+  expect(M().mainPhase()).toBe('idle')
+  expect(sent.slice(k).filter(s => s.includes('模型恢復了')).length).toBe(1)
+  await killed(g)
+})
+
+test('a lane run that hits the wall walls an idle main as well (one account): nothing is offered to it until the wall comes down', async () => {
+  await drained()
+  const g = await startMain()
+  L.__wallUp('rate_limit', 'lane 429', 'adam.reflex.4.r1')
+  expect(M().mainPhase()).toBe('walled')
+  const id = await joey('有空嗎')
+  expect(state(id)).toBe('queued')
+  await L.__wallDown(); await sleep(10)
+  expect(state(id)).toBe('offered')
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  await killed(g)
+})
+
+test('002k G03 / SR3: a turn with no hook event for MAIN_STUCK_MS is 疑似卡死: one alarm (it names the open tool), cleared by the next event', async () => {
+  __setMainStuckMs(40)
+  const g = await startMain()
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'in_turn', tool_open: 'Bash' })
+  const k = sent.length
+  await sleep(60); await M().tick(); await M().tick()
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1); expect(sent.slice(k).find(s => s.includes('疑似卡死'))).toContain('Bash')
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
+  __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('fleet #13 / SIGSTOP wedge: a stopped main sends no hook event; the stuck rule fires from that silence; the item stays with it, SIGCONT clears the alarm', async () => {
+  __setMainStuckMs(40)
+  const g = await startMain()
+  const id = await joey('在嗎')
+  await hook(g, 'UserPromptSubmit', { prompt_id: P(), dids: [id] })
+  g.proc.kill('SIGSTOP')
+  const k = sent.length
+  await sleep(60); await M().tick(); await sleep(10)
+  expect(M().mainPhase()).toBe('in_turn')                                                   // kill -0 still answers: not gone
+  expect(state(id)).toBe('bound')
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1)
+  g.proc.kill('SIGCONT')
+  await hook(g, 'PostToolUse', { prompt_id: M().currentGen()!.prompt_id, tool_name: 'Read' })
+  await sleep(10)
+  expect(sent.slice(k).some(s => s.includes('疑似卡死解除'))).toBe(true)
+  __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('002k G16b: an idle main that never takes its offer (a menu on its pane) is the same rule: one alarm, with the pane read', async () => {
+  await drained()
+  __setMainStuckMs(40); __setOfferRetryMs(3_600_000)
+  const g = await startMain()
+  pane.text = "You've hit your weekly limit\n 1. Wait here, then continue automatically\n 2. Upgrade your plan"
+  const id = await joey('哈囉')
+  expect(state(id)).toBe('offered')
+  const k = sent.length
+  await sleep(60); await M().tick(); await sleep(10)
+  const alarm = sent.slice(k).find(s => s.includes('疑似卡死'))!
+  expect(alarm).toContain('沒有被接手'); expect(alarm).toContain('Upgrade your plan')
+  expect(pane.drives).toBe(0)                                                               // read, never pressed here
+  pane.text = ''
+  __setMainStuckMs(stuck0); __setOfferRetryMs(retry0)
+  await hook(g, 'UserPromptSubmit', { prompt_id: P(), dids: [id] })
+  await killed(g)
+})
+
+test('/main renew: the brief is a carry item for the NEW session only; the old gen ends `replaced`; the new one is offered the brief first', async () => {
+  await drained()
+  const g = await startMain()
+  const out = await L.mainRenew('joey_lab')
+  expect(out).toContain('主線換新中')
+  const st = L.__lanesState()
+  const newSid = st.renew!.new_sid
+  const brief = M().items(r => r.kind === 'carry')[0]
+  expect(brief.target).toBe(newSid); expect(brief.state).toBe('queued')                    // the old main (idle) is not offered it
+  expect(String(brief.notif.params.content)).toContain('主線交接')
+  await sleep(700)                                                                           // the daemon stops the old process
+  const { proc: p2, pid: pid2 } = proc()
+  open.add(`mcp-${pid2}`); L.__noteMcpPid(`mcp-${pid2}`, pid2)
+  const r = await L.__mainEvent({ event: 'SessionStart', pid: pid2, session_id: newSid, source: 'startup' })
+  expect(r.accepted).toBe(true)
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'gone', end_reason: 'replaced' })
+  await M().pump()
+  expect(M().items(r => r.id === brief.id)[0]).toMatchObject({ state: 'offered', gen: String(pid2) })
+  expect(st.renew).toBeUndefined()
+  await killed({ pid: pid2, sid: newSid, proc: p2, mcp: `mcp-${pid2}` })
+  open.delete(g.mcp)
+})
+
+test('the main-only rules: ledger_query before answering what happened (one line), digest rides along and never wakes it, the lane tools by name; not in a lane card or the not-main context', () => {
+  const ctx = mainContext('adam', 'a20fb7c0-f35a-4365-9a21-9e16e9f78fed')
+  expect(ctx).toContain('先呼叫一次 ledger_query()（不帶任何參數）'); expect(ctx).toContain('清單裡每一件都要交代到')
+  expect(ctx.split('\n').filter(l => l.includes('ledger_query')).length).toBe(1)
+  expect(ctx).toContain('不要重複通知他'); expect(ctx).toContain('車道摘要'); expect(ctx).toContain('不會為了它單獨叫醒你')
+  expect(ctx).toContain('fan_out(tasks, conclusion)'); expect(ctx).toContain('commitment(who, what, by, due)'); expect(ctx).toContain('ToolSearch')
+  const names = L.mainToolDefs().map((t: any) => t.name)
+  for (const n of ['fan_out', 'commitment', 'commitment_done', 'curate_memory', 'curate_stop', 'memory_decide', 'open_worker', 'fork', 'peer_hold']) expect(names).toContain(n)
+  const card = L.identityCard({ kind: 'reflex' } as any)
+  expect(card).not.toContain('ledger_query'); expect(card).not.toContain('車道摘要')
+  expect(notMainContext('adam', 'x')).not.toContain('ledger_query')
+})
+
+test('main-hook.py: one script for every event; with no daemon it holds nothing and prints nothing (and never reads the transcript)', async () => {
+  const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-hook.py')
+  for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'StopFailure', 'SessionEnd']) {
+    const p = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { PATH: process.env.PATH ?? '', LANES_DIR: dir, TYPESAFE_KEY_FILE: '/nonexistent' } })
+    p.stdin.write(JSON.stringify({ hook_event_name: ev, session_id: 's', prompt_id: 'p', transcript_path: '/nonexistent/t.jsonl', cwd: dir })); p.stdin.end()
+    expect((await new Response(p.stdout).text()).trim()).toBe(''); expect(await p.exited).toBe(0)
+  }
+  expect(readFileSync(HOOK, 'utf8')).not.toContain("open(p.get('transcript_path')")
+})

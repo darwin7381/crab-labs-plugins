@@ -6,7 +6,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 const GATE = join(import.meta.dir, 'lanes-hooks', 'main-memory-gate.py')
-const ANSWERED = join(import.meta.dir, 'lanes-hooks', 'main-answered-gate.py')
+const ANSWERED = join(import.meta.dir, 'lanes-hooks', 'main-hook.py')        // the main's Stop hook: the memory gate, then the answered aid
 const rec = (o: object) => JSON.stringify(o) + '\n'
 const prompt = (ts: string, text = '<channel source="telegram" message_id="1">hi</channel>') => rec({ type: 'user', timestamp: ts, message: { role: 'user', content: text } })
 const toolResult = (ts: string) => rec({ type: 'user', timestamp: ts, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] } })
@@ -71,7 +71,7 @@ test('D1 hook: only the undecided ones are listed, oldest first; a decision for 
   expect(r.reason).toContain('mp-two'); expect(r.reason).not.toContain('mp-one')
 })
 
-test('D1 hook: main-answered-gate.py (the Stop hook the lab wires for the main) holds the turn the same way, ahead of its own check', async () => {
+test('D1 hook: main-hook.py (the main\'s one Stop hook) holds the turn the same way, ahead of the answered check (no daemon: nothing pulled)', async () => {
   const s = setup(OPEN, prompt(T(1)) + prompt(T(10)) + prompt(T(20)))
   const r = await hook(ANSWERED, s)
   expect(r.decision).toBe('block'); expect(r.reason).toContain('mp-aaa111')
