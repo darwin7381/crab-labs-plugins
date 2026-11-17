@@ -11,7 +11,7 @@ import {
   lanesInit, routeEvent, callLaneTool, callMainTool, ledgerQueryTool, identityCard, mainToolDefs, isMainTool, LANE_TOOLS, __lanesState, __digest,
 } from './lanes.ts'
 import {
-  cleanReport, DIGEST_MAX_ROUTINE, isWakeEntry, LEDGER_QUERY_MAX, LEDGER_QUERY_TEXT_MAX, parseSince, queryLedger, renderDigest, type LedgerRec,
+  cleanReport, DIGEST_MAX_ROUTINE, LEDGER_QUERY_MAX, LEDGER_QUERY_TEXT_MAX, parseSince, queryLedger, renderDigest, type LedgerRec,
 } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -42,17 +42,6 @@ function reset(lines: string[]): void {
 }
 
 // ------------------------------------------------------------------ 1. wake entries: the only things that wake an idle main
-test('wake entries (002d) = work handed to the main (escalation) and a stopped thread; a message a lane already sent to Joey never wakes it', () => {
-  expect(isWakeEntry(escalation())).toBe(true)
-  expect(isWakeEntry(L({ kind: 'stop', text: '停止投遞：hop 7 > limit 6' }))).toBe(true)
-  expect(isWakeEntry(L({ kind: 'notify', refs: { tier: 'push', escalated: false }, text: '[push] P1 備份失敗' }))).toBe(false)   // 002d: the lane told Joey; the main reads it in its digest
-  expect(isWakeEntry(L({ kind: 'notify', refs: { tier: 'push', escalated: true, ask: true }, text: '[push] 要你決定' }))).toBe(false)
-  expect(isWakeEntry(escalatedPush())).toBe(false)                                   // duplicate of the escalation (Stage A: D4 + D5)
-  for (const kind of ['fyi', 'receipt', 'action', 'commitment', 'memory_proposal']) expect(isWakeEntry(L({ kind, text: 'x' }))).toBe(false)
-  expect(isWakeEntry(silentFyi('3'))).toBe(false)
-  expect(isWakeEntry({ ...escalation(), notify_main: false })).toBe(false)
-})
-
 // ------------------------------------------------------------------ 2. digest NOT delivered to an idle main
 // ------------------------------------------------------------------ 3. piggyback: exactly once on the next inbound
 // ------------------------------------------------------------------ 4. an escalation still wakes the main and carries the pending digest
@@ -73,7 +62,6 @@ test('structured digest: a thread that promised something shows all four parts w
   expect(lines[i + 3]).toContain('（只列這次新增的')
   expect(d.text).toContain('mesh-50008')
   expect(d.text).toContain('不承諾明天 10 點前')                                      // the exact text sent to the peer survives
-  expect(d.wake).toBe(false)                                                         // a promise needs the main, but only escalate() wakes it
 })
 
 test('structured digest: routine / FYI threads are ONE line each, with their facts; the header counts threads and entries', () => {
@@ -106,7 +94,6 @@ test('structured digest: lane thread with an escalation is a block first (never 
   expect(lines[iEsc + 1]).not.toContain('承諾')                                         // 002k (B15): a "none" part is left out
   expect(lines[iEsc + 1]).toContain('已通知 Joey（已響鈴），不要重複通知他')              // what the lane did, from its push
   expect(lines[iEsc + 2]).toContain('這件事交給你了')                                  // 002d: the handoff names its owner (on the 需主線 line: three lines in all)
-  expect(d.wake).toBe(true)
 })
 
 test('structured digest: old-style lanes (no four fields) fall back — receipt summary / notify text / actions / commitments / memory proposals', () => {

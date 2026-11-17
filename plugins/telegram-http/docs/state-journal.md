@@ -77,15 +77,60 @@ Fields:
 
 Other fields: `pid`, `session_id`, `transcript_path` (recorded, never read for state), `source`, `error`.
 
-### `event` (M3), `run` (M5), `wake` (M4)
+### `event` (M3): one record per inbound event
+
+The router opens the record when it gives an event to a lane, or to the main.
+
+| state | meaning |
+|---|---|
+| `open` | something is still owed: an obligation is `open`, or a `main` obligation is not met |
+| `closed` | every obligation is `met` |
+
+Fields:
+- `class`: `scheduled`, `followup`, `peer`, `joey`, `alert` or `critical`. The router writes it from the routing rule's trigger, or the follow-up
+  scheduler does. No hook parses prompt text for it.
+- `owner`: the lane id, or `main`.
+- `outcome`: `normal`, `changed` or `failed`. It is the worst outcome any call reported (a structured field of `notify_joey`, `ask_joey` and `receipt`).
+- `tool`: the call that changed the record. `refused`: the reason, when that call was refused.
+- `thread`, `lane`, `from`, `text` (the first 300 characters).
+- `obligations`: `[{id, kind, level, state, by, owner, due_at, ...}]`, where `state` is `open`, `met` or `handed`.
+
+| kind | levels | met by |
+|---|---|---|
+| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted). A critical alert's line has `ring` and `due_at`: when the due sweep rings, it sets `rang`. |
+| `peer` | `answer`, `interim`, `commitment` | `reply_agent` to that peer. `interim` is met by the router when a lane hands the request to the main; a new `answer` then opens with `owner: main` and a `due_at`. `commitment` is the main's own commitment tool, met by `commitment_done`. |
+| `receipt` | `run` (`run_id`) | `receipt(run_id)`, once per scheduler run across every event |
+| `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
+
+The one rule: a lane's outbound call asks to meet an obligation of its event.
+- Meeting an open one is accepted. Raising one (line → decision) is accepted.
+- Repeating a met one is refused, and the refusal names what is still open.
+- Handing an event to the main moves its open `joey` and `peer` obligations to `handed`.
+
+**The lane stop.** The lane's Stop hook (lanes-hooks/lane-stop-hook.py) posts to `POST /lane-stop` with its run token (`LANE_RUN_TOKEN`; the port
+is `LANES_HTTP_PORT`, set by the daemon in the lane's environment). The daemon blocks once with the open obligations, or lets the run end.
+
+**The exit rule.** When a run ends, at whatever reason, its open obligations become one `main` obligation, plus one M1 item.
+
+**The due sweep** runs every second. It acts on open obligations past `due_at`:
+- a critical line: the router rings once (`rang`);
+- a hand-over, a promised answer, a commitment: Joey is told once (`told`).
+
+A `main` obligation is due 300 s after the hand-over (`LANES_HANDOFF_FALLBACK_MS`), or at once when the main has been away (gone or walled) for
+60 s (`LANES_HANDOFF_DOWN_GRACE_MS`).
+
+### `wake` (M4): a decision, logged
+
+`id` is an item id or an event id. `state` is `wake` (M1 offers the item: the main was idle and something is owed to it) or `no_wake`. `reason` says
+which: information, the main in a turn (the item is pulled at its next boundary), the main walled or gone, or the event owes nothing.
+
+### `run` (M5)
 
 | rec | id | states | fields |
 |---|---|---|---|
-| `event` | event id | `open`, `closed` | `class`, `owner`, `obligations`, `outcome`, `tool` (the call that changed it), `refused` (the reason, on a refused call) |
 | `run` | run id | `queued`, `leased`, `running`, `exited` | `event`, `reason`, `exit_code` |
-| `wake` | item id or event id | `wake`, `no_wake` | `reason` |
 
-These are written from steps 2 and 3 of the rebuild on. Their fields are documented with those steps (below).
+Written from step 3 of the rebuild on.
 
 ## The main's hook
 
@@ -139,7 +184,7 @@ How the main is registered:
 
 ## Lanes
 
-The lane settings are written by the daemon into `.lanes/lane-settings.json`. A slot carries nothing for them.
+The daemon writes the lane settings into `.lanes/lane-settings.json`. The lane Stop hook is lane-stop-hook.py. A slot carries nothing for lanes.
 
 ## Special cases kept (marked `SPECIAL CASE` in the code)
 

@@ -205,7 +205,9 @@ test('K2: the program\'s own refusals (thread stopped, already answered by the r
   st.threads['adam#t-2'].stopped = 'test stop'
   expect(await reply(2, 'eve', KEY)).toContain('blocked: thread adam#t-2 was stopped')
   delete st.threads['adam#t-2'].stopped
-  expect(await L.callLaneTool({ ...tok(2), interim: 'eve' }, 'reply_agent', { to: 'eve', text: KEY })).toContain('the router already told eve')
+  const t2 = { ...tok(2), evId: 'ev-k2-interim' }                                          // M3: the router already answered eve (interim) for this event
+  L.__events().open(t2.evId, { class: 'peer', owner: t2.lane, obligations: [{ kind: 'peer', level: 'interim', to: 'eve', state: 'met', by: 'router' }] })
+  expect(await L.callLaneTool(t2, 'reply_agent', { to: 'eve', text: KEY })).toContain('the router already told eve')
   expect(calls.length).toBe(0)
   reset(); failMode = true; answerFor = () => ({ gives_credential: 0.95 })                     // a failed call does not mark a once either
   expect(await reply(2, 'eve', KEY)).toContain('sent to eve')

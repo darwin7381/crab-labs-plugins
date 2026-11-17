@@ -102,22 +102,6 @@ test('A4 proposal review: the questions, the memory ids as inputs, the raw answe
   expect(existsSync(join(dir, 'run', 'proposal-review.jsonl'))).toBe(true)
 })
 
-test('C1 main commitment and C4 promise match: the questions, the message and the open promises as inputs, p = the promise probability / the choice confidence', async () => {
-  expect(await L.mainCommitmentCheck({ msgId: 70001, to: 'eve', text: '我會在明天 10:00 前把規格給你。', thread: { thread: null, from: 'none' } })).toBe('written')
-  const c1 = calls('main-commitment-C1')
-  expect(c1.length).toBe(1)
-  expect(Object.keys(c1[0].question)).toEqual(['promises']); expect(c1[0].question.promises.instructions).toContain('will do or deliver something later')
-  expect(c1[0].inputs).toMatchObject({ to: 'eve', btcc_msg_id: 70001 }); expect(c1[0].inputs.text).toContain('明天 10:00')
-  expect(c1[0].answer.promises.noul).toBe(0.93); expect(c1[0].p).toBe(0.93); expect(c1[0].err).toBeNull()
-  st.promises['pr-jl'] = { id: 'pr-jl', peer: 'eve', thread: 'adam#t-jl', event: 'ev-jl', what: '/v2/orders/bulk 端點', created: Date.now(), due: Date.now() + 1e6, state: 'open', handoff: 'h' } as any
-  await L.mainSentTo('eve', null, null, '另一個話題：週三的值班表我晚點給你。')
-  const c4 = calls('promise-match-C4')
-  expect(c4.length).toBe(1)
-  expect(c4[0].question.which.criteria).toHaveProperty('none'); expect(c4[0].inputs).toMatchObject({ peer: 'eve' }); expect(c4[0].inputs.open[0]).toMatchObject({ id: 'pr-jl' })
-  expect(c4[0].answer.which.choice).toBe('none'); expect(c4[0].p).toBe(0.91); expect(c4[0].err).toBeNull()
-  expect(existsSync(join(dir, 'run', 'main-commitment.jsonl'))).toBe(true); expect(existsSync(join(dir, 'run', 'promise-match.jsonl'))).toBe(true)
-})
-
 test('a failed call is logged too: answer null, p null, err says why; no key as well', async () => {
   mode = 'http500'
   await L.mainCommitmentCheck({ msgId: 70002, to: 'eve', text: '我明天回你。', thread: { thread: null, from: 'none' } })

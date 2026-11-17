@@ -3,7 +3,6 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { isWakeEntry } from './lanes-digest.ts'
 const L = await import('./lanes.ts?c7-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-c7-'))
@@ -29,7 +28,7 @@ test('C7: cain writes into eve\'s thread: one ledger line with refs.flag thread-
   expect(f[0]).toMatchObject({ kind: 'action', lane: 'router', thread: 'adam#t-eve1', event: 'mesh-n1', notify_main: false,
     refs: { flag: 'thread-not-yours', from: 'cain', owner_peer: 'eve', thread: 'adam#t-eve1', btcc_msg_id: '50040' } })
   expect(f[0].text).toContain('cain'); expect(f[0].text).toContain('eve')
-  expect(isWakeEntry(f[0])).toBe(false)
+  expect(L.__main().items(r => r.event === 'mesh-n1' && r.kind === 'handoff').length).toBe(0)   // nothing is owed to the main: no wake
 })
 
 test('C7: nothing is flagged for the thread\'s own peer, an unknown thread, a thread with no peer, or an event with no thread', async () => {

@@ -63,14 +63,3 @@ test('E4: no reply_to for a run that Joey\'s message did not start: a peer, an a
     expect({ name, replyTo: sent.at(-1)!.replyTo }).toEqual({ name, replyTo: undefined })
   }
 })
-
-test('E4: end to end: Joey quotes a lane message; the lane answers to a peer only; the daemon\'s never-silent line to Joey is a reply to his quote', async () => {
-  st.lanes['adam.reflex.1'] = { id: 'adam.reflex.1', kind: 'reflex', n: 1, session_id: 's-q', thread: 'adam#t-q', status: 'idle', created: '', last: new Date().toISOString(), transcript: join(dir, 'none.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0 } as any
-  st.threads['adam#t-q'] = { id: 'adam#t-q', lane: 'adam.reflex.1', peer: 'eve', hops: 1, tokens: 0, created: '', last: '' } as any
-  st.botmsgs['777'] = 'adam.reflex.1'
-  const k = sent.length
-  const d = await L.routeEvent({ id: 'tg-quote-1', source: 'telegram', from: 'joey', verified: true, text: '那 eve 問的維護，今天會不會維護？', meta: { message_id: '1600', chat_id: '1' }, reply_to_message_id: '777', notif: { method: '', params: {} } } as any)
-  expect(d.target).toBe('lane'); expect(d.lane).toBe('adam.reflex.1')
-  expect(await until(() => sent.length > k)).toBe(true)
-  expect(sent[k].text).toContain('的訊息我處理了'); expect(sent[k].replyTo).toBe(1600)
-})

@@ -1,0 +1,349 @@
+// M3, the event record with obligations (lanes-events.ts + the lane tools in lanes.ts). Every lane outbound tool call is a request to meet an
+// obligation of its event: an open one is met, a raise (line → decision) is accepted, a repeat of a met one is refused with what is still open.
+// The router picks tier and format from class × obligation × outcome; the stop hook asks once; the exit rule hands what is still open to the main;
+// one due sweep acts on what nobody met in time. The failures of class B (and J's due timers) of 002j–002n are played here. The lane is a script that
+// waits for the test to say how its run ends (normal, cut at --max-turns, killed); its tool calls are made through the run's own token. No model.
+import { test, expect, afterAll } from 'bun:test'
+import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+process.env.LANES_FLOOD_CONTROL = '0'
+const L = await import('./lanes.ts?m3-test') as typeof import('./lanes.ts')
+const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
+const dir = mkdtempSync(join(tmpdir(), 'lanes-m3-'))
+process.env.LANES_DIR = dir
+copyFileSync(ROUTER, join(dir, 'router.json'))
+const GO = join(dir, 'go')
+const bin = join(dir, 'lane.py')
+writeFileSync(bin, `#!/usr/bin/env python3
+import json, os, sys, time
+t0 = time.time()
+mode = 'ok'
+while time.time() - t0 < 30:
+    if os.path.exists('${GO}'):
+        mode = open('${GO}').read().strip(); os.remove('${GO}'); break
+    time.sleep(0.02)
+if mode == 'turns':
+    print(json.dumps({'type': 'result', 'subtype': 'error_max_turns', 'is_error': True, 'terminal_reason': 'max_turns'}), flush=True); sys.exit(1)
+if mode == 'die':
+    sys.exit(3)
+print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'ok'}), flush=True)
+`)
+chmodSync(bin, 0o755)
+const restore = L.__setClaudeBin(bin)
+L.__setRetryBackoff(20)
+const sent: Array<{ text: string; silent: boolean; replyTo?: number }> = [], mesh: any[] = []
+L.__setMeshSend(async b => { mesh.push(b); return { text: `sent to ${b.to}`, msgId: 70000 + mesh.length, delivered: true } })
+L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
+  sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo }); return 9000 + sent.length }, joeyChatId: () => '1' } as any)
+afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
+const rows = (n = 'ledger.jsonl'): any[] => { try { return readFileSync(join(dir, n), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
+const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+const E = () => L.__events()
+const obs = (id: string): any[] => E().get(id)?.obligations ?? []
+const ob = (id: string, kind: string) => obs(id).find(o => o.kind === kind)
+let n = 0
+const mk = (from: string, text: string, extra: object = {}) => ({ id: `mesh-m3-${++n}`, source: 'mesh', from, verified: true, text, meta: {}, notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } }, ...extra } as any)
+const sched = (run: number, what = 'backup-check', tags = '') => mk('scheduler', `[scheduled][${what}]${tags}[run:${run}][P3][routine] ${what}：照例檢查`)
+/** route an event, wait until its lane run is in progress, return its run token */
+async function start(ev: any): Promise<{ id: string; lane: string; tok: any }> {
+  const d = await L.routeEvent(ev)
+  expect(d.target).toBe('lane')
+  expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
+  return { id: ev.id, lane: d.lane!, tok: L.__runTok(d.lane!)! }
+}
+async function end(lane: string, mode = 'ok'): Promise<void> {
+  writeFileSync(GO, mode)
+  expect(await until(() => !L.__runTok(lane))).toBe(true)
+  await sleep(40)
+}
+const call = (tok: any, name: string, a: object) => L.callLaneTool(tok, name, a)
+const handed = (id: string) => L.__main().items(r => r.kind === 'handoff' && r.event === id)
+
+test('the router opens the record with the obligations of the class: scheduled (line + receipt), peer (line + answer), critical (line that rings at its due time), high-frequency (receipt only)', async () => {
+  const s = await start(sched(41))
+  expect(E().get(s.id)).toMatchObject({ state: 'open', class: 'scheduled', owner: s.lane })
+  expect(obs(s.id).map(o => `${o.kind}:${o.level}`).sort()).toEqual(['joey:line', 'receipt:run'])
+  expect(ob(s.id, 'receipt').run_id).toBe('41')
+  await call(s.tok, 'notify_joey', { text: '備份正常' }); await call(s.tok, 'receipt', { outcome: 'done', run_id: '41' })
+  await end(s.lane)
+  expect(E().get(s.id)!.state).toBe('closed')
+  const p = await start(mk('eve', '下週維護幾點？'))
+  expect(obs(p.id).map(o => `${o.kind}:${o.level}:${o.to ?? ''}`).sort()).toEqual(['joey:line:', 'peer:answer:eve'])
+  await call(p.tok, 'reply_agent', { to: 'eve', text: '週三 02:00' }); await call(p.tok, 'notify_joey', { text: 'Eve 問維護時間，已回週三 02:00' })
+  await end(p.lane)
+  const h = await start(sched(42, 'heartbeat', '[high-frequency]'))
+  expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])                                  // the scheduler's tag is a router field: no prompt regex in any hook
+  await call(h.tok, 'receipt', { outcome: 'nothing-to-do', run_id: '42' })
+  await end(h.lane)
+  expect(E().get(h.id)!.state).toBe('closed')
+  const ev = journal().filter(l => l.rec === 'event' && l.id === s.id)
+  expect(ev[0]).toMatchObject({ state: 'open', class: 'scheduled' }); expect(ev.some(l => l.tool === 'notify_joey')).toBe(true)
+})
+
+test('002m L6B3 / B11: the one-message rule is ONE rule: a second notify_joey is refused, and the refusal names what is still open', async () => {
+  const s = await start(sched(43))
+  expect(await call(s.tok, 'notify_joey', { text: '備份完成' })).toContain('sent to Joey')
+  const again = await call(s.tok, 'notify_joey', { text: '補充一下細節' })
+  expect(again).toContain('refused: Joey already has his line'); expect(again).toContain('still open: the receipt of scheduler run 43')
+  expect(journal().filter(l => l.rec === 'event' && l.id === s.id && l.refused).length).toBe(1)
+  expect(sent.filter(x => x.text.includes('補充一下細節')).length).toBe(0)
+  await call(s.tok, 'receipt', { outcome: 'done', run_id: '43' })
+  await end(s.lane)
+})
+
+test('002n B06 (event 4), 002n B01: a scheduled run that told Joey its line and then needs his decision raises it with ask_joey: accepted, no hand-over, the main gets nothing', async () => {
+  const s = await start(sched(44, 'cert-check'))
+  const k = sent.length
+  await call(s.tok, 'notify_joey', { text: '憑證 3 天後到期' })
+  const ask = await call(s.tok, 'ask_joey', { text: '憑證 3 天後到期：要現在續約嗎？（要花錢）' })
+  expect(ask).toContain('sent to Joey')
+  expect(ob(s.id, 'joey')).toMatchObject({ level: 'decision', state: 'met', by: 'ask_joey' })
+  expect(rows().find(r => r.event === s.id && r.refs?.ask)!.refs.raised).toBe('line→decision')
+  expect(await call(s.tok, 'ask_joey', { text: '再問一次' })).toContain('already asked to decide')
+  expect(await call(s.tok, 'handoff_main', { text: '也交給主線' })).toContain('Joey was asked to decide this event')
+  await call(s.tok, 'receipt', { outcome: 'done', run_id: '44' })
+  await end(s.lane)
+  expect(handed(s.id).length).toBe(0)                                                      // nothing owed to the main: it is not woken, Joey hears two messages
+  expect(sent.length - k).toBe(2); expect(sent.at(-1)!.silent).toBe(false)                 // the decision rings (escalated column)
+})
+
+test('002m L6B2, 002n aid (a) / B01: the outcome is a field, never words: a routine event with outcome normal reaches Joey as its first line; failed reaches him whole', async () => {
+  const a = await start(mk('alert-dispatcher', '[P2][warning] mock-api p95 > 2s'))
+  const text = 'mock-api 恢復正常，error 1%（在門檻內）\nperformance/api-error 類的告警已清除\n細節：p95 1.8s'
+  expect(await call(a.tok, 'notify_joey', { text, outcome: 'normal' })).toContain('first line')
+  expect(sent.at(-1)!.text).toContain('mock-api 恢復正常，error 1%'); expect(sent.at(-1)!.text).not.toContain('細節')
+  expect(rows().find(r => r.event === a.id && r.kind === 'notify')!.text).toContain('細節')       // the whole text is in the ledger
+  await end(a.lane)
+  const b = await start(mk('alert-dispatcher', '[P2][warning] mock-backup upload 403'))
+  await call(b.tok, 'notify_joey', { text: 'mock-backup upload 失敗\nfailed_step=upload, errors=3\n已重試兩次', outcome: 'failed' })
+  expect(sent.at(-1)!.text).toContain('已重試兩次')
+  expect(E().get(b.id)!.outcome).toBe('failed')
+  await end(b.lane)
+})
+
+test('002m L6B4, 002l D14: one completion per scheduler run across every event and run: a follow-up run\'s receipt(run_id) is refused, the scheduler is not called again', async () => {
+  const s = await start(sched(45))
+  await call(s.tok, 'notify_joey', { text: '排了 5 分鐘後再查' })
+  expect(await call(s.tok, 'receipt', { outcome: 'done', run_id: '45' })).not.toContain('refused')
+  expect(await call(s.tok, 'receipt', { outcome: 'done', run_id: '45' })).toContain('scheduler run 45 was already completed (by this event)')
+  await end(s.lane)
+  const f = await start(mk('scheduler', '[scheduled][backup-check][run:45] 後續檢查', { klass: 'followup' }))
+  expect(E().get(f.id)!.class).toBe('followup')
+  expect(await call(f.tok, 'receipt', { outcome: 'done', run_id: '45' })).toContain(`already completed (by ${s.id})`)
+  await call(f.tok, 'notify_joey', { text: '後續檢查：一樣正常' })
+  expect(sent.at(-1)!.silent).toBe(true)                                                   // a follow-up line never rings again
+  await end(f.lane)
+})
+
+test('002n E02, 002m L6B6: a run cut at --max-turns after its event got everything (line + receipt, or a decision) is only recorded: the main is not woken', async () => {
+  const s = await start(sched(46))
+  await call(s.tok, 'notify_joey', { text: '完成' }); await call(s.tok, 'receipt', { outcome: 'done', run_id: '46' })
+  await end(s.lane, 'turns')
+  expect(rows().find(r => r.kind === 'stop' && r.event === s.id)!.refs.capped).toBe('turns')
+  expect(handed(s.id).length).toBe(0)
+  expect(journal().some(l => l.rec === 'wake' && l.id === s.id && l.state === 'no_wake' && /owes nothing/.test(l.reason))).toBe(true)
+  const a = await start(sched(47))
+  await call(a.tok, 'ask_joey', { text: '要不要停用舊備份？' }); await call(a.tok, 'receipt', { outcome: 'done', run_id: '47' })
+  await end(a.lane, 'turns')
+  expect(handed(a.id).length).toBe(0)                                                      // Joey owns the decision: no second report through the main
+})
+
+test('002l N4: a run cut at its cap with its line still owed: what is open goes to the main as ONE hand-over (no unlabelled router line to Joey)', async () => {
+  const p = await start(mk('eve', '幫我查上週 5xx 有幾次'))
+  await call(p.tok, 'reply_agent', { to: 'eve', text: '查到一半' })
+  const k = sent.length
+  await end(p.lane, 'turns')
+  const h = handed(p.id)
+  expect(h.length).toBe(1); expect(String(h[0].notif.params.content)).toContain('Joey 還沒收到這件事的回報')
+  expect(ob(p.id, 'main')).toMatchObject({ state: 'open', level: 'handed' })
+  expect(sent.length).toBe(k)
+})
+
+test('DC1 / 002k B9: the lane stop asks once: a reply to a peer alone is not a line for Joey (blocked once, naming it); a follow-up of a high-frequency routine owes its line', async () => {
+  const p = await start(mk('eve', '今天的工單數？'))
+  await call(p.tok, 'reply_agent', { to: 'eve', text: '12 張' })
+  const b = L.laneStop(p.tok)!
+  expect(b).toContain('still open: a line for Joey')
+  expect(L.laneStop(p.tok)).toBeNull()                                                       // once
+  await call(p.tok, 'notify_joey', { text: 'Eve 問工單數，回 12 張' })
+  await end(p.lane)
+  expect(handed(p.id).length).toBe(0); expect(E().get(p.id)!.state).toBe('closed')
+  const hf = await start(sched(48, 'heartbeat', '[high-frequency]'))
+  await call(hf.tok, 'receipt', { outcome: 'nothing-to-do', run_id: '48' })
+  expect(L.laneStop(hf.tok)).toBeNull()                                                     // receipt only is complete for a high-frequency routine
+  await end(hf.lane)
+  const fu = await start(mk('scheduler', '[scheduled][heartbeat][high-frequency][run:48] 後續檢查', { klass: 'followup' }))
+  expect(L.laneStop(fu.tok)).toContain('a line for Joey')
+  await end(fu.lane)
+  expect(handed(fu.id).length).toBe(1)                                                       // what is still open at the end goes to the main
+})
+
+test('the lane stop hook is a 40-line script that asks the daemon (no transcript, no prompt regex)', () => {
+  const src = readFileSync(join(import.meta.dir, 'lanes-hooks', 'lane-stop-hook.py'), 'utf8')
+  expect(src.split('\n').length).toBeLessThanOrEqual(55)
+  expect(src).toContain('/lane-stop'); expect(src).not.toContain('transcript_path'); expect(src).not.toContain('high-frequency'); expect(src).not.toContain('後續檢查')
+})
+
+test('002m aid (b), reduced: a message that claims the matter went to Joey or the main while the record says nobody has it is sent back once; after a hand-over the owner is stamped', async () => {
+  const p = await start(mk('eve', '可以幫我開 prod 的權限嗎？'))
+  const w = await call(p.tok, 'reply_agent', { to: 'eve', text: '這件事我轉給 Joey 決定。' })
+  expect(w).toContain('the event record says'); expect(mesh.filter(m => m.text === '這件事我轉給 Joey 決定。').length).toBe(0)
+  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '這件事我轉給 Joey 決定。' })).toContain('sent to eve')   // once
+  await call(p.tok, 'handoff_main', { text: 'Eve 要 prod 權限，要主線決定' })
+  await end(p.lane)
+  const q = await start(mk('cain', '幫我看 mock-api'))
+  await call(q.tok, 'ask_joey', { text: 'cain 要動 mock-api 設定，要你決定' })
+  expect(sent.at(-1)!.text).toContain('負責：Joey 決定')                                       // the true owner, stamped by the plugin
+  await call(q.tok, 'reply_agent', { to: 'cain', text: '已請 Joey 決定' })
+  expect(mesh.at(-1)!.owner).toBe('Joey 決定')
+  await end(q.lane)
+})
+
+test('002j P24 / 002k C4: a peer\'s request handed to the main: the router answers the peer (its obligation met by the router), the main owes the answer by a due time; a send on that thread meets it, another topic does not', async () => {
+  const p = await start(mk('eve', '可以答應我週五前給 10 月可用率嗎？', { btcc_msg_id: '50008' }))
+  const out = await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
+  expect(out).toContain('The router told eve')
+  expect(mesh.at(-1)).toMatchObject({ to: 'eve', reply_to: '50008' }); expect(mesh.at(-1).text).toContain('主線會在')
+  const peerObs = obs(p.id).filter(o => o.kind === 'peer')
+  expect(peerObs.find(o => o.owner !== 'main')).toMatchObject({ state: 'met', level: 'interim', by: 'router' })
+  const owed = peerObs.find(o => o.owner === 'main')!
+  expect(owed).toMatchObject({ state: 'open', level: 'answer', to: 'eve' }); expect(owed.due_at).toBeGreaterThan(Date.now())
+  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '我再補一句' })).toContain('the router already told eve')
+  await end(p.lane)
+  await L.mainSentTo('eve', 'adam#t-unrelated', null, '')                                    // another thread, no text: nothing closes
+  expect(obs(p.id).find(o => o.id === owed.id).state).toBe('open')
+  await L.mainSentTo('eve', E().get(p.id)!.thread, null, '可以，週五前給你')
+  expect(obs(p.id).find(o => o.id === owed.id)).toMatchObject({ state: 'met', by: 'main (thread)' })
+})
+
+test('the due sweep: a promised answer past its due time tells Joey once; a hand-over the main has not finished tells Joey once; a main away past the grace makes it due at once', async () => {
+  const p = await start(mk('eve', '能不能延後部署？', { btcc_msg_id: '50010' }))
+  await call(p.tok, 'handoff_main', { text: 'Eve 要延後部署，要主線決定' })
+  await end(p.lane)
+  const owed = obs(p.id).find(o => o.kind === 'peer' && o.owner === 'main')!
+  const k = sent.length
+  L.dueTick(owed.due_at + 1)
+  await sleep(20)
+  expect(sent.slice(k).filter(s => s.text.includes('eve 在等主線回覆')).length).toBe(1)
+  L.dueTick(owed.due_at + 2); await sleep(20)
+  expect(sent.slice(k).filter(s => s.text.includes('eve 在等主線回覆')).length).toBe(1)      // once
+  const main = ob(p.id, 'main')
+  L.dueTick(main.due_at + 1); await sleep(20)
+  expect(sent.slice(k).filter(s => s.text.includes('原本交給主線處理') && s.text.includes('延後部署')).length).toBe(1)
+  expect(ob(p.id, 'main')).toMatchObject({ state: 'open', told: true })                     // still the main's: told, not taken away
+  const q = await start(mk('cain', '幫我看一下 ticket 12'))
+  await call(q.tok, 'handoff_main', { text: 'cain 要看 ticket 12，要主線' })
+  await end(q.lane)
+  // no live main (gone since the start of this file): past the 60 s grace the hand-over is due now (002g, 002j)
+  const m = sent.length
+  L.dueTick(Date.now() + 61_000); await sleep(20)
+  expect(sent.slice(m).some(s => s.text.includes('cain 要看 ticket 12') && s.text.includes('不在線'))).toBe(true)
+})
+
+test('002k E1, 002i: a critical alert whose lane has not reported by its due time is rung by the router, once; the lane\'s later line goes out silent; a lane that reports in time rings itself', async () => {
+  const a = await start(mk('alert-dispatcher', '[P1][critical] mock-backup 全部失敗'))
+  expect(E().get(a.id)!.class).toBe('critical')
+  const j = ob(a.id, 'joey'); expect(j.ring).toBe(true); expect(j.due_at).toBeGreaterThan(Date.now())
+  expect(rows().filter(r => r.event === a.id && r.refs?.must_know).length).toBe(1)          // marked for the main once, at the event's open
+  const k = sent.length
+  L.dueTick(j.due_at + 1); L.dueTick(j.due_at + 2); await sleep(20)
+  expect(sent.slice(k).filter(s => s.text.includes('嚴重警報已收到')).length).toBe(1)
+  expect(sent.slice(k)[0].silent).toBe(false)
+  await call(a.tok, 'notify_joey', { text: '查到了：bucket policy 被改，已還原' })
+  expect(sent.at(-1)!.silent).toBe(true)                                                     // one ring in total
+  await end(a.lane)
+  const b = await start(mk('alert-dispatcher', '[P0] mock-api 全掛'))
+  await call(b.tok, 'notify_joey', { text: 'mock-api 已重啟恢復' })
+  expect(sent.at(-1)!.silent).toBe(false)
+  const m = sent.length
+  L.dueTick(ob(b.id, 'joey').due_at + 1); await sleep(20)
+  expect(sent.length).toBe(m)                                                                // met before its due time: the router adds nothing
+  await end(b.lane)
+})
+
+test('002k G10: the main\'s commitment with a due time is an obligation of the main: past due, Joey once; done before, nothing; done after, recorded late', async () => {
+  const mainSid = 'mcp-m3-main'
+  L.__setMainConnected(mainSid)
+  const out = await L.callMainTool('commitment', { who: 'Eve', what: '週報', due: new Date(Date.now() + 60_000).toISOString() }, mainSid)
+  const id = out.match(/id (cm-[0-9a-f]+)/)![1]
+  expect(ob(id, 'peer')).toMatchObject({ level: 'commitment', owner: 'main', state: 'open' })
+  const k = sent.length
+  L.dueTick(Date.now() + 61_000); L.dueTick(Date.now() + 62_000); await sleep(20)
+  expect(sent.slice(k).filter(s => s.text.includes('主線答應的事過了時限')).length).toBe(1)
+  expect(await L.callMainTool('commitment_done', { commitment_id: id }, mainSid)).toContain('it was past due')
+  expect(await L.callMainTool('commitment_done', { commitment_id: id }, mainSid)).toContain('already marked done')
+  const out2 = await L.callMainTool('commitment', { who: 'Joey', what: '下午給你清單', due: new Date(Date.now() + 60_000).toISOString() }, mainSid)
+  const id2 = out2.match(/id (cm-[0-9a-f]+)/)![1]
+  await L.callMainTool('commitment_done', { commitment_id: id2 }, mainSid)
+  const m = sent.length
+  L.dueTick(Date.now() + 61_000); await sleep(20)
+  expect(sent.length).toBe(m)
+  L.__setMainConnected(null)
+})
+
+test('002f / 002m G06: a lane that dies three times: its event goes to the main with where each run died (the exit rule)', async () => {
+  const p = await start(mk('eve', '幫我算月報'))
+  let tok = p.tok
+  for (let i = 0; i < 3; i++) {
+    writeFileSync(GO, 'die')
+    if (i < 2) { expect(await until(() => !!L.__runTok(p.lane) && L.__runTok(p.lane) !== tok)).toBe(true); tok = L.__runTok(p.lane) }   // run again after its death
+  }
+  expect(await until(() => handed(p.id).length === 1)).toBe(true)
+  expect(String(handed(p.id)[0].notif.params.content)).toContain('每一次死在哪裡')
+}, 20_000)
+
+test('002k E3 / H4 (model aid kept): a Joey or peer run that declines without looking at the service catalog is held once, with what ./bin/svc prints', async () => {
+  mkdirSync(join(dir, 'bin'), { recursive: true })
+  writeFileSync(join(dir, 'bin', 'svc'), '#!/bin/sh\nif [ -z "$1" ]; then echo "mock-api  GET /health  GET /config"; else echo "$1 $2 → ok"; fi\n'); chmodSync(join(dir, 'bin', 'svc'), 0o755)
+  const p = await start(mk('eve', '你能看 mock-api 的設定嗎？'))
+  await call(p.tok, 'reply_agent', { to: 'eve', text: '我無法查看設定。' })
+  await call(p.tok, 'notify_joey', { text: 'Eve 問設定，我無法查' })
+  const held = L.laneStop(p.tok)!
+  expect(held).toContain('never looked at the service catalog'); expect(held).toContain('GET mock-api/config → ok')
+  expect(L.laneStop(p.tok)).toBeNull()                                                       // once; nothing else is open
+  await end(p.lane)
+  const q = await start(mk('eve', '你能看 mock-api 的設定嗎？'))
+  q.tok.calls = [{ name: 'Bash', input: { command: './bin/svc GET mock-api/config' } }]
+  await call(q.tok, 'reply_agent', { to: 'eve', text: '我無法改設定，但看過了：正常' }); await call(q.tok, 'notify_joey', { text: '回了 Eve' })
+  expect(L.laneStop(q.tok)).toBeNull()                                                       // it looked: no hold
+  await end(q.lane)
+})
+
+test('002l D16: the main\'s report on a hand-over takes the tier of the event\'s class: by handoff_id, or unnamed when every item of its current turn is such a hand-over; a Joey message in the turn makes it ordinary', async () => {
+  const proc = Bun.spawn(['sleep', '600'])
+  const sid = '00000000-0000-4000-8000-00000000d016'
+  writeFileSync(join(dir, 'main-expected'), sid)
+  await L.__mainEvent({ event: 'SessionStart', pid: proc.pid, session_id: sid })
+  const p = await start(mk('eve', '可以答應我週五前給 10 月可用率嗎？'))
+  expect(L.tierFor(p.tok.cls, false).tier).toBe('silent')                                     // a peer's matter
+  await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
+  await end(p.lane)
+  const hid = ob(p.id, 'main').handoff
+  expect(L.handoffReplyTier({ handoff_id: hid })).toMatchObject({ silent: true, handoff: hid })
+  expect(L.handoffReplyTier({ handoff_id: `〔${hid}〕` })).toMatchObject({ silent: true })
+  expect(L.handoffReplyTier({ handoff_id: 'ho-nope' })).toBeNull()
+  expect(L.handoffReplyTier({})).toBeNull()                                                  // no turn of the main carries it yet
+  const items = L.__main().items(r => r.state !== 'done' && r.kind !== 'digest')
+  const turn = `p-d16-${Math.random()}`
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, prompt_id: turn, dids: items.filter(r => r.kind === 'handoff' && r.handoff === hid).map(r => r.id) })
+  const bound = L.__main().items(r => r.state === 'bound' && r.prompt_id === turn)
+  if (bound.every(r => r.kind === 'handoff' && r.handoff === hid)) expect(L.handoffReplyTier({})).toMatchObject({ silent: true, handoff: hid })   // M1: this turn is that report
+  expect(L.handoffReplyTier({ reply_to: 1030 })).toBeNull()                                  // quoting a message of Joey's: an ordinary answer
+  L.noteMainReplyTier(L.handoffReplyTier({ handoff_id: hid })!, 1015)
+  expect(rows().find(r => r.lane === 'main' && r.refs?.message_id === 1015)!.refs.tier).toBe('silent')
+  M1joey: {
+    const meta = { chat_id: '1', message_id: '1020', user: 'joey_lab' }
+    await L.routeEvent({ id: 'tg-1-1020', source: 'telegram', from: 'joey', text: '今天怎樣？', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '今天怎樣？', meta } } } as any)
+    await L.__mainEvent({ event: 'PostToolUse', pid: proc.pid, prompt_id: turn, tool_name: 'Bash' })   // pulled into the same turn
+    expect(L.handoffReplyTier({})).toBeNull()                                                // Joey's message is in this turn: an ordinary reply
+  }
+  await L.lanesCommand('/lanes notify default', 'joey_lab')
+  expect(L.handoffReplyTier({ handoff_id: hid })).toMatchObject({ silent: false })           // the notify profile still rules
+  await L.lanesCommand('/lanes notify tiered', 'joey_lab')
+  await L.__mainEvent({ event: 'Stop', pid: proc.pid, prompt_id: turn, phase: 'final' })
+  expect(ob(p.id, 'main').state).toBe('met')
+  proc.kill('SIGKILL')
+})

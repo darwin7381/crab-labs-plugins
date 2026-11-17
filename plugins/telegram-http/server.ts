@@ -1145,10 +1145,10 @@ const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
 // `extra` is only ever passed with lanes on (002): thread / hop / sending-lane marker ride along
 // in the comms log and the /inject body, and `minted` reports the BTCC id + delivery outcome.
-type LaneSendExtra = { thread?: string; hop?: number; lane?: string; minted?: (id: number | undefined, delivered: boolean) => void }
+type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: string; minted?: (id: number | undefined, delivered: boolean) => void }
 function laneFields(extra?: LaneSendExtra): Record<string, unknown> {
   if (!extra) return {}
-  return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}) }
+  return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}), ...(extra.owner ? { owner: extra.owner } : {}) }
 }
 async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, extra?: LaneSendExtra): Promise<string> {
   const target = to.trim().toLowerCase()

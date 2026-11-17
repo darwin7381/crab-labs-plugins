@@ -121,7 +121,7 @@ test('D1: renderDigest in isolation: the reopen list alone makes a digest', () =
   const old = prop('mp-old', '2026-11-13T02:00:00.000Z')
   expect(renderDigest([], [])).toBeNull()
   const d = renderDigest([], [old])!
-  expect(d.text).toContain('• mp-old｜adam.worker.1'); expect(d.text).not.toContain('Jev 檢查'); expect(d.wake).toBe(false); expect(d.items).toBe(1)
+  expect(d.text).toContain('• mp-old｜adam.worker.1'); expect(d.text).not.toContain('Jev 檢查'); expect(d.items).toBe(1)
 })
 
 test('D1: while the curator holds the write right accept is refused and veto is not; when it hands the right back, the Joey-sourced proposals it was given are closed as curated', async () => {

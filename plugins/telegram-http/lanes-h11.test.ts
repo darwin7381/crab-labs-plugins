@@ -4,7 +4,6 @@ import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { isWakeEntry } from './lanes-digest.ts'
 process.env.LANES_FLOOD_CONTROL = '0'                                      // this file sends many new threads from one peer: the flood gate (H14) is not what it tests
 process.env.LANES_THREAD_BUDGET = '250000'                                   // read once at import: set it for this instance only
 const L = await import('./lanes.ts?h11-test') as typeof import('./lanes.ts')
@@ -67,7 +66,7 @@ test('H11: a run that reaches the thread budget in the run is stopped (SIGTERM),
   expect(s).toMatchObject({ kind: 'stop', notify_main: true, lane: d.lane, refs: { capped: 'budget', in_run: true, budget: 250000 } })
   expect(s.text).toContain('預算'); expect(s.text).toContain('250000'); expect(s.text).toContain('這一趟已經中止')
   expect(s.text).toContain('第 3 頁讀完了，繼續下一頁')                                   // the last text of the run when it was stopped (3 x 90,015 >= 250,000)
-  expect(isWakeEntry(s)).toBe(true)                                                       // the main is woken
+  expect(await until(() => L.__main().items(r => r.kind === 'handoff' && r.event === 'mesh-h1').length === 1)).toBe(true)   // what the event still owes goes to the main (M3 exit rule)
   const exit = rows('lanes.jsonl').find(r => r.kind === 'exit' && r.lane === d.lane)!
   expect(exit.signal).toBe('SIGTERM'); expect(exit.tokens_in).toBeGreaterThanOrEqual(250000); expect(exit.tokens_in).toBeLessThan(450000)   // stopped within a turn or two of the budget, not at 20 pages
   const th = st.threads[st.lanes[d.lane!].thread]

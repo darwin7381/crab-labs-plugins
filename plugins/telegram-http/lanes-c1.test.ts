@@ -38,7 +38,9 @@ let id = 70000
 const send = (text: string, to = 'eve', extra: object = {}) => outbound({ msgId: ++id, owner: 'main', to, text, thread: null, ...extra })
 // eve has an open request: the router promised her an answer on thread adam#t-c1a (a promise), and has another live thread
 st.threads['adam#t-c1a'] = { id: 'adam#t-c1a', lane: 'adam.reflex.1', peer: 'eve', hops: 1, tokens: 0, created: '', last: '2026-11-13T01:00:00Z' } as any
-st.promises['pr-c1'] = { id: 'pr-c1', peer: 'eve', thread: 'adam#t-c1a', event: 'ev-c1', what: '/v2/orders/bulk', created: Date.now(), due: Date.now() + 1_800_000, state: 'open', handoff: 'h1' } as any
+// M3: the router's promise is an answer the main owes eve, on that thread
+L.__events().open('ev-c1', { class: 'peer', owner: 'main', thread: 'adam#t-c1a', obligations: [{ kind: 'peer', level: 'answer', owner: 'main', to: 'eve', what: '/v2/orders/bulk', due_at: Date.now() + 1_800_000 }] })
+const c1ob = () => (L.__events().get('ev-c1')!.obligations as any[])[0]
 
 test('C1: the main\'s send is an action line first, then a commitment (lane main, refs.auto) on the thread of the peer\'s open promise', async () => {
   mode = 'high'
@@ -50,8 +52,8 @@ test('C1: the main\'s send is an action line first, then a commitment (lane main
   const c = commitments()[0]
   expect(c).toMatchObject({ kind: 'commitment', lane: 'main', thread: 'adam#t-c1a', notify_main: false, refs: { auto: true, who: 'eve', from: 'main-send', thread_from: 'promise' } })
   expect(c.refs.p).toBeGreaterThanOrEqual(0.7); expect(c.refs.by).toContain('明天'); expect(c.text).toContain('答應 eve')
-  expect(st.promises['pr-c1'].state).toBe('open')                                            // 002k (C4): a send with no thread, no reply_to and no Jev match answers nothing in particular
-  st.promises['pr-c1'].state = 'kept'                                                        // (the rest of this file is about commitments, not promises)
+  expect(c1ob().state).toBe('open')                                            // 002k (C4): a send with no thread, no reply_to and no Jev match answers nothing in particular
+  L.__events().set('ev-c1', c1ob().id, { state: 'met' })                                     // (the rest of this file is about commitments, not promises)
 })
 
 test('C1: p below 0.7 writes nothing; exactly 0.7 does', async () => {
@@ -99,9 +101,9 @@ test('C1: the thread comes from the peer\'s open promise, then work handed to th
   st.threads['adam#t-c1b'] = { id: 'adam#t-c1b', lane: 'adam.reflex.2', peer: 'dan', hops: 1, tokens: 0, created: '', last: '2026-11-13T02:00:00Z' } as any
   st.threads['adam#t-c1c'] = { id: 'adam#t-c1c', lane: 'adam.reflex.3', peer: 'dan', hops: 1, tokens: 0, created: '', last: '2026-11-13T03:00:00Z' } as any
   expect(L.peerThread('dan')).toEqual({ thread: 'adam#t-c1c', from: 'peer-thread' })              // the newest live thread
-  st.handoffs['h-dan'] = { id: 'h-dan', lane: 'adam.reflex.2', thread: 'adam#t-c1b', event: 'e', text: 'x', created: Date.now(), state: 'pending' } as any
+  L.__events().open('ev-dan-h', { class: 'peer', owner: 'adam.reflex.2', thread: 'adam#t-c1b', obligations: [{ kind: 'main', level: 'handed', owner: 'main', handoff: 'h-dan' }] })
   expect(L.peerThread('dan')).toEqual({ thread: 'adam#t-c1b', from: 'handoff' })                  // work handed to the main from dan's thread
-  st.promises['pr-dan'] = { id: 'pr-dan', peer: 'dan', thread: 'adam#t-c1c', event: 'e', what: 'x', created: Date.now(), due: Date.now() + 1000, state: 'open', handoff: 'h-dan' } as any
+  L.__events().open('ev-dan-p', { class: 'peer', owner: 'main', thread: 'adam#t-c1c', obligations: [{ kind: 'peer', level: 'answer', owner: 'main', to: 'dan', what: 'x', due_at: Date.now() + 1000 }] })
   expect(L.peerThread('dan')).toEqual({ thread: 'adam#t-c1c', from: 'promise' })
   expect(L.peerThread('dan', 'adam#t-c1b')).toEqual({ thread: 'adam#t-c1b', from: 'send' })
   expect(L.peerThread('nobody')).toEqual({ thread: null, from: 'none' })

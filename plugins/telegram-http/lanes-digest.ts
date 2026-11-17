@@ -52,16 +52,8 @@ export function cleanReport(a: unknown): LaneReport | null {
   return any ? r : null
 }
 
-// ------------------------------------------------------------------ what wakes the main
-/** Only these wake an idle main; every other pending entry rides along with its next natural turn.
- *  escalation (a lane handed a decision up), stop (a thread was cut off: hop / budget), and a push-tier notice —
- *  except the push of a run that already escalated (the escalation is that run's wake; its push is a duplicate). */
-export function isWakeEntry(r: LedgerRec): boolean {
-  // 002d: only work that was handed to the main wakes it (a lane's handoff_main, a lane that failed, a stopped thread).
-  // A message a lane already sent to Joey, ringing or not, is a line in the main's next digest and wakes nobody.
-  // 002m (L6B6): a stop of a run that had already asked Joey or handed the event over says wake: false (one report per event)
-  return !!r.notify_main && (r.kind === 'escalation' || r.kind === 'stop') && r.refs?.wake !== false
-}
+/** work the router handed to the main (a hand-over, a stopped thread): its block comes first and is never cut */
+const handedEntry = (r: LedgerRec): boolean => !!r.notify_main && (r.kind === 'escalation' || r.kind === 'stop')
 
 // ------------------------------------------------------------------ rendering
 const NONE_RE = /^(無|无|沒有|没有|無需|不需要|不用|none|nothing|n\/a|no|nil|-|—|–)[\s.。!！]*$/i
@@ -185,7 +177,7 @@ function buildBlock(v: View): Block {
   if (rep?.needs_main && !needsParts.some(p => p.includes(rep.needs_main.slice(0, 40)))) needsParts.push(rep.needs_main)
   const needs = needsParts.join('；')
 
-  const waking = v.recs.some(isWakeEntry)          // it woke (or would wake) the main: never shown as routine
+  const waking = v.recs.some(handedEntry)          // handed to the main: never shown as routine
   const must = v.recs.some(r => r.refs?.must_know === true)   // 002k (B2): marked once per thread however many lines carry it
   const joeyProposal = by('memory_proposal').some(r => r.refs?.joey === true)
   const routine = !waking && !esc.length && !must && isNone(promised) && isNone(needs)
@@ -210,7 +202,7 @@ function buildBlock(v: View): Block {
   }
 }
 
-export type RenderedDigest = { text: string; items: number; threads: number; wake: boolean }
+export type RenderedDigest = { text: string; items: number; threads: number }
 // 002k (B15, 002j group B / B08): the caps were 6 heavy blocks of 6 lines and 10 routine lines (48 lines for 18 threads) against the design's 8 lines.
 // Now 3 heavy blocks of at most 3 lines and 5 routine lines, and the routine threads of one class are ONE line with a count. What is handed to the
 // main (an escalation / a stop), a critical alert's mark and a memory proposal from a Joey message are never cut by the caps.
@@ -293,7 +285,7 @@ export function renderDigest(recs: LedgerRec[], reopen: LedgerRec[] = [], holds:
     lines.push(...reopenLines)
   }
   lines.push('（只列這次新增的。整天每件事一行的完整清單：ledger_query() 不帶參數；某一件的原文：ledger_query(text=關鍵字)。）')
-  return { text: lines.join('\n'), items, threads: blocks.length, wake: recs.some(isWakeEntry) }
+  return { text: lines.join('\n'), items, threads: blocks.length }
 }
 
 // ------------------------------------------------------------------ activity list (002d)

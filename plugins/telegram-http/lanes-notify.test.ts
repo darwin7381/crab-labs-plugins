@@ -75,9 +75,10 @@ test('a reply in a thread inherits the class of the run that asked; other classe
   expect(effectiveClass('peer', 'joey')).toBe('peer')
 })
 
-test('lanes declare nothing: notify_joey takes only text', () => {
+test('lanes declare nothing about the tier: notify_joey takes the text and the outcome as a field (normal | changed | failed), never a tier', () => {
   const t = LANE_TOOLS.find(x => x.name === 'notify_joey')!
-  expect(Object.keys((t.inputSchema as any).properties)).toEqual(['text'])
+  expect(Object.keys((t.inputSchema as any).properties)).toEqual(['text', 'outcome'])
+  expect((t.inputSchema as any).properties.outcome.enum).toEqual(['normal', 'changed', 'failed'])
   expect((t.inputSchema as any).required).toEqual(['text'])
 })
 

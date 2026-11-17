@@ -200,21 +200,21 @@ test('information never travels alone: a digest with nothing owed to the main is
   await kill(g)
 })
 
-test('inv A(3): a hand-over is an item: an item that was taken in and not finished (gen ended) is not settled; done on Stop settles the 002d hand-over', async () => {
+test('inv A(3): a hand-over is an item: taken in and not finished (gen ended) leaves its obligation open; done on Stop meets it (M3 main obligation)', async () => {
   const st = L.__lanesState()
   st.lanes['adam.reflex.7'] = { id: 'adam.reflex.7', kind: 'reflex', n: 7, session_id: 's', thread: 'adam#t-h7', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
-  const tok = { runId: 'adam.reflex.7.r1', lane: 'adam.reflex.7', evId: 'ev-h7', closers: [], critical: false, trigger: 'peer', cls: 'peer', escalated: false, pushed: false } as any
+  const tok = { runId: 'adam.reflex.7.r1', lane: 'adam.reflex.7', evId: 'ev-h7', closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any
   const g = await startMain()
   await L.callLaneTool(tok, 'handoff_main', { text: 'Eve 要主線答應週五交報告' })
-  const h = Object.values(st.handoffs).find((x: any) => x.event === 'ev-h7') as any
-  const item = M().items(r => r.kind === 'handoff' && (r.handoffs ?? []).includes(h.id))[0]
+  const ob = () => (L.__events().get('ev-h7')!.obligations as any[]).find(o => o.kind === 'main')
+  const item = M().items(r => r.kind === 'handoff' && r.handoff === ob().handoff)[0]
   expect(item.state).toBe('offered')
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [item.id] })
   await kill(g)                                                                         // taken in, never finished
-  expect(state(item.id)).toBe('queued'); expect(h.state).toBe('pending')
+  expect(state(item.id)).toBe('queued'); expect(ob().state).toBe('open')
   const g2 = await startMain()
   const p2 = P(); await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: [item.id] }); await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
-  expect(state(item.id)).toBe('done'); expect(h.state).toBe('delivered')
+  expect(state(item.id)).toBe('done'); expect(ob().state).toBe('met')
   await kill(g2)
 })
 

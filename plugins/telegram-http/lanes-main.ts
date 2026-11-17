@@ -77,6 +77,7 @@ export function createMain(E: MainEnv) {
   let stuck: { gen: string; prompt: string | null; at: number } | null = null
   let offering = false
   let seq = 0
+  const bootAt = Date.now()
 
   const J = (): Journal => E.journal
   /** boot: fold done by the caller (journal.load); pick the live gen */
@@ -102,7 +103,7 @@ export function createMain(E: MainEnv) {
     if (g && g.state === 'walled') return Date.parse(g.ts)
     if (g) return 0
     const last = J().rows('main').pop()
-    return last ? Date.parse(last.ts) : 0
+    return last ? Date.parse(last.ts) : bootAt                // no main has registered since this daemon started
   }
   function mainSession(): { session_id: string; pid: number; transcript_path: string } | null {
     const g = currentGen()
@@ -126,7 +127,7 @@ export function createMain(E: MainEnv) {
     const g = currentGen()
     if (kind === 'digest') J().write('wake', id, 'no_wake', { reason: 'information: rides the next delivery' })
     else if (!g || g.state !== 'idle') J().write('wake', id, 'no_wake', { reason: !g ? 'main gone: offered to the next gen' : g.state === 'in_turn' ? 'main in a turn: pulled at its next tool boundary or Stop' : `main ${g.state}` })
-    void pump()
+    if (kind !== 'digest') void pump()
     return id
   }
   const owed = (r: Row): boolean => r.kind !== 'digest'
@@ -150,6 +151,10 @@ export function createMain(E: MainEnv) {
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
   async function pump(): Promise<void> {
     if (!E || offering) return
+    offering = true                                                   // one offer at a time: the decision and the write are one transition
+    try { await offerNext() } finally { offering = false }
+  }
+  async function offerNext(): Promise<void> {
     const g = currentGen()
     if (!g || g.state !== 'idle') return
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
@@ -160,9 +165,8 @@ export function createMain(E: MainEnv) {
     const p = (it.notif?.params ?? {}) as Record<string, any>
     const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${String(p.content ?? '')}` : String(p.content ?? '')
     const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
-    offering = true
     let ok = false
-    try { ok = await E.offer(notif, it.via as Via, Number(g.pid)) } catch (e) { E.log('warn', `lanes: offer of ${it.id} failed: ${e}`) } finally { offering = false }
+    try { ok = await E.offer(notif, it.via as Via, Number(g.pid)) } catch (e) { E.log('warn', `lanes: offer of ${it.id} failed: ${e}`) }
     const now = currentGen()
     if (!ok || !now || now.id !== g.id) {
       if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }

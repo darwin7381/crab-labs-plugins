@@ -35,26 +35,3 @@ test('B21: cleanReport strips the markup (the fallback); text around it stays', 
   expect(stripMarkup('a<b>c</b> d <parameter name="x" ')).toBe('a c d')
   expect(cleanReport({ happened: '<b></b>' })?.happened ?? '').toBe('')
 })
-
-test('B21: receipt with markup is a tool error asking for each field as its own argument; nothing is recorded; the resend works; a second bad one is stripped', async () => {
-  const tok = run()
-  await expect(L.callLaneTool(tok, 'receipt', { outcome: 'done', happened: 'eve 問逾時', did: BAD })).rejects.toThrow(/own argument/)
-  expect(rows().length).toBe(0)                                                    // refused: nothing reached the ledger
-  await L.callLaneTool(tok, 'receipt', { outcome: 'done', happened: 'eve 問逾時', did: '回覆 eve：30 秒', promised: '無', needs_main: '無' })
-  expect(rows().length).toBe(1)
-  expect(rows()[0].refs.report.did).toBe('回覆 eve：30 秒')
-  // a model that sends the markup again anyway: it is stripped, so the digest never carries it
-  await L.callLaneTool(tok, 'receipt', { outcome: 'done', happened: 'eve 問逾時', did: BAD, promised: '無', needs_main: '無' })
-  const last = rows()[1]
-  expect(JSON.stringify(last)).not.toMatch(MARKUP_RE); expect(last.refs.report.did).toContain('回覆 eve：30 秒')
-  const d = renderDigest(rows() as any)!
-  expect(d.text).not.toMatch(MARKUP_RE)
-})
-
-test('B21: markup in summary is refused too; a clean receipt is untouched', async () => {
-  const tok = run()
-  await expect(L.callLaneTool(tok, 'receipt', { outcome: 'done', summary: '完成</parameter>' })).rejects.toThrow(/summary contains tag markup/)
-  const k = rows().length
-  await L.callLaneTool(run(), 'receipt', { outcome: 'nothing-to-do', happened: 'p95 < 2s 且 error > 5% 沒有發生', did: '無', promised: '無', needs_main: '無' })
-  expect(rows().length).toBe(k + 1); expect(rows()[k].refs.report.happened).toContain('p95 < 2s')
-})

@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
 import { lanesInit, callLaneTool, identityCard, laneContext, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected, __main, __digest } from './lanes.ts'
-import { isWakeEntry, queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
+import { queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-handoff-'))
@@ -175,7 +175,7 @@ test('002f: a stopped thread stays stopped: the stop wakes the main once, later 
   expect(st.threads['adam#t-loop'].stopped).toBeTruthy()
   let rows = ledgerRows()
   expect(rows.filter(r => r.kind === 'stop').length).toBe(1)
-  expect(rows.filter(isWakeEntry).length).toBe(1)                         // the main is woken with the stop, once
+  expect(rows.filter(r => r.kind === 'stop' && r.notify_main).length).toBe(1)   // the stop, once
   expect(rows.find(r => r.kind === 'stop').text).toContain('不要帶 reply_to')
   const handed = () => __main().items(r => r.kind === 'handoff' && String(r.event) === 'mesh-loop-7')
   expect(handed().length).toBe(1)                                         // M1: the stop is one item for the main
@@ -186,7 +186,7 @@ test('002f: a stopped thread stays stopped: the stop wakes the main once, later 
   rows = ledgerRows()
   expect(rows.filter(r => r.kind === 'stop').length).toBe(1)              // no second stop
   expect(rows.filter(r => r.kind === 'fyi' && r.thread === 'adam#t-loop').length).toBe(2)   // both are on the record
-  expect(rows.slice(-2).some(isWakeEntry)).toBe(false)                    // and neither wakes the main
+  expect(rows.slice(-2).some(r => r.kind === 'stop')).toBe(false)         // and neither is a stop
   expect(__main().items(r => r.kind === 'handoff' && /mesh-loop-[89]/.test(String(r.event))).length).toBe(0)   // nothing to wake it for
   expect(handed().length).toBe(1)
   const ride = __digest()!                                                // they ride along with whatever reaches the main next

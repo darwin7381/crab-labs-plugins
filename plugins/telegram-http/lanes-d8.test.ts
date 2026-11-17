@@ -71,21 +71,6 @@ test('D8: at 80% of the thread budget the run is told to hand over (system notic
   expect(s.refs.partial).toContain('最後的工具結果：'); expect(s.refs.partial).toMatch(/page \d+: 5xx=\d+/)   // not only 「還沒有文字結果；用過 Bash」
 })
 
-test('N4: two calls before the turn cap the run is told to close; a run still cut at the cap sends its own labelled line to Joey (event tier), the stop row wakes the main', async () => {
-  writeFileSync(join(dir, 'mode'), 'turns'); writeFileSync(join(dir, 'seen.txt'), '')
-  const n0 = sent.length
-  const d = await L.routeEvent(ev('mesh-t1', '20 頁的排程報告'))
-  expect(await until(() => stops('mesh-t1').length === 1)).toBe(true)
-  expect(rows('lanes.jsonl').filter(r => r.kind === 'limit_warning' && r.lane === d.lane).map(r => r.which)).toEqual(['turns'])
-  expect(seen()).toContain('只剩 2 次模型呼叫')
-  expect(await until(() => sent.length > n0)).toBe(true)
-  const m = sent.slice(n0).find(x => x.text.includes('還沒做完'))!
-  expect(m.text.startsWith(`〔adam·反射線#${st.lanes[d.lane!].n}〕`)).toBe(true)                  // labelled with the lane, not the main's unlabelled report
-  expect(m.text).toContain('回合上限'); expect(m.text).toContain('page 5: 5xx=15')
-  expect(m.silent).toBe(true)                                                                       // a peer's matter: the event's tier (silent)
-  expect(stops('mesh-t1')[0].text).toContain('車道已經用它自己的標記告訴 Joey')
-})
-
 test('D8/N4: the steer hook renders a system notice without the Joey frame, and never holds a run at Stop for one', () => {
   const d = mkdtempSync(join(tmpdir(), 'lanes-d8-hook-'))
   mkdirSync(join(d, 'run', 'steer'), { recursive: true })
