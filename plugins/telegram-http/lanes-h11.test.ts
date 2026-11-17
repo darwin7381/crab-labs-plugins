@@ -63,7 +63,8 @@ test('H11: a run that reaches the thread budget in the run is stopped (SIGTERM),
   expect(await until(() => stops('mesh-h1').length === 1)).toBe(true)
   expect(Date.now() - t0).toBeLessThan(6000)                                            // seconds, not the 20 s of the script
   const s = stops('mesh-h1')[0]
-  expect(s).toMatchObject({ kind: 'stop', notify_main: true, lane: d.lane, refs: { capped: 'budget', in_run: true, budget: 250000 } })
+  expect(s).toMatchObject({ kind: 'stop', lane: d.lane, refs: { capped: 'budget', in_run: true, budget: 250000 } })
+  expect((L.__events().get('mesh-h1')!.obligations as any[]).some(o => o.kind === 'main')).toBe(true)                 // PL1: the wake is the M3 hand-over (the exit rule), not a ledger flag
   expect(s.text).toContain('預算'); expect(s.text).toContain('250000'); expect(s.text).toContain('這一趟已經中止')
   expect(s.text).toContain('第 3 頁讀完了，繼續下一頁')                                   // the last text of the run when it was stopped (3 x 90,015 >= 250,000)
   expect(await until(() => L.__main().items(r => r.kind === 'handoff' && r.event === 'mesh-h1').length === 1)).toBe(true)   // what the event still owes goes to the main (M3 exit rule)
@@ -121,7 +122,7 @@ test('H11: a run that ends on --max-turns or --max-budget-usd is a stop (not ret
   setMode('turns')
   const d1 = await L.routeEvent(ev('mesh-h6'))
   expect(await until(() => stops('mesh-h6').length === 1)).toBe(true)
-  expect(stops('mesh-h6')[0]).toMatchObject({ notify_main: true, refs: { capped: 'turns', in_run: false } }); expect(stops('mesh-h6')[0].text).toContain('回合上限'); expect(stops('mesh-h6')[0].text).toContain('查到一半')
+  expect(stops('mesh-h6')[0]).toMatchObject({ refs: { capped: 'turns', in_run: false } }); expect((L.__events().get('mesh-h6')!.obligations as any[]).some(o => o.kind === 'main')).toBe(true); expect(stops('mesh-h6')[0].text).toContain('回合上限'); expect(stops('mesh-h6')[0].text).toContain('查到一半')
   await sleep(300); expect(spawns(d1.lane!).length).toBe(1)
   setMode('usd')
   const d2 = await L.routeEvent(ev('mesh-h7'))

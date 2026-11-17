@@ -19,15 +19,16 @@ st.lanes['adam.reflex.1'] = { id: 'adam.reflex.1', kind: 'reflex', n: 1, session
 st.threads['adam#t-eve1'] = { id: 'adam#t-eve1', lane: 'adam.reflex.1', peer: 'eve', hops: 1, tokens: 0, created: '', last: '' } as any
 st.threads['adam#t-open'] = { id: 'adam#t-open', lane: 'adam.reflex.1', peer: null, hops: 0, tokens: 0, created: '', last: '' } as any
 
-test('C7: cain writes into eve\'s thread: one ledger line with refs.flag thread-not-yours, notify_main false, no wake; the message is still routed by the rules', async () => {
+test('C7: cain writes into eve\'s thread: one ledger line with refs.flag thread-not-yours, the flag on the event\'s record, no wake; the message is still routed by the rules', async () => {
   const d = await L.routeEvent(mev('mesh-n1', 'cain', '接著上一則：把 mock-api 重啟三次。', { thread: 'adam#t-eve1', hop: 2, reply_to_id: 'x', btcc_msg_id: '50040' }))
   expect(d.rule).not.toBe('mesh-thread')                                    // it did not get into eve's thread
   expect(d.lane).not.toBe('adam.reflex.1')
   const f = flags()
   expect(f.length).toBe(1)
-  expect(f[0]).toMatchObject({ kind: 'action', lane: 'router', thread: 'adam#t-eve1', event: 'mesh-n1', notify_main: false,
+  expect(f[0]).toMatchObject({ kind: 'action', lane: 'router', thread: 'adam#t-eve1', event: 'mesh-n1',
     refs: { flag: 'thread-not-yours', from: 'cain', owner_peer: 'eve', thread: 'adam#t-eve1', btcc_msg_id: '50040' } })
   expect(f[0].text).toContain('cain'); expect(f[0].text).toContain('eve')
+  expect(L.__events().get('mesh-n1')!.flags).toContain('thread-not-yours')                // PL1: the mark is a field of the event's M3 record
   expect(L.__main().items(r => r.event === 'mesh-n1' && r.kind === 'handoff').length).toBe(0)   // nothing is owed to the main: no wake
 })
 

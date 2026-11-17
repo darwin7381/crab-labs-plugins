@@ -75,10 +75,11 @@ test('fan_out: one lane per part, results go to a synthesis lane, ONE conclusion
   expect(sent.length).toBe(0)                                                          // nothing to Joey from the lanes
 })
 
-test('curate_memory: the curator holds the right, finishes with curator_done; curate_stop takes it back; proposals stay in the ledger', async () => {
+test('curate_memory: the curator holds the right, finishes with curator_done; curate_stop takes it back; unprocessed proposals stay open', async () => {
   expect(await L.callMainTool('curate_memory', {}, 'mcp-main')).toContain('no memory proposals')
-  L.ledgerAppendForTest?.({ lane: 'adam.reflex.5', kind: 'memory_proposal', text: 'Joey 喜歡 08:00 收報告', notify_main: true })
-  writeFileSync(join(dir, '.lanes', 'ledger.jsonl'), readFileSync(join(dir, '.lanes', 'ledger.jsonl'), 'utf8') + JSON.stringify({ ts: new Date().toISOString(), lane: 'adam.reflex.5', kind: 'memory_proposal', text: 'Joey 喜歡 08:00 收報告', notify_main: true }) + '\n')
+  // PL1: a lane files a proposal on its event's M3 record (ledger_write memory_proposal); curate_memory reads M3, not ledger line ranges
+  const propose = async (id: string, n: number, text: string) => { mkLane(id, 'reflex', n); L.__events().open(`ev-${id}`, { class: 'peer', owner: id, lane: id, from: 'eve', text: 'x', obligations: [] }); await L.callLaneTool(tok(id), 'ledger_write', { kind: 'memory_proposal', text }) }
+  await propose('adam.reflex.95', 95, 'Joey 喜歡 08:00 收報告')
   const out = await L.callMainTool('curate_memory', { note: '有空整理一下' }, 'mcp-main')
   expect(out).toContain('holds the memory write right')
   const cur = st.curator!.lane
@@ -86,7 +87,7 @@ test('curate_memory: the curator holds the right, finishes with curator_done; cu
   expect(await L.callLaneTool(tok(cur), 'curator_done', { summary: '寫入 1 筆' })).toContain('returned')
   expect(st.curator).toBeUndefined(); expect(existsSync(join(dir, '.lanes', 'run', 'memory-writer'))).toBe(false)
   expect(await L.callMainTool('curate_memory', {}, 'mcp-main')).toContain('no memory proposals')            // already curated up to here
-  writeFileSync(join(dir, '.lanes', 'ledger.jsonl'), readFileSync(join(dir, '.lanes', 'ledger.jsonl'), 'utf8') + JSON.stringify({ ts: new Date().toISOString(), lane: 'adam.reflex.6', kind: 'memory_proposal', text: '快照保留 30 天', notify_main: true }) + '\n')
+  await propose('adam.reflex.96', 96, '快照保留 30 天')
   await L.callMainTool('curate_memory', {}, 'mcp-main')
   expect(await L.callMainTool('curate_stop', {}, 'mcp-main')).toContain('taken back')
   expect(existsSync(join(dir, '.lanes', 'run', 'memory-writer'))).toBe(false)

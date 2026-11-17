@@ -47,7 +47,7 @@ test('H14: a burst of 20 from one peer: 5 get a lane, 15 get none and are merged
   for (const d of ds.slice(5)) { expect(d.rule).toBe('peer-flood'); expect(d.target).toBe('ledger'); expect(d.lane).toBeUndefined() }
   expect(lanesOf('cain')).toBe(5)                                                          // five lanes, not twenty
   const flags = rows('ledger.jsonl').filter(r => r.refs?.flag === 'peer-flood')
-  expect(flags.length).toBe(1); expect(flags[0]).toMatchObject({ kind: 'action', notify_main: false, refs: { peer: 'cain', phase: 'start', reason: 'rate' } })
+  expect(flags.length).toBe(1); expect(flags[0]).toMatchObject({ kind: 'action', refs: { peer: 'cain', phase: 'start', reason: 'rate' } })
   expect(await until(() => pushes(/流量管制/).length >= 1)).toBe(true)
   expect(pushes(/流量管制/).length).toBe(1); expect(pushes(/流量管制/)[0].silent).toBe(false); expect(pushes(/流量管制/)[0].text).toContain('cain')   // one push at the start
   const toCain = mesh.filter(m => m.to === 'cain')
@@ -77,7 +77,9 @@ test('H14: when the peer has been quiet, ONE ledger row peer_flood <peer> (count
   L.floodTick(Date.now() + 300_000)
   const r = floodRows('cain')
   expect(r.length).toBe(1)
-  expect(r[0]).toMatchObject({ kind: 'fyi', notify_main: true, refs: { peer_flood: 'cain', count: 18, answered: 5, ledger_only: 18, first: 'mesh-fcain-6', last: 'mesh-gcain-3', tokens_avoided: 18 * 300000 } })
+  expect(L.__events().get('mesh-fcain-6')!.flood).toMatchObject({ peer: 'cain', count: 18, answered: 5, last: 'mesh-gcain-3' })   // PL1: the episode's head record carries the end
+  expect(L.__events().get('mesh-fcain-6')!.flood.ended).toBeTruthy(); expect(L.__events().get('mesh-gcain-3')).toMatchObject({ gate: 'peer-flood', episode: 'mesh-fcain-6' })
+  expect(r[0]).toMatchObject({ kind: 'fyi', refs: { peer_flood: 'cain', count: 18, answered: 5, ledger_only: 18, first: 'mesh-fcain-6', last: 'mesh-gcain-3', tokens_avoided: 18 * 300000 } })
   expect(r[0].refs.samples.length).toBe(3); expect(r[0].refs.samples[0]).toContain('第 6 則'); expect(r[0].refs.window_s).toBeGreaterThanOrEqual(1); expect(r[0].refs.reasons).toEqual({ rate: 18 })
   expect(r[0].text).toStartWith('peer_flood cain：18 則'); expect(r[0].text).toContain('第一則 mesh-fcain-6'); expect(r[0].text).toContain('最後一則 mesh-gcain-3')
   const end = pushes(/流量管制結束/)
@@ -137,7 +139,7 @@ test('H14: the main\'s peer_hold: all of the peer\'s events are ledger-only (no 
   const k = sent.length, m = mesh.length
   expect(await hold({ peer: 'fay', minutes: 30, reason: 'Joey 說不理 fay：它在洗版' })).toContain('on hold for 30 minute(s)')
   const start = rows('ledger.jsonl').find(r => r.refs?.peer_hold === 'fay' && r.kind === 'action')!
-  expect(start).toMatchObject({ lane: 'main', notify_main: true }); expect(start.text).toContain('主線暫停 fay'); expect(start.text).toContain('Joey 說不理 fay')
+  expect(start).toMatchObject({ lane: 'main' }); expect(start.text).toContain('主線暫停 fay'); expect(start.text).toContain('Joey 說不理 fay')
   const lanesBefore = lanesOf('fay')
   const ds = []
   for (let i = 1; i <= 30; i++) ds.push(await L.routeEvent(ev(`mesh-hfay-${i}`, 'fay', `回我一下（第 ${i} 則）`, i % 5 === 0 ? { thread: 'adam#t-unknown', hop: 2 } : {})))
@@ -154,7 +156,9 @@ test('H14: the main\'s peer_hold: all of the peer\'s events are ledger-only (no 
   expect(L.__main().items(r => r.kind === 'handoff' && /fay/.test(String(r.notif?.params?.content))).length).toBe(0)   // a hold never wakes the main
   L.floodTick(Date.now() + 40 * 60_000)                                                    // 30 minutes are up
   const end = rows('ledger.jsonl').find(r => r.refs?.peer_hold === 'fay' && r.refs.ended)!
-  expect(end).toMatchObject({ kind: 'fyi', notify_main: true, refs: { count: 30, first: 'mesh-hfay-1', last: 'mesh-hfay-30' } }); expect(end.refs.samples.length).toBe(3); expect(end.text).toContain('時間到')
+  expect(end).toMatchObject({ kind: 'fyi', refs: { count: 30, first: 'mesh-hfay-1', last: 'mesh-hfay-30' } });
+  expect(L.__events().get('mesh-hfay-1')!.hold).toMatchObject({ peer: 'fay', count: 30, last: 'mesh-hfay-30', ended: '時間到' })   // PL1: on the head's M3 record
+  for (const i of [2, 30]) expect(L.__events().get(`mesh-hfay-${i}`)).toMatchObject({ owner: 'router', gate: 'peer-hold', episode: 'mesh-hfay-1', obligations: [] }); expect(end.refs.samples.length).toBe(3); expect(end.text).toContain('時間到')
   expect(L.holdLines()).toEqual([])
   expect((await L.routeEvent(ev('mesh-hfay-31', 'fay', '我又來了'))).target).toBe('lane')    // the hold is over
 })

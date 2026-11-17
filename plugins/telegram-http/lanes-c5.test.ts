@@ -35,7 +35,8 @@ test('C5: a stop by the lane\'s own reply_agent (hop limit) drains the events qu
   expect(th.stopped).toContain('hop 7')
   const drained = rows('ledger.jsonl').filter(r => r.refs?.drained)
   expect(drained.map(r => r.event).sort()).toEqual(['mesh-s2', 'mesh-s3'])                        // one fyi each
-  for (const r of drained) { expect(r).toMatchObject({ kind: 'fyi', thread: th.id, notify_main: true }); expect(r.text).toContain('沒有處理') }
+  for (const r of drained) { expect(r).toMatchObject({ kind: 'fyi', thread: th.id }); expect(r.text).toContain('沒有處理') }
+  for (const id of ['mesh-s2', 'mesh-s3']) expect(L.__events().get(id)).toMatchObject({ owner: d1.lane, thread: th.id })   // PL1: the main reads them on their M3 records
   expect(drained.find(r => r.event === 'mesh-s3')!.text).toContain('15:00')
   expect(rows('routing.jsonl').filter(r => r.rule === 'thread-stopped-drain').length).toBe(2)
   expect(await until(() => rows('lanes.jsonl').some(r => r.kind === 'exit' && r.lane === d1.lane))).toBe(true)

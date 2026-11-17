@@ -10,7 +10,7 @@
 // ------------------------------------------------------------------ ledger records
 export type LedgerRec = {
   ts: string; lane: string; thread: string | null; event?: string | null; kind: string; text: string
-  notify_main: boolean; refs?: any; detail?: string | null
+  refs?: any; detail?: string | null
 }
 export const LEDGER_KINDS = ['action', 'commitment', 'escalation', 'memory_proposal', 'memory_decision', 'receipt', 'notify', 'fyi', 'stop', 'lane_lifecycle'] as const
 
@@ -231,11 +231,4 @@ export function queryLedger(raw: string | null, q: { since?: unknown; kind?: unk
     ...(fresh.length ? fresh : [rows.length ? '（都已列在上面）' : '（這個範圍內沒有）'])].join('\n')
 }
 
-// ------------------------------------------------------------------ 002k (D1): memory proposals and their decisions
-/** The memory proposals that came from a Joey message (refs.joey, set by the daemon from the event, never by the lane) and have no
- *  memory_decision yet, oldest first. */
-export function openJoeyProposals(recs: LedgerRec[]): LedgerRec[] {
-  const decided = new Set(recs.filter(r => r.kind === 'memory_decision').map(r => r.refs?.proposal_id))
-  return recs.filter(r => r.kind === 'memory_proposal' && r.refs?.joey === true && r.refs?.proposal_id && !decided.has(r.refs.proposal_id))
-}
 

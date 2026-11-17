@@ -34,7 +34,11 @@ test('/lanes close by WO number: the lane is closed, its topic and ticket unboun
   expect(st.topics['55']).toBeUndefined(); expect(st.tickets['WO-27']).toBeUndefined()
   expect(rows('lanes.jsonl').some(r => r.kind === 'closed' && r.lane === 'adam.worker.1')).toBe(true)
   const led = rows('ledger.jsonl').find(r => r.refs?.closed === 'adam.worker.1')
-  expect(led.notify_main).toBe(true); expect(led.text).toContain('WO-27')
+  expect(led.text).toContain('WO-27')
+  // PL1: the main is told through M3, not by a ledger flag: Joey's close is a record (information) in the main's views
+  const rec = L.__events().rows(e => e.lane === 'adam.worker.1' && String(e.id).startsWith('lanes-close-'))[0]
+  expect(rec).toMatchObject({ owner: 'router', obligations: [] }); expect(String(rec.did)).toContain('WO-27')
+  expect(L.activityList(undefined)).toContain('WO-27')
   expect(await L.lanesCommand('/lanes close 工作線#1', 'joey_lab')).toContain('已經關了')
   expect(await L.lanesCommand('/lanes close nope', 'joey_lab')).toContain('找不到')
 })

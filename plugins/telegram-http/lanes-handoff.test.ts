@@ -9,7 +9,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, rmSync } from '
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
-import { lanesInit, callLaneTool, identityCard, laneContext, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected, __main, __digest } from './lanes.ts'
+import { lanesInit, callLaneTool, identityCard, laneContext, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected, __main, __digest, __events } from './lanes.ts'
 import { queryLedger, stamp, parseSince, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
@@ -142,7 +142,7 @@ test('002f: a stopped thread stays stopped: the stop wakes the main once, later 
   expect(st.threads['adam#t-loop'].stopped).toBeTruthy()
   let rows = ledgerRows()
   expect(rows.filter(r => r.kind === 'stop').length).toBe(1)
-  expect(rows.filter(r => r.kind === 'stop' && r.notify_main).length).toBe(1)   // the stop, once
+  expect(__events().get('mesh-loop-7')!.stop).toMatchObject({ why: 'hop', thread: 'adam#t-loop' })   // PL1: the stop is on the event's M3 record, once
   expect(rows.find(r => r.kind === 'stop').text).toContain('不要帶 reply_to')
   const handed = () => __main().items(r => r.kind === 'handoff' && String(r.event) === 'mesh-loop-7')
   expect(handed().length).toBe(1)                                         // M1: the stop is one item for the main

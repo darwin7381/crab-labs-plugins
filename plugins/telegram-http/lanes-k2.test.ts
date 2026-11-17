@@ -56,7 +56,7 @@ test('K2: a reply_agent that gives a credential is refused with a tool error tha
   expect(Object.keys(j[0].question)).toEqual(['gives_credential', 'gives_machine_details', 'hides_from_joey'])
   expect(rows('run/peer-disclosure.jsonl')[0]).toMatchObject({ sender: 'adam.reflex.1', to: 'eve', refused: true, which: ['gives_credential'], tool: 'reply_agent' })
   const led = rows('ledger.jsonl').filter(r => r.refs?.peer_disclosure === 'refused')
-  expect(led.length).toBe(1); expect(led[0]).toMatchObject({ lane: 'adam.reflex.1', thread: 'adam#t-1', kind: 'action', notify_main: false, refs: { which: ['gives_credential'], to: 'eve', tool: 'reply_agent' } })
+  expect(led.length).toBe(1); expect(led[0]).toMatchObject({ lane: 'adam.reflex.1', thread: 'adam#t-1', kind: 'action', refs: { which: ['gives_credential'], to: 'eve', tool: 'reply_agent' } })
 })
 
 test('K2: refuse once: the next send of that sender to that peer goes out as written, then the check starts again; other senders and other peers are separate', async () => {

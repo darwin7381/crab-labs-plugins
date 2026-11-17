@@ -51,7 +51,8 @@ test('D3: a running lane told to close reports where it is within the grace; the
   expect(closeRows(d.lane!).length).toBe(0)                                             // not yet: the run is still in its grace
   expect(await until(() => closeRows(d.lane!).length === 1)).toBe(true)
   const c = closeRows(d.lane!)[0]
-  expect(c.notify_main).toBe(true); expect(c.refs).toMatchObject({ was_running: true, stopped: null, reported: 1 })
+  expect(c.refs).toMatchObject({ was_running: true, stopped: null, reported: 1 })
+  expect(L.__events().get('mesh-c1')!.lane_closed).toMatchObject({ run: c.refs.run, reported: 1, stopped: null })   // PL1: the main reads the close on the event's M3 record
   expect(c.text).toContain('它自己收尾結束了'); expect(c.text).toMatch(/notify_joey：WO-227 進度 \d+\/20 頁/)
   const exit = rows('lanes.jsonl').find(r => r.kind === 'exit' && r.lane === d.lane)!
   expect(exit.signal).toBeNull(); expect(exit.exit_code).toBe(0)

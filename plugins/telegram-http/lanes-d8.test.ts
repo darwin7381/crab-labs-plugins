@@ -67,7 +67,7 @@ test('D8: at 80% of the thread budget the run is told to hand over (system notic
   expect(w.map(r => r.which)).toEqual(['budget'])
   expect(seen()).toContain('"kind":"system"'); expect(seen()).toContain('預算快用完了'); expect(seen()).toContain('handoff_main')
   const s = stops('mesh-b1')[0]
-  expect(s.refs.capped).toBe('budget'); expect(s.notify_main).toBe(true)
+  expect(s.refs.capped).toBe('budget'); expect((L.__events().get('mesh-b1')!.obligations as any[]).some(o => o.kind === 'main')).toBe(true)   // PL1: the stop reaches the main as its M3 hand-over
   expect(s.refs.partial).toContain('最後的工具結果：'); expect(s.refs.partial).toMatch(/page \d+: 5xx=\d+/)   // not only 「還沒有文字結果；用過 Bash」
 })
 

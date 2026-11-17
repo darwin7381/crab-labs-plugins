@@ -49,7 +49,7 @@ const report = { happened: 'Eve（mesh-50008）要 mock-api 10 月可用率放�
   promised: '對 Eve：算出來後附算法與來源回覆；沒有時限', needs_main: '決定誰算、用哪個來源、期限' }
 const reportRec = (rep: any, o: Partial<LedgerRec> = {}) => L({ kind: 'receipt', text: 'run -: done — x', refs: { report: rep }, ...o })
 
-test('lane receipt tool: four fields feed the digest (notify_main), a bare summary receipt stays ledger-only as before; run_id optional', async () => {
+test('lane receipt tool: four fields feed the digest (the event record), a bare summary receipt stays ledger-only as before; run_id optional', async () => {
   reset([])
   const st = __lanesState()
   st.lanes['adam.reflex.9'] = { id: 'adam.reflex.9', kind: 'reflex', n: 9, session_id: 's', thread: 'adam#t-r9', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
@@ -59,10 +59,11 @@ test('lane receipt tool: four fields feed the digest (notify_main), a bare summa
   expect(out).toContain('receipt recorded')
   await callLaneTool(tok, 'receipt', { outcome: 'nothing-to-do', summary: 'hourly-backup-check: 無變化' })
   const rows = readFileSync(join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
-  expect(rows[0]).toMatchObject({ kind: 'receipt', notify_main: true, refs: { report } })
+  expect(rows[0]).toMatchObject({ kind: 'receipt', refs: { report } })
+  expect(String(__events().get('ev-9')!.did)).toContain(report.happened.slice(0, 20))                // PL1: the report feeds the digest through the event's M3 record
   expect(rows[0].text).toBe(`run -: done — ${report.happened}`)
-  expect(rows[1]).toMatchObject({ kind: 'commitment', notify_main: false, refs: { who: '未指明', what: report.promised, from: 'receipt.promised' } })   // 002c: the receipt's promise gets its own kind
-  expect(rows[2]).toMatchObject({ kind: 'receipt', notify_main: false, refs: null, text: 'run -: nothing-to-do — hourly-backup-check: 無變化' })
+  expect(rows[1]).toMatchObject({ kind: 'commitment', refs: { who: '未指明', what: report.promised, from: 'receipt.promised' } })   // 002c: the receipt's promise gets its own kind
+  expect(rows[2]).toMatchObject({ kind: 'receipt', refs: null, text: 'run -: nothing-to-do — hourly-backup-check: 無變化' })
   const t = __digest()!                                                              // the digest is M3's record of the event: its line says what the lane reported
   expect(t.text).toContain(report.happened.slice(0, 40))                            // lane report → digest, end to end
   expect(t.fields.items).toBe(1)

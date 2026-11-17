@@ -21,7 +21,9 @@ function thread(): { id: string; lane: string; run: (ev: string, followup: boole
   const lane = `adam.reflex.${n}`, id = `adam#t-c6${n}`
   st.lanes[lane] = { id: lane, kind: 'reflex', n, session_id: 's', thread: id, status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   st.threads[id] = { id, lane, peer: null, hops: 0, tokens: 0, created: '', last: '' } as any
-  return { id, lane, run: (ev, followup) => ({ runId: `${lane}.r1`, lane, evId: ev, closers: [], critical: false, trigger: 'scheduled', cls: 'scheduled', escalated: false, pushed: false, followup }) }
+  // every run's event has its M3 record (the router opens it); this stands in for the router
+  const rec = (ev: string) => { if (!L.__events().get(ev)) L.__events().open(ev, { class: 'scheduled', owner: lane, lane, thread: id, obligations: [] }); return ev }
+  return { id, lane, run: (ev, followup) => ({ runId: `${lane}.r1`, lane, evId: rec(ev), closers: [], critical: false, trigger: 'scheduled', cls: 'scheduled', escalated: false, pushed: false, followup }) }
 }
 /** fire the pending follow-up of a thread as the router would: it becomes event ev-fu-<k> */
 function fire(thr: string, k: string): string {
@@ -57,7 +59,8 @@ test('C6: the chain cap: the ordinary run and four follow-up runs; the fifth fol
   expect(Object.values(st.followups).filter(f => f.thread === t.id).length).toBe(4)       // five runs in all (1 + 4), never a sixth
   const e = ends(t.id)
   expect(e.length).toBe(1)
-  expect(e[0]).toMatchObject({ kind: 'fyi', notify_main: true, refs: { followup_chain_ended: 'cap', runs: 4, cap: 4 } })
+  expect(e[0]).toMatchObject({ kind: 'fyi', refs: { followup_chain_ended: 'cap', runs: 4, cap: 4 } })
+  expect(L.__events().get(tok.evId)).toMatchObject({ chain_end: 'cap', chain_runs: 4 })          // PL1: the main reads it on the event's M3 record
   expect(e[0].text).toContain('到上限')
   await L.callLaneTool(tok, 'followup', { after_minutes: 10, note: note(6) })              // asked again in the same run: refused again, no second line
   expect(ends(t.id).length).toBe(1)
@@ -94,7 +97,8 @@ test('C6: the no-change rule: a follow-up run that found what the run before fou
   expect(pending().length).toBe(0)
   expect(Object.values(st.followups).filter(f => f.thread === t.id).at(-1)).toMatchObject({ state: 'ended', ended: 'no-change' })
   const e = ends(t.id)
-  expect(e.length).toBe(1); expect(e[0].refs.followup_chain_ended).toBe('no-change'); expect(e[0]).toMatchObject({ kind: 'fyi', notify_main: true })
+  expect(e.length).toBe(1); expect(e[0].refs.followup_chain_ended).toBe('no-change'); expect(e[0]).toMatchObject({ kind: 'fyi' })
+  expect(L.__events().get(fu2.evId)).toMatchObject({ chain_end: 'no-change' })                    // PL1: on the event's M3 record
   // and nothing fires: the cancelled one is not due-able
   for (const f of Object.values(st.followups)) if (f.thread === t.id) f.due = Date.now() - 1
   expect(Object.values(st.followups).filter(f => f.thread === t.id && f.state === 'pending').length).toBe(0)

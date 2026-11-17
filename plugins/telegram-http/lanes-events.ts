@@ -39,12 +39,14 @@ export function createEvents(J: Journal) {
     return J.write('event', e.id, closed ? 'closed' : 'open', { obligations: obs, ...f })!
   }
   /** the router: one record per inbound event (an existing record is returned as it is: a retry is the same event) */
-  function open(id: string, f: { class: EvClass; owner: string; obligations: Array<Omit<Ob, 'id' | 'state'> & { state?: Ob['state'] }>; thread?: string | null; lane?: string | null; from?: string; text?: string }): Row {
+  /** the router: one record per inbound event (an existing record is returned as it is: a retry is the same event). `owner` is a lane, `main`, or
+   *  `router` (information nobody handles: no obligations, closed at once). `fields` are what the main must know about it (must_know, flags, ...). */
+  function open(id: string, f: { class: EvClass; owner: string; obligations: Array<Omit<Ob, 'id' | 'state'> & { state?: Ob['state'] }>; thread?: string | null; lane?: string | null; from?: string; text?: string; fields?: Record<string, unknown> }): Row {
     const was = get(id)
     if (was) return was
     const obs: Ob[] = f.obligations.map(o => ({ state: 'open', ...o, id: obId(o.kind) }) as Ob)
     for (const o of obs) if (o.kind === 'receipt' && o.run_id && receiptMet(o.run_id)) { o.state = 'met'; o.by = `already completed by ${receiptMet(o.run_id)!.id}` }
-    return write({ id }, obs, { class: f.class, owner: f.owner, outcome: 'normal', thread: f.thread ?? null, lane: f.lane ?? null, from: f.from ?? null, text: (f.text ?? '').slice(0, 300) })
+    return write({ id }, obs, { ...(f.fields ?? {}), class: f.class, owner: f.owner, outcome: 'normal', thread: f.thread ?? null, lane: f.lane ?? null, from: f.from ?? null, text: (f.text ?? '').slice(0, 300) })
   }
   /** what an event still owes from its lane (the stop hook's question, and the exit rule's) */
   function openObs(id: string): Ob[] { return obsOf(get(id)).filter(o => o.state === 'open' && o.kind !== 'main' && (o.owner ?? 'lane') === 'lane') }
@@ -116,8 +118,11 @@ export function createEvents(J: Journal) {
     write(e, [...obsOf(e), ob], f)
     return ob
   }
-  /** a field on the record (what the lane did, for the digest), no obligation changes */
-  function note(id: string, f: Record<string, unknown>): void { const e = get(id); if (e) write(e, obsOf(e), f) }
+  /** a field on the record (what the lane did, for the digest), no obligation changes. byMain: the main made this change itself, so it has seen the
+   *  record at this version (`main_seen`; the digest does not tell the main what it did) */
+  function note(id: string, f: Record<string, unknown>, byMain = false): void { const e = get(id); if (e) write(e, obsOf(e), { ...f, ...(byMain ? { main_seen: e.version + 1 } : {}) }) }
+  /** one more entry of a list field of the record (proposals, promised, main_sends) */
+  function push(id: string, key: string, item: unknown): void { const e = get(id); if (e) write(e, obsOf(e), { [key]: [...((e[key] as unknown[]) ?? []), item] }) }
   /** obligations past their due time, not met, not acted on yet. A ring is Joey's, not the lane's: handing the event to the main does not take it away. */
   function due(now: number): Array<{ e: Row; o: Ob }> {
     const out: Array<{ e: Row; o: Ob }> = []
@@ -128,6 +133,6 @@ export function createEvents(J: Journal) {
     }
     return out
   }
-  return { open, get, obsOf, openObs, openText, request, set, add, note, due, receiptMet,
+  return { open, get, obsOf, openObs, openText, request, set, add, note, push, due, receiptMet,
     rows: (pred: (r: Row) => boolean = () => true) => J.rows('event', pred) }
 }

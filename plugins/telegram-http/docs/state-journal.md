@@ -102,7 +102,10 @@ prompt whose Stop made it idle (a later event of that prompt re-opens the turn; 
 
 ### `event` (M3): one record per inbound event
 
-The router opens the record when it gives an event to a lane, or to the main.
+**Every inbound event has a record, whatever its route** (one helper in the router, `recordInbound`): one given to a lane (with what it owes),
+one given to the main (a hand-over owed to it), and one the router keeps to itself: a `no_reply` notice, a peer message held by a hold or a flood
+gate, an alert repeat, a message on a stopped thread. A hand-over never creates a record. What the main must know about an event is a field of its
+record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no state reads.
 
 | state | meaning |
 |---|---|
@@ -112,10 +115,26 @@ The router opens the record when it gives an event to a lane, or to the main.
 Fields:
 - `class`: `scheduled`, `followup`, `peer`, `joey`, `alert` or `critical`. The router writes it from the routing rule's trigger, or the follow-up
   scheduler does. No hook parses prompt text for it.
-- `owner`: the lane id, or `main`.
+- `owner`: the lane id, `main`, or `router`: information nobody handles (it has no obligations).
 - `outcome`: `normal`, `changed` or `failed`. It is the worst outcome any call reported (a structured field of `notify_joey`, `ask_joey` and `receipt`).
 - `tool`: the call that changed the record. `refused`: the reason, when that call was refused.
 - `thread`, `lane`, `from`, `text` (the first 300 characters).
+- What the main must know (all optional):
+  - `must_know: true`: a critical event, set when it opens (the digest's 【主線必須知道】 comes from this field);
+  - `flags` (`authority-claim`, `instructions-to-agent`, `thread-not-yours`), `claim` (the matched words of an authority claim), `screen_p`;
+  - `repeat_of` (the alert it repeats) and `repeat` (n) on an alert repeat, with `worse` (`old → new`) when the values got worse; the origin then
+    carries `repeats` and `worse` too;
+  - `gate` (`peer-flood`, `peer-hold`) and `episode` (the episode's first event) on a gated message; that first event carries `flood` or `hold`
+    (`peer`, `count`, … and `ended` when the episode is over);
+  - `answers`: the lane (or `main`) whose question a `no_reply` notice answers;
+  - `stop`: `{why: hop | budget | already-stopped, thread, note}` on an event the thread gate stopped;
+  - `chain_end` (`cap`, `no-change`) and `chain_runs`: its follow-up chain ended;
+  - `result`: a fork's (or the curator's) final text; `did`: what the lane reported;
+  - `lane_closed`: `{by, via, run, reported, stopped, last}` when its lane was closed while the run was running;
+  - `proposals`: `[{id, text, joey, at, lane, decision, decided_at, writer}]`, the memory proposals filed in a run of this event (the main's
+    `memory_decide`, or the curator, writes `decision`);
+  - `promised`: the commitments a lane recorded in a run of this event;
+  - `main_seen`: the version the main has seen because it made that change itself (a memory decision): the digest does not tell the main what it did.
 - `obligations`: `[{id, kind, level, state, by, owner, due_at, ...}]`, where `state` is `open`, `met` or `handed`.
 
 | kind | levels | met by |
@@ -200,16 +219,20 @@ What happens next:
 ## The digest and the activity list: one renderer over M3
 
 The digest is information that rides an M1 offer or pull. It is never offered alone.
-- One line per event record whose `version` is past what the digests showed: the `events` of every digest item that is `done`, `offered` or
+- One line per event record in the views whose `version` is past what the digests showed (and past its `main_seen`): the `events` of every digest item that is `done`, `offered` or
   `bound`, read from the journal (no file of its own). A digest item that goes back to `queued` shows nothing yet, so a turn that continues and
   then fails does not lose its digest's lines.
 - At most 8 lines, in this order: owed to the main (`需主線`), waiting on Joey's decision, the rest. The overflow is named on one line.
-- An open Joey memory proposal and an active peer hold are lines of every digest while they last.
+- An open Joey memory proposal (from the M3 records' `proposals`) and an active peer hold are lines of every digest while they last.
+- **The views** are every record whose owner is not `main`, except a record that rides on another: a gated message of an episode (its first
+  event carries the episode) and an alert repeat that got no run (its origin carries it). A fresh lane on an old thread gets the thread's lines
+  (`threadSummary`), and a closed lane's last lines come from its records too: nothing reads the ledger for them.
 - A line is `• MM-DD HH:MM｜<who handled it>｜<what happened>｜來自 <sender>｜<where each obligation stands>` (lanes.ts digestLine).
 
 **The activity list** (`ledger_query()` with no `kind` and no `text`) is the same renderer (lanes-digest.ts `renderEvents`) over the same lines, in the
-same order, for every event record changed in the window: the last 24 h, or since `since`. It has no line limit, and it is not affected by what the
-digests showed. The main's own events are in neither view. A filtered `ledger_query` still reads ledger.jsonl entries.
+same order, for every event record in the views changed in the window: the last 24 h, or since `since`. It has no line limit, and it is not
+affected by what the digests showed. The main's own events are in neither view. A filtered `ledger_query(kind=…, text=…)` searches ledger.jsonl:
+the audit log (its lines no longer carry `notify_main`).
 
 ## The main's hook
 

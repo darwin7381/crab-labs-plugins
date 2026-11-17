@@ -45,7 +45,10 @@ test('B12: the B08 burst of twelve repeats opens ONE lane; eleven "repeat n of <
   const led = rows('ledger.jsonl').filter(r => r.refs?.fingerprint)
   expect(led.length).toBe(11)
   expect(led.map(r => r.text.split('：')[0])).toEqual(Array.from({ length: 11 }, (_, i) => `repeat ${i + 1} of ${thread}`))
-  for (const r of led) { expect(r.notify_main).toBe(false); expect(r.thread).toBe(thread); expect(r.refs.fingerprint).toBe(L.alertFingerprint('alert-dispatcher', burst(1))) }
+  for (const r of led) { expect(r.thread).toBe(thread); expect(r.refs.fingerprint).toBe(L.alertFingerprint('alert-dispatcher', burst(1))) }
+  // PL1: each repeat has its M3 record, information riding on the alert it repeats (closed, nothing owed; its origin is not marked: not worse)
+  for (let n = 2; n <= 12; n++) expect(L.__events().get(`mesh-b${n}`)).toMatchObject({ repeat_of: 'mesh-b1', repeat: n - 1, owner: decisions[0].lane, obligations: [] })
+  expect(L.__events().get('mesh-b1')!.worse).toBeUndefined()
   expect(rows('routing.jsonl').filter(r => r.rule === 'alert-repeat').length).toBe(11)
   expect(await until(() => exits() >= 1)).toBe(true)
   await sleep(300)
@@ -55,7 +58,7 @@ test('B12: the B08 burst of twelve repeats opens ONE lane; eleven "repeat n of <
   const before = prompts().length
   const d13 = await L.routeEvent(alert('mesh-b13', burst(13)))
   expect(d13.rule).toBe('alert-repeat'); expect(d13.target).toBe('ledger'); expect(d13.lane).toBe(decisions[0].lane)
-  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13')!.notify_main).toBe(false)
+  expect(L.__events().get('mesh-b13')).toMatchObject({ repeat_of: 'mesh-b1', obligations: [] }); expect(L.__events().get('mesh-b13')!.worse).toBeUndefined()
   expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13')!.text).toContain('數字沒有比')
   // worse (p95 > 2s → > 3s) but the owner finished moments ago (the gap): no run yet; the main's digest has it
   const worse = '[P2][warning] mock-api p95 > 3s（第 13 次偵測）'
@@ -63,7 +66,9 @@ test('B12: the B08 burst of twelve repeats opens ONE lane; eleven "repeat n of <
   const dg = await L.routeEvent(alert('mesh-b13g', worse))
   expect(dg.target).toBe('ledger')
   const rg = rows('ledger.jsonl').find(r => r.event === 'mesh-b13g')!
-  expect(rg.notify_main).toBe(true); expect(rg.refs.worse).toBe('2 → 3')
+  expect(rg.refs.worse).toBe('2 → 3')
+  expect(L.__events().get('mesh-b13g')).toMatchObject({ repeat_of: 'mesh-b1', worse: '2 → 3' })          // PL1: the main must know: its origin's record says so
+  expect(L.__events().get('mesh-b1')).toMatchObject({ worse: '2 → 3' })
   await sleep(300)
   expect(prompts().length).toBe(before)
   // after the gap, a worse repeat makes the owner lane run again on its own thread, with the repeats parked before it
@@ -80,7 +85,7 @@ test('B12: the B08 burst of twelve repeats opens ONE lane; eleven "repeat n of <
   // the owner has now seen 3s: the same again is unchanged (for nobody), even with no gap
   const d14 = await L.routeEvent(alert('mesh-b13b', worse))
   expect(d14.target).toBe('ledger')
-  expect(rows('ledger.jsonl').find(r => r.event === 'mesh-b13b')!.notify_main).toBe(false)
+  expect(L.__events().get('mesh-b13b')).toMatchObject({ repeat_of: 'mesh-b1', obligations: [] }); expect(L.__events().get('mesh-b13b')!.worse).toBeUndefined()
   L.__setAlertRerunGap(300_000)
 })
 

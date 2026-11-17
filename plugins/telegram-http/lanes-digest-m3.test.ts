@@ -74,8 +74,9 @@ test('002k B15, 002m L6B5, inv F(2): at most 8 lines however many events changed
 })
 
 test('inv F(3): an open proposal from Joey is a line owed to the main in every digest until it is decided, and is never the line that is cut', () => {
-  writeFileSync(join(dir, 'ledger.jsonl'), JSON.stringify({ ts: new Date().toISOString(), lane: 'adam.worker.1', thread: 'adam#t-w', kind: 'memory_proposal', text: '記住：週報一律 09:00',
-    notify_main: true, refs: { proposal_id: 'mp-f3', joey: true } }) + '\n')
+  // PL1: a proposal lives on the M3 record of the event whose run filed it (the ledger line is only its audit)
+  const pe = event({ text: 'Joey：記住週報', obligations: [] })
+  E().push(pe, 'proposals', { id: 'mp-f3', text: '記住：週報一律 09:00', joey: true, at: new Date().toISOString(), lane: 'adam.worker.1' })
   for (let i = 0; i < 12; i++) event({ text: `事件 ${i}`, obligations: [] })
   const d = L.__digest()!
   const lines = content(d.text)
@@ -83,7 +84,7 @@ test('inv F(3): an open proposal from Joey is a line owed to the main in every d
   expect(lines.some(l => l.includes('記憶提案 mp-f3') && l.includes('需主線'))).toBe(true)
   done(d)
   expect(L.__digest()!.text).toContain('mp-f3')                                                     // still listed with nothing else new
-  writeFileSync(join(dir, 'ledger.jsonl'), '')
+  E().note(pe, { proposals: [{ id: 'mp-f3', text: '記住：週報一律 09:00', joey: true, at: new Date().toISOString(), lane: 'adam.worker.1', decision: 'veto' }] })
 })
 
 test('002e, inv F(4): no separator that can lie: what is the main\'s says 需主線 on its own line, the rest says what Joey already has; the summary gate\'s parser reads the items', () => {

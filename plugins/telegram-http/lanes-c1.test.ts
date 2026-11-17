@@ -50,7 +50,7 @@ test('C1: the main\'s send is an action line first, then a commitment (lane main
   const ai = all.findIndex(r => r.kind === 'action' && r.lane === 'main'), ci = all.findIndex(r => r.kind === 'commitment')
   expect(ai).toBeGreaterThanOrEqual(0); expect(ci).toBeGreaterThan(ai)                      // after the action line
   const c = commitments()[0]
-  expect(c).toMatchObject({ kind: 'commitment', lane: 'main', thread: 'adam#t-c1a', notify_main: false, refs: { auto: true, who: 'eve', from: 'main-send', thread_from: 'promise' } })
+  expect(c).toMatchObject({ kind: 'commitment', lane: 'main', thread: 'adam#t-c1a', refs: { auto: true, who: 'eve', from: 'main-send', thread_from: 'promise' } })
   expect(c.refs.p).toBeGreaterThanOrEqual(0.7); expect(c.refs.by).toContain('明天'); expect(c.text).toContain('答應 eve')
   expect(c1ob().state).toBe('open')                                            // 002k (C4): a send with no thread, no reply_to and no Jev match answers nothing in particular
   L.__events().set('ev-c1', c1ob().id, { state: 'met' })                                     // (the rest of this file is about commitments, not promises)

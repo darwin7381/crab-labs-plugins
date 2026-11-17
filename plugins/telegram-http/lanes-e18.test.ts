@@ -95,7 +95,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   expect(L.__journal().rows('run', r => r.event === 'tg-e18-2').length).toBe(0)              // no run record: it is not waiting for the run to end
   expect(L.lanesHealth().steering_pending).toBe(1)
   expect(steerRows('sent').length).toBe(1)
-  expect(steerRows('sent')[0]).toMatchObject({ lane: 'router', thread: 'adam#t-w1', event: 'tg-e18-2', notify_main: false, kind: 'action', refs: { steer: 'sent', run: 'adam.worker.1.r1', message_id: '2001' } })
+  expect(steerRows('sent')[0]).toMatchObject({ lane: 'router', thread: 'adam#t-w1', event: 'tg-e18-2', kind: 'action', refs: { steer: 'sent', run: 'adam.worker.1.r1', message_id: '2001' } })
   // the hook (the lane process, at its next tool boundary) hands it to the model
   expect(await until(() => hookOut().length >= 1)).toBe(true)
   const out = hookOut()[0]
@@ -106,7 +106,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   expect(out.out.hookSpecificOutput.additionalContext).toContain('Joey 本人')
   expect(await until(() => steerRows('delivered').length === 1)).toBe(true)                  // the daemon wrote the delivery
   const del = steerRows('delivered')[0]
-  expect(del).toMatchObject({ lane: LANE, thread: 'adam#t-w1', event: 'tg-e18-2', kind: 'action', notify_main: false, refs: { steer: 'delivered', run: 'adam.worker.1.r1', via: 'PostToolUse', tool: 'Bash', message_id: '2001' } })
+  expect(del).toMatchObject({ lane: LANE, thread: 'adam#t-w1', event: 'tg-e18-2', kind: 'action', refs: { steer: 'delivered', run: 'adam.worker.1.r1', via: 'PostToolUse', tool: 'Bash', message_id: '2001' } })
   expect(del.refs.wait_ms).toBeGreaterThanOrEqual(0); expect(del.refs.wait_ms).toBeLessThan(4000)
   expect(L.lanesHealth().steering_pending).toBe(0)
   expect(st.lanes[LANE].status).toBe('running')                                             // still the same run
@@ -137,7 +137,7 @@ test('E18: a message the run never reached a tool boundary for is not lost: it i
   expect(steerRows('delivered').length).toBe(deliveredBefore)
   const rq = steerRows('requeued')
   expect(rq.length).toBe(1)
-  expect(rq[0]).toMatchObject({ lane: LANE, event: 'tg-e18-4', kind: 'action', notify_main: false, refs: { steer: 'requeued', id: 'tg-e18-4', run: expect.stringMatching(/^adam\.worker\.1\.r\d+$/), as: 'tg-e18-4' } })
+  expect(rq[0]).toMatchObject({ lane: LANE, event: 'tg-e18-4', kind: 'action', refs: { steer: 'requeued', id: 'tg-e18-4', run: expect.stringMatching(/^adam\.worker\.1\.r\d+$/), as: 'tg-e18-4' } })
   expect(await until(() => prompts().length === np + 1)).toBe(true)                        // the lane process wrote the prompt it was started with
   expect(prompts().at(-1)).toContain('改成只看 5xx。')
   expect(await until(() => existsSync(f('started')))).toBe(true)

@@ -5,7 +5,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } fr
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
-import { openJoeyProposals, LEDGER_KINDS, type LedgerRec } from './lanes-digest.ts'
+import { LEDGER_KINDS } from './lanes-digest.ts'
 const L = await import('./lanes.ts?d1-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-d1-'))
@@ -30,6 +30,8 @@ function run(source: 'telegram' | 'mesh', from: string, trigger: string, kind: '
 const idOf = (out: string): string => /id (mp-[0-9a-f]+)/.exec(out)![1]
 const proposals = () => rows().filter(r => r.kind === 'memory_proposal')
 const decide = (a: object) => L.callMainTool('memory_decide', a, 'mcp-main')
+/** PL1: the open Joey proposals, from the M3 records (the ledger lines are only their audit) */
+const openJoey = (): string[] => L.__events().rows(r => Array.isArray(r.proposals)).flatMap(r => r.proposals).filter((p: any) => p.joey && !p.decision).map((p: any) => p.id)
 const RULE = 'Joey 在話題裡說：記住，mock 服務的例行排程一律 09:00，不要再改。'
 const git = (...args: string[]) => spawnSync('git', ['-C', mem, ...args], { encoding: 'utf8' }).stdout.trim()
 
@@ -43,7 +45,7 @@ test('D1: a memory proposal gets an id; refs.joey / source / from are set by the
   const e = run('mesh', 'eve', 'peer', 'reflex')
   const eo = await L.callLaneTool(e, 'ledger_write', { kind: 'memory_proposal', text: 'Eve 的稿件排程一律 10:00', refs: { joey: true } })    // a lane claiming joey: ignored
   expect(proposals().find(x => x.refs.proposal_id === idOf(eo))!.refs).toMatchObject({ joey: false, source: 'mesh', from: 'eve' })
-  expect(openJoeyProposals(rows() as LedgerRec[]).map(x => x.refs.proposal_id)).toEqual([pid])
+  expect(openJoey()).toEqual([pid])
   await L.callLaneTool(j, 'ledger_write', { kind: 'action', text: '查了 config' })                                                            // other kinds carry no id
   expect(rows().find(x => x.kind === 'action')!.refs.proposal_id).toBeUndefined()
 })
@@ -72,9 +74,9 @@ test('D1: accept writes the memory the normal way (file with frontmatter, MEMORY
   expect(readFileSync(join(mem, 'MEMORY.md'), 'utf8')).toContain(`- [${pid}](decision_${pid}.md) — `)
   expect(git('log', '-1', '--format=%an|%s')).toBe(`adam.main|memory: decision_${pid}.md`)
   const d = rows().find(r => r.kind === 'memory_decision')!
-  expect(d).toMatchObject({ lane: 'main', thread: j.lane.replace('adam.worker.', 'adam#t-d1'), notify_main: false, refs: { proposal_id: pid, decision: 'accept', writer: 'adam.main', file: `decision_${pid}.md`, joey: true } })
+  expect(d).toMatchObject({ lane: 'main', thread: j.lane.replace('adam.worker.', 'adam#t-d1'), refs: { proposal_id: pid, decision: 'accept', writer: 'adam.main', file: `decision_${pid}.md`, joey: true } })
   expect(d.text).toContain('採納')
-  expect(openJoeyProposals(rows() as LedgerRec[])).toEqual([])
+  expect(openJoey()).not.toContain(pid)
   expect(await decide({ proposal_id: pid, decision: 'veto', reason: 'again' })).toContain('already decided (accept)')       // one decision per proposal
 })
 
@@ -94,6 +96,9 @@ test('D1: rewrite writes the main\'s text instead; veto writes nothing and keeps
 
 test('D1: the digest lists every open Joey-sourced proposal again (no new activity needed) until a decision exists; it never wakes the main; a mesh proposal is not re-listed', async () => {
   writeFileSync(join(dir, 'ledger.jsonl'), '')
+  // PL1: proposals live on M3 records, not in the ledger file: the earlier tests' open ones are decided first (the clean start this test needs)
+  for (const r of L.__events().rows(x => Array.isArray(x.proposals))) for (const p of r.proposals) if (!p.decision) await decide({ proposal_id: p.id, decision: 'veto', reason: 'test reset' })
+  { const t0 = L.__digest(); if (t0) L.__journal().write('msg', `dg-d1-reset`, 'done', { kind: 'digest', events: t0.fields.events }) }
   const j = run('telegram', 'joey', 'joey')
   const pid = idOf(await L.callLaneTool(j, 'ledger_write', { kind: 'memory_proposal', text: RULE }))
   const e = run('mesh', 'eve', 'peer', 'reflex')
@@ -117,13 +122,13 @@ test('D1: while the curator holds the write right accept is refused and veto is 
   const cid = 'adam.curator.9'
   st.lanes[cid] = { id: cid, kind: 'curator', n: 9, session_id: 's', thread: 'adam#t-cur9', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   st.threads['adam#t-cur9'] = { id: 'adam#t-cur9', lane: cid, peer: null, hops: 0, tokens: 0, created: '', last: '' } as any
-  const lines = readFileSync(join(dir, 'ledger.jsonl'), 'utf8').split('\n').filter(Boolean).length
-  st.curator = { lane: cid, since: new Date().toISOString(), from_line: 0, from_line_end: lines } as any
+  st.curator = { lane: cid, since: new Date().toISOString(), given: [pid] } as any                         // PL1: the proposals it was given (M3 ids), not ledger line ranges
   const refused = await decide({ proposal_id: pid, decision: 'accept', reason: 'r' })
   expect(refused).toContain('curator lane adam.curator.9 holds the memory write right'); expect(existsSync(join(mem, `decision_${pid}.md`))).toBe(false)
   const ct = { runId: `${cid}.r1`, lane: cid, evId: 'ev-cur', closers: [], critical: false, trigger: 'curator', cls: 'curator', escalated: false, pushed: false } as any
   expect(await L.callLaneTool(ct, 'curator_done', { summary: '寫進 feedback_schedule.md' })).toContain('returned')
   const d = rows().find(r => r.kind === 'memory_decision')!
   expect(d).toMatchObject({ lane: cid, refs: { proposal_id: pid, decision: 'curated', writer: cid, joey: true } }); expect(d.refs.reason).toContain('feedback_schedule.md')
-  expect(openJoeyProposals(rows() as LedgerRec[])).toEqual([])
+  expect(openJoey()).not.toContain(pid)
+  expect(L.__events().get(j.evId)!.proposals.find((p: any) => p.id === pid)).toMatchObject({ decision: 'curated', writer: cid })   // PL1: its state is on the M3 record
 })
