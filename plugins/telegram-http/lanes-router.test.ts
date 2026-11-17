@@ -73,3 +73,29 @@ test('PL6: every route row is written by one function: routing.jsonl and lane.ro
   const key = (r: any) => `${r.event}|${r.rule}|${r.target}|${r.thread ?? ''}`
   expect(routes().map(key).sort()).toEqual(rows.map(key).sort())                                       // the mirror IS the record
 })
+
+// 002p (A05, FXL's live smoke): Eve's e2/e3 quote her OWN e1 (reply_to = e1's btcc id). The router read only the ids of messages WE sent, so each opened a
+// new reflex lane (three lanes, three answers to one question). A message that quotes the peer's own earlier message belongs to the conversation that
+// message went into: its origin event's thread and that thread's owner; queued behind the running run, the two follow-ups are its next run together.
+test('002p A05: follow-ups that quote the peer\'s own message go to its origin event\'s thread and lane (one owner); another peer quoting it does not', async () => {
+  const e1 = mk('eve', 'mock-api 的 /v2/notifications 今天會不會維護？', { btcc_msg_id: '91001' })
+  const d1 = await L.routeEvent(e1)
+  expect(d1).toMatchObject({ rule: 'mesh-peer-new', target: 'lane' })
+  const th = L.__lanesState().lanes[d1.lane!].thread
+  expect(await until(() => !!L.__runTok(d1.lane!))).toBe(true)                               // e1's run is in progress
+  const e2 = mk('eve', '補充：我 14:00 要用。', { btcc_msg_id: '91002', reply_to_id: '91001' })
+  const e3 = mk('eve', '能不能延到 15:00 之後？', { btcc_msg_id: '91003', reply_to_id: '91001' })
+  const d2 = await L.routeEvent(e2), d3 = await L.routeEvent(e3)
+  for (const [d, e] of [[d2, e2], [d3, e3]] as const) {
+    expect(d).toMatchObject({ rule: 'mesh-thread', target: 'lane', lane: d1.lane })
+    expect(routing().find(r => r.event === e.id)).toMatchObject({ rule: 'mesh-thread', lane: d1.lane, thread: th })
+    expect(L.__events().get(e.id)).toMatchObject({ owner: d1.lane, thread: th, class: 'peer' })
+  }
+  const c = await L.routeEvent(mk('cain', '我也想知道', { btcc_msg_id: '91004', reply_to_id: '91001' }))
+  expect(c.rule).toBe('mesh-peer-new'); expect(c.lane).not.toBe(d1.lane)                    // only the thread's peer speaks in it
+  writeFileSync(GO, 'ok'); await until(() => L.__runTok(d1.lane!)?.evId === e2.id)           // e1's run ends; the follow-ups are the lane's next run, together
+  expect(L.__runTok(d1.lane!)?.evId).toBe(e2.id)
+  expect(routing().find(r => r.event === e3.id && r.rule === 'coalesced')).toMatchObject({ into: e2.id, lane: d1.lane, thread: th })
+  writeFileSync(GO, 'ok'); await until(() => !L.__runTok(d1.lane!))
+  writeFileSync(GO, 'ok'); await until(() => !L.__runTok(c.lane!))
+}, 30_000)

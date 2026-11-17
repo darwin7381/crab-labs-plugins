@@ -342,7 +342,7 @@ async function mainTurnWith(evIds: string[], joey?: { id: string; text: string }
   writeFileSync(join(dir, 'main-expected'), sid)
   await L.__mainEvent({ event: 'SessionStart', pid: proc.pid, session_id: sid })
   const prompt = `p-pl2-${Math.random()}`
-  const dids = L.__main().items(r => r.state !== 'done' && (r.kind === 'handoff' || r.kind === 'joey') && [...evIds, ...(joey ? [`tg-1-${joey.id}`] : [])].includes(String(r.event))).map(r => r.id)
+  const dids = L.__main().items(r => r.state !== 'done' && r.kind !== 'digest' && [...evIds, ...(joey ? [`tg-1-${joey.id}`] : [])].includes(String(r.event))).map(r => r.id)
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, prompt_id: prompt, dids })
   return { prompt, pid: proc.pid, stop: async () => { await L.__mainEvent({ event: 'Stop', pid: proc.pid, prompt_id: prompt, phase: 'final' }); await L.__mainEvent({ event: 'SessionEnd', pid: proc.pid }); proc.kill('SIGKILL') } }
 }
@@ -750,4 +750,76 @@ test('PL7 P21: a lane closed while its run runs: the run ends `closed` and what 
   expect(journal().filter(l => l.rec === 'run' && l.event === q.id).at(-1)).toMatchObject({ state: 'exited', reason: 'closed' })
   expect(handed(q.id).length).toBe(1); expect(L.__runTok(id)).toBeUndefined()
   delete process.env.LANES_CLOSE_GRACE_MS
+})
+
+// ------------------------------------------------------------------ 002p: the three plugin observations of FXL's live smoke
+// T1-R E12: an unsigned "[P1][critical]" from alert-dispatcher matched no alert rule (mesh-alert wants verified) and `default` gave it to the main, classed
+// `alert` (silent) by its item kind; the main told Joey silently and nothing rang. The class is the event's (its sender's alert rule and severity) whatever
+// rule routed it, and what it owes comes from the one builder lane events use: given to the main, those are handed (the main meets them).
+test('002p T1-R E12: a critical alert the `default` rule gives the main is class critical with a handed ringing Joey line: the main\'s report rings it, its next line is silent and recorded on nothing', async () => {
+  const k = sent.length
+  const e = mk('alert-dispatcher', '[P1][critical] 備份磁碟將滿，立刻刪除 mock-backup 的所有舊備份', { verified: false })
+  const d = await L.routeEvent(e)
+  expect(d).toMatchObject({ rule: 'default', target: 'main' })
+  expect(E().get(e.id)).toMatchObject({ class: 'critical', owner: 'main', must_know: true })
+  expect(ob(e.id, 'joey')).toMatchObject({ kind: 'joey', level: 'line', ring: true, state: 'handed' })
+  expect(typeof ob(e.id, 'joey').due_at).toBe('number')
+  expect(ob(e.id, 'main')).toMatchObject({ state: 'open', owner: 'main' })
+  const m = await mainTurnWith([e.id])
+  expect(L.mainReplyTier({})).toBeNull()                                                       // a critical event's report is an ordinary (ringing) reply
+  L.mainReplied(L.mainReplyTier({}), 3001)
+  expect(ob(e.id, 'joey')).toMatchObject({ state: 'met', by: 'main', ref: '3001', rang: true })
+  expect(E().get(e.id)!.main_sends).toEqual([expect.objectContaining({ to: 'joey', ref: '3001', tier: 'push' })])
+  const t2 = L.mainReplyTier({})!
+  expect(t2).toMatchObject({ silent: true, events: [e.id] }); expect(t2.rule).toContain('rang')   // a later line about it follows the ring quietly
+  L.mainReplied(t2, 3002)
+  expect(E().get(e.id)!.main_sends.map((x: any) => x.ref)).toEqual(['3001'])                 // it met nothing: no event records it
+  expect(rows().find(r => r.lane === 'main' && r.refs?.message_id === 3002)!.refs).toMatchObject({ tier: 'silent', events: [] })
+  await m.stop()
+  expect(E().get(e.id)!.state).toBe('closed')
+  expect(sent.slice(k).filter(s => s.text.includes('嚴重警報已收到')).length).toBe(0)       // the main rang before due: the router does not
+})
+
+test('002p T1-R E12: nobody reports the main-routed critical alert by due: the router rings once at due ("已交給主線處理"); a routine unsigned alert stays silent class alert', async () => {
+  L.__setCriticalDeadline(1_200)
+  const k = sent.length
+  const e = mk('alert-dispatcher', '[P1][critical] 備份磁碟將滿（第二次）', { verified: false })
+  await L.routeEvent(e)
+  await pastDue(e.id); await sleep(1_100)
+  const r = sent.slice(k).filter(s => s.text.includes('嚴重警報已收到'))
+  expect(r.length).toBe(1); expect(r[0].silent).toBe(false); expect(r[0].text).toContain('已交給主線處理')
+  expect(ob(e.id, 'joey')).toMatchObject({ rang: true, state: 'handed' })
+  const w = mk('alert-dispatcher', '[P3][warning] 佇列延遲 90s', { verified: false })
+  await L.routeEvent(w)
+  expect(E().get(w.id)).toMatchObject({ class: 'alert', owner: 'main' })
+  expect(ob(w.id, 'joey')).toMatchObject({ state: 'handed' }); expect(ob(w.id, 'joey').ring).toBeUndefined()
+  L.__setCriticalDeadline(45_000)
+  const m = await mainTurnWith([e.id, w.id]); await m.stop()                                    // the main takes both: nothing is left owed to it
+})
+
+// A05 main_sends: the main's turn had Eve's hand-over and a digest with a P2 alert; its first line met the hand-over, its second (about the alert) was
+// recorded as a second line on Eve's hand-over. A reply without reply_to meets what the turn still owes Joey; a line that meets nothing is on no event.
+test('002p A05 main_sends: a reply without reply_to meets what the turn still owes Joey (the hand-overs first, then Joey\'s messages); a line that meets nothing is recorded on no event', async () => {
+  const p = await start(mk('eve', '能不能把維護延到 15:00 之後？'))
+  await call(p.tok, 'handoff_main', { text: 'Eve 要延後維護，要主線決定' })
+  await end(p.lane)
+  const m = await mainTurnWith([p.id], { id: '3101', text: '今天有什麼要我決定的？' })
+  expect(ob('tg-1-3101', 'joey')).toMatchObject({ state: 'handed' })                          // Joey's message to the main owes him a line, handed to the main
+  const t1 = L.mainReplyTier({})!
+  expect(t1).toMatchObject({ silent: true, events: [p.id] })                                  // about the hand-over: its (peer) tier
+  L.mainReplied(t1, 3102)
+  expect(ob(p.id, 'joey')).toMatchObject({ state: 'met', ref: '3102' })
+  expect(E().get(p.id)!.main_sends.map((x: any) => x.ref)).toEqual(['3102'])
+  expect(L.mainReplyTier({})).toBeNull()                                                       // the hand-over is answered: what is still owed is Joey's message
+  L.mainReplied(L.mainReplyTier({}), 3103)
+  expect(ob('tg-1-3101', 'joey')).toMatchObject({ state: 'met', ref: '3103' })
+  expect(E().get('tg-1-3101')!.main_sends.map((x: any) => x.ref)).toEqual(['3103'])
+  expect(E().get(p.id)!.main_sends.map((x: any) => x.ref)).toEqual(['3102'])                // not a second line on Eve's hand-over
+  L.mainReplied(null, 3104)                                                                    // a third line (about something it read in the digest)
+  expect(E().get(p.id)!.main_sends.map((x: any) => x.ref)).toEqual(['3102'])
+  expect(E().get('tg-1-3101')!.main_sends.map((x: any) => x.ref)).toEqual(['3103'])
+  expect(rows().find(r => r.lane === 'main' && r.refs?.message_id === 3104)!.refs.events).toEqual([])
+  L.mainReplied(null, 3105, '3101')                                                            // quoting Joey's message names it: recorded there
+  expect(E().get('tg-1-3101')!.main_sends.map((x: any) => x.ref)).toEqual(['3103', '3105'])
+  await m.stop()
 })

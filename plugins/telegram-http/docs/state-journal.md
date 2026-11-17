@@ -118,7 +118,8 @@ prompt whose Stop made it idle (a later event of that prompt re-opens the turn; 
 ### `event` (M3): one record per inbound event
 
 **Every inbound event has a record, whatever its route** (one helper in the router, `recordInbound`): one given to a lane (with what it owes),
-one given to the main (a hand-over owed to it), and one the router keeps to itself: a `no_reply` notice, a peer message held by a hold or a flood
+one given to the main (a hand-over owed to it, plus what its class owes, already `handed`: the same obligations a lane's event opens with, from one
+builder; 002p), and one the router keeps to itself: a `no_reply` notice, a peer message held by a hold or a flood
 gate, an alert repeat, a message on a stopped thread. A hand-over never creates a record. What the main must know about an event is a field of its
 record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no state reads.
 
@@ -165,7 +166,9 @@ Fields:
   - `dropped`: the event's thread was stopped before it ran (`by` says why); `merged`: another run handled it (`into`).
 - `refused`, `refused_kind`: the reason and the kind of a refused request (every refusal is a journal line).
 - `main_sends`: `[{to, ref, at, tier | delivered, prompt}]`: the main's Telegram replies (`to: joey`) and send_to_agent calls made in a turn this
-  event's item was bound to.
+  event's item was bound to that met (or rang) an obligation of this event, or that quote its message. A line that meets nothing is on no event (002p).
+- `class`: the event's own class, whatever rule routed it (002p): an alert sender's event has its alert rule's class and severity (`critical` for a
+  `[P1][critical]`) even when a rule without a class of its own (`default`, the master switch) gave it to the main.
 
 | kind | levels | met by |
 |---|---|---|
@@ -180,10 +183,11 @@ The one rule: a lane's outbound call asks to meet an obligation of its event.
 - **One hand-over transition** (`events.handOver`, used by handoff_main, the exit rule and the thread stop alike): one `main` obligation opens and
   every lane obligation still owed (`joey`, `peer`, `receipt`) moves to `handed`. An event already handed keeps its hand-over (no second item).
 - **The main's replies and sends** are requests against the events whose items are bound to its running turn (M1: prompt → items → events). A
-  reply's events are the quoted message's event when it quotes an item of the turn (`reply_to` = its message id), else the turn's events other than
-  Joey's own messages (the hand-overs it reports on), else Joey's messages. It meets their Joey line (handed or still owed), rings a ring nobody
-  rang, and each records the send. A delivered send_to_agent meets the answers they owe that agent. Nothing is matched by a parameter: the reply
-  tool has no `handoff_id`. The tier comes from the same events: a reply that quotes a message or answers Joey's own message is ordinary;
+  reply's events are the quoted message's event when it quotes an item of the turn (`reply_to` = its message id), else what the turn still owes
+  Joey (a Joey line handed or open, or a ring nobody rang): the hand-overs first, else Joey's own messages. It meets their Joey line, rings a ring
+  nobody rang, and each records the send; a reply that meets nothing records on no event (002p, A05: the main's second line, about an alert it read in
+  the digest, was a second line on Eve's hand-over). The tier comes from the events it meets, else from the turn's hand-overs, else Joey's messages. A delivered send_to_agent meets the answers they owe that agent. Nothing is matched by a parameter: the reply
+  tool has no `handoff_id`. The tier: a reply that quotes a message or answers Joey's own message is ordinary;
   otherwise silent when every event's class is silent (a push class whose ring already rang is silent).
 
 **The scheduler receipt.** A lane has two ways to complete scheduler run N: the receipt tool, and the scheduler card's CLI
@@ -264,6 +268,11 @@ fork, curate_memory, master-on/off, digest and registration rows. A row has `eve
 - `thread`: the owner's thread, i.e. the conversation the event belongs to after routing (the lane's thread, the thread a stop closed, the main's
   thread); `peer_thread`: the thread the sender supplied;
 - `followup` on a follow-up row (its `event` is the origin event), `into` on a coalesced row, `episode` on a gated row.
+
+The conversation a message belongs to (`thread_known`, rule `mesh-thread`): the thread it names, else the message it quotes (`reply_to`): one we sent
+(its owner's thread), or, since 002p (A05), one **the same peer** sent us earlier (the thread the router put that message in; its owner now). A
+peer's follow-up to its own question is therefore a run on its origin event's lane and thread; queued behind that lane's running run, follow-ups of
+the same peer are its next run together (`coalesced`). Another peer quoting it is a new conversation.
 
 ## The digest and the activity list: one renderer over M3
 

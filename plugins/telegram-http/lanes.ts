@@ -652,6 +652,14 @@ function threadOwnerFor(ev: InEvent): { owner: string; thread: string | null; vi
     const o = S.outbound[ev.reply_to_id]
     return { owner: o.owner, thread: o.thread, via: 'reply_to', cls: o.cls }
   }
+  // 002p (A05): a message that quotes the peer's OWN earlier message (Eve's e2/e3 reply_to e1) belongs to the conversation that message went into: its
+  // origin event's thread, owned by whoever owns that thread now. The router recorded where every peer message went (noteInbound); the same lookup files
+  // the main's quoting sends (peerThread). 002o read only our outbound ids, so each follow-up opened a new reflex lane (three lanes, three answers).
+  const inb = ev.reply_to_id ? S.inbound?.[ev.reply_to_id] : undefined
+  if (inb?.thread && inb.peer === String(ev.from ?? '').toLowerCase()) {
+    const t = S.threads[inb.thread]
+    if (t?.lane && (!t.peer || t.peer === inb.peer)) return { owner: t.lane, thread: t.id, via: 'reply_to-own', cls: t.ask_cls }
+  }
   return null
 }
 
@@ -792,8 +800,12 @@ function toMain(ev: InEvent, d: Decision): void {
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
     : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text), meta: { ...(p.meta ?? {}) } } }
   const kind: ItemKind = ev.source === 'telegram' ? 'joey' : routerCfg().alert_senders.includes(ev.from) ? 'alert' : 'peer'
-  // M3: an event the router gives the main owes the main (M4: that is what wakes it; M1 offers the item)
-  recordInbound(ev, { owner: 'main', class: kind === 'joey' ? 'joey' : kind === 'alert' ? 'alert' : 'peer', obligations: [{ kind: 'main', level: 'handed', owner: 'main' }] })
+  // M3: an event the router gives the main owes the main (M4: that is what wakes it; M1 offers the item). 002p (T1-R E12): its class comes from the one
+  // classifier (evClassOf over the event's trigger class) and what it owes from the one builder (eventObligations), exactly as a lane's event; given to the
+  // main, those are `handed` (the main meets them: its reply meets the Joey line and rings a critical one's ring, the due sweep rings it if nobody did)
+  ev.trigger ??= triggerClass(undefined, ev) || undefined
+  const cls = evClassOf(ev)
+  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...eventObligations(ev, cls).map(o => ({ ...o, state: 'handed' }))] })
   main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id })
 }
 /** server.ts: the router could not decide (it threw); the event still goes to the main, as the router's fallback does */
@@ -865,11 +877,20 @@ function stoppedQuiet(ev: InEvent, t: Thread | null, laneId: string | null): Dec
 
 /** Trigger class of an event under rule r (router.json `trigger`; `<trigger>-critical` / `<trigger>-info`
  *  when the rule's critical_regex / info_regex matches). Lanes opened by the main: worker / fork. */
-export function triggerClass(r: Rule, ev: InEvent): string {
-  const t = r.trigger ?? r.id
-  if (r.critical_regex && new RegExp(r.critical_regex, 'i').test(ev.text)) return `${t}-critical`
-  if (r.info_regex && new RegExp(r.info_regex, 'i').test(ev.text)) return `${t}-info`
+export function triggerClass(r: Rule | undefined, ev: InEvent): string {
+  // 002p (T1-R E12): the class is the event's, not the route's. An alert sender's event that a rule without a class of its own routed (unsigned, so
+  // `mesh-alert` did not match and `default` gave it to the main; the master switch) is still that sender's alert, with the severity its alert rule
+  // reads: a [P1][critical] owes Joey a ring wherever it went. 002o classed it by the item kind (`alert`, silent) and the main told Joey silently.
+  const k = r?.trigger ? r : alertRuleOf(ev.from) ?? r
+  const t = k?.trigger ?? k?.id ?? ''
+  if (k?.critical_regex && new RegExp(k.critical_regex, 'i').test(ev.text)) return `${t}-critical`
+  if (k?.info_regex && new RegExp(k.info_regex, 'i').test(ev.text)) return `${t}-info`
   return t
+}
+/** the rule that says what an alert sender's events are: the first rule for that sender with a class (`trigger`) of its own */
+function alertRuleOf(from: string): Rule | undefined {
+  const cfg = routerCfg()
+  return cfg.alert_senders.includes(from) ? cfg.rules.find(x => !!x.trigger && Array.isArray(x.match.from) && (x.match.from as string[]).includes(from)) : undefined
 }
 
 /** Spec v3, stricter option (design/notify.md 「分級由分流器依訊息類型決定，不靠各條線自己判斷」): the tier of a
@@ -2433,18 +2454,24 @@ function recordRoute(ev: InEvent, d: Decision): void {
   const lane = d.lane && S.lanes[d.lane] ? d.lane : null
   recordInbound(ev, { owner: d.target === 'main' ? 'main' : d.target === 'lane' && lane ? lane : 'router', lane, thread: d.thread ?? (lane ? S.lanes[lane].thread : ev.thread ?? null) })
 }
-/** the obligations an event opens with, from its class and the router's own fields (never from the prompt text) */
-function openLaneEvent(ev: InEvent, lane: Lane): void {
-  if (!events || events.get(ev.id)) return
-  const cls = evClassOf(ev, lane)
+/** the obligations an event opens with, from its class and the router's own fields (never from the prompt text), whoever gets it (a lane, or the main:
+ *  toMain hands them over): Joey a line (a critical event's line rings, due CRITICAL_DEADLINE_MS), the asking peer an answer, the scheduler run its receipt.
+ *  A task (a fan-out part, a curator, a synthesis) owes nobody a line. */
+function eventObligations(ev: InEvent, cls: EvClass, task = false): any[] {
   const obs: any[] = []
-  const task = !!ev.fanout || lane.kind === 'curator' || lane.kind === 'synthesis'     // a fan-out part reports to its synthesis, a curator to the main: policy, not Joey
   // PL5: the scheduler's run id and frequency travel as event meta (the /inject body's run_id and frequency): no text is parsed for them
   const hf = cls === 'scheduled' && String(ev.meta?.frequency ?? '').toLowerCase() === 'high'
   if (!task && !hf) obs.push({ kind: 'joey', level: 'line', ...(cls === 'critical' ? { ring: true, due_at: Date.now() + (S.wall ? 0 : CRITICAL_DEADLINE_MS) } : {}) })
   if (ev.source === 'mesh' && cls === 'peer' && !ev.no_reply && !ev.synthetic && ev.from && ev.from !== 'main') obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase() })
   const run = cls === 'scheduled' && ev.meta?.run_id ? String(ev.meta.run_id) : null
   if (run) obs.push({ kind: 'receipt', level: 'run', run_id: run })
+  return obs
+}
+function openLaneEvent(ev: InEvent, lane: Lane): void {
+  if (!events || events.get(ev.id)) return
+  const cls = evClassOf(ev, lane)
+  const task = !!ev.fanout || lane.kind === 'curator' || lane.kind === 'synthesis'     // a fan-out part reports to its synthesis, a curator to the main: policy, not Joey
+  const obs = eventObligations(ev, cls, task)
   // 002k (B2), PL1: a critical alert is marked for the main once, when its event opens: `must_know` is a field of its record (the digest renders the mark)
   events.open(ev.id, { class: cls, owner: lane.id, obligations: obs, thread: lane.thread, lane: lane.id, from: ev.from, text: ev.text,
     fields: { ...(cls === 'critical' ? { must_know: true } : {}), ...evFields(ev) } })
@@ -2523,30 +2550,39 @@ function mainTurn(): { prompt: string; items: Row[]; events: Row[] } | null {
   return { prompt: String(g.prompt_id), items, events: ids.map(id => events.get(id)).filter((e): e is Row => !!e) }
 }
 export type MainTier = { silent: boolean; rule: string; events: string[] }
-/** the events a reply of the main is a request against: the quoted message's event when it quotes an item of the turn (reply_to = its message id);
- *  otherwise the turn's events that are not Joey's own messages (the hand-overs it reports on), or Joey's messages when the turn has nothing else */
-function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof mainTurn>>; events: Row[]; quoted: boolean } | null {
+/** what a reply to Joey can still meet on an event: a Joey line nobody met (open, or handed to the main), or a ring nobody rang */
+const owesJoey = (e: Row): boolean => ((e.obligations ?? []) as Ob[]).some(o => o.kind === 'joey' && (o.state === 'open' || o.state === 'handed' || (!!o.ring && !o.rang)))
+/** the events a reply of the main is a request against, and the events whose class gives its tier (`about`).
+ *  - It quotes an item of the turn (reply_to = its message id): that item's event, named by the reply itself.
+ *  - Otherwise it meets what the turn still owes Joey (owesJoey): the hand-overs it reports on first, else Joey's own messages. 002p (A05 main_sends):
+ *    a line that meets nothing is a request against nothing: no event records it (002o linked every line of the turn to every hand-over of the turn, so
+ *    the main's second line, about a P2 alert it read in the digest, was a second line on Eve's hand-over). The binding is the obligation the send
+ *    meets, as for send_to_agent (mainSentInTurn: met only what is owed to its addressee).
+ *  - `about` (the tier): the turn's hand-overs, else Joey's messages, whether or not anything is still owed (a later line about them keeps their tier). */
+function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof mainTurn>>; events: Row[]; about: Row[]; quoted: boolean } | null {
   const t = mainTurn()
   if (!t) return null
   const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
   if (rt) {
     const it = t.items.find(r => String((r.notif?.params as any)?.meta?.message_id ?? '') === rt)
-    return { turn: t, events: it?.event ? t.events.filter(e => e.id === it.event) : [], quoted: true }
+    const evs = it?.event ? t.events.filter(e => e.id === it.event) : []
+    return { turn: t, events: evs, about: evs, quoted: true }
   }
   const joeyEv = new Set(t.items.filter(r => r.kind === 'joey').map(r => String(r.event)))
-  const others = t.events.filter(e => !joeyEv.has(e.id))
-  return { turn: t, events: others.length ? others : t.events, quoted: false }
+  const others = t.events.filter(e => !joeyEv.has(e.id)), joeys = t.events.filter(e => joeyEv.has(e.id))
+  const meets = [others.filter(owesJoey), joeys.filter(owesJoey)].find(a => a.length) ?? []
+  return { turn: t, events: meets, about: meets.length ? meets : others.length ? others : joeys, quoted: false }
 }
 /** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push): it quotes a message, or answers Joey's own message */
 export function mainReplyTier(a: { reply_to?: unknown }): MainTier | null {
   if (D?.role !== 'tg' || !S || !events) return null
   const x = replyTargets(a.reply_to)
-  if (!x || x.quoted || !x.events.length) return null
+  if (!x || x.quoted || !x.about.length) return null
   const joeyEv = new Set(x.turn.items.filter(r => r.kind === 'joey').map(r => String(r.event)))
-  if (x.events.some(e => joeyEv.has(e.id))) return null                            // it answers Joey's own message: ordinary
-  const tiers = x.events.map(e => { const cls = String(e.class ?? ''); const t = tierFor(cls, false); return t.tier === 'push' && rung(e) ? { tier: 'silent' as Tier, rule: `${t.rule}+rang` } : t })
+  if (x.about.some(e => joeyEv.has(e.id))) return null                             // it answers Joey's own message: ordinary
+  const tiers = x.about.map(e => { const cls = String(e.class ?? ''); const t = tierFor(cls, false); return t.tier === 'push' && rung(e) ? { tier: 'silent' as Tier, rule: `${t.rule}+rang` } : t })
   if (tiers.some(t => t.tier === 'push')) return null
-  return { silent: true, rule: `turn ${x.turn.prompt}: ${tiers[0].rule}`, events: x.events.map(e => e.id) }
+  return { silent: true, rule: `turn ${x.turn.prompt}: ${tiers[0].rule}`, events: x.about.map(e => e.id) }
 }
 /** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against its target events (replyTargets) */
 export function mainReplied(t: MainTier | null, messageId: number | null, replyTo?: unknown): void {
