@@ -19,7 +19,7 @@
  * Files live in <workspace>/.lanes/ (LANES_DIR): router.json, main.json, main-expected,
  * ledger.jsonl (append-only), routing.jsonl, lanes.jsonl (lane lifecycle + tokens), state.json
  * (lanes, threads, outbound/bot-message/topic maps), queue/ (leased lane events), focus.md
- * (main writes), digest.json, run/ (per-run MCP configs, stderr).
+ * (main writes), run/ (per-run MCP configs, stderr).
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
@@ -238,6 +238,7 @@ function mainEnv() {
     streamOpen: (pid: number): boolean => { const sid = sessionOfPid(pid); return !!sid && !!D.streamOpen?.(sid) },
     info: digestInfo,
     done: itemDone,
+    undone: itemUndone,
     tellJoey: (text: string, rule: string) => {
       ledger({ lane: 'router', kind: 'notify', notify_main: false, text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
       void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
@@ -2402,12 +2403,14 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
   return hid
 }
 /** M1 told us an item is done: the main obligation it carried is met */
+const metBy = (it: Row): string => `main (item ${it.id} done)`
+/** M1: an item reached done. What a digest showed needs nothing here: digestInfo reads it from the digest items themselves. */
 function itemDone(it: Row): void {
-  if (it.kind === 'digest' && it.events) {                                         // what the done digest showed: an event changed since then has a later version
-    const cur = readJson<{ seen?: Record<string, number> }>(digestPath(), {})
-    writeJsonAtomic(digestPath(), { seen: { ...(cur.seen ?? {}), ...it.events } })
-  }
-  if (it.event && events.get(it.event)) events.set(String(it.event), o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === it.id), { state: 'met', by: `main (item ${it.id} done)` })
+  if (it.event && events.get(it.event)) events.set(String(it.event), o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === it.id), { state: 'met', by: metBy(it) })
+}
+/** M1: an item left done (its turn went on after the Stop that closed it): the hand-over it met is open again */
+function itemUndone(it: Row): void {
+  if (it.event && events.get(it.event)) events.set(String(it.event), o => o.kind === 'main' && o.state === 'met' && o.by === metBy(it), { state: 'open', by: null })
 }
 // ------------------------------------------------------------------ 002l (D16): the main's report on a hand-over goes out at the event's tier
 // design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」. The router decides it for the main's reply (server.ts), from the record:
@@ -3769,15 +3772,15 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
 
 // ================================================================== digest (tg role)
 // The digest is information: it is never offered alone; M1 attaches it to whatever it offers or the main's hook pulls (lanes-main.ts). It shows each event
-// record whose version is past what a done digest showed (.lanes/digest.json `seen`) and past what a live (offered or bound) digest item shows (its `events`).
-const digestPath = () => join(LANES_DIR, 'digest.json')
+// record whose version is past what any digest item that reached the main shows: done, offered or bound (its `events`). The journal is the one record of
+// that; a digest item that goes back to queued (its turn failed) shows nothing yet.
 function readLedgerLines(): string[] {
   try { return readFileSync(ledgerPath(), 'utf8').split('\n').filter(Boolean) } catch { return [] }
 }
 function digestInfo(): { text: string; fields: Record<string, unknown> } | null {
-  const seen: Record<string, number> = readJson<{ seen?: Record<string, number> }>(digestPath(), {}).seen ?? {}
-  const live = main.items(r => r.kind === 'digest' && (r.state === 'offered' || r.state === 'bound'))
-  const shown: Record<string, number> = Object.assign({}, seen, ...live.map(r => r.events ?? {}))
+  const shown: Record<string, number> = {}
+  for (const r of main.items(r => r.kind === 'digest' && (r.state === 'done' || r.state === 'offered' || r.state === 'bound')))
+    for (const [id, v] of Object.entries((r.events ?? {}) as Record<string, number>)) shown[id] = Math.max(Number(shown[id]) || 0, Number(v) || 0)
   const changed = events.rows(e => e.owner !== 'main' && !!e.lane && e.version > (Number(shown[e.id]) || 0))
   const standing = standingLines()
   if (!changed.length && !standing.proposals.length) return null                  // a hold alone is not news: it rides with something that is

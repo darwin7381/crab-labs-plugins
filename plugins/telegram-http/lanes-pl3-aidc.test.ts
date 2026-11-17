@@ -28,7 +28,7 @@ const joey = (text: string) => ({ id: `tg-${Math.random()}`, source: 'telegram',
 const turnEnd = () => rec({ type: 'system', subtype: 'turn_duration', timestamp: new Date(Date.now() + 5).toISOString() })
 function reset(n: number[]): void {
   writeFileSync(join(dir, 'ledger.jsonl'), n.map(fyi).join(''))
-  rmSync(join(dir, 'digest.json'), { force: true }); writeFileSync(T, '')
+  writeFileSync(T, '')
 }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const io = (got: unknown[], idle = true) => ({ mainConnected: async () => true, mainIdle: async () => idle, deliver: async (c: string, m: Record<string, string>) => { got.push({ c, m }); return true } })

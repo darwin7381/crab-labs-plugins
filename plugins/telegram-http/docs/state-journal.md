@@ -44,6 +44,21 @@ No mechanism reads a transcript to learn a state.
 
 The one rule: an item is `done` only when its turn ends with `Stop`. `StopFailure`, an interrupted turn, or the end of the gen put it back to `queued`.
 
+**A turn ends at its last Stop.** Claude Code runs every Stop hook of the session in parallel, and the turn goes on, under the same `prompt_id`,
+when any one of them blocks (decision `block` or exit 2; the next Stop then has `stop_hook_active: true`). main-hook.py cannot see the others'
+answers: a main whose user settings carry their own Stop hook (the fleet's `check_tg_reply.py`) can have the Stop that main-hook.py let through
+(`phase: final`) blocked by that hook. So a Stop is the end of the turn only until the same prompt shows up again:
+- `Stop` (final): the turn's `bound` items become `done`, the gen goes `idle` with `stopped_prompt` = the prompt.
+- Any later hook event of the gen with that `prompt_id` (PreToolUse, PostToolUse, a Stop, a StopFailure): the turn was not over. The gen goes back
+  to `in_turn` on that prompt, and the items `done` at that Stop go back to `bound` with `reason: turn_continued` (what their `done` met, a
+  hand-over's `main` obligation, is `open` again). From there they follow the one rule: `done` at the turn's next final Stop, `queued` at a
+  StopFailure or at the end of the gen.
+- An event with any other prompt starts a new turn and clears `stopped_prompt`. No time window decides any of this: only the prompt id.
+- An item offered while the gen was idle between the Stop and the continuation (the gap) is not bound to the continued turn: it waits, `offered`,
+  for the prompt it opens (its own UserPromptSubmit binds it). Nothing new is offered into the continued turn: the gen is `in_turn`, so an item
+  that comes is pulled at its next tool boundary or Stop, like in any turn.
+- The turn's `reply` / `send_to_agent` calls (what the answered gate checks) are kept for the prompt across the continuation.
+
 How items move:
 - **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main, with the digest riding on it.
   An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
@@ -64,8 +79,8 @@ Fields:
   `meta.did = "<item id>,<digest id>"`.
 - `gen` and `prompt_id`, while `offered` or `bound`. `via_pull: true` means the item was pulled at a tool boundary or at `Stop`.
 - `reason`, when the item returns to `queued`: `stop_failure:<error>`, `gen_end`, `interrupted` (a new prompt came with no Stop), `session_start`
-  (the same process started a new session mid-turn).
-- `done` may carry `reason: asked_restart` (special case 1 below).
+  (the same process started a new session mid-turn). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).
+- `done` clears an earlier `reason`; it may carry `reason: asked_restart` (special case 1 below).
 - Digest items also have `events` and `items`:
   - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
   - `items`: how many entries the digest lists (event lines plus the standing lines: open Joey memory proposals and peer holds).
@@ -82,7 +97,8 @@ Fields:
 | `walled` | the account's model wall is up: `kind` is the StopFailure error (`rate_limit`, `server_error`, ...), or the kind of the lane wall |
 | `gone` | `end_reason`: `asked` (/restart, /kill_stuck), `killed` (`kill -0` failed), `exited` (SessionEnd), or `replaced` (another process took the role, or /main renew) |
 
-Other fields: `pid`, `session_id`, `transcript_path` (recorded, never read for state), `source`, `error`.
+Other fields: `pid`, `session_id`, `transcript_path` (recorded, never read for state), `source`, `error`, and `stopped_prompt` on an `idle` gen: the
+prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop").
 
 ### `event` (M3): one record per inbound event
 
@@ -184,8 +200,9 @@ What happens next:
 ## The digest and the activity list: one renderer over M3
 
 The digest is information that rides an M1 offer or pull. It is never offered alone.
-- One line per event record whose `version` is past what the digests showed: `.lanes/digest.json` `{seen: {<event id>: <version>}}`, merged from a
-  digest item's `events` when it reaches `done`, and the `events` of a digest item still `offered` or `bound`.
+- One line per event record whose `version` is past what the digests showed: the `events` of every digest item that is `done`, `offered` or
+  `bound`, read from the journal (no file of its own). A digest item that goes back to `queued` shows nothing yet, so a turn that continues and
+  then fails does not lose its digest's lines.
 - At most 8 lines, in this order: owed to the main (`需主線`), waiting on Joey's decision, the rest. The overflow is named on one line.
 - An open Joey memory proposal and an active peer hold are lines of every digest while they last.
 - A line is `• MM-DD HH:MM｜<who handled it>｜<what happened>｜來自 <sender>｜<where each obligation stands>` (lanes.ts digestLine).
@@ -220,7 +237,8 @@ The model aids keep their own registrations:
 - memory-commit-hook.py: PostToolUse on Write and Edit.
 
 Do not register main-answered-gate.py or main-memory-gate.py as hooks of their own. main-hook.py runs them at Stop, after it has asked the daemon
-to pull. That way a Stop that some aid holds is never counted as the end of the turn.
+to pull. That way a Stop that some aid holds is never counted as the end of the turn. A Stop hook the plugin does not own (the user's) can still
+block a Stop main-hook.py let through: the daemon re-opens that turn at its next event ("A turn ends at its last Stop").
 
 Environment the hook needs. The keeper already sets these for the main:
 - `TELEGRAM_HTTP_PORT`: the tg daemon's port.

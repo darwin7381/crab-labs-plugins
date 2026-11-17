@@ -334,6 +334,25 @@ test('the main-only rules: ledger_query before answering what happened (one line
   expect(notMainContext('adam', 'x')).not.toContain('ledger_query')
 })
 
+test('RBU2: a turn ends at its last Stop. After a Stop the gen is idle with stopped_prompt; a later event of that prompt (another Stop hook blocked it) puts it back in_turn; a new prompt is a new turn, nothing interrupted', async () => {
+  await drained()
+  const g = await startMain()
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p })
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(M().currentGen()).toMatchObject({ state: 'idle', stopped_prompt: p }); expect(M().currentGen()!.prompt_id).toBeUndefined()
+  await hook(g, 'Stop', { prompt_id: p, stop_hook_active: true })                          // continued with text only: its next Stop re-opens it
+  expect(M().currentGen()).toMatchObject({ state: 'in_turn', prompt_id: p }); expect(M().currentGen()!.stopped_prompt).toBeUndefined()
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(M().currentGen()).toMatchObject({ state: 'idle', stopped_prompt: p })
+  const p2 = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p2 })
+  expect(M().currentGen()).toMatchObject({ state: 'in_turn', prompt_id: p2 }); expect(M().currentGen()!.stopped_prompt).toBeUndefined()
+  expect(M().items(r => r.reason === 'interrupted' && r.gen === String(g.pid)).length).toBe(0)
+  expect(mainLines(g.pid).map(l => l.state)).toEqual(['idle', 'in_turn', 'idle', 'in_turn', 'idle', 'in_turn'])
+  await killed(g)
+})
+
 test('main-hook.py: one script for every event; with no daemon it holds nothing and prints nothing (and never reads the transcript)', async () => {
   const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-hook.py')
   for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop', 'StopFailure', 'SessionEnd']) {

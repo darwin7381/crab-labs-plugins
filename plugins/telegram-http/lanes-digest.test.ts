@@ -37,7 +37,6 @@ const escalatedPush = () => L({ lane: 'adam.reflex.5', thread: 'adam#t-04f200', 
   text: '[push] A-1103 mock-backup P1 回報（已升級主線，請主線轉 Joey 決定）' })
 function reset(lines: string[]): void {
   writeFileSync(join(dir, 'ledger.jsonl'), lines.length ? lines.join('\n') + '\n' : '')
-  rmSync(join(dir, 'digest.json'), { force: true })
   rmSync(join(dir, 'routing.jsonl'), { force: true })
 }
 

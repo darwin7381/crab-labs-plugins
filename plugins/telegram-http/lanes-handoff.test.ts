@@ -28,7 +28,6 @@ lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, ht
 const ledgerRows = (): any[] => { try { return readFileSync(join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
 function reset(mainConnected = true): void {
   writeFileSync(join(dir, 'ledger.jsonl'), '')
-  rmSync(join(dir, 'digest.json'), { force: true })
   const st = __lanesState()
   st.handoffs = {}; st.dedupe = {}; st.pushes = {}
   sent.length = 0

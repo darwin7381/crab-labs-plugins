@@ -6,7 +6,10 @@
  *     `kill -0` of its pid (SIGKILL fires no hook). Nothing reads the transcript.
  * M1. One record per item meant for the main: queued → offered(gen) → bound(gen, prompt_id) → done.
  *     The one rule: an item is done only when the turn it was bound to ends with Stop. StopFailure, or the end of its gen, puts it back
- *     to queued for the next idle gen. An idle main is offered one item (it opens the turn); a busy main is never pushed to: its hook
+ *     to queued for the next idle gen. A turn of a prompt ends at its LAST Stop: other Stop hooks (the user's, run in parallel with ours)
+ *     can block a Stop ours let through, and the turn goes on under the same prompt_id. So a Stop leaves the gen idle with `stopped_prompt`,
+ *     and any later hook event of that prompt in that gen re-opens the turn: M2 back to in_turn, the items done at that Stop back to bound
+ *     (reason turn_continued). They end at the turn's next Stop like any bound item. An idle main is offered one item (it opens the turn); a busy main is never pushed to: its hook
  *     pulls queued items at the next tool boundary (PostToolUse) or at Stop, and they are bound to that prompt at that moment.
  * One writer: the tg daemon. Information (the digest) is never offered alone: it rides the next offer or pull.
  */
@@ -30,6 +33,8 @@ export type MainEnv = {
   info: () => { text: string; fields: Record<string, unknown> } | null
   /** an item reached done */
   done: (item: Row) => void
+  /** an item left done: its turn went on after the Stop that closed it (whatever `done` set is undone) */
+  undone: (item: Row) => void
   /** a line to Joey from the router (push), with the rule that sent it */
   tellJoey: (text: string, rule: string) => void
   /** the shared model wall (one record for the lanes and the main) */
@@ -201,7 +206,7 @@ export function createMain(E: MainEnv) {
   }
   function finish(pred: (r: Row) => boolean, how: Record<string, unknown> = {}): Row[] {
     const rs = items(r => r.state === 'bound' && pred(r))
-    for (const r of rs) { J().write('msg', r.id, 'done', how); try { E.done(J().get('msg', r.id)!) } catch (e) { E.log('warn', `lanes: done hook ${r.id}: ${e}`) } }
+    for (const r of rs) { J().write('msg', r.id, 'done', { reason: null, ...how }); try { E.done(J().get('msg', r.id)!) } catch (e) { E.log('warn', `lanes: done hook ${r.id}: ${e}`) } }
     return rs
   }
 
@@ -213,7 +218,7 @@ export function createMain(E: MainEnv) {
     // SPECIAL CASE (kept, see RBP report): these items end done without a Stop because the owner decided a deliberate restart closes them.
     const cut = why === 'asked' && g.prompt_id ? finish(r => r.gen === g.id && r.prompt_id === g.prompt_id, { reason: 'asked_restart' }) : []
     const back = requeue(r => r.gen === g.id, 'gen_end')
-    setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null })
+    setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null, stopped_prompt: null })
     if (cur === g.id) cur = null
     pendingEnd.delete(g.id); lastEventAt.delete(g.id)
     if (stuck?.gen === g.id) stuck = null
@@ -223,12 +228,22 @@ export function createMain(E: MainEnv) {
   }
   function beginTurn(g: Row, prompt: string, dids?: string[]): void {
     if (g.prompt_id === prompt) return
+    if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
     if (g.prompt_id) requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted')       // a turn that never got Stop or StopFailure
-    setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null })
+    outputs.clear()                                                                                  // the answered gate looks at this prompt's calls only
+    setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
     const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
     // what the prompt names (its did="…"), and whatever was offered to this gen: one offer opens one turn, so it is this turn's
     const bind = items(r => (r.state === 'offered' && r.gen === g.id) || (ids.has(r.id) && r.state === 'queued' && forGen(r, g)))
     for (const r of bind) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt })
+  }
+  /** the prompt the gen last stopped is running again: a Stop hook other than ours blocked that Stop. The turn was not over: it re-opens, and
+   *  what that Stop closed is bound to it again. An item offered in the gap is not this turn's: it opens its own prompt (beginTurn). */
+  function continueTurn(g: Row, prompt: string): void {
+    setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
+    const back = items(r => r.state === 'done' && r.gen === g.id && r.prompt_id === prompt)
+    for (const r of back) { J().write('msg', r.id, 'bound', { reason: 'turn_continued' }); try { E.undone(J().get('msg', r.id)!) } catch (e) { E.log('warn', `lanes: undone hook ${r.id}: ${e}`) } }
+    E.log('info', `lanes: main gen ${g.id}: turn ${prompt} went on after its Stop (another Stop hook held it); ${back.length} item(s) bound again`)
   }
   const wallErrors = new Set(['rate_limit', 'authentication_failed', 'billing_error', 'oauth_org_not_allowed', 'account_on_hold', 'server_error', 'cloud_credential_error'])
 
@@ -266,8 +281,8 @@ export function createMain(E: MainEnv) {
             user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }), outputs: outputs.get(p) ?? [] }
         }
         finish(r => r.gen === g.id && r.prompt_id === p)
-        outputs.delete(p)
-        setMain(J().get('main', g.id)!, 'idle', { prompt_id: null, tool_open: null, error: null })
+        // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
+        setMain(J().get('main', g.id)!, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p })
         void pump()
         return {}
       }
@@ -277,7 +292,7 @@ export function createMain(E: MainEnv) {
         const back = requeue(r => r.gen === g.id && (!p || r.prompt_id === p), `stop_failure:${err}`)
         if (p) outputs.delete(p)
         // every API error ends the turn without Stop; a wall kind holds the main until the shared probe gets through
-        setMain(J().get('main', g.id)!, 'walled', { kind: wallErrors.has(err) ? err : 'error', error: err, prompt_id: null, tool_open: null })
+        setMain(J().get('main', g.id)!, 'walled', { kind: wallErrors.has(err) ? err : 'error', error: err, prompt_id: null, tool_open: null, stopped_prompt: null })
         E.wallUp(wallErrors.has(err) ? err : 'error', String(b.reason ?? err).slice(0, 200), `main:${back.length}`)
         return {}
       }
@@ -300,7 +315,7 @@ export function createMain(E: MainEnv) {
     const same = currentGen()
     if (same && same.state === 'in_turn' && same.prompt_id) requeue(r => r.gen === same.id && r.prompt_id === same.prompt_id, 'session_start')
     const id = String(pid)
-    J().write('main', id, E.wallActive() ? 'walled' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null })
+    J().write('main', id, E.wallActive() ? 'walled' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null })
     cur = id
     lastEventAt.set(id, Date.now())
     E.log('info', `lanes: main gen ${id} (session ${sid}, ${b.source ?? 'startup'})`)

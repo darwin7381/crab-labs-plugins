@@ -26,8 +26,10 @@ function event(o: { from?: string; text: string; obligations: any[]; cls?: any; 
   return id
 }
 const content = (text: string) => text.split('\n').slice(1, -1)                                  // without the header and the footnote
-const seen = (): Record<string, number> => { try { return JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).seen ?? {} } catch { return {} } }
-const done = (t: any) => writeFileSync(join(dir, 'digest.json'), JSON.stringify({ seen: { ...seen(), ...t.fields.events } }))   // as itemDone: merged
+// a digest that reached the main and ended done: a digest item in the journal (what digestInfo reads what was shown from)
+let dgN = 0
+const done = (t: any) => L.__journal().write('msg', `dg-test-${++dgN}`, 'done', { kind: 'digest', events: t.fields.events })
+const seen = (): Record<string, number> => { const o: Record<string, number> = {}; for (const r of L.__main().items(r => r.kind === 'digest' && r.state === 'done')) for (const [k, v] of Object.entries(r.events ?? {})) o[k] = Math.max(o[k] ?? 0, Number(v)); return o }
 
 test('one line per event, from its record: who handled it, what happened, where each obligation stands; the main\'s own events are not in it', () => {
   const a = event({ text: '下週維護幾點？', did: '回覆 Eve：週三 02:00', obligations: [{ kind: 'joey', level: 'line', state: 'met' }, { kind: 'peer', level: 'answer', to: 'eve', state: 'met' }] })

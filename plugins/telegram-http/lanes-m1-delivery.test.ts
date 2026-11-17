@@ -203,7 +203,7 @@ test('information never travels alone: a digest with nothing owed to the main is
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [o.params.meta.did] })
   expect(state(dg)).toBe('bound')
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
-  expect(state(dg)).toBe('done'); expect(JSON.parse(readFileSync(join(dir, 'digest.json'), 'utf8')).seen['ev-m1-9']).toBe(v)
+  expect(state(dg)).toBe('done')
   expect(L.__digest()).toBeNull()                                                       // nothing changed since the done digest
   await kill(g)
 })
@@ -224,6 +224,75 @@ test('inv A(3): a hand-over is an item: taken in and not finished (gen ended) le
   const p2 = P(); await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: [item.id] }); await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
   expect(state(item.id)).toBe('done'); expect(ob().state).toBe('met')
   await kill(g2)
+})
+
+// RBU2 (live u002o-T1-a-r1-20261117-215910): the user's own Stop hook (the fleet's check_tg_reply.py) runs in parallel with main-hook.py. Ours let the Stop
+// through (phase final: the items done, the gen idle) while that one blocked it, and the turn went on under the same prompt_id. A turn ends at its LAST Stop.
+const handover = (n: number, text: string) => {
+  const st = L.__lanesState(), id = `adam.reflex.${n}`
+  st.lanes[id] = { id, kind: 'reflex', n, session_id: 's', thread: `adam#t-h${n}`, status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
+  return L.callLaneTool({ runId: `${id}.r1`, lane: id, evId: `ev-h${n}`, closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any, 'handoff_main', { text })
+}
+test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the same prompt binds its item again (turn_continued); a StopFailure then queues it again, never done; the hand-over it met is open again', async () => {
+  const g = await startMain()
+  await handover(81, 'Eve 要主線確認週五的報告')
+  const ob = () => (L.__events().get('ev-h81')!.obligations as any[]).find(o => o.kind === 'main')
+  const id = M().items(r => r.kind === 'handoff' && r.handoff === ob().handoff)[0].id
+  expect(state(id)).toBe('offered')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  expect((await hook(g, 'Stop', { prompt_id: p })).block).toBeUndefined()                   // ours holds nothing
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(ob().state).toBe('met'); expect(M().mainPhase()).toBe('idle')
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply' })   // the other hook blocked: the turn goes on
+  expect(M().mainPhase()).toBe('in_turn'); expect(M().currentGen()!.prompt_id).toBe(p)
+  expect(linesOf('msg', id).at(-1)).toMatchObject({ state: 'bound', reason: 'turn_continued' })
+  expect(M().items(r => r.id === id)[0]).toMatchObject({ gen: String(g.pid), prompt_id: p })
+  expect(ob().state).toBe('open')                                                           // the hand-over is not met while its turn runs
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'server_error', reason: 'API Error: 529 overloaded' })
+  expect(state(id)).toBe('queued'); expect(linesOf('msg', id).at(-1)).toMatchObject({ reason: 'stop_failure:server_error' })
+  expect(ob().state).toBe('open')
+  expect(linesOf('msg', id).map(l => l.state)).toEqual(['queued', 'offered', 'bound', 'done', 'bound', 'queued'])
+  await L.__wallDown(); await sleep(20)
+  expect(state(id)).toBe('offered')
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(ob().state).toBe('met')
+  await kill(g)
+})
+
+test('another Stop hook blocks the turn: the continued turn ends done exactly once at its final Stop; nothing is offered into it (a message in it is pulled); an offer written in the gap is bound by its own UserPromptSubmit', async () => {
+  const g = await startMain()
+  const a = await joey('A：先查發票 4471')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [a] })
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply', tool_input: { text: '查好了：4471 已付' } })
+  await hook(g, 'Stop', { prompt_id: p }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(a)).toBe('done')
+  const k = offers.length
+  const b = await joey('B：在空檔裡送到')                                                    // the gen looks idle: offered (the gap)
+  expect(state(b)).toBe('offered'); expect(offers.length).toBe(k + 1)
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })                           // the turn of A goes on
+  expect(state(a)).toBe('bound'); expect(state(b)).toBe('offered')                          // B is not this turn's
+  const c = await joey('C：回合進行中送到')
+  expect(state(c)).toBe('queued'); expect(offers.length).toBe(k + 1)                        // nothing is offered into the continued turn
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
+  expect(M().items(r => r.id === c)[0]).toMatchObject({ state: 'bound', prompt_id: p, via_pull: true })
+  const chk = await hook(g, 'Stop', { prompt_id: p, stop_hook_active: true })
+  expect(chk.items!.map(i => i.body)).toEqual(['A：先查發票 4471', 'C：回合進行中送到'])
+  expect(chk.outputs!.map(o => o.text)).toEqual(['查好了：4471 已付'])                      // the turn's replies before the block still count for it
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(a)).toBe('done'); expect(state(c)).toBe('done'); expect(state(b)).toBe('offered')
+  const after = (id: string) => { const ls = linesOf('msg', id), i = ls.findIndex(l => l.reason === 'turn_continued'); return ls.slice(i).filter(l => l.state === 'done').length }
+  expect(after(a)).toBe(1)                                                                  // done exactly once after it was bound again
+  expect(linesOf('msg', c).filter(l => l.state === 'done').length).toBe(1)
+  expect(offers.length).toBe(k + 1)                                                         // B was offered once and only once
+  const p2 = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [b] })
+  expect(M().items(r => r.id === b)[0]).toMatchObject({ state: 'bound', prompt_id: p2 })
+  expect(state(a)).toBe('done')                                                             // a new prompt is a new turn: nothing of p moves
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(b)).toBe('done')
+  await kill(g)
 })
 
 test('a daemon restart folds the journal: a queued item is offered once, an item already offered is not offered again', async () => {
