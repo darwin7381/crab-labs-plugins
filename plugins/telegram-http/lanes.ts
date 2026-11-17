@@ -2510,8 +2510,8 @@ function itemUndone(it: Row): void {
 // yet, and each event records the send (`main_sends`, with main_seen: the digest does not repeat to the main what it did). A send_to_agent meets
 // the answers they owe that agent, on the delivery result. Nothing is matched by a parameter or by text.
 // The tier of such a reply (design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」): a reply that quotes a message, or a turn
-// that carries a Joey message, is ordinary (push); otherwise the turn's events decide: silent when every one of them is a silent-tier class (a push
-// class whose ring already rang is silent too), push otherwise. The notify profile still rules (default = everything rings).
+// that answers Joey's own message, is ordinary (push); a reply about the turn's hand-overs takes their tier: silent when every one of them is a
+// silent-tier class (a push class whose ring already rang is silent too), push otherwise. The notify profile still rules (default = everything rings).
 const ringOf = (e: Row | undefined): Ob | undefined => ((e?.obligations ?? []) as Ob[]).find(o => o.kind === 'joey' && o.ring)
 const rung = (e: Row | undefined): boolean => { const r = ringOf(e); return !!r && (!!r.rang || r.state === 'met') }
 /** the main's running turn: its prompt, its bound items and the events they carry (M1 + M2) */
@@ -2523,31 +2523,47 @@ function mainTurn(): { prompt: string; items: Row[]; events: Row[] } | null {
   return { prompt: String(g.prompt_id), items, events: ids.map(id => events.get(id)).filter((e): e is Row => !!e) }
 }
 export type MainTier = { silent: boolean; rule: string; events: string[] }
-/** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push) */
+/** the events a reply of the main is a request against: the quoted message's event when it quotes an item of the turn (reply_to = its message id);
+ *  otherwise the turn's events that are not Joey's own messages (the hand-overs it reports on), or Joey's messages when the turn has nothing else */
+function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof mainTurn>>; events: Row[]; quoted: boolean } | null {
+  const t = mainTurn()
+  if (!t) return null
+  const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
+  if (rt) {
+    const it = t.items.find(r => String((r.notif?.params as any)?.meta?.message_id ?? '') === rt)
+    return { turn: t, events: it?.event ? t.events.filter(e => e.id === it.event) : [], quoted: true }
+  }
+  const joeyEv = new Set(t.items.filter(r => r.kind === 'joey').map(r => String(r.event)))
+  const others = t.events.filter(e => !joeyEv.has(e.id))
+  return { turn: t, events: others.length ? others : t.events, quoted: false }
+}
+/** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push): it quotes a message, or answers Joey's own message */
 export function mainReplyTier(a: { reply_to?: unknown }): MainTier | null {
   if (D?.role !== 'tg' || !S || !events) return null
-  if (a.reply_to != null && String(a.reply_to) !== '') return null                  // quoting a message: an answer to Joey, ordinary
-  const t = mainTurn()
-  if (!t || !t.events.length || t.items.some(r => r.kind === 'joey')) return null
-  const tiers = t.events.map(e => { const cls = String(e.class ?? ''); const x = tierFor(cls, false); return x.tier === 'push' && rung(e) ? { tier: 'silent' as Tier, rule: `${x.rule}+rang` } : x })
-  if (tiers.some(x => x.tier === 'push')) return null
-  return { silent: true, rule: `turn ${t.prompt}: ${tiers[0].rule}`, events: t.events.map(e => e.id) }
+  const x = replyTargets(a.reply_to)
+  if (!x || x.quoted || !x.events.length) return null
+  const joeyEv = new Set(x.turn.items.filter(r => r.kind === 'joey').map(r => String(r.event)))
+  if (x.events.some(e => joeyEv.has(e.id))) return null                            // it answers Joey's own message: ordinary
+  const tiers = x.events.map(e => { const cls = String(e.class ?? ''); const t = tierFor(cls, false); return t.tier === 'push' && rung(e) ? { tier: 'silent' as Tier, rule: `${t.rule}+rang` } : t })
+  if (tiers.some(t => t.tier === 'push')) return null
+  return { silent: true, rule: `turn ${x.turn.prompt}: ${tiers[0].rule}`, events: x.events.map(e => e.id) }
 }
-/** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against the events of its turn */
-export function mainReplied(t: MainTier | null, messageId: number | null): void {
+/** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against its target events (replyTargets) */
+export function mainReplied(t: MainTier | null, messageId: number | null, replyTo?: unknown): void {
   if (D?.role !== 'tg' || !S || !events) return
-  const turn = mainTurn()
-  for (const e of turn?.events ?? []) {
+  const x = replyTargets(replyTo)
+  for (const e of x?.events ?? []) {
     if (messageId == null) continue
     for (const o of (e.obligations ?? []) as Ob[]) {
       if (o.kind === 'joey' && (o.state === 'open' || o.state === 'handed')) events.set(e.id, o.id, { state: 'met', by: 'main', ref: String(messageId), ...(o.ring && !o.rang && !t?.silent ? { rang: true } : {}) }, { tool: 'reply' })
       else if (o.kind === 'joey' && o.ring && !o.rang && !t?.silent) events.set(e.id, o.id, { rang: true, by: 'main' }, { tool: 'reply' })
     }
-    events.push(e.id, 'main_sends', { to: 'joey', ref: String(messageId), at: nowIso(), tier: t?.silent ? 'silent' : 'push', prompt: turn!.prompt }, true)
+    events.push(e.id, 'main_sends', { to: 'joey', ref: String(messageId), at: nowIso(), tier: t?.silent ? 'silent' : 'push', prompt: x!.turn.prompt }, true)
   }
-  ledger({ lane: 'main', kind: 'notify', text: `[${t?.silent ? 'silent' : 'push'}] 主線回覆 Joey（這一回合的事：${turn?.events.map(e => e.id).join(', ') || '-'}）${t ? '：分流器依那些事的類別靜音送出' : ''}`,
-    refs: { tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: turn?.events.map(e => e.id) ?? [], message_id: messageId } })
-  logos('lane.notify', { lane: 'main', tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: turn?.events.map(e => e.id) ?? [], message_id: messageId })
+  const ids = x?.events.map(e => e.id) ?? []
+  ledger({ lane: 'main', kind: 'notify', text: `[${t?.silent ? 'silent' : 'push'}] 主線回覆 Joey（${ids.join(', ') || '-'}）${t ? '：分流器依那些事的類別靜音送出' : ''}`,
+    refs: { tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: ids, message_id: messageId } })
+  logos('lane.notify', { lane: 'main', tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: ids, message_id: messageId })
 }
 /** the main sent `to` a message (send_to_agent), delivered or not: a request against the answers the events of its turn owe that agent. Met only on
  *  delivery. Returns the events it answered (none: the explicit references and the promise aid decide, mainSentTo). */

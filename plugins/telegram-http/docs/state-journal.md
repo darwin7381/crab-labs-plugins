@@ -180,9 +180,11 @@ The one rule: a lane's outbound call asks to meet an obligation of its event.
 - **One hand-over transition** (`events.handOver`, used by handoff_main, the exit rule and the thread stop alike): one `main` obligation opens and
   every lane obligation still owed (`joey`, `peer`, `receipt`) moves to `handed`. An event already handed keeps its hand-over (no second item).
 - **The main's replies and sends** are requests against the events whose items are bound to its running turn (M1: prompt → items → events). A
-  reply meets their Joey line (handed or still owed) and rings a ring nobody rang; a delivered send_to_agent meets the answers they owe that agent.
-  Nothing is matched by a parameter: the reply tool has no `handoff_id`. The tier of such a reply comes from the same events: a quoted message or a
-  Joey message in the turn makes it ordinary; otherwise silent when every event's class is silent (a push class whose ring already rang is silent).
+  reply's events are the quoted message's event when it quotes an item of the turn (`reply_to` = its message id), else the turn's events other than
+  Joey's own messages (the hand-overs it reports on), else Joey's messages. It meets their Joey line (handed or still owed), rings a ring nobody
+  rang, and each records the send. A delivered send_to_agent meets the answers they owe that agent. Nothing is matched by a parameter: the reply
+  tool has no `handoff_id`. The tier comes from the same events: a reply that quotes a message or answers Joey's own message is ordinary;
+  otherwise silent when every event's class is silent (a push class whose ring already rang is silent).
 
 **The scheduler receipt.** A lane has two ways to complete scheduler run N: the receipt tool, and the scheduler card's CLI
 `./bin/btcc-receipt complete N`. Both are one request, handled in one place (lanes.ts `completeRun`): meet the event's `receipt` obligation for run N,

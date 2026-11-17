@@ -334,18 +334,20 @@ test('002k E3 / H4 (model aid kept): a Joey or peer run that declines without lo
 })
 
 /** PL2: a stand-in main whose running turn has the hand-over items of these events bound (M1 prompt → items); returns its controls */
-async function mainTurnWith(evIds: string[]): Promise<{ prompt: string; pid: number; stop: () => Promise<void> }> {
+async function mainTurnWith(evIds: string[], joey?: { id: string; text: string }): Promise<{ prompt: string; pid: number; stop: () => Promise<void> }> {
+  if (joey) { const meta = { chat_id: '1', message_id: joey.id, user: 'joey_lab' }
+    await L.routeEvent({ id: `tg-1-${joey.id}`, source: 'telegram', from: 'joey', text: joey.text, meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: joey.text, meta } } } as any) }
   const proc = Bun.spawn(['sleep', '600'])
   const sid = `00000000-0000-4000-8000-${String(proc.pid).padStart(12, '0')}`
   writeFileSync(join(dir, 'main-expected'), sid)
   await L.__mainEvent({ event: 'SessionStart', pid: proc.pid, session_id: sid })
   const prompt = `p-pl2-${Math.random()}`
-  const dids = L.__main().items(r => r.state !== 'done' && r.kind === 'handoff' && evIds.includes(String(r.event))).map(r => r.id)
+  const dids = L.__main().items(r => r.state !== 'done' && (r.kind === 'handoff' || r.kind === 'joey') && [...evIds, ...(joey ? [`tg-1-${joey.id}`] : [])].includes(String(r.event))).map(r => r.id)
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, prompt_id: prompt, dids })
   return { prompt, pid: proc.pid, stop: async () => { await L.__mainEvent({ event: 'Stop', pid: proc.pid, prompt_id: prompt, phase: 'final' }); await L.__mainEvent({ event: 'SessionEnd', pid: proc.pid }); proc.kill('SIGKILL') } }
 }
 
-test('002l D16, PL2 G06 / B02 / E01: the main\'s reply is a request against the events of its turn (M1 prompt → items → events), never a parameter: the tier follows their class, it meets the handed Joey line, and the event records the send', async () => {
+test('002l D16, PL2 G06 / B02 / E01: the main\'s reply is a request against the events of its turn (M1 prompt → items → events), never a parameter: a quoted message\'s event, else the hand-overs; the tier follows their class, it meets the handed Joey line, and the event records the send', async () => {
   const p = await start(mk('eve', '可以答應我週五前給 10 月可用率嗎？'))
   expect(L.tierFor(p.tok.cls, false).tier).toBe('silent')                                     // a peer's matter
   await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
@@ -374,7 +376,11 @@ test('002l D16, PL2 G06 / B02 / E01: the main\'s reply is a request against the 
     const meta = { chat_id: '1', message_id: '1020', user: 'joey_lab' }
     await L.routeEvent({ id: 'tg-1-1020', source: 'telegram', from: 'joey', text: '今天怎樣？', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '今天怎樣？', meta } } } as any)
     await L.__mainEvent({ event: 'PostToolUse', pid: m.pid, prompt_id: m.prompt, tool_name: 'Bash' })   // pulled into the same turn
-    expect(L.mainReplyTier({})).toBeNull()                                                    // Joey's message is in this turn: an ordinary reply
+    expect(L.mainReplyTier({ reply_to: '1020' })).toBeNull()                                 // it quotes Joey's message: it answers him, ordinary
+    expect(L.mainReplyTier({})?.events ?? []).not.toContain('tg-1-1020')                     // a report that quotes nothing is about the hand-overs (B3 below)
+    L.mainReplied(null, 1021, '1020')
+    expect(E().get('tg-1-1020')!.main_sends).toEqual([expect.objectContaining({ to: 'joey', ref: '1021' })])   // the quoted message's event, and only it
+    expect(E().get(p.id)!.main_sends.map((x: any) => x.ref)).toEqual(['1015', '7001', '7002'])
   }
   await m.stop()
   expect(ob(p.id, 'main').state).toBe('met')
@@ -414,9 +420,12 @@ test('B3: the lane calls nothing and ends before due: the exit rule hands it to 
   expect(rings(k).length).toBe(0)                                                            // not before due
   await pastDue(a.id); await sleep(1_100)
   expect(rings(k).length).toBe(1); expect(rings(k)[0].text).toContain('已交給主線處理')
-  const m = await mainTurnWith([a.id])
+  const m = await mainTurnWith([a.id], { id: '2101', text: '跑 sleep 65 之後回我' })       // basics B3b: Joey's own message is in the same turn
   const t = L.mainReplyTier({})!
-  expect(t).toMatchObject({ silent: true }); expect(t.rule).toContain('rang')                // the main's report follows the ring quietly
+  expect(t).toMatchObject({ silent: true, events: [a.id] }); expect(t.rule).toContain('rang')   // the main's report (it quotes nothing) follows the ring quietly
+  expect(L.mainReplyTier({ reply_to: '2101' })).toBeNull()                                  // its answer to Joey (it quotes him) is ordinary
+  L.mainReplied(t, 2102); L.mainReplied(null, 2103, '2101')
+  expect(ob(a.id, 'joey')).toMatchObject({ state: 'met', ref: '2102' }); expect(E().get('tg-1-2101')!.main_sends.map((x: any) => x.ref)).toEqual(['2103'])
   expect(sent.slice(k).filter(s => !s.silent).length).toBe(1)
   await m.stop()
   L.__setCriticalDeadline(45_000)
