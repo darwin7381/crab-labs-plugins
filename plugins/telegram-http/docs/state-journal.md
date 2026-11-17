@@ -109,8 +109,8 @@ record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no 
 
 | state | meaning |
 |---|---|
-| `open` | something is still owed: an obligation is `open`, or a `main` obligation is not met |
-| `closed` | every obligation is `met` |
+| `open` | something is still owed: an obligation is `open` or `requested` |
+| `closed` | nothing is owed (every obligation is `met`, `handed`, `dropped` or `merged`; an event with no obligations is closed at once) |
 
 Fields:
 - `class`: `scheduled`, `followup`, `peer`, `joey`, `alert` or `critical`. The router writes it from the routing rule's trigger, or the follow-up
@@ -135,19 +135,33 @@ Fields:
     `memory_decide`, or the curator, writes `decision`);
   - `promised`: the commitments a lane recorded in a run of this event;
   - `main_seen`: the version the main has seen because it made that change itself (a memory decision): the digest does not tell the main what it did.
-- `obligations`: `[{id, kind, level, state, by, owner, due_at, ...}]`, where `state` is `open`, `met` or `handed`.
+- `obligations`: `[{id, kind, level, state, by, owner, due_at, ref, failed, outcome, into, ...}]`. `state`:
+  - `open`: owed;
+  - `requested`: the outbound call was accepted and is being delivered (`prev` holds what it was);
+  - `met`: delivered (`ref` = the Telegram message id, the btcc id of a delivered mesh send, or the scheduler's answer). A failed delivery puts the
+    obligation back to what it was, with `failed` = why: the lane's retry is a request like the first one, not a repeat;
+  - `handed`: the one hand-over transition gave it to the main;
+  - `dropped`: the event's thread was stopped before it ran (`by` says why); `merged`: another run handled it (`into`).
+- `refused`, `refused_kind`: the reason and the kind of a refused request (every refusal is a journal line).
+- `main_sends`: `[{to, ref, at, tier | delivered, prompt}]`: the main's Telegram replies (`to: joey`) and send_to_agent calls made in a turn this
+  event's item was bound to.
 
 | kind | levels | met by |
 |---|---|---|
-| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted). A critical alert's line has `ring` and `due_at`: see "The ring" below. |
-| `peer` | `answer`, `interim`, `commitment` | `reply_agent` to that peer. `interim` is met by the router when a lane hands the request to the main; a new `answer` then opens with `owner: main` and a `due_at`. `commitment` is the main's own commitment tool, met by `commitment_done`. |
+| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted, and so is a line whose `outcome` differs from the one it was met with), or the main's reply in a turn the event's item is bound to. A critical alert's line has `ring` and `due_at`: see "The ring" below. |
+| `peer` | `answer`, `interim`, `commitment`, `message` | `reply_agent` to that peer, met when the inbox reports it delivered. `interim` is met by the router when a lane hands the request to the main and its fixed message is delivered; a new `answer` then opens with `owner: main` and a `due_at`. The main meets an answer by a delivered send_to_agent in a turn the event's item is bound to (else by a send on the promise's thread, quoting its message, or the promise aid). `commitment` is the main's own commitment tool, met by `commitment_done`. `message`: a lane's reply_agent to an agent its event did not owe (one per agent). |
 | `receipt` | `run` (`run_id`) | the run's completion at the scheduler, once per scheduler run across every event: `receipt(run_id)`, or the lane's `./bin/btcc-receipt complete N` (`by: btcc-receipt`), whichever comes first. See "The scheduler receipt" below. |
 | `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
 
 The one rule: a lane's outbound call asks to meet an obligation of its event.
-- Meeting an open one is accepted. Raising one (line → decision) is accepted.
-- Repeating a met one is refused, and the refusal names what is still open.
-- Handing an event to the main moves its open `joey` and `peer` obligations to `handed`.
+- Meeting an open one is accepted (`requested`), and it is `met` on the delivery result. Raising one (line → decision, or a line with another outcome) is accepted.
+- Repeating a met or requested one is refused, and the refusal names what is still open.
+- **One hand-over transition** (`events.handOver`, used by handoff_main, the exit rule and the thread stop alike): one `main` obligation opens and
+  every lane obligation still owed (`joey`, `peer`, `receipt`) moves to `handed`. An event already handed keeps its hand-over (no second item).
+- **The main's replies and sends** are requests against the events whose items are bound to its running turn (M1: prompt → items → events). A
+  reply meets their Joey line (handed or still owed) and rings a ring nobody rang; a delivered send_to_agent meets the answers they owe that agent.
+  Nothing is matched by a parameter: the reply tool has no `handoff_id`. The tier of such a reply comes from the same events: a quoted message or a
+  Joey message in the turn makes it ordinary; otherwise silent when every event's class is silent (a push class whose ring already rang is silent).
 
 **The scheduler receipt.** A lane has two ways to complete scheduler run N: the receipt tool, and the scheduler card's CLI
 `./bin/btcc-receipt complete N`. Both are one request, handled in one place (lanes.ts `completeRun`): meet the event's `receipt` obligation for run N,
@@ -159,12 +173,12 @@ the hook still denies the CLI. So the daemon is the only thing that completes a 
 **The lane stop.** The lane's Stop hook (lanes-hooks/lane-stop-hook.py) posts to `POST /lane-stop` with its run token (`LANE_RUN_TOKEN`; the port
 is `LANES_HTTP_PORT`, set by the daemon in the lane's environment). The daemon blocks once with the open obligations, or lets the run end.
 
-**The exit rule.** When a run ends, at whatever reason, its open obligations become one `main` obligation, plus one M1 item.
+**The exit rule.** When a run ends, at whatever reason, its open obligations go to the main by the one hand-over transition, plus one M1 item.
 
 **The ring.** A critical event rings Joey once. The first line about it that reaches Joey with a ring meets the ring: the lane's `notify_joey` or
 `ask_joey` (the obligation is `met`), or the main's report on the event's hand-over (`rang`, `by: main`). If none has by `due_at`, the due sweep
 rings (`rang`). Handing the event to the main, by `handoff_main` or by the exit rule, does not take the ring away from the router. Every later line
-about the event goes out silent: a lane line (tier rule `+rang-at-due`) and the main's report (`+rang`).
+about the event goes out silent: a lane line (tier rule `+rang-at-due`) and the main's report in a turn bound to it (`+rang`).
 
 **The due sweep** runs every second. It acts on open obligations past `due_at`:
 - a critical line: the router rings once (`rang`), unless a line that rang reached Joey first;

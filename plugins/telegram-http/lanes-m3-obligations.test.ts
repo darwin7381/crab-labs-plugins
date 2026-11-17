@@ -323,40 +323,51 @@ test('002k E3 / H4 (model aid kept): a Joey or peer run that declines without lo
   await end(q.lane)
 })
 
-test('002l D16: the main\'s report on a hand-over takes the tier of the event\'s class: by handoff_id, or unnamed when every item of its current turn is such a hand-over; a Joey message in the turn makes it ordinary', async () => {
+/** PL2: a stand-in main whose running turn has the hand-over items of these events bound (M1 prompt → items); returns its controls */
+async function mainTurnWith(evIds: string[]): Promise<{ prompt: string; pid: number; stop: () => Promise<void> }> {
   const proc = Bun.spawn(['sleep', '600'])
-  const sid = '00000000-0000-4000-8000-00000000d016'
+  const sid = `00000000-0000-4000-8000-${String(proc.pid).padStart(12, '0')}`
   writeFileSync(join(dir, 'main-expected'), sid)
   await L.__mainEvent({ event: 'SessionStart', pid: proc.pid, session_id: sid })
+  const prompt = `p-pl2-${Math.random()}`
+  const dids = L.__main().items(r => r.state !== 'done' && r.kind === 'handoff' && evIds.includes(String(r.event))).map(r => r.id)
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, prompt_id: prompt, dids })
+  return { prompt, pid: proc.pid, stop: async () => { await L.__mainEvent({ event: 'Stop', pid: proc.pid, prompt_id: prompt, phase: 'final' }); await L.__mainEvent({ event: 'SessionEnd', pid: proc.pid }); proc.kill('SIGKILL') } }
+}
+
+test('002l D16, PL2 G06 / B02 / E01: the main\'s reply is a request against the events of its turn (M1 prompt → items → events), never a parameter: the tier follows their class, it meets the handed Joey line, and the event records the send', async () => {
   const p = await start(mk('eve', '可以答應我週五前給 10 月可用率嗎？'))
   expect(L.tierFor(p.tok.cls, false).tier).toBe('silent')                                     // a peer's matter
   await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
   await end(p.lane)
-  const hid = ob(p.id, 'main').handoff
-  expect(L.handoffReplyTier({ handoff_id: hid })).toMatchObject({ silent: true, handoff: hid })
-  expect(L.handoffReplyTier({ handoff_id: `〔${hid}〕` })).toMatchObject({ silent: true })
-  expect(L.handoffReplyTier({ handoff_id: 'ho-nope' })).toBeNull()
-  expect(L.handoffReplyTier({})).toBeNull()                                                  // no turn of the main carries it yet
-  const items = L.__main().items(r => r.state !== 'done' && r.kind !== 'digest')
-  const turn = `p-d16-${Math.random()}`
-  await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, prompt_id: turn, dids: items.filter(r => r.kind === 'handoff' && r.handoff === hid).map(r => r.id) })
-  const bound = L.__main().items(r => r.state === 'bound' && r.prompt_id === turn)
-  if (bound.every(r => r.kind === 'handoff' && r.handoff === hid)) expect(L.handoffReplyTier({})).toMatchObject({ silent: true, handoff: hid })   // M1: this turn is that report
-  expect(L.handoffReplyTier({ reply_to: 1030 })).toBeNull()                                  // quoting a message of Joey's: an ordinary answer
-  L.noteMainReplyTier(L.handoffReplyTier({ handoff_id: hid })!, 1015)
-  expect(rows().find(r => r.lane === 'main' && r.refs?.message_id === 1015)!.refs.tier).toBe('silent')
+  expect(ob(p.id, 'joey').state).toBe('handed')
+  expect(L.mainReplyTier({})).toBeNull()                                                      // no turn of the main carries it yet: an ordinary reply
+  const m = await mainTurnWith([p.id])
+  expect(L.mainReplyTier({})).toMatchObject({ silent: true, events: [p.id] })                // M1: this turn is that report
+  expect(L.mainReplyTier({ reply_to: 1030 })).toBeNull()                                     // quoting a message of Joey's: an ordinary answer
+  await L.lanesCommand('/lanes notify default', 'joey_lab')
+  expect(L.mainReplyTier({})).toBeNull()                                                      // the notify profile still rules (default: it rings)
+  await L.lanesCommand('/lanes notify tiered', 'joey_lab')
+  L.mainReplied(L.mainReplyTier({}), 1015)
+  expect(ob(p.id, 'joey')).toMatchObject({ state: 'met', by: 'main', ref: '1015' })           // G06: the main told Joey: nothing is owed any more (no second ring at due)
+  expect(E().get(p.id)!.main_sends).toEqual([expect.objectContaining({ to: 'joey', ref: '1015', tier: 'silent', prompt: m.prompt })])
+  expect(E().get(p.id)!.main_seen).toBe(E().get(p.id)!.version)                              // what the main did itself is not news for its digest
+  expect(rows().find(r => r.lane === 'main' && r.refs?.message_id === 1015)!.refs).toMatchObject({ tier: 'silent', events: [p.id] })
+  // its send_to_agent in the same turn meets the answer it owes eve, on the delivery result only
+  const owed = () => obs(p.id).find(o => o.kind === 'peer' && o.owner === 'main')!
+  await L.mainSentTo('eve', null, null, '還在確認', '7001', false)
+  expect(owed().state).toBe('open')                                                           // not delivered: still owed
+  await L.mainSentTo('eve', null, null, '可以，週五前給你', '7002', true)
+  expect(owed()).toMatchObject({ state: 'met', by: 'main', ref: '7002' })
+  expect(E().get(p.id)!.main_sends.map((x: any) => x.ref)).toEqual(['1015', '7001', '7002'])
   M1joey: {
     const meta = { chat_id: '1', message_id: '1020', user: 'joey_lab' }
     await L.routeEvent({ id: 'tg-1-1020', source: 'telegram', from: 'joey', text: '今天怎樣？', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '今天怎樣？', meta } } } as any)
-    await L.__mainEvent({ event: 'PostToolUse', pid: proc.pid, prompt_id: turn, tool_name: 'Bash' })   // pulled into the same turn
-    expect(L.handoffReplyTier({})).toBeNull()                                                // Joey's message is in this turn: an ordinary reply
+    await L.__mainEvent({ event: 'PostToolUse', pid: m.pid, prompt_id: m.prompt, tool_name: 'Bash' })   // pulled into the same turn
+    expect(L.mainReplyTier({})).toBeNull()                                                    // Joey's message is in this turn: an ordinary reply
   }
-  await L.lanesCommand('/lanes notify default', 'joey_lab')
-  expect(L.handoffReplyTier({ handoff_id: hid })).toMatchObject({ silent: false })           // the notify profile still rules
-  await L.lanesCommand('/lanes notify tiered', 'joey_lab')
-  await L.__mainEvent({ event: 'Stop', pid: proc.pid, prompt_id: turn, phase: 'final' })
+  await m.stop()
   expect(ob(p.id, 'main').state).toBe('met')
-  proc.kill('SIGKILL')
 })
 
 // ------------------------------------------------------------------ the due ring (basics B3): one ring per critical event, from whoever reaches Joey first
@@ -393,9 +404,11 @@ test('B3: the lane calls nothing and ends before due: the exit rule hands it to 
   expect(rings(k).length).toBe(0)                                                            // not before due
   await pastDue(a.id); await sleep(1_100)
   expect(rings(k).length).toBe(1); expect(rings(k)[0].text).toContain('已交給主線處理')
-  const t = L.handoffReplyTier({ handoff_id: hid })!
+  const m = await mainTurnWith([a.id])
+  const t = L.mainReplyTier({})!
   expect(t).toMatchObject({ silent: true }); expect(t.rule).toContain('rang')                // the main's report follows the ring quietly
   expect(sent.slice(k).filter(s => !s.silent).length).toBe(1)
+  await m.stop()
   L.__setCriticalDeadline(45_000)
 })
 
@@ -419,18 +432,20 @@ test('B3: the lane hands the critical alert to the main before due: a ringing re
   const a = await start(mk('alert-dispatcher', '[P1][critical] backup 全部失敗（交主線）'))
   await call(a.tok, 'handoff_main', { text: '備份全失敗，要主線決定要不要停寫入' })
   await end(a.lane)
-  const ha = ob(a.id, 'main').handoff
-  const t = L.handoffReplyTier({ handoff_id: ha })!
-  expect(t.silent).toBe(false)                                                               // nothing rang yet: the main's report is the ring
-  L.noteMainReplyTier(t, 4242)
-  expect(ob(a.id, 'joey').rang).toBe(true)
+  const m = await mainTurnWith([a.id])
+  expect(L.mainReplyTier({})).toBeNull()                                                     // nothing rang yet: the main's report is the ring (push)
+  L.mainReplied(null, 4242)
+  expect(ob(a.id, 'joey')).toMatchObject({ rang: true, state: 'met', by: 'main', ref: '4242' })
+  await m.stop()
   const b = await start(mk('alert-dispatcher', '[P1][critical] backup 全部失敗（交主線，主線沒回）'))
   await call(b.tok, 'handoff_main', { text: '同上，主線還沒回' })
   await end(b.lane)
   await pastDue(a.id); await pastDue(b.id); await sleep(1_100)
   expect(rings(k).length).toBe(1)                                                            // b's, by the router; a's was the main's report
   expect(rings(k)[0].text).toContain('主線沒回')
-  expect(L.handoffReplyTier({ handoff_id: ob(b.id, 'main').handoff })!.silent).toBe(true)
+  const mb = await mainTurnWith([b.id])
+  expect(L.mainReplyTier({})!.silent).toBe(true)                                              // rung at due: the main's report on b is silent
+  await mb.stop()
   L.__setCriticalDeadline(45_000)
 })
 
@@ -576,4 +591,72 @@ test('PL1 (fork result): a fork lane\'s result is a field of its event record, r
   await end(id)
   expect(E().get('ev-fork-77')).toMatchObject({ owner: id, result: 'ok' })
   expect(digestNow()).toContain('｜ok｜')
+})
+
+// ------------------------------------------------------------------ PL2 (AUD): an obligation's state is tied to what its obligee actually got
+const meshOk = async (b: any) => { mesh.push(b); return { text: `sent to ${b.to}`, msgId: 70000 + mesh.length, delivered: true } }
+test('PL2 P4 (A05, B05, B08, C03, C04, H01, H02): a send is requested, then met on its delivery; a failed delivery leaves it owed, so the retry is accepted (not "already has the answer"); a Telegram send that fails leaves the line owed', async () => {
+  const p = await start(mk('eve', '維護時段是幾點？'))
+  L.__setMeshSend(async b => { mesh.push(b); return { text: `send to ${b.to} FAILED — message NOT delivered`, msgId: 70000 + mesh.length, delivered: false } })
+  const r1 = await call(p.tok, 'reply_agent', { to: 'eve', text: '週三 02:00' })
+  expect(r1).toContain('NOT delivered'); expect(r1).toContain('still owed')
+  expect(ob(p.id, 'peer')).toMatchObject({ state: 'open', failed: "not delivered to the peer's inbox" })
+  const lines = journal().filter(l => l.rec === 'event' && l.id === p.id)
+  expect(lines.map(l => l.obligations.find((o: any) => o.kind === 'peer').state).slice(-2)).toEqual(['requested', 'open'])   // requested, then back: never met before the send
+  L.__setMeshSend(meshOk)
+  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '週三 02:00' })).toBe('sent to eve')    // the retry is a request like the first
+  expect(ob(p.id, 'peer')).toMatchObject({ state: 'met', by: 'reply_agent', ref: String(70000 + mesh.length) })
+  const again = await call(p.tok, 'reply_agent', { to: 'eve', text: '補一句' })
+  expect(again).toContain('eve already has the answer')
+  expect(journal().filter(l => l.rec === 'event' && l.id === p.id && l.refused && l.refused_kind === 'peer').length).toBe(1)   // every refusal is a journal line
+  const k = sent.length, keep = L.__setSendBotForTest(async () => { throw new Error('telegram down') })
+  await expect(call(p.tok, 'notify_joey', { text: '回了 Eve 維護時段' })).rejects.toThrow(/still owed/)
+  expect(ob(p.id, 'joey')).toMatchObject({ state: 'open', failed: 'the Telegram send failed' })
+  L.__setSendBotForTest(keep)
+  expect(await call(p.tok, 'notify_joey', { text: '回了 Eve 維護時段' })).toContain('sent to Joey')
+  expect(ob(p.id, 'joey')).toMatchObject({ state: 'met', ref: String(9000 + sent.length) }); expect(sent.length).toBe(k + 1)
+  await end(p.lane)
+  expect(E().get(p.id)!.state).toBe('closed')
+})
+
+test('PL2 P22: a reply_agent to an agent the event does not owe opens its own obligation (level message), met on delivery; a second one to that agent is refused', async () => {
+  const p = await start(mk('eve', '幫我問 cain 備份保留幾天'))
+  expect(await call(p.tok, 'reply_agent', { to: 'cain', text: '備份保留幾天？（eve 問的）' })).toBe('sent to cain')
+  expect(obs(p.id).find(o => o.to === 'cain')).toMatchObject({ kind: 'peer', level: 'message', state: 'met', ref: expect.any(String) })
+  expect(await call(p.tok, 'reply_agent', { to: 'cain', text: '再問一次' })).toContain('cain already got a message about this event')
+  await call(p.tok, 'reply_agent', { to: 'eve', text: '問了 cain，等他回' }); await call(p.tok, 'notify_joey', { text: 'Eve 問備份保留，已轉問 cain' })
+  await end(p.lane)
+})
+
+test('PL2 P6 (E02, G05, G06, B08, T6-R): the exit rule is the one hand-over: the lane\'s line, answer and receipt move to handed, and the event closes when the main\'s item is done', async () => {
+  const s = await start(sched(71))
+  await end(s.lane)                                                                          // nothing called: everything still owed
+  expect(obs(s.id).map(o => `${o.kind}:${o.state}`).sort()).toEqual(['joey:handed', 'main:open', 'receipt:handed'])
+  const p = await start(mk('eve', '能答應週五嗎？'))
+  await call(p.tok, 'handoff_main', { text: 'Eve 要週五，要主線決定' })
+  await end(p.lane)
+  expect(handed(p.id).length).toBe(1)                                                        // one hand-over, one item (the exit rule finds nothing owed)
+  for (const id of [s.id, p.id]) {                                                           // M1 done → the main obligation met → nothing owed: closed (002o: open forever)
+    const it = handed(id)[0]
+    L.__journal().write('msg', it.id, 'bound', { gen: 'x', prompt_id: 'px' }); L.__journal().write('msg', it.id, 'done', {})
+    E().set(id, o => o.kind === 'main' && o.state === 'open', { state: 'met', by: `main (item ${it.id} done)` })
+    if (id === p.id) { expect(E().get(id)!.state).toBe('open'); await L.mainSentTo('eve', E().get(id)!.thread, null, '可以', '7100', true) }   // the main still owed eve its promised answer
+    expect(E().get(id)!.state).toBe('closed')
+  }
+})
+
+test('PL2 P5 (C04, H04, B08, G07): a drained or coalesced event is dropped / merged, never met in bulk; the digest does not say Joey was told; P8: an event that owes nothing is closed', async () => {
+  const first = await start(mk('eve', '第一個問題'))
+  const th = E().get(first.id)!.thread
+  const q2 = await L.routeEvent(mk('eve', '補充一', { thread: th, hop: 2, reply_to_id: 'x' }))
+  const q2id = `mesh-m3-${n}`
+  expect(q2.target).toBe('lane')
+  L.drainStoppedThread(th, 'hop 7 > limit 6')
+  expect(obs(q2id).map(o => `${o.kind}:${o.state}`).sort()).toEqual(['joey:dropped', 'peer:dropped'])
+  expect(E().get(q2id)!.state).toBe('closed')
+  const d = L.__digest()!.text
+  expect(d).toContain('沒有處理（對話線已關閉）'); expect(d).not.toMatch(/補充一[^\n]*已通知 Joey/)
+  await call(first.tok, 'reply_agent', { to: 'eve', text: '答' }); await call(first.tok, 'notify_joey', { text: '答了 eve' }); await end(first.lane)
+  const info = await L.routeEvent(mk('eve', 'FYI 只是說一聲', { no_reply: true }))
+  expect(info.target).toBe('ledger'); expect(E().get(`mesh-m3-${n}`)).toMatchObject({ state: 'closed', obligations: [] })
 })

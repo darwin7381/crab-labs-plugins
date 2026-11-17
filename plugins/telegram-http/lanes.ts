@@ -806,7 +806,7 @@ function threadGate(t: Thread | null, ev: InEvent): { why: 'hop' | 'budget'; not
 // the main's next digest, nobody is woken) and get no run. startRun checks it too, for what is restored from disk or comes back from a retry.
 function dropQueued(it: QItem, thread: string, why: string): void {
   endRun(it, 'dropped', { why: `thread stopped (${why})` })
-  events?.set(it.ev.id, o => o.state === 'open', { state: 'met', by: `router: thread stopped (${why})` }, { tool: 'router' })
+  events?.settleUnrun(it.ev.id, 'dropped', `router: thread stopped (${why})`)      // PL2: dropped, not met: nobody answered
   const more = it.extra?.length ? `（連同同時排進來的另外 ${it.extra.length} 則）` : ''
   ledger({ lane: S.lanes[it.lane]?.id ?? 'router', thread, event: it.ev.id, kind: 'fyi',
     text: `對話線 ${thread} 已經關閉（${why}），排隊中的 ${it.ev.from} 的訊息沒有處理，也沒有開車道${more}。內容：${it.ev.text.slice(0, 160)}`,
@@ -1738,7 +1738,7 @@ function coalesce(it: QItem, waiting: QItem[]): void {
   runRec(it, 'queued', { extra: it.extra.map(lightEv) })
   for (const o of more) {
     endRun(o, 'merged', { into: it.ev.id })
-    events?.set(o.ev.id, x => x.state === 'open', { state: 'met', by: `coalesced into ${it.ev.id}` }, { tool: 'router' })
+    events?.settleUnrun(o.ev.id, 'merged', `coalesced into ${it.ev.id}`, it.ev.id)       // PL2: merged into the run that answers it, not met
     appendJsonl('routing.jsonl', { event: o.ev.id, source: o.ev.source, from: o.ev.from, rule: 'coalesced', target: 'lane', lane: it.lane, note: `handled in the same run as ${it.ev.id}` })
   }
   logos('lane.coalesced', { lane: it.lane, event: it.ev.id, with: more.map(o => o.ev.id) })
@@ -2439,7 +2439,7 @@ function ownerOf(evId: string): string | undefined {
   if (!e) return undefined                                                         // no record: nothing to stamp
   const obs: Ob[] = e.obligations ?? []
   if (obs.some(o => o.kind === 'main')) return '主線'
-  if (obs.some(o => o.kind === 'joey' && o.level === 'decision' && o.state === 'met')) return 'Joey 決定'
+  if (obs.some(o => o.kind === 'joey' && o.level === 'decision' && (o.state === 'met' || o.state === 'requested'))) return 'Joey 決定'
   const lane = S?.lanes?.[String(e.owner ?? '')]
   return lane ? laneLabel(lane) : undefined
 }
@@ -2447,16 +2447,17 @@ function ownerOf(evId: string): string | undefined {
 // walled) makes it due after AWAY_GRACE_MS (002g: 60 s); a critical alert's line (CRITICAL_DEADLINE_MS, 002k E1: 45 s); the main's promised answer to a peer
 // (PROMISE_MIN, 002j: 30 min). They are due times on explicit state, not windows over a transcript.
 const HANDOFF_DUE_MS = (): number => num('LANES_HANDOFF_FALLBACK_MS', 300_000)
-/** M3 → M4 → M1: the event is handed to the main. One obligation (kind main, due HANDOFF_DUE_MS), one M1 item; M1 offers it when the main is idle
- *  (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop. */
+/** M3 → M4 → M1: the event is handed to the main. ONE transition for every hand-over (handoff_main, the exit rule, the thread stop): events.handOver
+ *  adds the main obligation (due HANDOFF_DUE_MS, set now and never rewritten) and moves what the lane still owed to `handed`; then one M1 item carries
+ *  it. M1 offers it when the main is idle (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop.
+ *  An event already handed (an open main obligation) keeps that hand-over: no second item. */
 function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true): string {
   const body = text.slice(0, max)
-  if (events.get(evId) && !(events.get(evId)!.obligations ?? []).some((o: Ob) => o.kind === 'main'))
-    events.add(evId, { id: hid, kind: 'main', level: 'handed', owner: 'main', handoff: hid, what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}) }, { tool: 'router' })
-  else if (events.get(evId)) events.set(evId, o => o.kind === 'main' && o.state === 'open', { due_at: Date.now() + HANDOFF_DUE_MS(), handoff: hid, what: body.slice(0, 600), ...(cls ? { cls } : {}) })
-  else events.open(evId, { class: 'peer', owner: 'main', obligations: [{ id: hid, kind: 'main', level: 'handed', owner: 'main', handoff: hid, what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}) } as any], thread: lane?.thread ?? null, lane: lane?.id ?? null, text })
+  const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}) })
+  if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
+  if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
   if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
-  const item = main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次；回報時 reply 帶 handoff_id=${hid}。）`,
+  const item = main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）`,
     meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, o => o.id === hid, { item })
   journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `owed to the main (${hid})${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
@@ -2473,41 +2474,63 @@ function itemDone(it: Row): void {
 function itemUndone(it: Row): void {
   if (it.event && events.get(it.event)) events.set(String(it.event), o => o.kind === 'main' && o.state === 'met' && o.by === metBy(it), { state: 'open', by: null })
 }
-// ------------------------------------------------------------------ 002l (D16): the main's report on a hand-over goes out at the event's tier
-// design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」. The router decides it for the main's reply (server.ts), from the record:
-//   - reply with handoff_id = a hand-over's id: the plain tier of that event's class;
-//   - no id, not quoting a message: when every item of the main's current turn (M1: bound to its prompt) is a hand-over of a silent-tier event, the
-//     reply is that report: silent. A Joey message in the turn, or a reply that quotes one, is ordinary (push).
-// The notify profile still rules (profile default = everything rings); a hand-over the router made itself (a failed lane) has no class: push.
-// A critical event rings Joey once (its Joey line's `ring`): the main's report on its hand-over is a line about that event like any other. It rings only
-// while the ring is still owed, and a report that rings meets it (noteMainReplyTier sets `rang`); after the router's ring at due it is silent.
-const mainObOf = (hid: string): { e: Row; o: Ob } | undefined => { for (const e of events.rows()) for (const o of (e.obligations ?? []) as Ob[]) if (o.kind === 'main' && o.handoff === hid) return { e, o }; return undefined }
+// ------------------------------------------------------------------ PL2: the main's replies and sends are requests against the events of its turn
+// M1 knows prompt → items → events: the events whose items are bound to the main's running turn are what that turn handles. A Telegram reply of the
+// main is a request against them: it meets their Joey line (handed to the main, or still owed), it rings a critical event's ring that nobody rang
+// yet, and each event records the send (`main_sends`, with main_seen: the digest does not repeat to the main what it did). A send_to_agent meets
+// the answers they owe that agent, on the delivery result. Nothing is matched by a parameter or by text.
+// The tier of such a reply (design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」): a reply that quotes a message, or a turn
+// that carries a Joey message, is ordinary (push); otherwise the turn's events decide: silent when every one of them is a silent-tier class (a push
+// class whose ring already rang is silent too), push otherwise. The notify profile still rules (default = everything rings).
 const ringOf = (e: Row | undefined): Ob | undefined => ((e?.obligations ?? []) as Ob[]).find(o => o.kind === 'joey' && o.ring)
 const rung = (e: Row | undefined): boolean => { const r = ringOf(e); return !!r && (!!r.rang || r.state === 'met') }
-export function handoffReplyTier(a: { handoff_id?: unknown; reply_to?: unknown }): { silent: boolean; rule: string; handoff?: string } | null {
-  if (D?.role !== 'tg' || !S || !events) return null
-  const tierOf = (x: { e: Row; o: Ob } | undefined) => { const t = x?.o.cls ? tierFor(x.o.cls, false) : null; return t && t.tier === 'push' && rung(x!.e) ? { tier: 'silent' as Tier, rule: `${t.rule}+rang` } : t }
-  const id = a.handoff_id != null ? String(a.handoff_id).trim().replace(/^〔|〕$/g, '') : ''
-  if (id) { const t = tierOf(mainObOf(id)); return t ? { silent: t.tier !== 'push', rule: `handoff ${id}: ${t.rule}`, handoff: id } : null }
-  if (a.reply_to != null && String(a.reply_to) !== '') return null                  // quoting a message: an answer to Joey, ordinary
-  const g = main.currentGen()
-  const turn = g?.prompt_id ? main.items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === g.prompt_id && r.kind !== 'digest') : []
-  if (!turn.length || turn.some(r => r.kind !== 'handoff')) return null
-  const tiers = turn.map(r => tierOf(mainObOf(String(r.handoff))))
-  if (tiers.some(t => !t || t.tier === 'push')) return null
-  const ids = turn.map(r => String(r.handoff))
-  return { silent: true, rule: `handoff-turn ${ids.join(',')}: ${tiers[0]!.rule}`, handoff: ids.join(',') }
+/** the main's running turn: its prompt, its bound items and the events they carry (M1 + M2) */
+function mainTurn(): { prompt: string; items: Row[]; events: Row[] } | null {
+  const g = main?.currentGen()
+  if (!g?.prompt_id || g.state !== 'in_turn') return null
+  const items = main.items(r => (r.state === 'bound' || r.state === 'done') && r.gen === g.id && r.prompt_id === g.prompt_id && r.kind !== 'digest')
+  const ids = [...new Set(items.map(r => String(r.event ?? '')).filter(Boolean))]
+  return { prompt: String(g.prompt_id), items, events: ids.map(id => events.get(id)).filter((e): e is Row => !!e) }
 }
-/** server.ts: the main's reply went out with this tier (for the record) */
-export function noteMainReplyTier(t: { silent: boolean; rule: string; handoff?: string }, messageId: number | null): void {
-  if (D?.role !== 'tg' || !S) return
-  if (!t.silent) for (const hid of String(t.handoff ?? '').split(',').filter(Boolean)) {      // a report that rang meets the ring of its event
-    const x = mainObOf(hid), r = ringOf(x?.e)
-    if (x && r && !r.rang) events.set(x.e.id, r.id, { rang: true, by: 'main' }, { tool: 'reply' })
+export type MainTier = { silent: boolean; rule: string; events: string[] }
+/** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push) */
+export function mainReplyTier(a: { reply_to?: unknown }): MainTier | null {
+  if (D?.role !== 'tg' || !S || !events) return null
+  if (a.reply_to != null && String(a.reply_to) !== '') return null                  // quoting a message: an answer to Joey, ordinary
+  const t = mainTurn()
+  if (!t || !t.events.length || t.items.some(r => r.kind === 'joey')) return null
+  const tiers = t.events.map(e => { const cls = String(e.class ?? ''); const x = tierFor(cls, false); return x.tier === 'push' && rung(e) ? { tier: 'silent' as Tier, rule: `${x.rule}+rang` } : x })
+  if (tiers.some(x => x.tier === 'push')) return null
+  return { silent: true, rule: `turn ${t.prompt}: ${tiers[0].rule}`, events: t.events.map(e => e.id) }
+}
+/** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against the events of its turn */
+export function mainReplied(t: MainTier | null, messageId: number | null): void {
+  if (D?.role !== 'tg' || !S || !events) return
+  const turn = mainTurn()
+  for (const e of turn?.events ?? []) {
+    if (messageId == null) continue
+    for (const o of (e.obligations ?? []) as Ob[]) {
+      if (o.kind === 'joey' && (o.state === 'open' || o.state === 'handed')) events.set(e.id, o.id, { state: 'met', by: 'main', ref: String(messageId), ...(o.ring && !o.rang && !t?.silent ? { rang: true } : {}) }, { tool: 'reply' })
+      else if (o.kind === 'joey' && o.ring && !o.rang && !t?.silent) events.set(e.id, o.id, { rang: true, by: 'main' }, { tool: 'reply' })
+    }
+    events.push(e.id, 'main_sends', { to: 'joey', ref: String(messageId), at: nowIso(), tier: t?.silent ? 'silent' : 'push', prompt: turn!.prompt }, true)
   }
-  ledger({ lane: 'main', kind: 'notify', text: `[${t.silent ? 'silent' : 'push'}] 主線回報交接的事（${t.handoff ?? '-'}）：分流器依那件事的類別${t.silent ? '靜音送出' : '照常推播'}`,
-    refs: { tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId } })
-  logos('lane.notify', { lane: 'main', tier: t.silent ? 'silent' : 'push', tier_rule: t.rule, handoff: t.handoff ?? null, message_id: messageId })
+  ledger({ lane: 'main', kind: 'notify', text: `[${t?.silent ? 'silent' : 'push'}] 主線回覆 Joey（這一回合的事：${turn?.events.map(e => e.id).join(', ') || '-'}）${t ? '：分流器依那些事的類別靜音送出' : ''}`,
+    refs: { tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: turn?.events.map(e => e.id) ?? [], message_id: messageId } })
+  logos('lane.notify', { lane: 'main', tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: turn?.events.map(e => e.id) ?? [], message_id: messageId })
+}
+/** the main sent `to` a message (send_to_agent), delivered or not: a request against the answers the events of its turn owe that agent. Met only on
+ *  delivery. Returns the events it answered (none: the explicit references and the promise aid decide, mainSentTo). */
+function mainSentInTurn(to: string, ref: string, delivered: boolean): string[] {
+  const turn = mainTurn(), peer = to.toLowerCase(), hit: string[] = []
+  for (const e of turn?.events ?? []) {
+    const owed = ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'peer' && o.to === peer && (o.state === 'open' || o.state === 'handed'))
+    if (!owed.length) continue
+    if (delivered) for (const o of owed) events.set(e.id, o.id, { state: 'met', by: 'main', ref }, { tool: 'send_to_agent' })
+    events.push(e.id, 'main_sends', { to: peer, ref, at: nowIso(), delivered, prompt: turn!.prompt }, true)
+    hit.push(e.id)
+  }
+  return hit
 }
 
 // ------------------------------------------------------------------ 002j: a request only the main can agree to (problem 24)
@@ -2517,6 +2540,8 @@ export function noteMainReplyTier(t: { silent: boolean; rule: string; handoff?: 
 let PROMISE_MIN = Number(process.env.LANES_HANDOFF_REPLY_MIN ?? 30)
 export const __setPromiseMin = (m: number): void => { PROMISE_MIN = m }
 let meshSendHook: ((b: any) => Promise<any>) | null = null
+/** tests only: swap the bot send (returns the previous one) */
+export const __setSendBotForTest = (f: LanesDeps['sendBot']): LanesDeps['sendBot'] => { const was = D.sendBot; D.sendBot = f; return was }
 export const __setMeshSend = (f: ((b: any) => Promise<any>) | null): void => { meshSendHook = f }
 /** tests only: a run of an event, as the router's enqueue would leave it (the event's M3 record is opened as openLaneEvent does: every run's event has one) */
 export const __putQueue = (it: any): void => { if (S.lanes[it.lane]) openLaneEvent(it.ev, S.lanes[it.lane]); if (!it.rid && it.state === 'queued') { it.attempts ??= 0; queueRun(it) } else queue.set(it.ev.id, it) }
@@ -2539,7 +2564,7 @@ async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to
   if (th) { th.hops = hop; th.last = nowIso(); if (!th.peer) th.peer = from }
   const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, thread: lane.thread, hop, lane: lane.id, owner: '主線' })
   if (r?.msgId != null) S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }
-  events.set(tok.evId, peerOb.id, { state: 'met', level: 'interim', by: 'router' })
+  if (r?.delivered === true) events.set(tok.evId, peerOb.id, { state: 'met', level: 'interim', by: 'router', ref: String(r.msgId ?? '') })   // PL2: met on the delivery (else it stays handed: the main answers)
   const ob = events.add(tok.evId, { kind: 'peer', level: 'answer', to: from, owner: 'main', due_at: due, handoff: hid, what: (queue.get(tok.evId)?.ev.text ?? '').slice(0, 160),
     ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}), ...(r?.msgId != null ? { sent: String(r.msgId) } : {}) })
   ledger({ lane: 'router', thread: lane.thread, event: tok.evId, kind: 'commitment',
@@ -2573,9 +2598,11 @@ function keepPromise(p: OpenPromise, how: string): void {
     text: `主線已回覆 ${p.o.to}（系統告訴過對方 ${simTime(p.o.due_at!)} 前會回的那件事${late ? '；過了時間才回' : ''}）`, refs: { obligation: p.o.id, matched: how, late } })
   logos('lane.promise.kept', { obligation: p.o.id, peer: p.o.to, late, matched: how })
 }
-/** the main sent `to` a message (send_to_agent): the answers it owes that agent (M3, owner main) which this message gives are met */
-export async function mainSentTo(to: string, thread: string | null, replyTo?: string | number | null, text?: string): Promise<void> {
+/** the main sent `to` a message (send_to_agent): first a request against the events of its turn (PL2, mainSentInTurn); else the answers it promised that
+ *  agent (M3, owner main) which this message names (its thread, the message it quotes), or the promise aid (Jev) picks. Met only when delivered. */
+export async function mainSentTo(to: string, thread: string | null, replyTo?: string | number | null, text?: string, ref = '', delivered = true): Promise<void> {
   if (!events) return
+  if (mainSentInTurn(String(to), ref, delivered).length || !delivered) return
   const peer = String(to).toLowerCase()
   const open: OpenPromise[] = []
   for (const ev of events.rows(r => r.state === 'open')) for (const o of (ev.obligations ?? []) as Ob[]) if (o.kind === 'peer' && o.owner === 'main' && o.state === 'open' && o.to === peer) open.push({ ev, o })
@@ -2748,15 +2775,16 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       { const w = ownerClaimWarning(tok, events.get(evId), text); if (w) return w }
       const outcome = outcomeArg(a) ?? 'normal'
       const r0 = joeyRendering(events.get(evId), tok, lane, 'line', undefined, text, outcome)
-      const v = events.request(evId, 'notify_joey', { kind: 'joey', level: 'line' }, outcome, false, { said: text.slice(0, 200), joey_tier: r0.tier })
+      const v = events.request(evId, 'notify_joey', { kind: 'joey', level: 'line' }, outcome, { said: text.slice(0, 200), joey_tier: r0.tier })   // PL2: requested
       if (!v.ok) return v.why!
       const r = joeyRendering(v.event, tok, lane, 'line', v.ob, text, outcome)
       const rec = { lane: lane.id, thread: lane.thread, event: evId, class: tok.cls, trigger: tok.trigger, escalated: false }
-      ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, 400)}`,
-        refs: { class: tok.cls, trigger: tok.trigger, escalated: false, tier: r.tier, tier_rule: r.rule, outcome }, detail: lane.transcript })
-      if (r.tier === 'ledger') { logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule }); return 'recorded in the ledger' }
+      if (r.tier === 'ledger') { events.result(evId, v.ob?.id, true, { ref: 'ledger' }); ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, 400)}`, refs: { class: tok.cls, trigger: tok.trigger, escalated: false, tier: r.tier, tier_rule: r.rule, outcome }, detail: lane.transcript }); logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule }); return 'recorded in the ledger' }
       const id = await pushJoey(lane, r.body, r.tier === 'silent', joeyReplyTo(replyEventFor(tok)), ownerOf(evId))
-      if (id == null) throw new Error('send failed')
+      events.result(evId, v.ob?.id, id != null, { ref: id, why: 'the Telegram send failed' })                      // PL2: met on the delivery, not before it
+      ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, 400)}`,
+        refs: { class: tok.cls, trigger: tok.trigger, escalated: false, tier: r.tier, tier_rule: r.rule, outcome, message_id: id, delivered: id != null }, detail: lane.transcript })
+      if (id == null) throw new Error('send failed: Joey did not get it; the line is still owed (send it again)')
       if (r.tier === 'push') S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()]
       saveState()
       logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule, message_id: id })
@@ -2776,18 +2804,20 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'stop', text: `reply_agent → ${to} 擋下：hop ${hop} 超過上限 ${HOP_LIMIT}。` })
         return `blocked: hop limit ${HOP_LIMIT} reached in thread ${lane.thread}; recorded. What this event still owes goes to the main when your run ends. Do not retry.`
       }
-      { const v0 = events.request(tok.evId, 'reply_agent', { kind: 'peer', level: 'answer', to }, undefined, true); if (!v0.ok) return v0.why! }   // M3's refusal costs no Jev call
-      // 002k (K2): after the program's own refusals (they cost no call and must not use up the once), before anything is counted or sent
-      { const pd = await peerDisclosureCheck(lane.id, to, text, 'reply_agent', { thread: lane.thread, event: tok.evId, once: `${tok.runId}:reply_agent:${to}` }); if (pd.refuse) throw new Error(pd.refuse) }
-      const v = events.request(tok.evId, 'reply_agent', { kind: 'peer', level: 'answer', to }, undefined, false, { answered: text.slice(0, 200) })      // M3: the answer this event owes `to` (another agent: no obligation)
+      // M3 (PL2): the request is journaled first (requested, or a refusal line: M3's refusal costs no Jev call); an agent the event did not owe gets its own obligation
+      const v = events.request(tok.evId, 'reply_agent', { kind: 'peer', level: 'answer', to }, undefined, { answered: text.slice(0, 200) })
       if (!v.ok) return v.why!
+      // 002k (K2): after the program's own refusals (they cost no call and must not use up the once), before anything is counted or sent
+      { const pd = await peerDisclosureCheck(lane.id, to, text, 'reply_agent', { thread: lane.thread, event: tok.evId, once: `${tok.runId}:reply_agent:${to}` }); if (pd.refuse) { events.result(tok.evId, v.ob?.id, false, { why: 'refused by the disclosure check' }); throw new Error(pd.refuse) } }
       if (th) { th.hops = hop; th.last = nowIso(); th.ask_cls = tok.cls; if (!th.peer) th.peer = to }
       saveState()
       const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: a.no_reply === true, thread: lane.thread, hop, lane: lane.id, owner: ownerOf(tok.evId) })
       if (r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
-      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: `reply_agent → ${to}（hop ${hop}）：${text.slice(0, 200)}`, refs: { btcc_msg_id: r?.msgId ?? null } })
-      if (r) ownerRelay(lane, tok, to, text, r.msgId ?? null)
-      return r?.text ?? 'send failed: inbox daemon unreachable'
+      const ok = r?.delivered === true
+      events.result(tok.evId, v.ob?.id, ok, { ref: r?.msgId ?? null, why: r ? 'not delivered to the peer\'s inbox' : 'the inbox daemon did not answer' })   // PL2: met on the delivery result
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: `reply_agent → ${to}（hop ${hop}）：${text.slice(0, 200)}`, refs: { btcc_msg_id: r?.msgId ?? null, delivered: ok } })
+      if (ok) ownerRelay(lane, tok, to, text, r.msgId ?? null)
+      return (r?.text ?? 'send failed: inbox daemon unreachable') + (ok ? '' : `. The answer to ${to} is still owed: send it again when it can go through.`)
     }
     case 'ledger_write': {
       const kind = String(a.kind ?? '')
@@ -2848,16 +2878,17 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!text) throw new Error('empty text')
       { const back = await reportCheck(lane, tok, 'ask_joey', text); if (back) return back }
       const evId = joeyEventOf(tok)
-      const v = events.request(evId, 'ask_joey', { kind: 'joey', level: 'decision' }, outcomeArg(a), false, { said: text.slice(0, 200), joey_tier: 'push' })
+      const v = events.request(evId, 'ask_joey', { kind: 'joey', level: 'decision' }, outcomeArg(a), { said: text.slice(0, 200), joey_tier: 'push' })   // PL2: requested
       if (!v.ok) return v.why!
       const r = joeyRendering(v.event, tok, lane, 'decision', v.ob, text, outcomeArg(a) ?? 'changed')
       const rec = { lane: lane.id, thread: lane.thread, event: evId, class: tok.cls, trigger: tok.trigger, escalated: true, ask: true }
       ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, 1000)}`,
         refs: { class: tok.cls, trigger: tok.trigger, escalated: true, ask: true, tier: r.tier, tier_rule: r.rule, ...(v.raised ? { raised: 'line→decision' } : {}) }, detail: lane.transcript })
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: evId, class: tok.cls, to: 'joey' })
-      if (r.tier === 'ledger') { logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule }); return 'recorded in the ledger (this kind of notice never reaches Joey)' }
+      if (r.tier === 'ledger') { events.result(evId, v.ob?.id, true, { ref: 'ledger' }); logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule }); return 'recorded in the ledger (this kind of notice never reaches Joey)' }
       const id = await pushJoey(lane, r.body, r.tier === 'silent', joeyReplyTo(replyEventFor(tok)), ownerOf(evId))
-      if (id == null) throw new Error('send failed')
+      events.result(evId, v.ob?.id, id != null, { ref: id, why: 'the Telegram send failed' })                      // PL2: met on the delivery
+      if (id == null) throw new Error('send failed: Joey did not get it; the question is still owed (ask again)')
       if (r.tier === 'push') S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()]
       saveState()
       logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule, message_id: id })
@@ -2866,10 +2897,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
     case 'handoff_main': {
       const text = String(a.text ?? '').trim()
       if (!text) throw new Error('empty text')
-      const hid = `ho-${shortId()}`
-      const v = events.request(tok.evId, 'handoff_main', { kind: 'main', level: 'handed', handoff: hid })
+      const v = events.request(tok.evId, 'handoff_main', { kind: 'main', level: 'handed' })        // accepted or refused (journaled); the hand-over is ONE transition
       if (!v.ok) return v.why!
-      handToMain(tok.evId, lane, text, hid, tok.cls)
+      const hid = handToMain(tok.evId, lane, text, `ho-${shortId()}`, tok.cls)
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words): its answer obligation is met by the
       // router, and a new one (the main's, with a due time) takes its place
@@ -3379,11 +3409,13 @@ const laneTransports = new Map<string, { transport: StreamableHTTPServerTranspor
 // (002l D14, 002m L6B4: a run completed twice). Whichever comes first meets it; the second is refused with what is still open. This is the only place that
 // completes a run at the scheduler.
 export async function completeRun(tok: RunTok, runId: string, outcome: string, summary: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string }> {
-  const v = events.request(tok.evId, via, { kind: 'receipt', level: 'run', run_id: runId }, outcome === 'failed' ? 'failed' : undefined)
+  const v = events.request(tok.evId, via, { kind: 'receipt', level: 'run', run_id: runId }, outcome === 'failed' ? 'failed' : undefined)   // PL2: requested
   if (!v.ok) { logos('lane.receipt_dup', { lane: tok.lane, run: tok.runId, run_id: runId, via }); return { ok: false, text: v.why! } }
   const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome, summary: typeof summary === 'string' ? summary : undefined })
-  logos('lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
-  return { ok: true, text: r ? String(r.text ?? JSON.stringify(r)) : 'the scheduler did not answer' }
+  const answer = r ? String(r.text ?? JSON.stringify(r)) : null
+  events.result(tok.evId, v.ob?.id, answer != null, { ref: answer?.slice(0, 120) ?? null, why: 'the scheduler did not answer' })   // met on the scheduler's answer
+  logos('lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: answer != null })
+  return { ok: answer != null, text: answer ?? `the scheduler did not answer: run ${runId} is not completed yet (the receipt is still owed; try again)` }
 }
 function laneBearer(req: IncomingMessage): string | null {
   const m = String(req.headers['authorization'] ?? '').match(/^Bearer\s+(\S+)$/i)
@@ -3899,11 +3931,15 @@ function digestLine(e: Row): DigestLine {
   const who = laneLabelOf(String(e.lane ?? e.owner ?? ''))
   const handed = obs.find(o => o.kind === 'main' && o.state === 'open'), joey = obs.find(o => o.kind === 'joey')
   const st: string[] = []
-  if (joey) st.push(joey.state === 'handed' ? '交給主線回報 Joey' : joey.state === 'open' ? (joey.rang ? '分流器已響鈴，車道還在查' : '還沒告訴 Joey')
-    : joey.level === 'decision' ? '已請 Joey 決定，不要重複通知他' : `已通知 Joey（${e.joey_tier === 'push' ? '已響鈴' : '靜默'}），不要重複通知他`)
-  for (const o of obs.filter(o => o.kind === 'peer')) st.push(o.owner === 'main' ? `你答應回 ${o.to}${o.due_at ? `（${simTime(o.due_at)} 前）` : ''}${o.state === 'met' ? '：已回' : ''}`
-    : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'met' ? `已回 ${o.to}${e.answered ? `：「${clip(String(e.answered), 80)}」` : ''}` : `還沒回 ${o.to}`)
-  for (const o of obs.filter(o => o.kind === 'receipt')) st.push(o.state === 'met' ? `run ${o.run_id} 回執已送` : `run ${o.run_id} 還沒回執`)
+  const unrun = (o: Ob): string | null => o.state === 'dropped' ? '沒有處理（對話線已關閉）' : o.state === 'merged' ? `併入 ${o.into ?? '另一件'} 一起處理` : null
+  const failed = (o: Ob): string => o.failed ? `（上次沒送到：${o.failed}）` : ''
+  if (joey) st.push(unrun(joey) ?? (joey.state === 'handed' ? '交給主線回報 Joey' : joey.state === 'requested' ? '正在通知 Joey'
+    : joey.state === 'open' ? (joey.rang ? '分流器已響鈴，車道還在查' : `還沒告訴 Joey${failed(joey)}`)
+    : joey.level === 'decision' ? '已請 Joey 決定，不要重複通知他' : joey.by === 'main' ? '你已回報 Joey' : `已通知 Joey（${e.joey_tier === 'push' ? '已響鈴' : '靜默'}），不要重複通知他`))
+  for (const o of obs.filter(o => o.kind === 'peer')) st.push(unrun(o) ?? (o.owner === 'main' ? `你答應回 ${o.to}${o.due_at ? `（${simTime(o.due_at)} 前）` : ''}${o.state === 'met' ? '：已回' : ''}`
+    : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'handed' ? `交給主線回 ${o.to}` : o.state === 'met' ? `已${o.by === 'main' ? '由你' : ''}${o.level === 'message' ? '告訴' : '回'} ${o.to}${e.answered && o.by !== 'main' ? `：「${clip(String(e.answered), 80)}」` : ''}`
+    : o.state === 'requested' ? `正在送給 ${o.to}` : `還沒回 ${o.to}${failed(o)}`))
+  for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線` : `run ${o.run_id} 還沒回執${failed(o)}`))
   if (handed) st.push(`需主線：〔${handed.handoff ?? handed.id}〕${clip(String(handed.what ?? ''), 200)}`)
   // PL1: what the main must know about the event is on its record
   if (e.answers) st.push(`回覆 ${e.answers === 'main' ? '你' : laneLabelOf(String(e.answers))} 的提問（對方標了不用回）`)
@@ -3949,10 +3985,10 @@ export async function routeRemote(ev: InEvent): Promise<Decision | null> {
 }
 /** inbox role: tell the tg daemon about a mesh send made by the main (send_to_agent). */
 export async function noteMainOutbound(msgId: number | undefined, thread: string | undefined, hop: number | undefined,
-  to?: string, text?: string, replyTo?: number | string): Promise<void> {
+  to?: string, text?: string, replyTo?: number | string, delivered = true): Promise<void> {
   if (msgId == null) return
   await peerCall(TG_PORT, '/lanes/outbound', 'POST', { msgId, owner: 'main', thread: thread ?? null, hop: hop ?? null, to: to ?? null, text: (text ?? '').slice(0, 400),
-    reply_to: replyTo ?? null })    // 002k (C4): what the send quotes; with the thread it says which promise the send answers
+    reply_to: replyTo ?? null, delivered })    // 002k (C4): what the send quotes; with the thread it says which promise the send answers. PL2: the delivery result
 }
 /** inbox role (K2): the tool-error text when the tg daemon refuses this send to a peer (disclosure check), or null. A daemon that cannot be asked, or does not answer: null (the send goes out). */
 export async function checkPeerSend(from: string, to: string, text: string): Promise<string | null> {
@@ -4092,7 +4128,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
         if (where.thread && !b.thread && where.from.startsWith('reply_to')) S.outbound[String(b.msgId)] = { owner: 'main', thread: where.thread }
         ledger({ lane: 'main', thread: b.thread ?? (where.from.startsWith('reply_to') ? where.thread : null), event: `main-send-${b.msgId}`, kind: 'action',
           text: `send_to_agent → ${String(b.to)}：${String(b.text).slice(0, 300)}`, refs: { btcc_msg_id: b.msgId, ...(b.reply_to != null ? { reply_to: String(b.reply_to) } : {}) } })
-        void mainSentTo(String(b.to), b.thread ?? null, b.reply_to ?? null, String(b.text))   // 002j: a promise the router made in the main's name is kept (002k C4: only the ones this answers)
+        void mainSentTo(String(b.to), b.thread ?? null, b.reply_to ?? null, String(b.text), String(b.msgId), b.delivered !== false)   // PL2: the turn's events first; 002j/002k C4: a promise it names
         void mainCommitmentCheck({ msgId: b.msgId, to: String(b.to), text: String(b.text), thread: where })   // 002k (C1): not awaited: the send is long done
       }
       saveState(); sendJson(res, 200, { ok: true }); return true

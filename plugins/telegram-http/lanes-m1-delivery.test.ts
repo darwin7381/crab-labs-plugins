@@ -212,6 +212,7 @@ test('inv A(3): a hand-over is an item: taken in and not finished (gen ended) le
   const st = L.__lanesState()
   st.lanes['adam.reflex.7'] = { id: 'adam.reflex.7', kind: 'reflex', n: 7, session_id: 's', thread: 'adam#t-h7', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   const tok = { runId: 'adam.reflex.7.r1', lane: 'adam.reflex.7', evId: 'ev-h7', closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any
+  L.__events().open('ev-h7', { class: 'peer', owner: 'adam.reflex.7', lane: 'adam.reflex.7', from: 'eve', text: 'Eve 要主線答應週五交報告', obligations: [] })   // the router recorded it (PL1)
   const g = await startMain()
   await L.callLaneTool(tok, 'handoff_main', { text: 'Eve 要主線答應週五交報告' })
   const ob = () => (L.__events().get('ev-h7')!.obligations as any[]).find(o => o.kind === 'main')
@@ -231,6 +232,7 @@ test('inv A(3): a hand-over is an item: taken in and not finished (gen ended) le
 const handover = (n: number, text: string) => {
   const st = L.__lanesState(), id = `adam.reflex.${n}`
   st.lanes[id] = { id, kind: 'reflex', n, session_id: 's', thread: `adam#t-h${n}`, status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
+  L.__events().open(`ev-h${n}`, { class: 'peer', owner: id, lane: id, from: 'eve', text, obligations: [] })   // the router recorded it (PL1)
   return L.callLaneTool({ runId: `${id}.r1`, lane: id, evId: `ev-h${n}`, closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any, 'handoff_main', { text })
 }
 test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the same prompt binds its item again (turn_continued); a StopFailure then queues it again, never done; the hand-over it met is open again', async () => {

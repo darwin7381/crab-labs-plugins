@@ -6,8 +6,14 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync } fro
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
+import { createServer } from 'http'
 process.env.LANES_FLOOD_CONTROL = '0'
+// the scheduler, as the inbox daemon reaches it (POST /lanes/scheduler): PL2, a receipt is met on the scheduler's answer
+const schedSrv = createServer((req, res) => { req.resume(); req.on('end', () => res.end(JSON.stringify({ text: '{"state":"completed"}' }))) })
+await new Promise<void>(r => schedSrv.listen(0, '127.0.0.1', () => r()))
+process.env.LANES_INBOX_PORT = String((schedSrv.address() as any).port)
 const L = await import('./lanes.ts?m4-test') as typeof import('./lanes.ts')
+delete process.env.LANES_INBOX_PORT
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-m4-'))
 process.env.LANES_DIR = dir
@@ -30,7 +36,7 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
   sendBot: async (_c: string, text: string) => { sent.push(text); return 100 + sent.length }, joeyChatId: () => '1' } as any)
 L.__setWallProbe(3_600_000)
 const procs: any[] = []
-afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setClaudeBin(restore); L.__setWallProbe(300_000); delete process.env.LANES_FLOOD_CONTROL })
+afterAll(() => { schedSrv.close(); try { writeFileSync(GO, 'ok') } catch {}; for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setClaudeBin(restore); L.__setWallProbe(300_000); delete process.env.LANES_FLOOD_CONTROL })
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
 const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
@@ -112,6 +118,7 @@ test('inv C(4): a walled main gets nothing owed until the wall comes down; then 
   const st = L.__lanesState()                                                                 // no lane can run behind the wall: a run that was already going hands over
   st.lanes['adam.reflex.99'] = { id: 'adam.reflex.99', kind: 'reflex', n: 99, session_id: 's', thread: 'adam#t-99', status: 'running', created: '', last: '', transcript: '/x', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   const a = 'ev-m4-walled'
+  L.__events().open(a, { class: 'peer', owner: 'adam.reflex.99', lane: 'adam.reflex.99', from: 'eve', text: 'Eve 要權限', obligations: [{ kind: 'peer', level: 'answer', to: 'eve' }] })   // the router recorded it
   await L.callLaneTool({ runId: 'adam.reflex.99.r1', lane: 'adam.reflex.99', evId: a, closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any, 'handoff_main', { text: 'Eve 要權限' })
   expect(offers.length).toBe(k)
   expect(journal().some(l => l.rec === 'wake' && l.id === a && l.state === 'no_wake' && /walled/.test(l.reason))).toBe(true)

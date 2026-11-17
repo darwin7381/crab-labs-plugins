@@ -1411,7 +1411,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
           },
           format: formatSchema,
-          ...(Lanes.LANES_ON ? { handoff_id: { type: 'string', description: 'lanes: when this reply reports on work a lane handed to you (the 〔ho-…〕 id in the digest), pass that id. The router then decides whether it rings, by the kind of that event.' } } : {}),
         },
         required: ['chat_id', 'text'],
       },
@@ -1477,10 +1476,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           hop = c.hop
         }
         { const refused = await Lanes.checkPeerSend('main', String(args.to ?? ''), String(args.text ?? '')); if (refused) return { content: [{ type: 'text', text: refused }], isError: true } }     // 002k (K2): disclosure check, as for a lane's reply_agent
-        let minted: number | undefined
+        let minted: number | undefined, delivered = false
         const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op,
-          { thread, hop, lane: `${INBOX_SELF}.main`, minted: id => { minted = id } })
-        await Lanes.noteMainOutbound(minted, thread, hop, String(args.to ?? ''), String(args.text ?? ''))
+          { thread, hop, lane: `${INBOX_SELF}.main`, minted: (id, ok) => { minted = id; delivered = ok } })
+        await Lanes.noteMainOutbound(minted, thread, hop, String(args.to ?? ''), String(args.text ?? ''), replyTo, delivered)   // PL2: met on the delivery
         return { content: [{ type: 'text', text: result + (thread ? ` [thread ${thread} hop ${hop}]` : '') }] }
       }
       const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op)
@@ -1508,7 +1507,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         assertAllowedChat(chat_id)
         // 002l (D16): the report on a hand-over goes out at the tier the router gives that event (design/notify 「分級由分流器…決定」); otherwise as before
-        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.handoffReplyTier({ handoff_id: args.handoff_id, reply_to }) : null
+        // PL2: the tier comes from the events of the main's running turn (M1 prompt → items → events), never from a parameter
+        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to }) : null
         const quiet = handoffTier?.silent ? { disable_notification: true } : {}
 
         for (const f of files) {
@@ -1579,11 +1579,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        if (handoffTier) Lanes.noteMainReplyTier(handoffTier, sentIds[0] ?? null)
+        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null)   // PL2: a request against the turn's events (met on the sent id)
         const result =
           (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (handoffTier ? ` (${handoffTier.silent ? 'silent' : 'push'}: the router's tier for the hand-over ${handoffTier.handoff})` : '')
+            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (handoffTier ? ` (${handoffTier.silent ? 'silent' : 'push'}: the router's tier for this turn's ${handoffTier.events.join(', ')})` : '')
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
