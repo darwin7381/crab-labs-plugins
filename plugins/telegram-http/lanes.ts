@@ -1832,7 +1832,7 @@ export function laneMaxUsd(kind: LaneKind): number {
 }
 function laneEnv(lane: Lane): Record<string, string> {
   const keep = ['PATH', 'LANG', 'LC_ALL', 'TERM', 'XDG_RUNTIME_DIR', 'USER', 'LOGNAME', 'SHELL']
-  const env: Record<string, string> = { HOME: process.env.HOME || homedir() }
+  const env: Record<string, string> = { ...userEnv(), HOME: process.env.HOME || homedir() }     // the user's settings env (the login): see writeLaneSettings
   for (const k of keep) if (process.env[k]) env[k] = process.env[k]!
   if (process.env.LANES_TOOL_SEARCH !== '1') env.ENABLE_TOOL_SEARCH = 'false'   // 002k (B1): lane tools are loaded at once (see above)
   env.GENESIS_ACTOR = lane.id
@@ -1983,8 +1983,33 @@ function renderEvent(ev: InEvent): string {
   return `[車道事件 ${ev.id}｜${tags.join('｜')}]${mark}\n${ev.text}`
 }
 
+// ------------------------------------------------------------------ a lane is the plugin's session, not the user's
+// A lane runs with --setting-sources project,local: the user's settings (~/.claude/settings.json) do not load. Their hooks were written for a person's
+// interactive session (the fleet's check_tg_reply.py blocks every Stop that sent no Telegram reply; that fights the lane, whose routine work is a
+// silent line or a receipt and whose Stop hook is the plugin's lane-stop-hook), and the plugins they enable bring hooks of their own. What a lane still
+// takes from the user's settings is said here, explicitly:
+//   - their `env` (the login lives there: CLAUDE_CODE_OAUTH_TOKEN), put in the lane's process environment, never written to a file;
+//   - the guard hooks LANES_USER_GUARDS names (comma-separated script names, e.g. "eden_guard.py,redact_hook.py"): copied into the lane settings with
+//     their event, matcher and timeout. A named guard that is not in the user's settings is logged; nothing else of the user's runs in a lane.
+const userSettings = (): any => readJson<any>(join(process.env.CLAUDE_CONFIG_DIR || join(process.env.HOME || homedir(), '.claude'), 'settings.json'), {})
+function userEnv(): Record<string, string> {
+  const e = userSettings()?.env
+  return e && typeof e === 'object' ? Object.fromEntries(Object.entries(e).filter(([, v]) => typeof v === 'string')) as Record<string, string> : {}
+}
+function userGuards(): Record<string, any[]> {
+  const names = String(process.env.LANES_USER_GUARDS ?? '').split(',').map(s => s.trim()).filter(Boolean)
+  const out: Record<string, any[]> = {}, found = new Set<string>()
+  for (const [ev, arr] of Object.entries((userSettings()?.hooks ?? {}) as Record<string, any[]>)) for (const m of Array.isArray(arr) ? arr : []) {
+    const hs = (m?.hooks ?? []).filter((h: any) => h?.type === 'command' && names.some(n => { const hit = String(h.command ?? '').split(/[\s/]/).includes(n); if (hit) found.add(n); return hit }))
+    if (hs.length) (out[ev] ??= []).push({ matcher: m.matcher ?? '', hooks: hs.map((h: any) => ({ type: 'command', command: h.command, ...(h.timeout ? { timeout: h.timeout } : {}) })) })
+  }
+  for (const n of names) if (!found.has(n)) D?.log('warn', `lanes: LANES_USER_GUARDS names ${n}, which is not a command hook in the user's settings: lanes run without it`)
+  return out
+}
+
 function writeLaneSettings(): void {
   const py = process.env.LANES_PYTHON ?? '/usr/bin/python3'
+  const guards = userGuards()
   const settings = {
     ...(laneAutoMemoryOff() ? { autoMemoryEnabled: false } : {}),         // 002l (S0 item 1): with the env, the setting too
     hooks: {
@@ -1996,8 +2021,9 @@ function writeLaneSettings(): void {
       PostToolUse: [{ matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'memory-commit-hook.py')}`, timeout: 20 }] },
         // 002k (E18): Joey's message that reached this run while it was in progress, handed over at the next tool boundary (lane-stop-hook.py hands it over at the end)
         { matcher: '', hooks: [{ type: 'command', command: `${py} ${join(PLUGIN_DIR, 'lanes-hooks', 'lane-steer-hook.py')}`, timeout: 10 }] }],
-    },
+    } as Record<string, any[]>,
   }
+  for (const [ev, ms] of Object.entries(guards)) settings.hooks[ev] = [...(settings.hooks[ev] ?? []), ...ms]     // the user's guards, beside the plugin's
   writeJsonAtomic(join(LANES_DIR, 'lane-settings.json'), settings, 0o644)
 }
 
@@ -2110,7 +2136,7 @@ function startRun(it: QItem): void {
   const args = ['-p', runPrompt(it, lane), '--model', MODEL, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt-file', laneSystemPromptFile(lane.kind),        // 002l (D15): card + CLAUDE.md context + memory index, one file per kind
-    '--settings', join(LANES_DIR, 'lane-settings.json'),
+    '--settings', join(LANES_DIR, 'lane-settings.json'), '--setting-sources', 'project,local',   // the plugin's lane settings, never the user's (writeLaneSettings)
     '--output-format', 'stream-json', '--verbose',
     '--dangerously-skip-permissions',
     '--disable-slash-commands', '--tools', laneBuiltinTools(lane.kind),     // 002k (B1)

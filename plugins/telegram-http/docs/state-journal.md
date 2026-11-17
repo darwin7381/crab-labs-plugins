@@ -266,6 +266,18 @@ How the main is registered:
 
 The daemon writes the lane settings into `.lanes/lane-settings.json`. The lane Stop hook is lane-stop-hook.py. A slot carries nothing for lanes.
 
+A lane is the plugin's session, not the user's. It runs with `--settings .lanes/lane-settings.json --setting-sources project,local`: the user's
+settings (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) do not load, so neither their hooks nor the plugins they enable run in a
+lane. Their hooks were written for an interactive session: the fleet's `check_tg_reply.py` blocks every Stop that sent no Telegram reply, which fights
+a lane whose routine work is a silent line or a receipt, and whose Stop hook (lane-stop-hook.py) already owns what is still owed. The workspace's own
+project and local settings still load. What a lane takes from the user's settings is explicit:
+- their `env` (the login, `CLAUDE_CODE_OAUTH_TOKEN`), put into the lane's process environment, never written to a file;
+- the guard hooks `LANES_USER_GUARDS` names (comma-separated script names, e.g. `eden_guard.py,redact_hook.py`), copied into the lane settings
+  beside the plugin's hooks with their event, matcher and timeout. A named guard that is not in the user's settings is logged.
+
+The main is a normal session: it keeps the user's settings and their hooks. That is why M1 ends a turn at its last Stop ("A turn ends at its last
+Stop").
+
 ## Special cases kept (marked `SPECIAL CASE` in the code)
 
 1. **An asked restart** (`/restart`, `/kill_stuck`): the items of the cut turn end `done` with `reason: asked_restart`, and Joey gets one line. They are
