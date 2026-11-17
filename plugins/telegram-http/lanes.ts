@@ -277,8 +277,6 @@ function sessionOfPid(pid: number): string | null {
   for (const [s, p] of mcpSessionPid) if (p === pid) { if (D.streamOpen?.(s)) return s; any = s }
   return any
 }
-export function mainRegistration(): { session_id: string; pid: number; transcript_path: string } | null { return D?.role === 'tg' && main ? main.mainSession() : null }
-export function mainMcpSession(): string | null { const pid = main?.mainPid(); return pid ? sessionOfPid(pid) : null }
 // ------------------------------------------------------------------ 002m (LG1): a session that is not the main has no Telegram tools
 // runtime RU5 「只有持有「主」的那一個，拿得到你主對話的回覆工具」 and RU4 「沒有發的工具，就是不能做的事。搞錯身份也做不出主線的事」; RT11 (a second claude
 // started in the folder is never the main). G01 (002l r1-r3): the refused second session still listed and could call reply, react and edit_message.
@@ -1233,8 +1231,7 @@ function noteAlert(ev: InEvent, thread: string): void {
 
 // ------------------------------------------------------------------ 002k (E18): Joey's steering reaches a lane run that is in progress
 // 002j E04 / F01: a message of Joey's that routed to a lane whose run was in progress was queued behind that run (48 to 156 s). A `claude -p` lane has no
-// channel to receive a message on mid-run (the main gets one from the harness, which absorbs it into the turn: main-midturn-hook.py reads that from the
-// transcript), so the daemon does the equivalent through a file: the message is appended to run/steer/<lane>.in.jsonl and lane-steer-hook.py, a PostToolUse
+// channel to receive a message on mid-run (the main's hook pulls what reached it at its tool boundaries: M1, lanes-main.ts), so the daemon does the equivalent through a file: the message is appended to run/steer/<lane>.in.jsonl and lane-steer-hook.py, a PostToolUse
 // hook every lane run carries, hands it to the model at its next tool boundary (lane-stop-hook.py hands it over when the run is about to end with it
 // undelivered). The hook marks what it handed over in run/steer/<lane>.out.jsonl; the daemon reads that, writes the delivery to the ledger, and when the run
 // ends with a message still undelivered (the run was inside one long tool call, or ended on its own) that message becomes the lane's next run at priority 0:

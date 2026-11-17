@@ -2,7 +2,7 @@
 """Mid-run steering for a LANE (universe 002k, E18): PostToolUse + Stop hook.
 
 A message from Joey that routes to a lane whose run is in progress used to wait in the queue until the run ended (002j E04 / F01: 48 to 156 s). A `claude -p`
-lane has no channel to receive it on (the main gets such messages from the harness: main-midturn-hook.py reads the transcript's absorbed-mid-turn records), so the
+lane has no channel to receive it on (the main's hook pulls what reached it at its tool boundaries: lanes-main.ts M1), so the
 daemon does the equivalent through a file: it appends the message to <lanes dir>/run/steer/<lane id>.in.jsonl, and this hook, which every lane run carries, hands
 it to the model once:
   PostToolUse -> additionalContext at the next tool boundary (rides on the call the model was going to make anyway: no extra model call)
@@ -10,7 +10,7 @@ it to the model once:
                  the lane's two Stop checks never answer one Stop event with two different blocks; this file is registered for PostToolUse only)
 What was handed over is written to <lane id>.out.jsonl (before anything is printed: a message that cannot be marked is not handed over, so it never repeats); the
 daemon reads that file, writes the delivery to the ledger and queues whatever was NOT delivered (the run ended first) as the lane's next run, ahead of the rest.
-Not in the main's settings (the main has main-midturn-hook.py).
+Not in the main's settings (the main has main-hook.py).
 """
 import json
 import os
