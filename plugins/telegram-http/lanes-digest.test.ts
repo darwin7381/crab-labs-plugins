@@ -88,8 +88,7 @@ test('ledger_query: filters — since (ISO and relative), kind, text (substring 
     lq(400, { kind: 'notify', text: '[push] A-1103 mock-backup P1 回報' }),
   ]).join('\n')
   const q = (a: object) => queryLedger(raw, a, NOW)
-  expect(rowsOf(q({})).length).toBe(3)                                               // 002d: no filter = the activity list, one line per thread / threadless event
-  expect(q({}).split('\n')[0]).toContain('活動清單：3 件事')
+  expect(rowsOf(q({})).length).toBe(5)                                               // the pure lookup with no filter lists entries; the tool gives the activity list (M3)
   expect(rowsOf(q({ kind: 'action' })).length).toBe(1)
   expect(rowsOf(q({ kind: 'escalation' })).length).toBe(1)
   expect(rowsOf(q({ kind: 'FYI' }))[0]).toContain('P-201')                           // kind is case-insensitive too
@@ -100,10 +99,10 @@ test('ledger_query: filters — since (ISO and relative), kind, text (substring 
   expect(rowsOf(q({ text: '[unclosed' })).length).toBe(0)                            // invalid regex, no such substring: empty, not a crash
   expect(rowsOf(q({ text: 'adam#t-af248d' })).length).toBe(1)                        // thread is searchable
   expect(rowsOf(q({ since: '-4h' })).length).toBe(1)                                 // NOW - 240 min = minute 360: only the entry at 400
-  expect(rowsOf(q({ since: new Date(T0 + 150 * 60_000).toISOString() })).length).toBe(2)   // activity list: the thread with entries 200+400, the notice at 300
+  expect(rowsOf(q({ since: new Date(T0 + 150 * 60_000).toISOString() })).length).toBe(3)   // the entries at 200, 300, 400
   expect(rowsOf(q({ since: '-11h', kind: 'receipt' })).length).toBe(1)               // NOW - 660 min is before minute 0
   expect(q({ since: '-9h', kind: 'receipt' })).toContain('沒有符合的 kind=receipt')    // NOW - 540 min is after the receipt: 002c says so and widens to all kinds (never empty)
-  expect(q({ since: '-1m' })).toContain('這個範圍內沒有紀錄')
+  expect(q({ since: '-1m' })).toContain('沒有符合的紀錄')
 })
 
 test('ledger_query: newest last, capped at 30 entries, each text cut to 600 chars, header says how many matched', () => {
@@ -134,7 +133,8 @@ test('ledger_query: missing / empty / damaged ledger is safe; bad arguments are 
 test('ledger_query tool reads the LIVE ledger at call time (a missing file = empty ledger) and is main-only', async () => {
   rmSync(join(dir, 'ledger.jsonl'), { force: true })
   expect(existsSync(join(dir, 'ledger.jsonl'))).toBe(false)
-  expect(ledgerQueryTool({})).toContain('帳本還沒有任何紀錄')
+  expect(ledgerQueryTool({})).toStartWith('活動清單：')                                // no filter: the M3 event view, not the ledger file
+  expect(ledgerQueryTool({ text: 'x' })).toContain('帳本還沒有任何紀錄')
   writeFileSync(join(dir, 'ledger.jsonl'), jl([lq(1, { text: 'first' })]).join('\n') + '\n')
   expect(rowsOf(ledgerQueryTool({ text: 'first' })).length).toBe(1)
   writeFileSync(join(dir, 'ledger.jsonl'), readFileSync(join(dir, 'ledger.jsonl'), 'utf8') + jl([lq(2, { text: 'appended later' })]).join('\n') + '\n')

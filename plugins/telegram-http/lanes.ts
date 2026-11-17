@@ -39,14 +39,14 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  clip, cleanReport, MUST_KNOW_MARK, openJoeyProposals, parseLedgerLine, parseLocal, queryLedger, renderEventDigest, stripMarkup, type DigestLine, type LedgerRec,
+  clip, cleanReport, MUST_KNOW_MARK, openJoeyProposals, parseLedgerLine, parseLocal, parseSince, queryLedger, renderEvents, stripMarkup, type DigestLine, type LedgerRec,
 } from './lanes-digest.ts'
 
 export const LANES_ON = process.env.GENESIS_LANES === '1'
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const HOP_LIMIT = Number(process.env.LANES_HOP_LIMIT ?? 6)
-import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp, renderActivity } from './lanes-digest.ts'
+import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp } from './lanes-digest.ts'
 import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, outcomeFingerprint, runIdOfText, sameOutcome, simTime } from './lanes-followup.ts'
 
 const MAX_RUNNING = Number(process.env.LANES_MAX ?? 4)
@@ -416,7 +416,6 @@ export function handoverBrief(gen: number): string {
   const pend = mainObs.filter(x => x.o.kind === 'main').slice(-8).map(x => `- ${x.o.told ? '（已直接告訴 Joey）' : ''}〔${x.o.handoff ?? x.o.id}〕${String(x.e.text ?? '').slice(0, 240)}`)
   const promises = mainObs.filter(x => x.o.kind === 'peer' || x.o.level === 'commitment').map(x => `- 答應 ${x.o.to}：${x.o.due_at ? `${simTime(x.o.due_at)} 前` : ''}「${String(x.o.what ?? '').slice(0, 120)}」（${x.o.told ? '已過時' : '未到期'}）`)
   const lanes = Object.values(S.lanes).filter(l => l.status !== 'closed').map(l => `- ${laneLabel(l)}（${l.id}）${l.title ? `「${l.title}」` : ''} ${running.has(l.id) ? '執行中' : '閒置'}`)
-  const act = renderActivity(recs.filter(r => Date.now() - Date.parse(r.ts) < 24 * 3600_000))
   return [
     `〔系統通知｜主線交接〕你是 ${D.agent} 的主線（第 ${gen} 代）。Joey 要求把主線換成新的 session，你就是新的主線；上一代 session 已經結束，它的對話不在你的 context 裡。`,
     '下面是交接內容，全部來自磁碟上的焦點卡與帳本。要細節用 ledger_query。先把焦點卡讀過，接著做手上的事；不用回覆這則通知。',
@@ -425,7 +424,7 @@ export function handoverBrief(gen: number): string {
     ...(promises.length ? ['', '## 系統替你答應的回覆期限', promises.join('\n')] : []),
     '', '## 交給主線、還要你處理的事', pend.length ? pend.join('\n') : '（沒有）',
     '', '## 開著的車道', lanes.length ? lanes.join('\n') : '（沒有）',
-    '', '## 最近 24 小時的活動清單', act ? act.lines.join('\n') : '（沒有）',
+    '', '## 最近 24 小時的活動清單', activityList(undefined),
   ].join('\n')
 }
 export async function mainRenew(who: string): Promise<string> {
@@ -3397,8 +3396,10 @@ async function openWorkerLane(title: string, brief: string): Promise<Lane> {
   return lane
 }
 
-/** ledger_query: the live append-only ledger, read at call time; a missing file is an empty ledger. */
+/** ledger_query: with no kind and no text, the activity list (the M3 event view); otherwise the live append-only ledger, read at call time (a missing
+ *  file is an empty ledger). */
 export function ledgerQueryTool(a: any): string {
+  if (!String(a?.kind ?? '').trim() && !String(a?.text ?? '').trim()) return activityList(a?.since)
   let raw: string | null = null
   try { raw = readFileSync(ledgerPath(), 'utf8') } catch { raw = null }
   return queryLedger(raw, { since: a?.since, kind: a?.kind, text: a?.text }, Date.now())
@@ -3767,14 +3768,30 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   const live = main.items(r => r.kind === 'digest' && (r.state === 'offered' || r.state === 'bound'))
   const shown: Record<string, number> = Object.assign({}, seen, ...live.map(r => r.events ?? {}))
   const changed = events.rows(e => e.owner !== 'main' && !!e.lane && e.version > (Number(shown[e.id]) || 0))
-  const lines = readLedgerLines().map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
-  const reopen = openJoeyProposals(lines).map(r => `• 記憶提案 ${r.refs?.proposal_id ?? '-'}｜${laneLabelOf(r.lane)}｜${stamp(r.ts)}｜還沒決定（Joey 說的話）；需主線：用 memory_decide 決定：${clip(r.text.split('\n〔Jev')[0], 200)}`)   // 002k (D1)
-  if (!changed.length && !reopen.length) return null
-  const d = renderEventDigest(changed.map(digestLine), [...reopen, ...holdLines()])
+  const standing = standingLines()
+  if (!changed.length && !standing.proposals.length) return null                  // a hold alone is not news: it rides with something that is
+  const d = renderEvents(changed.map(digestLine), [...standing.proposals, ...standing.holds], 'digest')
   if (!d) return null
   appendJsonl('routing.jsonl', { event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
   return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items } }
+}
+/** the lines every view carries while they last: open Joey memory proposals (002k D1) and active peer holds */
+function standingLines(): { proposals: string[]; holds: string[] } {
+  const lines = readLedgerLines().map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
+  return { proposals: openJoeyProposals(lines).map(r => `• ${stamp(r.ts)}｜${laneLabelOf(r.lane)}｜記憶提案 ${r.refs?.proposal_id ?? '-'}｜還沒決定（Joey 說的話）；需主線：用 memory_decide 決定：${clip(r.text.split('\n〔Jev')[0], 200)}`),
+    holds: holdLines() }
+}
+const DAY_MS = 24 * 3600_000
+/** ledger_query() with no filter: the activity list. The same lines as the digest (digestLine, renderEvents), for every event record changed in the window
+ *  (`since`; default the last 24 h), with no line limit. The main's own events are not in it (it handled them). */
+export function activityList(sinceArg: unknown, now = Date.now()): string {
+  const since = parseSince(sinceArg, now)
+  if (since === 'bad') return `since 格式不對：${String(sinceArg)}。用時間（2026-11-13 12:00；不寫時區就當成 ${TZ_LABEL}）或相對時間（-4h、-30m、-2d）。`
+  const from = since ?? now - DAY_MS
+  const evs = events ? events.rows(e => e.owner !== 'main' && !!e.lane && Date.parse(String(e.ts)) >= from) : []
+  const standing = standingLines()
+  return renderEvents(evs.map(digestLine), [...standing.proposals, ...standing.holds], 'day', `${since == null ? '最近 24 小時' : `${stamp(new Date(from).toISOString())} 起`}`)!.text
 }
 const laneLabelOf = (id: string): string => S.lanes[id] ? laneLabel(S.lanes[id]) : id === 'router' ? '分流器' : id
 /** one event, one line: who handled it, what happened, and where each obligation stands (M3) */
@@ -3793,7 +3810,7 @@ function digestLine(e: Row): DigestLine {
   const mark = e.class === 'critical' ? MUST_KNOW_MARK : ''
   const out = e.outcome === 'failed' ? '（失敗）' : e.outcome === 'changed' ? '（有變化）' : ''
   return { id: e.id, group: handed ? 0 : joey?.level === 'decision' && joey.state === 'met' ? 1 : 2, label: `${who}｜${e.from ?? '-'}`,
-    line: `• ${mark}${who}｜${e.from ?? '-'}｜${stamp(String(e.created))}｜${what}${out}｜${st.join('；') || (e.state === 'closed' ? '已結束' : '處理中')}` }
+    line: `• ${stamp(String(e.created))}｜${who}｜${mark}${what}${out}｜來自 ${e.from ?? '-'}｜${st.join('；') || (e.state === 'closed' ? '已結束' : '處理中')}` }
 }
 
 // ================================================================== cross-daemon calls

@@ -2,7 +2,7 @@
 //   ask_joey      the lane needs JOEY: it tells him itself, once (push); the main is not woken, it reads it in its digest
 //   handoff_main  the lane needs the MAIN: the main is woken and reports; Joey hears nothing from the lane or the router
 //   fallback      a handoff the main does not get (not connected / not delivered in time) is told to Joey, once
-// and the activity list: ledger_query() with no filter = one line per handled event.
+// and ledger_query's filtered answers (the activity list is the M3 event view: lanes-digest-m3.test.ts).
 // No network, no daemon, no lane process.
 import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'fs'
@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
 import { lanesInit, callLaneTool, identityCard, laneContext, routeEvent, LANE_TOOLS, __lanesState, __setMainConnected, __main, __digest } from './lanes.ts'
-import { queryLedger, stamp, parseSince, NOT_TOLD, type LedgerRec } from './lanes-digest.ts'
+import { queryLedger, stamp, parseSince, type LedgerRec } from './lanes-digest.ts'
 
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-handoff-'))
@@ -64,7 +64,7 @@ test('identity card: three ways out, one per event; a critical alert must reach 
   expect(laneContext(lane, { summary: undefined, ev: {} } as any)).not.toContain('分流器標記：嚴重警報')
 })
 
-// ------------------------------------------------------------------ the activity list
+// ------------------------------------------------------------------ a day of ledger entries (filtered queries)
 const T0 = Date.parse('2026-11-13T02:00:00Z')
 const rec = (i: number, o: Partial<LedgerRec>): string =>
   JSON.stringify({ ts: new Date(T0 + i * 60_000).toISOString(), lane: 'adam.reflex.1', thread: 'adam#t-a1', event: `ev-${i}`, kind: 'action', text: '', notify_main: false, refs: null, detail: null, ...o })
@@ -83,24 +83,6 @@ const DAY = [
   // a request the lane handed to the main
   rec(40, { lane: 'adam.reflex.4', thread: 'adam#t-a4', kind: 'escalation', notify_main: true, text: 'Eve 要 10 月可用率，明天 10:00 前；需要主線決定要不要答應', refs: { handoff: 'ho-1' } }),
 ]
-
-test('activity list: ledger_query() with no filter = one line per handled event, every one of them, with who was told', () => {
-  const out = queryLedger(DAY.join('\n'), {}, T0 + 600 * 60_000)
-  const lines = out.split('\n')
-  expect(lines[0]).toContain('活動清單：6 件事')
-  const body = lines.slice(1, -1)
-  expect(body.length).toBe(6)
-  expect(body[0]).toContain('31 張')
-  expect(body[0]).toContain('已通知 Joey（靜默）')
-  expect(body[1]).toContain('每週三 02:00–03:00')
-  expect(body[1]).toContain(NOT_TOLD)                                                  // answered a peer, Joey was not messaged
-  expect(body[2]).toContain('P-201')                                                   // the two router notices do not hide each other
-  expect(body[3]).toContain('下週一我請假')
-  expect(body[4]).toContain('已請 Joey 決定（已響鈴）')
-  expect(body[5]).toContain('交給主線：Eve 要 10 月可用率')
-  expect(lines[lines.length - 1]).toContain('帳本各種類現有筆數')
-  expect(queryLedger(DAY.join('\n'), { since: new Date(T0 + 25 * 60_000).toISOString() }, T0 + 600 * 60_000).split('\n')[0]).toContain('活動清單：2 件事')
-})
 
 test('a filtered ledger_query always ends by saying what else exists and how to get the whole day', () => {
   const out = queryLedger(DAY.join('\n'), { kind: 'escalation' }, T0 + 600 * 60_000)
@@ -135,26 +117,12 @@ test('002e: the header Joey reads names the lane and carries no internal thread 
   expect(sent[0].text).not.toContain('adam#t-')
 })
 
-test('002e: what the main itself told another agent is a line of the activity list (next to the handoff it answers, or on its own)', () => {
-  const day = [
-    rec(40, { lane: 'adam.reflex.4', thread: 'adam#t-a4', kind: 'escalation', notify_main: true, text: 'Eve 要 10 月可用率；需要主線決定', refs: { handoff: 'ho-1' } }),
-    rec(41, { lane: 'main', thread: 'adam#t-a4', event: 'main-send-50010', kind: 'action', text: 'send_to_agent → eve：整月數字給不出來，只有 10-22 之後的取樣 99.13%' }),
-    rec(50, { lane: 'main', thread: null, event: 'main-send-50011', kind: 'action', text: 'send_to_agent → cain：請不要再發測試訊息' }),
-  ]
-  const lines = queryLedger(day.join('\n'), {}, T0 + 600 * 60_000).split('\n')
-  expect(lines[0]).toContain('活動清單：2 件事')
-  expect(lines[1]).toContain('交給主線：Eve 要 10 月可用率')
-  expect(lines[1]).toContain('主線做了：send_to_agent → eve：整月數字給不出來')
-  expect(lines[2]).toContain('send_to_agent → cain')
-})
-
 // ------------------------------------------------------------------ 002f
 test('002f: every time the main is shown is local (UTC+8) and the list says so; a time given back without a zone is read as local', () => {
   expect(stamp('2026-11-13T04:50:12.000Z')).toBe('11-13 12:50')          // the 12:50 failure is shown as 12:50, not 04:50
   expect(stamp('2026-11-12T18:05:00Z')).toBe('11-13 02:05')              // the date follows the local day
-  const out = queryLedger(DAY.join('\n'), {}, T0 + 600 * 60_000).split('\n')
-  expect(out[0]).toContain('時間為 UTC+8')
-  expect(out[1].startsWith('• 11-13 10:00｜')).toBe(true)                 // T0 = 02:00Z = 10:00 local
+  const out = queryLedger(DAY.join('\n'), { kind: 'notify' }, T0 + 600 * 60_000).split('\n')
+  expect(out[1].startsWith('11-13 10:00｜')).toBe(true)                   // T0 = 02:00Z = 10:00 local
   expect(queryLedger(DAY.join('\n'), { kind: 'notify' }, T0 + 600 * 60_000).split('\n')[0]).toContain('時間為 UTC+8')
   expect(parseSince('2026-11-13 12:00', 0)).toBe(Date.parse('2026-11-13T04:00:00Z'))
   expect(parseSince('2026-11-13T12:00:00+08:00', 0)).toBe(Date.parse('2026-11-13T04:00:00Z'))

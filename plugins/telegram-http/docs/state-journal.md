@@ -168,13 +168,18 @@ What happens next:
 
 **Busy** is "the lane has a queued, leased or running record" (`laneBusy`). The journal is the queue: there are no queue files.
 
-## The digest: a renderer over M3
+## The digest and the activity list: one renderer over M3
 
 The digest is information that rides an M1 offer or pull. It is never offered alone.
 - One line per event record whose `version` is past what the digests showed: `.lanes/digest.json` `{seen: {<event id>: <version>}}`, merged from a
   digest item's `events` when it reaches `done`, and the `events` of a digest item still `offered` or `bound`.
 - At most 8 lines, in this order: owed to the main (`需主線`), waiting on Joey's decision, the rest. The overflow is named on one line.
 - An open Joey memory proposal and an active peer hold are lines of every digest while they last.
+- A line is `• MM-DD HH:MM｜<who handled it>｜<what happened>｜來自 <sender>｜<where each obligation stands>` (lanes.ts digestLine).
+
+**The activity list** (`ledger_query()` with no `kind` and no `text`) is the same renderer (lanes-digest.ts `renderEvents`) over the same lines, in the
+same order, for every event record changed in the window: the last 24 h, or since `since`. It has no line limit, and it is not affected by what the
+digests showed. The main's own events are in neither view. A filtered `ledger_query` still reads ledger.jsonl entries.
 
 ## The main's hook
 
