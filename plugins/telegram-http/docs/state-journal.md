@@ -66,7 +66,8 @@ How items move:
 - **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main, with the digest riding on it.
   An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
   the SDK drops a notification without an error when it has no GET stream). If no such stream exists, the item stays `queued` and nothing is
-  offered; the next pump (the stream opening, a Stop, the 5-second tick) tries again. An item is offered to a gen once: an offer is never written again.
+  offered; the next pump (the stream opening, a Stop, the 5-second tick) tries again. An item is offered to a gen once, and once more only at a stuck
+  episode (below): the episode's untaken items go back to `queued` with `reason: stuck_unbound` and M1 offers again (002q, H02/H03).
 - **Bind.** At the first hook event with a new `prompt_id`, the daemon binds to that turn every item offered to this gen, plus any queued item the
   prompt names (`did="..."`).
 - **Pull.** A busy gen is never offered anything. At its next PostToolUse, or at its Stop, every queued item is bound to the running prompt and
@@ -83,7 +84,7 @@ Fields:
   `meta.did = "<item id>,<digest id>"`.
 - `gen` and `prompt_id`, while `offered` or `bound`. `via_pull: true` means the item was pulled at a tool boundary or at `Stop`.
 - `reason`, when the item returns to `queued`: `stop_failure:<error>`, `gen_end`, `interrupted` (a new prompt came with no Stop), `session_start`
-  (the same process started a new session mid-turn). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).
+  (the same process started a new session mid-turn), `stuck_unbound` (002q: offered, never bound, and the gen's stuck episode began). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).
 - `done` clears an earlier `reason`; it may carry `reason: asked_restart` (special case 1 below).
 - Digest items also have `events` and `items`:
   - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
@@ -414,5 +415,8 @@ while an item offered to it is not bound yet (`idle` or `walled` with an `offere
 PostToolUse is the event the gen owes when the tool ends, and Claude Code bounds a tool by its own timeout. It is stuck when it owes one and has sent none for `LANES_MAIN_STUCK_MS` (default 600 s); the silence counts
 from its last hook event, or from the offer when that came later.
 - One alarm per episode. For an idle gen the limit-menu pane read says whether a menu is the reason.
+- **The episode is M1's recovery signal** (002q, H02/H03: a notification lost on the client side under host load stayed lost, and the play never
+  started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)
+  and M1 offers again at once (a walled gen at its next probe time). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
 - The next hook event of the gen clears it, and Joey is told once. A later silence is a new episode.
-- Nothing else moves this clock: an offer is written once, so a frozen main (SIGSTOP) is alarmed once and gets its offer when it runs again.
+- Nothing else moves this clock: a frozen main (SIGSTOP) is alarmed once and re-offered once; it gets what was written into it when it runs again.

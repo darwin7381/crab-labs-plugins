@@ -294,7 +294,7 @@ test('fleet #13 / SIGSTOP wedge: a stopped main sends no hook event; the stuck r
   await killed(g)
 })
 
-test('D3 (basics): the main frozen with SIGSTOP while items are offered: exactly one 疑似卡死, nothing offered twice, no clock reset; SIGCONT and its next hook event clear it', async () => {
+test('D3 (basics), 002q H02: the main frozen with SIGSTOP while items are offered: exactly one 疑似卡死; the episode re-offers the untaken item once (no more while it lasts); SIGCONT and its next hook event clear it', async () => {
   await drained()
   __setMainStuckMs(80)
   const g = await startMain()
@@ -307,8 +307,9 @@ test('D3 (basics): the main frozen with SIGSTOP while items are offered: exactly
   expect(M().mainPhase()).toBe('idle')                                                      // kill -0 answers a stopped process: the gen is not gone
   expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1)
   expect(sent.slice(k).find(s => s.includes('疑似卡死'))).toContain('沒有被接手')
-  expect(offers.length).toBe(o + 1)                                                         // the offer was written once; nothing rewrote it
-  expect(journal().filter(l => l.rec === 'msg' && l.id === a).map(l => l.state)).toEqual(['queued', 'offered'])
+  expect(offers.length).toBe(o + 2)                                                         // 002q: written once, and once more at the stuck episode; not again while it lasts
+  expect(journal().filter(l => l.rec === 'msg' && l.id === a).map(l => l.state)).toEqual(['queued', 'offered', 'queued', 'offered'])
+  expect(journal().find(l => l.rec === 'msg' && l.id === a && l.state === 'queued' && l.reason)).toMatchObject({ reason: 'stuck_unbound' })
   expect(journal().some(l => l.reason === 'offer_unanswered')).toBe(false)
   g.proc.kill('SIGCONT')
   const p = P()
@@ -322,6 +323,30 @@ test('D3 (basics): the main frozen with SIGSTOP while items are offered: exactly
   expect(state(a)).toBe('done'); expect(state(b)).toBe('done')
   for (let i = 0; i < 4; i++) { await sleep(25); await M().tick() }                         // idle with nothing offered owes nothing: no second alarm
   expect(sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(1)
+  __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('002q H02/H03: an offer the client lost (no hook event ever binds it) is offered once more at the stuck episode, and the main takes it; the alarm says so', async () => {
+  await drained()
+  __setMainStuckMs(60)
+  const g = await startMain()
+  const k = sent.length, o = offers.length
+  const a = await joey('H02 prime')
+  expect(state(a)).toBe('offered'); expect(offers.length).toBe(o + 1)                      // written into a live stream, then lost on the client side
+  for (let i = 0; i < 3; i++) { await sleep(30); await M().tick() }
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1)
+  expect(sent.slice(k).find(s => s.includes('疑似卡死'))).toContain('我再交給它一次')
+  expect(offers.length).toBe(o + 2); expect(state(a)).toBe('offered')                       // the episode is the signal: offered again, with no timer of its own
+  expect(offers.at(-1)!.notif.params.meta.did.split(',')[0]).toBe(a)
+  for (let i = 0; i < 4; i++) { await sleep(30); await M().tick() }
+  expect(offers.length).toBe(o + 2)                                                         // once per episode
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [a] })                            // this time the main takes it
+  expect(state(a)).toBe('bound')
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(a)).toBe('done')
   __setMainStuckMs(stuck0)
   await killed(g)
 })
