@@ -71,9 +71,9 @@ test('002m aid (c) 1fb35ef, 002b, A06/C03: lane events that end with their oblig
   expect(M().mainPhase()).toBe('idle')
   const k = offers.length
   const a = await laneDoes({ ...mk('scheduler', '[scheduled][backup-check][run:61][P3][routine] 查備份'), meta: { run_id: '61' } }, async t => {
-    await L.callLaneTool(t, 'notify_joey', { text: '備份正常' }); await L.callLaneTool(t, 'receipt', { outcome: 'done', run_id: '61', happened: '備份檢查', did: '一切正常', promised: '無', needs_main: '無' }) })
+    await L.callLaneTool(t, 'notify_joey', { outcome: 'normal', text: '備份正常' }); await L.callLaneTool(t, 'receipt', { outcome: 'done', run_id: '61', happened: '備份檢查', did: '一切正常', promised: '無', needs_main: '無' }) })
   const b = await laneDoes(mk('eve', '維護幾點？'), async t => {
-    await L.callLaneTool(t, 'reply_agent', { to: 'eve', text: '02:00' }); await L.callLaneTool(t, 'notify_joey', { text: 'Eve 問維護，回 02:00' }) })
+    await L.callLaneTool(t, 'reply_agent', { to: 'eve', text: '02:00' }); await L.callLaneTool(t, 'notify_joey', { outcome: 'normal', text: 'Eve 問維護，回 02:00' }) })
   await M().tick()
   expect(offers.length).toBe(k)                                                             // nothing was offered: the idle main was not woken
   for (const id of [a, b]) expect(journal().some(l => l.rec === 'wake' && l.id === id && l.state === 'no_wake')).toBe(true)
@@ -87,7 +87,7 @@ test('002m aid (c) 1fb35ef, 002b, A06/C03: lane events that end with their oblig
 
 test('002d: a line that rings Joey (a critical alert the lane reported) is information for the main: it does not wake it', async () => {
   const k = offers.length
-  await laneDoes(mk('alert-dispatcher', '[P1] mock-api 全掛'), async t => { await L.callLaneTool(t, 'notify_joey', { text: 'mock-api 已重啟恢復' }) })
+  await laneDoes(mk('alert-dispatcher', '[P1] mock-api 全掛'), async t => { await L.callLaneTool(t, 'notify_joey', { outcome: 'normal', text: 'mock-api 已重啟恢復' }) })
   await M().tick()
   expect(sent.at(-1)).toContain('mock-api 已重啟恢復')
   expect(offers.length).toBe(k)

@@ -75,12 +75,12 @@ test('a reply in a thread inherits the class of the run that asked; other classe
   expect(effectiveClass('peer', 'joey')).toBe('peer')
 })
 
-test('lanes declare nothing about the tier: notify_joey takes the text and the outcome as a field (normal | changed | failed), never a tier', () => {
+test('lanes declare nothing about the tier: notify_joey takes the text and the outcome as a required field (normal | changed | failed | needs_you), never a tier', () => {
   const t = LANE_TOOLS.find(x => x.name === 'notify_joey')!
   expect(Object.keys((t.inputSchema as any).properties)).toEqual(['text', 'outcome', 'service', 'check'])   // 002q (B08): the matter is a field too
   expect(Object.keys((t.inputSchema as any).properties)).not.toContain('tier')
-  expect((t.inputSchema as any).properties.outcome.enum).toEqual(['normal', 'changed', 'failed'])
-  expect((t.inputSchema as any).required).toEqual(['text'])
+  expect((t.inputSchema as any).properties.outcome.enum).toEqual(['normal', 'changed', 'failed', 'needs_you'])   // 002q: needs_you = Joey has to decide or do something
+  expect((t.inputSchema as any).required).toEqual(['text', 'outcome'])
 })
 
 test('frequency cap: 2nd plain push in a thread within 10 min → silent; escalated runs and Joey replies exempt', () => {

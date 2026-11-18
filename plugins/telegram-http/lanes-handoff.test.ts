@@ -53,7 +53,7 @@ test('lane tools: ask_joey and handoff_main replace escalate; a lane cannot writ
 test('identity card: three ways out, one per event; a critical alert must reach Joey and is not a reason to hand off', () => {
   const lane = { id: 'adam.reflex.5', kind: 'reflex', n: 5, session_id: 's', thread: 'adam#t-04f200', status: 'new', created: '', last: '', transcript: '', runs: 0, tokens_in: 0, tokens_out: 0 } as any
   const card = identityCard(lane, { summary: undefined } as any)
-  for (const w of ['notify_joey(text)', 'ask_joey(text)', 'handoff_main(text)', '同一件事只選一個']) expect(card).toContain(w)
+  for (const w of ['notify_joey(text, outcome)', 'ask_joey(text)', 'handoff_main(text)', '同一件事只選一個']) expect(card).toContain(w)
   expect(card).not.toContain('escalate')
   // 002k (B19): the card is the same for every lane of a kind; the critical flag is in the lane context at the head of the event prompt
   expect(card).toContain('不要為了「嚴重」而 handoff_main')
@@ -95,7 +95,7 @@ test('a filtered ledger_query always ends by saying what else exists and how to 
 test('002e: what a follow-up run reports never rings again (all-clear = silent); if Joey must decide, ask_joey still rings', async () => {
   reset()
   const tok = { ...run('alert-critical', true), followup: true }
-  await callLaneTool(tok, 'notify_joey', { text: 'A-1103 已恢復：14:50 備份成功' })
+  await callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: 'A-1103 已恢復：14:50 備份成功' })
   expect(sent.length).toBe(1)
   expect(sent[0].silent).toBe(true)
   const row = ledgerRows()[0]
@@ -105,13 +105,13 @@ test('002e: what a follow-up run reports never rings again (all-clear = silent);
   await callLaneTool(tok2, 'ask_joey', { text: '後續檢查：備份仍然失敗，要你決定是否改用備援 bucket' })
   expect(sent[1].silent).toBe(false)
   const first = run('alert-critical', true)                                             // the first run of the alert itself still rings
-  await callLaneTool(first, 'notify_joey', { text: 'P1：備份 upload 403' })
+  await callLaneTool(first, 'notify_joey', { outcome: 'normal', text: 'P1：備份 upload 403' })
   expect(sent[2].silent).toBe(false)
 })
 
 test('002e: the header Joey reads names the lane and carries no internal thread id', async () => {
   reset()
-  await callLaneTool(run('scheduled'), 'notify_joey', { text: '例行回報' })
+  await callLaneTool(run('scheduled'), 'notify_joey', { outcome: 'normal', text: '例行回報' })
   expect(sent[0].text.split('\n')[0]).toMatch(/^〔adam·反射線#\d+〕$/)
   expect(sent[0].text).not.toContain('adam#t-')
 })

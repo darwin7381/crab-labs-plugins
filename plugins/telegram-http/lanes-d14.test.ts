@@ -44,46 +44,46 @@ test('D14: a worker that only filed a proposal and tells Joey 「已記下」: s
   const tok = run()
   const pid = /id (mp-[0-9a-f]+)/.exec(await propose(tok))![1]
   calls = []
-  const r1 = await L.callLaneTool(tok, 'notify_joey', { text: CLAIM })
+  const r1 = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: CLAIM })
   expect(r1).toStartWith('not sent:'); expect(r1).toContain(pid); expect(r1).toContain('a proposal is not a memory write and not a record'); expect(r1).toContain('「收到，已記下：mock 服務的例行排程一律 09:00，不再改。」')
   expect(sent.length).toBe(0); expect(calls.length).toBe(0)                                  // decided by the program: Jev was not asked
   const log = rows('run/report-check.jsonl').at(-1)
   expect(log).toMatchObject({ by: 'program', relation: 'proposal-is-not-a-record', sent_back: true, tool: 'notify_joey' })
-  const r2 = await L.callLaneTool(tok, 'notify_joey', { text: CLAIM })
+  const r2 = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: CLAIM })
   expect(r2).toContain('sent to Joey'); expect(sent.length).toBe(1)                          // once: it goes out as written the second time
 })
 
 test('D14: the claim words: 記下 / 已記 / recorded / remembered; a negation, or a sentence that says it was only proposed, is not a claim', async () => {
   for (const c of ['已記，之後照這個。', 'I recorded your rule: 09:00 for every routine.', 'Got it, I remembered it.', '我記下了。']) {
     const tok = run(); await propose(tok)
-    expect(await L.callLaneTool(tok, 'notify_joey', { text: c })).toStartWith('not sent:')
+    expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: c })).toStartWith('not sent:')
   }
   for (const c of ['還沒記下，我把它交給主線決定。', '已把這句記成提案，主線決定後才會寫進記憶。', 'I have proposed it to the main; it is not recorded yet.', '收到，主線會看。', 'Nothing was recorded.']) {
     const tok = run(); await propose(tok)
-    expect(await L.callLaneTool(tok, 'notify_joey', { text: c })).toContain('sent to Joey')
+    expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: c })).toContain('sent to Joey')
   }
 })
 
 test('D14: a record of the run\'s own (ledger_write action / commitment, the commitment tool) or a memory write for the proposal means the claim stands', async () => {
   const a = run(); await propose(a); await L.callLaneTool(a, 'ledger_write', { kind: 'action', text: '已把 Joey 的 09:00 規則寫進 runbook 草稿' })
-  expect(await L.callLaneTool(a, 'notify_joey', { text: CLAIM })).toContain('sent to Joey')
+  expect(await L.callLaneTool(a, 'notify_joey', { outcome: 'normal', text: CLAIM })).toContain('sent to Joey')
   const b = run(); await propose(b); await L.callLaneTool(b, 'commitment', { who: 'joey', what: '09:00 規則', by: '今天' })
-  expect(await L.callLaneTool(b, 'notify_joey', { text: CLAIM })).toContain('sent to Joey')
+  expect(await L.callLaneTool(b, 'notify_joey', { outcome: 'normal', text: CLAIM })).toContain('sent to Joey')
   const c = run(); const pid = /id (mp-[0-9a-f]+)/.exec(await propose(c))![1]
   expect(await L.callMainTool('memory_decide', { proposal_id: pid, decision: 'accept', reason: 'Joey 明說' }, 'mcp-main')).toContain('accepted')   // the main wrote it
-  expect(await L.callLaneTool(c, 'notify_joey', { text: CLAIM })).toContain('sent to Joey')
+  expect(await L.callLaneTool(c, 'notify_joey', { outcome: 'normal', text: CLAIM })).toContain('sent to Joey')
   const d = run(); const dpid = /id (mp-[0-9a-f]+)/.exec(await propose(d))![1]; await L.callMainTool('memory_decide', { proposal_id: dpid, decision: 'veto', reason: '不記' }, 'mcp-main')
-  expect(await L.callLaneTool(d, 'notify_joey', { text: CLAIM })).toStartWith('not sent:')   // a veto is not a write
+  expect(await L.callLaneTool(d, 'notify_joey', { outcome: 'normal', text: CLAIM })).toStartWith('not sent:')   // a veto is not a write
 })
 
 test('D14: no proposal in the run (nothing for this relation), a curator lane (it writes memory itself) and the flag off are not touched', async () => {
   const none = run()
-  expect(await L.callLaneTool(none, 'notify_joey', { text: CLAIM })).toContain('sent to Joey')          // the existing check (Jev, tool results) is what applies
+  expect(await L.callLaneTool(none, 'notify_joey', { outcome: 'normal', text: CLAIM })).toContain('sent to Joey')          // the existing check (Jev, tool results) is what applies
   const cur = run('curator'); await propose(cur)
-  expect(await L.callLaneTool(cur, 'notify_joey', { text: '已記下整理好的提案。' })).toContain('sent to Joey')
+  expect(await L.callLaneTool(cur, 'notify_joey', { outcome: 'normal', text: '已記下整理好的提案。' })).toContain('sent to Joey')
   process.env.LANES_REPORT_CHECK = '0'
   const off = run(); await propose(off)
-  expect(await L.callLaneTool(off, 'notify_joey', { text: CLAIM })).toContain('sent to Joey')
+  expect(await L.callLaneTool(off, 'notify_joey', { outcome: 'normal', text: CLAIM })).toContain('sent to Joey')
   process.env.LANES_REPORT_CHECK = '1'
 })
 
@@ -91,7 +91,7 @@ test('D14: the proposals and writes of the run reach Jev as evidence for the per
   const tok = run()
   const pid = /id (mp-[0-9a-f]+)/.exec(await propose(tok))![1]
   calls = []
-  expect(await L.callLaneTool(tok, 'notify_joey', { text: 'mock 服務的排程目前是 07:30 和 02:00，已交給主線決定。' })).toContain('sent to Joey')
+  expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: 'mock 服務的排程目前是 07:30 和 02:00，已交給主線決定。' })).toContain('sent to Joey')
   expect(calls.length).toBe(1)
   const ev = calls[0].state.tool_results.find((r: any) => r.call === 'ledger (this run)')
   expect(ev.result).toContain(pid); expect(ev.result).toContain('A proposal is NOT a memory write'); expect(ev.result).toContain('Memory writes by this run: none'); expect(ev.result).toContain('Ledger records written by this run: none')

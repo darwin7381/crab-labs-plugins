@@ -38,9 +38,9 @@ const tok = (run: string) => ({ runId: run, lane: 'adam.reflex.1', evId: 'ev-1',
 
 test('a sentence the tool results contradict sends the report back once; the second attempt goes out', async () => {
   mode = 'contra'
-  const r1 = await L.callLaneTool(tok('r1'), 'notify_joey', { text: 'mock-api 目前正常，p95 180ms。已確認。' })
+  const r1 = await L.callLaneTool(tok('r1'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 180ms。已確認。' })
   expect(r1).toContain('not sent'); expect(r1).toContain('mock-api 目前正常'); expect(sent.length).toBe(0)
-  const r2 = await L.callLaneTool(tok('r1'), 'notify_joey', { text: 'mock-api 目前正常，p95 180ms。已確認。' })
+  const r2 = await L.callLaneTool(tok('r1'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 180ms。已確認。' })
   expect(r2).not.toContain('not sent'); expect(sent.length).toBe(1)
   const log = readFileSync(join(dir, 'run', 'report-check.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   expect(log[0].sent_back).toBe(true)
@@ -48,8 +48,8 @@ test('a sentence the tool results contradict sends the report back once; the sec
 
 test('supported text goes out at once; a failed call sends the text as it is', async () => {
   mode = 'ok'
-  expect(await L.callLaneTool(tok('r2'), 'notify_joey', { text: 'mock-api 目前 degraded，p95 2600ms。' })).not.toContain('not sent')
+  expect(await L.callLaneTool(tok('r2'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前 degraded，p95 2600ms。' })).not.toContain('not sent')
   mode = 'fail'
-  expect(await L.callLaneTool(tok('r3'), 'notify_joey', { text: 'mock-api 目前正常，p95 180ms。' })).not.toContain('not sent')
+  expect(await L.callLaneTool(tok('r3'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 180ms。' })).not.toContain('not sent')
   expect(sent.length).toBe(3)
 })

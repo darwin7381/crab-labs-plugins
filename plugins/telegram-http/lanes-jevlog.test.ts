@@ -81,7 +81,7 @@ test('A3 report check: one question per sentence, the tool results as a count, t
   ].map(r => JSON.stringify(r)).join('\n') + '\n')
   st.lanes['adam.reflex.1'] = { id: 'adam.reflex.1', kind: 'reflex', n: 1, session_id: 's', thread: 'adam#t-1', status: 'running', created: '', last: '', transcript: tr, runs: 0, tokens_in: 0, tokens_out: 0 } as any
   const tok = { runId: 'adam.reflex.1.r1', lane: 'adam.reflex.1', evId: 'ev-1', closers: [], critical: false, trigger: 'alert', cls: 'alert', escalated: false, pushed: false } as any
-  await L.callLaneTool(tok, 'notify_joey', { text: 'mock-api 目前 degraded，p95 2600ms。已確認。' })
+  await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: 'mock-api 目前 degraded，p95 2600ms。已確認。' })
   const r = calls('report-check-A3')
   expect(r.length).toBe(1)
   expect(Object.keys(r[0].question)[0]).toBe('S1'); expect(r[0].question.S1.instructions).toContain('How do `tool_results` relate')

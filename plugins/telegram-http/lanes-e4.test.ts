@@ -35,7 +35,7 @@ const TG = (mid: string, extra: object = {}) => ({ source: 'telegram', from: 'jo
 
 test('E4: notify_joey in a run started by Joey\'s Telegram message is a reply to that message; so is ask_joey', async () => {
   const tok = run(TG('1234'))
-  expect(await L.callLaneTool(tok, 'notify_joey', { text: '請求 id：req-1、req-2。' })).toContain('sent to Joey')
+  expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '請求 id：req-1、req-2。' })).toContain('sent to Joey')
   expect(sent.at(-1)).toMatchObject({ replyTo: 1234 }); expect(sent.at(-1)!.text).toContain('req-1')
   const t2 = run(TG('1300'))
   expect(await L.callLaneTool(t2, 'ask_joey', { text: '要不要重啟？' })).toContain('sent to Joey')
@@ -44,7 +44,7 @@ test('E4: notify_joey in a run started by Joey\'s Telegram message is a reply to
 
 test('E4: a worker\'s topic and the reply go together', async () => {
   const tok = run(TG('1400'), 'joey', 555)
-  await L.callLaneTool(tok, 'notify_joey', { text: '收到，我來查。' })
+  await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '收到，我來查。' })
   expect(sent.at(-1)).toMatchObject({ replyTo: 1400, topic: 555 })
 })
 
@@ -59,7 +59,7 @@ test('E4: no reply_to for a run that Joey\'s message did not start: a peer, an a
   ]
   for (const [name, ev, trig] of cases) {
     const tok = run(ev, trig)
-    await L.callLaneTool(tok, 'notify_joey', { text: `通知 ${name}` })
+    await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: `通知 ${name}` })
     expect({ name, replyTo: sent.at(-1)!.replyTo }).toEqual({ name, replyTo: undefined })
   }
 })
