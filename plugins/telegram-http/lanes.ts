@@ -1520,11 +1520,19 @@ function restoreRuns(): void {
       text: `lane ${lane.id} run ${r.run ?? '?'} crashed: daemon restarted (the run was cut off; its event ${it.ev.id} is run again)`, refs: { run: r.run ?? null, signal: 'daemon-restart', counted: resumable, runs: lane.runs } })
     ;(it.deaths ??= []).push({ run: String(r.run ?? '?'), how: 'daemon 重啟時這一趟還在跑，被切斷', after_s: 0, calls: 0 })
     if (it.attempts >= MAX_ATTEMPTS && lane) exitRule(lane, it, failedHandoffText(it), 3000)
-    else queueRun(it)
+    else if (runAgain(it)) queueRun(it)
+    else journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run was cut by the daemon restart; the event owes nothing more: not run again' })   // 002q (T6-R)
     cut++
   }
   saveState()
   if (queue.size || cut) D.log('info', `lanes: ${queue.size} lane run(s) restored from the journal; ${cut} were running when the daemon stopped and are run again`)
+}
+/** M5 × M3 (002q, T6-R): a run that ended unfinished (it died, timed out, or was cut by a daemon restart) is run again only while its event still owes
+ *  the lane something, read from the journal's fold of its record (and the Joey messages steered into it). A fan-out part always runs again (its
+ *  synthesis waits for it); an event with no record is not one the router routed. 002p re-ran a CLOSED event after a daemon restart: the lane found
+ *  everything done and ended without a line. */
+function runAgain(it: QItem, steered: InEvent[] = []): boolean {
+  return !!it.ev.fanout || !events.get(it.ev.id) || [it.ev.id, ...steered.map(e => e.id)].some(id => events.openObs(id).length > 0)
 }
 /** a lane process left by the previous daemon: stop it if it is really that run (the pid may belong to something else by now) */
 function reapOrphan(pid: number, run: string): void {
@@ -2389,11 +2397,10 @@ function startRun(it: QItem): void {
       after_s: Math.round((Date.now() - started) / 100) / 10, calls: usage.size,
       last_tool: toolBrief(tools[tools.length - 1]), last_result: one(lastResults[lastResults.length - 1], 160),
       last_text: one(lastText || result, 120), stderr: one(errTail.split('\n').filter(l => l.trim()).slice(-2).join(' '), 160) })
-    const owes = !events.get(it.ev.id) || [it.ev.id, ...(tok.steered ?? []).map(e => e.id)].some(id => events.openObs(id).length > 0)
     if (it.attempts >= MAX_ATTEMPTS) {
       if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊連續 ${it.attempts} 次沒做完，沒有結果）`)
       else exitRule(lane, it, failedHandoffText(it), 3000, tok.steered)
-    } else if (owes || it.ev.fanout) {
+    } else if (runAgain(it, tok.steered)) {
       it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts
       queueRun(it)
       setTimeout(pump, RETRY_BACKOFF_MS * it.attempts + 20)

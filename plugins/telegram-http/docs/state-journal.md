@@ -273,7 +273,10 @@ What happens next:
 - A death or a timeout is run again after `attempt × LANES_RETRY_BACKOFF_MS`, while the event still owes something. After 3 attempts, the exit
   rule hands what is open to the main.
 - At boot, a run left `leased` or `running` died with the daemon. It gets `exited(died, signal daemon-restart)`, its lanes.jsonl exit row and a
-  lane_lifecycle ledger line, and its event runs again.
+  lane_lifecycle ledger line, and its event runs again **only while it still owes the lane something** (002q, T6-R).
+- One rule decides every re-run (`runAgain`), a death, a timeout and a daemon restart alike: the event's folded record still has an obligation the
+  lane owes (or a Joey message steered into the run does), or the run is a fan-out part. Otherwise no new run: a `wake` line `no_wake` with
+  "owes nothing more". 002p re-ran a closed event after a daemon restart, and the lane, finding everything done, ended without a line.
 
 **Busy** is "the lane has a queued, leased or running record" (`laneBusy`). The journal is the queue: there are no queue files.
 

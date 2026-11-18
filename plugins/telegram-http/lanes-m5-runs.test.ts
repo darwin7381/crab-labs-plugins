@@ -145,6 +145,44 @@ test('002k G11: at boot a run left running died with the daemon: exited(died, da
   Bun.spawnSync(['pkill', '-f', d2])                                                                  // nothing of this test is left running
 })
 
+test('002q T6-R: at boot a run the daemon restart cut is run again only while its event still owes something (the journal fold): a CLOSED event (line and receipt met) gets no new run', async () => {
+  const d2 = mkdtempSync(join(tmpdir(), 'lanes-m5-t6-'))
+  copyFileSync(ROUTER, join(d2, 'router.json'))
+  const lanes = Object.fromEntries([1, 2].map(i => [`adam.reflex.${i}`, { id: `adam.reflex.${i}`, kind: 'reflex', n: i, session_id: `s-r${i}`, thread: `adam#t-r${i}`, status: 'running',
+    created: '', last: '', transcript: join(d2, `r${i}.jsonl`), runs: 1, tokens_in: 0, tokens_out: 0 }]))
+  const threads = Object.fromEntries([1, 2].map(i => [`adam#t-r${i}`, { id: `adam#t-r${i}`, lane: `adam.reflex.${i}`, peer: null, hops: 0, tokens: 0, created: '', last: '' }]))
+  writeFileSync(join(d2, 'state.json'), JSON.stringify({ counters: { reflex: 2 }, lanes, threads }))
+  mkdirSync(join(d2, 'lanes'), { recursive: true })
+  const t = new Date().toISOString()
+  const ob = (kind: string, state: string, x: object = {}) => ({ id: `${kind}-x`, kind, level: kind === 'joey' ? 'line' : 'run', state, ...x })
+  const lines: any[] = []
+  for (const [id, lane, obs, st] of [['mesh-t6-closed', 'adam.reflex.1', [ob('joey', 'met', { by: 'notify_joey', ref: '1003' }), ob('receipt', 'met', { run_id: '801' })], 'closed'],
+                                     ['mesh-t6-open', 'adam.reflex.2', [ob('joey', 'open'), ob('receipt', 'open', { run_id: '802' })], 'open']] as const) {
+    const ev = { id, source: 'mesh', from: 'scheduler', text: '[scheduled][backup][run:0] 備份', meta: {}, notif: { method: '', params: {} } }
+    lines.push({ ts: t, rec: 'event', id, state: st, class: 'scheduled', owner: lane, lane, obligations: obs },
+      { ts: t, rec: 'run', id: `${id}#2`, state: 'queued', event: id, lane, attempt: 2, ev, priority: 5, enqueued: t },
+      { ts: t, rec: 'run', id: `${id}#2`, state: 'running', event: id, lane, attempt: 2, run: `${lane}.r2`, pid: 2_000_000_001 })
+  }
+  writeFileSync(join(d2, 'lanes', 'state.jsonl'), lines.map(x => JSON.stringify(x)).join('\n') + '\n')
+  process.env.LANES_DIR = d2
+  const B = await import('./lanes.ts?m5-t6') as typeof import('./lanes.ts')
+  B.__setClaudeBin(HANG)
+  B.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: d2, transcriptDir: d2, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => [] } as any)
+  process.env.LANES_DIR = dir
+  const j = () => readFileSync(join(d2, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  const runs = (ev: string) => j().filter(l => l.rec === 'run' && l.event === ev)
+  for (const ev of ['mesh-t6-closed', 'mesh-t6-open']) expect(runs(ev).find(l => l.state === 'exited')).toMatchObject({ reason: 'died', signal: 'daemon-restart' })
+  expect(await until(() => runs('mesh-t6-open').some(l => l.state === 'queued' && l.attempt === 3))).toBe(true)   // it still owes its line and its receipt: run again
+  await sleep(100)
+  expect(runs('mesh-t6-closed').filter(l => l.state === 'queued').length).toBe(1)                           // closed: no attempt 3 (002p queued one 0.6 s after the restart)
+  expect(j().find(l => l.rec === 'wake' && l.id === 'mesh-t6-closed')).toMatchObject({ state: 'no_wake' })
+  expect(j().find(l => l.rec === 'wake' && l.id === 'mesh-t6-closed').reason).toContain('owes nothing more')
+  expect(await until(() => runs('mesh-t6-open').some(l => l.state === 'running' && l.attempt === 3))).toBe(true)
+  B.__setClaudeBin(OK)
+  for (let i = 0; i < 50 && Bun.spawnSync(['pgrep', '-f', d2]).exitCode === 0; i++) { Bun.spawnSync(['pkill', '-f', d2]); await sleep(100) }   // nothing of this test is left running
+  expect(Bun.spawnSync(['pgrep', '-f', d2]).exitCode).toBe(1)
+})
+
 test('002n E02: a run cut at --max-turns is classified cap_turns from its result record; a cap is a stop, never a retry; M3 decides what follows (here the receipt it still owes goes to the main)', async () => {
   const CAP = script('cap.sh', `echo '{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns"}'\nexit 1`)
   L.__setClaudeBin(CAP)
