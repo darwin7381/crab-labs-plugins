@@ -598,11 +598,12 @@ function ledger(e: { lane: string; thread?: string | null; event?: string; kind:
   appendJsonl('ledger.jsonl', rec)
   logos('lane.ledger', { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, ledger_kind: e.kind, text: e.text.slice(0, 300), refs: e.refs ?? null })
 }
-/** the main's focus card as written, or null when there is none */
+const NO_FOCUS = '（主線還沒有寫焦點卡。）'
+/** the main's focus card as written, or null when there is none (no file, an empty one, or the placeholder line a new workspace starts with) */
 function focusText(): string | null {
-  try { return readFileSync(join(LANES_DIR, 'focus.md'), 'utf8').trim() || null } catch { return null }
+  try { const t = readFileSync(join(LANES_DIR, 'focus.md'), 'utf8').trim(); return t && t !== NO_FOCUS ? t : null } catch { return null }
 }
-function focusCard(): string { return focusText() ?? '（主線還沒有寫焦點卡。）' }
+function focusCard(): string { return focusText() ?? NO_FOCUS }
 
 // ================================================================== router
 export type InEvent = {

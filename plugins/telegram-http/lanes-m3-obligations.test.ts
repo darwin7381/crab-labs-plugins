@@ -295,6 +295,8 @@ test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the ro
   expect(mesh.at(-1)).toMatchObject({ to: 'eve', reply_to: '50008' }); expect(mesh.at(-1).text).toContain('主線會在')
   expect(mesh.at(-1).text).toContain('主線目前的焦點卡：「進行中：日誌基準統計。別碰：mock-api 設定。預計 +6m 完成。」')
   rmSync(join(dir, 'focus.md')); expect(L.interimText(Date.now())).not.toContain('焦點卡')              // no card, no sentence
+  writeFileSync(join(dir, 'focus.md'), '（主線還沒有寫焦點卡。）\n'); expect(L.interimText(Date.now())).not.toContain('焦點卡')   // the placeholder a new workspace starts with is no card (002r smoke C07)
+  rmSync(join(dir, 'focus.md'))
   const peerObs = obs(p.id).filter(o => o.kind === 'peer')
   expect(peerObs.length).toBe(2)                                                               // the answer (now the main's) and the router's line: no third
   expect(peerObs.find(o => o.level === 'interim')).toMatchObject({ state: 'met', owner: 'router', by: 'router', ref: String(70000 + mesh.length) })
