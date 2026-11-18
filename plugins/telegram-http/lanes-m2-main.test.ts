@@ -259,11 +259,11 @@ test('002k G03 / SR3, P14: a turn with no hook event for MAIN_STUCK_MS is 疑似
   const g = await startMain()
   const p = P()
   await hook(g, 'UserPromptSubmit', { prompt_id: p })
-  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash', tool_timeout_ms: 4000 })
   expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'in_turn', tool_open: 'Bash' })
   const k = sent.length
   await sleep(60); await M().tick(); await M().tick()
-  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(0)                   // P14 (G02 r1: a 2-minute Bash): no alarm while the tool runs
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(0)                   // P14 (G02 r1: a 2-minute Bash): no alarm inside the tool's own bound
   await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })
   await sleep(60); await M().tick(); await M().tick()
   await sleep(10)
@@ -272,6 +272,31 @@ test('002k G03 / SR3, P14: a turn with no hook event for MAIN_STUCK_MS is 疑似
   await sleep(10)
   expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
   __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('002q G03: a tool that declares no bound (an MCP call) is silence after MAIN_STUCK_MS: one alarm naming the tool, cleared when it returns; a Bash past its own timeout is silence too', async () => {
+  const stuck1 = MAIN_STUCK_MS
+  __setMainStuckMs(40)
+  const g = await startMain()
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__world__admin_export' })
+  const k = sent.length
+  await sleep(60); await M().tick(); await M().tick()
+  await sleep(10)
+  const alarms = sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除'))
+  expect(alarms.length).toBe(1)
+  expect(alarms[0]).toContain('mcp__world__admin_export')
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'mcp__world__admin_export' })
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
+  const k2 = sent.length
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash', tool_timeout_ms: 40 })          // bound 50 ms
+  await sleep(80); await M().tick(); await M().tick()
+  await sleep(10)
+  expect(sent.slice(k2).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(1)
+  __setMainStuckMs(stuck1)
   await killed(g)
 })
 

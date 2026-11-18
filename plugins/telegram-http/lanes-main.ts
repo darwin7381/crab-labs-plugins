@@ -65,7 +65,7 @@ export type MainEnv = {
 
 export type MainEvent = {
   event: string; session_id?: string; prompt_id?: string; pid?: number; transcript_path?: string; source?: string
-  error?: string; tool_name?: string; tool_input?: any; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
+  error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
 }
 /** PL5: the turn the main's aids judge, from M1/M2 (they read no transcript): its prompt, when it and the turn before it started, the items bound to
  *  it (the digest's content is the digest), and its tool calls with their results (main-hook.py posts every PostToolUse) */
@@ -91,6 +91,7 @@ export type MainApi = ReturnType<typeof createMain>
 export function createMain(E: MainEnv) {
   let cur: string | null = null                           // the live gen (id = pid as text)
   const lastEventAt = new Map<string, number>()          // gen → ms of its last hook event (silence = the stuck rule)
+  const toolBound = new Map<string, number>()            // gen → ms the open tool may stay silent: its own declared timeout (0 = it declares none)
   const pendingEnd = new Map<string, EndReason>()        // gen → why it is about to end (asked: /restart; replaced: /main renew)
   const outputs = new Map<string, Output[]>()            // prompt id → the reply / send_to_agent calls of that turn (answered gate)
   const calls = new Map<string, Turn['calls']>()          // prompt id → every tool call of that turn with its result (the summary gate)
@@ -298,6 +299,7 @@ export function createMain(E: MainEnv) {
       case 'PreToolUse': {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
+        toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
         return /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p) } : {}   // PL5: the summary gate judges the reply against this turn
       }
       case 'PostToolUse': {
@@ -398,18 +400,20 @@ export function createMain(E: MainEnv) {
       // from its last hook event, or from the offer when that came later. One alarm per episode; the next hook event clears it (mainEvent).
       const offered = items(r => r.state === 'offered' && r.gen === g.id)
       const offeredAt = offered.length ? Math.min(...offered.map(r => Date.parse(r.ts))) : 0
-      // P14 (decided in PL4): an open tool call is work, not silence: its PostToolUse is the event the gen owes when the tool ends (Claude Code bounds a
-      // tool by its own timeout; a dead process is kill -0's). Silence counts while the model owes the next event: a turn with no tool open, or an
-      // offer not taken (idle, or walled with its probe offer)
-      const owes = (g.state === 'in_turn' && !g.tool_open) || ((g.state === 'idle' || g.state === 'walled') && offered.length > 0)
+      // P14, refined (002q G03): an open tool call is work for as long as that tool is bounded: a Bash runs at most its declared timeout, so the
+      // silence allowed is the larger of MAIN_STUCK_MS and that bound. A tool that declares no bound (an MCP call can hang for ever) is silence
+      // like any other after MAIN_STUCK_MS. A dead process is kill -0's. One rule: the gen owes a hook event (a turn is open, or an offer is
+      // not taken) and has sent none for longer than it could legitimately be silent
+      const owes = g.state === 'in_turn' || ((g.state === 'idle' || g.state === 'walled') && offered.length > 0)
       const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt)
-      if (owes && now - since > MAIN_STUCK_MS) {
+      const limit = g.state === 'in_turn' && g.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
+      if (owes && now - since > limit) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         const queued = items(r => r.state === 'queued' && owed(r)).length + offered.length
         const menu = g.state !== 'in_turn' && E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null
         const mins = Math.max(1, Math.round((now - since) / 60_000))
         E.tellJoey(g.state === 'in_turn'
-          ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
+          ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜${g.tool_open ? `（停在工具 ${g.tool_open} 裡沒有回來）` : ''}。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
           : `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它，我再交給它一次。`, 'main-stuck')
         // 002q (H02, H03): an offer the gen never took (no hook event for it: a notification lost on the client side, under host load) is not left to
         // wait for ever. The stuck episode is the signal: its untaken items go back to `queued` (reason stuck_unbound) and M1 offers once more, now.

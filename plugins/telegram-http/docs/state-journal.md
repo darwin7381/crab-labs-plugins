@@ -426,10 +426,12 @@ Stop").
 
 ## Stuck (疑似卡死)
 
-This is M2 only. The tg daemon checks every 5 s. A gen owes a hook event while a turn is open with no tool running (`in_turn`, no `tool_open`) or
-while an item offered to it is not bound yet (`idle` or `walled` with an `offered` item). An open tool call is work, not silence (P14): its
-PostToolUse is the event the gen owes when the tool ends, and Claude Code bounds a tool by its own timeout. It is stuck when it owes one and has sent none for `LANES_MAIN_STUCK_MS` (default 600 s); the silence counts
-from its last hook event, or from the offer when that came later.
+This is M2 only. The tg daemon checks every 5 s. A gen owes a hook event while a turn is open (`in_turn`) or
+while an item offered to it is not bound yet (`idle` or `walled` with an `offered` item). An open tool call is work for as long as that tool is
+bounded (P14, refined in 002q): main-hook.py sends a Bash call's own timeout with its PreToolUse (`tool_timeout_ms`), and the silence allowed while
+it is open is the larger of `LANES_MAIN_STUCK_MS` and that bound (with a margin). A tool that declares no bound, such as an MCP call, is silence
+like any other. The gen is stuck when it owes a hook event and has sent none for longer than that; the silence counts from its last hook event, or
+from the offer when that came later. The alarm names the open tool.
 - One alarm per episode. For an idle gen the limit-menu pane read says whether a menu is the reason.
 - **The episode is M1's recovery signal** (002q, H02/H03: a notification lost on the client side under host load stayed lost, and the play never
   started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)

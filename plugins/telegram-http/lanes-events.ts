@@ -59,7 +59,7 @@ export function createEvents(J: Journal) {
   /** 002q (B08): the last Joey line met about a matter, in any event (a fold over the event records: no table of its own) */
   function lastOnMatter(subject: string): { e: Row; o: Ob } | undefined {
     let best: { e: Row; o: Ob } | undefined
-    for (const e of J.rows('event')) for (const o of (e.obligations ?? []) as Ob[])
+    for (const e of J.rows('event')) if (e.class !== 'joey') for (const o of (e.obligations ?? []) as Ob[])
       if (o.kind === 'joey' && o.state === 'met' && o.subject === subject && (!best || String(o.met_at ?? '') >= String(best.o.met_at ?? ''))) best = { e, o }
     return best
   }
@@ -102,7 +102,9 @@ export function createEvents(J: Journal) {
         const out = outcome ?? 'normal'
         // 002q (B08): one matter, one line per outcome, across events and their follow-ups: the last line Joey got about this matter (any event) with the
         // same outcome makes this one a repeat: refused, and this event's line is settled as merged into the event that told him
-        const told = want.subject && want.level === 'line' ? lastOnMatter(want.subject) : undefined
+        // The rule is about a lane's own reports. An event of class joey is Joey's own message: its line is the answer he asked for, never a repeat
+        // (002q E03: his quote-reply about the same service was refused as a repeat and went to the main)
+        const told = want.subject && want.level === 'line' && e.class !== 'joey' ? lastOnMatter(want.subject) : undefined
         if (told && (told.o.outcome ?? 'normal') === out && !(ob && (ob.state === 'requested' || ob.state === 'handed'))) {
           const said = told.e.said ? `: 「${String(told.e.said).slice(0, 160)}」` : ''
           refused = `Joey already has a line about ${want.subject} with outcome ${out} (event ${told.e.id}${told.e.lane ? `, ${told.e.lane}` : ''}${said}); one line per matter: another only when the outcome changed`

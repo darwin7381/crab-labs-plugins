@@ -857,6 +857,33 @@ test('002q B08: a line about a matter Joey already has with the same outcome is 
   await end(plain.lane)
 })
 
+// ------------------------------------------------------------------ 002q (E03, live smoke): the matter rule is about a lane's reports, not about answers to Joey
+// Joey quoted the lane's alert line and asked which requests failed. The lane's answer named the same service and check, was refused as a repeat of
+// its own report, and the lane handed Joey's question to the main. An event of class joey owes Joey the answer he asked for.
+test('002q E03: Joey quotes a lane line and asks about the same matter: the lane\'s answer is sent, not merged by matter; a later report still compares with the lane\'s report, not with the answer', async () => {
+  const subj = { service: 'mock-e03q', check: 'error_rate' }
+  const a = await start(sched(596, 'svc-check-e03'))
+  expect(await call(a.tok, 'notify_joey', { text: 'mock-e03q 錯誤率 3%，未重啟', outcome: 'changed', ...subj })).toContain('sent to Joey')
+  const quoted = 9000 + sent.length                                                           // the bot message id of that line (sendBot above)
+  await call(a.tok, 'receipt', { outcome: 'done', run_id: '596' })
+  await end(a.lane)
+  const text = '是哪幾個請求失敗？'
+  const q = { id: `tg-e03q-${++n}`, source: 'telegram', from: 'joey', verified: true, text, reply_to_message_id: String(quoted), meta: {}, notif: { method: 'notifications/claude/channel', params: { content: text, meta: {} } } } as any
+  const b = await start(q)
+  expect(b.lane).toBe(a.lane)
+  expect(E().get(b.id)!.class).toBe('joey')
+  const k = sent.length
+  expect(await call(b.tok, 'notify_joey', { text: '最早三筆 5xx：req=1、2、3', outcome: 'changed', ...subj })).toContain('sent to Joey')
+  expect(ob(b.id, 'joey')).toMatchObject({ state: 'met' })
+  expect(sent.slice(k).length).toBe(1)
+  await end(b.lane)
+  expect(handed(b.id).length).toBe(0)                                                          // answered by the lane: nothing goes to the main
+  const c = await start(sched(597, 'svc-check-e03b'))
+  expect(await call(c.tok, 'notify_joey', { text: 'mock-e03q 錯誤率 3%', outcome: 'changed', ...subj })).toContain(`event ${a.id}`)   // the lane's report, not the answer
+  await call(c.tok, 'receipt', { outcome: 'done', run_id: '597' })
+  await end(c.lane)
+})
+
 // ------------------------------------------------------------------ PL5 (AUD P15): the scheduler's run id and frequency are event meta; no text is parsed for them
 test('PL5 P15 (B08 [run:40] ×4, WD6): each scheduled event\'s receipt is its meta run id, whatever the text says; the frequency is meta too', async () => {
   const mkS = (text: string, meta: Record<string, string>) => { const e = mk('scheduler', text); e.meta = meta; return e }

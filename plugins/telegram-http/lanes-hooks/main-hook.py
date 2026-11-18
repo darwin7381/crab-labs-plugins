@@ -95,6 +95,13 @@ def main():
             'transcript_path': p.get('transcript_path'), 'source': p.get('source'), 'tool_name': p.get('tool_name'), 'error': p.get('error')}
     if ev == 'UserPromptSubmit':
         body['dids'] = DID.findall(str(p.get('prompt') or ''))
+    if ev == 'PreToolUse' and p.get('tool_name') == 'Bash':   # the tool's own bound (M2's stuck rule): a Bash runs at most its timeout
+        ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
+        if not ti.get('run_in_background'):
+            try:
+                body['tool_timeout_ms'] = int(ti.get('timeout') or os.environ.get('BASH_DEFAULT_TIMEOUT_MS') or 120000)
+            except (TypeError, ValueError):
+                body['tool_timeout_ms'] = 120000
     if ev == 'PostToolUse':                              # every tool: the daemon keeps this turn's calls (reply / send_to_agent keep their to, reply_to, text keys)
         body['tool_input'] = trim_input(p.get('tool_input'))
         tr = p.get('tool_response')
