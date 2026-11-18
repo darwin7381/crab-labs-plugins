@@ -103,7 +103,19 @@ Fields:
 | `gone` | `end_reason`: `asked` (/restart, /kill_stuck), `killed` (`kill -0` failed), `exited` (SessionEnd), or `replaced` (another process took the role, or /main renew) |
 
 Other fields: `pid`, `session_id`, `transcript_path` (recorded, never read for state), `source`, `error`, and `stopped_prompt` on an `idle` gen: the
-prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop").
+prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop"). `owed_hold` (the prompt) and
+`owed_events` (002q): the turn that the Stop check held because it still owed Joey a line, and those events (see "The main's Stop" below).
+
+**The main's Stop** (`POST /lanes/main-event`, `phase: check`, then `phase: final` when nothing held the turn). The daemon's answer to a check, in order:
+1. Items still queued are pulled into the turn: `block` 「這一輪先不要結束。…」 with them (M1).
+2. 002q (H06): **the turn still owes Joey a line.** The events of the items bound to this prompt (a digest and a `no_reply` notice owe nothing)
+   whose `joey` obligation the main owns and has not met: `handed` to it (Joey's own message to the main, a hand-over, including the give-up
+   hand-over's 「由你回報 Joey 一次」), or `open` on an event the main owns. Not `met`, `requested`, `dropped` or `merged`. If any, and this prompt is not
+   already the gen's `owed_hold`: `block` 「這一輪還欠 Joey 一句，先不要結束：<who>「<first words>」；…」, and the gen records `owed_hold` and
+   `owed_events`. One hold per turn: the next Stop of the same turn goes on to step 3, and what is still owed stays open on its event. Code, no
+   model call; it is the rule the lane stop applies to a lane.
+3. The aids' facts: `items` (the turn's bound items but the digest), `outputs` (its reply / send_to_agent calls), `turn`, `proposals`, `curator`.
+   main-hook.py then runs the memory gate and the answered gate, which keeps its own narrow question (a turn of two or more messages).
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
 - An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once
@@ -149,6 +161,8 @@ Fields:
   queued or running waits for it.
 - `owner`: the lane id, `main`, or `router`: information nobody handles (it has no obligations).
 - `outcome`: `normal`, `changed` or `failed`. It is the worst outcome any call reported (a structured field of `notify_joey`, `ask_joey` and `receipt`).
+  notify_joey's `outcome` is required, one of `normal | changed | failed | needs_you` (002q); a call without one is refused (nothing is journaled or
+  sent). `needs_you` (Joey has to decide or do something before the matter can move) is not an outcome on the record: it is the call's level.
 - `tool`: the call that changed the record. `refused`: the reason, when that call was refused.
 - `thread`, `lane`, `from`, `text` (the first 300 characters).
 - What the main must know (all optional):
@@ -184,7 +198,7 @@ Fields:
 
 | kind | levels | met by |
 |---|---|---|
-| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` (a decision; raising a met line is accepted, and so is a line whose `outcome` differs from the one it was met with), or the main's reply in a turn the event's item is bound to. A critical alert's line has `ring` and `due_at`: see "The ring" below. |
+| `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` or `notify_joey` with `outcome: needs_you` (a decision: one code path, the same transition, tier and ledger row; `by` / `tool` name the call made; raising a met line is accepted, and so is a line whose `outcome` differs from the one it was met with), or the main's reply in a turn the event's item is bound to. A critical alert's line has `ring` and `due_at`: see "The ring" below. |
 | `peer` | `answer`, `interim`, `commitment`, `message` | `reply_agent` to that peer, met when the inbox reports it delivered. `interim` is the router's own line (`owner: router`, created `met` when its fixed message is delivered) when a lane hands the request to the main; it meets and refuses nothing of the lane's (002q, B09, A05 50006). The event's `answer`, handed to the main, then becomes the main's: `owner: main`, `open`, a `due_at`, `req` (the peer's message id), `sent` (the interim's id). The lane may still send the peer its own line (level `message`, one per agent). The main meets an answer by a delivered send_to_agent in a turn the event's item is bound to (else by a send on the promise's thread, quoting its message, or the promise aid). `commitment` is the main's own commitment tool, met by `commitment_done`. `message`: a lane's reply_agent to an agent its event did not owe (one per agent). |
 | `receipt` | `run` (`run_id`) | the run's completion at the scheduler, once per scheduler run across every event: `receipt(run_id)`, or the lane's `./bin/btcc-receipt complete N` (`by: btcc-receipt`), whichever comes first. See "The scheduler receipt" below. |
 | `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
