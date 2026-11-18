@@ -113,7 +113,11 @@ export function createEvents(J: Journal) {
           const row = write(e, obs, { tool, refused, refused_kind: 'joey' })
           return { ok: false, why: `refused: ${refused}. ${openText(id)}`, ob: obs.find(o => o.kind === 'joey'), event: row }
         }
-        if (!ob) { ob = { id: obId('joey'), kind: 'joey', level: want.level, state: 'open' }; obs.push(ob); raised = true; ask(ob, want.level) }
+        // 002r (T2-R E5): an event the router opened with no Joey line (a high-frequency routine owes a receipt only; a fan-out part and a curator
+        // report to the main) takes a line only when there is news: a changed or failed outcome, or a decision. "Nothing new" is the receipt's.
+        if (!ob && want.level === 'line' && out === 'normal' && e.class !== 'joey')
+          refused = 'this event owes Joey no line (a routine check tells him only when something changed, a part reports to the main): nothing new goes in your receipt, not to Joey'
+        else if (!ob) { ob = { id: obId('joey'), kind: 'joey', level: want.level, state: 'open' }; obs.push(ob); raised = true; ask(ob, want.level) }
         else if (ob.state === 'handed') refused = 'this event is handed to the main: the main reports to Joey'
         else if (ob.state === 'requested') refused = 'a line about this event is being sent to Joey right now'
         else if (ob.state === 'met' && (RANK[want.level] < RANK[ob.level] || (RANK[want.level] === RANK[ob.level] && (ob.level === 'decision' || out === (ob.outcome ?? 'normal')))))

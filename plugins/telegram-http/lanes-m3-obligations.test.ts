@@ -94,9 +94,17 @@ test('the router opens the record with the obligations of the class: scheduled (
   await end(p.lane)
   const h = await start(sched(42, 'heartbeat', '[high-frequency]'))
   expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])                                  // the scheduler's tag is a router field: no prompt regex in any hook
+  // 002r (T2-R E5): it owes Joey nothing, so "nothing new" is refused (the record grows no Joey line)
+  const before = sent.length
+  expect(await call(h.tok, 'notify_joey', { outcome: 'normal', text: 'run:42 與上次相同，無變化' })).toContain('owes Joey no line')
+  expect(sent.length).toBe(before); expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])
   await call(h.tok, 'receipt', { outcome: 'nothing-to-do', run_id: '42' })
   await end(h.lane)
   expect(E().get(h.id)!.state).toBe('closed')
+  const h2 = await start(sched(942, 'heartbeat', '[high-frequency]'))                      // news is a raise: it goes out
+  expect(await call(h2.tok, 'notify_joey', { outcome: 'changed', text: 'run:942：consecutive_failures 由 1 變 2' })).toContain('sent to Joey')
+  expect(sent.length).toBe(before + 1); expect(ob(h2.id, 'joey')).toMatchObject({ state: 'met', level: 'line' })
+  await call(h2.tok, 'receipt', { outcome: 'done', run_id: '942' }); await end(h2.lane)
   const ev = journal().filter(l => l.rec === 'event' && l.id === s.id)
   expect(ev[0]).toMatchObject({ state: 'open', class: 'scheduled' }); expect(ev.some(l => l.tool === 'notify_joey')).toBe(true)
 })
