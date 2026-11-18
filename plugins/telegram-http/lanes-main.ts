@@ -57,6 +57,8 @@ export type MainEnv = {
   /** PL7 (M4): an item is owed to the main (offered, pulled; the wake) only while it carries an open M3 main obligation (lanes.ts). Without it: every
    *  item but the digest (a unit of M1 alone) */
   owed?: (item: Row) => boolean
+  /** 002q (M3): of these events, the ones whose Joey line the main owns and still owes (handed, or open on an event it owns): the Stop check's facts */
+  joeyOwed?: (events: string[]) => Array<{ id: string; from: string; text: string }>
   /** the memory gate's facts (M3): the open Joey-sourced proposals, and whether a curator lane holds the write right */
   memory?: () => { proposals: Array<{ id: string; ts: string; lane: string; text: string }>; curator: boolean }
 }
@@ -78,6 +80,8 @@ const num = (k: string, d: number): number => { const n = Number(process.env[k] 
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
 export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
 const BODY_MAX = 4000
+/** the first words of an event's text (the Stop check names each event it holds the turn for) */
+const firstWords = (t: string): string => { const s = String(t ?? '').replace(/\s+/g, ' ').trim(); return s.length > 30 ? `${s.slice(0, 30)}…` : s }
 const WALL_WORD: Record<string, string> = { rate_limit: '模型額度用完了', authentication_failed: '模型登入失效', billing_error: '模型帳務出錯', account_on_hold: '模型帳號被暫停',
   oauth_org_not_allowed: '模型帳號不被允許', cloud_credential_error: '模型憑證出錯' }
 
@@ -314,6 +318,17 @@ export function createMain(E: MainEnv) {
           const got = pull(J().get('main', g.id)!, p)
           if (got.length) return { block: '這一輪先不要結束。' + renderPulled(got) }
           const bound = items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === p && r.kind !== 'digest')
+          // 002q (M3): the main's turn may not end silently while it owes Joey a line, the rule the lane stop hook applies. Code, no model, before the
+          // aids: the events of the items bound to this prompt (a digest and a no_reply notice owe nothing) whose Joey line the main owns and still owes.
+          // One hold per turn (owed_hold on the gen): the next Stop of the same turn ends it, and what is still owed stays open on its event.
+          const gen = J().get('main', g.id)!
+          if (E.joeyOwed && gen.owed_hold !== p) {
+            const owed = E.joeyOwed([...new Set(bound.filter(r => metaOf(r.notif).no_reply !== 'true').map(r => String(r.event ?? '')).filter(Boolean))])
+            if (owed.length) {
+              setMain(gen, 'in_turn', { owed_hold: p, owed_events: owed.map(o => o.id) })
+              return { block: `這一輪還欠 Joey 一句，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」`).join('；')}。用 reply 回 Joey（一則可以回全部），再結束這一輪。` }
+            }
+          }
           return { items: bound.map(r => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
             user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }), outputs: outputs.get(p) ?? [],
             turn: turnOf(J().get('main', g.id)!, p), ...(E.memory ? E.memory() : { proposals: [], curator: false }) }   // PL5: the memory gate's facts

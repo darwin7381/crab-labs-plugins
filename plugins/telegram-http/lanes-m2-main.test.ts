@@ -475,7 +475,9 @@ test('PL5 P16: PreToolUse of the reply tool answers the turn (prompt, starts, bo
     calls: [{ name: 'mcp__plugin_telegram-http_telegram-http__ledger_query', input: {}, result: '活動清單：1 件事', error: false }, { name: 'Bash', input: { command: 'false' }, result: 'exit 1', error: true }] })
   expect(Date.parse(r.turn.started_at)).toBeGreaterThan(Date.parse(r.turn.prev_started_at))   // the turn before it (p0) started earlier
   expect((await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })).turn).toBeUndefined()   // only the reply tool is judged
+  expect((await hook(g, 'Stop', { prompt_id: p })).block).toContain('今天發生了什麼？')         // 002q: the turn owes Joey's message a line: held once, before the aids
   const s = await hook(g, 'Stop', { prompt_id: p })
+  expect(s.block).toBeUndefined()
   expect(s.turn.prompt_id).toBe(p); expect(Array.isArray(s.proposals)).toBe(true); expect(s.curator).toBe(false)
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
   const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2 })
@@ -483,3 +485,29 @@ test('PL5 P16: PreToolUse of the reply tool answers the turn (prompt, starts, bo
   await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
   await killed(g)
 })
+
+// 002q (M3, 002p H06 turn 881e8cb1): the main's turn bound Joey's message 1011 and a digest, sent no line, and ended: the answered gate only looks at a
+// turn of two or more messages (the digest is not one), so nothing held it. The main's Stop check now answers "what does this turn still owe Joey?" from
+// M1 (the items bound to the prompt) and M3 (their events' Joey line, owned by the main and still open or handed): held once, naming each event.
+test('002q H06 (M2): a turn that binds only a digest ends without a hold; a Joey message unanswered is held once per turn, never twice', async () => {
+  await drained()
+  const g = await startMain()
+  const d = M().enqueue('digest', { method: 'notifications/claude/channel', params: { content: '〔車道摘要｜1 件事有變化〕• 反射線#1｜eve 問 p95｜已通知 Joey（靜默）', meta: {} } })
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [d] })
+  expect(state(d)).toBe('bound')
+  const s = await hook(g, 'Stop', { prompt_id: p })
+  expect(s.block).toBeUndefined(); expect(Array.isArray(s.items)).toBe(true)                  // no hold: the aids get the turn
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(M().currentGen()).toMatchObject({ state: 'idle', stopped_prompt: p })
+  const id = await joey('現在怎樣？')
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] })
+  const h = await hook(g, 'Stop', { prompt_id: p2 })
+  expect(h.block).toContain('Joey「現在怎樣？」'); expect(h.items).toBeUndefined()            // before the aids: they are not asked
+  expect(M().currentGen()).toMatchObject({ state: 'in_turn', prompt_id: p2, owed_hold: p2 })   // the turn goes on; the hold is on the record
+  const again = await hook(g, 'Stop', { prompt_id: p2 })
+  expect(again.block).toBeUndefined(); expect(again.items.map((x: any) => x.body)).toContain('現在怎樣？')   // never a second hold
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done')
+  await killed(g)
+})
+

@@ -285,6 +285,13 @@ function mainEnv() {
     context: mainContext,
     // PL7 (M4): an item is owed to the main (offered, pulled, wakes) only while its event carries an open main obligation
     owed: (r: Row): boolean => r.kind !== 'digest' && !!r.event && ((events?.get(String(r.event))?.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === r.id)),
+    // 002q (M3, the main's Stop check): of these events, those whose Joey line the main owns and still owes: handed to it, or open on an event it owns.
+    // A line met, requested (being sent), dropped or merged owes nothing. Who asked (Joey for his own messages) and the event's first words.
+    joeyOwed: (ids: string[]) => ids.flatMap(id => {
+      const e = events?.get(id)
+      const owes = ((e?.obligations ?? []) as Ob[]).some(o => o.kind === 'joey' && (o.state === 'handed' || (o.state === 'open' && (o.owner === 'main' || e!.owner === 'main'))))
+      return e && owes ? [{ id, from: e.class === 'joey' ? 'Joey' : String(e.from ?? '?'), text: String(e.text ?? '') }] : []
+    }),
     // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
     memory: () => ({ proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text })), curator: !!S?.curator }),
   }

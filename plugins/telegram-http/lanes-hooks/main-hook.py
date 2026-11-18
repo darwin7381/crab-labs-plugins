@@ -8,7 +8,9 @@ every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopba
                 its deny reason refuses the reply
   PostToolUse   every tool's input (each string cut to 3000 chars) and result (text, cut to 20000 chars; tool_error) go to the daemon, which
                 keeps this turn's calls; it answers the items that reached the main during this turn (pulled at this tool boundary; additionalContext)
-  Stop          items still queued are pulled (decision block); else the model aids run (an undecided Joey memory proposal over the daemon's
+  Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes Joey a line (the daemon's M3 check:
+                the Joey line of an event bound to this turn, owned by the main and not met) is held (decision block, naming each event); else
+                the model aids run (an undecided Joey memory proposal over the daemon's
                 `proposals` / `turn` / `curator`, the answered check over the items M1 bound to this turn); when nothing holds the turn, the
                 daemon is told the turn really ended
 The daemon decides everything and hands the aids the turn (items, calls, start times); this script and its aids read no transcript.

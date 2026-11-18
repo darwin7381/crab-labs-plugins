@@ -178,6 +178,8 @@ test('a busy main is never pushed to: three messages are pulled at the next tool
   const stop = await hook(g2, 'Stop', { prompt_id: p2 })                                  // Stop pulls what is left (decision block, same prompt)
   expect(stop.block).toContain('這一輪先不要結束')
   for (const id of ids) expect(state(id)).toBe('bound')
+  const owed = await hook(g2, 'Stop', { prompt_id: p2 })                                  // 002q: nothing left to pull, but the turn owes Joey three lines: held once
+  expect(owed.block).toContain('Joey「第一則」'); expect(owed.block).toContain('Joey「第三則」'); expect(owed.items).toBeUndefined()
   const again = await hook(g2, 'Stop', { prompt_id: p2 })                                 // nothing left: the aids get the turn's items
   expect(again.block).toBeUndefined(); expect(again.items!.length).toBe(3)
   await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
@@ -245,7 +247,8 @@ test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the sa
   expect(state(id)).toBe('offered')
   const p = P()
   await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
-  expect((await hook(g, 'Stop', { prompt_id: p })).block).toBeUndefined()                   // ours holds nothing
+  expect((await hook(g, 'Stop', { prompt_id: p })).block).toContain('eve「Eve 要主線確認週五的報告」')   // 002q: the hand-over's Joey line is owed: held once
+  expect((await hook(g, 'Stop', { prompt_id: p })).block).toBeUndefined()                   // ours holds nothing more
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
   expect(state(id)).toBe('done'); expect(ob().state).toBe('met'); expect(M().mainPhase()).toBe('idle')
   await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply' })   // the other hook blocked: the turn goes on

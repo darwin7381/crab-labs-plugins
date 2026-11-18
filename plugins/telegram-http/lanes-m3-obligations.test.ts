@@ -1036,3 +1036,64 @@ test('002q T6-R: a give-up hand-over of an event that owes Joey no line (high fr
   expect(E().get(s.id)!.state).toBe('closed')                                                  // the receipt stays handed: not the main's to send
   expect(ob(s.id, 'receipt').state).toBe('handed')
 })
+
+// 002q (M3, 002p H06 turn 881e8cb1): the main's Stop check holds a turn once while it owes Joey a line: the events of the items bound to the prompt whose
+// Joey line the main owns and has not met (handed, or open on its own event). Code, before the aids; the second Stop of the same turn is never held.
+/** a Stop (phase check) of the stand-in main's turn. What earlier tests left queued is pulled into the turn first (M1's own block, '這一輪先不要結束。'):
+ *  that Stop is passed, as the hook's next Stop would be; the answer returned is the first Stop that pulled nothing */
+async function stopCheck(m: { pid: number; prompt: string }): Promise<any> {
+  for (let i = 0; i < 10; i++) { const r = await L.__mainEvent({ event: 'Stop', pid: m.pid, prompt_id: m.prompt }); if (!String(r.block ?? '').startsWith('這一輪先不要結束。')) return r }
+  throw new Error('still pulling after 10 Stops')
+}
+/** run body with a stand-in main turn; the stand-in is always stopped (no process left behind when an expectation fails) */
+async function withTurn(m: { stop: () => Promise<void> }, body: () => Promise<void>): Promise<void> { try { await body() } finally { await m.stop() } }
+test('002q H06: a turn binds Joey\'s message and makes no reply: Stop check holds it once, naming the message; the same turn replies and Stops, and the event closes', async () => {
+  const m = await mainTurnWith([], { id: '3501', text: '現在怎樣？mock-api 還好嗎' })
+  await withTurn(m, async () => {
+  expect(ob('tg-1-3501', 'joey')).toMatchObject({ state: 'handed' })
+  const h = await stopCheck(m)
+  expect(h.block).toContain('Joey「現在怎樣？mock-api 還好嗎」'); expect(h.items).toBeUndefined()
+  expect(L.__main().currentGen()).toMatchObject({ state: 'in_turn', prompt_id: m.prompt, owed_hold: m.prompt })
+  L.mainReplied(L.mainReplyTier({}), 3502)                                                     // the turn goes on and replies
+  expect(ob('tg-1-3501', 'joey')).toMatchObject({ state: 'met', by: 'main', ref: '3502' })
+  const s2 = await stopCheck(m)
+  expect(s2.block).toBeUndefined(); expect(s2.items.map((x: any) => x.mid)).toContain('3501')  // the aids get the turn
+  })
+  expect(E().get('tg-1-3501')!.state).toBe('closed')
+})
+
+test('002q: a peer hand-over carries a Joey line; a turn with it and no report is held once, naming who asked; after the report the next Stop is not held', async () => {
+  const p = await start(mk('eve', '能不能把 d-90 的報告提前到週四？'))
+  await call(p.tok, 'handoff_main', { text: 'Eve 要 d-90 提前到週四，要主線決定' })
+  await end(p.lane)
+  expect(ob(p.id, 'joey')).toMatchObject({ state: 'handed' })
+  const m = await mainTurnWith([p.id])
+  await withTurn(m, async () => {
+  const h = await stopCheck(m)
+  expect(h.block).toContain('eve「能不能把 d-90 的報告提前到週四？」')
+  L.mainReplied(L.mainReplyTier({}), 3511)
+  expect(ob(p.id, 'joey')).toMatchObject({ state: 'met', ref: '3511' })
+  expect((await stopCheck(m)).block).toBeUndefined()
+  })
+})
+
+test('002q: a give-up hand-over (「由你回報 Joey 一次」) and no report: held once; a second Stop of the same turn without a reply is not held, and the event stays open (the true state)', async () => {
+  const s = await start(sched(74, 'disk-check', '[high-frequency]'))
+  for (let i = 0; i < 3; i++) {
+    writeFileSync(GO, 'die')
+    expect(await until(() => !L.__runTok(s.lane) || L.__runTok(s.lane)!.runId !== s.tok.runId)).toBe(true)
+    if (i < 2) { expect(await until(() => !!L.__runTok(s.lane))).toBe(true); s.tok = L.__runTok(s.lane)! }
+  }
+  expect(await until(() => handed(s.id).length === 1)).toBe(true)
+  expect(ob(s.id, 'joey')).toMatchObject({ level: 'line', state: 'handed' })
+  const m = await mainTurnWith([s.id])
+  await withTurn(m, async () => {
+  const h = await stopCheck(m)
+  expect(h.block).toContain('scheduler「[scheduled][disk-check][high-f…」')   // who asked, first words
+  const again = await stopCheck(m)
+  expect(again.block).toBeUndefined(); expect(Array.isArray(again.items)).toBe(true)          // never a second hold: the aids decide the rest
+  })
+  expect(ob(s.id, 'main').state).toBe('met')                                                  // the hand-over's item is done
+  expect(ob(s.id, 'joey').state).toBe('handed')                                               // the line is still owed to Joey
+  expect(E().get(s.id)!.state).toBe('open')
+})
