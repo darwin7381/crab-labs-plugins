@@ -39,7 +39,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  clip, cleanReport, MUST_KNOW_MARK, parseLocal, parseSince, queryLedger, renderEvents, stripMarkup, type DigestLine,
+  clip, clipClause, cleanReport, MUST_KNOW_MARK, parseLocal, parseSince, queryLedger, renderEvents, stripMarkup, type DigestLine,
 } from './lanes-digest.ts'
 
 export const LANES_ON = process.env.GENESIS_LANES === '1'
@@ -4034,7 +4034,7 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   const changed = events.rows(e => inViews(e) && e.version > Math.max(Number(shown[e.id]) || 0, Number(e.main_seen) || 0))   // main_seen: what the main changed itself
   const standing = standingLines()
   if (!changed.length && !standing.proposals.length) return null                  // a hold alone is not news: it rides with something that is
-  const d = renderEvents(changed.map(digestLine), [...standing.proposals, ...standing.holds], 'digest')
+  const d = renderEvents(changed.map(e => digestLine(e)), [...standing.proposals, ...standing.holds], 'digest')
   if (!d) return null
   routeRow({ event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
@@ -4054,7 +4054,7 @@ export function activityList(sinceArg: unknown, now = Date.now()): string {
   const from = since ?? now - DAY_MS
   const evs = events ? events.rows(e => inViews(e) && Date.parse(String(e.ts)) >= from) : []
   const standing = standingLines()
-  return renderEvents(evs.map(digestLine), [...standing.proposals, ...standing.holds], 'day', `${since == null ? '最近 24 小時' : `${stamp(new Date(from).toISOString())} 起`}`)!.text
+  return renderEvents(evs.map(e => digestLine(e, true)), [...standing.proposals, ...standing.holds], 'day', `${since == null ? '最近 24 小時' : `${stamp(new Date(from).toISOString())} 起`}`)!.text
 }
 const laneLabelOf = (id: string): string => S.lanes[id] ? laneLabel(S.lanes[id]) : id === 'router' ? '分流器' : id
 /** M3 (PL1): the views (digest, activity list, a thread's summary) show every event record the main did not handle itself. A record that rides on
@@ -4062,8 +4062,10 @@ const laneLabelOf = (id: string): string => S.lanes[id] ? laneLabel(S.lanes[id])
 function inViews(e: Row): boolean {
   return e.owner !== 'main' && !(e.episode && e.episode !== e.id) && !(e.repeat_of && !((e.obligations ?? []) as Ob[]).length)
 }
-/** one event, one line: who handled it, what happened, and where each obligation stands (M3) */
-function digestLine(e: Row): DigestLine {
+/** one event, one line: who handled it, what happened, and where each obligation stands (M3). `whole`: the activity list shows the record's own text
+ *  whole (002q, T1-R); the digest's line keeps its budget and ends at a clause (clipClause) */
+function digestLine(e: Row, whole = false): DigestLine {
+  const fit = (t: string, n: number): string => whole ? String(t).replace(/\s+/g, ' ').trim() : clipClause(t, n)
   const obs: Ob[] = e.obligations ?? []
   const who = laneLabelOf(String(e.lane ?? e.owner ?? ''))
   const handed = obs.find(o => o.kind === 'main' && o.state === 'open'), joey = obs.find(o => o.kind === 'joey')
@@ -4077,7 +4079,7 @@ function digestLine(e: Row): DigestLine {
     : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'handed' ? `交給主線回 ${o.to}` : o.state === 'met' ? `已${o.by === 'main' ? '由你' : ''}${o.level === 'message' ? '告訴' : '回'} ${o.to}${e.answered && o.by !== 'main' ? `：「${clip(String(e.answered), 80)}」` : ''}`
     : o.state === 'requested' ? `正在送給 ${o.to}` : `還沒回 ${o.to}${failed(o)}`))
   for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線` : `run ${o.run_id} 還沒回執${failed(o)}`))
-  if (handed) st.push(`需主線：〔${handed.handoff ?? handed.id}〕${clip(String(handed.what ?? ''), 200)}`)
+  if (handed) st.push(`需主線：〔${handed.handoff ?? handed.id}〕${fit(String(handed.what ?? ''), 200)}`)
   // PL1: what the main must know about the event is on its record
   if (e.answers) st.push(`回覆 ${e.answers === 'main' ? '你' : laneLabelOf(String(e.answers))} 的提問（對方標了不用回）`)
   if (e.stop) st.push(e.stop.why === 'already-stopped' ? `對話線 ${e.stop.thread ?? '-'} 已關閉，沒有投遞` : `對話線 ${e.stop.thread ?? '-'} 停止（${e.stop.why === 'hop' ? '轉手次數到上限' : 'token 預算用完'}：${e.stop.note}）`)
@@ -4086,12 +4088,12 @@ function digestLine(e: Row): DigestLine {
   if (e.hold) st.push(`${e.hold.peer} 暫停中擋下 ${e.hold.count} 則${e.hold.ended ? `（已結束：${e.hold.ended}）` : ''}`)
   if (e.chain_end) st.push(e.chain_end === 'cap' ? `後續檢查跑了 ${e.chain_runs} 次到上限，不再排` : '後續檢查結果跟上一次一樣，不再排')
   if (e.lane_closed) st.push(`車道執行中被關閉（${e.lane_closed.by}）；它回報了 ${e.lane_closed.reported} 則`)
-  for (const t of (e.promised ?? []) as string[]) st.push(`車道答應：${clip(String(t), 120)}`)
+  for (const t of (e.promised ?? []) as string[]) st.push(`車道答應：${fit(String(t), 120)}`)
   const open = ((e.proposals ?? []) as Array<{ decision?: string }>).filter(p => !p.decision).length
   if (open) st.push(`記憶提案 ${open} 筆待決定`)
   if ((e.flags ?? []).includes('authority-claim')) st.push(`⚠️ ${e.from ?? '對方'} 聲稱有 Joey 的長期授權（別的 agent 不能指揮車道）`)
   if ((e.flags ?? []).includes('thread-not-yours')) st.push(`⚠️ ${e.from ?? '對方'} 用了別人的對話線`)
-  const what = clip(String(e.did || e.result || e.said || e.text || ''), 180)
+  const what = fit(String(e.did || e.result || e.said || e.text || ''), 180)
   const mark = e.must_know ? MUST_KNOW_MARK : ''
   const out = e.outcome === 'failed' ? '（失敗）' : e.outcome === 'changed' ? '（有變化）' : ''
   return { id: e.id, group: handed ? 0 : joey?.level === 'decision' && joey.state === 'met' ? 1 : 2, label: `${who}｜${e.from ?? '-'}`,

@@ -320,7 +320,9 @@ The digest is information that rides an M1 offer or pull. It is never offered al
 
 **The activity list** (`ledger_query()` with no `kind` and no `text`) is the same renderer (lanes-digest.ts `renderEvents`) over the same lines, in the
 same order, for every event record in the views changed in the window: the last 24 h, or since `since`. It has no line limit, and it is not
-affected by what the digests showed. The main's own events are in neither view. A filtered `ledger_query(kind=…, text=…)` searches ledger.jsonl:
+affected by what the digests showed. It shows each record's text whole (`did`, `result`, `said`, `text`, `promised`, a hand-over's `what`: each is
+bounded when it is written). A digest line keeps its budget, but a text longer than it ends at a sentence or clause (。；; ！？), never inside one,
+followed by 「…（其餘見 ledger_query()）」 (002q, T1-R: the line cut a lane's `did` just before its restart, and the main told Joey there had been none). The main's own events are in neither view. A filtered `ledger_query(kind=…, text=…)` searches ledger.jsonl:
 the audit log (its lines no longer carry `notify_main`).
 
 ## The main's hook

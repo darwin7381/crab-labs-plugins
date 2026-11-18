@@ -63,6 +63,16 @@ export function clip(s: string, n: number): string {
   const t = String(s).replace(/\s+/g, ' ').trim()
   return t.length > n ? t.slice(0, n - 1) + '…' : t
 }
+/** 002q (T1-R): a record's text in a view. The activity list (`n` = Infinity) shows it whole: the record bounds it when it is written. A digest line
+ *  keeps its budget but ends at a sentence or clause, never inside one, and says the rest is in ledger_query: 002p cut a lane's `did` mid-sentence
+ *  just before "./bin/svc POST mock-api/restart", and the main told Joey twice there had been no restart. */
+export function clipClause(s: string, n: number): string {
+  const t = String(s).replace(/\s+/g, ' ').trim()
+  if (t.length <= n) return t
+  const head = t.slice(0, n)
+  const at = Math.max(...['。', '；', ';', '！', '？', '. '].map(b => head.lastIndexOf(b)))
+  return (at >= n / 3 ? head.slice(0, at + 1) : head.slice(0, n - 1)) + '…（其餘見 ledger_query()）'
+}
 const laneName = (l: string) => (l === 'router' ? '分流器' : l)
 /** 002f: every time shown to the model is LOCAL and the list says which zone. The lanes write their own text in local time
  *  (the persona asks for it); a bare UTC stamp next to it was copied into the day summary as if it were local

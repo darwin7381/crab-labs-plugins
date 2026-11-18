@@ -129,3 +129,20 @@ test('the activity list window: since narrows it (ISO or relative), a bad since 
   expect(L.ledgerQueryTool({ since: 'yesterday' })).toContain('since 格式不對')
   expect(L.ledgerQueryTool({ kind: 'receipt' })).not.toStartWith('活動清單')
 })
+
+// 002q (T1-R): the main's ledger_query() line for reflex #3's event cut the lane's `did` mid-sentence, before "./bin/svc POST mock-api/restart", and kept
+// "ledger 查 24 小時內無 mock-api 重啟": the main told Joey twice there had been no restart. The activity list shows the record's text whole; the digest
+// keeps its budget but ends at a clause and says where the rest is.
+test('002q T1-R: ledger_query() shows an event\'s record whole; the digest line ends at a clause, never inside one, and points to ledger_query()', () => {
+  const did = '收到 P2 警報後先看 dashboard 與最近部署紀錄（09:40 有一次設定變更，與這次無關），再查 mock-api health：p95 2.4s、error 3%（10:52 起），三個 replica 中有一個 CPU 95%；ledger 查 24 小時內無 mock-api 重啟；依 runbook 執行 ./bin/svc POST mock-api/restart 滾動重啟一次（10:56:02 完成），10:58 再查 p95 回到 180ms；已排 10 分鐘後的後續檢查確認穩定。'
+  const id = event({ from: 'alert-dispatcher', cls: 'alert', text: '[P2][warning] mock-api p95 > 2s', did, obligations: [{ kind: 'joey', level: 'line', state: 'met' }] })
+  E().push(id, 'promised', '若 10 分鐘後 p95 仍超過 1s，再重啟一次並通知 Joey；超過兩次就請 Joey 決定要不要擴容。這一條會在後續檢查時確認，結果寫進同一件事的紀錄裡，主線不用另外追。')
+  const day = L.ledgerQueryTool({}).split('\n').find(l => l.includes(id) || l.includes('mock-api p95') || l.includes('滾動重啟'))!
+  expect(day).toContain('./bin/svc POST mock-api/restart 滾動重啟一次（10:56:02 完成）')
+  expect(day).toContain('已排 10 分鐘後的後續檢查確認穩定。')
+  expect(day).toContain('主線不用另外追。')
+  const dg = L.__digest()!.text.split('\n').find(l => l.includes('mock-api health'))!
+  expect(dg).toContain('…（其餘見 ledger_query()）')
+  const shown = dg.split('｜').find(x => x.includes('mock-api health'))!
+  expect(shown.replace('…（其餘見 ledger_query()）', '').replace(/（[^（]*）$/, '')).toMatch(/[。；]$/)    // it ends at a clause boundary
+})
