@@ -247,7 +247,10 @@ function mainEnv() {
     done: itemDone,
     undone: itemUndone,
     tellJoey: (text: string, rule: string, evs: string[] = []) => {
-      if (rule === 'main-wall-up' || rule === 'main-wall-down') { const g = main?.currentGen(); logos(`lane.${rule.replace(/-/g, '_')}`, { gen: g?.id ?? null, kind: g?.kind ?? null, since: g?.wall_since ?? null }) }   // PL4: the main's own wall
+      if (rule === 'main-wall-up' || rule === 'main-wall-down') {                   // PL4: the main's own wall
+        const g = main?.currentGen(); logos(`lane.${rule.replace(/-/g, '_')}`, { gen: g?.id ?? null, kind: g?.kind ?? null, since: g?.wall_since ?? null })
+        return wallNotice(text, rule, !!S?.wall)                                    // 002q: one notice per limit, lanes and main together
+      }
       ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true, ...(evs.length ? { events: evs } : {}) } })
       void pushJoey(undefined, text, false).then(id => { routerToldJoey(evs, id, rule); logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id, events: evs }) })
     },
@@ -269,7 +272,16 @@ function mainEnv() {
       for (const [s] of mcpSessionPid) { try { D.toolsChanged?.(s) } catch {} }
       logos('lane.main_gen', { pid, role: D.role })
     },
-    menu: async (drive = false) => { const m = await inspectMainMenu(drive, drive ? 'main-probe' : 'main-stuck'); return m ? (drive ? menuSentence(m) : `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。`) : null },
+    menu: async (drive = false) => {
+      const m = await inspectMainMenu(drive, drive ? 'main-probe' : 'main-stuck')
+      if (!m) return null
+      if (!drive) return { text: `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。`, asks: true }
+      // 002q (T7-R 1016): a limit menu the probe dealt with (chosen, or already gone) asks nothing of Joey: it is part of the wall episode and rides its
+      // one wall-down notice (lanes-main). A menu Joey must choose on is told now.
+      const handled = !!m.chose && (m.result === 'ok' || m.result === 'gone')
+      if (handled) ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${menuSentence(m)}`, refs: { tier: 'ledger', tier_rule: 'main-menu+handled' } })
+      return { text: menuSentence(m), asks: !handled }
+    },
     context: mainContext,
     // PL7 (M4): an item is owed to the main (offered, pulled, wakes) only while its event carries an open main obligation
     owed: (r: Row): boolean => r.kind !== 'digest' && !!r.event && ((events?.get(String(r.event))?.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === r.id)),
@@ -1605,8 +1617,7 @@ function wallUp(w: { kind: string; text: string }, by: string): void {
   const backoff = wallBackoffMs(w.kind, 1) > WALL_PROBE_MS ? `，還沒恢復就把間隔加倍（最多 ${Math.round(wallBackoffMs(w.kind, 99) / 60_000)} 分鐘）` : ''
   const text = `車道${WALL_WORD[w.kind] ?? '模型無法使用'}（原文：${w.text}）。車道先暫停派工（排隊 ${waiting} 件），一件都沒有丟。我 ${every} 分鐘後自動試一次${backoff}，恢復後會接著處理並告訴你。嚴重警報這段期間照樣直接通知你。`
   logos('lane.wall_up', { wall: w.kind, text: w.text, by, waiting })
-  ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-up', escalated: true } })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-up', message_id: id }))
+  wallNotice(text, 'wall-up', mainWalled())
   armProbe(WALL_PROBE_MS + 30)
 }
 // One timer for the lanes' wall. (Each walled run used to arm its own: two runs in flight when the wall came up meant
@@ -1714,8 +1725,17 @@ async function wallDown(by: string): Promise<void> {
   const waiting = [...queue.values()].filter(i => i.state === 'queued').length
   const text = `車道的模型恢復了（${stamp(w.since)} 起中斷，${TZ_LABEL}）。排隊的 ${waiting} 件車道事件現在開始處理。`
   logos('lane.wall_down', { since: w.since, probes: w.probes + 1, by, waiting })
-  ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: 'wall-down', escalated: true } })
-  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'wall-down', message_id: id }))
+  wallNotice(text, 'wall-down', mainWalled())
+}
+/** 002q (G07, T7-R): one subscription limit, one notice up and one down, for the lanes and the main together (runtime: they 「吃同一個訂閱額度」;
+ *  D12/PL4). The two walls stay two records (the lanes' S.wall, the main gen's wall episode); the notice reads both. A side that walls while the
+ *  other is already walled, or recovers while the other is still walled, is recorded (ledger, `+same-limit`), not pushed: Joey hears the wall
+ *  when the first side hits it and the recovery when the last side is through. 002p told each side's up and down: four pushes for one limit. */
+const mainWalled = (): boolean => { const g = main?.currentGen(); return !!g && g.state !== 'gone' && !!g.wall_since }
+function wallNotice(text: string, rule: string, otherWalled: boolean): void {
+  if (otherWalled) { ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${text}`, refs: { tier: 'ledger', tier_rule: `${rule}+same-limit`, escalated: false } }); logos('lane.notify', { escalated: false, tier: 'ledger', tier_rule: `${rule}+same-limit` }); return }
+  ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
+  void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
 }
 // ------------------------------------------------------------------ 002l (D13): lane slots follow the live quota
 // design/stability 「額度燒得更快」: 「名額要跟著即時額度調，我們已經有精確的額度輪詢可以接。」 (and 「每隻 agent…有同時在線的名額，額滿就排隊，不硬開」). 002k had only the

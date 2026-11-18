@@ -179,8 +179,32 @@ test('PL4 P11/P13 (T7-R 1247.3): the lanes\' wall going up or down never moves t
   expect(mainLines(g.pid).at(-1).wall_since).toBeTruthy(); expect(state(id)).toBe('queued')
   await L.__wallDown('adam.reflex.4.r1'); await sleep(20)                                      // P11: a lane run gets through: the LANES' wall comes down ...
   expect(M().mainPhase()).toBe('walled'); expect(state(id)).toBe('queued')                    // ... and the main is not taken out of its own (no main signal)
-  expect(sent.slice(k).filter(s => s.includes('主線額度') || s.includes('主線模型額度')).length).toBe(1)   // one main-wall-up notice
-  expect(sent.slice(k).filter(s => s.includes('主線恢復')).length).toBe(0)
+  // 002q (G07): one limit, one notice up: the lanes' wall told Joey; the main hitting the same limit is recorded, not pushed again; the lanes'
+  // recovery while the main is still walled is recorded too (the recovery is told when the last side is through)
+  expect(sent.slice(k).filter(s => s.includes('車道模型額度用完了')).length).toBe(1)
+  expect(sent.slice(k).filter(s => s.includes('主線模型額度') || s.includes('車道的模型恢復了') || s.includes('主線恢復')).length).toBe(0)
+  const led = readFileSync(join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(r => String(r.refs?.tier_rule ?? '').endsWith('+same-limit'))
+  expect(led.map(r => r.refs.tier_rule)).toEqual(['main-wall-up+same-limit', 'wall-down+same-limit'])
+  await killed(g)
+})
+
+test('002q G07: one subscription limit gives Joey one notice up and one down, for lanes and main together, whichever side hits it first and recovers last', async () => {
+  await drained()
+  const g = await startMain()
+  const k = sent.length
+  const id = await joey('週報好了嗎')
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: "You've hit your weekly limit" })   // the main first
+  L.__wallUp('rate_limit', "You've hit your weekly limit", 'adam.reflex.3.r1')                          // then a lane on the same limit
+  await sleep(20)
+  expect(sent.slice(k).filter(s => s.includes('模型額度用完了')).length).toBe(1)
+  expect(sent.slice(k).filter(s => s.includes('模型額度用完了'))[0]).toContain('主線')
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })   // the main through first
+  await sleep(20)
+  expect(sent.slice(k).filter(s => s.includes('恢復了')).length).toBe(0)                     // the lanes are still walled: recorded only
+  await L.__wallDown('adam.reflex.3.r2'); await sleep(20)
+  expect(sent.slice(k).filter(s => s.includes('恢復了')).length).toBe(1)                     // the last side through: one recovery notice
+  expect(sent.slice(k).length).toBe(2)
   await killed(g)
 })
 

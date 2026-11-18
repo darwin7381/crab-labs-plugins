@@ -51,7 +51,7 @@ export type MainEnv = {
   genChanged: (pid: number | null) => void
   /** the limit-menu pane read (a TUI state no hook reports): a sentence for Joey, or null. drive = choose the option that waits or continues (the
    *  walled main's probe: a menu it is parked on is dealt with before anything is offered to it) */
-  menu?: (drive?: boolean) => Promise<string | null>
+  menu?: (drive?: boolean) => Promise<{ text: string; asks: boolean } | null>
   /** the registration context an accepted main gets */
   context: (agent: string, sid: string) => string
   /** PL7 (M4): an item is owed to the main (offered, pulled; the wake) only while it carries an open M3 main obligation (lanes.ts). Without it: every
@@ -181,9 +181,10 @@ export function createMain(E: MainEnv) {
     if (!it) return
     if (probe) {
       const menu = E.menu ? await E.menu(true).catch(() => null) : null
-      if (menu) E.tellJoey(menu, 'main-menu')                                         // what was chosen (or that Joey must choose), once per probe that found a menu
+      // 002q (T7-R 1016): a menu Joey must choose on is told now; one the probe dealt with asks nothing of him: it rides the episode's one wall-down notice
+      if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
       const w = J().get('main', g.id)!
-      setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)) })   // one probe offer per retry time
+      setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)), ...(menu && !menu.asks ? { wall_menu: menu.text } : {}) })   // one probe offer per retry time
     }
     const dg = attachInfo()
     const ids = [it.id, ...(dg ? [dg.id] : [])]
@@ -319,9 +320,9 @@ export function createMain(E: MainEnv) {
         }
         finish(r => r.gen === g.id && r.prompt_id === p)
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
-        const was = J().get('main', g.id)!, since = was.wall_since as string | undefined
-        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, probes: null, retry_at: null, kind: null } : {}) })
-        if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
+        const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
+        if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
         void pump()
         return {}
       }
@@ -390,7 +391,7 @@ export function createMain(E: MainEnv) {
       if (owes && now - since > MAIN_STUCK_MS) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         const queued = items(r => r.state === 'queued' && owed(r)).length + offered.length
-        const menu = g.state !== 'in_turn' && E.menu ? await E.menu(false).catch(() => null) : null
+        const menu = g.state !== 'in_turn' && E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null
         const mins = Math.max(1, Math.round((now - since) / 60_000))
         E.tellJoey(g.state === 'in_turn'
           ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`

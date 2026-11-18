@@ -113,6 +113,11 @@ prompt whose Stop made it idle (a later event of that prompt re-opens the turn; 
   turn is the same episode: `probes` + 1, a longer `retry_at`, no new notice. The episode ends at the gen's next final Stop: `wall_since`,
   `probes` and `retry_at` are cleared and Joey is told once (`main-wall-down`).
 - A new gen starts `idle` or `starting`, whatever the lanes' wall says.
+- **One limit, one notice each way** (002q, G07, T7-R): the two walls stay two records, but Joey's wall notices read both. A side that walls while
+  the other is already walled (`main-wall-up` with the lanes' wall up, `wall-up` with the main's episode open), or recovers while the other is still
+  walled, is a ledger line (`tier: ledger`, `tier_rule: <rule>+same-limit`), not a push. Joey hears the wall when the first side hits it and the
+  recovery when the last side is through. A limit menu the probe dealt with (chosen, or gone) is recorded on the gen (`wall_menu`, cleared with the
+  episode) and rides the episode's wall-down notice; only a menu Joey must choose on is told at once (`main-menu`).
 - `turn_started` is not used; the turn's start is the `in_turn` line's `ts`.
 
 ### `event` (M3): one record per inbound event
