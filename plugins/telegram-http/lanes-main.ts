@@ -296,9 +296,10 @@ export function createMain(E: MainEnv) {
     // 002r (H05): a subagent's tool call. It starts, continues and ends no turn of the main, opens no tool of the main and is no boundary to pull at
     // (the pulled message would land in the subagent). While the main's turn is open (it waits on its Agent call) the subagent's work is the gen's
     // sign of life; an idle main that leaves an offer untaken is not excused by its background agents.
-    if (b.sub) { if (g.state === 'in_turn') lastEventAt.set(g.id, Date.now()); return {} }
+    if (b.sub && g.state !== 'in_turn') return {}
     lastEventAt.set(g.id, Date.now())
     if (stuck && stuck.gen === g.id) { stuck = null; E.tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
+    if (b.sub) return {}                                                    // in an open turn: a sign of life (and the all-clear), nothing else
     const p = String(b.prompt_id ?? '')
     switch (ev) {
       case 'UserPromptSubmit': if (p) beginTurn(g, p, b.dids); return {}

@@ -275,6 +275,25 @@ test('002k G03 / SR3, P14: a turn with no hook event for MAIN_STUCK_MS is 疑似
   await killed(g)
 })
 
+test('002r H05: while the main waits on its Agent call, its subagent\'s tool calls keep the turn alive and clear a stuck notice; they open no tool of the main', async () => {
+  const stuck1 = MAIN_STUCK_MS
+  __setMainStuckMs(40)
+  const g = await startMain()
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Agent' })
+  const k = sent.length
+  for (let i = 0; i < 6; i++) { await sleep(20); await hook(g, 'PostToolUse', { tool_name: 'Read', sub: true }); await M().tick() }   // 3 stuck windows of the main's own silence
+  expect(sent.slice(k).some(t => t.includes('疑似卡死'))).toBe(false)
+  await sleep(60); await M().tick(); await M().tick(); await sleep(10)                          // now the subagent is silent too
+  expect(sent.slice(k).filter(t => t.includes('疑似卡死') && !t.includes('解除')).length).toBe(1)
+  await hook(g, 'PreToolUse', { tool_name: 'Bash', sub: true }); await sleep(10)               // it works again: the all-clear
+  expect(sent.slice(k).filter(t => t.includes('疑似卡死解除')).length).toBe(1)
+  expect(M().currentGen()!.tool_open).toBe('Agent')                                            // the main's open call is still its own
+  __setMainStuckMs(stuck1)
+  await killed(g)
+})
+
 test('002q G03: a tool that declares no bound (an MCP call) is silence after MAIN_STUCK_MS: one alarm naming the tool, cleared when it returns; a Bash past its own timeout is silence too', async () => {
   const stuck1 = MAIN_STUCK_MS
   __setMainStuckMs(40)
