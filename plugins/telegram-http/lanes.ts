@@ -2649,9 +2649,12 @@ function mainSentInTurn(to: string, ref: string, delivered: boolean): string[] {
 }
 
 // ------------------------------------------------------------------ 002j: a request only the main can agree to (problem 24)
-// When a lane hands a peer's request to the main, the router answers the peer in fixed words with a time: the event's peer obligation is met by the
-// router (level interim), and a new one opens for the MAIN (level answer, due in LANES_HANDOFF_REPLY_MIN). The main meets it by sending that peer a
-// message that answers it (mainSentTo); at its due time the sweep tells Joey once.
+// When a lane hands a peer's request to the main, the router tells the peer in fixed words who decides and by when. 002q (B09, A05 50006): that
+// interim is the ROUTER's own line, its own obligation (level interim, owner router, met on delivery). It neither meets nor refuses the lane's
+// answer: the answer the event owed the peer, handed to the main, becomes the main's (owner main, open, due in LANES_HANDOFF_REPLY_MIN); the main
+// meets it by sending that peer a message that answers it (mainSentTo); at its due time the sweep tells Joey once. The lane may still send the peer
+// its own line about its part (its focus, its ETA): a reply_agent of its own, one per agent (level message). 002p met the lane's answer with the
+// interim and refused the lane's own reply ("the router already told eve"), so its focus card never reached Eve.
 let PROMISE_MIN = Number(process.env.LANES_HANDOFF_REPLY_MIN ?? 30)
 export const __setPromiseMin = (m: number): void => { PROMISE_MIN = m }
 let meshSendHook: ((b: any) => Promise<any>) | null = null
@@ -2668,9 +2671,9 @@ export function interimText(due: number): string {
 }
 async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to: string; text: string } | null> {
   const ev = queue.get(tok.evId)?.ev
-  const peerOb = (events.get(tok.evId)?.obligations ?? []).find((o: Ob) => o.kind === 'peer' && o.state === 'handed' && (o.owner ?? 'lane') === 'lane') as Ob | undefined
-  if (!ev || !peerOb) return null                                       // only an event that owes a peer an answer
-  const from = peerOb.to!
+  const answer = (events.get(tok.evId)?.obligations ?? []).find((o: Ob) => o.kind === 'peer' && o.level === 'answer' && o.state === 'handed' && (o.owner ?? 'lane') === 'lane') as Ob | undefined
+  if (!ev || !answer) return null                                       // only an event that owes a peer an answer
+  const from = answer.to!
   const th = S.threads[lane.thread]
   const hop = (th?.hops ?? 0) + 1
   if (th?.stopped || hop > HOP_LIMIT) return null
@@ -2679,13 +2682,14 @@ async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to
   if (th) { th.hops = hop; th.last = nowIso(); if (!th.peer) th.peer = from }
   const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, thread: lane.thread, hop, lane: lane.id, owner: '主線' })
   if (r?.msgId != null) S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }
-  if (r?.delivered === true) events.set(tok.evId, peerOb.id, { state: 'met', level: 'interim', by: 'router', ref: String(r.msgId ?? '') })   // PL2: met on the delivery (else it stays handed: the main answers)
-  const ob = events.add(tok.evId, { kind: 'peer', level: 'answer', to: from, owner: 'main', due_at: due, handoff: hid, what: (queue.get(tok.evId)?.ev.text ?? '').slice(0, 160),
-    ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}), ...(r?.msgId != null ? { sent: String(r.msgId) } : {}) })
+  // the answer is the main's now, with a due time; the router's line is its own obligation (met on the delivery)
+  events.set(tok.evId, answer.id, { state: 'open', owner: 'main', due_at: due, handoff: hid, what: ev.text.slice(0, 160),
+    ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}), ...(r?.msgId != null ? { sent: String(r.msgId) } : {}) }, { tool: 'router' })
+  if (r?.delivered === true) events.add(tok.evId, { kind: 'peer', level: 'interim', to: from, owner: 'router', state: 'met', by: 'router', ref: String(r.msgId ?? '') }, { tool: 'router' })
   ledger({ lane: 'router', thread: lane.thread, event: tok.evId, kind: 'commitment',
-    text: commitmentText({ who: from, what: `主線直接回覆 ${from} 這件事（答應或拒絕）。分流器已經替車道回覆 ${from}：「${text}」`, by: `${simTime(due)} 前` }),
-    refs: { who: from, by: simTime(due), from: 'handoff-interim', obligation: ob?.id ?? null, due: new Date(due).toISOString(), btcc_msg_id: r?.msgId ?? null, sent: text } })
-  logos('lane.promise', { obligation: ob?.id ?? null, peer: from, thread: lane.thread, event: tok.evId, due: new Date(due).toISOString(), handoff: hid, sent: r?.msgId != null })
+    text: commitmentText({ who: from, what: `主線直接回覆 ${from} 這件事（答應或拒絕）。分流器已經告訴 ${from}：「${text}」`, by: `${simTime(due)} 前` }),
+    refs: { who: from, by: simTime(due), from: 'handoff-interim', obligation: answer.id, due: new Date(due).toISOString(), btcc_msg_id: r?.msgId ?? null, sent: text } })
+  logos('lane.promise', { obligation: answer.id, peer: from, thread: lane.thread, event: tok.evId, due: new Date(due).toISOString(), handoff: hid, sent: r?.msgId != null })
   saveState()
   return { to: from, text }
 }
@@ -3013,10 +3017,10 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!v.ok) return v.why!
       const hid = handToMain(tok.evId, lane, text, `ho-${shortId()}`, tok.cls)
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null })
-      // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words): its answer obligation is met by the
-      // router, and a new one (the main's, with a due time) takes its place
+      // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words, the router's own line); the answer is
+      // the main's, with a due time (002q: the lane's own reply to the peer stays its own)
       let told = ''
-      try { const t = await interimToPeer(lane, tok, hid); if (t) told = ` The router told ${t.to}: "${t.text}" Send ${t.to} nothing more about this.` } catch (e) { D.log('warn', `lanes: interim reply failed: ${e}`) }
+      try { const t = await interimToPeer(lane, tok, hid); if (t) told = ` The router told ${t.to}: "${t.text}" The answer is the main's now. You may still tell ${t.to} your own part (what you are doing, by when) with reply_agent, once; do not answer for the main.` } catch (e) { D.log('warn', `lanes: interim reply failed: ${e}`) }
       return 'handed to the main: it gets your text, takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.' + told
     }
     case 'receipt': {

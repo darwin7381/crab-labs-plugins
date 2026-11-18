@@ -4,8 +4,8 @@
  * The router opens one record per inbound event: { class, owner, obligations[], outcome }. An obligation is what the event still owes someone:
  *   joey     a line, or a decision (level line < decision); `ring` + due_at for a critical alert
  *   main     the event was handed to the main (level handed): an M1 item, met when that item is done
- *   peer     an answer to the peer that asked (level answer), the main's promised answer (level answer, owner main, due_at), or a message to an agent
- *            the event did not owe (level message)
+ *   peer     an answer to the peer that asked (level answer; handed to the main and promised by the router it is the main's: owner main, due_at),
+ *            a message of the lane's own to an agent (level message), or the router's interim line (level interim, owner router)
  *   receipt  the completion of a scheduler run (run_id), once per run_id across every event
  * An obligation is open → requested (the outbound call was accepted and is being delivered) → met on the delivery result (the Telegram message
  * id, the mesh `delivered`, the scheduler's answer), or back to open with `failed` when the delivery failed. handed: one hand-over transition
@@ -126,8 +126,7 @@ export function createEvents(J: Journal) {
         ob = obs.find(o => o.kind === 'peer' && o.to === want.to && (o.owner ?? 'lane') === 'lane')
         if (!ob) { ob = { id: obId('peer'), kind: 'peer', level: 'message', to: want.to, state: 'open' }; obs.push(ob); ask(ob, 'message') }   // an agent the event did not owe: its own obligation
         else if (ob.state === 'open') ask(ob, ob.level)
-        else refused = ob.level === 'interim' ? `the router already told ${want.to} that the main decides this and by when: send ${want.to} nothing more about it`
-          : ob.state === 'requested' ? `a message to ${want.to} about this event is being delivered right now`
+        else refused = ob.state === 'requested' ? `a message to ${want.to} about this event is being delivered right now`
           : ob.state === 'handed' ? `this event is handed to the main: the main answers ${want.to}`
           : ob.level === 'message' ? `${want.to} already got a message about this event` : `${want.to} already has the answer to this event`
         break

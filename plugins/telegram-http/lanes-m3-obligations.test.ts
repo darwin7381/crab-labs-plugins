@@ -220,16 +220,22 @@ test('002m aid (b), reduced: a message that claims the matter went to Joey or th
   await end(q.lane)
 })
 
-test('002j P24 / 002k C4: a peer\'s request handed to the main: the router answers the peer (its obligation met by the router), the main owes the answer by a due time; a send on that thread meets it, another topic does not', async () => {
+test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the router tells the peer (its OWN line, its own obligation), the answer becomes the main\'s with a due time; the lane\'s own reply still goes out (one); a send on that thread meets the answer, another topic does not', async () => {
   const p = await start(mk('eve', '可以答應我週五前給 10 月可用率嗎？', { btcc_msg_id: '50008' }))
   const out = await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
-  expect(out).toContain('The router told eve')
+  expect(out).toContain('The router told eve'); expect(out).toContain('your own part')
   expect(mesh.at(-1)).toMatchObject({ to: 'eve', reply_to: '50008' }); expect(mesh.at(-1).text).toContain('主線會在')
   const peerObs = obs(p.id).filter(o => o.kind === 'peer')
-  expect(peerObs.find(o => o.owner !== 'main')).toMatchObject({ state: 'met', level: 'interim', by: 'router' })
+  expect(peerObs.length).toBe(2)                                                               // the answer (now the main's) and the router's line: no third
+  expect(peerObs.find(o => o.level === 'interim')).toMatchObject({ state: 'met', owner: 'router', by: 'router', ref: String(70000 + mesh.length) })
   const owed = peerObs.find(o => o.owner === 'main')!
-  expect(owed).toMatchObject({ state: 'open', level: 'answer', to: 'eve' }); expect(owed.due_at).toBeGreaterThan(Date.now())
-  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '我再補一句' })).toContain('the router already told eve')
+  expect(owed).toMatchObject({ state: 'open', level: 'answer', to: 'eve', req: '50008' }); expect(owed.due_at).toBeGreaterThan(Date.now())
+  // B09: the lane's own reply (its focus, its ETA) is its own line: accepted, delivered, and it meets neither the router's line nor the main's answer
+  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '我正在做日誌基準統計，約 6 分鐘後完成；答不答應由主線回你' })).toContain('sent to eve')
+  expect(mesh.at(-1)).toMatchObject({ to: 'eve' }); expect(mesh.at(-1).text).toContain('日誌基準統計')
+  expect(obs(p.id).find(o => o.kind === 'peer' && o.level === 'message')).toMatchObject({ state: 'met', to: 'eve' })
+  expect(obs(p.id).find(o => o.id === owed.id).state).toBe('open')
+  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '再補一句' })).toContain('eve already got a message about this event')   // one of its own
   await end(p.lane)
   await L.mainSentTo('eve', 'adam#t-unrelated', null, '')                                    // another thread, no text: nothing closes
   expect(obs(p.id).find(o => o.id === owed.id).state).toBe('open')
