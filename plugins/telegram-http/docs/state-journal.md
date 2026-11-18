@@ -183,6 +183,13 @@ Fields:
 | `receipt` | `run` (`run_id`) | the run's completion at the scheduler, once per scheduler run across every event: `receipt(run_id)`, or the lane's `./bin/btcc-receipt complete N` (`by: btcc-receipt`), whichever comes first. See "The scheduler receipt" below. |
 | `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
 
+**A matter** (002q, B08): notify_joey and ask_joey take a structured `service` and `check`; together they are the line's matter (`subject` =
+`<service>/<check>`, lowercased; never read from the text). Joey gets one line per matter and outcome across events and their follow-ups: a line
+whose matter's last met line (any event; the fold over the records, latest `met_at`) has the same outcome is refused, the refusal names that event
+and what it said, and this event's Joey line is settled `merged` (`into` = that event, `by: matter`): nothing is owed, so the stop does not ask for
+it and the exit rule hands nothing to the main. A changed outcome is a raise. A line without `service` follows its event's own rule only. Joey line
+fields: `subject`, `met_at` (when it was met).
+
 The one rule: a lane's outbound call asks to meet an obligation of its event.
 - Meeting an open one is accepted (`requested`), and it is `met` on the delivery result. Raising one (line → decision, or a line with another outcome) is accepted.
 - Repeating a met or requested one is refused, and the refusal names what is still open.

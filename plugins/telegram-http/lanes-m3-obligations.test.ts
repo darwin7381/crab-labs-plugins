@@ -715,6 +715,49 @@ test('PL3 P10 (B08 1015/1016, T3-R E4, A05, G03): a follow-up is a run of its OR
   expect(handed(s.id).length).toBe(0)
 })
 
+// ------------------------------------------------------------------ 002q (B08): one matter, one line per outcome, across events and their follow-ups
+// Four scheduled checks found one degraded service and each told Joey; then three follow-ups each told him it recovered (7 lines, and three of them said
+// "not restarted" after reflex.1 had restarted it). A matter is the line's structured subject (service + check), whatever event carries it.
+test('002q B08: a line about a matter Joey already has with the same outcome is refused from any event (the line is merged into the event that told him, named in the refusal); a changed outcome is a raise; a follow-up repeating the matter\'s last outcome is refused', async () => {
+  const k = sent.length
+  const subj = { service: 'mock-b08q', check: 'p95' }
+  const a = await start(sched(591, 'svc-check-1'))
+  expect(await call(a.tok, 'notify_joey', { text: 'mock-b08q p95 > 2s，已重啟一次', outcome: 'changed', ...subj })).toContain('sent to Joey')
+  expect(await call(a.tok, 'followup', { after_minutes: 5, note: '再看 mock-b08q' })).toContain('scheduled')
+  await call(a.tok, 'receipt', { outcome: 'done', run_id: '591' })
+  await end(a.lane)
+  expect(ob(a.id, 'joey')).toMatchObject({ state: 'met', subject: 'mock-b08q/p95', outcome: 'changed' })
+  const others: string[] = []
+  for (const run of [592, 593]) {
+    const b = await start(sched(run, `svc-check-${run}`))
+    const r = await call(b.tok, 'notify_joey', { text: 'mock-b08q p95 > 2s，未重啟', outcome: 'changed', service: ' Mock-B08q ', check: 'P95' })   // the key is normalized
+    expect(r).toContain('Joey already has a line about mock-b08q/p95 with outcome changed'); expect(r).toContain(a.id); expect(r).toContain('已重啟一次')
+    expect(ob(b.id, 'joey')).toMatchObject({ state: 'merged', into: a.id, by: 'matter' })
+    await call(b.tok, 'receipt', { outcome: 'done', run_id: String(run) })
+    expect(L.laneStop(b.tok)).toBeNull()                                                       // nothing is owed: the stop does not ask for a line
+    await end(b.lane)
+    expect(handed(b.id).length).toBe(0)                                                        // nor does the exit rule hand one to the main
+    expect(E().get(b.id)!.state).toBe('closed')
+    others.push(b.id)
+  }
+  const c = await start(sched(594, 'svc-check-4'))
+  expect(await call(c.tok, 'notify_joey', { text: 'mock-b08q 已恢復', outcome: 'normal', ...subj })).toContain('sent to Joey')   // a changed outcome: a raise, from another event
+  await call(c.tok, 'receipt', { outcome: 'done', run_id: '594' })
+  await end(c.lane)
+  const f = Object.values(L.__lanesState().followups).find(x => x.event === a.id)!
+  f.due = Date.now() - 1; L.followupTick()
+  expect(await until(() => !!L.__runTok(a.lane))).toBe(true)
+  const fu = L.__runTok(a.lane)!
+  expect(await call(fu, 'notify_joey', { text: 'mock-b08q 已恢復', outcome: 'normal', ...subj })).toContain(`event ${c.id}`)   // the matter's last line already says it
+  expect(ob(a.id, 'joey')).toMatchObject({ state: 'met', outcome: 'changed' })              // the origin keeps its own line
+  await end(a.lane)
+  expect(sent.slice(k).length).toBe(2)                                                         // two lines in all: degraded (with the restart), recovered
+  const plain = await start(sched(595, 'svc-check-5'))                                          // no subject: the event's own one-line rule only
+  expect(await call(plain.tok, 'notify_joey', { text: 'mock-b08q p95 > 2s', outcome: 'changed' })).toContain('sent to Joey')
+  await call(plain.tok, 'receipt', { outcome: 'done', run_id: '595' })
+  await end(plain.lane)
+})
+
 // ------------------------------------------------------------------ PL5 (AUD P15): the scheduler's run id and frequency are event meta; no text is parsed for them
 test('PL5 P15 (B08 [run:40] ×4, WD6): each scheduled event\'s receipt is its meta run id, whatever the text says; the frequency is meta too', async () => {
   const mkS = (text: string, meta: Record<string, string>) => { const e = mk('scheduler', text); e.meta = meta; return e }

@@ -25,9 +25,16 @@ export type Ob = { id: string; kind: ObKind; level: string; state: ObState; by?:
   due_at?: number; ring?: boolean; rang?: boolean; told?: boolean; to?: string; run_id?: string; item?: string; handoff?: string; cls?: string; what?: string; req?: string; sent?: string
   /** the delivery that met it (message id, btcc id, the scheduler's answer); why the last delivery failed; the outcome a joey line was met with; the event a merged one went into */
   ref?: string; failed?: string; outcome?: Outcome; into?: string
+  /** 002q (B08): a Joey line's matter (`<service>/<check>`, from the call's structured service and check) and when it was met */
+  subject?: string; met_at?: string
   /** while requested: what it was before the request (a failed delivery puts it back) */
   prev?: { state: ObState; level: string; outcome?: Outcome; by?: string } }
-export type Want = { kind: ObKind; level: string; to?: string; run_id?: string; handoff?: string; outcome?: Outcome }
+export type Want = { kind: ObKind; level: string; to?: string; run_id?: string; handoff?: string; outcome?: Outcome; subject?: string }
+/** 002q (B08): the matter a Joey line is about, from the call's structured `service` and `check` (never from its text): one key across events */
+export function matterKey(service: unknown, check: unknown): string | undefined {
+  const n = (v: unknown): string => String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ')
+  return n(service) ? `${n(service)}/${n(check)}` : undefined
+}
 export type Verdict = { ok: boolean; why?: string; ob?: Ob; raised?: boolean; event?: Row }
 export type HandOver = { handoff: string; by: string; what?: string; due_at?: number; cls?: string }
 
@@ -49,6 +56,13 @@ export function createEvents(J: Journal) {
   /** a receipt obligation is one per scheduler run, whichever event carries it (met, or being delivered) */
   const receiptMet = (run: string): Row | undefined => J.rows('event', e => (e.obligations ?? []).some((o: Ob) => o.kind === 'receipt' && o.run_id === run && (o.state === 'met' || o.state === 'requested')))[0]
 
+  /** 002q (B08): the last Joey line met about a matter, in any event (a fold over the event records: no table of its own) */
+  function lastOnMatter(subject: string): { e: Row; o: Ob } | undefined {
+    let best: { e: Row; o: Ob } | undefined
+    for (const e of J.rows('event')) for (const o of (e.obligations ?? []) as Ob[])
+      if (o.kind === 'joey' && o.state === 'met' && o.subject === subject && (!best || String(o.met_at ?? '') >= String(best.o.met_at ?? ''))) best = { e, o }
+    return best
+  }
   /** closed = nothing is owed (owed: open, requested, or a Joey line / peer answer handed to the main). An event that owes nothing, information, is
    *  closed at once. 002q: a Joey line handed to the main keeps its event open until the main's line meets it (002p closed it when the hand-over's
    *  M1 item was done, with the line still owed). */
@@ -86,6 +100,17 @@ export function createEvents(J: Journal) {
       case 'joey': {
         ob = joey
         const out = outcome ?? 'normal'
+        // 002q (B08): one matter, one line per outcome, across events and their follow-ups: the last line Joey got about this matter (any event) with the
+        // same outcome makes this one a repeat: refused, and this event's line is settled as merged into the event that told him
+        const told = want.subject && want.level === 'line' ? lastOnMatter(want.subject) : undefined
+        if (told && (told.o.outcome ?? 'normal') === out && !(ob && (ob.state === 'requested' || ob.state === 'handed'))) {
+          const said = told.e.said ? `: 「${String(told.e.said).slice(0, 160)}」` : ''
+          refused = `Joey already has a line about ${want.subject} with outcome ${out} (event ${told.e.id}${told.e.lane ? `, ${told.e.lane}` : ''}${said}); one line per matter: another only when the outcome changed`
+          if (ob && ob.state === 'open') { ob.state = 'merged'; ob.into = told.e.id; ob.by = 'matter' }
+          else if (!ob) obs.push({ id: obId('joey'), kind: 'joey', level: 'line', state: 'merged', into: told.e.id, by: 'matter', subject: want.subject })
+          const row = write(e, obs, { tool, refused, refused_kind: 'joey' })
+          return { ok: false, why: `refused: ${refused}. ${openText(id)}`, ob: obs.find(o => o.kind === 'joey'), event: row }
+        }
         if (!ob) { ob = { id: obId('joey'), kind: 'joey', level: want.level, state: 'open' }; obs.push(ob); raised = true; ask(ob, want.level) }
         else if (ob.state === 'handed') refused = 'this event is handed to the main: the main reports to Joey'
         else if (ob.state === 'requested') refused = 'a line about this event is being sent to Joey right now'
@@ -94,6 +119,7 @@ export function createEvents(J: Journal) {
             : `Joey already has his line for this event (outcome ${ob.outcome ?? 'normal'}); one message per event: another line only when the outcome changed (put anything more in your receipt)`
         else if (ob.state === 'dropped' || ob.state === 'merged') refused = `this event's line was ${ob.state}${ob.into ? ` into ${ob.into}` : ''}`
         else { raised = ob.state === 'met'; ask(ob, want.level); ob.outcome = out }
+        if (ob && ob.state === 'requested' && want.subject) ob.subject = want.subject
         break
       }
       case 'peer':
@@ -135,7 +161,7 @@ export function createEvents(J: Journal) {
     const obs = obsOf(e)
     const o = obId_ ? obs.find(x => x.id === obId_) : undefined
     if (!o || o.state !== 'requested') return null
-    if (ok) { o.state = 'met'; o.ref = d.ref != null ? String(d.ref) : undefined; delete o.prev; delete o.failed }
+    if (ok) { o.state = 'met'; o.ref = d.ref != null ? String(d.ref) : undefined; o.met_at = new Date().toISOString(); delete o.prev; delete o.failed }
     else { const p = o.prev ?? { state: 'open' as ObState, level: o.level }; o.state = p.state; o.level = p.level; o.outcome = p.outcome; o.by = p.by; o.failed = d.why ?? 'not delivered'; delete o.prev }
     return write(e, obs, { tool: ok ? 'delivered' : 'not-delivered', ...f })
   }

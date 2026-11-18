@@ -77,7 +77,8 @@ test('a reply in a thread inherits the class of the run that asked; other classe
 
 test('lanes declare nothing about the tier: notify_joey takes the text and the outcome as a field (normal | changed | failed), never a tier', () => {
   const t = LANE_TOOLS.find(x => x.name === 'notify_joey')!
-  expect(Object.keys((t.inputSchema as any).properties)).toEqual(['text', 'outcome'])
+  expect(Object.keys((t.inputSchema as any).properties)).toEqual(['text', 'outcome', 'service', 'check'])   // 002q (B08): the matter is a field too
+  expect(Object.keys((t.inputSchema as any).properties)).not.toContain('tier')
   expect((t.inputSchema as any).properties.outcome.enum).toEqual(['normal', 'changed', 'failed'])
   expect((t.inputSchema as any).required).toEqual(['text'])
 })
