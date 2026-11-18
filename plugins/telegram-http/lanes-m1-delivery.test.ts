@@ -268,6 +268,28 @@ test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the sa
   await kill(g)
 })
 
+test('002r H05: a subagent\'s tool calls are not the main\'s turn: after the Stop they bind nothing again, in a turn they open no tool and pull nothing; the next prompt gets nothing twice', async () => {
+  const g = await startMain()
+  const id = await joey('把 20 頁日誌讀完')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Agent' })                              // the main starts an agent: its own call
+  const late = await joey('順便看一下 health')                                                    // reaches the main while the agent works
+  expect((await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Read', sub: true })).additionalContext).toBeUndefined()   // not pulled into the subagent
+  expect(state(late)).toBe('queued'); expect(M().currentGen()!.tool_open).toBe('Agent')          // the main's open call is still its Agent call
+  expect((await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Agent', tool_input: {}, tool_response: 'launched' })).additionalContext).toContain('順便看一下 health')   // the main's own boundary
+  await hook(g, 'Stop', { prompt_id: p }); await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(state(late)).toBe('done'); expect(M().mainPhase()).toBe('idle')
+  for (const t of ['Read', 'Bash', 'Read']) { await hook(g, 'PreToolUse', { prompt_id: p, tool_name: t, sub: true }); await hook(g, 'PostToolUse', { prompt_id: p, tool_name: t, sub: true }) }
+  expect(M().mainPhase()).toBe('idle'); expect(state(id)).toBe('done')                           // 002q H05 r2: these re-opened the turn and bound the items again
+  expect(linesOf('msg', id).some(l => l.reason === 'turn_continued')).toBe(false)
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2 })                           // the task notification's turn: a prompt of its own, no item
+  expect(state(id)).toBe('done'); expect(M().items(r => r.prompt_id === p2).length).toBe(0)
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(linesOf('msg', id).map(l => l.state)).toEqual(['queued', 'offered', 'bound', 'done'])   // delivered once
+  await kill(g)
+})
+
 test('another Stop hook blocks the turn: the continued turn ends done exactly once at its final Stop; nothing is offered into it (a message in it is pulled); an offer written in the gap is bound by its own UserPromptSubmit', async () => {
   const g = await startMain()
   const a = await joey('A：先查發票 4471')

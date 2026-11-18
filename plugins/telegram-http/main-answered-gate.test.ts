@@ -7,7 +7,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-answered-gate.py')
-let server: any, calls: any[] = [], mode: 'missed' | 'answered' | 'fail' | 'html' = 'missed'
+let server: any, calls: any[] = [], mode: 'missed' | 'answered' | 'fail' | 'html' = 'missed', unsentP = 0.95
 
 beforeAll(() => {
   server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
@@ -17,6 +17,7 @@ beforeAll(() => {
     if (mode === 'html') return new Response('<html><body>Attention Required</body></html>', { status: 403, headers: { 'content-type': 'text/html' } })
     const answers: Record<string, unknown> = {}
     for (const k of Object.keys(body.questions)) {
+      if (k === 'unsent') { answers[k] = { type: 'noul', noul: unsentP }; continue }
       const kind = k.split('.')[1]
       const p = mode === 'missed' ? { reply_needed: 0.95, answered: 0.05, deferred: 0.02 }[kind] : { reply_needed: 0.95, answered: 0.93, deferred: 0.02 }[kind]
       answers[k] = { type: 'noul', noul: p }
@@ -115,4 +116,55 @@ test('a message marked no_reply, and a system notice, never need a reply', async
   const r = await run(prompt('100', '開始做報告') + rec({ type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', timestamp: 't', content: fyi })
     + rec({ type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', timestamp: 't', content: sys }) + reply('報告做完了', '100'))
   expect(r.out).toBeNull(); expect(calls.length).toBe(0)
+})
+
+// ---- 002r (universe 002q, G02): the turn's last words reached nobody
+const call = (name: string, error = false) => ({ name, input: {}, result: error ? 'failed' : 'ok', error })
+const REPLY = 'mcp__plugin_telegram-http_telegram-http__reply'
+const ACK = '收到，開始一頁一頁抓，抓完回你總數。', FINAL = '5xx 總行數是 194 行，來自 4,769 行存取日誌（1–20 頁，每頁 250 行，第 20 頁 19 行）。'
+async function runLast(o: { final?: string; calls?: any[]; outputs?: any[]; items?: any[]; prompt?: string; env?: Record<string, string>; dir?: string }) {
+  const d = o.dir ?? mkdtempSync(join(tmpdir(), 'gate-'))
+  mkdirSync(join(d, '.lanes', 'run'), { recursive: true })
+  const p = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    env: { ...process.env, LANES_DIR: join(d, '.lanes'), TYPESAFE_BASE_URL: `http://127.0.0.1:${server.port}`, TYPESAFE_API_KEY: 'test-key', ...(o.env ?? {}) } })
+  p.stdin.write(JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: d, last_assistant_message: o.final ?? FINAL, lanes_turn: {
+    items: o.items ?? [{ mid: '2003', kind: 'tg', user: 'joey_lab', no_reply: false, system: false, body: '把日誌第 1 頁到第 20 頁一頁一頁抓，數每一頁有幾行 5xx，給我總數。' }],
+    outputs: o.outputs ?? [{ to: 'Joey', reply_to: '', text: ACK }],
+    turn: { prompt_id: o.prompt ?? 'p1', calls: o.calls ?? [call(REPLY), call('Bash'), call('Bash')] } } })); p.stdin.end()
+  const out = (await new Response(p.stdout).text()).trim(); await p.exited
+  const logp = join(d, '.lanes', 'run', 'answered-gate.jsonl')
+  return { out: out ? JSON.parse(out) : null, dir: d, log: existsSync(logp) ? readFileSync(logp, 'utf8').trim().split('\n').map(l => JSON.parse(l)) : [] }
+}
+
+test('002r G02: an answer written after the last reply, on the main\'s own screen, holds the turn once; the next Stop of that turn ends it', async () => {
+  calls = []; mode = 'answered'; unsentP = 0.97
+  const r = await runLast({})
+  expect(r.out.decision).toBe('block'); expect(r.out.reason).toContain('只出現在你自己的畫面上'); expect(r.out.reason).toContain('reply')
+  expect(calls.length).toBe(1); expect(Object.keys(calls[0].questions)).toEqual(['unsent'])     // one message, one question: the per-message check is not asked
+  expect(calls[0].state.final_text).toContain('194'); expect(calls[0].state.outputs).toEqual([{ to: 'Joey', text: ACK }])
+  expect(calls[0].state.messages[0]).toMatchObject({ from: 'joey_lab' })
+  expect(r.log.at(-1)).toMatchObject({ blocked: ['unsent'], unsent: { calls_after: 2, p: 0.97 } })
+  const again = await runLast({ dir: r.dir })
+  expect(again.out).toBeNull(); expect(calls.length).toBe(1)                                    // once per turn, and Jev is not asked again
+  const next = await runLast({ dir: r.dir, prompt: 'p2' })                                      // another turn of the same session is its own
+  expect(next.out.decision).toBe('block')
+})
+
+test('002r: a recap after the reply (Jev: nothing new), a turn with no call after its last output, a short closing line and a turn with no output are not held', async () => {
+  calls = []; mode = 'answered'; unsentP = 0.08
+  const recap = await runLast({ final: 'I sent Joey the 24-hour error breakdown on Telegram (message 2008) and logged the open items in notes.', calls: [call('Bash'), call(REPLY), call('Bash')] })
+  expect(recap.out).toBeNull(); expect(calls.length).toBe(1); expect(recap.log.at(-1)).toMatchObject({ blocked: [], unsent: { calls_after: 1, p: 0.08 } })
+  calls = []; unsentP = 0.97
+  expect((await runLast({ calls: [call('Bash'), call(REPLY)] })).out).toBeNull()                 // the reply was the turn's last call
+  expect((await runLast({ final: '已回覆。' })).out).toBeNull()                                   // nothing of substance
+  expect((await runLast({ outputs: [], calls: [call('Bash')] })).out).toBeNull()                 // no output at all: the owed-line hold's case, not this one
+  expect((await runLast({ calls: [call(REPLY, true), call('Bash')], outputs: [] })).out).toBeNull()   // a reply that failed delivered nothing
+  expect(calls.length).toBe(0)
+})
+
+test('002r: a failed Jev call holds nothing; shadow mode records and never holds; a send_to_agent counts as an output', async () => {
+  calls = []; unsentP = 0.97
+  mode = 'fail'; let r = await runLast({}); expect(r.out).toBeNull(); expect(r.log.at(-1).error).toBeTruthy()
+  mode = 'answered'; r = await runLast({ env: { ANSWERED_GATE_MODE: 'shadow' } }); expect(r.out).toBeNull(); expect(r.log.at(-1)).toMatchObject({ mode: 'shadow', blocked: [], unsent: { p: 0.97 } })
+  r = await runLast({ calls: [call(REPLY), call('Bash'), call('mcp__plugin_agent-inbox_agent-inbox__send_to_agent')] }); expect(r.out).toBeNull()   // the send was the last call
 })

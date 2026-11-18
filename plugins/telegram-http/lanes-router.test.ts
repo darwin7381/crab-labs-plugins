@@ -27,7 +27,8 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 're
 `)
 chmodSync(bin, 0o755)
 const restore = L.__setClaudeBin(bin)
-L.__setMeshSend(async b => ({ text: `sent to ${b.to}`, msgId: 60000 + Math.floor(Math.random() * 1000), delivered: true }))
+const meshOut: any[] = []
+L.__setMeshSend(async b => { meshOut.push(b); return { text: `sent to ${b.to}`, msgId: 60000 + Math.floor(Math.random() * 1000), delivered: true } })
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
   sendBot: async () => 1, joeyChatId: () => '1' } as any)
 afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; logosSrv.close(); L.__setClaudeBin(restore); delete process.env.LANES_FLOOD_CONTROL })
@@ -48,8 +49,15 @@ test('PL6 P18 (C04, H04): the thread-gate row carries the stopped (owner\'s) thr
   const row = routing().find(r => r.event === `mesh-rt-${n}`)
   expect(row).toMatchObject({ rule: 'thread-gate', target: 'ledger', thread: th, peer_thread: th })     // 002o: thread null
   expect(L.__events().get(`mesh-rt-${n}`)).toMatchObject({ class: 'peer', owner: d1.lane, stop: { why: 'hop', thread: th } })   // not 'peer'/'main' hard-coded by a hand-over
+  // 002r (C04): the peer is told once that the exchange stopped, in the router's words, no_reply; the record has it as the router's own met line
+  const stopId = `mesh-rt-${n}`
+  await until(() => (L.__events().get(stopId)?.obligations ?? []).some((o: any) => o.level === 'stop-notice'))
+  const told = meshOut.filter(m => m.to === 'eve' && m.no_reply === true)
+  expect(told.length).toBe(1); expect(told[0]).toMatchObject({ thread: th, lane: 'router' }); expect(told[0].text).toContain('轉手次數'); expect(told[0].text).toContain('不用回')
+  expect((L.__events().get(stopId)!.obligations as any[]).find(o => o.level === 'stop-notice')).toMatchObject({ kind: 'peer', to: 'eve', owner: 'router', state: 'met', by: 'router' })
   const later = await L.routeEvent(mk('eve', '還在嗎', { thread: th, hop: 8, reply_to_id: 'x' }))
   expect(routing().find(r => r.event === `mesh-rt-${n}`)).toMatchObject({ rule: 'thread-gate', thread: th }); expect(later.note).toContain('already stopped')
+  await sleep(50); expect(meshOut.filter(m => m.to === 'eve' && m.no_reply === true).length).toBe(1)   // a message on a stopped thread is not told again
   writeFileSync(GO, 'ok'); await until(() => !L.__runTok(d1.lane!))
 })
 

@@ -11,9 +11,12 @@ every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopba
   Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes Joey a line (the daemon's M3 check:
                 the Joey line of an event bound to this turn, owned by the main and not met) is held (decision block, naming each event); else
                 the model aids run (an undecided Joey memory proposal over the daemon's
-                `proposals` / `turn` / `curator`, the answered check over the items M1 bound to this turn); when nothing holds the turn, the
+                `proposals` / `turn` / `curator`, the answered check over the items M1 bound to this turn, which also asks whether the
+                turn's last words (the payload's last_assistant_message, after the turn's last output) reached anyone); when nothing holds the turn, the
                 daemon is told the turn really ended
 The daemon decides everything and hands the aids the turn (items, calls, start times); this script and its aids read no transcript.
+A hook event that carries `agent_id` fired inside a subagent (Claude Code runs the session's tool hooks for a subagent's calls too): it is not
+the main's turn. It is posted as `sub: true`, nothing is printed, and the daemon only keeps an open turn alive by it (002r).
 CLAUDE_PID (set by Claude Code) names the process.
 """
 import importlib.util
@@ -91,6 +94,9 @@ def main():
         return
     ev = p.get('hook_event_name') or ''
     pid = os.environ.get('CLAUDE_PID') or ''
+    if p.get('agent_id'):                    # 002r (H05): a subagent's (or teammate's) tool call, not the main's turn: the daemon only notes the process works
+        post({'event': ev, 'session_id': p.get('session_id'), 'pid': int(pid) if pid.isdigit() else None, 'sub': True}, 5)
+        return
     body = {'event': ev, 'session_id': p.get('session_id'), 'prompt_id': p.get('prompt_id'), 'pid': int(pid) if pid.isdigit() else None,
             'transcript_path': p.get('transcript_path'), 'source': p.get('source'), 'tool_name': p.get('tool_name'), 'error': p.get('error')}
     if ev == 'UserPromptSubmit':
@@ -122,7 +128,7 @@ def main():
             out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': deny}})
     elif ev == 'Stop':
         held = r.get('block') or aid('main-memory-gate.py', 'reason', p, r.get('turn') or {}, r.get('proposals') or [], bool(r.get('curator'))) \
-            or aid('main-answered-gate.py', 'reason', p, r.get('items') or [], r.get('outputs') or [])
+            or aid('main-answered-gate.py', 'reason', p, r.get('items') or [], r.get('outputs') or [], r.get('turn') or {})
         if held:
             out({'decision': 'block', 'reason': held})
             return

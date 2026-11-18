@@ -66,6 +66,8 @@ export type MainEnv = {
 export type MainEvent = {
   event: string; session_id?: string; prompt_id?: string; pid?: number; transcript_path?: string; source?: string
   error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
+  /** 002r: the event fired inside a subagent of the main (the hook input's agent_id): not the main's turn */
+  sub?: boolean
 }
 /** PL5: the turn the main's aids judge, from M1/M2 (they read no transcript): its prompt, when it and the turn before it started, the items bound to
  *  it (the digest's content is the digest), and its tool calls with their results (main-hook.py posts every PostToolUse) */
@@ -291,6 +293,10 @@ export function createMain(E: MainEnv) {
     if (ev === 'SessionStart') return sessionStart(b, pid)
     const g = currentGen()
     if (!g || !pid || Number(g.pid) !== pid) return {}                       // not the main: nothing of it is tracked
+    // 002r (H05): a subagent's tool call. It starts, continues and ends no turn of the main, opens no tool of the main and is no boundary to pull at
+    // (the pulled message would land in the subagent). While the main's turn is open (it waits on its Agent call) the subagent's work is the gen's
+    // sign of life; an idle main that leaves an offer untaken is not excused by its background agents.
+    if (b.sub) { if (g.state === 'in_turn') lastEventAt.set(g.id, Date.now()); return {} }
     lastEventAt.set(g.id, Date.now())
     if (stuck && stuck.gen === g.id) { stuck = null; E.tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
     const p = String(b.prompt_id ?? '')

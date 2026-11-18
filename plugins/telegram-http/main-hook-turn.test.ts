@@ -91,3 +91,45 @@ test('Stop: the memory gate runs on the daemon\'s proposals and turn; a held tur
   fresh(() => ({ turn, proposals, curator: true }))
   expect(await hook(world(), { hook_event_name: 'Stop' })).toBeNull()
 })
+
+// ---- 002r (universe 002q, G02): the whole path of the last-words hold. The hook posts the Stop check, the daemon answers the turn (its items, its
+// outputs, its calls), the answered gate reads the Stop payload's last_assistant_message and asks Jev (a local stand-in); a hold is printed and the
+// daemon is not told the turn ended.
+test('002r G02: Stop with an answer left on the main\'s own screen after its last reply is held once, end to end; the next Stop of the turn ends it', async () => {
+  let jevCalls: any[] = []
+  const jev = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) { const b = await req.json() as any; jevCalls.push(b); return Response.json({ answers: { unsent: { type: 'noul', noul: 0.97 } } }) } })
+  try {
+    const w = world()
+    const run = async () => {
+      const p = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+        env: { PATH: process.env.PATH ?? '', LANES_DIR: w.ld, TELEGRAM_HTTP_PORT: String(server.port), MCP_TOKEN_DIR: tok, TYPESAFE_API_KEY: 'test-key',
+          TYPESAFE_BASE_URL: `http://127.0.0.1:${jev.port}`, PYTHONDONTWRITEBYTECODE: '1' } })
+      p.stdin.write(JSON.stringify({ session_id: 's1', prompt_id: 'p1', transcript_path: join(w.d, 't.jsonl'), cwd: w.d, hook_event_name: 'Stop',
+        last_assistant_message: '5xx 總行數是 194 行，來自 4,769 行存取日誌（1–20 頁，每頁 250 行，第 20 頁 19 行）。' })); p.stdin.end()
+      const out = (await new Response(p.stdout).text()).trim(); expect(await p.exited).toBe(0)
+      return out ? JSON.parse(out) : null
+    }
+    const turn = { prompt_id: 'p1', started_at: null, prev_started_at: null, items: [],
+      calls: [{ name: REPLY, input: { text: '收到，抓完回你總數。' }, result: 'sent (id: 2004)', error: false }, { name: 'Bash', input: {}, result: 'page 20 ok', error: false }] }
+    fresh(b => b.phase === 'check' ? { items: [{ mid: '2003', kind: 'tg', user: 'joey_lab', no_reply: false, system: false, body: '數每一頁有幾行 5xx，給我總數。' }],
+      outputs: [{ to: 'Joey', reply_to: '', text: '收到，抓完回你總數。' }], turn, proposals: [], curator: false } : {})
+    const held = await run()
+    expect(held.decision).toBe('block'); expect(held.reason).toContain('只出現在你自己的畫面上')
+    expect(posted.map(b => b.phase)).toEqual(['check'])                                  // held: the daemon is not told the turn ended
+    expect(jevCalls.length).toBe(1); expect(jevCalls[0].state.final_text).toContain('194'); expect(jevCalls[0].state.outputs).toEqual([{ to: 'Joey', text: '收到，抓完回你總數。' }])
+    posted = []
+    expect(await run()).toBeNull()                                                       // the same turn's next Stop: not asked again, the turn ends
+    expect(posted.map(b => b.phase)).toEqual(['check', 'final']); expect(jevCalls.length).toBe(1)
+  } finally { jev.stop(true) }
+})
+
+test('002r H05: a hook event that carries agent_id (a subagent\'s tool call) is posted as sub and prints nothing, whatever the daemon would answer', async () => {
+  const w = world()
+  fresh(() => ({ additionalContext: 'one item reached you', block: 'x', turn: { calls: [] } }))
+  expect(await hook(w, { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: { file_path: '/a' }, tool_response: 'x', agent_id: 'a7730af99049a14de', agent_type: 'general-purpose' })).toBeNull()
+  expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: REPLY, tool_input: { text: 'x' }, agent_id: 'a7730af99049a14de' })).toBeNull()
+  expect(posted.length).toBe(2); expect(posted.every(b => b.sub === true && b.session_id === 's1' && b.tool_name === undefined && b.prompt_id === undefined)).toBe(true)
+  fresh(() => ({ additionalContext: 'one item reached you' }))                // the same call by the main itself: pulled as before
+  expect((await hook(w, { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: {}, tool_response: 'x' })).hookSpecificOutput.additionalContext).toBe('one item reached you')
+  expect(posted[0].sub).toBeUndefined()
+})

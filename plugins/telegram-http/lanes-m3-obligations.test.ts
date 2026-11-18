@@ -4,7 +4,7 @@
 // one due sweep acts on what nobody met in time. The failures of class B (and J's due timers) of 002j–002n are played here. The lane is a script that
 // waits for the test to say how its run ends (normal, cut at --max-turns, killed); its tool calls are made through the run's own token. No model.
 import { test, expect, afterAll } from 'bun:test'
-import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'fs'
+import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdirSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
@@ -289,9 +289,12 @@ test('002m aid (b), reduced: a message that claims the matter went to Joey or th
 
 test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the router tells the peer (its OWN line, its own obligation), the answer becomes the main\'s with a due time; the lane\'s own reply still goes out (one); a send on that thread meets the answer, another topic does not', async () => {
   const p = await start(mk('eve', '可以答應我週五前給 10 月可用率嗎？', { btcc_msg_id: '50008' }))
+  writeFileSync(join(dir, 'focus.md'), '進行中：日誌基準統計。別碰：mock-api 設定。預計 +6m 完成。\n')   // 002r (B09): the router's interim carries the main's focus card
   const out = await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
   expect(out).toContain('The router told eve'); expect(out).toContain('your own part')
   expect(mesh.at(-1)).toMatchObject({ to: 'eve', reply_to: '50008' }); expect(mesh.at(-1).text).toContain('主線會在')
+  expect(mesh.at(-1).text).toContain('主線目前的焦點卡：「進行中：日誌基準統計。別碰：mock-api 設定。預計 +6m 完成。」')
+  rmSync(join(dir, 'focus.md')); expect(L.interimText(Date.now())).not.toContain('焦點卡')              // no card, no sentence
   const peerObs = obs(p.id).filter(o => o.kind === 'peer')
   expect(peerObs.length).toBe(2)                                                               // the answer (now the main's) and the router's line: no third
   expect(peerObs.find(o => o.level === 'interim')).toMatchObject({ state: 'met', owner: 'router', by: 'router', ref: String(70000 + mesh.length) })
@@ -306,8 +309,9 @@ test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the ro
   await end(p.lane)
   await L.mainSentTo('eve', 'adam#t-unrelated', null, '')                                    // another thread, no text: nothing closes
   expect(obs(p.id).find(o => o.id === owed.id).state).toBe('open')
-  await L.mainSentTo('eve', E().get(p.id)!.thread, null, '可以，週五前給你')
-  expect(obs(p.id).find(o => o.id === owed.id)).toMatchObject({ state: 'met', by: 'main (thread)' })
+  await L.mainSentTo('eve', E().get(p.id)!.thread, null, '可以，週五前給你', '70099')
+  expect(obs(p.id).find(o => o.id === owed.id)).toMatchObject({ state: 'met', by: 'main (thread)', ref: '70099' })
+  expect((E().get(p.id)!.main_sends as any[]).at(-1)).toMatchObject({ to: 'eve', ref: '70099', delivered: true, matched: 'thread' })   // 002r (C07): which message kept the promise
 })
 
 test('the due sweep: a promised answer past its due time tells Joey once; a hand-over the main has not finished tells Joey once; a main away past the grace makes it due at once', async () => {

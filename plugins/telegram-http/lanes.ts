@@ -598,10 +598,11 @@ function ledger(e: { lane: string; thread?: string | null; event?: string; kind:
   appendJsonl('ledger.jsonl', rec)
   logos('lane.ledger', { lane: e.lane, thread: e.thread ?? null, event: e.event ?? null, ledger_kind: e.kind, text: e.text.slice(0, 300), refs: e.refs ?? null })
 }
-function focusCard(): string {
-  try { const t = readFileSync(join(LANES_DIR, 'focus.md'), 'utf8').trim(); if (t) return t } catch {}
-  return '（主線還沒有寫焦點卡。）'
+/** the main's focus card as written, or null when there is none */
+function focusText(): string | null {
+  try { return readFileSync(join(LANES_DIR, 'focus.md'), 'utf8').trim() || null } catch { return null }
 }
+function focusCard(): string { return focusText() ?? '（主線還沒有寫焦點卡。）' }
 
 // ================================================================== router
 export type InEvent = {
@@ -866,6 +867,10 @@ export function drainStoppedThread(thread: string, why: string): number {
   if (n) saveState()
   return n
 }
+export function stopNoticeText(why: 'hop' | 'budget'): string {
+  return `這條對話已經到自動往來的上限（${why === 'hop' ? '轉手次數' : 'token 預算'}），系統先停在這裡：之後在這條線上的訊息不會有自動回覆。`
+    + `你最後這一則已經交給 ${D.agent} 的主線，由主線決定怎麼回你。這是系統自動通知，不用回。`
+}
 function stopThread(ev: InEvent, t: Thread | null, gate: { why: 'hop' | 'budget'; note: string }, laneId: string | null): Decision {
   const why = gate.note
   // M3 (PL1): the stopped event's record says why and where (the router opens it here, with what it owes; the hand-over below moves it to the main)
@@ -877,6 +882,11 @@ function stopThread(ev: InEvent, t: Thread | null, gate: { why: 'hop' | 'budget'
   const text = `停止投遞：${why}（thread ${t?.id ?? ev.thread ?? '-'}，寄件者 ${ev.from}）。內容：${ev.text.slice(0, 160)}`
     + `\n這條對話線已經關閉：對方之後在這條線上再傳的訊息只會記進帳本，不會再開車道，也不會再叫醒你。還需要跟對方談，就用 send_to_agent 另開一則新的（不要帶 reply_to）。`
   ledger({ lane: laneId ?? 'router', thread: t?.id ?? ev.thread ?? null, event: ev.id, kind: 'stop', text })
+  // 002r (C04): the peer is told once, in the router's fixed words, marked no_reply (as a flood is): its last message is with the main, this line ends the exchange
+  if (owesPeer && D.role === 'tg' && events) void laneMeshSend({ to: ev.from, no_reply: true, reply_to: ev.btcc_msg_id, thread: t?.id ?? ev.thread ?? undefined, lane: 'router',
+    text: stopNoticeText(gate.why) }).then(r => {
+      if (r?.delivered === true) events.add(ev.id, { kind: 'peer', level: 'stop-notice', to: ev.from.toLowerCase(), owner: 'router', state: 'met', by: 'router', ref: String(r.msgId ?? '') }, { tool: 'router' })
+    }).catch(() => {})
   // M3: the peer's message is owed an answer nobody else can give now: the main gets it, once (M4 wakes it through M1)
   if (D.role === 'tg' && events) handToMain(ev.id, laneId ? S.lanes[laneId] : undefined, text, undefined, undefined, 1000, false)
   return { rule: 'thread-gate', target: 'ledger', lane: laneId ?? undefined, note: why, thread: t?.id ?? ev.thread ?? undefined }
@@ -2694,7 +2704,9 @@ export const __runTok = (laneId: string): RunTok | undefined => running.get(lane
 export const __runToken = (tok: RunTok): string | undefined => [...runTokens].find(([, t]) => t === tok)?.[0]   // tests only (the lane's LANE_RUN_TOKEN)
 const laneMeshSend = (b: unknown): Promise<any> => meshSendHook ? meshSendHook(b) : inboxPost('/lanes/send', b)
 export function interimText(due: number): string {
+  const card = focusText()
   return `這件事要 ${D.agent} 的主線決定。我是 ${D.agent} 的車道，不能代為答應或拒絕。已經交給主線，主線會在 ${simTime(due)} 前直接回你。`
+    + (card ? `主線目前的焦點卡：「${card.replace(/\s+/g, ' ').slice(0, 300)}」` : '')   // 002r (B09): what the main is busy with and until when, in the router's own line
 }
 async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to: string; text: string } | null> {
   const ev = queue.get(tok.evId)?.ev
@@ -2737,9 +2749,10 @@ async function jevMatchPromise(open: OpenPromise[], peer: string, text: string):
   if (r.error || !r.answers) { D.log('warn', `lanes: promise match for the send to ${peer} failed (${r.error}); nothing closed`); return null }
   return c && c !== 'none' && conf >= PROMISE_MATCH_P() ? open.find(p => p.o.id === c) ?? null : null
 }
-function keepPromise(p: OpenPromise, how: string): void {
+function keepPromise(p: OpenPromise, how: string, ref: string): void {
   const late = !!p.o.told
-  events.set(p.ev.id, p.o.id, { state: 'met', by: `main (${how})` }, { tool: 'send_to_agent' })
+  events.set(p.ev.id, p.o.id, { state: 'met', by: `main (${how})`, ...(ref ? { ref } : {}) }, { tool: 'send_to_agent' })
+  events.push(p.ev.id, 'main_sends', { to: p.o.to, ref, at: nowIso(), delivered: true, matched: how }, true)   // 002r (C07): the event records the send that kept it, as a send in its own turn does
   ledger({ lane: 'router', thread: p.ev.thread ?? null, event: p.ev.id, kind: 'fyi',
     text: `主線已回覆 ${p.o.to}（系統告訴過對方 ${simTime(p.o.due_at!)} 前會回的那件事${late ? '；過了時間才回' : ''}）`, refs: { obligation: p.o.id, matched: how, late } })
   logos('lane.promise.kept', { obligation: p.o.id, peer: p.o.to, late, matched: how })
@@ -2757,12 +2770,12 @@ export async function mainSentTo(to: string, thread: string | null, replyTo?: st
   const byThread = thread ? open.filter(p => p.ev.thread === thread) : []
   const byReply = rt ? open.filter(p => p.o.req === rt || p.o.sent === rt) : []
   if (byThread.length || byReply.length) {
-    for (const p of [...byThread, ...byReply.filter(x => !byThread.includes(x))]) keepPromise(p, byThread.includes(p) ? 'thread' : 'reply_to')
+    for (const p of [...byThread, ...byReply.filter(x => !byThread.includes(x))]) keepPromise(p, byThread.includes(p) ? 'thread' : 'reply_to', ref)
     return
   }
   if (!text?.trim()) return                                    // nothing says which request this answers: all stay open
   const hit = await jevMatchPromise(open, peer, text)
-  if (hit) keepPromise(hit, 'jev')
+  if (hit) keepPromise(hit, 'jev', ref)
 }
 
 /** the due sweep (every second): what nobody met by its due time, the router does. This one sweep replaces the critical ring (45 s), the hand-over

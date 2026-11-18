@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""End-of-turn check of the MAIN (universe 002j): every message taken in during this turn is answered or deferred.
+"""End-of-turn check of the MAIN (universe 002j): every message taken in during this turn is answered or deferred, and (002r) the
+turn's last words reached somebody.
 
 Problem (problems list, item 9): a message that reaches the main while it is working is pulled into the running turn. A model
 may fold it into the task at hand and end the turn without ever answering it (seen live on 2026-11-14 with Haiku, with no
@@ -16,6 +17,14 @@ Jev can only make the turn continue once. It releases nothing and decides nothin
 HTML 403, a timeout, a malformed answer) = the hook says nothing and the turn ends as it would have.
 
 ANSWERED_GATE_MODE=shadow records what it would have done (run/answered-gate.jsonl) and never blocks. Default: enforce.
+
+002r, the last words (universe 002q, G02): the main acknowledged Joey's request, worked, and ended the turn with the answer written as
+plain text on its own screen. Every other check passed: the turn had a reply, and nothing was owed by the record. So, when the turn
+made tool calls after its last delivered reply / send_to_agent (`turn.calls`, the daemon's record) and ends on a text of substance
+(the Stop payload's `last_assistant_message`; no transcript is read), Jev is asked one question: does that text state an answer or
+result a sender asked for which no output of the turn contains. Yes = the turn is held once, with fixed words. The question and its
+threshold were calibrated on the real turns of universes 002o, 002p and 002q (59 recap or waiting texts after a reply: highest 0.37;
+the real unsent answer: 0.99).
 """
 import json
 import os
@@ -30,6 +39,17 @@ MODEL = os.environ.get('TYPESAFE_DEFAULT_MODEL', 'jev-1.14.0')
 API = os.environ.get('TYPESAFE_BASE_URL', 'https://api.typesafe.ai').rstrip('/') + '/v1/systemone'
 KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE', os.path.expanduser('~/.genesis/typesafe.env'))
 TIMEOUT_S = float(os.environ.get('ANSWERED_GATE_TIMEOUT_S', '6'))
+UNSENT_MIN = 40                          # a final text shorter than this states no result
+UNSENT_P = float(os.environ.get('ANSWERED_GATE_UNSENT_P', '0.6'))
+UNSENT_SETTING = ('An agent works for its boss and for other senders. They can read ONLY `outputs`: the messages the agent sent during this turn, in order. '
+                  '`messages` are what the agent took in during the turn. `final_text` is what the agent wrote on its own screen as the turn ended; '
+                  'nobody else can see it.')
+UNSENT_Q = {'type': 'noul',
+            'instructions': 'Does `final_text` state an answer, a result or a figure that a sender of `messages` asked for, which no item of `outputs` already told that sender?',
+            'criteria': {'true': 'final_text gives the asked-for answer or result, and no output contains it: the outputs only acknowledge, report progress, or promise it for later',
+                         'false': 'what final_text states was already sent in an output, or final_text only describes what was sent or done, or says the agent is still waiting'}}
+UNSENT_WORDS = ('這一輪先不要結束。你最後寫的那段結果只出現在你自己的畫面上，對方看不到。'
+                '要讓他知道，現在用 reply（給 Joey）或 send_to_agent（給同伴）發出去；內容其實都發過了的話，直接結束即可。')
 
 
 def load_key():
@@ -162,17 +182,87 @@ def judge(msgs, outs):
     return verdict, a
 
 
-def reason(p, msgs, outs):
-    """The block reason for a turn whose bound messages were not addressed, or None. msgs: [{mid, kind, user, no_reply, system, body}] (M1);
-    outs: [{to, reply_to, text}]. Never raises."""
+def reason(p, msgs, outs, turn=None):
+    """The block reason for a turn whose bound messages were not addressed, or whose last words reached nobody, or None.
+    msgs: [{mid, kind, user, no_reply, system, body}] (M1); outs: [{to, reply_to, text}]; turn: the daemon's turn ({prompt_id, calls}). Never raises."""
     try:
-        return _reason(p, list(msgs or []), list(outs or []))
+        return _reason(p, list(msgs or []), list(outs or []), turn)
     except Exception:
         return None
 
 
-def _reason(p, msgs, outs):
+def calls_after_last_output(calls, had_outputs):
+    """How many tool calls the turn made after its last delivered reply / send_to_agent. None: it delivered nothing (the owed-line hold's
+    case, not this one). The daemon keeps the turn's last 40 calls: an output older than that leaves all of them after it."""
+    calls = list(calls or [])
+    last = None
+    for i, c in enumerate(calls):
+        if isinstance(c, dict) and str(c.get('name') or '').endswith(('__reply', '__send_to_agent')) and not c.get('error'):
+            last = i
+    if last is None:
+        return len(calls) if had_outputs else None
+    return len(calls) - 1 - last
+
+
+def unsent_p(msgs, outs, final):
+    """Jev's probability that `final` states an asked-for answer or result that no output of the turn contains."""
+    a = ask({'setting': UNSENT_SETTING, 'messages': [{'from': m.get('user') or '', 'text': str(m.get('body') or '')[:BODY_MAX]} for m in msgs][-6:],
+             'outputs': [{'to': o['to'], 'text': o['text'][:OUT_MAX]} for o in outs[-12:]], 'final_text': final[:3000]}, {'unsent': UNSENT_Q})
+    return (a.get('unsent') or {}).get('noul')
+
+
+def _load(sp):
+    try:
+        return json.load(open(sp, encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def _save(sp, st):
+    """False = cannot remember = the hold would repeat on every stop: the caller says nothing instead."""
+    try:
+        tmp = f'{sp}.{os.getpid()}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(dict(list(st.items())[-500:]), f)
+        os.replace(tmp, sp)
+        return True
+    except OSError:
+        return False
+
+
+def _reason(p, msgs, outs, turn=None):
     sid, d = p.get('session_id') or '', lanes_run_dir(p)
+    return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn if isinstance(turn, dict) else {})
+
+
+def _unsent(p, sid, d, msgs, outs, turn):
+    """The hold for a turn whose last words reached nobody, or None. One hold per turn (the prompt id)."""
+    final = str(p.get('last_assistant_message') or '').strip()
+    after = calls_after_last_output(turn.get('calls'), bool(outs))
+    if not msgs or not outs or not after or len(final) < UNSENT_MIN:
+        return None
+    sp = os.path.join(d, 'answered-gate.json')
+    st, key = _load(sp), f"{sid}:unsent:{turn.get('prompt_id') or p.get('prompt_id') or ''}"
+    if key in st:
+        return None
+    facts = {'calls_after': after, 'chars': len(final)}
+    try:
+        pr = unsent_p(msgs, outs, final)
+    except Exception as e:                               # a failed call is an error, never a verdict
+        record(d, {'session': sid, 'unsent': facts, 'error': f'{type(e).__name__}: {e}'[:200], 'ms': CALL.get('ms')})
+        jev_log(d, 'unsent-gate', CALL.get('question'), {'session': sid, **facts}, None, None, CALL.get('ms'), CALL.get('error'))
+        return None
+    jev_log(d, 'unsent-gate', CALL.get('question'), {'session': sid, **facts}, CALL.get('answers'), pr, CALL.get('ms'), None)
+    mode = os.environ.get('ANSWERED_GATE_MODE', 'enforce')
+    hold = pr is not None and pr >= UNSENT_P
+    record(d, {'session': sid, 'mode': mode, 'ms': CALL.get('ms'), 'unsent': {**facts, 'p': pr}, 'blocked': ['unsent'] if hold and mode != 'shadow' else []})
+    if not hold or mode == 'shadow':
+        return None
+    st[key] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+    return UNSENT_WORDS if _save(sp, st) else None
+
+
+def _missed(p, sid, d, msgs, outs):
     if len(msgs) < 2:                                   # a turn that took in one message is not checked
         return None
     def log_call():                                      # 002k: the call, when there was one, in the unified log too
@@ -187,10 +277,7 @@ def _reason(p, msgs, outs):
         return None
     log_call()
     sp = os.path.join(d, 'answered-gate.json')
-    try:
-        st = json.load(open(sp, encoding='utf-8'))
-    except Exception:
-        st = {}
+    st = _load(sp)
     missed = [m for m in msgs if verdict.get(m['mid']) == 'not_addressed' and f"{sid}:{m['mid']}" not in st]
     mode = os.environ.get('ANSWERED_GATE_MODE', 'enforce')
     record(d, {'session': sid, 'mode': mode, 'outputs': len(outs), 'ms': CALL.get('ms'), 'blocked': [m['mid'] for m in missed] if mode != 'shadow' else [],
@@ -199,12 +286,7 @@ def _reason(p, msgs, outs):
         return None
     for m in missed:
         st[f"{sid}:{m['mid']}"] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    try:
-        tmp = f'{sp}.{os.getpid()}.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(dict(list(st.items())[-500:]), f)
-        os.replace(tmp, sp)
-    except OSError:
+    if not _save(sp, st):
         return None                                      # cannot remember = would repeat on every stop: say nothing instead
     lines = '\n'.join(f"- {m['user'] or '寄件者'}（{'Telegram' if m['kind'] == 'tg' else 'mesh'} {m['mid']}）：「{m['body'][:300]}」" for m in missed)
     return ('這一輪先不要結束。你這一回合收到的下面這幾則訊息，到現在沒有回應，也沒有交代什麼時候處理：\n' + lines +
@@ -218,7 +300,7 @@ def main():
     except Exception:
         return
     t = p.get('lanes_turn') or {}
-    r = reason(p, t.get('items') or [], t.get('outputs') or [])
+    r = reason(p, t.get('items') or [], t.get('outputs') or [], t.get('turn'))
     if r:
         print(json.dumps({'decision': 'block', 'reason': r}, ensure_ascii=False))
 
