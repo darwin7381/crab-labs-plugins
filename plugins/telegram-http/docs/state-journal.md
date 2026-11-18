@@ -272,6 +272,11 @@ What happens next:
 - A wall is not an attempt: the event is queued again as it was, and the shared wall goes up.
 - A death or a timeout is run again after `attempt × LANES_RETRY_BACKOFF_MS`, while the event still owes something. After 3 attempts, the exit
   rule hands what is open to the main.
+- **An attempt's record** (002q, G06): the run keeps every tool call with its result. A death adds to the run's `deaths` (on its next `queued` line)
+  `{run, how, after_s, calls, steps, last_text, stderr}`, where `steps` = the attempt's calls in order (the last 10), each
+  `"<tool> \`<input>\` → <result, 160 chars>"` or `"… → （沒有結果：死在這一步）"`. It replaces 002m's `last_tool` / `last_result` (the last call only:
+  the main re-ran the status, logs and snapshots the first attempt had read). The give-up hand-over lists every attempt's steps, within M1's
+  item body (3800 characters).
 - At boot, a run left `leased` or `running` died with the daemon. It gets `exited(died, signal daemon-restart)`, its lanes.jsonl exit row and a
   lane_lifecycle ledger line, and its event runs again **only while it still owes the lane something** (002q, T6-R).
 - One rule decides every re-run (`runAgain`), a death, a timeout and a daemon restart alike: the event's folded record still has an obligation the

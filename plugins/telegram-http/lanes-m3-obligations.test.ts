@@ -34,6 +34,12 @@ if mode == 'turns':
     print(json.dumps({'type': 'result', 'subtype': 'error_max_turns', 'is_error': True, 'terminal_reason': 'max_turns'}), flush=True); sys.exit(1)
 if mode == 'die':
     sys.exit(3)
+if mode == 'workdie':   # 002q G06: an attempt that ran two queries (results back) and died in its third call
+    def say(o): print(json.dumps(o), flush=True)
+    for i, (cmd, res) in enumerate([('./bin/svc GET mock-backup/status', 'HTTP 403 Forbidden: upload token expired'), ('./bin/svc GET mock-backup/snapshots', 'snap-1101 ok, snap-1102 missing'), ('cat docs/runbooks/backup.md', None)]):
+        say({'type': 'assistant', 'message': {'id': f'msg-{i}', 'usage': {}, 'content': [{'type': 'tool_use', 'id': f'tu-{i}', 'name': 'Bash', 'input': {'command': cmd}}]}})
+        if res: say({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': f'tu-{i}', 'content': res}]}})
+    sys.exit(3)
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'ok'}), flush=True)
 `)
 chmodSync(bin, 0o755)
@@ -314,6 +320,26 @@ test('002f / 002m G06: a lane that dies three times: its event goes to the main 
   }
   expect(await until(() => handed(p.id).length === 1)).toBe(true)
   expect(String(handed(p.id)[0].notif.params.content)).toContain('每一次死在哪裡')
+}, 20_000)
+
+test('002q G06: a give-up hand-over carries each attempt\'s record: every call it made with its result, so the main does not query again what an attempt found', async () => {
+  const p = await start(mk('eve', '備份昨晚為什麼失敗？'))
+  let tok = p.tok
+  for (let i = 0; i < 3; i++) {
+    writeFileSync(GO, 'workdie')
+    if (i < 2) { expect(await until(() => !!L.__runTok(p.lane) && L.__runTok(p.lane) !== tok)).toBe(true); tok = L.__runTok(p.lane) }
+  }
+  expect(await until(() => handed(p.id).length === 1)).toBe(true)
+  const text = String(handed(p.id)[0].notif.params.content)
+  expect(text).toContain('已經查到的不用再查')
+  for (const n of ['第 1 次', '第 2 次', '第 3 次']) expect(text).toContain(n)
+  expect(text.split('./bin/svc GET mock-backup/status').length - 1).toBe(3)                   // each attempt's own record, not only the last call
+  expect(text).toContain('HTTP 403 Forbidden: upload token expired')
+  expect(text).toContain('snap-1102 missing')
+  expect(text).toContain('cat docs/runbooks/backup.md` → （沒有結果：死在這一步）')
+  expect(L.__journal().rows('run', r => r.event === p.id && !!r.deaths).at(-1)!.deaths[0].steps).toEqual([
+    'Bash `./bin/svc GET mock-backup/status` → HTTP 403 Forbidden: upload token expired', 'Bash `./bin/svc GET mock-backup/snapshots` → snap-1101 ok, snap-1102 missing',
+    'Bash `cat docs/runbooks/backup.md` → （沒有結果：死在這一步）'])
 }, 20_000)
 
 test('002k E3 / H4 (model aid kept): a Joey or peer run that declines without looking at the service catalog is held once, with what ./bin/svc prints', async () => {

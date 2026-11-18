@@ -1417,15 +1417,25 @@ type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; a
   extra?: InEvent[]
   /** 002m (G06): where each failed attempt died, for the hand-over after the last one */
   deaths?: RunDeath[] }
-type RunDeath = { run: string; how: string; after_s: number; calls: number; last_tool?: string; last_result?: string; last_text?: string; stderr?: string }
+/** 002q (G06): an attempt's record is every tool call it made with its result (`steps`, in order), so the main does not run again what an attempt
+ *  already found. 002m kept only the last call and its result: the main re-ran the status, logs and snapshots the first attempt had read. */
+type RunDeath = { run: string; how: string; after_s: number; calls: number; steps?: string[]; last_text?: string; stderr?: string }
+type RunStep = { id?: string; name: string; input: any; result?: string; error?: boolean }
+const STEP_RESULT_MAX = 300, DEATH_STEPS_MAX = 10, HANDOVER_RECORD_MAX = 3800   // the hand-over fits M1's item body (BODY_MAX 4000)
+/** one step of an attempt, as the hand-over says it: the call and what it returned */
+function stepLine(t: RunStep): string {
+  return `${toolBrief(t)}${t.result != null ? ` → ${t.error ? '（錯誤）' : ''}${t.result.slice(0, 160) || '（空）'}` : ' → （沒有結果：死在這一步）'}`
+}
 /** 002m (G06): one attempt's death, as the hand-over says it. stability SR2 「反射線連續失敗就升級主線」 (H15: the main is told where each run died) */
 export function deathLine(d: RunDeath, n: number): string {
+  const steps = d.steps ?? []
   return `第 ${n} 次（${d.run}）：${d.how}，跑了 ${d.after_s} 秒、${d.calls} 次模型呼叫`
-    + (d.last_tool ? `；死前最後的工具呼叫 ${d.last_tool}` : '；沒有呼叫任何工具')
-    + (d.last_result ? `；最後的工具結果：${d.last_result}` : '')
-    + (d.last_text ? `；最後寫的字：${d.last_text}` : '')
-    + (d.stderr ? `；錯誤輸出：${d.stderr}` : '')
+    + (steps.length ? `；做過的事與結果：\n${steps.map((x, i) => `    ${i + 1}. ${x}`).join('\n')}` : '；沒有呼叫任何工具')
+    + (d.last_text ? `\n    最後寫的字：${d.last_text}` : '')
+    + (d.stderr ? `\n    錯誤輸出：${d.stderr}` : '')
 }
+function toolBrief(t: { name: string; input: any }): string;
+function toolBrief(t: { name: string; input: any } | undefined): string | undefined;
 function toolBrief(t: { name: string; input: any } | undefined): string | undefined {
   if (!t) return undefined
   const name = t.name.replace(/^mcp__lane__/, 'lane:')
@@ -1435,6 +1445,7 @@ function toolBrief(t: { name: string; input: any } | undefined): string | undefi
 export function failedHandoffText(it: { attempts: number; ev: { from: string; text: string }; deaths?: RunDeath[] }): string {
   const deaths = it.deaths ?? []
   return `車道連續 ${it.attempts} 次沒處理完這則事件，已放棄，請主線接手。寄件者 ${it.ev.from}，原文：${it.ev.text.slice(0, 400)}`
+    + `\n下面是每一次做過的事與結果：已經查到的不用再查。`
     + `\n每一次死在哪裡：\n${deaths.length ? deaths.map((d, i) => `- ${deathLine(d, i + 1)}`).join('\n') : '- （沒有紀錄：這幾次都沒有被 daemon 看到結束）'}`
     + (deaths.length && deaths.length < it.attempts ? `\n- 其餘 ${it.attempts - deaths.length} 次沒有被 daemon 看到結束（daemon 重啟或租約到期）` : '')
 }
@@ -1519,7 +1530,7 @@ function restoreRuns(): void {
     if (lane) ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'lane_lifecycle',
       text: `lane ${lane.id} run ${r.run ?? '?'} crashed: daemon restarted (the run was cut off; its event ${it.ev.id} is run again)`, refs: { run: r.run ?? null, signal: 'daemon-restart', counted: resumable, runs: lane.runs } })
     ;(it.deaths ??= []).push({ run: String(r.run ?? '?'), how: 'daemon 重啟時這一趟還在跑，被切斷', after_s: 0, calls: 0 })
-    if (it.attempts >= MAX_ATTEMPTS && lane) exitRule(lane, it, failedHandoffText(it), 3000)
+    if (it.attempts >= MAX_ATTEMPTS && lane) exitRule(lane, it, failedHandoffText(it), HANDOVER_RECORD_MAX)
     else if (runAgain(it)) queueRun(it)
     else journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run was cut by the daemon restart; the event owes nothing more: not run again' })   // 002q (T6-R)
     cut++
@@ -2228,13 +2239,12 @@ function startRun(it: QItem): void {
   D.log('info', `lanes: spawn ${runId} pid=${child.pid} ${resume ? 'resume' : 'new'} session=${lane.session_id} event=${it.ev.id}`)
 
   const usage = new Map<string, { in: number; out: number; fresh: number }>()
-  const tools: Array<{ name: string; input: any }> = []
+  const tools: RunStep[] = []                                           // 002q (G06): every call of the run with its result (the attempt's record)
   let result = '', sessionSeen = '', buf = ''
   let resultJson: any = null                                           // M5: the run's own result record; its exit reason is read from it
   let lastText = ''
   let budgetStop: { total: number; at: number } | null = null          // 002k (H11): this run was stopped by the thread budget, in the run
   let warnedTurns = false, warnedBudget = false                        // 002l (D8, N4): the limit notices of this run
-  const lastResults: string[] = []                                     // 002l (D8): the last tool results of the run, for the stop row's partial
   let resultUsage: any = null                                           // 002m (L6CEH1): the run's own totals, from its result event
   const runTranscript = (): string => sessionSeen ? join(D.transcriptDir, `${sessionSeen}.jsonl`) : lane.transcript
   const settleUsage = (): void => {                                      // 002m (L6CEH1): the stream's snapshots, corrected by the transcript
@@ -2257,7 +2267,7 @@ function startRun(it: QItem): void {
         usage.set(mid, maxUsage(usage.get(mid), callUsage(u)))
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') {
-            tools.push({ name: c.name, input: c.input })
+            tools.push({ id: c.id ? String(c.id) : undefined, name: c.name, input: c.input })
             if (!String(c.name).startsWith('mcp__lane__')) (tok.calls ??= []).push({ name: c.name, input: c.input })   // the lane stop's model aid (its lane tools: callLaneTool)
             const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
             if (rs && c.id) restarts.set(String(c.id), { svc: rs, cmd: String(c.input?.command ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) })
@@ -2296,7 +2306,8 @@ function startRun(it: QItem): void {
               refs: { restart: rst.svc, ok, cmd: rst.cmd, run: runId } })
             logos('lane.restart', { lane: lane.id, run: runId, event: it.ev.id, svc: rst.svc, ok })
           }
-          if (body.trim()) { lastResults.push(body.replace(/\s+/g, ' ').trim().slice(0, 300)); if (lastResults.length > 2) lastResults.shift() }
+          const step = tools.find(t => t.id && t.id === String(c.tool_use_id ?? ''))
+          if (step) { step.result = body.replace(/\s+/g, ' ').trim().slice(0, STEP_RESULT_MAX); step.error = !!c.is_error }
         }
       }
       if (j.type === 'result') { result = String(j.result ?? ''); resultJson = j; resultUsage = j.usage ?? null }
@@ -2327,6 +2338,7 @@ function startRun(it: QItem): void {
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     queueSteering(lane, steerLeft, signal ? `was stopped (${signal})` : `ended (exit ${code})`)
+    const lastResults = tools.filter(t => t.result).slice(-2).map(t => t.result!)   // 002l (D8): the last tool results, for a cut run's partial
     closeRecord(lane, { runId, evId: it.ev.id, tools, lastText, lastResults, signal: signal ?? null })      // 002l (D3): a lane closed while this run ran: what it reached
     if (S.threads[lane.thread]) { S.threads[lane.thread].tokens += tin; S.threads[lane.thread].fresh = (S.threads[lane.thread].fresh ?? 0) + tfresh }   // 002l (D1, D7): the budget counts tfresh
     releaseClaims(lane.id, 'run ended')
@@ -2395,11 +2407,11 @@ function startRun(it: QItem): void {
     ;(it.deaths ??= []).push({ run: runId,
       how: timedOut ? `超過 ${Math.round(LANE_MAX_RUN_MS / 1000)} 秒還沒結束，被 daemon 停下（${signal ?? 'SIGKILL'}）` : signal ? `行程被訊號 ${signal} 結束` : `行程以 exit ${code} 結束${resultJson?.subtype ? `（${resultJson.subtype}）` : ''}`,
       after_s: Math.round((Date.now() - started) / 100) / 10, calls: usage.size,
-      last_tool: toolBrief(tools[tools.length - 1]), last_result: one(lastResults[lastResults.length - 1], 160),
+      steps: tools.slice(-DEATH_STEPS_MAX).map(stepLine),
       last_text: one(lastText || result, 120), stderr: one(errTail.split('\n').filter(l => l.trim()).slice(-2).join(' '), 160) })
     if (it.attempts >= MAX_ATTEMPTS) {
       if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊連續 ${it.attempts} 次沒做完，沒有結果）`)
-      else exitRule(lane, it, failedHandoffText(it), 3000, tok.steered)
+      else exitRule(lane, it, failedHandoffText(it), HANDOVER_RECORD_MAX, tok.steered)
     } else if (runAgain(it, tok.steered)) {
       it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts
       queueRun(it)
