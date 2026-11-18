@@ -38,8 +38,8 @@ export type MainEnv = {
   done: (item: Row) => void
   /** an item left done: its turn went on after the Stop that closed it (whatever `done` set is undone) */
   undone: (item: Row) => void
-  /** a line to Joey from the router (push), with the rule that sent it */
-  tellJoey: (text: string, rule: string) => void
+  /** a line to Joey from the router (push), with the rule that sent it; `events`: the M3 events the line is about (it meets their Joey line) */
+  tellJoey: (text: string, rule: string, events?: string[]) => void
   /** the backoff before the walled main's next probe offer (ms), after `probes` failed ones */
   wallBackoff?: (kind: string, probes: number) => number
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
@@ -246,7 +246,10 @@ export function createMain(E: MainEnv) {
     if (cur === g.id) cur = null
     pendingEnd.delete(g.id); lastEventAt.delete(g.id)
     if (stuck?.gen === g.id) stuck = null
-    if (cut.length) E.tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${cut.filter(r => r.kind !== 'digest').length} 則訊息不會自動交給新的主線：${cut.filter(r => r.kind !== 'digest').map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart')
+    // 002q (T8-R): the notice is the line Joey gets about each cut message, so it is on their events (it meets their Joey line)
+    const told = cut.filter(r => r.kind !== 'digest')
+    if (told.length) E.tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${told.length} 則訊息不會自動交給新的主線：${told.map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart',
+      [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))])
     E.log('info', `lanes: main gen ${g.id} gone (${why}); ${back.length} item(s) queued again`)
     try { E.genChanged(null) } catch {}
   }

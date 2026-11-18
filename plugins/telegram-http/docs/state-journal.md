@@ -125,8 +125,12 @@ record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no 
 
 | state | meaning |
 |---|---|
-| `open` | something is still owed: an obligation is `open` or `requested` |
-| `closed` | nothing is owed (every obligation is `met`, `handed`, `dropped` or `merged`; an event with no obligations is closed at once) |
+| `open` | something is still owed: an obligation is `open` or `requested`, or a Joey line or a peer answer is `handed` to the main |
+| `closed` | nothing is owed (every obligation is `met`, `dropped` or `merged`, or a receipt `handed`; an event with no obligations is closed at once) |
+
+002q (T7-R, T8-R, T6-R): a Joey line or a peer answer handed to the main is owed by the main, so it keeps the event open until the main's reply or
+send meets it. 002p closed the event when the hand-over's M1 item was done, with the line still owed. A handed receipt does not hold the event
+open: nothing the main has completes a scheduler run after the lane ended.
 
 Fields:
 - `class`: `scheduled`, `peer`, `joey`, `alert` or `critical` (`followup` is no longer written). The router writes it from the routing rule's
@@ -167,6 +171,8 @@ Fields:
 - `refused`, `refused_kind`: the reason and the kind of a refused request (every refusal is a journal line).
 - `main_sends`: `[{to, ref, at, tier | delivered, prompt}]`: the main's Telegram replies (`to: joey`) and send_to_agent calls made in a turn this
   event's item was bound to that met (or rang) an obligation of this event, or that quote its message. A line that meets nothing is on no event (002p).
+- `router_sends`: `[{to: joey, ref, at, rule}]` (002q, T8-R): a router line about this event, delivered (the asked-restart notice). It meets the
+  event's Joey line still owed (`by: router (asked-restart)`, `ref` = the message id).
 - `class`: the event's own class, whatever rule routed it (002p): an alert sender's event has its alert rule's class and severity (`critical` for a
   `[P1][critical]`) even when a rule without a class of its own (`default`, the master switch) gave it to the main.
 
@@ -182,13 +188,17 @@ The one rule: a lane's outbound call asks to meet an obligation of its event.
 - Repeating a met or requested one is refused, and the refusal names what is still open.
 - **One hand-over transition** (`events.handOver`, used by handoff_main, the exit rule and the thread stop alike): one `main` obligation opens and
   every lane obligation still owed (`joey`, `peer`, `receipt`) moves to `handed`. An event already handed keeps its hand-over (no second item).
+  Every hand-over tells the main 「處理完由你回報 Joey 一次」, so an event with no Joey obligation at all (a high-frequency routine, a task) gets one
+  here: a `joey` line, `handed` (002q, T6-R: the main's report after a give-up hand-over met nothing and was on no event).
 - **The main's replies and sends** are requests against the events whose items are bound to its running turn (M1: prompt → items → events). A
-  reply's events are the quoted message's event when it quotes an item of the turn (`reply_to` = its message id), else what the turn still owes
-  Joey (a Joey line handed or open, or a ring nobody rang): the hand-overs first, else Joey's own messages. It meets their Joey line, rings a ring
-  nobody rang, and each records the send; a reply that meets nothing records on no event (002p, A05: the main's second line, about an alert it read in
-  the digest, was a second line on Eve's hand-over). The tier comes from the events it meets, else from the turn's hand-overs, else Joey's messages. A delivered send_to_agent meets the answers they owe that agent. Nothing is matched by a parameter: the reply
-  tool has no `handoff_id`. The tier: a reply that quotes a message or answers Joey's own message is ordinary;
-  otherwise silent when every event's class is silent (a push class whose ring already rang is silent).
+  reply's events are the quoted message's event when it quotes an item of the turn (`reply_to` = its message id), else **every** event of the turn
+  whose Joey line is still owed (handed or open, or a ring nobody rang), hand-overs and Joey's own messages alike (002q, T7-R: one line answered
+  three of Joey's questions and Eve's hand-over; 002p's "hand-overs first" bound it to the hand-over alone, silent). It meets their Joey line, rings a
+  ring nobody rang, and each records the send; a reply that meets nothing records on no event (002p, A05). A delivered send_to_agent meets the
+  answers they owe that agent. Nothing is matched by a parameter: the reply tool has no `handoff_id`.
+- **The tier** of such a reply is the highest the obligations it meets require (design/notify 「類別 × 義務 × 結果」): Joey's own message
+  requires an ordinary answer (push), a ring nobody rang a push, a lane's event handed to the main its class's tier (a push class whose ring already
+  rang is silent). A reply that quotes a message is ordinary. A reply that meets nothing takes the highest tier of the turn's events.
 
 **The scheduler receipt.** A lane has two ways to complete scheduler run N: the receipt tool, and the scheduler card's CLI
 `./bin/btcc-receipt complete N`. Both are one request, handled in one place (lanes.ts `completeRun`): meet the event's `receipt` obligation for run N,
@@ -370,7 +380,8 @@ Stop").
 ## Special cases kept (marked `SPECIAL CASE` in the code)
 
 1. **An asked restart** (`/restart`, `/kill_stuck`): the items of the cut turn end `done` with `reason: asked_restart`, and Joey gets one line. They are
-   not re-given. This is the owner's decision (002j, 5018d39), kept as data.
+   not re-given. This is the owner's decision (002j, 5018d39), kept as data. That line is on the events it names (002q, T8-R): delivered, it meets
+   each one's Joey line (`router_sends`).
 
 2. **The TUI relay's wall line** (`wallKind`). The relay (system-alert.ts, fleet code that stays) forwards the CLI's own error line from the
    main's pane or transcript. Deferring it to the one wall notice (002l D12) means recognising that line; no signal carries it. This is

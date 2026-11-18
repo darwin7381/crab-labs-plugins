@@ -246,10 +246,10 @@ function mainEnv() {
     info: digestInfo,
     done: itemDone,
     undone: itemUndone,
-    tellJoey: (text: string, rule: string) => {
+    tellJoey: (text: string, rule: string, evs: string[] = []) => {
       if (rule === 'main-wall-up' || rule === 'main-wall-down') { const g = main?.currentGen(); logos(`lane.${rule.replace(/-/g, '_')}`, { gen: g?.id ?? null, kind: g?.kind ?? null, since: g?.wall_since ?? null }) }   // PL4: the main's own wall
-      ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true } })
-      void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id }))
+      ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true, ...(evs.length ? { events: evs } : {}) } })
+      void pushJoey(undefined, text, false).then(id => { routerToldJoey(evs, id, rule); logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id, events: evs }) })
     },
     wallBackoff: (kind: string, probes: number) => wallBackoffMs(kind, probes),
     expectedSession: (): string[] => {
@@ -2536,9 +2536,9 @@ function itemUndone(it: Row): void {
 // main is a request against them: it meets their Joey line (handed to the main, or still owed), it rings a critical event's ring that nobody rang
 // yet, and each event records the send (`main_sends`, with main_seen: the digest does not repeat to the main what it did). A send_to_agent meets
 // the answers they owe that agent, on the delivery result. Nothing is matched by a parameter or by text.
-// The tier of such a reply (design/notify 「分級由分流器依訊息類型與車道設定決定，不靠各條線自己判斷要不要吵你」): a reply that quotes a message, or a turn
-// that answers Joey's own message, is ordinary (push); a reply about the turn's hand-overs takes their tier: silent when every one of them is a
-// silent-tier class (a push class whose ring already rang is silent too), push otherwise. The notify profile still rules (default = everything rings).
+// The tier (design/notify 「用哪一級通知、什麼格式，由分流器依『類別 × 義務 × 結果』決定」): the highest tier the obligations the line meets require.
+// Joey's own message requires an ordinary (push) answer; a critical event's ring nobody rang requires a push; a lane's event handed to the main
+// requires its class's tier (a push class whose ring already rang is silent). The notify profile still rules (default = everything rings).
 const ringOf = (e: Row | undefined): Ob | undefined => ((e?.obligations ?? []) as Ob[]).find(o => o.kind === 'joey' && o.ring)
 const rung = (e: Row | undefined): boolean => { const r = ringOf(e); return !!r && (!!r.rang || r.state === 'met') }
 /** the main's running turn: its prompt, its bound items and the events they carry (M1 + M2) */
@@ -2552,13 +2552,12 @@ function mainTurn(): { prompt: string; items: Row[]; events: Row[] } | null {
 export type MainTier = { silent: boolean; rule: string; events: string[] }
 /** what a reply to Joey can still meet on an event: a Joey line nobody met (open, or handed to the main), or a ring nobody rang */
 const owesJoey = (e: Row): boolean => ((e.obligations ?? []) as Ob[]).some(o => o.kind === 'joey' && (o.state === 'open' || o.state === 'handed' || (!!o.ring && !o.rang)))
-/** the events a reply of the main is a request against, and the events whose class gives its tier (`about`).
+/** the events a reply of the main is a request against (`events`), and the events whose obligations give its tier (`about`).
  *  - It quotes an item of the turn (reply_to = its message id): that item's event, named by the reply itself.
- *  - Otherwise it meets what the turn still owes Joey (owesJoey): the hand-overs it reports on first, else Joey's own messages. 002p (A05 main_sends):
- *    a line that meets nothing is a request against nothing: no event records it (002o linked every line of the turn to every hand-over of the turn, so
- *    the main's second line, about a P2 alert it read in the digest, was a second line on Eve's hand-over). The binding is the obligation the send
- *    meets, as for send_to_agent (mainSentInTurn: met only what is owed to its addressee).
- *  - `about` (the tier): the turn's hand-overs, else Joey's messages, whether or not anything is still owed (a later line about them keeps their tier). */
+ *  - Otherwise (002q, T7-R / T8-R: one line answered three of Joey's questions and Eve's hand-over, and 002p bound it to the hand-over alone, at the
+ *    hand-over's silent tier, so Joey's three events closed with their line still owed): EVERY event bound to the turn whose Joey line is still open
+ *    (owesJoey). A line that meets nothing is a request against nothing (A05: the main's second line, about an alert it read in the digest): no event
+ *    records it; its tier follows the turn's events (a later line about them keeps their tier). */
 function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof mainTurn>>; events: Row[]; about: Row[]; quoted: boolean } | null {
   const t = mainTurn()
   if (!t) return null
@@ -2568,20 +2567,23 @@ function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof m
     const evs = it?.event ? t.events.filter(e => e.id === it.event) : []
     return { turn: t, events: evs, about: evs, quoted: true }
   }
-  const joeyEv = new Set(t.items.filter(r => r.kind === 'joey').map(r => String(r.event)))
-  const others = t.events.filter(e => !joeyEv.has(e.id)), joeys = t.events.filter(e => joeyEv.has(e.id))
-  const meets = [others.filter(owesJoey), joeys.filter(owesJoey)].find(a => a.length) ?? []
-  return { turn: t, events: meets, about: meets.length ? meets : others.length ? others : joeys, quoted: false }
+  const meets = t.events.filter(owesJoey)
+  return { turn: t, events: meets, about: meets.length ? meets : t.events, quoted: false }
 }
-/** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push): it quotes a message, or answers Joey's own message */
+/** the tier one event's obligations require of a line about it: Joey's own message (or a quoted one) ordinary; otherwise its class's tier, silent once
+ *  its ring rang */
+function eventTier(e: Row, turn: NonNullable<ReturnType<typeof mainTurn>>): { tier: Tier; rule: string } {
+  if (turn.items.some(r => r.kind === 'joey' && String(r.event) === e.id)) return { tier: 'push', rule: 'joey-message' }
+  const t = tierFor(String(e.class ?? ''), false)
+  return t.tier === 'push' && rung(e) ? { tier: 'silent', rule: `${t.rule}+rang` } : t
+}
+/** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push): it quotes a message, or one of the obligations it meets needs a push */
 export function mainReplyTier(a: { reply_to?: unknown }): MainTier | null {
   if (D?.role !== 'tg' || !S || !events) return null
   const x = replyTargets(a.reply_to)
   if (!x || x.quoted || !x.about.length) return null
-  const joeyEv = new Set(x.turn.items.filter(r => r.kind === 'joey').map(r => String(r.event)))
-  if (x.about.some(e => joeyEv.has(e.id))) return null                             // it answers Joey's own message: ordinary
-  const tiers = x.about.map(e => { const cls = String(e.class ?? ''); const t = tierFor(cls, false); return t.tier === 'push' && rung(e) ? { tier: 'silent' as Tier, rule: `${t.rule}+rang` } : t })
-  if (tiers.some(t => t.tier === 'push')) return null
+  const tiers = x.about.map(e => eventTier(e, x.turn))
+  if (tiers.some(t => t.tier === 'push')) return null                               // the highest tier any of them requires
   return { silent: true, rule: `turn ${x.turn.prompt}: ${tiers[0].rule}`, events: x.about.map(e => e.id) }
 }
 /** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against its target events (replyTargets) */
@@ -2600,6 +2602,18 @@ export function mainReplied(t: MainTier | null, messageId: number | null, replyT
   ledger({ lane: 'main', kind: 'notify', text: `[${t?.silent ? 'silent' : 'push'}] 主線回覆 Joey（${ids.join(', ') || '-'}）${t ? '：分流器依那些事的類別靜音送出' : ''}`,
     refs: { tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: ids, message_id: messageId } })
   logos('lane.notify', { lane: 'main', tier: t?.silent ? 'silent' : 'push', tier_rule: t?.rule ?? 'main-reply', events: ids, message_id: messageId })
+}
+/** 002q (T8-R): a router line that is about named events (the asked-restart notice) is their Joey line: delivered, it meets each one's Joey line still owed
+ *  (`by: router (<rule>)`) and the event records it (`router_sends`) */
+function routerToldJoey(ids: string[], messageId: number | null, rule: string): void {
+  if (!events || messageId == null) return
+  for (const id of ids) {
+    const e = events.get(id)
+    if (!e) continue
+    const o = ((e.obligations ?? []) as Ob[]).find(x => x.kind === 'joey' && (x.state === 'open' || x.state === 'handed'))
+    if (o) events.set(id, o.id, { state: 'met', by: `router (${rule})`, ref: String(messageId) }, { tool: rule })
+    events.push(id, 'router_sends', { to: 'joey', ref: String(messageId), at: nowIso(), rule })
+  }
 }
 /** the main sent `to` a message (send_to_agent), delivered or not: a request against the answers the events of its turn owe that agent. Met only on
  *  delivery. Returns the events it answered (none: the explicit references and the promise aid decide, mainSentTo). */

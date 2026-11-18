@@ -13,7 +13,7 @@
  * The one rule: every outbound tool call of a lane is a request to meet an obligation of its event. Meeting an open one is accepted; raising it
  * (a line to a decision, or a line whose outcome changed) is accepted; repeating a met or requested one is refused, and the refusal names what is
  * still open. The router (lanes.ts) picks the tier and format from class × obligation × outcome. One sweep acts on obligations past their due time.
- * closed = nothing is open or requested. One writer: the tg daemon. Every transition is a journal line (rec event).
+ * closed = nothing is owed (open, requested, or a Joey line / peer answer handed to the main). One writer: the tg daemon. Every transition is a journal line (rec event).
  */
 import type { Journal, Row } from './lanes-state.ts'
 
@@ -35,6 +35,10 @@ const RANK: Record<string, number> = { none: 0, line: 1, decision: 2 }
 const SEV: Record<Outcome, number> = { normal: 0, changed: 1, failed: 2 }
 /** still owed: nothing has met it yet (a request in flight is not a delivery) */
 export const owing = (o: Ob): boolean => o.state === 'open' || o.state === 'requested'
+/** 002q (T7-R, T8-R, T6-R): what keeps an event open. Owed by whoever holds it: an open or requested obligation, or a Joey line or a peer answer
+ *  handed to the main (the main meets those: its reply, its send_to_agent). A handed receipt is not the main's to send (nothing it has completes a
+ *  scheduler run after the lane ended): it stays `handed` on the record and does not hold the event open. */
+export const owed = (o: Ob): boolean => owing(o) || (o.state === 'handed' && (o.kind === 'joey' || o.kind === 'peer'))
 
 export type EventsApi = ReturnType<typeof createEvents>
 export function createEvents(J: Journal) {
@@ -45,9 +49,11 @@ export function createEvents(J: Journal) {
   /** a receipt obligation is one per scheduler run, whichever event carries it (met, or being delivered) */
   const receiptMet = (run: string): Row | undefined => J.rows('event', e => (e.obligations ?? []).some((o: Ob) => o.kind === 'receipt' && o.run_id === run && (o.state === 'met' || o.state === 'requested')))[0]
 
-  /** closed = no obligation is open or requested (an event that owes nothing, information, is closed at once) */
+  /** closed = nothing is owed (owed: open, requested, or a Joey line / peer answer handed to the main). An event that owes nothing, information, is
+   *  closed at once. 002q: a Joey line handed to the main keeps its event open until the main's line meets it (002p closed it when the hand-over's
+   *  M1 item was done, with the line still owed). */
   function write(e: Row | { id: string }, obs: Ob[], f: Record<string, unknown> = {}): Row {
-    return J.write('event', e.id, obs.some(owing) ? 'open' : 'closed', { obligations: obs, ...f })!
+    return J.write('event', e.id, obs.some(owed) ? 'open' : 'closed', { obligations: obs, ...f })!
   }
   /** the router: one record per inbound event (an existing record is returned as it is: a retry is the same event) */
   /** the router: one record per inbound event (an existing record is returned as it is: a retry is the same event). `owner` is a lane, `main`, or
@@ -135,7 +141,8 @@ export function createEvents(J: Journal) {
   }
   /** THE hand-over (handoff_main, the exit rule, the thread stop alike): one `main` obligation (open, owned by the main) and every lane obligation
    *  still owed (a line for Joey, an answer to a peer, a receipt) moves to `handed`. Returns the open main obligation (the existing one when the
-   *  event is already handed). */
+   *  event is already handed). 002q (T6-R): every hand-over tells the main 「處理完由你回報 Joey 一次」, so an event with no Joey obligation at all (a
+   *  high-frequency routine, a task) gets one here, a line handed to the main: what the main reports meets it, and the event stays open until then. */
   function handOver(id: string, h: HandOver): Ob | null {
     const e = get(id)
     if (!e) return null
@@ -145,6 +152,7 @@ export function createEvents(J: Journal) {
     const ob: Ob = { id: h.handoff, kind: 'main', level: 'handed', state: 'open', by: h.by, owner: 'main', handoff: h.handoff,
       ...(h.what != null ? { what: h.what } : {}), ...(h.due_at != null ? { due_at: h.due_at } : {}), ...(h.cls ? { cls: h.cls } : {}) }
     for (const o of obs) if (owing(o) && (o.owner ?? 'lane') === 'lane' && o.kind !== 'main') { o.state = 'handed'; delete o.prev }
+    if (!obs.some(o => o.kind === 'joey')) obs.push({ id: obId('joey'), kind: 'joey', level: 'line', state: 'handed', by: h.by })
     obs.push(ob)
     write(e, obs, { tool: h.by, refused: null })
     return ob

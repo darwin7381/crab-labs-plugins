@@ -146,6 +146,12 @@ test('002j 5018d39 (kept as data): /restart mid-turn ends the gen `asked`; the c
   expect(M().items(r => r.id === id)[0]).toMatchObject({ state: 'done', reason: 'asked_restart' })
   await sleep(10)
   expect(sent.slice(k).filter(s => s.includes('主線被指令重啟')).length).toBe(1)
+  // 002q (T8-R): that line is about the cut message: it is on its event and meets its Joey line, so the event does not close with the line owed
+  const ev = M().items(r => r.id === id)[0].event
+  const e = L.__events().get(ev)!
+  expect(e.obligations.find((o: any) => o.kind === 'joey')).toMatchObject({ state: 'met', by: 'router (asked-restart)' })
+  expect(e.router_sends).toEqual([expect.objectContaining({ to: 'joey', rule: 'asked-restart' })])
+  expect(e.state).toBe('closed')
   await killed(g)
 })
 
