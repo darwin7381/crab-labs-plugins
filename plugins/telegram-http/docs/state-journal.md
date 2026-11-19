@@ -188,6 +188,8 @@ Fields:
   - `proposals`: `[{id, text, joey, at, lane, decision, decided_at, writer}]`, the memory proposals filed in a run of this event (the main's
     `memory_decide`, or the curator, writes `decision`);
   - `promised`: the commitments a lane recorded in a run of this event;
+  - `tg`: `{message_id, topic}` on Joey's own Telegram message (002t): a hand-over of that event carries his words verbatim, marked as the
+    router's transcript (〔Joey 原話｜…〕), after the lane's text;
   - `main_seen`: the version the main has seen because it made that change itself (a memory decision): the digest does not tell the main what it did.
 - `obligations`: `[{id, kind, level, state, by, owner, due_at, ref, failed, outcome, into, ...}]`. `state`:
   - `open`: owed;

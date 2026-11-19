@@ -2491,7 +2491,8 @@ const evClassOf = (ev: InEvent, lane?: Lane): EvClass =>
     : ev.trigger === 'scheduled' ? 'scheduled' : /^alert/.test(ev.trigger ?? '') ? 'alert' : 'peer')
 /** what the router marked on an event, as fields of its record (PL1) */
 const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
-  ...(ev.screen_p != null ? { screen_p: ev.screen_p } : {}) })
+  ...(ev.screen_p != null ? { screen_p: ev.screen_p } : {}),
+  ...(ev.source === 'telegram' && !ev.synthetic ? { tg: { message_id: ev.meta?.message_id ?? null, topic: ev.message_thread_id ?? null } } : {}) })   // 002t: Joey's own message
 /** M3 (PL1): the router's one place that records an inbound event. Every inbound event has a record, whatever its route: a lane's (with what it owes),
  *  the main's (a hand-over owed to it), or information nobody handles (owner `router`, no obligations: closed at once). An existing record is kept
  *  (a retry is the same event); what the router marked is merged onto it. */
@@ -2561,7 +2562,13 @@ const HANDOFF_DUE_MS = (): number => num('LANES_HANDOFF_FALLBACK_MS', 300_000)
  *  it. M1 offers it when the main is idle (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop.
  *  An event already handed (an open main obligation) keeps that hand-over: no second item. */
 function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true, carry?: { content: string; meta: Record<string, string> }): string {
-  const body = text.slice(0, max)
+  // 002t (station 4, I03 live): Joey ordered an irreversible step inside a worker's topic; the worker handed it to the main in its own words, and the
+  // main rightly would not act on a lane's retelling (「我看不到你在話題的原話，帳本只有工作線的轉述」). A hand-over of Joey's own Telegram message
+  // carries his words as the router received them, marked as such: the main reads Joey, not the lane.
+  const e0 = events?.get(evId)
+  const tg = e0?.tg as { message_id?: unknown; topic?: unknown } | undefined
+  const said = tg && e0?.text ? `\n〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕${tg.topic != null ? `話題 #${tg.topic}，` : ''}message_id ${tg.message_id ?? '-'}：「${String(e0.text).slice(0, 1500)}」` : ''
+  const body = text.slice(0, max) + said
   const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}) })
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
