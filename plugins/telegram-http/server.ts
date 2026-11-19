@@ -1474,8 +1474,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         let hop = args.hop != null && Number(args.hop) > 0 ? Number(args.hop) : undefined
         if (!thread) { const t = Lanes.threadForReply(replyTo); if (t) { thread = t.thread; hop = hop ?? t.hop + 1 } }
         if (thread) {
-          const c = await Lanes.checkMainSend(thread, hop ?? 1)
-          if (!c.ok) return { content: [{ type: 'text', text: `send blocked — nothing was sent: ${c.why}. The thread is stopped; tell Joey instead of continuing it.` }] }
+          const c = await Lanes.checkMainSend(thread, hop ?? 1, noReply)            // 002w (C): a no_reply answer passes a stopped conversation
+          if (!c.ok) return { content: [{ type: 'text', text: `send blocked — nothing was sent: ${c.why}. The conversation is stopped (the router told the peer): your last answer on it goes out only with no_reply: true; anything else, tell Joey.` }] }
           hop = c.hop
         }
         { const refused = await Lanes.checkPeerSend('main', String(args.to ?? ''), String(args.text ?? '')); if (refused) return { content: [{ type: 'text', text: refused }], isError: true } }     // 002k (K2): disclosure check, as for a lane's reply_agent

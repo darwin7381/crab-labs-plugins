@@ -912,6 +912,26 @@ function stoppedQuiet(ev: InEvent, t: Thread | null, laneId: string | null): Dec
   return { rule: 'thread-gate', target: 'ledger', lane: laneId ?? undefined, note: `already stopped (${t.stopped}): recorded, nobody woken`, thread: t.id }
 }
 
+/** 002w (C, gaps 1, 15): THE outbound gate of a conversation, for a lane's reply_agent, the router's interim and the main's send_to_agent alike: may a send
+ *  on thread `t` at hop `hop` go out? A no_reply send passes a stopped or over-limit thread and counts no hop (`count` false): it asks for nothing, so it
+ *  cannot extend the loop (the main's closing answer on a stopped conversation, marked no_reply at its PreToolUse). A send past the hop limit stops the
+ *  conversation through stopThread (the event record's `stop`, the router's stop notice, the hand-over), with `ev`, the message being answered. */
+function outboundGate(t: Thread | null | undefined, hop: number, noReply: boolean, ev: InEvent | undefined, laneId: string | null): { ok: boolean; count: boolean; why?: string } {
+  if (noReply && (t?.stopped || hop > HOP_LIMIT)) return { ok: true, count: false }
+  if (t?.stopped) return { ok: false, count: false, why: `thread stopped (${t.stopped})` }
+  if (hop <= HOP_LIMIT) return { ok: true, count: true }
+  const note = `hop ${hop} > limit ${HOP_LIMIT}`
+  if (ev) stopThread(ev, t ?? null, { why: 'hop', note }, laneId)
+  else if (t) { t.stopped = note; drainStoppedThread(t.id, note); saveState() }       // nothing inbound to answer on it: the thread alone is stopped
+  return { ok: false, count: false, why: note }
+}
+/** the message the main's send on thread `t` answers: the newest event a peer sent on it (its record; the request id from its answer obligation) */
+function threadEvent(t: Thread | undefined): InEvent | undefined {
+  const e = t ? (events?.rows(r => r.thread === t.id && !!r.from && !['main', 'router', 'joey'].includes(String(r.from))) ?? []).pop() : undefined
+  if (!e) return undefined
+  const req = ((e.obligations ?? []) as Ob[]).find(o => o.kind === 'peer' && o.req)?.req
+  return { id: e.id, source: 'mesh', from: String(e.from), text: String(e.text ?? ''), meta: {}, notif: { method: '', params: {} }, thread: t!.id, ...(req ? { btcc_msg_id: req } : {}) } as InEvent
+}
 /** Trigger class of an event under rule r (router.json `trigger`; `<trigger>-critical` / `<trigger>-info`
  *  when the rule's critical_regex / info_regex matches). Lanes opened by the main: worker / fork. */
 export function triggerClass(r: Rule | undefined, ev: InEvent): string {
@@ -2786,7 +2806,7 @@ async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to
   const from = answer.to!
   const th = S.threads[lane.thread]
   const hop = (th?.hops ?? 0) + 1
-  if (th?.stopped || hop > HOP_LIMIT) return null
+  if (!outboundGate(th, hop, false, ev, lane.id).ok) return null           // 002w (C): past the limit the conversation is stopped (stopThread), not skipped silently
   const due = Date.now() + PROMISE_MIN * 60_000
   const text = interimText(due)
   if (th) { th.hops = hop; th.last = nowIso(); if (!th.peer) th.peer = from }
@@ -3067,20 +3087,16 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!to || !text) throw new Error('to and text required')
       { const back = await reportCheck(lane, tok, 'reply_agent', text); if (back) return back }
       { const w = ownerClaimWarning(tok, events.get(tok.evId), text); if (w) return w }
-      if (th?.stopped) return `blocked: thread ${lane.thread} was stopped (${th.stopped}). Escalate instead.`
-      const hop = (th?.hops ?? 0) + 1
-      if (hop > HOP_LIMIT) {
-        if (th) { th.stopped = `hop ${hop} > ${HOP_LIMIT}`; drainStoppedThread(th.id, th.stopped) }
-        saveState()
-        ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'stop', text: `reply_agent → ${to} 擋下：hop ${hop} 超過上限 ${HOP_LIMIT}。` })
-        return `blocked: hop limit ${HOP_LIMIT} reached in thread ${lane.thread}; recorded. What this event still owes goes to the main when your run ends. Do not retry.`
-      }
+      const gate = outboundGate(th, (th?.hops ?? 0) + 1, a.no_reply === true, queue.get(tok.evId)?.ev, lane.id)    // 002w (C): the one gate
+      if (!gate.ok) return th?.stopped && !gate.why?.startsWith('hop') ? `blocked: thread ${lane.thread} was stopped (${th.stopped}). Escalate instead.`
+        : `blocked: hop limit ${HOP_LIMIT} reached in thread ${lane.thread}: the router stopped the conversation (it told ${to} so, no_reply) and handed this event to the main. Do not retry.`
+      const hop = gate.count ? (th?.hops ?? 0) + 1 : th?.hops ?? 0
       // M3 (PL2): the request is journaled first (requested, or a refusal line: M3's refusal costs no Jev call); an agent the event did not owe gets its own obligation
       const v = events.request(tok.evId, 'reply_agent', { kind: 'peer', level: 'answer', to }, undefined, { answered: text.slice(0, 200) })
       if (!v.ok) return v.why!
       // 002k (K2): after the program's own refusals (they cost no call and must not use up the once), before anything is counted or sent
       { const pd = await peerDisclosureCheck(lane.id, to, text, 'reply_agent', { thread: lane.thread, event: tok.evId, once: `${tok.runId}:reply_agent:${to}` }); if (pd.refuse) { events.result(tok.evId, v.ob?.id, false, { why: 'refused by the disclosure check' }); throw new Error(pd.refuse) } }
-      if (th) { th.hops = hop; th.last = nowIso(); th.ask_cls = tok.cls; if (!th.peer) th.peer = to }
+      if (th) { th.hops = hop; th.last = nowIso(); if (gate.count) th.ask_cls = tok.cls; if (!th.peer) th.peer = to }
       saveState()
       const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: a.no_reply === true, thread: lane.thread, hop, lane: lane.id, owner: ownerOf(tok.evId) })
       if (r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
@@ -4276,9 +4292,9 @@ export async function checkPeerSend(from: string, to: string, text: string): Pro
   const r = await peerCall(TG_PORT, '/lanes/peer-check', 'POST', { from, to, text })
   return r && typeof r.refuse === 'string' && r.refuse ? r.refuse : null
 }
-/** inbox role: hop gate for a main send in a thread. */
-export async function checkMainSend(thread: string, hop: number): Promise<{ ok: boolean; hop: number; why?: string }> {
-  const r = await peerCall(TG_PORT, '/lanes/outbound-check', 'POST', { thread, hop })
+/** inbox role: hop gate for a main send in a thread (002w C: a no_reply send passes a stopped or over-limit thread) */
+export async function checkMainSend(thread: string, hop: number, noReply = false): Promise<{ ok: boolean; hop: number; why?: string }> {
+  const r = await peerCall(TG_PORT, '/lanes/outbound-check', 'POST', { thread, hop, no_reply: noReply })
   return r ?? { ok: true, hop }
 }
 
@@ -4429,14 +4445,14 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const r = await peerDisclosureCheck(String(b.from ?? 'main'), String(b.to ?? ''), String(b.text ?? ''), 'send_to_agent')
       sendJson(res, 200, { refuse: r.refuse ?? null, which: r.which ?? null }); return true
     }
-    if (p === '/lanes/outbound-check' && req.method === 'POST') {
+    if (p === '/lanes/outbound-check' && req.method === 'POST') {        // the main's send_to_agent on a thread, asked by the inbox daemon (002w C: the one gate)
       const b = await readBody(req)
       const t = S.threads[String(b.thread)]
       const hop = Math.max(Number(b.hop ?? 0), (t?.hops ?? 0) + 1)
-      if (t?.stopped) { sendJson(res, 200, { ok: false, hop, why: `thread stopped (${t.stopped})` }); return true }
-      if (hop > HOP_LIMIT) { sendJson(res, 200, { ok: false, hop, why: `hop ${hop} > limit ${HOP_LIMIT}` }); return true }
-      if (t) { t.hops = hop; t.last = nowIso(); saveState() }
-      sendJson(res, 200, { ok: true, hop }); return true
+      const g = outboundGate(t, hop, b.no_reply === true, threadEvent(t), 'main')
+      if (!g.ok) { sendJson(res, 200, { ok: false, hop, why: g.why }); return true }
+      if (t && g.count) { t.hops = hop; t.last = nowIso(); saveState() }
+      sendJson(res, 200, { ok: true, hop: g.count ? hop : t?.hops ?? hop }); return true
     }
     if (p === '/lanes/status') {
       sendJson(res, 200, { main: main.currentGen() ?? null, running: [...running.keys()], queued: [...queue.values()].map(i => ({ ev: i.ev.id, lane: i.lane, state: i.state, attempts: i.attempts })),

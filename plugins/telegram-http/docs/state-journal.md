@@ -267,6 +267,17 @@ then call the scheduler. The lane guard hook (lane-guard-hook.py, PreToolUse on 
 either path and from any event, is refused ("already completed"). `./bin/btcc-receipt ack` is not a completion and runs as it is. Without the daemon
 the hook still denies the CLI. So the daemon is the only thing that completes a run at the scheduler.
 
+**Stopping a conversation** (002w C) is one function, `stopThread`: the event record's `stop`, the thread `stopped` and its queued peer events drained,
+the router's stop notice to the peer (marked no_reply, the `stop-notice` obligation), and the one hand-over of the event to the main. Every place that
+stops a thread goes through it: the router's thread gate on an inbound message (hop limit, thread budget), and **the one outbound gate**
+(`outboundGate`), which decides every send on a thread: a lane's reply_agent, the router's interim (interimToPeer), and the main's send_to_agent (the
+inbox daemon asks `POST /lanes/outbound-check` with `{thread, hop, no_reply}`). A send past the hop limit stops the conversation there (for the main's
+send, the event answered is the newest message the peer sent on that thread). A `no_reply` send passes a stopped or over-limit thread and counts no hop:
+it asks for nothing, so it cannot extend the loop; that is how the main's closing answer, marked no_reply at its PreToolUse, reaches the peer. Before
+002w a lane's reply_agent past the limit only marked the thread stopped (no `stop`, no notice, the event handed over when the run ended), the main's send
+past it was only refused, the interim skipped silently (gap 15), and the inbox daemon refused any send on a stopped thread, the main's no_reply answer
+included (gap 1).
+
 **The lane stop.** The lane's Stop hook (lanes-hooks/lane-stop-hook.py) posts to `POST /lane-stop` with its run token (`LANE_RUN_TOKEN`; the port
 is `LANES_HTTP_PORT`, set by the daemon in the lane's environment). The daemon blocks once with the open obligations, or lets the run end.
 
