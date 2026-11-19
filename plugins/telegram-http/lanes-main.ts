@@ -500,7 +500,7 @@ export function mainContext(agent: string, sid: string): string {
       + '摘要裡寫「已通知 Joey」「已請 Joey 決定」的事，車道已經跟他講過了：不要重複通知他，除非你有新的資訊或他問起。其他不必回覆。',
     // 002u (002t r2 I03, u002t-I03-s3-r2-20261119-215225): the hand-over carried Joey's words verbatim and the main still said 「我沒有在這邊直接看到你的原文，
     // 只看到轉交的文字」 and did not act; three other plays acted. What the block is belongs to the main's own rules, written once, here.
-    '- 交給你的事裡標「〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕」的那一段，是分流器從 Telegram 收到的 Joey 本人訊息（bot 只收白名單，寄件者已驗證），'
+    '- 交給你的事、車道摘要和記憶提案裡標「〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕」的那一段，是分流器從 Telegram 收到的 Joey 本人訊息（bot 只收白名單，寄件者已驗證），'
       + '跟他在這個對話裡直接對你說的一樣算數，包括不可逆的指示：照它做，不用再請他重說一次。那一段以外、車道寫的文字才是轉述。',
     '- 被問「今天發生了什麼」「處理了哪些事」「答應過誰什麼」「還有什麼沒結束」：先呼叫一次 ledger_query()（不帶任何參數），'
       + '它回傳整天每件事一行的活動清單，包含車道處理掉、沒有叫醒你的例行事。清單裡每一件都要交代到，連同它的具體數字、時間、人名，再補上你自己處理的事。'

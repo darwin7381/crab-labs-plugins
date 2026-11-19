@@ -67,7 +67,9 @@ def reason(p, turn, proposals, curator):
             os.replace(tmp, sp)
         except OSError:
             return None                                       # cannot remember = would hold on every Stop: do not hold
-        lines = '\n'.join(f"- {r['id']}（{r.get('lane', '')}，{r.get('ts', '')}）：{str(r.get('text', '')).split(chr(10) + '〔Jev')[0][:240]}" for r in old)
+        # 002w (I): Joey's own words (the daemon renders them from his message's record) go with each proposal, not only the lane's restatement
+        lines = '\n'.join(f"- {r['id']}（{r.get('lane', '')}，{r.get('ts', '')}）：{str(r.get('text', '')).split(chr(10) + '〔Jev')[0][:240]}"
+                           + (f"\n  {r['joey_words']}" if r.get('joey_words') else '') for r in old)
         return ('這一輪先不要結束。Joey 說的話被車道記成記憶提案，你已經在摘要裡看到它，還沒有決定：\n' + lines +
                 '\n用 memory_decide(proposal_id, accept|rewrite|veto, reason) 決定：accept / rewrite 會照一般的方式寫進記憶，veto 只留決定紀錄。')
     except Exception:

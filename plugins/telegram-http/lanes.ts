@@ -2636,6 +2636,18 @@ function ownerOf(evId: string): string | undefined {
 // (002d: 300 s); a critical alert's line (CRITICAL_DEADLINE_MS, 002k E1: 45 s); the main's promised answer to a peer
 // (PROMISE_MIN, 002j: 30 min). They are due times on explicit state, not windows over a transcript.
 const HANDOFF_DUE_MS = (): number => num('LANES_HANDOFF_FALLBACK_MS', 300_000)
+/** 002w (I, 002v round 2 D02): Joey's own words, as the router received them from Telegram (the event record's `tg` and `text`), marked as the router's
+ *  transcript, not a lane's retelling; '' for an event that is not his own message. ONE renderer for everything the main gets that came from his message:
+ *  the hand-over, the memory proposal (its standing digest line, its ledger row, the memory gate's listing) and the digest line of his event. In D02 the
+ *  lane filed Joey's 「記住」 in its own words and the main vetoed it: 「我在主線對話紀錄裡找不到你 2006 那則的原文」 (only the hand-over carried them, 002t). */
+function joeyWords(e: Row | undefined, oneLine = false): string {
+  const tg = e?.tg as { message_id?: unknown; topic?: unknown } | undefined
+  if (!tg || !e?.text) return ''
+  const t = String(e.text).slice(0, 1500)
+  return `〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕${tg.topic != null ? `話題 #${tg.topic}，` : ''}message_id ${tg.message_id ?? '-'}：「${oneLine ? t.replace(/\s+/g, ' ').trim() : t}」`
+}
+/** the Joey words a memory proposal came from: his message in the run's event set when it was filed (`joey_event`), else its own event's */
+const proposalWords = (e: Row, p: Proposal, oneLine = false): string => joeyWords(p.joey_event ? events?.get(p.joey_event) : e, oneLine)
 /** M3 → M4 → M1: the event is handed to the main. ONE transition for every hand-over (handoff_main, the exit rule, the thread stop): events.handOver
  *  adds the main obligation (due HANDOFF_DUE_MS, set now and never rewritten) and moves what the lane still owed to `handed`; then one M1 item carries
  *  it. M1 offers it when the main is idle (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop.
@@ -2644,10 +2656,8 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
   // 002t (station 4, I03 live): Joey ordered an irreversible step inside a worker's topic; the worker handed it to the main in its own words, and the
   // main rightly would not act on a lane's retelling (「我看不到你在話題的原話，帳本只有工作線的轉述」). A hand-over of Joey's own Telegram message
   // carries his words as the router received them, marked as such: the main reads Joey, not the lane.
-  const e0 = events?.get(evId)
-  const tg = e0?.tg as { message_id?: unknown; topic?: unknown } | undefined
-  const said = tg && e0?.text ? `\n〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕${tg.topic != null ? `話題 #${tg.topic}，` : ''}message_id ${tg.message_id ?? '-'}：「${String(e0.text).slice(0, 1500)}」` : ''
-  const body = text.slice(0, max) + said
+  const said = joeyWords(events?.get(evId))
+  const body = text.slice(0, max) + (said ? `\n${said}` : '')
   const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}),
     answer_due: Date.now() + PROMISE_MIN * 60_000 })                              // 002w (B, gap 9): a peer's answer handed to the main is due like a promised one
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
@@ -3117,11 +3127,15 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // where it came from: refs.joey = the run was triggered by a Joey message
       const pid = kind === 'memory_proposal' ? `mp-${shortId()}` : null
       const src = kind === 'memory_proposal' ? (() => { const ev = queue.get(tok.evId)?.ev; return { proposal_id: pid, source: ev?.source ?? null, from: ev?.from ?? null, joey: byJoeyRun(tok) } })() : {}
-      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: kind as LedgerKind, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : ''),
+      // 002w (I): the Joey message the proposal came from (the run's event set) travels with it: its words on the ledger row, its id on the proposal
+      const je = kind === 'memory_proposal' ? runEvents(queue.get(tok.evId)).filter(e => e.source === 'telegram' && !e.synthetic).pop()?.id : undefined
+      const words = je ? joeyWords(events.get(je)) : ''
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: kind as LedgerKind, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : '') + (words ? `\n${words}` : ''),
         refs: { ...(a.refs ?? {}), ...(review ? { review: review.refs } : {}), ...src }, detail: lane.transcript })
       if (kind === 'memory_proposal') {
         (tok.proposals ??= []).push({ id: pid!, text: String(a.text ?? '').slice(0, 200) })
-        events.push(tok.evId, 'proposals', { id: pid, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : ''), joey: (src as any).joey === true, at: nowIso(), lane: lane.id })   // M3 (PL1)
+        events.push(tok.evId, 'proposals', { id: pid, text: String(a.text ?? '').slice(0, 1000) + (review?.note ? `\n${review.note}` : ''), joey: (src as any).joey === true, at: nowIso(), lane: lane.id,
+          ...(je ? { joey_event: je } : {}) })   // M3 (PL1)
       }
       else if (kind === 'action' || kind === 'commitment') tok.records = (tok.records ?? 0) + 1
       if (kind === 'commitment') events.push(tok.evId, 'promised', String(a.text ?? '').slice(0, 300))   // M3 (PL1): what the lane promised is on its event
@@ -3830,13 +3844,15 @@ export function ledgerQueryTool(a: any): string {
 // turn once while one is still open after a whole turn of the main.
 function stripReview(text: string): string { return String(text ?? '').split('\n〔Jev')[0].trim() }
 /** M3 (PL1): a memory proposal lives on the record of the event whose run filed it (`proposals`); its decision too. The ledger lines are the audit. */
-type Proposal = { id: string; text: string; joey: boolean; at: string; lane: string; decision?: string; decided_at?: string; writer?: string }
+type Proposal = { id: string; text: string; joey: boolean; at: string; lane: string; decision?: string; decided_at?: string; writer?: string
+  /** 002w (I): the Joey message it came from (proposalWords renders his words from that event's record) */
+  joey_event?: string }
 /** the main's memory gate's facts: the open Joey proposals, each with `shown` = a digest that carried it reached the main (bound or done; 002v),
  *  and whether the curator holds the write right */
-export function memoryFacts(): { proposals: Array<{ id: string; ts: string; lane: string; text: string; shown: boolean }>; curator: boolean } {
+export function memoryFacts(): { proposals: Array<{ id: string; ts: string; lane: string; text: string; shown: boolean; joey_words: string }>; curator: boolean } {
   const seen = new Set<string>()
   for (const r of main?.items(x => x.kind === 'digest' && (x.state === 'bound' || x.state === 'done')) ?? []) for (const id of (Array.isArray(r.proposals) ? r.proposals : []) as string[]) seen.add(id)
-  return { proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text, shown: seen.has(p.id) })), curator: !!S?.curator }
+  return { proposals: proposalsOf(p => p.joey && !p.decision).map(({ e, p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text, shown: seen.has(p.id), joey_words: proposalWords(e, p) })), curator: !!S?.curator }
 }
 function proposalsOf(pred: (p: Proposal) => boolean = () => true): Array<{ e: Row; p: Proposal }> {
   const out: Array<{ e: Row; p: Proposal }> = []
@@ -4217,7 +4233,8 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
 }
 /** the lines every view carries while they last: open Joey memory proposals (002k D1) and active peer holds */
 function standingLines(): { proposals: string[]; holds: string[] } {
-  return { proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => `• ${stamp(p.at)}｜${laneLabelOf(p.lane)}｜記憶提案 ${p.id}｜還沒決定（Joey 說的話）；需主線：用 memory_decide 決定：${clip(stripReview(p.text), 200)}`),
+  return { proposals: proposalsOf(p => p.joey && !p.decision).map(({ e, p }) => { const w = proposalWords(e, p, true)
+    return `• ${stamp(p.at)}｜${laneLabelOf(p.lane)}｜記憶提案 ${p.id}｜還沒決定（Joey 說的話）；需主線：用 memory_decide 決定：${clip(stripReview(p.text), 200)}${w ? `｜${w}` : ''}` }),
     holds: holdLines() }
 }
 const DAY_MS = 24 * 3600_000
@@ -4274,8 +4291,9 @@ function digestLine(e: Row, whole = false): DigestLine {
   const what = fit(String(e.did || e.result || e.said || e.text || ''), 180)
   const mark = e.must_know ? MUST_KNOW_MARK : ''
   const out = e.outcome === 'failed' ? '（失敗）' : e.outcome === 'changed' ? '（有變化）' : ''
+  const words = joeyWords(e, true)                                                // 002w (I): his own words, next to what the lane did with them
   return { id: e.id, group: handed ? 0 : joey?.level === 'decision' && joey.state === 'met' ? 1 : 2, label: `${who}｜${e.from ?? '-'}`,
-    line: `• ${stamp(String(e.created))}｜${who}｜${mark}${what}${out}｜來自 ${e.from ?? '-'}｜${st.join('；') || (e.state === 'closed' ? (e.owner === 'router' && !obs.length ? '只記錄（資訊）' : '已結束') : '處理中')}` }
+    line: `• ${stamp(String(e.created))}｜${who}｜${mark}${what}${out}｜來自 ${e.from ?? '-'}｜${st.join('；') || (e.state === 'closed' ? (e.owner === 'router' && !obs.length ? '只記錄（資訊）' : '已結束') : '處理中')}${words ? `｜${words}` : ''}` }
 }
 
 // ================================================================== cross-daemon calls

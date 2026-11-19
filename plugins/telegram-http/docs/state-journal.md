@@ -214,11 +214,16 @@ Fields:
   - `chain_end` (`cap`, `no-change`) and `chain_runs`: its follow-up chain ended;
   - `result`: a fork's (or the curator's) final text; `did`: what the lane reported;
   - `lane_closed`: `{by, via, run, reported, stopped, last}` when its lane was closed while the run was running;
-  - `proposals`: `[{id, text, joey, at, lane, decision, decided_at, writer}]`, the memory proposals filed in a run of this event (the main's
+  - `proposals`: `[{id, text, joey, at, lane, decision, decided_at, writer, joey_event}]`, the memory proposals filed in a run of this event (the main's
     `memory_decide`, or the curator, writes `decision`);
   - `promised`: the commitments a lane recorded in a run of this event;
-  - `tg`: `{message_id, topic}` on Joey's own Telegram message (002t): a hand-over of that event carries his words verbatim, marked as the
-    router's transcript (〔Joey 原話｜…〕), after the lane's text;
+  - `tg`: `{message_id, topic}` on Joey's own Telegram message (002t). **His own words travel with everything the main gets from his message**
+    (002w I, 002v round 2 D02): ONE renderer (`joeyWords`) writes them from this record (`tg` and `text`, the router's transcript of the message),
+    marked 〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕, and every such item uses it: the hand-over of the event (after the lane's text),
+    the digest line and activity-list line of the event, and a memory proposal filed in a run whose event set holds his message (`joey_event` on the
+    proposal: its standing digest line, its `memory_proposal` ledger row that ledger_query(kind=memory_proposal) shows, and the memory gate's listing,
+    the `joey_words` of the Stop check's `proposals`). 002t put them on the hand-over only: in D02 the lane filed Joey's 「記住」 in its own words and the
+    main, held to decide it, vetoed it: 「我在主線對話紀錄裡找不到你 2006 那則的原文」;
   - `main_seen`: the version the main has seen because it made that change itself (a memory decision): the digest does not tell the main what it did.
 - `obligations`: `[{id, kind, level, state, by, owner, due_at, ref, failed, outcome, into, ...}]`. `state`:
   - `open`: owed;
