@@ -114,7 +114,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   await sleep(400); expect(hookOut().length).toBe(1)
   // its notify_joey answers the message that steered it, in its topic
   const tok = L.__runTok(LANE)!
-  expect(tok.steered?.map(e => e.id)).toEqual(['tg-e18-2'])
+  expect(L.__runEvents(LANE)).toEqual(['tg-e18-1', 'tg-e18-2'])                             // 002w (A): the run's event set holds the steered message
   expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '好，只看 payments。' })).toContain('sent to Joey')
   expect(sent.at(-1)).toMatchObject({ replyTo: 2001, topic: 555 })
   await finish(1)

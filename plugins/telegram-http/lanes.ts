@@ -1370,8 +1370,11 @@ function syncSteer(laneId: string): void {
       text: `steering delivered：${s.ev.from} 的訊息在 ${Math.round(waitMs / 100) / 10} 秒後交給 ${s.run} 正在跑的那一趟（${m.event === 'Stop' ? '它要結束時攔下來' : `工具 ${m.tool || '-'} 之後`}）：${clip(s.ev.text, 160)}`,
       refs: { steer: 'delivered', id: s.ev.id, run: s.run, wait_ms: waitMs, via: m.event ?? null, tool: m.tool || null, message_id: s.ev.meta?.message_id ?? null } })
     logos('lane.steer', { lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, run: s.run, phase: 'delivered', wait_ms: waitMs, via: m.event ?? null })
-    const r = running.get(laneId)
-    if (r && r.runId === s.run) (r.tok.steered ??= []).push(s.ev)
+    const r = running.get(laneId), q = r && r.runId === s.run ? queue.get(r.evId) : undefined
+    if (q && !q.steered?.some(e => e.id === s.ev.id)) {           // 002w (A): on the run's record, so a re-run and a restart keep it in the event set
+      q.steered = [...(q.steered ?? []), s.ev]
+      runRec(q, 'running', { steered: q.steered.map(lightEv) })
+    }
   }
   if (left.length !== list.length) { if (left.length) S.steering![laneId] = left; else delete S.steering![laneId]; saveState() }
 }
@@ -1418,7 +1421,8 @@ function armSteerTimer(): void {
 /** what Joey wrote last into this run: its notify_joey and ask_joey answer THAT message (E4), not the one that started the run */
 function replyEventFor(tok: RunTok): InEvent | undefined {
   syncSteer(tok.lane)
-  return tok.steered?.length ? tok.steered[tok.steered.length - 1] : queue.get(tok.evId)?.ev
+  const it = queue.get(tok.evId)
+  return it?.steered?.length ? it.steered[it.steered.length - 1] : it?.ev
 }
 
 function dispatch(ev: InEvent, lane: Lane | undefined, base: { rule: string; critical?: boolean }): Decision {
@@ -1452,7 +1456,10 @@ type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; a
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
   extra?: InEvent[]
   /** 002m (G06): where each failed attempt died, for the hand-over after the last one */
-  deaths?: RunDeath[] }
+  deaths?: RunDeath[]
+  /** 002w (A): Joey's messages steered into a run of this event (E18), in this run or an earlier attempt: written on the run record when the hook hands
+   *  one over, kept when the event is queued again. With `ev` and `extra` it is the run's event set (runEvents). */
+  steered?: InEvent[] }
 /** 002q (G06): an attempt's record is every tool call it made with its result (`steps`, in order), so the main does not run again what an attempt
  *  already found. 002m kept only the last call and its result: the main re-ran the status, logs and snapshots the first attempt had read. */
 type RunDeath = { run: string; how: string; after_s: number; calls: number; steps?: string[]; last_text?: string; stderr?: string }
@@ -1496,8 +1503,6 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   unchanged?: boolean; chainEnded?: boolean
   /** PL3: this run is a follow-up run (followupId) of its origin event */
   followup?: boolean; followupId?: string
-  /** 002k (E18): Joey's messages that reached this run while it was in progress and were handed to it at a tool boundary (the last one is what its notify_joey answers) */
-  steered?: InEvent[]
   /** 002k: the run is a fan-out member / the synthesis of a fan-out */
   fanout?: string; synthesis?: string
   /** every tool call of the run (from its stream), for the lane-stop model aid */
@@ -1522,8 +1527,17 @@ function queueRun(it: QItem): void {
   it.state = 'queued'; it.pid = undefined
   queue.set(it.ev.id, it)
   runRec(it, 'queued', { ev: lightEv(it.ev), priority: it.priority, summary: it.summary ?? null, enqueued: it.enqueued, extra: it.extra?.map(lightEv) ?? null,
-    deaths: it.deaths ?? null, not_before: it.not_before ?? null })
+    deaths: it.deaths ?? null, not_before: it.not_before ?? null, steered: it.steered?.map(lightEv) ?? null })
 }
+/** 002w (A): the run's event set: its event, the messages riding in it (`extra`: a peer's coalesced messages, alert repeats, Joey's messages a run never
+ *  reached) and every Joey message steered into a run of it (`steered`, kept over re-runs). The lane stop, the exit rule, the re-run decision and the
+ *  event a Joey line answers all read this one set. */
+function runEvents(it: QItem | undefined): InEvent[] {
+  const seen = new Set<string>()
+  return (it ? [it.ev, ...(it.extra ?? []), ...(it.steered ?? [])] : []).filter(e => !seen.has(e.id) && !!seen.add(e.id))
+}
+/** the ids of a running run's event set (its event first) */
+const runEventIds = (tok: RunTok): string[] => { const ids = runEvents(queue.get(tok.evId)).map(e => e.id); return ids.length ? ids : [tok.evId] }
 /** H05: the thread's budget state as the budget accounting holds it: the fresh tokens its runs spent (freshTokens) and the limit (THREAD_BUDGET) */
 const budgetOf = (thread: string | undefined): { thread: string | null; used: number; limit: number } =>
   ({ thread: thread ?? null, used: (thread && S.threads[thread]?.fresh) || 0, limit: THREAD_BUDGET })
@@ -1552,7 +1566,8 @@ function restoreRuns(): void {
   for (const r of latest.values()) {
     if (r.state === 'exited' || !r.ev) continue
     const it: QItem = { ev: r.ev, lane: String(r.lane), state: 'queued', attempts: r.state === 'queued' ? Number(r.attempt) - 1 : Number(r.attempt), priority: Number(r.priority ?? 5),
-      summary: r.summary ?? undefined, enqueued: String(r.enqueued ?? r.created), rid: r.id, ...(r.extra ? { extra: r.extra } : {}), ...(r.deaths ? { deaths: r.deaths } : {}) }
+      summary: r.summary ?? undefined, enqueued: String(r.enqueued ?? r.created), rid: r.id, ...(r.extra ? { extra: r.extra } : {}), ...(r.deaths ? { deaths: r.deaths } : {}),
+      ...(r.steered ? { steered: r.steered } : {}) }
     if (r.state === 'queued') { queue.set(it.ev.id, it); continue }
     // 002f, 002k G11: it was running under the previous daemon: that run cannot report any more. Its process is stopped, it gets the exit
     // row it never could write, and the event is run again (an attempt like any death).
@@ -1566,20 +1581,71 @@ function restoreRuns(): void {
     if (lane) ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'lane_lifecycle',
       text: `lane ${lane.id} run ${r.run ?? '?'} crashed: daemon restarted (the run was cut off; its event ${it.ev.id} is run again)`, refs: { run: r.run ?? null, signal: 'daemon-restart', counted: resumable, runs: lane.runs } })
     ;(it.deaths ??= []).push({ run: String(r.run ?? '?'), how: 'daemon 重啟時這一趟還在跑，被切斷', after_s: 0, calls: 0 })
-    if (it.attempts >= MAX_ATTEMPTS && lane) exitRule(lane, it, failedHandoffText(it), HANDOVER_RECORD_MAX)
-    else if (runAgain(it)) queueRun(it)
-    else journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run was cut by the daemon restart; the event owes nothing more: not run again' })   // 002q (T6-R)
+    runEnded(lane, it, { reason: 'restore' })                           // 002w (A): the one end of a run (002q T6-R: run again only while the set owes)
     cut++
   }
   saveState()
   if (queue.size || cut) D.log('info', `lanes: ${queue.size} lane run(s) restored from the journal; ${cut} were running when the daemon stopped and are run again`)
 }
-/** M5 × M3 (002q, T6-R): a run that ended unfinished (it died, timed out, or was cut by a daemon restart) is run again only while its event still owes
- *  the lane something, read from the journal's fold of its record (and the Joey messages steered into it). A fan-out part always runs again (its
- *  synthesis waits for it); an event with no record is not one the router routed. 002p re-ran a CLOSED event after a daemon restart: the lane found
- *  everything done and ended without a line. */
-function runAgain(it: QItem, steered: InEvent[] = []): boolean {
-  return !!it.ev.fanout || !events.get(it.ev.id) || [it.ev.id, ...steered.map(e => e.id)].some(id => events.openObs(id).length > 0)
+/** M5 × M3 (002q, T6-R): a run that ended unfinished (it died, timed out, hit the wall, or was cut by a daemon restart) is run again only while its event
+ *  set (runEvents) still owes the lane something, read from the journal's fold of the records, or its task lane still owes its task (taskOwed: the
+ *  synthesis waits for a fan-out part); an event with no record is not one the router routed. 002p re-ran a CLOSED event after a daemon restart: the
+ *  lane found everything done and ended without a line. */
+function runAgain(it: QItem): boolean {
+  return !!taskOwed(it) || !events.get(it.ev.id) || runEvents(it).some(e => events.openObs(e.id).length > 0)
+}
+/** 002w (A): what a task lane's run owes besides M3 (a task owes nobody a line, so no obligation holds it): a fan-out part its result to the synthesis
+ *  (report_result), a synthesis its one conclusion to the main (deliver_synthesis), a curator the memory write right back (curator_done). null: none */
+function taskOwed(it: QItem): 'part' | 'synthesis' | 'curator' | null {
+  const fo = it.ev.fanout ? S.fanouts?.[it.ev.fanout] : undefined
+  if (fo && fo.synthesis === it.lane) return fo.done ? null : 'synthesis'
+  if (fo && fo.members.includes(it.lane)) return fo.results[it.lane] != null ? null : 'part'
+  return S.curator?.lane === it.lane ? 'curator' : null
+}
+/** 002w (A): a task lane's run ended for good without its closing call: what it reached goes where the task's result goes (gap 6, 7) */
+function endTask(it: QItem, lane: Lane | undefined, why: string, reached: string): void {
+  const fo = it.ev.fanout ? S.fanouts?.[it.ev.fanout] : undefined
+  const r = reached.replace(/\s+/g, ' ').trim()
+  switch (taskOwed(it)) {
+    case 'part':                                                         // the synthesis starts when every part has a result: this part's is what it reached
+      fanoutResult(fo!.id, it.lane, `（這一塊沒有用 report_result 交回就結束了：${why}；${r ? `結果到結束為止：${r.slice(0, 900)}` : '沒有結果'}）`)
+      return
+    case 'synthesis':                                                    // the main asked for one conclusion: it gets what the synthesis reached
+      fo!.done = nowIso(); saveState()
+      handToMain(it.ev.id, lane, `扇出 ${fo!.id} 的綜合線沒有交回結論就結束了（${why}）`, `syn-${shortId()}`, undefined, 1000, false, {
+        content: `〔扇出結果｜${fo!.id}〕主線交辦的「${(fo!.brief ?? '').slice(0, 80)}」，綜合線沒有用 deliver_synthesis 交回結論就結束了（${why}）。它做到的：${r ? r.slice(0, 1500) : '（沒有文字結果）'}\n\n`
+          + `各塊交回的結果在帳本（ledger_query(text="扇出 ${fo!.id}")）。請你收尾，把結論回給要的人（通常是 Joey）。`,
+        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } })
+      return
+    case 'curator':                                                      // the write right comes back, and the main is told once
+      curatorEnd(it.lane, 'ended', `${why}${r ? `；它最後寫的：${r.slice(0, 300)}` : ''}`)
+      return
+  }
+}
+const endWords = (reason: string, it: QItem): string => reason === 'normal' ? '這一趟結束了' : reason === 'closed' ? '車道被關閉' : reason === 'gone' ? '車道已經不在'
+  : reason === 'budget' ? '對話線的 token 預算用完' : reason === 'cap_turns' ? '到了回合上限' : reason === 'cap_usd' ? '到了單趟金額上限' : `連續 ${it.attempts} 次沒做完`
+/** 002w (A, gaps 2, 3, 5, 6, 7, 12, 22): THE end of a lane run, whatever ended it: an exit (normal, died, timeout, cap_turns, cap_usd, budget, closed,
+ *  wall:<kind>), a run the daemon restart cut (restore), a queued run refused before it started (budget, closed) or whose lane is gone (gone). One place
+ *  decides what follows, over the run's event set (runEvents):
+ *  - the re-run: died, timeout, restore and a wall are retryable; the run is queued again while the set still owes something (runAgain). A wall is
+ *    not an attempt (the event is queued again as it was);
+ *  - the lanes' wall: up on a wall; down on any other exit of a run that reached the model (it wrote a result record or made a model call);
+ *  - otherwise, and after MAX_ATTEMPTS, the run's work has ended: a task lane's own duty (endTask), then the exit rule over the set. */
+function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string }): void {
+  const wall = e.reason.startsWith('wall:') ? e.reason.slice(5) : null
+  const retryable = !!wall || e.reason === 'died' || e.reason === 'timeout' || e.reason === 'restore'
+  if (wall) it.attempts = Math.max(0, it.attempts - 1)                      // nothing was tried: not an attempt
+  const again = retryable && it.attempts < MAX_ATTEMPTS && runAgain(it)
+  if (again) {
+    if (e.reason === 'died' || e.reason === 'timeout') { it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts; setTimeout(pump, RETRY_BACKOFF_MS * it.attempts + 20) }   // 002f backoff
+    queueRun(it)
+  }
+  if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
+  else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
+  if (again) return
+  const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
+  endTask(it, lane, endWords(e.reason, it), e.reached ?? '')
+  exitRule(lane, it, gaveUp ? failedHandoffText(it) : e.said ?? '', gaveUp ? HANDOVER_RECORD_MAX : 1000)
 }
 /** a lane process left by the previous daemon: stop it if it is really that run (the pid may belong to something else by now) */
 function reapOrphan(pid: number, run: string): void {
@@ -2221,19 +2287,23 @@ function sessionBusy(it: QItem): boolean {
 }
 function startRun(it: QItem): void {
   const lane = S.lanes[it.lane]
-  if (!lane) { endRun(it, 'died', { why: 'lane gone' }); return }
+  if (!lane) {                                                             // 002w (A, gap 22): what its event set owes goes to the main
+    endRun(it, 'died', { why: 'lane gone' })
+    runEnded(undefined, it, { reason: 'gone', said: `車道 ${it.lane} 已經不在，事件 ${it.ev.id} 沒有車道處理。` })
+    saveState(); return
+  }
   const th = S.threads[lane.thread]
   if (th && (th.fresh ?? 0) >= THREAD_BUDGET) {
     endRun(it, 'budget', { why: 'thread budget spent before the run', budget: budgetOf(lane.thread) })
     const text = `thread ${lane.thread} 已用 ${th.fresh} token（新的輸入、快取寫入與輸出；快取重讀不算），超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。`
     ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop', text })
-    exitRule(lane, it, text)
-    return
+    runEnded(lane, it, { reason: 'budget', said: text })
+    saveState(); return
   }
   if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
-  if (lane.status === 'closed') {                                          // PL7 (P21): its lane was closed while it waited: closed, and the exit rule
+  if (lane.status === 'closed') {                                          // PL7 (P21): its lane was closed while it waited: closed, and the one end
     endRun(it, 'closed', { why: 'its lane was closed before it ran' })
-    exitRule(lane, it, `${lane.id} 在這件事開始處理之前被關閉了`)
+    runEnded(lane, it, { reason: 'closed', said: `${lane.id} 在這件事開始處理之前被關閉了` })
     saveState(); return
   }
   const runId = `${lane.id}.r${lane.runs + 1}`
@@ -2398,23 +2468,15 @@ function startRun(it: QItem): void {
     logos('lane.exit', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
       exit_code: code, signal, reason, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
     D.log('info', `lanes: exit ${runId} ${reason} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
-    const wall = reason.startsWith('wall:') ? reason.slice(5) : null
     endRun(it, reason, { exit_code: code, signal: signal ?? null, run: runId, tokens: { in: tin, out: tout, fresh: tfresh, calls: usage.size }, budget: budgetOf(lane.thread) })
-    if (reason === 'closed') {                                             // the main or Joey closed this lane: not run again; what its event still owes goes to the main
-      exitRule(lane, it, `${lane.id} 在執行中被關閉（${laneLabel(lane)}）${lastText || result ? `，最後寫的是：${(lastText || result).replace(/\s+/g, ' ').slice(0, 300)}` : ''}`, 1000, tok.steered)
-      saveState(); pump(); return
-    }
-    if (wall) {
-      // 002j: the model wall. Nothing was tried, so this is not an attempt: the event is queued again as it was; the probe timer starts the next run
-      it.attempts = Math.max(0, it.attempts - 1); queueRun(it)
-      wallUp({ kind: wall, text: result.slice(0, 200) }, runId)
-      saveState()
-      return
-    }
+    // what the run reached, as each reason records it; what follows is decided in ONE place (runEnded, 002w A)
+    const last = (lastText || result).replace(/\s+/g, ' ').trim()
+    let said = reason === 'closed' ? `${lane.id} 在執行中被關閉（${laneLabel(lane)}）${last ? `，最後寫的是：${last.slice(0, 300)}` : ''}`
+      : `${lane.id} 這一趟結束了${result ? `，最後寫的是：${result.replace(/\s+/g, ' ').slice(0, 300)}` : ''}`
+    let reached = last.slice(0, 900)
     if (reason === 'budget' || reason === 'cap_turns' || reason === 'cap_usd') {
       // 002k (H11): a cap or the thread budget is a stop, not a failure to retry. 002l (D8): the partial keeps the last tool results too
-      const said = (lastText || result || '').replace(/\s+/g, ' ').trim()
-      const partial = [said || `（還沒有文字結果；用過 ${[...new Set(names)].join('、') || '沒有工具'}）`,
+      const partial = [last || `（還沒有文字結果；用過 ${[...new Set(names)].join('、') || '沒有工具'}）`,
         ...(lastResults.length ? [`最後的工具結果：${lastResults.join(' ｜ ')}`] : [])].join(' ').slice(0, 900)
       const th2 = S.threads[lane.thread]
       const capped = reason === 'budget' ? 'budget' : reason === 'cap_usd' ? 'usd' : 'turns'
@@ -2422,45 +2484,27 @@ function startRun(it: QItem): void {
         ? `預算：thread ${lane.thread} 在這一趟的途中用到 ${budgetStop!.total} token（新的輸入、快取寫入與輸出；快取重讀不算），達到預算 ${THREAD_BUDGET}，這一趟已經中止（${usage.size} 次呼叫之後）。`
         : capped === 'usd' ? `預算：這一趟花到單趟的金額上限（--max-budget-usd ${laneMaxUsd(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
         : `這一趟到了回合上限（--max-turns ${laneMaxTurns(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
-      // M3's exit rule: what the event already got is only recorded; what it still owes goes to the main (one obligation, one M1 item)
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop',
         text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}`,
         refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
       logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET })
       D.log('warn', `lanes: ${runId} stopped (${capped}): ${why}`)
-      if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊被中止：${capped === 'turns' ? '回合上限' : '預算'}；結果到中止為止：${partial}）`)
-      else exitRule(lane, it, `${why}中止前的結果：${partial}`, 1000, tok.steered)
-      saveState()
-      pump()
-      return
+      said = `${why}中止前的結果：${partial}`; reached = partial
     }
-    if (reason === 'normal') {
-      if (S.wall) void wallDown(runId)                                // the first run that gets through takes the wall down
-      exitRule(lane, it, `${lane.id} 這一趟結束了${result ? `，最後寫的是：${result.replace(/\s+/g, ' ').slice(0, 300)}` : ''}`, 1000, tok.steered)
-      if (lane.kind === 'fork') {
-        events.note(it.ev.id, { result: result.slice(0, 600) || '(無文字結果)' })      // M3 (PL1): the fork's result is a field of its event
-        ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
-          text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
-      }
-      saveState(); pump()
-      return
+    if (reason === 'died' || reason === 'timeout') {                  // 002m (G06): where each attempt died is kept for the give-up hand-over
+      const one = (x: string | undefined, n: number) => x ? x.replace(/\s+/g, ' ').trim().slice(0, n) || undefined : undefined
+      ;(it.deaths ??= []).push({ run: runId,
+        how: timedOut ? `超過 ${Math.round(LANE_MAX_RUN_MS / 1000)} 秒還沒結束，被 daemon 停下（${signal ?? 'SIGKILL'}）` : signal ? `行程被訊號 ${signal} 結束` : `行程以 exit ${code} 結束${resultJson?.subtype ? `（${resultJson.subtype}）` : ''}`,
+        after_s: Math.round((Date.now() - started) / 100) / 10, calls: usage.size,
+        steps: tools.slice(-DEATH_STEPS_MAX).map(stepLine),
+        last_text: one(lastText || result, 120), stderr: one(errTail.split('\n').filter(l => l.trim()).slice(-2).join(' '), 160) })
     }
-    // died / timeout. 002f: the daemon saw this run die, so there is nothing to wait for: while the event still owes something it is run again after a
-    // short backoff (002m G06: where each attempt died is kept); after the last attempt what it owes goes to the main (the exit rule).
-    const one = (x: string | undefined, n: number) => x ? x.replace(/\s+/g, ' ').trim().slice(0, n) || undefined : undefined
-    ;(it.deaths ??= []).push({ run: runId,
-      how: timedOut ? `超過 ${Math.round(LANE_MAX_RUN_MS / 1000)} 秒還沒結束，被 daemon 停下（${signal ?? 'SIGKILL'}）` : signal ? `行程被訊號 ${signal} 結束` : `行程以 exit ${code} 結束${resultJson?.subtype ? `（${resultJson.subtype}）` : ''}`,
-      after_s: Math.round((Date.now() - started) / 100) / 10, calls: usage.size,
-      steps: tools.slice(-DEATH_STEPS_MAX).map(stepLine),
-      last_text: one(lastText || result, 120), stderr: one(errTail.split('\n').filter(l => l.trim()).slice(-2).join(' '), 160) })
-    if (it.attempts >= MAX_ATTEMPTS) {
-      if (it.ev.fanout) fanoutResult(it.ev.fanout, lane.id, `（這一塊連續 ${it.attempts} 次沒做完，沒有結果）`)
-      else exitRule(lane, it, failedHandoffText(it), HANDOVER_RECORD_MAX, tok.steered)
-    } else if (runAgain(it, tok.steered)) {
-      it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts
-      queueRun(it)
-      setTimeout(pump, RETRY_BACKOFF_MS * it.attempts + 20)
-    } else journal.write('wake', it.ev.id, 'no_wake', { reason: `the run ${reason}; the event owes nothing more: not run again` })
+    if (reason === 'normal' && lane.kind === 'fork') {
+      events.note(it.ev.id, { result: result.slice(0, 600) || '(無文字結果)' })      // M3 (PL1): the fork's result is a field of its event
+      ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
+        text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
+    }
+    runEnded(lane, it, { reason, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId })
     saveState()
     pump()
   })
@@ -2547,9 +2591,10 @@ function openLaneEvent(ev: InEvent, lane: Lane): void {
   events.open(ev.id, { class: cls, owner: lane.id, obligations: obs, thread: lane.thread, lane: lane.id, from: ev.from, text: ev.text,
     fields: { ...(cls === 'critical' ? { must_know: true } : {}), ...evFields(ev) } })
 }
-/** the event a run's Joey line answers: Joey's last message steered into the run, if it is still owed, else the run's own event (E4) */
+/** the event a run's Joey line answers: Joey's last message of the run's event set (steered into it, in this run or an earlier attempt, or riding in it)
+ *  whose line is still owed, else the run's own event (E4; 002w A: the set, not this run's token) */
 function joeyEventOf(tok: RunTok): string {
-  const st = (tok.steered ?? []).map(e => e.id).filter(id => events.openObs(id).some(o => o.kind === 'joey'))
+  const st = runEventIds(tok).filter(id => id !== tok.evId && events.openObs(id).some(o => o.kind === 'joey'))
   return st.length ? st[st.length - 1] : tok.evId
 }
 /** who owns an event now (stamped on every outbound message): the lane, the main once it is handed over, Joey once he was asked to decide */
@@ -2723,6 +2768,8 @@ export const __setMeshSend = (f: ((b: any) => Promise<any>) | null): void => { m
 export const __putQueue = (it: any): void => { if (S.lanes[it.lane]) openLaneEvent(it.ev, S.lanes[it.lane]); if (!it.rid && it.state === 'queued') { it.attempts ??= 0; queueRun(it) } else queue.set(it.ev.id, it) }
 export const __runTok = (laneId: string): RunTok | undefined => running.get(laneId)?.tok     // tests only (E18)
 export const __runToken = (tok: RunTok): string | undefined => [...runTokens].find(([, t]) => t === tok)?.[0]   // tests only (the lane's LANE_RUN_TOKEN)
+/** tests only (002w A): the event set of the run going on in this lane (its event, what rides in it, Joey's messages steered into it) */
+export const __runEvents = (laneId: string): string[] => { const r = running.get(laneId); return r ? runEventIds(r.tok) : [] }
 const laneMeshSend = (b: unknown): Promise<any> => meshSendHook ? meshSendHook(b) : inboxPost('/lanes/send', b)
 export function interimText(due: number): string {
   const card = focusText()
@@ -2896,8 +2943,8 @@ function chainEnded(lane: Lane, tok: RunTok, why: 'cap' | 'no-change', runs: num
 // got Joey's tg-1033 by steer and relayed it to Eve, and no commitment was written because only the trigger event was looked at.
 const byJoeyRun = (tok: RunTok): boolean => {
   if (tok.trigger === 'joey' || tok.cls === 'joey' || queue.get(tok.evId)?.ev.source === 'telegram') return true
-  syncSteer(tok.lane)                                                // what the hook has handed over by now is on tok.steered
-  return !!tok.steered?.some(e => e.source === 'telegram')
+  syncSteer(tok.lane)                                                // what the hook has handed over by now is in the run's event set
+  return runEvents(queue.get(tok.evId)).some(e => e.source === 'telegram')
 }
 function ownerRelay(lane: Lane, tok: RunTok, to: string, text: string, msgId: number | null): void {
   if (!byJoeyRun(tok) || (tok.commitments ?? 0) > 0) return
@@ -3443,13 +3490,14 @@ async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string):
 }
 
 // ------------------------------------------------------------------ M3: the lane stop
-/** the run is about to end: what its event (and Joey's messages steered into it) still owes, asked once. It blocks once, then the exit rule takes over. */
+/** the run is about to end: what its event set (runEvents: its event, what rides in it, Joey's messages steered into it) still owes, asked once. It blocks
+ *  once, then the exit rule takes over. */
 export function laneStop(tok: RunTok): string | null {
   const lane = S.lanes[tok.lane]
   if (!lane || !events) return null
   if (!tok.declineHeld) { const d = declineAid(tok); if (d) { tok.declineHeld = true; return d } }
   if (tok.stopHeld) return null
-  const ids = [tok.evId, ...(tok.steered ?? []).map(e => e.id)].filter(id => events.openObs(id).length)
+  const ids = runEventIds(tok).filter(id => events.openObs(id).length)
   if (!ids.length) return null
   tok.stopHeld = true
   logos('lane.stop_held', { lane: lane.id, run: tok.runId, events: ids })
@@ -3497,12 +3545,13 @@ function declineAid(tok: RunTok): string | null {
 // 002t (station 4, F01 zero-token): each event that still owes is handed over AS ITSELF: its own hand-over, its own text. A Joey message steered into
 // the run (a worker's topic) that the run ended without answering was listed in the run's hand-over but filed on the run's own event, with that
 // event's text; the main's report met the hand-over there, and the steered message stayed owed for ever (its route never settled).
-function exitRule(lane: Lane, it: QItem, said: string, max = 1000, steered: InEvent[] = []): void {
-  const owing = [it.ev, ...steered.filter(e => e.id !== it.ev.id)].map(ev => ({ ev, open: events.openObs(ev.id) })).filter(x => x.open.length)
+// 002w (A): over the run's event set (runEvents): Joey's messages steered into an earlier attempt and those riding in it (`extra`) as well.
+function exitRule(lane: Lane | undefined, it: QItem, said: string, max = 1000): void {
+  const owing = runEvents(it).map(ev => ({ ev, open: events.openObs(ev.id) })).filter(x => x.open.length)
   if (!owing.length) { journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run ended; the event owes nothing more: recorded only' }); return }
   for (const { ev, open } of owing) {
     const what = open.map(o => o.kind === 'joey' ? 'Joey 還沒收到這件事的回報' : o.kind === 'peer' ? `${o.to} 還在等回答` : `排程 run ${o.run_id} 還沒有回執`).join('；')
-    handToMain(ev.id, lane, `${lane.id} 處理 ${ev.from} 的事，結束時還欠：${what}。請主線接手並回報（由你回報 Joey 一次）。${said}\n原文：${ev.text.slice(0, 300)}`, undefined,
+    handToMain(ev.id, lane, `${lane?.id ?? it.lane} 處理 ${ev.from} 的事，結束時還欠：${what}。請主線接手並回報（由你回報 Joey 一次）。${said}\n原文：${ev.text.slice(0, 300)}`, undefined,
       ev.cls ?? ev.trigger ?? it.ev.cls ?? it.ev.trigger, max)
   }
 }
@@ -3536,16 +3585,22 @@ function startSynthesis(fo: Fanout): void {
 }
 // design/memory 「主線閒下來時，可以把寫入權交給一條整理線…做完交還」, MM5 「整理線只整理提案，不刪主線寫的內容，只能標記『建議刪除』」.
 const memoryWriterFile = (): string => join(LANES_DIR, 'run', 'memory-writer')
-function curatorEnd(laneId: string, how: 'done' | 'revoked', summary: string): void {
+/** the write right comes back to the main: `done` (curator_done), `revoked` (curate_stop), `ended` (002w A, gap 7: the curator's run ended for good without
+ *  curator_done, or its lane was closed: the main is told once, by the one hand-over of the curator's event) */
+function curatorEnd(laneId: string, how: 'done' | 'revoked' | 'ended', summary: string): void {
   const c = S.curator
   if (!c || c.lane !== laneId) return
   delete S.curator
   saveState()
-  if (c.event) events.note(c.event, how === 'done' ? { result: summary.slice(0, 600) || '(整理線沒有寫摘要)' } : { did: '主線收回記憶寫入權；還沒處理的記憶提案留著，下次整理再給' })   // M3 (PL1)
+  if (c.event) events.note(c.event, how === 'done' ? { result: summary.slice(0, 600) || '(整理線沒有寫摘要)' } : how === 'revoked' ? { did: '主線收回記憶寫入權；還沒處理的記憶提案留著，下次整理再給' }
+    : { did: `整理線沒有用 curator_done 交回寫入權就結束了（${summary.slice(0, 200)}）；寫入權已回到主線，還沒處理的記憶提案留著` })   // M3 (PL1)
   try { rmSync(memoryWriterFile()) } catch {}
   appendJsonl('lanes.jsonl', { lane: laneId, kind: 'write_right', to: 'main', how })
-  ledger({ lane: how === 'done' ? laneId : 'main', kind: 'action',
-    text: how === 'done' ? `整理線交回記憶寫入權：${summary.slice(0, 400)}` : `主線收回記憶寫入權（${laneId}）；還沒處理的記憶提案留在帳本，沒有丟。`, refs: { write_right: 'main', from: laneId } })
+  ledger({ lane: how === 'revoked' ? 'main' : laneId, kind: 'action',
+    text: how === 'done' ? `整理線交回記憶寫入權：${summary.slice(0, 400)}` : how === 'revoked' ? `主線收回記憶寫入權（${laneId}）；還沒處理的記憶提案留在帳本，沒有丟。`
+      : `整理線 ${laneId} 沒有交回記憶寫入權就結束了（${summary.slice(0, 300)}）；寫入權回到主線，還沒處理的記憶提案留在帳本，沒有丟。`, refs: { write_right: 'main', from: laneId, how } })
+  if (how === 'ended' && c.event) handToMain(c.event, S.lanes[laneId], `整理線 ${laneId} 沒有用 curator_done 交回記憶寫入權就結束了（${summary.slice(0, 300)}）。`
+    + '寫入權已經回到你手上，記憶目錄又只有你寫；它沒處理的記憶提案還開著（memory_decide 決定，或之後再 curate_memory）。', undefined, undefined, 1000)
   if (how === 'done') {          // 002k (D1): the curator went through the proposals it was given: none is left open for ever (M3 holds their state)
     const given = new Set(c.given ?? [])
     for (const { e, p } of proposalsOf(p => given.has(p.id) && !p.decision)) {
@@ -3971,6 +4026,8 @@ function closeLane(l: Lane, who: string, via: 'joey' | 'main'): { running: boole
   saveState()
   appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: !!run, title: l.title ?? null, grace_ms: run ? CLOSE_GRACE_MS() : 0 })
   const who2 = via === 'joey' ? 'Joey 用 /lanes close' : '主線用 lane_close'
+  // 002w (A, gap 7): a curator lane closed with no run going gives the write right back at once (a running one gives it back when its run ends: runEnded)
+  if (!run && S.curator?.lane === l.id) curatorEnd(l.id, 'ended', `${who2} 關閉了它`)
   if (!run) {
     // M3 (PL1): Joey's close is an inbound command: its record tells the main what the lane last did (the main's own lane_close it knows itself)
     if (via === 'joey') events.open(`lanes-close-${l.id}-${Date.now()}`, { class: 'joey', owner: 'router', lane: l.id, thread: l.thread, from: who, text: `/lanes close ${l.id}`, obligations: [],

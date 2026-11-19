@@ -259,7 +259,8 @@ the hook still denies the CLI. So the daemon is the only thing that completes a 
 **The lane stop.** The lane's Stop hook (lanes-hooks/lane-stop-hook.py) posts to `POST /lane-stop` with its run token (`LANE_RUN_TOKEN`; the port
 is `LANES_HTTP_PORT`, set by the daemon in the lane's environment). The daemon blocks once with the open obligations, or lets the run end.
 
-**The exit rule.** When a run ends, at whatever reason, its open obligations go to the main by the one hand-over transition, plus one M1 item.
+**The exit rule.** When a run's work ends, at whatever reason (`runEnded`, 002w A), the open obligations of its event set (its event, what rides in
+it, Joey's messages steered into it) go to the main by the one hand-over transition, one per event, plus one M1 item each.
 
 **The ring.** A critical event rings Joey once. The first line about it that reaches Joey with a ring meets the ring: the lane's `notify_joey` or
 `ask_joey` (the obligation is `met`), or the main's report on the event's hand-over (`rang`, `by: main`). If none has by `due_at`, the due sweep
@@ -283,9 +284,9 @@ which: information, the main in a turn (the item is pulled at its next boundary)
 
 | state | meaning |
 |---|---|
-| `queued` | waiting for a slot. Fields: `ev` (the event, without its channel payload), `priority`, `summary`, `enqueued`, `extra` (messages riding in it), `deaths`, `not_before` (the backoff after a death) |
+| `queued` | waiting for a slot. Fields: `ev` (the event, without its channel payload), `priority`, `summary`, `enqueued`, `extra` (messages riding in it), `deaths`, `not_before` (the backoff after a death), `steered` (002w: Joey's messages steered into an earlier run of it) |
 | `leased` | picked: `run` (the lane run id, e.g. `adam.reflex.3.r2`) |
-| `running` | spawned: `pid`, `budget` (the thread's budget state as the run starts) |
+| `running` | spawned: `pid`, `budget` (the thread's budget state as the run starts); a later `running` line adds `steered` when the steer hook hands Joey's message over (002w) |
 | `exited` | `reason`, `exit_code`, `signal`, `tokens` (what this run used), `budget` (the thread's budget state after it) |
 
 Every line also has `event`, `lane` and `attempt`.
@@ -310,8 +311,35 @@ How the reason is decided (exitReason):
 - Otherwise from the exit code: exit 0 with no signal is `normal`, anything else is `died`.
 - Never from the error text.
 
+**The end of a run (002w A) is one function, `runEnded`** (lanes.ts). Every way a run ends goes through it: the exit handler (every `reason`
+above), a run the daemon restart cut (`restore`, at boot), and a queued run refused before it starts (`budget`, `closed`, and `gone`: its lane is no
+longer in the state). The branches of the exit handler, restoreRuns and startRun's refusals no longer decide anything: each records what the run
+reached (its ledger lines, its `deaths`, the hand-over text) and calls it. It works over **the run's event set** (`runEvents`): the run's event, what
+rides in it (`extra`: a peer's coalesced messages, alert repeats, Joey's messages a run never reached), and every Joey message steered into a run of it
+(`steered`, E18). `steered` is on the run record: the daemon writes it (a `running` line with `steered`) when the steer hook hands a message over, the
+`queued` line of a re-run carries it, and restoreRuns reads it back. The lane stop, the exit rule, `runAgain`, the event a Joey line answers
+(`joeyEventOf`, `replyEventFor`) and the owner-relay check (`byJoeyRun`) read this one set; the run token no longer holds a list of its own. Before
+002w a re-run, a wall or a daemon restart dropped the steered messages (their Joey line was never asked about, never handed over, and the re-run's
+line went to the run's own event: gap 2), and `extra` was read by nobody (gap 3).
+
+What `runEnded` decides, in order:
+- **The re-run**: `died`, `timeout`, `restore` and `wall:*` are retryable. The run is queued again while its event set still owes the lane something,
+  or its task lane still owes its task (`runAgain`; `taskOwed` below). A wall is not an attempt (the attempt count goes back, no backoff); a death or
+  a timeout waits `attempt × LANES_RETRY_BACKOFF_MS`. 2a936a7 re-queued a walled run whatever it owed (002v round 1 G07, gap 5).
+- **The lanes' wall**: up on a wall; down on any other end of a run that reached the model (it wrote a result record or made a model call). 2a936a7
+  took it down on a `normal` exit only: a probe that got through and then died, timed out or hit a cap left `pump` paused until the next backoff
+  (gap 12). A refusal before the run and a restore never reached the model and move nothing.
+- Otherwise (not retryable, nothing owed, or after the third attempt) the run's work has ended:
+  - **a task lane's own duty** (`endTask`), when its closing call never came (`taskOwed`: a fan-out part without `report_result`, a synthesis
+    without `deliver_synthesis`, a curator holding the write right without `curator_done`): the part's result is what it reached, or 「沒有結果」, so
+    the synthesis starts (gap 6: only report_result, a cap and the last death did it); the synthesis hands what it reached to the main, the one
+    hand-over with a `carry` item (gap 6); the curator gives the write right back (`curatorEnd(…, 'ended')`) and the main is told once, by the one
+    hand-over of the curator's event (gap 7). `closeLane` does the same for a curator lane with no run going (a running one ends through its run);
+  - **the exit rule** over the event set: each event that still owes is handed over as itself. A run whose lane is gone goes through it too (gap 22:
+    it used to end with no decision at all).
+
 What happens next:
-- A wall is not an attempt: the event is queued again as it was, and the shared wall goes up.
+- A wall is not an attempt: the event is queued again as it was (while its set owes something), and the shared wall goes up.
 - A death or a timeout is run again after `attempt × LANES_RETRY_BACKOFF_MS`, while the event still owes something. After 3 attempts, the exit
   rule hands what is open to the main.
 - **An attempt's record** (002q, G06): the run keeps every tool call with its result. A death adds to the run's `deaths` (on its next `queued` line)
@@ -321,8 +349,8 @@ What happens next:
   item body (3800 characters).
 - At boot, a run left `leased` or `running` died with the daemon. It gets `exited(died, signal daemon-restart)`, its lanes.jsonl exit row and a
   lane_lifecycle ledger line, and its event runs again **only while it still owes the lane something** (002q, T6-R).
-- One rule decides every re-run (`runAgain`), a death, a timeout and a daemon restart alike: the event's folded record still has an obligation the
-  lane owes (or a Joey message steered into the run does), or the run is a fan-out part. Otherwise no new run: a `wake` line `no_wake` with
+- One rule decides every re-run (`runAgain`), a death, a timeout, a wall and a daemon restart alike: an event of the run's event set still has an
+  obligation the lane owes, or the run's task is not done (`taskOwed`). Otherwise no new run, and the exit rule writes a `wake` line `no_wake` with
   "owes nothing more". 002p re-ran a closed event after a daemon restart, and the lane, finding everything done, ended without a line.
 
 **Busy** is "the lane has a queued, leased or running record" (`laneBusy`). The journal is the queue: there are no queue files.
