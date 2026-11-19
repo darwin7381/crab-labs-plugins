@@ -152,14 +152,16 @@ test('PL7 P20: the fan-out synthesis is owed to the main through its M3 hand-ove
   expect(offers.length).toBe(m)                                                              // information alone wakes nobody
 })
 
-test('PL7 P20: the router\'s fallback (the router threw) gives the main an M3 record with a main obligation; its item is owed like any hand-over, done meets it', async () => {
+test('PL7 P20, 002w D: the router\'s fallback (the router threw) gives the main the event\'s own record from the one builder (toMain): a main obligation and what its class owes; its item is owed like any hand-over, done meets it', async () => {
   const k = offers.length
-  L.toMainDirect({ method: 'notifications/claude/channel', params: { content: '路由器壞掉時的訊息', meta: { user: 'joey_lab', message_id: '4040' } } }, 'telegram')
+  const meta = { user: 'joey_lab', message_id: '4040', chat_id: '1' }
+  L.toMainDirect({ id: 'tg-1-4040', source: 'telegram', from: 'joey', text: '路由器壞掉時的訊息', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '路由器壞掉時的訊息', meta } } } as any)
   await sleep(10)
   expect(offers.length).toBe(k + 1)
   const item = M().items(r => r.state === 'offered').at(-1)!
   const ev = L.__events().get(String(item.event))!
-  expect(ev).toMatchObject({ owner: 'main', class: 'joey' }); expect(String(ev.id)).toStartWith('direct-')
+  expect(ev).toMatchObject({ id: 'tg-1-4040', owner: 'main', class: 'joey' })                    // 002w D: its own record (2a936a7: a direct-… record, no Joey line)
+  expect((ev.obligations as any[]).find(o => o.kind === 'joey')).toMatchObject({ state: 'handed' })
   await mainTurn()
   expect((L.__events().get(ev.id)!.obligations as any[])[0]).toMatchObject({ kind: 'main', state: 'met' })
 })

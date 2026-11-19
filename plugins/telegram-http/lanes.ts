@@ -300,6 +300,7 @@ function mainEnv() {
     memory: () => memoryFacts(),
     // 002v (C04): the senders of the events the thread gate stopped (stopThread writes `stop` on the event record)
     stoppedPeers: (ids: string[]) => [...new Set(ids.flatMap(id => { const e = events?.get(id); return e?.stop && e.from ? [String(e.from).toLowerCase()] : [] }))],
+    toolDone: mainToolDone,                                                         // 002w (D): the main's own completion of a scheduler run
   }
 }
 
@@ -825,7 +826,7 @@ function toMain(ev: InEvent, d: Decision): void {
   if (d.target !== 'main' || D.role !== 'tg' || !main) return
   const p = (ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
-    : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text), meta: { ...(p.meta ?? {}) } } }
+    : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text ?? ''), meta: { ...(p.meta ?? {}) } } }
   const kind: ItemKind = ev.source === 'telegram' ? 'joey' : routerCfg().alert_senders.includes(ev.from) ? 'alert' : 'peer'
   // M3: an event the router gives the main owes the main (M4: that is what wakes it; M1 offers the item). 002p (T1-R E12): its class comes from the one
   // classifier (evClassOf over the event's trigger class) and what it owes from the one builder (eventObligations), exactly as a lane's event; given to the
@@ -833,15 +834,17 @@ function toMain(ev: InEvent, d: Decision): void {
   ev.trigger ??= triggerClass(undefined, ev) || undefined
   const cls = evClassOf(ev)
   recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...eventObligations(ev, cls).map(o => ({ ...o, state: 'handed',
-    ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: ev.text.slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
+    ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
   main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id })
 }
-/** server.ts: the router could not decide (it threw); the event still goes to the main, as the router's fallback does */
-export function toMainDirect(notif: Notif, source: 'telegram' | 'mesh'): void {
+/** 002w (D, gap 10): the router could not decide (it threw), for a Telegram message (server.ts) or a mesh one (/lanes/route): the event still goes to the
+ *  main through the one builder (toMain: its own record, what its class owes handed to the main, its M1 item), never a record of its own kind. A record the
+ *  router had already opened (it threw after) gets the one hand-over instead. */
+export function toMainDirect(ev: InEvent): void {
   if (D?.role !== 'tg' || !main) return
-  const p = (notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
-  oweMain(`direct-${Date.now().toString(36)}${shortId()}`, source === 'telegram' ? 'joey' : 'peer', notif,
-    { cls: source === 'telegram' ? 'joey' : 'peer', from: String(p.meta?.user ?? source), text: String(p.content ?? ''), via: source === 'telegram' ? 'tg' : 'inbox' })
+  routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: 'router-failed', target: 'main', lane: null, thread: null, note: 'the router threw: the event goes to the main' })
+  if (events.get(ev.id)) { handToMain(ev.id, undefined, `分流器處理這則訊息時出錯，交給主線：${ev.from}：${String(ev.text ?? '').slice(0, 600)}`); return }
+  toMain(ev, { rule: 'router-failed', target: 'main' })
 }
 
 /** Hop / budget gate for a mesh event entering a thread. Returns a stop note or null. */
@@ -938,16 +941,16 @@ export function triggerClass(r: Rule | undefined, ev: InEvent): string {
   // 002p (T1-R E12): the class is the event's, not the route's. An alert sender's event that a rule without a class of its own routed (unsigned, so
   // `mesh-alert` did not match and `default` gave it to the main; the master switch) is still that sender's alert, with the severity its alert rule
   // reads: a [P1][critical] owes Joey a ring wherever it went. 002o classed it by the item kind (`alert`, silent) and the main told Joey silently.
-  const k = r?.trigger ? r : alertRuleOf(ev.from) ?? r
+  // 002w (D, gap 17): any sender's, not only an alert sender's: a scheduler's event is `scheduled` wherever it goes, and owes its receipt
+  const k = r?.trigger ? r : senderRuleOf(ev.from) ?? r
   const t = k?.trigger ?? k?.id ?? ''
   if (k?.critical_regex && new RegExp(k.critical_regex, 'i').test(ev.text)) return `${t}-critical`
   if (k?.info_regex && new RegExp(k.info_regex, 'i').test(ev.text)) return `${t}-info`
   return t
 }
-/** the rule that says what an alert sender's events are: the first rule for that sender with a class (`trigger`) of its own */
-function alertRuleOf(from: string): Rule | undefined {
-  const cfg = routerCfg()
-  return cfg.alert_senders.includes(from) ? cfg.rules.find(x => !!x.trigger && Array.isArray(x.match.from) && (x.match.from as string[]).includes(from)) : undefined
+/** the rule that says what a sender's events are: the first rule for that sender (match.from) with a class (`trigger`) of its own */
+function senderRuleOf(from: string): Rule | undefined {
+  return routerCfg().rules.find(x => !!x.trigger && Array.isArray(x.match.from) && (x.match.from as string[]).includes(from))
 }
 
 /** Spec v3, stricter option (design/notify.md 「分級由分流器依訊息類型決定，不靠各條線自己判斷」): the tier of a
@@ -3688,15 +3691,33 @@ const laneTransports = new Map<string, { transport: StreamableHTTPServerTranspor
 // M3: a scheduler run's completion is its event's `receipt` obligation (run_id), met once across every event, every lane run and both paths a lane has:
 // the receipt tool, and the scheduler card's CLI (./bin/btcc-receipt complete N), which the lane guard hook hands to POST /lane-receipt and never lets run
 // (002l D14, 002m L6B4: a run completed twice). Whichever comes first meets it; the second is refused with what is still open. This is the only place that
-// completes a run at the scheduler.
-export async function completeRun(tok: RunTok, runId: string, outcome: string, summary: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string }> {
-  const v = events.request(tok.evId, via, { kind: 'receipt', level: 'run', run_id: runId }, outcome === 'failed' ? 'failed' : undefined)   // PL2: requested
-  if (!v.ok) { logos('lane.receipt_dup', { lane: tok.lane, run: tok.runId, run_id: runId, via }); return { ok: false, text: v.why! } }
-  const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome, summary: typeof summary === 'string' ? summary : undefined })
-  const answer = r ? String(r.text ?? JSON.stringify(r)) : null
-  events.result(tok.evId, v.ob?.id, answer != null, { ref: answer?.slice(0, 120) ?? null, why: 'the scheduler did not answer' })   // met on the scheduler's answer
-  logos('lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: answer != null })
+// completes a run at the scheduler for a lane. 002w (D, gap 17): a receipt handed to the main is met the same way (meetReceipt) when the main completes the
+// run itself (its ./bin/btcc-receipt complete N, seen at its PostToolUse: mainToolDone); the main has no lane guard, so its CLI is what reached the scheduler.
+async function meetReceipt(evId: string, runId: string, outcome: string, via: string, complete: () => Promise<string | null>): Promise<{ ok: boolean; text: string; dup?: boolean }> {
+  const v = events.request(evId, via, { kind: 'receipt', level: 'run', run_id: runId }, outcome === 'failed' ? 'failed' : undefined)   // PL2: requested
+  if (!v.ok) return { ok: false, text: v.why!, dup: true }
+  const answer = await complete()
+  events.result(evId, v.ob?.id, answer != null, { ref: answer?.slice(0, 120) ?? null, why: 'the scheduler did not answer' })   // met on the scheduler's answer
   return { ok: answer != null, text: answer ?? `the scheduler did not answer: run ${runId} is not completed yet (the receipt is still owed; try again)` }
+}
+export async function completeRun(tok: RunTok, runId: string, outcome: string, summary: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string }> {
+  const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
+    const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome, summary: typeof summary === 'string' ? summary : undefined })
+    return r ? String(r.text ?? JSON.stringify(r)) : null
+  })
+  logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok })
+  return { ok: c.ok, text: c.text }
+}
+const RECEIPT_CLI = /(?:^|[\s;&|(])(?:\S*\/)?bin\/btcc-receipt\s+complete\s+['"]?(\d+)/g
+/** 002w (D, gap 17): a tool call of the main went through (PostToolUse): a ./bin/btcc-receipt complete N in it completed scheduler run N, so the receipt the
+ *  main owes for N (handed to it) is met, through the same transition as a lane's (meetReceipt) */
+function mainToolDone(name: string, input: any, response: string, error: boolean): void {
+  if (name !== 'Bash' || error || !events) return
+  for (const m of String(input?.command ?? '').matchAll(RECEIPT_CLI)) {
+    const run = m[1]
+    for (const e of events.rows(r => r.state === 'open')) if (events.mainObs(e.id).some(o => o.kind === 'receipt' && o.run_id === run))
+      void meetReceipt(e.id, run, 'done', 'main (btcc-receipt)', async () => response.slice(0, 200) || 'completed')
+  }
 }
 function laneBearer(req: IncomingMessage): string | null {
   const m = String(req.headers['authorization'] ?? '').match(/^Bearer\s+(\S+)$/i)
@@ -4416,7 +4437,11 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
   if (!D.authOk(req.headers['authorization'] as string | undefined)) { sendJson(res, 403, { error: 'loopback token required' }); return true }
   const p = u.pathname
   if (D.role === 'tg') {
-    if (p === '/lanes/route' && req.method === 'POST') { sendJson(res, 200, await routeEvent(await readBody(req) as InEvent)); return true }
+    if (p === '/lanes/route' && req.method === 'POST') {                    // the inbox daemon's mesh message; 002w (D): a router failure is the main's, through the one builder
+      const ev = await readBody(req) as InEvent
+      sendJson(res, 200, await routeEvent(ev).catch((e): Decision => { D.log('error', `lanes: router failed on ${ev.id} (${e}): main`); toMainDirect(ev); return { rule: 'router-failed', target: 'main' } }))
+      return true
+    }
     // M2/M1: every hook event of the main (lanes-hooks/main-hook.py); the reply is what the hook prints
     if (p === '/lanes/main-event' && req.method === 'POST') {
       const b = await readBody(req)

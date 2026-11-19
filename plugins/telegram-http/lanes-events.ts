@@ -46,10 +46,9 @@ const RANK: Record<string, number> = { none: 0, line: 1, decision: 2 }
 const SEV: Record<Outcome, number> = { normal: 0, changed: 1, failed: 2 }
 /** still owed: nothing has met it yet (a request in flight is not a delivery) */
 export const owing = (o: Ob): boolean => o.state === 'open' || o.state === 'requested'
-/** 002q (T7-R, T8-R, T6-R): what keeps an event open. Owed by whoever holds it: an open or requested obligation, or a Joey line or a peer answer
- *  handed to the main (the main meets those: its reply, its send_to_agent). A handed receipt is not the main's to send (nothing it has completes a
- *  scheduler run after the lane ended): it stays `handed` on the record and does not hold the event open. */
-export const owed = (o: Ob): boolean => owing(o) || (o.state === 'handed' && (o.kind === 'joey' || o.kind === 'peer'))
+/** 002q (T7-R, T8-R, T6-R): what keeps an event open. Owed by whoever holds it: an open or requested obligation, or a Joey line, a peer answer or a
+ *  scheduler receipt handed to the main (the main meets those: its reply, its send_to_agent, and since 002w D its own ./bin/btcc-receipt complete N). */
+export const owed = (o: Ob): boolean => owing(o) || (o.state === 'handed' && (o.kind === 'joey' || o.kind === 'peer' || o.kind === 'receipt'))
 
 export type EventsApi = ReturnType<typeof createEvents>
 export function createEvents(J: Journal) {

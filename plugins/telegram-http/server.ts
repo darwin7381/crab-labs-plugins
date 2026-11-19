@@ -2531,7 +2531,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
       reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.message_thread_id,
     }
     const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
-    if (!d) Lanes.toMainDirect(notification, 'telegram')                 // the router decided nothing: the main's delivery ledger takes it
+    if (!d) Lanes.toMainDirect(ev)                                       // 002w (D): the router decided nothing: the main gets it through the one builder
     return
   }
   // In ROAMER_MODE, route to the current target's MCP session only,
@@ -3368,7 +3368,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           btcc_msg_id: btccMsgId != null ? String(btccMsgId) : undefined,
         }
         const d = await Lanes.routeRemote(ev)                            // target main: the tg daemon queued it for the main (M1)
-        if (!d) broadcastNotification(notification)                       // router unreachable: the fleet path (any open session of this agent)
+        // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
+        // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
+        if (!d) broadcastNotification(notification)
         else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)   // 開工回執: a lane took the scheduled run (its run id from the meta)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))

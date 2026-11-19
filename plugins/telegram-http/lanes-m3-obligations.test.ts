@@ -842,6 +842,7 @@ test('PL2 P6 (E02, G05, G06, B08, T6-R): the exit rule is the one hand-over: the
     expect(E().get(id)!.state).toBe('open')
     E().set(id, o => o.kind === 'joey' && o.state === 'handed', { state: 'met', by: 'main', ref: '7099' })      // the main's line (mainReplied, played above)
     if (id === p.id) { expect(E().get(id)!.state).toBe('open'); await L.mainSentTo('eve', E().get(id)!.thread, null, '可以', '7100', true) }   // the main still owed eve its promised answer
+    if (id === s.id) { expect(E().get(id)!.state).toBe('open'); E().set(id, o => o.kind === 'receipt' && o.state === 'handed', { state: 'met', by: 'main (btcc-receipt)' }) }   // 002w D: the receipt handed to the main is the main's (its ./bin/btcc-receipt, lanes-w-d)
     expect(E().get(id)!.state).toBe('closed')
   }
 })
@@ -1135,8 +1136,8 @@ test('002q T6-R: a give-up hand-over of an event that owes Joey no line (high fr
   expect(ob(s.id, 'joey')).toMatchObject({ state: 'met', by: 'main', ref: '3401' })
   expect(E().get(s.id)!.main_sends).toEqual([expect.objectContaining({ to: 'joey', ref: '3401' })])
   await m.stop()
-  expect(E().get(s.id)!.state).toBe('closed')                                                  // the receipt stays handed: not the main's to send
-  expect(ob(s.id, 'receipt').state).toBe('handed')
+  expect(ob(s.id, 'receipt').state).toBe('handed')                                             // 002w D: the receipt handed to the main is the main's: the event
+  expect(E().get(s.id)!.state).toBe('open')                                                    // stays open until the main completes the run (lanes-w-d)
 })
 
 // 002q (M3, 002p H06 turn 881e8cb1): the main's Stop check holds a turn once while it owes Joey a line: the events of the items bound to the prompt whose

@@ -61,7 +61,7 @@ answers: a main whose user settings carry their own Stop hook (the fleet's `chec
 
 How items move:
 - **Owed** (M4's one wake rule): an item is owed to the main only while its event carries an open `main` obligation (`toMain`'s record, a hand-over,
-  the synthesis's hand-over, a renew brief's `renew-…` record, the router fallback's `direct-…` record). An item with no such obligation is never
+  the synthesis's hand-over, a renew brief's `renew-…` record). An item with no such obligation is never
   offered or pulled; the digest never is.
 - **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main, with the digest riding on it.
   An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
@@ -169,17 +169,23 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
 **Every inbound event has a record, whatever its route** (one helper in the router, `recordInbound`): one given to a lane (with what it owes),
 one given to the main (a hand-over owed to it, plus what its class owes, already `handed`: the same obligations a lane's event opens with, from one
 builder; 002p), and one the router keeps to itself: a `no_reply` notice, a peer message held by a hold or a flood
-gate, an alert repeat, a message on a stopped thread. A hand-over never creates a record. What the main must know about an event is a field of its
+gate, an alert repeat, a message on a stopped thread. 002w (D, gap 10): the router's failures go through the same builder: a Telegram message the
+router threw on (server.ts) and a mesh message it threw on (`POST /lanes/route` answers `{rule: router-failed, target: main}`, so the inbox daemon
+does not broadcast it) are given to the main by `toMainDirect` = `toMain` (their own record, what their class owes handed to the main, their M1 item);
+a record the router had already opened gets the one hand-over. 2a936a7 opened a `direct-…` record with a main obligation only (no Joey line: the owed
+hold never held, the main's reply met nothing) and the inbox daemon broadcast a mesh message to every open session. What remains broadcast is a mesh
+message when the tg daemon itself cannot be reached (there is no M1 to queue into). A hand-over never creates a record. What the main must know about an event is a field of its
 record (below); the ledger (`ledger.jsonl`) is an audit log that no view and no state reads.
 
 | state | meaning |
 |---|---|
 | `open` | something is still owed: an obligation is `open` or `requested`, or a Joey line or a peer answer is `handed` to the main |
-| `closed` | nothing is owed (every obligation is `met`, `dropped` or `merged`, or a receipt `handed`; an event with no obligations is closed at once) |
+| `closed` | nothing is owed (every obligation is `met`, `dropped` or `merged`; an event with no obligations is closed at once) |
 
 002q (T7-R, T8-R, T6-R): a Joey line or a peer answer handed to the main is owed by the main, so it keeps the event open until the main's reply or
-send meets it. 002p closed the event when the hand-over's M1 item was done, with the line still owed. A handed receipt does not hold the event
-open: nothing the main has completes a scheduler run after the lane ended.
+send meets it. 002p closed the event when the hand-over's M1 item was done, with the line still owed. 002w (D, gap 17): a receipt handed to the main
+is the main's too and holds the event open until the main completes the run (its own `./bin/btcc-receipt complete N`, below); before, a handed
+receipt was never met and its event closed with the scheduler run still open.
 
 Fields:
 - `class`: `scheduled`, `peer`, `joey`, `alert` or `critical` (`followup` is no longer written). The router writes it from the routing rule's
@@ -227,7 +233,9 @@ Fields:
 - `router_sends`: `[{to: joey, ref, at, rule}]` (002q, T8-R): a router line about this event, delivered (the asked-restart notice). It meets the
   event's Joey line still owed (`by: router (asked-restart)`, `ref` = the message id).
 - `class`: the event's own class, whatever rule routed it (002p): an alert sender's event has its alert rule's class and severity (`critical` for a
-  `[P1][critical]`) even when a rule without a class of its own (`default`, the master switch) gave it to the main.
+  `[P1][critical]`) even when a rule without a class of its own (`default`, the master switch) gave it to the main. 002w (D, gap 17): any sender's
+  (`senderRuleOf`: the first rule for that sender with a class of its own): a scheduler's event is `scheduled` wherever it goes, and owes its receipt
+  (2a936a7 classed it `peer` under the master switch, the screen or `default`, with no receipt).
 
 | kind | levels | met by |
 |---|---|---|
@@ -265,7 +273,12 @@ The one rule: a lane's outbound call asks to meet an obligation of its event.
 then call the scheduler. The lane guard hook (lane-guard-hook.py, PreToolUse on Bash) does not let the CLI run: it posts the request to
 `POST /lane-receipt` with the run's token and denies the Bash call with the daemon's answer. The first request completes the run; any later one, by
 either path and from any event, is refused ("already completed"). `./bin/btcc-receipt ack` is not a completion and runs as it is. Without the daemon
-the hook still denies the CLI. So the daemon is the only thing that completes a run at the scheduler.
+the hook still denies the CLI. So the daemon is the only thing that completes a run at the scheduler for a lane.
+
+002w (D, gap 17): a receipt handed to the main (the exit rule, a hand-over, an event the router gave the main) is the main's. The main has no lane
+guard: its own `./bin/btcc-receipt complete N` reaches the scheduler. At the PostToolUse of that Bash call the daemon meets the receipt for run N that
+the main owes (`mainToolDone` → `meetReceipt`, the same request/result transition as a lane's completeRun, by `main (btcc-receipt)`); the main's Stop
+check names a receipt still owed (step 2 of the main's Stop).
 
 **Stopping a conversation** (002w C) is one function, `stopThread`: the event record's `stop`, the thread `stopped` and its queued peer events drained,
 the router's stop notice to the peer (marked no_reply, the `stop-notice` obligation), and the one hand-over of the event to the main. Every place that

@@ -67,6 +67,8 @@ export type MainEnv = {
   /** 002v (C04): of these events, the senders of those the router's thread gate stopped (the event record's `stop`): the main's answer to them
    *  in the turn that took the stop in is the last line of that conversation, so the router marks it no_reply ("不用回" is the router's) */
   stoppedPeers?: (events: string[]) => string[]
+  /** 002w (D): a tool call of the main went through (its PostToolUse): the daemon meets what it completed (a scheduler receipt) */
+  toolDone?: (name: string, input: any, response: string, error: boolean) => void
 }
 
 export type MainEvent = {
@@ -346,6 +348,7 @@ export function createMain(E: MainEnv) {
           to: String(b.tool_input.to ?? (n.endsWith('__reply') ? 'Joey' : '')), reply_to: String(b.tool_input.reply_to ?? ''), text: String(b.tool_input.text) })
         { const list = calls.get(p) ?? calls.set(p, []).get(p)!; list.push({ name: n, input: b.tool_input ?? {}, result: String(b.tool_response ?? ''), error: !!b.tool_error }); if (list.length > 40) list.shift() }
         setMain(J().get('main', g.id)!, 'in_turn', { tool_open: null })
+        try { E.toolDone?.(n, b.tool_input ?? {}, String(b.tool_response ?? ''), !!b.tool_error) } catch (e) { E.log('warn', `lanes: toolDone ${n}: ${e}`) }
         const got = pull(J().get('main', g.id)!, p)
         return got.length ? { additionalContext: renderPulled(got) } : {}
       }
