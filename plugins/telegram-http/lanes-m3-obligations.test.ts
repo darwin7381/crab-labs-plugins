@@ -11,6 +11,15 @@ import { createServer } from 'http'
 process.env.LANES_FLOOD_CONTROL = '0'
 // the scheduler, as the inbox daemon reaches it (POST /lanes/scheduler): every completion is counted here
 const schedCalls: any[] = []
+// 002s: a local stand-in for Jev, used only where a test points TYPESAFE_BASE_URL at it (the line-news check)
+let newsP: number | null = 0.02
+const jevCalls: any[] = []
+const jevSrv = createServer((req, res) => { let b = ''; req.on('data', c => b += c); req.on('end', () => { const q = JSON.parse(b || '{}'); jevCalls.push(q)
+  if (newsP == null) { res.writeHead(500); res.end('{}'); return }
+  res.end(JSON.stringify({ answers: Object.fromEntries(Object.keys(q.questions ?? {}).map(k => [k, { type: 'noul', noul: newsP }])) })) }) })
+await new Promise<void>(r => jevSrv.listen(0, '127.0.0.1', () => r()))
+const withJev = async <T>(f: () => Promise<T>): Promise<T> => { process.env.TYPESAFE_BASE_URL = `http://127.0.0.1:${(jevSrv.address() as any).port}`; process.env.TYPESAFE_API_KEY = 'test-key'
+  try { return await f() } finally { delete process.env.TYPESAFE_BASE_URL; delete process.env.TYPESAFE_API_KEY } }
 const schedSrv = createServer((req, res) => { let b = ''; req.on('data', c => b += c); req.on('end', () => { schedCalls.push({ path: req.url, ...JSON.parse(b || '{}') }); res.end(JSON.stringify({ text: '{"state":"completed"}' })) }) })
 await new Promise<void>(r => schedSrv.listen(0, '127.0.0.1', () => r()))
 process.env.LANES_INBOX_PORT = String((schedSrv.address() as any).port)
@@ -49,7 +58,7 @@ const sent: Array<{ text: string; silent: boolean; replyTo?: number }> = [], mes
 L.__setMeshSend(async b => { mesh.push(b); return { text: `sent to ${b.to}`, msgId: 70000 + mesh.length, delivered: true } })
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
   sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo }); return 9000 + sent.length }, joeyChatId: () => '1' } as any)
-afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; schedSrv.close(); laneSrv.close(); L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
+afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; schedSrv.close(); jevSrv.close(); laneSrv.close(); L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
 // the daemon's lane routes (/lane-stop, /lane-receipt) on a real port, for the lane hooks run as processes
 const laneSrv = createServer(async (req, res) => { if (!(await L.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res))) res.writeHead(404).end() })
 await new Promise<void>(r => laneSrv.listen(0, '127.0.0.1', () => r()))
@@ -96,8 +105,10 @@ test('the router opens the record with the obligations of the class: scheduled (
   expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])                                  // the scheduler's tag is a router field: no prompt regex in any hook
   // 002r (T2-R E5): it owes Joey nothing, so "nothing new" is refused (the record grows no Joey line)
   const before = sent.length
-  expect(await call(h.tok, 'notify_joey', { outcome: 'normal', text: 'run:42 與上次相同，無變化' })).toContain('owes Joey no line')
+  newsP = 0.02; jevCalls.length = 0
+  expect(await withJev(() => call(h.tok, 'notify_joey', { outcome: 'normal', text: 'run:42 與上次相同，無變化' }))).toContain('owes Joey no line')
   expect(sent.length).toBe(before); expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])
+  expect(jevCalls.length).toBe(1); expect(jevCalls[0].state.line).toContain('無變化'); expect(Object.keys(jevCalls[0].questions)).toEqual(['news'])
   await call(h.tok, 'receipt', { outcome: 'nothing-to-do', run_id: '42' })
   await end(h.lane)
   expect(E().get(h.id)!.state).toBe('closed')
@@ -105,6 +116,20 @@ test('the router opens the record with the obligations of the class: scheduled (
   expect(await call(h2.tok, 'notify_joey', { outcome: 'changed', text: 'run:942：consecutive_failures 由 1 變 2' })).toContain('sent to Joey')
   expect(sent.length).toBe(before + 1); expect(ob(h2.id, 'joey')).toMatchObject({ state: 'met', level: 'line' })
   await call(h2.tok, 'receipt', { outcome: 'done', run_id: '942' }); await end(h2.lane)
+  // 002s (T2-R E8, 002r r3): a line that carries news is not refused for its label: `normal` ("still in the normal range") goes out as changed
+  const h3 = await start(sched(943, 'heartbeat', '[high-frequency]'))
+  newsP = 0.96; jevCalls.length = 0
+  expect(await withJev(() => call(h3.tok, 'notify_joey', { outcome: 'normal', text: 'run:943：status ok，p95 260ms（上次 180ms，+80ms），仍在正常範圍' }))).toContain('sent to Joey')
+  expect(sent.length).toBe(before + 2); expect(jevCalls.length).toBe(1); expect(ob(h3.id, 'joey')).toMatchObject({ state: 'met', level: 'line' }); expect(E().get(h3.id)!.outcome).toBe('changed')
+  await call(h3.tok, 'receipt', { outcome: 'done', run_id: '943' }); await end(h3.lane)
+  const h4 = await start(sched(944, 'heartbeat', '[high-frequency]'))                      // the judge fails: the line goes out, never dropped on a failed call
+  newsP = null
+  expect(await withJev(() => call(h4.tok, 'notify_joey', { outcome: 'normal', text: 'run:944：與上次相同' }))).toContain('sent to Joey')
+  expect(sent.length).toBe(before + 3)
+  await call(h4.tok, 'receipt', { outcome: 'done', run_id: '944' }); await end(h4.lane)
+  const s2 = await start(sched(945)); jevCalls.length = 0; newsP = 0.02                    // an event that owes a line is not judged: its normal line goes out
+  expect(await withJev(() => call(s2.tok, 'notify_joey', { outcome: 'normal', text: '備份正常' }))).toContain('sent to Joey'); expect(jevCalls.length).toBe(0)
+  await call(s2.tok, 'receipt', { outcome: 'done', run_id: '945' }); await end(s2.lane)
   const ev = journal().filter(l => l.rec === 'event' && l.id === s.id)
   expect(ev[0]).toMatchObject({ state: 'open', class: 'scheduled' }); expect(ev.some(l => l.tool === 'notify_joey')).toBe(true)
 })

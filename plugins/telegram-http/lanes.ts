@@ -2920,6 +2920,22 @@ function ownerClaimWarning(tok: RunTok, e: Row | undefined, text: string): strin
  *  `decision` (the escalated tier: it rings; the main reads it in its digest); any other notify_joey is a line with its outcome. notify_joey's
  *  outcome is required: a call without one is refused (nothing is journaled or sent). */
 const NOTIFY_OUTCOMES = ['normal', 'changed', 'failed', 'needs_you']
+const LINE_NEWS_P = (): number => Number(process.env.LANES_LINE_NEWS_P ?? 0.3)
+/** model aid (002s): does a routine check's line carry news? Calibrated on the real lane-written texts of 002o..002r: 49 lines with news (a changed
+ *  value, an action taken, a new problem) scored 0.74 or more, the real "same as the last run" line 0.02, 45 of 51 no-change texts under 0.3.
+ *  true / false; null = the call failed (the caller lets the line out: a line too many is cheaper than a change Joey never hears of). */
+async function lineNews(lane: Lane, tok: RunTok, text: string): Promise<boolean | null> {
+  const r = await jevAsk(
+    { setting: 'A routine scheduled check ran and wrote `line` as its report. The check compares the current state with the previous run of the same check.', line: text.slice(0, 1500) },
+    { news: { type: 'noul', instructions: 'Compared with the previous run of the same check, does `line` report something new: a value or status that is different now, an action that was taken, or a problem that was not there before?',
+      criteria: { true: 'The line states a difference from the previous run (a number went up or down, a status changed, something recovered or newly failed), or an action taken now (a restart, a rerun, an escalation)',
+        false: 'The line describes the same state as the previous run: nothing changed, including a failure or an open problem that was already known and is unchanged, and no action was taken' } } },
+    'genesis-line-news/1', undefined,
+    { dir: LANES_DIR, site: 'line-news', inputs: { lane: lane.id, run: tok.runId, text: text.slice(0, 200) }, p: a => a.news?.noul })
+  const p = r.answers?.news?.noul
+  if (r.error || typeof p !== 'number') { D.log('warn', `lanes: line-news check for ${lane.id} failed (${r.error ?? 'no answer'}); the line goes out`); return null }
+  return p >= LINE_NEWS_P()
+}
 async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey', a: any): Promise<string> {
   const text = String(a.text ?? '').trim()
   if (!text) throw new Error('empty text')
@@ -2931,7 +2947,10 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   { const back = await reportCheck(lane, tok, tool, text); if (back) return back }
   const evId = joeyEventOf(tok)
   if (!decision) { const w = ownerClaimWarning(tok, events.get(evId), text); if (w) return w }
-  const outcome: Outcome | undefined = decision ? outcomeArg(a) : said as Outcome
+  // 002s (T2-R E8): an event the router opened with no Joey line (a high-frequency routine). The lane's label does not decide alone: the line is
+  // judged (lineNews). News goes out as `changed`; a line that says nothing changed keeps `normal` and M3 refuses it; a failed call lets it out.
+  const noLine = !decision && said === 'normal' && (() => { const e0 = events.get(evId); return !!e0 && e0.class !== 'joey' && !((e0.obligations ?? []) as Ob[]).some(o => o.kind === 'joey') })()
+  const outcome: Outcome | undefined = decision ? outcomeArg(a) : noLine && (await lineNews(lane, tok, text)) !== false ? 'changed' : said as Outcome
   const shown: Outcome = outcome ?? (decision ? 'changed' : 'normal')
   const r0 = joeyRendering(events.get(evId), tok, lane, level, undefined, text, shown)
   // PL2: requested (a decision raises a line already met); 002q: one line per matter

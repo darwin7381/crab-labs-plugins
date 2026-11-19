@@ -25,6 +25,11 @@ made tool calls after its last delivered reply / send_to_agent (`turn.calls`, th
 result a sender asked for which no output of the turn contains. Yes = the turn is held once, with fixed words. The question and its
 threshold were calibrated on the real turns of universes 002o, 002p and 002q (59 recap or waiting texts after a reply: highest 0.37;
 the real unsent answer: 0.99).
+
+002s, the unrecorded promise (universe 002r, C07; T6-R, T7-R): a turn that sent a peer a message and called no `commitment` is asked, per
+message, whether it promises the recipient something by a stated time. Yes = the turn is held once with the message quoted. Over the 100
+distinct messages the main sent peers in 002o..002r: 78 scored under 0.1, the clear promises 0.93 or more, the relayed ones ("Joey 決定：
+週五前…") 0.5 to 0.8; the threshold is 0.5.
 """
 import json
 import os
@@ -48,6 +53,17 @@ UNSENT_Q = {'type': 'noul',
             'instructions': 'Does `final_text` state an answer, a result or a figure that a sender of `messages` asked for, which no item of `outputs` already told that sender?',
             'criteria': {'true': 'final_text gives the asked-for answer or result, and no output contains it: the outputs only acknowledge, report progress, or promise it for later',
                          'false': 'what final_text states was already sent in an output, or final_text only describes what was sent or done, or says the agent is still waiting'}}
+PROMISE_P = float(os.environ.get('ANSWERED_GATE_PROMISE_P', '0.5'))
+PROMISE_SETTING = 'An operations agent sent each item of `messages` to a colleague.'
+
+
+def promise_q(i):
+    return {'type': 'noul',
+            'instructions': f'Does the item of `messages` with id {i} promise its recipient that something will be delivered, done or answered by a stated time or date?',
+            'criteria': {'true': 'The message commits to a concrete time or date by which the recipient gets a deliverable, a result or an answer (for example: by Friday, before 12:00 tomorrow, within 30 minutes)',
+                         'false': 'The message promises nothing, or says someone will reply or decide later without stating by when, or refuses, or only reports facts'}}
+
+
 UNSENT_WORDS = ('這一輪先不要結束。你最後寫的那段結果只出現在你自己的畫面上，對方看不到。'
                 '要讓他知道，現在用 reply（給 Joey）或 send_to_agent（給同伴）發出去；內容其實都發過了的話，直接結束即可。')
 
@@ -232,7 +248,8 @@ def _save(sp, st):
 
 def _reason(p, msgs, outs, turn=None):
     sid, d = p.get('session_id') or '', lanes_run_dir(p)
-    return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn if isinstance(turn, dict) else {})
+    turn = turn if isinstance(turn, dict) else {}
+    return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn) or _promised(p, sid, d, outs, turn)
 
 
 def _unsent(p, sid, d, msgs, outs, turn):
@@ -260,6 +277,45 @@ def _unsent(p, sid, d, msgs, outs, turn):
         return None
     st[key] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
     return UNSENT_WORDS if _save(sp, st) else None
+
+
+def promise_ps(peer_outs):
+    """Jev's probability, per message to a peer, that it promises the recipient something by a stated time. One request."""
+    M = [{'id': f'P{i}', 'to': o['to'], 'text': o['text'][:OUT_MAX]} for i, o in enumerate(peer_outs, 1)]
+    a = ask({'setting': PROMISE_SETTING, 'messages': M}, {x['id']: promise_q(x['id']) for x in M})
+    return [(a.get(x['id']) or {}).get('noul') for x in M]
+
+
+def _promised(p, sid, d, outs, turn):
+    """002s (002r C07; T6-R, T7-R): identity rule 5 承諾必入帳. The turn told a peer that something comes by a stated time and called no
+    `commitment`: over 002o..002r 8 of 11 such turns recorded nothing, so nothing would ring when the time passed. Located in code (a message to a
+    peer, no commitment call among the turn's calls), judged by Jev (is it a time-bound promise), held once per turn."""
+    peers = [o for o in outs if str(o.get('to') or '').strip() and str(o['to']).strip().lower() != 'joey'][-6:]
+    if not peers or any(isinstance(c, dict) and str(c.get('name') or '').endswith('__commitment') and not c.get('error') for c in (turn.get('calls') or [])):
+        return None
+    sp = os.path.join(d, 'answered-gate.json')
+    st, key = _load(sp), f"{sid}:promise:{turn.get('prompt_id') or p.get('prompt_id') or ''}"
+    if key in st:
+        return None
+    try:
+        ps = promise_ps(peers)
+    except Exception as e:                               # a failed call is an error, never a verdict
+        record(d, {'session': sid, 'promise': {'messages': len(peers)}, 'error': f'{type(e).__name__}: {e}'[:200], 'ms': CALL.get('ms')})
+        jev_log(d, 'promise-gate', CALL.get('question'), {'session': sid, 'messages': len(peers)}, None, None, CALL.get('ms'), CALL.get('error'))
+        return None
+    top = max([x for x in ps if isinstance(x, (int, float))], default=None)
+    jev_log(d, 'promise-gate', CALL.get('question'), {'session': sid, 'messages': len(peers)}, CALL.get('answers'), top, CALL.get('ms'), None)
+    mode = os.environ.get('ANSWERED_GATE_MODE', 'enforce')
+    hit = [o for o, x in zip(peers, ps) if isinstance(x, (int, float)) and x >= PROMISE_P]
+    record(d, {'session': sid, 'mode': mode, 'ms': CALL.get('ms'), 'promise': {'messages': len(peers), 'p': ps}, 'blocked': ['promise'] if hit and mode != 'shadow' else []})
+    if not hit or mode == 'shadow':
+        return None
+    st[key] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+    if not _save(sp, st):
+        return None
+    lines = '\n'.join(f"- 給 {o['to']}：「{' '.join(o['text'].split())[:200]}」" for o in hit)
+    return ('這一輪先不要結束。你這一回合對同伴說了某件事會在某個時間前完成或回覆，這是承諾，帳本裡還沒有：\n' + lines +
+            '\n用 commitment 記下來（對象、內容、期限），到期沒完成系統才會提醒。如果那句話其實沒有答應期限，直接結束即可。')
 
 
 def _missed(p, sid, d, msgs, outs):
