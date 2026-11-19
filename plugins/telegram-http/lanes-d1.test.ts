@@ -107,12 +107,29 @@ test('D1: the digest lists every open Joey-sourced proposal again (no new activi
   const ack = (t: any) => { if (t) L.__journal().write('msg', `dg-d1-${Date.now()}`, 'done', { kind: 'digest', events: t.fields.events }) }
   const t1 = L.__digest()!
   expect(t1.text).toContain(`記憶提案 ${pid}｜`); expect(t1.text).toContain('還沒決定（Joey 說的話）'); expect(t1.text).toContain('需主線：用 memory_decide 決定'); expect(t1.text).toContain('一律 09:00')
-  expect(t1.text).not.toContain(eid)                                                                       // Eve's was not said by Joey: not re-listed
+  expect(t1.text).toContain(`記憶提案待決定：${eid}`); expect(t1.text).not.toContain(`記憶提案 ${eid}｜`)      // 002u: Eve's shows its id on its event's line, once (not a standing line)
   ack(t1)
   expect(L.__main().items(r => r.kind !== 'digest').length).toBe(0)                                        // nothing is owed to the main: a proposal never wakes it
   expect(L.__digest()!.text).toContain(pid)                                                                // nothing new, but the next delivery carries it again
+  expect(L.__digest()!.text).not.toContain(eid)                                                            // Eve's was not said by Joey: not re-listed
   await decide({ proposal_id: pid, decision: 'veto', reason: '先不記' })
   expect(L.__digest()).toBeNull()                                                                          // decided: gone, and a quiet record gives no digest
+})
+
+test('002u: every proposal shows the id memory_decide takes where its description says it is: the event\'s line (digest, activity list) and ledger_query(kind=memory_proposal)', async () => {
+  // zero-token D01/D03 probe (u002t-Z93): Eve's proposal was 「記憶提案 1 筆待決定」 in the digest and the lane's text alone in ledger_query; no surface named
+  // its id, so the main could not decide it (memory_decide refuses without one)
+  writeFileSync(join(dir, 'ledger.jsonl'), '')
+  const e = run('mesh', 'eve', 'peer', 'reflex')
+  L.__events().open(e.evId, { class: 'peer', owner: e.lane, lane: e.lane, thread: st.lanes[e.lane].thread, from: 'eve', text: 'x', obligations: [] })
+  const eid = idOf(await L.callLaneTool(e, 'ledger_write', { kind: 'memory_proposal', text: 'Eve 的稿件排程一律 10:00' }))
+  expect(L.activityList(undefined)).toContain(`記憶提案待決定：${eid}`)
+  const q = L.ledgerQueryTool({ kind: 'memory_proposal' })
+  expect(q).toContain(`｜${eid}｜Eve 的稿件排程一律 10:00`)
+  const out = await decide({ proposal_id: eid, decision: 'veto', reason: 'Eve 的稿件排程不是 adam 的規則' })
+  expect(out).toContain(`vetoed: ${eid}`)
+  expect(L.ledgerQueryTool({ kind: 'memory_decision' })).toContain(`｜${eid}｜記憶提案 ${eid}：否決`)       // the decision row names it too
+  expect(L.activityList(undefined)).not.toContain(`記憶提案待決定：${eid}`)                               // decided: no longer open on its line
 })
 
 test('D1: while the curator holds the write right accept is refused and veto is not; when it hands the right back, the Joey-sourced proposals it was given are closed as curated', async () => {

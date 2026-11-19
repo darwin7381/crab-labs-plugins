@@ -183,6 +183,10 @@ const isTold = (r: LedgerRec): boolean => r.kind === 'action' && /^(reply_agent|
  *  002c: never an empty answer. An unknown kind lists the valid kinds and falls back to a free-text match across all
  *  kinds (text, else the unknown kind word itself); a known kind with no entries says so with the per-kind counts and
  *  falls back the same way; as a last resort the newest entries are shown. */
+/** one ledger row as the query shows it. 002u (station 5, zero-token D01 probe): a memory proposal or decision row names its proposal id (refs.proposal_id),
+ *  the id memory_decide takes; the row showed the lane's text only, and the main could not decide a proposal that was not Joey's. */
+const ledgerRow = (r: LedgerRec): string =>
+  `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${r.refs?.proposal_id ? `${r.refs.proposal_id}｜` : ''}${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`
 function queryLedgerBase(raw: string | null, q: { since?: unknown; kind?: unknown; text?: unknown }, now: number): string {
   const kindIn = typeof q.kind === 'string' ? q.kind.trim().toLowerCase() : ''
   const kindKnown = !kindIn || (LEDGER_KINDS as readonly string[]).includes(kindIn)
@@ -216,7 +220,7 @@ function queryLedgerBase(raw: string | null, q: { since?: unknown; kind?: unknow
   }
   if (!hit.length) return `帳本查詢：沒有符合的紀錄（帳本共 ${all.length} 筆；各種類現有筆數：${counts}）。${echo}`
   const shown = hit.slice(-LEDGER_QUERY_MAX)
-  const rows = shown.map(r => `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`)
+  const rows = shown.map(ledgerRow)
   return [...notes, `帳本查詢：符合 ${hit.length} 筆${hit.length > shown.length ? `，只顯示最新 ${shown.length} 筆` : ''}（舊→新，時間為 ${TZ_LABEL}）。${echo}`, ...rows,
     `（以上只是符合條件的紀錄。帳本各種類現有筆數：${counts}。整天每件事一行的完整清單：ledger_query() 不帶參數。）`].join('\n')
 }
@@ -234,7 +238,7 @@ export function queryLedger(raw: string | null, q: { since?: unknown; kind?: unk
   const told = (raw ?? '').split('\n').filter(Boolean).map(parseLedgerLine).filter((r): r is LedgerRec => !!r && isTold(r))
     .filter(r => (since === null || Date.parse(r.ts) >= since) && (!match || match(`${r.text} ${r.lane} ${r.thread ?? ''} ${r.refs ? JSON.stringify(r.refs) : ''}`)))
   const shown = told.slice(-LEDGER_QUERY_MAX)
-  const rows = shown.map(r => `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`)
+  const rows = shown.map(ledgerRow)
   const fresh = rows.filter(r => !base.includes(r))                  // the widened answer above may already list some of them
   return [base,
     `〔窗口內對 peer 說過的話：${told.length} 筆${told.length > shown.length ? `，只顯示最新 ${shown.length} 筆` : ''}（reply_agent / send_to_agent 的 action 紀錄；沒有記成承諾的轉述或答應也在這裡，要自己看一眼；舊→新，時間為 ${TZ_LABEL}）〕`,

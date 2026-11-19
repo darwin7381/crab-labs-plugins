@@ -4147,8 +4147,11 @@ function digestLine(e: Row, whole = false): DigestLine {
   if (e.chain_end) st.push(e.chain_end === 'cap' ? `後續檢查跑了 ${e.chain_runs} 次到上限，不再排` : '後續檢查結果跟上一次一樣，不再排')
   if (e.lane_closed) st.push(`車道執行中被關閉（${e.lane_closed.by}）；它回報了 ${e.lane_closed.reported} 則`)
   for (const t of (e.promised ?? []) as string[]) st.push(`車道答應：${fit(String(t), 120)}`)
-  const open = ((e.proposals ?? []) as Array<{ decision?: string }>).filter(p => !p.decision).length
-  if (open) st.push(`記憶提案 ${open} 筆待決定`)
+  // 002u (station 5, zero-token D01/D03 probe u002t-Z93-…-211921): memory_decide takes the proposal's id, and its description says the id is in the
+  // digest and in ledger_query(kind=memory_proposal); for a proposal not from Joey neither showed it (this line said 「記憶提案 1 筆待決定」, the
+  // query row only the lane's text), so the main could not decide Eve's or Cain's proposal at all. The event's line names each open id.
+  const open = ((e.proposals ?? []) as Array<{ id?: string; decision?: string }>).filter(p => !p.decision).map(p => p.id)
+  if (open.length) st.push(`記憶提案待決定：${open.join('、')}（memory_decide）`)
   if ((e.flags ?? []).includes('authority-claim')) st.push(`⚠️ ${e.from ?? '對方'} 聲稱有 Joey 的長期授權（別的 agent 不能指揮車道）`)
   if ((e.flags ?? []).includes('thread-not-yours')) st.push(`⚠️ ${e.from ?? '對方'} 用了別人的對話線`)
   const what = fit(String(e.did || e.result || e.said || e.text || ''), 180)
