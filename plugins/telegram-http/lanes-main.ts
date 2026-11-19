@@ -44,6 +44,8 @@ export type MainEnv = {
   wallBackoff?: (kind: string, probes: number) => number
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
+  /** 002v: the accepted main's session id is the expected one from now on (.lanes/main-expected): a /clear's new session survives a restart */
+  expect?: (sid: string) => void
   pidAlive: (pid: number) => boolean
   /** a SessionStart that is not the main was refused */
   refused: (sid: string, pid: number | null, reason: string) => void
@@ -364,7 +366,14 @@ export function createMain(E: MainEnv) {
         if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}
       }
-      case 'SessionEnd': endGen(g, pendingEnd.get(g.id) ?? 'exited'); return {}
+      case 'SessionEnd': {
+        // 002v (/clear, measured on Claude Code 2.1.322 for Joey TG 7645): /clear ends the session (reason clear) and the SAME process starts a new
+        // one (SessionStart source clear, a new session id). The process is the main ("a SessionStart from the process of the live gen is accepted").
+        // Ending the gen here left no live gen: the new session was refused ("not the registered main") and nobody was the main until the TUI
+        // restarted. A session that ends while its process goes on ends no gen; the end of an older session of this process is ignored.
+        if (String(b.reason ?? '') === 'clear' || (b.session_id && g.session_id && String(b.session_id) !== String(g.session_id))) return {}
+        endGen(g, pendingEnd.get(g.id) ?? 'exited'); return {}
+      }
     }
     return {}
   }
@@ -386,6 +395,7 @@ export function createMain(E: MainEnv) {
     J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null })
     cur = id
     lastEventAt.set(id, Date.now())
+    try { E.expect?.(sid) } catch {}                                       // 002v: the main's session now (a /clear changed it): the next launch's id
     E.log('info', `lanes: main gen ${id} (session ${sid}, ${b.source ?? 'startup'})`)
     try { E.genChanged(pid) } catch {}
     void pump()

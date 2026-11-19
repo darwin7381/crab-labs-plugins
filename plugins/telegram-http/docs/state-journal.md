@@ -405,7 +405,10 @@ What the hook prints, from the daemon's answer:
 
 How the main is registered:
 - A `SessionStart` is accepted when its session id is `.lanes/main-expected` (written by the keeper), or the new session of a `/main renew`, or when it
-  comes from the process of the live gen (`/clear`, `/compact`).
+  comes from the process of the live gen (`/clear`, `/compact`). The accepted session id is written to `.lanes/main-expected`.
+- `/clear` (Claude Code 2.1.322): `SessionEnd` with reason `clear`, then `SessionStart` source `clear` with a new session id, same process. A
+  `SessionEnd` with reason `clear`, or of a session other than the gen's current one, ends no gen (002v: it used to end it, and the new session was
+  refused: nobody was the main until the TUI restarted).
 - Any other SessionStart is refused. Joey is told once, and that process's MCP sessions lose the Telegram tools.
 
 ## Lanes

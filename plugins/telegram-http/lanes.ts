@@ -260,6 +260,7 @@ function mainEnv() {
       try { expected = readFileSync(join(LANES_DIR, 'main-expected'), 'utf8').trim() } catch {}
       return [expected, S?.renew?.new_sid ?? ''].filter(Boolean)
     },
+    expect: (sid: string) => { try { writeFileSync(join(LANES_DIR, 'main-expected'), sid) } catch {} },
     pidAlive,
     refused: (sid: string, pid: number | null, reason: string) => {
       routeRow({ event: 'register-main', rule: 'registration', target: 'refused', session: sid, pid, reason, role: D.role })

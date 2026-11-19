@@ -115,6 +115,8 @@ def main():
         body['tool_error'] = bool(tr.get('is_error')) if isinstance(tr, dict) else False
     if ev == 'StopFailure':
         body['reason'] = str(p.get('last_assistant_message') or '')[:300]
+    if ev == 'SessionEnd':                               # 002v: why it ended (clear: the process goes on with a new session)
+        body['reason'] = str(p.get('reason') or '')
     if ev == 'Stop':
         body['phase'] = 'check'
     r = post(body, 1.2 if ev == 'SessionEnd' else 10)

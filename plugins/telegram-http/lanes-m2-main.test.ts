@@ -475,6 +475,26 @@ test('the main-only rules: ledger_query before answering what happened (one line
   expect(notMainContext('adam', 'x')).not.toContain('ledger_query')
 })
 
+test('002v (/clear, Joey TG 7645): the main role belongs to the process: /clear starts a new session in it, which stays the main and is the next launch\'s id', async () => {
+  await drained()
+  const g = await startMain()
+  expect(M().mainPhase()).toBe('idle')
+  const sid2 = randomUUID()
+  await hook(g, 'SessionEnd', { reason: 'clear' })                                         // the measured order: the old session ends (reason clear) ...
+  expect(M().mainPhase()).toBe('idle')                                                     // ... and the process is still the main
+  const r = await L.__mainEvent({ event: 'SessionStart', pid: g.pid, session_id: sid2, source: 'clear' })   // ... then a new session in the same process
+  expect(r.accepted).toBe(true); expect(r.additionalContext).toContain('你是 adam 的主線')
+  expect(M().mainSession()!.session_id).toBe(sid2)
+  expect(readFileSync(join(dir, 'main-expected'), 'utf8').trim()).toBe(sid2)              // a restart resumes the session after the /clear
+  await hook({ ...g, sid: g.sid }, 'SessionEnd', { reason: 'other' })                      // a late end of the OLD session ends nothing
+  expect(M().mainPhase()).toBe('idle')
+  const id = await joey('/clear 之後還收得到嗎？')
+  expect(state(id)).toBe('offered')                                                         // Joey's message reaches the main
+  await hook({ ...g, sid: sid2 }, 'SessionEnd', { reason: 'prompt_input_exit' })          // /exit: the process ends: the gen ends
+  expect(M().mainPhase()).toBe('gone')
+  await killed({ ...g, sid: sid2 })
+})
+
 test('RBU2: a turn ends at its last Stop. After a Stop the gen is idle with stopped_prompt; a later event of that prompt (another Stop hook blocked it) puts it back in_turn; a new prompt is a new turn, nothing interrupted', async () => {
   await drained()
   const g = await startMain()
