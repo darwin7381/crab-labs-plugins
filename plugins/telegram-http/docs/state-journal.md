@@ -108,14 +108,24 @@ Other fields: `pid`, `session_id`, `transcript_path` (recorded, never read for s
 prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop"). `owed_hold` (the prompt) and
 `owed_events` (002q): the turn that the Stop check held because it still owed Joey a line, and those events (see "The main's Stop" below).
 
+**What a turn of the main works on** (002w B) is one set, M1's `turnWork(gen, prompt)`: the items bound to the prompt (not the digest) and their events;
+for a turn that took in nothing (its own background task's notification opened it; Claude Code starts such turns on its own), the work the gen carries
+on: the last turn that took items in (the gen's `work`: those items' aid view, their ids and their event ids, and every output since). Every per-turn duty
+reads it: the Stop check's hold (step 2 below), the last-words check's `context` (step 3), `mark_no_reply`, and what the main's reply (`mainTurn` →
+`replyTargets`, `mainReplied`, the tier) and send_to_agent (`mainSentInTurn`) meet. Before 002w only the last-words check got the carried work: in a turn
+that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, and the reply and the send met nothing (gap 8). The work is cleared at a
+`SessionStart` with source `clear` (the new session never saw it: inventory 24a), and when the gen ends.
+
 **The main's Stop** (`POST /lanes/main-event`, `phase: check`, then `phase: final` when nothing held the turn). The daemon's answer to a check, in order:
 1. Items still queued are pulled into the turn: `block` 「這一輪先不要結束。…」 with them (M1).
-2. 002q (H06): **the turn still owes Joey a line.** The events of the items bound to this prompt (a digest and a `no_reply` notice owe nothing)
-   whose `joey` obligation the main owns and has not met: `handed` to it (Joey's own message to the main, a hand-over, including the give-up
-   hand-over's 「由你回報 Joey 一次」), or `open` on an event the main owns. Not `met`, `requested`, `dropped` or `merged`. If any, and this prompt is not
-   already the gen's `owed_hold`: `block` 「這一輪還欠 Joey 一句，先不要結束：<who>「<first words>」；…」, and the gen records `owed_hold` and
-   `owed_events`. One hold per turn: the next Stop of the same turn goes on to step 3, and what is still owed stays open on its event. Code, no
-   model call; it is the rule the lane stop applies to a lane.
+2. 002q (H06), 002w (B): **the turn still owes what it works on.** The events of `turnWork` (above) on which the main still owes (`events.mainObs`, the
+   question `openObs` asks of a lane): a `joey` line, a peer's `answer` or a `receipt`, `handed` to it (Joey's own message to the main, a hand-over,
+   including the give-up hand-over's 「由你回報 Joey 一次」, a peer's message the router gave the main), or `open` where the main owns the obligation or the
+   event (an answer the router promised in its name). Not `met`, `requested`, `dropped` or `merged`; a `commitment` (the main's own promise for later) is
+   no turn's. If any, and this prompt is not already the gen's `owed_hold`: `block` 「這一輪還欠事沒交代，先不要結束：<who>「<first words>」：回 Joey 一句、回
+   eve、排程 run N 的回執；…」, and the gen records `owed_hold` and `owed_events`. One hold per turn: the next Stop of the same turn goes on to step 3, and
+   what is still owed stays open on its event. Code, no model call; it is the rule the lane stop applies to a lane. 2a936a7 asked Joey lines only: a peer
+   handed to the main was never asked about (gap 9).
 3. The aids' facts: `items` (the turn's bound items but the digest), `outputs` (its reply / send_to_agent calls), `turn`, `proposals`, `curator`.
    main-hook.py then runs the memory gate and the answered gate, which keeps its own narrow question (a turn of two or more messages).
    002r (H05): a hook event that carries `agent_id` fired inside a subagent of the main (Claude Code runs the session's tool hooks for a subagent's
@@ -135,7 +145,8 @@ prompt whose Stop made it idle (a later event of that prompt re-opens the turn; 
    002v (002s r2 C04): "不用回" is the router's (identity.md). At PreToolUse of send_to_agent the hook tells the daemon who it goes to; when the
    turn took in the last message of a conversation the thread gate stopped (the event's `stop`) and the send goes to that peer, the daemon answers
    `mark_no_reply` and the hook runs the main's own input with `no_reply: true` (`updatedInput`). Another peer, a send already no_reply and a
-   later turn (a new conversation is the main's to open) are not marked. The stop's hand-over tells the main its answer will be marked.
+   later turn with items of its own (a new conversation is the main's to open) are not marked; a turn that took in nothing carries on the work, and
+   its answer to that peer is marked (002w B, turnWork). The stop's hand-over tells the main its answer will be marked.
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
 - An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once
@@ -221,7 +232,7 @@ Fields:
 | kind | levels | met by |
 |---|---|---|
 | `joey` | `line` < `decision` | `notify_joey` (a line), `ask_joey` or `notify_joey` with `outcome: needs_you` (a decision: one code path, the same transition, tier and ledger row; `by` / `tool` name the call made; raising a met line is accepted, and so is a line whose `outcome` differs from the one it was met with), or the main's reply in a turn the event's item is bound to. A critical alert's line has `ring` and `due_at`: see "The ring" below. | An event the router opened with no Joey line (a high-frequency routine owes a receipt only; a fan-out part and a curator report to the main) takes a line only when there is news: `outcome` changed or failed, or a decision; a `normal` line is refused and the record grows no Joey line (002r, T2-R). The label alone does not decide (002s): a line the lane labelled `normal` is judged first (model aid `line-news`: does it state a difference from the previous run, an action taken, or a new problem); news goes out as `changed`, and a failed call lets the line out. |
-| `peer` | `answer`, `interim`, `commitment`, `message`, `stop-notice` | `reply_agent` to that peer, met when the inbox reports it delivered. `interim` is the router's own line (`owner: router`, created `met` when its fixed message is delivered) when a lane hands the request to the main; it meets and refuses nothing of the lane's (002q, B09, A05 50006). The event's `answer`, handed to the main, then becomes the main's: `owner: main`, `open`, a `due_at`, `req` (the peer's message id), `sent` (the interim's id). The lane may still send the peer its own line (level `message`, one per agent). The main meets an answer by a delivered send_to_agent in a turn the event's item is bound to (else by a send on the promise's thread, quoting its message, or the promise aid). `commitment` is the main's own commitment tool, met by `commitment_done`. `message`: a lane's reply_agent to an agent its event did not owe (one per agent). | `stop-notice` (002r, C04): the router's own line (`owner: router`, created `met` on delivery) when it stops a thread at its hop limit or budget: the peer is told once, in fixed words, marked no_reply (a flood is told the same way), that the exchange stopped and its last message is with the main. The `interim` (002r, B09) also carries the main's focus card when one is written: what the main is busy with reaches the peer in the router's line, whatever the lane's own reply says. A promise the main keeps outside the event's turn (matched by thread, by the quoted message, or by the promise aid) records the message that kept it (`ref`) and the event's `main_sends` gets the send (`matched`: thread, reply_to or jev) (002r, C07). |
+| `peer` | `answer`, `interim`, `commitment`, `message`, `stop-notice` | `reply_agent` to that peer, met when the inbox reports it delivered. `interim` is the router's own line (`owner: router`, created `met` when its fixed message is delivered) when a lane hands the request to the main; it meets and refuses nothing of the lane's (002q, B09, A05 50006). The event's `answer`, handed to the main, then becomes the main's: `owner: main`, `open`, a `due_at`, `req` (the peer's message id), `sent` (the interim's id). The lane may still send the peer its own line (level `message`, one per agent). The main meets an answer by a delivered send_to_agent in a turn the event's item is bound to, or a turn that carries that work on (else by a send on the promise's thread, quoting its message, or the promise aid). 002w (B, gap 9): an answer handed to the main (`handed`, owner lane: a hand-over, a thread stop, a peer's message the router gave the main) is matched the same way as one the router promised (owner main, `open`), and it gets a `due_at` (`LANES_HANDOFF_REPLY_MIN` after it was handed, and `what`): at that time the due sweep tells Joey once (`answer-due`). A peer answer records the request it answers (`req`, the peer's btcc message id), so a later send that quotes it meets it. Before 002w a handed answer was met only inside the turn it was bound to, had no due time, and kept its event open for ever. `commitment` is the main's own commitment tool, met by `commitment_done`. `message`: a lane's reply_agent to an agent its event did not owe (one per agent). | `stop-notice` (002r, C04): the router's own line (`owner: router`, created `met` on delivery) when it stops a thread at its hop limit or budget: the peer is told once, in fixed words, marked no_reply (a flood is told the same way), that the exchange stopped and its last message is with the main. The `interim` (002r, B09) also carries the main's focus card when one is written: what the main is busy with reaches the peer in the router's line, whatever the lane's own reply says. A promise the main keeps outside the event's turn (matched by thread, by the quoted message, or by the promise aid) records the message that kept it (`ref`) and the event's `main_sends` gets the send (`matched`: thread, reply_to or jev) (002r, C07). |
 | `receipt` | `run` (`run_id`) | the run's completion at the scheduler, once per scheduler run across every event: `receipt(run_id)`, or the lane's `./bin/btcc-receipt complete N` (`by: btcc-receipt`), whichever comes first. See "The scheduler receipt" below. |
 | `main` | `handed` (`handoff`, `item`, `due_at`, `cls`, `what`) | the M1 item that carries it reaching `done` |
 
@@ -269,7 +280,7 @@ about the event goes out silent: a lane line (tier rule `+rang-at-due`) and the 
 
 **The due sweep** runs every second. It acts on open obligations past `due_at`:
 - a critical line: the router rings once (`rang`), unless a line that rang reached Joey first;
-- a hand-over, a promised answer, a commitment: Joey is told once (`told`).
+- a hand-over, a promised answer, an answer handed to the main (002w), a commitment: Joey is told once (`told`).
 
 A `main` obligation is due 300 s after the hand-over (`LANES_HANDOFF_FALLBACK_MS`). The sweep acts only on the `due_at` an obligation got when it was
 created: nothing rewrites it, so a main that is away makes nothing due early (what was given to it waits; the wall or stuck notice told Joey once),

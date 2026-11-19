@@ -59,8 +59,9 @@ export type MainEnv = {
   /** PL7 (M4): an item is owed to the main (offered, pulled; the wake) only while it carries an open M3 main obligation (lanes.ts). Without it: every
    *  item but the digest (a unit of M1 alone) */
   owed?: (item: Row) => boolean
-  /** 002q (M3): of these events, the ones whose Joey line the main owns and still owes (handed, or open on an event it owns): the Stop check's facts */
-  joeyOwed?: (events: string[]) => Array<{ id: string; from: string; text: string }>
+  /** 002q (M3), 002w (B): of these events, what the main still owes on each (a Joey line, a peer's answer, a scheduler receipt: handed to it, or open on
+   *  what it owns), the rule the lane stop applies to a lane: the Stop check's facts, one entry per event, `owes` naming each */
+  mainOwed?: (events: string[]) => Array<{ id: string; from: string; text: string; owes: string[] }>
   /** the memory gate's facts (M3): the open Joey-sourced proposals, and whether a curator lane holds the write right */
   memory?: () => { proposals: Array<{ id: string; ts: string; lane: string; text: string }>; curator: boolean }
   /** 002v (C04): of these events, the senders of those the router's thread gate stopped (the event record's `stop`): the main's answer to them
@@ -107,7 +108,8 @@ export function createMain(E: MainEnv) {
   // 002v (002s r2 G02, u002s-G02-s2-r2-20261119-221622): gen → the work its turns carry on: the items of the last turn that took any in, and every
   // output since. A turn that takes in nothing (a background task's notification opened it, Claude Code starts it on its own) continues that work:
   // the last-words check reads the work's messages and outputs for it (that turn ended on Joey's 194, never sent, and had no items to ask about).
-  const work = new Map<string, { items: AidItem[]; outputs: Output[] }>()
+  // 002w (B): the work keeps its item ids and their event ids, so every per-turn duty of such a turn reads them (turnWork).
+  const work = new Map<string, { items: AidItem[]; outputs: Output[]; ids: string[]; events: string[] }>()
   let stuck: { gen: string; prompt: string | null; at: number } | null = null
   let offering = false
   let seq = 0
@@ -182,6 +184,15 @@ export function createMain(E: MainEnv) {
       calls: calls.get(p) ?? [] }
   }
 
+  /** 002w (B, gaps 8, 9): what a turn of the main works on: the items bound to prompt `p` (not the digest) and their events; a turn that took in nothing
+   *  carries on the gen's work (the last turn that took items in: `carried`). Every per-turn duty reads this one set: the Stop check's hold, the last-words
+   *  check's context, mark_no_reply, and (lanes.ts mainTurn) what the main's reply and send_to_agent meet. */
+  function turnWork(g: Row, p: string): { items: Row[]; events: string[]; carried: boolean } {
+    const its = items(r => (r.state === 'bound' || r.state === 'done') && r.gen === g.id && r.prompt_id === p && r.kind !== 'digest')
+    const w = its.length ? undefined : work.get(g.id)
+    const rows = w ? items(r => w.ids.includes(r.id)) : its
+    return { items: rows, events: w ? w.events : [...new Set(its.map(r => String(r.event ?? '')).filter(Boolean))], carried: !!w }
+  }
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
   async function pump(): Promise<void> {
     if (!E || offering) return
@@ -322,9 +333,8 @@ export function createMain(E: MainEnv) {
         if (/__send_to_agent$/.test(String(b.tool_name ?? '')) && b.tool_input?.no_reply !== true && E.stoppedPeers) {
           // 002v (002s r2 C04, u002s-C04-s2-r2-20261119-215937): the thread gate stopped the conversation and handed its last message to this turn; the
           // main's answer to that peer ends it. "不用回" is the router's to enforce (identity.md), not the model's to remember: the hook marks the send.
-          const evs = [...new Set(items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done')).map(r => String(r.event ?? '')).filter(Boolean))]
           const to = String(b.tool_input?.to ?? '').trim().toLowerCase()
-          if (to && E.stoppedPeers(evs).includes(to)) return { mark_no_reply: `the conversation with ${to} was stopped by the thread gate; this answer ends it` }
+          if (to && E.stoppedPeers(turnWork(g, p).events).includes(to)) return { mark_no_reply: `the conversation with ${to} was stopped by the thread gate; this answer ends it` }
         }
         return /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p) } : {}   // PL5: the summary gate judges the reply against this turn
       }
@@ -345,26 +355,28 @@ export function createMain(E: MainEnv) {
         if (b.phase !== 'final') {
           const got = pull(J().get('main', g.id)!, p)
           if (got.length) return { block: '這一輪先不要結束。' + renderPulled(got) }
-          const bound = items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === p && r.kind !== 'digest')
-          // 002q (M3): the main's turn may not end silently while it owes Joey a line, the rule the lane stop hook applies. Code, no model, before the
-          // aids: the events of the items bound to this prompt (a digest and a no_reply notice owe nothing) whose Joey line the main owns and still owes.
-          // One hold per turn (owed_hold on the gen): the next Stop of the same turn ends it, and what is still owed stays open on its event.
+          const t = turnWork(g, p)
+          // 002q (M3), 002w (B): the main's turn may not end silently while it still owes what the turn works on, the rule the lane stop applies to a
+          // lane: a Joey line, a peer's answer, a scheduler receipt, handed to it or open on what it owns. Code, no model, before the aids; over turnWork
+          // (a turn that took in nothing is asked about the work it carries on). One hold per turn (owed_hold on the gen), naming each: the next Stop of
+          // the same turn ends it, and what is still owed stays open on its event.
           const gen = J().get('main', g.id)!
-          if (E.joeyOwed && gen.owed_hold !== p) {
-            const owed = E.joeyOwed([...new Set(bound.filter(r => metaOf(r.notif).no_reply !== 'true').map(r => String(r.event ?? '')).filter(Boolean))])
+          if (E.mainOwed && gen.owed_hold !== p) {
+            const owed = E.mainOwed(t.events)
             if (owed.length) {
               setMain(gen, 'in_turn', { owed_hold: p, owed_events: owed.map(o => o.id) })
-              return { block: `這一輪還欠 Joey 一句，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」`).join('；')}。用 reply 回 Joey（一則可以回全部），再結束這一輪。` }
+              return { block: `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ./bin/btcc-receipt complete <run> 回執；做完再結束這一輪。` }
             }
           }
-          const its = bound.map(aidItem), w = its.length ? undefined : work.get(g.id)
+          const its = t.carried ? [] : t.items.filter(r => r.state === 'bound').map(aidItem), w = t.carried ? work.get(g.id) : undefined
           return { items: its, outputs: outputs.get(p) ?? [], ...(w ? { context: { items: w.items, outputs: w.outputs } } : {}),
             turn: turnOf(J().get('main', g.id)!, p), ...(E.memory ? E.memory() : { proposals: [], curator: false }) }   // PL5: the memory gate's facts
         }
         { // 002v: the work this turn leaves for the next (the turn's items, or the outputs it adds to the work it carried on)
-          const mine = items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done') && r.kind !== 'digest').map(aidItem)
+          const mine = items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done') && r.kind !== 'digest')
           const outs = outputs.get(p) ?? [], w = work.get(g.id)
-          if (mine.length) work.set(g.id, { items: mine.slice(-6), outputs: outs.slice(-12) })
+          if (mine.length) work.set(g.id, { items: mine.map(aidItem).slice(-6), outputs: outs.slice(-12), ids: mine.map(r => r.id),
+            events: [...new Set(mine.map(r => String(r.event ?? '')).filter(Boolean))] })
           else if (w && outs.length) w.outputs = [...w.outputs, ...outs].slice(-12)
         }
         finish(r => r.gen === g.id && r.prompt_id === p)
@@ -415,6 +427,7 @@ export function createMain(E: MainEnv) {
     const same = currentGen()
     if (same && same.state === 'in_turn' && same.prompt_id) requeue(r => r.gen === same.id && r.prompt_id === same.prompt_id, 'session_start')
     const id = String(pid)
+    if (b.source === 'clear') work.delete(id)                               // 002w (B, 24a): the new session never saw that work
     J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null })
     cur = id
     lastEventAt.set(id, Date.now())
@@ -467,7 +480,7 @@ export function createMain(E: MainEnv) {
   }
 
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick,
+  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork,
     items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

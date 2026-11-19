@@ -9,8 +9,9 @@ every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopba
                 message of a conversation the thread gate stopped, and this send goes to that peer), the send runs with no_reply set (updatedInput)
   PostToolUse   every tool's input (each string cut to 3000 chars) and result (text, cut to 20000 chars; tool_error) go to the daemon, which
                 keeps this turn's calls; it answers the items that reached the main during this turn (pulled at this tool boundary; additionalContext)
-  Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes Joey a line (the daemon's M3 check:
-                the Joey line of an event bound to this turn, owned by the main and not met) is held (decision block, naming each event); else
+  Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes what it works on (the daemon's M3
+                check, 002w: a Joey line, a peer's answer, a receipt of an event of this turn, or of the work a turn that took in nothing carries
+                on, handed to the main or open on what it owns) is held (decision block, naming each event); else
                 the model aids run (an undecided Joey memory proposal over the daemon's
                 `proposals` / `turn` / `curator`, the answered check over the items M1 bound to this turn, which also asks whether the
                 turn's last words (the payload's last_assistant_message, after the turn's last output) reached anyone; 002v: a turn that took in

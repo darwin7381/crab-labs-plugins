@@ -75,7 +75,7 @@ test('002v G02: a turn that takes in nothing gets the work it carries on (the la
   await hook(g, 'Stop', { prompt_id: p3, phase: 'final' })
 })
 
-test('002v C04: the turn that took in a stopped conversation\'s last message answers that peer with no_reply set by the router; another peer, a later turn, a send already no_reply: untouched', async () => {
+test('002v C04, 002w B (gap 8, path mark_no_reply of a turn that took in nothing): the turn that took in a stopped conversation\'s last message, or a turn that took in nothing and carries it on, answers that peer with no_reply set by the router; another peer, a later turn with items of its own, a send already no_reply: untouched', async () => {
   const g = M().currentGen()!; const gg = { pid: Number(g.pid), sid: String(g.session_id) }
   const d1 = await L.routeEvent(mk('eve', '週三 14:00 維護，確定嗎？'))
   const th = L.__lanesState().lanes[d1.lane!].thread
@@ -92,8 +92,16 @@ test('002v C04: the turn that took in a stopped conversation\'s last message ans
   expect((await hook(gg, 'PreToolUse', { prompt_id: p, tool_name: SEND, tool_input: { to: 'cain' } })).mark_no_reply).toBeUndefined()   // another peer
   expect((await hook(gg, 'PreToolUse', { prompt_id: p, tool_name: SEND, tool_input: { to: 'eve', no_reply: true } })).mark_no_reply).toBeUndefined()
   await stop(gg, p); await hook(gg, 'Stop', { prompt_id: p, phase: 'final' })
-  const p2 = P(); await hook(gg, 'UserPromptSubmit', { prompt_id: p2 })         // a later turn: a new conversation is the main's to open
-  expect((await hook(gg, 'PreToolUse', { prompt_id: p2, tool_name: SEND, tool_input: { to: 'eve' } })).mark_no_reply).toBeUndefined()
+  // 002w (B, gap 8): a later turn that took in nothing carries on that work (turnWork): its answer to eve still ends the stopped conversation
+  const p2 = P(); await hook(gg, 'UserPromptSubmit', { prompt_id: p2 })
+  expect((await hook(gg, 'PreToolUse', { prompt_id: p2, tool_name: SEND, tool_input: { to: 'eve' } })).mark_no_reply).toContain('eve')
   await stop(gg, p2); await hook(gg, 'Stop', { prompt_id: p2, phase: 'final' })
+  // a later turn with items of its own: a new conversation is the main's to open
+  const meta = { chat_id: '1', message_id: '9002', user: 'joey_lab' }
+  await L.routeEvent({ id: 'tg-1-9002', source: 'telegram', from: 'joey', text: '跟 eve 另開一件事。', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '跟 eve 另開一件事。', meta } } } as any)
+  await until(() => M().items(r => r.event === 'tg-1-9002' && r.state === 'offered').length === 1)      // the offer is written before the prompt binds it
+  const p3 = P(); await hook(gg, 'UserPromptSubmit', { prompt_id: p3, dids: M().items(r => r.event === 'tg-1-9002').map(r => r.id) })
+  expect((await hook(gg, 'PreToolUse', { prompt_id: p3, tool_name: SEND, tool_input: { to: 'eve' } })).mark_no_reply).toBeUndefined()
+  await stop(gg, p3); await hook(gg, 'Stop', { prompt_id: p3, phase: 'final' })
   writeFileSync(GO, 'ok'); await until(() => !L.__runTok(d1.lane!))
 })

@@ -38,7 +38,9 @@ export function matterKey(service: unknown, check: unknown): string | undefined 
   return n(service) ? `${n(service)}/${n(check)}` : undefined
 }
 export type Verdict = { ok: boolean; why?: string; ob?: Ob; raised?: boolean; event?: Row }
-export type HandOver = { handoff: string; by: string; what?: string; due_at?: number; cls?: string }
+export type HandOver = { handoff: string; by: string; what?: string; due_at?: number; cls?: string
+  /** 002w (B, gap 9): the due time a peer's answer handed to the main gets (like an answer the router promised: the due sweep tells Joey once) */
+  answer_due?: number }
 
 const RANK: Record<string, number> = { none: 0, line: 1, decision: 2 }
 const SEV: Record<Outcome, number> = { normal: 0, changed: 1, failed: 2 }
@@ -83,6 +85,13 @@ export function createEvents(J: Journal) {
   }
   /** what an event still owes from its lane (the stop hook's question, and the exit rule's) */
   function openObs(id: string): Ob[] { return obsOf(get(id)).filter(o => owing(o) && o.kind !== 'main' && (o.owner ?? 'lane') === 'lane') }
+  /** 002w (B, gap 9): what an event still owes from the MAIN (its Stop check's question, the one openObs asks of a lane): a Joey line, a peer's answer or a
+   *  scheduler receipt handed to it, or open where the main owns the obligation or the event. A commitment (the main's own promise, due later) is no turn's. */
+  function mainObs(id: string): Ob[] {
+    const e = get(id)
+    return obsOf(e).filter(o => (o.kind === 'joey' || o.kind === 'receipt' || (o.kind === 'peer' && o.level === 'answer'))
+      && (o.state === 'handed' || (o.state === 'open' && (o.owner === 'main' || e?.owner === 'main'))))
+  }
   const openText = (id: string): string => {
     const os = openObs(id)
     return os.length ? `still open: ${os.map(o => o.kind === 'joey' ? `a ${o.level} for Joey (notify_joey; ask_joey if he must decide)` : o.kind === 'peer' ? `an answer to ${o.to} (reply_agent)` : `the receipt of scheduler run ${o.run_id} (receipt run_id=${o.run_id})`).join('; ')}.`
@@ -188,7 +197,10 @@ export function createEvents(J: Journal) {
     if (open) return open
     const ob: Ob = { id: h.handoff, kind: 'main', level: 'handed', state: 'open', by: h.by, owner: 'main', handoff: h.handoff,
       ...(h.what != null ? { what: h.what } : {}), ...(h.due_at != null ? { due_at: h.due_at } : {}), ...(h.cls ? { cls: h.cls } : {}) }
-    for (const o of obs) if (owing(o) && (o.owner ?? 'lane') === 'lane' && o.kind !== 'main') { o.state = 'handed'; delete o.prev }
+    for (const o of obs) if (owing(o) && (o.owner ?? 'lane') === 'lane' && o.kind !== 'main') {
+      o.state = 'handed'; delete o.prev
+      if (o.kind === 'peer' && o.level === 'answer' && h.answer_due != null && o.due_at == null) { o.due_at = h.answer_due; o.what ??= String(e.text ?? '').slice(0, 160) }   // 002w (B)
+    }
     if (!obs.some(o => o.kind === 'joey')) obs.push({ id: obId('joey'), kind: 'joey', level: 'line', state: 'handed', by: h.by })
     obs.push(ob)
     write(e, obs, { tool: h.by, refused: null })
@@ -228,12 +240,12 @@ export function createEvents(J: Journal) {
   function due(now: number): Array<{ e: Row; o: Ob }> {
     const out: Array<{ e: Row; o: Ob }> = []
     for (const e of J.rows('event', r => r.state === 'open')) for (const o of (e.obligations ?? []) as Ob[]) {
-      if (!(o.state === 'open' || (o.state === 'handed' && o.ring)) || o.due_at == null || now < o.due_at) continue
+      if (!(o.state === 'open' || (o.state === 'handed' && (o.ring || o.kind === 'peer'))) || o.due_at == null || now < o.due_at) continue   // 002w (B): a handed answer
       if (o.ring ? o.rang : o.told) continue
       out.push({ e, o })
     }
     return out
   }
-  return { open, get, obsOf, openObs, openText, request, result, handOver, settleUnrun, set, add, note, push, due, receiptMet,
+  return { open, get, obsOf, openObs, mainObs, openText, request, result, handOver, settleUnrun, set, add, note, push, due, receiptMet,
     rows: (pred: (r: Row) => boolean = () => true) => J.rows('event', pred) }
 }

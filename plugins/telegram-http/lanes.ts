@@ -286,12 +286,12 @@ function mainEnv() {
     context: mainContext,
     // PL7 (M4): an item is owed to the main (offered, pulled, wakes) only while its event carries an open main obligation
     owed: (r: Row): boolean => r.kind !== 'digest' && !!r.event && ((events?.get(String(r.event))?.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === r.id)),
-    // 002q (M3, the main's Stop check): of these events, those whose Joey line the main owns and still owes: handed to it, or open on an event it owns.
-    // A line met, requested (being sent), dropped or merged owes nothing. Who asked (Joey for his own messages) and the event's first words.
-    joeyOwed: (ids: string[]) => ids.flatMap(id => {
-      const e = events?.get(id)
-      const owes = ((e?.obligations ?? []) as Ob[]).some(o => o.kind === 'joey' && (o.state === 'handed' || (o.state === 'open' && (o.owner === 'main' || e!.owner === 'main'))))
-      return e && owes ? [{ id, from: e.class === 'joey' ? 'Joey' : String(e.from ?? '?'), text: String(e.text ?? '') }] : []
+    // 002q (M3), 002w (B, gap 9): the main's Stop check: of these events, what the main still owes on each (events.mainObs: a Joey line, a peer's answer, a
+    // receipt, handed to it or open on what it owns; met, requested, dropped or merged owes nothing). Who asked (Joey for his own messages), the first words.
+    mainOwed: (ids: string[]) => ids.flatMap(id => {
+      const e = events?.get(id), os = e ? events.mainObs(id) : []
+      return e && os.length ? [{ id, from: e.class === 'joey' ? 'Joey' : String(e.from ?? '?'), text: String(e.text ?? ''),
+        owes: [...new Set(os.map(o => o.kind === 'joey' ? '回 Joey 一句' : o.kind === 'peer' ? `回 ${o.to}` : `排程 run ${o.run_id} 的回執`))] }] : []
     }),
     // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
     // 002v (002u r1 D02, u002u-D02-s2-r1-20261119-231449): `shown` = a digest that carried the proposal's event reached the main (bound or done): the
@@ -832,7 +832,8 @@ function toMain(ev: InEvent, d: Decision): void {
   // main, those are `handed` (the main meets them: its reply meets the Joey line and rings a critical one's ring, the due sweep rings it if nobody did)
   ev.trigger ??= triggerClass(undefined, ev) || undefined
   const cls = evClassOf(ev)
-  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...eventObligations(ev, cls).map(o => ({ ...o, state: 'handed' }))] })
+  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...eventObligations(ev, cls).map(o => ({ ...o, state: 'handed',
+    ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: ev.text.slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
   main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id })
 }
 /** server.ts: the router could not decide (it threw); the event still goes to the main, as the router's fallback does */
@@ -2577,7 +2578,8 @@ function eventObligations(ev: InEvent, cls: EvClass, task = false): any[] {
   // order comes from the board, which is answered on the ticket, not by reply_agent: the worker's reply_agent failed (unknown agent "board"), it
   // handed the event over, the main could not answer it either, and the event stayed open for ever with every work order.
   if (ev.source === 'mesh' && cls === 'peer' && !ev.no_reply && !ev.synthetic && ev.from && ev.from !== 'main'
-      && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())) obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase() })
+      && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())) obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase(),
+      ...(ev.btcc_msg_id ? { req: String(ev.btcc_msg_id) } : {}) })        // 002w (B): the request it answers (a later send quoting it meets it, mainSentTo)
   const run = cls === 'scheduled' && ev.meta?.run_id ? String(ev.meta.run_id) : null
   if (run) obs.push({ kind: 'receipt', level: 'run', run_id: run })
   return obs
@@ -2623,7 +2625,8 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
   const tg = e0?.tg as { message_id?: unknown; topic?: unknown } | undefined
   const said = tg && e0?.text ? `\n〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕${tg.topic != null ? `話題 #${tg.topic}，` : ''}message_id ${tg.message_id ?? '-'}：「${String(e0.text).slice(0, 1500)}」` : ''
   const body = text.slice(0, max) + said
-  const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}) })
+  const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}),
+    answer_due: Date.now() + PROMISE_MIN * 60_000 })                              // 002w (B, gap 9): a peer's answer handed to the main is due like a promised one
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
   if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
@@ -2663,13 +2666,13 @@ function itemUndone(it: Row): void {
 // requires its class's tier (a push class whose ring already rang is silent). The notify profile still rules (default = everything rings).
 const ringOf = (e: Row | undefined): Ob | undefined => ((e?.obligations ?? []) as Ob[]).find(o => o.kind === 'joey' && o.ring)
 const rung = (e: Row | undefined): boolean => { const r = ringOf(e); return !!r && (!!r.rang || r.state === 'met') }
-/** the main's running turn: its prompt, its bound items and the events they carry (M1 + M2) */
+/** the main's running turn: its prompt, and what it works on (M1 turnWork: its bound items and their events, or, for a turn that took in nothing, the work it
+ *  carries on: 002w B, gap 8) */
 function mainTurn(): { prompt: string; items: Row[]; events: Row[] } | null {
   const g = main?.currentGen()
   if (!g?.prompt_id || g.state !== 'in_turn') return null
-  const items = main.items(r => (r.state === 'bound' || r.state === 'done') && r.gen === g.id && r.prompt_id === g.prompt_id && r.kind !== 'digest')
-  const ids = [...new Set(items.map(r => String(r.event ?? '')).filter(Boolean))]
-  return { prompt: String(g.prompt_id), items, events: ids.map(id => events.get(id)).filter((e): e is Row => !!e) }
+  const t = main.turnWork(g, String(g.prompt_id))
+  return { prompt: String(g.prompt_id), items: t.items, events: t.events.map(id => events.get(id)).filter((e): e is Row => !!e) }
 }
 export type MainTier = { silent: boolean; rule: string; events: string[] }
 /** what a reply to Joey can still meet on an event: a Joey line nobody met (open, or handed to the main), or a ring nobody rang */
@@ -2822,7 +2825,7 @@ function keepPromise(p: OpenPromise, how: string, ref: string): void {
   events.set(p.ev.id, p.o.id, { state: 'met', by: `main (${how})`, ...(ref ? { ref } : {}) }, { tool: 'send_to_agent' })
   events.push(p.ev.id, 'main_sends', { to: p.o.to, ref, at: nowIso(), delivered: true, matched: how }, true)   // 002r (C07): the event records the send that kept it, as a send in its own turn does
   ledger({ lane: 'router', thread: p.ev.thread ?? null, event: p.ev.id, kind: 'fyi',
-    text: `主線已回覆 ${p.o.to}（系統告訴過對方 ${simTime(p.o.due_at!)} 前會回的那件事${late ? '；過了時間才回' : ''}）`, refs: { obligation: p.o.id, matched: how, late } })
+    text: `主線已回覆 ${p.o.to}（${p.o.sent ? `系統告訴過對方 ${simTime(p.o.due_at!)} 前會回的那件事` : '交給主線、要回對方的那件事'}${late ? '；過了時間才回' : ''}）`, refs: { obligation: p.o.id, matched: how, late } })
   logos('lane.promise.kept', { obligation: p.o.id, peer: p.o.to, late, matched: how })
 }
 /** the main sent `to` a message (send_to_agent): first a request against the events of its turn (PL2, mainSentInTurn); else the answers it promised that
@@ -2835,7 +2838,9 @@ export async function mainSentTo(to: string, thread: string | null, replyTo?: st
   if (mainSentInTurn(String(to), ref, delivered).length || !delivered) return
   const peer = String(to).toLowerCase()
   const open: OpenPromise[] = []
-  for (const ev of events.rows(r => r.state === 'open')) for (const o of (ev.obligations ?? []) as Ob[]) if (o.kind === 'peer' && o.level !== 'commitment' && o.owner === 'main' && o.state === 'open' && o.to === peer) open.push({ ev, o })
+  // 002w (B, gap 9): an answer handed to the main (owner lane, `handed`) as well as one the router promised in its name (owner main, `open`)
+  for (const ev of events.rows(r => r.state === 'open')) for (const o of (ev.obligations ?? []) as Ob[])
+    if (o.kind === 'peer' && o.level !== 'commitment' && o.to === peer && ((o.owner === 'main' && o.state === 'open') || o.state === 'handed')) open.push({ ev, o })
   if (!open.length) return
   const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
   const byThread = thread ? open.filter(p => p.ev.thread === thread) : []
@@ -2869,8 +2874,9 @@ export function dueTick(now = Date.now()): void {
     const text = o.kind === 'main'
       ? `這件事原本交給主線處理（${o.handoff ?? o.id}），${Math.max(1, Math.round((now - (o.due_at! - HANDOFF_DUE_MS())) / 60_000))} 分鐘了主線還沒處理完${main.mainPhase() === 'walled' ? '（主線現在不能用模型）' : main.mainPhase() === 'gone' ? '（主線現在不在線）' : ''}，先直接讓你知道：\n${String(o.what ?? e.text ?? '').slice(0, 600)}`
       : o.level === 'commitment' ? `主線答應的事過了時限，還沒有標完成：答應 ${o.to}：${o.what}（時限 ${simTime(o.due_at!)}；${e.id}）。做完了主線會用 commitment_done 標掉。`
-      : `${o.to} 在等主線回覆：「${o.what ?? ''}」。車道把這件事交給主線時，系統告訴過 ${o.to} 主線會在 ${simTime(o.due_at!)} 前回。時間到了，主線還沒有回 ${o.to}。`
-    const rule = o.kind === 'main' ? 'handoff-due' : o.level === 'commitment' ? 'commitment-due' : 'promise-due'
+      : o.sent ? `${o.to} 在等主線回覆：「${o.what ?? ''}」。車道把這件事交給主線時，系統告訴過 ${o.to} 主線會在 ${simTime(o.due_at!)} 前回。時間到了，主線還沒有回 ${o.to}。`
+      : `${o.to} 在等主線回覆：「${o.what ?? ''}」。這件事交給主線了，到 ${simTime(o.due_at!)} 主線還沒有回 ${o.to}。`      // 002w (B, gap 9): an answer handed to the main
+    const rule = o.kind === 'main' ? 'handoff-due' : o.level === 'commitment' ? 'commitment-due' : o.sent ? 'promise-due' : 'answer-due'
     ledger({ lane: 'router', thread: e.thread ?? null, event: e.id, kind: 'notify', text: `[push] ${text.slice(0, 600)}`, refs: { tier: 'push', tier_rule: rule, escalated: true, obligation: o.id } })
     void pushJoey(o.kind === 'main' ? lane : undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id, obligation: o.id }))
   }
