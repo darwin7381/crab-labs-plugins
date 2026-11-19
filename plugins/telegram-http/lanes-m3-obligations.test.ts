@@ -135,6 +135,19 @@ test('the router opens the record with the obligations of the class: scheduled (
   expect(ev[0]).toMatchObject({ state: 'open', class: 'scheduled' }); expect(ev.some(l => l.tool === 'notify_joey')).toBe(true)
 })
 
+test('002t (A03 live): an answer is owed only to a sender the agent can answer: a [board] work order owes Joey a line, the board no reply_agent answer', async () => {
+  const w = await start(mk('board', '[board][WO-77] 請統計一下 tickets 的張數，完成後回報。'))
+  expect(L.__lanesState().lanes[w.lane].kind).toBe('worker')
+  expect(obs(w.id).map(o => `${o.kind}:${o.level}`)).toEqual(['joey:line'])                 // no peer:answer to "board" (not an agent of the registry)
+  await call(w.tok, 'notify_joey', { outcome: 'normal', text: 'WO-77：共 435 張。' })
+  await end(w.lane)
+  expect(E().get(w.id)!.state).toBe('closed')
+  const p = await start(mk('eve', '問一下 mock-api 的版本？'))
+  expect(obs(p.id).map(o => `${o.kind}:${o.level}`).sort()).toEqual(['joey:line', 'peer:answer'])   // eve is an agent: she is owed an answer
+  await call(p.tok, 'reply_agent', { to: 'eve', text: '1.8.6' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問版本，已回 1.8.6' })
+  await end(p.lane)
+})
+
 test('002m L6B3 / B11: the one-message rule is ONE rule: a second notify_joey is refused, and the refusal names what is still open', async () => {
   const s = await start(sched(43))
   expect(await call(s.tok, 'notify_joey', { outcome: 'normal', text: '備份完成' })).toContain('sent to Joey')

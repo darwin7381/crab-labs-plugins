@@ -2519,7 +2519,11 @@ function eventObligations(ev: InEvent, cls: EvClass, task = false): any[] {
   // PL5: the scheduler's run id and frequency travel as event meta (the /inject body's run_id and frequency): no text is parsed for them
   const hf = cls === 'scheduled' && String(ev.meta?.frequency ?? '').toLowerCase() === 'high'
   if (!task && !hf) obs.push({ kind: 'joey', level: 'line', ...(cls === 'critical' ? { ring: true, due_at: Date.now() + (S.wall ? 0 : CRITICAL_DEADLINE_MS) } : {}) })
-  if (ev.source === 'mesh' && cls === 'peer' && !ev.no_reply && !ev.synthetic && ev.from && ev.from !== 'main') obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase() })
+  // 002t (station 4, A03 live): an answer is owed only to a sender the agent can answer: an agent of the mesh registry. A [board][WO-n] work
+  // order comes from the board, which is answered on the ticket, not by reply_agent: the worker's reply_agent failed (unknown agent "board"), it
+  // handed the event over, the main could not answer it either, and the event stayed open for ever with every work order.
+  if (ev.source === 'mesh' && cls === 'peer' && !ev.no_reply && !ev.synthetic && ev.from && ev.from !== 'main'
+      && (D.registryNames?.() ?? []).map(n => n.toLowerCase()).includes(ev.from.toLowerCase())) obs.push({ kind: 'peer', level: 'answer', to: ev.from.toLowerCase() })
   const run = cls === 'scheduled' && ev.meta?.run_id ? String(ev.meta.run_id) : null
   if (run) obs.push({ kind: 'receipt', level: 'run', run_id: run })
   return obs
@@ -2957,7 +2961,8 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   const shown: Outcome = outcome ?? (decision ? 'changed' : 'normal')
   const r0 = joeyRendering(events.get(evId), tok, lane, level, undefined, text, shown)
   // PL2: requested (a decision raises a line already met); 002q: one line per matter
-  const v = events.request(evId, tool, { kind: 'joey', level, subject: matterKey(a.service, a.check) }, outcome, { said: text.slice(0, 200), joey_tier: r0.tier })
+  const v = events.request(evId, tool, { kind: 'joey', level, subject: matterKey(a.service, a.check), conversation: lane.kind === 'worker' && lane.topic != null }, outcome,
+    { said: text.slice(0, 200), joey_tier: r0.tier })
   if (!v.ok) return v.why!
   const r = joeyRendering(v.event, tok, lane, level, v.ob, text, shown)
   const rec = { lane: lane.id, thread: lane.thread, event: evId, class: tok.cls, trigger: tok.trigger, escalated: decision, ...(decision ? { ask: true } : {}) }

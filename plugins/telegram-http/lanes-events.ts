@@ -29,7 +29,9 @@ export type Ob = { id: string; kind: ObKind; level: string; state: ObState; by?:
   subject?: string; met_at?: string
   /** while requested: what it was before the request (a failed delivery puts it back) */
   prev?: { state: ObState; level: string; outcome?: Outcome; by?: string } }
-export type Want = { kind: ObKind; level: string; to?: string; run_id?: string; handoff?: string; outcome?: Outcome; subject?: string }
+export type Want = { kind: ObKind; level: string; to?: string; run_id?: string; handoff?: string; outcome?: Outcome; subject?: string
+  /** 002t: the line goes into the lane's own Telegram topic, where Joey talks with it (a worker): a conversation, so a met line refuses no later one */
+  conversation?: boolean }
 /** 002q (B08): the matter a Joey line is about, from the call's structured `service` and `check` (never from its text): one key across events */
 export function matterKey(service: unknown, check: unknown): string | undefined {
   const n = (v: unknown): string => String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ')
@@ -120,6 +122,10 @@ export function createEvents(J: Journal) {
         else if (!ob) { ob = { id: obId('joey'), kind: 'joey', level: want.level, state: 'open' }; obs.push(ob); raised = true; ask(ob, want.level) }
         else if (ob.state === 'handed') refused = 'this event is handed to the main: the main reports to Joey'
         else if (ob.state === 'requested') refused = 'a line about this event is being sent to Joey right now'
+        // 002t (station 4, I03 and F01 live): a worker's own topic is a conversation with Joey, like the main's chat. The one-message rule is about
+        // notifications (one line per event, per outcome); in a topic it refused the result Joey asked for, because the worker's greeting had met the
+        // line (I03: 「14 份快照，最舊 10-30」 never reached him), and every progress report he asked for.
+        else if (ob.state === 'met' && want.conversation && want.level === 'line' && ob.level === 'line') { ask(ob, 'line'); ob.outcome = out }
         else if (ob.state === 'met' && (RANK[want.level] < RANK[ob.level] || (RANK[want.level] === RANK[ob.level] && (ob.level === 'decision' || out === (ob.outcome ?? 'normal')))))
           refused = ob.level === 'decision' ? 'Joey was already asked to decide this event (ask_joey); one ask per event'
             : `Joey already has his line for this event (outcome ${ob.outcome ?? 'normal'}); one message per event: another line only when the outcome changed (put anything more in your receipt)`

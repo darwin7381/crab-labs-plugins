@@ -165,6 +165,18 @@ test('E18: a run that ends while the message is undelivered hands it over at the
   expect(JSON.stringify(L.__main().items((r: any) => r.kind === 'handoff' && r.event === 'tg-e18-5'))).not.toContain('順便也算一下錯誤率。')
 })
 
+test('002t: a worker in its own topic talks with Joey: a second line of the same run goes out (the greeting met the line; the result Joey asked for is not refused)', async () => {
+  await startRun('tool', 'tg-e18-c1', '看一下快照，回報後待命', '2300')
+  const tok = L.__runTok(LANE)!
+  const n = sent.length
+  expect(await L.callLaneTool(tok, 'notify_joey', { text: '開工：先看快照數量。', outcome: 'normal' })).toContain('sent to Joey')
+  expect(await L.callLaneTool(tok, 'notify_joey', { text: '快照共 14 份，最舊 10-30。', outcome: 'normal' })).toContain('sent to Joey')
+  expect(sent.slice(n).map(s => s.text).join('|')).toContain('快照共 14 份')
+  expect(sent.slice(n).every(s => String(s.topic) === TOPIC)).toBe(true)
+  await finish(exits() + 1)
+  await drain()
+})
+
 test('E18: LANES_STEER_MIDTURN=0 puts it back: the message queues behind the run, as before', async () => {
   await startRun('none', 'tg-e18-7', '開始', '2300')
   const sp = spawns(), sent0 = steerRows('sent').length, np = prompts().length
