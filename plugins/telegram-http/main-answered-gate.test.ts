@@ -7,7 +7,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-answered-gate.py')
-let server: any, calls: any[] = [], mode: 'missed' | 'answered' | 'fail' | 'html' = 'missed', unsentP = 0.95, promiseP = 0.03
+let server: any, calls: any[] = [], mode: 'missed' | 'answered' | 'fail' | 'html' = 'missed', unsentP = 0.95
 
 beforeAll(() => {
   server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
@@ -18,7 +18,6 @@ beforeAll(() => {
     const answers: Record<string, unknown> = {}
     for (const k of Object.keys(body.questions)) {
       if (k === 'unsent') { answers[k] = { type: 'noul', noul: unsentP }; continue }
-      if (/^P\d+$/.test(k)) { answers[k] = { type: 'noul', noul: promiseP }; continue }
       const kind = k.split('.')[1]
       const p = mode === 'missed' ? { reply_needed: 0.95, answered: 0.05, deferred: 0.02 }[kind] : { reply_needed: 0.95, answered: 0.93, deferred: 0.02 }[kind]
       answers[k] = { type: 'noul', noul: p }
@@ -168,32 +167,4 @@ test('002r: a failed Jev call holds nothing; shadow mode records and never holds
   mode = 'fail'; let r = await runLast({}); expect(r.out).toBeNull(); expect(r.log.at(-1).error).toBeTruthy()
   mode = 'answered'; r = await runLast({ env: { ANSWERED_GATE_MODE: 'shadow' } }); expect(r.out).toBeNull(); expect(r.log.at(-1)).toMatchObject({ mode: 'shadow', blocked: [], unsent: { p: 0.97 } })
   r = await runLast({ calls: [call(REPLY), call('Bash'), call('mcp__plugin_agent-inbox_agent-inbox__send_to_agent')] }); expect(r.out).toBeNull()   // the send was the last call
-})
-
-// ---- 002s (universe 002r, C07; T6-R, T7-R): a time-bound promise to a peer with no commitment record
-const SEND = 'mcp__plugin_agent-inbox_agent-inbox__send_to_agent', COMMIT = 'mcp__plugin_telegram-http_telegram-http__commitment'
-const PROMISE = '可以。我會在 2026-11-14 12:00（UTC+8）前把 11/02–11/08 的工單分類統計給你。'
-test('002s: a turn that promised a peer something by a stated time and recorded no commitment is held once, with the message quoted', async () => {
-  calls = []; mode = 'answered'; promiseP = 0.97
-  const o = { final: '已回 Eve。', outputs: [{ to: 'Joey', reply_to: '', text: 'Eve 要工單統計，我答應明天中午前給。' }, { to: 'eve', reply_to: '50005', text: PROMISE }], calls: [call(REPLY), call(SEND)] }
-  const r = await runLast(o)
-  expect(r.out.decision).toBe('block'); expect(r.out.reason).toContain('commitment'); expect(r.out.reason).toContain('給 eve：「可以。我會在 2026-11-14 12:00')
-  expect(calls.length).toBe(1); expect(Object.keys(calls[0].questions)).toEqual(['P1']); expect(calls[0].state.messages).toEqual([{ id: 'P1', to: 'eve', text: PROMISE }])   // the reply to Joey is not asked about
-  expect(r.log.at(-1)).toMatchObject({ blocked: ['promise'], promise: { messages: 1, p: [0.97] } })
-  expect((await runLast({ ...o, dir: r.dir })).out).toBeNull(); expect(calls.length).toBe(1)   // once per turn
-})
-
-test('002s: a commitment call in the turn, a turn with no message to a peer, a message that promises no time, and a failed call are not held', async () => {
-  calls = []; mode = 'answered'; promiseP = 0.97
-  const outs = [{ to: 'eve', reply_to: '', text: PROMISE }]
-  expect((await runLast({ final: 'ok', outputs: outs, calls: [call(SEND), call(COMMIT)] })).out).toBeNull()        // recorded: not asked
-  expect((await runLast({ final: 'ok', outputs: [{ to: 'Joey', reply_to: '', text: PROMISE }], calls: [call(REPLY)] })).out).toBeNull()   // only Joey: not asked
-  expect(calls.length).toBe(0)
-  promiseP = 0.04
-  const r = await runLast({ final: 'ok', outputs: [{ to: 'eve', reply_to: '', text: 'Joey 決定後我會回你。' }], calls: [call(SEND)] })
-  expect(r.out).toBeNull(); expect(calls.length).toBe(1); expect(r.log.at(-1)).toMatchObject({ blocked: [], promise: { p: [0.04] } })
-  promiseP = 0.97; mode = 'fail'
-  const f = await runLast({ final: 'ok', outputs: outs, calls: [call(SEND)] }); expect(f.out).toBeNull(); expect(f.log.at(-1).error).toBeTruthy()
-  mode = 'answered'
-  expect((await runLast({ final: 'ok', outputs: outs, calls: [call(SEND)], env: { ANSWERED_GATE_MODE: 'shadow' } })).out).toBeNull()
 })

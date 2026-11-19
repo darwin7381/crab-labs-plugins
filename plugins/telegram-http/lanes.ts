@@ -2759,13 +2759,16 @@ function keepPromise(p: OpenPromise, how: string, ref: string): void {
   logos('lane.promise.kept', { obligation: p.o.id, peer: p.o.to, late, matched: how })
 }
 /** the main sent `to` a message (send_to_agent): first a request against the events of its turn (PL2, mainSentInTurn); else the answers it promised that
- *  agent (M3, owner main) which this message names (its thread, the message it quotes), or the promise aid (Jev) picks. Met only when delivered. */
+ *  agent (M3, owner main) which this message names (its thread, the message it quotes), or the promise aid (Jev) picks. Met only when delivered.
+ *  002s: an ANSWER is what a message keeps. A commitment (level `commitment`: something to deliver by a time) is closed by commitment_done only: in
+ *  002s's smoke (C07 s3) the main recorded 「/v2/orders/bulk 週五前」 and one second later the message that TOLD Eve so was matched to it (the only open
+ *  item of that peer, confidence 0.98) and closed it; a later message on the same thread would have closed it the same way. */
 export async function mainSentTo(to: string, thread: string | null, replyTo?: string | number | null, text?: string, ref = '', delivered = true): Promise<void> {
   if (!events) return
   if (mainSentInTurn(String(to), ref, delivered).length || !delivered) return
   const peer = String(to).toLowerCase()
   const open: OpenPromise[] = []
-  for (const ev of events.rows(r => r.state === 'open')) for (const o of (ev.obligations ?? []) as Ob[]) if (o.kind === 'peer' && o.owner === 'main' && o.state === 'open' && o.to === peer) open.push({ ev, o })
+  for (const ev of events.rows(r => r.state === 'open')) for (const o of (ev.obligations ?? []) as Ob[]) if (o.kind === 'peer' && o.level !== 'commitment' && o.owner === 'main' && o.state === 'open' && o.to === peer) open.push({ ev, o })
   if (!open.length) return
   const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
   const byThread = thread ? open.filter(p => p.ev.thread === thread) : []
@@ -4196,8 +4199,18 @@ export function threadForReply(replyTo: number | undefined): { thread: string; h
 // question about the sent text: does it say its sender will do or deliver something later? At p >= LANES_MAIN_COMMIT_P (0.7) the daemon
 // writes kind commitment, lane main, refs.auto true. A failed call is an error, never a verdict: nothing is written, and the failure is
 // logged (run/main-commitment.jsonl and the daemon log). LANES_MAIN_COMMITMENTS=0 switches it off (on by default in 002k).
+// 002s (C07 of 002r and of 002s's own smoke): the promise the main PASSES ON (「Joey 決定：/v2/orders/bulk 週五前完成，由他找人做」) is one too: the
+// peer plans on it and holds this agent to it. The question above scores it 0.05 to 0.30 (the sender does nothing itself), so nothing was
+// recorded. The same request now carries a second narrow question: is the recipient told that something comes by a stated time or date,
+// whoever does the work? At LANES_MAIN_COMMIT_DEADLINE_P (0.55) it is a commitment as well. Measured in this payload on the 106 distinct
+// messages the main sent peers in 002o..002s: every relayed or own deadline scores 0.66 or more, everything else 0.47 or less (a
+// maintenance window stated as a fact, "no date is set yet", a refusal); the five relays the first question missed are all caught, and
+// the first question's own verdicts are unchanged (33 of 106 before, 38 with the second).
+// This check is the ONE mechanism for the main's promises to a peer: the Stop aid's promise hold of the first 002s draft did the same job
+// a second way and held a turn whose promise the router had already recorded (002s smoke, C07 s2), so it is gone.
 const MAIN_COMMITMENTS = (): boolean => process.env.LANES_MAIN_COMMITMENTS !== '0'
 const MAIN_COMMIT_P = (): number => Number(process.env.LANES_MAIN_COMMIT_P ?? 0.7)
+const MAIN_COMMIT_DEADLINE_P = (): number => Number(process.env.LANES_MAIN_COMMIT_DEADLINE_P ?? 0.55)
 const MAIN_COMMIT_DEDUPE_MS = 180_000
 /** The thread a main-to-peer message belongs to, taken from the peer's OPEN request or promise (the send itself carries thread null):
  *  the thread of the newest open promise the router made to that peer; else of the newest work handed to the main from that peer's
@@ -4248,17 +4261,18 @@ export async function mainCommitmentCheck(m: { msgId: unknown; to: string; text:
     logMainCommitment({ to: m.to, btcc_msg_id: m.msgId, error: r.error, ms: r.ms })
     return 'error'
   }
-  const hit = r.p >= MAIN_COMMIT_P()
+  const dl = typeof r.deadline === 'number' ? r.deadline : null
+  const hit = r.p >= MAIN_COMMIT_P() || (dl != null && dl >= MAIN_COMMIT_DEADLINE_P())
   // a commitment the main wrote itself with the commitment tool a moment ago is the record: no second one for the same send
   const own = hit && (events?.rows(e => e.owner === 'main' && Date.now() - Date.parse(String(e.created)) < MAIN_COMMIT_DEDUPE_MS) ?? [])
     .some(e => ((e.obligations ?? []) as Ob[]).some(o => o.level === 'commitment' && String(o.to ?? '').toLowerCase() === m.to.toLowerCase()))   // M3: the main's own commitment record
-  logMainCommitment({ to: m.to, btcc_msg_id: m.msgId, p: r.p, hit, wrote: hit && !own, thread: m.thread.thread, thread_from: m.thread.from, ms: r.ms })
+  logMainCommitment({ to: m.to, btcc_msg_id: m.msgId, p: r.p, deadline: dl, hit, wrote: hit && !own, thread: m.thread.thread, thread_from: m.thread.from, ms: r.ms })
   if (!hit) return 'no'
   if (own) return 'dup'
   const cm = commitmentFromReport(m.text, undefined, m.to) ?? { who: m.to, what: m.text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
   ledger({ lane: 'main', thread: m.thread.thread, event: `main-send-${m.msgId}`, kind: 'commitment', text: commitmentText(cm),
-    refs: { ...cm, from: 'main-send', auto: true, p: r.p, btcc_msg_id: m.msgId, thread_from: m.thread.from } })
-  logos('lane.main_commitment', { to: m.to, p: r.p, thread: m.thread.thread, btcc_msg_id: m.msgId })
+    refs: { ...cm, from: 'main-send', auto: true, p: r.p, ...(dl != null ? { deadline: dl } : {}), btcc_msg_id: m.msgId, thread_from: m.thread.from } })
+  logos('lane.main_commitment', { to: m.to, p: r.p, deadline: dl, thread: m.thread.thread, btcc_msg_id: m.msgId })
   return 'written'
 }
 

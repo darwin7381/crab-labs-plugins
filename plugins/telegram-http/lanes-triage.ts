@@ -214,15 +214,20 @@ async function jevAskRaw(state: Record<string, unknown>, questions: Record<strin
   }
 }
 
-/** C1: does this message say its sender will do or deliver something later? One narrow question; p is Jev's probability. */
-export async function promiseAsk(text: string, to: string, timeoutMs = TIMEOUT_MS, log?: { dir: string; ref?: unknown }): Promise<{ p?: number; error?: string; ms: number }> {
+/** C1: what a message to a peer promises. Two narrow questions in ONE request: `p`, the sender says it will do or deliver something later
+ *  (its own promise); `deadline` (002s), the recipient is told something comes by a stated time or date, whoever does the work (a promise
+ *  the sender passes on: 「Joey 決定：週五前完成，由他找人做」). Each is Jev's probability. */
+export async function promiseAsk(text: string, to: string, timeoutMs = TIMEOUT_MS, log?: { dir: string; ref?: unknown }): Promise<{ p?: number; deadline?: number; error?: string; ms: number }> {
   const r = await jevAsk(
     { setting: 'An AI agent sent `message` to another AI agent. `recipient` is a fact established by the system.', message: { recipient: to, text: text.slice(0, 3000) } },
     { promises: { type: 'noul', instructions: 'Does `message` say that its sender will do or deliver something later?',
-      criteria: { true: 'The sender says it will do, send, decide or answer something later or by a time (a promise or a deadline)', false: 'The message only informs, answers now, refuses, or asks; nothing is promised for later' } } },
-    'genesis-main-commitment/1', timeoutMs,
-    log?.dir ? { dir: log.dir, site: 'main-commitment-C1', inputs: { to, btcc_msg_id: log.ref ?? null, text: clip(text) }, p: a => a.promises?.noul } : undefined)
+      criteria: { true: 'The sender says it will do, send, decide or answer something later or by a time (a promise or a deadline)', false: 'The message only informs, answers now, refuses, or asks; nothing is promised for later' } },
+      deadline: { type: 'noul', instructions: 'Does `message` tell its recipient that something will be delivered, done or answered by a stated time or date?',
+      criteria: { true: 'The message states a concrete time or date by which the recipient gets a deliverable, a result or an answer (for example: by Friday, before 12:00 tomorrow, within 30 minutes), whoever will do the work: the sender, or someone the sender names',
+        false: 'The message states no time or date for anything still to come: it promises nothing, or says someone will reply or decide later without saying by when, or says no date is set yet, or refuses, or reports something already delivered' } } },
+    'genesis-main-commitment/2', timeoutMs,
+    log?.dir ? { dir: log.dir, site: 'main-commitment-C1', inputs: { to, btcc_msg_id: log.ref ?? null, text: clip(text) }, p: a => { const v = [a.promises?.noul, a.deadline?.noul].filter((x: unknown): x is number => typeof x === 'number'); return v.length ? Math.max(...v) : undefined } } : undefined)
   if (r.error || !r.answers) return { error: r.error ?? 'no answers', ms: r.ms }
-  const p = r.answers.promises?.noul
-  return typeof p === 'number' ? { p, ms: r.ms } : { error: 'no probability in the answer', ms: r.ms }
+  const p = r.answers.promises?.noul, deadline = r.answers.deadline?.noul
+  return typeof p === 'number' ? { p, ...(typeof deadline === 'number' ? { deadline } : {}), ms: r.ms } : { error: 'no probability in the answer', ms: r.ms }
 }

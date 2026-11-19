@@ -124,8 +124,6 @@ prompt whose Stop made it idle (a later event of that prompt re-opens the turn; 
    reply / send_to_agent (`turn.calls`) and ends on a text of substance (the Stop payload's `last_assistant_message`; no transcript is read), Jev
    is asked whether that text states an answer or result a sender asked for which no output of the turn contains; yes holds the turn once
    (「你最後寫的那段結果只出現在你自己的畫面上…」). An acknowledgement before the work met the event's Joey line, so step 2 holds nothing here.
-   002s: the same gate asks about an unrecorded promise. A turn that sent a peer a message and called no `commitment` is asked, per message, whether it
-   promises the recipient something by a stated time; yes holds the turn once (「…這是承諾，帳本裡還沒有…用 commitment 記下來」).
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
 - An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once

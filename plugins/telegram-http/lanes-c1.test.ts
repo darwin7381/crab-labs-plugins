@@ -3,12 +3,13 @@ import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-let server: any, mode: 'high' | 'low' | 'edge' | 'fail' = 'high', calls = 0
+let server: any, mode: 'high' | 'low' | 'edge' | 'fail' | 'relay' | 'relaylow' = 'high', calls = 0
 beforeAll(() => {
   server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
     calls++
     await req.json()
     if (mode === 'fail') return new Response('<html>blocked</html>', { status: 503 })
+    if (mode === 'relay' || mode === 'relaylow') return Response.json({ answers: { promises: { type: 'noul', noul: 0.05 }, deadline: { type: 'noul', noul: mode === 'relay' ? 0.93 : 0.5 } } })   // 002s: the sender does nothing itself
     return Response.json({ answers: { promises: { type: 'noul', noul: mode === 'high' ? 0.93 : mode === 'edge' ? 0.7 : 0.08 } } })
   } })
   process.env.TYPESAFE_BASE_URL = `http://127.0.0.1:${server.port}`; process.env.TYPESAFE_API_KEY = 'k'
@@ -82,6 +83,19 @@ test('C1: the env switch: LANES_MAIN_COMMITMENTS=0 asks nobody and writes nothin
   await send('我會再回你。'); await sleep(200)
   expect(commitments().length).toBe(n); expect(calls).toBe(c0)
   delete process.env.LANES_MAIN_COMMITMENTS
+})
+
+test('002s C07: a deadline the main passes on (the sender does nothing itself) is a commitment too: the second question of the same request, at 0.55', async () => {
+  mode = 'relay'
+  const n = commitments().length, c0 = calls
+  await send('Joey 決定：/v2/orders/bulk 週五前會做好，他正在找人負責。'); expect(await until(() => commitments().length === n + 1)).toBe(true)
+  expect(calls).toBe(c0 + 1)                                                                  // one request carries both questions
+  expect(commitments()[n].refs).toMatchObject({ auto: true, who: 'eve', from: 'main-send', p: 0.05, deadline: 0.93 }); expect(commitments()[n].refs.by).toContain('週五')
+  mode = 'relaylow'
+  await send('mock-api 維護時段：每週三 02:00–03:00，下週三 11-18 為維護。'); await sleep(200)
+  expect(commitments().length).toBe(n + 1)                                                    // a time stated as a fact is below the mark: nothing written
+  const rec = readFileSync(join(dir, 'run', 'main-commitment.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).pop()
+  expect(rec).toMatchObject({ p: 0.05, deadline: 0.5, hit: false, wrote: false })
 })
 
 test('C1: the main has a commitment tool; a send right after it does not record a second commitment', async () => {

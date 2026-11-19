@@ -16,7 +16,8 @@ let newsP: number | null = 0.02
 const jevCalls: any[] = []
 const jevSrv = createServer((req, res) => { let b = ''; req.on('data', c => b += c); req.on('end', () => { const q = JSON.parse(b || '{}'); jevCalls.push(q)
   if (newsP == null) { res.writeHead(500); res.end('{}'); return }
-  res.end(JSON.stringify({ answers: Object.fromEntries(Object.keys(q.questions ?? {}).map(k => [k, { type: 'noul', noul: newsP }])) })) }) })
+  res.end(JSON.stringify({ answers: Object.fromEntries(Object.entries(q.questions ?? {}).map(([k, v]: [string, any]) => [k, v?.type === 'choice'
+    ? { type: 'choice', choice: Object.keys(v.criteria ?? {}).find(c => c !== 'none') ?? 'none', confidence: 0.98 } : { type: 'noul', noul: newsP }])) })) }) })
 await new Promise<void>(r => jevSrv.listen(0, '127.0.0.1', () => r()))
 const withJev = async <T>(f: () => Promise<T>): Promise<T> => { process.env.TYPESAFE_BASE_URL = `http://127.0.0.1:${(jevSrv.address() as any).port}`; process.env.TYPESAFE_API_KEY = 'test-key'
   try { return await f() } finally { delete process.env.TYPESAFE_BASE_URL; delete process.env.TYPESAFE_API_KEY } }
@@ -420,6 +421,28 @@ test('002k G10: the main\'s commitment with a due time is an obligation of the m
   const m = sent.length
   L.dueTick(Date.now() + 61_000); await sleep(20)
   expect(sent.length).toBe(m)
+  L.__setMainConnected(null)
+})
+
+test('002s C07: a message keeps an answer the main owes, never a commitment: the message that tells the peer of it does not close it, commitment_done does', async () => {
+  const mainSid = 'mcp-m3-main'
+  L.__setMainConnected(mainSid)
+  // the smoke's case: the commitment is the only open item of that peer; the promise aid would pick it (the stand-in picks the first item, 0.98)
+  const out = await L.callMainTool('commitment', { who: 'frank', what: '/v2/orders/bulk 週五前上線（Joey 找人做）', by: '週五前' }, mainSid)
+  const id = out.match(/id (cm-[0-9a-f]+)/)![1]
+  const c0 = jevCalls.length
+  await withJev(() => L.mainSentTo('frank', null, null, '/v2/orders/bulk：Joey 已決定找人做，目標週五前上線。', '7301', true))
+  expect(jevCalls.length).toBe(c0)                                                            // no answer is owed to frank: nothing to match, nothing asked
+  expect(ob(id, 'peer')).toMatchObject({ level: 'commitment', state: 'open' })
+  // a commitment and an owed answer on ONE thread: a message on that thread keeps the answer only
+  E().open('ev-s3-ans', { class: 'peer', owner: 'main', thread: 'adam#t-s3', obligations: [{ kind: 'peer', level: 'answer', owner: 'main', to: 'frank', what: 'bulk 端點週五前能有嗎', due_at: Date.now() + 1_800_000 }] })
+  E().open('cm-s3s3s3', { class: 'peer', owner: 'main', thread: 'adam#t-s3', obligations: [{ kind: 'peer', level: 'commitment', owner: 'main', to: 'frank', what: '/v2/orders/bulk 週五前上線' }] })
+  await L.mainSentTo('frank', 'adam#t-s3', null, '可以，週五前上線。', '7302', true)
+  expect(ob('ev-s3-ans', 'peer')).toMatchObject({ level: 'answer', state: 'met', by: 'main (thread)', ref: '7302' })
+  expect(ob('cm-s3s3s3', 'peer')).toMatchObject({ level: 'commitment', state: 'open' }); expect(E().get('cm-s3s3s3')!.state).toBe('open')
+  expect(await L.callMainTool('commitment_done', { commitment_id: 'cm-s3s3s3' }, mainSid)).toContain('marked done')
+  expect(await L.callMainTool('commitment_done', { commitment_id: id }, mainSid)).toContain('marked done')
+  expect(ob(id, 'peer').state).toBe('met'); expect(E().get('cm-s3s3s3')!.state).toBe('closed')
   L.__setMainConnected(null)
 })
 
