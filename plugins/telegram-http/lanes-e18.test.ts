@@ -178,6 +178,18 @@ test('002t: a worker in its own topic talks with Joey: a second line of the same
   await drain()
 })
 
+test('002v (002u D02 r3): Joey\'s own message is class joey even on a lane the router flagged critical: no critical ring for his words', async () => {
+  st.lanes[LANE].critical = true
+  try {
+    await startRun('tool', 'tg-e18-crit', '這種失敗半夜不用叫我，早上 9 點一起報。', '2400')
+    const e = L.__events().get('tg-e18-crit')!
+    expect(e.class).toBe('joey'); expect(e.must_know).toBeUndefined()
+    expect(((e.obligations ?? []) as any[]).find(o => o.kind === 'joey')?.ring).toBeUndefined()
+    await finish(exits() + 1)
+    await drain()
+  } finally { st.lanes[LANE].critical = false }
+})
+
 test('E18: LANES_STEER_MIDTURN=0 puts it back: the message queues behind the run, as before', async () => {
   await startRun('none', 'tg-e18-7', '開始', '2300')
   const sp = spawns(), sent0 = steerRows('sent').length, np = prompts().length

@@ -2490,8 +2490,11 @@ function laneLabel(l: Lane): string { return `${{ reflex: '反射線', worker: '
 // obligation (kind main) and one M1 item for it: M4's one wake rule is "M2 idle and an item owed to the main", and M1 offers that item. Nothing else
 // wakes the main: what a lane did is information and rides the next delivery (the digest).
 let events: EventsApi
+// 002v (002u D02 r3, u002u-D02-s2-r3-20261119-235246): Joey's own Telegram message is class joey whatever lane it reaches. His quote-reply to the line
+// of a critical alert's lane took the lane's critical flag: its line rang at the critical due time and the router told him 「嚴重警報已收到，已交給
+// 主線處理…原文：這種備份失敗半夜不用叫我…」 about his own words. The alert itself stays critical (its own event).
 const evClassOf = (ev: InEvent, lane?: Lane): EvClass =>
-  ev.klass ?? (lane?.critical || /-critical$/.test(ev.trigger ?? '') ? 'critical' : ev.source === 'telegram' || ['joey', 'worker', 'fork'].includes(ev.trigger ?? lane?.kind ?? '') ? 'joey'
+  ev.klass ?? (ev.source === 'telegram' && !ev.synthetic ? 'joey' : lane?.critical || /-critical$/.test(ev.trigger ?? '') ? 'critical' : ev.source === 'telegram' || ['joey', 'worker', 'fork'].includes(ev.trigger ?? lane?.kind ?? '') ? 'joey'
     : ev.trigger === 'scheduled' ? 'scheduled' : /^alert/.test(ev.trigger ?? '') ? 'alert' : 'peer')
 /** what the router marked on an event, as fields of its record (PL1) */
 const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
