@@ -5,14 +5,16 @@ Register it for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, S
 every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopback MCP token) and prints what the daemon answers:
   SessionStart  the registration: the main-only rules, or "you are not the main"
   PreToolUse    on the reply tool (…__reply): the summary gate (main-summary-gate.py reason(p, turn)) over the `turn` the daemon answers;
-                its deny reason refuses the reply
+                its deny reason refuses the reply. On send_to_agent (002v): when the daemon answers mark_no_reply (the turn took in the last
+                message of a conversation the thread gate stopped, and this send goes to that peer), the send runs with no_reply set (updatedInput)
   PostToolUse   every tool's input (each string cut to 3000 chars) and result (text, cut to 20000 chars; tool_error) go to the daemon, which
                 keeps this turn's calls; it answers the items that reached the main during this turn (pulled at this tool boundary; additionalContext)
   Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes Joey a line (the daemon's M3 check:
                 the Joey line of an event bound to this turn, owned by the main and not met) is held (decision block, naming each event); else
                 the model aids run (an undecided Joey memory proposal over the daemon's
                 `proposals` / `turn` / `curator`, the answered check over the items M1 bound to this turn, which also asks whether the
-                turn's last words (the payload's last_assistant_message, after the turn's last output) reached anyone); when nothing holds the turn, the
+                turn's last words (the payload's last_assistant_message, after the turn's last output) reached anyone; 002v: a turn that took in
+                nothing is asked over the `context` the daemon hands: the work it carries on); when nothing holds the turn, the
                 daemon is told the turn really ended
 The daemon decides everything and hands the aids the turn (items, calls, start times); this script and its aids read no transcript.
 A hook event that carries `agent_id` fired inside a subagent (Claude Code runs the session's tool hooks for a subagent's calls too): it is not
@@ -108,6 +110,9 @@ def main():
                 body['tool_timeout_ms'] = int(ti.get('timeout') or os.environ.get('BASH_DEFAULT_TIMEOUT_MS') or 120000)
             except (TypeError, ValueError):
                 body['tool_timeout_ms'] = 120000
+    if ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):   # 002v: the router may mark it no_reply (a stopped conversation)
+        ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
+        body['tool_input'] = {'to': ti.get('to'), 'no_reply': ti.get('no_reply')}
     if ev == 'PostToolUse':                              # every tool: the daemon keeps this turn's calls (reply / send_to_agent keep their to, reply_to, text keys)
         body['tool_input'] = trim_input(p.get('tool_input'))
         tr = p.get('tool_response')
@@ -124,13 +129,16 @@ def main():
         out({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': r['additionalContext']}})
     elif ev == 'PostToolUse' and r.get('additionalContext'):
         out({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': r['additionalContext']}})
+    elif ev == 'PreToolUse' and r.get('mark_no_reply') and str(p.get('tool_name') or '').endswith('__send_to_agent') and isinstance(p.get('tool_input'), dict):
+        # 002v: updatedInput replaces the whole input (hooks reference, PreToolUse decision control): the main's own input with no_reply set
+        out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'updatedInput': {**p['tool_input'], 'no_reply': True}}})
     elif ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__reply') and isinstance(r.get('turn'), dict):
         deny = aid('main-summary-gate.py', 'reason', p, r['turn'])
         if deny:
             out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': deny}})
     elif ev == 'Stop':
         held = r.get('block') or aid('main-memory-gate.py', 'reason', p, r.get('turn') or {}, r.get('proposals') or [], bool(r.get('curator'))) \
-            or aid('main-answered-gate.py', 'reason', p, r.get('items') or [], r.get('outputs') or [], r.get('turn') or {})
+            or aid('main-answered-gate.py', 'reason', p, r.get('items') or [], r.get('outputs') or [], r.get('turn') or {}, r.get('context'))
         if held:
             out({'decision': 'block', 'reason': held})
             return

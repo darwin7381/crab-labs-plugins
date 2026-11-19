@@ -63,6 +63,9 @@ export type MainEnv = {
   joeyOwed?: (events: string[]) => Array<{ id: string; from: string; text: string }>
   /** the memory gate's facts (M3): the open Joey-sourced proposals, and whether a curator lane holds the write right */
   memory?: () => { proposals: Array<{ id: string; ts: string; lane: string; text: string }>; curator: boolean }
+  /** 002v (C04): of these events, the senders of those the router's thread gate stopped (the event record's `stop`): the main's answer to them
+   *  in the turn that took the stop in is the last line of that conversation, so the router marks it no_reply ("不用回" is the router's) */
+  stoppedPeers?: (events: string[]) => string[]
 }
 
 export type MainEvent = {
@@ -75,8 +78,9 @@ export type MainEvent = {
  *  it (the digest's content is the digest), and its tool calls with their results (main-hook.py posts every PostToolUse) */
 export type Turn = { prompt_id: string; started_at: string | null; prev_started_at: string | null
   items: Array<{ id: string; kind: string; content: string; user: string }>; calls: Array<{ name: string; input: any; result: string; error: boolean }> }
+type AidItem = { mid: string; kind: string; user: string; no_reply: boolean; system: boolean; body: string }
 export type MainReply = { accepted?: boolean; additionalContext?: string; block?: string; turn?: Turn; proposals?: unknown[]; curator?: boolean
-  items?: Array<{ mid: string; kind: string; user: string; no_reply: boolean; system: boolean; body: string }>; outputs?: Output[] }
+  items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string }
 type Output = { to: string; reply_to: string; text: string }
 
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
@@ -100,15 +104,21 @@ export function createMain(E: MainEnv) {
   const outputs = new Map<string, Output[]>()            // prompt id → the reply / send_to_agent calls of that turn (answered gate)
   const calls = new Map<string, Turn['calls']>()          // prompt id → every tool call of that turn with its result (the summary gate)
   const starts = new Map<string, { prompt: string; at: string; prev: string | null }>()   // gen → its running turn's start, and the start of the turn before
+  // 002v (002s r2 G02, u002s-G02-s2-r2-20261119-221622): gen → the work its turns carry on: the items of the last turn that took any in, and every
+  // output since. A turn that takes in nothing (a background task's notification opened it, Claude Code starts it on its own) continues that work:
+  // the last-words check reads the work's messages and outputs for it (that turn ended on Joey's 194, never sent, and had no items to ask about).
+  const work = new Map<string, { items: AidItem[]; outputs: Output[] }>()
   let stuck: { gen: string; prompt: string | null; at: number } | null = null
   let offering = false
   let seq = 0
 
   const J = (): Journal => E.journal
+  const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
+    user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
     cur = null; stuck = null; offering = false
-    lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear()
+    lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
     const g = live[live.length - 1]
@@ -254,7 +264,7 @@ export function createMain(E: MainEnv) {
     const back = requeue(r => r.gen === g.id, 'gen_end')
     setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null, stopped_prompt: null })
     if (cur === g.id) cur = null
-    pendingEnd.delete(g.id); lastEventAt.delete(g.id)
+    pendingEnd.delete(g.id); lastEventAt.delete(g.id); work.delete(g.id)
     if (stuck?.gen === g.id) stuck = null
     // 002q (T8-R): the notice is the line Joey gets about each cut message, so it is on their events (it meets their Joey line)
     const told = cut.filter(r => r.kind !== 'digest')
@@ -309,6 +319,13 @@ export function createMain(E: MainEnv) {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
+        if (/__send_to_agent$/.test(String(b.tool_name ?? '')) && b.tool_input?.no_reply !== true && E.stoppedPeers) {
+          // 002v (002s r2 C04, u002s-C04-s2-r2-20261119-215937): the thread gate stopped the conversation and handed its last message to this turn; the
+          // main's answer to that peer ends it. "不用回" is the router's to enforce (identity.md), not the model's to remember: the hook marks the send.
+          const evs = [...new Set(items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done')).map(r => String(r.event ?? '')).filter(Boolean))]
+          const to = String(b.tool_input?.to ?? '').trim().toLowerCase()
+          if (to && E.stoppedPeers(evs).includes(to)) return { mark_no_reply: `the conversation with ${to} was stopped by the thread gate; this answer ends it` }
+        }
         return /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p) } : {}   // PL5: the summary gate judges the reply against this turn
       }
       case 'PostToolUse': {
@@ -340,9 +357,15 @@ export function createMain(E: MainEnv) {
               return { block: `這一輪還欠 Joey 一句，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」`).join('；')}。用 reply 回 Joey（一則可以回全部），再結束這一輪。` }
             }
           }
-          return { items: bound.map(r => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
-            user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }), outputs: outputs.get(p) ?? [],
+          const its = bound.map(aidItem), w = its.length ? undefined : work.get(g.id)
+          return { items: its, outputs: outputs.get(p) ?? [], ...(w ? { context: { items: w.items, outputs: w.outputs } } : {}),
             turn: turnOf(J().get('main', g.id)!, p), ...(E.memory ? E.memory() : { proposals: [], curator: false }) }   // PL5: the memory gate's facts
+        }
+        { // 002v: the work this turn leaves for the next (the turn's items, or the outputs it adds to the work it carried on)
+          const mine = items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done') && r.kind !== 'digest').map(aidItem)
+          const outs = outputs.get(p) ?? [], w = work.get(g.id)
+          if (mine.length) work.set(g.id, { items: mine.slice(-6), outputs: outs.slice(-12) })
+          else if (w && outs.length) w.outputs = [...w.outputs, ...outs].slice(-12)
         }
         finish(r => r.gen === g.id && r.prompt_id === p)
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop

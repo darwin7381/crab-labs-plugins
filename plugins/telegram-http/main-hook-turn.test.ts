@@ -133,3 +133,18 @@ test('002r H05: a hook event that carries agent_id (a subagent\'s tool call) is 
   expect((await hook(w, { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: {}, tool_response: 'x' })).hookSpecificOutput.additionalContext).toBe('one item reached you')
   expect(posted[0].sub).toBeUndefined()
 })
+
+// 002v (002s r2 C04, u002s-C04-s2-r2-20261119-215937): the daemon answers a send_to_agent PreToolUse with mark_no_reply (the turn took in a stopped
+// conversation's last message and the send goes to that peer): the hook runs the main's own input with no_reply set (updatedInput replaces the whole
+// input). The daemon is told only who it goes to and whether no_reply is set; another peer, or another tool: nothing.
+test('002v C04: PreToolUse of send_to_agent marked by the daemon runs with no_reply set, the rest of the input unchanged; unmarked or another tool: nothing', async () => {
+  const w = world(), SEND = 'mcp__plugin_agent-inbox_agent-inbox__send_to_agent'
+  const input = { to: 'eve', text: '維護時段是每週三 02:00–03:00（UTC+8）。', line: 'mail', ask: '無' }
+  fresh(b => b.tool_name === SEND && b.tool_input?.to === 'eve' ? { mark_no_reply: 'stopped' } : {})
+  const o = await hook(w, { hook_event_name: 'PreToolUse', tool_name: SEND, tool_input: input })
+  expect(o).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { ...input, no_reply: true } } })
+  expect(posted.at(-1).tool_input).toEqual({ to: 'eve', no_reply: null })
+  expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: SEND, tool_input: { ...input, to: 'cain' } })).toBeNull()
+  fresh(() => ({ mark_no_reply: 'stopped' }))
+  expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } })).toBeNull()
+})

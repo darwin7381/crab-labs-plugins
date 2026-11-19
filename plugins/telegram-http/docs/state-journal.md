@@ -126,6 +126,16 @@ prompt whose Stop made it idle (a later event of that prompt re-opens the turn; 
    reply / send_to_agent (`turn.calls`) and ends on a text of substance (the Stop payload's `last_assistant_message`; no transcript is read), Jev
    is asked whether that text states an answer or result a sender asked for which no output of the turn contains; yes holds the turn once
    (「你最後寫的那段結果只出現在你自己的畫面上…」). An acknowledgement before the work met the event's Joey line, so step 2 holds nothing here.
+   002v (002s r2 G02): every turn of the main is asked, whatever opened it. A turn that took in nothing (its own background task's notification
+   opened it; Claude Code starts such turns on its own) carries on the work of the gen's last turn that took items in: the daemon keeps that work
+   (its items, and every output since) and hands it with the Stop check as `context`; the answered gate asks the same question over the work's
+   messages and outputs, and when the turn itself sent nothing, all of it came after the last output. Before this, such a turn had no items and
+   no outputs and was never asked: the main counted 20 pages after a restart, ended the notification's turn on 「the total is 194」, and Joey never
+   got it.
+   002v (002s r2 C04): "不用回" is the router's (identity.md). At PreToolUse of send_to_agent the hook tells the daemon who it goes to; when the
+   turn took in the last message of a conversation the thread gate stopped (the event's `stop`) and the send goes to that peer, the daemon answers
+   `mark_no_reply` and the hook runs the main's own input with `no_reply: true` (`updatedInput`). Another peer, a send already no_reply and a
+   later turn (a new conversation is the main's to open) are not marked. The stop's hand-over tells the main its answer will be marked.
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
 - An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once

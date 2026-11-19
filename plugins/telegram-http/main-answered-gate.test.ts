@@ -122,7 +122,7 @@ test('a message marked no_reply, and a system notice, never need a reply', async
 const call = (name: string, error = false) => ({ name, input: {}, result: error ? 'failed' : 'ok', error })
 const REPLY = 'mcp__plugin_telegram-http_telegram-http__reply'
 const ACK = '收到，開始一頁一頁抓，抓完回你總數。', FINAL = '5xx 總行數是 194 行，來自 4,769 行存取日誌（1–20 頁，每頁 250 行，第 20 頁 19 行）。'
-async function runLast(o: { final?: string; calls?: any[]; outputs?: any[]; items?: any[]; prompt?: string; env?: Record<string, string>; dir?: string }) {
+async function runLast(o: { final?: string; calls?: any[]; outputs?: any[]; items?: any[]; prompt?: string; env?: Record<string, string>; dir?: string; context?: any }) {
   const d = o.dir ?? mkdtempSync(join(tmpdir(), 'gate-'))
   mkdirSync(join(d, '.lanes', 'run'), { recursive: true })
   const p = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
@@ -130,7 +130,7 @@ async function runLast(o: { final?: string; calls?: any[]; outputs?: any[]; item
   p.stdin.write(JSON.stringify({ hook_event_name: 'Stop', session_id: 's1', cwd: d, last_assistant_message: o.final ?? FINAL, lanes_turn: {
     items: o.items ?? [{ mid: '2003', kind: 'tg', user: 'joey_lab', no_reply: false, system: false, body: '把日誌第 1 頁到第 20 頁一頁一頁抓，數每一頁有幾行 5xx，給我總數。' }],
     outputs: o.outputs ?? [{ to: 'Joey', reply_to: '', text: ACK }],
-    turn: { prompt_id: o.prompt ?? 'p1', calls: o.calls ?? [call(REPLY), call('Bash'), call('Bash')] } } })); p.stdin.end()
+    turn: { prompt_id: o.prompt ?? 'p1', calls: o.calls ?? [call(REPLY), call('Bash'), call('Bash')] }, ...(o.context ? { context: o.context } : {}) } })); p.stdin.end()
   const out = (await new Response(p.stdout).text()).trim(); await p.exited
   const logp = join(d, '.lanes', 'run', 'answered-gate.jsonl')
   return { out: out ? JSON.parse(out) : null, dir: d, log: existsSync(logp) ? readFileSync(logp, 'utf8').trim().split('\n').map(l => JSON.parse(l)) : [] }
@@ -167,4 +167,22 @@ test('002r: a failed Jev call holds nothing; shadow mode records and never holds
   mode = 'fail'; let r = await runLast({}); expect(r.out).toBeNull(); expect(r.log.at(-1).error).toBeTruthy()
   mode = 'answered'; r = await runLast({ env: { ANSWERED_GATE_MODE: 'shadow' } }); expect(r.out).toBeNull(); expect(r.log.at(-1)).toMatchObject({ mode: 'shadow', blocked: [], unsent: { p: 0.97 } })
   r = await runLast({ calls: [call(REPLY), call('Bash'), call('mcp__plugin_agent-inbox_agent-inbox__send_to_agent')] }); expect(r.out).toBeNull()   // the send was the last call
+})
+
+// 002v (002s r2 G02, u002s-G02-s2-r2-20261119-221622): the main's turn opened by its own background task's notification took in nothing and ended on
+// "the total is **194**", never sent. The daemon hands such a turn the work it carries on (`context`: the last turn's items, every output since).
+test('002v G02: a turn that took in nothing is asked over the work it carries on; the answer written after a background task, never sent, holds it once', async () => {
+  calls = []; mode = 'answered'; unsentP = 0.97
+  const ctx = { items: [{ mid: '2003', kind: 'tg', user: 'joey_lab', no_reply: false, system: false, body: '把日誌第 1 頁到第 20 頁一頁一頁抓，數每一頁有幾行 5xx，給我總數。' }],
+    outputs: [{ to: 'Joey', reply_to: '', text: ACK }] }
+  const r = await runLast({ items: [], outputs: [], context: ctx, calls: [call('Bash')] })
+  expect(r.out.decision).toBe('block'); expect(r.out.reason).toContain('只出現在你自己的畫面上')
+  expect(calls[0].state.outputs).toEqual([{ to: 'Joey', text: ACK }]); expect(calls[0].state.messages[0]).toMatchObject({ from: 'joey_lab' })
+  expect(r.log.at(-1)).toMatchObject({ blocked: ['unsent'], unsent: { carried: true, calls_after: 1, p: 0.97 } })
+  expect((await runLast({ items: [], outputs: [], context: ctx, calls: [] })).out.decision).toBe('block')   // no call at all: all of the turn came after the last output
+  calls = []; unsentP = 0.08
+  expect((await runLast({ items: [], outputs: [], context: ctx, calls: [call('Bash')] })).out).toBeNull(); expect(calls.length).toBe(1)   // Jev: nothing new
+  calls = []; unsentP = 0.97
+  expect((await runLast({ items: [], outputs: [], calls: [call('Bash')] })).out).toBeNull(); expect(calls.length).toBe(0)    // no work handed: not asked, as before
+  expect((await runLast({ items: [], outputs: [], context: { items: [], outputs: [] }, calls: [call('Bash')] })).out).toBeNull(); expect(calls.length).toBe(0)
 })

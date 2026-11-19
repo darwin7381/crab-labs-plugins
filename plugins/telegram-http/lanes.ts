@@ -298,6 +298,8 @@ function mainEnv() {
     // main has seen it. The gate used "filed before the main's previous turn started" as a stand-in for that, which gives the main a whole extra
     // turn: in D02 the only turn after Joey's 「記住」 showed it and ended without deciding, and nothing held it.
     memory: () => memoryFacts(),
+    // 002v (C04): the senders of the events the thread gate stopped (stopThread writes `stop` on the event record)
+    stoppedPeers: (ids: string[]) => [...new Set(ids.flatMap(id => { const e = events?.get(id); return e?.stop && e.from ? [String(e.from).toLowerCase()] : [] }))],
   }
 }
 
@@ -885,7 +887,7 @@ function stopThread(ev: InEvent, t: Thread | null, gate: { why: 'hop' | 'budget'
   if (t) { t.stopped = why; drainStoppedThread(t.id, why) }
   saveState()
   const text = `停止投遞：${why}（thread ${t?.id ?? ev.thread ?? '-'}，寄件者 ${ev.from}）。內容：${ev.text.slice(0, 160)}`
-    + `\n這條對話線已經關閉：對方之後在這條線上再傳的訊息只會記進帳本，不會再開車道，也不會再叫醒你。還需要跟對方談，就用 send_to_agent 另開一則新的（不要帶 reply_to）。`
+    + `\n這條對話線已經關閉：對方之後在這條線上再傳的訊息只會記進帳本，不會再開車道，也不會再叫醒你。你在這一回合回 ${ev.from} 的話，分流器會標成「不用回」，這段往來就停在你這一句。之後還需要跟對方談，就用 send_to_agent 另開一則新的（不要帶 reply_to）。`
   ledger({ lane: laneId ?? 'router', thread: t?.id ?? ev.thread ?? null, event: ev.id, kind: 'stop', text })
   // 002r (C04): the peer is told once, in the router's fixed words, marked no_reply (as a flood is): its last message is with the main, this line ends the exchange
   if (owesPeer && D.role === 'tg' && events) void laneMeshSend({ to: ev.from, no_reply: true, reply_to: ev.btcc_msg_id, thread: t?.id ?? ev.thread ?? undefined, lane: 'router',

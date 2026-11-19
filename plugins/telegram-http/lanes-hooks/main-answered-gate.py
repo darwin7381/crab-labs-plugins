@@ -182,11 +182,13 @@ def judge(msgs, outs):
     return verdict, a
 
 
-def reason(p, msgs, outs, turn=None):
+def reason(p, msgs, outs, turn=None, context=None):
     """The block reason for a turn whose bound messages were not addressed, or whose last words reached nobody, or None.
-    msgs: [{mid, kind, user, no_reply, system, body}] (M1); outs: [{to, reply_to, text}]; turn: the daemon's turn ({prompt_id, calls}). Never raises."""
+    msgs: [{mid, kind, user, no_reply, system, body}] (M1); outs: [{to, reply_to, text}]; turn: the daemon's turn ({prompt_id, calls});
+    context (002v): for a turn that took in nothing, the work it carries on ({items, outputs}: the last turn that took items in, and every
+    output since). Never raises."""
     try:
-        return _reason(p, list(msgs or []), list(outs or []), turn)
+        return _reason(p, list(msgs or []), list(outs or []), turn, context if isinstance(context, dict) else None)
     except Exception:
         return None
 
@@ -230,23 +232,31 @@ def _save(sp, st):
         return False
 
 
-def _reason(p, msgs, outs, turn=None):
+def _reason(p, msgs, outs, turn=None, context=None):
     sid, d = p.get('session_id') or '', lanes_run_dir(p)
     turn = turn if isinstance(turn, dict) else {}
-    return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn)
+    return _missed(p, sid, d, msgs, outs) or _unsent(p, sid, d, msgs, outs, turn, context)
 
 
-def _unsent(p, sid, d, msgs, outs, turn):
-    """The hold for a turn whose last words reached nobody, or None. One hold per turn (the prompt id)."""
+def _unsent(p, sid, d, msgs, outs, turn, context=None):
+    """The hold for a turn whose last words reached nobody, or None. One hold per turn (the prompt id).
+    002v (002s r2 G02): a turn that took in nothing (a background task's notification opened it) carries on the work of the last turn that
+    took messages in: its messages and outputs are the question's, and when the turn itself sent nothing, all of it came after the last output."""
     final = str(p.get('last_assistant_message') or '').strip()
+    carried = not msgs and bool(context and context.get('items'))
+    own = list(outs)
+    if carried:
+        msgs, outs = list(context['items']), list(context.get('outputs') or []) + own
     after = calls_after_last_output(turn.get('calls'), bool(outs))
+    if carried and not own and outs:
+        after = max(after or 0, 1)
     if not msgs or not outs or not after or len(final) < UNSENT_MIN:
         return None
     sp = os.path.join(d, 'answered-gate.json')
     st, key = _load(sp), f"{sid}:unsent:{turn.get('prompt_id') or p.get('prompt_id') or ''}"
     if key in st:
         return None
-    facts = {'calls_after': after, 'chars': len(final)}
+    facts = {'calls_after': after, 'chars': len(final), **({'carried': True} if carried else {})}
     try:
         pr = unsent_p(msgs, outs, final)
     except Exception as e:                               # a failed call is an error, never a verdict
@@ -301,7 +311,7 @@ def main():
     except Exception:
         return
     t = p.get('lanes_turn') or {}
-    r = reason(p, t.get('items') or [], t.get('outputs') or [], t.get('turn'))
+    r = reason(p, t.get('items') or [], t.get('outputs') or [], t.get('turn'), t.get('context'))
     if r:
         print(json.dumps({'decision': 'block', 'reason': r}, ensure_ascii=False))
 
