@@ -63,7 +63,9 @@ How items move:
 - **Owed** (M4's one wake rule): an item is owed to the main only while its event carries an open `main` obligation (`toMain`'s record, a hand-over,
   the synthesis's hand-over, a renew brief's `renew-…` record). An item with no such obligation is never
   offered or pulled; the digest never is.
-- **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main, with the digest riding on it.
+- **Offer.** An idle gen is offered one notification: the oldest queued item that is owed to the main and whose own stream can take it (its `via`;
+  002w E, gap 4: an item whose stream is down waits without holding the others; 2a936a7 tried only the oldest, so a mesh item behind a closed inbox
+  stream held Joey's Telegram messages), with the digest riding on it.
   An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
   the SDK drops a notification without an error when it has no GET stream). If no such stream exists, the item stays `queued` and nothing is
   offered; the next pump (the stream opening, a Stop, the 5-second tick) tries again. An item is offered to a gen once, and once more only at a stuck
@@ -157,6 +159,9 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
   turn is the same episode: `probes` + 1, a longer `retry_at`, no new notice. The episode ends at the gen's next final Stop: `wall_since`,
   `probes` and `retry_at` are cleared and Joey is told once (`main-wall-down`).
 - A new gen starts `idle` or `starting`, whatever the lanes' wall says.
+- **The wall episode is the agent's, not a gen's** (002w E, gap 13): a gen that ends while walled (killed, replaced, restarted) hands its open episode
+  (`wall_since`, `wall_menu`) to the next gen at its SessionStart (the ended record's fields are cleared); that gen's first final Stop ends it with the
+  one wall-down notice. 2a936a7 lost the episode with the gen: Joey heard `main-wall-up` and never the recovery.
 - **One limit, one notice each way** (002q, G07, T7-R): the two walls stay two records, but Joey's wall notices read both. A side that walls while
   the other is already walled (`main-wall-up` with the lanes' wall up, `wall-up` with the main's episode open), or recovers while the other is still
   walled, is a ledger line (`tier: ledger`, `tier_rule: <rule>+same-limit`), not a push. Joey hears the wall when the first side hits it and the
@@ -530,4 +535,9 @@ from the offer when that came later. The alarm names the open tool.
   started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)
   and M1 offers again at once (a walled gen at its next probe time). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
 - The next hook event of the gen clears it, and Joey is told once. A later silence is a new episode.
+- **Owed items nobody can take** (002w E, gaps 4, 11) are an episode of the same rule: owed items queued for longer than `LANES_MAIN_STUCK_MS` while
+  there is no live gen (「主線不在」), or while the live gen is `idle` or `starting`, holds no offer and could not be offered them (its stream is down:
+  「主線收不到訊息」). One alarm per episode with the queued count (`main-undelivered`); the next delivery (an offer written, or items bound or pulled into
+  a turn) ends it and Joey is told once (`main-delivered`). The end of a gen does not end it. 2a936a7 counted only a gen in a turn or holding an offer:
+  a stream that never opened, or no main at all, left Joey's messages waiting with nobody told (his own messages have no `due_at`).
 - Nothing else moves this clock: a frozen main (SIGSTOP) is alarmed once and re-offered once; it gets what was written into it when it runs again.

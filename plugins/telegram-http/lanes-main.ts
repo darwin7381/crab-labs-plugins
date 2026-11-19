@@ -112,7 +112,8 @@ export function createMain(E: MainEnv) {
   // the last-words check reads the work's messages and outputs for it (that turn ended on Joey's 194, never sent, and had no items to ask about).
   // 002w (B): the work keeps its item ids and their event ids, so every per-turn duty of such a turn reads them (turnWork).
   const work = new Map<string, { items: AidItem[]; outputs: Output[]; ids: string[]; events: string[] }>()
-  let stuck: { gen: string; prompt: string | null; at: number } | null = null
+  /** the stuck episode: a live gen silent too long; or (002w E) `undelivered`: owed items nobody could take (no live gen, or one that cannot be offered them) */
+  let stuck: { gen: string | null; prompt: string | null; at: number; undelivered?: boolean } | null = null
   let offering = false
   let seq = 0
 
@@ -209,8 +210,10 @@ export function createMain(E: MainEnv) {
     const probe = g.state === 'walled' && Date.now() >= Number(g.retry_at ?? Infinity)
     if (g.state !== 'idle' && !probe) return
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
-    const it = items(r => r.state === 'queued' && owed(r) && forGen(r, g))[0]
-    if (!it) return
+    // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
+    // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
+    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g))
+    if (!cands.length) return
     if (probe) {
       const menu = E.menu ? await E.menu(true).catch(() => null) : null
       // 002q (T7-R 1016): a menu Joey must choose on is told now; one the probe dealt with asks nothing of him: it rides the episode's one wall-down notice
@@ -218,20 +221,34 @@ export function createMain(E: MainEnv) {
       const w = J().get('main', g.id)!
       setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)), ...(menu && !menu.asks ? { wall_menu: menu.text } : {}) })   // one probe offer per retry time
     }
-    const dg = attachInfo()
-    const ids = [it.id, ...(dg ? [dg.id] : [])]
-    const p = (it.notif?.params ?? {}) as Record<string, any>
-    const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${String(p.content ?? '')}` : String(p.content ?? '')
-    const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
-    let ok = false
-    try { ok = await E.offer(notif, it.via as Via, Number(g.pid)) } catch (e) { E.log('warn', `lanes: offer of ${it.id} failed: ${e}`) }
-    const now = currentGen()
-    if (!ok || !now || now.id !== g.id) {
-      if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
+    const down = new Set<string>()
+    for (const it of cands) {
+      if (down.has(String(it.via))) continue
+      const dg = attachInfo()
+      const ids = [it.id, ...(dg ? [dg.id] : [])]
+      const p = (it.notif?.params ?? {}) as Record<string, any>
+      const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${String(p.content ?? '')}` : String(p.content ?? '')
+      const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
+      let ok = false
+      try { ok = await E.offer(notif, it.via as Via, Number(g.pid)) } catch (e) { E.log('warn', `lanes: offer of ${it.id} failed: ${e}`) }
+      const now = currentGen()
+      if (!now || now.id !== g.id) return
+      if (!ok) {
+        down.add(String(it.via))
+        if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
+        continue
+      }
+      for (const id of ids) J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
+      J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
+      delivered()
       return
     }
-    for (const id of ids) J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
-    J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
+  }
+  /** 002w (E, gaps 4, 11): an item reached the main (offered, or bound at a boundary): an episode of owed items nobody could take is over */
+  function delivered(): void {
+    if (!stuck?.undelivered) return
+    stuck = null
+    E.tellJoey('主線接到訊息了：等著的訊息現在交給它。', 'main-delivered')
   }
 
   /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary */
@@ -242,6 +259,7 @@ export function createMain(E: MainEnv) {
     const all = dg ? [...got, dg] : got
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true })
     for (const r of got) J().write('wake', r.id, 'wake', { reason: `pulled into the running turn ${prompt}` })
+    delivered()
     return all.map(r => J().get('msg', r.id)!)
   }
   const SRC: Record<string, string> = { tg: 'telegram', inbox: 'agent-inbox' }
@@ -278,7 +296,7 @@ export function createMain(E: MainEnv) {
     setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null, stopped_prompt: null })
     if (cur === g.id) cur = null
     pendingEnd.delete(g.id); lastEventAt.delete(g.id); work.delete(g.id)
-    if (stuck?.gen === g.id) stuck = null
+    if (stuck?.gen === g.id && !stuck.undelivered) stuck = null              // 002w (E): what nobody could take is still waiting: that episode goes on
     // 002q (T8-R): the notice is the line Joey gets about each cut message, so it is on their events (it meets their Joey line)
     const told = cut.filter(r => r.kind !== 'digest')
     if (told.length) E.tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${told.length} 則訊息不會自動交給新的主線：${told.map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart',
@@ -297,6 +315,7 @@ export function createMain(E: MainEnv) {
     // what the prompt names (its did="…"), and whatever was offered to this gen: one offer opens one turn, so it is this turn's
     const bind = items(r => (r.state === 'offered' && r.gen === g.id) || (ids.has(r.id) && r.state === 'queued' && forGen(r, g)))
     for (const r of bind) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt })
+    if (bind.length) delivered()
   }
   /** the prompt the gen last stopped is running again: a Stop hook other than ours blocked that Stop. The turn was not over: it re-opens, and
    *  what that Stop closed is bound to it again. An item offered in the gap is not this turn's: it opens its own prompt (beginTurn). */
@@ -323,7 +342,7 @@ export function createMain(E: MainEnv) {
     // sign of life; an idle main that leaves an offer untaken is not excused by its background agents.
     if (b.sub && g.state !== 'in_turn') return {}
     lastEventAt.set(g.id, Date.now())
-    if (stuck && stuck.gen === g.id) { stuck = null; E.tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
+    if (stuck && !stuck.undelivered && stuck.gen === g.id) { stuck = null; E.tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
     if (b.sub) return {}                                                    // in an open turn: a sign of life (and the all-clear), nothing else
     const p = String(b.prompt_id ?? '')
     switch (ev) {
@@ -431,7 +450,12 @@ export function createMain(E: MainEnv) {
     if (same && same.state === 'in_turn' && same.prompt_id) requeue(r => r.gen === same.id && r.prompt_id === same.prompt_id, 'session_start')
     const id = String(pid)
     if (b.source === 'clear') work.delete(id)                               // 002w (B, 24a): the new session never saw that work
-    J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null })
+    // 002w (E, gap 13): the main's wall is an episode of the AGENT: a gen that ended walled hands its open episode to this one, whose first final Stop
+    // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
+    const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
+    const carry = ended.length ? { wall_since: ended.map(r => String(r.wall_since)).sort()[0], wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
+    for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, probes: null, retry_at: null, wall_menu: null })
+    J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null, ...carry })
     cur = id
     lastEventAt.set(id, Date.now())
     try { E.expect?.(sid) } catch {}                                       // 002v: the main's session now (a /clear changed it): the next launch's id
@@ -451,6 +475,18 @@ export function createMain(E: MainEnv) {
     if (!E) return
     const g = currentGen()
     if (g && !E.pidAlive(Number(g.pid))) { endGen(g, pendingEnd.get(g.id) ?? 'killed'); return }
+    // 002w (E, gaps 4, 11): owed items queued past MAIN_STUCK_MS that nobody could take: no live gen, or a live gen that is neither in a turn (it would
+    // pull them), nor walled (its wall notice told Joey), nor holding an offer (an offer it does not take is the silence rule below), and could not be
+    // offered them. One alarm per episode, with the count; the next delivery ends it.
+    if (!stuck && (!g || ((g.state === 'idle' || g.state === 'starting') && !items(r => r.state === 'offered' && r.gen === g.id).length))) {
+      const owedNow = items(r => r.state === 'queued' && owed(r))
+      if (owedNow.some(r => now - Date.parse(String(r.ts)) > MAIN_STUCK_MS)) {
+        stuck = { gen: g?.id ?? null, prompt: null, at: now, undelivered: true }
+        const mins = Math.max(1, Math.round((now - Math.min(...owedNow.map(r => Date.parse(String(r.ts))))) / 60_000))
+        E.tellJoey(!g ? `主線不在：現在沒有登記中的主線，${owedNow.length} 則訊息等它（最久的等了 ${mins} 分鐘）。警報和同事的事由車道照常處理；主線一登記我就交給它並告訴你。`
+          : `主線收不到訊息：${owedNow.length} 則訊息送不進主線（它的訊息通道沒有開，最久的等了 ${mins} 分鐘；行程還活著）。警報和同事的事由車道照常處理；一送進去我會告訴你。`, 'main-undelivered')
+      }
+    }
     if (g && !stuck) {
       // 疑似卡死, on M2 alone: the gen owes a hook event (a turn is open, or an offer is unbound) and has sent none for MAIN_STUCK_MS. The silence counts
       // from its last hook event, or from the offer when that came later. One alarm per episode; the next hook event clears it (mainEvent).
