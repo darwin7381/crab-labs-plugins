@@ -104,11 +104,13 @@ test('D1: the digest lists every open Joey-sourced proposal again (no new activi
   const e = run('mesh', 'eve', 'peer', 'reflex')
   const eid = idOf(await L.callLaneTool(e, 'ledger_write', { kind: 'memory_proposal', text: 'Eve 的稿件排程一律 10:00' }))
   // the digest is M1 information (L.__digest: what rides the next delivery); an open Joey proposal is a line owed to the main in every digest until decided
-  const ack = (t: any) => { if (t) L.__journal().write('msg', `dg-d1-${Date.now()}`, 'done', { kind: 'digest', events: t.fields.events }) }
+  const ack = (t: any) => { if (t) L.__journal().write('msg', `dg-d1-${Date.now()}`, 'done', { kind: 'digest', events: t.fields.events, proposals: t.fields.proposals }) }
   const t1 = L.__digest()!
+  expect(L.memoryFacts().proposals.find(p => p.id === pid)!.shown).toBe(false)                         // 002v: not shown until a digest carrying it reaches the main
   expect(t1.text).toContain(`記憶提案 ${pid}｜`); expect(t1.text).toContain('還沒決定（Joey 說的話）'); expect(t1.text).toContain('需主線：用 memory_decide 決定'); expect(t1.text).toContain('一律 09:00')
   expect(t1.text).toContain(`記憶提案待決定：${eid}`); expect(t1.text).not.toContain(`記憶提案 ${eid}｜`)      // 002u: Eve's shows its id on its event's line, once (not a standing line)
   ack(t1)
+  expect(L.memoryFacts().proposals.find(p => p.id === pid)!.shown).toBe(true)                          // the digest that carried it is done: the gate may hold
   expect(L.__main().items(r => r.kind !== 'digest').length).toBe(0)                                        // nothing is owed to the main: a proposal never wakes it
   expect(L.__digest()!.text).toContain(pid)                                                                // nothing new, but the next delivery carries it again
   expect(L.__digest()!.text).not.toContain(eid)                                                            // Eve's was not said by Joey: not re-listed

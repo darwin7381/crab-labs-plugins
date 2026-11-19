@@ -294,7 +294,10 @@ function mainEnv() {
       return e && owes ? [{ id, from: e.class === 'joey' ? 'Joey' : String(e.from ?? '?'), text: String(e.text ?? '') }] : []
     }),
     // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
-    memory: () => ({ proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text })), curator: !!S?.curator }),
+    // 002v (002u r1 D02, u002u-D02-s2-r1-20261119-231449): `shown` = a digest that carried the proposal's event reached the main (bound or done): the
+    // main has seen it. The gate used "filed before the main's previous turn started" as a stand-in for that, which gives the main a whole extra
+    // turn: in D02 the only turn after Joey's 「記住」 showed it and ended without deciding, and nothing held it.
+    memory: () => memoryFacts(),
   }
 }
 
@@ -3725,6 +3728,13 @@ export function ledgerQueryTool(a: any): string {
 function stripReview(text: string): string { return String(text ?? '').split('\n〔Jev')[0].trim() }
 /** M3 (PL1): a memory proposal lives on the record of the event whose run filed it (`proposals`); its decision too. The ledger lines are the audit. */
 type Proposal = { id: string; text: string; joey: boolean; at: string; lane: string; decision?: string; decided_at?: string; writer?: string }
+/** the main's memory gate's facts: the open Joey proposals, each with `shown` = a digest that carried it reached the main (bound or done; 002v),
+ *  and whether the curator holds the write right */
+export function memoryFacts(): { proposals: Array<{ id: string; ts: string; lane: string; text: string; shown: boolean }>; curator: boolean } {
+  const seen = new Set<string>()
+  for (const r of main?.items(x => x.kind === 'digest' && (x.state === 'bound' || x.state === 'done')) ?? []) for (const id of (Array.isArray(r.proposals) ? r.proposals : []) as string[]) seen.add(id)
+  return { proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => ({ id: p.id, ts: p.at, lane: p.lane, text: p.text, shown: seen.has(p.id) })), curator: !!S?.curator }
+}
 function proposalsOf(pred: (p: Proposal) => boolean = () => true): Array<{ e: Row; p: Proposal }> {
   const out: Array<{ e: Row; p: Proposal }> = []
   for (const e of events?.rows(r => Array.isArray(r.proposals)) ?? []) for (const p of e.proposals as Proposal[]) if (pred(p)) out.push({ e, p })
@@ -4097,7 +4107,8 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   if (!d) return null
   routeRow({ event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
-  return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items } }
+  return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items,
+    proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => p.id) } }   // 002v: the standing Joey proposals it carried (the memory gate's `shown`)
 }
 /** the lines every view carries while they last: open Joey memory proposals (002k D1) and active peer holds */
 function standingLines(): { proposals: string[]; holds: string[] } {

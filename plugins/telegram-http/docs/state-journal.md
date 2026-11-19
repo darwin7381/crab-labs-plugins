@@ -88,6 +88,8 @@ Fields:
 - `done` clears an earlier `reason`; it may carry `reason: asked_restart` (special case 1 below).
 - Digest items also have `events` and `items`:
   - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
+  - `proposals`: the ids of the open Joey memory proposals it carries as standing lines (002v): a digest of these that is `bound` or `done`
+    means the main was shown them, and the main's memory gate holds the Stop of a turn while one is still undecided;
   - `items`: how many entries the digest lists (event lines plus the standing lines: open Joey memory proposals and peer holds).
 
 ### `main` (M2): one record per main process

@@ -1,4 +1,5 @@
-// Universe 002k (D1): the main's Stop hook holds the turn ONCE while a Joey-sourced memory proposal is undecided and older than one main turn.
+// Universe 002k (D1): the main's Stop hook holds the turn ONCE while a Joey-sourced memory proposal is undecided and has been shown to the main
+// (002v: a digest that carried it reached the main; until 002v: "older than one main turn", which gave the main an extra turn: 002u D01, D02).
 // Run as Claude Code runs it (stdin payload, stdout decision). No network, no model.
 // 002p: the gate reads neither the ledger, state.json nor the transcript. The daemon hands it the turn (prompt_id, started_at, prev_started_at),
 // the open Joey-sourced proposals (decided and non-Joey ones are the daemon's to leave out) and whether a curator holds the write right.
@@ -11,8 +12,8 @@ const GATE = join(import.meta.dir, 'lanes-hooks', 'main-memory-gate.py')
 const MAIN_HOOK = join(import.meta.dir, 'lanes-hooks', 'main-hook.py')        // the main's Stop hook: the memory gate, then the answered aid
 const rec = (o: object) => JSON.stringify(o) + '\n'
 const prompt = (ts: string, text = '<channel source="telegram" message_id="1">hi</channel>') => rec({ type: 'user', timestamp: ts, message: { role: 'user', content: text } })
-type Proposal = { id: string; ts: string; lane: string; text: string }
-const proposal = (id: string, ts: string): Proposal => ({ id, ts, lane: 'adam.worker.1', text: '記住：mock 服務的例行排程一律 09:00。\n〔Jev 檢查：有依據〕' })
+type Proposal = { id: string; ts: string; lane: string; text: string; shown: boolean }
+const proposal = (id: string, ts: string, shown = true): Proposal => ({ id, ts, lane: 'adam.worker.1', text: '記住：mock 服務的例行排程一律 09:00。\n〔Jev 檢查：有依據〕', shown })
 const T = (m: number) => `2026-11-13T02:${String(m).padStart(2, '0')}:00.000Z`
 /** the daemon's turn: the starts of the main's turns so far, the last one is this turn */
 const turnOf = (starts: string[]) => starts.length ? { prompt_id: `p-${starts.at(-1)}`, started_at: starts.at(-1)!, prev_started_at: starts.length > 1 ? starts.at(-2)! : null, items: [], calls: [] } : {}
@@ -31,8 +32,8 @@ async function hook(script: string, s: S, extra: object = {}) {
 }
 const OPEN = [proposal('mp-aaa111', T(5))]
 
-test('D1 hook: a Joey-sourced proposal filed before the main\'s previous turn is held once; the same turn passes the second time; the next turn holds again', async () => {
-  const s = setup(OPEN, [T(1), T(10), T(20)])                                           // filed 02:05; turns start 02:01, 02:10, 02:20: a whole turn (02:10) went by
+test('D1 hook: a Joey-sourced proposal the main has been shown is held once; the same turn passes the second time; the next turn holds again', async () => {
+  const s = setup(OPEN, [T(1), T(10), T(20)])                                           // the digest that carried it reached the main
   const r = await hook(GATE, s)
   expect(r.decision).toBe('block')
   expect(r.reason).toContain('mp-aaa111'); expect(r.reason).toContain('一律 09:00'); expect(r.reason).not.toContain('Jev 檢查'); expect(r.reason).toContain('memory_decide(proposal_id, accept|rewrite|veto, reason)')
@@ -43,12 +44,10 @@ test('D1 hook: a Joey-sourced proposal filed before the main\'s previous turn is
   expect(Object.keys(JSON.parse(readFileSync(join(s.ld, 'run', 'memory-gate.json'), 'utf8')))).toEqual([`s1:p-${T(20)}`, `s1:p-${T(40)}`])   // <session>:<prompt_id>
 })
 
-test('D1 hook: not older than one main turn: the turn it was filed in, and the next one, are not held; the turn after that is', async () => {
-  expect(await hook(GATE, setup(OPEN, [T(1), T(10)]))).toBeNull()                      // filed 02:05, previous turn started 02:01: the main has not had a turn with it yet
-  expect(await hook(GATE, setup(OPEN, [T(10)]))).toBeNull()                             // a first turn (prev_started_at null)
-  expect(await hook(GATE, setup([proposal('mp-late', T(12))], [T(1), T(10)]))).toBeNull()   // filed during the current turn
-  expect((await hook(GATE, setup(OPEN, [T(6), T(10)]))).decision).toBe('block')         // the previous turn (02:06) began after it was filed: a whole turn has gone by
-  expect((await hook(GATE, setup(OPEN, [T(6), T(10), T(15)]))).decision).toBe('block')
+test('002v (002u D01, D02): shown, not "a turn later": the first turn the main sees it in is held; one it has not been shown is not', async () => {
+  expect((await hook(GATE, setup(OPEN, [T(10)]))).decision).toBe('block')             // a first turn, shown in its digest: held (was: not held until a turn later)
+  expect((await hook(GATE, setup([proposal('mp-late', T(12))], [T(1), T(10)]))).decision).toBe('block')   // filed during the turn and shown in it
+  expect(await hook(GATE, setup([proposal('mp-unseen', T(5), false)], [T(1), T(10), T(20)]))).toBeNull()   // the digest carrying it has not reached the main
 })
 
 test('D1 hook: nothing is held with no open proposal (the daemon leaves decided and non-Joey ones out), a curator holding the write right, or a non-Stop event', async () => {
@@ -60,15 +59,15 @@ test('D1 hook: nothing is held with no open proposal (the daemon leaves decided 
   expect(await hook(GATE, { d: mkdtempSync(join(tmpdir(), 'mgate-')), ld: '/nonexistent/.lanes', turn: turnOf(turns), proposals: [], curator: false })).toBeNull()
 })
 
-test('D1 hook: every open proposal handed in that is old enough is listed, in the order given', async () => {
-  const r = await hook(GATE, setup([proposal('mp-one', T(5)), proposal('mp-two', T(6)), proposal('mp-new', T(15))], [T(1), T(10), T(20)]))
+test('D1 hook: every open proposal handed in that the main has been shown is listed, in the order given', async () => {
+  const r = await hook(GATE, setup([proposal('mp-one', T(5)), proposal('mp-two', T(6)), proposal('mp-new', T(15), false)], [T(1), T(10), T(20)]))
   expect(r.reason).toContain('mp-one'); expect(r.reason).toContain('mp-two'); expect(r.reason).not.toContain('mp-new')
   expect(r.reason.indexOf('mp-one')).toBeLessThan(r.reason.indexOf('mp-two'))
 })
 
 test('D1 / 002p: the gate reads no transcript and no ledger: only `turn` and `proposals` decide; standalone without `turn` it does nothing', async () => {
   const ledgerLine = rec({ ts: T(5), lane: 'adam.worker.1', kind: 'memory_proposal', text: '記住：x', notify_main: true, refs: { proposal_id: 'mp-ledger', joey: true } })
-  const s = setup(OPEN, [T(10)])                                                        // the turn: a first turn; the transcript: three turns
+  const s = setup([proposal('mp-aaa111', T(5), false)], [T(1), T(10), T(20)])         // the daemon says not shown; the transcript and ledger say more
   writeFileSync(join(s.d, 't.jsonl'), prompt(T(1)) + prompt(T(10)) + prompt(T(20)) + rec({ type: 'system', subtype: 'turn_duration', uuid: 'u1' }))
   writeFileSync(join(s.ld, 'ledger.jsonl'), ledgerLine)
   expect(await hook(GATE, s)).toBeNull()

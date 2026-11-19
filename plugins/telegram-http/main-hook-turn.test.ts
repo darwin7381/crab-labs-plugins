@@ -80,7 +80,7 @@ test('PreToolUse of the reply tool: the summary gate runs on the daemon\'s turn;
 test('Stop: the memory gate runs on the daemon\'s proposals and turn; a held turn is not reported final; curator holds nothing', async () => {
   const w = world()
   const turn = { prompt_id: 'p3', started_at: '2026-11-13T02:20:00.000Z', prev_started_at: '2026-11-13T02:10:00.000Z', items: [], calls: [] }
-  const proposals = [{ id: 'mp-aaa111', ts: '2026-11-13T02:05:00.000Z', lane: 'adam.worker.1', text: '記住：例行排程一律 09:00。' }]
+  const proposals = [{ id: 'mp-aaa111', ts: '2026-11-13T02:05:00.000Z', lane: 'adam.worker.1', text: '記住：例行排程一律 09:00。', shown: true }]   // 002v: the main was shown it
   fresh(() => ({ turn, proposals, curator: false }))
   const r = await hook(w, { hook_event_name: 'Stop' })
   expect(r.decision).toBe('block'); expect(r.reason).toContain('mp-aaa111'); expect(r.reason).toContain('memory_decide')

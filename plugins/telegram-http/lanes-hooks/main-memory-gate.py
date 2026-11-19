@@ -7,8 +7,9 @@ record says why. The reporting rule did not hold the main to it; this hook does,
   - the open proposals: ledger entries kind memory_proposal with refs.joey (set by the daemon from the event, never by the lane) that
     have no memory_decision with the same refs.proposal_id (the main's memory_decide tool writes it). 002p: the daemon computes them and
     hands them in (`proposals`: [{id, ts, lane, text}]); this file reads neither the ledger nor state.json nor any transcript;
-  - "older than one main turn": the proposal was filed before the start of the main's PREVIOUS turn (turn.prev_started_at), i.e. a whole
-    turn of the main has gone by with it listed in the digest (the digest lists every open Joey-sourced proposal again until it is decided);
+  - shown to the main: a digest that carried the proposal's event reached it (the daemon's `shown`; 002v). Until 002v the stand-in was
+    "filed before the start of the main's PREVIOUS turn", which gave the main a whole extra turn (002u D02: one turn after Joey's 「記住」,
+    the proposal in its digest, no decision, never held);
   - the turn is held ONCE: state run/memory-gate.json keeps <session>:<turn.prompt_id>; the second Stop of the same turn passes.
 
 While the curator lane holds the memory write right (`curator`, from the daemon) the main cannot accept anything, so nothing is held then.
@@ -42,10 +43,9 @@ def reason(p, turn, proposals, curator):
         if curator:
             return None                                       # the curator holds the write right: the main cannot accept
         turn = turn if isinstance(turn, dict) else {}
-        prev = parse_ts(turn.get('prev_started_at')) if turn.get('prev_started_at') else None
-        if prev is None:
-            return None                                       # the main has not had a turn before this one
-        old = [r for r in open_ if (parse_ts(r.get('ts')) or 0) < prev]
+        if not turn.get('prompt_id'):
+            return None                                       # no turn handed in by the daemon: nothing to hold
+        old = [r for r in open_ if r.get('shown') is True]      # the main has been shown it (a digest that carried it reached the main)
         if not old:
             return None
         ld = os.environ.get('LANES_DIR') or os.path.join(p.get('cwd') or os.getcwd(), '.lanes')
@@ -68,7 +68,7 @@ def reason(p, turn, proposals, curator):
         except OSError:
             return None                                       # cannot remember = would hold on every Stop: do not hold
         lines = '\n'.join(f"- {r['id']}（{r.get('lane', '')}，{r.get('ts', '')}）：{str(r.get('text', '')).split(chr(10) + '〔Jev')[0][:240]}" for r in old)
-        return ('這一輪先不要結束。Joey 說的話被車道記成記憶提案，過了主線的一整個回合，到現在還沒有決定：\n' + lines +
+        return ('這一輪先不要結束。Joey 說的話被車道記成記憶提案，你已經在摘要裡看到它，還沒有決定：\n' + lines +
                 '\n用 memory_decide(proposal_id, accept|rewrite|veto, reason) 決定：accept / rewrite 會照一般的方式寫進記憶，veto 只留決定紀錄。')
     except Exception:
         return None
