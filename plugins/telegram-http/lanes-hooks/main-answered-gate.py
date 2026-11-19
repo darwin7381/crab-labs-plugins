@@ -28,8 +28,9 @@ the real unsent answer: 0.99).
 
 002s, the unrecorded promise (universe 002r, C07; T6-R, T7-R): a turn that sent a peer a message and called no `commitment` is asked, per
 message, whether it promises the recipient something by a stated time. Yes = the turn is held once with the message quoted. Over the 100
-distinct messages the main sent peers in 002o..002r: 78 scored under 0.1, the clear promises 0.93 or more, the relayed ones ("Joey 決定：
-週五前…") 0.5 to 0.8; the threshold is 0.5.
+distinct messages the main sent peers in 002o..002r and the smoke of 002s: the promises and the relayed ones ("Joey 決定：週五前…由他找人") score
+0.61 or more, the others 0.36 or less (no date set yet, a maintenance window stated as a fact, something already delivered); the threshold
+is 0.5. The question asks for a deadline told to the recipient, whoever does the work: a relayed promise is tracked like the agent's own.
 """
 import json
 import os
@@ -59,9 +60,9 @@ PROMISE_SETTING = 'An operations agent sent each item of `messages` to a colleag
 
 def promise_q(i):
     return {'type': 'noul',
-            'instructions': f'Does the item of `messages` with id {i} promise its recipient that something will be delivered, done or answered by a stated time or date?',
-            'criteria': {'true': 'The message commits to a concrete time or date by which the recipient gets a deliverable, a result or an answer (for example: by Friday, before 12:00 tomorrow, within 30 minutes)',
-                         'false': 'The message promises nothing, or says someone will reply or decide later without stating by when, or refuses, or only reports facts'}}
+            'instructions': f'Does the item of `messages` with id {i} tell its recipient that something will be delivered, done or answered by a stated time or date?',
+            'criteria': {'true': 'The message states a concrete time or date by which the recipient gets a deliverable, a result or an answer (for example: by Friday, before 12:00 tomorrow, within 30 minutes), whoever will do the work: the sender, or someone the sender names',
+                         'false': 'The message states no time or date for anything still to come: it promises nothing, or says someone will reply or decide later without saying by when, or says no date is set yet, or refuses, or reports something already delivered'}}
 
 
 UNSENT_WORDS = ('這一輪先不要結束。你最後寫的那段結果只出現在你自己的畫面上，對方看不到。'
