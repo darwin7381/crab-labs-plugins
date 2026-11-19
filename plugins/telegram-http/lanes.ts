@@ -3473,12 +3473,17 @@ function declineAid(tok: RunTok): string | null {
 // 「每個回合都要回報一句、不准靜默」 (plan/decisions DC1) is the event's own record. When a run ends (normal, at a cap or the budget, or after its last failed
 // attempt), what the event already got is only recorded; the obligations still open (a line for Joey, an answer to a peer, a scheduler receipt) go to
 // the main as ONE hand-over (M4 wakes it through M1). An event that owes nothing wakes nobody (002n E02, 002m L6B6).
+// 002t (station 4, F01 zero-token): each event that still owes is handed over AS ITSELF: its own hand-over, its own text. A Joey message steered into
+// the run (a worker's topic) that the run ended without answering was listed in the run's hand-over but filed on the run's own event, with that
+// event's text; the main's report met the hand-over there, and the steered message stayed owed for ever (its route never settled).
 function exitRule(lane: Lane, it: QItem, said: string, max = 1000, steered: InEvent[] = []): void {
-  const evs = [it.ev.id, ...steered.map(e => e.id)]
-  const open = evs.flatMap(id => events.openObs(id).map(o => ({ id, o })))
-  if (!open.length) { journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run ended; the event owes nothing more: recorded only' }); return }
-  const what = open.map(x => x.o.kind === 'joey' ? 'Joey 還沒收到這件事的回報' : x.o.kind === 'peer' ? `${x.o.to} 還在等回答` : `排程 run ${x.o.run_id} 還沒有回執`).join('；')
-  handToMain(it.ev.id, lane, `${lane.id} 處理 ${it.ev.from} 的事，結束時還欠：${what}。請主線接手並回報（由你回報 Joey 一次）。${said}\n原文：${it.ev.text.slice(0, 300)}`, undefined, it.ev.cls ?? it.ev.trigger, max)
+  const owing = [it.ev, ...steered.filter(e => e.id !== it.ev.id)].map(ev => ({ ev, open: events.openObs(ev.id) })).filter(x => x.open.length)
+  if (!owing.length) { journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run ended; the event owes nothing more: recorded only' }); return }
+  for (const { ev, open } of owing) {
+    const what = open.map(o => o.kind === 'joey' ? 'Joey 還沒收到這件事的回報' : o.kind === 'peer' ? `${o.to} 還在等回答` : `排程 run ${o.run_id} 還沒有回執`).join('；')
+    handToMain(ev.id, lane, `${lane.id} 處理 ${ev.from} 的事，結束時還欠：${what}。請主線接手並回報（由你回報 Joey 一次）。${said}\n原文：${ev.text.slice(0, 300)}`, undefined,
+      ev.cls ?? ev.trigger ?? it.ev.cls ?? it.ev.trigger, max)
+  }
 }
 
 // ------------------------------------------------------------------ 002k: file claims, fan-out, curator
