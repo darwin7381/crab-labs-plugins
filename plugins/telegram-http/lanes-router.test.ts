@@ -20,9 +20,13 @@ const GO = join(dir, 'go'), bin = join(dir, 'lane.py')
 writeFileSync(bin, `#!/usr/bin/env python3
 import json, os, time
 t0 = time.time()
-while time.time() - t0 < 30 and not os.path.exists('${GO}'): time.sleep(0.02)
-try: os.remove('${GO}')
-except OSError: pass
+mine = '${GO}.' + os.environ.get('LANE_ID', '-')
+while time.time() - t0 < 30 and not os.path.exists('${GO}') and not os.path.exists(mine): time.sleep(0.02)
+for f in (mine, '${GO}'):
+    try:
+        os.remove(f)
+        break
+    except OSError: pass
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'ok'}), flush=True)
 `)
 chmodSync(bin, 0o755)
@@ -101,9 +105,10 @@ test('002p A05: follow-ups that quote the peer\'s own message go to its origin e
   }
   const c = await L.routeEvent(mk('cain', '我也想知道', { btcc_msg_id: '91004', reply_to_id: '91001' }))
   expect(c.rule).toBe('mesh-peer-new'); expect(c.lane).not.toBe(d1.lane)                    // only the thread's peer speaks in it
-  writeFileSync(GO, 'ok'); await until(() => L.__runTok(d1.lane!)?.evId === e2.id)           // e1's run ends; the follow-ups are the lane's next run, together
+  // 002w: each run is released by its own lane's file (GO.<lane id>): with one shared file, cain's waiting run could take the release meant for e1's (flaky)
+  writeFileSync(`${GO}.${d1.lane}`, 'ok'); await until(() => L.__runTok(d1.lane!)?.evId === e2.id)   // e1's run ends; the follow-ups are the lane's next run, together
   expect(L.__runTok(d1.lane!)?.evId).toBe(e2.id)
   expect(routing().find(r => r.event === e3.id && r.rule === 'coalesced')).toMatchObject({ into: e2.id, lane: d1.lane, thread: th })
-  writeFileSync(GO, 'ok'); await until(() => !L.__runTok(d1.lane!))
-  writeFileSync(GO, 'ok'); await until(() => !L.__runTok(c.lane!))
+  writeFileSync(`${GO}.${d1.lane}`, 'ok'); await until(() => !L.__runTok(d1.lane!))
+  writeFileSync(`${GO}.${c.lane}`, 'ok'); await until(() => !L.__runTok(c.lane!))
 }, 30_000)

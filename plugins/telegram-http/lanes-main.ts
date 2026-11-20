@@ -238,7 +238,9 @@ export function createMain(E: MainEnv) {
         if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
         continue
       }
-      for (const id of ids) J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
+      // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
+      // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
+      for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
       delivered()
       return
