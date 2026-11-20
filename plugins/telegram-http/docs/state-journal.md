@@ -567,3 +567,17 @@ from the offer when that came later. The alarm names the open tool.
   a turn) ends it and Joey is told once (`main-delivered`). The end of a gen does not end it. 2a936a7 counted only a gen in a turn or holding an offer:
   a stream that never opened, or no main at all, left Joey's messages waiting with nobody told (his own messages have no `due_at`).
 - Nothing else moves this clock: a frozen main (SIGSTOP) is alarmed once and re-offered once; it gets what was written into it when it runs again.
+
+## 002w, after 002v's round 3: two more paths of duties already owned
+
+- **One receipt per scheduler run, the main included** (duty D22, the receipt; 002v r3 T3-R, u002v-T3-a-r3-20261120-081010: a lane completed
+  run 62 through the daemon and the main completed it again 9 s later with `./bin/btcc-receipt`; two receipts reached the scheduler). The lane
+  path was already the daemon's (the lane guard hands the CLI to `/lane-receipt`, `completeRun`). The main's path is now asked too: at the
+  main's PreToolUse of a Bash call that carries `btcc-receipt`, main-hook.py posts the command and the daemon's `mainToolGate` answers `deny`
+  when run N's receipt is already met or being sent, or is still a lane's to send; it lets the call through when the main holds the receipt
+  (handed to it: met at PostToolUse, `mainToolDone`) or when no event of the router carries run N. The hook prints the deny.
+- **A fork's result does not go back through a hand-over** (overview.md 「複製之後各走各的，不會自動合回去」; 002v r3 F03,
+  u002v-F03-s5-r3-20261120-075430: the fork called handoff_main with its result and the main stopped to relay it). `handoff_main` from a
+  lane of kind fork is refused, with the words that say what to do (notify_joey, or ask_joey; the main reads it in the digest), and the
+  fork's lane context says it has no handoff_main. What a fork still owes when its run ends goes to the main by the exit rule, as for any lane.
+

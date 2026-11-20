@@ -148,3 +148,16 @@ test('002v C04: PreToolUse of send_to_agent marked by the daemon runs with no_re
   fresh(() => ({ mark_no_reply: 'stopped' }))
   expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } })).toBeNull()
 })
+
+// 002w (D; 002v r3 T3-R): the daemon refuses a second completion of a scheduler run at the main's PreToolUse of Bash; the hook hands it the command only
+// when it carries btcc-receipt, and prints the daemon's deny.
+test('002w D: PreToolUse of a Bash that carries btcc-receipt posts the command and prints the daemon\'s deny; any other Bash posts no command', async () => {
+  const w = world()
+  fresh(b => b.tool_input?.command?.includes('complete 62') ? { deny: '排程 run 62 已經回執過了' } : {})
+  const o = await hook(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: './bin/btcc-receipt complete 62 --outcome done' } })
+  expect(o).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: '排程 run 62 已經回執過了' } })
+  expect(posted.at(-1).tool_input).toEqual({ command: './bin/btcc-receipt complete 62 --outcome done' })
+  expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls -la' } })).toBeNull()
+  expect(posted.at(-1).tool_input).toBeUndefined()
+})
+

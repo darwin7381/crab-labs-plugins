@@ -117,6 +117,8 @@ def main():
                 body['tool_timeout_ms'] = int(ti.get('timeout') or os.environ.get('BASH_DEFAULT_TIMEOUT_MS') or 120000)
             except (TypeError, ValueError):
                 body['tool_timeout_ms'] = 120000
+        if 'btcc-receipt' in str(ti.get('command') or ''):   # 002w (D): the daemon may refuse a second completion of a scheduler run
+            body['tool_input'] = {'command': str(ti.get('command'))[:3000]}
     if ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):   # 002v: the router may mark it no_reply (a stopped conversation)
         ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
         body['tool_input'] = {'to': ti.get('to'), 'no_reply': ti.get('no_reply')}
@@ -136,6 +138,8 @@ def main():
         out({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': r['additionalContext']}})
     elif ev == 'PostToolUse' and r.get('additionalContext'):
         out({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': r['additionalContext']}})
+    elif ev == 'PreToolUse' and r.get('deny'):               # 002w (D): the daemon refuses this call (a scheduler run is completed once)
+        out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': str(r['deny'])}})
     elif ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):
         # 002w (F, gap 18): the C16 claims check judges what the main tells a peer as it judges what it tells Joey (the daemon hands the turn for both)
         deny = aid('main-summary-gate.py', 'claims', p, r['turn']) if isinstance(r.get('turn'), dict) else None

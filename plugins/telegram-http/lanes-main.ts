@@ -69,6 +69,8 @@ export type MainEnv = {
   stoppedPeers?: (events: string[]) => string[]
   /** 002w (D): a tool call of the main went through (its PostToolUse): the daemon meets what it completed (a scheduler receipt) */
   toolDone?: (name: string, input: any, response: string, error: boolean) => void
+  /** 002w (D): a tool call of the main the daemon refuses before it runs (a scheduler run completed twice): the hook's deny reason, or null */
+  toolGate?: (name: string, input: any) => string | null
 }
 
 export type MainEvent = {
@@ -83,7 +85,7 @@ export type Turn = { prompt_id: string; started_at: string | null; prev_started_
   items: Array<{ id: string; kind: string; content: string; user: string }>; calls: Array<{ name: string; input: any; result: string; error: boolean }> }
 type AidItem = { mid: string; kind: string; user: string; no_reply: boolean; system: boolean; body: string }
 export type MainReply = { accepted?: boolean; additionalContext?: string; block?: string; turn?: Turn; proposals?: unknown[]; curator?: boolean
-  items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string }
+  items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string; deny?: string }
 type Output = { to: string; reply_to: string; text: string }
 
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
@@ -353,6 +355,7 @@ export function createMain(E: MainEnv) {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
+        { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
         let mark: string | undefined
         if (send && b.tool_input?.no_reply !== true && E.stoppedPeers) {

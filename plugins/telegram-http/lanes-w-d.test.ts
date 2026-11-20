@@ -85,10 +85,28 @@ test('002w D, gap 17, path the main\'s ./bin/btcc-receipt complete N (PostToolUs
   L.mainReplied(L.mainReplyTier({}), 9302)                                                            // Joey got his line
   expect(E().get('mesh-9301')!.state).toBe('open')                                                    // the receipt is still owed
   expect((await stopCheck(pr)).block).toContain('排程 run 9301 的回執')
+  const RC = { prompt_id: pr, tool_name: 'Bash', tool_input: { command: 'cd /w && ./bin/btcc-receipt complete 9301 --outcome done' } }
+  expect((await hook('PreToolUse', RC)).deny).toBeUndefined()                                        // 002w (T3-R): the main holds this receipt: its completion goes through
   await hook('PostToolUse', { prompt_id: pr, tool_name: 'Bash', tool_input: { command: 'cd /w && ./bin/btcc-receipt complete 9301 --outcome done' }, tool_response: 'completed run 9301', tool_error: false })
   await new Promise(r => setTimeout(r, 20))
   expect(ob('mesh-9301', 'receipt')).toMatchObject({ state: 'met', by: 'main (btcc-receipt)' })
   await hook('PostToolUse', { prompt_id: pr, tool_name: 'Bash', tool_input: { command: './bin/btcc-receipt ack 9301' }, tool_response: 'ok', tool_error: false })   // an ack is not a completion
+  expect((await hook('PreToolUse', RC)).deny).toContain('已經回執過了')                               // 002w (T3-R): a second completion of the run is refused before it runs
+  expect((await hook('PreToolUse', { prompt_id: pr, tool_name: 'Bash', tool_input: { command: './bin/btcc-receipt complete 424242 --outcome done' } })).deny).toBeUndefined()   // a run no event carries: not ours
+  expect((await hook('PreToolUse', { prompt_id: pr, tool_name: 'Bash', tool_input: { command: 'ls' } })).deny).toBeUndefined()
   await end(pr)
   expect(E().get('mesh-9301')!.state).toBe('closed')                                                 // the turn's item done, the line and the receipt met
 })
+
+// 002v r3 T3-R (u002v-T3-a-r3-20261120-081010): hourly-backup-check run 62 went to a reflex lane, which completed it through the daemon; 9 s later the main
+// completed run 62 again with the CLI, and the scheduler got two receipts. A run a lane holds is the lane's to complete; one a lane met is done.
+test('002w D, path the main\'s ./bin/btcc-receipt for a run a LANE holds or has met (PreToolUse): refused before it runs (2a936a7: the CLI ran, a second receipt reached the scheduler)', async () => {
+  E().open('mesh-9401', { class: 'scheduled', owner: 'adam.reflex.9', from: 'scheduler', text: '[scheduled][run:9401] 每小時備份檢查', obligations: [{ kind: 'receipt', level: 'run', run_id: '9401' }] })
+  const pr = `pd-${++np}`; await hook('UserPromptSubmit', { prompt_id: pr })
+  const call = { prompt_id: pr, tool_name: 'Bash', tool_input: { command: './bin/btcc-receipt complete 9401 --outcome done --note x' } }
+  expect((await hook('PreToolUse', call)).deny).toContain('adam.reflex.9 在處理')                    // the lane still holds it
+  const v = E().request('mesh-9401', 'receipt', { kind: 'receipt', level: 'run', run_id: '9401' }); E().result('mesh-9401', v.ob?.id, true, { ref: 'completed' })   // the lane's receipt
+  expect((await hook('PreToolUse', call)).deny).toContain('已經回執過了')
+  await end(pr)
+})
+
