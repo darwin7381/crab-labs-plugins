@@ -351,13 +351,16 @@ export function createMain(E: MainEnv) {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
-        if (/__send_to_agent$/.test(String(b.tool_name ?? '')) && b.tool_input?.no_reply !== true && E.stoppedPeers) {
+        const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
+        let mark: string | undefined
+        if (send && b.tool_input?.no_reply !== true && E.stoppedPeers) {
           // 002v (002s r2 C04, u002s-C04-s2-r2-20261119-215937): the thread gate stopped the conversation and handed its last message to this turn; the
           // main's answer to that peer ends it. "不用回" is the router's to enforce (identity.md), not the model's to remember: the hook marks the send.
           const to = String(b.tool_input?.to ?? '').trim().toLowerCase()
-          if (to && E.stoppedPeers(turnWork(g, p).events).includes(to)) return { mark_no_reply: `the conversation with ${to} was stopped by the thread gate; this answer ends it` }
+          if (to && E.stoppedPeers(turnWork(g, p).events).includes(to)) mark = `the conversation with ${to} was stopped by the thread gate; this answer ends it`
         }
-        return /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p) } : {}   // PL5: the summary gate judges the reply against this turn
+        // PL5: the summary gate judges the reply against this turn; 002w (F, gap 18): its C16 claims check judges a send_to_agent the same way
+        return send || /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p), ...(mark ? { mark_no_reply: mark } : {}) } : {}
       }
       case 'PostToolUse': {
         if (!p) return {}

@@ -1582,7 +1582,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to)   // PL2: a request against the turn's events (met on the sent id)
+        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to, text)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
         const result =
           (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`

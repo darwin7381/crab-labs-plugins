@@ -5,8 +5,10 @@ Register it for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, S
 every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopback MCP token) and prints what the daemon answers:
   SessionStart  the registration: the main-only rules, or "you are not the main"
   PreToolUse    on the reply tool (…__reply): the summary gate (main-summary-gate.py reason(p, turn)) over the `turn` the daemon answers;
-                its deny reason refuses the reply. On send_to_agent (002v): when the daemon answers mark_no_reply (the turn took in the last
-                message of a conversation the thread gate stopped, and this send goes to that peer), the send runs with no_reply set (updatedInput)
+                its deny reason refuses the reply. On send_to_agent: 002w, its C16 claims check (main-summary-gate.py claims(p, turn), the one
+                the reply gets) refuses a send that says the main did what its own tool results say it did not; else (002v) when the daemon
+                answers mark_no_reply (the turn took in the last message of a conversation the thread gate stopped, and this send goes to that
+                peer), the send runs with no_reply set (updatedInput)
   PostToolUse   every tool's input (each string cut to 3000 chars) and result (text, cut to 20000 chars; tool_error) go to the daemon, which
                 keeps this turn's calls; it answers the items that reached the main during this turn (pulled at this tool boundary; additionalContext)
   Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes what it works on (the daemon's M3
@@ -130,9 +132,14 @@ def main():
         out({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': r['additionalContext']}})
     elif ev == 'PostToolUse' and r.get('additionalContext'):
         out({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': r['additionalContext']}})
-    elif ev == 'PreToolUse' and r.get('mark_no_reply') and str(p.get('tool_name') or '').endswith('__send_to_agent') and isinstance(p.get('tool_input'), dict):
-        # 002v: updatedInput replaces the whole input (hooks reference, PreToolUse decision control): the main's own input with no_reply set
-        out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'updatedInput': {**p['tool_input'], 'no_reply': True}}})
+    elif ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):
+        # 002w (F, gap 18): the C16 claims check judges what the main tells a peer as it judges what it tells Joey (the daemon hands the turn for both)
+        deny = aid('main-summary-gate.py', 'claims', p, r['turn']) if isinstance(r.get('turn'), dict) else None
+        if deny:
+            out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': deny}})
+        elif r.get('mark_no_reply') and isinstance(p.get('tool_input'), dict):
+            # 002v: updatedInput replaces the whole input (hooks reference, PreToolUse decision control): the main's own input with no_reply set
+            out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'updatedInput': {**p['tool_input'], 'no_reply': True}}})
     elif ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__reply') and isinstance(r.get('turn'), dict):
         deny = aid('main-summary-gate.py', 'reason', p, r['turn'])
         if deny:

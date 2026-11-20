@@ -221,7 +221,14 @@ Fields:
   - `lane_closed`: `{by, via, run, reported, stopped, last}` when its lane was closed while the run was running;
   - `proposals`: `[{id, text, joey, at, lane, decision, decided_at, writer, joey_event}]`, the memory proposals filed in a run of this event (the main's
     `memory_decide`, or the curator, writes `decision`);
-  - `promised`: the commitments a lane recorded in a run of this event;
+  - `promised`: the commitments recorded about this event: a lane's (its commitment, ledger_write or receipt), and since 002w (F, gap 16) every
+    promise **the one promise check** (`promiseCheck`) finds in an outbound text about it. That check runs on every outbound text: a lane's reply_agent
+    and notify_joey, the main's send_to_agent (`/lanes/outbound`) and its Telegram reply (`mainReplied`). A relay a lane sends in a run of Joey's is
+    his word passed on, recorded without asking (002k C2, `from: owner-relay`); any other text is asked promiseAsk's two questions (`from: lane-send` /
+    `main-send`). The event is the run's own (a lane), or the one the main's line met, else its turn's first; a text of the main about no event opens a
+    commitment record of the main (`by: promise-check`, no due time: the text gives none, the commitment tool's `due` does). One per lane run; none
+    right after the main's own commitment tool. 2a936a7 checked the main's send_to_agent only, into the ledger only (the renew brief and the digest
+    read M3 and never saw it), and a lane's text only in a run of Joey's;
   - `tg`: `{message_id, topic}` on Joey's own Telegram message (002t). **His own words travel with everything the main gets from his message**
     (002w I, 002v round 2 D02): ONE renderer (`joeyWords`) writes them from this record (`tg` and `text`, the router's transcript of the message),
     marked 〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕, and every such item uses it: the hand-over of the event (after the lane's text),
@@ -274,6 +281,10 @@ The one rule: a lane's outbound call asks to meet an obligation of its event.
   three of Joey's questions and Eve's hand-over; 002p's "hand-overs first" bound it to the hand-over alone, silent). It meets their Joey line, rings a
   ring nobody rang, and each records the send; a reply that meets nothing records on no event (002p, A05). A delivered send_to_agent meets the
   answers they owe that agent. Nothing is matched by a parameter: the reply tool has no `handoff_id`.
+- 002w (F, gap 14): a **lane's** line takes its tier from the class of the event it meets (`joeyRendering` → `metClass`: another event of the run's set
+  has its record's `class`; the run's own event keeps the router's class of the run, the notify table's names), so
+  Joey's message steered into a scheduled or peer run is answered at his tier; the lane's context block marks 嚴重警報 by its event's class, never for
+  Joey's own message on a critical lane (2a936a7 read the run's class and the lane's flag).
 - **The tier** of such a reply is the highest the obligations it meets require (design/notify 「類別 × 義務 × 結果」): Joey's own message
   requires an ordinary answer (push), a ring nobody rang a push, a lane's event handed to the main its class's tier (a push class whose ring already
   rang is silent). A reply that quotes a message is ordinary. A reply that meets nothing takes the highest tier of the turn's events.
@@ -485,6 +496,8 @@ What the daemon answers besides:
 What the hook prints, from the daemon's answer:
 - SessionStart: `additionalContext`. That is the main-only rules for the accepted main, or "you are not the main".
 - PreToolUse of `reply`: the summary gate's `deny`, when it has one.
+- PreToolUse of `send_to_agent` (002w F, gap 18): the C16 claims check (`main-summary-gate.py claims(p, turn)`, the same function the reply's gate
+  starts with) over the `turn` the daemon now answers for it too: its `deny`; else 002v's `updatedInput` with no_reply when the daemon marks it.
 - PostToolUse: `additionalContext` with the items pulled into this turn.
 - Stop: `decision: block` with the items pulled, or with an aid's reason.
 

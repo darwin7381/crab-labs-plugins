@@ -495,13 +495,22 @@ def digest_relay_check(p, reply, d, turn):
 
 
 
+def claims(p, turn):
+    """002w (F, gap 18): the C16 claims check alone, for any outbound text of the main: its Telegram reply (reason() below) and its send_to_agent
+    (main-hook.py). The deny reason, or None."""
+    turn = turn if isinstance(turn, dict) else {}
+    text = str((p.get('tool_input') or {}).get('text') or '')
+    ld = os.environ.get('LANES_DIR') or os.path.join(p.get('cwd') or os.getcwd(), '.lanes')
+    return reply_check(p, text, os.path.join(ld, 'run'), turn) or None
+
+
 def reason(p, turn):
     """The deny reason for the reply in p (the PreToolUse payload), or None. Every input about this turn comes from `turn` (the daemon's answer to
     /lanes/main-event): prompt_id, started_at, prev_started_at, items, calls. No transcript is read."""
     turn = turn if isinstance(turn, dict) else {}
     reply = str((p.get('tool_input') or {}).get('text') or '')
     ld0 = os.environ.get('LANES_DIR') or os.path.join(p.get('cwd') or os.getcwd(), '.lanes')
-    contra = reply_check(p, reply, os.path.join(ld0, 'run'), turn)    # 002k (C16): what the reply says the main did, against its own tool results
+    contra = claims(p, turn)                                          # 002k (C16): what the reply says the main did, against its own tool results
     if contra:
         return contra
     relay = digest_relay_check(p, reply, os.path.join(ld0, 'run'), turn)  # 002n (aid c, T3-R #8): digest items Joey did not ask about, relayed to him
