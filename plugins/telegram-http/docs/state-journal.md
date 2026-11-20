@@ -68,8 +68,10 @@ How items move:
   stream held Joey's Telegram messages), with the digest riding on it.
   An offer is written only into a stream that can take it: the gen's MCP GET stream is open and the SDK transport holds it (server.ts `streamLive`;
   the SDK drops a notification without an error when it has no GET stream). If no such stream exists, the item stays `queued` and nothing is
-  offered; the next pump (the stream opening, a Stop, the 5-second tick) tries again. An item is offered to a gen once, and once more only at a stuck
-  episode (below): the episode's untaken items go back to `queued` with `reason: stuck_unbound` and M1 offers again (002q, H02/H03).
+  offered; the next pump (the stream opening, a Stop, the 5-second tick) tries again. An item is offered to a gen once, and once more when it stays
+  unbound: an idle gen's after `LANES_OFFER_LEASE_MS` (20 s; `reason: offer_untaken`, nobody is told: 002x), a walled gen's probe item or an idle
+  gen's item the lease has not written again at a stuck episode (below; `reason: stuck_unbound`, 002q H02/H03). `reoffered` on the item names
+  the idle gen that got it twice: it is never written to that gen a third time.
 - **Bind.** At the first hook event with a new `prompt_id`, the daemon binds to that turn every item offered to this gen, plus any queued item the
   prompt names (`did="..."`).
 - **Pull.** A busy gen is never offered anything. At its next PostToolUse, or at its Stop, every queued item is bound to the running prompt and
@@ -86,7 +88,8 @@ Fields:
   `meta.did = "<item id>,<digest id>"`.
 - `gen` and `prompt_id`, while `offered` or `bound`. `via_pull: true` means the item was pulled at a tool boundary or at `Stop`.
 - `reason`, when the item returns to `queued`: `stop_failure:<error>`, `gen_end`, `interrupted` (a new prompt came with no Stop), `session_start`
-  (the same process started a new session mid-turn), `stuck_unbound` (002q: offered, never bound, and the gen's stuck episode began). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).
+  (the same process started a new session mid-turn), `stuck_unbound` (002q: offered, never bound, and the gen's stuck episode began), `offer_untaken` (002x: offered to an idle gen and not bound
+  within `LANES_OFFER_LEASE_MS`: written once more). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).
 - `done` clears an earlier `reason`; it may carry `reason: asked_restart` (special case 1 below).
 - Digest items also have `events` and `items`:
   - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
@@ -560,6 +563,11 @@ from the offer when that came later. The alarm names the open tool.
 - **The episode is M1's recovery signal** (002q, H02/H03: a notification lost on the client side under host load stayed lost, and the play never
   started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)
   and M1 offers again at once (a walled gen at its next probe time). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
+- **The offer has its own bound** (002x; 002w r1 A05 and r2 I04: an offer written half a second after the gen's stream opened was never bound and
+  waited for the stuck episode, which is ten minutes outside the lab): an idle gen's offer still unbound after `LANES_OFFER_LEASE_MS` of silence
+  (20 s; the 1,304 offers of 002v and 002w were bound within 1.6 s) goes back to `queued` (`reason: offer_untaken`, `reoffered: <gen>`) and M1
+  writes it once more, telling nobody. An item the lease has written again is not written a third time at the episode; the alarm then says
+  「已經再交給它一次，還是沒有被接手」.
 - The next hook event of the gen clears it, and Joey is told once. A later silence is a new episode.
 - **Owed items nobody can take** (002w E, gaps 4, 11) are an episode of the same rule: owed items queued for longer than `LANES_MAIN_STUCK_MS` while
   there is no live gen (「主線不在」), or while the live gen is `idle` or `starting`, holds no offer and could not be offered them (its stream is down:

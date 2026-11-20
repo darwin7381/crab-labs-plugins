@@ -6,7 +6,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } fr
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { __setMainStuckMs, MAIN_STUCK_MS, mainContext, notMainContext } from './lanes-main.ts'
+import { __setMainStuckMs, __setOfferLeaseMs, MAIN_STUCK_MS, OFFER_LEASE_MS, mainContext, notMainContext } from './lanes-main.ts'
 const L = await import('./lanes.ts?m2-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-m2-'))
@@ -23,6 +23,7 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
 L.__setWallProbe(3_600_000)
 const procs: any[] = []
 const stuck0 = MAIN_STUCK_MS
+const lease0 = OFFER_LEASE_MS
 afterAll(() => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } __setMainStuckMs(stuck0); L.__setWallProbe(300_000) })
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
@@ -368,6 +369,53 @@ test('D3 (basics), 002q H02: the main frozen with SIGSTOP while items are offere
   for (let i = 0; i < 4; i++) { await sleep(25); await M().tick() }                         // idle with nothing offered owes nothing: no second alarm
   expect(sent.slice(k).filter(s => s.includes('疑似卡死') && !s.includes('解除')).length).toBe(1)
   __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('002x (002w r1 A05, r2 I04): an offer an idle gen does not bind within the lease is written once more and nobody is told; a stuck episode after that writes nothing more and says so', async () => {
+  await drained()
+  __setOfferLeaseMs(40); __setMainStuckMs(200)
+  const g = await startMain()
+  const k = sent.length, o = offers.length
+  const a = await joey('lease 第一則')
+  expect(state(a)).toBe('offered'); expect(offers.length).toBe(o + 1)                      // written into a live stream, then lost on the client side
+  await sleep(15); await M().tick()
+  expect(offers.length).toBe(o + 1)                                                         // inside the lease: nothing
+  await sleep(45); await M().tick(); await sleep(10)
+  expect(offers.length).toBe(o + 2); expect(state(a)).toBe('offered')                       // the lease is over: written once more
+  expect(offers.at(-1)!.notif.params.meta.did.split(',')[0]).toBe(a)
+  expect(journal().find(l => l.rec === 'msg' && l.id === a && l.state === 'queued' && l.reason)).toMatchObject({ reason: 'offer_untaken', reoffered: String(g.pid) })
+  expect(sent.slice(k).some(s => s.includes('疑似卡死'))).toBe(false)                         // the offer's own bound: no alarm
+  for (let i = 0; i < 2; i++) { await sleep(45); await M().tick() }
+  expect(offers.length).toBe(o + 2)                                                         // once per gen: no third copy at the next lease
+  for (let i = 0; i < 4; i++) { await sleep(50); await M().tick() }                         // MAIN_STUCK_MS of silence since the second offer
+  await sleep(10)
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死')).length).toBe(1)
+  expect(sent.slice(k).find(s => s.includes('疑似卡死'))).toContain('已經再交給它一次，還是沒有被接手')
+  expect(offers.length).toBe(o + 2)                                                         // the episode tells Joey; it writes no third copy
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [a] })
+  expect(state(a)).toBe('bound')
+  expect(sent.slice(k).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  expect(state(a)).toBe('done')
+  __setOfferLeaseMs(lease0); __setMainStuckMs(stuck0)
+  await killed(g)
+})
+
+test('002x: an offer bound inside the lease is written once; the lease is the offer\'s, not a timer that runs on', async () => {
+  await drained()
+  __setOfferLeaseMs(40)
+  const g = await startMain()
+  const o = offers.length
+  const a = await joey('lease 之內就接手')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [a] })
+  for (let i = 0; i < 3; i++) { await sleep(30); await M().tick() }                         // in its turn well past the lease
+  expect(offers.length).toBe(o + 1); expect(state(a)).toBe('bound')
+  expect(journal().some(l => l.reason === 'offer_untaken' && l.id === a)).toBe(false)
+  await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+  __setOfferLeaseMs(lease0)
   await killed(g)
 })
 

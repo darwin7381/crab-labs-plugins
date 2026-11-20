@@ -92,6 +92,11 @@ const num = (k: string, d: number): number => { const n = Number(process.env[k] 
 /** 疑似卡死: a gen that owes a hook event (a turn open, or an offer unbound) has sent none for this long */
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
 export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
+/** 002x: the offer's own bound. An idle gen binds an offer within two seconds (1,304 offers of 002v and 002w: the slowest took 1.6 s); one still
+ *  unbound after this long was lost on the client side (002w r1 A05, r2 I04: written half a second after the gen's stream opened, never bound, and
+ *  it waited for the stuck episode: MAIN_STUCK_MS, ten minutes outside the lab). It is written once more, and nobody is told */
+export let OFFER_LEASE_MS = num('LANES_OFFER_LEASE_MS', 20_000)
+export const __setOfferLeaseMs = (ms: number): void => { OFFER_LEASE_MS = ms }
 const BODY_MAX = 4000
 /** the first words of an event's text (the Stop check names each event it holds the turn for) */
 const firstWords = (t: string): string => { const s = String(t ?? '').replace(/\s+/g, ' ').trim(); return s.length > 30 ? `${s.slice(0, 30)}…` : s }
@@ -507,20 +512,28 @@ export function createMain(E: MainEnv) {
       const owes = g.state === 'in_turn' || ((g.state === 'idle' || g.state === 'walled') && offered.length > 0)
       const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt)
       const limit = g.state === 'in_turn' && g.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
-      if (owes && now - since > limit) {
+      // 002x: the offer's own bound. An idle gen's offer still unbound after OFFER_LEASE_MS of silence goes back to `queued` (reason offer_untaken)
+      // and the pump below writes it once more. `reoffered` on the item names the gen that got it twice: the lease does it once per gen, and the
+      // stuck episode below does not write such an item a third time (a client that is frozen, not deaf, takes every copy when it runs again).
+      const untaken = g.state === 'idle' ? offered.filter(r => r.reoffered !== g.id) : []
+      if (untaken.length && now - since > OFFER_LEASE_MS && now - since <= limit) {
+        for (const r of untaken) J().write('msg', r.id, 'queued', { reason: 'offer_untaken', gen: null, prompt_id: null, via_pull: null, reoffered: g.id })
+      } else if (owes && now - since > limit) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
+        // what the episode writes again: a walled gen's probe item (its next probe), an idle gen's item the lease has not written again yet
+        const again = g.state === 'walled' ? offered : g.state === 'idle' ? offered.filter(r => r.reoffered !== g.id) : []
         const queued = items(r => r.state === 'queued' && owed(r)).length + offered.length
         const menu = g.state !== 'in_turn' && E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null
         const mins = Math.max(1, Math.round((now - since) / 60_000))
         const doing = g.state === 'in_turn' ? items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === g.prompt_id && r.kind !== 'digest').map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 60)).filter(Boolean) : []
         E.tellJoey(g.state === 'in_turn'
           ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜${g.tool_open ? `（停在工具 ${g.tool_open} 裡沒有回來）` : ''}${doing.length ? `；它正在處理：${doing.map(t => `「${t}」`).join('、')}` : ''}。有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
-          : `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它，我再交給它一次。`, 'main-stuck')
+          : `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它，${again.length || !offered.length ? '我再交給它一次' : '已經再交給它一次，還是沒有被接手'}。`, 'main-stuck')
         // 002q (H02, H03): an offer the gen never took (no hook event for it: a notification lost on the client side, under host load) is not left to
         // wait for ever. The stuck episode is the signal: its untaken items go back to `queued` (reason stuck_unbound) and M1 offers once more, now.
         // Once per episode (the alarm does not fire again until a hook event ends it), and no timer of its own. A walled gen's probe item waits for
         // its next retry time like any probe.
-        if (g.state !== 'in_turn' && offered.length) requeue(r => r.state === 'offered' && r.gen === g.id, 'stuck_unbound')
+        for (const r of again) J().write('msg', r.id, 'queued', { reason: 'stuck_unbound', gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
       }
     }
     await pump()
