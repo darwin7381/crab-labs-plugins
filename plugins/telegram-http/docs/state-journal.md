@@ -581,3 +581,22 @@ from the offer when that came later. The alarm names the open tool.
   lane of kind fork is refused, with the words that say what to do (notify_joey, or ask_joey; the main reads it in the digest), and the
   fork's lane context says it has no handoff_main. What a fork still owes when its run ends goes to the main by the exit rule, as for any lane.
 
+## 002x: one promise record
+
+002w round 1, C07 (u002w-C07-s3-r1-20261120-125819). 002w's F put every found promise on "the event the send is about" as a bare text in the
+event's `promised` list. For the main's send to Eve in a turn Joey's message opened, that event was Joey's message (no thread): the promise could
+not be found by the conversation it was made in (the level's check, and anyone asking "what did I promise Eve on this thread"), the digest called it
+「車道答應」, and the mirror record changed name (`lane.main_commitment` to `lane.commitment_auto`) so the lab saw nothing. The main's report to Joey
+(「已回 Eve：Joey 答應，週五前會有人做好」: 0.16 / 0.91) was recorded as a promise to Joey.
+
+- **`recordPromise` is the one writer** of an event's `promised` list, for the four ways a promise is found (the outbound check, a lane's commitment
+  tool, its ledger_write kind commitment, its receipt's `promised`). An entry is a record: `{text, by, to, thread, at, ref?}` (`by`: the lane id or
+  `main`). Journals before 002x hold bare texts; `promiseOf` reads both.
+- **Which event:** the event of the conversation the promise was made in. For the main's send that is the peer's newest message on the send's thread
+  (`threadEvent`), when the thread is known: named by the send, quoted (`reply_to`), or one the main owes on (a promise, a hand-over). The peer's newest
+  live thread is a guess (`peer-thread`) and is not used; then, and with no conversation at all, it is the event the turn works on. A lane's promise is
+  on its run's event, whose thread is the lane's.
+- **To Joey only the speaker's own promise counts.** The second question (a deadline passed on, whoever does it) records a promise made to somebody
+  else on the owner's behalf; told to Joey it is his own decision coming back.
+- Readers: the digest and activity list say whose promise it is (「主線答應」 / 「車道答應」); the /main renew brief lists the texts.
+

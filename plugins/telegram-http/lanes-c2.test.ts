@@ -32,7 +32,7 @@ test('C2: Joey said "tell Eve": reply_agent to Eve leaves a commitment (who = Ev
   expect(cms()[0]).toMatchObject({ kind: 'commitment', lane: tok.lane, thread: `adam#t-c2${n}`, event: tok.evId,
     refs: { who: 'eve', what: text, from: 'owner-relay', auto: true, btcc_msg_id: 80001 } })
   expect(cms()[0].refs.by).toContain('週五'); expect(cms()[0].text).toContain('答應 eve')
-  expect(L.__events().get(tok.evId)!.promised).toEqual([cms()[0].text])                     // PL1: the promise is on the event's M3 record (the digest shows it)
+  expect(L.__events().get(tok.evId)!.promised).toMatchObject([{ text: cms()[0].text, by: tok.lane, to: 'eve', thread: `adam#t-c2${n}` }])   // PL1, 002x: the promise record on the event (the digest shows it)
 })
 
 test('C2: not when the lane already wrote a commitment in that run (its own call, or a receipt promise); not when the run was not Joey\'s', async () => {

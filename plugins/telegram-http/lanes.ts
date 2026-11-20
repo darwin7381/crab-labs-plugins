@@ -464,7 +464,7 @@ function sendJson(res: ServerResponse, code: number, obj: unknown): void {
 // process (its gen ends `replaced`; M1 queues again whatever it had). When the new session's SessionStart comes, the brief is offered to it like any item.
 const renewFile = (): string => join(LANES_DIR, 'run', 'renew')
 export function handoverBrief(gen: number): string {
-  const commitments = (events?.rows(e => Array.isArray(e.promised)) ?? []).flatMap(e => (e.promised as string[]).map(t => `- ${String(t).slice(0, 240)}`)).slice(-12)   // M3 (PL1)
+  const commitments = (events?.rows(e => Array.isArray(e.promised)) ?? []).flatMap(e => (e.promised as unknown[]).map(t => `- ${promiseOf(t, e).text.slice(0, 240)}`)).slice(-12)   // M3 (PL1)
   const mainObs = events.rows(e => e.state === 'open').flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.owner === 'main' && o.state === 'open').map(o => ({ e, o })))
   const pend = mainObs.filter(x => x.o.kind === 'main').slice(-8).map(x => `- ${x.o.told ? '（已直接告訴 Joey）' : ''}〔${x.o.handoff ?? x.o.id}〕${String(x.e.text ?? '').slice(0, 240)}`)
   const promises = mainObs.filter(x => x.o.kind === 'peer' || x.o.level === 'commitment').map(x => `- 答應 ${x.o.to}：${x.o.due_at ? `${simTime(x.o.due_at)} 前` : ''}「${String(x.o.what ?? '').slice(0, 120)}」（${x.o.told ? '已過時' : '未到期'}）`)
@@ -3015,6 +3015,17 @@ const byJoeyRun = (tok: RunTok): boolean => {
  *  brief read it); a text of the main about no event opens a commitment record of the main, like the commitment tool's (the text gives no due time).
  *  Not twice: a lane run that already recorded one, or the main's own commitment tool a moment ago. 2a936a7 checked the main's send_to_agent only and wrote
  *  the ledger only, and a lane's text only in a run of Joey's. LANES_MAIN_COMMITMENTS=0 switches the question off. */
+/** 002x (002w r1 C07, u002w-C07-s3-r1-20261120-125819): THE record of a promise (M3: the event's `promised` list). One writer for the four ways a
+ *  promise is found (the outbound check, a lane's commitment tool, its ledger_write kind commitment, its receipt's `promised`): the entry says who made
+ *  it, to whom and on which conversation, on the event of that conversation. 002w wrote the main's promise to Eve on the turn's event (Joey's message, no
+ *  thread) as a bare text: nothing could find it by the conversation it belongs to, and the digest called it the lane's. */
+export type Promise_ = { text: string; by: string; to: string | null; thread: string | null; at: string; ref?: string }
+function recordPromise(evId: string, p: { by: string; to?: string | null; text: string; thread?: string | null; ref?: unknown }): void {
+  events.push(evId, 'promised', { text: p.text.slice(0, 500), by: p.by, to: p.to ? String(p.to).toLowerCase() : null, thread: p.thread ?? events.get(evId)?.thread ?? null,
+    at: nowIso(), ...(p.ref != null ? { ref: String(p.ref) } : {}) } as Promise_)
+}
+/** an entry of `promised` as its record (journals before 002x hold bare texts: the lane's, on the event's own thread) */
+export const promiseOf = (x: unknown, e?: Row): Promise_ => typeof x === 'string' ? { text: x, by: String(e?.lane ?? e?.owner ?? 'lane'), to: null, thread: (e?.thread as string) ?? null, at: '' } : x as Promise_
 export async function promiseCheck(o: { who: string; to: string; text: string; ev?: string; thread: string | null; ref?: unknown; tok?: RunTok; relay?: boolean; thread_from?: string; detail?: string }): Promise<'written' | 'no' | 'error' | 'off' | 'dup'> {
   const to = String(o.to ?? '').toLowerCase(), byMain = o.who === 'main'
   if (o.tok && (o.tok.commitments ?? 0) > 0) return 'dup'
@@ -3029,7 +3040,10 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
     }
   }
   const dl = typeof ask?.deadline === 'number' ? ask.deadline : null
-  const hit = !ask || ask.p! >= MAIN_COMMIT_P() || (dl != null && dl >= MAIN_COMMIT_DEADLINE_P())
+  // 002x (002w r1 C07): a deadline passed on (the second question) is a promise to somebody ELSE on the owner's behalf. Told to Joey it is his own
+  // decision coming back (「已回 Eve：Joey 答應，週五前會有人做好」 scored 0.16 / 0.91 and was recorded as a promise to Joey): to Joey only the
+  // speaker's own promise counts (the first question).
+  const hit = !ask || ask.p! >= MAIN_COMMIT_P() || (to !== 'joey' && dl != null && dl >= MAIN_COMMIT_DEADLINE_P())
   // a commitment the main wrote itself with the commitment tool a moment ago is the record: no second one for the same send
   const own = hit && byMain && (events?.rows(e => e.owner === 'main' && Date.now() - Date.parse(String(e.created)) < MAIN_COMMIT_DEDUPE_MS) ?? [])
     .some(e => ((e.obligations ?? []) as Ob[]).some(x => x.level === 'commitment' && x.by !== 'promise-check' && String(x.to ?? '').toLowerCase() === to))   // M3: the main's own commitment tool record
@@ -3038,7 +3052,11 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   if (own) return 'dup'
   const cm = commitmentFromReport(o.text, o.relay ? to : undefined, to) ?? { who: to, what: o.text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
   if (o.tok) o.tok.commitments = 1
-  if (o.ev) events.push(o.ev, 'promised', commitmentText(cm))
+  // the event of the conversation the promise was made in: the peer's newest message on the send's thread; else the event the send is about
+  // (a thread the send named, quoted, or kept a promise on; the peer's newest live thread is a guess, peerThread's `peer-thread`, and is not used: 002l D4)
+  const conv = o.thread && o.thread_from !== 'peer-thread' && o.thread_from !== 'none' ? o.thread : null
+  const pev = (byMain && conv ? threadEvent(S.threads[conv])?.id : undefined) ?? o.ev
+  if (pev) recordPromise(pev, { by: o.who, to, text: commitmentText(cm), thread: byMain ? conv : o.thread, ref: o.ref })
   else if (byMain) events.open(`cm-${shortId()}`, { class: to === 'joey' ? 'joey' : 'peer', owner: 'main', thread: o.thread, text: cm.what,
     obligations: [{ kind: to === 'joey' ? 'joey' : 'peer', level: 'commitment', owner: 'main', to, what: cm.what, by: 'promise-check' }] })
   ledger({ lane: byMain ? 'main' : o.who, thread: o.thread, event: o.ev ?? (byMain ? `main-send-${o.ref}` : undefined), kind: 'commitment', text: commitmentText(cm),
@@ -3198,14 +3216,14 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
           ...(je ? { joey_event: je } : {}) })   // M3 (PL1)
       }
       else if (kind === 'action' || kind === 'commitment') tok.records = (tok.records ?? 0) + 1
-      if (kind === 'commitment') events.push(tok.evId, 'promised', String(a.text ?? '').slice(0, 300))   // M3 (PL1): what the lane promised is on its event
+      if (kind === 'commitment') recordPromise(tok.evId, { by: lane.id, text: String(a.text ?? '').slice(0, 300), thread: lane.thread })   // M3 (PL1): what the lane promised is on its event
       return `ledger: ${kind} recorded${pid ? ` (id ${pid})` : ''}`
     }
     case 'commitment': {
       const chk = checkCommitmentArgs(a)
       if (!chk.ok) return `commitment refused: ${chk.error}`
       tok.commitments = (tok.commitments ?? 0) + 1
-      events.push(tok.evId, 'promised', commitmentText(chk.c))              // M3 (PL1): the promise is on the event's record
+      recordPromise(tok.evId, { by: lane.id, to: chk.c.who, text: commitmentText(chk.c), thread: lane.thread })   // M3 (PL1): the promise is on the event's record
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'commitment', text: commitmentText(chk.c), refs: { ...chk.c }, detail: lane.transcript })
       return `ledger: commitment recorded (${chk.c.who}: ${chk.c.what}; by ${chk.c.by})`
     }
@@ -3282,7 +3300,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         const cm = commitmentFromReport(rep.promised, queue.get(tok.evId)?.ev.from, th?.peer)
         if (cm) {
           tok.commitments = 1
-          events.push(tok.evId, 'promised', commitmentText(cm))
+          recordPromise(tok.evId, { by: lane.id, to: cm.who, text: commitmentText(cm), thread: lane.thread })
           ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'commitment', text: commitmentText(cm), refs: { ...cm, from: 'receipt.promised' }, detail: lane.transcript })
         }
       }
@@ -4360,7 +4378,7 @@ function digestLine(e: Row, whole = false): DigestLine {
   if (e.hold) st.push(`${e.hold.peer} 暫停中擋下 ${e.hold.count} 則${e.hold.ended ? `（已結束：${e.hold.ended}）` : ''}`)
   if (e.chain_end) st.push(e.chain_end === 'cap' ? `後續檢查跑了 ${e.chain_runs} 次到上限，不再排` : '後續檢查結果跟上一次一樣，不再排')
   if (e.lane_closed) st.push(`車道執行中被關閉（${e.lane_closed.by}）；它回報了 ${e.lane_closed.reported} 則`)
-  for (const t of (e.promised ?? []) as string[]) st.push(`車道答應：${fit(String(t), 120)}`)
+  for (const t of (e.promised ?? []) as unknown[]) { const p = promiseOf(t, e); st.push(`${p.by === 'main' ? '主線' : '車道'}答應：${fit(p.text, 120)}`) }
   // 002u (station 5, zero-token D01/D03 probe u002t-Z93-…-211921): memory_decide takes the proposal's id, and its description says the id is in the
   // digest and in ledger_query(kind=memory_proposal); for a proposal not from Joey neither showed it (this line said 「記憶提案 1 筆待決定」, the
   // query row only the lane's text), so the main could not decide Eve's or Cain's proposal at all. The event's line names each open id.

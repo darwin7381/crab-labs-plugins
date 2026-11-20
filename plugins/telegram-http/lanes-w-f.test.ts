@@ -8,12 +8,12 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
 import type { AddressInfo } from 'net'
-let jev: any, jevCalls: any[] = []
+let jev: any, jevCalls: any[] = [], pP = 0.93, pD = 0.9          // the promise check's two answers (a test sets them)
 beforeAll(() => {
   jev = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
     const b: any = await req.json(); jevCalls.push(b)
     const q = b.questions ?? {}
-    if (q.promises) return Response.json({ answers: { promises: { type: 'noul', noul: 0.93 }, deadline: { type: 'noul', noul: 0.9 } } })
+    if (q.promises) return Response.json({ answers: { promises: { type: 'noul', noul: pP }, deadline: { type: 'noul', noul: pD } } })
     if (q.S1) return Response.json({ answers: Object.fromEntries(Object.keys(q).map(k => [k, { type: 'choice', choice: 'contradicts', confidence: 0.95 }])) })
     return Response.json({ answers: {} })
   } })
@@ -78,7 +78,7 @@ test('002w F, gap 16, path a lane\'s reply_agent in a peer run: the promise is c
   expect(await L.callLaneTool(r.tok, 'reply_agent', { to: 'eve', text: '週五 12:00 前給你完整報告。' })).toContain('sent to eve')
   expect(await until(() => cms().length === k + 1)).toBe(true)
   expect(cms().at(-1)).toMatchObject({ lane: r.lane, event: r.tok.evId, refs: { from: 'lane-send', auto: true, who: 'eve' } })
-  expect(E().get(r.tok.evId)!.promised).toEqual([cms().at(-1).text])
+  expect(E().get(r.tok.evId)!.promised).toMatchObject([{ text: cms().at(-1).text, by: r.lane, to: 'eve', thread: st.lanes[r.lane].thread }])   // 002x: who, to whom, which conversation
   await done(r.lane)
 })
 
@@ -88,7 +88,7 @@ test('002w F, gap 16, path a lane\'s notify_joey: what it tells Joey it will do 
   expect(await L.callLaneTool(r.tok, 'notify_joey', { outcome: 'changed', text: 'p95 升到 900ms，我 10 分鐘後再查一次並回報。' })).toContain('sent to Joey')
   expect(await until(() => cms().length === k + 1)).toBe(true)
   expect(cms().at(-1).refs).toMatchObject({ who: 'joey', from: 'lane-send' })
-  expect(E().get(r.tok.evId)!.promised?.length).toBe(1)
+  expect(E().get(r.tok.evId)!.promised).toMatchObject([{ by: r.lane, to: 'joey' }])
   await done(r.lane)
 })
 
@@ -107,15 +107,25 @@ async function mainTurnWith(evIds: string[]) {
   return { prompt, pid: proc.pid, stop: async () => { await L.__mainEvent({ event: 'Stop', pid: proc.pid, prompt_id: prompt, phase: 'final' }); await L.__mainEvent({ event: 'SessionEnd', pid: proc.pid }); proc.kill('SIGKILL') } }
 }
 
-test('002w F, gap 16, path the main\'s send_to_agent: its promise goes on the record of the event the turn works on (2a936a7: the ledger only)', async () => {
+test('002w F, gap 16, 002x, path the main\'s send_to_agent: its promise goes on the M3 record (2a936a7: the ledger only): on the event of the conversation the send belongs to, else on the event the turn works on', async () => {
   const meta = { chat_id: '1', message_id: '9721', user: 'joey_lab' }
   await L.routeEvent({ id: 'tg-1-9721', source: 'telegram', from: 'joey', text: '跟 eve 說週四給她', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '跟 eve 說週四給她', meta } } } as any)
   const m = await mainTurnWith(['tg-1-9721'])
-  const k = cms().length
+  // a peer with no conversation: the promise is on the event the turn works on, with no thread
+  let k = cms().length
+  await outbound({ msgId: 69000, owner: 'main', to: 'cain', text: 'Joey 說週四前給你。', thread: null })
+  expect(await until(() => cms().length === k + 1)).toBe(true)
+  expect(E().get('tg-1-9721')!.promised).toMatchObject([{ text: cms().at(-1).text, by: 'main', to: 'cain', thread: null, ref: '69000' }])
+  // a peer the main owes on a conversation (an earlier hand-over here): the send is matched to it (peerThread), and the promise is on that conversation's event
+  const where = L.peerThread('eve'); expect(where.from).not.toBe('peer-thread'); expect(where.thread).toBeTruthy()
+  k = cms().length
   await outbound({ msgId: 69001, owner: 'main', to: 'eve', text: 'Joey 說週四前給你。', thread: null })
   expect(await until(() => cms().length === k + 1)).toBe(true)
   expect(cms().at(-1).refs).toMatchObject({ from: 'main-send', who: 'eve' })
-  expect(E().get('tg-1-9721')!.promised).toEqual([cms().at(-1).text])
+  const on = E().rows((e: any) => (e.promised ?? []).some((x: any) => x.ref === '69001'))
+  expect(on.length).toBe(1); expect(on[0].thread).toBe(where.thread); expect(on[0].from).toBe('eve')
+  expect(on[0].promised.find((x: any) => x.ref === '69001')).toMatchObject({ by: 'main', to: 'eve', thread: where.thread })
+  expect(E().get('tg-1-9721')!.promised.length).toBe(1)                                                    // not on the turn's event too
   await m.stop()
 })
 
@@ -152,3 +162,29 @@ test('002w F, gap 18, path the main\'s send_to_agent at PreToolUse: the daemon h
   expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('我已經重啟了 mock-api')
   await m.stop()
 })
+
+// 002x (002w r1 C07, u002w-C07-s3-r1-20261120-125819): Eve asked on her thread; a lane handed it over; in a later turn opened by Joey's message the main told
+// Eve 「Joey 答應了，週五前會有人做好」 (a deadline passed on: 0.06 / 0.98) and then told Joey 「已回 Eve：Joey 答應，週五前會有人做好」 (0.16 / 0.91). 002w wrote
+// both on Joey's message (no thread): the promise to Eve could not be found by her conversation, and Joey's own decision came back as a promise to him.
+test('002x C07: the main\'s promise to a peer is recorded on that conversation\'s event (who, to whom, thread), not on the turn\'s; a deadline passed on back to Joey is not a promise to him', async () => {
+  const eve = mk('eve', '週五前能幫我加一個 /v2/orders/bulk 端點嗎？')
+  const r = await laneRun(eve); const th = st.lanes[r.lane].thread
+  await done(r.lane)
+  const meta = { chat_id: '1', message_id: '9741', user: 'joey_lab' }
+  await L.routeEvent({ id: 'tg-1-9741', source: 'telegram', from: 'joey', text: 'Eve 要的端點，答應她，週五前做好。', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: 'x', meta } } } as any)
+  const m = await mainTurnWith(['tg-1-9741'])
+  pP = 0.06; pD = 0.98
+  let k = cms().length
+  await outbound({ msgId: 69002, owner: 'main', to: 'eve', text: 'Joey 答應了：/v2/orders/bulk 週五前會有人做好。', thread: th, ev: 'tg-1-9741' })
+  expect(await until(() => cms().length === k + 1)).toBe(true)
+  expect(E().get(eve.id)!.promised).toMatchObject([{ by: 'main', to: 'eve', thread: th, ref: '69002' }])     // on Eve's event, found by her thread
+  expect(E().get('tg-1-9741')!.promised ?? []).toEqual([])                                                  // not on Joey's message
+  expect(L.activityList(undefined)).toContain('主線答應：')                                                    // the activity list says whose promise it is
+  pP = 0.16; pD = 0.91; k = cms().length
+  L.mainReplied(L.mainReplyTier({}), 9742, undefined, '已回 Eve：Joey 答應，週五前會有人做好 /v2/orders/bulk。')
+  await sleep(300)
+  expect(cms().length).toBe(k)                                                                              // Joey's own decision, told back to him: no promise
+  pP = 0.93; pD = 0.9
+  await m.stop()
+})
+
