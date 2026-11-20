@@ -42,6 +42,7 @@ import {
   type InlineButton,
   type ReplyOptions,
 } from './channel-bot-control.ts'
+import { orderBotMenu } from './bot-menu.ts'
 import {
   isRoamerEnabled,
   handleRoamerSlash,
@@ -3043,8 +3044,9 @@ async function pollLoop(): Promise<void> {
           // Register to both default and all_private_chats scopes so
           // the autocomplete shows up in DMs regardless of any BotFather-
           // era placeholder scope leftover.
-          void bot.api.setMyCommands(merged).catch(() => {})
-          void bot.api.setMyCommands(merged, { scope: { type: 'all_private_chats' } }).catch(() => {})
+          const menu = orderBotMenu(merged)                 // /clear first, /model second (Joey TG 7727)
+          void bot.api.setMyCommands(menu).catch(() => {})
+          void bot.api.setMyCommands(menu, { scope: { type: 'all_private_chats' } }).catch(() => {})
         },
       })
       return // bot.stop() was called — clean exit from the loop

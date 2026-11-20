@@ -1,3 +1,12 @@
+## 1.33.1 — 2026-11-21
+
+- **Bot menu order: `/clear` first, `/model` second, on every bot** (Joey TG 7727; first asked 11-19).
+  - **Why:** on 11-19 only the channel bot's menu was changed, by a one-off `setMyCommands` call outside the plugin; every other bot kept
+    `/start`, `/help` on top, and the channel bot's own order would have gone back to that at its next daemon start.
+  - **How:** `bot-menu.ts` `orderBotMenu()` puts the two commands first and keeps the rest in the order they were assembled; `server.ts` registers
+    that list in both scopes at start. A bot without the control commands is unchanged. `bot-menu.test.ts`.
+  - The menus of the running bots were set to the same order with the Bot API directly, so no daemon restart is needed for this.
+
 ## 1.33.0 — 2026-11-17
 
 - **Mailbox (信箱), receiving side: agent-inbox daemons fetch their messages from the hub and tell it what they took** (mailbox spec v3, Epeius `knowledge/delivery-ledger-spec-phase1.md`).
