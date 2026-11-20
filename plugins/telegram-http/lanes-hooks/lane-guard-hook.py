@@ -172,6 +172,25 @@ def holds_write_right():
         return False
 
 
+def curator_write(tool, ti, rp):
+    """002w (G): the refusal for a curator's write in the memory dir, or '': a new file, or Edits whose old text stays in the new text."""
+    keep = ('the curator only adds to memory: a new file, or an Edit whose new_string keeps the old text (a mark such as 建議刪除 added next to it). '
+            'What the main wrote is not overwritten or removed: file a memory_proposal 「建議刪除：…（理由）」 for the main instead.')
+    if tool == 'Write':
+        return f'{keep} ({os.path.basename(rp)} exists: a Write would replace it.)' if os.path.exists(rp) else ''
+    if tool == 'Edit':
+        edits = [ti]
+    elif tool == 'MultiEdit':
+        edits = ti.get('edits') or []
+    else:
+        return keep
+    for e in edits:
+        old, new = str((e or {}).get('old_string') or ''), str((e or {}).get('new_string') or '')
+        if old and old not in new:
+            return f'{keep} (this edit removes 「{old[:80]}」.)'
+    return ''
+
+
 def claimed_by():
     try:
         st = json.load(open(os.path.join(os.environ.get('LANES_DIR', ''), 'state.json'), encoding='utf-8'))
@@ -678,7 +697,13 @@ def main():
         mem = os.path.realpath(os.environ.get('LANES_MEMORY_DIR') or '/nonexistent')
         in_mem = rp == mem or rp.startswith(mem + os.sep)
         # 002k: the curator lane holds the memory write right while .lanes/run/memory-writer names it (design/memory 整理線)
+        # 002w (G, gap 20): MM5 「整理線只整理提案，不刪主線寫的內容，只能標記『建議刪除』」 is the guard's, not the prompt's: with the right the curator
+        # writes new files and Edits that keep the old text (a mark added, nothing removed); a Write over an existing file, an Edit that removes text and
+        # a notebook edit are refused
         if in_mem and os.environ.get('LANE_KIND') == 'curator' and holds_write_right():
+            why = curator_write(tool, ti, rp)
+            if why:
+                deny(why)
             return
         if rp == persona or any(rp == r or rp.startswith(r + os.sep) for r in roots):
             deny(f'lanes cannot write {f}: memory, the focus card and .lanes/ have a single writer (the main). '

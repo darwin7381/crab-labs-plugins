@@ -123,11 +123,11 @@ test('002r G02: Stop with an answer left on the main\'s own screen after its las
   } finally { jev.stop(true) }
 })
 
-test('002r H05: a hook event that carries agent_id (a subagent\'s tool call) is posted as sub and prints nothing, whatever the daemon would answer', async () => {
+test('002r H05, 002w G: a hook event that carries agent_id (a subagent\'s tool call) is posted as sub and prints nothing, whatever the daemon would answer; its Telegram reply is denied', async () => {
   const w = world()
   fresh(() => ({ additionalContext: 'one item reached you', block: 'x', turn: { calls: [] } }))
   expect(await hook(w, { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: { file_path: '/a' }, tool_response: 'x', agent_id: 'a7730af99049a14de', agent_type: 'general-purpose' })).toBeNull()
-  expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: REPLY, tool_input: { text: 'x' }, agent_id: 'a7730af99049a14de' })).toBeNull()
+  expect((await hook(w, { hook_event_name: 'PreToolUse', tool_name: REPLY, tool_input: { text: 'x' }, agent_id: 'a7730af99049a14de' }))!.hookSpecificOutput.permissionDecision).toBe('deny')   // 002w G: the reply tool is the main's
   expect(posted.length).toBe(2); expect(posted.every(b => b.sub === true && b.session_id === 's1' && b.tool_name === undefined && b.prompt_id === undefined)).toBe(true)
   fresh(() => ({ additionalContext: 'one item reached you' }))                // the same call by the main itself: pulled as before
   expect((await hook(w, { hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: {}, tool_response: 'x' })).hookSpecificOutput.additionalContext).toBe('one item reached you')

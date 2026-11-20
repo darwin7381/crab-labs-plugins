@@ -324,10 +324,25 @@ const refusedPids = new Map<number, number>()          // claude pid → when it
 export function sessionNotMain(mcpSid: string | undefined): boolean {
   if (D?.role !== 'tg' || !mcpSid) return false
   const pid = mcpSessionPid.get(mcpSid)
-  if (!pid) return false
+  return !!pid && pidNotMain(pid)
+}
+/** the tg daemon's rule (M2): claude process `pid` is not the main (its registration was refused, or a live main is another process) */
+function pidNotMain(pid: number): boolean {
   const mp = main?.mainPid() ?? null
   if (refusedPids.has(pid) && pid !== mp) return true
   return !!mp && pid !== mp
+}
+/** 002w (G, gap 19): THE not-the-main check of an MCP session, in either daemon: the tg daemon applies its rule; the inbox daemon (whose session ids map
+ *  to claude pids by the same socket read) asks the tg daemon, the one keeper of M2 (POST /lanes/not-main). A session whose process is not known, or a tg
+ *  daemon that cannot be asked, is not judged (false). server.ts uses it for the tool list of both daemons and for every main-only tool: the Telegram
+ *  tools and send_to_agent. 2a936a7 judged in the tg daemon only: a refused second session kept send_to_agent and its sends were filed as the main's. */
+export async function notMainSession(mcpSid: string | undefined): Promise<boolean> {
+  if (!D || !mcpSid) return false
+  if (D.role === 'tg') return sessionNotMain(mcpSid)
+  const pid = mcpSessionPid.get(mcpSid)
+  if (!pid) return false
+  const r = await peerCall(TG_PORT, '/lanes/not-main', 'POST', { pid })
+  return r?.not_main === true
 }
 /** the Telegram tools only the main gets (server.ts), besides the main-only lane tools (isMainTool) */
 export const MAIN_TELEGRAM_TOOLS = ['reply', 'react', 'edit_message', 'download_attachment']
@@ -3696,7 +3711,7 @@ function curatorEnd(laneId: string, how: 'done' | 'revoked' | 'ended', summary: 
 }
 function kindLines(kind: LaneKind): string[] {
   if (kind === 'curator') return ['', '# 你是整理線（例外規則，優先於上面的權限上限）',
-    `- 主線把長期記憶的寫入權暫時交給你。記憶目錄：${memoryDir()}。你可以直接改那裡的檔（每次寫入會自動提交，提交訊息帶你的車道與對話編號）。`,
+    `- 主線把長期記憶的寫入權暫時交給你。記憶目錄：${memoryDir()}。你可以在那裡新增記憶檔，或用 Edit 在既有內容旁加上標記（每次寫入會自動提交，提交訊息帶你的車道與對話編號）；覆寫或刪掉既有內容會被擋下。`,
     '- 只整理記憶提案：把有根據的提案寫進記憶。不刪、不改寫主線寫的內容；提案跟主線寫的內容衝突時，不動那個檔，改用 ledger_write(kind=memory_proposal) 寫一筆「建議刪除：…（理由）」留給主線。',
     '- 整理完用 curator_done(summary) 交回寫入權。主線隨時可以收回；收回後你寫不了記憶，沒處理的提案留在帳本。']
   return []
@@ -4491,6 +4506,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       if (!b.pid && b.event === 'SessionStart') b.pid = callerClaudePid(req)       // a hook without CLAUDE_PID: the caller's socket says which claude it is
       sendJson(res, 200, await main.mainEvent(b)); return true
     }
+    if (p === '/lanes/not-main' && req.method === 'POST') { const b = await readBody(req); sendJson(res, 200, { not_main: pidNotMain(Number(b.pid)) }); return true }   // 002w (G): asked by the inbox daemon
     // the state journal, folded: the interface the lab reads
     if (p === '/lanes/state' && req.method === 'GET') { sendJson(res, 200, journal.snapshot({ current_gen: main.currentGen()?.id ?? null, wall: S.wall ?? null })); return true }
     if (p === '/lanes/outbound' && req.method === 'POST') {

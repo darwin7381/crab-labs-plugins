@@ -1358,7 +1358,8 @@ function buildServer(): Server {
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
  // 002m (LG1): a claude process that is not the registered main (its register-main was refused, or a live main holds the role)
  // gets none of the main's Telegram or lane tools (runtime RU5 「只有持有「主」的那一個，拿得到你主對話的回覆工具」).
- if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.sessionNotMain(serverSessionId.get(mcp))) return { tools: [] }
+ // 002w (G, gap 19): in the inbox daemon too (send_to_agent is the main's): the one check, which asks the tg daemon there
+ if (Lanes.LANES_ON && await Lanes.notMainSession(serverSessionId.get(mcp))) return { tools: [] }
  if (INBOX_ONLY) {
    // A2A mesh (Joey 4564): the inbox is bidirectional — every agent can message
    // every other agent in the fleet registry. Deliveries auto-log to BTCC Comms.
@@ -1464,6 +1465,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
+    // 002w (G, gap 19): only the main sends as the main: a session that is not it gets no Telegram tool and no send_to_agent (the one check, both daemons)
+    if (Lanes.LANES_ON && (INBOX_ONLY ? req.params.name === 'send_to_agent' : Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name)) && await Lanes.notMainSession(serverSessionId.get(mcp))) {
+      log('warn', `lanes: ${req.params.name} refused for MCP session ${serverSessionId.get(mcp)} (not the registered main)`)      // 002m (LG1)
+      return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
+    }
     if (INBOX_ONLY && req.params.name === 'send_to_agent') {
       const replyTo = args.reply_to != null && String(args.reply_to).match(/^\d+$/) ? Number(args.reply_to) : undefined
       const noReply = args.no_reply === true || args.no_reply === 'true'
@@ -1487,10 +1493,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       const result = await sendToAgent(String(args.to ?? ''), String(args.text ?? ''), replyTo, noReply, op)
       return { content: [{ type: 'text', text: result }] }
-    }
-    if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name) && Lanes.sessionNotMain(serverSessionId.get(mcp))) {
-      log('warn', `lanes: ${req.params.name} refused for MCP session ${serverSessionId.get(mcp)} (not the registered main)`)      // 002m (LG1)
-      return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
     }
     if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.isMainTool(req.params.name)) {
       const out = await Lanes.callMainTool(req.params.name, args, serverSessionId.get(mcp))

@@ -130,6 +130,8 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
    handed to the main was never asked about (gap 9).
 3. The aids' facts: `items` (the turn's bound items but the digest), `outputs` (its reply / send_to_agent calls), `turn`, `proposals`, `curator`.
    main-hook.py then runs the memory gate and the answered gate, which keeps its own narrow question (a turn of two or more messages).
+   002w (G, gap 19): the Telegram reply tool is the main's: main-hook.py denies a subagent's PreToolUse of `…__reply` (the subagent returns its result
+   to the main, which answers Joey); 2a936a7 printed nothing and the subagent could reply.
    002r (H05): a hook event that carries `agent_id` fired inside a subagent of the main (Claude Code runs the session's tool hooks for a subagent's
    calls too). main-hook.py posts it as `sub: true` and prints nothing; the daemon starts, continues and ends no turn by it, opens no tool, pulls
    nothing (a pull there would hand the main's message to the subagent) and only counts it as the gen's sign of life while a turn is open. Before
@@ -467,7 +469,9 @@ The main session's settings must carry:
 }
 ```
 
-memory-commit-hook.py keeps its own registration (PostToolUse on Write and Edit). The PreToolUse timeout is 30 s because the summary gate's Jev
+memory-commit-hook.py keeps its own registration (PostToolUse on Write and Edit). 002w (G, gap 21): its `commit(p, file)` is the one memory commit;
+main-hook.py calls it at the main's final Stop with no file, and everything the turn changed under the memory dir is committed (a Bash or NotebookEdit
+write included: 2a936a7 committed Write/Edit/MultiEdit only). The PreToolUse timeout is 30 s because the summary gate's Jev
 calls (`SUMMARY_GATE_JEV`, `MAIN_REPLY_CHECK`, `TYPESAFE_*` must be in main-hook.py's environment) run inside it.
 
 Do not register main-summary-gate.py, main-answered-gate.py or main-memory-gate.py as hooks of their own (run alone, the first two do nothing
@@ -507,7 +511,16 @@ How the main is registered:
 - `/clear` (Claude Code 2.1.322): `SessionEnd` with reason `clear`, then `SessionStart` source `clear` with a new session id, same process. A
   `SessionEnd` with reason `clear`, or of a session other than the gen's current one, ends no gen (002v: it used to end it, and the new session was
   refused: nobody was the main until the TUI restarted).
-- Any other SessionStart is refused. Joey is told once, and that process's MCP sessions lose the Telegram tools.
+- Any other SessionStart is refused. Joey is told once, and that process's MCP sessions lose the Telegram tools, and send_to_agent too (002w G,
+  gap 19): the not-the-main check is one function (`notMainSession`) for both daemons; the inbox daemon, which knows each MCP session's claude pid by
+  the same socket read, asks the tg daemon (`POST /lanes/not-main`, the M2 rule `pidNotMain`). A session that is not the main lists no send_to_agent and
+  its call is refused (2a936a7: the inbox daemon judged nobody, and a second session's sends were filed as the main's). A process that cannot be told
+  apart, or a tg daemon that cannot be asked, is not judged.
+
+The curator's memory writes (002w G, gap 20; design/memory MM5 「整理線只整理提案，不刪主線寫的內容」): while it holds the write right the lane guard
+lets it write a new file, or Edit / MultiEdit when every edit's new text keeps the old text (a mark added next to it); a Write over an existing file, an
+edit that removes text and a NotebookEdit are refused, with the way out (a memory_proposal 「建議刪除：…」 for the main). 2a936a7 let it write any file of
+the memory dir; the rule was prompt text.
 
 ## Lanes
 

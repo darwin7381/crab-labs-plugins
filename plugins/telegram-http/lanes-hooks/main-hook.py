@@ -101,6 +101,10 @@ def main():
     pid = os.environ.get('CLAUDE_PID') or ''
     if p.get('agent_id'):                    # 002r (H05): a subagent's (or teammate's) tool call, not the main's turn: the daemon only notes the process works
         post({'event': ev, 'session_id': p.get('session_id'), 'pid': int(pid) if pid.isdigit() else None, 'sub': True}, 5)
+        if ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__reply'):
+            # 002w (G, gap 19): the Telegram reply tool is the main's: a subagent of the main reports to the main, which answers Joey
+            out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                 'permissionDecisionReason': 'refused: the reply tool belongs to the main session; a subagent returns its result to the main, and the main answers Joey.'}})
         return
     body = {'event': ev, 'session_id': p.get('session_id'), 'prompt_id': p.get('prompt_id'), 'pid': int(pid) if pid.isdigit() else None,
             'transcript_path': p.get('transcript_path'), 'source': p.get('source'), 'tool_name': p.get('tool_name'), 'error': p.get('error')}
@@ -152,6 +156,7 @@ def main():
             return
         body['phase'] = 'final'
         post(body, 10)
+        aid('memory-commit-hook.py', 'commit', p, None)   # 002w (G, gap 21): what the turn changed in memory by any tool (Bash, NotebookEdit) is committed
 
 
 if __name__ == '__main__':
