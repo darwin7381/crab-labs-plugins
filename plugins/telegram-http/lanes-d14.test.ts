@@ -5,6 +5,8 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 let server: any, calls: any[] = []
+/** the report check's requests (002w F: a delivered line is also asked the one promise check, another request) */
+const reportCalls = () => calls.filter(c => Array.isArray(c?.state?.tool_results))
 beforeAll(() => {
   server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
     const body = await req.json() as any
@@ -46,7 +48,7 @@ test('D14: a worker that only filed a proposal and tells Joey 「已記下」: s
   calls = []
   const r1 = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: CLAIM })
   expect(r1).toStartWith('not sent:'); expect(r1).toContain(pid); expect(r1).toContain('a proposal is not a memory write and not a record'); expect(r1).toContain('「收到，已記下：mock 服務的例行排程一律 09:00，不再改。」')
-  expect(sent.length).toBe(0); expect(calls.length).toBe(0)                                  // decided by the program: Jev was not asked
+  expect(sent.length).toBe(0); expect(reportCalls().length).toBe(0)                                  // decided by the program: Jev was not asked
   const log = rows('run/report-check.jsonl').at(-1)
   expect(log).toMatchObject({ by: 'program', relation: 'proposal-is-not-a-record', sent_back: true, tool: 'notify_joey' })
   const r2 = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: CLAIM })
@@ -92,7 +94,7 @@ test('D14: the proposals and writes of the run reach Jev as evidence for the per
   const pid = /id (mp-[0-9a-f]+)/.exec(await propose(tok))![1]
   calls = []
   expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: 'mock 服務的排程目前是 07:30 和 02:00，已交給主線決定。' })).toContain('sent to Joey')
-  expect(calls.length).toBe(1)
-  const ev = calls[0].state.tool_results.find((r: any) => r.call === 'ledger (this run)')
+  expect(reportCalls().length).toBe(1)
+  const ev = reportCalls()[0].state.tool_results.find((r: any) => r.call === 'ledger (this run)')
   expect(ev.result).toContain(pid); expect(ev.result).toContain('A proposal is NOT a memory write'); expect(ev.result).toContain('Memory writes by this run: none'); expect(ev.result).toContain('Ledger records written by this run: none')
 })
