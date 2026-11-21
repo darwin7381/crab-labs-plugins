@@ -369,6 +369,28 @@ describe('taken', () => {
   })
 })
 
+describe('no transcript to read', () => {
+  test('receipt check unavailable: one push each, counted as seen and taken; available later: back to receipts', async () => {
+    let available = false
+    const r = rig({ receiptCheck: () => available })   // the channel bot's daemon on 11-20: its transcript dir didn't exist
+    r.add(1); r.add(2)
+    await r.make().start()
+    expect(ids(r.pushed)).toEqual(['1', '2'])
+    for (let i = 0; i < 5; i++) { r.t += 120_000; await r.sync.kick('timer') }
+    expect(r.pushed.length).toBe(2)                         // not re-pushed up to maxPushes
+    expect(r.hub.get(1)!.received_at).not.toBeNull()
+    expect(r.hub.get(2)!.received_at).not.toBeNull()
+    expect(r.logs.some(l => l.includes('never seen'))).toBe(false)
+    available = true
+    r.add(3)
+    r.t += 30_000; await r.sync.kick('timer')
+    expect(ids(r.pushed)).toEqual(['1', '2', '3'])
+    r.t += 120_000; await r.sync.kick('timer')
+    expect(ids(r.pushed)).toEqual(['1', '2', '3', '3'])      // receipts again: unseen after the grace → pushed again
+    expect(r.hub.get(3)!.received_at).toBeNull()
+  })
+})
+
 describe('gc', () => {
   test('taken entries go 24 h after taken; never-taken ones 48 h after their last activity', () => {
     const now = 10 * DAY

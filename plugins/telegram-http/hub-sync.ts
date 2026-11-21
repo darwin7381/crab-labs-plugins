@@ -182,7 +182,10 @@ export type HubDeps = {
 
 export type HubOpts = {
   stateDir: string
-  receiptCheck: boolean
+  /** Whether a push can be confirmed from the transcript. A function is asked at each use: false while the daemon
+   *  has no transcript dir to read (RECEIPT_CHECK=0, or the dir doesn't exist), and then a push counts as seen,
+   *  as on the old path; otherwise every push read as unseen and was sent maxPushes times (channel bot, 11-20). */
+  receiptCheck: boolean | (() => boolean)
   graceMs: number
   maxPushes: number
   /** Wait after a 404 / 401 / 403 before asking again (default 5 min). */
@@ -418,8 +421,13 @@ export class HubSync {
     }
   }
 
+  private receiptOn(): boolean {
+    const rc = this.opts.receiptCheck
+    return typeof rc === 'function' ? rc() : rc
+  }
+
   private sweepSeen(): void {
-    if (!this.opts.receiptCheck) return
+    if (!this.receiptOn()) return
     const unseen = Object.entries(this.state).filter(([, e]) => !e.old_path && e.pushes > 0 && e.seen_at == null)
     if (!unseen.length) return
     const since = Math.min(...unseen.map(([, e]) => e.last_push_at ?? this.now()))
@@ -441,7 +449,7 @@ export class HubSync {
       const key = String(id)
       const e = this.state[key]
       if (e && (e.old_path || e.seen_at != null || e.taken_at != null)) continue
-      if (!e && this.opts.receiptCheck) {
+      if (!e && this.receiptOn()) {
         // Never pushed from here: if the old path already put it in the session (a previous process, the rollout
         // before this version, a lost state file), don't push it again — just report it taken.
         firstSight ??= this.deps.seenLines(this.now() - DAY_MS)
@@ -467,7 +475,7 @@ export class HubSync {
       const entry = e ?? (this.state[key] = { pushes: 0, last_push_at: null, seen_at: null, taken_at: null })
       entry.pushes++
       entry.last_push_at = now
-      if (!this.opts.receiptCheck) entry.seen_at = now   // RECEIPT_CHECK=0: pushed = seen (1.32.1 rule)
+      if (!this.receiptOn()) entry.seen_at = now   // no receipt check: pushed = seen (1.32.1 rule)
       this.dirty = true
       this.save()   // per push: a restart right after must know it was pushed
       pushed++

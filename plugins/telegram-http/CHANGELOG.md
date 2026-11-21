@@ -1,3 +1,19 @@
+## 1.33.2 — 2026-11-21
+
+- **Hub sync: a daemon that can't read its session's transcript counts a push as taken, instead of pushing every message three times**
+  (Epeius daily check, 11-21).
+  - **What happened:** the channel bot's agent-inbox daemon (`agent-inbox.sonn`) looked for transcripts in `~/.claude/projects/-Users-btai--claude-channels`,
+    a directory that doesn't exist: its state dir's parent isn't the bot's workspace (`~/.claude/workspace-telegram`). The old path already handles
+    that case (no transcript dir → pushed = delivered), but hub sync did not: from 11-17 to 11-21 it pushed each of 12 hub messages three times
+    and never reported them taken. The MBP daemon had the same wrong directory; no hub message had reached it yet.
+  - **Fix:** `HubOpts.receiptCheck` can be a function, asked at each use; `server.ts` passes `RECEIPT_CHECK && consumptionCheckAvailable()`.
+    While it is false, a push counts as seen (the `RECEIPT_CHECK=0` rule); once the transcript dir appears, receipts apply again. `hub-sync.test.ts`.
+  - **Transcript dir name:** Claude Code replaces every character other than a letter or digit with `-`; the daemon replaced only `/` and `.`, so a
+    workspace with `_` or a space (MBP: `~/Development/crab_labs` → `-Users-JL-Development-crab-labs`) never matched. No running daemon's dir
+    changes with this (79 Mac mini + 5 MBP daemons checked); it matters once `AGENT_WORKSPACE_DIR` names such a path.
+  - **Config, outside the plugin:** `AGENT_WORKSPACE_DIR` added to the channel bot's and the MBP's agent-inbox plists, so both daemons read the right
+    transcripts and receipts work there too.
+
 ## 1.33.1 — 2026-11-21
 
 - **Bot menu order: `/clear` first, `/model` second, on every bot** (Joey TG 7727; first asked 11-19).

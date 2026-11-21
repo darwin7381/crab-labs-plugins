@@ -768,7 +768,9 @@ function persistInbound(notif: { method: string; params: unknown }): string | nu
 // If the transcript dir can't be resolved (AGENT_WORKSPACE_DIR env override →
 // STATE_DIR-parent heuristic), falls back to legacy ack-on-write.
 const AGENT_WORKSPACE_DIR = process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR)
-const TRANSCRIPT_DIR = join(homedir(), '.claude', 'projects', AGENT_WORKSPACE_DIR.replace(/[/.]/g, '-'))
+// Claude Code names a project dir by replacing every character other than a letter or digit with '-'
+// ("/Users/JL/Development/crab_labs" → "-Users-JL-Development-crab-labs"); '/' and '.' alone missed '_' and spaces.
+const TRANSCRIPT_DIR = join(homedir(), '.claude', 'projects', AGENT_WORKSPACE_DIR.replace(/[^a-zA-Z0-9]/g, '-'))
 // Evaluated per use, cached once true: a brand-new workspace has no transcript dir until Claude Code takes its
 // first input, and a startup-only check left tracking (and receipt verification) off for the daemon's whole life
 // (11-17 lab). A dir that never exists (channel bot: STATE_DIR's parent isn't a workspace) stays off, as before.
@@ -1168,7 +1170,8 @@ if (hubMode.on) {
     dispatchOld: (chatId, notif) => dispatchInbound(chatId, notif),
     defaultChatId: () => String(loadAccess().allowFrom[0] ?? 'local-inject'),
     log,
-  }, { stateDir: STATE_DIR, receiptCheck: RECEIPT_CHECK, graceMs: RECEIPT_GRACE_MS, maxPushes: MAX_REDELIVERIES })
+  }, { stateDir: STATE_DIR, receiptCheck: () => RECEIPT_CHECK && consumptionCheckAvailable(), graceMs: RECEIPT_GRACE_MS,
+    maxPushes: MAX_REDELIVERIES })
 }
 
 function loadInboxRegistry(): Record<string, { url: string; desc?: string }> {
