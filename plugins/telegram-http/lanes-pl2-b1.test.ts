@@ -53,10 +53,11 @@ test('L6B1: two restarts by two lanes are two "restart mock-api" actions; the to
   await L.routeEvent(alert('mesh-3', 11)); expect(await until(() => exits() >= 3)).toBe(true)
   writeFileSync(join(dir, 'mode'), 'plain')
   await L.routeEvent(alert('mesh-4', 15)); expect(await until(() => exits() >= 4)).toBe(true)
-  const acts = rows().filter(r => r.refs?.restart)
-  expect(acts.length).toBe(3)
+  // 002y (X-2): each restart is a record written at the send and one line settling it (ledger_query folds them into one entry, below)
+  const sent = rows().filter(r => r.refs?.restart && r.refs.record), acts = rows().filter(r => r.refs?.restart && r.refs.settles)
+  expect(sent.length).toBe(3); expect(acts.map(r => r.refs.settles)).toEqual(sent.map(r => r.refs.record))
   expect(acts.map(r => r.refs.ok)).toEqual([true, true, false])
-  for (const r of acts) { expect(r.kind).toBe('action'); expect(r.text).toMatch(/^restart mock-api/) }
+  for (const r of [...sent, ...acts]) { expect(r.kind).toBe('action'); expect(r.text).toMatch(/^restart mock-api/) }
   expect(acts[2].text).toContain('restart mock-api（沒有成功）')
   expect(L.LANE_LEDGER_QUERY_DESCRIPTION).toContain('ledger_query(since="-24h", text="restart mock-api")')
   const tok = { runId: 'x.r1', lane: Object.keys(L.__lanesState().lanes)[0], evId: 'ev', closers: [], critical: false, trigger: 'alert', cls: 'alert', escalated: false, pushed: false } as any

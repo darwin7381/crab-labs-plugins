@@ -424,6 +424,14 @@ What happens next:
   item body (3800 characters).
 - At boot, a run left `leased` or `running` died with the daemon. It gets `exited(died, signal daemon-restart)`, its lanes.jsonl exit row and a
   lane_lifecycle ledger line, and its event runs again **only while it still owes the lane something** (002q, T6-R).
+- **A restart is one record from its send** (002y, X-2; 002x G05 r1-r3: God killed the lane after `./bin/svc POST mock-api/restart` reached the
+  service and before its result; 002m wrote the ledger action only when the command returned, so the re-run found none and could not tell whether
+  it had restarted). A Bash restart (`restartCommand`) writes its ledger action when the command is sent: 「restart <svc>（已送出，結果還沒回來）」,
+  `refs: {restart, state: sent, record, cmd, run}`; the running run's record carries it in `restarts` while it is out. One more line settles it
+  (`refs.settles` = the record): `ok` / `failed` (「（沒有成功）」) when its result comes back; `unknown` (「（結果不明：送出後這一趟…，結果沒有回來）」,
+  `ok: null`) when the run ends without it (it died, timed out or was stopped), and at boot for a run the daemon stopped with a restart out.
+  The ledger stays append-only; ledger_query folds a settling line into its record (`foldSettled`): one entry per restart, at the time it was
+  sent, with its last settlement, so runbook §4's count is one per restart.
 - One rule decides every re-run (`runAgain`), a death, a timeout, a wall and a daemon restart alike: an event of the run's event set still has an
   obligation the lane owes, or the run's task is not done (`taskOwed`). Otherwise no new run, and the exit rule writes a `wake` line `no_wake` with
   "owes nothing more". 002p re-ran a closed event after a daemon restart, and the lane, finding everything done, ended without a line.

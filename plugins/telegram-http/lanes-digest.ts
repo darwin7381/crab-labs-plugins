@@ -187,6 +187,20 @@ const isTold = (r: LedgerRec): boolean => r.kind === 'action' && /^(reply_agent|
  *  the id memory_decide takes; the row showed the lane's text only, and the main could not decide a proposal that was not Joey's. */
 const ledgerRow = (r: LedgerRec): string =>
   `${stamp(r.ts)}｜${r.kind}｜${laneName(r.lane)}${r.thread ? `｜${r.thread}` : ''}｜${r.refs?.proposal_id ? `${r.refs.proposal_id}｜` : ''}${clip(r.text, LEDGER_QUERY_TEXT_MAX)}`
+/** 002y (X-2): a record the ledger writes as two lines (a lane's restart: `refs.record` when it is sent, then a line with `refs.settles` naming it when its
+ *  result comes back or its run ends without it) is ONE entry: the latest settling line's text and refs replace the record's, which keeps its time (when
+ *  it was sent). A settling line whose record is not in the ledger stays an entry of its own. */
+export function foldSettled(rows: LedgerRec[]): LedgerRec[] {
+  const at = new Map<string, number>()
+  const out: LedgerRec[] = []
+  for (const r of rows) {
+    const s = r.refs?.settles
+    if (s != null && at.has(String(s))) { const i = at.get(String(s))!; out[i] = { ...out[i], text: r.text, refs: { ...r.refs, record: String(s), settled_at: r.ts } }; continue }
+    if (r.refs?.record != null) at.set(String(r.refs.record), out.length)
+    out.push(r)
+  }
+  return out
+}
 function queryLedgerBase(raw: string | null, q: { since?: unknown; kind?: unknown; text?: unknown }, now: number): string {
   const kindIn = typeof q.kind === 'string' ? q.kind.trim().toLowerCase() : ''
   const kindKnown = !kindIn || (LEDGER_KINDS as readonly string[]).includes(kindIn)
@@ -194,7 +208,7 @@ function queryLedgerBase(raw: string | null, q: { since?: unknown; kind?: unknow
   if (since === 'bad') return `since 格式不對：${String(q.since)}。用時間（2026-11-13 12:00；不寫時區就當成 ${TZ_LABEL}）或相對時間（-4h、-30m、-2d）。`
   const text = typeof q.text === 'string' ? q.text.trim() : ''
   const echo = `since=${typeof q.since === 'string' && q.since.trim() ? q.since.trim() : '-'} kind=${kindIn || '-'} text=${text ? clip(text, 80) : '-'}`
-  const all = (raw ?? '').split('\n').filter(Boolean).map(parseLedgerLine).filter((r): r is LedgerRec => !!r)
+  const all = foldSettled((raw ?? '').split('\n').filter(Boolean).map(parseLedgerLine).filter((r): r is LedgerRec => !!r))
   if (!all.length) return `帳本還沒有任何紀錄（ledger.jsonl 不存在或是空的）。${echo}`
   const counts = LEDGER_KINDS.map(k => `${k} ${all.filter(r => r.kind === k).length}`).join('、')
   const find = (kind: string, needle: string): LedgerRec[] => {

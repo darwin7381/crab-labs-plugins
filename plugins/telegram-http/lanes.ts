@@ -1613,6 +1613,9 @@ function restoreRuns(): void {
     // row it never could write, and the event is run again (an attempt like any death).
     reapOrphan(Number(r.pid), String(r.run ?? ''))
     const lane = S.lanes[it.lane]
+    // 002y (X-2): a restart that run had sent with no result yet: its record is settled, 結果不明 (the daemon stopped with the run)
+    for (const p of (Array.isArray(r.restarts) ? r.restarts : []) as PendingRestart[])
+      restartLedger({ id: it.lane, thread: lane?.thread ?? null }, it.ev.id, String(r.run ?? '?'), p, 'unknown', 'daemon 重啟時這一趟還在跑，被切斷')
     const resumable = !!lane?.transcript && existsSync(lane.transcript)
     if (lane && resumable) lane.runs += 1
     endRun(it, 'died', { signal: 'daemon-restart', exit_code: null })
@@ -2418,7 +2421,11 @@ function startRun(it: QItem): void {
   const settleUsage = (): void => {                                      // 002m (L6CEH1): the stream's snapshots, corrected by the transcript
     for (const [id, u] of transcriptUsage(runTranscript(), [...usage.keys()])) usage.set(id, maxUsage(usage.get(id), u))
   }
-  const restarts = new Map<string, { svc: string; cmd: string }>()       // 002m (L6B1): tool_use id of a Bash restart → the service
+  // 002m (L6B1): tool_use id of a Bash restart → the service. 002y (X-2): its record is written at the send and settled at its result or at the run's end;
+  // the run's journal record carries the ones still out (`restarts`), so a daemon that stops with the run settles them at boot (restoreRuns)
+  const restarts = new Map<string, PendingRestart & { settled?: boolean }>()
+  let exited = false
+  const pendingRec = (): void => { if (!exited) runRec(it, 'running', { restarts: [...restarts.values()].map(({ record, svc, cmd }) => ({ record, svc, cmd })) }) }
   child.stdout!.setEncoding('utf8')
   child.stdout!.on('data', (chunk: string) => {
     buf += chunk
@@ -2438,7 +2445,12 @@ function startRun(it: QItem): void {
             tools.push({ id: c.id ? String(c.id) : undefined, name: c.name, input: c.input })
             if (!String(c.name).startsWith('mcp__lane__')) (tok.calls ??= []).push({ name: c.name, input: c.input })   // the lane stop's model aid (its lane tools: callLaneTool)
             const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
-            if (rs && c.id) restarts.set(String(c.id), { svc: rs, cmd: String(c.input?.command ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) })
+            if (rs && c.id) {
+              const r: PendingRestart = { record: `rst-${shortId()}`, svc: rs, cmd: String(c.input?.command ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) }
+              restarts.set(String(c.id), r)
+              restartLedger(lane, it.ev.id, runId, r, 'sent')                        // 002y (X-2): the record exists from the send
+              pendingRec()
+            }
           }
           else if (c?.type === 'text' && String(c.text ?? '').trim()) lastText = String(c.text)
         }
@@ -2466,13 +2478,12 @@ function startRun(it: QItem): void {
           if (rst) {
             // 002m (L6B1): runbook §4 counts the restarts of the last 24 h (a third one needs Joey first), and lanes count them with ledger_query. The count
             // read free text (「./bin/svc POST mock-api/restart」, 「重啟」), and the tool's own example `text="restart mock-api"` matched none (B r3). Every restart
-            // a lane runs is one structured action: text 「restart <service>…」, refs.restart = <service>.
+            // a lane runs is one structured action: text 「restart <service>…」, refs.restart = <service>. 002y (X-2): this settles the record the send wrote
+            // (a result read after the run's end, which settled it unknown, settles it again: the lookup shows the last settlement)
             restarts.delete(String(c.tool_use_id ?? ''))
             const ok = !c.is_error && !/"error"|blocked|not found|denied|refused|失敗|錯誤|failed|curl: \(\d+\)/i.test(body)
-            ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
-              text: `restart ${rst.svc}${ok ? '' : '（沒有成功）'}：${lane.id} 執行 ${rst.cmd}${ok ? '' : `；結果：${body.replace(/\s+/g, ' ').trim().slice(0, 160)}`}`,
-              refs: { restart: rst.svc, ok, cmd: rst.cmd, run: runId } })
-            logos('lane.restart', { lane: lane.id, run: runId, event: it.ev.id, svc: rst.svc, ok })
+            restartLedger(lane, it.ev.id, runId, rst, ok ? 'ok' : 'failed', body.replace(/\s+/g, ' ').trim().slice(0, 160))
+            pendingRec()
           }
           const step = tools.find(t => t.id && t.id === String(c.tool_use_id ?? ''))
           if (step) { step.result = body.replace(/\s+/g, ' ').trim().slice(0, STEP_RESULT_MAX); step.error = !!c.is_error }
@@ -2484,6 +2495,13 @@ function startRun(it: QItem): void {
   child.stderr!.on('data', (c: Buffer) => { errTail = (errTail + c.toString('utf8')).slice(-600); try { appendFileSync(join(LANES_DIR, 'run', `${lane.id}.err.log`), c) } catch {} })
   child.on('exit', (code, signal) => {
     clearTimeout(limit)
+    exited = true
+    // 002y (X-2, G05): a restart this run sent whose result never came back is settled now, 結果不明 (the record of it was written at the send)
+    for (const r of restarts.values()) if (!r.settled) {
+      r.settled = true
+      restartLedger(lane, it.ev.id, runId, r, 'unknown', timedOut ? `這一趟超過 ${Math.round(LANE_MAX_RUN_MS / 1000)} 秒被 daemon 停下（${signal ?? 'SIGKILL'}）`
+        : budgetStop ? `這一趟到了 token 預算被中止（${signal ?? 'SIGTERM'}）` : signal ? `這一趟的行程被訊號 ${signal} 結束` : `這一趟的行程以 exit ${code} 結束`)
+    }
     syncSteer(lane.id)                                                // 002k (E18): what the hook handed over is recorded while the run's entry still stands
     if (lockSid) { try { if (readFileSync(sidLock(lockSid), 'utf8').trim() === String(child.pid)) rmSync(sidLock(lockSid)) } catch {} }   // 002l (S0 item 2)
     running.delete(lane.id)
@@ -2967,7 +2985,7 @@ const LEDGER_QUERY_PROPS = {
   text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } }
 export const LANE_LEDGER_QUERY_DESCRIPTION =
   "[read only] Look back in the agent's ledger (what the lanes handled, told Joey, promised, handed over). Use it to count or check history yourself, e.g. restarts of a service in the last 24 h: " +
-  'ledger_query(since="-24h", text="restart mock-api") lists one "restart mock-api" action for every restart a lane ran (the router writes it when the restart command returns; a failed one says 沒有成功); ' +
+  'ledger_query(since="-24h", text="restart mock-api") lists one "restart mock-api" action for every restart a lane ran (the router writes it when the restart command is sent and settles it when its result comes back; a failed one says 沒有成功, one whose result never came back 結果不明); ' +
   'restarts done by the main or by hand are not in it, so also read the notices it lists. Filters: `text` (substring or regex), `since`, `kind`. No filter = the activity list (one line per event). ' +
   'A filtered answer ends with the per-kind counts; at most 30 entries, newest last. It writes nothing.'
 export const LANE_TOOLS = [
@@ -3775,6 +3793,23 @@ function limitLines(lane: Lane): string[] {
   if (!parts.length) return []
   return ['', `# 這一趟的上限`, `- ${parts.join('；')}。到上限這一趟會被中止。`,
     `- 快到上限時系統會在工具結果後面提醒你（〔系統通知｜車道上限〕）。一被提醒就收尾：還做不完就用 handoff_main 交給主線（寫清楚你查到什麼、你的做法、還剩什麼），做完了就 notify_joey 一句，最後 receipt。不要等到被中止。`]
+}
+/** 002y (X-2; 002x G05 r1-r3): ONE ledger record per restart a lane runs (runbook §4 counts them with ledger_query). 002m wrote it only when the restart
+ *  command returned: in G05 God killed the lane after `./bin/svc POST mock-api/restart` reached the service and before its result, and the re-run found no
+ *  record (「帳本沒有 restart 紀錄，所以無法確認重啟是否執行」). Now the record is written when the command is SENT (`state: sent`, `refs.record`) and
+ *  settled by one more line naming it (`refs.settles`): `ok` or `failed` when the result comes back, `unknown` when the run ends without it (it died, timed
+ *  out, was stopped) or the daemon stopped with the run (the run's journal record keeps its pending restarts: restoreRuns settles them). The ledger stays
+ *  append-only; the lookup folds a settling line into its record (lanes-digest foldSettled): one entry per restart. */
+export type PendingRestart = { record: string; svc: string; cmd: string }
+function restartLedger(lane: { id: string; thread?: string | null }, evId: string, runId: string, r: PendingRestart, state: 'sent' | 'ok' | 'failed' | 'unknown', note = ''): void {
+  const text = state === 'sent' ? `restart ${r.svc}（已送出，結果還沒回來）：${lane.id} 執行 ${r.cmd}`
+    : state === 'ok' ? `restart ${r.svc}：${lane.id} 執行 ${r.cmd}`
+    : state === 'failed' ? `restart ${r.svc}（沒有成功）：${lane.id} 執行 ${r.cmd}；結果：${note}`
+    : `restart ${r.svc}（結果不明：送出後${note}，結果沒有回來；服務可能已經重啟了）：${lane.id} 執行 ${r.cmd}`
+  const ok = state === 'ok' ? true : state === 'failed' ? false : null
+  ledger({ lane: lane.id, thread: lane.thread ?? null, event: evId, kind: 'action', text,
+    refs: { restart: r.svc, ok, state, cmd: r.cmd, run: runId, ...(state === 'sent' ? { record: r.record } : { settles: r.record }) } })
+  if (state !== 'sent') logos('lane.restart', { lane: lane.id, run: runId, event: evId, svc: r.svc, ok, state })
 }
 /** 002m (L6B1): the service a Bash command restarts, or null: the workspace's `svc POST <service>/restart` (any path to svc), `systemctl restart <unit>`,
  *  `docker restart <name>`, `kubectl rollout restart <kind>/<name>` */
