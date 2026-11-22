@@ -1371,8 +1371,11 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
 // field yet (wakeKind: the watchdog's marker).
 function laneEventOf(n: { method: string; params: unknown }, verified?: boolean): Lanes.InEvent {
   const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
-  const meta = p.meta ?? {}
   const text = String(p.content ?? '')
+  // lanes-golive (A1): the scheduler sends the run number and the high-frequency mark only in the header; a body field wins when a sender has one
+  const runId = p.meta?.run_id || fleetRunId(n)
+  const frequency = p.meta?.frequency || (Lanes.highFrequencyHeader(text) ? 'high' : '')
+  const meta: Record<string, string> = { ...(p.meta ?? {}), ...(runId ? { run_id: String(runId) } : {}), ...(frequency ? { frequency: String(frequency) } : {}) }
   const from = String(meta.user ?? 'unknown')
   const btcc = meta.btcc_msg_id ?? meta.msg_id
   const hop = Number(meta.hop)

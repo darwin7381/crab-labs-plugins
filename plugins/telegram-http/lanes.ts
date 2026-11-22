@@ -702,6 +702,12 @@ export function wakeKind(from: string | undefined, text: string, field?: unknown
   if (/已經切換，可以繼續了/.test(t)) return 'resume'
   return 'stall'
 }
+/** lanes-golive (A1): the scheduler's high-frequency mark is in the text header only: `[scheduled][tag][run:N]…[high-frequency]` (BTCC d95a0db; ORG-CHART
+ *  §0 #5). True when the leading run of bracket groups of a [scheduled] line carries it (a mention in the body does not count). */
+export function highFrequencyHeader(text: string): boolean {
+  const head = String(text ?? '').trimStart().match(/^(?:\[[^\]\n]*\])+/)?.[0] ?? ''
+  return head.startsWith('[scheduled]') && head.includes('[high-frequency]')
+}
 /** the line field of an /inject body or hub meta (line, or the older tier name), or null when it names none */
 export function lineOf(v: unknown): Line | null {
   const s = String(v ?? '').trim().toLowerCase()
