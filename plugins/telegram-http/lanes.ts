@@ -1839,6 +1839,20 @@ async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult 
   logos('lane.main_menu', { why, key: pk.key, options: pk.options, chose: res.chose ?? null, result: res.result ?? null, resurfaced: res.resurfaced })
   return res
 }
+/** 002y (X-1, 002x T7-R, every play): ONE owner of the main's limit menu. The startup-picker watchdog rang Joey with the menu's buttons seconds after
+ *  the main walled, and the probe below then chose 「Wait here, then continue automatically」 itself: Joey was asked to pick what the router picked.
+ *  With lanes on (server.ts passes this as the watchdog's `owner` for the main's pane) the menu is this mechanism's while the main's wall episode is
+ *  open (`wall_since`: walled, or in its probe's turn), and a limit menu (an option speaks of a limit, usage or a reset) on a main still in its turn:
+ *  the menu is drawn when the limit cuts the turn, and the StopFailure that walls the gen can reach the daemon after the watchdog's poll. The probe
+ *  drives the option that waits or continues (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
+ *  reads it too (lanes-main). Any other menu (a starting main's resume menu, an idle main's prompt) stays the watchdog's. */
+const LIMIT_OPTION = /limit|usage|reset/i
+export function mainMenuOwned(options: string[]): boolean {
+  if (D?.role !== 'tg' || !D.mainPicker) return false
+  const g = main?.currentGen()
+  if (!g || g.state === 'gone') return false
+  return !!g.wall_since || (g.state === 'in_turn' && options.some(o => LIMIT_OPTION.test(o)))
+}
 function menuSentence(m: MenuResult): string {
   const labels = m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')
   if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，它繼續了。`

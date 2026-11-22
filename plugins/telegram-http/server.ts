@@ -1756,6 +1756,9 @@ if (isControlEnabled() || isRoamerEnabled()) {
       }
     },
     log,
+    // 002y (X-1): with lanes on, the main's limit menu in its wall is the lanes main-wall mechanism's (one owner); lanes off: no owner, as before
+    ...(Lanes.LANES_ON && !INBOX_ONLY ? { owner: (t: WatchTarget, pk: { options: string[] }) =>
+      t.tmux === process.env.CHANNEL_BOT_TMUX_SESSION && Lanes.mainMenuOwned(pk.options) ? 'the lanes main-wall probe' : null } : {}),
   })
 }
 

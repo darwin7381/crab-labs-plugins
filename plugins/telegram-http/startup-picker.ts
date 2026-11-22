@@ -239,6 +239,8 @@ const surfaced = new Map<string, boolean>()
 const sentGeneric = new Map<string, Set<string>>()
 const forced = new Set<string>()
 export function rearmStartupPicker(tmux: string): void { surfaced.set(tmux, false); forced.add(tmux) }
+// 002y (X-1): tmux → the key of a menu another owner holds (logged once, not each poll)
+const deferred = new Map<string, string>()
 
 export function startStartupPickerWatchdog(opts: {
   listTargets: () => Promise<PickerTarget[]>
@@ -247,6 +249,11 @@ export function startStartupPickerWatchdog(opts: {
   pollMs?: number
   /** tests: the pane reader */
   capture?: (tmux: string) => Promise<string>
+  /** 002y (X-1, 002x T7-R): who else owns this menu now (a name), or null. With lanes on, the main's limit menu in its wall episode is the lanes
+   *  main-wall mechanism's (lanes.ts mainMenuOwned): it chooses the option that waits or continues, or puts the menu in front of Joey by re-arming
+   *  it (rearmStartupPicker). An owned menu is not sent from here unless its owner re-armed it, and it is not marked surfaced (once the owner lets
+   *  go, it is a menu like any other). Unset (lanes off), or a call that throws: every menu is the watchdog's, as before. */
+  owner?: (t: PickerTarget, picker: DetectedPicker) => string | null
 }): void {
   const pollMs = opts.pollMs ?? 8_000
   const capture = opts.capture ?? capturePane
@@ -259,6 +266,13 @@ export function startStartupPickerWatchdog(opts: {
       const picker = detectStartupPicker(pane)
       if (picker) {
         if (!surfaced.get(t.tmux)) {
+          let by: string | null = null
+          if (opts.owner && !forced.has(t.tmux)) { try { by = opts.owner(t, picker) } catch (e) { opts.log('warn', `startup picker owner check failed (${e}); the watchdog sends it`) } }
+          if (by) {
+            if (deferred.get(t.tmux) !== picker.key) { deferred.set(t.tmux, picker.key); opts.log('info', `${describePicker(picker, t.tmux)} — ${by} owns it now; not sent to TG from here`) }
+            continue
+          }
+          deferred.delete(t.tmux)
           surfaced.set(t.tmux, true)
           const seen = sentGeneric.get(t.tmux) ?? new Set<string>()
           if (picker.key.startsWith('generic-') && seen.has(picker.key) && !forced.has(t.tmux)) {
@@ -276,6 +290,8 @@ export function startStartupPickerWatchdog(opts: {
             })),
           })
         }
+      } else if (deferred.delete(t.tmux)) {
+        opts.log('info', `startup picker cleared on pane ${t.tmux} (its owner dealt with it)`)
       } else if (surfaced.get(t.tmux)) {
         surfaced.set(t.tmux, false) // episode over — re-arm
         opts.log('info', `startup picker cleared on pane ${t.tmux}`)

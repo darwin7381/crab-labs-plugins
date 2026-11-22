@@ -172,6 +172,18 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
   walled, is a ledger line (`tier: ledger`, `tier_rule: <rule>+same-limit`), not a push. Joey hears the wall when the first side hits it and the
   recovery when the last side is through. A limit menu the probe dealt with (chosen, or gone) is recorded on the gen (`wall_menu`, cleared with the
   episode) and rides the episode's wall-down notice; only a menu Joey must choose on is told at once (`main-menu`).
+- **One owner of the limit menu** (002y, X-1; 002x T7-R, every play, e.g. u002x-T7-s6-r3: main-wall-up msg 2013 @1232.0, the startup-picker
+  watchdog's 「🔀 claude 停在一個選單，請選擇」 with buttons msg 2015 @1234.2, the probe's choice @1277.8). Two parts read the main's pane: the
+  startup-picker watchdog (server.ts, an 8 s poll; it rang Joey with the menu at once) and this mechanism (the probe chose for him 44 s later). The
+  probe chooses option 2 of the T7-R menu, 「Wait here, then continue automatically at …」 (`pickContinueOption`: an option that continues first,
+  then one that waits; never one that could spend money or change the plan or model: upgrade, extra usage, request more, add funds, buy, billing,
+  pay, credit, a currency sign, plan, a model name, do not continue, exit, trust, delete). With lanes on, the menu is this mechanism's while the
+  gen's wall episode is open (`wall_since`), and a limit menu (an option speaks of a limit, usage or a reset) on a gen still `in_turn` (the menu is
+  drawn when the limit cuts the turn; the StopFailure can reach the daemon after the watchdog's poll): `mainMenuOwned`, passed to the watchdog as
+  its `owner` for the main's pane. The watchdog does not send an owned menu unless the owner re-armed it (`rearmStartupPicker`): the probe found
+  no safe option (Joey keeps that decision: the `main-menu` sentence and the menu's buttons), or its key press did not take, or the stuck alarm
+  read it (below). So Joey hears the wall once (`main-wall-up`) and what was chosen in its wall-down notice. Every other menu (a starting main's
+  resume menu, an idle main's prompt, another pane) and every menu with lanes off stays the watchdog's, as before.
 - `turn_started` is not used; the turn's start is the `in_turn` line's `ts`.
 
 ### `event` (M3): one record per inbound event
@@ -561,7 +573,8 @@ bounded (P14, refined in 002q): main-hook.py sends a Bash call's own timeout wit
 it is open is the larger of `LANES_MAIN_STUCK_MS` and that bound (with a margin). A tool that declares no bound, such as an MCP call, is silence
 like any other. The gen is stuck when it owes a hook event and has sent none for longer than that; the silence counts from its last hook event, or
 from the offer when that came later. The alarm names the open tool.
-- One alarm per episode. For an idle gen the limit-menu pane read says whether a menu is the reason.
+- One alarm per episode. The limit-menu pane read says whether a menu is the reason (an idle or walled gen; since 002y, X-1, a gen in its turn
+  too: a limit menu there is the main-wall mechanism's, not the watchdog's, and with no StopFailure this alarm is what puts it in front of Joey).
 - **The episode is M1's recovery signal** (002q, H02/H03: a notification lost on the client side under host load stayed lost, and the play never
   started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)
   and M1 offers again at once (a walled gen at its next probe time). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
