@@ -2980,7 +2980,10 @@ function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof m
   const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
   if (rt) {
     const it = t.items.find(r => String((r.notif?.params as any)?.meta?.message_id ?? '') === rt)
-    const evs = it?.event ? t.events.filter(e => e.id === it.event) : []
+    // lanes-golive (lab run 11-23, G1): a lane handed Joey's own message to the main; the turn carries the hand-over item, not Joey's, and the main
+    // quotes HIS message (reply_to = its Telegram id). The quoted message is the event's own (its record's tg.message_id): that event's Joey line is met.
+    // Matching only the items left it owed: the Stop check held the turn and the main sent Joey the same answer twice.
+    const evs = it?.event ? t.events.filter(e => e.id === it.event) : t.events.filter(e => String((e as any).tg?.message_id ?? '') === rt)
     return { turn: t, events: evs, about: evs, quoted: true }
   }
   const meets = t.events.filter(owesJoey)
