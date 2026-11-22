@@ -52,8 +52,14 @@ export function recentReceiptLines(dir: string, sinceMs: number, tailBytes = 4 *
       .map(f => { const p = join(dir, f); return { p, m: statSync(p).mtimeMs } })
       .filter(x => x.m >= sinceMs - 5000).sort((a, b) => b.m - a.m).slice(0, 3)
   } catch { return [] }
+  return receiptLinesIn(files.map(f => f.p), tailBytes)
+}
+
+/** The same lines from the named transcripts only (lanes-golive C4: with lanes on, the main's own transcript, found by its session id: lane runs
+ *  write theirs into the same directory and are often the newest). Unreadable → [] (never throws). */
+export function receiptLinesIn(paths: string[], tailBytes = 4 * 1024 * 1024): string[] {
   const out: string[] = []
-  for (const { p } of files) {
+  for (const p of paths) {
     let fd: number | null = null
     try {
       fd = openSync(p, 'r')

@@ -20,7 +20,7 @@
 // MBP's inbox daemon keeps its state in ~/.claude, not in daddy-claude's workspace).
 // State and log: <state dir>/keepwarm-local.json, keepwarm-local.log.
 
-import { appendFileSync, closeSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const KEEPWARM_AFTER_S = 50 * 60
@@ -204,6 +204,8 @@ export interface LocalKeepwarmDeps {
   mode(): 'live' | 'dry' | 'off'
   projectsDir(): string | null
   mail(): Promise<MailCount>
+  /** lanes-golive (C4): the session's transcript when it is known by id (a lanes main); absent = the newest .jsonl of projectsDir (fleet). null = none */
+  transcript?(): string | null
   deliver(text: string): Promise<boolean>
   log(level: 'info' | 'warn' | 'error', msg: string): void
   stateDir: string
@@ -253,7 +255,8 @@ export class LocalKeepwarm {
     try {
       const now = this.now()
       const dir = this.d.projectsDir()
-      const path = dir ? newestJsonl(dir) : null
+      const named = this.d.transcript ? this.d.transcript() : undefined
+      const path = named !== undefined ? (named && existsSync(named) ? named : null) : dir ? newestJsonl(dir) : null
       const text = path ? readTail(path) : ''
       const s = path ? scan(text) : null
       if (s?.last_real) st.last_real = Math.max(s.last_real, st.last_real ?? 0)

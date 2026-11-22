@@ -12,7 +12,7 @@
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
-import { receiptKeys, receivedIn, recentReceiptLines } from './receipt.ts'
+import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
 import { HubSync, drainLeftoverDoorbells, hubSyncMode } from './hub-sync.ts'
 import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
@@ -60,7 +60,7 @@ import {
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
-import { newestGenuineAssistantAtIn } from './liveness.ts'
+import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DutyOfficer, askModelCli, isDutyCallback, realTmux } from './duty-officer.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
@@ -869,7 +869,14 @@ function recordDelivery(notif: { method: string; params: unknown }): void {
 // full rationale recorded here through 1.22.x). This wrapper just binds it to
 // this daemon's TRANSCRIPT_DIR.
 function newestGenuineAssistantAt(): number {
+  // lanes-golive (C4): with lanes on, the main's own transcript (by its session id); a lane's newer one is not the main's consumption
+  if (Lanes.LANES_ON) { const f = Lanes.mainTranscriptFile(TRANSCRIPT_DIR); return f ? genuineAssistantAtFile(f) : 0 }
   return newestGenuineAssistantAtIn(TRANSCRIPT_DIR)
+}
+/** receipt lines since `since`: the newest transcripts (fleet), or the main's own with lanes on (C4) */
+function receiptLines(since: number): string[] {
+  if (Lanes.LANES_ON) { const f = Lanes.mainTranscriptFile(TRANSCRIPT_DIR); return f ? receiptLinesIn([f]) : [] }
+  return recentReceiptLines(TRANSCRIPT_DIR, since)
 }
 
 
@@ -879,7 +886,7 @@ function sweepDeliveries(): void {
   const newest = newestGenuineAssistantAt()
   // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
   const unseen = recentDeliveries.filter(d => d.keys && !d.received)
-  const lines = unseen.length ? recentReceiptLines(TRANSCRIPT_DIR, Math.min(...unseen.map(d => d.at))) : []
+  const lines = unseen.length ? receiptLines(Math.min(...unseen.map(d => d.at))) : []
   for (const d of unseen) if (receivedIn(lines, d.keys!)) { d.received = true; hub?.oldPathSeen(d.notif) }
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
@@ -1204,7 +1211,7 @@ if (hubMode.on) {
     // lanes-golive (C3): with lanes on the hub's rows go to the router (the one entrance into the main), never straight into a session; a row the
     // router could not be asked about stays at the hub (0 = nobody took it) for the next sync
     push: Lanes.LANES_ON ? laneHubPush : pushToReadySessions,
-    seenLines: since => consumptionCheckAvailable() ? recentReceiptLines(TRANSCRIPT_DIR, since) : [],
+    seenLines: since => consumptionCheckAvailable() ? receiptLines(since) : [],
     dispatchOld: (chatId, notif) => dispatchInbound(chatId, notif),
     defaultChatId: () => String(loadAccess().allowFrom[0] ?? 'local-inject'),
     log,
@@ -1940,7 +1947,7 @@ if (isSystemAlertEnabled()) {
     // Roamer: tail the current target's EXACT transcript, moving with /roam
     // (issue #6). Channel-bot: undefined → static CHANNEL_BOT_PROJECTS_DIR env.
     // 002: tail the registered main's transcript, not the newest jsonl (lanes share the dir; evidence #7)
-    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscript() : undefined),
+    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscriptFile(TRANSCRIPT_DIR) : undefined),
     // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
     // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
     defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => Lanes.wallKind(msg) != null : undefined,
@@ -2000,6 +2007,8 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
     stateDir: STATE_DIR,
     mode: keepwarmMode,
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
+    // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
+    ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
     // this agent's own unread count, with its own credential (an agent may read only its own row)
     mail: async () => {
       try {

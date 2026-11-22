@@ -402,6 +402,21 @@ function pidAlive(pid: number | null | undefined): boolean {
   try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' }
 }
 export function mainTranscript(): string | null { return main?.mainSession()?.transcript_path || null }
+/** lanes-golive (C4): the main's session id, either daemon: the tg daemon's registered main, else .lanes/main-expected (the launcher writes it before a
+ *  start, the tg daemon keeps it current after each accepted SessionStart). null = no main known. */
+export function mainSessionId(): string | null {
+  const reg = D?.role === 'tg' ? main?.mainSession()?.session_id : undefined
+  if (reg) return reg
+  try { const s = readFileSync(join(LANES_DIR || join(D?.workspaceDir ?? '.', '.lanes'), 'main-expected'), 'utf8').trim(); return /^[0-9a-f-]{36}$/i.test(s) ? s : null } catch { return null }
+}
+/** lanes-golive (C4): THE transcript of the main, found by its session id, never as the newest .jsonl of the directory (lane runs write theirs there
+ *  too). The hook's own transcript path when the tg daemon has it; otherwise <dir>/<session id>.jsonl. null = no main known (nothing is guessed). */
+export function mainTranscriptFile(dir: string): string | null {
+  const t = D?.role === 'tg' ? mainTranscript() : null
+  if (t) return t
+  const sid = mainSessionId()
+  return sid ? join(dir, `${sid}.jsonl`) : null
+}
 /** called by the control commands that kill or restart the TUI on purpose (/restart, /kill_stuck): the gen ends `asked` */
 export function markDeliberateRestart(): void { main?.markEnd('asked') }
 
