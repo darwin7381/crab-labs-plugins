@@ -14,7 +14,7 @@ import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines } from './receipt.ts'
 import { HubSync, drainLeftoverDoorbells, hubSyncMode } from './hub-sync.ts'
-import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend } from './fleet-mail.ts'
+import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -61,10 +61,14 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn } from './liveness.ts'
-import { startStartupPickerWatchdog, handleStartupPickerCallback } from './startup-picker.ts'
 import { DutyOfficer, askModelCli, isDutyCallback, realTmux } from './duty-officer.ts'
 import { LocalKeepwarm } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
+// Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
+// (GENESIS_LANES=1); with it unset the daemon runs the fleet code paths unchanged. In lanes mode nothing here delivers to
+// the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
+import * as Lanes from './lanes.ts'
+import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
@@ -298,7 +302,11 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // Inbox-only daemons never talk to Telegram: the Bot instance exists so shared
 // code paths typecheck, but polling never starts and no API call is ever made.
-const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!)
+// genesis lab: grammy must use the same API root as callBotApi/file downloads, so a
+// TELEGRAM_API_ROOT mock receives getUpdates/sendMessage too (upstream passes no client option).
+const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!, {
+  client: { apiRoot: process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org' },
+})
 let botUsername = ''
 
 type PendingEntry = {
@@ -821,7 +829,7 @@ function deliveryKey(notif: { method: string; params: unknown }): string {
 }
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
-  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(notif); hub?.oldPathSeen(notif); return }
+  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(fleetRunId(notif)); hub?.oldPathSeen(notif); return }
   if (!RECEIPT_CHECK) hub?.oldPathSeen(notif)  // receipt off: pushed = seen (the 1.32.1 rule)
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
   recentDeliveries.push({ notif, at: Date.now(), pendingPath: null, keys: RECEIPT_CHECK ? receiptKeys(notif) : null, received: false })
@@ -882,7 +890,7 @@ function sweepDeliveries(): void {
       if (d.pendingPath) {
         try { rmSync(d.pendingPath); log('info', `late consumption — retracted re-persisted dup ${d.pendingPath} (issue #13)`) } catch {}
       }
-      maybeAutoAckScheduled(d.notif)
+      maybeAutoAckScheduled(fleetRunId(d.notif))
       recentDeliveries.splice(i, 1)
     } else if (!d.pendingPath && now - d.at > (notReceived ? RECEIPT_GRACE_MS : CONSUME_GRACE_MS)) {
       if (notReceived) {
@@ -929,7 +937,16 @@ function sweepDeliveries(): void {
   }
 }
 
+let replayRunning = false
 async function replayPendingFromDisk(server: Server): Promise<number> {
+  // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
+  // would each read the same parked file before either removed it: the same message delivered twice (fleet record
+  // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
+  if (replayRunning) return 0
+  replayRunning = true
+  try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
+}
+async function replayPendingFromDiskLocked(server: Server): Promise<number> {
   // 🔴 SSE-open gate. `server.notification()` RESOLVES even when the SSE stream
   // is not yet open — the write lands in a stream nobody is reading — and this
   // function then rmSync's the durable file on that false success, destroying
@@ -1114,14 +1131,17 @@ function meshAuth(): Record<string, string> {
 // outcome summary must be authored). Inbox daemons only; fire-and-forget; the
 // ack endpoint 409s on repeats so multi-session broadcast double-acks are noise.
 const autoAckedRuns = new Set<string>()
-function maybeAutoAckScheduled(notif: { method: string; params: unknown }): void {
+/** the fleet's single-session path (not lanes; unchanged): the run id of a scheduler wake-up, from its meta or its [scheduled][tag][run:N] head */
+function fleetRunId(notif: { method: string; params: unknown }): string | undefined {
+  const p = (notif?.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
+  if (p.meta?.run_id) return String(p.meta.run_id)
+  return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
+}
+function maybeAutoAckScheduled(runId: string | undefined): void {
   if (!INBOX_ONLY) return
   try {
-    const content = (notif.params as { content?: unknown } | undefined)?.content
-    if (typeof content !== 'string') return
-    const m = content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)
-    if (!m) return
-    const rid = m[1]
+    if (!runId || !/^\d+$/.test(runId)) return
+    const rid = runId
     if (!BTCC_API_BASE) return
     if (autoAckedRuns.has(rid)) return
     autoAckedRuns.add(rid)
@@ -1245,17 +1265,60 @@ async function coreFeed(method: 'GET' | 'POST', path: string, body?: unknown, ti
 // line → a call; call / send_mail / feed_post; the fleet server). On until the whole fleet has restarted;
 // A2A_LEGACY=0 in the machine config turns the old shapes off.
 const A2A_LEGACY = (process.env.A2A_LEGACY ?? '1').trim() !== '0'
-const fleetDeps = {
+const fleetDeps: FleetDeps = {
   call: (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) =>
     sendToAgent(to, text, replyTo, noReply, op, 'call'),
   btcc: btccMail,
   core: coreFeed,
 }
 
+// ---- lanes (002) on top of WO-99 (lanes-golive merge). Only with Lanes.LANES_ON. ----
+// The lab's main send_to_agent was the pre-WO-99 tool (always a push). Here the WO-99 line rules (callInboxTool:
+// line, ask, because, reply_to = no_reply, legacy shape = call) run first and unchanged; the CALL rail then carries the
+// lanes thread / hop / sending-lane marker and passes the lanes checks (checkMainSend, checkPeerSend, noteMainOutbound).
+// mail and feed are not lane-aware yet: no thread / hop, no peer check (go-live step 2, conflicts.md A5 / C2).
+const LANE_SEND_PROPS = {
+  thread: { type: 'string', description: 'Optional conversation id "<agent>#t-xxxx" (the thread="…" of the message you answer). Replies in a thread reach the exact lane that owns it. Filled in automatically when reply_to names a message that carried a thread. line=call only.' },
+  hop: { type: 'number', description: 'Optional hop count; normally computed by the daemon. A thread stops at hop 6. line=call only.' },
+}
+function withLaneSendProps<T extends { inputSchema: { properties: Record<string, unknown> } }>(t: T): T {
+  return { ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, ...LANE_SEND_PROPS } } }
+}
+function laneMainDeps(args: Record<string, unknown>): FleetDeps {
+  return {
+    ...fleetDeps,
+    call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => {
+      // 002: the main's sends carry thread/hop; a quote-reply continues the thread it answers
+      let thread = typeof args.thread === 'string' && args.thread.trim() ? args.thread.trim() : undefined
+      let hop = args.hop != null && Number(args.hop) > 0 ? Number(args.hop) : undefined
+      if (!thread) { const t = Lanes.threadForReply(replyTo); if (t) { thread = t.thread; hop = hop ?? t.hop + 1 } }
+      if (thread) {
+        const c = await Lanes.checkMainSend(thread, hop ?? 1, noReply === true)       // 002w (C): a no_reply answer passes a stopped conversation
+        if (!c.ok) return `send blocked — nothing was sent: ${c.why}. The conversation is stopped (the router told the peer): your last answer on it goes out only as a reply (reply_to) or with no_reply: true; anything else, tell Joey.`
+        hop = c.hop
+      }
+      // 002k (K2): disclosure check before anything is sent, as for a lane's reply_agent; a refusal is an isError result (callInboxTool: not "delivered")
+      { const refused = await Lanes.checkPeerSend('main', to, text); if (refused) return refused }
+      let minted: number | undefined, delivered = false
+      const result = await sendToAgent(to, text, replyTo, noReply, op, 'call',
+        { thread, hop, lane: `${INBOX_SELF}.main`, minted: (id, ok) => { minted = id; delivered = ok } })
+      await Lanes.noteMainOutbound(minted, thread, hop, to, text, replyTo, delivered)   // PL2: met on the delivery
+      return result + (thread ? ` [thread ${thread} hop ${hop}]` : '')
+    },
+  }
+}
+
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
-async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, tier?: 'call'): Promise<string> {
+// `extra` is only ever passed with lanes on (002): thread / hop / sending-lane marker ride along
+// in the comms log and the /inject body, and `minted` reports the BTCC id + delivery outcome.
+type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: string; minted?: (id: number | undefined, delivered: boolean) => void }
+function laneFields(extra?: LaneSendExtra): Record<string, unknown> {
+  if (!extra) return {}
+  return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}), ...(extra.owner ? { owner: extra.owner } : {}) }
+}
+async function sendToAgent(to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, tier?: 'call', extra?: LaneSendExtra): Promise<string> {
   const target = to.trim().toLowerCase()
   const body = text.trim()
   if (!body) return 'send failed: empty text'
@@ -1307,7 +1370,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         // one thing, one owner (Joey TG 970): we honour BTCC's hold, so BTCC may hold us (409)
         'X-Mesh-Fanout': '1',
       },
-      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}), ...(tier ? { tier } : {}) }),
+      body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: target, kind: 'message', body, delivery: 'sending', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}), ...(tier ? { tier } : {}), ...laneFields(extra) }),
       signal: AbortSignal.timeout(6000),
     }).catch(() => null)
     if (lr?.ok) {
@@ -1336,7 +1399,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         ...(msgId != null ? { msg_id: msgId } : {}),
         ...(replyTo != null ? { reply_to_id: replyTo } : {}),
         ...(opRef ? { op: opRef } : {}),
-        ...(noReply ? { no_reply: true } : {}) }),
+        ...(noReply ? { no_reply: true } : {}),
+        ...laneFields(extra) }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -1361,6 +1425,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     } catch {}
   }
   const opNote = opWarn ? ` — ⚠ ${opWarn}` : ''
+  extra?.minted?.(msgId, delivery === 'delivered')
   return delivery === 'delivered'
     ? `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})${opNote}`
     : `send to ${target} FAILED${detail} — message NOT delivered`
@@ -1376,7 +1441,7 @@ function buildServer(): Server {
       instructions: INBOX_TEXT,
     } : {
       capabilities: {
-        tools: {},
+        tools: { listChanged: true },     // 002m (LG1): a session found not to be the main is told to list its tools again
         experimental: {
           'claude/channel': {},
           // Permission-relay opt-in (anthropics/claude-cli-internal#23061).
@@ -1442,6 +1507,10 @@ function buildServer(): Server {
 )
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+ // 002m (LG1): a claude process that is not the registered main (its register-main was refused, or a live main holds the role)
+ // gets none of the main's Telegram or lane tools (runtime RU5 「只有持有「主」的那一個，拿得到你主對話的回覆工具」).
+ // 002w (G, gap 19): in the inbox daemon too (send_to_agent is the main's): the one check, which asks the tg daemon there
+ if (Lanes.LANES_ON && await Lanes.notMainSession(serverSessionId.get(mcp))) return { tools: [] }
  if (INBOX_ONLY) {
    // WO-99 v3: one sending tool (send_to_agent, three lines) plus the receiving tools, all on this server.
    // feed_ask only for agents on the wall's ask list (a listed-but-refused tool costs every agent a call).
@@ -1450,7 +1519,9 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      const r = await coreFeed('GET', '/api/feed/me', undefined, 1500)
      ask = r.status === 200 && r.json?.ask === true
    } catch {}
-   return { tools: INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask) }
+   const tools = INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask)
+   // lanes (002) on top of WO-99: thread / hop on send_to_agent, read only on the call line (laneMainDeps below)
+   return { tools: Lanes.LANES_ON ? tools.map(t => t.name === 'send_to_agent' ? withLaneSendProps(t) : t) : tools }
  }
  const richOn = isRichEnabled()
  const formatSchema = {
@@ -1523,15 +1594,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    ...(Lanes.LANES_ON ? Lanes.mainToolDefs() : []),
   ],
  })
 })
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  // 002w (G, gap 19): only the main sends as the main: a session that is not it gets no Telegram tool and no send_to_agent (the one check, both daemons)
+  if (Lanes.LANES_ON && (INBOX_ONLY ? req.params.name === 'send_to_agent' : Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name)) && await Lanes.notMainSession(serverSessionId.get(mcp))) {
+    log('warn', `lanes: ${req.params.name} refused for MCP session ${serverSessionId.get(mcp)} (not the registered main)`)      // 002m (LG1)
+    return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
+  }
   if (INBOX_ONLY) {
     try {
-      const res: any = await callInboxTool(req.params.name, args, fleetDeps, A2A_LEGACY)
+      // lanes on: the call line goes through the lanes checks (laneMainDeps); the WO-99 line rules run first, unchanged
+      const res: any = await callInboxTool(req.params.name, args, Lanes.LANES_ON ? laneMainDeps(args) : fleetDeps, A2A_LEGACY)
       // feed read-marks: on /fleet they run on the response's 'finish'; the SDK path has no such hook, so
       // they run shortly after the result is handed back (a dropped result can leave a post marked read)
       const after = res?._afterSend
@@ -1545,6 +1623,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   }
   try {
+    if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.isMainTool(req.params.name)) {
+      const out = await Lanes.callMainTool(req.params.name, args, serverSessionId.get(mcp))
+      return { content: [{ type: 'text', text: out }] }
+    }
     switch (req.params.name) {
       case 'reply': {
         const chat_id = args.chat_id as string
@@ -1558,6 +1640,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const useRich = format === 'rich' && isRichEnabled()
 
         assertAllowedChat(chat_id)
+        // 002l (D16): the report on a hand-over goes out at the tier the router gives that event (design/notify 「分級由分流器…決定」); otherwise as before
+        // PL2: the tier comes from the events of the main's running turn (M1 prompt → items → events), never from a parameter
+        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to }) : null
+        const quiet = handoffTier?.silent ? { disable_notification: true } : {}
 
         for (const f of files) {
           assertSendable(f)
@@ -1588,6 +1674,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   chat_id,
                   rich_message: { markdown: chunks[i] },
                   ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+                  ...quiet,
                 })
                 sentIds.push(r.message_id)
                 continue
@@ -1598,6 +1685,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
+              ...quiet,
             })
             sentIds.push(sent.message_id)
           }
@@ -1614,8 +1702,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
           const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+            ? { reply_parameters: { message_id: reply_to }, ...quiet }
+            : (handoffTier?.silent ? quiet : undefined)
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -1625,10 +1713,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to, text)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
         const result =
-          sentIds.length === 1
+          (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
-            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+            : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (handoffTier ? ` (${handoffTier.silent ? 'silent' : 'push'}: the router's tier for this turn's ${handoffTier.events.join(', ')})` : '')
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
@@ -1742,7 +1831,11 @@ if (isSystemAlertEnabled()) {
     log,
     // Roamer: tail the current target's EXACT transcript, moving with /roam
     // (issue #6). Channel-bot: undefined → static CHANNEL_BOT_PROJECTS_DIR env.
-    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : undefined,
+    // 002: tail the registered main's transcript, not the newest jsonl (lanes share the dir; evidence #7)
+    resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscript() : undefined),
+    // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
+    // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
+    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => Lanes.wallKind(msg) != null : undefined,
     notify: text => {
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
@@ -1893,6 +1986,9 @@ if (isControlEnabled() || isRoamerEnabled()) {
       }
     },
     log,
+    // 002y (X-1): with lanes on, the main's limit menu in its wall is the lanes main-wall mechanism's (one owner); lanes off: no owner, as before
+    ...(Lanes.LANES_ON && !INBOX_ONLY ? { owner: (t: WatchTarget, pk: { options: string[] }) =>
+      t.tmux === process.env.CHANNEL_BOT_TMUX_SESSION && Lanes.mainMenuOwned(pk.options) ? 'the lanes main-wall probe' : null } : {}),
   })
 }
 
@@ -1954,6 +2050,24 @@ bot.command('help', async ctx => {
     `/start — pairing instructions\n` +
     `/status — check your pairing state`
   )
+})
+
+// 002k: /lanes — list, close, master switch, notify profile (lanes.ts lanesCommand). Answered by the daemon, never forwarded to a session.
+// 002k: /main renew — hand the main role to a fresh session (lanes.ts mainRenew). Answered by the daemon.
+bot.command('main', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  const sub = (ctx.message?.text ?? '').trim().split(/\s+/)[1] ?? ''
+  if (!Lanes.LANES_ON || sub !== 'renew') { await ctx.reply('用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）'); return }
+  await ctx.reply(await Lanes.mainRenew(ctx.from?.username ?? gated.senderId))
+})
+
+bot.command('lanes', async ctx => {
+  const gated = dmCommandGate(ctx)
+  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+  if (!Lanes.LANES_ON) { await ctx.reply('車道沒有開啟（這個 agent 是單一 session）。'); return }
+  const text = await Lanes.lanesCommand(ctx.message?.text ?? '/lanes', ctx.from?.username ?? gated.senderId)
+  await ctx.reply(text)
 })
 
 bot.command('status', async ctx => {
@@ -2612,6 +2726,8 @@ async function handleInbound(
       ...(attachment.name ? { attachment_name: attachment.name } : {}),
     } : {}),
     ...(voiceTranscript ? { voice_transcript: voiceTranscript } : {}),
+    // 002: the topic a message was sent in (worker lanes are bound to topics)
+    ...(Lanes.LANES_ON && (ctx.message as any)?.message_thread_id != null ? { message_thread_id: String((ctx.message as any).message_thread_id) } : {}),
     // Reply-root / forward-origin / album context (2026-07-10) — see
     // replyForwardMeta. Without these the agent couldn't tell WHAT was
     // being replied to, WHO originally wrote a forwarded message, or
@@ -2654,6 +2770,20 @@ async function handleInbound(
 // on, broadcast otherwise. Extracted from handleInbound so the album flush
 // timer (#6) dispatches through the exact same path.
 async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }): Promise<void> {
+  // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
+  // everything else → the registered main only). Never a broadcast.
+  if (Lanes.LANES_ON) {
+    const p = notification.params as { content?: string; meta?: Record<string, string> }
+    const meta = p.meta ?? {}
+    const ev: Lanes.InEvent = {
+      id: `tg-${chat_id}-${meta.message_id ?? Date.now()}`, source: 'telegram', from: meta.user ?? 'joey',
+      text: String(p.content ?? ''), meta, notif: notification, verified: true,
+      reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.message_thread_id,
+    }
+    const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
+    if (!d) Lanes.toMainDirect(ev)                                       // 002w (D): the router decided nothing: the main gets it through the one builder
+    return
+  }
   // In ROAMER_MODE, route to the current target's MCP session only,
   // not broadcast. Each roamer keeps multiple bridged claudes alive
   // (one per ever-claimed target) but TG inbound goes only to whichever
@@ -2875,7 +3005,22 @@ async function maybeTranscribeVoice(attachment: AttachmentMeta | undefined): Pro
 //   3. Session active AND SSE open → deliver directly
 //   4. If no session had SSE open, also persist to disk as safety net (covers
 //      daemon restart between broadcast and SSE open)
+// 002j: every delivery can be recognised in the transcript. Telegram messages carry message_id and mesh messages
+// btcc_msg_id; system notices, digests and locally injected messages carried nothing (fleet replay 2026-11-14: 337 of
+// about 4,500 deliveries), so the daemon could not tell whether they were read and fell back to the time rule. Those get
+// the daemon's own id, `did`, which Claude Code writes into the <channel> tag like any other meta key.
+let didSeq = 0
+function stampDid(notif: { method: string; params: unknown }): void {
+  try {
+    const p = notif.params as { meta?: Record<string, unknown> } | undefined
+    if (!p || typeof p !== 'object') return
+    const m = (p.meta ??= {})
+    if (m.message_id || m.btcc_msg_id || m.did) return
+    m.did = `${Date.now().toString(36)}-${(++didSeq).toString(36)}`
+  } catch {}
+}
 function broadcastNotification(notif: { method: string; params: unknown }): void {
+  stampDid(notif)
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
     persistInbound(notif)
@@ -2925,6 +3070,10 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
   }
 }
 
+function parkMemQueue(sid: string): void {
+  memQueue.delete(sid)
+}
+
 // issue #3 fix: remove a (zombie) session from every registry, regardless of
 // whether transport.onclose ever fired. Mirrors the onclose cleanup body.
 function evictZombieSession(sid: string, reason: string): void {
@@ -2935,7 +3084,7 @@ function evictZombieSession(sid: string, reason: string): void {
   transports.delete(sid)
   sseOpen.delete(sid)
   sseReadyAt.delete(sid)
-  memQueue.delete(sid)
+  parkMemQueue(sid)
   sessionLastActiveAt.delete(sid)
   if (srv) {
     for (const [reqId, p] of pendingPermissions) {
@@ -2943,6 +3092,7 @@ function evictZombieSession(sid: string, reason: string): void {
     }
   }
   forgetIssuedSession(sid)
+  if (Lanes.LANES_ON) Lanes.forgetMcpSession(sid)
   log('info', `MCP session evicted by GC: ${sid} reason=${reason} (active=${activeServers.size})`)
   try { transport?.close() } catch {}
   try { if (isRoamerEnabled()) roamerOnMcpSessionClosed(sid) } catch {}
@@ -3138,6 +3288,13 @@ function forgetIssuedSession(sid: string): void {
   saveIssuedSessions()
 }
 
+/** the session's GET stream is open AND the SDK transport holds it: a notification written now reaches the client's stream. The SDK's send() returns
+ *  without error when it has no GET stream (before handleRequest mapped it, or after the client cancelled it), so sseOpen alone does not say this. */
+function streamLive(sid: string): boolean {
+  const t = transports.get(sid) as any
+  return !!sseOpen.get(sid) && !!t?._webStandardTransport?._streamMapping?.has?.('_GET_stream')
+}
+
 function registerSession(id: string, transport: StreamableHTTPServerTransport, server: Server, how: 'opened' | 'resumed'): void {
   transports.set(id, transport)
   serverSessionId.set(server, id)
@@ -3173,9 +3330,10 @@ async function openSession(resumeId?: string): Promise<StreamableHTTPServerTrans
       transports.delete(transport.sessionId)
       sseOpen.delete(transport.sessionId)
       sseReadyAt.delete(transport.sessionId)
-      memQueue.delete(transport.sessionId)
+      parkMemQueue(transport.sessionId)
       sessionLastActiveAt.delete(transport.sessionId)
       forgetIssuedSession(transport.sessionId)
+      if (Lanes.LANES_ON) Lanes.forgetMcpSession(transport.sessionId)
       log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
       for (const [reqId, p] of pendingPermissions) {
         if (p.server === server) pendingPermissions.delete(reqId)
@@ -3217,6 +3375,76 @@ try { mcpToken = ensureToken(HTTP_PORT as number) } catch (e) {
   log('error', `mcp token: could not create (${e}) — /mcp ${MCP_REQUIRE_TOKEN ? 'REFUSES every client' : 'stays open'}`)
 }
 const mcpGate = makeGate(mcpToken, MCP_REQUIRE_TOKEN, msg => log('warn', msg))
+
+// 002 lanes wiring (inert unless GENESIS_LANES=1)
+if (Lanes.LANES_ON) {
+  const tokOk = (a: string | undefined) => {
+    if (!mcpToken || !a) return false
+    const got = Buffer.from(a), want = Buffer.from(`Bearer ${mcpToken}`)
+    return got.length === want.length && timingSafeEqual(got, want)
+  }
+  Lanes.lanesInit({
+    role: INBOX_ONLY ? 'inbox' : 'tg',
+    agent: process.env.LANES_AGENT ?? INBOX_SELF,
+    workspaceDir: AGENT_WORKSPACE_DIR,
+    transcriptDir: TRANSCRIPT_DIR,
+    httpPort: HTTP_PORT as number,
+    log,
+    stateDir: STATE_DIR,
+    notifySession: async (sid: string, notif: { method: string; params: unknown }): Promise<boolean> => {
+      if (!streamLive(sid)) return false                     // the SDK drops a notification silently when it has no GET stream: not written = not offered
+      for (const s of activeServers) if (serverSessionId.get(s) === sid) {
+        try { await s.notification(notif as Parameters<Server['notification']>[0]); return true } catch (err) { log('warn', `lanes: offer to ${sid} failed: ${err}`); return false }
+      }
+      return false
+    },
+    streamOpen: streamLive,
+    authOk: tokOk,
+    toolsChanged: (sid: string) => {      // 002m (LG1)
+      for (const s of activeServers) if (serverSessionId.get(s) === sid && sseOpen.get(sid)) {
+        void s.sendToolListChanged().catch(err => log('warn', `lanes: tools/list_changed to ${sid} failed: ${err}`))
+      }
+    },
+    // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice
+    ...(process.env.CHANNEL_BOT_TMUX_SESSION ? { mainPicker: {
+      capture: () => capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
+      detect: detectStartupPicker,
+      drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key),
+      rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
+    } } : {}),
+    registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
+    ...(INBOX_ONLY ? {
+      meshSend: async (to, text, replyTo, noReply, extra) => {
+        let msgId: number | undefined, delivered = false
+        // a lane's reply_agent is a push into the peer's session: the WO-99 call rail (tier 'call'); mail / feed for lanes = go-live step 2
+        const out = await sendToAgent(to, text, replyTo, noReply, undefined, 'call', { ...extra, minted: (id, ok) => { msgId = id; delivered = ok } })
+        return { text: out, msgId, delivered }
+      },
+      schedulerCall: async (runId, action, outcome, summary) => {
+        if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
+        try {
+          const r = await fetch(`${BTCC_API_BASE}/api/scheduler/runs/${runId}/${action}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() },
+            body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'done', ...(summary ? { summary } : {}) } : {}),
+            signal: AbortSignal.timeout(6000),
+          })
+          return `${action} run ${runId}: HTTP ${r.status}`
+        } catch (e) { return `${action} run ${runId} failed: ${e}` }
+      },
+    } : {
+      sendBot: async (chat, text, o) => {
+        const m = await bot.api.sendMessage(chat, text.slice(0, 4000), {
+          ...(o.silent ? { disable_notification: true } : {}),
+          ...(o.topic != null ? { message_thread_id: o.topic } : {}),
+          ...(o.replyTo ? { reply_parameters: { message_id: o.replyTo, allow_sending_without_reply: true } } : {}),   // 002k (E4): a deleted message must not lose the notice
+        })
+        return m.message_id
+      },
+      createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
+      joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
+    }),
+  })
+}
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
   try {
@@ -3247,11 +3475,15 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         })(),
         hub: hub ? hub.health() : { enabled: false, why: hubMode.why },
         pid: process.pid,
+        // 002: health = "the registered main is connected", not "≥1 session" (evidence #8)
+        ...(Lanes.LANES_ON ? Lanes.lanesHealth() : {}),
       }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify(body))
       return
     }
+
+    if (Lanes.LANES_ON && await Lanes.handleLanesHttp(u, req, res)) return
 
     // /v1/logs — OTLP/HTTP JSON logs receiver (system-alert primary layer).
     // Claude TUI exports telemetry events here when launched with
@@ -3368,6 +3600,50 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       // Default chat_id = first allowFrom (the owner): if the agent finishes and
       // reports via the reply tool, the report lands with the boss per contract.
       const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
+      if (Lanes.LANES_ON) {
+        // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
+        // sender (it is stamped by the sender's own daemon, never by message text).
+        const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
+        const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
+        const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
+        const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
+        const notification = {
+          method: 'notifications/claude/channel',
+          params: {
+            content: text,
+            meta: {
+              chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
+              ...verdictMeta(verdict),
+              ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
+              ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
+              ...(opRef ? { op: opRef } : {}),
+              ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
+              ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
+              ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+              ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
+              // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
+              ...(body?.run_id != null && /^\d+$/.test(String(body.run_id)) ? { run_id: String(body.run_id) } : {}),
+              ...(typeof body?.frequency === 'string' && body.frequency ? { frequency: String(body.frequency).slice(0, 16) } : {}),
+            },
+          },
+        }
+        Lanes.noteInboundThread(btccMsgId != null ? String(btccMsgId) : undefined, thread, hop)
+        const ev: Lanes.InEvent = {
+          id: `mesh-${btccMsgId ?? `${Date.now()}-${randomBytes(2).toString('hex')}`}`, source: 'mesh', from, text,
+          meta: notification.params.meta as Record<string, string>, notif: notification, verified: verdict.verified,
+          thread, hop, lane_marker: laneMarker, no_reply: body?.no_reply === true,
+          reply_to_id: body?.reply_to_id != null ? String(body.reply_to_id) : undefined,
+          btcc_msg_id: btccMsgId != null ? String(btccMsgId) : undefined,
+        }
+        const d = await Lanes.routeRemote(ev)                            // target main: the tg daemon queued it for the main (M1)
+        // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
+        // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
+        if (!d) broadcastNotification(notification)
+        else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)   // 開工回執: a lane took the scheduled run (its run id from the meta)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
+        return
+      }
       const notif = {
         method: 'notifications/claude/channel',
         params: {
@@ -3618,6 +3894,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // the old 50 ms here lost 35 replayed deliveries for atlas on 11-17, and the same for every agent
         // reconnected that day). Receipt is verified per delivery afterwards (RECEIPT_GRACE_MS).
         await new Promise(r => setTimeout(r, Math.max(50, (sseReadyAt.get(sessionId) ?? 0) - Date.now())))
+        // lanes: which claude process owns this session (socket → pid). Told only now that the SDK holds the stream (streamLive) and the client
+        // is ready: a starting main becomes offerable at this point and not before, so its first offer is never written into a stream that drops it.
+        if (Lanes.LANES_ON) { try { Lanes.noteMcpSocket(sessionId, req) } catch (e) { log('warn', `lanes: noteMcpSocket ${e}`) } }
         let boundServer: Server | undefined
         for (const s of activeServers) {
           if (serverSessionId.get(s) === sessionId) { boundServer = s; break }
@@ -3638,8 +3917,11 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           }
           // Disk-pending drain (covers daemon restart and "0 active session" gap).
           // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
-          void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
-          void hub?.kick('session-ready')   // hub rows that waited while detached
+          // lanes: nothing is parked for the main here (the tg daemon's delivery ledger holds it)
+          if (!Lanes.LANES_ON) {
+            void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
+          }
+          void hub?.kick('session-ready')   // hub rows that waited while detached (lanes on: who owns delivery to the main is go-live step 2, conflicts.md C3)
         }
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {

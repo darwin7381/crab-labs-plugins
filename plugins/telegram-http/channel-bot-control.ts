@@ -34,6 +34,7 @@ import {
   writeSync, fsyncSync, renameSync, unlinkSync, realpathSync,
 } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
+import { markDeliberateRestart } from './lanes.ts'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 
@@ -946,7 +947,7 @@ const IDLE_CONFIRM_SAMPLES = 2
 const IDLE_SAMPLE_GAP_MS = 500
 
 /** Idle only if `IDLE_CONFIRM_SAMPLES` consecutive samples all read idle. */
-async function isClaudeIdleStable(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+export async function isClaudeIdleStable(tmuxName: string = TMUX_SESSION): Promise<boolean> {
   for (let i = 0; i < IDLE_CONFIRM_SAMPLES; i++) {
     if (await isClaudeBusy(tmuxName)) return false
     if (i < IDLE_CONFIRM_SAMPLES - 1) await new Promise(r => setTimeout(r, IDLE_SAMPLE_GAP_MS))
@@ -2068,6 +2069,7 @@ export async function handleControlSlash(
   // ---- Phase 2: system-level control ------------------------------------
   if (cmd === '/restart') {
     await tryRun('restart claude TUI', async () => {
+      markDeliberateRestart()
       const how = await restartClaudeTUI()
       await replyToTg(`🔁 restarting — tmux session 已砍，${how}。TUI 回線約 30–60s（監控 tick + 啟動等待）。`)
     })
@@ -2075,6 +2077,7 @@ export async function handleControlSlash(
   }
   if (cmd === '/kill-stuck' || cmd === '/kill_stuck') {
     await tryRun('pkill -9 claude TUI', async () => {
+      markDeliberateRestart()
       const r = await killStuckClaude()
       await replyToTg(
         r.killed > 0
