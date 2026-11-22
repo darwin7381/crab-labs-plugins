@@ -512,6 +512,17 @@ Environment the hook needs. The keeper already sets these for the main:
 - `MCP_TOKEN_DIR`: where the loopback token is, if it is not `~/.claude/agent-inbox/mcp-tokens`.
 - `CLAUDE_PID`: set by Claude Code itself. Without it, the daemon identifies the caller of `SessionStart` by its socket.
 
+**Which process is at the other end** (002y, X-5): the daemons map each MCP session to its claude pid by the request's socket (`noteMcpSocket`,
+`callerClaudePid`: the socket's process, then up its parents to the first claude), and keep one live process per session id (`sessionHolder`:
+the argv of every process). Every such fact comes from one platform layer, `lanes-proc.ts`, a function per fact: `peerPid(clientPort,
+serverPort)`, `parentPid`, `argv`, `exe`, `sessionPids`. Linux reads `/proc` (`/proc/net/tcp*` + `/proc/<pid>/fd`, `stat`, `cmdline`, `exe`), as
+before. macOS (the fleet's Macs, which have no `/proc`: through 002x no MCP session there was mapped to its pid, so the main was never offered
+anything) asks `lsof -nP -w -iTCP:<clientPort> -sTCP:ESTABLISHED -Fpn` (the end whose local port is the client port), `ps -o ppid= | command= |
+comm= -p <pid>` and `ps -axo pid=,command=`, with `LC_ALL=C` and a 3 s timeout. A missing command, a failure, a timeout or an empty answer is
+unknown, and unknown is not judged (a session whose process is not known is not judged not-the-main; a session id no known process names is free).
+The answer for a connection is kept on its socket (a keep-alive connection carries many requests); an unknown one is asked again on its next request.
+Another platform: every fact unknown. The macOS half is verified against recorded lsof / ps output (lanes-y-x5.test.ts), not yet on a Mac end to end.
+
 What the hook sends to `POST /lanes/main-event`:
 - always: `{event, session_id, prompt_id, pid, transcript_path, source, tool_name, error}`;
 - UserPromptSubmit: `dids`, the `did="..."` values in the prompt;

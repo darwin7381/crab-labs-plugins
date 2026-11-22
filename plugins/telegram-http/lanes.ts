@@ -22,13 +22,14 @@
  * (main writes), run/ (per-run MCP configs, stderr).
  */
 import { Journal, type Row } from './lanes-state.ts'
+import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, type TriageAsk } from './lanes-triage.ts'
 import { randomBytes, randomUUID } from 'crypto'
 import {
-  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, renameSync,
+  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync,
   rmSync, statSync, writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
@@ -309,7 +310,8 @@ function mainEnv() {
 // ================================================================== the main (M2 lives in lanes-main.ts; these are its uses here)
 // The main's hook (lanes-hooks/main-hook.py) posts every event to /lanes/main-event; SessionStart is the registration: accepted when its session id is
 // .lanes/main-expected (written by the keeper that launched it), the session of a /main renew, or the same process as the live main.
-// The daemon still tells MCP sessions apart by their socket (/proc): the session owned by the main's pid is the main's; any other is not (LG1).
+// The daemon still tells MCP sessions apart by their socket: the session owned by the main's pid is the main's; any other is not (LG1). 002y (X-5): the
+// socket's process and the process facts come from the platform layer (lanes-proc.ts: Linux /proc, macOS lsof and ps).
 const mcpSessionPid = new Map<string, number>()   // MCP session id → owning claude pid
 /** the MCP session (of this daemon) owned by process `pid` whose stream is open, else any it owns */
 function sessionOfPid(pid: number): string | null {
@@ -376,65 +378,40 @@ export function mainTranscript(): string | null { return main?.mainSession()?.tr
 /** called by the control commands that kill or restart the TUI on purpose (/restart, /kill_stuck): the gen ends `asked` */
 export function markDeliberateRestart(): void { main?.markEnd('asked') }
 
-function hexPort(p: number): string { return p.toString(16).toUpperCase().padStart(4, '0') }
-
-/** inode of the CLIENT-side socket 127.0.0.1:<clientPort> → 127.0.0.1:<serverPort> */
-function clientSocketInode(clientPort: number, serverPort: number): string | null {
-  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
-    let text = ''
-    try { text = readFileSync(f, 'utf8') } catch { continue }
-    for (const line of text.split('\n').slice(1)) {
-      const c = line.trim().split(/\s+/)
-      if (c.length < 10) continue
-      const lp = c[1].split(':').pop(), rp = c[2].split(':').pop()
-      if (lp === hexPort(clientPort) && rp === hexPort(serverPort)) return c[9]
-    }
-  }
-  return null
-}
-function pidOfInode(inode: string): number | null {
-  const want = `socket:[${inode}]`
-  let pids: string[] = []
-  try { pids = readdirSync('/proc').filter(x => /^\d+$/.test(x)) } catch { return null }
-  for (const p of pids) {
-    let fds: string[]
-    try { fds = readdirSync(`/proc/${p}/fd`) } catch { continue }
-    for (const fd of fds) {
-      try { if (readlinkSync(`/proc/${p}/fd/${fd}`) === want) return Number(p) } catch {}
-    }
-  }
-  return null
-}
-function ppidOf(pid: number): number | null {
-  try {
-    const s = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    const rest = s.slice(s.lastIndexOf(')') + 2).split(' ')
-    return Number(rest[1])
-  } catch { return null }
-}
+// 002y (X-5; the fleet is mostly macOS): every process fact lanes reads comes from ONE platform layer, a function per fact (lanes-proc.ts). Through
+// 002x they were Linux /proc reads here (/proc/net/tcp + /proc/<pid>/fd for a socket's process, stat, cmdline, exe): on a Mac no MCP session was ever
+// mapped to its claude pid, so the main was never offered anything. Linux keeps /proc; macOS asks lsof and ps; an unknown fact is not judged.
+let PROC: ProcFacts = procFactsFor()
+/** tests only: the process facts (returns the previous ones) */
+export const __setProcFacts = (f: ProcFacts): ProcFacts => { const was = PROC; PROC = f; return was }
 function isClaudeProc(pid: number): boolean {
-  try {
-    const argv0 = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0] ?? ''
-    if (/(^|\/)claude$/.test(argv0)) return true
-    const exe = readlinkSync(`/proc/${pid}/exe`)
-    return /\/claude\/versions\//.test(exe) || /(^|\/)claude$/.test(exe)
-  } catch { return false }
+  const argv0 = PROC.argv(pid)?.[0] ?? ''
+  if (/(^|\/)claude$/.test(argv0)) return true
+  const exe = PROC.exe(pid) ?? ''
+  return /\/claude\/versions\//.test(exe) || /(^|\/)claude$/.test(exe)
 }
 function claudeAncestor(pid: number): number | null {
   let p: number | null = pid
   for (let i = 0; p && p > 1 && i < 24; i++) {
     if (isClaudeProc(p)) return p
-    p = ppidOf(p)
+    p = PROC.parentPid(p)
   }
   return null
 }
+/** the claude process at the other end of this request's connection. 002y (X-5): looked up once per connection (a keep-alive connection carries many
+ *  requests; on a Mac one lookup is an lsof and a few ps calls): the answer is kept on the socket. A connection whose process was not found is asked
+ *  again on its next request (unknown is not an answer). */
+const peerOfSocket = new WeakMap<object, number>()
 function callerClaudePid(req: IncomingMessage): number | null {
+  const sock = req.socket as object | undefined
+  const known = sock ? peerOfSocket.get(sock) : undefined
+  if (known) return known
   const port = req.socket?.remotePort
   if (!port) return null
-  const inode = clientSocketInode(port, D.httpPort)
-  if (!inode) return null
-  const pid = pidOfInode(inode)
-  return pid ? claudeAncestor(pid) : null
+  const pid = PROC.peerPid(port, D.httpPort)
+  const claude = pid ? claudeAncestor(pid) : null
+  if (claude && sock) peerOfSocket.set(sock, claude)
+  return claude
 }
 
 /** server.ts calls this when an MCP session's SSE stream opens (req = that GET). */
@@ -2274,7 +2251,8 @@ export function sessionArgs(lane: Lane): { resume: boolean; args: string[] } {
 // design/stability 「重啟時接錯 session」 and docs/en/sessions (quoted there): 「同一個 session id 同時在兩個行程接回，紀錄會交錯，沒有鎖」. S0 measured it: two
 // processes resuming one id both run, no error, and the history silently forks (one branch is lost to every later resume). The CLI has no lock, so the
 // router keeps one: run/sid/<session id>.pid while a lane process runs on that id, and before it starts a run on an id it also looks for ANY live process
-// whose command line resumes or names that id (/proc; a process this daemon did not start, a run left by a previous daemon, a person's `claude --resume`).
+// whose command line resumes or names that id (the platform layer's sessionPids, 002y X-5; a process this daemon did not start, a run left by a previous
+// daemon, a person's `claude --resume`).
 // A busy id is not started: the event stays queued and is tried again in LANES_SESSION_BUSY_RETRY_MS (5 s). A fork (--resume <main> --fork-session) is a new
 // id by construction and is not held back by the main's live process.
 const sidLock = (sid: string): string => join(LANES_DIR, 'run', 'sid', `${sid.replace(/[^A-Za-z0-9_.-]/g, '_')}.pid`)
@@ -2291,33 +2269,19 @@ export function sessionHolder(sid: string, cached = false, scan = true): number 
   try {
     const pid = Number(readFileSync(sidLock(sid), 'utf8').trim())
     if (pid && pid !== process.pid && pidAlive(pid)) {
-      const cmd = (() => { try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8') } catch { return spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }).stdout ?? '' } })()
-      if (cmd.includes(sid)) return pid
+      if ((PROC.argv(pid) ?? []).join(' ').includes(sid)) return pid      // 002y (X-5): the platform layer's argv (unknown: the lock is not trusted)
     }
   } catch {}
   if (!scan) return null
   const p = liveSessions(cached).get(sid)
   return p != null && pidAlive(p) ? p : null                          // a cached entry can only miss a newer process, never keep a dead one
 }
-/** session id → pid of every live process whose command line resumes or names it. A /proc scan costs ~60 ms on a box with 3,700 processes, so the router's
- *  own checks (cached) reuse one for 2 s; a direct call scans afresh. */
+/** session id → pid of every live process whose command line resumes or names it. A /proc scan costs ~60 ms on a box with 3,700 processes (a Mac's
+ *  `ps -axo pid=,command=` about as much with 1,200), so the router's own checks (cached) reuse one for 2 s; a direct call scans afresh. */
 let sessScan: { at: number; map: Map<string, number> } | null = null
 function liveSessions(cached: boolean): Map<string, number> {
   if (cached && sessScan && Date.now() - sessScan.at < 2_000) return sessScan.map
-  const map = new Map<string, number>()
-  let pids: string[] = []
-  try { pids = readdirSync('/proc').filter(x => /^\d+$/.test(x)) } catch { pids = [] }
-  for (const p of pids) {
-    if (Number(p) === process.pid) continue
-    let argv: string[]
-    try { argv = readFileSync(`/proc/${p}/cmdline`, 'utf8').split('\0') } catch { continue }
-    if (argv.includes('--fork-session')) continue
-    for (let k = 0; k < argv.length; k++) {
-      const a = argv[k]
-      if ((a === '--resume' || a === '-r' || a === '--session-id') && argv[k + 1]) map.set(argv[k + 1], Number(p))
-      else if (a.startsWith('--resume=') || a.startsWith('--session-id=')) map.set(a.slice(a.indexOf('=') + 1), Number(p))
-    }
-  }
+  const map = PROC.sessionPids()                                       // 002y (X-5): the platform layer (the same flags, forks and this daemon excluded)
   sessScan = { at: Date.now(), map }
   return map
 }
