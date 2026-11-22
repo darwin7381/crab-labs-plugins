@@ -62,7 +62,7 @@ import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsA
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn } from './liveness.ts'
 import { DutyOfficer, askModelCli, isDutyCallback, realTmux } from './duty-officer.ts'
-import { LocalKeepwarm } from './keepwarm-local.ts'
+import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
 // Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
 // (GENESIS_LANES=1); with it unset the daemon runs the fleet code paths unchanged. In lanes mode nothing here delivers to
@@ -1312,6 +1312,43 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
   }
 }
 
+// lanes-golive: the router's event for a mesh notification (an /inject, a hub row, a wake-up line of this daemon's own). Every field comes from the
+// notification's meta, which the /inject handler (or hub sync, or the keep-warm) filled from the body; nothing is read from the text except what has no
+// field yet (wakeKind: the watchdog's marker).
+function laneEventOf(n: { method: string; params: unknown }, verified?: boolean): Lanes.InEvent {
+  const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
+  const meta = p.meta ?? {}
+  const text = String(p.content ?? '')
+  const from = String(meta.user ?? 'unknown')
+  const btcc = meta.btcc_msg_id ?? meta.msg_id
+  const hop = Number(meta.hop)
+  const wake = Lanes.wakeKind(from, text, meta.wake)
+  return {
+    id: `mesh-${btcc ?? `${Date.now()}-${randomBytes(2).toString('hex')}`}`, source: 'mesh', from, text, meta, notif: n,
+    verified: verified ?? meta.verified === 'true',
+    ...(meta.thread ? { thread: meta.thread } : {}), ...(Number.isFinite(hop) && hop > 0 ? { hop } : {}),
+    ...(meta.sender_lane ? { lane_marker: meta.sender_lane } : {}),
+    no_reply: meta.no_reply === 'true',
+    ...(meta.reply_to_id ? { reply_to_id: String(meta.reply_to_id) } : {}),
+    ...(btcc ? { btcc_msg_id: String(btcc) } : {}),
+    ...(wake ? { wake } : {}),
+    line: Lanes.lineOf(meta.line) ?? (wake === 'mail' ? 'mail' : 'call'),
+  }
+}
+// lanes-golive (C1, C3): THE entrance of a mesh notification with lanes on, from either daemon: the router decides (the agent-inbox daemon asks the tg
+// daemon's router; the tg daemon routes itself). Only when no router can be asked does the fleet path (any open session of this agent) take it.
+async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean): Promise<Lanes.Decision | null> {
+  const ev = laneEventOf(n, verified)
+  Lanes.noteInboundThread(ev.btcc_msg_id, ev.thread, ev.hop)
+  const d = INBOX_ONLY ? await Lanes.routeRemote(ev)                       // target main: the tg daemon queued it for the main (M1)
+    : await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev); return { rule: 'router-failed', target: 'main' } as Lanes.Decision })
+  // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
+  // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
+  if (!d) broadcastNotification(n)
+  else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)    // 開工回執: a lane took the scheduled run (its run id from the meta)
+  return d
+}
+
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
@@ -1912,7 +1949,9 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
       await dispatchInbound(chatId, {
         method: 'notifications/claude/channel',
         params: { content: text, meta: { chat_id: chatId, user: 'fleet-watchdog', user_id: 'local-inject',
-          ts: new Date().toISOString(), via: 'local-inject', verified: 'true', relay: 'daemon', no_reply: 'true' } },
+          ts: new Date().toISOString(), via: 'local-inject', verified: 'true', relay: 'daemon', no_reply: 'true',
+          // lanes-golive (C1): the router reads the kind as a field (lanes off: the meta is exactly the fleet's)
+          ...(Lanes.LANES_ON ? { wake: Lanes.wakeKind(SENDER_KEEPWARM, text) ?? 'keepwarm' } : {}) } },
       })
       return true
     },
@@ -2781,6 +2820,10 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
   if (Lanes.LANES_ON) {
     const p = notification.params as { content?: string; meta?: Record<string, string> }
     const meta = p.meta ?? {}
+    // lanes-golive (C1): only a Telegram message of Joey's is a Telegram event. What else comes down this path (the agent-inbox daemon's keep-warm and
+    // mailbox lines, hub sync's old path, a local inject) is a mesh event for the router; building a Telegram event from it made the daemon's own keep-warm
+    // a message from Joey that the main owed a reply.
+    if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }
     const ev: Lanes.InEvent = {
       id: `tg-${chat_id}-${meta.message_id ?? Date.now()}`, source: 'telegram', from: meta.user ?? 'joey',
       text: String(p.content ?? ''), meta, notif: notification, verified: true,
@@ -3627,25 +3670,17 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
               ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
               ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
               ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
+              // lanes-golive (C1/C2): what the router reads as fields: the wake-up kind (body.wake, else the watchdog's sender and marker) and the line
+              // (body.line / body.tier; a push without one is a call)
+              ...((w => w ? { wake: w } : {})(Lanes.wakeKind(from, text, body?.wake))),
+              line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call',
               // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
               ...(body?.run_id != null && /^\d+$/.test(String(body.run_id)) ? { run_id: String(body.run_id) } : {}),
               ...(typeof body?.frequency === 'string' && body.frequency ? { frequency: String(body.frequency).slice(0, 16) } : {}),
             },
           },
         }
-        Lanes.noteInboundThread(btccMsgId != null ? String(btccMsgId) : undefined, thread, hop)
-        const ev: Lanes.InEvent = {
-          id: `mesh-${btccMsgId ?? `${Date.now()}-${randomBytes(2).toString('hex')}`}`, source: 'mesh', from, text,
-          meta: notification.params.meta as Record<string, string>, notif: notification, verified: verdict.verified,
-          thread, hop, lane_marker: laneMarker, no_reply: body?.no_reply === true,
-          reply_to_id: body?.reply_to_id != null ? String(body.reply_to_id) : undefined,
-          btcc_msg_id: btccMsgId != null ? String(btccMsgId) : undefined,
-        }
-        const d = await Lanes.routeRemote(ev)                            // target main: the tg daemon queued it for the main (M1)
-        // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
-        // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
-        if (!d) broadcastNotification(notification)
-        else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)   // 開工回執: a lane took the scheduled run (its run id from the meta)
+        const d = await laneDeliverMesh(notification, verdict.verified)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
         return

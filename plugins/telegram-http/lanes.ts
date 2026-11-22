@@ -634,6 +634,33 @@ export type InEvent = {
   /** event class used for the notify tier: = trigger, except a reply in a thread inherits the class of
    *  the lane run that asked (router.json notify.classes.<trigger>.inherit = "asking_run") */
   cls?: string
+  /** lanes-golive (C1): a fleet wake-up line (wakeKind): keepwarm | mail | stall | restart | resume. Set by server.ts from the /inject body's `wake`
+   *  field, else from the watchdog's own sender and marker (it sends no field yet). The router gives each kind its fixed destination (routeWake). */
+  wake?: WakeKind
+  /** lanes-golive (C2): the line the item came by (feed | mail | call), a field of the event (the /inject body's `line` or `tier`, the hub payload's
+   *  meta.line); a push with no field is a call. The router reads it (predicate `line`), never the text. */
+  line?: Line
+}
+export type WakeKind = 'keepwarm' | 'mail' | 'stall' | 'restart' | 'resume'
+export type Line = 'feed' | 'mail' | 'call'
+/** lanes-golive (C1): which fleet wake-up line this is, or null. The /inject body's `wake` field wins; without one, the delivery watchdog's sender
+ *  (fleet-watchdog, keepwarm.py / watchdog.py / keepwarm-local.ts) and the marker its line starts with: 「[保溫]」 keep-warm, 「讀信箱（」 the mailbox
+ *  reminder, 「[fleet-watchdog]」 a STALL / RESTART / resume wake (a line of that sender with no known marker is a stall wake: it exists for the main). */
+export function wakeKind(from: string | undefined, text: string, field?: unknown): WakeKind | null {
+  const f = String(field ?? '').trim().toLowerCase().replace(/[-_ ]?(reminder|wake)$/, '')
+  if (['keepwarm', 'mail', 'stall', 'restart', 'resume'].includes(f)) return f as WakeKind
+  if (String(from ?? '').toLowerCase() !== 'fleet-watchdog') return null
+  const t = String(text ?? '').trimStart()
+  if (t.startsWith('[保溫]')) return 'keepwarm'
+  if (t.startsWith('讀信箱（') || t.startsWith('讀信箱(')) return 'mail'
+  if (/session 重啟了|didn't finish before the previous session ended/.test(t)) return 'restart'
+  if (/已經切換，可以繼續了/.test(t)) return 'resume'
+  return 'stall'
+}
+/** the line field of an /inject body or hub meta (line, or the older tier name), or null when it names none */
+export function lineOf(v: unknown): Line | null {
+  const s = String(v ?? '').trim().toLowerCase()
+  return s === 'feed' || s === 'mail' || s === 'call' ? s : s === 'page' ? 'call' : null
 }
 export type Decision = { rule: string; target: 'main' | 'ledger' | 'lane'; lane?: string; note?: string; critical?: boolean
   /** the owner's thread: the conversation the event belongs to after routing (the lane's thread, the stopped thread) */
@@ -734,6 +761,9 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     toMain(ev, d)
     return d
   }
+  // lanes-golive (C1): a fleet wake-up line has a fixed destination, before any hold, gate or rule (the lab's `mesh-no-reply` rule filed them in the ledger:
+  // the cache went cold, a stuck main was never woken, mail was never read)
+  if (D.role === 'tg' && S && ev.wake) return routeWake(ev)
   // 002k (H14, H13): the peer's hold and the flood gate come first: before the rules, before any Jev screen, with no model. An event over the limit gets no lane.
   if (D.role === 'tg' && S) {
     const g = peerGate(ev)
@@ -814,9 +844,20 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   recordRoute(ev, d)
   return d
 }
+/** lanes-golive (C1): where each wake-up line goes. Keep-warm, STALL-WAKE, RESTART-WAKE and the resume line exist for the main: they reach it through
+ *  M1 like any item, owing nobody anything but the item itself (「收到保溫，回一個句點就結束」; the watchdog's wake lists inputs that carry their own
+ *  obligations). The mailbox reminder is the mail line's: it goes to the main (as before lanes) until a mail lane reads the mailbox (C2). */
+function routeWake(ev: InEvent): Decision {
+  const d: Decision = { rule: `wake-${ev.wake}`, target: 'main', note: `fleet wake-up line (${ev.wake}): the main` }
+  routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
+    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: ev.wake })
+  D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → main`)
+  toMain(ev, d, { owesOnlyMain: true })
+  return d
+}
 /** M1: an event the router gives the main is an item for it (the screen's warning in front). The digest is not attached here: it rides whatever M1
- *  offers or the main's hook pulls next (lanes-main.ts). */
-function toMain(ev: InEvent, d: Decision): void {
+ *  offers or the main's hook pulls next (lanes-main.ts). `owesOnlyMain`: the item is all it owes (a wake-up line: no Joey line, no answer, no receipt). */
+function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}): void {
   if (d.target !== 'main' || D.role !== 'tg' || !main) return
   const p = (ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
@@ -827,7 +868,7 @@ function toMain(ev: InEvent, d: Decision): void {
   // main, those are `handed` (the main meets them: its reply meets the Joey line and rings a critical one's ring, the due sweep rings it if nobody did)
   ev.trigger ??= triggerClass(undefined, ev) || undefined
   const cls = evClassOf(ev)
-  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...eventObligations(ev, cls).map(o => ({ ...o, state: 'handed',
+  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
   main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id })
 }
