@@ -23,20 +23,21 @@ async function until(f: () => boolean, ms = 6000) { const t0 = Date.now(); while
 const tools = (a: string[]): string => a[a.indexOf('--tools') + 1]
 const ALL = ['reflex', 'worker', 'fork', 'curator', 'synthesis'] as const
 
-test('E12 / K3: on by default for worker and fork lanes, never for reflex, synthesis or curator lanes; the other lists are the B1 lists', () => {
-  delete process.env.LANES_WORKER_AGENT_TOOL
+// lanes-golive: on the fleet a lane starts no sub-agents (off unless LANES_WORKER_AGENT_TOOL=1); the lab's K3 tool is what these tests specify, with the switch on
+test('E12 / K3: with the switch on (LANES_WORKER_AGENT_TOOL=1): worker and fork lanes, never reflex, synthesis or curator lanes; the other lists are the B1 lists', () => {
+  process.env.LANES_WORKER_AGENT_TOOL = '1'
   expect(L.laneBuiltinTools('worker')).toBe('Bash,Read,Write,Edit,Agent,ToolSearch'); expect(L.laneBuiltinTools('fork')).toBe('Bash,Read,Write,Edit,Agent,ToolSearch')
   for (const k of ['reflex', 'synthesis', 'curator'] as const) expect(L.laneBuiltinTools(k)).not.toContain('Agent')
   expect(L.laneBuiltinTools('curator')).toBe('Bash,Read,Write,Edit,ToolSearch'); expect(L.laneBuiltinTools('reflex')).toBe('Bash,Read,ToolSearch'); expect(L.laneBuiltinTools('synthesis')).toBe('Bash,Read,ToolSearch')
   for (const k of ALL) expect(L.laneAgentOn(k)).toBe(k === 'worker' || k === 'fork')
 })
 
-test('E12 / K3: LANES_WORKER_AGENT_TOOL=0 takes it away again; any other value leaves it on', () => {
+test('E12 / K3: LANES_WORKER_AGENT_TOOL=0 (or unset, the fleet default) takes it away; only 1 gives it', () => {
   process.env.LANES_WORKER_AGENT_TOOL = '0'
   for (const k of ALL) { expect(L.laneBuiltinTools(k)).not.toContain('Agent'); expect(L.laneAgentOn(k)).toBe(false) }
   expect(L.laneBuiltinTools('worker')).toBe('Bash,Read,Write,Edit,ToolSearch')
-  for (const v of ['1', 'true', '', ' 1']) { process.env.LANES_WORKER_AGENT_TOOL = v; expect(L.laneBuiltinTools('worker')).toContain('Agent') }
-  delete process.env.LANES_WORKER_AGENT_TOOL
+  for (const v of ['true', '', ' 1']) { process.env.LANES_WORKER_AGENT_TOOL = v; expect(L.laneBuiltinTools('worker')).not.toContain('Agent') }
+  process.env.LANES_WORKER_AGENT_TOOL = '1'; expect(L.laneBuiltinTools('worker')).toContain('Agent')
 })
 
 test('E12 / K3: the spawned worker process has Agent, the --agents definitions and no fork by default; with the switch at 0 none of them; a reflex lane never', async () => {
@@ -48,7 +49,7 @@ test('E12 / K3: the spawned worker process has Agent, the --agents definitions a
   }
   const run = async (i: number, kind: 'worker' | 'reflex') => { const k = argvs().length; mk(kind, i); L.sweepQueue(); expect(await until(() => argvs().length > k)).toBe(true); return argvs().find(a => a[a.indexOf('-p') + 1].includes(`adam.${kind}.${i}`))! }
   const denied = (a: string[]): string[] => a.slice(a.indexOf('--disallowedTools') + 1)
-  delete process.env.LANES_WORKER_AGENT_TOOL
+  process.env.LANES_WORKER_AGENT_TOOL = '1'                                                 // lanes-golive: the switch on (the fleet default is off)
   const w = await run(1, 'worker')
   expect(tools(w)).toBe('Bash,Read,Write,Edit,Agent,ToolSearch')
   expect(Object.keys(JSON.parse(w[w.indexOf('--agents') + 1])).sort()).toEqual([...L.LANE_AGENT_TYPES].sort())

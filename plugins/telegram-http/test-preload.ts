@@ -21,3 +21,5 @@ process.env.LANES_CLAUDE_BIN ??= `${import.meta.dir}/test-fixtures/no-claude.sh`
 // lanes-golive (C6): the fleet default notify profile is `default` (every line rings, ORG-CHART §0 #2 / #5). The lab's suite specifies the `tiered` table
 // (silent classes, the cap, quiet follow-ups): it runs under that profile unless a test file takes it away (lanes-golive-c6.test.ts tests the default).
 process.env.LANES_NOTIFY_PROFILE ??= 'tiered'
+// lanes-golive: worker / fork lanes have no Agent tool on the fleet (no sub-agents in a lane); the lab suite specifies the K3 tool, so it runs with it on
+process.env.LANES_WORKER_AGENT_TOOL ??= '1'

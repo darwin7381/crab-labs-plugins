@@ -42,7 +42,7 @@ test('K3: --agents redefines every agent type claude offers, each without the la
 })
 
 test('K3: the spawned worker and fork get --agents and Agent(fork) denied; the server name in the deny spec is the one in their MCP config; others get nothing', async () => {
-  delete process.env.LANES_WORKER_AGENT_TOOL
+  process.env.LANES_WORKER_AGENT_TOOL = '1'                                                 // lanes-golive: the switch on (the fleet default is off)
   const mk = (kind: 'worker' | 'fork' | 'reflex' | 'curator', i: number) => {
     const id = `adam.${kind}.${i}`, st = L.__lanesState()
     st.lanes[id] = { id, kind, n: i, session_id: `s${i}`, thread: `adam#t-k3${i}`, status: 'new', created: '', last: '', transcript: '', runs: 0, tokens_in: 0, tokens_out: 0 } as any

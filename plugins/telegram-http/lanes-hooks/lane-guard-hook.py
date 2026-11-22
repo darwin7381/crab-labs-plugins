@@ -220,7 +220,11 @@ def deny(reason):
 #              copies it. A target that cannot be worked out (a variable, a substitution) is refused for these kinds. Outside the workspace (/tmp) is free.
 # What it cannot see: a script file that does the writing or the calling itself (python3 job.py), a build tool (npm install), a command written in pieces. The sandbox
 # would see those; installing socat is what it needs (see the commit message).
-RESTRICTED = ('reflex', 'synthesis', 'curator')
+RESTRICTED = ('reflex', 'synthesis', 'curator', 'mail')     # lanes-golive: the mail lane writes no workspace file either
+# lanes-golive: knowledge/ holds the main's anchor files (定錨檔, knowledge/REANCHOR.md: the global rule of 11-22) and its other knowledge files; a lane's
+# record is its receipt and the ledger, so no lane writes there, whatever its kind or claim
+KNOWLEDGE_WHY = ('lanes do not write knowledge/ (the anchor files, knowledge/REANCHOR.md and the other knowledge files are the main\'s). '
+                 'Your record is your receipt and the ledger: put it there, or hand the change to the main with handoff_main.')
 ACT_KINDS = ('reflex', 'worker', 'fork')
 SVC_ALIAS = {'mock-api': 'api', 'mock-backup': 'backup', 'mock-posts': 'posts', 'mock-tickets': 'tickets'}
 SVC_ALLOW_DEFAULT = 'POST:api/restart,POST:backup/rerun,POST:tickets'
@@ -562,6 +566,8 @@ def write_policy(cmd, cwd, kind, depth=0):
             return 'lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. Use ledger_write(kind=memory_proposal) or escalate.'
         if under(rp, os.path.join(ws, 'bin')):
             return 'bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.'
+        if under(rp, os.path.join(ws, 'knowledge')):
+            return KNOWLEDGE_WHY
         if under(rp, ws) and not under(rp, out):
             rel = os.path.relpath(rp, ws)
             if kind in RESTRICTED:
@@ -716,9 +722,12 @@ def main():
         if under(rp, os.path.join(ws, 'bin')):                                  # 002k (H6): the svc wrapper is the barrier
             deny('bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.')
             return
+        if under(rp, os.path.join(ws, 'knowledge')):                            # lanes-golive: the main's anchor and knowledge files
+            deny(KNOWLEDGE_WHY)
+            return
         if rp.startswith(ws + os.sep):
             kind = os.environ.get('LANE_KIND') or ''
-            if kind in ('reflex', 'synthesis', 'curator'):
+            if kind in RESTRICTED:
                 if not under(rp, os.path.join(ws, 'out')):                       # 002k (H6): out/ is the scratch place of these kinds
                     deny(f'a {kind} lane does not edit workspace files ({f}). Use out/ for scratch files, or hand the change to the main with handoff_main.')
             elif claimed_by() .get(rp) != os.environ.get('LANE_ID'):
