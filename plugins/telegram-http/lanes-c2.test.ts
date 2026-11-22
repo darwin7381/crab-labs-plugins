@@ -27,7 +27,7 @@ const cms = () => rows().filter(r => r.kind === 'commitment')
 test('C2: Joey said "tell Eve": reply_agent to Eve leaves a commitment (who = Eve, what = the sent text, owner-relay, auto)', async () => {
   const tok = run('joey', 'telegram')
   const text = '週五前會把 /v2/orders/bulk 做好，Joey 已經答應。'
-  expect(await L.callLaneTool(tok, 'reply_agent', { to: 'eve', text })).toBe('sent')
+  expect(await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text })).toBe('sent')
   expect(cms().length).toBe(1)
   expect(cms()[0]).toMatchObject({ kind: 'commitment', lane: tok.lane, thread: `adam#t-c2${n}`, event: tok.evId,
     refs: { who: 'eve', what: text, from: 'owner-relay', auto: true, btcc_msg_id: 80001 } })
@@ -38,20 +38,20 @@ test('C2: Joey said "tell Eve": reply_agent to Eve leaves a commitment (who = Ev
 test('C2: not when the lane already wrote a commitment in that run (its own call, or a receipt promise); not when the run was not Joey\'s', async () => {
   const own = run('joey', 'telegram')
   await L.callLaneTool(own, 'commitment', { who: 'eve', what: '週五前給規格', by: '週五前' })
-  await L.callLaneTool(own, 'reply_agent', { to: 'eve', text: '我週五前給你規格。' })
+  await L.callLaneTool(own, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '我週五前給你規格。' })
   expect(cms().filter(r => r.event === own.evId).length).toBe(1)                                // only the lane's own
   expect(cms().find(r => r.event === own.evId)!.refs.from).toBeUndefined()
   const peer = run('peer', 'mesh')
-  await L.callLaneTool(peer, 'reply_agent', { to: 'cain', text: '明天會給你。' })
+  await L.callLaneTool(peer, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '明天會給你。' })
   const sched = run('scheduled', 'mesh')
-  await L.callLaneTool(sched, 'reply_agent', { to: 'cain', text: '備份已完成。' })
+  await L.callLaneTool(sched, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '備份已完成。' })
   expect(cms().filter(r => r.event === peer.evId || r.event === sched.evId).length).toBe(0)
 })
 
 test('C2: a Joey-quoted or worker-topic run (trigger joey) counts; one relay is one commitment even with a second reply; the receipt does not add another', async () => {
   const tok = run('joey', 'telegram')
-  await L.callLaneTool(tok, 'reply_agent', { to: 'cain', text: '請你明天 10:00 前把樣本給我。' })
-  await L.callLaneTool(tok, 'reply_agent', { to: 'cain', text: '補充：格式用 csv。' })
+  await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '請你明天 10:00 前把樣本給我。' })
+  await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '補充：格式用 csv。' })
   await L.callLaneTool(tok, 'receipt', { outcome: 'done', happened: 'Joey 要我轉達 cain', did: '已轉達 cain', promised: '明天 10:00 前收樣本', needs_main: '無' })
   expect(cms().filter(r => r.event === tok.evId).length).toBe(1)
   expect(cms().find(r => r.event === tok.evId)!.refs.who).toBe('cain')
@@ -60,6 +60,6 @@ test('C2: a Joey-quoted or worker-topic run (trigger joey) counts; one relay is 
 test('C2: a send that failed leaves no commitment', async () => {
   L.__setMeshSend(async () => null as any)
   const tok = run('joey', 'telegram')
-  expect(await L.callLaneTool(tok, 'reply_agent', { to: 'eve', text: '週五給你。' })).toContain('send failed')
+  expect(await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '週五給你。' })).toContain('send failed')
   expect(cms().filter(r => r.event === tok.evId).length).toBe(0)
 })

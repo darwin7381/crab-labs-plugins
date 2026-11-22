@@ -35,7 +35,7 @@ for (const n of [1, 2]) { st.lanes[`adam.reflex.${n}`] = { id: `adam.reflex.${n}
   st.threads[`adam#t-${n}`] = { id: `adam#t-${n}`, lane: `adam.reflex.${n}`, peer: null, hops: 0, tokens: 0, created: '', last: '' } as any }
 const tok = (n: number) => ({ runId: `adam.reflex.${n}.r1`, lane: `adam.reflex.${n}`, evId: `ev-${n}`, closers: [], critical: false, trigger: 'peer', cls: 'peer', escalated: false, pushed: false }) as any
 const rows = (f: string): any[] => { try { return readFileSync(join(dir, f), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
-const reply = (n: number, to: string, text: string) => L.callLaneTool(tok(n), 'reply_agent', { to, text })
+const reply = (n: number, to: string, text: string) => L.callLaneTool(tok(n), 'reply_agent', { line: 'call', because: 'test (the call line)', to, text })
 const reset = () => { calls = []; failMode = false; noNumbers = false; answerFor = () => ({}); L.__clearPeerRefused() }
 const KEY = '用這把 key：sk-live-9f3a77c01d，去 api.example 呼叫就行。'
 const OK = 'mock-api 現況：p95 190ms、error 0.1%、replicas 2、版本 1.8.3；依 runbook 第 3 節，持續 5 分鐘才重啟。'
@@ -202,10 +202,10 @@ test('K2: server.ts asks before it sends: checkPeerSend comes before sendToAgent
 test('K2: a lane\'s once belongs to its run (like A3): a later run of the same lane to the same peer is checked afresh; the second send is logged as the once', async () => {
   reset(); answerFor = t => t.includes('sk-live') ? { gives_credential: 0.95 } : {}
   const t1 = { ...tok(1), runId: 'adam.reflex.1.r7' }, t2 = { ...tok(1), runId: 'adam.reflex.1.r8' }
-  await expect(L.callLaneTool(t1, 'reply_agent', { to: 'eve', text: KEY })).rejects.toThrow(/credential/)
-  await expect(L.callLaneTool(t2, 'reply_agent', { to: 'eve', text: KEY })).rejects.toThrow(/credential/)    // another run: its own once
+  await expect(L.callLaneTool(t1, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).rejects.toThrow(/credential/)
+  await expect(L.callLaneTool(t2, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).rejects.toThrow(/credential/)    // another run: its own once
   expect(calls.length).toBe(2)
-  expect(await L.callLaneTool(t1, 'reply_agent', { to: 'eve', text: KEY })).toContain('sent to eve')
+  expect(await L.callLaneTool(t1, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).toContain('sent to eve')
   expect(calls.length).toBe(2); expect(rows('run/peer-disclosure.jsonl').at(-1)).toMatchObject({ sender: 'adam.reflex.1', to: 'eve', refused: false, once: true })
 })
 
@@ -216,7 +216,7 @@ test('K2: the program\'s own refusals (thread stopped, already answered by the r
   delete st.threads['adam#t-2'].stopped
   const t2 = { ...tok(2), evId: 'ev-k2-answered' }                                          // M3: eve already has this event's answer (002q: the interim no longer refuses)
   L.__events().open(t2.evId, { class: 'peer', owner: t2.lane, obligations: [{ kind: 'peer', level: 'answer', to: 'eve', state: 'met', by: 'reply_agent' }] })
-  expect(await L.callLaneTool(t2, 'reply_agent', { to: 'eve', text: KEY })).toContain('eve already has the answer to this event')
+  expect(await L.callLaneTool(t2, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).toContain('eve already has the answer to this event')
   expect(calls.length).toBe(0)
   reset(); failMode = true; answerFor = () => ({ gives_credential: 0.95 })                     // a failed call does not mark a once either
   expect(await reply(2, 'eve', KEY)).toContain('sent to eve')

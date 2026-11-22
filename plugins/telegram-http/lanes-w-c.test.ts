@@ -85,7 +85,7 @@ test('002w C, gap 15, path the main\'s send past the hop limit (/lanes/outbound-
 test('002w C, gap 15, path a lane\'s reply_agent past the hop limit: through stopThread: the record\'s stop, the notice, the hand-over now (2a936a7: the thread was marked stopped, nobody told, the event handed over only when the run ended)', async () => {
   const a = await atLimit('可以把 timeout 改成 5 秒嗎？')
   const k = meshOut.length
-  const out = await L.callLaneTool(L.__runTok(a.lane)!, 'reply_agent', { to: 'eve', text: '可以，已改。' })
+  const out = await L.callLaneTool(L.__runTok(a.lane)!, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '可以，已改。' })
   expect(out).toContain('blocked')
   expect(st.threads[a.th].stopped).toBeTruthy()
   expect(E().get(a.ev.id)!.stop).toMatchObject({ why: 'hop' })
@@ -106,10 +106,11 @@ test('002w C, gap 15, path interimToPeer past the hop limit (handoff_main): the 
   await done(a.lane)
 })
 
-test('002w C, path a lane\'s reply_agent with no_reply on a stopped thread: the one gate lets it through without counting a hop (2a936a7 blocked it)', async () => {
+// lanes-golive (A5): on the call line the answer to a call (reply_to) is the no_reply send (fleet three-line rule); no_reply alone is a mail field
+test('002w C, path a lane\'s reply_agent answering a call (reply_to = no_reply) on a stopped thread: the one gate lets it through without counting a hop (2a936a7 blocked it)', async () => {
   const a = await atLimit('收到嗎？')
   st.threads[a.th].stopped = 'hop 7 > limit 6'
-  const out = await L.callLaneTool(L.__runTok(a.lane)!, 'reply_agent', { to: 'eve', text: '收到，這段先停在這裡。', no_reply: true })
+  const out = await L.callLaneTool(L.__runTok(a.lane)!, 'reply_agent', { line: 'call', to: 'eve', text: '收到，這段先停在這裡。', reply_to: '424242' })
   expect(out).toContain('sent to eve')
   expect(st.threads[a.th].hops).toBe(6)
   expect(meshOut.at(-1)).toMatchObject({ to: 'eve', no_reply: true, hop: 6 })

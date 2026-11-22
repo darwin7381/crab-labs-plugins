@@ -1288,9 +1288,40 @@ const LANE_SEND_PROPS = {
 function withLaneSendProps<T extends { inputSchema: { properties: Record<string, unknown> } }>(t: T): T {
   return { ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, ...LANE_SEND_PROPS } } }
 }
+/** every tool of the agent-inbox server (WO-99 v3) and the old names it still answers while A2A_LEGACY is on */
+function isInboxToolName(name: string): boolean {
+  return INBOX_TOOLS.some(t => t.name === name) || ['call', 'send_mail', 'feed_post'].includes(name)
+}
+// lanes-golive (C2): the main's mail and feed leave through the same lanes checks as its calls: the disclosure check before anything is sent (to the
+// mail's addressee, the original sender of a mail it answers, or the wall), and the outbound note after (the promise check, the answer it meets).
+// Mail carries no thread / hop: the conversation id of a mail is for later (Chiron's need 5, 「現在不留」).
+async function laneMailBtcc(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; json: any }> {
+  const send = method === 'POST' && path === '/api/mesh/mail/send'
+  const reply = method === 'POST' ? path.match(/^\/api\/mesh\/mail\/(\d+)\/reply$/) : null
+  if (!send && !reply) return btccMail(method, path, body)
+  const b = (body ?? {}) as Record<string, unknown>
+  let to = send ? String(b.to ?? '').trim().toLowerCase() : ''
+  if (reply) { const m = await btccMail('GET', `/api/mesh/mail/${reply[1]}`).catch(() => null); to = m?.status === 200 && m.json?.from ? String(m.json.from).toLowerCase() : '' }
+  const text = [b.title, b.ask, b.body].filter(x => typeof x === 'string' && x).join('\n')
+  if (to) { const refused = await Lanes.checkPeerSend('main', to, text); if (refused) return { status: 403, json: { detail: refused } } }
+  const r = await btccMail(method, path, body)
+  if (r.status === 200 && to && typeof r.json?.id === 'number')
+    await Lanes.noteMainOutbound(undefined, undefined, undefined, to, text, reply ? reply[1] : undefined, !!(r.json.stored || r.json.delivered), { line: 'mail', ref: `mail-${r.json.id}` })
+  return r
+}
+async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; json: any }> {
+  if (method === 'POST' && path === '/api/feed/posts') {
+    const b = (body ?? {}) as Record<string, unknown>
+    const refused = await Lanes.checkPeerSend('main', 'the feed wall', [b.title, b.body].filter(x => typeof x === 'string' && x).join('\n'))
+    if (refused) return { status: 403, json: { detail: refused } }
+  }
+  return coreFeed(method, path, body, timeoutMs)
+}
 function laneMainDeps(args: Record<string, unknown>): FleetDeps {
   return {
     ...fleetDeps,
+    btcc: laneMailBtcc,
+    core: laneMainCore,
     call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => {
       // 002: the main's sends carry thread/hop; a quote-reply continues the thread it answers
       let thread = typeof args.thread === 'string' && args.thread.trim() ? args.thread.trim() : undefined
@@ -1643,7 +1674,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   // 002w (G, gap 19): only the main sends as the main: a session that is not it gets no Telegram tool and no send_to_agent (the one check, both daemons)
-  if (Lanes.LANES_ON && (INBOX_ONLY ? req.params.name === 'send_to_agent' : Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name)) && await Lanes.notMainSession(serverSessionId.get(mcp))) {
+  // lanes-golive (C2): in the agent-inbox daemon every tool is the main's: send_to_agent, the mailbox (an open marks mail read for good) and the wall
+  if (Lanes.LANES_ON && (INBOX_ONLY ? isInboxToolName(req.params.name) : Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name)) && await Lanes.notMainSession(serverSessionId.get(mcp))) {
     log('warn', `lanes: ${req.params.name} refused for MCP session ${serverSessionId.get(mcp)} (not the registered main)`)      // 002m (LG1)
     return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
   }
@@ -3463,11 +3495,38 @@ if (Lanes.LANES_ON) {
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     ...(INBOX_ONLY ? {
-      meshSend: async (to, text, replyTo, noReply, extra) => {
+      meshSend: async (to, text, replyTo, noReply, extra, send) => {
         let msgId: number | undefined, delivered = false
-        // a lane's reply_agent is a push into the peer's session: the WO-99 call rail (tier 'call'); mail / feed for lanes = go-live step 2
-        const out = await sendToAgent(to, text, replyTo, noReply, undefined, 'call', { ...extra, minted: (id, ok) => { msgId = id; delivered = ok } })
-        return { text: out, msgId, delivered }
+        if (!send || send.line === 'call') {
+          // a call: the WO-99 call rail (tier 'call') with the lanes thread / hop / sending-lane marker; the receiver reads why it can't wait first (fleet-mail.ts)
+          const body = send?.because ? `因為：${send.because}\n${text}` : text
+          const out = await sendToAgent(to, body, replyTo, noReply, undefined, 'call', { ...extra, minted: (id, ok) => { msgId = id; delivered = ok } })
+          return { text: out, msgId, delivered }
+        }
+        // lanes-golive (C2): mail and feed go through the agent-inbox tool's own rules (fleet-mail.ts), with this agent's credential; the tg daemon has
+        // already run the lane checks. The hub's answer gives the id and whether it was stored or delivered.
+        let got: { status: number; json: any } | null = null
+        const deps: FleetDeps = { ...fleetDeps,
+          btcc: async (m, path, b) => { const r = await btccMail(m, path, b); if (m === 'POST' && path === '/api/mesh/mail/send') got = r; return r },
+          core: async (m, path, b, t) => { const r = await coreFeed(m, path, b, t); if (m === 'POST' && path === '/api/feed/posts') got = r; return r } }
+        const res: any = await callInboxTool('send_to_agent', { line: send.line, to, text, title: send.title, ask: send.ask, deadline: send.deadline,
+          no_reply: send.line === 'mail' ? noReply : undefined, touches: send.touches, ref: send.ref }, deps, false)
+        const j = (got as { status: number; json: any } | null)
+        if (j?.status === 200 && typeof j.json?.id === 'number') msgId = j.json.id
+        delivered = j?.status === 200 && (send.line === 'feed' ? typeof j.json?.id === 'number' : !!(j.json?.stored || j.json?.delivered))
+        return { text: String(res?.content?.[0]?.text ?? ''), msgId, delivered, isError: !!res?.isError }
+      },
+      // lanes-golive (C2): the mail lane's mailbox tools, the agent's own (fleet-mail.ts). Before a reply leaves, the disclosure check runs on it
+      // against the mail's original sender (the tg daemon's /lanes/peer-check, as for the main's sends).
+      mailTool: async (name, args, lane) => {
+        let to: string | undefined
+        if (name === 'mailbox_reply' && Number(args.id) > 0) {
+          const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}`).catch(() => null)
+          to = m?.status === 200 && m.json?.from ? String(m.json.from) : undefined
+          if (to) { const refused = await Lanes.checkPeerSend(lane, to, String(args.body ?? '')); if (refused) return { text: refused, isError: true, to } }
+        }
+        const res: any = await callInboxTool(name, args, fleetDeps, false)
+        return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(to ? { to } : {}) }
       },
       schedulerCall: async (runId, action, outcome, summary) => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
@@ -3737,7 +3796,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         return
       }
       const batch = Array.isArray(payload)
-      const out = (await Promise.all((batch ? payload : [payload]).map(m => handleFleetRpc(m, fleetDeps))))
+      // lanes-golive: with lanes on, an old session's sends pass the same lanes checks as the main's (laneMainDeps); lanes off: the fleet's deps
+      const out = (await Promise.all((batch ? payload : [payload]).map(m => handleFleetRpc(m, Lanes.LANES_ON ? laneMainDeps((m as any)?.params?.arguments ?? {}) : fleetDeps))))
         .filter(x => x !== null)
       if (!out.length) { res.writeHead(202).end(); return }
       // Feed read-marks run only once the response is handed to the agent's socket ('finish'). A request

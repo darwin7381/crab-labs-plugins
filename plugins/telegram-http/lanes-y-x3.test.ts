@@ -48,8 +48,8 @@ async function start(ev: any): Promise<{ id: string; lane: string; tok: any; req
 async function end(lane: string): Promise<void> { writeFileSync(GO, 'ok'); expect(await until(() => !L.__runTok(lane))).toBe(true); await sleep(40) }
 /** the lane's own reply to Eve; a reply that says the main has it before the record does is sent back once (ownerClaimWarning): the lane sends it again */
 async function ownReply(tok: any, text: string): Promise<string> {
-  const r = await L.callLaneTool(tok, 'reply_agent', { to: 'eve', text })
-  return r.startsWith('not sent') ? L.callLaneTool(tok, 'reply_agent', { to: 'eve', text }) : r
+  const r = await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text })
+  return r.startsWith('not sent') ? L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text }) : r
 }
 const interims = (k: number) => mesh.slice(k).filter(m => m.owner === '主線' && String(m.text).includes('主線會在'))
 /** what the duty asks, whichever call came first: the peer was told once when the main answers (the router's interim, met); the answer is the main's
@@ -74,7 +74,7 @@ test('002y X-3, reply first (B09 r1): the lane answered Eve (「重啟由主線�
   expect(out).toContain('The router told eve')
   expect(interims(k).length).toBe(1); expect(interims(k)[0]).toMatchObject({ to: 'eve', reply_to: p.req })
   mainOwes(p.id, p.req)
-  expect(await L.callLaneTool(p.tok, 'reply_agent', { to: 'eve', text: '再補一句' })).toContain('eve already got a message about this event')   // still one line of its own
+  expect(await L.callLaneTool(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '再補一句' })).toContain('eve already got a message about this event')   // still one line of its own
   await end(p.lane)
   expect(interims(k).length).toBe(1)                                                         // once
   const s0 = sent.length, due = peers(p.id).find(o => o.level === 'answer').due_at
@@ -99,7 +99,7 @@ test('002y X-3, the two calls at once: the reply still in flight when the reques
   const p = await start(ask('mock-api 能不能重啟一下？'))
   let release!: () => void
   hold = new Promise<void>(r => { release = r })
-  const reply = L.callLaneTool(p.tok, 'reply_agent', { to: 'eve', text: '我查到 p95 2600ms，health degraded。' })
+  const reply = L.callLaneTool(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '我查到 p95 2600ms，health degraded。' })
   expect(await until(() => peers(p.id).some(o => o.level === 'answer' && o.state === 'requested'))).toBe(true)
   const hand = L.callLaneTool(p.tok, 'handoff_main', { text: 'Eve 請求重啟 mock-api，要主線決定' })
   expect(await until(() => ((E().get(p.id)?.obligations ?? []) as any[]).some(o => o.kind === 'main'))).toBe(true)
@@ -113,7 +113,7 @@ test('002y X-3, the two calls at once: the reply still in flight when the reques
 test('002y X-3, not a hand-over of the request: the lane answered Eve and its run ended owing Joey a line: the exit rule hands that over; Eve\'s answer stays answered, no interim', async () => {
   const k = mesh.length
   const p = await start(ask('mock-api 的 p95 現在多少？'))
-  expect(await L.callLaneTool(p.tok, 'reply_agent', { to: 'eve', text: 'p95 現在 190ms。' })).toContain('sent to eve')
+  expect(await L.callLaneTool(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: 'p95 現在 190ms。' })).toContain('sent to eve')
   await end(p.lane)
   expect(((E().get(p.id)?.obligations ?? []) as any[]).some(o => o.kind === 'main')).toBe(true)   // handed by the exit rule (the Joey line)
   expect(peers(p.id)).toEqual([expect.objectContaining({ level: 'answer', state: 'met', by: 'reply_agent' })])

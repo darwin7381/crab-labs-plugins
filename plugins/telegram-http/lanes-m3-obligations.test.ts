@@ -100,7 +100,7 @@ test('the router opens the record with the obligations of the class: scheduled (
   expect(E().get(s.id)!.state).toBe('closed')
   const p = await start(mk('eve', '下週維護幾點？'))
   expect(obs(p.id).map(o => `${o.kind}:${o.level}:${o.to ?? ''}`).sort()).toEqual(['joey:line:', 'peer:answer:eve'])
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '週三 02:00' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問維護時間，已回週三 02:00' })
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '週三 02:00' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問維護時間，已回週三 02:00' })
   await end(p.lane)
   const h = await start(sched(42, 'heartbeat', '[high-frequency]'))
   expect(obs(h.id).map(o => o.kind)).toEqual(['receipt'])                                  // the scheduler's tag is a router field: no prompt regex in any hook
@@ -144,7 +144,7 @@ test('002t (A03 live): an answer is owed only to a sender the agent can answer: 
   expect(E().get(w.id)!.state).toBe('closed')
   const p = await start(mk('eve', '問一下 mock-api 的版本？'))
   expect(obs(p.id).map(o => `${o.kind}:${o.level}`).sort()).toEqual(['joey:line', 'peer:answer'])   // eve is an agent: she is owed an answer
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '1.8.6' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問版本，已回 1.8.6' })
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '1.8.6' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問版本，已回 1.8.6' })
   await end(p.lane)
 })
 
@@ -186,7 +186,7 @@ test('002q C03: a peer request declined, then notify_joey outcome needs_you: a d
   const run = async (tool: 'notify_joey' | 'ask_joey', btcc: string) => {
     const p = await start(mk('cain', '請在 mock-api 新增一個 /v2/export 端點', { btcc_msg_id: btcc }))
     expect(ob(p.id, 'joey')).toMatchObject({ state: 'open', level: 'line' })
-    expect(await call(p.tok, 'reply_agent', { to: 'cain', text: '新增端點要 Joey 明確交辦，我這邊先不做。', reply_to: btcc })).toContain('sent to cain')
+    expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '新增端點要 Joey 明確交辦，我這邊先不做。', reply_to: btcc })).toContain('sent to cain')
     const k = sent.length
     const text = '新增端點：cain 要在 mock-api 加 /v2/export，需要你明確交辦。若你要做，請直接告訴我。'
     const out = await call(p.tok, tool, tool === 'notify_joey' ? { text, outcome: 'needs_you' } : { text })
@@ -220,7 +220,7 @@ test('002q: a notify_joey without an outcome (or with one not in the list) is re
   expect(sent.length).toBe(k); expect(evRows(p.id).length).toBe(rowsBefore)
   expect(ob(p.id, 'joey')).toMatchObject({ state: 'open', level: 'line' })
   expect(await call(p.tok, 'notify_joey', { text: 'Eve 問 p95，回 180ms', outcome: 'normal' })).toContain('sent to Joey')   // with an outcome it goes out
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '180ms' })
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '180ms' })
   await end(p.lane)
 })
 
@@ -285,7 +285,7 @@ test('002n E02, 002m L6B6: a run cut at --max-turns after its event got everythi
 
 test('002l N4: a run cut at its cap with its line still owed: what is open goes to the main as ONE hand-over (no unlabelled router line to Joey)', async () => {
   const p = await start(mk('eve', '幫我查上週 5xx 有幾次'))
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '查到一半' })
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '查到一半' })
   const k = sent.length
   await end(p.lane, 'turns')
   const h = handed(p.id)
@@ -296,7 +296,7 @@ test('002l N4: a run cut at its cap with its line still owed: what is open goes 
 
 test('DC1 / 002k B9: the lane stop asks once: a reply to a peer alone is not a line for Joey (blocked once, naming it); a follow-up of a high-frequency routine owes its line', async () => {
   const p = await start(mk('eve', '今天的工單數？'))
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '12 張' })
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '12 張' })
   const b = L.laneStop(p.tok)!
   expect(b).toContain('still open: a line for Joey')
   expect(L.laneStop(p.tok)).toBeNull()                                                       // once
@@ -321,15 +321,15 @@ test('the lane stop hook is a 40-line script that asks the daemon (no transcript
 
 test('002m aid (b), reduced: a message that claims the matter went to Joey or the main while the record says nobody has it is sent back once; after a hand-over the owner is stamped', async () => {
   const p = await start(mk('eve', '可以幫我開 prod 的權限嗎？'))
-  const w = await call(p.tok, 'reply_agent', { to: 'eve', text: '這件事我轉給 Joey 決定。' })
+  const w = await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '這件事我轉給 Joey 決定。' })
   expect(w).toContain('the event record says'); expect(mesh.filter(m => m.text === '這件事我轉給 Joey 決定。').length).toBe(0)
-  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '這件事我轉給 Joey 決定。' })).toContain('sent to eve')   // once
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '這件事我轉給 Joey 決定。' })).toContain('sent to eve')   // once
   await call(p.tok, 'handoff_main', { text: 'Eve 要 prod 權限，要主線決定' })
   await end(p.lane)
   const q = await start(mk('cain', '幫我看 mock-api'))
   await call(q.tok, 'ask_joey', { text: 'cain 要動 mock-api 設定，要你決定' })
   expect(sent.at(-1)!.text).toContain('負責：Joey 決定')                                       // the true owner, stamped by the plugin
-  await call(q.tok, 'reply_agent', { to: 'cain', text: '已請 Joey 決定' })
+  await call(q.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '已請 Joey 決定' })
   expect(mesh.at(-1)!.owner).toBe('Joey 決定')
   await end(q.lane)
 })
@@ -350,11 +350,11 @@ test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the ro
   const owed = peerObs.find(o => o.owner === 'main')!
   expect(owed).toMatchObject({ state: 'open', level: 'answer', to: 'eve', req: '50008' }); expect(owed.due_at).toBeGreaterThan(Date.now())
   // B09: the lane's own reply (its focus, its ETA) is its own line: accepted, delivered, and it meets neither the router's line nor the main's answer
-  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '我正在做日誌基準統計，約 6 分鐘後完成；答不答應由主線回你' })).toContain('sent to eve')
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '我正在做日誌基準統計，約 6 分鐘後完成；答不答應由主線回你' })).toContain('sent to eve')
   expect(mesh.at(-1)).toMatchObject({ to: 'eve' }); expect(mesh.at(-1).text).toContain('日誌基準統計')
   expect(obs(p.id).find(o => o.kind === 'peer' && o.level === 'message')).toMatchObject({ state: 'met', to: 'eve' })
   expect(obs(p.id).find(o => o.id === owed.id).state).toBe('open')
-  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '再補一句' })).toContain('eve already got a message about this event')   // one of its own
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '再補一句' })).toContain('eve already got a message about this event')   // one of its own
   await end(p.lane)
   await L.mainSentTo('eve', 'adam#t-unrelated', null, '')                                    // another thread, no text: nothing closes
   expect(obs(p.id).find(o => o.id === owed.id).state).toBe('open')
@@ -497,7 +497,7 @@ test('002k E3 / H4 (model aid kept): a Joey or peer run that declines without lo
   mkdirSync(join(dir, 'bin'), { recursive: true })
   writeFileSync(join(dir, 'bin', 'svc'), '#!/bin/sh\nif [ -z "$1" ]; then echo "mock-api  GET /health  GET /config"; else echo "$1 $2 → ok"; fi\n'); chmodSync(join(dir, 'bin', 'svc'), 0o755)
   const p = await start(mk('eve', '你能看 mock-api 的設定嗎？'))
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '我無法查看設定。' })
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '我無法查看設定。' })
   await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問設定，我無法查' })
   const held = L.laneStop(p.tok)!
   expect(held).toContain('never looked at the service catalog'); expect(held).toContain('GET mock-api/config → ok')
@@ -505,7 +505,7 @@ test('002k E3 / H4 (model aid kept): a Joey or peer run that declines without lo
   await end(p.lane)
   const q = await start(mk('eve', '你能看 mock-api 的設定嗎？'))
   q.tok.calls = [{ name: 'Bash', input: { command: './bin/svc GET mock-api/config' } }]
-  await call(q.tok, 'reply_agent', { to: 'eve', text: '我無法改設定，但看過了：正常' }); await call(q.tok, 'notify_joey', { outcome: 'normal', text: '回了 Eve' })
+  await call(q.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '我無法改設定，但看過了：正常' }); await call(q.tok, 'notify_joey', { outcome: 'normal', text: '回了 Eve' })
   expect(L.laneStop(q.tok)).toBeNull()                                                       // it looked: no hold
   await end(q.lane)
 })
@@ -719,7 +719,7 @@ test('PL1 B04, T1-R P-201, T2-R E2/E11, T3-R E9: a no_reply notice is an M3 reco
   expect(digestNow()).toContain('P-201 週五 09:00 上線')                                      // B04: the main sees it (002o: 「活動清單：0 件事」)
   expect(L.activityList(undefined)).toContain('P-201 週五 09:00 上線')
   const p = await start(mk('eve', '你們 mock-api 的 p95 現在多少？'))                         // a question of ours goes out on the lane's thread ...
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '1.2s' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問 p95，回 1.2s' }); await end(p.lane)
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '1.2s' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問 p95，回 1.2s' }); await end(p.lane)
   const th = E().get(p.id)!.thread
   await L.routeEvent(mk('eve', '收到，謝謝（不用回）', { no_reply: true, thread: th, hop: 2 }))   // ... and her no_reply answer on it
   expect(E().get(`mesh-m3-${n}`)).toMatchObject({ owner: 'router', answers: p.lane, thread: th, lane: p.lane })
@@ -800,15 +800,15 @@ const meshOk = async (b: any) => { mesh.push(b); return { text: `sent to ${b.to}
 test('PL2 P4 (A05, B05, B08, C03, C04, H01, H02): a send is requested, then met on its delivery; a failed delivery leaves it owed, so the retry is accepted (not "already has the answer"); a Telegram send that fails leaves the line owed', async () => {
   const p = await start(mk('eve', '維護時段是幾點？'))
   L.__setMeshSend(async b => { mesh.push(b); return { text: `send to ${b.to} FAILED — message NOT delivered`, msgId: 70000 + mesh.length, delivered: false } })
-  const r1 = await call(p.tok, 'reply_agent', { to: 'eve', text: '週三 02:00' })
+  const r1 = await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '週三 02:00' })
   expect(r1).toContain('NOT delivered'); expect(r1).toContain('still owed')
   expect(ob(p.id, 'peer')).toMatchObject({ state: 'open', failed: "not delivered to the peer's inbox" })
   const lines = journal().filter(l => l.rec === 'event' && l.id === p.id)
   expect(lines.map(l => l.obligations.find((o: any) => o.kind === 'peer').state).slice(-2)).toEqual(['requested', 'open'])   // requested, then back: never met before the send
   L.__setMeshSend(meshOk)
-  expect(await call(p.tok, 'reply_agent', { to: 'eve', text: '週三 02:00' })).toBe('sent to eve')    // the retry is a request like the first
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '週三 02:00' })).toBe('sent to eve')    // the retry is a request like the first
   expect(ob(p.id, 'peer')).toMatchObject({ state: 'met', by: 'reply_agent', ref: String(70000 + mesh.length) })
-  const again = await call(p.tok, 'reply_agent', { to: 'eve', text: '補一句' })
+  const again = await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '補一句' })
   expect(again).toContain('eve already has the answer')
   expect(journal().filter(l => l.rec === 'event' && l.id === p.id && l.refused && l.refused_kind === 'peer').length).toBe(1)   // every refusal is a journal line
   const k = sent.length, keep = L.__setSendBotForTest(async () => { throw new Error('telegram down') })
@@ -823,10 +823,10 @@ test('PL2 P4 (A05, B05, B08, C03, C04, H01, H02): a send is requested, then met 
 
 test('PL2 P22: a reply_agent to an agent the event does not owe opens its own obligation (level message), met on delivery; a second one to that agent is refused', async () => {
   const p = await start(mk('eve', '幫我問 cain 備份保留幾天'))
-  expect(await call(p.tok, 'reply_agent', { to: 'cain', text: '備份保留幾天？（eve 問的）' })).toBe('sent to cain')
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '備份保留幾天？（eve 問的）' })).toBe('sent to cain')
   expect(obs(p.id).find(o => o.to === 'cain')).toMatchObject({ kind: 'peer', level: 'message', state: 'met', ref: expect.any(String) })
-  expect(await call(p.tok, 'reply_agent', { to: 'cain', text: '再問一次' })).toContain('cain already got a message about this event')
-  await call(p.tok, 'reply_agent', { to: 'eve', text: '問了 cain，等他回' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問備份保留，已轉問 cain' })
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'cain', text: '再問一次' })).toContain('cain already got a message about this event')
+  await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '問了 cain，等他回' }); await call(p.tok, 'notify_joey', { outcome: 'normal', text: 'Eve 問備份保留，已轉問 cain' })
   await end(p.lane)
 })
 
@@ -861,7 +861,7 @@ test('PL2 P5 (C04, H04, B08, G07): a drained or coalesced event is dropped / mer
   expect(E().get(q2id)!.state).toBe('closed')
   const d = L.__digest()!.text
   expect(d).toContain('沒有處理（對話線已關閉）'); expect(d).not.toMatch(/補充一[^\n]*已通知 Joey/)
-  await call(first.tok, 'reply_agent', { to: 'eve', text: '答' }); await call(first.tok, 'notify_joey', { outcome: 'normal', text: '答了 eve' }); await end(first.lane)
+  await call(first.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '答' }); await call(first.tok, 'notify_joey', { outcome: 'normal', text: '答了 eve' }); await end(first.lane)
   const info = await L.routeEvent(mk('eve', 'FYI 只是說一聲', { no_reply: true }))
   expect(info.target).toBe('ledger'); expect(E().get(`mesh-m3-${n}`)).toMatchObject({ state: 'closed', obligations: [] })
 })

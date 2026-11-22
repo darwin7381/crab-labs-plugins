@@ -34,7 +34,7 @@ test('D5: a run started by a peer gets Joey\'s message by steering; its relay to
   expect(tok.trigger).not.toBe('joey')                                                  // the run itself was Eve's
   mkdirSync(join(dir, 'run', 'steer'), { recursive: true })
   appendFileSync(join(dir, 'run', 'steer', `${d.lane}.out.jsonl`), JSON.stringify({ id: 'tg-1033', at: Date.now(), event: 'PostToolUse', tool: 'Bash' }) + '\n')   // the hook handed it over
-  const out = await L.callLaneTool(tok, 'reply_agent', { to: 'eve', text: 'Joey 說 WO-27 週五交給你。', reply_to: '50020' })
+  const out = await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: 'Joey 說 WO-27 週五交給你。', reply_to: '50020' })
   expect(out).toBe('sent')
   const c = rows().find(r => r.kind === 'commitment' && r.lane === d.lane)!
   expect(c).toBeTruthy(); expect(c.refs).toMatchObject({ from: 'owner-relay', auto: true, who: 'eve' })
@@ -43,7 +43,7 @@ test('D5: a run started by a peer gets Joey\'s message by steering; its relay to
 test('D5: without a steered Joey message the same relay is no owner-relay commitment', async () => {
   const d = await L.routeEvent({ id: 'mesh-c9', source: 'mesh', from: 'eve', verified: true, btcc_msg_id: '50030', text: '順便問 WO-28？', meta: {}, notif: { method: '', params: {} } } as any)
   expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
-  await L.callLaneTool(L.__runTok(d.lane!)!, 'reply_agent', { to: 'eve', text: 'WO-28 還在排隊。', reply_to: '50030' })
+  await L.callLaneTool(L.__runTok(d.lane!)!, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: 'WO-28 還在排隊。', reply_to: '50030' })
   expect(rows().some(r => r.kind === 'commitment' && r.lane === d.lane)).toBe(false)
   await until(() => !Object.keys(st.lanes).some(id => L.__runTok(id)), 8000)            // no lane process outlives the file
 }, 12000)

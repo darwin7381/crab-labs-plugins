@@ -75,7 +75,7 @@ test('002w F, gap 14, path the lane\'s context block: a Joey run on a critical l
 test('002w F, gap 16, path a lane\'s reply_agent in a peer run: the promise is checked and put on the event\'s record (2a936a7: only a Joey run\'s relay was recorded)', async () => {
   const r = await laneRun(mk('eve', '報告什麼時候好？'))
   const k = cms().length
-  expect(await L.callLaneTool(r.tok, 'reply_agent', { to: 'eve', text: '週五 12:00 前給你完整報告。' })).toContain('sent to eve')
+  expect(await L.callLaneTool(r.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '週五 12:00 前給你完整報告。' })).toContain('sent to eve')
   expect(await until(() => cms().length === k + 1)).toBe(true)
   expect(cms().at(-1)).toMatchObject({ lane: r.lane, event: r.tok.evId, refs: { from: 'lane-send', auto: true, who: 'eve' } })
   expect(E().get(r.tok.evId)!.promised).toMatchObject([{ text: cms().at(-1).text, by: r.lane, to: 'eve', thread: st.lanes[r.lane].thread }])   // 002x: who, to whom, which conversation
