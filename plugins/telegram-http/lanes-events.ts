@@ -55,7 +55,8 @@ export const owing = (o: Ob): boolean => o.state === 'open' || o.state === 'requ
 export const owed = (o: Ob): boolean => owing(o) || (o.state === 'handed' && (o.kind === 'joey' || o.kind === 'peer' || o.kind === 'receipt'))
 
 export type EventsApi = ReturnType<typeof createEvents>
-export function createEvents(J: Journal) {
+/** `changed`: called after every write of an event record (lanes-golive: the open-handoffs file follows the main's obligations). Never throws into a write. */
+export function createEvents(J: Journal, changed?: () => void) {
   let k = 0
   const obId = (kind: string): string => `${kind}-${Date.now().toString(36)}-${(++k).toString(36)}`
   const get = (id: string): Row | undefined => J.get('event', id)
@@ -74,7 +75,9 @@ export function createEvents(J: Journal) {
    *  closed at once. 002q: a Joey line handed to the main keeps its event open until the main's line meets it (002p closed it when the hand-over's
    *  M1 item was done, with the line still owed). */
   function write(e: Row | { id: string }, obs: Ob[], f: Record<string, unknown> = {}): Row {
-    return J.write('event', e.id, obs.some(owed) ? 'open' : 'closed', { obligations: obs, ...f })!
+    const row = J.write('event', e.id, obs.some(owed) ? 'open' : 'closed', { obligations: obs, ...f })!
+    try { changed?.() } catch {}
+    return row
   }
   /** the router: one record per inbound event (an existing record is returned as it is: a retry is the same event) */
   /** the router: one record per inbound event (an existing record is returned as it is: a retry is the same event). `owner` is a lane, `main`, or
@@ -198,7 +201,7 @@ export function createEvents(J: Journal) {
     const obs = obsOf(e)
     const open = obs.find(o => o.kind === 'main' && owing(o))
     if (open) return open
-    const ob: Ob = { id: h.handoff, kind: 'main', level: 'handed', state: 'open', by: h.by, owner: 'main', handoff: h.handoff,
+    const ob: Ob = { id: h.handoff, kind: 'main', level: 'handed', state: 'open', by: h.by, owner: 'main', handoff: h.handoff, at: new Date().toISOString(),
       ...(h.what != null ? { what: h.what } : {}), ...(h.due_at != null ? { due_at: h.due_at } : {}), ...(h.cls ? { cls: h.cls } : {}) }
     // 002y (X-3, 002w r1 B09): the peer's request handed over AFTER the lane's own reply met its answer left the main owing nothing and the peer never told
     // when the main would answer (the order of the two calls decided it). Handing the request over makes the answer owed again, as the main's: the

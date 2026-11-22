@@ -225,7 +225,8 @@ export function lanesInit(deps: LanesDeps): void {
     journal.load()
     main = createMain(mainEnv())
     main.initMain()
-    events = createEvents(journal)
+    events = createEvents(journal, writeOpenHandoffs)
+    writeOpenHandoffs()
     writeLaneSettings()
     restoreRuns()
     for (const [id, list] of Object.entries(S.steering ?? {})) {                 // 002k (E18): messages that were with a run when the daemon stopped: that run is gone, they are the lane's next run
@@ -347,6 +348,37 @@ function mainTookItems(items: Row[]): void {
       void inboxPost('/lanes/scheduler', { run_id: run, action: 'ack' }).then(r => D.log('info', `lanes: scheduler run ${run} taken by the main: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
     }
   }
+}
+
+// lanes-golive: what the main still owes survives its compaction. The daemon (the one writer) keeps .lanes/open-handoffs.md, read-only, one line per open
+// main obligation (a lane's hand-over, or an item routed to the main), rewritten whenever an event record changes and the list with it. The fleet's
+// re-anchor hook (WO-119, reanchor_hook.py) reads it after a compaction. Line format (fields separated by 「｜」):
+//   - <event id>｜來自 <from>｜<handoff id, or 交給主線>｜<what, one line, ≤160 chars>｜自 <MM-DD HH:MM>｜期限 <MM-DD HH:MM | —>
+export const openHandoffsFile = (): string => join(LANES_DIR, 'open-handoffs.md')
+let openHandoffsText = ''
+export function openHandoffsLines(): string[] {
+  const out: string[] = []
+  for (const e of events?.rows(r => r.state === 'open') ?? []) for (const o of (e.obligations ?? []) as Ob[]) {
+    if (o.kind !== 'main' || o.state !== 'open') continue
+    const what = String(o.what ?? e.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 160)
+    const since = String(o.at ?? e.created ?? '')
+    out.push(`- ${e.id}｜來自 ${String(e.from ?? '?')}｜${o.handoff ?? '交給主線'}｜${what || '-'}｜自 ${since ? stamp(since) : '—'}｜期限 ${o.due_at ? stamp(new Date(Number(o.due_at)).toISOString()) : '—'}`)
+  }
+  return out
+}
+function writeOpenHandoffs(): void {
+  if (D?.role !== 'tg' || !LANES_DIR) return
+  const lines = openHandoffsLines()
+  const text = [`# ${D.agent}：交給主線、還沒處理完的事（${TZ_LABEL}）`,
+    '# 分流器寫的唯讀檔（.lanes/open-handoffs.md）；每次這些義務有變動就重寫。每行：事件｜來自｜交接編號｜要做什麼｜從何時起｜期限',
+    ...(lines.length ? lines : ['（沒有）']), ''].join('\n')
+  if (text === openHandoffsText) return
+  try {
+    const p = openHandoffsFile(), tmp = `${p}.${process.pid}.tmp`
+    try { rmSync(tmp) } catch {}
+    writeFileSync(tmp, text, { mode: 0o444 }); renameSync(tmp, p)
+    openHandoffsText = text
+  } catch (e) { D.log('warn', `lanes: open-handoffs.md not written: ${e}`) }
 }
 
 // ================================================================== the main (M2 lives in lanes-main.ts; these are its uses here)
