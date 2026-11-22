@@ -18,3 +18,6 @@ globalThis.fetch = Object.assign((input: any, init?: any) => {
 // - No test starts the real claude. A lane run that a test did not give its own fake binary (__setClaudeBin) to, or one that starts after the file put the
 //   real one back in its afterAll, runs test-fixtures/no-claude.sh instead: a failed run at once, no model call, no process left behind.
 process.env.LANES_CLAUDE_BIN ??= `${import.meta.dir}/test-fixtures/no-claude.sh`
+// lanes-golive (C6): the fleet default notify profile is `default` (every line rings, ORG-CHART §0 #2 / #5). The lab's suite specifies the `tiered` table
+// (silent classes, the cap, quiet follow-ups): it runs under that profile unless a test file takes it away (lanes-golive-c6.test.ts tests the default).
+process.env.LANES_NOTIFY_PROFILE ??= 'tiered'

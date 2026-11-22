@@ -123,10 +123,11 @@ test('the router opens the record with the obligations of the class: scheduled (
   expect(await withJev(() => call(h3.tok, 'notify_joey', { outcome: 'normal', text: 'run:943：status ok，p95 260ms（上次 180ms，+80ms），仍在正常範圍' }))).toContain('sent to Joey')
   expect(sent.length).toBe(before + 2); expect(jevCalls.length).toBe(1); expect(ob(h3.id, 'joey')).toMatchObject({ state: 'met', level: 'line' }); expect(E().get(h3.id)!.outcome).toBe('changed')
   await call(h3.tok, 'receipt', { outcome: 'done', run_id: '943' }); await end(h3.lane)
-  const h4 = await start(sched(944, 'heartbeat', '[high-frequency]'))                      // the judge fails: the line goes out, never dropped on a failed call
+  // lanes-golive (C6, ORG-CHART §0 #5): the judge fails: the lane's own `normal` stands and the line stays in the receipt (the lab let it out as changed)
+  const h4 = await start(sched(944, 'heartbeat', '[high-frequency]'))
   newsP = null
-  expect(await withJev(() => call(h4.tok, 'notify_joey', { outcome: 'normal', text: 'run:944：與上次相同' }))).toContain('sent to Joey')
-  expect(sent.length).toBe(before + 3)
+  expect(await withJev(() => call(h4.tok, 'notify_joey', { outcome: 'normal', text: 'run:944：與上次相同' }))).toContain('owes Joey no line')
+  expect(sent.length).toBe(before + 2)
   await call(h4.tok, 'receipt', { outcome: 'done', run_id: '944' }); await end(h4.lane)
   const s2 = await start(sched(945)); jevCalls.length = 0; newsP = 0.02                    // an event that owes a line is not judged: its normal line goes out
   expect(await withJev(() => call(s2.tok, 'notify_joey', { outcome: 'normal', text: '備份正常' }))).toContain('sent to Joey'); expect(jevCalls.length).toBe(0)

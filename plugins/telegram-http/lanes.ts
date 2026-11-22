@@ -1109,7 +1109,11 @@ const screenOn = (): boolean => process.env.LANES_INJECTION_SCREEN === '1'
 let SCREEN_P = Number(process.env.LANES_SCREEN_P ?? 0.8)
 const SCREEN_TIMEOUT_MS = Number(process.env.LANES_SCREEN_TIMEOUT_MS ?? 3000)
 export const __setScreenP = (p: number): void => { SCREEN_P = p }
-let NOTIFY_PROFILE_ENV = (process.env.LANES_NOTIFY_PROFILE ?? 'tiered').trim()
+// lanes-golive (C6): the fleet default is `default`: every line to Joey is an ordinary push (ORG-CHART §0 #2 「做了什麼就報什麼、全進 Joey 手機…永遠不是砍
+// 通知」; #5: a routine with nothing new is ONE line, a high-frequency one only its receipt, which the router keeps by opening no Joey line for it). The lab's
+// `tiered` table (silent scheduled / peer / board / routine alert lines, a frequency cap, quiet follow-ups and quiet lines after a ring) runs only when it is
+// switched on explicitly (LANES_NOTIFY_PROFILE=tiered or /lanes notify tiered): that is a change of who rings Joey, his ruling.
+let NOTIFY_PROFILE_ENV = (process.env.LANES_NOTIFY_PROFILE ?? 'default').trim()
 export function notifyProfile(): 'default' | 'tiered' {
   const p = (S as any)?.notify_profile ?? NOTIFY_PROFILE_ENV
   return p === 'default' ? 'default' : 'tiered'
@@ -1120,7 +1124,7 @@ export function notifyDecision(cls: string, escalated: boolean, thread: string):
   let { tier, rule } = tierFor(cls, escalated)
   const lim = routerCfg().notify?.limits ?? {}
   const exempt = (escalated && lim.cap_exempt_escalated !== false) || (lim.cap_exempt_classes ?? []).includes(cls)
-  if (tier === 'push' && lim.push_per_thread && !exempt) {
+  if (tier === 'push' && lim.push_per_thread && !exempt && notifyProfile() === 'tiered') {      // lanes-golive (C6): no cap in the fleet default
     const win = (lim.window_minutes ?? 10) * 60_000, now = Date.now()
     const recent = (S.pushes[thread] ?? []).filter(t => now - t < win)
     if (recent.length >= lim.push_per_thread) { tier = lim.over_limit_tier ?? 'silent'; rule += `+cap(${lim.push_per_thread}/${lim.window_minutes ?? 10}min)` }
@@ -1352,7 +1356,7 @@ export function floodTick(now = Date.now()): void {
       text: `peer_flood ${peer}：${e.count} 則超過限制的訊息被合併（${windowS} 秒內，${stamp(e.start)} 起），第一則 ${e.first}、最後一則 ${e.last}；樣本：${e.samples.join(' ｜ ')}。同一段時間有 ${e.answered} 則照常開了車道，${e.count} 則只進帳本，估計省下約 ${avoided} token。`,
       refs: { peer_flood: peer, count: e.count, window_s: windowS, start: e.start, first: e.first, last: e.last, samples: e.samples, answered: e.answered, ledger_only: e.count, tokens_avoided: avoided, reasons: e.reasons } })
     logos('lane.peer_flood', { peer, phase: 'end', count: e.count, answered: e.answered, tokens_avoided: avoided })
-    void pushJoey(undefined, `〔流量管制結束〕${peer} 安靜下來了：${windowS} 秒內共 ${e.count + e.answered} 則，${e.answered} 則開了車道回覆，${e.count} 則只進帳本，估計省下約 ${avoided} token。細節在帳本 peer_flood ${peer}。`, true)
+    void pushJoey(undefined, `〔流量管制結束〕${peer} 安靜下來了：${windowS} 秒內共 ${e.count + e.answered} 則，${e.answered} 則開了車道回覆，${e.count} 則只進帳本，估計省下約 ${avoided} token。細節在帳本 peer_flood ${peer}。`, notifyProfile() === 'tiered')
   }
   for (const h of Object.values(S.holds ?? {})) if (h.until != null && h.until <= now) endHold(h.peer, '時間到')
   saveState()
@@ -2912,7 +2916,7 @@ function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof m
 function eventTier(e: Row, turn: NonNullable<ReturnType<typeof mainTurn>>): { tier: Tier; rule: string } {
   if (turn.items.some(r => r.kind === 'joey' && String(r.event) === e.id)) return { tier: 'push', rule: 'joey-message' }
   const t = tierFor(String(e.class ?? ''), false)
-  return t.tier === 'push' && rung(e) ? { tier: 'silent', rule: `${t.rule}+rang` } : t
+  return notifyProfile() === 'tiered' && t.tier === 'push' && rung(e) ? { tier: 'silent', rule: `${t.rule}+rang` } : t      // lanes-golive (C6): the main's reply rings (tiered only quiets it)
 }
 /** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push): it quotes a message, or one of the obligations it meets needs a push */
 export function mainReplyTier(a: { reply_to?: unknown }): MainTier | null {
@@ -3252,7 +3256,7 @@ function joeyRendering(e: Row | undefined, tok: RunTok, lane: Lane, level: 'line
   // of the notify table); another event of the run's set has its record's class
   const dec = notifyDecision(metClass(e, tok), level === 'decision', lane.thread)
   let { tier, rule } = dec
-  if (level === 'line' && tier === 'push' && (ob?.rang || tok.followup)) { tier = 'silent'; rule += ob?.rang ? '+rang-at-due' : '+followup-quiet' }
+  if (notifyProfile() === 'tiered' && level === 'line' && tier === 'push' && (ob?.rang || tok.followup)) { tier = 'silent'; rule += ob?.rang ? '+rang-at-due' : '+followup-quiet' }   // lanes-golive (C6): tiered only
   const routine = level === 'line' && outcome === 'normal' && ROUTINE_CLASSES.includes(String(e?.class)) && !tok.critical
   const first = text.split('\n').map(l => l.trim()).find(Boolean) ?? text
   return { tier, rule: routine && first !== text.trim() ? `${rule}+one-line` : rule, body: routine ? first.slice(0, 400) : text }
@@ -3305,7 +3309,9 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   // 002s (T2-R E8): an event the router opened with no Joey line (a high-frequency routine). The lane's label does not decide alone: the line is
   // judged (lineNews). News goes out as `changed`; a line that says nothing changed keeps `normal` and M3 refuses it; a failed call lets it out.
   const noLine = !decision && said === 'normal' && (() => { const e0 = events.get(evId); return !!e0 && e0.class !== 'joey' && !((e0.obligations ?? []) as Ob[]).some(o => o.kind === 'joey') })()
-  const outcome: Outcome | undefined = decision ? outcomeArg(a) : noLine && (await lineNews(lane, tok, text)) !== false ? 'changed' : said as Outcome
+  // lanes-golive (C6, ORG-CHART §0 #5 「高頻例行…無變化只打 complete 回執」): the lane itself said `normal`; only Jev finding news in it makes it a line (a failed call
+  // keeps the lane's own label, and M3 keeps it in the receipt). The lab let a failed call out as `changed`: an hourly no-change line on Joey's phone.
+  const outcome: Outcome | undefined = decision ? outcomeArg(a) : noLine && (await lineNews(lane, tok, text)) === true ? 'changed' : said as Outcome
   const shown: Outcome = outcome ?? (decision ? 'changed' : 'normal')
   const r0 = joeyRendering(events.get(evId), tok, lane, level, undefined, text, shown)
   // PL2: requested (a decision raises a line already met); 002q: one line per matter
