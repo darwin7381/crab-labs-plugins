@@ -681,6 +681,9 @@ export interface OfficerDeps {
   /** `to` is set only for a test target (config test_rulings_to); otherwise the daemon's rulings recipient. */
   mail(title: string, body: string, to?: string): Promise<string>
   recipients(): string[]
+  /** lanes-golive (C8): another program owns this screen (with lanes on: the main's usage-limit menu is the lanes main-wall probe's): its name, or null.
+   *  An owned screen is never judged, pressed or sent; absent = nobody else owns anything (the fleet's behaviour). */
+  owner?(t: Target, lines: string[]): string | null
   log(level: 'info' | 'warn' | 'error', msg: string): void
   now?(): number
   sleep?(ms: number): Promise<void>
@@ -916,6 +919,14 @@ export class DutyOfficer {
     if (state !== 'OTHER' || now - s.since < this.L.stallMs) return
     // a raw notice held back by the hourly cap: after the hour, look again (the model may be back)
     if (s.rec?.action === 'suppressed' && now - s.rec.t >= this.L.renotifyMs) s.rec = null
+    if (!s.rec) {
+      const owner = this.d.owner?.(t, lines) ?? null
+      if (owner) {
+        s.rec = { action: 'left_to_owner', t: now }
+        this.event('left_to_owner', { agent: t.label, tmux: t.tmux, owner, screen_hash: hash, tail: lines })
+        return
+      }
+    }
     if (!s.rec && isRateLimitMenu(lines)) {
       s.rec = { action: 'left_to_modal_guard', t: now }
       this.event('left_to_modal_guard', { agent: t.label, tmux: t.tmux, screen_hash: hash, tail: lines })

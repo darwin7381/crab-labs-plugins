@@ -237,6 +237,7 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(() => dueTick(), 1_000).unref()        // M3: the one due sweep (critical ring, hand-over not taken, promised answers, commitments)
     setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
+    if (deps.mainPicker && process.env.CHANNEL_BOT_TMUX_SESSION) publishMenuOwner(process.env.CHANNEL_BOT_TMUX_SESSION)   // lanes-golive (C8)
   }
   deps.log('info', `lanes: ON (role=${deps.role} agent=${deps.agent} dir=${LANES_DIR} model=${MODEL} cap=${MAX_RUNNING} hop_limit=${HOP_LIMIT})`)
 }
@@ -1977,6 +1978,34 @@ async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult 
  *  the menu is drawn when the limit cuts the turn, and the StopFailure that walls the gen can reach the daemon after the watchdog's poll. The probe
  *  drives the option that waits or continues (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
  *  reads it too (lanes-main). Any other menu (a starting main's resume menu, an idle main's prompt) stays the watchdog's. */
+// lanes-golive (C8): one owner of the main's usage-limit menu. With lanes on it is the lanes main-wall probe (inspectMainMenu, driven from M2). The other
+// actors stand aside: the startup-picker watchdog and the duty officer in this daemon by their `owner` hooks (server.ts), and the programs outside the
+// plugin (Hephaestus's ratelimit-modal-guard, Epeius's delivery watchdog's resume line) by this file, refreshed every 30 s while the daemon runs:
+//   ~/.claude/lanes/menu-owner/<tmux session>.json  {owner: "lanes-wall", menus: ["usage-limit"], agent, tmux, pid, at}
+// fresh (mtime under 120 s) and its pid alive = do not press keys on that pane's usage-limit menu.
+export const MENU_OWNER_FRESH_S = 120
+export function menuOwnerFile(tmux: string, home = process.env.HOME || homedir()): string {
+  return join(home, '.claude', 'lanes', 'menu-owner', `${tmux.replace(/[^A-Za-z0-9._-]/g, '_')}.json`)
+}
+function publishMenuOwner(tmux: string): void {
+  const p = menuOwnerFile(tmux)
+  const write = (): void => {
+    try { mkdirSync(dirname(p), { recursive: true }); writeJsonAtomic(p, { owner: 'lanes-wall', menus: ['usage-limit'], agent: D.agent, tmux, pid: process.pid, at: nowIso() }, 0o644) }
+    catch (e) { D.log('warn', `lanes: menu owner file ${p}: ${e}`) }
+  }
+  write()
+  setInterval(write, 30_000).unref()
+  const drop = (): void => { try { if (readJson<any>(p, {})?.pid === process.pid) rmSync(p) } catch {} }
+  process.once('exit', drop)
+}
+/** lanes-golive (C8): the owner of this pane's limit menu when it is not the caller, by the published file (for an in-plugin caller of another daemon) */
+export function menuOwnerOf(tmux: string): string | null {
+  try {
+    const p = menuOwnerFile(tmux), o = readJson<any>(p, null)
+    if (!o?.pid || (Date.now() - statSync(p).mtimeMs) / 1000 > MENU_OWNER_FRESH_S || !pidAlive(Number(o.pid))) return null
+    return String(o.owner ?? 'lanes-wall')
+  } catch { return null }
+}
 const LIMIT_OPTION = /limit|usage|reset/i
 export function mainMenuOwned(options: string[]): boolean {
   if (D?.role !== 'tg' || !D.mainPicker) return false

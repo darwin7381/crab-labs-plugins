@@ -61,7 +61,7 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DutyOfficer, askModelCli, isDutyCallback, realTmux } from './duty-officer.ts'
+import { DutyOfficer, askModelCli, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
 // Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
@@ -2069,6 +2069,12 @@ if (isControlEnabled() || isRoamerEnabled()) {
       try { await bot.api.editMessageText(s.chat, s.msg, text, { reply_markup: { inline_keyboard: [] } }) }
       catch (e) { log('warn', `duty-officer edit ${s.chat}/${s.msg} failed: ${e}`) }
     },
+    // lanes-golive (C8): the main's usage-limit menu is the lanes main-wall probe's (one owner); the duty officer leaves it alone
+    ...(Lanes.LANES_ON && !INBOX_ONLY ? { owner: (t: { tmux: string }, lines: string[]) => {
+      if (t.tmux !== process.env.CHANNEL_BOT_TMUX_SESSION) return null
+      const pk = detectStartupPicker(lines.join('\n'))
+      return isRateLimitMenu(lines) || (pk && Lanes.mainMenuOwned(pk.options)) ? 'the lanes main-wall probe' : null
+    } } : {}),
     mail: async (title, body, to) => {
       let cred = ''
       try { cred = readFileSync(DUTY_CREDENTIAL, 'utf8').trim() } catch {}
