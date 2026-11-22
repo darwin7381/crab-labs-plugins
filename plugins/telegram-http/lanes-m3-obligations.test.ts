@@ -58,7 +58,8 @@ L.__setRetryBackoff(20)
 const sent: Array<{ text: string; silent: boolean; replyTo?: number }> = [], mesh: any[] = []
 L.__setMeshSend(async b => { mesh.push(b); return { text: `sent to ${b.to}`, msgId: 70000 + mesh.length, delivered: true } })
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
-  sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo }); return 9000 + sent.length }, joeyChatId: () => '1' } as any)
+  sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo }); return 9000 + sent.length }, joeyChatId: () => '1',
+  createTopic: async () => 4400 + sent.length } as any)          // lanes-golive: a worker lane needs a real topic (no topic = the main does the work)
 afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; schedSrv.close(); jevSrv.close(); laneSrv.close(); L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
 // the daemon's lane routes (/lane-stop, /lane-receipt) on a real port, for the lane hooks run as processes
 const laneSrv = createServer(async (req, res) => { if (!(await L.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res))) res.writeHead(404).end() })
