@@ -9,6 +9,7 @@ the auto-commit). Lanes cannot write there at all (lane-guard-hook).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -40,8 +41,10 @@ def commit(p, f=None):
     thread = os.environ.get('LANE_THREAD') or '-'
     rel = os.path.relpath(os.path.realpath(f), os.path.realpath(mem)) if f is not None else ', '.join(changed)[:200]
     msg = f'memory: {rel}\n\nlane={lane} thread={thread} session={p.get("session_id", "")}'
-    env = {**os.environ, 'GIT_AUTHOR_NAME': lane, 'GIT_AUTHOR_EMAIL': f'{lane}@genesis.lab',
-           'GIT_COMMITTER_NAME': lane, 'GIT_COMMITTER_EMAIL': f'{lane}@genesis.lab'}
+    # lanes-golive (A6): the agent's fleet identity form (lanes.ts gitEmail), the lane or <agent>.main as the name
+    email = os.environ.get('LANES_GIT_EMAIL') or (re.sub(r'[^a-z0-9._-]', '-', agent.lower()) + '@fleet.local')
+    env = {**os.environ, 'GIT_AUTHOR_NAME': lane, 'GIT_AUTHOR_EMAIL': email,
+           'GIT_COMMITTER_NAME': lane, 'GIT_COMMITTER_EMAIL': email}
     subprocess.run(['git', '-C', mem, 'add', '-A'], check=False, env=env)
     r = subprocess.run(['git', '-C', mem, 'commit', '-q', '-m', msg], check=False, env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

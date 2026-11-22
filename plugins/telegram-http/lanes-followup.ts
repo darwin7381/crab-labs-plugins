@@ -65,7 +65,7 @@ export function checkFollowupArgs(a: unknown, pendingInThread: number): { ok: tr
   const after = Number(o.after_minutes)
   const note = typeof o.note === 'string' ? o.note.replace(/\s+/g, ' ').trim() : ''
   if (!Number.isFinite(after) || after < FOLLOWUP_MIN_MINUTES || after > FOLLOWUP_MAX_MINUTES)
-    return { ok: false, error: `after_minutes must be a number from ${FOLLOWUP_MIN_MINUTES} to ${FOLLOWUP_MAX_MINUTES} (simulated minutes from now)` }
+    return { ok: false, error: `after_minutes must be a number from ${FOLLOWUP_MIN_MINUTES} to ${FOLLOWUP_MAX_MINUTES} (minutes from now)` }
   if (!note) return { ok: false, error: 'note is required: what to check again and what to do if the condition still holds' }
   if (pendingInThread >= FOLLOWUP_MAX_PER_THREAD)
     return { ok: false, error: `this thread already has ${pendingInThread} pending follow-ups (max ${FOLLOWUP_MAX_PER_THREAD}); finish, or escalate to the main` }
@@ -81,7 +81,7 @@ export function duePending(all: Record<string, Followup>, nowMs: number): Follow
 export function followupEventText(f: Followup, nowMs: number): string {
   return [
     `[車道事件｜後續檢查 ${f.id}｜thread ${f.thread}｜原事件 ${f.event}]`,
-    `這是這條對話線先前排好的後續檢查，現在（模擬時間 ${simTime(nowMs)}）到時間了；排定時是 ${simTime(Date.parse(f.created))}，要求 ${f.after_minutes} 分鐘後再看。`,
+    `這是這條對話線先前排好的後續檢查，現在（${simTime(nowMs)}）到時間了；排定時是 ${simTime(Date.parse(f.created))}，要求 ${f.after_minutes} 分鐘後再看。`,
     `當時留下的備註：${f.note}`,
     `這是同一件事的再一趟，不是新的事：Joey 已經有這件事的那一句。照備註與 runbook 重新檢查現況：條件還成立，就做可逆的小處理並確認結果（不可逆的事仍然只能 escalate）；真的還需要再等，可以再呼叫一次 followup。`,
     `結果跟上一趟不同（outcome 變了：例如從 changed 變成恢復的 normal，或變成 failed）才用 notify_joey 告訴 Joey，並填 outcome；一樣的結果分流器會拒絕，不必再說。最後呼叫 receipt 收尾（不用再填 run_id：回執上一趟已送），happened / did / promised / needs_main 寫具體的數字與時間。`,

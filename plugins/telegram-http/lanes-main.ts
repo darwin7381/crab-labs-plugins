@@ -67,6 +67,8 @@ export type MainEnv = {
   /** 002v (C04): of these events, the senders of those the router's thread gate stopped (the event record's `stop`): the main's answer to them
    *  in the turn that took the stop in is the last line of that conversation, so the router marks it no_reply ("不用回" is the router's) */
   stoppedPeers?: (events: string[]) => string[]
+  /** lanes-golive (A5): the btcc id of the newest of these events from `peer` that the thread gate stopped (the call the main's answer quotes), or null */
+  stoppedRequest?: (events: string[], peer: string) => string | null
   /** 002w (D): a tool call of the main went through (its PostToolUse): the daemon meets what it completed (a scheduler receipt) */
   toolDone?: (name: string, input: any, response: string, error: boolean) => void
   /** 002w (D): a tool call of the main the daemon refuses before it runs (a scheduler run completed twice): the hook's deny reason, or null */
@@ -88,7 +90,7 @@ export type Turn = { prompt_id: string; started_at: string | null; prev_started_
   items: Array<{ id: string; kind: string; content: string; user: string }>; calls: Array<{ name: string; input: any; result: string; error: boolean }> }
 type AidItem = { mid: string; kind: string; user: string; no_reply: boolean; system: boolean; body: string }
 export type MainReply = { accepted?: boolean; additionalContext?: string; block?: string; turn?: Turn; proposals?: unknown[]; curator?: boolean
-  items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string; deny?: string }
+  items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string; mark_reply_to?: string; deny?: string }
 type Output = { to: string; reply_to: string; text: string }
 
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
@@ -373,15 +375,20 @@ export function createMain(E: MainEnv) {
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
-        let mark: string | undefined
-        if (send && b.tool_input?.no_reply !== true && E.stoppedPeers) {
+        let mark: string | undefined, markReplyTo: string | null = null
+        // lanes-golive (A5): the WO-99 lines. no_reply is a mail field; a call ends a conversation as the answer to a call (reply_to, auto no_reply);
+        // a feed post has no addressee. Already ending (or not a send to anyone): no mark.
+        const line = String(b.tool_input?.line ?? '')
+        const ends = line === 'feed' || (line === 'call' ? !!b.tool_input?.reply_to : b.tool_input?.no_reply === true)
+        if (send && !ends && E.stoppedPeers) {
           // 002v (002s r2 C04, u002s-C04-s2-r2-20261119-215937): the thread gate stopped the conversation and handed its last message to this turn; the
           // main's answer to that peer ends it. "不用回" is the router's to enforce (identity.md), not the model's to remember: the hook marks the send.
           const to = String(b.tool_input?.to ?? '').trim().toLowerCase()
           if (to && E.stoppedPeers(turnWork(g, p).events).includes(to)) mark = `the conversation with ${to} was stopped by the thread gate; this answer ends it`
+          if (mark && line === 'call') { markReplyTo = E.stoppedRequest?.(turnWork(g, p).events, to) ?? null; if (!markReplyTo) mark = undefined }   // a call ends only as an answer (reply_to)
         }
         // PL5: the summary gate judges the reply against this turn; 002w (F, gap 18): its C16 claims check judges a send_to_agent the same way
-        return send || /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p), ...(mark ? { mark_no_reply: mark } : {}) } : {}
+        return send || /__reply$/.test(String(b.tool_name ?? '')) ? { turn: turnOf(J().get('main', g.id)!, p), ...(mark ? { mark_no_reply: mark } : {}), ...(markReplyTo ? { mark_reply_to: markReplyTo } : {}) } : {}
       }
       case 'PostToolUse': {
         if (!p) return {}
@@ -411,7 +418,7 @@ export function createMain(E: MainEnv) {
             const owed = E.mainOwed(t.events)
             if (owed.length) {
               setMain(gen, 'in_turn', { owed_hold: p, owed_events: owed.map(o => o.id) })
-              return { block: `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ./bin/btcc-receipt complete <run> 回執；做完再結束這一輪。` }
+              return { block: `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ~/.claude/tools/btcc-receipt complete <run> 回執；做完再結束這一輪。` }
             }
           }
           const its = t.carried ? [] : t.items.filter(r => r.state === 'bound').map(aidItem), w = t.carried ? work.get(g.id) : undefined
@@ -564,7 +571,8 @@ export function notMainContext(agent: string, reasons: string): string {
 export function mainContext(agent: string, sid: string): string {
   return [
     `[lanes] 你是 ${agent} 的主線（session ${sid} 已登記）。以下是主線專用規則，車道不適用：`,
-    '- Telegram 與分流到主線的 mesh 訊息只會送到你這裡。例行警報、排程、別的 agent 的新話題由反射線（headless 車道）處理；'
+    '- Telegram 與分流到主線的 mesh 訊息只會送到你這裡。排程、警報、別的 agent 的呼叫由反射線（headless 車道）處理；你的信箱由讀信線讀：「讀信箱」提醒不會再送到你這裡，'
+      + '讀信線判斷不了的信會交給你（信還在你的信箱，用 mailbox_open 讀，處理完用 mailbox_check 勾掉）。'
       + '它們做了什麼，會附在下一則交給你的訊息裡（標「車道摘要」；不會為了它單獨叫醒你）。你忙的時候送到的訊息，會在你下一個工具呼叫之後或回合要結束時交給你（標「交給主線」）。'
       + '只有交給你的事（車道用 handoff_main 交接、車道處理失敗、被停掉的對話線）會叫醒你：那件事由你接手，處理完由你回報 Joey 一次。'
       + '摘要裡寫「已通知 Joey」「已請 Joey 決定」的事，車道已經跟他講過了：不要重複通知他，除非你有新的資訊或他問起。其他不必回覆。',
@@ -576,11 +584,12 @@ export function mainContext(agent: string, sid: string): string {
       + '它回傳整天每件事一行的活動清單，包含車道處理掉、沒有叫醒你的例行事。清單裡每一件都要交代到，連同它的具體數字、時間、人名，再補上你自己處理的事。'
       + '某一件的原文用 ledger_query(text=關鍵字)；答應過什麼也可以查 kind=commitment。',
     '- 維護焦點卡 .lanes/focus.md：任務改變時更新，3 到 6 行，寫「目前在做什麼、關鍵限制、別碰什麼」。車道開機時會讀它。',
-    '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Telegram 話題的工作線；fork(task) 開一條帶著你目前脈絡的分身線。',
+    '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Joey 私訊話題的工作線（bot 沒開私訊話題時，它會告訴你，那就自己做）；fork(task) 開一條帶著你目前脈絡的分身線。',
     '- 一件事可以拆成幾塊各自去查：用 fan_out(tasks, conclusion)，每塊開一條查詢線，最後一條綜合線讀完全部、交回你一份結論；你讀的是一份綜合，不是 N 份全文。不要自己一塊一塊查。',
     '- 你答應了別人什麼（給 Joey 或別的 agent「我會…」「…前給你」）：用 commitment(who, what, by, due) 記下；有時限就填 due，到時沒標完成會提醒 Joey。做完用 commitment_done。',
     '- 帳本裡累積了好幾筆記憶提案、你又閒著：用 curate_memory 把寫入權交給一條整理線去整理，做完它自己交還（curate_stop 隨時收回）；單筆提案用 memory_decide 決定。',
-    '- 回報車道交給你的事時照平常用 reply：分流器知道你這一回合在處理哪幾件事（交給你的那幾則），響不響由它依那些事的類別決定，你不用自己判斷。',
+    '- 回報車道交給你的事時照平常用 reply（照現行規則推播：做了什麼就報什麼）。找別隻 agent 照 agent-inbox 的說明用 send_to_agent 的三條線（動態／信／呼叫）。'
+      + '排程的回執照人格檔用 ~/.claude/tools/btcc-receipt complete <run>（一個 run 只會完成一次，車道已完成的會被擋下並告訴你）。',
     '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、memory_history、memory_revert、open_worker、fork、peer_hold）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
     '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。'
       + '記憶目錄是 git：memory_history 看誰在什麼時候改了什麼；要退回某一次改動，用 memory_revert(sha, reason)，不要手動改回去。',

@@ -119,9 +119,10 @@ def main():
                 body['tool_timeout_ms'] = 120000
         if 'btcc-receipt' in str(ti.get('command') or ''):   # 002w (D): the daemon may refuse a second completion of a scheduler run
             body['tool_input'] = {'command': str(ti.get('command'))[:3000]}
-    if ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):   # 002v: the router may mark it no_reply (a stopped conversation)
+    if ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):   # 002v: the router may mark it (a stopped conversation)
         ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
-        body['tool_input'] = {'to': ti.get('to'), 'no_reply': ti.get('no_reply')}
+        # lanes-golive (A5): the WO-99 line decides what ends a conversation (mail: no_reply; call: reply_to; feed has no `to`)
+        body['tool_input'] = {'line': ti.get('line'), 'to': ti.get('to'), 'reply_to': ti.get('reply_to'), 'no_reply': ti.get('no_reply')}
     if ev == 'PostToolUse':                              # every tool: the daemon keeps this turn's calls (reply / send_to_agent keep their to, reply_to, text keys)
         body['tool_input'] = trim_input(p.get('tool_input'))
         tr = p.get('tool_response')
@@ -146,8 +147,15 @@ def main():
         if deny:
             out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': deny}})
         elif r.get('mark_no_reply') and isinstance(p.get('tool_input'), dict):
-            # 002v: updatedInput replaces the whole input (hooks reference, PreToolUse decision control): the main's own input with no_reply set
-            out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'updatedInput': {**p['tool_input'], 'no_reply': True}}})
+            # 002v: updatedInput replaces the whole input (hooks reference, PreToolUse decision control): the main's own input, ended.
+            # lanes-golive (A5): a mail ends with no_reply; a call only as the answer to the stopped call (reply_to: the call line ignores no_reply);
+            # the old shape (no line: a call before WO-99) with no_reply, as before
+            ti, line = p['tool_input'], str(p['tool_input'].get('line') or '')
+            if line == 'call':
+                if r.get('mark_reply_to'):
+                    out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'updatedInput': {**ti, 'reply_to': str(r['mark_reply_to'])}}})
+            elif line != 'feed':
+                out({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'updatedInput': {**ti, 'no_reply': True}}})
     elif ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__reply') and isinstance(r.get('turn'), dict):
         deny = aid('main-summary-gate.py', 'reason', p, r['turn'])
         if deny:

@@ -143,7 +143,7 @@ test('002v C04: PreToolUse of send_to_agent marked by the daemon runs with no_re
   fresh(b => b.tool_name === SEND && b.tool_input?.to === 'eve' ? { mark_no_reply: 'stopped' } : {})
   const o = await hook(w, { hook_event_name: 'PreToolUse', tool_name: SEND, tool_input: input })
   expect(o).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { ...input, no_reply: true } } })
-  expect(posted.at(-1).tool_input).toEqual({ to: 'eve', no_reply: null })
+  expect(posted.at(-1).tool_input).toEqual({ line: 'mail', to: 'eve', reply_to: null, no_reply: null })   // lanes-golive (A5): the line decides the mark
   expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: SEND, tool_input: { ...input, to: 'cain' } })).toBeNull()
   fresh(() => ({ mark_no_reply: 'stopped' }))
   expect(await hook(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } })).toBeNull()

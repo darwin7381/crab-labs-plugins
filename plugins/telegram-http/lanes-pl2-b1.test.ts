@@ -59,7 +59,7 @@ test('L6B1: two restarts by two lanes are two "restart mock-api" actions; the to
   expect(acts.map(r => r.refs.ok)).toEqual([true, true, false])
   for (const r of [...sent, ...acts]) { expect(r.kind).toBe('action'); expect(r.text).toMatch(/^restart mock-api/) }
   expect(acts[2].text).toContain('restart mock-api（沒有成功）')
-  expect(L.LANE_LEDGER_QUERY_DESCRIPTION).toContain('ledger_query(since="-24h", text="restart mock-api")')
+  expect(L.LANE_LEDGER_QUERY_DESCRIPTION).toContain('ledger_query(since="-24h", text="restart <service>")')   // lanes-golive (A6): the example names no lab service
   const tok = { runId: 'x.r1', lane: Object.keys(L.__lanesState().lanes)[0], evId: 'ev', closers: [], critical: false, trigger: 'alert', cls: 'alert', escalated: false, pushed: false } as any
   const out = await L.callLaneTool(tok, 'ledger_query', { since: '-24h', text: 'restart mock-api' })
   expect(out.split('\n').filter(l => l.includes('｜action｜') && l.includes('restart mock-api')).length).toBe(3)

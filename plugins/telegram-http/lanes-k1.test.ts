@@ -36,13 +36,14 @@ test('K1: a lane process is not handed the service address (neither name), thoug
   expect(e.LANE_ID).toBe(d.lane); expect(e.GENESIS_ACTOR).toBe(d.lane); expect(e.LANE_KIND).toBe('reflex'); expect(e.LANES_DIR).toBe(dir)
 })
 
-test('K1: the lane card says in one sentence that services are reached only through ./bin/svc <METHOD> <path>, and ./bin/svc alone prints the catalog', () => {
-  for (const kind of ['reflex', 'worker', 'fork', 'curator', 'synthesis'] as const) {
-    const lines = L.identityCard({ kind }).split('\n').filter(l => l.includes('./bin/svc'))
+// lanes-golive (A6): the fleet has no ./bin/svc (a lab wrapper): the card names the lane's own tools in one line instead, and no ./bin/svc at all
+test('K1 (fleet): the lane card names the lane\'s own tools in one line and no ./bin/svc', () => {
+  for (const kind of ['reflex', 'worker', 'fork', 'curator', 'synthesis', 'mail'] as const) {
+    const card = L.identityCard({ kind })
+    expect(card).not.toContain('./bin/svc')
+    const lines = card.split('\n').filter(l => l.startsWith('- 工具：'))
     expect(lines.length).toBe(1)
-    expect(lines[0]).toContain('只能經由 ./bin/svc <METHOD> <path>')
-    expect(lines[0]).toContain('不帶任何參數的 ./bin/svc 會印出服務目錄')
-    expect(lines[0].split('。').filter(Boolean).length).toBe(1)                     // one sentence
+    expect(lines[0]).toContain('Bash、Read')
   }
   expect(L.identityCard({ kind: 'reflex' })).toBe(L.identityCard({ kind: 'reflex' }))   // still the same text for every lane of a kind (B19)
 })
