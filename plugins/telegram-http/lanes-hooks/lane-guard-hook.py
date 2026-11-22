@@ -628,7 +628,7 @@ def write_policy(cmd, cwd, kind, depth=0):
 
 
 # ---- M3: a scheduler run is completed in one place (lanes.ts completeRun), whichever way the lane asks for it
-# The scheduler card tells the agent to run ./bin/btcc-receipt complete N; a lane also has the receipt tool. Both are the same request: meet the event's
+# The scheduler card tells the agent to run ~/.claude/tools/btcc-receipt complete N (the lab: ./bin/btcc-receipt); a lane also has the receipt tool. Both are the same request: meet the event's
 # receipt obligation for run N, once. The guard hands the CLI's request to the daemon (POST /lane-receipt with the run's token), which completes the run
 # there (or refuses it: already completed), and the command itself does not run. So nothing but the daemon completes a run at the scheduler.
 RECEIPT_CLI = 'btcc-receipt'
@@ -670,7 +670,7 @@ def complete_through_daemon(calls):
             text = f'not completed: call receipt(run_id={c["run_id"]}, outcome=...)'
         said.append(f'run {c["run_id"] or "?"} {text}')
     return ('This command was not run: a lane completes a scheduler run through the router, the same request as the receipt tool, once per run. '
-            + ' | '.join(said) + ' Do not run ./bin/btcc-receipt complete again; run any other part of the command on its own.')
+            + ' | '.join(said) + ' Do not run btcc-receipt complete again; run any other part of the command on its own.')
 
 
 def bash_policy(cmd, cwd, kind):

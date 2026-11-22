@@ -67,3 +67,11 @@ test('A5: the stop mark per line: a mail gets no_reply, a call gets reply_to (th
   reply = { turn: { prompt_id: 'p' }, mark_no_reply: 'stopped' }                         // no stopped call to quote: a call is left as it is
   expect(await hook({ line: 'call', to: 'eve', because: 'b', text: 'x' })).toBeNull()
 })
+
+// lab run 2026-11-23 (sonn-lab, S1): a fleet lane that ran `btcc-receipt complete N` was told 「Do not run ./bin/btcc-receipt complete again」, the lab's path
+test('A6 (lab run 11-23): the guard\'s refusal of a lane\'s receipt CLI names the fleet tool, not the lab\'s ./bin path', () => {
+  const src = require('fs').readFileSync(join(import.meta.dir, 'lanes-hooks', 'lane-guard-hook.py'), 'utf8')
+  const f = src.slice(src.indexOf('def complete_through_daemon('), src.indexOf('def bash_policy('))
+  expect(f).toContain('Do not run btcc-receipt complete again')
+  expect(f).not.toMatch(/\.\/bin\/btcc-receipt/)
+})
