@@ -265,7 +265,10 @@ Fields:
 - `main_sends`: `[{to, ref, at, tier | delivered, prompt}]`: the main's Telegram replies (`to: joey`) and send_to_agent calls made in a turn this
   event's item was bound to that met (or rang) an obligation of this event, or that quote its message. A line that meets nothing is on no event (002p).
 - `router_sends`: `[{to: joey, ref, at, rule}]` (002q, T8-R): a router line about this event, delivered (the asked-restart notice). It meets the
-  event's Joey line still owed (`by: router (asked-restart)`, `ref` = the message id).
+  event's Joey line still owed (`by: router (asked-restart)`, `ref` = the message id). 002y (X-4; 002x T8-R a-r3: 2013 answered by 2014 at
+  1388.88, /restart at 1389.42, notice 2017 still said 「還要處理的話請再說一次」): the notice names only the cut messages whose Joey line is still
+  owed (`mainOwed`, kind `joey`); a cut message the main already answered is closed (`done`, `reason: asked_restart`, like every cut item) without
+  it, and its event gets no `router_sends`. None owed: no notice.
 - `class`: the event's own class, whatever rule routed it (002p): an alert sender's event has its alert rule's class and severity (`critical` for a
   `[P1][critical]`) even when a rule without a class of its own (`default`, the master switch) gave it to the main. 002w (D, gap 17): any sender's
   (`senderRuleOf`: the first rule for that sender with a class of its own): a scheduler's event is `scheduled` wherever it goes, and owes its receipt
@@ -567,7 +570,8 @@ Stop").
 
 1. **An asked restart** (`/restart`, `/kill_stuck`): the items of the cut turn end `done` with `reason: asked_restart`, and Joey gets one line. They are
    not re-given. This is the owner's decision (002j, 5018d39), kept as data. That line is on the events it names (002q, T8-R): delivered, it meets
-   each one's Joey line (`router_sends`).
+   each one's Joey line (`router_sends`). It names only the cut items whose Joey line is still owed (002y, X-4); one the main already answered is
+   closed without it, and with none owed there is no line.
 
 2. **The TUI relay's wall line** (`wallKind`). The relay (system-alert.ts, fleet code that stays) forwards the CLI's own error line from the
    main's pane or transcript. Deferring it to the one wall notice (002l D12) means recognising that line; no signal carries it. This is

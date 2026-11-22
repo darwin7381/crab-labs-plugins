@@ -291,7 +291,8 @@ function mainEnv() {
     mainOwed: (ids: string[]) => ids.flatMap(id => {
       const e = events?.get(id), os = e ? events.mainObs(id) : []
       return e && os.length ? [{ id, from: e.class === 'joey' ? 'Joey' : String(e.from ?? '?'), text: String(e.text ?? ''),
-        owes: [...new Set(os.map(o => o.kind === 'joey' ? '回 Joey 一句' : o.kind === 'peer' ? `回 ${o.to}` : `排程 run ${o.run_id} 的回執`))] }] : []
+        owes: [...new Set(os.map(o => o.kind === 'joey' ? '回 Joey 一句' : o.kind === 'peer' ? `回 ${o.to}` : `排程 run ${o.run_id} 的回執`))],
+        kinds: [...new Set(os.map(o => String(o.kind)))] }] : []                    // 002y (X-4): the same facts, by kind (the asked-restart notice reads joey)
     }),
     // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
     // 002v (002u r1 D02, u002u-D02-s2-r1-20261119-231449): `shown` = a digest that carried the proposal's event reached the main (bound or done): the

@@ -61,7 +61,7 @@ export type MainEnv = {
   owed?: (item: Row) => boolean
   /** 002q (M3), 002w (B): of these events, what the main still owes on each (a Joey line, a peer's answer, a scheduler receipt: handed to it, or open on
    *  what it owns), the rule the lane stop applies to a lane: the Stop check's facts, one entry per event, `owes` naming each */
-  mainOwed?: (events: string[]) => Array<{ id: string; from: string; text: string; owes: string[] }>
+  mainOwed?: (events: string[]) => Array<{ id: string; from: string; text: string; owes: string[]; kinds?: string[] }>
   /** the memory gate's facts (M3): the open Joey-sourced proposals, and whether a curator lane holds the write right */
   memory?: () => { proposals: Array<{ id: string; ts: string; lane: string; text: string }>; curator: boolean }
   /** 002v (C04): of these events, the senders of those the router's thread gate stopped (the event record's `stop`): the main's answer to them
@@ -307,9 +307,16 @@ export function createMain(E: MainEnv) {
     pendingEnd.delete(g.id); lastEventAt.delete(g.id); work.delete(g.id)
     if (stuck?.gen === g.id && !stuck.undelivered) stuck = null              // 002w (E): what nobody could take is still waiting: that episode goes on
     // 002q (T8-R): the notice is the line Joey gets about each cut message, so it is on their events (it meets their Joey line)
+    // 002y (X-4; 002x T8-R a-r3: 2013 answered by msg 2014 at 1388.88, /restart at 1389.42, the notice msg 2017 still said 「還要處理的話請再說一次」):
+    // only a cut message whose Joey line is still owed (M3: mainOwed, kind joey) is named; one the main already answered is closed (done, as every cut
+    // item) without that sentence. An item with no event cannot be judged: it is named, as before. No such message: no notice.
     const told = cut.filter(r => r.kind !== 'digest')
-    if (told.length) E.tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${told.length} 則訊息不會自動交給新的主線：${told.map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart',
-      [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))])
+    const evs = [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))]
+    const owesJoey = E.mainOwed ? new Set(E.mainOwed(evs).filter(x => (x.kinds ?? []).includes('joey')).map(x => x.id)) : null
+    const still = owesJoey ? told.filter(r => !r.event || owesJoey.has(String(r.event))) : told
+    if (still.length) E.tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${still.length} 則訊息不會自動交給新的主線：${still.map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart',
+      [...new Set(still.map(r => String(r.event ?? '')).filter(Boolean))])
+    if (still.length < told.length) E.log('info', `lanes: asked restart of gen ${g.id}: ${told.length - still.length} cut message(s) already answered, closed without the notice`)
     E.log('info', `lanes: main gen ${g.id} gone (${why}); ${back.length} item(s) queued again`)
     try { E.genChanged(null) } catch {}
   }
