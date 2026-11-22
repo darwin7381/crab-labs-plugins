@@ -1,7 +1,10 @@
 // Universe 002l (D11, RV3 G07 #6): the generic menu detector does not take numbered prose for a menu, and one menu is sent to Joey once.
 // design/notify 「分流器同時管頻率上限與去重，同一件事不會連發」. Panes are strings; no tmux.
-import { test, expect } from 'bun:test'
-import { detectStartupPicker, startStartupPickerWatchdog, rearmStartupPicker } from './startup-picker.ts'
+// lanes-golive: these are the lanes daemon's rules (server.ts turns them on with GENESIS_LANES=1); with lanes off the fleet's rule stands (last test).
+import { test, expect, beforeAll, afterAll } from 'bun:test'
+import { detectStartupPicker, startStartupPickerWatchdog, rearmStartupPicker, useLanesMenuRules } from './startup-picker.ts'
+beforeAll(() => useLanesMenuRules(true))
+afterAll(() => useLanesMenuRules(false))
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 3000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(15) } return f() }
 const LIMIT = `\n You've hit your weekly limit · resets 5:48pm (Asia/Taipei)\n\n What do you want to do?\n\n ❯ 1. Wait here, then continue automatically at 5:48 PM\n   2. Upgrade your plan\n   3. Don’t continue automatically\n\n Enter to confirm · Esc to cancel\n`
@@ -32,4 +35,14 @@ test('D11: a generic menu that comes and goes on the pane is sent once; rearmSta
   pane = 'normal prompt\n'; await sleep(60); pane = LIMIT; await sleep(80)
   expect(surfaced.length).toBe(2)                                                          // the rearm was for once
   pane = 'normal prompt\n'
+})
+
+test('lanes-golive: lanes off, the generic menu is the fleet\'s rule (4d7860e): a cursor glyph, ● included, on a numbered option anywhere in the pane', () => {
+  useLanesMenuRules(false)
+  try {
+    expect(detectStartupPicker(LIMIT)?.options.length).toBe(3)
+    expect(detectStartupPicker(SUMMARY)?.key).toMatch(/^generic-/)
+    expect(detectStartupPicker(FAR_UP)?.options.length).toBe(2)
+    expect(detectStartupPicker('\n Pick one\n ● 1. Yes\n   2. No\n')?.options).toEqual(['Yes', 'No'])
+  } finally { useLanesMenuRules(true) }
 })

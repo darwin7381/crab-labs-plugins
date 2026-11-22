@@ -109,6 +109,18 @@ function paneHasPickerCursor(pane: string): boolean {
   return genericMenu(pane) != null
 }
 
+// lanes-golive: the two 002l (D11) rules above (the bottom-of-pane generic menu, and one send per menu per pane) are the lanes daemon's. server.ts turns
+// them on with lanes on (useLanesMenuRules); off (every fleet daemon), the generic menu is the fleet's rule, unchanged since 4d7860e: a cursor glyph
+// (❯ › ▶ ● ○ ◉ >) on a numbered option anywhere in the pane, and a menu that leaves and comes back is sent again.
+let lanesMenuRules = false
+export function useLanesMenuRules(on: boolean): void { lanesMenuRules = on }
+const FLEET_CURSOR_OPTION_LINE = /^\s*[❯›▶●○◉>]\s*\d+\.\s+\S/m
+function fleetGenericMenu(pane: string): string[] | null {
+  if (!FLEET_CURSOR_OPTION_LINE.test(pane)) return null
+  const options = parseOptions(pane)
+  return options.length >= 2 ? options : null
+}
+
 // Best-effort human title: the non-empty line just above the first "1." option
 // (usually the question/prompt), else a generic label.
 function genericPickerTitle(pane: string): string {
@@ -157,7 +169,7 @@ export function detectStartupPicker(pane: string): DetectedPicker | null {
   // LABELS so a stale tap can only ever drive the SAME menu (driveStartupPicker
   // re-checks live.key === expectKey before sending a keystroke → wrong/changed
   // menu = 'gone', nothing sent). New menu shapes now relay automatically.
-  const options = genericMenu(pane)                                     // 002l (D11): the bottom of the pane only, cursor on an option, no input box below
+  const options = lanesMenuRules ? genericMenu(pane) : fleetGenericMenu(pane)   // 002l (D11), lanes only: the bottom of the pane only, cursor on an option, no input box below
   if (options) return { key: `generic-${hash6(options.join('|'))}`, title: genericPickerTitle(pane), options }
   return null
 }
@@ -278,7 +290,7 @@ export function startStartupPickerWatchdog(opts: {
           deferred.delete(t.tmux)
           surfaced.set(t.tmux, true)
           const seen = sentGeneric.get(t.tmux) ?? new Set<string>()
-          if (picker.key.startsWith('generic-') && seen.has(picker.key) && !forced.has(t.tmux)) {
+          if (lanesMenuRules && picker.key.startsWith('generic-') && seen.has(picker.key) && !forced.has(t.tmux)) {
             opts.log('info', `${describePicker(picker, t.tmux)} — already sent to TG once on this pane; not sent again`)
             continue
           }

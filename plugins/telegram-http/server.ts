@@ -68,10 +68,13 @@ import { parseFleetConfig } from './fleet-config.ts'
 // (GENESIS_LANES=1); with it unset the daemon runs the fleet code paths unchanged. In lanes mode nothing here delivers to
 // the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
 import * as Lanes from './lanes.ts'
-import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker } from './startup-picker.ts'
+import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
+
+// lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
+if (Lanes.LANES_ON) useLanesMenuRules(true)
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -304,9 +307,9 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 // code paths typecheck, but polling never starts and no API call is ever made.
 // genesis lab: grammy must use the same API root as callBotApi/file downloads, so a
 // TELEGRAM_API_ROOT mock receives getUpdates/sendMessage too (upstream passes no client option).
-const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!, {
-  client: { apiRoot: process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org' },
-})
+// Unset (every fleet daemon): no client option, the fleet's constructor exactly.
+const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!,
+  process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : undefined)
 let botUsername = ''
 
 type PendingEntry = {
@@ -942,7 +945,8 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
   // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
   // would each read the same parked file before either removed it: the same message delivered twice (fleet record
   // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
-  if (replayRunning) return 0
+  // lanes-golive: lanes only. With lanes off the fleet's replay is unchanged (a candidate fleet fix, for its owner to take).
+  if (Lanes.LANES_ON && replayRunning) return 0
   replayRunning = true
   try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
 }
@@ -1441,7 +1445,7 @@ function buildServer(): Server {
       instructions: INBOX_TEXT,
     } : {
       capabilities: {
-        tools: { listChanged: true },     // 002m (LG1): a session found not to be the main is told to list its tools again
+        tools: Lanes.LANES_ON ? { listChanged: true } : {},     // 002m (LG1): a session found not to be the main is told to list its tools again (lanes only)
         experimental: {
           'claude/channel': {},
           // Permission-relay opt-in (anthropics/claude-cli-internal#23061).
@@ -2054,21 +2058,23 @@ bot.command('help', async ctx => {
 
 // 002k: /lanes — list, close, master switch, notify profile (lanes.ts lanesCommand). Answered by the daemon, never forwarded to a session.
 // 002k: /main renew — hand the main role to a fresh session (lanes.ts mainRenew). Answered by the daemon.
-bot.command('main', async ctx => {
-  const gated = dmCommandGate(ctx)
-  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
-  const sub = (ctx.message?.text ?? '').trim().split(/\s+/)[1] ?? ''
-  if (!Lanes.LANES_ON || sub !== 'renew') { await ctx.reply('用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）'); return }
-  await ctx.reply(await Lanes.mainRenew(ctx.from?.username ?? gated.senderId))
-})
+// lanes-golive: registered only with lanes on; lanes off, /main and /lanes are ordinary messages as in the fleet.
+if (Lanes.LANES_ON) {
+  bot.command('main', async ctx => {
+    const gated = dmCommandGate(ctx)
+    if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+    const sub = (ctx.message?.text ?? '').trim().split(/\s+/)[1] ?? ''
+    if (sub !== 'renew') { await ctx.reply('用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）'); return }
+    await ctx.reply(await Lanes.mainRenew(ctx.from?.username ?? gated.senderId))
+  })
 
-bot.command('lanes', async ctx => {
-  const gated = dmCommandGate(ctx)
-  if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
-  if (!Lanes.LANES_ON) { await ctx.reply('車道沒有開啟（這個 agent 是單一 session）。'); return }
-  const text = await Lanes.lanesCommand(ctx.message?.text ?? '/lanes', ctx.from?.username ?? gated.senderId)
-  await ctx.reply(text)
-})
+  bot.command('lanes', async ctx => {
+    const gated = dmCommandGate(ctx)
+    if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
+    const text = await Lanes.lanesCommand(ctx.message?.text ?? '/lanes', ctx.from?.username ?? gated.senderId)
+    await ctx.reply(text)
+  })
+}
 
 bot.command('status', async ctx => {
   const gated = dmCommandGate(ctx)
@@ -3020,7 +3026,7 @@ function stampDid(notif: { method: string; params: unknown }): void {
   } catch {}
 }
 function broadcastNotification(notif: { method: string; params: unknown }): void {
-  stampDid(notif)
+  if (Lanes.LANES_ON) stampDid(notif)      // lanes-golive: lanes only; lanes off, the <channel> tag carries exactly the fleet's meta
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
     persistInbound(notif)
