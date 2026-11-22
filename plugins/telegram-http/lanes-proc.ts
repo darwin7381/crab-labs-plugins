@@ -16,7 +16,7 @@
  * (a session whose process is not known is not judged not-the-main; a session id no known process holds is free). Another platform: every fact unknown.
  * PURE parsers (lsofPeerPid, psFirstLine, psRows, sessionPidsOf) take the commands' output, so tests run them on recorded output.
  */
-import { readFileSync, readdirSync, readlinkSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, readlinkSync } from 'fs'
 import { spawnSync } from 'child_process'
 
 export type ProcFacts = {
@@ -31,9 +31,18 @@ export type ProcFacts = {
 export type Run = (cmd: string, args: string[]) => string | null
 
 const RUN_TIMEOUT_MS = 3_000
+/** lanes-golive (lab run 11-23): the system tools are run by their absolute path. macOS keeps lsof in /usr/sbin, which no fleet daemon's PATH has
+ *  (launchd plists: ~/.bun/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin): spawnSync('lsof') was ENOENT, every peerPid unknown, and the main was never
+ *  mapped to its MCP stream (it stayed 'starting' and was offered nothing). A bare name is looked up in the system directories first, then left to PATH. */
+const SYS_DIRS = ['/usr/sbin', '/usr/bin', '/bin', '/sbin']
+export function resolveBin(cmd: string, exists: (p: string) => boolean = existsSync): string {
+  if (cmd.includes('/')) return cmd
+  for (const d of SYS_DIRS) if (exists(`${d}/${cmd}`)) return `${d}/${cmd}`
+  return cmd
+}
 export const runCmd: Run = (cmd, args) => {
   try {
-    const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: RUN_TIMEOUT_MS, env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] })
+    const r = spawnSync(resolveBin(cmd), args, { encoding: 'utf8', timeout: RUN_TIMEOUT_MS, env: { ...process.env, LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] })
     return r.error || r.signal ? null : String(r.stdout ?? '')
   } catch { return null }
 }
