@@ -37,7 +37,7 @@ test('S0: while a lane process runs, its session id is locked; the lock goes wit
 
 test('S0: another process resuming the lane\'s session id (not started by this daemon) holds back the lane\'s next run until it is gone; nothing is lost', async () => {
   const lane = Object.values(st.lanes)[0]
-  const fake = spawn('/bin/sh', ['-c', 'sleep 1.5', 'claude', '--resume', lane.session_id], { stdio: 'ignore' })   // argv carries "--resume <sid>"
+  const fake = spawn('/bin/sh', ['-c', 'sleep 1.5; :', 'claude', '--resume', lane.session_id], { stdio: 'ignore' })   // argv carries "--resume <sid>" (two commands: macOS sh would exec a lone sleep and drop it)
   strays.push(fake)
   await sleep(100)
   expect(L.sessionHolder(lane.session_id)).toBe(fake.pid!)

@@ -194,7 +194,9 @@ def curator_write(tool, ti, rp):
 def claimed_by():
     try:
         st = json.load(open(os.path.join(os.environ.get('LANES_DIR', ''), 'state.json'), encoding='utf-8'))
-        return {k: v.get('lane') for k, v in (st.get('claims') or {}).items()}
+        # keyed by real path, like the paths they are compared with (os.path.realpath below): lanes.ts writes the resolved path,
+        # which on macOS can sit under a symlink (/var -> /private/var, /tmp -> /private/tmp); lanes-golive
+        return {os.path.realpath(k): v.get('lane') for k, v in (st.get('claims') or {}).items()}
     except (OSError, ValueError):
         return {}
 

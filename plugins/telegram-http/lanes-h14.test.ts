@@ -100,7 +100,7 @@ test('H14: the queue cap counts the peer\'s queued and running events, also for 
   expect(r.rule).toBe('peer-flood'); expect(st.flood!.dan.episode!.reasons).toEqual({ queue: 3 })    // not a new thread, but the peer already has 3 open
   delete process.env.LANES_PEER_NEW_PER_MIN; delete process.env.LANES_PEER_MAX_OPEN
   await until(() => rows('lanes.jsonl').filter(x => x.kind === 'exit').length >= 8, 12000)
-})
+}, 20000)   // lanes-golive: it waits up to 12 s for the runs to end (5.4 s on a Mac), like the D1 test below
 
 test('002l D1: there is no per-peer token budget (the design\'s budget is per conversation): a peer whose lanes re-read 600k still gets a lane for its next new conversation, whatever LANES_PEER_BUDGET says', async () => {
   writeFileSync(join(dir, 'mode'), 'tokens')
