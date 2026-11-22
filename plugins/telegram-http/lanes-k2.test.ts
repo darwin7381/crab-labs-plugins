@@ -182,12 +182,21 @@ test('K2: the inbox daemon\'s checkPeerSend returns the refusal, and null (the s
   expect(await none.checkPeerSend('main', 'eve', 'hello')).toBeNull()
 })
 
-test('K2: server.ts asks before it sends: checkPeerSend comes before sendToAgent in the main\'s send_to_agent path, and a refusal is an isError tool result', () => {
+// lanes-golive: the main's send_to_agent is the WO-99 tool now (callInboxTool, three lines); in lanes mode its call line runs through laneMainDeps in
+// server.ts. The 002k shape this test read (an inline send_to_agent handler) is gone; the same two facts are checked on the new path.
+test('K2: server.ts asks before it sends: checkPeerSend comes before sendToAgent in the main\'s send_to_agent path, and a refusal is an isError tool result', async () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'latin1')
-  const block = src.slice(src.indexOf("if (INBOX_ONLY && req.params.name === 'send_to_agent')"))
-  const iCheck = block.indexOf("Lanes.checkPeerSend('main'"), iSend = block.indexOf('await sendToAgent(String(args.to')
+  const block = src.slice(src.indexOf('function laneMainDeps('))
+  const iCheck = block.indexOf("Lanes.checkPeerSend('main'"), iSend = block.indexOf('await sendToAgent(to, text')
   expect(iCheck).toBeGreaterThan(0); expect(iSend).toBeGreaterThan(iCheck)
-  expect(block.slice(iCheck, iCheck + 260)).toContain('isError: true')
+  expect(block.slice(iCheck, iCheck + 160)).toContain('if (refused) return refused')
+  expect(src).toContain('callInboxTool(req.params.name, args, Lanes.LANES_ON ? laneMainDeps(args) : fleetDeps, A2A_LEGACY)')
+  // the refusal text the call rail returns is not "delivered…", so callInboxTool hands it back as an isError result
+  const { callInboxTool } = await import('./fleet-mail.ts')
+  const refusal = 'send_to_agent blocked - nothing was sent: x'
+  const deps = { call: async () => refusal, btcc: async () => ({ status: 500, json: {} }), core: async () => ({ status: 500, json: {} }) }
+  const r: any = await callInboxTool('send_to_agent', { line: 'call', to: 'eve', because: 'Joey is waiting', text: 'hello' }, deps as any, true)
+  expect(r.isError).toBe(true); expect(r.content[0].text).toBe(refusal)
 })
 
 test('K2: a lane\'s once belongs to its run (like A3): a later run of the same lane to the same peer is checked afresh; the second send is logged as the once', async () => {
