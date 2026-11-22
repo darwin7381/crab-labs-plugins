@@ -23,3 +23,6 @@ process.env.LANES_CLAUDE_BIN ??= `${import.meta.dir}/test-fixtures/no-claude.sh`
 process.env.LANES_NOTIFY_PROFILE ??= 'tiered'
 // lanes-golive: worker / fork lanes have no Agent tool on the fleet (no sub-agents in a lane); the lab suite specifies the K3 tool, so it runs with it on
 process.env.LANES_WORKER_AGENT_TOOL ??= '1'
+// lanes-golive (release): the lab tests read the Genesis lab's router (universes/002/router.json); a copy lives in test-fixtures so `bun test` needs no
+// file outside the repo. LANES_TEST_ROUTER still overrides it.
+process.env.LANES_TEST_ROUTER ??= `${import.meta.dir}/test-fixtures/lab-router.json`

@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "doc": "Universe 002 router (DESIGN-002 §2). Evaluated in order, first match wins; predicates are a fixed vocabulary interpreted by lanes.ts (no model call). Nothing matched → main (= today's behaviour).",
+  "alert_senders": [
+    "alert-dispatcher"
+  ],
+  "rules": [
+    {
+      "id": "tg-quote-lane",
+      "match": {
+        "source": "telegram",
+        "quotes_lane_message": true
+      },
+      "to": "quoted_lane",
+      "trigger": "joey"
+    },
+    {
+      "id": "tg-worker-topic",
+      "match": {
+        "source": "telegram",
+        "in_worker_topic": true
+      },
+      "to": "topic_worker",
+      "trigger": "joey"
+    },
+    {
+      "id": "tg-main",
+      "match": {
+        "source": "telegram"
+      },
+      "to": "main"
+    },
+    {
+      "id": "mesh-no-reply",
+      "match": {
+        "source": "mesh",
+        "no_reply": true,
+        "not_alert": true
+      },
+      "to": "ledger",
+      "trigger": "no_reply"
+    },
+    {
+      "id": "mesh-scheduled",
+      "match": {
+        "source": "mesh",
+        "text_prefix": "[scheduled]",
+        "from": [
+          "scheduler"
+        ],
+        "verified": true
+      },
+      "to": "reflex",
+      "trigger": "scheduled"
+    },
+    {
+      "id": "mesh-alert",
+      "match": {
+        "source": "mesh",
+        "from": [
+          "alert-dispatcher"
+        ],
+        "verified": true
+      },
+      "to": "reflex",
+      "critical_regex": "^\\s*\\[(P0|P1|critical)\\]|嚴重|critical",
+      "trigger": "alert",
+      "info_regex": "^\\s*\\[(P3|P4|info)\\]|\\[info\\]"
+    },
+    {
+      "id": "mesh-board",
+      "match": {
+        "source": "mesh",
+        "text_regex": "^\\s*\\[board\\]\\[WO-\\d+\\]"
+      },
+      "to": "worker_for_ticket",
+      "trigger": "board"
+    },
+    {
+      "id": "mesh-thread",
+      "match": {
+        "source": "mesh",
+        "thread_known": true
+      },
+      "to": "thread_owner",
+      "trigger": "thread"
+    },
+    {
+      "id": "mesh-peer-new",
+      "match": {
+        "source": "mesh",
+        "from_agent": true
+      },
+      "to": "reflex",
+      "trigger": "peer"
+    },
+    {
+      "id": "default",
+      "match": {},
+      "to": "main"
+    }
+  ],
+  "notify": {
+    "doc": "Spec v3, stricter option (design/notify.md 「分級由分流器依訊息類型決定，不靠各條線自己判斷」; genesis/conditions 「依事件類別，以及車道有沒有用『升級』」). The router alone sets the tier of every lane message to Joey: classes[<event class>][plain|escalated]. Event class = the routing rule's trigger (rules[].trigger; -critical / -info when critical_regex / info_regex match); lanes opened by the main get their lane kind (worker, fork); a reflex lane without a trigger = 'other' → default. 'escalated' = the lane called escalate() earlier in the same run; an escalated run that sent no push gets the escalation text pushed by the router at exit (exactly one push). Lanes declare nothing (notify_joey(text) has no tier/kind argument). no_reply notices never reach a lane: rule mesh-no-reply → ledger, no session. The main's own messages are not routed here.",
+    "classes": {
+      "alert-critical": {
+        "plain": "push",
+        "escalated": "push",
+        "why": "P0/P1/critical alert (critical_regex)"
+      },
+      "joey": {
+        "plain": "push",
+        "escalated": "push",
+        "why": "reply to a Joey-originated request (Joey quoted a lane message / wrote in a worker topic)"
+      },
+      "worker": {
+        "plain": "push",
+        "escalated": "push",
+        "why": "worker lane opened by the main (open_worker) in Joey's DM topic: its reports answer the request the main delegated (not named in spec v3; classified as a Joey-originated request)"
+      },
+      "scheduled": {
+        "plain": "silent",
+        "escalated": "push",
+        "why": "routine scheduler run"
+      },
+      "peer": {
+        "plain": "silent",
+        "escalated": "push",
+        "why": "peer agent's new topic: peer result"
+      },
+      "thread": {
+        "plain": "silent",
+        "escalated": "push",
+        "inherit": "asking_run",
+        "why": "peer reply in a lane's thread: peer result, unless it answers a question the lane asked while serving another class (then that class, e.g. joey → push)"
+      },
+      "board": {
+        "plain": "silent",
+        "escalated": "push",
+        "why": "[board][WO-n] ticket (peer/board work)"
+      },
+      "alert": {
+        "plain": "silent",
+        "escalated": "push",
+        "why": "non-critical alert (P2/warning, unmarked): routine alert 例行警報"
+      },
+      "alert-info": {
+        "plain": "silent",
+        "escalated": "push",
+        "why": "P3/P4/info alert"
+      },
+      "fork": {
+        "plain": "silent",
+        "escalated": "push",
+        "why": "fork lane opened by the main: its result also reaches the main's digest"
+      },
+      "no_reply": {
+        "plain": "ledger",
+        "escalated": "ledger",
+        "why": "no_reply notice: ledger only, no session (rule mesh-no-reply)"
+      }
+    },
+    "default": {
+      "plain": "push",
+      "escalated": "push"
+    },
+    "limits": {
+      "push_per_thread": 1,
+      "window_minutes": 10,
+      "over_limit_tier": "silent",
+      "cap_exempt_escalated": true,
+      "cap_exempt_classes": [
+        "joey"
+      ],
+      "dedupe_minutes": 10,
+      "doc": "「分流器同時管頻率上限與去重」: ≤1 push per thread per 10 min, further pushes go silent; escalated runs and replies to Joey are exempt (the cap is for machine-originated repeats); the same text from the same thread within 10 min is suppressed."
+    }
+  }
+}
