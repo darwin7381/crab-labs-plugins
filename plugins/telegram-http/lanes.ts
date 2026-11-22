@@ -27,7 +27,7 @@ import { createMain, mainContext, type MainApi, type ItemKind, type Via } from '
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
-import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, type TriageAsk } from './lanes-triage.ts'
+import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
 import { randomBytes, randomUUID } from 'crypto'
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync,
@@ -90,7 +90,10 @@ export function transcriptUsage(path: string, ids: Iterable<string>): Map<string
   return out
 }
 const RESUME_MAX_AGE_MS = Number(process.env.LANES_RESUME_MAX_AGE_MS ?? 24 * 3600_000)
-const MODEL = process.env.LANES_MODEL ?? 'claude-opus-5-5'
+// lanes-golive: the lane model's fleet default is Sonnet 5.5 (configurable, LANES_MODEL); the lab ran Haiku 5.5, the merged code Opus 5.5
+export const LANE_MODEL_DEFAULT = 'claude-sonnet-5-5'
+const MODEL = process.env.LANES_MODEL || LANE_MODEL_DEFAULT
+export const laneModel = (): string => MODEL
 let CLAUDE_BIN = process.env.LANES_CLAUDE_BIN ?? 'claude'
 const MAX_ATTEMPTS = 3
 // 002f: a lane run the daemon SAW die is dispatched again after attempt × this (it used to wait for the 2-minute lease)
@@ -214,6 +217,7 @@ const shortId = () => randomBytes(3).toString('hex')
 export function lanesInit(deps: LanesDeps): void {
   D = deps
   LANES_DIR = process.env.LANES_DIR ?? join(deps.workspaceDir, '.lanes')
+  setJevKeyDefault(join(deps.workspaceDir, '.secrets', 'typesafe.env'))      // lanes-golive: the fleet's key place (the agent's workspace .secrets)
   for (const d of ['', 'run']) mkdirSync(join(LANES_DIR, d), { recursive: true, mode: 0o700 })
   if (deps.role === 'tg') {
     loadState()

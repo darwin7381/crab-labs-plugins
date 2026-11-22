@@ -84,7 +84,9 @@ def lane_items(text):
 JEV = os.environ.get('SUMMARY_GATE_JEV') == '1'
 MODEL = os.environ.get('TYPESAFE_DEFAULT_MODEL', 'jev-1.14.0')
 API = os.environ.get('TYPESAFE_BASE_URL', 'https://api.typesafe.ai').rstrip('/') + '/v1/systemone'
-KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE', os.path.expanduser('~/.genesis/typesafe.env'))
+# lanes-golive: the fleet's key place is the agent's workspace .secrets/typesafe.env (Claude Code runs a hook with CLAUDE_PROJECT_DIR = the workspace);
+# TYPESAFE_API_KEY / TYPESAFE_KEY_FILE win. The lab's ~/.genesis/typesafe.env is not read.
+KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE') or os.path.join(os.environ.get('CLAUDE_PROJECT_DIR') or os.getcwd(), '.secrets', 'typesafe.env')
 STATED_CONF, CONTRA_CONF = 0.7, 0.8
 T_START = time.monotonic()
 BUDGET_S = float(os.environ.get('SUMMARY_GATE_BUDGET_S', '17'))        # the hook's own time limit in the main's settings is 20 s: the Jev calls of one run share this

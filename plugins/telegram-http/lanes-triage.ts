@@ -47,11 +47,17 @@ export function jevLog(lanesDir: string, rec: JevCall): void {
 }
 const clip = (s: unknown, n = 200): string => String(s ?? '').slice(0, n)
 
+// lanes-golive: where the Jev key is read. The fleet registers a TypeSafe key per agent in its workspace: <workspace>/.secrets/typesafe.env (600, line
+// TYPESAFE_API_KEY=…; ~/infra/log.md: Plutus 11-14, the newsflash line 11-15, Angelia's 11-02 rotation). TYPESAFE_API_KEY, then TYPESAFE_KEY_FILE, still
+// win. The lab's ~/.genesis/typesafe.env is not read. lanesInit sets the default from the agent's workspace; before that it is the daemon's AGENT_WORKSPACE_DIR.
+let KEY_FILE_DEFAULT = join(process.env.AGENT_WORKSPACE_DIR || process.cwd(), '.secrets', 'typesafe.env')
+export function setJevKeyDefault(path: string): void { KEY_FILE_DEFAULT = path }
+export const jevKeyFile = (): string => process.env.TYPESAFE_KEY_FILE || KEY_FILE_DEFAULT
 function loadKey(): string | null {
   const k = (process.env.TYPESAFE_API_KEY ?? '').trim()
   if (k) return k
   try {
-    for (let line of readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').split('\n')) {
+    for (let line of readFileSync(jevKeyFile(), 'utf8').split('\n')) {
       line = line.trim().replace(/^export\s+/, '')
       if (line.startsWith('TYPESAFE_API_KEY=')) return line.slice('TYPESAFE_API_KEY='.length).trim().replace(/^["']|["']$/g, '') || null
     }

@@ -37,7 +37,9 @@ BODY_MAX, OUT_MAX = 1500, 2000
 YES, NO = 0.7, 0.35                      # starting points (official cookbooks); calibrate on run/answered-gate.jsonl
 MODEL = os.environ.get('TYPESAFE_DEFAULT_MODEL', 'jev-1.14.0')
 API = os.environ.get('TYPESAFE_BASE_URL', 'https://api.typesafe.ai').rstrip('/') + '/v1/systemone'
-KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE', os.path.expanduser('~/.genesis/typesafe.env'))
+# lanes-golive: the fleet's key place is the agent's workspace .secrets/typesafe.env (Claude Code runs a hook with CLAUDE_PROJECT_DIR = the workspace);
+# TYPESAFE_API_KEY / TYPESAFE_KEY_FILE win. The lab's ~/.genesis/typesafe.env is not read.
+KEY_FILE = os.environ.get('TYPESAFE_KEY_FILE') or os.path.join(os.environ.get('CLAUDE_PROJECT_DIR') or os.getcwd(), '.secrets', 'typesafe.env')
 TIMEOUT_S = float(os.environ.get('ANSWERED_GATE_TIMEOUT_S', '6'))
 UNSENT_MIN = 40                          # a final text shorter than this states no result
 UNSENT_P = float(os.environ.get('ANSWERED_GATE_UNSENT_P', '0.6'))
