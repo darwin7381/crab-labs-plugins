@@ -1193,7 +1193,9 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       const key = `WO-${wo}`
       let lane = S.tickets[key] ? S.lanes[S.tickets[key]] : undefined
       if (!lane || lane.status === 'closed') {
-        lane = await openWorkerLane(`工單 ${key}`, `工單 ${key} 由分流器開線`)
+        const opened = await openWorkerLane(`工單 ${key}`, `工單 ${key} 由分流器開線`)
+        if (!opened) return { ...base, target: 'main', note: `no worker topic for ${key} (topic mode off or refused): the main does the work` }
+        lane = opened
         S.tickets[key] = lane.id; saveState()
       }
       return dispatch(ev, lane, base)
@@ -4193,9 +4195,17 @@ export function mainToolDefs(): any[] {
 }
 export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'memory_history', 'memory_revert', 'peer_hold'].includes(name) }
 
-async function openWorkerLane(title: string, brief: string): Promise<Lane> {
+/** lanes-golive: a worker lane bound to a new topic in Joey's private chat (createForumTopic with his user id; Bot API 10.5 private-chat topics), or null when
+ *  the bot cannot open one (LANES_WORKER_TOPICS=off, no Telegram in this daemon, or the API refused: topic mode off): then the main does the work. */
+async function openWorkerLane(title: string, brief: string): Promise<Lane | null> {
   let topic: number | undefined
-  if (D.createTopic && D.joeyChatId) topic = await D.createTopic(D.joeyChatId(), title.slice(0, 120))
+  if ((process.env.LANES_WORKER_TOPICS ?? 'auto').trim() === 'off' || !D.createTopic || !D.joeyChatId || !D.joeyChatId()) return null
+  try { topic = await D.createTopic(D.joeyChatId(), title.slice(0, 120)) } catch (e) {
+    D.log('warn', `lanes: no worker topic for 「${title.slice(0, 60)}」 (${String(e).slice(0, 160)}): the main does the work`)
+    ledger({ lane: 'router', kind: 'fyi', text: `開不了工作線的話題（${String(e).slice(0, 120)}）：「${title.slice(0, 80)}」交給主線做。`, refs: { topics: 'off' } })
+    return null
+  }
+  if (topic == null) return null
   const lane = newLane('worker', { title, topic })
   if (topic != null) S.topics[String(topic)] = lane.id
   S.threads[lane.thread].peer = null
@@ -4328,6 +4338,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const title = String(a.title ?? '').trim(), brief = String(a.brief ?? '').trim()
       if (!title || !brief) return 'open_worker needs title and brief'
       const lane = await openWorkerLane(title, brief)
+      if (!lane) return 'refused: this bot cannot open a topic in Joey\'s private chat now (its topic mode is off, or Telegram refused). Nothing was opened: do the work yourself, or fork(task) for a side task.'
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: brief, meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線交辦｜工作線開啟]\n任務標題：${title}\n主線的簡報：\n${brief}\n\n先在話題裡用 notify_joey 跟 Joey 打個招呼並說明你接下來要做什麼，然後開始做。` }
       enqueue(ev, lane.id, 3)

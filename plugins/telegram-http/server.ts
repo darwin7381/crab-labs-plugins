@@ -1425,6 +1425,20 @@ async function laneHubPush(n: { method: string; params: unknown }): Promise<numb
   return d ? 1 : 0
 }
 
+// lanes-golive: private-chat topics for worker lanes (Bot API 10.5, 2026-11-22: a bot turns topic mode on with setMySettings has_topics_enabled=true;
+// getMe reports has_topics_enabled). LANES_WORKER_TOPICS: auto (default: use topics, a failed createForumTopic falls back to the main) | enable (turn
+// the bot's topic mode on at start if it is off, then as auto) | off (never: every worker task is the main's). Nothing is changed unless `enable`.
+async function laneTopicsAtStart(me: Record<string, unknown>): Promise<void> {
+  const mode = (process.env.LANES_WORKER_TOPICS ?? 'auto').trim()
+  try {
+    if (mode === 'enable' && me.has_topics_enabled !== true) {
+      await (bot.api.raw as any).setMySettings({ has_topics_enabled: true })
+      me = (await bot.api.getMe()) as unknown as Record<string, unknown>
+    }
+    log('info', `lanes: worker topics ${mode} (getMe has_topics_enabled=${String(me.has_topics_enabled)})`)
+  } catch (e) { log('warn', `lanes: worker topics (${mode}): ${String(e).slice(0, 200)}`) }
+}
+
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
@@ -2857,7 +2871,8 @@ async function handleInbound(
     } : {}),
     ...(voiceTranscript ? { voice_transcript: voiceTranscript } : {}),
     // 002: the topic a message was sent in (worker lanes are bound to topics)
-    ...(Lanes.LANES_ON && (ctx.message as any)?.message_thread_id != null ? { message_thread_id: String((ctx.message as any).message_thread_id) } : {}),
+    // lanes-golive: a message inside a private-chat topic (Bot API 9.3+/10.5: is_topic_message, message_thread_id) belongs to that topic's worker lane
+    ...(Lanes.LANES_ON && (ctx.message as any)?.message_thread_id != null && (ctx.message as any)?.is_topic_message !== false ? { message_thread_id: String((ctx.message as any).message_thread_id) } : {}),
     // Reply-root / forward-origin / album context (2026-07-10) — see
     // replyForwardMeta. Without these the agent couldn't tell WHAT was
     // being replied to, WHO originally wrote a forwarded message, or
@@ -3305,6 +3320,7 @@ async function pollLoop(): Promise<void> {
           attempt = 0
           botUsername = info.username
           log('info', `polling as @${info.username}`)
+          if (Lanes.LANES_ON && !INBOX_ONLY) void laneTopicsAtStart(info as unknown as Record<string, unknown>)
           // Baseline commands (everyone gets these). Channel-bot mode
           // appends the TUI-control commands so /resume_list, /restart,
           // etc. appear in Telegram's autocomplete.
@@ -3601,6 +3617,7 @@ if (Lanes.LANES_ON) {
         })
         return m.message_id
       },
+      // lanes-golive: a worker lane's topic in Joey's private chat (Bot API: the bot's topic mode on, createForumTopic with the user's chat id)
       createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
       joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
     }),
