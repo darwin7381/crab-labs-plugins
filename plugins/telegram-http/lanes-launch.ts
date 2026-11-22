@@ -51,6 +51,7 @@ export function mainSettings(python = process.env.LANES_PYTHON || 'python3', plu
       Stop: main(30),
       StopFailure: main(15),
       SessionEnd: main(2),
+      PreCompact: main(5),          // a compaction: the main-only rules go with the next prompt again
     },
   }
 }

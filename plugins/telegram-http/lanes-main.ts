@@ -368,7 +368,21 @@ export function createMain(E: MainEnv) {
     if (b.sub) return {}                                                    // in an open turn: a sign of life (and the all-clear), nothing else
     const p = String(b.prompt_id ?? '')
     switch (ev) {
-      case 'UserPromptSubmit': if (p) beginTurn(g, p, b.dids); return {}
+      case 'UserPromptSubmit': {
+        if (p) beginTurn(g, p, b.dids)
+        // lanes-golive (Chiron line8-delivery-20261122: on --resume a SessionStart hook's context reached the conversation in 25 of 334 resumes; startup, clear
+        // and compact do get it): the main-only rules go with the session's first prompt (a typed one, or a delivered item's) when its SessionStart could
+        // not carry them, and again after a compaction (PreCompact clears the mark). Once per session.
+        const row = J().get('main', g.id)!
+        if (row.rules_shown === row.session_id) return {}
+        setMain(row, row.state as MainPhase, { rules_shown: row.session_id })
+        return { additionalContext: E.context(E.agent, String(row.session_id)) }
+      }
+      case 'PreCompact': {
+        const row = J().get('main', g.id)!
+        if (row.rules_shown) setMain(row, row.state as MainPhase, { rules_shown: null })    // the compacted conversation needs the rules again
+        return {}
+      }
       case 'PreToolUse': {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
@@ -486,14 +500,17 @@ export function createMain(E: MainEnv) {
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const carry = ended.length ? { wall_since: ended.map(r => String(r.wall_since)).sort()[0], wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, probes: null, retry_at: null, wall_menu: null })
-    J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null, ...carry })
+    // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
+    // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)
+    const carried = ['startup', 'clear', 'compact'].includes(String(b.source ?? ''))
+    J().write('main', id, E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? null, source: b.source ?? null, prompt_id: null, tool_open: null, end_reason: null, stopped_prompt: null, rules_shown: carried ? sid : null, ...carry })
     cur = id
     lastEventAt.set(id, Date.now())
     try { E.expect?.(sid) } catch {}                                       // 002v: the main's session now (a /clear changed it): the next launch's id
     E.log('info', `lanes: main gen ${id} (session ${sid}, ${b.source ?? 'startup'})`)
     try { E.genChanged(pid) } catch {}
     void pump()
-    return { accepted: true, additionalContext: E.context(E.agent, sid) }
+    return carried ? { accepted: true, additionalContext: E.context(E.agent, sid) } : { accepted: true }
   }
   /** the tg daemon's MCP stream of the main opened: a starting gen can now be offered */
   function streamOpened(pid: number): void {

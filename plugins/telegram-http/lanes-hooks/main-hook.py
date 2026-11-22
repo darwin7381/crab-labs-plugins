@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The main's one hook (lanes M1 + M2; docs/state-journal.md).
 
-Register it for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, StopFailure and SessionEnd (matcher "" each). It posts
+Register it for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, StopFailure, SessionEnd and PreCompact (matcher "" each). It posts
 every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopback MCP token) and prints what the daemon answers:
   SessionStart  the registration: the main-only rules, or "you are not the main"
   PreToolUse    on the reply tool (…__reply): the summary gate (main-summary-gate.py reason(p, turn)) over the `turn` the daemon answers;
@@ -137,6 +137,8 @@ def main():
     r = post(body, 1.2 if ev == 'SessionEnd' else 10)
     if ev == 'SessionStart' and r.get('additionalContext'):
         out({'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': r['additionalContext']}})
+    elif ev == 'UserPromptSubmit' and r.get('additionalContext'):   # lanes-golive: the main-only rules of a resumed session (its SessionStart context is lost)
+        out({'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': r['additionalContext']}})
     elif ev == 'PostToolUse' and r.get('additionalContext'):
         out({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': r['additionalContext']}})
     elif ev == 'PreToolUse' and r.get('deny'):               # 002w (D): the daemon refuses this call (a scheduler run is completed once)
