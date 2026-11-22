@@ -940,6 +940,13 @@ function sweepDeliveries(): void {
   }
 }
 
+/** lanes-golive (C3): a parked notification, given to the router again (true = it took it): a Telegram message of Joey's in the tg daemon through
+ *  dispatchInbound (routeEvent, and the main through the one builder if the router throws); anything else as a mesh event */
+async function laneRedeliver(notif: { method: string; params: unknown }): Promise<boolean> {
+  const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
+  if (!INBOX_ONLY && meta.via !== 'local-inject') { await dispatchInbound(String(meta.chat_id ?? loadAccess().allowFrom[0] ?? ''), notif); return true }
+  return (await laneDeliverMesh(notif, undefined, false)) != null
+}
 let replayRunning = false
 async function replayPendingFromDisk(server: Server): Promise<number> {
   // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
@@ -979,8 +986,13 @@ async function replayPendingFromDiskLocked(server: Server): Promise<number> {
       continue
     }
     try {
-      await server.notification(notif as Parameters<Server['notification']>[0])
-      recordDelivery(notif)
+      if (Lanes.LANES_ON) {
+        // lanes-golive (C3): a parked delivery goes back through the one entrance (the router), never straight into whichever session is open
+        if (!(await laneRedeliver(notif))) break
+      } else {
+        await server.notification(notif as Parameters<Server['notification']>[0])
+        recordDelivery(notif)
+      }
       try { rmSync(fullPath) } catch {}
       replayed++
     } catch (err) {
@@ -1189,12 +1201,16 @@ if (hubMode.on) {
   hub = new HubSync({
     base: BTCC_API_BASE,
     auth: meshAuth,
-    push: pushToReadySessions,
+    // lanes-golive (C3): with lanes on the hub's rows go to the router (the one entrance into the main), never straight into a session; a row the
+    // router could not be asked about stays at the hub (0 = nobody took it) for the next sync
+    push: Lanes.LANES_ON ? laneHubPush : pushToReadySessions,
     seenLines: since => consumptionCheckAvailable() ? recentReceiptLines(TRANSCRIPT_DIR, since) : [],
     dispatchOld: (chatId, notif) => dispatchInbound(chatId, notif),
     defaultChatId: () => String(loadAccess().allowFrom[0] ?? 'local-inject'),
     log,
-  }, { stateDir: STATE_DIR, receiptCheck: () => RECEIPT_CHECK && consumptionCheckAvailable(), graceMs: RECEIPT_GRACE_MS,
+  // lanes-golive (C3): with lanes on, taken = the router accepted the row (it is on the lanes journal; M1 owns its delivery to the main), so no
+  // transcript receipt is waited for: one count per delivery
+  }, { stateDir: STATE_DIR, receiptCheck: () => !Lanes.LANES_ON && RECEIPT_CHECK && consumptionCheckAvailable(), graceMs: RECEIPT_GRACE_MS,
     maxPushes: MAX_REDELIVERIES })
 }
 
@@ -1368,16 +1384,35 @@ function laneEventOf(n: { method: string; params: unknown }, verified?: boolean)
 }
 // lanes-golive (C1, C3): THE entrance of a mesh notification with lanes on, from either daemon: the router decides (the agent-inbox daemon asks the tg
 // daemon's router; the tg daemon routes itself). Only when no router can be asked does the fleet path (any open session of this agent) take it.
-async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean): Promise<Lanes.Decision | null> {
+async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean, fallback = true): Promise<Lanes.Decision | null> {
   const ev = laneEventOf(n, verified)
   Lanes.noteInboundThread(ev.btcc_msg_id, ev.thread, ev.hop)
   const d = INBOX_ONLY ? await Lanes.routeRemote(ev)                       // target main: the tg daemon queued it for the main (M1)
     : await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev); return { rule: 'router-failed', target: 'main' } as Lanes.Decision })
   // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
   // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
-  if (!d) broadcastNotification(n)
+  if (!d) { if (fallback) broadcastNotification(n) }
   else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)    // 開工回執: a lane took the scheduled run (its run id from the meta)
   return d
+}
+
+// lanes-golive (C3): what this daemon's own /inject check found for a doorbell the hub will deliver (its verdict, the lanes thread / hop / sending-lane
+// marker, the line and wake fields), merged into the hub row's meta when the row is routed: the router sees the same event either path gives it.
+const hubInjectMeta = new Map<string, Record<string, string>>()
+const HUB_META_KEYS = ['verified', 'relay', 'forged', 'thread', 'hop', 'sender_lane', 'line', 'wake', 'run_id', 'frequency', 'no_reply']
+function rememberHubMeta(id: number, meta: Record<string, string>): void {
+  hubInjectMeta.set(String(id), Object.fromEntries(HUB_META_KEYS.filter(k => meta[k] != null && meta[k] !== '').map(k => [k, String(meta[k])])))
+  if (hubInjectMeta.size > 2000) hubInjectMeta.delete(hubInjectMeta.keys().next().value!)
+}
+/** hub sync's push with lanes on: the row goes to the router; 1 = the router took it (the hub reports it taken), 0 = no router to ask (it waits at the hub) */
+async function laneHubPush(n: { method: string; params: unknown }): Promise<number> {
+  const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
+  const id = String(p.meta?.msg_id ?? '')
+  const extra = hubInjectMeta.get(id)
+  const notif = extra ? { ...n, params: { ...p, meta: { ...(p.meta ?? {}), ...extra } } } : n
+  const d = await laneDeliverMesh(notif, undefined, false)
+  if (d) hubInjectMeta.delete(id)
+  return d ? 1 : 0
 }
 
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
@@ -3739,9 +3774,14 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             },
           },
         }
-        const d = await laneDeliverMesh(notification, verdict.verified)
+        // lanes-golive (C3): a sender-assigned hub id is a doorbell here too: hub sync fetches the row and hands it to the router (laneHubPush), and
+        // reports it taken; without a hub row it comes through the router now, from this /inject. Either way one entrance, one count.
+        const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'
+        if (hubRoute === 'hub') rememberHubMeta(senderMsgId!, notification.params.meta as Record<string, string>)
+        const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified) : null
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }))
+        res.end(JSON.stringify(hubRoute === 'old' ? { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }
+          : { injected: true, hub: true, routed: 'hub' }))
         return
       }
       const notif = {
@@ -4022,7 +4062,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           if (!Lanes.LANES_ON) {
             void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
           }
-          void hub?.kick('session-ready')   // hub rows that waited while detached (lanes on: who owns delivery to the main is go-live step 2, conflicts.md C3)
+          void hub?.kick('session-ready')   // hub rows that waited while detached (lanes on: they go to the router, laneHubPush; M1 delivers to the main)
         }
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {

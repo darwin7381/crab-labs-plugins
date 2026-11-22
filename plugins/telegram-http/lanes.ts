@@ -311,7 +311,26 @@ function mainEnv() {
     // 002v (C04): the senders of the events the thread gate stopped (stopThread writes `stop` on the event record)
     stoppedPeers: (ids: string[]) => [...new Set(ids.flatMap(id => { const e = events?.get(id); return e?.stop && e.from ? [String(e.from).toLowerCase()] : [] }))],
     toolDone: mainToolDone,
-    toolGate: mainToolGate,                                                         // 002w (D): one receipt per scheduler run, the main included                                                         // 002w (D): the main's own completion of a scheduler run
+    toolGate: mainToolGate,
+    bound: mainTookItems,                                                           // lanes-golive (C3): the main has it: a scheduler run's start receipt                                                         // 002w (D): one receipt per scheduler run, the main included                                                         // 002w (D): the main's own completion of a scheduler run
+  }
+}
+
+/** lanes-golive (C3): the main's turn took these items in (M1 bound). For a scheduler run handed to the main that is its start receipt (開工回執): the
+ *  fleet acks a run when the transcript shows the delivery consumed; with lanes on M1 is the one that knows (a lane's run is acked when the lane takes
+ *  it, server.ts). Once per run. */
+const ackedRuns = new Set<string>()
+export let __ackHook: ((runId: string) => void) | null = null
+export const __setAckHook = (f: ((runId: string) => void) | null): void => { __ackHook = f }          // tests only
+function mainTookItems(items: Row[]): void {
+  for (const it of items) {
+    const e = it.event ? events?.get(String(it.event)) : undefined
+    for (const o of ((e?.obligations ?? []) as Ob[])) if (o.kind === 'receipt' && o.run_id && !ackedRuns.has(String(o.run_id))) {
+      const run = String(o.run_id)
+      ackedRuns.add(run); if (ackedRuns.size > 1000) ackedRuns.clear()
+      if (__ackHook) { __ackHook(run); continue }
+      void inboxPost('/lanes/scheduler', { run_id: run, action: 'ack' }).then(r => D.log('info', `lanes: scheduler run ${run} taken by the main: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
+    }
   }
 }
 

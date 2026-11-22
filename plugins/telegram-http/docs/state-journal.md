@@ -646,3 +646,19 @@ not be found by the conversation it was made in (the level's check, and anyone a
   else on the owner's behalf; told to Joey it is his own decision coming back.
 - Readers: the digest and activity list say whose promise it is (「主線答應」 / 「車道答應」); the /main renew brief lists the texts.
 
+
+## lanes-golive: who owns what on the fleet (one entrance into the main)
+
+With `GENESIS_LANES=1` each duty below has one owner. With lanes off none of this runs and the fleet paths are exactly 1.33.2's.
+
+| Duty | Owner | Not |
+|---|---|---|
+| Deciding where an inbound item goes (Telegram, /inject, hub row, wake-up line, parked delivery) | the router, `routeEvent` in the tg daemon; the agent-inbox daemon asks it (`/lanes/route`) through `laneDeliverMesh` (server.ts) | `dispatchInbound` building a Telegram event from a mesh notification; hub sync pushing into a session |
+| Writing anything into the main session | M1 (`lanes-main.ts`: offer when idle, pull at a boundary, re-offer after `OFFER_LEASE_MS`) | `broadcastNotification`, `pushToReadySessions`, the disk replay (they run only when no router can be asked: `laneDeliverMesh` fallback) |
+| Fetching hub rows (BTCC `/api/mesh/inbox/pending`) and reporting them taken (`/api/mesh/inbox/taken`) | hub sync (`hub-sync.ts`, agent-inbox daemon, Epeius's); with lanes on its `push` is `laneHubPush` (the router) and `taken` = the router accepted the row (it is in this journal), `receiptCheck` off | a transcript receipt per hub row |
+| A doorbell (/inject with the sender's hub id) | hub sync decides hub or old path (`hub.doorbell`), as on the fleet; the /inject meta (verdict, thread, hop, line, wake) rides along to the router (`rememberHubMeta`) | routing the /inject and the hub row both |
+| Knowing the main has a delivery | M1 `bound` (the main's turn took the item); `mainTookItems` sends a scheduler run's start receipt (ack) once | `receipt.ts` / `recordDelivery` / `sweepDeliveries` (fallback broadcasts only) |
+| A run a lane takes | its start receipt when the router gives it to the lane (`laneDeliverMesh`: `maybeAutoAckScheduled`), its completion by `receipt(run_id)` / `btcc-receipt` (one per run, `toolGate`) | |
+| Parked deliveries (`inbox/pending`) | the timer drain hands each back to the router (`laneRedeliver`) | replaying them into whichever session is open |
+| Wake-up lines (keep-warm, STALL / RESTART / resume, 讀信箱) | the delivery watchdog sends them (Epeius; keepwarm-local on MBP / txmonster); the router gives each its fixed destination (`routeWake`: the main, or the mail lane) | the `mesh-no-reply` rule (ledger) |
+| Reading mail | the mail lane (`routeMailWake`, mailbox tools through `/lanes/mail-tool`: fleet-mail.ts with the agent's credential); what it cannot judge it hands to the main | the main on a wake (it gets only the digest) |

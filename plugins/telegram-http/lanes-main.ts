@@ -71,6 +71,9 @@ export type MainEnv = {
   toolDone?: (name: string, input: any, response: string, error: boolean) => void
   /** 002w (D): a tool call of the main the daemon refuses before it runs (a scheduler run completed twice): the hook's deny reason, or null */
   toolGate?: (name: string, input: any) => string | null
+  /** lanes-golive (C3): items the main's turn took in (bound: offered and opened a turn, or pulled at a boundary): with lanes on this is the one evidence
+   *  that the main has a delivery (the fleet's transcript receipt is not read for it), e.g. a scheduler run's start receipt */
+  bound?: (items: Row[]) => void
 }
 
 export type MainEvent = {
@@ -268,6 +271,7 @@ export function createMain(E: MainEnv) {
     const all = dg ? [...got, dg] : got
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true })
     for (const r of got) J().write('wake', r.id, 'wake', { reason: `pulled into the running turn ${prompt}` })
+    try { E.bound?.(got.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }
     delivered()
     return all.map(r => J().get('msg', r.id)!)
   }
@@ -331,7 +335,7 @@ export function createMain(E: MainEnv) {
     // what the prompt names (its did="…"), and whatever was offered to this gen: one offer opens one turn, so it is this turn's
     const bind = items(r => (r.state === 'offered' && r.gen === g.id) || (ids.has(r.id) && r.state === 'queued' && forGen(r, g)))
     for (const r of bind) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt })
-    if (bind.length) delivered()
+    if (bind.length) { try { E.bound?.(bind.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }; delivered() }
   }
   /** the prompt the gen last stopped is running again: a Stop hook other than ours blocked that Stop. The turn was not over: it re-opens, and
    *  what that Stop closed is bound to it again. An item offered in the gap is not this turn's: it opens its own prompt (beginTurn). */
