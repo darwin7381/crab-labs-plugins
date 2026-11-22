@@ -798,6 +798,7 @@ function matches(r: Rule, ev: InEvent, cfg: RouterCfg): boolean {
   if (m.verified === true && !ev.verified) return false
   if (m.thread_known && !threadOwnerFor(ev)) return false
   if (m.from_agent && !(ev.verified && (D.registryNames?.() ?? []).includes(ev.from))) return false
+  if (typeof m.line === 'string' && (ev.line ?? 'call') !== m.line) return false               // lanes-golive (C2): the item's line field (a push with none is a call)
   return true
 }
 
@@ -1191,6 +1192,10 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       if (o.owner === 'main') { saveState(); return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main`, thread: o.thread ?? undefined } }
       ev.cls = effectiveClass(ev.trigger, o.cls)
       return dispatch(ev, S.lanes[o.owner], base)
+    }
+    case 'mail_lane': {                                           // lanes-golive (C2): an item of the mail line (pushed because the mailbox was not open)
+      ev.trigger = r.trigger ?? 'mail'; ev.cls = ev.trigger
+      return dispatch(ev, mailLane(), base)
     }
     case 'worker_for_ticket': {
       const wo = (ev.text.match(/\[WO-(\d+)\]/) ?? [])[1]
