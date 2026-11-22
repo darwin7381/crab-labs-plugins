@@ -2668,14 +2668,16 @@ const proposalWords = (e: Row, p: Proposal, oneLine = false): string => joeyWord
  *  adds the main obligation (due HANDOFF_DUE_MS, set now and never rewritten) and moves what the lane still owed to `handed`; then one M1 item carries
  *  it. M1 offers it when the main is idle (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop.
  *  An event already handed (an open main obligation) keeps that hand-over: no second item. */
-function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true, carry?: { content: string; meta: Record<string, string> }): string {
+function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true, carry?: { content: string; meta: Record<string, string> },
+  request = false): string {
   // 002t (station 4, I03 live): Joey ordered an irreversible step inside a worker's topic; the worker handed it to the main in its own words, and the
   // main rightly would not act on a lane's retelling (「我看不到你在話題的原話，帳本只有工作線的轉述」). A hand-over of Joey's own Telegram message
   // carries his words as the router received them, marked as such: the main reads Joey, not the lane.
   const said = joeyWords(events?.get(evId))
   const body = text.slice(0, max) + (said ? `\n${said}` : '')
   const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}),
-    answer_due: Date.now() + PROMISE_MIN * 60_000 })                              // 002w (B, gap 9): a peer's answer handed to the main is due like a promised one
+    answer_due: Date.now() + PROMISE_MIN * 60_000,                               // 002w (B, gap 9): a peer's answer handed to the main is due like a promised one
+    ...(request ? { request: true } : {}) })                                     // 002y (X-3): handoff_main hands the peer's request itself (handOver)
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
   if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
@@ -2812,6 +2814,9 @@ function mainSentInTurn(to: string, ref: string, delivered: boolean): string[] {
 // meets it by sending that peer a message that answers it (mainSentTo); at its due time the sweep tells Joey once. The lane may still send the peer
 // its own line about its part (its focus, its ETA): a reply_agent of its own, one per agent (level message). 002p met the lane's answer with the
 // interim and refused the lane's own reply ("the router already told eve"), so its focus card never reached Eve.
+// 002y (X-3, 002w r1 B09): in either order. A lane that replied first (「重啟由主線處理」) had met the answer, the hand-over found nothing owed, and the
+// interim below was skipped: Eve never got the time and the main owed her nothing. handoff_main hands the REQUEST (handOver `request`): the lane's
+// earlier reply becomes its `message` and the answer is handed again, so the interim below finds it whichever call came first.
 let PROMISE_MIN = Number(process.env.LANES_HANDOFF_REPLY_MIN ?? 30)
 export const __setPromiseMin = (m: number): void => { PROMISE_MIN = m }
 let meshSendHook: ((b: any) => Promise<any>) | null = null
@@ -3264,7 +3269,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (lane.kind === 'fork') return 'refused: a fork does not hand its work back to the main (it does not merge back). Tell Joey the result yourself with notify_joey (ask_joey if he must decide); the main reads it in its digest. Nothing was handed over.'
       const v = events.request(tok.evId, 'handoff_main', { kind: 'main', level: 'handed' })        // accepted or refused (journaled); the hand-over is ONE transition
       if (!v.ok) return v.why!
-      const hid = handToMain(tok.evId, lane, text, `ho-${shortId()}`, tok.cls)
+      // 002y (X-3): the request itself is the main's from here, whether the lane replied to the peer before this call or replies after it
+      const hid = handToMain(tok.evId, lane, text, `ho-${shortId()}`, tok.cls, 1000, true, undefined, true)
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words, the router's own line); the answer is
       // the main's, with a due time (002q: the lane's own reply to the peer stays its own)

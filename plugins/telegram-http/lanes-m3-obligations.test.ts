@@ -371,9 +371,12 @@ test('the due sweep: a promised answer past its due time tells Joey once; a hand
   const k = sent.length
   L.dueTick(owed.due_at + 1)
   await sleep(20)
-  expect(sent.slice(k).filter(s => s.text.includes('eve 在等主線回覆')).length).toBe(1)
+  // 002y (X-3): counted on this event's own line: an earlier test's event (002m aid (b): the lane answered Eve, then handed the request over) now owes
+  // Eve the main's answer too, due before this one
+  const late = () => sent.slice(k).filter(s => s.text.includes('eve 在等主線回覆') && s.text.includes('延後部署'))
+  expect(late().length).toBe(1)
   L.dueTick(owed.due_at + 2); await sleep(20)
-  expect(sent.slice(k).filter(s => s.text.includes('eve 在等主線回覆')).length).toBe(1)      // once
+  expect(late().length).toBe(1)      // once
   const main = ob(p.id, 'main')
   L.dueTick(main.due_at + 1); await sleep(20)
   expect(sent.slice(k).filter(s => s.text.includes('原本交給主線處理') && s.text.includes('延後部署')).length).toBe(1)

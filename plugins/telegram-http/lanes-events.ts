@@ -40,7 +40,11 @@ export function matterKey(service: unknown, check: unknown): string | undefined 
 export type Verdict = { ok: boolean; why?: string; ob?: Ob; raised?: boolean; event?: Row }
 export type HandOver = { handoff: string; by: string; what?: string; due_at?: number; cls?: string
   /** 002w (B, gap 9): the due time a peer's answer handed to the main gets (like an answer the router promised: the due sweep tells Joey once) */
-  answer_due?: number }
+  answer_due?: number
+  /** 002y (X-3): the lane hands the peer's REQUEST itself to the main (handoff_main): the answer is the main's whatever the lane already sent. A reply of
+   *  the lane's that met it (reply_agent) was the lane's own line: it stays met as level `message`, and the answer is handed like an owed one. The exit
+   *  rule and the thread stop do not set it (what the lane already answered there stays answered). */
+  request?: boolean }
 
 const RANK: Record<string, number> = { none: 0, line: 1, decision: 2 }
 const SEV: Record<Outcome, number> = { normal: 0, changed: 1, failed: 2 }
@@ -196,6 +200,13 @@ export function createEvents(J: Journal) {
     if (open) return open
     const ob: Ob = { id: h.handoff, kind: 'main', level: 'handed', state: 'open', by: h.by, owner: 'main', handoff: h.handoff,
       ...(h.what != null ? { what: h.what } : {}), ...(h.due_at != null ? { due_at: h.due_at } : {}), ...(h.cls ? { cls: h.cls } : {}) }
+    // 002y (X-3, 002w r1 B09): the peer's request handed over AFTER the lane's own reply met its answer left the main owing nothing and the peer never told
+    // when the main would answer (the order of the two calls decided it). Handing the request over makes the answer owed again, as the main's: the
+    // lane's reply becomes its own line (`message`, still met), and a new answer to that peer is owed below like any other.
+    if (h.request) for (const o of [...obs]) if (o.kind === 'peer' && o.level === 'answer' && o.state === 'met' && (o.owner ?? 'lane') === 'lane' && o.by === 'reply_agent') {
+      o.level = 'message'
+      obs.push({ id: obId('peer'), kind: 'peer', level: 'answer', to: o.to, state: 'open', ...(o.req ? { req: o.req } : {}) })
+    }
     for (const o of obs) if (owing(o) && (o.owner ?? 'lane') === 'lane' && o.kind !== 'main') {
       o.state = 'handed'; delete o.prev
       if (o.kind === 'peer' && o.level === 'answer' && h.answer_due != null && o.due_at == null) { o.due_at = h.answer_due; o.what ??= String(e.text ?? '').slice(0, 160) }   // 002w (B)
