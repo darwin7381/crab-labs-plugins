@@ -2337,18 +2337,31 @@ function renderEvent(ev: InEvent): string {
 // silent line or a receipt and whose Stop hook is the plugin's lane-stop-hook), and the plugins they enable bring hooks of their own. What a lane still
 // takes from the user's settings is said here, explicitly:
 //   - their `env` (the login lives there: CLAUDE_CODE_OAUTH_TOKEN), put in the lane's process environment, never written to a file;
-//   - the guard hooks LANES_USER_GUARDS names (comma-separated script names, e.g. "eden_guard.py,redact_hook.py"): copied into the lane settings with
-//     their event, matcher and timeout. A named guard that is not in the user's settings is logged; nothing else of the user's runs in a lane.
+//   - lanes-golive (A3): the user's hooks that guard actions, copied into the lane settings with their event, matcher and timeout. By default every
+//     command hook of the user's settings on SessionStart, UserPromptSubmit, PreToolUse and PostToolUse (the fleet's: secret scrubbing redact_hook.py,
+//     the authority table authority_hook.py, alert_setup_hook.py), except the main-only scripts (MAIN_ONLY_USER_HOOKS: the Telegram reply gates
+//     check_tg_reply.py / check_scheduled_receipt.py, the main's re-anchor reanchor_hook.py) and any named in LANES_USER_HOOKS_SKIP. Hooks on the
+//     events that close a turn or compact it (Stop, SubagentStop, PreCompact, ...) are the main's: a lane has its own Stop hook. LANES_USER_GUARDS
+//     (comma-separated script names) narrows it to exactly those, as in the lab; LANES_USER_GUARDS=none carries none. A named guard that is not in
+//     the user's settings is logged.
 const userSettings = (): any => readJson<any>(join(process.env.CLAUDE_CONFIG_DIR || join(process.env.HOME || homedir(), '.claude'), 'settings.json'), {})
 function userEnv(): Record<string, string> {
   const e = userSettings()?.env
   return e && typeof e === 'object' ? Object.fromEntries(Object.entries(e).filter(([, v]) => typeof v === 'string')) as Record<string, string> : {}
 }
+export const GUARD_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse']
+export const MAIN_ONLY_USER_HOOKS = ['check_tg_reply.py', 'check_scheduled_receipt.py', 'reanchor_hook.py']
 function userGuards(): Record<string, any[]> {
-  const names = String(process.env.LANES_USER_GUARDS ?? '').split(',').map(s => s.trim()).filter(Boolean)
+  const raw = String(process.env.LANES_USER_GUARDS ?? '').trim()
+  const names = raw && raw !== 'none' ? raw.split(',').map(s => s.trim()).filter(Boolean) : []
+  const skip = [...MAIN_ONLY_USER_HOOKS, ...String(process.env.LANES_USER_HOOKS_SKIP ?? '').split(',').map(s => s.trim()).filter(Boolean)]
+  const words = (h: any): string[] => String(h?.command ?? '').split(/[\s/]/)
   const out: Record<string, any[]> = {}, found = new Set<string>()
+  if (raw === 'none') return out
   for (const [ev, arr] of Object.entries((userSettings()?.hooks ?? {}) as Record<string, any[]>)) for (const m of Array.isArray(arr) ? arr : []) {
-    const hs = (m?.hooks ?? []).filter((h: any) => h?.type === 'command' && names.some(n => { const hit = String(h.command ?? '').split(/[\s/]/).includes(n); if (hit) found.add(n); return hit }))
+    const hs = (m?.hooks ?? []).filter((h: any) => h?.type === 'command' && (names.length
+      ? names.some(n => { const hit = words(h).includes(n); if (hit) found.add(n); return hit })
+      : GUARD_EVENTS.includes(ev) && !skip.some(n => words(h).includes(n))))
     if (hs.length) (out[ev] ??= []).push({ matcher: m.matcher ?? '', hooks: hs.map((h: any) => ({ type: 'command', command: h.command, ...(h.timeout ? { timeout: h.timeout } : {}) })) })
   }
   for (const n of names) if (!found.has(n)) D?.log('warn', `lanes: LANES_USER_GUARDS names ${n}, which is not a command hook in the user's settings: lanes run without it`)

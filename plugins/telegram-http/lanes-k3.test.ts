@@ -67,7 +67,7 @@ test('K3: the spawned worker and fork get --agents and Agent(fork) denied; the s
 
 test('K3: the lane settings carry the sub-agent type hook next to the guard, which is as it was', () => {
   const s = JSON.parse(readFileSync(join(dir, 'lane-settings.json'), 'utf8'))
-  const pre = s.hooks.PreToolUse
+  const pre = s.hooks.PreToolUse.filter((m: any) => m.hooks.some((h: any) => h.command.includes('lanes-hooks')))   // lanes-golive (A3): the user's guards ride after the plugin's
   expect(pre.length).toBe(2)
   expect(pre[0].matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash'); expect(pre[0].hooks[0].command).toContain('lane-guard-hook.py')
   expect(pre[1].matcher).toBe('Agent|Task'); expect(pre[1].hooks[0].command).toContain('lane-agent-hook.py')

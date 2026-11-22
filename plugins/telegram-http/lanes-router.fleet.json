@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "doc": "Fleet default router (lanes-golive). Copy to <workspace>/.lanes/router.json and edit there. Rules are evaluated in order, first match wins; predicates are a fixed vocabulary read by lanes.ts (no model call). Nothing matched → main. Before any rule the router gives the fleet's wake-up lines their fixed destination (lanes.ts routeWake, from the event's `wake` field): keep-warm, STALL-WAKE, RESTART-WAKE and the resume line → the main; the 讀信箱 reminder → the mail lane, whose work queue is the agent's mailbox (mail, board notices, mail-tier alerts). Joey's Telegram → the main. Scheduler runs, page-tier alerts and peer calls → a reflex lane. A board work order pushed as a call (an urgent ticket) → a worker lane in Joey's DM topic (the main when topics are off). Mesh no_reply notices → the ledger (the main's next digest). What reaches Joey: every lane line rings (ORG-CHART §0 #2: 做了什麼就報什麼、全進 Joey 手機); a routine run with nothing new is one line (#5); a high-frequency run with nothing new is its receipt only (#5, the router opens no Joey line for it).",
+  "alert_senders": ["alert-dispatcher"],
+  "rules": [
+    { "id": "tg-quote-lane", "match": { "source": "telegram", "quotes_lane_message": true }, "to": "quoted_lane", "trigger": "joey" },
+    { "id": "tg-worker-topic", "match": { "source": "telegram", "in_worker_topic": true }, "to": "topic_worker", "trigger": "joey" },
+    { "id": "tg-main", "match": { "source": "telegram" }, "to": "main" },
+    { "id": "mesh-no-reply", "match": { "source": "mesh", "no_reply": true, "not_alert": true }, "to": "ledger", "trigger": "no_reply" },
+    { "id": "mesh-scheduled", "match": { "source": "mesh", "text_prefix": "[scheduled]", "from": ["scheduler"], "verified": true }, "to": "reflex", "trigger": "scheduled" },
+    { "id": "mesh-alert", "match": { "source": "mesh", "from": ["alert-dispatcher"], "verified": true }, "to": "reflex", "trigger": "alert",
+      "critical_regex": "^\\s*\\[(P0|P1|critical)\\]|嚴重|critical", "info_regex": "^\\s*\\[(P3|P4|info)\\]|\\[info\\]" },
+    { "id": "mesh-board", "match": { "source": "mesh", "text_regex": "^\\s*\\[board\\]\\[WO-\\d+\\]" }, "to": "worker_for_ticket", "trigger": "board" },
+    { "id": "mesh-thread", "match": { "source": "mesh", "thread_known": true }, "to": "thread_owner", "trigger": "thread" },
+    { "id": "mesh-peer-call", "match": { "source": "mesh", "from_agent": true, "line": "call" }, "to": "reflex", "trigger": "peer" },
+    { "id": "default", "match": {}, "to": "main" }
+  ],
+  "notify": {
+    "doc": "ORG-CHART §0 #2 and #5 (current rules): nothing that reaches Joey is silent. Every class pushes, plain or escalated; no frequency cap. The only line that does not go out is a no_reply notice (the ledger: it owed nobody a reply before lanes either) and a high-frequency routine with nothing new (no Joey line is opened for it: the receipt only). The notify profile `default` (LANES_NOTIFY_PROFILE, the fleet default) pushes everything whatever this table says; this table is what `/lanes notify tiered` would use, and it is the same.",
+    "classes": {
+      "alert-critical": { "plain": "push", "escalated": "push" },
+      "joey": { "plain": "push", "escalated": "push" },
+      "worker": { "plain": "push", "escalated": "push" },
+      "scheduled": { "plain": "push", "escalated": "push" },
+      "peer": { "plain": "push", "escalated": "push" },
+      "thread": { "plain": "push", "escalated": "push", "inherit": "asking_run" },
+      "board": { "plain": "push", "escalated": "push" },
+      "alert": { "plain": "push", "escalated": "push" },
+      "alert-info": { "plain": "push", "escalated": "push" },
+      "fork": { "plain": "push", "escalated": "push" },
+      "mail": { "plain": "push", "escalated": "push" },
+      "no_reply": { "plain": "ledger", "escalated": "ledger" }
+    },
+    "default": { "plain": "push", "escalated": "push" }
+  }
+}

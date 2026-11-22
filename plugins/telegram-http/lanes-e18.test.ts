@@ -229,7 +229,7 @@ test('E18: only Joey\'s Telegram messages steer: a peer\'s message to a running 
 
 test('E18: the lane\'s settings carry the steering hook for PostToolUse (all tools); Stop keeps its one hook, which hands over what is pending itself', () => {
   const s = JSON.parse(readFileSync(join(dir, 'lane-settings.json'), 'utf8'))
-  const post = s.hooks.PostToolUse
+  const post = s.hooks.PostToolUse.filter((m: any) => m.hooks.some((h: any) => h.command.includes('lanes-hooks')))   // lanes-golive (A3): the user's guards ride after the plugin's
   expect(post.length).toBe(2)
   expect(post[0].matcher).toBe('Write|Edit|MultiEdit')                                       // the curator's memory commit is as it was
   expect(post[1].matcher).toBe(''); expect(post[1].hooks[0].command).toContain('lane-steer-hook.py')
