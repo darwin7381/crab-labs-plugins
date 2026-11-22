@@ -98,7 +98,7 @@ describe('decideMail', () => {
   })
 })
 
-function rig(opts: { mode?: 'live' | 'dry' | 'off'; mail?: MailCount; recs?: any[] } = {}) {
+function rig(opts: { mode?: 'live' | 'dry' | 'off'; mail?: MailCount; recs?: any[]; wall?: () => boolean | null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'kwl-'))
   const proj = join(dir, 'proj')
   mkdirSync(proj)
@@ -109,6 +109,7 @@ function rig(opts: { mode?: 'live' | 'dry' | 'off'; mail?: MailCount; recs?: any
   const kw = new LocalKeepwarm({
     name: 'mbp', stateDir: dir, mode: () => opts.mode ?? 'live', projectsDir: () => proj,
     mail: async () => mail, deliver: async t => { delivered.push(t); return true }, log: () => {}, now: () => clock,
+    wall: opts.wall,
   })
   return { kw, dir, proj, delivered, at: (t: number) => { clock = t }, setMail: (m: MailCount) => { mail = m },
     log: () => { try { return readFileSync(join(dir, 'keepwarm-local.log'), 'utf8') } catch { return '' } } }
@@ -181,5 +182,39 @@ describe('LocalKeepwarm pass', () => {
     await r.kw.run()
     expect(r.delivered).toEqual([])
     expect(r.log()).not.toContain('KEEPWARM-ERROR')
+  })
+})
+
+// WO-120: a fresh usage-wall state decides "walled" instead of the transcript scan.
+describe('LocalKeepwarm with the usage-wall state', () => {
+  const wallRec = (t: number) => ({ type: 'assistant', timestamp: iso(t), error: 'rate_limit', isApiErrorMessage: true,
+    message: { model: '<synthetic>', content: [{ type: 'text', text: 'usage limit reached' }] } })
+  test('state walled (the scan sees a normal answer): keep-warm noted, 讀信箱 skipped', async () => {
+    const r = rig({ wall: () => true, mail: { on: false, n: 0, oldestS: null } })
+    r.at(T0 + 1 + 51 * 60)
+    await r.kw.run()
+    expect(r.delivered).toEqual([])
+    expect(r.log()).toContain('KEEPWARM-SKIP mbp: usage wall')
+    const m = rig({ wall: () => true, mail: { on: true, n: 2, oldestS: 1800 }, recs: [chan(T0, 'chiron', '看一下'), req(T0 + 1), answer(T0 + 5), end(T0 + 6)] })
+    m.at(T0 + 1 + 51 * 60)
+    await m.kw.run()
+    expect(m.delivered).toEqual([])
+  })
+  test('state cleared (the scan still ends on the limit answer): keep-warm goes', async () => {
+    const recs = [...turnAt(T0 - 600), joey(T0), req(T0 + 1), wallRec(T0 + 2), end(T0 + 3)]
+    const before = rig({ recs })
+    before.at(T0 + 1 + 51 * 60)
+    await before.kw.run()
+    expect(before.delivered).toEqual([])                 // no state: the scan says walled, as before
+    const r = rig({ recs, wall: () => false })
+    r.at(T0 + 1 + 51 * 60)
+    await r.kw.run()
+    expect(r.delivered).toEqual([POKE_TEXT])
+  })
+  test('state unknown (null): the scan decides, as before', async () => {
+    const r = rig({ wall: () => null })
+    r.at(T0 + 1 + 51 * 60)
+    await r.kw.run()
+    expect(r.delivered).toEqual([POKE_TEXT])
   })
 })

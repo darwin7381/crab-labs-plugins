@@ -1,7 +1,8 @@
 // Unit test for the 429/usage-limit alert fix (Joey 2026-07-10).
 // Run: bun test system-alert.test.ts
 import { test, expect } from 'bun:test'
-import { extractSystemAlert, handleOtlpLogs, startSystemAlertWatcher, newestJsonl, resolveWatchFile } from './system-alert'
+import { extractSystemAlert, handleOtlpLogs, startSystemAlertWatcher, newestJsonl, resolveWatchFile, wallRoute } from './system-alert'
+import type { WallState } from './usage-wall'
 import { mkdtempSync, writeFileSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -116,4 +117,45 @@ test('OTLP layer skips refusals the server already retried (server_fallback_hop=
   expect(handleOtlpLogs(otlp({ 'event.name': 'api_refusal', query_source: 'Explore', server_fallback_hop: 'false' }))).toBe(0)
   expect(handleOtlpLogs(otlp({ 'event.name': 'api_refusal', query_source: 'repl_main_thread', server_fallback_hop: 'false', model: 'claude-x-refusal-test' }))).toBe(1)
   expect(sent.join('\n')).toContain('claude-x-refusal-test')
+})
+
+// WO-120: inside a usage wall the state owns the alerts (enter + clear, usage-wall.test.ts); API errors are not
+// forwarded one by one. No fresh state = as before.
+const wallState = (walled: boolean): WallState => ({ walled, episode: 'atlas-1', since: '2026-07-10T13:59:00.000Z',
+  kind: 'weekly', text: 'limit', resets_at: null, cleared_at: walled ? null : '2026-07-10T14:30:00.000Z',
+  cleared_by: walled ? null : 'ok_turn', agent: 'atlas', tmux: 'claude-atlas', session: null, key: 'claude-atlas',
+  sinceMs: Date.parse('2026-07-10T13:59:00.000Z'), clearedMs: walled ? null : Date.parse('2026-07-10T14:30:00.000Z') })
+
+test('jsonl: walled → the limit line and other API errors are dropped; login, refusal, fallback still go', () => {
+  const w = wallState(true)
+  expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, w)).toBe('drop')
+  const e500 = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, apiErrorStatus: 500, message: { content: [{ type: 'text', text: 'API Error: 500 Internal server error' }] } })
+  expect(wallRoute(e500, extractSystemAlert(e500)!, w)).toBe('drop')
+  const login = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, message: { content: [{ type: 'text', text: 'API Error: 401 Please run /login' }] } })
+  expect(wallRoute(login, extractSystemAlert(login)!, w)).toBe('send')
+  const refusal = JSON.stringify({ type: 'assistant', message: { stop_reason: 'refusal', content: [{ type: 'text', text: 'no' }] } })
+  expect(wallRoute(refusal, extractSystemAlert(refusal)!, w)).toBe('send')
+})
+
+test('jsonl: fresh state not (yet) walled → a limit record waits for the state; other API errors go as before; no state → as before', () => {
+  const w = wallState(false)
+  expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, w)).toBe('defer')
+  const e500 = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, apiErrorStatus: 500, message: { content: [{ type: 'text', text: 'API Error: 500' }] } })
+  expect(wallRoute(e500, extractSystemAlert(e500)!, w)).toBe('send')
+  expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, null)).toBe('send')
+})
+
+test('OTLP: api_error / retries exhausted inside a wall are not forwarded; outside one they are', () => {
+  const sent: string[] = []
+  let walled = true
+  startSystemAlertWatcher({ notify: (m) => sent.push(m), log: () => {}, wall: () => wallState(walled) })
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_error', status_code: '529', error: 'Overloaded inside wall' }))).toBe(0)
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_retries_exhausted', error: 'x' }))).toBe(0)
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_refusal', query_source: 'repl_main_thread', model: 'claude-wall-refusal' }))).toBe(1)
+  walled = false
+  expect(handleOtlpLogs(otlp({ 'event.name': 'api_error', status_code: '529', error: 'Overloaded after wall' }))).toBe(1)
+  expect(sent.join('\n')).not.toContain('Overloaded inside wall')
+  expect(sent.join('\n')).toContain('Overloaded after wall')
+  expect(sent.join('\n')).toContain('claude-wall-refusal')
+  startSystemAlertWatcher({ notify: () => {}, log: () => {} })   // back to no state for later tests
 })

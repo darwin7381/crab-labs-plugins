@@ -166,6 +166,9 @@ export interface LanesDeps {
   toolsChanged?: (mcpSid: string) => void
   /** 002k (G16): the main's pane and the startup picker on it (server.ts builds it from startup-picker.ts when it knows the main's tmux target) */
   mainPicker?: MainPicker
+  /** WO-120 (server.ts mainWallNoticeOwned): true = the usage-wall alerts (system-alert WallAlerts) tell Joey about this wall of the main, so the
+   *  main-wall-up / main-wall-down notice goes to the ledger only. Absent / false = pushed as before. The wall records themselves are untouched. */
+  wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
 }
 /** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
  *  or put the menu in front of Joey again with a fresh debounce */
@@ -264,6 +267,12 @@ function mainEnv() {
     tellJoey: (text: string, rule: string, evs: string[] = []) => {
       if (rule === 'main-wall-up' || rule === 'main-wall-down') {                   // PL4: the main's own wall
         const g = main?.currentGen(); logos(`lane.${rule.replace(/-/g, '_')}`, { gen: g?.id ?? null, kind: g?.kind ?? null, since: g?.wall_since ?? null })
+        // WO-120: the usage-wall alerts are the one sender of this wall's two pushes; the notice is kept on the ledger
+        if (D.wallNoticeOwned?.(rule, { kind: g?.kind != null ? String(g.kind) : null })) {
+          ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${text}`, refs: { tier: 'ledger', tier_rule: `${rule}+usage-wall`, escalated: false } })
+          logos('lane.notify', { escalated: false, tier: 'ledger', tier_rule: `${rule}+usage-wall` })
+          return
+        }
         return wallNotice(text, rule, !!S?.wall)                                    // 002q: one notice per limit, lanes and main together
       }
       ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true, ...(evs.length ? { events: evs } : {}) } })
@@ -1892,6 +1901,11 @@ function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string
 // that arrives meanwhile is rung through at once, with the reason nobody can look into it.
 // All of it is code: the wall is recognised from the run's own result record (`is_error` + `api_error_status`), never guessed.
 export function wallActive(): boolean { return !!S?.wall }
+/** WO-120 (server.ts heldNow, tg daemon): the items M1 holds for the main right now (queued or offered, digests aside); the usage-wall clear alert
+ *  counts them with the daemons' own held items. Read only. */
+export function mainHeldCount(): number {
+  try { return D?.role === 'tg' && main ? main.items(r => r.kind !== 'digest' && (r.state === 'queued' || r.state === 'offered')).length : 0 } catch { return 0 }
+}
 // SPECIAL CASE (kept, see RBP report): the TUI relay (system-alert.ts, fleet code that stays) relays the CLI's own error line from the main's pane or
 // transcript; to defer it to the one wall notice (002l D12) the line itself has to be recognised, and no signal carries it. This is its only use:
 // a lane run's wall kind comes from its result's status (exitReason), the main's from StopFailure's error field.

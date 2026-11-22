@@ -42,6 +42,8 @@ function rig(o: Partial<HubOpts> & { dir?: string } = {}) {
     transcript: [] as string[],
     dispatched: [] as Notif[],
     logs: [] as string[],
+    walled: false,                                   // WO-120 hold
+    ate: (_at: number): boolean => false,            // WO-120 wallAte
     add(id: number, p: unknown = payload(`msg ${id}`)) { hub.set(id, { payload: p, received_at: null }) },
     record(n: Notif) { r.transcript.push(rendered(n)) },
     gets() { return calls.filter(c => c.path.endsWith('/pending')).length },
@@ -82,6 +84,8 @@ function rig(o: Partial<HubOpts> & { dir?: string } = {}) {
         defaultChatId: () => 'owner',
         log: (_l, m) => { r.logs.push(m) },
         now: () => r.t,
+        hold: () => r.walled,
+        ate: at => r.ate(at),
       }, { stateDir: dir, receiptCheck: true, graceMs: 90_000, maxPushes: 3, backoffMs: 300_000, ...o, ...extra })
       return r.sync
     },
@@ -411,5 +415,67 @@ describe('gc', () => {
     expect(loadState(p)).toEqual({})
     writeFileSync(p, JSON.stringify({ '7': { pushes: 2, last_push_at: 5, seen_at: 'x' }, abc: {}, '8': 3 }))
     expect(loadState(p)).toEqual({ '7': { pushes: 2, last_push_at: 5, seen_at: null, taken_at: null } })
+  })
+})
+
+describe('WO-120 usage wall', () => {
+  test('walled: nothing pushed, rows stay untaken and are counted; after the clear each is pushed once, in order', async () => {
+    const r = rig()
+    r.add(5); r.add(3); r.add(9)
+    const s = r.make()
+    r.walled = true
+    await s.kick('t')
+    r.t += 120_000
+    await s.kick('t')
+    expect(r.pushed).toEqual([])
+    expect(s.withheld().count).toBe(3)
+    expect(s.health().withheld_wall).toBe(3)
+    expect(r.takenPosts().length).toBe(0)
+    expect([...r.hub.values()].every(v => v.received_at == null)).toBe(true)
+    r.walled = false
+    await s.kick('wall-cleared')
+    expect(ids(r.pushed)).toEqual(['3', '5', '9'])
+    expect(s.withheld().count).toBe(0)
+    for (const n of r.pushed) r.record(n)
+    r.t += 1000
+    await s.kick('t')
+    r.t += 300_000
+    await s.kick('t')
+    expect(ids(r.pushed)).toEqual(['3', '5', '9'])
+    expect([3, 5, 9].map(id => s.entry(id)!.pushes)).toEqual([1, 1, 1])
+    expect([...r.hub.values()].every(v => v.received_at != null)).toBe(true)
+  })
+  test('a push the wall ate: not seen, not counted, pushed once more after the clear (and remembered across a restart)', async () => {
+    const r = rig()
+    r.add(7)
+    let s = r.make()
+    await s.kick('t')
+    expect(ids(r.pushed)).toEqual(['7'])
+    r.record(r.pushed[0])                       // in the transcript: the wall answered it
+    const pushedAt = r.t
+    r.walled = true
+    r.ate = at => at === pushedAt
+    r.t += 30_000
+    await s.kick('t')
+    expect(s.entry(7)).toMatchObject({ pushes: 0, seen_at: null, wall_ate: pushedAt })
+    expect(r.takenPosts().length).toBe(0)
+    s = r.make()                                // restart inside the wall
+    expect(s.entry(7)).toMatchObject({ pushes: 0, wall_ate: pushedAt })
+    r.t += 120_000
+    await s.kick('t')
+    expect(r.pushed.length).toBe(1)
+    expect(s.withheld().count).toBe(1)
+    r.walled = false
+    await s.kick('wall-cleared')
+    expect(ids(r.pushed)).toEqual(['7', '7'])
+    expect(s.entry(7)!.pushes).toBe(1)
+    r.record(r.pushed[1])
+    r.t += 1000
+    await s.kick('t')
+    expect(s.entry(7)!.seen_at).not.toBeNull()
+    expect(r.hub.get(7)!.received_at).not.toBeNull()
+    r.t += 300_000
+    await s.kick('t')
+    expect(r.pushed.length).toBe(2)
   })
 })

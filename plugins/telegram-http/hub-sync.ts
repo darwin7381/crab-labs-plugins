@@ -39,6 +39,8 @@ export type HubEntry = {
   taken_at: number | null
   /** Delivered on the old (1.32.2) path instead of by hub sync: never pushed from the hub, reported taken once seen. */
   old_path?: true
+  /** WO-120: last_push_at of a push the usage wall ate (in the transcript, never answered); that push was not counted. */
+  wall_ate?: number
 }
 export type HubState = Record<string, HubEntry>
 export type DoorbellRoute = 'hub' | 'old' | 'dup-hub' | 'dup-old'
@@ -118,6 +120,7 @@ export function loadState(path: string): HubState {
       pushes: typeof x.pushes === 'number' && x.pushes >= 0 ? Math.floor(x.pushes) : 0,
       last_push_at: numOrNull(x.last_push_at), seen_at: numOrNull(x.seen_at), taken_at: numOrNull(x.taken_at),
       ...(x.old_path === true ? { old_path: true as const } : {}),
+      ...(typeof x.wall_ate === 'number' && Number.isFinite(x.wall_ate) ? { wall_ate: x.wall_ate } : {}),
     }
   }
   return out
@@ -178,6 +181,12 @@ export type HubDeps = {
   defaultChatId: () => string
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
   now?: () => number
+  /** WO-120: true while the agent's session is inside a usage wall: nothing is pushed (the rows stay untaken at the
+   *  hub and are pushed after the clear). Absent / false = as before. */
+  hold?: () => boolean
+  /** WO-120: did the usage wall eat the push made at this time (usage-wall.ts wallAte)? Such a push is in the
+   *  transcript but was never answered: it is not counted as seen nor as a push, and is pushed again after the clear. */
+  ate?: (pushedAtMs: number) => boolean
 }
 
 export type HubOpts = {
@@ -211,6 +220,7 @@ export class HubSync {
   private status = 'not synced yet'
   private takenStatus = 'ok'
   private capLogged = new Set<number>()
+  private withheldSince = new Map<number, number>()   // WO-120: rows a wall kept from being pushed → since when
   private readonly now: () => number
   private readonly fetchFn: typeof fetch
 
@@ -319,7 +329,14 @@ export class HubSync {
       capped: es.filter(e => !e.old_path && e.seen_at == null && e.pushes >= this.opts.maxPushes).length,
       held_doorbells: this.held.size,
       without_payload: this.nullPayload,
+      withheld_wall: this.withheldSince.size,
     }
+  }
+
+  /** WO-120: rows the last sync did not push because the session is inside a usage wall. */
+  withheld(): { count: number; oldestMs: number | null } {
+    const t = [...this.withheldSince.values()]
+    return { count: t.length, oldestMs: t.length ? Math.min(...t) : null }
   }
 
   /** Snapshot for tests. */
@@ -435,6 +452,16 @@ export class HubSync {
     if (!lines.length) return
     for (const [id, e] of unseen) {
       if (seenIn(lines, id)) {
+        // WO-120: the wall ate this push — not seen, not counted; pushed again after the clear
+        if (e.last_push_at != null && this.deps.ate?.(e.last_push_at)) {
+          if (e.wall_ate !== e.last_push_at) {
+            e.wall_ate = e.last_push_at
+            e.pushes = Math.max(0, e.pushes - 1)
+            this.dirty = true
+            this.deps.log('info', `hub: #${id} is in the transcript but the usage wall ate it — not counted, pushed again after the clear`)
+          }
+          continue
+        }
         e.seen_at = this.now()
         this.dirty = true
         this.deps.log('info', `hub: #${id} seen in the transcript after ${e.pushes} push(es)`)
@@ -444,6 +471,7 @@ export class HubSync {
 
   private async pushDue(): Promise<number> {
     let pushed = 0
+    const withheld = new Map<number, number>()   // WO-120
     let firstSight: string[] | null = null   // transcript lines, read once per run, only if a never-pushed row exists
     for (const id of [...this.listing.keys()].sort((a, b) => a - b)) {
       const key = String(id)
@@ -469,6 +497,8 @@ export class HubSync {
       }
       const now = this.now()
       if (e?.last_push_at != null && now - e.last_push_at < this.opts.graceMs) continue
+      // WO-120: inside a usage wall nothing goes into the session; the row stays untaken at the hub
+      if (this.deps.hold?.()) { withheld.set(id, this.withheldSince.get(id) ?? now); continue }
       const notif = payloadNotif(id, this.listing.get(id)!, { chat_id: this.deps.defaultChatId(), ts: new Date(now).toISOString() })
       const n = await this.deps.push(notif)
       if (n === 0) break   // no ready session: everything waits at the hub for the next trigger
@@ -481,6 +511,8 @@ export class HubSync {
       pushed++
       this.deps.log('info', `hub: pushed #${id} into ${n} session(s) (push ${entry.pushes}/${this.opts.maxPushes})`)
     }
+    if (withheld.size && !this.withheldSince.size) this.deps.log('info', `hub: usage wall — ${withheld.size} row(s) not pushed, kept untaken at the hub until the clear`)
+    this.withheldSince = withheld
     return pushed
   }
 

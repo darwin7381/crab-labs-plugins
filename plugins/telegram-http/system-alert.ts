@@ -38,6 +38,7 @@
 
 import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { join } from 'node:path'
+import { isWallRecordLine, wallCovers, type WallState } from './usage-wall.ts'
 
 type Notify = (text: string) => void
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -45,6 +46,21 @@ type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
 const POLL_MS = 20_000
 const DEDUPE_WINDOW_MS = 10 * 60_000
 const MAX_ALERT_CHARS = 500
+// WO-120: the usage-wall state (usage-wall.ts) owns usage walls: one alert at enter, one at clear (WallAlerts), and no
+// API-error text forwarded one by one while walled. _wall() null (no fresh state) = everything as before.
+const WALL_TICK_MS = 5_000
+const WALL_DEFER_MS = 60_000   // a wall record the state hasn't picked up within this long is forwarded as before
+let _wall: () => WallState | null = () => null
+
+/** WO-120: what the jsonl tail does with an alert while the usage-wall state is fresh. 'send' = as before; 'drop' =
+ *  the wall's own two alerts cover it; 'defer' = a wall record the state hasn't shown as walled yet: wait for it. */
+export function wallRoute(line: string, alert: string, w: WallState | null): 'send' | 'drop' | 'defer' {
+  if (!w || alert.includes('Please run /login')) return 'send'
+  const apiError = line.includes('"isApiErrorMessage":true') || line.includes('"subtype":"api_error"') || /^API Error/i.test(alert)
+  if (!apiError) return 'send'
+  if (w.walled) return 'drop'
+  return isWallRecordLine(line) ? 'defer' : 'send'
+}
 
 export function isSystemAlertEnabled(): boolean {
   return process.env.SYSTEM_ALERT_FORWARD === '1'
@@ -240,6 +256,11 @@ export function handleOtlpLogs(payload: unknown): number {
           // Suppress the raw provider "exceed your account's rate limit"
           // string here — it names the wrong problem (Joey 2026-07-10).
           if (eventName === 'api_error' && attrs['status_code'] === '429') continue
+          // WO-120: inside a usage wall API errors are not forwarded one by one (the wall's enter/clear alerts are)
+          if ((eventName === 'api_error' || eventName === 'api_retries_exhausted') && _wall()?.walled) {
+            _log('info', `system-alert: not forwarded (${eventName} inside a usage wall): ${(attrs['error'] ?? '').slice(0, 160)}`)
+            continue
+          }
           // The server already retried this refusal on another model, so the
           // user never saw it (documented server_fallback_hop=true).
           if (eventName === 'api_refusal' && attrs['server_fallback_hop'] === 'true') continue
@@ -327,10 +348,18 @@ export function startSystemAlertWatcher(opts: {
   // with /roam (returns null between targets). Omitted → static env dir +
   // newest-jsonl (channel-bot: one primary session per fixed dir). (issue #6)
   resolveFile?: () => string | null
+  // WO-120: this daemon's usage-wall state (usage-wall.ts WallReader.state) and its enter/clear alerts (WallAlerts).
+  wall?: () => WallState | null
+  wallAlerts?: { tick(w: WallState | null, notify: Notify): unknown }
 }): void {
   _notify = opts.notify
   _log = opts.log
   if (opts.defer) _defer = opts.defer
+  _wall = opts.wall ?? (() => null)
+  if (opts.wallAlerts) {
+    const wa = opts.wallAlerts
+    setInterval(() => { try { wa.tick(_wall(), _notify) } catch (err) { opts.log('warn', `usage wall alerts: ${err}`) } }, WALL_TICK_MS).unref()
+  }
   const staticDir = process.env.SYSTEM_ALERT_PROJECTS_DIR || process.env.CHANNEL_BOT_PROJECTS_DIR || ''
   if (!staticDir && !opts.resolveFile) {
     opts.log('warn', 'system-alert: no SYSTEM_ALERT_PROJECTS_DIR / CHANNEL_BOT_PROJECTS_DIR and no dynamic resolver — jsonl fallback disabled (OTLP receiver still active)')
@@ -340,8 +369,16 @@ export function startSystemAlertWatcher(opts: {
   let watchedFile = ''
   let offset = 0
   let remainder = ''
+  const deferred: Array<{ alert: string; src: string; ts: number; at: number }> = []   // WO-120
 
   const tick = () => {
+    // WO-120: wall records held back for the state: dropped once it shows them covered, else forwarded as before
+    for (let i = deferred.length - 1; i >= 0; i--) {
+      const d = deferred[i]
+      const w = _wall()
+      if (w && wallCovers(w, d.ts)) { deferred.splice(i, 1); continue }
+      if (!w || Date.now() - d.at >= WALL_DEFER_MS) { deferred.splice(i, 1); relayTuiAlert(d.alert, d.src) }
+    }
     const cur = resolveWatchFile(opts.resolveFile, staticDir)
     if (!cur) return
     if (cur.path !== watchedFile) {
@@ -373,7 +410,12 @@ export function startSystemAlertWatcher(opts: {
         // prevents replaying yesterday's errors on daemon restart.
         const ts = lineTimestampMs(line)
         if (ts !== null && ts < startedAt - 120_000) continue
-        relayTuiAlert(alert, `jsonl session ${watchedFile.split('/').pop()?.slice(0, 8) ?? '?'}…`)
+        const src = `jsonl session ${watchedFile.split('/').pop()?.slice(0, 8) ?? '?'}…`
+        // WO-120 first (a fresh usage-wall state owns the wall's alerts), then the lanes defer (relayTuiAlert; null with lanes off)
+        const route = wallRoute(line, alert, _wall())
+        if (route === 'drop') { opts.log('info', `system-alert: not forwarded (inside a usage wall): ${alert.slice(0, 80)}`); continue }
+        if (route === 'defer') { deferred.push({ alert, src, ts: ts ?? Date.now(), at: Date.now() }); continue }
+        relayTuiAlert(alert, src)
       }
     } catch (err) {
       opts.log('warn', `system-alert: read failed: ${err instanceof Error ? err.message : err}`)

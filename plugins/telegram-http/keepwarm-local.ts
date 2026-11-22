@@ -211,6 +211,9 @@ export interface LocalKeepwarmDeps {
   stateDir: string
   name: string
   now?(): number
+  /** WO-120: the usage-wall state for this agent (usage-wall.ts): true / false when fresh, null = unknown (the
+   *  transcript scan decides, as before). */
+  wall?(): boolean | null
 }
 
 function newestJsonl(dir: string): string | null {
@@ -259,6 +262,9 @@ export class LocalKeepwarm {
       const path = named !== undefined ? (named && existsSync(named) ? named : null) : dir ? newestJsonl(dir) : null
       const text = path ? readTail(path) : ''
       const s = path ? scan(text) : null
+      // WO-120: a fresh usage-wall state decides "walled" instead of this scan (which reads any api-request as the end)
+      const wall = this.d.wall?.() ?? null
+      if (s && wall !== null) s.walled = wall
       if (s?.last_real) st.last_real = Math.max(s.last_real, st.last_real ?? 0)
       if (st.poked_at && (st.poked_kind ?? 'poke') === 'poke' && !st.judged && path) {
         const u = firstUsageAfter(text, st.poked_at)

@@ -72,6 +72,7 @@ import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, d
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
+import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState } from './usage-wall.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
 if (Lanes.LANES_ON) useLanesMenuRules(true)
@@ -743,9 +744,10 @@ const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
 mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 let persistSeq = 0
 
-function persistInbound(notif: { method: string; params: unknown }): string | null {
+// atMs (WO-120): name the file by this time instead of now, so the drain (sorted by name) keeps the original order.
+function persistInbound(notif: { method: string; params: unknown }, atMs?: number): string | null {
   try {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-')
+    const ts = new Date(atMs ?? Date.now()).toISOString().replace(/[:.]/g, '-')
     const seq = String(++persistSeq).padStart(4, '0')
     const filename = `${ts}-${seq}.json`
     const tmpPath = join(PENDING_DIR, filename + '.tmp')
@@ -812,6 +814,103 @@ const RECEIPT_CHECK = process.env.RECEIPT_CHECK !== '0'
 // and pushed from there; the old path below reports the hub ids it delivered as taken. Set further down, once
 // meshAuth and the session registry exist; null = off (HUB_SYNC=0, not agent-inbox, no BTCC_API_BASE) = 1.32.2.
 let hub: HubSync | null = null
+
+// ---- WO-120: usage wall (usage-wall.ts) --------------------------------------------------------------------------
+// One state per agent, decided by usage_wall.py (~/.claude/usage-wall/<tmux key>.json). While it says walled, nothing is
+// written into the session: deliveries park in inbox/pending (no re-delivery attempt counted, never quarantined), hub
+// rows stay untaken at the hub, and a delivery the wall ate before the state flipped is re-persisted once (sweep). At
+// the clear the drain delivers every held item once, in order. No fresh state (keeper dead, OFF, USAGE_WALL_READ=0)
+// → state() is null → everything below behaves exactly as before. Roamers route per target: never matched.
+const wallReader = new WallReader(isRoamerEnabled() ? {} : {
+  tmux: process.env.CHANNEL_BOT_TMUX_SESSION || undefined,
+  agent: process.env.AGENT_INBOX_SELF || undefined,
+  transcriptDirs: [TRANSCRIPT_DIR, process.env.CHANNEL_BOT_PROJECTS_DIR, process.env.KEEPWARM_PROJECTS_DIR]
+    .map(d => (d ?? '').trim()).filter(Boolean),
+}, { onChange: (prev, next) => onWallChange(prev, next) })
+/** What this daemon holds now: parked deliveries + hub rows a wall kept from being pushed. */
+function heldNow(): { count: number; oldestMs: number | null } {
+  let count = 0
+  let oldestMs: number | null = null
+  try {
+    for (const f of readdirSync(PENDING_DIR)) {
+      if (!f.endsWith('.json')) continue
+      count++
+      try { const m = statSync(join(PENDING_DIR, f)).mtimeMs; if (oldestMs == null || m < oldestMs) oldestMs = m } catch {}
+    }
+  } catch {}
+  const h = hub?.withheld()
+  if (h?.count) {
+    count += h.count
+    if (h.oldestMs != null && (oldestMs == null || h.oldestMs < oldestMs)) oldestMs = h.oldestMs
+  }
+  if (Lanes.LANES_ON && !INBOX_ONLY) count += Lanes.mainHeldCount()   // lanes on: what M1 holds for the main (the one entrance)
+  return { count, oldestMs }
+}
+// WO-120 × lanes: with a fresh state, the usage-wall alerts (WallAlerts, tg daemon with SYSTEM_ALERT_FORWARD=1) are the one sender of a wall's two
+// pushes, so the lanes main-wall-up / main-wall-down notices go to the lanes ledger only. Owned only for the kinds usage_wall.py records
+// (rate_limit, billing_error; M2 also walls on login / hold / server errors, which stay its own push), and the down only when the up was owned or the
+// state shows this wall (walled, or cleared within 10 min). Lanes' own wall (lane runs, S.wall) is a separate record: its notices are unchanged.
+// A main-wall-up lanes pushed itself because no state could be read yet (the agent's first wall: the file is written by the same StopFailure) is
+// remembered, and WallAlerts records that episode's enter as told instead of pushing it again (its clear still goes).
+let wallAlertsOn = false
+let mainWallUpOwned = false
+let mainWallToldAt = 0
+function mainWallNoticeOwned(rule: 'main-wall-up' | 'main-wall-down', kind: string | null): boolean {
+  const w = wallAlertsOn ? wallReader.state() : null
+  if (rule === 'main-wall-up') {
+    const usage = kind === 'rate_limit' || kind === 'billing_error'
+    mainWallUpOwned = !!w && usage
+    if (!mainWallUpOwned && wallAlertsOn && usage) mainWallToldAt = Date.now()
+    return mainWallUpOwned
+  }
+  const owned = !!w && (mainWallUpOwned || w.walled || (w.clearedMs != null && Date.now() - w.clearedMs < 600_000))
+  mainWallUpOwned = false
+  return owned
+}
+// <key>.held-<tg|inbox>.json: written from the first wall seen, never removed (the Mac mini watchdog reads it as "this
+// daemon redelivers what a wall ate"); redelivers=false where the daemon can't tell (no transcript dir).
+const heldSidecar = new HeldSidecar({ dir: () => wallDir(), role: INBOX_ONLY ? 'inbox' : 'tg', held: heldNow,
+  redelivers: consumptionCheckAvailable, log })
+// The same item is held once: a sender that retries during a long wall (same content; same message_id / msg_id when it
+// has one, so two real Telegram messages with the same text stay two) is not parked a second time.
+function heldKey(notif: { method: string; params: unknown }): string {
+  const meta = (notif.params as { meta?: Record<string, unknown> } | undefined)?.meta ?? {}
+  return `${deliveryKey(notif)}|${meta.message_id ?? ''}|${meta.msg_id ?? ''}`
+}
+let wallHeldKeys = new Set<string>()
+/** Park one item for the wall; false = the same item is already held. */
+function holdForWall(notif: { method: string; params: unknown }, atMs?: number): boolean {
+  const k = heldKey(notif)
+  if (wallHeldKeys.has(k)) {
+    log('info', `usage wall: the same item is already held — not parked twice (${deliveryKey(notif).slice(0, 80)})`)
+    return false
+  }
+  wallHeldKeys.add(k)
+  const p = persistInbound(notif, atMs)
+  log('info', `usage wall: held ${notif.method} in inbox/pending until the wall clears (${p ? p.split('/').pop() : 'persist failed'})`)
+  return true
+}
+function onWallChange(prev: WallState | null, next: WallState | null): void {
+  if (next?.walled) {
+    log('info', `usage wall: ${next.episode} (${next.kind ?? '?'}, since ${next.since}) — holding every delivery into the session until it clears`)
+    wallHeldKeys = new Set()
+    try {
+      for (const f of readdirSync(PENDING_DIR)) {
+        if (!f.endsWith('.json')) continue
+        try { wallHeldKeys.add(heldKey(JSON.parse(readFileSync(join(PENDING_DIR, f), 'utf8')))) } catch {}
+      }
+    } catch {}
+    heldSidecar.update(next)
+    setImmediate(() => sweepDeliveries())   // re-persist what the wall ate before the state flipped
+    return
+  }
+  if (!prev?.walled) return
+  wallHeldKeys = new Set()
+  heldSidecar.update(next, true)            // the clear: what is held, snapshotted before anything drains
+  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh (as before WO-120)'} — delivering the held items once each, in order`)
+  setImmediate(() => { sweepDeliveries(); void drainPendingIfLive(); void hub?.kick('wall-cleared') })
+}
+setInterval(() => heldSidecar.update(wallReader.state()), Math.max(250, wallReader.cacheMs())).unref()
 
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
 // whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
@@ -884,6 +983,7 @@ function sweepDeliveries(): void {
   if (!consumptionCheckAvailable() || recentDeliveries.length === 0) return
   const now = Date.now()
   const newest = newestGenuineAssistantAt()
+  const wall = wallReader.state()   // WO-120
   // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
   const unseen = recentDeliveries.filter(d => d.keys && !d.received)
   const lines = unseen.length ? receiptLines(Math.min(...unseen.map(d => d.at))) : []
@@ -891,6 +991,19 @@ function sweepDeliveries(): void {
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
     const notReceived = !!d.keys && !d.received
+    // WO-120: a delivery the usage wall ate (made before the state flipped, no genuine answer before the wall began) is
+    // re-persisted once, named by its own time so the drain keeps the order, and that push is not counted toward
+    // MAX_REDELIVERIES (never quarantined). The drain delivers it after the clear and tracks that copy from there.
+    if (wallAte(wall, d.at, newest, now)) {
+      if (!d.pendingPath) {
+        const k = deliveryKey(d.notif)
+        deliveryAttempts.set(k, Math.max(0, (deliveryAttempts.get(k) ?? 1) - 1))
+        log('info', `usage wall ${wall!.episode} ate a delivery made ${Math.round((now - d.at) / 1000)}s ago — re-persisted, not counted as a re-delivery; delivered once after the clear`)
+        holdForWall(d.notif, d.at)
+      }
+      recentDeliveries.splice(i, 1)
+      continue
+    }
     // Consumed = the client took THIS delivery (receipt; skipped when it has no meta.ts) and then a
     // genuine (non-API-error) assistant record came strictly after it. An assistant record alone is not
     // enough: on 11-17 it acked 35 deliveries the client had dropped (Atlas btcc 9738).
@@ -955,11 +1068,22 @@ async function laneRedeliver(notif: { method: string; params: unknown }): Promis
   return (await laneDeliverMesh(notif, undefined, false)) != null
 }
 let replayRunning = false
+// WO-120 (lanes off): inside a usage wall the parked items stay parked (the drain after the clear delivers them), and one replay at a time (the clear
+// kicks a drain that can meet the 30 s timer's or a session-open's; a replay stuck longer than REPLAY_LOCK_MS stops blocking the next one). With lanes
+// on the replay hands each parked item to the router (laneRedeliver), the one entrance: no wall hold in front of it, and 002j's single flight below.
+const REPLAY_LOCK_MS = 60_000
+let replayBusySince = 0
 async function replayPendingFromDisk(server: Server): Promise<number> {
+  if (!Lanes.LANES_ON) {
+    if (wallReader.walled()) return 0
+    if (Date.now() - replayBusySince < REPLAY_LOCK_MS) return 0
+    replayBusySince = Date.now()
+    try { return await replayPendingFromDiskLocked(server) } finally { replayBusySince = 0 }
+  }
   // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
   // would each read the same parked file before either removed it: the same message delivered twice (fleet record
   // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
-  // lanes-golive: lanes only. With lanes off the fleet's replay is unchanged (a candidate fleet fix, for its owner to take).
+  // lanes-golive: lanes only (lanes off: WO-120's one-at-a-time above).
   if (Lanes.LANES_ON && replayRunning) return 0
   replayRunning = true
   try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
@@ -1042,10 +1166,12 @@ async function drainPendingIfLive(): Promise<void> {
   // Parking is acceptable; parking SILENTLY is not. Warn once per file so a
   // stuck queue is visible without waiting for someone to stat the directory.
   const now = Date.now()
+  const wall = wallReader.state()   // WO-120: held on purpose inside a wall (no alert); after it, age counts from the clear
   for (const f of files) {
     if (parkAlerted.has(f)) continue
+    if (wall?.walled) break
     let ageMs = 0
-    try { ageMs = now - statSync(join(PENDING_DIR, f)).mtimeMs } catch {}
+    try { ageMs = now - Math.max(statSync(join(PENDING_DIR, f)).mtimeMs, wall?.clearedMs ?? 0) } catch {}
     if (ageMs > PARK_ALERT_AFTER_MS) {
       parkAlerted.add(f)
       log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
@@ -1215,6 +1341,10 @@ if (hubMode.on) {
     dispatchOld: (chatId, notif) => dispatchInbound(chatId, notif),
     defaultChatId: () => String(loadAccess().allowFrom[0] ?? 'local-inject'),
     log,
+    // WO-120: nothing is pushed into a walled session, and a push the wall ate is pushed once more after the clear. Lanes off only: with lanes on
+    // the push is laneHubPush (the router, the one entrance; M1 holds for the main's wall) and receipts are off, so neither applies there.
+    hold: () => !Lanes.LANES_ON && wallReader.walled(),
+    ate: at => !Lanes.LANES_ON && wallAte(wallReader.state(), at, newestGenuineAssistantAt()),
   // lanes-golive (C3): with lanes on, taken = the router accepted the row (it is on the lanes journal; M1 owns its delivery to the main), so no
   // transcript receipt is waited for: one count per delivery
   }, { stateDir: STATE_DIR, receiptCheck: () => !Lanes.LANES_ON && RECEIPT_CHECK && consumptionCheckAvailable(), graceMs: RECEIPT_GRACE_MS,
@@ -1968,6 +2098,11 @@ if (isSystemAlertEnabled()) {
     // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
     // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
     defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => Lanes.wallKind(msg) != null : undefined,
+    // WO-120: usage walls are one state — API errors inside one aren't forwarded one by one; enter + clear alerts (with lanes on these are the
+    // main's wall notices too: mainWallNoticeOwned)
+    wall: () => wallReader.state(),
+    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, dir: () => wallDir(), log,
+      enterToldElsewhere: w => (mainWallToldAt && w.sinceMs != null && Math.abs(mainWallToldAt - w.sinceMs) < 120_000 ? 'lanes main-wall-up' : null) })),
     notify: text => {
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
@@ -2026,6 +2161,7 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
     ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
+    wall: () => { const w = wallReader.state(); return w ? w.walled : null },   // WO-120: the state decides "walled"
     // this agent's own unread count, with its own credential (an agent may read only its own row)
     mail: async () => {
       try {
@@ -3169,6 +3305,12 @@ function stampDid(notif: { method: string; params: unknown }): void {
   } catch {}
 }
 function broadcastNotification(notif: { method: string; params: unknown }): void {
+  // WO-120: inside a usage wall nothing is written into the session: park it (no re-delivery attempt is counted); the
+  // drain after the clear delivers it once, in order. With lanes on this is the fallback path (no router could be asked), so the hold stays here.
+  if (wallReader.walled()) {
+    if (holdForWall(notif)) heldSidecar.update(wallReader.state())
+    return
+  }
   if (Lanes.LANES_ON) stampDid(notif)      // lanes-golive: lanes only; lanes off, the <channel> tag carries exactly the fleet's meta
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
@@ -3563,6 +3705,7 @@ if (Lanes.LANES_ON) {
       rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
+    wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes
     ...(INBOX_ONLY ? {
       meshSend: async (to, text, replyTo, noReply, extra, send) => {
         let msgId: number | undefined, delivered = false
@@ -3652,6 +3795,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           catch { return 0 }
         })(),
         hub: hub ? hub.health() : { enabled: false, why: hubMode.why },
+        // WO-120: this daemon's usage-wall state (null = no fresh state: delivering as before)
+        usage_wall: (() => { const w = wallReader.state(); return w ? { walled: w.walled, episode: w.episode, key: w.key, cleared_by: w.cleared_by } : null })(),
         pid: process.pid,
         // 002: health = "the registered main is connected", not "≥1 session" (evidence #8)
         ...(Lanes.LANES_ON ? Lanes.lanesHealth() : {}),
@@ -4080,7 +4225,11 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         if (boundServer && sseOpen.get(sessionId)) {    // closed during the wait → leave it all parked
           const queued = memQueue.get(sessionId) ?? []
           memQueue.delete(sessionId)                    // take ownership before the first await
-          if (queued.length > 0) {
+          if (queued.length > 0 && wallReader.walled()) {
+            // WO-120: inside a usage wall they park on disk instead; the drain after the clear delivers them
+            for (const notif of queued) holdForWall(notif)
+            log('info', `usage wall: ${queued.length} mem-queued notif(s) for session ${sessionId} parked in inbox/pending until the wall clears`)
+          } else if (queued.length > 0) {
             log('info', `flushing ${queued.length} mem-queued notif(s) for session ${sessionId}`)
             for (const notif of queued) {
               try {
