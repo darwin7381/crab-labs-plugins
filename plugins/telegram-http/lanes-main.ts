@@ -17,6 +17,7 @@
  * One writer: the tg daemon. Information (the digest) is never offered alone: it rides the next offer or pull.
  */
 import type { Journal, Row } from './lanes-state.ts'
+import { BOUNDARY_MAIN_RULE, boundaryCardOn } from './lanes-boundary.ts'
 
 export type Notif = { method: string; params: unknown }
 export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry'
@@ -616,6 +617,8 @@ export function mainContext(agent: string, sid: string): string {
       + '它回傳整天每件事一行的活動清單，包含車道處理掉、沒有叫醒你的例行事。清單裡每一件都要交代到，連同它的具體數字、時間、人名，再補上你自己處理的事。'
       + '某一件的原文用 ledger_query(text=關鍵字)；答應過什麼也可以查 kind=commitment。',
     '- 維護焦點卡 .lanes/focus.md：任務改變時更新，3 到 6 行，寫「目前在做什麼、關鍵限制、別碰什麼」。車道開機時會讀它。',
+    // WO-125 (A.5): the boundary card's rule, the ticket's words, next to the focus card's (LANES_BOUNDARY_CARD=0: not there)
+    ...(boundaryCardOn() ? [BOUNDARY_MAIN_RULE] : []),
     // WO-123: the files a lane may append to are the main's to declare; the last sentence (what NOT to declare) is Chiron's (#10869)
     '- 車道預設不能寫你的檔。要讓車道自己把紀錄補進某個檔（日誌、流水帳、狀態紀錄），在 .lanes/appendable.txt 宣告它：一行一個相對路徑（只收 .md .txt .log .csv .tsv .jsonl；記憶、.lanes/、CLAUDE.md、REANCHOR 與它列的定錨檔、設定檔一律不收）。'
       + '車道用 append_file 把內容加在檔案最後，既有內容它動不了。你自己往這些檔加內容也用 append_file 或 shell 的 >>，不要整檔重寫，車道同時加的那一行才不會掉。'

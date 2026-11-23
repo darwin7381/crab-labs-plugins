@@ -27,17 +27,21 @@ import { createMain, mainContext, type MainApi, type ItemKind, type Via } from '
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
+import {
+  BOUNDARY_WARN_LINES, blockFactsOn, blockedFacts, blockedLine, blockedReceiptRefusal, bashWritesPath, boundaryCard, boundaryCardOn, boundaryReminder, isSuccess,
+  parseSteps, receiptStepsOn, receiptToolWithSteps, stepsNotDoneText, stepsRefusal, type Blocked, type BoundaryCard,
+} from './lanes-boundary.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import {
-  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync,
+  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync,
   rmSync, statSync, writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { dirname, join, resolve as resolvePath } from 'path'
+import { basename, dirname, join, resolve as resolvePath } from 'path'
 import { fileURLToPath } from 'url'
 import type { IncomingMessage, ServerResponse } from 'http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -665,6 +669,10 @@ type State = {
   msg_topics?: Record<string, number | null>
   /** lanes-topics (item 2): topic (thread id) → its name as last known (the bot's createForumTopic, the topic's creation / edit service message) */
   topic_names?: Record<string, string>
+  /** WO-125 (A.4): the boundary card the last run got (its length; the hash of boundary.md, null = the default), and the boundary.md contents whose
+   *  「邊界卡現在 N 行」 line has reached the main in a digest (at most once per content) */
+  boundary?: { hash: string | null; lines: number; source: 'default' | 'file' }
+  boundary_told?: string[]
 }
 /** 002k (E18): a message of Joey's handed to the run in progress (run/steer/<lane>.in.jsonl) and what is known of it: when (ms, the daemon's clock) and for which run */
 type SteerRec = { ev: InEvent; sent: number; run: string }
@@ -741,6 +749,8 @@ function focusText(): string | null {
   try { const t = readFileSync(join(LANES_DIR, 'focus.md'), 'utf8').trim(); return t && t !== NO_FOCUS ? t : null } catch { return null }
 }
 function focusCard(): string { return focusText() ?? NO_FOCUS }
+/** WO-125 (A): the boundary card of a run starting now, or null with LANES_BOUNDARY_CARD=0 */
+function runBoundary(): BoundaryCard | null { return boundaryCardOn() ? boundaryCard(D.agent, LANES_DIR) : null }
 
 // ================================================================== router
 export type InEvent = {
@@ -1040,7 +1050,11 @@ function routeMailWake(ev: InEvent): Decision {
 export const MAIL_LANE_TOOL_NAMES = ['mailbox_list', 'mailbox_open', 'mailbox_check', 'mailbox_reply']
 export const MAIL_LANE_TOOLS = FLEET_TOOLS.filter(t => MAIL_LANE_TOOL_NAMES.includes(t.name))
 /** the lane tools a run lists: every lane's, plus the mailbox for the mail lane */
-export function laneToolsFor(kind: LaneKind | undefined): any[] { return kind === 'mail' ? [...LANE_TOOLS, ...MAIL_LANE_TOOLS] : LANE_TOOLS }
+export function laneToolsFor(kind: LaneKind | undefined): any[] {
+  // WO-125 (C): with LANES_RECEIPT_STEPS on, the receipt takes `steps` (receiptToolWithSteps); off, LANE_TOOLS as they were
+  const base = receiptStepsOn() ? LANE_TOOLS.map(t => t.name === 'receipt' ? receiptToolWithSteps(t) : t) : LANE_TOOLS
+  return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS] : base
+}
 
 /** M1: an event the router gives the main is an item for it (the screen's warning in front). The digest is not attached here: it rides whatever M1
  *  offers or the main's hook pulls next (lanes-main.ts). `owesOnlyMain`: the item is all it owes (a wake-up line: no Joey line, no answer, no receipt). */
@@ -1768,7 +1782,12 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   /** every tool call of the run (from its stream), for the lane-stop model aid */
   calls?: Array<{ name: string; input: any }>
   /** the lane stop asked once (M3: it blocks once); the decline aid and the owner-claim warning were given once */
-  stopHeld?: boolean; declineHeld?: boolean; claimWarned?: boolean }
+  stopHeld?: boolean; declineHeld?: boolean; claimWarned?: boolean
+  /** WO-125 (B): the writes and commands the guard refused in this run (POST /lane-blocked), each cleared by a later success on its target; the
+   *  〔系統〕 line last written on the run's event */
+  blocked?: Blocked[]; blockedNoted?: string
+  /** WO-125 (C): the steps of the receipt this run filed (how many, how many not done); this run handed work to the main (an accepted handoff_main) */
+  steps?: { marked: number; notDone: number }; handedOver?: boolean }
 const runTokens = new Map<string, RunTok>()
 // ------------------------------------------------------------------ M5: the run record
 // One record per lane run: queued → leased → running(pid) → exited(reason). reason: normal | cap_turns | cap_usd | budget | wall:<kind> | died |
@@ -2212,8 +2231,8 @@ function coalesce(it: QItem, waiting: QItem[]): void {
   }
   logos('lane.coalesced', { lane: it.lane, event: it.ev.id, with: more.map(o => o.ev.id) })
 }
-function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = []): string {
-  const head = laneContext(lane, it, cardUpdate)
+function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = [], boundary?: BoundaryCard | null): string {
+  const head = laneContext(lane, it, cardUpdate, boundary)
   if (!it.extra?.length) return `${head}\n${renderEvent(it.ev)}`
   const repeats = it.extra.filter(e => e.repeat_of), more = it.extra.filter(e => !e.repeat_of)
   return [head, renderEvent(it.ev),
@@ -2331,6 +2350,7 @@ function laneEnv(lane: Lane): Record<string, string> {
   env.LANES_MEMORY_DIR = memoryDir()
   env.LANES_WORKSPACE = D.workspaceDir               // 002k (H6): the guard hook's workspace is the lane's start directory, not wherever its shell has wandered
   if (process.env.LANES_SVC_ALLOW) env.LANES_SVC_ALLOW = process.env.LANES_SVC_ALLOW   // 002k (H6): the guard's documented svc allowlist override reaches the hook (laneEnv drops the rest of the daemon's env)
+  if (blockFactsOn()) env.LANES_BLOCK_FACTS = '1'       // WO-125 (B): the guard hook reports what it refuses (POST /lane-blocked); off: it reports nothing, as before
   // 002l (S0 item 1): a lane never writes auto-memory (design/memory 「其他線…不碰記憶檔」; S0: 3 sessions creating MEMORY.md at once lost 7 of 12 index lines).
   // CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 (claude 2.1.322, the env behind the autoMemoryEnabled setting) takes the auto-memory section and the memory tools' path out
   // of the lane's prompt; the lane reads the memory index in its stable system prompt instead (laneSystemPrompt) and still proposes through the ledger. Not
@@ -2455,8 +2475,10 @@ export function identityCard(lane: Pick<Lane, 'kind'>, _it?: unknown): string {
 }
 
 /** 002k (B19): everything that differs from lane to lane (lane id, thread, why the lane was opened, the focus card, the critical
- *  flag, a thread summary, the fan-out role) at the head of the event prompt, in front of the event. */
-export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardUpdate: string[] = []): string {
+ *  flag, a thread summary, the fan-out role) at the head of the event prompt, in front of the event. WO-125 (A): the boundary card follows the focus
+ *  card, built for this run (`boundary`: the one startRun built, so the run's record says which; undefined = built here; null = none, the switch off). */
+export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardUpdate: string[] = [], boundary?: BoundaryCard | null): string {
+  const bc = boundary === undefined ? runBoundary() : boundary
   const kindName = KIND_NAME[lane.kind]
   const why = lane.kind === 'worker'
     ? `為「${lane.title ?? ''}」而開，綁定 Joey 私訊裡的話題 #${lane.topic ?? '-'}（Joey 在那個話題裡說的話會送到你這裡；你的 notify_joey 會自動發到那個話題）`
@@ -2473,6 +2495,7 @@ export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardU
     ``,
     `# 焦點卡（主線寫的，你只能讀）`,
     focusCard(),
+    ...(bc ? [``, bc.text] : []),                                       // WO-125 (A): every run, resumed sessions included (it is in the run prompt)
     ...(it.summary ? [``, `# 這個 thread 先前的帳本紀錄（原車道已結束太久，由你接手）`, it.summary] : []),
     ...fanoutLines(lane, it),
     ...appendableLines(),
@@ -2667,7 +2690,9 @@ function startRun(it: QItem): void {
   const { resume, args: sess } = sessionArgs(lane)
   const cardUpdate = cardDelivery(lane, resume && !sess.includes('--fork-session'))   // 1.36.2: a resumed session gets a changed card once
   const lm = laneModelFor(lane.kind)                                        // lanes-topics (item 3): worker / fork lanes run the main's model
-  const args = ['-p', runPrompt(it, lane, cardUpdate), '--model', lm.model, ...sess]
+  const bc = runBoundary()                                                  // WO-125 (A): this run's boundary card; its length is the digest's reminder (A.4)
+  if (bc) S.boundary = { hash: bc.hash, lines: bc.lines, source: bc.source }
+  const args = ['-p', runPrompt(it, lane, cardUpdate, bc), '--model', lm.model, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt-file', laneSystemPromptFile(lane.kind),        // 002l (D15): card + CLAUDE.md context + memory index, one file per kind
     '--settings', join(LANES_DIR, 'lane-settings.json'), '--setting-sources', 'project,local',   // the plugin's lane settings, never the user's (writeLaneSettings)
@@ -2780,6 +2805,7 @@ function startRun(it: QItem): void {
           }
           const step = tools.find(t => t.id && t.id === String(c.tool_use_id ?? ''))
           if (step) { step.result = body.replace(/\s+/g, ' ').trim().slice(0, STEP_RESULT_MAX); step.error = !!c.is_error }
+          if (step && !c.is_error && tok.blocked?.length) clearBlocked(tok, step.name, step.input)      // WO-125 (B): a later success on a refused target
         }
       }
       if (j.type === 'result') { result = String(j.result ?? ''); resultJson = j; resultUsage = j.usage ?? null }
@@ -2827,9 +2853,15 @@ function startRun(it: QItem): void {
       .map(t => t.name.replace('mcp__lane__', ''))
     // PL7 (P21): a run whose lane was closed while it ran ends `closed`, an exit reason like the others: the exit rule below handles it
     const reason = lane.status === 'closed' ? 'closed' : exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
+    // WO-125 (observation points, ticket item 8): per run, what the guard refused (still counting at the end), the steps the receipt marked, the card's length
+    const bf = blockFactsOn() ? blockedFacts(tok.blocked) : null
+    if (blockFactsOn()) noteBlocked(tok)                                // the run's line in the main's digest carries the final count
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: runId, event: it.ev.id, session_id: lane.session_id,
       transcript: lane.transcript, exit_code: code, signal, reason, duration_s: Math.round((Date.now() - started) / 100) / 10,
-      calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers })
+      calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers,
+      ...(blockFactsOn() ? { blocked_n: bf?.n ?? 0, blocked_targets: bf?.targets.slice(0, 3) ?? [] } : {}),
+      ...(receiptStepsOn() ? { steps_marked: tok.steps?.marked ?? 0, steps_not_done: tok.steps?.notDone ?? 0 } : {}),
+      ...(bc ? { boundary_lines: bc.lines, boundary_source: bc.source } : {}) })
     logos('lane.exit', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
       exit_code: code, signal, reason, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
     D.log('info', `lanes: exit ${runId} ${reason} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
@@ -3591,16 +3623,20 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
     { said: text.slice(0, 200), joey_tier: r0.tier })
   if (!v.ok) return v.why!
   const r = joeyRendering(v.event, tok, lane, level, v.ob, text, shown)
+  // WO-125 (B): what the guard refused in this run so far rides on the line Joey gets anyway (never a message of its own): after the rendering, so a
+  // routine line cut to its first line still carries it
+  const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
+  const body = bl ? `${r.body}\n${blockedLine(bl)}` : r.body
   const cls = metClass(v.event, tok)                                             // the met event's class (002w F)
   const rec = { lane: lane.id, thread: lane.thread, event: evId, class: cls, trigger: tok.trigger, escalated: decision, ...(decision ? { ask: true } : {}) }
   const refs = { class: cls, trigger: tok.trigger, escalated: decision, ...(decision ? { ask: true } : {}), tier: r.tier, tier_rule: r.rule, ...(decision ? (v.raised ? { raised: 'line→decision' } : {}) : { outcome }) }
-  const note = (extra: Record<string, unknown> = {}): void => ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, decision ? 1000 : 400)}`, refs: { ...refs, ...extra }, detail: lane.transcript })
+  const note = (extra: Record<string, unknown> = {}): void => ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, decision ? 1000 : 400)}${bl ? `\n${blockedLine(bl)}` : ''}`, refs: { ...refs, ...(bl ? { blocked: bl } : {}), ...extra }, detail: lane.transcript })
   if (decision) logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: evId, class: cls, to: 'joey' })
   if (r.tier === 'ledger') {
     events.result(evId, v.ob?.id, true, { ref: 'ledger' }); note(); logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule })
     return decision ? 'recorded in the ledger (this kind of notice never reaches Joey)' : 'recorded in the ledger'
   }
-  const id = await pushJoey(lane, r.body, r.tier === 'silent', joeyReplyTo(replyEventFor(tok)), ownerOf(evId))
+  const id = await pushJoey(lane, body, r.tier === 'silent', joeyReplyTo(replyEventFor(tok)), ownerOf(evId))
   events.result(evId, v.ob?.id, id != null, { ref: id, why: 'the Telegram send failed' })                      // PL2: met on the delivery, not before it
   note({ message_id: id, delivered: id != null })
   if (id == null) throw new Error(`send failed: Joey did not get it; the ${decision ? 'question' : 'line'} is still owed (${decision ? 'ask' : 'send it'} again)`)
@@ -3772,6 +3808,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!v.ok) return v.why!
       // 002y (X-3): the request itself is the main's from here, whether the lane replied to the peer before this call or replies after it
       const hid = handToMain(tok.evId, lane, text, `ho-${shortId()}`, tok.cls, 1000, true, undefined, true)
+      tok.handedOver = true                                               // WO-125 (C): its steps not done are the main's now (stepsRefusal)
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words, the router's own line); the answer is
       // the main's, with a due time (002q: the lane's own reply to the peer stays its own)
@@ -3782,6 +3819,15 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
     case 'receipt': {
       const runIdArg = String(a.run_id ?? '').replace(/\D/g, '')
       const outcome = String(a.outcome ?? 'done')
+      // WO-125 (C, B): checked before anything is recorded; a refused receipt records nothing. C: a step marked not done and a success outcome, in a
+      // run that handed nothing to the main. B: a scheduled run's receipt filed as a success while a refused write or command still counts.
+      const steps = receiptStepsOn() ? parseSteps(a.steps) : null
+      if (steps && !Array.isArray(steps)) return `沒有記錄：${steps.why}`
+      if (steps && isSuccess(outcome) && steps.some(x => !x.done) && !tok.handedOver) return stepsRefusal(outcome, steps)
+      const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
+      if (bl && runIdArg && isSuccess(outcome) && !receiptFiled(runIdArg)) return blockedReceiptRefusal(runIdArg, outcome, bl)
+      const notDone = steps ? stepsNotDoneText(steps) : ''
+      if (steps) tok.steps = { marked: steps.length, notDone: steps.filter(x => !x.done).length }
       // 002b: a receipt that carries the four-part report goes to the main's digest (notify_main); a bare one stays ledger-only. Tag markup is stripped (B21).
       const rep = cleanReport(a)
       tok.receipt = { outcome, text: [a.summary, a.happened, a.did, a.promised, a.needs_main].filter(x => typeof x === 'string').join(' ') }
@@ -3799,10 +3845,14 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         }
       }
       const note = a.summary ? stripMarkup(String(a.summary)).slice(0, 200) : rep?.happened.slice(0, 200)
-      if (rep) events.note(tok.evId, { did: [rep.happened, rep.did].filter(x => x && !/^(無|none)$/i.test(x)).join('；').slice(0, 300) })   // the digest's line for this event
-      else if (note && !events.get(tok.evId)?.did) events.note(tok.evId, { did: note })
-      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'receipt', text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}`,
-        ...(rep ? { refs: { report: rep, class: tok.cls } } : {}) })     // 002k (B15): the class lets the digest merge routine threads of one class
+      const undone = notDone ? `沒做：${notDone}` : ''                     // WO-125 (C): the receipt says which steps were not done (and so does the digest)
+      if (rep) events.note(tok.evId, { did: [rep.happened, undone, rep.did].filter(x => x && !/^(無|none)$/i.test(x)).join('；').slice(0, 300) })   // the digest's line for this event
+      else if (note && !events.get(tok.evId)?.did) events.note(tok.evId, { did: undone ? `${note}；${undone}` : note })
+      const more = { ...(steps ? { steps } : {}), ...(bl ? { blocked: bl } : {}) }      // WO-125: the steps as marked, what the guard refused (B: the 〔系統〕 line)
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'receipt',
+        text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}${steps ? `\n步驟 ${steps.length} 步${notDone ? `，${undone}` : '，都做了'}` : ''}${bl ? `\n${blockedLine(bl)}` : ''}`,
+        ...(rep || steps || bl ? { refs: { ...(rep ? { report: rep, class: tok.cls } : {}), ...more } } : {}) })     // 002k (B15): the class lets the digest merge routine threads of one class
+      if (bl) noteBlocked(tok)
       if (rep && !(tok.commitments ?? 0)) {     // 002c: a promise that only lives in the receipt still gets its own ledger kind
         const cm = commitmentFromReport(rep.promised, queue.get(tok.evId)?.ev.from, th?.peer)
         if (cm) {
@@ -3815,7 +3865,11 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, a.summary, 'receipt')).text}${chainNote}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
-    case 'append_file': return appendTool(a, { lane: lane.id, thread: lane.thread, event: tok.evId })   // WO-123
+    case 'append_file': {                                                // WO-123
+      const out = appendTool(a, { lane: lane.id, thread: lane.thread, event: tok.evId })
+      if (out.startsWith('added ') && tok.blocked?.length) clearBlocked(tok, 'append_file', a)   // WO-125 (B): the refused write went in the one allowed way
+      return out
+    }
     case 'claim_file': {
       const path = String(a.path ?? '').trim(), why = String(a.why ?? '').trim()
       if (!path) throw new Error('path required')
@@ -4352,6 +4406,61 @@ export async function completeRun(tok: RunTok, runId: string, outcome: string, s
   })
   logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok })
   return { ok: c.ok, text: c.text }
+}
+// ------------------------------------------------------------------ WO-125 (B): what the guard refused in a run, as system facts
+// lane-guard-hook.py reports each refusal of a lane run (POST /lane-blocked, the run's token; LANES_BLOCK_FACTS=1 in the lane's env): the target is the file a
+// write tool or a shell write was refused on (workspace-relative), else the command's first 80 characters. Not reported: the receipt's own handling (a
+// receipt-only command, a run already completed, a receipt chained after ALLOWED steps). A refusal stops counting when a later call of the same run
+// succeeds on its target (the stream's tool results: a Write / Edit to the path, a Bash command that writes it, append_file to it). What still counts
+// rides on the run's notify_joey / ask_joey, its receipt and its digest line (blockedLine), and a scheduled receipt cannot be filed as a success.
+/** a refusal the guard reported for this run; false = not recorded (the switch off, no target) */
+export function recordBlocked(tok: RunTok, b: any): boolean {
+  if (!blockFactsOn() || !tok) return false
+  const target = String(b?.target ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+  if (!target) return false
+  const rec: Blocked = { target, category: b?.category === 'command' ? 'command' : 'file', tool: String(b?.tool ?? '').slice(0, 40), at: nowIso() }
+  ;(tok.blocked ??= []).push(rec)
+  appendJsonl('lanes.jsonl', { lane: tok.lane, kind: 'blocked', run: tok.runId, event: tok.evId, tool: rec.tool, category: rec.category, target })
+  return true
+}
+/** a path as the guard names it: relative to the workspace when inside it (symlinks resolved), else absolute */
+function laneRel(p: string): string {
+  if (!p) return ''
+  const abs = resolvePath(D.workspaceDir, p.startsWith('~/') ? join(process.env.HOME || homedir(), p.slice(2)) : p)
+  let real = abs
+  try { real = realpathSync(abs) } catch { try { real = join(realpathSync(dirname(abs)), basename(abs)) } catch {} }
+  const roots = [resolvePath(D.workspaceDir)]
+  try { roots.push(realpathSync(D.workspaceDir)) } catch {}
+  for (const c of [real, abs]) for (const r of roots) if (c === r || c.startsWith(r + '/')) return c.slice(r.length + 1) || '.'
+  return real
+}
+/** the guard's name for a command it refused that writes no file it could name: its first 80 characters, whitespace folded (lane-guard-hook.py command_head) */
+const commandHead = (cmd: string): string => Array.from(cmd.replace(/\s+/g, ' ').trim()).slice(0, 80).join('')
+/** a call of the run succeeded (its tool result came back without error): the refusals on its target stop counting */
+function clearBlocked(tok: RunTok, name: string, input: any): void {
+  const live = (tok.blocked ?? []).filter(b => !b.cleared)
+  if (!live.length) return
+  let hit: (b: Blocked) => boolean
+  if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'append_file'].includes(name)) {
+    const t = laneRel(String(input?.file_path ?? input?.notebook_path ?? input?.path ?? ''))
+    hit = b => b.category === 'file' && b.target === t
+  } else if (name === 'Bash') {
+    const cmd = String(input?.command ?? ''), head = commandHead(cmd)
+    hit = b => b.category === 'file' ? bashWritesPath(cmd, b.target) : b.target === head
+  } else return
+  const at = nowIso()
+  for (const b of live) if (hit(b)) b.cleared = at
+}
+/** the run's event carries the line of what still counts (the main's digest renders it); written only when it changed */
+function noteBlocked(tok: RunTok): void {
+  const f = blockedFacts(tok.blocked), line = f ? blockedLine(f) : ''
+  if (line === (tok.blockedNoted ?? '')) return
+  tok.blockedNoted = line
+  events?.note(tok.evId, { blocked: line || null })
+}
+/** scheduler run `run` has its receipt met or being sent (on any event): a receipt filed again is refused as a repeat, not for what was refused */
+function receiptFiled(run: string): boolean {
+  return !!events?.rows(e => ((e.obligations ?? []) as Ob[]).some(o => o.kind === 'receipt' && String(o.run_id) === run && (o.state === 'met' || o.state === 'requested'))).length
 }
 const RECEIPT_CLI = /(?:^|[\s;&|(])(?:\S*\/)?btcc-receipt\s+complete\s+['"]?(\d+)/g      // lanes-golive (A6): any path (fleet ~/.claude/tools/btcc-receipt, lab ./bin/btcc-receipt)
 /** 002w (D, gap 17): a tool call of the main went through (PostToolUse): a ./bin/btcc-receipt complete N in it completed scheduler run N, so the receipt the
@@ -4988,12 +5097,24 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   const changed = events.rows(e => inViews(e) && e.version > Math.max(Number(shown[e.id]) || 0, Number(e.main_seen) || 0))   // main_seen: what the main changed itself
   const standing = standingLines()
   if (!changed.length && !standing.proposals.length) return null                  // a hold alone is not news: it rides with something that is
-  const d = renderEvents(changed.map(e => digestLine(e)), [...standing.proposals, ...standing.holds], 'digest')
+  const long = boundaryLong()                                                     // WO-125 (A.4): rides like a hold, never news alone
+  const d = renderEvents(changed.map(e => digestLine(e)), [...standing.proposals, ...standing.holds, ...(long ? [boundaryReminder(long.lines)] : [])], 'digest')
   if (!d) return null
   routeRow({ event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
   return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items,
-    proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => p.id) } }   // 002v: the standing Joey proposals it carried (the memory gate's `shown`)
+    proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => p.id),   // 002v: the standing Joey proposals it carried (the memory gate's `shown`)
+    ...(long ? { boundary_card: long.hash } : {}) } }                           // WO-125 (A.4): this boundary.md's reminder (told once a digest carrying it reached the main)
+}
+/** WO-125 (A.4): the boundary card the last run got is longer than BOUNDARY_WARN_LINES and the main has not been told about this boundary.md yet (a digest
+ *  that carried the line reached it: offered, bound or done; one that went back to the queue carries it again). At most once per content of the file. */
+function boundaryLong(): { hash: string; lines: number } | null {
+  const b = S.boundary
+  if (!boundaryCardOn() || !b?.hash || b.lines <= BOUNDARY_WARN_LINES || (S.boundary_told ?? []).includes(b.hash)) return null
+  if (main.items(r => r.kind === 'digest' && (r.state === 'done' || r.state === 'offered' || r.state === 'bound') && r.boundary_card === b.hash).length) {
+    S.boundary_told = [...(S.boundary_told ?? []), b.hash].slice(-50); saveState(); return null
+  }
+  return { hash: b.hash, lines: b.lines }
 }
 /** the lines every view carries while they last: open Joey memory proposals (002k D1) and active peer holds */
 function standingLines(): { proposals: string[]; holds: string[] } {
@@ -5035,6 +5156,7 @@ function digestLine(e: Row, whole = false): DigestLine {
     : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'handed' ? `交給主線回 ${o.to}` : o.state === 'met' ? `已${o.by === 'main' ? '由你' : ''}${o.level === 'message' ? '告訴' : '回'} ${o.to}${e.answered && o.by !== 'main' ? `：「${clip(String(e.answered), 80)}」` : ''}`
     : o.state === 'requested' ? `正在送給 ${o.to}` : `還沒回 ${o.to}${failed(o)}`))
   for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線` : `run ${o.run_id} 還沒回執${failed(o)}`))
+  if (e.blocked && blockFactsOn()) st.push(String(e.blocked))                    // WO-125 (B): what the guard refused in the run, as the system counted it
   if (handed) st.push(`需主線：〔${handed.handoff ?? handed.id}〕${fit(String(handed.what ?? ''), 200)}`)
   // PL1: what the main must know about the event is on its record
   if (e.answers) st.push(`回覆 ${e.answers === 'main' ? '你' : laneLabelOf(String(e.answers))} 的提問（對方標了不用回）`)
@@ -5193,9 +5315,19 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     const b = await readBody(req), tok = runTokens.get(token)!
     const run = String(b.run_id ?? '').replace(/\D/g, ''), outcome = String(b.outcome ?? 'done'), note = stripMarkup(String(b.note ?? '')).slice(0, 200)
     if (!run) { sendJson(res, 200, { ok: false, text: 'no run id: btcc-receipt complete <run>' }); return true }
+    // WO-125 (B): while a refused write or command of this run counts, the run is not completed as a success; the hook tells the lane to file it again
+    const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
+    if (bl && isSuccess(outcome) && !receiptFiled(run)) { sendJson(res, 200, { ok: false, text: blockedReceiptRefusal(run, outcome, bl), refile: true }); return true }
     const c = await completeRun(tok, run, outcome, note || undefined, 'btcc-receipt')
-    if (c.ok) ledger({ lane: tok.lane, thread: S.lanes[tok.lane]?.thread ?? null, event: tok.evId, kind: 'receipt', text: `run ${run}: ${outcome}${note ? ' — ' + note : ''}（btcc-receipt）` })
+    if (c.ok) ledger({ lane: tok.lane, thread: S.lanes[tok.lane]?.thread ?? null, event: tok.evId, kind: 'receipt', text: `run ${run}: ${outcome}${note ? ' — ' + note : ''}（btcc-receipt）${bl ? `\n${blockedLine(bl)}` : ''}`,
+      ...(bl ? { refs: { blocked: bl } } : {}) })
+    if (c.ok && bl) noteBlocked(tok)
     sendJson(res, 200, c); return true
+  }
+  if (u.pathname === '/lane-blocked' && D.role === 'tg' && req.method === 'POST') {             // WO-125 (B): a write or command the lane's guard hook refused
+    const token = laneBearer(req)
+    if (!token) { sendJson(res, 403, { error: 'lane token required' }); return true }
+    sendJson(res, 200, { ok: recordBlocked(runTokens.get(token)!, await readBody(req)) }); return true
   }
   if (!u.pathname.startsWith('/lanes/')) return false
   if (!D.authOk(req.headers['authorization'] as string | undefined)) { sendJson(res, 403, { error: 'loopback token required' }); return true }

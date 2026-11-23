@@ -274,6 +274,41 @@ def deny(reason):
                                              'permissionDecisionReason': reason}}))
 
 
+# ---- WO-125 (B): a refusal is a system fact of the run
+# Each write or command refused in a lane run is reported to the daemon (POST /lane-blocked with the run's token), which counts it on the run: the run's
+# notify_joey / ask_joey, its receipt and its digest line then carry 「〔系統〕這一趟 N 次寫入或指令被擋：…」, and its scheduled receipt is not completed as a
+# success (11-23: five runs reported as done a write refused here). Only with LANES_BLOCK_FACTS=1 in the lane's env (lanes.ts laneEnv, the daemon's switch).
+# The target is the file (workspace-relative inside the workspace), else the command's first 80 characters. Not reported: the receipt's own handling (a
+# receipt-only command, whatever the daemon answers; a receipt chained after ALLOWED steps). The report never changes the decision: it is sent after the
+# decision is printed, and any failure is ignored.
+BLOCK = {'target': ''}                  # the file of the refusal write_policy returned ('' = none named: the command is the target)
+
+
+def shown_path(rp, ws):
+    return os.path.relpath(rp, ws) if under(rp, ws) else rp
+
+
+def command_head(cmd):
+    return re.sub(r'\s+', ' ', cmd).strip()[:80]
+
+
+def report_block(tool, target, category):
+    if os.environ.get('LANES_BLOCK_FACTS') != '1' or not target:
+        return
+    port, tok = os.environ.get('LANES_HTTP_PORT'), os.environ.get('LANE_RUN_TOKEN')
+    if not port or not tok:
+        return
+    try:
+        sys.stdout.flush()
+        req = urllib.request.Request(f'http://127.0.0.1:{port}/lane-blocked', method='POST',
+                                     data=json.dumps({'tool': tool, 'category': category, 'target': target}).encode(),
+                                     headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {tok}'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            r.read()
+    except Exception:
+        pass
+
+
 # ---- 002k (H6): the lane barrier holes, closed here
 # 002j group H (H03): the barrier against irreversible service calls and workspace writes was client-side: the svc wrapper takes the lane's identity from
 # GENESIS_ACTOR, which the lane's own Bash can override; PUT and PATCH pass the wrapper; Bash can write workspace files (sed -i, >>, python open()).
@@ -641,20 +676,24 @@ def write_policy(cmd, cwd, kind, depth=0):
         rp = os.path.realpath(os.path.join(cwd_now or '/', os.path.expanduser(pat)))
         if anchor and rp == anchor and pat == raw:              # exactly that file (not a pattern that starts there)
             return ''
+
+        def refused(why):                                       # WO-125 (B): the file this refusal is about
+            BLOCK['target'] = shown_path(rp, ws)
+            return why
         if rp in declared or any(under(d, rp) for d in declared):    # WO-123: an appendable file (or a directory holding one, for rm -r / mv)
-            return append_why(os.path.relpath(rp, ws))
+            return refused(append_why(os.path.relpath(rp, ws)))
         if any(under(rp, r) for r in roots):
-            return 'lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. Use ledger_write(kind=memory_proposal) or escalate.'
+            return refused('lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. Use ledger_write(kind=memory_proposal) or escalate.')
         if under(rp, os.path.join(ws, 'bin')):
-            return 'bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.'
+            return refused('bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.')
         if under(rp, os.path.join(ws, 'knowledge')):
-            return knowledge_why()
+            return refused(knowledge_why())
         if under(rp, ws) and not under(rp, out):
             rel = os.path.relpath(rp, ws)
             if kind in RESTRICTED:
-                return f'a {kind or "lane"} lane does not write workspace files ({rel}). Use out/ (or /tmp) for scratch files, or hand the change to the main with handoff_main.'
+                return refused(f'a {kind or "lane"} lane does not write workspace files ({rel}). Use out/ (or /tmp) for scratch files, or hand the change to the main with handoff_main.')
             if claims.get(rp) != me:
-                return f'claim the file first: claim_file(path="{rel}", why=...). If another lane holds it you will be told who.'
+                return refused(f'claim the file first: claim_file(path="{rel}", why=...). If another lane holds it you will be told who.')
         return ''
 
     UNRESOLVED = ('the write target of this command cannot be worked out (it uses a variable, a substitution or a command that changes directory in a way that is not visible): '
@@ -736,7 +775,7 @@ def receipt_cli_calls(cmd, depth=0):
 def complete_through_daemon(calls):
     """the deny reason: what the daemon did with each completion the command asked for"""
     port, tok = os.environ.get('LANES_HTTP_PORT'), os.environ.get('LANE_RUN_TOKEN')
-    said = []
+    said, refile = [], False
     for c in calls:
         text = ''
         if port and tok:
@@ -746,13 +785,15 @@ def complete_through_daemon(calls):
                 with urllib.request.urlopen(req, timeout=8) as r:
                     a = json.loads(r.read() or b'{}') or {}
                 text = ('completed: ' if a.get('ok') else 'not completed: ') + str(a.get('text', ''))
+                refile = refile or bool(a.get('refile'))         # WO-125 (B): refused as a success while refusals count: it is filed again, as failed
             except Exception as e:
                 text = f'not completed: the router could not be reached ({type(e).__name__}); call receipt(run_id={c["run_id"]}, outcome=...)'
         else:
             text = f'not completed: call receipt(run_id={c["run_id"]}, outcome=...)'
         said.append(f'run {c["run_id"] or "?"} {text}')
     return ('This command was not run: a lane completes a scheduler run through the router, the same request as the receipt tool, once per run. '
-            + ' | '.join(said) + ' Do not run btcc-receipt complete again; run any other part of the command on its own.')
+            + ' | '.join(said) + (' File the receipt again as that says (btcc-receipt complete <run> --outcome failed --note \'...\' on its own, or the receipt tool); run any other part of the command on its own.'
+                                  if refile else ' Do not run btcc-receipt complete again; run any other part of the command on its own.'))
 
 
 def bash_policy(cmd, cwd, kind):
@@ -836,6 +877,11 @@ def main():
         rp = os.path.realpath(os.path.join(cwd, os.path.expanduser(f)))
         mem = os.path.realpath(os.environ.get('LANES_MEMORY_DIR') or '/nonexistent')
         in_mem = rp == mem or rp.startswith(mem + os.sep)
+        ws = workspace_root(cwd)
+
+        def refuse(why):                                                         # WO-125 (B): every refusal of a write tool is reported, its file the target
+            deny(why)
+            report_block(tool, shown_path(rp, ws), 'file')
         # 002k: the curator lane holds the memory write right while .lanes/run/memory-writer names it (design/memory 整理線)
         # 002w (G, gap 20): MM5 「整理線只整理提案，不刪主線寫的內容，只能標記『建議刪除』」 is the guard's, not the prompt's: with the right the curator
         # writes new files and Edits that keep the old text (a mark added, nothing removed); a Write over an existing file, an Edit that removes text and
@@ -843,35 +889,35 @@ def main():
         if in_mem and os.environ.get('LANE_KIND') == 'curator' and holds_write_right():
             why = curator_write(tool, ti, rp)
             if why:
-                deny(why)
+                refuse(why)
             return
         if rp == persona or any(rp == r or rp.startswith(r + os.sep) for r in roots):
-            deny(f'lanes cannot write {f}: memory, the focus card and .lanes/ have a single writer (the main). '
-                 'Use ledger_write(kind=memory_proposal) for something worth remembering, or escalate.')
+            refuse(f'lanes cannot write {f}: memory, the focus card and .lanes/ have a single writer (the main). '
+                   'Use ledger_write(kind=memory_proposal) for something worth remembering, or escalate.')
             return
         # 002k: workspace files (design/stability SR6): a reflex lane does not edit them; other lanes claim the file first (claim_file)
-        ws = workspace_root(cwd)
         if rp in appendable(ws):                                                 # WO-123: append-only, through append_file
-            deny(append_why(f))
+            refuse(append_why(f))
             return
         if under(rp, os.path.join(ws, 'bin')):                                  # 002k (H6): the svc wrapper is the barrier
-            deny('bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.')
+            refuse('bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.')
             return
         if under(rp, os.path.join(ws, 'knowledge')):                            # lanes-golive: the main's anchor and knowledge files
             if rp != own_anchor(ws):                                             # lanes-topics (item 5): except a worker's own anchor file
-                deny(knowledge_why())
+                refuse(knowledge_why())
             return
         if rp.startswith(ws + os.sep):
             kind = os.environ.get('LANE_KIND') or ''
             if kind in RESTRICTED:
                 if not under(rp, os.path.join(ws, 'out')):                       # 002k (H6): out/ is the scratch place of these kinds
-                    deny(f'a {kind} lane does not edit workspace files ({f}). Use out/ for scratch files, or hand the change to the main with handoff_main.')
+                    refuse(f'a {kind} lane does not edit workspace files ({f}). Use out/ for scratch files, or hand the change to the main with handoff_main.')
             elif claimed_by() .get(rp) != os.environ.get('LANE_ID'):
-                deny(f'claim the file first: claim_file(path="{f}", why=...). If another lane holds it you will be told who.')
+                refuse(f'claim the file first: claim_file(path="{f}", why=...). If another lane holds it you will be told who.')
         return
     if tool == 'Bash':
         cmd = str(ti.get('command', ''))
         calls = receipt_cli_calls(cmd)
+        BLOCK['target'] = ''
         try:
             why = bash_refusal(cmd, cwd, os.environ.get('LANE_KIND') or '', roots)   # 002k (D13, H6): identity, ./bin/svc methods, direct service calls, write targets
         except Exception:
@@ -883,12 +929,15 @@ def main():
             # Only a command that is nothing but the receipt call completes the run: chained after other steps (refused OR allowed) it completes
             # nothing, because none of those steps has run yet when the hook sees the command.
             if receipt_only(cmd):
-                deny(complete_through_daemon(calls))
+                deny(complete_through_daemon(calls))                             # WO-125: the receipt's own handling, never reported
             else:
                 deny(receipt_refused(why, calls))
+                if why:                                                          # WO-125 (B): the rest of it was refused (a write, a command): that counts;
+                    report_block('Bash', BLOCK['target'] or command_head(cmd), 'file' if BLOCK['target'] else 'command')   # chained after ALLOWED steps: not
             return
         if why:
             deny(why)
+            report_block('Bash', BLOCK['target'] or command_head(cmd), 'file' if BLOCK['target'] else 'command')   # WO-125 (B)
 
 
 if __name__ == '__main__':

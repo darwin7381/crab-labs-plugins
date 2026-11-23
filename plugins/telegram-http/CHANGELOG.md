@@ -1,3 +1,57 @@
+## 1.37.0 — 2026-11-24
+
+- **Lanes on: the lanes' boundary, first step (WO-125; Joey 「那就試試看吧、記得同步紀錄觀察點」, TG chiron:2095; agent-inbox 1.7.0 carries the same code).**
+  - **Why:** Chiron read the 108 lane runs of 11-23 on the Mac mini (`claude-chiron/knowledge/lane-boundary-20261124/evidence-runs.md`). Lanes closed
+    46 runs themselves; 10 of those were wrong (9 on reflex lanes). In 5 of them a write the guard had refused was reported as done, to Joey and in
+    the receipt (elsa.reflex.1 run 6843, cadmus.reflex.3 run 6818, cadmus.reflex.5 run 6863, pheme.reflex.1 run 6815, metis.reflex.3 run 6870):
+    15 refused writes in 10 runs, none got through, and the eng-log lines of 13:37 / 21:37 TW and the login-habits line were lost without anyone
+    noticing. 4 more closed partial work as 「正常」. A resumed lane session keeps the card of its first run (1.36.2), so these rules ride in every run.
+  - **A — the boundary card (`LANES_BOUNDARY_CARD`):** every run's 〔車道資訊〕 block carries, right after the focus card, the ticket's default card
+    (`lanes-boundary.ts` `boundaryDefault`, the agent's name filled in). A non-empty `.lanes/boundary.md` (the main writes it) replaces the line
+    「- （還沒有）」 under 判例, whole; the default part up to the 判例 heading always stays. It is built per run in the run prompt, so a resumed
+    session gets the current card every run. It is not part of `card_hash` (an edit of boundary.md does not resend the lane card). A card over 40
+    lines puts 「邊界卡現在 N 行，整理一下」 in the main's digest, once per content of boundary.md (state.json `boundary` / `boundary_told`; it counts as
+    told when a digest carrying it reached the main; it rides a digest like a hold, never alone). The main's rules carry the ticket's sentence
+    right after the focus card's (`lanes-main.ts`).
+  - **B — what the guard refused, as system facts (`LANES_BLOCK_FACTS`):** `lane-guard-hook.py` reports each refusal of a lane run to the daemon
+    (`POST /lane-blocked`, the run's token; only with `LANES_BLOCK_FACTS=1`, which `laneEnv` sets): the file (workspace-relative) for a write tool or
+    a shell write, else the command's first 80 characters. The report goes out after the decision is printed and its failure is ignored. Not
+    reported: the receipt's own handling (a receipt-only `btcc-receipt complete`, whatever the daemon answers; a receipt chained after ALLOWED
+    steps). A refusal stops counting when a later call of the same run succeeds on its target (the stream's tool results): a Write / Edit to the
+    path, a Bash command that writes it, `append_file` to it. While N ≥ 1, `notify_joey` and `ask_joey` add the line
+    `〔系統〕這一趟 N 次寫入或指令被擋：<at most 3 targets>（「等 N 個」 for more）` to the text Joey gets (after the routine first-line cut, so it is always
+    seen; never a message of its own), the receipt records (the receipt tool and the CLI) carry it with `refs.blocked`, and the event's line in
+    the digest and the activity list carries it. A scheduled receipt filed as `done` / `ok` / `normal` is refused and nothing is recorded (the
+    receipt tool with `run_id`, and `btcc-receipt complete N` through the guard, whose refusal then says to file again): file `failed` with what
+    was refused, or hand those steps to the main.
+  - **C — steps (`LANES_RECEIPT_STEPS`):** the receipt tool takes `steps: [{ step, done, note? }]`; its description says to list each step of
+    the instruction with done / not done, and that 部分完成 is outcome `failed` (the scheduler gets `failed`). A step not done with `done` /
+    `normal` / `ok` is refused with 「把沒做的那幾步交給主線，或把結果改成部分完成」 and nothing is recorded, unless the run already handed work to the
+    main (an accepted `handoff_main`). Accepted steps go to `refs.steps`; the steps not done are named in the receipt's text and its digest line.
+  - **Observation points (ticket item 8):** each run's `exit` row in `lanes.jsonl` gets `blocked_n`, `blocked_targets` (at most 3),
+    `steps_marked`, `steps_not_done`, `boundary_lines`, `boundary_source` (`default` | `file`), each only with its switch on; each reported
+    refusal is a `blocked` row (tool, category, target).
+  - **Switches:** all three default on. `LANES_BOUNDARY_CARD=0`, `LANES_BLOCK_FACTS=0`, `LANES_RECEIPT_STEPS=0` in the tg daemon's env turn each
+    off, alone. With all three off, one scenario run against 1.36.2 (aef6074) gave byte-identical prompts, tool lists, main rules, tool results,
+    Joey's messages, ledger and `lanes.jsonl` rows, digest and activity list.
+  - **Decided while building (Sonn's plan said otherwise):** a command that chains `btcc-receipt complete` with a write the guard refuses counts as
+    a refusal of that write (in all five runs of 11-23 that command came before Joey's line); only a receipt chained after allowed steps is the
+    receipt's own handling. A Bash command clears a refusal only when it writes the path (a redirect, tee, touch, cp / mv / install / rsync
+    destination, sed -i, dd of=, open(…, 'a')), not when it only names it: a reflex lane cannot write a workspace file by shell at all, so a
+    `tail` of it after the refusal would have erased the fact. A scheduled receipt whose run is already completed is answered as a repeat, not
+    refused for the refusals. The step sentence is in the receipt tool's description, not in the lane card (the card and `card_hash` stay as
+    they are: no lane gets its card resent). `nothing-to-do` is not refused.
+  - Test `lanes-wo125` (19): the default card in a new and a resumed session; a boundary.md edit in the next resumed run; a 45-line card whole and
+    the digest line once per content; the main's rule; the five runs of 11-23 replayed with their own commands through the guard process, the daemon
+    routes and a scheduler stand-in (Joey's line and the receipts carry 〔系統〕, the run is completed only as `failed`); clearing by a later write
+    but not by a read; 「等 N 個」 and ask_joey; a repeated receipt carries nothing; steps refused, accepted as failed, accepted after a hand-over; the
+    same number of messages to Joey with the switches on and off; the exit row fields; the switches off; the guard decides identically with and
+    without reporting, and with the daemon unreachable.
+  - **Not verified:** on a live lane (a real claude running the hook with the new env, a model filling `steps`, a lane following the card). The
+    shell-write test is a reading of the command line, not of what ran. A lane line close to Telegram's length limit could be split in two by the
+    added line. Every lane run prompt is longer by the card (≈10 lines, plus boundary.md). A scheduled run whose lane hits a refused write now
+    completes as `failed` at the scheduler where it completed `ok` before; whether the scheduler or BTCC reacts to that was not checked.
+
 ## 1.36.2 — 2026-11-24
 
 - **Lanes on: a resumed lane session gets a changed lane card (agent-inbox 1.6.2 carries the same code).**
