@@ -137,6 +137,16 @@ test('jsonl: walled → the limit line and other API errors are dropped; login, 
   expect(wallRoute(refusal, extractSystemAlert(refusal)!, w)).toBe('send')
 })
 
+test("jsonl: no state yet (an agent's first wall) → a limit record waits when the keeper runs; without it, as before", () => {
+  const login = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, message: { content: [{ type: 'text', text: 'API Error: 401 Please run /login' }] } })
+  expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, null, true)).toBe('defer')
+  expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, null, false)).toBe('send')
+  expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, null)).toBe('send')
+  expect(wallRoute(login, extractSystemAlert(login)!, null, true)).toBe('send')
+  const e500 = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, apiErrorStatus: 500, message: { content: [{ type: 'text', text: 'API Error: 500 Internal server error' }] } })
+  expect(wallRoute(e500, extractSystemAlert(e500)!, null, true)).toBe('send')
+})
+
 test('jsonl: fresh state not (yet) walled → a limit record waits for the state; other API errors go as before; no state → as before', () => {
   const w = wallState(false)
   expect(wallRoute(usageLimitLine, extractSystemAlert(usageLimitLine)!, w)).toBe('defer')

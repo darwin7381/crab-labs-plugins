@@ -72,7 +72,7 @@ import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, d
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
-import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState } from './usage-wall.ts'
+import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
 if (Lanes.LANES_ON) useLanesMenuRules(true)
@@ -2102,7 +2102,10 @@ if (isSystemAlertEnabled()) {
     // main's wall notices too: mainWallNoticeOwned)
     wall: () => wallReader.state(),
     wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, dir: () => wallDir(), log,
-      enterToldElsewhere: w => (mainWallToldAt && w.sinceMs != null && Math.abs(mainWallToldAt - w.sinceMs) < 120_000 ? 'lanes main-wall-up' : null) })),
+      enterToldElsewhere: w => (mainWallToldAt && w.sinceMs != null && Math.abs(mainWallToldAt - w.sinceMs) < 120_000 ? 'lanes main-wall-up' : null),
+      // lanes on (Sonn #10731): the enter alert also says the main's messages are held, none lost; lanes off: text unchanged
+      enterNote: Lanes.LANES_ON ? () => lanesEnterNote(Lanes.mainHeldCount()) : undefined })),
+    keeperAlive: () => wallKeeperAlive(),   // WO-120: an agent's first wall is waited for, not sent raw beside the enter alert
     notify: text => {
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {

@@ -51,11 +51,15 @@ const MAX_ALERT_CHARS = 500
 const WALL_TICK_MS = 5_000
 const WALL_DEFER_MS = 60_000   // a wall record the state hasn't picked up within this long is forwarded as before
 let _wall: () => WallState | null = () => null
+let _keeperAlive: () => boolean = () => false   // WO-120: the usage-wall keeper is running here
 
 /** WO-120: what the jsonl tail does with an alert while the usage-wall state is fresh. 'send' = as before; 'drop' =
  *  the wall's own two alerts cover it; 'defer' = a wall record the state hasn't shown as walled yet: wait for it. */
-export function wallRoute(line: string, alert: string, w: WallState | null): 'send' | 'drop' | 'defer' {
-  if (!w || alert.includes('Please run /login')) return 'send'
+export function wallRoute(line: string, alert: string, w: WallState | null, keeperAlive = false): 'send' | 'drop' | 'defer' {
+  if (alert.includes('Please run /login')) return 'send'
+  // no state yet: an agent's first wall can be read here before its state file exists; with the keeper running the
+  // state follows within seconds, so wait for it (else two ⚠️ at enter). Reading off / no keeper → as before.
+  if (!w) return keeperAlive && isWallRecordLine(line) ? 'defer' : 'send'
   const apiError = line.includes('"isApiErrorMessage":true') || line.includes('"subtype":"api_error"') || /^API Error/i.test(alert)
   if (!apiError) return 'send'
   if (w.walled) return 'drop'
@@ -351,11 +355,13 @@ export function startSystemAlertWatcher(opts: {
   // WO-120: this daemon's usage-wall state (usage-wall.ts WallReader.state) and its enter/clear alerts (WallAlerts).
   wall?: () => WallState | null
   wallAlerts?: { tick(w: WallState | null, notify: Notify): unknown }
+  keeperAlive?: () => boolean
 }): void {
   _notify = opts.notify
   _log = opts.log
   if (opts.defer) _defer = opts.defer
   _wall = opts.wall ?? (() => null)
+  _keeperAlive = opts.keeperAlive ?? (() => false)
   if (opts.wallAlerts) {
     const wa = opts.wallAlerts
     setInterval(() => { try { wa.tick(_wall(), _notify) } catch (err) { opts.log('warn', `usage wall alerts: ${err}`) } }, WALL_TICK_MS).unref()
@@ -377,7 +383,7 @@ export function startSystemAlertWatcher(opts: {
       const d = deferred[i]
       const w = _wall()
       if (w && wallCovers(w, d.ts)) { deferred.splice(i, 1); continue }
-      if (!w || Date.now() - d.at >= WALL_DEFER_MS) { deferred.splice(i, 1); relayTuiAlert(d.alert, d.src) }
+      if ((!w && !_keeperAlive()) || Date.now() - d.at >= WALL_DEFER_MS) { deferred.splice(i, 1); relayTuiAlert(d.alert, d.src) }
     }
     const cur = resolveWatchFile(opts.resolveFile, staticDir)
     if (!cur) return
@@ -412,7 +418,7 @@ export function startSystemAlertWatcher(opts: {
         if (ts !== null && ts < startedAt - 120_000) continue
         const src = `jsonl session ${watchedFile.split('/').pop()?.slice(0, 8) ?? '?'}…`
         // WO-120 first (a fresh usage-wall state owns the wall's alerts), then the lanes defer (relayTuiAlert; null with lanes off)
-        const route = wallRoute(line, alert, _wall())
+        const route = wallRoute(line, alert, _wall(), _keeperAlive())
         if (route === 'drop') { opts.log('info', `system-alert: not forwarded (inside a usage wall): ${alert.slice(0, 80)}`); continue }
         if (route === 'defer') { deferred.push({ alert, src, ts: ts ?? Date.now(), at: Date.now() }); continue }
         relayTuiAlert(alert, src)

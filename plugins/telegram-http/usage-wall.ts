@@ -13,7 +13,7 @@
 // exist; USAGE_WALL_READ=0 turns reading off. Otherwise wallState() is null and every caller behaves exactly as before
 // WO-120. USAGE_WALL_DIR overrides the directory (tests).
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 
@@ -268,6 +268,15 @@ export function hhmmTaipei(ms: number): string {
 }
 
 /** Today's system-alert format (system-alert.ts sendAlert), the state's error line as the message. */
+function withNote(text: string, note: string | null | undefined): string {
+  return note && note.trim() ? `${text}\n${note.trim()}` : text
+}
+
+/** Lanes on (Sonn #10731): the enter alert says what happens to the messages for the main. */
+export function lanesEnterNote(mainHeld: number): string {
+  return (mainHeld > 0 ? `給主線的 ${mainHeld} 則訊息先保留，一件都沒有丟；主線一能用就交給它。` : '') + '車道照常處理警報與同事的事。'
+}
+
 export function enterText(w: WallState): string {
   const msg = (w.text ?? '').trim() || `用量上限（${w.kind ?? 'unknown'}）`
   return `⚠️ 系統警告（claude TUI 自身輸出，非 AI 回覆）\n${msg.slice(0, 500)}\n(usage-wall ${w.agent ?? w.tmux ?? w.key})`
@@ -284,6 +293,15 @@ type AlertRec = { enter_at: string; clear_for?: string; clear_at?: string; enter
 /** Two pushes per episode: enter (first time the episode is seen walled) and clear (cleared_at set, once per
  *  cleared_at). A reopened episode (walled again under the same id) sends nothing until its next clear. Which
  *  episodes were alerted is kept in <stateDir>/usage-wall-alerts.json, so a daemon restart doesn't alert again. */
+/** The usage-wall machinery is running here: reading is on and the keeper's heartbeat (<dir>/.keeper) is fresh. A wall
+ *  record seen before this agent's state file exists (its first wall) is then worth waiting for (system-alert defers it). */
+export function wallKeeperAlive(env: NodeJS.ProcessEnv = process.env, now: number = Date.now()): boolean {
+  if ((env.USAGE_WALL_READ ?? '').trim() === '0') return false
+  const dir = wallDir(env)
+  if (existsSync(join(dir, 'OFF'))) return false
+  try { return now - statSync(join(dir, '.keeper')).mtimeMs < FRESH_MS } catch { return false }
+}
+
 export class WallAlerts {
   private db: Record<string, AlertRec> | null = null
   constructor(private readonly o: {
@@ -295,6 +313,8 @@ export class WallAlerts {
     now?: () => number
     /** Someone else already pushed this episode's enter (lanes, before the state existed): record it, don't push it again. */
     enterToldElsewhere?: (w: WallState) => string | null
+    /** An extra line under the enter alert (lanes on: what the main's held messages are doing; Sonn #10731). */
+    enterNote?: (w: WallState) => string | null
   }) {}
 
   private path(): string { return join(this.o.stateDir, ALERTS_FILE) }
@@ -330,7 +350,7 @@ export class WallAlerts {
       db[w.episode] = { enter_at: new Date(now).toISOString(), ...(by ? { enter_by: by } : {}) }
       this.save(now)
       if (by) { this.o.log('info', `usage wall: enter for ${w.episode} already told by ${by} — not pushed again`); return null }
-      notify(enterText(w))
+      notify(withNote(enterText(w), this.o.enterNote?.(w)))
       this.o.log('info', `usage wall: enter alert for ${w.episode}`)
       return 'enter'
     }

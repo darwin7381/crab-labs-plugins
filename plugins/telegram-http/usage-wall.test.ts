@@ -5,7 +5,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   ALERTS_FILE, HeldSidecar, WallAlerts, WallReader, clearText, enterText, heldPath, heldTotal, isWallRecordLine,
-  readHeld, readWallState, wallAte, wallCovers, wallKey, type WallState,
+  readHeld, readWallState, wallAte, wallCovers, wallKey, lanesEnterNote, wallKeeperAlive, type WallState,
 } from './usage-wall.ts'
 
 const NOW = Date.parse('2026-11-23T08:00:00Z')
@@ -245,5 +245,37 @@ describe('jsonl helpers', () => {
     expect(wallCovers({ ...w, walled: false, clearedMs: NOW + 5000 } as WallState, NOW + 1000)).toBe(true)
     expect(wallCovers({ ...w, walled: false, clearedMs: NOW + 5000 } as WallState, NOW + 60_000)).toBe(false)
     expect(wallCovers(null, NOW)).toBe(false)
+  })
+})
+
+describe('lanes enter note (Sonn #10731) and keeper liveness', () => {
+  test('lanesEnterNote: N held → both sentences; 0 → only the second', () => {
+    expect(lanesEnterNote(3)).toBe('給主線的 3 則訊息先保留，一件都沒有丟；主線一能用就交給它。車道照常處理警報與同事的事。')
+    expect(lanesEnterNote(0)).toBe('車道照常處理警報與同事的事。')
+  })
+  test('WallAlerts enterNote: an extra line under the enter alert; none → text unchanged', () => {
+    const state = mkdtempSync(join(tmpdir(), 'uwa-'))
+    const w = { walled: true, episode: 'ep-note', since: iso(NOW), kind: 'fable', text: 'You have reached your Fable limit',
+      resets_at: null, cleared_at: null, cleared_by: null, agent: 'nestor', tmux: 'claude-nestor', session: 's1', key: 'claude-nestor',
+      sinceMs: NOW, clearedMs: null } as WallState
+    const sent: string[] = []
+    new WallAlerts({ stateDir: state, log: () => {}, now: () => NOW, enterNote: () => lanesEnterNote(2) }).tick(w, t => sent.push(t))
+    expect(sent.length).toBe(1)
+    expect(sent[0]).toBe(enterText(w) + '\n' + lanesEnterNote(2))
+    const state2 = mkdtempSync(join(tmpdir(), 'uwa-'))
+    const sent2: string[] = []
+    new WallAlerts({ stateDir: state2, log: () => {}, now: () => NOW }).tick(w, t => sent2.push(t))
+    expect(sent2).toEqual([enterText(w)])
+  })
+  test('wallKeeperAlive: fresh .keeper → true; stale, OFF, USAGE_WALL_READ=0, missing → false', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'uwk-'))
+    const env = { USAGE_WALL_DIR: dir } as NodeJS.ProcessEnv
+    expect(wallKeeperAlive(env)).toBe(false)
+    writeFileSync(join(dir, '.keeper'), 'x')
+    expect(wallKeeperAlive(env)).toBe(true)
+    expect(wallKeeperAlive(env, Date.now() + 200_000)).toBe(false)
+    expect(wallKeeperAlive({ ...env, USAGE_WALL_READ: '0' })).toBe(false)
+    writeFileSync(join(dir, 'OFF'), '')
+    expect(wallKeeperAlive(env)).toBe(false)
   })
 })

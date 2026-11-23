@@ -32,6 +32,16 @@
   - **keepwarm-local:** a fresh state decides "walled" instead of the transcript scan.
   - Tests: `usage-wall.test.ts`, `usage-wall.daemon.test.ts` (a real agent-inbox daemon and MCP client), additions in
     `hub-sync.test.ts`, `system-alert.test.ts`, `keepwarm-local.test.ts`.
+  - **First wall of an agent:** before its state file exists, a limit record read by system-alert waits (up to 60 s)
+    for the state when the keeper runs here (`<dir>/.keeper` fresh), instead of going out raw next to the enter alert
+    (WO-120 lab 2026-11-23: a possible third push). No keeper, reading off → as 1.34.0.
+  - **Lanes on:** the enter alert carries one more line (Sonn #10731, from the lanes main-wall-up text Joey set):
+    「給主線的 N 則訊息先保留，一件都沒有丟；主線一能用就交給它。車道照常處理警報與同事的事。」 (N = `mainHeldCount()`; 0 →
+    only the second sentence). Lanes off: the text is unchanged.
+  - **Lab** (2026-11-23, isolated HOME, mock API + mock Telegram + BTCC stub, real TUI and both daemons): a 3 h 52 min
+    wall with 3 scheduled runs and 2 mails sent into it → 0 deliveries into the session during the wall, exactly one ⚠️
+    and one ✅ ("累積 6 件"), each of the 6 held items delivered once after the clear, 3 run acks, keep-warm skipped.
+
 ## 1.34.0 — 2026-11-23
 
 - **Lanes (多分身): an agent can keep one long-lived main session and hand routine events to short headless lane sessions. OFF by default; with it off the plugin behaves like 1.33.2** (Joey TG sonn:7783 / 7795 / 7802 / 7811, chiron:2001 / 2013).
