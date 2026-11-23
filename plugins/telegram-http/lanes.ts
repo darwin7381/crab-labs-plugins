@@ -27,7 +27,7 @@ import { createMain, mainContext, type MainApi, type ItemKind, type Via } from '
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
-import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
+import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
 import { randomBytes, randomUUID } from 'crypto'
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync,
@@ -3718,7 +3718,7 @@ async function proposalReview(text: string, ev: InEvent | undefined): Promise<{ 
   const jl = (err: string | null, answer?: unknown, p?: number | null) => jevLog(LANES_DIR, { site: 'proposal-A4', question: q,
     inputs: { event: ev?.id ?? null, from: ev?.from ?? null, verified: ev?.verified === true, proposal: text.slice(0, 120), memory: mem.map(m => `${m.id} ${m.file}`) }, answer: answer ?? null, p: p ?? null, ms: Date.now() - t0, err })
   try {
-    const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
+    const key = jevKey() ?? ''   // the one key reader (lanes-triage.ts): TYPESAFE_API_KEY, TYPESAFE_KEY_FILE, then the agent's <workspace>/.secrets/typesafe.env
     if (!key) { logProposalReview({ event: ev?.id, ms: Date.now() - t0, err: 'no key' }); jl('no key'); return null }
     const res = await fetch((process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone', { method: 'POST', signal: AbortSignal.timeout(8000),
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-proposal-review/1' },
@@ -3903,7 +3903,7 @@ async function reportCheck(lane: Lane, tok: RunTok, tool: string, text: string):
   let verdicts: Array<{ s: string; choice: string | null; conf: number }> = [], err: string | null = null
   let rawAnswers: any = null
   try {
-    const key = (process.env.TYPESAFE_API_KEY ?? '').trim() || (() => { try { const m = readFileSync(process.env.TYPESAFE_KEY_FILE ?? join(homedir(), '.genesis', 'typesafe.env'), 'utf8').match(/TYPESAFE_API_KEY=["']?([^"'\n]+)/); return m ? m[1].trim() : '' } catch { return '' } })()
+    const key = jevKey() ?? ''   // the one key reader (lanes-triage.ts): TYPESAFE_API_KEY, TYPESAFE_KEY_FILE, then the agent's <workspace>/.secrets/typesafe.env
     if (!key) throw new Error('no key')
     const res = await fetch((process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '') + '/v1/systemone', { method: 'POST', signal: AbortSignal.timeout(8000),
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': 'genesis-report-check/1' },

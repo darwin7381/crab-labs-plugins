@@ -91,6 +91,7 @@ test('002j, 002l S0-4: a walled run is not an attempt: one wall record, one noti
   const a = sched('w-1'), b = sched('w-2')
   await L.routeEvent(a); await L.routeEvent(b)
   expect(await until(() => L.wallActive())).toBe(true)
+  expect(await until(() => exits(a.id).length >= 1)).toBe(true)   // the wall record is set before the run's exit line is on disk (flaked 4 of 6 on a loaded box, Epeius 2026-11-23)
   expect(exits(a.id)[0].reason).toBe('wall:rate_limit')
   expect(runLines(a.id).filter(l => l.state === 'queued').map(l => l.attempt)).toEqual([1, 1])     // queued again as it was: not an attempt
   await sleep(100)

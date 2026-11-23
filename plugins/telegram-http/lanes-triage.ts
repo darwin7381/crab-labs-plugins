@@ -53,6 +53,9 @@ const clip = (s: unknown, n = 200): string => String(s ?? '').slice(0, n)
 let KEY_FILE_DEFAULT = join(process.env.AGENT_WORKSPACE_DIR || process.cwd(), '.secrets', 'typesafe.env')
 export function setJevKeyDefault(path: string): void { KEY_FILE_DEFAULT = path }
 export const jevKeyFile = (): string => process.env.TYPESAFE_KEY_FILE || KEY_FILE_DEFAULT
+/** the Jev key, or null: the ONE reader (every check in lanes.ts and here asks this; 1.34.2: proposal review and report check read the lab's
+ *  ~/.genesis path themselves and never found the fleet's key, so both always passed) */
+export function jevKey(): string | null { return loadKey() }
 function loadKey(): string | null {
   const k = (process.env.TYPESAFE_API_KEY ?? '').trim()
   if (k) return k
