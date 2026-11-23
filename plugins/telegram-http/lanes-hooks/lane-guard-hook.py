@@ -201,6 +201,23 @@ def claimed_by():
         return {}
 
 
+def own_anchor(ws):
+    """lanes-topics (item 5): the one knowledge/ file this lane may write, as a real path, or '': a worker lane's anchor file, as the router assigned it
+    (state.json lanes[LANE_ID].anchor, under knowledge/lines/), while the lane is open. Any other lane kind, or a closed lane: none."""
+    if os.environ.get('LANE_KIND') != 'worker':
+        return ''
+    try:
+        st = json.load(open(os.path.join(os.environ.get('LANES_DIR', ''), 'state.json'), encoding='utf-8'))
+        lane = (st.get('lanes') or {}).get(os.environ.get('LANE_ID') or '') or {}
+    except (OSError, ValueError):
+        return ''
+    rel = str(lane.get('anchor') or '')
+    if lane.get('kind') != 'worker' or lane.get('status') == 'closed' or not rel:
+        return ''
+    rp = os.path.realpath(os.path.join(ws, rel))
+    return rp if under(rp, os.path.join(ws, 'knowledge', 'lines')) and rp.endswith('.md') else ''
+
+
 def deny(reason):
     print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                                              'permissionDecisionReason': reason}}))
@@ -225,6 +242,13 @@ RESTRICTED = ('reflex', 'synthesis', 'curator', 'mail')     # lanes-golive: the 
 # record is its receipt and the ledger, so no lane writes there, whatever its kind or claim
 KNOWLEDGE_WHY = ('lanes do not write knowledge/ (the anchor files, knowledge/REANCHOR.md and the other knowledge files are the main\'s). '
                  'Your record is your receipt and the ledger: put it there, or hand the change to the main with handoff_main.')
+
+
+def knowledge_why():
+    """the refusal for a write under knowledge/; a worker lane is told its own anchor file is the one it may write (lanes-topics item 5)"""
+    if os.environ.get('LANE_KIND') == 'worker':
+        return KNOWLEDGE_WHY + ' A worker lane writes exactly one file there: its own anchor file, the path in its 〔車道資訊〕 block (knowledge/lines/...).'
+    return KNOWLEDGE_WHY
 ACT_KINDS = ('reflex', 'worker', 'fork')
 SVC_ALIAS = {'mock-api': 'api', 'mock-backup': 'backup', 'mock-posts': 'posts', 'mock-tickets': 'tickets'}
 SVC_ALLOW_DEFAULT = 'POST:api/restart,POST:backup/rerun,POST:tickets'
@@ -552,6 +576,7 @@ def write_policy(cmd, cwd, kind, depth=0):
     claims = claimed_by() if kind not in RESTRICTED else {}
     roots = protected_roots()
     cwd_v = os.path.realpath(cwd)
+    anchor = own_anchor(ws)                                     # lanes-topics (item 5): a worker's own anchor file
 
     def check(raw, cwd_now, why_copy=False):
         if raw in ('', '-') or raw.startswith('/dev/') or raw.startswith('/proc/self/fd'):
@@ -562,12 +587,14 @@ def write_policy(cmd, cwd, kind, depth=0):
             return UNRESOLVED
         pat = re.split(r'[*?\[{]', raw, 1)[0] or '.'            # a pattern: the directory it starts in
         rp = os.path.realpath(os.path.join(cwd_now or '/', os.path.expanduser(pat)))
+        if anchor and rp == anchor and pat == raw:              # exactly that file (not a pattern that starts there)
+            return ''
         if any(under(rp, r) for r in roots):
             return 'lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. Use ledger_write(kind=memory_proposal) or escalate.'
         if under(rp, os.path.join(ws, 'bin')):
             return 'bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.'
         if under(rp, os.path.join(ws, 'knowledge')):
-            return KNOWLEDGE_WHY
+            return knowledge_why()
         if under(rp, ws) and not under(rp, out):
             rel = os.path.relpath(rp, ws)
             if kind in RESTRICTED:
@@ -723,7 +750,8 @@ def main():
             deny('bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.')
             return
         if under(rp, os.path.join(ws, 'knowledge')):                            # lanes-golive: the main's anchor and knowledge files
-            deny(KNOWLEDGE_WHY)
+            if rp != own_anchor(ws):                                             # lanes-topics (item 5): except a worker's own anchor file
+                deny(knowledge_why())
             return
         if rp.startswith(ws + os.sep):
             kind = os.environ.get('LANE_KIND') or ''

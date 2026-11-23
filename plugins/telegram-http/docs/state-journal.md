@@ -683,3 +683,12 @@ Measured 2026-11-23 in a real client (lanes-topics.ts has the facts): a bot mess
 - The decision: an explicit topic (`reply(topic=…)`, `"0"` = outside; a lane's own topic; the topic a command was typed in) → the topic of
   the message answered (`reply_to`), when known, outside included → for the main's reply only, the one topic every Telegram item of its
   turn is in (`mainTurn`: the items' events with a `tg` record) → none.
+- **A worker lane's topic** (state.json `lanes[<id>]`): `topic_name` as stored (emoji dropped first: the server drops them from a name and
+  still answers true); `topic_close: "pending"` from the close (the main's `lane_close`, Joey's `/lanes close`) until the ✅ icon and the one
+  closing line went (`topic_done`: when). A close a restart cut off is finished at boot; a lane closed by an older version has neither field
+  and is left alone. The topic is never deleted; once closed it is no longer in `topics`, so what Joey types there goes to the main.
+- **A worker lane's anchor file** (`lanes[<id>].anchor`, relative to the workspace: `knowledge/lines/<slug>.md`): assigned and created (only if
+  absent) when the lane opens, with the title, the topic, Joey's words of the opening turn and the brief. lane-guard-hook.py reads this field:
+  the open worker lane may write that one path under `knowledge/` and nothing else there. The main lists it in `knowledge/REANCHOR.md`.
+- **The lane's model** (lanes.jsonl `spawn`: `model`, `model_from`): worker and fork lanes `LANES_MODEL_WORKER` → the main's last genuine
+  assistant record's model → `LANES_MODEL`; the other kinds `LANES_MODEL`.

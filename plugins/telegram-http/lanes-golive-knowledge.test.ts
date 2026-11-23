@@ -19,11 +19,14 @@ function guard(kind: string, input: Record<string, unknown>): string {
 }
 
 test('the card of every kind: no anchor files, nothing under knowledge/, no sub-agents; the record is the receipt and the ledger', () => {
-  for (const kind of ['reflex', 'worker', 'fork', 'curator', 'synthesis', 'mail'] as const) {
+  for (const kind of ['reflex', 'fork', 'curator', 'synthesis', 'mail'] as const) {
     const card = L.identityCard({ kind })
     expect(card).toContain('你不寫定錨檔、不碰 knowledge/ 底下任何檔（包括 knowledge/REANCHOR.md），也不開子 agent')
     expect(card).toContain('你的紀錄就是 receipt 和帳本')
   }
+  // lanes-topics (item 5): a worker lane owns exactly one anchor file (lanes-topics-anchor.test.ts); nothing else under knowledge/, no sub-agents
+  const w = L.identityCard({ kind: 'worker' })
+  expect(w).toContain('你只寫一份定錨檔，就是「〔車道資訊〕」裡給你的那一份（knowledge/lines/ 底下）；knowledge/ 底下別的檔（包括 knowledge/REANCHOR.md）不碰，也不開子 agent')
 })
 
 test('the guard refuses a write under knowledge/ for every kind (Write, Edit, shell), whatever claim', () => {

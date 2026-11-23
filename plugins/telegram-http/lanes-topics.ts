@@ -78,3 +78,10 @@ export function topicLink(username: unknown, thread: number): string | null {
   const u = String(username ?? '').trim().replace(/^@/, '')
   return u ? `https://t.me/${u}/${thread}` : null
 }
+
+/** lanes-topics (item 5): the file name part of a work topic's anchor file (knowledge/lines/<slug>.md): letters and digits of the title (any script),
+ *  lower case, everything else one dash, at most 48 characters; `fallback` when nothing is left */
+export function anchorSlug(title: unknown, fallback: string): string {
+  const s = stripEmoji(title).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '')
+  return [...(s || fallback)].slice(0, 48).join('').replace(/-+$/, '') || fallback
+}
