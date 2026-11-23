@@ -26,6 +26,7 @@ import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
+import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
@@ -2450,6 +2451,7 @@ export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>): stri
     focusCard(),
     ...(it.summary ? [``, `# 這個 thread 先前的帳本紀錄（原車道已結束太久，由你接手）`, it.summary] : []),
     ...fanoutLines(lane, it),
+    ...appendableLines(),
     ...limitLines(lane),
     `〔車道資訊結束；下面是事件〕`,
   ].join('\n')
@@ -3351,8 +3353,12 @@ export const LANE_LEDGER_QUERY_DESCRIPTION =
   'ledger_query(since="-24h", text="restart <service>") lists one "restart <service>" action for every restart a lane ran (the router writes it when the restart command is sent and settles it when its result comes back; a failed one says 沒有成功, one whose result never came back 結果不明); ' +
   'restarts done by the main or by hand are not in it, so also read the notices it lists. Filters: `text` (substring or regex), `since`, `kind`. No filter = the activity list (one line per event). ' +
   'A filtered answer ends with the per-kind counts; at most 30 entries, newest last. It writes nothing.'
+// WO-123 (lanes-append.ts): one tool, the lanes' and the main's
+const APPEND_TOOL_DESCRIPTION = 'Add text at the END of a file the main declared for this (the files are listed in a lane\'s 〔車道資訊〕). path = that file\'s workspace-relative path; text = what to add, a line or a few (a line break is added). Nothing already in the file can be changed: Write, Edit and shell writes to these files are refused. For records and logs; not for memory, anchor files or settings.'
+const APPEND_TOOL_SCHEMA = { type: 'object', properties: { path: { type: 'string' }, text: { type: 'string' } }, required: ['path', 'text'] }
 export const LANE_TOOLS = [
   { name: 'ledger_query', description: LANE_LEDGER_QUERY_DESCRIPTION, inputSchema: { type: 'object', properties: LEDGER_QUERY_PROPS } },
+  { name: 'append_file', description: APPEND_TOOL_DESCRIPTION, inputSchema: APPEND_TOOL_SCHEMA },
   { name: 'claim_file', description: 'Before you edit a file in the workspace, claim it (path, why). If another lane holds it, you are told who and since when: wait for it or hand the change to the main. Claims are released when your run ends.',
     inputSchema: { type: 'object', properties: { path: { type: 'string' }, why: { type: 'string' } }, required: ['path', 'why'] } },
   { name: 'report_result', description: 'Fan-out tasks only: hand your result back to the synthesis (not to Joey). One call, the whole result.',
@@ -3773,6 +3779,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, a.summary, 'receipt')).text}${chainNote}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
+    case 'append_file': return appendTool(a, { lane: lane.id, thread: lane.thread, event: tok.evId })   // WO-123
     case 'claim_file': {
       const path = String(a.path ?? '').trim(), why = String(a.why ?? '').trim()
       if (!path) throw new Error('path required')
@@ -4388,6 +4395,33 @@ async function handleLaneMcp(req: IncomingMessage, res: ServerResponse): Promise
   res.writeHead(sid ? 404 : 400).end()
 }
 
+// ================================================================== WO-123: files a lane may append to (lanes-append.ts)
+let appendRefusedLogged = ''
+/** the checked declaration (.lanes/appendable.txt); a refused line is logged once per content of the refusals */
+function appendable(): ReturnType<typeof readDeclared>['ok'] {
+  const { ok, refused } = readDeclared(D.workspaceDir, LANES_DIR, memoryDir())
+  const sig = refused.map(r => `${r.line}: ${r.why}`).join(' | ')
+  if (sig && sig !== appendRefusedLogged) { appendRefusedLogged = sig; D.log('warn', `lanes: ${APPENDABLE_FILE} lines not accepted: ${sig}`) }
+  return ok
+}
+/** the lane card's lines: nothing when no file is declared (the card of an agent without a declaration is byte-identical to before) */
+function appendableLines(): string[] {
+  const ok = appendable()
+  return ok.length ? ['', '# 你可以往後加內容的檔（主線宣告的）', `用 append_file(path, text) 把內容加在檔案最後；既有內容你動不了（Write、Edit、shell 寫入都會被擋）。只有這幾個：${ok.map(d => d.rel).join('、')}`] : []
+}
+function appendTool(a: any, who: { lane: string; thread?: string; event?: string }): string {
+  const path = String(a?.path ?? '').trim(), text = String(a?.text ?? '')
+  if (!path) throw new Error('path required')
+  if (!text.trim()) throw new Error('empty text')
+  if (text.length > APPEND_MAX) return `refused: ${text.length} characters; append_file takes at most ${APPEND_MAX} at a time (a record line, not a document). Nothing was written.`
+  const ok = appendable(), d = declaredFor(path, D.workspaceDir, ok)
+  if (!d) return `refused: ${path} is not a file the main declared for appending (${ok.length ? `declared: ${ok.map(x => x.rel).join(', ')}` : `none is declared: .lanes/${APPENDABLE_FILE} is the main's to write`}). Nothing was written.${who.lane === 'main' ? '' : ' If this line has to be in that file, hand it to the main with handoff_main.'}`
+  let r: { bytes: number; before: number }
+  try { r = appendText(d.abs, text) } catch (e) { return `refused: ${d.rel} could not be appended to (${String((e as Error)?.message ?? e).slice(0, 120)}). Nothing was written.` }
+  ledger({ lane: who.lane, ...(who.thread ? { thread: who.thread } : {}), ...(who.event ? { event: who.event } : {}), kind: 'action', text: `append_file ${d.rel}：加了 ${r.bytes} 位元組（原本 ${r.before}）`, refs: { append: d.rel, bytes: r.bytes, before: r.before } })
+  return `added ${r.bytes} bytes at the end of ${d.rel} (it was ${r.before} bytes; nothing before that changed).`
+}
+
 // ================================================================== main-only tools (tg role)
 export function mainToolDefs(): any[] {
   return [
@@ -4396,6 +4430,7 @@ export function mainToolDefs(): any[] {
     { name: 'fork', description: '[lanes · main only] Fork this session (full context so far) into a fork lane to work on a side task. Its result lands in the ledger and your next digest; it never merges back silently.',
       inputSchema: { type: 'object', properties: { task: { type: 'string' } }, required: ['task'] } },
     { name: 'lanes_list', description: '[lanes · main only] List this agent\'s lanes (id, kind, thread, status, tokens).', inputSchema: { type: 'object', properties: {} } },
+    { name: 'append_file', description: '[lanes · main] ' + APPEND_TOOL_DESCRIPTION + ' The main declares those files in .lanes/' + APPENDABLE_FILE + ' (one workspace-relative path per line) and, when it adds to one itself, uses this tool or the shell\'s >> so that a lane\'s line written at the same moment is kept.', inputSchema: APPEND_TOOL_SCHEMA },
     { name: 'fan_out', description: '[lanes · main only] Split a task into parts checked in parallel: one lane per part, then one synthesis lane reads all results and delivers ONE conclusion to you. You read one result, not N.', inputSchema: { type: 'object', properties: { tasks: { type: 'array', items: { type: 'string' } }, conclusion: { type: 'string', description: 'what the one conclusion must contain' } }, required: ['tasks', 'conclusion'] } },
     { name: 'curate_memory', description: '[lanes · main only] Hand the memory write right to a curator lane that works through the memory proposals in the ledger. It never deletes what you wrote (it marks 建議刪除 instead) and returns the right when done.', inputSchema: { type: 'object', properties: { note: { type: 'string' } } } },
     { name: 'curate_stop', description: '[lanes · main only] Take the memory write right back from the curator lane now (it stops; unprocessed proposals stay in the ledger).', inputSchema: { type: 'object', properties: {} } },
@@ -4419,7 +4454,7 @@ export function mainToolDefs(): any[] {
         text: { type: 'string', description: 'case-insensitive substring or regex over the entry text, lane, thread and refs; empty = any' } } } },
   ]
 }
-export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'memory_history', 'memory_revert', 'peer_hold'].includes(name) }
+export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'memory_history', 'memory_revert', 'peer_hold', 'append_file'].includes(name) }
 
 /** lanes-golive: a worker lane bound to a new topic in Joey's private chat (createForumTopic with his user id; Bot API 10.5 private-chat topics), or null when
  *  the bot cannot open one (LANES_WORKER_TOPICS=off, no Telegram in this daemon, the bot's topic mode is off or lets the user open topics, or the API
@@ -4695,6 +4730,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
         refs: { commitment_done: id, late } })
       return `commitment ${id} marked done${late ? ' (it was past due: Joey had been rung)' : ''}.`
     }
+    case 'append_file': return appendTool(a, { lane: 'main' })   // WO-123
     case 'fan_out': {
       const tasks = (Array.isArray(a.tasks) ? a.tasks : []).map((t: unknown) => String(t).trim()).filter(Boolean).slice(0, 8)
       const brief = String(a.conclusion ?? '').trim()

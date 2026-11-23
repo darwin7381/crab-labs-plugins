@@ -615,6 +615,9 @@ export function mainContext(agent: string, sid: string): string {
       + '它回傳整天每件事一行的活動清單，包含車道處理掉、沒有叫醒你的例行事。清單裡每一件都要交代到，連同它的具體數字、時間、人名，再補上你自己處理的事。'
       + '某一件的原文用 ledger_query(text=關鍵字)；答應過什麼也可以查 kind=commitment。',
     '- 維護焦點卡 .lanes/focus.md：任務改變時更新，3 到 6 行，寫「目前在做什麼、關鍵限制、別碰什麼」。車道開機時會讀它。',
+    // WO-123: the files a lane may append to are the main's to declare. (A sentence of Chiron's on what NOT to declare goes at the end of this item.)
+    '- 車道預設不能寫你的檔。要讓車道自己把紀錄補進某個檔（日誌、流水帳、狀態紀錄），在 .lanes/appendable.txt 宣告它：一行一個相對路徑（只收 .md .txt .log .csv .tsv .jsonl；記憶、.lanes/、CLAUDE.md、REANCHOR 與它列的定錨檔、設定檔一律不收）。'
+      + '車道用 append_file 把內容加在檔案最後，既有內容它動不了。你自己往這些檔加內容也用 append_file 或 shell 的 >>，不要整檔重寫，車道同時加的那一行才不會掉。',
     '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Joey 私訊話題的工作線（一件事一個話題；它回你話題連結和話題名稱；bot 沒開私訊話題時，它會告訴你，那就自己做）；fork(task) 開一條帶著你目前脈絡的分身線。'
       + '做完用 lane_close 收掉：話題標上 ✅、留著不刪；Joey 之後在那個話題說的話交給你，你的 reply 會自動回到那個話題（reply_to 他那則，或 topic 指定；topic="0" 是話題外）。'
       + '話題裡來的訊息，標籤帶 topic_state（closed＝那條線已結束）和 topic_anchor（那條線的定錨檔）：回答前先讀那份檔，Bot API 查不到話題的歷史訊息。',
@@ -623,7 +626,7 @@ export function mainContext(agent: string, sid: string): string {
     '- 帳本裡累積了好幾筆記憶提案、你又閒著：用 curate_memory 把寫入權交給一條整理線去整理，做完它自己交還（curate_stop 隨時收回）；單筆提案用 memory_decide 決定。',
     '- 回報車道交給你的事時照平常用 reply（照現行規則推播：做了什麼就報什麼）。找別隻 agent 照 agent-inbox 的說明用 send_to_agent 的三條線（動態／信／呼叫）。'
       + '排程的回執照人格檔用 ~/.claude/tools/btcc-receipt complete <run>（一個 run 只會完成一次，車道已完成的會被擋下並告訴你）。',
-    '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、memory_history、memory_revert、open_worker、fork、peer_hold）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
+    '- 上面這些車道工具（fan_out、commitment、commitment_done、curate_memory、curate_stop、memory_decide、memory_history、memory_revert、open_worker、fork、peer_hold、append_file）可能是延遲載入的：看不到就先用 ToolSearch 搜它的名字載入，再呼叫。',
     '- 記憶目錄只有主線寫，每次寫入自動 commit；車道只能在帳本留 memory_proposal，你在摘要裡看到再決定要不要寫。'
       + '記憶目錄是 git：memory_history 看誰在什麼時候改了什麼；要退回某一次改動，用 memory_revert(sha, reason)，不要手動改回去。',
   ].join('\n')

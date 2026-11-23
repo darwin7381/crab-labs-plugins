@@ -218,6 +218,57 @@ def own_anchor(ws):
     return rp if under(rp, os.path.join(ws, 'knowledge', 'lines')) and rp.endswith('.md') else ''
 
 
+APPEND_EXT = ('.md', '.txt', '.log', '.csv', '.tsv', '.jsonl')
+APPEND_NEVER_DIRS = ('.lanes', '.secrets', '.git', '.claude', 'bin', '.telegram-state', '.agent-inbox-state', 'node_modules', os.path.join('knowledge', 'lines'))
+APPEND_NEVER_NAMES = ('claude.md', 'reanchor.md', 'memory.md')
+
+
+def appendable(ws):
+    """WO-123: the files the main declared for appending (.lanes/appendable.txt), as real paths. The same rules as lanes-append.ts readDeclared (keep
+    the two in step): workspace-relative, a regular file or not there yet, a record-like extension, never memory / .lanes / secrets / settings /
+    CLAUDE.md / REANCHOR.md and the anchor files it lists / a worker's anchor files. A lane adds to these with the append_file tool only: every
+    write tool and shell write to one of them is refused, for every lane kind (a claim does not open it)."""
+    lanes_dir = os.environ.get('LANES_DIR') or ''
+    try:
+        text = open(os.path.join(lanes_dir, 'appendable.txt'), encoding='utf-8').read()
+    except OSError:
+        return set()
+    wsr = os.path.realpath(ws)
+    ld = os.path.realpath(lanes_dir)
+    mem = os.path.realpath(os.environ.get('LANES_MEMORY_DIR') or '/nonexistent')
+    anchors = set()
+    try:
+        rean = open(os.path.join(wsr, 'knowledge', 'REANCHOR.md'), encoding='utf-8').read()
+        for m in re.finditer(r'`([^`\s]+\.md)`|定錨檔：\s*([^\s|｜)）`]+\.md)', rean):
+            q = m.group(1) or m.group(2)
+            if q and not q.startswith(('/', '~')):
+                anchors.add(os.path.realpath(os.path.join(wsr, q)))
+    except OSError:
+        pass
+    out = set()
+    for raw in text.split('\n'):
+        line = raw.strip()
+        if not line or line.startswith('#') or line.startswith(('/', '~')):
+            continue
+        abs0 = os.path.normpath(os.path.join(wsr, line))
+        if abs0 == wsr or not under(abs0, wsr):
+            continue
+        if os.path.islink(abs0) or (os.path.lexists(abs0) and not os.path.isfile(abs0)):
+            continue
+        rp = os.path.realpath(abs0)
+        if not under(rp, wsr) or os.path.splitext(rp)[1].lower() not in APPEND_EXT or os.path.basename(rp).lower() in APPEND_NEVER_NAMES:
+            continue
+        if any(under(rp, os.path.join(wsr, d)) for d in APPEND_NEVER_DIRS) or under(rp, ld) or under(rp, mem) or rp in anchors:
+            continue
+        out.add(rp)
+    return out
+
+
+def append_why(f):
+    return (f'{f} is a file lanes may only ADD to: use append_file(path="{f}", text=...) to put text at its end. '
+            'Nothing already in it can be changed (Write, Edit and shell writes are refused).')
+
+
 def deny(reason):
     print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                                              'permissionDecisionReason': reason}}))
@@ -577,6 +628,7 @@ def write_policy(cmd, cwd, kind, depth=0):
     roots = protected_roots()
     cwd_v = os.path.realpath(cwd)
     anchor = own_anchor(ws)                                     # lanes-topics (item 5): a worker's own anchor file
+    declared = appendable(ws)                                   # WO-123: files a lane may only append to, with append_file
 
     def check(raw, cwd_now, why_copy=False):
         if raw in ('', '-') or raw.startswith('/dev/') or raw.startswith('/proc/self/fd'):
@@ -589,6 +641,8 @@ def write_policy(cmd, cwd, kind, depth=0):
         rp = os.path.realpath(os.path.join(cwd_now or '/', os.path.expanduser(pat)))
         if anchor and rp == anchor and pat == raw:              # exactly that file (not a pattern that starts there)
             return ''
+        if rp in declared or any(under(d, rp) for d in declared):    # WO-123: an appendable file (or a directory holding one, for rm -r / mv)
+            return append_why(os.path.relpath(rp, ws))
         if any(under(rp, r) for r in roots):
             return 'lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. Use ledger_write(kind=memory_proposal) or escalate.'
         if under(rp, os.path.join(ws, 'bin')):
@@ -747,6 +801,9 @@ def main():
             return
         # 002k: workspace files (design/stability SR6): a reflex lane does not edit them; other lanes claim the file first (claim_file)
         ws = workspace_root(cwd)
+        if rp in appendable(ws):                                                 # WO-123: append-only, through append_file
+            deny(append_why(f))
+            return
         if under(rp, os.path.join(ws, 'bin')):                                  # 002k (H6): the svc wrapper is the barrier
             deny('bin/ holds the svc wrapper, the barrier of the lanes: no lane writes, moves, deletes or copies it.')
             return

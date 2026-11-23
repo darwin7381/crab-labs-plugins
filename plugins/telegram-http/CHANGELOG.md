@@ -1,3 +1,30 @@
+## 1.36.0 — 2026-11-23
+
+- **Lanes on: a lane may add text at the end of the files the main declared (WO-123, Chiron; agent-inbox 1.6.0 carries the same code).**
+  - **Why:** Joey TG chiron:2070 「所以現在分身是完全不能寫檔的？…為何不讓簡單的事分身可以在一定確定性底下進行處理？」. On 11-23, of 44 hand-overs to
+    mains, 3 happened only because the lane could not write one line to a record file (pheme's `state/situation.md`, chiron's
+    `knowledge/harness-journal.md`, kairos's sync log; cadmus's eng-log the same), and each hand-over wakes a main with its whole context.
+  - **The declaration is the main's:** `.lanes/appendable.txt`, one workspace-relative path per line (`#` = comment). Accepted: a regular file (or
+    one not there yet) inside the workspace with a record-like extension (`.md .txt .log .csv .tsv .jsonl`). Never declarable, whatever the file
+    says: the memory directory, `.lanes/`, `.secrets/`, `.git/`, `.claude/`, `bin/`, the daemons' state directories, `CLAUDE.md`, `MEMORY.md`,
+    `knowledge/REANCHOR.md` and the anchor files it lists, `knowledge/lines/` (workers' anchor files), a symbolic link, anything that resolves
+    outside the workspace, and every other extension (settings, state, code). A refused line is logged once by the daemon.
+  - **Append-only by construction:** the one way in is the tool `append_file(path, text)` (every lane kind; the main has it too). The daemon opens
+    the file with O_APPEND and makes one synchronous write: a line break before the text when the file does not end with one, one after it when
+    the text does not; at most 4,000 characters a call; one ledger action per append (file, bytes, size before). `lane-guard-hook.py` reads the
+    same declaration with the same rules and refuses Write / Edit / MultiEdit / NotebookEdit and every shell write (`>`, `>>`, `sed -i`, `rm`,
+    `cp`, `mv`, `rm -r` of a directory holding one) to a declared file, for every lane kind, a worker holding a claim included; the refusal names
+    `append_file`. So what is already in a declared file cannot be changed, cut or replaced by a lane, however the write is spelled.
+  - **The lane card** lists the declared files (nothing is added to the card when none is declared). **The main's rules** say how to declare
+    and that the main adds to these files with `append_file` or the shell's `>>` (a whole-file rewrite could drop a lane's line written at the
+    same moment); a sentence of Chiron's on what not to declare follows (`lanes-main.ts`, the item after the focus card).
+  - **No declaration file: unchanged.** The card, the guard's answers and the tools' behaviour are what they were (the tool refuses: nothing is
+    declared). The `out/` rule for reflex / mail / synthesis / curator lanes stays as it is.
+  - Tests `lanes-append` (Chiron's acceptance 1 to 6): the declaration's accept / refuse table; append keeps the earlier bytes identical; 20
+    appends from the daemon side against 20 concurrent shell `>>`: 40 whole lines; the guard refuses each spelling for reflex, mail and a
+    claiming worker; an undeclared file is refused as before; no declaration: no mention of `append_file` anywhere; through a real lane run:
+    the tool appends, refuses an undeclared and a never-declarable path, and writes one ledger action.
+
 ## 1.35.3 — 2026-11-23
 
 - **Always (lanes on or off): a message that is a rich message is delivered.** 2026-11-17 (Hestia, mail #9758): Joey sent an agent a formatted
