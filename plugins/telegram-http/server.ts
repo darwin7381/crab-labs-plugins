@@ -74,6 +74,7 @@ import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
+import { richToMarkdown } from './rich-inbound.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
 if (Lanes.LANES_ON) useLanesMenuRules(true)
@@ -2426,8 +2427,10 @@ bot.use(async (ctx, next) => {
   if (m) {
     const kind = m.photo ? 'photo' : m.document ? 'document' : m.video ? 'video'
       : m.voice ? 'voice' : m.audio ? 'audio' : m.animation ? 'animation'
-      : m.sticker ? 'sticker' : m.text != null ? 'text' : 'other'
-    log('info', `inbound u=${ctx.update.update_id} chat=${m.chat?.id} msg=${m.message_id} kind=${kind}${m.media_group_id ? ` mgid=${m.media_group_id}` : ''}${m.document?.file_name ? ` name=${safeName(m.document.file_name)}` : ''}`)
+      : m.sticker ? 'sticker' : m.text != null ? 'text' : (m as any).rich_message ? 'rich' : 'other'
+    // kind=other: the names of the message's fields (never their content), so an undelivered type can be told from a service message afterwards
+    const shape = kind === 'other' ? ` keys=${Object.keys(m).filter(k => !['message_id', 'from', 'chat', 'date', 'message_thread_id', 'is_topic_message'].includes(k)).slice(0, 8).join(',')}` : ''
+    log('info', `inbound u=${ctx.update.update_id} chat=${m.chat?.id} msg=${m.message_id} kind=${kind}${m.media_group_id ? ` mgid=${m.media_group_id}` : ''}${m.document?.file_name ? ` name=${safeName(m.document.file_name)}` : ''}${shape}`)
   }
   await next()
 })
@@ -2797,6 +2800,16 @@ bot.on('message:contact', async ctx => {
   await handleInbound(ctx, `(contact: ${name}, ${safeName(c.phone_number)})`, undefined)
 })
 
+// A message whose content is `rich_message` and nothing else (a formatted paste; a forwarded rich reply of a bot): no handler above matches it, and
+// until 1.35.3 it was dropped with one `kind=other` line (2026-11-17, Hestia #9758: Joey waited an hour). Delivered as its text, blocks flattened to
+// markdown (rich-inbound.ts); a block type this version does not know is named in the text.
+bot.on('message', async (ctx, next) => {
+  const m = ctx.message as any
+  if (!m?.rich_message || m.text != null || m.caption != null) return next()
+  const { attachment, image } = replyAttachment(ctx)
+  await handleInbound(ctx, richToMarkdown(m.rich_message) || '(rich message: nothing readable in it)', image, attachment, true)
+})
+
 type AttachmentMeta = {
   kind: string
   file_id: string
@@ -2885,7 +2898,8 @@ function replyForwardMeta(ctx: Context, attachmentFromReply: boolean, skipTopicC
     } else if (rt.sender_chat) {
       out.reply_to_user = safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)
     }
-    const rootText = rt.text ?? rt.caption
+    // a rich message (every sendRichMessage reply of a bot; a formatted paste) has no text / caption: its blocks as text (Hestia #9758)
+    const rootText = rt.text ?? rt.caption ?? (rt.rich_message ? (richToMarkdown(rt.rich_message) || undefined) : undefined)
     // Media-kind labels go through metaExcerpt too — a 255-char filename in
     // `(document: …)` gets the same cap + … marker as plain text (#13).
     const rawLabel = rootText ?? mediaKindLabel(rt)

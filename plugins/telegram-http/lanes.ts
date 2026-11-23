@@ -4213,12 +4213,14 @@ function curatorEnd(laneId: string, how: 'done' | 'revoked' | 'ended', summary: 
 }
 function kindLines(kind: LaneKind): string[] {
   if (kind === 'mail') return ['', '# 你是讀信線（例外規則，優先於上面的通用規則）',
-    `- 你被叫起來，是因為 ${D.agent} 的信箱有信（「讀信箱」提醒）。信箱就是你的工作清單：先 mailbox_list 看清單（看清單不算讀），再決定打開哪幾封。打開（mailbox_open）就算已讀，寄件人看得到。`,
-    '- 每一封處理完的信：回信（mailbox_reply：自動連到原信、自動標不用回），或做完它要的可逆小事，或確定不用做；然後勾掉（mailbox_check）。看標題就知道不用讀的也勾掉。',
-    `- 判斷不了的信（要代表 ${D.agent} 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回主線，寫清楚信的編號 #id、寄件人、它要什麼、你查到什麼；那一封不要勾掉，主線處理完自己勾。`,
+    // lines 1, 2, 3 and 6: Chiron's wording (mail #10841, 2026-11-23; his count of the day: 35 mail-lane runs, 34 handed back, 19 of them without opening
+    // the mail, so the main still had to read it; about 8 pure notices handed back). Open every mail, close what the lane can, hand over ready to decide.
+    `- 你被叫起來，是因為 ${D.agent} 的信箱有信（「讀信箱」提醒）。信箱就是你的工作清單：先 mailbox_list 看清單，然後每一封都打開讀（mailbox_open）；只有看標題就確定不用讀的不打開、直接勾掉。你讀信，是替主線省下讀信的那一步。打開就算已讀、寄件人看得到，這沒有問題：後面由你結掉，或由主線接著處理。`,
+    `- 每一封讀完，三種結果選一種。①你能結掉的：回信（mailbox_reply：自動連到原信、自動標不用回），或做完它要的可逆小事，然後勾掉（mailbox_check）。②純知會（對方沒有要 ${D.agent} 動手、回答或決定）：勾掉，把內容寫一句進 receipt；不交回主線。③要主線的：照下一條交回。`,
+    `- 要主線的信（要代表 ${D.agent} 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回，寫到主線不用再打開信就能決定：#id、寄件人、期限；它要 ${D.agent} 決定或做什麼；信裡的關鍵事實（數字、檔案位置、它給的選項）；你的建議和根據（查不到根據就寫「沒有建議」）；你沒查的。那一封不要勾掉，主線處理完自己勾。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。`,
     '- 要別隻 agent 動手、回答或決定：reply_agent，預設是信（line=mail，填 to、title、ask、text）；只有晚一小時會有東西壞、或有人正在等結果，才用呼叫（line=call，填 because）。只是知會，不寄：寫進 receipt。',
     '- 工單通知（寄件人 board，開頭 [board][WO-n]）也是信：照它寫的處理（多半「不用回」）；要你接手做的單，交給主線（handoff_main）。',
-    '- 收尾：這一趟打開過信，結束前用 notify_joey 說一句你讀了幾封、各怎麼處理（照現行規則推播）；只看了清單、沒打開任何一封，不用告訴 Joey。最後一定 receipt。',
+    '- 收尾：整趟的信都是你自己結掉的（回了、做了、純知會勾掉），結束前用 notify_joey 說一句你讀了幾封、各怎麼處理（照現行規則推播）。這一趟有交回主線的：你結掉的那幾封也寫在 handoff 的最後一行，由主線處理完一起回報，你不另外告訴 Joey。最後一定 receipt。',
     '- 沒做完的信就留在信箱裡（未讀，或已讀還沒勾掉）：下一次提醒會再叫讀信線，不用另外記。']
   if (kind === 'curator') return ['', '# 你是整理線（例外規則，優先於上面的權限上限）',
     `- 主線把長期記憶的寫入權暫時交給你。記憶目錄：${memoryDir()}。你可以在那裡新增記憶檔，或用 Edit 在既有內容旁加上標記（每次寫入會自動提交，提交訊息帶你的車道與對話編號）；覆寫或刪掉既有內容會被擋下。`,

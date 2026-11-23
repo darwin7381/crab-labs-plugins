@@ -1,3 +1,26 @@
+## 1.35.3 — 2026-11-23
+
+- **Always (lanes on or off): a message that is a rich message is delivered.** 2026-11-17 (Hestia, mail #9758): Joey sent an agent a formatted
+  paste of about 3,000 characters. Its `Message` had `rich_message` (blocks) and no `text` / `caption`; no handler matched and it was dropped with
+  one `kind=other` log line. He waited an hour (「到底有沒有看到？？」). Every rich reply a bot sends (`sendRichMessage`) is such a message, so one
+  forwarded to another agent was dropped the same way, and a reply to one arrived without `reply_to_text`.
+  - `rich-inbound.ts`: the official types (core.telegram.org/bots/api `RichText*`, `RichBlock*`, read 2026-11-23) flattened to markdown: headings,
+    paragraphs with bold / italic / strikethrough / code / links, lists (bullets, numbers, checkboxes, nested blocks), tables, block and pull
+    quotations, pre, dividers, details, maps, buttons; media blocks as `（照片 file_id=…）` with their caption (download_attachment takes the id);
+    a model's `thinking` block is left out; a block type this version does not know is named (`（無法顯示的區塊類型：x）`), never skipped silently.
+  - `server.ts`: a `message` handler after the typed ones delivers a rich-only message as that text through `handleInbound` (same gate, topic,
+    reply / forward meta as a text message); `reply_to_text` falls back to the replied-to message's rich text; the inbound trace says `kind=rich`,
+    and for `kind=other` now lists the message's field names (never content), so an undelivered type can be told from a service message.
+  - Tests `rich-inbound` (the flattening; through a real daemon: delivered as text, `reply_to_text` of a rich message). Not yet seen with a real
+    Telegram update in this version: the shapes are the official ones and Hestia's dump of msg 658.
+- **Lanes on: the mail lane's words** (Chiron, mail #10841; his count of 11-23: 35 mail-lane runs, 34 handed back, 19 of them without opening
+  the mail, about 8 pure notices handed back). `lanes.ts kindLines('mail')` lines 1, 2, 3 and 6 are his text: open every mail; close what the
+  lane can; a pure notice is checked off and goes into the receipt, not to the main; a hand-over is written so the main can decide without
+  opening the mail (id, sender, deadline, what is asked, the facts, a recommendation with its ground, what was not checked); a run that handed
+  something over gives Joey no line of its own. Test `lanes-mail-handover`: after `mailbox_open` + `handoff_main` the opened mail's Joey line is
+  `handed` and nothing is sent to Joey by the lane (his condition: not one more message for Joey).
+- Tests: full suite 867 (863 pass, 3 skip, 1 fail: `lanes-e18` E18, a 5 s wait that also failed 1 of 3 runs alone at load average 13; untouched by this version).
+
 ## 1.35.2 — 2026-11-23
 
 - **A mail lane's read is not the main's read** (WO-124, Chiron; Joey TG chiron:2070 「子線已讀和主線已讀是不一樣的已讀？」). BTCC c6bd7f2
