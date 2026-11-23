@@ -75,7 +75,7 @@ test('the guard: Write, Edit, > , >> , sed -i , rm on a declared file are refuse
     expect([kind, guard(kind, { tool_name: 'Bash', tool_input: { command: `sed -i '' 's/第一行/改/' state/situation.md` } }, lane)]).not.toEqual([kind, ''])
   }
   expect(readFileSync(f, 'utf8')).toBe('# 狀況\n第一行\n第二行\n')
-})
+}, 60000)   // ~30 hook processes: 5 s was too short with the machine loaded (1.37.0 full run, load average 80)
 
 test('an undeclared workspace file is refused as before; with no declaration nothing mentions append_file (points 3 and 6)', () => {
   setDeclared(['state/situation.md'])
