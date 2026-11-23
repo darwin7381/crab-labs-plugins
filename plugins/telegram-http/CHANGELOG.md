@@ -1,3 +1,20 @@
+## 1.37.2 — 2026-11-24
+
+- **Lanes on: a session that reconnects after a daemon restart lists its tools again (WO-126; agent-inbox 1.7.2 carries the same code).**
+  - **What happened:** after the 1.37.1 daemon-only wave, epeius's running main had no `mailbox_decide`: claude-code reconnects to a restarted
+    daemon with a fresh `initialize` but keeps the tool list it fetched at session start; it lists again only on `tools/list_changed`. A tool
+    an upgrade adds reached a main only after a TUI restart, and the daemon-only waves (this one, Sonn's step ②) restart no TUI.
+  - **What changed:** when a session's stream opens, the daemon (lanes on: the server declares `listChanged` only then, 002m LG1) sends that
+    session `tools/list_changed` once, after the client-ready delay (`READY_DELAY_MS` + 0.5 s). Canary on epeius (its agent-inbox daemon run
+    from the dev clone, 11-23 23:2xZ): `mailbox_decide` appeared in the running session ~3 s after the stream opened, no TUI restart.
+  - `mailbox_open` of a lane item no longer prints 「要你：」 above the card: a lane item's ask is its card's decide (shown once, on the card).
+    A colleague's mail keeps its sender's ask.
+  - **Live (1.37.1 + this, epeius, 11-23 23:26–23:28Z):** lane item #10994 (ref wo126-e2e-1; a second open with the same ref → 409) listed and
+    opened with its card; `mailbox_decide` as_recommended → BTCC once (the second → 409 once only) → `mail_decision` → `/lanes/route`
+    (`rule=default → main`, today's router has no mail rule) → the main got it with lane / lane_thread / ref in the channel meta. #10996
+    (deadline 12 min) → `mail_due` 23 s later by the minute poll (`/due?within=900`) → the main. Metrics that day: lane_items 2,
+    decisions as_recommended 1 / declined 1, decide median 16 s, max 21 s, overdue 0.
+
 ## 1.37.1 — 2026-11-24
 
 - **The mailbox side of the lane boundary: decision cards, the main's decision, the router's two events (WO-126; agent-inbox 1.7.1 carries the same code).**

@@ -332,7 +332,8 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const m = r.json
       const who = deps.openBy === 'lane' ? '｜車道讀過（寄件人看到的是車道讀過，不是主線已讀）'
         : m.lane_read_at ? `｜車道 ${hm(m.lane_read_at)} 先讀過` : ''
-      const head = `#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}${who}`
+      // a lane item's ask is its card's decide: shown once, on the card
+      const head = `#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask && !m.from_lane ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}${who}`
       // WO-126: the card and the original; a lane item's body is its card, shown once
       if (m.card) return text(m.from_lane ? `${head}\n\n${cardBlock(m)}` : `${head}\n\n${cardBlock(m)}\n\n── 原信 ──\n${m.body}`)
       return text(`${head}\n\n${m.body}`)

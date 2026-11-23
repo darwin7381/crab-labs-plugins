@@ -849,6 +849,7 @@ const memQueue = new Map<string, Array<{ method: string; params: unknown }>>()  
 // delivery (RECEIPT_GRACE_MS below), so a client slower than this delay costs a redelivery, not a loss.
 const READY_DELAY_MS = Number(process.env.MCP_READY_DELAY_MS ?? 2500)
 const sseReadyAt = new Map<string, number>()          // session id → ms when pushes may start
+const toldToolList = new Set<string>()                // WO-126: sessions told once to list their tools again
 function sseReady(sid: string): boolean {
   return !!sseOpen.get(sid) && Date.now() >= (sseReadyAt.get(sid) ?? Infinity)
 }
@@ -4315,6 +4316,17 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         //   5. THEN await the long-lived SSE request lifecycle
         sseOpen.set(sessionId, true)
         sseReadyAt.set(sessionId, Date.now() + READY_DELAY_MS)   // pushes wait for the client handler
+        // WO-126: a session that reconnects after this daemon restarted keeps the tool list it fetched before (claude-code lists again on
+        // tools/list_changed, not on a reconnect): tell each session once, when its stream is ready, so a tool an upgrade added (mailbox_decide)
+        // reaches a running main without a TUI restart. Lanes only: the server declares listChanged only then (002m LG1).
+        if (Lanes.LANES_ON && !toldToolList.has(sessionId)) {
+          toldToolList.add(sessionId)
+          if (toldToolList.size > 5000) toldToolList.delete(toldToolList.values().next().value!)
+          setTimeout(() => {
+            for (const s of activeServers) if (serverSessionId.get(s) === sessionId && sseOpen.get(sessionId))
+              void s.sendToolListChanged().catch(err => log('warn', `tools/list_changed to ${sessionId} failed: ${err}`))
+          }, READY_DELAY_MS + 500).unref?.()
+        }
         sessionLastActiveAt.set(sessionId, Date.now())  // SSE confirmed open ⇒ reset zombie-GC clock
 
         // 2026-05-22 — Dead-transport detection patch (belt + suspenders):

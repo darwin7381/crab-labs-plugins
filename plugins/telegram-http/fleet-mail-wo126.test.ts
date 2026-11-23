@@ -51,6 +51,8 @@ test('open: the card (five boxes, who put it, how to answer) and then the origin
   expect(t2).toContain('分身 kot.reflex.2 放的件')
   expect(t2).toContain('已決定（11-24 06:20Z）：改成：改週四')
   expect(t2).not.toContain('原信')
+  expect(t2).not.toContain('\n要你：')                                   // a lane item's ask is its card's decide: once, on the card
+  expect(t).toContain('\n要你：回可不可以\n')                            // a colleague's ask stays (the sender's own words)
 })
 
 test('mailbox_decide: the main only; the answer goes to BTCC once and its event to the router; lanes off says do it yourself', async () => {
@@ -107,4 +109,7 @@ test('tool shapes: the main\'s list is unchanged (mailbox_decide is added by ser
   expect(src).toContain("mailEvent: (decided: any) => mailEvents.emit(decisionEvent(decided))")
   expect(src).toContain("btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`)")
   expect(src).toContain("{ ...fleetDeps, openBy: 'lane', lane }")
+  // a session that reconnects after a daemon restart is told once to list its tools again (live on epeius 11-23 23:2xZ: mailbox_decide appeared 3 s later)
+  expect(src).toContain('if (Lanes.LANES_ON && !toldToolList.has(sessionId)) {')
+  expect(src).toContain('void s.sendToolListChanged().catch(err => log(\'warn\', `tools/list_changed to ${sessionId} failed: ${err}`))')
 })
