@@ -25,7 +25,7 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
-import { topicMode, type TopicVerdict } from './lanes-topics.ts'
+import { plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
@@ -164,6 +164,9 @@ export interface LanesDeps {
   createTopic?: (chat_id: string, name: string) => Promise<number>
   /** lanes-topics (item 1): may the bot open a work topic now (lanes-topics.ts topicVerdict over a fresh getMe)? usable false = the main does the work */
   topicsUsable?: () => Promise<TopicVerdict>
+  /** lanes-topics (item 4): the bot's username (the topic link), and a finished topic's ✅ icon (editForumTopic; the result says what was done) */
+  botUsername?: () => string
+  topicDone?: (chat_id: string, thread: number) => Promise<string>
   joeyChatId?: () => string
   /** inbox role: mesh send with lane extras; resolves the minted btcc id */
   meshSend?: (to: string, text: string, replyTo: number | undefined, noReply: boolean,
@@ -262,6 +265,9 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(() => dueTick(), 1_000).unref()        // M3: the one due sweep (critical ring, hand-over not taken, promised answers, commitments)
     setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
+    // lanes-topics (item 4): a worker closed before the previous daemon stopped, its topic not finished yet (only `pending` ones: older closed lanes untouched)
+    setTimeout(() => { for (const l of Object.values(S.lanes)) if (l.status === 'closed' && l.topic_close === 'pending' && !l.topic_done && !running.has(l.id)) void finishTopic(l, '關閉時 daemon 重啟，開機後補上') },
+      num('LANES_TOPIC_SWEEP_MS', 3_000)).unref()
     if (deps.mainPicker && process.env.CHANNEL_BOT_TMUX_SESSION) publishMenuOwner(process.env.CHANNEL_BOT_TMUX_SESSION)   // lanes-golive (C8)
   }
   deps.log('info', `lanes: ON (role=${deps.role} agent=${deps.agent} dir=${LANES_DIR} model=${MODEL} cap=${MAX_RUNNING} hop_limit=${HOP_LIMIT})`)
@@ -606,6 +612,8 @@ type Lane = {
   created: string; last: string; transcript: string; runs: number
   tokens_in: number; tokens_out: number; topic?: number; title?: string; critical?: boolean
   fork_from?: string
+  /** lanes-topics (item 4): a worker's topic name as stored (= shown); its finish: pending at the close, done (time) once the ✅ and the closing line went */
+  topic_name?: string; topic_close?: 'pending'; topic_done?: string
 }
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
   /** 002l (D1, D7): fresh tokens (freshTokens) the thread's runs spent: what the thread budget counts. `tokens` stays the input-side total, for the record. */
@@ -4395,19 +4403,45 @@ async function openWorkerLane(title: string, brief: string): Promise<Lane | null
     ledger({ lane: 'router', kind: 'fyi', text: `沒開工作線的話題（${v.why.slice(0, 160)}）：「${title.slice(0, 80)}」交給主線做。`, refs: { topics: 'not-used' } })
     return null
   }
-  try { topic = await D.createTopic(D.joeyChatId(), title.slice(0, 120)) } catch (e) {
+  // lanes-topics (item 4): the name sent is the name the server keeps and shows (it drops emoji): stored as such
+  const name = plainTopicName(title, `${KIND_NAME.worker} ${(S.counters.worker ?? 0) + 1}`)
+  try { topic = await D.createTopic(D.joeyChatId(), name) } catch (e) {
     D.log('warn', `lanes: no worker topic for 「${title.slice(0, 60)}」 (${String(e).slice(0, 160)}): the main does the work`)
     ledger({ lane: 'router', kind: 'fyi', text: `開不了工作線的話題（${String(e).slice(0, 120)}）：「${title.slice(0, 80)}」交給主線做。`, refs: { topics: 'off' } })
     return null
   }
   if (topic == null) return null
-  const lane = newLane('worker', { title, topic })
-  if (topic != null) { S.topics[String(topic)] = lane.id; noteTopicName(topic, title.slice(0, 120)) }
+  const lane = newLane('worker', { title, topic, topic_name: name })
+  if (topic != null) { S.topics[String(topic)] = lane.id; noteTopicName(topic, name) }
   S.threads[lane.thread].peer = null
   saveState()
-  ledger({ lane: lane.id, thread: lane.thread, kind: 'action', text: `工作線開啟：「${title}」，話題 #${topic ?? '-'}。簡報：${brief.slice(0, 300)}` })
+  ledger({ lane: lane.id, thread: lane.thread, kind: 'action', text: `工作線開啟：「${title}」，話題 #${topic ?? '-'}「${name}」。簡報：${brief.slice(0, 300)}` })
   return lane
 }
+
+/** lanes-topics (item 4): a worker lane's topic when the lane ends (the main's lane_close, Joey's /lanes close, or, when a run was going at the close, that
+ *  run's end): the ✅ icon (D.topicDone: editForumTopic with getForumTopicIconStickers' ✅; the name stays as it was, emoji in a name are dropped by the
+ *  server) and one closing line in the topic. The topic is never deleted (deleteForumTopic removes its messages). Once per lane: `topic_close` is set to
+ *  pending at the close (persisted: a daemon restart in between finishes it at boot), `topic_done` when it went. A message Joey types there later goes
+ *  to the main (the topic is no longer bound: closeLane) and the main's answer lands in the topic (targetTopic). */
+const topicFinishing = new Set<Promise<void>>()
+function finishTopic(lane: Lane, by: string): Promise<void> {
+  if (D.role !== 'tg' || lane.kind !== 'worker' || lane.topic == null || lane.topic_done) return Promise.resolve()
+  lane.topic_done = nowIso(); delete lane.topic_close; saveState()
+  const chat = D.joeyChatId?.() ?? '', topic = lane.topic, name = lane.topic_name ?? topicName(topic)
+  const p = (async () => {
+    let icon = 'the icon was not changed (this daemon cannot)'
+    if (D.topicDone && chat) { try { icon = await D.topicDone(chat, topic) } catch (e) { icon = `the icon was not set: ${String(e).slice(0, 160)}` } }
+    // silent: a marker in the topic (the result itself is the lane's or the main's line, which rings); Joey or the main closed it
+    const id = await pushJoey(lane, `這條工作線結束了（${by}）。話題留著、不會刪；之後在這裡說的話交給主線，主線會回在這個話題。`, true)
+    ledger({ lane: lane.id, thread: lane.thread, kind: 'action', text: `工作線結束：話題 #${topic}${name ? `「${name}」` : ''}，${icon}；結束句 ${id ?? '沒送出'}（${by}）。話題沒有刪。`,
+      refs: { topic, topic_done: true, message_id: id, icon } })
+  })()
+  topicFinishing.add(p); void p.finally(() => topicFinishing.delete(p))
+  return p
+}
+/** tests only: the topic finishes in progress */
+export const __topicFinishing = (): Promise<void> => Promise.all([...topicFinishing]).then(() => {})
 
 /** ledger_query: with no kind and no text, the activity list (the M3 event view); otherwise the live append-only ledger, read at call time (a missing
  *  file is an empty ledger). */
@@ -4538,7 +4572,10 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
         synthetic: `[車道事件｜主線交辦｜工作線開啟]\n任務標題：${title}\n主線的簡報：\n${brief}\n\n先在話題裡用 notify_joey 跟 Joey 打個招呼並說明你接下來要做什麼，然後開始做。` }
       enqueue(ev, lane.id, 3)
       routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'open_worker', target: 'lane', lane: lane.id, thread: lane.thread, note: `topic ${lane.topic}` })
-      return `worker ${lane.id} opened in topic #${lane.topic} (“${title}”); thread ${lane.thread}. Joey can talk to it inside that topic.`
+      // lanes-topics (item 4): the link that opens the topic, and the name as stored (= as Joey sees it: emoji dropped)
+      const link = topicLink(D.botUsername?.(), lane.topic!)
+      return `worker ${lane.id} opened in topic #${lane.topic} 「${lane.topic_name ?? title}」 (${link ?? 'link: the bot username is not known yet'}); thread ${lane.thread}. `
+        + 'Joey can talk to it inside that topic. When the work is done, close it with lane_close: the topic gets a ✅ icon and stays (never deleted); what he types there afterwards comes to you, and your reply lands in that topic.'
     }
     case 'fork': {
       const task = String(a.task ?? '').trim()
@@ -4665,9 +4702,11 @@ function closeLane(l: Lane, who: string, via: 'joey' | 'main'): { running: boole
   l.status = 'closed'
   for (const [k, v] of Object.entries(S.topics)) if (v === l.id) delete S.topics[k]
   for (const [k, v] of Object.entries(S.tickets)) if (v === l.id) delete S.tickets[k]
+  if (l.kind === 'worker' && l.topic != null && !l.topic_done) l.topic_close = 'pending'      // lanes-topics (item 4): its topic is finished (now, or when the run ends)
   saveState()
   appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: !!run, title: l.title ?? null, grace_ms: run ? CLOSE_GRACE_MS() : 0 })
   const who2 = via === 'joey' ? 'Joey 用 /lanes close' : '主線用 lane_close'
+  if (!run) void finishTopic(l, who2)
   // 002w (A, gap 7): a curator lane closed with no run going gives the write right back at once (a running one gives it back when its run ends: runEnded)
   if (!run && S.curator?.lane === l.id) curatorEnd(l.id, 'ended', `${who2} 關閉了它`)
   if (!run) {
@@ -4702,6 +4741,7 @@ function closeRecord(lane: Lane, run: { runId: string; evId: string; tools: Arra
       + `之前的帳本紀錄：${c.last.join('；') || '（沒有）'}。這件事如果還沒做完，由主線決定要不要接手。`,
     refs: { closed: lane.id, by: c.by, was_running: true, run: run.runId, reported: reported.length, stopped: run.signal ?? null } })
   logos('lane.closed', { lane: lane.id, run: run.runId, reported: reported.length, signal: run.signal ?? null, by: c.by })
+  void finishTopic(lane, who2)                                                       // lanes-topics (item 4): after the run's own last line
 }
 const KIND_EN: Record<string, string> = { reflex: 'reflex', worker: 'worker', fork: 'fork', curator: 'curator', synthesis: 'synthesis' }
 function openedBy(l: Lane): string {

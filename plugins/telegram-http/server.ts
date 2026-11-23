@@ -3784,6 +3784,7 @@ try { mcpToken = ensureToken(HTTP_PORT as number) } catch (e) {
 const mcpGate = makeGate(mcpToken, MCP_REQUIRE_TOKEN, msg => log('warn', msg))
 
 // 002 lanes wiring (inert unless GENESIS_LANES=1)
+let checkIconId: string | undefined                // lanes-topics (item 4): the ✅ topic icon's custom emoji id, once found
 if (Lanes.LANES_ON) {
   const tokOk = (a: string | undefined) => {
     if (!mcpToken || !a) return false
@@ -3889,6 +3890,16 @@ if (Lanes.LANES_ON) {
       createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
       // lanes-topics (item 1): the topic mode as getMe shows it now (one decision, lanes-topics.ts)
       topicsUsable: async () => topicVerdict((await bot.api.getMe()) as unknown as TopicMe),
+      // lanes-topics (item 4): the topic link's username; a finished topic gets the ✅ icon (its id from getForumTopicIconStickers, looked up once and kept;
+      // none there: the icon is left as it is). Never deleteForumTopic: it removes the topic's messages.
+      botUsername: () => botUsername,
+      topicDone: async (chat, thread) => {
+        checkIconId ??= ((await bot.api.getForumTopicIconStickers()) as Array<{ emoji?: string; custom_emoji_id?: string }>)
+          .find(s => s.emoji?.replace(/️/g, '') === '✅')?.custom_emoji_id
+        if (!checkIconId) return 'getForumTopicIconStickers has no ✅: the icon was left as it is'
+        await bot.api.editForumTopic(chat, thread, { icon_custom_emoji_id: checkIconId })
+        return `the icon was set to ✅ (${checkIconId})`
+      },
       joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
     }),
   })

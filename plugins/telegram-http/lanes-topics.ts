@@ -61,3 +61,20 @@ export async function topicModeAtStart(mode: TopicMode, me: TopicMe | null, api:
     return { mode, verdict: { usable: false, why: warn }, set: true, warn }
   }
 }
+
+/** the emoji of a text taken out (pictographs, flags, skin tones, variation selectors, joiners, keycaps, tags) */
+export function stripEmoji(s: unknown): string {
+  return String(s ?? '').replace(/\p{Extended_Pictographic}|\p{Regional_Indicator}|[\u{1F3FB}-\u{1F3FF}\u{FE0E}\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}]/gu, '')
+}
+/** lanes-topics (item 4): a topic name as the server keeps it. The server drops emoji from a name and still answers true (measured 11-23: 「✅ 工作：示範」 was
+ *  shown as 「工作：示範」), so they are dropped here first and the name stored is the name shown. Whitespace folded; at most 120 characters (the Bot API
+ *  allows 128); `fallback` when nothing is left. */
+export function plainTopicName(title: unknown, fallback: string): string {
+  const s = stripEmoji(title).replace(/\s+/g, ' ').trim()
+  return [...(s || fallback)].slice(0, 120).join('')
+}
+/** the link that opens a topic of the bot's private chat (Bot API 10.4: t.me/<bot username>/<thread id>), or null while the username is not known */
+export function topicLink(username: unknown, thread: number): string | null {
+  const u = String(username ?? '').trim().replace(/^@/, '')
+  return u ? `https://t.me/${u}/${thread}` : null
+}
