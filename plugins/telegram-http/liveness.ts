@@ -56,23 +56,55 @@ export function genuineAssistantAtFile(path: string): number {
     let newestTs = 0
     for (const line of text.split('\n')) {
       if (!line) continue
-      let r: { type?: string; isApiErrorMessage?: boolean; timestamp?: string; message?: { model?: string } }
+      let r: GenuineCandidate
       try { r = JSON.parse(line) } catch { continue }
-      if (r?.type !== 'assistant') continue
-      if (r?.isApiErrorMessage) continue
-      // 2026-09-19 (chiron 3779, verified on 3 transcripts): after a supervisor/
-      // wrapper restart the CLI answers the isMeta "Continue from where you left
-      // off." prompt with an assistant record that is model=<synthetic>, has no
-      // requestId, shares the user record's millisecond and reads "No response
-      // requested." — ZERO model calls. It is not an API error, so the check
-      // above let it through and a delivery landing just before the restart was
-      // marked consumed by a turn no model ever saw (same lie-family as the
-      // 2026-08-22 prometheus loss). Anything the CLI stamps <synthetic> is by
-      // definition not the agent reading anything.
-      if (r?.message?.model === '<synthetic>') continue
+      if (!isGenuineAssistant(r)) continue
       const t = Date.parse(r?.timestamp ?? '')
       if (Number.isFinite(t) && t > newestTs) newestTs = t
     }
     return newestTs
   } catch { return 0 }
+}
+
+type GenuineCandidate = { type?: string; isApiErrorMessage?: boolean; timestamp?: string; message?: { model?: string } }
+/** THE predicate: an assistant record a model really produced */
+export function isGenuineAssistant(r: GenuineCandidate | null | undefined): boolean {
+  if (r?.type !== 'assistant') return false
+  if (r?.isApiErrorMessage) return false
+  // 2026-09-19 (chiron 3779, verified on 3 transcripts): after a supervisor/
+  // wrapper restart the CLI answers the isMeta "Continue from where you left
+  // off." prompt with an assistant record that is model=<synthetic>, has no
+  // requestId, shares the user record's millisecond and reads "No response
+  // requested." — ZERO model calls. It is not an API error, so the check
+  // above let it through and a delivery landing just before the restart was
+  // marked consumed by a turn no model ever saw (same lie-family as the
+  // 2026-08-22 prometheus loss). Anything the CLI stamps <synthetic> is by
+  // definition not the agent reading anything.
+  if (r?.message?.model === '<synthetic>') return false
+  return true
+}
+
+/** lanes-topics (item 3): the model of the LAST genuine assistant record of one transcript (the session's model as it really ran), or null. Reads the
+ *  tail, widening (64KB, 1MB, 8MB) until it finds one: a turn of big tool results can push the last assistant record far from the end. */
+export function genuineAssistantModelFile(path: string): string | null {
+  try {
+    const size = statSync(path).size
+    for (const want of [TRANSCRIPT_TAIL_BYTES, 1024 * 1024, 8 * 1024 * 1024]) {
+      const start = Math.max(0, size - want), len = size - start
+      if (len <= 0) return null
+      const buf = Buffer.allocUnsafe(len)
+      const fd = openSync(path, 'r')
+      try { readSync(fd, buf, 0, len, start) } finally { closeSync(fd) }
+      const lines = buf.toString('utf8').split('\n')
+      if (start > 0) lines.shift()                                  // the partial first line
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i] || !lines[i].includes('"assistant"')) continue
+        let r: GenuineCandidate
+        try { r = JSON.parse(lines[i]) } catch { continue }
+        if (isGenuineAssistant(r) && typeof r.message?.model === 'string' && r.message.model.trim()) return r.message.model.trim()
+      }
+      if (start === 0) return null
+    }
+    return null
+  } catch { return null }
 }

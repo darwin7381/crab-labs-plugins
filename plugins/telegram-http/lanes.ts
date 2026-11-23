@@ -26,6 +26,7 @@ import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { topicMode, type TopicVerdict } from './lanes-topics.ts'
+import { genuineAssistantModelFile } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
@@ -95,6 +96,17 @@ const RESUME_MAX_AGE_MS = Number(process.env.LANES_RESUME_MAX_AGE_MS ?? 24 * 360
 export const LANE_MODEL_DEFAULT = 'claude-sonnet-5-5'
 const MODEL = process.env.LANES_MODEL || LANE_MODEL_DEFAULT
 export const laneModel = (): string => MODEL
+/** lanes-topics (item 3): the model a lane of this kind runs. A worker lane (a work topic) and a fork lane (the main's side task) do the main's own work, so
+ *  they run the main's model: LANES_MODEL_WORKER when set, else the model of the main's last genuine assistant record in its transcript (liveness.ts:
+ *  never <synthetic>, never an API error record), else LANES_MODEL. Reflex, mail, curator and synthesis lanes run LANES_MODEL. */
+export function laneModelFor(kind: string): { model: string; source: 'LANES_MODEL_WORKER' | 'main' | 'LANES_MODEL' } {
+  if (kind !== 'worker' && kind !== 'fork') return { model: MODEL, source: 'LANES_MODEL' }
+  const set = String(process.env.LANES_MODEL_WORKER ?? '').trim()
+  if (set) return { model: set, source: 'LANES_MODEL_WORKER' }
+  const t = D ? mainTranscriptFile(D.transcriptDir) : null
+  const m = t ? genuineAssistantModelFile(t) : null
+  return m ? { model: m, source: 'main' } : { model: MODEL, source: 'LANES_MODEL' }
+}
 let CLAUDE_BIN = process.env.LANES_CLAUDE_BIN ?? 'claude'
 const MAX_ATTEMPTS = 3
 // 002f: a lane run the daemon SAW die is dispatched again after attempt × this (it used to wait for the 2-minute lease)
@@ -2608,7 +2620,8 @@ function startRun(it: QItem): void {
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
   ensureMemoryIndex()                                                    // 002l (S0 item 1): the index exists before any lane starts
   const { resume, args: sess } = sessionArgs(lane)
-  const args = ['-p', runPrompt(it, lane), '--model', MODEL, ...sess]
+  const lm = laneModelFor(lane.kind)                                        // lanes-topics (item 3): worker / fork lanes run the main's model
+  const args = ['-p', runPrompt(it, lane), '--model', lm.model, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt-file', laneSystemPromptFile(lane.kind),        // 002l (D15): card + CLAUDE.md context + memory index, one file per kind
     '--settings', join(LANES_DIR, 'lane-settings.json'), '--setting-sources', 'project,local',   // the plugin's lane settings, never the user's (writeLaneSettings)
@@ -2638,9 +2651,10 @@ function startRun(it: QItem): void {
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
-    transcript: lane.transcript, pid: child.pid, resume, fork_from: lane.kind === 'fork' && lane.runs === 0 ? lane.fork_from : null, attempt: it.attempts })
-  logos('lane.spawn', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript, pid: child.pid, resume, attempt: it.attempts })
-  D.log('info', `lanes: spawn ${runId} pid=${child.pid} ${resume ? 'resume' : 'new'} session=${lane.session_id} event=${it.ev.id}`)
+    transcript: lane.transcript, pid: child.pid, resume, fork_from: lane.kind === 'fork' && lane.runs === 0 ? lane.fork_from : null, attempt: it.attempts,
+    model: lm.model, model_from: lm.source })
+  logos('lane.spawn', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript, pid: child.pid, resume, attempt: it.attempts, model: lm.model })
+  D.log('info', `lanes: spawn ${runId} pid=${child.pid} ${resume ? 'resume' : 'new'} session=${lane.session_id} event=${it.ev.id} model=${lm.model} (${lm.source})`)
 
   const usage = new Map<string, { in: number; out: number; fresh: number }>()
   const tools: RunStep[] = []                                           // 002q (G06): every call of the run with its result (the attempt's record)
