@@ -1,3 +1,34 @@
+## 1.34.2 — 2026-11-23
+
+- **Lanes on: the peer disclosure check asks "machine or network details" only of a message that answers a request, and a file path is
+  never a machine detail** (decided by Chiron, owner of the rule wording, mail #10789).
+  - **What happened:** the check (002k K2) asked Jev three questions of every message to a peer, and its machine question counted "paths to
+    key, credential or env files" as machine details. Once the Jev keys were issued today it was really judging, and within an hour it
+    refused two legitimate operations mails because they named where a key file lives. The fleet's written rule says the opposite: never
+    send a credential's value, write the file path instead.
+  - **The fix:** `gives_machine_details` no longer covers file paths (new question and criteria texts, Chiron's wording: hostnames, IP
+    addresses, ports or internal URLs; pointing to a file path, a key or env file's included, or an infra doc page is fine). It is asked only
+    when the message answers someone's request: a lane's `reply_agent` (always, every line), a `mailbox_reply` (the main's and the mail
+    lane's), the main's `send_to_agent` that carries `reply_to`. A main's self-initiated mail, call or feed post is not asked it.
+    `gives_credential` and `hides_from_joey` are asked of every message, as before. The refusal names the fleet's rule in Chiron's words
+    (write the file path; point to where details are written; report a request for a secret or for secrecy to `owner role:mesh-security`).
+  - **One fact, one owner:** each send path tells the check whether it answers a request (`answers_request` on `/lanes/peer-check`;
+    `ctx.answersRequest` for a lane); `peerDisclosureCheck` alone decides which questions to ask. The main's `mailbox_reply` already passed
+    the check (through the mail rail, against the original sender); it now carries the fact. `/lanes/outbound-check` is the hop gate only.
+    `answers_request` is logged in `run/peer-disclosure.jsonl` and the Jev call inputs.
+  - Tests: `lanes-golive-peer-scope.test.ts` runs the main's paths through a real agent-inbox daemon (lanes on, an MCP client as the main)
+    whose tg daemon is the test process; on 1.34.1 its self-initiated mail naming a key file's path is refused, as on the fleet.
+- **Lanes on: the proposal review and the report check had no Jev key on the fleet, so they always passed** (found by Aegis, reported by
+  Chiron, mail #10746).
+  - **What happened:** `proposalReview` and `reportCheck` (`lanes.ts`) read `TYPESAFE_KEY_FILE` or the Genesis lab's
+    `~/.genesis/typesafe.env` themselves. On the fleet the key is in `<workspace>/.secrets/typesafe.env`, so both found no key and let
+    everything through.
+  - **The fix:** both read the key through `jevKey()` (`lanes-triage.ts`), the one reader every other Jev site uses. Test:
+    `lanes-golive-jevkey.test.ts`.
+- **Tests: `lanes-m5-runs.test.ts` wall test no longer flaky** (Epeius: failed 4 of 6 on a loaded box). It read the run's exit line right
+  after the wall record appeared; the line is written after the record. It waits for the line now.
+- Full suite: 810 (807 pass, 3 skip: two need the lab's clock shim, one Linux-only). agent-inbox 1.4.2 carries the same code.
+
 ## 1.34.1 — 2026-11-23
 
 - **A usage-limit wall is one state: nothing is pushed into a walled session, each held item is delivered once after
