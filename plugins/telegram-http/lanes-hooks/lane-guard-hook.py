@@ -771,6 +771,50 @@ def bash_policy(cmd, cwd, kind):
     return write_policy(cmd, cwd, kind)
 
 
+def bash_refusal(cmd, cwd, kind, roots):
+    """The refusal for a lane's Bash command (bash_policy, then the shell check on memory / .lanes / CLAUDE.md), or ''."""
+    why = bash_policy(cmd, cwd, kind)
+    if why:
+        return why
+    names = [r for r in roots] + ['.lanes', '/memory', 'CLAUDE.md']
+    if any(n and n in cmd for n in names) and WRITE_HINTS.search(cmd):
+        return ('lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. '
+                'Use ledger_write(kind=memory_proposal) or escalate.')
+    return ''
+
+
+# ---- 1.36.2: a refused command has no side effect, its receipt included
+# 2026-11-23 10:06Z, elsa.reflex.1 (scheduled run 6843) ran ONE command: `echo ... >> data/login-habits.md; cf_access_watch.py --ack; btcc-receipt complete 6843`.
+# The receipt branch came first: the hook completed run 6843 through the daemon (ledger: 「run 6843: ok — ...（btcc-receipt）」) and refused the command
+# without looking at the rest; run alone, the write was then refused (a reflex lane writes no workspace file) and the --ack never ran, yet the run stood
+# completed and the lane told Joey the line was recorded. Now the rest of the command is checked first: a command the guard refuses completes nothing.
+def receipt_only(cmd, depth=0):
+    """True when the command is nothing but `btcc-receipt complete N` calls (a cd before them allowed, also inside bash -c '...')"""
+    cmds, _ = commands(cmd)
+    for words, redirs in cmds:
+        prog, args, _w = command_word(words)
+        if redirs:
+            return False
+        if prog in SHELLS and depth < 3:
+            inner = option_value(args, ('-c',))
+            if inner and receipt_only(inner, depth + 1):
+                continue
+            return False
+        if (prog == RECEIPT_CLI and args[:1] == ['complete']) or prog in ('cd', 'pushd'):
+            continue
+        return False
+    return bool(cmds)
+
+
+def receipt_refused(why, calls):
+    """the deny reason for a refused command that also asked for a scheduler run's completion: nothing ran, the run is not completed"""
+    runs = ', '.join(c['run_id'] or '?' for c in calls)
+    return (f'This command was refused and NOTHING in it ran, the btcc-receipt complete included: scheduler run {runs} is NOT completed. '
+            f'Why it was refused: {why} '
+            'Run the allowed steps as separate commands, check that they worked, and file the receipt '
+            '(btcc-receipt complete, or the receipt tool with run_id) only after the work is really done.')
+
+
 def main():
     try:
         p = json.load(sys.stdin)
@@ -822,17 +866,22 @@ def main():
     if tool == 'Bash':
         cmd = str(ti.get('command', ''))
         calls = receipt_cli_calls(cmd)
+        try:
+            why = bash_refusal(cmd, cwd, os.environ.get('LANE_KIND') or '', roots)   # 002k (D13, H6): identity, ./bin/svc methods, direct service calls, write targets
+        except Exception:
+            if not calls:
+                raise
+            why = ''                                                             # the receipt path is never worse than before 1.36.2
         if calls:
-            deny(complete_through_daemon(calls))
+            # 1.36.2: the daemon completes the run only for a command the guard lets through (or one that is nothing but the receipt call); the command
+            # itself never runs either way (M3: nothing but the daemon completes a run)
+            if why and not receipt_only(cmd):
+                deny(receipt_refused(why, calls))
+            else:
+                deny(complete_through_daemon(calls))
             return
-        why = bash_policy(cmd, cwd, os.environ.get('LANE_KIND') or '')       # 002k (D13, H6): identity, ./bin/svc methods, direct service calls, write targets
         if why:
             deny(why)
-            return
-        names = [r for r in roots] + ['.lanes', '/memory', 'CLAUDE.md']
-        if any(n and n in cmd for n in names) and WRITE_HINTS.search(cmd):
-            deny('lanes cannot modify memory, .lanes/ or CLAUDE.md through the shell. '
-                 'Use ledger_write(kind=memory_proposal) or escalate.')
 
 
 if __name__ == '__main__':

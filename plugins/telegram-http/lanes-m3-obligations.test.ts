@@ -657,10 +657,10 @@ test('B3: the lane hands the critical alert to the main before due: a ringing re
 // A lane can ask for a run's completion two ways: the receipt tool, or the scheduler card's ./bin/btcc-receipt complete N (a Bash call). The guard hook
 // (a real process here) hands the CLI's request to POST /lane-receipt; lanes.ts completeRun meets the event's receipt obligation and calls the scheduler,
 // or refuses. The CLI itself never runs.
-async function cli(tok: any, command: string): Promise<{ deny: string | null }> {
+async function cli(tok: any, command: string, cwd = dir): Promise<{ deny: string | null }> {
   const p = Bun.spawn(['python3', join(import.meta.dir, 'lanes-hooks', 'lane-guard-hook.py')], { stdin: 'pipe', stdout: 'pipe',
     env: { PATH: process.env.PATH ?? '', LANES_HTTP_PORT: String((laneSrv.address() as any).port), LANE_RUN_TOKEN: L.__runToken(tok)!, LANE_KIND: 'reflex', LANES_DIR: dir } })
-  p.stdin.write(JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: dir })); p.stdin.end()
+  p.stdin.write(JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd })); p.stdin.end()
   const out = await new Response(p.stdout).text(); await p.exited
   return { deny: out.trim() ? JSON.parse(out).hookSpecificOutput.permissionDecisionReason : null }
 }
@@ -707,6 +707,38 @@ test('scheduler receipt: across events: a follow-up run\'s CLI for a run another
   expect(completions('63').length).toBe(1); expect(completions('64').length).toBe(0)
   await call(f.tok, 'notify_joey', { outcome: 'normal', text: '後續：一樣' })
   await end(f.lane)
+})
+
+// 1.36.2: elsa.reflex.1 (scheduled run 6843, 2026-11-23 10:06Z) chained a workspace write, an --ack and `btcc-receipt complete 6843` in one command. The
+// hook completed run 6843 through the router and refused the command for the receipt alone; run on its own, the write was refused (a reflex lane writes
+// no workspace file). The run stood completed, the lane told Joey the line was recorded, and nothing had been written. Now the rest of the command is
+// checked first: a command the guard refuses completes nothing (here in a workspace of its own, `ws`, beside the lanes dir).
+test('scheduler receipt (1.36.2): a command the guard refuses completes nothing, its receipt included; a receipt-only command and an allowed command with a receipt complete as before', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'lanes-m3-ws-')); mkdirSync(join(ws, 'data')); mkdirSync(join(ws, 'out'))
+  const s = await start(sched(66))
+  const r = await cli(s.tok, `echo "- 11-23 05:43Z ether.fi 新登入通知" >> data/login-habits.md; python3 scripts/cf_access_watch.py --ack 2>&1 | tail -2; ./bin/btcc-receipt complete 66 --outcome ok --note '已記錄'`, ws)
+  expect(r.deny).toContain('NOTHING in it ran, the btcc-receipt complete included: scheduler run 66 is NOT completed')
+  expect(r.deny).toContain('a reflex lane does not write workspace files (data/login-habits.md)')
+  expect(r.deny).toContain('Run the allowed steps as separate commands')
+  expect(r.deny).toContain('only after the work is really done')
+  expect(r.deny).not.toContain('run 66 completed')
+  expect((await cli(s.tok, "bash -c 'echo x > data/a.md && ./bin/btcc-receipt complete 66'", ws)).deny).toContain('scheduler run 66 is NOT completed')   // inside bash -c too
+  expect(completions('66').length).toBe(0)                                                    // the scheduler stand-in heard nothing
+  expect(ob(s.id, 'receipt').state).toBe('open')
+  expect(rows().filter(x => x.event === s.id && x.kind === 'receipt').length).toBe(0)
+  const only = await cli(s.tok, "./bin/btcc-receipt complete 66 --outcome done --note 'checked CLAUDE.md, rm nothing'", ws)   // the receipt call is the whole command
+  expect(only.deny).toContain('run 66 completed')
+  expect(completions('66').length).toBe(1)
+  expect(ob(s.id, 'receipt')).toMatchObject({ state: 'met', by: 'btcc-receipt' })
+  await call(s.tok, 'notify_joey', { outcome: 'normal', text: 'run 66 正常' })
+  await end(s.lane)
+  const a = await start(sched(67))
+  const ok = await cli(a.tok, 'echo ok >> out/note.md && ./bin/btcc-receipt complete 67', ws)      // an allowed command with a receipt: as before
+  expect(ok.deny).toContain('This command was not run'); expect(ok.deny).toContain('run 67 completed')
+  expect(completions('67').length).toBe(1)
+  await call(a.tok, 'notify_joey', { outcome: 'normal', text: 'run 67 正常' })
+  await end(a.lane)
+  rmSync(ws, { recursive: true, force: true })
 })
 
 // ------------------------------------------------------------------ PL1 (AUD): one store of "what happened". Every inbound event has an M3 record, whatever its route;

@@ -1,3 +1,47 @@
+## 1.36.2 — 2026-11-24
+
+- **Lanes on: a resumed lane session gets a changed lane card (agent-inbox 1.6.2 carries the same code).**
+  - **What happened:** claude records a session's system prompt at its first request and replays it on every `--resume`, whatever
+    `--append-system-prompt-file` holds by then. The lane card (`identityCard`, the kind lines included) is in that file, so a change to the card
+    reached only lane sessions created after the release. nestor.mail.1 (session f2f6b18a, created 11-23 02:25Z) ran r8 (15:04Z) and r9 (16:01Z)
+    as resumes while its daemon ran 1.35.3 and 1.36.0; the `prompt_snapshot` of r9 has a system prompt byte-identical to r1's, with the 1.35.2
+    line 「再決定打開哪幾封」 and without 「每一封都打開讀」. Across the fleet on 11-23, every mail-lane session created after 14:51Z had the new
+    words (hestia, social-writer, cadmus, angelia, talos, hephaestus) and every resumed one kept the old (sandwich-master, chiron, epeius, pheme,
+    prometheus, nestor, plutus, the channel bot). The 1.36.1 entry's reading of nestor.mail.1 at 15:04Z (「with the 1.35.3 words in the card」) is
+    therefore wrong: that session never had them.
+  - **What changed:** each lane keeps `card_hash` (sha256 of its kind's card, 16 hex characters): set when its session is created (`--session-id`,
+    or a fork's first run, which get the card in the system prompt) and whenever the card is delivered. A run that resumes a session whose
+    hash differs from the current card's, or has none (every lane from before 1.36.2), carries the current card once, at the end of its
+    〔車道資訊〕 block under 「# 車道卡已更新（以這一份為準，取代你先前拿到的車道卡）」; that run's `spawn` record in `lanes.jsonl` has
+    `card_update: <hash>`. The system-prompt file is unchanged (one cached prefix per kind), and the instruction files (CLAUDE.md, the memory
+    index) are not sent again. A run whose card has not changed gets the same prompt as before, byte for byte. After the upgrade, the next run
+    of every existing lane carries the block once (no hash recorded yet).
+  - Test `lanes-card-update`: a new mail lane records the hash and gets no block; a changed card (a test hook on the kind lines) reaches the next
+    resumed run exactly once, inside 〔車道資訊〕, and not the run after; a lane with no hash gets it once.
+  - **Not verified:** with a live claude, that a lane follows the block over the replayed system prompt. The hash is recorded at spawn: a
+    resumed run that dies before claude writes its prompt to the transcript loses the block, and its retry does not carry it. A fork lane's
+    first run (`--resume <main> --fork-session`) is treated as a new session; whether claude uses `--append-system-prompt-file` there or the
+    main's recorded system prompt was not checked (no fork lane has run on the fleet).
+- **Lanes on: a Bash command the guard refuses completes no scheduler run.**
+  - **What happened:** 11-23 10:06:11Z, elsa.reflex.1 (scheduled run 6843) ran one command: `echo "- 11-23 05:43Z ether.fi…" >> data/login-habits.md;
+    python3 scripts/cf_access_watch.py --ack …; ~/.claude/tools/btcc-receipt complete 6843 --outcome ok --note '31封，1封ether.fi新登入通知已記錄，無需處理'`.
+    `lane-guard-hook.py` looked for the receipt call first: it completed run 6843 through the daemon (ledger 10:06:11.387Z 「run 6843: ok — …
+    （btcc-receipt）」) and refused the command for the receipt alone (「run 6843 completed: complete run 6843: HTTP 200 … run any other part of the
+    command on its own」), without checking the rest. The lane told Joey 「已記到登入習性」 (message 4220, 10:06:12Z), then ran the write and the
+    `--ack` on their own (10:06:14Z); the guard refused that (「a reflex lane does not write workspace files (data/login-habits.md)」). Its receipt
+    said 「記一行到 data/login-habits.md、cf_access_watch --ack」. Neither ran: `data/login-habits.md` was last modified 11-21 and has no ether.fi line.
+  - **What changed:** the hook checks the whole command (`bash_refusal`: `bash_policy` and the memory / `.lanes/` / CLAUDE.md shell check, as
+    before) before the receipt step. A refused command that contains `btcc-receipt complete` sends nothing to the daemon; the refusal says that
+    nothing in the command ran, the receipt included, that the run is NOT completed, why the command was refused, and to run the allowed steps
+    as separate commands and file the receipt only after the work is done (`receipt_refused`). A command that is nothing but the receipt call
+    (`receipt_only`: a `cd` before it allowed, also inside `bash -c`) goes to the daemon as before, even when its note trips the shell check. An
+    allowed command chained with a receipt call is unchanged: the daemon completes the run and the command does not run.
+  - Test `lanes-m3-obligations` 「scheduler receipt (1.36.2)」, with the guard run as a process against the daemon routes and the scheduler
+    stand-in: elsa's command from a reflex lane is refused, also inside `bash -c`, the stand-in receives no completion and the receipt obligation
+    stays open; the receipt alone then completes once; an allowed command with a receipt completes as before.
+  - **Not verified:** on a live lane. Kept as it was and worth a look: an allowed command chained with a receipt call completes the run although
+    the rest of that command never runs.
+
 ## 1.36.1 — 2026-11-24
 
 - **Lanes on: three sentences of Chiron's (mail #10869; agent-inbox 1.6.1 carries the same code).** Words only.
