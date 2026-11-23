@@ -159,5 +159,7 @@ test('daemon: createForumTopic with the plain name; the close looks the ✅ up, 
     const items = () => { try { return readFileSync(join(d.stateDir, 'lanes', 'state.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(x => x.rec === 'msg' && x.notif?.params?.meta?.message_id === '91') } catch { return [] } }
     expect(await untilA(() => items().length > 0)).toBe(true)
     expect(items()[0].notif.params.meta).toMatchObject({ topic: '7001', topic_name: '工單 WO-77' })
+    expect(items()[0].notif.params.meta.topic_state).toBe('closed')                         // the line behind the topic has ended: the main answers there
+    expect(String(items()[0].notif.params.meta.topic_anchor)).toMatch(/^knowledge\/lines\/.+\.md$/)   // and is told where that line's hand-over file is
   } finally { await d.stop(); api.stop() }
 }, 60000)

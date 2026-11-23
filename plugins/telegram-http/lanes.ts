@@ -2940,6 +2940,16 @@ export function topicName(thread: unknown): string | undefined {
   const k = topicId(thread)
   return k != null ? S?.topic_names?.[String(k)] : undefined
 }
+/** the line of work a topic belongs to: the worker lane that owns (or owned) it: its anchor file and whether the lane is still open. The main is told
+ *  both with every message from that topic (the <channel> tag's topic_anchor / topic_state), so in a finished topic it reads the line's state from the
+ *  file its lane left instead of from message history (the Bot API has none). */
+export function topicLine(thread: unknown): { anchor?: string; state: 'open' | 'closed' } | undefined {
+  const k = topicId(thread)
+  if (k == null || !S) return undefined
+  const lanes = Object.values(S.lanes).filter(l => l.kind === 'worker' && l.topic != null && String(l.topic) === String(k))
+  const lane = lanes.find(l => l.status !== 'closed') ?? lanes[lanes.length - 1]
+  return lane ? { ...(lane.anchor ? { anchor: lane.anchor } : {}), state: lane.status === 'closed' ? 'closed' : 'open' } : undefined
+}
 export function noteTopicName(thread: unknown, name: unknown): void {
   const k = topicId(thread), n = String(name ?? '').replace(/\s+/g, ' ').trim()
   if (D?.role !== 'tg' || !S || k == null || !n) return

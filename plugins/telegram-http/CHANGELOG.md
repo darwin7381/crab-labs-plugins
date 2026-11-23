@@ -45,11 +45,18 @@
     stays its own first line: its GFM characters are escaped (`sonn_lab` → `sonn\_lab`) and a blank line separates it from the body; the
     plain fallback is label, line break, body, as before. The lane card says GFM is rendered (headings, lists, tables, bold, code), as the
     main's reply tool does. One info line per delivered lane line (method, chat, message id, topic, ms; never the text). Lanes off: unchanged.
+  - **7. A topic's message names its line.** Joey asked whether an agent reading a topic's message can see that line's state (TG 7897).
+    The Bot API has no history, and feeding a topic's past messages with every message would cost a re-read each turn. The state of a line
+    lives in its anchor file (item 5), so the `<channel>` meta of a message from a topic that has (or had) a worker lane now carries
+    `topic_state` (`open` / `closed`) and `topic_anchor` (that lane's `knowledge/lines/<slug>.md`); the main's rules say to read that file
+    before answering in a finished topic (`lanes.ts topicLine`, `lanes-main.ts`). An open topic's messages go to its own lane, which holds
+    that line's whole conversation, as before.
 - **Always (lanes on or off): a Telegram send that gets no answer fails in bounded time.** 11-23 19:19 TPE the channel bot's `reply` (rich
   text, `callBotApi`'s bare `fetch`) had no result for over 120 s with nothing in the log, while getMe answered in 0.7 s. Every Bot API
   call that delivers something to a chat (`sendMessage`, `sendRichMessage`, `sendPhoto`, `sendDocument`, `sendChatAction`,
   `editMessageText`, `setMessageReaction`, `createForumTopic`, `editForumTopic`) waits at most `TELEGRAM_SEND_TIMEOUT_S` (default 45):
-  grammy's calls through an API transformer, `callBotApi` with an abort signal. On expiry the tool call errors: the message may or may not
+  grammy's calls through an API transformer, `callBotApi` with an abort signal. The two uploads (`sendPhoto`, `sendDocument`) wait
+  `TELEGRAM_UPLOAD_TIMEOUT_S` (default 300, never below the send bound): a large file on a slow link is still uploading at 45 s. On expiry the tool call errors: the message may or may not
   have been delivered, and it was not sent again (the rich → plain fallbacks of `reply` and `edit_message` do not run on it). One warn line
   per timeout (method, elapsed); one info line per message the main's `reply` delivered (method, chat, message id, topic, ms); never the
   text. `getUpdates` keeps grammy's long poll.

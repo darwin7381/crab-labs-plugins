@@ -320,11 +320,16 @@ let botUsername = ''
 // message MAY have been delivered, and is never sent again by the daemon (a duplicate is the caller's choice: the rich → plain fallbacks do not run on
 // it). One log line per timeout (method, elapsed; never the text). getUpdates (long polling) and every other method keep grammy's own wait.
 const SEND_TIMEOUT_S = (() => { const n = Number(process.env.TELEGRAM_SEND_TIMEOUT_S ?? 45); return Number.isFinite(n) && n > 0 ? n : 45 })()
+// A file upload (photo, document: up to 50 MB) legitimately takes longer than a text send: its own bound, TELEGRAM_UPLOAD_TIMEOUT_S (default 300), never
+// shorter than the send bound. Without it a large file on a slow uplink would be reported as "no answer" at 45 s while still uploading.
+const UPLOAD_TIMEOUT_S = (() => { const n = Number(process.env.TELEGRAM_UPLOAD_TIMEOUT_S ?? 300); return Math.max(SEND_TIMEOUT_S, Number.isFinite(n) && n > 0 ? n : 300) })()
+const UPLOAD_SENDS = new Set(['sendPhoto', 'sendDocument'])
+const sendBoundS = (method: string): number => UPLOAD_SENDS.has(method) ? UPLOAD_TIMEOUT_S : SEND_TIMEOUT_S
 const BOUNDED_SENDS = new Set(['sendMessage', 'sendRichMessage', 'sendPhoto', 'sendDocument', 'sendChatAction', 'editMessageText', 'setMessageReaction',
   'createForumTopic', 'editForumTopic'])
 class SendTimeoutError extends Error {
   constructor(readonly method: string, readonly elapsedMs: number) {
-    super(`${method}: no answer from Telegram within ${SEND_TIMEOUT_S} s; the message may or may not have been delivered. It was not sent again: look at the chat before sending it again.`)
+    super(`${method}: no answer from Telegram within ${sendBoundS(method)} s; the message may or may not have been delivered. It was not sent again: look at the chat before sending it again.`)
   }
 }
 /** run one Bot API call with the send bound; `outer`: the caller's own abort signal, kept */
@@ -336,9 +341,9 @@ async function boundedSend<T>(method: string, run: (signal: AbortSignal) => Prom
   const expired = new Promise<never>((_, rej) => {
     timer = setTimeout(() => {
       ac.abort()
-      log('warn', `telegram send timeout: ${method} got no answer in ${Date.now() - t0} ms (bound ${SEND_TIMEOUT_S} s); not sent again`)
+      log('warn', `telegram send timeout: ${method} got no answer in ${Date.now() - t0} ms (bound ${sendBoundS(method)} s); not sent again`)
       rej(new SendTimeoutError(method, Date.now() - t0))
-    }, SEND_TIMEOUT_S * 1000)
+    }, sendBoundS(method) * 1000)
   })
   try { return await Promise.race([run(ac.signal), expired]) }
   finally { clearTimeout(timer); outer?.removeEventListener('abort', onOuter) }
@@ -3149,6 +3154,8 @@ async function handleInbound(
     // lanes-golive: a message inside a private-chat topic (Bot API 9.3+/10.5: is_topic_message, message_thread_id) belongs to that topic's worker lane
     // lanes-topics (item 2): the <channel> tag shows it as topic="<thread id>" (the reply tool's `topic`) and, when known, topic_name
     ...(inTopic != null ? { topic: String(inTopic), ...(Lanes.topicName(inTopic) ? { topic_name: metaExcerpt(Lanes.topicName(inTopic)!, 128) } : {}) } : {}),
+    // the line of work behind the topic: its hand-over (anchor) file and whether its lane is still open (a finished topic's messages come to the main)
+    ...(inTopic != null && Lanes.topicLine(inTopic) ? (t => ({ topic_state: t.state, ...(t.anchor ? { topic_anchor: t.anchor } : {}) }))(Lanes.topicLine(inTopic)!) : {}),
     // Reply-root / forward-origin / album context (2026-07-10) — see
     // replyForwardMeta. Without these the agent couldn't tell WHAT was
     // being replied to, WHO originally wrote a forwarded message, or
