@@ -1433,7 +1433,7 @@ const fleetDeps: FleetDeps = {
 // The lab's main send_to_agent was the pre-WO-99 tool (always a push). Here the WO-99 line rules (callInboxTool:
 // line, ask, because, reply_to = no_reply, legacy shape = call) run first and unchanged; the CALL rail then carries the
 // lanes thread / hop / sending-lane marker and passes the lanes checks (checkMainSend, checkPeerSend, noteMainOutbound).
-// mail and feed are not lane-aware yet: no thread / hop, no peer check (go-live step 2, conflicts.md A5 / C2).
+// mail and feed are not lane-aware yet: no thread / hop (go-live step 2, conflicts.md A5 / C2); they do pass the peer check (laneMailBtcc, laneMainCore below).
 const LANE_SEND_PROPS = {
   thread: { type: 'string', description: 'Optional conversation id "<agent>#t-xxxx" (the thread="…" of the message you answer). Replies in a thread reach the exact lane that owns it. Filled in automatically when reply_to names a message that carried a thread. line=call only.' },
   hop: { type: 'number', description: 'Optional hop count; normally computed by the daemon. A thread stops at hop 6. line=call only.' },
@@ -1448,6 +1448,8 @@ function isInboxToolName(name: string): boolean {
 // lanes-golive (C2): the main's mail and feed leave through the same lanes checks as its calls: the disclosure check before anything is sent (to the
 // mail's addressee, the original sender of a mail it answers, or the wall), and the outbound note after (the promise check, the answer it meets).
 // Mail carries no thread / hop: the conversation id of a mail is for later (Chiron's need 5, 「現在不留」).
+// 1.34.2 (Chiron, mail #10789): each send tells the check whether it answers someone's request (a mailbox_reply does, a new mail or a feed post does not);
+// the check alone decides from that which questions to ask (lanes.ts peerDisclosureCheck).
 async function laneMailBtcc(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; json: any }> {
   const send = method === 'POST' && path === '/api/mesh/mail/send'
   const reply = method === 'POST' ? path.match(/^\/api\/mesh\/mail\/(\d+)\/reply$/) : null
@@ -1456,7 +1458,7 @@ async function laneMailBtcc(method: 'GET' | 'POST', path: string, body?: unknown
   let to = send ? String(b.to ?? '').trim().toLowerCase() : ''
   if (reply) { const m = await btccMail('GET', `/api/mesh/mail/${reply[1]}`).catch(() => null); to = m?.status === 200 && m.json?.from ? String(m.json.from).toLowerCase() : '' }
   const text = [b.title, b.ask, b.body].filter(x => typeof x === 'string' && x).join('\n')
-  if (to) { const refused = await Lanes.checkPeerSend('main', to, text); if (refused) return { status: 403, json: { detail: refused } } }
+  if (to) { const refused = await Lanes.checkPeerSend('main', to, text, !!reply); if (refused) return { status: 403, json: { detail: refused } } }
   const r = await btccMail(method, path, body)
   if (r.status === 200 && to && typeof r.json?.id === 'number')
     await Lanes.noteMainOutbound(undefined, undefined, undefined, to, text, reply ? reply[1] : undefined, !!(r.json.stored || r.json.delivered), { line: 'mail', ref: `mail-${r.json.id}` })
@@ -1465,7 +1467,7 @@ async function laneMailBtcc(method: 'GET' | 'POST', path: string, body?: unknown
 async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number): Promise<{ status: number; json: any }> {
   if (method === 'POST' && path === '/api/feed/posts') {
     const b = (body ?? {}) as Record<string, unknown>
-    const refused = await Lanes.checkPeerSend('main', 'the feed wall', [b.title, b.body].filter(x => typeof x === 'string' && x).join('\n'))
+    const refused = await Lanes.checkPeerSend('main', 'the feed wall', [b.title, b.body].filter(x => typeof x === 'string' && x).join('\n'), false)
     if (refused) return { status: 403, json: { detail: refused } }
   }
   return coreFeed(method, path, body, timeoutMs)
@@ -1485,8 +1487,9 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
         if (!c.ok) return `send blocked — nothing was sent: ${c.why}. The conversation is stopped (the router told the peer): your last answer on it goes out only as a reply (reply_to) or with no_reply: true; anything else, tell Joey.`
         hop = c.hop
       }
-      // 002k (K2): disclosure check before anything is sent, as for a lane's reply_agent; a refusal is an isError result (callInboxTool: not "delivered")
-      { const refused = await Lanes.checkPeerSend('main', to, text); if (refused) return refused }
+      // 002k (K2): disclosure check before anything is sent, as for a lane's reply_agent; a refusal is an isError result (callInboxTool: not "delivered").
+      // 1.34.2: a call that carries reply_to answers that call
+      { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null); if (refused) return refused }
       let minted: number | undefined, delivered = false
       const result = await sendToAgent(to, text, replyTo, noReply, op, 'call',
         { thread, hop, lane: `${INBOX_SELF}.main`, minted: (id, ok) => { minted = id; delivered = ok } })
@@ -3738,7 +3741,7 @@ if (Lanes.LANES_ON) {
         if (name === 'mailbox_reply' && Number(args.id) > 0) {
           const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}`).catch(() => null)
           to = m?.status === 200 && m.json?.from ? String(m.json.from) : undefined
-          if (to) { const refused = await Lanes.checkPeerSend(lane, to, String(args.body ?? '')); if (refused) return { text: refused, isError: true, to } }
+          if (to) { const refused = await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true); if (refused) return { text: refused, isError: true, to } }   // a reply answers the mail
         }
         const res: any = await callInboxTool(name, args, fleetDeps, false)
         return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(to ? { to } : {}) }

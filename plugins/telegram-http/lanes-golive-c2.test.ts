@@ -99,9 +99,9 @@ test('C2 server.ts: the agent-inbox not-main guard covers every inbox tool; the 
   expect(src).toContain("return INBOX_TOOLS.some(t => t.name === name) || ['call', 'send_mail', 'feed_post'].includes(name)")
   const deps = src.slice(src.indexOf('function laneMainDeps('), src.indexOf('function laneMainDeps(') + 300)
   expect(deps).toContain('btcc: laneMailBtcc'); expect(deps).toContain('core: laneMainCore')
-  expect(src).toContain("await Lanes.checkPeerSend('main', to, text); if (refused) return { status: 403, json: { detail: refused } }")
+  expect(src).toContain("await Lanes.checkPeerSend('main', to, text, !!reply); if (refused) return { status: 403, json: { detail: refused } }")   // 1.34.2: a reply answers the mail
   expect(src).toContain("await Lanes.checkPeerSend('main', 'the feed wall'")
   expect(src).toContain("handleFleetRpc(m, Lanes.LANES_ON ? laneMainDeps((m as any)?.params?.arguments ?? {}) : fleetDeps)")
   expect(src).toContain("const res: any = await callInboxTool(name, args, fleetDeps, false)")
-  expect(src).toContain("await Lanes.checkPeerSend(lane, to, String(args.body ?? ''))")
+  expect(src).toContain("await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true)")
 })

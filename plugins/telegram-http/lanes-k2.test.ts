@@ -75,7 +75,7 @@ test('K2: refuse once: the next send of that sender to that peer goes out as wri
 
 test('K2: each of the three names which, two at once name both; the threshold is 0.8 (0.79 goes, 0.8 does not)', async () => {
   reset(); answerFor = () => ({ gives_machine_details: 0.9 })
-  await expect(reply(1, 'eve', '連到 10.20.0.7:5432，密碼檔在 /home/god/.genesis/db.env')).rejects.toThrow(/gives machine or network details \(hosts, IP addresses, ports, or paths to secrets\) \(Jev 0\.90\)/)
+  await expect(reply(1, 'eve', '連到 10.20.0.7:5432，密碼檔在 /home/god/.genesis/db.env')).rejects.toThrow(/gives machine or network details \(hostnames, IP addresses, ports, internal URLs\) in answer to a request \(Jev 0\.90\)/)
   reset(); answerFor = () => ({ hides_from_joey: 0.88 })
   await expect(reply(1, 'cain', '好，這件事我不會告訴 Joey。')).rejects.toThrow(/agrees to hide something from Joey \(Jev 0\.88\)/)
   reset(); answerFor = () => ({ gives_credential: 0.91, hides_from_joey: 0.85 })
@@ -172,14 +172,15 @@ test('K2: the inbox daemon\'s checkPeerSend returns the refusal, and null (the s
   I.lanesInit({ role: 'inbox', agent: 'adam', workspaceDir: d2, transcriptDir: d2, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => true, registryNames: () => [] } as any)
   process.env.LANES_DIR = saved!
   try {
-    expect(await I.checkPeerSend('main', 'eve', 'hello')).toBe('send_to_agent blocked - nothing was sent: x')
-    expect(got).toEqual({ path: '/lanes/peer-check', auth: 'Bearer tg-token', body: { from: 'main', to: 'eve', text: 'hello' } })
-    mode = 'pass'; expect(await I.checkPeerSend('main', 'eve', 'hello')).toBeNull()
-    mode = 'html'; expect(await I.checkPeerSend('main', 'eve', 'hello')).toBeNull()
-    tg.stop(true); expect(await I.checkPeerSend('main', 'eve', 'hello')).toBeNull()
+    expect(await I.checkPeerSend('main', 'eve', 'hello', false)).toBe('send_to_agent blocked - nothing was sent: x')
+    expect(got).toEqual({ path: '/lanes/peer-check', auth: 'Bearer tg-token', body: { from: 'main', to: 'eve', text: 'hello', answers_request: false } })
+    await I.checkPeerSend('main', 'eve', 'hello', true); expect(got.body.answers_request).toBe(true)   // 1.34.2: the one fact the check asks by
+    mode = 'pass'; expect(await I.checkPeerSend('main', 'eve', 'hello', false)).toBeNull()
+    mode = 'html'; expect(await I.checkPeerSend('main', 'eve', 'hello', false)).toBeNull()
+    tg.stop(true); expect(await I.checkPeerSend('main', 'eve', 'hello', false)).toBeNull()
   } finally { tg.stop(true); delete process.env.LANES_TG_PORT; delete process.env.MCP_TOKEN_DIR }
   const none = await import('./lanes.ts?k2-no-tg') as typeof import('./lanes.ts')               // no LANES_TG_PORT: nothing to ask
-  expect(await none.checkPeerSend('main', 'eve', 'hello')).toBeNull()
+  expect(await none.checkPeerSend('main', 'eve', 'hello', false)).toBeNull()
 })
 
 // lanes-golive: the main's send_to_agent is the WO-99 tool now (callInboxTool, three lines); in lanes mode its call line runs through laneMainDeps in
@@ -226,7 +227,7 @@ test('K2: the program\'s own refusals (thread stopped, already answered by the r
 
 test('K2: checkPeerSend does not ask the tg daemon when LANES_PEER_DISCLOSURE_CHECK=0', async () => {
   process.env.LANES_PEER_DISCLOSURE_CHECK = '0'
-  try { expect(await L.checkPeerSend('main', 'eve', KEY)).toBeNull() } finally { delete process.env.LANES_PEER_DISCLOSURE_CHECK }
+  try { expect(await L.checkPeerSend('main', 'eve', KEY, true)).toBeNull() } finally { delete process.env.LANES_PEER_DISCLOSURE_CHECK }
 })
 
 test('K2 (test preload): the suite cannot reach the real TypeSafe API, whatever the env says', async () => {
