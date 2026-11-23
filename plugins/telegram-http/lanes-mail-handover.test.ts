@@ -54,3 +54,22 @@ test('a mail-lane run that opened a mail and handed it to the main: the lane giv
   expect((ev.obligations as any[]).map(o => `${o.kind}:${o.state}`)).toEqual(['joey:handed', 'main:open'])   // the opened mail's Joey line went with the hand-over
   expect(sent).toEqual([])
 })
+
+test('a mail-lane run that hands the list back without opening any mail is sent back once: open first; a second call goes through', async () => {
+  const d = await L.routeEvent(reminder())
+  expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
+  const tok = L.__runTok(d.lane!)!
+  await L.callLaneTool(tok, 'mailbox_list', {})
+  const r1 = await L.callLaneTool(tok, 'handoff_main', { text: '信箱 1 封，沒打開、沒勾掉，請主線處理。#77 eve 維護時段' })
+  expect(r1).toContain('not handed over: this run has not opened any mail')
+  expect((L.__events().get(tok.evId)!.obligations as any[]).some(o => o.kind === 'main')).toBe(false)
+  await L.callLaneTool(tok, 'mailbox_open', { id: 77 })
+  expect(await L.callLaneTool(tok, 'handoff_main', { text: '#77 eve，期限無；要 adam 決定維護時段；信裡：下週幾；建議：每週三 02:00；沒查：無。' })).toContain('handed to the main')
+  await done(d.lane!)
+  const d2 = await L.routeEvent(reminder())                                    // the mailbox cannot be read: the second call is let through
+  expect(await until(() => !!L.__runTok(d2.lane!))).toBe(true)
+  const tok2 = L.__runTok(d2.lane!)!
+  expect(await L.callLaneTool(tok2, 'handoff_main', { text: '信箱工具壞了，打不開' })).toContain('not handed over')
+  expect(await L.callLaneTool(tok2, 'handoff_main', { text: '信箱工具壞了，打不開；#77 請主線自己讀' })).toContain('handed to the main')
+  await done(d2.lane!)
+})

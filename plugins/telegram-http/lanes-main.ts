@@ -602,8 +602,9 @@ export function notMainContext(agent: string, reasons: string): string {
 export function mainContext(agent: string, sid: string): string {
   return [
     `[lanes] 你是 ${agent} 的主線（session ${sid} 已登記）。以下是主線專用規則，車道不適用：`,
-    '- Telegram 與分流到主線的 mesh 訊息只會送到你這裡。排程、警報、別的 agent 的呼叫由反射線（headless 車道）處理；你的信箱由讀信線讀：「讀信箱」提醒不會再送到你這裡，'
-      + '讀信線判斷不了的信會交給你（信還在你的信箱，用 mailbox_open 讀，處理完用 mailbox_check 勾掉）。'
+    '- Telegram 與分流到主線的 mesh 訊息只會送到你這裡。排程、警報、別的 agent 的呼叫由反射線（headless 車道）處理；你的信箱由讀信線讀：「讀信箱」提醒不會再送到你這裡。'
+      // the mailbox sentences: Chiron's wording (mail #10869, after WO-124: a lane's read shows as 車道讀過, the deadline watches the main)
+      + '要你決定或動手的信，讀信線會整理好交給你（對方要什麼、期限、關鍵事實、它的建議）；信還在你的信箱，清單上標「車道讀過」。照交接就能決定的，做完用 mailbox_check 勾掉，不必為了已讀再打開；要看原文才用 mailbox_open。你沒接手也沒勾的信，到期會通知寄件人。'
       + '它們做了什麼，會附在下一則交給你的訊息裡（標「車道摘要」；不會為了它單獨叫醒你）。你忙的時候送到的訊息，會在你下一個工具呼叫之後或回合要結束時交給你（標「交給主線」）。'
       + '只有交給你的事（車道用 handoff_main 交接、車道處理失敗、被停掉的對話線）會叫醒你：那件事由你接手，處理完由你回報 Joey 一次。'
       + '摘要裡寫「已通知 Joey」「已請 Joey 決定」的事，車道已經跟他講過了：不要重複通知他，除非你有新的資訊或他問起。其他不必回覆。',
@@ -615,9 +616,10 @@ export function mainContext(agent: string, sid: string): string {
       + '它回傳整天每件事一行的活動清單，包含車道處理掉、沒有叫醒你的例行事。清單裡每一件都要交代到，連同它的具體數字、時間、人名，再補上你自己處理的事。'
       + '某一件的原文用 ledger_query(text=關鍵字)；答應過什麼也可以查 kind=commitment。',
     '- 維護焦點卡 .lanes/focus.md：任務改變時更新，3 到 6 行，寫「目前在做什麼、關鍵限制、別碰什麼」。車道開機時會讀它。',
-    // WO-123: the files a lane may append to are the main's to declare. (A sentence of Chiron's on what NOT to declare goes at the end of this item.)
+    // WO-123: the files a lane may append to are the main's to declare; the last sentence (what NOT to declare) is Chiron's (#10869)
     '- 車道預設不能寫你的檔。要讓車道自己把紀錄補進某個檔（日誌、流水帳、狀態紀錄），在 .lanes/appendable.txt 宣告它：一行一個相對路徑（只收 .md .txt .log .csv .tsv .jsonl；記憶、.lanes/、CLAUDE.md、REANCHOR 與它列的定錨檔、設定檔一律不收）。'
-      + '車道用 append_file 把內容加在檔案最後，既有內容它動不了。你自己往這些檔加內容也用 append_file 或 shell 的 >>，不要整檔重寫，車道同時加的那一行才不會掉。',
+      + '車道用 append_file 把內容加在檔案最後，既有內容它動不了。你自己往這些檔加內容也用 append_file 或 shell 的 >>，不要整檔重寫，車道同時加的那一行才不會掉。'
+      + '會被程式讀進去照著做的檔（排程或交易用的狀態、清單、佇列）不要宣告，就算副檔名收：車道處理的是別人送來的文字，它加進去的一行會被那支程式當真。',   // Chiron's sentence (#10869)
     '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Joey 私訊話題的工作線（一件事一個話題；它回你話題連結和話題名稱；bot 沒開私訊話題時，它會告訴你，那就自己做）；fork(task) 開一條帶著你目前脈絡的分身線。'
       + '做完用 lane_close 收掉：話題標上 ✅、留著不刪；Joey 之後在那個話題說的話交給你，你的 reply 會自動回到那個話題（reply_to 他那則，或 topic 指定；topic="0" 是話題外）。'
       + '話題裡來的訊息，標籤帶 topic_state（closed＝那條線已結束）和 topic_anchor（那條線的定錨檔）：回答前先讀那份檔，Bot API 查不到話題的歷史訊息。',

@@ -1751,6 +1751,8 @@ const running = new Map<string, { child: ChildProcess; evId: string; runId: stri
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string; commitments?: number
   /** lanes-golive (C2): how many mails this mail-lane run opened (an opened mail owes Joey the run's one line) */
   mailOpened?: number
+  /** 1.36.1: this mail-lane run was told once to open the mail before handing it over */
+  mailHandoffWarned?: boolean
   /** the receipt this run filed (its outcome feeds the follow-up chain's no-change rule) */
   receipt?: { outcome: string; text: string }
   /** 002k (D14): what this run recorded: the memory proposals it filed, and its own ledger records (ledger_write action / commitment) */
@@ -3731,6 +3733,16 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!text) throw new Error('empty text')
       // 002w (002v r3 F03, u002v-F03-s5-r3-20261120-075430): a fork goes its own way and does not merge back (overview.md 「複製之後各走各的，不會自動合回去」):
       // its result is its own line to Joey, and the main reads it in the digest. Handing it over made the main stop and relay it.
+      // 1.36.1: the words alone did not do it. With Chiron's lines in the card (1.35.3), nestor.mail.1 (11-23 15:04Z: 「信箱 3 封…沒打開、沒勾掉，請主線處理」) and
+      // sonn's mail lane (16:01Z: 「兩封新信，我沒打開」) still handed the list back unread, so the main was woken to read the mail itself. A mail-lane run that
+      // opened no mail is sent back once; a second call goes through (the mailbox may be unreadable, and the lane then says so).
+      if (lane.kind === 'mail' && !(tok.mailOpened && tok.mailOpened > 0) && !tok.mailHandoffWarned) {
+        tok.mailHandoffWarned = true
+        return 'not handed over: this run has not opened any mail (mailbox_open). Open each mail first: the sender then sees 車道讀過, not the main\'s read, and a category your focus card '
+          + 'leaves to the main is still yours to read and prepare. Then hand over what the main must decide, written so that it does not have to open the mail: #id, sender, deadline, '
+          + 'what is asked, the facts in the mail (numbers, file paths, the options given), your recommendation and its ground, what you did not check. Pure notices: check them off and put '
+          + 'one line in the receipt. If a mail cannot be opened (the mailbox tool failed), call handoff_main again and say so.'
+      }
       if (lane.kind === 'fork') return 'refused: a fork does not hand its work back to the main (it does not merge back). Tell Joey the result yourself with notify_joey (ask_joey if he must decide); the main reads it in its digest. Nothing was handed over.'
       const v = events.request(tok.evId, 'handoff_main', { kind: 'main', level: 'handed' })        // accepted or refused (journaled); the hand-over is ONE transition
       if (!v.ok) return v.why!
@@ -4222,7 +4234,7 @@ function kindLines(kind: LaneKind): string[] {
   if (kind === 'mail') return ['', '# 你是讀信線（例外規則，優先於上面的通用規則）',
     // lines 1, 2, 3 and 6: Chiron's wording (mail #10841, 2026-11-23; his count of the day: 35 mail-lane runs, 34 handed back, 19 of them without opening
     // the mail, so the main still had to read it; about 8 pure notices handed back). Open every mail, close what the lane can, hand over ready to decide.
-    `- 你被叫起來，是因為 ${D.agent} 的信箱有信（「讀信箱」提醒）。信箱就是你的工作清單：先 mailbox_list 看清單，然後每一封都打開讀（mailbox_open）；只有看標題就確定不用讀的不打開、直接勾掉。你讀信，是替主線省下讀信的那一步。打開就算已讀、寄件人看得到，這沒有問題：後面由你結掉，或由主線接著處理。`,
+    `- 你被叫起來，是因為 ${D.agent} 的信箱有信（「讀信箱」提醒）。信箱就是你的工作清單：先 mailbox_list 看清單，然後每一封都打開讀（mailbox_open）；只有看標題就確定不用讀的不打開、直接勾掉。你讀信，是替主線省下讀信的那一步。你打開，寄件人看到的是「車道讀過」，不是主線已讀；到期提醒看的是主線有沒有接手、或這封有沒有勾掉，所以放心打開。`,
     `- 每一封讀完，三種結果選一種。①你能結掉的：回信（mailbox_reply：自動連到原信、自動標不用回），或做完它要的可逆小事，然後勾掉（mailbox_check）。②純知會（對方沒有要 ${D.agent} 動手、回答或決定）：勾掉，把內容寫一句進 receipt；不交回主線。③要主線的：照下一條交回。`,
     `- 要主線的信（要代表 ${D.agent} 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回，寫到主線不用再打開信就能決定：#id、寄件人、期限；它要 ${D.agent} 決定或做什麼；信裡的關鍵事實（數字、檔案位置、它給的選項）；你的建議和根據（查不到根據就寫「沒有建議」）；你沒查的。那一封不要勾掉，主線處理完自己勾。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。`,
     '- 要別隻 agent 動手、回答或決定：reply_agent，預設是信（line=mail，填 to、title、ask、text）；只有晚一小時會有東西壞、或有人正在等結果，才用呼叫（line=call，填 because）。只是知會，不寄：寫進 receipt。',

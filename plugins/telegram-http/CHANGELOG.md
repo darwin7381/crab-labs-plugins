@@ -1,3 +1,19 @@
+## 1.36.1 — 2026-11-24
+
+- **Lanes on: three sentences of Chiron's (mail #10869; agent-inbox 1.6.1 carries the same code).** Words only.
+  - The main's rule on files a lane may append to (WO-123) ends with what not to declare: a file a program reads and acts on (state, lists,
+    queues of schedules or trading), whatever its extension: a lane handles text sent by others, and the line it adds would be taken at its word.
+  - The mail lane's first line, after WO-124 (1.35.2): a lane's open shows the sender 「車道讀過」, not the main's read; the deadline reminder
+    watches whether the main took the mail over or it was checked off, so the lane opens freely.
+  - The main's rule about its mailbox: the mail lane hands over what the main must decide or do, ready to decide (what is asked, the deadline,
+    the facts, its recommendation); the mail stays in the mailbox marked 「車道讀過」; what can be decided from the hand-over is done and checked
+    off without opening it, the original is opened only when needed; a mail neither taken over nor checked off is reported to its sender when due.
+- **Lanes on: a mail-lane run that opened no mail cannot hand the list back at the first try.** With the 1.35.3 words in the card
+  (`.lanes/run/system-mail.md` rewritten 15:04:03Z, new words in it), nestor.mail.1 at 15:04Z handed back 「信箱 3 封…沒打開、沒勾掉，請主線處理」, and
+  the channel bot's mail lane at 16:01Z 「兩封新信，我沒打開」: the main was woken with its whole context to read the mail itself. `handoff_main`
+  in a mail-lane run with no `mailbox_open` yet is sent back once with what to do (open, prepare, hand over ready to decide; notices checked
+  off); a second call goes through (an unreadable mailbox). Test `lanes-mail-handover`.
+
 ## 1.36.0 — 2026-11-23
 
 - **Lanes on: a lane may add text at the end of the files the main declared (WO-123, Chiron; agent-inbox 1.6.0 carries the same code).**
