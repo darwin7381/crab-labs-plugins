@@ -68,6 +68,7 @@ import { parseFleetConfig } from './fleet-config.ts'
 // (GENESIS_LANES=1); with it unset the daemon runs the fleet code paths unchanged. In lanes mode nothing here delivers to
 // the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
 import * as Lanes from './lanes.ts'
+import { topicMode, topicModeAtStart, topicVerdict, type TopicMe } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
@@ -1558,18 +1559,19 @@ async function laneHubPush(n: { method: string; params: unknown }): Promise<numb
   return d ? 1 : 0
 }
 
-// lanes-golive: private-chat topics for worker lanes (Bot API 10.5, 2026-11-22: a bot turns topic mode on with setMySettings has_topics_enabled=true;
-// getMe reports has_topics_enabled). LANES_WORKER_TOPICS: auto (default: use topics, a failed createForumTopic falls back to the main) | enable (turn
-// the bot's topic mode on at start if it is off, then as auto) | off (never: every worker task is the main's). Nothing is changed unless `enable`.
+// lanes-golive: private-chat topics for worker lanes (Bot API 10.5, 2026-11-22: setMySettings; getMe reports has_topics_enabled and
+// allows_users_to_create_topics). lanes-topics (item 1): the topic mode is ONE decision (lanes-topics.ts topicModeAtStart). LANES_WORKER_TOPICS=enable
+// sends has_topics_enabled=true AND allows_users_to_create_topics=false in one call and checks both with getMe; auto changes nothing and warns once when
+// getMe shows the broken mode (the user opens a topic per message: 11-23, Joey's chat); off: never a worker topic. Whether a worker may open a topic is
+// asked again from getMe each time one opens (Lanes deps topicsUsable): in the broken mode the main does the work.
 async function laneTopicsAtStart(me: Record<string, unknown>): Promise<void> {
-  const mode = (process.env.LANES_WORKER_TOPICS ?? 'auto').trim()
-  try {
-    if (mode === 'enable' && me.has_topics_enabled !== true) {
-      await (bot.api.raw as any).setMySettings({ has_topics_enabled: true })
-      me = (await bot.api.getMe()) as unknown as Record<string, unknown>
-    }
-    log('info', `lanes: worker topics ${mode} (getMe has_topics_enabled=${String(me.has_topics_enabled)})`)
-  } catch (e) { log('warn', `lanes: worker topics (${mode}): ${String(e).slice(0, 200)}`) }
+  const r = await topicModeAtStart(topicMode(), me as TopicMe, {
+    setMySettings: p => (bot.api.raw as any).setMySettings(p),
+    getMe: async () => (await bot.api.getMe()) as unknown as TopicMe,
+  })
+  if (r.warn) log('warn', `lanes: worker topics: ${r.warn}`)
+  log('info', `lanes: worker topics ${r.mode}: ${r.verdict.usable === true ? 'usable' : r.verdict.usable === false ? 'not used' : 'not known (asked when a worker opens)'}`
+    + `${r.set ? ' (setMySettings sent)' : ''}: ${r.verdict.why}`)
 }
 
 // Board ops room (戰情室, BTCC WO-35): OP-3 / 3 / slug. Tag-safe charset; BTCC resolves it.
@@ -3775,6 +3777,8 @@ if (Lanes.LANES_ON) {
       },
       // lanes-golive: a worker lane's topic in Joey's private chat (Bot API: the bot's topic mode on, createForumTopic with the user's chat id)
       createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
+      // lanes-topics (item 1): the topic mode as getMe shows it now (one decision, lanes-topics.ts)
+      topicsUsable: async () => topicVerdict((await bot.api.getMe()) as unknown as TopicMe),
       joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
     }),
   })

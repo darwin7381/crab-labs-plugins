@@ -25,6 +25,7 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
+import { topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
@@ -149,6 +150,8 @@ export interface LanesDeps {
   /** tg role: bot calls */
   sendBot?: (chat_id: string, text: string, opts: { silent?: boolean; topic?: number; replyTo?: number }) => Promise<number>
   createTopic?: (chat_id: string, name: string) => Promise<number>
+  /** lanes-topics (item 1): may the bot open a work topic now (lanes-topics.ts topicVerdict over a fresh getMe)? usable false = the main does the work */
+  topicsUsable?: () => Promise<TopicVerdict>
   joeyChatId?: () => string
   /** inbox role: mesh send with lane extras; resolves the minted btcc id */
   meshSend?: (to: string, text: string, replyTo: number | undefined, noReply: boolean,
@@ -1247,7 +1250,7 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       let lane = S.tickets[key] ? S.lanes[S.tickets[key]] : undefined
       if (!lane || lane.status === 'closed') {
         const opened = await openWorkerLane(`工單 ${key}`, `工單 ${key} 由分流器開線`)
-        if (!opened) return { ...base, target: 'main', note: `no worker topic for ${key} (topic mode off or refused): the main does the work` }
+        if (!opened) return { ...base, target: 'main', note: `no worker topic for ${key} (${lastTopicRefusal ? 'topic mode not usable' : 'topic mode off or refused'}): the main does the work` }
         lane = opened
         S.tickets[key] = lane.id; saveState()
       }
@@ -4275,10 +4278,21 @@ export function mainToolDefs(): any[] {
 export function isMainTool(name: string): boolean { return ['open_worker', 'fork', 'lanes_list', 'lane_close', 'ledger_query', 'fan_out', 'curate_memory', 'curate_stop', 'commitment', 'commitment_done', 'memory_decide', 'memory_history', 'memory_revert', 'peer_hold'].includes(name) }
 
 /** lanes-golive: a worker lane bound to a new topic in Joey's private chat (createForumTopic with his user id; Bot API 10.5 private-chat topics), or null when
- *  the bot cannot open one (LANES_WORKER_TOPICS=off, no Telegram in this daemon, or the API refused: topic mode off): then the main does the work. */
+ *  the bot cannot open one (LANES_WORKER_TOPICS=off, no Telegram in this daemon, the bot's topic mode is off or lets the user open topics, or the API
+ *  refused): then the main does the work. */
+let lastTopicRefusal = ''
 async function openWorkerLane(title: string, brief: string): Promise<Lane | null> {
   let topic: number | undefined
-  if ((process.env.LANES_WORKER_TOPICS ?? 'auto').trim() === 'off' || !D.createTopic || !D.joeyChatId || !D.joeyChatId()) return null
+  lastTopicRefusal = ''
+  if (topicMode() === 'off' || !D.createTopic || !D.joeyChatId || !D.joeyChatId()) return null
+  // lanes-topics (item 1): the bot's topic mode, asked now. In the broken mode (the user opens a topic per message) or with topics off, no worker topic
+  const v = D.topicsUsable ? await D.topicsUsable().catch((e): TopicVerdict => ({ usable: null, why: `getMe failed: ${String(e).slice(0, 120)}` })) : null
+  if (v?.usable === false) {
+    lastTopicRefusal = v.why
+    D.log('warn', `lanes: no worker topic for 「${title.slice(0, 60)}」: ${v.why}`)
+    ledger({ lane: 'router', kind: 'fyi', text: `沒開工作線的話題（${v.why.slice(0, 160)}）：「${title.slice(0, 80)}」交給主線做。`, refs: { topics: 'not-used' } })
+    return null
+  }
   try { topic = await D.createTopic(D.joeyChatId(), title.slice(0, 120)) } catch (e) {
     D.log('warn', `lanes: no worker topic for 「${title.slice(0, 60)}」 (${String(e).slice(0, 160)}): the main does the work`)
     ledger({ lane: 'router', kind: 'fyi', text: `開不了工作線的話題（${String(e).slice(0, 120)}）：「${title.slice(0, 80)}」交給主線做。`, refs: { topics: 'off' } })
@@ -4417,7 +4431,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const title = String(a.title ?? '').trim(), brief = String(a.brief ?? '').trim()
       if (!title || !brief) return 'open_worker needs title and brief'
       const lane = await openWorkerLane(title, brief)
-      if (!lane) return 'refused: this bot cannot open a topic in Joey\'s private chat now (its topic mode is off, or Telegram refused). Nothing was opened: do the work yourself, or fork(task) for a side task.'
+      if (!lane) return `refused: this bot cannot open a topic in Joey's private chat now (${lastTopicRefusal || 'its topic mode is off, or Telegram refused'}). Nothing was opened: do the work yourself, or fork(task) for a side task.`
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: brief, meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線交辦｜工作線開啟]\n任務標題：${title}\n主線的簡報：\n${brief}\n\n先在話題裡用 notify_joey 跟 Joey 打個招呼並說明你接下來要做什麼，然後開始做。` }
       enqueue(ev, lane.id, 3)
