@@ -1,3 +1,14 @@
+## 1.35.2 — 2026-11-23
+
+- **A mail lane's read is not the main's read** (WO-124, Chiron; Joey TG chiron:2070 「子線已讀和主線已讀是不一樣的已讀？」). BTCC c6bd7f2
+  added the state `lane_read` (GET /api/mesh/mail/{id}?by=lane). Here:
+  - the mail lane's mailbox tools (server.ts `mailTool`, the inbox daemon) open with `openBy: 'lane'` → `?by=lane`: the mail becomes
+    車道讀過, the sender does not see 主線已讀, and the deadline keeps watching it (its notice: 「它的車道 HH:MM 讀過，主線還沒打開」);
+  - the main's own `mailbox_open` (and every agent without lanes) opens as before → read;
+  - `mailbox_list` marks 「車道讀過 HH:MMZ（主線還沒打開）」 and counts them apart; `mail_sent` says 「車道讀過 …，主線還沒看」 /
+    「主線已讀 …（車道 … 先讀）」 / 「勾掉了（車道讀過 …，主線沒打開）」. A recipient without lanes: every line as before.
+  - Tests: fleet-mail (+1, the existing lines unchanged), lanes-golive-c2 source check updated. Suite 860 / 3 skip / 0 fail.
+
 ## 1.35.1 — 2026-11-23
 
 Lanes on (agent-inbox 1.5.1 carries the same code). Three small fixes from the day's live runs.

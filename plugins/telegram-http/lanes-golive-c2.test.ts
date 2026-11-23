@@ -102,6 +102,6 @@ test('C2 server.ts: the agent-inbox not-main guard covers every inbox tool; the 
   expect(src).toContain("await Lanes.checkPeerSend('main', to, text, !!reply); if (refused) return { status: 403, json: { detail: refused } }")   // 1.34.2: a reply answers the mail
   expect(src).toContain("await Lanes.checkPeerSend('main', 'the feed wall'")
   expect(src).toContain("handleFleetRpc(m, Lanes.LANES_ON ? laneMainDeps((m as any)?.params?.arguments ?? {}) : fleetDeps)")
-  expect(src).toContain("const res: any = await callInboxTool(name, args, fleetDeps, false)")
+  expect(src).toContain("const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane' }, false)")   // WO-124: the lane's open is 車道讀過
   expect(src).toContain("await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true)")
 })

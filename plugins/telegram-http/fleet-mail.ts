@@ -20,7 +20,11 @@ const CUT_NOTE = `標題超過 ${TITLE_MAX} 字，已截短，完整標題在內
 export type BtccCall = (method: 'GET' | 'POST', path: string, body?: unknown) => Promise<{ status: number; json: any }>
 export type CoreCall = (method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number) => Promise<{ status: number; json: any }>
 export type CallFn = (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => Promise<string>
-export interface FleetDeps { call: CallFn; btcc: BtccCall; core: CoreCall }
+export interface FleetDeps {
+  call: CallFn; btcc: BtccCall; core: CoreCall
+  /** WO-124: who opens mail through these tools. 'lane' = the agent's mail lane (lanes mode): its open is 車道讀過, not 主線已讀 */
+  openBy?: 'lane'
+}
 const TOUCH_MAX = 5
 
 export const FLEET_TOOLS = [
@@ -236,23 +240,31 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const mail = (r.json.mail ?? []) as any[]
       if (!mail.length) return text('信箱是空的。')
       const unread = mail.filter(m => m.status === 'unread').length
-      const lines = mail.map(m => `#${m.id}｜${m.from}｜${m.title}${m.ask ? `｜要你：${m.ask}` : ''}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${m.status === 'unread' ? '未讀' : '已讀'}${m.no_reply ? '｜不用回' : ''}`)
-      return text(`${unread} 封未讀、${mail.length - unread} 封已讀還沒勾掉：\n${lines.join('\n')}`)
+      const laneRead = mail.filter(m => m.status === 'lane_read').length   // WO-124: the lane opened it, the main has not
+      const st = (m: any) => m.status === 'unread' ? '未讀' : m.status === 'lane_read' ? `車道讀過 ${hm(m.lane_read_at)}（主線還沒打開）` : '已讀'
+      const lines = mail.map(m => `#${m.id}｜${m.from}｜${m.title}${m.ask ? `｜要你：${m.ask}` : ''}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${st(m)}${m.no_reply ? '｜不用回' : ''}`)
+      const head = laneRead
+        ? `${unread} 封未讀、${laneRead} 封車道讀過（等主線）、${mail.length - unread - laneRead} 封已讀還沒勾掉：`
+        : `${unread} 封未讀、${mail.length - unread} 封已讀還沒勾掉：`
+      return text(`${head}\n${lines.join('\n')}`)
     }
     case 'mailbox_open': {
       const id = intId(args.id)
       if (!id) return text('mailbox_open: id 要填信的編號', true)
-      const r = await deps.btcc('GET', `/api/mesh/mail/${id}`)
+      // WO-124: the mail lane's open is 車道讀過 (by=lane); the main's own open makes it read, even after the lane read it
+      const r = await deps.btcc('GET', `/api/mesh/mail/${id}${deps.openBy === 'lane' ? '?by=lane' : ''}`)
       if (r.status !== 200) return text(errText(r), true)
       const m = r.json
-      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}\n\n${m.body}`)
+      const who = deps.openBy === 'lane' ? '｜車道讀過（寄件人看到的是車道讀過，不是主線已讀）'
+        : m.lane_read_at ? `｜車道 ${hm(m.lane_read_at)} 先讀過` : ''
+      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}${who}\n\n${m.body}`)
     }
     case 'mailbox_check': {
       const id = intId(args.id)
       if (!id) return text('mailbox_check: id 要填信的編號', true)
       const r = await deps.btcc('POST', `/api/mesh/mail/${id}/check`, {})
       if (r.status !== 200) return text(errText(r), true)
-      return text(`#${id} 勾掉了，不在清單上了。${r.json.was === 'unread' ? '（它還沒打開過，寄的人看到的是未讀。）' : ''}`)
+      return text(`#${id} 勾掉了，不在清單上了。${r.json.was === 'unread' ? '（它還沒打開過，寄的人看到的是未讀。）' : r.json.was === 'lane_read' && deps.openBy !== 'lane' ? '（只有車道讀過，主線沒打開。）' : ''}`)
     }
     case 'mailbox_reply': {
       const id = intId(args.id)
@@ -274,8 +286,11 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const rows = (r.json.sent ?? []) as any[]
       if (!rows.length) return text('你還沒有寄出過信。')
       return text(rows.map(m => {
-        const st = m.status === 'unread' ? '未讀' : m.status === 'read' ? `已讀 ${hm(m.read_at)}`
-          : m.status === 'checked' ? `勾掉了${m.read_at ? `（已讀 ${hm(m.read_at)}）` : '（沒打開過）'}`
+        // WO-124: say who read it. A recipient without lanes never has lane_read_at: its lines are as before.
+        const st = m.status === 'unread' ? '未讀'
+          : m.status === 'lane_read' ? `車道讀過 ${hm(m.lane_read_at)}，主線還沒看`
+          : m.status === 'read' ? (m.lane_read_at ? `主線已讀 ${hm(m.read_at)}（車道 ${hm(m.lane_read_at)} 先讀）` : `已讀 ${hm(m.read_at)}`)
+          : m.status === 'checked' ? `勾掉了${m.read_at ? `（${m.lane_read_at ? '主線' : ''}已讀 ${hm(m.read_at)}）` : m.lane_read_at ? `（車道讀過 ${hm(m.lane_read_at)}，主線沒打開）` : '（沒打開過）'}`
           : m.status === 'pushed' ? '已直接送進 session（對方信箱沒開）' : String(m.status)
         return `#${m.id}｜給 ${m.to}｜${m.title}｜期限 ${hm(m.deadline)}｜${st}`
       }).join('\n'))

@@ -3893,7 +3893,8 @@ if (Lanes.LANES_ON) {
           to = m?.status === 200 && m.json?.from ? String(m.json.from) : undefined
           if (to) { const refused = await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true); if (refused) return { text: refused, isError: true, to } }   // a reply answers the mail
         }
-        const res: any = await callInboxTool(name, args, fleetDeps, false)
+        // WO-124: the mail lane's opens are 車道讀過 (BTCC by=lane), not the main's read
+        const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane' }, false)
         return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(to ? { to } : {}) }
       },
       schedulerCall: async (runId, action, outcome, summary) => {

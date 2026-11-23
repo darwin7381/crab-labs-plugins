@@ -117,6 +117,39 @@ describe('fleet MCP server', () => {
     const long = await handleFleetRpc(tool('mailbox_reply', { id: 11, body: 'x', title: '一'.repeat(51) }), d)
     expect(long.result.isError).toBeUndefined()      // the server cuts it (Joey 1407), nothing refused here
   })
+  test('WO-124: the lane opens with by=lane; the main opens without; list and sent say who read it', async () => {
+    const seen: string[] = []
+    const btcc = async (m: string, p: string) => {
+      seen.push(p)
+      if (p.startsWith('/api/mesh/mail/list')) return { status: 200, json: { mail: [
+        { id: 21, from: 'pheme', title: 'A', deadline: null, waited: '1 分鐘', no_reply: false, status: 'lane_read', lane_read_at: '2026-11-23T11:18:00+00:00' },
+        { id: 22, from: 'atlas', title: 'B', deadline: null, waited: '2 分鐘', no_reply: false, status: 'unread' }] } }
+      if (p.startsWith('/api/mesh/mail/sent')) return { status: 200, json: { sent: [
+        { id: 21, to: 'chiron', title: 'A', deadline: null, status: 'lane_read', read_at: null, lane_read_at: '2026-11-23T11:18:00+00:00' },
+        { id: 23, to: 'chiron', title: 'C', deadline: null, status: 'read', read_at: '2026-11-23T12:00:00+00:00', lane_read_at: '2026-11-23T11:30:00+00:00' },
+        { id: 24, to: 'chiron', title: 'D', deadline: null, status: 'checked', read_at: null, lane_read_at: '2026-11-23T11:40:00+00:00' },
+        { id: 25, to: 'pheme', title: 'E', deadline: null, status: 'read', read_at: '2026-11-23T12:10:00+00:00', lane_read_at: null }] } }
+      return { status: 200, json: { id: 21, from: 'pheme', title: 'A', body: '全文', deadline: null, waited: '1 分鐘', no_reply: false,
+        status: p.includes('by=lane') ? 'lane_read' : 'read', lane_read_at: '2026-11-23T11:18:00+00:00' } }
+    }
+    const lane = deps({ btcc }).d as any
+    lane.openBy = 'lane'
+    const lo = out(await handleFleetRpc(tool('mailbox_open', { id: 21 }), lane))
+    expect(seen.at(-1)).toBe('/api/mesh/mail/21?by=lane')
+    expect(lo).toContain('車道讀過（寄件人看到的是車道讀過，不是主線已讀）')
+    const main = deps({ btcc }).d
+    const mo = out(await handleFleetRpc(tool('mailbox_open', { id: 21 }), main))
+    expect(seen.at(-1)).toBe('/api/mesh/mail/21')                                   // the main's open: no by → 主線已讀
+    expect(mo).toContain('車道 11-23 11:18Z 先讀過')
+    const l = out(await handleFleetRpc(tool('mailbox_list'), main))
+    expect(l.split('\n')[0]).toBe('1 封未讀、1 封車道讀過（等主線）、0 封已讀還沒勾掉：')
+    expect(l).toContain('#21｜pheme｜A｜期限 —｜等了 1 分鐘｜車道讀過 11-23 11:18Z（主線還沒打開）')
+    const s = out(await handleFleetRpc(tool('mail_sent'), main))
+    expect(s).toContain('#21｜給 chiron｜A｜期限 —｜車道讀過 11-23 11:18Z，主線還沒看')
+    expect(s).toContain('#23｜給 chiron｜C｜期限 —｜主線已讀 11-23 12:00Z（車道 11-23 11:30Z 先讀）')
+    expect(s).toContain('#24｜給 chiron｜D｜期限 —｜勾掉了（車道讀過 11-23 11:40Z，主線沒打開）')
+    expect(s).toContain('#25｜給 pheme｜E｜期限 —｜已讀 11-23 12:10Z')               // a recipient without lanes: as before
+  })
   test('a reply that could not be delivered is an error, not a success', async () => {
     let reply: any = { status: 200, json: { id: 31, stored: false, delivered: false, detail: 'receiver 502' } }
     const { d } = deps({ btcc: async () => reply })
