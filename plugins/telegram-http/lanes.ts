@@ -636,6 +636,10 @@ type State = {
   steering?: Record<string, SteerRec[]>                                // 002k (E18): Joey's messages handed to a running run, not yet seen delivered (lane id → list)
   inbound?: Record<string, { peer: string; thread: string | null; at: string }>   // 002l (D4): a peer's mesh message (btcc id) → the conversation it was routed into
   mail_lane?: string                                                   // lanes-golive (C2): the lane that reads the mailbox (its work queue)
+  /** lanes-topics (item 2): `<chat>:<message id>` → the topic that Telegram message is in (null: outside topics), for Joey's messages and the bot's own */
+  msg_topics?: Record<string, number | null>
+  /** lanes-topics (item 2): topic (thread id) → its name as last known (the bot's createForumTopic, the topic's creation / edit service message) */
+  topic_names?: Record<string, string>
 }
 /** 002k (E18): a message of Joey's handed to the run in progress (run/steer/<lane>.in.jsonl) and what is known of it: when (ms, the daemon's clock) and for which run */
 type SteerRec = { ev: InEvent; sent: number; run: string }
@@ -863,6 +867,8 @@ function noteInbound(ev: InEvent, d: Decision): void {
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
   const cfg = routerCfg()
+  // lanes-topics (item 2): where Joey's message is (a topic, or outside topics): a reply to it goes there (targetTopic)
+  if (D.role === 'tg' && S && ev.source === 'telegram' && !ev.synthetic) noteMsgTopic(ev.meta?.chat_id, ev.meta?.message_id, ev.message_thread_id ?? null)
   // 002l (D2): the master switch comes FIRST. design/stability 「另有一個總開關，關掉就整個退回現在的單線模式」: off = today's single-session behaviour,
   // where every event reaches the main. Nothing of the lane machinery decides any more: no hold, no flood gate (002k ran peerGate before it, and Eve's
   // message after /lanes off went to the ledger: A07 e6), no Jev screen, no rule. Lanes already running finish their event and report.
@@ -2424,7 +2430,7 @@ function renderEvent(ev: InEvent): string {
   if (ev.source === 'telegram') {
     const head = [`[車道事件 ${ev.id}｜來源 Telegram｜Joey`]
     if (ev.reply_to_message_id && S.botmsgs[ev.reply_to_message_id]) head.push(`引用了你先前發的訊息（message_id ${ev.reply_to_message_id}）回覆`)
-    if (ev.message_thread_id) head.push(`在話題 #${ev.message_thread_id} 裡`)
+    if (ev.message_thread_id) { const name = topicName(ev.message_thread_id); head.push(`在話題 #${ev.message_thread_id}${name ? `「${name}」` : ''} 裡`) }
     const lines = [head.join('｜') + ']']
     if (ev.reply_to_text) lines.push(`引用的內容：${ev.reply_to_text}`)
     lines.push(`Joey：${ev.text}`)
@@ -2830,6 +2836,87 @@ async function pushJoey(lane: Lane | undefined, text: string, silent: boolean, r
 }
 function laneLabel(l: Lane): string { return `${KIND_NAME[l.kind]}#${l.n}` }
 
+// ================================================================== lanes-topics (item 2): which topic an outgoing Telegram message goes into
+// Measured 11-23 (lanes-topics.ts): a bot message is inside a topic only when it carries message_thread_id; reply_parameters alone puts it outside, though
+// the API's answer names the topic. So every send path asks ONE function (server.ts topicFields → targetTopic) and sends the field:
+//   1. an explicit topic (the main's reply(topic=…), a worker lane's own topic, the topic a control command was typed in);
+//   2. else the topic of the message it answers (reply_to), when the daemon knows it: Joey's messages are recorded as they come in (routeEvent) and the bot's
+//      own as they go out (noteSent), in state.json (msg_topics), and Joey's are in the journal too (the event's `tg`); a message known to be outside
+//      topics decides as well (no topic);
+//   3. else, for the main's reply, the one topic every Telegram item its current turn works on is in (M1 turnWork);
+//   4. else no topic: the ordinary conversation.
+export type TopicAsk = { chat?: string; topic?: unknown; replyTo?: unknown; turn?: boolean }
+const MSG_TOPICS_MAX = 3000
+export const topicId = (v: unknown): number | undefined => {
+  const s = String(v ?? '').trim().replace(/^#/, ''), n = Number(s)
+  return v != null && /^\d+$/.test(s) && Number.isSafeInteger(n) && n > 0 ? n : undefined
+}
+function noteMsgTopic(chat: unknown, id: unknown, topic: unknown, save = true): void {
+  if (D?.role !== 'tg' || !S || chat == null || id == null || String(id) === '') return
+  S.msg_topics ??= {}
+  const k = `${chat}:${id}`
+  delete S.msg_topics[k]                                                       // re-inserted last: the oldest go first
+  S.msg_topics[k] = topicId(topic) ?? null
+  const keys = Object.keys(S.msg_topics)
+  if (keys.length > MSG_TOPICS_MAX) for (const x of keys.slice(0, keys.length - MSG_TOPICS_MAX)) delete S.msg_topics[x]
+  if (save) saveState()
+}
+/** server.ts: the bot sent these messages to `chat`, in this topic (null: outside topics) */
+export function noteSent(chat: string, ids: Array<number | null | undefined>, topic: number | null): void {
+  const got = ids.filter((x): x is number => x != null)
+  if (!got.length) return
+  for (const id of got) noteMsgTopic(chat, id, topic, false)
+  if (D?.role === 'tg' && S) saveState()
+}
+/** the topic message `id` of `chat` is in: a thread id, null (known to be outside topics), undefined (not known) */
+export function knownTopic(chat: string, id: unknown): number | null | undefined {
+  if (D?.role !== 'tg' || !S || id == null || String(id) === '') return undefined
+  const k = `${chat}:${id}`
+  if (S.msg_topics && k in S.msg_topics) return S.msg_topics[k]
+  const tg = events?.get(`tg-${chat}-${id}`)?.tg as { topic?: unknown } | undefined   // the journal: Joey's message, as the router recorded it
+  return tg ? topicId(tg.topic) ?? null : undefined
+}
+/** the one topic every Telegram item of the main's running turn is in (its items' events: Joey's own messages, or a lane's hand-over of one), or undefined
+ *  (no Telegram item, items outside topics, or items in different topics) */
+function turnTopic(chat: string): number | undefined {
+  const t = mainTurn()
+  if (!t) return undefined
+  let topic: number | null | undefined
+  for (const it of t.items) {
+    const e = it.event ? events?.get(String(it.event)) : undefined
+    const tg = e?.tg as { topic?: unknown } | undefined
+    if (!tg || (chat && !String(e!.id).startsWith(`tg-${chat}-`))) continue
+    const here = topicId(tg.topic) ?? null
+    if (topic === undefined) topic = here
+    else if (topic !== here) return undefined
+  }
+  return topic ?? undefined
+}
+/** THE target topic of an outgoing Telegram message (rules above); undefined = no topic (the ordinary conversation) */
+export function targetTopic(a: TopicAsk): number | undefined {
+  const explicit = topicId(a.topic)
+  if (explicit != null) return explicit
+  if (/^\s*(0|none|outside)\s*$/i.test(String(a.topic ?? ''))) return undefined     // explicitly the ordinary conversation
+  if (D?.role !== 'tg' || !S) return undefined
+  const chat = String(a.chat ?? D.joeyChatId?.() ?? '')
+  const rt = a.replyTo != null ? String(a.replyTo).trim() : ''
+  if (rt) { const k = knownTopic(chat, rt); if (k !== undefined) return k ?? undefined }
+  return a.turn ? turnTopic(chat) : undefined
+}
+/** a topic's name as last known (the bot named it, or its creation / edit service message said it) */
+export function topicName(thread: unknown): string | undefined {
+  const k = topicId(thread)
+  return k != null ? S?.topic_names?.[String(k)] : undefined
+}
+export function noteTopicName(thread: unknown, name: unknown): void {
+  const k = topicId(thread), n = String(name ?? '').replace(/\s+/g, ' ').trim()
+  if (D?.role !== 'tg' || !S || k == null || !n) return
+  S.topic_names ??= {}
+  if (S.topic_names[String(k)] === n) return
+  S.topic_names[String(k)] = n
+  saveState()
+}
+
 // ================================================================== M3 + M4 glue: events, the main's obligations, the due sweep
 // The router opens the event record when an event is given to a lane (openLaneEvent) or to the main (toMain). Work handed to the main is one
 // obligation (kind main) and one M1 item for it: M4's one wake rule is "M2 idle and an item owed to the main", and M1 offers that item. Nothing else
@@ -2920,7 +3007,8 @@ function joeyWords(e: Row | undefined, oneLine = false): string {
   const tg = e?.tg as { message_id?: unknown; topic?: unknown } | undefined
   if (!tg || !e?.text) return ''
   const t = String(e.text).slice(0, 1500)
-  return `〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕${tg.topic != null ? `話題 #${tg.topic}，` : ''}message_id ${tg.message_id ?? '-'}：「${oneLine ? t.replace(/\s+/g, ' ').trim() : t}」`
+  const name = tg.topic != null ? topicName(tg.topic) : undefined
+  return `〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕${tg.topic != null ? `話題 #${tg.topic}${name ? `「${name}」` : ''}，` : ''}message_id ${tg.message_id ?? '-'}：「${oneLine ? t.replace(/\s+/g, ' ').trim() : t}」`
 }
 /** the Joey words a memory proposal came from: his message in the run's event set when it was filed (`joey_event`), else its own event's */
 const proposalWords = (e: Row, p: Proposal, oneLine = false): string => joeyWords(p.joey_event ? events?.get(p.joey_event) : e, oneLine)
@@ -4300,7 +4388,7 @@ async function openWorkerLane(title: string, brief: string): Promise<Lane | null
   }
   if (topic == null) return null
   const lane = newLane('worker', { title, topic })
-  if (topic != null) S.topics[String(topic)] = lane.id
+  if (topic != null) { S.topics[String(topic)] = lane.id; noteTopicName(topic, title.slice(0, 120)) }
   S.threads[lane.thread].peer = null
   saveState()
   ledger({ lane: lane.id, thread: lane.thread, kind: 'action', text: `工作線開啟：「${title}」，話題 #${topic ?? '-'}。簡報：${brief.slice(0, 300)}` })

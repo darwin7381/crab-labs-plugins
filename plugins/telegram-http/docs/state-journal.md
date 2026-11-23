@@ -662,3 +662,24 @@ With `GENESIS_LANES=1` each duty below has one owner. With lanes off none of thi
 | Parked deliveries (`inbox/pending`) | the timer drain hands each back to the router (`laneRedeliver`) | replaying them into whichever session is open |
 | Wake-up lines (keep-warm, STALL / RESTART / resume, 讀信箱) | the delivery watchdog sends them (Epeius; keepwarm-local on MBP / txmonster); the router gives each its fixed destination (`routeWake`: the main, or the mail lane) | the `mesh-no-reply` rule (ledger) |
 | Reading mail | the mail lane (`routeMailWake`, mailbox tools through `/lanes/mail-tool`: fleet-mail.ts with the agent's credential); what it cannot judge it hands to the main | the main on a wake (it gets only the digest) |
+
+## lanes-topics: work topics in Joey's private chat (1.35.0)
+
+Measured 2026-11-23 in a real client (lanes-topics.ts has the facts): a bot message is shown inside a topic only when it carries
+`message_thread_id`; `reply_parameters` alone lands outside the topic although the API's answer names it.
+
+| Duty | Owner | Not |
+|---|---|---|
+| The bot's topic mode | one decision: `topicModeAtStart` (lanes-topics.ts) at start (`enable` sends `has_topics_enabled=true` and `allows_users_to_create_topics=false` in one call and checks both with getMe; `auto` changes nothing and warns once on the broken mode); `topicVerdict` over a fresh getMe each time a worker opens (`LanesDeps.topicsUsable`) | a worker topic opened while the user can open topics |
+| The topic of an outgoing Telegram message | `targetTopic` (lanes.ts), asked by `topicFields` (server.ts) on every send path: the main's reply (each chunk, rich or plain, each file), the typing action, lane lines and router notices (`sendBot`), daemon-answered commands (`/lanes`, `/main`, control slashes, button taps) | a send that builds `message_thread_id` itself |
+
+- **state.json `msg_topics`**: `"<chat>:<message id>"` → thread id, or `null` (outside topics). Written for Joey's Telegram messages as
+  the router takes them (`routeEvent`) and for the bot's own sends (`noteSent`); the newest 3,000 are kept. Joey's messages are also in
+  this journal (the event record's `tg.topic`), which `knownTopic` reads when the map does not have the id (an older message, a lost
+  state.json).
+- **state.json `topic_names`**: thread id → name as last known (the bot's own createForumTopic; the topic's creation or edit service
+  message; the creation message a message typed in a topic replies to). The `<channel>` meta of a message typed in a topic is
+  `topic="<id>"` and, when known, `topic_name`; that creation message is not shown as a reply.
+- The decision: an explicit topic (`reply(topic=…)`, `"0"` = outside; a lane's own topic; the topic a command was typed in) → the topic of
+  the message answered (`reply_to`), when known, outside included → for the main's reply only, the one topic every Telegram item of its
+  turn is in (`mainTurn`: the items' events with a `tg` record) → none.

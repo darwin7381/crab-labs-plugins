@@ -672,10 +672,29 @@ async function callBotApi(method: string, payload: Record<string, unknown>): Pro
  * button list — passing UUID directly bypasses the list-idx → picker-idx
  * mapping that caused the 1.2.5 off-by-one bug.
  */
+// lanes-topics (item 2): THE topic of an outgoing Telegram message, as the Bot API field. Every send path asks this (lanes.ts targetTopic decides: an
+// explicit topic, else the topic of the message it answers, else, for the main's reply, the one topic of its turn's Telegram items, else none). A message
+// is shown inside a topic only when it carries message_thread_id (measured 11-23: reply_parameters alone lands outside). Lanes off: never a topic.
+function topicFields(a: Lanes.TopicAsk): { message_thread_id?: number } {
+  if (!Lanes.LANES_ON || INBOX_ONLY) return {}
+  const t = Lanes.targetTopic(a)
+  return t != null ? { message_thread_id: t } : {}
+}
+/** lanes-topics: what the bot sent where (a later reply_to of it finds its topic) */
+function sentIn(chat: string, ids: Array<number | null | undefined>, f: { message_thread_id?: number }): void {
+  if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.noteSent(chat, ids, f.message_thread_id ?? null)
+}
+/** the topic an inbound (or callback) message is in, or undefined (outside topics) */
+function topicOfMessage(m: any): number | undefined {
+  return m?.message_thread_id != null && m?.is_topic_message !== false ? Lanes.topicId(m.message_thread_id) : undefined
+}
+
 async function sendTextWithMaybeKeyboard(
   chatId: string,
   text: string,
   keyboardSpec?: InlineButton[][],
+  /** lanes-topics: where it answers (the topic a command was typed in, the message a button was on); lanes off: ignored */
+  where?: Lanes.TopicAsk,
 ): Promise<void> {
   const chunks = chunk(text, 4000, 'newline')
   const kb = keyboardSpec
@@ -688,10 +707,12 @@ async function sendTextWithMaybeKeyboard(
         return k
       })()
     : undefined
+  const tf = where ? topicFields(where) : {}
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1
     try {
-      await bot.api.sendMessage(chatId, chunks[i], isLast && kb ? { reply_markup: kb } : {})
+      const m = await bot.api.sendMessage(chatId, chunks[i], { ...tf, ...(isLast && kb ? { reply_markup: kb } : {}) })
+      if (where) sentIn(chatId, [m?.message_id], tf)
     } catch (err) {
       log('warn', `sendTextWithMaybeKeyboard failed: ${err instanceof Error ? err.message : err}`)
     }
@@ -1729,6 +1750,8 @@ function buildServer(): Server {
         '- forward_origin/forward_from/forward_date: the ORIGINAL author; the outer user only forwarded it.',
         '- Album = ONE message: media_group_count items, photos as image_path/image_path_2/…, documents as numbered attachment_file_id/attachment_name (download EACH). media_group_id without media_group_count: possibly INCOMPLETE; say so.',
         '- voice_transcript: local speech-to-text of a voice note (may be truncated, trailing …); treat it as what they said; download the audio only if you need the original.',
+        // lanes-topics (item 2): lanes on only
+        ...(Lanes.LANES_ON ? ['- topic/topic_name: written in that topic; a reply to it lands there. reply(topic=…) picks one, "0" = outside.'] : []),
         '',
         'reply takes files: ["/abs/path"] for attachments. react adds an emoji; edit_message updates progress silently. Edits don\'t push a notification: when a long task completes, send a NEW reply so their phone pings.',
         '',
@@ -1818,6 +1841,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
             description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
           },
           format: formatSchema,
+          // lanes-topics (item 2): lanes on only (lanes off, the tool is exactly the fleet's)
+          ...(Lanes.LANES_ON ? { topic: {
+            type: 'string',
+            description: 'Optional topic (thread id) of the chat to send into: the topic="…" of a <channel> message; "0" = the ordinary conversation, outside topics. Usually leave it out: the reply goes into the topic of the message it answers (reply_to), else into the one topic every Joey message of this turn is in; with neither it goes outside topics.',
+          } } : {}),
         },
         required: ['chat_id', 'text'],
       },
@@ -1911,6 +1939,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // PL2: the tier comes from the events of the main's running turn (M1 prompt → items → events), never from a parameter
         const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to }) : null
         const quiet = handoffTier?.silent ? { disable_notification: true } : {}
+        // lanes-topics (item 2): every part of the reply (each chunk, each file) carries the one topic decision; lanes off: {}
+        const topicF = topicFields({ chat: chat_id, topic: args.topic, replyTo: reply_to, turn: true })
 
         for (const f of files) {
           assertSendable(f)
@@ -1942,6 +1972,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   rich_message: { markdown: chunks[i] },
                   ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
                   ...quiet,
+                  ...topicF,
                 })
                 sentIds.push(r.message_id)
                 continue
@@ -1953,6 +1984,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
               ...quiet,
+              ...topicF,
             })
             sentIds.push(sent.message_id)
           }
@@ -1968,9 +2000,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
+          const base = reply_to != null && replyMode !== 'off'
             ? { reply_parameters: { message_id: reply_to }, ...quiet }
             : (handoffTier?.silent ? quiet : undefined)
+          const opts = topicF.message_thread_id != null ? { ...(base ?? {}), ...topicF } : base
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -1981,10 +2014,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to, text)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
+        sentIn(chat_id, sentIds, topicF)
+        const tname = topicF.message_thread_id != null ? Lanes.topicName(topicF.message_thread_id) : undefined
         const result =
           (sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`) + (handoffTier ? ` (${handoffTier.silent ? 'silent' : 'push'}: the router's tier for this turn's ${handoffTier.events.join(', ')})` : '')
+            + (topicF.message_thread_id != null ? ` in topic ${topicF.message_thread_id}${tname ? ` 「${tname}」` : ''}` : '')
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
@@ -2342,19 +2378,32 @@ bot.command('help', async ctx => {
 // 002k: /main renew — hand the main role to a fresh session (lanes.ts mainRenew). Answered by the daemon.
 // lanes-golive: registered only with lanes on; lanes off, /main and /lanes are ordinary messages as in the fleet.
 if (Lanes.LANES_ON) {
+  // lanes-topics (item 2): answered in the topic it was typed in, through the one topic decision
+  const replyWhereTyped = async (ctx: Context, text: string): Promise<void> => {
+    const chat = String(ctx.chat!.id), tf = topicFields({ chat, topic: topicOfMessage(ctx.message) })
+    const m = await ctx.reply(text, tf)
+    sentIn(chat, [m?.message_id], tf)
+  }
   bot.command('main', async ctx => {
     const gated = dmCommandGate(ctx)
     if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
     const sub = (ctx.message?.text ?? '').trim().split(/\s+/)[1] ?? ''
-    if (sub !== 'renew') { await ctx.reply('用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）'); return }
-    await ctx.reply(await Lanes.mainRenew(ctx.from?.username ?? gated.senderId))
+    if (sub !== 'renew') { await replyWhereTyped(ctx, '用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）'); return }
+    await replyWhereTyped(ctx, await Lanes.mainRenew(ctx.from?.username ?? gated.senderId))
   })
 
   bot.command('lanes', async ctx => {
     const gated = dmCommandGate(ctx)
     if (!gated || !gated.access.allowFrom.includes(gated.senderId)) return
     const text = await Lanes.lanesCommand(ctx.message?.text ?? '/lanes', ctx.from?.username ?? gated.senderId)
-    await ctx.reply(text)
+    await replyWhereTyped(ctx, text)
+  })
+
+  // lanes-topics (item 2): a topic's name as its service messages say it (the bot's own createForumTopic, a rename); nothing is answered or routed
+  bot.on(['message:forum_topic_created', 'message:forum_topic_edited'], ctx => {
+    const m: any = ctx.message
+    if (!loadAccess().allowFrom.includes(String(ctx.chat?.id))) return
+    Lanes.noteTopicName(m?.message_thread_id, m?.forum_topic_created?.name ?? m?.forum_topic_edited?.name)
   })
 }
 
@@ -2425,7 +2474,8 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     const chatId = String(ctx.chat?.id ?? senderId)
-    const reply = async (msg: string) => { await sendTextWithMaybeKeyboard(chatId, msg) }
+    const cbm: any = ctx.callbackQuery.message           // lanes-topics: the answer goes where the button was
+    const reply = async (msg: string) => { await sendTextWithMaybeKeyboard(chatId, msg, undefined, { chat: chatId, topic: topicOfMessage(cbm), replyTo: cbm?.message_id }) }
     try { await handleStartupPickerCallback(data, paneWatchTargets, reply) }
     catch (err) { log('warn', `startup-picker callback failed: ${err instanceof Error ? err.message : err}`) }
     await ctx.answerCallbackQuery().catch(() => {})
@@ -2441,8 +2491,9 @@ bot.on('callback_query:data', async ctx => {
     }
     const chatId = String(ctx.chat?.id ?? senderId)
     const httpPort = String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT)
+    const cbm: any = ctx.callbackQuery.message           // lanes-topics: a tap on a picker is answered where the picker is
     const replyToTg = async (msg: string, opts?: ReplyOptions) => {
-      await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard)
+      await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard, { chat: chatId, topic: topicOfMessage(cbm), replyTo: cbm?.message_id })
     }
     try {
       // Roamer /model + /effort picker taps carry `@<hash6>` — validate + drive
@@ -2741,13 +2792,13 @@ function mediaKindLabel(m: any): string | undefined {
  *  media_group_id — album correlation id (each album item arrives as its own
  *    message; same id ⇒ same album)
  */
-function replyForwardMeta(ctx: Context, attachmentFromReply: boolean): Record<string, string> {
+function replyForwardMeta(ctx: Context, attachmentFromReply: boolean, skipTopicCreation = false): Record<string, string> {
   const out: Record<string, string> = {}
   const m: any = ctx.message
   if (!m) return out
 
   const rt = m.reply_to_message
-  if (rt) {
+  if (rt && !(skipTopicCreation && rt.forum_topic_created)) {
     out.reply_to_message_id = String(rt.message_id)
     if (rt.from) {
       out.reply_to_user = displayName(rt.from)
@@ -2908,8 +2959,14 @@ async function handleInbound(
     return
   }
 
+  // lanes-topics (item 2): the topic this message was typed in (lanes off: none, as before); its name as its creation message says it (a message typed in a
+  // topic replies to the topic's creation service message: knowledge/topics-design.md A3)
+  const inTopic = Lanes.LANES_ON ? topicOfMessage(ctx.message) : undefined
+  if (inTopic != null) Lanes.noteTopicName(inTopic, (ctx.message as any)?.reply_to_message?.forum_topic_created?.name)
+  const here: Lanes.TopicAsk = { chat: chat_id, topic: inTopic }
+
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  void bot.api.sendChatAction(chat_id, 'typing', topicFields(here)).catch(() => {})
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
@@ -2932,7 +2989,7 @@ async function handleInbound(
       text,
       String(HTTP_PORT),
       async (msg: string, opts?: ReplyOptions) => {
-        await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard)
+        await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard, here)     // lanes-topics: answered where it was typed
       },
     )
     if (handled) {
@@ -2949,7 +3006,7 @@ async function handleInbound(
   // "build notification + broadcast" block below (see roamer routing).
   if (isRoamerEnabled()) {
     const replyToTg = async (msg: string, opts?: ReplyOptions) => {
-      await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard)
+      await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard, here)
     }
     const handled = await handleRoamerSlash(text, replyToTg)
     if (handled) {
@@ -3016,12 +3073,14 @@ async function handleInbound(
     ...(voiceTranscript ? { voice_transcript: voiceTranscript } : {}),
     // 002: the topic a message was sent in (worker lanes are bound to topics)
     // lanes-golive: a message inside a private-chat topic (Bot API 9.3+/10.5: is_topic_message, message_thread_id) belongs to that topic's worker lane
-    ...(Lanes.LANES_ON && (ctx.message as any)?.message_thread_id != null && (ctx.message as any)?.is_topic_message !== false ? { message_thread_id: String((ctx.message as any).message_thread_id) } : {}),
+    // lanes-topics (item 2): the <channel> tag shows it as topic="<thread id>" (the reply tool's `topic`) and, when known, topic_name
+    ...(inTopic != null ? { topic: String(inTopic), ...(Lanes.topicName(inTopic) ? { topic_name: metaExcerpt(Lanes.topicName(inTopic)!, 128) } : {}) } : {}),
     // Reply-root / forward-origin / album context (2026-07-10) — see
     // replyForwardMeta. Without these the agent couldn't tell WHAT was
     // being replied to, WHO originally wrote a forwarded message, or
     // that N album photos belong together.
-    ...replyForwardMeta(ctx, attachmentFromReply && !!(attachment || image)),
+    // lanes-topics: with lanes on, the topic's creation service message (what a message typed in a topic replies to) is not a reply of Joey's
+    ...replyForwardMeta(ctx, attachmentFromReply && !!(attachment || image), Lanes.LANES_ON),
   }
 
   // #6: photos sharing a media_group_id are ONE album — buffer them briefly
@@ -3071,7 +3130,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
     const ev: Lanes.InEvent = {
       id: `tg-${chat_id}-${meta.message_id ?? Date.now()}`, source: 'telegram', from: meta.user ?? 'joey',
       text: String(p.content ?? ''), meta, notif: notification, verified: true,
-      reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.message_thread_id,
+      reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.topic,
     }
     const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
     if (!d) Lanes.toMainDirect(ev)                                       // 002w (D): the router decided nothing: the main gets it through the one builder
@@ -3768,11 +3827,14 @@ if (Lanes.LANES_ON) {
       },
     } : {
       sendBot: async (chat, text, o) => {
+        // lanes-topics (item 2): a lane's line carries its lane's topic (explicit); the router's notices the topic of the message they answer, if any
+        const tf = topicFields({ chat, topic: o.topic, replyTo: o.replyTo })
         const m = await bot.api.sendMessage(chat, text.slice(0, 4000), {
           ...(o.silent ? { disable_notification: true } : {}),
-          ...(o.topic != null ? { message_thread_id: o.topic } : {}),
+          ...tf,
           ...(o.replyTo ? { reply_parameters: { message_id: o.replyTo, allow_sending_without_reply: true } } : {}),   // 002k (E4): a deleted message must not lose the notice
         })
+        sentIn(chat, [m.message_id], tf)
         return m.message_id
       },
       // lanes-golive: a worker lane's topic in Joey's private chat (Bot API: the bot's topic mode on, createForumTopic with the user's chat id)
