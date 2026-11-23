@@ -42,6 +42,10 @@ export type MainEnv = {
   tellJoey: (text: string, rule: string, events?: string[]) => void
   /** the backoff before the walled main's next probe offer (ms), after `probes` failed ones */
   wallBackoff?: (kind: string, probes: number) => number
+  /** WO-120: the agent's usage-wall state (usage_wall.py, read by usage-wall.ts) for the wall episode that began at `wallSinceMs`: 'walled' = the
+   *  keeper probes outside the session, so no item is fed to the wall; cleared (clearedMs) = its probe (or a genuine turn) got an answer: one
+   *  offer now, once per clear (a failed offer then waits for retry_at or a newer clear); null = no fresh state: the PL4 probe as before */
+  usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
   /** 002v: the accepted main's session id is the expected one from now on (.lanes/main-expected): a /clear's new session survives a restart */
@@ -219,7 +223,16 @@ export function createMain(E: MainEnv) {
     if (!g) return
     // PL4: a walled gen is offered one item when its retry time comes: its probe. Its own hook events then take it out of `walled` (and a
     // StopFailure walls it again, with a longer backoff). A limit menu it is parked on is driven first (002k G16a).
-    const probe = g.state === 'walled' && Date.now() >= Number(g.retry_at ?? Infinity)
+    let probe = g.state === 'walled' && Date.now() >= Number(g.retry_at ?? Infinity)
+    let clearUsed: number | null = null
+    if (g.state === 'walled' && E.usageWall) {
+      // WO-120: with a fresh usage-wall state the keeper is the probe (outside the session, nothing eaten, no false run ack): while it says
+      // walled no item is offered; a clear the gen has not used yet sends the one offer now. Once per clear: if that offer walls again while
+      // the state still shows the same clear (reader lag, a wall kind the state does not record), the next one waits for retry_at as before.
+      const uw = E.usageWall(Date.parse(String(g.wall_since ?? '')) || 0)
+      if (uw?.walled) probe = false
+      else if (uw?.clearedMs != null && uw.clearedMs > Number(g.uw_clear_used ?? 0)) { probe = true; clearUsed = uw.clearedMs }
+    }
     if (g.state !== 'idle' && !probe) return
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
@@ -231,7 +244,8 @@ export function createMain(E: MainEnv) {
       // 002q (T7-R 1016): a menu Joey must choose on is told now; one the probe dealt with asks nothing of him: it rides the episode's one wall-down notice
       if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
       const w = J().get('main', g.id)!
-      setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)), ...(menu && !menu.asks ? { wall_menu: menu.text } : {}) })   // one probe offer per retry time
+      setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)), ...(menu && !menu.asks ? { wall_menu: menu.text } : {}),
+        ...(clearUsed != null ? { uw_clear_used: clearUsed } : {}) })   // one probe offer per retry time (WO-120: and per usage-wall clear)
     }
     const down = new Set<string>()
     for (const it of cands) {

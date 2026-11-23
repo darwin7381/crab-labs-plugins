@@ -3711,7 +3711,14 @@ if (Lanes.LANES_ON) {
       rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
-    wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes
+    wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
+    // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)
+    usageWall: (wallSinceMs: number) => {
+      const w = wallReader.state()
+      if (!w) return null
+      if (w.walled) return { walled: true, clearedMs: null }
+      return w.clearedMs != null && w.clearedMs >= wallSinceMs - 60_000 ? { walled: false, clearedMs: w.clearedMs } : null
+    },   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes
     ...(INBOX_ONLY ? {
       meshSend: async (to, text, replyTo, noReply, extra, send) => {
         let msgId: number | undefined, delivered = false

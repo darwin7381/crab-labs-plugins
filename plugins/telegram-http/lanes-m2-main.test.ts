@@ -14,12 +14,13 @@ process.env.LANES_DIR = dir
 copyFileSync(ROUTER, join(dir, 'router.json'))
 const offers: Array<{ sid: string; notif: any }> = [], open = new Set<string>(), sent: string[] = [], toolsChanged: string[] = []
 const pane = { text: '', drives: 0 }
+let uwMode: { walled: boolean; clearedMs: number | null } | null = null     // WO-120: what the usage-wall state says (null = no fresh state)
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve'],
   notifySession: async (sid: string, notif: any) => { if (!open.has(sid)) return false; offers.push({ sid, notif }); return true },
   streamOpen: (sid: string) => open.has(sid), toolsChanged: (sid: string) => { toolsChanged.push(sid) },
   sendBot: async (_c: string, text: string) => { sent.push(text); return 300 + sent.length }, joeyChatId: () => '1',
   mainPicker: { capture: async () => pane.text, detect: (p: string) => /limit/.test(p) ? { key: 'generic-1', title: 'limit', options: ['Wait here, then continue automatically', 'Upgrade your plan'] } : null,
-    drive: async () => { pane.drives++; return 'ok' as const }, rearm: () => {} } } as any)
+    drive: async () => { pane.drives++; return 'ok' as const }, rearm: () => {} }, usageWall: () => uwMode } as any)
 L.__setWallProbe(3_600_000)
 const procs: any[] = []
 const stuck0 = MAIN_STUCK_MS
@@ -235,6 +236,38 @@ test('PL4: the walled main is offered one item at its retry time (its probe); it
   expect(sent.slice(k).filter(s => s.startsWith('〔adam·分流器〕\n主線模型額度用完了')).length).toBe(1)   // one up ...
   expect(sent.slice(k).filter(s => s.includes('主線恢復了')).length).toBe(1)                  // ... one down, for one episode
   L.__setWallProbe(3_600_000)
+  await killed(g)
+})
+
+test('WO-120: with a fresh usage-wall state the walled main is not fed its PL4 probe; each new clear sends one offer at once, a failed one does not bypass the backoff', async () => {
+  await drained()
+  L.__setWallProbe(40)
+  const g = await startMain()
+  const id = await joey('週報呢？')
+  const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: '429' })
+  expect(M().mainPhase()).toBe('walled')
+  uwMode = { walled: true, clearedMs: null }
+  await sleep(80); await M().tick(); await M().pump()
+  expect(state(id)).toBe('queued')                                                             // retry time passed, but the keeper probes: nothing offered
+  L.__setWallProbe(3_600_000)
+  const p0 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p0, dids: [] }); await hook(g, 'StopFailure', { prompt_id: p0, error: 'rate_limit', reason: '429' })
+  expect(Number(mainLines(g.pid).at(-1).retry_at) - Date.now()).toBeGreaterThan(60_000)        // next PL4 retry far away
+  const c1 = Date.now()
+  uwMode = { walled: false, clearedMs: c1 }
+  await M().tick(); await M().pump()
+  expect(state(id)).toBe('offered')                                                            // cleared: offered now, not at retry_at
+  // the offer walls again while the state still shows the same clear (reader lag): no second immediate offer, retry_at governs
+  const p1 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p1, dids: [id] }); await hook(g, 'StopFailure', { prompt_id: p1, error: 'rate_limit', reason: '429' })
+  expect(M().mainPhase()).toBe('walled'); expect(state(id)).toBe('queued')
+  await M().tick(); await M().pump(); await M().pump()
+  expect(state(id)).toBe('queued')                                                             // same clear used once: no bypass of the backoff
+  uwMode = { walled: false, clearedMs: c1 + 1000 }                                              // a newer clear: one offer now
+  await M().tick(); await M().pump()
+  expect(state(id)).toBe('offered')
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(M().mainPhase()).toBe('idle')
+  uwMode = null
   await killed(g)
 })
 

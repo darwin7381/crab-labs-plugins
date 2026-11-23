@@ -169,6 +169,8 @@ export interface LanesDeps {
   /** WO-120 (server.ts mainWallNoticeOwned): true = the usage-wall alerts (system-alert WallAlerts) tell Joey about this wall of the main, so the
    *  main-wall-up / main-wall-down notice goes to the ledger only. Absent / false = pushed as before. The wall records themselves are untouched. */
   wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
+  /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall) */
+  usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
 }
 /** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
  *  or put the menu in front of Joey again with a fresh debounce */
@@ -279,6 +281,7 @@ function mainEnv() {
       void pushJoey(undefined, text, false).then(id => { routerToldJoey(evs, id, rule); logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id, events: evs }) })
     },
     wallBackoff: (kind: string, probes: number) => wallBackoffMs(kind, probes),
+    usageWall: (wallSinceMs: number) => D.usageWall?.(wallSinceMs) ?? null,   // WO-120: the keeper probes, not an item fed to the wall
     expectedSession: (): string[] => {
       let expected = ''
       try { expected = readFileSync(join(LANES_DIR, 'main-expected'), 'utf8').trim() } catch {}

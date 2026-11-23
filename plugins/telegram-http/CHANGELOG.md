@@ -1,3 +1,16 @@
+## 1.34.3 — 2026-11-23
+
+- **Lanes on: the walled main is not fed its PL4 probe while the usage-wall state says walled** (WO-120; Sonn mail #10808).
+  - **Why:** the first real walls after 1.34.1 (11-23 05:46Z, Fable, five lanes agents) showed M1 offering an item to the walled main at each
+    retry time: every offer was answered only by the limit error (kot 06:18 and 06:28, the same scheduled run 6823, which was also counted as
+    acked although the main never took it; 10–11 eaten inputs per agent over ~4 h). The usage-wall keeper (usage_wall.py) already probes outside
+    the session, so the in-session probe only feeds the wall.
+  - **What:** `MainEnv.usageWall(wallSinceMs)` (lanes-main.ts), from server.ts's usage-wall reader through `LanesDeps.usageWall`: `walled` → no
+    offer at retry_at; a clear after this episode began → one offer now, once per clear (a failed one does not bypass the backoff: it waits for retry_at or a newer clear; stop-time review); `null` (no fresh state, keeper down, OFF) → the PL4
+    probe exactly as before. The main still leaves `walled` only on its own hook events.
+  - Test: lanes-m2-main (walled → nothing offered past retry_at; a clear → offered at once; the same clear after a failed offer → no bypass;
+    a newer clear → offered). Suite 808 / 3 skip / 0 fail before the once-per-clear rule; lanes + usage-wall suites 98/0 after it.
+
 ## 1.34.2 — 2026-11-23
 
 - **Lanes on: the peer disclosure check asks "machine or network details" only of a message that answers a request, and a file path is
