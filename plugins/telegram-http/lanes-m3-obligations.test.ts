@@ -713,7 +713,7 @@ test('scheduler receipt: across events: a follow-up run\'s CLI for a run another
 // hook completed run 6843 through the router and refused the command for the receipt alone; run on its own, the write was refused (a reflex lane writes
 // no workspace file). The run stood completed, the lane told Joey the line was recorded, and nothing had been written. Now the rest of the command is
 // checked first: a command the guard refuses completes nothing (here in a workspace of its own, `ws`, beside the lanes dir).
-test('scheduler receipt (1.36.2): a command the guard refuses completes nothing, its receipt included; a receipt-only command and an allowed command with a receipt complete as before', async () => {
+test('scheduler receipt (1.36.2): a command the guard refuses completes nothing, its receipt included; a receipt chained after allowed steps completes nothing either; only a receipt-only command completes the run', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'lanes-m3-ws-')); mkdirSync(join(ws, 'data')); mkdirSync(join(ws, 'out'))
   const s = await start(sched(66))
   const r = await cli(s.tok, `echo "- 11-23 05:43Z ether.fi 新登入通知" >> data/login-habits.md; python3 scripts/cf_access_watch.py --ack 2>&1 | tail -2; ./bin/btcc-receipt complete 66 --outcome ok --note '已記錄'`, ws)
@@ -733,8 +733,11 @@ test('scheduler receipt (1.36.2): a command the guard refuses completes nothing,
   await call(s.tok, 'notify_joey', { outcome: 'normal', text: 'run 66 正常' })
   await end(s.lane)
   const a = await start(sched(67))
-  const ok = await cli(a.tok, 'echo ok >> out/note.md && ./bin/btcc-receipt complete 67', ws)      // an allowed command with a receipt: as before
-  expect(ok.deny).toContain('This command was not run'); expect(ok.deny).toContain('run 67 completed')
+  const ok = await cli(a.tok, 'echo ok >> out/note.md && ./bin/btcc-receipt complete 67', ws)      // an ALLOWED command chained with the receipt: nothing of it
+  expect(ok.deny).toContain('This command was not run and NOTHING in it ran'); expect(ok.deny).toContain('scheduler run 67 is NOT completed')   // has run yet, so the
+  expect(ok.deny).toContain('The receipt has to be a command of its own'); expect(ok.deny).not.toContain('run 67 completed')                   // run is not completed
+  expect(completions('67').length).toBe(0)
+  expect((await cli(a.tok, './bin/btcc-receipt complete 67 --outcome ok', ws)).deny).toContain('run 67 completed')                              // filed on its own, after the work
   expect(completions('67').length).toBe(1)
   await call(a.tok, 'notify_joey', { outcome: 'normal', text: 'run 67 正常' })
   await end(a.lane)

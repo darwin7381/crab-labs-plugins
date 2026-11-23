@@ -34,13 +34,13 @@
     before) before the receipt step. A refused command that contains `btcc-receipt complete` sends nothing to the daemon; the refusal says that
     nothing in the command ran, the receipt included, that the run is NOT completed, why the command was refused, and to run the allowed steps
     as separate commands and file the receipt only after the work is done (`receipt_refused`). A command that is nothing but the receipt call
-    (`receipt_only`: a `cd` before it allowed, also inside `bash -c`) goes to the daemon as before, even when its note trips the shell check. An
-    allowed command chained with a receipt call is unchanged: the daemon completes the run and the command does not run.
+    (`receipt_only`: a `cd` before it allowed, also inside `bash -c`) goes to the daemon as before, even when its note trips the shell check. A
+    receipt chained after ALLOWED steps completes nothing either (it used to complete the run while none of those steps had run): the refusal
+    says the receipt has to be a command of its own, filed after the work.
   - Test `lanes-m3-obligations` 「scheduler receipt (1.36.2)」, with the guard run as a process against the daemon routes and the scheduler
     stand-in: elsa's command from a reflex lane is refused, also inside `bash -c`, the stand-in receives no completion and the receipt obligation
-    stays open; the receipt alone then completes once; an allowed command with a receipt completes as before.
-  - **Not verified:** on a live lane. Kept as it was and worth a look: an allowed command chained with a receipt call completes the run although
-    the rest of that command never runs.
+    stays open; the receipt alone then completes once; an allowed step chained with a receipt completes nothing, the receipt alone after it does.
+  - **Not verified:** on a live lane.
 
 ## 1.36.1 — 2026-11-24
 

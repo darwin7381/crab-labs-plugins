@@ -809,6 +809,12 @@ def receipt_only(cmd, depth=0):
 def receipt_refused(why, calls):
     """the deny reason for a refused command that also asked for a scheduler run's completion: nothing ran, the run is not completed"""
     runs = ', '.join(c['run_id'] or '?' for c in calls)
+    if not why:
+        # an allowed command chained with the receipt: until 1.36.2 the run was completed here and the command refused "for the receipt alone", so the
+        # run stood completed before any of the work had run. The receipt is filed by a command of its own, after the work.
+        return (f'This command was not run and NOTHING in it ran, the btcc-receipt complete included: scheduler run {runs} is NOT completed. '
+                'The receipt has to be a command of its own. Run the work first as separate commands, check that it worked, and then file the receipt '
+                '(btcc-receipt complete alone, or the receipt tool with run_id) only after the work is really done.')
     return (f'This command was refused and NOTHING in it ran, the btcc-receipt complete included: scheduler run {runs} is NOT completed. '
             f'Why it was refused: {why} '
             'Run the allowed steps as separate commands, check that they worked, and file the receipt '
@@ -873,12 +879,13 @@ def main():
                 raise
             why = ''                                                             # the receipt path is never worse than before 1.36.2
         if calls:
-            # 1.36.2: the daemon completes the run only for a command the guard lets through (or one that is nothing but the receipt call); the command
-            # itself never runs either way (M3: nothing but the daemon completes a run)
-            if why and not receipt_only(cmd):
-                deny(receipt_refused(why, calls))
-            else:
+            # 1.36.2: the command itself never runs either way (M3: nothing but the daemon completes a run).
+            # Only a command that is nothing but the receipt call completes the run: chained after other steps (refused OR allowed) it completes
+            # nothing, because none of those steps has run yet when the hook sees the command.
+            if receipt_only(cmd):
                 deny(complete_through_daemon(calls))
+            else:
+                deny(receipt_refused(why, calls))
             return
         if why:
             deny(why)
