@@ -4,15 +4,22 @@
 export type Call = { method: string; body: Record<string, any>; at: number }
 export type BotApiMock = {
   url: string; token: string; calls: Call[]; me: Record<string, any>
+  /** every getUpdates: when it came and when it was answered (ms) */
+  polls: Array<{ start: number; end?: number }>
+  /** calls this returns true for are never answered (the request stays open) */
+  hang: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
   push: (u: Record<string, any>) => void
   of: (method: string) => Call[]
   stop: () => void
 }
 export const ICON_CHECK = '5237699328843200968'
 
-export function startBotApiMock(me: Record<string, any> = {}): BotApiMock {
+/** pollHoldMs: how long an empty getUpdates is held open (a real long poll holds up to its timeout) */
+export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: number } = {}): BotApiMock {
   const token = '123456:TEST-not-a-real-token'
   const calls: Call[] = []
+  const polls: Array<{ start: number; end?: number }> = []
+  const hang: BotApiMock['hang'] = { fn: null }
   const updates: Record<string, any>[] = []
   let nextUpdate = 1, nextMsg = 5000, nextTopic = 7000
   const state = { id: 999, is_bot: true, first_name: 'lab', username: 'lab_test_bot', has_topics_enabled: false, allows_users_to_create_topics: false, ...me }
@@ -35,15 +42,19 @@ export function startBotApiMock(me: Record<string, any> = {}): BotApiMock {
     } catch {}
     for (const k of ['reply_parameters', 'reply_markup', 'rich_message']) if (typeof body[k] === 'string') { try { body[k] = JSON.parse(body[k]) } catch {} }
     if (method !== 'getUpdates') calls.push({ method, body, at: Date.now() })
+    if (hang.fn?.(method, body)) return new Promise<Response>(() => {})
     switch (method) {
       case 'getMe': return ok({ ...state })
       case 'getUpdates': {
-        const offset = Number(body.offset ?? 0)
-        for (let i = 0; i < 10; i++) {
+        const offset = Number(body.offset ?? 0), p: { start: number; end?: number } = { start: Date.now() }
+        polls.push(p)
+        const hold = o.pollHoldMs ?? 500
+        while (Date.now() - p.start < hold) {
           const out = updates.filter(u => u.update_id >= offset)
-          if (out.length) return ok(out)
-          await sleep(50)
+          if (out.length) { p.end = Date.now(); return ok(out) }
+          await sleep(25)
         }
+        p.end = Date.now()
         return ok([])
       }
       case 'setMySettings':
@@ -58,7 +69,7 @@ export function startBotApiMock(me: Record<string, any> = {}): BotApiMock {
     }
   } })
   return {
-    url: `http://127.0.0.1:${server.port}`, token, calls, me: state,
+    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang,
     push: (u) => { updates.push({ update_id: nextUpdate++, ...u }) },
     of: (method) => calls.filter(c => c.method === method),
     stop: () => server.stop(true),

@@ -314,6 +314,38 @@ const bot = new Bot(INBOX_ONLY ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN!
   process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : undefined)
 let botUsername = ''
 
+// lanes-topics (item 7, always on, lanes on or off): a send never hangs forever. 2026-11-23 19:19 TPE the channel bot's reply (rich text, callBotApi's bare
+// fetch) got no result for over 120 s with nothing in the log, while getMe answered in 0.7 s; grammy's own calls wait up to its 500 s default. Every
+// call that delivers something to a chat gets TELEGRAM_SEND_TIMEOUT_S (default 45): on expiry the call fails with SendTimeoutError, which says the
+// message MAY have been delivered, and is never sent again by the daemon (a duplicate is the caller's choice: the rich → plain fallbacks do not run on
+// it). One log line per timeout (method, elapsed; never the text). getUpdates (long polling) and every other method keep grammy's own wait.
+const SEND_TIMEOUT_S = (() => { const n = Number(process.env.TELEGRAM_SEND_TIMEOUT_S ?? 45); return Number.isFinite(n) && n > 0 ? n : 45 })()
+const BOUNDED_SENDS = new Set(['sendMessage', 'sendRichMessage', 'sendPhoto', 'sendDocument', 'sendChatAction', 'editMessageText', 'setMessageReaction',
+  'createForumTopic', 'editForumTopic'])
+class SendTimeoutError extends Error {
+  constructor(readonly method: string, readonly elapsedMs: number) {
+    super(`${method}: no answer from Telegram within ${SEND_TIMEOUT_S} s; the message may or may not have been delivered. It was not sent again: look at the chat before sending it again.`)
+  }
+}
+/** run one Bot API call with the send bound; `outer`: the caller's own abort signal, kept */
+async function boundedSend<T>(method: string, run: (signal: AbortSignal) => Promise<T>, outer?: AbortSignal): Promise<T> {
+  const ac = new AbortController(), t0 = Date.now()
+  const onOuter = (): void => ac.abort()
+  outer?.addEventListener('abort', onOuter)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => {
+      ac.abort()
+      log('warn', `telegram send timeout: ${method} got no answer in ${Date.now() - t0} ms (bound ${SEND_TIMEOUT_S} s); not sent again`)
+      rej(new SendTimeoutError(method, Date.now() - t0))
+    }, SEND_TIMEOUT_S * 1000)
+  })
+  try { return await Promise.race([run(ac.signal), expired]) }
+  finally { clearTimeout(timer); outer?.removeEventListener('abort', onOuter) }
+}
+bot.api.config.use((prev, method, payload, signal) =>
+  BOUNDED_SENDS.has(method) ? boundedSend(method, s => prev(method, payload, s), signal) : prev(method, payload, signal))
+
 type PendingEntry = {
   senderId: string
   chatId: string
@@ -653,12 +685,16 @@ function isRichEnabled(): boolean {
 const API_ROOT = process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org'
 
 async function callBotApi(method: string, payload: Record<string, unknown>): Promise<any> {
-  const res = await fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
+  // lanes-topics (item 7): the raw sends (sendRichMessage, editMessageText) have the same bound as grammy's (boundedSend)
+  const data = await boundedSend(method, async signal => {
+    const res = await fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    })
+    return (await res.json()) as { ok: boolean; result?: any; description?: string; error_code?: number }
   })
-  const data = (await res.json()) as { ok: boolean; result?: any; description?: string; error_code?: number }
   if (!data.ok) throw new Error(`${method}: ${data.error_code ?? '?'} ${data.description ?? 'unknown error'}`)
   return data.result
 }
@@ -1958,6 +1994,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
         const sentIds: number[] = []
+        // lanes-topics (item 7): one line per message the reply delivered (method, chat, id, topic, ms; never the text), so an incident can be read from the log
+        const sentLog = (method: string, id: unknown, t0: number): void =>
+          log('info', `reply sent: method=${method} chat=${chat_id} message=${id ?? '?'} topic=${topicF.message_thread_id ?? '-'} ms=${Date.now() - t0}`)
 
         try {
           for (let i = 0; i < chunks.length; i++) {
@@ -1966,6 +2005,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               replyMode !== 'off' &&
               (replyMode === 'all' || i === 0)
             if (useRich) {
+              const t0 = Date.now()
               try {
                 const r = await callBotApi('sendRichMessage', {
                   chat_id,
@@ -1975,11 +2015,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
                   ...topicF,
                 })
                 sentIds.push(r.message_id)
+                sentLog('sendRichMessage', r.message_id, t0)
                 continue
               } catch (re) {
+                if (re instanceof SendTimeoutError) throw re          // item 7: it may have been delivered: never sent again as plain text
                 log('warn', `sendRichMessage failed, falling back to plain: ${re instanceof Error ? re.message : re}`)
               }
             }
+            const t0 = Date.now()
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
@@ -1987,6 +2030,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               ...topicF,
             })
             sentIds.push(sent.message_id)
+            sentLog('sendMessage', sent.message_id, t0)
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
@@ -2004,12 +2048,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ? { reply_parameters: { message_id: reply_to }, ...quiet }
             : (handoffTier?.silent ? quiet : undefined)
           const opts = topicF.message_thread_id != null ? { ...(base ?? {}), ...topicF } : base
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
+          const t0 = Date.now(), method = PHOTO_EXTS.has(ext) ? 'sendPhoto' : 'sendDocument'
+          try {
+            const sent = method === 'sendPhoto' ? await bot.api.sendPhoto(chat_id, input, opts) : await bot.api.sendDocument(chat_id, input, opts)
             sentIds.push(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            sentIds.push(sent.message_id)
+            sentLog(method, sent.message_id, t0)
+          } catch (fe) {
+            // item 7: a file that got no answer says what had already gone out
+            if (fe instanceof SendTimeoutError) throw new Error(`reply failed after ${sentIds.length} of ${chunks.length + files.length} part(s) sent: ${fe.message}`)
+            throw fe
           }
         }
 
@@ -2062,6 +2109,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const rid = r && typeof r === 'object' ? r.message_id : args.message_id
             return { content: [{ type: 'text', text: `edited (id: ${rid})` }] }
           } catch (re) {
+            if (re instanceof SendTimeoutError) throw re              // item 7: no answer: not edited again as plain text
             log('warn', `editMessageText rich failed, falling back to plain: ${re instanceof Error ? re.message : re}`)
           }
         }
