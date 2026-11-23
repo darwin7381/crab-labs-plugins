@@ -61,7 +61,7 @@
   per timeout (method, elapsed); one info line per message the main's `reply` delivered (method, chat, message id, topic, ms); never the
   text. `getUpdates` keeps grammy's long poll.
 - Tests: `lanes-topics-mode`, `-target`, `-send`, `-sendtimeout`, `-model`, `-lifecycle`, `-anchor`, `-richlines`; the daemon tests run a real
-  `server.ts` against a Bot API stand-in (`test-fixtures/tg-bot-api-mock.ts`, `tg-daemon.ts`), lanes on and off. Full suite 858 (855 pass, 3 skip, 0 fail; 1.34.3: 811, 808 pass, 3 skip).
+  `server.ts` against a Bot API stand-in (`test-fixtures/tg-bot-api-mock.ts`, `tg-daemon.ts`), lanes on and off. Full suite 859 (856 pass, 3 skip, 0 fail; 1.34.3: 811, 808 pass, 3 skip).
 
 ## 1.34.3 — 2026-11-23
 
