@@ -1,3 +1,54 @@
+## 1.35.0 — 2026-11-23
+
+- **Lanes on: work topics in Joey's private chat, done properly** (agent-inbox 1.5.0 carries the same code).
+  - **What happened:** on 11-23 the channel bot's private-chat topic mode was switched on for a demo with `setMySettings
+    has_topics_enabled=true` alone, which left `allows_users_to_create_topics` true. The Telegram app then opened a new topic for every
+    message Joey typed (「為什麼我現在只要一跟你講話就被開一個 topic？」), and the replies, sent with no `message_thread_id`, landed outside
+    those topics, where he could not find them. The design given to him: the main is the ordinary conversation, outside topics; a work topic
+    is one piece of work backed by its own worker lane (own context, in parallel), opened and finished by the main; only the bot opens topics.
+  - **Measured in the real client** (Telegram Web A 13.0.2 and Web K, the test bot and the test account; the workspace anchor file
+    `knowledge/topics-design.md`): with `has_topics_enabled=true` and `allows_users_to_create_topics=false` Joey types in "All Messages"
+    (its input says "Off-topic message"), the bot gets no `message_thread_id`, no topic is created, he has no "new topic" control; with users
+    allowed, every message from the default view opens a topic. A bot message is inside a topic only when it carries `message_thread_id`:
+    `reply_parameters` alone puts it outside, although the API's answer names the topic; both: inside, with the quote. `editForumTopic`
+    renames (emoji in a name are dropped by the server, which answers true) and sets the icon (✅ is in `getForumTopicIconStickers`);
+    `closeForumTopic` does not exist for private chats (400); `deleteForumTopic` removes the topic with its messages.
+  - **1. Topic mode is one decision** (`lanes-topics.ts`). `LANES_WORKER_TOPICS=enable` sends `has_topics_enabled=true` and
+    `allows_users_to_create_topics=false` in one `setMySettings` call and checks both with getMe. `auto` changes nothing; when getMe shows
+    topics on with users allowed to open them, it logs one warning and opens no worker topic (the main does the work). The mode is asked
+    again from getMe each time a worker opens; `open_worker`'s refusal says why.
+  - **2. Every message into a topic names the topic.** One function decides (`lanes.ts targetTopic`, asked through `server.ts topicFields`
+    by every send path): an explicit topic (`reply`'s new `topic`, `"0"` = outside; a lane's own topic; the topic a command was typed in);
+    else the topic of the `reply_to` message when the daemon knows it (Joey's messages as the router takes them, the bot's own as they go out:
+    state.json `msg_topics`; Joey's also in the journal, so a restart keeps it); else, for the main's reply, the one topic every Telegram item
+    of its turn (`turnWork`) is in; else none. Routed: `reply` (rich text, every plain chunk, photos, documents), the typing action, lane lines
+    and router notices, `/lanes`, `/main`, the control slashes, roamer slashes and button taps. Ops notices (pairing, the permission prompt,
+    system alerts, login-expired, the duty officer, the startup picker) stay outside topics; `/start`, `/help`, `/status` answer where typed
+    through grammy's `ctx.reply`, as before. The `<channel>` meta shows `topic` and, when known, `topic_name` (from the bot's own
+    `createForumTopic` and the topics' creation / edit service messages); a topic's creation message is no longer shown as a reply.
+  - **3. A work topic's lane runs the main's model.** Worker and fork lanes: `LANES_MODEL_WORKER`, else the model of the main's last genuine
+    assistant record (`liveness.ts isGenuineAssistant`: never `<synthetic>`, never an API error record), else `LANES_MODEL`; read at each
+    run. Reflex, mail, curator and synthesis lanes keep `LANES_MODEL`. The spawn record names the model and where it came from.
+  - **4. Lifecycle.** The topic is created under the name the server keeps (emoji dropped first), and `open_worker` returns its link
+    (`https://t.me/<bot>/<thread id>`) and that name. Closing a worker lane (the main's `lane_close`, Joey's `/lanes close`, or, when a run
+    was going, at that run's end) sets the topic's ✅ icon (looked up once in `getForumTopicIconStickers`; none there: left) and posts one
+    silent closing line in the topic. Never deleted. A close cut off by a restart is finished at boot. What Joey types in a finished topic
+    goes to the main, and the main's answer lands in that topic (item 2).
+  - **5. A work topic's anchor file.** Each worker lane owns `knowledge/lines/<slug>.md`, created when it opens (only if absent) with the
+    title, the topic, Joey's words of the opening turn and the brief; its 〔車道資訊〕 says to read it first and update it at checkpoints.
+    `lane-guard-hook.py` lets the open worker write that one path and nothing else under `knowledge/`. `open_worker` gives the main the path
+    for `knowledge/REANCHOR.md` (the main is that file's only writer). Other lanes: unchanged.
+- **Always (lanes on or off): a Telegram send that gets no answer fails in bounded time.** 11-23 19:19 TPE the channel bot's `reply` (rich
+  text, `callBotApi`'s bare `fetch`) had no result for over 120 s with nothing in the log, while getMe answered in 0.7 s. Every Bot API
+  call that delivers something to a chat (`sendMessage`, `sendRichMessage`, `sendPhoto`, `sendDocument`, `sendChatAction`,
+  `editMessageText`, `setMessageReaction`, `createForumTopic`, `editForumTopic`) waits at most `TELEGRAM_SEND_TIMEOUT_S` (default 45):
+  grammy's calls through an API transformer, `callBotApi` with an abort signal. On expiry the tool call errors: the message may or may not
+  have been delivered, and it was not sent again (the rich → plain fallbacks of `reply` and `edit_message` do not run on it). One warn line
+  per timeout (method, elapsed); one info line per message the main's `reply` delivered (method, chat, message id, topic, ms); never the
+  text. `getUpdates` keeps grammy's long poll.
+- Tests: `lanes-topics-mode`, `-target`, `-send`, `-sendtimeout`, `-model`, `-lifecycle`, `-anchor`; the daemon tests run a real
+  `server.ts` against a Bot API stand-in (`test-fixtures/tg-bot-api-mock.ts`, `tg-daemon.ts`), lanes on and off. Full suite 854 (851 pass, 3 skip, 0 fail; 1.34.3: 811, 808 pass, 3 skip).
+
 ## 1.34.3 — 2026-11-23
 
 - **Lanes on: the walled main is not fed its PL4 probe while the usage-wall state says walled** (WO-120; Sonn mail #10808).
