@@ -1,3 +1,20 @@
+## 1.35.1 — 2026-11-23
+
+Lanes on (agent-inbox 1.5.1 carries the same code). Three small fixes from the day's live runs.
+
+- **The wall notice says what makes the main move again.** 11-23 14:18–18:00 TPE the channel bot's main sat at its Fable weekly limit until Joey
+  switched its model; the notice said the messages were kept and "恢復時我會告訴你", not that nothing would happen by itself. Both wall-up notices
+  (`usage-wall.ts lanesEnterNote`, under the usage-wall alert; `lanes-main.ts` main-wall-up, when no usage-wall state owns the wall) now say
+  「主線要等額度重置、換帳號或換模型才會再動。」.
+- **A denied hand-over is no hand-over claim.** A worker lane's report that said 「不交給主線」 was sent back once by `ownerClaimWarning`
+  (the model aid for "says it was passed to Joey or the main while the record says nobody has it"). `lanes.ts claimsHandover`: a match of
+  `CLAIM_RE` counts only when its own clause does not deny it (不／沒／未／別／勿／無須／無需／免 within six characters before it; not / n't / never /
+  without / no need / nothing / nobody / no one within 24); a real claim in another clause still counts. Test `lanes-claim-negation`.
+- **The guard's "cannot work out the write target" hint names the worker's anchor file** (`lane-guard-hook.py`): a worker lane was told to write
+  under out/ or /tmp only, while its own `knowledge/lines/<slug>.md` is also allowed by its literal path.
+- Tests: full suite 862 (the two usage-wall.daemon timing tests and one lifecycle boot test failed once in a full run under machine load
+  (load average 14) and passed 3 of 3 alone; 856 pass, 3 skip, 3 fail in that run).
+
 ## 1.35.0 — 2026-11-23
 
 - **Lanes on: work topics in Joey's private chat, done properly** (agent-inbox 1.5.0 carries the same code).

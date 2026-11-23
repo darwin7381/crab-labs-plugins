@@ -3491,8 +3491,20 @@ function joeyRendering(e: Row | undefined, tok: RunTok, lane: Lane, level: 'line
 }
 /** model aid (kept; 002m aid b, reduced): a message that says the matter was passed to Joey or the main while the record says nobody has it */
 const CLAIM_RE = /(?:轉給|轉交|交給|交由|上報|升級給|升級到|請示)\s*(?:Joey|joey|老闆|主線|主\s*agent)|(?:請|讓|由)\s*(?:Joey|joey|主線)\s*(?:來)?(?:決定|定奪|處理|裁決|接手)|(?:Joey|主線)\s*(?:會|將)\s*(?:決定|處理|回覆|接手)|\b(?:passed|forwarded|escalated|handed)\b[^.]{0,20}\bto\s+(?:Joey|the main)/i
+// lanes-topics live run (11-23): a worker's report said 「不交給主線」 and was sent back as a hand-over claim. A claim that is denied in its own clause
+// (不／沒／未／別／不用／不必…, not / never / without / no need) is no claim: looked at in the few characters before the match, inside the same clause.
+const CLAIM_NEG = /(?:不|沒|没|未|別|别|勿|毋|無須|無需|无需|免)[^，。；！？,.;!?\n]{0,6}$|(?:\bnot\b|n't|\bnever\b|\bwithout\b|\bno need\b|\bnothing\b|\bnobody\b|\bno one\b)[^,.;!?\n]{0,24}$/i
+/** true = the text says the matter was (or will be) passed to Joey or the main (CLAIM_RE), in at least one clause that does not deny it */
+export function claimsHandover(text: string): boolean {
+  const re = new RegExp(CLAIM_RE.source, 'gi')
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (!CLAIM_NEG.test(text.slice(Math.max(0, m.index - 30), m.index))) return true
+    if (m[0].length === 0) re.lastIndex++
+  }
+  return false
+}
 function ownerClaimWarning(tok: RunTok, e: Row | undefined, text: string): string | null {
-  if (!e || tok.claimWarned || !CLAIM_RE.test(text)) return null
+  if (!e || tok.claimWarned || !claimsHandover(text)) return null
   const obs: Ob[] = e.obligations ?? []
   // the main has something of it: a hand-over, Joey's decision, or a memory proposal of this event (the main decides those: PL1, on the record)
   if (obs.some(o => o.kind === 'main') || obs.some(o => o.kind === 'joey' && o.level === 'decision' && o.state === 'met') || ((e.proposals ?? []) as Proposal[]).some(p => !p.decision)) return null

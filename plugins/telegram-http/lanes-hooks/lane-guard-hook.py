@@ -604,7 +604,8 @@ def write_policy(cmd, cwd, kind, depth=0):
         return ''
 
     UNRESOLVED = ('the write target of this command cannot be worked out (it uses a variable, a substitution or a command that changes directory in a way that is not visible): '
-                  'write to a literal path under out/ or /tmp.')
+                  'write to a literal path under out/ or /tmp'
+                  + (f', or to your own anchor file ({os.path.relpath(anchor, ws)}) by its literal path' if anchor else '') + '.')
     cmds, bodies = commands(cmd)
     for a, b in re.findall(r'\$\(([^()]*)\)|`([^`]*)`', cmd):
         r = write_policy(a or b, cwd_v, kind, depth + 1)

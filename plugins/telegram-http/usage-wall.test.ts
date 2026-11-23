@@ -249,9 +249,9 @@ describe('jsonl helpers', () => {
 })
 
 describe('lanes enter note (Sonn #10731) and keeper liveness', () => {
-  test('lanesEnterNote: N held → both sentences; 0 → only the second', () => {
-    expect(lanesEnterNote(3)).toBe('給主線的 3 則訊息先保留，一件都沒有丟；主線一能用就交給它。車道照常處理警報與同事的事。')
-    expect(lanesEnterNote(0)).toBe('車道照常處理警報與同事的事。')
+  test('lanesEnterNote: what makes the main move again, first; N held → the kept-messages sentence; 0 → without it', () => {
+    expect(lanesEnterNote(3)).toBe('主線要等額度重置、換帳號或換模型才會再動。給主線的 3 則訊息先保留，一件都沒有丟；主線一能用就交給它。車道照常處理警報與同事的事。')
+    expect(lanesEnterNote(0)).toBe('主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。')
   })
   test('WallAlerts enterNote: an extra line under the enter alert; none → text unchanged', () => {
     const state = mkdtempSync(join(tmpdir(), 'uwa-'))

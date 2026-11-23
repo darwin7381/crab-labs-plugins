@@ -272,9 +272,10 @@ function withNote(text: string, note: string | null | undefined): string {
   return note && note.trim() ? `${text}\n${note.trim()}` : text
 }
 
-/** Lanes on (Sonn #10731): the enter alert says what happens to the messages for the main. */
+/** Lanes on (Sonn #10731): the enter alert says what happens to the messages for the main, and (11-23: the channel bot's main sat walled from 14:18
+ *  to 18:00 because the notice did not say it) that the main does not move again by itself: a reset, another account or another model. */
 export function lanesEnterNote(mainHeld: number): string {
-  return (mainHeld > 0 ? `給主線的 ${mainHeld} 則訊息先保留，一件都沒有丟；主線一能用就交給它。` : '') + '車道照常處理警報與同事的事。'
+  return '主線要等額度重置、換帳號或換模型才會再動。' + (mainHeld > 0 ? `給主線的 ${mainHeld} 則訊息先保留，一件都沒有丟；主線一能用就交給它。` : '') + '車道照常處理警報與同事的事。'
 }
 
 export function enterText(w: WallState): string {
