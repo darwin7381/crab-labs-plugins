@@ -24,6 +24,10 @@ export interface FleetDeps {
   call: CallFn; btcc: BtccCall; core: CoreCall
   /** WO-124: who opens mail through these tools. 'lane' = the agent's mail lane (lanes mode): its open is 車道讀過, not 主線已讀 */
   openBy?: 'lane'
+  /** WO-126: the lane (lane.id) calling, when openBy is 'lane': a lane item or a card names it */
+  lane?: string
+  /** WO-126: hand the mail_decision event to the lane router (the agent-inbox daemon's mail-events queue). Absent = lanes off: the main does it itself */
+  mailEvent?: (decided: any) => Promise<'handed' | 'queued'>
 }
 const TOUCH_MAX = 5
 
@@ -135,6 +139,71 @@ export const FLEET_TOOLS = [
   },
 ]
 
+// ── WO-126: decision cards (seam claude-epeius/knowledge/lane-mailbox-seam.md v2; Joey TG chiron:2095) ──────────────────
+// The main's mailbox is the one list of what waits on the main's decision. A lane opens an item there (decide_later) or the mail lane puts a
+// card on a colleague's mail (mailbox_card); the main answers once (mailbox_decide); the agent-inbox daemon hands the answer to the router.
+const CARD_PROPS = {
+  decide: { type: 'string', description: '要主線決定什麼，一句' },
+  deadline: { type: 'string', description: '選填：決定的期限，ISO-8601 或「幾小時後」；沒填＝分身的件 1 小時、同事的信照信的期限' },
+  facts: { type: 'string', description: '關鍵事實與出處；長的寫成檔，這裡放檔案位置' },
+  recommend: { type: 'string', description: '你的建議，一句' },
+  basis: { type: 'string', description: '建議的根據' },
+  then: { type: 'string', description: '主線說好之後你會做什麼' },
+}
+export const CARD_SCHEMA = { type: 'object', required: ['decide', 'recommend'], properties: CARD_PROPS }
+export const DECIDE_TOOL = {
+  name: 'mailbox_decide',
+  description: '回一件等你決定的事（信箱清單上帶「要你決定」的那幾件）：照建議、改成…、或不做。只能回一次；回了，放這件的分身接著做完並向 Joey 回報。',
+  inputSchema: {
+    type: 'object',
+    required: ['id', 'decision'],
+    properties: {
+      id: { type: 'integer', description: '那一件的編號' },
+      decision: { type: 'string', enum: ['as_recommended', 'changed', 'declined'], description: 'as_recommended 照建議｜changed 改成（note 寫改成什麼）｜declined 不做' },
+      note: { type: 'string', description: 'changed 必填：改成什麼；另外兩種可以補一句' },
+    },
+  },
+}
+/** the lanes' two calls (Sonn's decide_later and mailbox_card reach them through /lanes/mail-tool with openBy 'lane') */
+export const LANE_DECIDE_LATER_TOOL = {
+  name: 'decide_later',
+  description: '把一件要主線決定的事放進主線的信箱（附決定卡），主線回決定後交回你這條線接著做。同一件事只開一次（ref）。',
+  inputSchema: {
+    type: 'object',
+    required: ['title', 'card'],
+    properties: {
+      title: { type: 'string', description: '50 字內：誰、對什麼、要主線決定什麼' },
+      card: CARD_SCHEMA,
+      deadline: { type: 'string', description: '選填：期限，ISO-8601 或「幾小時後」；沒填是 1 小時' },
+      ref: { type: 'string', description: '這件事的事件 id；同一個 ref 只能開一件' },
+      thread: { type: 'string', description: '這條線的對話 id（決定回來時照它找接手的線）' },
+    },
+  },
+}
+export const MAILBOX_CARD_TOOL = {
+  name: 'mailbox_card',
+  description: '在一封要主線決定的同事來信上附決定卡。每封只能附一張；寄件人看到的狀態不會因此多任何字。',
+  inputSchema: {
+    type: 'object',
+    required: ['id', 'card'],
+    properties: { id: { type: 'integer', description: '信的編號' }, card: CARD_SCHEMA, thread: { type: 'string', description: '這條線的對話 id' } },
+  },
+}
+const DECISION_WORDS: Record<string, string> = { as_recommended: '照建議', changed: '改成', declined: '不做' }
+const decisionText = (d: string, note?: string | null) => d === 'changed' ? `改成：${note ?? ''}` : `${DECISION_WORDS[d] ?? d}${note ? `（${note}）` : ''}`
+/** one card, the five boxes, for mailbox_open */
+function cardBlock(m: any): string {
+  const c = m.card ?? {}
+  const who = m.from_lane ? `分身 ${m.from_lane} 放的件` : `${m.card_lane ?? '車道'} 附的卡`
+  const out = [`── 決定卡（${who}，${hm(m.card_at)}）──`, `要你決定：${c.decide ?? ''}`, `期限：${hm(c.deadline)}`]
+  if (c.facts) out.push(`關鍵事實：${c.facts}`)
+  out.push(`建議：${c.recommend ?? ''}`)
+  if (c.basis) out.push(`根據：${c.basis}`)
+  if (c.then) out.push(`說好之後：${c.then}`)
+  out.push(m.decision ? `已決定（${hm(m.decided_at)}）：${decisionText(m.decision, m.note)}` : '用 mailbox_decide 回：照建議（as_recommended）、改成…（changed＋note）、不做（declined）。')
+  return out.join('\n')
+}
+
 const text = (s: string, isError = false) => ({ content: [{ type: 'text', text: s }], ...(isError ? { isError: true } : {}) })
 
 function hm(iso?: string | null): string {
@@ -242,11 +311,17 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const unread = mail.filter(m => m.status === 'unread').length
       const laneRead = mail.filter(m => m.status === 'lane_read').length   // WO-124: the lane opened it, the main has not
       const st = (m: any) => m.status === 'unread' ? '未讀' : m.status === 'lane_read' ? `車道讀過 ${hm(m.lane_read_at)}（主線還沒打開）` : '已讀'
-      const lines = mail.map(m => `#${m.id}｜${m.from}｜${m.title}${m.ask ? `｜要你：${m.ask}` : ''}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${st(m)}${m.no_reply ? '｜不用回' : ''}`)
+      // WO-126: a card's line says what to decide, by when, and the recommendation (the card's deadline, not the mail's)
+      const line = (m: any) => m.card
+        ? `#${m.id}｜${m.from_lane ? `${m.from}（分身 ${m.from_lane}）` : m.from}｜${m.title}｜要你決定：${m.card.decide}｜決定期限 ${hm(m.card.deadline)}｜建議：${m.card.recommend}`
+          + (m.decision ? `｜已決定：${DECISION_WORDS[m.decision] ?? m.decision}` : '') + `｜等了 ${m.waited}${m.from_lane ? '' : `｜${st(m)}`}`
+        : `#${m.id}｜${m.from}｜${m.title}${m.ask ? `｜要你：${m.ask}` : ''}｜期限 ${hm(m.deadline)}｜等了 ${m.waited}｜${st(m)}${m.no_reply ? '｜不用回' : ''}`
+      const lines = mail.map(line)
       const head = laneRead
         ? `${unread} 封未讀、${laneRead} 封車道讀過（等主線）、${mail.length - unread - laneRead} 封已讀還沒勾掉：`
         : `${unread} 封未讀、${mail.length - unread} 封已讀還沒勾掉：`
-      return text(`${head}\n${lines.join('\n')}`)
+      const waiting = mail.filter(m => m.card && !m.decision).length
+      return text(`${head}${waiting ? `\n其中 ${waiting} 件等你決定（mailbox_decide 回）。` : ''}\n${lines.join('\n')}`)
     }
     case 'mailbox_open': {
       const id = intId(args.id)
@@ -257,7 +332,10 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const m = r.json
       const who = deps.openBy === 'lane' ? '｜車道讀過（寄件人看到的是車道讀過，不是主線已讀）'
         : m.lane_read_at ? `｜車道 ${hm(m.lane_read_at)} 先讀過` : ''
-      return text(`#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}${who}\n\n${m.body}`)
+      const head = `#${m.id} 來自 ${m.from}｜${m.title}\n${m.ask ? `要你：${m.ask}\n` : ''}期限 ${hm(m.deadline)}｜等了 ${m.waited}${m.no_reply ? '｜不用回' : ''}${m.reply_to_id ? `｜回覆 #${m.reply_to_id}` : ''}${who}`
+      // WO-126: the card and the original; a lane item's body is its card, shown once
+      if (m.card) return text(m.from_lane ? `${head}\n\n${cardBlock(m)}` : `${head}\n\n${cardBlock(m)}\n\n── 原信 ──\n${m.body}`)
+      return text(`${head}\n\n${m.body}`)
     }
     case 'mailbox_check': {
       const id = intId(args.id)
@@ -294,6 +372,40 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
           : m.status === 'pushed' ? '已直接送進 session（對方信箱沒開）' : String(m.status)
         return `#${m.id}｜給 ${m.to}｜${m.title}｜期限 ${hm(m.deadline)}｜${st}`
       }).join('\n'))
+    }
+    case 'mailbox_decide': {
+      if (deps.openBy === 'lane') return text('只有主線回決定。這件做不下去，整件交給主線（handoff_main）；不能再開第二張卡。', true)
+      const id = intId(args.id)
+      const decision = String(args.decision ?? '').trim()
+      if (!id || !decision) return text('mailbox_decide: id 和 decision 都要填（as_recommended｜changed｜declined）', true)
+      const note = args.note != null && String(args.note).trim() ? String(args.note).trim() : undefined
+      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/decide`, { decision, ...(note ? { note } : {}) })
+      if (r.status !== 200) return text(`沒有記下：${errText(r)}`, true)
+      const j = r.json
+      const said = `#${id} 記下決定：${decisionText(j.decision, j.note)}。`
+      if (!deps.mailEvent) return text(`${said}車道沒開：照這個決定自己做完（回信、勾掉）。`)
+      const how = await deps.mailEvent(j).catch(() => 'queued' as const)
+      const who = j.lane ? `${j.lane}${j.thread ? `（${j.thread}）` : ''}` : '分身'
+      return text(how === 'handed' ? `${said}已交給 ${who} 接著做完，它會向 Joey 回報。`
+        : `${said}分流器現在連不上，決定排著，連上就交給 ${who}；不用再回一次。`)
+    }
+    case 'decide_later': case 'mailbox_card': {
+      if (deps.openBy !== 'lane' || !deps.lane) return text(`${name} 是車道的工具；主線直接決定，或寄信給自己。`, true)
+      const card = args.card && typeof args.card === 'object' ? args.card : null
+      if (!card) return text(`${name}: card 要填（decide、recommend 必填；facts、basis、then、deadline 選填）`, true)
+      const thread = args.thread ? String(args.thread).trim() : undefined
+      if (name === 'decide_later') {
+        const title = String(args.title ?? '').trim()
+        const r = await deps.btcc('POST', '/api/mesh/mail/lane-item?by=lane', { lane: deps.lane, ...(thread ? { thread } : {}), title, card,
+          ...(hoursOrIso(args.deadline) !== undefined ? { deadline: hoursOrIso(args.deadline) } : {}), ...(args.ref ? { ref: String(args.ref) } : {}) })
+        if (r.status !== 200) return text(`沒有放進信箱：${errText(r)}`, true)
+        return text(`放進主線的信箱了（#${r.json.id}，期限 ${hm(r.json.deadline)}）。主線回決定後，這件會交回 ${thread ?? deps.lane} 接著做。${r.json.title_truncated ? CUT_NOTE : ''}${r.json.card_truncated ? '卡上有格子超過 600 字，已截短；長的寫成檔、放位置。' : ''}`)
+      }
+      const id = intId(args.id)
+      if (!id) return text('mailbox_card: id 要填信的編號', true)
+      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/card?by=lane`, { lane: deps.lane, ...(thread ? { thread } : {}), card })
+      if (r.status !== 200) return text(`沒有附上：${errText(r)}`, true)
+      return text(`#${id} 附上決定卡了（決定期限 ${hm(r.json.deadline)}）。主線的清單會列出它；主線回決定後交回這條線做完。${r.json.card_truncated ? '卡上有格子超過 600 字，已截短；長的寫成檔、放位置。' : ''}`)
     }
     case 'feed_post': {
       const title = String(args.title ?? '').trim()
@@ -434,6 +546,7 @@ export async function sendToAgent(args: Record<string, unknown>, deps: FleetDeps
 export async function callInboxTool(name: string, args: Record<string, unknown>, deps: FleetDeps, legacy: boolean) {
   if (name === 'send_to_agent') return sendToAgent(args, deps, legacy)
   if (RECEIVE_NAMES.includes(name)) return callTool(name, args, deps)
+  if (name === DECIDE_TOOL.name || name === 'decide_later' || name === 'mailbox_card') return callTool(name, args, deps)   // WO-126 (the tool checks who calls)
   if (legacy && (name === 'call' || name === 'send_mail' || name === 'feed_post')) return callTool(name, args, deps)
   return text(`unknown tool: ${name}`, true)
 }

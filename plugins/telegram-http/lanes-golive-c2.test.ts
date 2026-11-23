@@ -96,12 +96,12 @@ test('C2: reply_agent is mail by default (the fleet rule words: ask required), a
 test('C2 server.ts: the agent-inbox not-main guard covers every inbox tool; the main\'s mail and feed go through the lanes checks; the mail lane\'s mailbox is the agent\'s own (fleet-mail.ts)', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   expect(src).toContain('(INBOX_ONLY ? isInboxToolName(req.params.name) : Lanes.MAIN_TELEGRAM_TOOLS.includes(req.params.name))')
-  expect(src).toContain("return INBOX_TOOLS.some(t => t.name === name) || ['call', 'send_mail', 'feed_post'].includes(name)")
+  expect(src).toContain("return [...INBOX_TOOLS, DECIDE_TOOL].some(t => t.name === name) || ['call', 'send_mail', 'feed_post'].includes(name)")   // WO-126: mailbox_decide is the main's
   const deps = src.slice(src.indexOf('function laneMainDeps('), src.indexOf('function laneMainDeps(') + 300)
   expect(deps).toContain('btcc: laneMailBtcc'); expect(deps).toContain('core: laneMainCore')
   expect(src).toContain("await Lanes.checkPeerSend('main', to, text, !!reply); if (refused) return { status: 403, json: { detail: refused } }")   // 1.34.2: a reply answers the mail
   expect(src).toContain("await Lanes.checkPeerSend('main', 'the feed wall'")
   expect(src).toContain("handleFleetRpc(m, Lanes.LANES_ON ? laneMainDeps((m as any)?.params?.arguments ?? {}) : fleetDeps)")
-  expect(src).toContain("const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane' }, false)")   // WO-124: the lane's open is 車道讀過
+  expect(src).toContain("const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane', lane }, false)")   // WO-124: the lane's open is 車道讀過; WO-126: the lane id
   expect(src).toContain("await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true)")
 })

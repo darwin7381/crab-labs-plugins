@@ -14,7 +14,8 @@ import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
 import { HubSync, drainLeftoverDoorbells, hubSyncMode } from './hub-sync.ts'
-import { callInboxTool, handleFleetRpc, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
+import { callInboxTool, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
+import { MailEvents, decisionEvent, WITHIN_S as MAIL_DUE_WITHIN_S } from './mail-events.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
@@ -1572,7 +1573,7 @@ function withLaneSendProps<T extends { inputSchema: { properties: Record<string,
 }
 /** every tool of the agent-inbox server (WO-99 v3) and the old names it still answers while A2A_LEGACY is on */
 function isInboxToolName(name: string): boolean {
-  return INBOX_TOOLS.some(t => t.name === name) || ['call', 'send_mail', 'feed_post'].includes(name)
+  return [...INBOX_TOOLS, DECIDE_TOOL].some(t => t.name === name) || ['call', 'send_mail', 'feed_post'].includes(name)
 }
 // lanes-golive (C2): the main's mail and feed leave through the same lanes checks as its calls: the disclosure check before anything is sent (to the
 // mail's addressee, the original sender of a mail it answers, or the wall), and the outbound note after (the promise check, the answer it meets).
@@ -1601,11 +1602,24 @@ async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown
   }
   return coreFeed(method, path, body, timeoutMs)
 }
+// WO-126 (seam claude-epeius/knowledge/lane-mailbox-seam.md v2): the agent-inbox daemon hands the lane router the mailbox's two events: the main's
+// decision (mailbox_decide → mail_decision) and the cards entering the due window (GET /due every minute → mail_due). One the router cannot take
+// now waits in <state>/mail-events.json and goes on the next tick. Lanes off: no events (the main does what it decided itself).
+const mailEvents = INBOX_ONLY && Lanes.LANES_ON
+  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
+  : null
+if (mailEvents) {
+  const fetchDue = async () => { const r = await btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`).catch(() => null); return r?.status === 200 && Array.isArray(r.json?.due) ? r.json.due : null }
+  const tick = () => void mailEvents.tick(fetchDue).catch(e => log('warn', `mail-events tick: ${e}`))
+  setTimeout(tick, 15_000).unref?.()
+  setInterval(tick, 60_000).unref?.()
+}
 function laneMainDeps(args: Record<string, unknown>): FleetDeps {
   return {
     ...fleetDeps,
     btcc: laneMailBtcc,
     core: laneMainCore,
+    ...(mailEvents ? { mailEvent: (decided: any) => mailEvents.emit(decisionEvent(decided)) } : {}),
     call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => {
       // 002: the main's sends carry thread/hop; a quote-reply continues the thread it answers
       let thread = typeof args.thread === 'string' && args.thread.trim() ? args.thread.trim() : undefined
@@ -1915,7 +1929,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      const r = await coreFeed('GET', '/api/feed/me', undefined, 1500)
      ask = r.status === 200 && r.json?.ask === true
    } catch {}
-   const tools = INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask)
+   // WO-126: mailbox_decide only with lanes on (a card exists only where lanes put one)
+   const tools = [...INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask), ...(Lanes.LANES_ON ? [DECIDE_TOOL] : [])]
    // lanes (002) on top of WO-99: thread / hop on send_to_agent, read only on the call line (laneMainDeps below)
    return { tools: Lanes.LANES_ON ? tools.map(t => t.name === 'send_to_agent' ? withLaneSendProps(t) : t) : tools }
  }
@@ -3908,7 +3923,7 @@ if (Lanes.LANES_ON) {
           if (to) { const refused = await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true); if (refused) return { text: refused, isError: true, to } }   // a reply answers the mail
         }
         // WO-124: the mail lane's opens are 車道讀過 (BTCC by=lane), not the main's read
-        const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane' }, false)
+        const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane', lane }, false)   // WO-126: a lane item / a card names the lane
         return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(to ? { to } : {}) }
       },
       schedulerCall: async (runId, action, outcome, summary) => {

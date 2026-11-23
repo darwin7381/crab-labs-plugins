@@ -1,3 +1,26 @@
+## 1.37.1 — 2026-11-24
+
+- **The mailbox side of the lane boundary: decision cards, the main's decision, the router's two events (WO-126; agent-inbox 1.7.1 carries the same code).**
+  - **Why:** Joey TG chiron:2095 「那就試試看吧、記得同步紀錄觀察點」 on the lane-boundary design: what waits on the main's decision has one list, the main's
+    mailbox, and the main answers once while the lane does the rest. Seam agreed with Sonn (#10963): `claude-epeius/knowledge/lane-mailbox-seam.md` v2.
+    BTCC `a3b7aac` holds the data and the endpoints (`/lane-item`, `/{id}/card`, `/{id}/decide`, `/due`, `/decisions/metrics`).
+  - **The main (agent-inbox server, lanes on only):** new tool `mailbox_decide(id, decision, note?)`: as_recommended | changed (note says to what) |
+    declined; once only (BTCC 409), never from a lane (the tool refuses it, BTCC answers 403 to by=lane). `mailbox_list` gives a card one line
+    (要你決定／決定期限／建議, 已決定 once answered; 「其中 N 件等你決定」 under the head); `mailbox_open` shows the card's five boxes, then the
+    original (a lane item's body is its card, shown once). Mail without a card reads exactly as before.
+  - **The lanes:** `callInboxTool` answers `decide_later` (→ `POST /lane-item?by=lane`) and `mailbox_card` (→ `POST /{id}/card?by=lane`) when called
+    with openBy 'lane' and the lane id (server.ts mailTool now passes it). Their schemas are exported (`LANE_DECIDE_LATER_TOOL`, `MAILBOX_CARD_TOOL`,
+    `CARD_SCHEMA`); the lane tools themselves and `MAIL_LANE_TOOL_NAMES` are Sonn's step ②.
+  - **The events (`mail-events.ts`):** after a decision, the agent-inbox daemon hands the router `mail_decision` (id `mail-decision-<mail_id>`); every
+    60 s it reads `GET /due?within=900` and hands each card new to that window over as `mail_due` (id `mail-due-<mail_id>-<deadline>`). Both go by
+    `routeRemote` → the tg daemon's `/lanes/route`. One the router does not take waits in `<state>/mail-events.json`, in order, and goes again on
+    the next tick. Each carries a readable text and a channel notification: a router with no rule for source `mail` (today's) gives it to the main
+    as one item (test `lanes-mail-events`: no lane, nothing to Telegram). Lanes off: no poller, no events; the decide answer says to do it oneself.
+  - Tests: `mail-events` (shape, ids, waiting through a restart, the due window), `fleet-mail-wo126` (list, open, decide, the lanes' calls, who may
+    call what), `lanes-mail-events`; `lanes-golive-c2` pins the two changed server.ts lines.
+  - **Not verified here:** a live card end to end needs Sonn's lane tools (step ②); until then nothing creates a card, `/due` is empty, and no
+    event is sent.
+
 ## 1.37.0 — 2026-11-24
 
 - **Lanes on: the lanes' boundary, first step (WO-125; Joey 「那就試試看吧、記得同步紀錄觀察點」, TG chiron:2095; agent-inbox 1.7.0 carries the same code).**
