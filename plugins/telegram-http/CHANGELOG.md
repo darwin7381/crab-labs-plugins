@@ -1,3 +1,37 @@
+## 1.34.1 — 2026-11-23
+
+- **A usage-limit wall is one state: nothing is pushed into a walled session, each held item is delivered once after
+  the clear, and Joey's phone gets two alerts per wall** (WO-120, Chiron; Joey TG chiron:2001).
+  - **Why:** inside a wall every input gets the synthetic limit error. Every delivery path kept pushing (re-deliveries
+    every 10 min up to 3, then quarantine; hub rows; keep-warm), and system-alert pushed a phone alert every 10 minutes
+    for the whole wall (one 28 h wall: 649 alerts fleet-wide in a week).
+  - **The state** is decided by `usage_wall.py` (JCS `tools/harness/`), `~/.claude/usage-wall/<tmux key>.json`;
+    `usage-wall.ts` only reads it. It is trusted only while `updated_at` is under 180 s old and `<dir>/OFF` is absent;
+    `USAGE_WALL_READ=0` turns reading off; `USAGE_WALL_DIR` moves it. Otherwise everything behaves as 1.34.0. A daemon's
+    file: `tmux` = `CHANNEL_BOT_TMUX_SESSION`, or `agent` = `AGENT_INBOX_SELF`, or the transcript's dir = this daemon's.
+  - **Hold (both daemons, `server.ts`):** while walled, live dispatch parks in `inbox/pending` (no re-delivery attempt
+    counted, never quarantined; the same item re-sent is held once), the drain and session-ready replay deliver nothing,
+    hub rows are not pushed (they stay untaken at the hub). A delivery the wall ate just before the state flipped is
+    re-persisted once under its own time and not counted toward `MAX_REDELIVERIES`; a hub push it ate is not counted as
+    seen or as a push. At the clear the drain runs at once and delivers each held item once, in order. One disk replay at
+    a time. No stuck-park alert while a wall holds items on purpose. `/healthz` shows `usage_wall`.
+  - **Held count:** `<key>.held-<tg|inbox>.json` (`redelivers`, `episode`, `count`, `oldest`, `held_at_clear`,
+    `drained_at`): written from the first wall a daemon sees, `count: 0` after the drain, never removed.
+  - **system-alert (tg daemon, `SYSTEM_ALERT_FORWARD=1`):** inside a wall API-error texts are not forwarded one by one;
+    per episode one enter alert (today's format, the state's error line) and one clear alert
+    「✅ <agent> 用量上限解除（HH:MM，<how>）；卡住期間累積 N 件，現在逐一送進去。」(N from both sidecars), kept in
+    `<state dir>/usage-wall-alerts.json` so a restart doesn't repeat them. A reopened episode sends nothing until its
+    next clear. Other alerts unchanged.
+  - **With lanes on (`GENESIS_LANES=1`)** the router and M1 stay the one entrance into the main (state journal, lanes-golive): no hold is added in
+    front of them. The hold stays on the paths that still write into a session directly (the `broadcastNotification` fallback, its memQueue flush,
+    the sweep of those deliveries); hub sync's hold and eaten-push rule apply only to `pushToReadySessions` (lanes off), and the disk replay keeps
+    lanes' own single flight and hands parked items to the router. WallAlerts is the one sender of the main's usage-wall pushes: lanes'
+    `main-wall-up` / `main-wall-down` go to the lanes ledger (`+usage-wall`) when the state is fresh and the kind is `rate_limit` / `billing_error`
+    (`LanesDeps.wallNoticeOwned`); a `main-wall-up` lanes pushed before the state existed makes WallAlerts record that enter instead of pushing it
+    again. The TUI relay goes WO-120's route first, then lanes' defer. The clear's N includes what M1 holds for the main (`mainHeldCount`).
+  - **keepwarm-local:** a fresh state decides "walled" instead of the transcript scan.
+  - Tests: `usage-wall.test.ts`, `usage-wall.daemon.test.ts` (a real agent-inbox daemon and MCP client), additions in
+    `hub-sync.test.ts`, `system-alert.test.ts`, `keepwarm-local.test.ts`.
 ## 1.34.0 — 2026-11-23
 
 - **Lanes (多分身): an agent can keep one long-lived main session and hand routine events to short headless lane sessions. OFF by default; with it off the plugin behaves like 1.33.2** (Joey TG sonn:7783 / 7795 / 7802 / 7811, chiron:2001 / 2013).
