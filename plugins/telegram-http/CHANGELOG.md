@@ -38,6 +38,13 @@
     title, the topic, Joey's words of the opening turn and the brief; its 〔車道資訊〕 says to read it first and update it at checkpoints.
     `lane-guard-hook.py` lets the open worker write that one path and nothing else under `knowledge/`. `open_worker` gives the main the path
     for `knowledge/REANCHOR.md` (the main is that file's only writer). Other lanes: unchanged.
+  - **6. Lane lines to Joey render like the main's replies.** The live test on the test bot showed a worker's report in its topic as raw
+    markdown (`## …`, table pipes, `**…**`): lane lines and router notices went out as plain `sendMessage`. They now use the main's `reply`
+    send (`server.ts sendTextParts`): `sendRichMessage` first, the plain fallback once on a rendering error (never on a timeout), chunked as
+    the main's, the topic on every part, ring / silent as before (and no longer cut at 4,000 characters). The label (〔agent·工作線#n〕)
+    stays its own first line: its GFM characters are escaped (`sonn_lab` → `sonn\_lab`) and a blank line separates it from the body; the
+    plain fallback is label, line break, body, as before. The lane card says GFM is rendered (headings, lists, tables, bold, code), as the
+    main's reply tool does. One info line per delivered lane line (method, chat, message id, topic, ms; never the text). Lanes off: unchanged.
 - **Always (lanes on or off): a Telegram send that gets no answer fails in bounded time.** 11-23 19:19 TPE the channel bot's `reply` (rich
   text, `callBotApi`'s bare `fetch`) had no result for over 120 s with nothing in the log, while getMe answered in 0.7 s. Every Bot API
   call that delivers something to a chat (`sendMessage`, `sendRichMessage`, `sendPhoto`, `sendDocument`, `sendChatAction`,
@@ -46,8 +53,8 @@
   have been delivered, and it was not sent again (the rich → plain fallbacks of `reply` and `edit_message` do not run on it). One warn line
   per timeout (method, elapsed); one info line per message the main's `reply` delivered (method, chat, message id, topic, ms); never the
   text. `getUpdates` keeps grammy's long poll.
-- Tests: `lanes-topics-mode`, `-target`, `-send`, `-sendtimeout`, `-model`, `-lifecycle`, `-anchor`; the daemon tests run a real
-  `server.ts` against a Bot API stand-in (`test-fixtures/tg-bot-api-mock.ts`, `tg-daemon.ts`), lanes on and off. Full suite 854 (851 pass, 3 skip, 0 fail; 1.34.3: 811, 808 pass, 3 skip).
+- Tests: `lanes-topics-mode`, `-target`, `-send`, `-sendtimeout`, `-model`, `-lifecycle`, `-anchor`, `-richlines`; the daemon tests run a real
+  `server.ts` against a Bot API stand-in (`test-fixtures/tg-bot-api-mock.ts`, `tg-daemon.ts`), lanes on and off. Full suite 858 (855 pass, 3 skip, 0 fail; 1.34.3: 811, 808 pass, 3 skip).
 
 ## 1.34.3 — 2026-11-23
 

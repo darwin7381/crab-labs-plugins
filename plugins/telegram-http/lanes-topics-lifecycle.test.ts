@@ -149,8 +149,9 @@ test('daemon: createForumTopic with the plain name; the close looks the ✅ up, 
     expect(await untilA(() => api.of('editForumTopic').length === 1, 15000)).toBe(true)
     expect(api.of('getForumTopicIconStickers').length).toBe(1)
     expect(api.of('editForumTopic')[0].body).toEqual({ chat_id: '1828', message_thread_id: topic, icon_custom_emoji_id: ICON_CHECK })
-    expect(await untilA(() => api.of('sendMessage').some(c => String(c.body.text).includes('這條工作線結束了')))).toBe(true)
-    const line = api.of('sendMessage').find(c => String(c.body.text).includes('這條工作線結束了'))!
+    // rich lane lines: the closing line goes as a rendered message, like the main's reply (lanes-topics-richlines.test.ts)
+    expect(await untilA(() => api.of('sendRichMessage').some(c => String(c.body.rich_message?.markdown).includes('這條工作線結束了')))).toBe(true)
+    const line = api.of('sendRichMessage').find(c => String(c.body.rich_message?.markdown).includes('這條工作線結束了'))!
     expect(line.body).toMatchObject({ message_thread_id: topic, disable_notification: true })
     expect(api.calls.some(c => c.method === 'deleteForumTopic' || c.method === 'closeForumTopic')).toBe(false)
     // later, in the finished topic: the main's item (no lane), its meta naming the topic

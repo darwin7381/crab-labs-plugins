@@ -755,6 +755,71 @@ async function sendTextWithMaybeKeyboard(
   }
 }
 
+/**
+ * THE text send to a chat: the main's `reply` and (lanes on) every lane line and router notice (sendBot). Each part goes as a Rich Message (GFM
+ * rendered) when `useRich`, and as a plain sendMessage when the rich send fails for any reason but the item-7 timeout (it may have been delivered:
+ * never sent twice). `rich[i]` / `plain[i]` are the same part in each form (a lane line's label is written differently in each). reply_parameters on
+ * the first part (every part with `replyAll`); `quiet` and the topic on every part. A failure says how many parts had gone out.
+ */
+async function sendTextParts(chat_id: string, parts: { rich: string[]; plain: string[] }, o: {
+  what: string; useRich: boolean; parseMode?: 'MarkdownV2'; quiet: { disable_notification?: boolean }; topicF: { message_thread_id?: number }
+  replyParams?: Record<string, unknown>; replyAll?: boolean; sentLog?: (method: string, id: unknown, t0: number) => void
+}): Promise<number[]> {
+  const sentIds: number[] = []
+  const { quiet, topicF, parseMode } = o
+  const n = parts.plain.length
+  try {
+    for (let i = 0; i < n; i++) {
+      const shouldReplyTo = !!o.replyParams && (o.replyAll || i === 0)
+      if (o.useRich) {
+        const t0 = Date.now()
+        try {
+          const r = await callBotApi('sendRichMessage', {
+            chat_id,
+            rich_message: { markdown: parts.rich[i] },
+            ...(shouldReplyTo ? { reply_parameters: o.replyParams } : {}),
+            ...quiet,
+            ...topicF,
+          })
+          sentIds.push(r.message_id)
+          o.sentLog?.('sendRichMessage', r.message_id, t0)
+          continue
+        } catch (re) {
+          if (re instanceof SendTimeoutError) throw re          // item 7: it may have been delivered: never sent again as plain text
+          log('warn', `sendRichMessage failed, falling back to plain: ${re instanceof Error ? re.message : re}`)
+        }
+      }
+      const t0 = Date.now()
+      const sent = await bot.api.sendMessage(chat_id, parts.plain[i], {
+        ...(shouldReplyTo ? { reply_parameters: o.replyParams as { message_id: number } } : {}),
+        ...(parseMode ? { parse_mode: parseMode } : {}),
+        ...quiet,
+        ...topicF,
+      })
+      sentIds.push(sent.message_id)
+      o.sentLog?.('sendMessage', sent.message_id, t0)
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new Error(`${o.what} failed after ${sentIds.length} of ${n} chunk(s) sent: ${msg}`)
+  }
+  return sentIds
+}
+
+/** lanes-topics (rich lane lines): a lane line's label (〔agent·工作線#2〕, written by pushJoey) as its own first paragraph of the rendered part: the GFM
+ *  characters that could act in it are escaped (a fleet name is [a-z0-9-]: normally there is none) and a blank line keeps it off the body's first
+ *  paragraph. The plain form is the label, a line break, the body, as before. */
+function laneLabelMd(label: string): string { return label.replace(/[\\`*_~[\]<>|]/g, '\\$&') }
+function laneLineParts(label: string, body: string, limit: number, useRich: boolean): { rich: string[]; plain: string[] } {
+  const room = Math.max(1, limit - (label ? [...label].length + 2 : 0))
+  const chunks = chunk(body, room, useRich ? 'newline' : 'length')
+  if (!chunks.length) chunks.push('')
+  return {
+    rich: chunks.map((c, i) => i === 0 && label ? `${laneLabelMd(label)}\n\n${c}` : c),
+    plain: chunks.map((c, i) => i === 0 && label ? `${label}\n${c}` : c),
+  }
+}
+
 // .jpg/.jpeg/.png/.gif/.webp go as photos (Telegram compresses + shows inline);
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
@@ -1993,51 +2058,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const mode = useRich ? 'newline' : (access.chunkMode ?? 'length')
         const replyMode = access.replyToMode ?? 'first'
         const chunks = chunk(text, limit, mode)
-        const sentIds: number[] = []
         // lanes-topics (item 7): one line per message the reply delivered (method, chat, id, topic, ms; never the text), so an incident can be read from the log
         const sentLog = (method: string, id: unknown, t0: number): void =>
           log('info', `reply sent: method=${method} chat=${chat_id} message=${id ?? '?'} topic=${topicF.message_thread_id ?? '-'} ms=${Date.now() - t0}`)
-
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            if (useRich) {
-              const t0 = Date.now()
-              try {
-                const r = await callBotApi('sendRichMessage', {
-                  chat_id,
-                  rich_message: { markdown: chunks[i] },
-                  ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-                  ...quiet,
-                  ...topicF,
-                })
-                sentIds.push(r.message_id)
-                sentLog('sendRichMessage', r.message_id, t0)
-                continue
-              } catch (re) {
-                if (re instanceof SendTimeoutError) throw re          // item 7: it may have been delivered: never sent again as plain text
-                log('warn', `sendRichMessage failed, falling back to plain: ${re instanceof Error ? re.message : re}`)
-              }
-            }
-            const t0 = Date.now()
-            const sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-              ...quiet,
-              ...topicF,
-            })
-            sentIds.push(sent.message_id)
-            sentLog('sendMessage', sent.message_id, t0)
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
-        }
+        // the one text send (sendTextParts), shared with the lane lines
+        const sentIds = await sendTextParts(chat_id, { rich: chunks, plain: chunks }, { what: 'reply', useRich, parseMode, quiet, topicF, sentLog,
+          replyParams: reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined, replyAll: replyMode === 'all' })
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
@@ -3878,13 +3904,18 @@ if (Lanes.LANES_ON) {
       sendBot: async (chat, text, o) => {
         // lanes-topics (item 2): a lane's line carries its lane's topic (explicit); the router's notices the topic of the message they answer, if any
         const tf = topicFields({ chat, topic: o.topic, replyTo: o.replyTo })
-        const m = await bot.api.sendMessage(chat, text.slice(0, 4000), {
-          ...(o.silent ? { disable_notification: true } : {}),
-          ...tf,
-          ...(o.replyTo ? { reply_parameters: { message_id: o.replyTo, allow_sending_without_reply: true } } : {}),   // 002k (E4): a deleted message must not lose the notice
+        // lanes-topics (rich lane lines): the same send as the main's reply (GFM rendered, plain on a rendering error, chunked, bounded); the label
+        // pushJoey wrote as the first line stays its own first line (laneLineParts)
+        const label = o.label && text.startsWith(`${o.label}\n`) ? o.label : ''
+        const access = loadAccess(), useRich = isRichEnabled()
+        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+        const ids = await sendTextParts(chat, laneLineParts(label, label ? text.slice(label.length + 1) : text, limit, useRich), {
+          what: 'lane line', useRich, quiet: o.silent ? { disable_notification: true } : {}, topicF: tf,
+          replyParams: o.replyTo ? { message_id: o.replyTo, allow_sending_without_reply: true } : undefined,   // 002k (E4): a deleted message must not lose the notice
+          sentLog: (method, id, t0) => log('info', `lane line sent: method=${method} chat=${chat} message=${id ?? '?'} topic=${tf.message_thread_id ?? '-'} ms=${Date.now() - t0}`),
         })
-        sentIn(chat, [m.message_id], tf)
-        return m.message_id
+        sentIn(chat, ids, tf)
+        return ids[0]
       },
       // lanes-golive: a worker lane's topic in Joey's private chat (Bot API: the bot's topic mode on, createForumTopic with the user's chat id)
       createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,

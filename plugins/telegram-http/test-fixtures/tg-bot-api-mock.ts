@@ -8,6 +8,8 @@ export type BotApiMock = {
   polls: Array<{ start: number; end?: number }>
   /** calls this returns true for are never answered (the request stays open) */
   hang: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
+  /** calls this returns true for are answered 400 (as a markdown the rich renderer cannot take) */
+  fail: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
   push: (u: Record<string, any>) => void
   of: (method: string) => Call[]
   stop: () => void
@@ -20,6 +22,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
   const calls: Call[] = []
   const polls: Array<{ start: number; end?: number }> = []
   const hang: BotApiMock['hang'] = { fn: null }
+  const fail: BotApiMock['fail'] = { fn: null }
   const updates: Record<string, any>[] = []
   let nextUpdate = 1, nextMsg = 5000, nextTopic = 7000
   const state = { id: 999, is_bot: true, first_name: 'lab', username: 'lab_test_bot', has_topics_enabled: false, allows_users_to_create_topics: false, ...me }
@@ -43,6 +46,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     for (const k of ['reply_parameters', 'reply_markup', 'rich_message']) if (typeof body[k] === 'string') { try { body[k] = JSON.parse(body[k]) } catch {} }
     if (method !== 'getUpdates') calls.push({ method, body, at: Date.now() })
     if (hang.fn?.(method, body)) return new Promise<Response>(() => {})
+    if (fail.fn?.(method, body)) return Response.json({ ok: false, error_code: 400, description: "Bad Request: can't parse the rich message" }, { status: 400 })
     switch (method) {
       case 'getMe': return ok({ ...state })
       case 'getUpdates': {
@@ -69,7 +73,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     }
   } })
   return {
-    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang,
+    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail,
     push: (u) => { updates.push({ update_id: nextUpdate++, ...u }) },
     of: (method) => calls.filter(c => c.method === method),
     stop: () => server.stop(true),
