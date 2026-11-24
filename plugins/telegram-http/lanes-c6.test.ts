@@ -1,10 +1,12 @@
 // Universe 002k (C6): a follow-up chain stops by program: a run cap, and no next follow-up when a run found what the previous one found.
 // The C02 case of 002j group C: a chain re-polled for 9 simulated hours while it waited for Joey (10 runs, 3.3M tokens). No network, no model.
-import { test, expect } from 'bun:test'
+import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { outcomeFingerprint, sameOutcome, FOLLOWUP_CHAIN_MAX } from './lanes-followup.ts'
+process.env.LANES_RECEIPT_STEPS = '0'                                       // 1.39.0 (WO-129) changes the scheduled receipt; this file's subject runs as 1.38.3 (lanes-wo129 tests it)
+afterAll(() => { delete process.env.LANES_RECEIPT_STEPS })
 const L = await import('./lanes.ts?c6-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-c6-'))

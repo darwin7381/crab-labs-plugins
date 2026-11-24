@@ -167,6 +167,30 @@ export function stepsRefusal(outcome: string, steps: Step[]): string {
   return `沒有記錄：steps 裡有沒做的步驟（${stepsNotDoneText(steps)}），結果不能填 ${outcome}。把沒做的那幾步交給主線，或把結果改成部分完成：`
     + '交給主線＝先 handoff_main（寫清楚哪幾步沒做、為什麼），再送這份回執，沒做的步驟照樣寫 done=false；部分完成＝outcome 填 failed（排程端記成 failed），did 寫哪幾步做了、哪幾步沒做。'
 }
+// ------------------------------------------------------------------ WO-129 (telegram-http 1.39.0): the run a schedule gave a lane has one receipt path, with steps
+// Chiron's ticket. With LANES_RECEIPT_STEPS on: a scheduled run's receipt carries steps (refused without); a lane completes a scheduled run only with the
+// receipt tool (its btcc-receipt complete, or a direct call of the completion API the guard sees, is refused with a pointer); when steps were not done,
+// the run's notify_joey ends with the steps line, in the form of the blocked-writes line. Off: 1.38.3.
+/** item 1: the refusal of a scheduled run's receipt that has no steps */
+export function missingStepsRefusal(run: string | null): string {
+  return `沒有記錄：這一趟是排程交給你的${run ? `（run ${run}）` : ''}，回執要帶 steps：把指示裡的每一步照順序列一項（step＝那一步是什麼，done＝true｜false，note＝發生了什麼或為什麼沒做）。`
+    + '條件沒成立所以不用做的步驟算做了（done=true，note 寫條件沒成立）；指示只有一件事就列一項。補上 steps，再送一次這份回執。'
+}
+/** item 2: what a lane is told when it completes a scheduled run any other way than the receipt tool (btcc-receipt complete, a direct completion call) */
+export function receiptCliPointer(run: string | null, how: 'cli' | 'api' = 'cli'): string {
+  return `This command was not run: in a lane, a scheduled run is completed only by the receipt tool: receipt(run_id=${run || '<run>'}, outcome, steps), every step of the instruction `
+    + 'in its order (step, done true|false, note). '
+    + (how === 'api' ? 'A direct call of the scheduler\'s completion API is not how a lane completes a run. ' : 'The btcc-receipt complete in your persona or in the scheduler\'s message means the receipt tool for you. ')
+    + 'btcc-receipt ack is unchanged. Nothing was sent to the scheduler; run any other part of the command on its own.'
+}
+/** item 4, the ticket's form: 〔系統〕這一趟 5 步裡 1 步沒做：第 3 步「…」 (at most 3 listed, as the blocked-writes line); '' when every step was done */
+export const STEP_IN_LINE_MAX = 40
+export function stepsLine(steps: Step[] | undefined): string {
+  const not = (steps ?? []).map((s, i) => ({ s, i })).filter(x => !x.s.done)
+  if (!not.length) return ''
+  const name = (t: string): string => { const c = Array.from(t.replace(/\s+/g, ' ').trim()); return c.length > STEP_IN_LINE_MAX ? c.slice(0, STEP_IN_LINE_MAX - 1).join('') + '…' : c.join('') }
+  return `〔系統〕這一趟 ${steps!.length} 步裡 ${not.length} 步沒做：${not.slice(0, 3).map(x => `第 ${x.i + 1} 步「${name(x.s.step)}」`).join('、')}${not.length > 3 ? ` 等 ${not.length} 步` : ''}`
+}
 /** the receipt tool when C is on: the description says how to list the steps, the schema takes them */
 export function receiptToolWithSteps(base: { name: string; description: string; inputSchema: any }): { name: string; description: string; inputSchema: any } {
   return {

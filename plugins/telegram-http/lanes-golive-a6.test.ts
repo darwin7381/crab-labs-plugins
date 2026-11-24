@@ -19,7 +19,8 @@ test('A6: no lab text in a lane\'s card (every kind) or in the main\'s context; 
   for (const kind of ['reflex', 'worker', 'fork', 'curator', 'synthesis', 'mail'] as const) {
     const card = L.identityCard({ kind })
     for (const re of LAB) expect(card).not.toMatch(re)
-    expect(card).toContain('~/.claude/tools/btcc-receipt'); expect(card).toContain('line=mail'); expect(card).toContain('line=call'); expect(card).toContain('line=feed')
+    // 1.39.0 (WO-129, the ticket's words): a lane's card names btcc-receipt complete as the receipt tool, without the fleet path (LANES_RECEIPT_STEPS=0: the path, as before)
+    expect(card).toContain('btcc-receipt complete，對你來說就是 receipt 工具'); expect(card).toContain('line=mail'); expect(card).toContain('line=call'); expect(card).toContain('line=feed')
   }
   const tools = JSON.stringify(L.laneToolsFor('mail'))
   for (const re of LAB) expect(tools).not.toMatch(re)

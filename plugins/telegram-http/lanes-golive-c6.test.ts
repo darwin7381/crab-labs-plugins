@@ -1,10 +1,12 @@
 // lanes-golive C6: what rings Joey follows the current rules (ORG-CHART §0 #2 「做了什麼就報什麼、全進 Joey 手機…永遠不是砍通知」, #5 例行無變化一句話,
 // high-frequency 只打回執). The lab's tiers (silent scheduled / peer / board / routine alert lines, a frequency cap, a quiet follow-up, a quiet line after
 // a ring, a quiet main reply) are not the fleet default: the default profile pushes every line; `tiered` stays an explicit switch (/lanes notify).
-import { test, expect } from 'bun:test'
+import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, writeFileSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+process.env.LANES_RECEIPT_STEPS = '0'                                       // 1.39.0 (WO-129) changes the scheduled receipt; this file's subject runs as 1.38.3 (lanes-wo129 tests it)
+afterAll(() => { delete process.env.LANES_RECEIPT_STEPS })
 const prev = process.env.LANES_NOTIFY_PROFILE
 delete process.env.LANES_NOTIFY_PROFILE
 const L = await import('./lanes.ts?golive-c6') as typeof import('./lanes.ts')

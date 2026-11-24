@@ -772,6 +772,47 @@ def receipt_cli_calls(cmd, depth=0):
     return out
 
 
+# ---- WO-129 (telegram-http 1.39.0): a lane completes a scheduled run only with the receipt tool (its steps)
+# With LANES_RECEIPT_STEPS=1 (the lane's env, set by the router) the router answers a lane's btcc-receipt complete with `cli_blocked` and the pointer to the
+# receipt tool (completing nothing): that answer is the whole deny reason. A Bash command that calls the scheduler's completion API itself
+# (.../api/scheduler/runs/<N>/complete) is refused the same way (the router counts it: via=api). btcc-receipt ack is not touched.
+COMPLETION_API = re.compile(r'/api/scheduler/runs/(\d+)/complete\b')
+
+
+def steps_on():
+    return os.environ.get('LANES_RECEIPT_STEPS') == '1'
+
+
+def receipt_tool_words():
+    return 'the receipt tool: receipt(run_id, outcome, steps)' if steps_on() else 'btcc-receipt complete alone, or the receipt tool with run_id'
+
+
+def lane_receipt_post(body):
+    """POST /lane-receipt with the run's token: the router's answer (dict), or None when it cannot be reached"""
+    port, tok = os.environ.get('LANES_HTTP_PORT'), os.environ.get('LANE_RUN_TOKEN')
+    if not (port and tok):
+        return None
+    req = urllib.request.Request(f'http://127.0.0.1:{port}/lane-receipt', data=json.dumps(body).encode(), method='POST',
+                                 headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {tok}'})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read() or b'{}') or {}
+    except Exception:
+        return None
+
+
+def completion_api_refusal(cmd):
+    """the deny reason for a command that calls the scheduler's completion API directly (steps on), or ''"""
+    if not steps_on():
+        return ''
+    runs = COMPLETION_API.findall(cmd)
+    if not runs:
+        return ''
+    a = lane_receipt_post({'run_id': runs[0], 'via': 'api'}) or {}
+    return str(a.get('text') or f'This command was not run: in a lane, a scheduled run is completed only by the receipt tool: receipt(run_id={runs[0]}, outcome, steps). '
+                                  'Nothing was sent to the scheduler.')
+
+
 def complete_through_daemon(calls):
     """the deny reason: what the daemon did with each completion the command asked for"""
     port, tok = os.environ.get('LANES_HTTP_PORT'), os.environ.get('LANE_RUN_TOKEN')
@@ -785,12 +826,14 @@ def complete_through_daemon(calls):
                 with urllib.request.urlopen(req, timeout=8) as r:
                     a = json.loads(r.read() or b'{}') or {}
                 # 1.38.2: a run handed to the main with the matter is the main's to complete: the router records the lane's part only
+                if a.get('cli_blocked'):                         # WO-129: the receipt tool is the lane's one way; the router's pointer says it all
+                    return str(a.get('text', ''))
                 text = ('completed: ' if a.get('ok') else 'left for the main: ' if a.get('left_for_main') else 'not completed: ') + str(a.get('text', ''))
                 refile = refile or bool(a.get('refile'))         # WO-125 (B): refused as a success while refusals count: it is filed again, as failed
             except Exception as e:
                 text = f'not completed: the router could not be reached ({type(e).__name__}); call receipt(run_id={c["run_id"]}, outcome=...)'
         else:
-            text = f'not completed: call receipt(run_id={c["run_id"]}, outcome=...)'
+            text = f'not completed: call receipt(run_id={c["run_id"]}, outcome=...{", steps=[...]" if steps_on() else ""})'
         said.append(f'run {c["run_id"] or "?"} {text}')
     return ('This command was not run: a lane completes a scheduler run through the router, the same request as the receipt tool, once per run. '
             + ' | '.join(said) + (' File the receipt again as that says (btcc-receipt complete <run> --outcome failed --note \'...\' on its own, or the receipt tool); run any other part of the command on its own.'
@@ -856,11 +899,11 @@ def receipt_refused(why, calls):
         # run stood completed before any of the work had run. The receipt is filed by a command of its own, after the work.
         return (f'This command was not run and NOTHING in it ran, the btcc-receipt complete included: scheduler run {runs} is NOT completed. '
                 'The receipt has to be a command of its own. Run the work first as separate commands, check that it worked, and then file the receipt '
-                '(btcc-receipt complete alone, or the receipt tool with run_id) only after the work is really done.')
+                f'({receipt_tool_words()}) only after the work is really done.')
     return (f'This command was refused and NOTHING in it ran, the btcc-receipt complete included: scheduler run {runs} is NOT completed. '
             f'Why it was refused: {why} '
             'Run the allowed steps as separate commands, check that they worked, and file the receipt '
-            '(btcc-receipt complete, or the receipt tool with run_id) only after the work is really done.')
+            f'({receipt_tool_words() if steps_on() else "btcc-receipt complete, or the receipt tool with run_id"}) only after the work is really done.')
 
 
 def main():
@@ -917,6 +960,10 @@ def main():
         return
     if tool == 'Bash':
         cmd = str(ti.get('command', ''))
+        api = completion_api_refusal(cmd)                                        # WO-129: a direct completion call (steps on): refused, never run
+        if api:
+            deny(api)
+            return
         calls = receipt_cli_calls(cmd)
         BLOCK['target'] = ''
         try:

@@ -8,6 +8,7 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { createServer } from 'http'
 process.env.LANES_FLOOD_CONTROL = '0'
+process.env.LANES_RECEIPT_STEPS = '0'                                       // 1.39.0 (WO-129) changes the scheduled receipt; this file's subject runs as 1.38.3 (lanes-wo129 tests it)
 // the scheduler, as the inbox daemon reaches it (POST /lanes/scheduler): PL2, a receipt is met on the scheduler's answer
 const schedSrv = createServer((req, res) => { req.resume(); req.on('end', () => res.end(JSON.stringify({ text: '{"state":"completed"}' }))) })
 await new Promise<void>(r => schedSrv.listen(0, '127.0.0.1', () => r()))
@@ -36,7 +37,7 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
   sendBot: async (_c: string, text: string) => { sent.push(text); return 100 + sent.length }, joeyChatId: () => '1' } as any)
 L.__setWallProbe(3_600_000)
 const procs: any[] = []
-afterAll(() => { schedSrv.close(); try { writeFileSync(GO, 'ok') } catch {}; for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setClaudeBin(restore); L.__setWallProbe(300_000); delete process.env.LANES_FLOOD_CONTROL })
+afterAll(() => { schedSrv.close(); try { writeFileSync(GO, 'ok') } catch {}; for (const p of procs) { try { p.kill('SIGKILL') } catch {} } L.__setClaudeBin(restore); L.__setWallProbe(300_000); delete process.env.LANES_FLOOD_CONTROL; delete process.env.LANES_RECEIPT_STEPS })
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
 const journal = (): any[] => readFileSync(join(dir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))

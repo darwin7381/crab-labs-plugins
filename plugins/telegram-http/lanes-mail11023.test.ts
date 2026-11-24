@@ -167,6 +167,8 @@ test('#11023-1, replay of run 6916: handoff_main, then the lane\'s receipt(run_i
 }, 30000)
 
 test('#11023-1, the guard hook path: btcc-receipt complete N from a lane that handed the run over is not sent to the scheduler; the deny reason says the main completes it; the lane\'s part is on the ledger', async () => {
+  process.env.LANES_RECEIPT_STEPS = '0'                                                                // 1.39.0 (WO-129): a lane's CLI completes nothing at all (lanes-wo129); 1.38.2's path
+  try {
   const r = await start(sched(6917, 'harness-journal'))
   expect(await call(r, 'handoff_main', { text: '日誌要主線寫，交給你；做完 complete 6917' })).toContain('handed to the main')
   const deny = await guard(r, "btcc-receipt complete 6917 --outcome failed --note '日誌沒寫，交主線'")
@@ -179,26 +181,30 @@ test('#11023-1, the guard hook path: btcc-receipt complete N from a lane that ha
   expect(ob(r.id, 'receipt')).toMatchObject({ state: 'handed' })
   await end(r)
   settleEv(r.id)                                                                                       // nothing left owed to the next test's main
+  } finally { delete process.env.LANES_RECEIPT_STEPS }
 }, 30000)
 
 test('#11023-1: a lane that closes the run itself (nothing handed over) completes it as before, by the receipt tool or by btcc-receipt through the guard', async () => {
   const a = await start(sched(6918, 'backup-check'))
   await call(a, 'notify_joey', { outcome: 'normal', text: '備份正常' })
-  expect(await call(a, 'receipt', { outcome: 'done', run_id: '6918', happened: '備份正常', did: '查了', promised: '無', needs_main: '無' })).toBe('receipt recorded; scheduler: complete run 6918: HTTP 200')
+  expect(await call(a, 'receipt', { outcome: 'done', run_id: '6918', happened: '備份正常', did: '查了', promised: '無', needs_main: '無', steps: [{ step: '查備份', done: true }] })).toBe('receipt recorded; scheduler: complete run 6918: HTTP 200 The line you sent before: sent to Joey (message_id 2101)')   // 1.39.0: the line waited for the receipt
   expect(completions('6918')).toMatchObject([{ outcome: 'done' }])
   expect(ledger().filter(x => x.event === a.id && x.kind === 'receipt').at(-1).refs?.left_for_main).toBeUndefined()
   await end(a)
-  const b = await start(sched(6919, 'backup-check'))
-  await call(b, 'notify_joey', { outcome: 'normal', text: '備份正常' })
-  expect(await guard(b, 'btcc-receipt complete 6919 --outcome done')).toContain('run 6919 completed: complete run 6919: HTTP 200')
-  expect(completions('6919').length).toBe(1)
-  await end(b)
+  process.env.LANES_RECEIPT_STEPS = '0'                                                                // 1.39.0 (WO-129): the CLI path is the switch-off path
+  try {
+    const b = await start(sched(6919, 'backup-check'))
+    await call(b, 'notify_joey', { outcome: 'normal', text: '備份正常' })
+    expect(await guard(b, 'btcc-receipt complete 6919 --outcome done')).toContain('run 6919 completed: complete run 6919: HTTP 200')
+    expect(completions('6919').length).toBe(1)
+    await end(b)
+  } finally { delete process.env.LANES_RECEIPT_STEPS }
 }, 30000)
 
 test('#11023-1 with decide_later (1.38.x: it hands the matter to the main): the asking run\'s receipt leaves the run open; the decision\'s run completes it', async () => {
   const r = await start(sched(6920, 'config-review'))
   expect(await call(r, 'decide_later', { title: '要不要改 log_level', card: { decide: '要不要把 log_level 改成 warn', recommend: '改' } })).toContain('The main was woken with your card')
-  expect(await call(r, 'receipt', { outcome: 'done', run_id: '6920', happened: '要主線決定', did: '放進信箱', promised: '無', needs_main: '決定' })).toContain('left for the main')
+  expect(await call(r, 'receipt', { outcome: 'done', run_id: '6920', happened: '要主線決定', did: '放進信箱', promised: '無', needs_main: '決定', steps: [{ step: '要不要改 log_level', done: false, note: '放進信箱等主線決定' }] })).toContain('left for the main')
   expect(completions('6920')).toEqual([])
   await end(r)
   const mid = [...box.keys()].at(-1)!, it = box.get(mid)
@@ -209,7 +215,7 @@ test('#11023-1 with decide_later (1.38.x: it hands the matter to the main): the 
   const dr: Run = { id: `mail-decision-${mid}`, lane: d.lane!, tok: L.__runTok(d.lane!)!, env: {} }
   expect(ob(dr.id, 'receipt')).toMatchObject({ state: 'open', run_id: '6920' })                      // the receipt moved to the decision's run
   await call(dr, 'notify_joey', { outcome: 'changed', text: 'log_level 改成 warn 了' })
-  expect(await call(dr, 'receipt', { outcome: 'done', run_id: '6920', happened: '照主線的決定', did: '改了', promised: '無', needs_main: '無' })).toBe('receipt recorded; scheduler: complete run 6920: HTTP 200')
+  expect(await call(dr, 'receipt', { outcome: 'done', run_id: '6920', happened: '照主線的決定', did: '改了', promised: '無', needs_main: '無', steps: [{ step: '改 log_level 成 warn', done: true }] })).toStartWith('receipt recorded; scheduler: complete run 6920: HTTP 200')
   expect(completions('6920').length).toBe(1)
   await end(dr)
   settleEv(r.id, dr.id)

@@ -106,6 +106,9 @@ async function hook(r: Run, tool: string, input: object, cwd = ws): Promise<{ de
 const bash = (r: Run, command: string, cwd = ws) => hook(r, 'Bash', { command }, cwd)
 const call = (r: Run, name: string, a: object) => L.callLaneTool(r.tok, name, a)
 const line = (k: number, ...targets: string[]) => B.blockedLine({ n: k, targets })
+/** 1.39.0 (WO-129): the tests of B (what the guard refused) use the 1.38 receipt paths (a receipt without steps, btcc-receipt through the router): they run with
+ *  LANES_RECEIPT_STEPS=0, which leaves B as it is; C (the steps) runs with it on, and lanes-wo129 tests the new receipt path */
+const stepsOff = async (f: () => Promise<void>): Promise<void> => { process.env.LANES_RECEIPT_STEPS = '0'; try { await f() } finally { delete process.env.LANES_RECEIPT_STEPS } }
 const DEFAULT_HEAD = '# 邊界卡（adam 的；主線寫的，你只能讀）'
 const count = (s: string, sub: string) => s.split(sub).length - 1
 /** a routine run that closes cleanly: its line and its receipt */
@@ -208,7 +211,7 @@ const REPLAYS = [
     handoff: 'run 6870 巡檢已 complete、Joey 已收一行。反射線不能寫工作區，請主線補：①cp /tmp/board_new.json 成 state/board-baseline.json ②在 knowledge/mission-registry.md 追加「巡檢 run 6870」' },
 ]
 
-for (const rp of REPLAYS) test(`WO-125 #4: replay ${rp.name}: Joey's line and the receipt carry 〔系統〕; the scheduled run is not completed as done / ok`, async () => {
+for (const rp of REPLAYS) test(`WO-125 #4: replay ${rp.name}: Joey's line and the receipt carry 〔系統〕; the scheduled run is not completed as done / ok`, () => stepsOff(async () => {
   const r = await start(sched(rp.run, rp.what))
   expect(r.env.LANES_BLOCK_FACTS).toBe('1')                                                                   // laneEnv hands the switch to the hook
   const first = await bash(r, rp.first)
@@ -248,9 +251,9 @@ for (const rp of REPLAYS) test(`WO-125 #4: replay ${rp.name}: Joey's line and th
   expect(E().get(r.id)!.blocked).toBe(line(2, rp.target))
   expect(L.activityList(undefined)).toContain(line(2, rp.target))                                             // the run's line in the main's views
   const dg = L.__digest(); if (dg) digestDone(dg)
-}, 30000)
+}), 30000)
 
-test('WO-125 #4 (B): a refusal stops counting only when a later call of the run succeeds on its target: a read of it does not; a Write, a shell write or append_file does', async () => {
+test('WO-125 #4 (B): a refusal stops counting only when a later call of the run succeeds on its target: a read of it does not; a Write, a shell write or append_file does', () => stepsOff(async () => {
   writeFileSync(join(dir, 'appendable.txt'), 'state/eng-log.md\n')
   const r = await start(sched(7001, 'eng-heartbeat'))
   expect((await bash(r, 'echo "- 心跳 ok" >> state/eng-log.md')).deny).toContain('append_file')                // a declared file: append_file only
@@ -277,9 +280,9 @@ test('WO-125 #4 (B): a refusal stops counting only when a later call of the run 
   await call(r, 'receipt', { outcome: 'failed', run_id: '7001', happened: '心跳', did: 'svc DELETE 被擋', promised: '無', needs_main: '無' })
   expect(await end(r)).toMatchObject({ blocked_n: 1, blocked_targets: ['./bin/svc DELETE mock-api/cache'] })
   rmSync(join(dir, 'appendable.txt'))
-}, 30000)
+}), 30000)
 
-test('WO-125 #4 (B): more than three targets: three are listed, then 「等 N 個」; ask_joey carries the line too', async () => {
+test('WO-125 #4 (B): more than three targets: three are listed, then 「等 N 個」; ask_joey carries the line too', () => stepsOff(async () => {
   const r = await start(sched(7002, 'cleanup'))
   for (const f of ['a.md', 'b.md', 'c.md', 'd.md']) expect((await bash(r, `echo x > state/${f}`)).deny).toContain(`state/${f}`)
   const l = line(4, 'state/a.md', 'state/b.md', 'state/c.md', 'state/d.md')
@@ -287,9 +290,9 @@ test('WO-125 #4 (B): more than three targets: three are listed, then 「等 N �
   expect(await call(r, 'ask_joey', { text: '四個狀態檔都寫不進去，要不要交主線？' })).toContain('sent to Joey')
   expect(sent.at(-1)!.text.endsWith(`\n${l}`)).toBe(true)
   expect(await end(r)).toMatchObject({ blocked_n: 4, blocked_targets: ['state/a.md', 'state/b.md', 'state/c.md'] })
-}, 30000)
+}), 30000)
 
-test('WO-125 #5: a repeated receipt refused (already completed) and a receipt chained after allowed steps are the receipt\'s own handling: no 〔系統〕 line, the outcome as filed', async () => {
+test('WO-125 #5: a repeated receipt refused (already completed) and a receipt chained after allowed steps are the receipt\'s own handling: no 〔系統〕 line, the outcome as filed', () => stepsOff(async () => {
   const r = await start(sched(7003, 'backup-check'))
   expect((await bash(r, "echo ok >> out/note.md && ~/.claude/tools/btcc-receipt complete 7003 --outcome ok")).deny).toContain('The receipt has to be a command of its own')
   expect((await bash(r, "~/.claude/tools/btcc-receipt complete 7003 --outcome ok --note '照例，無事'")).deny).toContain('run 7003 completed')
@@ -304,7 +307,7 @@ test('WO-125 #5: a repeated receipt refused (already completed) and a receipt ch
   const exit = await end(r)
   expect(exit).toMatchObject({ blocked_n: 0, blocked_targets: [] })
   expect(E().get(r.id)!.blocked).toBeUndefined()
-}, 30000)
+}), 30000)
 
 // ------------------------------------------------------------------ C: the steps
 test('WO-125 #6: a numbered schedule with step 2 skipped: done / normal are refused with the ticket\'s words and record nothing; failed (部分完成) is recorded with the step not done', async () => {
@@ -368,7 +371,8 @@ test('WO-125 #7: Joey gets as many messages with the feature as without it; only
   try { off = await scenario(7102) } finally { for (const k of SWITCHES) delete process.env[k] }
   expect(on.sentN).toBe(1); expect(off.sentN).toBe(1)
   const norm = (t: string) => t.replace(/反射線#\d+/g, '反射線#N').replace(/71\d\d/g, 'RUN')
-  expect(norm(on.texts[0])).toBe(`${norm(off.texts[0])}\n${line(1, 'state/eng-log.md')}`)
+  // 1.39.0 (WO-129, item 4): the receipt's steps not done follow on the same line Joey gets anyway, in the same form (still one message)
+  expect(norm(on.texts[0])).toBe(`${norm(off.texts[0])}\n${line(1, 'state/eng-log.md')}\n${B.stepsLine([{ step: '1. eng_check', done: true }, { step: '2. append eng-log', done: false }])}`)
 }, 30000)
 
 test('WO-125 #8: the observation points are on each run\'s exit record in lanes.jsonl', async () => {
@@ -409,7 +413,7 @@ test('WO-125 #9: all three switches off: prompts, tool results, records and the 
   } finally { for (const k of SWITCHES) delete process.env[k]; rmSync(join(dir, 'boundary.md')) }
 }, 30000)
 
-test('WO-125: the guard hook decides exactly as before whether or not it reports (same output for every command, allowed or refused)', async () => {
+test('WO-125: the guard hook decides exactly as before whether or not it reports (same output for every command, allowed or refused)', () => stepsOff(async () => {
   const r = await start(sched(7106, 'eng-heartbeat'))
   const withFacts = r, without = { ...r, env: Object.fromEntries(Object.entries(r.env).filter(([k]) => k !== 'LANES_BLOCK_FACTS')) }
   const cmds = [...REPLAYS.map(x => x.second), 'echo ok >> out/a.md', 'cat state/eng-log.md', './bin/svc GET mock-api/health', 'GENESIS_ACTOR=main ./bin/svc GET x', 'echo x >> .lanes/focus.md']
@@ -427,4 +431,4 @@ test('WO-125: the guard hook decides exactly as before whether or not it reports
     p.stdin.write(JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: ws })); p.stdin.end(); const raw = await new Response(p.stdout).text(); await p.exited; return raw }
   for (const c of [REPLAYS[0].second, 'echo ok >> out/a.md']) expect(await unreachable(c)).toBe((await bash(without, c)).raw)   // a report that fails changes nothing
   await end(r)
-}, 30000)
+}), 30000)

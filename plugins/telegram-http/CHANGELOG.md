@@ -1,3 +1,51 @@
+## 1.39.0 — 2026-11-24
+
+- **Lanes on: the run a schedule gave a lane has one receipt path, and it always carries steps; steps not done are visible to Joey and to the scheduler (board WO-129, Chiron's ticket; agent-inbox 1.9.0 carries the same code).**
+  - **What happened:** atlas.reflex.23, scheduled run 6910 (daily report, 11-24 00:07Z). The lane's `btcc-receipt complete 6910 --outcome ok` went guard
+    hook → `POST /lane-receipt` (no steps) and completed the run ok at 00:09:05Z (「run 6910: ok — 日報已發營運群(msg 2012)…（btcc-receipt）」); at 00:09:11Z it
+    handed step 3 to the main (ho-6aadec) and at 00:09:13Z its receipt said 「failed — 步驟 5 步，沒做：第 3 步「TaskList逐案核一手」」: one run, two results, the
+    scheduler's the wrong one. The scheduler's message tells every agent to run btcc-receipt complete (bt-control-center scheduler-worker/worker.py
+    191-196) and the lane card pointed lanes to it as the same receipt.
+  - **Now (`LANES_RECEIPT_STEPS`, default on; `0` = 1.38.3 with that switch off):**
+    1. In a run a schedule gave the lane (its class `scheduled`, not a follow-up run; a decision's run of such a run too), `receipt` without `steps` is
+       refused (「沒有記錄：這一趟是排程交給你的（run N），回執要帶 steps：把指示裡的每一步照順序列一項…」), nothing recorded; with steps it is accepted. Other runs
+       (mail, a peer's call, an alert): steps optional, as before.
+    2. A lane completes a scheduled run only with the receipt tool: its `btcc-receipt complete` (the guard still hands it to `/lane-receipt`) is answered
+       `cli_blocked` and completes nothing; the guard prints the router's pointer (「…completed only by the receipt tool: receipt(run_id=N, outcome, steps)…
+       btcc-receipt ack is unchanged.」). A Bash command that calls the completion API itself (`…/api/scheduler/runs/N/complete`) is refused the same way
+       (the lane's env carries `LANES_RECEIPT_STEPS=1` for the guard). `btcc-receipt ack` runs as before; the main's own `btcc-receipt complete` is not a
+       lane's and goes through (and meets a receipt handed to it, 1.38.2).
+    3. One run, one result: the only completion a lane can make is a receipt whose steps are listed, and a step not done cannot be filed as a success
+       without a hand-over (WO-125 C). The 6910 order replayed: the CLI's ok is refused, the receipt with step 3 not done and outcome done is refused,
+       after the hand-over it is accepted and left for the main: the scheduler never gets ok from the lane.
+    4. When steps were not done, the run's `notify_joey` ends with 「〔系統〕這一趟 5 步裡 1 步沒做：第 3 步「TaskList逐案核一手」」 (the blocked-writes line's
+       form: at most 3 listed, each step cut at 40 characters, then 「等 N 步」; after the blocked-writes line when both). All done: nothing added. A
+       scheduled run's `notify_joey` about the run itself that comes before the receipt (the card's order) is **held** until the receipt is accepted
+       (the answer says 「held for your receipt…」; the receipt's answer then says what the send did), at the latest until the run ends (sent then, without
+       a steps line). Not held: `ask_joey` / `needs_you`, a ledger-only line, an answer to Joey's own message steered into the run. Still one message.
+       Telegram: the longest line is 171 characters (3 steps of 40, 「等 99 步」); a lane line's part holds 4,096 − (label + 2) characters
+       (`〔atlas·反射線#23〕`: 4,080), so a body (with the blocked line) of more than 3,908 characters becomes two parts because of it; a routine line with
+       outcome normal reaches Joey as its first line (≤ 400) and never does.
+    5. Words, the ticket's, verbatim: the identity card's receipt line 「  - receipt(run_id, outcome, steps)：…指示只有一件事就列一項。」 and 「排程回執用
+       receipt(run_id, outcome, steps)；人格檔或排程訊息裡寫的 btcc-receipt complete，對你來說就是 receipt 工具（開工的 btcc-receipt ack 照舊）」. Every kind's
+       card hash changes (a resumed lane gets the card once).
+    6. A step whose condition was not met is done (done=true, note says so): accepted, not counted, no line.
+    7. A high-frequency nothing-to-do run lists one step and is accepted on its first receipt: no refusal, no extra model turn. Extra tokens per such
+       run, estimated from characters (no tokenizer run): the steps argument, e.g. `[{"step": "看佇列長度", "done": true, "note": "0，條件沒成立"}]` (52
+       characters, 11 CJK), about 20-30 output tokens; the card grows by 144 characters (83 CJK), about 100-140 tokens of the kind's system prompt
+       (cached: read, not written, while the cache is warm).
+  - **lanes.jsonl:** exit rows (switch on) `receipt_refused` {missing_steps, not_done_success, cli_blocked}; `receipt_cli_refused` {run, event, run_id,
+    via: cli | api}. The ledger's notify row carries `refs.steps_line`.
+  - Tests: `lanes-wo129` (9, the ticket's acceptance list). Files whose subject is not the scheduled receipt run with `LANES_RECEIPT_STEPS=0`, as
+    `lanes-wo127` runs with `LANES_DEFER_DECISIONS=0`: lanes-m3-obligations, lanes-m4-wake, lanes-c6, lanes-golive-c6 (whole file); lanes-wo125's B tests
+    (the 1.38 receipt paths), one lanes-mail11023 test and half of another (the CLI path), one lanes-handoff test (a header). Adjusted to the new
+    contract: lanes-mail11023 (receipts carry steps; a held line goes with the receipt), lanes-wo125 #7 (the steps line follows the blocked line),
+    lanes-golive-a6 (the card names btcc-receipt complete as the receipt tool). Suite: 955 (952 pass, 3 skip, 0 fail); 1.38.3: 946 (943 pass, 3 skip, 0 fail).
+  - **Deploy:** both daemons of an agent (the tg daemon routes and answers `/lane-receipt`; the agent-inbox daemon runs the same server code); the
+    guard hook is read by each lane run as it starts. Nothing for BTCC: the scheduler's message can keep its `btcc-receipt complete` line (the lane card
+    says what it means for a lane); a lane run started before the upgrade keeps its old card until its next run.
+  - **Not verified here:** a live lane on a real schedule (the scheduler and the lane process are stand-ins; the guard hook runs as a real process).
+
 ## 1.38.3 — 2026-11-24
 
 - **Lanes on: the mail lane renews its conversation; a report is not a commitment (board WO-131; Chiron mail #11046, #11059 item 1; agent-inbox 1.8.3 carries the same code).**

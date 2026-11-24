@@ -9,6 +9,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
 process.env.LANES_FLOOD_CONTROL = '0'
+process.env.LANES_RECEIPT_STEPS = '0'                                       // 1.39.0 (WO-129) changes the scheduled receipt; this file's subject runs as 1.38.3 (lanes-wo129 tests it)
 // the scheduler, as the inbox daemon reaches it (POST /lanes/scheduler): every completion is counted here
 const schedCalls: any[] = []
 // 002s: a local stand-in for Jev, used only where a test points TYPESAFE_BASE_URL at it (the line-news check)
@@ -60,7 +61,7 @@ L.__setMeshSend(async b => { mesh.push(b); return { text: `sent to ${b.to}`, msg
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => ['eve', 'cain'],
   sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent, replyTo: o?.replyTo }); return 9000 + sent.length }, joeyChatId: () => '1',
   createTopic: async () => 4400 + sent.length } as any)          // lanes-golive: a worker lane needs a real topic (no topic = the main does the work)
-afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; schedSrv.close(); jevSrv.close(); laneSrv.close(); L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL })
+afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; schedSrv.close(); jevSrv.close(); laneSrv.close(); L.__setClaudeBin(restore); L.__setRetryBackoff(5000); delete process.env.LANES_FLOOD_CONTROL; delete process.env.LANES_RECEIPT_STEPS })
 // the daemon's lane routes (/lane-stop, /lane-receipt) on a real port, for the lane hooks run as processes
 const laneSrv = createServer(async (req, res) => { if (!(await L.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res))) res.writeHead(404).end() })
 await new Promise<void>(r => laneSrv.listen(0, '127.0.0.1', () => r()))

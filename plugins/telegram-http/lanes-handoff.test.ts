@@ -111,7 +111,8 @@ test('002e: what a follow-up run reports never rings again (all-clear = silent);
 
 test('002e: the header Joey reads names the lane and carries no internal thread id', async () => {
   reset()
-  await callLaneTool(run('scheduled'), 'notify_joey', { outcome: 'normal', text: '例行回報' })
+  process.env.LANES_RECEIPT_STEPS = '0'                       // 1.39.0 (WO-129): a scheduled run's line waits for its receipt; the header is this test's subject
+  try { await callLaneTool(run('scheduled'), 'notify_joey', { outcome: 'normal', text: '例行回報' }) } finally { delete process.env.LANES_RECEIPT_STEPS }
   expect(sent[0].text.split('\n')[0]).toMatch(/^〔adam·反射線#\d+〕$/)
   expect(sent[0].text).not.toContain('adam#t-')
 })
