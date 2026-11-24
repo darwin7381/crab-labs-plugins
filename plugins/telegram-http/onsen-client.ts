@@ -422,7 +422,8 @@ export class OnsenClient {
   }
 
   // ---------------------------------------------------------------- chat_history
-  async queryHistory(a: HistoryArgs): Promise<string> {
+  /** via: who looks it up, for Onsen's lookup counts (tool = the agent's chat_history; hook = a hook putting history back, Onsen step 2) */
+  async queryHistory(a: HistoryArgs, via: 'tool' | 'hook' = 'tool'): Promise<string> {
     const limit = Math.max(1, Math.min(200, Math.floor(Number(a.limit ?? 20)) || 20))
     let since: string | undefined, until: string | undefined
     try { since = parseWhen(a.since); until = parseWhen(a.until) } catch (e) { return errText(e) }
@@ -436,7 +437,7 @@ export class OnsenClient {
     else {
       try {
         if (id) {
-          const row = await this.fetchOne(id, chat, cred)
+          const row = await this.fetchOne(id, chat, cred, via)
           if (row) return formatFull(row, joey)
           return `Onsen 裡找不到 ${id}${chat ? `（chat ${chat}）` : ''}。`
         }
@@ -445,7 +446,7 @@ export class OnsenClient {
         if (since) p.set('since', since)
         if (until) p.set('until', until)
         if (q) p.set('q', q)
-        const r = await this.get(`/messages?${p}`, cred)
+        const r = await this.get(`/messages?${p}`, cred, via)
         if (r.status === 200 && Array.isArray(r.json?.messages)) {
           const rows = r.json.messages as any[]
           return formatList(rows, typeof r.json.total === 'number' ? r.json.total : rows.length, joey)
@@ -457,31 +458,31 @@ export class OnsenClient {
     }
     return this.localHistory({ limit, since, until, q, id, chat }, why, joey)
   }
-  private async get(path: string, cred: string): Promise<{ status: number; json: any }> {
-    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': 'tool' }), signal: AbortSignal.timeout(this.cfg.queryTimeoutMs ?? 4000) })
+  private async get(path: string, cred: string, via: 'tool' | 'hook' = 'tool'): Promise<{ status: number; json: any }> {
+    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': via }), signal: AbortSignal.timeout(this.cfg.queryTimeoutMs ?? 4000) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
   /** one message in full: an Onsen id; `tg:<n>` (the Telegram alias in `chat`); a bare number: the Onsen id first, then the alias */
-  private async fetchOne(id: string, chat: string | undefined, cred: string): Promise<any | null> {
+  private async fetchOne(id: string, chat: string | undefined, cred: string, via: 'tool' | 'hook' = 'tool'): Promise<any | null> {
     const tg = /^tg:(\d+)$/i.exec(id)
     if (!tg) {
-      const r = await this.get(`/messages/${encodeURIComponent(id)}`, cred)
+      const r = await this.get(`/messages/${encodeURIComponent(id)}`, cred, via)
       if (r.status === 200 && r.json && typeof r.json === 'object') return r.json.message ?? r.json
       if (r.status !== 404 && r.status !== 400) throw new Error(`HTTP ${r.status}`)
       if (!/^\d+$/.test(id)) return null
     }
     if (!chat) return null
     const msgId = tg ? tg[1]! : id
-    const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${msgId}`, cred)
+    const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${msgId}`, cred, via)
     if (r.status === 404) return null
     if (r.status !== 200 || !r.json) throw new Error(`HTTP ${r.status}`)
     const j = r.json.message ?? r.json
     if (j && (j.body != null || Array.isArray(j.events))) return j
     const oid = j?.id ?? j?.message_id
     if (oid == null) return null
-    const full = await this.get(`/messages/${encodeURIComponent(String(oid))}`, cred)
+    const full = await this.get(`/messages/${encodeURIComponent(String(oid))}`, cred, via)
     return full.status === 200 && full.json ? full.json.message ?? full.json : null
   }
 

@@ -4360,6 +4360,21 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     // /fleet — the agent-inbox plugin's second MCP server (fleet-mail.ts): the fleet's main text as its
     // instructions + call / mail / mailbox tools. Stateless JSON-RPC: no session, no SSE, never a channel,
     // so inbound delivery stays on /mcp alone. Same loopback token as /mcp.
+    // Onsen step 2 (WO-139 / Chiron's reanchor hook): this agent's conversation history exactly as chat_history writes it, for a hook that puts
+    // it back into the session after a compaction or a restart. Telegram daemon only; the loopback token as /mcp. Onsen down: this daemon's
+    // spool answers, and its first line says so. Counted in Onsen as lookups by a hook, apart from the agent's own chat_history.
+    if (!INBOX_ONLY && onsen && u.pathname === '/onsen/history' && req.method === 'GET') {
+      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {
+        const r = refusal(req.headers['authorization'] as string | undefined)
+        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
+        return
+      }
+      const args: Record<string, unknown> = {}
+      for (const k of ['limit', 'since', 'until', 'q', 'id', 'chat']) { const v = u.searchParams.get(k); if (v) args[k] = k === 'limit' ? Number(v) : v }
+      const text = await onsen.queryHistory(args, 'hook').catch(e => `chat_history failed: ${e instanceof Error ? e.message : e}`)
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(text)
+      return
+    }
     // WO-126 (1.38.1): the main's mailbox_decide, handed over by this agent's Telegram daemon (its tool lives there); same loopback token as /mcp
     if (INBOX_ONLY && Lanes.LANES_ON && u.pathname === '/mail/decide' && req.method === 'POST') {
       if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {

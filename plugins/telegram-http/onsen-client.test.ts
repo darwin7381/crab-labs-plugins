@@ -275,6 +275,20 @@ describe('chat_history', () => {
     expect(lines.at(-1)).toBe('共 4 則，顯示 4 則')
   })
 
+  test('step 2: a hook asks through the daemon (/onsen/history): the same text, counted as X-Onsen-Via: hook, list and one message alike', async () => {
+    const dir = tmp(), on = fakeOnsen(), c = client(dir, on.f)
+    c.recordMessage(outText('main', 2168, '收到').r as OnsenItem)
+    await c.syncNow(true)
+    const n0 = on.calls.length
+    const out = await c.queryHistory({ limit: 5 }, 'hook')
+    expect(out).toMatch(/｜main｜#1 tg:2168｜收到/)
+    await c.queryHistory({ id: 'tg:2168' }, 'hook')
+    expect(on.calls.slice(n0).map(x => x.headers['x-onsen-via'])).toEqual(['hook', 'hook', 'hook'])
+    const src = require('fs').readFileSync(require('path').join(import.meta.dir, 'server.ts'), 'utf8')
+    expect(src).toContain("if (!INBOX_ONLY && onsen && u.pathname === '/onsen/history' && req.method === 'GET') {")
+    expect(src).toContain("const text = await onsen.queryHistory(args, 'hook')")
+  })
+
   test('id: an Onsen id; tg:<n>; a bare number (Onsen id first, then the Telegram alias); full text with its events', async () => {
     const dir = tmp(), on = fakeOnsen(), c = client(dir, on.f)
     c.recordMessage(outText('main', 2168, 'y'.repeat(500)).r as OnsenItem)
