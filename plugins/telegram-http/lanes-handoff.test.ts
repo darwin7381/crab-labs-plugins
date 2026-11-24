@@ -56,7 +56,8 @@ test('identity card: three ways out, one per event; a critical alert must reach 
   for (const w of ['notify_joey(text, outcome)', 'ask_joey(text)', 'handoff_main(text)', '同一件事只選一個']) expect(card).toContain(w)
   expect(card).not.toContain('escalate')
   // 002k (B19): the card is the same for every lane of a kind; the critical flag is in the lane context at the head of the event prompt
-  expect(card).toContain('不要為了「嚴重」而 handoff_main')
+  // WO-132 (1.40.0, Chiron's words): severity is no reason to hand off, nor a reason not to; the old sentence with LANES_BOUNDARY_CARD=0 (lanes-wo132)
+  expect(card).toContain('嚴重本身不是交主線的理由，也不是不交的理由：照邊界卡的三問判，要主線的照樣用 handoff_main 交。摘要不會叫醒主線。')
   expect(identityCard({ ...lane, critical: true })).toBe(card)
   const crit = laneContext({ ...lane, critical: true }, { summary: undefined, ev: {} } as any)
   expect(crit).toContain('分流器標記：嚴重警報')

@@ -335,7 +335,7 @@ test('WO-131 B: the mail lane\'s line 3 and the boundary card\'s step, verbatim;
   expect(card.filter(l => l.startsWith('- 要主線的信')).length).toBe(1)
   const line = B.boundaryDefault('adam').find(l => l.startsWith('需要任何一樣：'))!
   expect(line).toBe('需要任何一樣：分的是「一步」，不是「一件」。你做得了的每一步都做完（讀、查、對數字、擬好回覆、備好指令），' + BOUNDARY_STEP + B.BOUNDARY_DECISION_SENTENCE)
-  expect(B.boundaryDefault('adam').length).toBe(10)
+  expect(B.boundaryDefault('adam').length).toBe(11)                                                   // WO-132 (1.40.0) added the production line
   // the 1.38.2 line, put back: another hash. A mail lane whose session got the old card gets the new one in its next run, once
   const old = '- 要主線的信（要代表 adam 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回，寫到主線不用再打開信就能決定：#id、寄件人、期限；它要 adam 決定或做什麼；信裡的關鍵事實（數字、檔案位置、它給的選項）；你的建議和根據（查不到根據就寫「沒有建議」）；你沒查的。那一封不要勾掉，主線處理完自己勾。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。'
   const was = L.__setKindLinesForTest((kind, lines) => kind === 'mail' ? lines.map(l => l === MAIL_LINE_3 ? old : l) : lines)

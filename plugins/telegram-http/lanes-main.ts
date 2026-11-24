@@ -152,6 +152,8 @@ export function createMain(E: MainEnv) {
   function currentGen(): Row | null { return cur ? J().get('main', cur) ?? null : null }
   function mainPid(): number | null { const g = currentGen(); return g ? Number(g.pid) : null }
   function mainPhase(): MainPhase { return (currentGen()?.state as MainPhase) ?? 'gone' }
+  /** WO-132 (item 3): when the main's running turn started (this daemon saw its first hook event), or null (not in a turn, or begun before this daemon) */
+  function turnStart(): string | null { const g = currentGen(); const st = g ? starts.get(g.id) : undefined; return g && g.state === 'in_turn' && st && st.prompt === g.prompt_id ? st.at : null }
   /** the main is there: a live gen that is not walled */
   function mainUp(): boolean { const p = mainPhase(); return p === 'idle' || p === 'in_turn' || p === 'starting' }
   function mainSession(): { session_id: string; pid: number; transcript_path: string } | null {
@@ -592,7 +594,7 @@ export function createMain(E: MainEnv) {
   }
 
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork,
+  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork, turnStart,
     items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

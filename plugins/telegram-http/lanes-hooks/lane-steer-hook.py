@@ -10,6 +10,8 @@ it to the model once:
                  the lane's two Stop checks never answer one Stop event with two different blocks; this file is registered for PostToolUse only)
 What was handed over is written to <lane id>.out.jsonl (before anything is printed: a message that cannot be marked is not handed over, so it never repeats); the
 daemon reads that file, writes the delivery to the ledger and queues whatever was NOT delivered (the run ended first) as the lane's next run, ahead of the rest.
+WO-132 (telegram-http 1.40.0): kind `merged` = an alert of the run's incident the router merged into it (same host, inside the window); the daemon wrote its
+whole text (its head and the event), handed over the same way, at the next tool boundary or at Stop.
 Not in the main's settings (the main has main-hook.py).
 """
 import json
@@ -44,9 +46,18 @@ def render_system(items):
     return '\n'.join(f"〔系統通知｜車道上限〕{str(e.get('text') or '')[:BODY_MAX]}" for e in items)
 
 
+def render_merged(items):
+    # WO-132 (item 2): an alert of the run's incident, merged into it by the router; the daemon wrote its whole text (the system's head and the event)
+    return '\n'.join(str(e.get('text') or '')[:BODY_MAX * 2] for e in items)
+
+
 def render(items):
     sys_items = [e for e in items if e.get('kind') == 'system']
-    items = [e for e in items if e.get('kind') != 'system']
+    merged = [e for e in items if e.get('kind') == 'merged']
+    items = [e for e in items if e.get('kind') not in ('system', 'merged')]
+    if merged:
+        rest = render(items + sys_items) if (items or sys_items) else ''
+        return render_merged(merged) + ('\n' + rest if rest else '')
     if not items:
         return render_system(sys_items)
     parts = []

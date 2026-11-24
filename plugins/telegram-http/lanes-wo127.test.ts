@@ -515,7 +515,7 @@ test('WO-127: the lane tools are Epeius\'s definitions minus what the daemon fil
 
 test('WO-127 item 8: the words, verbatim: the boundary card\'s sentence right after 「…你說好之後還剩哪幾步。」 (same line: the card still has 10 lines); the main\'s rule right after the boundary card\'s', () => {
   const card = B.boundaryDefault('adam')
-  expect(card.length).toBe(10)
+  expect(card.length).toBe(11)                                                                     // WO-132 (1.40.0) added a line of its own; this sentence still has none
   // 1.38.3 (WO-131, Chiron mail #11046): the step's words before it changed (「…你說好之後我會做什麼。整件只能主線自己做的才用 handoff_main。」); the sentence is unchanged
   expect(card.find(l => l.includes('你說好之後我會做什麼。'))!.endsWith('整件只能主線自己做的才用 handoff_main。主線回了決定：照決定把剩下的做完，向 Joey 回報一次，寫明是照主線的決定。做不下去就整件交給主線，不再問第二次。')).toBe(true)
   const ctx = mainContext('adam', 'sid').split('\n')

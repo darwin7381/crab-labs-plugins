@@ -1,3 +1,81 @@
+## 1.40.0 — 2026-11-24
+
+- **Lanes on: an alert's lane leaves production to the main; one lane per incident; a run is told what the main and the agent's other lanes are doing (board WO-132, Chiron's ticket; agent-inbox 1.10.0 carries the same code).**
+  - **What happened:** Prometheus, 11-24 09:27:21–09:28:10Z: alerts 1361, 1360, 1363, 1364 (warning, four httpchecks of one host, bt-xboard-falkenstein)
+    opened a reflex lane each in 49 s (`mesh-alert` → prometheus.reflex.1–4, four threads; routing.jsonl 36–39). reflex.2 and reflex.3 each ran
+    `docker compose -f …four files… up -d` on the production identity box over ssh with the fleet root key (09:29:31Z, 09:29:39Z; transcripts 946ca28e,
+    7844aaa2), did not hand over and registered no BTCC change; reflex.4 filed normal after a /healthz 504 it did not check; Joey got 5 messages in 3
+    minutes (TG 928–932) while the main was on that box (its Traefik upgrade from 09:25Z, ho-a248c3). Chiron's recount of 100 runs
+    (`claude-chiron/knowledge/lane-boundary-20261124/`) adds: kot.reflex.3 (alert 1356 critical) told Joey 「主線接手決定後續」 with no hand-over (state
+    `no_wake`), kot.reflex.4 (1358) 「要主線核對」 the same way; 4 of the 5 runs with a refused write handed over without the 〔系統〕 line, the main saw
+    it in a digest 50–67 minutes later (step1-measures §8); cadmus.reflex.7 (run 6933): the notice de-duplication dropped its line, the receipt refused
+    「回報 Joey 一行」 not done, it handed over, and the main sent the line the de-duplication had held back. Mail #11101 (Sonn, 09:22Z): `mailbox_decide`
+    as_recommended with the note 「主線已用 fleet 身分建好：schedule id 386 …」 reached the mail lane as 「主線回了決定：照建議。」 only (its transcript
+    a331a339 has no 386): it tried to create the schedule itself and handed it back.
+  - **What changed:**
+    1. **Words, verbatim (the ticket's):** the boundary card's question 2 (「2. 收不回的動作，或動到正式環境的動作：…就算是把它恢復原狀。」) and question 3
+       (「…主線手上正在動的東西。正式服務出事時，先當成主線可能正在動它。」) replaced; a line after 「沒把握：…」 (「正式服務正在壞、等不起：唯讀查清楚、把要下的
+       指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。」); the lane card's 「做可逆的小處理（不動正式的機器或服務）」 and the
+       second half of its critical-alert line: 「嚴重本身不是交主線的理由，也不是不交的理由：照邊界卡的三問判，要主線的照樣用 handoff_main 交。摘要不會叫醒
+       主線。」 The boundary card is 11 lines (`boundary_lines` +1); every kind's lane-card hash changes (a resumed lane gets the new card once). Switch:
+       `LANES_BOUNDARY_CARD` (off: 1.39.1's card and lane card, byte for byte).
+    2. **One lane per incident** (`LANES_INCIDENT_MERGE`, default on; `LANES_INCIDENT_WINDOW_S`, default 600). Incident key: the agent and the alert's
+       host (the alert meta's `host`, else the host the dispatcher writes, 「alert N：source / host / name」; with no host, source/name). While a reflex lane
+       handles an alert with that key, a later one is merged into it: a run in progress gets it at its next tool boundary through the E18 steering
+       file (kind `merged`, the daemon's text: 「〔系統併入｜同一件事故…又來了 1 張警報（同一台 <host>，10 分鐘內），分流器沒有另開分身，交給你一起看。一起
+       回報一次…〕」 and the event); delivered, it rides in the run's `extra`; not reached before the run's end, it is the lane's next run, first in line,
+       owing its line. A queued run takes it in its `extra`. A run that ended inside the window: the alert is the lane's next run, on its thread
+       (resumed), with the tag 「分流器標記：跟這條線在處理的是同一件事故（同一台 <host>）…」. After the window: a lane of its own (a new incident). A merged
+       alert owes nothing of its own (one report: the lane's normal reporting; no router notice). A merged critical alert into a warning run: the run's
+       event becomes critical (its Joey line rings at the critical due time) and the run's line goes at the critical tier; when that line already went,
+       the critical alert owes its own (ringing). The fingerprint dedupe (B12) runs first, unchanged; merged alerts' fingerprints point to the
+       incident's thread.
+    3. **Run context** (`LANES_RUN_CONTEXT`, default on): the 〔車道資訊〕 block gets 「# 此刻（系統寫的，時間為 UTC+8）」 with 「主線：閒著」 or
+       「主線：回合中（自 HH:MM 起，在處理：<its turn's first item, 80 characters>）」 (no time when the turn began before this daemon saw it; also
+       「主線：暫時不能用模型」, 「主線：正在啟動」, 「主線：目前沒有在跑」), and 「這一隻此刻還在跑的分身：<lane id>（<sender>：<first line, 60 characters>，自 HH:MM 起）；…」
+       or 「這一隻此刻沒有別的分身在跑」.
+    4. **A hand-over carries what the guard refused** (`LANES_BLOCK_FACTS`): with refusals still counting, the 〔系統〕 line rides the item that wakes the
+       main: `handoff_main`'s text, `decide_later`'s card, and the exit rule's hand-over.
+    5. **Closing check** (`LANES_BOUNDARY_CARD`): a `notify_joey` / `ask_joey` whose text says the main takes over or is asked to act (主線接手、交給／交由／
+       轉給…主線、要／請／讓…主線、由主線＋處理／決定／核對…、主線＋會／將／再／可／要／有需要…; English: hand… to the main, the main will / should…; a
+       clause that denies it does not count, as `claimsHandover`) from a run with no `handoff_main` / `decide_later` / `mailbox_card` is refused once:
+       「沒有送出：這一則 notify_joey 說主線會接手或要主線做事（「…」），但這一趟沒有交給主線…要主線做的：先用 handoff_main 交給它…不需要主線的：把那一句
+       拿掉，再送一次。這個提醒一趟只有一次。」 Not when the main already has something of the event (a hand-over on its record, a memory proposal it
+       decides) nor in a decision's run (both as the existing claims check); quoted code (a fenced block, `inline`) is not read. The old claims check
+       then has had its once too. Over the lane lines of 11-23 / 11-24 (93 in the fleet's ledgers) the words find 6: kot.reflex.3, kot.reflex.4,
+       prometheus.reflex.2, prometheus.reflex.4, epeius.mail.1 (「程式改動還沒做,由主線做」), sonn.mail.2 (「主線要改程式」, Epeius's main).
+    6. **De-duplication is a report made** (`LANES_RECEIPT_STEPS`): a `notify_joey` refused because Joey already has the same line (matter + outcome)
+       ends with 「（Joey 已經收過同一則，這一步算做了：receipt 的 steps 裡回報 Joey 的那一步填 done=true。）」; that run's receipt records a report step
+       (its words or note: Joey / 回報 / 通知 / 告訴 / 報告 / notify / report) marked not done as done (note 「…Joey 已經收過同一則（通知被去重擋下），算做了」),
+       so the receipt is not refused for it and nothing is handed over.
+    7. **The main's note reaches the lane** (a fix, no switch): a decision's run carries 「主線附註：<note>」 right after 「主線回了決定：…」 for every decision
+       (as_recommended, changed, declined), with 「（主線附註是主線寫的：它已經做了什麼、要你怎麼做，以附註為準，不要重做主線已經做好的。）」. The note was in the
+       event (`ev.note`, the decision record); `decisionRunText` dropped it for as_recommended.
+    8. **Observation, recorded only** (`LANES_PROD_CHANGE`, default on): the exit row's `prod_change` lists the Bash commands of the run that change
+       state on another machine: an ssh with a remote command (docker / docker compose up·restart·down·rm…, docker exec of such, systemctl
+       restart·stop·start·reload…, service, rm / mv / cp / chmod… outside /tmp, a redirect to a file, sed -i, kill, reboot, nginx -s, kubectl apply…, ufw,
+       iptables, package installs, git pull…; a heredoc after ssh is its remote command; `--dry-run` is not a change) and scp / rsync to a remote
+       destination outside /tmp. Nothing is refused (the guard's refusal of remote commands waits for Joey's ruling). Over the 425 Bash calls of the
+       171 lane runs of 11-22 to 11-24 it finds 4: reflex.2's and reflex.3's rebuilds, and two copies to gpu-box (plutus, kairos: mkdir / cp / rsync).
+  - **lanes.jsonl:** exit rows `merged_events` {n, alert_ids, events} (merge on) and `prod_change` [{host, what[], cmd}] (on); `main_ask_refused` {run,
+    event, tool, phrase}. routing.jsonl: rule `incident-merge`. Ledger: router `action` rows 「incident 同一台 <host>：…併給 <lane>（…）」 (refs.incident =
+    the key, incident_of, how, alert), 「incident merge delivered：…」 (refs.incident = delivered), refs.incident_raise. Event records: `incident_of`,
+    `incident`; a raised one `raised_by`. state.json: `incidents`.
+  - Tests: `lanes-wo132` (12): the words and the hash (#1); the Prometheus replay, one lane, three merged at the next tool boundary, one Joey message,
+    `merged_events` 3 [1360, 1363, 1364], the run told the main is in a turn on ho-a248c3 (#2, #3); the next alert inside the window is the lane's next
+    run (a resumed session gets the card once), after it a lane of its own; a critical merged into a warning run rings, after the line it owes its own;
+    the replay with `LANES_INCIDENT_MERGE=0` (four lanes, four messages, each later lane listing the running ones) and `LANES_RUN_CONTEXT=0` (#3, #5);
+    the main idle / in a turn; a refused write and a hand-over (handoff_main, decide_later, the exit rule; off: as before) (#4); kot.reflex.3 replay
+    (refused once, hand-over, the main woken; off: the line goes out); cadmus.reflex.7 replay; #11101's note for the three decisions; reflex.2 / .3's
+    commands replayed (`prod_change` one each, the dry-run not counted) and the reading of commands; the lane card off = 1.39.1's byte for byte.
+    Adjusted: lanes-wo125 (card line counts +1; the system-prompt check names the card's head: the lane card's critical line now names 邊界卡),
+    lanes-wo127 / lanes-wo131 (11 lines), lanes-handoff (the critical sentence). Suite: 967 (964 pass, 3 skip, 0 fail); 1.39.1: 955 (952 pass, 3 skip, 0 fail).
+  - **Deploy:** the tg daemon of each lanes-on agent (router, lanes, the steering file) and its agent-inbox daemon (same code); `lane-steer-hook.py` is
+    read by each lane run as it starts. Nothing for BTCC. Ships on its own on 1.39.1; WO-128 follows as 1.41.0. A lane run in progress at the upgrade
+    keeps its old card; a resumed session gets the new card once.
+  - **Not verified here:** a live alert storm and a live main (the lane process, the main and the dispatcher are stand-ins; the hooks run as real
+    processes); the merged alerts' wording on a real model; the turn start after a daemon restart mid-turn (no time shown then).
+
 ## 1.39.1 — 2026-11-24
 
 - **Lanes on: the mail lane's read before a reply is 車道讀過; a card's no_reply comes in BTCC's answer (Sonn #11115; agent-inbox 1.9.1 carries the same code).**

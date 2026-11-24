@@ -1,0 +1,86 @@
+{
+ "reflex2": [
+  [
+   "09:27:24.546",
+   "date -u; for i in 1 2 3; do curl -s -o /dev/null -w \"%{http_code} %{time_total}\\n\" -m 10 https://auth.kbro.ai/authui/login; done"
+  ],
+  [
+   "09:27:57.783",
+   "dig +short auth.kbro.ai; curl -sv -m 8 -o /dev/null https://auth.kbro.ai/ 2>&1 | tail -8; curl -s -m 8 -o /dev/null -w \"%{http_code}\\n\" https://auth.kbro.ai/.well-known/openid-configuration; ls ~/cc-workspaces/claude-prometheus/knowledge | tail -5"
+  ],
+  [
+   "09:28:10.206",
+   "curl -s -m 8 -o /dev/null -w \"root %{http_code}\\n\" https://auth.kbro.ai/; curl -s -m 8 -o /dev/null -w \"health %{http_code}\\n\" https://auth.kbro.ai/healthz; grep -iE \"txmonster|host|origin\" ~/infra/shared-services/identity/README.md | head -15"
+  ],
+  [
+   "09:28:13.712",
+   "grep -n -iE \"^\\| *auth|auth.kbro|192.0.2.12\" ~/infra/machines/README.md | head; ssh -i ~/.ssh/fleet_key -o ConnectTimeout=8 -o BatchMode=yes root@192.0.2.12 'uptime; docker ps --format \"{{.Names}} {{.Status}}\"; df -h / | tail -1; free -m | sed -n 2p' 2>&1 | head -20"
+  ],
+  [
+   "09:28:19.402",
+   "sleep 5; curl -s -m 8 -o /dev/null -w \"login %{http_code}\\n\" https://auth.kbro.ai/authui/login; ssh -i ~/.ssh/fleet_key -o ConnectTimeout=8 root@192.0.2.12 'docker ps -a --filter name=proxy --format \"{{.Status}}\"; docker logs --tail 15 zitadel-proxy-1 2>&1 | cut -c1-200; journalctl -n 5 --no-pager 2>/dev/null | cut -c1-160; tail -5 /root/*.log 2>/dev/null'; tail -5 ~/infra/log.md | cut -c1-300"
+  ],
+  [
+   "09:28:40.380",
+   "ssh -i ~/.ssh/fleet_key -o ConnectTimeout=8 root@192.0.2.12 'ufw status numbered | head -30; ip -br a | grep -E \"br-|172.31\"; docker network ls | grep -i zitadel; ss -ltnp | grep 3040; journalctl -u \"*auth*\" -n 5 --no-pager | cut -c1-200; docker inspect zitadel-proxy-1 --format \"{{.Created}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}\"; docker logs --tail 3 bt-authui 2>&1 | cut -c1-200'"
+  ],
+  [
+   "09:29:20.106",
+   "ssh -i ~/.ssh/fleet_key root@192.0.2.12 'cd /opt/zitadel; ls; grep -rn \"kbro-edge\\|172.31.255\" --include=*.yml --include=*.sh --include=*.md . 2>/dev/null | cut -c1-220 | head -20; docker network ls | grep edge; history | tail -0; ls -lt /opt/zitadel | head -5'"
+  ],
+  [
+   "09:29:25.783",
+   "ssh -i ~/.ssh/fleet_key root@192.0.2.12 'cd /opt/zitadel; sed -n 5,14p README-DEPLOY.md'"
+  ],
+  [
+   "09:29:31.382",
+   "ssh -i ~/.ssh/fleet_key root@192.0.2.12 'cd /opt/zitadel; F=\"-f docker-compose.yml -f docker-compose.mode-cf-origin.yml -f docker-compose.bridge.yml -f docker-compose.kbro-auth-edge.yml\"; docker compose $F up -d --dry-run 2>&1 | tail -8; docker compose $F up -d proxy 2>&1 | tail -6; sleep 4; docker ps --format \"{{.Names}} {{.Status}}\"; docker exec zitadel-console-patch-1 nginx -s reload 2>&1|tail -1'; for i in 1 2; do curl -s -m 10 -o /dev/null -w \"%{http_code}\\n\" https://auth.kbro.ai/authui/login; done"
+  ]
+ ],
+ "reflex3": [
+  [
+   "09:27:52.955",
+   "for i in 1 2 3; do curl -s -o /dev/null -w \"%{http_code} %{time_total}\\n\" -m 10 https://auth.kbro.ai/.well-known/openid-configuration; done; date -u"
+  ],
+  [
+   "09:28:07.045",
+   "cd ~/infra/shared-services/identity; grep -n -i -E \"auth.kbro.ai|txmonster|tunnel|回滾|rollback\" README.md | head -30; dig +short auth.kbro.ai"
+  ],
+  [
+   "09:28:10.538",
+   "ssh -i ~/.ssh/fleet_key -o ConnectTimeout=8 -o BatchMode=yes root@192.0.2.12 'uptime; systemctl is-active kbro-auth; docker ps --format \"{{.Names}} {{.Status}}\" | head -20; curl -s -o /dev/null -w \"local:%{http_code}\\n\" -m5 -H \"Host: auth.kbro.ai\" http://127.0.0.1:80/.well-known/openid-configuration' 2>&1 | tail -30"
+  ],
+  [
+   "09:28:15.887",
+   "sleep 20; curl -s -o /dev/null -w \"%{http_code}\\n\" -m 10 https://auth.kbro.ai/.well-known/openid-configuration; ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'docker logs --tail 15 zitadel-proxy-1 2>&1; last -5 | head -5; grep -E \"proxy|traefik\" /root/.bash_history 2>/dev/null | tail -3' 2>&1 | tail -30"
+  ],
+  [
+   "09:28:51.826",
+   "ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'systemctl status kbro-auth --no-pager | head -12; journalctl -u kbro-auth --since \"-10min\" --no-pager | tail -25; curl -s -o /dev/null -w \"direct:%{http_code} %{time_total}\\n\" -m 8 -H \"Host: 127.0.0.1:3040\" http://127.0.0.1:3040/.well-known/openid-configuration; ss -tn state established \"( sport = :3040 )\" | wc -l; free -m|head -2' 2>&1 | tail -45"
+  ],
+  [
+   "09:28:58.242",
+   "ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'docker exec zitadel-proxy-1 wget -q -O /dev/null -T5 http://172.31.255.1:3040/healthz; echo rc=$?; ip addr | grep 172.31.255; grep -E \"AUTH_LISTEN\" /etc/kbro-auth/auth.env; ss -ltn | grep 3040; docker inspect zitadel-proxy-1 --format \"{{.State.StartedAt}} {{.HostConfig.RestartPolicy.Name}}\"; curl -s -o /dev/null -w \"ext:%{http_code}\\n\" -m 8 https://auth.kbro.ai/.well-known/openid-configuration' 2>&1|tail"
+  ],
+  [
+   "09:29:19.287",
+   "ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'docker inspect zitadel-proxy-1 --format \"{{json .NetworkSettings.Networks}}\" | head -c 600; echo; docker network ls; docker exec zitadel-proxy-1 ip route; iptables -S INPUT 2>/dev/null | head; ufw status 2>/dev/null|head -20; grep -rn \"kbro-edge\\|172.31.255\" /opt/zitadel/*.yml /opt/zitadel/docker-compose* 2>/dev/null | head' 2>&1|tail -40"
+  ],
+  [
+   "09:29:26.124",
+   "ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'cd /opt/zitadel; cat docker-compose.kbro-auth-edge.yml; ls; docker inspect zitadel-proxy-1 --format \"{{json .Config.Labels}}\" | tr \",\" \"\\n\" | grep -i compose; grep -n -i \"edge\" README* DEPLOY* 2>/dev/null | head' 2>&1|tail -60"
+  ],
+  [
+   "09:29:31.595",
+   "ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'cd /opt/zitadel && docker compose -f docker-compose.yml -f docker-compose.mode-cf-origin.yml -f docker-compose.bridge.yml -f docker-compose.kbro-auth-edge.yml up -d --dry-run 2>&1 | tail -15'"
+  ],
+  [
+   "09:29:39.526",
+   "ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'cd /opt/zitadel && docker compose -f docker-compose.yml -f docker-compose.mode-cf-origin.yml -f docker-compose.bridge.yml -f docker-compose.kbro-auth-edge.yml up -d 2>&1 | tail -5; sleep 5; docker ps --format \"{{.Names}} {{.Status}}\"|grep proxy'; for u in .well-known/openid-configuration authui/api/branding?requestId=health \"\"; do curl -s -o /dev/null -w \"%{http_code} \" -m 10 \"https://auth.kbro.ai/$u\"; done; curl -s -m10 -o /dev/null -w \"console %{http_code}\\n\" https://auth.kbro.ai/ui/console/"
+  ],
+  [
+   "09:29:51.036",
+   "for u in \".well-known/openid-configuration\" \"authui/api/branding?requestId=health\" \"\" \"ui/console/\"; do curl -s -o /dev/null -w \"%{http_code} \" -m 10 \"https://auth.kbro.ai/$u\"; done; echo; ssh -i ~/.ssh/fleet_key -o BatchMode=yes root@192.0.2.12 'curl -s -o /dev/null -w \"zapi:%{http_code}\\n\" -m5 http://127.0.0.1:18080/debug/healthz'"
+  ]
+ ]
+}

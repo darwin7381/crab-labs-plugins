@@ -32,13 +32,14 @@ export function boundaryDefault(agent: string): string[] {
     `# 邊界卡（${agent} 的；主線寫的，你只能讀）`,
     '這件事做完，需不需要下面任何一樣？三樣都不需要，就是你的：做完，記一筆。',
     `1. 用 ${agent} 的名義答應、核准、拒絕；或在有一項沒過、有一段沒查的時候，判定「沒事」。`,
-    '2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。',
-    `3. 只有主對話才知道的事：Joey 剛講的、談到一半的、${agent} 自己的標準。`,
+    BOUNDARY_Q2,                                                       // WO-132 item 1 (Chiron's words, verbatim): production counts
+    boundaryQ3(agent),
     '需要任何一樣：分的是「一步」，不是「一件」。你做得了的每一步都做完（讀、查、對數字、擬好回覆、備好指令），'
       // WO-131 (1.38.3, Chiron mail #11046, verbatim): the step goes to the main as a decision card (LANES_DECISIONS=0: the 1.37 words, no card tool)
       + (decisionsOn() ? BOUNDARY_CARD_STEP : BOUNDARY_HANDOFF_STEP)
       + (decisionsOn() ? boundaryDecisionSentence() : ''),          // WO-127 item 8: the same line (the card's line count and hash do not change)
     '沒把握：交給主線，不猜著做完。',
+    BOUNDARY_PROD_LINE,                                                // WO-132 item 1: a line of its own after the 「沒把握」 line
     '回報照實際發生的寫：指示裡的步驟，哪幾步做了、哪幾步沒做，都列出來；有沒做的，結果不能填正常。寫入或指令被擋，就寫被擋，不寫已做。',
     '判例（主線留的，新的在上面；跟上面衝突時照判例）：',
     BOUNDARY_NONE,
@@ -201,4 +202,232 @@ export function receiptToolWithSteps(base: { name: string; description: string; 
       steps: { type: 'array', description: 'each step of the instruction, in order: { step: what it was, done: true | false, note: what happened or why not }',
         items: { type: 'object', properties: { step: { type: 'string' }, done: { type: 'boolean' }, note: { type: 'string' } }, required: ['step', 'done'] } } } },
   }
+}
+
+// ------------------------------------------------------------------ WO-132 (telegram-http 1.40.0): an alert's lane on a production machine
+// Chiron's ticket (Joey TG chiron:2081 「也不要失控明明處理不完硬亂弄腳矯枉過正」, 2095). Prometheus 11-24 09:27–09:30Z: four warning alerts of one host in 49 s
+// opened four reflex lanes; two of them ran `docker compose … up -d` on the production identity box over ssh while the main was fixing that box, and Joey
+// got five messages in three minutes. The words (item 1, verbatim) ride the boundary card's switch (LANES_BOUNDARY_CARD); the helpers below are pure.
+/** item 1: question 2 of the boundary card */
+export const BOUNDARY_Q2 = '2. 收不回的動作，或動到正式環境的動作：錢、金鑰、發布、刪除、改設定、對外；在正式的機器或服務上重啟、重建、部署、套用設定也算，就算文件寫了怎麼做、就算是把它恢復原狀。'
+/** item 1: question 3 of the boundary card (the agent's name filled in, as the card already does) */
+export const boundaryQ3 = (agent: string): string => `3. 只有主對話才知道的事：Joey 剛講的、談到一半的、${agent} 自己的標準、主線手上正在動的東西。正式服務出事時，先當成主線可能正在動它。`
+/** item 1: the line after the 「沒把握」 line */
+export const BOUNDARY_PROD_LINE = '正式服務正在壞、等不起：唯讀查清楚、把要下的指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。'
+/** item 1: the identity card's 「做可逆的小處理」, and what it reads with the boundary card on */
+export const IDENTITY_SMALL_OLD = '做可逆的小處理'
+export const IDENTITY_SMALL_NEW = '做可逆的小處理（不動正式的機器或服務）'
+/** item 1 (Chiron 10:23Z, the ticket's 5th point): the second half of the identity card's critical-alert line, old and new */
+export const CRITICAL_TAIL_OLD = '不要為了「嚴重」而 handoff_main：主線會在摘要裡看到。'
+export const CRITICAL_TAIL_NEW = '嚴重本身不是交主線的理由，也不是不交的理由：照邊界卡的三問判，要主線的照樣用 handoff_main 交。摘要不會叫醒主線。'
+
+/** item 5: a line to Joey that says the main takes over or is asked to act (主線接手／交給主線／要主線…／主線會…), in a clause that does not deny it.
+ *  The same way as the claims check of lanes.ts (CLAIM_RE / claimsHandover): a pattern, then the few characters before the match in its own clause. */
+const MAIN_ASK_RE = new RegExp([
+  '主線\\s*(?:來\\s*)?接手',
+  '(?:交給|交由|交回|轉給|轉交|留給|丟給|請|要|讓|需要|需|待|等|麻煩)\\s*主線',
+  '由\\s*主線\\s*(?:來\\s*)?(?:處理|決定|接手|回報|報|核對|確認|看|查|補|做|定奪|裁決|跟進|追)',
+  '主線\\s*(?:會|將|再|可以?|可再|得|應該?|該|需要|要|有需要|來|去)(?!的)',
+  '\\b(?:hand(?:ed|ing)?|pass(?:ed|ing)?|leave|leaving|left)\\b[^.;\\n]{0,24}\\bto the main\\b',
+  '\\bthe main (?:will|should|can|could|needs? to|must|has to|to)\\b',
+].join('|'), 'gi')
+const MAIN_ASK_NEG = /(?:不|沒|没|未|別|别|勿|毋|無須|無需|无需|免)[^，。；！？,.;!?\n]{0,6}$|(?:\bnot\b|n't|\bnever\b|\bwithout\b|\bno need\b)[^,.;!?\n]{0,24}$/i
+/** the phrase that says so ('' = none). Quoted code (a fenced block, `inline`) is not the lane's own sentence: a pasted hook error is no ask. */
+export function mainAskPhrase(text: string): string {
+  const raw = String(text ?? '')
+  const s = raw.replace(/```[\s\S]*?(?:```|$)/g, m => ' '.repeat(m.length)).replace(/`[^`\n]*`/g, m => '`' + ' '.repeat(m.length - 2) + '`')   // same length: indexes stay
+  const re = new RegExp(MAIN_ASK_RE.source, 'gi')
+  for (let m = re.exec(s); m; m = re.exec(s)) {
+    if (!MAIN_ASK_NEG.test(s.slice(Math.max(0, m.index - 30), m.index))) {
+      const from = Math.max(0, s.lastIndexOf('\n', m.index) + 1, ...['。', '；', '！', '？'].map(p => s.lastIndexOf(p, m!.index) + 1))
+      const to = [s.indexOf('\n', m.index), ...['。', '；', '！', '？'].map(p => s.indexOf(p, m!.index))].filter(i => i >= 0).reduce((a, b) => Math.min(a, b), s.length)
+      return Array.from(raw.slice(from, to).trim()).slice(0, 80).join('')
+    }
+    if (m[0].length === 0) re.lastIndex++
+  }
+  return ''
+}
+/** item 5: the refusal (once per run) of a notify_joey / ask_joey that says the main takes over, from a run that handed nothing to the main */
+export function mainAskRefusal(tool: string, phrase: string): string {
+  return `沒有送出：這一則 ${tool} 說主線會接手或要主線做事（「${phrase}」），但這一趟沒有交給主線（沒有 handoff_main、decide_later、mailbox_card），主線不會被叫醒，也看不到。`
+    + '要主線做的：先用 handoff_main 交給它（寫清楚要它做什麼；等得起、只要它決定的用 decide_later），交了之後由主線回報 Joey，你不用再通知 Joey。'
+    + '不需要主線的：把那一句拿掉，再送一次。這個提醒一趟只有一次。'
+}
+/** item 6: what a notify_joey refused by the notice de-duplication says in its tool result (Joey already got the same line: the step is done) */
+export const DEDUPE_DONE_NOTE = '（Joey 已經收過同一則，這一步算做了：receipt 的 steps 裡回報 Joey 的那一步填 done=true。）'
+/** item 6: a step of a receipt that is the report to Joey (its words, or its note) */
+export const REPORT_STEP_RE = /joey|回報|通知|告訴|報給|報告|notify|report/i
+/** item 6: the steps as the receipt records them when this run's notify_joey was dropped by the de-duplication: a report step marked not done is done */
+export function dedupedSteps(steps: Step[]): { steps: Step[]; changed: number } {
+  let changed = 0
+  const out = steps.map(s => {
+    if (s.done || !REPORT_STEP_RE.test(`${s.step} ${s.note ?? ''}`)) return s
+    changed++
+    return { ...s, done: true, note: `${s.note ? `${s.note}；` : ''}Joey 已經收過同一則（通知被去重擋下），算做了` }
+  })
+  return { steps: out, changed }
+}
+
+/** item 8 (observation only, never a refusal): the commands of a Bash call that change state on another machine, as the guard sees the command: an ssh with
+ *  a remote command that restarts, rebuilds, removes, writes or reconfigures (docker / docker compose up·restart·down·rm…, systemctl restart·stop·start…,
+ *  rm, mv, a write, kill, nginx -s, kubectl apply…, ufw, iptables, package installs, git pull…), and scp / rsync to a remote destination. One entry per
+ *  remote host the command touches: { host, what: the changes found }. */
+export type RemoteChange = { host: string; what: string[] }
+/** the simple commands of a shell line (quotes removed, words kept whole); ; & | && || newline ( ) end a command. A heredoc after ssh becomes its remote command. */
+export function shellCommands(cmd: string): string[][] {
+  let src = String(cmd ?? '')
+  src = src.replace(/<<-?\s*(['"]?)([A-Za-z_][\w-]*)\1([^\n]*)\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/g, (_m, _q, _tag, rest: string, body: string, off: number) => {
+    const line = src.slice(src.lastIndexOf('\n', off) + 1, off)
+    return /(?:^|[\s;&|(])(?:\S*\/)?ssh\s/.test(line) ? `${rest} '${body.replace(/'/g, `'\\''`)}'` : rest
+  })
+  const out: string[][] = []
+  let cur: string[] = [], w = '', inW = false, i = 0
+  const push = (): void => { if (inW) { cur.push(w); w = ''; inW = false } }
+  const end = (): void => { push(); if (cur.length) out.push(cur); cur = [] }
+  while (i < src.length) {
+    const c = src[i]
+    if (c === "'") { const j = src.indexOf("'", i + 1); w += j < 0 ? src.slice(i + 1) : src.slice(i + 1, j); inW = true; i = j < 0 ? src.length : j + 1; continue }
+    if (c === '"') {
+      let j = i + 1
+      while (j < src.length && src[j] !== '"') { if (src[j] === '\\' && j + 1 < src.length) { w += src[j + 1]; j += 2; continue } w += src[j]; j++ }
+      inW = true; i = j + 1; continue
+    }
+    if (c === '\\' && i + 1 < src.length) { if (src[i + 1] !== '\n') { w += src[i + 1]; inW = true } i += 2; continue }
+    if (c === '#' && !inW) { while (i < src.length && src[i] !== '\n') i++; continue }
+    if (';&|\n()'.includes(c)) { end(); i++; continue }
+    if (/\s/.test(c)) { push(); i++; continue }
+    w += c; inW = true; i++
+  }
+  end()
+  return out
+}
+const WRAPPERS = new Set(['sudo', 'env', 'nohup', 'time', 'nice', 'ionice', 'command', 'exec', 'stdbuf', 'then', 'do', 'else', '{', '!'])
+const SSH_ARG_OPTS = new Set('BbcDEeFIiJLlmOoPpQRSWw'.split(''))
+const SCRATCH = /^(?:\/tmp\/|\/var\/tmp\/|\/dev\/)/
+const progOf = (w: string | undefined): string => String(w ?? '').replace(/^.*\//, '')
+/** the words of a command without its leading assignments and wrappers (sudo -u x, timeout 10, env A=b …) */
+function bare(words: string[]): string[] {
+  let k = 0
+  while (k < words.length) {
+    const w = words[k]
+    if (/^[A-Za-z_]\w*=/.test(w) || WRAPPERS.has(w)) { k++; if (w === 'sudo') while (k < words.length && words[k].startsWith('-')) k += ['-u', '-g', '-C', '-h', '-p'].includes(words[k]) ? 2 : 1; continue }
+    if (w === 'timeout') { k++; while (k < words.length && words[k].startsWith('-')) k++; k++; continue }
+    break
+  }
+  return words.slice(k)
+}
+const nonOpts = (ws: string[]): string[] => ws.filter(x => !x.startsWith('-'))
+/** the state changes one simple command makes on the machine it runs on (nested shells, docker exec and ssh not followed here, but by remoteChangesOf) */
+function changesOf(words0: string[], depth: number): string[] {
+  const words = bare(words0)
+  if (!words.length || depth > 4) return []
+  const out: string[] = []
+  // a write by redirect (> file, >> file), outside /tmp and /dev
+  for (let k = 0; k < words.length; k++) {
+    const m = words[k].match(/^\d*(>>?)(.*)$/)
+    if (!m) continue
+    const target = m[2] || words[k + 1] || ''
+    if (target && !target.startsWith('&') && !SCRATCH.test(target)) out.push(`${m[1]} ${target}`)
+  }
+  const p = progOf(words[0]), args = words.slice(1), sub = nonOpts(args)[0] ?? ''
+  const nested = (s: string | undefined): string[] => s ? shellCommands(s).flatMap(c => changesOf(c, depth + 1)) : []
+  switch (p) {
+    case 'bash': case 'sh': case 'zsh': case 'dash': { const i = args.indexOf('-c'); return [...out, ...(i >= 0 ? nested(args[i + 1]) : [])] }
+    case 'su': { const i = args.indexOf('-c'); return [...out, ...(i >= 0 ? nested(args[i + 1]) : [])] }
+    case 'docker': case 'podman': return [...out, ...dockerChanges(p, args, depth)]
+    case 'docker-compose': return [...out, ...composeChanges('docker-compose', args, depth)]
+    case 'systemctl': return ['restart', 'stop', 'start', 'reload', 'try-restart', 'reload-or-restart', 'try-reload-or-restart', 'enable', 'disable', 'mask', 'unmask', 'kill',
+      'daemon-reload', 'isolate', 'reboot', 'poweroff', 'halt', 'set-property', 'edit', 'revert'].includes(sub) ? [...out, `systemctl ${sub}`] : out
+    case 'service': { const a = nonOpts(args); return ['restart', 'stop', 'start', 'reload', 'force-reload'].includes(a[1] ?? '') ? [...out, `service ${a[0]} ${a[1]}`] : out }
+    case 'rm': case 'rmdir': case 'unlink': case 'shred': case 'mv': case 'cp': case 'truncate': case 'chmod': case 'chown': case 'chgrp': case 'ln': case 'install':
+    case 'mkdir': case 'touch': case 'tee': {
+      const paths = nonOpts(args).filter(a => !/^[0-7]{3,4}$|^[ugoa]*[+-=][rwxXst]+$/.test(a))
+      return paths.length && paths.every(a => SCRATCH.test(a)) ? out : [...out, p]
+    }
+    case 'dd': return args.some(a => a.startsWith('of=') && !SCRATCH.test(a.slice(3))) ? [...out, 'dd of='] : out
+    case 'sed': case 'perl': return args.some(a => /^-[A-Za-z]*i/.test(a) || a.startsWith('--in-place')) ? [...out, `${p} -i`] : out
+    case 'kill': case 'pkill': case 'killall': case 'reboot': case 'shutdown': case 'poweroff': case 'halt': return [...out, p]
+    case 'nginx': { const i = args.indexOf('-s'); return i >= 0 ? [...out, `nginx -s ${args[i + 1] ?? ''}`.trim()] : out }
+    case 'apachectl': case 'apache2ctl': return ['restart', 'graceful', 'stop', 'start', 'graceful-stop'].includes(sub) ? [...out, `${p} ${sub}`] : out
+    case 'kubectl': return ['apply', 'delete', 'create', 'replace', 'patch', 'edit', 'scale', 'rollout', 'set', 'label', 'annotate', 'drain', 'cordon', 'uncordon', 'taint'].includes(sub)
+      && !(sub === 'rollout' && ['status', 'history'].includes(nonOpts(args)[1] ?? '')) ? [...out, `kubectl ${sub}`] : out
+    case 'ufw': return ['allow', 'deny', 'reject', 'limit', 'delete', 'insert', 'enable', 'disable', 'reset', 'reload', 'route', 'default', 'prepend'].includes(sub) ? [...out, `ufw ${sub}`] : out
+    case 'iptables': case 'ip6tables': return args.some(a => /^-(?:[AIDRFXPNZ]|-append|-insert|-delete|-replace|-flush|-policy)$/.test(a)) ? [...out, p] : out
+    case 'apt': case 'apt-get': case 'yum': case 'dnf': case 'apk': case 'snap': return ['install', 'remove', 'purge', 'upgrade', 'dist-upgrade', 'full-upgrade', 'autoremove', 'add', 'del', 'refresh'].includes(sub) ? [...out, `${p} ${sub}`] : out
+    case 'pip': case 'pip3': return ['install', 'uninstall'].includes(sub) ? [...out, `${p} ${sub}`] : out
+    case 'git': return ['pull', 'push', 'checkout', 'reset', 'merge', 'rebase', 'commit', 'clean', 'stash', 'switch', 'restore', 'apply', 'am', 'cherry-pick', 'revert'].includes(sub) ? [...out, `git ${sub}`] : out
+    case 'crontab': return args.some(a => a === '-r' || a === '-e') || nonOpts(args).length ? [...out, 'crontab'] : out
+    case 'certbot': return ['renew', 'certonly', 'delete', 'revoke', 'install', 'run'].includes(sub) || !sub ? [...out, `certbot ${sub}`.trim()] : out
+  }
+  return out
+}
+const DOCKER_MUT = new Set(['run', 'start', 'stop', 'restart', 'kill', 'rm', 'rmi', 'create', 'pull', 'update', 'rename', 'pause', 'unpause', 'cp', 'load', 'import', 'commit', 'prune'])
+const DOCKER_GROUPS = new Set(['container', 'network', 'volume', 'image', 'system', 'service', 'stack', 'swarm', 'node', 'secret', 'config', 'plugin'])
+const DOCKER_GROUP_MUT = new Set([...DOCKER_MUT, 'connect', 'disconnect', 'remove', 'deploy', 'scale', 'rollback', 'init', 'join', 'leave', 'enable', 'disable', 'install', 'upgrade', 'push'])
+function dockerChanges(p: string, args: string[], depth: number): string[] {
+  let k = 0
+  while (k < args.length && args[k].startsWith('-')) k += ['-H', '--host', '-c', '--context', '--config', '-l', '--log-level'].includes(args[k]) ? 2 : 1
+  const sub = args[k] ?? ''
+  if (sub === 'compose') return composeChanges(`${p} compose`, args.slice(k + 1), depth)
+  if (sub === 'exec') return execChanges(`${p} exec`, args.slice(k + 1), ['-e', '--env', '-u', '--user', '-w', '--workdir', '--env-file'], depth)
+  if (DOCKER_GROUPS.has(sub)) {
+    const s2 = nonOpts(args.slice(k + 1))[0] ?? ''
+    if (sub === 'container' && s2 === 'exec') return execChanges(`${p} container exec`, args.slice(args.indexOf('exec', k) + 1), ['-e', '--env', '-u', '--user', '-w', '--workdir', '--env-file'], depth)
+    return DOCKER_GROUP_MUT.has(s2) ? [`${p} ${sub} ${s2}`] : []
+  }
+  return DOCKER_MUT.has(sub) ? [`${p} ${sub}`] : []
+}
+const COMPOSE_ARG_OPTS = new Set(['-f', '--file', '-p', '--project-name', '--project-directory', '--env-file', '--profile', '--ansi', '--parallel', '--progress'])
+const COMPOSE_MUT = new Set(['up', 'down', 'restart', 'stop', 'start', 'rm', 'kill', 'pull', 'create', 'run', 'pause', 'unpause', 'scale', 'cp'])
+function composeChanges(name: string, args: string[], depth: number): string[] {
+  let k = 0
+  while (k < args.length && (args[k].startsWith('-') || args[k].startsWith('$'))) k += COMPOSE_ARG_OPTS.has(args[k]) ? 2 : 1
+  const sub = args[k] ?? ''
+  if (sub === 'exec') return execChanges(`${name} exec`, args.slice(k + 1), ['-e', '--env', '-u', '--user', '-w', '--workdir', '--index'], depth)
+  if (!COMPOSE_MUT.has(sub) || args.slice(k + 1).includes('--dry-run')) return []
+  return [`${name} ${sub}`]
+}
+/** docker exec / compose exec: what the command it runs inside the container changes */
+function execChanges(name: string, args: string[], withValue: string[], depth: number): string[] {
+  let k = 0
+  while (k < args.length && args[k].startsWith('-')) k += withValue.includes(args[k]) ? 2 : 1
+  const inner = args.slice(k + 1)                                     // after the container (or service) name
+  return changesOf(inner, depth + 1).map(c => `${name} … ${c}`)
+}
+/** item 8: the remote changes of one Bash command (see RemoteChange) */
+export function remoteChanges(cmd: string, depth = 0): RemoteChange[] {
+  const out: RemoteChange[] = []
+  const add = (host: string, what: string[]): void => {
+    if (!what.length) return
+    const had = out.find(o => o.host === host)
+    if (had) had.what.push(...what.filter(w => !had.what.includes(w))); else out.push({ host, what: [...new Set(what)] })
+  }
+  if (depth > 3) return out
+  for (const c of shellCommands(cmd)) {
+    const words = bare(c)
+    const p = progOf(words[0])
+    if (p === 'ssh') {
+      let k = 1
+      while (k < words.length && words[k].startsWith('-') && words[k] !== '--') {
+        const letters = words[k].slice(1)
+        let needs = false
+        for (let x = 0; x < letters.length; x++) if (SSH_ARG_OPTS.has(letters[x])) { needs = x === letters.length - 1; break }
+        k += needs ? 2 : 1
+      }
+      if (words[k] === '--') k++
+      const host = words[k], remote = words.slice(k + 1).join(' ')
+      if (!host || !remote.trim()) continue
+      add(host, shellCommands(remote).flatMap(rc => changesOf(rc, 0)))
+      for (const r of remoteChanges(remote, depth + 1)) add(r.host, r.what)    // ssh through a jump host's shell
+      continue
+    }
+    if (p === 'scp' || p === 'rsync') {
+      const a = nonOpts(words.slice(1))
+      const dest = a.at(-1) ?? ''
+      const m = dest.match(/^(?:[^/:\s]+@)?([^/:\s]+):/)
+      const path = dest.slice(dest.indexOf(':') + 1)
+      if (a.length >= 2 && m && !SCRATCH.test(path) && !(p === 'rsync' && words.some(w => w === '-n' || w === '--dry-run' || /^-[A-Za-z]*n[A-Za-z]*$/.test(w)))) add(dest.slice(0, dest.indexOf(':')), [`${p} to remote`])
+    }
+  }
+  return out
 }
