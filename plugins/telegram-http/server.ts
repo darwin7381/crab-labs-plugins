@@ -1649,6 +1649,30 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
   }
 }
 
+// WO-126 (1.38.1): mailbox_decide lives on the main's Telegram server (claude-code re-lists that server's tools on tools/list_changed; a main
+// initialized before an upgrade never re-lists the agent-inbox server's). The Telegram daemon has no mesh credential: it hands the call to the
+// agent-inbox daemon (POST /mail/decide, the loopback token), which records it in BTCC and hands the router the mail_decision event.
+let decideListed: { at: string; session: string | null } | null = null      // the last time the registered main listed it (healthz: who has it)
+function noteDecideListed(sid: string | undefined): typeof DECIDE_TOOL {
+  decideListed = { at: new Date().toISOString(), session: sid ?? null }
+  return DECIDE_TOOL
+}
+async function inboxDecide(args: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
+  const port = Number(process.env.LANES_INBOX_PORT ?? 0)
+  if (!port) return { text: 'mailbox_decide: this agent has no agent-inbox daemon (LANES_INBOX_PORT is not set); nothing was recorded.', isError: true }
+  let tok = ''
+  try { tok = readFileSync(join(process.env.MCP_TOKEN_DIR ?? join(homedir(), '.claude', 'agent-inbox', 'mcp-tokens'), String(port)), 'utf8').trim() } catch {}
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/mail/decide`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+      body: JSON.stringify({ id: args.id, decision: args.decision, ...(args.note != null ? { note: args.note } : {}) }), signal: AbortSignal.timeout(20_000) })
+    const j: any = await r.json().catch(() => null)
+    if (j && typeof j.text === 'string') return { text: j.text, isError: !!j.isError }
+    return { text: `沒有記下：agent-inbox daemon 回 ${r.status}。決定沒有送出，稍後再回一次。`, isError: true }
+  } catch (e) {
+    return { text: `沒有記下：agent-inbox daemon 連不上（${String(e).slice(0, 80)}）。決定沒有送出，稍後再回一次。`, isError: true }
+  }
+}
+
 // lanes-golive: the router's event for a mesh notification (an /inject, a hub row, a wake-up line of this daemon's own). Every field comes from the
 // notification's meta, which the /inject handler (or hub sync, or the keep-warm) filled from the body; nothing is read from the text except what has no
 // field yet (wakeKind: the watchdog's marker).
@@ -1850,7 +1874,9 @@ function buildServer(): Server {
   const mcp = new Server(
     { name: INBOX_ONLY ? 'agent-inbox' : 'telegram-http', version: '1.0.0' },
     INBOX_ONLY ? {
-      capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
+      // WO-126 (1.38.1): with lanes on, declared as on the Telegram server (002m LG1). claude-code acts on tools/list_changed only from a server that
+      // declared it at initialize; without it the inbox's notice after a restart was ignored (Chiron's main, 11-24). Sessions initialized from now on.
+      capabilities: { tools: Lanes.LANES_ON ? { listChanged: true } : {}, experimental: { 'claude/channel': {} } },
       // the one place that says how to reach another agent and how to read what arrives (WO-99 v3; Chiron's
       // words verbatim, inbox-text.ts). Claude Code caps a server's instructions: measured 4,096 chars (11-16).
       instructions: INBOX_TEXT,
@@ -1936,8 +1962,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
      const r = await coreFeed('GET', '/api/feed/me', undefined, 1500)
      ask = r.status === 200 && r.json?.ask === true
    } catch {}
-   // WO-126: mailbox_decide only with lanes on (a card exists only where lanes put one)
-   const tools = [...INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask), ...(Lanes.LANES_ON ? [DECIDE_TOOL] : [])]
+   // WO-126 (1.38.1): mailbox_decide is listed on the main's Telegram server, not here: a running main never re-lists this server's tools (its
+   // session was initialized without listChanged), so a tool added here reached no main that was already running. A session that already holds
+   // the agent-inbox one can still call it (callInboxTool answers it).
+   const tools = INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask)
    // lanes (002) on top of WO-99: thread / hop on send_to_agent, read only on the call line (laneMainDeps below)
    return { tools: Lanes.LANES_ON ? tools.map(t => t.name === 'send_to_agent' ? withLaneSendProps(t) : t) : tools }
  }
@@ -2017,7 +2045,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['chat_id', 'message_id', 'text'],
       },
     },
-    ...(Lanes.LANES_ON ? Lanes.mainToolDefs() : []),
+    ...(Lanes.LANES_ON ? [...Lanes.mainToolDefs(), noteDecideListed(serverSessionId.get(mcp))] : []),
   ],
  })
 })
@@ -2045,6 +2073,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     } catch (e) {
       return { content: [{ type: 'text', text: `tool error: ${String(e).slice(0, 200)}` }], isError: true }
     }
+  }
+  // WO-126 (1.38.1): the main's mailbox_decide, on this (the Telegram) server; the agent-inbox daemon holds the agent's credential and the event queue
+  if (Lanes.LANES_ON && !INBOX_ONLY && req.params.name === DECIDE_TOOL.name) {
+    if (await Lanes.notMainSession(serverSessionId.get(mcp))) return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
+    const r = await inboxDecide(args)
+    return { content: [{ type: 'text', text: r.text }], ...(r.isError ? { isError: true } : {}) }
   }
   try {
     if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.isMainTool(req.params.name)) {
@@ -4007,6 +4041,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         active_sessions: activeServers.size,
         sessions_with_open_sse: [...sseOpen.values()].filter(Boolean).length,  // issue #3: live vs zombie
+        ...(Lanes.LANES_ON && !INBOX_ONLY ? { mailbox_decide_listed: decideListed } : {}),   // WO-126: the main listed mailbox_decide (when, which session)
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,
@@ -4219,6 +4254,18 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     // /fleet — the agent-inbox plugin's second MCP server (fleet-mail.ts): the fleet's main text as its
     // instructions + call / mail / mailbox tools. Stateless JSON-RPC: no session, no SSE, never a channel,
     // so inbound delivery stays on /mcp alone. Same loopback token as /mcp.
+    // WO-126 (1.38.1): the main's mailbox_decide, handed over by this agent's Telegram daemon (its tool lives there); same loopback token as /mcp
+    if (INBOX_ONLY && Lanes.LANES_ON && u.pathname === '/mail/decide' && req.method === 'POST') {
+      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {
+        const r = refusal(req.headers['authorization'] as string | undefined)
+        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
+        return
+      }
+      const b = (await readJsonBody(req).catch(() => null) ?? {}) as Record<string, unknown>
+      const out: any = await callInboxTool('mailbox_decide', b, laneMainDeps(b), false).catch(e => ({ content: [{ type: 'text', text: `tool error: ${String(e).slice(0, 200)}` }], isError: true }))
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ text: String(out?.content?.[0]?.text ?? ''), isError: !!out?.isError }))
+      return
+    }
     if (INBOX_ONLY && u.pathname === '/fleet') {
       if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?',
                          req.headers['user-agent'] as string | undefined)) {

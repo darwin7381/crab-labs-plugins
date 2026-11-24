@@ -1,3 +1,20 @@
+## 1.38.1 — 2026-11-24
+
+- **Lanes on: `mailbox_decide` is a tool of the main's Telegram server, so a main that was already running gets it (WO-126; agent-inbox 1.8.1 carries the same code).**
+  - **What happened (Chiron, WO-126 returned 11-24 00:52Z):** Chiron's main (session 68de57d0, running since 11-23 10:13Z) had no `mailbox_decide`
+    after the 1.38.0 wave, while the same restart did bring it telegram-http's `append_file`. The agent-inbox server declared `capabilities.tools: {}`
+    (no `listChanged`); claude-code acts on `tools/list_changed` only from a server that declared it at initialize, so 1.37.2's notice after a restart
+    was ignored on that server. 1.37.2's canary was wrong: it restarted epeius's inbox daemon with bootout/bootstrap (down > 2 s), the client
+    re-initialized (`MCP session opened: 2c154821…`, not `resumed`) and listed everything anew; a wave's `kickstart -k` resumes the session id and
+    never lists again.
+  - **What changed:** the Telegram daemon lists `mailbox_decide` with the main's lane tools (lanes on; a session that is not the registered main gets
+    no tools there, and a call from one is refused). It has no mesh credential, so the call goes to the agent's agent-inbox daemon (`POST /mail/decide`,
+    the loopback token), which records it in BTCC and hands the router `mail_decision` as before. The agent-inbox server no longer lists it (a session
+    that already holds the agent-inbox one can still call it) and, with lanes on, declares `listChanged` too: sessions initialized from now on act on it.
+  - **Who has it:** the Telegram daemon records the last time the registered main listed its tools with `mailbox_decide` in `/healthz`
+    (`mailbox_decide_listed`: at, session). `claude-epeius/monitors/rollout/decide_reach.py` counts it across the three machines.
+  - Tests: `fleet-mail-wo126` pins the moved listing, the forward and the route.
+
 ## 1.38.0 — 2026-11-24
 
 - **Lanes on: one round trip. The main answers one decision; the lane that asked finishes the work (WO-127; Joey 「那就試試看吧、記得同步紀錄觀察點」, TG chiron:2095; agent-inbox 1.8.0 carries the same code).**

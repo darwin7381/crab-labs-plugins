@@ -105,7 +105,16 @@ test('tool shapes: the main\'s list is unchanged (mailbox_decide is added by ser
   expect(LANE_DECIDE_LATER_TOOL.inputSchema.required).toEqual(['title', 'card'])
   expect(MAILBOX_CARD_TOOL.inputSchema.required).toEqual(['id', 'card'])
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain("...(Lanes.LANES_ON ? [DECIDE_TOOL] : [])")
+  // 1.38.1: mailbox_decide is listed on the main's Telegram server (a running main re-lists that one on tools/list_changed; it never re-listed the
+  // agent-inbox server, whose capability lacked listChanged: Chiron's main, 11-24); the Telegram daemon hands the call to the agent-inbox daemon
+  expect(src).toContain("...(Lanes.LANES_ON ? [...Lanes.mainToolDefs(), noteDecideListed(serverSessionId.get(mcp))] : [])")
+  expect(src).toContain("capabilities: { tools: Lanes.LANES_ON ? { listChanged: true } : {}, experimental: { 'claude/channel': {} } },")
+  expect(src).toContain("const tools = INBOX_TOOLS.filter(t => t.name !== 'feed_ask' || ask)")
+  expect(src).toContain("if (Lanes.LANES_ON && !INBOX_ONLY && req.params.name === DECIDE_TOOL.name) {")
+  expect(src).toContain("const r = await fetch(`http://127.0.0.1:${port}/mail/decide`")
+  expect(src).toContain("if (INBOX_ONLY && Lanes.LANES_ON && u.pathname === '/mail/decide' && req.method === 'POST') {")
+  expect(src).toContain("const out: any = await callInboxTool('mailbox_decide', b, laneMainDeps(b), false)")
+  expect(src).toContain("mailbox_decide_listed: decideListed")
   expect(src).toContain("mailEvent: (decided: any) => mailEvents.emit(decisionEvent(decided))")
   expect(src).toContain("btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`)")
   expect(src).toContain("{ ...fleetDeps, openBy: 'lane', lane }")
