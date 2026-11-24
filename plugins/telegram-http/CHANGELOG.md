@@ -1,3 +1,13 @@
+## 1.39.1 — 2026-11-24
+
+- **Lanes on: the mail lane's read before a reply is 車道讀過; a card's no_reply comes in BTCC's answer (Sonn #11115; agent-inbox 1.9.1 carries the same code).**
+  - **What happened:** before a mail lane's `mailbox_reply`, the agent-inbox daemon reads the original to find whom the reply goes to (the disclosure
+    check). That read had no `?by=lane`, so BTCC took it as the main's open: a mail the lane answered showed 「主線已讀」 to its sender and on the main's
+    list (WO-124's two reads, wrong for every lane reply since 1.35.2).
+  - **What changed:** that read carries `?by=lane`. BTCC `6bd7fc2` puts `no_reply` in the answers to `/{id}/card`, `/{id}/decide` and `/lane-item`;
+    the lane's `mailbox_card` takes it from the card answer and reads the mail again only when an older BTCC does not say it (1.38.3's extra read).
+  - Tests: `fleet-mail-wo126` pins both lines; BTCC test_mail 156/0. Suite 955: 952 pass, 3 skip, 0 fail.
+
 ## 1.39.0 — 2026-11-24
 
 - **Lanes on: the run a schedule gave a lane has one receipt path, and it always carries steps; steps not done are visible to Joey and to the scheduler (board WO-129, Chiron's ticket; agent-inbox 1.9.0 carries the same code).**

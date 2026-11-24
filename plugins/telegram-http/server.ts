@@ -3963,10 +3963,11 @@ if (Lanes.LANES_ON) {
           const btcc = async (m: 'GET' | 'POST', path: string, b?: unknown) => { const r = await btccMail(m, path, b); if (m === 'POST' && /^\/api\/mesh\/mail\/(lane-item|\d+\/card)/.test(path)) got = r; return r }
           const res: any = await callInboxTool(name, args, { ...fleetDeps, btcc, openBy: 'lane', lane }, false)
           const j = (got as { status: number; json: any } | null)?.status === 200 ? (got as unknown as { json: any }).json : null
-          // WO-131 (1.38.3, Chiron mail #11059 item 1): whether the carded mail was sent no_reply. BTCC's card and decide answers do not carry it; the mail
-          // record does (GET by=lane: the card already made it lane_read, so the read changes nothing). Unreadable: not said (the decision's run answers it).
-          let noReply: boolean | undefined
-          if (name === 'mailbox_card' && j && typeof j.id === 'number') {
+          // WO-131 (1.38.3, Chiron mail #11059 item 1): whether the carded mail was sent no_reply. BTCC 6bd7fc2 (Sonn #11115) says it in the card answer;
+          // an older BTCC does not, and then the mail record does (GET by=lane: the card already made it lane_read, so the read changes nothing).
+          // Unreadable: not said (the decision's run answers it).
+          let noReply: boolean | undefined = typeof j?.no_reply === 'boolean' ? j.no_reply : undefined
+          if (noReply === undefined && name === 'mailbox_card' && j && typeof j.id === 'number') {
             const m = await btccMail('GET', `/api/mesh/mail/${j.id}?by=lane`).catch(() => null)
             if (m?.status === 200 && typeof m.json?.no_reply === 'boolean') noReply = m.json.no_reply
           }
@@ -3975,7 +3976,8 @@ if (Lanes.LANES_ON) {
         }
         let to: string | undefined
         if (name === 'mailbox_reply' && Number(args.id) > 0) {
-          const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}`).catch(() => null)
+          // Sonn #11115: the lane reads the original only to know whom the reply goes to; by=lane, so the main's 「主線已讀」 stays the main's (WO-124)
+          const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}?by=lane`).catch(() => null)
           to = m?.status === 200 && m.json?.from ? String(m.json.from) : undefined
           if (to) { const refused = await Lanes.checkPeerSend(lane, to, String(args.body ?? ''), true); if (refused) return { text: refused, isError: true, to } }   // a reply answers the mail
         }
