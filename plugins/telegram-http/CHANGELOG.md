@@ -1,3 +1,11 @@
+## 1.42.1 — 2026-11-25
+
+- **Onsen (WO-139; agent-inbox 1.12.1 carries the same code): every message this daemon sends is recorded, not only the four paths of 1.42.0.**
+  - One place records them all (the grammy transformer and `callBotApi`); each path names its sender: `main` (reply text and files, edit_message, react), the lane id or `router` (lane lines, tellJoey, notify_joey / ask_joey, topic lines), `system:alert` (TUI warnings, ops alerts, usage-wall enter / clear), `system:duty-officer`, `system:login-watchdog`, `system:startup-picker`, `system:permission`, `system:pairing`, `system:ack`, `system:control` (control slash commands, roamer replies, the daemon-answered /start /help /status /main /lanes, whose command is recorded as an `in` command), `system:button` (what a button press sends). A send outside every named path is recorded as `system:daemon`.
+  - An allowlisted person editing a message they sent (Telegram `edited_message`, already delivered by default) becomes an edit event on it. Recording only; nothing is routed.
+  - Not recorded: a stranger's pairing prompt and the answers to their /start or /help (their messages never are); reactions Joey adds (Telegram sends them only with `allowed_updates`, which would change polling); typing, toasts, menu and topic management calls; failed edits and reactions. Programs that send with the bot token outside the daemon (`~/.claude/tools/quota-poller.py`) are listed on WO-139.
+  - Test `onsen-paths` (5). Suite 1026: 1021 pass, 3 skip, 2 fail (lanes-m3-obligations and main-hook-turn timed out at 5 s under load ~150; alone they pass).
+
 ## 1.42.0 — 2026-11-25
 
 - **Onsen, Relay step 1 (WO-139; agent-inbox 1.12.0 carries the same code): every message between Joey and the agent is recorded in Onsen, and the agent can look it up (`chat_history`).**
