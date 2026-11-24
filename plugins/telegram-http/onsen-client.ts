@@ -35,10 +35,16 @@ export const idemOut = (agent: string, chat: string, id: string | number): strin
 export const idemOutFailed = (agent: string, chat: string): string => `tg:${agent}:${chat}:out-failed:${randomUUID()}`
 
 // ------------------------------------------------------------------ who is sending (server.ts sets it around each send path)
-export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean }
+export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean; skip?: boolean }
 const als = new AsyncLocalStorage<SendCtx>()
+/** the author of a Telegram call made outside every named send path (server.ts records it all the same) */
+export const DEFAULT_CTX: SendCtx = { sender: 'system:daemon' }
 /** run `fn` with `sender` as the author of every Telegram call it makes */
 export function withSender<T>(sender: string, fn: () => T): T { return als.run({ sender }, fn) }
+/** `sender` unless a caller already named the author (a shared helper: its callers name themselves) */
+export function withDefaultSender<T>(sender: string, fn: () => T): T { return als.getStore() ? fn() : als.run({ sender }, fn) }
+/** the Telegram calls `fn` makes are not recorded (a stranger's pairing: not part of any conversation Onsen keeps) */
+export function withoutRecord<T>(fn: () => T): T { return als.run({ sender: '', skip: true }, fn) }
 /** inside a send: this call is part i of n of one text */
 export function withPart<T>(part: number, parts: number, fn: () => T): T {
   const c = als.getStore()
@@ -116,6 +122,15 @@ export function inboundItem(agent: string, m: any, body: string): OnsenItem {
     ...(shape.attachments ? { attachments: shape.attachments } : {}), status: 'ok', backfilled: false,
     ...(Object.keys(meta).length ? { meta } : {}),
   }
+}
+
+/** an allowlisted person edited a message they sent (Telegram edited_message): an edit event, the new full text. Keyed by edit_date: a re-delivered update is
+ *  the same event. */
+export function inboundEdit(agent: string, m: any): OnsenEvent {
+  const chat = String(m?.chat?.id ?? ''), id = String(m?.message_id ?? '')
+  const body = String(m?.text ?? m?.caption ?? '')
+  return { idem_key: `tg:${agent}:${chat}:edit:${id}:${m?.edit_date ?? Math.floor(Date.now() / 1000)}`, agent, client: 'telegram', chat, target_client_msg_id: id, kind: 'edit',
+    actor: `tg:${m?.from?.id ?? '?'}`, body, at: iso(m?.edit_date) }
 }
 
 const OUT_KIND: Record<string, OnsenItem['kind']> = {

@@ -364,7 +364,7 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
-/** Onsen (WO-139): record one Bot API call made inside a send context (never throws). A rich attempt's failure is not recorded when the plain fallback
+/** Onsen (WO-139): record one Bot API call (never throws); its author is the send context (Onsen.withSender), system:daemon outside every named path. A rich attempt's failure is not recorded when the plain fallback
  *  follows (it is the message); a timeout has no fallback (item 7), so it is recorded as failed. */
 function onsenNote(ctx: Onsen.SendCtx, method: string, payload: unknown, result: unknown, err?: unknown): void {
   if (!onsen) return
@@ -380,12 +380,12 @@ function onsenIn(m: any, text: string, transcript?: string): void {
     onsen.recordMessage(Onsen.inboundItem(ONSEN_AGENT, m, body))
   } catch {}
 }
-// Onsen (WO-139): the one place every grammy Bot API call passes (callBotApi has its own). A call made inside a send context (Onsen.withSender: who
-// sends) is recorded after Telegram answers: a message with its message_id, an edit / a reaction as an event, a failure as a failed message. Recording
+// Onsen (WO-139): the one place every grammy Bot API call passes (callBotApi has its own). Every message sent, edited or reacted to is recorded after
+// Telegram answers, under the send context's author (Onsen.withSender; system:daemon outside every named path; Onsen.withoutRecord: not at all): a message with its message_id, an edit / a reaction as an event, a failure as a failed message. Recording
 // only appends to the local spool: the call's own result or error is returned unchanged.
 bot.api.config.use(async (prev, method, payload, signal) => {
-  const octx = onsen && Onsen.RECORDED_METHODS.has(method) ? Onsen.sendCtx() : undefined
-  if (!octx) return prev(method, payload, signal)
+  const octx = onsen && Onsen.RECORDED_METHODS.has(method) ? Onsen.sendCtx() ?? Onsen.DEFAULT_CTX : undefined
+  if (!octx || octx.skip) return prev(method, payload, signal)
   let res: any
   try { res = await prev(method, payload, signal) } catch (e) { onsenNote(octx, method, payload, undefined, e); throw e }
   onsenNote(octx, method, payload, res?.ok ? res.result : undefined, res?.ok ? undefined : new Error(`${method}: ${res?.error_code ?? '?'} ${res?.description ?? 'unknown error'}`))
@@ -654,7 +654,7 @@ function checkApprovals(): void {
 
   for (const senderId of files) {
     const file = join(APPROVED_DIR, senderId)
-    void bot.api.sendMessage(senderId, "Paired! Say hi to Claude.").then(
+    void Onsen.withSender('system:pairing', () => bot.api.sendMessage(senderId, "Paired! Say hi to Claude.")).then(   // Onsen (WO-139)
       () => rmSync(file, { force: true }),
       err => {
         log('error', `failed to send approval confirm: ${err}`)
@@ -747,8 +747,8 @@ async function callBotApi(method: string, payload: Record<string, unknown>): Pro
 }
 /** Onsen (WO-139): the raw sends are recorded as the grammy ones are (inside a send context only) */
 function onsenRaw(method: string, payload: unknown, result: unknown, err?: unknown): void {
-  const octx = onsen && Onsen.RECORDED_METHODS.has(method) ? Onsen.sendCtx() : undefined
-  if (octx) onsenNote(octx, method, payload, result, err)
+  const octx = onsen && Onsen.RECORDED_METHODS.has(method) ? Onsen.sendCtx() ?? Onsen.DEFAULT_CTX : undefined
+  if (octx && !octx.skip) onsenNote(octx, method, payload, result, err)
 }
 
 /**
@@ -799,7 +799,7 @@ async function sendTextWithMaybeKeyboard(
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1
     try {
-      const m = await bot.api.sendMessage(chatId, chunks[i], { ...tf, ...(isLast && kb ? { reply_markup: kb } : {}) })
+      const m = await Onsen.withDefaultSender('system:control', () => bot.api.sendMessage(chatId, chunks[i], { ...tf, ...(isLast && kb ? { reply_markup: kb } : {}) }))   // Onsen (WO-139)
       if (where) sentIn(chatId, [m?.message_id], tf)
     } catch (err) {
       log('warn', `sendTextWithMaybeKeyboard failed: ${err instanceof Error ? err.message : err}`)
@@ -1989,7 +1989,7 @@ function buildServer(): Server {
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
     for (const chat_id of opsRecipients(access)) {
-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+      void Onsen.withSender('system:permission', () => bot.api.sendMessage(chat_id, text, { reply_markup: keyboard })).catch(e => {   // Onsen (WO-139)
         log('error', `permission_request send to ${chat_id} failed: ${e}`)
       })
     }
@@ -2213,9 +2213,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
-        await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
+        await Onsen.withSender('main', () => bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [   // Onsen (WO-139): a reaction event
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
-        ])
+        ]))
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'download_attachment': {
@@ -2336,7 +2336,7 @@ if (isSystemAlertEnabled()) {
       // lanes on (Sonn #10731): the enter alert also says the main's messages are held, none lost; lanes off: text unchanged
       enterNote: Lanes.LANES_ON ? () => lanesEnterNote(Lanes.mainHeldCount()) : undefined })),
     keeperAlive: () => wallKeeperAlive(),   // WO-120: an agent's first wall is waited for, not sent raw beside the enter alert
-    notify: text => {
+    notify: text => Onsen.withSender('system:alert', () => {   // Onsen (WO-139): TUI warnings, ops alerts, usage-wall enter / clear
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
         // Log the success too (2026-09-10, Hephaestus 3451): "forwarded" alone
@@ -2349,7 +2349,7 @@ if (isSystemAlertEnabled()) {
           log('error', `system-alert send to ${chat_id} failed: ${e}`)
         })
       }
-    },
+    }),
   })
 }
 
@@ -2433,7 +2433,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
     tmux: realTmux,
     model: askModelCli,
     recipients: () => opsRecipients(loadAccess()),
-    send: async (chats, text, buttons) => {
+    send: (chats, text, buttons) => Onsen.withSender('system:duty-officer', async () => {   // Onsen (WO-139)
       const kb = buttons ? (() => {
         const k = new InlineKeyboard()
         buttons.forEach((row, i) => { if (i > 0) k.row(); for (const b of row) k.text(b.text, b.callback_data) })
@@ -2447,9 +2447,9 @@ if (isControlEnabled() || isRoamerEnabled()) {
         } catch (e) { log('error', `duty-officer send to ${chat} failed: ${e}`) }
       }
       return out
-    },
+    }),
     edit: async (s, text) => {
-      try { await bot.api.editMessageText(s.chat, s.msg, text, { reply_markup: { inline_keyboard: [] } }) }
+      try { await Onsen.withSender('system:duty-officer', () => bot.api.editMessageText(s.chat, s.msg, text, { reply_markup: { inline_keyboard: [] } })) }   // Onsen (WO-139)
       catch (e) { log('warn', `duty-officer edit ${s.chat}/${s.msg} failed: ${e}`) }
     },
     // lanes-golive (C8): the main's usage-limit menu is the lanes main-wall probe's (one owner); the duty officer leaves it alone
@@ -2488,14 +2488,14 @@ if (isControlEnabled() || isRoamerEnabled()) {
   startStartupPickerWatchdog({
     listTargets: paneWatchTargets,
     skip: tmux => dutyOfficer?.handles(tmux) ?? false,
-    surface: ({ title, buttons }) => {
+    surface: ({ title, buttons }) => Onsen.withSender('system:startup-picker', () => {   // Onsen (WO-139)
       const access = loadAccess()
       const keyboard = buttons.map(b => [b])
       for (const chat_id of opsRecipients(access)) {
         void sendTextWithMaybeKeyboard(chat_id, title, keyboard).catch(e =>
           log('error', `startup-picker surface to ${chat_id} failed: ${e}`))
       }
-    },
+    }),
     log,
     // 002y (X-1): with lanes on, the main's limit menu in its wall is the lanes main-wall mechanism's (one owner); lanes off: no owner, as before
     ...(Lanes.LANES_ON && !INBOX_ONLY ? { owner: (t: WatchTarget, pk: { options: string[] }) =>
@@ -2506,14 +2506,14 @@ if (isControlEnabled() || isRoamerEnabled()) {
 if (isControlEnabled() || isRoamerEnabled()) {
   startLoginExpiredWatchdog({
     listTargets: paneWatchTargets,
-    notify: text => {
+    notify: text => Onsen.withSender('system:login-watchdog', () => {   // Onsen (WO-139)
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
         void bot.api.sendMessage(chat_id, text).catch(e => {
           log('error', `login-expired alert send to ${chat_id} failed: ${e}`)
         })
       }
-    },
+    }),
     log,
   })
 }
@@ -2542,6 +2542,33 @@ bot.use(async (ctx, next) => {
     log('info', `inbound u=${ctx.update.update_id} chat=${m.chat?.id} msg=${m.message_id} kind=${kind}${m.media_group_id ? ` mgid=${m.media_group_id}` : ''}${m.document?.file_name ? ` name=${safeName(m.document.file_name)}` : ''}${shape}`)
   }
   await next()
+})
+
+// Onsen (WO-139): a command the daemon answers itself (bot.command below: it never reaches handleInbound) is recorded as Joey's message when its sender
+// is allowlisted, and the answer as system:control (a stranger's /start and its answer are not recorded: their messages never are). What a button press
+// sends (the callback handlers) is system:button unless its path names itself.
+const ONSEN_DAEMON_COMMANDS = new Set(['start', 'help', 'status', ...(Lanes.LANES_ON ? ['main', 'lanes'] : [])])
+bot.use(async (ctx, next) => {
+  if (!onsen) return next()
+  if (ctx.callbackQuery) return Onsen.withSender('system:button', () => next())
+  const m = ctx.message
+  const cmd = m?.text?.startsWith('/') ? m.text.slice(1).split(/[\s@]/)[0]!.toLowerCase() : ''
+  if (!m || !ONSEN_DAEMON_COMMANDS.has(cmd)) return next()
+  let allowed = false
+  try { allowed = m.chat.type === 'private' && loadAccess().allowFrom.includes(String(m.from?.id)) } catch {}
+  if (!allowed) return Onsen.withoutRecord(() => next())
+  onsenIn(m, m.text!)
+  return Onsen.withSender('system:control', () => next())
+})
+// Onsen (WO-139): an allowlisted person edits a message they sent: an edit event on it (the new full text). Recording only; nothing is routed.
+bot.on('edited_message', ctx => {
+  const m: any = ctx.editedMessage
+  if (!onsen || !m?.from) return
+  try {
+    const a = loadAccess(), chat = String(m.chat?.id ?? '')
+    const ok = m.chat?.type === 'private' ? a.allowFrom.includes(String(m.from.id)) : !!a.groups?.[chat] && (a.groups[chat]!.allowFrom.length === 0 || a.groups[chat]!.allowFrom.includes(String(m.from.id)))
+    if (ok) onsen.recordEvent(Onsen.inboundEdit(ONSEN_AGENT, m))
+  } catch {}
 })
 
 bot.command('start', async ctx => {
@@ -3123,9 +3150,9 @@ async function handleInbound(
     // #16: show remaining validity so a stale code in scrollback is
     // recognizably dead (30min TTL; expired codes are auto-pruned).
     const mins = pairingRemainingMin(result.expiresAt)
-    await ctx.reply(
+    await Onsen.withoutRecord(() => ctx.reply(   // Onsen (WO-139): a stranger's pairing: not part of any recorded conversation
       `${lead} — run in Claude Code:\n\n/telegram:access pair ${result.code}\n\n(code expires in ~${mins} min)`,
-    )
+    ))
     return
   }
 
@@ -3158,9 +3185,9 @@ async function handleInbound(
     }
     if (msgId != null) {
       const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
-      void bot.api.setMessageReaction(chat_id, msgId, [
+      void Onsen.withSender('system:permission', () => bot.api.setMessageReaction(chat_id, msgId, [   // Onsen (WO-139)
         { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-      ]).catch(() => {})
+      ])).catch(() => {})
     }
     return
   }
@@ -3178,10 +3205,10 @@ async function handleInbound(
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
   if (access.ackReaction && msgId != null) {
-    void bot.api
+    void Onsen.withSender('system:ack', () => bot.api   // Onsen (WO-139)
       .setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
-      ])
+      ]))
       .catch(() => {})
   }
 
