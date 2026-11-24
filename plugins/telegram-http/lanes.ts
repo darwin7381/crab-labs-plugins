@@ -36,6 +36,7 @@ import {
   type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk,
 } from './lanes-boundary.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
+import { CHAT_HISTORY_TOOL } from './onsen-tool.ts'   // Onsen (WO-139): the definition only; the query comes through LanesDeps.chatHistory
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING, LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } from './fleet-mail.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
@@ -169,7 +170,7 @@ export interface LanesDeps {
   /** MCP session `sid` has its stream open */
   streamOpen?: (sid: string) => boolean
   /** tg role: bot calls. `label`: the text's first line is this lane label (〔agent·…〕), kept as its own first line when the text is rendered */
-  sendBot?: (chat_id: string, text: string, opts: { silent?: boolean; topic?: number; replyTo?: number; label?: string }) => Promise<number>
+  sendBot?: (chat_id: string, text: string, opts: { silent?: boolean; topic?: number; replyTo?: number; label?: string; laneId?: string }) => Promise<number>   // Onsen (WO-139): laneId = who sends (none: the router)
   createTopic?: (chat_id: string, name: string) => Promise<number>
   /** lanes-topics (item 1): may the bot open a work topic now (lanes-topics.ts topicVerdict over a fresh getMe)? usable false = the main does the work */
   topicsUsable?: () => Promise<TopicVerdict>
@@ -201,6 +202,8 @@ export interface LanesDeps {
   wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
   /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall) */
   usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
+  /** Onsen (WO-139): the chat_history tool's answer (server.ts: onsen-client.ts queryHistory); absent = no Onsen here */
+  chatHistory?: (args: Record<string, unknown>) => Promise<string>
 }
 /** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
  *  or put the menu in front of Joey again with a fresh debounce */
@@ -3743,7 +3746,7 @@ async function pushJoey(lane: Lane | undefined, text: string, silent: boolean, r
   // the true owner of the event is stamped on the message whenever it is not the lane that writes (M3; a wrong claim in the text is corrected here)
   const head = lane ? `〔${D.agent}·${laneLabel(lane)}${owner && owner !== laneLabel(lane) ? `｜負責：${owner}` : ''}〕` : `〔${D.agent}·分流器〕`
   try {
-    const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { silent, topic: lane?.topic, label: head, ...(replyTo ? { replyTo } : {}) })
+    const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { silent, topic: lane?.topic, label: head, ...(replyTo ? { replyTo } : {}), ...(lane ? { laneId: lane.id } : {}) })   // Onsen (WO-139): laneId
     if (lane) { S.botmsgs[String(id)] = lane.id; saveState() }
     return id
   } catch (e) { D.log('error', `lanes: push to Joey failed: ${e}`); return null }
@@ -4342,6 +4345,7 @@ export const LANE_TOOLS = [
     inputSchema: { type: 'object', properties: { after_minutes: { type: 'number', description: 'minutes from now (1-240)' }, note: { type: 'string', description: 'what to check again, what to do if it still holds, the scheduler run_id if any' } }, required: ['after_minutes', 'note'] } },
   { name: 'ask_joey', description: 'Ask Joey to decide, or tell him something he must know now (critical, suspicious, beyond what you can fix and it cannot wait). Always rings, so use it once per event and say everything in that one message: what happened, what you found, what you did, what he must decide. The main reads it in its next digest; do NOT also hand it to the main.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, outcome: { type: 'string', enum: ['normal', 'changed', 'failed'], description: 'normal (nothing new: Joey reads your first line), changed, or failed (he reads it all)' }, service: { type: 'string', description: 'the service the line is about (e.g. btcc-api); empty when it is about no service' }, check: { type: 'string', description: 'what about it (e.g. health, latency, backup): with service, the matter. Joey gets one line per matter and outcome across events: a repeat is not sent' } }, required: ['text'] } },
+  CHAT_HISTORY_TOOL,   // Onsen (WO-139): the conversation's history, read only (D.chatHistory)
   { name: 'handoff_main', description: 'Hand this work to the main session (a promise on behalf of the agent, an irreversible action, something that needs the main\'s context or tools). The main is woken with your text, takes over and reports to Joey itself. Do NOT notify Joey about it yourself.',
     inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'everything the main needs: who asked what (ids, exact text), what you found, what is left to do' } }, required: ['text'] } },
   { name: 'receipt', description: 'Closing report of a lane run, and the execution receipt of a scheduled routine ([scheduled][...][run:N]; pass run_id then). outcome: nothing-to-do | done | failed. Fill happened / did / promised / needs_main, each ONE concrete line (ids, numbers, names, times; the exact text sent to a peer; "無" when nothing): they are your part of the main\'s digest. summary (one line) still works as the fallback.',
@@ -4632,6 +4636,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
   const th = S.threads[lane.thread]
   switch (name) {
     case 'notify_joey': return joeyLine(tok, lane, 'notify_joey', a)
+    case 'chat_history': return D.chatHistory ? D.chatHistory(a ?? {}) : 'chat_history：這個常駐程式沒有接上 Onsen。'   // Onsen (WO-139)
     case 'reply_agent': {
       // lanes-golive (C2): the three lines, with fleet-mail.ts's rules and words (mail by default; a call only with a because, or as the answer to a call)
       const chk = laneSendArgs(a)

@@ -40,8 +40,12 @@ const CRED_RE = /^mesh_[A-Za-z0-9_-]{20,}$/
 
 /** This daemon's own credential, or null (missing / malformed → unsigned, as before). */
 export function readOwnCredential(stateDir: string): string | null {
+  return readCredentialFile(join(stateDir, 'mesh-credential'))
+}
+/** Onsen (WO-139): a credential file by its path (the agent-inbox daemon's, read by the Telegram daemon), the same check; null = missing / malformed */
+export function readCredentialFile(path: string): string | null {
   try {
-    const v = readFileSync(join(stateDir, 'mesh-credential'), 'utf8').trim()
+    const v = readFileSync(path, 'utf8').trim()
     return CRED_RE.test(v) ? v : null
   } catch {
     return null
