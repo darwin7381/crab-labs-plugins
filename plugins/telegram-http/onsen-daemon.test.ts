@@ -108,12 +108,12 @@ test('chat_history is listed for the main and answers from Onsen, oldest first, 
 test('Onsen down across a daemon restart: what was said meanwhile is kept, sent once Onsen is back, and nothing is sent twice', async () => {
   up!.stop(true); up = null
   api.push(dm(JOEY, 2200, 'Onsen 停的時候說的'))
-  await until(() => api.of('sendChatAction').some(c => true), 3000)
   const r = await d.call('reply', { chat_id: String(JOEY), text: '停的時候回的' })
   expect(r.isError).toBe(false)                                            // Telegram is not affected
   // chat_history answers from the local spool meanwhile
-  const local = await d.call('chat_history', {})
-  expect(local.text).toContain('本機暫存'); expect(local.text).toContain('Onsen 停的時候說的')
+  let local = { text: '' }
+  expect(await until(async () => (local = await d.call('chat_history', {})).text.includes('Onsen 停的時候說的'), 10000)).toBe(true)
+  expect(local.text).toContain('本機暫存'); expect(local.text).toContain('停的時候回的')
   await d.stop()
   d = await startTgDaemon(api, root, JOEY, env)
   startOnsen()
