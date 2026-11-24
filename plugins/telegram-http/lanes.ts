@@ -345,7 +345,7 @@ function mainEnv() {
     mainOwed: (ids: string[]) => ids.flatMap(id => {
       const e = events?.get(id), os = e ? events.mainObs(id) : []
       return e && os.length ? [{ id, from: e.class === 'joey' ? 'Joey' : String(e.from ?? '?'), text: String(e.text ?? ''),
-        owes: [...new Set(os.map(o => o.kind === 'joey' ? '回 Joey 一句' : o.kind === 'peer' ? `回 ${o.to}` : `排程 run ${o.run_id} 的回執`))],
+        owes: [...new Set(os.map(o => o.kind === 'joey' ? '回 Joey 一句' : o.kind === 'peer' ? `回 ${o.to}` : `排程 run ${o.run_id} 的回執（btcc-receipt complete ${o.run_id}）`))],
         kinds: [...new Set(os.map(o => String(o.kind)))] }] : []                    // 002y (X-4): the same facts, by kind (the asked-restart notice reads joey)
     }),
     // PL5: the memory gate's facts come from M3 (it reads neither the ledger nor state.json)
@@ -3351,8 +3351,11 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
   if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
+  // 1.38.2 (Chiron mail #11023, item 1): a scheduler run's receipt handed over with the matter is the main's to file; the lane does not complete it
+  const runs = ((events.get(evId)?.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && o.state === 'handed' && o.run_id).map(o => String(o.run_id))
+  const owesRun = runs.length ? `\n（排程 run ${runs.join('、')} 的回執也交給你了：做完用 ~/.claude/tools/btcc-receipt complete ${runs.length === 1 ? runs[0] : '<run>'} 回執；車道不會替這一輪回執。）` : ''
   const item = carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
-    : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）`,
+    : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）${owesRun}`,
       meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, o => o.id === hid, { item })
   journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `owed to the main (${hid})${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
@@ -3593,9 +3596,26 @@ export async function mainSentTo(to: string, thread: string | null, replyTo?: st
 /** the due sweep (every second): what nobody met by its due time, the router does. This one sweep replaces the critical ring (45 s), the hand-over
  *  fallback, the promise due and the commitment due. PL3: it acts only on the due_at an obligation got when it was created; nothing rewrites one
  *  (the main being away is M1's business: what it was given waits for it, and the wall / stuck notice already told Joey once). */
+/** 1.38.2 (Chiron mail #11023 item 2, WO-128 point 3): a hand-over is not "unhandled" while the main works on it: its M1 item is offered to the live main
+ *  or bound to its turn, or the main has sent Joey a reply about it since it was handed over (the event's `main_sends`, written by mainReplied). Evidence:
+ *  ho-f69139 (handed 11-23 15:27:57Z, bound 15:27:57.3Z, the main replied TG 2073 at 15:29:28Z, the sweep still pushed TG 2074 at 15:32:58Z) and
+ *  ho-1d6dd1 (handed 00:48:28Z, replied TG 2103 at 00:52:45Z, pushed TG 2104 at 00:53:29Z). The push waits, and is never made once the main replied.
+ *  When the item leaves the main's hands with the hand-over still open (StopFailure, the main went away: M1 queues it again) and no reply was sent, the
+ *  hand-over's own due time stands: past it, the next sweep tells Joey, once, as before. Returns why it waits, or null. */
+function mainOnIt(e: Row, o: Ob): 'turn' | 'replied' | null {
+  const g = main?.currentGen(), it = o.item ? journal?.get('msg', String(o.item)) : undefined
+  if (g && it && it.gen === g.id && (it.state === 'offered' || it.state === 'bound')) return 'turn'
+  const since = String(o.at ?? '')
+  return ((e.main_sends ?? []) as Array<{ to?: string; at?: string }>).some(s => s?.to === 'joey' && (!since || String(s.at ?? '') >= since)) ? 'replied' : null
+}
+const heldDue = new Set<string>()                                        // the hand-overs whose push waited (logged once each)
 export function dueTick(now = Date.now()): void {
   if (!events || !S) return
   for (const { e, o } of events.due(now)) {
+    if (o.kind === 'main') {                                             // 1.38.2: the main is on it (mainOnIt): no push now
+      const why = mainOnIt(e, o)
+      if (why) { if (!heldDue.has(o.id)) { heldDue.add(o.id); if (heldDue.size > 1000) heldDue.clear(); logos('lane.handoff_due_held', { event: e.id, handoff: o.handoff ?? o.id, why }) } continue }
+    }
     const lane = S.lanes[String(e.lane ?? '')]
     if (o.kind === 'joey' && o.ring) {
       events.set(e.id, o.id, { rang: true }, { tool: 'router' })
@@ -4091,7 +4111,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (steps && !Array.isArray(steps)) return `沒有記錄：${steps.why}`
       if (steps && isSuccess(outcome) && steps.some(x => !x.done) && !tok.handedOver) return stepsRefusal(outcome, steps)
       const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
-      if (bl && runIdArg && isSuccess(outcome) && !receiptFiled(runIdArg)) return blockedReceiptRefusal(runIdArg, outcome, bl)
+      const left = !!runIdArg && receiptLeftForMain(runIdArg)            // 1.38.2: the run is the main's to complete: this receipt records the lane's part only
+      if (bl && runIdArg && isSuccess(outcome) && !receiptFiled(runIdArg) && !left) return blockedReceiptRefusal(runIdArg, outcome, bl)
       const notDone = steps ? stepsNotDoneText(steps) : ''
       if (steps) tok.steps = { marked: steps.length, notDone: steps.filter(x => !x.done).length }
       // 002b: a receipt that carries the four-part report goes to the main's digest (notify_main); a bare one stays ledger-only. Tag markup is stripped (B21).
@@ -4114,10 +4135,10 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const undone = notDone ? `沒做：${notDone}` : ''                     // WO-125 (C): the receipt says which steps were not done (and so does the digest)
       if (rep) events.note(tok.evId, { did: [rep.happened, undone, rep.did].filter(x => x && !/^(無|none)$/i.test(x)).join('；').slice(0, 300) })   // the digest's line for this event
       else if (note && !events.get(tok.evId)?.did) events.note(tok.evId, { did: undone ? `${note}；${undone}` : note })
-      const more = { ...(steps ? { steps } : {}), ...(bl ? { blocked: bl } : {}) }      // WO-125: the steps as marked, what the guard refused (B: the 〔系統〕 line)
+      const more = { ...(steps ? { steps } : {}), ...(bl ? { blocked: bl } : {}), ...(left ? { left_for_main: runIdArg } : {}) }      // WO-125: the steps as marked, what the guard refused (B: the 〔系統〕 line)
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'receipt',
-        text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}${steps ? `\n步驟 ${steps.length} 步${notDone ? `，${undone}` : '，都做了'}` : ''}${bl ? `\n${blockedLine(bl)}` : ''}`,
-        ...(rep || steps || bl ? { refs: { ...(rep ? { report: rep, class: tok.cls } : {}), ...more } } : {}) })     // 002k (B15): the class lets the digest merge routine threads of one class
+        text: `run ${runIdArg || '-'}: ${outcome}${note ? ' — ' + note : ''}${steps ? `\n步驟 ${steps.length} 步${notDone ? `，${undone}` : '，都做了'}` : ''}${bl ? `\n${blockedLine(bl)}` : ''}${left ? `\n${LEFT_FOR_MAIN_LINE(runIdArg)}` : ''}`,
+        ...(rep || steps || bl || left ? { refs: { ...(rep ? { report: rep, class: tok.cls } : {}), ...more } } : {}) })     // 002k (B15): the class lets the digest merge routine threads of one class
       if (bl) noteBlocked(tok)
       if (rep && !(tok.commitments ?? 0)) {     // 002c: a promise that only lives in the receipt still gets its own ledger kind
         const cm = commitmentFromReport(rep.promised, queue.get(tok.evId)?.ev.from, th?.peer)
@@ -4128,6 +4149,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         }
       }
       if (!runIdArg) return `receipt recorded${chainNote}. ${events.openText(tok.evId)}`
+      if (left) { await completeRun(tok, runIdArg, outcome, a.summary, 'receipt'); return `receipt recorded; ${leftForMainText(runIdArg)}${chainNote}` }   // 1.38.2: logged there, not sent
       return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, a.summary, 'receipt')).text}${chainNote}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
@@ -4673,7 +4695,25 @@ async function meetReceipt(evId: string, runId: string, outcome: string, via: st
   events.result(evId, v.ob?.id, answer != null, { ref: answer?.slice(0, 120) ?? null, why: 'the scheduler did not answer' })   // met on the scheduler's answer
   return { ok: answer != null, text: answer ?? `the scheduler did not answer: run ${runId} is not completed yet (the receipt is still owed; try again)` }
 }
-export async function completeRun(tok: RunTok, runId: string, outcome: string, summary: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string }> {
+/** 1.38.2 (Chiron mail #11023, item 1; run 6916, 11-24 01:01Z): the matter was handed to the main (handoff_main, decide_later, the exit rule): the run's
+ *  receipt went with it (`handed`), and the main completes the run when it has done the work (~/.claude/tools/btcc-receipt complete N, mainToolDone). Since
+ *  WO-125 C a lane's receipt after its hand-over carries run_id with its steps not done, so it completed the run as failed (HTTP 200) and the main's own
+ *  completion 12 minutes later was refused (mainToolGate: 「已經回執過了」). A lane's receipt or btcc-receipt for such a run records the lane's part
+ *  and does not complete it. True when run `runId`'s receipt is handed to the main on some event and met or being sent on none. */
+export function receiptLeftForMain(runId: string): boolean {
+  if (!events || !runId) return false
+  const held = events.rows(() => true).flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && String(o.run_id) === runId))
+  return held.some(o => o.state === 'handed') && !held.some(o => o.state === 'met' || o.state === 'requested')
+}
+/** the ledger's line and the lane's answer when its receipt leaves the run to the main */
+const LEFT_FOR_MAIN_LINE = (run: string): string => `排程 run ${run} 沒有在這裡完成：這件事交給主線了，主線做完由它回執。`
+const leftForMainText = (run: string): string => `scheduler run ${run} is left for the main: this matter was handed to it, so the main completes run ${run} `
+  + `(btcc-receipt complete ${run}) when the work is done. Nothing was sent to the scheduler; do not complete it yourself. Your part is recorded.`
+export async function completeRun(tok: RunTok, runId: string, outcome: string, summary: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
+  if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
+    logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
+    return { ok: false, leftForMain: true, text: leftForMainText(runId) }
+  }
   const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
     const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome, summary: typeof summary === 'string' ? summary : undefined })
     return r ? String(r.text ?? JSON.stringify(r)) : null
@@ -5595,6 +5635,13 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (!run) { sendJson(res, 200, { ok: false, text: 'no run id: btcc-receipt complete <run>' }); return true }
     // WO-125 (B): while a refused write or command of this run counts, the run is not completed as a success; the hook tells the lane to file it again
     const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
+    if (receiptLeftForMain(run)) {                                         // 1.38.2: handed to the main with the matter: the lane's part is recorded, the run is not completed
+      const c = await completeRun(tok, run, outcome, note || undefined, 'btcc-receipt')
+      ledger({ lane: tok.lane, thread: S.lanes[tok.lane]?.thread ?? null, event: tok.evId, kind: 'receipt',
+        text: `run ${run}: ${outcome}${note ? ' — ' + note : ''}（btcc-receipt）${bl ? `\n${blockedLine(bl)}` : ''}\n${LEFT_FOR_MAIN_LINE(run)}`, refs: { left_for_main: run, ...(bl ? { blocked: bl } : {}) } })
+      if (bl) noteBlocked(tok)
+      sendJson(res, 200, { ok: false, left_for_main: true, text: c.text }); return true
+    }
     if (bl && isSuccess(outcome) && !receiptFiled(run)) { sendJson(res, 200, { ok: false, text: blockedReceiptRefusal(run, outcome, bl), refile: true }); return true }
     const c = await completeRun(tok, run, outcome, note || undefined, 'btcc-receipt')
     if (c.ok) ledger({ lane: tok.lane, thread: S.lanes[tok.lane]?.thread ?? null, event: tok.evId, kind: 'receipt', text: `run ${run}: ${outcome}${note ? ' — ' + note : ''}（btcc-receipt）${bl ? `\n${blockedLine(bl)}` : ''}`,

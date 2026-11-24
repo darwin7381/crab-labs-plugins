@@ -784,7 +784,8 @@ def complete_through_daemon(calls):
             try:
                 with urllib.request.urlopen(req, timeout=8) as r:
                     a = json.loads(r.read() or b'{}') or {}
-                text = ('completed: ' if a.get('ok') else 'not completed: ') + str(a.get('text', ''))
+                # 1.38.2: a run handed to the main with the matter is the main's to complete: the router records the lane's part only
+                text = ('completed: ' if a.get('ok') else 'left for the main: ' if a.get('left_for_main') else 'not completed: ') + str(a.get('text', ''))
                 refile = refile or bool(a.get('refile'))         # WO-125 (B): refused as a success while refusals count: it is filed again, as failed
             except Exception as e:
                 text = f'not completed: the router could not be reached ({type(e).__name__}); call receipt(run_id={c["run_id"]}, outcome=...)'

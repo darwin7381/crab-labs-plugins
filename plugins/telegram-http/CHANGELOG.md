@@ -1,3 +1,32 @@
+## 1.38.2 — 2026-11-24
+
+- **Lanes on: two fixes from Chiron's mail #11023 (agent-inbox 1.8.2 carries the same code). No switch: both are bug fixes.**
+  - **1. A run handed to the main is the main's to complete.** What happened: chiron.reflex.3, scheduled run 6916 (harness-journal, 11-24 01:00Z):
+    ack, one step, `handoff_main` (ho-88afbc), then `receipt` with run_id 6916, outcome failed, 4 steps (2 not done) → the router answered
+    「complete run 6916: HTTP 200」 at 01:01:13Z. The main did the work and at 01:12:26Z its `btcc-receipt complete 6916 --outcome ok` was refused by its
+    hook (「排程 run 6916 已經回執過了（receipt 送的）…」): failed at the scheduler, done in fact. Cause: `handOver` moves the run's receipt to `handed`
+    (the main's), but the receipt request accepted a handed receipt from the lane; since WO-125 C (1.37.0) a lane that hands steps over files a receipt
+    with run_id and its steps not done, so it completed the run. Before 1.37.0 the same schedule's lane receipt had no run_id (run 6856, 11-23 13:00Z,
+    completed by the main 13:02:19Z).
+    Now: when run N's receipt is handed to the main (handoff_main, decide_later, the exit rule) and met nowhere, a lane's `receipt(run_id=N)` and its
+    `btcc-receipt complete N` (guard hook → `/lane-receipt`) record the lane's part (the ledger receipt row with its steps, the 〔系統〕 line, plus
+    「排程 run N 沒有在這裡完成：這件事交給主線了，主線做完由它回執。」, `refs.left_for_main`) and send nothing to the scheduler; the answer says the run is
+    left for the main (the hook prints 「left for the main: …」). The main's hand-over item adds 「（排程 run N 的回執也交給你了：做完用
+    ~/.claude/tools/btcc-receipt complete N 回執；車道不會替這一輪回執。）」 and its Stop check names it 「排程 run N 的回執（btcc-receipt complete N）」; the
+    main's own completion goes through and meets it, as 002w D did. A lane that closes the run itself completes it as before; after a decision the
+    receipt moves to the decision's run (WO-127), which completes it. A receipt filed before the hand-over still completes the run (it cannot be undone).
+  - **2. The hand-over sweep does not push what the main is working on (WO-128 point 3, moved here).** What happened: 300 s after a hand-over the sweep
+    pushed its text to Joey while the main had taken it and answered: ho-f69139 (handed 11-23 15:27:57Z, bound to the main's turn 15:27:57.3Z, the main's
+    reply TG 2073 at 15:29:28Z, the router's TG 2074 at 15:32:58Z, the turn ended 15:33:09Z) and ho-1d6dd1 (handed 00:48:28Z, reply TG 2103 at 00:52:45Z,
+    push TG 2104 at 00:53:29Z). Now a due hand-over is not pushed while its M1 item is offered to the live main or bound to its turn, nor ever once the
+    main has replied to Joey about it after it was handed over (the event's `main_sends`, the same record as the ledger's 「主線回覆 Joey」). When the item
+    leaves the main's hands with the hand-over still open and no reply (StopFailure, the main ended or was killed: M1 queues it again), the hand-over's
+    own due time stands: the next sweep pushes it once, as before. A withheld push is logged once (logos `lane.handoff_due_held`, why `turn` | `replied`).
+  - Tests: `lanes-mail11023` (7): run 6916 replayed (the receipt tool; the guard hook's btcc-receipt; the main's item, Stop check and completion), a lane
+    that closes its own run, decide_later's receipt carried to the decision's run, ho-f69139 and ho-1d6dd1 replayed, the item leaving the main unanswered,
+    a hand-over nobody took. Against 1.38.1 six of the seven fail. Suite: 933 (930 pass, 3 skip, 0 fail); baseline 1.38.1 here: 926 (923 pass, 3 skip, 0 fail).
+  - **Not verified here:** a live lane and main (the scheduler and the main are stand-ins; the guard hook runs as a real process).
+
 ## 1.38.1 — 2026-11-24
 
 - **Lanes on: `mailbox_decide` is a tool of the main's Telegram server, so a main that was already running gets it (WO-126; agent-inbox 1.8.1 carries the same code).**
