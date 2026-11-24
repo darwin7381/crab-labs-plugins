@@ -1584,7 +1584,13 @@ function isInboxToolName(name: string): boolean {
 async function laneMailBtcc(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; json: any }> {
   const send = method === 'POST' && path === '/api/mesh/mail/send'
   const reply = method === 'POST' ? path.match(/^\/api\/mesh\/mail\/(\d+)\/reply$/) : null
-  if (!send && !reply) return btccMail(method, path, body)
+  if (!send && !reply) {
+    const r = await btccMail(method, path, body)
+    // WO-127 (item 6): the main checked a mail off itself: the router closes a card it did not answer (the hand-over, the reminder, open-handoffs.md)
+    const checked = method === 'POST' ? path.match(/^\/api\/mesh\/mail\/(\d+)\/check$/) : null
+    if (checked && r.status === 200) await Lanes.noteMainMailChecked(Number(checked[1]))
+    return r
+  }
   const b = (body ?? {}) as Record<string, unknown>
   let to = send ? String(b.to ?? '').trim().toLowerCase() : ''
   if (reply) { const m = await btccMail('GET', `/api/mesh/mail/${reply[1]}`).catch(() => null); to = m?.status === 200 && m.json?.from ? String(m.json.from).toLowerCase() : '' }
@@ -3917,6 +3923,14 @@ if (Lanes.LANES_ON) {
       // lanes-golive (C2): the mail lane's mailbox tools, the agent's own (fleet-mail.ts). Before a reply leaves, the disclosure check runs on it
       // against the mail's original sender (the tg daemon's /lanes/peer-check, as for the main's sends).
       mailTool: async (name, args, lane) => {
+        if (name === 'decide_later' || name === 'mailbox_card') {
+          // WO-127: a lane's card (fleet-mail.ts, Epeius's calls): the router also needs the mail BTCC opened or carded, and its deadline
+          let got: { status: number; json: any } | null = null
+          const btcc = async (m: 'GET' | 'POST', path: string, b?: unknown) => { const r = await btccMail(m, path, b); if (m === 'POST' && /^\/api\/mesh\/mail\/(lane-item|\d+\/card)/.test(path)) got = r; return r }
+          const res: any = await callInboxTool(name, args, { ...fleetDeps, btcc, openBy: 'lane', lane }, false)
+          const j = (got as { status: number; json: any } | null)?.status === 200 ? (got as unknown as { json: any }).json : null
+          return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(j && typeof j.id === 'number' ? { mail_id: j.id, ...(j.deadline ? { deadline: String(j.deadline) } : {}) } : {}) }
+        }
         let to: string | undefined
         if (name === 'mailbox_reply' && Number(args.id) > 0) {
           const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}`).catch(() => null)

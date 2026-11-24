@@ -30,10 +30,11 @@ import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } fr
 import {
   BOUNDARY_WARN_LINES, blockFactsOn, blockedFacts, blockedLine, blockedReceiptRefusal, bashWritesPath, boundaryCard, boundaryCardOn, boundaryReminder, isSuccess,
   parseSteps, receiptStepsOn, receiptToolWithSteps, stepsNotDoneText, stepsRefusal, type Blocked, type BoundaryCard,
+  DECISION_ASK_AGAIN, cardLines, decisionPrefix, decisionReporter, decisionsOn, decisionWords,
 } from './lanes-boundary.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
-import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING } from './fleet-mail.ts'
+import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING, LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } from './fleet-mail.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import {
@@ -180,7 +181,7 @@ export interface LanesDeps {
               send?: LaneSendFields) => Promise<{ text: string; msgId?: number; delivered: boolean; isError?: boolean }>
   /** inbox role, lanes-golive (C2): one of the agent's mailbox tools for the mail lane `lane` (fleet-mail.ts callInboxTool); `to` = the original sender of a
    *  mail it replies to (the disclosure check ran on it) */
-  mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string }>
+  mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string }>
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, summary?: string) => Promise<string>
   registryNames?: () => string[]
   /** loopback MCP token check (mcp-auth gate) */
@@ -401,6 +402,10 @@ export function openHandoffsLines(): string[] {
     const what = String(o.what ?? e.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 160)
     const since = String(o.at ?? e.created ?? '')
     out.push(`- ${e.id}｜來自 ${String(e.from ?? '?')}｜${o.handoff ?? '交給主線'}｜${what || '-'}｜自 ${since ? stamp(since) : '—'}｜期限 ${o.due_at ? stamp(new Date(Number(o.due_at)).toISOString()) : '—'}`)
+  }
+  // WO-127: a card still waiting on the main's decision stays listed (after a /clear or a compaction too) until it is decided or checked off; same line format
+  if (decisionsOn()) for (const e of events?.rows(r => waitsOf(r).some(pendingWait)) ?? []) for (const w of waitsOf(e).filter(pendingWait)) {
+    out.push(`- ${e.id}｜來自 ${w.lane}｜信箱 #${w.mail_id} 等你決定（mailbox_decide）｜${(w.decide || w.title || '-').replace(/\s+/g, ' ').trim().slice(0, 160)}｜自 ${stamp(w.at)}｜期限 ${w.deadline ? stamp(w.deadline) : '—'}`)
   }
   return out
 }
@@ -754,7 +759,7 @@ function runBoundary(): BoundaryCard | null { return boundaryCardOn() ? boundary
 
 // ================================================================== router
 export type InEvent = {
-  id: string; source: 'telegram' | 'mesh'; from: string; text: string
+  id: string; source: 'telegram' | 'mesh' | 'mail'; from: string; text: string
   meta: Record<string, string>; notif: Notif
   verified?: boolean; thread?: string; hop?: number; lane_marker?: string
   reply_to_id?: string; btcc_msg_id?: string; no_reply?: boolean
@@ -786,7 +791,17 @@ export type InEvent = {
   /** lanes-golive (C2): the line the item came by (feed | mail | call), a field of the event (the /inject body's `line` or `tier`, the hub payload's
    *  meta.line); a push with no field is a call. The router reads it (predicate `line`), never the text. */
   line?: Line
+  /** WO-126 (mail-events.ts MailEvent): the mailbox's events carry their own fields (source 'mail'): the kind, the mail, the lane and thread that asked,
+   *  the main's decision, the card, the deadline */
+  kind?: string; mail_id?: number; lane?: string | null; title?: string; ref?: string | null; decision?: string; note?: string | null
+  card?: Record<string, unknown>; deadline?: string; decide?: string; overdue?: boolean
+  /** WO-127: the router made this event a run of the lane that asked: the main's decision it carries (the run's token reads it) */
+  decided?: Decided
 }
+/** WO-127: a decision the router hands a lane run: the mail, the main's decision, where it came from (the event of the run that asked, and how: a lane item
+ *  opened by decide_later or a card on a colleague's mail) */
+export type Decided = { mail_id: number; decision: string; note: string | null; origin: string | null; item: 'lane_item' | 'card' | null; title: string
+  card: Record<string, unknown>; from?: string | null }
 export type WakeKind = 'keepwarm' | 'mail' | 'stall' | 'restart' | 'resume'
 export type Line = 'feed' | 'mail' | 'call'
 /** lanes-golive (C1): which fleet wake-up line this is, or null. The /inject body's `wake` field wins; without one, the delivery watchdog's sender
@@ -962,7 +977,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     ledger({ lane: 'router', kind: 'action', text: `可疑訊息送主線查證：${ev.from} 的訊息含對 agent 的指示（Jev ${pInstr.toFixed(2)}；規則原本會走 ${was}，沒有開車道）：${ev.text.slice(0, 200)}`,
       refs: { flag: 'instructions-to-agent', p: pInstr, event: ev.id, was } })
   } else {
-    for (const r of cfg.rules) {
+    for (const r of routerRules(cfg)) {
       if (!matches(r, ev, cfg)) continue
       d = await applyRule(r, ev)
       break
@@ -1035,7 +1050,7 @@ function mailLane(): Lane {
 function routeMailWake(ev: InEvent): Decision {
   const lane = mailLane()
   ev.trigger = 'mail'; ev.cls = 'mail'
-  const waiting = [...queue.values()].find(i => i.lane === lane.id && i.state === 'queued')
+  const waiting = [...queue.values()].find(i => i.lane === lane.id && i.state === 'queued' && !i.ev.decided)   // WO-127: a decision's run reads no mailbox
   let d: Decision
   if (waiting) {
     d = { rule: 'wake-mail', target: 'ledger', lane: lane.id, note: `a mailbox run of ${lane.id} is already waiting (${waiting.ev.id}): it reads the whole mailbox` }
@@ -1049,11 +1064,204 @@ function routeMailWake(ev: InEvent): Decision {
 /** the mailbox tools a mail lane gets (the agent-inbox server's own definitions: same names, same words) */
 export const MAIL_LANE_TOOL_NAMES = ['mailbox_list', 'mailbox_open', 'mailbox_check', 'mailbox_reply']
 export const MAIL_LANE_TOOLS = FLEET_TOOLS.filter(t => MAIL_LANE_TOOL_NAMES.includes(t.name))
+/** WO-127: the lanes' two mailbox calls (fleet-mail.ts, Epeius's definitions), without the two fields the daemon fills (ref = the run's event, thread = the
+ *  lane's thread): decide_later for every lane, mailbox_card for the mail lane */
+const laneFilled = <T extends { inputSchema: { properties: Record<string, unknown> } }>(t: T): T =>
+  ({ ...t, inputSchema: { ...t.inputSchema, properties: Object.fromEntries(Object.entries(t.inputSchema.properties).filter(([k]) => k !== 'ref' && k !== 'thread')) } })
+export const DECIDE_LATER_LANE_TOOL = laneFilled(LANE_DECIDE_LATER_TOOL)
+export const MAILBOX_CARD_LANE_TOOL = laneFilled(MAILBOX_CARD_TOOL)
+/** the names /lanes/mail-tool takes for them (the agent-inbox daemon side) */
+export const DECISION_LANE_TOOL_NAMES = ['decide_later', 'mailbox_card']
 /** the lane tools a run lists: every lane's, plus the mailbox for the mail lane */
 export function laneToolsFor(kind: LaneKind | undefined): any[] {
   // WO-125 (C): with LANES_RECEIPT_STEPS on, the receipt takes `steps` (receiptToolWithSteps); off, LANE_TOOLS as they were
   const base = receiptStepsOn() ? LANE_TOOLS.map(t => t.name === 'receipt' ? receiptToolWithSteps(t) : t) : LANE_TOOLS
-  return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS] : base
+  // WO-127 (LANES_DECISIONS): decide_later for every lane, mailbox_card for the mail lane; off, the lists as they were
+  const dec = decisionsOn() ? [DECIDE_LATER_LANE_TOOL, ...(kind === 'mail' ? [MAILBOX_CARD_LANE_TOOL] : [])] : []
+  return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS, ...dec] : dec.length ? [...base, ...dec] : base
+}
+
+// ------------------------------------------------------------------ WO-127: one round trip (the main answers one decision; the lane that asked finishes)
+// Chiron's ticket (Joey TG chiron:2095 「那就試試看吧、記得同步紀錄觀察點」; seam claude-epeius/knowledge/lane-mailbox-seam.md v2). The mailbox (BTCC, fleet-mail.ts,
+// Epeius) holds what waits on the main's decision: a lane opens an item there (decide_later) or the mail lane puts a card on a colleague's mail
+// (mailbox_card); the main answers once (mailbox_decide); the agent-inbox daemon hands the router the decision (mail_decision) and the cards entering
+// their due window (mail_due), mail-events.ts. Here:
+//  - decide_later: the run's event is handed to the main as handoff_main hands it (the main is woken now, with the card; item 1 「不改叫醒的方式」);
+//    mailbox_card: the mail lane hands its cards over with its handoff_main, as today (the cards ride its text);
+//  - mail_decision → a run of the lane of that thread (resumed; a fresh lane with the ledger summary when it is closed or too old). What the main owed on
+//    the asking event (its Joey line, a peer's answer, a receipt) moves to the decision's event: the main's turn that decided owes nothing more, and its
+//    Stop check holds nothing for it. One decision per mail: a second is recorded and dropped;
+//  - mail_due → information: it rides the main's next delivery in the digest; it wakes nobody and owes nothing;
+//  - the decision's run cannot ask again (decide_later / mailbox_card refused); handoff_main hands the whole matter back with the card and what the run did;
+//    its notify_joey starts with 「照主線的決定（…）：」 (LANES_DECISION_REPORTER=main: the main reports instead);
+//  - the main checks the mail off without deciding (mailbox_check, /lanes/mail-checked): the matter is closed, off .lanes/open-handoffs.md, no reminder.
+// LANES_DECISIONS=0: none of it (no tool, no rule, no sentence): 1.37.2.
+/** a card the main has not answered yet, on the record of the event whose run put it there (the record's `waits`) */
+type Wait = { mail_id: number; item: 'lane_item' | 'card'; title: string; decide: string; deadline: string | null; at: string; lane: string; thread: string
+  cls: string; trigger: string; card: Record<string, unknown>; from?: string | null
+  decided?: { decision: string; at: string; event: string }; checked?: { by: string; at: string }; handed?: boolean }
+const waitsOf = (e: Row | undefined): Wait[] => (Array.isArray(e?.waits) ? e!.waits : []) as Wait[]
+const pendingWait = (w: Wait): boolean => !w.decided && !w.checked
+const CARD_BOX_MAX = 600                                                // BTCC cuts each box at 600 characters; the record keeps what BTCC keeps
+const clipCard = (c: Record<string, unknown> | null | undefined): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(c ?? {}).filter(([, v]) => v != null && String(v).trim() !== '').map(([k, v]) => [k, String(v).slice(0, CARD_BOX_MAX)]))
+const whenOf = (s: string): string => Number.isNaN(Date.parse(s)) ? s : `${stamp(s)}（${TZ_LABEL}）`
+/** the router's rule for source 'mail' (lanes-router.fleet.json `mail-event`), put in front of a router.json that predates it; LANES_DECISIONS=0: absent */
+const MAIL_EVENT_RULE: Rule = { id: 'mail-event', match: { source: 'mail' }, to: 'mail_event' }
+function routerRules(cfg: RouterCfg): Rule[] {
+  const has = cfg.rules.some(r => r.to === 'mail_event')
+  if (!decisionsOn()) return has ? cfg.rules.filter(r => r.to !== 'mail_event') : cfg.rules
+  return has ? cfg.rules : [MAIL_EVENT_RULE, ...cfg.rules]
+}
+/** mail_due: information for the main (owner router, nothing owed): the next digest carries it; nobody is woken, Joey owes no line */
+function mailDue(ev: InEvent): Decision {
+  const m = Number(ev.mail_id)
+  recordInbound(ev, { owner: 'router', thread: ev.thread ?? null, fields: { mail_id: m, deadline: ev.deadline ?? null, overdue: ev.overdue === true } })
+  ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'fyi', text: ev.text.slice(0, 300), refs: { mail_due: m, deadline: ev.deadline ?? null, lane: ev.lane ?? null } })
+  return { rule: 'mail-due', target: 'ledger', ...(ev.thread ? { thread: ev.thread } : {}),
+    note: `mail #${m} (deadline ${ev.deadline ?? '-'}): information, it rides the main's next delivery; nobody is woken, nothing is owed` }
+}
+/** mail_decision: the run of the lane that asked, on its thread */
+function mailDecision(ev: InEvent): Decision {
+  const m = Number(ev.mail_id)
+  const first = events.get(ev.id) ?? events.rows(e => e.decision_mail_id === m && e.id !== ev.id)[0]
+  if (first) {                                                            // the same event again (the inbox daemon retries), or a second decision of the mail
+    ledger({ lane: 'router', thread: (first.thread as string) ?? null, event: ev.id, kind: 'fyi',
+      text: `信箱 #${m} 的決定又送來一次（${decisionWords(String(ev.decision ?? ''), ev.note)}）：一件事只收一次決定，已經交給 ${first.lane ?? first.owner}（${first.id}）；這一次只記錄。`,
+      refs: { mail_id: m, repeat_of: first.id, decision: ev.decision ?? null } })
+    if (!events.get(ev.id)) recordInbound(ev, { owner: 'router', thread: (first.thread as string) ?? null, fields: { mail_id: m, dropped: 'second decision', repeat_of: first.id } })
+    return { rule: 'mail-decision-repeat', target: 'ledger', note: `mail #${m} already has its decision (${first.id}): recorded, dropped` }
+  }
+  const origin = events.rows(e => waitsOf(e).some(w => w.mail_id === m)).pop() ?? (ev.ref ? events.get(String(ev.ref)) : undefined)
+  const wait = waitsOf(origin).find(w => w.mail_id === m)
+  const thread = ev.thread ?? wait?.thread ?? (origin?.thread as string | undefined) ?? null
+  let lane = thread && S.threads[thread]?.lane ? S.lanes[S.threads[thread].lane!] : undefined
+  lane ??= (ev.lane ? S.lanes[String(ev.lane)] : undefined) ?? (origin?.lane ? S.lanes[String(origin.lane)] : undefined)
+  if (!lane) return { rule: 'mail-decision', target: 'main', note: `no lane for thread ${thread ?? '-'} (mail #${m}): the main does it` }
+  // the lane that resumes it; closed or too old (the existing rules): a fresh lane on the same thread with the ledger summary. The mail lane is one per agent
+  let target = lane, summary: string | undefined, how = lane.runs > 0 ? `resume ${lane.session_id}` : `new session ${lane.session_id}`
+  if (lane.kind === 'mail') {
+    target = mailLane()
+    if (target.id !== lane.id) { summary = threadSummary(lane.thread); how = `${lane.id} is no longer the mail lane: ${target.id} with the ledger summary of ${lane.thread}` }
+  } else if (lane.status === 'closed' || (lane.kind === 'reflex' && lane.runs > 0 && Date.now() - Date.parse(lane.last) > RESUME_MAX_AGE_MS)) {
+    target = newLane('reflex', { thread: lane.thread })
+    S.threads[lane.thread].lane = target.id; saveState()
+    summary = threadSummary(lane.thread)
+    how = `${lane.id} ${lane.status === 'closed' ? 'is closed' : 'is too old'}: fresh lane ${target.id} on ${lane.thread} with the ledger summary`
+  }
+  const decided: Decided = { mail_id: m, decision: String(ev.decision ?? ''), note: ev.note ?? null, origin: origin?.id ?? null, item: wait?.item ?? null,
+    title: String(ev.title || wait?.title || ''), card: clipCard(ev.card && Object.keys(ev.card).length ? ev.card : wait?.card), from: wait?.from ?? null }
+  ev.decided = decided
+  ev.klass = (origin?.class as EvClass | undefined) ?? 'peer'
+  ev.trigger = ev.cls = wait?.cls ?? (target.kind === 'mail' ? 'mail' : 'peer')
+  ev.synthetic = decisionRunText(ev, decided, target)
+  // what the main owed on the asking event moves here: the Joey line (item 4: the lane reports; LANES_DECISION_REPORTER=main: it stays the main's), a peer's
+  // answer, a scheduler receipt. The decision's run owes them now.
+  const owedByMain = origin ? events.mainObs(origin.id).filter(o => o.kind !== 'joey' || decisionReporter() === 'lane') : []
+  const obs: any[] = decisionReporter() === 'lane' ? [{ kind: 'joey', level: 'line' }] : []
+  for (const o of owedByMain) if (o.kind === 'peer' && o.level === 'answer') obs.push({ kind: 'peer', level: 'answer', to: o.to, ...(o.req ? { req: o.req } : {}) })
+    else if (o.kind === 'receipt') obs.push({ kind: 'receipt', level: 'run', run_id: o.run_id })
+  events.open(ev.id, { class: ev.klass, owner: target.id, lane: target.id, thread: target.thread, from: ev.from, text: ev.text, obligations: obs,
+    fields: { decision: decided.decision, decision_note: decided.note, decision_mail_id: m, decision_of: origin?.id ?? null, ...(summary ? { resumed_from: lane.id } : {}) } })
+  if (origin) settleAsked(origin, m, ev.id, decided, owedByMain.map(o => o.id))
+  if (wait?.item === 'lane_item') checkOffLaneItem(m, target, ev.id)
+  const busy = running.has(target.id)
+  enqueue(ev, target.id, 5, summary)
+  return { rule: 'mail-decision', target: 'lane', lane: target.id, thread: target.thread,
+    note: `mail #${m} decided (${decided.decision}) → ${target.id}: ${busy ? `queued behind the running run; then ${how}` : how}` }
+}
+/** the asking event: this card is decided; what the main owed on it went to the decision's event (merged into it); the hand-over is met once no card of
+ *  it waits any more (a mail-lane run can hand several cards over in one) */
+function settleAsked(e: Row, m: number, dEv: string, d: Decided, moved: string[]): void {
+  const waits = waitsOf(e).map(w => w.mail_id === m ? { ...w, decided: { decision: d.decision, at: nowIso(), event: dEv } } : w)
+  const still = waits.some(pendingWait)
+  if (moved.length) events.set(e.id, o => moved.includes(o.id), { state: 'merged', into: dEv, by: `decision #${m}` })
+  if (!still) events.set(e.id, o => o.kind === 'main' && o.state === 'open', { state: 'met', by: `main (mailbox_decide #${m}, handed to ${dEv})` })
+  events.note(e.id, { waits })
+  ledger({ lane: 'router', thread: (e.thread as string) ?? null, event: e.id, kind: 'action',
+    text: `主線回了信箱 #${m} 的決定（${decisionWords(d.decision, d.note)}）：交給 ${dEv} 照決定做完${moved.length ? `；主線在這件事上欠的（${moved.length} 項）跟著交過去，主線不用再回報` : ''}。`,
+    refs: { mail_id: m, decision: d.decision, to_event: dEv, moved } })
+}
+/** a decided lane item has done its job in the main's mailbox (the decision is recorded on it): the system checks it off for the lane (the seam's 「勾掉」;
+ *  a lane other than the mail lane has no mailbox tool). A colleague's carded mail is answered and checked off by the mail lane itself. */
+function checkOffLaneItem(m: number, lane: Lane, evId: string): void {
+  void (async () => {
+    const r = await (mailToolHook ? mailToolHook({ name: 'mailbox_check', args: { id: m }, lane: lane.id }) : inboxPost('/lanes/mail-tool', { name: 'mailbox_check', args: { id: m }, lane: lane.id })).catch(() => null)
+    ledger({ lane: 'router', thread: lane.thread, event: evId, kind: 'action', text: `勾掉信箱 #${m}（分身放的件，主線已決定）：${r && !r.isError ? '好了' : `沒有勾掉：${String(r?.text ?? 'the agent-inbox daemon did not answer')}`}`,
+      refs: { mail: m, check_off: r && !r.isError ? 'ok' : 'failed' } })
+  })()
+}
+/** the event block of a decision's run (the run prompt carries the decision, the card and the mail id) */
+function decisionRunText(ev: InEvent, d: Decided, lane: Lane): string {
+  const what = d.item === 'card' ? `${d.from ? `${d.from} 寄來的信` : '一封同事的信'} #${d.mail_id}${d.title ? `「${d.title}」` : ''}（讀信線附了決定卡）`
+    : `信箱 #${d.mail_id}${d.title ? `「${d.title}」` : ''}（車道放進主線信箱、要主線決定的件）`
+  const todo = d.decision === 'as_recommended' ? '照建議：把卡上「說好之後」那幾步做完。'
+    : d.decision === 'changed' ? `改成：${d.note ?? ''}。照主線改過的做（卡上「說好之後」的步驟照這個改）。`
+    : d.decision === 'declined' ? `不做：卡上「說好之後」那幾步不做${d.note ? `（${d.note}）` : ''}；該告訴的人照樣告訴，然後收尾。` : `${decisionWords(d.decision, d.note)}。`
+  return [`[車道事件 ${ev.id}｜來源 信箱｜主線的決定｜信 #${d.mail_id}｜thread ${lane.thread}]`,
+    `主線回了決定：${decisionWords(d.decision, d.note)}。這件事先前交給主線決定：${what}。`,
+    '── 決定卡 ──', ...cardLines(d.card, whenOf),
+    '── 照決定做完 ──',
+    `- ${todo}`,
+    ...(d.item === 'card' ? ['- 這封信照決定回信（mailbox_reply）、勾掉（mailbox_check）。'] : []),
+    decisionReporter() === 'lane' ? '- 做完向 Joey 回報一次（notify_joey）。開頭的「照主線的決定（…）：」系統會加，不用自己寫。'
+      : '- 這件事由主線向 Joey 回報：你不用通知 Joey，做了什麼寫進 receipt。',
+    '- 只准一來一回：不能為這件事再放第二張卡（decide_later、mailbox_card 會被擋）。做不下去就用 handoff_main 整件交回主線，系統會附上這張卡和你做到哪。',
+  ].join('\n')
+}
+/** item 1: what the main gets when a lane's decide_later hands the matter over: the card and how to answer it */
+function decisionHandoverText(hid: string, lane: Lane, w: Wait, said: string): string {
+  return [`〔要你決定｜${hid}｜信箱 #${w.mail_id}〕${laneLabel(lane)}（${lane.id}）把一件要你決定的事放進你的信箱：「${w.title}」`,
+    ...cardLines({ ...w.card, ...(w.deadline ? { deadline: w.deadline } : {}) }, whenOf),
+    decisionReporter() === 'lane'
+      ? `照卡就能決定的：用 mailbox_decide(id=${w.mail_id}, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，${lane.id} 會接著做完並向 Joey 回報，你不用再為這件事回報。`
+      : `照卡就能決定的：用 mailbox_decide(id=${w.mail_id}, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，${lane.id} 會接著做完；這件事由你向 Joey 回報一次，寫明你的決定。`,
+    `收不回的動作、要你這段對話才知道的事：你自己做，做完用 mailbox_check(${w.mail_id}) 勾掉，這一件就算結掉。`,
+    ...(said ? [said] : [])].join('\n')
+}
+/** the cards this run put on mail that are not handed over yet and still wait on a decision (one the lane checked off itself waits on nothing) */
+function cardsWaiting(tok: RunTok): Wait[] {
+  const waiting = new Set(waitsOf(events.get(tok.evId)).filter(pendingWait).map(w => w.mail_id))
+  return (tok.cards ?? []).filter(c => !c.handed && waiting.has(c.mail_id))
+}
+/** the mail lane's hand-over carries the cards it put on mail in this run (they are answered with mailbox_decide) */
+function cardsBlock(cards: Wait[]): string {
+  return ['', `〔系統附上｜這一趟附了決定卡的信（${cards.length} 封）〕照卡就能決定的，用 mailbox_decide(id, decision) 回：讀信線會接著做完（回信、勾掉）並向 Joey 回報，你不用再為那幾封回報。`,
+    ...cards.flatMap(c => [`── 信 #${c.mail_id} 的決定卡 ──`, ...cardLines({ ...c.card, ...(c.deadline ? { deadline: c.deadline } : {}) }, whenOf)])].join('\n')
+}
+/** item 5: a decision's run hands the matter back: the card, and what this run did (its ledger rows, then the tools it used) */
+function handBackBlock(tok: RunTok, lane: Lane): string {
+  const d = tok.decision!
+  const done = readJsonl('ledger.jsonl').filter(r => r.event === tok.evId && r.lane === lane.id && ['action', 'commitment', 'notify', 'receipt', 'fyi'].includes(String(r.kind)))
+    .map(r => `- ${clip(String(r.text ?? ''), 200)}`)
+  const used = (tok.calls ?? []).filter(c => c.name !== 'mcp__lane__handoff_main').map(c => toolBrief(c)).slice(-10)
+  return ['', `〔系統附上｜一來一回〕主線先前回的決定：${decisionWords(d.decision, d.note)}（信箱 #${d.mail_id}${d.title ? `「${d.title}」` : ''}）。分身照決定做不下去，整件交回你；這件事不會再問第二次。`,
+    '── 決定卡 ──', ...cardLines(d.card, whenOf),
+    '── 這一趟做到哪（帳本）──', ...(done.length ? done : ['- （這一趟在帳本裡還沒有紀錄）']),
+    ...(used.length ? ['── 這一趟用過的工具 ──', ...used.map(u => `- ${u}`)] : [])].join('\n')
+}
+/** item 6: a card checked off without a decision: by the main (/lanes/mail-checked, its mailbox_check) the matter is closed: the hand-over, the Joey line and
+ *  a peer's answer the main owed on it are met, it leaves .lanes/open-handoffs.md, the due sweep has nothing left to remind of. By the mail lane: the card
+ *  waits no more. Returns how many events had it. */
+export function mailChecked(m: number, by: string): number {
+  if (D?.role !== 'tg' || !events || !decisionsOn() || !(m > 0)) return 0
+  let n = 0
+  for (const e of events.rows(r => waitsOf(r).some(w => w.mail_id === m && pendingWait(w)))) {
+    const waits = waitsOf(e).map(w => w.mail_id === m && pendingWait(w) ? { ...w, checked: { by, at: nowIso() } } : w)
+    const main_ = by === 'main', still = waits.some(pendingWait)
+    if (main_ && !still) {
+      // what the main owed on it (the hand-over, the Joey line and a peer's answer handed to it) is met by its own handling; a scheduler receipt is not (only
+      // the scheduler's own completion meets that)
+      const owed = events.mainObs(e.id).filter(o => o.kind !== 'receipt').map(o => o.id)
+      events.set(e.id, o => (o.kind === 'main' && o.state === 'open') || owed.includes(o.id), { state: 'met', by: `main (mailbox_check #${m})` })
+    }
+    events.note(e.id, { waits }, main_)
+    ledger({ lane: main_ ? 'main' : by, thread: (e.thread as string) ?? null, event: e.id, kind: 'fyi',
+      text: main_ ? `主線沒有回決定，自己處理了信箱 #${m}、勾掉了：這件事結掉${still ? '（同一趟的其他卡還在等決定）' : ''}。` : `${by} 勾掉了信箱 #${m}：這張卡不再等主線決定。`,
+      refs: { mail_id: m, checked_by: by } })
+    n++
+  }
+  return n
 }
 
 /** M1: an event the router gives the main is an item for it (the screen's warning in front). The digest is not attached here: it rides whatever M1
@@ -1289,6 +1497,9 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       ev.trigger = r.trigger ?? 'mail'; ev.cls = ev.trigger
       return dispatch(ev, mailLane(), base)
     }
+    case 'mail_event':                                            // WO-127: the mailbox's events (the main's decision, a card entering its due window)
+      return ev.kind === 'mail_decision' ? mailDecision(ev) : ev.kind === 'mail_due' ? mailDue(ev)
+        : { ...base, target: 'main', note: `a mailbox event of kind ${ev.kind ?? '?'}: the main` }
     case 'worker_for_ticket': {
       const wo = (ev.text.match(/\[WO-(\d+)\]/) ?? [])[1]
       const key = `WO-${wo}`
@@ -1787,7 +1998,10 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
    *  〔系統〕 line last written on the run's event */
   blocked?: Blocked[]; blockedNoted?: string
   /** WO-125 (C): the steps of the receipt this run filed (how many, how many not done); this run handed work to the main (an accepted handoff_main) */
-  steps?: { marked: number; notDone: number }; handedOver?: boolean }
+  steps?: { marked: number; notDone: number }; handedOver?: boolean
+  /** WO-127: this run carries the main's decision (its event is a mail_decision the router gave this lane); the mails this run put in the main's mailbox
+   *  (decide_later) and the cards it put on mail (mailbox_card, the mail lane); the lane stop asked once about cards not handed over */
+  decision?: Decided; decideLater?: number[]; cards?: Wait[]; cardsHeld?: boolean }
 const runTokens = new Map<string, RunTok>()
 // ------------------------------------------------------------------ M5: the run record
 // One record per lane run: queued → leased → running(pid) → exited(reason). reason: normal | cap_turns | cap_usd | budget | wall:<kind> | died |
@@ -2682,7 +2896,8 @@ function startRun(it: QItem): void {
   const trigger = it.ev.trigger ?? (lane.kind === 'reflex' ? 'other' : lane.kind)   // main-opened worker / fork: their kind
   const tok: RunTok = { runId, lane: lane.id, evId: it.ev.id, closers: [], critical, trigger, cls: it.ev.cls ?? trigger,
     followup: !!it.ev.followup, followupId: it.ev.followup,
-    fanout: lane.kind === 'synthesis' ? undefined : it.ev.fanout, synthesis: lane.kind === 'synthesis' ? it.ev.fanout : undefined }
+    fanout: lane.kind === 'synthesis' ? undefined : it.ev.fanout, synthesis: lane.kind === 'synthesis' ? it.ev.fanout : undefined,
+    ...(it.ev.decided ? { decision: it.ev.decided } : {}) }                 // WO-127: a run of the main's decision
   runTokens.set(token, tok)
   const mcpCfg = join(LANES_DIR, 'run', `${runId}.mcp.json`)
   writeJsonAtomic(mcpCfg, { mcpServers: { lane: { type: 'http', url: `http://127.0.0.1:${D.httpPort}/lane-mcp`, headers: { Authorization: `Bearer ${token}` } } } })
@@ -2861,7 +3076,12 @@ function startRun(it: QItem): void {
       calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers,
       ...(blockFactsOn() ? { blocked_n: bf?.n ?? 0, blocked_targets: bf?.targets.slice(0, 3) ?? [] } : {}),
       ...(receiptStepsOn() ? { steps_marked: tok.steps?.marked ?? 0, steps_not_done: tok.steps?.notDone ?? 0 } : {}),
-      ...(bc ? { boundary_lines: bc.lines, boundary_source: bc.source } : {}) })
+      ...(bc ? { boundary_lines: bc.lines, boundary_source: bc.source } : {}),
+      // WO-127 (ticket item 11, the observation points): the decision this run carried and how it ended (done | handed_back; an attempt that did not end
+      // normally and handed nothing back: null, its retry writes its own row); the mail a run's decide_later opened. Only with the switch on.
+      ...(decisionsOn() && tok.decision ? { decision: tok.decision.decision, decision_mail_id: tok.decision.mail_id,
+        decision_outcome: tok.handedOver ? 'handed_back' : reason === 'normal' ? 'done' : null } : {}),
+      ...(decisionsOn() && tok.decideLater?.length ? { decide_later_mail_id: tok.decideLater.length === 1 ? tok.decideLater[0] : tok.decideLater } : {}) })
     logos('lane.exit', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
       exit_code: code, signal, reason, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
     D.log('info', `lanes: exit ${runId} ${reason} code=${code}${signal ? ' signal=' + signal : ''} calls=${usage.size} in=${tin} out=${tout} closers=${closers.join(',') || '(none)'}`)
@@ -3568,7 +3788,7 @@ export function claimsHandover(text: string): boolean {
   return false
 }
 function ownerClaimWarning(tok: RunTok, e: Row | undefined, text: string): string | null {
-  if (!e || tok.claimWarned || !claimsHandover(text)) return null
+  if (!e || tok.claimWarned || tok.decision || !claimsHandover(text)) return null      // WO-127: in a decision's run the main did decide: saying so is no false claim
   const obs: Ob[] = e.obligations ?? []
   // the main has something of it: a hand-over, Joey's decision, or a memory proposal of this event (the main decides those: PL1, on the record)
   if (obs.some(o => o.kind === 'main') || obs.some(o => o.kind === 'joey' && o.level === 'decision' && o.state === 'met') || ((e.proposals ?? []) as Proposal[]).some(p => !p.decision)) return null
@@ -3617,12 +3837,14 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   // keeps the lane's own label, and M3 keeps it in the receipt). The lab let a failed call out as `changed`: an hourly no-change line on Joey's phone.
   const outcome: Outcome | undefined = decision ? outcomeArg(a) : noLine && (await lineNews(lane, tok, text)) === true ? 'changed' : said as Outcome
   const shown: Outcome = outcome ?? (decision ? 'changed' : 'normal')
-  const r0 = joeyRendering(events.get(evId), tok, lane, level, undefined, text, shown)
+  // WO-127 (item 4): the line of a run that finishes what the main decided says so in front, the system's words (the checks above read the lane's own text)
+  const toJoey = tok.decision ? `${decisionPrefix(tok.decision.decision, tok.decision.note)}${text}` : text
+  const r0 = joeyRendering(events.get(evId), tok, lane, level, undefined, toJoey, shown)
   // PL2: requested (a decision raises a line already met); 002q: one line per matter
   const v = events.request(evId, tool, { kind: 'joey', level, subject: matterKey(a.service, a.check), conversation: lane.kind === 'worker' && lane.topic != null }, outcome,
-    { said: text.slice(0, 200), joey_tier: r0.tier })
+    { said: toJoey.slice(0, 200), joey_tier: r0.tier })
   if (!v.ok) return v.why!
-  const r = joeyRendering(v.event, tok, lane, level, v.ob, text, shown)
+  const r = joeyRendering(v.event, tok, lane, level, v.ob, toJoey, shown)
   // WO-125 (B): what the guard refused in this run so far rides on the line Joey gets anyway (never a message of its own): after the rendering, so a
   // routine line cut to its first line still carries it
   const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
@@ -3630,7 +3852,7 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   const cls = metClass(v.event, tok)                                             // the met event's class (002w F)
   const rec = { lane: lane.id, thread: lane.thread, event: evId, class: cls, trigger: tok.trigger, escalated: decision, ...(decision ? { ask: true } : {}) }
   const refs = { class: cls, trigger: tok.trigger, escalated: decision, ...(decision ? { ask: true } : {}), tier: r.tier, tier_rule: r.rule, ...(decision ? (v.raised ? { raised: 'line→decision' } : {}) : { outcome }) }
-  const note = (extra: Record<string, unknown> = {}): void => ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${text.slice(0, decision ? 1000 : 400)}${bl ? `\n${blockedLine(bl)}` : ''}`, refs: { ...refs, ...(bl ? { blocked: bl } : {}), ...extra }, detail: lane.transcript })
+  const note = (extra: Record<string, unknown> = {}): void => ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'notify', text: `[${r.tier}] ${toJoey.slice(0, decision ? 1000 : 400)}${bl ? `\n${blockedLine(bl)}` : ''}`, refs: { ...refs, ...(bl ? { blocked: bl } : {}), ...extra }, detail: lane.transcript })
   if (decision) logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: evId, class: cls, to: 'joey' })
   if (r.tier === 'ledger') {
     events.result(evId, v.ob?.id, true, { ref: 'ledger' }); note(); logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule })
@@ -3645,7 +3867,7 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   saveState()
   logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule, message_id: id })
   return decision ? `sent to Joey (message_id ${id}). The main will read it in its next digest; do not hand it to the main as well.`
-    : `sent to Joey (message_id ${id}${lane.topic ? `, topic ${lane.topic}` : ''}${r.body !== text ? '; a routine event with a normal outcome reaches him as its first line, the whole text is in the ledger' : ''})`
+    : `sent to Joey (message_id ${id}${lane.topic ? `, topic ${lane.topic}` : ''}${r.body !== toJoey ? '; a routine event with a normal outcome reaches him as its first line, the whole text is in the ledger' : ''})`
 }
 
 /** exported for tests */
@@ -3726,8 +3948,48 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       if (name === 'mailbox_reply' || name === 'mailbox_check')
         ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: name === 'mailbox_reply' ? `回信 #${a.id}${r.to ? ` → ${r.to}` : ''}：${String(a.body ?? '').slice(0, 200)}` : `勾掉信 #${a.id}`, refs: { mail: a.id, ...(r.to ? { to: r.to } : {}) } })
+      if (name === 'mailbox_check') mailChecked(Number(a.id), lane.id)            // WO-127: a card the lane checked off waits on no decision any more
       if (name === 'mailbox_reply' && r.to) void promiseCheck({ who: lane.id, to: String(r.to), text: String(a.body ?? ''), ev: tok.evId, thread: lane.thread, ref: `mail-${a.id}`, tok, detail: lane.transcript })
       return String(r.text ?? '')
+    }
+    case 'decide_later': case 'mailbox_card': {
+      if (!decisionsOn()) break                                                // LANES_DECISIONS=0: not a lane tool (1.37.2)
+      if (tok.decision) return DECISION_ASK_AGAIN                               // item 5: one round trip
+      if (name === 'mailbox_card' && lane.kind !== 'mail') return 'refused: mailbox_card puts a decision card on a colleague\'s mail; it is the mail lane\'s. A matter of your own the main must decide goes in its mailbox with decide_later.'
+      // the hand-over is checked before anything is put in the mailbox: a matter already handed to the main (or put to Joey) is not handed twice
+      if (name === 'decide_later') { const v = events.request(tok.evId, 'decide_later', { kind: 'main', level: 'handed' }); if (!v.ok) return v.why! }
+      const card = a.card && typeof a.card === 'object' ? a.card as Record<string, unknown> : null
+      const args = name === 'decide_later'
+        ? { title: a.title, card: a.card, ...(a.deadline != null && a.deadline !== '' ? { deadline: a.deadline } : {}), thread: lane.thread, ref: tok.evId }
+        : { id: a.id, card: a.card, thread: lane.thread }
+      const r = mailToolHook ? await mailToolHook({ name, args, lane: lane.id }) : await inboxPost('/lanes/mail-tool', { name, args, lane: lane.id })
+      if (!r) throw new Error('the agent-inbox daemon did not answer: nothing was put in the mailbox. Try again, or hand the step to the main with handoff_main.')
+      if (r.isError) throw new Error(String(r.text ?? `${name}: the mailbox refused it`))
+      const m = Number(r.mail_id ?? (name === 'mailbox_card' ? a.id : String(r.text ?? '').match(/#(\d+)/)?.[1]))
+      const w: Wait = { mail_id: m, item: name === 'decide_later' ? 'lane_item' : 'card', title: name === 'decide_later' ? String(a.title ?? '').trim().slice(0, 120) : '',
+        decide: String(card?.decide ?? '').trim().slice(0, CARD_BOX_MAX), deadline: r.deadline ? String(r.deadline) : typeof card?.deadline === 'string' ? card.deadline : null,
+        at: nowIso(), lane: lane.id, thread: lane.thread, cls: tok.cls, trigger: tok.trigger, card: clipCard(card) }
+      events.note(tok.evId, { waits: [...waitsOf(events.get(tok.evId)), w] })
+      ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action',
+        text: `${name === 'decide_later' ? '放進主線信箱等決定' : '附決定卡在信上'} #${m}${w.title ? `「${w.title}」` : ''}：要主線決定：${w.decide}；建議：${String(card?.recommend ?? '').slice(0, 200)}`,
+        refs: { [name]: m, deadline: w.deadline } })
+      if (name === 'mailbox_card') {
+        (tok.cards ??= []).push(w)
+        return `${String(r.text ?? '')} Hand it to the main with handoff_main, as for any mail the main must decide (the cards of this run go with your text by themselves): `
+          + 'the main answers each card with mailbox_decide, and the decision comes back to the mail lane as a run that finishes it (reply, check off, one line to Joey).'
+      }
+      // item 1: the matter goes to the main as handoff_main hands it (the main is woken now, with the card): its Joey line and a peer's answer are the main's
+      // until the decision comes back to this thread
+      ;(tok.decideLater ??= []).push(m)
+      const hid0 = `ho-${shortId()}`
+      const hid = handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」：要你決定：${w.decide}`, hid0, tok.cls, 1000, true,
+        { content: decisionHandoverText(hid0, lane, w, joeyWords(events.get(tok.evId))), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid0, mail_id: String(m) } }, true)
+      tok.handedOver = true
+      logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, mail_id: m, main_phase: main?.mainPhase() ?? null })
+      let told = ''
+      try { const t = await interimToPeer(lane, tok, hid); if (t) told = ` The router told ${t.to}: "${t.text}"` } catch (e) { D.log('warn', `lanes: interim reply failed: ${e}`) }
+      return `${String(r.text ?? '')} The main was woken with your card (hand-over ${hid}). It answers once with mailbox_decide; the decision comes back to this thread as a new run, which finishes the matter and tells Joey. `
+        + `Do not tell Joey about it now; close this run with receipt.${told}`
     }
     case 'ledger_write': {
       const kind = String(a.kind ?? '')
@@ -3796,18 +4058,22 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // 1.36.1: the words alone did not do it. With Chiron's lines in the card (1.35.3), nestor.mail.1 (11-23 15:04Z: 「信箱 3 封…沒打開、沒勾掉，請主線處理」) and
       // sonn's mail lane (16:01Z: 「兩封新信，我沒打開」) still handed the list back unread, so the main was woken to read the mail itself. A mail-lane run that
       // opened no mail is sent back once; a second call goes through (the mailbox may be unreadable, and the lane then says so).
-      if (lane.kind === 'mail' && !(tok.mailOpened && tok.mailOpened > 0) && !tok.mailHandoffWarned) {
+      if (lane.kind === 'mail' && !(tok.mailOpened && tok.mailOpened > 0) && !tok.mailHandoffWarned && !tok.decision) {   // WO-127: a decision's run opened its mail before
         tok.mailHandoffWarned = true
         return 'not handed over: this run has not opened any mail (mailbox_open). Open each mail first: the sender then sees 車道讀過, not the main\'s read, and a category your focus card '
           + 'leaves to the main is still yours to read and prepare. Then hand over what the main must decide, written so that it does not have to open the mail: #id, sender, deadline, '
           + 'what is asked, the facts in the mail (numbers, file paths, the options given), your recommendation and its ground, what you did not check. Pure notices: check them off and put '
           + 'one line in the receipt. If a mail cannot be opened (the mailbox tool failed), call handoff_main again and say so.'
       }
-      if (lane.kind === 'fork') return 'refused: a fork does not hand its work back to the main (it does not merge back). Tell Joey the result yourself with notify_joey (ask_joey if he must decide); the main reads it in its digest. Nothing was handed over.'
+      if (lane.kind === 'fork' && !tok.decision) return 'refused: a fork does not hand its work back to the main (it does not merge back). Tell Joey the result yourself with notify_joey (ask_joey if he must decide); the main reads it in its digest. Nothing was handed over.'
       const v = events.request(tok.evId, 'handoff_main', { kind: 'main', level: 'handed' })        // accepted or refused (journaled); the hand-over is ONE transition
       if (!v.ok) return v.why!
+      // WO-127: a decision's run hands the whole matter back with the card and what it did (item 5); the mail lane's cards of this run ride its text (item 1)
+      const cards = decisionsOn() && tok.cards?.length ? cardsWaiting(tok) : []
+      const full = tok.decision ? `${text.slice(0, 1000)}\n${handBackBlock(tok, lane)}` : cards.length ? `${text.slice(0, 1000)}\n${cardsBlock(cards)}` : text
+      for (const c of cards) c.handed = true
       // 002y (X-3): the request itself is the main's from here, whether the lane replied to the peer before this call or replies after it
-      const hid = handToMain(tok.evId, lane, text, `ho-${shortId()}`, tok.cls, 1000, true, undefined, true)
+      const hid = handToMain(tok.evId, lane, full, `ho-${shortId()}`, tok.cls, full === text ? 1000 : HANDOVER_RECORD_MAX, true, undefined, true)
       tok.handedOver = true                                               // WO-125 (C): its steps not done are the main's now (stepsRefusal)
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words, the router's own line); the answer is
@@ -4193,6 +4459,14 @@ export function laneStop(tok: RunTok): string | null {
   const lane = S.lanes[tok.lane]
   if (!lane || !events) return null
   if (!tok.declineHeld) { const d = declineAid(tok); if (d) { tok.declineHeld = true; return d } }
+  // WO-127 (item 1, 「不改叫醒的方式」): a card wakes the main through the mail lane's hand-over, as today; a run that put cards on mail and did not hand them over
+  // is asked once
+  const unhanded = decisionsOn() && !tok.handedOver && tok.cards?.length ? cardsWaiting(tok) : []
+  if (unhanded.length && !tok.cardsHeld) {
+    tok.cardsHeld = true
+    return `⛔ lane-stop: ${lane.id} put decision cards on ${unhanded.map(c => `#${c.mail_id}`).join(', ')} but has not handed them to the main: call handoff_main now `
+      + '(what the main must decide; the cards go with your text by themselves), so that the main is woken to answer them.'
+  }
   if (tok.stopHeld) return null
   const ids = runEventIds(tok).filter(id => events.openObs(id).length)
   if (!ids.length) return null
@@ -5211,6 +5485,10 @@ export async function noteMainOutbound(msgId: number | undefined, thread: string
   await peerCall(TG_PORT, '/lanes/outbound', 'POST', { msgId: msgId ?? o.ref, owner: 'main', thread: thread ?? null, hop: hop ?? null, to: to ?? null, text: (text ?? '').slice(0, 400),
     reply_to: replyTo ?? null, delivered, line: o.line ?? 'call' })    // 002k (C4): what the send quotes; with the thread it says which promise the send answers. PL2: the delivery result
 }
+/** inbox role, WO-127 (item 6): the main checked mail #id off itself (its mailbox_check went through): a card it did not answer is closed */
+export async function noteMainMailChecked(mailId: number): Promise<void> {
+  if (mailId > 0) await peerCall(TG_PORT, '/lanes/mail-checked', 'POST', { mail_id: mailId })
+}
 /** inbox role (K2): the tool-error text when the tg daemon refuses this send to a peer (disclosure check), or null. A daemon that cannot be asked, or does not answer: null (the send goes out).
  *  answersRequest (1.34.2): the send answers someone's request (a mailbox_reply, a send_to_agent with reply_to); the check asks the machine question only then. */
 export async function checkPeerSend(from: string, to: string, text: string, answersRequest: boolean): Promise<string | null> {
@@ -5344,6 +5622,10 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       if (!b.pid && b.event === 'SessionStart') b.pid = callerClaudePid(req)       // a hook without CLAUDE_PID: the caller's socket says which claude it is
       sendJson(res, 200, await main.mainEvent(b)); return true
     }
+    if (p === '/lanes/mail-checked' && req.method === 'POST') {             // WO-127 (item 6): the main checked a mail off itself (the agent-inbox daemon, laneMailBtcc)
+      const b = await readBody(req)
+      sendJson(res, 200, { ok: true, settled: mailChecked(Number(b.mail_id), 'main') }); return true
+    }
     if (p === '/lanes/not-main' && req.method === 'POST') { const b = await readBody(req); sendJson(res, 200, { not_main: pidNotMain(Number(b.pid)) }); return true }   // 002w (G): asked by the inbox daemon
     // the state journal, folded: the interface the lab reads
     if (p === '/lanes/state' && req.method === 'GET') { sendJson(res, 200, journal.snapshot({ current_gen: main.currentGen()?.id ?? null, wall: S.wall ?? null })); return true }
@@ -5400,7 +5682,9 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (p === '/lanes/mail-tool' && req.method === 'POST') {             // lanes-golive (C2): the mail lane's mailbox tools, with this agent's own credential
       const b = await readBody(req)
       const name = String(b.name ?? '')
-      if (!MAIL_LANE_TOOL_NAMES.includes(name) || !D.mailTool) { sendJson(res, 200, { text: `no mailbox tool ${name}`, isError: true }); return true }
+      if (!(MAIL_LANE_TOOL_NAMES.includes(name) || DECISION_LANE_TOOL_NAMES.includes(name)) || !D.mailTool) { sendJson(res, 200, { text: `no mailbox tool ${name}`, isError: true }); return true }
+      // WO-127: decide_later for any lane; mailbox_card is the mail lane's (lane id <agent>.mail.<n>)
+      if (name === 'mailbox_card' && !/\.mail\.\d+$/.test(String(b.lane ?? ''))) { sendJson(res, 200, { text: 'mailbox_card is the mail lane\'s', isError: true }); return true }
       sendJson(res, 200, await D.mailTool(name, (b.args ?? {}) as Record<string, unknown>, String(b.lane ?? 'lane'))); return true
     }
     // M1 transport: the tg daemon offers an item that came in by mesh; it goes out through this daemon's MCP stream of the main process (pid)

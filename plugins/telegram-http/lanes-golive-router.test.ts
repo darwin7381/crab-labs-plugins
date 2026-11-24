@@ -19,7 +19,7 @@ const mesh = (from: string, text: string, o: Record<string, unknown> = {}) => ({
 
 test('the fleet router file: every rule uses a target and predicates the router knows; every notify class pushes (no_reply: the ledger); no cap', () => {
   const r = JSON.parse(readFileSync(FLEET, 'utf8'))
-  const targets = ['main', 'ledger', 'quoted_lane', 'topic_worker', 'thread_owner', 'worker_for_ticket', 'reflex', 'mail_lane']
+  const targets = ['main', 'ledger', 'quoted_lane', 'topic_worker', 'thread_owner', 'worker_for_ticket', 'reflex', 'mail_lane', 'mail_event']   // WO-127: the mailbox's events
   const preds = ['source', 'quotes_lane_message', 'in_worker_topic', 'no_reply', 'not_alert', 'text_prefix', 'text_regex', 'from', 'verified', 'thread_known', 'from_agent', 'line']
   for (const rule of r.rules) { expect(targets).toContain(rule.to); for (const k of Object.keys(rule.match)) expect(preds).toContain(k) }
   expect(r.rules.at(-1)).toMatchObject({ id: 'default', match: {}, to: 'main' })

@@ -343,11 +343,11 @@ test('WO-125 (C): the receipt tool says how to list the steps and takes them; LA
   expect(rc.description).toContain('List each step of the instruction in steps')
   expect(rc.description).toContain('部分完成'); expect(rc.description).toContain('outcome failed')
   expect(rc.inputSchema.properties.steps.items.required).toEqual(['step', 'done'])
-  process.env.LANES_RECEIPT_STEPS = '0'
+  process.env.LANES_RECEIPT_STEPS = '0'; process.env.LANES_DECISIONS = '0'                                    // WO-127 (1.38.0): decide_later has its own switch
   try {
     expect(L.laneToolsFor('reflex')).toBe(L.LANE_TOOLS)
     expect(L.laneToolsFor('mail').filter((t: any) => t.name === 'receipt')).toEqual(L.LANE_TOOLS.filter(t => t.name === 'receipt'))
-  } finally { delete process.env.LANES_RECEIPT_STEPS }
+  } finally { delete process.env.LANES_RECEIPT_STEPS; delete process.env.LANES_DECISIONS }
 })
 
 // ------------------------------------------------------------------ 7, 8, 9: Joey's phone, the observation points, the switches off
@@ -389,7 +389,8 @@ test('WO-125 #9: all three switches off: prompts, tool results, records and the 
     expect(ctxOff).not.toContain('邊界卡')
     expect(ctxOff).toBe(ctxOn.replace(`\n\n${card.text}`, ''))                                                   // the card is the only difference
     expect(mainContext('adam', 'sid')).toBe(mainOn.replace(`\n${B.BOUNDARY_MAIN_RULE}`, ''))
-    expect(L.laneToolsFor('reflex')).toBe(L.LANE_TOOLS)
+    process.env.LANES_DECISIONS = '0'                                                                          // WO-127 (1.38.0) adds decide_later with its own switch
+    try { expect(L.laneToolsFor('reflex')).toBe(L.LANE_TOOLS) } finally { delete process.env.LANES_DECISIONS }
     const s = await scenario(7104)
     expect(runsOf().at(-1).env.LANES_BLOCK_FACTS).toBeUndefined()                                               // the hook is not asked to report
     expect(laneRows().filter(x => x.kind === 'blocked' && x.event === s.r.id).length).toBe(0)

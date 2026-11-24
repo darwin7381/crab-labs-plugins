@@ -1,10 +1,17 @@
 {
   "version": 1,
-  "doc": "Fleet default router (lanes-golive). Copy to <workspace>/.lanes/router.json and edit there. Rules are evaluated in order, first match wins; predicates are a fixed vocabulary read by lanes.ts (no model call). Nothing matched → main. Before any rule the router gives the fleet's wake-up lines their fixed destination (lanes.ts routeWake, from the event's `wake` field): keep-warm, STALL-WAKE, RESTART-WAKE and the resume line → the main; the 讀信箱 reminder → the mail lane, whose work queue is the agent's mailbox (mail, board notices, mail-tier alerts). Joey's Telegram → the main. A pushed item of the mail line (line=mail: the hub delivered a mail into the session because the mailbox was not open) → the mail lane, before the no_reply rule (a no_reply mail means 照做就好、不用回, not nothing to do). Scheduler runs, page-tier alerts and peer calls → a reflex lane. A board work order pushed as a call (an urgent ticket) → a worker lane in Joey's DM topic (the main when topics are off). Mesh no_reply notices → the ledger (the main's next digest). What reaches Joey: every lane line rings (ORG-CHART §0 #2: 做了什麼就報什麼、全進 Joey 手機); a routine run with nothing new is one line (#5); a high-frequency run with nothing new is its receipt only (#5, the router opens no Joey line for it).",
+  "doc": "Fleet default router (lanes-golive). Copy to <workspace>/.lanes/router.json and edit there. Rules are evaluated in order, first match wins; predicates are a fixed vocabulary read by lanes.ts (no model call). Nothing matched → main. Before any rule the router gives the fleet's wake-up lines their fixed destination (lanes.ts routeWake, from the event's `wake` field): keep-warm, STALL-WAKE, RESTART-WAKE and the resume line → the main; the 讀信箱 reminder → the mail lane, whose work queue is the agent's mailbox (mail, board notices, mail-tier alerts). Joey's Telegram → the main. A pushed item of the mail line (line=mail: the hub delivered a mail into the session because the mailbox was not open) → the mail lane, before the no_reply rule (a no_reply mail means 照做就好、不用回, not nothing to do). Scheduler runs, page-tier alerts and peer calls → a reflex lane. A board work order pushed as a call (an urgent ticket) → a worker lane in Joey's DM topic (the main when topics are off). Mesh no_reply notices → the ledger (the main's next digest). The mailbox's events (source mail, WO-126/127; the code puts this rule in front of a router.json that predates it, and LANES_DECISIONS=0 takes it away): the main's decision on a card (mail_decision) → a run of the lane that asked, on its thread (a fresh lane with the ledger summary when that lane is closed or too old), one decision per mail; a card entering its due window (mail_due) → information for the main's next digest (no wake, nothing owed). What reaches Joey: every lane line rings (ORG-CHART §0 #2: 做了什麼就報什麼、全進 Joey 手機); a routine run with nothing new is one line (#5); a high-frequency run with nothing new is its receipt only (#5, the router opens no Joey line for it).",
   "alert_senders": [
     "alert-dispatcher"
   ],
   "rules": [
+    {
+      "id": "mail-event",
+      "match": {
+        "source": "mail"
+      },
+      "to": "mail_event"
+    },
     {
       "id": "tg-quote-lane",
       "match": {

@@ -1,3 +1,50 @@
+## 1.38.0 — 2026-11-24
+
+- **Lanes on: one round trip. The main answers one decision; the lane that asked finishes the work (WO-127; Joey 「那就試試看吧、記得同步紀錄觀察點」, TG chiron:2095; agent-inbox 1.8.0 carries the same code).**
+  - **Why:** the ticket's rule 「主線只做決定那一步，其餘由原本那條分身做完；只准一來一回」. 1.37.x put cards and decisions in the mailbox (WO-126), but no lane could
+    open one, and Epeius measured (#11000) that the router had no rule for source `mail`: a `mail_decision` went `rule=default → main`, and the main's Stop
+    check then owed Joey a line for every mail item it was handed, so each `mail_due` would have cost Joey one more Telegram message.
+  - **Item 1, the lanes' calls:** `decide_later(title, card, deadline?)` for every lane, `mailbox_card(id, card)` for the mail lane: Epeius's definitions
+    (`LANE_DECIDE_LATER_TOOL`, `MAILBOX_CARD_TOOL`) minus `ref` / `thread`, which the daemon fills (the run's event id, the lane's thread). They go through
+    `/lanes/mail-tool` (the agent-inbox daemon takes the two names; `mailbox_card` only from a mail lane); its answer now carries the mail id and the card's
+    deadline (server.ts mailTool). After `decide_later` the run's event is handed to the main as `handoff_main` hands it (the main is woken now, as today):
+    its item 〔要你決定｜ho-…｜信箱 #id〕 has the card's boxes and how to answer (`mailbox_decide`; or do it yourself and `mailbox_check`). A mail lane's cards
+    ride its own `handoff_main` (〔系統附上｜這一趟附了決定卡的信〕); a mail-lane run that carded mail and did not hand it over is asked once by the lane stop
+    (a card it checked off itself does not count). A card waits on the asking event's record (`waits`) and `.lanes/open-handoffs.md` lists it (「信箱 #id
+    等你決定」, same line format) until it is decided or checked off, after a /clear or a compaction too.
+  - **Items 2, 3, the router:** a rule for source `mail` (`mail-event`, first in `lanes-router.fleet.json`; the code puts it in front of a router.json that
+    predates it). `mail_decision`: deduped by event id; one decision per mail (a second one is a ledger row and is dropped); routed to the lane of its
+    thread, resumed (closed, or a reflex lane idle longer than `LANES_RESUME_MAX_AGE_MS`: a fresh reflex lane on that thread with the ledger summary; a mail
+    lane: the agent's one mail lane, renewed by its own rule). The run's event block carries the decision, the card and the mail id. What the main owed on
+    the asking event (its Joey line, a peer's answer, a scheduler receipt) moves to the decision's event (merged into it), and the hand-over is met once
+    no card of it waits: the main's turn that called `mailbox_decide` owes nothing for it and its Stop check holds nothing. A decided lane item is checked
+    off in the mailbox for the lane (the seam's 「勾掉」; a colleague's mail is answered and checked off by the mail lane itself). `mail_due`: information
+    (owner router, nothing owed): it rides the main's next digest, wakes nobody, owes Joey nothing.
+  - **Item 4, reporting:** the finishing run's `notify_joey` / `ask_joey` starts with 「照主線的決定（照建議｜改成：<note>｜不做）：」, the system's words; WO-125's
+    〔系統〕 line still follows (item 7). `LANES_DECISION_REPORTER=main`: the Joey line stays the main's (its Stop check holds once, as today) and the
+    decision's run owes none; the card's and the main's sentences say who reports.
+  - **Item 5, one round trip:** in a decision's run `decide_later` and `mailbox_card` are refused; `handoff_main` hands the whole matter back with
+    〔系統附上｜一來一回〕: the decision, the card, the run's ledger rows and the tools it used (a mail-lane or fork run may hand back too).
+  - **Item 6:** the main checks a mail off without deciding (`mailbox_check` → the agent-inbox daemon → `/lanes/mail-checked`): the hand-over, the Joey line
+    and a peer's answer it owed on that matter are met, it leaves open-handoffs.md, the due sweep has nothing left to remind of. A scheduler receipt is
+    not met by it.
+  - **Item 8, the words (verbatim):** the boundary card's sentence right after 「…你說好之後還剩哪幾步。」, on the same line (the card's line count and the
+    lane card's `card_hash` do not change: no card resend); the main's rule right after the boundary card's. A decision's run may say the main decided
+    (the owner-claim aid does not refuse it there).
+  - **Switches:** `LANES_DECISIONS` (default on; `0` = 1.37.2: no tool, no rule, no sentence, no record field), `LANES_DECISION_REPORTER=lane|main`
+    (default `lane`), both in the tg daemon's env.
+  - **Observation points (item 11):** BTCC `/decisions/metrics` (decisions by kind, card-to-decision time); on the lanes side each `exit` row in
+    `lanes.jsonl`: `decision`, `decision_mail_id`, `decision_outcome` (`done` | `handed_back`; null for an attempt that did not end normally) on a decision's
+    run, `decide_later_mail_id` on a run that called `decide_later`. Only with the switch on, only on those runs.
+  - **Tests:** `lanes-wo127` (19: the ticket's 1-12 (7 inside #2), `mail_due`, the card hold, the `/lanes/route` path with a run still going, the tools, the words, the
+    inbox side, the server.ts wiring); `lanes-mail-events` pins the switch-off routing; the WO-125 tests compare the 1.36.2 tool list with
+    `LANES_DECISIONS=0`; the fleet router test knows `mail_event`. Switch off against 1.37.2 (1ffdcd7): one scenario (a `decide_later` attempt, a mail-lane
+    run with a `mailbox_card` attempt, a `mail_decision` and a `mail_due`, the main's turn and Stop check) gave identical tool lists, main rules, card hashes,
+    routes, tool results, prompts, Joey / mesh / mailbox traffic, ledger, lanes.jsonl, routing.jsonl, M1 items, event records, open-handoffs.md, digest and
+    activity list (times and random ids masked). Suite: 926 (923 pass, 3 skip, 0 fail); baseline 1.37.2 here: 907 (903 pass, 3 skip, 1 fail: lanes-topics-lifecycle under load, passes alone).
+  - **Not verified here:** BTCC and a live main (the mailbox is a stand-in that answers as BTCC does); the Stop hook's model aids on a real decide turn; the
+    inbox daemon's capture of the item id against real BTCC.
+
 ## 1.37.2 — 2026-11-24
 
 - **Lanes on: a session that reconnects after a daemon restart lists its tools again (WO-126; agent-inbox 1.7.2 carries the same code).**
