@@ -188,7 +188,7 @@ test('#11023-1: a lane that closes the run itself (nothing handed over) complete
   const a = await start(sched(6918, 'backup-check'))
   await call(a, 'notify_joey', { outcome: 'normal', text: '備份正常' })
   expect(await call(a, 'receipt', { outcome: 'done', run_id: '6918', happened: '備份正常', did: '查了', promised: '無', needs_main: '無', steps: [{ step: '查備份', done: true }] })).toBe('receipt recorded; scheduler: complete run 6918: HTTP 200 The line you sent before: sent to Joey (message_id 2101)')   // 1.39.0: the line waited for the receipt
-  expect(completions('6918')).toMatchObject([{ outcome: 'done' }])
+  expect(completions('6918')).toMatchObject([{ outcome: 'ok' }])   // 1.41.1 (Metis #11280): the receipt's `done` reaches the scheduler as its `ok`
   expect(ledger().filter(x => x.event === a.id && x.kind === 'receipt').at(-1).refs?.left_for_main).toBeUndefined()
   await end(a)
   process.env.LANES_RECEIPT_STEPS = '0'                                                                // 1.39.0 (WO-129): the CLI path is the switch-off path

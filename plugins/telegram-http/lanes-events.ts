@@ -24,10 +24,12 @@ export type ObState = 'open' | 'requested' | 'met' | 'handed' | 'dropped' | 'mer
 export type Ob = { id: string; kind: ObKind; level: string; state: ObState; by?: string; owner?: string
   /** WO-128: a hand-over that can wait (a decision card): the main's, but no M1 item and no due time until it is woken (`woke`: urgent | due); `card`: the
    *  hand-over is a decision card's (not listed in open-handoffs.md: the mailbox is the list) */
-  defer?: boolean; woke?: 'urgent' | 'due'; woke_at?: string; card?: boolean
+  defer?: boolean; woke?: 'urgent' | 'due' | 'batch'; woke_at?: string; card?: boolean      // WO-137 甲: `batch` = the batch wake's own obligation
   due_at?: number; ring?: boolean; rang?: boolean; told?: boolean; to?: string; run_id?: string; item?: string; handoff?: string; cls?: string; what?: string; req?: string; sent?: string
   /** the delivery that met it (message id, btcc id, the scheduler's answer); why the last delivery failed; the outcome a joey line was met with; the event a merged one went into */
   ref?: string; failed?: string; outcome?: Outcome; into?: string
+  /** 1.41.1: a scheduler receipt recorded met on a refusal, owed again since this boot (lanes.ts restoreReceipts) */
+  restored?: string
   /** 002q (B08): a Joey line's matter (`<service>/<check>`, from the call's structured service and check) and when it was met */
   subject?: string; met_at?: string
   /** while requested: what it was before the request (a failed delivery puts it back) */

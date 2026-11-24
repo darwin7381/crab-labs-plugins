@@ -31,9 +31,9 @@ import {
   BOUNDARY_WARN_LINES, blockFactsOn, blockedFacts, blockedLine, blockedReceiptRefusal, bashWritesPath, boundaryCard, boundaryCardOn, boundaryReminder, isSuccess,
   parseSteps, receiptStepsOn, receiptToolWithSteps, stepsNotDoneText, stepsRefusal, type Blocked, type BoundaryCard, type Step,
   missingStepsRefusal, receiptCliPointer, stepsLine,
-  DECISION_ASK_AGAIN, cardLines, decisionPrefix, decisionReporter, decisionsOn, decisionWords, deferDecisionsOn, URGENT_BECAUSE_PROP,
+  DECISION_ASK_AGAIN, cardLines, decisionPrefix, decisionReporter, decisionsOn, decisionWords, deferDecisionsOn, URGENT_BECAUSE_PROP, batchWakeOn, deferMaxWaitS,
   CRITICAL_TAIL_NEW, CRITICAL_TAIL_OLD, DEDUPE_DONE_NOTE, IDENTITY_SMALL_NEW, IDENTITY_SMALL_OLD, dedupedSteps, mainAskPhrase, mainAskRefusal, remoteChanges,
-  type RemoteChange,
+  type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk,
 } from './lanes-boundary.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
@@ -261,6 +261,7 @@ export function lanesInit(deps: LanesDeps): void {
     main = createMain(mainEnv())
     main.initMain()
     events = createEvents(journal, writeOpenHandoffs)
+    restoreReceipts()                               // 1.41.1 (Metis mail #11280): a receipt recorded met on a scheduler refusal is owed again
     writeOpenHandoffs()
     writeLaneSettings()
     rotateMailLanesAtBoot()                         // WO-131: a mail lane over its renewal thresholds is closed now; its restored runs move at their start
@@ -385,12 +386,22 @@ function mainEnv() {
  *  main, the router's own). Only with LANES_DEFER_DECISIONS on. */
 function mainWoke(it: Row, o: { gen: string; probe: boolean }): void {
   if (!deferDecisionsOn() || !LANES_DIR) return
-  const e = it.event ? events?.get(String(it.event)) : undefined
-  const ob = ((e?.obligations ?? []) as Ob[]).find(x => x.kind === 'main' && x.item === it.id)
-  const cause = ob?.woke === 'due' ? 'due' : it.kind === 'handoff' || it.kind === 'carry' ? 'urgent_handoff' : 'other'
+  const cause = wakeCause(it)
+  const ob = mainObOf(it)
   appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_wake', cause, event: it.event ?? null, item: it.id, item_kind: it.kind, handoff: ob?.handoff ?? null,
     by: ob?.by ?? null, gen: o.gen, ...(o.probe ? { probe: true } : {}) })
   logos('lane.main_wake', { cause, event: it.event ?? null, item_kind: it.kind, handoff: ob?.handoff ?? null, gen: o.gen })
+  cardsTold([it])                                                                 // WO-137 甲 (item 2): the digest riding this offer told the main its cards
+}
+/** WO-128 (item 9), WO-137 甲 (item 6): what an item wakes the main for: `batch` (the batch wake of cards that can wait), `due` (a card's due wake),
+ *  `urgent_handoff` (a lane's hand-over that cannot wait), `other` (Joey, a peer, an alert routed to the main, the router's own) */
+function mainObOf(it: Row): Ob | undefined {
+  const e = it.event ? events?.get(String(it.event)) : undefined
+  return ((e?.obligations ?? []) as Ob[]).find(x => x.kind === 'main' && x.item === it.id)
+}
+function wakeCause(it: Row): 'batch' | 'due' | 'urgent_handoff' | 'other' {
+  const ob = mainObOf(it)
+  return ob?.woke === 'batch' ? 'batch' : ob?.woke === 'due' ? 'due' : it.kind === 'handoff' || it.kind === 'carry' ? 'urgent_handoff' : 'other'
 }
 /** WO-128 (item 4): the lines the main gets back with its context (registration on startup / clear / compact, a resumed main's first prompt, the first prompt
  *  after a compaction): the count and titles of what waits on its decision, read from the mailbox through the agent-inbox daemon. Unreadable: one line saying
@@ -420,6 +431,7 @@ const ackedRuns = new Set<string>()
 export let __ackHook: ((runId: string) => void) | null = null
 export const __setAckHook = (f: ((runId: string) => void) | null): void => { __ackHook = f }          // tests only
 function mainTookItems(items: Row[]): void {
+  cardsTold(items.filter(r => r.kind !== 'digest'))                               // WO-137 甲 (item 2): a digest taken in with these items (pulled, or bound to a turn)
   for (const it of items) {
     const e = it.event ? events?.get(String(it.event)) : undefined
     for (const o of ((e?.obligations ?? []) as Ob[])) if (o.kind === 'receipt' && o.run_id && !ackedRuns.has(String(o.run_id))) {
@@ -1236,6 +1248,9 @@ type Wait = { mail_id: number; item: 'lane_item' | 'card'; title: string; decide
   /** WO-128: can it wait (defer: the main is not woken for it; it rides the main's next digest and is woken alone when due) or not (urgent, with the lane's
    *  reason); when the due wake reached the main for it */
   urgency?: 'defer' | 'urgent'; urgent_because?: string; due_woke?: string
+  /** WO-137 甲 (items 2, 6): when a delivery first told the main about this card (a digest that listed it reached the main: offered, bound or done), the
+   *  seconds from the card placed (`at`) to then, and what that delivery woke the main for (main_wake's causes: batch | due | urgent_handoff | other) */
+  told_at?: string; told_s?: number; told_via?: string
   /** WO-128 (Chiron 13:00Z, 四): who said it cannot wait: `critical` = the system (the run handles a critical alert, its own or one merged into it), whatever
    *  the lane wrote; absent = the lane's urgent_because */
   urgent_by?: 'critical' }
@@ -1298,6 +1313,118 @@ function dueWakeText(hid: string, w: Wait, said: string): string {
       : `照卡就能決定的：用 mailbox_decide(id=${w.mail_id}, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，${w.lane} 會接著做完；這件事由你向 Joey 回報一次，寫明你的決定。`,
     `收不回的動作、要你這段對話才知道的事：你自己做，做完用 mailbox_check(${w.mail_id}) 勾掉，這一件就算結掉。`,
     ...(said ? [said] : [])].join('\n')
+}
+// ------------------------------------------------------------------ WO-137 甲 (Chiron, board WO-137): 「等得起」 means batched, not held until the deadline
+// 11-24 14:09Z → 18:21Z: of 9 cards that could wait, 4 were never told their main (atlas #11276 / #11278, cards 14:49Z, deadline 11-25 12:00Z: the due
+// wake 21 h later; lynceus #11248; epeius #11307). The card's deadline was the mail's, and an idle main does not wake by itself (keep-warm is pre-empted by
+// the mail reminders). Now a card that can wait is told within LANES_DEFER_MAX_WAIT_S (default 2700 s) of the agent's earliest card not told yet: a digest
+// that lists it reaching the main tells it (whatever woke the main); otherwise one batch wake carries every card waiting. The card's deadline and its due
+// wake stay as they were. LANES_DEFER_MAX_WAIT_S=0: none of it (1.41.0).
+/** digests whose cards were already counted (in memory; after a restart the scan counts them again, and a told card is never told twice) */
+const toldDigests = new Set<string>()
+/** WO-137 甲 (items 2, 6): a digest that lists cards (its `cards`) reached the main (offered, bound or done): each card it lists that still waits and was not
+ *  told yet is told now. `with`: the items the digest rode with (what the delivery woke the main for: main_wake's cause). Kept on the card's wait (told_at,
+ *  told_s, told_via) and one lanes.jsonl row `card_told` per card. Then a batch wake still queued whose cards are all told or decided is not needed: met. */
+function cardsTold(withItems: Row[]): void {
+  if (!batchWakeOn() || !events || !main || !journal) return
+  const ds = main.items(r => r.kind === 'digest' && Array.isArray(r.cards) && (r.state === 'offered' || r.state === 'bound' || r.state === 'done') && !toldDigests.has(r.id))
+  if (!ds.length) return
+  const causes = withItems.map(wakeCause)
+  const via = (['batch', 'due', 'urgent_handoff', 'other'] as const).find(c => causes.includes(c)) ?? 'other'
+  const at = new Map<number, number>()                                            // mail id → when it was first told (the digest's own transition time)
+  for (const d of ds) {
+    toldDigests.add(d.id)
+    const t = Date.parse(String(d.ts)) || Date.now()
+    for (const m of d.cards as unknown[]) { const k = Number(m); if (Number.isFinite(k) && (!at.has(k) || t < at.get(k)!)) at.set(k, t) }
+  }
+  if (toldDigests.size > 5000) toldDigests.clear()
+  const evs = events.rows(r => waitsOf(r).some(w => pendingWait(w) && !w.told_at && at.has(w.mail_id)))
+  if (evs.length) {
+    // the main has seen an event's record up to what a digest that reached it showed (or what it changed itself): this write does not make it news
+    const shown: Record<string, number> = {}
+    for (const r of main.items(r => r.kind === 'digest' && (r.state === 'done' || r.state === 'offered' || r.state === 'bound')))
+      for (const [id, v] of Object.entries((r.events ?? {}) as Record<string, number>)) shown[id] = Math.max(Number(shown[id]) || 0, Number(v) || 0)
+    for (const e of evs) {
+      const seen = Math.max(Number(shown[e.id]) || 0, Number(e.main_seen) || 0) >= e.version
+      const told: Wait[] = []
+      const waits = waitsOf(e).map(w => {
+        if (!pendingWait(w) || w.told_at || !at.has(w.mail_id)) return w
+        const t = at.get(w.mail_id)!, s0 = Date.parse(w.at)
+        const x = { ...w, told_at: new Date(t).toISOString(), told_s: Number.isFinite(s0) ? Math.max(0, Math.round((t - s0) / 1000)) : undefined, told_via: via }
+        told.push(x); return x
+      })
+      events.note(e.id, { waits }, seen)
+      for (const w of told) {
+        appendJsonl('lanes.jsonl', { lane: 'main', kind: 'card_told', mail_id: w.mail_id, event: e.id, lane_of: w.lane, urgency: w.urgency ?? null, placed: w.at, told_s: w.told_s ?? null, via })
+        logos('lane.card_told', { mail_id: w.mail_id, event: e.id, urgency: w.urgency ?? null, told_s: w.told_s ?? null, via })
+      }
+    }
+  }
+  settleBatch()
+}
+/** the batch wake's own record: an event of the main (owner main: not in any digest or view) with `batch` (the cards it was for, the earliest card's time),
+ *  one main obligation `woke: batch` with no due time (an unhandled batch wake is never pushed to Joey, item 4) and its M1 item */
+const BATCH_KIND = 'mailbox'
+/** a batch wake still queued (it reached nobody yet) whose cards are all told or decided meanwhile (the main woke for something else and its digest listed
+ *  them): it is not needed any more: met, so M1 never offers it (an item is owed only while its main obligation is open) */
+function settleBatch(): void {
+  for (const e of events.rows(r => !!r.batch && r.state === 'open')) {
+    const ob = ((e.obligations ?? []) as Ob[]).find(o => o.kind === 'main' && o.state === 'open')
+    if (!ob?.item || journal.get('msg', String(ob.item))?.state !== 'queued') continue
+    const cards = new Set(((e.batch?.cards ?? []) as unknown[]).map(Number))
+    const still = events.rows(r => waitsOf(r).some(w => cards.has(w.mail_id) && pendingWait(w) && !w.told_at)).length
+    if (still) continue
+    events.set(e.id, ob.id, { state: 'met', by: 'router (its cards were told or decided before the batch wake reached the main)' })
+    ledger({ lane: 'router', event: e.id, kind: 'fyi', text: `信箱的一批（${[...cards].map(m => `#${m}`).join('、')}）在叫醒主線之前就讓主線看到了（或已決定）：這一次不再叫醒。`, refs: { batch: e.id, settled: true } })
+    logos('lane.batch_wake_settled', { batch: e.id, cards: [...cards] })
+  }
+}
+/** WO-137 甲 (item 1): the batch wake. Cards that can wait (urgency defer), still waiting, not told yet, with no due wake and in no batch before: when the
+ *  earliest of them has waited LANES_DEFER_MAX_WAIT_S, the main is woken once (one M1 item of its own) and the digest riding it lists every card waiting
+ *  (「信箱有 N 件等你決定」). One batch at a time: while one is open no other is made. The clock is the cards' own placing time and the batch records, both in
+ *  the state journal: a daemon restart keeps it. Run by the due sweep (dueTick). */
+export function batchTick(now = Date.now()): void {
+  if (!batchWakeOn() || !events || !main || !S || !journal) return
+  let open = false
+  const batched = new Set<number>(), untold: Array<{ e: Row; w: Wait }> = []
+  for (const e of events.rows(r => !!r.batch || waitsOf(r).some(pendingWait))) {
+    if (e.batch) {
+      for (const m of (e.batch.cards ?? []) as unknown[]) batched.add(Number(m))
+      if (e.state === 'open' && ((e.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && o.state === 'open')) open = true
+      continue
+    }
+    for (const w of waitsOf(e)) if (pendingWait(w) && w.urgency === 'defer' && !w.told_at && !w.due_woke) untold.push({ e, w })
+  }
+  if (open) { settleBatch(); return }
+  const due = untold.filter(x => !batched.has(x.w.mail_id))
+  if (!due.length) return
+  const first = Math.min(...due.map(x => Date.parse(x.w.at)).filter(Number.isFinite))
+  if (!Number.isFinite(first) || now < first + deferMaxWaitS() * 1000) return
+  const id = `batch-${now.toString(36)}-${shortId()}`
+  const cards = [...new Set(due.map(x => x.w.mail_id))]
+  const mins = Math.max(1, Math.round((now - first) / 60_000))
+  const text = batchWakeText(id, cards.length, new Date(first).toISOString(), mins)
+  events.open(id, { class: 'peer', owner: 'main', from: 'lanes', text: `信箱的一批：${cards.map(m => `#${m}`).join('、')}（最早一件 ${stamp(new Date(first).toISOString())} 放進來，${mins} 分鐘沒告訴主線）`,
+    obligations: [{ kind: 'main', level: 'handed', owner: 'main', handoff: id, woke: 'batch', card: true }],
+    fields: { batch: { cards, first_at: new Date(first).toISOString(), at: new Date(now).toISOString(), waited_s: Math.round((now - first) / 1000) } } })
+  const item = main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: text, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: BATCH_KIND, no_reply: 'true' } } },
+    { event: id, fields: { handoff: id } })
+  events.set(id, o => o.kind === 'main', { item })
+  ledger({ lane: 'router', event: id, kind: 'fyi', text: `信箱有 ${cards.length} 件等得起的事（${cards.map(m => `#${m}`).join('、')}）主線還沒看過，最早一件放進來 ${mins} 分鐘了：叫醒主線一次（一批；沒處理不推 Joey）。`,
+    refs: { batch: id, cards, waited_s: Math.round((now - first) / 1000) } })
+  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'batch_wake', batch: id, cards, first_at: new Date(first).toISOString(), waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
+  journal.write('wake', id, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `cards that can wait (${cards.map(m => `#${m}`).join(', ')}) not told for ${mins} min: the batch wake${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  logos('lane.batch_wake', { batch: id, cards, waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
+}
+/** WO-137 甲: the batch wake's item (the list itself is the digest that rides it: 「信箱有 N 件等你決定」 and one line per card) */
+function batchWakeText(id: string, n: number, firstIso: string, mins: number): string {
+  return [`〔信箱｜等你決定的事｜一批｜${id}〕你的信箱有等得起的事在等你決定：${n} 件放進來之後還沒讓你看過（最早一件 ${stamp(firstIso)}（${TZ_LABEL}）放進來，${mins} 分鐘了），你一直沒醒，所以為它們叫你一次。`
+      + '清單在這一次附上的車道摘要裡（「信箱有 N 件等你決定」那一段，快到期的排前面）。',
+    decisionReporter() === 'lane'
+      ? '照卡就能決定的：用 mailbox_decide(id, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，放卡的分身會接著做完並向 Joey 回報，你不用再為那幾件回報；要看卡用 mailbox_open。'
+      : '照卡就能決定的：用 mailbox_decide(id, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，放卡的分身會接著做完；那幾件由你向 Joey 回報，寫明你的決定；要看卡用 mailbox_open。',
+    '收不回的動作、要你這段對話才知道的事：你自己做，做完用 mailbox_check(id) 勾掉。',
+    '這一次沒處理的，不會再為它們整批叫你；快到期的那一件會再單獨叫你。'].join('\n')
 }
 /** mail_decision: the run of the lane that asked, on its thread */
 function mailDecision(ev: InEvent): Decision {
@@ -4137,6 +4264,7 @@ function mainOnIt(e: Row, o: Ob): 'turn' | 'replied' | null {
 const heldDue = new Set<string>()                                        // the hand-overs whose push waited (logged once each)
 export function dueTick(now = Date.now()): void {
   if (!events || !S) return
+  try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
   for (const { e, o } of events.due(now)) {
     if (o.kind === 'main') {                                             // 1.38.2: the main is on it (mainOnIt): no push now
       const why = mainOnIt(e, o)
@@ -5373,12 +5501,58 @@ const laneTransports = new Map<string, { transport: StreamableHTTPServerTranspor
 // (002l D14, 002m L6B4: a run completed twice). Whichever comes first meets it; the second is refused with what is still open. This is the only place that
 // completes a run at the scheduler for a lane. 002w (D, gap 17): a receipt handed to the main is met the same way (meetReceipt) when the main completes the
 // run itself (its ./bin/btcc-receipt complete N, seen at its PostToolUse: mainToolDone); the main has no lane guard, so its CLI is what reached the scheduler.
-async function meetReceipt(evId: string, runId: string, outcome: string, via: string, complete: () => Promise<string | null>): Promise<{ ok: boolean; text: string; dup?: boolean }> {
+/** 1.41.1 (Metis mail #11280), once at boot: a scheduler receipt that a lane's receipt or btcc-receipt recorded met while the scheduler's answer refused it
+ *  (「complete run N: HTTP 422」 and the like; schedulerAnswerOk) is owed again. The lane's run is long over, so it is handed to the main, the way the exit rule
+ *  hands what a run still owes (no item, no wake, no push): the event is open again, the main's next digest shows 「run N 的回執交給主線（排程器沒收下：…）」,
+ *  and its own btcc-receipt complete N goes through the gate and meets it. On the fleet's journals 11-23 to 11-24: metis 6804, angelia 6865, cadmus 6969 /
+ *  6994, elsa 6972, pheme 6989. A receipt the main's btcc-receipt met (mainToolDone) is not touched: its record is the Bash output, which cannot show
+ *  whether the run was completed (chiron 6985, the one known wrong one, was completed at BTCC by hand at 13:17:13Z). LANES_RECEIPT_RESTORE=0: not done. */
+function restoreReceipts(): void {
+  if (process.env.LANES_RECEIPT_RESTORE === '0' || !events) return
+  const recs = events.rows(r => ((r.obligations ?? []) as Ob[]).some(o => o.kind === 'receipt' && o.state === 'met'))
+  const metOf = (run: string) => recs.flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && o.state === 'met' && String(o.run_id) === run).map(o => ({ e, o })))
+  const laneSent = (o: Ob): boolean => o.by === 'receipt' || o.by === 'btcc-receipt'
+  const refused = (o: Ob): boolean => laneSent(o) && o.ref != null && !schedulerAnswerOk(o.ref).ok
+  const runs = new Set(recs.flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && o.state === 'met' && refused(o)).map(o => String(o.run_id))))
+  for (const run of runs) {
+    const all = metOf(run)
+    // completed after all: a lane's receipt the scheduler took, or the main's own btcc-receipt (its record cannot be checked; left as it is)
+    if (all.some(x => (laneSent(x.o) && !refused(x.o)) || x.o.by === 'main (btcc-receipt)')) continue
+    const [first, ...rest] = all.filter(x => refused(x.o))
+    const why = String(first.o.ref).slice(0, 200)
+    events.set(first.e.id, first.o.id, { state: 'handed', failed: why, by: 'router (1.41.1: the scheduler refused this receipt; it had been recorded as sent)', restored: nowIso() })
+    // the run's other records that only followed it (a stall-nudge's 「already completed by …」, a second refused receipt): handled in that one
+    for (const x of [...rest, ...all.filter(y => !laneSent(y.o))]) events.set(x.e.id, x.o.id, { state: 'merged', into: first.e.id, by: 'router (1.41.1: restored with the run\'s receipt)' })
+    ledger({ lane: 'router', thread: (first.e.thread as string) ?? null, event: first.e.id, kind: 'fyi',
+      text: `排程 run ${run} 的回執先前記成已送，但排程器沒收下（「${why}」），run 沒有完成：改回還欠，交給主線（主線用 btcc-receipt complete ${run} 回執）。`,
+      refs: { run_id: run, restored: true, answer: why } })
+    appendJsonl('lanes.jsonl', { lane: 'router', kind: 'receipt_restored', event: first.e.id, run_id: run, answer: why, met_at: first.o.met_at ?? null, merged: [...rest, ...all.filter(y => !laneSent(y.o))].map(x => x.e.id) })
+    logos('lane.receipt_restored', { event: first.e.id, run_id: run, answer: why })
+  }
+}
+/** the scheduler's answer to a completion: `ok` = the run is completed (now, or already: `already`); `text` = what it said */
+type RunAnswer = { ok: boolean; text: string; already?: boolean }
+async function meetReceipt(evId: string, runId: string, outcome: string, via: string, complete: () => Promise<RunAnswer | null>): Promise<{ ok: boolean; text: string; dup?: boolean }> {
   const v = events.request(evId, via, { kind: 'receipt', level: 'run', run_id: runId }, outcome === 'failed' ? 'failed' : undefined)   // PL2: requested
   if (!v.ok) return { ok: false, text: v.why!, dup: true }
-  const answer = await complete()
-  events.result(evId, v.ob?.id, answer != null, { ref: answer?.slice(0, 120) ?? null, why: 'the scheduler did not answer' })   // met on the scheduler's answer
-  return { ok: answer != null, text: answer ?? `the scheduler did not answer: run ${runId} is not completed yet (the receipt is still owed; try again)` }
+  const a = await complete()
+  // 1.41.1 (Metis mail #11280, run 6804): met only when the scheduler completed the run. Any answer used to count: metis.reflex.1's 「complete run 6804:
+  // HTTP 422」 was recorded met, its retry and the main's own completion were refused as repeats, and BTCC kept the run stalled_no_complete.
+  const ok = !!a?.ok
+  events.result(evId, v.ob?.id, ok, { ref: a?.text.slice(0, 200) ?? null, why: a ? a.text.slice(0, 200) : 'the scheduler did not answer' })
+  if (ok) settleRunReceipts(runId, evId)
+  if (!a) return { ok: false, text: `the scheduler did not answer: run ${runId} is not completed yet (the receipt is still owed; try again)` }
+  if (!ok) {
+    appendJsonl('lanes.jsonl', { lane: via.startsWith('main') ? 'main' : 'router', kind: 'receipt_refused_by_scheduler', event: evId, run_id: runId, via, outcome, answer: a.text.slice(0, 200) })
+    return { ok: false, text: `scheduler run ${runId} is NOT completed: the scheduler answered 「${a.text.slice(0, 200)}」. The receipt is still owed: file it again (outcome done, nothing-to-do or failed); if the scheduler refuses it again, leave it: what this event still owes goes to the main when the run ends.` }
+  }
+  return { ok: true, text: a.text }
+}
+/** 1.41.1: a scheduler run is completed once, whichever event carries it: the run's receipt still owed on another event (open, or handed to the main) is met
+ *  with it (a run and its stall-nudge, a receipt restored at boot) */
+function settleRunReceipts(runId: string, by: string): void {
+  for (const e of events.rows(r => r.id !== by && ((r.obligations ?? []) as Ob[]).some(o => o.kind === 'receipt' && String(o.run_id) === runId && (o.state === 'open' || o.state === 'handed'))))
+    events.set(e.id, o => o.kind === 'receipt' && String(o.run_id) === runId && (o.state === 'open' || o.state === 'handed'), { state: 'met', by: `completed by ${by}`, met_at: nowIso() })
 }
 /** 1.38.2 (Chiron mail #11023, item 1; run 6916, 11-24 01:01Z): the matter was handed to the main (handoff_main, decide_later, the exit rule): the run's
  *  receipt went with it (`handed`), and the main completes the run when it has done the work (~/.claude/tools/btcc-receipt complete N, mainToolDone). Since
@@ -5400,8 +5574,11 @@ export async function completeRun(tok: RunTok, runId: string, outcome: string, s
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
   }
   const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
-    const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome, summary: typeof summary === 'string' ? summary : undefined })
-    return r ? String(r.text ?? JSON.stringify(r)) : null
+    // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422
+    const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome: btccOutcome(outcome), summary: typeof summary === 'string' ? summary : undefined })
+    if (!r) return null
+    const text = String(r.text ?? JSON.stringify(r))
+    return { ...schedulerAnswerOk(text), ...(typeof r.ok === 'boolean' ? { ok: r.ok } : {}), text }
   })
   logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok })
   return { ok: c.ok, text: c.text }
@@ -5461,16 +5638,28 @@ function noteBlocked(tok: RunTok): void {
 function receiptFiled(run: string): boolean {
   return !!events?.rows(e => ((e.obligations ?? []) as Ob[]).some(o => o.kind === 'receipt' && String(o.run_id) === run && (o.state === 'met' || o.state === 'requested'))).length
 }
-const RECEIPT_CLI = /(?:^|[\s;&|(])(?:\S*\/)?btcc-receipt\s+complete\s+['"]?(\d+)/g      // lanes-golive (A6): any path (fleet ~/.claude/tools/btcc-receipt, lab ./bin/btcc-receipt)
 /** 002w (D, gap 17): a tool call of the main went through (PostToolUse): a ./bin/btcc-receipt complete N in it completed scheduler run N, so the receipt the
- *  main owes for N (handed to it) is met, through the same transition as a lane's (meetReceipt) */
+ *  main owes for N (handed to it) is met, through the same transition as a lane's (meetReceipt).
+ *  1.41.1 (Chiron mail #11236, run 6985): only a btcc-receipt the command really runs counts (receiptCliRuns reads its words as the guard does; the regex
+ *  over the whole text took a heredoc's mention for a call), and only when the CLI did not print a refusal (receiptCliAnswer: 「btcc-receipt: HTTP 422 …」
+ *  leaves the receipt owed; a 409 「run is completed」 meets it). The run's receipt still owed on any event (the main's, or one no lane holds any more) is
+ *  met: the run is completed at the scheduler. */
 function mainToolDone(name: string, input: any, response: string, error: boolean): void {
   if (name !== 'Bash' || error || !events) return
-  for (const m of String(input?.command ?? '').matchAll(RECEIPT_CLI)) {
-    const run = m[1]
-    for (const e of events.rows(r => r.state === 'open')) if (events.mainObs(e.id).some(o => o.kind === 'receipt' && o.run_id === run))
-      void meetReceipt(e.id, run, 'done', 'main (btcc-receipt)', async () => response.slice(0, 200) || 'completed')
+  const runs = [...new Set(receiptCliRuns(String(input?.command ?? '')))]
+  if (!runs.length) return
+  const ans = receiptCliAnswer(response)
+  for (const run of runs) {
+    const live = events.rows(r => ((r.obligations ?? []) as Ob[]).some(o => o.kind === 'receipt' && String(o.run_id) === run && (o.state === 'open' || o.state === 'handed')))
+    const e = live.find(x => events.mainObs(x.id).some(o => o.kind === 'receipt' && String(o.run_id) === run)) ?? live.find(x => !laneHolds(x.id))
+    if (e) void meetReceipt(e.id, run, 'done', 'main (btcc-receipt)', async () => ans)
   }
+}
+/** a lane is on this event now: a run of it is running (the event is in its set) or queued */
+function laneHolds(evId: string): boolean {
+  if ([...running.values()].some(r => runEventIds(r.tok).includes(evId))) return true
+  const q = queue.get(evId)
+  return !!q && (q.state === 'queued' || q.state === 'leased')
 }
 /** 002w (D; 002v r3 T3-R, u002v-T3-a-r3-20261120-081010: a lane completed run 62 through the daemon and the main completed it again 9 s later with the CLI):
  *  a scheduler run is completed once, whoever does it. Asked at the main's PreToolUse of a Bash call that carries ./bin/btcc-receipt complete N: refused when
@@ -5478,8 +5667,7 @@ function mainToolDone(name: string, input: any, response: string, error: boolean
  *  (handed to it) or no event of the router carries run N (not ours to refuse). The refusal is the hook's deny reason. */
 export function mainToolGate(name: string, input: any): string | null {
   if (name !== 'Bash' || !events) return null
-  for (const m of String(input?.command ?? '').matchAll(RECEIPT_CLI)) {
-    const run = m[1]
+  for (const run of new Set(receiptCliRuns(String(input?.command ?? '')))) {       // 1.41.1: a mention is not a call (Chiron mail #11236)
     const held = events.rows(() => true).flatMap(e => ((e.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && String(o.run_id) === run).map(o => ({ e, o })))
     if (!held.length) continue
     const done = held.find(x => x.o.state === 'met' || x.o.state === 'requested')
@@ -6095,7 +6283,8 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
     for (const [id, v] of Object.entries((r.events ?? {}) as Record<string, number>)) shown[id] = Math.max(Number(shown[id]) || 0, Number(v) || 0)
   const changed = events.rows(e => inViews(e) && e.version > Math.max(Number(shown[e.id]) || 0, Number(e.main_seen) || 0))   // main_seen: what the main changed itself
   const standing = standingLines()
-  const box = mailboxLines()                                                      // WO-128 (item 1): what waits on the main's decision rides every delivery
+  const boxed = mailboxWaits()
+  const box = mailboxLines(boxed)                                                 // WO-128 (item 1): what waits on the main's decision rides every delivery
   if (!changed.length && !standing.proposals.length && !box.length) return null    // a hold alone is not news: it rides with something that is
   const long = boundaryLong()                                                     // WO-125 (A.4): rides like a hold, never news alone
   const d = renderEvents(changed.map(e => digestLine(e)), [...standing.proposals, ...standing.holds, ...box, ...(long ? [boundaryReminder(long.lines)] : [])], 'digest')
@@ -6104,16 +6293,20 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
   return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items,
     proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => p.id),   // 002v: the standing Joey proposals it carried (the memory gate's `shown`)
-    ...(long ? { boundary_card: long.hash } : {}) } }                           // WO-125 (A.4): this boundary.md's reminder (told once a digest carrying it reached the main)
+    ...(long ? { boundary_card: long.hash } : {}),                              // WO-125 (A.4): this boundary.md's reminder (told once a digest carrying it reached the main)
+    ...(batchWakeOn() ? { cards: boxed.map(w => w.mail_id) } : {}) } }          // WO-137 甲 (item 2): the cards it lists (told once it reached the main: cardsTold)
 }
 /** WO-128 (item 1): 「信箱有 N 件等你決定」 and one line per card (#id, what to decide, deadline), soonest first: every card the router knows still waits on the main's
  *  decision (can wait or not). It makes the digest of the main's next delivery (whatever wakes it), never a wake of its own. Off (LANES_DEFER_DECISIONS=0): none. */
 const MAILBOX_LINES_MAX = 8
-function mailboxLines(): string[] {
+/** every card the router knows still waits on the main's decision, soonest deadline first (one per mail) */
+function mailboxWaits(): Wait[] {
   if (!deferDecisionsOn() || !events) return []
   const by = new Map<number, Wait>()
   for (const e of events.rows(r => waitsOf(r).some(pendingWait))) for (const w of waitsOf(e).filter(pendingWait)) by.set(w.mail_id, w)
-  const ws = [...by.values()].sort((a, b) => (Date.parse(a.deadline ?? '') || Infinity) - (Date.parse(b.deadline ?? '') || Infinity) || a.mail_id - b.mail_id)
+  return [...by.values()].sort((a, b) => (Date.parse(a.deadline ?? '') || Infinity) - (Date.parse(b.deadline ?? '') || Infinity) || a.mail_id - b.mail_id)
+}
+function mailboxLines(ws: Wait[] = mailboxWaits()): string[] {
   if (!ws.length) return []
   return [`〔信箱有 ${ws.length} 件等你決定（等得起的不會單獨叫醒你，快到期才會；用 mailbox_decide 回，要看卡用 mailbox_open）〕`,
     ...ws.slice(0, MAILBOX_LINES_MAX).map(w => `• #${w.mail_id}${w.title ? `「${clip(w.title, 60)}」` : ''}｜要你決定：${clip(w.decide || '（卡上沒寫）', 160)}｜期限 ${w.deadline ? stamp(w.deadline) : '—'}`),
@@ -6168,7 +6361,7 @@ function digestLine(e: Row, whole = false): DigestLine {
   for (const o of obs.filter(o => o.kind === 'peer')) st.push(unrun(o) ?? (o.owner === 'main' ? `你答應回 ${o.to}${o.due_at ? `（${simTime(o.due_at)} 前）` : ''}${o.state === 'met' ? '：已回' : ''}`
     : o.level === 'interim' ? `分流器已告訴 ${o.to} 由主線決定` : o.state === 'handed' ? `交給主線回 ${o.to}` : o.state === 'met' ? `已${o.by === 'main' ? '由你' : ''}${o.level === 'message' ? '告訴' : '回'} ${o.to}${e.answered && o.by !== 'main' ? `：「${clip(String(e.answered), 80)}」` : ''}`
     : o.state === 'requested' ? `正在送給 ${o.to}` : `還沒回 ${o.to}${failed(o)}`))
-  for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線` : `run ${o.run_id} 還沒回執${failed(o)}`))
+  for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線${o.failed ? `（排程器沒收下：${clip(String(o.failed), 100)}）` : ''}` : `run ${o.run_id} 還沒回執${failed(o)}`))   // 1.41.1: why it is still owed
   if (e.blocked && blockFactsOn()) st.push(String(e.blocked))                    // WO-125 (B): what the guard refused in the run, as the system counted it
   if (handed) st.push(handed.defer && !handed.woke ? `在你的信箱等決定（〔${handed.handoff ?? handed.id}〕等得起，不會單獨叫醒你）：${fit(String(handed.what ?? ''), 200)}`   // WO-128
     : `需主線：〔${handed.handoff ?? handed.id}〕${fit(String(handed.what ?? ''), 200)}`)
@@ -6458,8 +6651,10 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     }
     if (p === '/lanes/scheduler' && req.method === 'POST') {
       const b = await readBody(req)
-      const text = D.schedulerCall ? await D.schedulerCall(String(b.run_id), b.action === 'ack' ? 'ack' : 'complete', b.outcome, b.summary) : 'no scheduler'
-      sendJson(res, 200, { text }); return true
+      // 1.41.1 (Metis mail #11280): the outcome in the scheduler's words (an older tg daemon still sends `done`), and whether the scheduler took it
+      const action = b.action === 'ack' ? 'ack' : 'complete'
+      const text = D.schedulerCall ? await D.schedulerCall(String(b.run_id), action, action === 'complete' ? btccOutcome(b.outcome) : b.outcome, b.summary) : 'no scheduler'
+      sendJson(res, 200, { text, ok: schedulerAnswerOk(text).ok }); return true
     }
   }
   sendJson(res, 404, { error: 'no such lanes route' }); return true

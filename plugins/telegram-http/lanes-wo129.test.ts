@@ -118,7 +118,7 @@ test('WO-129 #1: a scheduled run\'s receipt without steps is refused, telling it
   expect(ledger().some(x => x.event === r.id && x.kind === 'receipt')).toBe(false)                   // refused = nothing recorded
   expect(await call(r, 'receipt', { outcome: 'done', run_id: '7001', ...REPORT, needs_main: '無', steps: [{ step: '查備份', done: true }, { step: '回執', done: true }] }))
     .toBe('receipt recorded; scheduler: complete run 7001: HTTP 200')
-  expect(completions('7001')).toMatchObject([{ outcome: 'done' }])
+  expect(completions('7001')).toMatchObject([{ outcome: 'ok' }])   // 1.41.1 (Metis #11280): the receipt's `done` reaches the scheduler as its `ok`
   expect(await end(r)).toMatchObject({ steps_marked: 2, steps_not_done: 0, receipt_refused: { missing_steps: 1, not_done_success: 0, cli_blocked: 0 } })
 }, 30000)
 

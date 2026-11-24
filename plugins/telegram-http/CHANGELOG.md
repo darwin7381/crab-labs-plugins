@@ -1,3 +1,87 @@
+## 1.41.1 — 2026-11-25
+
+- **Lanes on: 「等得起」 means batched, not held until the deadline; WO-132's production words reverted; a scheduler receipt is met only when the scheduler completed the run (board WO-137 甲／乙, Chiron; Chiron mail #11236; Metis mail #11280; agent-inbox 1.11.1 carries the same code).**
+  - **甲, what happened:** 11-24 14:09Z → 18:21Z, 9 cards that could wait; 4 were never told their main: atlas #11276 / #11278 (cards 14:49:28.584Z / 14:49:30.876Z,
+    deadline 11-25 12:00Z: the due wake would have come at 11:45Z, 21 h later), lynceus #11248 (14:24Z, deadline 04:00Z), epeius #11307 (16:50Z, deadline
+    02:30Z → 02:15Z). The card's deadline was the mail's, and an idle main does not wake by itself (keep-warm is pre-empted by the mail reminders).
+  - **甲, what changed (the ticket's 1-7):**
+    1. A card that can wait (urgency `defer`) that the main has not been told about: from the agent's earliest such card, at the latest after
+       `LANES_DEFER_MAX_WAIT_S` (default 2700 s) the main is woken once (`batchTick`, run by the due sweep `dueTick`): an M1 item of its own (a `carry`,
+       meta kind `mailbox`, 〔信箱｜等你決定的事｜一批｜batch-…〕, how to answer; the list is the digest riding it: 「信箱有 N 件等你決定」 and one line per card,
+       every card waiting). Its record: an event of the main (`batch: { cards, first_at, at, waited_s }`, owner main: in no digest or view), one main
+       obligation `woke: batch`, `card: true` (not in open-handoffs.md). One batch at a time; a card that was in a batch never starts another.
+       The clock is the cards' own `at` and the batch records, both in the state journal: a restart keeps it (tested by booting a second daemon on a journal).
+    2. Told: a digest that lists the card (its new field `cards`, every card waiting) reached the main (offered, bound or done; the M1 hooks `woke` and
+       `bound`, so a pull into a running turn counts too). After that only the existing due wake (deadline − 15 min) applies. A batch still queued whose
+       cards were all told or decided meanwhile is met without being offered (`settleBatch`).
+    3. The card's deadline is not touched.
+    4. The batch obligation has no due time: an unhandled batch wake is never pushed to Joey. The due wake and cannot-wait hand-overs push as before.
+       (The general 「主線不在／收不到訊息」 notice after 10 minutes of owed items nobody can take still covers a batch item, as any item.)
+    5. Cards with `urgent_because` and cards of a critical run: woken at once as before; they never start a batch clock.
+    6. `main_wake.cause` gains `batch`. Per card, on its wait record: `told_at`, `told_s` (seconds from the card placed to the main first told),
+       `told_via` (the cause of the delivery that told it: batch | due | urgent_handoff | other); lanes.jsonl `card_told` { mail_id, event, lane_of, urgency,
+       placed, told_s, via } and `batch_wake` { batch, cards, first_at, waited_s, main_phase }. Writing `told_*` does not make the card's event news in the
+       next digest when the main had seen its record (main_seen).
+    7. The main's rule, verbatim: 「- 等得起的事會併成一批告訴你：你每次醒來，摘要會列「信箱有幾件等你決定」；你一直沒醒的話，最晚 45 分鐘會為它們叫你一次。快到期的那一件會再單獨叫你。」
+       (the minutes follow `LANES_DEFER_MAX_WAIT_S`).
+    - **Switch:** `LANES_DEFER_MAX_WAIT_S` (seconds, default 2700; `0` = 1.41.0: no batch wake, no `cards` on the digest, no `told_*`, no `card_told`, the
+      1.41.0 rule), under `LANES_DEFER_DECISIONS`.
+    - **Not changed:** the digest's and the context block's header 「等得起的不會單獨叫醒你，快到期才會」; the lane tool answers; what the main gets back at
+      SessionStart (read from BTCC) does not count as told.
+  - **乙 (Chiron; Joey TG chiron:2153 「你確定他改的是真的不該讓他動的嗎？」), verbatim:** the boundary card's question 2 back to 「2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。」;
+    question 3 「3. 只有主對話才知道的事：Joey 剛講的、談到一半的、${agent} 自己的標準、主線手上正在動的東西（看上面「此刻」）。」; the production line
+    (`boundaryProdLine(agent)`, in place of `BOUNDARY_PROD_LINE`) 「正式服務壞了：先看上面「此刻」。主線正在回合中、而且在動同一個服務：…文件上沒有的做法、刪資料、動錢、動金鑰：交主線。」;
+    the lane card's 「做可逆的小處理」 (`IDENTITY_SMALL_NEW` = 1.39.1's). Kept: WO-132's incident merge, 「# 此刻」, the closing check, `prod_change` (record
+    only), the critical-alert line. Every kind's lane-card hash changes (a resumed lane gets the new card once).
+  - **Chiron mail #11236 (run 6985):** 11-24 13:01:42Z the main ran a heredoc rewriting knowledge/lane-boundary-20261124/ANCHOR.md whose text said 「再由主線
+    `~/.claude/tools/btcc-receipt complete 6985 --outcome ok --note …`」; `mainToolDone` matched `RECEIPT_CLI` against the whole command and recorded the
+    receipt met at 13:05:42Z (ref: the heredoc's output 「anchor sum 4667…」); the real call at 13:15:54Z was denied by `mainToolGate` (「已經回執過了」); BTCC
+    still showed acked at 13:16Z and the main POSTed /complete by hand at 13:17:13Z (completed). Now `receiptCliRuns` (lanes-boundary.ts) reads the command's
+    words as the guard does (shellCommands: quotes removed, a heredoc's body dropped; env / sudo / timeout …, `bash -c`, `python3 <path>/btcc-receipt`): a
+    mention (echo, quoted string, heredoc, commit message) is not a call, for `mainToolDone` and `mainToolGate` alike. A real call counts only without a
+    refusal in its output (`receiptCliAnswer`: 「btcc-receipt: HTTP 422 …」 leaves the receipt owed with `failed`; 409 「run is completed」 meets it). Over
+    1924 Bash commands with 「btcc-receipt complete」 in the workspaces' transcripts (Mac mini, last 4 days) the new reading and the old regex differ on 2:
+    chiron 6985 and a hephaestus `ssh … python3 - <<EOF` on the BTCC box (a remote script). Of 141 receipts met by `main (btcc-receipt)` on Mac mini, 6985 is
+    the only one met by a mention (subagent's scan; MBP not scanned).
+  - **Metis mail #11280 (run 6804):** 11-23 02:43:53Z metis.reflex.1's receipt(run_id 6804, outcome `done`) reached BTCC with `done`; BTCC answered HTTP 422,
+    recorded met (`ref` 「complete run 6804: HTTP 422」), so the btcc-receipt retry (02:43:54Z), the stall-nudge's lane (03:43Z, its receipt pre-set 「already
+    completed by mesh-1795401818723-58ec」) and the main's own call (14:45:31Z) were refused as repeats; BTCC kept it stalled_no_complete. Not the 1.38.2
+    receiptLeftForMain path, not the mention bug. A general gap: every receipt a lane's `receipt` tool filed with `done` got 422 (6 of 6 in the fleet's
+    journals: metis 6804, angelia 6865, cadmus 6969 / 6994, elsa 6972, pheme 6989; the 23 other `done` receipts were completed by the CLI's `ok`), and any
+    scheduler answer met the receipt (server.ts `schedulerCall` answers 「complete run N: HTTP <status>」 for every status; `meetReceipt` met on any answer).
+    Now: the outcome goes in the scheduler's words (`btccOutcome`: done / normal / ok → ok; nothing-to-do; failed; in `completeRun` and in the inbox's
+    /lanes/scheduler, which also answers `ok`); `schedulerCall` adds BTCC's detail to a non-2xx answer and defaults to ok; `meetReceipt` meets only on
+    `schedulerAnswerOk` (2xx, or 409 「is completed」); a refusal leaves the receipt owed with `failed`, the lane is told 「scheduler run N is NOT completed …
+    still owed」 (lanes.jsonl `receipt_refused_by_scheduler`), and what the run still owes at its end goes to the main (the exit rule). A completion met on one
+    event meets the run's receipt still owed on any other (`settleRunReceipts`).
+  - **Restoring what was recorded wrongly (`restoreReceipts`, once at boot; `LANES_RECEIPT_RESTORE=0` = off):** a receipt a lane's `receipt` / btcc-receipt
+    recorded met on a refusal (its `ref` fails `schedulerAnswerOk`), with no accepted completion of the run elsewhere, is owed again: `handed` to the main with
+    `failed` and `restored` (no item, no wake, no push; the main's next digest: 「run N 的回執交給主線（排程器沒收下：…）」; its btcc-receipt goes through the
+    gate and meets it); the run's other records that only followed it (a stall-nudge's 「already completed by …」) are `merged` into it; one ledger fyi and a
+    lanes.jsonl `receipt_restored` each. Receipts met by the main's own btcc-receipt are not touched (their record is the Bash output, which cannot show
+    whether the run was completed; chiron 6985 is completed at BTCC). On the fleet's journals this reopens metis 6804, angelia 6865, cadmus 6969 / 6994,
+    elsa 6972, pheme 6989 at their next boot.
+  - **Tests:** `lanes-wo137` (9: the words; one card due the next day: no wake at 44:59, a batch at 45:00 with told_s 2700, no push after 300 s, no second
+    batch, then the due wake; three cards in 30 minutes: one batch of 3; woken for Joey within 45 minutes: told, no batch; also pulled into a running turn;
+    an unhandled batch (no main, then offered and left): no push; urgent cards never batched, a queued batch whose card was told first is met unoffered;
+    replay of atlas #11276 / #11278: no batch at 15:34:28.583Z, one at 15:34:28.584Z carrying both; a restart: a second daemon booted on the journal; the
+    switch at 0). `lanes-wo132` 乙 replay of prometheus.reflex.2 (alert 1360) with the main idle: its boundary card and lane card say a documented repair is its
+    own and none of WO-132's prohibitions. `lanes-wo137-receipts` (6: the parsers; metis 6804 `done` → ok → met; a 422: owed, re-filed, handed at the end,
+    the main's 422 output keeps it owed, its 409 meets it; chiron 6985's heredoc meets nothing, its real call is let through and meets it, a mention is not
+    denied; the boot restore (and off); the inbox's /lanes/scheduler). Adjusted: `lanes-wo132` #1 / #2, `lanes-wo128` item 5 / #10, `lanes-wo128-final` 二
+    (the 乙 words, the 甲 rule), `lanes-mail11023` and `lanes-wo129` (the scheduler gets `ok` for `done`). Suite on this machine, 11-24 19:00–19:40Z: two full runs, 994 tests (948 pass, 3 skip, 43 fail) and 993 (955
+    pass, 3 skip, 35 fail); the unchanged 1.41.0 (f225d44, extracted with git archive) run the same way: 950 tests, 901 pass, 46 fail, the first failure the
+    same (WO-132 #4 running with `LANES_DEFER_DECISIONS=0` in effect: an order-dependent leak between files, then unhandled errors from runs writing into
+    removed temp dirs). The 25 files that failed in either run pass alone (each run by itself: all pass). `lanes-wo128` / `-final` / `lanes-wo131` with
+    `LANES_DEFER_MAX_WAIT_S=0`: all pass except `lanes-wo128` item 5's check of the default (1.41.1) words.
+  - **Not verified here:** BTCC (the scheduler, its 422 / 409 bodies, and that `ok` completes a run through `schedulerCall`'s JSON body, are stand-ins; the
+    422 cause is read from the fleet's journals and BTCC's documented outcomes, not BTCC's code); a live main reading the batch item; the MBP's journals and
+    transcripts; whether the six restored runs are still stalled at BTCC.
+  - **Deploy:** with `LANES_DEFER_DECISIONS=0` removed, cards placed under 1.41.0 with the switch on that still wait and carry no `told_at` count as not told:
+    an agent with such cards gets one batch wake within a second of its daemon's start. The boot restore reopens the six receipts above (their mains see
+    them in the next digest and can complete them; `LANES_RECEIPT_RESTORE=0` to skip). Both daemons (tg and agent-inbox) carry the scheduler fix; the tg side
+    maps `done` itself, so an older agent-inbox daemon still gets `ok`.
+
 ## 1.41.0 — 2026-11-24
 
 - **Lanes on: what can wait does not wake the main (WO-128, Chiron; Joey TG chiron:2081, 2083, 2095 「那就試試看吧、記得同步紀錄觀察點」; agent-inbox 1.11.0 carries the same code).

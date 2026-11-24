@@ -3997,10 +3997,11 @@ if (Lanes.LANES_ON) {
         try {
           const r = await fetch(`${BTCC_API_BASE}/api/scheduler/runs/${runId}/${action}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() },
-            body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'done', ...(summary ? { summary } : {}) } : {}),
+            body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'ok', ...(summary ? { summary } : {}) } : {}),   // 1.41.1: BTCC's outcomes are ok | nothing-to-do | failed
             signal: AbortSignal.timeout(6000),
           })
-          return `${action} run ${runId}: HTTP ${r.status}`
+          // 1.41.1 (Metis mail #11280): a refusal says why (BTCC's detail), so the lanes can tell 「run is completed」 (409: met) from a refusal (the receipt stays owed)
+          return `${action} run ${runId}: HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}`}`
         } catch (e) { return `${action} run ${runId} failed: ${e}` }
       },
     } : {

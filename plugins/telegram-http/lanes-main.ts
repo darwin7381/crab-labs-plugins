@@ -17,7 +17,7 @@
  * One writer: the tg daemon. Information (the digest) is never offered alone: it rides the next offer or pull.
  */
 import type { Journal, Row } from './lanes-state.ts'
-import { BOUNDARY_MAIN_RULE, DEFER_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, deferDecisionsOn } from './lanes-boundary.ts'
+import { BOUNDARY_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, deferDecisionsOn, deferMainRule } from './lanes-boundary.ts'
 
 export type Notif = { method: string; params: unknown }
 export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry'
@@ -637,7 +637,7 @@ export function mainContext(agent: string, sid: string): string {
     // WO-127 (item 8): the decision card's rule, the ticket's words, right after the boundary card's (LANES_DECISIONS=0: not there)
     ...(decisionsOn() ? [decisionMainRule()] : []),
     // WO-128 (item 5): what can wait does not wake the main, right after the decision card's (LANES_DEFER_DECISIONS=0: not there)
-    ...(deferDecisionsOn() ? [DEFER_MAIN_RULE] : []),
+    ...(deferDecisionsOn() ? [deferMainRule()] : []),                           // WO-137 甲 (item 7): the batch wake's words (LANES_DEFER_MAX_WAIT_S=0: 1.41.0's)
     // WO-123: the files a lane may append to are the main's to declare; the last sentence (what NOT to declare) is Chiron's (#10869)
     '- 車道預設不能寫你的檔。要讓車道自己把紀錄補進某個檔（日誌、流水帳、狀態紀錄），在 .lanes/appendable.txt 宣告它：一行一個相對路徑（只收 .md .txt .log .csv .tsv .jsonl；記憶、.lanes/、CLAUDE.md、REANCHOR 與它列的定錨檔、設定檔一律不收）。'
       + '車道用 append_file 把內容加在檔案最後，既有內容它動不了。你自己往這些檔加內容也用 append_file 或 shell 的 >>，不要整檔重寫，車道同時加的那一行才不會掉。'

@@ -180,7 +180,7 @@ test('WO-128 final 二: the mail lane\'s line 3 is Chiron\'s 13:00Z line, verbat
   const b = B.boundaryDefault('adam')
   const i = b.indexOf(B.BOUNDARY_DEFER_LINE)
   expect(b[i]).toBe('要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。')
-  expect(b[i + 1]).toBe('正式服務正在壞、等不起：唯讀查清楚、把要下的指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。')
+  expect(b[i + 1]).toBe(B.boundaryProdLine('adam'))                                                   // 1.41.1 (WO-137 乙): the production line's words
   expect(b.join('\n')).not.toContain('沒把握：交給主線，不猜著做完。')
 })
 

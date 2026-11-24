@@ -123,16 +123,18 @@ const reflexLanes = () => Object.values(st().lanes).filter(l => l.kind === 'refl
 const hhmm = (iso: string) => new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Taipei', hourCycle: 'h23', hour: '2-digit', minute: '2-digit' }).format(new Date(iso))
 
 // ------------------------------------------------------------------ 1: the words
-test('WO-132 #1: the words, verbatim: questions 2 and 3 of the boundary card, the line after 「沒把握」, the identity card\'s 「做可逆的小處理」 and its critical-alert line; the lane card\'s hash changes', () => {
+// 1.41.1 (WO-137 乙, Chiron; Joey TG chiron:2153): WO-132's production words reverted. Question 2 is 1.39.1's again, question 3 points at 「此刻」, the line after
+// 「沒把握」 is the ticket's new production line (the agent's name filled in), the identity card's 「做可逆的小處理」 is 1.39.1's; the critical-alert line stays.
+test('WO-132 #1 (words as 1.41.1 has them, WO-137 乙): questions 2 and 3 of the boundary card, the line after 「沒把握」, the identity card\'s 「做可逆的小處理」 and its critical-alert line; the lane card\'s hash changes', () => {
   const card = B.boundaryDefault('prometheus')
-  expect(card[3]).toBe('2. 收不回的動作，或動到正式環境的動作：錢、金鑰、發布、刪除、改設定、對外；在正式的機器或服務上重啟、重建、部署、套用設定也算，就算文件寫了怎麼做、就算是把它恢復原狀。')
-  expect(card[4]).toBe('3. 只有主對話才知道的事：Joey 剛講的、談到一半的、prometheus 自己的標準、主線手上正在動的東西。正式服務出事時，先當成主線可能正在動它。')
+  expect(card[3]).toBe('2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。')
+  expect(card[4]).toBe('3. 只有主對話才知道的事：Joey 剛講的、談到一半的、prometheus 自己的標準、主線手上正在動的東西（看上面「此刻」）。')
   const i = card.indexOf(B.deferDecisionsOn() ? B.BOUNDARY_DEFER_LINE : '沒把握：交給主線，不猜著做完。')   // 1.41.0: WO-128 replaced the 「沒把握」 line in place
   expect(i).toBe(6)
-  expect(card[i + 1]).toBe('正式服務正在壞、等不起：唯讀查清楚、把要下的指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。')
+  expect(card[i + 1]).toBe('正式服務壞了：先看上面「此刻」。主線正在回合中、而且在動同一個服務：把你查到的原因和備好的指令用 handoff_main 交給它，不跟它同時動手。主線閒著或叫不醒：文件（runbook、README）寫明、做了可以重來的修復，由你做，這不算改設定；動手前照 prometheus 自己的規矩登記變更，做完向 Joey 回報一次，寫明下了什麼指令、結果、還沒查的。文件上沒有的做法、刪資料、動錢、動金鑰：交主線。')
   expect(card.length).toBe(11)
   const id = L.identityCard({ kind: 'reflex' }).split('\n')
-  expect(id.find(l => l.startsWith('- 權限上限：'))).toContain('可以查、回覆別的 agent、做可逆的小處理（不動正式的機器或服務）、記帳。')
+  expect(id.find(l => l.startsWith('- 權限上限：'))).toContain('可以查、回覆別的 agent、做可逆的小處理、記帳。')
   const crit = id.find(l => l.includes('分流器標記：嚴重警報'))!
   expect(crit).toBe('- 事件訊息最前面的「〔車道資訊〕」區塊裡，有「分流器標記：嚴重警報」就是嚴重警報：查證後一定要讓 Joey 知道，用 notify_joey 回報（這一類分流器會響鈴）；需要他決定就改用 ask_joey。'
     + '嚴重本身不是交主線的理由，也不是不交的理由：照邊界卡的三問判，要主線的照樣用 handoff_main 交。摘要不會叫醒主線。')
@@ -203,7 +205,7 @@ test('WO-132 #2: the incident\'s lane ended inside the window: the next alert of
   expect(routing().at(-1)).toMatchObject({ event: 'mesh-wo132-console', rule: 'incident-merge', lane: lane.id, thread: lane.thread })
   expect(r.prompt).toContain('分流器標記：跟這條線在處理的是同一件事故（同一台 bt-xboard-falkenstein），分流器沒有另開分身')
   expect(r.prompt.split(L.CARD_UPDATED_HEAD).length - 1).toBe(1)                           // #1: the resumed session gets the current card once
-  expect(r.prompt).toContain('做可逆的小處理（不動正式的機器或服務）')
+  expect(r.prompt).toContain(B.CRITICAL_TAIL_NEW); expect(r.prompt).not.toContain('（不動正式的機器或服務）')   // 1.41.1: the card's difference from 1.39.1's is the critical-alert line
   expect(E().get('mesh-wo132-console')!.obligations.some((o: any) => o.kind === 'joey')).toBe(true)   // its own run owes its line
   await call(r, 'notify_joey', { outcome: 'normal', text: 'console 檢查已恢復。' })
   const ex = await end(r)
@@ -480,3 +482,31 @@ test('WO-132 #5: with the boundary card off the lane card is 1.39.1\'s, byte for
   } finally { delete process.env.LANES_BOUNDARY_CARD }
 })
 
+
+// ------------------------------------------------------------------ 1.41.1 (WO-137 乙): the production words reverted
+// Chiron judged WO-132's words wrong (Joey TG chiron:2153 「你確定他改的是真的不該讓他動的嗎？」). Replay of prometheus.reflex.2 (alert 1360, 11-24 09:27:21.291Z,
+// prometheus .lanes/routing.jsonl and lanes.jsonl; it ran `docker compose … up -d` on the identity box), this time with the main idle: the card it gets does
+// not tell it not to repair. With the main idle a documented, repeatable repair is its own (registered, reported once); only an undocumented way, deleting
+// data, money and keys go to the main.
+test('WO-137 乙, replay of prometheus.reflex.2 with the main idle: the boundary card and the lane card it gets do not tell it not to repair; 「主線：閒著」 and the production line say a documented repair is its own', async () => {
+  const m = await mainUp()
+  process.env.LANES_INCIDENT_MERGE = '0'
+  try {
+    st().alert_fp = {}
+    const r = await start(alert('mesh-1795512441285-5d65-wo137', ALERTS[1][2]))
+    expect(r.prompt).toContain('alert 1360：netdata / bt-xboard-falkenstein')
+    expect(r.prompt).toContain('\n# 此刻（系統寫的，時間為 UTC+8）\n主線：閒著\n')
+    const card = r.prompt.slice(r.prompt.indexOf('# 邊界卡'), r.prompt.indexOf('判例（主線留的'))
+    expect(card).toContain('\n2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。\n')
+    expect(card).toContain('\n3. 只有主對話才知道的事：Joey 剛講的、談到一半的、prometheus 自己的標準、主線手上正在動的東西（看上面「此刻」）。\n')
+    expect(card).toContain('\n正式服務壞了：先看上面「此刻」。主線正在回合中、而且在動同一個服務：把你查到的原因和備好的指令用 handoff_main 交給它，不跟它同時動手。'
+      + '主線閒著或叫不醒：文件（runbook、README）寫明、做了可以重來的修復，由你做，這不算改設定；動手前照 prometheus 自己的規矩登記變更，做完向 Joey 回報一次，寫明下了什麼指令、結果、還沒查的。'
+      + '文件上沒有的做法、刪資料、動錢、動金鑰：交主線。\n')
+    const sys = readFileSync(String(runsOf().filter(x => x.lane === r.lane).at(-1).argv.find((a: string, i: number, all: string[]) => all[i - 1] === '--append-system-prompt-file')), 'utf8')
+    expect(sys).toContain('可以查、回覆別的 agent、做可逆的小處理、記帳。')
+    for (const t of [r.prompt, sys]) for (const no of ['不自己下那個指令', '就算文件寫了怎麼做', '就算是把它恢復原狀', '先當成主線可能正在動它', '不動正式的機器或服務', '動到正式環境', '在正式的機器或服務上重啟'])
+      expect(t).not.toContain(no)
+    await call(r, 'notify_joey', { outcome: 'changed', text: 'auth.kbro.ai 登入逾時約 2 分鐘，已恢復。' }); await end(r)
+  } finally { delete process.env.LANES_INCIDENT_MERGE }
+  await m.kill()
+}, 30000)

@@ -410,10 +410,14 @@ test('WO-128 item 5: the words, verbatim: the boundary card\'s line replaced (10
   const card = B.boundaryDefault('adam')
   expect(card.length).toBe(11)                                                                     // 1.41.0: WO-132 (1.40.0) put its production line right after this one
   expect(card[6]).toBe('要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。')
-  expect(card[7]).toBe(B.BOUNDARY_PROD_LINE)
+  expect(card[7]).toBe(B.boundaryProdLine('adam'))                                                 // 1.41.1 (WO-137 乙): its words
   expect(card.join('\n')).not.toContain('沒把握：交給主線，不猜著做完。')
   const ctx = mainContext('adam', 'sid').split('\n')
-  expect(ctx[ctx.indexOf(B.decisionMainRule()) + 1]).toBe('- 等得起的事不會單獨叫醒你：你每次醒來，摘要會列「信箱有幾件等你決定」，一起處理；快到期的那一件才會單獨叫你。')
+  // 1.41.1 (WO-137 甲 item 7): with the batch wake on (default) the rule is the ticket's new words; LANES_DEFER_MAX_WAIT_S=0: 1.41.0's
+  expect(ctx[ctx.indexOf(B.decisionMainRule()) + 1]).toBe('- 等得起的事會併成一批告訴你：你每次醒來，摘要會列「信箱有幾件等你決定」；你一直沒醒的話，最晚 45 分鐘會為它們叫你一次。快到期的那一件會再單獨叫你。')
+  process.env.LANES_DEFER_MAX_WAIT_S = '0'
+  try { const c0 = mainContext('adam', 'sid').split('\n'); expect(c0[c0.indexOf(B.decisionMainRule()) + 1]).toBe('- 等得起的事不會單獨叫醒你：你每次醒來，摘要會列「信箱有幾件等你決定」，一起處理；快到期的那一件才會單獨叫你。') }
+  finally { delete process.env.LANES_DEFER_MAX_WAIT_S }
   const dl = L.laneToolsFor('reflex').find((t: any) => t.name === 'decide_later'), mc = L.laneToolsFor('mail').find((t: any) => t.name === 'mailbox_card')
   expect(Object.keys(dl.inputSchema.properties)).toEqual(['title', 'card', 'deadline', 'urgent_because'])
   expect(Object.keys(mc.inputSchema.properties)).toEqual(['id', 'card', 'urgent_because'])
@@ -427,11 +431,11 @@ test('WO-128 item 5: the words, verbatim: the boundary card\'s line replaced (10
 })
 
 test('WO-128 #10: LANES_DEFER_DECISIONS=0 = 1.38: no urgent_because, the old card line, no main rule; every card wakes the main; no mailbox block in the digest or the context; open-handoffs lists the card; mail_due is information; no main_wake row, no card_urgency', async () => {
-  const onCtx = mainContext('adam', 'sid'), onCard = B.boundaryDefault('adam'), onTools = Object.fromEntries((['reflex', 'mail'] as const).map(k => [k, L.laneToolsFor(k)]))
+  const onCtx = mainContext('adam', 'sid'), onRule = B.deferMainRule(), onCard = B.boundaryDefault('adam'), onTools = Object.fromEntries((['reflex', 'mail'] as const).map(k => [k, L.laneToolsFor(k)]))
   L.__setMailWaiting(async () => ({ ok: true, items: [{ id: 1, title: 't', decide: 'd', deadline: hourOut() }] }))
   process.env.LANES_DEFER_DECISIONS = '0'
   try {
-    expect(mainContext('adam', 'sid')).toBe(onCtx.replace(`\n${B.DEFER_MAIN_RULE}`, ''))
+    expect(mainContext('adam', 'sid')).toBe(onCtx.replace(`\n${onRule}`, ''))
     expect(B.boundaryDefault('adam')).toEqual(onCard.map(l => l === B.BOUNDARY_DEFER_LINE ? '沒把握：交給主線，不猜著做完。' : l))
     const strip = (t: any) => ({ ...t, inputSchema: { ...t.inputSchema, properties: Object.fromEntries(Object.entries(t.inputSchema.properties).filter(([k]) => k !== 'urgent_because')) } })
     expect(L.laneToolsFor('reflex')).toEqual(onTools.reflex.map(strip)); expect(L.laneToolsFor('mail')).toEqual(onTools.mail.map(strip))

@@ -22,6 +22,11 @@ export const decisionsOn = (): boolean => process.env.LANES_DECISIONS !== '0'
 export const decisionReporter = (): 'lane' | 'main' => process.env.LANES_DECISION_REPORTER === 'main' ? 'main' : 'lane'
 /** WO-128 (telegram-http 1.39.0): a card that can wait does not wake the main (default on; `0` = 1.38.x: every card wakes the main). Under LANES_DECISIONS. */
 export const deferDecisionsOn = (): boolean => decisionsOn() && process.env.LANES_DEFER_DECISIONS !== '0'
+/** WO-137 甲 (telegram-http 1.41.1): the longest a card that can wait goes untold (seconds, from the agent's earliest card the main has not been told about);
+ *  then the main is woken once for every card waiting (the batch wake). Default 2700 (45 minutes); `0` = 1.41.0: no batch wake, only the due wake. */
+export const deferMaxWaitS = (): number => { const n = Number(process.env.LANES_DEFER_MAX_WAIT_S ?? 2700); return Number.isFinite(n) && n > 0 ? n : 0 }
+/** WO-137 甲: the batch wake is on (under LANES_DEFER_DECISIONS) */
+export const batchWakeOn = (): boolean => deferDecisionsOn() && deferMaxWaitS() > 0
 
 // ------------------------------------------------------------------ A: the boundary card
 export const BOUNDARY_FILE = 'boundary.md'
@@ -34,14 +39,14 @@ export function boundaryDefault(agent: string): string[] {
     `# 邊界卡（${agent} 的；主線寫的，你只能讀）`,
     '這件事做完，需不需要下面任何一樣？三樣都不需要，就是你的：做完，記一筆。',
     `1. 用 ${agent} 的名義答應、核准、拒絕；或在有一項沒過、有一段沒查的時候，判定「沒事」。`,
-    BOUNDARY_Q2,                                                       // WO-132 item 1 (Chiron's words, verbatim): production counts
+    BOUNDARY_Q2,                                                       // WO-137 乙: back to 1.39.1's question 2 (WO-132 had added production)
     boundaryQ3(agent),
     '需要任何一樣：分的是「一步」，不是「一件」。你做得了的每一步都做完（讀、查、對數字、擬好回覆、備好指令），'
       // WO-131 (1.38.3, Chiron mail #11046, verbatim): the step goes to the main as a decision card (LANES_DECISIONS=0: the 1.37 words, no card tool)
       + (decisionsOn() ? BOUNDARY_CARD_STEP : BOUNDARY_HANDOFF_STEP)
       + (decisionsOn() ? boundaryDecisionSentence() : ''),          // WO-127 item 8: the same line (the card's line count and hash do not change)
     deferDecisionsOn() ? BOUNDARY_DEFER_LINE : '沒把握：交給主線，不猜著做完。',   // WO-128 item 5: the same line replaced (line count, card_hash unchanged)
-    BOUNDARY_PROD_LINE,                                                // WO-132 item 1: a line of its own after the 「沒把握」 line (WO-128's, when it is on)
+    boundaryProdLine(agent),                                           // WO-132 item 1: a line of its own after the 「沒把握」 line (WO-128's); WO-137 乙: its words
     '回報照實際發生的寫：指示裡的步驟，哪幾步做了、哪幾步沒做，都列出來；有沒做的，結果不能填正常。寫入或指令被擋，就寫被擋，不寫已做。',
     '判例（主線留的，新的在上面；跟上面衝突時照判例）：',
     BOUNDARY_NONE,
@@ -86,6 +91,10 @@ export const decisionMainRule = (): string => decisionReporter() === 'main' ? DE
 export const BOUNDARY_DEFER_LINE = '要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。'
 /** item 5: the main's rule, right after the decision card's */
 export const DEFER_MAIN_RULE = '- 等得起的事不會單獨叫醒你：你每次醒來，摘要會列「信箱有幾件等你決定」，一起處理；快到期的那一件才會單獨叫你。'
+/** WO-137 甲 (item 7, the ticket's words, verbatim at the default 45 minutes): the same rule with the batch wake on; LANES_DEFER_MAX_WAIT_S=0: 1.41.0's */
+export const deferMainRule = (): string => batchWakeOn()
+  ? `- 等得起的事會併成一批告訴你：你每次醒來，摘要會列「信箱有幾件等你決定」；你一直沒醒的話，最晚 ${Math.max(1, Math.round(deferMaxWaitS() / 60))} 分鐘會為它們叫你一次。快到期的那一件會再單獨叫你。`
+  : DEFER_MAIN_RULE
 /** item 1: the optional argument of decide_later and mailbox_card (the lanes' copies; not sent to BTCC) */
 export const URGENT_BECAUSE_PROP = { type: 'string', description: '選填。等不起才填：什麼會壞、誰在等（一句）。填了＝現在叫醒主線。不填＝等得起：不叫醒主線，它下一次醒來時在摘要看到這一件，快到期才單獨叫它。' }
 export type MainDecision = 'as_recommended' | 'changed' | 'declined'
@@ -219,14 +228,16 @@ export function receiptToolWithSteps(base: { name: string; description: string; 
 // opened four reflex lanes; two of them ran `docker compose … up -d` on the production identity box over ssh while the main was fixing that box, and Joey
 // got five messages in three minutes. The words (item 1, verbatim) ride the boundary card's switch (LANES_BOUNDARY_CARD); the helpers below are pure.
 /** item 1: question 2 of the boundary card */
-export const BOUNDARY_Q2 = '2. 收不回的動作，或動到正式環境的動作：錢、金鑰、發布、刪除、改設定、對外；在正式的機器或服務上重啟、重建、部署、套用設定也算，就算文件寫了怎麼做、就算是把它恢復原狀。'
+export const BOUNDARY_Q2 = '2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。'
 /** item 1: question 3 of the boundary card (the agent's name filled in, as the card already does) */
-export const boundaryQ3 = (agent: string): string => `3. 只有主對話才知道的事：Joey 剛講的、談到一半的、${agent} 自己的標準、主線手上正在動的東西。正式服務出事時，先當成主線可能正在動它。`
+export const boundaryQ3 = (agent: string): string => `3. 只有主對話才知道的事：Joey 剛講的、談到一半的、${agent} 自己的標準、主線手上正在動的東西（看上面「此刻」）。`
 /** item 1: the line after the 「沒把握」 line */
-export const BOUNDARY_PROD_LINE = '正式服務正在壞、等不起：唯讀查清楚、把要下的指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。'
+export const BOUNDARY_PROD_LINE_132 = '正式服務正在壞、等不起：唯讀查清楚、把要下的指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。'
+/** WO-137 乙 (Chiron; Joey TG chiron:2153), verbatim: the production line as 1.41.1 sends it (${agent} filled in) */
+export const boundaryProdLine = (agent: string): string => `正式服務壞了：先看上面「此刻」。主線正在回合中、而且在動同一個服務：把你查到的原因和備好的指令用 handoff_main 交給它，不跟它同時動手。主線閒著或叫不醒：文件（runbook、README）寫明、做了可以重來的修復，由你做，這不算改設定；動手前照 ${agent} 自己的規矩登記變更，做完向 Joey 回報一次，寫明下了什麼指令、結果、還沒查的。文件上沒有的做法、刪資料、動錢、動金鑰：交主線。`
 /** item 1: the identity card's 「做可逆的小處理」, and what it reads with the boundary card on */
 export const IDENTITY_SMALL_OLD = '做可逆的小處理'
-export const IDENTITY_SMALL_NEW = '做可逆的小處理（不動正式的機器或服務）'
+export const IDENTITY_SMALL_NEW = '做可逆的小處理'                     // WO-137 乙: back to 1.39.1's words (WO-132 had added 「（不動正式的機器或服務）」)
 /** item 1 (Chiron 10:23Z, the ticket's 5th point): the second half of the identity card's critical-alert line, old and new */
 export const CRITICAL_TAIL_OLD = '不要為了「嚴重」而 handoff_main：主線會在摘要裡看到。'
 export const CRITICAL_TAIL_NEW = '嚴重本身不是交主線的理由，也不是不交的理由：照邊界卡的三問判，要主線的照樣用 handoff_main 交。摘要不會叫醒主線。'
@@ -438,6 +449,77 @@ export function remoteChanges(cmd: string, depth = 0): RemoteChange[] {
       const path = dest.slice(dest.indexOf(':') + 1)
       if (a.length >= 2 && m && !SCRATCH.test(path) && !(p === 'rsync' && words.some(w => w === '-n' || w === '--dry-run' || /^-[A-Za-z]*n[A-Za-z]*$/.test(w)))) add(dest.slice(0, dest.indexOf(':')), [`${p} to remote`])
     }
+  }
+  return out
+}
+
+// ------------------------------------------------------------------ 1.41.1: a scheduler receipt is met only when the scheduler completed the run
+// Chiron mail #11236 (run 6985, 11-24): the main's heredoc that rewrote ANCHOR.md mentioned 「btcc-receipt complete 6985」; mainToolDone matched it against the
+// whole command text and recorded the receipt met (13:05:42Z), so the main's real call at 13:15:54Z was refused (「已經回執過了」) and it had to POST
+// /complete by hand. Metis mail #11280 (run 6804, 11-23 02:43:53Z): the lane's receipt sent outcome `done`, BTCC answered HTTP 422, and the receipt was
+// recorded met (any answer was), so its retries and the main's call were refused; BTCC kept the run stalled_no_complete. Same on angelia 6865, cadmus 6969 /
+// 6994, elsa 6972, pheme 6989 (the fleet's state journals, 11-23 to 11-24: every receipt a lane filed with `done` got 422; 23 others filed `done` too and
+// were completed by the btcc-receipt CLI's `ok`).
+/** the scheduler's outcomes (BTCC schedule_runs.outcome; the btcc-receipt CLI's choices): ok | nothing-to-do | failed. The receipt's words in them: done /
+ *  normal / ok (and none) → ok; nothing-to-do; failed. Another word goes as it is (the scheduler refuses it, and the receipt stays owed). */
+export function btccOutcome(outcome: unknown): string {
+  const o = String(outcome ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-')
+  if (!o || isSuccess(o)) return 'ok'
+  if (['nothing-to-do', 'nothing', 'noop', 'no-op', 'skipped'].includes(o)) return 'nothing-to-do'
+  if (['failed', 'fail', 'failure', 'error', 'partial', 'partly-done', '部分完成'].includes(o)) return 'failed'
+  return o
+}
+/** a scheduler that says the run is already completed (BTCC 409 「run is completed, not completable」): someone completed it; nothing is owed */
+const ALREADY_COMPLETED = /\bis completed\b|"state"\s*:\s*"completed"/i
+/** what the agent-inbox daemon's answer to /lanes/scheduler says: `<action> run N: HTTP <status>[ <body>]` (server.ts schedulerCall), `<action> run N
+ *  failed: <error>`, `BTCC_API_BASE not set`, `no scheduler`. ok = the run is completed now (2xx) or already was (409 with 「is completed」); another
+ *  answer (an older daemon, a stand-in) counts as before. */
+export function schedulerAnswerOk(text: unknown): { ok: boolean; already?: boolean } {
+  const t = String(text ?? '')
+  const m = t.match(/^(?:complete|ack) run \S+: HTTP (\d{3})/)
+  if (m) {
+    const s = Number(m[1])
+    if (s >= 200 && s < 300) return { ok: true }
+    return s === 409 && ALREADY_COMPLETED.test(t.slice(m[0].length)) ? { ok: true, already: true } : { ok: false }
+  }
+  if (/^(?:complete|ack) run \S+ failed: /.test(t) || t === 'BTCC_API_BASE not set' || t === 'no scheduler') return { ok: false }
+  return { ok: true }
+}
+/** what the btcc-receipt CLI printed (the main's Bash result): on a refusal or an error it prints 「btcc-receipt: HTTP <code> <body>」 or 「btcc-receipt:
+ *  <Error>: …」 and exits 1; otherwise BTCC's answer. ok = no such line, or a 409 that says the run is completed; `text`: the line, or BTCC's answer. */
+export function receiptCliAnswer(response: unknown): { ok: boolean; already?: boolean; text: string } {
+  const r = String(response ?? '')
+  const http = r.match(/btcc-receipt: HTTP (\d{3})[^\n"]*(?:"[^\n]*)?/)
+  if (http) return Number(http[1]) === 409 && ALREADY_COMPLETED.test(http[0]) ? { ok: true, already: true, text: http[0].slice(0, 200) } : { ok: false, text: http[0].slice(0, 200) }
+  const err = r.match(/btcc-receipt: [A-Za-z]*(?:Error|Exception)\b[^\n]*/)
+  if (err) return { ok: false, text: err[0].slice(0, 200) }
+  const done = r.match(/\{[^\n{}]*"state"\s*:\s*"completed"[^\n{}]*\}/)
+  return { ok: true, text: (done ? done[0] : r).slice(0, 200) || 'completed' }
+}
+/** the programs a command line runs through before the one it names (the guard's WRAPPERS, lane-guard-hook.py), shell keywords, and the shells whose -c runs a line */
+const RUN_WRAPPERS = new Set(['sudo', 'time', 'timeout', 'nohup', 'exec', 'env', 'command', 'nice', 'stdbuf', 'setsid', 'xargs', 'watch', 'builtin'])
+const RUN_KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{', '}'])
+const RUN_SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh'])
+/** Chiron mail #11236: the scheduler runs a Bash line really completes with the btcc-receipt CLI (`btcc-receipt complete N`, any path, through env / sudo /
+ *  timeout …, python3 <path>/btcc-receipt, inside bash -c '…'), read as the guard reads it (lane-guard-hook.py receipt_cli_calls): the words of each simple
+ *  command (shellCommands: quotes removed, a heredoc's body dropped). A mention is not a call: an echo, a quoted string, a heredoc's text, a commit message. */
+export function receiptCliRuns(cmd: string, depth = 0): string[] {
+  const out: string[] = []
+  for (const c of shellCommands(cmd)) {
+    let k = 0
+    while (k < c.length) {
+      const w = c[k], b = progOf(w)
+      if (RUN_KEYWORDS.has(w) || /^[A-Za-z_]\w*=/.test(w) || RUN_WRAPPERS.has(b)) { k += b === 'timeout' && !RUN_KEYWORDS.has(w) ? 2 : 1; continue }
+      if (w.startsWith('-') && k && RUN_WRAPPERS.has(progOf(c[k - 1]))) { k++; continue }
+      break
+    }
+    let prog = progOf(c[k]), args = c.slice(k + 1)
+    if (/^python[\d.]*$/.test(prog) && progOf(args.find(a => !a.startsWith('-'))) === 'btcc-receipt') { const i = args.findIndex(a => !a.startsWith('-')); prog = 'btcc-receipt'; args = args.slice(i + 1) }
+    if (RUN_SHELLS.has(prog) && depth < 3) { const i = args.indexOf('-c'); if (i >= 0 && args[i + 1]) out.push(...receiptCliRuns(args[i + 1], depth + 1)); continue }
+    if (prog !== 'btcc-receipt' || args[0] !== 'complete') continue
+    const pos: string[] = []
+    for (let i = 1; i < args.length; i++) { if (args[i] === '--outcome' || args[i] === '--note') { i++; continue } if (!args[i].startsWith('-')) pos.push(args[i]) }
+    if (/^\d+$/.test(pos[0] ?? '')) out.push(pos[0])
   }
   return out
 }
