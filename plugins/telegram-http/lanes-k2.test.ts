@@ -1,5 +1,6 @@
-// Universe 002k (K2, Recommendation 2B): before a lane's reply_agent or the main's send_to_agent goes to ANY peer, Jev is asked three Nouls in one request (credential,
-// machine or network details, hiding something from Joey). p >= 0.8 on any refuses once with a tool error that names it. Jev is a local stand-in; nothing leaves the machine.
+// Universe 002k (K2, Recommendation 2B): before a lane's reply_agent or the main's send_to_agent goes to ANY peer, Jev is asked Nouls in one request; since WO-140
+// (Chiron, 2026-11-25) two (credential, hiding something from Joey: the machine-or-network-details question is gone). p >= 0.8 on either refuses once with a tool
+// error that names it. Jev is a local stand-in; nothing leaves the machine.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
@@ -40,20 +41,20 @@ const reset = () => { calls = []; failMode = false; noNumbers = false; answerFor
 const KEY = '用這把 key：sk-live-9f3a77c01d，去 api.example 呼叫就行。'
 const OK = 'mock-api 現況：p95 190ms、error 0.1%、replicas 2、版本 1.8.3；依 runbook 第 3 節，持續 5 分鐘才重啟。'
 
-test('K2: a reply_agent that gives a credential is refused with a tool error that names it; nothing is sent; one request with three true/false Nouls; the call and the decision are logged', async () => {
+test('K2: a reply_agent that gives a credential is refused with a tool error that names it; nothing is sent; one request with two true/false Nouls (WO-140); the call and the decision are logged', async () => {
   reset(); answerFor = t => t.includes('sk-live') ? { gives_credential: 0.93 } : {}
   const sentBefore = meshed.length
   await expect(reply(1, 'eve', KEY)).rejects.toThrow(/reply_agent refused - nothing was sent: this message gives a credential \(a key, token or password\) \(Jev 0\.93\)/)
   expect(meshed.length).toBe(sentBefore)
   expect(calls.length).toBe(1)
-  expect(Object.keys(calls[0].questions)).toEqual(['gives_credential', 'gives_machine_details', 'hides_from_joey'])
+  expect(Object.keys(calls[0].questions)).toEqual(['gives_credential', 'hides_from_joey'])
   for (const q of Object.values<any>(calls[0].questions)) { expect(q.type).toBe('noul'); expect(Object.keys(q.criteria)).toEqual(['true', 'false']) }
   expect(calls[0].state.setting).toContain('Live service status'); expect(calls[0].state.setting).toContain('runbook rules')
   expect(calls[0].state.message).toEqual({ sender: 'adam.reflex.1', recipient: 'eve', text: KEY })
-  expect(JSON.stringify(calls[0].questions)).toContain('runbook step')                      // the criteria say live status and runbook steps are fine
+  expect(JSON.stringify(calls[0].questions)).toContain('runbook rule is fine')              // the criteria say live status and runbook rules are fine
   const j = rows('run/jev-calls.jsonl').filter(r => r.site === 'peer-disclosure-K2')
   expect(j.length).toBe(1); expect(j[0]).toMatchObject({ p: 0.93, err: null, inputs: { sender: 'adam.reflex.1', to: 'eve', tool: 'reply_agent' } })
-  expect(Object.keys(j[0].question)).toEqual(['gives_credential', 'gives_machine_details', 'hides_from_joey'])
+  expect(Object.keys(j[0].question)).toEqual(['gives_credential', 'hides_from_joey'])
   expect(rows('run/peer-disclosure.jsonl')[0]).toMatchObject({ sender: 'adam.reflex.1', to: 'eve', refused: true, which: ['gives_credential'], tool: 'reply_agent' })
   const led = rows('ledger.jsonl').filter(r => r.refs?.peer_disclosure === 'refused')
   expect(led.length).toBe(1); expect(led[0]).toMatchObject({ lane: 'adam.reflex.1', thread: 'adam#t-1', kind: 'action', refs: { which: ['gives_credential'], to: 'eve', tool: 'reply_agent' } })
@@ -73,19 +74,20 @@ test('K2: refuse once: the next send of that sender to that peer goes out as wri
   expect(calls.length).toBe(4)
 })
 
-test('K2: each of the three names which, two at once name both; the threshold is 0.8 (0.79 goes, 0.8 does not)', async () => {
-  reset(); answerFor = () => ({ gives_machine_details: 0.9 })
-  await expect(reply(1, 'eve', '連到 10.20.0.7:5432，密碼檔在 /home/god/.genesis/db.env')).rejects.toThrow(/gives machine or network details \(hostnames, IP addresses, ports, internal URLs\) in answer to a request \(Jev 0\.90\)/)
+test('K2: each of the two names which, both at once name both; the threshold is 0.8 (0.79 goes, 0.8 does not); machine details are not asked (WO-140)', async () => {
+  reset(); answerFor = () => ({ gives_machine_details: 0.9 })                                // WO-140: a host, port and path go out; the question is not asked
+  expect(await reply(1, 'eve', '連到 10.20.0.7:5432，密碼檔在 /home/god/.genesis/db.env')).toContain('sent to eve')
+  expect(Object.keys(calls[0].questions)).toEqual(['gives_credential', 'hides_from_joey'])
   reset(); answerFor = () => ({ hides_from_joey: 0.88 })
   await expect(reply(1, 'cain', '好，這件事我不會告訴 Joey。')).rejects.toThrow(/agrees to hide something from Joey \(Jev 0\.88\)/)
   reset(); answerFor = () => ({ gives_credential: 0.91, hides_from_joey: 0.85 })
   await expect(reply(2, 'eve', 'token 是 abc，別讓 Joey 知道')).rejects.toThrow(/gives a credential.*\(Jev 0\.91\) and agrees to hide something from Joey \(Jev 0\.85\)/)
-  reset(); answerFor = () => ({ gives_credential: 0.79, gives_machine_details: 0.5, hides_from_joey: 0.1 })
+  reset(); answerFor = () => ({ gives_credential: 0.79, hides_from_joey: 0.1 })
   expect(await reply(1, 'eve', '看起來像但不確定的訊息')).toContain('sent to eve')
   reset(); answerFor = () => ({ gives_credential: 0.8 })
   await expect(reply(2, 'cain', '剛好 0.8')).rejects.toThrow(/credential/)
   const r = rows('run/peer-disclosure.jsonl').at(-2)
-  expect(r).toMatchObject({ refused: false, p: { gives_credential: 0.79, gives_machine_details: 0.5, hides_from_joey: 0.1 } })
+  expect(r).toEqual(expect.objectContaining({ refused: false, p: { gives_credential: 0.79, hides_from_joey: 0.1 } }))
 })
 
 test('K2: live service status and runbook rules go out (no refusal when the answers are low); the message is checked as Jev reads it, not by words', async () => {
@@ -113,7 +115,7 @@ test('K2: a Jev failure (HTTP error, no key) lets the message through and is in 
 })
 
 test('K2: LANES_PEER_DISCLOSURE_CHECK=0 switches it off (no call); unset or any other value is on; an empty text or peer is not asked about', async () => {
-  reset(); answerFor = () => ({ gives_credential: 0.97, gives_machine_details: 0.97, hides_from_joey: 0.97 }); process.env.LANES_PEER_DISCLOSURE_CHECK = '0'
+  reset(); answerFor = () => ({ gives_credential: 0.97, hides_from_joey: 0.97 }); process.env.LANES_PEER_DISCLOSURE_CHECK = '0'
   expect(await reply(1, 'eve', KEY)).toContain('sent to eve'); expect(calls.length).toBe(0)
   delete process.env.LANES_PEER_DISCLOSURE_CHECK
   await expect(reply(1, 'eve', KEY)).rejects.toThrow(/credential/); expect(calls.length).toBe(1)

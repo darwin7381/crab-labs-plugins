@@ -342,7 +342,7 @@ test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the ro
   writeFileSync(join(dir, 'focus.md'), '進行中：日誌基準統計。別碰：mock-api 設定。預計 +6m 完成。\n')   // 002r (B09): the router's interim carries the main's focus card
   const out = await call(p.tok, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })
   expect(out).toContain('The router told eve'); expect(out).toContain('your own part')
-  expect(mesh.at(-1)).toMatchObject({ to: 'eve', reply_to: '50008' }); expect(mesh.at(-1).text).toContain('主線會在')
+  expect(mesh.at(-1)).toMatchObject({ to: 'eve', reply_to: '50008', no_reply: true }); expect(mesh.at(-1).text).toContain('主線會在')   // WO-140: the interim owes no reply
   expect(mesh.at(-1).text).toContain('主線目前的焦點卡：「進行中：日誌基準統計。別碰：mock-api 設定。預計 +6m 完成。」')
   rmSync(join(dir, 'focus.md')); expect(L.interimText(Date.now())).not.toContain('焦點卡')              // no card, no sentence
   writeFileSync(join(dir, 'focus.md'), '（主線還沒有寫焦點卡。）\n'); expect(L.interimText(Date.now())).not.toContain('焦點卡')   // the placeholder a new workspace starts with is no card (002r smoke C07)
