@@ -22,6 +22,9 @@ export type ObKind = 'joey' | 'main' | 'peer' | 'receipt'
 export type Outcome = 'normal' | 'changed' | 'failed'
 export type ObState = 'open' | 'requested' | 'met' | 'handed' | 'dropped' | 'merged'
 export type Ob = { id: string; kind: ObKind; level: string; state: ObState; by?: string; owner?: string
+  /** WO-128: a hand-over that can wait (a decision card): the main's, but no M1 item and no due time until it is woken (`woke`: urgent | due); `card`: the
+   *  hand-over is a decision card's (not listed in open-handoffs.md: the mailbox is the list) */
+  defer?: boolean; woke?: 'urgent' | 'due'; woke_at?: string; card?: boolean
   due_at?: number; ring?: boolean; rang?: boolean; told?: boolean; to?: string; run_id?: string; item?: string; handoff?: string; cls?: string; what?: string; req?: string; sent?: string
   /** the delivery that met it (message id, btcc id, the scheduler's answer); why the last delivery failed; the outcome a joey line was met with; the event a merged one went into */
   ref?: string; failed?: string; outcome?: Outcome; into?: string
@@ -44,7 +47,11 @@ export type HandOver = { handoff: string; by: string; what?: string; due_at?: nu
   /** 002y (X-3): the lane hands the peer's REQUEST itself to the main (handoff_main): the answer is the main's whatever the lane already sent. A reply of
    *  the lane's that met it (reply_agent) was the lane's own line: it stays met as level `message`, and the answer is handed like an owed one. The exit
    *  rule and the thread stop do not set it (what the lane already answered there stays answered). */
-  request?: boolean }
+  request?: boolean
+  /** WO-128: the hand-over can wait (a decision card): no M1 item, no due time (lanes.ts handToMain) */
+  defer?: boolean
+  /** WO-128: a decision card's hand-over (decide_later; a deferred mailbox_card) */
+  card?: boolean }
 
 const RANK: Record<string, number> = { none: 0, line: 1, decision: 2 }
 const SEV: Record<Outcome, number> = { normal: 0, changed: 1, failed: 2 }
@@ -135,7 +142,9 @@ export function createEvents(J: Journal, changed?: () => void) {
         if (!ob && want.level === 'line' && out === 'normal' && e.class !== 'joey')
           refused = 'this event owes Joey no line, and your line reports nothing new since the last run (a routine check tells him only when something changed, a part reports to the main): it goes in your receipt, not to Joey'
         else if (!ob) { ob = { id: obId('joey'), kind: 'joey', level: want.level, state: 'open' }; obs.push(ob); raised = true; ask(ob, want.level) }
-        else if (ob.state === 'handed') refused = 'this event is handed to the main: the main reports to Joey'
+        else if (ob.state === 'handed') refused = obs.some(o => o.kind === 'main' && o.defer && !o.woke && owing(o))       // WO-128: a card that can wait
+          ? 'this matter waits on the main\'s decision in its mailbox (a card that can wait; the main is not woken for it): the run that finishes it after the decision tells Joey, once. Put what you did in your receipt'
+          : 'this event is handed to the main: the main reports to Joey'
         else if (ob.state === 'requested') refused = 'a line about this event is being sent to Joey right now'
         // 002t (station 4, I03 and F01 live): a worker's own topic is a conversation with Joey, like the main's chat. The one-message rule is about
         // notifications (one line per event, per outcome); in a topic it refused the result Joey asked for, because the worker's greeting had met the
@@ -202,7 +211,8 @@ export function createEvents(J: Journal, changed?: () => void) {
     const open = obs.find(o => o.kind === 'main' && owing(o))
     if (open) return open
     const ob: Ob = { id: h.handoff, kind: 'main', level: 'handed', state: 'open', by: h.by, owner: 'main', handoff: h.handoff, at: new Date().toISOString(),
-      ...(h.what != null ? { what: h.what } : {}), ...(h.due_at != null ? { due_at: h.due_at } : {}), ...(h.cls ? { cls: h.cls } : {}) }
+      ...(h.what != null ? { what: h.what } : {}), ...(h.due_at != null ? { due_at: h.due_at } : {}), ...(h.cls ? { cls: h.cls } : {}),
+      ...(h.defer ? { defer: true } : {}), ...(h.card ? { card: true } : {}) }
     // 002y (X-3, 002w r1 B09): the peer's request handed over AFTER the lane's own reply met its answer left the main owing nothing and the peer never told
     // when the main would answer (the order of the two calls decided it). Handing the request over makes the answer owed again, as the main's: the
     // lane's reply becomes its own line (`message`, still met), and a new answer to that peer is owed below like any other.

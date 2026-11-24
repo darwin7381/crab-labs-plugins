@@ -12,7 +12,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, chmodSync, mkdi
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { decisionEvent } from './mail-events.ts'
+import { decisionEvent, dueEvent } from './mail-events.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 const L = await import('./lanes.ts?wo132') as typeof import('./lanes.ts')
 const B = await import('./lanes-boundary.ts')
@@ -49,7 +49,9 @@ chmodSync(bin, 0o755)
 const restore = L.__setClaudeBin(bin)
 const sent: Array<{ text: string; silent: boolean }> = []
 const open = new Set<string>()
-L.__setMailTool(async b => ({ text: b.name === 'decide_later' ? '放進主線的信箱了（#13201，期限 11-25 03:00Z）。' : 'ok', isError: false, ...(b.name === 'decide_later' ? { mail_id: 13201, deadline: '2026-11-25T03:00:00.000Z' } : {}) }))
+let mailId = 13200
+L.__setMailTool(async b => { const id = b.name === 'decide_later' ? ++mailId : 0
+  return { text: id ? `放進主線的信箱了（#${id}，期限 11-25 03:00Z）。` : 'ok', isError: false, ...(id ? { mail_id: id, deadline: '2026-11-25T03:00:00.000Z' } : {}) } })
 L.lanesInit({ role: 'tg', agent: 'prometheus', workspaceDir: ws, transcriptDir: join(tmp, 'tr'), httpPort: 0, log: () => {}, authOk: () => true, registryNames: () => ['eve', 'scheduler'],
   notifySession: async (sid: string) => open.has(sid), streamOpen: (sid: string) => open.has(sid), toolsChanged: () => {},
   sendBot: async (_c: string, text: string, o: any) => { sent.push({ text, silent: !!o?.silent }); return 900 + sent.length }, joeyChatId: () => '1' } as any)
@@ -125,8 +127,8 @@ test('WO-132 #1: the words, verbatim: questions 2 and 3 of the boundary card, th
   const card = B.boundaryDefault('prometheus')
   expect(card[3]).toBe('2. 收不回的動作，或動到正式環境的動作：錢、金鑰、發布、刪除、改設定、對外；在正式的機器或服務上重啟、重建、部署、套用設定也算，就算文件寫了怎麼做、就算是把它恢復原狀。')
   expect(card[4]).toBe('3. 只有主對話才知道的事：Joey 剛講的、談到一半的、prometheus 自己的標準、主線手上正在動的東西。正式服務出事時，先當成主線可能正在動它。')
-  const i = card.indexOf('沒把握：交給主線，不猜著做完。')
-  expect(i).toBeGreaterThan(0)
+  const i = card.indexOf(B.deferDecisionsOn() ? B.BOUNDARY_DEFER_LINE : '沒把握：交給主線，不猜著做完。')   // 1.41.0: WO-128 replaced the 「沒把握」 line in place
+  expect(i).toBe(6)
   expect(card[i + 1]).toBe('正式服務正在壞、等不起：唯讀查清楚、把要下的指令備好，用 handoff_main 交給主線，第一句寫什麼壞了、誰在等。不自己下那個指令。')
   expect(card.length).toBe(11)
   const id = L.identityCard({ kind: 'reflex' }).split('\n')
@@ -305,10 +307,23 @@ test('WO-132 #4: a run with a refused write still counting hands over to the mai
   await end(r)
   const r2 = await start(sched(6915, 'morning-check'))
   L.recordBlocked(r2.tok, { target: 'state/watch.md', category: 'file', tool: 'Write' })
-  expect(await call(r2, 'decide_later', { title: '要不要清 plutus 快取', card: { decide: '清不清', recommend: '清' } })).toContain('The main was woken')
+  // 1.41.0 (WO-128): a decide_later wakes the main now only when it cannot wait (urgent_because)
+  expect(await call(r2, 'decide_later', { title: '要不要清 plutus 快取', card: { decide: '清不清', recommend: '清' }, urgent_because: '磁碟今晚滿' })).toContain('The main was woken')
   const it2 = M().items(x => x.event === r2.id && x.kind === 'carry').at(-1)!
   expect(String((it2.notif.params as any).content)).toContain(`\n${B.blockedLine({ n: 1, targets: ['state/watch.md'] })}`)
   await call(r2, 'receipt', { run_id: '6915', outcome: 'failed', steps: [{ step: '清快取', done: false }], happened: 'x', did: 'x', promised: '無', needs_main: 'x' }); await end(r2)
+  // a card that can wait wakes nobody now; the event's record carries the line, and the item of its due wake has it
+  const r5 = await start(sched(6919, 'morning-check'))
+  L.recordBlocked(r5.tok, { target: 'state/watch2.md', category: 'file', tool: 'Write' })
+  const line5 = B.blockedLine({ n: 1, targets: ['state/watch2.md'] })
+  expect(await call(r5, 'decide_later', { title: '要不要清 plutus 快取（二）', card: { decide: '清不清', recommend: '清' } })).toContain('It can wait')
+  expect(M().items(x => x.event === r5.id).length).toBe(0)
+  expect(E().get(r5.id)!.blocked).toBe(line5)
+  await call(r5, 'receipt', { run_id: '6919', outcome: 'failed', steps: [{ step: '清快取', done: false }], happened: 'x', did: 'x', promised: '無', needs_main: 'x' }); await end(r5)
+  const m5 = (E().get(r5.id)!.waits as any[]).at(-1).mail_id
+  await L.routeEvent(dueEvent({ id: m5, title: '要不要清 plutus 快取（二）', decide: '清不清', deadline: '2026-11-25T03:00:00.000Z', lane: r5.lane, thread: st().lanes[r5.lane].thread }) as any)
+  const it5 = M().items(x => x.event === r5.id).at(-1)!
+  expect(String((it5.notif.params as any).content)).toContain(`\n${line5}`)
   // a run that ends with its event still owing: the exit rule's hand-over carries the line too
   const r4 = await start(sched(6918, 'morning-check'))
   L.recordBlocked(r4.tok, { target: 'maintenance/flightlog/plutus-data-size.log', category: 'file', tool: 'Bash' })

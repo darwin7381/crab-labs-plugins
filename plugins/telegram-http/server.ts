@@ -3985,6 +3985,13 @@ if (Lanes.LANES_ON) {
         const res: any = await callInboxTool(name, args, { ...fleetDeps, openBy: 'lane', lane }, false)   // WO-126: a lane item / a card names the lane
         return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(to ? { to } : {}) }
       },
+      // WO-128 (item 4): the cards that wait on the main's decision, for the context the main gets back after a /clear, a compaction or a restart: BTCC /due
+      // over the longest window it takes (7 days), the past due included (seam: claude-epeius/knowledge/lane-mailbox-seam.md)
+      mailWaiting: async () => {
+        const r = await btccMail('GET', `/api/mesh/mail/due?within=${7 * 86400}`).catch(() => null)
+        if (r?.status === 200 && Array.isArray(r.json?.due)) return { ok: true, items: r.json.due.map((d: any) => ({ id: Number(d.id), title: String(d.title ?? ''), decide: String(d.decide ?? ''), deadline: String(d.deadline ?? ''), overdue: d.overdue === true })) }
+        return { ok: false, why: r ? `BTCC ${r.status}` : 'BTCC 連不上' }
+      },
       schedulerCall: async (runId, action, outcome, summary) => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         try {

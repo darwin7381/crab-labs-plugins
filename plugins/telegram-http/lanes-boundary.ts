@@ -20,6 +20,8 @@ export const receiptStepsOn = (): boolean => process.env.LANES_RECEIPT_STEPS !==
 export const decisionsOn = (): boolean => process.env.LANES_DECISIONS !== '0'
 /** WO-127 item 4: who tells Joey about a matter the main decided: `lane` (default: the run that finishes it, once) | `main` (the main, as before) */
 export const decisionReporter = (): 'lane' | 'main' => process.env.LANES_DECISION_REPORTER === 'main' ? 'main' : 'lane'
+/** WO-128 (telegram-http 1.39.0): a card that can wait does not wake the main (default on; `0` = 1.38.x: every card wakes the main). Under LANES_DECISIONS. */
+export const deferDecisionsOn = (): boolean => decisionsOn() && process.env.LANES_DEFER_DECISIONS !== '0'
 
 // ------------------------------------------------------------------ A: the boundary card
 export const BOUNDARY_FILE = 'boundary.md'
@@ -38,8 +40,8 @@ export function boundaryDefault(agent: string): string[] {
       // WO-131 (1.38.3, Chiron mail #11046, verbatim): the step goes to the main as a decision card (LANES_DECISIONS=0: the 1.37 words, no card tool)
       + (decisionsOn() ? BOUNDARY_CARD_STEP : BOUNDARY_HANDOFF_STEP)
       + (decisionsOn() ? boundaryDecisionSentence() : ''),          // WO-127 item 8: the same line (the card's line count and hash do not change)
-    '沒把握：交給主線，不猜著做完。',
-    BOUNDARY_PROD_LINE,                                                // WO-132 item 1: a line of its own after the 「沒把握」 line
+    deferDecisionsOn() ? BOUNDARY_DEFER_LINE : '沒把握：交給主線，不猜著做完。',   // WO-128 item 5: the same line replaced (line count, card_hash unchanged)
+    BOUNDARY_PROD_LINE,                                                // WO-132 item 1: a line of its own after the 「沒把握」 line (WO-128's, when it is on)
     '回報照實際發生的寫：指示裡的步驟，哪幾步做了、哪幾步沒做，都列出來；有沒做的，結果不能填正常。寫入或指令被擋，就寫被擋，不寫已做。',
     '判例（主線留的，新的在上面；跟上面衝突時照判例）：',
     BOUNDARY_NONE,
@@ -78,6 +80,14 @@ export const DECISION_MAIN_RULE = '- 分身交來要你決定的事附著決定�
 const DECISION_MAIN_RULE_MAIN = '- 分身交來要你決定的事附著決定卡。照卡就能決定的：用 mailbox_decide 回（照建議／改成…／不做），原本那條分身會接著做完；這件事由你向 Joey 回報一次，寫明你的決定。'
   + '收不回的動作、要你這段對話才知道的事：你自己做，做完那一件就算結掉。收不回的事和真金，先看原文再決定。'
 export const decisionMainRule = (): string => decisionReporter() === 'main' ? DECISION_MAIN_RULE_MAIN : DECISION_MAIN_RULE
+
+// ------------------------------------------------------------------ WO-128: what can wait does not wake the main (Chiron's ticket; the words are its, verbatim)
+/** item 5: the boundary card's line, in place of 「沒把握：交給主線，不猜著做完。」 */
+export const BOUNDARY_DEFER_LINE = '要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。'
+/** item 5: the main's rule, right after the decision card's */
+export const DEFER_MAIN_RULE = '- 等得起的事不會單獨叫醒你：你每次醒來，摘要會列「信箱有幾件等你決定」，一起處理；快到期的那一件才會單獨叫你。'
+/** item 1: the optional argument of decide_later and mailbox_card (the lanes' copies; not sent to BTCC) */
+export const URGENT_BECAUSE_PROP = { type: 'string', description: '選填。等不起才填：什麼會壞、誰在等（一句）。填了＝現在叫醒主線。不填＝等得起：不叫醒主線，它下一次醒來時在摘要看到這一件，快到期才單獨叫它。' }
 export type MainDecision = 'as_recommended' | 'changed' | 'declined'
 /** the decision in words: 照建議｜改成：<note>｜不做 */
 export function decisionWords(decision: string, note?: string | null): string {

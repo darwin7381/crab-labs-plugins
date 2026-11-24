@@ -13,6 +13,7 @@ import { join } from 'path'
 import { createServer } from 'http'
 import { decisionEvent, dueEvent } from './mail-events.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
+process.env.LANES_DEFER_DECISIONS = '0'                                     // WO-128 (1.39.0): these tests pin 1.38's behaviour (every card wakes the main); lanes-wo128 tests the switch on
 // the tg daemon's own HTTP routes, for the agent-inbox side's calls into it (/lanes/mail-checked)
 let Lref: any = null
 const tgSrv = createServer(async (req, res) => { if (!Lref || !(await Lref.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res))) res.writeHead(404).end() })
@@ -80,7 +81,7 @@ const procs: any[] = []
 afterAll(() => { for (const f of [...Object.keys(L.__lanesState().lanes)]) try { writeFileSync(join(tmp, `go-${f}`), 'ok') } catch {}
   for (const p of procs) try { p.kill('SIGKILL') } catch {}
   tgSrv.close(); L.__setClaudeBin(restore); L.__setMailTool(null); L.__setMeshSend(null)
-  for (const k of ['LANES_FLOOD_CONTROL', 'LANES_DECISIONS', 'LANES_DECISION_REPORTER']) delete process.env[k]
+  for (const k of ['LANES_FLOOD_CONTROL', 'LANES_DECISIONS', 'LANES_DECISION_REPORTER', 'LANES_DEFER_DECISIONS']) delete process.env[k]
   rmSync(ws, { recursive: true, force: true }); rmSync(tmp, { recursive: true, force: true }) })
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))

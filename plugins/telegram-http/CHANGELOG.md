@@ -1,3 +1,60 @@
+## 1.41.0 — 2026-11-24
+
+- **Lanes on: what can wait does not wake the main (WO-128, Chiron; Joey TG chiron:2081, 2083, 2095 「那就試試看吧、記得同步紀錄觀察點」; agent-inbox 1.10.0 carries the same code).
+  Built now, deployed later: it needs a running main that has `mailbox_decide` (1.38.1).**
+  - **Why (the ticket):** a lane had two ways to the main: record (no wake) or hand over (woken now, pushed to Joey after 300 s). A decision that can
+    wait took the loudest one: on 11-23 the main was woken by lanes 63 times in 18 hours, each time re-reading its whole conversation. The rule now is
+    the three lines toward a colleague: nothing for the main → record; the main must decide but it can wait → its mailbox, not woken; it cannot wait
+    → wake it, saying what breaks or who is waiting.
+  - **Item 1, the lanes' calls:** `decide_later` and `mailbox_card` take an optional `urgent_because` (what breaks, who is waiting). It is kept on the
+    router's record (`waits[].urgency`, `urgent_because`) and the ledger row (「；等不起：…」 / 「；等得起：不叫醒主線」, `refs.urgency`); it is not sent to BTCC
+    (fleet-mail.ts builds BTCC's body from named fields; the card's boxes stay Epeius's). Blank = none = it can wait.
+    - **Can wait (the default):** the run's event is handed to the main (its Joey line, a peer's answer, a scheduler receipt are the main's until the
+      decision comes back, as in WO-127) but the hand-over waits in the mailbox: no M1 item, no due time (`defer`, `card` on the main obligation). The
+      lane is told the main is not woken; a peer that asked gets the router's interim with the card's deadline. A mail lane's card needs no
+      `handoff_main` (the lane stop asks only about cards that cannot wait); a `handoff_main` later in the same run wakes the main after all
+      (`woke: urgent`, the 300 s counted from then). Every delivery to the main (whatever woke it, offered or pulled) carries in its digest
+      「〔信箱有 N 件等你決定（…）〕」 and one line per card, soonest deadline first: `• #id「title」｜要你決定：…｜期限 MM-DD HH:MM` (at most 8, then
+      「另有 N 件」). The digest is never offered alone, so this wakes nobody. A card's `mail_due` (Epeius's, 15 minutes before its deadline) is its one
+      wake (`mail-due-wake`): the hand-over gets its item now (〔要你決定｜快到期｜ho-…｜信箱 #id〕 with the card and how to answer) and its due time
+      from now; a hand-over an earlier turn already met gets a new one; one the main already holds is not woken again; a second `mail_due` is not.
+    - **Cannot wait:** woken now, as 1.38 (`woke: urgent`); the item and the mail lane's hand-over carry 「等不起…：<reason>」.
+  - **Item 3:** the 300 s push is for hand-overs that wake the main; a card that can wait is pushed only 300 s after its due wake (「這件事放在主線的信箱
+    等決定（ho-…；信箱 #id，期限 …），快到期叫醒主線 N 分鐘了還沒處理…」), once; a peer's answer due later on the same matter is then a ledger line, not a
+    second push. 1.38.2's rule applies too (no push while the main holds the item or after it replied to Joey about it).
+  - **Item 4:** `.lanes/open-handoffs.md` lists no decision card (no 「信箱 #id 等你決定」 line, no card's hand-over); Joey's unfinished messages to the main
+    and lanes' other hand-overs are listed as before. The context the main gets back (its SessionStart on startup / clear / compact, a resumed main's
+    first prompt, the first prompt after a compaction) ends with what waits in the mailbox, read through the agent-inbox daemon (`POST /lanes/mail-waiting`
+    → BTCC `/api/mesh/mail/due?within=604800`, the longest window BTCC takes, past due included): 「〔信箱有 N 件等你決定（從信箱讀的…）〕」 and up to 10
+    lines; 「〔信箱〕現在沒有等你決定的件。」; unreadable within `LANES_MAILBOX_READ_MS` (4 s): one line 「〔信箱〕等你決定的件現在讀不到（why）；分流器記得
+    N 件：…；用 mailbox_list 看。」
+  - **Item 5, the words (verbatim):** the boundary card's 「沒把握：交給主線，不猜著做完。」 is replaced in place (10 lines; the lane card's `card_hash` does
+    not change); the main's rule 「- 等得起的事不會單獨叫醒你：…」 right after the decision card's.
+  - **Item 6, the switch:** `LANES_DEFER_DECISIONS` (default on; `0` = 1.40.0: every card wakes the main; under `LANES_DECISIONS`), in the tg daemon's env.
+  - **Item 9, observation points (lanes.jsonl, switch on only):** the exit row of a run that opened a card has `card_urgency` (`defer` | `urgent`; a list
+    in order when it opened several); one row `kind: "main_wake"` per wake of the main (M1 offered an idle main an item, or a walled main its probe)
+    with `cause` (`due` | `urgent_handoff`: a lane's hand-over that woke it: handoff_main, a card with a reason, the exit rule | `other`: Joey, a peer or
+    an alert routed to the main, the router's own), `event`, `item`, `item_kind`, `handoff`, `by`, `gen`. Card-to-decision time: BTCC `/decisions/metrics`.
+  - **Tests:** `lanes-wo128` (10: the ticket's 1-10, the words, the mail lane and a lane that finds it cannot wait after all); `lanes-wo127` runs with
+    `LANES_DEFER_DECISIONS=0` (it pins 1.38). Switch off against 1.38.2 (8d0546a): one scenario (a `decide_later`, a mail-lane `mailbox_card` + `handoff_main`,
+    the main's turn, Stop checks and reply, a `mail_decision` and its run, a `mail_due`, the due sweep) gave identical tool lists, main rules, boundary
+    card, card hashes, SessionStart context, routes, tool results, run prompts, Joey / mesh / mailbox traffic, ledger, lanes.jsonl, routing.jsonl, the
+    M1 / M2 / M3 / run records, open-handoffs.md, digests and activity list (times and random ids masked). Suite: 943 (940 pass, 3 skip, 0 fail).
+  - **Not verified here:** BTCC and a live main (the mailbox, `/due` and the main are stand-ins); the agent-inbox daemon's `mailWaiting` against real
+    BTCC; how a real main handles 「信箱有 N 件」 in a digest. A card whose deadline is more than 7 days out is not in the context block (BTCC's window).
+  - **Renumbered (rebased on 1.39.0, WO-129):** written as 1.39.0 on top of 1.38.2 (0dc2a17, branch lanes-topics); now on top of 1.38.3 (WO-131) and
+    1.39.0 (WO-129), behaviour unchanged. With both: a deferred card (`tok.parked`) lets a receipt with steps not done through as a hand-over does;
+    the mail lane's line 3 (1.38.3, Chiron #11046) still says 「附完用 handoff_main 交回」, and a `handoff_main` in a run wakes the main after all.
+    `lanes-wo131`'s card test follows it (open-handoffs.md lists no cards; the card's wait on the asking event is what survives the mail lane's renewal).
+    Suite on this branch: 965 (962 pass, 3 skip, 0 fail; a first run had usage-wall.daemon's two timing tests fail under load, both pass alone).
+  - **Renumbered again (rebased on 1.39.1 and 1.40.0, WO-132):** 1.40.0 → 1.41.0, behaviour unchanged. With WO-132: the boundary card keeps WO-128's
+    line in place of 「沒把握：…」 and WO-132's production line right after it (11 lines); WO-132's 〔系統〕 blocked line rides the
+    items WO-128 adds: a deferred card's due wake (the event's record carries the line) and `handoff_main`'s wake of a deferred matter; an urgent
+    `decide_later` carries it as before. WO-132's closing check counts a card that can wait as a hand-over (the run's `decide_later` / `mailbox_card`).
+    Tests adjusted: lanes-wo128 item 5 (11 lines; WO-132's line follows WO-128's), lanes-wo132 #1 (the production line follows WO-128's line) and #4
+    (`decide_later` wakes the main with `urgent_because`; one that can wait: the event carries the line and its due wake's item has it). Suite on this
+    branch: 977 (973 pass, 3 skip, 1 fail: lanes-topics-richlines' log-line test under load, passes alone twice); 1.40.0: 967 (964 pass, 3 skip, 0 fail).
+
 ## 1.40.0 — 2026-11-24
 
 - **Lanes on: an alert's lane leaves production to the main; one lane per incident; a run is told what the main and the agent's other lanes are doing (board WO-132, Chiron's ticket; agent-inbox 1.10.0 carries the same code).**

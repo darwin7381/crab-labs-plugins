@@ -31,7 +31,7 @@ import {
   BOUNDARY_WARN_LINES, blockFactsOn, blockedFacts, blockedLine, blockedReceiptRefusal, bashWritesPath, boundaryCard, boundaryCardOn, boundaryReminder, isSuccess,
   parseSteps, receiptStepsOn, receiptToolWithSteps, stepsNotDoneText, stepsRefusal, type Blocked, type BoundaryCard, type Step,
   missingStepsRefusal, receiptCliPointer, stepsLine,
-  DECISION_ASK_AGAIN, cardLines, decisionPrefix, decisionReporter, decisionsOn, decisionWords,
+  DECISION_ASK_AGAIN, cardLines, decisionPrefix, decisionReporter, decisionsOn, decisionWords, deferDecisionsOn, URGENT_BECAUSE_PROP,
   CRITICAL_TAIL_NEW, CRITICAL_TAIL_OLD, DEDUPE_DONE_NOTE, IDENTITY_SMALL_NEW, IDENTITY_SMALL_OLD, dedupedSteps, mainAskPhrase, mainAskRefusal, remoteChanges,
   type RemoteChange,
 } from './lanes-boundary.ts'
@@ -186,6 +186,9 @@ export interface LanesDeps {
    *  mail it replies to (the disclosure check ran on it) */
   mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string; no_reply?: boolean }>
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, summary?: string) => Promise<string>
+  /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
+   *  main gets back after a /clear, a compaction or a restart */
+  mailWaiting?: () => Promise<{ ok: boolean; items?: Array<{ id: number; title?: string; decide?: string; deadline?: string; overdue?: boolean }>; why?: string }>
   registryNames?: () => string[]
   /** loopback MCP token check (mcp-auth gate) */
   authOk: (authz: string | undefined) => boolean
@@ -371,10 +374,45 @@ function mainEnv() {
     },
     toolDone: mainToolDone,
     toolGate: mainToolGate,
+    woke: mainWoke,                                                                 // WO-128 (item 9): one main_wake row per wake (switch on)
+    mailbox: async (): Promise<string> => deferDecisionsOn() ? mailboxContext() : '',   // WO-128 (item 4): what waits in the mailbox, when the main gets its context back
     bound: mainTookItems,                                                           // lanes-golive (C3): the main has it: a scheduler run's start receipt                                                         // 002w (D): one receipt per scheduler run, the main included                                                         // 002w (D): the main's own completion of a scheduler run
   }
 }
 
+/** WO-128 (item 9): M1 offered the main an item (an idle main, or a walled one's probe): one wake. lanes.jsonl `main_wake`, `cause`: due (a card's due wake),
+ *  urgent_handoff (a lane's hand-over that cannot wait: handoff_main, a card with urgent_because, the exit rule), other (Joey, a peer or an alert routed to the
+ *  main, the router's own). Only with LANES_DEFER_DECISIONS on. */
+function mainWoke(it: Row, o: { gen: string; probe: boolean }): void {
+  if (!deferDecisionsOn() || !LANES_DIR) return
+  const e = it.event ? events?.get(String(it.event)) : undefined
+  const ob = ((e?.obligations ?? []) as Ob[]).find(x => x.kind === 'main' && x.item === it.id)
+  const cause = ob?.woke === 'due' ? 'due' : it.kind === 'handoff' || it.kind === 'carry' ? 'urgent_handoff' : 'other'
+  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'main_wake', cause, event: it.event ?? null, item: it.id, item_kind: it.kind, handoff: ob?.handoff ?? null,
+    by: ob?.by ?? null, gen: o.gen, ...(o.probe ? { probe: true } : {}) })
+  logos('lane.main_wake', { cause, event: it.event ?? null, item_kind: it.kind, handoff: ob?.handoff ?? null, gen: o.gen })
+}
+/** WO-128 (item 4): the lines the main gets back with its context (registration on startup / clear / compact, a resumed main's first prompt, the first prompt
+ *  after a compaction): the count and titles of what waits on its decision, read from the mailbox through the agent-inbox daemon. Unreadable: one line saying
+ *  so, with the cards the router knows. */
+let mailWaitingHook: (() => Promise<any>) | null = null
+export const __setMailWaiting = (f: (() => Promise<any>) | null): void => { mailWaitingHook = f }      // tests only
+const MAILBOX_READ_MS = (): number => num('LANES_MAILBOX_READ_MS', 4_000)
+async function mailboxContext(): Promise<string> {
+  const read: Promise<any> = (mailWaitingHook ? mailWaitingHook() : inboxPost('/lanes/mail-waiting', {})).catch(() => null)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const r = await Promise.race([read, new Promise(res => { timer = setTimeout(() => res('timeout'), MAILBOX_READ_MS()) })]).finally(() => clearTimeout(timer))
+  if (r && r !== 'timeout' && r.ok && Array.isArray(r.items)) {
+    const items = r.items as Array<{ id: number; title?: string; decide?: string; deadline?: string; overdue?: boolean }>
+    if (!items.length) return '〔信箱〕現在沒有等你決定的件。'
+    return [`〔信箱有 ${items.length} 件等你決定（從信箱讀的；等得起的不會單獨叫醒你，快到期才會；用 mailbox_decide 回，要看卡用 mailbox_open）〕`,
+      ...items.slice(0, 10).map(it => `• #${it.id}${it.title ? `「${clip(String(it.title), 60)}」` : ''}｜要你決定：${clip(String(it.decide ?? '（卡上沒寫）'), 160)}｜期限 ${it.deadline ? stamp(String(it.deadline)) : '—'}${it.overdue ? '（已過期）' : ''}`),
+      ...(items.length > 10 ? [`另有 ${items.length - 10} 件：用 mailbox_list 看`] : [])].join('\n')
+  }
+  const why = r === 'timeout' ? `${Math.round(MAILBOX_READ_MS() / 1000)} 秒內沒有回應` : r?.why ? String(r.why).slice(0, 120) : 'agent-inbox daemon 沒有回應'
+  const known = [...new Map((events?.rows(e => waitsOf(e).some(pendingWait)) ?? []).flatMap(e => waitsOf(e).filter(pendingWait)).map(w => [w.mail_id, w])).values()]
+  return `〔信箱〕等你決定的件現在讀不到（${why}）${known.length ? `；分流器記得 ${known.length} 件：${known.slice(0, 10).map(w => `#${w.mail_id}「${clip(w.title || w.decide, 40)}」`).join('、')}` : ''}；用 mailbox_list 看。`
+}
 /** lanes-golive (C3): the main's turn took these items in (M1 bound). For a scheduler run handed to the main that is its start receipt (開工回執): the
  *  fleet acks a run when the transcript shows the delivery consumed; with lanes on M1 is the one that knows (a lane's run is acked when the lane takes
  *  it, server.ts). Once per run. */
@@ -403,12 +441,13 @@ export function openHandoffsLines(): string[] {
   const out: string[] = []
   for (const e of events?.rows(r => r.state === 'open') ?? []) for (const o of (e.obligations ?? []) as Ob[]) {
     if (o.kind !== 'main' || o.state !== 'open') continue
+    if (o.card && deferDecisionsOn()) continue                                     // WO-128 (item 4): a decision card is listed in the mailbox, not here
     const what = String(o.what ?? e.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 160)
     const since = String(o.at ?? e.created ?? '')
     out.push(`- ${e.id}｜來自 ${String(e.from ?? '?')}｜${o.handoff ?? '交給主線'}｜${what || '-'}｜自 ${since ? stamp(since) : '—'}｜期限 ${o.due_at ? stamp(new Date(Number(o.due_at)).toISOString()) : '—'}`)
   }
   // WO-127: a card still waiting on the main's decision stays listed (after a /clear or a compaction too) until it is decided or checked off; same line format
-  if (decisionsOn()) for (const e of events?.rows(r => waitsOf(r).some(pendingWait)) ?? []) for (const w of waitsOf(e).filter(pendingWait)) {
+  if (decisionsOn() && !deferDecisionsOn()) for (const e of events?.rows(r => waitsOf(r).some(pendingWait)) ?? []) for (const w of waitsOf(e).filter(pendingWait)) {   // WO-128: not with it on
     out.push(`- ${e.id}｜來自 ${w.lane}｜信箱 #${w.mail_id} 等你決定（mailbox_decide）｜${(w.decide || w.title || '-').replace(/\s+/g, ' ').trim().slice(0, 160)}｜自 ${stamp(w.at)}｜期限 ${w.deadline ? stamp(w.deadline) : '—'}`)
   }
   return out
@@ -1167,7 +1206,9 @@ export function laneToolsFor(kind: LaneKind | undefined): any[] {
   // WO-125 (C): with LANES_RECEIPT_STEPS on, the receipt takes `steps` (receiptToolWithSteps); off, LANE_TOOLS as they were
   const base = receiptStepsOn() ? LANE_TOOLS.map(t => t.name === 'receipt' ? receiptToolWithSteps(t) : t) : LANE_TOOLS
   // WO-127 (LANES_DECISIONS): decide_later for every lane, mailbox_card for the mail lane; off, the lists as they were
-  const dec = decisionsOn() ? [DECIDE_LATER_LANE_TOOL, ...(kind === 'mail' ? [MAILBOX_CARD_LANE_TOOL] : [])] : []
+  // WO-128 (LANES_DEFER_DECISIONS): both take urgent_because; off, Epeius's definitions as 1.38 listed them
+  const urg = <T extends { inputSchema: { properties: Record<string, unknown> } }>(t: T): T => deferDecisionsOn() ? ({ ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, urgent_because: URGENT_BECAUSE_PROP } } }) : t
+  const dec = decisionsOn() ? [urg(DECIDE_LATER_LANE_TOOL), ...(kind === 'mail' ? [urg(MAILBOX_CARD_LANE_TOOL)] : [])] : []
   return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS, ...dec] : dec.length ? [...base, ...dec] : base
 }
 
@@ -1191,9 +1232,14 @@ type Wait = { mail_id: number; item: 'lane_item' | 'card'; title: string; decide
   cls: string; trigger: string; card: Record<string, unknown>; from?: string | null
   /** WO-131 (1.38.3): the carded mail was sent no_reply (the agent-inbox daemon's answer to mailbox_card; absent: not known) */
   no_reply?: boolean
-  decided?: { decision: string; at: string; event: string }; checked?: { by: string; at: string }; handed?: boolean }
+  decided?: { decision: string; at: string; event: string }; checked?: { by: string; at: string }; handed?: boolean
+  /** WO-128: can it wait (defer: the main is not woken for it; it rides the main's next digest and is woken alone when due) or not (urgent, with the lane's
+   *  reason); when the due wake reached the main for it */
+  urgency?: 'defer' | 'urgent'; urgent_because?: string; due_woke?: string }
 const waitsOf = (e: Row | undefined): Wait[] => (Array.isArray(e?.waits) ? e!.waits : []) as Wait[]
 const pendingWait = (w: Wait): boolean => !w.decided && !w.checked
+/** WO-128: a card's deadline in ms (BTCC's ISO); unreadable or past: an hour from now (the lane item's default) */
+const deadlineMs = (s: string | null | undefined): number => { const t = Date.parse(String(s ?? '')); return Number.isFinite(t) && t > Date.now() ? t : Date.now() + 3600_000 }
 const CARD_BOX_MAX = 600                                                // BTCC cuts each box at 600 characters; the record keeps what BTCC keeps
 const clipCard = (c: Record<string, unknown> | null | undefined): Record<string, unknown> =>
   Object.fromEntries(Object.entries(c ?? {}).filter(([, v]) => v != null && String(v).trim() !== '').map(([k, v]) => [k, String(v).slice(0, CARD_BOX_MAX)]))
@@ -1210,8 +1256,42 @@ function mailDue(ev: InEvent): Decision {
   const m = Number(ev.mail_id)
   recordInbound(ev, { owner: 'router', thread: ev.thread ?? null, fields: { mail_id: m, deadline: ev.deadline ?? null, overdue: ev.overdue === true } })
   ledger({ lane: 'router', thread: ev.thread ?? null, event: ev.id, kind: 'fyi', text: ev.text.slice(0, 300), refs: { mail_due: m, deadline: ev.deadline ?? null, lane: ev.lane ?? null } })
+  // WO-128 (item 1): a card that can wait and nobody woke the main for: this is its one wake (the 300 s push counts from it). The router's own wake on the
+  // asking event; this event stays information.
+  const woke = deferDecisionsOn() ? dueWake(m) : null
+  if (woke) return { rule: 'mail-due-wake', target: 'ledger', ...(ev.thread ? { thread: ev.thread } : {}),
+    note: `mail #${m} (deadline ${ev.deadline ?? '-'}) can wait and nobody woke the main for it: the main is woken now (${woke}); the 300 s push counts from this wake` }
   return { rule: 'mail-due', target: 'ledger', ...(ev.thread ? { thread: ev.thread } : {}),
     note: `mail #${m} (deadline ${ev.deadline ?? '-'}): information, it rides the main's next delivery; nobody is woken, nothing is owed` }
+}
+/** WO-128: the due wake of card #m: it can wait (urgency defer), still waits on the main, and no due wake reached the main for it yet. Its hand-over waits in
+ *  the mailbox: woken now (wakeDeferred); it was met by an earlier turn (the main saw it, did not decide): a new hand-over, woken now; the main has it already
+ *  (an open item): nothing more. Returns the hand-over the main is woken for, or null. */
+function dueWake(m: number): string | null {
+  const e = events.rows(r => waitsOf(r).some(w => w.mail_id === m && pendingWait(w))).pop()
+  const w = waitsOf(e).find(x => x.mail_id === m && pendingWait(x))
+  if (!e || !w || w.urgency !== 'defer' || w.due_woke) return null
+  events.note(e.id, { waits: waitsOf(e).map(x => x.mail_id === m && pendingWait(x) ? { ...x, due_woke: nowIso() } : x) })
+  const lane = S.lanes[w.lane]
+  const parked = deferredMain(e.id)
+  const has = ((e.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && o.state === 'open' && !parked)
+  if (has) { ledger({ lane: 'router', thread: w.thread, event: e.id, kind: 'fyi', text: `信箱 #${m} 快到期；這件事主線手上已經有了，不再叫醒。`, refs: { mail_due: m } }); return null }
+  const hid = parked ? String(parked.handoff ?? parked.id) : `ho-${shortId()}`
+  const carry = { content: `${dueWakeText(hid, w, joeyWords(e))}${e.blocked && blockFactsOn() ? `\n${String(e.blocked)}` : ''}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid, mail_id: String(m) } }
+  const what = `信箱 #${m}${w.title ? `「${w.title}」` : ''}快到期（期限 ${w.deadline ? stamp(w.deadline) : '—'}）：要你決定：${w.decide}`
+  return parked ? wakeDeferred(e.id, 'due', lane, what, carry) : handToMain(e.id, lane, what, hid, w.cls, 1000, true, carry, false, { card: true, woke: 'due' })
+}
+/** WO-128: the item of a due wake: the card, the deadline, and how to answer it */
+function dueWakeText(hid: string, w: Wait, said: string): string {
+  const lane = S.lanes[w.lane]
+  return [`〔要你決定｜快到期｜${hid}｜信箱 #${w.mail_id}〕${lane ? `${laneLabel(lane)}（${w.lane}）` : w.lane}${w.item === 'card' ? '附了決定卡的信' : '放進你信箱的事'}快到期了`
+      + `${w.deadline ? `（期限 ${whenOf(w.deadline)}）` : ''}：「${w.title || w.decide}」。它等得起，所以先前沒有單獨叫醒你；現在只為這一件叫你。`,
+    ...cardLines({ ...w.card, ...(w.deadline ? { deadline: w.deadline } : {}) }, whenOf),
+    decisionReporter() === 'lane'
+      ? `照卡就能決定的：用 mailbox_decide(id=${w.mail_id}, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，${w.lane} 會接著做完並向 Joey 回報，你不用再為這件事回報。`
+      : `照卡就能決定的：用 mailbox_decide(id=${w.mail_id}, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，${w.lane} 會接著做完；這件事由你向 Joey 回報一次，寫明你的決定。`,
+    `收不回的動作、要你這段對話才知道的事：你自己做，做完用 mailbox_check(${w.mail_id}) 勾掉，這一件就算結掉。`,
+    ...(said ? [said] : [])].join('\n')
 }
 /** mail_decision: the run of the lane that asked, on its thread */
 function mailDecision(ev: InEvent): Decision {
@@ -1310,6 +1390,7 @@ function decisionRunText(ev: InEvent, d: Decided, lane: Lane): string {
 /** item 1: what the main gets when a lane's decide_later hands the matter over: the card and how to answer it */
 function decisionHandoverText(hid: string, lane: Lane, w: Wait, said: string): string {
   return [`〔要你決定｜${hid}｜信箱 #${w.mail_id}〕${laneLabel(lane)}（${lane.id}）把一件要你決定的事放進你的信箱：「${w.title}」`,
+    ...(w.urgent_because ? [`等不起（${lane.id} 寫的）：${w.urgent_because}`] : []),            // WO-128 (item 1): why it wakes the main now
     ...cardLines({ ...w.card, ...(w.deadline ? { deadline: w.deadline } : {}) }, whenOf),
     decisionReporter() === 'lane'
       ? `照卡就能決定的：用 mailbox_decide(id=${w.mail_id}, decision=as_recommended｜changed（note 寫改成什麼）｜declined) 回，${lane.id} 會接著做完並向 Joey 回報，你不用再為這件事回報。`
@@ -1320,12 +1401,12 @@ function decisionHandoverText(hid: string, lane: Lane, w: Wait, said: string): s
 /** the cards this run put on mail that are not handed over yet and still wait on a decision (one the lane checked off itself waits on nothing) */
 function cardsWaiting(tok: RunTok): Wait[] {
   const waiting = new Set(waitsOf(events.get(tok.evId)).filter(pendingWait).map(w => w.mail_id))
-  return (tok.cards ?? []).filter(c => !c.handed && waiting.has(c.mail_id))
+  return (tok.cards ?? []).filter(c => !c.handed && waiting.has(c.mail_id) && c.urgency !== 'defer')   // WO-128: a card that can wait is not handed over
 }
 /** the mail lane's hand-over carries the cards it put on mail in this run (they are answered with mailbox_decide) */
 function cardsBlock(cards: Wait[]): string {
   return ['', `〔系統附上｜這一趟附了決定卡的信（${cards.length} 封）〕照卡就能決定的，用 mailbox_decide(id, decision) 回：讀信線會接著做完（回信、勾掉）並向 Joey 回報，你不用再為那幾封回報。`,
-    ...cards.flatMap(c => [`── 信 #${c.mail_id} 的決定卡 ──`, ...cardLines({ ...c.card, ...(c.deadline ? { deadline: c.deadline } : {}) }, whenOf)])].join('\n')
+    ...cards.flatMap(c => [`── 信 #${c.mail_id} 的決定卡 ──`, ...(c.urgent_because ? [`等不起：${c.urgent_because}`] : []), ...cardLines({ ...c.card, ...(c.deadline ? { deadline: c.deadline } : {}) }, whenOf)])].join('\n')
 }
 /** item 5: a decision's run hands the matter back: the card, and what this run did (its ledger rows, then the tools it used) */
 function handBackBlock(tok: RunTok, lane: Lane): string {
@@ -2250,6 +2331,10 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   /** WO-127: this run carries the main's decision (its event is a mail_decision the router gave this lane); the mails this run put in the main's mailbox
    *  (decide_later) and the cards it put on mail (mailbox_card, the mail lane); the lane stop asked once about cards not handed over */
   decision?: Decided; decideLater?: number[]; cards?: Wait[]; cardsHeld?: boolean
+  /** WO-128 (item 9): the urgency of each card this run opened (decide_later, mailbox_card), in order */
+  cardUrgency?: Array<'defer' | 'urgent'>
+  /** WO-128: a card of this run waits in the main's mailbox with the run's event (a mail lane's mailbox_card that can wait): its steps not done are the main's */
+  parked?: boolean
   /** WO-129: the steps of the receipt this run filed (the steps line of its notify_joey); a notify_joey of a scheduled run held until that receipt (or the
    *  run's end); the receipts refused in this run, by reason (the exit row's receipt_refused) */
   stepList?: Step[]; heldLine?: HeldLine; receiptRefused?: { missing_steps: number; not_done_success: number; cli_blocked: number }
@@ -3424,6 +3509,8 @@ function startRun(it: QItem): void {
         ...(cut && workDone && !tok.handedOver ? { decision_outcome_from: 'tools' } : {}) } : {}),
       ...(requeue ? { requeued: 'fresh mail lane' } : {}),
       ...(decisionsOn() && tok.decideLater?.length ? { decide_later_mail_id: tok.decideLater.length === 1 ? tok.decideLater[0] : tok.decideLater } : {}),
+      // WO-128 (item 9): a run that opened a card: can it wait (defer) or not (urgent); one value per card in order when it opened several
+      ...(deferDecisionsOn() && tok.cardUrgency?.length ? { card_urgency: tok.cardUrgency.length === 1 ? tok.cardUrgency[0] : tok.cardUrgency } : {}),
       // WO-132 (observation points): the alerts of the run's incident it handled (item 2), and what it sent that changes state on another machine (item 8; recorded only)
       ...(incidentMergeOn() ? { merged_events: mergedEvents(it) } : {}),
       ...(prodChangeOn() ? { prod_change: prodChanges } : {}) })
@@ -3695,27 +3782,60 @@ const proposalWords = (e: Row, p: Proposal, oneLine = false): string => joeyWord
  *  it. M1 offers it when the main is idle (the wake), or the main's hook pulls it at its next boundary. Done when that item's turn ends with Stop.
  *  An event already handed (an open main obligation) keeps that hand-over: no second item. */
 function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true, carry?: { content: string; meta: Record<string, string> },
-  request = false): string {
+  request = false, w: HandWake = {}): string {
   // 002t (station 4, I03 live): Joey ordered an irreversible step inside a worker's topic; the worker handed it to the main in its own words, and the
   // main rightly would not act on a lane's retelling (「我看不到你在話題的原話，帳本只有工作線的轉述」). A hand-over of Joey's own Telegram message
   // carries his words as the router received them, marked as such: the main reads Joey, not the lane.
   const said = joeyWords(events?.get(evId))
   const body = text.slice(0, max) + (said ? `\n${said}` : '')
-  const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cls ? { cls } : {}),
-    answer_due: Date.now() + PROMISE_MIN * 60_000,                               // 002w (B, gap 9): a peer's answer handed to the main is due like a promised one
-    ...(request ? { request: true } : {}) })                                     // 002y (X-3): handoff_main hands the peer's request itself (handOver)
+  // WO-128: a card that can wait (w.defer) is the main's with no item and no due time: it waits in the main's mailbox until a wake (wakeDeferred)
+  const ob = events.handOver(evId, { handoff: hid, by: lane?.id ?? 'router', what: body.slice(0, 600), ...(w.defer ? {} : { due_at: Date.now() + HANDOFF_DUE_MS() }), ...(cls ? { cls } : {}),
+    answer_due: w.answerDue ?? Date.now() + PROMISE_MIN * 60_000,               // 002w (B, gap 9): a peer's answer handed to the main is due like a promised one
+    ...(request ? { request: true } : {}),                                       // 002y (X-3): handoff_main hands the peer's request itself (handOver)
+    ...(w.defer ? { defer: true } : {}), ...(w.card ? { card: true } : {}) })
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
-  if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}) }, detail: lane?.transcript })
+  if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}), ...(w.defer ? { defer: true } : {}), ...(w.woke ? { woke: w.woke } : {}) }, detail: lane?.transcript })
+  if (w.defer) {
+    journal.write('wake', evId, 'no_wake', { reason: `owed to the main (${hid}), but it can wait: it waits in the main's mailbox, rides the main's next digest and wakes it alone when it is due` })
+    logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase(), defer: true })
+    return hid
+  }
+  const item = carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
+    : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: handoffContent(evId, hid, body),
+      meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
+  events.set(evId, o => o.id === hid, { item, ...(w.woke ? { woke: w.woke, woke_at: nowIso() } : {}) })
+  journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `owed to the main (${hid})${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase() })
+  return hid
+}
+/** WO-128: how a hand-over is made: it can wait (defer: no item, no due time), it is a decision card's (card: not in open-handoffs.md), what woke the main
+ *  for it (woke: the main_wake row's cause), the due time a peer's answer handed with it gets (answerDue) */
+type HandWake = { defer?: boolean; card?: boolean; woke?: 'urgent' | 'due'; answerDue?: number }
+/** the item a hand-over gives the main (not a card's carry) */
+function handoffContent(evId: string, hid: string, body: string): string {
   // 1.38.2 (Chiron mail #11023, item 1): a scheduler run's receipt handed over with the matter is the main's to file; the lane does not complete it
   const runs = ((events.get(evId)?.obligations ?? []) as Ob[]).filter(o => o.kind === 'receipt' && o.state === 'handed' && o.run_id).map(o => String(o.run_id))
   const owesRun = runs.length ? `\n（排程 run ${runs.join('、')} 的回執也交給你了：做完用 ~/.claude/tools/btcc-receipt complete ${runs.length === 1 ? runs[0] : '<run>'} 回執；車道不會替這一輪回執。）` : ''
+  return `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）${owesRun}`
+}
+/** WO-128: the event's hand-over that waits in the main's mailbox (can wait, not woken yet) */
+const deferredMain = (evId: string): Ob | undefined => ((events?.get(evId)?.obligations ?? []) as Ob[]).find(o => o.kind === 'main' && o.state === 'open' && o.defer && !o.woke)
+/** WO-128: a hand-over that waited in the main's mailbox wakes the main now: the lane says it cannot wait after all (handoff_main: `urgent`), or its card is
+ *  about to be due (mail_due: `due`). Its M1 item now, and its due time counts from now (item 3: 「等得起的，到期前叫醒主線之後才開始算」). */
+function wakeDeferred(evId: string, cause: 'urgent' | 'due', lane: Lane | undefined, text: string, carry?: { content: string; meta: Record<string, string> }): string | null {
+  const o = deferredMain(evId)
+  if (!o) return null
+  const hid = String(o.handoff ?? o.id)
+  const said = carry ? '' : joeyWords(events.get(evId))
+  const body = text.slice(0, HANDOVER_RECORD_MAX) + (said ? `\n${said}` : '')
+  ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, woke: cause }, detail: lane?.transcript })
   const item = carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
-    : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: `〔交給主線｜${hid}〕${body}\n（這件事交給你了：處理完由你回報 Joey 一次。）${owesRun}`,
+    : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: handoffContent(evId, hid, body),
       meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
-  events.set(evId, o => o.id === hid, { item })
-  journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `owed to the main (${hid})${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
-  logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase() })
+  events.set(evId, x => x.id === o.id, { item, woke: cause, woke_at: nowIso(), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cause === 'urgent' ? { what: body.slice(0, 600) } : {}) })
+  journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `${cause === 'due' ? 'due soon' : 'cannot wait after all'}: the main is woken for ${hid}${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase(), woke: cause })
   return hid
 }
 /** PL7 (M4): what the main is given with no inbound event of its own (a /main renew brief, the router's fallback) is an M3 record owed to the main
@@ -3871,7 +3991,7 @@ export function interimText(due: number): string {
   return `這件事要 ${D.agent} 的主線決定。我是 ${D.agent} 的車道，不能代為答應或拒絕。已經交給主線，主線會在 ${simTime(due)} 前直接回你。`
     + (card ? `主線目前的焦點卡：「${card.replace(/\s+/g, ' ').slice(0, 300)}」` : '')   // 002r (B09): what the main is busy with and until when, in the router's own line
 }
-async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to: string; text: string } | null> {
+async function interimToPeer(lane: Lane, tok: RunTok, hid: string, dueAt?: number): Promise<{ to: string; text: string } | null> {
   const ev = queue.get(tok.evId)?.ev
   const answer = (events.get(tok.evId)?.obligations ?? []).find((o: Ob) => o.kind === 'peer' && o.level === 'answer' && o.state === 'handed' && (o.owner ?? 'lane') === 'lane') as Ob | undefined
   if (!ev || !answer) return null                                       // only an event that owes a peer an answer
@@ -3879,7 +3999,7 @@ async function interimToPeer(lane: Lane, tok: RunTok, hid: string): Promise<{ to
   const th = S.threads[lane.thread]
   const hop = (th?.hops ?? 0) + 1
   if (!outboundGate(th, hop, false, ev, lane.id).ok) return null           // 002w (C): past the limit the conversation is stopped (stopThread), not skipped silently
-  const due = Date.now() + PROMISE_MIN * 60_000
+  const due = dueAt ?? Date.now() + PROMISE_MIN * 60_000                  // WO-128: a card that can wait: the main answers by the card's deadline
   const text = interimText(due)
   if (th) { th.hops = hop; th.last = nowIso(); if (!th.peer) th.peer = from }
   const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, thread: lane.thread, hop, lane: lane.id, owner: '主線' })
@@ -3983,7 +4103,16 @@ export function dueTick(now = Date.now()): void {
       continue
     }
     events.set(e.id, o.id, { told: true }, { tool: 'router' })
-    const text = o.kind === 'main'
+    // WO-128 (item 8): a card that can wait gets at most one push: once its due wake was told, a peer's answer due on the same matter is a ledger line
+    if (o.kind === 'peer' && ((e.obligations ?? []) as Ob[]).some(x => x.kind === 'main' && x.defer && x.told)) {
+      ledger({ lane: 'router', thread: e.thread ?? null, event: e.id, kind: 'notify', text: `[ledger] ${o.to} 在等主線回覆：「${String(o.what ?? '').slice(0, 200)}」；這件事快到期時已經告訴過 Joey 一次，不再推。`,
+        refs: { tier: 'ledger', tier_rule: 'answer-due+card-told', escalated: false, obligation: o.id } })
+      continue
+    }
+    const pend = o.kind === 'main' && o.woke === 'due' ? waitsOf(e).filter(pendingWait) : []
+    const text = o.kind === 'main' && o.woke === 'due'                   // WO-128 (item 3): a card that could wait, pushed 300 s after its due wake
+      ? `這件事放在主線的信箱等決定（${o.handoff ?? o.id}${pend.length ? `；信箱 ${pend.map(w => `#${w.mail_id}${w.deadline ? `，期限 ${stamp(w.deadline)}` : ''}`).join('；')}` : ''}），快到期叫醒主線 ${Math.max(1, Math.round((now - (o.due_at! - HANDOFF_DUE_MS())) / 60_000))} 分鐘了還沒處理${main.mainPhase() === 'walled' ? '（主線現在不能用模型）' : main.mainPhase() === 'gone' ? '（主線現在不在線）' : ''}，先直接讓你知道：\n${String(o.what ?? e.text ?? '').slice(0, 600)}`
+      : o.kind === 'main'
       ? `這件事原本交給主線處理（${o.handoff ?? o.id}），${Math.max(1, Math.round((now - (o.due_at! - HANDOFF_DUE_MS())) / 60_000))} 分鐘了主線還沒處理完${main.mainPhase() === 'walled' ? '（主線現在不能用模型）' : main.mainPhase() === 'gone' ? '（主線現在不在線）' : ''}，先直接讓你知道：\n${String(o.what ?? e.text ?? '').slice(0, 600)}`
       : o.level === 'commitment' ? `主線答應的事過了時限，還沒有標完成：答應 ${o.to}：${o.what}（時限 ${simTime(o.due_at!)}；${e.id}）。做完了主線會用 commitment_done 標掉。`
       : o.sent ? `${o.to} 在等主線回覆：「${o.what ?? ''}」。車道把這件事交給主線時，系統告訴過 ${o.to} 主線會在 ${simTime(o.due_at!)} 前回。時間到了，主線還沒有回 ${o.to}。`
@@ -4384,6 +4513,10 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (name === 'mailbox_card' && lane.kind !== 'mail') return 'refused: mailbox_card puts a decision card on a colleague\'s mail; it is the mail lane\'s. A matter of your own the main must decide goes in its mailbox with decide_later.'
       // the hand-over is checked before anything is put in the mailbox: a matter already handed to the main (or put to Joey) is not handed twice
       if (name === 'decide_later') { const v = events.request(tok.evId, 'decide_later', { kind: 'main', level: 'handed' }); if (!v.ok) return v.why! }
+      // WO-128 (item 1): can it wait? urgent_because (what breaks, who is waiting) wakes the main now; none, or blank, = it can wait. Kept on the router's
+      // record and the ledger, not sent to BTCC (the card's five boxes are Epeius's). LANES_DEFER_DECISIONS=0: not read, every card wakes the main (1.38).
+      const because = deferDecisionsOn() ? String(a.urgent_because ?? '').replace(/\s+/g, ' ').trim().slice(0, 300) : ''
+      const urgency: 'defer' | 'urgent' | undefined = deferDecisionsOn() ? (because ? 'urgent' : 'defer') : undefined
       const card = a.card && typeof a.card === 'object' ? a.card as Record<string, unknown> : null
       const args = name === 'decide_later'
         ? { title: a.title, card: a.card, ...(a.deadline != null && a.deadline !== '' ? { deadline: a.deadline } : {}), thread: lane.thread, ref: tok.evId }
@@ -4395,13 +4528,28 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const w: Wait = { mail_id: m, item: name === 'decide_later' ? 'lane_item' : 'card', title: name === 'decide_later' ? String(a.title ?? '').trim().slice(0, 120) : '',
         decide: String(card?.decide ?? '').trim().slice(0, CARD_BOX_MAX), deadline: r.deadline ? String(r.deadline) : typeof card?.deadline === 'string' ? card.deadline : null,
         at: nowIso(), lane: lane.id, thread: lane.thread, cls: tok.cls, trigger: tok.trigger, card: clipCard(card),
-        ...(name === 'mailbox_card' && typeof r.no_reply === 'boolean' ? { no_reply: r.no_reply } : {}) }
+        ...(name === 'mailbox_card' && typeof r.no_reply === 'boolean' ? { no_reply: r.no_reply } : {}),
+        ...(urgency ? { urgency, ...(because ? { urgent_because: because } : {}) } : {}) }
       events.note(tok.evId, { waits: [...waitsOf(events.get(tok.evId)), w] })
+      if (urgency) (tok.cardUrgency ??= []).push(urgency)
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action',
-        text: `${name === 'decide_later' ? '放進主線信箱等決定' : '附決定卡在信上'} #${m}${w.title ? `「${w.title}」` : ''}：要主線決定：${w.decide}；建議：${String(card?.recommend ?? '').slice(0, 200)}`,
-        refs: { [name]: m, deadline: w.deadline } })
+        text: `${name === 'decide_later' ? '放進主線信箱等決定' : '附決定卡在信上'} #${m}${w.title ? `「${w.title}」` : ''}：要主線決定：${w.decide}；建議：${String(card?.recommend ?? '').slice(0, 200)}`
+          + (urgency === 'urgent' ? `；等不起：${because}` : urgency === 'defer' ? '；等得起：不叫醒主線' : ''),
+        refs: { [name]: m, deadline: w.deadline, ...(urgency ? { urgency } : {}) } })
       if (name === 'mailbox_card') {
         (tok.cards ??= []).push(w)
+        if (urgency === 'defer') {
+          if (blockFactsOn() && blockedFacts(tok.blocked)) noteBlocked(tok)    // WO-132 (item 4): its due wake carries what the guard refused
+          // WO-128: the card waits in the main's mailbox; the run's event waits on the decision with it (handed to the main, not woken: its line to Joey is the
+          // decision run's). A later handoff_main of this run wakes the main (wakeDeferred).
+          if (!((events.get(tok.evId)?.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested')))
+            handToMain(tok.evId, lane, `${laneLabel(lane)} 在信 #${m} 附了決定卡（等得起）：要你決定：${w.decide}`, `ho-${shortId()}`, tok.cls, 1000, true, undefined, false,
+              { defer: true, card: true, answerDue: deadlineMs(w.deadline) })
+          tok.parked = true
+          return `${String(r.text ?? '')} It can wait: the main is not woken for it. It sees the card the next time it is woken (its digest lists what waits on its decision) and is woken `
+            + 'alone shortly before the deadline; the decision comes back to the mail lane as a run that finishes it (reply, check off, one line to Joey). Do not hand this card over with '
+            + 'handoff_main and do not tell Joey about it now. If it cannot wait after all, call handoff_main and say what breaks or who is waiting: that wakes the main now.'
+        }
         return `${String(r.text ?? '')} Hand it to the main with handoff_main, as for any mail the main must decide (the cards of this run go with your text by themselves): `
           + 'the main answers each card with mailbox_decide, and the decision comes back to the mail lane as a run that finishes it (reply, check off, one line to Joey).'
       }
@@ -4410,9 +4558,23 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       ;(tok.decideLater ??= []).push(m)
       const hid0 = `ho-${shortId()}`
       const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null                // WO-132 (item 4): what the guard refused rides the item that wakes the main
-      if (bl) noteBlocked(tok)
+      if (bl) noteBlocked(tok)                                                     // (and the event's record: a card that can wait carries it at its due wake)
+      if (urgency === 'defer') {
+        // WO-128 (item 1): it can wait: handed to the main (its Joey line, a peer's answer, a receipt are the main's until the decision comes back), not woken
+        const dueMs = deadlineMs(w.deadline)
+        const hid = handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」（等得起）：要你決定：${w.decide}`, hid0, tok.cls, 1000, true, undefined, true,
+          { defer: true, card: true, answerDue: dueMs })
+        tok.handedOver = true
+        logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, mail_id: m, main_phase: main?.mainPhase() ?? null, defer: true })
+        let told = ''
+        try { const t = await interimToPeer(lane, tok, hid, dueMs); if (t) told = ` The router told ${t.to}: "${t.text}"` } catch (e) { D.log('warn', `lanes: interim reply failed: ${e}`) }
+        return `${String(r.text ?? '')} It can wait: the main is not woken for it (hand-over ${hid} waits in its mailbox). The main sees it the next time it is woken (its digest lists `
+          + 'what waits on its decision) and is woken alone shortly before the deadline; the decision comes back to this thread as a new run, which finishes the matter and tells Joey. '
+          + `Do not tell Joey about it now; close this run with receipt.${told}`
+      }
       const hid = handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」：要你決定：${w.decide}`, hid0, tok.cls, 1000, true,
-        { content: `${decisionHandoverText(hid0, lane, w, joeyWords(events.get(tok.evId)))}${bl ? `\n${blockedLine(bl)}` : ''}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid0, mail_id: String(m) } }, true)
+        { content: `${decisionHandoverText(hid0, lane, w, joeyWords(events.get(tok.evId)))}${bl ? `\n${blockedLine(bl)}` : ''}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid0, mail_id: String(m) } }, true,
+        urgency ? { card: true, woke: 'urgent' } : {})
       tok.handedOver = true
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, mail_id: m, main_phase: main?.mainPhase() ?? null })
       let told = ''
@@ -4495,6 +4657,19 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
           + 'one line in the receipt. If a mail cannot be opened (the mailbox tool failed), call handoff_main again and say so.'
       }
       if (lane.kind === 'fork' && !tok.decision) return 'refused: a fork does not hand its work back to the main (it does not merge back). Tell Joey the result yourself with notify_joey (ask_joey if he must decide); the main reads it in its digest. Nothing was handed over.'
+      // WO-128: the matter waits in the main's mailbox (a card that can wait): handoff_main says it cannot wait after all: the main is woken now with this text
+      if (deferDecisionsOn() && deferredMain(tok.evId)) {
+        const cards = tok.cards?.length ? cardsWaiting(tok) : []
+        const full0 = cards.length ? `${text.slice(0, 1000)}\n${cardsBlock(cards)}` : text
+        for (const c of cards) c.handed = true
+        const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null            // WO-132 (item 4): what the guard refused rides the item that wakes the main
+        if (bl) noteBlocked(tok)
+        const full = bl ? `${full0.slice(0, HANDOVER_RECORD_MAX - blockedLine(bl).length - 1)}\n${blockedLine(bl)}` : full0   // wakeDeferred keeps HANDOVER_RECORD_MAX
+        const hid = wakeDeferred(tok.evId, 'urgent', lane, full)
+        tok.handedOver = true
+        logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null, woke: 'urgent' })
+        return 'handed to the main: it is woken now with your text (this matter was waiting in its mailbox). It takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.'
+      }
       const v = events.request(tok.evId, 'handoff_main', { kind: 'main', level: 'handed' })        // accepted or refused (journaled); the hand-over is ONE transition
       if (!v.ok) return v.why!
       // WO-127: a decision's run hands the whole matter back with the card and what it did (item 5); the mail lane's cards of this run ride its text (item 1)
@@ -4528,7 +4703,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const steps = parsed && tok.notifyDeduped ? dedupedSteps(parsed).steps : parsed
       // WO-129 (item 1): the run a schedule gave this lane files its receipt with its steps; other runs (mail, a peer's call, an alert): optional
       if (receiptStepsOn() && steps === null && schedRun(tok)) { receiptRefusedCount(tok, 'missing_steps'); return missingStepsRefusal(runIdArg || runIdOf(tok)) }
-      if (steps && isSuccess(outcome) && steps.some(x => !x.done) && !tok.handedOver) { receiptRefusedCount(tok, 'not_done_success'); return stepsRefusal(outcome, steps) }
+      if (steps && isSuccess(outcome) && steps.some(x => !x.done) && !tok.handedOver && !tok.parked) { receiptRefusedCount(tok, 'not_done_success'); return stepsRefusal(outcome, steps) }
       const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
       const left = !!runIdArg && receiptLeftForMain(runIdArg)            // 1.38.2: the run is the main's to complete: this receipt records the lane's part only
       if (bl && runIdArg && isSuccess(outcome) && !receiptFiled(runIdArg) && !left) return blockedReceiptRefusal(runIdArg, outcome, bl)
@@ -5833,15 +6008,29 @@ function digestInfo(): { text: string; fields: Record<string, unknown> } | null 
     for (const [id, v] of Object.entries((r.events ?? {}) as Record<string, number>)) shown[id] = Math.max(Number(shown[id]) || 0, Number(v) || 0)
   const changed = events.rows(e => inViews(e) && e.version > Math.max(Number(shown[e.id]) || 0, Number(e.main_seen) || 0))   // main_seen: what the main changed itself
   const standing = standingLines()
-  if (!changed.length && !standing.proposals.length) return null                  // a hold alone is not news: it rides with something that is
+  const box = mailboxLines()                                                      // WO-128 (item 1): what waits on the main's decision rides every delivery
+  if (!changed.length && !standing.proposals.length && !box.length) return null    // a hold alone is not news: it rides with something that is
   const long = boundaryLong()                                                     // WO-125 (A.4): rides like a hold, never news alone
-  const d = renderEvents(changed.map(e => digestLine(e)), [...standing.proposals, ...standing.holds, ...(long ? [boundaryReminder(long.lines)] : [])], 'digest')
+  const d = renderEvents(changed.map(e => digestLine(e)), [...standing.proposals, ...standing.holds, ...box, ...(long ? [boundaryReminder(long.lines)] : [])], 'digest')
   if (!d) return null
   routeRow({ event: `digest-${Date.now()}`, source: 'ledger', rule: 'digest', target: 'main', note: `${changed.length} event(s)` })
   logos('lane.digest', { items: d.items, events: changed.length, text: d.text })
   return { text: d.text, fields: { events: Object.fromEntries(changed.map(e => [e.id, e.version])), items: d.items,
     proposals: proposalsOf(p => p.joey && !p.decision).map(({ p }) => p.id),   // 002v: the standing Joey proposals it carried (the memory gate's `shown`)
     ...(long ? { boundary_card: long.hash } : {}) } }                           // WO-125 (A.4): this boundary.md's reminder (told once a digest carrying it reached the main)
+}
+/** WO-128 (item 1): 「信箱有 N 件等你決定」 and one line per card (#id, what to decide, deadline), soonest first: every card the router knows still waits on the main's
+ *  decision (can wait or not). It makes the digest of the main's next delivery (whatever wakes it), never a wake of its own. Off (LANES_DEFER_DECISIONS=0): none. */
+const MAILBOX_LINES_MAX = 8
+function mailboxLines(): string[] {
+  if (!deferDecisionsOn() || !events) return []
+  const by = new Map<number, Wait>()
+  for (const e of events.rows(r => waitsOf(r).some(pendingWait))) for (const w of waitsOf(e).filter(pendingWait)) by.set(w.mail_id, w)
+  const ws = [...by.values()].sort((a, b) => (Date.parse(a.deadline ?? '') || Infinity) - (Date.parse(b.deadline ?? '') || Infinity) || a.mail_id - b.mail_id)
+  if (!ws.length) return []
+  return [`〔信箱有 ${ws.length} 件等你決定（等得起的不會單獨叫醒你，快到期才會；用 mailbox_decide 回，要看卡用 mailbox_open）〕`,
+    ...ws.slice(0, MAILBOX_LINES_MAX).map(w => `• #${w.mail_id}${w.title ? `「${clip(w.title, 60)}」` : ''}｜要你決定：${clip(w.decide || '（卡上沒寫）', 160)}｜期限 ${w.deadline ? stamp(w.deadline) : '—'}`),
+    ...(ws.length > MAILBOX_LINES_MAX ? [`另有 ${ws.length - MAILBOX_LINES_MAX} 件：用 mailbox_list 看`] : [])]
 }
 /** WO-125 (A.4): the boundary card the last run got is longer than BOUNDARY_WARN_LINES and the main has not been told about this boundary.md yet (a digest
  *  that carried the line reached it: offered, bound or done; one that went back to the queue carries it again). At most once per content of the file. */
@@ -5894,7 +6083,8 @@ function digestLine(e: Row, whole = false): DigestLine {
     : o.state === 'requested' ? `正在送給 ${o.to}` : `還沒回 ${o.to}${failed(o)}`))
   for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線` : `run ${o.run_id} 還沒回執${failed(o)}`))
   if (e.blocked && blockFactsOn()) st.push(String(e.blocked))                    // WO-125 (B): what the guard refused in the run, as the system counted it
-  if (handed) st.push(`需主線：〔${handed.handoff ?? handed.id}〕${fit(String(handed.what ?? ''), 200)}`)
+  if (handed) st.push(handed.defer && !handed.woke ? `在你的信箱等決定（〔${handed.handoff ?? handed.id}〕等得起，不會單獨叫醒你）：${fit(String(handed.what ?? ''), 200)}`   // WO-128
+    : `需主線：〔${handed.handoff ?? handed.id}〕${fit(String(handed.what ?? ''), 200)}`)
   // PL1: what the main must know about the event is on its record
   if (e.answers) st.push(`回覆 ${e.answers === 'main' ? '你' : laneLabelOf(String(e.answers))} 的提問（對方標了不用回）`)
   if (e.stop) st.push(e.stop.why === 'already-stopped' ? `對話線 ${e.stop.thread ?? '-'} 已關閉，沒有投遞` : `對話線 ${e.stop.thread ?? '-'} 停止（${e.stop.why === 'hop' ? '轉手次數到上限' : 'token 預算用完'}：${e.stop.note}）`)
@@ -6158,6 +6348,11 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
         line ? { line, ...Object.fromEntries(['title', 'ask', 'because', 'deadline', 'ref'].filter(k => typeof b[k] === 'string' && b[k]).map(k => [k, String(b[k])])),
           ...(Array.isArray(b.touches) ? { touches: b.touches.map(String).slice(0, 5) } : {}) } : undefined)
       sendJson(res, 200, r); return true
+    }
+    if (p === '/lanes/mail-waiting' && req.method === 'POST') {          // WO-128 (item 4): what waits on the main's decision, for the main's context
+      await readBody(req)
+      if (!D.mailWaiting) { sendJson(res, 200, { ok: false, why: 'this agent-inbox daemon does not read the mailbox for the router' }); return true }
+      sendJson(res, 200, await D.mailWaiting().catch(e => ({ ok: false, why: String(e).slice(0, 120) }))); return true
     }
     if (p === '/lanes/mail-tool' && req.method === 'POST') {             // lanes-golive (C2): the mail lane's mailbox tools, with this agent's own credential
       const b = await readBody(req)

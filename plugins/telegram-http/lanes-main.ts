@@ -17,7 +17,7 @@
  * One writer: the tg daemon. Information (the digest) is never offered alone: it rides the next offer or pull.
  */
 import type { Journal, Row } from './lanes-state.ts'
-import { BOUNDARY_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn } from './lanes-boundary.ts'
+import { BOUNDARY_MAIN_RULE, DEFER_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, deferDecisionsOn } from './lanes-boundary.ts'
 
 export type Notif = { method: string; params: unknown }
 export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry'
@@ -81,6 +81,11 @@ export type MainEnv = {
   /** lanes-golive (C3): items the main's turn took in (bound: offered and opened a turn, or pulled at a boundary): with lanes on this is the one evidence
    *  that the main has a delivery (the fleet's transcript receipt is not read for it), e.g. a scheduler run's start receipt */
   bound?: (items: Row[]) => void
+  /** WO-128 (item 9): M1 offered an idle (or walled, its probe) main an item: one wake of the main */
+  woke?: (item: Row, o: { gen: string; probe: boolean }) => void
+  /** WO-128 (item 4): what waits on the main's decision in its mailbox, as lines for the context the main gets back (registration, a resumed main's first
+   *  prompt, after a compaction); '' = nothing to add */
+  mailbox?: () => Promise<string>
 }
 
 export type MainEvent = {
@@ -271,6 +276,7 @@ export function createMain(E: MainEnv) {
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
       for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
+      try { E.woke?.(J().get('msg', it.id)!, { gen: g.id, probe }) } catch (e) { E.log('warn', `lanes: woke hook: ${e}`) }
       delivered()
       return
     }
@@ -373,7 +379,7 @@ export function createMain(E: MainEnv) {
   async function mainEvent(b: MainEvent): Promise<MainReply> {
     const pid = Number(b.pid) || 0
     const ev = String(b.event ?? '')
-    if (ev === 'SessionStart') return sessionStart(b, pid)
+    if (ev === 'SessionStart') return withMailbox(sessionStart(b, pid))
     const g = currentGen()
     if (!g || !pid || Number(g.pid) !== pid) return {}                       // not the main: nothing of it is tracked
     // 002r (H05): a subagent's tool call. It starts, continues and ends no turn of the main, opens no tool of the main and is no boundary to pull at
@@ -393,7 +399,7 @@ export function createMain(E: MainEnv) {
         const row = J().get('main', g.id)!
         if (row.rules_shown === row.session_id) return {}
         setMain(row, row.state as MainPhase, { rules_shown: row.session_id })
-        return { additionalContext: E.context(E.agent, String(row.session_id)) }
+        return withMailbox({ additionalContext: E.context(E.agent, String(row.session_id)) })
       }
       case 'PreCompact': {
         const row = J().get('main', g.id)!
@@ -495,6 +501,13 @@ export function createMain(E: MainEnv) {
       }
     }
     return {}
+  }
+  /** WO-128 (item 4): the context the main gets back (its rules: registration, a resumed main's first prompt, after a compaction) carries what waits on its
+   *  decision in the mailbox. Not added to a refusal. */
+  async function withMailbox(r: MainReply): Promise<MainReply> {
+    if (!E.mailbox || r.accepted === false || !r.additionalContext) return r
+    const m = await E.mailbox().catch(() => '')
+    return m ? { ...r, additionalContext: `${r.additionalContext}\n${m}` } : r
   }
   function sessionStart(b: MainEvent, pid: number): MainReply {
     const sid = String(b.session_id ?? '')
@@ -623,6 +636,8 @@ export function mainContext(agent: string, sid: string): string {
     ...(boundaryCardOn() ? [BOUNDARY_MAIN_RULE] : []),
     // WO-127 (item 8): the decision card's rule, the ticket's words, right after the boundary card's (LANES_DECISIONS=0: not there)
     ...(decisionsOn() ? [decisionMainRule()] : []),
+    // WO-128 (item 5): what can wait does not wake the main, right after the decision card's (LANES_DEFER_DECISIONS=0: not there)
+    ...(deferDecisionsOn() ? [DEFER_MAIN_RULE] : []),
     // WO-123: the files a lane may append to are the main's to declare; the last sentence (what NOT to declare) is Chiron's (#10869)
     '- 車道預設不能寫你的檔。要讓車道自己把紀錄補進某個檔（日誌、流水帳、狀態紀錄），在 .lanes/appendable.txt 宣告它：一行一個相對路徑（只收 .md .txt .log .csv .tsv .jsonl；記憶、.lanes/、CLAUDE.md、REANCHOR 與它列的定錨檔、設定檔一律不收）。'
       + '車道用 append_file 把內容加在檔案最後，既有內容它動不了。你自己往這些檔加內容也用 append_file 或 shell 的 >>，不要整檔重寫，車道同時加的那一行才不會掉。'

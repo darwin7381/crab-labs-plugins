@@ -286,11 +286,16 @@ test('WO-131 A, a decision\'s run cut by the budget before it finished: the deci
 test('WO-131 A, cards and open-handoffs survive the renewal; a decision that waits behind the old lane\'s running run is moved to the fresh lane when it starts (the existing rule for a mail_decision whose lane is gone)', async () => {
   wearOut()
   const w = await carded(8911)
-  expect(handoffs()).toContain('信箱 #8911 等你決定')
+  // 1.40.0 (WO-128): open-handoffs.md lists no cards (the mailbox's count and titles reach the main instead); the card waits on the asking event either way
+  const listed = !B.deferDecisionsOn()
+  const waiting = () => (E().get(w.id)!.waits as any[]).filter(x => x.mail_id === 8911 && !x.decided && !x.checked).length
+  expect(waiting()).toBe(1)
+  if (listed) expect(handoffs()).toContain('信箱 #8911 等你決定')
   thread(w.lane).fresh = 700_000
   const g = await start(reminder())                                                               // renewed: a fresh lane
   expect(g.lane).not.toBe(w.lane)
-  expect(handoffs()).toContain('信箱 #8911 等你決定')                                                // the card still waits on the asking event
+  expect(waiting()).toBe(1)                                                                         // the card still waits on the asking event
+  if (listed) expect(handoffs()).toContain('信箱 #8911 等你決定')
   thread(g.lane).fresh = 700_000                                                                   // and this one is due too, but it is running
   const d = await L.routeEvent(decided(8911, 'as_recommended'))
   expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: g.lane, note: expect.stringContaining('queued behind the running run') })
@@ -306,6 +311,7 @@ test('WO-131 A, cards and open-handoffs survive the renewal; a decision that wai
   await call(h, 'notify_joey', { outcome: 'changed', text: '已回 Eve：答應' })
   await end(h)
   expect(handoffs()).not.toContain('#8911')
+  expect(waiting()).toBe(0)
   expect(mainItems('mail-decision-8911')).toEqual([])
 }, 40000)
 
