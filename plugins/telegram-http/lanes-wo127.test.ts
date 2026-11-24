@@ -509,13 +509,15 @@ test('WO-127: the lane tools are Epeius\'s definitions minus what the daemon fil
   expect(L.laneToolsFor('mail').find((t: any) => t.name === 'mailbox_card').description).toBe(MAILBOX_CARD_TOOL.description)
   const h = Object.fromEntries((['reflex', 'mail', 'worker'] as const).map(k => [k, L.cardHash(k)]))
   process.env.LANES_DECISIONS = '0'
-  try { for (const k of ['reflex', 'mail', 'worker'] as const) expect(L.cardHash(k)).toBe(h[k]) } finally { delete process.env.LANES_DECISIONS }
+  // 1.38.3 (WO-131 B): the mail lane's card names mailbox_card only while the tool exists, so its hash differs with the switch off; the others do not
+  try { for (const k of ['reflex', 'worker'] as const) expect(L.cardHash(k)).toBe(h[k]); expect(L.cardHash('mail')).not.toBe(h.mail) } finally { delete process.env.LANES_DECISIONS }
 })
 
 test('WO-127 item 8: the words, verbatim: the boundary card\'s sentence right after 「…你說好之後還剩哪幾步。」 (same line: the card still has 10 lines); the main\'s rule right after the boundary card\'s', () => {
   const card = B.boundaryDefault('adam')
   expect(card.length).toBe(10)
-  expect(card.find(l => l.includes('你說好之後還剩哪幾步。'))!.endsWith('你說好之後還剩哪幾步。主線回了決定：照決定把剩下的做完，向 Joey 回報一次，寫明是照主線的決定。做不下去就整件交給主線，不再問第二次。')).toBe(true)
+  // 1.38.3 (WO-131, Chiron mail #11046): the step's words before it changed (「…你說好之後我會做什麼。整件只能主線自己做的才用 handoff_main。」); the sentence is unchanged
+  expect(card.find(l => l.includes('你說好之後我會做什麼。'))!.endsWith('整件只能主線自己做的才用 handoff_main。主線回了決定：照決定把剩下的做完，向 Joey 回報一次，寫明是照主線的決定。做不下去就整件交給主線，不再問第二次。')).toBe(true)
   const ctx = mainContext('adam', 'sid').split('\n')
   const i = ctx.indexOf(B.BOUNDARY_MAIN_RULE)
   expect(ctx[i + 1]).toBe('- 分身交來要你決定的事附著決定卡。照卡就能決定的：用 mailbox_decide 回（照建議／改成…／不做），原本那條分身會接著做完並向 Joey 回報，你不用再為這件事回報。收不回的動作、要你這段對話才知道的事：你自己做，做完那一件就算結掉。收不回的事和真金，先看原文再決定。')
@@ -553,7 +555,7 @@ test('WO-127 #12: LANES_DECISIONS=0: as 1.37.2: no tool, no rule (the mailbox\'s
   const onCtx = L.laneContext(lane, it), onMain = mainContext('adam', 'sid'), onTools = Object.fromEntries((['reflex', 'mail'] as const).map(k => [k, L.laneToolsFor(k).map((t: any) => t.name)]))
   process.env.LANES_DECISIONS = '0'
   try {
-    expect(L.laneContext(lane, it)).toBe(onCtx.replace(B.BOUNDARY_DECISION_SENTENCE, ''))
+    expect(L.laneContext(lane, it)).toBe(onCtx.replace(B.BOUNDARY_CARD_STEP + B.BOUNDARY_DECISION_SENTENCE, B.BOUNDARY_HANDOFF_STEP))   // 1.38.3: the 1.37 step words with it off
     expect(mainContext('adam', 'sid')).toBe(onMain.replace(`\n${B.DECISION_MAIN_RULE}`, ''))
     expect(B.boundaryDefault('adam').join('\n')).not.toContain('主線回了決定')
     expect(L.laneToolsFor('reflex').map((t: any) => t.name)).toEqual(onTools.reflex.filter((x: string) => x !== 'decide_later'))

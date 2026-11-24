@@ -92,7 +92,49 @@ export function followupEventText(f: Followup, nowMs: number): string {
 export type Commitment = { who: string; what: string; by: string }
 
 const DAYWORD = '(?:今天|明天|明早|今晚|後天|週[一二三四五六日]|星期[一二三四五六日])'
-const BY_RE = new RegExp(`(?:${DAYWORD}\\s*)?\\d{1,2}\\s*(?::\\d{2}|點|時)\\s*前?|\\d+\\s*(?:分鐘|小時)\\s*(?:內|後|以內)?|${DAYWORD}(?:前|內)?`)
+// 1.38.3: 「第 1 點」 is an item number, not one o'clock (sonn's commitment of TG 7899 got 「時限：1 點」 from 「第 1 點的『自動帶回覆』」)
+const BY_RE = new RegExp(`(?:${DAYWORD}\\s*)?(?<!第\\s*)\\d{1,2}\\s*(?::\\d{2}|點|時)\\s*前?|\\d+\\s*(?:分鐘|小時)\\s*(?:內|後|以內)?|${DAYWORD}(?:前|內)?`)
+
+// ------------------------------------------------------------------ 1.38.3 (WO-131 D): what counts as a promise for later
+// Every reply the main sent Joey (and some of its mails) was recorded as a commitment with the whole message: sonn 11-23 13:37Z → 11-24 01:25Z, 20 rows,
+// p 0.72-0.99 (TG 7901 「進度：…正在縮。接下來：全套測試 → 推 1.35.0 → 回你兩題的完整答案」 0.99; TG 7905 「✅ 1.35.0 全艦隊上線…」 0.97). The question Jev is asked
+// (promiseAsk: 「Does `message` say that its sender will do or deliver something later?」) is answered right: a status report names the sender's next steps.
+// The record wants less: a promise owed to someone. A text is asked only when one of its sentences has an explicit form of one, and the commitment is
+// those sentences, not the message:
+//   - the sender's own future: 我會…, 我們會…, 我將…, I will / I'll / we'll;
+//   - something owed by a time: <day or time>前／之前／以前／內 … 給／回你／交／完成… (「明天 10:00 前給你」, 「週五前會做好」, 「30 分鐘內回你」);
+//   - a day or a later time with an action owed: 明天／明早／稍後／晚點／N 分鐘後… 給／回你／告訴／查／確認… (「我明天回你」, 「10 分鐘後再查一次並回報」); 今晚 is no later
+//     time by itself (「今晚上線的三樣」 is a report), only with 前／之前 (「今晚前給你」);
+//   - after something, owed to the recipient: …後／之後／到時 … 回你／給你／告訴你 (「上線後在這個 thread 回你一句」, Sonn to Chiron, #10900).
+// A question (？／嗎) and a negated one (不用／不必／不會…) are not. A report of what was done, or of the work in progress and its next steps without such a
+// form (「我現在提交、再整套跑一次」, 「換完給你結果」), is not asked. LANES_PROMISE_FORM=0: every text is asked, whole (1.38.2).
+export const promiseFormOn = (): boolean => process.env.LANES_PROMISE_FORM !== '0'
+const LATER = '(?:明天|明早|明晚|明日|今天內|今日內|後天|稍後|晚點|晚一點|待會|等一下|回頭|下週[一二三四五六日]?|下周[一二三四五六日]?|下禮拜|週[一二三四五六日]|星期[一二三四五六日]|月底|\\d+\\s*(?:分鐘|小時|天)後)'
+const WHEN = `(?:${LATER}|今天|今晚|\\d{1,2}\\s*(?::\\d{2}|點|時)(?:\\d{1,2}\\s*分)?|\\d{1,2}[/-]\\d{1,2}|\\d+\\s*(?:分鐘|小時|天))`
+const OWED = '(?:給|回你|回妳|回您|回覆|回報|回信|答覆|告訴|通知|交|寄|送|完成|做好|做完|弄好|處理|整理|補|提供|確認|查|修好|上線|推上|發|決定)'
+const PROMISE_FORMS: RegExp[] = [
+  /(?:我|我們|我们|咱們)(?:這邊|这边)?\s*(?:會|会|將|将)(?![議议員员計计談谈面]|不[會会])/,
+  /\b(?:I|we)(?:'ll|’ll|\s+will|\s+shall)\b|\bI'm going to\b/i,
+  new RegExp(`${WHEN}\\s*(?:之前|以前|前|以內|內)[^。！？；\\n]{0,40}?${OWED}`),
+  new RegExp(`${LATER}[^。！？；\\n]{0,30}?${OWED}`),
+  /(?:之後|以後|(?<![然最])後|到時)[^。！？；\n]{0,16}?(?:回你|回妳|回您|給你|給妳|告訴你|通知你|交給你|寄給你)/,
+  /\bby (?:tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|end of (?:day|week)|eod|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b|\btomorrow\b[^.!?\n]{0,30}\b(?:send|give|reply|answer|deliver|finish|fix|check)/i,
+]
+const QUESTION = /(?:[？?]|嗎[。.!！]?)\s*$|([會会能要可])不\1/            // …？, …嗎, 會不會 / 能不能 / 要不要
+/** a negated stretch (up to the next comma or stop) promises nothing: 「明天不用給」, 「這不會影響」 */
+const NEGATED = /(?:不用|不必|不需要|不會|不会|無需|无需|別|别|沒有要|不打算|don't|won't|will not|not going to)[^，,。；;！!？?\n]*/gi
+/** the sentences of `text` that hold an explicit promise for later ([] = none: a report, an answer, information) */
+export function promiseSentences(text: string): string[] {
+  const clean = String(text ?? '').replace(/第\s*\d+\s*(?:點|项|項|條|条|題|题|步|件)/g, '第N')
+  const out: string[] = []
+  for (const raw of clean.split(/(?<=[。！？!?；;])|\n+/)) {
+    const s = raw.replace(/^(?:[\s>*#|•·-]+|\d+[.、)）]\s*)+/, '').replace(/\s+/g, ' ').trim()     // list and quote marks, not a leading number
+    if (s.length < 2 || QUESTION.test(s)) continue
+    const said = s.replace(NEGATED, '')
+    if (PROMISE_FORMS.some(re => re.test(said))) out.push(s)
+  }
+  return out
+}
 
 export function commitmentText(c: Commitment): string {
   return `答應 ${c.who}：${c.what}（時限：${c.by}）`

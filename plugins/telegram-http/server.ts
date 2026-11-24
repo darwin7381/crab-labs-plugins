@@ -3963,7 +3963,15 @@ if (Lanes.LANES_ON) {
           const btcc = async (m: 'GET' | 'POST', path: string, b?: unknown) => { const r = await btccMail(m, path, b); if (m === 'POST' && /^\/api\/mesh\/mail\/(lane-item|\d+\/card)/.test(path)) got = r; return r }
           const res: any = await callInboxTool(name, args, { ...fleetDeps, btcc, openBy: 'lane', lane }, false)
           const j = (got as { status: number; json: any } | null)?.status === 200 ? (got as unknown as { json: any }).json : null
-          return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(j && typeof j.id === 'number' ? { mail_id: j.id, ...(j.deadline ? { deadline: String(j.deadline) } : {}) } : {}) }
+          // WO-131 (1.38.3, Chiron mail #11059 item 1): whether the carded mail was sent no_reply. BTCC's card and decide answers do not carry it; the mail
+          // record does (GET by=lane: the card already made it lane_read, so the read changes nothing). Unreadable: not said (the decision's run answers it).
+          let noReply: boolean | undefined
+          if (name === 'mailbox_card' && j && typeof j.id === 'number') {
+            const m = await btccMail('GET', `/api/mesh/mail/${j.id}?by=lane`).catch(() => null)
+            if (m?.status === 200 && typeof m.json?.no_reply === 'boolean') noReply = m.json.no_reply
+          }
+          return { text: String(res?.content?.[0]?.text ?? ''), isError: !!res?.isError, ...(j && typeof j.id === 'number' ? { mail_id: j.id, ...(j.deadline ? { deadline: String(j.deadline) } : {}),
+            ...(noReply !== undefined ? { no_reply: noReply } : {}) } : {}) }
         }
         let to: string | undefined
         if (name === 'mailbox_reply' && Number(args.id) > 0) {

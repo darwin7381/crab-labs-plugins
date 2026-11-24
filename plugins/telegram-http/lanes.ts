@@ -57,7 +57,7 @@ export const LANES_ON = process.env.GENESIS_LANES === '1'
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const HOP_LIMIT = Number(process.env.LANES_HOP_LIMIT ?? 6)
 import { LEDGER_QUERY_DESCRIPTION, TZ_LABEL, stamp } from './lanes-digest.ts'
-import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, outcomeFingerprint, sameOutcome, simTime } from './lanes-followup.ts'
+import { type Followup, FOLLOWUP_CHAIN_MAX, checkCommitmentArgs, checkFollowupArgs, commitmentFromReport, commitmentText, duePending, followupEventText, outcomeFingerprint, promiseFormOn, promiseSentences, sameOutcome, simTime } from './lanes-followup.ts'
 
 const MAX_RUNNING = Number(process.env.LANES_MAX ?? 4)
 // 002l (D1, D7): design/identity rule 6 「每個對話有轉手次數上限與 token 預算，超過就停、升級主線」: the budget is per conversation (thread) and counts the
@@ -181,7 +181,7 @@ export interface LanesDeps {
               send?: LaneSendFields) => Promise<{ text: string; msgId?: number; delivered: boolean; isError?: boolean }>
   /** inbox role, lanes-golive (C2): one of the agent's mailbox tools for the mail lane `lane` (fleet-mail.ts callInboxTool); `to` = the original sender of a
    *  mail it replies to (the disclosure check ran on it) */
-  mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string }>
+  mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string; no_reply?: boolean }>
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, summary?: string) => Promise<string>
   registryNames?: () => string[]
   /** loopback MCP token check (mcp-auth gate) */
@@ -257,6 +257,7 @@ export function lanesInit(deps: LanesDeps): void {
     events = createEvents(journal, writeOpenHandoffs)
     writeOpenHandoffs()
     writeLaneSettings()
+    rotateMailLanesAtBoot()                         // WO-131: a mail lane over its renewal thresholds is closed now; its restored runs move at their start
     restoreRuns()
     for (const [id, list] of Object.entries(S.steering ?? {})) {                 // 002k (E18): messages that were with a run when the daemon stopped: that run is gone, they are the lane's next run
       const lane = S.lanes[id]
@@ -628,6 +629,12 @@ type Lane = {
   anchor?: string
   /** 1.36.2: cardHash() of the lane card this lane's session last received (its system prompt at creation, or an update block in a run prompt) */
   card_hash?: string
+  /** WO-131 (1.38.3): the fresh tokens (freshTokens) of this lane's last run, what the mail lane's renewal reads (LANES_MAIL_ROTATE_FRESH) */
+  last_fresh?: number
+  /** WO-131: a mail lane renewed by its token rule (closed then): why, when, at which point (event | start | cut | boot) */
+  rotated?: { why: string; at: string; where: string }
+  /** WO-131: a mail lane that replaced a renewed one: the old thread, whose ledger summary its first run gets (once: summary_given) */
+  prev_thread?: string; summary_given?: boolean
 }
 type Thread = { id: string; lane: string | null; peer: string | null; hops: number; tokens: number; created: string; last: string; stopped?: string
   /** 002l (D1, D7): fresh tokens (freshTokens) the thread's runs spent: what the thread budget counts. `tokens` stays the input-side total, for the record. */
@@ -777,6 +784,8 @@ export type InEvent = {
   rerun_of?: string
   /** 002m (LACDE1): what got worse since the owner's last run (old → new), for its event block */
   rerun_worse?: string
+  /** WO-131 (1.38.3): this mail-lane event's run was cut by the thread budget and was handed to a fresh mail lane once (a second cut is not) */
+  budget_requeued?: boolean
   /** 002l (N1): marks the router put on this event (authority-claim, instructions-to-agent, thread-not-yours); the lane reads them in its event block.
    *  M3 (PL1): they are fields of the event's record too (flags, claim, screen_p) */
   flags?: string[]; claim?: string; screen_p?: number
@@ -801,7 +810,9 @@ export type InEvent = {
 /** WO-127: a decision the router hands a lane run: the mail, the main's decision, where it came from (the event of the run that asked, and how: a lane item
  *  opened by decide_later or a card on a colleague's mail) */
 export type Decided = { mail_id: number; decision: string; note: string | null; origin: string | null; item: 'lane_item' | 'card' | null; title: string
-  card: Record<string, unknown>; from?: string | null }
+  card: Record<string, unknown>; from?: string | null
+  /** WO-131 (1.38.3): a card's mail was sent no_reply (from BTCC's mail record, read by the agent-inbox daemon when the card was put on it) */
+  no_reply?: boolean }
 export type WakeKind = 'keepwarm' | 'mail' | 'stall' | 'restart' | 'resume'
 export type Line = 'feed' | 'mail' | 'call'
 /** lanes-golive (C1): which fleet wake-up line this is, or null. The /inject body's `wake` field wins; without one, the delivery watchdog's sender
@@ -1033,17 +1044,85 @@ function routeWake(ev: InEvent): Decision {
 // item for the main, no new mail state). The mailbox reminder (the watchdog's 讀信箱 line, keepwarm-local's) is what dispatches it: a mail the lane did
 // not finish stays unread / unticked in the mailbox and the next reminder dispatches the lane again. The main is never shown mail on a wake: only the
 // digest of what the lanes did. One mail lane per agent; it is renewed (a fresh session) when it has been idle longer than LANES_RESUME_MAX_AGE_MS.
+// WO-131 (1.38.3): and by its tokens. The mail lane is the one long-lived single thread (a reflex lane's thread is one matter): every resumed run after the
+// cache expired writes the whole conversation into the cache again (fresh tokens per run grew chiron 36,002 → 138,489 by run 17, plutus 67,954 → 116,943),
+// so the thread reached THREAD_BUDGET (1,000,000) and startRun answered every later reminder 「不再開車道處理，升級主線」: plutus.mail.1 at 04:03:42Z, chiron.mail.1
+// at 06:18:03Z, sonn.mail.1 at 03:07:05Z (its next six reminders, 03:08Z to 07:13Z, were refused before they ran, owed nothing, woke nobody: the mail sat in the
+// mailbox, 3 → 7 unread, until the main closed the lane). Now the mail lane is renewed (closed; a fresh lane on a new thread, whose first run gets the old
+// thread's ledger summary and, being a new session, the current cards) when its thread has used LANES_MAIL_ROTATE_TOKENS (600,000) or its last run's fresh
+// tokens were LANES_MAIL_ROTATE_FRESH (100,000) or more (0 = that rule off), checked when the next event for it arrives; an event already queued on it is
+// moved when its run would start; a mail lane's event is never refused for the budget and escalated: it goes to a fresh mail lane; a run the budget cuts
+// before its closing call is run once more on a fresh mail lane; at boot every open mail lane over a threshold is closed. Reflex lanes: unchanged.
+const MAIL_ROTATE_TOKENS = (): number => num('LANES_MAIL_ROTATE_TOKENS', 600_000)
+const MAIL_ROTATE_FRESH = (): number => num('LANES_MAIL_ROTATE_FRESH', 100_000)
+/** the fresh tokens of the lane's last run: its record, else (a lane of a version before 1.38.3) its last exit row in lanes.jsonl */
+function lastRunFresh(l: Lane): number {
+  if (typeof l.last_fresh === 'number') return l.last_fresh
+  const row = readJsonl('lanes.jsonl').filter(r => r.lane === l.id && r.kind === 'exit' && typeof r.tokens_fresh === 'number').pop()
+  return row ? Number(row.tokens_fresh) : 0
+}
+/** why this mail lane is due for renewal, or null: its thread's fresh tokens, its last run's, or its thread over the budget itself */
+function mailRotateWhy(l: Lane): string | null {
+  if (l.kind !== 'mail' || l.status === 'closed') return null
+  const used = S.threads[l.thread]?.fresh ?? 0, last = l.runs > 0 ? lastRunFresh(l) : 0
+  if (MAIL_ROTATE_TOKENS() > 0 && used >= MAIL_ROTATE_TOKENS()) return `thread ${l.thread} used ${used} fresh tokens (≥ LANES_MAIL_ROTATE_TOKENS ${MAIL_ROTATE_TOKENS()})`
+  if (MAIL_ROTATE_FRESH() > 0 && last >= MAIL_ROTATE_FRESH()) return `its last run used ${last} fresh tokens (≥ LANES_MAIL_ROTATE_FRESH ${MAIL_ROTATE_FRESH()})`
+  if (THREAD_BUDGET > 0 && used >= THREAD_BUDGET) return `thread ${l.thread} used ${used} fresh tokens (≥ the thread budget ${THREAD_BUDGET})`
+  return null
+}
+/** WO-131: the mail lane is closed by its renewal rule (the next mail event opens a fresh one, mailLane) */
+function retireMailLane(l: Lane, why: string, where: 'event' | 'start' | 'cut' | 'boot', to?: string): void {
+  l.status = 'closed'
+  l.rotated = { why, at: nowIso(), where }
+  saveState()
+  appendJsonl('lanes.jsonl', { lane: l.id, kind: 'mail_lane_rotated', why, where, thread: l.thread, thread_fresh: S.threads[l.thread]?.fresh ?? 0,
+    last_fresh: l.runs > 0 ? lastRunFresh(l) : null, runs: l.runs, to: to ?? null })
+  ledger({ lane: 'router', thread: l.thread, kind: 'lane_lifecycle', text: `讀信線 ${l.id} 換新（${why}）：下一則信箱事件開新的讀信線，帶這條線的帳本摘要；決定卡和交給主線的事都還在。`,
+    refs: { mail_lane_rotated: l.id, why, where, thread_fresh: S.threads[l.thread]?.fresh ?? 0 } })
+  logos('lane.mail_rotated', { lane: l.id, why, where, thread: l.thread })
+}
 function mailLane(): Lane {
   let l = S.mail_lane ? S.lanes[S.mail_lane] : undefined
   const stale = !!l && l.runs > 0 && Date.now() - Date.parse(l.last) > RESUME_MAX_AGE_MS && !laneBusy(l.id)
-  if (!l || l.status === 'closed' || stale) {
+  const rotate = !!l && !stale && l.status !== 'closed' && !laneBusy(l.id) ? mailRotateWhy(l) : null   // WO-131: a busy lane's next event is moved at its start
+  if (!l || l.status === 'closed' || stale || rotate) {
     if (l && stale) { l.status = 'closed'; appendJsonl('lanes.jsonl', { lane: l.id, kind: 'mail_lane_renewed', why: `idle since ${l.last}` }) }
-    l = newLane('mail', { title: '信箱' })
+    const prev = l
+    l = newLane('mail', { title: '信箱', ...(prev && (rotate || prev.rotated) ? { prev_thread: prev.thread } : {}) })
+    if (prev && rotate) retireMailLane(prev, rotate, 'event', l.id)
     S.threads[l.thread].peer = null
     S.mail_lane = l.id
     saveState()
   }
   return l
+}
+/** WO-131: a queued event of a mail lane that is renewed (closed by the rule, or due now) runs on the current mail lane instead: never refused for the
+ *  budget, never escalated. Not an attempt. A decision's run gets its event block again (it names the lane's thread). */
+function moveToMailLane(it: QItem, from: Lane, why: string, steps?: string[]): Lane {
+  if (from.status !== 'closed') retireMailLane(from, why, steps ? 'cut' : 'start')
+  const to = mailLane()
+  const summary = [it.summary ?? (to.runs === 0 && !to.summary_given ? threadSummary(from.thread) : ''),
+    ...(steps ? [`〔上一趟（${from.id}）被對話線的 token 預算中止，這件事交給你重跑一次。它中止前做過的事（照順序）：〕`, ...(steps.length ? steps.map((s, i) => `${i + 1}. ${s}`) : ['（沒有呼叫任何工具）']),
+      '做過的不要再做一次（已回的信不再回、已交給主線的不再交、已告訴 Joey 的不再講）；從還沒做的那一步接著做完。'] : [])].filter(Boolean).join('\n')
+  if (to.runs === 0) to.summary_given = true
+  events?.note(it.ev.id, { owner: to.id, lane: to.id, thread: to.thread, moved_from: from.id })
+  if (it.ev.decided) it.ev.synthetic = decisionRunText(it.ev, it.ev.decided, to)
+  const nit: QItem = { ev: it.ev, lane: to.id, state: 'queued', attempts: 0, priority: it.priority, enqueued: it.enqueued, ...(summary ? { summary } : {}),
+    ...(it.extra?.length ? { extra: it.extra } : {}), ...(it.steered?.length ? { steered: it.steered } : {}) }
+  queueRun(nit)
+  appendJsonl('lanes.jsonl', { lane: from.id, kind: 'mail_event_moved', event: it.ev.id, to: to.id, why, cut: !!steps })
+  routeRow({ event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'mail-lane-renewed', target: 'lane', lane: to.id, thread: to.thread, note: `${from.id} renewed (${why}): ${to.id}${steps ? ', the cut run once more' : ''}` })
+  saveState()
+  setTimeout(pump, 0)
+  return to
+}
+/** WO-131: at boot every open mail lane whose thread or last run is at or over a renewal threshold is closed: the next reminder opens a fresh one */
+function rotateMailLanesAtBoot(): void {
+  for (const l of Object.values(S.lanes)) {
+    if (l.kind !== 'mail' || l.status === 'closed') continue
+    const why = mailRotateWhy(l)
+    if (why) retireMailLane(l, why, 'boot')
+  }
 }
 /** the 讀信箱 reminder → the mail lane. A reminder that finds a mailbox run already waiting to start adds nothing (that run lists the whole mailbox);
  *  one that finds a run in progress queues one run after it (mail that came after its mailbox_list) */
@@ -1099,6 +1178,8 @@ export function laneToolsFor(kind: LaneKind | undefined): any[] {
 /** a card the main has not answered yet, on the record of the event whose run put it there (the record's `waits`) */
 type Wait = { mail_id: number; item: 'lane_item' | 'card'; title: string; decide: string; deadline: string | null; at: string; lane: string; thread: string
   cls: string; trigger: string; card: Record<string, unknown>; from?: string | null
+  /** WO-131 (1.38.3): the carded mail was sent no_reply (the agent-inbox daemon's answer to mailbox_card; absent: not known) */
+  no_reply?: boolean
   decided?: { decision: string; at: string; event: string }; checked?: { by: string; at: string }; handed?: boolean }
 const waitsOf = (e: Row | undefined): Wait[] => (Array.isArray(e?.waits) ? e!.waits : []) as Wait[]
 const pendingWait = (w: Wait): boolean => !w.decided && !w.checked
@@ -1150,7 +1231,8 @@ function mailDecision(ev: InEvent): Decision {
     how = `${lane.id} ${lane.status === 'closed' ? 'is closed' : 'is too old'}: fresh lane ${target.id} on ${lane.thread} with the ledger summary`
   }
   const decided: Decided = { mail_id: m, decision: String(ev.decision ?? ''), note: ev.note ?? null, origin: origin?.id ?? null, item: wait?.item ?? null,
-    title: String(ev.title || wait?.title || ''), card: clipCard(ev.card && Object.keys(ev.card).length ? ev.card : wait?.card), from: wait?.from ?? null }
+    title: String(ev.title || wait?.title || ''), card: clipCard(ev.card && Object.keys(ev.card).length ? ev.card : wait?.card), from: wait?.from ?? null,
+    ...(wait?.no_reply ? { no_reply: true } : {}) }
   ev.decided = decided
   ev.klass = (origin?.class as EvClass | undefined) ?? 'peer'
   ev.trigger = ev.cls = wait?.cls ?? (target.kind === 'mail' ? 'mail' : 'peer')
@@ -1203,7 +1285,8 @@ function decisionRunText(ev: InEvent, d: Decided, lane: Lane): string {
     '── 決定卡 ──', ...cardLines(d.card, whenOf),
     '── 照決定做完 ──',
     `- ${todo}`,
-    ...(d.item === 'card' ? ['- 這封信照決定回信（mailbox_reply）、勾掉（mailbox_check）。'] : []),
+    // WO-131 (1.38.3, Chiron mail #11059 item 1): a mail sent no_reply is not answered
+    ...(d.item === 'card' ? [d.no_reply ? '- 這封信標了不用回：不回信，勾掉（mailbox_check）。' : '- 這封信照決定回信（mailbox_reply）、勾掉（mailbox_check）。'] : []),
     decisionReporter() === 'lane' ? '- 做完向 Joey 回報一次（notify_joey）。開頭的「照主線的決定（…）：」系統會加，不用自己寫。'
       : '- 這件事由主線向 Joey 回報：你不用通知 Joey，做了什麼寫進 receipt。',
     '- 只准一來一回：不能為這件事再放第二張卡（decide_later、mailbox_card 會被擋）。做不下去就用 handoff_main 整件交回主線，系統會附上這張卡和你做到哪。',
@@ -2156,6 +2239,11 @@ function reapOrphan(pid: number, run: string): void {
 /** busy = the lane has a run that is queued, leased or running (M5) */
 export function laneBusy(laneId: string): boolean { return running.has(laneId) || [...queue.values()].some(i => i.lane === laneId && i.state !== 'done') }
 function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string): void {
+  // WO-131: the first event of a mail lane that replaced a renewed one carries the old thread's ledger summary (once)
+  const ml = S.lanes[laneId]
+  if (summary === undefined && ml?.kind === 'mail' && ml.prev_thread && ml.runs === 0 && !ml.summary_given) {
+    summary = threadSummary(ml.prev_thread) || undefined; ml.summary_given = true; saveState()
+  }
   const it: QItem = { ev, lane: laneId, state: 'queued', attempts: 0, priority, summary, enqueued: nowIso() }
   // 002k (B12): alert repeats that came while this thread had no run to take them start its next run
   const th = S.threads[S.lanes[laneId]?.thread ?? '']
@@ -2710,7 +2798,8 @@ export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardU
     `# 焦點卡（主線寫的，你只能讀）`,
     focusCard(),
     ...(bc ? [``, bc.text] : []),                                       // WO-125 (A): every run, resumed sessions included (it is in the run prompt)
-    ...(it.summary ? [``, `# 這個 thread 先前的帳本紀錄（原車道已結束太久，由你接手）`, it.summary] : []),
+    ...(it.summary ? [``, lane.kind === 'mail' && lane.prev_thread ? `# 上一條讀信線的帳本紀錄（那條線的對話用到上限，換成你這條新的，由你接手）`
+      : `# 這個 thread 先前的帳本紀錄（原車道已結束太久，由你接手）`, it.summary] : []),
     ...fanoutLines(lane, it),
     ...appendableLines(),
     ...limitLines(lane),
@@ -2877,6 +2966,14 @@ function startRun(it: QItem): void {
     saveState(); return
   }
   const th = S.threads[lane.thread]
+  // WO-131: a mail lane's event is never refused for the budget (that refusal escalated nothing and the reminders after it vanished): a mail lane renewed by
+  // its rule, or due for it now (its thread or its last run over a threshold, or the thread over the budget), hands the event to the current mail lane
+  if (lane.kind === 'mail' && (lane.rotated || (lane.status !== 'closed' && mailRotateWhy(lane)))) {
+    const why = lane.rotated?.why ?? mailRotateWhy(lane)!
+    endRun(it, 'moved', { why: `mail lane renewed: ${why}` })
+    moveToMailLane(it, lane, why)
+    return
+  }
   if (th && (th.fresh ?? 0) >= THREAD_BUDGET) {
     endRun(it, 'budget', { why: 'thread budget spent before the run', budget: budgetOf(lane.thread) })
     const text = `thread ${lane.thread} 已用 ${th.fresh} token（新的輸入、快取寫入與輸出；快取重讀不算），超過預算 ${THREAD_BUDGET}；事件 ${it.ev.id} 不再開車道處理，升級主線。`
@@ -3056,6 +3153,7 @@ function startRun(it: QItem): void {
     // a run that died before claude wrote its transcript leaves nothing to --resume: retry fresh
     if (code === 0 || existsSync(lane.transcript)) lane.runs += 1
     lane.tokens_in += tin; lane.tokens_out += tout; lane.last = nowIso()
+    lane.last_fresh = tfresh                                           // WO-131: what the mail lane's renewal reads (LANES_MAIL_ROTATE_FRESH)
     lane.status = lane.status === 'closed' ? 'closed' : 'idle'
     queueSteering(lane, steerLeft, signal ? `was stopped (${signal})` : `ended (exit ${code})`)
     const lastResults = tools.filter(t => t.result).slice(-2).map(t => t.result!)   // 002l (D8): the last tool results, for a cut run's partial
@@ -3071,6 +3169,13 @@ function startRun(it: QItem): void {
     // WO-125 (observation points, ticket item 8): per run, what the guard refused (still counting at the end), the steps the receipt marked, the card's length
     const bf = blockFactsOn() ? blockedFacts(tok.blocked) : null
     if (blockFactsOn()) noteBlocked(tok)                                // the run's line in the main's digest carries the final count
+    // WO-131: a run cut by a limit (the budget, a cap) that had already made its closing call (a receipt or a hand-over accepted, a line to Joey or the
+    // main) did its work: its decision_outcome comes from that record (chiron.mail.1.r17 had append_file, mailbox_check, notify_joey, receipt: null before).
+    // A mail lane's run the budget cut before that is run once more on a fresh mail lane (requeue); a second cut ends as before (the exit rule).
+    const CLOSING = ['receipt', 'notify_joey', 'ask_joey', 'handoff_main']
+    const cut = reason === 'budget' || reason === 'cap_turns' || reason === 'cap_usd'
+    const workDone = !!tok.receipt || !!tok.handedOver || closers.some(c => CLOSING.includes(c)) || tok.closers.some(c => CLOSING.includes(c))
+    const requeue = reason === 'budget' && lane.kind === 'mail' && !workDone && !it.ev.budget_requeued
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: runId, event: it.ev.id, session_id: lane.session_id,
       transcript: lane.transcript, exit_code: code, signal, reason, duration_s: Math.round((Date.now() - started) / 100) / 10,
       calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers,
@@ -3080,7 +3185,9 @@ function startRun(it: QItem): void {
       // WO-127 (ticket item 11, the observation points): the decision this run carried and how it ended (done | handed_back; an attempt that did not end
       // normally and handed nothing back: null, its retry writes its own row); the mail a run's decide_later opened. Only with the switch on.
       ...(decisionsOn() && tok.decision ? { decision: tok.decision.decision, decision_mail_id: tok.decision.mail_id,
-        decision_outcome: tok.handedOver ? 'handed_back' : reason === 'normal' ? 'done' : null } : {}),
+        decision_outcome: tok.handedOver ? 'handed_back' : reason === 'normal' || (cut && workDone) ? 'done' : requeue ? 'requeued' : null,
+        ...(cut && workDone && !tok.handedOver ? { decision_outcome_from: 'tools' } : {}) } : {}),
+      ...(requeue ? { requeued: 'fresh mail lane' } : {}),
       ...(decisionsOn() && tok.decideLater?.length ? { decide_later_mail_id: tok.decideLater.length === 1 ? tok.decideLater[0] : tok.decideLater } : {}) })
     logos('lane.exit', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript,
       exit_code: code, signal, reason, calls: usage.size, tokens_in: tin, tokens_out: tout, closers })
@@ -3102,11 +3209,20 @@ function startRun(it: QItem): void {
         : capped === 'usd' ? `預算：這一趟花到單趟的金額上限（--max-budget-usd ${laneMaxUsd(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
         : `這一趟到了回合上限（--max-turns ${laneMaxTurns(lane.kind)}），已經中止（${usage.size} 次呼叫）。`
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'stop',
-        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}`,
-        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial } })
+        text: `${why}事件 ${it.ev.id}（${it.ev.from}）：${it.ev.text.slice(0, 160)}。中止前的結果：${partial}${requeue ? '。讀信線換新，這件事交給新的讀信線重跑一次（帶這一趟做過的步驟）。' : ''}`,
+        refs: { capped, run: runId, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET, in_run: capped === 'budget', partial,
+          ...(requeue ? { requeued: true } : {}) } })
       logos('lane.budget_stop', { lane: lane.id, run: runId, event: it.ev.id, capped, calls: usage.size, tokens_in_run: tin, fresh_in_run: tfresh, thread_tokens: th2?.fresh ?? null, budget: THREAD_BUDGET })
       D.log('warn', `lanes: ${runId} stopped (${capped}): ${why}`)
       said = `${why}中止前的結果：${partial}`; reached = partial
+    }
+    if (requeue) {                                                      // WO-131: once, on a fresh mail lane, with what this run did; never escalated for the budget
+      it.ev.budget_requeued = true
+      moveToMailLane(it, lane, `the budget cut run ${runId} (thread ${lane.thread} at ${budgetStop?.total ?? S.threads[lane.thread]?.fresh ?? 0})`, tools.map(stepLine))
+      if (S.wall) void wallDown(runId)                                  // as runEnded does: a run that reached the model takes the lanes' wall down
+      saveState()
+      pump()
+      return
     }
     if (reason === 'died' || reason === 'timeout') {                  // 002m (G06): where each attempt died is kept for the give-up hand-over
       const one = (x: string | undefined, n: number) => x ? x.replace(/\s+/g, ' ').trim().slice(0, n) || undefined : undefined
@@ -3736,9 +3852,15 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   const to = String(o.to ?? '').toLowerCase(), byMain = o.who === 'main'
   if (o.tok && (o.tok.commitments ?? 0) > 0) return 'dup'
   let ask: { p?: number; deadline?: number; error?: string; ms?: number } | null = null
+  // 1.38.3 (WO-131 D): only a text with an explicit promise for later is asked, and about those sentences (promiseSentences); the record is them too
+  let forms: string[] | null = null
   if (!o.relay) {
     if (!MAIN_COMMITMENTS()) return 'off'
-    ask = await promiseAsk(o.text, o.to, undefined, { dir: LANES_DIR, ref: o.ref })
+    if (promiseFormOn()) {
+      forms = promiseSentences(o.text)
+      if (!forms.length) { logMainCommitment({ who: o.who, to: o.to, btcc_msg_id: o.ref ?? null, form: false, hit: false, wrote: false, thread: o.thread }); return 'no' }
+    }
+    ask = await promiseAsk(forms ? forms.join('\n') : o.text, o.to, undefined, { dir: LANES_DIR, ref: o.ref })
     if (ask.error || typeof ask.p !== 'number') {
       D.log('warn', `lanes: ${byMain ? 'main commitment check' : `promise check of ${o.who}`} for the text to ${o.to} failed (${ask.error}); nothing written`)
       logMainCommitment({ who: o.who, to: o.to, btcc_msg_id: o.ref ?? null, error: ask.error, ms: ask.ms })
@@ -3753,10 +3875,12 @@ export async function promiseCheck(o: { who: string; to: string; text: string; e
   // a commitment the main wrote itself with the commitment tool a moment ago is the record: no second one for the same send
   const own = hit && byMain && (events?.rows(e => e.owner === 'main' && Date.now() - Date.parse(String(e.created)) < MAIN_COMMIT_DEDUPE_MS) ?? [])
     .some(e => ((e.obligations ?? []) as Ob[]).some(x => x.level === 'commitment' && x.by !== 'promise-check' && String(x.to ?? '').toLowerCase() === to))   // M3: the main's own commitment tool record
-  if (ask) logMainCommitment({ who: o.who, to: o.to, btcc_msg_id: o.ref ?? null, p: ask.p, deadline: dl, hit, wrote: hit && !own, thread: o.thread, thread_from: o.thread_from ?? null, ms: ask.ms })
+  if (ask) logMainCommitment({ who: o.who, to: o.to, btcc_msg_id: o.ref ?? null, p: ask.p, deadline: dl, hit, wrote: hit && !own, thread: o.thread, thread_from: o.thread_from ?? null, ms: ask.ms,
+    ...(forms ? { form: true, sentences: forms.length } : {}) })
   if (!hit) return 'no'
   if (own) return 'dup'
-  const cm = commitmentFromReport(o.text, o.relay ? to : undefined, to) ?? { who: to, what: o.text.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
+  const said = forms ? forms.join(' ') : o.text
+  const cm = commitmentFromReport(said, o.relay ? to : undefined, to) ?? { who: to, what: said.replace(/\s+/g, ' ').trim().slice(0, 500), by: '未說明' }
   if (o.tok) o.tok.commitments = 1
   // the event of the conversation the promise was made in: the peer's newest message on the send's thread; else the event the send is about
   // (a thread the send named, quoted, or kept a promise on; the peer's newest live thread is a guess, peerThread's `peer-thread`, and is not used: 002l D4)
@@ -3988,7 +4112,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const m = Number(r.mail_id ?? (name === 'mailbox_card' ? a.id : String(r.text ?? '').match(/#(\d+)/)?.[1]))
       const w: Wait = { mail_id: m, item: name === 'decide_later' ? 'lane_item' : 'card', title: name === 'decide_later' ? String(a.title ?? '').trim().slice(0, 120) : '',
         decide: String(card?.decide ?? '').trim().slice(0, CARD_BOX_MAX), deadline: r.deadline ? String(r.deadline) : typeof card?.deadline === 'string' ? card.deadline : null,
-        at: nowIso(), lane: lane.id, thread: lane.thread, cls: tok.cls, trigger: tok.trigger, card: clipCard(card) }
+        at: nowIso(), lane: lane.id, thread: lane.thread, cls: tok.cls, trigger: tok.trigger, card: clipCard(card),
+        ...(name === 'mailbox_card' && typeof r.no_reply === 'boolean' ? { no_reply: r.no_reply } : {}) }
       events.note(tok.evId, { waits: [...waitsOf(events.get(tok.evId)), w] })
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action',
         text: `${name === 'decide_later' ? '放進主線信箱等決定' : '附決定卡在信上'} #${m}${w.title ? `「${w.title}」` : ''}：要主線決定：${w.decide}；建議：${String(card?.recommend ?? '').slice(0, 200)}`,
@@ -4610,7 +4735,10 @@ function kindLines(kind: LaneKind): string[] {
     // the mail, so the main still had to read it; about 8 pure notices handed back). Open every mail, close what the lane can, hand over ready to decide.
     `- 你被叫起來，是因為 ${D.agent} 的信箱有信（「讀信箱」提醒）。信箱就是你的工作清單：先 mailbox_list 看清單，然後每一封都打開讀（mailbox_open）；只有看標題就確定不用讀的不打開、直接勾掉。你讀信，是替主線省下讀信的那一步。你打開，寄件人看到的是「車道讀過」，不是主線已讀；到期提醒看的是主線有沒有接手、或這封有沒有勾掉，所以放心打開。`,
     `- 每一封讀完，三種結果選一種。①你能結掉的：回信（mailbox_reply：自動連到原信、自動標不用回），或做完它要的可逆小事，然後勾掉（mailbox_check）。②純知會（對方沒有要 ${D.agent} 動手、回答或決定）：勾掉，把內容寫一句進 receipt；不交回主線。③要主線的：照下一條交回。`,
-    `- 要主線的信（要代表 ${D.agent} 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回，寫到主線不用再打開信就能決定：#id、寄件人、期限；它要 ${D.agent} 決定或做什麼；信裡的關鍵事實（數字、檔案位置、它給的選項）；你的建議和根據（查不到根據就寫「沒有建議」）；你沒查的。那一封不要勾掉，主線處理完自己勾。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。`,
+    // WO-131 (1.38.3, Chiron mail #11046, verbatim): the decision card is the way a mail goes to the main (LANES_DECISIONS=0: the 1.37 line, no card tool)
+    decisionsOn()
+      ? `- 要主線的信（要代表 ${D.agent} 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：在那封信上附決定卡（mailbox_card），五格：要 ${D.agent} 決定什麼／期限／信裡的關鍵事實與出處（數字、檔案位置、它給的選項）／你的建議和根據（查不到根據就寫「沒有建議」）／主線說好之後你會做什麼。附完用 handoff_main 交回，一句話列出附了卡的 #id 和各要決定什麼，卡的內容不用再寫一次。那一封不要勾掉。主線用 mailbox_decide 回了決定，你會被叫起來照決定做完。整件只能主線自己做的（收不回的動作、要它這段對話才知道的事、工單驗收）：不附卡，用 handoff_main 把 #id、寄件人、期限、它要什麼、關鍵事實寫清楚交回。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。`
+      : `- 要主線的信（要代表 ${D.agent} 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回，寫到主線不用再打開信就能決定：#id、寄件人、期限；它要 ${D.agent} 決定或做什麼；信裡的關鍵事實（數字、檔案位置、它給的選項）；你的建議和根據（查不到根據就寫「沒有建議」）；你沒查的。那一封不要勾掉，主線處理完自己勾。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。`,
     '- 要別隻 agent 動手、回答或決定：reply_agent，預設是信（line=mail，填 to、title、ask、text）；只有晚一小時會有東西壞、或有人正在等結果，才用呼叫（line=call，填 because）。只是知會，不寄：寫進 receipt。',
     '- 工單通知（寄件人 board，開頭 [board][WO-n]）也是信：照它寫的處理（多半「不用回」）；要你接手做的單，交給主線（handoff_main）。',
     '- 收尾：整趟的信都是你自己結掉的（回了、做了、純知會勾掉），結束前用 notify_joey 說一句你讀了幾封、各怎麼處理（照現行規則推播）。這一趟有交回主線的：你結掉的那幾封也寫在 handoff 的最後一行，由主線處理完一起回報，你不另外告訴 Joey。最後一定 receipt。',

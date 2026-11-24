@@ -1,3 +1,54 @@
+## 1.38.3 — 2026-11-24
+
+- **Lanes on: the mail lane renews its conversation; a report is not a commitment (board WO-131; Chiron mail #11046, #11059 item 1; agent-inbox 1.8.3 carries the same code).**
+  - **A. What happened (WO-131, Chiron's measurements 11-24 06:21Z, sonn's own files read again):** one mail lane and one thread per agent, renewed only
+    when closed or idle > 24 h. Every resumed run after the cache expired wrote the whole conversation into the cache again (fresh tokens per run: chiron
+    36,002 → 138,489 by run 17, plutus 67,954 → 116,943, sonn 46,128 → 111,653), so the thread reached `THREAD_BUDGET` (1,000,000) and `startRun` answered
+    every later event 「…不再開車道處理，升級主線」. sonn.mail.1.r15 was cut by the budget at 03:07:05Z (1 call, 110,465 fresh, thread 1,001,825). The six
+    reminders after it (03:08:04Z, 04:08:45Z, 05:09:26Z, 06:10:08Z, 07:11:01Z, 07:13:04Z) were routed `wake-mail → sonn.mail.1`, each refused before its run
+    (journal: `exited reason=budget` 「thread budget spent before the run」, then `wake no_wake` 「the event owes nothing more: recorded only」): the stop row
+    said 升級主線 but nothing went to the main except six 「…｜已結束」 lines in the 07:12:53Z digest; the mailbox went 3 → 7 unread until the main closed the
+    lane by hand (07:16:47Z). plutus.mail.1: the same from 04:03:42Z (5 refused). chiron.mail.1.r17 (a decision's run) was cut at 1,000,338 after
+    append_file, mailbox_check, notify_joey and receipt: its exit row said `decision_outcome: null`.
+  - **Now:** the mail lane is renewed (the old lane closed; a fresh lane on a new thread, whose first run gets the old thread's ledger summary under
+    「# 上一條讀信線的帳本紀錄…」 and, being a new session, the current cards) when its thread has used `LANES_MAIL_ROTATE_TOKENS` (default 600,000) fresh
+    tokens or its last run used `LANES_MAIL_ROTATE_FRESH` (default 100,000) or more (`0` turns that rule off; a thread over the budget always renews). The
+    exit rows already had the run's `tokens_fresh`; the lane record now keeps it (`last_fresh`; a lane from before reads its last exit row). Checked when the
+    next event for the mail lane arrives (reminder or `mail_decision`); an event queued behind a running run is moved when its run would start. A mail
+    lane's event is never refused for the budget and escalated: it goes to the current mail lane. A run the budget cuts before its closing call (no receipt,
+    no accepted hand-over, no line to Joey or the main) is run once more on a fresh mail lane, its prompt listing what the cut run did (「做過的不要再做一次」);
+    a second cut of the same event ends as before (the exit rule hands what it still owes to the main). **A decision event is not lost:** cut mid-way it
+    is re-run once on the fresh mail lane with its event block made again (the decision, the card, the new thread), still owing what the main had owed
+    (its Joey line, a peer's answer, a receipt); cut again, those go to the main as any cut run's do. A run cut after it had done its work (a closing call
+    made) is not re-run, and a decision's run records `decision_outcome: done` from that record (`decision_outcome_from: tools`). At boot every open mail
+    lane at or over a threshold is closed (no wait, no main call); a reminder the previous daemon left queued for it runs on the fresh lane. Reflex lanes:
+    unchanged. Cards (`waits` on the asking event) and `.lanes/open-handoffs.md` do not depend on the lane: they survive; a `mail_decision` whose mail lane
+    was renewed runs on the current mail lane with the old thread's summary (the existing rule).
+  - **lanes.jsonl:** `mail_lane_rotated` {lane, why, where: event | start | cut | boot, thread, thread_fresh, last_fresh, runs, to}; `mail_event_moved`
+    {lane, event, to, why, cut}; exit rows `requeued: "fresh mail lane"`, `decision_outcome` `requeued` | `done` + `decision_outcome_from: "tools"`.
+    routing.jsonl `rule: mail-lane-renewed`; the journal's run record of a moved event ends `reason: moved`.
+  - **B. Words (Chiron mail #11046), verbatim:** the mail lane's line 3 (decision card on the mail, five boxes, `handoff_main` listing the carded ids; only
+    what the main alone can do goes without a card); the boundary card's step 「只把需要主線的那一步交出去：用 decide_later 開一張決定卡（…）…整件只能主線自己做的才用
+    handoff_main。」, the WO-127 sentence still right after it, same line (10 lines). The mail card's hash changes: a resumed mail lane gets the new card once
+    (1.36.2's rule). `LANES_DECISIONS=0` keeps the 1.38.2 words in both (there is no card tool then).
+  - **C. No answer to a no_reply mail (Chiron mail #11059 item 1):** the flag is on the mail record only (BTCC's card and decide answers do not carry it;
+    the lanes side had nothing). The agent-inbox daemon's `mailbox_card` now reads the mail (`GET /api/mesh/mail/{id}?by=lane`: the card already made it
+    lane_read) and returns `no_reply`; the card's wait keeps it; the decision's run then says 「- 這封信標了不用回：不回信，勾掉（mailbox_check）。」 instead of the
+    reply line. Unknown (an inbox daemon before 1.38.3, the read failed): the reply line, as before.
+  - **D. False commitments:** every reply sonn's main sent Joey from 11-23 13:37Z to 11-24 01:25Z was a `commitment` row (`main-send`, auto, the whole
+    message): 19 of 42 sends checked, p 0.72-0.99. `promiseAsk`'s question (「Does `message` say that its sender will do or deliver something later?」) is
+    answered right on a status report: it names its next steps (TG 7901 「接下來：全套測試 → 推 1.35.0 → 回你兩題的完整答案」 0.99). Now (`promiseSentences`,
+    lanes-followup.ts) only the sentences with an explicit promise for later are asked, and they are the record: 我會／我們會／I will…; <time>前／內 … an action
+    owed (給、回你、完成…); 明天／稍後／N 分鐘後… an action owed; …後／到時 … 回你／給你／告訴你. Questions and negated stretches are not. A text with none is
+    not asked (main-commitment.jsonl `form: false`). On those 42 sends 4 are still asked (Jev decides as before, about the promise sentences); of the 19
+    recorded, 17 hold no promise form and 2 do (TG 7910 「你下次轉寄或貼格式化內容時，我會看紀錄確認。」, mail #10900 「…上線後在這個 thread 回你一句。」). On Chiron's 39
+    main-send rows (their stored 500 characters): 2 hold one (「明天我數一次交回的樣子…」, 「觀察點我會跟著每一步同步記。」).
+    「第 1 點」 is no longer read as a deadline (TG 7899 had 「時限：1 點」). `LANES_PROMISE_FORM=0`: 1.38.2 (every text asked, whole).
+  - Tests: `lanes-wo131` (9), `lanes-wo131-boot` (1), `lanes-wo131-promise` (3); `lanes-wo127` (the boundary words, the mail card's hash with the switch
+    off) and `lanes-c1` (a time stated as a fact is no longer asked) follow the change. Suite: 946 (943 pass, 3 skip, 0 fail); baseline 1.38.2: 933 (930 pass, 3 skip, 0 fail).
+  - **Not verified here:** a live mail lane over the thresholds (the lane process is a stand-in that prints usage); BTCC's real `GET …?by=lane` answer for
+    a carded mail (a stand-in answers); Jev's live answers on the promise sentences (not called).
+
 ## 1.38.2 — 2026-11-24
 
 - **Lanes on: two fixes from Chiron's mail #11023 (agent-inbox 1.8.2 carries the same code). No switch: both are bug fixes.**

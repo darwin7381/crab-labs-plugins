@@ -92,10 +92,18 @@ test('002s C07: a deadline the main passes on (the sender does nothing itself) i
   expect(calls).toBe(c0 + 1)                                                                  // one request carries both questions
   expect(commitments()[n].refs).toMatchObject({ auto: true, who: 'eve', from: 'main-send', p: 0.05, deadline: 0.93 }); expect(commitments()[n].refs.by).toContain('週五')
   mode = 'relaylow'
+  const c1 = calls
   await send('mock-api 維護時段：每週三 02:00–03:00，下週三 11-18 為維護。'); await sleep(200)
   expect(commitments().length).toBe(n + 1)                                                    // a time stated as a fact is below the mark: nothing written
   const rec = readFileSync(join(dir, 'run', 'main-commitment.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).pop()
-  expect(rec).toMatchObject({ p: 0.05, deadline: 0.5, hit: false, wrote: false })
+  // 1.38.3 (WO-131 D): no sentence of it promises anything for later, so Jev is not asked at all (1.38.2 asked: p 0.05, deadline 0.5, below the mark)
+  expect(rec).toMatchObject({ form: false, hit: false, wrote: false }); expect(calls).toBe(c1)
+  process.env.LANES_PROMISE_FORM = '0'                                                        // the switch off: asked, whole, as 1.38.2
+  await send('mock-api 維護時段：每週三 02:00–03:00，下週三 11-18 為維護。'); await sleep(200)
+  expect(calls).toBe(c1 + 1); expect(commitments().length).toBe(n + 1)
+  const rec2 = readFileSync(join(dir, 'run', 'main-commitment.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).pop()
+  expect(rec2).toMatchObject({ p: 0.05, deadline: 0.5, hit: false, wrote: false }); expect(rec2.form).toBeUndefined()
+  delete process.env.LANES_PROMISE_FORM
 })
 
 test('C1: the main has a commitment tool; a send right after it does not record a second commitment', async () => {

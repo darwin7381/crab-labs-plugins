@@ -34,7 +34,9 @@ export function boundaryDefault(agent: string): string[] {
     `1. 用 ${agent} 的名義答應、核准、拒絕；或在有一項沒過、有一段沒查的時候，判定「沒事」。`,
     '2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。',
     `3. 只有主對話才知道的事：Joey 剛講的、談到一半的、${agent} 自己的標準。`,
-    '需要任何一樣：分的是「一步」，不是「一件」。你做得了的每一步都做完（讀、查、對數字、擬好回覆、備好指令），只把需要主線的那一步交出去，寫成：要你決定什麼／期限／關鍵事實與出處／我的建議與根據（查不到根據就寫「沒有建議」）／你說好之後還剩哪幾步。'
+    '需要任何一樣：分的是「一步」，不是「一件」。你做得了的每一步都做完（讀、查、對數字、擬好回覆、備好指令），'
+      // WO-131 (1.38.3, Chiron mail #11046, verbatim): the step goes to the main as a decision card (LANES_DECISIONS=0: the 1.37 words, no card tool)
+      + (decisionsOn() ? BOUNDARY_CARD_STEP : BOUNDARY_HANDOFF_STEP)
       + (decisionsOn() ? boundaryDecisionSentence() : ''),          // WO-127 item 8: the same line (the card's line count and hash do not change)
     '沒把握：交給主線，不猜著做完。',
     '回報照實際發生的寫：指示裡的步驟，哪幾步做了、哪幾步沒做，都列出來；有沒做的，結果不能填正常。寫入或指令被擋，就寫被擋，不寫已做。',
@@ -61,7 +63,11 @@ export const BOUNDARY_MAIN_RULE = '- 邊界卡 .lanes/boundary.md：分身每一
 // ------------------------------------------------------------------ WO-127: one round trip (the main answers one decision, the lane that asked finishes)
 // Chiron's ticket WO-127 (Joey 「那就試試看吧、記得同步紀錄觀察點」, TG chiron:2095; seam claude-epeius/knowledge/lane-mailbox-seam.md v2). The words of
 // item 8 are the ticket's, verbatim; the `main` reporter (LANES_DECISION_REPORTER=main) says who reports instead.
-/** item 8: the boundary card's sentence, right after 「…你說好之後還剩哪幾步。」 (on the same line) */
+/** WO-125 A.2: the step that needs the main, as 1.37.0 to 1.38.2 wrote it (and LANES_DECISIONS=0 still does: there is no card tool then) */
+export const BOUNDARY_HANDOFF_STEP = '只把需要主線的那一步交出去，寫成：要你決定什麼／期限／關鍵事實與出處／我的建議與根據（查不到根據就寫「沒有建議」）／你說好之後還剩哪幾步。'
+/** WO-131 (1.38.3, Chiron mail #11046): how the step that needs the main is handed over, in the boundary card's 「需要任何一樣：…」 sentence */
+export const BOUNDARY_CARD_STEP = '只把需要主線的那一步交出去：用 decide_later 開一張決定卡（同事的來信用 mailbox_card 附在那封信上），五格：要你決定什麼／期限／關鍵事實與出處／我的建議與根據（查不到根據就寫「沒有建議」）／你說好之後我會做什麼。整件只能主線自己做的才用 handoff_main。'
+/** item 8: the boundary card's sentence, right after the step's words (on the same line) */
 export const BOUNDARY_DECISION_SENTENCE = '主線回了決定：照決定把剩下的做完，向 Joey 回報一次，寫明是照主線的決定。做不下去就整件交給主線，不再問第二次。'
 const BOUNDARY_DECISION_SENTENCE_MAIN = '主線回了決定：照決定把剩下的做完（這件事由主線向 Joey 回報）。做不下去就整件交給主線，不再問第二次。'
 export const boundaryDecisionSentence = (): string => decisionReporter() === 'main' ? BOUNDARY_DECISION_SENTENCE_MAIN : BOUNDARY_DECISION_SENTENCE
