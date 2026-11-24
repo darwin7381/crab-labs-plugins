@@ -55,7 +55,9 @@ test('B19: the started processes get the same --append-system-prompt; the lane d
   expect(d2.lane).not.toBe(d1.lane)
   expect(await until(() => argvs().length >= 2)).toBe(true)
   const all = argvs()                                                              // the two processes start together: find each by its lane
-  const x = all.find(a => after(a, '-p').includes(d1.lane!))!, y = all.find(a => after(a, '-p').includes(d2.lane!))!
+  // by the lane's own id line: since 1.40.0 (WO-132 run context) the other lane's prompt lists this lane under 「此刻還在跑的分身」 too
+  const own = (id: string) => (a: string[]) => after(a, '-p').includes(`lane id：${id}；`)
+  const x = all.find(own(d1.lane!))!, y = all.find(own(d2.lane!))!
   expect(after(x, '--append-system-prompt-file')).toBe(after(y, '--append-system-prompt-file'))   // 002l (D15): one file per kind
   const px = after(x, '-p'), py = after(y, '-p')
   expect(px).toContain(d1.lane!); expect(px).toContain('QQ-1'); expect(px).not.toContain('分流器標記：嚴重警報')
