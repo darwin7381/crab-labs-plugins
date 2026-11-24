@@ -335,23 +335,28 @@ test('WO-131 A, reflex lanes are unchanged: a reflex lane whose thread is past 6
 // ------------------------------------------------------------------ B: the words (Chiron mail #11046), verbatim
 const MAIL_LINE_3 = '- 要主線的信（要代表 adam 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：在那封信上附決定卡（mailbox_card），五格：要 adam 決定什麼／期限／信裡的關鍵事實與出處（數字、檔案位置、它給的選項）／你的建議和根據（查不到根據就寫「沒有建議」）／主線說好之後你會做什麼。附完用 handoff_main 交回，一句話列出附了卡的 #id 和各要決定什麼，卡的內容不用再寫一次。那一封不要勾掉。主線用 mailbox_decide 回了決定，你會被叫起來照決定做完。整件只能主線自己做的（收不回的動作、要它這段對話才知道的事、工單驗收）：不附卡，用 handoff_main 把 #id、寄件人、期限、它要什麼、關鍵事實寫清楚交回。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。'
 const BOUNDARY_STEP = '只把需要主線的那一步交出去：用 decide_later 開一張決定卡（同事的來信用 mailbox_card 附在那封信上），五格：要你決定什麼／期限／關鍵事實與出處／我的建議與根據（查不到根據就寫「沒有建議」）／你說好之後我會做什麼。整件只能主線自己做的才用 handoff_main。'
+// 1.41.0 (WO-128 final, Chiron on the ticket 2026-11-24 13:00Z): with LANES_DEFER_DECISIONS on, line 3 is Chiron's step-3 line (lanes-wo128-final pins it);
+// #11046's line is the switch-off one
 test('WO-131 B: the mail lane\'s line 3 and the boundary card\'s step, verbatim; the WO-127 sentence still follows; the mail card\'s hash changes (a resumed mail lane gets the new card once); LANES_DECISIONS=0 keeps the old words', async () => {
+  process.env.LANES_DEFER_DECISIONS = '0'
+  try { expect(L.identityCard({ kind: 'mail' }).split('\n')).toContain(MAIL_LINE_3) } finally { delete process.env.LANES_DEFER_DECISIONS }
   const card = L.identityCard({ kind: 'mail' }).split('\n')
-  expect(card).toContain(MAIL_LINE_3)
+  expect(card).not.toContain(MAIL_LINE_3)
+  const LINE_3 = card.find(l => l.startsWith('- 要主線的信'))!
   expect(card.filter(l => l.startsWith('- 要主線的信')).length).toBe(1)
   const line = B.boundaryDefault('adam').find(l => l.startsWith('需要任何一樣：'))!
   expect(line).toBe('需要任何一樣：分的是「一步」，不是「一件」。你做得了的每一步都做完（讀、查、對數字、擬好回覆、備好指令），' + BOUNDARY_STEP + B.BOUNDARY_DECISION_SENTENCE)
   expect(B.boundaryDefault('adam').length).toBe(11)                                                   // WO-132 (1.40.0) added the production line
   // the 1.38.2 line, put back: another hash. A mail lane whose session got the old card gets the new one in its next run, once
   const old = '- 要主線的信（要代表 adam 答應或決定、要做不可逆的事、要主線手上的脈絡或工具）：用 handoff_main 交回，寫到主線不用再打開信就能決定：#id、寄件人、期限；它要 adam 決定或做什麼；信裡的關鍵事實（數字、檔案位置、它給的選項）；你的建議和根據（查不到根據就寫「沒有建議」）；你沒查的。那一封不要勾掉，主線處理完自己勾。焦點卡上寫「交回主線」的類別，意思是由主線決定，不是不讓你讀：照樣打開、照樣整理。'
-  const was = L.__setKindLinesForTest((kind, lines) => kind === 'mail' ? lines.map(l => l === MAIL_LINE_3 ? old : l) : lines)
+  const was = L.__setKindLinesForTest((kind, lines) => kind === 'mail' ? lines.map(l => l === LINE_3 ? old : l) : lines)
   const oldHash = L.cardHash('mail')
   L.__setKindLinesForTest(was)
   expect(L.cardHash('mail')).not.toBe(oldHash)
   const m = st().mail_lane!
   st().lanes[m].card_hash = oldHash
   const r = await start(reminder()); expect(r.lane).toBe(m)
-  expect(r.prompt).toContain(L.CARD_UPDATED_HEAD); expect(r.prompt).toContain(MAIL_LINE_3)
+  expect(r.prompt).toContain(L.CARD_UPDATED_HEAD); expect(r.prompt).toContain(LINE_3)
   await end(r)
   const r2 = await start(reminder()); expect(r2.prompt).not.toContain(L.CARD_UPDATED_HEAD); await end(r2)
   process.env.LANES_DECISIONS = '0'

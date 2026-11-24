@@ -1,7 +1,8 @@
 ## 1.41.0 — 2026-11-24
 
-- **Lanes on: what can wait does not wake the main (WO-128, Chiron; Joey TG chiron:2081, 2083, 2095 「那就試試看吧、記得同步紀錄觀察點」; agent-inbox 1.10.0 carries the same code).
-  Built now, deployed later: it needs a running main that has `mailbox_decide` (1.38.1).**
+- **Lanes on: what can wait does not wake the main (WO-128, Chiron; Joey TG chiron:2081, 2083, 2095 「那就試試看吧、記得同步紀錄觀察點」; agent-inbox 1.11.0 carries the same code).
+  It needed a running main that has `mailbox_decide` (1.38.1): resolved (Chiron 13:00Z: WO-126 closed, all 42 mains reach it). Final words and mechanism:
+  the last bullet (Chiron on the ticket, 2026-11-24 13:00Z).**
   - **Why (the ticket):** a lane had two ways to the main: record (no wake) or hand over (woken now, pushed to Joey after 300 s). A decision that can
     wait took the loudest one: on 11-23 the main was woken by lanes 63 times in 18 hours, each time re-reading its whole conversation. The rule now is
     the three lines toward a colleague: nothing for the main → record; the main must decide but it can wait → its mailbox, not woken; it cannot wait
@@ -54,6 +55,49 @@
     Tests adjusted: lanes-wo128 item 5 (11 lines; WO-132's line follows WO-128's), lanes-wo132 #1 (the production line follows WO-128's line) and #4
     (`decide_later` wakes the main with `urgent_because`; one that can wait: the event carries the line and its due wake's item has it). Suite on this
     branch: 977 (973 pass, 3 skip, 1 fail: lanes-topics-richlines' log-line test under load, passes alone twice); 1.40.0: 967 (964 pass, 3 skip, 0 fail).
+  - **Final (Chiron on the ticket, 2026-11-24 13:00Z, 「照這一則做完就可以上線」; Sonn 13:15Z):**
+    - **二, the mail lane's line 3 (Chiron's words, verbatim, in place of #11046's; `LANES_DEFER_DECISIONS=0`: #11046's):** every mail for the main gets a
+      card, a mail only the main can do too (工單驗收: 「整件只能主線自己做的就寫『無，主線自己做』」; the main closes it with `mailbox_check`, 1.38.0).
+      Can it wait decides the wake. The mail card's hash changes (a resumed mail lane gets the new card once); the other kinds' do not.
+    - **二, the mechanism:** a card without `urgent_because` waits as before (no wake) and the lane stop never asks for `handoff_main` (`laneStop`: the
+      cards question is off with the switch on). With `urgent_because` the system wakes the main when the card is attached (`cardWake`), no
+      `handoff_main` needed: a hand-over of its own (〔要你決定｜ho-…｜信箱 #id〕「…在一封要你決定的信上附了決定卡」, the 等不起 line, the card, how to
+      answer, WO-132's 〔系統〕 blocked line); the run's event already waiting in the mailbox (an earlier card of the run that can wait): that hand-over is
+      woken with this card; the main already holding the event's item (an earlier card that cannot wait): one more item of the same hand-over
+      (`addToMain`; the hand-over is met when the main is done with the last item; the 300 s count is the first wake's). The tool's answer says not to
+      hand the card over. `handoff_main` stays for 「這一趟自己出了狀況、要整件交回」: after a card that can wait it wakes the matter (as before); after one
+      that cannot wait it is one more item of that hand-over (it would have been refused as handed already).
+    - **三, the card's deadline:** the card's own; else the mail's (BTCC falls back to it); a mail with none (a program's mail: board, alert-dispatcher;
+      「期限 —」): an hour from when it is attached (`CARD_DEFAULT_DEADLINE_H` 1, BTCC's `lane_item_deadline_h` default, not read from BTCC). BTCC gives
+      such a card `mail_deadline_h` (24 h), so the main was not woken for a day. The lanes ask for it (`default_deadline_h: 1` in mailbox_card's args,
+      switch on only, not sent to BTCC); fleet-mail.ts `cardDeadline` reads the mail (`GET /api/mesh/mail/{id}?by=lane`, as 1.38.3's lookup; the card makes
+      it lane_read anyway) and fills `card.deadline` before `POST /{id}/card`; the mail unreadable: an hour (an early wake, never none). A colleague's mail
+      sent without a deadline carries BTCC's 24 h default in its record, which the read cannot tell from one the sender set: it is used. A deadline written
+      only in the mail's text (Chiron #11059 item 2) is the lane's to put on the card (line 3: 「期限（信有寫就照信…）」).
+      **The due wake, the real number:** the agent-inbox daemon reads `/due?within=900` every 60 s (mail-events.ts, server.ts; Epeius's, unchanged), so an
+      hour's card is handed over once, between 45:00 and 46:00 after it is attached (Chiron wrote about 55 minutes; that needs the window at 300 s).
+    - **四, a critical alert's run:** a card opened in a run whose event set has an event of class critical (its own alert, or one WO-132's incident merge
+      put into it: the run raised, riding in it, or handed to the run in progress and not reached yet) cannot wait, decided by the system whatever
+      `urgent_because` says (`criticalRun`; `urgent_by: "critical"` on the router's record and the ledger row's refs; the item's line 「等不起（系統判定：
+      這一趟處理的是嚴重警報，這一趟開的卡一律當等不起）」, then the lane's words if any; the tool's answer says so). Runs that follow 「正式服務正在壞」 hand
+      over with `handoff_main` (WO-132) and wake the main at once, also after a card of the run that can wait (tested).
+    - **四、其他:** the boundary card keeps WO-128's line in place of 「沒把握：…」 and WO-132's production line right after it (tested).
+    - **Switch off (`LANES_DEFER_DECISIONS=0`) = 1.40.0:** against 133c474, the boundary card, the main's rules, and every lane kind's card, hash and tool
+      list are identical (a dump of both; only the curator card's temp memory path differs); no `default_deadline_h` (BTCC's fallback, as 1.40.0); a mail
+      card asks for `handoff_main` and the lane stop asks once; a critical run's card has no `urgent_by`. `lanes-wo127` (pins the switch off) unchanged.
+    - **Tests:** `lanes-wo128-final` (8, named after Chiron's points): 二 the words and the boundary card; 二 a mail-lane card without urgent_because (no
+      wake, no handoff asked, no push) and with it (the main woken at once with the card); 三 a board notice's card that can wait, the main never woken
+      otherwise: the card an hour out, mail-events.ts's real ticks over a BTCC stand-in hand over one `mail_due` at 45 minutes, one wake (cause `due`);
+      三 the deadline rule (its own / the mail's / none / unreadable / not asked); 四 replay of kot.reflex.3 (alert 1356's text, a `decide_later` with no
+      urgent_because: the main woken at once, urgent_by critical; with a reason too: both on the item); 四 a critical alert merged into a warning run
+      (raised; on its way); 四 「正式服務正在壞」 (handoff_main, and after a card that can wait); the switch off. Adjusted to the 13:00Z mechanism:
+      `lanes-wo128`'s mail-lane test (an urgent card wakes the main by itself, no handoff asked; handoff_main after it adds an item; a third run:
+      handoff_main after a card that can wait) and item 5 (the mail card's hash now changes with the switch); `lanes-wo131` B (#11046's line under the
+      switch off, the new line by default). Suite: 985 (982 pass, 3 skip, 0 fail); a first run under
+      load had 50 fail from one flake (lanes-wo132 #2+#3's 「自 HH:MM 起」 crossed a minute; its open run then wrote into removed temp dirs, unhandled
+      errors in later files): the 23 files pass alone, and the rerun is clean.
+    - **Not changed here:** the mail lane's line 5 still says a board ticket 「要你接手做的單，交給主線（handoff_main）」 (not in Chiron's note: his line 3
+      now sends a mail only the main can do as a card); BTCC; Epeius's due window.
 
 ## 1.40.0 — 2026-11-24
 

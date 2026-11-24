@@ -221,6 +221,18 @@ function hoursOrIso(v: unknown): string | number | undefined {
   return /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : s
 }
 
+/** WO-128 (telegram-http 1.41.0, Chiron on the ticket 2026-11-24 13:00Z): the card always carries a deadline, since the due wake is 15 minutes before it:
+ *  the card's own; else the mail's (BTCC falls back to it); a mail without one (a program's mail, e.g. a board notice: 「期限 —」): `hours` from now. BTCC
+ *  would give that card `mail_deadline_h` (24) and the main would not be woken for a day. Only when the lanes ask for it (`default_deadline_h`, sent with
+ *  LANES_DEFER_DECISIONS on); the mail is read by=lane (the card makes it lane_read anyway). Unreadable: `hours` from now (an early wake, never none). */
+async function cardDeadline(id: number, card: any, hours: unknown, deps: FleetDeps): Promise<any> {
+  const h = Number(hours)
+  if (!(h > 0) || (card.deadline != null && String(card.deadline).trim() !== '')) return card
+  const m = await deps.btcc('GET', `/api/mesh/mail/${id}?by=lane`).catch(() => null)
+  if (m?.status === 200 && m.json?.deadline) return card
+  return { ...card, deadline: new Date(Date.now() + h * 3600_000).toISOString() }
+}
+
 function intId(v: unknown): number | null {
   const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10)
   return Number.isInteger(n) && n > 0 ? n : null
@@ -404,7 +416,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       }
       const id = intId(args.id)
       if (!id) return text('mailbox_card: id 要填信的編號', true)
-      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/card?by=lane`, { lane: deps.lane, ...(thread ? { thread } : {}), card })
+      const r = await deps.btcc('POST', `/api/mesh/mail/${id}/card?by=lane`, { lane: deps.lane, ...(thread ? { thread } : {}), card: await cardDeadline(id, card, args.default_deadline_h, deps) })
       if (r.status !== 200) return text(`沒有附上：${errText(r)}`, true)
       return text(`#${id} 附上決定卡了（決定期限 ${hm(r.json.deadline)}）。主線的清單會列出它；主線回決定後交回這條線做完。${r.json.card_truncated ? '卡上有格子超過 600 字，已截短；長的寫成檔、放位置。' : ''}`)
     }

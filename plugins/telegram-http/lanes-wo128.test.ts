@@ -359,7 +359,9 @@ test('WO-128 #6: open-handoffs.md lists no cards (can wait or not, a lane item o
 }, 40000)
 
 // ------------------------------------------------------------------ the mail lane, and a lane that finds it cannot wait after all
-test('WO-128: the mail lane\'s card that can wait needs no hand-over (the lane stop does not ask; its line to Joey is the decision run\'s); handoff_main in the same run wakes the main after all (urgent_handoff), and the 300 s count starts there', async () => {
+// 1.41.0 final (Chiron on the ticket, 2026-11-24 13:00Z, 二): a mail-lane card with urgent_because wakes the main by itself (it no longer asks for handoff_main);
+// handoff_main stays for 「這一趟自己出了狀況、要整件交回」 (after a card that can wait: wakes the matter; after one that cannot: one more item of its hand-over)
+test('WO-128: the mail lane\'s card that can wait needs no hand-over (the lane stop does not ask; its line to Joey is the decision run\'s); one with urgent_because wakes the main by itself (no handoff_main asked; urgent_handoff); handoff_main after either still reaches the main; the 300 s count starts at the wake', async () => {
   const k = sent.length, w0 = wakes().length
   const w = await start(reminder())
   await call(w, 'mailbox_open', { id: 8821 })
@@ -369,31 +371,42 @@ test('WO-128: the mail lane\'s card that can wait needs no hand-over (the lane s
   await call(w, 'receipt', { outcome: 'done', happened: '1 封', did: '附卡', promised: '無', needs_main: '#8821' })
   expect(await end(w)).toMatchObject({ card_urgency: 'defer' })
   expect(itemsOf(w.id)).toEqual([]); expect(sent.slice(k)).toEqual([])
-  // another run: a card that can wait, then one that cannot; the lane hands over: the main is woken, the urgent card rides the text
+  // another run: a card that can wait, then one that cannot: the system wakes the main with the urgent card; the lane stop asks nothing
   const w2 = await start(reminder())
   await call(w2, 'mailbox_open', { id: 8822 }); await call(w2, 'mailbox_open', { id: 8823 })
   await call(w2, 'mailbox_card', { id: 8822, card: { decide: '8822 要不要答應', recommend: '答應' } })
-  expect(await call(w2, 'mailbox_card', { id: 8823, card: { decide: '8823 要不要退款', recommend: '退' }, urgent_because: '客戶今天中午前要答覆' })).toContain('Hand it to the main with handoff_main')
-  const held = String(L.laneStop(w2.tok))
-  expect(held).toContain('#8823'); expect(held).not.toContain('#8822')                                // the one that cannot wait is asked about, once
-  expect(await call(w2, 'handoff_main', { text: '#8823 客戶要退款，今天中午前要答覆' })).toContain('it is woken now')
+  expect(await call(w2, 'mailbox_card', { id: 8823, card: { decide: '8823 要不要退款', recommend: '退' }, urgent_because: '客戶今天中午前要答覆' })).toContain('It cannot wait: the main is woken now with this card')
+  expect(L.laneStop(w2.tok)).toBeNull()                                                                // no handoff_main asked for
   const o = ob(w2.id, 'main')
-  expect(o).toMatchObject({ state: 'open', defer: true, woke: 'urgent' }); expect(o.item).toBeTruthy(); expect(o.due_at).toBeGreaterThan(Date.now() + 290_000)
+  expect(o).toMatchObject({ state: 'open', defer: true, woke: 'urgent', card: true }); expect(o.item).toBeTruthy(); expect(o.due_at).toBeGreaterThan(Date.now() + 290_000)
   const c = contentOf(itemsOf(w2.id).at(-1)!.notif)
-  expect(c).toContain('#8823 客戶要退款'); expect(c).toContain('── 信 #8823 的決定卡 ──\n等不起：客戶今天中午前要答覆'); expect(c).not.toContain('── 信 #8822')
-  await call(w2, 'receipt', { outcome: 'done', happened: '2 封', did: '附卡、交主線', promised: '無', needs_main: '#8823' })
+  expect(c).toContain(`〔要你決定｜${o.handoff}｜信箱 #8823〕`); expect(c).toContain(`等不起（${w2.lane} 寫的）：客戶今天中午前要答覆`); expect(c).toContain('要你決定：8823 要不要退款')
+  expect(c).not.toContain('8822')
+  // the run itself went wrong: handoff_main is one more item of the same hand-over (not refused as handed already)
+  expect(await call(w2, 'handoff_main', { text: '#8824 打不開（mailbox_open 回 500），請主線看' })).toContain('your text goes to it with the hand-over its card already woke it for')
+  expect(itemsOf(w2.id).length).toBe(2); expect(ob(w2.id, 'main').item).toBe(itemsOf(w2.id).at(-1)!.id)
+  expect(contentOf(itemsOf(w2.id).at(-1)!.notif)).toContain('#8824 打不開')
+  await call(w2, 'receipt', { outcome: 'done', happened: '3 封', did: '附卡', promised: '無', needs_main: '#8823、#8824' })
   expect(await end(w2)).toMatchObject({ card_urgency: ['defer', 'urgent'] })
+  // a third run: a card that can wait, then handoff_main (it cannot wait after all): the matter is woken
+  const w3 = await start(reminder())
+  await call(w3, 'mailbox_open', { id: 8825 })
+  await call(w3, 'mailbox_card', { id: 8825, card: { decide: '8825 要不要答應', recommend: '答應' } })
+  expect(await call(w3, 'handoff_main', { text: '#8825 寄件人說今天中午前要答覆' })).toContain('it is woken now')
+  expect(ob(w3.id, 'main')).toMatchObject({ state: 'open', defer: true, woke: 'urgent' })
+  await call(w3, 'receipt', { outcome: 'done', happened: '1 封', did: '附卡、交主線', promised: '無', needs_main: '#8825' })
+  await end(w3)
   L.dueTick(o.due_at + 1); await sleep(20)                                                             // no main: 300 s after the wake, one push as for any hand-over
   expect(sent.slice(k).filter(s => s.text.includes('原本交給主線處理') && s.text.includes('#8823')).length).toBe(1)
   const m0 = await mainUp()
   expect(await until(() => wakes().length > w0)).toBe(true)
-  expect(wakes().slice(w0)).toMatchObject([{ cause: 'urgent_handoff', event: w2.id }])
+  expect(wakes().slice(w0)[0]).toMatchObject({ cause: 'urgent_handoff', event: w2.id })
   await m0.kill()
-  settle(w.id, w2.id)
+  settle(w.id, w2.id, w3.id)
 }, 40000)
 
 // ------------------------------------------------------------------ 5 (words), 10: the switch
-test('WO-128 item 5: the words, verbatim: the boundary card\'s line replaced (10 lines, card_hash unchanged); the main\'s rule right after the decision card\'s; both tools take urgent_because (not sent to BTCC)', () => {
+test('WO-128 item 5: the words, verbatim: the boundary card\'s line replaced (10 lines, card_hash unchanged; the mail card\'s changes with the 13:00Z line 3); the main\'s rule right after the decision card\'s; both tools take urgent_because (not sent to BTCC)', () => {
   const card = B.boundaryDefault('adam')
   expect(card.length).toBe(11)                                                                     // 1.41.0: WO-132 (1.40.0) put its production line right after this one
   expect(card[6]).toBe('要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。')
@@ -408,7 +421,9 @@ test('WO-128 item 5: the words, verbatim: the boundary card\'s line replaced (10
   expect(dl.inputSchema.required).toEqual(['title', 'card'])
   const h = Object.fromEntries((['reflex', 'mail', 'worker'] as const).map(k => [k, L.cardHash(k)]))
   process.env.LANES_DEFER_DECISIONS = '0'
-  try { for (const k of ['reflex', 'mail', 'worker'] as const) expect(L.cardHash(k)).toBe(h[k]) } finally { delete process.env.LANES_DEFER_DECISIONS }
+  // 1.41.0 final: the mail lane's line 3 is Chiron's 13:00Z words with the switch on, 1.38.3's with it off: the mail card's hash differs (a resumed mail lane
+  // gets the new card once); the others do not
+  try { for (const k of ['reflex', 'worker'] as const) expect(L.cardHash(k)).toBe(h[k]); expect(L.cardHash('mail')).not.toBe(h.mail) } finally { delete process.env.LANES_DEFER_DECISIONS }
 })
 
 test('WO-128 #10: LANES_DEFER_DECISIONS=0 = 1.38: no urgent_because, the old card line, no main rule; every card wakes the main; no mailbox block in the digest or the context; open-handoffs lists the card; mail_due is information; no main_wake row, no card_urgency', async () => {
