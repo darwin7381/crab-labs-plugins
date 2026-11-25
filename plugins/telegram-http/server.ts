@@ -2895,6 +2895,20 @@ bot.on('callback_query:data', async ctx => {
 
   // Onsen step 2 (WO-142): the button under the /clear reply, 「讓它看得到之前的」: lifts the restart line that /clear drew (olift:<line id|->:<the /clear
   // message id>; `-`: the draw was still in the spool, lifted behind it). Allowlisted users only. The reply says it and loses the button.
+  // WO-145 point 5: 「不要顯示這則」 under the status message: stop it in this chat (remembered) and delete it. Allowlisted users only.
+  if (data === 'opin:off') {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chat = String((ctx.callbackQuery.message as any)?.chat?.id ?? senderId)
+    if (!statusPinRef) { await ctx.answerCallbackQuery({ text: '已經不顯示了' }).catch(() => {}); return }
+    const id = await statusPinRef.dismiss(chat)
+    log('info', `onsen: status message dismissed by tg:${senderId} in chat ${chat} (message ${id})`)
+    await ctx.answerCallbackQuery({ text: '不再顯示這則' }).catch(() => {})
+    return
+  }
   if (data.startsWith('olift:')) {
     const senderId = String(ctx.from.id)
     if (!loadAccess().allowFrom.includes(senderId)) {
@@ -4338,6 +4352,10 @@ if (Lanes.LANES_ON) {
 //              / pid reused / no stream of it here) | idle | busy | waiting | stuck (busy, nothing written for ONSEN_STUCK_S). Detail only: lanes on, the
 //              main's M2 row and hook events (the tool, subagents, PreCompact, its own wall); lanes off, the transcript's turn; both, the usage-wall
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
+/** WO-145 point 5 (Chiron 06:04Z): one button under the status message; it stops the message in that chat and deletes it */
+const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callback_data: 'opin:off' }]] }
+/** the status pin of this daemon (null: ONSEN_STATUS_PIN off), for the button's callback */
+let statusPinRef: OnsenVisible.StatusPin | null = null
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000),
     ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}) })   // WO-145: ✍ when the main takes it in
@@ -4347,6 +4365,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const kick = (): void => { if (!kickTimer) { kickTimer = setTimeout(() => { kickTimer = null; try { feed(compute()) } catch {} }, 25); (kickTimer as any).unref?.() } }
   // WO-145 (ONSEN_STATUS_PIN): the same view, shown in a pinned silent message in each DM chat of an allowlisted person (onsen-visible.ts StatusPin)
   const pin = ONSEN_VISIBLE.pin ? statusPinSetup() : null
+  statusPinRef = pin?.pin ?? null
   const feed = (v: OnsenStatus.StatusView): void => { status.update(v); try { pin?.show(v) } catch (e) { log('warn', `onsen: status pin: ${e}`) } }
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
@@ -4398,9 +4417,10 @@ function statusPinSetup(): { pin: OnsenVisible.StatusPin; show: (v: OnsenStatus.
   const bounded = <X>(p: Promise<X>, what: string): Promise<X> => Promise.race([p, new Promise<never>((_, rej) => { const t = setTimeout(() => rej(new Error(`${what}: no answer in ${T / 1000} s`)), T); (t as any).unref?.() })])
   const pin = new OnsenVisible.StatusPin({ dir: join(STATE_DIR, 'onsen'), log, api: {
     // outside every topic (lanes-topics: explicitly the ordinary conversation): the status is about the agent, not about one line of work
-    send: async (chat, text) => (await Onsen.withSender('system:status', () => bot.api.sendMessage(chat, text, { disable_notification: true, ...topicFields({ chat, topic: '0' }) }))).message_id,
+    send: async (chat, text) => (await Onsen.withSender('system:status', () => bot.api.sendMessage(chat, text, { disable_notification: true, reply_markup: STATUS_PIN_KB, ...topicFields({ chat, topic: '0' }) }))).message_id,
     pin: (chat, id) => bounded(bot.api.pinChatMessage(chat, id, { disable_notification: true }), 'pinChatMessage'),
-    edit: (chat, id, text) => Onsen.withSender('system:status', () => bot.api.editMessageText(chat, id, text)),
+    edit: (chat, id, text) => Onsen.withSender('system:status', () => bot.api.editMessageText(chat, id, text, { reply_markup: STATUS_PIN_KB })),
+    del: (chat, id) => bounded(bot.api.deleteMessage(chat, id), 'deleteMessage'),
     pinnedId: async chat => { const c: any = await bounded(bot.api.getChat(chat), 'getChat'); return c?.pinned_message?.message_id ?? null },
   } })
   const pending = new OnsenVisible.PendingTracker()

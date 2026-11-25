@@ -227,6 +227,21 @@ describe('the pinned status message', () => {
       edit: async (c, id, t) => { note(`edit ${c} ${id} ${t}`) }, pinnedId: async () => 901 }
     return { pin: new StatusPin({ dir: mkdtempSync(join(tmpdir(), 'onsen-vis-pinr-')), api, log, minEditMs: 300 }), calls, at }
   }
+  test('1.48.2: the 「不要顯示這則」 button: dismiss deletes the message, writes the marker, and nothing is sent or edited there again (a restart too)', async () => {
+    const { pin, calls, dir, clock } = mk()
+    const dels: string[] = []
+    ;(pin as any).o.api.del = async (c: string, id: number) => { dels.push(`${c}:${id}`) }
+    pin.update('1828', 'A'); await flush()
+    expect(await pin.dismiss('1828')).toBe(901)
+    expect(dels).toEqual(['1828:901'])
+    expect(pin.isOff('1828')).toBe(true)
+    const n = calls.length
+    clock.t += 10_000; pin.update('1828', 'B'); await flush()
+    expect(calls.length).toBe(n)
+    const again = new StatusPin({ dir, api: (pin as any).o.api, log, now: () => clock.t })
+    again.update('1828', 'C'); await flush()
+    expect(calls.length).toBe(n)
+  })
   test('sent and pinned once; the same text: nothing; a change: one edit; changes within 5 s: coalesced, the last one wins', async () => {
     const { pin, calls, clock } = mk()
     pin.update('1828', 'A'); await flush()

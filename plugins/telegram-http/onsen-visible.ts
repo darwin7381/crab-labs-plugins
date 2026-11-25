@@ -242,6 +242,8 @@ export type PinApi = {
   edit: (chat: string, id: number, text: string) => Promise<unknown>
   /** getChat(chat).pinned_message?.message_id (null: nothing pinned) */
   pinnedId: (chat: string) => Promise<number | null>
+  /** deleteMessage (the 「不要顯示這則」 button) */
+  del?: (chat: string, id: number) => Promise<unknown>
 }
 type Slot = { message_id: number | null; pinned: boolean; text: string | null; want: string | null; lastEditAt: number; lastCheckAt: number; busy: boolean
   timer: ReturnType<typeof setTimeout> | null; retryAt: number }
@@ -301,7 +303,18 @@ export class StatusPin {
     this.persist()
   }
   /** Joey does not want it in this chat: the marker file, the message forgotten (deleting the marker starts a new one) */
-  private stop(chat: string, s: Slot, why: 'unpinned' | 'deleted'): void {
+  /** the 「不要顯示這則」 button (Chiron WO-145 point 5, 06:04Z): stop in this chat as an unpin would (the marker, remembered across restarts), and
+   *  delete the message. The message id it deleted, or null when there was none. */
+  async dismiss(chat: string): Promise<number | null> {
+    const v = this.saved.chats[chat]
+    const s: Slot = this.slots.get(chat) ?? { message_id: v?.message_id ?? null, pinned: !!v?.pinned, text: v?.text ?? null, want: null, lastEditAt: 0, lastCheckAt: 0,
+      busy: false, timer: null, retryAt: 0 }
+    const id = s.message_id
+    this.stop(chat, s, 'dismissed')
+    if (id != null && this.o.api.del) { try { await this.o.api.del(chat, id) } catch (e) { this.o.log('warn', `onsen: deleting the status message ${id} in chat ${chat} failed (${errText(e)})`) } }
+    return id
+  }
+  private stop(chat: string, s: Slot, why: 'unpinned' | 'deleted' | 'dismissed'): void {
     try {
       mkdirSync(this.o.dir, { recursive: true, mode: 0o700 })
       writeFileSync(this.offFile(chat), JSON.stringify({ chat, why, message_id: s.message_id, at: new Date(this.now()).toISOString(),

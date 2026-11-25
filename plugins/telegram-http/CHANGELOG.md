@@ -1,3 +1,7 @@
+## 1.48.2 — 2026-11-25
+
+- **Pinned status (WO-145 point 5, Chiron 06:04Z): one button under it, 「不要顯示這則」.** Pressing it (allowlisted users only) stops the status message in that chat, deletes it, and writes the stop marker (`<STATE_DIR>/onsen/status-pin-off-<chat>.json`, remembered across restarts; delete the file to start again). Deleting the message, or unpinning it for both sides, still counts the same. Why a button: in a private chat an unpin can be one-sided, and the bot neither hears of it nor sees it (`getChat` still shows its message pinned; lab 05:46Z). The button rides every edit (`reply_markup`). agent-inbox 1.18.2 carries the same code.
+
 ## 1.48.1 — 2026-11-25
 
 - **Onsen status (WO-143/145): a registry file younger than 5 s is not judged by its shape** (`REG_YOUNG_MS`). A session that just started writes its file before every field is filled (lab 05:46Z: the main's own 63377.json sent the daemon to the CLI for 10 min).
