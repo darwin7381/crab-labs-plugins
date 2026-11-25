@@ -130,3 +130,6 @@ plugins/telegram-http/onsen-inbox.ts::export function recipientNote
 plugins/telegram-http/onsen-inbox.ts::的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。
 plugins/telegram-http/lanes.ts::自動不用回。只在有結果、做不了、或要對方補東西時回
 plugins/telegram-http/lanes.ts::function laneOfRun
+plugins/telegram-http/lanes-threads.ts::export function threadTitle
+plugins/telegram-http/lanes.ts::function retitleThreads
+plugins/telegram-http/lanes.ts::note: typeof note === 'string' && note ? note : undefined

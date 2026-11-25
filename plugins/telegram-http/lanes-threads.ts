@@ -106,8 +106,9 @@ export type LastItem = { id: string; kind: string; at: string; preview: string }
 /** one thread as Onsen gets it */
 export type ThreadView = { thread: string; key_kind: KeyKind; key: string; title?: string | null; owner: string | null; state: ThreadState
   snooze_until?: string | null; last_item?: LastItem | null }
-/** what Onsen was last told about a thread (n: the per-thread event counter of the dedupe) */
-export type Sent = { owner: string | null; state: ThreadState; item: string | null; n: number }
+/** what Onsen was last told about a thread (n: the per-thread event counter of the dedupe). `title` (WO-164 titles): undefined = not known (a state file from
+ *  before it was kept): not compared */
+export type Sent = { owner: string | null; state: ThreadState; item: string | null; n: number; title?: string | null }
 export type OnsenThreadEvent = { thread: string; event: 'open' | 'assign' | 'transfer' | 'snooze' | 'close' | 'reopen' | 'item' | 'wait'; at: string; dedupe: string
   key_kind?: KeyKind; key?: string; title?: string; owner?: string | null; note?: string; snooze_until?: string; by?: string
   item?: { id: string; kind: string; at: string; text: string } }
@@ -128,7 +129,7 @@ export function threadEvents(v: ThreadView, sent: Sent | undefined, o: { at: str
     push(v.state === 'closed' ? 'close' : 'open', { key_kind: v.key_kind, key: v.key, ...(v.title ? { title: v.title } : {}), owner: v.owner, ...(item ? { item: itemOf(item) } : {}) })
     if (v.state === 'waiting_peer') push('wait')
     else if (v.state === 'snoozed' && v.snooze_until) push('snooze', { snooze_until: v.snooze_until })
-    return { events: out, sent: { owner: v.owner, state: v.state, item: item?.id ?? null, n } }
+    return { events: out, sent: { owner: v.owner, state: v.state, item: item?.id ?? null, n, title: v.title || null } }
   }
   const was = sent.state
   if (was === 'closed' && v.state !== 'closed') push('reopen')
@@ -140,18 +141,97 @@ export function threadEvents(v: ThreadView, sent: Sent | undefined, o: { at: str
     else if (v.state === 'waiting_peer') push('wait')
     else if (v.state === 'snoozed' && v.snooze_until) push('snooze', { snooze_until: v.snooze_until })
   }
-  return { events: out, sent: { owner: v.owner, state: v.state, item: item?.id ?? sent.item, n } }
+  // WO-164 titles: a new title (the start's retitling, threadTitle) is an ordinary change: Onsen takes a title on any event (onsen6 _apply), so the first event of
+  // this change carries it; with no other change, the event that keeps the state (open / wait / snooze). A closed thread is not retitled; Onsen cannot clear one.
+  let title = sent.title
+  if (v.title && sent.title !== undefined && v.title !== sent.title && v.state !== 'closed') {
+    if (out.length) out[0].title = v.title
+    else if (v.state === 'open') push('open', { title: v.title })
+    else if (v.state === 'waiting_peer') push('wait', { title: v.title })
+    else if (v.state === 'snoozed' && v.snooze_until) push('snooze', { snooze_until: v.snooze_until, title: v.title })
+    if (out.length) title = v.title
+  }
+  return { events: out, sent: { owner: v.owner, state: v.state, item: item?.id ?? sent.item, n, ...(title !== undefined ? { title } : {}) } }
 }
 /** an Onsen thread row (GET /threads) as `sent`: what Onsen holds now (n kept from the local count, so a dedupe never repeats) */
-export function sentOf(row: { owner?: unknown; state?: unknown; last_item?: unknown }, n: number): Sent {
+export function sentOf(row: { owner?: unknown; state?: unknown; last_item?: unknown; title?: unknown }, n: number): Sent {
   const st = String(row.state ?? 'open')
   const li = row.last_item as { id?: unknown } | null | undefined
   return { owner: row.owner == null ? null : String(row.owner), state: (['open', 'waiting_peer', 'snoozed', 'closed'].includes(st) ? st : 'open') as ThreadState,
-    item: li?.id != null ? String(li.id) : null, n }
+    item: li?.id != null ? String(li.id) : null, n, title: row.title == null || row.title === '' ? null : String(row.title) }
 }
 /** a title: the first line of the first item, at most 80 characters (Onsen masks and cuts it again) */
 export function titleOf(text: string): string {
   return Array.from(String(text ?? '').split('\n').map(s => s.trim()).find(Boolean) ?? '').slice(0, 80).join('')
+}
+
+// ------------------------------------------------------------------ titles from the key (Chiron WO-164 17:18Z, 「串的標題照串鍵取，不取第一則的全文」)
+// A schedule's thread was titled by its first run's whole line ([scheduled][wo164-acc][run:7170431][P3]…), and every later run and Onsen's open threads
+// showed it. Titles now come from the key (and, where the key does not say it, the item that opens the thread): schedule 「排程 <名字>」 (the name in the
+// header's second square bracket), ticket 「WO-<n>」 (「WO-<n> <title>」 when the item carries the ticket's title), alert 「事故 <host>」 (refs.incident
+// before '#'), mail the first mail's title, call 「<對方>：<第一句前 30 字>」, Joey 「Joey 私訊」 (「Joey 私訊／<話題名>」 in a topic of his DM). Anything
+// else (a thread of its own) keeps the first line of its first item; a call or a mail that is a thread of its own is still a call or a mail.
+/** the version of the titles: a thread titled by threadTitle carries it (lanes.ts title_v); the start retitles the open threads without it, once */
+export const TITLE_V = 2
+/** what a title is made of besides the key: the item that opens the thread (its kind as decideWake reads it, its sender, its text; a mail's own title; the
+ *  name of the topic it was written in) */
+export type TitleItem = { kind?: string | null; from?: string | null; text?: string | null; title?: string | null; topic_name?: string | null }
+const clip80 = (s: string): string => Array.from(s.replace(/\s+/g, ' ').trim()).slice(0, 80).join('')
+const firstLine = (text: unknown): string => String(text ?? '').split('\n').map(s => s.trim()).find(Boolean) ?? ''
+/** the schedule's name: the header's second square bracket (`[scheduled][wo164-acc][run:…]` → wo164-acc); null = none (an empty tag, no header) */
+export function scheduleNameOf(text: unknown): string | null {
+  const m = String(text ?? '').trimStart().match(/^\[scheduled\]\[([^\]\n]*)\]/i)
+  return m && m[1].trim() ? m[1].trim() : null
+}
+/** the ticket's title as the board's item carries it (BTCC board.py _push_text: `[board][WO-<n>][OP-…]? <why>：<title>`); null when the head is not
+ *  that ticket's */
+export function boardTitleOf(text: unknown, n: string): string | null {
+  const m = firstLine(text).match(/^\[board\]\[WO-(\d+)\](?:\[OP-[^\]]*\])?\s*(.*)$/i)
+  if (!m || m[1] !== n) return null
+  const i = m[2].indexOf('：')
+  const t = i >= 0 ? m[2].slice(i + 1).trim() : ''
+  return t || null
+}
+/** a mail's title: its own (a mailbox event's, the one this agent sent), else the pushed head without its mark (Onsen: 「【信】<title>」, a reply
+ *  「【回信】<title>」); '' = none */
+export function mailTitleOf(it: TitleItem): string {
+  if (it.title && String(it.title).trim()) return String(it.title).trim()
+  return firstLine(it.text).replace(/^【(?:回信|信)】\s*/, '').trim()
+}
+/** the first sentence of a text (up to 。！？!? or a full stop before a space, or the line's end), at most `n` characters */
+export function firstSentence(text: unknown, n = 30): string {
+  const s = firstLine(text).split(/[。！？!?]|\.(?=\s)/)[0].trim()
+  return Array.from(s).slice(0, n).join('')
+}
+/** the host of an incident key (`<host>#<first alert id>`, BTCC's refs.incident) */
+export function hostOf(key: string): string {
+  const m = String(key).match(/^(.*)#\d+$/)
+  return (m ? m[1] : String(key)).trim()
+}
+function callTitle(it: TitleItem): string {
+  const who = String(it.from ?? '').trim(), s = firstSentence(it.text)
+  if (!who) return titleOf(String(it.text ?? ''))
+  return s ? `${who}：${s}` : who
+}
+/** a thread's title from its key and the item that opens it (see above); '' = nothing to call it */
+export function threadTitle(kk: KeyKind, key: string, it: TitleItem): string {
+  switch (kk) {
+    case 'schedule': return clip80(`排程 ${scheduleNameOf(it.text) ?? `#${key}`}`)
+    case 'ticket': { const t = boardTitleOf(it.text, key); return clip80(t ? `WO-${key} ${t}` : `WO-${key}`) }
+    case 'incident': return clip80(`事故 ${hostOf(key)}`)
+    case 'mail': return clip80(mailTitleOf(it)) || titleOf(String(it.text ?? ''))
+    case 'peer_call': return clip80(callTitle(it))
+    case 'tg': {
+      const m = String(key).match(/^tg:([^:]*)(?::(.+))?$/)
+      if (m && m[1].startsWith('-')) return titleOf(String(it.text ?? ''))      // a group, not his DM: as before
+      const topic = m?.[2]
+      return clip80(topic ? `Joey 私訊／${String(it.topic_name ?? '').trim() || `#${topic}`}` : 'Joey 私訊')
+    }
+    default:
+      if (it.kind === 'peer_call') return clip80(callTitle(it))
+      if (it.kind === 'peer_mail') return clip80(mailTitleOf(it)) || titleOf(String(it.text ?? ''))
+      return titleOf(String(it.text ?? ''))
+  }
 }
 /** an item's preview: its text on one line, at most 80 characters */
 export function previewOf(text: string): string {

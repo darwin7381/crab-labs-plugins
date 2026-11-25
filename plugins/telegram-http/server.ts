@@ -4315,12 +4315,13 @@ if (Lanes.LANES_ON) {
         if (r?.status === 200 && Array.isArray(r.json?.due)) return { ok: true, items: r.json.due.map((d: any) => ({ id: Number(d.id), title: String(d.title ?? ''), decide: String(d.decide ?? ''), deadline: String(d.deadline ?? ''), overdue: d.overdue === true })) }
         return { ok: false, why: r ? `BTCC ${r.status}` : 'BTCC 連不上' }
       },
-      schedulerCall: async (runId, action, outcome, summary) => {
+      schedulerCall: async (runId, action, outcome, note) => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         try {
           const r = await fetch(`${BTCC_API_BASE}/api/scheduler/runs/${runId}/${action}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() },
-            body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'ok', ...(summary ? { summary } : {}) } : {}),   // 1.41.1: BTCC's outcomes are ok | nothing-to-do | failed
+            // 1.41.1: BTCC's outcomes are ok | nothing-to-do | failed. Receipt note (btcc-ack-auth): the line is `note` (bt-control-center scheduler.py complete_run reads note only)
+            body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'ok', ...(note ? { note } : {}) } : {}),
             signal: AbortSignal.timeout(6000),
           })
           // 1.41.1 (Metis mail #11280): a refusal says why (BTCC's detail), so the lanes can tell 「run is completed」 (409: met) from a refusal (the receipt stays owed)

@@ -101,7 +101,7 @@ test('threadEvents: the first carries the key; then only what changed (owner, it
   expect(threadEvents({ ...v, owner: null, state: 'open', last_item: { ...v.last_item, id: 'e3' } }, c.sent, { at: 't3', epoch: 'ep' }).events.map(e => e.event)).toEqual(['reopen', 'item'])
   expect(threadEvents({ ...v, state: 'waiting_peer' }, undefined, { at: 't', epoch: 'ep' }).events.map(e => e.event)).toEqual(['open', 'wait'])
   expect(threadEvents({ ...v, state: 'closed' }, undefined, { at: 't', epoch: 'ep' }).events[0].event).toBe('close')
-  expect(sentOf({ owner: null, state: 'closed', last_item: { id: 'e9' } }, 4)).toEqual({ owner: null, state: 'closed', item: 'e9', n: 4 })
+  expect(sentOf({ owner: null, state: 'closed', last_item: { id: 'e9' } }, 4)).toEqual({ owner: null, state: 'closed', item: 'e9', n: 4, title: null })   // WO-164 titles: the title Onsen holds
 })
 
 // ------------------------------------------------------------------ the router

@@ -40,7 +40,7 @@ import { genuineAssistantModelFile } from './liveness.ts'
 import { CHAT_HISTORY_TOOL, FORM_CLOSE_TOOL } from './onsen-tool.ts'
 import { decideWake, legacyAgentRules, loadWakeTable, WAKE_KINDS, type WakeItem, type WakeRule, type WakeState, type WakeTable, type WakeVerdict } from './wake-decide.ts'
 import { sourceKindOf, memberStateOf } from './onsen-wake.ts'   // Onsen (WO-139): the definition only; the query comes through LanesDeps.chatHistory
-import { threadKeyOf, threadEvents, sentOf, titleOf, previewOf, ticketOf, runOf, type KeyKind, type LastItem, type OnsenThreadEvent, type Sent, type ThreadRefs,
+import { threadKeyOf, threadEvents, sentOf, titleOf, threadTitle, TITLE_V, previewOf, ticketOf, runOf, type KeyKind, type LastItem, type OnsenThreadEvent, type Sent, type ThreadRefs,
   type ThreadState, type ThreadView } from './lanes-threads.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING, LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } from './fleet-mail.ts'
@@ -194,7 +194,8 @@ export interface LanesDeps {
   /** inbox role, lanes-golive (C2): one of the agent's mailbox tools for the mail lane `lane` (fleet-mail.ts callInboxTool); `to` = the original sender of a
    *  mail it replies to (the disclosure check ran on it) */
   mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string; no_reply?: boolean }>
-  schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, summary?: string) => Promise<string>
+  /** receipt note (btcc-ack-auth): `note` is the run's one line, BTCC's field (scheduler.py complete_run reads note, stores outcome_note; it never read summary) */
+  schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
   mailWaiting?: () => Promise<{ ok: boolean; items?: Array<{ id: number; title?: string; decide?: string; deadline?: string; overdue?: boolean }>; why?: string }>
@@ -275,6 +276,7 @@ export function lanesInit(deps: LanesDeps): void {
   for (const d of ['', 'run']) mkdirSync(join(LANES_DIR, d), { recursive: true, mode: 0o700 })
   if (deps.role === 'tg') {
     loadState()
+    if (retitleThreads('start')) saveState()        // WO-164 titles: the open threads get their titles from the key (Onsen: at the handshake's sync)
     journal = new Journal(join(deps.stateDir ?? LANES_DIR, 'lanes', 'state.jsonl'))
     journal.load()
     if (onsenTap?.journal) journal.observe(onsenTap.journal)          // Onsen step 3 (WO-143): read-only
@@ -742,7 +744,9 @@ type Thread = { id: string; lane: string | null; peer: string | null; hops: numb
    *  counts from there, as it did when each run had a thread of its own */
   fresh_base?: number
   /** WO-164: Onsen holds another open thread on this key (a conflict): this one joined it */
-  alias_of?: string }
+  alias_of?: string
+  /** WO-164 titles (Chiron 17:18Z): the title was made by threadTitle (from the key); the start retitles the open threads without it, once */
+  title_v?: number }
 /** 002k (B12): the alert a thread was opened for, by fingerprint: sender + text with the digits masked */
 type AlertFp = { thread: string; event?: string; sev: string; repeats: number; first: string; last: string
   /** 002l (alertRepeat): when a repeat last made the finished owner lane run again */
@@ -1156,7 +1160,11 @@ function bindThread(ev: InEvent, d: Decision, kind: string): void {
   if (owner && t.lane !== owner) t.lane = owner
   if (t.state === 'closed') S.thread_keys![keyId(t.key_kind!, t.key!)] = t.id
   t.state = 'open'
-  if (!t.title) t.title = titleOf(ev.text)
+  if (!t.title) {                                                            // WO-164 titles: from the key (lanes-threads.ts threadTitle), set when the thread opens
+    t.title = threadTitle(t.key_kind!, t.key!, { kind, from: ev.from, text: ev.text, title: ev.source === 'mail' ? ev.title : null,
+      topic_name: ev.meta?.topic_name ?? topicName(ev.message_thread_id) ?? null }) || titleOf(ev.text)
+    t.title_v = TITLE_V
+  }
   t.last_item = { id: ev.id, kind, at: nowIso(), preview: previewOf(ev.text) }
   t.last = nowIso()
   k.thread = t.id
@@ -1175,11 +1183,14 @@ function releaseScheduleThread(lane: Lane | undefined, it: QItem): void {
 /** WO-164 (Chiron 16:50Z, 9): a mail's thread key is its refs.conversation, always: a new mail is a conversation of its own id, a reply keeps its parent's
  *  (Onsen 0.12.3 fills it). A new mail this agent sends (not a reply) opens that conversation's thread, owned by who sent it (the main, a lane): the answers
  *  that carry the conversation go to it. A reply binds nothing here: its conversation's thread exists, the answers find it by the key. */
-function sentMailThread(id: string, owner: string, isReply: boolean): void {
+function sentMailThread(id: string, owner: string, isReply: boolean, title?: string | null): void {
   if (!threadKeysOn() || !S || isReply || !/^\d+$/.test(id) || threadByKey('mail', id)) return
   const t = ensureThread(newThreadId(), owner, null, 0)
   stampKey(t, 'mail', id)
   t.state = 'open'
+  // WO-164 titles: a mail thread is called by its first mail's title: the one this agent sent (else the first answer's, at its bind)
+  const tt = threadTitle('mail', id, { kind: 'peer_mail', title: title ?? null })
+  if (tt) { t.title = tt; t.title_v = TITLE_V }
   saveState()
 }
 /** WO-164: a new lane opened on an existing thread for a new matter of its key (a schedule's next run, a new lane on a ticket or an incident) counts its
@@ -1187,6 +1198,34 @@ function sentMailThread(id: string, owner: string, isReply: boolean): void {
 function freshRunOnThread(t: Thread): void {
   t.fresh_base = t.fresh ?? 0
   t.hops = 0
+}
+/** WO-164 titles (Chiron 17:18Z, 「串的標題照串鍵取」): the open threads titled before titles came from the key (no title_v) get theirs now, from the key and what
+ *  is left of their first item (the old title is its first line; a call's peer; the topic's name). Onsen gets it as an ordinary change (syncThreads: the first
+ *  event of the change carries the title; the start handshake treats the daemon as authoritative); what Onsen was told before is kept as the old title. A
+ *  closed thread and a thread of its own (key item) keep theirs. At start, and for the threads a handshake takes in from Onsen. */
+function retitleThreads(why: 'start' | 'handshake'): number {
+  if (!threadKeysOn() || !S?.threads) return 0
+  const changed: Array<{ thread: string; key: string; was: string | null; title: string }> = []
+  for (const t of Object.values(S.threads)) {
+    if (!t.key_kind || !t.key || t.alias_of || t.state === 'closed' || t.title_v === TITLE_V || t.key_kind === 'item') continue
+    const self = String(D.agent ?? '').toLowerCase()
+    const keyPeer = t.key_kind === 'peer_call' ? String(t.key).split('#')[0].toLowerCase() : ''
+    const peer = t.key_kind === 'peer_call' ? (t.peer ?? (keyPeer && keyPeer !== self ? keyPeer : null)) : null
+    const topic = t.key_kind === 'tg' ? String(t.key).split(':')[2] : undefined
+    const was = t.title ?? null
+    const title = threadTitle(t.key_kind, t.key, { from: peer, text: was ?? '', topic_name: topic ? topicName(topic) ?? null : null })
+    t.title_v = TITLE_V
+    if (!title || title === was) continue
+    const sent = S.thread_sent?.[t.id]
+    if (sent && sent.title === undefined) sent.title = was                   // what Onsen holds: the title the thread was opened with
+    t.title = title
+    changed.push({ thread: t.id, key: `${t.key_kind}:${t.key}`, was, title })
+  }
+  if (changed.length) {
+    appendJsonl('lanes.jsonl', { lane: 'router', kind: 'thread_retitled', why, n: changed.length, threads: changed.slice(0, 50) })
+    D.log('info', `lanes: ${changed.length} open thread(s) retitled from their key (${why}): ${changed.slice(0, 5).map(c => `${c.key} 「${c.title}」`).join('; ')}`)
+  }
+  return changed.length
 }
 /** the fresh tokens the thread's budget counts (WO-164: since its current lane was opened on it) */
 const threadFresh = (t: Thread | undefined | null): number => Math.max(0, (t?.fresh ?? 0) - (t?.fresh_base ?? 0))
@@ -1224,7 +1263,8 @@ function syncThreads(): void {
     if (!t.key_kind || !t.key || t.alias_of) continue
     const v: ThreadView = { thread: t.id, key_kind: t.key_kind, key: t.key, title: t.title ?? null, owner: threadOwner(t), state: t.state ?? 'open', last_item: t.last_item ?? null }
     const was = S.thread_sent[t.id]
-    if (was && was.owner === v.owner && was.state === v.state && (was.item ?? null) === (v.last_item?.id ?? was.item ?? null)) continue
+    if (was && was.owner === v.owner && was.state === v.state && (was.item ?? null) === (v.last_item?.id ?? was.item ?? null)
+      && (was.title === undefined || !v.title || was.title === v.title || v.state === 'closed')) continue
     const r = threadEvents(v, was, { at, epoch: S.thread_epoch })
     if (!r.events.length) continue
     out.push(...r.events)
@@ -1255,9 +1295,10 @@ async function threadHandshake(): Promise<void> {
     }
     const sent = sentOf(row, S.thread_sent[id]?.n ?? 0)
     const now = { owner: threadOwner(t), state: t.state ?? 'open', item: t.last_item?.id ?? null }
-    if (now.owner !== sent.owner || now.state !== sent.state || (now.item && now.item !== sent.item)) differ++
+    if (now.owner !== sent.owner || now.state !== sent.state || (now.item && now.item !== sent.item) || (t.title && now.state !== 'closed' && t.title !== sent.title)) differ++
     S.thread_sent[id] = sent
   }
+  if (took) retitleThreads('handshake')                                      // WO-164 titles: a thread taken in from Onsen gets its title from its key too
   S.thread_sync_at = started
   appendJsonl('lanes.jsonl', { lane: 'router', kind: 'thread_handshake', onsen_rows: rows.length, taken_in: took, differ, local_keyed: Object.values(S.threads).filter(t => t.key_kind && !t.alias_of).length })
   D.log('info', `lanes: thread handshake: Onsen ${rows.length} row(s) ${after ? `changed since ${after}` : '(all)'}, ${took} taken in, ${differ} to correct`)
@@ -1271,7 +1312,7 @@ export function threadConflict(ev: OnsenThreadEvent, res: { thread?: string; own
   if (!local || local.alias_of) return
   let t = S.threads[res.thread]
   if (!t) t = S.threads[res.thread] = { id: res.thread, lane: local.lane, peer: local.peer, hops: 0, tokens: 0, created: local.created, last: local.last,
-    key_kind: local.key_kind, key: local.key, title: local.title, state: 'open', ...(local.last_item ? { last_item: local.last_item } : {}) }
+    key_kind: local.key_kind, key: local.key, title: local.title, ...(local.title_v ? { title_v: local.title_v } : {}), state: 'open', ...(local.last_item ? { last_item: local.last_item } : {}) }
   else { if (local.lane) t.lane = local.lane; t.state = 'open'; if (local.last_item) t.last_item = local.last_item }
   local.alias_of = t.id
   if (t.key_kind && t.key) S.thread_keys![keyId(t.key_kind, t.key)] = t.id
@@ -1291,7 +1332,7 @@ export function threadRefused(ev: OnsenThreadEvent): void {
 /** tests only */
 export const __threadByKey = (kk: KeyKind, key: string): Thread | null => threadByKey(kk, key)
 /** tests only: the main sent mail #id (what /lanes/outbound does for line mail) */
-export const __mainMailThread = (id: string, replyTo: string | null = null): void => sentMailThread(id, 'main', replyTo != null)
+export const __mainMailThread = (id: string, replyTo: string | null = null, title?: string): void => sentMailThread(id, 'main', replyTo != null, title)
 
 // ================================================================== ledger / focus
 type LedgerKind = 'action' | 'commitment' | 'escalation' | 'memory_proposal' | 'memory_decision' | 'receipt' | 'notify' | 'fyi' | 'stop' | 'lane_lifecycle'
@@ -5943,7 +5984,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       saveState()
       const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: noReply, ...(call ? { thread: lane.thread, hop } : {}), lane: lane.id, owner: ownerOf(tok.evId), ...f })
       if (call && r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
-      else if (f.line === 'mail' && r?.msgId != null) sentMailThread(String(r.msgId), lane.id, false)   // WO-164 (9): the lane's new mail opens its conversation
+      else if (f.line === 'mail' && r?.msgId != null) sentMailThread(String(r.msgId), lane.id, false, f.title ?? null)   // WO-164 (9): the lane's new mail opens its conversation
       const ok = r?.delivered === true
       events.result(tok.evId, v.ob?.id, ok, { ref: r?.msgId ?? null, why: r ? 'not delivered to the peer\'s inbox' : 'the inbox daemon did not answer' })   // PL2: met on the delivery result
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: `reply_agent(${f.line}) → ${to}${call ? `（hop ${hop}）` : ''}：${text.slice(0, 200)}`, refs: { btcc_msg_id: r?.msgId ?? null, delivered: ok, line: f.line } })
@@ -6261,8 +6302,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       }
       const held = tok.heldLine ? ` ${await flushHeld(tok, lane)}` : ''      // WO-129 (item 4): the line to Joey this run held for its receipt goes now
       if (!runIdArg) return `receipt recorded${chainNote}. ${events.openText(tok.evId)}${held}`
-      if (left) { await completeRun(tok, runIdArg, outcome, a.summary, 'receipt'); return `receipt recorded; ${leftForMainText(runIdArg)}${chainNote}${held}` }   // 1.38.2: logged there, not sent
-      return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, a.summary, 'receipt')).text}${chainNote}${held}`
+      // receipt note (btcc-ack-auth): the scheduler gets the receipt's one line as the ledger keeps it (its summary, else what happened) in BTCC's field `note`
+      if (left) { await completeRun(tok, runIdArg, outcome, note, 'receipt'); return `receipt recorded; ${leftForMainText(runIdArg)}${chainNote}${held}` }   // 1.38.2: logged there, not sent
+      return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, note, 'receipt')).text}${chainNote}${held}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
     case 'append_file': {                                                // WO-123
@@ -6893,14 +6935,15 @@ export function receiptLeftForMain(runId: string): boolean {
 const LEFT_FOR_MAIN_LINE = (run: string): string => `排程 run ${run} 沒有在這裡完成：這件事交給主線了，主線做完由它回執。`
 const leftForMainText = (run: string): string => `scheduler run ${run} is left for the main: this matter was handed to it, so the main completes run ${run} `
   + `(btcc-receipt complete ${run}) when the work is done. Nothing was sent to the scheduler; do not complete it yourself. Your part is recorded.`
-export async function completeRun(tok: RunTok, runId: string, outcome: string, summary: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
+export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
   if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
     logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
   }
   const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
     // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422
-    const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome: btccOutcome(outcome), summary: typeof summary === 'string' ? summary : undefined })
+    // receipt note (btcc-ack-auth): the line goes as `note`, the field BTCC reads (it was sent as `summary`, which BTCC never read: the result sentence was dropped)
+    const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome: btccOutcome(outcome), note: typeof note === 'string' && note ? note : undefined })
     if (!r) return null
     const text = String(r.text ?? JSON.stringify(r))
     return { ...schedulerAnswerOk(text), ...(typeof r.ok === 'boolean' ? { ok: r.ok } : {}), text }
@@ -7912,7 +7955,8 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       // lanes-golive (C2): a mail of the main's is answered in its mailbox, never by an /inject quoting it: only a call's id routes a reply
       const isCall = b.line == null || b.line === 'call'
       if (isCall) S.outbound[String(b.msgId)] = { owner: String(b.owner ?? 'main'), thread: b.thread ?? null }
-      else if (b.line === 'mail' && String(b.owner ?? 'main') === 'main') sentMailThread(String(b.msgId).replace(/^mail-/, ''), 'main', b.reply_to != null)   // WO-164 (9)
+      else if (b.line === 'mail' && String(b.owner ?? 'main') === 'main') sentMailThread(String(b.msgId).replace(/^mail-/, ''), 'main', b.reply_to != null,   // WO-164 (9)
+        typeof b.title === 'string' ? b.title : typeof b.text === 'string' ? b.text.split('\n')[0] : null)   // WO-164 titles: the mail's title (laneMailBtcc's text starts with it)
       if (b.thread) { const t = ensureThread(String(b.thread), 'main', null, 0); if (b.hop) t.hops = Math.max(t.hops, Number(b.hop)) }
       // 002e: what the main itself tells another agent is part of the day's activity (002d: only the lanes' sends were)
       if (String(b.owner ?? 'main') === 'main' && b.to && b.text) {
@@ -7983,7 +8027,9 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const b = await readBody(req)
       // 1.41.1 (Metis mail #11280): the outcome in the scheduler's words (an older tg daemon still sends `done`), and whether the scheduler took it
       const action = b.action === 'ack' ? 'ack' : 'complete'
-      const text = D.schedulerCall ? await D.schedulerCall(String(b.run_id), action, action === 'complete' ? btccOutcome(b.outcome) : b.outcome, b.summary) : 'no scheduler'
+      // receipt note (btcc-ack-auth): the run's line is `note` (BTCC's field); a tg daemon from before this change still sends it as `summary`
+      const note = typeof b.note === 'string' && b.note ? b.note : typeof b.summary === 'string' && b.summary ? b.summary : undefined
+      const text = D.schedulerCall ? await D.schedulerCall(String(b.run_id), action, action === 'complete' ? btccOutcome(b.outcome) : b.outcome, note) : 'no scheduler'
       sendJson(res, 200, { text, ok: schedulerAnswerOk(text).ok }); return true
     }
   }

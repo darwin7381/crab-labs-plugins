@@ -686,7 +686,7 @@ test('scheduler receipt: ./bin/btcc-receipt complete first meets the obligation 
   const r = await cli(s.tok, "cd . && ./bin/btcc-receipt complete 62 --outcome nothing-to-do --note '照例，無事'")
   expect(r.deny).toContain('run 62 completed'); expect(r.deny).toContain('"state":"completed"')
   expect(ob(s.id, 'receipt')).toMatchObject({ state: 'met', by: 'btcc-receipt' })
-  expect(completions('62')).toMatchObject([{ outcome: 'nothing-to-do', summary: '照例，無事' }])
+  expect(completions('62')).toMatchObject([{ outcome: 'nothing-to-do', note: '照例，無事' }])   // receipt note (btcc-ack-auth): BTCC's field
   expect(L.laneStop(s.tok)).toBeNull()                                                       // nothing is open: the CLI met it
   expect(await call(s.tok, 'receipt', { outcome: 'done', run_id: '62' })).toContain('scheduler run 62 was already completed (by this event)')
   expect((await cli(s.tok, "bash -c './bin/btcc-receipt complete 62'")).deny).toContain('run 62 not completed')   // also inside bash -c

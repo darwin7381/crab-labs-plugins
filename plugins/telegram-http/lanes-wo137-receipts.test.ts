@@ -140,6 +140,44 @@ test('Metis #11280, replay of run 6804: the lane\'s receipt(outcome done) reache
   await end(r)
 })
 
+// Receipt note (Sonn btcc-ack-auth): BTCC's complete_run reads `note` (outcome_note; bt-control-center backend/app/routers/scheduler.py), never `summary`: the
+// receipt's line was sent as summary and dropped. It goes as note now: the receipt's summary, else what happened (the line the ledger keeps).
+test('receipt note: the receipt\'s line reaches the scheduler as `note` (its summary, else what happened), never as `summary`', async () => {
+  const k = schedCalls.length
+  const r = await start(sched(6831, 'v1571-note'))
+  await call(r, 'notify_joey', { outcome: 'normal', text: '照例檢查：30 個清單都正常' })
+  expect(await call(r, 'receipt', { run_id: '6831', outcome: 'nothing-to-do', steps: STEPS(6831), summary: '照例檢查：30 個清單都正常', happened: '跨艦隊巡檢', did: '查', promised: '無', needs_main: '無' })).toContain('HTTP 200')
+  expect(completions('6831')).toEqual([{ path: '/lanes/scheduler', run_id: '6831', action: 'complete', outcome: 'nothing-to-do', note: '照例檢查：30 個清單都正常' }])
+  await end(r)
+  const q = await start(sched(6832, 'v1571-note'))
+  await call(q, 'notify_joey', { outcome: 'normal', text: '跨艦隊巡檢：30 個清單有 open 任務' })
+  expect(await call(q, 'receipt', { run_id: '6832', outcome: 'done', steps: STEPS(6832), happened: '跨艦隊巡檢：30 個清單有 open 任務', did: '拉 cc-workboard', promised: '無', needs_main: '無' })).toContain('HTTP 200')
+  expect(completions('6832')).toEqual([{ path: '/lanes/scheduler', run_id: '6832', action: 'complete', outcome: 'ok', note: '跨艦隊巡檢：30 個清單有 open 任務' }])
+  expect(schedCalls.slice(k).some(c => 'summary' in c)).toBe(false)
+  await end(q)
+})
+test('receipt note, the agent-inbox daemon\'s /lanes/scheduler: the line goes to the scheduler as its note (BTCC\'s field); a tg daemon from before this change: its `summary` too', async () => {
+  const calls: any[] = []
+  const I = await import('./lanes.ts?v1571-inbox-note') as typeof import('./lanes.ts')
+  I.lanesInit({ role: 'inbox', agent: 'metis', workspaceDir: ws, transcriptDir: join(tmp, 'tr'), httpPort: 0, log: () => {}, authOk: () => true,
+    schedulerCall: async (run: string, action: string, outcome?: string, note?: string) => { calls.push({ run, action, outcome, note }); return `${action} run ${run}: HTTP 200` } } as any)
+  const srv = createServer(async (req, res) => { if (!(await I.handleLanesHttp(new URL(req.url ?? '/', 'http://127.0.0.1'), req, res))) res.writeHead(404).end() })
+  await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()))
+  const post = async (b: object) => (await fetch(`http://127.0.0.1:${(srv.address() as any).port}/lanes/scheduler`, { method: 'POST', body: JSON.stringify(b), headers: { Authorization: 'Bearer x' } })).json()
+  try {
+    await post({ run_id: '6841', action: 'complete', outcome: 'ok', note: '照例，無事' })
+    await post({ run_id: '6842', action: 'complete', outcome: 'ok', summary: '舊版 tg daemon 的一句' })
+    await post({ run_id: '6843', action: 'complete', outcome: 'ok' })
+    expect(calls).toEqual([{ run: '6841', action: 'complete', outcome: 'ok', note: '照例，無事' }, { run: '6842', action: 'complete', outcome: 'ok', note: '舊版 tg daemon 的一句' },
+      { run: '6843', action: 'complete', outcome: 'ok', note: undefined }])
+  } finally { srv.close() }
+  // server.ts schedulerCall: the body BTCC gets carries `note`
+  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  const f = src.slice(src.indexOf('schedulerCall: async (runId, action, outcome, note) => {'), src.indexOf('} catch (e) { return `${action} run ${runId} failed: ${e}` }'))
+  expect(f).toContain("body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'ok', ...(note ? { note } : {}) } : {}),")
+  expect(f).not.toContain('summary')
+})
+
 test('Metis #11280: a scheduler that refuses the receipt (HTTP 422): the receipt stays owed and the lane is told; filing again calls the scheduler again (not refused as a repeat); the run ends owing it: handed to the main, whose btcc-receipt is let through; its 422 output leaves it owed, a 409 「run is completed」 meets it', async () => {
   refuse.add('6811')
   const m = await mainUp()
@@ -274,6 +312,6 @@ test('1.41.1, the agent-inbox daemon\'s /lanes/scheduler: an older tg daemon\'s 
     expect(calls.at(-1)).toEqual({ run: '6823', action: 'ack', outcome: undefined })
   } finally { srv.close(); refuse.delete('6822') }
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain("{ outcome: outcome ?? 'ok', ...(summary ? { summary } : {}) }")
+  expect(src).toContain("{ outcome: outcome ?? 'ok', ...(note ? { note } : {}) }")   // receipt note: BTCC reads note (the two tests above)
   expect(src).toContain("return `${action} run ${runId}: HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\\s+/g, ' ').slice(0, 200)}`}`")
 })
