@@ -28,7 +28,7 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'gramm
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, randomUUID, timingSafeEqual } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync, readSync, existsSync } from 'fs'
-import { homedir } from 'os'
+import { homedir, hostname } from 'os'
 import { join, extname, sep, dirname } from 'path'
 import { execFile, spawnSync } from 'child_process'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
@@ -79,6 +79,7 @@ import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
 import * as OnsenVisible from './onsen-visible.ts'
+import * as OnsenWake from './onsen-wake.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
@@ -426,6 +427,8 @@ let formInbox: OnsenVisible.FormInbox | null = null
 /** Onsen 1.45.1: an MCP stream opened (sid, its GET): which claude process holds it (the status's not_connected check); null = recording off */
 let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
+/** WO-147 (ONSEN_WAKE_LOG): the route tap is attached (set up with step 3) */
+let onsenWakeLog = false
 const onsenAllow = { at: 0, ids: [] as string[] }
 /** Onsen step 3: Joey's Telegram message behind these meta (a sender on the DM allowlist, a chat, a message id), or null. The allowlist is read at most
  *  every 5 s (it is consulted on every lanes journal write). */
@@ -4366,7 +4369,8 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-145 (ONSEN_STATUS_PIN): the same view, shown in a pinned silent message in each DM chat of an allowlisted person (onsen-visible.ts StatusPin)
   const pin = ONSEN_VISIBLE.pin ? statusPinSetup() : null
   statusPinRef = pin?.pin ?? null
-  const feed = (v: OnsenStatus.StatusView): void => { status.update(v); try { pin?.show(v) } catch (e) { log('warn', `onsen: status pin: ${e}`) } }
+  let lastView: OnsenStatus.StatusView | null = null                  // WO-147: the agent's state a wake row carries (member_state)
+  const feed = (v: OnsenStatus.StatusView): void => { lastView = v; status.update(v); try { pin?.show(v) } catch (e) { log('warn', `onsen: status pin: ${e}`) } }
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick })
@@ -4407,8 +4411,29 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     turn_end_settling: facts.pendingLater(),
     // WO-145: the visible half (only what is on)
     ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),
-    ...(formInbox ? { forms: formInbox.stats } : {}) })
+    ...(formInbox ? { forms: formInbox.stats } : {}), ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
   log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
+  // WO-147 (Onsen step 4a, ONSEN_WAKE_LOG): every route record (routing.jsonl line) as one wake row in Onsen (onsen-wake.ts), through the spool. Read only:
+  // the row is built from the record the router already wrote and appended to the spool after the router's own step (a microtask: toMain has given the
+  // event its M1 item by then, and nothing of the route waits for it); any failure is logged once an hour and that row is dropped.
+  if (Lanes.LANES_ON && OnsenWake.wakeLogOn(process.env, ONSEN_AGENT)) {
+    const host = (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, '')
+    const boot = randomBytes(3).toString('hex')
+    let seq = 0, warnAt = 0
+    const warn = (e: unknown): void => { if (Date.now() - warnAt > 3600_000) { warnAt = Date.now(); log('warn', `onsen: wake row dropped (${e instanceof Error ? e.message : e}); routing unchanged`) } }
+    Lanes.observeRoutes((row, ctx) => {
+      const now = Date.now(), at = new Date(now).toISOString(), n = ++seq
+      const memberState = OnsenWake.memberStateOf(lastView, ctx.main)
+      queueMicrotask(() => {
+        try {
+          const ok = onsen.recordWake(OnsenWake.wakeItem(row, { ...ctx, did: ctx.did() }, { agent: ONSEN_AGENT, host, at, idem: OnsenWake.idemWake(ONSEN_AGENT, boot, n, now), memberState }))
+          if (!ok) warn(new Error('the spool did not take it'))
+        } catch (e) { warn(e) }
+      })
+    })
+    onsenWakeLog = true
+    log('info', `onsen: wake log on for ${ONSEN_AGENT} (host ${host}): every routing.jsonl row also as a row in Onsen (POST ${onsen.cfg.base}/wake/batch, through the spool)`)
+  }
   // WO-145 (ONSEN_FORM_LINKS): the answers to the page forms this agent sent come in by a long poll and go to the main as Joey's message would
   if (ONSEN_VISIBLE.forms) {
     formInbox = new OnsenVisible.FormInbox({ dir: join(STATE_DIR, 'onsen'), log, request: (m, p, b, t) => onsen.request(m, p, b, t),

@@ -15,6 +15,8 @@
 //   - step 3 (WO-143): delivery facts (k 'd': delivered / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
 //     /status/batch; 1.45.1: the registry's states and last_activity_at) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
 //     refused as a whole (an Onsen without those routes) goes to rejected.jsonl: the messages behind it are never held.
+//   - WO-147 (step 4a, onsen-wake.ts): every wake decision (one route record of the lanes router) as one row (k 'w', POST /wake/batch), through the same
+//     spool and the same batch rules as the step 3 facts: written locally first, synced in order, a resent line keeps its idem_key (duplicate = sent).
 //   - WO-145 (the half Joey sees, onsen-visible.ts): a send context may carry `redact` (a reply's page links with their one-time form keys → the links as the
 //     agent wrote them): the record keeps the text WITHOUT the keys. A form answer's ack that Onsen did not take directly goes through the spool (k 'a',
 //     POST /forms/ack). `observe` lets the daemon read every line it appends (the pinned status's local counts). `request`: one call with the credential.
@@ -24,6 +26,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
+import type { WakeItem } from './onsen-wake.ts'
 
 // ------------------------------------------------------------------ records (the contract posted on WO-139)
 export type OnsenAttachment = { name?: string; mime?: string; size?: number; file_id?: string }
@@ -57,8 +60,10 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 /** WO-145: the form answers this daemon queued for the main (POST /forms/ack), when Onsen did not take the ack directly */
 export type FormAck = { ids: number[]; at: string }
 export type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
-  | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck }
-const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a'])
+  | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
+const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w'])
+/** the batch route of each kind that is posted in runs (≤500 a batch) */
+const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch' }
 
 export const idemIn = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:in:${id}`
 export const idemOut = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:out:${id}`
@@ -281,7 +286,7 @@ export class OnsenClient {
   private authWarnAt = 0
   private observers: Array<(line: SpoolLine) => void> = []
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
-    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0 }
+    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -299,6 +304,8 @@ export class OnsenClient {
   /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
   recordDelivery(f: DeliveryFact): void { if (this.append({ k: 'd', r: f })) this.stats.deliveries_recorded++ }
   recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) this.stats.status_recorded++ }
+  /** WO-147: one wake decision (onsen-wake.ts wakeItem), through the same spool; false = not spooled (recording off, or the append failed) */
+  recordWake(w: WakeItem): boolean { const ok = this.append({ k: 'w', r: w }); if (ok) this.stats.wake_recorded++; return ok }
   /** WO-145: form answers queued for the main whose ack Onsen did not take directly: POST /forms/ack when the spool reaches it. false = not spooled */
   recordFormAck(ids: number[]): boolean {
     const ok = ids.length > 0 && this.append({ k: 'a', r: { ids, at: new Date().toISOString() } })
@@ -455,9 +462,9 @@ export class OnsenClient {
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
-      if (t.line.k === 'd' || t.line.k === 's') {
-        // step 3 (WO-143): a run of delivery facts (or of status lines): one batch (≤500), in its place in the order
-        const k = t.line.k, path = k === 'd' ? '/deliveries/batch' : '/status/batch'
+      if (t.line.k === 'd' || t.line.k === 's' || t.line.k === 'w') {
+        // step 3 (WO-143): a run of delivery facts (or of status lines; WO-147: of wake decisions): one batch (≤500), in its place in the order
+        const k = t.line.k, path = BATCH_PATH[k]!
         const run: Array<{ line: SpoolLine; end: number }> = []
         while (i < todo.length && run.length < 500 && todo[i]!.line?.k === k) { run.push({ line: todo[i]!.line!, end: todo[i]!.end }); i++ }
         const r = await this.post(path, { items: run.map(x => x.line.r) }, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))

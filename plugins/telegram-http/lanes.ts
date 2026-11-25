@@ -240,10 +240,11 @@ function appendJsonl(name: string, rec: Record<string, unknown>): void {
 const ledgerPath = () => join(LANES_DIR, 'ledger.jsonl')
 /** PL6: the ONE writer of a route record: routing.jsonl and its Logos mirror (lane.route) get the same row. `thread` is the owner's thread (the
  *  conversation the event belongs to after routing); `peer_thread` is the thread the sender supplied. */
-function routeRow(r: Record<string, unknown> & { event: string; rule: string }): void {
+function routeRow(r: Record<string, unknown> & { event: string; rule: string }, ev?: InEvent): void {
   const row = { ...r, ...(typeof r.text === 'string' ? { text: r.text.slice(0, 120) } : {}) }
   appendJsonl('routing.jsonl', row)
   logos('lane.route', row)
+  if (routeTap) tapRoute(row, ev)       // WO-147 (Onsen step 4a): read only; `ev` (the event the row is about, when the writer has it) is for the tap alone
 }
 function logos(kind: string, rec: Record<string, unknown>): void {
   if (!LOGOS_URL) return
@@ -794,6 +795,51 @@ export function observeLanes(t: OnsenTap): void {
   onsenTap = t
   if (journal && t.journal) journal.observe(t.journal)
 }
+// WO-147 (Onsen step 4a): every route record (routeRow: the one writer of routing.jsonl, routeWake's kinds included) is shown to the route tap
+// (server.ts, ONSEN_WAKE_LOG) right after it is written: the row as written, and what the tap cannot read itself. Read only: the tap changes no state,
+// its errors never reach the router (logged once an hour), and with no tap nothing here runs.
+export type RouteTapCtx = {
+  /** the event the row is about (null: a row with no event, e.g. a refused registration, a digest, a /lanes command) */
+  ev: InEvent | null
+  /** the main's M2 record at this moment (null: no gen); offered = an item already offered to it (one offer opens one turn) */
+  main: { state: string; offered: boolean } | null
+  /** the kind of the row's lane (reflex | worker | fork | curator | synthesis | mail), null without one */
+  laneKind: string | null
+  /** the router's alert senders (router.json, as last read; never read again for the tap) */
+  alertSenders: string[]
+  /** the roster (D.registryNames), read when asked */
+  roster: () => string[]
+  /** the M1 item the row's event got for the main AFTER this row (toMain runs right after the row), read when asked; null = none */
+  did: () => string | null
+}
+let routeTap: ((row: Record<string, unknown>, ctx: RouteTapCtx) => void) | null = null
+let routeTapWarnAt = 0
+export function observeRoutes(fn: ((row: Record<string, unknown>, ctx: RouteTapCtx) => void) | null): void { routeTap = fn }
+/** the newest M1 item of event `id` (by creation order), or null */
+function lastMainItem(id: string): { id: string; n: number } | null {
+  if (!id || D?.role !== 'tg' || !main) return null
+  let best: Row | null = null
+  for (const r of main.items(x => x.event === id)) if (!best || r.n > best.n) best = r
+  return best ? { id: best.id, n: best.n } : null
+}
+function tapRoute(row: Record<string, unknown>, ev?: InEvent): void {
+  try {
+    const g = D?.role === 'tg' && main ? main.currentGen() : null
+    const evId = String(row.event ?? '')
+    const before = row.target === 'main' ? lastMainItem(evId) : null
+    const lane = typeof row.lane === 'string' && S?.lanes ? S.lanes[row.lane] : undefined
+    routeTap!(row, {
+      ev: ev ?? null,
+      main: g ? { state: String(g.state), offered: main.items(r => r.state === 'offered' && r.gen === g.id).length > 0 } : null,
+      laneKind: lane?.kind ?? null,
+      alertSenders: routerCache?.cfg.alert_senders ?? ['alert-dispatcher'],
+      roster: () => { try { return D.registryNames?.() ?? [] } catch { return [] } },
+      did: () => { if (row.target !== 'main') return null; const now = lastMainItem(evId); return now && now.n !== before?.n ? now.id : null },
+    })
+  } catch (e) {
+    if (Date.now() - routeTapWarnAt > 3600_000) { routeTapWarnAt = Date.now(); D?.log('warn', `lanes: route tap failed (${e}); the route is unchanged, the record dropped`) }
+  }
+}
 /** /lanes/main-event (and the tests' __mainEvent): the tap sees the event, then M2 handles it */
 function mainEventIn(b: any) {
   try { onsenTap?.mainEvent?.(b) } catch {}
@@ -1041,13 +1087,13 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     if (ev.wake === 'mail' && ev.meta?.ring === 'true') {
       const d: Decision = { rule: 'master-off-ring', target: 'ledger', note: `lanes switched off by ${S.master_off.by}: the mailbox's ring has no mail lane to wake` }
       routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
-        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: 'mail' })
+        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: 'mail' }, ev)
       D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ledger`)
       return d
     }
     let d: Decision = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off.by} at ${stamp(S.master_off.since)}` }
     routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note,
-      class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
+      class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null }, ev)
     D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=master-off → main`)
     noteInbound(ev, d)
     toMain(ev, d)
@@ -1061,7 +1107,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     const g = peerGate(ev)
     if (g) {
       routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: g.rule, target: 'ledger', lane: null, thread: null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note, episode: g.episode,
-        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null })
+        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null }, ev)
       D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${g.rule} → ledger — ${g.note}`)
       noteInbound(ev, { rule: g.rule, target: 'ledger' })
       // M3 (PL1): a gated message has its record too: information (no obligations), riding on its episode's head, which carries the episode
@@ -1122,7 +1168,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   const base_tier = d.target === 'ledger' ? (cls ? tierFor(cls, false).tier : 'ledger') : cls ? tierFor(cls, false).tier : null
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: d.lane ?? null,
     thread: d.thread ?? (d.lane ? S.lanes[d.lane]?.thread : null) ?? null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null,
-    class: cls, base_tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
+    class: cls, base_tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ${d.target}${d.lane ? ' ' + d.lane : ''}${d.note ? ' — ' + d.note : ''}`)
   // 002j (A5): the same event is shown to Jev AFTER the decision and both are written side by side (run/triage-shadow.jsonl).
   // Not awaited and never read back: the table above is the only thing that routes.
@@ -1143,7 +1189,7 @@ function routeWake(ev: InEvent): Decision {
   if (ev.wake === 'mail') return routeMailWake(ev)
   const d: Decision = { rule: `wake-${ev.wake}`, target: 'main', note: `fleet wake-up line (${ev.wake}): the main` }
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
-    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: ev.wake })
+    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: ev.wake }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → main`)
   toMain(ev, d, { owesOnlyMain: true })
   return d
@@ -1222,7 +1268,7 @@ function moveToMailLane(it: QItem, from: Lane, why: string, steps?: string[]): L
     ...(it.extra?.length ? { extra: it.extra } : {}), ...(it.steered?.length ? { steered: it.steered } : {}) }
   queueRun(nit)
   appendJsonl('lanes.jsonl', { lane: from.id, kind: 'mail_event_moved', event: it.ev.id, to: to.id, why, cut: !!steps })
-  routeRow({ event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'mail-lane-renewed', target: 'lane', lane: to.id, thread: to.thread, note: `${from.id} renewed (${why}): ${to.id}${steps ? ', the cut run once more' : ''}` })
+  routeRow({ event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'mail-lane-renewed', target: 'lane', lane: to.id, thread: to.thread, note: `${from.id} renewed (${why}): ${to.id}${steps ? ', the cut run once more' : ''}` }, it.ev)
   saveState()
   setTimeout(pump, 0)
   return to
@@ -1247,7 +1293,7 @@ function routeMailWake(ev: InEvent): Decision {
     recordInbound(ev, { owner: 'router', lane: lane.id, fields: { merged_into: waiting.ev.id } })
   } else d = dispatch(ev, lane, { rule: 'wake-mail' })
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: d.lane ?? null, thread: lane.thread, peer_thread: null, hop: null,
-    note: d.note ?? null, class: 'mail', base_tier: tierFor('mail', false).tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: 'mail' })
+    note: d.note ?? null, class: 'mail', base_tier: tierFor('mail', false).tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: 'mail' }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=wake-mail → ${d.target} ${d.lane ?? ''}${d.note ? ' — ' + d.note : ''}`)
   return d
 }
@@ -1682,7 +1728,7 @@ export function replaceQueuedMain(chat: string, messageId: string, rewrite: Para
  *  router had already opened (it threw after) gets the one hand-over instead. */
 export function toMainDirect(ev: InEvent): void {
   if (D?.role !== 'tg' || !main) return
-  routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: 'router-failed', target: 'main', lane: null, thread: null, note: 'the router threw: the event goes to the main' })
+  routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: 'router-failed', target: 'main', lane: null, thread: null, note: 'the router threw: the event goes to the main' }, ev)
   if (events.get(ev.id)) { handToMain(ev.id, undefined, `分流器處理這則訊息時出錯，交給主線：${ev.from}：${String(ev.text ?? '').slice(0, 600)}`); return }
   toMain(ev, { rule: 'router-failed', target: 'main' })
 }
@@ -1694,7 +1740,7 @@ export function toMainForm(ev: InEvent): Decision | null {
   if (D?.role !== 'tg' || !main) return null
   const d: Decision = { rule: 'web-form', target: 'main', note: `a page answer (form ${ev.meta?.form_id ?? '?'}): to the main` }
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
-    class: null, base_tier: null, btcc_msg_id: null, tg_message_id: ev.meta?.message_id ?? null })
+    class: null, base_tier: null, btcc_msg_id: null, tg_message_id: ev.meta?.message_id ?? null }, ev)
   D.log('info', `lanes: route ${ev.id} (web-form from ${ev.from}) rule=web-form → main`)
   toMain(ev, d)
   return d
@@ -1719,7 +1765,7 @@ function dropQueued(it: QItem, thread: string, why: string): void {
   ledger({ lane: S.lanes[it.lane]?.id ?? 'router', thread, event: it.ev.id, kind: 'fyi',
     text: `對話線 ${thread} 已經關閉（${why}），排隊中的 ${it.ev.from} 的訊息沒有處理，也沒有開車道${more}。內容：${it.ev.text.slice(0, 160)}`,
     refs: { drained: true, stopped: why, btcc_msg_id: it.ev.btcc_msg_id ?? null } })
-  routeRow({ event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'thread-stopped-drain', target: 'ledger', lane: it.lane, thread, note: `thread stopped (${why}): queued event not run` })
+  routeRow({ event: it.ev.id, source: it.ev.source, from: it.ev.from, rule: 'thread-stopped-drain', target: 'ledger', lane: it.lane, thread, note: `thread stopped (${why}): queued event not run` }, it.ev)
 }
 const peerEventOf = (it: QItem): boolean => it.ev.source === 'mesh' && !it.ev.synthetic && !it.ev.fanout && it.ev.from !== 'main'
 export function drainStoppedThread(thread: string, why: string): number {
@@ -3034,7 +3080,7 @@ function coalesce(it: QItem, waiting: QItem[]): void {
   for (const o of more) {
     endRun(o, 'merged', { into: it.ev.id })
     events?.settleUnrun(o.ev.id, 'merged', `coalesced into ${it.ev.id}`, it.ev.id)       // PL2: merged into the run that answers it, not met
-    routeRow({ event: o.ev.id, source: o.ev.source, from: o.ev.from, rule: 'coalesced', target: 'lane', lane: it.lane, thread: S.lanes[it.lane]?.thread ?? null, into: it.ev.id, note: `handled in the same run as ${it.ev.id}` })
+    routeRow({ event: o.ev.id, source: o.ev.source, from: o.ev.from, rule: 'coalesced', target: 'lane', lane: it.lane, thread: S.lanes[it.lane]?.thread ?? null, into: it.ev.id, note: `handled in the same run as ${it.ev.id}` }, o.ev)
   }
   logos('lane.coalesced', { lane: it.lane, event: it.ev.id, with: more.map(o => o.ev.id) })
 }
@@ -3066,7 +3112,7 @@ export function followupTick(): void {
     const rec = events?.get(f.event)
     const ev: InEvent = { id: f.event, source: 'mesh', from: f.from, text: String(rec?.text ?? f.note), meta: {}, notif: { method: '', params: {} },
       thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id, synthetic: followupEventText(f, now) }
-    routeRow({ event: f.event, source: 'followup', from: f.from, rule: 'followup', target: 'lane', lane: lane.id, thread: f.thread, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` })
+    routeRow({ event: f.event, source: 'followup', from: f.from, rule: 'followup', target: 'lane', lane: lane.id, thread: f.thread, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` }, ev)
     logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: f.event, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
     const d = dispatch(ev, lane, { rule: 'followup' })
     D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
@@ -5661,7 +5707,7 @@ function startSynthesis(fo: Fanout): void {
   const ev: InEvent = { id: `ev-syn-${shortId()}`, source: 'mesh', from: 'main', text: fo.brief, meta: {}, notif: { method: '', params: {} }, fanout: fo.id,
     synthetic: `[車道事件｜主線扇出｜綜合線]\n主線把一件事拆成 ${fo.members.length} 塊交給查詢線，結果都在下面。你是綜合線：讀完全部，整理成一份結論（每一塊的狀態，加一個整體判斷），用 deliver_synthesis 交給主線，一次。不要通知 Joey，不要再開線。\n\n主線的要求：${fo.brief}\n\n${parts}` }
   enqueue(ev, lane.id, 2)
-  routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fan_out-synthesis', target: 'lane', lane: lane.id, thread: lane.thread, note: `fanout ${fo.id}` })
+  routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fan_out-synthesis', target: 'lane', lane: lane.id, thread: lane.thread, note: `fanout ${fo.id}` }, ev)
 }
 // design/memory 「主線閒下來時，可以把寫入權交給一條整理線…做完交還」, MM5 「整理線只整理提案，不刪主線寫的內容，只能標記『建議刪除』」.
 const memoryWriterFile = (): string => join(LANES_DIR, 'run', 'memory-writer')
@@ -6286,7 +6332,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: brief, meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線交辦｜工作線開啟]\n任務標題：${title}\n主線的簡報：\n${brief}\n\n先在話題裡用 notify_joey 跟 Joey 打個招呼並說明你接下來要做什麼，然後開始做。` }
       enqueue(ev, lane.id, 3)
-      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'open_worker', target: 'lane', lane: lane.id, thread: lane.thread, note: `topic ${lane.topic}` })
+      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'open_worker', target: 'lane', lane: lane.id, thread: lane.thread, note: `topic ${lane.topic}` }, ev)
       // lanes-topics (item 4): the link that opens the topic, and the name as stored (= as Joey sees it: emoji dropped)
       const link = topicLink(D.botUsername?.(), lane.topic!)
       return `worker ${lane.id} opened in topic #${lane.topic} 「${lane.topic_name ?? title}」 (${link ?? 'link: the bot username is not known yet'}); thread ${lane.thread}. `
@@ -6302,7 +6348,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const ev: InEvent = { id: `ev-${Date.now()}-${shortId()}`, source: 'mesh', from: 'main', text: task, meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線開分身線]\n你現在是分身線（不是主線）。任務：\n${task}\n\n完成後用 ledger_write(kind=action) 寫結論，並用 notify_joey 收尾。` }
       enqueue(ev, lane.id, 3)
-      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fork', target: 'lane', lane: lane.id, thread: lane.thread, note: `fork of ${mainReg.session_id}` })
+      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fork', target: 'lane', lane: lane.id, thread: lane.thread, note: `fork of ${mainReg.session_id}` }, ev)
       return `fork ${lane.id} started from your session ${mainReg.session_id}; its result arrives in your digest.`
     }
     case 'lanes_list': {
@@ -6357,7 +6403,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
         const ev: InEvent = { id: `ev-fo-${shortId()}`, source: 'mesh', from: 'main', text: t, meta: {}, notif: { method: '', params: {} }, fanout: id,
           synthetic: `[車道事件｜主線扇出 ${id}｜第 ${i + 1}/${tasks.length} 塊]\n${t}\n\n只做這一塊，查完用 report_result 把結果交回（不要通知 Joey）。` }
         enqueue(ev, lane.id, 2)
-        routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fan_out', target: 'lane', lane: lane.id, thread: lane.thread, note: `fanout ${id} part ${i + 1}/${tasks.length}` })
+        routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'fan_out', target: 'lane', lane: lane.id, thread: lane.thread, note: `fanout ${id} part ${i + 1}/${tasks.length}` }, ev)
       })
       saveState()
       ledger({ lane: 'main', kind: 'action', text: `主線扇出 ${id}：${tasks.length} 塊（${tasks.map(t => t.slice(0, 30)).join('；')}），結論要求：${brief.slice(0, 200)}`, refs: { fanout: id } })
@@ -6377,7 +6423,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       const ev: InEvent = { id: evId, source: 'mesh', from: 'main', text: 'curate memory proposals', meta: {}, notif: { method: '', params: {} },
         synthetic: `[車道事件｜主線交辦｜整理記憶提案]\n${String(a.note ?? '').trim() || '整理累積的記憶提案。'}\n\n待處理的記憶提案 ${props.length} 筆：\n${list}\n\n記憶目錄：${memoryDir()}。先讀相關的記憶檔，再決定每一筆：寫進去、或衝突時寫一筆「建議刪除」提案留給主線。做完用 curator_done 交回寫入權。` }
       enqueue(ev, lane.id, 3)
-      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'curate_memory', target: 'lane', lane: lane.id, thread: lane.thread, note: `${props.length} proposals` })
+      routeRow({ event: ev.id, source: 'main', from: 'main', rule: 'curate_memory', target: 'lane', lane: lane.id, thread: lane.thread, note: `${props.length} proposals` }, ev)
       ledger({ lane: 'main', kind: 'action', text: `主線把記憶寫入權交給整理線 ${lane.id}（${props.length} 筆提案）`, refs: { write_right: lane.id } })
       return `curator ${lane.id} holds the memory write right and works through ${props.length} proposal(s). curate_stop takes it back.`
     }
