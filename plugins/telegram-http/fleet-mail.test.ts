@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { FLEET_INSTRUCTIONS, FLEET_TOOLS, handleFleetRpc, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
+import { FLEET_INSTRUCTIONS, FLEET_TOOLS, feedPath, handleFleetRpc, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { FLEET_TEXT } from './fleet-text.ts'
 
 function deps(over: Partial<FleetDeps> = {}) {
@@ -340,5 +340,48 @@ describe('send_to_agent (three lines)', () => {
       : { status: 200, json: { id: 3, from: 'chiron', title: 't', ask: '回答 X', deadline: null, waited: '1 分鐘', body: 'b' } }
     expect(msg(await callInboxTool('mailbox_list', {}, r.d, true))).toContain('｜要你：回答 X｜')
     expect(msg(await callInboxTool('mailbox_open', { id: 3 }, r.d, true))).toContain('\n要你：回答 X\n')
+  })
+})
+
+describe('WO-167 feedPath (FEED_ONSEN)', () => {
+  const PATHS = ['/api/feed/posts', '/api/feed/posts/646', '/api/feed/read', '/api/feed/ask', '/api/feed/search?q=ton%20dns&limit=50', '/api/feed/me',
+    '/api/feed/config', '/api/feed/asks?hours=24']
+  test('on: every /api/feed call goes to /api/onsen/feed, the rest of the path and the query as given', () => {
+    expect(PATHS.map(p => feedPath(p, true))).toEqual(['/api/onsen/feed/posts', '/api/onsen/feed/posts/646', '/api/onsen/feed/read', '/api/onsen/feed/ask',
+      '/api/onsen/feed/search?q=ton%20dns&limit=50', '/api/onsen/feed/me', '/api/onsen/feed/config', '/api/onsen/feed/asks?hours=24'])
+    expect(feedPath('/api/feed', true)).toBe('/api/onsen/feed')
+  })
+  test('off: exactly the path as given; anything that is not the wall is never touched', () => {
+    for (const p of PATHS) expect(feedPath(p, false)).toBe(p)
+    for (const p of ['/api/mesh/mail/send', '/api/feeds', '/api/feedback', '/api/onsen/feed/posts', '/x/api/feed/posts']) {
+      expect(feedPath(p, true)).toBe(p)
+      expect(feedPath(p, false)).toBe(p)
+    }
+  })
+  test('the feed tools keep naming /api/feed; with the switch on, the paths they reach are Onsen\'s and the texts are the same', async () => {
+    const card = { id: 300645, legacy_id: 646, time: '2026-11-25T19:21:00+00:00', author: 'epeius', title: 'Mac mini: TUIs', touches: [], ref: null,
+      supersedes: null, superseded_by: null, superseded_by_author: null }
+    const run = async (onsen: boolean) => {
+      const seen: string[] = []
+      const answer = (p: string) => p.endsWith('/posts') ? { id: 300700 } : p.endsWith('/ask') ? { candidates: 1, judged: 1, related: 1, more: 0, unjudged: 0, jev: 'ok',
+        given: [{ ...card, body: '全文', links: [], read: false }] } : p.includes('/search') ? { total: 1, cards: [card] }
+        : p.endsWith('/read') ? { marked: 1 } : p.endsWith('/me') ? { ask: true } : { ...card, body: '全文', links: [], read: false }
+      const { d } = deps({ core: async (m, p) => { const q = feedPath(p, onsen); seen.push(`${m} ${q}`); return { status: 200, json: answer(q) } } })
+      const texts: string[] = []
+      for (const [name, args] of [['feed_post', { title: 't', body: 'b' }], ['feed_ask', { about: '要改 ton 網域' }], ['feed_search', { q: 'mac' }],
+        ['feed_open', { id: 646 }]] as const) {
+        const r = await handleFleetRpc(tool(name, args), d)
+        texts.push(out(r))
+        for (const h of takeAfterSend([r])) await h()
+      }
+      await handleFleetRpc(rpc('tools/list'), d)
+      return { seen, texts }
+    }
+    const on = await run(true), off = await run(false)
+    expect(on.seen).toEqual(['POST /api/onsen/feed/posts', 'POST /api/onsen/feed/ask', 'POST /api/onsen/feed/read', 'GET /api/onsen/feed/search?q=mac&limit=20',
+      'GET /api/onsen/feed/posts/646', 'POST /api/onsen/feed/read', 'GET /api/onsen/feed/me'])
+    expect(off.seen).toEqual(on.seen.map(x => x.replace('/api/onsen/feed', '/api/feed')))
+    expect(on.texts).toEqual(off.texts)
+    expect(on.texts[3]).toContain('#300645｜')
   })
 })

@@ -32,6 +32,14 @@ export interface FleetDeps {
 }
 const TOUCH_MAX = 5
 
+/** WO-167: the feed wall's primary is Onsen's (Fleet Core /api/onsen/feed/*: the same endpoints, request and response shapes, on the same host,
+ *  with the same credential; fleet-core onsen_feed.py). The tools here always name /api/feed/*; server.ts coreFeed sends each call through
+ *  this, with FEED_ONSEN=1 (machine config) as `onsen`. Off: the path as given, exactly as before. */
+export function feedPath(path: string, onsen: boolean): string {
+  if (!onsen || !/^\/api\/feed(?=$|[/?])/.test(path)) return path
+  return `/api/onsen/feed${path.slice('/api/feed'.length)}`
+}
+
 export const FLEET_TOOLS = [
   {
     name: 'call',

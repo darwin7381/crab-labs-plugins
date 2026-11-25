@@ -14,7 +14,7 @@ import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
 import { drainLeftoverDoorbells } from './hub-sync.ts'
-import { callInboxTool, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
+import { callInboxTool, feedPath, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { ONSEN_TEXT_DEFAULT, withOnsenFormat } from './fleet-text.ts'
 import { MailEvents, decisionEvent, WITHIN_S as MAIL_DUE_WITHIN_S } from './mail-events.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
@@ -1650,10 +1650,14 @@ async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): P
 }
 // ---- feed wall (WO-92): Fleet Core /api/feed/*, same credential. Never throws: an unreachable core is
 // a status the tools explain ("改用搜尋" for ask), not a tool crash.
+// WO-167: the wall lives in Onsen (/api/onsen/feed/*, the same endpoints and shapes). FEED_ONSEN=1 (machine config, as MAIL_ONSEN) sends every
+// feed call there (fleet-mail.ts feedPath); unset or 0 = /api/feed as before (the stop switch). Read at start. Callers keep naming /api/feed/*.
 const FLEET_CORE_BASE = (process.env.FLEET_CORE_BASE ?? 'https://core.kbro.ai').replace(/\/+$/, '')
+const FEED_ONSEN = (process.env.FEED_ONSEN ?? '') === '1'
+log('info', `feed: ${FEED_ONSEN ? 'Onsen (/api/onsen/feed, FEED_ONSEN=1)' : 'Fleet Core (/api/feed)'}`)
 async function coreFeed(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 10000): Promise<{ status: number; json: any }> {
   try {
-    const r = await fetch(`${FLEET_CORE_BASE}${path}`, {
+    const r = await fetch(`${FLEET_CORE_BASE}${feedPath(path, FEED_ONSEN)}`, {
       method,
       headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth() },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
