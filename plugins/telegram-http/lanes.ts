@@ -36,7 +36,7 @@ import {
   type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk, mainChatOn, mainSameMatterOn, mainSameMatterP, mainSameMatterRefusal,
 } from './lanes-boundary.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
-import { CHAT_HISTORY_TOOL } from './onsen-tool.ts'   // Onsen (WO-139): the definition only; the query comes through LanesDeps.chatHistory
+import { CHAT_HISTORY_TOOL, FORM_CLOSE_TOOL } from './onsen-tool.ts'   // Onsen (WO-139): the definition only; the query comes through LanesDeps.chatHistory
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING, LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } from './fleet-mail.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
@@ -204,6 +204,8 @@ export interface LanesDeps {
   usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
   /** Onsen (WO-139): the chat_history tool's answer (server.ts: onsen-client.ts queryHistory); absent = no Onsen here */
   chatHistory?: (args: Record<string, unknown>) => Promise<string>
+  /** WO-153: form_close's answer (server.ts: onsen-tool.ts formClose, POST /forms/close); absent = Onsen recording off here, and lanes do not list the tool */
+  formClose?: (args: Record<string, unknown>) => Promise<string>
   /** WO-144: chat_history's answer for a run's opening (server.ts: the same queryHistory, the default chat, counted as a hook's lookup), with the
    *  opening's bounds: Onsen's timeout before the spool answers, the cut of each body. Absent = the block says （這一趟取不到） */
   mainChat?: (a: { limit: number }, o: { timeoutMs: number; cut: number }) => Promise<string>
@@ -266,6 +268,7 @@ export function lanesInit(deps: LanesDeps): void {
     journal = new Journal(join(deps.stateDir ?? LANES_DIR, 'lanes', 'state.jsonl'))
     journal.load()
     if (onsenTap?.journal) journal.observe(onsenTap.journal)          // Onsen step 3 (WO-143): read-only
+    journal.observeLines(l => { if (wakeTap && l.rec === 'wake') tapWake(l) })   // WO-147: the hand-over decisions' wake lines (read only; nothing without a tap)
     main = createMain(mainEnv())
     main.initMain()
     events = createEvents(journal, writeOpenHandoffs)
@@ -840,6 +843,56 @@ function tapRoute(row: Record<string, unknown>, ev?: InEvent): void {
     if (Date.now() - routeTapWarnAt > 3600_000) { routeTapWarnAt = Date.now(); D?.log('warn', `lanes: route tap failed (${e}); the route is unchanged, the record dropped`) }
   }
 }
+// WO-147 (Chiron 09:56Z): the hand-over decisions (#28 handoff_main, #29 a decision card, #30 the deferred cards' batch, #31 a lane run's end) write no
+// routing.jsonl line: each writes ONE event-keyed `wake` / `no_wake` line in the state journal (handToMain, wakeDeferred, addToMain, batchTick, exitRule).
+// The wake tap sees every such line as written (Journal.observeLines), with the decision its caller named (asWake); the M1 item-keyed wake lines (an
+// item's offer, pull, or its no_wake at enqueue) are the delivery of a decision already recorded and are not shown. Read only, like the route tap.
+export type HandKind = 'handoff' | 'card' | 'batch' | 'lane_exit' | 'other'
+/** the decision a caller makes around a hand-over: its kind, a short rule id, how urgent today's rules make it, the lane that made it, the card's mail */
+export type HandDecision = { kind: HandKind; rule: string; urgency?: 'interrupt' | 'ordered' | 'silent'; lane?: string | null; mail_id?: number | null }
+export type WakeTapCtx = HandDecision & {
+  /** the main's M2 record at this moment (null: no gen) */
+  main: { state: string; offered: boolean } | null
+  /** the M1 item this decision gave the main (made inside asWake), or null (a card that can wait, a run that owed nothing) */
+  did: string | null
+  /** the event's record (M3): who it came from, its text, its thread, its Telegram id, a receipt's run */
+  rec: { from: string | null; text: string | null; thread: string | null; tg: string | null; run_id: string | null; mail_id: number | null } | null
+}
+let wakeTap: ((line: Record<string, unknown>, ctx: WakeTapCtx) => void) | null = null
+let handCtx: (HandDecision & { n0: number }) | null = null
+export function observeWakes(fn: ((line: Record<string, unknown>, ctx: WakeTapCtx) => void) | null): void { wakeTap = fn }
+/** the newest M1 item's creation number (0: none) */
+function itemSeq(): number { let n = 0; for (const r of journal?.t.msg.values() ?? []) if (r.n > n) n = r.n; return n }
+/** run `fn` (a hand-over: sync) as decision `c`: the wake tap reads it when the event-keyed wake line is written. With no tap: just `fn()`. */
+function asWake<T>(c: HandDecision, fn: () => T): T {
+  if (!wakeTap) return fn()
+  const prev = handCtx
+  try { handCtx = { ...c, n0: itemSeq() } } catch { handCtx = null }
+  try { return fn() } finally { handCtx = prev }
+}
+function tapWake(line: Record<string, unknown>): void {
+  try {
+    const id = String(line.id ?? '')
+    if (!id || journal.get('msg', id)) return                     // an M1 item's own line: the delivery of a decision recorded already
+    const c = handCtx
+    const g = D?.role === 'tg' && main ? main.currentGen() : null
+    let did: string | null = null
+    if (c) { let best: Row | null = null; for (const r of journal.t.msg.values()) if (r.event === id && r.n > c.n0 && (!best || r.n > best.n)) best = r; did = best?.id ?? null }
+    const e = events?.get(id)
+    const tg = e?.tg as { chat_id?: unknown; message_id?: unknown } | undefined
+    const run = ((e?.obligations ?? []) as Ob[]).find(o => o.kind === 'receipt' && o.run_id)?.run_id
+    wakeTap!(line, {
+      kind: c?.kind ?? 'other', rule: c?.rule ?? 'wake-row', ...(c?.urgency ? { urgency: c.urgency } : {}), lane: c?.lane ?? null, mail_id: c?.mail_id ?? null,
+      main: g ? { state: String(g.state), offered: main.items(r => r.state === 'offered' && r.gen === g.id).length > 0 } : null,
+      did,
+      rec: e ? { from: e.from != null ? String(e.from) : null, text: e.text != null ? String(e.text) : null, thread: e.thread != null ? String(e.thread) : null,
+        tg: tg?.chat_id != null && tg?.message_id != null ? `${tg.chat_id}:${tg.message_id}` : null, run_id: run != null ? String(run) : null,
+        mail_id: typeof e.mail_id === 'number' ? e.mail_id : null } : null,
+    })
+  } catch (err) {
+    if (Date.now() - routeTapWarnAt > 3600_000) { routeTapWarnAt = Date.now(); D?.log('warn', `lanes: wake tap failed (${err}); the decision is unchanged, the record dropped`) }
+  }
+}
 /** /lanes/main-event (and the tests' __mainEvent): the tap sees the event, then M2 handles it */
 function mainEventIn(b: any) {
   try { onsenTap?.mainEvent?.(b) } catch {}
@@ -1316,7 +1369,8 @@ export function laneToolsFor(kind: LaneKind | undefined): any[] {
   // WO-128 (LANES_DEFER_DECISIONS): both take urgent_because; off, Epeius's definitions as 1.38 listed them
   const urg = <T extends { inputSchema: { properties: Record<string, unknown> } }>(t: T): T => deferDecisionsOn() ? ({ ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, urgent_because: URGENT_BECAUSE_PROP } } }) : t
   const dec = decisionsOn() ? [urg(DECIDE_LATER_LANE_TOOL), ...(kind === 'mail' ? [urg(MAILBOX_CARD_LANE_TOOL)] : [])] : []
-  return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS, ...dec] : dec.length ? [...base, ...dec] : base
+  const fc = D?.formClose ? [FORM_CLOSE_TOOL] : []                                 // WO-153: only with Onsen recording on (server.ts gives formClose)
+  return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS, ...dec, ...fc] : dec.length || fc.length ? [...base, ...dec, ...fc] : base
 }
 
 // ------------------------------------------------------------------ WO-127: one round trip (the main answers one decision; the lane that asked finishes)
@@ -1395,7 +1449,8 @@ function dueWake(m: number): string | null {
   const hid = parked ? String(parked.handoff ?? parked.id) : `ho-${shortId()}`
   const carry = { content: `${dueWakeText(hid, w, joeyWords(e))}${e.blocked && blockFactsOn() ? `\n${String(e.blocked)}` : ''}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid, mail_id: String(m) } }
   const what = `信箱 #${m}${w.title ? `「${w.title}」` : ''}快到期（期限 ${w.deadline ? stamp(w.deadline) : '—'}）：要你決定：${w.decide}`
-  return parked ? wakeDeferred(e.id, 'due', lane, what, carry) : handToMain(e.id, lane, what, hid, w.cls, 1000, true, carry, false, { card: true, woke: 'due' })
+  return asWake({ kind: 'card', rule: 'card-due', urgency: 'ordered', lane: w.lane ?? null, mail_id: m },          // WO-147
+    () => parked ? wakeDeferred(e.id, 'due', lane, what, carry) : handToMain(e.id, lane, what, hid, w.cls, 1000, true, carry, false, { card: true, woke: 'due' }))
 }
 /** WO-128: the item of a due wake: the card, the deadline, and how to answer it */
 function dueWakeText(hid: string, w: Wait, said: string): string {
@@ -1478,7 +1533,8 @@ function settleBatch(): void {
  *  earliest of them has waited LANES_DEFER_MAX_WAIT_S, the main is woken once (one M1 item of its own) and the digest riding it lists every card waiting
  *  (「信箱有 N 件等你決定」). One batch at a time: while one is open no other is made. The clock is the cards' own placing time and the batch records, both in
  *  the state journal: a daemon restart keeps it. Run by the due sweep (dueTick). */
-export function batchTick(now = Date.now()): void {
+export function batchTick(now = Date.now()): void { asWake({ kind: 'batch', rule: 'defer-batch', urgency: 'ordered' }, () => batchTickRun(now)) }   // WO-147
+function batchTickRun(now: number): void {
   if (!batchWakeOn() || !events || !main || !S || !journal) return
   let open = false
   const batched = new Set<number>(), untold: Array<{ e: Row; w: Wait }> = []
@@ -1729,7 +1785,7 @@ export function replaceQueuedMain(chat: string, messageId: string, rewrite: Para
 export function toMainDirect(ev: InEvent): void {
   if (D?.role !== 'tg' || !main) return
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: 'router-failed', target: 'main', lane: null, thread: null, note: 'the router threw: the event goes to the main' }, ev)
-  if (events.get(ev.id)) { handToMain(ev.id, undefined, `分流器處理這則訊息時出錯，交給主線：${ev.from}：${String(ev.text ?? '').slice(0, 600)}`); return }
+  if (events.get(ev.id)) { asWake({ kind: 'other', rule: 'handoff-router-failed', urgency: 'ordered' }, () => handToMain(ev.id, undefined, `分流器處理這則訊息時出錯，交給主線：${ev.from}：${String(ev.text ?? '').slice(0, 600)}`)); return }   // WO-147
   toMain(ev, { rule: 'router-failed', target: 'main' })
 }
 
@@ -1798,7 +1854,7 @@ function stopThread(ev: InEvent, t: Thread | null, gate: { why: 'hop' | 'budget'
       if (r?.delivered === true) events.add(ev.id, { kind: 'peer', level: 'stop-notice', to: ev.from.toLowerCase(), owner: 'router', state: 'met', by: 'router', ref: String(r.msgId ?? '') }, { tool: 'router' })
     }).catch(() => {})
   // M3: the peer's message is owed an answer nobody else can give now: the main gets it, once (M4 wakes it through M1)
-  if (D.role === 'tg' && events) handToMain(ev.id, laneId ? S.lanes[laneId] : undefined, text, undefined, undefined, 1000, false)
+  if (D.role === 'tg' && events) asWake({ kind: 'other', rule: 'handoff-thread-stop', urgency: 'ordered', lane: laneId ?? null }, () => handToMain(ev.id, laneId ? S.lanes[laneId] : undefined, text, undefined, undefined, 1000, false))   // WO-147
   return { rule: 'thread-gate', target: 'ledger', lane: laneId ?? undefined, note: why, thread: t?.id ?? ev.thread ?? undefined }
 }
 /** 002f: a stopped thread stays stopped. The stop itself was handed to the main once (kind=stop wakes it). What the peer sends on
@@ -2478,7 +2534,7 @@ function queueSteering(lane: Lane, left: SteerRec[], why: string): void {
   if (lane.status === 'closed') {                                          // PL7 (P21): the lane was closed: Joey's message goes to the main (the one hand-over), never only to the ledger
     for (const s of left) {
       ledger({ lane: lane.id, thread: lane.thread, event: s.ev.id, kind: 'fyi', text: `${lane.id} 在 Joey 的訊息送到之前被關掉了（${why}），訊息交給主線：${clip(s.ev.text, 200)}`, refs: { steer: 'lane-closed', id: s.ev.id, run: s.run } })
-      if (events.openObs(s.ev.id).length) handToMain(s.ev.id, lane, `${lane.id} 在 Joey 的訊息送到之前被關掉了，這則沒有處理：${s.ev.text}`, undefined, s.ev.cls ?? s.ev.trigger)
+      if (events.openObs(s.ev.id).length) asWake({ kind: 'lane_exit', rule: 'exit-closed', urgency: 'ordered', lane: lane.id }, () => handToMain(s.ev.id, lane, `${lane.id} 在 Joey 的訊息送到之前被關掉了，這則沒有處理：${s.ev.text}`, undefined, s.ev.cls ?? s.ev.trigger))   // WO-147
     }
     return
   }
@@ -2740,10 +2796,10 @@ function endTask(it: QItem, lane: Lane | undefined, why: string, reached: string
       return
     case 'synthesis':                                                    // the main asked for one conclusion: it gets what the synthesis reached
       fo!.done = nowIso(); saveState()
-      handToMain(it.ev.id, lane, `扇出 ${fo!.id} 的綜合線沒有交回結論就結束了（${why}）`, `syn-${shortId()}`, undefined, 1000, false, {
+      asWake({ kind: 'lane_exit', rule: 'exit-synthesis', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => handToMain(it.ev.id, lane, `扇出 ${fo!.id} 的綜合線沒有交回結論就結束了（${why}）`, `syn-${shortId()}`, undefined, 1000, false, {
         content: `〔扇出結果｜${fo!.id}〕主線交辦的「${(fo!.brief ?? '').slice(0, 80)}」，綜合線沒有用 deliver_synthesis 交回結論就結束了（${why}）。它做到的：${r ? r.slice(0, 1500) : '（沒有文字結果）'}\n\n`
           + `各塊交回的結果在帳本（ledger_query(text="扇出 ${fo!.id}")）。請你收尾，把結論回給要的人（通常是 Joey）。`,
-        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } })
+        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } }))
       return
     case 'curator':                                                      // the write right comes back, and the main is told once
       curatorEnd(it.lane, 'ended', `${why}${r ? `；它最後寫的：${r.slice(0, 300)}` : ''}`)
@@ -2772,8 +2828,10 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?:
   else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
   if (again) return
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
-  endTask(it, lane, endWords(e.reason, it), e.reached ?? '')
-  exitRule(lane, it, gaveUp ? failedHandoffText(it) : e.said ?? '', gaveUp ? HANDOVER_RECORD_MAX : 1000)
+  asWake({ kind: 'lane_exit', rule: gaveUp ? 'exit-failed' : 'exit-owes', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => {   // WO-147
+    endTask(it, lane, endWords(e.reason, it), e.reached ?? '')
+    exitRule(lane, it, gaveUp ? failedHandoffText(it) : e.said ?? '', gaveUp ? HANDOVER_RECORD_MAX : 1000)
+  })
 }
 /** a lane process left by the previous daemon: stop it if it is really that run (the pid may belong to something else by now) */
 function reapOrphan(pid: number, run: string): void {
@@ -4958,6 +5016,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
   switch (name) {
     case 'notify_joey': return joeyLine(tok, lane, 'notify_joey', a)
     case 'chat_history': return D.chatHistory ? D.chatHistory(a ?? {}) : 'chat_history：這個常駐程式沒有接上 Onsen。'   // Onsen (WO-139)
+    case 'form_close': return D.formClose ? D.formClose(a ?? {}) : 'form_close：這個常駐程式沒有開 Onsen 紀錄。'   // WO-153
     case 'reply_agent': {
       // lanes-golive (C2): the three lines, with fleet-mail.ts's rules and words (mail by default; a call only with a because, or as the answer to a call)
       a = answerToCallArgs(a, queue.get(tok.evId)?.ev)      // WO-140: no line, answering the call that started this run → a call back (reply_to filled in)
@@ -5059,7 +5118,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
           const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null              // WO-132 (item 4): what the guard refused rides the item that wakes the main
           if (bl) noteBlocked(tok)
           w.handed = true
-          const hid = cardWake(tok, lane, w, bl)
+          const hid = asWake({ kind: 'card', rule: 'card-now', urgency: 'interrupt', lane: lane.id, mail_id: m }, () => cardWake(tok, lane, w, bl))   // WO-147
           tok.parked = true
           logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, mail_id: m, main_phase: main?.mainPhase() ?? null, woke: 'urgent',
             ...(crit ? { urgent_by: 'critical' } : {}) })
@@ -5071,8 +5130,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
           // WO-128: the card waits in the main's mailbox; the run's event waits on the decision with it (handed to the main, not woken: its line to Joey is the
           // decision run's). A later handoff_main of this run wakes the main (wakeDeferred).
           if (!((events.get(tok.evId)?.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested')))
-            handToMain(tok.evId, lane, `${laneLabel(lane)} 在信 #${m} 附了決定卡（等得起）：要你決定：${w.decide}`, `ho-${shortId()}`, tok.cls, 1000, true, undefined, false,
-              { defer: true, card: true, answerDue: deadlineMs(w.deadline) })
+            asWake({ kind: 'card', rule: 'card-deferred', urgency: 'silent', lane: lane.id, mail_id: m },                      // WO-147
+              () => handToMain(tok.evId, lane, `${laneLabel(lane)} 在信 #${m} 附了決定卡（等得起）：要你決定：${w.decide}`, `ho-${shortId()}`, tok.cls, 1000, true, undefined, false,
+                { defer: true, card: true, answerDue: deadlineMs(w.deadline) }))
           tok.parked = true
           return `${String(r.text ?? '')} It can wait: the main is not woken for it. It sees the card the next time it is woken (its digest lists what waits on its decision) and is woken `
             + 'alone shortly before the deadline; the decision comes back to the mail lane as a run that finishes it (reply, check off, one line to Joey). Do not hand this card over with '
@@ -5090,8 +5150,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (urgency === 'defer') {
         // WO-128 (item 1): it can wait: handed to the main (its Joey line, a peer's answer, a receipt are the main's until the decision comes back), not woken
         const dueMs = deadlineMs(w.deadline)
-        const hid = handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」（等得起）：要你決定：${w.decide}`, hid0, tok.cls, 1000, true, undefined, true,
-          { defer: true, card: true, answerDue: dueMs })
+        const hid = asWake({ kind: 'card', rule: 'card-deferred', urgency: 'silent', lane: lane.id, mail_id: m },              // WO-147
+          () => handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」（等得起）：要你決定：${w.decide}`, hid0, tok.cls, 1000, true, undefined, true,
+            { defer: true, card: true, answerDue: dueMs }))
         tok.handedOver = true
         logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, mail_id: m, main_phase: main?.mainPhase() ?? null, defer: true })
         let told = ''
@@ -5100,9 +5161,10 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
           + 'what waits on its decision) and is woken alone shortly before the deadline; the decision comes back to this thread as a new run, which finishes the matter and tells Joey. '
           + `Do not tell Joey about it now; close this run with receipt.${told}`
       }
-      const hid = handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」：要你決定：${w.decide}`, hid0, tok.cls, 1000, true,
-        { content: `${decisionHandoverText(hid0, lane, w, joeyWords(events.get(tok.evId)))}${bl ? `\n${blockedLine(bl)}` : ''}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid0, mail_id: String(m) } }, true,
-        urgency ? { card: true, woke: 'urgent' } : {})
+      const hid = asWake({ kind: 'card', rule: 'card-now', urgency: 'interrupt', lane: lane.id, mail_id: m },                    // WO-147
+        () => handToMain(tok.evId, lane, `${laneLabel(lane)} 把要主線決定的事放進信箱 #${m}「${w.title}」：要你決定：${w.decide}`, hid0, tok.cls, 1000, true,
+          { content: `${decisionHandoverText(hid0, lane, w, joeyWords(events.get(tok.evId)))}${bl ? `\n${blockedLine(bl)}` : ''}`, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid0, mail_id: String(m) } }, true,
+          urgency ? { card: true, woke: 'urgent' } : {}))
       tok.handedOver = true
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, mail_id: m, main_phase: main?.mainPhase() ?? null,
         ...(crit ? { urgent_by: 'critical' } : {}) })
@@ -5196,7 +5258,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null            // WO-132 (item 4): what the guard refused rides the item that wakes the main
         if (bl) noteBlocked(tok)
         const full = bl ? `${full0.slice(0, HANDOVER_RECORD_MAX - blockedLine(bl).length - 1)}\n${blockedLine(bl)}` : full0   // wakeDeferred keeps HANDOVER_RECORD_MAX
-        const hid = wakeDeferred(tok.evId, 'urgent', lane, full)
+        const hid = asWake({ kind: 'handoff', rule: 'handoff-woke-deferred', urgency: 'interrupt', lane: lane.id }, () => wakeDeferred(tok.evId, 'urgent', lane, full))   // WO-147
         tok.handedOver = true
         logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null, woke: 'urgent' })
         return 'handed to the main: it is woken now with your text (this matter was waiting in its mailbox). It takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.'
@@ -5207,7 +5269,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (wm?.card) {
         const bl = blockFactsOn() ? blockedFacts(tok.blocked) : null
         if (bl) noteBlocked(tok)
-        const hid = addToMain(tok.evId, wm, lane, bl ? `${text.slice(0, HANDOVER_RECORD_MAX - blockedLine(bl).length - 1)}\n${blockedLine(bl)}` : text)
+        const hid = asWake({ kind: 'handoff', rule: 'handoff-addToMain', urgency: 'interrupt', lane: lane.id },              // WO-147
+          () => addToMain(tok.evId, wm, lane, bl ? `${text.slice(0, HANDOVER_RECORD_MAX - blockedLine(bl).length - 1)}\n${blockedLine(bl)}` : text))
         tok.handedOver = true
         logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null, woke: 'urgent', added: true })
         return `handed to the main: your text goes to it with the hand-over its card already woke it for (${hid}). It takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.`
@@ -5225,7 +5288,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       const body = bl ? `${full.slice(0, cap)}\n${blockedLine(bl)}` : full
       if (bl) noteBlocked(tok)
       // 002y (X-3): the request itself is the main's from here, whether the lane replied to the peer before this call or replies after it
-      const hid = handToMain(tok.evId, lane, body, `ho-${shortId()}`, tok.cls, bl ? body.length : cap, true, undefined, true)
+      const hid = asWake({ kind: 'handoff', rule: 'handoff_main', urgency: 'ordered', lane: lane.id }, () => handToMain(tok.evId, lane, body, `ho-${shortId()}`, tok.cls, bl ? body.length : cap, true, undefined, true))   // WO-147
       tok.handedOver = true                                               // WO-125 (C): its steps not done are the main's now (stepsRefusal)
       logos('lane.escalate', { lane: lane.id, thread: lane.thread, event: tok.evId, class: tok.cls, to: 'main', handoff: hid, main_phase: main?.mainPhase() ?? null })
       // 002j: when another agent is waiting for this, the router tells it who decides and by when (fixed words, the router's own line); the answer is
@@ -5324,8 +5387,8 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (fo) { fo.done = nowIso(); saveState() }
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: `綜合結論交給主線：${text.slice(0, 300)}`, refs: { fanout: tok.synthesis } })
       // PL7: the conclusion is owed to the main: the one hand-over of the synthesis event, carried by a carry item
-      handToMain(tok.evId, lane, `扇出 ${tok.synthesis} 的綜合結論`, `syn-${shortId()}`, undefined, 1000, false, { content: `〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`,
-        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } })
+      asWake({ kind: 'handoff', rule: 'handoff-synthesis', urgency: 'ordered', lane: lane.id }, () => handToMain(tok.evId, lane, `扇出 ${tok.synthesis} 的綜合結論`, `syn-${shortId()}`, undefined, 1000, false, { content: `〔扇出結果｜${tok.synthesis}〕主線交辦的「${(fo?.brief ?? '').slice(0, 80)}」，${fo?.members.length ?? '?'} 條查詢線的結果已由綜合線整理成一份：\n\n${text}\n\n請你把結論回給要的人（通常是 Joey）。`,
+        meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'synthesis' } }))
       logos('lane.synthesis', { fanout: tok.synthesis, lane: lane.id, queued: true, chars: text.length })
       return 'queued for the main: it gets your conclusion when it is free (at once if it is idle).'
     }
@@ -5674,7 +5737,11 @@ function declineAid(tok: RunTok): string | null {
 // 002w (A): over the run's event set (runEvents): Joey's messages steered into an earlier attempt and those riding in it (`extra`) as well.
 function exitRule(lane: Lane | undefined, it: QItem, said: string, max = 1000): void {
   const owing = runEvents(it).map(ev => ({ ev, open: events.openObs(ev.id) })).filter(x => x.open.length)
-  if (!owing.length) { journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run ended; the event owes nothing more: recorded only' }); return }
+  if (!owing.length) {
+    asWake({ kind: 'lane_exit', rule: 'exit-none', urgency: 'silent', lane: lane?.id ?? it.lane },          // WO-147
+      () => journal.write('wake', it.ev.id, 'no_wake', { reason: 'the run ended; the event owes nothing more: recorded only' }))
+    return
+  }
   for (const { ev, open } of owing) {
     const what = open.map(o => o.kind === 'joey' ? 'Joey 還沒收到這件事的回報' : o.kind === 'peer' ? `${o.to} 還在等回答` : `排程 run ${o.run_id} 還沒有回執`).join('；')
     handToMain(ev.id, lane, `${lane?.id ?? it.lane} 處理 ${ev.from} 的事，結束時還欠：${what}。請主線接手並回報（由你回報 Joey 一次）。${said}\n原文：${ev.text.slice(0, 300)}`, undefined,
@@ -5725,8 +5792,9 @@ function curatorEnd(laneId: string, how: 'done' | 'revoked' | 'ended', summary: 
   ledger({ lane: how === 'revoked' ? 'main' : laneId, kind: 'action',
     text: how === 'done' ? `整理線交回記憶寫入權：${summary.slice(0, 400)}` : how === 'revoked' ? `主線收回記憶寫入權（${laneId}）；還沒處理的記憶提案留在帳本，沒有丟。`
       : `整理線 ${laneId} 沒有交回記憶寫入權就結束了（${summary.slice(0, 300)}）；寫入權回到主線，還沒處理的記憶提案留在帳本，沒有丟。`, refs: { write_right: 'main', from: laneId, how } })
-  if (how === 'ended' && c.event) handToMain(c.event, S.lanes[laneId], `整理線 ${laneId} 沒有用 curator_done 交回記憶寫入權就結束了（${summary.slice(0, 300)}）。`
-    + '寫入權已經回到你手上，記憶目錄又只有你寫；它沒處理的記憶提案還開著（memory_decide 決定，或之後再 curate_memory）。', undefined, undefined, 1000)
+  if (how === 'ended' && c.event) asWake({ kind: 'lane_exit', rule: 'exit-curator', urgency: 'ordered', lane: laneId },             // WO-147
+    () => handToMain(c.event!, S.lanes[laneId], `整理線 ${laneId} 沒有用 curator_done 交回記憶寫入權就結束了（${summary.slice(0, 300)}）。`
+      + '寫入權已經回到你手上，記憶目錄又只有你寫；它沒處理的記憶提案還開著（memory_decide 決定，或之後再 curate_memory）。', undefined, undefined, 1000))
   if (how === 'done') {          // 002k (D1): the curator went through the proposals it was given: none is left open for ever (M3 holds their state)
     const given = new Set(c.given ?? [])
     for (const { e, p } of proposalsOf(p => given.has(p.id) && !p.decision)) {

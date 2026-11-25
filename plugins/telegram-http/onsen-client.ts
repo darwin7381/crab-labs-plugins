@@ -898,7 +898,7 @@ export function formatFull(m: any, joey = ''): string {
   return `${whenUtc(m.at)}｜${whoOf(m, joey)}｜${ref(m)}${extra ? `｜${extra}` : ''}\n${String(m.body ?? '')}${att}${evLines.length ? `\n事件：\n${evLines.join('\n')}` : ''}`
 }
 
-export { CHAT_HISTORY_TOOL } from './onsen-tool.ts'
+export { CHAT_HISTORY_TOOL, FORM_CLOSE_TOOL, formClose } from './onsen-tool.ts'
 
 // ------------------------------------------------------------------ wiring helpers for server.ts
 /** this agent's fleet name: LANES_AGENT, else AGENT_INBOX_SELF, else the workspace dir's claude-<name> */

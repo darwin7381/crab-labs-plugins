@@ -4,20 +4,24 @@
 //       an alert, a board push, the watchdog's keep-warm, an external program's no_reply notice) makes exactly one wake row, with its fields; the rows equal
 //       routing.jsonl's lines, one for one
 //   off (no switch): the same events, the same routing.jsonl rule / target; no wake row, no /wake/batch call
+//   1.49.1: the hand-over decisions (#28 handoff_main, #29 a decision card now / can wait, #30 the deferred cards' batch, #31 a lane run's end) from real
+//       lane runs (test-fixtures/lane-tool.ts calls the lane tool on the daemon's /lane-mcp), one row per event-keyed wake line of the state journal; the
+//       same lines with the switch off. Rows = routing.jsonl lines + event-keyed wake lines, always.
 //   Onsen down, then up (and its first answer lost): routing goes on at the same speed, the rows wait in the spool, arrive after, none twice
 // Mesh events reach the daemon the way the agent-inbox daemon sends every one of them with lanes on: POST /lanes/route with the loopback token.
 import { test, expect, afterAll, beforeAll } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { startBotApiMock, dm, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
+import { HAND_RULES } from './onsen-wake.ts'
 
 const JOEY = 1828
 const CRED_ON = 'mesh_WAKEonSECRETsecretSECRETsecret0123456', CRED_OFF = 'mesh_WAKEoffSECRETsecretSECRETsecret012345'
 type Who = 'on' | 'off'
 let apiOn: BotApiMock, apiOff: BotApiMock, on: TgDaemon, off: TgDaemon, onsenPort: number, root = ''
-let up: ReturnType<typeof Bun.serve> | null = null
+let up: ReturnType<typeof Bun.serve> | null = null, inboxSrv: ReturnType<typeof Bun.serve> | null = null
 const calls: Array<{ who: Who; path: string; n: number }> = []
 const wakePosted: Array<{ who: Who; item: any }> = []            // every wake item POSTed (a resend shows twice here)
 const wakeRows = new Map<string, { who: Who; id: number; item: any }>()   // what the stand-in stored, by idem_key (Onsen's UNIQUE)
@@ -62,6 +66,13 @@ function startOnsen(): void {
 const rows = (who: Who) => [...wakeRows.values()].filter(r => r.who === who).map(r => r.item)
 const jl = (d: TgDaemon, f: string): any[] => { try { return readFileSync(join(d.ws, '.lanes', f), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
 const routing = (d: TgDaemon) => jl(d, 'routing.jsonl')
+const stateLines = (d: TgDaemon): any[] => { try { return readFileSync(join(d.stateDir, 'lanes', 'state.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
+/** the state journal's event-keyed wake lines (no M1 item record has that id): one Onsen row each */
+const eventWakes = (d: TgDaemon): any[] => { const j = stateLines(d), items = new Set(j.filter(l => l.rec === 'msg').map(l => l.id)); return j.filter(l => l.rec === 'wake' && !items.has(l.id)) }
+const isHand = (r: any) => HAND_RULES.includes(r.rule)
+/** a hand-over line with its random ids taken out (the same decision in two daemons) */
+const norm = (s: unknown) => String(s ?? '').replace(/\b(ho|syn)-[0-9a-f]{6}\b/g, '$1-*').replace(/\bbatch-[0-9a-z]+-[0-9a-f]{6}\b/g, 'batch-*').replace(/#\d+/g, '#*')
+const wakeKey = (l: any) => `${norm(l.id)}|${l.state}|${norm(l.reason)}`
 const spoolWake = (d: TgDaemon): any[] => { const p = join(d.stateDir, 'onsen', 'spool.jsonl'); return existsSync(p) ? readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(l => l.k === 'w') : [] }
 async function route(d: TgDaemon, ev: any): Promise<{ d: any; ms: number }> {
   const tok = readFileSync(join(root, d === on ? 'on' : 'off', 'tok', String(d.port)), 'utf8').trim()
@@ -94,17 +105,29 @@ beforeAll(async () => {
   mkdirSync(join(root, 'cred'), { recursive: true })
   writeFileSync(join(root, 'cred', 'on'), CRED_ON + '\n'); writeFileSync(join(root, 'cred', 'off'), CRED_OFF + '\n')
   writeFileSync(join(root, 'registry.json'), JSON.stringify({ eve: { url: 'http://127.0.0.1:9' }, adam: { url: 'http://127.0.0.1:9' } }))
+  // a stand-in agent-inbox daemon (the lanes' mailbox calls: decide_later puts the card in the main's mailbox, as BTCC answers through fleet-mail.ts)
+  const inboxPort = await freePort()
+  let mailId = 15000
+  inboxSrv = Bun.serve({ port: inboxPort, hostname: '127.0.0.1', async fetch(req) {
+    const u = new URL(req.url), body = req.method === 'POST' ? await req.json().catch(() => ({})) : {}
+    if (u.pathname === '/lanes/mail-tool' && body?.name === 'decide_later') { const id = ++mailId; return Response.json({ text: `放進主線的信箱了（#${id}）。`, isError: false, mail_id: id, deadline: new Date(Date.now() + 3600_000).toISOString() }) }
+    if (u.pathname === '/lanes/mail-tool') return Response.json({ text: 'ok', isError: false })
+    return Response.json({})
+  } })
+  const laneBin = join(root, 'lane-tool.sh')
+  writeFileSync(laneBin, `#!/bin/sh\nexec "${process.execPath}" "${join(import.meta.dir, 'test-fixtures', 'lane-tool.ts')}" "$@"\n`)
+  chmodSync(laneBin, 0o755)
   const base = { ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude', ONSEN_REGISTRY_CLI: '0',
-    ONSEN_FORM_LINKS: 'adam', AGENT_INBOX_REGISTRY: join(root, 'registry.json') }
+    ONSEN_FORM_LINKS: 'adam', AGENT_INBOX_REGISTRY: join(root, 'registry.json'), LANES_CLAUDE_BIN: laneBin, LANES_INBOX_PORT: String(inboxPort), LANES_DEFER_MAX_WAIT_S: '2' }
   on = await startTgDaemon(apiOn, join(root, 'on'), JOEY, { ...base, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'on'), ONSEN_WAKE_LOG: 'someone-else, adam', ONSEN_HOST: 'lab-host' })
   off = await startTgDaemon(apiOff, join(root, 'off'), JOEY, { ...base, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'off'), ONSEN_WAKE_LOG: 'someone-else' })
   for (const d of [on, off]) expect(await until(() => { try { return !!readFileSync(join(root, d === on ? 'on' : 'off', 'tok', String(d.port)), 'utf8').trim() } catch { return false } }, 10000)).toBe(true)
 }, 90000)
-afterAll(async () => { await on?.stop(); await off?.stop(); apiOn?.stop(); apiOff?.stop(); up?.stop(true) })
+afterAll(async () => { await on?.stop(); await off?.stop(); apiOn?.stop(); apiOff?.stop(); up?.stop(true); inboxSrv?.stop(true) })
 
-/** the on-daemon's wake rows equal its routing.jsonl lines, and stay so for a moment (nothing in flight) */
+/** the on-daemon's wake rows equal its routing.jsonl lines plus its event-keyed wake lines, and stay so for a moment (nothing in flight) */
 async function settled(ms = 30000): Promise<boolean> {
-  const same = () => rows('on').length === routing(on).length
+  const same = () => rows('on').length === routing(on).length + eventWakes(on).length
   if (!await until(same, ms)) return false
   await sleep(1200)
   return until(same, ms)
@@ -121,11 +144,14 @@ test('on / off: the 9 sources, one wake row each with its fields; routing.jsonl 
   // the routes are the same with the switch and without it
   const key = (r: any) => `${r.event}|${r.rule}|${r.target}|${r.lane ? String(r.lane).replace(/\.\d+$/, '') : ''}`
   for (const id of ids) expect(routing(on).filter(r => r.event === id).map(key)).toEqual(routing(off).filter(r => r.event === id).map(key))
-  // one row per routing.jsonl line, in the same order (a route record's idem_key counts up), each source with its fields
-  const mine = rows('on'), lines = routing(on)
+  // one row per routing.jsonl line, in the same order (a row's idem_key counts up), each source with its fields; the lane runs' ends are hand-over rows
+  const all = rows('on'), mine = all.filter(r => !isHand(r)), lines = routing(on)
+  expect(all.length).toBe(lines.length + eventWakes(on).length)
   expect(mine.length).toBe(lines.length)
   expect([...mine].sort((a, b) => Number(a.idem_key.split(':').pop()) - Number(b.idem_key.split(':').pop())).map(r => `${r.refs.event_id}|${r.rule}`))
     .toEqual(lines.map(l => `${l.event}|${l.rule}`))
+  expect(all.filter(isHand).map(r => `${r.refs.event_id}|${r.at}|${r.note}`).sort()).toEqual(eventWakes(on).map(l => `${l.id}|${l.ts}|${l.reason}`).sort())
+  expect(eventWakes(on).map(wakeKey).sort()).toEqual(eventWakes(off).map(wakeKey).sort())          // the state journal's decisions: the same with the switch off
   const want: Array<[string, string, string, string, string, Record<string, string>]> = [
     ['tg-1828-7001', 'joey_tg', 'interrupt', 'tg-main', 'held:offline', { tg: '1828:7001' }],
     ['tg-1828-form-9101', 'joey_form', 'interrupt', 'web-form', 'held:offline', { form_id: '601', tg: '1828:form-9101' }],
@@ -154,13 +180,49 @@ test('on / off: the 9 sources, one wake row each with its fields; routing.jsonl 
   expect(spoolWake(off).length).toBe(0)
   expect(rows('off').length).toBe(0)
   const h = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
-  expect(h.onsen.wake_recorded).toBe(lines.length)
-  expect(h.onsen.status.wake_log).toEqual({ on: true, recorded: lines.length })
+  expect(h.onsen.wake_recorded).toBe(all.length)
+  expect(h.onsen.status.wake_log).toEqual({ on: true, recorded: all.length })
   const hOff = await fetch(`http://127.0.0.1:${off.port}/healthz`).then(r => r.json()) as any
   expect(hOff.onsen.wake_recorded).toBe(0); expect(hOff.onsen.status.wake_log).toBeUndefined()
   expect(on.log()).toContain('onsen: wake log on for adam (host lab-host)')
   expect(off.log()).not.toContain('onsen: wake log on')
   expect(on.log()).not.toContain(CRED_ON)
+}, 120000)
+
+test('1.49.1 the hand-over decisions from real lane runs: handoff_main, card-now, card-deferred, then the batch; each one row per event-keyed wake line, joined (id, ts, reason); the same lines with the switch off', async () => {
+  const evs = [mesh('mesh-h1', 'eve', '[[HANDOFF]] 能答應週五給報表嗎？', { btcc_msg_id: 'h1', line: 'call', verified: 'true' }),
+    mesh('mesh-h2', 'eve', '[[CARD-NOW]] api-gw 的 timeout 今天要定', { btcc_msg_id: 'h2', line: 'call', verified: 'true' }),
+    mesh('mesh-h3', 'eve', '[[CARD-DEFER]] 下季的預算格式要不要改', { btcc_msg_id: 'h3', line: 'call', verified: 'true' })]
+  for (const d of [on, off]) for (const ev of evs) expect((await route(d, JSON.parse(JSON.stringify(ev)))).d).toMatchObject({ rule: 'mesh-peer-call', target: 'lane' })
+  const has = (d: TgDaemon, f: (l: any) => boolean) => eventWakes(d).some(f)
+  for (const d of [on, off]) {
+    expect(await until(() => has(d, l => l.id === 'mesh-h1' && /owed to the main/.test(l.reason)) && has(d, l => l.id === 'mesh-h2' && /owed to the main/.test(l.reason))
+      && has(d, l => l.id === 'mesh-h3' && /can wait/.test(l.reason)) && has(d, l => String(l.id).startsWith('batch-')), 30000)).toBe(true)
+    expect(await until(() => evs.every(e => has(d, l => l.id === e.id && /the run ended|結束時還欠|owed to the main/.test(l.reason) && eventWakes(d).filter(x => x.id === e.id).length >= 2)), 30000)).toBe(true)
+  }
+  expect(await settled()).toBe(true)
+  const hand = rows('on').filter(isHand), mine = (id: string) => hand.filter(r => r.refs.event_id === id)
+  expect(mine('mesh-h1').filter(r => r.rule === 'handoff_main')).toEqual([expect.objectContaining({ source_kind: 'handoff', urgency: 'ordered', target: 'held:offline', member_state: 'offline' })])
+  expect(mine('mesh-h1').find(r => r.rule === 'handoff_main')!.refs.did).toMatch(/^m-/)
+  expect(mine('mesh-h2').filter(r => r.rule === 'card-now')).toEqual([expect.objectContaining({ source_kind: 'card', urgency: 'interrupt', target: 'held:offline', refs: expect.objectContaining({ mail_id: expect.stringMatching(/^\d+$/) }) })])
+  expect(mine('mesh-h3').filter(r => r.rule === 'card-deferred')).toEqual([expect.objectContaining({ source_kind: 'card', urgency: 'silent', target: 'none' })])
+  expect(mine('mesh-h3').find(r => r.rule === 'card-deferred')!.refs.did).toBeUndefined()
+  const batch = hand.filter(r => r.source_kind === 'batch')
+  expect(batch).toEqual([expect.objectContaining({ rule: 'defer-batch', urgency: 'ordered', target: 'held:offline', sender: 'lanes' })])
+  for (const e of evs) expect(mine(e.id).filter(r => r.source_kind === 'lane_exit').length).toBe(1)        // each run's end: one lane_exit row (its exit rule's one line)
+  // per kind, exact: the hand-over rows of each kind join the state journal's lines one for one, and nothing else
+  const lines = eventWakes(on)
+  expect(hand.map(r => `${r.refs.event_id}|${r.at}|${r.note}`).sort()).toEqual(lines.map(l => `${l.id}|${l.ts}|${l.reason}`).sort())
+  for (const k of ['handoff', 'card', 'batch', 'lane_exit']) {
+    const ks = hand.filter(r => r.source_kind === k)
+    expect(ks.length).toBeGreaterThan(0)
+    for (const r of ks) expect(lines.filter(l => l.id === r.refs.event_id && l.ts === r.at && l.reason === r.note).length).toBeGreaterThanOrEqual(1)
+  }
+  expect(rows('on').length).toBe(routing(on).length + lines.length)
+  // the switch off: the same routes and the same state journal decisions
+  for (const e of evs) expect(routing(on).filter(r => r.event === e.id).map(r => `${r.rule}|${r.target}`)).toEqual(routing(off).filter(r => r.event === e.id).map(r => `${r.rule}|${r.target}`))
+  expect(eventWakes(on).map(wakeKey).sort()).toEqual(eventWakes(off).map(wakeKey).sort())
+  expect(rows('off').length).toBe(0)
 }, 120000)
 
 test('Onsen down, then up with its first answer lost: routing unaffected, the rows written meanwhile arrive, none twice', async () => {
@@ -198,9 +260,12 @@ test('Onsen down, then up with its first answer lost: routing unaffected, the ro
   expect(sent.length).toBeGreaterThan(new Set(sent).size)                           // a resend happened …
   const stored = rows('on').map(r => r.idem_key)
   expect(stored.length).toBe(new Set(stored).size)                                  // … and nothing is stored twice
-  expect(rows('on').length).toBe(routing(on).length)
+  expect(rows('on').length).toBe(routing(on).length + eventWakes(on).length)
   expect(routing(on).length).toBeGreaterThanOrEqual(before + evs.length)
-  for (const e of evs) expect(rows('on').filter(r => r.refs.event_id === e.id).length).toBe(routing(on).filter(r => r.event === e.id).length)
+  for (const e of evs) {
+    expect(rows('on').filter(r => r.refs.event_id === e.id && !isHand(r)).length).toBe(routing(on).filter(r => r.event === e.id).length)
+    expect(rows('on').filter(r => r.refs.event_id === e.id && isHand(r)).length).toBe(eventWakes(on).filter(l => l.id === e.id).length)
+  }
   const h2 = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
   expect(h2.onsen.duplicates).toBeGreaterThan(0)
   expect(h2.onsen.pending_bytes).toBe(0)

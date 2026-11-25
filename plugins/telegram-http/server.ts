@@ -388,8 +388,9 @@ const FORM_REF = /^form-\d+$/
 async function formLinks(chat: string, text: string, who: string): Promise<{ text: string; redact: Array<[string, string]> }> {
   if (!ONSEN_VISIBLE.forms || !onsen || !text) return { text, redact: [] }
   try {
-    const r = await OnsenVisible.rewriteFormLinks(text, { hosts: ONSEN_FORM_HOSTS, chat, create: async title => {
-      const a = await onsen!.request('POST', '/forms', { chat, title }, 3_000)
+    // WO-153: the link as written (without the key) goes with the form, so Onsen checks that page at once
+    const r = await OnsenVisible.rewriteFormLinks(text, { hosts: ONSEN_FORM_HOSTS, chat, create: async (title, url) => {
+      const a = await onsen!.request('POST', '/forms', { chat, title, url }, 3_000)
       if (!a) throw new Error('no mesh credential')
       if (a.status < 200 || a.status >= 300 || typeof a.json?.key !== 'string') throw new Error(`Onsen /forms answered HTTP ${a.status}`)
       return { id: Number(a.json.id), key: String(a.json.key), expires_at: a.json.expires_at }
@@ -2175,6 +2176,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     ...(Lanes.LANES_ON ? [...Lanes.mainToolDefs(), noteDecideListed(serverSessionId.get(mcp))] : []),
     ...(onsen ? [Onsen.CHAT_HISTORY_TOOL] : []),   // Onsen (WO-139): not main-only; every lane has it too (lanes.ts LANE_TOOLS)
+    ...(onsen?.cfg.record ? [Onsen.FORM_CLOSE_TOOL] : []),   // WO-153: close a page form it sent (recording on only); every lane has it too (LanesDeps.formClose)
   ],
  })
 })
@@ -2207,6 +2209,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (Lanes.LANES_ON && !INBOX_ONLY && req.params.name === DECIDE_TOOL.name) {
     if (await Lanes.notMainSession(serverSessionId.get(mcp))) return { content: [{ type: 'text', text: Lanes.notMainRefusal(req.params.name) }], isError: true }
     const r = await inboxDecide(args)
+    return { content: [{ type: 'text', text: r.text }], ...(r.isError ? { isError: true } : {}) }
+  }
+  // WO-153: close a page form this agent sent (Onsen POST /forms/close, this daemon's mesh credential); recording on only
+  if (onsen?.cfg.record && req.params.name === Onsen.FORM_CLOSE_TOOL.name) {
+    const r = await Onsen.formClose((m, p, b, t) => onsen.request(m, p, b, t), args)
+    if (!r.isError) log('info', `onsen: form_close ${JSON.stringify({ id: args.id ?? null, url: args.url ?? null })} → ${r.text.slice(0, 200)}`)
     return { content: [{ type: 'text', text: r.text }], ...(r.isError ? { isError: true } : {}) }
   }
   // Onsen (WO-139): the conversation's history, read only (Onsen; its local spool when Onsen does not answer)
@@ -4339,6 +4347,7 @@ if (Lanes.LANES_ON) {
       },
       joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
       chatHistory: (a: Record<string, unknown>) => onsen ? onsen.queryHistory(a) : Promise.resolve('chat_history：這個常駐程式沒有接上 Onsen。'),   // Onsen (WO-139)
+      ...(onsen?.cfg.record ? { formClose: async (a: Record<string, unknown>) => (await Onsen.formClose((m, p, b, t) => onsen.request(m, p, b, t), a)).text } : {}),   // WO-153
       // WO-144: the block of a lane run's opening: the same query (the default chat, Joey's restart line applied, the spool when Onsen is silent), with the
       // opening's bounds; counted by Onsen as a hook's lookup (X-Onsen-Via: hook), so the agent's own chat_history count stays its own
       mainChat: (a, o) => onsen ? onsen.queryHistory(a, 'hook', o) : Promise.resolve(''),
@@ -4431,8 +4440,20 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
         } catch (e) { warn(e) }
       })
     })
+    // 1.49.1 (Chiron, WO-147 09:56Z): the hand-over decisions (handoff_main, a decision card, the deferred cards' batch, a lane run's end): one row per
+    // event-keyed wake line of the state journal (onsen-wake.ts handItem; at = the line's ts)
+    Lanes.observeWakes((line, ctx) => {
+      const now = Date.now(), n = ++seq
+      const memberState = OnsenWake.memberStateOf(lastView, ctx.main)
+      queueMicrotask(() => {
+        try {
+          const ok = onsen.recordWake(OnsenWake.handItem(line, ctx, { agent: ONSEN_AGENT, host, idem: OnsenWake.idemWake(ONSEN_AGENT, boot, n, now), memberState }))
+          if (!ok) warn(new Error('the spool did not take it'))
+        } catch (e) { warn(e) }
+      })
+    })
     onsenWakeLog = true
-    log('info', `onsen: wake log on for ${ONSEN_AGENT} (host ${host}): every routing.jsonl row also as a row in Onsen (POST ${onsen.cfg.base}/wake/batch, through the spool)`)
+    log('info', `onsen: wake log on for ${ONSEN_AGENT} (host ${host}): every routing.jsonl row and every hand-over wake line of the state journal also as a row in Onsen (POST ${onsen.cfg.base}/wake/batch, through the spool)`)
   }
   // WO-145 (ONSEN_FORM_LINKS): the answers to the page forms this agent sent come in by a long poll and go to the main as Joey's message would
   if (ONSEN_VISIBLE.forms) {

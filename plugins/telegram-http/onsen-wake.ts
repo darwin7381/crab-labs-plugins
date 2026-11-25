@@ -6,6 +6,12 @@
 // field differently, and no agent sees anything of it. server.ts wires it (ONSEN_WAKE_LOG) and the rows go through the Onsen spool (onsen-client.ts,
 // k 'w'): written locally first, synced in order, a resent line keeps its idem_key (the server answers duplicate).
 //
+// 1.49.1 (Chiron on WO-147, 09:56Z): the hand-over decisions too (#28 handoff_main, #29 a decision card, #30 the deferred cards' batch, #31 a lane run's end).
+// They write no routing.jsonl line; each writes ONE event-keyed wake / no_wake line in the state journal (lanes/state.jsonl: rec "wake", id = the event).
+// One Onsen row per such line (handItem): at = the line's ts, refs.event_id = its id, so each row joins its line exactly. The M1 item-keyed wake lines
+// (id = an M1 item, m-…: an item's offer, its pull, its no_wake at enqueue, an unreachable stream) are the delivery of a decision already recorded (its
+// routing.jsonl row or its event-keyed line) and are never sent. So: Onsen rows = routing.jsonl lines + state.jsonl event-keyed wake lines.
+//
 // The row (the contract of onsen4.py):
 //   source_kind  what kind of thing reached the daemon (sourceKindOf)
 //   urgency      how urgent today's rules make it (urgencyOf): interrupt | ordered | silent | state (keep-warm, stall, restart, resume: a state crossed)
@@ -14,7 +20,7 @@
 //   member_state the agent's status at that moment (statusOf's view as the daemon last computed it; walled when the view carries a wall)
 //   refs         btcc_msg_id run_id ticket tg event_id did thread form_id mail_id (what there is)
 //   preview      the first 120 characters (code points) of the text
-import type { InEvent, RouteTapCtx } from './lanes.ts'
+import type { InEvent, RouteTapCtx, WakeTapCtx } from './lanes.ts'
 
 export const SOURCE_KINDS = ['joey_tg', 'joey_edit', 'joey_form', 'peer_call', 'peer_mail', 'mail_ring', 'mail_event', 'scheduled', 'alert', 'board',
   'wd_keepwarm', 'wd_mail', 'wd_stall', 'wd_restart', 'wd_resume', 'external', 'handoff', 'card', 'batch', 'lane_exit', 'other'] as const
@@ -161,5 +167,40 @@ export function wakeItem(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'e
     ...(row.rule != null ? { rule: cutPoints(row.rule, 80) } : {}), ...(row.note != null && row.note !== '' ? { note: cutPoints(row.note, 300) } : {}),
     ...(o.memberState ? { member_state: o.memberState } : {}), ...(sender != null && sender !== '' ? { sender: cutPoints(sender, 120) } : {}),
     refs: refsOf(row, ev, ctx.did ?? null), ...(text ? { preview: cutPoints(text, PREVIEW_MAX) } : {}),
+  }
+}
+
+/** the rule ids of the hand-over rows (lanes.ts asWake callers), by kind:
+ *  handoff   handoff_main (the lane tool) · handoff-woke-deferred (handoff_main on a matter waiting in the main's mailbox: wakes it now) · handoff-addToMain
+ *            (handoff_main after a card of the same run already woke the main: one more item) · handoff-synthesis (deliver_synthesis)
+ *  card      card-now (urgent_because / a critical run / no defer mode: woken now) · card-deferred (can wait: no item) · card-due (its due wake)
+ *  batch     defer-batch (the deferred cards' batch wake)
+ *  lane_exit exit-owes (the run ended owing: handed to the main) · exit-failed (the same after its last attempt) · exit-none (owed nothing: recorded only)
+ *            · exit-synthesis (a synthesis ended without its conclusion) · exit-curator (a curator ended without curator_done) · exit-closed (a lane
+ *            closed before Joey's message reached it)
+ *  other     handoff-router-failed (the router threw on an event it had recorded) · handoff-thread-stop (a thread stopped at its hop / token limit) ·
+ *            wake-row (an event-keyed wake line no caller named: none today) */
+export const HAND_RULES = ['handoff_main', 'handoff-woke-deferred', 'handoff-addToMain', 'handoff-synthesis', 'card-now', 'card-deferred', 'card-due', 'defer-batch',
+  'exit-owes', 'exit-failed', 'exit-none', 'exit-synthesis', 'exit-curator', 'exit-closed', 'handoff-router-failed', 'handoff-thread-stop', 'wake-row']
+/** the hand-over's target: `wake` (the main idle at that moment: M1 offers its item) and a `no_wake` with an item (the main busy, walled, starting, gone)
+ *  go by the main's M2 record like a route to the main; a `no_wake` with no item (a card that can wait, a run that owed nothing) is `none` */
+export function handTarget(state: string, ctx: Pick<WakeTapCtx, 'main' | 'did'>): string {
+  if (state === 'no_wake' && !ctx.did) return 'none'
+  return targetOf({ target: 'main' }, { main: ctx.main, laneKind: null })
+}
+/** one event-keyed wake line of the state journal (a hand-over decision) → one Onsen row */
+export function handItem(line: Record<string, unknown>, ctx: WakeTapCtx, o: { agent: string; host: string; idem: string; memberState: string | null }): WakeItem {
+  const id = String(line.id ?? ''), rec = ctx.rec
+  const sender = ctx.lane ?? (ctx.kind === 'batch' ? 'lanes' : 'router')
+  const why = typeof line.reason === 'string' ? line.reason : ''
+  const r: Record<string, unknown> = { event_id: id, did: ctx.did, thread: rec?.thread, tg: rec?.tg, run_id: rec?.run_id, mail_id: ctx.mail_id ?? rec?.mail_id }
+  const refs: WakeRefs = {}
+  for (const [k, v] of Object.entries(r)) if (v != null && v !== '') (refs as any)[k] = cutPoints(v, 120)
+  const text = rec?.text ?? ''
+  return {
+    idem_key: o.idem, agent: o.agent, host: o.host, at: String(line.ts ?? new Date().toISOString()), source_kind: ctx.kind as SourceKind, ...(ctx.urgency ? { urgency: ctx.urgency } : {}),
+    target: handTarget(String(line.state ?? ''), ctx), rule: cutPoints(ctx.rule, 80),
+    ...(why ? { note: cutPoints(why, 300) } : {}),                     // the line's reason, as written (with at and event_id it joins the line)
+    ...(o.memberState ? { member_state: o.memberState } : {}), sender: cutPoints(sender, 120), refs, ...(text ? { preview: cutPoints(text, PREVIEW_MAX) } : {}),
   }
 }

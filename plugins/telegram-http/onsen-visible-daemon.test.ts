@@ -43,6 +43,12 @@ function startOnsen(): void {
       while (Date.now() < end && !mine().length) await sleep(50)
       return Response.json({ agent: 'adam', items: mine().map(({ acked, for: _f, ...i }) => i) })
     }
+    if (path === '/forms/close') {                                    // WO-153: Onsen 0.8.3's answers (the daemon only passes them on)
+      if (body.id === 777) return Response.json({ id: 777, closed: true })
+      if (body.id === 778) return Response.json({ id: 778, closed: true, already: true })
+      if (body.id === 779) return Response.json({ error: 'not yours' }, { status: 403 })
+      return Response.json({ error: 'no such open form' }, { status: 404 })
+    }
     if (path === '/forms/ack') { let n = 0; for (const i of inbox) if (i.for === who && body.ids.includes(i.id) && !i.acked) { i.acked = true; n++ } return Response.json({ acked: n }) }
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
@@ -118,7 +124,7 @@ test('on: the pinned status, ✍, a keyed link recorded without the key, a page 
   const r = await call(c, 'reply', { chat_id: String(JOEY), text: URL_TEXT })
   expect(r.isError).toBe(false)
   const form = got.find(g => g.who === 'on' && g.path === '/forms')!
-  expect(form.body).toEqual({ chat: String(JOEY), title: '選好按送出：打開頁面，或' })
+  expect(form.body).toEqual({ chat: String(JOEY), title: '選好按送出：打開頁面，或', url: 'https://ops.fud.city/wo/145?a=1#pick' })   // WO-153: the link as written, no key
   const tg = apiOn.of('sendRichMessage').at(-1)!.body.rich_message.markdown
   expect(tg).toBe('## 請選方案\n選好按送出：[打開頁面](https://ops.fud.city/wo/145?a=1&k=onsenform_TEST1-k_y#pick)，或 https://example.com/x')
   expect(await until(() => msgs('on').some((m: any) => m.sender === 'main' && m.body === URL_TEXT), 10000)).toBe(true)
@@ -195,4 +201,37 @@ test('lanes on: a page answer goes to the main through the lanes (rule web-form,
   expect(apiLanes.of('sendMessage').find(c => String(c.body.text).startsWith('〔你在頁面送出的｜排程〕'))!.body).toMatchObject({ text: '〔你在頁面送出的｜排程〕\n週四 10:00', disable_notification: true })
   expect(apiLanes.of('setMessageReaction').length).toBe(0)                               // ONSEN_REACT_SEEN off here
   expect(apiLanes.of('pinChatMessage').length).toBe(0)                                   // ONSEN_STATUS_PIN off here
+}, 60000)
+
+test('WO-153 form_close: listed with recording on, its answer is Onsen\'s (closed, already, 404, 403), a call without id or url never reaches Onsen; recording off: not listed', async () => {
+  const c = await connect(on, [])
+  const tools = (await c.listTools()).tools
+  const fc = tools.find(t => t.name === 'form_close')!
+  expect(fc).toBeDefined()
+  const { FORM_CLOSE_DESC } = await import('./onsen-tool.ts')
+  expect(fc.description).toBe(FORM_CLOSE_DESC)
+  const closes = () => got.filter(g => g.who === 'on' && g.path === '/forms/close')
+  const r1 = await call(c, 'form_close', { id: 777, reason: '已經在 Telegram 回答了' })
+  expect(r1).toEqual({ text: '{"id":777,"closed":true}', isError: false })
+  expect(closes().at(-1)!.body).toEqual({ id: 777, reason: '已經在 Telegram 回答了' })
+  expect(await call(c, 'form_close', { id: 778 })).toEqual({ text: '{"id":778,"closed":true,"already":true}', isError: false })
+  const r404 = await call(c, 'form_close', { url: 'https://ops.fud.city/wo/145?a=1#pick' })
+  expect(r404.isError).toBe(true); expect(r404.text).toContain('no such open form (404)')
+  expect(closes().at(-1)!.body).toEqual({ url: 'https://ops.fud.city/wo/145?a=1#pick' })
+  const r403 = await call(c, 'form_close', { id: 779 })
+  expect(r403.isError).toBe(true); expect(r403.text).toContain('not your form (403)')
+  const n = closes().length
+  const r0 = await call(c, 'form_close', { reason: 'x' })
+  expect(r0.isError).toBe(true); expect(closes().length).toBe(n)
+  await c.close()
+  // recording off for the agent (ONSEN_RECORD=0): the tool is not listed
+  const api0 = startBotApiMock({}, { pollHoldMs: 300 })
+  const root0 = mkdtempSync(join(tmpdir(), 'onsen-vis-norec-'))
+  const d0 = await startTgDaemon(api0, root0, JOEY, { ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, GENESIS_LANES: '0', ONSEN_RECORD: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude' })
+  try {
+    const c0 = await connect(d0, [])
+    expect((await c0.listTools()).tools.some(t => t.name === 'form_close')).toBe(false)
+    expect((await c0.listTools()).tools.some(t => t.name === 'chat_history')).toBe(true)
+    await c0.close()
+  } finally { await d0.stop(); api0.stop() }
 }, 60000)

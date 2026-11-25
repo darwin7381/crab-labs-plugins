@@ -24,6 +24,10 @@ export class Journal {
   private observers: Array<(row: Row, line: Record<string, unknown>) => void> = []
   constructor(readonly path: string, private clock: () => number = Date.now) {}
   observe(fn: (row: Row, line: Record<string, unknown>) => void): void { this.observers.push(fn) }
+  /** WO-147 (Onsen step 4a): read-only observers of every line as written, `wake` lines included (the observers above see folded records only, and a `wake`
+   *  line folds into none); not called by load(). Never throw into a write. */
+  private lineObservers: Array<(line: Record<string, unknown>) => void> = []
+  observeLines(fn: (line: Record<string, unknown>) => void): void { this.lineObservers.push(fn) }
 
   /** fold the file (boot); returns how many lines were read */
   load(): number {
@@ -46,6 +50,7 @@ export class Journal {
     appendFileSync(this.path, JSON.stringify(line) + '\n')
     const row = this.apply(line)
     if (row) for (const o of this.observers) { try { o(row, line) } catch {} }
+    for (const o of this.lineObservers) { try { o(line) } catch {} }
     return row
   }
 
