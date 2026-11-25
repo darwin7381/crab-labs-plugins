@@ -22,6 +22,10 @@ const args = process.argv.slice(2)
 const arg = (k: string, d: string): string => { const i = args.indexOf(k); return i >= 0 && args[i + 1] ? args[i + 1] : d }
 const SINCE = arg('--since', '2026-11-24T00:00:00Z')
 const OUT = arg('--out', join(process.cwd(), 'wake-replay-out'))
+// WO-164: --old-table <lanes-wake-rules.json of 1.55.x> compares that table (and the owners as the router found them) with this one and the owners thread keys
+// give (the item's thread: what the sender's fields name; nothing read from the text): every row whose target changes, by kind (wo164-summary.json)
+const OLD_TABLE_PATH = arg('--old-table', '')
+const ONLY = arg('--agents', '').split(',').map(x => x.trim()).filter(Boolean)
 const HOME = homedir()
 const TABLE = loadWakeTable()
 const FLEET_ROUTER = JSON.parse(readFileSync(join(import.meta.dir, '..', 'lanes-router.fleet.json'), 'utf8'))
@@ -95,6 +99,7 @@ const rows: Row[] = []
 const perAgent: Record<string, { route: number; hand: number; onsen: number }> = {}
 
 for (const a of agents()) {
+  if (ONLY.length && !ONLY.includes(a.name)) continue
   const route = jsonl(join(a.ws, '.lanes', 'routing.jsonl')).filter(r => ms(r.ts) >= ms(SINCE))
   const journal = jsonl(join(a.stateDir, 'lanes', 'state.jsonl'))
   const spool = [...jsonl(join(a.stateDir, 'onsen', 'spool.1.jsonl')), ...jsonl(join(a.stateDir, 'onsen', 'spool.jsonl'))]
@@ -176,7 +181,11 @@ for (const a of agents()) {
       refs: { event_id: String(r.event ?? ''), ...(r.btcc_msg_id ? { btcc_msg_id: String(r.btcc_msg_id) } : {}), ...(r.peer_thread ? { thread: String(r.peer_thread) } : {}) } }
     // the state: one member state; what the router's tables said about this item (its owner, a gate), recorded by its rule and note
     const state: WakeState = { member, main_offered: offered }
+    // a row the new path decided (WO-157: wake:<verdict>[/<the doing code's rule>]) says the same facts by its verdict and its doing rule
+    const vRule = rule.startsWith('wake:') ? rule.slice(5).split('/')[0] : '', dRule = rule.startsWith('wake:') ? rule.slice(5).split('/').slice(1).join('/') : ''
     if (GATE_OF[rule]) state.gate = GATE_OF[rule]
+    else if (dRule && GATE_OF[dRule]) state.gate = GATE_OF[dRule]
+    if (['owner', 'owner-rest', 'joey-owner', 'mail-decision'].includes(vRule) || OWNER_RULES.has(dRule)) state.owner = r.target === 'lane' ? laneKind : 'main'
     if (rule === 'wake-mail' && r.target === 'ledger') state.gate = 'mail_run_waiting'
     if (rule === 'master-off') state.lanes_off = true
     if (OWNER_RULES.has(rule) || kind === 'own') state.owner = r.target === 'lane' ? laneKind : 'main'
@@ -298,3 +307,51 @@ writeFileSync(join(OUT, 'replay-rows.jsonl'), results.map(r => JSON.stringify({ 
 console.log(`rows ${rows.length}, decisions ${tot} (Onsen-written ${summary.onsen_rows}, rebuilt ${summary.rebuilt_rows}); identical ${same} (${(100 * same / tot).toFixed(1)}%), `
   + `same behaviour other label ${beh}, state source ${st}, differ ${summary.differ}; validation ${val.length} rows: target ${valT}, kind ${valK}, member ${valM}`)
 console.log(`out: ${OUT}`)
+
+// ---------------------------------------------------------------- WO-164: the old table against this one, owners by thread keys
+if (OLD_TABLE_PATH) {
+  const OLD = loadWakeTable(OLD_TABLE_PATH)
+  /** the state WO-164 gives the same row: the owner is the owner of the item's thread. In these records no sender wrote a key field, so the thread is what
+   *  the router's own links found (the old owner) except where the old router read the text: an incident merged by the host in the text (no refs.incident:
+   *  no owner), and a schedule (its thread has no owner for decideWake: every run opens a reflex lane of its own) */
+  const stateOf = (r: Row): WakeState => {
+    const st = { ...r.state }
+    if (r.rule === 'incident-merge' || r.item.kind === 'scheduled') delete st.owner
+    return st
+  }
+  type W = { agent: string; at: string; kind: string; rule: string; old: string; old_rule: string; new: string; new_rule: string; doing?: string; preview: string; owner_old?: string | null; owner_new?: string | null }
+  const out: W[] = []
+  for (const r of rows) {
+    if (r.excluded) continue
+    const ar = rulesAt(r.agent, r.at)
+    const vo = decideWake(r.item, r.state, OLD, ar)
+    const st = stateOf(r)
+    const vn = decideWake(r.item, st, TABLE, ar)
+    // the doing code's own change: a board item names its ticket only in its field now (refs.ticket): with none, no worker is named (the main does it)
+    const doing = r.item.kind === 'board' && vn.target.startsWith('lane:worker') ? 'no refs.ticket in this record: the main does the work (worker_for_ticket)'
+      : r.rule === 'incident-merge' ? 'no refs.incident in this record: not merged (a reflex lane of its own)' : undefined
+    out.push({ agent: r.agent, at: r.at, kind: String(r.item.kind), rule: r.rule, old: norm(vo.target), old_rule: vo.rule, new: norm(vn.target), new_rule: vn.rule,
+      ...(doing ? { doing } : {}), preview: r.preview, owner_old: r.state.owner ?? null, owner_new: st.owner ?? null })
+  }
+  const by = new Map<string, { n: number; changed: number; doing: number; groups: Map<string, W[]> }>()
+  for (const w of out) {
+    const k = by.get(w.kind) ?? { n: 0, changed: 0, doing: 0, groups: new Map() }
+    k.n++
+    const changed = w.old !== w.new
+    if (changed) k.changed++
+    if (w.doing) k.doing++
+    if (changed || w.doing || w.old_rule !== w.new_rule) {
+      const g = `${w.old} (${w.old_rule}) → ${w.new} (${w.new_rule})${w.doing ? ` + ${w.doing}` : ''}`
+      k.groups.set(g, [...(k.groups.get(g) ?? []), w])
+    }
+    by.set(w.kind, k)
+  }
+  const summary = { since: SINCE, generated: new Date().toISOString(), old_table: OLD_TABLE_PATH, old_version: OLD.version, new_version: TABLE.version, decisions: out.length,
+    target_changed: out.filter(w => w.old !== w.new).length, doing_changed: out.filter(w => w.doing).length,
+    by_kind: Object.fromEntries([...by.entries()].sort((x, y) => y[1].n - x[1].n).map(([k, v]) => [k, { n: v.n, target_changed: v.changed, doing_changed: v.doing,
+      groups: [...v.groups.entries()].sort((x, y) => y[1].length - x[1].length).map(([g, list]) => ({ change: g, n: list.length, agents: [...new Set(list.map(w => w.agent))],
+        samples: list.slice(0, 3).map(w => ({ agent: w.agent, at: w.at, rule: w.rule, owner_old: w.owner_old, owner_new: w.owner_new, preview: w.preview })) })) }])) }
+  writeFileSync(join(OUT, 'wo164-summary.json'), JSON.stringify(summary, null, 2))
+  writeFileSync(join(OUT, 'wo164-rows.jsonl'), out.map(w => JSON.stringify(w)).join('\n') + '\n')
+  console.log(`WO-164: ${out.length} decisions; target changed ${summary.target_changed}, doing changed ${summary.doing_changed}; ${join(OUT, 'wo164-summary.json')}`)
+}

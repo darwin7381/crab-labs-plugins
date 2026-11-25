@@ -32,6 +32,8 @@ const sha = (s: string) => createHash('sha256').update(s).digest('hex')
 // ------------------------------------------------------------------ the stand-in Onsen (its state lives here: the server can stop and start again)
 type MItem = { recipient: string; seq: number; sender: string; relay: string | null; kind: string; payload: any; dedupe: string | null; acked: boolean; unverified: boolean; no_reply?: boolean | null }
 const store = { items: [] as MItem[], last: new Map<string, number>(), polledAt: new Map<string, number>(), sends: [] as any[], polls: [] as string[], acked: new Map<string, number>() }
+/** WO-164 point 7: the recipient's state Onsen 0.12.2 answers a peer_call / peer_mail /send with (results[].recipient); unset = no block (an older Onsen) */
+const recipientOf = new Map<string, any>()
 const CALLER: Record<string, string> = { [CRED_ON]: 'adam', [CRED_OFF]: 'adam-off', [CRED_SND]: 'zed', [CRED_PAT]: 'pat' }
 function put(recipient: string, sender: string, relay: string | null, kind: string, payload: any, dedupe?: string | null, unverified = false, topNoReply: boolean | null = null): { to: string; seq: number; duplicate: boolean } {
   const key = dedupe || (Number.isInteger(payload?.msg_id) ? `msg:${payload.msg_id}` : null)
@@ -53,7 +55,8 @@ function startOnsen(): void {
       store.sends.push({ caller, ...body })
       if (typeof body?.payload?.text !== 'string' || !body.payload.text) return Response.json({ detail: 'payload.text is required' }, { status: 400 })
       const tos = Array.isArray(body.to) ? body.to : [body.to]
-      const results = tos.map((t: string) => ({ ...put(t, caller, null, body.kind ?? 'other', body.payload, body.dedupe), pulling: Date.now() - (store.polledAt.get(t) ?? 0) < 90_000 }))
+      const results = tos.map((t: string) => ({ ...put(t, caller, null, body.kind ?? 'other', body.payload, body.dedupe), pulling: Date.now() - (store.polledAt.get(t) ?? 0) < 90_000,
+        ...(recipientOf.has(t) && (body.kind === 'peer_call' || body.kind === 'peer_mail') ? { recipient: recipientOf.get(t) } : {}) }))
       return Response.json({ results })
     }
     if (path === '/inbox' && req.method === 'GET') {
@@ -358,4 +361,36 @@ test('(f) an item Onsen marks unverified reaches the session as verified="false"
   expect(snd.log()).toContain('DROPPED forged inject (filed for review): claimed=eve relay=btcc text=WO158 f2 claims eve')
   expect(seen('WO158 f3 eve')[0]!.meta).toMatchObject({ user: 'eve', verified: 'true', relay: 'direct' })
   expect(snd.log()).toMatch(/onsen inbox: item \d+ \(peer_call\) from ⚠️released#7 via btcc \(unverified\) msg:9101: handed on/)
+}, 30000)
+
+test('(g) WO-164 point 7 (Chiron 15:56Z, his words): the recipient\'s state Onsen answers with follows the original sentence of send_to_agent (call; mail when its answer carries it); idle adds nothing', async () => {
+  const call = async (args: Record<string, unknown>) => { const r: any = await sndClient.callTool({ name: 'send_to_agent', arguments: args }); return { text: String(r.content?.[0]?.text ?? ''), isError: !!r.isError } }
+  store.polledAt.set('eve', Date.now())                                          // eve's daemon pulls: delivered
+  const ORIG = "delivered to eve's inbox (queued durably; logged to BTCC Comms)"
+  const want: Array<[any, string]> = [
+    [{ state: 'idle', reporting: 'live', reported_s_ago: 3 }, ''],
+    [{ state: 'busy', reporting: 'live', reported_s_ago: 3 }, ''],
+    [{ state: 'busy', reporting: 'live', reported_s_ago: 3, walled_until: '2026-11-25T07:30:00Z' }, ' eve 現在撞到用量上限，約 15:30 恢復。你的訊息排著，它恢復後才會看到。'],
+    [{ state: 'offline', reporting: 'live', reported_s_ago: 3 }, ' eve 的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。'],
+    [{ state: 'waiting', reporting: 'live', reported_s_ago: 3, waiting_for: 'permission prompt' }, ' eve 的主線停在一個選單上等 Joey 按，按完之前看不到你的訊息；例行的事它的分身照常處理。'],
+    [{ state: 'idle', reporting: 'lost', reported_s_ago: 120 }, ' eve 已經 120 秒沒有回報狀態，可能沒在跑。訊息排著。'],
+    [null, ''],
+  ]
+  let k = 0
+  for (const [rec, tail] of want) {
+    recipientOf.set('eve', rec)
+    const r = await call({ line: 'call', to: 'eve', because: '測試', text: `WO164 g${++k}` })
+    expect(r).toEqual({ text: ORIG + tail, isError: false })
+  }
+  // not pulling and offline: the 1.52.0 sentence for its own case, then the state's
+  store.polledAt.set('eve', 0)
+  recipientOf.set('eve', { state: 'offline', reporting: 'live', reported_s_ago: 3 })
+  expect((await call({ line: 'call', to: 'eve', because: '測試', text: 'WO164 g9' })).text).toBe("queued in eve's Onsen inbox (logged to BTCC Comms): eve's daemon is not taking messages right now; it gets this when it comes back. Do not send it again. eve 的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。")
+  recipientOf.delete('eve')
+  // a mail whose answer carries the recipient's state (Onsen's mailbox send does not yet: then nothing is added)
+  mailAnswer = { id: 7002, stored: true, recipient: { state: 'offline', reporting: 'live', reported_s_ago: 5 } }
+  expect((await call({ line: 'mail', to: 'eve', title: '備份', ask: '今天內確認', text: 'WO164 g10' })).text)
+    .toBe('已放進 eve 的信箱（#7002）。它一小時內會知道有信；讀了沒用 mail_sent 查。eve 的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。')
+  mailAnswer = { id: 7003, stored: true }
+  expect((await call({ line: 'mail', to: 'eve', title: '備份', ask: '今天內確認', text: 'WO164 g11' })).text).toBe('已放進 eve 的信箱（#7003）。它一小時內會知道有信；讀了沒用 mail_sent 查。')
 }, 30000)

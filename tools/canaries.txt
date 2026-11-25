@@ -119,3 +119,14 @@ plugins/telegram-http/lanes-main.ts::const heldCut = (r: Row): boolean
 plugins/telegram-http/fleet-mail.ts::只是『收到、我會做』就不送
 plugins/telegram-http/onsen-status.ts::turnBegan(at: number, slackMs = 100)
 plugins/telegram-http/server.ts::const turnStarts = new OnsenStatus.TurnStarts()
+plugins/telegram-http/lanes-threads.ts::export function threadKeyOf
+plugins/telegram-http/lanes.ts::export function threadKeysOn
+plugins/telegram-http/lanes.ts::function bindThread
+plugins/telegram-http/lanes.ts::function releaseScheduleThread
+plugins/telegram-http/lanes-wake-rules.json::owner-mail-main
+plugins/telegram-http/lanes-main.ts::batchedRider
+plugins/telegram-http/onsen-client.ts::/threads/events
+plugins/telegram-http/onsen-inbox.ts::export function recipientNote
+plugins/telegram-http/onsen-inbox.ts::的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。
+plugins/telegram-http/lanes.ts::自動不用回。只在有結果、做不了、或要對方補東西時回
+plugins/telegram-http/lanes.ts::function laneOfRun

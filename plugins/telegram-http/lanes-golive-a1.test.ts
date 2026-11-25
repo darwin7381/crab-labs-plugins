@@ -35,6 +35,8 @@ test('a run a lane takes owes its receipt (run id from the header); a high-frequ
 test('server.ts: the event meta takes the run id and frequency from the header when the body has no field', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   const f = src.slice(src.indexOf('function laneEventOf('), src.indexOf('async function laneDeliverMesh('))
-  expect(f).toContain('const runId = p.meta?.run_id || fleetRunId(n)')
+  expect(f).toContain(': p.meta?.run_id || fleetRunId(n)')
+  // WO-164: an agent in LANES_WAKE_DECIDE reads the run from the fields only (refs.run / refs.run_id, the body's run_id), never the header
+  expect(f).toContain('const runId = Lanes.threadKeysOn() ? runOf(facts.refs, p.meta?.run_id) ?? undefined : p.meta?.run_id || fleetRunId(n)')
   expect(f).toContain("const frequency = p.meta?.frequency || (Lanes.highFrequencyHeader(text) ? 'high' : '')")
 })

@@ -106,6 +106,8 @@ type Output = { to: string; reply_to: string; text: string }
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
 /** 疑似卡死: a gen that owes a hook event (a turn open, or an offer unbound) has sent none for this long */
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
+/** WO-164: how long a batched item waits for a delivery before it leads one itself (LANES_DEFER_MAX_WAIT_S, the cards' batch window; 0 = no limit) */
+export const batchWaitMs = (): number => { const n = num('LANES_DEFER_MAX_WAIT_S', 2700); return n > 0 ? n * 1000 : 0 }
 /** WO-157b (Chiron status-latency-lab, 「會判錯的」 3): how long statusOf must keep reading idle, with no hook event of the gen meanwhile, before a turn M2
  *  still holds open is closed as interrupted (Esc fires no Stop: the lab measured M2 in_turn 131 s while the session file, the screen and statusOf said idle
  *  0.4–0.6 s after the key) */
@@ -188,14 +190,16 @@ export function createMain(E: MainEnv) {
   const items = (pred: (r: Row) => boolean): Row[] => J().rows('msg', pred)
   const metaOf = (n: Notif): Record<string, string> => (((n?.params ?? {}) as any).meta ?? {}) as Record<string, string>
   /** queue an item for the main. `target` = only the gen with this session id may take it (a renew brief is for the new main). */
-  function enqueue(kind: ItemKind, notif: Notif, o: { via?: Via; event?: string | null; target?: string; fields?: Record<string, unknown> } = {}): string {
+  function enqueue(kind: ItemKind, notif: Notif, o: { via?: Via; event?: string | null; target?: string; fields?: Record<string, unknown>; batched?: boolean } = {}): string {
     const id = newId()
     const params = { ...((notif.params ?? {}) as Record<string, unknown>) }
     params.meta = { ...metaOf(notif), did: id }
-    J().write('msg', id, 'queued', { kind, via: o.via ?? 'tg', event: o.event ?? null, ...(o.target ? { target: o.target } : {}), notif: { method: notif.method, params }, ...(o.fields ?? {}) })
+    J().write('msg', id, 'queued', { kind, via: o.via ?? 'tg', event: o.event ?? null, ...(o.target ? { target: o.target } : {}), notif: { method: notif.method, params }, ...(o.fields ?? {}),
+      ...(o.batched ? { reason: 'batched', batched_at: new Date().toISOString() } : {}) })
     seq++
     const g = currentGen()
     if (kind === 'digest') J().write('wake', id, 'no_wake', { reason: 'information: rides the next delivery' })
+    else if (o.batched) J().write('wake', id, 'no_wake', { reason: `batched: rides the next delivery to the main and never wakes it alone${batchWaitMs() ? ` (it leads one after ${Math.round(batchWaitMs() / 60_000)} min)` : ''}` })
     else if (!g || g.state !== 'idle') J().write('wake', id, 'no_wake', { reason: !g ? 'main gone: offered to the next gen' : g.state === 'in_turn' ? 'main in a turn: pulled at its next tool boundary or Stop' : `main ${g.state}` })
     if (kind !== 'digest') void pump()
     return id
@@ -206,8 +210,13 @@ export function createMain(E: MainEnv) {
    *  to ride the next thing the main is given (an offer, or a pull into a turn). It never opens a turn on its own: the main would start again what Joey
    *  just stopped. A colleague's, a scheduler's, an alert's item that no new turn took within MAIN_STUCK_MS is let go (tick: 'interrupted_untaken'). */
   const heldCut = (r: Row): boolean => r.state === 'queued' && r.reason === 'interrupted'
+  /** WO-164 (Chiron: 「信交給主線名下的串是併批，不為它單獨叫醒」): a mail on a thread the main owns, queued batched. It rides the next thing the main is given
+   *  (an offer, or a pull into a turn) and never opens a turn on its own, until it has waited LANES_DEFER_MAX_WAIT_S (the cards' batch window, 2700 s; 0 =
+   *  no limit): then it leads one offer and every other batched item rides it (one wake for the batch) */
+  const batchedRider = (r: Row, now = Date.now()): boolean => r.state === 'queued' && r.reason === 'batched'
+    && !(batchWaitMs() > 0 && now - (Date.parse(String(r.batched_at ?? r.ts)) || now) >= batchWaitMs())
   /** the reason an offered item goes back with when nobody took the offer: a held item keeps its hold (it rides the next offer again) */
-  const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : why
+  const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : r.reason === 'batched' ? 'batched' : why
   /** an item that was in an interrupted turn: Chiron's line goes in front of it each time it reaches the main (cut_at, set when the turn was cut) */
   const cutText = (r: Row, text: string): string => r.cut_at ? `${INTERRUPTED_LINE}\n${text}` : text
   /** the digest that rides this delivery: the one queued digest item, refreshed, or a new one; null = nothing to tell */
@@ -268,7 +277,7 @@ export function createMain(E: MainEnv) {
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
-    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r))
+    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r))
     if (!cands.length) return
     if (probe) {
       const menu = E.menu ? await E.menu(true).catch(() => null) : null
@@ -283,7 +292,7 @@ export function createMain(E: MainEnv) {
       if (down.has(String(it.via))) continue
       const dg = attachInfo()
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
-      const riders = items(r => heldCut(r) && owed(r) && forGen(r, g))
+      const riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g))   // WO-164: and the batched
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
       const p = (it.notif?.params ?? {}) as Record<string, any>
       const own = [cutText(it, String(p.content ?? '')), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
@@ -306,7 +315,7 @@ export function createMain(E: MainEnv) {
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
       for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) of an interrupted turn riding` : ''}` })
-      for (const r of riders) J().write('wake', r.id, 'wake', { reason: `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
+      for (const r of riders) J().write('wake', r.id, 'wake', { reason: r.reason === 'batched' ? `batched: rides the offer of ${it.id} (gen ${g.id})` : `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
       try { E.woke?.(J().get('msg', it.id)!, { gen: g.id, probe }) } catch (e) { E.log('warn', `lanes: woke hook: ${e}`) }
       delivered()
       return
@@ -630,7 +639,7 @@ export function createMain(E: MainEnv) {
     // pull them), nor walled (its wall notice told Joey), nor holding an offer (an offer it does not take is the silence rule below), and could not be
     // offered them. One alarm per episode, with the count; the next delivery ends it.
     if (!stuck && (!g || ((g.state === 'idle' || g.state === 'starting') && !items(r => r.state === 'offered' && r.gen === g.id).length))) {
-      const owedNow = items(r => r.state === 'queued' && owed(r) && !heldCut(r))     // WO-157c: a held item waits for a delivery, not for a stream
+      const owedNow = items(r => r.state === 'queued' && owed(r) && !heldCut(r) && !batchedRider(r, now))     // WO-157c: a held item waits for a delivery, not for a stream (WO-164: a batched one too)
       if (owedNow.some(r => now - Date.parse(String(r.ts)) > MAIN_STUCK_MS)) {
         stuck = { gen: g?.id ?? null, prompt: null, at: now, undelivered: true }
         const mins = Math.max(1, Math.round((now - Math.min(...owedNow.map(r => Date.parse(String(r.ts))))) / 60_000))

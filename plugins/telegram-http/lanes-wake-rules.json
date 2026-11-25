@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "doc": "WO-157 (Onsen step 4b): the ONE receiver-side wake decision as data. decideWake (wake-decide.ts) reads the item's own fields (kind, urgency, no_reply, deadline, sender, refs) and this agent's one state (member: Onsen's status of the main; main_offered; lane_free; owner, gate, worker_topics: what the router's own tables say about this item) and returns where it goes: main_now | main_after_step | lane:<kind> | ledger (record only) | held:<wall|offline|starting|waiting|stuck> (then where it goes when released). Chiron's decisions (WO-157, mesh-12029; decision 2 as revised 13:46Z, mesh-12051): the state is ONE source, the daemon's own statusOf (onsen-status.ts, the value reported to Onsen, read locally): offline / idle / busy / waiting / stuck and its detail walled / compacting; idle = give now, busy = after this step.",
+  "version": 2,
+  "doc": "WO-157 (Onsen step 4b): the ONE receiver-side wake decision as data. decideWake (wake-decide.ts) reads the item's own fields (kind, urgency, no_reply, deadline, sender, refs) and this agent's one state (member: Onsen's status of the main; main_offered; lane_free; owner, gate, worker_topics: what the router's own tables say about this item) and returns where it goes: main_now | main_after_step | lane:<kind> | ledger (record only) | held:<wall|offline|starting|waiting|stuck> (then where it goes when released). Chiron's decisions (WO-157, mesh-12029; decision 2 as revised 13:46Z, mesh-12051): the state is ONE source, the daemon's own statusOf (onsen-status.ts, the value reported to Onsen, read locally): offline / idle / busy / waiting / stuck and its detail walled / compacting; idle = give now, busy = after this step. WO-164 (version 2; Chiron's ticket, Joey TG chiron:2434): every item belongs to a thread with a fixed key (lanes-threads.ts threadKeyOf, from the item's fields) and `owner` is the owner of that thread; the owner rules come before every kind × state rule, mail included (owner-mail-main, owner); a mail on a thread the main owns is batched (the batch map): it rides the next delivery and never wakes the main alone. A schedule's thread has no owner for this (every run opens a reflex lane of its own on it). Only the agents in LANES_WAKE_DECIDE read this table.",
   "urgency_default": {
     "doc": "the urgency when the sender filled none (design page: a call interrupts; mail, a scheduled run, an unmarked program notice are ordered; a post on the wall is record only; a state crossing is `state`)",
     "joey_tg": "interrupt",
@@ -69,6 +69,19 @@
     "lane": {
       "doc": "a lane destination: the lanes share the main's account (the wall holds them too); offline does not hold them (decision 3)",
       "walled": "held:wall"
+    },
+    "batch": {
+      "doc": "WO-164: a mail on a thread the main owns (owner-mail-main): given to the main batched. main_after_step:batch = it is queued for the main and rides the next thing the main is given (an offer, or a pull into a turn); it never wakes the main alone (after LANES_DEFER_MAX_WAIT_S it leads one delivery for the whole batch). The holds as for the main.",
+      "idle": "main_after_step:batch",
+      "busy": "main_after_step:batch",
+      "compacting": "main_after_step:batch",
+      "waiting": "held:waiting",
+      "menu": "held:waiting",
+      "stuck": "held:stuck",
+      "walled": "held:wall",
+      "starting": "held:starting",
+      "offline": "held:offline",
+      "gone": "held:offline"
     }
   },
   "rules": [
@@ -163,6 +176,55 @@
         "#3 toMainForm"
       ],
       "doc": "Joey's message: the main (now when idle, after this step when busy; held and told where it is when waiting, stuck or offline)."
+    },
+    {
+      "id": "owner-mail-main",
+      "when": {
+        "kind": [
+          "peer_mail"
+        ],
+        "owner": "main",
+        "urgency": [
+          "interrupt",
+          "ordered",
+          "state"
+        ]
+      },
+      "to": "main",
+      "map": "batch",
+      "replaces": [
+        "#9 mail → the mail lane, for a mail on a thread the main owns (WO-164)"
+      ],
+      "doc": "WO-164 (Chiron: 「給誰看主人；多急看種類：信交給主線名下的串是併批，不為它單獨叫醒」): a mail on a thread the main owns goes to the main, batched: it rides the next delivery and never wakes the main alone."
+    },
+    {
+      "id": "owner",
+      "when": {
+        "kind": [
+          "peer_call",
+          "peer_mail",
+          "scheduled",
+          "alert",
+          "board",
+          "external",
+          "other"
+        ],
+        "owner": "any",
+        "urgency": [
+          "interrupt",
+          "ordered",
+          "state"
+        ]
+      },
+      "to": "owner",
+      "map": "main",
+      "replaces": [
+        "#5 R:mesh-thread (threadOwnerFor)",
+        "#24 incidentMerge",
+        "#27 the ticket's worker already open",
+        "#9 mail for a thread a line owns (WO-164)"
+      ],
+      "doc": "WO-164: the item's thread has an owner (the thread its key names: a call's thread, a reply's, a mail conversation, a ticket, an incident): that owner, before every kind × state rule. A colleague's no_reply reply with reply_to wakes the line that asked (decision 1). Something its sender marked silent is still recorded only (record-only, below: the daemons' own notices). A schedule's thread has no owner here."
     },
     {
       "id": "keepwarm-busy",
@@ -329,7 +391,7 @@
       "doc": "the sender said nobody needs to act (urgency silent): record only (rides the main's next digest). The daemons mark their own automatic notices so (decision 1); an agent's own message is never judged from its text."
     },
     {
-      "id": "owner",
+      "id": "owner-rest",
       "when": {
         "owner": "any"
       },
@@ -340,7 +402,7 @@
         "#24 incidentMerge",
         "#27 the ticket's worker already open"
       ],
-      "doc": "the item belongs to a conversation one of this agent's lines owns (its thread, a reply to our message, the incident a lane handles, the ticket's worker): that line. A colleague's no_reply reply with reply_to wakes the line that asked (decision 1)."
+      "doc": "WO-164: what the owner rule above does not take (a mailbox event, a kind it does not list): the line the item's conversation belongs to, as before version 2. the item belongs to a conversation one of this agent's lines owns (its thread, a reply to our message, the incident a lane handles, the ticket's worker): that line. A colleague's no_reply reply with reply_to wakes the line that asked (decision 1)."
     },
     {
       "id": "peer-no-reply",

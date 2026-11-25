@@ -23,6 +23,7 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
+import { stamp } from './lanes-digest.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
 export type Answer = { status: number; json: any } | null
@@ -33,7 +34,9 @@ export type Req = (method: 'GET' | 'POST', path: string, body?: unknown, timeout
 export type PullItem = { seq: number; sender: string; relay?: string | null; kind?: string; payload: Record<string, unknown>; at?: string; given?: number
   dedupe?: string | null; dedupe_key?: string | null
   /** Onsen 0.9.4: a relay passed on a name it could not verify (a BTCC console release); the daemon delivers it as verified=false */
-  unverified?: boolean }
+  unverified?: boolean
+  /** Onsen 0.9.3 / 0.12.0: the sender's facts (btcc_msg_id, run_id, ticket, alert, thread, op, form; WO-163: schedule, run, incident, conversation) */
+  refs?: Record<string, unknown> | null }
 
 /** A switch (ONSEN_PULL, ONSEN_SEND): a comma list of agent names or `*`; unset or empty = off */
 export function switchOn(value: string | undefined, agent: string): boolean {
@@ -310,7 +313,34 @@ export type SendKind = 'peer_call' | 'peer_mail'
 export type SendFacts = { refs?: { btcc_msg_id?: number; thread?: string; op?: string }; no_reply?: boolean }
 
 /** error: why it was not stored (only when stored is false) */
-export type SendOutcome = { stored: boolean; duplicate: boolean; pulling: boolean; error?: string }
+export type SendOutcome = { stored: boolean; duplicate: boolean; pulling: boolean; error?: string
+  /** WO-163 point 7 (Epeius; Chiron WO-164 point 7): the recipient's state as Onsen holds it, when /send answers it ({state, reporting, reported_s_ago,
+   *  walled_until?, waiting_for?}); absent from an Onsen that does not send it */
+  recipient?: Record<string, unknown> }
+/** WO-164 point 7 (Chiron, WO-164 15:56Z, his words; WO-163 point 7): the sentence that follows the original one in the tool result of send_to_agent (call,
+ *  mail) and a lane's reply_agent when the answer carries the recipient's state as Onsen holds it (`recipient`: {state, reporting, reported_s_ago,
+ *  walled_until?, waiting_for?}, Onsen 0.12.2 /send). Only these four; every other state adds nothing (''). Nothing is decided here (who gets it): the state
+ *  is said. The 1.52.0 sentence 「X's daemon is not taking messages right now」 stays for its own case (the recipient's daemon is not taking from Onsen).
+ *  Reporting lost first (the state shown is then the last one sent, not the present); a wall: walled_until, a `walled` field or state; HH:MM in the lanes'
+ *  zone (LANES_TZ, as the 此刻 line) when the time is known. */
+export function recipientNote(to: string, rec: unknown): string {
+  if (!rec || typeof rec !== 'object') return ''
+  const r = rec as Record<string, any>
+  const x = String(to ?? '').trim() || '對方'
+  if (r.reporting === 'lost') {
+    const n = Number(r.reported_s_ago)
+    return `${x} 已經 ${Number.isFinite(n) ? Math.round(n) : '?'} 秒沒有回報狀態，可能沒在跑。訊息排著。`
+  }
+  const wall = r.walled_until ?? (r.walled && typeof r.walled === 'object' ? r.walled.until : undefined)
+  if (wall != null || r.walled === true || (r.walled && typeof r.walled === 'object') || r.state === 'walled') {
+    const ms = typeof wall === 'number' ? wall : typeof wall === 'string' ? Date.parse(wall) : NaN
+    const hm = Number.isFinite(ms) && ms > 0 ? stamp(new Date(ms).toISOString()).slice(6) : ''
+    return `${x} 現在撞到用量上限${hm ? `，約 ${hm} 恢復` : ''}。你的訊息排著，它恢復後才會看到。`
+  }
+  if (r.state === 'offline') return `${x} 的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。`
+  if (r.state === 'waiting') return `${x} 的主線停在一個選單上等 Joey 按，按完之前看不到你的訊息；例行的事它的分身照常處理。`
+  return ''
+}
 export class OnsenSender {
   /** sent: stored (new or already there); not_pulling: stored while the recipient's daemon was not polling (queued); failed: not stored */
   readonly stats = { sent: 0, duplicate: 0, not_pulling: 0, failed: 0, last_error: null as string | null }
@@ -329,7 +359,8 @@ export class OnsenSender {
         const duplicate = res[0]?.duplicate === true, pulling = res[0]?.pulling === true
         if (duplicate) this.stats.duplicate++
         if (!pulling) this.stats.not_pulling++
-        return { stored: true, duplicate, pulling }
+        const rec = res[0]?.recipient ?? r?.json?.recipient
+        return { stored: true, duplicate, pulling, ...(rec && typeof rec === 'object' ? { recipient: rec as Record<string, unknown> } : {}) }
       }
       throw new Error(r ? `HTTP ${r.status}${r.json?.detail ? ` ${String(r.json.detail).slice(0, 120)}` : ''}` : 'no mesh credential')
     } catch (e) {

@@ -12,6 +12,7 @@
 // is whoever the credential says, never a name in the body. The wall never pushes: these tools are the
 // only way anything on it reaches an agent, and only when the agent asks.
 import { FLEET_TEXT } from './fleet-text.ts'
+import { recipientNote } from './onsen-inbox.ts'
 
 export const FLEET_INSTRUCTIONS = FLEET_TEXT
 const TITLE_MAX = 50   // Joey TG chiron:1407: 50, and longer is cut by the server, never refused
@@ -312,7 +313,8 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       })
       if (r.status !== 200) return text(`沒有寄出：${errText(r)}`, true)
       const j = r.json
-      const opNote = (j.warning ? `（${j.warning}）` : '') + (j.title_truncated ? CUT_NOTE : '')
+      // WO-164 point 7 (Chiron 15:56Z): the recipient's state when the mail's answer carries it (onsen-inbox.ts recipientNote; nothing for other states)
+      const opNote = (j.warning ? `（${j.warning}）` : '') + (j.title_truncated ? CUT_NOTE : '') + recipientNote(to, j.recipient)
       if (j.stored) return text(`已放進 ${to} 的信箱（#${j.id}）。它一小時內會知道有信；讀了沒用 mail_sent 查。${opNote}`)
       if (j.delivered) return text(`${to} 的信箱還沒開，這封照舊直接送進它的 session（#${j.id}）。${opNote}`)
       return text(`#${j.id} 記下了，但送不到 ${to}：${j.detail ?? '?'}`, true)

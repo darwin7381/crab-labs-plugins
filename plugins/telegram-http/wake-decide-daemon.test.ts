@@ -17,6 +17,7 @@ type Who = 'on' | 'off'
 let apiOn: BotApiMock, apiOff: BotApiMock, on: TgDaemon, off: TgDaemon, onsenPort: number, root = ''
 let up: ReturnType<typeof Bun.serve> | null = null, inboxSrv: ReturnType<typeof Bun.serve> | null = null
 const wakeRows: Array<{ who: Who; item: any }> = []
+const threadEvs: Array<{ who: Who; item: any }> = [], threadGets: Array<{ who: Who; q: string }> = []          // WO-164: /threads/events, GET /threads
 const inbox: Array<{ for: Who; id: number; form_id: number; chat: string; title: string; body: string; at: string; acked?: boolean }> = []
 let next = 1
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
@@ -29,6 +30,8 @@ function startOnsen(): void {
     if (!who) return Response.json({ error: 'auth' }, { status: 401 })
     const body = req.method === 'POST' ? await req.json() : undefined
     if (path === '/wake/batch') return Response.json({ results: body.items.map((it: any) => { wakeRows.push({ who, item: it }); return { id: next++, duplicate: false } }) })
+    if (path === '/threads/events') return Response.json({ results: body.items.map((it: any) => { threadEvs.push({ who, item: it }); return { id: next++, thread: it.thread, state: 'open', owner: it.owner ?? null, duplicate: false, conflict: false } }) })
+    if (path === '/threads' && req.method === 'GET') { threadGets.push({ who, q: u.search }); return Response.json({ agent: 'adam', threads: [] }) }
     if (path === '/messages/batch' || path === '/deliveries/batch' || path === '/status/batch') return Response.json({ results: body.items.map(() => ({ id: next++, duplicate: false })) })
     if (path === '/events') return Response.json({ id: next++, duplicate: false })
     if (path === '/forms/inbox') {
@@ -161,3 +164,23 @@ test('the hand-over decisions: a lane\'s handoff_main row says decided_by new an
   expect(exitOn.target).toBe(exitOff.target)
   expect(on.log()).not.toMatch(/hand-over .* decideWake said/)                     // the hand-over code did what decideWake said
 }, 90000)
+
+test('WO-164 through the daemon: with the switch the threads go to Onsen (/threads/events through the spool, each first event with its key; the start handshake asked GET /threads); without it nothing', async () => {
+  for (const d of [on, off]) await route(d, mesh('mesh-wo164-1', 'board', '[board][WO-164] 球到你手上', { btcc_msg_id: '910', verified: 'true' }, { item_kind: 'board', refs: { ticket: 164 } }))
+  for (const d of [on, off]) await route(d, mesh('mesh-wo164-2', 'board', '[board][WO-164] 對方留言了', { btcc_msg_id: '911', verified: 'true' }, { item_kind: 'board', refs: { ticket: 164 } }))
+  const mine = () => threadEvs.filter(e => e.who === 'on').map(e => e.item)
+  expect(await until(() => mine().some(e => e.key_kind === 'ticket' && e.key === '164') && mine().some(e => e.item?.id === 'mesh-wo164-2'), 30000)).toBe(true)
+  const t = mine().find(e => e.key_kind === 'ticket' && e.key === '164')!
+  expect(t).toMatchObject({ event: 'open', owner: 'main', item: { id: 'mesh-wo164-1', kind: 'board' } })
+  expect(mine().filter(e => e.thread === t.thread && (e.event === 'open' || e.key_kind)).length).toBe(1)        // one thread for the ticket
+  const ids = mine().map(e => e.dedupe)
+  expect(new Set(ids).size).toBe(ids.length)
+  expect(threadGets.filter(g => g.who === 'on').length).toBeGreaterThanOrEqual(1)
+  expect(threadGets[0].q).toContain('agent=adam')
+  expect(threadGets[0].q).toContain('state=all')
+  expect(threadEvs.filter(e => e.who === 'off').length).toBe(0)
+  expect(threadGets.filter(g => g.who === 'off').length).toBe(0)
+  const r = routing(on).find(x => x.event === 'mesh-wo164-2')
+  expect(r?.thread).toBe(t.thread)
+  expect(on.log()).toContain('threads of adam go to Onsen')
+}, 60000)

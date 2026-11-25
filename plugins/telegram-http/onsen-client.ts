@@ -61,9 +61,11 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 export type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
-const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w'])
+  /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
+  | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
+const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't'])
 /** the batch route of each kind that is posted in runs (≤500 a batch) */
-const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch' }
+const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch', t: '/threads/events' }
 
 export const idemIn = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:in:${id}`
 export const idemOut = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:out:${id}`
@@ -262,6 +264,9 @@ export type OnsenConfig = {
   fastStatus?: boolean
   /** the Telegram id of Joey's DM chat (chat_history's default chat; `tg:<it>` reads as Joey), or '' */
   joeyChat?: () => string
+  /** WO-164: Onsen's answer to each thread event the spool posted (/threads/events): `conflict` (another thread is open on its key; nothing stored) and a
+   *  refusal (a 4xx for that item) go back to the lanes (lanes.ts threadConflict / threadRefused) */
+  onThread?: (ev: any, res: any) => void
 }
 export type HistoryArgs = { limit?: unknown; since?: unknown; until?: unknown; q?: unknown; id?: unknown; chat?: unknown }
 /** WO-144: a caller's own bounds on one query (the lane opening's block): how long Onsen gets before the spool answers, and where a body is cut */
@@ -307,7 +312,8 @@ export class OnsenClient {
   private authWarnAt = 0
   private observers: Array<(line: SpoolLine) => void> = []
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
-    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0 }
+    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0,
+    thread_events: 0, thread_conflicts: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -327,6 +333,13 @@ export class OnsenClient {
   recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) { this.stats.status_recorded++; this.fastStatus(f) } }
   /** WO-147: one wake decision (onsen-wake.ts wakeItem), through the same spool; false = not spooled (recording off, or the append failed) */
   recordWake(w: WakeItem): boolean { const ok = this.append({ k: 'w', r: w }); if (ok) this.stats.wake_recorded++; return ok }
+  /** WO-164: thread events (lanes-threads.ts threadEvents), one spool line each, posted in order as /threads/events batches; false = not all spooled */
+  recordThreads(evs: unknown[]): boolean {
+    let ok = true
+    for (const e of evs) ok = this.append({ k: 't', r: e as Record<string, unknown> & { thread: string; dedupe: string } }) && ok
+    if (ok) this.stats.thread_events += evs.length
+    return ok
+  }
   /** WO-145: form answers queued for the main whose ack Onsen did not take directly: POST /forms/ack when the spool reaches it. false = not spooled */
   recordFormAck(ids: number[]): boolean {
     const ok = ids.length > 0 && this.append({ k: 'a', r: { ids, at: new Date().toISOString() } })
@@ -503,8 +516,8 @@ export class OnsenClient {
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
-      if (t.line.k === 'd' || t.line.k === 's' || t.line.k === 'w') {
-        // step 3 (WO-143): a run of delivery facts (or of status lines; WO-147: of wake decisions): one batch (≤500), in its place in the order
+      if (t.line.k === 'd' || t.line.k === 's' || t.line.k === 'w' || t.line.k === 't') {
+        // step 3 (WO-143): a run of delivery facts (or of status lines; WO-147: of wake decisions; WO-164: of thread events): one batch (≤500), in its place in the order
         const k = t.line.k, path = BATCH_PATH[k]!
         const run: Array<{ line: SpoolLine; end: number }> = []
         while (i < todo.length && run.length < 500 && todo[i]!.line?.k === k) { run.push({ line: todo[i]!.line!, end: todo[i]!.end }); i++ }
@@ -513,6 +526,10 @@ export class OnsenClient {
           r.json.results.forEach((res: any, n: number) => {
             if (res && res.error == null && res.id != null) { if (res.duplicate) this.stats.duplicates++; else this.stats.posted++ }
             else this.reject(run[n]!.line, `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}${res?.status != null ? ` (${res.status})` : ''}`)
+            if (k === 't' && this.cfg.onThread && (res?.conflict === true || res?.error != null)) {
+              if (res?.conflict === true) this.stats.thread_conflicts++
+              try { this.cfg.onThread((run[n]!.line as any).r, res) } catch (e) { this.cfg.log('warn', `onsen: thread answer hook: ${errText(e)}`) }
+            }
           })
           this.writeCursor(run[run.length - 1]!.end); this.ok()
           continue
