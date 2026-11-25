@@ -6,6 +6,7 @@ import { appendFileSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readF
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
+import { spawnSync } from 'child_process'
 import { OnsenClient, idemDelivery, idemStatus, inboundItem, type DeliveryFact, type StatusFact } from './onsen-client.ts'
 import { DeliveryFacts, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
   type RegEntry, type StatusInputs, type StatusSource } from './onsen-status.ts'
@@ -466,7 +467,10 @@ describe('the registry: which session is the main, offline and why, files vs the
     const n = Date.now()
     expect(await Promise.all(S.map(s => s.read(n)))).toEqual(Array(8).fill(null))                // asked newer than the cache: one new run, failed, shared
     expect(runs).toBe(2)
-    writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: 999_999, at: Date.now() }))  // a holder that died
+    writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: 999_999, at: Date.now() }))  // a holder that died just now: its run may still go
+    expect(await new SharedCli({ dir, run, stepMs: 20, waitMs: 200 }).read(Date.now())).toBe(null)   // 1.48.4: not taken over before deadHolderMs
+    expect(runs).toBe(2)
+    writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: 999_999, at: Date.now() - 30_000 }))  // died 30 s ago: past its run's deadline
     out = '[2]'
     expect(await S[0].read(Date.now())).toBe('[2]')
     expect(runs).toBe(3)
@@ -474,6 +478,61 @@ describe('the registry: which session is the main, offline and why, files vs the
     const W = new SharedCli({ dir, run, stepMs: 20, waitMs: 200 })
     expect(await W.read(Date.now())).toBe(null)                                                  // waits waitMs, then gives up without running
     expect(runs).toBe(3)
+  })
+
+  test('1.48.4 SharedCli: a holder that died mid-run: its run is killed (only that process), then the lock is taken over; a holder never frees a successor\'s lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'onsen-shared-crash-')), bin = join(dir, 'fake-claude')
+    writeFileSync(bin, `#!/usr/bin/perl\n$SIG{TERM} = 'IGNORE'; sleep 60;\n`, { mode: 0o755 })                // its command line keeps "agents --json"
+    const orphan = Bun.spawn([bin, 'agents', '--json'])                                              // the dead holder's run, still going
+    await sleep(100)
+    writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: 999_999, token: 'T', at: Date.now() - 30_000 }))
+    writeFileSync(join(dir, 'agents-cli.run'), JSON.stringify({ token: 'T', pid: orphan.pid, at: Date.now() - 30_000 }))
+    // the OS's view (Bun notes a child's exit a moment later): running = listed and not a zombie
+    const running = (pid: number) => { const st = String(spawnSync('ps', ['-o', 'stat=', '-p', String(pid)]).stdout ?? '').trim(); return st !== '' && !st.startsWith('Z') }
+    let runs = 0, concurrentWithOrphan = true
+    const S = new SharedCli({ dir, stepMs: 20, run: async () => { runs++; concurrentWithOrphan = running(orphan.pid); return '[]' } })
+    try {
+      expect(running(orphan.pid)).toBe(true)
+      expect(await S.read(Date.now())).toBe('[]')
+      expect(runs).toBe(1)
+      expect(concurrentWithOrphan).toBe(false)                                                       // the old run was gone before the new one started
+      await orphan.exited
+      expect(orphan.signalCode).toBe('SIGKILL')
+    } finally { orphan.kill('SIGKILL') }
+    // pids are reused: a recorded pid that is not a `claude agents --json` run is never killed
+    const bystander = Bun.spawn(['sleep', '60'])
+    try {
+      writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: 999_999, token: 'U', at: Date.now() - 30_000 }))
+      writeFileSync(join(dir, 'agents-cli.run'), JSON.stringify({ token: 'U', pid: bystander.pid, at: Date.now() - 30_000 }))
+      expect(await S.read(Date.now())).toBe('[]')
+      expect(runs).toBe(2)
+      expect(bystander.exitCode === null && bystander.signalCode === null).toBe(true)
+    } finally { bystander.kill('SIGKILL') }
+    // a holder whose lock was taken over meanwhile leaves the successor's lock alone
+    const S2 = new SharedCli({ dir, run: async () => { writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: process.pid, token: 'SUCCESSOR', at: Date.now() })); return '[3]' } })
+    expect(await S2.read(Date.now())).toBe('[3]')
+    expect(JSON.parse(readFileSync(join(dir, 'agents-cli.lock'), 'utf8')).token).toBe('SUCCESSOR')
+  })
+
+  test('1.48.4 withDeadline: the run ends at its own deadline even when the daemon that started it is SIGKILLed (measured)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'onsen-deadline-')), slow = join(dir, 'slow.sh'), pidf = join(dir, 'run.pid'), script = join(dir, 'holder.ts')
+    writeFileSync(slow, `#!/bin/sh\ntrap '' TERM\nexec sleep 60\n`, { mode: 0o755 })                      // ignores SIGTERM
+    writeFileSync(script, `import { runCli, withDeadline } from ${JSON.stringify(join(import.meta.dir, 'onsen-status.ts'))}\n` +
+      `import { writeFileSync } from 'fs'\n` +
+      `void runCli(...withDeadline(${JSON.stringify(slow)}, [], 1), 60_000, { onSpawn: p => writeFileSync(${JSON.stringify(pidf)}, String(p)) })\n` +
+      `setInterval(() => {}, 1000)\n`)
+    const holder = Bun.spawn(['bun', script])
+    let run = 0
+    try {
+    const t0 = performance.now()
+    while (!existsSync(pidf) && performance.now() - t0 < 5_000) await sleep(20)
+    run = Number(readFileSync(pidf, 'utf8'))
+    holder.kill('SIGKILL'); await holder.exited                                                       // the daemon dies mid-run
+    expect(pidAlive(run)).toBe(true)
+    while (pidAlive(run) && performance.now() - t0 < 6_000) await sleep(50)
+    console.log(`withDeadline: run ended ${((performance.now() - t0) / 1000).toFixed(1)} s after it started (deadline 1 s), its daemon killed`)
+    expect(pidAlive(run)).toBe(false)
+    } finally { holder.kill('SIGKILL'); if (run) { try { process.kill(run, 'SIGKILL') } catch {} } }
   })
 
   test('1.48.3 SharedCli across processes: 20 daemons starting at once run the CLI once, never two at a time (measured)', async () => {

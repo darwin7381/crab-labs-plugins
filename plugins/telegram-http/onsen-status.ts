@@ -12,7 +12,7 @@
 //   TurnWatch      lanes off: no hook reaches the daemon, so the main's turns are read from its transcript (turn_duration ends a turn; tool_use / tool_result
 //                  open and close tools), the file the daemon already reads for receipts. For the status: detail only.
 import { spawn, spawnSync } from 'child_process'
-import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, watch, writeFileSync, writeSync,
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, watch, writeFileSync, writeSync,
   type FSWatcher } from 'fs'
 import { basename, join } from 'path'
 import { idemDelivery, idemStatus, type DeliveryFact, type DeliveryState, type StatusFact, type StatusState } from './onsen-client.ts'
@@ -483,56 +483,111 @@ export function sameStart(a: string, b: string): boolean {
   return !(Number.isFinite(x) && Number.isFinite(y)) || Math.abs(x - y) <= 2_000
 }
 
+/** a run's own deadline (1.48.4): `perl -e 'alarm N; exec …'` arms SIGALRM in the process that becomes `bin`, so the run ends at N s even when the daemon
+ *  that started it is gone (a crash, a SIGKILL during a wave), when nothing else would ever kill it. Without perl: `bin` as is (the daemon's timer only) */
+export const PERL: string | null = ['/usr/bin/perl', '/bin/perl', '/usr/local/bin/perl'].find(p => existsSync(p)) ?? null
+export function withDeadline(bin: string, args: string[], seconds: number): [string, string[]] {
+  return PERL ? [PERL, ['-e', 'alarm shift; exec @ARGV or exit 127', String(Math.max(1, Math.ceil(seconds))), bin, ...args]] : [bin, args]
+}
+/** `claude agents --json`'s deadline on its own (withDeadline) */
+export const CLI_DEADLINE_S = 15
+
 /** run `bin args`: its stdout when it exits 0; null when it fails, prints more than maxBytes, or is still running at timeoutMs, in which case it is
- *  killed (SIGKILL: a process stuck in a swapping machine may never handle SIGTERM) (1.48.3) */
-export function runCli(bin: string, args: string[], timeoutMs = 15_000, maxBytes = 4 * 1024 * 1024): Promise<string | null> {
+ *  killed (SIGKILL: a process stuck in a swapping machine may never handle SIGTERM) (1.48.3); onSpawn: its pid (1.48.4) */
+export function runCli(bin: string, args: string[], timeoutMs = 15_000, o: { maxBytes?: number; onSpawn?: (pid: number) => void } = {}): Promise<string | null> {
+  const maxBytes = o.maxBytes ?? 4 * 1024 * 1024
   return new Promise(res => {
     let done = false, out = '', size = 0
     const end = (v: string | null) => { if (!done) { done = true; clearTimeout(t); res(v) } }
     let p: ReturnType<typeof spawn>
     try { p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'] }) } catch { return res(null) }
     const t = setTimeout(() => { try { p.kill('SIGKILL') } catch {}; end(null) }, timeoutMs)
+    if (p.pid) { try { o.onSpawn?.(p.pid) } catch {} }
     p.stdout?.on('data', (b: Buffer) => { size += b.length; if (size > maxBytes) { try { p.kill('SIGKILL') } catch {}; end(null) } else out += b.toString('utf8') })
     p.on('error', () => end(null))
     p.on('close', code => end(code === 0 ? out : null))
   })
 }
+/** pid is still a `claude agents --json` run (its command line says so): pids are reused, so nothing else is ever killed */
+export function isAgentsRun(pid: number): boolean {
+  try {
+    const r = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 3_000, stdio: ['ignore', 'pipe', 'ignore'] })
+    const c = String(r.stdout ?? '')
+    return r.status === 0 && c.includes('agents') && c.includes('--json')
+  } catch { return false }
+}
 
 /** one `claude agents --json` read shared by every daemon of this machine (1.48.3). 11-25 06:35Z: the whole fleet restarted at once, 38 daemons each
  *  spawned the CLI every 10 s with no wait for the last one, and the Mac mini (24 GB) ran out of memory and was reset twice. Now: at most one run at a
  *  time on the machine (an exclusive lock file); a daemon that wants a read while one runs waits for it and takes its answer (a cache file every daemon
- *  reads); in one daemon a second caller gets the read already in flight. The answer lists every session of the machine; each daemon keeps its own. */
+ *  reads); in one daemon a second caller gets the read already in flight. The answer lists every session of the machine; each daemon keeps its own.
+ *  1.48.4, a holder that dies mid-run (Codex review): its run carries its own deadline (withDeadline) and its pid is recorded (agents-cli.run); the lock
+ *  is taken over only after deadHolderMs (past that deadline), its run is killed first if it somehow still lives, and the takeover moves only that stale
+ *  lock (rename, then check its token); a holder removes the lock only while it is still its own (token), so it never frees a successor's */
 export class SharedCli {
   private inflight: Promise<string | null> | null = null
-  /** dir: where the lock and the cache live (one per machine and user); run: the CLI itself (runCli, killed at its timeout); lockStaleMs: a lock older
-   *  than this, or whose holder is gone, is taken over (the holder died); waitMs: how long a caller waits for an answer */
-  constructor(readonly o: { dir: string; run: () => Promise<string | null>; now?: Now; lockStaleMs?: number; waitMs?: number; stepMs?: number
-    alive?: (pid: number) => boolean }) {}
+  /** dir: where the lock and the cache live (one per machine and user); run: the CLI itself, reporting its pid (runCli on withDeadline); deadHolderMs: a
+   *  lock whose holder is gone is taken over after this long (longer than the run's own deadline); lockStaleMs: a lock older than this is taken over
+   *  even with its holder alive (a stalled holder; its run is past its deadline); waitMs: how long a caller waits for an answer; endRun: kills a dead
+   *  holder's run (default: SIGKILL when isAgentsRun) */
+  constructor(readonly o: { dir: string; run: (onSpawn: (pid: number) => void) => Promise<string | null>; now?: Now; deadHolderMs?: number
+    lockStaleMs?: number; waitMs?: number; stepMs?: number; alive?: (pid: number) => boolean; endRun?: (pid: number) => void }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   private get lockPath(): string { return join(this.o.dir, 'agents-cli.lock') }
+  private get runPath(): string { return join(this.o.dir, 'agents-cli.run') }
   private get cachePath(): string { return join(this.o.dir, 'agents-cli.json') }
+  private json(f: string): any { try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return null } }
   /** the last answer of any daemon: { at: when that run started, out: its stdout or null (it failed) } */
   cached(): { at: number; out: string | null } | null {
-    try { const j = JSON.parse(readFileSync(this.cachePath, 'utf8')); return typeof j?.at === 'number' ? { at: j.at, out: typeof j.out === 'string' ? j.out : null } : null }
-    catch { return null }
+    const j = this.json(this.cachePath)
+    return typeof j?.at === 'number' ? { at: j.at, out: typeof j.out === 'string' ? j.out : null } : null
   }
-  private lock(): boolean {
+  /** the lock: this taking's token, or null (another daemon holds it) */
+  private async lock(): Promise<string | null> {
+    const token = `${process.pid}.${Math.random().toString(36).slice(2, 10)}`
     for (let i = 0; i < 2; i++) {
-      try { const fd = openSync(this.lockPath, 'wx'); try { writeSync(fd, JSON.stringify({ pid: process.pid, at: this.now() })) } finally { closeSync(fd) } return true }
+      try { const fd = openSync(this.lockPath, 'wx'); try { writeSync(fd, JSON.stringify({ pid: process.pid, token, at: this.now() })) } finally { closeSync(fd) } return token }
       catch (e: any) {
-        if (e?.code !== 'EEXIST') return false
-        let stale = false
-        try {
-          const st = statSync(this.lockPath), j = JSON.parse(readFileSync(this.lockPath, 'utf8') || '{}')
-          stale = this.now() - st.mtimeMs > (this.o.lockStaleMs ?? 40_000) || (Number.isInteger(j.pid) && !(this.o.alive ?? pidAlive)(j.pid))
-        } catch { stale = false }
-        if (!stale) return false
-        try { unlinkSync(this.lockPath) } catch {}
+        if (e?.code !== 'EEXIST') return null
+        let mtime = this.now()
+        try { mtime = statSync(this.lockPath).mtimeMs } catch { continue }       // gone meanwhile: try again
+        const j = this.json(this.lockPath)
+        const age = this.now() - (typeof j?.at === 'number' ? j.at : mtime)
+        const gone = Number.isInteger(j?.pid) && !(this.o.alive ?? pidAlive)(j.pid)
+        if (!(age > (this.o.lockStaleMs ?? 60_000) || (gone && age > (this.o.deadHolderMs ?? 25_000)))) return null
+        await this.endRun(j?.token)
+        if (!this.takeOver(j?.token)) return null
       }
     }
+    return null
+  }
+  /** a dead or stalled holder's run, if it still lives: killed (only a `claude agents --json` process, only the one that lock recorded), and waited for
+   *  (up to 3 s) so the next run never overlaps it */
+  private async endRun(token: unknown): Promise<void> {
+    const r = this.json(this.runPath)
+    if (!r || r.token !== token || !Number.isInteger(r.pid)) return
+    const alive = this.o.alive ?? pidAlive
+    if (alive(r.pid)) {
+      let killed = false
+      try { if (this.o.endRun) { this.o.endRun(r.pid); killed = true } else if (isAgentsRun(r.pid)) { process.kill(r.pid, 'SIGKILL'); killed = true } } catch {}
+      for (let i = 0; killed && i < 150 && alive(r.pid); i++) await new Promise(res => setTimeout(res, 20))
+    }
+    try { unlinkSync(this.runPath) } catch {}
+  }
+  /** move the stale lock away: only the one whose token was read (another daemon may have taken over in between and written its own) */
+  private takeOver(token: unknown): boolean {
+    const tmp = `${this.lockPath}.takeover.${process.pid}.${Math.random().toString(36).slice(2, 8)}`
+    try { renameSync(this.lockPath, tmp) } catch { return false }
+    const j = this.json(tmp)
+    if ((j?.token ?? null) === (token ?? null)) { try { unlinkSync(tmp) } catch {}; return true }
+    try { linkSync(tmp, this.lockPath) } catch {}                          // it was a fresh lock: put it back (unless a lock is there again)
+    try { unlinkSync(tmp) } catch {}
     return false
   }
-  private unlock(): void { try { unlinkSync(this.lockPath) } catch {} }
+  private unlock(token: string): void {
+    if (this.json(this.runPath)?.token === token) { try { unlinkSync(this.runPath) } catch {} }
+    if (this.json(this.lockPath)?.token === token) { try { unlinkSync(this.lockPath) } catch {} }
+  }
   /** an answer from a run that started at or after notBefore (ms); null = the run failed, or none came within waitMs */
   read(notBefore: number): Promise<string | null> {
     if (!this.inflight) this.inflight = this.doRead(notBefore).finally(() => { this.inflight = null })
@@ -540,18 +595,20 @@ export class SharedCli {
   }
   private async doRead(notBefore: number): Promise<string | null> {
     try { mkdirSync(this.o.dir, { recursive: true }) } catch {}
-    const until = this.now() + (this.o.waitMs ?? 30_000)
+    const until = this.now() + (this.o.waitMs ?? 40_000)
     for (;;) {
       const c = this.cached()
       if (c && c.at >= notBefore) return c.out
-      if (this.lock()) {
+      const token = await this.lock()
+      if (token) {
         try {
           const c2 = this.cached()
           if (c2 && c2.at >= notBefore) return c2.out
-          const at = this.now(), out = await this.o.run()
+          const at = this.now()
+          const out = await this.o.run(pid => { try { writeFileSync(this.runPath, JSON.stringify({ token, pid, at: this.now() })) } catch {} })
           try { const tmp = `${this.cachePath}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify({ at, out })); renameSync(tmp, this.cachePath) } catch {}
           return out
-        } finally { this.unlock() }
+        } finally { this.unlock(token) }
       }
       if (this.now() >= until) return null
       await new Promise(r => setTimeout(r, this.o.stepMs ?? 200))

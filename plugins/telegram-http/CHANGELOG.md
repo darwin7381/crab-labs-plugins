@@ -1,3 +1,10 @@
+## 1.48.4 — 2026-11-25
+
+- **Onsen status, SharedCli: a daemon that dies mid-run can no longer break the one-run-per-machine limit** (Codex stop-time review of 1.48.3). In 1.48.3 the 15 s kill lived only in the daemon that started the run, a dead holder's lock was taken over at once, and a holder freed the lock without checking it was still its own. Now:
+  - **Every run carries its own deadline** (`withDeadline`: `perl -e 'alarm 15; exec claude agents --json'`), so it ends at 15 s even when its daemon is gone; the daemon's SIGKILL (18 s) stays as the second line. Measured: a run whose daemon was SIGKILLed ended 1.2 s after start with a 1 s deadline.
+  - **The run's pid is recorded** (`agents-cli.run`). A dead holder's lock is taken over only after 25 s (past the run's deadline), a stalled live holder's after 60 s; its run is killed first if it somehow still lives (only when `ps` shows a `claude agents --json` command line: pids are reused) and waited for.
+  - **The takeover moves only the stale lock** (rename, then check its token; a fresh lock moved by mistake is put back), and **a holder removes the lock only while it is still its own** (token), so it never frees a successor's.
+
 ## 1.48.3 — 2026-11-25
 
 - **Onsen status: the `claude agents --json` read can no longer pile up (Mac mini out of memory 11-25 06:35–07:04Z; Hephaestus #11624, Chiron #11627).** At 06:34Z the whole fleet restarted at once; 38 daemons judged their main's half-written registry file after 5 s, switched to the CLI, and each spawned `claude agents --json` every 10 s with no wait for the last run (15 s timeout, SIGTERM). Runs slowed as memory ran out, piled up, and the machine was reset twice. Now:

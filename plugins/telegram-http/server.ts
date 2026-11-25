@@ -4382,11 +4382,13 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
     ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
     // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
-    // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s.
+    // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s (1.48.4: by its own
+    // deadline too, so a run whose daemon died still ends).
     // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
     ...(process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
       const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
-        run: () => OnsenStatus.runCli(claudeBin, ['agents', '--json'], 15_000) })
+        // the run's own deadline (perl alarm, 15 s) holds even if this daemon dies mid-run; this daemon's SIGKILL at 18 s is the second line
+        run: onSpawn => OnsenStatus.runCli(...OnsenStatus.withDeadline(claudeBin, ['agents', '--json'], OnsenStatus.CLI_DEADLINE_S), 18_000, { onSpawn }) })
       return (notBefore: number) => shared.read(notBefore)
     })() }),
   })
