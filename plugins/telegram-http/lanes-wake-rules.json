@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "doc": "WO-157 (Onsen step 4b): the ONE receiver-side wake decision as data. decideWake (wake-decide.ts) reads the item's own fields (kind, urgency, no_reply, deadline, sender, refs) and this agent's one state (member: Onsen's status of the main; main_offered; lane_free; owner, gate, worker_topics: what the router's own tables say about this item) and returns where it goes: main_now | main_after_step | lane:<kind> | ledger (record only) | held:<wall|offline|starting|waiting|stuck> (then where it goes when released). Rules are read in order, first match wins; an agent's own rules (<workspace>/.lanes/router.json `wake_rules`, and its older router.json rules translated by legacyAgentRules) come first. `to` main/owner/lane:* is resolved by the state map the rule names (`map`). No text prefix decides anything: the kind is the sender's field. `replaces` names the decision points of claude-chiron/knowledge/tg-dialogue/step4-facts.md (#n) and the router rules (R:<id>, lanes-router.fleet.json) whose job the rule takes.",
+  "urgency_default": {
+    "doc": "the urgency when the sender filled none (design page: a call interrupts; mail, a scheduled run, an unmarked program notice are ordered; a post on the wall is record only; a state crossing is `state`)",
+    "joey_tg": "interrupt", "joey_edit": "interrupt", "joey_form": "interrupt",
+    "peer_call": "interrupt", "peer_mail": "ordered", "mail_ring": "ordered", "wd_mail": "ordered", "mail_event": "ordered",
+    "scheduled": "ordered", "alert": "interrupt", "board": "interrupt", "external": "ordered",
+    "wd_keepwarm": "state", "wd_stall": "state", "wd_restart": "state", "wd_resume": "state",
+    "handoff": "ordered", "card": "ordered", "batch": "ordered", "lane_exit": "ordered", "own": "ordered", "other": "ordered"
+  },
+  "maps": {
+    "doc": "how a destination becomes a target in each member state (design page table, rows 閒置／處理中／等人按、卡住／撞上限／失連). `+offered`: the main is idle but an item is already offered to it (one offer opens one turn). A lane destination goes on in every state but the wall and offline, where it is held and goes to the lane when released.",
+    "main": {
+      "idle": "main_now", "idle+offered": "main_after_step", "busy": "main_after_step", "compacting": "main_after_step",
+      "waiting": "held:waiting", "menu": "held:waiting", "stuck": "held:stuck", "walled": "held:wall", "starting": "held:starting", "offline": "held:offline", "gone": "held:offline"
+    },
+    "joey": {
+      "doc": "Joey's own message: as the main, and in the three held states he is told where it is (tell joey)",
+      "idle": "main_now", "idle+offered": "main_after_step", "busy": "main_after_step", "compacting": "main_after_step",
+      "waiting": { "target": "held:waiting", "tell": "joey" }, "menu": { "target": "held:waiting", "tell": "joey" }, "stuck": { "target": "held:stuck", "tell": "joey" }, "walled": "held:wall", "starting": "held:starting", "offline": { "target": "held:offline", "tell": "joey" }, "gone": { "target": "held:offline", "tell": "joey" }
+    },
+    "state": {
+      "doc": "a state crossing of the main itself (keep-warm, stall, restart, resume): it exists to move the main, so a busy, waiting or stuck main still gets it at its next step; the wall and offline hold it",
+      "idle": "main_now", "idle+offered": "main_after_step", "busy": "main_after_step", "compacting": "main_after_step",
+      "waiting": "main_after_step", "menu": "main_after_step", "stuck": "main_after_step", "walled": "held:wall", "starting": "held:starting", "offline": "held:offline", "gone": "held:offline"
+    },
+    "lane": {
+      "doc": "a lane destination: the lanes share the main's account (the wall holds them too); offline holds per the design page (失連：留著)",
+      "walled": "held:wall", "offline": { "target": "held:offline", "tell": "waiter" }, "gone": { "target": "held:offline", "tell": "waiter" }
+    }
+  },
+  "rules": [
+    { "id": "gate", "when": { "gate": "any" }, "to": "ledger",
+      "replaces": ["#5 peerGate (hold, flood)", "#24 alertRepeat", "#7 routeMailWake merge", "R:mesh-thread stoppedQuiet / thread-stopped-drain", "mail-decision-repeat"],
+      "doc": "an admission gate already said no (a peer on hold or over the flood limit, a repeat alert, a mailbox run already waiting, a stopped thread, a second decision): record only. The gates themselves are unchanged; this rule records their verdict as the decision." },
+    { "id": "lanes-off", "when": { "lanes_off": true }, "to": "main", "map": "main",
+      "replaces": ["routeEvent master-off (002l D2)"], "doc": "lanes switched off (/lanes off): every item reaches the main, as before lanes." },
+    { "id": "own", "when": { "kind": ["own"] }, "to": "owner", "map": "main",
+      "replaces": ["the main's lane tools (fork, open_worker, fan_out, curate_memory, synthesis)", "#32 followup"],
+      "doc": "the main or a lane started it and named its lane: that lane. Not a decision about anyone else's item." },
+    { "id": "joey-owner", "when": { "kind": ["joey_tg", "joey_edit", "joey_form"], "owner": "lane" }, "to": "owner", "map": "main",
+      "replaces": ["#1 R:tg-quote-lane", "#1 R:tg-worker-topic"], "doc": "Joey quotes a lane's message or writes in a worker's topic: that lane." },
+    { "id": "joey", "when": { "kind": ["joey_tg", "joey_edit", "joey_form"] }, "to": "main", "map": "joey",
+      "replaces": ["#1 R:tg-main", "#2 edit", "#3 toMainForm"], "doc": "Joey's message: the main (now when idle, after this step when busy; held and told where it is when waiting, stuck or offline)." },
+    { "id": "keepwarm-busy", "when": { "kind": ["wd_keepwarm"], "member": ["busy", "compacting"] }, "to": "ledger",
+      "replaces": ["#12/#13 the watchdog's own 回合在跑→不戳, checked again on arrival"], "doc": "keep-warm that arrives while the main is in a turn: its cache is being written by that turn; nothing to keep warm. Record only." },
+    { "id": "state-wake", "when": { "kind": ["wd_keepwarm", "wd_stall", "wd_restart", "wd_resume"] }, "to": "main", "map": "state",
+      "replaces": ["#12 #13 keep-warm", "#14 STALL-WAKE", "#15 RESTART-WAKE", "#16 resume", "L routeWake", "L wakeKind text markers"],
+      "doc": "a state of the main crossed a line: the main, by the state map (a busy, waiting or stuck main gets it after this step; wall and offline hold it)." },
+    { "id": "mail", "when": { "kind": ["peer_mail", "mail_ring", "wd_mail"] }, "to": "lane:mail", "map": "lane",
+      "replaces": ["#6 R:mesh-mail", "#7 the ring (receiving side)", "#8 #9 讀信提醒", "L routeMailWake"],
+      "doc": "a mail (and, until 4d retires them, the ring and the reminder that point at the mailbox): the mail lane reads it." },
+    { "id": "mail-decision", "when": { "kind": ["mail_event"], "sub": ["decision"], "owner": "lane" }, "to": "owner", "map": "lane",
+      "replaces": ["#10 mail_decision → the lane that asked (L mailDecision)"], "doc": "the main's decision on a card: the lane that asked, on its thread." },
+    { "id": "mail-decision-main", "when": { "kind": ["mail_event"], "sub": ["decision"] }, "to": "main", "map": "main",
+      "replaces": ["L mailDecision: no lane for the thread"], "doc": "a decision whose asking lane cannot be found: the main does it." },
+    { "id": "mail-due", "when": { "kind": ["mail_event"] }, "to": "ledger",
+      "replaces": ["#10 mail_due (L mailDue)"], "doc": "a card entering its due window: information for the main's next digest (the card's own due wake is a `card` item)." },
+    { "id": "hand-silent", "when": { "kind": ["handoff", "card", "batch", "lane_exit"], "urgency": ["silent"] }, "to": "ledger",
+      "replaces": ["#29 card-deferred", "#31 exit-none"], "doc": "a card that can wait (rides every digest until the batch or its due wake) and a run that owed nothing: record only." },
+    { "id": "hand", "when": { "kind": ["handoff", "card", "batch", "lane_exit"] }, "to": "main", "map": "main",
+      "replaces": ["#28 handoff_main (L handToMain, wakeDeferred, addToMain)", "#29 card-now (L cardWake)", "#30 defer-batch (L batchTick)", "#31 exit-owes / exit-failed (L exitRule)", "card-due (L dueWake)"],
+      "doc": "a lane hands the main what it cannot do (or the system does at a run's end, a card's due time, the 45-minute batch): the main, by the state map." },
+    { "id": "record-only", "when": { "urgency": ["silent"] }, "to": "ledger",
+      "replaces": ["R:mesh-no-reply (now only when the sender says record only; no_reply no longer decides)"], "doc": "the sender said nobody needs to act: record only (rides the main's next digest)." },
+    { "id": "owner", "when": { "owner": "any" }, "to": "owner", "map": "main",
+      "replaces": ["#5 R:mesh-thread (threadOwnerFor)", "#24 incidentMerge", "#27 the ticket's worker already open"], "doc": "the item belongs to a conversation one of this agent's lines owns (its thread, a reply to our message, the incident a lane handles, the ticket's worker): that line." },
+    { "id": "board-worker", "when": { "kind": ["board"], "worker_topics": true }, "to": "lane:worker", "map": "lane",
+      "replaces": ["#27 R:mesh-board (worker_for_ticket)"], "doc": "an urgent work order: a worker lane for the ticket." },
+    { "id": "board-main", "when": { "kind": ["board"] }, "to": "main", "map": "main",
+      "replaces": ["#27 worker_for_ticket: no worker topic"], "doc": "an urgent work order when no worker can be opened (topics off): the main does the work." },
+    { "id": "scheduled", "when": { "kind": ["scheduled"] }, "to": "lane:reflex", "map": "lane",
+      "replaces": ["#21 #22 receiving side", "R:mesh-scheduled"], "doc": "a scheduled run (and its nudge): a reflex lane." },
+    { "id": "alert", "when": { "kind": ["alert"] }, "to": "lane:reflex", "map": "lane",
+      "replaces": ["#24 R:mesh-alert"], "doc": "a page-tier alert: a reflex lane (repeats and incidents are the gate and owner rules above)." },
+    { "id": "peer-call", "when": { "kind": ["peer_call"] }, "to": "lane:reflex", "map": "lane",
+      "replaces": ["#5 R:mesh-peer-call"], "doc": "a colleague's call: a reflex lane first; the lane hands the main what it cannot do." },
+    { "id": "external", "when": { "kind": ["external"] }, "to": "lane:reflex", "map": "lane",
+      "replaces": ["R:default for programs outside the roster", "R:mesh-no-reply for their no_reply notices (the Iris case)"],
+      "doc": "a program outside the roster (Slack waker, reply-watch, crons): a reflex lane handles it (design page decision 2, the recommended default). An agent that wants its program at the main adds its own rule." },
+    { "id": "default", "when": {}, "to": "main", "map": "main", "replaces": ["R:default"], "doc": "anything else: the main." }
+  ]
+}
