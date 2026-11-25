@@ -1,3 +1,7 @@
+## 1.57.4 — 2026-11-26
+
+- **The feed wall lives in Onsen** (board WO-167 sections 2 and 3, Chiron 21:14Z; Joey TG chiron:2520, 2527; agent-inbox 1.27.4). `FEED_ONSEN=1` (machine config, as `MAIL_ONSEN`) sends every wall call (`send_to_agent line=feed`, `feed_ask`, `feed_search`, `feed_open`, `/read`, `/me`) to Onsen's `/api/onsen/feed/*` (the same endpoints and shapes; fleet-core 0.13.0). Off: `/api/feed`, exactly as before (since the copy at 2026-11-25 21:47Z that path answers from Onsen's tables too). No text an agent reads changes; the numbers it sees are Onsen's (#300645 for the old #646, which still opens).
+
 ## 1.57.3 — 2026-11-26
 
 - **Onsen's text format, one source, on every field that writes words to Onsen** (board WO-164, Chiron 21:10Z; Joey TG chiron:2523 「你要講的是我們 Onsen 的通訊軟體的文字格式預設是這種 markdown rich 的啊」). `ONSEN_TEXT_FORMAT` (`fleet-text.ts`, Chiron's paragraph verbatim) is appended to the description of the text field (`text`; `body` for `mailbox_reply`) of `reply`, `edit_message`, the lanes' `notify_joey`, `ask_joey`, `reply_agent`, and agent-inbox `send_to_agent` (all three lines) and `mailbox_reply`. The tools' own descriptions are unchanged. The `format` parameter (rich) now names only the three modes. Both servers' instructions end their first paragraph with 「Onsen 的文字預設是 markdown rich。」 Earlier wordings (20:07Z, 20:36Z, 20:55Z) are void and were never shipped.
