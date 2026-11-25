@@ -35,10 +35,10 @@ export const mainChatOn = (): boolean => process.env.LANES_MAIN_CHAT !== '0'
 export const mainSameMatterOn = (): boolean => mainChatOn() && process.env.LANES_MAIN_SAME_MATTER !== '0'
 /** the Jev threshold of the gate (`LANES_MAIN_SAME_MATTER_P`, default 0.5: the lab retest's same matter was 0.79–0.85 with one trial under 0.8, unrelated work 0.04) */
 export const mainSameMatterP = (): number => { const n = Number(process.env.LANES_MAIN_SAME_MATTER_P ?? 0.5); return Number.isFinite(n) ? n : 0.5 }
-/** what a refused action returns to the lane (Sonn's wording, pending Chiron's review); `doing` = the 「在處理」 of the 此刻 line */
+/** what a refused action returns to the lane (1.47.1: Chiron's words, WO-144 review); `doing` = the main's 「在處理」, shown cut at 80 */
 export function mainSameMatterRefusal(doing: string): string {
   const d = String(doing ?? '').replace(/\s+/g, ' ').trim()
-  return `沒有做：主線正在回合中處理同一件事（在處理：${d.length > 80 ? `${d.slice(0, 80)}…` : d}）。照邊界卡的但書，這件交給主線：用 handoff_main 交過去（寫你查到的、你本來要做什麼），不要自己動手。`
+  return `沒有做：主線正在回合中處理同一件事（在處理：${d.length > 80 ? `${d.slice(0, 80)}…` : d}）。這件交給主線：用 handoff_main，寫你查到的、你本來要做什麼。`
 }
 
 // ------------------------------------------------------------------ A: the boundary card

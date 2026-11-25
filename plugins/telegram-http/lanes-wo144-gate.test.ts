@@ -111,7 +111,7 @@ function fakeRun(kind: 'mail' | 'reflex' | 'worker', ev: Record<string, unknown>
   const e: any = { id: `mesh-wo144g-${n}`, source: 'mesh', from: 'mailbox', verified: false, text: '讀信箱（2 封未讀）：先用 mailbox_list 看清單', meta: {}, notif: { method: '', params: {} }, ...ev }
   L.__putQueue({ ev: e, lane: id, state: 'leased', lease_until: 0, attempts: 1, priority: 1, enqueued: '' })
   return { runId: `${id}.r1`, lane: id, evId: e.id, closers: [], critical: false, trigger: kind === 'mail' ? 'mail' : 'peer', cls: kind === 'mail' ? 'mail' : 'peer',
-    chatLines: CHAT.split('\n').slice(1), ...extra }
+    ...extra }
 }
 const sent = (name: string) => mailCalls.filter(c => c.name === name)
 let m: Awaited<ReturnType<typeof mainUp>>
@@ -144,7 +144,7 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
   const tok = L.__runTok(d.lane!)!
   expect(chatAsked).toBe(asked0 + 1)
-  expect(tok.chatLines).toEqual(CHAT.split('\n').slice(1))                       // the block's message lines, as in the prompt
+  expect(tok.chatLines).toBeUndefined()                                          // 1.47.1: the gate keeps no conversation lines (it sends none)
   const prompt = (jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'spawn').at(-1))
   expect(prompt).toMatchObject({ lane: d.lane, main_chat: 'onsen', main_chat_n: 3 })
   // list, open: read only, never gated, no Jev call
@@ -154,14 +154,18 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   // the 週報 mail: checking it off is not done
   const checks = sent('mailbox_check').length, replies = sent('mailbox_reply').length, mesh0 = meshed.length
   const refusal = B.mainSameMatterRefusal(now.doing)
-  expect(refusal).toBe(`沒有做：主線正在回合中處理同一件事（在處理：${JOEY_WEEKLY.slice(0, 80)}…）。照邊界卡的但書，這件交給主線：用 handoff_main 交過去（寫你查到的、你本來要做什麼），不要自己動手。`)
+  expect(refusal).toBe(`沒有做：主線正在回合中處理同一件事（在處理：${JOEY_WEEKLY.slice(0, 80)}…）。這件交給主線：用 handoff_main，寫你查到的、你本來要做什麼。`)   // 1.47.1: Chiron's words
   expect(await L.callLaneTool(tok, 'mailbox_check', { id: 90006 })).toBe(refusal)
   expect(sent('mailbox_check').length).toBe(checks)                               // nothing reached the mailbox
   expect(sameCalls.length).toBe(1)
   const q = sameCalls[0]
   expect(Object.keys(q.questions)).toEqual(['same_matter'])
   expect(q.state.main_doing).toBe(now.doing)
-  expect(q.state.conversation).toEqual(CHAT.split('\n').slice(1))
+  // 1.47.1 (Chiron's WO-144 review): Jev gets the main's turn and the event, nothing else: no conversation text, no word of the Onsen block
+  expect(Object.keys(q.state).sort()).toEqual(['event', 'main_doing', 'setting'])
+  expect(q.state.setting).not.toContain('conversation')
+  for (const said of ['測試台現在有信箱了', '收到。先前台跑 100 秒', '#39230', '#39242']) expect(JSON.stringify(q)).not.toContain(said)   // the block's other lines (Joey's agreed rule, the main's answer)
+  expect(JSON.stringify(q.questions)).not.toContain('conversation')
   expect(q.state.event).toMatchObject({ id: 90006 }); expect(q.state.event.text).toContain('週報 W48 補充'); expect(q.state.event.text).toContain('Onsen 逾時')
   // a reply on it, and a reply_agent to its sender: refused too, the same verdict (one Jev call for the run's 週報 mail)
   expect(await L.callLaneTool(tok, 'mailbox_reply', { id: 90006, body: '收到，週報補充看過了。' })).toBe(refusal)
@@ -176,7 +180,8 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   expect(led[0].text).toStartWith('mailbox_check #90006 擋下：主線正在回合中處理同一件事（在處理：週報那件事你來處理')
   expect(jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'main_same_matter_refused' && r.lane === d.lane).map(r => r.tool)).toEqual(['mailbox_check', 'mailbox_reply', 'reply_agent'])
   const jc = jsonl(join(dir, 'run', 'jev-calls.jsonl')).filter(r => r.site === 'main-same-matter-WO144')
-  expect(jc.length).toBe(1); expect(jc[0]).toMatchObject({ p: 0.9, err: null, inputs: { lane: d.lane, tool: 'mailbox_check', subject: 'mail:90006', prompt: 'p-weekly', conversation: 3, doing: JOEY_WEEKLY } })
+  expect(jc.length).toBe(1); expect(jc[0]).toMatchObject({ p: 0.9, err: null, inputs: { lane: d.lane, tool: 'mailbox_check', subject: 'mail:90006', prompt: 'p-weekly', doing: JOEY_WEEKLY } })
+  expect(jc[0].inputs.conversation).toBeUndefined()
   // the other mail (the test bench's restart question): another matter, one more call, it goes through
   await L.callLaneTool(tok, 'mailbox_open', { id: 90003 })
   expect(await L.callLaneTool(tok, 'mailbox_check', { id: 90003 })).toBe('#90003 勾掉了，不在清單上了。')

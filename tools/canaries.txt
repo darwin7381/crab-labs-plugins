@@ -71,3 +71,5 @@ plugins/telegram-http/lanes-boundary.ts::process.env.LANES_MAIN_SAME_MATTER_P ??
 plugins/telegram-http/onsen-status.ts::export class Registry implements StatusSource
 plugins/telegram-http/server.ts::const source: OnsenStatus.StatusSource = registry
 plugins/telegram-http/lanes.ts::export function claudePidOf(
+plugins/telegram-http/lanes.ts::export function mainSameState(doing: string, event: Record<string, unknown>)
+plugins/telegram-http/lanes-boundary.ts::）。這件交給主線：用 handoff_main，寫你查到的、你本來要做什麼。

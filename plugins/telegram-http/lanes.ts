@@ -2557,9 +2557,9 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   stepList?: Step[]; heldLine?: HeldLine; receiptRefused?: { missing_steps: number; not_done_success: number; cli_blocked: number }
   /** WO-132: the line saying the main takes over was refused once (item 5); a notify_joey was dropped by the de-duplication, so the report step is done (item 6) */
   mainAskWarned?: boolean; notifyDeduped?: boolean
-  /** WO-144 point 8: the latest message lines of this run's conversation block (startRun; the block in the prompt, never fetched again); the mails this
-   *  mail-lane run listed or opened (id → what it saw); the gate's Jev verdict per subject (`mail:<id>` or `event`; one call each, failures included) */
-  chatLines?: string[]; mailSeen?: Record<number, { text: string; from: string; opened: boolean; n: number }>; sameMatter?: Record<string, Promise<SameMatterVerdict>>
+  /** WO-144 point 8: the mails this mail-lane run listed or opened (id → what it saw); the gate's Jev verdict per subject (`mail:<id>` or `event`; one call
+   *  each, failures included) */
+  mailSeen?: Record<number, { text: string; from: string; opened: boolean; n: number }>; sameMatter?: Record<string, Promise<SameMatterVerdict>>
   /** WO-144 point 8 (retest t2): the subjects the gate refused in this run (`mail:<id>` / `event`); a mail-lane run with one hands over without opening a mail */
   sameRefused?: string[] }
 const runTokens = new Map<string, RunTok>()
@@ -3435,7 +3435,8 @@ export const __chatFetching = (): number => chatFetching.size                   
 // WO-144 point 8 (Joey TG chiron:2263, the card's 但書: 「主線正在回合中而且在處理同一件事（看上面「此刻」），交給主線，不跟它同時動手」). The lab (wo144-lab
 // RESULTS row 8, lab-relay.mail.6 / mail.7): the main was in a turn on Joey's 「週報那件事你來處理」, the run's 此刻 line and conversation block said so, and both
 // times the mail lane (Haiku) checked the 週報 mail off itself and told Joey. The words did not do it; the program does: an action on the matter (MAIN_SAME_GATED)
-// is not done while the main is in a turn (mainTurnNow: the 此刻 line's own source) on the same matter. "Same matter" is Jev's, one Noul, asked once per run and
+// is not done while the main is in a turn (mainTurnNow: the 此刻 line's own source) on the same matter. "Same matter" is Jev's, one Noul over the main's turn
+// and the event only (mainSameState: no conversation text goes to Jev, 1.47.1), asked once per run and
 // subject: a mail-lane run's subject is the mail the action is on (mailbox_check / mailbox_reply id; reply_agent to a sender of a mail this run opened or
 // listed), as the lane saw it (its event is only the 讀信箱 reminder, and one run reads several unrelated mails); any other action's is the run's event.
 // p >= LANES_MAIN_SAME_MATTER_P (0.5; 0.8 until the lab retest): refused (returned, nothing done; the mail lane's handoff_main then takes it without a
@@ -3445,14 +3446,16 @@ export const __chatFetching = (): number => chatFetching.size                   
 // LANES_MAIN_CHAT=0. Not gated: handoff_main, decide_later, mailbox_card (they hand to the main), notify_joey, ask_joey, receipt, chat_history, the read-only
 // mailbox tools, the ledger / commitment / follow-up records; the lane's own built-in tools (Bash, Write, Edit) do not pass through here.
 export const MAIN_SAME_GATED = ['mailbox_check', 'mailbox_reply', 'reply_agent']
-const MAIN_SAME_CONVO = 6                                                       // the conversation block's latest message lines Jev reads
 export type SameMatterVerdict = { same: boolean; p: number | null; error?: string }
 // The words were chosen on the real Jev with the lab's own inputs (runs lab-relay.mail.6 / mail.7, the other mails of those runs, two alert pairs), three calls
 // each: the 週報 mails 0.91–0.94 and 0.84–0.89, the unrelated mails, the reminder and the other alert 0.02–0.16, the same service's alert 0.99. A wording that also
 // said "acting on it would be doing the main's work in parallel" put the second trial at 0.61–0.81. The lab retest of 5ca6ab7 (the daemon's own calls): the same
 // matter 0.85, 0.84, 0.82, 0.79 (the last let through at 0.8), unrelated work 0.04: the threshold is 0.5. Its inputs again on the real Jev, three calls each, with
 // `main_doing` at 300 characters (the whole Joey message, 101–114 characters): the same matter 0.73–0.92 (at 80: 0.73–0.90), unrelated 0.03–0.12.
-export const MAIN_SAME_QUESTION = { same_matter: { type: 'noul', instructions: 'Does `event` concern the matter named in `main_doing`, the work the main session is doing right now? (`conversation` is background.)',
+// 1.47.1 (Chiron's WO-144 review): Jev gets `main_doing` and `event` only, no conversation lines. The same inputs, three calls each: the same matter 0.84–0.98
+// (the six 週報 mails of both lab rounds 0.84–0.97, the auth alert with the main on auth 0.98), unrelated 0.02–0.14 (the run's other mails, the reminder, a
+// mock-api question, a disk alert, retest control A, a 週報 mail while the main is on the restart question): 0.5 stays, mid-gap.
+export const MAIN_SAME_QUESTION = { same_matter: { type: 'noul', instructions: 'Does `event` concern the matter named in `main_doing`, the work the main session is doing right now?',
   criteria: { true: 'The subject of `event` (the report, mail, task, ticket, service or request it is about) is the subject `main_doing` names', false: 'The subject of `event` is a different one' } } }
 /** what a gated action is about: a mail of this mail-lane run (as the lane saw it), or the run's event */
 function sameMatterSubject(tok: RunTok, lane: Lane, name: string, a: any): { key: string; event: Record<string, unknown> } {
@@ -3471,16 +3474,17 @@ function sameMatterSubject(tok: RunTok, lane: Lane, name: string, a: any): { key
   return { key: 'event', event: { kind: ev?.source === 'mesh' ? 'a message from another agent or the system' : ev?.source === 'telegram' ? 'a message from Joey' : String(ev?.source ?? 'event'),
     from: ev?.from ?? null, text: clip(String(ev?.synthetic ?? ev?.text ?? ''), 800) } }
 }
-/** the Noul's state: the 此刻 line's 「在處理」, the run's conversation lines, what the action is about */
-export function mainSameState(doing: string, chatLines: string[] | undefined, event: Record<string, unknown>): Record<string, unknown> {
-  return { setting: 'An AI agent has one main session and helper lanes. The main session is in the middle of a turn right now; `main_doing` is what that turn was given, '
-      + '`conversation` the latest lines of the main\'s conversation with Joey, its owner (oldest first). A lane is about to act on `event` by itself (answer it, check it off, reply to its sender).',
-    main_doing: doing, conversation: chatLines?.length ? chatLines : '(none)', event }
+/** the Noul's state: the main's turn (its 「在處理」, up to MAIN_SAME_DOING_MAX) and what the action is about, nothing else. 1.47.1 (Chiron's WO-144 review): no
+ *  conversation text goes to an additional external service, so the run's conversation lines (the Onsen block) are not sent */
+export function mainSameState(doing: string, event: Record<string, unknown>): Record<string, unknown> {
+  return { setting: 'An AI agent has one main session and helper lanes. The main session is in the middle of a turn right now; `main_doing` is what that turn was given. '
+      + 'A lane is about to act on `event` by itself (answer it, check it off, reply to its sender).',
+    main_doing: doing, event }
 }
 async function askSameMatter(tok: RunTok, lane: Lane, name: string, sub: { key: string; event: Record<string, unknown> }, now: { doing: string; prompt: string | null }): Promise<SameMatterVerdict> {
-  const r = await jevAsk(mainSameState(now.doing, tok.chatLines, sub.event), MAIN_SAME_QUESTION, 'genesis-main-same-matter/1', undefined,
-    { dir: LANES_DIR, site: 'main-same-matter-WO144', inputs: { lane: lane.id, run: tok.runId, event: tok.evId, tool: name, subject: sub.key, doing: now.doing, prompt: now.prompt,
-      conversation: tok.chatLines?.length ?? 0 }, p: a => a.same_matter?.noul })
+  const r = await jevAsk(mainSameState(now.doing, sub.event), MAIN_SAME_QUESTION, 'genesis-main-same-matter/1', undefined,
+    { dir: LANES_DIR, site: 'main-same-matter-WO144', inputs: { lane: lane.id, run: tok.runId, event: tok.evId, tool: name, subject: sub.key, doing: now.doing, prompt: now.prompt },
+      p: a => a.same_matter?.noul })
   const p = r.answers?.same_matter?.noul
   if (r.error || typeof p !== 'number') {
     D.log('warn', `lanes: main-same-matter check for ${tok.runId} (${sub.key}) failed (${r.error ?? 'no answer'}); the action goes through`)
@@ -3719,7 +3723,6 @@ function startRun(it: QItem): void {
   const bc = runBoundary()                                                  // WO-125 (A): this run's boundary card; its length is the digest's reminder (A.4)
   if (bc) S.boundary = { hash: bc.hash, lines: bc.lines, source: bc.source }
   const chat = takeMainChat(it)                                             // WO-144: the conversation block fetched for this run (pump)
-  if (chat) tok.chatLines = chat.lines.filter(l => CHAT_LINE.test(l)).slice(-MAIN_SAME_CONVO)   // WO-144 point 8: the gate reads the same lines, never fetched again
   const args = ['-p', runPrompt(it, lane, cardUpdate, bc, chat), '--model', lm.model, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt-file', laneSystemPromptFile(lane.kind),        // 002l (D15): card + CLAUDE.md context + memory index, one file per kind
