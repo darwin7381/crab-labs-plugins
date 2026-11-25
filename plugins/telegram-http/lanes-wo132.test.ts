@@ -130,9 +130,9 @@ test('WO-132 #1 (words as 1.41.1 has them, WO-137 乙): questions 2 and 3 of the
   expect(card[3]).toBe('2. 收不回的動作：錢、金鑰、發布、刪除、改設定、對外。')
   expect(card[4]).toBe('3. 只有主對話才知道的事：Joey 剛講的、談到一半的、prometheus 自己的標準、主線手上正在動的東西（看上面「此刻」）。')
   const i = card.indexOf(B.deferDecisionsOn() ? B.BOUNDARY_DEFER_LINE : '沒把握：交給主線，不猜著做完。')   // 1.41.0: WO-128 replaced the 「沒把握」 line in place
-  expect(i).toBe(6)
+  expect(i).toBe(7)                                                                                // 1.46.0: WO-144's 「判斷之前」 line is right before it
   expect(card[i + 1]).toBe('正式服務壞了：先看上面「此刻」。主線正在回合中、而且在動同一個服務：把你查到的原因和備好的指令用 handoff_main 交給它，不跟它同時動手。主線閒著或叫不醒：文件（runbook、README）寫明、做了可以重來的修復，由你做，這不算改設定；動手前照 prometheus 自己的規矩登記變更，做完向 Joey 回報一次，寫明下了什麼指令、結果、還沒查的。文件上沒有的做法、刪資料、動錢、動金鑰：交主線。')
-  expect(card.length).toBe(11)
+  expect(card.length).toBe(12)
   const id = L.identityCard({ kind: 'reflex' }).split('\n')
   expect(id.find(l => l.startsWith('- 權限上限：'))).toContain('可以查、回覆別的 agent、做可逆的小處理、記帳。')
   const crit = id.find(l => l.includes('分流器標記：嚴重警報'))!
@@ -156,7 +156,7 @@ test('WO-132 #2 + #3, replay of Prometheus 09:27:21–09:28:10Z: four alerts, on
   // #3: the run's 〔車道資訊〕: the main in a turn since when, on what; no other lane of the agent running
   const at = L.__lanesState().lanes[r.lane].last
   expect(r.prompt).toContain(`# 此刻（系統寫的，時間為 UTC+8）\n主線：回合中（自 ${hhmm(new Date().toISOString())} 起，在處理：〔交給主線｜ho-a248c3〕#11128 警報 1359 critical（未勾、未 ack）：Traefik 3 則公告（11-24）。`)
-  expect(r.prompt).toContain('…）\n這一隻此刻沒有別的分身在跑\n\n# 焦點卡')
+  expect(r.prompt).toContain('…）\n這一隻此刻沒有別的分身在跑\n\n# 主線最近和 Joey 的對話')        // 1.46.0 (WO-144): the conversation block between 此刻 and the focus card
   expect(r.prompt.indexOf('# 此刻（')).toBeLessThan(r.prompt.indexOf('# 焦點卡'))
   expect(at).toBeTruthy()
   // the three later alerts, in their order: merged into the run in progress, no lane of their own

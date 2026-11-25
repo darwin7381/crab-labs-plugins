@@ -59,3 +59,6 @@ plugins/telegram-http/server.ts::Lanes.observeLanes({ journal:
 plugins/telegram-http/lanes.ts::export function observeLanes(
 plugins/telegram-http/lanes-state.ts::observe(fn: (row: Row
 plugins/telegram-http/onsen-client.ts::recordDelivery(f: DeliveryFact)
+plugins/telegram-http/lanes.ts::export function mainChatBlock(
+plugins/telegram-http/server.ts::mainChat: (a, o) => onsen ? onsen.queryHistory(a, 'hook', o)
+plugins/telegram-http/lanes-boundary.ts::export const BOUNDARY_LOOK_LINE

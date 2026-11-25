@@ -27,6 +27,9 @@ export const deferDecisionsOn = (): boolean => decisionsOn() && process.env.LANE
 export const deferMaxWaitS = (): number => { const n = Number(process.env.LANES_DEFER_MAX_WAIT_S ?? 2700); return Number.isFinite(n) && n > 0 ? n : 0 }
 /** WO-137 甲: the batch wake is on (under LANES_DEFER_DECISIONS) */
 export const batchWakeOn = (): boolean => deferDecisionsOn() && deferMaxWaitS() > 0
+/** WO-144 (telegram-http 1.46.0): every run's opening carries the main's recent conversation with Joey (from Onsen), and the boundary card says to look at it
+ *  before judging (default on; `0` = as before WO-144: no block, no sentence) */
+export const mainChatOn = (): boolean => process.env.LANES_MAIN_CHAT !== '0'
 
 // ------------------------------------------------------------------ A: the boundary card
 export const BOUNDARY_FILE = 'boundary.md'
@@ -45,6 +48,7 @@ export function boundaryDefault(agent: string): string[] {
       // WO-131 (1.38.3, Chiron mail #11046, verbatim): the step goes to the main as a decision card (LANES_DECISIONS=0: the 1.37 words, no card tool)
       + (decisionsOn() ? BOUNDARY_CARD_STEP : BOUNDARY_HANDOFF_STEP)
       + (decisionsOn() ? boundaryDecisionSentence() : ''),          // WO-127 item 8: the same line (the card's line count and hash do not change)
+    ...(mainChatOn() ? [BOUNDARY_LOOK_LINE] : []),                     // WO-144 item 2: right before the 「沒把握」 line, whichever of the two it is
     deferDecisionsOn() ? BOUNDARY_DEFER_LINE : '沒把握：交給主線，不猜著做完。',   // WO-128 item 5: the same line replaced (line count, card_hash unchanged)
     boundaryProdLine(agent),                                           // WO-132 item 1: a line of its own after the 「沒把握」 line (WO-128's); WO-137 乙: its words
     '回報照實際發生的寫：指示裡的步驟，哪幾步做了、哪幾步沒做，都列出來；有沒做的，結果不能填正常。寫入或指令被擋，就寫被擋，不寫已做。',
@@ -87,6 +91,8 @@ const DECISION_MAIN_RULE_MAIN = '- 分身交來要你決定的事附著決定卡
 export const decisionMainRule = (): string => decisionReporter() === 'main' ? DECISION_MAIN_RULE_MAIN : DECISION_MAIN_RULE
 
 // ------------------------------------------------------------------ WO-128: what can wait does not wake the main (Chiron's ticket; the words are its, verbatim)
+/** WO-144 item 2 (Chiron's words, verbatim; the 但書 from Joey TG chiron:2263): the line before the 「沒把握」 line, in the default card and so in the card built from .lanes/boundary.md */
+export const BOUNDARY_LOOK_LINE = '判斷之前：先看上面「主線最近和 Joey 的對話」；跟這件事有關的不夠，用 chat_history 搜（工單編號、標題裡的詞）。Joey 在對話裡已經講定的事，照他講的做，回報或交回時附那一則的編號。但書：對話裡還在談、沒有講定的，不算；主線正在回合中而且在處理同一件事（看上面「此刻」），交給主線，不跟它同時動手。'
 /** item 5: the boundary card's line, in place of 「沒把握：交給主線，不猜著做完。」 */
 export const BOUNDARY_DEFER_LINE = '要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。'
 /** item 5: the main's rule, right after the decision card's */

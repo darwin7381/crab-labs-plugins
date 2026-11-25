@@ -33,7 +33,7 @@ import {
   missingStepsRefusal, receiptCliPointer, stepsLine,
   DECISION_ASK_AGAIN, cardLines, decisionPrefix, decisionReporter, decisionsOn, decisionWords, deferDecisionsOn, URGENT_BECAUSE_PROP, batchWakeOn, deferMaxWaitS,
   CRITICAL_TAIL_NEW, CRITICAL_TAIL_OLD, DEDUPE_DONE_NOTE, IDENTITY_SMALL_NEW, IDENTITY_SMALL_OLD, dedupedSteps, mainAskPhrase, mainAskRefusal, remoteChanges,
-  type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk,
+  type RemoteChange, btccOutcome, receiptCliAnswer, receiptCliRuns, schedulerAnswerOk, mainChatOn,
 } from './lanes-boundary.ts'
 import { genuineAssistantModelFile } from './liveness.ts'
 import { CHAT_HISTORY_TOOL } from './onsen-tool.ts'   // Onsen (WO-139): the definition only; the query comes through LanesDeps.chatHistory
@@ -204,6 +204,9 @@ export interface LanesDeps {
   usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
   /** Onsen (WO-139): the chat_history tool's answer (server.ts: onsen-client.ts queryHistory); absent = no Onsen here */
   chatHistory?: (args: Record<string, unknown>) => Promise<string>
+  /** WO-144: chat_history's answer for a run's opening (server.ts: the same queryHistory, the default chat, counted as a hook's lookup), with the
+   *  opening's bounds: Onsen's timeout before the spool answers, the cut of each body. Absent = the block says （這一趟取不到） */
+  mainChat?: (a: { limit: number }, o: { timeoutMs: number; cut: number }) => Promise<string>
 }
 /** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
  *  or put the menu in front of Joey again with a fresh debounce */
@@ -2963,19 +2966,21 @@ function pump(): void {
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
-    if (running.has(it.lane)) continue                    // one process per lane; this event waits for it
+    if (running.has(it.lane) || chatFetching.has(it.lane)) continue    // one process per lane; this event waits for it (WO-144: or for the block of its run)
     if (it.not_before && Date.now() < it.not_before) { setTimeout(pump, it.not_before - Date.now() + 10); continue }   // 002f: the backoff after a death
-    if (running.size >= slots) {
+    if (running.size + chatFetching.size >= slots) {                    // WO-144: a run whose block is being fetched holds its slot
       D.log('info', `lanes: ${slots} slot(s) in use (cap ${MAX_RUNNING}${slots < MAX_RUNNING ? `, quota ${Math.round((quotaUsed() ?? 0) * 100)}%` : ''}) — ${it.ev.id} for ${it.lane} waits in queue`)
       break
     }
     if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
     if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
-      if (running.size > 0) return
+      if (running.size > 0 || chatFetching.size > 0) return
+      if (mainChatPending(it)) return                     // WO-144: its block first; the fetch's end pumps again
       S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
       startRun(it)
       return
     }
+    if (mainChatPending(it)) continue                     // WO-144: the block of its run is fetched first (≤ LANES_MAIN_CHAT_TIMEOUT_MS); its end pumps again
     coalesce(it, waiting)
     startRun(it)
   }
@@ -3002,8 +3007,8 @@ function coalesce(it: QItem, waiting: QItem[]): void {
   }
   logos('lane.coalesced', { lane: it.lane, event: it.ev.id, with: more.map(o => o.ev.id) })
 }
-function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = [], boundary?: BoundaryCard | null): string {
-  const head = laneContext(lane, it, cardUpdate, boundary)
+function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = [], boundary?: BoundaryCard | null, chat?: MainChat | null): string {
+  const head = laneContext(lane, it, cardUpdate, boundary, chat)
   if (!it.extra?.length) return `${head}\n${renderEvent(it.ev)}`
   const repeats = it.extra.filter(e => e.repeat_of), incident = it.extra.filter(e => e.incident_of && !e.repeat_of), more = it.extra.filter(e => !e.repeat_of && !e.incident_of)
   return [head, renderEvent(it.ev),
@@ -3256,8 +3261,9 @@ export function identityCard(lane: Pick<Lane, 'kind'>, _it?: unknown): string {
 /** 002k (B19): everything that differs from lane to lane (lane id, thread, why the lane was opened, the focus card, the critical
  *  flag, a thread summary, the fan-out role) at the head of the event prompt, in front of the event. WO-125 (A): the boundary card follows the focus
  *  card, built for this run (`boundary`: the one startRun built, so the run's record says which; undefined = built here; null = none, the switch off). */
-export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardUpdate: string[] = [], boundary?: BoundaryCard | null): string {
+export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardUpdate: string[] = [], boundary?: BoundaryCard | null, chat?: MainChat | null): string {
   const bc = boundary === undefined ? runBoundary() : boundary
+  const mc = chat === undefined ? (mainChatOn() ? mainChatBlock(null) : null) : chat     // WO-144: the block startRun fetched; undefined = built here (nothing fetched)
   const kindName = KIND_NAME[lane.kind]
   const why = lane.kind === 'worker'
     ? `為「${lane.title ?? ''}」而開，綁定 Joey 私訊裡的話題 #${lane.topic ?? '-'}（Joey 在那個話題裡說的話會送到你這裡；你的 notify_joey 會自動發到那個話題）`
@@ -3272,6 +3278,7 @@ export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardU
       + '每一趟開始先讀它；到檢查點（定了事、交了產物、丟了東西到背景、Joey 改了方向）就更新它：要交出什麼與 Joey 原話、已定的與被否決的、做到哪與產物在哪、背景在跑什麼、下一步。只寫事實，短句。'] : []),
     ...((events?.get(it.ev.id)?.class ?? evClassOf(it.ev, lane)) === 'critical' ? [`分流器標記：嚴重警報（這則事件已被分流器判定為嚴重）。`] : []),   // 002w (F): the event's class, not the lane's flag
     ...runContextLines(lane),                                          // WO-132 (item 3): what the main and this agent's other lanes are doing now
+    ...(mc ? ['', ...mc.lines] : []),                                  // WO-144 (item 1): the main's recent conversation with Joey, every run (resumed ones too)
     ``,
     `# 焦點卡（主線寫的，你只能讀）`,
     focusCard(),
@@ -3322,6 +3329,80 @@ function runContextLines(lane: Lane): string[] {
   if (!runContextOn() || !S) return []
   return ['', `# 此刻（系統寫的，時間為 ${TZ_LABEL}）`, mainNowLine(), lanesNowLine(lane.id)]
 }
+
+// WO-144 (Chiron; Joey TG chiron:2257): every run's opening carries the main's recent conversation with Joey, attached by the program from Onsen, after
+// 「此刻」 and before the focus card. It is chat_history's own answer (the same query: this agent's chat with Joey by default, Onsen applies Joey's restart
+// line and the answer says so, Onsen silent → this daemon's spool): the latest MAIN_CHAT_LIMIT messages, oldest to newest, in chat_history's line format with
+// each body cut at MAIN_CHAT_CUT; the whole block, its title included, at most MAIN_CHAT_MAX characters, the oldest lines dropped first. It is in the run's
+// prompt (the 〔車道資訊〕 block), never in the lane card: every run gets it, a resumed one included, and card_hash does not see it. Fetched before the run
+// starts (pump → mainChatPending), never longer than LANES_MAIN_CHAT_TIMEOUT_MS; any failure is the one line （這一趟取不到） and the run starts as usual.
+// LANES_MAIN_CHAT=0: no block (and no boundary-card sentence), as before WO-144.
+export const MAIN_CHAT_TITLE = '# 主線最近和 Joey 的對話（系統從 Onsen 附的，舊到新；更早的、全文：用 chat_history 查）'
+export const MAIN_CHAT_NONE = '（這一趟取不到）'
+export const MAIN_CHAT_EMPTY = '（沒有訊息）'
+export const MAIN_CHAT_LIMIT = 10
+export const MAIN_CHAT_MAX = 1500
+export const MAIN_CHAT_CUT = 100
+export const mainChatTimeoutMs = (): number => Math.max(100, num('LANES_MAIN_CHAT_TIMEOUT_MS', 3_000))
+export type MainChat = { lines: string[]; from: 'onsen' | 'spool' | 'none'; n: number }
+/** chat_history's message line: `MM-DD HH:MMZ｜who｜id｜body` (onsen-client.ts lineOf; a body is one line, its newlines shown as ⏎) */
+const CHAT_LINE = /^(\d\d|\?\?)-(\d\d|\?\?) (\d\d|\?\?):(\d\d|\?\?)Z｜/
+/** the block (title first) from chat_history's answer; null / anything that is not a list = （這一趟取不到） */
+export function mainChatBlock(answer: string | null | undefined): MainChat {
+  const none: MainChat = { lines: [MAIN_CHAT_TITLE, MAIN_CHAT_NONE], from: 'none', n: 0 }
+  if (!answer) return none
+  const rows = String(answer).split('\n')
+  const local = /^（.*本機暫存的紀錄/.test(rows[0] ?? '')                         // the spool answered (its first line says why and that it may be incomplete)
+  const listed = rows.some(r => /^共 \d+ 則，顯示 \d+ 則$/.test(r))
+  if (!listed) return none                                                      // an error text, not a list
+  const heads = rows.filter(r => (local && r === rows[0]) || (r.startsWith('Joey 在 ') && r.includes('叫你重新開始')))   // kept as chat_history prints them
+  const msgs = rows.filter(r => CHAT_LINE.test(r))
+  if (!msgs.length && local) return none                                        // Onsen silent and nothing in the spool: neither had it
+  const block = (m: string[]): string[] => [MAIN_CHAT_TITLE, ...heads, ...(m.length ? m : [MAIN_CHAT_EMPTY])]
+  let keep = msgs.slice(-MAIN_CHAT_LIMIT)
+  while (keep.length && block(keep).join('\n').length > MAIN_CHAT_MAX) keep = keep.slice(1)        // over: the oldest lines go first
+  return { lines: block(keep), from: local ? 'spool' : 'onsen', n: keep.length }
+}
+/** fetch the block for a run: never throws, never takes longer than mainChatTimeoutMs() (Onsen gets 70% of it, the spool the rest) */
+export async function fetchMainChat(): Promise<MainChat> {
+  if (!D?.mainChat) return mainChatBlock(null)
+  const T = mainChatTimeoutMs()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const answer = await Promise.race([
+      Promise.resolve().then(() => D.mainChat!({ limit: MAIN_CHAT_LIMIT }, { timeoutMs: Math.max(50, Math.round(T * 0.7)), cut: MAIN_CHAT_CUT })).catch(() => null),
+      new Promise<null>(r => { timer = setTimeout(() => r(null), T); (timer as any).unref?.() }),
+    ])
+    return mainChatBlock(answer)
+  } catch { return mainChatBlock(null) } finally { clearTimeout(timer) }
+}
+// the fetch happens before startRun (startRun stays synchronous): while a run's block is fetched, its lane and one slot are held (pump), so no other event
+// of that lane starts ahead of it; a block older than MAIN_CHAT_FRESH_MS when its run finally starts (a busy session id, the wall) is fetched again
+const MAIN_CHAT_FRESH_MS = 30_000
+const chatFetching = new Map<string, string>()                                  // lane id → the event whose block is being fetched
+const chatReady = new Map<string, MainChat & { at: number }>()                  // event id → its block, taken by startRun
+/** true = this item waits for its block (a fetch was started now, or is out); false = start it now */
+function mainChatPending(it: QItem): boolean {
+  if (!mainChatOn() || !D.mainChat) return false
+  const r = chatReady.get(it.ev.id)
+  if (r && Date.now() - r.at < MAIN_CHAT_FRESH_MS) return false
+  if (chatFetching.has(it.lane)) return true
+  chatFetching.set(it.lane, it.ev.id)
+  for (const [id, b] of chatReady) if (Date.now() - b.at > 4 * MAIN_CHAT_FRESH_MS) chatReady.delete(id)   // never taken (the event went elsewhere)
+  void fetchMainChat().then(b => { chatReady.set(it.ev.id, { ...b, at: Date.now() }) }).finally(() => {
+    chatFetching.delete(it.lane)
+    try { if (S) pump() } catch (e) { D.log('warn', `lanes: pump after the conversation block of ${it.ev.id}: ${e instanceof Error ? e.message : e}`) }
+  })
+  return true
+}
+/** the block of the run startRun is starting (switch off: null) */
+function takeMainChat(it: QItem): MainChat | null {
+  if (!mainChatOn()) return null
+  const r = chatReady.get(it.ev.id)
+  chatReady.delete(it.ev.id)
+  return r ? { lines: r.lines, from: r.from, n: r.n } : mainChatBlock(null)
+}
+export const __chatFetching = (): number => chatFetching.size                   // tests only
 
 function renderEvent(ev: InEvent): string {
   if (ev.synthetic) return ev.synthetic
@@ -3520,7 +3601,8 @@ function startRun(it: QItem): void {
   const lm = laneModelFor(lane.kind)                                        // lanes-topics (item 3): worker / fork lanes run the main's model
   const bc = runBoundary()                                                  // WO-125 (A): this run's boundary card; its length is the digest's reminder (A.4)
   if (bc) S.boundary = { hash: bc.hash, lines: bc.lines, source: bc.source }
-  const args = ['-p', runPrompt(it, lane, cardUpdate, bc), '--model', lm.model, ...sess]
+  const chat = takeMainChat(it)                                             // WO-144: the conversation block fetched for this run (pump)
+  const args = ['-p', runPrompt(it, lane, cardUpdate, bc, chat), '--model', lm.model, ...sess]
   args.push('--strict-mcp-config', '--mcp-config', mcpCfg,
     '--append-system-prompt-file', laneSystemPromptFile(lane.kind),        // 002l (D15): card + CLAUDE.md context + memory index, one file per kind
     '--settings', join(LANES_DIR, 'lane-settings.json'), '--setting-sources', 'project,local',   // the plugin's lane settings, never the user's (writeLaneSettings)
@@ -3551,7 +3633,8 @@ function startRun(it: QItem): void {
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
     transcript: lane.transcript, pid: child.pid, resume, fork_from: lane.kind === 'fork' && lane.runs === 0 ? lane.fork_from : null, attempt: it.attempts,
-    model: lm.model, model_from: lm.source, ...(cardUpdate.length ? { card_update: lane.card_hash } : {}) })
+    model: lm.model, model_from: lm.source, ...(cardUpdate.length ? { card_update: lane.card_hash } : {}),
+    ...(chat ? { main_chat: chat.from, main_chat_n: chat.n } : {}) })
   logos('lane.spawn', { lane: lane.id, run: runId, event: it.ev.id, session_id: lane.session_id, transcript: lane.transcript, pid: child.pid, resume, attempt: it.attempts, model: lm.model })
   D.log('info', `lanes: spawn ${runId} pid=${child.pid} ${resume ? 'resume' : 'new'} session=${lane.session_id} event=${it.ev.id} model=${lm.model} (${lm.source})`)
 

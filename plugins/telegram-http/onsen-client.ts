@@ -241,6 +241,8 @@ export type OnsenConfig = {
   joeyChat?: () => string
 }
 export type HistoryArgs = { limit?: unknown; since?: unknown; until?: unknown; q?: unknown; id?: unknown; chat?: unknown }
+/** WO-144: a caller's own bounds on one query (the lane opening's block): how long Onsen gets before the spool answers, and where a body is cut */
+export type HistoryOpts = { timeoutMs?: number; cut?: number }
 
 const RETRYABLE_4XX = new Set([401, 403, 408, 425, 429])
 const HOUR = 3600_000
@@ -641,7 +643,8 @@ export class OnsenClient {
 
   // ---------------------------------------------------------------- chat_history
   /** via: who looks it up, for Onsen's lookup counts (tool = the agent's chat_history; hook = a hook putting history back, Onsen step 2) */
-  async queryHistory(a: HistoryArgs, via: 'tool' | 'hook' = 'tool'): Promise<string> {
+  async queryHistory(a: HistoryArgs, via: 'tool' | 'hook' = 'tool', o: HistoryOpts = {}): Promise<string> {
+    const tmo = o.timeoutMs ?? this.cfg.queryTimeoutMs ?? 4000, cut = o.cut ?? CUT
     const limit = Math.max(1, Math.min(200, Math.floor(Number(a.limit ?? 20)) || 20))
     let since: string | undefined, until: string | undefined
     try { since = parseWhen(a.since); until = parseWhen(a.until) } catch (e) { return errText(e) }
@@ -655,7 +658,7 @@ export class OnsenClient {
     else {
       try {
         if (id) {
-          const row = await this.fetchOne(id, chat, cred, via)
+          const row = await this.fetchOne(id, chat, cred, via, tmo)
           if (row?.__behind) return behindLine(row.__behind)                     // step 2: before Joey's restart line (and nothing after it quotes it)
           if (row) return formatFull(row, joey)
           return `Onsen 裡找不到 ${id}${chat ? `（chat ${chat}）` : ''}。`
@@ -665,34 +668,34 @@ export class OnsenClient {
         if (since) p.set('since', since)
         if (until) p.set('until', until)
         if (q) p.set('q', q)
-        const r = await this.get(`/messages?${p}`, cred, via)
+        const r = await this.get(`/messages?${p}`, cred, via, tmo)
         if (r.status === 200 && Array.isArray(r.json?.messages)) {
           const rows = r.json.messages as any[]
           // step 2 (WO-142): the agent's own read stops at Joey's restart line; one line at the top says so
           const rl = r.json.restart_line_applied && r.json.restart_line?.at ? `${restartHead(r.json.restart_line.at)}\n` : ''
-          return rl + formatList(rows, typeof r.json.total === 'number' ? r.json.total : rows.length, joey)
+          return rl + formatList(rows, typeof r.json.total === 'number' ? r.json.total : rows.length, joey, cut)
         }
         why = `Onsen 回 HTTP ${r.status}`
       } catch (e) {
-        why = e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`) ? `Onsen ${Math.round((this.cfg.queryTimeoutMs ?? 4000) / 1000)} 秒內沒回應` : `Onsen 連不上（${errText(e).slice(0, 80)}）`
+        why = e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`) ? `Onsen ${Math.round(tmo / 1000)} 秒內沒回應` : `Onsen 連不上（${errText(e).slice(0, 80)}）`
       }
     }
-    return this.localHistory({ limit, since, until, q, id, chat }, why, joey)
+    return this.localHistory({ limit, since, until, q, id, chat, cut }, why, joey)
   }
-  private async get(path: string, cred: string, via: 'tool' | 'hook' = 'tool'): Promise<{ status: number; json: any }> {
-    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': via }), signal: AbortSignal.timeout(this.cfg.queryTimeoutMs ?? 4000) })
+  private async get(path: string, cred: string, via: 'tool' | 'hook' = 'tool', timeoutMs = this.cfg.queryTimeoutMs ?? 4000): Promise<{ status: number; json: any }> {
+    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': via }), signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
   /** one message in full: an Onsen id; `tg:<n>` (the Telegram alias in `chat`); a bare number: the Onsen id first, then the alias.
    *  step 2: `{ __behind: <the line's time> }` when Onsen answers 404 because the message is before Joey's restart line */
-  private async fetchOne(id: string, chat: string | undefined, cred: string, via: 'tool' | 'hook' = 'tool'): Promise<any | null> {
+  private async fetchOne(id: string, chat: string | undefined, cred: string, via: 'tool' | 'hook' = 'tool', tmo?: number): Promise<any | null> {
     const tg = /^tg:(\d+)$/i.exec(id)
     const behind = (r: { status: number; json: any }): string | null => r.status === 404 && r.json?.detail?.restart_line ? String(r.json.detail.restart_line) : null
     let onsenBehind: string | null = null
     if (!tg) {
-      const r = await this.get(`/messages/${encodeURIComponent(id)}`, cred, via)
+      const r = await this.get(`/messages/${encodeURIComponent(id)}`, cred, via, tmo)
       if (r.status === 200 && r.json && typeof r.json === 'object') return r.json.message ?? r.json
       if (r.status !== 404 && r.status !== 400) throw new Error(`HTTP ${r.status}`)
       onsenBehind = behind(r)
@@ -700,20 +703,20 @@ export class OnsenClient {
     }
     if (!chat) return onsenBehind ? { __behind: onsenBehind } : null
     const msgId = tg ? tg[1]! : id
-    const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${msgId}`, cred, via)
+    const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${msgId}`, cred, via, tmo)
     if (r.status === 404) { const b = behind(r) ?? onsenBehind; return b ? { __behind: b } : null }
     if (r.status !== 200 || !r.json) throw new Error(`HTTP ${r.status}`)
     const j = r.json.message ?? r.json
     if (j && (j.body != null || Array.isArray(j.events))) return j
     const oid = j?.id ?? j?.message_id
     if (oid == null) return null
-    const full = await this.get(`/messages/${encodeURIComponent(String(oid))}`, cred, via)
+    const full = await this.get(`/messages/${encodeURIComponent(String(oid))}`, cred, via, tmo)
     if (behind(full)) return { __behind: behind(full) }
     return full.status === 200 && full.json ? full.json.message ?? full.json : null
   }
 
   /** the local answer: this daemon's spool (and its previous generation), messages with their edits applied */
-  private localHistory(o: { limit: number; since?: string; until?: string; q?: string; id?: string; chat?: string }, why: string, joey: string): string {
+  private localHistory(o: { limit: number; since?: string; until?: string; q?: string; id?: string; chat?: string; cut?: number }, why: string, joey: string): string {
     const lines: SpoolLine[] = []
     for (const p of [this.spoolOld, this.spool]) {
       if (!existsSync(p)) continue
@@ -758,13 +761,14 @@ export class OnsenClient {
     const inScope = [...msgs.values()].filter(m => (!o.chat || m.chat === o.chat))
     const all = inScope.filter(m => after(m) && Date.parse(m.at) >= sinceMs && Date.parse(m.at) <= untilMs && (!ql || String(m.body).toLowerCase().includes(ql)))
       .sort((x, y) => Date.parse(y.at) - Date.parse(x.at))
+    const cutAt = o.cut ?? CUT
     const rows = all.slice(0, o.limit).map(m => {
       const b = String(m.body ?? '')
-      return [...b].length > CUT ? { ...m, body: [...b].slice(0, CUT).join(''), truncated: true } : m
+      return [...b].length > cutAt ? { ...m, body: [...b].slice(0, cutAt).join(''), truncated: true } : m
     })
     const cut = [...new Set(o.chat ? [o.chat] : inScope.map(m => m.chat))].map(c => lineAt(c)).filter((x): x is number => x != null)
     const rl = cut.length ? `${restartHead(new Date(Math.max(...cut)).toISOString())}\n` : ''
-    return `${head}\n${rl}${formatList(rows, all.length, joey)}`
+    return `${head}\n${rl}${formatList(rows, all.length, joey, cutAt)}`
   }
 }
 
@@ -806,21 +810,22 @@ function tgIdOf(m: any): string | undefined {
 }
 const ref = (m: any): string => { const tg = tgIdOf(m); return [m.id != null ? `#${m.id}` : '', tg ? `tg:${tg}` : ''].filter(Boolean).join(' ') || '#?' }
 const oneLine = (s: string): string => s.replace(/\s*\n\s*/g, ' ⏎ ').trim()
-function lineOf(m: any, joey: string): string {
-  let body = oneLine(String(m.body ?? ''))
-  if ([...body].length > CUT && !m.truncated) body = [...body].slice(0, CUT).join('')
-  const cut = m.truncated || [...oneLine(String(m.body ?? ''))].length > CUT
+function lineOf(m: any, joey: string, cutAt = CUT): string {
+  const full = oneLine(String(m.body ?? ''))
+  // a body already cut at CUT (Onsen's list, the spool) is not cut again at CUT; a shorter cut (WO-144: the lane opening's block) cuts it again
+  const over = [...full].length > cutAt && (!m.truncated || cutAt < CUT)
+  const body = over ? [...full].slice(0, cutAt).join('') : full
   const flags = `${m.status === 'failed' ? '（沒送出）' : ''}${m.edited ? '（改過）' : ''}`
-  return `${whenUtc(m.at)}｜${whoOf(m, joey)}｜${ref(m)}｜${flags}${body}${cut ? '…（全文用 id 取）' : ''}`
+  return `${whenUtc(m.at)}｜${whoOf(m, joey)}｜${ref(m)}｜${flags}${body}${m.truncated || over ? '…（全文用 id 取）' : ''}`
 }
 /** step 2 (WO-142): the line at the top of a list the restart line cut */
 export function restartHead(at: unknown): string { return `Joey 在 ${whenUtc(at)} 叫你重新開始：線之前的對話不顯示（他引用的那則照樣看得到）` }
 /** step 2: an id lookup of a message before the line */
 export function behindLine(at: unknown): string { return `這一則在 Joey 叫你重新開始（${whenUtc(at)}）之前，看不到` }
 /** the list: rows newest first as the API gives them, shown oldest first */
-export function formatList(rows: any[], total: number, joey = ''): string {
+export function formatList(rows: any[], total: number, joey = '', cutAt = CUT): string {
   if (!rows.length) return `沒有符合的訊息。\n共 ${total} 則，顯示 0 則`
-  const shown = [...rows].reverse().map(m => lineOf(m, joey))
+  const shown = [...rows].reverse().map(m => lineOf(m, joey, cutAt))
   return `${shown.join('\n')}\n共 ${total} 則，顯示 ${rows.length} 則`
 }
 /** one message in full: a header line, the whole body, then its events */

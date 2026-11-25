@@ -408,9 +408,9 @@ test('WO-128: the mail lane\'s card that can wait needs no hand-over (the lane s
 // ------------------------------------------------------------------ 5 (words), 10: the switch
 test('WO-128 item 5: the words, verbatim: the boundary card\'s line replaced (10 lines, card_hash unchanged; the mail card\'s changes with the 13:00Z line 3); the main\'s rule right after the decision card\'s; both tools take urgent_because (not sent to BTCC)', () => {
   const card = B.boundaryDefault('adam')
-  expect(card.length).toBe(11)                                                                     // 1.41.0: WO-132 (1.40.0) put its production line right after this one
-  expect(card[6]).toBe('要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。')
-  expect(card[7]).toBe(B.boundaryProdLine('adam'))                                                 // 1.41.1 (WO-137 乙): its words
+  expect(card.length).toBe(12)                                                                     // 1.41.0: WO-132 (1.40.0) put its production line right after this one; 1.46.0: WO-144 its 「判斷之前」 line right before it
+  expect(card[7]).toBe('要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。')
+  expect(card[8]).toBe(B.boundaryProdLine('adam'))                                                 // 1.41.1 (WO-137 乙): its words
   expect(card.join('\n')).not.toContain('沒把握：交給主線，不猜著做完。')
   const ctx = mainContext('adam', 'sid').split('\n')
   // 1.41.1 (WO-137 甲 item 7): with the batch wake on (default) the rule is the ticket's new words; LANES_DEFER_MAX_WAIT_S=0: 1.41.0's

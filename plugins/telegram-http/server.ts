@@ -4260,6 +4260,9 @@ if (Lanes.LANES_ON) {
       },
       joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
       chatHistory: (a: Record<string, unknown>) => onsen ? onsen.queryHistory(a) : Promise.resolve('chat_history：這個常駐程式沒有接上 Onsen。'),   // Onsen (WO-139)
+      // WO-144: the block of a lane run's opening: the same query (the default chat, Joey's restart line applied, the spool when Onsen is silent), with the
+      // opening's bounds; counted by Onsen as a hook's lookup (X-Onsen-Via: hook), so the agent's own chat_history count stays its own
+      mainChat: (a, o) => onsen ? onsen.queryHistory(a, 'hook', o) : Promise.resolve(''),
     }),
   })
 }

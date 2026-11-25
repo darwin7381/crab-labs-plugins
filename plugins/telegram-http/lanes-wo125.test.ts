@@ -127,7 +127,7 @@ test('WO-125 #1: an agent with no boundary.md: a new lane session and a resumed 
   const sys = readFileSync(a.argv[a.argv.indexOf('--append-system-prompt-file') + 1], 'utf8')
   expect(sys).not.toContain(DEFAULT_HEAD); expect(sys).not.toContain('三樣都不需要')                            // the run prompt, not the replayed system prompt (WO-132: the lane card's critical line names the card)
   expect(L.__lanesState().lanes[a.lane].card_hash).toBe(L.cardHash('mail'))                                   // not part of the lane card's hash (1.36.2)
-  expect(await end(a)).toMatchObject({ boundary_lines: 11, boundary_source: 'default' })                       // WO-132 (1.40.0): one line more
+  expect(await end(a)).toMatchObject({ boundary_lines: 12, boundary_source: 'default' })                       // WO-132 (1.40.0): one line more; WO-144 (1.46.0): one more
   const b = await start(reminder())
   expect(b.lane).toBe(a.lane); expect(b.argv).toContain('--resume')
   expect(count(b.prompt, DEFAULT_HEAD)).toBe(1); expect(b.prompt).toContain('- （還沒有）')
@@ -142,7 +142,7 @@ test('WO-125 #2: the main edits boundary.md: the next run of a resumed lane sess
   expect(c.prompt).toContain('判例（主線留的，新的在上面；跟上面衝突時照判例）：\n- 讀者低於標準線就是異常，交給我\n- 純知會的信勾掉就好\n')
   expect(c.prompt).not.toContain('- （還沒有）')
   for (const l of B.boundaryDefault('adam').slice(0, -1)) expect(c.prompt).toContain(l)                       // the three questions and the report sentences
-  expect(await end(c)).toMatchObject({ boundary_lines: 12, boundary_source: 'file' })
+  expect(await end(c)).toMatchObject({ boundary_lines: 13, boundary_source: 'file' })
   rmSync(join(dir, 'boundary.md'))
   const d = await start(reminder())
   expect(d.prompt).toContain('- （還沒有）'); expect(d.prompt).not.toContain('讀者低於標準線')
@@ -156,10 +156,10 @@ test('WO-125 #3: a card over 40 lines: every line is sent; the main\'s digest sa
   for (const l of lines) expect(r.prompt).toContain(l)
   expect(r.prompt).toContain(`判例（主線留的，新的在上面；跟上面衝突時照判例）：\n${lines.join('\n')}\n`)   // whole, in order, nothing cut
   await quiet(r, 7201)
-  expect(await end(r)).toMatchObject({ boundary_lines: 55, boundary_source: 'file' })
+  expect(await end(r)).toMatchObject({ boundary_lines: 56, boundary_source: 'file' })
   const d1 = L.__digest()!
-  expect(count(d1.text, '邊界卡現在 55 行，整理一下')).toBe(1)
-  expect(L.__digest()!.text).toContain('邊界卡現在 55 行')                                                      // not yet at the main: still carried
+  expect(count(d1.text, '邊界卡現在 56 行，整理一下')).toBe(1)
+  expect(L.__digest()!.text).toContain('邊界卡現在 56 行')                                                      // not yet at the main: still carried
   digestDone(d1)
   const r2 = await start(sched(7202, 'backup-check')); await quiet(r2, 7202); await end(r2)                   // the same content, another run
   const d2 = L.__digest()!
@@ -167,7 +167,7 @@ test('WO-125 #3: a card over 40 lines: every line is sent; the main\'s digest sa
   writeFileSync(join(dir, 'boundary.md'), [...lines, '- 判例 46'].join('\n'))                                   // new content: named again, once
   const r3 = await start(sched(7203, 'backup-check')); await quiet(r3, 7203); await end(r3)
   const d3 = L.__digest()!
-  expect(d3.text).toContain('邊界卡現在 56 行，整理一下'); digestDone(d3)
+  expect(d3.text).toContain('邊界卡現在 57 行，整理一下'); digestDone(d3)
   const r4 = await start(sched(7204, 'backup-check')); await quiet(r4, 7204); await end(r4)
   expect(L.__digest()?.text ?? '').not.toContain('邊界卡現在')
   rmSync(join(dir, 'boundary.md'))
@@ -378,7 +378,7 @@ test('WO-125 #7: Joey gets as many messages with the feature as without it; only
 test('WO-125 #8: the observation points are on each run\'s exit record in lanes.jsonl', async () => {
   writeFileSync(join(dir, 'boundary.md'), '- 純知會的信勾掉就好\n')
   const s = await scenario(7103)
-  expect(s.exit).toMatchObject({ blocked_n: 1, blocked_targets: ['state/eng-log.md'], steps_marked: 2, steps_not_done: 1, boundary_lines: 11, boundary_source: 'file' })
+  expect(s.exit).toMatchObject({ blocked_n: 1, blocked_targets: ['state/eng-log.md'], steps_marked: 2, steps_not_done: 1, boundary_lines: 12, boundary_source: 'file' })
   rmSync(join(dir, 'boundary.md'))
 }, 30000)
 
