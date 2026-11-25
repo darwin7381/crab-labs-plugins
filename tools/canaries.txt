@@ -62,3 +62,7 @@ plugins/telegram-http/onsen-client.ts::recordDelivery(f: DeliveryFact)
 plugins/telegram-http/lanes.ts::export function mainChatBlock(
 plugins/telegram-http/server.ts::mainChat: (a, o) => onsen ? onsen.queryHistory(a, 'hook', o)
 plugins/telegram-http/lanes-boundary.ts::export const BOUNDARY_LOOK_LINE
+plugins/telegram-http/lanes.ts::async function mainSameMatterGate(
+plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, 'reply_agent', a); if (g) return g }
+plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, name, a); if (g) return g }
+plugins/telegram-http/lanes-boundary.ts::export function mainSameMatterRefusal(

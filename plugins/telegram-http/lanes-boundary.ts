@@ -30,6 +30,16 @@ export const batchWakeOn = (): boolean => deferDecisionsOn() && deferMaxWaitS() 
 /** WO-144 (telegram-http 1.46.0): every run's opening carries the main's recent conversation with Joey (from Onsen), and the boundary card says to look at it
  *  before judging (default on; `0` = as before WO-144: no block, no sentence) */
 export const mainChatOn = (): boolean => process.env.LANES_MAIN_CHAT !== '0'
+/** WO-144 point 8 (telegram-http 1.46.0): the program gate behind the card's 但書 — a lane's action on the matter the main is handling in its current turn is
+ *  not done (default on; `LANES_MAIN_SAME_MATTER=0`, or `LANES_MAIN_CHAT=0`: no gate, no Jev call) */
+export const mainSameMatterOn = (): boolean => mainChatOn() && process.env.LANES_MAIN_SAME_MATTER !== '0'
+/** the Jev threshold of the gate (`LANES_MAIN_SAME_MATTER_P`, default 0.8) */
+export const mainSameMatterP = (): number => { const n = Number(process.env.LANES_MAIN_SAME_MATTER_P ?? 0.8); return Number.isFinite(n) ? n : 0.8 }
+/** what a refused action returns to the lane (Sonn's wording, pending Chiron's review); `doing` = the 「在處理」 of the 此刻 line */
+export function mainSameMatterRefusal(doing: string): string {
+  const d = String(doing ?? '').replace(/\s+/g, ' ').trim()
+  return `沒有做：主線正在回合中處理同一件事（在處理：${d.length > 80 ? `${d.slice(0, 80)}…` : d}）。照邊界卡的但書，這件交給主線：用 handoff_main 交過去（寫你查到的、你本來要做什麼），不要自己動手。`
+}
 
 // ------------------------------------------------------------------ A: the boundary card
 export const BOUNDARY_FILE = 'boundary.md'
