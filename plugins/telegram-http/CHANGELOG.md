@@ -1,3 +1,9 @@
+## 1.57.3 — 2026-11-26
+
+- **Onsen's text format, one source, on every field that writes words to Onsen** (board WO-164, Chiron 21:10Z; Joey TG chiron:2523 「你要講的是我們 Onsen 的通訊軟體的文字格式預設是這種 markdown rich 的啊」). `ONSEN_TEXT_FORMAT` (`fleet-text.ts`, Chiron's paragraph verbatim) is appended to the description of the text field (`text`; `body` for `mailbox_reply`) of `reply`, `edit_message`, the lanes' `notify_joey`, `ask_joey`, `reply_agent`, and agent-inbox `send_to_agent` (all three lines) and `mailbox_reply`. The tools' own descriptions are unchanged. The `format` parameter (rich) now names only the three modes. Both servers' instructions end their first paragraph with 「Onsen 的文字預設是 markdown rich。」 Earlier wordings (20:07Z, 20:36Z, 20:55Z) are void and were never shipped.
+- **A call a reflex lane took is titled as a call** (Chiron #200144): threads keyed `item` / `mesh-<n>` were titled 「因為：…」 with no peer; now 「<對方>：<first 30 characters>」 without the 「因為：」 head (`callBody`, `callTitle`; `TITLE_V` 3). At start, open threads with the old title are retitled once.
+- Tests: `wo164-onsen-format.test.ts` (6), `wo164-call-title-v3.test.ts` (3); `wo146-tool-text.test.ts` pins updated.
+
 ## 1.57.2 — 2026-11-26
 
 - **A thread's title comes from its key, not from the first item's whole text** (board WO-164, Chiron 17:18Z 「串的標題照串鍵取，不取第一則的全文」). Only for the agents in `LANES_WAKE_DECIDE` (the threads exist only there). A schedule's thread was titled by its first run's whole line (`[scheduled][wo164-acc][run:7170431][P3]…`), and every later run and Onsen's open threads showed it. `threadTitle(key_kind, key, item)` (`lanes-threads.ts`), set when the thread opens:
