@@ -43,7 +43,7 @@ describe('part 1: one route record → one wake row', () => {
     const ev = tg(7001, '幫我看一下 WO-147')
     const it = W.wakeItem(rowOf(ev, 'tg-main', 'main'), { ...ctx0, ev, main: { state: 'idle', offered: false }, did: 'm-x-1' }, o)
     expect(it).toEqual({ idem_key: o.idem, agent: 'adam', host: 'mini', at: o.at, source_kind: 'joey_tg', urgency: 'interrupt', target: 'main_now', rule: 'tg-main',
-      member_state: 'idle', sender: 'joey', refs: { tg: '1828:7001', event_id: 'tg-1828-7001', did: 'm-x-1' }, preview: '幫我看一下 WO-147' })
+      member_state: 'idle', sender: 'joey', refs: { tg: '1828:7001', event_id: 'tg-1828-7001', did: 'm-x-1' }, preview: '幫我看一下 WO-147', decided_by: 'old' })
     // an edit of his (Onsen step 2): its own kind
     const ed = tg(7001, '改過', { edited_at: '2026-11-25T10:00:00Z' })
     expect(W.wakeItem(rowOf(ed, 'tg-main', 'main'), { ...ctx0, ev: ed }, o)).toMatchObject({ source_kind: 'joey_edit', urgency: 'interrupt', target: 'held:offline' })

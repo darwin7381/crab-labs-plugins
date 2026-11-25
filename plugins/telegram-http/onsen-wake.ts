@@ -20,6 +20,9 @@
 //   member_state the agent's status at that moment (statusOf's view as the daemon last computed it; walled when the view carries a wall)
 //   refs         btcc_msg_id run_id ticket tg event_id did thread form_id mail_id (what there is)
 //   preview      the first 120 characters (code points) of the text
+//   decided_by   WO-157: new (decideWake decided: LANES_WAKE_DECIDE; rule wake:<its rule>[/<the rule the doing code returned>], target its verdict when the
+//                doing code did that) | old (the router's rules, the fixed paths). Onsen 0.9.4 ignores a field it does not know: until fleet-core stores it,
+//                the rule's `wake:` prefix is what tells the two apart in Onsen
 import type { InEvent, RouteTapCtx, WakeTapCtx } from './lanes.ts'
 
 export const SOURCE_KINDS = ['joey_tg', 'joey_edit', 'joey_form', 'peer_call', 'peer_mail', 'mail_ring', 'mail_event', 'scheduled', 'alert', 'board',
@@ -30,6 +33,8 @@ export type WakeRefs = Partial<Record<'btcc_msg_id' | 'run_id' | 'ticket' | 'tg'
 export type WakeItem = {
   idem_key: string; agent: string; host: string; at: string; source_kind: SourceKind; urgency?: Urgency; target: string
   rule?: string; note?: string; member_state?: string; sender?: string; refs: WakeRefs; preview?: string
+  /** WO-157: which path decided */
+  decided_by: 'new' | 'old'
 }
 export const PREVIEW_MAX = 120
 
@@ -128,7 +133,8 @@ export function targetOf(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'm
 /** the agent's state at that moment: statusOf's view as the daemon last computed it (step 3), walled when the view carries a wall; before the first view,
  *  the main's M2 record (idle, busy, walled, offline) */
 export function memberStateOf(view: { state: string; detail?: Record<string, unknown> } | null | undefined, m: RouteTapCtx['main']): string {
-  if (view?.state) return view.state !== 'offline' && view.detail?.walled ? 'walled' : view.state
+  // WO-157: statusOf's five states, and its detail's walled / compacting as states of their own (not when offline): the seven decideWake reads
+  if (view?.state) return view.state !== 'offline' && view.detail?.walled ? 'walled' : view.state !== 'offline' && view.detail?.compacting ? 'compacting' : view.state
   if (!m) return 'offline'
   return m.state === 'idle' ? 'idle' : m.state === 'in_turn' ? 'busy' : m.state === 'walled' ? 'walled' : 'offline'
 }
@@ -154,6 +160,18 @@ export function refsOf(row: Record<string, unknown>, ev: InEvent | null, did: st
   return out
 }
 
+/** WO-157: on the new path the row's target is decideWake's verdict when the doing code did what it said (the same kind of place: the main, a lane, the
+ *  ledger); a gate or merge inside the doing code that went elsewhere (a repeat alert to the ledger, a board with no worker topic to the main) leaves the
+ *  target the doing code's */
+function verdictTarget(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'main' | 'laneKind'>): string {
+  const did = targetOf(row, ctx), v = typeof row.wake_target === 'string' ? row.wake_target : ''
+  if (row.decided_by !== 'new' || !v) return did
+  const cls = (t: string) => t.startsWith('main_') ? 'main' : t.startsWith('lane:') ? 'lane' : t
+  if (v.startsWith('held:')) return did === 'ledger' || did === 'none' ? did : v
+  if (cls(v) === 'main' && cls(did) === 'main') return v
+  if (cls(v) === 'lane' && cls(did) === 'lane') return did                  // the lane the doing code picked (its kind)
+  return did
+}
 /** one route record → one Onsen row */
 export function wakeItem(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'ev' | 'main' | 'laneKind' | 'alertSenders' | 'roster'> & { did?: string | null },
   o: { agent: string; host: string; at: string; idem: string; memberState: string | null }): WakeItem {
@@ -163,10 +181,11 @@ export function wakeItem(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'e
   const text = typeof row.text === 'string' ? row.text : typeof ev?.text === 'string' ? ev.text : ''
   const sender = row.from ?? ev?.from
   return {
-    idem_key: o.idem, agent: o.agent, host: o.host, at: o.at, source_kind: kind, ...(urgency ? { urgency } : {}), target: targetOf(row, ctx),
+    idem_key: o.idem, agent: o.agent, host: o.host, at: o.at, source_kind: kind, ...(urgency ? { urgency } : {}), target: verdictTarget(row, ctx),
     ...(row.rule != null ? { rule: cutPoints(row.rule, 80) } : {}), ...(row.note != null && row.note !== '' ? { note: cutPoints(row.note, 300) } : {}),
     ...(o.memberState ? { member_state: o.memberState } : {}), ...(sender != null && sender !== '' ? { sender: cutPoints(sender, 120) } : {}),
     refs: refsOf(row, ev, ctx.did ?? null), ...(text ? { preview: cutPoints(text, PREVIEW_MAX) } : {}),
+    decided_by: row.decided_by === 'new' ? 'new' : 'old',
   }
 }
 
@@ -199,8 +218,9 @@ export function handItem(line: Record<string, unknown>, ctx: WakeTapCtx, o: { ag
   const text = rec?.text ?? ''
   return {
     idem_key: o.idem, agent: o.agent, host: o.host, at: String(line.ts ?? new Date().toISOString()), source_kind: ctx.kind as SourceKind, ...(ctx.urgency ? { urgency: ctx.urgency } : {}),
-    target: handTarget(String(line.state ?? ''), ctx), rule: cutPoints(ctx.rule, 80),
+    target: ((t: string) => ctx.decided_by === 'new' && ctx.wake_target && t !== 'none' && (ctx.wake_target.startsWith('held:') || ctx.wake_target.startsWith('main_')) ? ctx.wake_target : t)(handTarget(String(line.state ?? ''), ctx)), rule: cutPoints(ctx.decided_by === 'new' && ctx.wake_rule ? `wake:${ctx.wake_rule}/${ctx.rule}` : ctx.rule, 80),
     ...(why ? { note: cutPoints(why, 300) } : {}),                     // the line's reason, as written (with at and event_id it joins the line)
     ...(o.memberState ? { member_state: o.memberState } : {}), sender: cutPoints(sender, 120), refs, ...(text ? { preview: cutPoints(text, PREVIEW_MAX) } : {}),
+    decided_by: ctx.decided_by === 'new' ? 'new' : 'old',
   }
 }

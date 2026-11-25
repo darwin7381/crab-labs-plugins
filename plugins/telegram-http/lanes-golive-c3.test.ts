@@ -49,7 +49,8 @@ test('C3: a scheduler run the router gives the main gets its start receipt when 
 test('C3 server.ts: the lanes /inject branch goes to the router (no hub doorbell since 1.52.0), parked deliveries go back through the router', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   // WO-141 phase 2: the fleet-path fallback stays on for everything but the mailbox's ring (mail-ring.test.ts)
-  expect(src).toContain('const d = await laneDeliverMesh(notification, verdict.verified, !ring)')
+  // WO-157: the sender's wake facts (item kind, urgency) ride along as an argument, never in the meta
+  expect(src).toContain('const d = await laneDeliverMesh(notification, verdict.verified, !ring, wakeFactsOf(body as unknown as Record<string, unknown>))')
   expect(src).toContain('if (!(await laneRedeliver(notif))) break')
   // WO-158: hub sync is gone (no 30 s sync, no doorbell); an older process's parked doorbells are handed on once at start
   for (const gone of ['HubSync', 'hubSyncMode', 'laneHubPush', 'rememberHubMeta', 'hub.doorbell', "hub?.kick(", '/api/mesh/inbox/pending']) expect(src).not.toContain(gone)

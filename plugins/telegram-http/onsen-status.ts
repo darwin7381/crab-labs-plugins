@@ -114,10 +114,19 @@ export type StatusView = { state: StatusState; detail?: Record<string, unknown>;
 export type BusyInput = { turn_started_at: string | null; tool: { name: string; started_at: string | null; timeout_s?: number | null } | null; subagents: number }
 export type OfflineReason = 'no_registration' | 'pid_gone' | 'pid_reused' | 'not_connected'
 /** what the daemon knows beside the source (detail only): the usage wall (or the lanes main's own), Joey's messages it holds, the turn, a compaction */
-export type StatusShared = { queuedJoey: number; wall: { walled: boolean; until: string | null; kind: string | null } | null; turn?: BusyInput | null; compacting?: boolean }
+export type StatusShared = { queuedJoey: number; wall: { walled: boolean; until: string | null; kind: string | null } | null; turn?: BusyInput | null; compacting?: boolean
+  /** WO-157: the main's last turn start and its last final Stop as its hooks reported them (ms; lanes on) */
+  edges?: TurnEdges | null
+  /** WO-157 (Chiron 13:46Z, 5): this agent's lane runs in progress (detail.lanes) */
+  lanes?: LaneRunInfo[] }
+/** WO-157: the main's last turn start (UserPromptSubmit / PreToolUse) and its last final Stop (the daemon's own Stop hook passed it) */
+export type TurnEdges = { started_at: number | null; ended_at: number | null }
+/** one lane run in progress: the lane, its run (lane.rN), its kind, since when */
+export type LaneRunInfo = { id: string; run: string; kind?: string; since: string }
 /** what a source says: the main's own state (null = offline, `offline` says why), the newest write to its transcripts, and the shared detail */
-export type StatusInputs = { main: { status: string; waiting_for?: string | null } | null; offline?: OfflineReason; last_activity_at: string | null
-  queued_joey: number; walled?: { until: string | null; kind?: string | null } | null; compacting?: boolean; turn?: BusyInput | null }
+export type StatusInputs = { main: { status: string; waiting_for?: string | null; status_at?: number | null } | null; offline?: OfflineReason; last_activity_at: string | null
+  queued_joey: number; walled?: { until: string | null; kind?: string | null } | null; compacting?: boolean; turn?: BusyInput | null; lanes?: LaneRunInfo[]
+  edges?: TurnEdges | null }
 /** where the main's state comes from. A source reads one kind of evidence and fills StatusInputs; statusOf is the only judge. Registry is the one in use;
  *  another (a terminal reader, herdr / moshi style) implements this and nothing else changes. */
 export interface StatusSource { inputs(shared: StatusShared): StatusInputs }
@@ -130,12 +139,34 @@ export const stuckS = (): number => { const n = Number(process.env.ONSEN_STUCK_S
  *  (turn_started_at, tool {name, since}, subagents) when the hooks or the transcript show one */
 export function statusOf(i: StatusInputs, o: { now?: number; stuckS?: number } = {}): StatusView {
   const extras = { queued_joey: i.queued_joey, ...(i.walled ? { walled: { until: i.walled.until ?? null, ...(i.walled.kind ? { kind: i.walled.kind } : {}) } } : {}),
-    ...(i.compacting ? { compacting: true } : {}) }
+    ...(i.compacting ? { compacting: true } : {}), ...(i.lanes?.length ? { lanes: i.lanes } : {}) }
   const turn = i.turn ? { turn_started_at: i.turn.turn_started_at, tool: i.turn.tool ? { name: i.turn.tool.name, since: i.turn.tool.started_at,
     ...(Number(i.turn.tool.timeout_s) > 0 ? { timeout_s: Number(i.turn.tool.timeout_s) } : {}) } : null, subagents: i.turn.subagents } : {}
   const last = { last_activity_at: i.last_activity_at ?? null }
   if (!i.main) return { state: 'offline', detail: { reason: i.offline ?? 'no_registration', ...extras }, ...last }
-  const st = i.main.status
+  let st = i.main.status
+  // WO-157 (Chiron 13:46Z, 3): the registry's status can go stale. The 28 rows where statusOf and the hook state disagreed (11-24/25, Mac mini): 25 times
+  // the file said busy (2 times waiting, `dialog open`) for seconds to two hours after the main's turn had ended, and the main took the next item within
+  // 0.1 s (sandwich-master's file said busy from 11:35:15Z on through dozens of turns). When the hooks show the turn ended (a final Stop) after Claude Code
+  // last wrote the status, and no turn began since, the status is idle (detail registry_stale: what the file said); when they show a turn began after the
+  // file said idle and it has not ended, busy. A file written after the hook evidence wins as before.
+  const at = Number(i.main.status_at), e = i.edges
+  if (e && Number.isFinite(at) && at > 0) {
+    if ((st === 'busy' || st === 'waiting') && e.ended_at != null && e.ended_at > at && (e.started_at == null || e.started_at <= e.ended_at)) {
+      return { state: 'idle', detail: { registry_stale: st, ...extras }, ...last }
+    }
+    if ((st === 'idle' || st === 'shell') && e.started_at != null && e.started_at > at && (e.ended_at == null || e.ended_at < e.started_at)) {
+      const turn2 = i.turn ? { turn_started_at: i.turn.turn_started_at, tool: i.turn.tool ? { name: i.turn.tool.name, since: i.turn.tool.started_at } : null, subagents: i.turn.subagents } : {}
+      return { state: 'busy', detail: { registry_stale: st, ...turn2, ...extras }, ...last }
+    }
+  }
+  // WO-157 (3), the two rows the edges do not explain (kot 07:14Z, nestor 07:16Z): `waiting: dialog open` written a few seconds after the turn's final
+  // Stop, and the main took the next item within 0.1 s (2 of the 7 `dialog open` spells on this machine had turns inside them). A dialog outside a turn does
+  // not keep channel input from the main: idle {dialog_open}. Inside a turn (a start after the last Stop) it stays waiting; a permission prompt is always
+  // inside one.
+  if (st === 'waiting' && i.main.waiting_for === 'dialog open' && e && e.ended_at != null && (e.started_at == null || e.started_at <= e.ended_at)) {
+    return { state: 'idle', detail: { dialog_open: true, ...extras }, ...last }
+  }
   if (st === 'idle' || st === 'shell') return { state: 'idle', detail: { ...(st === 'shell' ? { background_shell: true } : {}), ...extras }, ...last }
   if (st === 'waiting') return { state: 'waiting', detail: { waitingFor: i.main.waiting_for ?? null, ...turn, ...extras }, ...last }
   if (st !== 'busy') return { state: 'busy', detail: { registry_status: st, ...turn, ...extras }, ...last }
@@ -193,6 +224,9 @@ export class LanesTap {
   private turn: { prompt: string; at: string } | null = null
   private subagents = 0
   private compactingAt: number | null = null
+  /** WO-157: the main's last turn start and last final Stop (ms), for statusOf's stale-registry rule */
+  private startedAt: number | null = null
+  private endedAt: number | null = null
   constructor(readonly o: { facts: DeliveryFacts; joey: JoeyOf; gen: () => Row | null; changed: () => void; now?: Now }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
 
@@ -241,6 +275,8 @@ export class LanesTap {
     if (!g || !b.pid || Number(g.pid) !== Number(b.pid)) return
     if (ev === 'PreCompact') this.compactingAt = this.now()
     else this.compactingAt = null
+    if (ev === 'UserPromptSubmit' || ev === 'PreToolUse') this.startedAt = this.now()
+    else if ((ev === 'Stop' && b.phase === 'final') || ev === 'StopFailure') this.endedAt = this.now()
     const tool = String(b.tool_name ?? '')
     if (ev === 'PreToolUse') this.toolTimeout = { name: tool, s: Number(b.tool_timeout_ms) > 0 ? Number(b.tool_timeout_ms) / 1000 : null }
     else if (ev === 'PostToolUse' || ev === 'Stop' || ev === 'StopFailure') this.toolTimeout = null
@@ -258,6 +294,8 @@ export class LanesTap {
       tool: g?.tool_open ? { ...(this.tool?.name === g.tool_open ? this.tool : { name: String(g.tool_open), started_at: null }),
         timeout_s: this.toolTimeout?.name === String(g.tool_open) ? this.toolTimeout.s : null } : null, subagents: this.subagents }
   }
+  /** WO-157: the main's turn edges as its hooks reported them (statusOf corrects a stale registry status with them) */
+  turnEdges(): TurnEdges { return { started_at: this.startedAt, ended_at: this.endedAt } }
   /** detail only: a PreCompact of the main, until its next hook event (at most 15 min) */
   compacting(): boolean { return this.compactingAt != null && this.now() - this.compactingAt < 15 * 60_000 }
   /** detail only: the main's own wall (M2 walled after an account-kind StopFailure; until unknown), or null */
@@ -417,7 +455,9 @@ export function newestJsonl(dir: string): string | null {
 // two are compared; when they disagree the CLI's reading is used instead, read again every 30 s and compared, until they agree. Every switch is logged.
 // 1.48.3 (11-25 06:35Z, the Mac mini ran out of memory): a file in another shape is read as far as it goes and never switches the read by itself; the CLI
 // is read through SharedCli, one run at a time on the whole machine, killed at its timeout, its answer shared by every daemon.
-export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number; entrypoint?: string }
+export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number; entrypoint?: string
+  /** WO-157: when Claude Code last wrote `status` (statusUpdatedAt, ms) */
+  statusAt?: number }
 /** the registry statuses statusOf knows */
 export const REG_STATUSES = new Set(['idle', 'busy', 'waiting', 'shell'])
 /** a registry file younger than this is not judged by its shape (a starting session fills it in a moment later) */
@@ -431,7 +471,8 @@ export function regEntry(j: any): RegEntry | null {
   for (const k of ['sessionId', 'cwd', 'kind', 'status']) if (typeof j[k] !== 'string') return null
   return { pid: j.pid, sessionId: j.sessionId, cwd: j.cwd, kind: j.kind, status: j.status, ...(typeof j.waitingFor === 'string' ? { waitingFor: j.waitingFor } : {}),
     ...(typeof j.procStart === 'string' ? { procStart: j.procStart } : {}), ...(typeof j.tmux === 'string' ? { tmux: j.tmux } : {}),
-    ...(typeof j.startedAt === 'number' ? { startedAt: j.startedAt } : {}), ...(typeof j.entrypoint === 'string' ? { entrypoint: j.entrypoint } : {}) }
+    ...(typeof j.startedAt === 'number' ? { startedAt: j.startedAt } : {}), ...(typeof j.entrypoint === 'string' ? { entrypoint: j.entrypoint } : {}),
+    ...(typeof j.statusUpdatedAt === 'number' ? { statusAt: j.statusUpdatedAt } : {}) }
 }
 const realOf = (p: string): string => { try { return realpathSync(p) } catch { return p } }
 const samePath = (a: string, b: string): boolean => a === b || realOf(a) === realOf(b)
@@ -812,7 +853,8 @@ export class Registry implements StatusSource {
     return m > 0 ? iso(m) : null
   }
   inputs(s: StatusShared): StatusInputs {
-    const base = { queued_joey: s.queuedJoey, walled: s.wall?.walled ? { until: s.wall.until, kind: s.wall.kind } : null, compacting: !!s.compacting, turn: s.turn ?? null }
+    const base = { queued_joey: s.queuedJoey, walled: s.wall?.walled ? { until: s.wall.until, kind: s.wall.kind } : null, compacting: !!s.compacting, turn: s.turn ?? null,
+      ...(s.lanes?.length ? { lanes: s.lanes } : {}), ...(s.edges ? { edges: s.edges } : {}) }
     const e = this.main()
     const off = (why: OfflineReason): StatusInputs => ({ main: null, offline: why, last_activity_at: this.lastActivity(e?.sessionId ?? this.o.sessionId?.() ?? null), ...base })
     if (!e) return off('no_registration')
@@ -821,12 +863,12 @@ export class Registry implements StatusSource {
       // closed session is offline `no_registration` and only a process that died with its file left behind (kill -9, a crash) is `pid_gone` (WO-143)
       const since = this.deadSince.get(e.pid) ?? this.now()
       this.deadSince.set(e.pid, since)
-      if (this.now() - since < DEAD_GRACE_MS) return { main: { status: e.status, waiting_for: e.waitingFor ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
+      if (this.now() - since < DEAD_GRACE_MS) return { main: { status: e.status, waiting_for: e.waitingFor ?? null, status_at: e.statusAt ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
       return off('pid_gone')
     }
     this.deadSince.delete(e.pid)
     if (e.procStart) { const os = this.startOf(e.pid); if (os && !sameStart(os, e.procStart)) return off('pid_reused') }
     if (!this.o.connected(e.pid)) return off('not_connected')
-    return { main: { status: e.status, waiting_for: e.waitingFor ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
+    return { main: { status: e.status, waiting_for: e.waitingFor ?? null, status_at: e.statusAt ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
   }
 }

@@ -36,23 +36,35 @@ describe('part 1: the table', () => {
 })
 
 describe('part 2: each kind, each state', () => {
-  test('Joey: main now when idle, after this step when busy, after this step when idle with an offer out', () => {
+  test('Joey: main now when idle, after this step when busy (statusOf only)', () => {
     expect(d({ kind: 'joey_tg' }, idle)).toMatchObject({ target: 'main_now', urgency: 'interrupt', rule: 'joey' })
     expect(d({ kind: 'joey_tg' }, busy)).toMatchObject({ target: 'main_after_step', rule: 'joey' })
-    expect(d({ kind: 'joey_edit' }, { member: 'idle', main_offered: true })).toMatchObject({ target: 'main_after_step' })
+    expect(d({ kind: 'joey_edit' }, { member: 'compacting' })).toMatchObject({ target: 'main_after_step' })
     expect(d({ kind: 'joey_form' }, idle)).toMatchObject({ target: 'main_now', rule: 'joey' })
   })
   test('Joey quoting a lane message or writing in a worker topic: that lane', () => {
     expect(d({ kind: 'joey_tg' }, { member: 'busy', owner: 'worker' })).toMatchObject({ target: 'lane:worker', rule: 'joey-owner' })
     expect(d({ kind: 'joey_tg' }, { member: 'idle', owner: 'reflex' })).toMatchObject({ target: 'lane:reflex', rule: 'joey-owner' })
   })
-  test("Joey's message when the main waits on a button, is stuck, walled, offline: held, and he is told (not for the wall: its own notice)", () => {
-    expect(d({ kind: 'joey_tg' }, { member: 'waiting' })).toMatchObject({ target: 'held:waiting', tell: 'joey', then: 'main' })
-    expect(d({ kind: 'joey_tg' }, { member: 'stuck' })).toMatchObject({ target: 'held:stuck', tell: 'joey' })
+  test("Joey's message when the main waits on a button, is stuck, walled, offline: held; nobody gets an extra notice (decision 6)", () => {
+    expect(d({ kind: 'joey_tg' }, { member: 'waiting' })).toMatchObject({ target: 'held:waiting', then: 'main' })
+    expect(d({ kind: 'joey_tg' }, { member: 'stuck' })).toMatchObject({ target: 'held:stuck' })
     expect(d({ kind: 'joey_tg' }, { member: 'walled' })).toMatchObject({ target: 'held:wall', then: 'main' })
-    expect(d({ kind: 'joey_tg' }, { member: 'walled' }).tell).toBeUndefined()
-    expect(d({ kind: 'joey_tg' }, { member: 'offline' })).toMatchObject({ target: 'held:offline', tell: 'joey' })
+    expect(d({ kind: 'joey_tg' }, { member: 'offline' })).toMatchObject({ target: 'held:offline' })
     expect(d({ kind: 'joey_tg' }, { member: 'starting' })).toMatchObject({ target: 'held:starting' })
+    for (const m of MEMBER_STATES) expect(d({ kind: 'joey_tg' }, { member: m }).tell).toBeUndefined()
+  })
+  test('decision 2 (13:46Z): statusOf alone, a cell for each of its seven states', () => {
+    const want: Record<string, [string, string, string]> = {          // member: joey, a hand-over, a state wake
+      idle: ['main_now', 'main_now', 'main_now'], busy: ['main_after_step', 'main_after_step', 'main_after_step'],
+      waiting: ['held:waiting', 'held:waiting', 'main_after_step'], stuck: ['held:stuck', 'held:stuck', 'main_after_step'],
+      compacting: ['main_after_step', 'main_after_step', 'main_after_step'], walled: ['held:wall', 'held:wall', 'held:wall'], offline: ['held:offline', 'held:offline', 'held:offline'] }
+    for (const [m, [j, h, w]] of Object.entries(want)) {
+      expect(d({ kind: 'joey_tg' }, { member: m }).target).toBe(j)
+      expect(d({ kind: 'handoff', urgency: 'ordered' }, { member: m }).target).toBe(h)
+      expect(d({ kind: 'wd_stall' }, { member: m }).target).toBe(w)
+      expect(d({ kind: 'scheduled' }, { member: m }).target).toBe(m === 'walled' ? 'held:wall' : 'lane:reflex')
+    }
   })
   test('a colleague: a call → a reflex lane; a mail → the mail lane; a reply in a conversation we own → its owner', () => {
     expect(d({ kind: 'peer_call', sender: 'eve' }, busy)).toMatchObject({ target: 'lane:reflex', urgency: 'interrupt', rule: 'peer-call' })
@@ -68,6 +80,7 @@ describe('part 2: each kind, each state', () => {
     expect(d({ kind: 'mail_event', sub: 'decision' }, { member: 'busy', owner: 'mail' })).toMatchObject({ target: 'lane:mail', rule: 'mail-decision' })
     expect(d({ kind: 'mail_event', sub: 'decision' }, { member: 'idle' })).toMatchObject({ target: 'main_now', rule: 'mail-decision-main' })
     expect(d({ kind: 'mail_event', sub: 'due' }, busy)).toMatchObject({ target: 'ledger', rule: 'mail-due' })
+    expect(d({ kind: 'mail_event', sub: 'something-else' }, busy)).toMatchObject({ target: 'main_after_step', rule: 'default' })
   })
   test('a scheduled run, a page alert → a reflex lane; an alert of an incident a lane already handles → that lane', () => {
     expect(d({ kind: 'scheduled', sender: 'scheduler', refs: { run_id: '7' } }, idle)).toMatchObject({ target: 'lane:reflex', urgency: 'ordered', rule: 'scheduled' })
@@ -97,9 +110,10 @@ describe('part 2: each kind, each state', () => {
     expect(d({ kind: 'card', urgency: 'silent' }, idle)).toMatchObject({ target: 'ledger', rule: 'hand-silent' })
     expect(d({ kind: 'lane_exit', urgency: 'silent' }, busy)).toMatchObject({ target: 'ledger', rule: 'hand-silent' })
   })
-  test('a lane destination when walled or offline: held, then the lane (offline: the waiter is told)', () => {
+  test('a lane destination when walled: held, then the lane; offline: the lane runs (decision 3)', () => {
     expect(d({ kind: 'scheduled' }, { member: 'walled' })).toMatchObject({ target: 'held:wall', then: 'lane:reflex' })
-    expect(d({ kind: 'peer_mail' }, { member: 'offline' })).toMatchObject({ target: 'held:offline', then: 'lane:mail', tell: 'waiter' })
+    expect(d({ kind: 'peer_mail' }, { member: 'offline' })).toMatchObject({ target: 'lane:mail' })
+    expect(d({ kind: 'scheduled' }, { member: 'gone' })).toMatchObject({ target: 'lane:reflex' })
     expect(d({ kind: 'peer_call' }, { member: 'stuck' })).toMatchObject({ target: 'lane:reflex' })
   })
   test('no free lane slot: still the lane (its queue), marked', () => {
@@ -110,10 +124,19 @@ describe('part 2: each kind, each state', () => {
     expect(d({ kind: 'own' }, { member: 'busy', owner: 'fork' })).toMatchObject({ target: 'lane:fork', rule: 'own' })
     expect(d({ kind: 'own' }, { member: 'busy', owner: 'synthesis' })).toMatchObject({ target: 'lane:synthesis', rule: 'own' })
   })
-  test('a gate that already said no, lanes switched off', () => {
+  test('a gate that already said no, lanes switched off (the ring: recorded only)', () => {
     expect(d({ kind: 'peer_call' }, { member: 'idle', gate: 'peer_flood' })).toMatchObject({ target: 'ledger', rule: 'gate' })
     expect(d({ kind: 'alert' }, { member: 'busy', gate: 'alert_repeat' })).toMatchObject({ target: 'ledger', rule: 'gate' })
     expect(d({ kind: 'peer_call' }, { member: 'idle', lanes_off: true })).toMatchObject({ target: 'main_now', rule: 'lanes-off' })
+    expect(d({ kind: 'mail_ring' }, { member: 'idle', lanes_off: true })).toMatchObject({ target: 'ledger', rule: 'lanes-off-ring' })
+  })
+  test('decision 5: an unverified colleague, scheduler or alert dispatcher → the main; a conversation we own still goes to its owner', () => {
+    expect(d({ kind: 'peer_call', unverified: true }, idle)).toMatchObject({ target: 'main_now', rule: 'unverified' })
+    expect(d({ kind: 'scheduled', unverified: true }, busy)).toMatchObject({ target: 'main_after_step', rule: 'unverified' })
+    expect(d({ kind: 'alert', unverified: true }, busy)).toMatchObject({ rule: 'unverified' })
+    expect(d({ kind: 'peer_call', unverified: true }, { member: 'busy', owner: 'reflex' })).toMatchObject({ target: 'lane:reflex', rule: 'owner' })
+    expect(d({ kind: 'external', unverified: true }, busy)).toMatchObject({ target: 'lane:reflex', rule: 'external' })
+    expect(d({ kind: 'board', unverified: true }, busy)).toMatchObject({ rule: 'board-worker' })
   })
   test('anything else → the main', () => {
     expect(d({ kind: 'other' }, busy)).toMatchObject({ target: 'main_after_step', rule: 'default' })
@@ -122,6 +145,11 @@ describe('part 2: each kind, each state', () => {
 })
 
 describe('part 3: what changed on purpose', () => {
+  test('decision 1: a no_reply reply with reply_to wakes the line that asked; the daemon\'s own notice (urgency silent) is recorded only, owner or not', () => {
+    expect(d({ kind: 'peer_call', no_reply: true, refs: { reply_to: '11835' } }, { member: 'busy', owner: 'main' })).toMatchObject({ target: 'main_after_step', rule: 'owner' })
+    expect(d({ kind: 'peer_call', no_reply: true, refs: { reply_to: '11835' } }, { member: 'idle', owner: 'reflex' })).toMatchObject({ target: 'lane:reflex', rule: 'owner' })
+    expect(d({ kind: 'peer_call', no_reply: true, urgency: 'silent', refs: { reply_to: '11835' } }, { member: 'idle', owner: 'main' })).toMatchObject({ target: 'ledger', rule: 'record-only' })
+  })
   test('no_reply decides nothing: a colleague\'s no_reply call is still a call; only urgency silent is record only', () => {
     expect(d({ kind: 'peer_call', no_reply: true }, idle)).toMatchObject({ target: 'lane:reflex', urgency: 'interrupt' })
     expect(d({ kind: 'peer_call', no_reply: true }, { member: 'busy', owner: 'main' })).toMatchObject({ target: 'main_after_step', rule: 'owner' })

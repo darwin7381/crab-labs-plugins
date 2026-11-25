@@ -431,6 +431,9 @@ let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
 /** WO-147 (ONSEN_WAKE_LOG): the route tap is attached (set up with step 3) */
 let onsenWakeLog = false
+/** WO-157 (Chiron 13:46Z): the main's status computed now, the one statusOf the daemon reports to Onsen (local reads, no network); null: Onsen step 3 off
+ *  for this agent (no status is computed here, and the lanes keep the old path) */
+let onsenStatusCompute: (() => { state: string; detail?: Record<string, unknown> }) | null = null
 const onsenAllow = { at: 0, ids: [] as string[] }
 /** Onsen step 3: Joey's Telegram message behind these meta (a sender on the DM allowlist, a chat, a message id), or null. The allowlist is read at most
  *  every 5 s (it is consulted on every lanes journal write). */
@@ -1783,7 +1786,16 @@ async function inboxDecide(args: Record<string, unknown>): Promise<{ text: strin
 // lanes-golive: the router's event for a mesh notification (an /inject or an Onsen item, a wake-up line of this daemon's own). Every field comes from the
 // notification's meta, which the delivery (or the keep-warm) filled from the body; nothing is read from the text except what has no
 // field yet (wakeKind: the watchdog's marker).
-function laneEventOf(n: { method: string; params: unknown }, verified?: boolean): Lanes.InEvent {
+/** WO-157: what the sender wrote as fields for the receiver's decideWake (an Onsen item's kind, the urgency of a daemon's own notice). Never put in the
+ *  meta: the session reads the meta as the channel tag's attributes, and nothing an agent reads changes */
+type WakeFacts = { item_kind?: string; urgency?: 'interrupt' | 'ordered' | 'silent' }
+const URGENCY_FIELDS = new Set(['interrupt', 'ordered', 'silent'])
+function wakeFactsOf(body: Record<string, unknown> | null | undefined): WakeFacts {
+  const k = typeof body?.item_kind === 'string' && /^[a-z_]{1,24}$/.test(body.item_kind) ? body.item_kind : undefined
+  const u = typeof body?.urgency === 'string' && URGENCY_FIELDS.has(body.urgency) ? body.urgency as WakeFacts['urgency'] : undefined
+  return { ...(k ? { item_kind: k } : {}), ...(u ? { urgency: u } : {}) }
+}
+function laneEventOf(n: { method: string; params: unknown }, verified?: boolean, facts: WakeFacts = {}): Lanes.InEvent {
   const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
   const text = String(p.content ?? '')
   // lanes-golive (A1): the scheduler sends the run number and the high-frequency mark only in the header; a body field wins when a sender has one
@@ -1804,12 +1816,13 @@ function laneEventOf(n: { method: string; params: unknown }, verified?: boolean)
     ...(btcc ? { btcc_msg_id: String(btcc) } : {}),
     ...(wake ? { wake } : {}),
     line: Lanes.lineOf(meta.line) ?? (wake === 'mail' ? 'mail' : 'call'),
+    ...facts,
   }
 }
 // lanes-golive (C1, C3): THE entrance of a mesh notification with lanes on, from either daemon: the router decides (the agent-inbox daemon asks the tg
 // daemon's router; the tg daemon routes itself). Only when no router can be asked does the fleet path (any open session of this agent) take it.
-async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean, fallback = true): Promise<Lanes.Decision | null> {
-  const ev = laneEventOf(n, verified)
+async function laneDeliverMesh(n: { method: string; params: unknown }, verified?: boolean, fallback = true, facts: WakeFacts = {}): Promise<Lanes.Decision | null> {
+  const ev = laneEventOf(n, verified, facts)
   Lanes.noteInboundThread(ev.btcc_msg_id, ev.thread, ev.hop)
   const d = INBOX_ONLY ? await Lanes.routeRemote(ev)                       // target main: the tg daemon queued it for the main (M1)
     : await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); Lanes.toMainDirect(ev); return { rule: 'router-failed', target: 'main' } as Lanes.Decision })
@@ -1840,7 +1853,9 @@ const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
 // `extra` is only ever passed with lanes on (002): thread / hop / sending-lane marker ride along
 // in the comms log and the /inject body, and `minted` reports the BTCC id + delivery outcome.
-type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: string; minted?: (id: number | undefined, delivered: boolean) => void }
+type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: string; minted?: (id: number | undefined, delivered: boolean) => void
+  /** WO-157 (decision 1): a notice of the daemon's own (the router's interim, a thread-stop notice, the flood reply): the receiver records it only */
+  urgency?: 'silent' }
 function laneFields(extra?: LaneSendExtra): Record<string, unknown> {
   if (!extra) return {}
   return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}), ...(extra.owner ? { owner: extra.owner } : {}) }
@@ -1924,7 +1939,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     ...(replyTo != null ? { reply_to_id: replyTo } : {}),
     ...(opRef ? { op: opRef } : {}),
     ...(noReply ? { no_reply: true } : {}),
-    ...laneFields(extra) }
+    ...laneFields(extra),
+    ...(extra?.urgency === 'silent' ? { urgency: 'silent' } : {}) }        // WO-157: the receiver's decideWake reads it (record only); not in the BTCC row
   if (pushUrl) {
     try {
       const r = await fetch(pushUrl, {
@@ -4183,6 +4199,8 @@ if (Lanes.LANES_ON) {
     return got.length === want.length && timingSafeEqual(got, want)
   }
   Lanes.lanesInit({
+    // WO-157 (Chiron 13:46Z): the one state source: statusOf computed now (what goes to Onsen); null = no status here (the lanes keep the old path)
+    mainStatus: () => onsenStatusCompute ? onsenStatusCompute() : null,
     role: INBOX_ONLY ? 'inbox' : 'tg',
     agent: process.env.LANES_AGENT ?? INBOX_SELF,
     workspaceDir: AGENT_WORKSPACE_DIR,
@@ -4392,8 +4410,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     const w = wallReader.state()
     const wall = w?.walled ? { walled: true, until: w.resets_at, kind: w.kind } : tap?.walled() ?? null
     return OnsenStatus.statusOf(source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : facts.queued(watch?.watching() ? 'taken' : 'seen'), wall,
-      turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false }))
+      turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false, lanes: tap ? Lanes.runningLanes() : [], edges: tap ? tap.turnEdges() : null }))
   }
+  onsenStatusCompute = compute                                          // WO-157: the lanes' one state source (decideWake, 此刻, the same-matter gate)
   registry.start()
   setInterval(() => { try { watch?.tick(); feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   setTimeout(kick, 1_000).unref?.()
@@ -4643,7 +4662,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
       },
     }
     // lanes-golive (C3): one entrance into the main: the router (1.52.0, WO-158: no hub doorbell any more)
-    const d = await laneDeliverMesh(notification, verdict.verified, !ring)
+    const d = await laneDeliverMesh(notification, verdict.verified, !ring, wakeFactsOf(body as unknown as Record<string, unknown>))
     if (ring && !d) {
       log('warn', `ring from ${from} NOT delivered: no lanes router to ask (the mailbox tries again later)`)
       return { code: 200, json: { injected: false, error: 'lanes router unreachable: ring not delivered' } }
@@ -4687,7 +4706,9 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
 async function deliverPulled(it: PullItem): Promise<HandResult> {
   // the sender's facts in Onsen's own fields (0.9.3) count as much as the payload's: an item whose no_reply is only a top-level fact is still a
   // no-reply answer to the router (Chiron WO-158 11:56Z: a no_reply peer_call sent that way opened a lane)
-  const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}) } as InboundBody
+  const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}),
+    // WO-157: the item's kind (Onsen's WO-147 names) is the sender's field the receiver's decideWake reads; the payload's own kind field, if any, wins
+    ...(typeof it.kind === 'string' && !(it.payload as Record<string, unknown> | undefined)?.item_kind ? { item_kind: it.kind } : {}) } as InboundBody
   const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
   const sender = String(it.sender ?? 'unknown').slice(0, 64)
   const unverified = it.unverified === true

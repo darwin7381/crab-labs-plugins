@@ -8,16 +8,17 @@
 //        sender's field (no text prefix decides anything); urgency is the sender's (interrupt / ordered / silent; `state` for a state crossing), and
 //        when it filled none the rule table's default for that kind. no_reply is carried and recorded but decides nothing (design page: 「欠不欠回覆」is
 //        another matter, no longer read as 「叫不叫醒」).
-// state  this agent's one state: `member` (Onsen's status of the main, the one pinned in the chat: idle busy waiting stuck menu compacting walled starting
-//        offline gone), `main_offered` (an item already offered to an idle main: one offer opens one turn), `lane_free` (a lane slot is free), and what the
-//        router's own tables say about this item: `owner` (the line its conversation belongs to: 'main' or a lane kind), `gate` (an admission gate already
-//        said no: hold, flood, repeat, merge, stopped thread), `worker_topics` (a worker lane can be opened), `lanes_off`.
+// state  this agent's one state (Chiron WO-157 13:46Z, after Joey TG chiron:2432 / 2263: ONE reliable state source): `member` = the daemon's own statusOf
+//        (onsen-status.ts, the value it reports to Onsen, read locally): offline idle busy waiting stuck, and its detail's walled / compacting as states of
+//        their own. Idle = give now, busy = after this step; a cell for every other state. No MainPhase, no M1 offer state (the hook keeps only the
+//        delivery moment). Also `lane_free` (a lane slot is free), and what the router's own tables say about this item: `owner` (the line its
+//        conversation belongs to: 'main' or a lane kind), `gate` (an admission gate already said no), `worker_topics`, `lanes_off`.
 // target main_now | main_after_step | lane:<reflex|mail|worker|fork|curator|synthesis> | ledger (record only) | held:<wall|offline|starting|waiting|stuck>
-//        (`then`: where it goes when released). `tell`: who is told it is held (joey | waiter).
+//        (`then`: where it goes when released). A held item gets no extra notice (decision 6).
 //
 // Pure: no I/O, no clock, no model. The table is data (lanes-wake-rules.json); an agent adds its own rules in <workspace>/.lanes/router.json `wake_rules`
 // (same shape), and its older router.json rules are translated (legacyAgentRules) so today's per-agent choices carry over without editing any file.
-// Phase 1: nothing calls it from the router yet (the replay, tools/wake-replay.ts, and the tests do).
+// Phase 2 (1.53.0): lanes.ts calls it for every decision when the agent is in LANES_WAKE_DECIDE (routeDecided, asWake, toMainForm, the main's own tools).
 import { readFileSync } from 'fs'
 import { join } from 'path'
 
@@ -40,11 +41,12 @@ export type WakeItem = {
   waiting?: string
   /** a sub-kind the sender knows (mail_event: decision | due) */
   sub?: string
+  /** the sender's name is not verified (Onsen `unverified: true`, a console release; a push nobody vouched for) */
+  unverified?: boolean
   refs?: Partial<Record<'btcc_msg_id' | 'run_id' | 'ticket' | 'tg' | 'event_id' | 'thread' | 'reply_to' | 'mail_id' | 'lane', string>>
 }
 export type WakeState = {
   member: MemberState | string
-  main_offered?: boolean
   lane_free?: boolean
   /** the line the item's conversation belongs to (router tables: its thread, a reply to our message, the quoted lane message, the worker topic, the
    *  ticket's worker, the incident's lane, the lane that asked for a decision): 'main', a lane kind, or null */
@@ -58,7 +60,7 @@ export type MapCell = string | { target: string; tell?: string }
 export type WakeRule = {
   id: string
   when: {
-    kind?: string[]; urgency?: string[]; sender?: string[]; no_reply?: boolean; sub?: string[]; member?: string[]
+    kind?: string[]; urgency?: string[]; sender?: string[]; no_reply?: boolean; sub?: string[]; member?: string[]; unverified?: boolean
     /** 'any' (set), 'none' (unset), 'lane' (a lane kind), 'main', or a list of lane kinds */
     owner?: string | string[]
     gate?: 'any' | string[]
@@ -113,6 +115,7 @@ export function ruleMatches(r: WakeRule, item: WakeItem, state: WakeState, urgen
   if (w.urgency && !w.urgency.includes(urgency)) return false
   if (w.sender && !w.sender.map(lc).includes(lc(item.sender))) return false
   if (typeof w.no_reply === 'boolean' && !!item.no_reply !== w.no_reply) return false
+  if (typeof w.unverified === 'boolean' && !!item.unverified !== w.unverified) return false
   if (w.sub && !w.sub.includes(String(item.sub ?? ''))) return false
   if (w.member && !w.member.includes(String(state.member))) return false
   if (w.owner != null && !ownerMatches(w.owner, state.owner)) return false
@@ -137,7 +140,7 @@ function resolve(dest: string, mapName: string | undefined, state: WakeState, t:
   const member = String(state.member || 'offline')
   if (dest === 'main') {
     const map = t.maps[mapName ?? 'main'] ?? t.maps.main
-    const c = (member === 'idle' && state.main_offered ? cell(map, 'idle+offered') : null) ?? cell(map, member) ?? cell(t.maps.main, member) ?? { target: 'held:offline' }
+    const c = cell(map, member) ?? cell(t.maps.main, member) ?? { target: 'held:offline' }
     return c.target.startsWith('held:') ? { ...c, then: 'main' } : c
   }
   // a lane destination: goes on except where the lane map holds it

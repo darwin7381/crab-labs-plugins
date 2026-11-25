@@ -105,3 +105,8 @@ plugins/telegram-http/lanes.ts::case 'form_close': return laneFormClose(tok, lan
 plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, 'form_close', a); if (g) return g }
 plugins/telegram-http/lanes.ts::const fc = D?.formClose && formCloseKind(kind, run) ? [FORM_CLOSE_TOOL] : []
 plugins/telegram-http/lanes.ts::if (closed) events?.push(tok.evId, 'forms_closed',
+plugins/telegram-http/wake-decide.ts::export function decideWake
+plugins/telegram-http/lanes.ts::export function wakeDecideOn
+plugins/telegram-http/lanes-wake-rules.json::"id": "unverified"
+plugins/telegram-http/onsen-wake.ts::decided_by: row.decided_by === 'new'
+plugins/telegram-http/server.ts::wakeFactsOf(body as unknown as Record<string, unknown>)
