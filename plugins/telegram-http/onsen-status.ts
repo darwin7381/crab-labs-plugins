@@ -106,7 +106,7 @@ export class DeliveryFacts {
 /** 1.45.1: the main's status. The state is Claude Code's own (its session registry, through a StatusSource); what the hooks (lanes on) or the transcript
  *  (lanes off) see of the turn, the usage wall, a compaction and Joey's held messages ride as detail only. */
 export type StatusView = { state: StatusState; detail?: Record<string, unknown>; last_activity_at?: string | null }
-export type BusyInput = { turn_started_at: string | null; tool: { name: string; started_at: string | null } | null; subagents: number }
+export type BusyInput = { turn_started_at: string | null; tool: { name: string; started_at: string | null; timeout_s?: number | null } | null; subagents: number }
 export type OfflineReason = 'no_registration' | 'pid_gone' | 'pid_reused' | 'not_connected'
 /** what the daemon knows beside the source (detail only): the usage wall (or the lanes main's own), Joey's messages it holds, the turn, a compaction */
 export type StatusShared = { queuedJoey: number; wall: { walled: boolean; until: string | null; kind: string | null } | null; turn?: BusyInput | null; compacting?: boolean }
@@ -126,14 +126,18 @@ export const stuckS = (): number => { const n = Number(process.env.ONSEN_STUCK_S
 export function statusOf(i: StatusInputs, o: { now?: number; stuckS?: number } = {}): StatusView {
   const extras = { queued_joey: i.queued_joey, ...(i.walled ? { walled: { until: i.walled.until ?? null, ...(i.walled.kind ? { kind: i.walled.kind } : {}) } } : {}),
     ...(i.compacting ? { compacting: true } : {}) }
-  const turn = i.turn ? { turn_started_at: i.turn.turn_started_at, tool: i.turn.tool ? { name: i.turn.tool.name, since: i.turn.tool.started_at } : null, subagents: i.turn.subagents } : {}
+  const turn = i.turn ? { turn_started_at: i.turn.turn_started_at, tool: i.turn.tool ? { name: i.turn.tool.name, since: i.turn.tool.started_at,
+    ...(Number(i.turn.tool.timeout_s) > 0 ? { timeout_s: Number(i.turn.tool.timeout_s) } : {}) } : null, subagents: i.turn.subagents } : {}
   const last = { last_activity_at: i.last_activity_at ?? null }
   if (!i.main) return { state: 'offline', detail: { reason: i.offline ?? 'no_registration', ...extras }, ...last }
   const st = i.main.status
   if (st === 'idle' || st === 'shell') return { state: 'idle', detail: { ...(st === 'shell' ? { background_shell: true } : {}), ...extras }, ...last }
   if (st === 'waiting') return { state: 'waiting', detail: { waitingFor: i.main.waiting_for ?? null, ...turn, ...extras }, ...last }
   if (st !== 'busy') return { state: 'busy', detail: { registry_status: st, ...turn, ...extras }, ...last }
-  const lim = o.stuckS ?? stuckS(), t = i.last_activity_at ? Date.parse(i.last_activity_at) : NaN
+  // an open tool that declared its own timeout (a long Bash, an MCP call) may run silently that long: the threshold is the larger of the two, with the
+  // lanes-main watchdog's 1.25 margin (WO-143: Chiron's criterion 4 「長 sleep 的工具呼叫 → busy」)
+  const toolS = Number(i.turn?.tool?.timeout_s) > 0 ? Math.round(Number(i.turn!.tool!.timeout_s) * 1.25) : 0
+  const lim = Math.max(o.stuckS ?? stuckS(), toolS), t = i.last_activity_at ? Date.parse(i.last_activity_at) : NaN
   if (Number.isFinite(t) && (o.now ?? Date.now()) - t > lim * 1000) return { state: 'stuck', detail: { threshold_s: lim, ...turn, ...extras }, ...last }
   return { state: 'busy', detail: { ...turn, ...extras }, ...last }
 }
@@ -179,6 +183,8 @@ export class LanesTap {
   /** lane runs that reached `running` in this daemon's life (an exit of a run that never ran, or ran before a restart, ends no turn) */
   private runs = new Set<string>()
   private tool: { name: string; started_at: string } | null = null
+  /** the open tool's declared timeout (PreToolUse tool_timeout_ms), for the stuck threshold */
+  private toolTimeout: { name: string; s: number | null } | null = null
   private turn: { prompt: string; at: string } | null = null
   private subagents = 0
   private compactingAt: number | null = null
@@ -231,6 +237,8 @@ export class LanesTap {
     if (ev === 'PreCompact') this.compactingAt = this.now()
     else this.compactingAt = null
     const tool = String(b.tool_name ?? '')
+    if (ev === 'PreToolUse') this.toolTimeout = { name: tool, s: Number(b.tool_timeout_ms) > 0 ? Number(b.tool_timeout_ms) / 1000 : null }
+    else if (ev === 'PostToolUse' || ev === 'Stop' || ev === 'StopFailure') this.toolTimeout = null
     if (ev === 'PreToolUse' && AGENT_TOOLS.has(tool)) this.subagents++
     else if (ev === 'PostToolUse' && AGENT_TOOLS.has(tool)) this.subagents = Math.max(0, this.subagents - 1)
     else if (ev === 'StopFailure' || (ev === 'Stop' && b.phase === 'final')) this.subagents = 0
@@ -242,7 +250,8 @@ export class LanesTap {
     const g = this.o.gen()
     if (String(g?.state ?? '') !== 'in_turn') return null
     return { turn_started_at: this.turn && this.turn.prompt === String(g?.prompt_id ?? '') ? this.turn.at : null,
-      tool: g?.tool_open ? (this.tool?.name === g.tool_open ? this.tool : { name: String(g.tool_open), started_at: null }) : null, subagents: this.subagents }
+      tool: g?.tool_open ? { ...(this.tool?.name === g.tool_open ? this.tool : { name: String(g.tool_open), started_at: null }),
+        timeout_s: this.toolTimeout?.name === String(g.tool_open) ? this.toolTimeout.s : null } : null, subagents: this.subagents }
   }
   /** detail only: a PreCompact of the main, until its next hook event (at most 15 min) */
   compacting(): boolean { return this.compactingAt != null && this.now() - this.compactingAt < 15 * 60_000 }
@@ -275,7 +284,7 @@ export class TurnWatch {
   private emitFloor = 0
   private inTurn = false
   private turnAt: string | null = null
-  private tools = new Map<string, { name: string; at: string; agent: boolean }>()
+  private tools = new Map<string, { name: string; at: string; agent: boolean; timeout_s: number | null }>()
   private taken = new Map<string, { chat: string; id: string }>()
   constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
@@ -343,7 +352,8 @@ export class TurnWatch {
       let ch = this.begin(ts)
       for (const x of Array.isArray(j.message?.content) ? j.message.content : []) {
         if (x?.type !== 'tool_use' || !x.id) continue
-        this.tools.set(String(x.id), { name: String(x.name ?? 'tool'), at: ts, agent: AGENT_TOOLS.has(String(x.name)) && !x.input?.run_in_background })
+        this.tools.set(String(x.id), { name: String(x.name ?? 'tool'), at: ts, agent: AGENT_TOOLS.has(String(x.name)) && !x.input?.run_in_background,
+          timeout_s: Number(x.input?.timeout) > 0 ? Number(x.input.timeout) / 1000 : null })
         ch = true
       }
       return ch
@@ -373,10 +383,10 @@ export class TurnWatch {
   }
   busy(): BusyInput | null {
     if (!this.inTurn) return null
-    let last: { name: string; at: string } | null = null
+    let last: { name: string; at: string; timeout_s: number | null } | null = null
     let agents = 0
     for (const t of this.tools.values()) { if (t.agent) agents++; if (!last || Date.parse(t.at) >= Date.parse(last.at)) last = t }
-    return { turn_started_at: this.turnAt, tool: last ? { name: last.name, started_at: last.at } : null, subagents: agents }
+    return { turn_started_at: this.turnAt, tool: last ? { name: last.name, started_at: last.at, timeout_s: last.timeout_s } : null, subagents: agents }
   }
   watching(): string | null { return this.file }
 }

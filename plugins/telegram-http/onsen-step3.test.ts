@@ -556,7 +556,7 @@ describe('lanes off: the main\'s turns from its transcript', () => {
     appendFileSync(f, rec({ type: 'user', isMeta: true, isSidechain: false, message: { role: 'user', content: `${tag(11)}\n看一下</channel>` }, timestamp: now }))
     appendFileSync(f, rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] }, timestamp: now }))
     W.tick()
-    expect(W.busy()).toEqual({ turn_started_at: now, tool: { name: 'Bash', started_at: now }, subagents: 0 })
+    expect(W.busy()).toEqual({ turn_started_at: now, tool: { name: 'Bash', started_at: now, timeout_s: null }, subagents: 0 })
     expect(F.queued('taken')).toBe(1)
     appendFileSync(f, rec({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] }, timestamp: now }))
     appendFileSync(f, rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Agent', input: { prompt: 'x' } }, { type: 'tool_use', id: 't3', name: 'Agent', input: { run_in_background: true } }] }, timestamp: now }))
@@ -595,4 +595,15 @@ describe('lanes off: the main\'s turns from its transcript', () => {
     W.tick()
     expect(out.map(x => `${x.client_msg_id}:${x.state}`)).toEqual(['31:turn_end'])
   })
+})
+
+test('1.47.0: an open tool that declared a long timeout raises the stuck threshold (a 15-min Bash is busy, not stuck)', async () => {
+  const { statusOf } = await import('./onsen-status.ts')
+  const now = Date.parse('2026-11-25T03:00:00Z')
+  const base = { main: { status: 'busy' } as any, queued_joey: 0, last_activity_at: new Date(now - 900_000).toISOString() } as any
+  const turn = (timeout_s: number | null) => ({ turn_started_at: null, tool: { name: 'Bash', started_at: new Date(now - 900_000).toISOString(), timeout_s }, subagents: 0 })
+  expect(statusOf({ ...base, turn: turn(null) }, { now, stuckS: 600 }).state).toBe('stuck')
+  expect(statusOf({ ...base, turn: turn(1200) }, { now, stuckS: 600 }).state).toBe('busy')        // 1200 s × 1.25 = 1500 s > 900 s silent
+  const s = statusOf({ ...base, turn: turn(600) }, { now, stuckS: 600 })                           // 750 s < 900 s silent
+  expect(s.state).toBe('stuck'); expect(s.detail?.threshold_s).toBe(750)
 })
