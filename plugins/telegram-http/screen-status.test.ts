@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MAPPED, ScreenStatus, answerExceptions, parseQuestions, publishView, readAnswers, regionParts, regions, screenHash, type JevAnswer, type ScreenDeps } from './screen-status.ts'
+import { MAPPED, ScreenStatus, answerExceptions, decide, parseQuestions, publishView, readAnswers, regionParts, regions, screenHash, type JevAnswer, type ScreenDeps } from './screen-status.ts'
 import { jevAsk } from './lanes-triage.ts'
 import type { StatusView } from './onsen-status.ts'
 
@@ -23,6 +23,9 @@ const BG_AGENTS = (t = '7m 45s') => screen(['⏺ Two helpers are on it.', '', '�
 const MENU = (cursor = 5) => ['', '  print(n)"', '▔'.repeat(80), '   Select model', '   Switch between Claude models.',
   ...['Default (recommended)', 'Sonnet', 'Fable', 'Opus', 'Haiku'].map((m, i) => `   ${i + 1 === cursor ? '❯' : ' '} ${i + 1}. ${m}`),
   '   Enter to set as default · s to use this session only · Esc to cancel', ''].join('\n')
+const BG_TASKS = screen(['⏺ The suite runs on the other machine.', '', '✻ Worked for 2m 3s · done 3:01 AM'],
+  ['  Opus 5.5 · 7d 74%', '  ⏵⏵ bypass permissions on · 2 background tasks · ctrl+t to show tasks · ↓ to manage', '', '  ⏺ main',
+    '  ◯ general-purpose  Running full test suite on txmon… 4m 3s · ↓ 12.0k tokens'])
 const INTERRUPTED = screen(['✻ Churned for 6s · done 12:07 AM', '  Called plugin:telegram-http:telegram-http, ran 1 shell command', '  ⎿  Interrupted · What should Claude do instead?'])
 const SHELL = '\nResume this session with:\nclaude --resume 76ebebd2-d899-497b-aa2b-300b404908fe\n\nuser@host:~/cc-workspaces/claude-lab$ \n'
 const h = (t: string) => screenHash(regionParts(t))
@@ -32,11 +35,13 @@ describe('regions (port of jev_screen.py)', () => {
     const r = regions(BG_AGENTS())
     expect(r.has_input_box).toBe(true)
     expect(r.input_box).toBe('❯')
-    expect(r.counted_by_program).toEqual({ running_agents: 2, shells: 1, monitors: 0 })
+    expect(r.counted_by_program).toEqual({ running_agents: 2, shells: 1, monitors: 0, background_tasks: 0 })
     expect(r.found_by_program.live_activity_line).toBeNull()
     const b = regions(BUSY())
     expect(b.found_by_program).toEqual({ live_activity_line: '✳ Cerebrating… (5m 4s · ↓ 24.2k tokens)', finished_marker_comes_after_it: false, tool_running_line: false, esc_to_interrupt: false })
-    expect(regions(IDLE_SHELL).counted_by_program).toEqual({ running_agents: 0, shells: 1, monitors: 0 })
+    expect(regions(IDLE_SHELL).counted_by_program).toEqual({ running_agents: 0, shells: 1, monitors: 0, background_tasks: 0 })
+    // v3 (Chiron 19:21Z): the newer status line
+    expect(regions(BG_TASKS).counted_by_program).toEqual({ running_agents: 1, shells: 0, monitors: 0, background_tasks: 2 })
     const long = screen(Array.from({ length: 30 }, (_, i) => `line ${i}`))
     expect(regions(long).above_input_box!.split('\n')).toHaveLength(14)
   })
@@ -93,20 +98,39 @@ describe('screen hash: what changes every second is masked, a real change is not
     const s = (pct: string, box = '❯ ', note: string[] = []) => screen(['✻ Worked for 17s · done 1:37 AM'], [`  Opus 5.5 · 7d ${pct}`, '  ⏵⏵ bypass permissions on (shift+tab to cycle)', ...note], box)
     expect(h(s('72%'))).toBe(h(s('71%')))
     expect(h(s('71%', '❯ please look at the build'))).toBe(h(s('71%')))
-    expect(h(s('71%', '❯ ', ['                                      Stop hook error occurred · ctrl+o to see']))).toBe(h(s('71%')))
+  })
+  test("Chiron's list (19:23Z): above the box only its last 2 lines count; the activity line only by being there (its verb changes mid-turn)", () => {
+    const busy = (out: string[], verb: string) => screen([...out, '', `✳ ${verb}… (5s · ↓ 1.0k tokens)`, '  ⎿  Tip: x'])
+    const a = h(busy(['⏺ Bash(ls)', '  ⎿  a'], 'Cerebrating'))
+    expect(h(busy(['⏺ Read(f.ts)', '  ⎿  Read 40 lines', '⏺ Bash(ls)', '  ⎿  b', '⏺ Now the tests.'], 'Burrowing'))).toBe(a)
+    // a todo list under the activity line: its last 2 lines count (digits masked)
+    const todo = (n: number) => screen(['✳ Working… (5s)', '  ⎿  ◼ step one', `      … +${n} in progress, 3 pending, 52 completed`])
+    expect(h(todo(24))).toBe(h(todo(25)))
+  })
+  test('an activity line wrapped onto the next line; notices (right-aligned, the usage notice) above or below the box', () => {
+    const wrap = (t: string[]) => screen(['⏺ Done with the edit.', ...t, '  ⎿  Tip: You have 29 plugins you haven\'t used lately.'])
+    const a = h(wrap(['✻ Thinking through messages… (running Stop hooks… 2/5 · 1m 27s ·', '↓ 2.7k tokens)']))
+    expect(h(wrap(['✢ Thinking through messages… (1m 39s · ↓ 3.1k tokens)']))).toBe(a)
+    const idle = (above: string[], below: string[] = []) => screen(['⏺ Sent.', '✻ Worked for 9s · done 3:00 AM', ...above], ['  Opus 5.5 · 7d 79%', '  ⏵⏵ bypass permissions on', ...below])
+    expect(h(idle(['                                             stop hook problem · ctrl+o to see']))).toBe(h(idle([])))
+    expect(h(idle(['      You\'ve used 79% of your weekly limit · resets Dec 1 at 6am (Asia/Taipei)']))).toBe(h(idle([])))
+    expect(h(idle([], ['                                      Stop hook error occurred · ctrl+o to see']))).toBe(h(idle([])))
   })
   test("a sub-agent row's live activity and its column alignment; a tool's Running… coming and going under a live activity line", () => {
     const sub = (desc: string, pad: string) => screen(['✻ Waiting for 1 background agent to finish'], ['  Opus 5.5 · 7d 72%', '  ⏵⏵ bypass permissions on', '', '  ⏺ main',
       `  ◯ general-purpose  ${desc}${pad}9m 59s · ↓ 1.2k tokens`])
     expect(h(sub('Waiting for mid-turn messages …', '  '))).toBe(h(sub('Running 3s mid-turn delivery …', ' ')))
+    // a tool's Running… coming and going is in Chiron's list (two hashes; the answer cache asks each once)
     const run = (r: boolean) => screen(['⏺ Bash(sleep 5)', ...(r ? ['  ⎿  Running…'] : ['  ⎿  (No output)']), '', '✳ Cerebrating… (5s)', '  ⎿  Tip: x'])
-    expect(h(run(true))).toBe(h(run(false)))
+    expect(h(run(true))).not.toBe(h(run(false)))
   })
   test('real changes count', () => {
     const all = [BUSY(), IDLE, IDLE_SHELL, BG_AGENTS(), MENU(5), MENU(4), INTERRUPTED, SHELL,
       screen(['⏺ Started the build in the background.', '', '✻ Brewed for 28s · done 2:29 AM · 2 shells still running'], ['  Fable 5.2 · 7d 72%', '  ⏵⏵ bypass permissions on · 2 shells']),
       screen(['⏺ Bash(ls)', '  ⎿  Running…', '', '✳ Cerebrating… (5s)']),
-      screen(['✻ Compacting conversation… (12s)'])]
+      screen(['✻ Compacting conversation… (12s)']), screen(['✻ Cerebrating… (12s)']), BG_TASKS,
+      BG_TASKS.replace('2 background tasks', '3 background tasks'),
+      screen(['✻ Worked for 17s · done 1:37 AM'], ['  Opus 5.5 · 7d 71%', '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt'])]
     expect(new Set(all.map(h)).size).toBe(all.length)
     // the same turn: a sub-agent appears under the box
     const one = BG_AGENTS(), lessAgents = one.replace(/\n {2}◯ general-purpose {2}Reading the docs[^\n]*/, '')
@@ -121,6 +145,9 @@ describe('questions file', () => {
   test('the shape Chiron writes is read; anything else is not', () => {
     const q = parseQuestions(JSON.stringify(good), '/x')!
     expect(q.model).toBe('jev-1.14.0'); expect(q.threshold).toBe(0.6); expect(q.setting).toBe('Text from a terminal.'); expect(q.sha).toHaveLength(12)
+    expect(q.menuRule).toBeNull()
+    expect(parseQuestions(JSON.stringify({ ...good, if_menu_is_not_none_with_probability_at_least: 0.6, then_state: 'waiting_for_human' }), '/x')!.menuRule)
+      .toEqual({ threshold: 0.6, state: 'waiting_for_human' })
     expect(parseQuestions('{', '/x')).toBeNull()
     expect(parseQuestions(JSON.stringify({ ...good, questions: { state: good.questions.state } }), '/x')).toBeNull()
     expect(parseQuestions(JSON.stringify({ ...good, publish_when_state_probability_at_least: 7 }), '/x')!.threshold).toBe(0.6)
@@ -146,7 +173,8 @@ describe('publish mapping (point 5)', () => {
     expect(publishView(ans('working'), st, prog('idle')).detail).toEqual({ subagents: 2, queued_joey: 0, judged_by: 'jev', judge_p: 0.9 })
     expect(publishView(ans('idle'), st, prog('busy', turn))).toMatchObject({ state: 'idle', detail: { queued_joey: 0, judged_by: 'jev' } })
     expect(publishView(ans('idle'), st, prog('busy', turn)).detail).not.toHaveProperty('tool')
-    expect(publishView(ans('idle_background_running'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { background: { agents: 2, shells: 1, monitors: 0 } } })
+    expect(publishView(ans('idle_background_running'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { background: { agents: 2, shells: 1, monitors: 0, tasks: 0 } } })
+    expect(publishView(ans('idle_background_running'), regions(BG_TASKS), prog('idle')).detail!.background).toEqual({ agents: 1, shells: 0, monitors: 0, tasks: 2 })
     expect(publishView(ans('waiting_for_human', 0.8, 'model_picker'), regions(MENU()), prog('waiting', { waitingFor: 'dialog open' }))).toMatchObject({ state: 'waiting', detail: { waitingFor: 'model_picker', judged_by: 'jev' } })
     const other = publishView(ans('waiting_for_human', 0.8, 'other'), regions(MENU()), prog('waiting'))
     expect(other.detail!.waitingFor).toBe('other'); expect(String(other.detail!.waiting_text)).toContain('Select model')
@@ -171,6 +199,19 @@ describe('exceptions an answer shows by itself (point 6)', () => {
     expect(answerExceptions(ans('idle_background_running'), none, 0.6)).toEqual(['jev_background_program_none'])
     expect(answerExceptions(ans('idle'), bg, 0.6)).toEqual(['program_background_jev_idle'])
     expect(answerExceptions(ans('not_claude'), none, 0.6)).toEqual(['state_unmapped:not_claude'])
+    expect(answerExceptions(ans('idle'), regions(BG_TASKS), 0.6)).toEqual(['program_background_jev_idle'])          // background tasks count
+  })
+  test("the menu rule (v2, Chiron 18:40Z): a menu other than none with p ≥ the file's threshold makes the state the file's then_state", () => {
+    const rule = { menuRule: { threshold: 0.6, state: 'waiting_for_human' } }
+    const d = decide(readAnswers({ state: { choice: 'starting', probabilities: { starting: 0.7 } }, menu: { choice: 'resume_picker', probabilities: { resume_picker: 0.8 } }, fits_any: { noul: 0.9 } }), rule)
+    expect(d).toMatchObject({ state: 'waiting_for_human', p: 0.8, menu: 'resume_picker', by_menu: { state: 'starting', p: 0.7 } })
+    expect(answerExceptions(d, regions(MENU()), 0.6)).toEqual(['menu_overrode_state:starting'])
+    expect(publishView(d, regions(MENU()), prog('idle'))).toMatchObject({ state: 'waiting', detail: { waitingFor: 'resume_picker', judge_p: 0.8 } })
+    const low = readAnswers({ state: { choice: 'idle', probabilities: { idle: 0.9 } }, menu: { choice: 'model_picker', probabilities: { model_picker: 0.5 } } })
+    expect(decide(low, rule).state).toBe('idle')
+    const none = readAnswers({ state: { choice: 'idle', probabilities: { idle: 0.9 } }, menu: { choice: 'none', probabilities: { none: 0.99 } } })
+    expect(decide(none, rule)).toBe(none)
+    expect(decide(readAnswers({ state: { choice: 'idle', probabilities: { idle: 0.9 } }, menu: { choice: 'login', probabilities: { login: 0.9 } } }), { menuRule: null }).state).toBe('idle')
   })
 })
 
@@ -212,7 +253,7 @@ describe('the reader', () => {
     for (let i = 0; i < 10; i++) { r.s.sample(r.pane.text, r.pane.cmd); await wait(1) }
     expect(r.calls).toHaveLength(1)
     expect(r.calls[0]!.model).toBe('jev-1.14.0')
-    expect(r.calls[0]!.state).toMatchObject({ setting: 'S', has_input_box: true, claude_process_alive: true, counted_by_program: { running_agents: 0, shells: 0, monitors: 0 } })
+    expect(r.calls[0]!.state).toMatchObject({ setting: 'S', has_input_box: true, claude_process_alive: true, counted_by_program: { running_agents: 0, shells: 0, monitors: 0, background_tasks: 0 } })
     expect(r.logs[0]).toMatchObject({ site: 'screen-status', p: 0.9, ms: 190, usage: { input_tokens: 2400 }, err: null })
     expect(r.s.view(r.program)).toMatchObject({ state: 'idle', detail: { judged_by: 'jev', judge_p: 0.9 } })
     // the spinner moving is not a change
@@ -231,10 +272,38 @@ describe('the reader', () => {
     expect(r.s.health().in_flight).toBe(true)
     r.resolve.shift()!(jevIdle()); await wait(2)
     expect(r.calls).toHaveLength(2)
-    expect(r.calls[1]!.state.counted_by_program).toEqual({ running_agents: 2, shells: 1, monitors: 0 })   // the latest screen, not the ones in between
+    expect(r.calls[1]!.state.counted_by_program).toEqual({ running_agents: 2, shells: 1, monitors: 0, background_tasks: 0 })   // the latest screen, not the ones in between
     r.resolve.shift()!(jevSays('idle_background_running')); await wait(2)
     expect(r.calls).toHaveLength(2)
     expect(r.s.view(r.program)).toMatchObject({ state: 'idle', detail: { background: { agents: 2, shells: 1, monitors: 0 }, judged_by: 'jev' } })
+  })
+  test('60 s after the last ask (refreshMs here), any change of the screen is asked again, even with the same hash; an unchanged screen is not', async () => {
+    const r = rig({ answer: () => jevSays('working'), opts: { refreshMs: 60 } })
+    r.s.active()
+    r.s.sample(BUSY('✳', '(5m 4s)'), '2.1.322'); await wait(2)
+    r.s.sample(BUSY('✶', '(5m 5s)'), '2.1.322'); await wait(2)
+    expect(r.calls).toHaveLength(1)                                               // same hash, within the minute
+    await wait(70)
+    r.s.sample(BUSY('✳', '(5m 4s)'), '2.1.322'); await wait(2)
+    expect(r.calls).toHaveLength(1)                                               // the text is the one last asked about
+    r.s.sample(BUSY('✻', '(6m 1s)'), '2.1.322'); await wait(2)
+    expect(r.calls).toHaveLength(2)
+    expect(r.s.health().refreshes).toBe(1)
+    r.s.sample(BUSY('·', '(6m 2s)'), '2.1.322'); await wait(2)
+    expect(r.calls).toHaveLength(2)                                               // the next minute has not passed
+  })
+  test("the menu rule in the reader: Jev's state says idle, its menu says a model picker with p 0.8 → waiting, the menu kind, and an exception", async () => {
+    const r = rig({ answer: () => ({ answers: { state: { choice: 'idle', probabilities: { idle: 0.9 } }, fits_any: { noul: 0.9 }, menu: { choice: 'model_picker', probabilities: { model_picker: 0.8 } } }, ms: 5 }),
+      questions: JSON.stringify({ version: 2, model: 'jev-1.14.0', setting: 'S', publish_when_state_probability_at_least: 0.6, if_menu_is_not_none_with_probability_at_least: 0.6,
+        then_state: 'waiting_for_human', questions: { state: { type: 'choice', instructions: 'x', criteria: { idle: 'b', waiting_for_human: 'w', other: 'c' } },
+          fits_any: { type: 'noul', instructions: 'y' }, menu: { type: 'choice', instructions: 'z', criteria: { none: 'n', model_picker: 'm', other: 'o' } } } }) })
+    r.s.active()
+    r.program = prog('waiting', { waitingFor: 'dialog open' })
+    r.s.sample(MENU(), '2.1.322'); await wait(20)
+    expect(r.s.view(r.program)).toMatchObject({ state: 'waiting', detail: { waitingFor: 'model_picker', judge_p: 0.8, judged_by: 'jev' } })
+    const ex = r.exceptions()
+    expect(ex.map(e => e.kinds)).toEqual([['menu_overrode_state:idle']])
+    expect(ex[0].jev).toMatchObject({ state: 'waiting_for_human', set_by_menu_rule: true, state_question: { state: 'idle', p: 0.9 } })
   })
   test('the cap per minute', async () => {
     const r = rig({ answer: () => jevIdle(), opts: { maxPerMin: 3 } })

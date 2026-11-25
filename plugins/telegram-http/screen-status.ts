@@ -9,17 +9,19 @@
 //   regions   regions(): Chiron's jev_screen.py regions(), ported line for line: the input box is between the last two horizontal rules; the last 14
 //             non-empty lines above it, the box, every line below it; no box (a menu, starting): the last 18 lines. The program reads facts
 //             (counted_by_program, found_by_program) and hands them to Jev as facts, not as questions.
-//   hash      screenHash(): what can change the answer. The input box's text, the spinner glyph, the activity line's parenthesis (elapsed time, tokens,
-//             "thinking …"), every digit in the lines kept (timers, token counters, the status line's percentages) and right-aligned notices are left
-//             out; the counts are hashed as numbers. Above the box only the lines from the last glyph line (activity / finished marker) down count:
-//             a busy turn's output scrolling above its spinner is not a new state.
+//   hash      screenHash(): only what can change the answer (Chiron's list, WO-165 19:23Z; digits masked): has_input_box; whether there is an activity
+//             line, a finished marker after it, a "Running…", an "esc to interrupt"; the four counts; the text below the input box; the last 2 lines
+//             above it; with no input box, the whole region. On top: an activity line's text is not hashed (its verb changes mid-turn, its glyph every
+//             second; "Compacting" is kept), nor a ◯ sub-agent row's activity text (its kind and the row count are), nor whitespace runs.
 //   ask       only when the hash changed (one retry after a failed call, never a repeat of an answered screen; a screen seen again within 10 min
-//             takes its earlier answer). One call in flight; a change while it flies is asked once it returns (coalesced, never queued). A timeout per
-//             call, at most maxPerMin calls a minute, a 30–60 s pause after 429 / 529, the first look at a random moment of the first 5 s after start.
+//             takes its earlier answer), and once more when 60 s have passed since the last ask and the screen's text changed at all. One call in
+//             flight; a change while it flies is asked once it returns (coalesced, never queued). A timeout per call, at most maxPerMin calls a
+//             minute, a 30–60 s pause after 429 / 529, the first look at a random moment of the first 5 s after start.
 //             Not asked when the process is gone (the pane does not run Claude Code, or statusOf says pid_gone / pid_reused). The three questions (and
 //             any others) and the publish threshold are Chiron's file, re-read when it changes:
 //             ~/Development/Joey-Crablabs-Skills/screen-status/questions.json (JEV_SCREEN_QUESTIONS overrides); unreadable: the whole thing is off.
-//   publish   state p ≥ the file's threshold (0.6): Jev's answer, mapped (publishView); else, and whenever Jev was not asked or failed: statusOf's view.
+//   publish   state p ≥ the file's threshold (0.6): Jev's answer, mapped (publishView); a menu other than none with p ≥ the file's menu threshold makes
+//             the state the file's then_state (decide()); else, and whenever Jev was not asked or failed: statusOf's view.
 //             Both carry detail.judged_by ('jev' | 'program'). Off (the JEV_SCREEN switch, no key, no questions file): statusOf's view, untouched.
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -36,7 +38,7 @@ const GLYPH = /^\s*[*·✢✳✶✻✽]\s+\S/                        // either, 
 /** Python's s[:n]: n code points */
 const cut = (s: string, n: number): string => { const a = Array.from(s); return a.length <= n ? s : a.slice(0, n).join('') }
 
-export type Counted = { running_agents: number; shells: number; monitors: number }
+export type Counted = { running_agents: number; shells: number; monitors: number; background_tasks: number }
 export type Found = { live_activity_line: string | null; finished_marker_comes_after_it: boolean; tool_running_line: boolean; esc_to_interrupt: boolean }
 export type Regions = {
   has_input_box: boolean; above_input_box?: string; input_box?: string; below_input_box?: string; screen_bottom?: string
@@ -65,6 +67,7 @@ export function regionParts(text: string): Parts {
   const src = below.join('\n') || blob
   let m = /(\d+) shells?/.exec(src); const shells = m ? parseInt(m[1]!, 10) : 0
   m = /(\d+) monitors?/.exec(src); const monitors = m ? parseInt(m[1]!, 10) : 0
+  m = /(\d+) background tasks?/.exec(src); const background_tasks = m ? parseInt(m[1]!, 10) : 0   // v3 (Chiron 19:21Z): "· 2 background tasks · ctrl+t to show tasks"
   let agents = below.filter(r => /^\s*◯\s+\S/.test(r)).length
   m = /Waiting for (\d+) background agents?/.exec(blob)
   if (m) agents = Math.max(agents, parseInt(m[1]!, 10))
@@ -76,45 +79,67 @@ export function regionParts(text: string): Parts {
     tool_running_line: above.slice(-10).some(r => r.includes('Running…')),
     esc_to_interrupt: blob.includes('esc to interrupt'),
   }
-  return { st: { ...st, counted_by_program: { running_agents: agents, shells, monitors }, found_by_program: found }, above, box, below }
+  return { st: { ...st, counted_by_program: { running_agents: agents, shells, monitors, background_tasks }, found_by_program: found }, above, box, below }
 }
 /** the state Chiron's script hands to Jev for one screen (jev_screen.py regions()) */
 export const regions = (text: string): Regions => regionParts(text).st
 
 // ------------------------------------------------------------------ the hash: what can change the answer
 const digits = (s: string): string => s.replace(/\d+(?:[.,:]\d+)*/g, '#')
-const glyphLine = (s: string): string => GLYPH.test(s) ? s.replace(/^(\s*)[*·✢✳✶✻✽]/, '$1✻').replace(/\s*\([^()]*\)?\s*$/, ' (…)') : s
-const NOTICE = /^\s{16,}\S/                                  // a right-aligned notice under the status line ("Stop hook error occurred · ctrl+o to see")
-const AGENT_ROW = /^\s*◯\s+(\S+)/                          // a running sub-agent: its live activity and timers change all the time; its kind does not
+const AGENT_ROW = /^\s*◯\s+(\S+)/                          // a running sub-agent row: its kind stays, its live activity text changes all the time
 const squash = (s: string): string => s.replace(/\s+/g, ' ').trim()     // column alignment moves when a timer gains a digit
-/** the lines the hash is taken of (exported for the tests and for looking at a hash that moves) */
+/** one hashed line: digits masked, whitespace runs collapsed; a live activity line counts only as being there (its verb changes mid-turn, its glyph
+ *  every second); a finished marker or any other glyph line with its glyph normalised */
+const hl = (l: string): string => ACT.test(l) ? (/Compacting/i.test(l) ? '<activity line: compacting>' : '<activity line>')
+  : squash(digits(GLYPH.test(l) ? l.replace(/^(\s*)[*·✢✳✶✻✽]/, '$1✻') : l))
+// right-aligned notices ("stop hook problem · ctrl+o to see") and the usage notice ("You've used 79% of your weekly limit"): not a state (measured
+// 11-25 19:27–19:31Z on a live pane: each one that came and went was a call)
+const NOTICE = /^\s{16,}\S|You've used \d+% of your/
+const parens = (l: string): number => (l.match(/\(/g)?.length ?? 0) - (l.match(/\)/g)?.length ?? 0)
+/** lines as the hash reads them: notices left out; an activity line and the line(s) its parenthesis wraps onto ("… (running Stop hooks… 2/5 · 1m 27s ·"
+ *  / "↓ 2.7k tokens)") are one line, and the wrap point moves as the timer grows */
+function hashRows(rows: string[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < rows.length; i++) {
+    const l = rows[i]!
+    if (NOTICE.test(l)) continue
+    if (ACT.test(l)) for (let d = parens(l), k = 0; d > 0 && k < 2 && i + 1 < rows.length; k++) d += parens(rows[++i]!)
+    out.push(hl(l))
+  }
+  return out
+}
+/** the lines the hash is taken of: Chiron's list (WO-165 19:23Z, "only what can change the answer"; digits masked): has_input_box; whether there is
+ *  an activity line, a finished marker after it, a "Running…", an "esc to interrupt"; the four counts; below_input_box in full; the last 2 lines above
+ *  the input box; with no input box, screen_bottom in full. Masks on top, for the same purpose: a live activity line's text (and its wrapped tail), a
+ *  ◯ sub-agent row's activity text (its kind stays; how many rows there are is a count), notices and whitespace runs are not part of it (exported
+ *  for the tests) */
 export function hashLines(p: Parts): string[] {
-  const f = p.st.found_by_program
-  // a tool's "Running…" coming and going in a turn whose activity line is live is the turn's output, not a new state (sandwich-master: 6 a minute)
-  const live = !!f.live_activity_line && !f.finished_marker_comes_after_it
-  const out: string[] = [p.st.has_input_box ? 'box' : 'nobox', JSON.stringify(p.st.counted_by_program),
-    JSON.stringify([!!f.live_activity_line, f.finished_marker_comes_after_it, live ? null : f.tool_running_line, f.esc_to_interrupt])]
+  const f = p.st.found_by_program, c = p.st.counted_by_program
+  const out: string[] = [p.st.has_input_box ? 'box' : 'nobox',
+    JSON.stringify([!!f.live_activity_line, f.finished_marker_comes_after_it, f.tool_running_line, f.esc_to_interrupt]),
+    JSON.stringify([c.running_agents, c.shells, c.monitors, c.background_tasks])]
   if (p.st.has_input_box) {
-    let i = -1
-    for (let k = p.above.length - 1; k >= 0; k--) if (GLYPH.test(p.above[k]!)) { i = k; break }
-    for (const l of i >= 0 ? p.above.slice(i) : p.above) out.push(squash(digits(glyphLine(l))))
-    out.push('—box—')                                         // the box's text (typing, a suggestion) says nothing about the state
-    for (const l of p.below) {
-      if (NOTICE.test(l)) continue
-      const a = AGENT_ROW.exec(l)
-      out.push(a ? `◯ ${a[1]}` : squash(digits(l)))
-    }
-  } else for (const l of p.above) out.push(squash(digits(glyphLine(l))))
+    out.push(...hashRows(p.above).slice(-2))
+    out.push('—below—')
+    for (const l of p.below) { if (NOTICE.test(l)) continue; const a = AGENT_ROW.exec(l); out.push(a ? `◯ ${a[1]}` : hl(l)) }
+  } else out.push(...hashRows(p.above))
   return out
 }
 export function screenHash(p: Parts): string {
   return createHash('sha1').update(hashLines(p).join('\n')).digest('hex').slice(0, 16)
 }
+/** the screen's text as it is (only for "has anything changed since the last ask": the 60 s re-ask) */
+export function rawHash(p: Parts): string {
+  const st = p.st
+  return createHash('sha1').update(JSON.stringify([st.above_input_box, st.input_box, st.below_input_box, st.screen_bottom])).digest('hex').slice(0, 16)
+}
 
 // ------------------------------------------------------------------ Chiron's questions file
 export const QUESTIONS_PATH_DEFAULT = (home: string): string => join(home, 'Development', 'Joey-Crablabs-Skills', 'screen-status', 'questions.json')
 export type Questions = { questions: Record<string, any>; setting: string | null; model: string | null; threshold: number; version: unknown; sha: string
-  path: string }
+  path: string
+  /** v2 (Chiron 18:40Z): `menu` not none with at least this probability → the state is `state` whatever the state question said (both from the file) */
+  menuRule: { threshold: number; state: string } | null }
 /** the file as Chiron writes it (version, model, setting, publish_when_state_probability_at_least, questions.state / fits_any / menu); null when it
  *  is not that shape: the whole thing does not run */
 export function parseQuestions(text: string, path: string): Questions | null {
@@ -125,12 +150,16 @@ export function parseQuestions(text: string, path: string): Questions | null {
   if (!q || typeof q !== 'object' || q.state?.type !== 'choice' || !crit(q.state) || q.menu?.type !== 'choice' || !crit(q.menu) || q.fits_any?.type !== 'noul') return null
   const thr = Number(j.publish_when_state_probability_at_least)
   return { questions: q, setting: typeof j.setting === 'string' && j.setting.trim() ? j.setting : null, model: typeof j.model === 'string' && j.model.trim() ? j.model.trim() : null,
-    threshold: Number.isFinite(thr) && thr > 0 && thr <= 1 ? thr : 0.6, version: j.version ?? null, sha: createHash('sha256').update(text).digest('hex').slice(0, 12), path }
+    threshold: Number.isFinite(thr) && thr > 0 && thr <= 1 ? thr : 0.6, version: j.version ?? null, sha: createHash('sha256').update(text).digest('hex').slice(0, 12), path,
+    menuRule: (() => { const t = Number(j.if_menu_is_not_none_with_probability_at_least)
+      return Number.isFinite(t) && t > 0 && t <= 1 && typeof j.then_state === 'string' && j.then_state ? { threshold: t, state: j.then_state } : null })() }
 }
 
 // ------------------------------------------------------------------ Jev's answer → the published view
 export type JevRead = { state: string | null; p: number; conf: number | null; probs: Record<string, number> | null; fits_any: number | null
-  menu: string | null; menu_p: number | null; menu_probs: Record<string, number> | null }
+  menu: string | null; menu_p: number | null; menu_probs: Record<string, number> | null
+  /** decide(): the menu rule set the state; the state question's own answer and probability */
+  by_menu?: { state: string | null; p: number } }
 const num = (x: unknown): number | null => typeof x === 'number' && Number.isFinite(x) ? x : null
 export function readAnswers(a: Record<string, any>): JevRead {
   const s = a?.state ?? {}, m = a?.menu ?? {}
@@ -139,6 +168,13 @@ export function readAnswers(a: Record<string, any>): JevRead {
   const state = typeof s.choice === 'string' ? s.choice : null, menu = typeof m.choice === 'string' ? m.choice : null
   return { state, p: num(probs?.[state ?? '']) ?? 0, conf: num(s.confidence), probs, fits_any: num(a?.fits_any?.noul),
     menu, menu_p: menu ? num(mprobs?.[menu]) : null, menu_probs: mprobs }
+}
+/** the state that counts: the state question's answer, or, when the file's menu rule applies (a menu other than none with p ≥ its threshold), the
+ *  rule's state with the menu's probability (by_menu keeps what the state question said) */
+export function decide(j: JevRead, q: Pick<Questions, 'menuRule'>): JevRead {
+  const r = q.menuRule
+  if (!r || !j.menu || j.menu === 'none' || j.menu_p == null || j.menu_p < r.threshold || j.state === r.state) return j
+  return { ...j, state: r.state, p: j.menu_p, by_menu: { state: j.state, p: j.p } }
 }
 /** the state options this program maps (point 5 of Chiron's 18:26Z comment); any other choice (not_claude, other, an option Chiron adds) is not
  *  published: statusOf's view is, and the screen is an exception */
@@ -163,7 +199,7 @@ export function publishView(j: JevRead, st: Regions, prog: StatusView): StatusVi
   switch (j.state) {
     case 'working': return v('busy', { ...turn, subagents: c.running_agents, ...base })
     case 'idle': return v('idle', { ...base })
-    case 'idle_background_running': return v('idle', { background: { agents: c.running_agents, shells: c.shells, monitors: c.monitors }, ...base })
+    case 'idle_background_running': return v('idle', { background: { agents: c.running_agents, shells: c.shells, monitors: c.monitors, tasks: c.background_tasks }, ...base })
     case 'waiting_for_human': {
       const menu = j.menu ?? 'other'
       const text = st.has_input_box ? st.above_input_box ?? '' : st.screen_bottom ?? ''
@@ -179,12 +215,13 @@ export function publishView(j: JevRead, st: Regions, prog: StatusView): StatusVi
 /** the exceptions an answer shows by itself (the comparison with statusOf is made settleMs later, once the screen held) */
 export function answerExceptions(j: JevRead, st: Regions, threshold: number): string[] {
   const k: string[] = []
-  if (j.state === 'other') k.push('state_other')
+  if (j.state === 'other' || j.by_menu?.state === 'other') k.push('state_other')
   if (j.menu === 'other') k.push('menu_other')
   if (j.state && !MAPPED.has(j.state) && j.state !== 'other') k.push(`state_unmapped:${j.state}`)
   if (j.p < threshold) k.push('state_p_low')
   if (j.fits_any == null || j.fits_any < 0.5) k.push('fits_any_low')
-  const c = st.counted_by_program, bg = c.running_agents + c.shells + c.monitors
+  if (j.by_menu && j.by_menu.p >= threshold) k.push(`menu_overrode_state:${j.by_menu.state}`)
+  const c = st.counted_by_program, bg = c.running_agents + c.shells + c.monitors + c.background_tasks
   if (j.state === 'idle_background_running' && bg === 0) k.push('jev_background_program_none')
   if (j.state === 'idle' && bg > 0) k.push('program_background_jev_idle')
   if (j.state === 'waiting_for_human' && (j.menu === 'none' || j.menu == null)) k.push('waiting_menu_none')
@@ -243,12 +280,15 @@ export interface ScreenOpts {
   firstJitterMs: number
   /** a screen seen again within this (a notice that comes and goes, a flicker between two screens) takes its earlier answer: not asked again */
   cacheMs: number
+  /** Chiron 19:23Z: this long after the last ask, any change of the screen's text (not only of its hash) is asked again, cache or not (a change the
+   *  hash does not see is caught within a minute) */
+  refreshMs: number
 }
 export const SCREEN_DEFAULTS: ScreenOpts = { pollMs: 1000, timeoutMs: 3000, maxPerMin: 20, settleMs: 1500, pokeMs: [40, 450], retryMs: 10_000,
-  backoffMs: 30_000, activeCheckMs: 10_000, exceptionsPerHour: 120, firstJitterMs: 5000, cacheMs: 10 * 60_000 }
+  backoffMs: 30_000, activeCheckMs: 10_000, exceptionsPerHour: 120, firstJitterMs: 5000, cacheMs: 10 * 60_000, refreshMs: 60_000 }
 const CACHE_MAX = 16
 export const SITE = 'screen-status'
-type Cur = { hash: string; parts: Parts; cmd: string; alive: boolean; at: number }
+type Cur = { hash: string; raw: string; parts: Parts; cmd: string; alive: boolean; at: number }
 type Ans = { hash: string; at: number; jev: JevRead; usable: boolean; parts: Parts; ms: number; model: string | null; seq: number }
 
 export class ScreenStatus {
@@ -257,6 +297,8 @@ export class ScreenStatus {
   private answer: Ans | null = null
   private cache = new Map<string, Ans>()
   private inflight: { hash: string; at: number } | null = null
+  /** the last call: when, and the screen's text then (the 60 s re-ask) */
+  private lastAsk: { at: number; raw: string } | null = null
   private failed: { hash: string; tries: number; at: number } | null = null
   private calls: number[] = []
   private backoffUntil = 0
@@ -272,7 +314,7 @@ export class ScreenStatus {
   private qWritten = new Set<string>()
   private excAt: number[] = []
   private seq = 0
-  readonly stats = { looks: 0, changes: 0, calls: 0, cache_hits: 0, failed: 0, capped: 0, exceptions: 0, judged_jev: 0, judged_program: 0 }
+  readonly stats = { looks: 0, changes: 0, calls: 0, refreshes: 0, cache_hits: 0, failed: 0, capped: 0, exceptions: 0, judged_jev: 0, judged_program: 0 }
   constructor(readonly d: ScreenDeps, o: Partial<ScreenOpts> = {}) { this.o = { ...SCREEN_DEFAULTS, ...o } }
   private now(): number { return (this.d.now ?? Date.now)() }
 
@@ -354,7 +396,7 @@ export class ScreenStatus {
     const hash = screenHash(parts)
     const alive = this.d.isClaude(cmd)
     const prev = this.cur
-    this.cur = { hash, parts, cmd, alive, at: now }
+    this.cur = { hash, raw: rawHash(parts), parts, cmd, alive, at: now }
     if (!prev || prev.hash !== hash || prev.alive !== alive) {
       this.stats.changes++
       this.maybeAsk()
@@ -365,13 +407,17 @@ export class ScreenStatus {
   // ---- asking
   private maybeAsk(): void {
     const c = this.cur
-    if (!c || this.inflight || this.answer?.hash === c.hash) return
-    if (!c.alive) return                                      // Claude Code is not the pane's program: not asked
+    if (!c || this.inflight) return
     const now = this.now()
-    const hit = this.cache.get(c.hash)
-    if (hit && now - hit.at < this.o.cacheMs) { this.stats.cache_hits++; this.answer = hit; this.d.publish(); return }
+    const refresh = !!this.lastAsk && now - this.lastAsk.at >= this.o.refreshMs && this.lastAsk.raw !== c.raw
+    if (!refresh && this.answer?.hash === c.hash) return
+    if (!c.alive) return                                      // Claude Code is not the pane's program: not asked
+    if (!refresh) {
+      const hit = this.cache.get(c.hash)
+      if (hit && now - hit.at < this.o.cacheMs) { this.stats.cache_hits++; this.answer = hit; this.d.publish(); return }
+    }
     if (now < this.backoffUntil) return
-    if (this.failed?.hash === c.hash && (this.failed.tries >= 2 || now - this.failed.at < this.o.retryMs)) return
+    if (!refresh && this.failed?.hash === c.hash && (this.failed.tries >= 2 || now - this.failed.at < this.o.retryMs)) return
     const prog = this.d.program()
     if (gone(prog)) return                                    // the process is gone (the OS says so): offline, not asked
     this.calls = this.calls.filter(t => now - t < 60_000)
@@ -383,6 +429,8 @@ export class ScreenStatus {
     const q = this.questions()
     if (!q) return
     this.calls.push(now)
+    if (refresh) this.stats.refreshes++
+    this.lastAsk = { at: now, raw: c.raw }
     this.inflight = { hash: c.hash, at: now }
     void this.ask(c, q)
   }
@@ -394,7 +442,7 @@ export class ScreenStatus {
     this.inflight = null
     this.stats.calls++
     this.writeQuestions(q)
-    const jev = r.answers ? readAnswers(r.answers) : null
+    const jev = r.answers ? decide(readAnswers(r.answers), q) : null
     try {
       this.d.logCall({ site: SITE, question: { file: q.path, version: q.version, sha: q.sha, copy: `run/screen-questions-${q.sha}.json` },
         inputs: { agent: this.d.agent, hash: c.hash, has_input_box: c.parts.st.has_input_box, counted_by_program: c.parts.st.counted_by_program,
@@ -470,7 +518,7 @@ export class ScreenStatus {
     const rec = { ts: new Date(now).toISOString(), agent: this.d.agent, kinds, has_input_box: st.has_input_box, screen, counted_by_program: st.counted_by_program,
       found_by_program: st.found_by_program,
       jev: jev ? { state: jev.state, state_p: r2(jev.p), state_confidence: jev.conf, state_probabilities: jev.probs, fits_any: jev.fits_any, menu: jev.menu,
-        menu_p: jev.menu_p, menu_probabilities: jev.menu_probs, ...call } : { ...call },
+        menu_p: jev.menu_p, menu_probabilities: jev.menu_probs, ...(jev.by_menu ? { set_by_menu_rule: true, state_question: jev.by_menu } : {}), ...call } : { ...call },
       program: { state: program.state, detail: program.detail ?? null }, published: (() => { const v = this.view(program); return { state: v.state, judged_by: v.detail?.judged_by ?? null } })(),
       hash: screenHash(parts), questions: { version: q.version, sha: q.sha } }
     const f = join(this.d.lanesDir, 'run', 'screen-exceptions.jsonl')
