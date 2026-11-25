@@ -292,6 +292,7 @@ describe('the registry: which session is the main, offline and why, files vs the
     expect(R.files().bad).toEqual([])
     expect(logs.some(l => /not in the known shape/.test(l))).toBe(false)
     writeFileSync(join(R.o.dir, '43.json'), JSON.stringify({ pid: 43, sessionId: 's43', cwd: WS, kind: 'interactive', status: 'idle' }))   // no procStart
+    const o43 = (Date.now() - 10_000) / 1000; utimesSync(join(R.o.dir, '43.json'), o43, o43)              // 1.48.1: past the young-file grace
     expect(R.files().bad).toEqual(['43.json'])
   })
 
@@ -303,6 +304,16 @@ describe('the registry: which session is the main, offline and why, files vs the
     expect(R.main()?.pid).toBe(51)
     writeFileSync(join(R.o.dir, '53.json'), JSON.stringify({ pid: 53, sessionId: 's53', cwd: WS, kind: 'interactive', entrypoint: 'sdk-cli', status: 'starting' }))
     expect(R.files().bad).toEqual([])
+  })
+
+  test('1.48.1: a registry file that was just written is not judged by its shape yet', () => {
+    const { R } = setup()
+    const f = join(R.o.dir, '61.json')
+    writeFileSync(f, JSON.stringify({ pid: 61, sessionId: 's61', cwd: WS, kind: 'interactive', entrypoint: 'cli', status: 'idle' }))   // no procStart yet
+    expect(R.files().bad).toEqual([])
+    const old = (Date.now() - 10_000) / 1000
+    utimesSync(f, old, old)
+    expect(R.files().bad).toEqual(['61.json'])
   })
 
   test('pid_reused: the OS start time is read at most every 30 s; the same second in another wording is the same start', () => {
@@ -389,6 +400,7 @@ describe('the registry: which session is the main, offline and why, files vs the
     up.add(81)
     const { status: _s, ...noStatus } = e
     put({ ...noStatus, state: 'working' })
+    const o81 = (Date.now() - 10_000) / 1000; utimesSync(join(R.o.dir, '81.json'), o81, o81)              // 1.48.1: past the young-file grace
     st()
     await sleep(20)
     expect(R.mode()).toMatchObject({ via: 'cli', why: expect.stringContaining('shape') })

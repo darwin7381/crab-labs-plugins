@@ -1,3 +1,9 @@
+## 1.48.1 — 2026-11-25
+
+- **Onsen status (WO-143/145): a registry file younger than 5 s is not judged by its shape** (`REG_YOUNG_MS`). A session that just started writes its file before every field is filled (lab 05:46Z: the main's own 63377.json sent the daemon to the CLI for 10 min).
+- **Pinned status (WO-145): an MCP tool shows its own name** (`mcp__plugin_telegram-http_telegram-http__reply` → `reply`); **the stuck line's 「HH:MM 起」 is the busy turn's start**.
+- agent-inbox 1.18.1 carries the same code.
+
 ## 1.48.0 — 2026-11-25
 
 - **Onsen step 3, the half Joey sees (board WO-145; Chiron's ticket; Joey TG chiron:2275 「趕快繼續啊」; agent-inbox 1.18.0 carries the same code, where none of it runs).** Three features, each behind its own switch; `onsen-visible.ts`, wired in `server.ts`.

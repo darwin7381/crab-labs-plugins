@@ -126,7 +126,9 @@ export function statusLine(v: StatusView, sinceMs: number, now = Date.now()): st
     return n != null ? `🟡 處理中${s2}：已經 ${n} 分鐘沒動靜` : `🟡 處理中${s2}：很久沒動靜`
   }
   const subs = Number(d.subagents ?? 0)
-  const doing = subs > 0 ? `等 ${subs} 隻子 agent` : d.tool?.name ? String(d.tool.name) : ''
+  // an MCP tool shows its own name, not the server's prefix: mcp__plugin_telegram-http_telegram-http__reply → reply
+  const tool = d.tool?.name ? String(d.tool.name).replace(/^mcp__.*__/, '') : ''
+  const doing = subs > 0 ? `等 ${subs} 隻子 agent` : tool
   return doing ? `🟡 處理中${since}：${doing}` : `🟡 處理中${since}`
 }
 /** line 2 ('' = no line): Joey's messages delivered and not yet seen, seen with nothing sent after (a part that is 0 is left out) */

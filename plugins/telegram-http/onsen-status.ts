@@ -418,6 +418,8 @@ export function newestJsonl(dir: string): string | null {
 export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number; entrypoint?: string }
 /** the registry statuses statusOf knows */
 export const REG_STATUSES = new Set(['idle', 'busy', 'waiting', 'shell'])
+/** a registry file younger than this is not judged by its shape (a starting session fills it in a moment later) */
+export const REG_YOUNG_MS = 5_000
 /** one registry record (a file, or an item of the CLI's array) in the shape 2.1.322 writes; null = not that shape */
 export function regEntry(j: any): RegEntry | null {
   if (!j || typeof j !== 'object' || !Number.isInteger(j.pid) || j.pid <= 0) return null
@@ -559,6 +561,9 @@ export class Registry implements StatusSource {
         c = { m: st.mtimeMs, size: st.size, e, bad: mine && mainCandidate(j ?? {}) && (!e || !REG_STATUSES.has(e.status) || typeof j.procStart !== 'string') }
         this.cache.set(f, c)
       }
+      // a session that just started writes its file before every field is filled (seen 11-25 05:46Z: the lab main's 63377.json): a file younger than
+      // REG_YOUNG_MS is not judged yet, it is read again on the next pass
+      if (c.bad && Date.now() - st.mtimeMs < REG_YOUNG_MS) { this.cache.delete(f); continue }
       if (c.e) entries.push(c.e)
       if (c.bad) bad.push(n)
     }
