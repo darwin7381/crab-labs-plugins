@@ -237,12 +237,12 @@ describe('the registry: which session is the main, offline and why, files vs the
   const START = 'Tue Nov 24 18:16:31 2026'
   const reg = (pid: number, o: Record<string, unknown> = {}) => ({ pid, sessionId: randomUUID(), cwd: WS, startedAt: 1_795_544_217_000, procStart: START, version: '2.1.322',
     kind: 'interactive', entrypoint: 'cli', tmux: 'claude-x:@1.%1', name: 'x', status: 'idle', updatedAt: 1, statusUpdatedAt: 1, ...o })
-  function setup(o: { tmux?: string; sessionId?: () => string | null; cli?: () => Promise<string | null>; alive?: (p: number) => boolean; start?: (p: number) => string | null } = {}) {
+  function setup(o: { tmux?: string; sessionId?: () => string | null; cli?: () => Promise<string | null>; alive?: (p: number) => boolean; start?: (p: number) => string | null; now?: () => number } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'onsen-reg-')), tx = mkdtempSync(join(tmpdir(), 'onsen-tx-'))
     const up = new Set<number>(), logs: string[] = []
     let changed = 0
     const R = new Registry({ dir, workspace: WS, transcripts: () => tx, connected: p => up.has(p), tmux: o.tmux, sessionId: o.sessionId, cli: o.cli, log: m => logs.push(m),
-      changed: () => { changed++ }, alive: o.alive ?? (() => true), procStart: o.start ?? (() => START), retryMs: 20 })
+      changed: () => { changed++ }, alive: o.alive ?? (() => true), procStart: o.start ?? (() => START), retryMs: 20, ...(o.now ? { now: o.now } : {}) })
     const put = (e: Record<string, unknown>) => writeFileSync(join(dir, `${e.pid}.json`), JSON.stringify(e))
     const st = (sh: any = { queuedJoey: 0, wall: null }) => statusOf(R.inputs(sh))
     return { R, dir, tx, up, logs, put, st, changes: () => changed }
@@ -261,19 +261,27 @@ describe('the registry: which session is the main, offline and why, files vs the
   })
 
   test('offline: no_registration, not_connected, pid_gone; then the registry\'s own status (pid_reused: the next test)', () => {
-    let alive = true
-    const { put, up, st } = setup({ alive: () => alive })
+    let alive = true, t = 1_000_000
+    const { put, up, st, dir } = setup({ alive: () => alive, now: () => t })
     expect(st()).toMatchObject({ state: 'offline', detail: { reason: 'no_registration' } })
     put(reg(21, { status: 'busy' }))
     expect(st().detail).toMatchObject({ reason: 'not_connected' })
     up.add(21)
     expect(st().state).toBe('busy')
     alive = false
-    expect(st().detail).toMatchObject({ reason: 'pid_gone' })
+    expect(st().state).toBe('busy')                                        // dead, file still there: a normal close may delete it within DEAD_GRACE_MS
+    t += 3_001
+    expect(st().detail).toMatchObject({ reason: 'pid_gone' })              // the file stayed: killed / crashed
     alive = true
     expect(st().state).toBe('busy')
     up.delete(21)
     expect(st().detail).toMatchObject({ reason: 'not_connected' })
+    // 1.47.0: a normal close: the process ends, then Claude Code deletes its file within the grace → no_registration, not pid_gone
+    up.add(21); expect(st().state).toBe('busy')
+    alive = false; t += 500
+    expect(st().state).toBe('busy')
+    rmSync(join(dir, '21.json')); t += 500
+    expect(st()).toMatchObject({ state: 'offline', detail: { reason: 'no_registration' } })
   })
 
   test('pid_reused: the OS start time is read at most every 30 s; the same second in another wording is the same start', () => {
@@ -607,3 +615,4 @@ test('1.47.0: an open tool that declared a long timeout raises the stuck thresho
   const s = statusOf({ ...base, turn: turn(600) }, { now, stuckS: 600 })                           // 750 s < 900 s silent
   expect(s.state).toBe('stuck'); expect(s.detail?.threshold_s).toBe(750)
 })
+

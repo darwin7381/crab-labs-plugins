@@ -449,6 +449,8 @@ export function compareRegistry(files: RegEntry[], cli: RegEntry[], workspace: s
   }
   return null
 }
+/** how long a dead pid's registry file may linger before the reason is pid_gone rather than a normal close (no_registration) */
+export const DEAD_GRACE_MS = 3_000
 export function pidAlive(pid: number): boolean { try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' } }
 /** the process's start time as `ps` gives it in UTC (the registry's procStart is written the same way), or null */
 export function osProcStart(pid: number): string | null {
@@ -495,6 +497,8 @@ export class Registry implements StatusSource {
   private watcher: FSWatcher | null = null
   private timers: Array<ReturnType<typeof setInterval>> = []
   private starts = new Map<number, { at: number; v: string | null }>()
+  /** pid → when it was first seen dead while its registry file was still there (DEAD_GRACE_MS) */
+  private deadSince = new Map<number, number>()
   private shapeTold = ''
   private started = false
   /** dir: the registry (~/.claude/sessions); workspace: AGENT_WORKSPACE_DIR; transcripts: the workspace's project dir (~/.claude/projects/<escaped>);
@@ -627,7 +631,15 @@ export class Registry implements StatusSource {
     const e = this.main()
     const off = (why: OfflineReason): StatusInputs => ({ main: null, offline: why, last_activity_at: this.lastActivity(e?.sessionId ?? this.o.sessionId?.() ?? null), ...base })
     if (!e) return off('no_registration')
-    if (!this.alive(e.pid)) return off('pid_gone')
+    if (!this.alive(e.pid)) {
+      // a normal close (/exit) ends the process a moment before Claude Code deletes its registry file: wait DEAD_GRACE_MS for the file to go, so a
+      // closed session is offline `no_registration` and only a process that died with its file left behind (kill -9, a crash) is `pid_gone` (WO-143)
+      const since = this.deadSince.get(e.pid) ?? this.now()
+      this.deadSince.set(e.pid, since)
+      if (this.now() - since < DEAD_GRACE_MS) return { main: { status: e.status, waiting_for: e.waitingFor ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
+      return off('pid_gone')
+    }
+    this.deadSince.delete(e.pid)
     if (e.procStart) { const os = this.startOf(e.pid); if (os && !sameStart(os, e.procStart)) return off('pid_reused') }
     if (!this.o.connected(e.pid)) return off('not_connected')
     return { main: { status: e.status, waiting_for: e.waitingFor ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
