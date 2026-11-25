@@ -364,7 +364,7 @@ bot.api.config.use((prev, method, payload, signal) =>
 // The credential is the agent's mesh credential, kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential); never logged.
 const ONSEN_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
 const ONSEN_CRED_FILE = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim() || join(process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR), '.agent-inbox-state', 'mesh-credential')
-const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({
+const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({ fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
   dir: join(STATE_DIR, 'onsen'), base: Onsen.onsenBase(process.env), agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
   credential: () => readCredentialFile(ONSEN_CRED_FILE), credentialWhere: ONSEN_CRED_FILE, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },

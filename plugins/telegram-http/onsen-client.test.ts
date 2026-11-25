@@ -365,3 +365,44 @@ describe('chat_history', () => {
     expect(lanes).toContain('...(lane ? { laneId: lane.id } : {}) })')
   })
 })
+
+describe('WO-162: the newest status does not wait behind a pass', () => {
+  test('a status recorded while a slow /messages/batch is in flight reaches Onsen at once; the spool still sends it in order (a duplicate)', async () => {
+    const dir = tmp(), posts: Array<{ path: string; at: number; ids: string[] }> = []
+    let release: () => void = () => {}
+    const gate = new Promise<void>(r => { release = r })
+    const f = (async (url: any, init: any) => {
+      const path = String(url).replace('https://onsen.test/api/onsen', '')
+      const body = JSON.parse(init?.body ?? '{}')
+      const items = Array.isArray(body.items) ? body.items : []
+      posts.push({ path, at: Date.now(), ids: items.map((x: any) => x.idem_key) })
+      if (path === '/messages/batch') await gate                                   // the slow round trip that held the busy rows
+      return new Response(JSON.stringify({ results: items.map((_: any, n: number) => ({ id: n + 1, ...(path === '/status/batch' && posts.filter(p => p.path === path).length > 1 ? { duplicate: true } : {}) })) }), { status: 200 })
+    }) as unknown as typeof fetch
+    const c = new OnsenClient({ dir, base: 'https://onsen.test/api/onsen', agent: AGENT, record: true, credential: () => CRED, log: () => {}, fetch: f, intervalMs: 3_600_000 })
+    c.start()
+    c.recordMessage(inboundItem(AGENT, tgMsg(1, '一則'), '一則'))
+    await new Promise(r => setTimeout(r, 120))                                     // the pass is now waiting on /messages/batch
+    const t0 = Date.now()
+    c.recordStatus({ idem_key: 'st-busy-1', agent: AGENT, state: 'busy', at: new Date().toISOString(), detail: { tool: { name: 'Bash' } } } as any)
+    await new Promise(r => setTimeout(r, 30))
+    const fast = posts.find(p => p.path === '/status/batch')
+    expect(fast && fast.ids).toEqual(['st-busy-1'])
+    expect(fast!.at - t0).toBeLessThan(30)                                          // not behind the pass
+    release()
+    await new Promise(r => setTimeout(r, 150))
+    expect(posts.filter(p => p.path === '/status/batch').length).toBe(2)           // the spool sent it too, in its place
+    expect(c.fastStats).toEqual({ sent: 1, failed: 0 })
+    c.stop()
+  })
+
+  test('fastStatus false: only the spool', async () => {
+    const dir = tmp(), on = fakeOnsen()
+    const c = new OnsenClient({ dir, base: 'https://onsen.test/api/onsen', agent: AGENT, record: true, credential: () => CRED, log: () => {}, fetch: on.f, intervalMs: 3_600_000, fastStatus: false })
+    c.start()
+    c.recordStatus({ idem_key: 'st-2', agent: AGENT, state: 'idle', at: new Date().toISOString(), detail: {} } as any)
+    await new Promise(r => setTimeout(r, 120))
+    expect(c.fastStats.sent).toBe(0)
+    c.stop()
+  })
+})

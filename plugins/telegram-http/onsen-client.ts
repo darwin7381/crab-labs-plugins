@@ -258,6 +258,8 @@ export type OnsenConfig = {
   rotateBytes?: number
   queryTimeoutMs?: number
   postTimeoutMs?: number
+  /** WO-162: the newest status also goes out at once on its own (default true; false: only through the spool, in order) */
+  fastStatus?: boolean
   /** the Telegram id of Joey's DM chat (chat_history's default chat; `tg:<it>` reads as Joey), or '' */
   joeyChat?: () => string
 }
@@ -290,6 +292,13 @@ export class OnsenClient {
   private running = false
   private again = false
   private kickTimer: ReturnType<typeof setTimeout> | null = null
+  // WO-162 (Chiron 16:10Z: a busy row took 0.9–2.0 s to show, an idle row 0.3–0.5 s): a pass sends the spool in order, one POST per run of one
+  // kind, and in a turn the kinds interleave (messages, facts, wake decisions, status), so a status line waited behind several round trips. The
+  // status is latest-wins on the server (an older report is ignored, the same idem_key is a duplicate), so the newest one also goes out on its
+  // own at once, never behind a pass; the spool still carries every line in order (the history). ONSEN_STATUS_FAST=0 turns the fast path off.
+  private fastPending: StatusFact | null = null
+  private fastRunning = false
+  readonly fastStats = { sent: 0, failed: 0 }
   private interval: ReturnType<typeof setInterval> | null = null
   private backoffMs = 0
   private nextTryAt = 0
@@ -315,7 +324,7 @@ export class OnsenClient {
   recordLine(line: SpoolLine | null): void { if (line) this.append(line) }
   /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
   recordDelivery(f: DeliveryFact): void { if (this.append({ k: 'd', r: f })) this.stats.deliveries_recorded++ }
-  recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) this.stats.status_recorded++ }
+  recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) { this.stats.status_recorded++; this.fastStatus(f) } }
   /** WO-147: one wake decision (onsen-wake.ts wakeItem), through the same spool; false = not spooled (recording off, or the append failed) */
   recordWake(w: WakeItem): boolean { const ok = this.append({ k: 'w', r: w }); if (ok) this.stats.wake_recorded++; return ok }
   /** WO-145: form answers queued for the main whose ack Onsen did not take directly: POST /forms/ack when the spool reaches it. false = not spooled */
@@ -352,6 +361,26 @@ export class OnsenClient {
     if (this.interval) clearInterval(this.interval)
     if (this.kickTimer) clearTimeout(this.kickTimer)
     this.interval = null; this.kickTimer = null
+  }
+  private fastStatus(f: StatusFact): void {
+    if (!this.interval || this.cfg.fastStatus === false) return
+    this.fastPending = f
+    if (!this.fastRunning) void this.fastFlush()
+  }
+  /** the newest status now (one in flight; a newer one replaces what waits); a failure is left to the spool, which retries */
+  private async fastFlush(): Promise<void> {
+    const cred = this.cfg.credential()
+    if (!cred) { this.fastPending = null; return }
+    this.fastRunning = true
+    try {
+      while (this.fastPending) {
+        const f = this.fastPending
+        this.fastPending = null
+        const r = await this.post(BATCH_PATH.s!, { items: [f] }, cred, 5_000).catch(() => null)
+        if (r && r.status >= 200 && r.status < 300) this.fastStats.sent++
+        else { this.fastStats.failed++; break }
+      }
+    } finally { this.fastRunning = false }
   }
   /** right after an append: one pass soon (coalesced; never during a backoff) */
   private kick(): void {
