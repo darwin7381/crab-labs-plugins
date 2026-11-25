@@ -261,6 +261,7 @@ export function lanesInit(deps: LanesDeps): void {
     loadState()
     journal = new Journal(join(deps.stateDir ?? LANES_DIR, 'lanes', 'state.jsonl'))
     journal.load()
+    if (onsenTap?.journal) journal.observe(onsenTap.journal)          // Onsen step 3 (WO-143): read-only
     main = createMain(mainEnv())
     main.initMain()
     events = createEvents(journal, writeOpenHandoffs)
@@ -767,7 +768,27 @@ export const __lanesState = (): State => S
 /** tests only: an MCP session owned by claude pid `pid` opened its stream (what noteMcpSocket learns from the socket) */
 export const __noteMcpPid = (sid: string, pid: number): void => { mcpSessionPid.set(sid, pid); main?.streamOpened(pid); if (sessionNotMain(sid)) { try { D.toolsChanged?.(sid) } catch {} } }
 /** tests only: one event of the main's hook, as /lanes/main-event receives it */
-export const __mainEvent = (b: any) => main.mainEvent(b)
+export const __mainEvent = (b: any) => mainEventIn(b)
+// Onsen step 3 (WO-143): read-only taps for the Telegram daemon's delivery facts and the main's status (server.ts, onsen-status.ts). They observe; they
+// change nothing in M1, M2 or the runs. `journal`: every journal write (the folded row and the line); `mainEvent`: every hook event of /lanes/main-event,
+// before M2 handles it.
+type OnsenTap = { journal?: (row: Row, line: Record<string, unknown>) => void; mainEvent?: (b: any) => void }
+let onsenTap: OnsenTap | null = null
+export function observeLanes(t: OnsenTap): void {
+  onsenTap = t
+  if (journal && t.journal) journal.observe(t.journal)
+}
+/** /lanes/main-event (and the tests' __mainEvent): the tap sees the event, then M2 handles it */
+function mainEventIn(b: any) {
+  try { onsenTap?.mainEvent?.(b) } catch {}
+  return main.mainEvent(b)
+}
+/** Onsen step 3: the main's current gen (M2 row: state, pid, prompt_id, tool_open, kind), read only; null = none */
+export function mainGenRow(): Row | null { try { return D?.role === 'tg' && main ? main.currentGen() : null } catch { return null } }
+/** Onsen step 3: Joey's Telegram messages M1 holds for the main and it has not taken in (queued or offered), read only */
+export function mainQueuedJoey(): number {
+  try { return D?.role === 'tg' && main ? main.items(r => r.kind === 'joey' && (r.state === 'queued' || r.state === 'offered')).length : 0 } catch { return 0 }
+}
 /** tests only: this lanes instance's M1 + M2 and journal */
 export const __main = (): MainApi => main
 export const __journal = (): Journal => journal
@@ -6602,7 +6623,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     if (p === '/lanes/main-event' && req.method === 'POST') {
       const b = await readBody(req)
       if (!b.pid && b.event === 'SessionStart') b.pid = callerClaudePid(req)       // a hook without CLAUDE_PID: the caller's socket says which claude it is
-      sendJson(res, 200, await main.mainEvent(b)); return true
+      sendJson(res, 200, await mainEventIn(b)); return true             // Onsen step 3 (WO-143): the tap sees it first (read only)
     }
     if (p === '/lanes/mail-checked' && req.method === 'POST') {             // WO-127 (item 6): the main checked a mail off itself (the agent-inbox daemon, laneMailBtcc)
       const b = await readBody(req)

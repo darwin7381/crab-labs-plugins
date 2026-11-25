@@ -77,6 +77,7 @@ import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
+import * as OnsenStatus from './onsen-status.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
@@ -381,6 +382,21 @@ function onsenIn(m: any, text: string, transcript?: string): void {
     const body = transcript ?? (kind === 'text' || kind === 'command' || kind === 'rich' || m.caption != null ? text : '')
     onsen.recordMessage(Onsen.inboundItem(ONSEN_AGENT, m, body))
   } catch {}
+}
+// Onsen step 3 (WO-143): delivery facts (delivered / seen / turn_end of Joey's messages) and the main's status, recorded only (onsen-status.ts). Set up
+// after the lanes are (the block after lanesInit below); null = recording off for this agent, or the agent-inbox daemon.
+let onsenFacts: OnsenStatus.DeliveryFacts | null = null
+let onsenStep3Stop: (() => void) | null = null
+let onsenStatusNow: (() => unknown) | null = null
+const onsenAllow = { at: 0, ids: [] as string[] }
+/** Onsen step 3: Joey's Telegram message behind these meta (a sender on the DM allowlist, a chat, a message id), or null. The allowlist is read at most
+ *  every 5 s (it is consulted on every lanes journal write). */
+const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
+  if (!meta) return null
+  const chat = String(meta.chat_id ?? ''), id = String(meta.message_id ?? ''), uid = String(meta.user_id ?? '')
+  if (!chat || !/^\d+$/.test(id) || !uid) return null
+  if (Date.now() - onsenAllow.at > 5_000) { try { onsenAllow.ids = loadAccess().allowFrom.map(String) } catch {} ; onsenAllow.at = Date.now() }
+  return onsenAllow.ids.includes(uid) ? { chat, id } : null
 }
 /** Onsen step 2 (WO-142): what /clear (Joey's message `msgId` in `chat`, from `fromId`) does around the keys: draw the restart line FIRST (directly, ~2.5 s at
  *  most; else into the spool, and /clear still goes on time), put the button 「讓它看得到之前的」 on the reply, and lift the line again if typing /clear
@@ -1127,6 +1143,9 @@ function deliveryKey(notif: { method: string; params: unknown }): string {
 }
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
+  // Onsen step 3 (WO-143), lanes off: the channel notification was written into a session's open stream: Joey's message is seen by the main (lanes on, M1
+  // says it: the lanes journal tap). Recorded only; a re-delivery is the same fact.
+  if (onsenFacts && !Lanes.LANES_ON) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.seen(j.chat, j.id, 'main') } catch {} }
   if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(fleetRunId(notif)); hub?.oldPathSeen(notif); return }
   if (!RECEIPT_CHECK) hub?.oldPathSeen(notif)  // receipt off: pushed = seen (the 1.32.1 rule)
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
@@ -2310,6 +2329,7 @@ function shutdown(reason: string): void {
   if (shuttingDown) return
   shuttingDown = true
   log('warn', `shutting down (reason: ${reason}) uptime=${process.uptime().toFixed(1)}s`)
+  try { onsenStep3Stop?.() } catch {}          // Onsen step 3 (WO-143): a turn_end still settling is written now (the spool is a local append)
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
@@ -3431,6 +3451,9 @@ async function handleInbound(
   // belongs to the outer message, not the root's photo).
   const mgid = ctx.message?.media_group_id
   editIndex.note(chat_id, msgId, ctx.message?.date)   // Onsen step 2 (WO-142): delivered into the conversation; an edit of it reaches the agent
+  // Onsen step 3 (WO-143): the daemon took Joey's message in (it goes to the router / the queues next): `delivered`, after the message's own record
+  // (onsenIn above). A command the daemon answered itself and a permission reply returned before this line: they are not delivered to the agent.
+  if (onsenFacts && msgId != null) { try { if (onsenJoeyOf({ chat_id, message_id: String(msgId), user_id: String(from.id) })) onsenFacts.delivered(chat_id, msgId) } catch {} }
   // Documents aggregate too (2026-08-23, Atlas lost 2 of 3 album statements):
   // a document album previously fell through here one-by-one — each item got
   // media_group_id in meta but never media_group_count/numbered fields, so the
@@ -3530,6 +3553,8 @@ const ALBUM_WINDOW_MS = 1500
 
 type AlbumEntry = {
   chatId: string
+  /** Onsen step 3 (WO-143): every item's Telegram message id (the delivery carries the first's: what happens to it happens to each) */
+  ids: string[]
   captions: string[]
   items: Array<{ imagePath?: string; fileId: string; size?: number;
                  docKind?: string; docMime?: string; docName?: string }>
@@ -3547,9 +3572,10 @@ function bufferAlbumItem(
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
-    entry = { chatId, captions: [], items: [], baseMeta: item.meta, timer: null }
+    entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, timer: null }
     albumBuffers.set(key, entry)
   }
+  if (item.meta.message_id) entry.ids.push(item.meta.message_id)
   if (entry.timer) clearTimeout(entry.timer)
   if (item.caption) entry.captions.push(item.caption)
   entry.items.push({ imagePath: item.imagePath, fileId: item.fileId, size: item.size,
@@ -3596,6 +3622,7 @@ function flushAlbum(key: string): void {
     : docNames.length > 0
       ? `(album: ${entry.items.length} items — ${docNames.join(', ')}${nPhotos > 0 ? ` + ${nPhotos} photo(s)` : ''})`
       : `(album: ${entry.items.length} photos)`
+  onsenFacts?.album(entry.chatId, entry.ids)          // Onsen step 3 (WO-143): seen / turn_end of the delivery are every item's
   void dispatchInbound(entry.chatId, {
     method: 'notifications/claude/channel',
     params: { content, meta },
@@ -3835,7 +3862,10 @@ function sendToMcpSession(sessionId: string, notif: { method: string; params: un
     return
   }
   if (sseOpen.get(sessionId)) {
-    void found.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
+    void found.notification(notif as Parameters<Server['notification']>[0]).then(() => {
+      // Onsen step 3 (WO-143): written into the roam target's stream: seen (recorded only)
+      if (onsenFacts) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.seen(j.chat, j.id, 'main') } catch {} }
+    }).catch(err => {
       log('error', `roamer notify session ${sessionId} failed: ${err}`)
     })
   } else {
@@ -4233,6 +4263,39 @@ if (Lanes.LANES_ON) {
     }),
   })
 }
+// Onsen step 3 (WO-143): what the daemon already knows, recorded as facts (onsen-status.ts). Recording off for this agent: nothing (no timer, no tap).
+//   delivered  handleInbound took Joey's message in (both modes)
+//   seen       lanes on: M1 bound it to a main turn (by main), or a lane run started with it / had it steered in (by the lane id);
+//              lanes off: the channel notification was written into an open session stream (recordDelivery, the roamer's send)
+//   turn_end   lanes on: M1 `done` at the main's Stop, written once the turn stayed closed 60 s (or at the next prompt); a lane run's exit;
+//              lanes off: the transcript's turn_duration after the record that took it in (TurnWatch)
+//   status     lanes on: the main's M2 row (+ its hook events: PreCompact, Agent calls); lanes off: an open session stream and the transcript's turns.
+//              Both: the usage-wall state (usage-wall.ts) for walled.
+if (onsen && onsen.cfg.record && !INBOX_ONLY) {
+  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000) })
+  const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 5_000) })
+  onsenFacts = facts
+  let kickTimer: ReturnType<typeof setTimeout> | null = null
+  const kick = (): void => { if (!kickTimer) { kickTimer = setTimeout(() => { kickTimer = null; try { status.update(compute()) } catch {} }, 25); (kickTimer as any).unref?.() } }
+  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
+  if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
+  const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick })
+  let streamAt = 0                                                      // lanes off: the last time a session had an open stream
+  const compute = (): OnsenStatus.StatusView => {
+    const w = wallReader.state()
+    const wall = w ? { walled: w.walled, until: w.resets_at, kind: w.kind } : null
+    if (tap) return OnsenStatus.statusOf(tap.inputs({ queuedJoey: Lanes.mainQueuedJoey(), wall }))
+    // lanes off: connected = a session's stream open now, or within 15 s (Claude Code's MCP reconnect closes the old stream before the new one opens)
+    if ([...sseOpen.values()].some(Boolean)) streamAt = Date.now()
+    return OnsenStatus.statusOf({ connected: streamAt > 0 && Date.now() - streamAt < 15_000, walled: wall?.walled ? { until: wall.until, kind: wall.kind } : null,
+      busy: watch?.busy() ?? null, queued_joey: facts.queued(watch?.watching() ? 'taken' : 'seen') })
+  }
+  setInterval(() => { try { watch?.tick(); status.update(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
+  setTimeout(kick, 1_000).unref?.()
+  onsenStep3Stop = () => { facts.flushLater(); status.stop() }
+  onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', turn_end_settling: facts.pendingLater() })
+  log('info', `onsen: step 3 on (delivery facts and the main's status; ${tap ? 'lanes journal' : 'lanes off: session streams and the transcript'})`)
+}
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
   try {
@@ -4254,7 +4317,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         active_sessions: activeServers.size,
         sessions_with_open_sse: [...sseOpen.values()].filter(Boolean).length,  // issue #3: live vs zombie
         ...(Lanes.LANES_ON && !INBOX_ONLY ? { mailbox_decide_listed: decideListed } : {}),   // WO-126: the main listed mailbox_decide (when, which session)
-        ...(onsen ? { onsen: onsen.health() } : {}),   // Onsen (WO-139): recording on, bytes waiting in the spool, last sync
+        // Onsen (WO-139): recording on, bytes waiting in the spool, last sync; step 3 (WO-143): deliveries_recorded, status_recorded, the status now
+        ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}) } } : {}),
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,

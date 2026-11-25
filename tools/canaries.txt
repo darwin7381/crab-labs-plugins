@@ -54,3 +54,8 @@ plugins/telegram-http/channel-bot-control.ts::hooks.beforeClear()
 plugins/telegram-http/server.ts::clearHooks(chat_id, msgId
 plugins/telegram-http/server.ts::deliverEditedMessage(m)
 plugins/telegram-http/onsen-client.ts::async drawLine(
+plugins/telegram-http/server.ts::onsenFacts.delivered(chat_id, msgId)
+plugins/telegram-http/server.ts::Lanes.observeLanes({ journal:
+plugins/telegram-http/lanes.ts::export function observeLanes(
+plugins/telegram-http/lanes-state.ts::observe(fn: (row: Row
+plugins/telegram-http/onsen-client.ts::recordDelivery(f: DeliveryFact)

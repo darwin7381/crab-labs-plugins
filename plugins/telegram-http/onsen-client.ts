@@ -12,6 +12,9 @@
 //   - step 2 (WO-142): draws and lifts restart lines (Joey's /clear and its button: POST /restart-lines, /restart-lines/lift), directly with a short
 //     timeout, else through the spool in order; keeps the lines it drew in <STATE_DIR>/onsen/lines.json so the spool's answer respects them too;
 //     records edit_delivered (an edited message of Joey's reached the agent).
+//   - step 3 (WO-143): delivery facts (k 'd': delivered / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
+//     /status/batch) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
+//     refused as a whole (an Onsen without those routes) goes to rejected.jsonl: the messages behind it are never held.
 // The credential (the agent's mesh credential, read from the agent-inbox daemon's state dir) is never logged, printed or written anywhere.
 
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -39,7 +42,17 @@ export type RestartLineLift = { agent: string; client: 'telegram'; chat: string;
 /** a line this daemon drew, kept in lines.json (the spool's answer filters by it); id null: not yet in Onsen */
 export type LocalLine = { chat: string; at: string; idem_key: string; client_msg_id?: string; by?: string; id: number | null; lifted_at: string | null
   lifted_by?: string | null; rejected?: boolean }
+/** step 3 (WO-143): one fact about one of Joey's messages reaching the agent (POST /deliveries/batch). delivered: the daemon took it in (queued);
+ *  seen: it entered a session (`by` main or the lane id); turn_end: the turn that saw it ended (`by` as for seen). One per (message, recipient, state). */
+export type DeliveryState = 'delivered' | 'seen' | 'turn_end'
+export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'; chat: string; client_msg_id: string; state: DeliveryState; at: string; by?: string
+  detail?: Record<string, unknown> }
+/** step 3: the main's status (POST /status/batch): busy carries { turn_started_at, tool, subagents, queued_joey }; walled { until } */
+export type StatusState = 'idle' | 'busy' | 'gone' | 'walled' | 'compacting'
+export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown> }
 type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
+  | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact }
+const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's'])
 
 export const idemIn = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:in:${id}`
 export const idemOut = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:out:${id}`
@@ -47,6 +60,9 @@ export const idemOutFailed = (agent: string, chat: string): string => `tg:${agen
 export const idemLine = (agent: string, chat: string, clearMsgId: string | number): string => `tg:${agent}:${chat}:line:${clearMsgId}`
 /** step 2: the callback data of the button under the /clear reply (≤ 64 bytes): olift:<line id, or - while the draw is in the spool>:<the /clear message id> */
 export const liftData = (lineId: number | null, clearMsgId: string | number): string => `olift:${lineId ?? '-'}:${clearMsgId}`
+/** step 3 (WO-143): one fact per (message, state); the recipient is the first to report it (a second `seen` is a duplicate at Onsen: first wins) */
+export const idemDelivery = (agent: string, chat: string, id: string | number, state: DeliveryState): string => `tg:${agent}:${chat}:dlv:${id}:${state}`
+export const idemStatus = (agent: string, ms: number, state: StatusState): string => `tg:${agent}:st:${ms}:${state}`
 
 // ------------------------------------------------------------------ who is sending (server.ts sets it around each send path)
 export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean; skip?: boolean }
@@ -246,7 +262,7 @@ export class OnsenClient {
   private appendWarnAt = 0
   private authWarnAt = 0
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
-    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0 }
+    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -261,15 +277,20 @@ export class OnsenClient {
   recordMessage(item: OnsenItem): void { this.append({ k: 'm', r: item }) }
   recordEvent(ev: OnsenEvent): void { this.append({ k: 'e', r: ev }) }
   recordLine(line: SpoolLine | null): void { if (line) this.append(line) }
-  private append(line: SpoolLine): void {
-    if (!this.cfg.record) return
+  /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
+  recordDelivery(f: DeliveryFact): void { if (this.append({ k: 'd', r: f })) this.stats.deliveries_recorded++ }
+  recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) this.stats.status_recorded++ }
+  private append(line: SpoolLine): boolean {
+    if (!this.cfg.record) return false
     try {
       mkdirSync(this.cfg.dir, { recursive: true, mode: 0o700 })
       appendFileSync(this.spool, JSON.stringify(line) + '\n', { mode: 0o600 })
       this.stats.recorded++
       this.kick()
+      return true
     } catch (e) {
       if (Date.now() - this.appendWarnAt > HOUR) { this.appendWarnAt = Date.now(); this.cfg.log('warn', `onsen: could not append to the spool (${errText(e)}); this record is lost`) }
+      return false
     }
   }
 
@@ -327,6 +348,12 @@ export class OnsenClient {
     const key = (line as any)?.r?.idem_key ?? '?'
     this.cfg.log('warn', `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
   }
+  /** step 3: a whole batch refused: each line to rejected.jsonl, one log line for the lot */
+  private rejectRun(lines: unknown[], why: string): void {
+    this.stats.rejected += lines.length
+    try { appendFileSync(this.rejected, lines.map(line => JSON.stringify({ at: new Date().toISOString(), why, line })).join('\n') + '\n', { mode: 0o600 }) } catch {}
+    this.cfg.log('warn', `onsen: rejected ${lines.length} line(s) (${why}); moved to rejected.jsonl, not retried`)
+  }
   private headers(cred: string, extra: Record<string, string> = {}): Record<string, string> {
     return { 'Content-Type': 'application/json', Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}`, ...extra }
   }
@@ -354,7 +381,7 @@ export class OnsenClient {
         if (buf[i] !== 0x0a) continue
         const raw = buf.subarray(from, i).toString('utf8')
         let line: SpoolLine | null = null
-        try { const j = JSON.parse(raw); if ((j.k === 'm' || j.k === 'e' || j.k === 'l' || j.k === 'u') && j.r) line = j } catch {}
+        try { const j = JSON.parse(raw); if (SPOOL_KINDS.has(j.k) && j.r) line = j } catch {}
         out.push({ line, raw, end: start + i + 1 })
         from = i + 1
       }
@@ -389,6 +416,28 @@ export class OnsenClient {
         if (done !== true) return this.failStatus(done, t.line.k === 'l' ? '/restart-lines' : '/restart-lines/lift')
         this.writeCursor(t.end); this.ok(); i++
         continue
+      }
+      if (t.line.k === 'd' || t.line.k === 's') {
+        // step 3 (WO-143): a run of delivery facts (or of status lines): one batch (≤500), in its place in the order
+        const k = t.line.k, path = k === 'd' ? '/deliveries/batch' : '/status/batch'
+        const run: Array<{ line: SpoolLine; end: number }> = []
+        while (i < todo.length && run.length < 500 && todo[i]!.line?.k === k) { run.push({ line: todo[i]!.line!, end: todo[i]!.end }); i++ }
+        const r = await this.post(path, { items: run.map(x => x.line.r) }, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        if (r.status >= 200 && r.status < 300 && Array.isArray(r.json?.results) && r.json.results.length === run.length) {
+          r.json.results.forEach((res: any, n: number) => {
+            if (res && res.error == null && res.id != null) { if (res.duplicate) this.stats.duplicates++; else this.stats.posted++ }
+            else this.reject(run[n]!.line, `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}${res?.status != null ? ` (${res.status})` : ''}`)
+          })
+          this.writeCursor(run[run.length - 1]!.end); this.ok()
+          continue
+        }
+        if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
+          // refused as a whole (no single-item route for these): every line to rejected.jsonl, one log line, so the messages behind them are not held
+          this.rejectRun(run.map(x => x.line), `${path} answered HTTP ${r.status} ${String(r.json?.error ?? JSON.stringify(r.json?.detail ?? '')).slice(0, 200)}`)
+          this.writeCursor(run[run.length - 1]!.end); this.ok()
+          continue
+        }
+        return this.failStatus(r, path)
       }
       if (t.line.k === 'e') {
         const r = await this.post('/events', t.line.r, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))

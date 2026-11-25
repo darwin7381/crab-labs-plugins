@@ -20,7 +20,10 @@ export type Row = { ts: string; rec: RecKind; id: string; state: string; created
 export class Journal {
   readonly t: Record<Table, Map<string, Row>> = { msg: new Map(), main: new Map(), event: new Map(), run: new Map() }
   private n = 0
+  /** Onsen step 3 (WO-143): read-only observers of each write (the folded row after it, and the line as written); not called by load(). Never throw into a write. */
+  private observers: Array<(row: Row, line: Record<string, unknown>) => void> = []
   constructor(readonly path: string, private clock: () => number = Date.now) {}
+  observe(fn: (row: Row, line: Record<string, unknown>) => void): void { this.observers.push(fn) }
 
   /** fold the file (boot); returns how many lines were read */
   load(): number {
@@ -41,7 +44,9 @@ export class Journal {
     for (const [k, v] of Object.entries(fields)) if (v !== undefined && !(k in line)) line[k] = v
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 })
     appendFileSync(this.path, JSON.stringify(line) + '\n')
-    return this.apply(line)
+    const row = this.apply(line)
+    if (row) for (const o of this.observers) { try { o(row, line) } catch {} }
+    return row
   }
 
   private apply(line: Record<string, any>): Row | null {
