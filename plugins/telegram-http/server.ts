@@ -74,7 +74,8 @@ import { topicMode, topicModeAtStart, topicVerdict, type TopicMe } from './lanes
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
-import { bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
+import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
+import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, itemKey, pushedMailText, switchOn, type HandResult, type PullItem } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
@@ -1609,6 +1610,25 @@ if (hubMode.on) {
     maxPushes: MAX_REDELIVERIES })
 }
 
+// WO-151 3a / 3b (Relay part 3, onsen-inbox.ts): this agent-inbox daemon takes what is sent to it from Onsen (ONSEN_PULL) and writes its calls there
+// too (ONSEN_SEND). Each switch: a comma list of agent names or `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default
+// https://core.kbro.ai/api/onsen); the credential is this daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
+// recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
+const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
+const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
+const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
+const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
+const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
+  const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
+  return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
+})() : null
+const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
+  deliver: it => deliverPulled(it), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
+  ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
+  ...(process.env.ONSEN_PULL_BACKOFF_MS ? { minBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS), maxBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS) * 4 } : {}) }) : null
+const onsenSender: OnsenSender | null = ONSEN_SEND_ON && onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
+if (INBOX_ONLY) log('info', `onsen inbox: pull ${onsenPuller ? 'on' : 'off'}, send ${onsenSender ? 'on' : 'off'}${onsenReq ? ` (${ONSEN_INBOX_BASE})` : ''}; ${onsenInbox?.keyCount ?? 0} delivered key(s), last_seq ${onsenInbox?.lastSeq ?? 0}, ${onsenInbox?.pending.length ?? 0} pending`)
+
 function loadInboxRegistry(): Record<string, { url: string; desc?: string }> {
   try { return JSON.parse(readFileSync(INBOX_REGISTRY_PATH, 'utf8')) } catch { return {} }
 }
@@ -1658,7 +1678,29 @@ async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): P
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(10000),
   })
-  return { status: r.status, json: await r.json().catch(() => ({})) }
+  const out = { status: r.status, json: await r.json().catch(() => ({})) }
+  // WO-151 3b (ONSEN_SEND): a mail BTCC pushed straight into the recipient's session (its mailbox is off: stored false) also goes into the recipient's
+  // Onsen inbox (key msg:<id>, the text BTCC pushed); a stored mail stays in BTCC's mailbox only
+  if (onsenSender && method === 'POST' && out.status === 200 && out.json?.stored === false && typeof out.json?.id === 'number') {
+    const reply = /^\/api\/mesh\/mail\/\d+\/reply$/.test(path)
+    if (reply || path === '/api/mesh/mail/send') void mirrorPushedMail(out.json.id, reply)
+  }
+  return out
+}
+/** WO-151 3b: the Onsen copy of a pushed mail: the mail as BTCC keeps it (GET by its sender: nothing is marked read), its text as BTCC pushed it
+ *  (pushedMailText), the fields the receiver's /deliver gives /inject (msg_id, logged, line mail, reply_to_id, no_reply) */
+async function mirrorPushedMail(id: number, reply: boolean): Promise<void> {
+  try {
+    const m = await btccMail('GET', `/api/mesh/mail/${id}`)
+    const j = m.json
+    if (m.status !== 200 || typeof j?.to !== 'string') throw new Error(`GET mail #${id}: HTTP ${m.status}`)
+    const text = pushedMailText({ id, from: String(j.from ?? INBOX_SELF), title: j.title, ask: j.ask, body: j.body, deadline: j.deadline, no_reply: j.no_reply,
+      reply_to_id: j.reply_to_id }, reply)
+    await onsenSender!.send(String(j.to), 'mail', { text, msg_id: id, logged: true, line: 'mail',
+      ...(j.reply_to_id != null ? { reply_to_id: j.reply_to_id } : {}), ...(j.no_reply === true ? { no_reply: true } : {}) }, `msg:${id}`)
+  } catch (e) {
+    log('warn', `onsen send: pushed mail #${id} not written to Onsen (${e instanceof Error ? e.message : e}); BTCC's push carried it as before`)
+  }
 }
 // ---- feed wall (WO-92): Fleet Core /api/feed/*, same credential. Never throws: an unreachable core is
 // a status the tools explain ("改用搜尋" for ask), not a tool crash.
@@ -1953,6 +1995,15 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   if (held) return `send held — nothing was sent to ${target}. ${held}`
   let delivery = 'failed'
   let detail = ''
+  // WO-151 3b (ONSEN_SEND): one dedupe key in the /inject body and in the Onsen copy (msg:<BTCC id>, else a fresh call:<uuid>), so a recipient that
+  // takes from Onsen delivers the call once, whichever arrives first
+  const onsenKey = onsenSender ? (msgId != null ? `msg:${msgId}` : `call:${randomUUID()}`) : null
+  const payload: Record<string, unknown> = { text: body, logged: msgId != null,
+    ...(msgId != null ? { msg_id: msgId } : {}),
+    ...(replyTo != null ? { reply_to_id: replyTo } : {}),
+    ...(opRef ? { op: opRef } : {}),
+    ...(noReply ? { no_reply: true } : {}),
+    ...laneFields(extra) }
   try {
     const r = await fetch(entry.url, {
       method: 'POST',
@@ -1961,12 +2012,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
         ...meshAuth(),
       },
-      body: JSON.stringify({ text: body, from: INBOX_SELF, logged: msgId != null,
-        ...(msgId != null ? { msg_id: msgId } : {}),
-        ...(replyTo != null ? { reply_to_id: replyTo } : {}),
-        ...(opRef ? { op: opRef } : {}),
-        ...(noReply ? { no_reply: true } : {}),
-        ...laneFields(extra) }),
+      body: JSON.stringify({ text: body, from: INBOX_SELF, ...payload, ...(onsenKey ? { dedupe: onsenKey } : {}) }),
       signal: AbortSignal.timeout(8000),
     })
     const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
@@ -1974,6 +2020,20 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     else detail = ` (inbox ${r.status})`
   } catch (e) {
     detail = ` (${e})`
+  }
+  // WO-151 3b: the Onsen copy, after today's push. Push delivered: not awaited (its latency unchanged). Push failed: awaited; Onsen took it and the
+  // recipient's daemon is pulling (Onsen 0.9.1 `pulling`: it polled in the last 90 s) = delivered (the same answer as a delivered push); otherwise the
+  // failure stands as before (the call waits in Onsen, not counted as delivered)
+  if (onsenSender) {
+    if (delivery === 'delivered') void onsenSender.send(target, 'call', payload, onsenKey)
+    else {
+      const o = await onsenSender.send(target, 'call', payload, onsenKey)
+      if (o.stored && o.pulling) {
+        onsenSender.stats.delivered_by_onsen++
+        log('info', `send to ${target}: the push failed${detail}; delivered through Onsen (${onsenKey}; the recipient's daemon is pulling)`)
+        delivery = 'delivered'; detail = ''
+      } else log('info', `send to ${target}: the push failed${detail}; ${o.stored ? `in Onsen (${onsenKey}), the recipient's daemon is not pulling: not counted as delivered` : 'not in Onsen either'}`)
+    }
   }
   // settle the delivery status on the minted row (best effort)
   if (msgId != null) {
@@ -4528,6 +4588,197 @@ async function echoFormAnswer(it: OnsenVisible.FormItem): Promise<void> {
     if (formEchoes.size > 500) formEchoes.delete(formEchoes.keys().next().value!)
   }
 }
+// The delivery of one inbound message (WO-151 3a: shared by POST /inject and the Onsen pull, onsen-inbox.ts): the body /inject takes and who sent it
+// (the verdict). /inject: the verdict from the presented credential (resolveInbound); a pulled item: Onsen's authenticated sender (deliverPulled), never
+// forged or held. Returns the HTTP answer /inject gives (code, JSON); the pull reads it. Everything below the dedupe is the /inject handler of 1.49.1,
+// unchanged.
+// WO-151 dedupe (both paths on): the message's key (dedupeKeyOf: the sender's `dedupe`, else msg:<msg_id>) already delivered by either path is dropped
+// first, before any comms row or route, and answered as delivered ({injected: true, duplicate: true}). A trusted delivery records its key
+// (onsen-inbox.json; claimed while it runs, so two arrivals of one key cannot both pass); a refused one (a ring with no router) leaves it free.
+type InboundBody = { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
+  msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
+  no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown }
+type InboundAnswer = { code: number; json: Record<string, unknown> }
+async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { holdUnsigned: boolean; trusted: boolean; src: 'inject' | 'onsen' }): Promise<InboundAnswer> {
+  const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
+  const opRef = body?.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
+  if (!text) return { code: 400, json: { error: 'text required' } }
+  // Forged = unsigned, but the claimed name is an identity that DOES sign. That can only
+  // be impersonation (the real sender would have signed), so it is never a legitimate
+  // not-yet-migrated sender — dropping it loses no task (distinct from Joey 6231, which
+  // protects forged=false unsigned senders). Default-drop so defence does not depend on
+  // every agent reading the tag (steropes 5831: attacker 156.240.236.28 kept reaching
+  // inboxes as ⚠️unverified labels). MESH_ALLOW_FORGED=1 reverts to deliver+label.
+  if (verdict.forged && process.env.MESH_ALLOW_FORGED !== '1') {
+    log('warn', `DROPPED forged inject (filed for review): claimed=${verdict.sender} relay=${verdict.relay} text=${text.slice(0, 80)}`)
+    fileHeld(verdict.sender, verdict.relay, text, 'forged-unsigned')
+    return { code: 200, json: { injected: false, dropped: 'forged-unsigned', held: true } }
+  }
+  if (o.holdUnsigned) {
+    log('warn', `HELD unsigned inject (MESH_REQUIRE_SIGNED): claimed=${verdict.sender} text=${text.slice(0, 80)}`)
+    fileHeld(verdict.sender, verdict.relay, text, 'unsigned')
+    return { code: 200, json: { injected: false, held: true } }
+  }
+  // WO-151: delivered already by the other path (or being delivered right now): dropped here, counted
+  const key = onsenInbox ? dedupeKeyOf(body?.dedupe, body?.msg_id) : null
+  if (key && onsenInbox!.seen(key)) {
+    if (o.src === 'inject') onsenInbox!.stats.inject_dup_dropped++
+    log('info', `onsen inbox: ${o.src === 'inject' ? '/inject' : 'Onsen item'} from ${verdict.sender} (${key}) already delivered by the ${o.src === 'inject' ? 'Onsen' : '/inject'} path: dropped`)
+    return { code: 200, json: { injected: true, duplicate: true } }
+  }
+  const claimed = !!key && o.trusted && onsenInbox!.claim(key)
+  let taken = false
+  try {
+    const out = await deliverInboundTaken(body!, text, opRef, verdict)
+    taken = out.json.injected === true || out.json.ignored != null
+    return out
+  } finally {
+    if (claimed) { if (taken) onsenInbox!.record(key!); else onsenInbox!.release(key!) }
+  }
+}
+async function deliverInboundTaken(body: InboundBody, text: string, opRef: string, verdict: Verdict): Promise<InboundAnswer> {
+  const from = verdict.sender
+  // WO-141 phase 2: BTCC's mailbox ring (body ring:true with wake=mail, through the oncall receiver). It wakes the agent's mail lane and
+  // nothing else: never a BTCC comms row (a ring is not a message), never the main. Lanes off: dropped and logged here (the watchdog's
+  // hourly 讀信箱 reminder carries no ring and reaches the main as before). Lanes on: the router's mail lane (coalesced while it runs);
+  // no router to ask: not delivered (no fleet-path fallback to the main), and the answer says so, so the mailbox tries again later.
+  const ring = body?.ring === true && Lanes.wakeKind(from, text, body?.wake) === 'mail'
+  // The sender's hub id (BTCC mesh push / Comms console / a peer that logged first): the doorbell for hub sync.
+  const senderMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
+  let btccMsgId: number | undefined = senderMsgId
+  // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
+  // delivery gets a BTCC row unless the sender declares logged:true (senders
+  // that already log with richer context: fleet call, BTCC /send, Argus wake).
+  if (INBOX_ONLY && body?.logged !== true && BTCC_API_BASE && !ring) {
+    // PARSE rather than strip (codex r3): wake handoffs keep their priority
+    // and get kind='wake' so BTCC history/UI retain the on-call semantics;
+    // only bare legacy identity prefixes (【a → b】) are dropped as noise.
+    let kind = 'message'
+    let logBody = text
+    const argusTpl = text.match(/^【Argus 值班轉交 ([A-Za-z0-9]{1,8})】\s*/)
+    const prioTag = text.match(/^\[[A-Za-z0-9]{1,8}\]\s/)
+    if (argusTpl) {
+      kind = 'wake'
+      logBody = `[${argusTpl[1]}] ` + text.slice(argusTpl[0].length).replace(/（詳見 xboard [^）]{0,80}）\s*$/, '')
+    } else if (prioTag) {
+      kind = 'wake'
+    } else {
+      logBody = text.replace(/^【[^】]{1,60}】\s*/, '')
+    }
+    try {
+      // awaited (not fire-and-forget): the minted row id travels in the channel
+      // meta as btcc_msg_id so the receiving agent can quote-reply to this message
+      const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+          ...meshAuth(),
+        },
+        body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified, ...(opRef ? { op: opRef } : {}) }),
+        signal: AbortSignal.timeout(6000),
+      }).catch(() => null)
+      if (r?.ok) {
+        const j = await r.json().catch(() => ({})) as { id?: number }
+        if (typeof j.id === 'number') btccMsgId = j.id
+      }
+    } catch {}
+  }
+  // Default chat_id = first allowFrom (the owner): if the agent finishes and
+  // reports via the reply tool, the report lands with the boss per contract.
+  const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
+  if (Lanes.LANES_ON) {
+    // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
+    // sender (it is stamped by the sender's own daemon, never by message text).
+    const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
+    const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
+    const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
+    const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
+    const notification = {
+      method: 'notifications/claude/channel',
+      params: {
+        content: text,
+        meta: {
+          chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
+          ...verdictMeta(verdict),
+          ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
+          ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
+          ...(opRef ? { op: opRef } : {}),
+          ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
+          ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
+          ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+          ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
+          // lanes-golive (C1/C2): what the router reads as fields: the wake-up kind (body.wake, else the watchdog's sender and marker) and the line
+          // (body.line / body.tier; a push without one is a call)
+          ...((w => w ? { wake: w } : {})(Lanes.wakeKind(from, text, body?.wake))),
+          line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call',
+          // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
+          ...((body as any)?.run_id != null && /^\d+$/.test(String((body as any).run_id)) ? { run_id: String((body as any).run_id) } : {}),
+          ...(typeof (body as any)?.frequency === 'string' && (body as any).frequency ? { frequency: String((body as any).frequency).slice(0, 16) } : {}),
+          ...(ring ? { ring: 'true' } : {}),          // WO-141: the router reads it (lanes switched off: a ring is recorded, not the main's)
+        },
+      },
+    }
+    // lanes-golive (C3): a sender-assigned hub id is a doorbell here too: hub sync fetches the row and hands it to the router (laneHubPush), and
+    // reports it taken; without a hub row it comes through the router now, from this /inject. Either way one entrance, one count.
+    const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'
+    if (hubRoute === 'hub') rememberHubMeta(senderMsgId!, notification.params.meta as Record<string, string>)
+    const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified, !ring) : null
+    if (ring && !d) {
+      log('warn', `ring from ${from} NOT delivered: no lanes router to ask (the mailbox tries again later)`)
+      return { code: 200, json: { injected: false, error: 'lanes router unreachable: ring not delivered' } }
+    }
+    return { code: 200, json: hubRoute === 'old' ? { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }
+      : { injected: true, hub: true, routed: 'hub' } }
+  }
+  if (ring) {
+    log('info', `ring from ${from} dropped: lanes off here (no mail lane to wake; the mailbox stays as it is, the watchdog reminds): ${text.slice(0, 60)}`)
+    return { code: 200, json: { injected: false, ignored: 'ring: lanes off here; the mailbox stays as it is' } }
+  }
+  const notif = {
+    method: 'notifications/claude/channel',
+    params: {
+      content: text,
+      meta: {
+        chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
+        ...verdictMeta(verdict),
+        ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
+        // Terminal-ack flag (Athena's a2a ack-loop fix): a no_reply delivery is
+        // tagged no_reply="true" so check_tg_reply lets the receiver's turn close
+        // WITHOUT forcing a reply — breaks the two-agent forced-ack loop at source.
+        ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
+        // ops room (BTCC WO-35): which 戰情室 this message belongs to; reply with the same op
+        ...(opRef ? { op: opRef } : {}),
+        ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
+        ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
+        ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+      },
+    },
+  }
+  // Hub doorbell (1.33.0): a sender-assigned hub id is delivered by hub sync when the hub lists it with a
+  // payload; decided asynchronously (the receiver gives /inject 8 s), falling back to this old path otherwise.
+  // An id this daemon minted itself (logged:false above) is excluded from the hub's pending list: old path.
+  const route = hub && senderMsgId != null && btccMsgId === senderMsgId
+    ? hub.doorbell(senderMsgId, chatId, notif) : 'old'
+  if (route === 'old') await dispatchInbound(chatId, notif)
+  return { code: 200, json: { injected: true, active_sessions: activeServers.size, hub: route === 'hub' || route === 'dup-hub' } }
+}
+/** WO-151 3a: one item taken from Onsen, handed to the same delivery as /inject (deliverInbound). Its sender is Onsen's authenticated caller, or the name
+ *  a relay identity (BTCC) speaks for: verified, never forged. The relay attribute agents read keeps the values it has today (direct: the sender itself;
+ *  btcc: BTCC spoke for it), so no text an agent reads changes; that it came through Onsen is in the log and /healthz (a value `onsen` there waits for
+ *  Chiron). The item's key (Onsen's `dedupe`, else msg:<msg_id>) goes in as the body's `dedupe`. */
+async function deliverPulled(it: PullItem): Promise<HandResult> {
+  const p = (it.payload ?? {}) as InboundBody
+  const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
+  const verdict: Verdict = { sender: String(it.sender ?? 'unknown').slice(0, 64), verified: true, relay, forged: false }
+  const key = itemKey(it)
+  const out = await deliverInbound({ ...p, dedupe: key ?? undefined }, verdict, { holdUnsigned: false, trusted: true, src: 'onsen' })
+  if (out.json.duplicate === true) return 'duplicate'
+  const ok = out.json.injected === true || out.json.ignored != null
+  log(ok ? 'info' : 'warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) from ${verdict.sender}${it.relay ? ` via ${it.relay}` : ''}${key ? ` ${key}` : ' (no key)'}: ${ok ? 'handed on' : `not delivered ${JSON.stringify(out.json).slice(0, 160)}`}`)
+  return ok ? 'delivered' : 'undelivered'
+}
+
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
   try {
@@ -4560,6 +4811,12 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           catch { return 0 }
         })(),
         hub: hub ? hub.health() : { enabled: false, why: hubMode.why },
+        // WO-151 3a / 3b: the Onsen pull (taken, handed on, duplicates dropped on either path) and the Onsen copy of this agent's sends
+        ...(INBOX_ONLY ? {
+          onsen_pull: { on: !!onsenPuller, ...(onsenPuller ? onsenPuller.health() : { last_seq: onsenInbox?.lastSeq ?? 0, acked_seq: onsenInbox?.ackedSeq ?? 0 }),
+            keys: onsenInbox?.keyCount ?? 0, inject_dup_dropped: onsenInbox?.stats.inject_dup_dropped ?? 0 },
+          onsen_send: { on: !!onsenSender, ...(onsenSender ? onsenSender.stats : {}) },
+        } : {}),
         // WO-120: this daemon's usage-wall state (null = no fresh state: delivering as before)
         usage_wall: (() => { const w = wallReader.state(); return w ? { walled: w.walled, episode: w.episode, key: w.key, cleared_by: w.cleared_by } : null })(),
         pid: process.pid,
@@ -4608,173 +4865,18 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
         return
       }
-      const body = (await readJsonBody(req).catch(() => null)) as
-        { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
-          msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
-          no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown } | null
-      const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
-      const opRef = body?.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
-      if (!text) {
-        res.writeHead(400, { 'content-type': 'application/json' }).end('{"error":"text required"}')
-        return
-      }
+      const body = (await readJsonBody(req).catch(() => null)) as InboundBody | null
       // Who really sent it: decided by the presented credential, never by the body alone
       // (access design v1.1 §5.3). Unsigned senders still deliver, marked verified=false.
       const verdict = resolveInbound(authz,
         typeof body?.from === 'string' ? body.from : undefined,
         typeof body?.verified_from === 'string' ? body.verified_from : undefined, meshTable)
-      // Forged = unsigned, but the claimed name is an identity that DOES sign. That can only
-      // be impersonation (the real sender would have signed), so it is never a legitimate
-      // not-yet-migrated sender — dropping it loses no task (distinct from Joey 6231, which
-      // protects forged=false unsigned senders). Default-drop so defence does not depend on
-      // every agent reading the tag (steropes 5831: attacker 156.240.236.28 kept reaching
-      // inboxes as ⚠️unverified labels). MESH_ALLOW_FORGED=1 reverts to deliver+label.
-      if (verdict.forged && process.env.MESH_ALLOW_FORGED !== '1') {
-        log('warn', `DROPPED forged inject (filed for review): claimed=${verdict.sender} relay=${verdict.relay} text=${text.slice(0, 80)}`)
-        fileHeld(verdict.sender, verdict.relay, text, 'forged-unsigned')
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ injected: false, dropped: 'forged-unsigned', held: true }))
-        return
-      }
-      if (holdUnsigned) {
-        log('warn', `HELD unsigned inject (MESH_REQUIRE_SIGNED): claimed=${verdict.sender} text=${text.slice(0, 80)}`)
-        fileHeld(verdict.sender, verdict.relay, text, 'unsigned')
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ injected: false, held: true }))
-        return
-      }
-      const from = verdict.sender
-      // WO-141 phase 2: BTCC's mailbox ring (body ring:true with wake=mail, through the oncall receiver). It wakes the agent's mail lane and
-      // nothing else: never a BTCC comms row (a ring is not a message), never the main. Lanes off: dropped and logged here (the watchdog's
-      // hourly 讀信箱 reminder carries no ring and reaches the main as before). Lanes on: the router's mail lane (coalesced while it runs);
-      // no router to ask: not delivered (no fleet-path fallback to the main), and the answer says so, so the mailbox tries again later.
-      const ring = body?.ring === true && Lanes.wakeKind(from, text, body?.wake) === 'mail'
-      // The sender's hub id (BTCC mesh push / Comms console / a peer that logged first): the doorbell for hub sync.
-      const senderMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
-      let btccMsgId: number | undefined = senderMsgId
-      // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
-      // delivery gets a BTCC row unless the sender declares logged:true (senders
-      // that already log with richer context: fleet call, BTCC /send, Argus wake).
-      if (INBOX_ONLY && body?.logged !== true && BTCC_API_BASE && !ring) {
-        // PARSE rather than strip (codex r3): wake handoffs keep their priority
-        // and get kind='wake' so BTCC history/UI retain the on-call semantics;
-        // only bare legacy identity prefixes (【a → b】) are dropped as noise.
-        let kind = 'message'
-        let logBody = text
-        const argusTpl = text.match(/^【Argus 值班轉交 ([A-Za-z0-9]{1,8})】\s*/)
-        const prioTag = text.match(/^\[[A-Za-z0-9]{1,8}\]\s/)
-        if (argusTpl) {
-          kind = 'wake'
-          logBody = `[${argusTpl[1]}] ` + text.slice(argusTpl[0].length).replace(/（詳見 xboard [^）]{0,80}）\s*$/, '')
-        } else if (prioTag) {
-          kind = 'wake'
-        } else {
-          logBody = text.replace(/^【[^】]{1,60}】\s*/, '')
-        }
-        try {
-          // awaited (not fire-and-forget): the minted row id travels in the channel
-          // meta as btcc_msg_id so the receiving agent can quote-reply to this message
-          const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-              ...meshAuth(),
-            },
-            body: JSON.stringify({ from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified, ...(opRef ? { op: opRef } : {}) }),
-            signal: AbortSignal.timeout(6000),
-          }).catch(() => null)
-          if (r?.ok) {
-            const j = await r.json().catch(() => ({})) as { id?: number }
-            if (typeof j.id === 'number') btccMsgId = j.id
-          }
-        } catch {}
-      }
-      // Default chat_id = first allowFrom (the owner): if the agent finishes and
-      // reports via the reply tool, the report lands with the boss per contract.
-      const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
-      if (Lanes.LANES_ON) {
-        // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
-        // sender (it is stamped by the sender's own daemon, never by message text).
-        const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
-        const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
-        const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
-        const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
-        const notification = {
-          method: 'notifications/claude/channel',
-          params: {
-            content: text,
-            meta: {
-              chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
-              ...verdictMeta(verdict),
-              ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
-              ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
-              ...(opRef ? { op: opRef } : {}),
-              ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
-              ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
-              ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
-              ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
-              // lanes-golive (C1/C2): what the router reads as fields: the wake-up kind (body.wake, else the watchdog's sender and marker) and the line
-              // (body.line / body.tier; a push without one is a call)
-              ...((w => w ? { wake: w } : {})(Lanes.wakeKind(from, text, body?.wake))),
-              line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call',
-              // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
-              ...(body?.run_id != null && /^\d+$/.test(String(body.run_id)) ? { run_id: String(body.run_id) } : {}),
-              ...(typeof body?.frequency === 'string' && body.frequency ? { frequency: String(body.frequency).slice(0, 16) } : {}),
-              ...(ring ? { ring: 'true' } : {}),          // WO-141: the router reads it (lanes switched off: a ring is recorded, not the main's)
-            },
-          },
-        }
-        // lanes-golive (C3): a sender-assigned hub id is a doorbell here too: hub sync fetches the row and hands it to the router (laneHubPush), and
-        // reports it taken; without a hub row it comes through the router now, from this /inject. Either way one entrance, one count.
-        const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'
-        if (hubRoute === 'hub') rememberHubMeta(senderMsgId!, notification.params.meta as Record<string, string>)
-        const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified, !ring) : null
-        if (ring && !d) {
-          log('warn', `ring from ${from} NOT delivered: no lanes router to ask (the mailbox tries again later)`)
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ injected: false, error: 'lanes router unreachable: ring not delivered' }))
-          return
-        }
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify(hubRoute === 'old' ? { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }
-          : { injected: true, hub: true, routed: 'hub' }))
-        return
-      }
-      if (ring) {
-        log('info', `ring from ${from} dropped: lanes off here (no mail lane to wake; the mailbox stays as it is, the watchdog reminds): ${text.slice(0, 60)}`)
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ injected: false, ignored: 'ring: lanes off here; the mailbox stays as it is' }))
-        return
-      }
-      const notif = {
-        method: 'notifications/claude/channel',
-        params: {
-          content: text,
-          meta: {
-            chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
-            ...verdictMeta(verdict),
-            ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
-            // Terminal-ack flag (Athena's a2a ack-loop fix): a no_reply delivery is
-            // tagged no_reply="true" so check_tg_reply lets the receiver's turn close
-            // WITHOUT forcing a reply — breaks the two-agent forced-ack loop at source.
-            ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
-            // ops room (BTCC WO-35): which 戰情室 this message belongs to; reply with the same op
-            ...(opRef ? { op: opRef } : {}),
-            ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
-            ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
-            ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
-          },
-        },
-      }
-      // Hub doorbell (1.33.0): a sender-assigned hub id is delivered by hub sync when the hub lists it with a
-      // payload; decided asynchronously (the receiver gives /inject 8 s), falling back to this old path otherwise.
-      // An id this daemon minted itself (logged:false above) is excluded from the hub's pending list: old path.
-      const route = hub && senderMsgId != null && btccMsgId === senderMsgId
-        ? hub.doorbell(senderMsgId, chatId, notif) : 'old'
-      if (route === 'old') await dispatchInbound(chatId, notif)
-      res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ injected: true, active_sessions: activeServers.size, hub: route === 'hub' || route === 'dup-hub' }))
+      // WO-151: who may mark a message delivered for the dedupe with the Onsen path: a signed sender, a hop BTCC or the oncall receiver vouches for,
+      // or a holder of the inject token. An unsigned caller without the token never records a key, so it cannot suppress a genuine message.
+      const trusted = verdict.verified || FORWARDERS.has(verdict.relay) || tokenOk
+      const out = await deliverInbound(body, verdict, { holdUnsigned, trusted, src: 'inject' })
+      res.writeHead(out.code, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(out.json))
       return
     }
 
@@ -5136,6 +5238,7 @@ function startListen(): void {
     void checkVersion().then(() => log('info', versionLine())).catch(() => {})
     // Hub sync (1.33.0): boot sync. Off → hand any doorbell a previous process held to the old path, so turning
     // HUB_SYNC off never strands one.
+    if (onsenPuller) onsenPuller.start()          // WO-151 3a
     if (hub) void hub.start()
     else {
       if (INBOX_ONLY) log('info', `hub sync: off (${hubMode.why}) — 1.32.2 delivery path only`)
