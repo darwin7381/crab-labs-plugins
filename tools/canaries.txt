@@ -68,3 +68,6 @@ plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, 
 plugins/telegram-http/lanes-boundary.ts::export function mainSameMatterRefusal(
 plugins/telegram-http/lanes.ts::&& !tok.sameRefused?.length && !tok.mailHandoffWarned
 plugins/telegram-http/lanes-boundary.ts::process.env.LANES_MAIN_SAME_MATTER_P ?? 0.5
+plugins/telegram-http/onsen-status.ts::export class Registry implements StatusSource
+plugins/telegram-http/server.ts::const source: OnsenStatus.StatusSource = registry
+plugins/telegram-http/lanes.ts::export function claudePidOf(

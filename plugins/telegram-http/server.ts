@@ -387,6 +387,8 @@ function onsenIn(m: any, text: string, transcript?: string): void {
 // after the lanes are (the block after lanesInit below); null = recording off for this agent, or the agent-inbox daemon.
 let onsenFacts: OnsenStatus.DeliveryFacts | null = null
 let onsenStep3Stop: (() => void) | null = null
+/** Onsen 1.45.1: an MCP stream opened (sid, its GET): which claude process holds it (the status's not_connected check); null = recording off */
+let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
 const onsenAllow = { at: 0, ids: [] as string[] }
 /** Onsen step 3: Joey's Telegram message behind these meta (a sender on the DM allowlist, a chat, a message id), or null. The allowlist is read at most
@@ -4272,8 +4274,10 @@ if (Lanes.LANES_ON) {
 //              lanes off: the channel notification was written into an open session stream (recordDelivery, the roamer's send)
 //   turn_end   lanes on: M1 `done` at the main's Stop, written once the turn stayed closed 60 s (or at the next prompt); a lane run's exit;
 //              lanes off: the transcript's turn_duration after the record that took it in (TurnWatch)
-//   status     lanes on: the main's M2 row (+ its hook events: PreCompact, Agent calls); lanes off: an open session stream and the transcript's turns.
-//              Both: the usage-wall state (usage-wall.ts) for walled.
+//   status     1.45.1: the state is Claude Code's own session registry's (onsen-status.ts Registry, the StatusSource): offline (no registration / pid gone
+//              / pid reused / no stream of it here) | idle | busy | waiting | stuck (busy, nothing written for ONSEN_STUCK_S). Detail only: lanes on, the
+//              main's M2 row and hook events (the tool, subagents, PreCompact, its own wall); lanes off, the transcript's turn; both, the usage-wall
+//              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000) })
   const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 5_000) })
@@ -4283,21 +4287,35 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick })
-  let streamAt = 0                                                      // lanes off: the last time a session had an open stream
+  // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
+  // (every open stream counts as the main's)
+  const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
+  onsenPeer = process.env.ONSEN_PEER_LOOKUP === '0' ? null : (sid, req) => streams.note(sid, Lanes.claudePidOf(req, HTTP_PORT!))
+  const claudeBin = process.env.ONSEN_CLAUDE_BIN || [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'].find(p => existsSync(p)) || 'claude'
+  const registry = new OnsenStatus.Registry({
+    dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
+    tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
+    connected: pid => streams.connected(pid), changed: kick, log: m => log('info', m),
+    // the documented read of the same registry, for the cross-check (start, every 10 min) and the fallback (every 10 s while the files disagree)
+    cli: () => new Promise(res => {
+      try { execFile(claudeBin, ['agents', '--json', '--cwd', AGENT_WORKSPACE_DIR], { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => res(err ? null : String(out))) }
+      catch { res(null) }
+    }),
+  })
+  const source: OnsenStatus.StatusSource = registry
   const compute = (): OnsenStatus.StatusView => {
     const w = wallReader.state()
-    const wall = w ? { walled: w.walled, until: w.resets_at, kind: w.kind } : null
-    if (tap) return OnsenStatus.statusOf(tap.inputs({ queuedJoey: Lanes.mainQueuedJoey(), wall }))
-    // lanes off: connected = a session's stream open now, or within 15 s (Claude Code's MCP reconnect closes the old stream before the new one opens)
-    if ([...sseOpen.values()].some(Boolean)) streamAt = Date.now()
-    return OnsenStatus.statusOf({ connected: streamAt > 0 && Date.now() - streamAt < 15_000, walled: wall?.walled ? { until: wall.until, kind: wall.kind } : null,
-      busy: watch?.busy() ?? null, queued_joey: facts.queued(watch?.watching() ? 'taken' : 'seen') })
+    const wall = w?.walled ? { walled: true, until: w.resets_at, kind: w.kind } : tap?.walled() ?? null
+    return OnsenStatus.statusOf(source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : facts.queued(watch?.watching() ? 'taken' : 'seen'), wall,
+      turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false }))
   }
+  registry.start()
   setInterval(() => { try { watch?.tick(); status.update(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop() }
-  onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', turn_end_settling: facts.pendingLater() })
-  log('info', `onsen: step 3 on (delivery facts and the main's status; ${tap ? 'lanes journal' : 'lanes off: session streams and the transcript'})`)
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop() }
+  onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
+    turn_end_settling: facts.pendingLater() })
+  log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
 }
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -4810,6 +4828,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // lanes: which claude process owns this session (socket → pid). Told only now that the SDK holds the stream (streamLive) and the client
         // is ready: a starting main becomes offerable at this point and not before, so its first offer is never written into a stream that drops it.
         if (Lanes.LANES_ON) { try { Lanes.noteMcpSocket(sessionId, req) } catch (e) { log('warn', `lanes: noteMcpSocket ${e}`) } }
+        if (onsenPeer) { try { onsenPeer(sessionId, req) } catch {} }       // Onsen 1.45.1: the claude process of this stream (lanes on: the lookup above, kept)
         let boundServer: Server | undefined
         for (const s of activeServers) {
           if (serverSessionId.get(s) === sessionId) { boundServer = s; break }

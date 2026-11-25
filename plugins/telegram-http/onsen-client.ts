@@ -13,7 +13,7 @@
 //     timeout, else through the spool in order; keeps the lines it drew in <STATE_DIR>/onsen/lines.json so the spool's answer respects them too;
 //     records edit_delivered (an edited message of Joey's reached the agent).
 //   - step 3 (WO-143): delivery facts (k 'd': delivered / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
-//     /status/batch) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
+//     /status/batch; 1.45.1: the registry's states and last_activity_at) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
 //     refused as a whole (an Onsen without those routes) goes to rejected.jsonl: the messages behind it are never held.
 // The credential (the agent's mesh credential, read from the agent-inbox daemon's state dir) is never logged, printed or written anywhere.
 
@@ -47,9 +47,10 @@ export type LocalLine = { chat: string; at: string; idem_key: string; client_msg
 export type DeliveryState = 'delivered' | 'seen' | 'turn_end'
 export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'; chat: string; client_msg_id: string; state: DeliveryState; at: string; by?: string
   detail?: Record<string, unknown> }
-/** step 3: the main's status (POST /status/batch): busy carries { turn_started_at, tool, subagents, queued_joey }; walled { until } */
-export type StatusState = 'idle' | 'busy' | 'gone' | 'walled' | 'compacting'
-export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown> }
+/** step 3: the main's status (POST /status/batch). 1.45.1: the state is Claude Code's own session registry's (onsen-status.ts statusOf); last_activity_at =
+ *  the newest write to the main's transcript or its subagents' (null = none found) */
+export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck'
+export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown>; last_activity_at?: string | null }
 type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact }
 const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's'])

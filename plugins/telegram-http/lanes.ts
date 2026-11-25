@@ -608,6 +608,19 @@ function callerClaudePid(req: IncomingMessage): number | null {
   return claude
 }
 
+/** Onsen 1.45.1, read only: the claude process at the other end of a request to this daemon (`port`: the daemon's), in either mode (lanes off too): the
+ *  same socket lookup as callerClaudePid, kept per connection (a second ask of a connection the lanes looked up already is free). null = not found */
+export function claudePidOf(req: IncomingMessage, port: number): number | null {
+  const sock = req.socket as object | undefined
+  const known = sock ? peerOfSocket.get(sock) : undefined
+  if (known) return known
+  const rp = req.socket?.remotePort
+  if (!rp) return null
+  const pid = PROC.peerPid(rp, port)
+  const claude = pid ? claudeAncestor(pid) : null
+  if (claude && sock) peerOfSocket.set(sock, claude)
+  return claude
+}
 /** server.ts calls this when an MCP session's SSE stream opens (req = that GET). */
 export function noteMcpSocket(sid: string, req: IncomingMessage): void {
   const pid = mcpSessionPid.get(sid) ?? callerClaudePid(req)

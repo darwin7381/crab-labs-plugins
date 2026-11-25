@@ -1,10 +1,13 @@
 // Onsen step 3 (WO-143) end to end: real Telegram daemons (server.ts) against the Bot API stand-in and a stand-in Onsen (a local HTTP server; nothing
 // reaches core.kbro.ai), in temp dirs (their HOME too). Facts only: what Joey sees on Telegram is not looked at here because nothing of it changes.
-//   lanes off: delivered when the daemon takes the message in (after its own record), seen when it is written into the session's stream, the main's
-//              turns read from its transcript (busy with the tool, turn_end at turn_duration), status gone → idle → busy → idle; /healthz counts
-//   lanes on:  delivered; no main registered: gone (the journal tap is attached and quiet)
+//   lanes off: delivered when the daemon takes the message in (after its own record), seen when it is written into the session's stream, turn_end at
+//              the transcript's turn_duration; 1.45.1: the status from Claude Code's session registry (a stand-in under the daemon's HOME): offline
+//              no_registration → not_connected → idle → busy (the transcript's tool as detail) → stuck → idle → waiting → offline pid_gone / pid_reused;
+//              last_activity_at; the latency from a registry write to the status line in the spool, measured; /healthz (the registry read and its check)
+//   lanes on:  delivered; no main registered: offline no_registration (the journal tap is attached and quiet)
 import { test, expect, afterAll, beforeAll } from 'bun:test'
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, chmodSync } from 'fs'
+import { spawnSync } from 'child_process'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
@@ -19,6 +22,7 @@ let api: BotApiMock, off: TgDaemon, on: TgDaemon, onsenPort: number
 let up: ReturnType<typeof Bun.serve> | null = null
 const got: Array<{ path: string; item: any; at: number; seq: number }> = []
 let seq = 0, next = 1
+const procs: any[] = []
 
 function startOnsen(): void {
   up = Bun.serve({ port: onsenPort, hostname: '127.0.0.1', async fetch(req) {
@@ -46,54 +50,110 @@ beforeAll(async () => {
   mkdirSync(join(root, 'cred'), { recursive: true })
   writeFileSync(join(root, 'cred', 'mesh-credential'), CRED + '\n')
   const env = { ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential') }
-  off = await startTgDaemon(api, join(root, 'off'), JOEY, { ...env, GENESIS_LANES: '0' })
+  // a stand-in `claude agents --json`: the registry files under the daemon's HOME, as the CLI prints them (shell shows as busy; --cwd: that folder and below)
+  writeFileSync(join(root, 'fake-agents.ts'), `import { readdirSync, readFileSync } from 'fs'
+const d = process.env.HOME + '/.claude/sessions', i = process.argv.indexOf('--cwd'), cwd = i > 0 ? process.argv[i + 1] : ''
+let a = []
+try { a = readdirSync(d).filter(n => n.endsWith('.json')).map(n => JSON.parse(readFileSync(d + '/' + n, 'utf8'))) } catch {}
+console.log(JSON.stringify(a.filter(e => !cwd || e.cwd === cwd || e.cwd.startsWith(cwd + '/')).map(e => ({ pid: e.pid, cwd: e.cwd, kind: e.kind, startedAt: e.startedAt,
+  sessionId: e.sessionId, name: e.name, status: e.status === 'shell' ? 'busy' : e.status }))))
+`)
+  writeFileSync(join(root, 'fake-claude'), `#!/bin/sh\nexec "${process.execPath}" "${join(root, 'fake-agents.ts')}" "$@"\n`)
+  chmodSync(join(root, 'fake-claude'), 0o755)
+  // the test's MCP client is not a claude process: the stream's peer lookup is off (every open stream counts as the main's; Streams is unit-tested)
+  off = await startTgDaemon(api, join(root, 'off'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: join(root, 'fake-claude') })
 }, 40000)
-afterAll(async () => { await off?.stop(); await on?.stop(); api?.stop(); up?.stop(true) })
+afterAll(async () => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } await off?.stop(); await on?.stop(); api?.stop(); up?.stop(true) })
 
-test('lanes off: delivered (after the message), seen when written into the stream, busy / turn_end from the transcript, the status, /healthz', async () => {
+test('lanes off: delivered (after the message), seen when written into the stream, turn_end from the transcript; the status from the registry; /healthz', async () => {
+  const sessions = join(off.home, '.claude', 'sessions')
+  const tdir = join(off.home, '.claude', 'projects', off.ws.replace(/[^a-zA-Z0-9]/g, '-'))
+  mkdirSync(sessions, { recursive: true }); mkdirSync(tdir, { recursive: true })
+  const last = () => statuses('adam').at(-1)
   expect(await until(() => statuses('adam').length > 0, 10000)).toBe(true)
-  expect(statuses('adam')[0]).toMatchObject({ state: 'gone', idem_key: expect.stringMatching(/^tg:adam:st:\d+:gone$/) })
+  expect(statuses('adam')[0]).toMatchObject({ state: 'offline', detail: { reason: 'no_registration' }, idem_key: expect.stringMatching(/^tg:adam:st:\d+:offline$/) })
+  expect('last_activity_at' in statuses('adam')[0]).toBe(true)
   // no session: the message is parked (delivered, not seen)
   api.push(dm(JOEY, 5001, '還沒有人在'))
   expect(await until(() => states(5001).includes('delivered'), 10000)).toBe(true)
   expect(facts(String(JOEY), 5001)[0]!.seq).toBeGreaterThan(msgSeq(5001))      // the message's own record first
   await Bun.sleep(300)
   expect(states(5001)).toEqual(['delivered'])
-  // a session opens: the parked message is written into its stream: seen by the main; status idle
+  // the main registers (Claude Code's registry file): it holds no stream here yet: offline not_connected
+  const main = Bun.spawn(['sleep', '600']); procs.push(main)
+  const lstart = (pid: number) => String(spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', env: { ...process.env, TZ: 'UTC' } }).stdout).trim()
+  const sid = randomUUID()
+  const regFile = (pid: number) => join(sessions, `${pid}.json`)
+  const reg = (o: Record<string, unknown> = {}, pid = main.pid) => writeFileSync(regFile(pid), JSON.stringify({ pid, sessionId: sid, cwd: off.ws, startedAt: Date.now(),
+    procStart: lstart(pid), version: '2.1.322', kind: 'interactive', entrypoint: 'cli', name: 'adam', status: 'idle', updatedAt: Date.now(), statusUpdatedAt: Date.now(), ...o }))
+  const tf = join(tdir, `${sid}.jsonl`)
+  writeFileSync(tf, '')
+  reg()
+  expect(await until(() => last()?.detail?.reason === 'not_connected', 10000)).toBe(true)
+  // a session opens: the parked message is written into its stream: seen by the main; idle (the registry's)
   const received: string[] = []
   const c = new Client({ name: 'onsen3-test', version: '0' }, { capabilities: {} })
   c.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') received.push(String((n.params as any)?.meta?.message_id ?? '')) }
   await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${off.port}/mcp`)))
   expect(await until(() => received.includes('5001'), 15000)).toBe(true)
   expect(await until(() => states(5001).includes('seen:main'), 10000)).toBe(true)
-  expect(await until(() => statuses('adam').at(-1)?.state === 'idle', 10000)).toBe(true)
-  // the main's transcript (the dir the daemon reads for receipts): the message taken in, a tool, then the turn's end
-  const tdir = join(off.home, '.claude', 'projects', off.ws.replace(/[^a-zA-Z0-9]/g, '-'))
-  mkdirSync(tdir, { recursive: true })
-  const tf = join(tdir, `${randomUUID()}.jsonl`)
-  const now = () => new Date().toISOString()
-  writeFileSync(tf, JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="5001" user="joey" user_id="${JOEY}" ts="x">\n還沒有人在\n</channel>` }, timestamp: now() }) + '\n'
-    + JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }] }, timestamp: now() }) + '\n')
-  expect(await until(() => statuses('adam').at(-1)?.state === 'busy', 20000)).toBe(true)
-  expect(statuses('adam').at(-1)!.detail).toMatchObject({ tool: { name: 'Bash' }, subagents: 0, queued_joey: 0 })
-  expect(typeof statuses('adam').at(-1)!.detail.turn_started_at).toBe('string')
-  appendFileSync(tf, JSON.stringify({ type: 'system', subtype: 'turn_duration', durationMs: 1200, timestamp: now() }) + '\n')
+  expect(await until(() => last()?.state === 'idle', 10000)).toBe(true)
+  // the latency: a registry write → the status line in the daemon's spool (a state change is written at once)
+  const spool = join(off.stateDir, 'onsen', 'spool.jsonl')
+  const spoolStates = () => existsSync(spool) ? readFileSync(spool, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(l => l.k === 's').map(l => l.r.state) : []
+  const lat: number[] = []
+  for (const st of ['busy', 'idle', 'waiting', 'idle', 'busy']) {
+    const n = spoolStates().length, t0 = performance.now()
+    reg({ status: st, ...(st === 'waiting' ? { waitingFor: 'permission prompt' } : {}) })
+    while (!(spoolStates().length > n && spoolStates().at(-1) === st) && performance.now() - t0 < 5000) await Bun.sleep(3)   // read every 3 ms
+    expect(spoolStates().at(-1)).toBe(st)
+    lat.push(performance.now() - t0)
+    await Bun.sleep(100)
+  }
+  console.log(`registry write → status line in the spool (ms): ${lat.map(x => x.toFixed(0)).join(', ')}`)
+  expect(Math.max(...lat)).toBeLessThan(1000)
+  expect(await until(() => statuses('adam').some(s => s.state === 'waiting' && s.detail?.waitingFor === 'permission prompt'), 10000)).toBe(true)
+  // busy: the transcript's turn rides as detail (the tool, since); last_activity_at = the transcript's last write
+  writeFileSync(tf, JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="5001" user="joey" user_id="${JOEY}" ts="x">\n還沒有人在\n</channel>` }, timestamp: new Date().toISOString() }) + '\n'
+    + JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }] }, timestamp: new Date().toISOString() }) + '\n')
+  expect(await until(() => last()?.state === 'busy' && last()?.detail?.tool?.name === 'Bash', 20000)).toBe(true)
+  expect(last()!.detail).toMatchObject({ subagents: 0, queued_joey: 0 })
+  expect(typeof last()!.detail.tool.since).toBe('string')
+  const { statSync } = await import('fs')
+  expect(await until(() => Math.abs(Date.parse(last()?.last_activity_at ?? '') - statSync(tf).mtimeMs) < 2, 10000)).toBe(true)
+  // nothing written for longer than ONSEN_STUCK_S (600 s) while busy: stuck
+  const old = new Date(Date.now() - 20 * 60_000)
+  utimesSync(tf, old, old)
+  expect(await until(() => last()?.state === 'stuck', 10000)).toBe(true)
+  expect(last()!.detail).toMatchObject({ threshold_s: 600 })
+  expect(Math.abs(Date.parse(last()!.last_activity_at) - old.getTime())).toBeLessThan(1000)
+  // the turn ends (turn_duration) and the registry says idle: turn_end, idle
+  appendFileSync(tf, JSON.stringify({ type: 'system', subtype: 'turn_duration', durationMs: 1200, timestamp: new Date().toISOString() }) + '\n')
+  reg({ status: 'idle' })
   expect(await until(() => states(5001).includes('turn_end:main'), 15000)).toBe(true)
   expect(states(5001)).toEqual(['delivered', 'seen:main', 'turn_end:main'])
-  expect(await until(() => statuses('adam').at(-1)?.state === 'idle', 10000)).toBe(true)
+  expect(await until(() => last()?.state === 'idle', 10000)).toBe(true)
+  // the process is gone (its file left behind): pid_gone; a pid that lives but started at another time: pid_reused
+  main.kill('SIGKILL'); await main.exited
+  expect(await until(() => last()?.detail?.reason === 'pid_gone', 10000)).toBe(true)
+  rmSync(regFile(main.pid))
+  const other = Bun.spawn(['sleep', '600']); procs.push(other)
+  reg({ procStart: 'Mon Jan  1 00:00:00 2024' }, other.pid)
+  expect(await until(() => last()?.detail?.reason === 'pid_reused', 10000)).toBe(true)
   // a stranger's message (not on the allowlist) gets no facts
   api.push(dm(4242, 5002, 'stranger'))
   await Bun.sleep(1500)
   expect(facts('4242', 5002)).toEqual([])
   const h = await fetch(`http://127.0.0.1:${off.port}/healthz`).then(r => r.json()) as any
   expect(h.onsen).toMatchObject({ record: true, deliveries_recorded: 3, pending_bytes: 0 })
-  expect(h.onsen.status_recorded).toBeGreaterThanOrEqual(4)
-  expect(h.onsen.status).toMatchObject({ state: 'idle', mode: 'transcript' })
+  expect(h.onsen.status_recorded).toBeGreaterThanOrEqual(8)
+  expect(h.onsen.status).toMatchObject({ state: 'offline', mode: 'transcript', registry: { via: 'files', check: { agree: true } } })
+  expect(off.log()).toContain('onsen: step 3 on')
   expect(off.log()).not.toContain(CRED)
   await c.close()
-}, 90000)
+}, 120000)
 
-test('lanes on: delivered after the message; no main registered: gone; the tap is attached (the journal writes go on)', async () => {
+test('lanes on: delivered after the message; no main registered: offline no_registration; the tap is attached (the journal writes go on)', async () => {
   const root = mkdtempSync(join(tmpdir(), 'onsen3-daemon-on-'))
   mkdirSync(join(root, 'cred'), { recursive: true })
   writeFileSync(join(root, 'cred', 'mesh-credential'), CRED + '\n')
@@ -102,13 +162,13 @@ test('lanes on: delivered after the message; no main registered: gone; the tap i
     on = await startTgDaemon(api2, root, JOEY, { ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'),
       LANES_AGENT: 'eve', AGENT_INBOX_SELF: 'eve' })
     expect(await until(() => statuses('eve').length > 0, 10000)).toBe(true)
-    expect(statuses('eve')[0]).toMatchObject({ state: 'gone' })
+    expect(statuses('eve')[0]).toMatchObject({ state: 'offline', detail: { reason: 'no_registration' } })
     api2.push(dm(JOEY, 6001, '主線不在'))
     expect(await until(() => got.some(g => g.path === '/deliveries/batch' && g.item.agent === 'eve' && g.item.client_msg_id === '6001'), 10000)).toBe(true)
     const d = got.filter(g => g.path === '/deliveries/batch' && g.item.agent === 'eve' && g.item.client_msg_id === '6001')
     expect(d.map(g => g.item.state)).toEqual(['delivered'])
     expect(d[0]!.seq).toBeGreaterThan(got.find(g => g.path === '/messages/batch' && g.item.agent === 'eve' && g.item.client_msg_id === '6001')!.seq)
     const h = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
-    expect(h.onsen.status).toMatchObject({ state: 'gone', mode: 'lanes' })
+    expect(h.onsen.status).toMatchObject({ state: 'offline', mode: 'lanes' })
   } finally { await on?.stop(); api2.stop() }
 }, 60000)

@@ -2,13 +2,18 @@
 //
 //   DeliveryFacts  delivered / seen / turn_end of each of Joey's messages (one per message and state; the first recipient wins at Onsen), spooled through
 //                  OnsenClient.recordDelivery behind the message's own record.
-//   StatusFacts    the main's status (idle / busy / gone / walled / compacting): every state change at once; while the state stays, a detail change (busy: the
-//                  tool, the subagent count, Joey's queued messages) at most once per 5 s, always the latest (a trailing write).
-//   LanesTap       lanes on: reads the lanes journal (M1 items, the main's M2 row, lane runs) and the main's hook events; it changes nothing in them.
+//   StatusFacts    the main's status: every state change at once; while the state stays, a change of the detail or of last_activity_at at most once per 5 s,
+//                  always the latest (a trailing write).
+//   statusOf       1.45.1: the one rule that turns a source's inputs into the status: offline / idle / busy / waiting / stuck.
+//   Registry       1.45.1, the source of the state (a StatusSource): Claude Code's own session registry (~/.claude/sessions/<pid>.json, what
+//                  `claude agents --json` reads), checked against that CLI at start and every 10 min; the CLI is read instead when they disagree.
+//   LanesTap       lanes on: reads the lanes journal (M1 items, the main's M2 row, lane runs) and the main's hook events; it changes nothing in them. For the
+//                  status it gives detail only (the tool, the subagent count, a compaction, the main's own wall).
 //   TurnWatch      lanes off: no hook reaches the daemon, so the main's turns are read from its transcript (turn_duration ends a turn; tool_use / tool_result
-//                  open and close tools), the file the daemon already reads for receipts.
-import { closeSync, openSync, readdirSync, readSync, statSync } from 'fs'
-import { join } from 'path'
+//                  open and close tools), the file the daemon already reads for receipts. For the status: detail only.
+import { spawnSync } from 'child_process'
+import { closeSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, watch, type FSWatcher } from 'fs'
+import { basename, join } from 'path'
 import { idemDelivery, idemStatus, type DeliveryFact, type DeliveryState, type StatusFact, type StatusState } from './onsen-client.ts'
 import type { Row } from './lanes-state.ts'
 
@@ -98,17 +103,39 @@ export class DeliveryFacts {
 }
 
 // ------------------------------------------------------------------ status
-export type StatusView = { state: StatusState; detail?: Record<string, unknown> }
+/** 1.45.1: the main's status. The state is Claude Code's own (its session registry, through a StatusSource); what the hooks (lanes on) or the transcript
+ *  (lanes off) see of the turn, the usage wall, a compaction and Joey's held messages ride as detail only. */
+export type StatusView = { state: StatusState; detail?: Record<string, unknown>; last_activity_at?: string | null }
 export type BusyInput = { turn_started_at: string | null; tool: { name: string; started_at: string | null } | null; subagents: number }
-export type StatusInputs = { connected: boolean; starting?: boolean; walled?: { until: string | null; kind?: string | null } | null; compacting?: boolean
-  busy?: BusyInput | null; queued_joey: number }
-/** one rule for both modes: gone (no main session connected) > walled (usage limit) > compacting > busy > idle */
-export function statusOf(i: StatusInputs): StatusView {
-  if (!i.connected) return i.starting ? { state: 'gone', detail: { starting: true } } : { state: 'gone' }
-  if (i.walled) return { state: 'walled', detail: { until: i.walled.until ?? null, ...(i.walled.kind ? { kind: i.walled.kind } : {}) } }
-  if (i.compacting) return { state: 'compacting' }
-  if (i.busy) return { state: 'busy', detail: { turn_started_at: i.busy.turn_started_at, tool: i.busy.tool, subagents: i.busy.subagents, queued_joey: i.queued_joey } }
-  return { state: 'idle' }
+export type OfflineReason = 'no_registration' | 'pid_gone' | 'pid_reused' | 'not_connected'
+/** what the daemon knows beside the source (detail only): the usage wall (or the lanes main's own), Joey's messages it holds, the turn, a compaction */
+export type StatusShared = { queuedJoey: number; wall: { walled: boolean; until: string | null; kind: string | null } | null; turn?: BusyInput | null; compacting?: boolean }
+/** what a source says: the main's own state (null = offline, `offline` says why), the newest write to its transcripts, and the shared detail */
+export type StatusInputs = { main: { status: string; waiting_for?: string | null } | null; offline?: OfflineReason; last_activity_at: string | null
+  queued_joey: number; walled?: { until: string | null; kind?: string | null } | null; compacting?: boolean; turn?: BusyInput | null }
+/** where the main's state comes from. A source reads one kind of evidence and fills StatusInputs; statusOf is the only judge. Registry is the one in use;
+ *  another (a terminal reader, herdr / moshi style) implements this and nothing else changes. */
+export interface StatusSource { inputs(shared: StatusShared): StatusInputs }
+/** stuck: the registry says busy and nothing was written to the main's transcripts for this long (ONSEN_STUCK_S, default 600 s; the value is Chiron's) */
+export const stuckS = (): number => { const n = Number(process.env.ONSEN_STUCK_S ?? 600); return Number.isFinite(n) && n > 0 ? n : 600 }
+
+/** the one rule. Registry status → state: (no main) offline {reason} | idle → idle | shell (out of a turn, a background shell runs) → idle
+ *  {background_shell} | waiting → waiting {waitingFor} | busy → busy, or stuck {threshold_s} when last_activity_at is older than the threshold | any other
+ *  value → busy {registry_status}. Every state's detail: queued_joey, walled {until, kind} and compacting when so; busy / waiting / stuck: the turn
+ *  (turn_started_at, tool {name, since}, subagents) when the hooks or the transcript show one */
+export function statusOf(i: StatusInputs, o: { now?: number; stuckS?: number } = {}): StatusView {
+  const extras = { queued_joey: i.queued_joey, ...(i.walled ? { walled: { until: i.walled.until ?? null, ...(i.walled.kind ? { kind: i.walled.kind } : {}) } } : {}),
+    ...(i.compacting ? { compacting: true } : {}) }
+  const turn = i.turn ? { turn_started_at: i.turn.turn_started_at, tool: i.turn.tool ? { name: i.turn.tool.name, since: i.turn.tool.started_at } : null, subagents: i.turn.subagents } : {}
+  const last = { last_activity_at: i.last_activity_at ?? null }
+  if (!i.main) return { state: 'offline', detail: { reason: i.offline ?? 'no_registration', ...extras }, ...last }
+  const st = i.main.status
+  if (st === 'idle' || st === 'shell') return { state: 'idle', detail: { ...(st === 'shell' ? { background_shell: true } : {}), ...extras }, ...last }
+  if (st === 'waiting') return { state: 'waiting', detail: { waitingFor: i.main.waiting_for ?? null, ...turn, ...extras }, ...last }
+  if (st !== 'busy') return { state: 'busy', detail: { registry_status: st, ...turn, ...extras }, ...last }
+  const lim = o.stuckS ?? stuckS(), t = i.last_activity_at ? Date.parse(i.last_activity_at) : NaN
+  if (Number.isFinite(t) && (o.now ?? Date.now()) - t > lim * 1000) return { state: 'stuck', detail: { threshold_s: lim, ...turn, ...extras }, ...last }
+  return { state: 'busy', detail: { ...turn, ...extras }, ...last }
 }
 
 export class StatusFacts {
@@ -117,9 +144,10 @@ export class StatusFacts {
   private timer: ReturnType<typeof setTimeout> | null = null
   constructor(readonly o: { agent: string; sink: (f: StatusFact) => void; throttleMs?: number; now?: Now }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
-  /** the status as the daemon sees it now: a state change is written at once; a detail change within the same state at most once per throttleMs (the latest) */
+  /** the status as the daemon sees it now: a state change is written at once; a change of the detail or last_activity_at within the same state at most
+   *  once per throttleMs (the latest) */
   update(v: StatusView): void {
-    const key = JSON.stringify(v.detail ?? null)
+    const key = JSON.stringify([v.detail ?? null, v.last_activity_at ?? null])
     if (!this.last || this.last.state !== v.state) return this.send(v, key)
     if (this.last.key === key) { this.pending = null; return }
     const wait = this.last.ms + (this.o.throttleMs ?? 5_000) - this.now()
@@ -135,7 +163,8 @@ export class StatusFacts {
     this.pending = null
     const ms = Math.max(this.now(), (this.last?.ms ?? 0) + 1)          // one idem key per write
     this.last = { state: v.state, key, ms }
-    try { this.o.sink({ idem_key: idemStatus(this.o.agent, ms, v.state), agent: this.o.agent, state: v.state, at: iso(ms), ...(v.detail ? { detail: v.detail } : {}) }) } catch {}
+    try { this.o.sink({ idem_key: idemStatus(this.o.agent, ms, v.state), agent: this.o.agent, state: v.state, at: iso(ms), ...(v.detail ? { detail: v.detail } : {}),
+      last_activity_at: v.last_activity_at ?? null }) } catch {}
   }
   current(): { state: StatusState; at: string } | null { return this.last ? { state: this.last.state, at: iso(this.last.ms) } : null }
   stop(): void { if (this.timer) clearTimeout(this.timer); this.timer = null; this.pending = null }
@@ -208,17 +237,19 @@ export class LanesTap {
     this.o.changed()
   }
 
-  inputs(o: { queuedJoey: number; wall: { walled: boolean; until: string | null; kind: string | null } | null }): StatusInputs {
+  /** 1.45.1, detail only: the main's turn as M2 and its hook events show it (null = M2 has it out of a turn) */
+  turnDetail(): BusyInput | null {
     const g = this.o.gen()
-    const st = String(g?.state ?? 'gone')
-    const connected = st === 'idle' || st === 'in_turn' || st === 'walled'
-    const walled = o.wall?.walled ? { until: o.wall.until, kind: o.wall.kind } : st === 'walled' ? { until: null, kind: g?.kind ? String(g.kind) : null } : null
-    const busy: BusyInput | null = st === 'in_turn' ? {
-      turn_started_at: this.turn && this.turn.prompt === String(g?.prompt_id ?? '') ? this.turn.at : null,
-      tool: g?.tool_open ? (this.tool?.name === g.tool_open ? this.tool : { name: String(g.tool_open), started_at: null }) : null,
-      subagents: this.subagents } : null
-    const compacting = this.compactingAt != null && this.now() - this.compactingAt < 15 * 60_000
-    return { connected, starting: st === 'starting', walled, compacting, busy, queued_joey: o.queuedJoey }
+    if (String(g?.state ?? '') !== 'in_turn') return null
+    return { turn_started_at: this.turn && this.turn.prompt === String(g?.prompt_id ?? '') ? this.turn.at : null,
+      tool: g?.tool_open ? (this.tool?.name === g.tool_open ? this.tool : { name: String(g.tool_open), started_at: null }) : null, subagents: this.subagents }
+  }
+  /** detail only: a PreCompact of the main, until its next hook event (at most 15 min) */
+  compacting(): boolean { return this.compactingAt != null && this.now() - this.compactingAt < 15 * 60_000 }
+  /** detail only: the main's own wall (M2 walled after an account-kind StopFailure; until unknown), or null */
+  walled(): { walled: true; until: null; kind: string | null } | null {
+    const g = this.o.gen()
+    return String(g?.state ?? '') === 'walled' ? { walled: true, until: null, kind: g?.kind ? String(g.kind) : null } : null
   }
 }
 
@@ -361,4 +392,234 @@ export function newestJsonl(dir: string): string | null {
     }
   } catch {}
   return best?.f ?? null
+}
+
+// ------------------------------------------------------------------ 1.45.1: the main's state from Claude Code's session registry
+// Claude Code keeps one file per live session, ~/.claude/sessions/<pid>.json (2.1.322: pid, sessionId, cwd, startedAt, procStart, kind, tmux, name, status
+// idle | busy | waiting | shell, waitingFor, statusUpdatedAt, updatedAt). `claude agents --json` is the documented read of the same registry
+// (code.claude.com/docs/en/agent-view, "read session state from a script"); it prints pid, cwd, kind, startedAt, sessionId, name, status, and shows `shell`
+// as `busy`. The daemon reads the files (a watch, and the status tick's 2 s read): spawning the CLI every few seconds in every daemon is too heavy. At start
+// and every 10 minutes the two are compared; when they disagree, or a file of this workspace has another shape, the CLI is read instead (every 10 s) until
+// a later comparison agrees again. Every switch is logged.
+export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number }
+/** the registry statuses statusOf knows */
+export const REG_STATUSES = new Set(['idle', 'busy', 'waiting', 'shell'])
+/** one registry record (a file, or an item of the CLI's array) in the shape 2.1.322 writes; null = not that shape */
+export function regEntry(j: any): RegEntry | null {
+  if (!j || typeof j !== 'object' || !Number.isInteger(j.pid) || j.pid <= 0) return null
+  for (const k of ['sessionId', 'cwd', 'kind', 'status']) if (typeof j[k] !== 'string') return null
+  return { pid: j.pid, sessionId: j.sessionId, cwd: j.cwd, kind: j.kind, status: j.status, ...(typeof j.waitingFor === 'string' ? { waitingFor: j.waitingFor } : {}),
+    ...(typeof j.procStart === 'string' ? { procStart: j.procStart } : {}), ...(typeof j.tmux === 'string' ? { tmux: j.tmux } : {}),
+    ...(typeof j.startedAt === 'number' ? { startedAt: j.startedAt } : {}) }
+}
+const realOf = (p: string): string => { try { return realpathSync(p) } catch { return p } }
+const samePath = (a: string, b: string): boolean => a === b || realOf(a) === realOf(b)
+/** this daemon's main among the registry's sessions: an interactive session (a lane's `claude -p` shares the folder) whose cwd is the workspace; in the
+ *  tmux session the channel bot drives when that is set (an entry that names a tmux pane); the main's session id when the lanes know it; else the newest
+ *  live one (startedAt) */
+export function pickMain(es: RegEntry[], o: { workspace: string; tmux?: string | null; sessionId?: string | null; alive?: (pid: number) => boolean }): RegEntry | null {
+  let c = es.filter(e => e.kind === 'interactive' && samePath(e.cwd, o.workspace))
+  if (o.tmux) c = c.filter(e => e.tmux === undefined || e.tmux.split(':')[0] === o.tmux)
+  if (o.sessionId) { const m = c.find(e => e.sessionId === o.sessionId); if (m) return m }
+  const live = o.alive ? c.filter(e => o.alive!(e.pid)) : c
+  return [...(live.length ? live : c)].sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0] ?? null
+}
+/** the files and the CLI describe the same sessions of this workspace (the files' `shell` is the CLI's `busy`; a dead pid's file left behind is not a
+ *  session); null = they agree, else what differs */
+export function compareRegistry(files: RegEntry[], cli: RegEntry[], workspace: string, alive: (pid: number) => boolean = pidAlive): string | null {
+  const mine = (e: RegEntry) => samePath(e.cwd, workspace)
+  const f = new Map(files.filter(e => mine(e) && alive(e.pid)).map(e => [e.pid, e])), c = new Map(cli.filter(mine).map(e => [e.pid, e]))
+  const pids = (m: Map<number, RegEntry>) => [...m.keys()].sort((a, b) => a - b).join(',')
+  if (pids(f) !== pids(c)) return `sessions differ: files [${pids(f)}], cli [${pids(c)}]`
+  for (const [pid, a] of f) {
+    const b = c.get(pid)!
+    if (a.sessionId !== b.sessionId || a.kind !== b.kind) return `pid ${pid}: session or kind differs`
+    if ((a.status === 'shell' ? 'busy' : a.status) !== b.status) return `pid ${pid}: status ${a.status} in the file, ${b.status} from the cli`
+    if (b.waitingFor !== undefined && a.waitingFor !== b.waitingFor) return `pid ${pid}: waitingFor differs`
+  }
+  return null
+}
+export function pidAlive(pid: number): boolean { try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' } }
+/** the process's start time as `ps` gives it in UTC (the registry's procStart is written the same way), or null */
+export function osProcStart(pid: number): string | null {
+  try {
+    const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 3_000, env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] })
+    const out = String(r.stdout ?? '').trim()
+    return r.status === 0 && out ? out : null
+  } catch { return null }
+}
+/** the same start time: the same text, or (another platform's wording) the same second within 2 s; text neither can read is not taken as different */
+export function sameStart(a: string, b: string): boolean {
+  const n = (s: string) => s.replace(/\s+/g, ' ').trim()
+  if (n(a) === n(b)) return true
+  const x = Date.parse(`${n(a)} UTC`), y = Date.parse(`${n(b)} UTC`)
+  return !(Number.isFinite(x) && Number.isFinite(y)) || Math.abs(x - y) <= 2_000
+}
+
+/** the claude processes this daemon has a stream with (offline not_connected). A stream's peer is looked up once (null = not found: counted as any pid,
+ *  not found is no proof of absence); a pid stays connected 15 s after its last open stream (Claude Code's MCP reconnect closes the old one first) */
+export class Streams {
+  private peer = new Map<string, number | null>()
+  private at = new Map<number, number>()
+  private anyAt = -Infinity
+  constructor(readonly o: { open: () => Iterable<[string, boolean]>; graceMs?: number; now?: Now }) {}
+  note(sid: string, pid: number | null): void { this.peer.set(sid, pid) }
+  connected(pid: number): boolean {
+    const now = (this.o.now ?? Date.now)(), open = new Set<string>()
+    for (const [sid, up] of this.o.open()) {
+      if (!up) continue
+      open.add(sid)
+      const p = this.peer.get(sid)
+      if (p == null) this.anyAt = now; else this.at.set(p, now)
+    }
+    for (const sid of [...this.peer.keys()]) if (!open.has(sid)) this.peer.delete(sid)
+    return now - Math.max(this.at.get(pid) ?? -Infinity, this.anyAt) < (this.o.graceMs ?? 15_000)
+  }
+}
+
+type Via = { via: 'files' | 'cli'; why: string; check: { at: string; agree: boolean; why: string | null } | null }
+export class Registry implements StatusSource {
+  private cache = new Map<string, { m: number; size: number; e: RegEntry | null; bad: boolean }>()
+  private v: Via = { via: 'files', why: '', check: null }
+  private cliRead: RegEntry[] = []
+  private watcher: FSWatcher | null = null
+  private timers: Array<ReturnType<typeof setInterval>> = []
+  private starts = new Map<number, { at: number; v: string | null }>()
+  private shapeTold = ''
+  private started = false
+  /** dir: the registry (~/.claude/sessions); workspace: AGENT_WORKSPACE_DIR; transcripts: the workspace's project dir (~/.claude/projects/<escaped>);
+   *  tmux: CHANNEL_BOT_TMUX_SESSION; sessionId: the lanes' main session id; connected: this daemon has a stream with that claude pid; cli: the output of
+   *  `claude agents --json --cwd <workspace>` (null = could not run); changed: a registry file changed (the watch) */
+  constructor(readonly o: { dir: string; workspace: string; transcripts: () => string | null; tmux?: string | null; sessionId?: () => string | null
+    connected: (pid: number) => boolean; cli?: () => Promise<string | null>; changed?: () => void; log?: (m: string) => void
+    alive?: (pid: number) => boolean; procStart?: (pid: number) => string | null; now?: Now; checkMs?: number; cliPollMs?: number; retryMs?: number }) {}
+  private now(): number { return (this.o.now ?? Date.now)() }
+  private alive(pid: number): boolean { return (this.o.alive ?? pidAlive)(pid) }
+  private log(m: string): void { try { this.o.log?.(m) } catch {} }
+
+  /** the watch on the registry dir, the comparison now and every 10 min, the CLI read every 10 s while it is the one in force */
+  start(): void {
+    this.started = true
+    this.watchDir()
+    void this.crossCheck()
+    this.timers.push(setInterval(() => { this.watchDir(); void this.crossCheck() }, this.o.checkMs ?? 600_000))
+    this.timers.push(setInterval(() => { if (this.v.via === 'cli') void this.readCli() }, this.o.cliPollMs ?? 10_000))
+    for (const t of this.timers) (t as any).unref?.()
+  }
+  stop(): void { this.started = false; for (const t of this.timers) clearInterval(t); this.timers = []; try { this.watcher?.close() } catch {}; this.watcher = null }
+  private watchDir(): void {
+    if (this.watcher) return
+    try {
+      this.watcher = watch(this.o.dir, (_ev, name) => { if (String(name ?? '').endsWith('.json')) { try { this.o.changed?.() } catch {} } })
+      this.watcher.on('error', () => { try { this.watcher?.close() } catch {}; this.watcher = null })
+    } catch { this.watcher = null }                                     // no dir yet: the 2 s read still runs and watches again (files)
+  }
+
+  /** the registry files now: a file is parsed again only when its mtime or size changed; one that is not JSON yet (written while read) keeps its last
+   *  reading. `bad`: files of this workspace in another shape */
+  files(): { entries: RegEntry[]; bad: string[] } {
+    const entries: RegEntry[] = [], bad: string[] = [], seen = new Set<string>()
+    if (this.started && !this.watcher) this.watchDir()                  // the dir appeared after start (a first session on this machine), or the watch failed
+    let names: string[] = []
+    try { names = readdirSync(this.o.dir).filter(n => /^\d+\.json$/.test(n)) } catch {}
+    for (const n of names) {
+      const f = join(this.o.dir, n)
+      seen.add(f)
+      let st: { mtimeMs: number; size: number }
+      try { st = statSync(f) } catch { continue }
+      let c = this.cache.get(f)
+      if (!c || c.m !== st.mtimeMs || c.size !== st.size) {
+        let j: any
+        try { j = JSON.parse(readFileSync(f, 'utf8')) } catch { if (c) entries.push(...(c.e ? [c.e] : [])); continue }
+        const e = regEntry(j)
+        const mine = typeof j?.cwd === 'string' && samePath(j.cwd, this.o.workspace)
+        c = { m: st.mtimeMs, size: st.size, e, bad: mine && (!e || !REG_STATUSES.has(e.status) || (e.kind === 'interactive' && typeof j.procStart !== 'string')) }
+        this.cache.set(f, c)
+      }
+      if (c.e) entries.push(c.e)
+      if (c.bad) bad.push(n)
+    }
+    for (const f of [...this.cache.keys()]) if (!seen.has(f)) this.cache.delete(f)
+    return { entries, bad }
+  }
+  /** the reading in force: the files, or (they disagreed with the CLI, or changed shape) the CLI's last answer */
+  entries(): RegEntry[] {
+    if (this.v.via === 'cli') return this.cliRead
+    const r = this.files()
+    if (r.bad.length) {
+      const key = r.bad.sort().join(',')
+      if (this.shapeTold !== key) { this.shapeTold = key; this.log(`onsen: registry file(s) ${key} of this workspace are not in the known shape: reading \`claude agents --json\` instead`) }
+      this.v = { ...this.v, via: 'cli', why: `registry file shape: ${key}` }
+      void this.readCli()
+      return this.cliRead
+    }
+    return r.entries
+  }
+  private async cliEntries(): Promise<RegEntry[] | null> {
+    const out = await (this.o.cli?.() ?? Promise.resolve(null)).catch(() => null)
+    if (out == null) return null
+    try { const a = JSON.parse(out); return Array.isArray(a) ? a.map(regEntry).filter((e): e is RegEntry => !!e) : null } catch { return null }
+  }
+  private async readCli(): Promise<void> {
+    const e = await this.cliEntries()
+    if (e) { this.cliRead = e; try { this.o.changed?.() } catch {} }
+  }
+  /** files vs CLI. A status can change between the two reads: a difference is read again once (retryMs) before it counts. The CLI unavailable: nothing
+   *  to compare, the reading stays as it is */
+  async crossCheck(): Promise<Via['check']> {
+    let why: string | null = null
+    for (let i = 0; i < 2; i++) {
+      const cli = await this.cliEntries()
+      if (!cli) { this.log('onsen: `claude agents --json` did not answer: the registry files are not cross-checked this time'); return this.v.check }
+      const f = this.files()
+      why = f.bad.length ? `registry file shape: ${f.bad.sort().join(',')}` : compareRegistry(f.entries, cli, this.o.workspace, p => this.alive(p))
+      if (!why) break
+      this.cliRead = cli
+      if (i === 0) await new Promise(r => setTimeout(r, this.o.retryMs ?? 1_500))
+    }
+    const was = this.v.via
+    this.v = { via: why ? 'cli' : 'files', why: why ?? '', check: { at: iso(this.now()), agree: !why, why } }
+    if (was !== this.v.via) this.log(why ? `onsen: the registry files disagree with \`claude agents --json\` (${why}): the CLI is read instead (every 10 s)`
+      : 'onsen: the registry files agree with `claude agents --json` again: the files are read')
+    else if (why) this.log(`onsen: registry cross-check: still disagree (${why})`)
+    if (why) { this.shapeTold = ''; try { this.o.changed?.() } catch {} }
+    return this.v.check
+  }
+  mode(): Via { return this.v }
+
+  main(): RegEntry | null {
+    return pickMain(this.entries(), { workspace: this.o.workspace, tmux: this.o.tmux ?? null, sessionId: this.o.sessionId?.() ?? null, alive: p => this.alive(p) })
+  }
+  /** the OS start time of `pid`, read at most every 30 s */
+  private startOf(pid: number): string | null {
+    const c = this.starts.get(pid), now = this.now()
+    if (c && now - c.at < 30_000) return c.v
+    const v = (this.o.procStart ?? osProcStart)(pid)
+    this.starts.set(pid, { at: now, v })
+    if (this.starts.size > 50) this.starts.delete(this.starts.keys().next().value!)
+    return v
+  }
+  /** the newest write to the main's transcript (<sessionId>.jsonl; without a session: the newest transcript of the workspace) and its subagents'
+   *  (<sessionId>/subagents/*.jsonl, where 2.1.322 writes them; an older Claude Code wrote sidechains into the main file), ISO; null = none found */
+  lastActivity(sid: string | null): string | null {
+    const dir = this.o.transcripts()
+    if (!dir) return null
+    const f = sid ? join(dir, `${sid}.jsonl`) : newestJsonl(dir)
+    if (!f) return null
+    let m = 0
+    try { m = statSync(f).mtimeMs } catch {}
+    const sub = join(dir, basename(f, '.jsonl'), 'subagents')
+    try { for (const n of readdirSync(sub)) if (n.endsWith('.jsonl')) { try { m = Math.max(m, statSync(join(sub, n)).mtimeMs) } catch {} } } catch {}
+    return m > 0 ? iso(m) : null
+  }
+  inputs(s: StatusShared): StatusInputs {
+    const base = { queued_joey: s.queuedJoey, walled: s.wall?.walled ? { until: s.wall.until, kind: s.wall.kind } : null, compacting: !!s.compacting, turn: s.turn ?? null }
+    const e = this.main()
+    const off = (why: OfflineReason): StatusInputs => ({ main: null, offline: why, last_activity_at: this.lastActivity(e?.sessionId ?? this.o.sessionId?.() ?? null), ...base })
+    if (!e) return off('no_registration')
+    if (!this.alive(e.pid)) return off('pid_gone')
+    if (e.procStart) { const os = this.startOf(e.pid); if (os && !sameStart(os, e.procStart)) return off('pid_reused') }
+    if (!this.o.connected(e.pid)) return off('not_connected')
+    return { main: { status: e.status, waiting_for: e.waitingFor ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
+  }
 }
