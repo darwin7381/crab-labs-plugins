@@ -1619,9 +1619,18 @@ ${text}`
 const SEND_MAX_CHARS = 3500
 
 // ---- fleet mail (WO-91): the `fleet` MCP server's BTCC calls, signed with this agent's credential ----
+// WO-160: the mail itself lives in Onsen (Fleet Core /api/onsen/mail/*, the same 13 endpoints and shapes as BTCC's /api/mesh/mail/*, Onsen 0.11.0).
+// MAIL_ONSEN=1 (machine config) sends every mailbox call there; unset or 0 = BTCC as before (the stop switch). Read at start.
+const MAIL_ONSEN = (process.env.MAIL_ONSEN ?? '') === '1'
+function mailUrl(path: string): string | null {
+  if (MAIL_ONSEN && path.startsWith('/api/mesh/mail')) return `${(process.env.FLEET_CORE_BASE ?? 'https://core.kbro.ai').replace(/\/+$/, '')}/api/onsen/mail${path.slice('/api/mesh/mail'.length)}`
+  return BTCC_API_BASE ? `${BTCC_API_BASE}${path}` : null
+}
+log('info', `mail: ${MAIL_ONSEN ? 'Onsen (/api/onsen/mail, MAIL_ONSEN=1)' : 'BTCC (/api/mesh/mail)'}`)
 async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): Promise<{ status: number; json: any }> {
-  if (!BTCC_API_BASE) return { status: 503, json: { detail: 'BTCC_API_BASE is not configured on this machine' } }
-  const r = await fetch(`${BTCC_API_BASE}${path}`, {
+  const url = mailUrl(path)
+  if (!url) return { status: 503, json: { detail: 'BTCC_API_BASE is not configured on this machine' } }
+  const r = await fetch(url, {
     method,
     headers: { 'Content-Type': 'application/json', 'User-Agent': `agent-inbox/${INBOX_SELF}`, ...meshAuth() },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -2540,9 +2549,10 @@ if (isControlEnabled() || isRoamerEnabled()) {
       let cred = ''
       try { cred = readFileSync(DUTY_CREDENTIAL, 'utf8').trim() } catch {}
       if (!cred) return 'no duty-officer credential on this machine'
-      if (!BTCC_API_BASE) return 'BTCC_API_BASE is not configured on this machine'
+      const url = mailUrl('/api/mesh/mail/send')
+      if (!url) return 'BTCC_API_BASE is not configured on this machine'
       try {
-        const r = await fetch(`${BTCC_API_BASE}/api/mesh/mail/send`, {
+        const r = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'User-Agent': 'duty-officer', Authorization: `Bearer ${cred}` },
           body: JSON.stringify({ to: to || DUTY_RULINGS_TO, title, body, no_reply: true }),

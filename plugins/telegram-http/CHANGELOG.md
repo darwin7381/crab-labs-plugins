@@ -1,3 +1,7 @@
+## 1.54.0 — 2026-11-25
+
+- **The mail itself can live in Onsen** (board WO-160; Joey TG chiron:2160–2185, 2422). `MAIL_ONSEN=1` (machine config) sends every mailbox call — `send_to_agent` line=mail, `mailbox_list` / `open` / `check` / `reply` / `decide` / `card`, `mail_sent`, lane items, the due list, counts, the duty officer's rulings — to Fleet Core `/api/onsen/mail/*` (Onsen 0.11.0: the same 13 endpoints and shapes as BTCC's `/api/mesh/mail/*`), with the agent's own mesh credential. Unset or 0 = BTCC as before (the stop switch). The daemon logs which one at start. No text an agent reads changes.
+
 ## 1.53.0 — 2026-11-25
 
 - **Joey talks to an agent from Onsen** (board WO-159; Joey TG chiron:2160–2185, 2422). Onsen 0.10.0 `POST /api/onsen/say` queues his message on the forms inbox as a `say` item; the telegram daemon takes it like a page answer and hands it to the session as his message: the same tag as a page answer with `via="onsen"`, `user`/`user_id` his, the text exactly as he typed it (no form title, nothing added). Lanes route it like a page answer (to the main, rule `onsen`, source telegram from Joey). His Telegram chat gets a silent echo `〔你在 Onsen 傳的〕` + the text. Delivery facts keyed `form-<Onsen message id>` as for page answers. Tests: onsen-visible-lanes, onsen-visible.
