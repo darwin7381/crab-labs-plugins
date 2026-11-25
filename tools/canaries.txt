@@ -91,3 +91,11 @@ plugins/telegram-http/lanes-boundary.ts::export const refusalHoldOn
 plugins/telegram-http/lanes.ts::function mainNewest(
 plugins/telegram-http/lanes-main.ts::openTools.set(g.id,
 plugins/telegram-http/lanes.ts::S.main_reply = { text: clip(text.trim(), 300), at: nowIso() }
+# WO-148 lab fixes (telegram-http 1.50.0): Joey's lines by direction, the open tool's input reaches main_doing, a matter already carded is not held
+plugins/telegram-http/onsen-client.ts::export function noteInbound(
+plugins/telegram-http/lanes.ts::const human = inbound?.size ? (r: ChatRow): boolean => inbound.has(r.key)
+plugins/telegram-http/lanes.ts::cut: MAIN_CHAT_CUT, inbound })
+plugins/telegram-http/lanes-hooks/main-hook.py::body['tool_brief'] = b
+plugins/telegram-http/lanes-main.ts::input: b.tool_brief ?? b.tool_input ?? null
+plugins/telegram-http/lanes.ts::function matterWithMain(
+plugins/telegram-http/lanes.ts::const has = phrase ? matterWithMain(tok, lane, phrase) : null

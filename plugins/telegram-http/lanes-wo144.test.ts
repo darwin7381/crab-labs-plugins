@@ -134,7 +134,8 @@ describe('part 1: the router', () => {
     const q = onsen.calls.find(c => c.path.startsWith('/messages?'))!
     expect(q.via).toBe('hook'); expect(q.auth).toBe(`Bearer ${CRED}`)
     expect(Object.fromEntries(new URL(`https://x${q.path}`).searchParams)).toEqual({ agent: AGENT, limit: '60', chat: JOEY })   // WO-148: a window of 60 to choose from
-    expect(depCalls.at(-1)).toEqual({ a: { limit: 60 }, o: { timeoutMs: 2100, cut: 100 } })
+    expect(depCalls.at(-1)).toEqual({ a: { limit: 60 }, o: { timeoutMs: 2100, cut: 100, inbound: expect.any(Set) } })
+    expect([...depCalls.at(-1)!.o.inbound]).toEqual(['tg:2204', 'tg:2201'])                         // WO-148 lab: the query names the lines that came in (Joey's), by direction
     expect(r.spawn).toMatchObject({ main_chat: 'onsen', main_chat_n: 3 })
   }, 20000)
 
@@ -222,7 +223,7 @@ describe('part 1: the router', () => {
       expect(a.ms).toBeLessThan(1000 + 1500)                                                       // the timeout, with room for a loaded machine
       expect(blockOf(a.prompt)[1]).toMatch(/^（Onsen 1 秒內沒回應：以下是這個常駐程式本機暫存的紀錄/)
       expect(blockOf(a.prompt)[2]).toBe(`${hm(20)}｜Joey｜tg:20｜本機的一則`)
-      expect(depCalls.at(-1)!.o).toEqual({ timeoutMs: 700, cut: 100 })
+      expect(depCalls.at(-1)!.o).toMatchObject({ timeoutMs: 700, cut: 100 })
       reset(); depMode = 'never'
       const b = await run()
       expect(b.ms).toBeGreaterThanOrEqual(950)

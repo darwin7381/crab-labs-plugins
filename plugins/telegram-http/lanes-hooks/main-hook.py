@@ -9,6 +9,8 @@ every event to the tg daemon's /lanes/main-event (TELEGRAM_HTTP_PORT, the loopba
                 the reply gets) refuses a send that says the main did what its own tool results say it did not; else (002v) when the daemon
                 answers mark_no_reply (the turn took in the last message of a conversation the thread gate stopped, and this send goes to that
                 peer), the send runs with no_reply set (updatedInput)
+  PreToolUse    (every tool, WO-148 lab) tool_brief: the one input field that says what the call is about (brief()), for a long turn's 「在處理」;
+                the daemon masks secret-looking values before it shows or sends it. tool_input stays as it was (a btcc-receipt Bash, send_to_agent's line)
   PostToolUse   every tool's input (each string cut to 3000 chars) and result (text, cut to 20000 chars; tool_error) go to the daemon, which
                 keeps this turn's calls; it answers the items that reached the main during this turn (pulled at this tool boundary; additionalContext)
   Stop          items still queued are pulled (decision block); else, once per turn, a turn that still owes what it works on (the daemon's M3
@@ -74,6 +76,21 @@ def trim_input(i):
     return {k: (v[:3000] if isinstance(v, str) else v) for k, v in i.items()}
 
 
+# WO-148 lab: the input field a tool's call is about, in the order lanes.ts toolWhat reads them (the daemon masks the value there)
+BRIEF_KEYS = ('command', 'file_path', 'notebook_path', 'path', 'url', 'pattern', 'query', 'description', 'title', 'to', 'text', 'prompt')
+
+
+def brief(i):
+    """The first non-empty string field of BRIEF_KEYS, cut to 300 chars, as {key: value}; {} when there is none."""
+    if not isinstance(i, dict):
+        return {}
+    for k in BRIEF_KEYS:
+        v = i.get(k)
+        if isinstance(v, str) and v.strip():
+            return {k: v[:300]}
+    return {}
+
+
 def response_text(r):
     """The tool's result as text, cut to 20000 chars: a str as is, a dict with a 'content' list = the text of its parts, else its JSON."""
     if isinstance(r, str):
@@ -119,6 +136,10 @@ def main():
                 body['tool_timeout_ms'] = 120000
         if 'btcc-receipt' in str(ti.get('command') or ''):   # 002w (D): the daemon may refuse a second completion of a scheduler run
             body['tool_input'] = {'command': str(ti.get('command'))[:3000]}
+    if ev == 'PreToolUse':                               # WO-148 lab: what the open tool is about (the daemon's 「在處理」 of a long turn); tool_input is unchanged
+        b = brief(p.get('tool_input'))
+        if b:
+            body['tool_brief'] = b
     if ev == 'PreToolUse' and str(p.get('tool_name') or '').endswith('__send_to_agent'):   # 002v: the router may mark it (a stopped conversation)
         ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
         # lanes-golive (A5): the WO-99 line decides what ends a conversation (mail: no_reply; call: reply_to; feed has no `to`)

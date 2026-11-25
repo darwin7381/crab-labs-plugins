@@ -208,8 +208,9 @@ export interface LanesDeps {
   /** WO-153: form_close's answer (server.ts: onsen-tool.ts formClose, POST /forms/close); absent = Onsen recording off here, and lanes do not list the tool */
   formClose?: (args: Record<string, unknown>) => Promise<string>
   /** WO-144: chat_history's answer for a run's opening (server.ts: the same queryHistory, the default chat, counted as a hook's lookup), with the
-   *  opening's bounds: Onsen's timeout before the spool answers, the cut of each body. Absent = the block says （這一趟取不到） */
-  mainChat?: (a: { limit: number }, o: { timeoutMs: number; cut: number }) => Promise<string>
+   *  opening's bounds: Onsen's timeout before the spool answers, the cut of each body. Absent = the block says （這一趟取不到）. WO-148 lab: `inbound`, a set
+   *  the query fills with the keys of the listed messages that came in from a person (onsen-client.ts HistoryOpts.inbound) */
+  mainChat?: (a: { limit: number }, o: { timeoutMs: number; cut: number; inbound?: Set<string> }) => Promise<string>
 }
 /** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
  *  or put the menu in front of Joey again with a fresh debounce */
@@ -3457,12 +3458,13 @@ function mainDoing(g: Row, max = 80): string {
 export const mainDoingNewestOn = (): boolean => process.env.LANES_MAIN_DOING_NEWEST !== '0'
 export const mainDoingNewestMs = (): number => Math.max(0, num('LANES_MAIN_DOING_NEWEST_MIN', 10)) * 60_000
 /** a tool input's one line for 「在處理」: the field that says what the call is about, a secret-looking value masked */
-function toolWhat(input: any): string {
+export function toolWhat(input: any): string {
   if (!input || typeof input !== 'object') return ''
   for (const k of ['command', 'file_path', 'notebook_path', 'path', 'url', 'pattern', 'query', 'description', 'title', 'to', 'text', 'prompt']) {
     const v = input[k]
     if (typeof v === 'string' && v.trim()) return v.replace(/\s+/g, ' ').trim()
-      .replace(/(bearer\s+|authorization:\s*|(?:token|key|secret|password|passwd)\s*[=:]\s*)\S+/gi, '$1…').replace(/[A-Za-z0-9_\-]{32,}/g, '…')
+      .replace(/(authorization:\s*(?:bearer\s+|basic\s+)?|bearer\s+|(?:token|key|secret|password|passwd|api[_-]?key)\s*[=:]\s*)[^\s"']+/gi, '$1…')
+      .replace(/\b(?:sk|pk|rk|ghp|gho|xox[abps]|AIza|mesh)[-_][A-Za-z0-9_\-]{8,}/g, '…').replace(/[A-Za-z0-9_\-]{32,}/g, '…')
   }
   return ''
 }
@@ -3571,8 +3573,10 @@ function firstLineOf(r: ChatRow): string {
   const i = r.body.indexOf(' ⏎ ')
   return i < 0 ? r.line : `${r.head}${r.flags}${r.body.slice(0, i)}${CHAT_MORE}`
 }
-/** the block (title first) from chat_history's answer; null / anything that is not a list = （這一趟取不到） */
-export function mainChatBlock(answer: string | null | undefined): MainChat {
+/** the block (title first) from chat_history's answer; null / anything that is not a list = （這一趟取不到）. `inbound` (WO-148 lab): the keys of the listed
+ *  messages that came in from a person (the query fills it): those are the DM human's lines, whatever Onsen names the member (the bench's `joey-test`
+ *  showed as joey-test and the block had none of them). Empty or absent (a caller that cannot tell): chat_history's 「Joey」 */
+export function mainChatBlock(answer: string | null | undefined, inbound?: Set<string>): MainChat {
   const none: MainChat = { lines: [MAIN_CHAT_TITLE, MAIN_CHAT_NONE], from: 'none', n: 0 }
   if (!answer) return none
   const rows = String(answer).split('\n')
@@ -3584,11 +3588,13 @@ export function mainChatBlock(answer: string | null | undefined): MainChat {
   const msgs = rows.filter(r => CHAT_LINE.test(r)).map(chatRow)
   if (!msgs.length && local) return none                                        // Onsen silent and nothing in the spool: neither had it
   // WO-148: Joey's latest messages, each with the main's first reply (the first `main` line after it, before his next one); the main's latest messages.
-  // A system:* sender is shown as 系統 (whoOf) and is never picked; nor is a lane's or the router's line.
-  const joey = msgs.map((r, i) => ({ r, i })).filter(x => x.r.who === 'Joey')
+  // A system:* sender is shown as 系統 (whoOf) and is never picked; nor is a lane's or the router's line. Joey = the DM's human: a message that came in
+  // from a person (direction in), not a member name
+  const human = inbound?.size ? (r: ChatRow): boolean => inbound.has(r.key) : (r: ChatRow): boolean => r.who === 'Joey'
+  const joey = msgs.map((r, i) => ({ r, i })).filter(x => human(x.r))
   const pairs = joey.slice(-MAIN_CHAT_JOEY).map(({ i }) => {
     let reply: number | null = null
-    for (let j = i + 1; j < msgs.length && msgs[j].who !== 'Joey'; j++) if (msgs[j].who === 'main') { reply = j; break }
+    for (let j = i + 1; j < msgs.length && !human(msgs[j]); j++) if (msgs[j].who === 'main') { reply = j; break }
     return { joey: i, reply }
   })
   const latest = msgs.map((r, i) => ({ r, i })).filter(x => x.r.who === 'main').slice(-MAIN_CHAT_MAIN_LATEST).map(x => x.i)
@@ -3628,13 +3634,14 @@ export function chatForRun(lane: Lane, mc: MainChat | null): MainChat | null {
 export async function fetchMainChat(): Promise<MainChat> {
   if (!D?.mainChat) return mainChatBlock(null)
   const T = mainChatTimeoutMs()
+  const inbound = new Set<string>()                                              // WO-148 lab: the query fills it (the DM human's lines, by direction)
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const answer = await Promise.race([
-      Promise.resolve().then(() => D.mainChat!({ limit: MAIN_CHAT_WINDOW }, { timeoutMs: Math.max(50, Math.round(T * 0.7)), cut: MAIN_CHAT_CUT })).catch(() => null),
+      Promise.resolve().then(() => D.mainChat!({ limit: MAIN_CHAT_WINDOW }, { timeoutMs: Math.max(50, Math.round(T * 0.7)), cut: MAIN_CHAT_CUT, inbound })).catch(() => null),
       new Promise<null>(r => { timer = setTimeout(() => r(null), T); (timer as any).unref?.() }),
     ])
-    return mainChatBlock(answer)
+    return mainChatBlock(answer, inbound)
   } catch { return mainChatBlock(null) } finally { clearTimeout(timer) }
 }
 // the fetch happens before startRun (startRun stays synchronous): while a run's block is fetched, its lane and one slot are held (pump), so no other event
@@ -4989,6 +4996,7 @@ function claimExempt(e: Row | undefined): boolean {
 function ownerClaimWarning(tok: RunTok, e: Row | undefined, text: string, tool = 'notify_joey', key?: string): string | null {
   if (!e || tok.claimWarned || tok.decision || !claimsHandover(text)) return null      // WO-127: in a decision's run the main did decide: saying so is no false claim
   if (claimExempt(e)) return null
+  { const lane = S.lanes[tok.lane]; if (lane && matterWithMain(tok, lane, text)) return null }   // WO-148 lab: an earlier run's card or hand-over makes it true
   tok.claimWarned = true
   // WO-148 (item 2): the refusal holds: until ask_joey or a hand-over (handoff_main, decide_later, mailbox_card) in this run, this tool is refused again
   if (refusalHoldOn()) {
@@ -5015,6 +5023,31 @@ type HoldNeed = 'handoff' | 'handoff_or_ask' | 'mail_open' | 'steps'
 type Hold = { check: string; tools: string[]; key?: string; need: HoldNeed; again: string; steps?: string[]; at: string; n: number }
 /** the run handed the matter to the main: handoff_main (or wakeDeferred / addToMain), decide_later, a mailbox_card */
 const handedOff = (tok: RunTok): boolean => !!tok.handedOver || !!tok.parked || !!tok.cards?.length || !!tok.decideLater?.length
+/** WO-148 lab (point 3: mail #90004 had a decision card from an earlier run, yet 「這件的決定仍留給主線（#90004 決定卡在主線信箱）」 was refused and held, and
+ *  the main relayed the lane's 純知會 to Joey). The matter a sentence names already waits on the main from any run: the router's own records, read here.
+ *  A mail named in it (#N of a mail this run listed or opened, or one a card was ever put on: other numbers, an Onsen id, are not mails): every one has a
+ *  card still waiting (a Wait on an event record, not decided or checked off) or an owing hand-over whose text names #N. No mail named: the mails this run
+ *  opened, the same way; none opened: an owing hand-over of an earlier event of this lane's thread. Returns what it found (for the record), or null */
+function matterWithMain(tok: RunTok, lane: Lane, sentence: string): string | null {
+  if (!events) return null
+  const isMail = (id: number): boolean => !!tok.mailSeen?.[id] || events.rows(r => waitsOf(r).some(w => w.mail_id === id)).length > 0
+  const named = [...new Set([...String(sentence).matchAll(/#(\d{3,})(?!\d)/g)].map(m => Number(m[1])))].filter(isMail)
+  const mails = named.length ? named : Object.entries(tok.mailSeen ?? {}).filter(([, m]) => m.opened).map(([id]) => Number(id))
+  if (mails.length) {
+    const found = mails.map(id => mailWithMain(id))
+    return found.every(Boolean) ? found.join('; ') : null
+  }
+  const e = events.rows(r => r.thread === lane.thread && r.id !== tok.evId && ((r.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested'))).pop()
+  return e ? `hand-over of ${e.id} (thread ${lane.thread})` : null
+}
+/** mail #id waits on the main: a card not decided or checked off (on any event's record), or an owing hand-over whose text names it */
+function mailWithMain(id: number): string | null {
+  const c = events.rows(r => waitsOf(r).some(w => w.mail_id === id && pendingWait(w))).pop()
+  if (c) return `card on #${id} (${c.id})`
+  const re = new RegExp(`#${id}(?!\\d)`)
+  const h = events.rows(r => ((r.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested') && re.test(String(o.what ?? '')))).pop()
+  return h ? `hand-over naming #${id} (${h.id})` : null
+}
 /** the main has the event the run's line to Joey is about (main_ask's own exemption) */
 function mainHasOf(tok: RunTok): boolean {
   const e0 = events.get(joeyEventOf(tok)), obs0: Ob[] = (e0?.obligations ?? []) as Ob[]
@@ -5095,7 +5128,10 @@ async function joeyLine(tok: RunTok, lane: Lane, tool: 'notify_joey' | 'ask_joey
   const mainHas = mainHasOf(tok)
   if (boundaryCardOn() && !tok.mainAskWarned && !tok.claimWarned && !tok.handedOver && !tok.cards?.length && !tok.decision && !mainHas) {
     const phrase = mainAskPhrase(text)
-    if (phrase) {
+    // WO-148 lab (point 3, mail #90004): the matter the sentence names already waits on the main from an earlier run (a card, a hand-over): it is no claim
+    const has = phrase ? matterWithMain(tok, lane, phrase) : null
+    if (phrase && has) appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'main_ask_matter_with_main', run: tok.runId, event: tok.evId, tool, phrase, by: has })
+    if (phrase && !has) {
       tok.mainAskWarned = true; tok.claimWarned = true
       appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'main_ask_refused', run: tok.runId, event: tok.evId, tool, phrase })
       const holds = refusalHoldOn() && lane.kind !== 'fork'                // a fork cannot hand over (handoff_main is refused to it): once, as before

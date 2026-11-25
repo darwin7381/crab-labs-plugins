@@ -54,7 +54,7 @@ chmodSync(bin, 0o755)
 const restoreBin = L.__setClaudeBin(bin)
 
 // ------------------------------------------------------------------ the stand-in Onsen: GET /messages as fleet-core answers it (newest first, limit, the restart line)
-type Row = { id: number; at: string; sender: string; body: string; tg: number }
+type Row = { id: number; at: string; sender: string; body: string; tg: number; dir?: 'in' | 'out' }
 const onsen = { rows: [] as Row[], lines: [] as Array<{ id: number; at: string; chat: string }>, limits: [] as number[] }
 const json = (status: number, j: unknown) => new Response(JSON.stringify(j), { status, headers: { 'content-type': 'application/json' } })
 const fakeFetch = (async (input: any, init?: any) => {
@@ -66,7 +66,7 @@ const fakeFetch = (async (input: any, init?: any) => {
     const line = onsen.lines.at(-1) ?? null
     const all = onsen.rows.filter(r => !line || Date.parse(r.at) > Date.parse(line.at)).sort((a, b) => b.id - a.id)
     const rows = all.slice(0, limit)
-    return json(200, { messages: rows.map(r => ({ id: r.id, at: r.at, direction: r.sender === `tg:${JOEY}` ? 'in' : 'out', sender: r.sender, kind: 'text',
+    return json(200, { messages: rows.map(r => ({ id: r.id, at: r.at, direction: r.dir ?? (r.sender === `tg:${JOEY}` ? 'in' : 'out'), sender: r.sender, kind: 'text',
       body: [...r.body].length > 300 ? [...r.body].slice(0, 300).join('') : r.body, truncated: [...r.body].length > 300, edited: false, client_msg_id: String(r.tg),
       status: 'ok', chat: JOEY })), total: all.length, restart_line: line, restart_lines: line ? [line] : [], restart_line_applied: !!line })
   }
@@ -80,6 +80,8 @@ const OPEN: Record<number, string> = {
   91001: '#91001 來自 chiron｜盤點：meetings 三段標成 txmonster\n要你：在盤點裡把 meetings 三段標成 txmonster\n期限 —｜等了 2 分鐘｜車道讀過\n\nchiron：meetings 那三段已經搬到 txmonster，盤點裡請改一下。',
   91002: '#91002 來自 lynceus｜mock-api p95 回到 180ms\n要你：知道就好\n期限 —｜等了 1 分鐘｜車道讀過\n\nlynceus：mock-api p95 回到 180ms，已恢復。',
   91003: '#91003 來自 eve｜週報 W48 數字\n要你：看一下\n期限 —｜等了 0 分鐘｜車道讀過\n\neve：週報 W48 的數字補好了。',
+  91004: '#91004 來自 kairos｜要不要換 Haiku 6\n要你：決定要不要換\n期限 11-26 12:00Z｜等了 1 分鐘｜車道讀過\n\nkairos：Haiku 6 的價格表出來了，要不要換？',
+  91005: '#91005 來自 kairos｜補充 #91004：Haiku 6 價格表（純知會）\n要你：知道就好\n期限 —｜等了 0 分鐘｜車道讀過\n\nkairos：補充 #91004 的價格表，純知會。',
 }
 const LIST = '3 封未讀、0 封已讀還沒勾掉：\n#91001｜chiron｜盤點：meetings 三段標成 txmonster｜要你：改盤點｜期限 —｜等了 2 分鐘｜未讀\n'
   + '#91002｜lynceus｜mock-api p95 回到 180ms｜要你：知道就好｜期限 —｜等了 1 分鐘｜未讀\n#91003｜eve｜週報 W48 數字｜要你：看一下｜期限 —｜等了 0 分鐘｜未讀'
@@ -139,7 +141,7 @@ const T0 = Date.parse('2026-11-25T01:00:00Z')
 const at = (min: number) => new Date(T0 + min * 60_000).toISOString()
 const hm = (min: number) => { const d = new Date(T0 + min * 60_000); return `11-25 ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}Z` }
 let id = 0
-const put = (min: number, sender: string, body: string): Row => { const r = { id: ++id, at: at(min), sender, body, tg: 3000 + id }; onsen.rows.push(r); return r }
+const put = (min: number, sender: string, body: string, dir?: 'in' | 'out'): Row => { const r: Row = { id: ++id, at: at(min), sender, body, tg: 3000 + id, ...(dir ? { dir } : {}) }; onsen.rows.push(r); return r }
 const J = `tg:${JOEY}`
 const line = (r: Row, who: string, body = r.body) => `${hm((Date.parse(r.at) - T0) / 60_000)}｜${who}｜#${r.id} tg:${r.tg}｜${body}`
 
@@ -196,6 +198,22 @@ describe('1. the opening block', () => {
     expect(pairs.map(l => l.split('｜')[2])).toEqual(js.slice(7 - kept).flatMap((j, k) => [`#${j.id} tg:${j.tg}`, `#${rs[7 - kept + k].id} tg:${rs[7 - kept + k].tg}`]))
     for (const l of msgs) expect(l.endsWith('…（全文用 id 取）')).toBe(true)
   }, 20000)
+
+  test('WO-148 lab: Joey = the DM\'s human by direction: Onsen names him joey-test (the bench) or the human is rosie: their lines are picked; an outbound line under another name is not; the spool path as before', async () => {
+    for (const who of ['joey-test', 'rosie']) {
+      onsen.rows = []; onsen.lines = []
+      const a = put(0, who, 'C1-甲：先查 mock-api', 'in'), ra = put(1, 'main', '收到甲')
+      put(1.5, 'eve', '（一則 out 列，不是人說的）', 'out')
+      const b = put(2, who, 'C1-乙：再查一次', 'in'), rb = put(3, 'main', '收到乙')
+      expect(blockOf((await run()).prompt)).toEqual([L.MAIN_CHAT_TITLE, line(a, who), line(ra, 'main'), line(b, who), line(rb, 'main')])
+      // 1.50.0 as the bench ran it (by the name 「Joey」, no direction): none of the human's lines, only the main's latest two
+      const answer = await oc.queryHistory({ limit: 60 }, 'hook', { cut: 100 })
+      expect(L.mainChatBlock(answer).lines).toEqual([L.MAIN_CHAT_TITLE, line(ra, 'main'), line(rb, 'main')])
+      const inbound = new Set<string>()
+      expect(L.mainChatBlock(await oc.queryHistory({ limit: 60 }, 'hook', { cut: 100, inbound }), inbound).lines).toEqual([L.MAIN_CHAT_TITLE, line(a, who), line(ra, 'main'), line(b, who), line(rb, 'main')])
+      expect([...inbound].sort()).toEqual([`tg:${a.tg}`, `tg:${b.tg}`])
+    }
+  }, 30000)
 
   test('Joey\'s restart line: nothing before it, its head line kept; a Joey message with no reply yet stands alone', async () => {
     onsen.rows = []; onsen.lines = []
@@ -284,11 +302,11 @@ describe('2. a refusal holds for the run', () => {
   test('LANES_REFUSAL_HOLD=0: as 1.49.0, the reworded line goes out', async () => {
     process.env.LANES_REFUSAL_HOLD = '0'
     try {
-      const tok = fakeRun('mail')
-      await L.callLaneTool(tok, 'mailbox_open', { id: 91001 })
-      const first = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '#91001 這件我沒做，留給主線。' })
+      const tok = fakeRun('mail')                                                                 // #91001 is with the main now (the test above handed it over): #91002
+      await L.callLaneTool(tok, 'mailbox_open', { id: 91002 })
+      const first = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '#91002 這件我沒做，留給主線。' })
       expect(first).toContain('不需要主線的：把那一句拿掉，再送一次。這個提醒一趟只有一次。')
-      expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '#91001 純知會。' })).toContain('sent to Joey')
+      expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: '#91002 純知會。' })).toContain('sent to Joey')
     } finally { delete process.env.LANES_REFUSAL_HOLD }
   })
 
@@ -338,8 +356,70 @@ describe('2. a refusal holds for the run', () => {
   })
 })
 
+describe('2b. a matter already with the main is no false claim (WO-148 lab, point 3)', () => {
+  test('an earlier run put a card on mail #91004; a new run says 「留給主線」 about #91004: not refused, not held, the line goes out; a mail with no card is still refused', async () => {
+    const a = fakeRun('mail')
+    await L.callLaneTool(a, 'mailbox_open', { id: 91004 })
+    expect(await L.callLaneTool(a, 'mailbox_card', { id: 91004, card: { decide: '要不要換 Haiku 6', deadline: '2026-11-26T12:00:00Z', facts: 'kairos 的價格表', recommend: '換', after: '回 kairos' } }))
+      .toContain('It can wait')
+    // the bench's r5: the next run reads the 純知會 about #91004 and says the decision stays with the main
+    const b = fakeRun('mail')
+    await L.callLaneTool(b, 'mailbox_open', { id: 91005 })
+    const t0 = toJoey.length
+    const r = await L.callLaneTool(b, 'notify_joey', { outcome: 'normal', text: '讀了 1 封：#91005 是 #91004 的補充（純知會），已勾掉。這件的決定仍留給主線（#91004 決定卡在主線信箱）。' })
+    expect(r).toContain('sent to Joey'); expect(toJoey.length).toBe(t0 + 1)
+    const rows = jsonl(join(dir, 'lanes.jsonl')).filter(x => x.run === b.runId)
+    expect(rows.filter(x => x.kind === 'main_ask_refused' || x.kind === 'refusal_held')).toEqual([])
+    expect(rows.find(x => x.kind === 'main_ask_matter_with_main')).toMatchObject({ phrase: '這件的決定仍留給主線（#91004 決定卡在主線信箱）', by: expect.stringContaining('card on #91004') })
+    // a mail nobody carded or handed over: refused, and the refusal holds
+    const c = fakeRun('mail')
+    await L.callLaneTool(c, 'mailbox_open', { id: 91005 })
+    expect(await L.callLaneTool(c, 'notify_joey', { outcome: 'normal', text: '#91005 這件留給主線。' })).toBe(B.mainAskRefusal('notify_joey', '#91005 這件留給主線'))
+    // once the card is decided or checked off, #91004 no longer waits on the main
+    L.mailChecked(91004, 'main')
+    const d = fakeRun('mail')
+    await L.callLaneTool(d, 'mailbox_open', { id: 91005 })
+    expect(await L.callLaneTool(d, 'notify_joey', { outcome: 'normal', text: '#91004 的決定仍留給主線。' })).toStartWith('沒有送出：這一則 notify_joey 說主線會接手')
+  })
+})
+
 // ================================================================== 3. a long turn's 「在處理」 is the newest
 const JOEY_WEEKLY = '週報那件事你來處理：先整理 W48 的數字，跑完再跟我說週報信你打算怎麼處理'
+const CMD = 'curl -s -H "Authorization: Bearer sk-live-9f3a77c01d4e" https://mock-api.internal/health | jq .p95'
+// WO-148 lab: lanes-hooks/main-hook.py run as Claude Code runs it, against a stand-in for the daemon's /lanes/main-event: what it posts
+const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-hook.py')
+async function mainHookPosts(payload: object, pid?: number): Promise<any> {
+  const got: any[] = []
+  const srv = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) { got.push(await req.json()); return Response.json({}) } })
+  const tokDir = join(tmp, `hooktok-${srv.port}`); mkdirSync(tokDir, { recursive: true }); writeFileSync(join(tokDir, String(srv.port)), 'tok\n')
+  try {
+    const h = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { PATH: process.env.PATH ?? '', TELEGRAM_HTTP_PORT: String(srv.port),
+      MCP_TOKEN_DIR: tokDir, CLAUDE_PID: pid ? String(pid) : '', PYTHONDONTWRITEBYTECODE: '1', TYPESAFE_API_KEY: '', TYPESAFE_KEY_FILE: '/nonexistent' } })
+    h.stdin.write(JSON.stringify(payload)); h.stdin.end()
+    await new Response(h.stdout).text(); expect(await h.exited).toBe(0)
+    return got[0] ?? null
+  } finally { srv.stop(true) }
+}
+describe('3a. the main\'s hook carries what the open tool is about', () => {
+  test('every PreToolUse posts tool_brief (the field the call is about, cut to 300); tool_input stays as it was: a btcc-receipt Bash, send_to_agent\'s line; a subagent\'s call posts no brief', async () => {
+    const edit = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: 's', prompt_id: 'p', tool_name: 'Edit', tool_input: { file_path: 'notes/a.md', old_string: 'x', new_string: 'y' } }, 4242)
+    expect(edit).toMatchObject({ event: 'PreToolUse', tool_name: 'Edit', pid: 4242, tool_brief: { file_path: 'notes/a.md' } }); expect(edit.tool_input).toBeUndefined()
+    const long = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: 's', prompt_id: 'p', tool_name: 'Bash', tool_input: { command: 'x'.repeat(500) } })
+    expect(long.tool_brief.command.length).toBe(300); expect(long.tool_timeout_ms).toBe(120000)
+    const rc = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: 's', prompt_id: 'p', tool_name: 'Bash', tool_input: { command: '~/.claude/tools/btcc-receipt complete 7004 --outcome ok' } })
+    expect(rc.tool_input).toEqual({ command: '~/.claude/tools/btcc-receipt complete 7004 --outcome ok' })   // the receipt check reads it, unchanged
+    expect(rc.tool_brief).toEqual({ command: '~/.claude/tools/btcc-receipt complete 7004 --outcome ok' })
+    const send = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: 's', prompt_id: 'p', tool_name: 'mcp__plugin_agent-inbox_agent-inbox__send_to_agent',
+      tool_input: { line: 'mail', to: 'eve', title: 't', ask: 'a', text: '週報補好了' } })
+    expect(send.tool_input).toEqual({ line: 'mail', to: 'eve', reply_to: null, no_reply: null }); expect(send.tool_brief).toEqual({ title: 't' })
+    const none = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: 's', prompt_id: 'p', tool_name: 'TodoWrite', tool_input: { todos: [] } })
+    expect(none.tool_brief).toBeUndefined()
+    const sub = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: 's', prompt_id: 'p', agent_id: 'a1', tool_name: 'Bash', tool_input: { command: 'ls' } })
+    expect(sub).toMatchObject({ sub: true }); expect(sub.tool_brief).toBeUndefined()
+    expect(L.toolWhat({ command: CMD })).toBe('curl -s -H "Authorization: Bearer …" https://mock-api.internal/health | jq .p95')
+    expect(L.toolWhat({ command: 'export TYPESAFE_API_KEY=abc123 && echo token: xyz && gh auth ghp_abcdefghij1234' })).toBe('export TYPESAFE_API_KEY=… && echo token: … && gh auth …')
+  }, 30000)
+})
 describe('3. main_doing takes the newest', () => {
   test('a turn longer than the threshold that switched matters: the gate\'s Jev payload carries the open tool, the latest reply to Joey and the focus card (the new matter), not the turn\'s first message', async () => {
     process.env.LANES_MAIN_DOING_NEWEST_MIN = '0.05'                                                   // 3 s stands for the 10 minutes
@@ -355,15 +435,20 @@ describe('3. main_doing takes the newest', () => {
       // the turn moves on to the mock-api incident: a reply to Joey, the focus card, the tool open now
       L.mainReplied(null, 777, undefined, '先放下另一件：mock-api p95 2600ms，我在修，修好跟你說', JOEY)
       writeFileSync(join(dir, 'focus.md'), '進行中：mock-api 事故（p95 2600ms）\n之後：W48 的數字\n別碰：mock-api 設定\n第四行不讀\n')
-      await hook('PreToolUse', { prompt_id: 'p-long', tool_name: 'Edit', tool_input: { file_path: 'notes/mock-api-incident.md', old_string: 'a', new_string: 'b' } })
+      // the main's real hook (lanes-hooks/main-hook.py) posts the PreToolUse: WO-148 lab: its tool_brief carries the command (1.50.0 sent nothing but the name)
+      const posted = await mainHookPosts({ hook_event_name: 'PreToolUse', session_id: sid, prompt_id: 'p-long', tool_name: 'Bash',
+        tool_input: { command: CMD, description: 'mock-api health' } }, p.pid)
+      expect(posted.tool_brief).toEqual({ command: CMD }); expect(posted.tool_input).toBeUndefined()      // tool_input as before: only for a btcc-receipt Bash
+      await L.__mainEvent(posted)
       expect(L.mainTurnNow()!.from).toBe('turn')
       await sleep(3100)
       const now = L.mainTurnNow()!
       expect(now.from).toBe('newest')
-      expect(now.doing).toMatch(/^正在用 Edit：notes\/mock-api-incident\.md（自 \d\d:\d\d 起）；最近回 Joey（\d\d:\d\d）：先放下另一件：mock-api p95 2600ms，我在修，修好跟你說；焦點卡：進行中：mock-api 事故（p95 2600ms） \/ 之後：W48 的數字 \/ 別碰：mock-api 設定$/)
+      expect(now.doing).toMatch(/^正在用 Bash：curl -s -H "Authorization: Bearer …" https:\/\/mock-api\.internal\/health \| jq \.p95（自 \d\d:\d\d 起）；最近回 Joey（\d\d:\d\d）：先放下另一件：mock-api p95 2600ms，我在修，修好跟你說；焦點卡：進行中：mock-api 事故（p95 2600ms） \/ 之後：W48 的數字 \/ 別碰：mock-api 設定$/)
       expect(now.doing).not.toContain('週報'); expect(now.doing).not.toContain('第四行')
       expect(now.doing.length).toBeLessThanOrEqual(L.MAIN_SAME_DOING_MAX)
-      expect(L.mainNowLine()).toContain('在處理：正在用 Edit：notes/mock-api-incident.md')            // the 此刻 line reads the same field (cut at 80)
+      expect(now.doing).not.toContain('sk-live')                                                     // the token in the command is masked
+      expect(L.mainNowLine()).toContain('在處理：正在用 Bash：curl -s -H "Authorization: Bearer …"')      // the 此刻 line reads the same field (cut at 80)
       // a mail-lane run: the mail on the mock-api incident is the matter the main is on now: refused; the 週報 mail is not (it was the turn's first message)
       const tok = fakeRun('mail')
       await L.callLaneTool(tok, 'mailbox_open', { id: 91002 }); await L.callLaneTool(tok, 'mailbox_open', { id: 91003 })

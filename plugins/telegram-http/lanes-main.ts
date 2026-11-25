@@ -90,7 +90,7 @@ export type MainEnv = {
 
 export type MainEvent = {
   event: string; session_id?: string; prompt_id?: string; pid?: number; transcript_path?: string; source?: string
-  error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
+  error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_brief?: Record<string, string>; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
   /** 002r: the event fired inside a subagent of the main (the hook input's agent_id): not the main's turn */
   sub?: boolean
 }
@@ -419,7 +419,8 @@ export function createMain(E: MainEnv) {
       case 'PreToolUse': {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
-        openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_input ?? null, at: new Date().toISOString() })   // WO-148 (item 3)
+        // WO-148 (item 3; lab: the hook sent tool_input only for a btcc-receipt Bash): the hook's tool_brief, the field the call is about (lanes.ts masks it)
+        openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_brief ?? b.tool_input ?? null, at: new Date().toISOString() })
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))

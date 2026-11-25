@@ -263,7 +263,19 @@ export type OnsenConfig = {
 }
 export type HistoryArgs = { limit?: unknown; since?: unknown; until?: unknown; q?: unknown; id?: unknown; chat?: unknown }
 /** WO-144: a caller's own bounds on one query (the lane opening's block): how long Onsen gets before the spool answers, and where a body is cut */
-export type HistoryOpts = { timeoutMs?: number; cut?: number }
+/** `inbound` (WO-148 lab): a caller's set; queryHistory adds the key (`tg:<id>`, else `#<Onsen id>`) of every listed message that came in from a person
+ *  (direction in, not a system:* sender), Onsen's answer and the spool's alike, so the caller can tell the DM human's lines by direction whatever name
+ *  Onsen gives that member (joey, joey-test, rosie). The text is unchanged */
+export type HistoryOpts = { timeoutMs?: number; cut?: number; inbound?: Set<string> }
+/** WO-148 lab: the listed rows that came in from a person, into `set` (see HistoryOpts.inbound) */
+export function noteInbound(rows: any[], set: Set<string> | undefined): void {
+  if (!set) return
+  for (const m of rows) {
+    if (String(m?.direction ?? '') !== 'in' || /^system(:|$)/.test(String(m?.sender ?? ''))) continue
+    const tg = tgIdOf(m)
+    if (tg) set.add(`tg:${tg}`); else if (m?.id != null) set.add(`#${m.id}`)
+  }
+}
 
 const RETRYABLE_4XX = new Set([401, 403, 408, 425, 429])
 const HOUR = 3600_000
@@ -723,6 +735,7 @@ export class OnsenClient {
         const r = await this.get(`/messages?${p}`, cred, via, tmo)
         if (r.status === 200 && Array.isArray(r.json?.messages)) {
           const rows = r.json.messages as any[]
+          noteInbound(rows, o.inbound)                                           // WO-148 lab: the DM human's lines, by direction
           // step 2 (WO-142): the agent's own read stops at Joey's restart line; one line at the top says so
           const rl = r.json.restart_line_applied && r.json.restart_line?.at ? `${restartHead(r.json.restart_line.at)}\n` : ''
           return rl + formatList(rows, typeof r.json.total === 'number' ? r.json.total : rows.length, joey, cut)
@@ -732,7 +745,7 @@ export class OnsenClient {
         why = e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`) ? `Onsen ${Math.round(tmo / 1000)} 秒內沒回應` : `Onsen 連不上（${errText(e).slice(0, 80)}）`
       }
     }
-    return this.localHistory({ limit, since, until, q, id, chat, cut }, why, joey)
+    return this.localHistory({ limit, since, until, q, id, chat, cut, inbound: o.inbound }, why, joey)
   }
   private async get(path: string, cred: string, via: 'tool' | 'hook' = 'tool', timeoutMs = this.cfg.queryTimeoutMs ?? 4000): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': via }), signal: AbortSignal.timeout(timeoutMs) })
@@ -768,7 +781,7 @@ export class OnsenClient {
   }
 
   /** the local answer: this daemon's spool (and its previous generation), messages with their edits applied */
-  private localHistory(o: { limit: number; since?: string; until?: string; q?: string; id?: string; chat?: string; cut?: number }, why: string, joey: string): string {
+  private localHistory(o: { limit: number; since?: string; until?: string; q?: string; id?: string; chat?: string; cut?: number; inbound?: Set<string> }, why: string, joey: string): string {
     const lines: SpoolLine[] = []
     for (const p of [this.spoolOld, this.spool]) {
       if (!existsSync(p)) continue
@@ -818,6 +831,7 @@ export class OnsenClient {
       const b = String(m.body ?? '')
       return [...b].length > cutAt ? { ...m, body: [...b].slice(0, cutAt).join(''), truncated: true } : m
     })
+    noteInbound(rows, o.inbound)                                                 // WO-148 lab: as Onsen's answer
     const cut = [...new Set(o.chat ? [o.chat] : inScope.map(m => m.chat))].map(c => lineAt(c)).filter((x): x is number => x != null)
     const rl = cut.length ? `${restartHead(new Date(Math.max(...cut)).toISOString())}\n` : ''
     return `${head}\n${rl}${formatList(rows, all.length, joey, cutAt)}`
