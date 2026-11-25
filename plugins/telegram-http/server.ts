@@ -4413,18 +4413,27 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     })() }),
   })
   const source: OnsenStatus.StatusSource = registry
+  const turnStarts = new OnsenStatus.TurnStarts()
   const compute = (): OnsenStatus.StatusView => {
     const w = wallReader.state()
     const wall = w?.walled ? { walled: true, until: w.resets_at, kind: w.kind } : tap?.walled() ?? null
-    const v = OnsenStatus.statusOf(source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : facts.queued(watch?.watching() ? 'taken' : 'seen'), wall,
-      turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false, lanes: tap ? Lanes.runningLanes() : [], edges: tap ? tap.turnEdges() : null }))
+    const inp = source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : 0, wall,
+      turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false, lanes: tap ? Lanes.runningLanes() : [], edges: tap ? tap.turnEdges() : null })
+    if (!tap) {
+      // WO-162 (1): the registry shows a new turn: the messages written into the main's stream by then are that turn's, not queued (the transcript
+      // confirms them a read later; the kick's transcript read (WO-157b) finds them only if Claude Code has flushed it by then)
+      const began = turnStarts.observe(inp.main, Date.now())
+      if (began != null) facts.turnBegan(began)
+      inp.queued_joey = facts.queued(watch?.watching() ? 'taken' : 'seen')
+    }
+    const v = OnsenStatus.statusOf(inp)
     // WO-157b (status-latency-lab 「會判錯的」 8): once the status says the turn began, the item offered to the main is the one it is taking in, not one waiting
     if (tap && v.detail && Number(v.detail.queued_joey) > 0 && v.state !== 'idle' && v.state !== 'offline') v.detail.queued_joey = Lanes.mainQueuedJoey({ offered: false })
     return v
   }
   onsenStatusCompute = compute                                          // WO-157: the lanes' one state source (decideWake, 此刻, the same-matter gate)
   registry.start()
-  setInterval(() => { try { watch?.tick(); feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
+  setInterval(() => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   // WO-162 (2), lanes off: the transcript is read every ONSEN_TRANSCRIPT_POLL_MS (250 ms; a stat when nothing was written) and a change of the turn (a
   // tool starting or ending, a message taken in) is computed and written at once; until 1.55.0 it was read with the 2 s status tick
   if (watch) {

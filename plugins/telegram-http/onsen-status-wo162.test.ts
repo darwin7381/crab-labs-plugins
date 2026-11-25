@@ -1,8 +1,6 @@
 // WO-162 (Chiron's lab, status-latency-lab.md; Joey TG chiron:2423 「狀態同步要多久？顆粒度如何等都要確保延遲不要太誇張影響使用或造成誤判」): the status the daemon
 // reports to Onsen.
-//   (1) the message being answered is not queued (fixed in 1.55.1, Sonn, WO-157b: lanes off, a kick reads the transcript first; lanes on, the offered item
-//       is the turn's once the status says it began): verified here through the daemon (lanes off) and in onsen-step3.test.ts (lanes on); a message
-//       that arrives mid-turn is counted at once (the status is computed when the count moves, not at the next 2 s tick)
+//   (1) the message being answered is not queued: the first row of a turn said queued_joey 1 (28/28), the transcript read had not marked it yet
 //   (2) a detail change is written at once (a tool starting or ending, waitingFor, dialog_open); the transcript is read every 250 ms (lanes off)
 //   (3) a report at least every 15 s, unchanged or not, each with detail.heartbeat_s (Onsen: no report for 3 × heartbeat_s = reporting lost)
 // Unit tests, then a real daemon (server.ts, lanes off) against the Bot API stand-in, a stand-in Onsen, a registry and a transcript the test writes, and an
@@ -15,8 +13,8 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { DeliveryFacts, StatusFacts, HEARTBEAT_MS } from './onsen-status.ts'
-import type { StatusFact } from './onsen-client.ts'
+import { DeliveryFacts, StatusFacts, TurnStarts, TurnWatch, HEARTBEAT_MS, type JoeyOf } from './onsen-status.ts'
+import type { DeliveryFact, StatusFact } from './onsen-client.ts'
 import { startBotApiMock, dm, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
 
@@ -24,7 +22,40 @@ const AGENT = 'adam'
 const JOEY = 1828
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
-describe('(1) the queued count moves the status at once', () => {
+describe('(1) the message being answered is not queued', () => {
+  test('TurnStarts: busy after idle / shell / offline / nothing is a new turn (the registry\'s statusUpdatedAt, else now); busy after busy or waiting is not', () => {
+    const T = new TurnStarts()
+    expect(T.observe({ status: 'idle', status_at: 1 }, 10)).toBe(null)
+    expect(T.observe({ status: 'busy', status_at: 500 }, 600)).toBe(500)
+    expect(T.observe({ status: 'busy', status_at: 500 }, 700)).toBe(null)           // the same turn, read again
+    expect(T.observe({ status: 'waiting', status_at: 800 }, 800)).toBe(null)
+    expect(T.observe({ status: 'busy', status_at: 900 }, 900)).toBe(null)           // a prompt answered: the same turn goes on
+    expect(T.observe({ status: 'shell', status_at: 950 }, 950)).toBe(null)
+    expect(T.observe({ status: 'busy' }, 1000)).toBe(1000)                          // no statusUpdatedAt: now
+    expect(T.observe(null, 1100)).toBe(null)
+    expect(T.observe({ status: 'busy', status_at: 1200 }, 1250)).toBe(1200)
+  })
+
+  test('turnBegan: what was written into the stream by the turn\'s start is that turn\'s; what came after, or was never written, stays queued', () => {
+    let t = 1_000
+    const F = new DeliveryFacts({ agent: AGENT, sink: () => {}, now: () => t })
+    F.delivered('1', 1); F.seen('1', 1, 'main')                 // written at 1000
+    F.delivered('1', 2)                                          // no stream: never written
+    expect(F.queued('taken')).toBe(2)
+    F.turnBegan(1_020)                                           // Claude Code's busy 20 ms later
+    expect(F.queued('taken')).toBe(1)
+    t = 2_000; F.seen('1', 2, 'main')                            // written mid-turn: Claude Code queues it until a tool boundary
+    F.turnBegan(1_020)
+    expect(F.queued('taken')).toBe(1)
+    F.taken('1', 2)                                              // the transcript shows it taken in
+    expect(F.queued('taken')).toBe(0)
+    // an album: every item goes with the first
+    F.album('1', ['5', '6']); F.delivered('1', 5); F.delivered('1', 6); t = 3_000; F.seen('1', 5, 'main')
+    expect(F.queued('taken')).toBe(2)
+    F.turnBegan(3_010)
+    expect(F.queued('taken')).toBe(0)
+  })
+
   test('changed: a message taken in, written into the stream, into a turn, its turn ended: each asks for the status now', () => {
     let n = 0
     const F = new DeliveryFacts({ agent: AGENT, sink: () => {}, changed: () => { n++ } })
@@ -105,7 +136,7 @@ beforeAll(async () => {
 }, 40000)
 afterAll(async () => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } await d?.stop(); api?.stop(); up?.stop(true) })
 
-test('daemon, lanes off: idle reported every heartbeat_s; 1.55.1: the first busy row does not count the message it answers (transcript flushed); a message mid-turn counts at once; a tool shows and goes within a transcript read; transcript flushed after the busy: counted until the next read only', async () => {
+test('daemon, lanes off: the first busy row of a turn does not count the message it answers; a message mid-turn counts at once; a tool shows and goes within a transcript read; idle reported every heartbeat_s', async () => {
   const sessions = join(d.home, '.claude', 'sessions'), tdir = join(d.home, '.claude', 'projects', d.ws.replace(/[^a-zA-Z0-9]/g, '-'))
   mkdirSync(sessions, { recursive: true }); mkdirSync(tdir, { recursive: true })
   const spool = join(d.stateDir, 'onsen', 'spool.jsonl')
@@ -134,15 +165,11 @@ test('daemon, lanes off: idle reported every heartbeat_s; 1.55.1: the first busy
   console.log(`heartbeat gaps (ms), heartbeat_s 1: ${gaps.join(', ')}`)
   for (const g of gaps) expect(g).toBeLessThanOrEqual(1100)
 
-  // (1) 1.55.1 (Sonn, WO-157b): a status kick reads the transcript first. Joey's message is written into the stream; the transcript already holds the
-  // user record when the registry says busy: the turn's first busy row does not count it
-  const iso = () => new Date().toISOString()
-  const userRec = (id: number, text: string) => JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="${id}" user="joey" user_id="${JOEY}" ts="x">\n${text}\n</channel>` }, timestamp: iso() }) + '\n'
+  // (1) Joey's message is written into the session's stream; Claude Code starts the turn (its registry says busy) before the transcript shows it
   api.push(dm(JOEY, 7001, '開始'))
   expect(await until(() => got.includes('7001'), 10000)).toBe(true)
   await sleep(50)
   const n1 = st().length
-  appendFileSync(tf, userRec(7001, '開始'))
   reg('busy')
   expect(await until(() => st().slice(n1).some(s => s.state === 'busy'), 5000)).toBe(true)
   const first = st().slice(n1).find(s => s.state === 'busy')
@@ -160,7 +187,9 @@ test('daemon, lanes off: idle reported every heartbeat_s; 1.55.1: the first busy
   expect(Date.parse(ls[qAt].r.at) - Date.parse(ls[dAt].r.at)).toBeLessThan(500)
 
   // (2) a tool in the transcript: in the spool within a transcript read (250 ms) and the kick; its result: gone as fast
+  const iso = () => new Date().toISOString()
   const toolLat: number[] = []
+  appendFileSync(tf, JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="7001" user="joey" user_id="${JOEY}" ts="x">\n開始\n</channel>` }, timestamp: iso() }) + '\n')
   for (let i = 0; i < 4; i++) {
     let n = st().length, t0 = performance.now()
     appendFileSync(tf, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: `tu${i}`, name: 'Bash', input: { command: 'sleep 4' } }] }, timestamp: iso() }) + '\n')
@@ -179,10 +208,7 @@ test('daemon, lanes off: idle reported every heartbeat_s; 1.55.1: the first busy
   appendFileSync(tf, JSON.stringify({ type: 'attachment', attachment: { type: 'queued_command', prompt: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="7002" user="joey" user_id="${JOEY}" ts="x">\n還有這個\n</channel>` }, timestamp: iso() }) + '\n')
   expect(await until(() => st().slice(n3).some(s => s.detail?.queued_joey === 0), 3000)).toBe(true)
 
-  // the turn ends. Joey's next message, in the order Claude Code writes them (Chiron's lab, txmonster, 7 turn starts caught within 37 ms of the busy:
-  // the user record was not in the transcript 57–87 ms after statusUpdatedAt, it was by 94–110 ms): the registry's busy first, the transcript 90 ms later.
-  // The kick (registry watch + 25 ms) reads the transcript before the record is there; the 250 ms transcript read finds it and the count is written at
-  // once (WO-162 (2)): the message being answered counts at most until that read
+  // the turn ends; Joey's next message starts the next one: its first busy row counts nothing either
   appendFileSync(tf, JSON.stringify({ type: 'system', subtype: 'turn_duration', durationMs: 900, timestamp: iso() }) + '\n')
   reg('idle')
   expect(await until(() => st().at(-1)?.state === 'idle', 5000)).toBe(true)
@@ -191,14 +217,7 @@ test('daemon, lanes off: idle reported every heartbeat_s; 1.55.1: the first busy
   await sleep(50)
   const n4 = st().length
   reg('busy')
-  await sleep(90)
-  const tw = performance.now()
-  appendFileSync(tf, userRec(7003, '下一則'))
   expect(await until(() => st().slice(n4).some(s => s.state === 'busy'), 5000)).toBe(true)
-  const firstLate = st().slice(n4).find(s => s.state === 'busy')
-  expect(await until(() => st().slice(n4).some(s => s.state === 'busy' && s.detail.queued_joey === 0), 2000)).toBe(true)
-  const fix = st().slice(n4).find(s => s.state === 'busy' && s.detail.queued_joey === 0)
-  console.log(`transcript 90 ms after the busy: first busy row queued_joey ${firstLate.detail.queued_joey}; 0 written ${(Date.parse(fix.at) - (performance.timeOrigin + tw)).toFixed(0)} ms after the record`)
-  expect(Date.parse(fix.at) - (performance.timeOrigin + tw)).toBeLessThan(500)
+  expect(st().slice(n4).find(s => s.state === 'busy').detail.queued_joey).toBe(0)
   await c.close()
 }, 90000)

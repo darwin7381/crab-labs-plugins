@@ -30,11 +30,12 @@ export class DeliveryFacts {
   private groups = new Map<string, string[]>()
   /** the main's turn closed these at a Stop; written once that turn stayed closed for settleMs (another Stop hook can still hold it) */
   private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; timer: ReturnType<typeof setTimeout> }>()
-  /** Joey's messages taken in and not yet into a turn (lanes off: the queued count) */
-  private open = new Map<string, { at: number; seen: boolean; taken: boolean }>()
+  /** Joey's messages taken in and not yet into a turn (lanes off: the queued count); seenAt: when it was last written into the main's stream */
+  private open = new Map<string, { at: number; seen: boolean; taken: boolean; seenAt?: number }>()
   /** onSeen (WO-145, the ✍ reaction): every `seen` report, for each message of it (an album: every item), the recipient named; a repeat too (the
-   *  caller keeps its own once). changed (WO-162): the queued count may have changed (a message taken in, written into the stream, into a turn, its
-   *  turn ended): the status is computed again now rather than at the next 2 s tick */
+   *  caller keeps its own once) */
+  /** changed (WO-162): the queued count may have changed (a message taken in, written into the stream, into a turn, its turn ended): the status is
+   *  computed again now rather than at the next 2 s tick */
   constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; settleMs?: number; now?: Now; max?: number
     onSeen?: (chat: string, id: string, by: string) => void; changed?: () => void }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
@@ -70,7 +71,7 @@ export class DeliveryFacts {
   seen(chat: string, id: string | number, by: string, at?: string): void {
     const s = String(id)
     this.emit(chat, s, 'seen', by, at)
-    for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) e.seen = true }
+    for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.seen = true; e.seenAt = this.now() } }
     if (this.o.onSeen) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
     this.changed()
   }
@@ -78,6 +79,13 @@ export class DeliveryFacts {
   taken(chat: string, id: string | number): void {
     for (const m of this.idsOf(chat, String(id))) { const e = this.open.get(k2(chat, m)); if (e) { e.seen = true; e.taken = true } }
     this.changed()
+  }
+  /** WO-162 (1), lanes off: a turn of the main began at `at` (ms; the registry's statusUpdatedAt of its busy). What was written into its stream by then
+   *  is what that turn took in: a session that starts a turn takes in what waits in its queue. The transcript shows it one read later; until now the
+   *  first status row of every turn counted the message being answered as queued (Chiron's lab, 28/28). slackMs: the daemon notes `seen` right after
+   *  the write, Claude Code writes its busy after reading it */
+  turnBegan(at: number, slackMs = 100): void {
+    for (const e of this.open.values()) if (e.seen && !e.taken && e.seenAt != null && e.seenAt <= at + slackMs) e.taken = true
   }
   turnEnd(chat: string, id: string | number, by: string, at?: string, detail?: Record<string, unknown>): void {
     const s = String(id)
@@ -241,8 +249,8 @@ export class StatusFacts {
       last_activity_at: v.last_activity_at ?? null }) } catch {}
     this.arm()
   }
-  /** the heartbeat: heartbeatMs after the last report, the latest view again, if one was handed in within the larger of heartbeatMs and freshMs;
-   *  otherwise nothing (the next update() reports at once, the beat being overdue) */
+  /** the heartbeat: heartbeatMs after the last report, the latest view again, if one was handed in within that time; otherwise nothing (the next
+   *  update() reports at once, the beat being overdue) */
   private arm(): void {
     if (this.beat) clearTimeout(this.beat)
     this.beat = null
@@ -260,6 +268,20 @@ export class StatusFacts {
     this.stopped = true
     if (this.timer) clearTimeout(this.timer); this.timer = null; this.pending = null
     if (this.beat) clearTimeout(this.beat); this.beat = null
+  }
+}
+
+/** WO-162 (1), lanes off: the start of a turn of the main, as the registry shows it: busy after anything but busy or waiting (waiting → busy is the same
+ *  turn going on after a prompt). observe() is handed the registry's main each time the status is computed; it answers when the turn began (ms: the
+ *  registry's statusUpdatedAt, else now) the first time it sees that turn, else null */
+export class TurnStarts {
+  private was: string | null = null
+  observe(main: { status: string; status_at?: number | null } | null, now: number): number | null {
+    const st = main?.status ?? null, was = this.was
+    this.was = st
+    if (st !== 'busy' || was === 'busy' || was === 'waiting') return null
+    const at = Number(main?.status_at)
+    return Number.isFinite(at) && at > 0 ? at : now
   }
 }
 
