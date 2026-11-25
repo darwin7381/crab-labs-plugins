@@ -284,6 +284,17 @@ describe('the registry: which session is the main, offline and why, files vs the
     expect(st()).toMatchObject({ state: 'offline', detail: { reason: 'no_registration' } })
   })
 
+  test('1.47.2: a non-interactive file of this workspace (a lane\'s -p run) in an odd shape does not send the read to the CLI', () => {
+    const { R, put, up, st, logs } = setup()
+    put(reg(41, { status: 'busy' })); up.add(41)
+    writeFileSync(join(R.o.dir, '42.json'), JSON.stringify({ pid: 42, sessionId: 's42', cwd: WS, kind: 'sdk-cli', status: 'running' }))
+    expect(st().state).toBe('busy')
+    expect(R.files().bad).toEqual([])
+    expect(logs.some(l => /not in the known shape/.test(l))).toBe(false)
+    writeFileSync(join(R.o.dir, '43.json'), JSON.stringify({ pid: 43, sessionId: 's43', cwd: WS, kind: 'interactive', status: 'idle' }))   // no procStart
+    expect(R.files().bad).toEqual(['43.json'])
+  })
+
   test('pid_reused: the OS start time is read at most every 30 s; the same second in another wording is the same start', () => {
     let t = 1_000_000, osStart: string | null = START, reads = 0
     const dir = mkdtempSync(join(tmpdir(), 'onsen-reg-'))

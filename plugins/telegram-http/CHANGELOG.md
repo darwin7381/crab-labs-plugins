@@ -1,3 +1,7 @@
+## 1.47.2 — 2026-11-25
+
+- **Onsen status (WO-143): only an interactive session's registry file can send the read to the CLI.** 1.47.0 treated any file of the workspace in an unknown shape as a reason to read `claude agents --json` instead of the files; a lane's few-seconds `claude -p` session in the same folder (another kind, other fields) did that on epeius at go-live (83124.json), and the daemon polled the CLI every 10 s until the 10-min check. A non-interactive file is never the main, so its shape no longer matters. agent-inbox 1.17.2 carries the same code. Test in `onsen-step3.test.ts`.
+
 ## 1.47.1 — 2026-11-25
 
 - **Lanes on: the same-matter gate (WO-144 point 8) sends Jev only the main's turn and the event; the refusal is Chiron's words (Chiron's review of WO-144; agent-inbox 1.17.1 carries the same code).**

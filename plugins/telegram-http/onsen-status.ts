@@ -547,7 +547,9 @@ export class Registry implements StatusSource {
         try { j = JSON.parse(readFileSync(f, 'utf8')) } catch { if (c) entries.push(...(c.e ? [c.e] : [])); continue }
         const e = regEntry(j)
         const mine = typeof j?.cwd === 'string' && samePath(j.cwd, this.o.workspace)
-        c = { m: st.mtimeMs, size: st.size, e, bad: mine && (!e || !REG_STATUSES.has(e.status) || (e.kind === 'interactive' && typeof j.procStart !== 'string')) }
+        // only an interactive session can be the main: a lane's short-lived `claude -p` file in the same folder (other kind, other fields) must not send
+        // the daemon to the CLI (1.47.0 on epeius: 83124.json, a few seconds' session, flipped the read to the CLI until the 10-min check)
+        c = { m: st.mtimeMs, size: st.size, e, bad: mine && j?.kind === 'interactive' && (!e || !REG_STATUSES.has(e.status) || typeof j.procStart !== 'string') }
         this.cache.set(f, c)
       }
       if (c.e) entries.push(c.e)
