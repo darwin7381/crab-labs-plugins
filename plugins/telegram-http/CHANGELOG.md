@@ -1,3 +1,11 @@
+## 1.56.1 — 2026-11-26
+
+- **`seen` is the moment Joey's message enters a turn** (board WO-165 B, Chiron; Joey TG chiron:2423; agent-inbox 1.26.1). Lanes off, `seen` used to be the moment the notification was written into the session's stream, where Claude Code may still hold it in its queue (Chiron's lab: 13–17 s while `/pending` already said seen). That moment is now a fact of its own, **`in_session`**; `seen` is when the transcript shows it taken in (a turn's prompt, or the `queue-operation remove` when a running turn absorbs it at a tool boundary; the `queued_command` attachment carries its enqueue time, so the newest record before it dates it). Lanes on: `in_session` when M1 offers it (or at the bind, for a pull); `seen` at the bind, as before. A lane run started with it: both at once.
+  - The ✍ (`ONSEN_REACT_SEEN`) stays on `seen`, so lanes off it now comes when the message enters a turn (Chiron told Joey). The transcript's tail read again at start writes no ✍ for messages taken in before this daemon began.
+  - `queued_joey` keeps its value (modes renamed with the facts): it now agrees with `/pending unseen`.
+  - TurnWatch reads the registry main's own `<session id>.jsonl` as soon as it exists (a new session's first message: seen 0.39 s, was up to 10 s), and no other transcript takes over while it is read.
+  - Needs Onsen with `in_session` (fleet-core 0.12.6, deployed 18:59Z); an older Onsen refuses that item alone (400 in its result, `rejected.jsonl`), the rest of the batch goes in.
+
 ## 1.56.0 — 2026-11-26
 
 - **Every item belongs to a thread with a fixed key and goes to that thread's owner** (board WO-164 phase 1, Chiron; Joey TG chiron:2434; agent-inbox 1.26.0). Only the agents in `LANES_WAKE_DECIDE` (today lab-relay and chiron); every other agent is unchanged, and no text an agent reads changes (except Chiron's points 7 and 8 below, fleet-wide).
