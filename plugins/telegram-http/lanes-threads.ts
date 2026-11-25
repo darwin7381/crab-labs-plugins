@@ -171,8 +171,9 @@ export function titleOf(text: string): string {
 // header's second square bracket), ticket 「WO-<n>」 (「WO-<n> <title>」 when the item carries the ticket's title), alert 「事故 <host>」 (refs.incident
 // before '#'), mail the first mail's title, call 「<對方>：<第一句前 30 字>」, Joey 「Joey 私訊」 (「Joey 私訊／<話題名>」 in a topic of his DM). Anything
 // else (a thread of its own) keeps the first line of its first item; a call or a mail that is a thread of its own is still a call or a mail.
-/** the version of the titles: a thread titled by threadTitle carries it (lanes.ts title_v); the start retitles the open threads without it, once */
-export const TITLE_V = 2
+/** the version of the titles: a thread titled by threadTitle carries it (lanes.ts title_v); the start retitles the open threads without it, once.
+ *  3 (Chiron #200144): a call's title drops the 「因為：」 head, and a call a reflex lane took (key item, mesh-<n>, its peer known) is titled as a call */
+export const TITLE_V = 3
 /** what a title is made of besides the key: the item that opens the thread (its kind as decideWake reads it, its sender, its text; a mail's own title; the
  *  name of the topic it was written in) */
 export type TitleItem = { kind?: string | null; from?: string | null; text?: string | null; title?: string | null; topic_name?: string | null }
@@ -208,8 +209,11 @@ export function hostOf(key: string): string {
   const m = String(key).match(/^(.*)#\d+$/)
   return (m ? m[1] : String(key)).trim()
 }
+/** a call's words without the head its sender's daemon writes first (「因為：<because>」: fleet-mail.ts sendToAgent, server.ts meshSend); Chiron #200144:
+ *  the title takes the sentence after it */
+export const callBody = (text: unknown): string => String(text ?? '').replace(/^\s*因為：\s*/, '')
 function callTitle(it: TitleItem): string {
-  const who = String(it.from ?? '').trim(), s = firstSentence(it.text)
+  const who = String(it.from ?? '').trim(), s = firstSentence(callBody(it.text))
   if (!who) return titleOf(String(it.text ?? ''))
   return s ? `${who}：${s}` : who
 }

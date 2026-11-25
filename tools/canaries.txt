@@ -133,3 +133,6 @@ plugins/telegram-http/lanes.ts::function laneOfRun
 plugins/telegram-http/lanes-threads.ts::export function threadTitle
 plugins/telegram-http/lanes.ts::function retitleThreads
 plugins/telegram-http/lanes.ts::note: typeof note === 'string' && note ? note : undefined
+plugins/telegram-http/fleet-text.ts::export const ONSEN_TEXT_FORMAT = 'Onsen 的文字預設是 markdown rich（GFM）
+plugins/telegram-http/lanes-threads.ts::export const callBody
+plugins/telegram-http/lanes-threads.ts::export const TITLE_V = 3

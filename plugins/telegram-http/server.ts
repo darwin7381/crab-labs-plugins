@@ -15,6 +15,7 @@ import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
 import { drainLeftoverDoorbells } from './hub-sync.ts'
 import { callInboxTool, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
+import { ONSEN_TEXT_DEFAULT, withOnsenFormat } from './fleet-text.ts'
 import { MailEvents, decisionEvent, WITHIN_S as MAIL_DUE_WITHIN_S } from './mail-events.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -2033,7 +2034,8 @@ function buildServer(): Server {
       },
       instructions: [
         // Claude Code truncates MCP server instructions at 2048 chars, silently (measured 2026-11-06). Keep this under 2000.
-        'The sender reads Telegram, not this session: anything they should see must go through the reply tool (pass chat_id back). Use reply_to only to quote an earlier message, not for normal replies.',
+        // WO-164 (Chiron 21:10Z): the one sentence on Onsen's text format; the whole of it is on the text fields (fleet-text.ts ONSEN_TEXT_FORMAT)
+        'The sender reads Telegram, not this session: anything they should see must go through the reply tool (pass chat_id back). Use reply_to only to quote an earlier message, not for normal replies. ' + ONSEN_TEXT_DEFAULT,
         '',
         'Messages arrive as <channel source="telegram" chat_id message_id user ts>. Attributes:',
         '- image_path: Read it (a photo they sent). image_error: the photo did NOT come through; say so explicitly, never answer as if you saw it; retry with download_attachment(attachment_file_id).',
@@ -2114,7 +2116,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
    type: 'string' as const,
    enum: richOn ? ['rich', 'text', 'markdownv2'] : ['text', 'markdownv2'],
    description: richOn
-     ? "Rendering mode. Default 'rich': write NORMAL GFM markdown — tables (| a | b |), **bold**, *italic*, `code`, ```fenced``` — rendered natively via Telegram Rich Messages with NO escaping. Put each URL on its own line as a bare link with nothing attached before or after it (no **, colon or bracket); do not use [text](url). Use 'text' for plain unrendered output. 'markdownv2' = legacy escaped mode."
+     // WO-164 (Chiron 21:10Z): only the three modes; how to write is on the text field (ONSEN_TEXT_FORMAT)
+    ? "'rich'（預設）：Onsen 的 markdown rich（GFM），寫法見 text 的說明｜'text'：純文字、不做顯示處理｜'markdownv2'：Telegram 舊的跳脫模式。"
      : "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
  }
  return ({
@@ -2127,7 +2130,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
         type: 'object',
         properties: {
           chat_id: { type: 'string' },
-          text: { type: 'string' },
+          text: { type: 'string', description: withOnsenFormat() },   // WO-164 (Chiron 21:10Z): Onsen's text format, on the field the words are written in
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
@@ -2179,7 +2182,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
         properties: {
           chat_id: { type: 'string' },
           message_id: { type: 'string' },
-          text: { type: 'string' },
+          text: { type: 'string', description: withOnsenFormat() },   // WO-164 (Chiron 21:10Z): Onsen's text format
           format: formatSchema,
         },
         required: ['chat_id', 'message_id', 'text'],

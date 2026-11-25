@@ -8,6 +8,7 @@ import { join } from 'path'
 import { CHAT_HISTORY_TOOL } from './onsen-tool.ts'
 import { INBOX_TOOLS, FLEET_TOOLS } from './fleet-mail.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
+import { ONSEN_TEXT_DEFAULT } from './fleet-text.ts'
 import { mainContext } from './lanes-main.ts'
 const L = await import('./lanes.ts?wo146') as typeof import('./lanes.ts')
 const dir = mkdtempSync(join(tmpdir(), 'wo146-'))
@@ -24,7 +25,7 @@ function instructions(lanesOn: boolean): string {
   const i = SRC.indexOf('instructions: [\n        // Claude Code truncates MCP server instructions at 2048')
   const j = SRC.indexOf("].join('\\n')", i)
   expect(i).toBeGreaterThan(0); expect(j).toBeGreaterThan(i)
-  const arr = new Function('Lanes', `return ${SRC.slice(i + 'instructions: '.length, j + 1)}`)({ LANES_ON: lanesOn }) as string[]
+  const arr = new Function('Lanes', 'ONSEN_TEXT_DEFAULT', `return ${SRC.slice(i + 'instructions: '.length, j + 1)}`)({ LANES_ON: lanesOn }, ONSEN_TEXT_DEFAULT) as string[]
   return arr.join('\n')
 }
 
@@ -33,8 +34,9 @@ test('reply: the first sentence says it is the only output and the only push; th
   expect(SRC).not.toContain("'Reply on Telegram. Pass chat_id")
 })
 
-test('format (rich): no [links](url) in the list; each URL on its own line, bare', () => {
-  expect(SRC).toContain("Default 'rich': write NORMAL GFM markdown — tables (| a | b |), **bold**, *italic*, `code`, ```fenced``` — rendered natively via Telegram Rich Messages with NO escaping. Put each URL on its own line as a bare link with nothing attached before or after it (no **, colon or bracket); do not use [text](url). Use 'text' for plain unrendered output.")
+test('format (rich): only the three modes (WO-164 Chiron 21:10Z: how to write is on the text field, wo164-onsen-format.test.ts); no [links](url)', () => {
+  expect(SRC).toContain(`? "'rich'（預設）：Onsen 的 markdown rich（GFM），寫法見 text 的說明｜'text'：純文字、不做顯示處理｜'markdownv2'：Telegram 舊的跳脫模式。"`)
+  expect(SRC).not.toContain("Default 'rich': write NORMAL GFM markdown")
   expect(SRC).not.toContain('[links](url)')
 })
 

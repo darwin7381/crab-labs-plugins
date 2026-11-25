@@ -44,6 +44,7 @@ import { threadKeyOf, threadEvents, sentOf, titleOf, threadTitle, TITLE_V, previ
   type ThreadState, type ThreadView } from './lanes-threads.ts'
 import { spawn, spawnSync, type ChildProcess } from 'child_process'
 import { FLEET_TOOLS, ASK_MISSING, BECAUSE_MISSING, LINE_MISSING, LANE_DECIDE_LATER_TOOL, MAILBOX_CARD_TOOL } from './fleet-mail.ts'
+import { withOnsenFormat } from './fleet-text.ts'
 import { triageOn, triageShadow, triageAsk, triageRecord, promiseAsk, jevAsk, jevLog, jevKey, setJevKeyDefault, type TriageAsk } from './lanes-triage.ts'
 import { createHash, randomBytes, randomUUID } from 'crypto'
 import {
@@ -1202,19 +1203,32 @@ function freshRunOnThread(t: Thread): void {
 /** WO-164 titles (Chiron 17:18Z, 「串的標題照串鍵取」): the open threads titled before titles came from the key (no title_v) get theirs now, from the key and what
  *  is left of their first item (the old title is its first line; a call's peer; the topic's name). Onsen gets it as an ordinary change (syncThreads: the first
  *  event of the change carries the title; the start handshake treats the daemon as authoritative); what Onsen was told before is kept as the old title. A
- *  closed thread and a thread of its own (key item) keep theirs. At start, and for the threads a handshake takes in from Onsen. */
+ *  closed thread keeps its title. A thread of its own (key item) keeps it too, except a call a reflex lane took (mesh-<n>, its peer known: Chiron #200144).
+ *  Titled by 1.57.2 (title_v 2): only a call's changed since: its 「<對方>：因為：…」 loses the 「因為：」. At start, and for the threads a handshake takes in. */
 function retitleThreads(why: 'start' | 'handshake'): number {
   if (!threadKeysOn() || !S?.threads) return 0
   const changed: Array<{ thread: string; key: string; was: string | null; title: string }> = []
+  const self = String(D.agent ?? '').toLowerCase()
   for (const t of Object.values(S.threads)) {
-    if (!t.key_kind || !t.key || t.alias_of || t.state === 'closed' || t.title_v === TITLE_V || t.key_kind === 'item') continue
-    const self = String(D.agent ?? '').toLowerCase()
+    if (!t.key_kind || !t.key || t.alias_of || t.state === 'closed' || t.title_v === TITLE_V) continue
     const keyPeer = t.key_kind === 'peer_call' ? String(t.key).split('#')[0].toLowerCase() : ''
-    const peer = t.key_kind === 'peer_call' ? (t.peer ?? (keyPeer && keyPeer !== self ? keyPeer : null)) : null
-    const topic = t.key_kind === 'tg' ? String(t.key).split(':')[2] : undefined
+    // the peer of a call: a peer's thread (its id's agent), else the one that opened it (the reflex case writes it on a fresh thread)
+    const peer = t.key_kind === 'peer_call' ? (t.peer ?? (keyPeer && keyPeer !== self ? keyPeer : null)) : t.key_kind === 'item' && String(t.key).startsWith('mesh-') ? t.peer : null
     const was = t.title ?? null
-    const title = threadTitle(t.key_kind, t.key, { from: peer, text: was ?? '', topic_name: topic ? topicName(topic) ?? null : null })
+    const v2 = t.title_v === 2
     t.title_v = TITLE_V
+    let title = ''
+    if (v2) {
+      // 1.57.2's call title kept the head (「chiron：因為：WO-167…」); every other kind is as 1.57.2 titled it
+      if (!peer || !was?.startsWith(`${peer}：因為：`)) continue
+      title = threadTitle('peer_call', t.key, { from: peer, text: was.slice(peer.length + 1) })
+    } else if (t.key_kind === 'item') {
+      if (!peer) continue                                                    // a thread of its own that no peer's call opened: as before
+      title = threadTitle('item', t.key, { kind: 'peer_call', from: peer, text: was ?? '' })
+    } else {
+      const topic = t.key_kind === 'tg' ? String(t.key).split(':')[2] : undefined
+      title = threadTitle(t.key_kind, t.key, { from: peer, text: was ?? '', topic_name: topic ? topicName(topic) ?? null : null })
+    }
     if (!title || title === was) continue
     const sent = S.thread_sent?.[t.id]
     if (sent && sent.title === undefined) sent.title = was                   // what Onsen holds: the title the thread was opened with
@@ -5504,10 +5518,11 @@ export const LANE_TOOLS = [
   { name: 'curator_done', description: 'Curator lane only: you are done with the memory proposals; the write right returns to the main. summary = what you wrote, what you left as 建議刪除.',
     inputSchema: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } },
   { name: 'notify_joey', description: 'Report a result to Joey on Telegram, once per event. Put the one line Joey needs first. The router decides whether it rings and how much of it he reads (by the kind of event and your outcome); your lane is prefixed automatically.',
-    inputSchema: { type: 'object', properties: { text: { type: 'string' }, outcome: { type: 'string', enum: ['normal', 'changed', 'failed', 'needs_you'], description: 'required. normal: nothing new (Joey reads your first line). changed: something changed (he reads it all). failed: it failed (he reads it all). needs_you: Joey has to decide or do something before this matter can move (it rings, the same as ask_joey).' }, service: { type: 'string', description: 'the service the line is about (e.g. btcc-api); empty when it is about no service' }, check: { type: 'string', description: 'what about it (e.g. health, latency, backup): with service, the matter. Joey gets one line per matter and outcome across events: a repeat is not sent' } }, required: ['text', 'outcome'] } },
+    // WO-164 (Chiron 21:10Z): Onsen's text format on the field the words are written in (fleet-text.ts ONSEN_TEXT_FORMAT); the same on ask_joey and reply_agent
+    inputSchema: { type: 'object', properties: { text: { type: 'string', description: withOnsenFormat() }, outcome: { type: 'string', enum: ['normal', 'changed', 'failed', 'needs_you'], description: 'required. normal: nothing new (Joey reads your first line). changed: something changed (he reads it all). failed: it failed (he reads it all). needs_you: Joey has to decide or do something before this matter can move (it rings, the same as ask_joey).' }, service: { type: 'string', description: 'the service the line is about (e.g. btcc-api); empty when it is about no service' }, check: { type: 'string', description: 'what about it (e.g. health, latency, backup): with service, the matter. Joey gets one line per matter and outcome across events: a repeat is not sent' } }, required: ['text', 'outcome'] } },
   { name: 'reply_agent', description: 'Send to another agent as this agent, on one of the three lines (the agent-inbox rules). No line: the answer to the call that started this run goes back as a call (reply_to filled in); otherwise mail. line=mail: a letter in its mailbox, read within the hour; fill to, title (50 chars: who, about what, what you want), ask (what it must do, answer or decide: one line), text; optional deadline, no_reply (it only needs to know). line=call: pushed into its session now, only when something breaks within the hour or someone is waiting for the result; fill to, because (what breaks or who waits: one line), text; answering a call: reply_to = its btcc_msg_id (no because needed; the answer is no_reply). line=feed: a post on the wall that notifies nobody; fill title and text. thread and hop are attached to a call automatically.',
     inputSchema: { type: 'object', properties: { line: { type: 'string', enum: ['mail', 'call', 'feed'], description: 'mail | call | feed. None: a call back when answering the call that started this run, else mail' }, to: { type: 'string', description: 'mail and call' }, title: { type: 'string', description: 'mail and feed, 50 chars' },
-      ask: { type: 'string', description: 'mail: required, one line' }, because: { type: 'string', description: 'call: required unless reply_to' }, text: { type: 'string' }, reply_to: { type: 'string', description: 'call: the btcc_msg_id of the call you answer' },
+      ask: { type: 'string', description: 'mail: required, one line' }, because: { type: 'string', description: 'call: required unless reply_to' }, text: { type: 'string', description: withOnsenFormat() }, reply_to: { type: 'string', description: 'call: the btcc_msg_id of the call you answer' },
       no_reply: { type: 'boolean', description: 'mail only' }, deadline: { type: 'string', description: 'mail only: ISO time or hours' }, touches: { type: 'array', items: { type: 'string' }, description: 'feed only' }, ref: { type: 'string', description: 'feed only' } }, required: ['text'] } },
   { name: 'ledger_write', description: 'Append to the agent ledger. kind: action | commitment | memory_proposal | receipt.',
     inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['action', 'commitment', 'memory_proposal', 'receipt'] }, text: { type: 'string' }, refs: { type: 'object' } }, required: ['kind', 'text'] } },
@@ -5516,7 +5531,7 @@ export const LANE_TOOLS = [
   { name: 'followup', description: 'Schedule a follow-up check on this same thread. Use it when the task says to act only if a condition lasts a while, or to look again later: do not just end. `after_minutes` from now the router starts a follow-up lane on this thread with your note. Close this run as usual (notify_joey / receipt).',
     inputSchema: { type: 'object', properties: { after_minutes: { type: 'number', description: 'minutes from now (1-240)' }, note: { type: 'string', description: 'what to check again, what to do if it still holds, the scheduler run_id if any' } }, required: ['after_minutes', 'note'] } },
   { name: 'ask_joey', description: 'Ask Joey to decide, or tell him something he must know now (critical, suspicious, beyond what you can fix and it cannot wait). Always rings, so use it once per event and say everything in that one message: what happened, what you found, what you did, what he must decide. The main reads it in its next digest; do NOT also hand it to the main.',
-    inputSchema: { type: 'object', properties: { text: { type: 'string' }, outcome: { type: 'string', enum: ['normal', 'changed', 'failed'], description: 'normal (nothing new: Joey reads your first line), changed, or failed (he reads it all)' }, service: { type: 'string', description: 'the service the line is about (e.g. btcc-api); empty when it is about no service' }, check: { type: 'string', description: 'what about it (e.g. health, latency, backup): with service, the matter. Joey gets one line per matter and outcome across events: a repeat is not sent' } }, required: ['text'] } },
+    inputSchema: { type: 'object', properties: { text: { type: 'string', description: withOnsenFormat() }, outcome: { type: 'string', enum: ['normal', 'changed', 'failed'], description: 'normal (nothing new: Joey reads your first line), changed, or failed (he reads it all)' }, service: { type: 'string', description: 'the service the line is about (e.g. btcc-api); empty when it is about no service' }, check: { type: 'string', description: 'what about it (e.g. health, latency, backup): with service, the matter. Joey gets one line per matter and outcome across events: a repeat is not sent' } }, required: ['text'] } },
   CHAT_HISTORY_TOOL,   // Onsen (WO-139): the conversation's history, read only (D.chatHistory)
   { name: 'handoff_main', description: 'Hand this work to the main session (a promise on behalf of the agent, an irreversible action, something that needs the main\'s context or tools). The main is woken with your text, takes over and reports to Joey itself. Do NOT notify Joey about it yourself.',
     inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'everything the main needs: who asked what (ids, exact text), what you found, what is left to do' } }, required: ['text'] } },

@@ -11,7 +11,7 @@
 // (core.kbro.ai /api/feed/*). The daemon calls both with this agent's own mesh credential, so the sender
 // is whoever the credential says, never a name in the body. The wall never pushes: these tools are the
 // only way anything on it reaches an agent, and only when the agent asks.
-import { FLEET_TEXT } from './fleet-text.ts'
+import { FLEET_TEXT, withOnsenFormat } from './fleet-text.ts'
 import { recipientNote } from './onsen-inbox.ts'
 
 export const FLEET_INSTRUCTIONS = FLEET_TEXT
@@ -86,7 +86,7 @@ export const FLEET_TOOLS = [
       required: ['id', 'body'],
       properties: {
         id: { type: 'integer', description: '要回的那封信的編號' },
-        body: { type: 'string', description: '內容。最多 3500 字' },
+        body: { type: 'string', description: withOnsenFormat('內容。最多 3500 字') },   // WO-164 (Chiron 21:10Z): Onsen's text format (fleet-text.ts)
         title: { type: 'string', description: `選填：標題（${TITLE_MAX} 字內，超過會自動截短）；沒填是「回覆：原標題」` },
       },
     },
@@ -504,7 +504,7 @@ export const SEND_TOOL = {
       line: { type: 'string', enum: ['feed', 'mail', 'call'], description: '必填，feed｜mail｜call。' },
       to: { type: 'string', description: 'mail、call 必填；feed 不填。' },
       title: { type: 'string', description: 'feed、mail 必填，50 字內，超過自動截短。' },
-      text: { type: 'string', description: '必填。' },
+      text: { type: 'string', description: withOnsenFormat('必填。') },   // WO-164 (Chiron 21:10Z): Onsen's text format, every line (fleet-text.ts)
       ask: { type: 'string', description: 'mail 必填（一句）。' },
       because: { type: 'string', description: 'call 必填（一句）；帶 reply_to 的回覆不用填。' },
       deadline: { type: 'string', description: 'mail 選填。' },
