@@ -4673,7 +4673,9 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function deliverPulled(it: PullItem): Promise<HandResult> {
-  const p = (it.payload ?? {}) as InboundBody
+  // the sender's facts in Onsen's own fields (0.9.3) count as much as the payload's: an item whose no_reply is only a top-level fact is still a
+  // no-reply answer to the router (Chiron WO-158 11:56Z: a no_reply peer_call sent that way opened a lane)
+  const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}) } as InboundBody
   const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
   const sender = String(it.sender ?? 'unknown').slice(0, 64)
   const unverified = it.unverified === true

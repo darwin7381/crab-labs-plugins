@@ -1,3 +1,7 @@
+## 1.52.1 — 2026-11-25
+
+- **A pulled item's top-level `no_reply` fact counts like the payload's** (board WO-158, Chiron 11:56Z: a `peer_call` sent straight to Onsen `/send` with `no_reply: true` only at the top was routed `mesh-peer-call → lane`). `deliverPulled` merges it into the body, so the router sees `no_reply` and files it `mesh-no-reply → ledger`. A real `send_to_agent` reply already carried it in the payload (checked live 12:33Z: chiron's routing row for msg 11961, `mesh-no-reply → ledger`). Test: `onsen-pull-daemon.test.ts`.
+
 ## 1.52.0 — 2026-11-25
 
 - **Onsen part 5, the daemon half: the old delivery path is taken out, Onsen is the only one (board WO-158, Chiron; Joey TG chiron:2403 「搞了一堆卡在中間才造成那麼多問題…果斷一點馬上解決」, 2405; agent-inbox 1.22.0 carries the same code, which runs there).**

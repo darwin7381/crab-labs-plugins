@@ -30,16 +30,16 @@ const CRED_PAT = 'mesh_PULLpatSECRETsecretSECRETsecret012345'
 const sha = (s: string) => createHash('sha256').update(s).digest('hex')
 
 // ------------------------------------------------------------------ the stand-in Onsen (its state lives here: the server can stop and start again)
-type MItem = { recipient: string; seq: number; sender: string; relay: string | null; kind: string; payload: any; dedupe: string | null; acked: boolean; unverified: boolean }
+type MItem = { recipient: string; seq: number; sender: string; relay: string | null; kind: string; payload: any; dedupe: string | null; acked: boolean; unverified: boolean; no_reply?: boolean | null }
 const store = { items: [] as MItem[], last: new Map<string, number>(), polledAt: new Map<string, number>(), sends: [] as any[], polls: [] as string[], acked: new Map<string, number>() }
 const CALLER: Record<string, string> = { [CRED_ON]: 'adam', [CRED_OFF]: 'adam-off', [CRED_SND]: 'zed', [CRED_PAT]: 'pat' }
-function put(recipient: string, sender: string, relay: string | null, kind: string, payload: any, dedupe?: string | null, unverified = false): { to: string; seq: number; duplicate: boolean } {
+function put(recipient: string, sender: string, relay: string | null, kind: string, payload: any, dedupe?: string | null, unverified = false, topNoReply: boolean | null = null): { to: string; seq: number; duplicate: boolean } {
   const key = dedupe || (Number.isInteger(payload?.msg_id) ? `msg:${payload.msg_id}` : null)
   const had = key ? store.items.find(i => i.recipient === recipient && i.dedupe === key) : undefined
   if (had) return { to: recipient, seq: had.seq, duplicate: true }
   const seq = (store.last.get(recipient) ?? 0) + 1
   store.last.set(recipient, seq)
-  store.items.push({ recipient, seq, sender, relay, kind, payload, dedupe: key, acked: false, unverified })
+  store.items.push({ recipient, seq, sender, relay, kind, payload, dedupe: key, acked: false, unverified, no_reply: topNoReply })
   return { to: recipient, seq, duplicate: false }
 }
 let onsenPort = 0, onsenSrv: ReturnType<typeof Bun.serve> | null = null
@@ -70,7 +70,7 @@ function startOnsen(): void {
       }
       // the item carries its dedupe key (the server change this daemon reads: onsen5.py _item + "dedupe")
       return Response.json({ agent: caller, last_seq: store.last.get(caller) ?? 0, acked_seq: store.acked.get(caller) ?? 0,
-        items: rows.map(i => ({ seq: i.seq, sender: i.sender, relay: i.relay, kind: i.kind, payload: i.payload, dedupe: i.dedupe, unverified: i.unverified, at: new Date().toISOString(), given: 1 })) })
+        items: rows.map(i => ({ seq: i.seq, sender: i.sender, relay: i.relay, kind: i.kind, payload: i.payload, dedupe: i.dedupe, unverified: i.unverified, no_reply: i.no_reply ?? null, at: new Date().toISOString(), given: 1 })) })
     }
     if (path === '/inbox/ack' && req.method === 'POST') {
       let n = 0
@@ -222,6 +222,10 @@ test('(a) first start: begins after Onsen\'s acked_seq (the 3 items sent before 
   expect(typeof h2.last_poll_at).toBe('string')
   expect(inOn.log()).toMatch(/onsen inbox: item 4 \(call\) from eve msg:501: handed on/)
   expect(inOn.log()).not.toContain(CRED_ON)
+  // 1.52.1: no_reply only as Onsen's top-level fact (not in the payload) is still a no-reply answer: the ledger, not a lane (Chiron WO-158 11:56Z)
+  put('adam', 'eve', null, 'peer_call', { text: 'WO158 top-level no_reply' }, null, false, true)
+  expect(await until(() => rowsOf(on, 'WO158 top-level no_reply').length > 0, 15000)).toBe(true)
+  expect(key(rowsOf(on, 'WO158 top-level no_reply')[0])).toMatch(/^mesh-no-reply\|ledger\|/)
 }, 90000)
 
 test('(b) both paths with one key: delivered once, either order; an explicit key and msg:<id>; an unsigned /inject records nothing', async () => {
