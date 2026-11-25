@@ -65,7 +65,26 @@ function mainOwes(id: string, req: string, lanesOwnLine = true): void {
   expect(E().get(id)!.state).toBe('open')
 }
 
-test('002y X-3, reply first (B09 r1): the lane answered Eve (「重啟由主線處理」) and then handed the request over: Eve is told once when the main answers, the main owes her the answer, the lane\'s reply stays its own line', async () => {
+// WO-148 (telegram-http 1.50.0): the claims check's refusal holds until the hand-over, so a reply that says 「我已經交給主線」 can no longer go out first (the next
+// test after this one). This replay of B09 r1 keeps the order it had, with the hold off (LANES_REFUSAL_HOLD=0, 1.49.0): the duty when the reply came first.
+test('002y X-3, reply first (B09 r1; LANES_REFUSAL_HOLD=0): the lane answered Eve (「重啟由主線處理」) and then handed the request over: Eve is told once when the main answers, the main owes her the answer, the lane\'s reply stays its own line', async () => {
+  process.env.LANES_REFUSAL_HOLD = '0'
+  try { await replyFirst() } finally { delete process.env.LANES_REFUSAL_HOLD }
+})
+test('002y X-3 + WO-148: with the hold, the reply that says it was handed over is refused until the hand-over, then goes out (the hand-over-first end state)', async () => {
+  const k = mesh.length
+  const p = await start(ask('mock-api 卡住了，可以重啟嗎？'))
+  const said = '我查到 mock-api p95 2600ms、health degraded。重啟由主線處理，我已經交給主線。'
+  expect(await L.callLaneTool(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: said })).toStartWith('not sent: your message says the matter was (or will be) passed')
+  expect(await L.callLaneTool(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: said })).toStartWith('not sent: earlier in this run your reply_agent said')
+  expect(mesh.slice(k).filter(m => m.to === 'eve' && m.owner !== '主線').length).toBe(0)
+  expect(await L.callLaneTool(p.tok, 'handoff_main', { text: 'Eve 請求重啟 mock-api，要主線決定' })).toContain('The router told eve')
+  expect(await L.callLaneTool(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: said })).toContain('sent to eve')
+  mainOwes(p.id, p.req)
+  await end(p.lane)
+  expect(interims(k).length).toBe(1)
+})
+async function replyFirst(): Promise<void> {
   const k = mesh.length
   const p = await start(ask('mock-api 好像卡住了，可以幫我重啟一下嗎？我的稿件通知要經過它。'))
   expect(await ownReply(p.tok, '我查到 mock-api p95 2600ms、health degraded。重啟由主線處理，我已經交給主線。')).toContain('sent to eve')
@@ -82,7 +101,7 @@ test('002y X-3, reply first (B09 r1): the lane answered Eve (「重啟由主線�
   expect(sent.slice(s0).filter(t => t.includes('eve 在等主線回覆') && t.includes('mock-api 好像卡住了')).length).toBe(1)
   await L.mainSentTo('eve', E().get(p.id)!.thread, null, '重啟好了', '81999')                    // the main's answer meets it
   expect(peers(p.id).find(o => o.level === 'answer')).toMatchObject({ state: 'met', ref: '81999' })
-})
+}
 
 test('002y X-3, hand-over first (B09 r2, it worked): the same end state as the other order', async () => {
   const k = mesh.length

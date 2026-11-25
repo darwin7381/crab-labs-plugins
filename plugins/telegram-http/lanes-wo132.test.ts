@@ -156,7 +156,7 @@ test('WO-132 #2 + #3, replay of Prometheus 09:27:21–09:28:10Z: four alerts, on
   // #3: the run's 〔車道資訊〕: the main in a turn since when, on what; no other lane of the agent running
   const at = L.__lanesState().lanes[r.lane].last
   expect(r.prompt).toContain(`# 此刻（系統寫的，時間為 UTC+8）\n主線：回合中（自 ${hhmm(new Date().toISOString())} 起，在處理：〔交給主線｜ho-a248c3〕#11128 警報 1359 critical（未勾、未 ack）：Traefik 3 則公告（11-24）。`)
-  expect(r.prompt).toContain('…）\n這一隻此刻沒有別的分身在跑\n\n# 主線最近和 Joey 的對話')        // 1.46.0 (WO-144): the conversation block between 此刻 and the focus card
+  expect(r.prompt).toContain('…）\n這一隻此刻沒有別的分身在跑\n\n# Joey 最近對主線說的，和主線怎麼回')        // 1.46.0 (WO-144): the conversation block between 此刻 and the focus card (WO-148: its title)
   expect(r.prompt.indexOf('# 此刻（')).toBeLessThan(r.prompt.indexOf('# 焦點卡'))
   expect(at).toBeTruthy()
   // the three later alerts, in their order: merged into the run in progress, no lane of their own

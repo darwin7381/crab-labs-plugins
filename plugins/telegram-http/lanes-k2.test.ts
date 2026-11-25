@@ -1,6 +1,7 @@
 // Universe 002k (K2, Recommendation 2B): before a lane's reply_agent or the main's send_to_agent goes to ANY peer, Jev is asked Nouls in one request; since WO-140
 // (Chiron, 2026-11-25) two (credential, hiding something from Joey: the machine-or-network-details question is gone). p >= 0.8 on either refuses once with a tool
-// error that names it. Jev is a local stand-in; nothing leaves the machine.
+// error that names it. Jev is a local stand-in; nothing leaves the machine. WO-148 (telegram-http 1.50.0): a lane's refusal has no free second pass (its next send
+// is checked again, the same text refused again without a call); the main keeps its once.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 import { tmpdir } from 'os'
@@ -60,18 +61,32 @@ test('K2: a reply_agent that gives a credential is refused with a tool error tha
   expect(led.length).toBe(1); expect(led[0]).toMatchObject({ lane: 'adam.reflex.1', thread: 'adam#t-1', kind: 'action', refs: { which: ['gives_credential'], to: 'eve', tool: 'reply_agent' } })
 })
 
-test('K2: refuse once: the next send of that sender to that peer goes out as written, then the check starts again; other senders and other peers are separate', async () => {
+test('K2: refused, then (WO-148: no free second pass for a lane) the same text to that peer is refused again without a call; a changed text is checked; other senders and other peers are separate', async () => {
   reset(); answerFor = t => t.includes('sk-live') ? { gives_credential: 0.95 } : {}
   const n0 = meshed.length
   await expect(reply(2, 'cain', KEY)).rejects.toThrow(/credential/)
   expect(calls.length).toBe(1)
-  expect(await reply(2, 'cain', KEY)).toContain('sent to cain')                              // refused once: this one goes out, with no call
-  expect(calls.length).toBe(1); expect(meshed.length).toBe(n0 + 1)
-  await expect(reply(2, 'cain', KEY)).rejects.toThrow(/credential/)                            // and the check is back
-  expect(calls.length).toBe(2)
-  await expect(reply(1, 'cain', KEY)).rejects.toThrow(/credential/)                            // another lane to the same peer: its own once
-  await expect(reply(2, 'eve', KEY)).rejects.toThrow(/credential/)                             // the same lane to another peer: its own once
+  await expect(reply(2, 'cain', KEY)).rejects.toThrow(/\(it is checked again; the same text is refused again\)/)   // 1.49.0 let this one out unchecked
+  expect(calls.length).toBe(1); expect(meshed.length).toBe(n0)
+  expect(rows('run/peer-disclosure.jsonl').at(-1)).toMatchObject({ sender: 'adam.reflex.2', to: 'cain', refused: true, again: true })
+  expect(await reply(2, 'cain', OK)).toContain('sent to cain')                                // the corrected text: checked, it goes out
+  expect(calls.length).toBe(2); expect(meshed.length).toBe(n0 + 1)
+  await expect(reply(1, 'cain', KEY)).rejects.toThrow(/credential/)                            // another lane to the same peer: checked on its own
+  await expect(reply(2, 'eve', KEY)).rejects.toThrow(/credential/)                             // the same lane to another peer: checked on its own
   expect(calls.length).toBe(4)
+})
+
+test('K2: LANES_REFUSAL_HOLD=0: as 1.49.0, refuse once: the next send of that sender to that peer goes out as written, then the check starts again', async () => {
+  reset(); answerFor = t => t.includes('sk-live') ? { gives_credential: 0.95 } : {}
+  process.env.LANES_REFUSAL_HOLD = '0'
+  try {
+    const n0 = meshed.length
+    await expect(reply(2, 'cain', KEY)).rejects.toThrow(/\(your next message to cain goes out as you write it\)/)
+    expect(await reply(2, 'cain', KEY)).toContain('sent to cain')                              // refused once: this one goes out, with no call
+    expect(calls.length).toBe(1); expect(meshed.length).toBe(n0 + 1)
+    await expect(reply(2, 'cain', KEY)).rejects.toThrow(/credential/)                          // and the check is back
+    expect(calls.length).toBe(2)
+  } finally { delete process.env.LANES_REFUSAL_HOLD }
 })
 
 test('K2: each of the two names which, both at once name both; the threshold is 0.8 (0.79 goes, 0.8 does not); machine details are not asked (WO-140)', async () => {
@@ -202,14 +217,14 @@ test('K2: server.ts asks before it sends: checkPeerSend comes before sendToAgent
   expect(r.isError).toBe(true); expect(r.content[0].text).toBe(refusal)
 })
 
-test('K2: a lane\'s once belongs to its run (like A3): a later run of the same lane to the same peer is checked afresh; the second send is logged as the once', async () => {
+test('K2: a lane\'s refusal belongs to its run (like A3): a later run of the same lane to the same peer is checked afresh; WO-148: the same run\'s same text is refused again without a call', async () => {
   reset(); answerFor = t => t.includes('sk-live') ? { gives_credential: 0.95 } : {}
   const t1 = { ...tok(1), runId: 'adam.reflex.1.r7' }, t2 = { ...tok(1), runId: 'adam.reflex.1.r8' }
   await expect(L.callLaneTool(t1, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).rejects.toThrow(/credential/)
-  await expect(L.callLaneTool(t2, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).rejects.toThrow(/credential/)    // another run: its own once
+  await expect(L.callLaneTool(t2, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).rejects.toThrow(/credential/)    // another run: checked on its own
   expect(calls.length).toBe(2)
-  expect(await L.callLaneTool(t1, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).toContain('sent to eve')
-  expect(calls.length).toBe(2); expect(rows('run/peer-disclosure.jsonl').at(-1)).toMatchObject({ sender: 'adam.reflex.1', to: 'eve', refused: false, once: true })
+  await expect(L.callLaneTool(t1, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: KEY })).rejects.toThrow(/credential/)    // 1.49.0: the once let it out
+  expect(calls.length).toBe(2); expect(rows('run/peer-disclosure.jsonl').at(-1)).toMatchObject({ sender: 'adam.reflex.1', to: 'eve', refused: true, again: true })
 })
 
 test('K2: the program\'s own refusals (thread stopped, already answered by the router) come first: no Jev call, and the once is not used up', async () => {

@@ -55,7 +55,7 @@ test('a mail-lane run that opened a mail and handed it to the main: the lane giv
   expect(sent).toEqual([])
 })
 
-test('a mail-lane run that hands the list back without opening any mail is sent back once: open first; a second call goes through', async () => {
+test('a mail-lane run that hands the list back without opening any mail is sent back: open first; WO-148: sent back again until a mailbox_open is tried (a failed one counts)', async () => {
   const d = await L.routeEvent(reminder())
   expect(await until(() => !!L.__runTok(d.lane!))).toBe(true)
   const tok = L.__runTok(d.lane!)!
@@ -66,10 +66,16 @@ test('a mail-lane run that hands the list back without opening any mail is sent 
   await L.callLaneTool(tok, 'mailbox_open', { id: 77 })
   expect(await L.callLaneTool(tok, 'handoff_main', { text: '#77 eve，期限無；要 adam 決定維護時段；信裡：下週幾；建議：每週三 02:00；沒查：無。' })).toContain('handed to the main')
   await done(d.lane!)
-  const d2 = await L.routeEvent(reminder())                                    // the mailbox cannot be read: the second call is let through
+  const d2 = await L.routeEvent(reminder())                                    // the mailbox cannot be read: the hand-over goes once a mailbox_open was tried
   expect(await until(() => !!L.__runTok(d2.lane!))).toBe(true)
   const tok2 = L.__runTok(d2.lane!)!
   expect(await L.callLaneTool(tok2, 'handoff_main', { text: '信箱工具壞了，打不開' })).toContain('not handed over')
-  expect(await L.callLaneTool(tok2, 'handoff_main', { text: '信箱工具壞了，打不開；#77 請主線自己讀' })).toContain('handed to the main')
+  // WO-148 (1.49.0 let the second call through): rewording the hand-over does not count; the run never tried mailbox_open
+  expect(await L.callLaneTool(tok2, 'handoff_main', { text: '信箱工具壞了，打不開；#77 請主線自己讀' })).toStartWith('not handed over: this run still has not opened any mail')
+  L.__setMailTool(async b => { mailCalls.push(b); return { text: 'mailbox: the agent-inbox daemon refused', isError: true } })
+  try { await expect(L.callLaneTool(tok2, 'mailbox_open', { id: 77 })).rejects.toThrow('mailbox: the agent-inbox daemon refused') }
+  finally { L.__setMailTool(async b => { mailCalls.push(b); return b.name === 'mailbox_reply' ? { text: '回信放進對方信箱了（#9001，不用回）。', isError: false, to: 'eve' }
+    : b.name === 'mailbox_open' ? { text: '#77 來自 eve｜維護時段\n要你：回時段\n\n下週幾？', isError: false } : { text: '1 封未讀、0 封已讀還沒勾掉：\n#77｜eve｜維護時段', isError: false } }) }
+  expect(await L.callLaneTool(tok2, 'handoff_main', { text: '信箱工具壞了，mailbox_open #77 失敗；#77 請主線自己讀' })).toContain('handed to the main')   // the failed open counts
   await done(d2.lane!)
 })

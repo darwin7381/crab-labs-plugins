@@ -101,8 +101,9 @@ const DECISION_MAIN_RULE_MAIN = '- 分身交來要你決定的事附著決定卡
 export const decisionMainRule = (): string => decisionReporter() === 'main' ? DECISION_MAIN_RULE_MAIN : DECISION_MAIN_RULE
 
 // ------------------------------------------------------------------ WO-128: what can wait does not wake the main (Chiron's ticket; the words are its, verbatim)
-/** WO-144 item 2 (Chiron's words, verbatim; the 但書 from Joey TG chiron:2263): the line before the 「沒把握」 line, in the default card and so in the card built from .lanes/boundary.md */
-export const BOUNDARY_LOOK_LINE = '判斷之前：先看上面「主線最近和 Joey 的對話」；跟這件事有關的不夠，用 chat_history 搜（工單編號、標題裡的詞）。Joey 在對話裡已經講定的事，照他講的做，回報或交回時附那一則的編號。但書：對話裡還在談、沒有講定的，不算；主線正在回合中而且在處理同一件事（看上面「此刻」），交給主線，不跟它同時動手。'
+/** WO-144 item 2 (Chiron's words, verbatim; the 但書 from Joey TG chiron:2263): the line before the 「沒把握」 line, in the default card and so in the card built
+ *  from .lanes/boundary.md. WO-148: the block it points at is titled 「Joey 最近對主線說的，和主線怎麼回」 now; only that name changed */
+export const BOUNDARY_LOOK_LINE = '判斷之前：先看上面「Joey 最近對主線說的，和主線怎麼回」；跟這件事有關的不夠，用 chat_history 搜（工單編號、標題裡的詞）。Joey 在對話裡已經講定的事，照他講的做，回報或交回時附那一則的編號。但書：對話裡還在談、沒有講定的，不算；主線正在回合中而且在處理同一件事（看上面「此刻」），交給主線，不跟它同時動手。'
 /** item 5: the boundary card's line, in place of 「沒把握：交給主線，不猜著做完。」 */
 export const BOUNDARY_DEFER_LINE = '要主線決定的那一步：等得起就用 decide_later 放進主線的信箱，不叫醒它；等不起才叫醒，寫出什麼會壞、誰在等。沒把握：當它等得起，不叫醒，也不猜著做完。'
 /** item 5: the main's rule, right after the decision card's */
@@ -198,10 +199,13 @@ export function stepsNotDoneText(steps: Step[]): string {
   return steps.map((s, i) => ({ s, i })).filter(x => !x.s.done).map(x => `第 ${x.i + 1} 步「${x.s.step}」${x.s.note ? `（${x.s.note}）` : ''}`).join('、')
 }
 /** WO-125 C: a step not done and a success outcome, in a run that handed nothing to the main. The words 「把沒做的那幾步交給主線，或把結果改成部分完成」
- *  are the ticket's; either way out is accepted: after an accepted handoff_main in the run the receipt goes through with its steps as they are. */
+ *  are the ticket's; either way out is accepted: after an accepted handoff_main in the run the receipt goes through with its steps as they are.
+ *  WO-148 (item 2, angelia.reflex.13: step ② refused as not done, then resent as done with a reason and recorded): the refusal holds for the run (stepsHeld) */
 export function stepsRefusal(outcome: string, steps: Step[]): string {
+  const reportOnly = steps.filter(s => !s.done).every(s => REPORT_STEP_RE.test(`${s.step} ${s.note ?? ''}`))
   return `沒有記錄：steps 裡有沒做的步驟（${stepsNotDoneText(steps)}），結果不能填 ${outcome}。把沒做的那幾步交給主線，或把結果改成部分完成：`
     + '交給主線＝先 handoff_main（寫清楚哪幾步沒做、為什麼），再送這份回執，沒做的步驟照樣寫 done=false；部分完成＝outcome 填 failed（排程端記成 failed），did 寫哪幾步做了、哪幾步沒做。'
+    + (refusalHoldOn() ? `${reportOnly ? '沒做的是回報 Joey：用 notify_joey 送出，那一步就算做了。' : ''}這一趟在交給主線之前，結果填 done、ok、normal 的回執都不會記錄，把沒做的步驟改寫成 done 也一樣。` : '')
 }
 // ------------------------------------------------------------------ WO-129 (telegram-http 1.39.0): the run a schedule gave a lane has one receipt path, with steps
 // Chiron's ticket. With LANES_RECEIPT_STEPS on: a scheduled run's receipt carries steps (refused without); a lane completes a scheduled run only with the
@@ -284,12 +288,36 @@ export function mainAskPhrase(text: string): string {
   }
   return ''
 }
-/** item 5: the refusal (once per run) of a notify_joey / ask_joey that says the main takes over, from a run that handed nothing to the main */
-export function mainAskRefusal(tool: string, phrase: string): string {
+/** item 5: the refusal of a notify_joey / ask_joey that says the main takes over, from a run that handed nothing to the main. WO-148 (item 2,
+ *  chiron.mail.3.r6: 「留給主線」 refused, then rewritten as 「純知會」 and sent, nothing handed over): it holds until a hand-over (`holds`); LANES_REFUSAL_HOLD=0,
+ *  or a fork (it cannot hand over: handoff_main is refused to it): once, as 1.49.0 */
+export function mainAskRefusal(tool: string, phrase: string, holds = refusalHoldOn()): string {
   return `沒有送出：這一則 ${tool} 說主線會接手或要主線做事（「${phrase}」），但這一趟沒有交給主線（沒有 handoff_main、decide_later、mailbox_card），主線不會被叫醒，也看不到。`
     + '要主線做的：先用 handoff_main 交給它（寫清楚要它做什麼；等得起、只要它決定的用 decide_later），交了之後由主線回報 Joey，你不用再通知 Joey。'
-    + '不需要主線的：把那一句拿掉，再送一次。這個提醒一趟只有一次。'
+    + (holds ? '這一趟在交給主線之前，notify_joey／ask_joey 都不會送出，拿掉或改寫那一句也一樣。' : '不需要主線的：把那一句拿掉，再送一次。這個提醒一趟只有一次。')
 }
+
+// ------------------------------------------------------------------ WO-148 (telegram-http 1.50.0): a refusal holds for the rest of the run (Chiron's recount)
+/** a refusal that wants an action holds until the action is done in the run (default on; `0` = 1.49.0: refused once, the second try passes) */
+export const refusalHoldOn = (): boolean => process.env.LANES_REFUSAL_HOLD !== '0'
+/** main_ask held: a later notify_joey / ask_joey of a run that said the main takes over and has not handed anything over yet */
+export function mainAskHeld(phrase: string): string {
+  return `沒有送出：這一趟稍早的一則說主線會接手或要主線做事（「${phrase}」），到現在還沒有交給主線。`
+    + '先用 handoff_main 交給它（寫清楚要它做什麼；等得起、只要它決定的用 decide_later；同事的信用 mailbox_card），交了之後由主線回報 Joey；'
+    + '在那之前 notify_joey／ask_joey 都不會送出，改寫那一句也一樣。'
+}
+/** receipt_steps held: a later receipt filed as a success in a run whose receipt listed a step not done, before a hand-over. `reportOnly`: every step not done
+ *  is the report to Joey (REPORT_STEP_RE), which a notify_joey meets */
+export function stepsHeld(notDone: string, reportOnly = false): string {
+  return `沒有記錄：這一趟稍早的回執寫了沒做的步驟（${notDone}），到現在還沒有交給主線。結果要填 done、ok 或 normal：`
+    + '先 handoff_main 把那幾步交給主線（寫清楚哪幾步沒做、為什麼），再送這份回執，那幾步照樣寫 done=false；不交：outcome 填 failed（部分完成），did 寫哪幾步做了、哪幾步沒做。'
+    + (reportOnly ? '沒做的是回報 Joey：用 notify_joey 送出，那一步就算做了。' : '')
+    + '把那幾步改寫成 done 不算。'
+}
+/** mail_open held: a mail lane's second handoff_main of a run that has not opened any mail (1.36.1's rule, once until 1.49.0) */
+export const MAIL_OPEN_HELD = 'not handed over: this run still has not opened any mail (mailbox_open), and this hand-over was sent back once already. '
+  + 'Open the mails first (mailbox_open on each), then hand over what the main must decide; if mailbox_open fails, call handoff_main again: the failed open counts. '
+  + 'Rewording the hand-over does not count.'
 /** item 6: what a notify_joey refused by the notice de-duplication says in its tool result (Joey already got the same line: the step is done) */
 export const DEDUPE_DONE_NOTE = '（Joey 已經收過同一則，這一步算做了：receipt 的 steps 裡回報 Joey 的那一步填 done=true。）'
 /** item 6: a step of a receipt that is the report to Joey (its words, or its note) */

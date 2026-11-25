@@ -322,11 +322,13 @@ test('the lane stop hook is a 40-line script that asks the daemon (no transcript
   expect(src).toContain('/lane-stop'); expect(src).not.toContain('transcript_path'); expect(src).not.toContain('high-frequency'); expect(src).not.toContain('後續檢查')
 })
 
-test('002m aid (b), reduced: a message that claims the matter went to Joey or the main while the record says nobody has it is sent back once; after a hand-over the owner is stamped', async () => {
+test('002m aid (b), reduced: a message that claims the matter went to Joey or the main while the record says nobody has it is sent back (WO-148: until ask_joey or a hand-over); after a hand-over the owner is stamped', async () => {
   const p = await start(mk('eve', '可以幫我開 prod 的權限嗎？'))
   const w = await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '這件事我轉給 Joey 決定。' })
   expect(w).toContain('the event record says'); expect(mesh.filter(m => m.text === '這件事我轉給 Joey 決定。').length).toBe(0)
-  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '這件事我轉給 Joey 決定。' })).toContain('sent to eve')   // once
+  // WO-148: refused again until the claim is made true (1.49.0 let this second one out)
+  expect(await call(p.tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '這件事我轉給 Joey 決定。' })).toContain('earlier in this run your reply_agent said')
+  expect(mesh.filter(m => m.text === '這件事我轉給 Joey 決定。').length).toBe(0)
   await call(p.tok, 'handoff_main', { text: 'Eve 要 prod 權限，要主線決定' })
   await end(p.lane)
   const q = await start(mk('cain', '幫我看 mock-api'))

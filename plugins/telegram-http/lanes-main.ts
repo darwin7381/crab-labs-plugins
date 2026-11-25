@@ -129,6 +129,7 @@ export function createMain(E: MainEnv) {
   const outputs = new Map<string, Output[]>()            // prompt id → the reply / send_to_agent calls of that turn (answered gate)
   const calls = new Map<string, Turn['calls']>()          // prompt id → every tool call of that turn with its result (the summary gate)
   const starts = new Map<string, { prompt: string; at: string; prev: string | null }>()   // gen → its running turn's start, and the start of the turn before
+  const openTools = new Map<string, { name: string; input: any; at: string }>()   // WO-148 (item 3): gen → the tool its turn has open now (PreToolUse → PostToolUse)
   // 002v (002s r2 G02, u002s-G02-s2-r2-20261119-221622): gen → the work its turns carry on: the items of the last turn that took any in, and every
   // output since. A turn that takes in nothing (a background task's notification opened it, Claude Code starts it on its own) continues that work:
   // the last-words check reads the work's messages and outputs for it (that turn ended on Joey's 194, never sent, and had no items to ask about).
@@ -145,7 +146,7 @@ export function createMain(E: MainEnv) {
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
     cur = null; stuck = null; offering = false
-    lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear()
+    lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear(); openTools.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
     const g = live[live.length - 1]
@@ -159,6 +160,11 @@ export function createMain(E: MainEnv) {
   function mainPhase(): MainPhase { return (currentGen()?.state as MainPhase) ?? 'gone' }
   /** WO-132 (item 3): when the main's running turn started (this daemon saw its first hook event), or null (not in a turn, or begun before this daemon) */
   function turnStart(): string | null { const g = currentGen(); const st = g ? starts.get(g.id) : undefined; return g && g.state === 'in_turn' && st && st.prompt === g.prompt_id ? st.at : null }
+  /** WO-148 (item 3): the tool the main's running turn has open now (name, input, since when), or null; seen by this daemon's hooks only */
+  function openTool(): { name: string; input: any; at: string } | null {
+    const g = currentGen()
+    return g && g.state === 'in_turn' && g.tool_open ? openTools.get(g.id) ?? null : null
+  }
   /** the main is there: a live gen that is not walled */
   function mainUp(): boolean { const p = mainPhase(); return p === 'idle' || p === 'in_turn' || p === 'starting' }
   function mainSession(): { session_id: string; pid: number; transcript_path: string } | null {
@@ -357,7 +363,7 @@ export function createMain(E: MainEnv) {
     if (g.prompt_id === prompt) return
     if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
     if (g.prompt_id) requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted')       // a turn that never got Stop or StopFailure
-    outputs.clear(); calls.clear()                                                                   // the aids look at this prompt's calls only
+    outputs.clear(); calls.clear(); openTools.delete(g.id)                                          // the aids look at this prompt's calls only
     starts.set(g.id, { prompt, at: new Date().toISOString(), prev: starts.get(g.id)?.at ?? null })
     setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
     const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
@@ -413,6 +419,7 @@ export function createMain(E: MainEnv) {
       case 'PreToolUse': {
         if (!p) return {}
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
+        openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_input ?? null, at: new Date().toISOString() })   // WO-148 (item 3)
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
@@ -438,7 +445,7 @@ export function createMain(E: MainEnv) {
         if (/(__reply|__send_to_agent)$/.test(n) && b.tool_input?.text) (outputs.get(p) ?? outputs.set(p, []).get(p)!).push({
           to: String(b.tool_input.to ?? (n.endsWith('__reply') ? 'Joey' : '')), reply_to: String(b.tool_input.reply_to ?? ''), text: String(b.tool_input.text) })
         { const list = calls.get(p) ?? calls.set(p, []).get(p)!; list.push({ name: n, input: b.tool_input ?? {}, result: String(b.tool_response ?? ''), error: !!b.tool_error }); if (list.length > 40) list.shift() }
-        setMain(J().get('main', g.id)!, 'in_turn', { tool_open: null })
+        setMain(J().get('main', g.id)!, 'in_turn', { tool_open: null }); openTools.delete(g.id)
         try { E.toolDone?.(n, b.tool_input ?? {}, String(b.tool_response ?? ''), !!b.tool_error) } catch (e) { E.log('warn', `lanes: toolDone ${n}: ${e}`) }
         const got = pull(J().get('main', g.id)!, p)
         return got.length ? { additionalContext: renderPulled(got) } : {}
@@ -476,6 +483,7 @@ export function createMain(E: MainEnv) {
         finish(r => r.gen === g.id && r.prompt_id === p)
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
+        openTools.delete(g.id)
         setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
         if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
         void pump()
@@ -483,6 +491,7 @@ export function createMain(E: MainEnv) {
       }
       case 'StopFailure': {
         if (p) beginTurn(g, p)
+        openTools.delete(g.id)
         const err = String(b.error ?? 'unknown')
         const back = requeue(r => r.gen === g.id && (!p || r.prompt_id === p), `stop_failure:${err}`)
         if (p) outputs.delete(p)
@@ -626,7 +635,7 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork, turnStart,
+  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork, turnStart, openTool,
     replaceQueued, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

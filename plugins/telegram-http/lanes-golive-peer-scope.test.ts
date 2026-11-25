@@ -190,8 +190,15 @@ test('(c2) WO-140: a refusal names the rule and says to send again on the same l
   const b = await main('send_to_agent', { line: 'call', to: 'eve', reply_to: '4244', text: CRED })
   expect(b.isError).toBe(false); expect(b.text).toMatch(/^delivered to eve/)
   expect(jev.length).toBe(1)                                                                   // the once: no second Jev call
-  await expect(L.callLaneTool(tok('adam.reflex.1'), 'reply_agent', { line: 'call', because: 'eve is waiting', to: 'eve', text: CRED }))
-    .rejects.toThrow('reply_agent refused - nothing was sent: this message gives a credential (a key, token or password) (Jev 0.95). ' + RULE)
+  // a lane's send: no free second pass (WO-148), so its refusal says it is checked again
+  const LANE_RULE = RULE.replace('(your next message to eve goes out as you write it)', '(it is checked again; the same text is refused again)')
+  const t = tok('adam.reflex.1')
+  await expect(L.callLaneTool(t, 'reply_agent', { line: 'call', because: 'eve is waiting', to: 'eve', text: CRED }))
+    .rejects.toThrow('reply_agent refused - nothing was sent: this message gives a credential (a key, token or password) (Jev 0.95). ' + LANE_RULE)
+  const j = jev.length
+  await expect(L.callLaneTool(t, 'reply_agent', { line: 'call', because: 'eve is waiting', to: 'eve', text: CRED }))
+    .rejects.toThrow('reply_agent refused - nothing was sent: this message gives a credential (a key, token or password) (Jev 0.95). ' + LANE_RULE)
+  expect(jev.length).toBe(j)                                                                   // the same text: refused again without a call
 }, 20000)
 
 test('(d) a credential value is refused on every path, self-initiated included', async () => {

@@ -36,14 +36,30 @@ const st = L.__lanesState()
 st.lanes['adam.reflex.1'] = { id: 'adam.reflex.1', kind: 'reflex', n: 1, session_id: 's', thread: 'adam#t-1', status: 'running', created: '', last: '', transcript: tr, runs: 0, tokens_in: 0, tokens_out: 0 } as any
 const tok = (run: string) => ({ runId: run, lane: 'adam.reflex.1', evId: 'ev-1', closers: [], critical: false, trigger: 'alert', cls: 'alert', escalated: false, pushed: false }) as any
 
-test('a sentence the tool results contradict sends the report back once; the second attempt goes out', async () => {
+test('a sentence the tool results contradict sends the report back; WO-148: the same text again is sent back again without a call, a corrected text is checked and goes out', async () => {
   mode = 'contra'
   const r1 = await L.callLaneTool(tok('r1'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 180ms。已確認。' })
   expect(r1).toContain('not sent'); expect(r1).toContain('mock-api 目前正常'); expect(sent.length).toBe(0)
+  expect(r1).toContain('(it is checked again; the same text is sent back again)')
+  const k = calls
   const r2 = await L.callLaneTool(tok('r1'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 180ms。已確認。' })
-  expect(r2).not.toContain('not sent'); expect(sent.length).toBe(1)
+  expect(r2).toBe(r1); expect(sent.length).toBe(0); expect(calls).toBe(k)                         // 1.49.0 let this one out unchecked
+  mode = 'ok'
+  const r3 = await L.callLaneTool(tok('r1'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前 degraded，p95 2600ms。已確認。' })
+  expect(r3).not.toContain('not sent'); expect(sent.length).toBe(1); expect(calls).toBeGreaterThan(k)
   const log = readFileSync(join(dir, 'run', 'report-check.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   expect(log[0].sent_back).toBe(true)
+})
+
+test('LANES_REFUSAL_HOLD=0: as 1.49.0, sent back once, the second attempt goes out', async () => {
+  process.env.LANES_REFUSAL_HOLD = '0'
+  try {
+    mode = 'contra'
+    const r1 = await L.callLaneTool(tok('r0'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 181ms。' })
+    expect(r1).toContain('not sent'); expect(r1).toContain('(it will be sent as you write it)')
+    expect(await L.callLaneTool(tok('r0'), 'notify_joey', { outcome: 'normal', text: 'mock-api 目前正常，p95 181ms。' })).not.toContain('not sent')
+    expect(sent.length).toBe(2)
+  } finally { delete process.env.LANES_REFUSAL_HOLD; sent.splice(1) }
 })
 
 test('supported text goes out at once; a failed call sends the text as it is', async () => {

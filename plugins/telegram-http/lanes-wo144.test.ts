@@ -4,6 +4,9 @@
 // Part 1: the router in this process, a real OnsenClient against a stand-in Onsen (a fake fetch) wired as server.ts wires it, a stand-in lane binary that
 // records every run's argv (the opening is the prompt after -p). Part 2: a real Telegram daemon (server.ts, lanes on) against a stand-in Onsen server: the
 // wiring, end to end. Nothing reaches core.kbro.ai.
+// WO-148 (telegram-http 1.50.0): the block holds Joey's latest messages with the main's first reply to each, and the main's latest two (the selection's own
+// tests: lanes-wo148.test.ts); a resumed session gets only what is new. These tests reset the lane's memory of what its session was given (reset()), so
+// each one starts as a new session would.
 import { test, expect, afterAll, describe } from 'bun:test'
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, chmodSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -104,10 +107,11 @@ const hm = (min: number) => { const d = new Date(Date.parse('2026-11-25T01:00:00
 let id = 0
 const put = (min: number, sender: string, body: string, chat?: string): Row => { const r = { id: ++id, at: at(min), sender, body, tg: 2200 + id, ...(chat ? { chat } : {}) }; onsen.rows.push(r); return r }
 let gen = 0
-const reset = () => { onsen.rows = []; onsen.lines = []; onsen.calls = []; onsen.down = false; onsen.hang = false; depMode = 'client'; id = 0; oc = mkClient(join(dir, `onsen-${++gen}`)) }
+const reset = () => { onsen.rows = []; onsen.lines = []; onsen.calls = []; onsen.down = false; onsen.hang = false; depMode = 'client'; id = 0; oc = mkClient(join(dir, `onsen-${++gen}`))
+  for (const l of Object.values(L.__lanesState().lanes)) delete (l as any).chat_seen }   // WO-148: as a new session (the ids above start again at 2201)
 
 describe('part 1: the router', () => {
-  test('the opening: the title, then the latest messages in chat_history\'s line format, oldest to newest, after 此刻 and before the focus card; the query is chat_history\'s (Joey\'s chat, counted as a hook)', async () => {
+  test('the opening: the title, then Joey\'s messages and the main\'s answers in chat_history\'s line format, oldest to newest, after 此刻 and before the focus card; the query is chat_history\'s (Joey\'s chat, counted as a hook)', async () => {
     reset()
     put(0, 'joey', 'WO-150 的回測先暫停，等我看完數字')
     put(1, 'main', '好，回測停在第 3 輪，數字在 knowledge/wo150.md')
@@ -116,11 +120,10 @@ describe('part 1: the router', () => {
     put(4, 'main', 'x', '-100777')                                         // another chat: not this block's
     const r = await run()
     expect(blockOf(r.prompt)).toEqual([
-      '# 主線最近和 Joey 的對話（系統從 Onsen 附的，舊到新；更早的、全文：用 chat_history 查）',
+      '# Joey 最近對主線說的，和主線怎麼回（系統從 Onsen 附的；更早的、全文：用 chat_history 查）',
       `${hm(0)}｜Joey｜#1 tg:2201｜WO-150 的回測先暫停，等我看完數字`,
       `${hm(1)}｜main｜#2 tg:2202｜好，回測停在第 3 輪，數字在 knowledge/wo150.md`,
-      `${hm(2)}｜adam.reflex.3｜#3 tg:2203｜〔reflex #3〕mock-api p95 回到 180ms，已恢復`,
-      `${hm(3)}｜Joey｜#4 tg:2204｜mock-api 的設定這週都別動 ⏎ 等 Eve 的報告`,
+      `${hm(3)}｜Joey｜#4 tg:2204｜mock-api 的設定這週都別動 ⏎ 等 Eve 的報告`,                     // WO-148: a lane's line is not in the block
     ])
     const p = r.prompt
     expect(p.indexOf('# 此刻（')).toBeGreaterThan(p.indexOf('〔車道資訊｜'))
@@ -130,35 +133,34 @@ describe('part 1: the router', () => {
     expect(p).toContain(`等 Eve 的報告\n\n# 焦點卡（主線寫的，你只能讀）\n進行中：WO-150 回測。`)          // right before the focus card, which is as it was
     const q = onsen.calls.find(c => c.path.startsWith('/messages?'))!
     expect(q.via).toBe('hook'); expect(q.auth).toBe(`Bearer ${CRED}`)
-    expect(Object.fromEntries(new URL(`https://x${q.path}`).searchParams)).toEqual({ agent: AGENT, limit: '10', chat: JOEY })
-    expect(depCalls.at(-1)).toEqual({ a: { limit: 10 }, o: { timeoutMs: 2100, cut: 100 } })
-    expect(r.spawn).toMatchObject({ main_chat: 'onsen', main_chat_n: 4 })
+    expect(Object.fromEntries(new URL(`https://x${q.path}`).searchParams)).toEqual({ agent: AGENT, limit: '60', chat: JOEY })   // WO-148: a window of 60 to choose from
+    expect(depCalls.at(-1)).toEqual({ a: { limit: 60 }, o: { timeoutMs: 2100, cut: 100 } })
+    expect(r.spawn).toMatchObject({ main_chat: 'onsen', main_chat_n: 3 })
   }, 20000)
 
-  test('more than 10 messages: the latest 10; long bodies cut at 100 with chat_history\'s mark; the whole block ≤ 1,500 characters with the oldest dropped first', async () => {
+  test('long bodies cut at 100 with chat_history\'s mark; Joey\'s latest five with their answers; the whole block ≤ 1,500 characters with the oldest pair dropped first', async () => {
     reset()
     for (let i = 0; i < 14; i++) put(i, i % 2 ? 'main' : 'joey', `第 ${i} 則 短`)
     const a = blockOf((await run()).prompt)
     expect(a.length).toBe(11)
-    expect(a[1]).toContain('｜第 4 則 短'); expect(a[10]).toContain('｜第 13 則 短')                    // 4…13: the latest ten, oldest first
+    expect(a[1]).toContain('｜第 4 則 短'); expect(a[10]).toContain('｜第 13 則 短')                    // Joey 4, 6, 8, 10, 12 and the answers 5…13, oldest first
     reset()
-    for (let i = 0; i < 14; i++) put(i, i % 2 ? 'adam.worker.12' : 'joey', `${i}號：` + '長'.repeat(500))
+    for (let i = 0; i < 14; i++) put(i, i % 2 ? 'main' : 'joey', `${i}號：` + '長'.repeat(500))
+    put(14, 'main', '14號：' + '長'.repeat(500)); put(15, 'main', '15號：' + '長'.repeat(500))          // the main's latest two: not answers
     const r = await run()
     const b = blockOf(r.prompt)
     expect(b.join('\n').length).toBeLessThanOrEqual(1500)
     expect(b[0]).toBe(L.MAIN_CHAT_TITLE)
     const msgs = b.slice(1)
-    expect(msgs.length).toBeGreaterThan(5); expect(msgs.length).toBeLessThan(10)
-    expect(msgs.at(-1)).toContain('｜13號：')                                                          // the newest is kept
-    expect(msgs.map(l => Number(/｜(\d+)號：/.exec(l)![1]))).toEqual(Array.from({ length: msgs.length }, (_, k) => 14 - msgs.length + k))   // contiguous, the oldest gone
+    const nums = msgs.map(l => Number(/｜(\d+)號：/.exec(l)![1]))
+    expect(nums.slice(-2)).toEqual([14, 15])                                                          // the main's latest two are kept
+    expect(nums.slice(0, -2)).toEqual(Array.from({ length: nums.length - 2 }, (_, k) => 14 - (nums.length - 2) + k))   // the newest pairs, contiguous: the oldest went
+    expect(nums.length).toBeLessThan(12)                                                              // five pairs and two would be over 1,500
     for (const l of msgs) {
       expect(l.endsWith('…（全文用 id 取）')).toBe(true)
       const body = l.split('｜').slice(3).join('｜').replace('…（全文用 id 取）', '')
       expect([...body].length).toBe(100)
     }
-    // one more line would be over 1,500
-    const one = msgs[0].length + 1
-    expect(b.join('\n').length + one).toBeGreaterThan(1500)
     expect(r.spawn).toMatchObject({ main_chat: 'onsen', main_chat_n: msgs.length })
   }, 30000)
 
@@ -230,7 +232,7 @@ describe('part 1: the router', () => {
     } finally { delete process.env.LANES_MAIN_CHAT_TIMEOUT_MS }
   }, 30000)
 
-  test('every run gets it, a resumed one included, fetched afresh; it is not part of the lane card: card_hash and the card-update block do not see it', async () => {
+  test('every run gets it, a resumed one included, fetched afresh (WO-148: only what is new); it is not part of the lane card: card_hash and the card-update block do not see it', async () => {
     reset()
     put(0, 'joey', '第一趟之前的話')
     const hash = L.cardHash('mail')
@@ -240,11 +242,11 @@ describe('part 1: the router', () => {
     const b = await run()
     expect(b.lane).toBe(a.lane)
     expect(b.argv).toContain('--resume')
-    expect(blockOf(b.prompt).at(-1)).toBe(`${hm(1)}｜Joey｜#2 tg:2202｜兩趟之間 Joey 又說了一則`)
-    expect(blockOf(b.prompt).length).toBe(b0.length + 1)
+    expect(blockOf(b.prompt)).toEqual([L.MAIN_CHAT_TITLE, `${hm(1)}｜Joey｜#2 tg:2202｜兩趟之間 Joey 又說了一則`])   // WO-148: the session has the first one
+    expect(b0).toEqual([L.MAIN_CHAT_TITLE, `${hm(0)}｜Joey｜#1 tg:2201｜第一趟之前的話`])
     expect(b.prompt).not.toContain(L.CARD_UPDATED_HEAD)
     expect(L.__lanesState().lanes[a.lane].card_hash).toBe(hash)
-    expect(L.identityCard({ kind: 'mail' })).not.toContain('主線最近和 Joey 的對話')
+    expect(L.identityCard({ kind: 'mail' })).not.toContain('Joey 最近對主線說的')
     const sys = b.argv[b.argv.indexOf('--append-system-prompt-file') + 1]
     expect(readFileSync(sys, 'utf8')).not.toContain(L.MAIN_CHAT_TITLE)
     process.env.LANES_MAIN_CHAT = '0'
@@ -253,7 +255,7 @@ describe('part 1: the router', () => {
   }, 20000)
 
   test('the boundary card: Chiron\'s sentence right before the 「沒把握」 line, in the default card and in the one built from .lanes/boundary.md, with either 「沒把握」 line', async () => {
-    const LOOK = '判斷之前：先看上面「主線最近和 Joey 的對話」；跟這件事有關的不夠，用 chat_history 搜（工單編號、標題裡的詞）。Joey 在對話裡已經講定的事，照他講的做，回報或交回時附那一則的編號。但書：對話裡還在談、沒有講定的，不算；主線正在回合中而且在處理同一件事（看上面「此刻」），交給主線，不跟它同時動手。'
+    const LOOK = '判斷之前：先看上面「Joey 最近對主線說的，和主線怎麼回」；跟這件事有關的不夠，用 chat_history 搜（工單編號、標題裡的詞）。Joey 在對話裡已經講定的事，照他講的做，回報或交回時附那一則的編號。但書：對話裡還在談、沒有講定的，不算；主線正在回合中而且在處理同一件事（看上面「此刻」），交給主線，不跟它同時動手。'
     expect(B.BOUNDARY_LOOK_LINE).toBe(LOOK)
     const card = B.boundaryDefault(AGENT)
     expect(card.length).toBe(12)
@@ -299,7 +301,7 @@ describe('part 1: the router', () => {
   test('the block from chat_history\'s answer: an error text or nothing is （這一趟取不到）; Onsen\'s empty list is （沒有訊息）', () => {
     expect(L.mainChatBlock(null).lines).toEqual([L.MAIN_CHAT_TITLE, L.MAIN_CHAT_NONE])
     expect(L.mainChatBlock('chat_history failed: boom').lines).toEqual([L.MAIN_CHAT_TITLE, L.MAIN_CHAT_NONE])
-    expect(L.mainChatBlock('沒有符合的訊息。\n共 0 則，顯示 0 則')).toEqual({ lines: [L.MAIN_CHAT_TITLE, L.MAIN_CHAT_EMPTY], from: 'onsen', n: 0 })
+    expect(L.mainChatBlock('沒有符合的訊息。\n共 0 則，顯示 0 則')).toMatchObject({ lines: [L.MAIN_CHAT_TITLE, L.MAIN_CHAT_EMPTY], from: 'onsen', n: 0 })
     expect(L.mainChatBlock('（Onsen 連不上（x）：以下是這個常駐程式本機暫存的紀錄，只有它自己記下的，可能不完整）\n沒有符合的訊息。\n共 0 則，顯示 0 則').lines)
       .toEqual([L.MAIN_CHAT_TITLE, L.MAIN_CHAT_NONE])
   })
@@ -337,10 +339,10 @@ describe('part 2: a real Telegram daemon', () => {
       expect(await until(() => rows().length > 0, 15000)).toBe(true)
       const argv = rows()[0], prompt = argv[argv.indexOf('-p') + 1]
       expect(blockOf(prompt)).toEqual([L.MAIN_CHAT_TITLE, `${hm(9)}｜Joey｜#9 tg:2309｜WO-150：照第二案做`])
-      expect(prompt).toMatch(/\n# 此刻（[^\n]*\n[^\n]*\n[^\n]*\n\n# 主線最近和 Joey 的對話/)
+      expect(prompt).toMatch(/\n# 此刻（[^\n]*\n[^\n]*\n[^\n]*\n\n# Joey 最近對主線說的，和主線怎麼回/)
       const q = got.find(g => g.path.startsWith('/api/onsen/messages?'))!
       expect(q.via).toBe('hook')
-      expect(q.path).toContain('limit=10'); expect(q.path).toContain('chat=1828')
+      expect(q.path).toContain('limit=60'); expect(q.path).toContain('chat=1828')
     } finally { await d.stop(); api.stop(); srv.stop(true); rmSync(root, { recursive: true, force: true }) }
   }, 60000)
 })

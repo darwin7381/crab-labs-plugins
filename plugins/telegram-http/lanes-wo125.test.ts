@@ -316,7 +316,8 @@ test('WO-125 #6: a numbered schedule with step 2 skipped: done / normal are refu
   await call(r, 'notify_joey', { outcome: 'normal', text: '工程心跳：全 ✓' })
   for (const outcome of ['done', 'normal']) {
     const t = await call(r, 'receipt', { outcome, run_id: '7004', steps, happened: '心跳', did: '跑了', promised: '無', needs_main: '無' })
-    expect(t).toContain('把沒做的那幾步交給主線，或把結果改成部分完成')
+    // WO-148: the first refusal has the ticket's words; it holds for the run, so the second success receipt gets the held refusal (it names the same step)
+    expect(t).toContain(outcome === 'done' ? '把沒做的那幾步交給主線，或把結果改成部分完成' : '先 handoff_main 把那幾步交給主線')
     expect(t).toContain('第 2 步「2. append 一行到 state/eng-log.md」（寫入被擋）')
   }
   expect(ledger().filter(x => x.event === r.id && x.kind === 'receipt').length).toBe(0)

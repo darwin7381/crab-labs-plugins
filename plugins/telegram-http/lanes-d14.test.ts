@@ -42,7 +42,7 @@ const RULE = '記住：mock 服務的例行排程一律 09:00，不要再改。'
 const CLAIM = '收到，已記下：mock 服務的例行排程一律 09:00，不再改。'
 const propose = (tok: any) => L.callLaneTool(tok, 'ledger_write', { kind: 'memory_proposal', text: RULE })
 
-test('D14: a worker that only filed a proposal and tells Joey 「已記下」: sent back once, naming the proposal; the second attempt goes out', async () => {
+test('D14: a worker that only filed a proposal and tells Joey 「已記下」: sent back, naming the proposal; WO-148: sent back again until it records something real', async () => {
   const tok = run()
   const pid = /id (mp-[0-9a-f]+)/.exec(await propose(tok))![1]
   calls = []
@@ -52,7 +52,11 @@ test('D14: a worker that only filed a proposal and tells Joey 「已記下」: s
   const log = rows('run/report-check.jsonl').at(-1)
   expect(log).toMatchObject({ by: 'program', relation: 'proposal-is-not-a-record', sent_back: true, tool: 'notify_joey' })
   const r2 = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: CLAIM })
-  expect(r2).toContain('sent to Joey'); expect(sent.length).toBe(1)                          // once: it goes out as written the second time
+  expect(r2).toStartWith('not sent:'); expect(sent.length).toBe(0)                          // WO-148: no free second pass (1.49.0 let it out as written)
+  expect(r2).toContain('(it is checked again; the same text is sent back again)')
+  await L.callLaneTool(tok, 'ledger_write', { kind: 'action', text: '排程改成 09:00（mock 服務）' })   // a record of its own: the claim stands now
+  const r3 = await L.callLaneTool(tok, 'notify_joey', { outcome: 'normal', text: CLAIM })
+  expect(r3).toContain('sent to Joey'); expect(sent.length).toBe(1)
 })
 
 test('D14: the claim words: 記下 / 已記 / recorded / remembered; a negation, or a sentence that says it was only proposed, is not a claim', async () => {

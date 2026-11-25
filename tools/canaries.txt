@@ -71,7 +71,7 @@ plugins/telegram-http/lanes-boundary.ts::process.env.LANES_MAIN_SAME_MATTER_P ??
 plugins/telegram-http/onsen-status.ts::export class Registry implements StatusSource
 plugins/telegram-http/server.ts::const source: OnsenStatus.StatusSource = registry
 plugins/telegram-http/lanes.ts::export function claudePidOf(
-plugins/telegram-http/lanes.ts::export function mainSameState(doing: string, event: Record<string, unknown>)
+plugins/telegram-http/lanes.ts::export function mainSameState(doing: string, event: Record<string, unknown>, from: 'turn' | 'newest' = 'turn')
 plugins/telegram-http/lanes-boundary.ts::）。這件交給主線：用 handoff_main，寫你查到的、你本來要做什麼。
 # WO-146 (telegram-http 1.47.4, agent-inbox 1.17.4): the tool descriptions carry the detail (Chiron's words)
 plugins/telegram-http/server.ts::Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone
@@ -80,3 +80,14 @@ plugins/telegram-http/server.ts::Edits are silent (no push): use them for detail
 plugins/telegram-http/onsen-tool.ts::這裡只有講過的話；你做了什麼（工具呼叫、改了哪些檔、指令的輸出）不在這裡
 plugins/telegram-http/lanes.ts::goes to a sub-agent (Agent tool) instead.
 plugins/telegram-http/inbox-text.ts::工具清單上沒有 feed_ask 的，用 feed_search 給一到幾個詞。
+# WO-148 (telegram-http 1.50.0, agent-inbox 1.20.0): the opening block (Joey's words and the main's answers; a resumed session gets only what is new), the refusal hold, main_doing the newest
+plugins/telegram-http/lanes.ts::export const MAIN_CHAT_TITLE = '# Joey 最近對主線說的，和主線怎麼回（系統從 Onsen 附的；更早的、全文：用 chat_history 查）'
+plugins/telegram-http/lanes.ts::export function chatForRun(
+plugins/telegram-http/lanes.ts::const chat = chatForRun(lane, takeMainChat(it))
+plugins/telegram-http/lanes.ts::function heldRefusal(
+plugins/telegram-http/lanes.ts::{ const h = heldRefusal(tok, decision ? 'ask_joey' : 'notify_joey'); if (h) return h }
+plugins/telegram-http/lanes.ts::if (isSuccess(outcome)) { const h = heldRefusal(tok, 'receipt', [], 'receipt_steps')
+plugins/telegram-http/lanes-boundary.ts::export const refusalHoldOn
+plugins/telegram-http/lanes.ts::function mainNewest(
+plugins/telegram-http/lanes-main.ts::openTools.set(g.id,
+plugins/telegram-http/lanes.ts::S.main_reply = { text: clip(text.trim(), 300), at: nowIso() }
