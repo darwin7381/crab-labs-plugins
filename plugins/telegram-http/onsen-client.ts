@@ -12,7 +12,7 @@
 //   - step 2 (WO-142): draws and lifts restart lines (Joey's /clear and its button: POST /restart-lines, /restart-lines/lift), directly with a short
 //     timeout, else through the spool in order; keeps the lines it drew in <STATE_DIR>/onsen/lines.json so the spool's answer respects them too;
 //     records edit_delivered (an edited message of Joey's reached the agent).
-//   - step 3 (WO-143): delivery facts (k 'd': delivered / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
+//   - step 3 (WO-143): delivery facts (k 'd': delivered / in_session / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
 //     /status/batch; 1.45.1: the registry's states and last_activity_at) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
 //     refused as a whole (an Onsen without those routes) goes to rejected.jsonl: the messages behind it are never held.
 //   - WO-147 (step 4a, onsen-wake.ts): every wake decision (one route record of the lanes router) as one row (k 'w', POST /wake/batch), through the same
@@ -49,8 +49,12 @@ export type RestartLineLift = { agent: string; client: 'telegram'; chat: string;
 export type LocalLine = { chat: string; at: string; idem_key: string; client_msg_id?: string; by?: string; id: number | null; lifted_at: string | null
   lifted_by?: string | null; rejected?: boolean }
 /** step 3 (WO-143): one fact about one of Joey's messages reaching the agent (POST /deliveries/batch). delivered: the daemon took it in (queued);
- *  seen: it entered a session (`by` main or the lane id); turn_end: the turn that saw it ended (`by` as for seen). One per (message, recipient, state). */
-export type DeliveryState = 'delivered' | 'seen' | 'turn_end'
+ *  in_session (WO-165): it was handed to a session (written into the main's stream; lanes on: M1 offered it, or bound it at a boundary; a lane run
+ *  started with it), which may hold it in its own queue; seen: it entered a turn of that session (lanes on: M1 bound it to a prompt; lanes off: the
+ *  main's transcript shows it taken in; a lane run started with it), `by` main or the lane id; until WO-165 seen was the in_session moment;
+ *  turn_end: the turn that saw it ended (`by` as for seen). One per (message, recipient, state). An Onsen that does not list in_session yet refuses
+ *  that item alone (400 in its result: logged, rejected.jsonl); the rest of the batch goes in. */
+export type DeliveryState = 'delivered' | 'in_session' | 'seen' | 'turn_end'
 export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'; chat: string; client_msg_id: string; state: DeliveryState; at: string; by?: string
   detail?: Record<string, unknown> }
 /** step 3: the main's status (POST /status/batch). 1.45.1: the state is Claude Code's own session registry's (onsen-status.ts statusOf); last_activity_at =

@@ -1,7 +1,7 @@
 // Onsen step 3 (WO-143) end to end: real Telegram daemons (server.ts) against the Bot API stand-in and a stand-in Onsen (a local HTTP server; nothing
 // reaches core.kbro.ai), in temp dirs (their HOME too). Facts only: what Joey sees on Telegram is not looked at here because nothing of it changes.
-//   lanes off: delivered when the daemon takes the message in (after its own record), seen when it is written into the session's stream, turn_end at
-//              the transcript's turn_duration; 1.45.1: the status from Claude Code's session registry (a stand-in under the daemon's HOME): offline
+//   lanes off: delivered when the daemon takes the message in (after its own record), in_session when it is written into the session's stream (WO-165;
+//              seen until then), seen when the transcript shows it taken into a turn, turn_end at the transcript's turn_duration; 1.45.1: the status from Claude Code's session registry (a stand-in under the daemon's HOME): offline
 //              no_registration → not_connected → idle → busy (the transcript's tool as detail) → stuck → idle → waiting → offline pid_gone / pid_reused;
 //              last_activity_at; the latency from a registry write to the status line in the spool, measured; /healthz (the registry read and its check)
 //   lanes on:  delivered; no main registered: offline no_registration (the journal tap is attached and quiet)
@@ -67,7 +67,7 @@ console.log(JSON.stringify(a.filter(e => !cwd || e.cwd === cwd || e.cwd.startsWi
 }, 40000)
 afterAll(async () => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } await off?.stop(); await on?.stop(); api?.stop(); up?.stop(true) })
 
-test('lanes off: delivered (after the message), seen when written into the stream, turn_end from the transcript; the status from the registry; /healthz', async () => {
+test('lanes off: delivered (after the message), in_session when written into the stream, seen and turn_end from the transcript; the status from the registry; /healthz', async () => {
   const sessions = join(off.home, '.claude', 'sessions')
   const tdir = join(off.home, '.claude', 'projects', off.ws.replace(/[^a-zA-Z0-9]/g, '-'))
   mkdirSync(sessions, { recursive: true }); mkdirSync(tdir, { recursive: true })
@@ -92,13 +92,14 @@ test('lanes off: delivered (after the message), seen when written into the strea
   writeFileSync(tf, '')
   reg()
   expect(await until(() => last()?.detail?.reason === 'not_connected', 10000)).toBe(true)
-  // a session opens: the parked message is written into its stream: seen by the main; idle (the registry's)
+  // a session opens: the parked message is written into its stream: in_session by the main (WO-165: not seen yet); idle (the registry's)
   const received: string[] = []
   const c = new Client({ name: 'onsen3-test', version: '0' }, { capabilities: {} })
   c.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') received.push(String((n.params as any)?.meta?.message_id ?? '')) }
   await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${off.port}/mcp`)))
   expect(await until(() => received.includes('5001'), 15000)).toBe(true)
-  expect(await until(() => states(5001).includes('seen:main'), 10000)).toBe(true)
+  expect(await until(() => states(5001).includes('in_session:main'), 10000)).toBe(true)
+  expect(states(5001)).toEqual(['delivered', 'in_session:main'])
   expect(await until(() => last()?.state === 'idle', 10000)).toBe(true)
   // the latency: a registry write → the status line in the daemon's spool (a state change is written at once)
   const spool = join(off.stateDir, 'onsen', 'spool.jsonl')
@@ -115,10 +116,13 @@ test('lanes off: delivered (after the message), seen when written into the strea
   console.log(`registry write → status line in the spool (ms): ${lat.map(x => x.toFixed(0)).join(', ')}`)
   expect(Math.max(...lat)).toBeLessThan(1000)
   expect(await until(() => statuses('adam').some(s => s.state === 'waiting' && s.detail?.waitingFor === 'permission prompt'), 10000)).toBe(true)
-  // busy: the transcript's turn rides as detail (the tool, since); last_activity_at = the transcript's last write
-  writeFileSync(tf, JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="5001" user="joey" user_id="${JOEY}" ts="x">\n還沒有人在\n</channel>` }, timestamp: new Date().toISOString() }) + '\n'
+  // busy: the transcript's turn rides as detail (the tool, since); last_activity_at = the transcript's last write. The user record takes 5001 in: seen
+  const promptAt = new Date().toISOString()
+  writeFileSync(tf, JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="5001" user="joey" user_id="${JOEY}" ts="x">\n還沒有人在\n</channel>` }, timestamp: promptAt }) + '\n'
     + JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'ls' } }] }, timestamp: new Date().toISOString() }) + '\n')
   expect(await until(() => last()?.state === 'busy' && last()?.detail?.tool?.name === 'Bash', 20000)).toBe(true)
+  expect(await until(() => states(5001).includes('seen:main'), 5000)).toBe(true)
+  expect(facts(String(JOEY), 5001).find((g: any) => g.item.state === 'seen')!.item.at).toBe(promptAt)
   expect(last()!.detail).toMatchObject({ subagents: 0, queued_joey: 0 })
   expect(typeof last()!.detail.tool.since).toBe('string')
   const { statSync } = await import('fs')
@@ -133,7 +137,7 @@ test('lanes off: delivered (after the message), seen when written into the strea
   appendFileSync(tf, JSON.stringify({ type: 'system', subtype: 'turn_duration', durationMs: 1200, timestamp: new Date().toISOString() }) + '\n')
   reg({ status: 'idle' })
   expect(await until(() => states(5001).includes('turn_end:main'), 15000)).toBe(true)
-  expect(states(5001)).toEqual(['delivered', 'seen:main', 'turn_end:main'])
+  expect(states(5001)).toEqual(['delivered', 'in_session:main', 'seen:main', 'turn_end:main'])
   expect(await until(() => last()?.state === 'idle', 10000)).toBe(true)
   // the process is gone (its file left behind): pid_gone; a pid that lives but started at another time: pid_reused
   main.kill('SIGKILL'); await main.exited
@@ -147,7 +151,7 @@ test('lanes off: delivered (after the message), seen when written into the strea
   await Bun.sleep(1500)
   expect(facts('4242', 5002)).toEqual([])
   const h = await fetch(`http://127.0.0.1:${off.port}/healthz`).then(r => r.json()) as any
-  expect(h.onsen).toMatchObject({ record: true, deliveries_recorded: 3, pending_bytes: 0 })
+  expect(h.onsen).toMatchObject({ record: true, deliveries_recorded: 4, pending_bytes: 0 })
   expect(h.onsen.status_recorded).toBeGreaterThanOrEqual(8)
   expect(h.onsen.status).toMatchObject({ state: 'offline', mode: 'transcript', registry: { via: 'files', check: { agree: true } } })
   // 1.48.3: the comparison went through the machine's shared read (one run at a time, answer in the cache file), the CLI run without --cwd

@@ -38,28 +38,30 @@ describe('(1) the message being answered is not queued', () => {
 
   test('turnBegan: what was written into the stream by the turn\'s start is that turn\'s; what came after, or was never written, stays queued', () => {
     let t = 1_000
-    const F = new DeliveryFacts({ agent: AGENT, sink: () => {}, now: () => t })
-    F.delivered('1', 1); F.seen('1', 1, 'main')                 // written at 1000
+    const out: DeliveryFact[] = []
+    const F = new DeliveryFacts({ agent: AGENT, sink: f => out.push(f), now: () => t })
+    F.delivered('1', 1); F.inSession('1', 1, 'main')            // written at 1000
     F.delivered('1', 2)                                          // no stream: never written
-    expect(F.queued('taken')).toBe(2)
+    expect(F.queued('seen')).toBe(2)
     F.turnBegan(1_020)                                           // Claude Code's busy 20 ms later
-    expect(F.queued('taken')).toBe(1)
-    t = 2_000; F.seen('1', 2, 'main')                            // written mid-turn: Claude Code queues it until a tool boundary
+    expect(F.queued('seen')).toBe(1)
+    expect(out.filter(f => f.state === 'seen')).toEqual([])      // WO-165: the count only; the seen fact waits for the transcript
+    t = 2_000; F.inSession('1', 2, 'main')                       // written mid-turn: Claude Code queues it until a tool boundary
     F.turnBegan(1_020)
-    expect(F.queued('taken')).toBe(1)
-    F.taken('1', 2)                                              // the transcript shows it taken in
-    expect(F.queued('taken')).toBe(0)
+    expect(F.queued('seen')).toBe(1)
+    F.seen('1', 2, 'main')                                       // the transcript shows it taken in
+    expect(F.queued('seen')).toBe(0)
     // an album: every item goes with the first
-    F.album('1', ['5', '6']); F.delivered('1', 5); F.delivered('1', 6); t = 3_000; F.seen('1', 5, 'main')
-    expect(F.queued('taken')).toBe(2)
+    F.album('1', ['5', '6']); F.delivered('1', 5); F.delivered('1', 6); t = 3_000; F.inSession('1', 5, 'main')
+    expect(F.queued('seen')).toBe(2)
     F.turnBegan(3_010)
-    expect(F.queued('taken')).toBe(0)
+    expect(F.queued('seen')).toBe(0)
   })
 
   test('changed: a message taken in, written into the stream, into a turn, its turn ended: each asks for the status now', () => {
     let n = 0
     const F = new DeliveryFacts({ agent: AGENT, sink: () => {}, changed: () => { n++ } })
-    F.delivered('1', 1); F.seen('1', 1, 'main'); F.taken('1', 1); F.turnEnd('1', 1, 'main')
+    F.delivered('1', 1); F.inSession('1', 1, 'main'); F.seen('1', 1, 'main'); F.turnEnd('1', 1, 'main')
     expect(n).toBe(4)
   })
 })

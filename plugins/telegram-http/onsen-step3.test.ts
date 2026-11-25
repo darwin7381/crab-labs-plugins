@@ -133,11 +133,17 @@ describe('delivery facts', () => {
     const F = new DeliveryFacts({ agent: AGENT, sink: f => out.push(f), settleMs: 80 })
     F.album(JOEY, ['10', '11', '12'])
     for (const id of [10, 11, 12]) F.delivered(JOEY, id)
+    F.inSession(JOEY, 10, 'main')                                                 // WO-165: handed to the session, not in a turn yet
+    expect(out.filter(f => f.state === 'in_session').map(f => f.client_msg_id)).toEqual(['10', '11', '12'])
+    expect(out.some(f => f.state === 'seen')).toBe(false)
+    expect(F.queued('in_session')).toBe(0); expect(F.queued('seen')).toBe(3)
     F.seen(JOEY, 10, 'main')
     expect(out.filter(f => f.state === 'seen').map(f => f.client_msg_id)).toEqual(['10', '11', '12'])
-    expect(F.queued('seen')).toBe(0); expect(F.queued('taken')).toBe(3)
-    F.seen(JOEY, 10, 'lane-x')                                                    // a second recipient: the first wins (not spooled again)
+    expect(F.queued('in_session')).toBe(0); expect(F.queued('seen')).toBe(0)
+    F.seen(JOEY, 10, 'lane-x'); F.inSession(JOEY, 10, 'lane-x')                   // a second recipient: the first wins (not spooled again)
     expect(out.filter(f => f.state === 'seen').length).toBe(3)
+    expect(out.filter(f => f.state === 'in_session').length).toBe(3)
+    expect(out.find(f => f.state === 'in_session')).toMatchObject({ by: 'main', idem_key: `tg:${AGENT}:${JOEY}:dlv:10:in_session` })
     F.turnEndLater(JOEY, 10, 'main', '2026-11-25T10:00:00.000Z')
     await sleep(30)
     F.cancelTurnEnd(JOEY, 10, 'main')                                            // the turn went on (another Stop hook held it)
@@ -631,12 +637,12 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
     const g = await startMain()
     await M().pump()
     expect(M().items(r => r.event === `tg-${JOEY}-901`)[0].state).toBe('offered')
-    expect(of(901)).toEqual([])
+    expect(of(901)).toEqual(['in_session:main'])                                 // WO-165: offered = written into the main's stream; not seen
     expect(tap.turnDetail()).toBe(null)
     expect(view('idle')).toEqual({ state: 'idle', detail: { queued_joey: 1 }, last_activity_at: null })
     const p = 'p-1'
     await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [M().items(r => r.event === `tg-${JOEY}-901`)[0].id] })
-    expect(of(901)).toEqual(['seen:main'])
+    expect(of(901)).toEqual(['in_session:main', 'seen:main'])
     expect(L.mainQueuedJoey()).toBe(0)
     await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash', tool_timeout_ms: 1000 })
     let v = view()
@@ -649,8 +655,11 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
     // a second Joey message while the main is busy: queued (it is pulled at the next tool boundary)
     await joey(902)
     expect((view().detail as any).queued_joey).toBe(1)
+    expect(of(902)).toEqual([])                                                  // queued in M1: not in the session
     await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Agent', tool_input: {}, tool_response: 'ok' })
-    expect(of(902)).toEqual(['seen:main'])                                       // pulled into the running turn
+    expect(of(902)).toEqual(['in_session:main', 'seen:main'])                   // pulled into the running turn: both at that moment
+    const f902 = facts.filter(f => f.client_msg_id === '902')
+    expect(f902[0]!.at).toBe(f902[1]!.at)
     v = view()
     expect(v.detail).toMatchObject({ tool: null, subagents: 0, queued_joey: 0 })
     // Stop: check, then final (another Stop hook holds it: the turn goes on under the same prompt)
@@ -661,14 +670,14 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
     await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply' })   // continueTurn: bound again
     expect(F.pendingLater()).toBe(0)
     await sleep(100)
-    expect(of(901)).toEqual(['seen:main'])                                       // no turn_end: that Stop was not the end
+    expect(of(901)).toEqual(['in_session:main', 'seen:main'])                    // no turn_end: that Stop was not the end
     expect(tap.turnDetail()).not.toBe(null)
     expect((view().detail as any).turn_started_at).toBe((v.detail as any).turn_started_at)   // the same turn
     await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply', tool_input: { text: 'ok' }, tool_response: 'sent' })
     await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
     await sleep(100)
-    expect(of(901)).toEqual(['seen:main', 'turn_end:main'])
-    expect(of(902)).toEqual(['seen:main', 'turn_end:main'])
+    expect(of(901)).toEqual(['in_session:main', 'seen:main', 'turn_end:main'])
+    expect(of(902)).toEqual(['in_session:main', 'seen:main', 'turn_end:main'])
     expect(changes).toBeGreaterThan(0)
   })
 
@@ -735,12 +744,12 @@ test('WO-162, lanes on: 1.55.1\'s rule (the offered item is the turn\'s once the
     J.write('run', 'r1', 'leased', { event: ev(960).id, lane: 'worker-a', run: 'worker-a.r1' })
     expect(of(960)).toEqual([])
     J.write('run', 'r1', 'running', { event: ev(960).id, lane: 'worker-a', pid: 1 })
-    expect(of(960)).toEqual(['seen:worker-a'])
+    expect(of(960)).toEqual(['in_session:worker-a', 'seen:worker-a'])              // WO-165: a run starts with it in its prompt: both at once
     J.write('run', 'r1', 'running', { event: ev(960).id, lane: 'worker-a', steered: [ev(961)] })
-    expect(of(961)).toEqual(['seen:worker-a'])
+    expect(of(961)).toEqual(['in_session:worker-a', 'seen:worker-a'])
     J.write('run', 'r1', 'exited', { event: ev(960).id, lane: 'worker-a', reason: 'normal' })
-    expect(of(960)).toEqual(['seen:worker-a', 'turn_end:worker-a'])
-    expect(of(961)).toEqual(['seen:worker-a', 'turn_end:worker-a'])
+    expect(of(960)).toEqual(['in_session:worker-a', 'seen:worker-a', 'turn_end:worker-a'])
+    expect(of(961)).toEqual(['in_session:worker-a', 'seen:worker-a', 'turn_end:worker-a'])
     expect(facts.find(f => f.client_msg_id === '960' && f.state === 'turn_end')!.detail).toEqual({ reason: 'normal' })
     J.write('run', 'r2', 'queued', { event: ev(970).id, lane: 'worker-b', ev: ev(970) })
     J.write('run', 'r2', 'exited', { event: ev(970).id, lane: 'worker-b', reason: 'merged' })
@@ -768,8 +777,9 @@ describe('lanes off: the main\'s turns from its transcript', () => {
     const W = new TurnWatch({ dir: () => dir, facts: F, joey: joeyOf, changed: () => { changed++ } })
     W.tick()
     expect(W.busy()).toBe(null)
-    F.delivered(JOEY, 11); F.seen(JOEY, 11, 'main'); F.delivered(JOEY, 12); F.seen(JOEY, 12, 'main')
-    expect(F.queued('taken')).toBe(2)
+    F.delivered(JOEY, 11); F.inSession(JOEY, 11, 'main'); F.delivered(JOEY, 12); F.inSession(JOEY, 12, 'main')
+    expect(F.queued('seen')).toBe(2)
+    expect(out.filter(x => x.state === 'seen')).toEqual([])                  // WO-165: written into the stream is not seen
     const now = new Date().toISOString()
     appendFileSync(f, rec({ type: 'user', isMeta: true, message: { role: 'user', content: `<command-name>/model</command-name>` }, timestamp: now }))
     W.tick()
@@ -779,14 +789,16 @@ describe('lanes off: the main\'s turns from its transcript', () => {
     appendFileSync(f, rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] }, timestamp: now }))
     W.tick()
     expect(W.busy()).toEqual({ turn_started_at: now, tool: { name: 'Bash', started_at: now, timeout_s: null }, subagents: 0 })
-    expect(F.queued('taken')).toBe(1)
+    expect(F.queued('seen')).toBe(1)
+    expect(out.filter(x => x.state === 'seen').map(x => [x.client_msg_id, x.by, x.at])).toEqual([['11', 'main', now]])   // the prompt's own time
     appendFileSync(f, rec({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] }, timestamp: now }))
     appendFileSync(f, rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Agent', input: { prompt: 'x' } }, { type: 'tool_use', id: 't3', name: 'Agent', input: { run_in_background: true } }] }, timestamp: now }))
     appendFileSync(f, rec({ type: 'attachment', attachment: { type: 'queued_command', prompt: `${tag(12)}\n還有這個</channel>` }, timestamp: now }))
     appendFileSync(f, rec({ type: 'assistant', isSidechain: true, message: { content: [{ type: 'tool_use', id: 's1', name: 'Read', input: {} }] }, timestamp: now }))
     W.tick()
     expect(W.busy()).toMatchObject({ subagents: 1 })
-    expect(F.queued('taken')).toBe(0)
+    expect(F.queued('seen')).toBe(0)
+    expect(out.filter(x => x.state === 'seen').map(x => x.client_msg_id)).toEqual(['11', '12'])
     expect(out.some(x => x.state === 'turn_end')).toBe(false)
     const end = new Date(Date.now() + 1000).toISOString()
     appendFileSync(f, rec({ type: 'system', subtype: 'turn_duration', durationMs: 900, timestamp: end }))
@@ -815,7 +827,7 @@ describe('lanes off: the main\'s turns from its transcript', () => {
     expect(W.busy()?.turn_started_at).toBe(now)
     appendFileSync(f, rec({ type: 'system', subtype: 'turn_duration', timestamp: now }))
     W.tick()
-    expect(out.map(x => `${x.client_msg_id}:${x.state}`)).toEqual(['31:turn_end'])
+    expect(out.map(x => `${x.client_msg_id}:${x.state}`)).toEqual(['31:seen', '31:turn_end'])   // 30 (long before): neither seen nor turn_end again
   })
 })
 

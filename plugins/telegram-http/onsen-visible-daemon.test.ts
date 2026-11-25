@@ -1,7 +1,8 @@
 // WO-145 end to end: real Telegram daemons (server.ts, lanes off) against their own Bot API stand-ins and one stand-in Onsen (a local HTTP server;
 // nothing reaches core.kbro.ai or Telegram), in temp dirs (their HOME too).
 //   on  (ONSEN_REACT_SEEN, ONSEN_STATUS_PIN, ONSEN_FORM_LINKS = adam): the pinned status (sent and pinned silently, edited on a change ≥ 5 s apart, line 2
-//       from the facts, recorded as system:status's); ✍ when the parked message is written into the session (recorded as system:seen's); a reply's page
+//       from the facts, recorded as system:status's); ✍ when the parked message enters a turn (WO-165: the transcript shows it; written into the
+//       session alone is in_session and leaves it; recorded as system:seen's); a reply's page
 //       link keyed on Telegram and recorded without the key; a page answer from the inbox to the session (via web-form, form-<id>), echoed silently
 //       (system:form-echo), acked, its facts; a reply_to form-<id> threads under the echo; the status message deleted → off, a marker file
 //   off (no switch): the same steps change nothing: no ✍, no status message, no getChat / pin, the link as written, no /forms or /forms/inbox call
@@ -57,6 +58,14 @@ const msgs = (who: Who) => got.filter(g => g.who === who && g.path === '/message
 const evs = (who: Who) => got.filter(g => g.who === who && g.path === '/events').map(g => g.body)
 const facts = (who: Who, id: string) => got.filter(g => g.who === who && g.path === '/deliveries/batch').flatMap(g => g.body.items)
   .filter((f: any) => f.client_msg_id === id).map((f: any) => `${f.state}${f.by ? `:${f.by}` : ''}`)
+/** WO-165: Claude Code takes a message into a turn: its user record in the main's transcript (the daemon's TurnWatch reads it; seen comes from it) */
+function takeIn(d: TgDaemon, id: string, extra = ''): void {
+  const dir = join(d.home, '.claude', 'projects', d.ws.replace(/[^a-zA-Z0-9]/g, '-'))
+  mkdirSync(dir, { recursive: true })
+  const f = join(dir, 'main-session.jsonl')
+  const tag = `<channel source="plugin:telegram-http:telegram-http" chat_id="${JOEY}" message_id="${id}" user="joey" user_id="${JOEY}"${extra} ts="x">`
+  writeFileSync(f, JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: `${tag}\nx\n</channel>` }, timestamp: new Date().toISOString() }) + '\n', { flag: 'a' })
+}
 
 async function connect(d: TgDaemon, got: Array<{ content: string; meta: any }>): Promise<Client> {
   const c = new Client({ name: 'onsen-vis-test', version: '0' }, { capabilities: {} })
@@ -106,10 +115,16 @@ test('on: the pinned status, ✍, a keyed link recorded without the key, a page 
   const e1 = apiOn.of('editMessageText').find(c => Number(c.body.message_id) === pinId)!
   expect(e1.at - tPin).toBeGreaterThan(4000)
   expect(apiOn.of('setMessageReaction').length).toBe(0)                                  // no 👀 configured, nothing seen yet: no reaction
-  // a session opens: the parked message is written into it: seen by main → ✍ on it, recorded as system:seen's
+  // a session opens: the parked message is written into it: in_session by main (WO-165), no ✍ yet; it enters a turn (the transcript shows it): seen by
+  // main → ✍ on it, recorded as system:seen's
   const inbound: Array<{ content: string; meta: any }> = []
   const c = await connect(on, inbound)
   expect(await until(() => inbound.some(x => x.meta.message_id === '8001'), 15000)).toBe(true)
+  expect(await until(() => facts('on', '8001').includes('in_session:main'), 10000)).toBe(true)
+  await sleep(1500)
+  expect(facts('on', '8001')).toEqual(['delivered', 'in_session:main'])
+  expect(apiOn.of('setMessageReaction').length).toBe(0)
+  takeIn(on, '8001')
   expect(await until(() => facts('on', '8001').includes('seen:main'), 10000)).toBe(true)
   expect(await until(() => apiOn.of('setMessageReaction').length === 1, 5000)).toBe(true)
   expect(apiOn.of('setMessageReaction')[0]!.body).toMatchObject({ chat_id: String(JOEY), message_id: 8001, reaction: [{ type: 'emoji', emoji: '✍' }] })
@@ -142,7 +157,9 @@ test('on: the pinned status, ✍, a keyed link recorded without the key, a page 
   const echo = apiOn.of('sendMessage').find(c => String(c.body.text).startsWith('〔你在頁面送出的｜選方案〕'))!
   expect(echo.body).toMatchObject({ chat_id: String(JOEY), text: '〔你在頁面送出的｜選方案〕\nchoice: B\nnote: 快', disable_notification: true })
   expect(await until(() => msgs('on').some((m: any) => m.sender === 'system:form-echo' && m.meta?.silent === true), 10000)).toBe(true)
-  expect(await until(() => facts('on', 'form-9001').join(',') === 'delivered,seen:main', 10000)).toBe(true)
+  expect(await until(() => facts('on', 'form-9001').join(',') === 'delivered,in_session:main', 10000)).toBe(true)
+  takeIn(on, 'form-9001', ' via="web-form" form_title="選方案" form_id="501"')
+  expect(await until(() => facts('on', 'form-9001').join(',') === 'delivered,in_session:main,seen:main', 10000)).toBe(true)
   expect(apiOn.of('setMessageReaction').length).toBe(2)                                  // no ✍ for a page answer (no Telegram message)
   // the main answers it: reply_to form-9001 threads under the echo on Telegram
   const echoId = Number(msgs('on').find((m: any) => m.sender === 'system:form-echo')!.client_msg_id)
@@ -164,7 +181,9 @@ test('on: the pinned status, ✍, a keyed link recorded without the key, a page 
   expect(apiOn.calls.filter(x => ['editMessageText', 'getChat', 'pinChatMessage'].includes(x.method)).length).toBe(n)
   expect(apiOn.of('sendMessage').filter(c => L1.test(String(c.body.text).split('\n')[0]!)).length).toBe(1)   // never a second status message
   const h = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
-  expect(h.onsen.status).toMatchObject({ react_seen: { reacted: 3, skipped_agent: 0, refused: false }, status_pin: { sent: 1, stopped: 1 }, forms: { delivered: 1, acked: 1 } })
+  // WO-165: 8002 and 8003 reached the session and never entered a turn (no transcript record): in_session, no ✍ (until 1.56.0: ✍ on both)
+  expect(facts('on', '8003')).toEqual(['delivered', 'in_session:main'])
+  expect(h.onsen.status).toMatchObject({ react_seen: { reacted: 1, skipped_agent: 0, refused: false }, status_pin: { sent: 1, stopped: 1 }, forms: { delivered: 1, acked: 1 } })
   await c.close()
 }, 120000)
 
@@ -174,6 +193,7 @@ test('off: the same steps change nothing (no ✍, no status message, no pin / ge
   const inbound: Array<{ content: string; meta: any }> = []
   const c = await connect(off, inbound)
   expect(await until(() => inbound.some(x => x.meta.message_id === '8601'), 15000)).toBe(true)
+  takeIn(off, '8601')
   expect(await until(() => facts('off', '8601').includes('seen:main'), 10000)).toBe(true)
   expect((await call(c, 'reply', { chat_id: String(JOEY), text: URL_TEXT })).isError).toBe(false)
   expect(apiOff.of('sendRichMessage').at(-1)!.body.rich_message.markdown).toBe(URL_TEXT)

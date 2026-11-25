@@ -377,8 +377,8 @@ const visibleOn = (name: OnsenVisible.Switch): boolean => !!onsen && onsen.cfg.r
 const ONSEN_VISIBLE = { seen: visibleOn('ONSEN_REACT_SEEN'), pin: visibleOn('ONSEN_STATUS_PIN'), forms: visibleOn('ONSEN_FORM_LINKS') }
 const ONSEN_FORM_HOSTS = OnsenVisible.formHosts(process.env)
 if (ONSEN_VISIBLE.seen || ONSEN_VISIBLE.pin || ONSEN_VISIBLE.forms) log('info', `onsen: visible half on for ${ONSEN_AGENT}: react_seen=${ONSEN_VISIBLE.seen ? 'on' : 'off'} status_pin=${ONSEN_VISIBLE.pin ? 'on' : 'off'} form_links=${ONSEN_VISIBLE.forms ? `on (${[...ONSEN_FORM_HOSTS].join(', ')})` : 'off'}`)
-/** WO-145 (ONSEN_REACT_SEEN): ✍ on Joey's message at the moment the main takes it in (DeliveryFacts onSeen, by main); the reaction is recorded in Onsen as
- *  system:seen's */
+/** WO-145 (ONSEN_REACT_SEEN): ✍ on Joey's message at the moment the main takes it in (DeliveryFacts onSeen, by main: WO-165, the moment it enters a turn,
+ *  not the moment it reaches the session); the reaction is recorded in Onsen as system:seen's */
 const seenReactor: OnsenVisible.SeenReactor | null = ONSEN_VISIBLE.seen ? new OnsenVisible.SeenReactor({ log,
   react: (chat, id) => Onsen.withSender('system:seen', () => bot.api.setMessageReaction(chat, id, [{ type: 'emoji', emoji: OnsenVisible.SEEN_EMOJI as ReactionTypeEmoji['emoji'] }])) }) : null
 /** WO-145 (ONSEN_FORM_LINKS): the echo message of each page answer (chat:form-<id> → its Telegram id), so the main's reply_to / react on form-<id> lands on it */
@@ -1185,9 +1185,10 @@ function deliveryKey(notif: { method: string; params: unknown }): string {
 }
 
 function recordDelivery(notif: { method: string; params: unknown }): void {
-  // Onsen step 3 (WO-143), lanes off: the channel notification was written into a session's open stream: Joey's message is seen by the main (lanes on, M1
-  // says it: the lanes journal tap). Recorded only; a re-delivery is the same fact.
-  if (onsenFacts && !Lanes.LANES_ON) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.seen(j.chat, j.id, 'main') } catch {} }
+  // Onsen step 3 (WO-143), lanes off: the channel notification was written into a session's open stream: Joey's message is in the main's session
+  // (WO-165: in_session; Claude Code may hold it in its queue, seen waits for the transcript to show it in a turn). Lanes on, M1 says it: the lanes
+  // journal tap. Recorded only; a re-delivery is the same fact.
+  if (onsenFacts && !Lanes.LANES_ON) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.inSession(j.chat, j.id, 'main') } catch {} }
   if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(fleetRunId(notif)); return }
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
   recentDeliveries.push({ notif, at: Date.now(), pendingPath: null, keys: RECEIPT_CHECK ? receiptKeys(notif) : null, received: false })
@@ -3955,8 +3956,8 @@ function sendToMcpSession(sessionId: string, notif: { method: string; params: un
   }
   if (sseOpen.get(sessionId)) {
     void found.notification(notif as Parameters<Server['notification']>[0]).then(() => {
-      // Onsen step 3 (WO-143): written into the roam target's stream: seen (recorded only)
-      if (onsenFacts) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.seen(j.chat, j.id, 'main') } catch {} }
+      // Onsen step 3 (WO-143): written into the roam target's stream: in_session (WO-165; recorded only). seen: the transcript, as for the main
+      if (onsenFacts) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.inSession(j.chat, j.id, 'main') } catch {} }
     }).catch(err => {
       log('error', `roamer notify session ${sessionId} failed: ${err}`)
     })
@@ -4381,8 +4382,12 @@ if (Lanes.LANES_ON) {
 }
 // Onsen step 3 (WO-143): what the daemon already knows, recorded as facts (onsen-status.ts). Recording off for this agent: nothing (no timer, no tap).
 //   delivered  handleInbound took Joey's message in (both modes)
-//   seen       lanes on: M1 bound it to a main turn (by main), or a lane run started with it / had it steered in (by the lane id);
-//              lanes off: the channel notification was written into an open session stream (recordDelivery, the roamer's send)
+//   in_session WO-165: handed to the session. Lanes on: M1 offered it to the idle main, or bound it (a pull at a boundary hands it over and binds it at
+//              once); a lane run started with it. Lanes off: the channel notification was written into an open session stream (recordDelivery, the
+//              roamer's send); Claude Code may hold it in its queue (a busy main takes it at a tool boundary or its next turn)
+//   seen       WO-165: it entered a turn. Lanes on: M1 bound it to a main turn (by main), or a lane run started with it / had it steered in (by the
+//              lane id); lanes off: the transcript shows it taken in (the prompt of a turn, or a queued_command absorbed mid-turn: TurnWatch).
+//              Until WO-165 lanes off wrote seen at the in_session moment. The ✍ reaction (ONSEN_REACT_SEEN) goes with seen
 //   turn_end   lanes on: M1 `done` at the main's Stop, written once the turn stayed closed 60 s (or at the next prompt); a lane run's exit;
 //              lanes off: the transcript's turn_duration after the record that took it in (TurnWatch)
 //   status     1.45.1: the state is Claude Code's own session registry's (onsen-status.ts Registry, the StatusSource): offline (no registration / pid gone
@@ -4395,7 +4400,7 @@ const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callbac
 let statusPinRef: OnsenVisible.StatusPin | null = null
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000),
-    ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}),   // WO-145: ✍ when the main takes it in
+    ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}),   // WO-145: ✍ when the main takes it in (WO-165: into a turn)
     changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
   // ONSEN_STATUS_HEARTBEAT_S (15 s; 0 = none), each carrying detail.heartbeat_s
@@ -4414,7 +4419,10 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const feed = (v: OnsenStatus.StatusView): void => { lastView = v; status.update(v); try { pin?.show(v) } catch (e) { log('warn', `onsen: status pin: ${e}`) } }
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
-  const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick })
+  // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
+  // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
+  const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
+    session: () => { try { return registry.mainSessionId() } catch { return null } } })
   // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
   // (every open stream counts as the main's)
   const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
@@ -4449,7 +4457,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
       // confirms them a read later; the kick's transcript read (WO-157b) finds them only if Claude Code has flushed it by then)
       const began = turnStarts.observe(inp.main, Date.now())
       if (began != null) facts.turnBegan(began)
-      inp.queued_joey = facts.queued(watch?.watching() ? 'taken' : 'seen')
+      inp.queued_joey = facts.queued(watch?.watching() ? 'seen' : 'in_session')   // WO-165: the same counts as 'taken' / 'seen' before
     }
     const v = OnsenStatus.statusOf(inp)
     // WO-157b (status-latency-lab 「會判錯的」 8): once the status says the turn began, the item offered to the main is the one it is taking in, not one waiting

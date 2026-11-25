@@ -55,11 +55,12 @@ test('a page answer: to the main (rule web-form, M1 item kind joey), seen by mai
   expect(it).toMatchObject({ kind: 'joey', state: 'offered' })
   expect(offers.at(-1).params.meta).toMatchObject({ via: 'web-form', message_id: 'form-77', form_title: '選方案' })
   expect(L.mainQueuedJoey()).toBe(1)
+  expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:in_session:main'])       // WO-165: offered = in the session
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, session_id: sid, prompt_id: 'p1', dids: [it.id] })
-  expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:seen:main'])
+  expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:in_session:main', 'form-77:seen:main'])
   await L.__mainEvent({ event: 'Stop', pid: proc.pid, session_id: sid, prompt_id: 'p1', phase: 'final' })
   await sleep(120)
-  expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:seen:main', 'form-77:turn_end:main'])
+  expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:in_session:main', 'form-77:seen:main', 'form-77:turn_end:main'])
   expect(reacted).toEqual([])
 })
 
@@ -102,7 +103,7 @@ test('Joey\'s Telegram message: ✍ at the moment M1 binds it to the main\'s tur
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: Number(g.pid), session_id: String(g.session_id), prompt_id: 'p2', dids: [it.id] })
   await sleep(10)
   expect(reacted).toEqual([`${JOEY}:301`])
-  expect(facts.filter(f => f.client_msg_id === '301').map(f => `${f.state}:${f.by}`)).toEqual(['seen:main'])
+  expect(facts.filter(f => f.client_msg_id === '301').map(f => `${f.state}:${f.by}`)).toEqual(['in_session:main', 'seen:main'])   // WO-165: offered, then bound
 })
 
 test('not the Telegram daemon\'s lanes: null (server.ts then delivers it as with lanes off)', async () => {

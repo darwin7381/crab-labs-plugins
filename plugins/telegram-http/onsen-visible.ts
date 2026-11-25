@@ -1,9 +1,10 @@
 // Onsen step 3, the half Joey sees (WO-145). Three features, each behind its own switch; each also needs Onsen recording on for the agent (ONSEN_RECORD,
 // ONSEN_AGENTS). A switch is a comma list of agent names or `*`, read like ONSEN_AGENTS (the daemon's env, then the machine config
 // ~/.config/crab-labs-plugins/env, fleet-config.ts); unset or empty = off, and off changes nothing at all.
-//   ONSEN_REACT_SEEN  SeenReactor: the moment the MAIN takes Joey's message in (its `seen` by main: lanes on M1 bound, lanes off the notification written
-//                     into the session's stream), the reaction on it becomes ✍. The daemon's 👀 (taken in) is unchanged; a lane's seen leaves 👀; the
-//                     agent's own reaction is never replaced (and a later one of its own wins, as today).
+//   ONSEN_REACT_SEEN  SeenReactor: the moment the MAIN takes Joey's message in (its `seen` by main: lanes on M1 bound, lanes off the transcript shows it
+//                     in a turn; WO-165: no longer the notification written into the session's stream, which is in_session and leaves 👀), the
+//                     reaction on it becomes ✍. The daemon's 👀 (taken in) is unchanged; a lane's seen leaves 👀; the agent's own reaction is never
+//                     replaced (and a later one of its own wins, as today). Line 2 of the pin counts by seen too: "not in yet" = not in a turn yet.
 //   ONSEN_STATUS_PIN  StatusPin: one message per DM chat of an allowlisted person, sent and pinned without a notification, then only edited: line 1 the
 //                     main's status (statusOf's view; statusLine), line 2 Joey's messages not in yet / seen and not answered (PendingTracker, from this
 //                     daemon's own spool: works with Onsen down). Edited only when the text changes, at least 5 s apart. Joey unpins or deletes it: that

@@ -1,7 +1,8 @@
 // Onsen step 3 (WO-143): the Telegram daemon records facts only. Nothing here changes what is delivered, to whom or when; nothing is shown on Telegram.
 //
-//   DeliveryFacts  delivered / seen / turn_end of each of Joey's messages (one per message and state; the first recipient wins at Onsen), spooled through
-//                  OnsenClient.recordDelivery behind the message's own record.
+//   DeliveryFacts  delivered / in_session / seen / turn_end of each of Joey's messages (one per message and state; the first recipient wins at Onsen),
+//                  spooled through OnsenClient.recordDelivery behind the message's own record. WO-165: seen = it entered a turn; in_session = it was
+//                  handed to the session (until WO-165 that moment was `seen`).
 //   StatusFacts    the main's status: every change of the state or the detail at once; last_activity_at moving alone at most once per 1 s, always the
 //                  latest (a trailing write); nothing new for 15 s: the same again (WO-162: the heartbeat, detail.heartbeat_s).
 //   statusOf       1.45.1: the one rule that turns a source's inputs into the status: offline / idle / busy / waiting / stuck.
@@ -30,10 +31,11 @@ export class DeliveryFacts {
   private groups = new Map<string, string[]>()
   /** the main's turn closed these at a Stop; written once that turn stayed closed for settleMs (another Stop hook can still hold it) */
   private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; timer: ReturnType<typeof setTimeout> }>()
-  /** Joey's messages taken in and not yet into a turn (lanes off: the queued count); seenAt: when it was last written into the main's stream */
-  private open = new Map<string, { at: number; seen: boolean; taken: boolean; seenAt?: number }>()
-  /** onSeen (WO-145, the ✍ reaction): every `seen` report, for each message of it (an album: every item), the recipient named; a repeat too (the
-   *  caller keeps its own once) */
+  /** Joey's messages taken in and not yet into a turn (lanes off: the queued count). session: handed to the session (in_session), sessionAt when;
+   *  turn: into a turn (seen, or WO-162's turnBegan for the count alone) */
+  private open = new Map<string, { at: number; session: boolean; turn: boolean; sessionAt?: number }>()
+  /** onSeen (WO-145, the ✍ reaction): every `seen` report (WO-165: the message entered a turn; in_session never calls it), for each message of it
+   *  (an album: every item), the recipient named; a repeat too (the caller keeps its own once) */
   /** changed (WO-162): the queued count may have changed (a message taken in, written into the stream, into a turn, its turn ended): the status is
    *  computed again now rather than at the next 2 s tick */
   constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; settleMs?: number; now?: Now; max?: number
@@ -64,28 +66,34 @@ export class DeliveryFacts {
   delivered(chat: string, id: string | number, at?: string): void {
     const s = String(id)
     this.emit(chat, s, 'delivered', undefined, at)
-    if (!this.open.has(k2(chat, s))) this.open.set(k2(chat, s), { at: this.now(), seen: false, taken: false })
+    if (!this.open.has(k2(chat, s))) this.open.set(k2(chat, s), { at: this.now(), session: false, turn: false })
     if (this.open.size > 2_000) this.open.delete(this.open.keys().next().value!)
     this.changed()
   }
-  seen(chat: string, id: string | number, by: string, at?: string): void {
+  /** WO-165: handed to a session (lanes off: written into the main's stream, where Claude Code may queue it; lanes on: M1 offered it, or bound it at a
+   *  boundary; a lane run started with it). Not seen: the ✍ waits for seen */
+  inSession(chat: string, id: string | number, by: string, at?: string): void {
     const s = String(id)
-    this.emit(chat, s, 'seen', by, at)
-    for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.seen = true; e.seenAt = this.now() } }
-    if (this.o.onSeen) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
+    this.emit(chat, s, 'in_session', by, at)
+    for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.session = true; e.sessionAt = this.now() } }
     this.changed()
   }
-  /** lanes off: the transcript shows it taken into a turn (not a fact of its own: the queued count) */
-  taken(chat: string, id: string | number): void {
-    for (const m of this.idsOf(chat, String(id))) { const e = this.open.get(k2(chat, m)); if (e) { e.seen = true; e.taken = true } }
+  /** WO-165: it entered a turn (lanes on: M1 bound it to a prompt, a lane run started with it; lanes off: the main's transcript shows it taken in, as
+   *  the prompt of a turn or absorbed mid-turn). Until WO-165 this was the in_session moment. quiet: the fact only, no onSeen (the transcript's tail
+   *  read again at start: a message taken in before this daemon began) */
+  seen(chat: string, id: string | number, by: string, at?: string, quiet = false): void {
+    const s = String(id)
+    this.emit(chat, s, 'seen', by, at)
+    for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.session = true; e.turn = true } }
+    if (this.o.onSeen && !quiet) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
     this.changed()
   }
   /** WO-162 (1), lanes off: a turn of the main began at `at` (ms; the registry's statusUpdatedAt of its busy). What was written into its stream by then
    *  is what that turn took in: a session that starts a turn takes in what waits in its queue. The transcript shows it one read later; until now the
-   *  first status row of every turn counted the message being answered as queued (Chiron's lab, 28/28). slackMs: the daemon notes `seen` right after
-   *  the write, Claude Code writes its busy after reading it */
+   *  first status row of every turn counted the message being answered as queued (Chiron's lab, 28/28). slackMs: the daemon notes in_session right
+   *  after the write, Claude Code writes its busy after reading it. The queued count only: the seen fact waits for the transcript (WO-165) */
   turnBegan(at: number, slackMs = 100): void {
-    for (const e of this.open.values()) if (e.seen && !e.taken && e.seenAt != null && e.seenAt <= at + slackMs) e.taken = true
+    for (const e of this.open.values()) if (e.session && !e.turn && e.sessionAt != null && e.sessionAt <= at + slackMs) e.turn = true
   }
   turnEnd(chat: string, id: string | number, by: string, at?: string, detail?: Record<string, unknown>): void {
     const s = String(id)
@@ -112,11 +120,12 @@ export class DeliveryFacts {
     for (const l of [...this.later.values()]) if (!by || l.by === by) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail)
   }
   pendingLater(): number { return this.later.size }
-  /** Joey's messages taken in by the daemon and not yet seen (mode seen) / not yet into a turn (mode taken); older than 6 h: dropped */
-  queued(mode: 'seen' | 'taken'): number {
+  /** Joey's messages taken in by the daemon and not yet into a turn (mode seen: the main's transcript is read) / not yet handed to the session (mode
+   *  in_session: no transcript to read); older than 6 h: dropped. WO-165 renamed the modes with the facts; the counts are what 'taken' / 'seen' were */
+  queued(mode: 'seen' | 'in_session'): number {
     const old = this.now() - 6 * 3600_000
     let n = 0
-    for (const [k, e] of this.open) { if (e.at < old) { this.open.delete(k); continue } if (!(mode === 'seen' ? e.seen : e.taken)) n++ }
+    for (const [k, e] of this.open) { if (e.at < old) { this.open.delete(k); continue } if (!(mode === 'seen' ? e.turn : e.session)) n++ }
     return n
   }
 }
@@ -309,11 +318,13 @@ export class LanesTap {
     const F = this.o.facts
     if (row.rec === 'msg') {
       const j = this.o.joey((row.notif?.params as any)?.meta)
-      if (j && line.state === 'bound') {
+      if (j && line.state === 'offered') F.inSession(j.chat, j.id, 'main', row.ts)   // WO-165: written into the idle main's stream
+      else if (j && line.state === 'bound') {
         // M1 bound it to a turn of the main: offered and opened the turn, or pulled at a tool boundary / Stop. bound again after its Stop
-        // (turn_continued): that Stop was not the turn's end
+        // (turn_continued): that Stop was not the turn's end. WO-165: a pulled item reaches the session as it is bound (in_session the same moment;
+        // an offered one has it already, this daemon writes each fact once)
         if (line.reason === 'turn_continued') F.cancelTurnEnd(j.chat, j.id, 'main')
-        else F.seen(j.chat, j.id, 'main', row.ts)
+        else { F.inSession(j.chat, j.id, 'main', row.ts); F.seen(j.chat, j.id, 'main', row.ts) }
       } else if (j && line.state === 'done') {
         F.turnEndLater(j.chat, j.id, 'main', row.ts, row.reason ? { reason: String(row.reason) } : undefined)
       }
@@ -323,7 +334,7 @@ export class LanesTap {
       const lane = String(row.lane ?? 'lane')
       if (line.state === 'running') {
         this.runs.add(row.id)
-        for (const e of evs) F.seen(e.chat, e.id, lane, row.ts)                  // spawned with it in its prompt, or steered into it
+        for (const e of evs) { F.inSession(e.chat, e.id, lane, row.ts); F.seen(e.chat, e.id, lane, row.ts) }   // spawned with it in its prompt, or steered into it
       } else if (line.state === 'exited' && this.runs.has(row.id)) {
         this.runs.delete(row.id)
         for (const e of evs) F.turnEnd(e.chat, e.id, lane, row.ts, row.reason ? { reason: String(row.reason) } : undefined)
@@ -404,14 +415,26 @@ export class TurnWatch {
   private turnAt: string | null = null
   private tools = new Map<string, { name: string; at: string; agent: boolean; timeout_s: number | null }>()
   private taken = new Map<string, { chat: string; id: string }>()
-  constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now }) {}
+  /** WO-165: the newest own timestamp of a record read from this transcript (ms), and when this watch began (a message taken in before it is the last
+   *  daemon life's: its seen is written again, Onsen keeps the first, but no ✍) */
+  private latestMs = 0
+  private readonly bornMs: number
+  /** session (WO-165): the main's session id when known (the registry's), its transcript read in preference to the newest file */
+  constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now
+    session?: () => string | null }) {
+    this.bornMs = this.now()
+  }
   private now(): number { return (this.o.now ?? Date.now)() }
 
   /** read what the main's transcript gained since the last tick */
   tick(): void {
     const dir = this.o.dir()
     if (!dir) return
-    if (!this.file || this.now() - this.scannedAt >= (this.o.rescanMs ?? 10_000)) {
+    // WO-165: the main's own transcript (<its session id>.jsonl, the registry's main) the moment it exists, so a new session's first message is seen at
+    // once, not at the next rescan (up to rescanMs after it; the bench, 11-25 18:45Z: 4.1 s); while it is read, no rescan takes another file
+    const sid = this.o.session?.() ?? null, own = sid ? join(dir, `${sid}.jsonl`) : null
+    if (own && own !== this.file && existsSync(own)) { this.scannedAt = this.now(); this.switchTo(own) }
+    else if (!this.file || (own !== this.file && this.now() - this.scannedAt >= (this.o.rescanMs ?? 10_000))) {
       this.scannedAt = this.now()
       const f = newestJsonl(dir)
       if (f && f !== this.file) this.switchTo(f)
@@ -438,9 +461,10 @@ export class TurnWatch {
     } catch {} finally { if (fd != null) try { closeSync(fd) } catch {} }
     if (changed) this.o.changed()
   }
-  /** a new transcript (a new session, a /clear): its tail is read for the current turn; a turn_end older than 10 min before now is not written again */
+  /** a new transcript (a new session, a /clear): its tail is read for the current turn; a seen or turn_end older than 10 min before now is not written
+   *  again */
   private switchTo(f: string): void {
-    this.file = f; this.rest = ''
+    this.file = f; this.rest = ''; this.latestMs = 0
     this.inTurn = false; this.turnAt = null; this.tools.clear(); this.taken.clear()
     this.emitFloor = this.now() - 10 * 60_000
     let size = 0
@@ -452,8 +476,16 @@ export class TurnWatch {
   handle(j: any): boolean {
     if (!j || typeof j !== 'object' || j.isSidechain === true) return false
     const ts = typeof j.timestamp === 'string' ? j.timestamp : iso(this.now())
+    // WO-165: a queued_command attachment (a message absorbed mid-turn at a tool boundary) carries its ENQUEUE time (2.1.3xx: the same as its
+    // queue-operation enqueue, seconds before); it is written after the queue-operation remove (absorbed_mid_turn). Its moment is the newest own
+    // timestamp read before it
+    const before = this.latestMs, own = typeof j.timestamp === 'string' ? Date.parse(j.timestamp) : NaN
+    if (own > this.latestMs) this.latestMs = own
     if (j.type === 'system' && j.subtype === 'turn_duration') return this.end(ts)
-    if (j.type === 'attachment' && j.attachment?.type === 'queued_command') { const b = this.begin(ts); this.takeIn(String(j.attachment.prompt ?? '')); return b }
+    if (j.type === 'attachment' && j.attachment?.type === 'queued_command') {
+      const at = before > (Number.isFinite(own) ? own : 0) ? iso(before) : ts
+      const b = this.begin(at); this.takeIn(String(j.attachment.prompt ?? ''), at); return b
+    }
     if (j.type === 'user') {
       if (j.isCompactSummary || j.isVisibleInTranscriptOnly) return false
       const c = j.message?.content
@@ -464,7 +496,7 @@ export class TurnWatch {
       }
       const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((x: any) => x?.type === 'text').map((x: any) => String(x.text ?? '')).join('\n') : ''
       if (!text.trim() || LOCAL_CMD.test(text)) return false
-      const b = this.begin(ts); this.takeIn(text); return b
+      const b = this.begin(ts); this.takeIn(text, ts); return b
     }
     if (j.type === 'assistant') {
       let ch = this.begin(ts)
@@ -483,13 +515,15 @@ export class TurnWatch {
     this.inTurn = true; this.turnAt = ts; this.tools.clear(); this.taken.clear()
     return true
   }
-  private takeIn(text: string): void {
+  /** WO-165: the Joey messages of a record that took them into a turn: seen at `at` (that record's moment) */
+  private takeIn(text: string, at: string): void {
+    const t = Date.parse(at)
     for (const a of channelTags(text)) {
       if (!/telegram/.test(a.source ?? '')) continue
       const j = this.o.joey(a)
       if (!j) continue
       this.taken.set(k2(j.chat, j.id), j)
-      this.o.facts.taken(j.chat, j.id)
+      if (!(t < this.emitFloor)) this.o.facts.seen(j.chat, j.id, 'main', at, t < this.bornMs)
     }
   }
   private end(ts: string): boolean {
@@ -905,8 +939,11 @@ export class Registry implements StatusSource {
   mode(): Via { return this.v }
 
   main(): RegEntry | null {
-    return pickMain(this.entries(), { workspace: this.o.workspace, tmux: this.o.tmux ?? null, sessionId: this.o.sessionId?.() ?? null, alive: p => this.alive(p) })
+    return (this.lastMain = pickMain(this.entries(), { workspace: this.o.workspace, tmux: this.o.tmux ?? null, sessionId: this.o.sessionId?.() ?? null, alive: p => this.alive(p) }))
   }
+  /** WO-165: the main as last read (no read of its own: the status computes it every 2 s and at each change); TurnWatch follows its transcript */
+  private lastMain: RegEntry | null = null
+  mainSessionId(): string | null { return this.lastMain?.sessionId ?? null }
   /** the OS start time of `pid`, read at most every 30 s */
   private startOf(pid: number): string | null {
     const c = this.starts.get(pid), now = this.now()
