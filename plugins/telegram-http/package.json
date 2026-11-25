@@ -1,6 +1,10 @@
 {
   "name": "crab-labs-channel-telegram-http",
+<<<<<<< HEAD
   "version": "1.47.4",
+=======
+  "version": "1.48.0",
+>>>>>>> 019b01c (telegram-http 1.48.0, agent-inbox 1.18.0: Onsen step 3, the half Joey sees: ✍ when the main takes his message in, a pinned silent status message, page form links and answers (WO-145))
   "license": "Apache-2.0",
   "type": "module",
   "bin": "./server.ts",

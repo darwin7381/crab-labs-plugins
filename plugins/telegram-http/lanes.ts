@@ -1687,6 +1687,19 @@ export function toMainDirect(ev: InEvent): void {
   toMain(ev, { rule: 'router-failed', target: 'main' })
 }
 
+/** WO-145 (server.ts, ONSEN_FORM_LINKS): an answer Joey sent from one of our pages (an Onsen form) goes to the main as his Telegram message would (the one
+ *  builder: its record, its Joey line handed to the main, its M1 item of kind joey), never to a lane: the router's rules are not asked. Route row rule
+ *  `web-form`. null = not the Telegram daemon's lanes (the caller delivers it as with lanes off). */
+export function toMainForm(ev: InEvent): Decision | null {
+  if (D?.role !== 'tg' || !main) return null
+  const d: Decision = { rule: 'web-form', target: 'main', note: `a page answer (form ${ev.meta?.form_id ?? '?'}): to the main` }
+  routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
+    class: null, base_tier: null, btcc_msg_id: null, tg_message_id: ev.meta?.message_id ?? null })
+  D.log('info', `lanes: route ${ev.id} (web-form from ${ev.from}) rule=web-form → main`)
+  toMain(ev, d)
+  return d
+}
+
 /** Hop / budget gate for a mesh event entering a thread. Returns a stop note or null. */
 function threadGate(t: Thread | null, ev: InEvent): { why: 'hop' | 'budget'; note: string } | null {
   if (ev.source !== 'mesh') return null

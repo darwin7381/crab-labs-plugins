@@ -8,8 +8,12 @@ export type BotApiMock = {
   polls: Array<{ start: number; end?: number }>
   /** calls this returns true for are never answered (the request stays open) */
   hang: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
-  /** calls this returns true for are answered 400 (as a markdown the rich renderer cannot take) */
-  fail: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
+  /** calls this returns true for are answered 400 (as a markdown the rich renderer cannot take; `desc`: another description) */
+  fail: { fn: ((method: string, body: Record<string, any>) => boolean) | null; desc?: string }
+  /** WO-145: the pinned message per chat (pinChatMessage / unpinChatMessage; getChat shows it); messages deleted by the user (an edit of one is refused
+   *  "message to edit not found") */
+  pinned: Map<string, number>
+  deleted: Set<number>
   push: (u: Record<string, any>) => void
   of: (method: string) => Call[]
   stop: () => void
@@ -23,6 +27,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
   const polls: Array<{ start: number; end?: number }> = []
   const hang: BotApiMock['hang'] = { fn: null }
   const fail: BotApiMock['fail'] = { fn: null }
+  const pinned = new Map<string, number>(), deleted = new Set<number>()
   const updates: Record<string, any>[] = []
   let nextUpdate = 1, nextMsg = 5000, nextTopic = 7000
   const state = { id: 999, is_bot: true, first_name: 'lab', username: 'lab_test_bot', has_topics_enabled: false, allows_users_to_create_topics: false, ...me }
@@ -46,9 +51,15 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     for (const k of ['reply_parameters', 'reply_markup', 'rich_message']) if (typeof body[k] === 'string') { try { body[k] = JSON.parse(body[k]) } catch {} }
     if (method !== 'getUpdates') calls.push({ method, body, at: Date.now() })
     if (hang.fn?.(method, body)) return new Promise<Response>(() => {})
-    if (fail.fn?.(method, body)) return Response.json({ ok: false, error_code: 400, description: "Bad Request: can't parse the rich message" }, { status: 400 })
+    if (fail.fn?.(method, body)) return Response.json({ ok: false, error_code: 400, description: fail.desc ?? "Bad Request: can't parse the rich message" }, { status: 400 })
     switch (method) {
       case 'getMe': return ok({ ...state })
+      case 'pinChatMessage': pinned.set(String(body.chat_id), Number(body.message_id)); return ok(true)
+      case 'unpinChatMessage': if (body.message_id == null || pinned.get(String(body.chat_id)) === Number(body.message_id)) pinned.delete(String(body.chat_id)); return ok(true)
+      case 'getChat': { const p = pinned.get(String(body.chat_id)); return ok({ id: Number(body.chat_id), type: 'private', first_name: 'J', ...(p != null ? { pinned_message: { message_id: p, date: 0, chat: { id: Number(body.chat_id), type: 'private' } } } : {}) }) }
+      case 'editMessageText':
+        if (deleted.has(Number(body.message_id))) return Response.json({ ok: false, error_code: 400, description: 'Bad Request: message to edit not found' }, { status: 400 })
+        return ok(true)
       case 'getUpdates': {
         const offset = Number(body.offset ?? 0), p: { start: number; end?: number } = { start: Date.now() }
         polls.push(p)
@@ -73,7 +84,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     }
   } })
   return {
-    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail,
+    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail, pinned, deleted,
     push: (u) => { updates.push({ update_id: nextUpdate++, ...u }) },
     of: (method) => calls.filter(c => c.method === method),
     stop: () => server.stop(true),

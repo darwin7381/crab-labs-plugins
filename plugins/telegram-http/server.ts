@@ -78,6 +78,7 @@ import { bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwn
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
+import * as OnsenVisible from './onsen-visible.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
@@ -367,6 +368,39 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
+// Onsen step 3, the half Joey sees (WO-145, onsen-visible.ts): three switches (ONSEN_REACT_SEEN, ONSEN_STATUS_PIN, ONSEN_FORM_LINKS: a comma list of agent
+// names or `*`, from the plist or the machine config; unset or empty = off). Each also needs recording on for this agent; the agent-inbox daemon has none.
+const visibleOn = (name: OnsenVisible.Switch): boolean => !!onsen && onsen.cfg.record && !INBOX_ONLY && OnsenVisible.switchOn(process.env, name, ONSEN_AGENT)
+const ONSEN_VISIBLE = { seen: visibleOn('ONSEN_REACT_SEEN'), pin: visibleOn('ONSEN_STATUS_PIN'), forms: visibleOn('ONSEN_FORM_LINKS') }
+const ONSEN_FORM_HOSTS = OnsenVisible.formHosts(process.env)
+if (ONSEN_VISIBLE.seen || ONSEN_VISIBLE.pin || ONSEN_VISIBLE.forms) log('info', `onsen: visible half on for ${ONSEN_AGENT}: react_seen=${ONSEN_VISIBLE.seen ? 'on' : 'off'} status_pin=${ONSEN_VISIBLE.pin ? 'on' : 'off'} form_links=${ONSEN_VISIBLE.forms ? `on (${[...ONSEN_FORM_HOSTS].join(', ')})` : 'off'}`)
+/** WO-145 (ONSEN_REACT_SEEN): ✍ on Joey's message at the moment the main takes it in (DeliveryFacts onSeen, by main); the reaction is recorded in Onsen as
+ *  system:seen's */
+const seenReactor: OnsenVisible.SeenReactor | null = ONSEN_VISIBLE.seen ? new OnsenVisible.SeenReactor({ log,
+  react: (chat, id) => Onsen.withSender('system:seen', () => bot.api.setMessageReaction(chat, id, [{ type: 'emoji', emoji: OnsenVisible.SEEN_EMOJI as ReactionTypeEmoji['emoji'] }])) }) : null
+/** WO-145 (ONSEN_FORM_LINKS): the echo message of each page answer (chat:form-<id> → its Telegram id), so the main's reply_to / react on form-<id> lands on it */
+const formEchoes = new Map<string, number>()
+const formEchoOf = (chat: string, ref: string): number | undefined => formEchoes.get(`${chat}:${ref}`)
+const FORM_REF = /^form-\d+$/
+/** WO-145 (ONSEN_FORM_LINKS): a reply's links to our pages get their one-time form keys (POST /forms, 3 s at most; without one in time the link goes as
+ *  written). Telegram gets the keyed text; `redact` makes Onsen record the text without the keys (Onsen.withSender's extra). */
+async function formLinks(chat: string, text: string, who: string): Promise<{ text: string; redact: Array<[string, string]> }> {
+  if (!ONSEN_VISIBLE.forms || !onsen || !text) return { text, redact: [] }
+  try {
+    const r = await OnsenVisible.rewriteFormLinks(text, { hosts: ONSEN_FORM_HOSTS, chat, create: async title => {
+      const a = await onsen!.request('POST', '/forms', { chat, title }, 3_000)
+      if (!a) throw new Error('no mesh credential')
+      if (a.status < 200 || a.status >= 300 || typeof a.json?.key !== 'string') throw new Error(`Onsen /forms answered HTTP ${a.status}`)
+      return { id: Number(a.json.id), key: String(a.json.key), expires_at: a.json.expires_at }
+    } })
+    if (r.forms.length) log('info', `onsen: ${who}'s text in chat ${chat}: ${r.forms.length} page link(s) carry a form key (form ${r.forms.map(f => f.id).join(', ')}; the keys are not logged or recorded)`)
+    if (r.missed) log('warn', `onsen: ${who}'s text in chat ${chat}: ${r.missed} page link(s) sent without a form key (${r.why.join('; ') || 'Onsen did not answer within 3 s'})`)
+    return { text: r.text, redact: r.redact }
+  } catch (e) {
+    log('warn', `onsen: form links in chat ${chat} failed (${e instanceof Error ? e.message : e}); the text goes as written`)
+    return { text, redact: [] }
+  }
+}
 /** Onsen (WO-139): record one Bot API call (never throws); its author is the send context (Onsen.withSender), system:daemon outside every named path. A rich attempt's failure is not recorded when the plain fallback
  *  follows (it is the message); a timeout has no fallback (item 7), so it is recorded as failed. */
 function onsenNote(ctx: Onsen.SendCtx, method: string, payload: unknown, result: unknown, err?: unknown): void {
@@ -387,6 +421,8 @@ function onsenIn(m: any, text: string, transcript?: string): void {
 // after the lanes are (the block after lanesInit below); null = recording off for this agent, or the agent-inbox daemon.
 let onsenFacts: OnsenStatus.DeliveryFacts | null = null
 let onsenStep3Stop: (() => void) | null = null
+/** WO-145 (ONSEN_FORM_LINKS): the long poll of page answers (set up with step 3); null = off */
+let formInbox: OnsenVisible.FormInbox | null = null
 /** Onsen 1.45.1: an MCP stream opened (sid, its GET): which claude process holds it (the status's not_connected check); null = recording off */
 let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
@@ -396,7 +432,8 @@ const onsenAllow = { at: 0, ids: [] as string[] }
 const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
   if (!meta) return null
   const chat = String(meta.chat_id ?? ''), id = String(meta.message_id ?? ''), uid = String(meta.user_id ?? '')
-  if (!chat || !/^\d+$/.test(id) || !uid) return null
+  // WO-145: a page answer (via web-form) is Joey's message too; its id is form-<Onsen message id> (Onsen keys its delivery facts that way)
+  if (!chat || !(/^\d+$/.test(id) || (meta.via === 'web-form' && FORM_REF.test(id))) || !uid) return null
   if (Date.now() - onsenAllow.at > 5_000) { try { onsenAllow.ids = loadAccess().allowFrom.map(String) } catch {} ; onsenAllow.at = Date.now() }
   return onsenAllow.ids.includes(uid) ? { chat, id } : null
 }
@@ -2183,7 +2220,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const chat_id = args.chat_id as string
         const text = args.text as string
-        const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        // WO-145: a page answer's id (form-<n>) is not a Telegram message: Telegram threads the reply under its echo; the lanes match the answer itself
+        const formRef = ONSEN_VISIBLE.forms && FORM_REF.test(String(args.reply_to ?? ''))
+        const reply_to = formRef ? formEchoOf(String(args.chat_id), String(args.reply_to)) : args.reply_to != null ? Number(args.reply_to) : undefined
+        const lanesReplyTo: unknown = formRef ? String(args.reply_to) : reply_to
         const files = (args.files as string[] | undefined) ?? []
         // When Rich Messages is on, an unset format defaults to 'rich' (send
         // GFM markdown natively). 'text' forces plain; 'markdownv2' = legacy.
@@ -2194,7 +2234,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         assertAllowedChat(chat_id)
         // 002l (D16): the report on a hand-over goes out at the tier the router gives that event (design/notify 「分級由分流器…決定」); otherwise as before
         // PL2: the tier comes from the events of the main's running turn (M1 prompt → items → events), never from a parameter
-        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to, chat_id }) : null
+        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to: lanesReplyTo, chat_id }) : null
         const quiet = handoffTier?.silent ? { disable_notification: true } : {}
         // lanes-topics (item 2): every part of the reply (each chunk, each file) carries the one topic decision; lanes off: {}
         const topicF = topicFields({ chat: chat_id, topic: args.topic, replyTo: reply_to, turn: true })
@@ -2213,13 +2253,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // split mid-block (which would break native table rendering).
         const mode = useRich ? 'newline' : (access.chunkMode ?? 'length')
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        // WO-145 (ONSEN_FORM_LINKS): links to our pages carry a one-time form key on Telegram; Onsen records the text without it (rich and text; not the
+        // legacy markdownv2, whose escaping a key would have to follow)
+        const fl = parseMode ? { text, redact: [] as Array<[string, string]> } : await formLinks(chat_id, text, 'main')
+        const chunks = chunk(fl.text, limit, mode)
         // lanes-topics (item 7): one line per message the reply delivered (method, chat, id, topic, ms; never the text), so an incident can be read from the log
         const sentLog = (method: string, id: unknown, t0: number): void =>
           log('info', `reply sent: method=${method} chat=${chat_id} message=${id ?? '?'} topic=${topicF.message_thread_id ?? '-'} ms=${Date.now() - t0}`)
         // the one text send (sendTextParts), shared with the lane lines
         const sentIds = await Onsen.withSender('main', () => sendTextParts(chat_id, { rich: chunks, plain: chunks }, { what: 'reply', useRich, parseMode, quiet, topicF, sentLog,   // Onsen (WO-139)
-          replyParams: reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined, replyAll: replyMode === 'all' }))
+          replyParams: reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined, replyAll: replyMode === 'all' }), { redact: fl.redact })
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
@@ -2242,7 +2285,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to, text, chat_id)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
+        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, lanesReplyTo, text, chat_id)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
         sentIn(chat_id, sentIds, topicF)
         const tname = topicF.message_thread_id != null ? Lanes.topicName(topicF.message_thread_id) : undefined
         const result =
@@ -2254,7 +2297,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'react': {
         assertAllowedChat(args.chat_id as string)
-        await Onsen.withSender('main', () => bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [   // Onsen (WO-139): a reaction event
+        // WO-145: a page answer (form-<n>) has its echo as its Telegram message
+        let reactId = String(args.message_id ?? '')
+        if (ONSEN_VISIBLE.forms && FORM_REF.test(reactId)) {
+          const e = formEchoOf(String(args.chat_id), reactId)
+          if (e == null) throw new Error(`${reactId} is a page answer: it has no Telegram message of its own to react on (its echo is not known to this daemon)`)
+          reactId = String(e)
+        }
+        // WO-145 (ONSEN_REACT_SEEN): the agent's own reaction is never replaced by ✍, and lands after one still in flight
+        if (seenReactor) { seenReactor.agentReacted(String(args.chat_id), reactId); await seenReactor.settle(String(args.chat_id), reactId) }
+        await Onsen.withSender('main', () => bot.api.setMessageReaction(args.chat_id as string, Number(reactId), [   // Onsen (WO-139): a reaction event
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ]))
         return { content: [{ type: 'text', text: 'reacted' }] }
@@ -3332,11 +3384,12 @@ async function handleInbound(
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
   if (access.ackReaction && msgId != null) {
-    void Onsen.withSender('system:ack', () => bot.api   // Onsen (WO-139)
+    const ack = Onsen.withSender('system:ack', () => bot.api   // Onsen (WO-139)
       .setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
       ]))
-      .catch(() => {})
+    void ack.catch(() => {})
+    seenReactor?.ack(chat_id, msgId, ack)          // WO-145: the ✍ (the main took it in) never lands under this 👀
   }
 
   // Channel-bot TUI control plane (opt-in via CHANNEL_BOT_TMUX_SESSION env).
@@ -4241,12 +4294,15 @@ if (Lanes.LANES_ON) {
         const label = o.label && text.startsWith(`${o.label}\n`) ? o.label : ''
         const access = loadAccess(), useRich = isRichEnabled()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+        // WO-145 (ONSEN_FORM_LINKS): a lane's line (not the router's notices): its page links carry a form key, recorded without it
+        const fl = o.laneId ? await formLinks(chat, text, o.laneId) : { text, redact: [] as Array<[string, string]> }
+        const lt = label && fl.text.startsWith(`${label}\n`) ? fl.text.slice(label.length + 1) : label ? text.slice(label.length + 1) : fl.text
         // Onsen (WO-139): a lane's line is the lane's (its id), the router's own notices the router's
-        const ids = await Onsen.withSender(o.laneId || 'router', () => sendTextParts(chat, laneLineParts(label, label ? text.slice(label.length + 1) : text, limit, useRich), {
+        const ids = await Onsen.withSender(o.laneId || 'router', () => sendTextParts(chat, laneLineParts(label, lt, limit, useRich), {
           what: 'lane line', useRich, quiet: o.silent ? { disable_notification: true } : {}, topicF: tf,
           replyParams: o.replyTo ? { message_id: o.replyTo, allow_sending_without_reply: true } : undefined,   // 002k (E4): a deleted message must not lose the notice
           sentLog: (method, id, t0) => log('info', `lane line sent: method=${method} chat=${chat} message=${id ?? '?'} topic=${tf.message_thread_id ?? '-'} ms=${Date.now() - t0}`),
-        }))
+        }), { redact: fl.redact })
         sentIn(chat, ids, tf)
         return ids[0]
       },
@@ -4283,11 +4339,15 @@ if (Lanes.LANES_ON) {
 //              main's M2 row and hook events (the tool, subagents, PreCompact, its own wall); lanes off, the transcript's turn; both, the usage-wall
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
-  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000) })
+  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000),
+    ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}) })   // WO-145: ✍ when the main takes it in
   const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 5_000) })
   onsenFacts = facts
   let kickTimer: ReturnType<typeof setTimeout> | null = null
-  const kick = (): void => { if (!kickTimer) { kickTimer = setTimeout(() => { kickTimer = null; try { status.update(compute()) } catch {} }, 25); (kickTimer as any).unref?.() } }
+  const kick = (): void => { if (!kickTimer) { kickTimer = setTimeout(() => { kickTimer = null; try { feed(compute()) } catch {} }, 25); (kickTimer as any).unref?.() } }
+  // WO-145 (ONSEN_STATUS_PIN): the same view, shown in a pinned silent message in each DM chat of an allowlisted person (onsen-visible.ts StatusPin)
+  const pin = ONSEN_VISIBLE.pin ? statusPinSetup() : null
+  const feed = (v: OnsenStatus.StatusView): void => { status.update(v); try { pin?.show(v) } catch (e) { log('warn', `onsen: status pin: ${e}`) } }
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick })
@@ -4314,12 +4374,86 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
       turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false }))
   }
   registry.start()
-  setInterval(() => { try { watch?.tick(); status.update(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
+  setInterval(() => { try { watch?.tick(); feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop() }
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop() }
   onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
-    turn_end_settling: facts.pendingLater() })
+    turn_end_settling: facts.pendingLater(),
+    // WO-145: the visible half (only what is on)
+    ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),
+    ...(formInbox ? { forms: formInbox.stats } : {}) })
   log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
+  // WO-145 (ONSEN_FORM_LINKS): the answers to the page forms this agent sent come in by a long poll and go to the main as Joey's message would
+  if (ONSEN_VISIBLE.forms) {
+    formInbox = new OnsenVisible.FormInbox({ dir: join(STATE_DIR, 'onsen'), log, request: (m, p, b, t) => onsen.request(m, p, b, t),
+      deliver: it => deliverFormAnswer(it), echo: it => echoFormAnswer(it), spoolAck: ids => onsen.recordFormAck(ids) })
+    formInbox.start()
+    log('info', `onsen: forms inbox on (GET ${onsen.cfg.base}/forms/inbox?wait=25; answers go to the main, echoed silently)`)
+  }
+}
+/** WO-145 (ONSEN_STATUS_PIN): the pinned status in each DM chat of an allowlisted person (a positive Telegram id: DM chat id = user id). Its counts come from
+ *  this daemon's own spool lines (PendingTracker: the facts, Joey's records, the agent's messages), read at start and then as they are appended. */
+function statusPinSetup(): { pin: OnsenVisible.StatusPin; show: (v: OnsenStatus.StatusView) => void } {
+  const T = 15_000
+  const bounded = <X>(p: Promise<X>, what: string): Promise<X> => Promise.race([p, new Promise<never>((_, rej) => { const t = setTimeout(() => rej(new Error(`${what}: no answer in ${T / 1000} s`)), T); (t as any).unref?.() })])
+  const pin = new OnsenVisible.StatusPin({ dir: join(STATE_DIR, 'onsen'), log, api: {
+    // outside every topic (lanes-topics: explicitly the ordinary conversation): the status is about the agent, not about one line of work
+    send: async (chat, text) => (await Onsen.withSender('system:status', () => bot.api.sendMessage(chat, text, { disable_notification: true, ...topicFields({ chat, topic: '0' }) }))).message_id,
+    pin: (chat, id) => bounded(bot.api.pinChatMessage(chat, id, { disable_notification: true }), 'pinChatMessage'),
+    edit: (chat, id, text) => Onsen.withSender('system:status', () => bot.api.editMessageText(chat, id, text)),
+    pinnedId: async chat => { const c: any = await bounded(bot.api.getChat(chat), 'getChat'); return c?.pinned_message?.message_id ?? null },
+  } })
+  const pending = new OnsenVisible.PendingTracker()
+  const n = pending.load([onsen!.spoolOld, onsen!.spool])
+  onsen!.observe(l => pending.line(l))
+  const since = new OnsenVisible.SinceTracker(pin.sinceStore())
+  // the first seconds after the daemon starts, the main's stream is reconnecting (offline not_connected for a moment): the message is not touched then,
+  // so a restart (a fleet rollout) neither flips it to ⚫ nor resets its 「HH:MM 起」 (the state it comes back to is carried, SinceTracker)
+  const holdUntil = Date.now() + Math.max(0, Number(process.env.ONSEN_STATUS_PIN_HOLD_MS ?? 20_000) || 0)
+  log('info', `onsen: status pin on (DM chats of the allowlist; ${n} spool line(s) read for the counts; stop markers ${join(STATE_DIR, 'onsen')}/status-pin-off-<chat>.json)`)
+  return { pin, show: v => {
+    if (Date.now() < holdUntil) return
+    const at = since.track(v.state), now = Date.now()
+    let chats: string[] = []
+    try { chats = loadAccess().allowFrom.map(String).filter(x => /^\d+$/.test(x)) } catch {}
+    for (const chat of chats) pin.update(chat, OnsenVisible.statusText(v, at, pending.counts(chat), now))
+  } }
+}
+/** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
+ *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
+ *  not allowlisted (acked and dropped, logged). */
+async function deliverFormAnswer(it: OnsenVisible.FormItem): Promise<boolean> {
+  const access = loadAccess(), chat = String(it.chat)
+  if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}))) {
+    log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
+    return false
+  }
+  const ref = `form-${it.id}`, uid = chat.startsWith('-') ? String(access.allowFrom[0] ?? '') : chat
+  const meta: Record<string, string> = { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts: it.at && Number.isFinite(Date.parse(it.at)) ? new Date(it.at).toISOString() : new Date().toISOString(),
+    via: 'web-form', form_title: metaExcerpt(it.title, 128), form_id: String(it.form_id) }
+  const notification = { method: 'notifications/claude/channel', params: { content: OnsenVisible.formBodyText(it.body), meta } }
+  // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
+  if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
+  if (Lanes.LANES_ON) {
+    const ev: Lanes.InEvent = { id: `tg-${chat}-${ref}`, source: 'telegram', from: uid, text: String(notification.params.content), meta, notif: notification, verified: true }
+    if (Lanes.toMainForm(ev)) return true
+  }
+  await dispatchInbound(chat, notification)
+  return true
+}
+/** WO-145: what Joey sees for his page answer: 〔你在頁面送出的｜title〕 and the body, without a notification; recorded as system:form-echo's */
+async function echoFormAnswer(it: OnsenVisible.FormItem): Promise<void> {
+  const parts = chunk(OnsenVisible.formEchoText(it), 4000, 'newline')
+  let first: number | undefined
+  for (const p of parts) {
+    // outside every topic (the answer goes to the main, not to a topic's lane)
+    const m = await Onsen.withSender('system:form-echo', () => bot.api.sendMessage(String(it.chat), p, { disable_notification: true, ...topicFields({ chat: String(it.chat), topic: '0' }) }))
+    first ??= m.message_id
+  }
+  if (first != null) {
+    formEchoes.set(`${it.chat}:form-${it.id}`, first)
+    if (formEchoes.size > 500) formEchoes.delete(formEchoes.keys().next().value!)
+  }
 }
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {

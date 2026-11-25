@@ -15,6 +15,9 @@
 //   - step 3 (WO-143): delivery facts (k 'd': delivered / seen / turn_end of Joey's messages, POST /deliveries/batch) and the main's status (k 's', POST
 //     /status/batch; 1.45.1: the registry's states and last_activity_at) go through the same spool, in order behind the messages they are about (onsen-status.ts decides them; server.ts wires them). A batch
 //     refused as a whole (an Onsen without those routes) goes to rejected.jsonl: the messages behind it are never held.
+//   - WO-145 (the half Joey sees, onsen-visible.ts): a send context may carry `redact` (a reply's page links with their one-time form keys → the links as the
+//     agent wrote them): the record keeps the text WITHOUT the keys. A form answer's ack that Onsen did not take directly goes through the spool (k 'a',
+//     POST /forms/ack). `observe` lets the daemon read every line it appends (the pinned status's local counts). `request`: one call with the credential.
 // The credential (the agent's mesh credential, read from the agent-inbox daemon's state dir) is never logged, printed or written anywhere.
 
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -51,9 +54,11 @@ export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'
  *  the newest write to the main's transcript or its subagents' (null = none found) */
 export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck'
 export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown>; last_activity_at?: string | null }
-type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
-  | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact }
-const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's'])
+/** WO-145: the form answers this daemon queued for the main (POST /forms/ack), when Onsen did not take the ack directly */
+export type FormAck = { ids: number[]; at: string }
+export type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
+  | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck }
+const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a'])
 
 export const idemIn = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:in:${id}`
 export const idemOut = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:out:${id}`
@@ -66,12 +71,22 @@ export const idemDelivery = (agent: string, chat: string, id: string | number, s
 export const idemStatus = (agent: string, ms: number, state: StatusState): string => `tg:${agent}:st:${ms}:${state}`
 
 // ------------------------------------------------------------------ who is sending (server.ts sets it around each send path)
-export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean; skip?: boolean }
+export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean; skip?: boolean
+  /** WO-145: [what Telegram got, what Onsen records] pairs applied to the recorded text, in order (a page link with its one-time key → the link without) */
+  redact?: Array<[string, string]> }
 const als = new AsyncLocalStorage<SendCtx>()
 /** the author of a Telegram call made outside every named send path (server.ts records it all the same) */
 export const DEFAULT_CTX: SendCtx = { sender: 'system:daemon' }
-/** run `fn` with `sender` as the author of every Telegram call it makes */
-export function withSender<T>(sender: string, fn: () => T): T { return als.run({ sender }, fn) }
+/** run `fn` with `sender` as the author of every Telegram call it makes; `extra` (WO-145): `redact` for the record */
+export function withSender<T>(sender: string, fn: () => T, extra?: Pick<SendCtx, 'redact'>): T {
+  return als.run(extra?.redact?.length ? { sender, redact: extra.redact } : { sender }, fn)
+}
+/** WO-145: the text as Onsen keeps it: every [sent, kept] pair of the send context applied */
+export function redactText(s: string, redact?: Array<[string, string]>): string {
+  if (!redact?.length) return s
+  for (const [from, to] of redact) if (from) s = s.split(from).join(to)
+  return s
+}
 /** `sender` unless a caller already named the author (a shared helper: its callers name themselves) */
 export function withDefaultSender<T>(sender: string, fn: () => T): T { return als.getStore() ? fn() : als.run({ sender }, fn) }
 /** the Telegram calls `fn` makes are not recorded (a stranger's pairing: not part of any conversation Onsen keeps) */
@@ -186,7 +201,7 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
     if (err !== undefined || payload.message_id == null) return null           // an event is a change that happened: a failed edit changed nothing
     const target = String(payload.message_id)
     const kind: OnsenEvent['kind'] = method === 'editMessageText' ? 'edit' : method === 'setMessageReaction' ? 'reaction' : 'retract'
-    const body = method === 'editMessageText' ? String(payload.text ?? payload.rich_message?.markdown ?? '') : undefined
+    const body = method === 'editMessageText' ? redactText(String(payload.text ?? payload.rich_message?.markdown ?? ''), ctx.redact) : undefined
     const emoji = method === 'setMessageReaction' ? (Array.isArray(payload.reaction) && payload.reaction[0] ? payload.reaction[0].emoji ?? payload.reaction[0].custom_emoji_id ?? null : null) : undefined
     return { k: 'e', r: {
       idem_key: `tg:${agent}:${chat}:${kind}:${target}:${randomUUID()}`, agent, client: 'telegram', chat, target_client_msg_id: target, kind, actor: ctx.sender,
@@ -194,7 +209,7 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
     } }
   }
   const kind = OUT_KIND[method]!
-  const body = String(method === 'sendRichMessage' ? payload.rich_message?.markdown ?? '' : method === 'sendMessage' ? payload.text ?? '' : payload.caption ?? '')
+  const body = redactText(String(method === 'sendRichMessage' ? payload.rich_message?.markdown ?? '' : method === 'sendMessage' ? payload.text ?? '' : payload.caption ?? ''), ctx.redact)
   const replyTo = payload.reply_parameters?.message_id ?? payload.reply_to_message_id
   const f = err === undefined ? fileOf(result, method) : undefined
   const fname = f?.file_name ?? payload?.[method.slice(4).toLowerCase()]?.filename
@@ -264,8 +279,9 @@ export class OnsenClient {
   private credWarnAt = 0
   private appendWarnAt = 0
   private authWarnAt = 0
+  private observers: Array<(line: SpoolLine) => void> = []
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
-    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0 }
+    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -283,6 +299,14 @@ export class OnsenClient {
   /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
   recordDelivery(f: DeliveryFact): void { if (this.append({ k: 'd', r: f })) this.stats.deliveries_recorded++ }
   recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) this.stats.status_recorded++ }
+  /** WO-145: form answers queued for the main whose ack Onsen did not take directly: POST /forms/ack when the spool reaches it. false = not spooled */
+  recordFormAck(ids: number[]): boolean {
+    const ok = ids.length > 0 && this.append({ k: 'a', r: { ids, at: new Date().toISOString() } })
+    if (ok) this.stats.form_acks_spooled++
+    return ok
+  }
+  /** WO-145: `fn` reads every line appended from now on (after it is in the spool; it never changes or holds the line) */
+  observe(fn: (line: SpoolLine) => void): void { this.observers.push(fn) }
   private append(line: SpoolLine): boolean {
     if (!this.cfg.record) return false
     try {
@@ -290,6 +314,7 @@ export class OnsenClient {
       appendFileSync(this.spool, JSON.stringify(line) + '\n', { mode: 0o600 })
       this.stats.recorded++
       this.kick()
+      for (const o of this.observers) { try { o(line) } catch {} }
       return true
     } catch (e) {
       if (Date.now() - this.appendWarnAt > HOUR) { this.appendWarnAt = Date.now(); this.cfg.log('warn', `onsen: could not append to the spool (${errText(e)}); this record is lost`) }
@@ -359,6 +384,16 @@ export class OnsenClient {
   }
   private headers(cred: string, extra: Record<string, string> = {}): Record<string, string> {
     return { 'Content-Type': 'application/json', Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}`, ...extra }
+  }
+  /** WO-145: one call to Onsen with this agent's credential (null: no credential); throws on a network error or the timeout */
+  async request(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 15_000): Promise<{ status: number; json: any } | null> {
+    const cred = this.cfg.credential()
+    if (!cred) return null
+    if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs)
+    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred), signal: AbortSignal.timeout(timeoutMs) })
+    let json: any = null
+    try { json = await r.json() } catch {}
+    return { status: r.status, json }
   }
   private async post(path: string, body: unknown, cred: string, timeoutMs?: number): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { method: 'POST', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
@@ -441,6 +476,15 @@ export class OnsenClient {
           continue
         }
         return this.failStatus(r, path)
+      }
+      if (t.line.k === 'a') {
+        // WO-145: a form answers' ack (the answers are already queued for the main; unacked, Onsen would hand them out again)
+        const r = await this.post('/forms/ack', { ids: t.line.r.ids }, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        if (r.status >= 200 && r.status < 300) this.stats.posted++
+        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `HTTP ${r.status} ${String(r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`)
+        else return this.failStatus(r, '/forms/ack')
+        this.writeCursor(t.end); this.ok(); i++
+        continue
       }
       if (t.line.k === 'e') {
         const r = await this.post('/events', t.line.r, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))

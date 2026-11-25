@@ -31,7 +31,10 @@ export class DeliveryFacts {
   private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; timer: ReturnType<typeof setTimeout> }>()
   /** Joey's messages taken in and not yet into a turn (lanes off: the queued count) */
   private open = new Map<string, { at: number; seen: boolean; taken: boolean }>()
-  constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; settleMs?: number; now?: Now; max?: number }) {}
+  /** onSeen (WO-145, the ✍ reaction): every `seen` report, for each message of it (an album: every item), the recipient named; a repeat too (the
+   *  caller keeps its own once) */
+  constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; settleMs?: number; now?: Now; max?: number
+    onSeen?: (chat: string, id: string, by: string) => void }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
 
   /** the album's messages: what happens to the first (the one delivered) happens to each */
@@ -64,6 +67,7 @@ export class DeliveryFacts {
     const s = String(id)
     this.emit(chat, s, 'seen', by, at)
     for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) e.seen = true }
+    if (this.o.onSeen) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
   }
   /** lanes off: the transcript shows it taken into a turn (not a fact of its own: the queued count) */
   taken(chat: string, id: string | number): void {
