@@ -66,3 +66,5 @@ plugins/telegram-http/lanes.ts::async function mainSameMatterGate(
 plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, 'reply_agent', a); if (g) return g }
 plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, name, a); if (g) return g }
 plugins/telegram-http/lanes-boundary.ts::export function mainSameMatterRefusal(
+plugins/telegram-http/lanes.ts::&& !tok.sameRefused?.length && !tok.mailHandoffWarned
+plugins/telegram-http/lanes-boundary.ts::process.env.LANES_MAIN_SAME_MATTER_P ?? 0.5

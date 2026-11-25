@@ -2546,7 +2546,9 @@ type RunTok = { runId: string; lane: string; evId: string; closers: string[]; cr
   mainAskWarned?: boolean; notifyDeduped?: boolean
   /** WO-144 point 8: the latest message lines of this run's conversation block (startRun; the block in the prompt, never fetched again); the mails this
    *  mail-lane run listed or opened (id → what it saw); the gate's Jev verdict per subject (`mail:<id>` or `event`; one call each, failures included) */
-  chatLines?: string[]; mailSeen?: Record<number, { text: string; from: string; opened: boolean; n: number }>; sameMatter?: Record<string, Promise<SameMatterVerdict>> }
+  chatLines?: string[]; mailSeen?: Record<number, { text: string; from: string; opened: boolean; n: number }>; sameMatter?: Record<string, Promise<SameMatterVerdict>>
+  /** WO-144 point 8 (retest t2): the subjects the gate refused in this run (`mail:<id>` / `event`); a mail-lane run with one hands over without opening a mail */
+  sameRefused?: string[] }
 const runTokens = new Map<string, RunTok>()
 /** WO-129 (item 1): the run a schedule gave this lane (its trigger is the scheduler's; a follow-up run of it is another run, with no receipt of its own) */
 const schedRun = (tok: RunTok): boolean => tok.cls === 'scheduled' && !tok.followup
@@ -3300,18 +3302,21 @@ export function laneContext(lane: Lane, it: Pick<QItem, 'summary' | 'ev'>, cardU
 // lanes on one host could not see each other, nor that the main was rebuilding that host). LANES_RUN_CONTEXT=0: no lines (1.39.1).
 export const runContextOn = (): boolean => process.env.LANES_RUN_CONTEXT !== '0'
 const hhmm = (iso: string): string => stamp(iso).slice(6)
-/** the main's current turn: what it was given (the items bound to the turn, the digest left out), one short line; '' when nothing is known */
-function mainDoing(g: Row): string {
+/** the main's current turn: what it was given (the items bound to the turn, the digest left out), one short line (the first item cut at `max`: 80 for the
+ *  此刻 line; WO-144 point 8's gate reads up to MAIN_SAME_DOING_MAX); '' when nothing is known */
+function mainDoing(g: Row, max = 80): string {
   if (!g.prompt_id) return ''
   const its = main.turnWork(g, String(g.prompt_id)).items.filter(r => r.kind !== 'digest')
-  const what = its.map(r => clip(String((r.notif?.params as any)?.content ?? ''), 80)).filter(Boolean)
+  const what = its.map(r => clip(String((r.notif?.params as any)?.content ?? ''), max)).filter(Boolean)
   return what.length ? `${what[0]}${what.length > 1 ? `（另有 ${what.length - 1} 件）` : ''}` : ''
 }
-/** WO-144 point 8: the main's turn right now, read as the 此刻 line reads it (M2's current gen in_turn; `doing` = its 「在處理」, mainDoing); null = not in a turn */
+/** WO-144 point 8: the main's turn right now, read as the 此刻 line reads it (M2's current gen in_turn; `doing` = its 「在處理」, mainDoing, here cut at
+ *  MAIN_SAME_DOING_MAX instead of the line's 80: the lab retest's 80 characters were mostly the main's Bash command); null = not in a turn */
+export const MAIN_SAME_DOING_MAX = 300
 export function mainTurnNow(): { doing: string; prompt: string | null } | null {
   try {
     const g = main?.currentGen()
-    return g && String(g.state) === 'in_turn' ? { doing: mainDoing(g), prompt: g.prompt_id ? String(g.prompt_id) : null } : null
+    return g && String(g.state) === 'in_turn' ? { doing: mainDoing(g, MAIN_SAME_DOING_MAX), prompt: g.prompt_id ? String(g.prompt_id) : null } : null
   } catch { return null }
 }
 export function mainNowLine(): string {
@@ -3420,9 +3425,10 @@ export const __chatFetching = (): number => chatFetching.size                   
 // is not done while the main is in a turn (mainTurnNow: the 此刻 line's own source) on the same matter. "Same matter" is Jev's, one Noul, asked once per run and
 // subject: a mail-lane run's subject is the mail the action is on (mailbox_check / mailbox_reply id; reply_agent to a sender of a mail this run opened or
 // listed), as the lane saw it (its event is only the 讀信箱 reminder, and one run reads several unrelated mails); any other action's is the run's event.
-// p >= LANES_MAIN_SAME_MATTER_P (0.8): refused (returned, nothing done), a ledger line, a lanes.jsonl row, a logos event. A failed call lets it through (logged
-// in run/jev-calls.jsonl, site main-same-matter-WO144, like every Jev call). No gate, no call: the main not in a turn, or nothing known of what it handles
-// (no 「在處理」); a run of the main's own (its decision coming back, a worker / fork / fan-out / synthesis / curator lane); LANES_MAIN_SAME_MATTER=0 or
+// p >= LANES_MAIN_SAME_MATTER_P (0.5; 0.8 until the lab retest): refused (returned, nothing done; the mail lane's handoff_main then takes it without a
+// mailbox_open), a ledger line, a lanes.jsonl row, a logos event. A failed call lets it through (logged in run/jev-calls.jsonl, site main-same-matter-WO144,
+// like every Jev call). No gate, no call: the main not in a turn, or nothing known of what it handles (no 「在處理」); a run of the main's own (its
+// decision coming back, a worker / fork / fan-out / synthesis / curator lane); LANES_MAIN_SAME_MATTER=0 or
 // LANES_MAIN_CHAT=0. Not gated: handoff_main, decide_later, mailbox_card (they hand to the main), notify_joey, ask_joey, receipt, chat_history, the read-only
 // mailbox tools, the ledger / commitment / follow-up records; the lane's own built-in tools (Bash, Write, Edit) do not pass through here.
 export const MAIN_SAME_GATED = ['mailbox_check', 'mailbox_reply', 'reply_agent']
@@ -3430,7 +3436,9 @@ const MAIN_SAME_CONVO = 6                                                       
 export type SameMatterVerdict = { same: boolean; p: number | null; error?: string }
 // The words were chosen on the real Jev with the lab's own inputs (runs lab-relay.mail.6 / mail.7, the other mails of those runs, two alert pairs), three calls
 // each: the 週報 mails 0.91–0.94 and 0.84–0.89, the unrelated mails, the reminder and the other alert 0.02–0.16, the same service's alert 0.99. A wording that also
-// said "acting on it would be doing the main's work in parallel" put the second trial at 0.61–0.81.
+// said "acting on it would be doing the main's work in parallel" put the second trial at 0.61–0.81. The lab retest of 5ca6ab7 (the daemon's own calls): the same
+// matter 0.85, 0.84, 0.82, 0.79 (the last let through at 0.8), unrelated work 0.04: the threshold is 0.5. Its inputs again on the real Jev, three calls each, with
+// `main_doing` at 300 characters (the whole Joey message, 101–114 characters): the same matter 0.73–0.92 (at 80: 0.73–0.90), unrelated 0.03–0.12.
 export const MAIN_SAME_QUESTION = { same_matter: { type: 'noul', instructions: 'Does `event` concern the matter named in `main_doing`, the work the main session is doing right now? (`conversation` is background.)',
   criteria: { true: 'The subject of `event` (the report, mail, task, ticket, service or request it is about) is the subject `main_doing` names', false: 'The subject of `event` is a different one' } } }
 /** what a gated action is about: a mail of this mail-lane run (as the lane saw it), or the run's event */
@@ -3458,7 +3466,7 @@ export function mainSameState(doing: string, chatLines: string[] | undefined, ev
 }
 async function askSameMatter(tok: RunTok, lane: Lane, name: string, sub: { key: string; event: Record<string, unknown> }, now: { doing: string; prompt: string | null }): Promise<SameMatterVerdict> {
   const r = await jevAsk(mainSameState(now.doing, tok.chatLines, sub.event), MAIN_SAME_QUESTION, 'genesis-main-same-matter/1', undefined,
-    { dir: LANES_DIR, site: 'main-same-matter-WO144', inputs: { lane: lane.id, run: tok.runId, event: tok.evId, tool: name, subject: sub.key, doing: clip(now.doing, 120), prompt: now.prompt,
+    { dir: LANES_DIR, site: 'main-same-matter-WO144', inputs: { lane: lane.id, run: tok.runId, event: tok.evId, tool: name, subject: sub.key, doing: now.doing, prompt: now.prompt,
       conversation: tok.chatLines?.length ?? 0 }, p: a => a.same_matter?.noul })
   const p = r.answers?.same_matter?.noul
   if (r.error || typeof p !== 'number') {
@@ -3476,6 +3484,7 @@ async function mainSameMatterGate(tok: RunTok, lane: Lane, name: string, a: any)
   const sub = sameMatterSubject(tok, lane, name, a)
   const v = await ((tok.sameMatter ??= {})[sub.key] ??= askSameMatter(tok, lane, name, sub, now))
   if (!v.same) return null
+  if (!(tok.sameRefused ??= []).includes(sub.key)) tok.sameRefused.push(sub.key)   // handoff_main takes it without a mailbox_open (retest t2's dead end)
   const what = sub.key === 'event' ? name : `${name} #${String(sub.key).slice(5)}`
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'main_same_matter_refused', run: tok.runId, event: tok.evId, tool: name, subject: sub.key, p: v.p, prompt: now.prompt, doing: clip(now.doing, 120) })
   ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action',
@@ -5088,7 +5097,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       // 1.36.1: the words alone did not do it. With Chiron's lines in the card (1.35.3), nestor.mail.1 (11-23 15:04Z: 「信箱 3 封…沒打開、沒勾掉，請主線處理」) and
       // sonn's mail lane (16:01Z: 「兩封新信，我沒打開」) still handed the list back unread, so the main was woken to read the mail itself. A mail-lane run that
       // opened no mail is sent back once; a second call goes through (the mailbox may be unreadable, and the lane then says so).
-      if (lane.kind === 'mail' && !(tok.mailOpened && tok.mailOpened > 0) && !tok.mailHandoffWarned && !tok.decision) {   // WO-127: a decision's run opened its mail before
+      // WO-144 point 8 (lab retest t2): what the same-matter gate refused in this run is handed over as it is: the gate told the lane to hand it to the main, and
+      // the lane read the agreed rule as 「don't open」; the hand-over was refused, nothing reached the main. A refused mail counts as opened here.
+      if (lane.kind === 'mail' && !(tok.mailOpened && tok.mailOpened > 0) && !tok.sameRefused?.length && !tok.mailHandoffWarned && !tok.decision) {   // WO-127: a decision's run opened its mail before
         tok.mailHandoffWarned = true
         return 'not handed over: this run has not opened any mail (mailbox_open). Open each mail first: the sender then sees 車道讀過, not the main\'s read, and a category your focus card '
           + 'leaves to the main is still yours to read and prepare. Then hand over what the main must decide, written so that it does not have to open the mail: #id, sender, deadline, '

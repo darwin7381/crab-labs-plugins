@@ -11,8 +11,8 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 process.env.LANES_FLOOD_CONTROL = '0'
 
-// ------------------------------------------------------------------ Jev stand-in: same_matter = 0.9 when the event is about the 週報, else 0.1; 'error' = HTTP 500
-let jevMode: 'weekly' | 'error' = 'weekly'
+// ------------------------------------------------------------------ Jev stand-in: same_matter = 0.9 when the event is about the 週報, else 0.1; 'error' = HTTP 500; a number = that p
+let jevMode: 'weekly' | 'error' | number = 'weekly'
 const sameCalls: any[] = []
 const jev = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
   const body = await req.json() as any
@@ -20,6 +20,7 @@ const jev = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
   if (keys.includes('same_matter')) {
     sameCalls.push(body)
     if (jevMode === 'error') return new Response('upstream error', { status: 500 })
+    if (typeof jevMode === 'number') return Response.json({ model: 'jev-1.14.0', answers: { same_matter: { type: 'noul', noul: jevMode } } })
     return Response.json({ model: 'jev-1.14.0', answers: { same_matter: { type: 'noul', noul: JSON.stringify(body.state?.event ?? '').includes('週報') ? 0.9 : 0.1 } } })
   }
   const answers: Record<string, unknown> = {}
@@ -132,8 +133,9 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   await m.hook('UserPromptSubmit', { prompt_id: 'p-weekly', dids: [item] })
   expect(M().currentGen()!.state).toBe('in_turn')
   const now = L.mainTurnNow()!
-  expect(now.doing).toContain('週報那件事你來處理')
-  expect(L.mainNowLine()).toContain(`在處理：${now.doing}`)                       // the 此刻 line's own source
+  expect(now.doing).toBe(JOEY_WEEKLY)                                           // the gate reads the turn's item up to 300 characters (retest: 80 was mostly the Bash command)
+  expect(JOEY_WEEKLY.length).toBeGreaterThan(80)
+  expect(L.mainNowLine()).toContain(`在處理：${JOEY_WEEKLY.slice(0, 79)}…）`)       // the 此刻 line: the same source, its own cut at 80
   // the 讀信箱 reminder starts the mail lane's run (its conversation block is fetched once, before it starts)
   const asked0 = chatAsked
   const d = await L.routeEvent({ id: 'mesh-wo144g-weekly', source: 'mesh', from: 'fleet-watchdog', verified: true, text: '讀信箱（1 封未讀，最舊的等了 0 分鐘）：先用 mailbox_list 看清單',
@@ -152,8 +154,7 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   // the 週報 mail: checking it off is not done
   const checks = sent('mailbox_check').length, replies = sent('mailbox_reply').length, mesh0 = meshed.length
   const refusal = B.mainSameMatterRefusal(now.doing)
-  expect(now.doing.length).toBeLessThanOrEqual(80)                               // mainDoing's own cut (the 此刻 line's)
-  expect(refusal).toBe(`沒有做：主線正在回合中處理同一件事（在處理：${now.doing}）。照邊界卡的但書，這件交給主線：用 handoff_main 交過去（寫你查到的、你本來要做什麼），不要自己動手。`)
+  expect(refusal).toBe(`沒有做：主線正在回合中處理同一件事（在處理：${JOEY_WEEKLY.slice(0, 80)}…）。照邊界卡的但書，這件交給主線：用 handoff_main 交過去（寫你查到的、你本來要做什麼），不要自己動手。`)
   expect(await L.callLaneTool(tok, 'mailbox_check', { id: 90006 })).toBe(refusal)
   expect(sent('mailbox_check').length).toBe(checks)                               // nothing reached the mailbox
   expect(sameCalls.length).toBe(1)
@@ -167,6 +168,7 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   expect(await L.callLaneTool(tok, 'reply_agent', { to: 'lab-peer', title: '週報 W48 補充收到', ask: '不用回', text: '補充看過了。' })).toBe(refusal)
   expect(sent('mailbox_reply').length).toBe(replies); expect(meshed.length).toBe(mesh0)
   expect(sameCalls.length).toBe(1)
+  expect(tok.sameRefused).toEqual(['mail:90006'])
   // the record: a ledger line and a lanes.jsonl row per refusal, the Jev call in run/jev-calls.jsonl
   const led = jsonl(join(dir, 'ledger.jsonl')).filter(r => r.refs?.main_same_matter === 'refused' && r.lane === d.lane)
   expect(led.map(r => r.refs.tool)).toEqual(['mailbox_check', 'mailbox_reply', 'reply_agent'])
@@ -174,7 +176,7 @@ test('replay of lab row 8: the main in a turn on Joey\'s 週報 matter; the mail
   expect(led[0].text).toStartWith('mailbox_check #90006 擋下：主線正在回合中處理同一件事（在處理：週報那件事你來處理')
   expect(jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'main_same_matter_refused' && r.lane === d.lane).map(r => r.tool)).toEqual(['mailbox_check', 'mailbox_reply', 'reply_agent'])
   const jc = jsonl(join(dir, 'run', 'jev-calls.jsonl')).filter(r => r.site === 'main-same-matter-WO144')
-  expect(jc.length).toBe(1); expect(jc[0]).toMatchObject({ p: 0.9, err: null, inputs: { lane: d.lane, tool: 'mailbox_check', subject: 'mail:90006', prompt: 'p-weekly', conversation: 3 } })
+  expect(jc.length).toBe(1); expect(jc[0]).toMatchObject({ p: 0.9, err: null, inputs: { lane: d.lane, tool: 'mailbox_check', subject: 'mail:90006', prompt: 'p-weekly', conversation: 3, doing: JOEY_WEEKLY } })
   // the other mail (the test bench's restart question): another matter, one more call, it goes through
   await L.callLaneTool(tok, 'mailbox_open', { id: 90003 })
   expect(await L.callLaneTool(tok, 'mailbox_check', { id: 90003 })).toBe('#90003 勾掉了，不在清單上了。')
@@ -249,6 +251,45 @@ test('switches: LANES_MAIN_SAME_MATTER=0, or LANES_MAIN_CHAT=0: no gate, no Jev 
     await L.callLaneTool(tok, 'mailbox_open', { id: 90006 })
     expect(await L.callLaneTool(tok, 'mailbox_check', { id: 90006 })).toBe('#90006 勾掉了，不在清單上了。')
   } finally { delete process.env.LANES_MAIN_SAME_MATTER_P }
+})
+
+test('lab retest t2: a mail the gate refused (listed, never opened) is handed to the main by handoff_main without a mailbox_open; a run that opened nothing and had nothing refused is still sent back', async () => {
+  expect(L.mainTurnNow()).not.toBeNull()
+  // t2: the list, two 週報 mails refused, no mailbox_open (the lane read the agreed rule as 「don't open」)
+  const tok = fakeRun('mail', {})
+  await L.callLaneTool(tok, 'mailbox_list', {})
+  const refusal = B.mainSameMatterRefusal(L.mainTurnNow()!.doing)
+  expect(await L.callLaneTool(tok, 'mailbox_check', { id: 90006 })).toBe(refusal)
+  expect(tok.mailOpened ?? 0).toBe(0); expect(tok.sameRefused).toEqual(['mail:90006'])
+  const handed = await L.callLaneTool(tok, 'handoff_main', { text: '#90006 lab-peer「週報 W48 補充：失敗那 2 趟的細節」（只看了清單）：照講定本來要勾掉；主線正在處理週報，閘擋下了，交給你。' })
+  expect(handed).toStartWith('handed to the main:')
+  expect(M().items(r => r.kind === 'handoff' && r.event === tok.evId).map(r => String(r.notif?.params?.content ?? ''))).toEqual([expect.stringContaining('（只看了清單）：照講定本來要勾掉；主線正在處理週報，閘擋下了，交給你。')])   // the main gets it
+  // another run: the list only, the other mail (not the main's matter) checked off, nothing opened and nothing refused: sent back once, as before
+  const tok2 = fakeRun('mail', {})
+  await L.callLaneTool(tok2, 'mailbox_list', {})
+  expect(await L.callLaneTool(tok2, 'mailbox_check', { id: 90003 })).toBe('#90003 勾掉了，不在清單上了。')
+  expect(tok2.sameRefused).toBeUndefined()
+  expect(await L.callLaneTool(tok2, 'handoff_main', { text: '#90003 lab-peer 問測試台要不要每天重開：交給你決定。' })).toStartWith('not handed over: this run has not opened any mail (mailbox_open).')
+})
+
+test('the default threshold is 0.5 (lab retest: the same matter 0.79–0.85, one trial under 0.8; unrelated work 0.04): p 0.6 refuses, p 0.4 goes through; LANES_MAIN_SAME_MATTER_P=0.8 lets 0.6 through', async () => {
+  expect(B.mainSameMatterP()).toBe(0.5)
+  try {
+    jevMode = 0.6
+    const a = fakeRun('mail', {})
+    await L.callLaneTool(a, 'mailbox_open', { id: 90006 })
+    expect(await L.callLaneTool(a, 'mailbox_check', { id: 90006 })).toBe(B.mainSameMatterRefusal(L.mainTurnNow()!.doing))
+    process.env.LANES_MAIN_SAME_MATTER_P = '0.8'
+    try {
+      const b = fakeRun('mail', {})
+      await L.callLaneTool(b, 'mailbox_open', { id: 90006 })
+      expect(await L.callLaneTool(b, 'mailbox_check', { id: 90006 })).toBe('#90006 勾掉了，不在清單上了。')
+    } finally { delete process.env.LANES_MAIN_SAME_MATTER_P }
+    jevMode = 0.4
+    const c = fakeRun('mail', {})
+    await L.callLaneTool(c, 'mailbox_open', { id: 90006 })
+    expect(await L.callLaneTool(c, 'mailbox_check', { id: 90006 })).toBe('#90006 勾掉了，不在清單上了。')
+  } finally { jevMode = 'weekly' }
 })
 
 test('the main gone: no gate, no Jev call', async () => {
