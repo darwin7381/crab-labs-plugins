@@ -69,7 +69,10 @@ export function regionParts(text: string): Parts {
   m = /(\d+) monitors?/.exec(src); const monitors = m ? parseInt(m[1]!, 10) : 0
   m = /(\d+) background tasks?/.exec(src); const background_tasks = m ? parseInt(m[1]!, 10) : 0   // v3 (Chiron 19:21Z): "· 2 background tasks · ctrl+t to show tasks"
   let agents = below.filter(r => /^\s*◯\s+\S/.test(r)).length
-  m = /Waiting for (\d+) background agents?/.exec(blob)
+  // "Waiting for N background agents" counts only while it is the LAST marker line above the box: once they finish, the old line stays on the screen
+  // under a later marker (✻ Crunched for 2s · done). Chiron WO-165 20:23Z (lab 20:11Z: background.agents 1 held for two minutes after it finished)
+  const marks = above.filter(r => GLYPH.test(r))
+  m = marks.length ? /Waiting for (\d+) background agents?/.exec(marks[marks.length - 1]!) : null
   if (m) agents = Math.max(agents, parseInt(m[1]!, 10))
   const actI: number[] = [], finI: number[] = []
   above.forEach((r, i) => { if (ACT.test(r)) actI.push(i); if (FIN.test(r)) finI.push(i) })

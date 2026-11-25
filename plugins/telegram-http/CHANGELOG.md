@@ -1,3 +1,7 @@
+## 1.57.1 — 2026-11-26
+
+- **The screen reader counts "Waiting for N background agents" only while it is the last marker line above the input box** (board WO-165 A, Chiron 20:23Z; agent-inbox 1.27.1). Once they finish, the old line stays on the screen under a later marker (✻ Crunched for 2s · done); scanning all 14 lines kept `background.agents 1` (and the next busy row's `subagents 1`) for two minutes after the sub-agent ended (lab 20:11Z). Now `running_agents` = the ◯ rows below the box, or max(that, N) when the last glyph line above is the waiting line: Chiron's `regions()` (`jev_screen.py`), identical on his 55 real screens (`lab-waiting-bg-agents` 2, `lab-bg-agent-after-notify-turn` 1, `lab-bg-agent-finished-stale-line` 0).
+
 ## 1.57.0 — 2026-11-26
 
 - **Jev reads the bottom of the main's screen and its reading is the status Onsen gets** (board WO-165 A, Chiron; Joey TG chiron:2485: 「如果暫時真無法穩的話可以配 Jev 直接讓他讀最底下的那些文字…先用這個實現可靠的…選項都要帶有個其他用來記錄例外情況」; agent-inbox 1.27.0). Only for the agents in **`JEV_SCREEN`** (a comma list or `*`, as `ONSEN_PULL`; the plist's value, else `~/.config/crab-labs-plugins/env`, re-read every 30 s), with a TypeSafe key (`.secrets/typesafe.env`) and Chiron's questions file (`~/Development/Joey-Crablabs-Skills/screen-status/questions.json`, JCS; `JEV_SCREEN_QUESTIONS` overrides; re-read when it changes). Any of the three missing: today's status, unchanged.

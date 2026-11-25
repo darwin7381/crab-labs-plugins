@@ -57,6 +57,10 @@ describe('regions (port of jev_screen.py)', () => {
     expect(r.found_by_program.live_activity_line).toBe('· Thinking… (3s)')
     expect(r.found_by_program.finished_marker_comes_after_it).toBe(true)
   })
+  test('"Waiting for N background agents" counts only as the last marker line (Chiron 20:23Z: the old line stays after they finish)', () => {
+    expect(regions(screen(['✻ Waiting for 2 background agents to finish'])).counted_by_program.running_agents).toBe(2)
+    expect(regions(screen(['✻ Waiting for 1 background agent to finish', 'the agent reported back', '✻ Crunched for 2s · done 4:11 AM'])).counted_by_program.running_agents).toBe(0)
+  })
   const dir = join(homedir(), 'cc-workspaces', 'claude-chiron', 'knowledge', 'tg-dialogue')
   const evalDir = join(dir, 'screen-eval')
   test.skipIf(!existsSync(join(evalDir, 'labels.json')))("Chiron's eval screens: the program's counts match labels.json", () => {
