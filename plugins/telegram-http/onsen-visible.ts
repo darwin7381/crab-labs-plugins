@@ -458,7 +458,7 @@ export async function rewriteFormLinks(text: string, o: { hosts: Set<string>; ch
   return { text: out, redact, forms: [...keyed].map(([u, k]) => ({ id: Number(k.f.id), url: u })), missed: found.size - keyed.size, why }
 }
 
-export type FormItem = { id: number; form_id: number; chat: string; title: string; body: string; at?: string }
+export type FormItem = { id: number; form_id: number; chat: string; title: string; body: string; at?: string; say?: boolean }   // say (WO-159): Joey wrote it in Onsen
 /** a form answer's body as text: JSON (an object of plain values: `key: value` lines; anything else pretty-printed); a JSON string its text; else as sent */
 export function formBodyText(body: unknown): string {
   const s = String(body ?? '')
@@ -471,7 +471,8 @@ export function formBodyText(body: unknown): string {
   return s
 }
 /** what Joey sees in the chat for his own page answer (silent) */
-export const formEchoText = (it: Pick<FormItem, 'title' | 'body'>): string => `〔你在頁面送出的｜${it.title}〕\n${formBodyText(it.body)}`
+export const formEchoText = (it: Pick<FormItem, 'title' | 'body' | 'say'>): string =>
+  it.say ? `〔你在 Onsen 傳的〕\n${it.body}` : `〔你在頁面送出的｜${it.title}〕\n${formBodyText(it.body)}`
 
 /** the answers to the forms this agent sent (GET /forms/inbox?wait=25, a long poll): each goes to the main (deliver), is echoed (echo), then acked; an ack
  *  Onsen does not take goes through the spool. An answer comes back until acked: the ids delivered are kept (<dir>/forms-delivered.json), never twice. */
@@ -541,7 +542,7 @@ export class FormInbox {
     if (r.status === 404) { this.warn('404', 'onsen: forms inbox: Onsen answered 404 (no /forms/inbox there yet); asked again every minute'); return { ok: false, wait: 60_000, why: '404' } }
     if (r.status !== 200 || !Array.isArray(r.json?.items)) return this.failed(`HTTP ${r.status}`)
     const items = (r.json.items as any[]).filter(x => x && Number.isFinite(Number(x.id))).map(x => ({ ...x, id: Number(x.id), form_id: Number(x.form_id), chat: String(x.chat ?? ''),
-      title: String(x.title ?? ''), body: String(x.body ?? '') }) as FormItem).sort((a, b) => a.id - b.id)
+      title: String(x.title ?? ''), body: String(x.body ?? ''), ...(x.say === true ? { say: true } : {}) }) as FormItem).sort((a, b) => a.id - b.id)
     const ack: number[] = []
     let broke = false
     for (const it of items) {

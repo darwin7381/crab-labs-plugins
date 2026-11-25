@@ -492,3 +492,8 @@ test('1.48.1: an MCP tool shows its own name', async () => {
   const v: any = { state: 'busy', detail: { tool: { name: 'mcp__plugin_telegram-http_telegram-http__reply' }, subagents: 0 } }
   expect(statusLine(v, Date.parse('2026-11-25T05:00:00Z'))).toBe('🟡 處理中（13:00 起）：reply')
 })
+
+test('WO-159: the echo of a message Joey wrote in Onsen: 〔你在 Onsen 傳的〕 and the text as he typed it', () => {
+  expect(formEchoText({ title: '', body: '{"a":1}', say: true })).toBe('〔你在 Onsen 傳的〕\n{"a":1}')
+  expect(formEchoText({ title: '選方案', body: '{"a":1}' })).toBe('〔你在頁面送出的｜選方案〕\na: 1')
+})

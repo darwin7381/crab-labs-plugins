@@ -1,3 +1,7 @@
+## 1.53.0 — 2026-11-25
+
+- **Joey talks to an agent from Onsen** (board WO-159; Joey TG chiron:2160–2185, 2422). Onsen 0.10.0 `POST /api/onsen/say` queues his message on the forms inbox as a `say` item; the telegram daemon takes it like a page answer and hands it to the session as his message: the same tag as a page answer with `via="onsen"`, `user`/`user_id` his, the text exactly as he typed it (no form title, nothing added). Lanes route it like a page answer (to the main, rule `onsen`, source telegram from Joey). His Telegram chat gets a silent echo `〔你在 Onsen 傳的〕` + the text. Delivery facts keyed `form-<Onsen message id>` as for page answers. Tests: onsen-visible-lanes, onsen-visible.
+
 ## 1.52.1 — 2026-11-25
 
 - **A pulled item's top-level `no_reply` fact counts like the payload's** (board WO-158, Chiron 11:56Z: a `peer_call` sent straight to Onsen `/send` with `no_reply: true` only at the top was routed `mesh-peer-call → lane`). `deliverPulled` merges it into the body, so the router sees `no_reply` and files it `mesh-no-reply → ledger`. A real `send_to_agent` reply already carried it in the payload (checked live 12:33Z: chiron's routing row for msg 11961, `mesh-no-reply → ledger`). Test: `onsen-pull-daemon.test.ts`.

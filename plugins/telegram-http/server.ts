@@ -438,7 +438,7 @@ const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
   if (!meta) return null
   const chat = String(meta.chat_id ?? ''), id = String(meta.message_id ?? ''), uid = String(meta.user_id ?? '')
   // WO-145: a page answer (via web-form) is Joey's message too; its id is form-<Onsen message id> (Onsen keys its delivery facts that way)
-  if (!chat || !(/^\d+$/.test(id) || (meta.via === 'web-form' && FORM_REF.test(id))) || !uid) return null
+  if (!chat || !(/^\d+$/.test(id) || ((meta.via === 'web-form' || meta.via === 'onsen') && FORM_REF.test(id))) || !uid) return null
   if (Date.now() - onsenAllow.at > 5_000) { try { onsenAllow.ids = loadAccess().allowFrom.map(String) } catch {} ; onsenAllow.at = Date.now() }
   return onsenAllow.ids.includes(uid) ? { chat, id } : null
 }
@@ -4474,9 +4474,11 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem): Promise<boolean> {
     return false
   }
   const ref = `form-${it.id}`, uid = chat.startsWith('-') ? String(access.allowFrom[0] ?? '') : chat
-  const meta: Record<string, string> = { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts: it.at && Number.isFinite(Date.parse(it.at)) ? new Date(it.at).toISOString() : new Date().toISOString(),
-    via: 'web-form', form_title: metaExcerpt(it.title, 128), form_id: String(it.form_id) }
-  const notification = { method: 'notifications/claude/channel', params: { content: OnsenVisible.formBodyText(it.body), meta } }
+  const ts = it.at && Number.isFinite(Date.parse(it.at)) ? new Date(it.at).toISOString() : new Date().toISOString()
+  // WO-159: a message Joey wrote in Onsen: his message as he typed it, with via="onsen" and nothing else added (Chiron: the only difference an agent sees)
+  const meta: Record<string, string> = it.say ? { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts, via: 'onsen' }
+    : { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts, via: 'web-form', form_title: metaExcerpt(it.title, 128), form_id: String(it.form_id) }
+  const notification = { method: 'notifications/claude/channel', params: { content: it.say ? it.body : OnsenVisible.formBodyText(it.body), meta } }
   // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
   if (Lanes.LANES_ON) {

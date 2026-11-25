@@ -1800,10 +1800,13 @@ export function toMainDirect(ev: InEvent): void {
  *  `web-form`. null = not the Telegram daemon's lanes (the caller delivers it as with lanes off). */
 export function toMainForm(ev: InEvent): Decision | null {
   if (D?.role !== 'tg' || !main) return null
-  const d: Decision = { rule: 'web-form', target: 'main', note: `a page answer (form ${ev.meta?.form_id ?? '?'}): to the main` }
+  // WO-159: a message Joey wrote in Onsen (via=onsen) goes the same way as a page answer: his message, to the main
+  const onsen = ev.meta?.via === 'onsen'
+  const d: Decision = onsen ? { rule: 'onsen', target: 'main', note: `Joey wrote it in Onsen: to the main` }
+    : { rule: 'web-form', target: 'main', note: `a page answer (form ${ev.meta?.form_id ?? '?'}): to the main` }
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
     class: null, base_tier: null, btcc_msg_id: null, tg_message_id: ev.meta?.message_id ?? null }, ev)
-  D.log('info', `lanes: route ${ev.id} (web-form from ${ev.from}) rule=web-form → main`)
+  D.log('info', `lanes: route ${ev.id} (${d.rule} from ${ev.from}) rule=${d.rule} → main`)
   toMain(ev, d)
   return d
 }

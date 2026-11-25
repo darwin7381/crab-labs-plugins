@@ -26,7 +26,7 @@ const reacted: string[] = []
 const R = new SeenReactor({ log: () => {}, react: async (c, id) => { reacted.push(`${c}:${id}`) } })
 const F = new DeliveryFacts({ agent: 'adam', sink: f => facts.push(f), settleMs: 40, onSeen: (c, id, by) => R.seen(c, id, by) })
 // server.ts onsenJoeyOf: a page answer (via web-form, form-<n>) is Joey's message too
-const joeyOf: JoeyOf = m => m && m.user_id === JOEY && m.chat_id && (/^\d+$/.test(String(m.message_id ?? '')) || (m.via === 'web-form' && /^form-\d+$/.test(String(m.message_id))))
+const joeyOf: JoeyOf = m => m && m.user_id === JOEY && m.chat_id && (/^\d+$/.test(String(m.message_id ?? '')) || ((m.via === 'web-form' || m.via === 'onsen') && /^form-\d+$/.test(String(m.message_id))))
   ? { chat: String(m.chat_id), id: String(m.message_id) } : null
 const tap = new LanesTap({ facts: F, joey: joeyOf, gen: () => L.mainGenRow(), changed: () => {} })
 L.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
@@ -61,6 +61,32 @@ test('a page answer: to the main (rule web-form, M1 item kind joey), seen by mai
   await sleep(120)
   expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:seen:main', 'form-77:turn_end:main'])
   expect(reacted).toEqual([])
+})
+
+test('WO-159: a message Joey wrote in Onsen (via onsen): to the main (rule onsen), M1 item kind joey, seen by main; only via differs from his message', async () => {
+  const proc = Bun.spawn(['sleep', '600']); procs.push(proc)
+  const sid = randomUUID()
+  writeFileSync(join(dir, 'main-expected'), sid)
+  open.add(`mcp-${proc.pid}`); L.__noteMcpPid(`mcp-${proc.pid}`, proc.pid)
+  expect((await L.__mainEvent({ event: 'SessionStart', pid: proc.pid, session_id: sid, source: 'startup' })).accepted).toBe(true)
+  await M().pump()
+  const meta = { chat_id: JOEY, message_id: 'form-88', user: JOEY, user_id: JOEY, ts: new Date().toISOString(), via: 'onsen' }
+  const notif = { method: 'notifications/claude/channel', params: { content: '今天先把 Onsen 的輸入框上線', meta } }
+  const d = L.toMainForm({ id: `tg-${JOEY}-form-88`, source: 'telegram', from: JOEY, text: '今天先把 Onsen 的輸入框上線', meta, notif, verified: true } as any)
+  expect(d).toMatchObject({ rule: 'onsen', target: 'main' })
+  const route = readFileSync(join(dir, 'routing.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(r => r.event === `tg-${JOEY}-form-88`)
+  expect(route).toEqual([expect.objectContaining({ source: 'telegram', from: JOEY, rule: 'onsen', target: 'main', lane: null, tg_message_id: 'form-88' })])
+  await M().pump(); await sleep(30)
+  const it = M().items(r => r.event === `tg-${JOEY}-form-88`)[0]
+  expect(it).toMatchObject({ kind: 'joey', state: 'offered' })
+  const m = offers.at(-1).params
+  expect(m.content).toBe('今天先把 Onsen 的輸入框上線')
+  expect(m.meta).toMatchObject(meta)
+  expect(m.meta.form_title).toBeUndefined()
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, session_id: sid, prompt_id: 'p9', dids: [it.id] })
+  expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toContain('form-88:seen:main')
+  await L.__mainEvent({ event: 'Stop', pid: proc.pid, session_id: sid, prompt_id: 'p9', phase: 'final' })
+  await sleep(120)
 })
 
 test('Joey\'s Telegram message: ✍ at the moment M1 binds it to the main\'s turn (not when it is only offered)', async () => {
