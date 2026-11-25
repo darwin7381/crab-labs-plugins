@@ -4379,11 +4379,16 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
     tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
     connected: pid => streams.connected(pid), changed: kick, log: m => log('info', m),
-    // the documented read of the same registry, for the cross-check (start, every 10 min) and the fallback (every 10 s while the files disagree)
-    cli: () => new Promise(res => {
-      try { execFile(claudeBin, ['agents', '--json', '--cwd', AGENT_WORKSPACE_DIR], { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => res(err ? null : String(out))) }
-      catch { res(null) }
-    }),
+    // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
+    ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
+    // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
+    // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s.
+    // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
+    ...(process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
+      const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
+        run: () => OnsenStatus.runCli(claudeBin, ['agents', '--json'], 15_000) })
+      return (notBefore: number) => shared.read(notBefore)
+    })() }),
   })
   const source: OnsenStatus.StatusSource = registry
   const compute = (): OnsenStatus.StatusView => {

@@ -1,3 +1,13 @@
+## 1.48.3 — 2026-11-25
+
+- **Onsen status: the `claude agents --json` read can no longer pile up (Mac mini out of memory 11-25 06:35–07:04Z; Hephaestus #11624, Chiron #11627).** At 06:34Z the whole fleet restarted at once; 38 daemons judged their main's half-written registry file after 5 s, switched to the CLI, and each spawned `claude agents --json` every 10 s with no wait for the last run (15 s timeout, SIGTERM). Runs slowed as memory ran out, piled up, and the machine was reset twice. Now:
+  - **A file in another shape never switches the read by itself.** It is read as far as it goes (an odd status is busy `{registry_status}`; a file without pid / sessionId / cwd / kind / status is not a session) and logged once.
+  - **One CLI run at a time on the whole machine, shared** (`SharedCli`, `~/.claude/onsen-shared/agents-cli.{lock,json}`; `ONSEN_SHARED_DIR`). A daemon that wants a read while one runs waits for it and takes its answer; one daemon never has two reads in flight. The run lists every session of the machine (no `--cwd`); each daemon keeps its own.
+  - **A run still going at 15 s is killed with SIGKILL** (`runCli`).
+  - **No fleet-wide burst:** the first comparison is 10–70 s after start at random, then every 10 min ± 20 %; a file in another shape younger than 60 s (`REG_SETTLE_MS`) is left out of the comparison. While the CLI's reading is in force it is read again (shared) and compared every 30 s (was 10 s, unshared), switching back as soon as they agree.
+  - **Off switch:** `ONSEN_REGISTRY_CLI=0` never runs the CLI (the files only, no comparison). `ONSEN_REGISTRY_FIRST_CHECK_MS` fixes the first comparison's delay (tests).
+  - Measured: 20 processes starting at once → 1 run, never 2 at a time (`onsen-step3.test.ts`).
+
 ## 1.48.2 — 2026-11-25
 
 - **Pinned status (WO-145 point 5, Chiron 06:04Z): one button under it, 「不要顯示這則」.** Pressing it (allowlisted users only) stops the status message in that chat, deletes it, and writes the stop marker (`<STATE_DIR>/onsen/status-pin-off-<chat>.json`, remembered across restarts; delete the file to start again). Deleting the message, or unpinning it for both sides, still counts the same. Why a button: in a private chat an unpin can be one-sided, and the bot neither hears of it nor sees it (`getChat` still shows its message pinned; lab 05:46Z). The button rides every edit (`reply_markup`). agent-inbox 1.18.2 carries the same code.

@@ -23,6 +23,7 @@ let up: ReturnType<typeof Bun.serve> | null = null
 const got: Array<{ path: string; item: any; at: number; seq: number }> = []
 let seq = 0, next = 1
 const procs: any[] = []
+let sharedDir = ''
 
 function startOnsen(): void {
   up = Bun.serve({ port: onsenPort, hostname: '127.0.0.1', async fetch(req) {
@@ -61,7 +62,8 @@ console.log(JSON.stringify(a.filter(e => !cwd || e.cwd === cwd || e.cwd.startsWi
   writeFileSync(join(root, 'fake-claude'), `#!/bin/sh\nexec "${process.execPath}" "${join(root, 'fake-agents.ts')}" "$@"\n`)
   chmodSync(join(root, 'fake-claude'), 0o755)
   // the test's MCP client is not a claude process: the stream's peer lookup is off (every open stream counts as the main's; Streams is unit-tested)
-  off = await startTgDaemon(api, join(root, 'off'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: join(root, 'fake-claude') })
+  off = await startTgDaemon(api, join(root, 'off'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: join(root, 'fake-claude'),
+    ONSEN_REGISTRY_FIRST_CHECK_MS: '300', ONSEN_SHARED_DIR: (sharedDir = join(root, 'shared')) })
 }, 40000)
 afterAll(async () => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } await off?.stop(); await on?.stop(); api?.stop(); up?.stop(true) })
 
@@ -148,6 +150,9 @@ test('lanes off: delivered (after the message), seen when written into the strea
   expect(h.onsen).toMatchObject({ record: true, deliveries_recorded: 3, pending_bytes: 0 })
   expect(h.onsen.status_recorded).toBeGreaterThanOrEqual(8)
   expect(h.onsen.status).toMatchObject({ state: 'offline', mode: 'transcript', registry: { via: 'files', check: { agree: true } } })
+  // 1.48.3: the comparison went through the machine's shared read (one run at a time, answer in the cache file), the CLI run without --cwd
+  expect(JSON.parse(readFileSync(join(sharedDir, 'agents-cli.json'), 'utf8'))).toMatchObject({ at: expect.any(Number), out: expect.stringContaining('[') })
+  expect(existsSync(join(sharedDir, 'agents-cli.lock'))).toBe(false)
   expect(off.log()).toContain('onsen: step 3 on')
   expect(off.log()).not.toContain(CRED)
   await c.close()

@@ -7,7 +7,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { OnsenClient, idemDelivery, idemStatus, inboundItem, type DeliveryFact, type StatusFact } from './onsen-client.ts'
-import { DeliveryFacts, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, type JoeyOf,
+import { DeliveryFacts, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
   type RegEntry, type StatusInputs, type StatusSource } from './onsen-status.ts'
 
 const CRED = 'mesh_STEP3************************************'
@@ -393,21 +393,106 @@ describe('the registry: which session is the main, offline and why, files vs the
     expect(compareRegistry([regEntry(reg(71))!], [], WS, () => true)).toContain('sessions differ')
   })
 
-  test('a file of this workspace in another shape: the CLI is read instead, logged once', async () => {
+  test('1.48.3: a file of this workspace in another shape is read as far as it goes, logged once, and never runs the CLI by itself', async () => {
     let cliCalls = 0
     const e = reg(81, { status: 'busy' })
     const { put, up, logs, st, R } = setup({ cli: async () => { cliCalls++; return JSON.stringify([{ pid: 81, cwd: WS, kind: 'interactive', sessionId: e.sessionId, status: 'busy' }]) } })
     up.add(81)
-    const { status: _s, ...noStatus } = e
-    put({ ...noStatus, state: 'working' })
-    const o81 = (Date.now() - 10_000) / 1000; utimesSync(join(R.o.dir, '81.json'), o81, o81)              // 1.48.1: past the young-file grace
-    st()
+    put({ ...e, procStart: undefined, status: 'starting' })                                        // no procStart, a status statusOf does not know
+    const o81 = (Date.now() - 10_000) / 1000; utimesSync(join(R.o.dir, '81.json'), o81, o81)              // past the young-file grace
+    for (let i = 0; i < 20; i++) st()                                                            // the 2 s tick, many times
     await sleep(20)
-    expect(R.mode()).toMatchObject({ via: 'cli', why: expect.stringContaining('shape') })
-    expect(st().state).toBe('busy')
+    expect(R.mode().via).toBe('files')
+    expect(st()).toMatchObject({ state: 'busy', detail: { registry_status: 'starting' } })
     expect(logs.filter(l => l.includes('not in the known shape')).length).toBe(1)
-    expect(cliCalls).toBeGreaterThan(0)
+    expect(cliCalls).toBe(0)
+    const { status: _s, ...noStatus } = e
+    put({ ...noStatus, state: 'working' })                                                       // without the fields regEntry needs: not a session
+    utimesSync(join(R.o.dir, '81.json'), o81, o81)
+    expect(st().detail).toMatchObject({ reason: 'no_registration' })
+    expect(cliCalls).toBe(0)
   })
+
+  test('1.48.3: the comparison leaves out a file in another shape younger than REG_SETTLE_MS (a fleet restarting at once)', async () => {
+    const e = reg(82, { status: 'idle' })
+    const asCli = (x: any) => JSON.stringify([{ pid: x.pid, cwd: WS, kind: 'interactive', sessionId: x.sessionId, status: x.status }])
+    const { put, R } = setup({ cli: async () => asCli(e) })
+    put({ pid: 82, sessionId: e.sessionId, cwd: WS, kind: 'interactive', entrypoint: 'cli' })     // still being filled in: no status yet
+    const o = (Date.now() - 10_000) / 1000; utimesSync(join(R.o.dir, '82.json'), o, o)               // past REG_YOUNG_MS, within REG_SETTLE_MS
+    expect(await R.crossCheck()).toMatchObject({ agree: true })
+    expect(R.mode().via).toBe('files')
+    const old = (Date.now() - REG_SETTLE_MS - 1_000) / 1000; utimesSync(join(R.o.dir, '82.json'), old, old)
+    expect(await R.crossCheck()).toMatchObject({ agree: false, why: expect.stringContaining('sessions differ') })
+  })
+
+  test('1.48.3: one CLI read in flight per daemon: concurrent comparisons and polls share it', async () => {
+    let calls = 0, release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    const e = reg(83, { status: 'idle' })
+    const { put, R } = setup({ cli: async () => { calls++; await gate; return JSON.stringify([{ pid: 83, cwd: WS, kind: 'interactive', sessionId: e.sessionId, status: 'idle' }]) } })
+    put(e)
+    const all = [R.crossCheck(), R.crossCheck(), R.crossCheck()]
+    await sleep(10)
+    expect(calls).toBe(1)
+    release()
+    for (const c of await Promise.all(all)) expect(c).toMatchObject({ agree: true })
+    expect(calls).toBe(1)
+  })
+
+  test('1.48.3 runCli: a run still going at its timeout is killed (SIGKILL) and answers null; a normal run answers its stdout', async () => {
+    const bin = join(mkdtempSync(join(tmpdir(), 'onsen-bin-')), 'slow.sh'), pidf = `${bin}.pid`
+    writeFileSync(bin, `#!/bin/sh\ntrap '' TERM\necho $$ > ${pidf}\nsleep 30\n`, { mode: 0o755 })              // ignores SIGTERM
+    const t0 = performance.now()
+    expect(await runCli(bin, [], 400)).toBe(null)
+    expect(performance.now() - t0).toBeLessThan(2_000)
+    await sleep(100)
+    const pid = Number(readFileSync(pidf, 'utf8'))
+    expect(pidAlive(pid)).toBe(false)
+    expect(await runCli('/bin/echo', ['[1]'], 2_000)).toBe('[1]\n')
+    expect(await runCli('/bin/sh', ['-c', 'exit 3'], 2_000)).toBe(null)
+  })
+
+  test('1.48.3 SharedCli: readers that come together share one run; a failed run is shared too; a newer answer can be asked for; a dead holder\'s lock is taken over', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'onsen-shared-'))
+    let runs = 0, out: string | null = '[]'
+    const run = async () => { runs++; await sleep(150); return out }
+    const S = Array.from({ length: 8 }, () => new SharedCli({ dir, run, stepMs: 20 }))           // eight daemons
+    const t = Date.now()
+    expect(await Promise.all(S.map(s => s.read(t - 5_000)))).toEqual(Array(8).fill('[]'))
+    expect(runs).toBe(1)
+    expect(await S[3].read(t - 5_000)).toBe('[]')                                                // the cached answer: no run
+    expect(runs).toBe(1)
+    out = null
+    const n = Date.now()
+    expect(await Promise.all(S.map(s => s.read(n)))).toEqual(Array(8).fill(null))                // asked newer than the cache: one new run, failed, shared
+    expect(runs).toBe(2)
+    writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: 999_999, at: Date.now() }))  // a holder that died
+    out = '[2]'
+    expect(await S[0].read(Date.now())).toBe('[2]')
+    expect(runs).toBe(3)
+    writeFileSync(join(dir, 'agents-cli.lock'), JSON.stringify({ pid: process.pid, at: Date.now() }))  // a live holder that never finishes
+    const W = new SharedCli({ dir, run, stepMs: 20, waitMs: 200 })
+    expect(await W.read(Date.now())).toBe(null)                                                  // waits waitMs, then gives up without running
+    expect(runs).toBe(3)
+  })
+
+  test('1.48.3 SharedCli across processes: 20 daemons starting at once run the CLI once, never two at a time (measured)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'onsen-shared-mp-')), bin = join(dir, 'fake-claude.sh'), log = join(dir, 'runs.log')
+    writeFileSync(bin, `#!/bin/sh\necho "start $(date +%s%N 2>/dev/null || date +%s)" >> ${log}\nsleep 0.5\necho "end" >> ${log}\necho '[]'\n`, { mode: 0o755 })
+    const script = join(dir, 'reader.ts')
+    writeFileSync(script, `import { SharedCli, runCli } from ${JSON.stringify(join(import.meta.dir, 'onsen-status.ts'))}\n` +
+      `const s = new SharedCli({ dir: ${JSON.stringify(dir)}, run: () => runCli(${JSON.stringify(bin)}, [], 5_000) })\n` +
+      `const v = await s.read(Date.now() - 5_000); console.log(v === null ? 'null' : v.trim())\n`)
+    const ps = Array.from({ length: 20 }, () => Bun.spawn(['bun', script], { stdout: 'pipe', stderr: 'pipe' }))
+    const outs = await Promise.all(ps.map(async p => { await p.exited; return (await new Response(p.stdout).text()).trim() }))
+    expect(outs).toEqual(Array(20).fill('[]'))
+    const lines = readFileSync(log, 'utf8').trim().split('\n')
+    let open = 0, most = 0
+    for (const l of lines) { open += l.startsWith('start') ? 1 : -1; most = Math.max(most, open) }
+    console.log(`SharedCli 20 processes: ${lines.filter(l => l.startsWith('start')).length} run(s), at most ${most} at a time`)
+    expect(most).toBe(1)
+    expect(lines.filter(l => l.startsWith('start')).length).toBeLessThanOrEqual(2)
+  }, 30_000)
 
   test('the watch: a registry file written or replaced calls changed within ~100 ms (measured)', async () => {
     const { R, put, changes, dir } = setup()

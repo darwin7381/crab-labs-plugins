@@ -11,8 +11,9 @@
 //                  status it gives detail only (the tool, the subagent count, a compaction, the main's own wall).
 //   TurnWatch      lanes off: no hook reaches the daemon, so the main's turns are read from its transcript (turn_duration ends a turn; tool_use / tool_result
 //                  open and close tools), the file the daemon already reads for receipts. For the status: detail only.
-import { spawnSync } from 'child_process'
-import { closeSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, watch, type FSWatcher } from 'fs'
+import { spawn, spawnSync } from 'child_process'
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, watch, writeFileSync, writeSync,
+  type FSWatcher } from 'fs'
 import { basename, join } from 'path'
 import { idemDelivery, idemStatus, type DeliveryFact, type DeliveryState, type StatusFact, type StatusState } from './onsen-client.ts'
 import type { Row } from './lanes-state.ts'
@@ -412,14 +413,18 @@ export function newestJsonl(dir: string): string | null {
 // Claude Code keeps one file per live session, ~/.claude/sessions/<pid>.json (2.1.322: pid, sessionId, cwd, startedAt, procStart, kind, tmux, name, status
 // idle | busy | waiting | shell, waitingFor, statusUpdatedAt, updatedAt). `claude agents --json` is the documented read of the same registry
 // (code.claude.com/docs/en/agent-view, "read session state from a script"); it prints pid, cwd, kind, startedAt, sessionId, name, status, and shows `shell`
-// as `busy`. The daemon reads the files (a watch, and the status tick's 2 s read): spawning the CLI every few seconds in every daemon is too heavy. At start
-// and every 10 minutes the two are compared; when they disagree, or a file of this workspace has another shape, the CLI is read instead (every 10 s) until
-// a later comparison agrees again. Every switch is logged.
+// as `busy`. The daemon reads the files (a watch, and the status tick's 2 s read). About a minute after start and then every ~10 minutes (jittered) the
+// two are compared; when they disagree the CLI's reading is used instead, read again every 30 s and compared, until they agree. Every switch is logged.
+// 1.48.3 (11-25 06:35Z, the Mac mini ran out of memory): a file in another shape is read as far as it goes and never switches the read by itself; the CLI
+// is read through SharedCli, one run at a time on the whole machine, killed at its timeout, its answer shared by every daemon.
 export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number; entrypoint?: string }
 /** the registry statuses statusOf knows */
 export const REG_STATUSES = new Set(['idle', 'busy', 'waiting', 'shell'])
 /** a registry file younger than this is not judged by its shape (a starting session fills it in a moment later) */
 export const REG_YOUNG_MS = 5_000
+/** a file in another shape younger than this is left out of the comparison with the CLI: when the whole fleet restarts at once a loaded machine takes
+ *  longer than REG_YOUNG_MS to fill the files in (11-25 06:35Z: 38 daemons judged their main's file at 5 s) */
+export const REG_SETTLE_MS = 60_000
 /** one registry record (a file, or an item of the CLI's array) in the shape 2.1.322 writes; null = not that shape */
 export function regEntry(j: any): RegEntry | null {
   if (!j || typeof j !== 'object' || !Number.isInteger(j.pid) || j.pid <= 0) return null
@@ -445,8 +450,9 @@ export function pickMain(es: RegEntry[], o: { workspace: string; tmux?: string |
 }
 /** the files and the CLI describe the same sessions of this workspace (the files' `shell` is the CLI's `busy`; a dead pid's file left behind is not a
  *  session); null = they agree, else what differs */
-export function compareRegistry(files: RegEntry[], cli: RegEntry[], workspace: string, alive: (pid: number) => boolean = pidAlive): string | null {
-  const mine = (e: RegEntry) => samePath(e.cwd, workspace)
+export function compareRegistry(files: RegEntry[], cli: RegEntry[], workspace: string, alive: (pid: number) => boolean = pidAlive,
+  ignore: ReadonlySet<number> = new Set()): string | null {
+  const mine = (e: RegEntry) => samePath(e.cwd, workspace) && !ignore.has(e.pid)
   const f = new Map(files.filter(e => mine(e) && alive(e.pid)).map(e => [e.pid, e])), c = new Map(cli.filter(mine).map(e => [e.pid, e]))
   const pids = (m: Map<number, RegEntry>) => [...m.keys()].sort((a, b) => a - b).join(',')
   if (pids(f) !== pids(c)) return `sessions differ: files [${pids(f)}], cli [${pids(c)}]`
@@ -475,6 +481,82 @@ export function sameStart(a: string, b: string): boolean {
   if (n(a) === n(b)) return true
   const x = Date.parse(`${n(a)} UTC`), y = Date.parse(`${n(b)} UTC`)
   return !(Number.isFinite(x) && Number.isFinite(y)) || Math.abs(x - y) <= 2_000
+}
+
+/** run `bin args`: its stdout when it exits 0; null when it fails, prints more than maxBytes, or is still running at timeoutMs, in which case it is
+ *  killed (SIGKILL: a process stuck in a swapping machine may never handle SIGTERM) (1.48.3) */
+export function runCli(bin: string, args: string[], timeoutMs = 15_000, maxBytes = 4 * 1024 * 1024): Promise<string | null> {
+  return new Promise(res => {
+    let done = false, out = '', size = 0
+    const end = (v: string | null) => { if (!done) { done = true; clearTimeout(t); res(v) } }
+    let p: ReturnType<typeof spawn>
+    try { p = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'] }) } catch { return res(null) }
+    const t = setTimeout(() => { try { p.kill('SIGKILL') } catch {}; end(null) }, timeoutMs)
+    p.stdout?.on('data', (b: Buffer) => { size += b.length; if (size > maxBytes) { try { p.kill('SIGKILL') } catch {}; end(null) } else out += b.toString('utf8') })
+    p.on('error', () => end(null))
+    p.on('close', code => end(code === 0 ? out : null))
+  })
+}
+
+/** one `claude agents --json` read shared by every daemon of this machine (1.48.3). 11-25 06:35Z: the whole fleet restarted at once, 38 daemons each
+ *  spawned the CLI every 10 s with no wait for the last one, and the Mac mini (24 GB) ran out of memory and was reset twice. Now: at most one run at a
+ *  time on the machine (an exclusive lock file); a daemon that wants a read while one runs waits for it and takes its answer (a cache file every daemon
+ *  reads); in one daemon a second caller gets the read already in flight. The answer lists every session of the machine; each daemon keeps its own. */
+export class SharedCli {
+  private inflight: Promise<string | null> | null = null
+  /** dir: where the lock and the cache live (one per machine and user); run: the CLI itself (runCli, killed at its timeout); lockStaleMs: a lock older
+   *  than this, or whose holder is gone, is taken over (the holder died); waitMs: how long a caller waits for an answer */
+  constructor(readonly o: { dir: string; run: () => Promise<string | null>; now?: Now; lockStaleMs?: number; waitMs?: number; stepMs?: number
+    alive?: (pid: number) => boolean }) {}
+  private now(): number { return (this.o.now ?? Date.now)() }
+  private get lockPath(): string { return join(this.o.dir, 'agents-cli.lock') }
+  private get cachePath(): string { return join(this.o.dir, 'agents-cli.json') }
+  /** the last answer of any daemon: { at: when that run started, out: its stdout or null (it failed) } */
+  cached(): { at: number; out: string | null } | null {
+    try { const j = JSON.parse(readFileSync(this.cachePath, 'utf8')); return typeof j?.at === 'number' ? { at: j.at, out: typeof j.out === 'string' ? j.out : null } : null }
+    catch { return null }
+  }
+  private lock(): boolean {
+    for (let i = 0; i < 2; i++) {
+      try { const fd = openSync(this.lockPath, 'wx'); try { writeSync(fd, JSON.stringify({ pid: process.pid, at: this.now() })) } finally { closeSync(fd) } return true }
+      catch (e: any) {
+        if (e?.code !== 'EEXIST') return false
+        let stale = false
+        try {
+          const st = statSync(this.lockPath), j = JSON.parse(readFileSync(this.lockPath, 'utf8') || '{}')
+          stale = this.now() - st.mtimeMs > (this.o.lockStaleMs ?? 40_000) || (Number.isInteger(j.pid) && !(this.o.alive ?? pidAlive)(j.pid))
+        } catch { stale = false }
+        if (!stale) return false
+        try { unlinkSync(this.lockPath) } catch {}
+      }
+    }
+    return false
+  }
+  private unlock(): void { try { unlinkSync(this.lockPath) } catch {} }
+  /** an answer from a run that started at or after notBefore (ms); null = the run failed, or none came within waitMs */
+  read(notBefore: number): Promise<string | null> {
+    if (!this.inflight) this.inflight = this.doRead(notBefore).finally(() => { this.inflight = null })
+    return this.inflight
+  }
+  private async doRead(notBefore: number): Promise<string | null> {
+    try { mkdirSync(this.o.dir, { recursive: true }) } catch {}
+    const until = this.now() + (this.o.waitMs ?? 30_000)
+    for (;;) {
+      const c = this.cached()
+      if (c && c.at >= notBefore) return c.out
+      if (this.lock()) {
+        try {
+          const c2 = this.cached()
+          if (c2 && c2.at >= notBefore) return c2.out
+          const at = this.now(), out = await this.o.run()
+          try { const tmp = `${this.cachePath}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify({ at, out })); renameSync(tmp, this.cachePath) } catch {}
+          return out
+        } finally { this.unlock() }
+      }
+      if (this.now() >= until) return null
+      await new Promise(r => setTimeout(r, this.o.stepMs ?? 200))
+    }
+  }
 }
 
 /** the claude processes this daemon has a stream with (offline not_connected). A stream's peer is looked up once (null = not found: counted as any pid,
@@ -510,26 +592,41 @@ export class Registry implements StatusSource {
   private deadSince = new Map<number, number>()
   private shapeTold = ''
   private started = false
+  private checkTimer: ReturnType<typeof setTimeout> | null = null
+  /** the CLI read in flight in this daemon (1.48.3: never a second one while one runs) */
+  private cliBusy: Promise<RegEntry[] | null> | null = null
   /** dir: the registry (~/.claude/sessions); workspace: AGENT_WORKSPACE_DIR; transcripts: the workspace's project dir (~/.claude/projects/<escaped>);
    *  tmux: CHANNEL_BOT_TMUX_SESSION; sessionId: the lanes' main session id; connected: this daemon has a stream with that claude pid; cli: the output of
-   *  `claude agents --json --cwd <workspace>` (null = could not run); changed: a registry file changed (the watch) */
+   *  `claude agents --json` from a run that started at or after notBefore (SharedCli.read; null = could not run; absent = no CLI: the files only);
+   *  changed: a registry file changed (the watch); firstCheckMs: the first comparison after start (default 10–70 s at random, so a fleet that starts
+   *  at once does not compare at once); checkMs: then every checkMs ± 20 %; cliPollMs: the CLI's reading read again while it is in force */
   constructor(readonly o: { dir: string; workspace: string; transcripts: () => string | null; tmux?: string | null; sessionId?: () => string | null
-    connected: (pid: number) => boolean; cli?: () => Promise<string | null>; changed?: () => void; log?: (m: string) => void
-    alive?: (pid: number) => boolean; procStart?: (pid: number) => string | null; now?: Now; checkMs?: number; cliPollMs?: number; retryMs?: number }) {}
+    connected: (pid: number) => boolean; cli?: (notBefore: number) => Promise<string | null>; changed?: () => void; log?: (m: string) => void
+    alive?: (pid: number) => boolean; procStart?: (pid: number) => string | null; now?: Now; firstCheckMs?: number; checkMs?: number; cliPollMs?: number
+    retryMs?: number }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   private alive(pid: number): boolean { return (this.o.alive ?? pidAlive)(pid) }
   private log(m: string): void { try { this.o.log?.(m) } catch {} }
 
-  /** the watch on the registry dir, the comparison now and every 10 min, the CLI read every 10 s while it is the one in force */
+  /** the watch on the registry dir; the comparison about a minute after start and then every ~10 min; while the CLI's reading is in force, it is read
+   *  again (shared, at most one run on the machine) and compared every 30 s */
   start(): void {
     this.started = true
     this.watchDir()
-    void this.crossCheck()
-    this.timers.push(setInterval(() => { this.watchDir(); void this.crossCheck() }, this.o.checkMs ?? 600_000))
-    this.timers.push(setInterval(() => { if (this.v.via === 'cli') void this.readCli() }, this.o.cliPollMs ?? 10_000))
+    const next = (ms: number) => {
+      this.checkTimer = setTimeout(() => { this.watchDir(); void this.crossCheck().finally(() => { if (this.started) next(this.jitter(this.o.checkMs ?? 600_000)) }) }, ms)
+      ;(this.checkTimer as any).unref?.()
+    }
+    next(this.o.firstCheckMs ?? 10_000 + Math.random() * 60_000)
+    this.timers.push(setInterval(() => { if (this.v.via === 'cli') void this.pollCli() }, this.o.cliPollMs ?? 30_000))
     for (const t of this.timers) (t as any).unref?.()
   }
-  stop(): void { this.started = false; for (const t of this.timers) clearInterval(t); this.timers = []; try { this.watcher?.close() } catch {}; this.watcher = null }
+  private jitter(ms: number): number { return ms * (0.8 + Math.random() * 0.4) }
+  stop(): void {
+    this.started = false; for (const t of this.timers) clearInterval(t); this.timers = []
+    if (this.checkTimer) clearTimeout(this.checkTimer); this.checkTimer = null
+    try { this.watcher?.close() } catch {}; this.watcher = null
+  }
   private watchDir(): void {
     if (this.watcher) return
     try {
@@ -539,9 +636,10 @@ export class Registry implements StatusSource {
   }
 
   /** the registry files now: a file is parsed again only when its mtime or size changed; one that is not JSON yet (written while read) keeps its last
-   *  reading. `bad`: files of this workspace in another shape */
-  files(): { entries: RegEntry[]; bad: string[] } {
-    const entries: RegEntry[] = [], bad: string[] = [], seen = new Set<string>()
+   *  reading. `bad`: files of this workspace in another shape (1.48.3: still read as far as they go); `unsettled`: the pids of those younger than
+   *  REG_SETTLE_MS, left out of the comparison with the CLI */
+  files(): { entries: RegEntry[]; bad: string[]; unsettled: Set<number> } {
+    const entries: RegEntry[] = [], bad: string[] = [], seen = new Set<string>(), unsettled = new Set<number>()
     if (this.started && !this.watcher) this.watchDir()                  // the dir appeared after start (a first session on this machine), or the watch failed
     let names: string[] = []
     try { names = readdirSync(this.o.dir).filter(n => /^\d+\.json$/.test(n)) } catch {}
@@ -565,51 +663,67 @@ export class Registry implements StatusSource {
       // REG_YOUNG_MS is not judged yet, it is read again on the next pass
       if (c.bad && Date.now() - st.mtimeMs < REG_YOUNG_MS) { this.cache.delete(f); continue }
       if (c.e) entries.push(c.e)
-      if (c.bad) bad.push(n)
+      if (c.bad) { bad.push(n); if (Date.now() - st.mtimeMs < REG_SETTLE_MS) unsettled.add(Number(n.slice(0, -5))) }
     }
     for (const f of [...this.cache.keys()]) if (!seen.has(f)) this.cache.delete(f)
-    return { entries, bad }
+    return { entries, bad, unsettled }
   }
-  /** the reading in force: the files, or (they disagreed with the CLI, or changed shape) the CLI's last answer */
+  /** the reading in force: the files, or (they disagreed with the CLI) the CLI's last answer. 1.48.3: a file in another shape is read as far as it goes
+   *  (an odd status is busy {registry_status}; a file without the fields regEntry needs is not a session) and is logged once; it never switches the read
+   *  to the CLI by itself (11-25 06:35Z that switch, in 38 daemons at once, started the memory run on the Mac mini) */
   entries(): RegEntry[] {
     if (this.v.via === 'cli') return this.cliRead
     const r = this.files()
     if (r.bad.length) {
       const key = r.bad.sort().join(',')
-      if (this.shapeTold !== key) { this.shapeTold = key; this.log(`onsen: registry file(s) ${key} of this workspace are not in the known shape: reading \`claude agents --json\` instead`) }
-      this.v = { ...this.v, via: 'cli', why: `registry file shape: ${key}` }
-      void this.readCli()
-      return this.cliRead
+      if (this.shapeTold !== key) { this.shapeTold = key; this.log(`onsen: registry file(s) ${key} of this workspace are not in the known shape: read as far as they go (the next comparison with \`claude agents --json\` decides)`) }
     }
     return r.entries
   }
-  private async cliEntries(): Promise<RegEntry[] | null> {
-    const out = await (this.o.cli?.() ?? Promise.resolve(null)).catch(() => null)
-    if (out == null) return null
-    try { const a = JSON.parse(out); return Array.isArray(a) ? a.map(regEntry).filter((e): e is RegEntry => !!e) : null } catch { return null }
+  /** the CLI's sessions from a run that started at or after notBefore; one call in flight at a time in this daemon (a second caller gets the same) */
+  private cliEntries(notBefore: number): Promise<RegEntry[] | null> {
+    if (!this.o.cli) return Promise.resolve(null)
+    if (!this.cliBusy) {
+      this.cliBusy = (async () => {
+        const out = await this.o.cli!(notBefore).catch(() => null)
+        if (out == null) return null
+        try { const a = JSON.parse(out); return Array.isArray(a) ? a.map(regEntry).filter((e): e is RegEntry => !!e) : null } catch { return null }
+      })().finally(() => { this.cliBusy = null })
+    }
+    return this.cliBusy
   }
-  private async readCli(): Promise<void> {
-    const e = await this.cliEntries()
-    if (e) { this.cliRead = e; try { this.o.changed?.() } catch {} }
+  /** while the CLI's reading is in force: read it again (an answer up to 25 s old, any daemon's, will do) and compare; agreeing switches back */
+  private async pollCli(): Promise<void> {
+    const cli = await this.cliEntries(this.now() - (this.o.cliPollMs ?? 30_000) + 5_000)
+    if (!cli || this.v.via !== 'cli') return
+    this.cliRead = cli
+    const f = this.files()
+    if (!compareRegistry(f.entries, cli, this.o.workspace, p => this.alive(p), f.unsettled)) this.setVia(null)
+    try { this.o.changed?.() } catch {}
   }
-  /** files vs CLI. A status can change between the two reads: a difference is read again once (retryMs) before it counts. The CLI unavailable: nothing
-   *  to compare, the reading stays as it is */
+  private setVia(why: string | null): void {
+    const was = this.v.via
+    this.v = { via: why ? 'cli' : 'files', why: why ?? '', check: { at: iso(this.now()), agree: !why, why } }
+    if (was !== this.v.via) this.log(why ? `onsen: the registry files disagree with \`claude agents --json\` (${why}): the CLI is read instead (every 30 s, shared)`
+      : 'onsen: the registry files agree with `claude agents --json` again: the files are read')
+    else if (why) this.log(`onsen: registry cross-check: still disagree (${why})`)
+  }
+  /** files vs CLI. A status can change between the two reads: a difference is read again once (retryMs, a new run) before it counts. A file in another
+   *  shape younger than REG_SETTLE_MS is left out. No CLI, or it did not answer: nothing to compare, the reading stays as it is */
   async crossCheck(): Promise<Via['check']> {
+    if (!this.o.cli) return this.v.check
     let why: string | null = null
     for (let i = 0; i < 2; i++) {
-      const cli = await this.cliEntries()
+      // the first read takes an answer another daemon got in the last 5 s (a fleet that starts at once shares one run); the retry, one from the last 1 s
+      const asked = this.now(), cli = await this.cliEntries(asked - (i === 0 ? 5_000 : 1_000))
       if (!cli) { this.log('onsen: `claude agents --json` did not answer: the registry files are not cross-checked this time'); return this.v.check }
       const f = this.files()
-      why = f.bad.length ? `registry file shape: ${f.bad.sort().join(',')}` : compareRegistry(f.entries, cli, this.o.workspace, p => this.alive(p))
+      why = compareRegistry(f.entries, cli, this.o.workspace, p => this.alive(p), f.unsettled)
       if (!why) break
       this.cliRead = cli
       if (i === 0) await new Promise(r => setTimeout(r, this.o.retryMs ?? 1_500))
     }
-    const was = this.v.via
-    this.v = { via: why ? 'cli' : 'files', why: why ?? '', check: { at: iso(this.now()), agree: !why, why } }
-    if (was !== this.v.via) this.log(why ? `onsen: the registry files disagree with \`claude agents --json\` (${why}): the CLI is read instead (every 10 s)`
-      : 'onsen: the registry files agree with `claude agents --json` again: the files are read')
-    else if (why) this.log(`onsen: registry cross-check: still disagree (${why})`)
+    this.setVia(why)
     if (why) { this.shapeTold = ''; try { this.o.changed?.() } catch {} }
     return this.v.check
   }
