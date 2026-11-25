@@ -200,6 +200,40 @@ test('the kind is the sender\'s field: an Onsen item of kind board with no [boar
   expect(rowOf(b.id)).toMatchObject({ decided_by: 'new' })
 })
 
+test('mail #200018 (Chiron mesh-12125): the agent\'s own no_reply call, no reply_to, no thread: a colleague (not an outside program), recorded only', async () => {
+  member = 'idle'
+  const self = mesh(AGENT, '〔WO-157 驗收｜寄給自己｜純測試、不用處理〕', { no_reply: true })
+  expect(await L.routeEvent(self)).toMatchObject({ target: 'ledger', rule: 'wake:peer-no-reply' })
+  expect(items(self.id).length).toBe(0)
+  const roster = mesh('chiron', '知會：備份跑完了', { no_reply: true })
+  expect(await L.routeEvent(roster)).toMatchObject({ target: 'ledger', rule: 'wake:peer-no-reply' })
+  const call = mesh(AGENT, '自己叫自己：幫我查一下')                       // not no_reply: a colleague's call, a reflex lane (not wake:external)
+  expect((await L.routeEvent(call)).rule).toBe('wake:peer-call')
+})
+
+test('status-latency-lab 3: a turn closed by Esc (no Stop) is closed as interrupted once statusOf reads idle twice, no hook event between', async () => {
+  const M = L.__main()
+  await idle(); await busy()
+  expect(String(M.currentGen()?.state)).toBe('in_turn')
+  const { __setMainIdleConfirmMs } = await import('./lanes-main.ts')
+  __setMainIdleConfirmMs(0)
+  try {
+    expect(M.statusIdle(false)).toBe(false)                              // busy reading: nothing
+    expect(M.statusIdle(true)).toBe(false)                               // first idle reading: remembered
+    expect(M.statusIdle(true)).toBe(true)                                // second, no hook event between: closed
+    expect(String(M.currentGen()?.state)).toBe('idle')
+    await busy()
+    expect(M.statusIdle(true)).toBe(false)
+    await L.__mainEvent({ event: 'PreToolUse', pid, tool_name: 'Bash' })   // a hook event between the readings: the turn is alive
+    expect(M.statusIdle(true)).toBe(false)
+    expect(String(M.currentGen()?.state)).toBe('in_turn')
+  } finally { __setMainIdleConfirmMs(4_000); await idle() }
+})
+
+test('status-latency-lab 5: an idle main with a dialog open: the 此刻 line names the menu', () => {
+  expect(L.mainNowWords({ state: 'idle', detail: { dialog_open: true } })).toBe('主線：停在一個選單上等 Joey 按（dialog open）。交給它的事要等 Joey 按了才會看到。')
+})
+
 test('switch off for the agent: the old rules, decided_by old', async () => {
   process.env.LANES_WAKE_DECIDE = 'someone-else'
   try {

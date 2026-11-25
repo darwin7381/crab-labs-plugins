@@ -343,6 +343,20 @@
       "doc": "the item belongs to a conversation one of this agent's lines owns (its thread, a reply to our message, the incident a lane handles, the ticket's worker): that line. A colleague's no_reply reply with reply_to wakes the line that asked (decision 1)."
     },
     {
+      "id": "peer-no-reply",
+      "when": {
+        "kind": [
+          "peer_call"
+        ],
+        "no_reply": true
+      },
+      "to": "ledger",
+      "replaces": [
+        "R:mesh-no-reply for a colleague's no_reply call that answers nothing of ours (Chiron mesh-12125: decision 1 wakes only a reply WITH reply_to or on our thread; the owner rule above takes those)"
+      ],
+      "doc": "a colleague's no_reply call with no reply_to and no thread of ours: record only, as before (it rides the main's next digest). With reply_to or on our thread the owner rule above wakes the line that asked (decision 1)."
+    },
+    {
       "id": "unverified",
       "when": {
         "kind": [

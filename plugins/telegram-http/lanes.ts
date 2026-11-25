@@ -295,6 +295,7 @@ export function lanesInit(deps: LanesDeps): void {
     setInterval(sweepQueue, 10_000).unref()
     setInterval(followupTick, 1_000).unref()
     setInterval(() => { void main.tick() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
+    setInterval(() => idleCheck(), 2_000).unref()                // WO-157b: a turn statusOf shows ended with no Stop (Esc) is closed as interrupted
     setInterval(() => dueTick(), 1_000).unref()        // M3: the one due sweep (critical ring, hand-over not taken, promised answers, commitments)
     setInterval(() => floodTick(), 10_000).unref()      // 002k (H14): a flood episode that went quiet, a hold that ran out
     if (S.wall) armProbe(Math.max(1_000, S.wall.probe_at - Date.now()))
@@ -848,7 +849,7 @@ function tapRoute(row: Record<string, unknown>, ev?: InEvent): void {
       main: g ? { state: String(g.state), offered: main.items(r => r.state === 'offered' && r.gen === g.id).length > 0 } : null,
       laneKind: lane?.kind ?? null,
       alertSenders: routerCache?.cfg.alert_senders ?? ['alert-dispatcher'],
-      roster: () => { try { return D.registryNames?.() ?? [] } catch { return [] } },
+      roster: () => kindRoster(),
       did: () => { if (row.target !== 'main') return null; const now = lastMainItem(evId); return now && now.n !== before?.n ? now.id : null },
     })
   } catch (e) {
@@ -931,8 +932,11 @@ function mainEventIn(b: any) {
 /** Onsen step 3: the main's current gen (M2 row: state, pid, prompt_id, tool_open, kind), read only; null = none */
 export function mainGenRow(): Row | null { try { return D?.role === 'tg' && main ? main.currentGen() : null } catch { return null } }
 /** Onsen step 3: Joey's Telegram messages M1 holds for the main and it has not taken in (queued or offered), read only */
-export function mainQueuedJoey(): number {
-  try { return D?.role === 'tg' && main ? main.items(r => r.kind === 'joey' && (r.state === 'queued' || r.state === 'offered')).length : 0 } catch { return 0 }
+export function mainQueuedJoey(o: { offered?: boolean } = {}): number {
+  // WO-157b (status-latency-lab 「會判錯的」 8): `offered: false` leaves out the item already offered to the main (server.ts asks so once the status says the
+  // turn has begun: that item is the one the turn is taking in; counting it made the first row of every turn say queued_joey: 1, 28 of 28)
+  const off = o.offered !== false
+  try { return D?.role === 'tg' && main ? main.items(r => r.kind === 'joey' && (r.state === 'queued' || (off && r.state === 'offered'))).length : 0 } catch { return 0 }
 }
 /** tests only: this lanes instance's M1 + M2 and journal */
 export const __main = (): MainApi => main
@@ -1186,6 +1190,26 @@ function agentWakeRules(cfg: RouterCfg): WakeRule[] {
   return rules
 }
 const LANE_KIND_SET = new Set(['reflex', 'mail', 'worker', 'fork', 'curator', 'synthesis'])
+/** WO-157b (Chiron mesh-12125, mail #200018): the names that make a sender a colleague when a kind is derived: the roster AND this agent itself.
+ *  registryNames leaves the agent out (it is the send_to_agent recipient list); a message the agent sends itself (chiron's own WO-157 check at
+ *  14:32:11Z, mesh-12123) was read as a program outside the roster (`external`), got a reflex lane and a line to Joey */
+function kindRoster(): string[] {
+  let names: string[] = []
+  try { names = D?.registryNames?.() ?? [] } catch {}
+  return D?.agent && !names.includes(D.agent) ? [...names, D.agent] : names
+}
+/** WO-157b (Chiron status-latency-lab 「會判錯的」 3; fleet-wide, not behind LANES_WAKE_DECIDE): M2 keeps a turn open when no Stop comes (Esc). statusOf is read
+ *  every 2 s; idle twice, MAIN_IDLE_CONFIRM_MS apart, with no hook event between: M1 closes the turn as interrupted and the held items are offered. The
+ *  status tap is told as if a final Stop came (its turn edges and tool) */
+function idleCheck(): void {
+  if (D?.role !== 'tg' || !main) return
+  try {
+    const v = mainStatusNow()
+    if (!v) return
+    const g = main.currentGen()
+    if (main.statusIdle(v.state === 'idle') && g) { try { onsenTap?.mainEvent?.({ event: 'Stop', phase: 'final', pid: Number(g.pid), interrupted: true }) } catch {} }
+  } catch (e) { D.log('warn', `lanes: idle check: ${e}`) }
+}
 /** WO-157 (Chiron 13:46Z): the main's status now (statusOf through server.ts), or null when this daemon computes none */
 function mainStatusNow(): { state: string; detail?: Record<string, unknown> } | null {
   try { return D?.mainStatus?.() ?? null } catch { return null }
@@ -1224,7 +1248,7 @@ function wakeItemOf(ev: InEvent, cfg: RouterCfg): WakeItem {
   // the sender's kind when it says more than Onsen's default: `peer_call` is what every BTCC push and send_to_agent call carries (the console, the
   // watchdog's STALL through BTCC, a program's notice too), so it is derived like an item with no kind; a wake-up field (wake=…) wins over any kind
   const sent = ev.item_kind && ev.item_kind !== 'peer_call' && !ev.wake && (WAKE_KINDS as readonly string[]).includes(ev.item_kind) ? ev.item_kind : null
-  const kind = sent ?? sourceKindOf({ source: ev.source, from: ev.from }, ev, { alertSenders: cfg.alert_senders ?? [], roster: () => D.registryNames?.() ?? [] })
+  const kind = sent ?? sourceKindOf({ source: ev.source, from: ev.from }, ev, { alertSenders: cfg.alert_senders ?? [], roster: kindRoster })
   const sub = ev.source === 'mail' ? (ev.kind === 'mail_decision' ? 'decision' : ev.kind === 'mail_due' ? 'due' : String(ev.kind ?? '')) : undefined
   return { kind, ...(ev.urgency ? { urgency: ev.urgency } : {}), ...(ev.no_reply ? { no_reply: true } : {}), sender: ev.from, ...(sub ? { sub } : {}),
     ...(ev.source === 'mesh' && ev.verified !== true ? { unverified: true } : {}),
@@ -3704,6 +3728,8 @@ export function mainNowLine(): string {
 /** WO-157: Chiron's 此刻 line for each of statusOf's seven states (mesh-12112, verbatim; nothing added) */
 export function mainNowWords(v: { state: string; detail?: Record<string, unknown>; last_activity_at?: string | null }, g?: Row | null): string {
   const st = memberStateOf(v as any, null), d = (v.detail ?? {}) as Record<string, any>
+  // WO-157b (status-latency-lab 「會判錯的」 5): a dialog open outside a turn is idle for the decision, but the screen is a menu waiting for a press: the line says so
+  if (st === 'idle' && d.dialog_open) return '主線：停在一個選單上等 Joey 按（dialog open）。交給它的事要等 Joey 按了才會看到。'
   if (st === 'idle') return '主線：閒置。交給它的事馬上會看到。'
   if (st === 'walled') {
     const until = typeof d.walled?.until === 'string' && !Number.isNaN(Date.parse(d.walled.until)) ? hhmm(d.walled.until) : null

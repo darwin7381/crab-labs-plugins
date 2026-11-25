@@ -41,6 +41,13 @@ test('Registry.backgroundAgents: background sub-agent transcripts written in the
   expect(reg.backgroundAgents('99999999-0000-0000-0000-000000000000')).toBeNull()
 })
 
+test('status-latency-lab 6: within 3 s of the final Stop a busy file is not stale yet: idle, no background_agents claimed', () => {
+  const v = statusOf({ ...base, main: { status: 'busy', status_at: T0, background_agents: 0 }, edges: { started_at: T0 + 1_000, ended_at: T0 + 10_000 } }, { now: T0 + 11_000 })
+  expect(v.state).toBe('idle')
+  expect(v.detail).not.toHaveProperty('registry_stale'); expect(v.detail).not.toHaveProperty('background_agents')
+  expect(statusOf({ ...base, main: { status: 'busy', status_at: T0, background_agents: 0 }, edges: { started_at: T0 + 1_000, ended_at: T0 + 10_000 } }, { now: T0 + 13_500 }).detail?.background_agents).toBe(true)
+})
+
 test('a stale idle file while the hooks show a turn that began after it and has not ended: busy', () => {
   const v = statusOf({ ...base, main: { status: 'idle', status_at: T0 }, edges: { started_at: T0 + 10_000, ended_at: T0 - 5_000 } }, { now: T0 + 20_000 })
   expect(v).toMatchObject({ state: 'busy', detail: { registry_stale: 'idle' } })

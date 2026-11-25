@@ -150,8 +150,10 @@ describe('part 3: what changed on purpose', () => {
     expect(d({ kind: 'peer_call', no_reply: true, refs: { reply_to: '11835' } }, { member: 'idle', owner: 'reflex' })).toMatchObject({ target: 'lane:reflex', rule: 'owner' })
     expect(d({ kind: 'peer_call', no_reply: true, urgency: 'silent', refs: { reply_to: '11835' } }, { member: 'idle', owner: 'main' })).toMatchObject({ target: 'ledger', rule: 'record-only' })
   })
-  test('no_reply decides nothing: a colleague\'s no_reply call is still a call; only urgency silent is record only', () => {
-    expect(d({ kind: 'peer_call', no_reply: true }, idle)).toMatchObject({ target: 'lane:reflex', urgency: 'interrupt' })
+  test('a colleague\'s no_reply call with no reply_to and no thread of ours stays record only (Chiron mesh-12125); with one it goes to its owner', () => {
+    expect(d({ kind: 'peer_call', no_reply: true }, idle)).toMatchObject({ target: 'ledger', rule: 'peer-no-reply' })
+    expect(d({ kind: 'peer_call', no_reply: true }, { member: 'idle', owner: 'reflex' })).toMatchObject({ target: 'lane:reflex', rule: 'owner' })
+    expect(d({ kind: 'peer_call' }, idle)).toMatchObject({ target: 'lane:reflex', rule: 'peer-call', urgency: 'interrupt' })
     expect(d({ kind: 'peer_call', no_reply: true }, { member: 'busy', owner: 'main' })).toMatchObject({ target: 'main_after_step', rule: 'owner' })
     expect(d({ kind: 'peer_call', urgency: 'silent' }, idle)).toMatchObject({ target: 'ledger', rule: 'record-only' })
     expect(d({ kind: 'peer_mail', no_reply: true }, idle)).toMatchObject({ target: 'lane:mail' })

@@ -81,6 +81,10 @@ export function sourceKindOf(row: Record<string, unknown>, ev: InEvent | null, o
   if (ev.source === 'mail') return 'mail_event'
   if (ev.source !== 'mesh') return 'other'
   if (from === 'main' || ev.fanout) return 'other'                       // the main's own tools (fork, open_worker, fan_out, curate_memory)
+  // WO-157b: the sender's kind field (an Onsen item's kind, lanes.ts item_kind) names it when it says more than Onsen's default peer_call (the bench run
+  // 14:59Z: a scheduled and an alert item sent by sonn were routed wake:scheduled / wake:alert but recorded source_kind peer_call)
+  const sent = (ev as { item_kind?: unknown }).item_kind
+  if (typeof sent === 'string' && sent !== 'peer_call' && (SOURCE_KINDS as readonly string[]).includes(sent)) return sent as SourceKind
   if (from === 'scheduler') return 'scheduled'
   if (o.alertSenders.map(lc).includes(from)) return 'alert'
   if (from === 'board' || BOARD_TICKET.test(String(ev.text ?? '').trimStart())) return 'board'

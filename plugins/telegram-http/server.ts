@@ -4374,7 +4374,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 5_000) })
   onsenFacts = facts
   let kickTimer: ReturnType<typeof setTimeout> | null = null
-  const kick = (): void => { if (!kickTimer) { kickTimer = setTimeout(() => { kickTimer = null; try { feed(compute()) } catch {} }, 25); (kickTimer as any).unref?.() } }
+  // WO-157b (status-latency-lab 「會判錯的」 8): lanes off, read the transcript before the status a change kicks (the message that began the turn is marked
+  // taken first, so the turn's first row does not count it as queued)
+  const kick = (): void => { if (!kickTimer) { kickTimer = setTimeout(() => { kickTimer = null; try { watch?.tick(); feed(compute()) } catch {} }, 25); (kickTimer as any).unref?.() } }
   // WO-145 (ONSEN_STATUS_PIN): the same view, shown in a pinned silent message in each DM chat of an allowlisted person (onsen-visible.ts StatusPin)
   const pin = ONSEN_VISIBLE.pin ? statusPinSetup() : null
   statusPinRef = pin?.pin ?? null
@@ -4409,8 +4411,11 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const compute = (): OnsenStatus.StatusView => {
     const w = wallReader.state()
     const wall = w?.walled ? { walled: true, until: w.resets_at, kind: w.kind } : tap?.walled() ?? null
-    return OnsenStatus.statusOf(source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : facts.queued(watch?.watching() ? 'taken' : 'seen'), wall,
+    const v = OnsenStatus.statusOf(source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : facts.queued(watch?.watching() ? 'taken' : 'seen'), wall,
       turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false, lanes: tap ? Lanes.runningLanes() : [], edges: tap ? tap.turnEdges() : null }))
+    // WO-157b (status-latency-lab 「會判錯的」 8): once the status says the turn began, the item offered to the main is the one it is taking in, not one waiting
+    if (tap && v.detail && Number(v.detail.queued_joey) > 0 && v.state !== 'idle' && v.state !== 'offline') v.detail.queued_joey = Lanes.mainQueuedJoey({ offered: false })
+    return v
   }
   onsenStatusCompute = compute                                          // WO-157: the lanes' one state source (decideWake, 此刻, the same-matter gate)
   registry.start()

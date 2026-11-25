@@ -39,6 +39,13 @@ const rowOf = (ev: any, rule: string, target: string, x: Record<string, unknown>
 
 // ================================================================== part 1: the mapping
 describe('part 1: one route record → one wake row', () => {
+  test('WO-157b: an Onsen item\'s kind field names the row\'s source_kind (not the sender\'s roster name); peer_call and a wake field are derived', () => {
+    const ev = { ...mesh('mesh-k1', 'eve', '測試排程', { line: 'call' }), item_kind: 'scheduled' }
+    expect(W.sourceKindOf({ source: 'mesh', from: 'eve' }, ev, { alertSenders: AS, roster: ROSTER })).toBe('scheduled')
+    expect(W.sourceKindOf({ source: 'mesh', from: 'eve' }, { ...ev, item_kind: 'alert' }, { alertSenders: AS, roster: ROSTER })).toBe('alert')
+    expect(W.sourceKindOf({ source: 'mesh', from: 'eve' }, { ...ev, item_kind: 'peer_call' }, { alertSenders: AS, roster: ROSTER })).toBe('peer_call')
+    expect(W.sourceKindOf({ source: 'mesh', from: 'mailbox' }, { ...mesh('mesh-k2', 'mailbox', '讀信箱', { wake: 'mail', ring: 'true' }), item_kind: 'peer_mail' }, { alertSenders: AS, roster: ROSTER })).toBe('mail_ring')
+  })
   test('1 Telegram (Joey): joey_tg, interrupt, the main by its M2 record; refs tg and event_id', () => {
     const ev = tg(7001, '幫我看一下 WO-147')
     const it = W.wakeItem(rowOf(ev, 'tg-main', 'main'), { ...ctx0, ev, main: { state: 'idle', offered: false }, did: 'm-x-1' }, o)

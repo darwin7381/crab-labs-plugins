@@ -106,6 +106,11 @@ type Output = { to: string; reply_to: string; text: string }
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
 /** 疑似卡死: a gen that owes a hook event (a turn open, or an offer unbound) has sent none for this long */
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
+/** WO-157b (Chiron status-latency-lab, 「會判錯的」 3): how long statusOf must keep reading idle, with no hook event of the gen meanwhile, before a turn M2
+ *  still holds open is closed as interrupted (Esc fires no Stop: the lab measured M2 in_turn 131 s while the session file, the screen and statusOf said idle
+ *  0.4–0.6 s after the key) */
+export let MAIN_IDLE_CONFIRM_MS = num('LANES_MAIN_IDLE_CONFIRM_MS', 4_000)
+export const __setMainIdleConfirmMs = (ms: number): void => { MAIN_IDLE_CONFIRM_MS = ms }
 export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
 /** 002x: the offer's own bound. An idle gen binds an offer within two seconds (1,304 offers of 002v and 002w: the slowest took 1.6 s); one still
  *  unbound after this long was lost on the client side (002w r1 A05, r2 I04: written half a second after the gen's stream opened, never bound, and
@@ -571,6 +576,26 @@ export function createMain(E: MainEnv) {
     void pump()
   }
   /** every few seconds: kill -0 (SIGKILL fires no hook), the stuck rule, and a pump (an item no stream could take is still queued) */
+  /** WO-157b: the main's statusOf as the daemon reads it now (idle: true when its state is idle). Two readings at least MAIN_IDLE_CONFIRM_MS apart that
+   *  both say idle while M2 holds the turn open, and no hook event of the gen between them: the turn ended without a Stop (Esc). It is closed as
+   *  interrupted (requeue 'interrupted', as beginTurn does for a turn that never got Stop or StopFailure), M2 goes idle, the queued items are offered.
+   *  Returns true when it closed a turn. */
+  let idleSeen: { gen: string; at: number; ev: number } | null = null
+  function statusIdle(isIdle: boolean, now = Date.now()): boolean {
+    const g = currentGen()
+    if (!g || g.state !== 'in_turn' || !isIdle) { idleSeen = null; return false }
+    const ev = lastEventAt.get(g.id) ?? 0
+    if (!idleSeen || idleSeen.gen !== g.id || idleSeen.ev !== ev) { idleSeen = { gen: g.id, at: now, ev }; return false }
+    if (now - idleSeen.at < MAIN_IDLE_CONFIRM_MS) return false
+    const heldS = Math.round((now - idleSeen.at) / 1000)
+    idleSeen = null
+    const back = g.prompt_id ? requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted') : []
+    openTools.delete(g.id)
+    setMain(g, 'idle', { prompt_id: null, tool_open: null, stopped_prompt: null })
+    E.log('info', `lanes: main gen ${g.id}: its turn ended without a Stop (statusOf idle for ${heldS} s, no hook event): closed as interrupted, ${back.length} item(s) queued again`)
+    void pump()
+    return true
+  }
   async function tick(now = Date.now()): Promise<void> {
     if (!E) return
     const g = currentGen()
@@ -644,7 +669,7 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork, turnStart, openTool,
+  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

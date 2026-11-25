@@ -132,6 +132,8 @@ export type StatusInputs = { main: { status: string; waiting_for?: string | null
 /** where the main's state comes from. A source reads one kind of evidence and fills StatusInputs; statusOf is the only judge. Registry is the one in use;
  *  another (a terminal reader, herdr / moshi style) implements this and nothing else changes. */
 export interface StatusSource { inputs(shared: StatusShared): StatusInputs }
+/** WO-157b: how long after the main's final Stop the session file may still say busy before it counts as stale (it is rewritten within ~0.5 s) */
+export const REGISTRY_SETTLE_MS = 3_000
 /** stuck: the registry says busy and nothing was written to the main's transcripts for this long (ONSEN_STUCK_S, default 600 s; the value is Chiron's) */
 export const stuckS = (): number => { const n = Number(process.env.ONSEN_STUCK_S ?? 600); return Number.isFinite(n) && n > 0 ? n : 600 }
 
@@ -157,6 +159,10 @@ export function statusOf(i: StatusInputs, o: { now?: number; stuckS?: number } =
     if ((st === 'busy' || st === 'waiting') && e.ended_at != null && e.ended_at > at && (e.started_at == null || e.started_at <= e.ended_at)) {
       // WO-157 (Chiron 12112, A): the file keeps busy after the turn while background sub-agents still run (the pane: 「✻ Waiting for 1 background agent
       // to finish」); all 24 such rows of the replay had 1–3 of them writing within 2 min. The count when it can be read, else true (as background_shell)
+      // WO-157b (Chiron status-latency-lab 「會判錯的」 6): Claude Code rewrites the file a moment after the final Stop (−0.3 to +0.2 s of the screen); the
+      // first row after every turn end said background_agents: true for 5 s with none running (7 of 7). Within REGISTRY_SETTLE_MS of the Stop the file is
+      // not stale yet: idle, nothing claimed. After it, a file still busy is the background-agent case
+      if ((o.now ?? Date.now()) - e.ended_at < REGISTRY_SETTLE_MS) return { state: 'idle', detail: { ...extras }, ...last }
       const bg = st === 'busy' ? (Number(i.main.background_agents) > 0 ? Number(i.main.background_agents) : true) : undefined
       return { state: 'idle', detail: { registry_stale: st, ...(bg !== undefined ? { background_agents: bg } : {}), ...extras }, ...last }
     }
