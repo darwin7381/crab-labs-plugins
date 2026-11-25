@@ -9,6 +9,9 @@
 //     crash between the POST and the cursor write costs nothing. The spool IS the queue: a daemon restart resumes from the cursor.
 //   - answers chat_history: GET /messages (or one message) with this agent's mesh credential; Onsen silent for ~4 s: the local spool answers, and says so.
 //   - knows who sent each Telegram call: server.ts runs a send inside `withSender(<who>, …)` (AsyncLocalStorage); the Bot API wrappers read it.
+//   - step 2 (WO-142): draws and lifts restart lines (Joey's /clear and its button: POST /restart-lines, /restart-lines/lift), directly with a short
+//     timeout, else through the spool in order; keeps the lines it drew in <STATE_DIR>/onsen/lines.json so the spool's answer respects them too;
+//     records edit_delivered (an edited message of Joey's reached the agent).
 // The credential (the agent's mesh credential, read from the agent-inbox daemon's state dir) is never logged, printed or written anywhere.
 
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -26,13 +29,24 @@ export type OnsenItem = {
 }
 export type OnsenEvent = {
   idem_key: string; agent: string; client: 'telegram'; chat: string; target_client_msg_id: string
-  kind: 'edit' | 'reaction' | 'retract'; actor: string; body?: string; data?: Record<string, unknown>; at: string
+  kind: 'edit' | 'reaction' | 'retract' | 'edit_delivered'; actor: string; body?: string; data?: Record<string, unknown>; at: string
 }
-type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent }
+/** step 2 (WO-142): Joey's /clear draws a line (POST /restart-lines); idem_key tg:<agent>:<chat>:line:<the /clear message id> */
+export type RestartLineDraw = { agent: string; client: 'telegram'; chat: string; idem_key: string; at: string; by?: string; client_msg_id?: string }
+/** step 2: his button lifts it (POST /restart-lines/lift). draw_idem (local only, never posted): a lift queued behind a draw still in the spool, resolved
+ *  to that draw's line id when the spool reaches it */
+export type RestartLineLift = { agent: string; client: 'telegram'; chat: string; at: string; by?: string; line_id?: number; draw_idem?: string }
+/** a line this daemon drew, kept in lines.json (the spool's answer filters by it); id null: not yet in Onsen */
+export type LocalLine = { chat: string; at: string; idem_key: string; client_msg_id?: string; by?: string; id: number | null; lifted_at: string | null
+  lifted_by?: string | null; rejected?: boolean }
+type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
 
 export const idemIn = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:in:${id}`
 export const idemOut = (agent: string, chat: string, id: string | number): string => `tg:${agent}:${chat}:out:${id}`
 export const idemOutFailed = (agent: string, chat: string): string => `tg:${agent}:${chat}:out-failed:${randomUUID()}`
+export const idemLine = (agent: string, chat: string, clearMsgId: string | number): string => `tg:${agent}:${chat}:line:${clearMsgId}`
+/** step 2: the callback data of the button under the /clear reply (≤ 64 bytes): olift:<line id, or - while the draw is in the spool>:<the /clear message id> */
+export const liftData = (lineId: number | null, clearMsgId: string | number): string => `olift:${lineId ?? '-'}:${clearMsgId}`
 
 // ------------------------------------------------------------------ who is sending (server.ts sets it around each send path)
 export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean; skip?: boolean }
@@ -221,6 +235,7 @@ export class OnsenClient {
   readonly spoolOld: string
   readonly cursorFile: string
   readonly rejected: string
+  readonly linesFile: string
   private running = false
   private again = false
   private kickTimer: ReturnType<typeof setTimeout> | null = null
@@ -230,13 +245,15 @@ export class OnsenClient {
   private credWarnAt = 0
   private appendWarnAt = 0
   private authWarnAt = 0
-  readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null }
+  readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
+    lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
     this.spoolOld = join(cfg.dir, 'spool.1.jsonl')
     this.cursorFile = join(cfg.dir, 'cursor.json')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
+    this.linesFile = join(cfg.dir, 'lines.json')
   }
   private get f(): typeof fetch { return this.cfg.fetch ?? fetch }
 
@@ -313,8 +330,8 @@ export class OnsenClient {
   private headers(cred: string, extra: Record<string, string> = {}): Record<string, string> {
     return { 'Content-Type': 'application/json', Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}`, ...extra }
   }
-  private async post(path: string, body: unknown, cred: string): Promise<{ status: number; json: any }> {
-    const r = await this.f(`${this.cfg.base}${path}`, { method: 'POST', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(this.cfg.postTimeoutMs ?? 15_000) })
+  private async post(path: string, body: unknown, cred: string, timeoutMs?: number): Promise<{ status: number; json: any }> {
+    const r = await this.f(`${this.cfg.base}${path}`, { method: 'POST', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
@@ -337,7 +354,7 @@ export class OnsenClient {
         if (buf[i] !== 0x0a) continue
         const raw = buf.subarray(from, i).toString('utf8')
         let line: SpoolLine | null = null
-        try { const j = JSON.parse(raw); if ((j.k === 'm' || j.k === 'e') && j.r) line = j } catch {}
+        try { const j = JSON.parse(raw); if ((j.k === 'm' || j.k === 'e' || j.k === 'l' || j.k === 'u') && j.r) line = j } catch {}
         out.push({ line, raw, end: start + i + 1 })
         from = i + 1
       }
@@ -366,6 +383,13 @@ export class OnsenClient {
     while (i < todo.length) {
       const t = todo[i]!
       if (!t.line) { this.reject(t.raw.slice(0, 2000), 'unreadable spool line'); this.writeCursor(t.end); i++; continue }
+      if (t.line.k === 'l' || t.line.k === 'u') {
+        // step 2 (WO-142): a restart line drawn or lifted while Onsen did not answer, in its place in the order
+        const done = await this.syncLine(t.line, cred)
+        if (done !== true) return this.failStatus(done, t.line.k === 'l' ? '/restart-lines' : '/restart-lines/lift')
+        this.writeCursor(t.end); this.ok(); i++
+        continue
+      }
       if (t.line.k === 'e') {
         const r = await this.post('/events', t.line.r, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) { if (r.json?.duplicate) this.stats.duplicates++; else this.stats.posted++ }
@@ -418,7 +442,152 @@ export class OnsenClient {
   }
 
   health(): Record<string, unknown> {
-    return { record: this.cfg.record, base: this.cfg.base, pending_bytes: this.pendingBytes(), backoff_s: Math.round(this.backoffMs / 1000), ...this.stats }
+    return { record: this.cfg.record, base: this.cfg.base, pending_bytes: this.pendingBytes(), backoff_s: Math.round(this.backoffMs / 1000), ...this.stats,
+      active_lines: this.readLines().filter(l => !l.lifted_at && !l.rejected).length }
+  }
+
+  // ---------------------------------------------------------------- restart lines (step 2, WO-142)
+  /** the lines this daemon drew (lines.json), oldest first */
+  readLines(): LocalLine[] {
+    try { const j = JSON.parse(readFileSync(this.linesFile, 'utf8')); return Array.isArray(j?.lines) ? j.lines : [] } catch { return [] }
+  }
+  private writeLines(lines: LocalLine[]): void {
+    try {
+      mkdirSync(this.cfg.dir, { recursive: true, mode: 0o700 })
+      const tmp = `${this.linesFile}.${process.pid}.tmp`
+      writeFileSync(tmp, JSON.stringify({ lines: lines.slice(-200) }), { mode: 0o600 })
+      renameSync(tmp, this.linesFile)
+    } catch (e) { this.cfg.log('warn', `onsen: could not write lines.json (${errText(e)})`) }
+  }
+  private updateLine(idem: string, f: (l: LocalLine) => void): LocalLine | undefined {
+    const all = this.readLines(), l = all.find(x => x.idem_key === idem)
+    if (l) { f(l); this.writeLines(all) }
+    return l
+  }
+  /** the active line of a chat as this daemon knows it: its newest drawn, unlifted, not refused line; null = none */
+  activeLine(chat: string): LocalLine | null {
+    let best: LocalLine | null = null
+    for (const l of this.readLines()) if (l.chat === chat && !l.lifted_at && !l.rejected && (!best || Date.parse(l.at) >= Date.parse(best.at))) best = l
+    return best
+  }
+
+  /** Joey's /clear (message `clientMsgId` in `chat`, by `tg:<id>`): draw the line now. Directly with a short timeout; Onsen silent or refusing: into
+   *  the spool (synced in order; the idem_key keeps it single). Recording off: null (nothing is drawn). Never throws. */
+  async drawLine(o: { chat: string; clientMsgId: string | number; by: string; at?: string; timeoutMs?: number }): Promise<{ id: number | null; spooled: boolean; idem_key: string } | null> {
+    if (!this.cfg.record) return null
+    const idem_key = idemLine(this.cfg.agent, o.chat, o.clientMsgId)
+    const body: RestartLineDraw = { agent: this.cfg.agent, client: 'telegram', chat: o.chat, idem_key, at: o.at ?? new Date().toISOString(), by: o.by, client_msg_id: String(o.clientMsgId) }
+    // first locally: the spool's answer respects the line at once, whatever Onsen does
+    const all = this.readLines().filter(x => x.idem_key !== idem_key)
+    all.push({ chat: o.chat, at: body.at, idem_key, client_msg_id: body.client_msg_id, by: o.by, id: null, lifted_at: null })
+    this.writeLines(all)
+    let why = ''
+    const cred = this.cfg.credential()
+    if (!cred) why = 'no mesh credential'
+    else {
+      try {
+        const r = await this.post('/restart-lines', body, cred, o.timeoutMs ?? 2500)
+        if (r.status >= 200 && r.status < 300 && r.json?.id != null) {
+          const id = Number(r.json.id)
+          this.updateLine(idem_key, l => { l.id = id })
+          this.stats.lines_drawn++
+          return { id, spooled: false, idem_key }
+        }
+        why = `HTTP ${r.status}`
+      } catch (e) { why = errText(e).slice(0, 120) }
+    }
+    this.append({ k: 'l', r: body })
+    this.stats.lines_spooled++
+    this.cfg.log('warn', `onsen: restart line in chat ${o.chat} not drawn directly (${why}); in the spool, drawn when Onsen answers`)
+    return { id: null, spooled: true, idem_key }
+  }
+
+  /** Joey's button: lift line `lineId` (else the line his /clear `clientMsgId` drew, else the newest of the chat). Locally at once; Onsen directly, or
+   *  through the spool behind a draw that is still there. nothing: there was no line to lift. Never throws. */
+  async liftLine(o: { chat: string; lineId?: number | null; clientMsgId?: string | number | null; by: string; timeoutMs?: number }): Promise<{ lifted: boolean; spooled: boolean; nothing: boolean }> {
+    const at = new Date().toISOString()
+    const all = this.readLines()
+    const idem = o.clientMsgId != null && o.clientMsgId !== '' ? idemLine(this.cfg.agent, o.chat, o.clientMsgId) : undefined
+    let local = (o.lineId != null ? all.find(x => x.id === o.lineId && x.chat === o.chat) : undefined) ?? (idem ? all.find(x => x.idem_key === idem) : undefined)
+    if (!local && o.lineId == null && !idem) local = all.filter(x => x.chat === o.chat && !x.lifted_at && !x.rejected).sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]
+    if (local?.rejected) return { lifted: false, spooled: false, nothing: true }            // Onsen refused that draw: there is no line
+    if (local) { local.lifted_at = at; local.lifted_by = o.by; this.writeLines(all) }
+    const lineId = o.lineId ?? local?.id ?? null
+    const body: RestartLineLift = { agent: this.cfg.agent, client: 'telegram', chat: o.chat, at, by: o.by, ...(lineId != null ? { line_id: lineId } : {}) }
+    // its draw is still in the spool: the lift goes behind it, in order (resolved to the draw's id when the spool reaches it)
+    if (lineId == null && local && this.cfg.record) {
+      this.append({ k: 'u', r: { ...body, draw_idem: local.idem_key } })
+      this.stats.lines_spooled++
+      return { lifted: true, spooled: true, nothing: false }
+    }
+    let why = ''
+    const cred = this.cfg.credential()
+    if (!cred) why = 'no mesh credential'
+    else {
+      try {
+        const r = await this.post('/restart-lines/lift', body, cred, o.timeoutMs ?? 2500)
+        if (r.status >= 200 && r.status < 300) { this.stats.lines_lifted++; return { lifted: true, spooled: false, nothing: !!r.json?.duplicate } }
+        if (r.status === 404) return { lifted: false, spooled: false, nothing: true }
+        why = `HTTP ${r.status}`
+      } catch (e) { why = errText(e).slice(0, 120) }
+    }
+    if (!this.cfg.record) { this.cfg.log('warn', `onsen: restart line lift in chat ${o.chat} failed (${why}); recording is off, so it is not queued`); return { lifted: false, spooled: false, nothing: false } }
+    this.append({ k: 'u', r: body })
+    this.stats.lines_spooled++
+    this.cfg.log('warn', `onsen: restart line lift in chat ${o.chat} not sent directly (${why}); in the spool`)
+    return { lifted: true, spooled: true, nothing: false }
+  }
+
+  /** the sync loop's half of a spooled draw / lift: true = done (or refused for good: moved to rejected.jsonl); else the answer to back off on */
+  private async syncLine(line: { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }, cred: string): Promise<true | { status: number; json: any }> {
+    const fail = (e: unknown) => ({ status: 0, json: { error: errText(e) } })
+    if (line.k === 'l') {
+      const r = await this.post('/restart-lines', line.r, cred).catch(fail)
+      if (r.status >= 200 && r.status < 300) {
+        if (r.json?.id != null) this.updateLine(line.r.idem_key, l => { l.id = Number(r.json.id) })
+        if (r.json?.duplicate) this.stats.duplicates++; else { this.stats.posted++; this.stats.lines_drawn++ }
+        return true
+      }
+      if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
+        this.reject(line, `HTTP ${r.status} ${String(r.json?.error ?? JSON.stringify(r.json?.detail ?? '')).slice(0, 200)}`)
+        this.updateLine(line.r.idem_key, l => { l.rejected = true })
+        return true
+      }
+      return r
+    }
+    const { draw_idem, ...body } = line.r
+    if (body.line_id == null && draw_idem) {
+      const d = this.readLines().find(x => x.idem_key === draw_idem)
+      if (d?.rejected) { this.cfg.log('info', `onsen: lift of ${draw_idem} skipped: its draw was refused`); return true }
+      if (d?.id != null) body.line_id = d.id
+    }
+    const r = await this.post('/restart-lines/lift', body, cred).catch(fail)
+    if (r.status >= 200 && r.status < 300) { this.stats.posted++; this.stats.lines_lifted++; return true }
+    if (r.status === 404) { this.cfg.log('info', `onsen: lift in chat ${body.chat}: no line to lift`); return true }
+    if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) { this.reject(line, `HTTP ${r.status}`); return true }
+    return r
+  }
+
+  /** step 2 (WO-142): Joey's edit of message `target` reached the agent (a new inbound, or the queued original's text replaced) */
+  recordEditDelivered(chat: string, target: string | number, editDate: string | number, replacedInQueue: boolean): void {
+    this.stats.edits_delivered++
+    this.recordEvent({ idem_key: `tg:${this.cfg.agent}:${chat}:edit_delivered:${target}:${editDate}`, agent: this.cfg.agent, client: 'telegram', chat,
+      target_client_msg_id: String(target), kind: 'edit_delivered', actor: 'system:daemon', data: { replaced_in_queue: replacedInQueue }, at: new Date().toISOString() })
+  }
+  /** the `in` item this daemon recorded for Telegram message `id` in `chat` (its spool and the previous generation), or null */
+  findInbound(chat: string, id: string | number): OnsenItem | null {
+    const want = String(id)
+    let hit: OnsenItem | null = null
+    for (const p of [this.spoolOld, this.spool]) {
+      if (!existsSync(p)) continue
+      try {
+        for (const raw of readFileSync(p, 'utf8').split('\n')) {
+          if (!raw || !raw.includes(`"client_msg_id":"${want}"`)) continue
+          try { const l = JSON.parse(raw); if (l.k === 'm' && l.r?.direction === 'in' && l.r.chat === chat && l.r.client_msg_id === want) hit = l.r } catch {}
+        }
+      } catch {}
+    }
+    return hit
   }
 
   // ---------------------------------------------------------------- chat_history
@@ -438,6 +607,7 @@ export class OnsenClient {
       try {
         if (id) {
           const row = await this.fetchOne(id, chat, cred, via)
+          if (row?.__behind) return behindLine(row.__behind)                     // step 2: before Joey's restart line (and nothing after it quotes it)
           if (row) return formatFull(row, joey)
           return `Onsen 裡找不到 ${id}${chat ? `（chat ${chat}）` : ''}。`
         }
@@ -449,7 +619,9 @@ export class OnsenClient {
         const r = await this.get(`/messages?${p}`, cred, via)
         if (r.status === 200 && Array.isArray(r.json?.messages)) {
           const rows = r.json.messages as any[]
-          return formatList(rows, typeof r.json.total === 'number' ? r.json.total : rows.length, joey)
+          // step 2 (WO-142): the agent's own read stops at Joey's restart line; one line at the top says so
+          const rl = r.json.restart_line_applied && r.json.restart_line?.at ? `${restartHead(r.json.restart_line.at)}\n` : ''
+          return rl + formatList(rows, typeof r.json.total === 'number' ? r.json.total : rows.length, joey)
         }
         why = `Onsen 回 HTTP ${r.status}`
       } catch (e) {
@@ -464,25 +636,30 @@ export class OnsenClient {
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
-  /** one message in full: an Onsen id; `tg:<n>` (the Telegram alias in `chat`); a bare number: the Onsen id first, then the alias */
+  /** one message in full: an Onsen id; `tg:<n>` (the Telegram alias in `chat`); a bare number: the Onsen id first, then the alias.
+   *  step 2: `{ __behind: <the line's time> }` when Onsen answers 404 because the message is before Joey's restart line */
   private async fetchOne(id: string, chat: string | undefined, cred: string, via: 'tool' | 'hook' = 'tool'): Promise<any | null> {
     const tg = /^tg:(\d+)$/i.exec(id)
+    const behind = (r: { status: number; json: any }): string | null => r.status === 404 && r.json?.detail?.restart_line ? String(r.json.detail.restart_line) : null
+    let onsenBehind: string | null = null
     if (!tg) {
       const r = await this.get(`/messages/${encodeURIComponent(id)}`, cred, via)
       if (r.status === 200 && r.json && typeof r.json === 'object') return r.json.message ?? r.json
       if (r.status !== 404 && r.status !== 400) throw new Error(`HTTP ${r.status}`)
-      if (!/^\d+$/.test(id)) return null
+      onsenBehind = behind(r)
+      if (!/^\d+$/.test(id)) return onsenBehind ? { __behind: onsenBehind } : null
     }
-    if (!chat) return null
+    if (!chat) return onsenBehind ? { __behind: onsenBehind } : null
     const msgId = tg ? tg[1]! : id
     const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${msgId}`, cred, via)
-    if (r.status === 404) return null
+    if (r.status === 404) { const b = behind(r) ?? onsenBehind; return b ? { __behind: b } : null }
     if (r.status !== 200 || !r.json) throw new Error(`HTTP ${r.status}`)
     const j = r.json.message ?? r.json
     if (j && (j.body != null || Array.isArray(j.events))) return j
     const oid = j?.id ?? j?.message_id
     if (oid == null) return null
     const full = await this.get(`/messages/${encodeURIComponent(String(oid))}`, cred, via)
+    if (behind(full)) return { __behind: behind(full) }
     return full.status === 200 && full.json ? full.json.message ?? full.json : null
   }
 
@@ -511,20 +688,34 @@ export class OnsenClient {
       if (l.r.kind === 'edit' && l.r.body != null) { m.body = l.r.body; m.edited = true }
     }
     const head = `（${why || 'Onsen 沒回應'}：以下是這個常駐程式本機暫存的紀錄，只有它自己記下的，可能不完整）`
+    // step 2 (WO-142): the restart lines this daemon drew (lines.json) apply here as Onsen applies them: only what is after the active line of each chat;
+    // a message before it is shown by id only when a message after the line quotes it
+    const lineCache = new Map<string, number>()
+    const lineAt = (chat: string): number | null => {
+      if (!lineCache.has(chat)) { const l = this.activeLine(chat); lineCache.set(chat, l ? Date.parse(l.at) : NaN) }
+      const v = lineCache.get(chat)!
+      return Number.isFinite(v) ? v : null
+    }
+    const after = (m: any): boolean => { const l = lineAt(m.chat); return l == null || Date.parse(m.at) > l }
     if (o.id) {
       const tg = /^tg:(\d+)$/i.exec(o.id)?.[1] ?? (/^\d+$/.test(o.id) ? o.id : undefined)
       const m = tg ? [...msgs.values()].find(x => x.client_msg_id === tg && (!o.chat || x.chat === o.chat)) : undefined
+      if (m && !after(m) && ![...msgs.values()].some(x => x.chat === m.chat && after(x) && x.reply_to_client_msg_id != null && x.reply_to_client_msg_id === m.client_msg_id))
+        return `${head}\n${behindLine(new Date(lineAt(m.chat)!).toISOString())}`
       return m ? `${head}\n${formatFull(m, joey)}` : `${head}\n本機暫存裡找不到 ${o.id}。`
     }
     const sinceMs = o.since ? Date.parse(o.since) : -Infinity, untilMs = o.until ? Date.parse(o.until) : Infinity
     const ql = o.q?.toLowerCase()
-    const all = [...msgs.values()].filter(m => (!o.chat || m.chat === o.chat) && Date.parse(m.at) >= sinceMs && Date.parse(m.at) <= untilMs && (!ql || String(m.body).toLowerCase().includes(ql)))
+    const inScope = [...msgs.values()].filter(m => (!o.chat || m.chat === o.chat))
+    const all = inScope.filter(m => after(m) && Date.parse(m.at) >= sinceMs && Date.parse(m.at) <= untilMs && (!ql || String(m.body).toLowerCase().includes(ql)))
       .sort((x, y) => Date.parse(y.at) - Date.parse(x.at))
     const rows = all.slice(0, o.limit).map(m => {
       const b = String(m.body ?? '')
       return [...b].length > CUT ? { ...m, body: [...b].slice(0, CUT).join(''), truncated: true } : m
     })
-    return `${head}\n${formatList(rows, all.length, joey)}`
+    const cut = [...new Set(o.chat ? [o.chat] : inScope.map(m => m.chat))].map(c => lineAt(c)).filter((x): x is number => x != null)
+    const rl = cut.length ? `${restartHead(new Date(Math.max(...cut)).toISOString())}\n` : ''
+    return `${head}\n${rl}${formatList(rows, all.length, joey)}`
   }
 }
 
@@ -573,6 +764,10 @@ function lineOf(m: any, joey: string): string {
   const flags = `${m.status === 'failed' ? '（沒送出）' : ''}${m.edited ? '（改過）' : ''}`
   return `${whenUtc(m.at)}｜${whoOf(m, joey)}｜${ref(m)}｜${flags}${body}${cut ? '…（全文用 id 取）' : ''}`
 }
+/** step 2 (WO-142): the line at the top of a list the restart line cut */
+export function restartHead(at: unknown): string { return `Joey 在 ${whenUtc(at)} 叫你重新開始：線之前的對話不顯示（他引用的那則照樣看得到）` }
+/** step 2: an id lookup of a message before the line */
+export function behindLine(at: unknown): string { return `這一則在 Joey 叫你重新開始（${whenUtc(at)}）之前，看不到` }
 /** the list: rows newest first as the API gives them, shown oldest first */
 export function formatList(rows: any[], total: number, joey = ''): string {
   if (!rows.length) return `沒有符合的訊息。\n共 ${total} 則，顯示 0 則`
@@ -591,6 +786,7 @@ export function formatFull(m: any, joey = ''): string {
     if (e.kind === 'edit') return `- ${whenUtc(e.at)} ${who} 改成：${e.body ?? ''}`
     if (e.kind === 'reaction') return `- ${whenUtc(e.at)} ${who} 按了 ${e.data?.emoji ?? '（收回表情）'}`
     if (e.kind === 'retract') return `- ${whenUtc(e.at)} ${who} 收回了這則`
+    if (e.kind === 'edit_delivered') return `- ${whenUtc(e.at)} 改過的內容交給了 agent${e.data?.replaced_in_queue ? '（原訊息還在佇列裡，直接換掉）' : ''}`
     return `- ${whenUtc(e.at)} ${who} ${e.kind}`
   })
   return `${whenUtc(m.at)}｜${whoOf(m, joey)}｜${ref(m)}${extra ? `｜${extra}` : ''}\n${String(m.body ?? '')}${att}${evLines.length ? `\n事件：\n${evLines.join('\n')}` : ''}`

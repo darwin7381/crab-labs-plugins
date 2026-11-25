@@ -42,6 +42,7 @@ import {
   type WatchTarget,
   type InlineButton,
   type ReplyOptions,
+  type ClearHooks,
 } from './channel-bot-control.ts'
 import { orderBotMenu } from './bot-menu.ts'
 import {
@@ -75,6 +76,7 @@ import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta } from './mesh-identity.ts'
 import * as Onsen from './onsen-client.ts'
+import * as OnsenEdit from './onsen-edit.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
@@ -379,6 +381,23 @@ function onsenIn(m: any, text: string, transcript?: string): void {
     const body = transcript ?? (kind === 'text' || kind === 'command' || kind === 'rich' || m.caption != null ? text : '')
     onsen.recordMessage(Onsen.inboundItem(ONSEN_AGENT, m, body))
   } catch {}
+}
+/** Onsen step 2 (WO-142): what /clear (Joey's message `msgId` in `chat`, from `fromId`) does around the keys: draw the restart line FIRST (directly, ~2.5 s at
+ *  most; else into the spool, and /clear still goes on time), put the button 「讓它看得到之前的」 on the reply, and lift the line again if typing /clear
+ *  failed. Recording off for this agent (ONSEN_RECORD / ONSEN_AGENTS): undefined, /clear exactly as before. */
+function clearHooks(chat: string, msgId: number | undefined, fromId: string): ClearHooks | undefined {
+  if (!onsen || !onsen.cfg.record || msgId == null) return undefined
+  return {
+    beforeClear: async () => {
+      const r = await onsen!.drawLine({ chat, clientMsgId: msgId, by: `tg:${fromId}` })
+      if (!r) return null
+      log('info', `onsen: restart line drawn in chat ${chat} for /clear ${msgId} (${r.spooled ? 'Onsen silent: in the spool' : `line ${r.id}`})`)
+      return {
+        keyboard: [[{ text: '讓它看得到之前的', callback_data: Onsen.liftData(r.id, msgId) }]],
+        undo: async () => { await onsen!.liftLine({ chat, lineId: r.id, clientMsgId: msgId, by: 'system:daemon' }) },
+      }
+    },
+  }
 }
 // Onsen (WO-139): the one place every grammy Bot API call passes (callBotApi has its own). Every message sent, edited or reacted to is recorded after
 // Telegram answers, under the send context's author (Onsen.withSender; system:daemon outside every named path; Onsen.withoutRecord: not at all): a message with its message_id, an edit / a reaction as an event, a failure as a failed message. Recording
@@ -2560,16 +2579,79 @@ bot.use(async (ctx, next) => {
   onsenIn(m, m.text!)
   return Onsen.withSender('system:control', () => next())
 })
-// Onsen (WO-139): an allowlisted person edits a message they sent: an edit event on it (the new full text). Recording only; nothing is routed.
+// Onsen (WO-139): an allowlisted person edits a message they sent: an edit event on it (the new full text).
+// Onsen step 2 (WO-142): and, with recording on for this agent, the edit reaches the agent (onsen-edit.ts): the original's unseen queued copy takes the new
+// text, else a new inbound 〔Joey 改了他 HH:MMZ 那一則（tg:N）〕 + the new text goes the way a normal message goes. Anyone else's edit: unchanged.
 bot.on('edited_message', ctx => {
   const m: any = ctx.editedMessage
   if (!onsen || !m?.from) return
+  let ok = false
   try {
     const a = loadAccess(), chat = String(m.chat?.id ?? '')
-    const ok = m.chat?.type === 'private' ? a.allowFrom.includes(String(m.from.id)) : !!a.groups?.[chat] && (a.groups[chat]!.allowFrom.length === 0 || a.groups[chat]!.allowFrom.includes(String(m.from.id)))
+    ok = m.chat?.type === 'private' ? a.allowFrom.includes(String(m.from.id)) : !!a.groups?.[chat] && (a.groups[chat]!.allowFrom.length === 0 || a.groups[chat]!.allowFrom.includes(String(m.from.id)))
     if (ok) onsen.recordEvent(Onsen.inboundEdit(ONSEN_AGENT, m))
   } catch {}
+  if (ok && onsen.cfg.record && !m.from.is_bot) void deliverEditedMessage(m).catch(err => log('warn', `onsen: delivering the edit of tg:${m.message_id} failed: ${err instanceof Error ? err.message : err}`))
 })
+/** Onsen step 2 (WO-142): the Telegram messages handleInbound delivered into the conversation (an edit of one of them reaches the agent) */
+const editIndex = new OnsenEdit.DeliveredIndex()
+async function deliverEditedMessage(m: any): Promise<void> {
+  if (!onsen) return
+  const text = m.text != null ? expandHiddenEntities(String(m.text), m.entities) : m.caption != null ? expandHiddenEntities(String(m.caption), m.caption_entities)
+    : m.rich_message ? (richToMarkdown(m.rich_message) || '') : ''
+  await OnsenEdit.deliverEdit(m, text, {
+    // delivered by this daemon (its index; after a restart, its spool: an `in` item that is not a command)
+    delivered: (chat, id) => editIndex.has(chat, id) || (() => { const it = onsen!.findInbound(chat, id); return !!it && it.kind !== 'command' })(),
+    replaceQueued: (chat, id, rw) => replaceQueuedEdit(chat, id, rw),
+    dispatch: (chat, notif) => dispatchInbound(chat, notif),
+    meta: em => {
+      const inTopic = Lanes.LANES_ON ? topicOfMessage(em) : undefined
+      return {
+        user: em.from?.username ?? String(em.from?.id ?? ''), user_id: String(em.from?.id ?? ''),
+        ...(inTopic != null ? { topic: String(inTopic), ...(Lanes.topicName(inTopic) ? { topic_name: metaExcerpt(Lanes.topicName(inTopic)!, 128) } : {}) } : {}),
+        ...replyForwardMeta({ message: em } as unknown as Context, false, Lanes.LANES_ON),
+      }
+    },
+    record: (chat, id, editDate, replaced) => onsen!.recordEditDelivered(chat, id, editDate, replaced),
+    log,
+  })
+}
+/** Onsen step 2 (WO-142): rewrite every copy of Telegram message `id` of `chat` that still waits unseen: lanes on, the main's M1 item (queued, never
+ *  offered); a session's in-memory queue (SSE not open yet); inbox/pending (parked, not a re-delivery copy of a push). true = at least one */
+function replaceQueuedEdit(chat: string, id: string, rw: (p: OnsenEdit.Params) => OnsenEdit.Params): boolean {
+  let n = 0
+  const rewrite = (notif: { method: string; params: unknown }): { method: string; params: unknown } => {
+    const p = (notif.params ?? {}) as Record<string, any>
+    const nw = rw({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })
+    return { method: notif.method, params: { ...p, content: nw.content, meta: nw.meta } }
+  }
+  if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.replaceQueuedMain(chat, id, rw)) n++
+  const pushed = (notif: unknown): boolean => recentDeliveries.some(d => d.notif === notif)
+  for (const [sid, q] of memQueue) {
+    for (let i = 0; i < q.length; i++) {
+      if (!OnsenEdit.carries(q[i]!, chat, id) || pushed(q[i])) continue
+      q[i] = rewrite(q[i]!); n++
+      log('info', `onsen: edit of tg:${id} replaced in the in-memory queue of session ${sid}`)
+    }
+  }
+  try {
+    const repersisted = new Set(recentDeliveries.map(d => d.pendingPath).filter(Boolean))
+    for (const f of readdirSync(PENDING_DIR)) {
+      if (!f.endsWith('.json')) continue
+      const full = join(PENDING_DIR, f)
+      if (repersisted.has(full)) continue                    // a copy of something already pushed into the session: the main may have read it
+      let notif: { method: string; params: unknown }
+      try { notif = JSON.parse(readFileSync(full, 'utf8')) } catch { continue }
+      if (!OnsenEdit.carries(notif, chat, id)) continue
+      const tmp = `${full}.edit.tmp`
+      writeFileSync(tmp, JSON.stringify(rewrite(notif)), { mode: 0o600 })
+      renameSync(tmp, full)
+      n++
+      log('info', `onsen: edit of tg:${id} replaced in parked delivery ${f}`)
+    }
+  } catch {}
+  return n > 0
+}
 
 bot.command('start', async ctx => {
   if (!dmCommandGate(ctx)) return
@@ -2733,6 +2815,28 @@ bot.on('callback_query:data', async ctx => {
       log('warn', `callback dispatch failed: ${err instanceof Error ? err.message : err}`)
     }
     await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+
+  // Onsen step 2 (WO-142): the button under the /clear reply, 「讓它看得到之前的」: lifts the restart line that /clear drew (olift:<line id|->:<the /clear
+  // message id>; `-`: the draw was still in the spool, lifted behind it). Allowlisted users only. The reply says it and loses the button.
+  if (data.startsWith('olift:')) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const mm = /^olift:(\d+|-):(\d+)$/.exec(data)
+    const cbm: any = ctx.callbackQuery.message
+    const chat = String(cbm?.chat?.id ?? ctx.chat?.id ?? senderId)
+    if (!onsen || !mm) {
+      await ctx.answerCallbackQuery({ text: '這個按鈕已經不能用了' }).catch(() => {})
+      return
+    }
+    const r = await onsen.liftLine({ chat, lineId: mm[1] === '-' ? null : Number(mm[1]), clientMsgId: mm[2], by: `tg:${senderId}` })
+    log('info', `onsen: restart line lifted by tg:${senderId} in chat ${chat} (/clear ${mm[2]}, line ${mm[1]}): ${r.nothing ? 'nothing to lift' : r.spooled ? 'spooled' : r.lifted ? 'lifted' : 'failed'}`)
+    await ctx.answerCallbackQuery({ text: r.nothing ? '這條線已經拿掉了' : r.spooled ? '已拿掉線（Onsen 恢復後同步）' : r.lifted ? '已拿掉線' : '沒拿掉：Onsen 沒回應，稍後再按一次' }).catch(() => {})
+    if (r.lifted || r.nothing) await ctx.editMessageText(`${cbm?.text ?? ''}\n已拿掉線：它查得到之前的對話了`.trim()).catch(() => {})
     return
   }
 
@@ -3224,6 +3328,7 @@ async function handleInbound(
       async (msg: string, opts?: ReplyOptions) => {
         await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard, here)     // lanes-topics: answered where it was typed
       },
+      clearHooks(chat_id, msgId, String(from.id)),   // Onsen step 2 (WO-142): /clear draws Joey's restart line before it is typed
     )
     if (handled) {
       log('info', `channel-bot-control handled slash: ${text.slice(0, 60)}`)
@@ -3325,6 +3430,7 @@ async function handleInbound(
   // completely unaffected. Reply-sourced images never aggregate (the album id
   // belongs to the outer message, not the root's photo).
   const mgid = ctx.message?.media_group_id
+  editIndex.note(chat_id, msgId, ctx.message?.date)   // Onsen step 2 (WO-142): delivered into the conversation; an edit of it reaches the agent
   // Documents aggregate too (2026-08-23, Atlas lost 2 of 3 album statements):
   // a document album previously fell through here one-by-one — each item got
   // media_group_id in meta but never media_group_count/numbered fields, so the
@@ -3364,7 +3470,8 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
     // a message from Joey that the main owed a reply.
     if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }
     const ev: Lanes.InEvent = {
-      id: `tg-${chat_id}-${meta.message_id ?? Date.now()}`, source: 'telegram', from: meta.user ?? 'joey',
+      // Onsen step 2 (WO-142): Joey's edit carries the original's message_id; its event is its own (edited_at)
+      id: `tg-${chat_id}-${meta.message_id ?? Date.now()}${meta.edited_at ? `-edit-${Date.parse(meta.edited_at) || Date.now()}` : ''}`, source: 'telegram', from: meta.user ?? 'joey',
       text: String(p.content ?? ''), meta, notif: notification, verified: true,
       reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.topic,
     }

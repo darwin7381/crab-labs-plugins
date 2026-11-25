@@ -1623,6 +1623,14 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
   main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id })
 }
+/** Onsen step 2 (WO-142, server.ts): Joey edited Telegram message `messageId` in `chat` and the main has not seen it yet (its M1 item still queued, never
+ *  offered): that item is rewritten (lanes-main.ts replaceQueued; server.ts gives the new text). true = replaced; false = the edit goes as a new message. */
+export function replaceQueuedMain(chat: string, messageId: string, rewrite: Parameters<MainApi['replaceQueued']>[2]): boolean {
+  if (D?.role !== 'tg' || !main) return false
+  const ids = main.replaceQueued(chat, messageId, rewrite)
+  if (ids.length) D.log('info', `lanes: Joey's edit of tg:${messageId} replaced the text of queued item(s) ${ids.join(',')}`)
+  return ids.length > 0
+}
 /** 002w (D, gap 10): the router could not decide (it threw), for a Telegram message (server.ts) or a mesh one (/lanes/route): the event still goes to the
  *  main through the one builder (toMain: its own record, what its class owes handed to the main, its M1 item), never a record of its own kind. A record the
  *  router had already opened (it threw after) gets the one hand-over instead. */
@@ -4068,11 +4076,12 @@ function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof m
   if (!t) return null
   const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
   if (rt) {
-    const it = t.items.find(r => String((r.notif?.params as any)?.meta?.message_id ?? '') === rt)
+    // Onsen step 2 (WO-142): every item carrying that message id (Joey's message and his edit of it, delivered as a new item with the same message_id)
+    const its = t.items.filter(r => String((r.notif?.params as any)?.meta?.message_id ?? '') === rt && r.event)
     // lanes-golive (lab run 11-23, G1): a lane handed Joey's own message to the main; the turn carries the hand-over item, not Joey's, and the main
     // quotes HIS message (reply_to = its Telegram id). The quoted message is the event's own (its record's tg.message_id): that event's Joey line is met.
     // Matching only the items left it owed: the Stop check held the turn and the main sent Joey the same answer twice.
-    const evs = it?.event ? t.events.filter(e => e.id === it.event) : t.events.filter(e => String((e as any).tg?.message_id ?? '') === rt)
+    const evs = its.length ? t.events.filter(e => its.some(it => it.event === e.id)) : t.events.filter(e => String((e as any).tg?.message_id ?? '') === rt)
     return { turn: t, events: evs, about: evs, quoted: true }
   }
   const meets = t.events.filter(owesJoey)

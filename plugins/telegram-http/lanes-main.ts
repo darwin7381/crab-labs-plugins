@@ -607,8 +607,21 @@ export function createMain(E: MainEnv) {
   }
 
 
+  /** Onsen step 2 (WO-142): Joey edited a message the main has not seen yet. Each item that carries it (chat_id / message_id in its meta), still queued
+   *  and never offered, taken in or put back (no `reason`), gets the content and meta `rewrite` gives; the ids rewritten ([] = none: the caller delivers
+   *  the edit as a new message) */
+  function replaceQueued(chat: string, messageId: string, rewrite: (p: { content: string; meta: Record<string, string> }) => { content: string; meta: Record<string, string> }): string[] {
+    const rs = items(r => r.state === 'queued' && !r.reason && r.kind !== 'digest' && metaOf(r.notif).chat_id === chat && String(metaOf(r.notif).message_id ?? '') === messageId)
+    for (const r of rs) {
+      const p = { ...((r.notif?.params ?? {}) as Record<string, any>) }
+      const nw = rewrite({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })
+      J().write('msg', r.id, 'queued', { notif: { method: r.notif.method, params: { ...p, content: nw.content, meta: nw.meta } }, edited_in_queue: true })
+    }
+    return rs.map(r => r.id)
+  }
+
   return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, turnWork, turnStart,
-    items: (pred: (r: Row) => boolean = () => true) => items(pred) }
+    replaceQueued, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 
 // ------------------------------------------------------------------ registration text (the main-only rules travel with the architecture)

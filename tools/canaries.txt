@@ -50,3 +50,7 @@ plugins/telegram-http/duty-officer.ts::export class DutyOfficer
 plugins/telegram-http/startup-picker.ts::opts.skip?.(t.tmux)
 plugins/telegram-http/inbox-text.ts::send_to_agent：找別隻 agent 只有這一個工具，底下三條線
 plugins/telegram-http/fleet-mail.ts::export async function sendToAgent
+plugins/telegram-http/channel-bot-control.ts::hooks.beforeClear()
+plugins/telegram-http/server.ts::clearHooks(chat_id, msgId
+plugins/telegram-http/server.ts::deliverEditedMessage(m)
+plugins/telegram-http/onsen-client.ts::async drawLine(

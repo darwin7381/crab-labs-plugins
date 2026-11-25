@@ -1224,6 +1224,15 @@ async function forwardInputPassthrough(
 }
 
 /**
+ * Onsen step 2 (WO-142): what the caller does around `/clear`. beforeClear runs BEFORE the keys are typed (Joey's restart line is drawn first: the
+ * SessionStart hook of the cleared session asks Onsen for it the moment the TUI clears); its keyboard goes on the reply, and `undo` runs when typing
+ * /clear failed (the line was for a clear that did not happen). Absent (roamer, Onsen off): /clear behaves exactly as before.
+ */
+export type ClearHooks = {
+  beforeClear?: () => Promise<{ keyboard?: InlineButton[][]; undo?: () => Promise<void> } | null | undefined>
+}
+
+/**
  * Try to handle text as one of the shared TUI commands. Sends keys to the
  * given tmux pane. Returns true if handled (so caller skips further dispatch).
  */
@@ -1236,6 +1245,7 @@ export async function forwardSharedTuiSlash(
   // jsonl. Omitted in channel-bot mode → detectCurrentModel falls back to the
   // fixed CHANNEL_BOT_PROJECTS_DIR env. (issue #8)
   projectsDirOverride?: string,
+  hooks?: ClearHooks,
 ): Promise<boolean> {
   // /input passthrough first — must beat the verbatim-send branches below so
   // `/input /clear` types `/clear` literally into the TUI instead of being
@@ -1280,10 +1290,16 @@ export async function forwardSharedTuiSlash(
     // so handleControlSlash's /resume <id> branch gets it. (Joey 2026-05-26 msg
     // 1656/1657: inline-keyboard button clicks were a no-op because of this.)
     if (cmd === '/resume' && args) return false
+    // Onsen step 2 (WO-142): /clear draws Joey's restart line FIRST (bounded by the hook itself), then the keys are typed as before
+    let line: Awaited<ReturnType<NonNullable<ClearHooks['beforeClear']>>> = null
+    if (cmd === '/clear' && hooks?.beforeClear) {
+      try { line = await hooks.beforeClear() } catch { line = null }
+    }
     try {
       await tmuxSendKeys(cmd, tmuxName, true)  // clearFirst: drop any draft so the command isn't polluted
-      await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`)
+      await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`, line?.keyboard ? { keyboard: line.keyboard } : undefined)
     } catch (err) {
+      if (line?.undo) { try { await line.undo() } catch {} }
       await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
     }
     return true
@@ -2044,6 +2060,7 @@ export async function handleControlSlash(
   text: string,
   httpPort: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  hooks?: ClearHooks,   // Onsen step 2 (WO-142): /clear draws Joey's restart line first
 ): Promise<boolean> {
   if (!isControlEnabled()) return false
   const trimmed = text.trim()
@@ -2062,7 +2079,7 @@ export async function handleControlSlash(
   // This block handles /clear /agents /mcp /resume /help /init /compact /model /effort /sigint /cancel
   // for BOTH channel-bot mode (here, with TMUX_SESSION) and roamer mode (which
   // calls forwardSharedTuiSlash directly with its current_target tmux).
-  if (await forwardSharedTuiSlash(text, TMUX_SESSION, replyToTg)) {
+  if (await forwardSharedTuiSlash(text, TMUX_SESSION, replyToTg, undefined, hooks)) {
     return true
   }
 
