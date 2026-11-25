@@ -1,3 +1,7 @@
+## 1.47.3 — 2026-11-25
+
+- **Onsen status (WO-143): a lane's `claude -p` run is never the main, and its registry file never sends the read to the CLI.** Captured on the Mac mini at 04:1xZ: a lane run registers as `kind: interactive`, `entrypoint: sdk-cli`, without `tmux` (so it also passed the tmux filter of the main's pick); every main TUI is `entrypoint: cli` (43/43). 1.47.2's "interactive only" shape check still let atlas and kot flip to the CLI on lane runs. The main's pick and the shape check now use `mainCandidate` (interactive and not sdk-cli). agent-inbox 1.17.3 carries the same code. Test in `onsen-step3.test.ts`.
+
 ## 1.47.2 — 2026-11-25
 
 - **Onsen status (WO-143): only an interactive session's registry file can send the read to the CLI.** 1.47.0 treated any file of the workspace in an unknown shape as a reason to read `claude agents --json` instead of the files; a lane's few-seconds `claude -p` session in the same folder (another kind, other fields) did that on epeius at go-live (83124.json), and the daemon polled the CLI every 10 s until the 10-min check. A non-interactive file is never the main, so its shape no longer matters. agent-inbox 1.17.2 carries the same code. Test in `onsen-step3.test.ts`.

@@ -295,6 +295,16 @@ describe('the registry: which session is the main, offline and why, files vs the
     expect(R.files().bad).toEqual(['43.json'])
   })
 
+  test('1.47.3: a lane run registers as interactive with entrypoint sdk-cli: never the main, and its odd shape never sends the read to the CLI', () => {
+    const { R, put, up, st } = setup({ tmux: 'claude-x' })
+    put(reg(51, { status: 'idle', entrypoint: 'cli', startedAt: 1 })); up.add(51)
+    put(reg(52, { status: 'busy', entrypoint: 'sdk-cli', startedAt: 9, tmux: undefined }))      // newer, no tmux: passed the tmux filter before
+    expect(st().state).toBe('idle')
+    expect(R.main()?.pid).toBe(51)
+    writeFileSync(join(R.o.dir, '53.json'), JSON.stringify({ pid: 53, sessionId: 's53', cwd: WS, kind: 'interactive', entrypoint: 'sdk-cli', status: 'starting' }))
+    expect(R.files().bad).toEqual([])
+  })
+
   test('pid_reused: the OS start time is read at most every 30 s; the same second in another wording is the same start', () => {
     let t = 1_000_000, osStart: string | null = START, reads = 0
     const dir = mkdtempSync(join(tmpdir(), 'onsen-reg-'))

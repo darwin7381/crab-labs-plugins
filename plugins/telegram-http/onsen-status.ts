@@ -411,7 +411,7 @@ export function newestJsonl(dir: string): string | null {
 // as `busy`. The daemon reads the files (a watch, and the status tick's 2 s read): spawning the CLI every few seconds in every daemon is too heavy. At start
 // and every 10 minutes the two are compared; when they disagree, or a file of this workspace has another shape, the CLI is read instead (every 10 s) until
 // a later comparison agrees again. Every switch is logged.
-export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number }
+export type RegEntry = { pid: number; sessionId: string; cwd: string; kind: string; status: string; waitingFor?: string; procStart?: string; tmux?: string; startedAt?: number; entrypoint?: string }
 /** the registry statuses statusOf knows */
 export const REG_STATUSES = new Set(['idle', 'busy', 'waiting', 'shell'])
 /** one registry record (a file, or an item of the CLI's array) in the shape 2.1.322 writes; null = not that shape */
@@ -420,15 +420,18 @@ export function regEntry(j: any): RegEntry | null {
   for (const k of ['sessionId', 'cwd', 'kind', 'status']) if (typeof j[k] !== 'string') return null
   return { pid: j.pid, sessionId: j.sessionId, cwd: j.cwd, kind: j.kind, status: j.status, ...(typeof j.waitingFor === 'string' ? { waitingFor: j.waitingFor } : {}),
     ...(typeof j.procStart === 'string' ? { procStart: j.procStart } : {}), ...(typeof j.tmux === 'string' ? { tmux: j.tmux } : {}),
-    ...(typeof j.startedAt === 'number' ? { startedAt: j.startedAt } : {}) }
+    ...(typeof j.startedAt === 'number' ? { startedAt: j.startedAt } : {}), ...(typeof j.entrypoint === 'string' ? { entrypoint: j.entrypoint } : {}) }
 }
 const realOf = (p: string): string => { try { return realpathSync(p) } catch { return p } }
 const samePath = (a: string, b: string): boolean => a === b || realOf(a) === realOf(b)
 /** this daemon's main among the registry's sessions: an interactive session (a lane's `claude -p` shares the folder) whose cwd is the workspace; in the
  *  tmux session the channel bot drives when that is set (an entry that names a tmux pane); the main's session id when the lanes know it; else the newest
  *  live one (startedAt) */
+/** a session that can be an agent's main: interactive and not a `claude -p` run. Lane runs register too (2.1.322: kind interactive, entrypoint
+ *  sdk-cli, no tmux; seen 11-25 04:1xZ for nestor and sandwich-master); the main TUIs are entrypoint cli (43/43 on the Mac mini) (WO-143, 1.47.3) */
+export const mainCandidate = (e: { kind?: string; entrypoint?: string }): boolean => e.kind === 'interactive' && e.entrypoint !== 'sdk-cli'
 export function pickMain(es: RegEntry[], o: { workspace: string; tmux?: string | null; sessionId?: string | null; alive?: (pid: number) => boolean }): RegEntry | null {
-  let c = es.filter(e => e.kind === 'interactive' && samePath(e.cwd, o.workspace))
+  let c = es.filter(e => mainCandidate(e) && samePath(e.cwd, o.workspace))
   if (o.tmux) c = c.filter(e => e.tmux === undefined || e.tmux.split(':')[0] === o.tmux)
   if (o.sessionId) { const m = c.find(e => e.sessionId === o.sessionId); if (m) return m }
   const live = o.alive ? c.filter(e => o.alive!(e.pid)) : c
@@ -549,7 +552,7 @@ export class Registry implements StatusSource {
         const mine = typeof j?.cwd === 'string' && samePath(j.cwd, this.o.workspace)
         // only an interactive session can be the main: a lane's short-lived `claude -p` file in the same folder (other kind, other fields) must not send
         // the daemon to the CLI (1.47.0 on epeius: 83124.json, a few seconds' session, flipped the read to the CLI until the 10-min check)
-        c = { m: st.mtimeMs, size: st.size, e, bad: mine && j?.kind === 'interactive' && (!e || !REG_STATUSES.has(e.status) || typeof j.procStart !== 'string') }
+        c = { m: st.mtimeMs, size: st.size, e, bad: mine && mainCandidate(j ?? {}) && (!e || !REG_STATUSES.has(e.status) || typeof j.procStart !== 'string') }
         this.cache.set(f, c)
       }
       if (c.e) entries.push(c.e)
