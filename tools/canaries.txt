@@ -110,3 +110,5 @@ plugins/telegram-http/lanes.ts::export function wakeDecideOn
 plugins/telegram-http/lanes-wake-rules.json::"id": "unverified"
 plugins/telegram-http/onsen-wake.ts::decided_by: row.decided_by === 'new'
 plugins/telegram-http/server.ts::wakeFactsOf(body as unknown as Record<string, unknown>)
+plugins/telegram-http/lanes.ts::export function mainNowWords
+plugins/telegram-http/onsen-status.ts::backgroundAgents(sid: string | null)

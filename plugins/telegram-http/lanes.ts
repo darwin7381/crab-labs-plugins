@@ -3677,9 +3677,9 @@ export const MAIN_SAME_DOING_MAX = 300
 export function mainTurnNow(): { doing: string; prompt: string | null; from: 'turn' | 'newest' } | null {
   try {
     const g = main?.currentGen()
-    // WO-157 (Chiron 13:46Z, 2): "the main is in a turn" is statusOf's (busy / waiting / stuck); what it works on is still read from its turn (M1 / M2
-    // content, not a judgment). No status computed here: M2, as before
-    const v = mainStatusNow()
+    // WO-157 (Chiron 13:46Z, 2): with LANES_WAKE_DECIDE on, "the main is in a turn" is statusOf's (busy / waiting / stuck); what it works on is still
+    // read from its turn (M1 / M2 content, not a judgment). Switch off, or no status computed here: M2, as before
+    const v = wakeDecideOn() ? mainStatusNow() : null
     const inTurn = v ? ['busy', 'waiting', 'stuck'].includes(String(v.state)) : !!g && String(g.state) === 'in_turn'
     if (!inTurn) return null
     return g ? { ...doingNow(g, MAIN_SAME_DOING_MAX), prompt: g.prompt_id ? String(g.prompt_id) : null } : { doing: '', prompt: null, from: 'turn' }
@@ -3687,19 +3687,10 @@ export function mainTurnNow(): { doing: string; prompt: string | null; from: 'tu
 }
 export function mainNowLine(): string {
   const g = main?.currentGen()
-  // WO-157 (Chiron 13:46Z, 2): the state is statusOf's (the value Onsen gets); the line's words are today's (no new text this version: waiting, stuck and
-  // a compaction read 回合中, the wall 暫時不能用模型, offline 目前沒有在跑). No status computed here: M2, as before
-  const v = mainStatusNow()
-  if (v?.state) {
-    const st = memberStateOf(v as any, null)
-    if (st === 'idle') return '主線：閒著'
-    if (st === 'walled') return `主線：暫時不能用模型${g?.wall_since ? `（自 ${hhmm(String(g.wall_since))} 起）` : ''}`
-    if (st === 'offline') return '主線：目前沒有在跑'
-    const at = (typeof v.detail?.turn_started_at === 'string' ? v.detail.turn_started_at : null) ?? main?.turnStart?.() ?? null
-    const doing = g ? doingNow(g, 80).doing : ''
-    const parts = [...(at ? [`自 ${hhmm(at)} 起`] : []), ...(doing ? [`在處理：${doing}`] : [])]
-    return `主線：回合中${parts.length ? `（${parts.join('，')}）` : ''}`
-  }
+  // WO-157 (Chiron 13:46Z, 2; his words, mesh-12112): with LANES_WAKE_DECIDE on, the state is statusOf's (the value Onsen gets), one line per state.
+  // Switch off, or no status computed here: M2 and today's words, as before
+  const v = wakeDecideOn() ? mainStatusNow() : null
+  if (v?.state) return mainNowWords(v, g)
   const ph = g ? String(g.state) : 'gone'
   if (ph === 'idle') return '主線：閒著'
   if (ph === 'in_turn') {
@@ -3709,6 +3700,25 @@ export function mainNowLine(): string {
   }
   if (ph === 'walled') return `主線：暫時不能用模型${g!.wall_since ? `（自 ${hhmm(String(g!.wall_since))} 起）` : ''}`
   return ph === 'starting' ? '主線：正在啟動' : '主線：目前沒有在跑'
+}
+/** WO-157: Chiron's 此刻 line for each of statusOf's seven states (mesh-12112, verbatim; nothing added) */
+export function mainNowWords(v: { state: string; detail?: Record<string, unknown>; last_activity_at?: string | null }, g?: Row | null): string {
+  const st = memberStateOf(v as any, null), d = (v.detail ?? {}) as Record<string, any>
+  if (st === 'idle') return '主線：閒置。交給它的事馬上會看到。'
+  if (st === 'walled') {
+    const until = typeof d.walled?.until === 'string' && !Number.isNaN(Date.parse(d.walled.until)) ? hhmm(d.walled.until) : null
+    return until ? `主線：撞上限，${until} 前收不到東西。` : '主線：撞上限，解除前收不到東西。'
+  }
+  if (st === 'compacting') return '主線：正在壓縮對話，壓完才收得到東西。'
+  if (st === 'waiting') return `主線：停在一個選單上等 Joey 按${d.waitingFor ? `（${d.waitingFor}）` : ''}。交給它的事要等 Joey 按了才會看到。`
+  if (st === 'stuck') {
+    const t = v.last_activity_at ? Date.parse(v.last_activity_at) : NaN
+    const mins = Number.isFinite(t) ? Math.max(1, Math.round((Date.now() - t) / 60_000)) : Math.max(1, Math.round((Number(d.threshold_s) || 600) / 60))
+    return `主線：回合開著，但 ${mins} 分鐘 沒有任何動靜，可能卡住了。交給它的事不一定會被看到。`
+  }
+  if (st === 'offline') return '主線：不在線。交給它的事會留著，等它回來。'
+  const doing = g ? doingNow(g, 80).doing : ''
+  return `主線：回合中${doing ? `（${doing}）` : ''}。交給它的事排在它這一步後面。`
 }
 export function lanesNowLine(self: string): string {
   const others = [...running.entries()].filter(([id]) => id !== self)

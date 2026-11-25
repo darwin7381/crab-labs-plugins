@@ -128,16 +128,26 @@ test('decision 2 (13:46Z): statusOf alone — idle = now even while the hook say
   await idle()
 })
 
-test('decision 2 (13:46Z): the 此刻 line and the same-matter gate read statusOf, with today\'s words', async () => {
+test('decision 2 (13:46Z): the 此刻 line and the same-matter gate read statusOf; the line in Chiron\'s words for each state (mesh-12112)', async () => {
   await busy()                                                            // M2: in a turn
   member = 'idle'
-  expect(L.mainNowLine()).toBe('主線：閒著')
+  expect(L.mainNowLine()).toBe('主線：閒置。交給它的事馬上會看到。')
   expect(L.mainTurnNow()).toBeNull()                                      // statusOf idle: not in a turn, whatever M2 says
-  for (const m of ['busy', 'waiting', 'stuck', 'compacting']) { member = m; expect(L.mainNowLine()).toMatch(/^主線：回合中/) }
   member = 'busy'
+  expect(L.mainNowLine()).toMatch(/^主線：回合中(（.+）)?。交給它的事排在它這一步後面。$/)
   expect(L.mainTurnNow()).not.toBeNull()
-  member = 'walled'; expect(L.mainNowLine()).toMatch(/^主線：暫時不能用模型/)
-  member = 'offline'; expect(L.mainNowLine()).toBe('主線：目前沒有在跑'); expect(L.mainTurnNow()).toBeNull()
+  member = 'compacting'; expect(L.mainNowLine()).toBe('主線：正在壓縮對話，壓完才收得到東西。')
+  member = 'offline'; expect(L.mainNowLine()).toBe('主線：不在線。交給它的事會留著，等它回來。'); expect(L.mainTurnNow()).toBeNull()
+  member = 'walled'; expect(L.mainNowLine()).toBe('主線：撞上限，解除前收不到東西。')
+  // the words for the states the stand-in above does not make
+  expect(L.mainNowWords({ state: 'busy', detail: { walled: { until: '2026-11-25T15:30:00.000Z' } } })).toMatch(/^主線：撞上限，\d\d:\d\d 前收不到東西。$/)
+  expect(L.mainNowWords({ state: 'waiting', detail: { waitingFor: 'permission prompt' } })).toBe('主線：停在一個選單上等 Joey 按（permission prompt）。交給它的事要等 Joey 按了才會看到。')
+  expect(L.mainNowWords({ state: 'stuck', detail: { threshold_s: 600 }, last_activity_at: new Date(Date.now() - 12 * 60_000).toISOString() }))
+    .toBe('主線：回合開著，但 12 分鐘 沒有任何動靜，可能卡住了。交給它的事不一定會被看到。')
+  expect(L.mainNowWords({ state: 'idle', detail: { registry_stale: 'busy', background_agents: 2 } })).toBe('主線：閒置。交給它的事馬上會看到。')
+  // switch off: today's line from M2, whatever statusOf says
+  process.env.LANES_WAKE_DECIDE = 'someone-else'
+  try { member = 'idle'; expect(L.mainNowLine()).toMatch(/^主線：回合中/) } finally { process.env.LANES_WAKE_DECIDE = `someone-else,${AGENT}` }
   member = 'idle'
   await idle()
 })

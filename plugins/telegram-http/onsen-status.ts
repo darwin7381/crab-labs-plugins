@@ -124,7 +124,9 @@ export type TurnEdges = { started_at: number | null; ended_at: number | null }
 /** one lane run in progress: the lane, its run (lane.rN), its kind, since when */
 export type LaneRunInfo = { id: string; run: string; kind?: string; since: string }
 /** what a source says: the main's own state (null = offline, `offline` says why), the newest write to its transcripts, and the shared detail */
-export type StatusInputs = { main: { status: string; waiting_for?: string | null; status_at?: number | null } | null; offline?: OfflineReason; last_activity_at: string | null
+export type StatusInputs = { main: { status: string; waiting_for?: string | null; status_at?: number | null
+    /** WO-157 (Chiron 12112, A): background sub-agents of the main still working (their transcripts written lately); null: not read */
+    background_agents?: number | null } | null; offline?: OfflineReason; last_activity_at: string | null
   queued_joey: number; walled?: { until: string | null; kind?: string | null } | null; compacting?: boolean; turn?: BusyInput | null; lanes?: LaneRunInfo[]
   edges?: TurnEdges | null }
 /** where the main's state comes from. A source reads one kind of evidence and fills StatusInputs; statusOf is the only judge. Registry is the one in use;
@@ -153,7 +155,10 @@ export function statusOf(i: StatusInputs, o: { now?: number; stuckS?: number } =
   const at = Number(i.main.status_at), e = i.edges
   if (e && Number.isFinite(at) && at > 0) {
     if ((st === 'busy' || st === 'waiting') && e.ended_at != null && e.ended_at > at && (e.started_at == null || e.started_at <= e.ended_at)) {
-      return { state: 'idle', detail: { registry_stale: st, ...extras }, ...last }
+      // WO-157 (Chiron 12112, A): the file keeps busy after the turn while background sub-agents still run (the pane: 「✻ Waiting for 1 background agent
+      // to finish」); all 24 such rows of the replay had 1–3 of them writing within 2 min. The count when it can be read, else true (as background_shell)
+      const bg = st === 'busy' ? (Number(i.main.background_agents) > 0 ? Number(i.main.background_agents) : true) : undefined
+      return { state: 'idle', detail: { registry_stale: st, ...(bg !== undefined ? { background_agents: bg } : {}), ...extras }, ...last }
     }
     if ((st === 'idle' || st === 'shell') && e.started_at != null && e.started_at > at && (e.ended_at == null || e.ended_at < e.started_at)) {
       const turn2 = i.turn ? { turn_started_at: i.turn.turn_started_at, tool: i.turn.tool ? { name: i.turn.tool.name, since: i.turn.tool.started_at } : null, subagents: i.turn.subagents } : {}
@@ -465,6 +470,8 @@ export const REG_YOUNG_MS = 5_000
 /** a file in another shape younger than this is left out of the comparison with the CLI: when the whole fleet restarts at once a loaded machine takes
  *  longer than REG_YOUNG_MS to fill the files in (11-25 06:35Z: 38 daemons judged their main's file at 5 s) */
 export const REG_SETTLE_MS = 60_000
+/** WO-157: a background sub-agent counts as still working when its transcript was written this recently (a long tool call writes nothing meanwhile) */
+export const BG_AGENT_ACTIVE_MS = 10 * 60_000
 /** one registry record (a file, or an item of the CLI's array) in the shape 2.1.322 writes; null = not that shape */
 export function regEntry(j: any): RegEntry | null {
   if (!j || typeof j !== 'object' || !Number.isInteger(j.pid) || j.pid <= 0) return null
@@ -841,6 +848,26 @@ export class Registry implements StatusSource {
   }
   /** the newest write to the main's transcript (<sessionId>.jsonl; without a session: the newest transcript of the workspace) and its subagents'
    *  (<sessionId>/subagents/*.jsonl, where 2.1.322 writes them; an older Claude Code wrote sidechains into the main file), ISO; null = none found */
+  /** WO-157 (Chiron 12112, A): the main's background sub-agents still working: their transcripts (<session>/subagents/agent-*.jsonl, launched in the
+   *  background per the .meta.json, or with no meta) written in the last BG_AGENT_ACTIVE_MS; null when the folder cannot be read */
+  backgroundAgents(sid: string | null): number | null {
+    const dir = this.o.transcripts()
+    const f = dir ? (sid ? join(dir, `${sid}.jsonl`) : newestJsonl(dir)) : null
+    if (!dir || !f) return null
+    const sub = join(dir, basename(f, '.jsonl'), 'subagents'), since = this.now() - BG_AGENT_ACTIVE_MS
+    let n = 0
+    try {
+      for (const name of readdirSync(sub)) {
+        if (!name.endsWith('.jsonl')) continue
+        let m = 0
+        try { m = statSync(join(sub, name)).mtimeMs } catch { continue }
+        if (m < since) continue
+        try { const meta = JSON.parse(readFileSync(join(sub, name.replace(/\.jsonl$/, '.meta.json')), 'utf8')); if (meta?.requestShape && meta.requestShape !== 'background') continue } catch {}
+        n++
+      }
+    } catch { return null }
+    return n
+  }
   lastActivity(sid: string | null): string | null {
     const dir = this.o.transcripts()
     if (!dir) return null
@@ -869,6 +896,7 @@ export class Registry implements StatusSource {
     this.deadSince.delete(e.pid)
     if (e.procStart) { const os = this.startOf(e.pid); if (os && !sameStart(os, e.procStart)) return off('pid_reused') }
     if (!this.o.connected(e.pid)) return off('not_connected')
-    return { main: { status: e.status, waiting_for: e.waitingFor ?? null, status_at: e.statusAt ?? null }, last_activity_at: this.lastActivity(e.sessionId), ...base }
+    return { main: { status: e.status, waiting_for: e.waitingFor ?? null, status_at: e.statusAt ?? null,
+      ...(e.status === 'busy' ? { background_agents: this.backgroundAgents(e.sessionId) } : {}) }, last_activity_at: this.lastActivity(e.sessionId), ...base }
   }
 }

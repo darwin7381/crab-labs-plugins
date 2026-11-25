@@ -3,7 +3,10 @@
 //      are newer than the file's statusUpdatedAt; a file written after them wins
 //   5  detail.lanes: the agent's lane runs in progress ride in the status
 import { test, expect } from 'bun:test'
-import { statusOf, regEntry, LanesTap, DeliveryFacts } from './onsen-status.ts'
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { statusOf, regEntry, LanesTap, DeliveryFacts, Registry } from './onsen-status.ts'
 
 const T0 = Date.parse('2026-11-25T08:49:00.000Z')
 const base = { last_activity_at: new Date(T0).toISOString(), queued_joey: 0 }
@@ -15,6 +18,27 @@ test('a stale busy (or waiting) file after a final Stop the file never caught: i
   expect(v).toMatchObject({ state: 'idle', detail: { registry_stale: 'busy' } })
   const w = statusOf({ ...base, main: { status: 'waiting', waiting_for: 'dialog open', status_at: T0 }, edges: { started_at: null, ended_at: T0 + 5_000 } }, { now })
   expect(w).toMatchObject({ state: 'idle', detail: { registry_stale: 'waiting' } })
+})
+
+test('Chiron 12112 (A): the busy file after the turn while background sub-agents run: idle {registry_stale, background_agents: count, or true}', () => {
+  const ended = { started_at: T0 + 68_600, ended_at: T0 + 70_400 }
+  expect(statusOf({ ...base, main: { status: 'busy', status_at: T0, background_agents: 2 }, edges: ended }, { now })).toMatchObject({ state: 'idle', detail: { registry_stale: 'busy', background_agents: 2 } })
+  expect(statusOf({ ...base, main: { status: 'busy', status_at: T0, background_agents: 0 }, edges: ended }, { now }).detail?.background_agents).toBe(true)
+  expect(statusOf({ ...base, main: { status: 'busy', status_at: T0, background_agents: null }, edges: ended }, { now }).detail?.background_agents).toBe(true)
+  expect(statusOf({ ...base, main: { status: 'waiting', status_at: T0 }, edges: ended }, { now }).detail).not.toHaveProperty('background_agents')
+})
+
+test('Registry.backgroundAgents: background sub-agent transcripts written in the last 10 min (a foreground one by its meta, an old one: not counted)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wo157-bg-')), sid = '11111111-2222-3333-4444-555555555555', sub = join(dir, sid, 'subagents')
+  mkdirSync(sub, { recursive: true }); writeFileSync(join(dir, `${sid}.jsonl`), '{}\n')
+  for (const [n, shape, ageMin] of [['a1', 'background', 1], ['a2', 'background', 3], ['a3', 'foreground', 1], ['a4', 'background', 30], ['a5', null, 2]] as const) {
+    writeFileSync(join(sub, `agent-${n}.jsonl`), '{}\n')
+    if (shape) writeFileSync(join(sub, `agent-${n}.meta.json`), JSON.stringify({ requestShape: shape }))
+    const t = (Date.now() - ageMin * 60_000) / 1000; utimesSync(join(sub, `agent-${n}.jsonl`), t, t)
+  }
+  const reg = new Registry({ dir: join(dir, 'sessions'), workspace: dir, transcripts: () => dir, connected: () => true, changed: () => {}, log: () => {} } as any)
+  expect(reg.backgroundAgents(sid)).toBe(3)                              // a1, a2, a5 (no meta)
+  expect(reg.backgroundAgents('99999999-0000-0000-0000-000000000000')).toBeNull()
 })
 
 test('a stale idle file while the hooks show a turn that began after it and has not ended: busy', () => {
