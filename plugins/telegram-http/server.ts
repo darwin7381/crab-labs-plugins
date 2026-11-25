@@ -4370,8 +4370,13 @@ const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callbac
 let statusPinRef: OnsenVisible.StatusPin | null = null
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000),
-    ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}) })   // WO-145: ✍ when the main takes it in
-  const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 5_000) })
+    ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}),   // WO-145: ✍ when the main takes it in
+    changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
+  // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
+  // ONSEN_STATUS_HEARTBEAT_S (15 s; 0 = none), each carrying detail.heartbeat_s
+  const hbS = Number(process.env.ONSEN_STATUS_HEARTBEAT_S ?? OnsenStatus.HEARTBEAT_MS / 1000)
+  const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 1_000),
+    heartbeatMs: Number.isFinite(hbS) && hbS >= 0 ? hbS * 1000 : OnsenStatus.HEARTBEAT_MS })
   onsenFacts = facts
   let kickTimer: ReturnType<typeof setTimeout> | null = null
   // WO-157b (status-latency-lab 「會判錯的」 8): lanes off, read the transcript before the status a change kicks (the message that began the turn is marked
@@ -4420,6 +4425,12 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   onsenStatusCompute = compute                                          // WO-157: the lanes' one state source (decideWake, 此刻, the same-matter gate)
   registry.start()
   setInterval(() => { try { watch?.tick(); feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
+  // WO-162 (2), lanes off: the transcript is read every ONSEN_TRANSCRIPT_POLL_MS (250 ms; a stat when nothing was written) and a change of the turn (a
+  // tool starting or ending, a message taken in) is computed and written at once; until 1.55.0 it was read with the 2 s status tick
+  if (watch) {
+    const pollMs = Number(process.env.ONSEN_TRANSCRIPT_POLL_MS ?? 250)
+    setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
+  }
   setTimeout(kick, 1_000).unref?.()
   onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop() }
   onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),

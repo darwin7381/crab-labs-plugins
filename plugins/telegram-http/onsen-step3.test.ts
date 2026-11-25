@@ -187,36 +187,33 @@ describe('status', () => {
     expect(statusOf(I({ last_activity_at: new Date(Date.now() - 31_000).toISOString() })).state).toBe('busy')   // the default: 600 s
   })
 
-  test('a state change at once; a detail change at most one per throttle window, the latest; the same detail: nothing', async () => {
+  test('WO-162: a state change and every detail change at once (each tool starting and ending); the same detail: nothing', async () => {
     const out: StatusFact[] = []
-    const S = new StatusFacts({ agent: AGENT, sink: f => out.push(f), throttleMs: 120 })
+    const S = new StatusFacts({ agent: AGENT, sink: f => out.push(f), throttleMs: 120, heartbeatMs: 0 })
     const b = (tool: string | null) => ({ state: 'busy' as const, detail: { turn_started_at: 't', tool: tool ? { name: tool, started_at: 't' } : null, subagents: 0, queued_joey: 0 } })
     S.update({ state: 'idle' })
     S.update({ state: 'idle' })
     S.update(b(null))
-    S.update(b('Read')); S.update(b('Grep')); S.update(b('Bash'))                  // within the window: one trailing write, the latest
-    expect(out.map(f => f.state)).toEqual(['idle', 'busy'])
-    await sleep(180)
-    expect(out.length).toBe(3)
-    expect((out[2]!.detail as any).tool.name).toBe('Bash')
+    S.update(b('Read')); S.update(b(null)); S.update(b('Bash'))                  // a tool starting and ending, then another: each at once
+    expect(out.map(f => (f.detail as any)?.tool?.name ?? f.state)).toEqual(['idle', 'busy', 'Read', 'busy', 'Bash'])
     S.update(b('Bash'))                                                           // nothing new
     await sleep(150)
-    expect(out.length).toBe(3)
-    S.update(b('Edit'))                                                           // past the window: at once
-    expect(out.length).toBe(4)
-    S.update(b('Write')); S.update({ state: 'idle' })                            // a state change drops the pending detail write
-    await sleep(150)
-    expect(out.map(f => f.state)).toEqual(['idle', 'busy', 'busy', 'busy', 'idle'])
-    expect((out[3]!.detail as any).tool.name).toBe('Edit')
+    expect(out.length).toBe(5)
+    S.update({ state: 'waiting', detail: { waitingFor: 'permission prompt', queued_joey: 0 } })
+    S.update({ state: 'idle', detail: { dialog_open: true, queued_joey: 0 } })
+    S.update({ state: 'idle', detail: { queued_joey: 0 } })                       // dialog_open going away: at once
+    S.update({ state: 'idle', detail: { queued_joey: 1 } })                       // a count: at once too
+    expect(out.slice(5).map(f => JSON.stringify(f.detail))).toEqual(['{"waitingFor":"permission prompt","queued_joey":0}', '{"dialog_open":true,"queued_joey":0}',
+      '{"queued_joey":0}', '{"queued_joey":1}'])
     expect(new Set(out.map(f => f.idem_key)).size).toBe(out.length)
     for (const f of out) expect(f.idem_key).toBe(`tg:${AGENT}:st:${Date.parse(f.at)}:${f.state}`)
     expect(S.current()?.state).toBe('idle')
     S.stop()
   })
 
-  test('1.45.1 last_activity_at: a top-level field of every item (null when unknown); its change is throttled like the detail\'s, a state change carries the latest', async () => {
+  test('1.45.1 last_activity_at: a top-level field of every item (null when unknown); WO-162: its change alone is throttled (the latest), a state change carries the latest', async () => {
     const out: StatusFact[] = []
-    const S = new StatusFacts({ agent: AGENT, sink: f => out.push(f), throttleMs: 100 })
+    const S = new StatusFacts({ agent: AGENT, sink: f => out.push(f), throttleMs: 100, heartbeatMs: 0 })
     S.update({ state: 'offline', detail: { reason: 'no_registration', queued_joey: 0 }, last_activity_at: null })
     expect(out[0]).toMatchObject({ state: 'offline', last_activity_at: null })
     S.update({ state: 'busy', detail: { queued_joey: 0 }, last_activity_at: 'a1' })
@@ -673,6 +670,46 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
     expect(of(901)).toEqual(['seen:main', 'turn_end:main'])
     expect(of(902)).toEqual(['seen:main', 'turn_end:main'])
     expect(changes).toBeGreaterThan(0)
+  })
+
+test('WO-162, lanes on: 1.55.1\'s rule (the offered item is the turn\'s once the status says it began) on the first busy row; each hook\'s tool change written at once', async () => {
+    const gr = L.mainGenRow()!                                                           // the main of the test above, idle after its Stop
+    const g = { pid: Number(gr.pid), sid: String(gr.session_id) }
+    const rows: StatusFact[] = []
+    const S = new StatusFacts({ agent: AGENT, sink: f => rows.push(f), heartbeatMs: 0 })
+    let reg = 'idle'
+    // server.ts compute, lanes on (1.55.1): statusOf, then a turn that began does not count the item offered to the main
+    const compute = () => {
+      const v = statusOf({ main: { status: reg }, last_activity_at: null, queued_joey: L.mainQueuedJoey(), walled: tap.walled(), compacting: tap.compacting(), turn: tap.turnDetail() })
+      if (v.detail && Number(v.detail.queued_joey) > 0 && v.state !== 'idle' && v.state !== 'offline') v.detail.queued_joey = L.mainQueuedJoey({ offered: false })
+      return v
+    }
+    await joey(980)
+    const id = M().items(r => r.event === `tg-${JOEY}-980`)[0].id
+    expect(M().items(r => r.id === id)[0].state).toBe('offered')
+    S.update(compute())
+    expect(rows.at(-1)).toMatchObject({ state: 'idle', detail: { queued_joey: 1 } })     // an idle main's untaken offer still counts
+    reg = 'busy'                                                                         // Claude Code's registry says busy (before or after the hook)
+    S.update(compute())
+    expect(rows.at(-1)).toMatchObject({ state: 'busy', detail: { queued_joey: 0 } })     // the turn's first row: the item it is taking in is not queued
+    const p = 'p-wo162'
+    await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] }); S.update(compute())
+    // tools from the hooks: each start and end its own row at once (until 1.55.1 a detail change within 5 s of the last row waited)
+    const n = rows.length
+    for (const tool of ['mcp__plugin_telegram-http_telegram-http__react', 'Read', 'Bash']) {
+      await hook(g, 'PreToolUse', { prompt_id: p, tool_name: tool }); S.update(compute())
+      await hook(g, 'PostToolUse', { prompt_id: p, tool_name: tool, tool_input: {}, tool_response: 'ok' }); S.update(compute())
+    }
+    expect(rows.slice(n).map(r => (r.detail as any).tool?.name ?? null)).toEqual(['mcp__plugin_telegram-http_telegram-http__react', null, 'Read', null, 'Bash', null])
+    await joey(981)                                                                      // mid-turn: queued
+    S.update(compute())
+    expect(rows.at(-1)!.detail).toMatchObject({ queued_joey: 1 })
+    await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
+    await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash', tool_input: {}, tool_response: 'ok' })   // pulled at the tool boundary
+    S.update(compute())
+    expect(rows.at(-1)!.detail).toMatchObject({ tool: null, queued_joey: 0 })
+    await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
+    S.stop()
   })
 
   test('PreCompact: compacting (detail) until the main\'s next hook event; a StopFailure that walls the main: walled (detail); a stranger\'s message: no facts', async () => {

@@ -2,8 +2,8 @@
 //
 //   DeliveryFacts  delivered / seen / turn_end of each of Joey's messages (one per message and state; the first recipient wins at Onsen), spooled through
 //                  OnsenClient.recordDelivery behind the message's own record.
-//   StatusFacts    the main's status: every state change at once; while the state stays, a change of the detail or of last_activity_at at most once per 5 s,
-//                  always the latest (a trailing write).
+//   StatusFacts    the main's status: every change of the state or the detail at once; last_activity_at moving alone at most once per 1 s, always the
+//                  latest (a trailing write); nothing new for 15 s: the same again (WO-162: the heartbeat, detail.heartbeat_s).
 //   statusOf       1.45.1: the one rule that turns a source's inputs into the status: offline / idle / busy / waiting / stuck.
 //   Registry       1.45.1, the source of the state (a StatusSource): Claude Code's own session registry (~/.claude/sessions/<pid>.json, what
 //                  `claude agents --json` reads), checked against that CLI at start and every 10 min; the CLI is read instead when they disagree.
@@ -33,10 +33,12 @@ export class DeliveryFacts {
   /** Joey's messages taken in and not yet into a turn (lanes off: the queued count) */
   private open = new Map<string, { at: number; seen: boolean; taken: boolean }>()
   /** onSeen (WO-145, the ✍ reaction): every `seen` report, for each message of it (an album: every item), the recipient named; a repeat too (the
-   *  caller keeps its own once) */
+   *  caller keeps its own once). changed (WO-162): the queued count may have changed (a message taken in, written into the stream, into a turn, its
+   *  turn ended): the status is computed again now rather than at the next 2 s tick */
   constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; settleMs?: number; now?: Now; max?: number
-    onSeen?: (chat: string, id: string, by: string) => void }) {}
+    onSeen?: (chat: string, id: string, by: string) => void; changed?: () => void }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
+  private changed(): void { try { this.o.changed?.() } catch {} }
 
   /** the album's messages: what happens to the first (the one delivered) happens to each */
   album(chat: string, ids: Array<string | number>): void {
@@ -63,22 +65,26 @@ export class DeliveryFacts {
     this.emit(chat, s, 'delivered', undefined, at)
     if (!this.open.has(k2(chat, s))) this.open.set(k2(chat, s), { at: this.now(), seen: false, taken: false })
     if (this.open.size > 2_000) this.open.delete(this.open.keys().next().value!)
+    this.changed()
   }
   seen(chat: string, id: string | number, by: string, at?: string): void {
     const s = String(id)
     this.emit(chat, s, 'seen', by, at)
     for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) e.seen = true }
     if (this.o.onSeen) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
+    this.changed()
   }
   /** lanes off: the transcript shows it taken into a turn (not a fact of its own: the queued count) */
   taken(chat: string, id: string | number): void {
     for (const m of this.idsOf(chat, String(id))) { const e = this.open.get(k2(chat, m)); if (e) { e.seen = true; e.taken = true } }
+    this.changed()
   }
   turnEnd(chat: string, id: string | number, by: string, at?: string, detail?: Record<string, unknown>): void {
     const s = String(id)
     this.cancelTurnEnd(chat, s, by)
     this.emit(chat, s, 'turn_end', by, at, detail)
     for (const m of this.idsOf(chat, s)) this.open.delete(k2(chat, m))
+    this.changed()
   }
   turnEndLater(chat: string, id: string | number, by: string, at: string, detail?: Record<string, unknown>): void {
     const s = String(id), key = `${k2(chat, s)}\u0000${by}`
@@ -189,36 +195,72 @@ export function statusOf(i: StatusInputs, o: { now?: number; stuckS?: number } =
   return { state: 'busy', detail: { ...turn, ...extras }, ...last }
 }
 
+/** WO-162 (3): a status is reported at least this often while the daemon computes it, unchanged or not; each report carries detail.heartbeat_s so Onsen
+ *  can tell a reporter that stopped (no report for 3 × heartbeat_s) from one that has nothing new to say */
+export const HEARTBEAT_MS = 15_000
 export class StatusFacts {
-  private last: { state: StatusState; key: string; ms: number } | null = null
+  private last: { state: StatusState; key: string; act: string | null; ms: number } | null = null
   private pending: StatusView | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
-  constructor(readonly o: { agent: string; sink: (f: StatusFact) => void; throttleMs?: number; now?: Now }) {}
+  private beat: ReturnType<typeof setTimeout> | null = null
+  /** the last view handed in, and when: the heartbeat repeats it only while it is fresh (a compute loop that stopped is not reported as alive) */
+  private latest: { v: StatusView; ms: number } | null = null
+  private stopped = false
+  /** throttleMs: last_activity_at alone moving is written at most this often (default 1 s); heartbeatMs: the longest gap between two reports (default
+   *  HEARTBEAT_MS; 0 = no heartbeat, no heartbeat_s); freshMs: the heartbeat repeats the latest view only if it was handed in within the larger of
+   *  this (default 5 s; the daemon computes one every 2 s) and heartbeatMs */
+  constructor(readonly o: { agent: string; sink: (f: StatusFact) => void; throttleMs?: number; heartbeatMs?: number; freshMs?: number; now?: Now }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
-  /** the status as the daemon sees it now: a state change is written at once; a change of the detail or last_activity_at within the same state at most
-   *  once per throttleMs (the latest) */
+  private get beatMs(): number { const n = Number(this.o.heartbeatMs ?? HEARTBEAT_MS); return Number.isFinite(n) && n > 0 ? n : 0 }
+  /** the status as the daemon sees it now. WO-162 (2): a new state or any change of the detail (a tool starting or ending, waitingFor, dialog_open, a
+   *  count) is written at once; until 1.55.0 a detail change waited up to 5 s, so tools under 2 s never showed and a 4 s tool showed once it was over.
+   *  Only last_activity_at moving on its own (each transcript write) waits, at most throttleMs, the latest. Nothing new for heartbeatMs: written again */
   update(v: StatusView): void {
-    const key = JSON.stringify([v.detail ?? null, v.last_activity_at ?? null])
-    if (!this.last || this.last.state !== v.state) return this.send(v, key)
-    if (this.last.key === key) { this.pending = null; return }
-    const wait = this.last.ms + (this.o.throttleMs ?? 5_000) - this.now()
-    if (wait <= 0) return this.send(v, key)
+    if (this.stopped) return
+    this.latest = { v, ms: this.now() }
+    const key = JSON.stringify(v.detail ?? null), act = v.last_activity_at ?? null
+    if (!this.last || this.last.state !== v.state || this.last.key !== key) return this.send(v)
+    if (this.beatMs && this.now() - this.last.ms >= this.beatMs) return this.send(v)
+    if (this.last.act === act) { this.pending = null; return }
+    const wait = this.last.ms + (this.o.throttleMs ?? 1_000) - this.now()
+    if (wait <= 0) return this.send(v)
     this.pending = v
     if (!this.timer) {
       this.timer = setTimeout(() => { this.timer = null; const p = this.pending; this.pending = null; if (p) this.update(p) }, wait)
       ;(this.timer as any).unref?.()
     }
   }
-  private send(v: StatusView, key: string): void {
+  private send(v: StatusView): void {
     if (this.timer) { clearTimeout(this.timer); this.timer = null }
     this.pending = null
     const ms = Math.max(this.now(), (this.last?.ms ?? 0) + 1)          // one idem key per write
-    this.last = { state: v.state, key, ms }
-    try { this.o.sink({ idem_key: idemStatus(this.o.agent, ms, v.state), agent: this.o.agent, state: v.state, at: iso(ms), ...(v.detail ? { detail: v.detail } : {}),
+    this.last = { state: v.state, key: JSON.stringify(v.detail ?? null), act: v.last_activity_at ?? null, ms }
+    const beat = this.beatMs
+    const detail = beat ? { ...(v.detail ?? {}), heartbeat_s: beat / 1000 } : v.detail
+    try { this.o.sink({ idem_key: idemStatus(this.o.agent, ms, v.state), agent: this.o.agent, state: v.state, at: iso(ms), ...(detail ? { detail } : {}),
       last_activity_at: v.last_activity_at ?? null }) } catch {}
+    this.arm()
+  }
+  /** the heartbeat: heartbeatMs after the last report, the latest view again, if one was handed in within the larger of heartbeatMs and freshMs;
+   *  otherwise nothing (the next update() reports at once, the beat being overdue) */
+  private arm(): void {
+    if (this.beat) clearTimeout(this.beat)
+    this.beat = null
+    const beat = this.beatMs
+    if (!beat || this.stopped) return
+    this.beat = setTimeout(() => {
+      this.beat = null
+      const l = this.latest
+      if (l && !this.stopped && this.now() - l.ms <= Math.max(beat, this.o.freshMs ?? 5_000)) this.send(l.v)
+    }, beat)
+    ;(this.beat as any).unref?.()
   }
   current(): { state: StatusState; at: string } | null { return this.last ? { state: this.last.state, at: iso(this.last.ms) } : null }
-  stop(): void { if (this.timer) clearTimeout(this.timer); this.timer = null; this.pending = null }
+  stop(): void {
+    this.stopped = true
+    if (this.timer) clearTimeout(this.timer); this.timer = null; this.pending = null
+    if (this.beat) clearTimeout(this.beat); this.beat = null
+  }
 }
 
 // ------------------------------------------------------------------ lanes on: the journal and the main's hook events
