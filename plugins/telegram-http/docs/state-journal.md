@@ -653,10 +653,9 @@ With `GENESIS_LANES=1` each duty below has one owner. With lanes off none of thi
 
 | Duty | Owner | Not |
 |---|---|---|
-| Deciding where an inbound item goes (Telegram, /inject, hub row, wake-up line, parked delivery) | the router, `routeEvent` in the tg daemon; the agent-inbox daemon asks it (`/lanes/route`) through `laneDeliverMesh` (server.ts) | `dispatchInbound` building a Telegram event from a mesh notification; hub sync pushing into a session |
-| Writing anything into the main session | M1 (`lanes-main.ts`: offer when idle, pull at a boundary, re-offer after `OFFER_LEASE_MS`) | `broadcastNotification`, `pushToReadySessions`, the disk replay (they run only when no router can be asked: `laneDeliverMesh` fallback) |
-| Fetching hub rows (BTCC `/api/mesh/inbox/pending`) and reporting them taken (`/api/mesh/inbox/taken`) | hub sync (`hub-sync.ts`, agent-inbox daemon, Epeius's); with lanes on its `push` is `laneHubPush` (the router) and `taken` = the router accepted the row (it is in this journal), `receiptCheck` off | a transcript receipt per hub row |
-| A doorbell (/inject with the sender's hub id) | hub sync decides hub or old path (`hub.doorbell`), as on the fleet; the /inject meta (verdict, thread, hop, line, wake) rides along to the router (`rememberHubMeta`) | routing the /inject and the hub row both |
+| Deciding where an inbound item goes (Telegram, /inject, an Onsen item, wake-up line, parked delivery) | the router, `routeEvent` in the tg daemon; the agent-inbox daemon asks it (`/lanes/route`) through `laneDeliverMesh` (server.ts) | `dispatchInbound` building a Telegram event from a mesh notification |
+| Writing anything into the main session | M1 (`lanes-main.ts`: offer when idle, pull at a boundary, re-offer after `OFFER_LEASE_MS`) | `broadcastNotification`, the disk replay (they run only when no router can be asked: `laneDeliverMesh` fallback) |
+| Taking what is sent to the agent | the agent-inbox daemon's Onsen pull (`onsen-inbox.ts`, `deliverPulled` → the same delivery as /inject); hub sync (BTCC `/api/mesh/inbox/pending`, doorbells) was removed in 1.52.0 (WO-158) | |
 | Knowing the main has a delivery | M1 `bound` (the main's turn took the item); `mainTookItems` sends a scheduler run's start receipt (ack) once | `receipt.ts` / `recordDelivery` / `sweepDeliveries` (fallback broadcasts only) |
 | A run a lane takes | its start receipt when the router gives it to the lane (`laneDeliverMesh`: `maybeAutoAckScheduled`), its completion by `receipt(run_id)` / `btcc-receipt` (one per run, `toolGate`) | |
 | Parked deliveries (`inbox/pending`) | the timer drain hands each back to the router (`laneRedeliver`) | replaying them into whichever session is open |

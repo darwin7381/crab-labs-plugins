@@ -1,12 +1,11 @@
-// lanes-golive C3: one entrance into the main. With lanes on the router is the only path that writes into the main session: hub sync keeps fetching
-// and reporting taken but hands its rows to the router; a doorbell is routed once (hub or old path, not both); parked deliveries go back through the
-// router; the main's taking an item (M1 bound) is the one delivery count, and for a scheduler run it sends the start receipt once.
+// lanes-golive C3: one entrance into the main. With lanes on the router is the only path that writes into the main session (hub sync, which handed its
+// rows to the router, was removed in 1.52.0, WO-158); parked deliveries go back through the router; the main's taking an item (M1 bound) is the one
+// delivery count, and for a scheduler run it sends the start receipt once.
 import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { HubSync } from './hub-sync.ts'
 const L = await import('./lanes.ts?golive-c3') as typeof import('./lanes.ts')
 const dir = mkdtempSync(join(tmpdir(), 'lanes-golive-c3-'))
 process.env.LANES_DIR = dir
@@ -47,38 +46,14 @@ test('C3: a scheduler run the router gives the main gets its start receipt when 
   await L.lanesCommand('/lanes on', 'test')
 })
 
-test('C3: hub sync with lanes on (push = the router, no transcript receipt): a row is handed over once and reported taken; a row nobody could take waits at the hub', async () => {
-  const sd = mkdtempSync(join(tmpdir(), 'hub-c3-'))
-  const pushed: any[] = [], taken: number[][] = []
-  let routerUp = false
-  const fetchFn = (async (url: string, init?: any) => {
-    if (String(url).endsWith('/api/mesh/inbox/pending')) return new Response(JSON.stringify({ rows: [{ id: 501, payload: { content: '問一下', meta: { user: 'eve' } } }] }), { status: 200 })
-    if (String(url).endsWith('/api/mesh/inbox/taken')) { taken.push(JSON.parse(init.body).msg_ids); return new Response(JSON.stringify({ updated: 1 }), { status: 200 }) }
-    return new Response('{}', { status: 404 })
-  }) as any
-  const hub = new HubSync({ base: 'http://btcc', auth: () => ({ Authorization: 'Bearer x' }), fetch: fetchFn,
-    push: async n => { if (!routerUp) return 0; pushed.push(n); return 1 }, seenLines: () => { throw new Error('no transcript is read with lanes on') },
-    dispatchOld: async () => {}, defaultChatId: () => '1', log: () => {} }, { stateDir: sd, receiptCheck: () => false, graceMs: 90_000, maxPushes: 3 })
-  await hub.kick('t1')
-  expect(pushed.length).toBe(0); expect(taken.length).toBe(0)       // the router could not be asked: nothing taken, the hub keeps it
-  routerUp = true
-  await hub.kick('t2')
-  expect(pushed.length).toBe(1); expect(pushed[0].params.meta.msg_id).toBe('501')
-  expect(taken).toEqual([[501]])
-  await hub.kick('t3')
-  expect(pushed.length).toBe(1)                                       // counted once: never pushed again
-})
-
-test('C3 server.ts: hub push is the router with lanes on, the receipt check is off then, the doorbell is honoured in the lanes /inject branch, parked deliveries go back through the router', () => {
+test('C3 server.ts: the lanes /inject branch goes to the router (no hub doorbell since 1.52.0), parked deliveries go back through the router', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain('push: Lanes.LANES_ON ? laneHubPush : pushToReadySessions,')
-  expect(src).toContain('receiptCheck: () => !Lanes.LANES_ON && RECEIPT_CHECK && consumptionCheckAvailable()')
-  expect(src).toContain("const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'")
   // WO-141 phase 2: the fleet-path fallback stays on for everything but the mailbox's ring (mail-ring.test.ts)
-  expect(src).toContain("const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified, !ring) : null")
+  expect(src).toContain('const d = await laneDeliverMesh(notification, verdict.verified, !ring)')
   expect(src).toContain('if (!(await laneRedeliver(notif))) break')
-  // a hub row that reaches the router carries this daemon's own /inject verdict and lanes fields
-  expect(src).toContain("const notif = extra ? { ...n, params: { ...p, meta: { ...(p.meta ?? {}), ...extra } } } : n")
+  // WO-158: hub sync is gone (no 30 s sync, no doorbell); an older process's parked doorbells are handed on once at start
+  for (const gone of ['HubSync', 'hubSyncMode', 'laneHubPush', 'rememberHubMeta', 'hub.doorbell', "hub?.kick(", '/api/mesh/inbox/pending']) expect(src).not.toContain(gone)
+  expect(src).toContain('void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)')
   const doc = readFileSync(join(import.meta.dir, 'docs', 'state-journal.md'), 'utf8')
   expect(doc).toContain('## lanes-golive: who owns what on the fleet (one entrance into the main)')
 })

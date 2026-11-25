@@ -1,21 +1,24 @@
 // WO-151 3a / 3b (Relay part 3; Joey TG chiron:2362 「本地有一份但改以遠端的主要主機程式為主？也會握手同步？」): the agent-inbox daemon takes what is
-// sent to it from Onsen (fleet-core onsen5.py, 0.9.0), and a sender also writes what it sends there. Both paths stay on: today's push to /inject and
-// this one; the same message is delivered once, by whichever arrives first.
+// sent to it from Onsen (fleet-core onsen5.py, 0.9.0), and a sender also writes what it sends there. WO-158 (1.52.0; Joey TG chiron:2403): Onsen is the
+// only path a call takes (send_to_agent no longer pushes to the roster url); /inject stays for local senders and for BTCC's pushes until they stop, and
+// a message that still arrives both ways is delivered once, by whichever arrives first.
 //
 //   take (3a)   OnsenPuller holds GET /inbox?after=<last seq taken>&wait=25 (the `after` is the handshake: "I have up to N"). New items are first
 //               written to the local copy (pending), then handed, in seq order, to the daemon's own delivery (server.ts deliverInbound, the code /inject
 //               runs), then acked (POST /inbox/ack {upto}). A crash between take and hand-off hands the pending items on at the next start (once, not
 //               zero times). Onsen answering `reset` (a promoted standby that lost the last instant): continue from its `continue_after`.
-//   first start the pull's first start (no local copy of the pull yet) begins at Onsen's current count (GET /inbox with an `after` past any count →
-//               reset → continue_after): senders write to Onsen before every daemon pulls, and what is already there came through /inject.
+//   first start the pull's first start (no local copy of the pull yet) begins after Onsen's acked_seq for this agent (GET /inbox?after=0: the last seq a
+//               daemon of this agent acked; 0 for a new agent): what nobody acked yet is handed on (WO-158: with Onsen the only path, a call sent before
+//               the daemon's first poll is told 「queued」 and must arrive). An Onsen that gives no acked_seq: its count, as 1.51.0 did.
 //   local copy  <STATE_DIR>/onsen-inbox.json (OnsenInbox; atomic writes): last_seq taken, acked_seq, the items taken but not yet handed on, and a
 //               bounded list of the dedupe keys already delivered (5000, oldest dropped first, each with its time).
 //   dedupe      one key per message in both paths (dedupeKeyOf): the sender's explicit `dedupe`, else `msg:<msg_id>` when msg_id is an integer (Onsen's
 //               own rule). Whichever path delivers first records it; the other finds it and is dropped (counted). No key: cannot be matched, delivered.
-//   Onsen down  the loop backs off (2 s doubling to 60 s); the /inject path keeps working; Onsen keeps what is not acked. One base: ONSEN_BASE
+//   Onsen down  the loop backs off (2 s doubling to 60 s); Onsen keeps what is not acked (and /inject keeps working for local senders). One base: ONSEN_BASE
 //               (Chiron 11:05Z, Joey TG chiron:2407: no standby switching here).
-//   send (3b)   OnsenSender: POST /send after the caller's own push (its latency unchanged). Push delivered: not awaited. Push failed: awaited, and
-//               Onsen's `pulling` (0.9.1: the recipient's daemon polled in the last 90 s) makes it delivered; otherwise the failure stands.
+//   send (3b)   OnsenSender: POST /send, awaited; WO-158: the only write of a call (server.ts sendToAgent). Stored and `pulling` (0.9.1: the
+//               recipient's daemon polled in the last 90 s) = delivered; stored, not pulling = queued (it takes it when it polls again); not stored =
+//               failed (the reason in the outcome).
 // The credential is the daemon's mesh credential (the request functions come from onsen-client.ts); it is never logged here.
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
@@ -28,7 +31,9 @@ export type Req = (method: 'GET' | 'POST', path: string, body?: unknown, timeout
 
 /** one item of the caller's inbox, as GET /inbox gives it (onsen5.py _item). `dedupe`: the sender's key, when Onsen returns it */
 export type PullItem = { seq: number; sender: string; relay?: string | null; kind?: string; payload: Record<string, unknown>; at?: string; given?: number
-  dedupe?: string | null; dedupe_key?: string | null }
+  dedupe?: string | null; dedupe_key?: string | null
+  /** Onsen 0.9.4: a relay passed on a name it could not verify (a BTCC console release); the daemon delivers it as verified=false */
+  unverified?: boolean }
 
 /** A switch (ONSEN_PULL, ONSEN_SEND): a comma list of agent names or `*`; unset or empty = off */
 export function switchOn(value: string | undefined, agent: string): boolean {
@@ -42,6 +47,11 @@ export function dedupeKeyOf(dedupe: unknown, msgId: unknown): string | null {
   if (d) return d
   return typeof msgId === 'number' && Number.isInteger(msgId) ? `msg:${msgId}` : null
 }
+/** WO-158: a roster url that is BTCC's own mailbox inject (/api/mesh/mailbox/<name>/inject: a mailbox-type identity such as bt-app-codex, no daemon,
+ *  nothing takes from Onsen for it): send_to_agent keeps the push to it */
+export function isMailboxInject(url: unknown): boolean {
+  try { return /^\/api\/mesh\/mailbox\/[^/]+\/inject\/?$/.test(new URL(String(url ?? '')).pathname) } catch { return false }
+}
 /** a pulled item's key: Onsen's field (dedupe, or dedupe_key), else one in the payload, else msg:<msg_id> */
 export function itemKey(it: PullItem): string | null {
   return dedupeKeyOf(it.dedupe ?? it.dedupe_key ?? it.payload?.dedupe, it.payload?.msg_id)
@@ -49,7 +59,7 @@ export function itemKey(it: PullItem): string | null {
 
 // ------------------------------------------------------------------ the local copy
 export type InboxFile = { v: 1; last_seq: number; acked_seq: number; pending: PullItem[]; keys: Array<[string, number]>; saved_at?: string
-  /** false: the file holds only /inject's keys (the pull never started): the pull's first start still takes Onsen's count */
+  /** false: the file holds only /inject's keys (the pull never started): the pull's first start still asks Onsen where to begin */
   based?: boolean }
 export const MAX_KEYS = 5000
 
@@ -57,7 +67,7 @@ export class OnsenInbox {
   lastSeq = 0
   ackedSeq = 0
   pending: PullItem[] = []
-  /** the pull has a starting point (its baseline or a local copy of its own); false at the pull's first start: it starts at Onsen's count (OnsenPuller.baseline) */
+  /** the pull has a starting point (its baseline or a local copy of its own); false at the pull's first start: it asks Onsen (OnsenPuller.baseline) */
   based = false
   private keys = new Map<string, number>()       // delivered key → ms; insertion order = age (a re-record moves it to the end)
   private claimed = new Set<string>()            // a delivery of this key is in progress (either path)
@@ -149,7 +159,7 @@ export class OnsenInbox {
     this.ackedSeq = Math.min(this.ackedSeq, this.lastSeq)
     this.save()
   }
-  /** the pull's first start: begin after Onsen's current count (what is there was sent while the pull was off and came through /inject) */
+  /** the pull's first start: begin after `seq` (Onsen's acked_seq for this agent; OnsenPuller.baseline) */
   baseline(seq: number): void {
     this.lastSeq = Math.max(0, seq)
     this.ackedSeq = Math.min(this.ackedSeq, this.lastSeq)
@@ -234,19 +244,29 @@ export class OnsenPuller {
     await this.ack()
   }
 
-  /** The pull's first start (no local copy of the pull yet): senders write to Onsen before every daemon pulls, so the inbox may hold items that already
-   *  came through /inject. Ask with an `after` past any count: Onsen answers reset with its count (continue_after); start after it. Nothing is acked:
-   *  the earlier items stay in Onsen as they were. */
+  /** The pull's first start (no local copy of the pull yet: a new agent, or a lost state file). WO-158: begin after Onsen's acked_seq for this agent
+   *  (GET /inbox?after=0 answers it with last_seq): what no daemon of this agent acked is handed on, so a call sent before the first poll (told
+   *  「queued」) arrives; one a daemon acked is not given again. A key /inject delivered meanwhile is still dropped by the dedupe. An Onsen that gives no
+   *  acked_seq: ask with an `after` past any count, Onsen answers reset with its count (continue_after), start after it (1.51.0). Nothing is acked here. */
   async baseline(): Promise<void> {
-    const r = await this.o.req('GET', `/inbox?after=${BASELINE_AFTER}&wait=0&limit=1&host=${encodeURIComponent(this.o.host)}`, undefined, 15_000)
+    const host = encodeURIComponent(this.o.host)
+    const r = await this.o.req('GET', `/inbox?after=0&wait=0&limit=1&host=${host}`, undefined, 15_000)
     if (!r) throw new NoCredential()
     if (r.status !== 200) throw new Error(`GET /inbox (first start): HTTP ${r.status}`)
-    const n = r.json?.reset === true && Number.isInteger(r.json?.continue_after) ? r.json.continue_after
-      : Number.isInteger(r.json?.last_seq) ? r.json.last_seq : null
-    if (n == null) throw new Error('GET /inbox (first start): no count in the answer')
+    const last = Number.isInteger(r.json?.last_seq) ? r.json.last_seq as number : null
+    let n: number | null = Number.isInteger(r.json?.acked_seq) ? Math.min(r.json.acked_seq, last ?? r.json.acked_seq) : null
+    if (n == null) {
+      const c = await this.o.req('GET', `/inbox?after=${BASELINE_AFTER}&wait=0&limit=1&host=${host}`, undefined, 15_000)
+      if (!c) throw new NoCredential()
+      if (c.status !== 200) throw new Error(`GET /inbox (first start): HTTP ${c.status}`)
+      n = c.json?.reset === true && Number.isInteger(c.json?.continue_after) ? c.json.continue_after : Number.isInteger(c.json?.last_seq) ? c.json.last_seq : null
+      if (n == null) throw new Error('GET /inbox (first start): no count in the answer')
+      this.o.log('info', `onsen inbox: first start of the pull: Onsen gives no acked_seq; starting at its count ${n}, earlier items skipped`)
+    } else {
+      this.o.log('info', `onsen inbox: first start of the pull: starting after seq ${n} (the last acked in Onsen); ${last != null ? Math.max(0, last - n) : '?'} item(s) not acked yet are handed on`)
+    }
     this.o.inbox.baseline(n)
     this.stats.baseline = n
-    this.o.log('info', `onsen inbox: first start of the pull: starting at seq ${n}, earlier items skipped (they were sent while the pull was off and came through /inject)`)
   }
 
   private async loop(): Promise<void> {
@@ -258,7 +278,7 @@ export class OnsenPuller {
       } catch (e) {
         if (!this.running) break
         if (e instanceof NoCredential) {
-          if (this.now() - this.credWarnAt > 3600_000) { this.credWarnAt = this.now(); this.o.log('warn', 'onsen inbox: no mesh credential; not taking from Onsen (the /inject path is unchanged)') }
+          if (this.now() - this.credWarnAt > 3600_000) { this.credWarnAt = this.now(); this.o.log('warn', 'onsen inbox: no mesh credential; not taking from Onsen (only /inject delivers)') }
           await this.sleep(this.o.noCredentialRetryMs ?? 60_000)
           continue
         }
@@ -268,7 +288,7 @@ export class OnsenPuller {
         this.backoffMs = this.backoffMs ? Math.min(this.backoffMs * 2, max) : min
         if (this.now() - this.warnAt > 300_000 || this.backoffMs === min) {
           this.warnAt = this.now()
-          this.o.log('warn', `onsen inbox: ${this.stats.last_error}; retrying in ${Math.round(this.backoffMs / 1000)} s (the /inject path is unchanged; Onsen keeps what is not acked)`)
+          this.o.log('warn', `onsen inbox: ${this.stats.last_error}; retrying in ${Math.round(this.backoffMs / 1000)} s (Onsen keeps what is not acked)`)
         }
         await this.sleep(this.backoffMs)
       }
@@ -289,13 +309,15 @@ export type SendKind = 'peer_call' | 'peer_mail'
 /** the sender's facts in their own fields (Onsen 0.9.3, Chiron WO-151 11:15Z); the text stays as the agent reads it */
 export type SendFacts = { refs?: { btcc_msg_id?: number; thread?: string; op?: string }; no_reply?: boolean }
 
-export type SendOutcome = { stored: boolean; duplicate: boolean; pulling: boolean }
+/** error: why it was not stored (only when stored is false) */
+export type SendOutcome = { stored: boolean; duplicate: boolean; pulling: boolean; error?: string }
 export class OnsenSender {
-  readonly stats = { sent: 0, duplicate: 0, failed: 0, delivered_by_onsen: 0, last_error: null as string | null }
+  /** sent: stored (new or already there); not_pulling: stored while the recipient's daemon was not polling (queued); failed: not stored */
+  readonly stats = { sent: 0, duplicate: 0, not_pulling: 0, failed: 0, last_error: null as string | null }
   private warnAt = 0
   constructor(readonly o: { req: Req; log: Log; now?: () => number }) {}
   /** POST /send; never throws. stored: Onsen has it (new or already had it); pulling (Onsen 0.9.1): the recipient's daemon asked for its inbox in the
-   *  last 90 s, so it will take it */
+   *  last 90 s, so it will take it; not pulling: it takes it when it polls again */
   async send(to: string, kind: SendKind, payload: Record<string, unknown>, dedupe: string | null, facts: SendFacts = {}): Promise<SendOutcome> {
     try {
       const refs = facts.refs && Object.keys(facts.refs).length ? facts.refs : undefined
@@ -304,52 +326,18 @@ export class OnsenSender {
       const res = r?.status === 200 && Array.isArray(r.json?.results) ? r.json.results : null
       if (res) {
         this.stats.sent++
-        const duplicate = res[0]?.duplicate === true
+        const duplicate = res[0]?.duplicate === true, pulling = res[0]?.pulling === true
         if (duplicate) this.stats.duplicate++
-        return { stored: true, duplicate, pulling: res[0]?.pulling === true }
+        if (!pulling) this.stats.not_pulling++
+        return { stored: true, duplicate, pulling }
       }
       throw new Error(r ? `HTTP ${r.status}${r.json?.detail ? ` ${String(r.json.detail).slice(0, 120)}` : ''}` : 'no mesh credential')
     } catch (e) {
       this.stats.failed++
       this.stats.last_error = `${e instanceof Error ? e.message : e}`.slice(0, 200)
       const now = this.o.now ? this.o.now() : Date.now()
-      if (now - this.warnAt > 300_000) { this.warnAt = now; this.o.log('warn', `onsen send: ${kind} to ${to} not written to Onsen (${this.stats.last_error}); today's path carried it as before`) }
-      return { stored: false, duplicate: false, pulling: false }
+      if (now - this.warnAt > 300_000) { this.warnAt = now; this.o.log('warn', `onsen send: ${kind} to ${to} not written to Onsen (${this.stats.last_error})`) }
+      return { stored: false, duplicate: false, pulling: false, error: this.stats.last_error ?? 'not stored' }
     }
   }
-}
-
-// ------------------------------------------------------------------ the pushed mail's text (BTCC store_or_push + the receiver's /deliver filter)
-/** Python's str.isprintable() for one code point: not Other (Cc, Cf, Cs, Co, Cn) or Separator (Zl, Zp, Zs), the ASCII space excepted */
-const NON_PRINTABLE = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u
-/** the text a push through the oncall receiver's /deliver reaches /inject with: printable characters and newlines, cut at 3500 code points (receiver.py) */
-export function receiverText(text: string): string {
-  const out: string[] = []
-  for (const ch of String(text ?? '')) {
-    if (ch === '\n' || ch === ' ' || !NON_PRINTABLE.test(ch)) out.push(ch)
-    if (out.length >= 3500) break
-  }
-  return out.join('')
-}
-/** BTCC mail.py _hm: "%m-%d %H:%MZ" in UTC, "—" without a time */
-export function hmUtc(iso: unknown): string {
-  if (iso == null || iso === '') return '—'
-  const d = new Date(String(iso))
-  if (Number.isNaN(d.getTime())) return '—'
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}Z`
-}
-/** The text BTCC pushes for a mail whose recipient's mailbox is off (mail.py store_or_push), from the mail as GET /api/mesh/mail/<id> returns it to its
- *  sender: a new mail 【信】…（期限 …。#id）, a reply 【回信】…（<from> 回你寄的信 #<original>；不用回）, the ask as 「要你：…」 right under the first line. */
-export function pushedMailText(m: { id: number; from: string; title?: string | null; ask?: string | null; body?: string | null; deadline?: string | null
-  no_reply?: boolean | null; reply_to_id?: number | null }, reply: boolean): string {
-  const title = m.title ?? '', body = m.body ?? ''
-  let text = reply
-    ? `【回信】${title}\n${body}\n（${m.from} 回你寄的信 #${m.reply_to_id}；不用回）`
-    : `【信】${title}\n${body}\n（期限 ${hmUtc(m.deadline)}${m.no_reply ? '；不用回' : ''}。#${m.id}）`
-  if (m.ask) {
-    const i = text.indexOf('\n')
-    text = i < 0 ? `${text}\n要你：${m.ask}` : `${text.slice(0, i)}\n要你：${m.ask}\n${text.slice(i + 1)}`
-  }
-  return receiverText(text)
 }

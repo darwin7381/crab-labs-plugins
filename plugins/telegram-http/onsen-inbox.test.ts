@@ -1,10 +1,10 @@
 // WO-151 3a / 3b units (onsen-inbox.ts): the dedupe key, the local copy (persistence, crash replay, bounded keys), the pull against an in-process
-// stand-in Onsen (first start at Onsen's count, reset, down then up counted by events), the sender's outcome, and the pushed mail's text.
+// stand-in Onsen (first start after Onsen's acked_seq (WO-158), reset, down then up counted by events), the sender's outcome, the mailbox-type url.
 import { test, expect, describe } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, statSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, itemKey, pushedMailText, receiverText, hmUtc, switchOn, BASELINE_AFTER, type PullItem, type Req, type HandResult } from './onsen-inbox.ts'
+import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, isMailboxInject, itemKey, switchOn, BASELINE_AFTER, type PullItem, type Req, type HandResult } from './onsen-inbox.ts'
 
 const dir = () => mkdtempSync(join(tmpdir(), 'onsen-inbox-'))
 const quiet = () => {}
@@ -89,7 +89,7 @@ describe('the local copy', () => {
 })
 
 // ------------------------------------------------------------------ a stand-in Onsen in this process (onsen5.py's contract) and the pull against it
-function standIn() {
+function standIn(o: { noAckedSeq?: boolean } = {}) {
   const items: PullItem[] = []
   let last = 0, acked = 0, down = false, polls = 0
   const keys = new Map<string, number>()
@@ -101,7 +101,7 @@ function standIn() {
       polls++
       const after = Number(u.searchParams.get('after'))
       if (after > last) return { status: 200, json: { items: [], reset: true, continue_after: last, last_seq: last } }
-      return { status: 200, json: { items: items.filter(i => i.seq > after).slice(0, Number(u.searchParams.get('limit') ?? 100)).map(i => ({ ...i })), last_seq: last, acked_seq: acked } }
+      return { status: 200, json: { items: items.filter(i => i.seq > after).slice(0, Number(u.searchParams.get('limit') ?? 100)).map(i => ({ ...i })), last_seq: last, ...(o.noAckedSeq ? {} : { acked_seq: acked }) } }
     }
     if (m === 'POST' && u.pathname === '/inbox/ack') { acked = Math.max(acked, Math.min((body as any).upto, last)); return { status: 200, json: { acked: 1 } } }
     return { status: 404, json: {} }
@@ -122,19 +122,40 @@ function puller(on: ReturnType<typeof standIn>, b: OnsenInbox, got: string[], de
 }
 
 describe('the pull', () => {
-  test('first start (no local copy): starts at Onsen\'s count; the 3 old items are not delivered; a 4th sent after is delivered once', async () => {
+  test('first start (no local copy, WO-158): starts after Onsen\'s acked_seq; a new agent (nothing acked) gets the 3 items sent before its first poll, then a 4th once', async () => {
+    const on = standIn(), got: string[] = [], logs: string[] = []
+    for (const t of ['old-1', 'old-2', 'old-3']) on.put(t)
+    const b = new OnsenInbox({ file: join(dir(), 'i.json') })
+    const p = new OnsenPuller({ req: on.req, base: 'test', inbox: b, log: (_l, m) => logs.push(m), host: 'h', waitS: 0, minBackoffMs: 5, maxBackoffMs: 20,
+      deliver: async it => { got.push(String(it.payload.text)); return 'delivered' } })
+    await p.once()                                        // the baseline: GET after=0 → acked_seq 0
+    expect([b.lastSeq, b.based, p.stats.baseline]).toEqual([0, true, 0])
+    expect(logs.join('\n')).toContain('starting after seq 0 (the last acked in Onsen); 3 item(s) not acked yet are handed on')
+    await p.once()
+    expect(got).toEqual(['old-1', 'old-2', 'old-3'])
+    on.put('new-4')
+    await p.once(); await p.once()
+    expect(got).toEqual(['old-1', 'old-2', 'old-3', 'new-4'])
+    expect(on.acked).toBe(4)
+  })
+  test('first start after a lost state file: what a daemon of this agent acked is not given again; what it did not ack is', async () => {
     const on = standIn(), got: string[] = []
+    for (const t of ['a', 'b', 'c']) on.put(t)
+    await on.req('POST', '/inbox/ack', { upto: 2 })      // the previous daemon took and acked a and b, then its state file was lost
+    const b = new OnsenInbox({ file: join(dir(), 'i.json') })
+    const p = puller(on, b, got)
+    await p.once(); await p.once()
+    expect([p.stats.baseline, got]).toEqual([2, ['c']])
+  })
+  test('first start against an Onsen that gives no acked_seq: its count, the earlier items skipped (1.51.0)', async () => {
+    const on = standIn({ noAckedSeq: true }), got: string[] = []
     for (const t of ['old-1', 'old-2', 'old-3']) on.put(t)
     const b = new OnsenInbox({ file: join(dir(), 'i.json') })
     const p = puller(on, b, got)
-    await p.once()                                        // the baseline: after past any count → reset → continue_after 3
+    await p.once()                                        // after past any count → reset → continue_after 3
     expect([b.lastSeq, b.based, p.stats.baseline]).toEqual([3, true, 3])
     await p.once()
     expect(got).toEqual([])
-    on.put('new-4')
-    await p.once(); await p.once()
-    expect(got).toEqual(['new-4'])
-    expect(on.acked).toBe(4)
     expect(BASELINE_AFTER).toBeLessThan(2 ** 63)
   })
   test('in seq order, acked after the hand-off; an item given again is not taken twice', async () => {
@@ -210,7 +231,7 @@ describe('the pull', () => {
 })
 
 describe('the sender', () => {
-  test('stored / duplicate / pulling from Onsen\'s answer; a failure never throws', async () => {
+  test('stored / duplicate / pulling from Onsen\'s answer; a failure never throws and says why', async () => {
     const sent: any[] = []
     let answer: any = { status: 200, json: { results: [{ to: 'eve', seq: 4, duplicate: false, pulling: true }] } }
     const s = new OnsenSender({ req: async (_m, _p, b) => { sent.push(b); if (answer instanceof Error) throw answer; return answer }, log: quiet })
@@ -218,27 +239,27 @@ describe('the sender', () => {
     expect(sent[0]).toEqual({ to: 'eve', kind: 'peer_call', payload: { text: 'hi' }, dedupe: 'msg:9', refs: { btcc_msg_id: 9 }, no_reply: true })
     answer = { status: 200, json: { results: [{ to: 'eve', seq: 4, duplicate: true, pulling: false }] } }
     expect(await s.send('eve', 'peer_call', { text: 'hi' }, 'msg:9')).toEqual({ stored: true, duplicate: true, pulling: false })
+    answer = { status: 200, json: { results: [{ to: 'eve', seq: 5, duplicate: false, pulling: false }] } }
+    expect(await s.send('eve', 'peer_call', { text: 'later' }, 'msg:10')).toEqual({ stored: true, duplicate: false, pulling: false })
     answer = new Error('down')
-    expect(await s.send('eve', 'peer_call', { text: 'hi' }, null)).toEqual({ stored: false, duplicate: false, pulling: false })
+    expect(await s.send('eve', 'peer_call', { text: 'hi' }, null)).toEqual({ stored: false, duplicate: false, pulling: false, error: 'down' })
     answer = { status: 400, json: { detail: 'payload.text is required' } }
-    expect((await s.send('eve', 'peer_call', {}, null)).stored).toBe(false)
-    expect(s.stats).toMatchObject({ sent: 2, duplicate: 1, failed: 2 })
+    expect(await s.send('eve', 'peer_call', {}, null)).toEqual({ stored: false, duplicate: false, pulling: false, error: 'HTTP 400 payload.text is required' })
+    const none = new OnsenSender({ req: async () => null, log: quiet })
+    expect((await none.send('eve', 'peer_call', { text: 'x' }, null)).error).toBe('no mesh credential')
+    expect(s.stats).toMatchObject({ sent: 3, duplicate: 1, not_pulling: 2, failed: 2 })
   })
 })
 
-describe('the pushed mail\'s text (BTCC store_or_push, then the receiver\'s /deliver filter)', () => {
-  test('a new mail: 【信】title, 要你 under the first line, body, deadline and id', () => {
-    expect(pushedMailText({ id: 7001, from: 'adam', title: '備份', ask: '今天內確認', body: '第一行\n第二行', deadline: '2026-11-26T03:04:59.123456+00:00', no_reply: false }, false))
-      .toBe('【信】備份\n要你：今天內確認\n第一行\n第二行\n（期限 11-26 03:04Z。#7001）')
-    expect(pushedMailText({ id: 7002, from: 'adam', title: 't', ask: null, body: 'b', deadline: null, no_reply: true }, false)).toBe('【信】t\nb\n（期限 —；不用回。#7002）')
-  })
-  test('a reply: 【回信】… (<from> 回你寄的信 #<original>；不用回)', () => {
-    expect(pushedMailText({ id: 7003, from: 'adam', title: '回覆：備份', ask: 'x', body: '好', deadline: '2026-11-26T00:00:00+00:00', no_reply: true, reply_to_id: 7001 }, true))
-      .toBe('【回信】回覆：備份\n要你：x\n好\n（adam 回你寄的信 #7001；不用回）')
-  })
-  test('the receiver keeps printable characters and newlines (Python isprintable), 3500 code points', () => {
-    expect(receiverText('a\tb​c d　e\r\nf')).toBe('abc de\nf')   // Python gives 'abc de\nf'
-    expect(receiverText('😀'.repeat(4000))).toBe('😀'.repeat(3500))
-    expect(hmUtc('2026-01-02T23:59:00+08:00')).toBe('01-02 15:59Z')
+describe('the roster url of a mailbox-type identity (WO-158)', () => {
+  test('BTCC\'s /api/mesh/mailbox/<name>/inject only', () => {
+    expect(isMailboxInject('https://btcc.blocktempo.ai/api/mesh/mailbox/bt-app-codex/inject')).toBe(true)
+    expect(isMailboxInject('https://btcc.blocktempo.ai/api/mesh/mailbox/bt-app-codex/inject/')).toBe(true)
+    expect(isMailboxInject('http://127.0.0.1:17696/inject')).toBe(false)
+    expect(isMailboxInject('https://steropes-inbox.fud.city/relay/atlas')).toBe(false)
+    expect(isMailboxInject('https://inbox.mbp.fud.city/inject')).toBe(false)
+    expect(isMailboxInject('https://x/api/mesh/mailbox/a/b/inject')).toBe(false)
+    expect(isMailboxInject('not a url')).toBe(false)
+    expect(isMailboxInject(undefined)).toBe(false)
   })
 })

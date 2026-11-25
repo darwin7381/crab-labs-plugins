@@ -3,8 +3,8 @@
 //
 // The state is decided by ONE program, ~/Development/Joey-Crablabs-Skills/tools/harness/usage_wall.py (its docstring is
 // the contract), which writes ~/.claude/usage-wall/<tmux key>.json. This module only READS it, for the two daemons:
-//   - hold: while walled nothing is written into the session; deliveries park in inbox/pending (server.ts) and hub rows
-//     stay untaken at the hub (hub-sync.ts); after the clear the existing drain delivers each one once, in order;
+//   - hold: while walled nothing is written into the session; deliveries park in inbox/pending (server.ts); after the
+//     clear the existing drain delivers each one once, in order;
 //   - the held count: <key>.held-<role>.json (role tg | inbox), written from the first wall this daemon sees and never
 //     removed (the Mac mini watchdog reads its existence: this daemon redelivers what a wall ate);
 //   - system-alert (tg daemon): exactly two pushes per episode, enter and clear (WallAlerts below).
@@ -159,7 +159,7 @@ export type HeldFile = {
   redelivers: boolean
   role: HeldRole
   episode: string | null
-  /** Items this daemon holds right now (parked deliveries + hub rows not pushed). 0 after the drain. */
+  /** Items this daemon holds right now (parked deliveries). 0 after the drain. */
   count: number
   oldest: string | null
   /** The count at the moment this daemon saw the clear, before anything drained (what the clear alert reports). */

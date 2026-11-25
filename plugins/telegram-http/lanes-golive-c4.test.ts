@@ -87,12 +87,11 @@ test('keepwarm-local: with the main\'s transcript named it judges the main, not 
   expect(POKE_TEXT).toContain('[保溫]')
 })
 
-test('server.ts: with lanes on the consumption check, the receipt lines, hub sync\'s seen lines and keepwarm-local read the main\'s transcript', () => {
+test('server.ts: with lanes on the consumption check, the receipt lines and keepwarm-local read the main\'s transcript', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   expect(src).toContain('if (Lanes.LANES_ON) { const f = Lanes.mainTranscriptFile(TRANSCRIPT_DIR); return f ? genuineAssistantAtFile(f) : 0 }')
   expect(src).toContain('if (Lanes.LANES_ON) { const f = Lanes.mainTranscriptFile(TRANSCRIPT_DIR); return f ? receiptLinesIn([f]) : [] }')
   expect(src).toContain('const lines = unseen.length ? receiptLines(Math.min(...unseen.map(d => d.at))) : []')
-  expect(src).toContain('seenLines: since => consumptionCheckAvailable() ? receiptLines(since) : [],')
   expect(src).toContain("...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile(")
   if (prev.LANES_DIR) process.env.LANES_DIR = prev.LANES_DIR
   if (prev.CLAUDE_CONFIG_DIR) process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR

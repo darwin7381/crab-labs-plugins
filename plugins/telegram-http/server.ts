@@ -13,7 +13,7 @@
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
-import { HubSync, drainLeftoverDoorbells, hubSyncMode } from './hub-sync.ts'
+import { drainLeftoverDoorbells } from './hub-sync.ts'
 import { callInboxTool, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { MailEvents, decisionEvent, WITHIN_S as MAIL_DUE_WITHIN_S } from './mail-events.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
@@ -75,7 +75,7 @@ import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, d
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
-import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, itemKey, pushedMailText, switchOn, type HandResult, type PullItem } from './onsen-inbox.ts'
+import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, isMailboxInject, itemKey, switchOn, type HandResult, type PullItem } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
@@ -1066,15 +1066,14 @@ const RECEIPT_GRACE_MS = Number(process.env.RECEIPT_GRACE_MS ?? 90_000)
 // then nothing would ever read as received and every delivery would be re-sent up to MAX_REDELIVERIES times.
 const RECEIPT_CHECK = process.env.RECEIPT_CHECK !== '0'
 
-// Hub sync (1.33.0, mailbox spec v3; hub-sync.ts): messages that have a hub row with a payload are pulled from BTCC
-// and pushed from there; the old path below reports the hub ids it delivered as taken. Set further down, once
-// meshAuth and the session registry exist; null = off (HUB_SYNC=0, not agent-inbox, no BTCC_API_BASE) = 1.32.2.
-let hub: HubSync | null = null
+// Hub sync (1.33.0–1.51.0: every 30 s the agent-inbox daemon asked BTCC for its untaken rows and pushed them) was removed in 1.52.0 (WO-158): every
+// BTCC sender that stored such a row also writes the recipient's Onsen inbox, which this daemon takes from (ONSEN_PULL). A doorbell an older process
+// parked in hub-doorbell/ is handed to the delivery once at start (startListen, drainLeftoverDoorbells).
 
 // ---- WO-120: usage wall (usage-wall.ts) --------------------------------------------------------------------------
 // One state per agent, decided by usage_wall.py (~/.claude/usage-wall/<tmux key>.json). While it says walled, nothing is
-// written into the session: deliveries park in inbox/pending (no re-delivery attempt counted, never quarantined), hub
-// rows stay untaken at the hub, and a delivery the wall ate before the state flipped is re-persisted once (sweep). At
+// written into the session: deliveries park in inbox/pending (no re-delivery attempt counted, never quarantined), and a
+// delivery the wall ate before the state flipped is re-persisted once (sweep). At
 // the clear the drain delivers every held item once, in order. No fresh state (keeper dead, OFF, USAGE_WALL_READ=0)
 // → state() is null → everything below behaves exactly as before. Roamers route per target: never matched.
 const wallReader = new WallReader(isRoamerEnabled() ? {} : {
@@ -1083,7 +1082,7 @@ const wallReader = new WallReader(isRoamerEnabled() ? {} : {
   transcriptDirs: [TRANSCRIPT_DIR, process.env.CHANNEL_BOT_PROJECTS_DIR, process.env.KEEPWARM_PROJECTS_DIR]
     .map(d => (d ?? '').trim()).filter(Boolean),
 }, { onChange: (prev, next) => onWallChange(prev, next) })
-/** What this daemon holds now: parked deliveries + hub rows a wall kept from being pushed. */
+/** What this daemon holds now: parked deliveries (lanes on, Telegram daemon: also what M1 holds for the main). */
 function heldNow(): { count: number; oldestMs: number | null } {
   let count = 0
   let oldestMs: number | null = null
@@ -1094,11 +1093,6 @@ function heldNow(): { count: number; oldestMs: number | null } {
       try { const m = statSync(join(PENDING_DIR, f)).mtimeMs; if (oldestMs == null || m < oldestMs) oldestMs = m } catch {}
     }
   } catch {}
-  const h = hub?.withheld()
-  if (h?.count) {
-    count += h.count
-    if (h.oldestMs != null && (oldestMs == null || h.oldestMs < oldestMs)) oldestMs = h.oldestMs
-  }
   if (Lanes.LANES_ON && !INBOX_ONLY) count += Lanes.mainHeldCount()   // lanes on: what M1 holds for the main (the one entrance)
   return { count, oldestMs }
 }
@@ -1164,7 +1158,7 @@ function onWallChange(prev: WallState | null, next: WallState | null): void {
   wallHeldKeys = new Set()
   heldSidecar.update(next, true)            // the clear: what is held, snapshotted before anything drains
   log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh (as before WO-120)'} — delivering the held items once each, in order`)
-  setImmediate(() => { sweepDeliveries(); void drainPendingIfLive(); void hub?.kick('wall-cleared') })
+  setImmediate(() => { sweepDeliveries(); void drainPendingIfLive() })
 }
 setInterval(() => heldSidecar.update(wallReader.state()), Math.max(250, wallReader.cacheMs())).unref()
 
@@ -1190,8 +1184,7 @@ function recordDelivery(notif: { method: string; params: unknown }): void {
   // Onsen step 3 (WO-143), lanes off: the channel notification was written into a session's open stream: Joey's message is seen by the main (lanes on, M1
   // says it: the lanes journal tap). Recorded only; a re-delivery is the same fact.
   if (onsenFacts && !Lanes.LANES_ON) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.seen(j.chat, j.id, 'main') } catch {} }
-  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(fleetRunId(notif)); hub?.oldPathSeen(notif); return }
-  if (!RECEIPT_CHECK) hub?.oldPathSeen(notif)  // receipt off: pushed = seen (the 1.32.1 rule)
+  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(fleetRunId(notif)); return }
   if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
   recentDeliveries.push({ notif, at: Date.now(), pendingPath: null, keys: RECEIPT_CHECK ? receiptKeys(notif) : null, received: false })
   if (recentDeliveries.length > 200) recentDeliveries.shift()
@@ -1246,7 +1239,7 @@ function sweepDeliveries(): void {
   // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
   const unseen = recentDeliveries.filter(d => d.keys && !d.received)
   const lines = unseen.length ? receiptLines(Math.min(...unseen.map(d => d.at))) : []
-  for (const d of unseen) if (receivedIn(lines, d.keys!)) { d.received = true; hub?.oldPathSeen(d.notif) }
+  for (const d of unseen) if (receivedIn(lines, d.keys!)) d.received = true
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
     const notReceived = !!d.keys && !d.received
@@ -1563,56 +1556,10 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
   } catch {}
 }
 
-// Hub sync wiring (1.33.0; the logic is in hub-sync.ts). Pushes go only into READY sessions (READY_DELAY_MS), never
-// through recordDelivery: the hub path tracks its own receipt (` msg_id="<id>"`) and cap, so the old path's
-// re-persist/replay never doubles a hub row. Agent-inbox daemons only (hubSyncMode). Started from startListen().
-const HUB_PUSH_TIMEOUT_MS = 5000
-async function pushToReadySessions(notif: { method: string; params: unknown }): Promise<number> {
-  let n = 0
-  for (const server of [...activeServers]) {
-    const sid = serverSessionId.get(server)
-    if (!sid || !sseReady(sid)) continue
-    let timer: ReturnType<typeof setTimeout> | undefined
-    try {
-      await Promise.race([
-        server.notification(notif as Parameters<Server['notification']>[0]),
-        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timed out')), HUB_PUSH_TIMEOUT_MS) }),
-      ])
-      n++
-    } catch (err) {
-      log('error', `hub push into session ${sid} failed: ${err}`)
-      if (!(err instanceof Error && err.message === 'timed out')) activeServers.delete(server)  // as broadcastNotification
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-  return n
-}
-const hubMode = hubSyncMode(process.env, INBOX_ONLY, BTCC_API_BASE)
-if (hubMode.on) {
-  hub = new HubSync({
-    base: BTCC_API_BASE,
-    auth: meshAuth,
-    // lanes-golive (C3): with lanes on the hub's rows go to the router (the one entrance into the main), never straight into a session; a row the
-    // router could not be asked about stays at the hub (0 = nobody took it) for the next sync
-    push: Lanes.LANES_ON ? laneHubPush : pushToReadySessions,
-    seenLines: since => consumptionCheckAvailable() ? receiptLines(since) : [],
-    dispatchOld: (chatId, notif) => dispatchInbound(chatId, notif),
-    defaultChatId: () => String(loadAccess().allowFrom[0] ?? 'local-inject'),
-    log,
-    // WO-120: nothing is pushed into a walled session, and a push the wall ate is pushed once more after the clear. Lanes off only: with lanes on
-    // the push is laneHubPush (the router, the one entrance; M1 holds for the main's wall) and receipts are off, so neither applies there.
-    hold: () => !Lanes.LANES_ON && wallReader.walled(),
-    ate: at => !Lanes.LANES_ON && wallAte(wallReader.state(), at, newestGenuineAssistantAt()),
-  // lanes-golive (C3): with lanes on, taken = the router accepted the row (it is on the lanes journal; M1 owns its delivery to the main), so no
-  // transcript receipt is waited for: one count per delivery
-  }, { stateDir: STATE_DIR, receiptCheck: () => !Lanes.LANES_ON && RECEIPT_CHECK && consumptionCheckAvailable(), graceMs: RECEIPT_GRACE_MS,
-    maxPushes: MAX_REDELIVERIES })
-}
-
 // WO-151 3a / 3b (Relay part 3, onsen-inbox.ts): this agent-inbox daemon takes what is sent to it from Onsen (ONSEN_PULL) and writes its calls there
-// too (ONSEN_SEND). Each switch: a comma list of agent names or `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default
-// https://core.kbro.ai/api/onsen); the credential is this daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
+// (ONSEN_SEND; WO-158, 1.52.0: only there, no push to the roster url; off = the push, the stop switch). Each switch: a comma list of agent names or
+// `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen); the credential is this
+// daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
 // recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
@@ -1629,7 +1576,9 @@ const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox 
 const onsenSender: OnsenSender | null = ONSEN_SEND_ON && onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
 if (INBOX_ONLY) log('info', `onsen inbox: pull ${onsenPuller ? 'on' : 'off'}, send ${onsenSender ? 'on' : 'off'}${onsenReq ? ` (${ONSEN_INBOX_BASE})` : ''}; ${onsenInbox?.keyCount ?? 0} delivered key(s), last_seq ${onsenInbox?.lastSeq ?? 0}, ${onsenInbox?.pending.length ?? 0} pending`)
 
-function loadInboxRegistry(): Record<string, { url: string; desc?: string }> {
+/** The roster (agent-registry-sync's copy of agent-registry.json). WO-158: with ONSEN_SEND on only the names are needed (send_to_agent's name check,
+ *  the lanes' peer list); `url` is read only for a mailbox-type identity (BTCC's mailbox inject) and, with ONSEN_SEND off, for the push. */
+function loadInboxRegistry(): Record<string, { url?: string; desc?: string }> {
   try { return JSON.parse(readFileSync(INBOX_REGISTRY_PATH, 'utf8')) } catch { return {} }
 }
 
@@ -1678,30 +1627,9 @@ async function btccMail(method: 'GET' | 'POST', path: string, body?: unknown): P
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(10000),
   })
-  const out = { status: r.status, json: await r.json().catch(() => ({})) }
-  // WO-151 3b (ONSEN_SEND): a mail BTCC pushed straight into the recipient's session (its mailbox is off: stored false) also goes into the recipient's
-  // Onsen inbox (key msg:<id>, the text BTCC pushed); a stored mail stays in BTCC's mailbox only
-  if (onsenSender && method === 'POST' && out.status === 200 && out.json?.stored === false && typeof out.json?.id === 'number') {
-    const reply = /^\/api\/mesh\/mail\/\d+\/reply$/.test(path)
-    if (reply || path === '/api/mesh/mail/send') void mirrorPushedMail(out.json.id, reply)
-  }
-  return out
-}
-/** WO-151 3b: the Onsen copy of a pushed mail: the mail as BTCC keeps it (GET by its sender: nothing is marked read), its text as BTCC pushed it
- *  (pushedMailText), the fields the receiver's /deliver gives /inject (msg_id, logged, line mail, reply_to_id, no_reply) */
-async function mirrorPushedMail(id: number, reply: boolean): Promise<void> {
-  try {
-    const m = await btccMail('GET', `/api/mesh/mail/${id}`)
-    const j = m.json
-    if (m.status !== 200 || typeof j?.to !== 'string') throw new Error(`GET mail #${id}: HTTP ${m.status}`)
-    const text = pushedMailText({ id, from: String(j.from ?? INBOX_SELF), title: j.title, ask: j.ask, body: j.body, deadline: j.deadline, no_reply: j.no_reply,
-      reply_to_id: j.reply_to_id }, reply)
-    await onsenSender!.send(String(j.to), 'peer_mail', { text, msg_id: id, logged: true, line: 'mail',
-      ...(j.reply_to_id != null ? { reply_to_id: j.reply_to_id } : {}), ...(j.no_reply === true ? { no_reply: true } : {}) }, `msg:${id}`,
-      { refs: { btcc_msg_id: id }, no_reply: j.no_reply === true })
-  } catch (e) {
-    log('warn', `onsen send: pushed mail #${id} not written to Onsen (${e instanceof Error ? e.message : e}); BTCC's push carried it as before`)
-  }
+  // a mail BTCC pushes because the recipient's mailbox is off: BTCC writes its Onsen copy itself (mesh.push, WO-156); the daemon's copy
+  // (mirrorPushedMail, 1.51.0) was removed in 1.52.0 (WO-158)
+  return { status: r.status, json: await r.json().catch(() => ({})) }
 }
 // ---- feed wall (WO-92): Fleet Core /api/feed/*, same credential. Never throws: an unreachable core is
 // a status the tools explain ("改用搜尋" for ask), not a tool crash.
@@ -1843,8 +1771,8 @@ async function inboxDecide(args: Record<string, unknown>): Promise<{ text: strin
   }
 }
 
-// lanes-golive: the router's event for a mesh notification (an /inject, a hub row, a wake-up line of this daemon's own). Every field comes from the
-// notification's meta, which the /inject handler (or hub sync, or the keep-warm) filled from the body; nothing is read from the text except what has no
+// lanes-golive: the router's event for a mesh notification (an /inject or an Onsen item, a wake-up line of this daemon's own). Every field comes from the
+// notification's meta, which the delivery (or the keep-warm) filled from the body; nothing is read from the text except what has no
 // field yet (wakeKind: the watchdog's marker).
 function laneEventOf(n: { method: string; params: unknown }, verified?: boolean): Lanes.InEvent {
   const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
@@ -1881,25 +1809,6 @@ async function laneDeliverMesh(n: { method: string; params: unknown }, verified?
   if (!d) { if (fallback) broadcastNotification(n) }
   else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)    // 開工回執: a lane took the scheduled run (its run id from the meta)
   return d
-}
-
-// lanes-golive (C3): what this daemon's own /inject check found for a doorbell the hub will deliver (its verdict, the lanes thread / hop / sending-lane
-// marker, the line and wake fields), merged into the hub row's meta when the row is routed: the router sees the same event either path gives it.
-const hubInjectMeta = new Map<string, Record<string, string>>()
-const HUB_META_KEYS = ['verified', 'relay', 'forged', 'thread', 'hop', 'sender_lane', 'line', 'wake', 'run_id', 'frequency', 'no_reply']
-function rememberHubMeta(id: number, meta: Record<string, string>): void {
-  hubInjectMeta.set(String(id), Object.fromEntries(HUB_META_KEYS.filter(k => meta[k] != null && meta[k] !== '').map(k => [k, String(meta[k])])))
-  if (hubInjectMeta.size > 2000) hubInjectMeta.delete(hubInjectMeta.keys().next().value!)
-}
-/** hub sync's push with lanes on: the row goes to the router; 1 = the router took it (the hub reports it taken), 0 = no router to ask (it waits at the hub) */
-async function laneHubPush(n: { method: string; params: unknown }): Promise<number> {
-  const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
-  const id = String(p.meta?.msg_id ?? '')
-  const extra = hubInjectMeta.get(id)
-  const notif = extra ? { ...n, params: { ...p, meta: { ...(p.meta ?? {}), ...extra } } } : n
-  const d = await laneDeliverMesh(notif, undefined, false)
-  if (d) hubInjectMeta.delete(id)
-  return d ? 1 : 0
 }
 
 // lanes-golive: private-chat topics for worker lanes (Bot API 10.5, 2026-11-22: setMySettings; getMe reports has_topics_enabled and
@@ -1963,7 +1872,11 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   const reg = loadInboxRegistry()
   if (target === INBOX_SELF) return 'send failed: that is your own inbox'
   const entry = reg[target]
-  if (!entry?.url) return `send failed: unknown agent "${target}" — registry has: ${Object.keys(reg).join(', ') || '(empty)'}`
+  // WO-158 (1.52.0): with ONSEN_SEND on the roster is the list of who exists (the name check), and a call goes into the recipient's Onsen inbox only: the
+  // roster url is not used, except for a mailbox-type identity (its url is BTCC's own mailbox inject: no daemon takes from Onsen for it), which keeps
+  // the push to that url. ONSEN_SEND off (the stop switch): the push to the roster url for everyone, as before Onsen.
+  const pushUrl = entry?.url && (!onsenSender || isMailboxInject(entry.url)) ? entry.url : null
+  if (!entry || (!onsenSender && !pushUrl)) return `send failed: unknown agent "${target}" — registry has: ${Object.keys(reg).join(', ') || '(empty)'}`
   // log FIRST to mint the message id — it travels with the delivery so the
   // receiver can quote-reply to this message (Telegram reply_to semantics)
   let msgId: number | undefined
@@ -1994,49 +1907,44 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // BTCC held it (the same thing from you already reached two agents in the last 30 min): deliver nothing.
   // BTCC unreachable is not a hold — delivery goes on as before.
   if (held) return `send held — nothing was sent to ${target}. ${held}`
-  let delivery = 'failed'
+  // delivered | queued (in the recipient's Onsen inbox, its daemon not polling: it takes it when it comes back) | failed
+  let delivery: 'delivered' | 'queued' | 'failed' = 'failed'
   let detail = ''
-  // WO-151 3b (ONSEN_SEND): one dedupe key in the /inject body and in the Onsen copy (msg:<BTCC id>, else a fresh call:<uuid>), so a recipient that
-  // takes from Onsen delivers the call once, whichever arrives first
-  const onsenKey = onsenSender ? (msgId != null ? `msg:${msgId}` : `call:${randomUUID()}`) : null
   const payload: Record<string, unknown> = { text: body, logged: msgId != null,
     ...(msgId != null ? { msg_id: msgId } : {}),
     ...(replyTo != null ? { reply_to_id: replyTo } : {}),
     ...(opRef ? { op: opRef } : {}),
     ...(noReply ? { no_reply: true } : {}),
     ...laneFields(extra) }
-  try {
-    const r = await fetch(entry.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-        ...meshAuth(),
-      },
-      body: JSON.stringify({ text: body, from: INBOX_SELF, ...payload, ...(onsenKey ? { dedupe: onsenKey } : {}) }),
-      signal: AbortSignal.timeout(8000),
-    })
-    const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
-    if (r.ok && j.injected) delivery = 'delivered'
-    else detail = ` (inbox ${r.status})`
-  } catch (e) {
-    detail = ` (${e})`
-  }
-  // WO-151 3b: the Onsen copy, after today's push. Push delivered: not awaited (its latency unchanged). Push failed: awaited; Onsen took it and the
-  // recipient's daemon is pulling (Onsen 0.9.1 `pulling`: it polled in the last 90 s) = delivered (the same answer as a delivered push); otherwise the
-  // failure stands as before (the call waits in Onsen, not counted as delivered)
-  if (onsenSender) {
+  if (pushUrl) {
+    try {
+      const r = await fetch(pushUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Inject-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
+          ...meshAuth(),
+        },
+        body: JSON.stringify({ text: body, from: INBOX_SELF, ...payload }),
+        signal: AbortSignal.timeout(8000),
+      })
+      const j = await r.json().catch(() => ({})) as { injected?: boolean; active_sessions?: number }
+      if (r.ok && j.injected) delivery = 'delivered'
+      else detail = ` (inbox ${r.status})`
+    } catch (e) {
+      detail = ` (${e})`
+    }
+  } else {
+    // WO-158: the recipient's Onsen inbox, the only write (awaited). The key is msg:<BTCC id>, else a fresh call:<uuid>; a message that still reaches
+    // the recipient another way with the same key is delivered once (onsen-inbox.ts dedupe). Stored and the recipient's daemon pulling (Onsen 0.9.1
+    // `pulling`: it polled in the last 90 s) = delivered; stored, not pulling = queued; not stored = failed, with Onsen's reason.
+    const onsenKey = msgId != null ? `msg:${msgId}` : `call:${randomUUID()}`
     const facts = { refs: { ...(msgId != null ? { btcc_msg_id: msgId } : {}), ...(extra?.thread ? { thread: extra.thread } : {}), ...(opRef ? { op: opRef } : {}) },
       no_reply: !!noReply }
-    if (delivery === 'delivered') void onsenSender.send(target, 'peer_call', payload, onsenKey, facts)
-    else {
-      const o = await onsenSender.send(target, 'peer_call', payload, onsenKey, facts)
-      if (o.stored && o.pulling) {
-        onsenSender.stats.delivered_by_onsen++
-        log('info', `send to ${target}: the push failed${detail}; delivered through Onsen (${onsenKey}; the recipient's daemon is pulling)`)
-        delivery = 'delivered'; detail = ''
-      } else log('info', `send to ${target}: the push failed${detail}; ${o.stored ? `in Onsen (${onsenKey}), the recipient's daemon is not pulling: not counted as delivered` : 'not in Onsen either'}`)
-    }
+    const o = await onsenSender!.send(target, 'peer_call', payload, onsenKey, facts)
+    if (o.stored) delivery = o.pulling ? 'delivered' : 'queued'
+    else detail = ` (Onsen: ${o.error ?? 'not stored'})`
+    log('info', `send to ${target}: ${o.stored ? `in Onsen (${onsenKey}${o.duplicate ? ', already there' : ''}); the recipient's daemon ${o.pulling ? 'is pulling: delivered' : 'is not pulling: queued'}` : `not written to Onsen${detail}: failed`}`)
   }
   // settle the delivery status on the minted row (best effort)
   if (msgId != null) {
@@ -2054,10 +1962,12 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     } catch {}
   }
   const opNote = opWarn ? ` — ⚠ ${opWarn}` : ''
-  extra?.minted?.(msgId, delivery === 'delivered')
-  return delivery === 'delivered'
-    ? `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})${opNote}`
-    : `send to ${target} FAILED${detail} — message NOT delivered`
+  // queued counts as sent for the lanes (the answer is in the recipient's inbox: a lane is not told to send it again)
+  extra?.minted?.(msgId, delivery !== 'failed')
+  if (delivery === 'delivered') return `delivered to ${target}'s inbox (queued durably${msgId != null ? '; logged to BTCC Comms' : ''})${opNote}`
+  // fleet-mail.ts reads 「queued in 」 like 「delivered」: not an error
+  if (delivery === 'queued') return `queued in ${target}'s Onsen inbox${msgId != null ? ' (logged to BTCC Comms)' : ''}: ${target}'s daemon is not taking messages right now; it gets this when it comes back. Do not send it again.${opNote}`
+  return `send to ${target} FAILED${detail} — message NOT delivered`
 }
 
 function buildServer(): Server {
@@ -3636,7 +3546,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
     const p = notification.params as { content?: string; meta?: Record<string, string> }
     const meta = p.meta ?? {}
     // lanes-golive (C1): only a Telegram message of Joey's is a Telegram event. What else comes down this path (the agent-inbox daemon's keep-warm and
-    // mailbox lines, hub sync's old path, a local inject) is a mesh event for the router; building a Telegram event from it made the daemon's own keep-warm
+    // mailbox lines, a doorbell an older process parked, a local inject) is a mesh event for the router; building a Telegram event from it made the daemon's own keep-warm
     // a message from Joey that the main owed a reply.
     if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }
     const ev: Lanes.InEvent = {
@@ -3988,7 +3898,6 @@ setInterval(() => {
   }
   sweepDeliveries()  // issue #13: ack-on-consumption + orphan re-persist
   void drainPendingIfLive()  // recover parked deliveries without waiting for a session-open event
-  void hub?.kick('timer')  // hub sync: pull untaken rows, re-push the unseen past grace, confirm taken
 }, 30_000).unref()
 
 /**
@@ -4646,9 +4555,8 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
   // hourly 讀信箱 reminder carries no ring and reaches the main as before). Lanes on: the router's mail lane (coalesced while it runs);
   // no router to ask: not delivered (no fleet-path fallback to the main), and the answer says so, so the mailbox tries again later.
   const ring = body?.ring === true && Lanes.wakeKind(from, text, body?.wake) === 'mail'
-  // The sender's hub id (BTCC mesh push / Comms console / a peer that logged first): the doorbell for hub sync.
-  const senderMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
-  let btccMsgId: number | undefined = senderMsgId
+  // The sender's BTCC id (BTCC mesh push / Comms console / a peer that logged first); else the row logged below mints one
+  let btccMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
   // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
   // delivery gets a BTCC row unless the sender declares logged:true (senders
   // that already log with richer context: fleet call, BTCC /send, Argus wake).
@@ -4722,17 +4630,13 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
         },
       },
     }
-    // lanes-golive (C3): a sender-assigned hub id is a doorbell here too: hub sync fetches the row and hands it to the router (laneHubPush), and
-    // reports it taken; without a hub row it comes through the router now, from this /inject. Either way one entrance, one count.
-    const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'
-    if (hubRoute === 'hub') rememberHubMeta(senderMsgId!, notification.params.meta as Record<string, string>)
-    const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified, !ring) : null
+    // lanes-golive (C3): one entrance into the main: the router (1.52.0, WO-158: no hub doorbell any more)
+    const d = await laneDeliverMesh(notification, verdict.verified, !ring)
     if (ring && !d) {
       log('warn', `ring from ${from} NOT delivered: no lanes router to ask (the mailbox tries again later)`)
       return { code: 200, json: { injected: false, error: 'lanes router unreachable: ring not delivered' } }
     }
-    return { code: 200, json: hubRoute === 'old' ? { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }
-      : { injected: true, hub: true, routed: 'hub' } }
+    return { code: 200, json: { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' } }
   }
   if (ring) {
     log('info', `ring from ${from} dropped: lanes off here (no mail lane to wake; the mailbox stays as it is, the watchdog reminds): ${text.slice(0, 60)}`)
@@ -4758,27 +4662,27 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
       },
     },
   }
-  // Hub doorbell (1.33.0): a sender-assigned hub id is delivered by hub sync when the hub lists it with a
-  // payload; decided asynchronously (the receiver gives /inject 8 s), falling back to this old path otherwise.
-  // An id this daemon minted itself (logged:false above) is excluded from the hub's pending list: old path.
-  const route = hub && senderMsgId != null && btccMsgId === senderMsgId
-    ? hub.doorbell(senderMsgId, chatId, notif) : 'old'
-  if (route === 'old') await dispatchInbound(chatId, notif)
-  return { code: 200, json: { injected: true, active_sessions: activeServers.size, hub: route === 'hub' || route === 'dup-hub' } }
+  await dispatchInbound(chatId, notif)
+  return { code: 200, json: { injected: true, active_sessions: activeServers.size } }
 }
 /** WO-151 3a: one item taken from Onsen, handed to the same delivery as /inject (deliverInbound). Its sender is Onsen's authenticated caller, or the name
  *  a relay identity (BTCC) speaks for: verified, never forged. The relay attribute agents read keeps the values it has today (direct: the sender itself;
  *  btcc: BTCC spoke for it), so no text an agent reads changes; that it came through Onsen is in the log and /healthz (a value `onsen` there waits for
- *  Chiron). The item's key (Onsen's `dedupe`, else msg:<msg_id>) goes in as the body's `dedupe`. */
+ *  Chiron). The item's key (Onsen's `dedupe`, else msg:<msg_id>) goes in as the body's `dedupe`.
+ *  WO-158: an item Onsen 0.9.4 marks `unverified: true` (only a relay can: a name it passes on without vouching for it, e.g. a BTCC console release) gets
+ *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
+ *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function deliverPulled(it: PullItem): Promise<HandResult> {
   const p = (it.payload ?? {}) as InboundBody
   const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
-  const verdict: Verdict = { sender: String(it.sender ?? 'unknown').slice(0, 64), verified: true, relay, forged: false }
+  const sender = String(it.sender ?? 'unknown').slice(0, 64)
+  const unverified = it.unverified === true
+  const verdict: Verdict = { sender, verified: !unverified, relay, forged: unverified && resolveInbound(undefined, sender, undefined, loadTable()).forged }
   const key = itemKey(it)
   const out = await deliverInbound({ ...p, dedupe: key ?? undefined }, verdict, { holdUnsigned: false, trusted: true, src: 'onsen' })
   if (out.json.duplicate === true) return 'duplicate'
   const ok = out.json.injected === true || out.json.ignored != null
-  log(ok ? 'info' : 'warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) from ${verdict.sender}${it.relay ? ` via ${it.relay}` : ''}${key ? ` ${key}` : ' (no key)'}: ${ok ? 'handed on' : `not delivered ${JSON.stringify(out.json).slice(0, 160)}`}`)
+  log(ok ? 'info' : 'warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) from ${verdict.sender}${it.relay ? ` via ${it.relay}` : ''}${unverified ? ' (unverified)' : ''}${key ? ` ${key}` : ' (no key)'}: ${ok ? 'handed on' : `not delivered ${JSON.stringify(out.json).slice(0, 160)}`}`)
   return ok ? 'delivered' : 'undelivered'
 }
 
@@ -4813,8 +4717,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length }
           catch { return 0 }
         })(),
-        hub: hub ? hub.health() : { enabled: false, why: hubMode.why },
-        // WO-151 3a / 3b: the Onsen pull (taken, handed on, duplicates dropped on either path) and the Onsen copy of this agent's sends
+        // WO-151 3a / 3b: the Onsen pull (taken, handed on, duplicates dropped on either path) and this agent's sends into Onsen (WO-158: the only path)
         ...(INBOX_ONLY ? {
           onsen_pull: { on: !!onsenPuller, ...(onsenPuller ? onsenPuller.health() : { last_seq: onsenInbox?.lastSeq ?? 0, acked_seq: onsenInbox?.ackedSeq ?? 0 }),
             keys: onsenInbox?.keyCount ?? 0, inject_dup_dropped: onsenInbox?.stats.inject_dup_dropped ?? 0 },
@@ -5173,7 +5076,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           if (!Lanes.LANES_ON) {
             void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
           }
-          void hub?.kick('session-ready')   // hub rows that waited while detached (lanes on: they go to the router, laneHubPush; M1 delivers to the main)
         }
         // Now await the SSE request to keep the response open until client disconnects.
         try { await reqPromise } finally {
@@ -5239,14 +5141,9 @@ function startListen(): void {
     // Joey rule 2026-07-12: never silently run stale code — self-report version
     // + freshness vs origin/main at every boot (fail-open, see version-check.ts).
     void checkVersion().then(() => log('info', versionLine())).catch(() => {})
-    // Hub sync (1.33.0): boot sync. Off → hand any doorbell a previous process held to the old path, so turning
-    // HUB_SYNC off never strands one.
     if (onsenPuller) onsenPuller.start()          // WO-151 3a
-    if (hub) void hub.start()
-    else {
-      if (INBOX_ONLY) log('info', `hub sync: off (${hubMode.why}) — 1.32.2 delivery path only`)
-      void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)
-    }
+    // WO-158: hub sync is gone; a doorbell an older process (≤ 1.51.0) parked waiting for a sync is handed to the delivery once, so none is stranded
+    void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)
     // Roamer cross-protocol auto-discovery: announce ourselves so partner-
     // protocol roamer daemons can find us when they spawn target claudes.
     // Safe no-op when ROAMER_MODE is unset (channel-bot deployments).

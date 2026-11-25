@@ -287,6 +287,8 @@ export function takeAfterSend(responses: any[]): AfterSend[] {
   return out
 }
 
+/** a call's answer that is not an error: delivered, or (WO-158) queued in the recipient's Onsen inbox while its daemon is not polling (server.ts sendToAgent) */
+const SENT_RE = /^(delivered|queued in )/
 export async function callTool(name: string, args: Record<string, unknown>, deps: FleetDeps) {
   switch (name) {
     case 'call': {
@@ -296,7 +298,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const replyTo = intId(args.reply_to) ?? undefined
       // 回呼叫的那一則也是呼叫，而且到此為止（spec #t-call）
       const r = await deps.call(to, body, replyTo, replyTo != null, args.op ? String(args.op) : undefined)
-      return text(r, !/^delivered/.test(r))
+      return text(r, !SENT_RE.test(r))
     }
     case 'send_mail': {
       const to = String(args.to ?? '').trim()
@@ -531,7 +533,7 @@ export async function sendToAgent(args: Record<string, unknown>, deps: FleetDeps
       const replyTo = intId(args.reply_to) ?? undefined
       const r = await deps.call(String(args.to).trim(), String(args.text).trim(), replyTo,
         args.no_reply === true || replyTo != null, args.op ? String(args.op) : undefined)
-      return text(r, !/^delivered/.test(r))
+      return text(r, !SENT_RE.test(r))
     }
     return text(LINE_MISSING, true)
   }
