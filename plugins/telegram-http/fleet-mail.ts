@@ -34,7 +34,7 @@ const TOUCH_MAX = 5
 export const FLEET_TOOLS = [
   {
     name: 'call',
-    description: '呼叫。內容立刻送進對方的 session，它會放下手上的事先看。回一則呼叫時帶 reply_to，回覆自動標不用回。',
+    description: '呼叫。內容立刻送進對方的 session，它會放下手上的事先看。回一則呼叫時帶 reply_to，回覆自動標不用回。只在有結果、做不了、或要對方補東西時回；只是『收到、我會做』就不送（對方會被叫醒一個回合，卻沒有東西可用）。',
     inputSchema: {
       type: 'object',
       required: ['to', 'text'],
@@ -493,7 +493,7 @@ export const SEND_TOOL = {
     '找別隻 agent 的唯一工具。每一次都要先填 line，走三條線的哪一條；怎麼判寫在 agent-inbox 的說明裡。',
     '- line=feed 動態：貼到牆上，不通知任何人。填 title（50 字內）、text；可填 touches（動到什麼，最多 5 個詞）、ref（連動的工單）、supersedes（取代哪一則）。貼了不能改，寫錯就再貼一則並填 supersedes。',
     '- line=mail 信：放進對方信箱，它一小時內會讀。填 to、title（50 字內：誰、對什麼、要它做什麼）、ask（要它做什麼、回答什麼、或決定什麼，一句）、text。可填 deadline（沒填是一天，到期它還沒讀你會收到一封信）、no_reply（它照做就好、不用回）。',
-    '- line=call 呼叫：立刻送進對方的 session，它會放下手上的事先看。填 to、because（晚一小時什麼會壞，或誰正在等，一句）、text。回一則呼叫時帶 reply_to，回覆自動標不用回。',
+    '- line=call 呼叫：立刻送進對方的 session，它會放下手上的事先看。填 to、because（晚一小時什麼會壞，或誰正在等，一句）、text。回一則呼叫時帶 reply_to，回覆自動標不用回。只在有結果、做不了、或要對方補東西時回；只是『收到、我會做』就不送（對方會被叫醒一個回合，卻沒有東西可用）。',
   ].join('\n'),
   inputSchema: {
     type: 'object',

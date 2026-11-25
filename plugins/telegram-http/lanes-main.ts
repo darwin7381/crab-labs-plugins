@@ -117,6 +117,9 @@ export const __setMainStuckMs = (ms: number): void => { MAIN_STUCK_MS = ms }
  *  it waited for the stuck episode: MAIN_STUCK_MS, ten minutes outside the lab). It is written once more, and nobody is told */
 export let OFFER_LEASE_MS = num('LANES_OFFER_LEASE_MS', 20_000)
 export const __setOfferLeaseMs = (ms: number): void => { OFFER_LEASE_MS = ms }
+/** WO-157c (Chiron, WO-157 15:25Z, his words): the line in front of an item whose turn was interrupted (Esc, or a turn that never ended normally) when it
+ *  reaches the main again */
+export const INTERRUPTED_LINE = '〔這一則你做到一半被中斷了（有人在你的畫面按了 Esc，或那一回合沒有正常結束）。中斷之後 Joey 說了新的，就照新的。沒有說，就回寄件人一句停在哪一步，不要自己把被中斷的動作重做一次。〕'
 const BODY_MAX = 4000
 /** the first words of an event's text (the Stop check names each event it holds the turn for) */
 const firstWords = (t: string): string => { const s = String(t ?? '').replace(/\s+/g, ' ').trim(); return s.length > 30 ? `${s.slice(0, 30)}…` : s }
@@ -199,6 +202,14 @@ export function createMain(E: MainEnv) {
   }
   const owed = (r: Row): boolean => E.owed ? E.owed(r) : r.kind !== 'digest'
   const forGen = (r: Row, g: Row): boolean => !r.target || r.target === g.session_id
+  /** WO-157c (Chiron 15:25Z, 1): an item of a turn that was interrupted (Esc: statusIdle; a turn that never got Stop: beginTurn), queued again and waiting
+   *  to ride the next thing the main is given (an offer, or a pull into a turn). It never opens a turn on its own: the main would start again what Joey
+   *  just stopped. A colleague's, a scheduler's, an alert's item that no new turn took within MAIN_STUCK_MS is let go (tick: 'interrupted_untaken'). */
+  const heldCut = (r: Row): boolean => r.state === 'queued' && r.reason === 'interrupted'
+  /** the reason an offered item goes back with when nobody took the offer: a held item keeps its hold (it rides the next offer again) */
+  const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : why
+  /** an item that was in an interrupted turn: Chiron's line goes in front of it each time it reaches the main (cut_at, set when the turn was cut) */
+  const cutText = (r: Row, text: string): string => r.cut_at ? `${INTERRUPTED_LINE}\n${text}` : text
   /** the digest that rides this delivery: the one queued digest item, refreshed, or a new one; null = nothing to tell */
   function attachInfo(): Row | null {
     const inf = E.info()
@@ -256,7 +267,8 @@ export function createMain(E: MainEnv) {
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
-    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g))
+    // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
+    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r))
     if (!cands.length) return
     if (probe) {
       const menu = E.menu ? await E.menu(true).catch(() => null) : null
@@ -270,9 +282,12 @@ export function createMain(E: MainEnv) {
     for (const it of cands) {
       if (down.has(String(it.via))) continue
       const dg = attachInfo()
-      const ids = [it.id, ...(dg ? [dg.id] : [])]
+      // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
+      const riders = items(r => heldCut(r) && owed(r) && forGen(r, g))
+      const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
       const p = (it.notif?.params ?? {}) as Record<string, any>
-      const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${String(p.content ?? '')}` : String(p.content ?? '')
+      const own = [cutText(it, String(p.content ?? '')), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
+      const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${own}` : own
       const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
       let ok = false
       // Sonn #11516 (1): while this offer is on its way the item is still `queued`; an edit must not rewrite it then (the main would get the old text
@@ -290,7 +305,8 @@ export function createMain(E: MainEnv) {
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
       for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
-      J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}` })
+      J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) of an interrupted turn riding` : ''}` })
+      for (const r of riders) J().write('wake', r.id, 'wake', { reason: `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
       try { E.woke?.(J().get('msg', it.id)!, { gen: g.id, probe }) } catch (e) { E.log('warn', `lanes: woke hook: ${e}`) }
       delivered()
       return
@@ -325,12 +341,17 @@ export function createMain(E: MainEnv) {
     const info = rs.filter(r => r.kind === 'digest'), msgs = rs.filter(r => r.kind !== 'digest')
     return ['〔交給主線｜這一回合進行中送到的訊息，交給你接著處理。來源已驗證（Telegram 只收白名單裡的人，這就是 Joey 本人；mesh 訊息看 verified）。'
       + '照平常處理：問的就回答，交代的就照做（能馬上做的現在做，其餘接在手上這一步之後），Telegram 用 reply 回，同事用 send_to_agent 回；已經處理過的不用重做。〕',
-      ...msgs.map(renderItem), ...info.map(r => `〔車道摘要（只讓你知道，不是新的指示）〕\n${contentOf(r)}`)].join('\n')
+      ...msgs.map(r => cutText(r, renderItem(r))), ...info.map(r => `〔車道摘要（只讓你知道，不是新的指示）〕\n${contentOf(r)}`)].join('\n')
   }
-  function requeue(pred: (r: Row) => boolean, reason: string): Row[] {
+  function requeue(pred: (r: Row) => boolean, reason: string, fields: Record<string, unknown> = {}): Row[] {
     const rs = items(r => (r.state === 'offered' || r.state === 'bound') && pred(r))
-    for (const r of rs) J().write('msg', r.id, 'queued', { reason, gen: null, prompt_id: null, via_pull: null })
+    for (const r of rs) J().write('msg', r.id, 'queued', { reason, gen: null, prompt_id: null, via_pull: null, ...fields })
     return rs
+  }
+  /** WO-157c: the items of gen `g`'s open turn, cut (Esc, or a turn that never got Stop): queued again and held (heldCut) to ride the next delivery, marked
+   *  for Chiron's line */
+  function cutTurn(g: Row): Row[] {
+    return g.prompt_id ? requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted', { cut_at: new Date().toISOString() }) : []
   }
   function finish(pred: (r: Row) => boolean, how: Record<string, unknown> = {}): Row[] {
     const rs = items(r => r.state === 'bound' && pred(r))
@@ -367,7 +388,7 @@ export function createMain(E: MainEnv) {
   function beginTurn(g: Row, prompt: string, dids?: string[]): void {
     if (g.prompt_id === prompt) return
     if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
-    if (g.prompt_id) requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted')       // a turn that never got Stop or StopFailure
+    if (g.prompt_id) cutTurn(g)                                     // a turn that never got Stop or StopFailure: its items ride this turn (pull, WO-157c)
     outputs.clear(); calls.clear(); openTools.delete(g.id)                                          // the aids look at this prompt's calls only
     starts.set(g.id, { prompt, at: new Date().toISOString(), prev: starts.get(g.id)?.at ?? null })
     setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
@@ -578,8 +599,8 @@ export function createMain(E: MainEnv) {
   /** every few seconds: kill -0 (SIGKILL fires no hook), the stuck rule, and a pump (an item no stream could take is still queued) */
   /** WO-157b: the main's statusOf as the daemon reads it now (idle: true when its state is idle). Two readings at least MAIN_IDLE_CONFIRM_MS apart that
    *  both say idle while M2 holds the turn open, and no hook event of the gen between them: the turn ended without a Stop (Esc). It is closed as
-   *  interrupted (requeue 'interrupted', as beginTurn does for a turn that never got Stop or StopFailure), M2 goes idle, the queued items are offered.
-   *  Returns true when it closed a turn. */
+   *  interrupted (cutTurn, as beginTurn does for a turn that never got Stop or StopFailure), M2 goes idle, the items that came in meanwhile are offered
+   *  and the cut ones ride with the next delivery (WO-157c). Returns true when it closed a turn. */
   let idleSeen: { gen: string; at: number; ev: number } | null = null
   function statusIdle(isIdle: boolean, now = Date.now()): boolean {
     const g = currentGen()
@@ -589,13 +610,18 @@ export function createMain(E: MainEnv) {
     if (now - idleSeen.at < MAIN_IDLE_CONFIRM_MS) return false
     const heldS = Math.round((now - idleSeen.at) / 1000)
     idleSeen = null
-    const back = g.prompt_id ? requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted') : []
+    const back = cutTurn(g).filter(r => owed(r))
     openTools.delete(g.id)
     setMain(g, 'idle', { prompt_id: null, tool_open: null, stopped_prompt: null })
-    E.log('info', `lanes: main gen ${g.id}: its turn ended without a Stop (statusOf idle for ${heldS} s, no hook event): closed as interrupted, ${back.length} item(s) queued again`)
+    // WO-157c (Chiron 15:25Z, 1): the cut items are held, not offered on their own (1.55.1 offered them and the main began again 4 s after Esc); what
+    // came in during the turn and never reached the conversation is offered now, with them riding
+    E.log('info', `lanes: main gen ${g.id}: its turn ended without a Stop (statusOf idle for ${heldS} s, no hook event): closed as interrupted, ${back.length} item(s) held to ride the next delivery`)
     void pump()
     return true
   }
+  /** the untaken notice (an idle gen that does not take what it is given): one sentence, the stuck rule's and WO-157c's */
+  const untakenText = (mins: number, menu: string | null, queued: number, again: boolean): string =>
+    `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它，${again ? '我再交給它一次' : '已經再交給它一次，還是沒有被接手'}。`
   async function tick(now = Date.now()): Promise<void> {
     if (!E) return
     const g = currentGen()
@@ -604,7 +630,7 @@ export function createMain(E: MainEnv) {
     // pull them), nor walled (its wall notice told Joey), nor holding an offer (an offer it does not take is the silence rule below), and could not be
     // offered them. One alarm per episode, with the count; the next delivery ends it.
     if (!stuck && (!g || ((g.state === 'idle' || g.state === 'starting') && !items(r => r.state === 'offered' && r.gen === g.id).length))) {
-      const owedNow = items(r => r.state === 'queued' && owed(r))
+      const owedNow = items(r => r.state === 'queued' && owed(r) && !heldCut(r))     // WO-157c: a held item waits for a delivery, not for a stream
       if (owedNow.some(r => now - Date.parse(String(r.ts)) > MAIN_STUCK_MS)) {
         stuck = { gen: g?.id ?? null, prompt: null, at: now, undelivered: true }
         const mins = Math.max(1, Math.round((now - Math.min(...owedNow.map(r => Date.parse(String(r.ts))))) / 60_000))
@@ -629,7 +655,7 @@ export function createMain(E: MainEnv) {
       // stuck episode below does not write such an item a third time (a client that is frozen, not deaf, takes every copy when it runs again).
       const untaken = g.state === 'idle' ? offered.filter(r => r.reoffered !== g.id) : []
       if (untaken.length && now - since > OFFER_LEASE_MS && now - since <= limit) {
-        for (const r of untaken) J().write('msg', r.id, 'queued', { reason: 'offer_untaken', gen: null, prompt_id: null, via_pull: null, reoffered: g.id })
+        for (const r of untaken) J().write('msg', r.id, 'queued', { reason: backReason(r, 'offer_untaken'), gen: null, prompt_id: null, via_pull: null, reoffered: g.id })
       } else if (owes && now - since > limit) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         // what the episode writes again: a walled gen's probe item (its next probe), an idle gen's item the lease has not written again yet
@@ -642,12 +668,24 @@ export function createMain(E: MainEnv) {
         const doing = g.state === 'in_turn' ? items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === g.prompt_id && r.kind !== 'digest').map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 60)).filter(Boolean) : []
         E.tellJoey(g.state === 'in_turn'
           ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜${g.tool_open ? `（停在工具 ${g.tool_open} 裡沒有回來）` : ''}${doing.length ? `；它正在處理：${doing.map(t => `「${t}」`).join('、')}` : ''}。${menu ?? ''}有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
-          : `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它，${again.length || !offered.length ? '我再交給它一次' : '已經再交給它一次，還是沒有被接手'}。`, 'main-stuck')
+          : untakenText(mins, menu, queued, !!(again.length || !offered.length)), 'main-stuck')
         // 002q (H02, H03): an offer the gen never took (no hook event for it: a notification lost on the client side, under host load) is not left to
         // wait for ever. The stuck episode is the signal: its untaken items go back to `queued` (reason stuck_unbound) and M1 offers once more, now.
         // Once per episode (the alarm does not fire again until a hook event ends it), and no timer of its own. A walled gen's probe item waits for
         // its next retry time like any probe.
-        for (const r of again) J().write('msg', r.id, 'queued', { reason: 'stuck_unbound', gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
+        for (const r of again) J().write('msg', r.id, 'queued', { reason: backReason(r, 'stuck_unbound'), gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
+      } else if (g.state === 'idle' && !offered.length) {
+        // WO-157c (Chiron 15:25Z, 1): a colleague's, a scheduler's or an alert's item of an interrupted turn that no new turn took within MAIN_STUCK_MS goes
+        // the untaken path above: Joey is told (the same words) and it is offered once more, now leading an offer (with Chiron's line in front). Joey's own
+        // items never go this way: they wait for the next delivery.
+        const cutOld = items(r => heldCut(r) && owed(r) && r.kind !== 'joey' && forGen(r, g) && now - Date.parse(String(r.cut_at ?? r.ts)) > MAIN_STUCK_MS)
+        if (cutOld.length) {
+          stuck = { gen: g.id, prompt: null, at: now }
+          for (const r of cutOld) J().write('msg', r.id, 'queued', { reason: 'interrupted_untaken' })
+          const menu = E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null
+          const mins = Math.max(1, Math.round((now - Math.min(...cutOld.map(r => Date.parse(String(r.cut_at ?? r.ts))))) / 60_000))
+          E.tellJoey(untakenText(mins, menu, items(r => r.state === 'queued' && owed(r)).length, true), 'main-stuck')
+        }
       }
     }
     await pump()

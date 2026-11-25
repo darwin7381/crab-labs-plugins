@@ -114,3 +114,6 @@ plugins/telegram-http/lanes.ts::export function mainNowWords
 plugins/telegram-http/onsen-status.ts::backgroundAgents(sid: string | null)
 plugins/telegram-http/lanes-main.ts::function statusIdle(isIdle: boolean
 plugins/telegram-http/lanes-wake-rules.json::"id": "peer-no-reply"
+plugins/telegram-http/lanes-main.ts::export const INTERRUPTED_LINE = '〔這一則你做到一半被中斷了
+plugins/telegram-http/lanes-main.ts::const heldCut = (r: Row): boolean
+plugins/telegram-http/fleet-mail.ts::只是『收到、我會做』就不送
