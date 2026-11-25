@@ -19,7 +19,7 @@ export const CHAT_HISTORY_TOOL = {
 
 // WO-153 (Chiron): close a page form the agent sent (Onsen POST /forms/close, the daemon's own mesh credential). The main's server (server.ts) and every lane
 // (lanes.ts, through LanesDeps.formClose) list it only when Onsen recording is on for the agent. The description is one constant: Chiron owns its wording.
-export const FORM_CLOSE_DESC = "Close a page form you sent that no longer needs Joey's answer (by its id or the page url); its key stops working."
+export const FORM_CLOSE_DESC = "關掉你發給 Joey 的一張表單：他用別的方式回了，或這件事不用他定了。關了它就不再列在他的『等你決定』；他之後點舊連結會看到『這一題已經關了』。給 `id`，或給 `url`（關那一頁最新、還開著的那一筆）；`reason` 寫一句為什麼關。只關得了自己發的。"   // Chiron's wording (WO-153 10:16Z)
 export const FORM_CLOSE_TOOL = {
   name: 'form_close',
   description: FORM_CLOSE_DESC,
