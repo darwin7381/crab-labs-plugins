@@ -74,7 +74,8 @@ test('C3 server.ts: hub push is the router with lanes on, the receipt check is o
   expect(src).toContain('push: Lanes.LANES_ON ? laneHubPush : pushToReadySessions,')
   expect(src).toContain('receiptCheck: () => !Lanes.LANES_ON && RECEIPT_CHECK && consumptionCheckAvailable()')
   expect(src).toContain("const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'")
-  expect(src).toContain("const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified) : null")
+  // WO-141 phase 2: the fleet-path fallback stays on for everything but the mailbox's ring (mail-ring.test.ts)
+  expect(src).toContain("const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified, !ring) : null")
   expect(src).toContain('if (!(await laneRedeliver(notif))) break')
   // a hub row that reaches the router carries this daemon's own /inject verdict and lanes fields
   expect(src).toContain("const notif = extra ? { ...n, params: { ...p, meta: { ...(p.meta ?? {}), ...extra } } } : n")

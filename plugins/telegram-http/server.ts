@@ -4315,7 +4315,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       const body = (await readJsonBody(req).catch(() => null)) as
         { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
           msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
-          no_reply?: boolean; op?: string | number } | null
+          no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown } | null
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
       const opRef = body?.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
       if (!text) {
@@ -4348,13 +4348,18 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         return
       }
       const from = verdict.sender
+      // WO-141 phase 2: BTCC's mailbox ring (body ring:true with wake=mail, through the oncall receiver). It wakes the agent's mail lane and
+      // nothing else: never a BTCC comms row (a ring is not a message), never the main. Lanes off: dropped and logged here (the watchdog's
+      // hourly 讀信箱 reminder carries no ring and reaches the main as before). Lanes on: the router's mail lane (coalesced while it runs);
+      // no router to ask: not delivered (no fleet-path fallback to the main), and the answer says so, so the mailbox tries again later.
+      const ring = body?.ring === true && Lanes.wakeKind(from, text, body?.wake) === 'mail'
       // The sender's hub id (BTCC mesh push / Comms console / a peer that logged first): the doorbell for hub sync.
       const senderMsgId: number | undefined = typeof body?.msg_id === 'number' ? body.msg_id : undefined
       let btccMsgId: number | undefined = senderMsgId
       // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
       // delivery gets a BTCC row unless the sender declares logged:true (senders
       // that already log with richer context: fleet call, BTCC /send, Argus wake).
-      if (INBOX_ONLY && body?.logged !== true && BTCC_API_BASE) {
+      if (INBOX_ONLY && body?.logged !== true && BTCC_API_BASE && !ring) {
         // PARSE rather than strip (codex r3): wake handoffs keep their priority
         // and get kind='wake' so BTCC history/UI retain the on-call semantics;
         // only bare legacy identity prefixes (【a → b】) are dropped as noise.
@@ -4420,6 +4425,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
               // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
               ...(body?.run_id != null && /^\d+$/.test(String(body.run_id)) ? { run_id: String(body.run_id) } : {}),
               ...(typeof body?.frequency === 'string' && body.frequency ? { frequency: String(body.frequency).slice(0, 16) } : {}),
+              ...(ring ? { ring: 'true' } : {}),          // WO-141: the router reads it (lanes switched off: a ring is recorded, not the main's)
             },
           },
         }
@@ -4427,10 +4433,22 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // reports it taken; without a hub row it comes through the router now, from this /inject. Either way one entrance, one count.
         const hubRoute = hub && senderMsgId != null && btccMsgId === senderMsgId ? hub.doorbell(senderMsgId, chatId, notification) : 'old'
         if (hubRoute === 'hub') rememberHubMeta(senderMsgId!, notification.params.meta as Record<string, string>)
-        const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified) : null
+        const d = hubRoute === 'old' ? await laneDeliverMesh(notification, verdict.verified, !ring) : null
+        if (ring && !d) {
+          log('warn', `ring from ${from} NOT delivered: no lanes router to ask (the mailbox tries again later)`)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ injected: false, error: 'lanes router unreachable: ring not delivered' }))
+          return
+        }
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify(hubRoute === 'old' ? { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' }
           : { injected: true, hub: true, routed: 'hub' }))
+        return
+      }
+      if (ring) {
+        log('info', `ring from ${from} dropped: lanes off here (no mail lane to wake; the mailbox stays as it is, the watchdog reminds): ${text.slice(0, 60)}`)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ injected: false, ignored: 'ring: lanes off here; the mailbox stays as it is' }))
         return
       }
       const notif = {

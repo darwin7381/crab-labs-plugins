@@ -999,6 +999,15 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   // where every event reaches the main. Nothing of the lane machinery decides any more: no hold, no flood gate (002k ran peerGate before it, and Eve's
   // message after /lanes off went to the ledger: A07 e6), no Jev screen, no rule. Lanes already running finish their event and report.
   if (D.role === 'tg' && S?.master_off) {
+    // WO-141 phase 2: the mailbox's ring (wake mail, meta ring, server.ts /inject) exists to wake a mail lane; switched off there is none, and
+    // the main is not woken for it (an agent without lanes keeps the watchdog's hourly 讀信箱 reminder, which carries no ring): recorded only
+    if (ev.wake === 'mail' && ev.meta?.ring === 'true') {
+      const d: Decision = { rule: 'master-off-ring', target: 'ledger', note: `lanes switched off by ${S.master_off.by}: the mailbox's ring has no mail lane to wake` }
+      routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
+        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: 'mail' })
+      D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ledger`)
+      return d
+    }
     let d: Decision = { rule: 'master-off', target: 'main', note: `lanes switched off by ${S.master_off.by} at ${stamp(S.master_off.since)}` }
     routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note,
       class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null })
