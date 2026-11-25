@@ -99,3 +99,9 @@ plugins/telegram-http/lanes-hooks/main-hook.py::body['tool_brief'] = b
 plugins/telegram-http/lanes-main.ts::input: b.tool_brief ?? b.tool_input ?? null
 plugins/telegram-http/lanes.ts::function matterWithMain(
 plugins/telegram-http/lanes.ts::const has = phrase ? matterWithMain(tok, lane, phrase) : null
+# WO-148 review of WO-153 (telegram-http 1.50.0): a lane's form_close is gated, recorded, reflex and mail only
+plugins/telegram-http/lanes.ts::export const MAIN_SAME_GATED = ['mailbox_check', 'mailbox_reply', 'reply_agent', 'form_close']
+plugins/telegram-http/lanes.ts::case 'form_close': return laneFormClose(tok, lane, a ?? {})
+plugins/telegram-http/lanes.ts::{ const g = await mainSameMatterGate(tok, lane, 'form_close', a); if (g) return g }
+plugins/telegram-http/lanes.ts::const fc = D?.formClose && formCloseKind(kind, run) ? [FORM_CLOSE_TOOL] : []
+plugins/telegram-http/lanes.ts::if (closed) events?.push(tok.evId, 'forms_closed',

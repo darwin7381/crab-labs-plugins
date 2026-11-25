@@ -1368,14 +1368,14 @@ export const MAILBOX_CARD_LANE_TOOL = laneFilled(MAILBOX_CARD_TOOL)
 /** the names /lanes/mail-tool takes for them (the agent-inbox daemon side) */
 export const DECISION_LANE_TOOL_NAMES = ['decide_later', 'mailbox_card']
 /** the lane tools a run lists: every lane's, plus the mailbox for the mail lane */
-export function laneToolsFor(kind: LaneKind | undefined): any[] {
+export function laneToolsFor(kind: LaneKind | undefined, run: { fanout?: boolean } = {}): any[] {
   // WO-125 (C): with LANES_RECEIPT_STEPS on, the receipt takes `steps` (receiptToolWithSteps); off, LANE_TOOLS as they were
   const base = receiptStepsOn() ? LANE_TOOLS.map(t => t.name === 'receipt' ? receiptToolWithSteps(t) : t) : LANE_TOOLS
   // WO-127 (LANES_DECISIONS): decide_later for every lane, mailbox_card for the mail lane; off, the lists as they were
   // WO-128 (LANES_DEFER_DECISIONS): both take urgent_because; off, Epeius's definitions as 1.38 listed them
   const urg = <T extends { inputSchema: { properties: Record<string, unknown> } }>(t: T): T => deferDecisionsOn() ? ({ ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, urgent_because: URGENT_BECAUSE_PROP } } }) : t
   const dec = decisionsOn() ? [urg(DECIDE_LATER_LANE_TOOL), ...(kind === 'mail' ? [urg(MAILBOX_CARD_LANE_TOOL)] : [])] : []
-  const fc = D?.formClose ? [FORM_CLOSE_TOOL] : []                                 // WO-153: only with Onsen recording on (server.ts gives formClose)
+  const fc = D?.formClose && formCloseKind(kind, run) ? [FORM_CLOSE_TOOL] : []       // WO-153: only with Onsen recording on (server.ts gives formClose); WO-148 review: reflex and mail lanes
   return kind === 'mail' ? [...base, ...MAIL_LANE_TOOLS, ...dec, ...fc] : dec.length || fc.length ? [...base, ...dec, ...fc] : base
 }
 
@@ -3687,7 +3687,7 @@ export const __chatFetching = (): number => chatFetching.size                   
 // decision coming back, a worker / fork / fan-out / synthesis / curator lane); LANES_MAIN_SAME_MATTER=0 or
 // LANES_MAIN_CHAT=0. Not gated: handoff_main, decide_later, mailbox_card (they hand to the main), notify_joey, ask_joey, receipt, chat_history, the read-only
 // mailbox tools, the ledger / commitment / follow-up records; the lane's own built-in tools (Bash, Write, Edit) do not pass through here.
-export const MAIN_SAME_GATED = ['mailbox_check', 'mailbox_reply', 'reply_agent']
+export const MAIN_SAME_GATED = ['mailbox_check', 'mailbox_reply', 'reply_agent', 'form_close']   // form_close: WO-148 review of WO-153 (it takes a decision off Joey's list)
 export type SameMatterVerdict = { same: boolean; p: number | null; error?: string }
 // The words were chosen on the real Jev with the lab's own inputs (runs lab-relay.mail.6 / mail.7, the other mails of those runs, two alert pairs), three calls
 // each: the 週報 mails 0.91–0.94 and 0.84–0.89, the unrelated mails, the reminder and the other alert 0.02–0.16, the same service's alert 0.99. A wording that also
@@ -3702,6 +3702,16 @@ export const MAIN_SAME_QUESTION = { same_matter: { type: 'noul', instructions: '
 /** what a gated action is about: a mail of this mail-lane run (as the lane saw it), or the run's event */
 function sameMatterSubject(tok: RunTok, lane: Lane, name: string, a: any): { key: string; event: Record<string, unknown> } {
   const seen = tok.mailSeen ?? {}
+  // WO-148 (review of WO-153): form_close's subject is the form (its id, else the page url) with what the lane gives as its reason and what it read: the mail
+  // this mail-lane run opened last, else the run's event; neither id nor url (formClose refuses that anyway): the run's event
+  if (name === 'form_close') {
+    const fid = a?.id != null && a.id !== '' && Number.isInteger(Number(a.id)) ? Number(a.id) : null, url = typeof a?.url === 'string' ? a.url.trim() : ''
+    const last = Object.values(seen).filter(m => m.opened).sort((x, y) => y.n - x.n)[0]
+    const ev = queue.get(tok.evId)?.ev
+    return { key: fid ? `form:${fid}` : url ? `form:${url}` : 'event', event: { kind: 'a page form the agent sent Joey to decide; the lane is about to close it (take it off his list)',
+      ...(fid ? { id: fid } : {}), ...(url ? { url } : {}), reason: clip(String(a?.reason ?? ''), 300),
+      read: last ? last.text : clip(String(ev?.synthetic ?? ev?.text ?? ''), 600) } }
+  }
   let id = name === 'mailbox_check' || name === 'mailbox_reply' ? Number(a?.id) : NaN
   if (name === 'reply_agent' && lane.kind === 'mail') {
     const to = String(a?.to ?? '').trim().toLowerCase()
@@ -3754,7 +3764,8 @@ async function mainSameMatterGate(tok: RunTok, lane: Lane, name: string, a: any)
   if (!v.same) return null
   if (!(tok.sameRefused ??= []).includes(sub.key)) tok.sameRefused.push(sub.key)   // handoff_main takes it without a mailbox_open (retest t2's dead end)
   addHold(tok, { check: 'same_matter', tools: MAIN_SAME_GATED, key: sub.key, need: 'handoff', again: mainSameMatterRefusal(now.doing) })
-  const what = sub.key === 'event' ? name : `${name} #${String(sub.key).slice(5)}`
+  const rest = sub.key.slice(sub.key.indexOf(':') + 1)
+  const what = sub.key === 'event' ? name : /^\d+$/.test(rest) ? `${name} #${rest}` : `${name} ${rest}`        // mail:<id>, form:<id>, form:<url>
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'main_same_matter_refused', run: tok.runId, event: tok.evId, tool: name, subject: sub.key, p: v.p, prompt: now.prompt, doing: clip(now.doing, 120) })
   ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action',
     text: `${what} 擋下：主線正在回合中處理同一件事（在處理：${clip(now.doing, 80)}；Jev ${(v.p ?? 0).toFixed(2)}），沒有做，要車道用 handoff_main 交給主線`,
@@ -5246,6 +5257,37 @@ export function answerToCallArgs(a: any, ev: InEvent | undefined): any {
   if (String(ev.from ?? '').trim().toLowerCase() !== String(a?.to ?? '').trim().toLowerCase()) return a
   return { ...a, line: 'call', reply_to: has(a?.reply_to) ? a.reply_to : String(ev.btcc_msg_id) }
 }
+// WO-148 (review of WO-153, the coordinator): form_close takes a question off Joey's 「等你決定」 and his old link then says it is closed, with no way back for
+// the lane; Onsen's "only your own" is the agent's (main and lanes share the credential), so a lane can close a form the main sent. For a lane it is now:
+//  - reflex and mail lanes only (the router's lanes; not a worker, fork, fan-out part, synthesis or curator): listed only for them, refused for the others;
+//  - gated like the other acting tools (MAIN_SAME_GATED): not while the main's turn is on the same matter, and under the WO-148 hold after such a refusal;
+//  - recorded: a ledger action row (the form id closed, also when the lane gave only the url), the event's record (`forms_closed`: the digest's line shows
+//    it), a lanes.jsonl row and a daemon log line, for every call that reached Onsen (closed or refused). The description is Chiron's and unchanged.
+export const formCloseKind = (kind: LaneKind | undefined, run: { fanout?: boolean; synthesis?: string | boolean } = {}): boolean =>
+  (kind === 'reflex' || kind === 'mail') && !run.fanout && !run.synthesis
+async function laneFormClose(tok: RunTok, lane: Lane, a: Record<string, unknown>): Promise<string> {
+  if (!D.formClose) return 'form_close：這個常駐程式沒有開 Onsen 紀錄。'
+  if (!formCloseKind(lane.kind, { fanout: !!tok.fanout, synthesis: tok.synthesis })) {
+    appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'form_close', run: tok.runId, event: tok.evId, result: 'not_this_lane', id: a.id ?? null, url: a.url ?? null })
+    return `refused: form_close is for the reflex and mail lanes only (this is a ${tok.fanout ? 'fan-out part' : tok.synthesis ? 'synthesis' : lane.kind} lane). Nothing was closed; if the form should be closed, say so to the main (handoff_main, or your result).`
+  }
+  { const g = await mainSameMatterGate(tok, lane, 'form_close', a); if (g) return g }
+  const text = String(await D.formClose(a))
+  const closed = !text.startsWith('form_close:')                          // onsen-tool.ts formClose: every refusal or failure starts so; a close is Onsen's JSON
+  let ans: any = null; try { ans = JSON.parse(text) } catch {}
+  const closedId = closed && Number.isInteger(Number(ans?.id)) ? Number(ans.id) : null
+  const asked = a.id != null && a.id !== '' ? `#${a.id}` : typeof a.url === 'string' ? String(a.url).trim() : '-'
+  const reason = typeof a.reason === 'string' ? a.reason.trim().slice(0, 300) : ''
+  const what = closed ? `關了表單 ${closedId != null ? `#${closedId}` : asked}${a.id == null && a.url ? `（給的是頁面 ${String(a.url).trim()}，關的是它最新還開著的那一筆）` : ''}${ans?.already ? '（已經關過）' : ''}`
+    : `表單 ${asked} 沒關成：${clip(text, 200)}`
+  ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action', text: `form_close ${what}${reason ? `；原因：${reason}` : ''}`,
+    refs: { form_close: closed ? 'closed' : 'refused', id: a.id ?? null, url: a.url ?? null, closed_id: closedId, ...(reason ? { reason } : {}), ...(ans?.already ? { already: true } : {}) } })
+  if (closed) events?.push(tok.evId, 'forms_closed', { id: closedId, url: a.url ?? null, reason: reason || null, lane: lane.id, at: nowIso() })
+  appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'form_close', run: tok.runId, event: tok.evId, result: closed ? 'closed' : 'refused', id: a.id ?? null, url: a.url ?? null, closed_id: closedId })
+  logos('lane.form_close', { lane: lane.id, run: tok.runId, event: tok.evId, closed, id: a.id ?? null, url: a.url ?? null, closed_id: closedId })
+  D.log('info', `lanes: ${lane.id} form_close ${closed ? `closed form ${closedId ?? asked}` : `refused for ${asked}`}${a.id == null && a.url ? ` (url ${String(a.url).trim()})` : ''}${reason ? `: ${reason.slice(0, 120)}` : ''}`)
+  return text
+}
 export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<string> {
   const lane = S.lanes[tok.lane]
   if (!lane) throw new Error('lane gone')
@@ -5254,7 +5296,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
   switch (name) {
     case 'notify_joey': return joeyLine(tok, lane, 'notify_joey', a)
     case 'chat_history': return D.chatHistory ? D.chatHistory(a ?? {}) : 'chat_history：這個常駐程式沒有接上 Onsen。'   // Onsen (WO-139)
-    case 'form_close': return D.formClose ? D.formClose(a ?? {}) : 'form_close：這個常駐程式沒有開 Onsen 紀錄。'   // WO-153
+    case 'form_close': return laneFormClose(tok, lane, a ?? {})                // WO-153; WO-148 review: reflex and mail lanes, gated, recorded
     case 'reply_agent': {
       // lanes-golive (C2): the three lines, with fleet-mail.ts's rules and words (mail by default; a call only with a because, or as the answer to a call)
       a = answerToCallArgs(a, queue.get(tok.evId)?.ev)      // WO-140: no line, answering the call that started this run → a call back (reply_to filled in)
@@ -6351,7 +6393,7 @@ function laneBearer(req: IncomingMessage): string | null {
 }
 async function openLaneSession(token: string): Promise<StreamableHTTPServerTransport> {
   const server = new Server({ name: 'lane', version: '1.0.0' }, { capabilities: { tools: {} } })
-  server.setRequestHandler(ListToolsRequestSchema, async () => { const tok = runTokens.get(token); return { tools: laneToolsFor(tok ? S.lanes[tok.lane]?.kind : undefined) } })
+  server.setRequestHandler(ListToolsRequestSchema, async () => { const tok = runTokens.get(token); return { tools: laneToolsFor(tok ? S.lanes[tok.lane]?.kind : undefined, { fanout: !!tok?.fanout }) } })
   server.setRequestHandler(CallToolRequestSchema, async req => {
     const tok = runTokens.get(token)
     if (!tok) return { content: [{ type: 'text', text: 'lane run is over' }], isError: true }
@@ -7031,6 +7073,8 @@ function digestLine(e: Row, whole = false): DigestLine {
     : o.state === 'requested' ? `正在送給 ${o.to}` : `還沒回 ${o.to}${failed(o)}`))
   for (const o of obs.filter(o => o.kind === 'receipt')) st.push(unrun(o) ?? (o.state === 'met' ? `run ${o.run_id} 回執已送` : o.state === 'handed' ? `run ${o.run_id} 的回執交給主線${o.failed ? `（排程器沒收下：${clip(String(o.failed), 100)}）` : ''}` : `run ${o.run_id} 還沒回執${failed(o)}`))   // 1.41.1: why it is still owed
   if (e.blocked && blockFactsOn()) st.push(String(e.blocked))                    // WO-125 (B): what the guard refused in the run, as the system counted it
+  for (const f of (e.forms_closed ?? []) as Array<{ id?: number | null; url?: string | null; reason?: string | null; lane?: string }>)   // WO-148 review of WO-153
+    st.push(`${laneLabelOf(String(f.lane ?? ''))}關了你發給 Joey 的表單 ${f.id != null ? `#${f.id}` : f.url ?? ''}${f.reason ? `（${fit(String(f.reason), 80)}）` : ''}`)
   if (handed) st.push(handed.defer && !handed.woke ? `在你的信箱等決定（〔${handed.handoff ?? handed.id}〕等得起，不會單獨叫醒你）：${fit(String(handed.what ?? ''), 200)}`   // WO-128
     : `需主線：〔${handed.handoff ?? handed.id}〕${fit(String(handed.what ?? ''), 200)}`)
   // PL1: what the main must know about the event is on its record

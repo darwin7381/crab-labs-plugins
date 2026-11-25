@@ -48,7 +48,7 @@ test('a form key is made with the link as written (no key), so Onsen checks that
   expect(r.forms.map(f => f.url)).toEqual(got.map(g => g[1]))
 })
 
-describe('lanes: form_close only when the daemon gives it (Onsen recording on)', () => {
+describe('lanes: form_close only when the daemon gives it (Onsen recording on), to reflex and mail lanes (1.50.0)', () => {
   test('listed and called through LanesDeps.formClose; without it not listed', async () => {
     const L = await import('./lanes.ts?form-close') as typeof import('./lanes.ts')
     const dir = mkdtempSync(join(tmpdir(), 'form-close-lanes-'))
@@ -57,7 +57,8 @@ describe('lanes: form_close only when the daemon gives it (Onsen recording on)',
     const seen: any[] = []
     L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, authOk: () => false, registryNames: () => [],
       sendBot: async () => 1, joeyChatId: () => '1', formClose: async (a: any) => { seen.push(a); return '{"id":3,"closed":true}' } } as any)
-    for (const k of ['reflex', 'mail', 'worker', 'fork'] as const) expect(L.laneToolsFor(k).filter(t => t.name === 'form_close')).toHaveLength(1)
+    for (const k of ['reflex', 'mail'] as const) expect(L.laneToolsFor(k).filter(t => t.name === 'form_close')).toHaveLength(1)
+    for (const k of ['worker', 'fork'] as const) expect(L.laneToolsFor(k).some(t => t.name === 'form_close')).toBe(false)   // telegram-http 1.50.0 (WO-148 review): reflex and mail lanes only
     L.__lanesState().lanes['adam.reflex.9'] = { id: 'adam.reflex.9', kind: 'reflex', thread: 'adam#t-fc', status: 'idle', runs: 0 } as any   // a lane the call names
     expect(await L.callLaneTool({ lane: 'adam.reflex.9', evId: 'e', runId: 'r' } as any, 'form_close', { id: 3 })).toBe('{"id":3,"closed":true}')
     expect(seen).toEqual([{ id: 3 }])

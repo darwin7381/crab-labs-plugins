@@ -98,7 +98,12 @@ const meshed: any[] = []
 L.__setMeshSend(async b => { meshed.push(b); return { msgId: 96000 + meshed.length, text: `sent to ${b.to}`, delivered: true } })
 const toJoey: string[] = []
 const open = new Set<string>()
-L.lanesInit({ role: 'tg', agent: AGENT, workspaceDir: ws, transcriptDir: tmp, httpPort: 0, log: () => {}, authOk: () => true, registryNames: () => ['chiron', 'lynceus', 'eve'],
+// WO-153's form_close as server.ts wires it for lanes (onsen-tool.ts formClose's text: Onsen's JSON, or a 「form_close: …」 refusal)
+const formCalls: any[] = []
+let formAnswer: (a: any) => string = a => JSON.stringify({ id: a.id ?? 91, closed: true })
+const logs: string[] = []
+L.lanesInit({ role: 'tg', agent: AGENT, workspaceDir: ws, transcriptDir: tmp, httpPort: 0, log: (lvl: string, m: string) => { logs.push(`${lvl} ${m}`) }, authOk: () => true, registryNames: () => ['chiron', 'lynceus', 'eve'],
+  formClose: async (a: any) => { formCalls.push(a); return formAnswer(a) },
   notifySession: async (sid: string) => open.has(sid), streamOpen: (sid: string) => open.has(sid), toolsChanged: () => {},
   sendBot: async (_c: string, text: string) => { toJoey.push(text); return 8000 + toJoey.length }, joeyChatId: () => JOEY,
   mainChat: (a: any, o: any) => oc.queryHistory(a, 'hook', o) } as any)
@@ -260,14 +265,14 @@ describe('1b. a resumed lane session', () => {
 // ================================================================== 2. a refusal holds for the run
 /** a lane's run as the router leaves it (no process): its lane, its event in the queue, its token */
 let f = 0
-function fakeRun(kind: 'mail' | 'reflex', ev: Record<string, unknown> = {}): any {
+function fakeRun(kind: 'mail' | 'reflex' | 'worker' | 'fork' | 'curator' | 'synthesis', ev: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): any {
   f += 1
   const lid = `adam.${kind}.h${f}`, thread = `adam#t-h${f}`
   L.__lanesState().lanes[lid] = { id: lid, kind, n: 100 + f, session_id: randomUUID(), thread, status: 'running', created: '', last: '', transcript: join(tmp, `h${f}.jsonl`), runs: 0, tokens_in: 0, tokens_out: 0 } as any
   L.__lanesState().threads[thread] = { id: thread, lane: lid, peer: null, hops: 0, tokens: 0, created: '', last: '' } as any
   const e: any = { id: `mesh-wo148h-${f}`, source: 'mesh', from: 'mailbox', verified: false, text: '讀信箱（3 封未讀）：先用 mailbox_list 看清單', meta: {}, notif: { method: '', params: {} }, ...ev }
   L.__putQueue({ ev: e, lane: lid, state: 'leased', lease_until: 0, attempts: 1, priority: 1, enqueued: '' })
-  return { runId: `${lid}.r1`, lane: lid, evId: e.id, closers: [], critical: false, trigger: kind === 'mail' ? 'mail' : 'peer', cls: kind === 'mail' ? 'mail' : 'peer' }
+  return { runId: `${lid}.r1`, lane: lid, evId: e.id, closers: [], critical: false, trigger: kind === 'mail' ? 'mail' : 'peer', cls: kind === 'mail' ? 'mail' : 'peer', ...extra }
 }
 const held = () => jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'refusal_held')
 
@@ -482,5 +487,79 @@ describe('3. main_doing takes the newest', () => {
       expect(await L.callLaneTool(tok, 'mailbox_check', { id: 91002 })).toBe('#91002 勾掉了，不在清單上了。')
       await hook('SessionEnd'); p.kill('SIGKILL')
     } finally { delete process.env.LANES_MAIN_DOING_NEWEST_MIN }
+  }, 30000)
+})
+
+// ================================================================== 4. a lane's form_close (WO-148 review of WO-153)
+describe('4. a lane\'s form_close: reflex and mail lanes only, gated, recorded', () => {
+  test('listed only for the reflex and mail lanes (not a worker, fork, curator, synthesis or a fan-out part); called from another lane: refused, nothing closed', async () => {
+    for (const k of ['reflex', 'mail'] as const) expect(L.laneToolsFor(k).some(t => t.name === 'form_close')).toBe(true)
+    for (const k of ['worker', 'fork', 'curator', 'synthesis'] as const) expect(L.laneToolsFor(k).some(t => t.name === 'form_close')).toBe(false)
+    expect(L.laneToolsFor('reflex', { fanout: true }).some(t => t.name === 'form_close')).toBe(false)
+    const n0 = formCalls.length
+    for (const [kind, extra] of [['worker', {}], ['fork', {}], ['curator', {}], ['reflex', { fanout: 'fo-1' }]] as const) {
+      const t = fakeRun(kind as any, { from: 'lynceus', text: '那張表單可以關了' }, extra as any)
+      expect(await L.callLaneTool(t, 'form_close', { id: 90 })).toStartWith('refused: form_close is for the reflex and mail lanes only')
+    }
+    expect(formCalls.length).toBe(n0)
+    expect(jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'form_close' && r.result === 'not_this_lane').length).toBe(4)
+  })
+
+  test('every close is recorded: a ledger action row (the form id closed, also when the lane gave the url), the event\'s record (the digest\'s line), lanes.jsonl, the daemon log; a refusal from Onsen too', async () => {
+    const t = fakeRun('reflex', { from: 'lynceus', text: 'Joey 在 TG 回過 WO-148 的選擇了，那頁表單可以關' })
+    formAnswer = () => JSON.stringify({ id: 91, closed: true })
+    const out = await L.callLaneTool(t, 'form_close', { url: 'https://ops.fud.city/wo/148', reason: 'Joey 在 Telegram 回過了' })
+    expect(out).toBe('{"id":91,"closed":true}')                                                     // Onsen's answer, as Epeius's tool gives it
+    expect(formCalls.at(-1)).toEqual({ url: 'https://ops.fud.city/wo/148', reason: 'Joey 在 Telegram 回過了' })   // his API unchanged
+    const led = jsonl(join(dir, 'ledger.jsonl')).filter(r => r.event === t.evId && r.refs?.form_close)
+    expect(led).toHaveLength(1)
+    expect(led[0]).toMatchObject({ kind: 'action', lane: t.lane, refs: { form_close: 'closed', closed_id: 91, url: 'https://ops.fud.city/wo/148', id: null, reason: 'Joey 在 Telegram 回過了' } })
+    expect(led[0].text).toBe('form_close 關了表單 #91（給的是頁面 https://ops.fud.city/wo/148，關的是它最新還開著的那一筆）；原因：Joey 在 Telegram 回過了')
+    expect(jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'form_close' && r.run === t.runId)).toEqual([expect.objectContaining({ result: 'closed', closed_id: 91, url: 'https://ops.fud.city/wo/148' })])
+    expect(logs.some(l => l === `info lanes: ${t.lane} form_close closed form 91 (url https://ops.fud.city/wo/148): Joey 在 Telegram 回過了`)).toBe(true)
+    expect(L.__events().get(t.evId)!.forms_closed).toEqual([expect.objectContaining({ id: 91, url: 'https://ops.fud.city/wo/148', lane: t.lane })])
+    expect(L.activityList()).toContain('關了你發給 Joey 的表單 #91（Joey 在 Telegram 回過了）')         // the main's view of the event (the digest's line)
+    // by id; and Onsen refusing (not the agent's, or no such open form): recorded as not closed, nothing on the event
+    const u = fakeRun('mail')
+    formAnswer = () => 'form_close: no such open form (404) {"error":"no such open form"}'
+    expect(await L.callLaneTool(u, 'form_close', { id: 95 })).toStartWith('form_close: no such open form (404)')
+    const r2 = jsonl(join(dir, 'ledger.jsonl')).filter(r => r.event === u.evId && r.refs?.form_close)
+    expect(r2).toEqual([expect.objectContaining({ kind: 'action', refs: expect.objectContaining({ form_close: 'refused', id: 95, closed_id: null }) })])
+    expect(r2[0].text).toStartWith('form_close 表單 #95 沒關成：form_close: no such open form (404)')
+    expect(L.__events().get(u.evId)!.forms_closed).toBeUndefined()
+    formAnswer = a => JSON.stringify({ id: a.id ?? 91, closed: true })
+  })
+
+  test('the same-matter gate: the main\'s turn is on the 週報, a lane closing the 週報 form is refused (Jev asked about the form), another form goes; after the main\'s turn the refusal holds until handoff_main', async () => {
+    const p = Bun.spawn(['sleep', '600']); procs.push(p)
+    const sid = randomUUID(); writeFileSync(join(dir, 'main-expected'), sid); open.add(`mcp-${p.pid}`); L.__noteMcpPid(`mcp-${p.pid}`, p.pid)
+    const hook = (event: string, o: object = {}) => L.__mainEvent({ event, pid: p.pid, session_id: sid, ...o } as any)
+    await hook('SessionStart', { source: 'startup' })
+    const item = L.__main().enqueue('joey', { method: 'notifications/claude/channel', params: { content: JOEY_WEEKLY, meta: { chat_id: JOEY, user: 'joey' } } }, { event: null })
+    await hook('UserPromptSubmit', { prompt_id: 'p-form', dids: [item] })
+    const now = L.mainTurnNow()!
+    expect(now.doing).toContain('週報')
+    const a = fakeRun('reflex', { from: 'lynceus', text: '週報 W48 那張表單 Joey 已經在 Telegram 回了，可以關' })
+    const n0 = formCalls.length, j0 = jevCalls.length
+    const refused = await L.callLaneTool(a, 'form_close', { id: 92, reason: '週報 W48 Joey 已在 Telegram 回覆' })
+    expect(refused).toBe(B.mainSameMatterRefusal(now.doing))
+    expect(formCalls.length).toBe(n0)                                                                // nothing was closed
+    const q = jevCalls.slice(j0).find(c => c.questions?.same_matter)!
+    expect(q.state.event).toMatchObject({ id: 92, reason: '週報 W48 Joey 已在 Telegram 回覆' }); expect(q.state.event.kind).toContain('page form')
+    const led = jsonl(join(dir, 'ledger.jsonl')).filter(r => r.event === a.evId && r.refs?.main_same_matter === 'refused')
+    expect(led[0].text).toStartWith('form_close #92 擋下：主線正在回合中處理同一件事')
+    const b = fakeRun('reflex', { from: 'kairos', text: 'mock-api 那題 Joey 說不用定了' })
+    expect(await L.callLaneTool(b, 'form_close', { id: 93, reason: 'mock-api 那題不用定了' })).toBe('{"id":93,"closed":true}')
+    expect(formCalls.at(-1)).toEqual({ id: 93, reason: 'mock-api 那題不用定了' })
+    // the main's turn ends: the refused form stays refused for this run (no Jev call, nothing closed) until it hands the matter over
+    await hook('Stop', { prompt_id: 'p-form', phase: 'final' })
+    expect(L.mainTurnNow()).toBeNull()
+    const j1 = jevCalls.length, n1 = formCalls.length
+    expect(await L.callLaneTool(a, 'form_close', { id: 92, reason: '主線閒了，現在關' })).toBe(refused)
+    expect(jevCalls.length).toBe(j1); expect(formCalls.length).toBe(n1)
+    expect(jsonl(join(dir, 'lanes.jsonl')).filter(r => r.kind === 'refusal_held' && r.run === a.runId)).toEqual([expect.objectContaining({ check: 'same_matter', tool: 'form_close', key: 'form:92' })])
+    expect(await L.callLaneTool(a, 'handoff_main', { text: '週報 W48 的表單 #92：Joey 已在 Telegram 回覆，要不要關由你定。' })).toStartWith('handed to the main:')
+    expect(await L.callLaneTool(a, 'form_close', { id: 92, reason: '交給主線之後' })).toBe('{"id":92,"closed":true}')
+    await hook('SessionEnd'); p.kill('SIGKILL')
   }, 30000)
 })
