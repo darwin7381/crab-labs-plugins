@@ -264,7 +264,11 @@ export function createMain(E: MainEnv) {
       const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${String(p.content ?? '')}` : String(p.content ?? '')
       const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
       let ok = false
+      // Sonn #11516 (1): while this offer is on its way the item is still `queued`; an edit must not rewrite it then (the main would get the old text
+      // while Onsen records replaced_in_queue): replaceQueued skips the ids in flight and the edit goes as a new message
+      for (const id of ids) inFlight.add(id)
       try { ok = await E.offer(notif, it.via as Via, Number(g.pid)) } catch (e) { E.log('warn', `lanes: offer of ${it.id} failed: ${e}`) }
+      finally { for (const id of ids) inFlight.delete(id) }
       const now = currentGen()
       if (!now || now.id !== g.id) return
       if (!ok) {
@@ -610,8 +614,10 @@ export function createMain(E: MainEnv) {
   /** Onsen step 2 (WO-142): Joey edited a message the main has not seen yet. Each item that carries it (chat_id / message_id in its meta), still queued
    *  and never offered, taken in or put back (no `reason`), gets the content and meta `rewrite` gives; the ids rewritten ([] = none: the caller delivers
    *  the edit as a new message) */
+  /** ids of items whose offer is on its way to the main right now (pump): never rewritten by an edit (Sonn #11516 point 1) */
+  const inFlight = new Set<string>()
   function replaceQueued(chat: string, messageId: string, rewrite: (p: { content: string; meta: Record<string, string> }) => { content: string; meta: Record<string, string> }): string[] {
-    const rs = items(r => r.state === 'queued' && !r.reason && r.kind !== 'digest' && metaOf(r.notif).chat_id === chat && String(metaOf(r.notif).message_id ?? '') === messageId)
+    const rs = items(r => r.state === 'queued' && !r.reason && !inFlight.has(r.id) && r.kind !== 'digest' && metaOf(r.notif).chat_id === chat && String(metaOf(r.notif).message_id ?? '') === messageId)
     for (const r of rs) {
       const p = { ...((r.notif?.params ?? {}) as Record<string, any>) }
       const nw = rewrite({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })

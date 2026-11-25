@@ -2193,7 +2193,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         assertAllowedChat(chat_id)
         // 002l (D16): the report on a hand-over goes out at the tier the router gives that event (design/notify 「分級由分流器…決定」); otherwise as before
         // PL2: the tier comes from the events of the main's running turn (M1 prompt → items → events), never from a parameter
-        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to }) : null
+        const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to, chat_id }) : null
         const quiet = handoffTier?.silent ? { disable_notification: true } : {}
         // lanes-topics (item 2): every part of the reply (each chunk, each file) carries the one topic decision; lanes off: {}
         const topicF = topicFields({ chat: chat_id, topic: args.topic, replyTo: reply_to, turn: true })
@@ -2241,7 +2241,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
-        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to, text)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
+        if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, sentIds[0] ?? null, reply_to, text, chat_id)   // PL2: a request against the turn's events (met on the sent id); 002w F: its promise checked
         sentIn(chat_id, sentIds, topicF)
         const tname = topicF.message_thread_id != null ? Lanes.topicName(topicF.message_thread_id) : undefined
         const result =
@@ -3484,6 +3484,9 @@ async function handleInbound(
 // Route one inbound notification: roamer target session when ROAMER_MODE is
 // on, broadcast otherwise. Extracted from handleInbound so the album flush
 // timer (#6) dispatches through the exact same path.
+/** Sonn #11516 (3): edit_date is in seconds: two edits of one message in the same second got the same lanes event id (events.open kept the first, the
+ *  queue entry was overwritten). A per-process counter makes each edit's event its own. */
+let editEventSeq = 0
 async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }): Promise<void> {
   // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
   // everything else → the registered main only). Never a broadcast.
@@ -3496,7 +3499,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
     if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }
     const ev: Lanes.InEvent = {
       // Onsen step 2 (WO-142): Joey's edit carries the original's message_id; its event is its own (edited_at)
-      id: `tg-${chat_id}-${meta.message_id ?? Date.now()}${meta.edited_at ? `-edit-${Date.parse(meta.edited_at) || Date.now()}` : ''}`, source: 'telegram', from: meta.user ?? 'joey',
+      id: `tg-${chat_id}-${meta.message_id ?? Date.now()}${meta.edited_at ? `-edit-${Date.parse(meta.edited_at) || Date.now()}-${++editEventSeq}` : ''}`, source: 'telegram', from: meta.user ?? 'joey',
       text: String(p.content ?? ''), meta, notif: notification, verified: true,
       reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.topic,
     }

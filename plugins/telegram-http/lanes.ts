@@ -4098,7 +4098,7 @@ const evClassOf = (ev: InEvent, lane?: Lane): EvClass =>
 const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
   ...(ev.screen_p != null ? { screen_p: ev.screen_p } : {}),
   ...(ev.incident_of ? { incident_of: ev.incident_of, incident: ev.incident_key ?? null } : {}),        // WO-132 (item 2): merged into its incident's lane
-  ...(ev.source === 'telegram' && !ev.synthetic ? { tg: { message_id: ev.meta?.message_id ?? null, topic: ev.message_thread_id ?? null } } : {}) })   // 002t: Joey's own message
+  ...(ev.source === 'telegram' && !ev.synthetic ? { tg: { message_id: ev.meta?.message_id ?? null, chat_id: ev.meta?.chat_id ?? null, topic: ev.message_thread_id ?? null } } : {}) })   // 002t: Joey's own message
 /** M3 (PL1): the router's one place that records an inbound event. Every inbound event has a record, whatever its route: a lane's (with what it owes),
  *  the main's (a hand-over owed to it), or information nobody handles (owner `router`, no obligations: closed at once). An existing record is kept
  *  (a retry is the same event); what the router marked is merged onto it. */
@@ -4302,17 +4302,23 @@ const owesJoey = (e: Row): boolean => ((e.obligations ?? []) as Ob[]).some(o => 
  *    hand-over's silent tier, so Joey's three events closed with their line still owed): EVERY event bound to the turn whose Joey line is still open
  *    (owesJoey). A line that meets nothing is a request against nothing (A05: the main's second line, about an alert it read in the digest): no event
  *    records it; its tier follows the turn's events (a later line about them keeps their tier). */
-function replyTargets(replyTo: unknown): { turn: NonNullable<ReturnType<typeof mainTurn>>; events: Row[]; about: Row[]; quoted: boolean } | null {
+function replyTargets(replyTo: unknown, chat?: unknown): { turn: NonNullable<ReturnType<typeof mainTurn>>; events: Row[]; about: Row[]; quoted: boolean } | null {
   const t = mainTurn()
   if (!t) return null
   const rt = replyTo != null && String(replyTo) !== '' ? String(replyTo) : ''
   if (rt) {
     // Onsen step 2 (WO-142): every item carrying that message id (Joey's message and his edit of it, delivered as a new item with the same message_id)
-    const its = t.items.filter(r => String((r.notif?.params as any)?.meta?.message_id ?? '') === rt && r.event)
+    // Sonn #11516 (2): the same Telegram number exists in different chats (a DM and a group): match the chat too when both sides know it
+    const sameChat = (c: unknown) => chat == null || String(chat) === '' || c == null || String(c) === String(chat)
+    const its = t.items.filter(r => { const m = (r.notif?.params as any)?.meta ?? {}; return String(m.message_id ?? '') === rt && sameChat(m.chat_id) && r.event })
     // lanes-golive (lab run 11-23, G1): a lane handed Joey's own message to the main; the turn carries the hand-over item, not Joey's, and the main
     // quotes HIS message (reply_to = its Telegram id). The quoted message is the event's own (its record's tg.message_id): that event's Joey line is met.
     // Matching only the items left it owed: the Stop check held the turn and the main sent Joey the same answer twice.
-    const evs = its.length ? t.events.filter(e => its.some(it => it.event === e.id)) : t.events.filter(e => String((e as any).tg?.message_id ?? '') === rt)
+    // both ways merged (Sonn #11516 (2)): a lane's hand-over of N and Joey's edit of N in one turn: the items match the edit's event, the record's
+    // tg.message_id matches the hand-over's; meeting only one left the other owed and the Stop check held the turn
+    const byItem = t.events.filter(e => its.some(it => it.event === e.id))
+    const byTg = t.events.filter(e => String((e as any).tg?.message_id ?? '') === rt && sameChat((e as any).tg?.chat_id))
+    const evs = [...new Map([...byItem, ...byTg].map(e => [e.id, e] as const)).values()]
     return { turn: t, events: evs, about: evs, quoted: true }
   }
   const meets = t.events.filter(owesJoey)
@@ -4326,18 +4332,18 @@ function eventTier(e: Row, turn: NonNullable<ReturnType<typeof mainTurn>>): { ti
   return notifyProfile() === 'tiered' && t.tier === 'push' && rung(e) ? { tier: 'silent', rule: `${t.rule}+rang` } : t      // lanes-golive (C6): the main's reply rings (tiered only quiets it)
 }
 /** server.ts: the tier of the main's Telegram reply; null = an ordinary reply (push): it quotes a message, or one of the obligations it meets needs a push */
-export function mainReplyTier(a: { reply_to?: unknown }): MainTier | null {
+export function mainReplyTier(a: { reply_to?: unknown; chat_id?: unknown }): MainTier | null {
   if (D?.role !== 'tg' || !S || !events) return null
-  const x = replyTargets(a.reply_to)
+  const x = replyTargets(a.reply_to, a.chat_id)
   if (!x || x.quoted || !x.about.length) return null
   const tiers = x.about.map(e => eventTier(e, x.turn))
   if (tiers.some(t => t.tier === 'push')) return null                               // the highest tier any of them requires
   return { silent: true, rule: `turn ${x.turn.prompt}: ${tiers[0].rule}`, events: x.about.map(e => e.id) }
 }
 /** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against its target events (replyTargets) */
-export function mainReplied(t: MainTier | null, messageId: number | null, replyTo?: unknown, text?: string): void {
+export function mainReplied(t: MainTier | null, messageId: number | null, replyTo?: unknown, text?: string, chat?: unknown): void {
   if (D?.role !== 'tg' || !S || !events) return
-  const x = replyTargets(replyTo)
+  const x = replyTargets(replyTo, chat)
   // 002w (F, gap 16): what the main tells Joey it will do goes through the one promise check, onto the event the line is about
   if (messageId != null && text?.trim()) void promiseCheck({ who: 'main', to: 'joey', text, ev: (x?.events[0] ?? x?.turn.events[0])?.id, thread: null, ref: messageId })
   for (const e of x?.events ?? []) {
