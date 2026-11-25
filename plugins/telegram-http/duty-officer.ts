@@ -685,6 +685,8 @@ export interface OfficerDeps {
    *  An owned screen is never judged, pressed or sent; absent = nobody else owns anything (the fleet's behaviour). */
   owner?(t: Target, lines: string[]): string | null
   log(level: 'info' | 'warn' | 'error', msg: string): void
+  /** WO-165 A: every look at a pane (its foreground command and visible text), for the screen-status reader of that pane */
+  onLook?(tmux: string, cmd: string, pane: string): void
   now?(): number
   sleep?(ms: number): Promise<void>
 }
@@ -849,6 +851,7 @@ export class DutyOfficer {
   async look(tmux: string): Promise<Look> {
     const [info, pane] = await Promise.all([this.d.tmux.info(tmux), this.d.tmux.capture(tmux)])
     if (!info || pane == null) return null
+    try { this.d.onLook?.(tmux, info.cmd, pane) } catch {}
     const lines = tailLines(pane)
     const extra = new Set([...this.extra, ...this.config().claude_cmds])
     return { state: classify(lines, info.cmd, extra), hash: thash(lines), lines, info, pane }

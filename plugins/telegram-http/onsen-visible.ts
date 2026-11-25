@@ -96,7 +96,10 @@ export function tpe(ms: number): string {
   const d = new Date(ms + 8 * HOUR), p = (n: number) => String(n).padStart(2, '0')
   return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`
 }
-const WAITING: Record<string, string> = { 'permission prompt': '權限詢問', 'dialog open': '選單', 'input needed': '它問了問題' }
+const WAITING: Record<string, string> = { 'permission prompt': '權限詢問', 'dialog open': '選單', 'input needed': '它問了問題',
+  // WO-165 A: the menu kinds Jev names (Chiron's questions file, `menu`)
+  permission: '權限詢問', model_picker: '模型選單', trust_folder: '要不要信任這個資料夾', usage_limit_options: '撞上限後的選項', resume_picker: '選要接哪段對話',
+  plan_or_question: '它問了問題', login: '要登入', other: '選單' }
 const OFFLINE: Record<string, string> = { no_registration: '沒有 session', pid_gone: '行程不在了', pid_reused: '行程不在了', not_connected: '連不上' }
 /** line 1: what statusOf says, in Joey's words. `sinceMs`: when this state began; `now` for stuck's minutes. Precedence: offline, then the usage wall,
  *  then the state (compacting before stuck: a compaction writes nothing for minutes). */
@@ -111,7 +114,14 @@ export function statusLine(v: StatusView, sinceMs: number, now = Date.now()): st
     const u = d.walled.until ? Date.parse(String(d.walled.until)) : NaN
     return Number.isFinite(u) ? `🔴 撞上限，${tpe(u)} 解除` : '🔴 撞上限'
   }
-  if (v.state === 'idle') return `🟢 閒置${since}`
+  if (v.state === 'starting') return `⚪ 啟動中${since}`                  // WO-165 A (Jev reads the screen)
+  if (v.state === 'idle') {
+    // WO-165 A: what Jev's reading adds to idle (background work the program counted on the screen; a turn just interrupted)
+    const b = d.background && typeof d.background === 'object' ? d.background : null
+    const bg = b ? [Number(b.agents) > 0 ? `${Number(b.agents)} 隻子 agent` : '', Number(b.shells) > 0 ? `${Number(b.shells)} 個 shell` : '',
+      Number(b.monitors) > 0 ? `${Number(b.monitors)} 個 monitor` : ''].filter(Boolean).join('、') : ''
+    return bg ? `🟢 閒置${since}：背景還有 ${bg}` : d.interrupted ? `🟢 閒置${since}：剛被中斷` : `🟢 閒置${since}`
+  }
   if (v.state === 'waiting') {
     const w = d.waitingFor == null ? '' : String(d.waitingFor)
     return w ? `🟠 等你按${since}：${WAITING[w.toLowerCase()] ?? w}` : `🟠 等你按${since}`

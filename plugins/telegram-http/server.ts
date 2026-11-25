@@ -63,7 +63,9 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DutyOfficer, askModelCli, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
+import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
+import { QUESTIONS_PATH_DEFAULT, ScreenStatus, snapPane } from './screen-status.ts'
+import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
 // Genesis universe 002 (Parallel Awareness). Every call below is behind Lanes.LANES_ON
@@ -2535,9 +2537,13 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
   }).start()
 }
 
+// WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of
+// the main's pane are handed to it, so the screen is not captured twice
+let screenStatus: ScreenStatus | null = null
 let dutyOfficer: DutyOfficer | null = null
 if (isControlEnabled() || isRoamerEnabled()) {
   dutyOfficer = new DutyOfficer({
+    onLook: (tmux, cmd, pane) => { if (screenStatus && tmux === process.env.CHANNEL_BOT_TMUX_SESSION) screenStatus.sample(pane, cmd) },
     // paneWatchTargets labels this daemon's own pane 'channel-bot' (it predates the fleet); the duty officer names
     // a pane by its tmux session (claude-aegis, daddy-claude …) in its log, in Joey's messages and in rulings
     listTargets: async () => (await paneWatchTargets()).map(t => {
@@ -4394,6 +4400,19 @@ if (Lanes.LANES_ON) {
 //              / pid reused / no stream of it here) | idle | busy | waiting | stuck (busy, nothing written for ONSEN_STUCK_S). Detail only: lanes on, the
 //              main's M2 row and hook events (the tool, subagents, PreCompact, its own wall); lanes off, the transcript's turn; both, the usage-wall
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
+/** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
+ *  agent off needs no restart) */
+const JEV_SCREEN_PLIST = fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN
+let jevScreenFile: { at: number; v: string | undefined } = { at: -Infinity, v: undefined }
+function jevScreenValue(): string | undefined {
+  if (JEV_SCREEN_PLIST !== undefined) return JEV_SCREEN_PLIST
+  if (Date.now() - jevScreenFile.at >= 30_000) {
+    let v: string | undefined
+    try { v = parseFleetConfig(readFileSync(FLEET_CONFIG_PATH, 'utf8')).JEV_SCREEN } catch {}
+    jevScreenFile = { at: Date.now(), v }
+  }
+  return jevScreenFile.v
+}
 /** WO-145 point 5 (Chiron 06:04Z): one button under the status message; it stops the message in that chat and deletes it */
 const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callback_data: 'opin:off' }]] }
 /** the status pin of this daemon (null: ONSEN_STATUS_PIN off), for the button's callback */
@@ -4416,7 +4435,14 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const pin = ONSEN_VISIBLE.pin ? statusPinSetup() : null
   statusPinRef = pin?.pin ?? null
   let lastView: OnsenStatus.StatusView | null = null                  // WO-147: the agent's state a wake row carries (member_state)
-  const feed = (v: OnsenStatus.StatusView): void => { lastView = v; status.update(v); try { pin?.show(v) } catch (e) { log('warn', `onsen: status pin: ${e}`) } }
+  // WO-165 A: with JEV_SCREEN on, what Onsen and the pin get is the screen reader's view (Jev's reading, or statusOf's with judged_by: program); the
+  // lanes (onsenStatusCompute) and the wake rows (lastView) keep statusOf's. A change of statusOf's view is an event: the screen is looked at at once
+  const feed = (v: OnsenStatus.StatusView): void => {
+    lastView = v
+    const pub = screenStatus ? screenStatus.view(v) : v
+    status.update(pub); try { pin?.show(pub) } catch (e) { log('warn', `onsen: status pin: ${e}`) }
+    screenStatus?.programChanged(v)
+  }
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
@@ -4465,6 +4491,23 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     return v
   }
   onsenStatusCompute = compute                                          // WO-157: the lanes' one state source (decideWake, 此刻, the same-matter gate)
+  // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's
+  // value, else the machine config's, re-read every 30 s), its TypeSafe key and Chiron's questions file (JCS screen-status/questions.json): Jev reads the
+  // bottom of the main's pane and its reading is reported. One look a second (JEV_SCREEN_POLL_MS) and at each change of statusOf's view; Jev only when the
+  // screen's hash changed; one call in flight, JEV_SCREEN_TIMEOUT_MS (3 s) each, at most JEV_SCREEN_MAX_PER_MIN (20) a minute
+  const ownPane = isControlEnabled() ? (process.env.CHANNEL_BOT_TMUX_SESSION ?? '').trim() : ''
+  if (ownPane) {
+    const lanesDir = process.env.LANES_DIR ?? join(AGENT_WORKSPACE_DIR, '.lanes')
+    const envMs = (k: string, d: number): number => { const n = Number(process.env[k]); return process.env[k] && Number.isFinite(n) && n > 0 ? n : d }
+    screenStatus = new ScreenStatus({ agent: ONSEN_AGENT, lanesDir, switchOn: () => switchOn(jevScreenValue(), ONSEN_AGENT), hasKey: () => !!jevKey(),
+      questionsPath: (process.env.JEV_SCREEN_QUESTIONS ?? '').trim() || QUESTIONS_PATH_DEFAULT(homedir()), snap: () => snapPane(ownPane),
+      isClaude: cmd => isClaudeCmd(cmd, new Set(dutyOfficer?.config().claude_cmds ?? [])), program: () => compute(),
+      publish: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } },
+      ask: (state, questions, timeoutMs, model) => jevAsk(state, questions, 'kbro-screen-status/1', timeoutMs, undefined, model),
+      logCall: rec => jevLog(lanesDir, rec), log: (lv, m) => log(lv, m) },
+      { pollMs: envMs('JEV_SCREEN_POLL_MS', 1000), timeoutMs: envMs('JEV_SCREEN_TIMEOUT_MS', 3000), maxPerMin: envMs('JEV_SCREEN_MAX_PER_MIN', 20) })
+    screenStatus.start()
+  }
   registry.start()
   setInterval(() => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   // WO-162 (2), lanes off: the transcript is read every ONSEN_TRANSCRIPT_POLL_MS (250 ms; a stat when nothing was written) and a change of the turn (a
@@ -4474,9 +4517,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
   }
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop() }
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop() }
   onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
-    turn_end_settling: facts.pendingLater(),
+    turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}),
     // WO-145: the visible half (only what is on)
     ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),
     ...(formInbox ? { forms: formInbox.stats } : {}), ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })

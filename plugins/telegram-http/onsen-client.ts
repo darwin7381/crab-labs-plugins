@@ -59,7 +59,7 @@ export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'
   detail?: Record<string, unknown> }
 /** step 3: the main's status (POST /status/batch). 1.45.1: the state is Claude Code's own session registry's (onsen-status.ts statusOf); last_activity_at =
  *  the newest write to the main's transcript or its subagents' (null = none found) */
-export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck'
+export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck' | 'walled' | 'starting'   // walled, starting: WO-165 A (Jev reads the screen; Onsen 0.12.5)
 export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown>; last_activity_at?: string | null }
 /** WO-145: the form answers this daemon queued for the main (POST /forms/ack), when Onsen did not take the ack directly */
 export type FormAck = { ids: number[]; at: string }

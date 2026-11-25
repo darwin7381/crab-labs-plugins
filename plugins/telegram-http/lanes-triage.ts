@@ -33,7 +33,9 @@ export function realNowMs(lanesDir: string): number {
     return statSync(p).mtimeMs
   } catch { return Date.now() }
 }
-export type JevCall = { site: string; question: unknown; inputs?: unknown; answer?: unknown; p?: number | null; ms: number; err?: string | null }
+export type JevCall = { site: string; question: unknown; inputs?: unknown; answer?: unknown; p?: number | null; ms: number; err?: string | null
+  /** WO-165 A: the response's usage ({input_tokens, output_tokens}: the price is per input token) and the model that answered, when the site has them */
+  usage?: unknown; model?: string | null }
 /** Appends one record to <lanesDir>/run/jev-calls.jsonl. ts = the real time; sim = the daemon's own clock (the simulated time under the
  *  shim: what the ledger and the transcripts show), so a call can be matched to both. Never throws. */
 export function jevLog(lanesDir: string, rec: JevCall): void {
@@ -41,7 +43,8 @@ export function jevLog(lanesDir: string, rec: JevCall): void {
   try {
     mkdirSync(join(lanesDir, 'run'), { recursive: true })
     const line = { ts: new Date(realNowMs(lanesDir)).toISOString(), sim: new Date().toISOString(), site: rec.site, question: rec.question,
-      inputs: rec.inputs ?? null, answer: rec.answer ?? null, p: typeof rec.p === 'number' && Number.isFinite(rec.p) ? rec.p : null, ms: rec.ms, err: rec.err ?? null }
+      inputs: rec.inputs ?? null, answer: rec.answer ?? null, p: typeof rec.p === 'number' && Number.isFinite(rec.p) ? rec.p : null, ms: rec.ms, err: rec.err ?? null,
+      ...(rec.usage != null ? { usage: rec.usage } : {}), ...(rec.model ? { model: rec.model } : {}) }
     appendFileSync(join(lanesDir, 'run', 'jev-calls.jsonl'), JSON.stringify(line) + '\n')
   } catch {}
 }
@@ -197,27 +200,31 @@ export async function triageShadow(lanesDir: string, ev: TriageEvent, r: TriageR
 /** One request to Jev with the given state and questions. Never throws: a failed call (no key, HTTP error, an HTML block page, a
  *  timeout) comes back as `error` and is never an answer. */
 export type JevLogCtx = { dir: string; site: string; inputs?: unknown; p?: (answers: Record<string, any>) => number | null | undefined }
-export async function jevAsk(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs = TIMEOUT_MS, log?: JevLogCtx): Promise<{ answers?: Record<string, any>; error?: string; ms: number }> {
-  const r = await jevAskRaw(state, questions, ua, timeoutMs)
+export type JevAskResult = { answers?: Record<string, any>; error?: string; ms: number
+  /** WO-165 A: the response's usage and the model that answered (null when the call failed) */
+  usage?: Record<string, unknown> | null; model?: string | null }
+/** model: a versioned id to send instead of the default (WO-165 A: Chiron's questions file pins the version its thresholds were tuned on) */
+export async function jevAsk(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs = TIMEOUT_MS, log?: JevLogCtx, model?: string | null): Promise<JevAskResult> {
+  const r = await jevAskRaw(state, questions, ua, timeoutMs, model || MODEL)
   if (log?.dir) {                                             // 002k: every call is in run/jev-calls.jsonl, failures included
     let p: number | null = null
     try { if (r.answers) p = log.p?.(r.answers) ?? null } catch {}
-    jevLog(log.dir, { site: log.site, question: questions, inputs: log.inputs, answer: r.answers ?? null, p, ms: r.ms, err: r.error ?? null })
+    jevLog(log.dir, { site: log.site, question: questions, inputs: log.inputs, answer: r.answers ?? null, p, ms: r.ms, err: r.error ?? null, usage: r.usage ?? null, model: r.model ?? null })
   }
   return r
 }
-async function jevAskRaw(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs: number): Promise<{ answers?: Record<string, any>; error?: string; ms: number }> {
+async function jevAskRaw(state: Record<string, unknown>, questions: Record<string, unknown>, ua: string, timeoutMs: number, model: string): Promise<JevAskResult> {
   const t0 = Date.now()
   try {
     const key = loadKey()
     if (!key) throw new Error('no key')
     const res = await fetch(api(), { method: 'POST', signal: AbortSignal.timeout(timeoutMs),
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': ua }, body: JSON.stringify({ model: MODEL, state, questions }) })
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'User-Agent': ua }, body: JSON.stringify({ model, state, questions }) })
     const text = await res.text()
-    let a: any
-    try { a = JSON.parse(text).answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
+    let j: any, a: any
+    try { j = JSON.parse(text); a = j.answers } catch { throw new Error(`not JSON (HTTP ${res.status})`) }
     if (!res.ok || !a || typeof a !== 'object') throw new Error(`HTTP ${res.status}, no answers`)
-    return { answers: a, ms: Date.now() - t0 }
+    return { answers: a, ms: Date.now() - t0, usage: j.usage && typeof j.usage === 'object' ? j.usage : null, model: typeof j.model === 'string' ? j.model : null }
   } catch (e: any) {
     return { error: `${e?.name ?? 'Error'}: ${e?.message ?? e}`.slice(0, 200), ms: Date.now() - t0 }
   }
