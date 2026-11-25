@@ -120,7 +120,10 @@ export function statusLine(v: StatusView, sinceMs: number, now = Date.now()): st
   if (v.state === 'stuck') {
     const t = v.last_activity_at ? Date.parse(v.last_activity_at) : NaN
     const n = Number.isFinite(t) ? Math.max(0, Math.floor((now - t) / 60_000)) : null
-    return n != null ? `🟡 處理中${since}：已經 ${n} 分鐘沒動靜` : `🟡 處理中${since}：很久沒動靜`
+    // the busy turn's start, not when it went quiet: 「處理中（14:00 起）：已經 10 分鐘沒動靜」 (WO-145 review)
+    const ts = d.turn_started_at ? Date.parse(String(d.turn_started_at)) : NaN
+    const s2 = Number.isFinite(ts) ? `（${tpe(ts)} 起）` : since
+    return n != null ? `🟡 處理中${s2}：已經 ${n} 分鐘沒動靜` : `🟡 處理中${s2}：很久沒動靜`
   }
   const subs = Number(d.subagents ?? 0)
   const doing = subs > 0 ? `等 ${subs} 隻子 agent` : d.tool?.name ? String(d.tool.name) : ''
