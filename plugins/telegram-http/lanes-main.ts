@@ -390,7 +390,15 @@ export function createMain(E: MainEnv) {
     const pid = Number(b.pid) || 0
     const ev = String(b.event ?? '')
     if (ev === 'SessionStart') return withMailbox(sessionStart(b, pid))
-    const g = currentGen()
+    let g = currentGen()
+    // 1.53.1 (Mnemosyne #12058, Chiron #12069: builder on txmonster, 2026-11-25): a main whose SessionStart never reached this daemon (the TUI started
+    // before the daemon answered, or the daemon restarted under it) was never the main again until its TUI restarted: every later event was "not the
+    // main" and its hand-overs piled up unread. With no live gen, any hook event of the registered session (main-expected) adopts it, as its
+    // SessionStart would have; the event is then handled as usual. A different session id, or a live gen of another process, is not adopted.
+    if (!g && pid && E.expectedSession().includes(String(b.session_id ?? ''))) {
+      const r = sessionStart({ ...b, source: 'adopt' }, pid)
+      if (r.accepted !== false) { E.log('info', `lanes: main adopted on ${ev} (no SessionStart reached this daemon) session=${b.session_id} pid=${pid}`); g = currentGen() }
+    }
     if (!g || !pid || Number(g.pid) !== pid) return {}                       // not the main: nothing of it is tracked
     // 002r (H05): a subagent's tool call. It starts, continues and ends no turn of the main, opens no tool of the main and is no boundary to pull at
     // (the pulled message would land in the subagent). While the main's turn is open (it waits on its Agent call) the subagent's work is the gen's

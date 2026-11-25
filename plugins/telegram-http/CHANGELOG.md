@@ -1,3 +1,14 @@
+## 1.54.1 — 2026-11-25
+
+- **Lanes on: a main whose SessionStart never reached the daemon is adopted on its next hook event (Mnemosyne #12058, Chiron #12069).**
+  - **Why:** builder on txmonster (TUI started 2026-11-25 10:58:16Z, when it moved from the Mac mini): its SessionStart was never accepted by the daemon
+    (no REGISTERED or REFUSED line; the last main record was the Mac process, gone 10:58:03Z). `mainEvent` answered every later event with "not the
+    main" when there was no live gen, so the main was never registered again until its TUI restarted, and 8 hand-overs piled up unread (same class as
+    Epeius #10931, lynceus).
+  - **The fix:** with no live gen, any hook event whose session id is the registered one (`main-expected`) runs the SessionStart registration
+    (`source: 'adopt'`) and is then handled as usual (log line `main adopted on <event>`). Another session id is not adopted; a live gen of another
+    process is not replaced by a non-SessionStart event (that still needs a SessionStart, as before).
+  - Tests: `lanes-main-adopt.test.ts` (adopt on UserPromptSubmit and the turn opens; a stranger's session adopts nothing; a live gen is not replaced).
 ## 1.54.0 — 2026-11-25
 
 - **The mail itself can live in Onsen** (board WO-160; Joey TG chiron:2160–2185, 2422). `MAIL_ONSEN=1` (machine config) sends every mailbox call — `send_to_agent` line=mail, `mailbox_list` / `open` / `check` / `reply` / `decide` / `card`, `mail_sent`, lane items, the due list, counts, the duty officer's rulings — to Fleet Core `/api/onsen/mail/*` (Onsen 0.11.0: the same 13 endpoints and shapes as BTCC's `/api/mesh/mail/*`), with the agent's own mesh credential. Unset or 0 = BTCC as before (the stop switch). The daemon logs which one at start. No text an agent reads changes.
