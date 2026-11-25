@@ -663,7 +663,7 @@ export function mainContext(agent: string, sid: string): string {
       + '會被程式讀進去照著做的檔（排程或交易用的狀態、清單、佇列）不要宣告，就算副檔名收：車道處理的是別人送來的文字，它加進去的一行會被那支程式當真。',   // Chiron's sentence (#10869)
     '- 長任務或要讀很多東西的事交出去：open_worker(title, brief) 開一條綁 Joey 私訊話題的工作線（一件事一個話題；它回你話題連結和話題名稱；bot 沒開私訊話題時，它會告訴你，那就自己做）；fork(task) 開一條帶著你目前脈絡的分身線。'
       + '做完用 lane_close 收掉：話題標上 ✅、留著不刪；Joey 之後在那個話題說的話交給你，你的 reply 會自動回到那個話題（reply_to 他那則，或 topic 指定；topic="0" 是話題外）。'
-      + '話題裡來的訊息，標籤帶 topic_state（closed＝那條線已結束）和 topic_anchor（那條線的定錨檔）：回答前先讀那份檔，Bot API 查不到話題的歷史訊息。',
+      + '話題裡來的訊息，標籤帶 topic_state（closed＝那條線已結束）和 topic_anchor（那條線的定錨檔）：回答前先讀那份檔，話題裡講過的用 chat_history 查。',   // WO-146: Onsen records topic messages (thread) in the DM's conversation; chat_history lists them
     '- 一件事可以拆成幾塊各自去查：用 fan_out(tasks, conclusion)，每塊開一條查詢線，最後一條綜合線讀完全部、交回你一份結論；你讀的是一份綜合，不是 N 份全文。不要自己一塊一塊查。',
     '- 你答應了別人什麼（給 Joey 或別的 agent「我會…」「…前給你」）：用 commitment(who, what, by, due) 記下；有時限就填 due，到時沒標完成會提醒 Joey。做完用 commitment_done。',
     '- 帳本裡累積了好幾筆記憶提案、你又閒著：用 curate_memory 把寫入權交給一條整理線去整理，做完它自己交還（curate_stop 隨時收回）；單筆提案用 memory_decide 決定。',

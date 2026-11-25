@@ -1993,7 +1993,8 @@ function buildServer(): Server {
         // lanes-topics (item 2): lanes on only
         ...(Lanes.LANES_ON ? ['- topic/topic_name: written in that topic; a reply to it lands there. reply(topic=…) picks one, "0" = outside.'] : []),
         '',
-        'reply takes files: ["/abs/path"] for attachments. react adds an emoji; edit_message updates progress silently. Edits don\'t push a notification: when a long task completes, send a NEW reply so their phone pings.',
+        // WO-146: the half-sentence on edit_message matches its tool description (detail inside one stage; a stage or the result is a new reply)
+        'reply takes files: ["/abs/path"] for attachments. react adds an emoji; edit_message adds detail inside one stage silently (no push); a new stage or the result is a NEW reply, so their phone pings.',
         '',
         // Onsen (WO-139): the agent has the conversation's history (chat_history) instead of asking for a paste
         '之前講過什麼（你說的、你回的、分身推的）：先用 chat_history 查，最新幾則、一段時間、搜內容都可以；查不到才去翻 session 紀錄。不用請對方再貼一次。',
@@ -2061,7 +2062,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
    type: 'string' as const,
    enum: richOn ? ['rich', 'text', 'markdownv2'] : ['text', 'markdownv2'],
    description: richOn
-     ? "Rendering mode. Default 'rich': write NORMAL GFM markdown — tables (| a | b |), **bold**, *italic*, `code`, ```fenced```, [links](url) — rendered natively via Telegram Rich Messages with NO escaping. Use 'text' for plain unrendered output. 'markdownv2' = legacy escaped mode."
+     ? "Rendering mode. Default 'rich': write NORMAL GFM markdown — tables (| a | b |), **bold**, *italic*, `code`, ```fenced``` — rendered natively via Telegram Rich Messages with NO escaping. Put each URL on its own line as a bare link with nothing attached before or after it (no **, colon or bracket); do not use [text](url). Use 'text' for plain unrendered output. 'markdownv2' = legacy escaped mode."
      : "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
  }
  return ({
@@ -2069,7 +2070,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone, so a result, each new stage of a long task, and anything they must decide goes out as a new reply. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2082,7 +2083,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each. Do not attach .md documents or long reports: put them in TKG (share-markdown) and send the link.',
           },
           format: formatSchema,
           // lanes-topics (item 2): lanes on only (lanes off, the tool is exactly the fleet's)
@@ -2096,7 +2097,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'react',
-      description: 'Add an emoji reaction to a Telegram message. Telegram only accepts a fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc) — non-whitelisted emoji will be rejected.',
+      description: 'Add an emoji reaction to a Telegram message: a silent status mark, never a report. Telegram accepts only its fixed set; for our use: 🫡 received or starting, 👍 agree, 💯 well done, 🎉 done, 🤔 looking into it, 😢 stuck, 🔥 found it (👀 is added automatically when a message arrives). ✅ ❌ 💪 🔍 are rejected.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2120,7 +2121,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent. Useful for interim progress updates. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
+      description: 'Edit a message the bot previously sent. Edits are silent (no push): use them for detail inside one stage; a new stage, the result, or anything they must see goes out as a new reply.',
       inputSchema: {
         type: 'object',
         properties: {

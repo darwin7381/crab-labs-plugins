@@ -122,7 +122,7 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'feed_search',
-    description: '搜尋牆。',
+    description: '用一到幾個詞搜牆上的貼文（讀過的也列，只給短卡，要讀用 feed_open）；開工前看跟這件事有關、還沒讀過的，用 feed_ask。',   // WO-146 (Chiron)
     inputSchema: {
       type: 'object',
       required: ['q'],
