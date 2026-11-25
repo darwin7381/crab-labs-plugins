@@ -214,14 +214,14 @@ describe('the sender', () => {
     const sent: any[] = []
     let answer: any = { status: 200, json: { results: [{ to: 'eve', seq: 4, duplicate: false, pulling: true }] } }
     const s = new OnsenSender({ req: async (_m, _p, b) => { sent.push(b); if (answer instanceof Error) throw answer; return answer }, log: quiet })
-    expect(await s.send('eve', 'call', { text: 'hi' }, 'msg:9')).toEqual({ stored: true, duplicate: false, pulling: true })
-    expect(sent[0]).toEqual({ to: 'eve', kind: 'call', payload: { text: 'hi' }, dedupe: 'msg:9' })
+    expect(await s.send('eve', 'peer_call', { text: 'hi' }, 'msg:9', { refs: { btcc_msg_id: 9 }, no_reply: true })).toEqual({ stored: true, duplicate: false, pulling: true })
+    expect(sent[0]).toEqual({ to: 'eve', kind: 'peer_call', payload: { text: 'hi' }, dedupe: 'msg:9', refs: { btcc_msg_id: 9 }, no_reply: true })
     answer = { status: 200, json: { results: [{ to: 'eve', seq: 4, duplicate: true, pulling: false }] } }
-    expect(await s.send('eve', 'call', { text: 'hi' }, 'msg:9')).toEqual({ stored: true, duplicate: true, pulling: false })
+    expect(await s.send('eve', 'peer_call', { text: 'hi' }, 'msg:9')).toEqual({ stored: true, duplicate: true, pulling: false })
     answer = new Error('down')
-    expect(await s.send('eve', 'call', { text: 'hi' }, null)).toEqual({ stored: false, duplicate: false, pulling: false })
+    expect(await s.send('eve', 'peer_call', { text: 'hi' }, null)).toEqual({ stored: false, duplicate: false, pulling: false })
     answer = { status: 400, json: { detail: 'payload.text is required' } }
-    expect((await s.send('eve', 'call', {}, null)).stored).toBe(false)
+    expect((await s.send('eve', 'peer_call', {}, null)).stored).toBe(false)
     expect(s.stats).toMatchObject({ sent: 2, duplicate: 1, failed: 2 })
   })
 })

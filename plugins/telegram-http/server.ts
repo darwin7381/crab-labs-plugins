@@ -1696,8 +1696,9 @@ async function mirrorPushedMail(id: number, reply: boolean): Promise<void> {
     if (m.status !== 200 || typeof j?.to !== 'string') throw new Error(`GET mail #${id}: HTTP ${m.status}`)
     const text = pushedMailText({ id, from: String(j.from ?? INBOX_SELF), title: j.title, ask: j.ask, body: j.body, deadline: j.deadline, no_reply: j.no_reply,
       reply_to_id: j.reply_to_id }, reply)
-    await onsenSender!.send(String(j.to), 'mail', { text, msg_id: id, logged: true, line: 'mail',
-      ...(j.reply_to_id != null ? { reply_to_id: j.reply_to_id } : {}), ...(j.no_reply === true ? { no_reply: true } : {}) }, `msg:${id}`)
+    await onsenSender!.send(String(j.to), 'peer_mail', { text, msg_id: id, logged: true, line: 'mail',
+      ...(j.reply_to_id != null ? { reply_to_id: j.reply_to_id } : {}), ...(j.no_reply === true ? { no_reply: true } : {}) }, `msg:${id}`,
+      { refs: { btcc_msg_id: id }, no_reply: j.no_reply === true })
   } catch (e) {
     log('warn', `onsen send: pushed mail #${id} not written to Onsen (${e instanceof Error ? e.message : e}); BTCC's push carried it as before`)
   }
@@ -2025,9 +2026,11 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // recipient's daemon is pulling (Onsen 0.9.1 `pulling`: it polled in the last 90 s) = delivered (the same answer as a delivered push); otherwise the
   // failure stands as before (the call waits in Onsen, not counted as delivered)
   if (onsenSender) {
-    if (delivery === 'delivered') void onsenSender.send(target, 'call', payload, onsenKey)
+    const facts = { refs: { ...(msgId != null ? { btcc_msg_id: msgId } : {}), ...(extra?.thread ? { thread: extra.thread } : {}), ...(opRef ? { op: opRef } : {}) },
+      no_reply: !!noReply }
+    if (delivery === 'delivered') void onsenSender.send(target, 'peer_call', payload, onsenKey, facts)
     else {
-      const o = await onsenSender.send(target, 'call', payload, onsenKey)
+      const o = await onsenSender.send(target, 'peer_call', payload, onsenKey, facts)
       if (o.stored && o.pulling) {
         onsenSender.stats.delivered_by_onsen++
         log('info', `send to ${target}: the push failed${detail}; delivered through Onsen (${onsenKey}; the recipient's daemon is pulling)`)

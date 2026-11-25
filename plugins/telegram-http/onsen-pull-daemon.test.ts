@@ -257,8 +257,8 @@ test('(e) the sender: one key in /inject and in Onsen; a failed push counts as d
   const inj1 = eveGot.at(-1)
   expect(inj1).toMatchObject({ text: '因為：測試\nWO151 e1', from: 'zed', logged: true, msg_id: commsId, dedupe: `msg:${commsId}` })
   expect(await until(() => store.sends.some(s => s.payload?.text === '因為：測試\nWO151 e1'), 5000)).toBe(true)
-  expect(store.sends.find(s => s.payload?.text === '因為：測試\nWO151 e1')).toEqual({ caller: 'zed', to: 'eve', kind: 'call', dedupe: `msg:${commsId}`,
-    payload: { text: '因為：測試\nWO151 e1', logged: true, msg_id: commsId } })
+  expect(store.sends.find(s => s.payload?.text === '因為：測試\nWO151 e1')).toEqual({ caller: 'zed', to: 'eve', kind: 'peer_call', dedupe: `msg:${commsId}`,
+    payload: { text: '因為：測試\nWO151 e1', logged: true, msg_id: commsId }, refs: { btcc_msg_id: commsId } })
   // BTCC unreachable: a fresh call:<uuid>, the same in both
   commsMode = 'down'
   expect(await call({ line: 'call', to: 'eve', because: '測試', text: 'WO151 e2' })).toMatch(/^delivered to eve's inbox/)
@@ -284,13 +284,13 @@ test('(e) the sender: one key in /inject and in Onsen; a failed push counts as d
   mailRecord['7001'] = { id: 7001, from: 'zed', to: 'eve', title: '備份', ask: '今天內確認', body: 'WO151 e5 內文', deadline: '2026-11-26T03:04:00.123456+00:00', no_reply: false, reply_to_id: null }
   const t5 = await call({ line: 'mail', to: 'eve', title: '備份', ask: '今天內確認', text: 'WO151 e5 內文' })
   expect(t5).toBe('eve 的信箱還沒開，這封照舊直接送進它的 session（#7001）。')
-  expect(await until(() => store.sends.some(s => s.kind === 'mail'), 5000)).toBe(true)
-  expect(store.sends.find(s => s.kind === 'mail')).toEqual({ caller: 'zed', to: 'eve', kind: 'mail', dedupe: 'msg:7001',
-    payload: { text: '【信】備份\n要你：今天內確認\nWO151 e5 內文\n（期限 11-26 03:04Z。#7001）', msg_id: 7001, logged: true, line: 'mail' } })
+  expect(await until(() => store.sends.some(s => s.kind === 'peer_mail'), 5000)).toBe(true)
+  expect(store.sends.find(s => s.kind === 'peer_mail')).toEqual({ caller: 'zed', to: 'eve', kind: 'peer_mail', dedupe: 'msg:7001',
+    payload: { text: '【信】備份\n要你：今天內確認\nWO151 e5 內文\n（期限 11-26 03:04Z。#7001）', msg_id: 7001, logged: true, line: 'mail' }, refs: { btcc_msg_id: 7001 } })
   mailAnswer = { id: 7002, stored: true }
   expect(await call({ line: 'mail', to: 'eve', title: '存著', ask: '看一下', text: 'WO151 e6' })).toMatch(/^已放進 eve 的信箱（#7002）/)
   await sleep(500)
-  expect(store.sends.filter(s => s.kind === 'mail').length).toBe(1)
+  expect(store.sends.filter(s => s.kind === 'peer_mail').length).toBe(1)
   const h = (await snd.health())
   expect(h.onsen_send).toMatchObject({ on: true, sent: 5, failed: 0, delivered_by_onsen: 1 })   // e1–e4 calls and the pushed mail
   expect(h.onsen_pull).toMatchObject({ on: false })

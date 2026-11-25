@@ -284,7 +284,10 @@ class NoCredential extends Error {}
 export const BASELINE_AFTER = Number.MAX_SAFE_INTEGER
 
 // ------------------------------------------------------------------ send (3b)
-export type SendKind = 'call' | 'mail' | 'scheduled' | 'alert' | 'board' | 'watchdog' | 'ring' | 'other'
+// Onsen 0.9.3: WO-147's source kinds (/send refuses any other name with 400)
+export type SendKind = 'peer_call' | 'peer_mail'
+/** the sender's facts in their own fields (Onsen 0.9.3, Chiron WO-151 11:15Z); the text stays as the agent reads it */
+export type SendFacts = { refs?: { btcc_msg_id?: number; thread?: string; op?: string }; no_reply?: boolean }
 
 export type SendOutcome = { stored: boolean; duplicate: boolean; pulling: boolean }
 export class OnsenSender {
@@ -293,9 +296,11 @@ export class OnsenSender {
   constructor(readonly o: { req: Req; log: Log; now?: () => number }) {}
   /** POST /send; never throws. stored: Onsen has it (new or already had it); pulling (Onsen 0.9.1): the recipient's daemon asked for its inbox in the
    *  last 90 s, so it will take it */
-  async send(to: string, kind: SendKind, payload: Record<string, unknown>, dedupe: string | null): Promise<SendOutcome> {
+  async send(to: string, kind: SendKind, payload: Record<string, unknown>, dedupe: string | null, facts: SendFacts = {}): Promise<SendOutcome> {
     try {
-      const r = await this.o.req('POST', '/send', { to, kind, payload, ...(dedupe ? { dedupe } : {}) }, 10_000)
+      const refs = facts.refs && Object.keys(facts.refs).length ? facts.refs : undefined
+      const r = await this.o.req('POST', '/send', { to, kind, payload, ...(dedupe ? { dedupe } : {}), ...(refs ? { refs } : {}),
+        ...(facts.no_reply ? { no_reply: true } : {}) }, 10_000)
       const res = r?.status === 200 && Array.isArray(r.json?.results) ? r.json.results : null
       if (res) {
         this.stats.sent++
