@@ -1852,8 +1852,10 @@ type PermCopy = { chat: string; msg: number; text: string }
 type PermPrompt = { request_id: string; tool_name: string; preview: string; copies: PermCopy[]; action: Onsen.ActionHandle | null; opened: number
   ended: { how: 'answered' | 'gone'; option?: 'allow' | 'deny'; member?: string | null; via: 'telegram' | 'onsen' | 'daemon' | 'officer'; at: number } | null }
 const permPrompts = new Map<string, PermPrompt>()
+// WO-197 (Chiron mesh 12852, 「不靠第二張名單對齊」): an agent named in ONSEN_BRIDGE has its Actions on, whatever ONSEN_ACTIONS says: a connector asks
+// people only through Actions. Asked each time, so it holds from the moment the agent is named (the 5 s connector check), not only at start
 const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log,
-  on: Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
+  on: () => connectorNow() || Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
 // A prompt lives only in this process (Claude Code's channel answer goes to the session that asked): after a restart the channel cannot answer it any
 // more. The open ones' Action ids are kept in a file. The next start keeps them for ONSEN_PERM_RESTART_GRACE_MS (180 s): a duty officer that asks
 // about the prompt still on the screen takes the Action over (MenuActions.shared, WO-176 r2: one Action per prompt); what nobody took is cancelled

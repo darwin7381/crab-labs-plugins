@@ -292,3 +292,6 @@ plugins/telegram-http/server.ts::for (const p of openMainPrompts()) if (p.opened
 plugins/telegram-http/server.ts::if (open.some(p => p.opened > was.since)) for (const p of open) if (p.opened <= was.since) permOffScreen(p,
 plugins/telegram-http/server.ts::(tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')
 plugins/telegram-http/onsen-screen-menu-daemon.test.ts::its Action is cancelled once, with the reason; nothing pressed from here
+plugins/telegram-http/server.ts::on: () => connectorNow() || Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
+plugins/telegram-http/onsen-client.ts::get on(): boolean { const v = this.o.on; return typeof v === 'function' ? v() !== false : v !== false }
+plugins/telegram-http/onsen-connector-actions-daemon.test.ts::named at runtime (the machine config), ONSEN_ACTIONS=0

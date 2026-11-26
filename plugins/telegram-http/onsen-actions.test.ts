@@ -315,6 +315,20 @@ describe('OnsenActions', () => {
     expect(s.calls.find(c => c.path === '/v1/actions/2/resolve')!.body.resolved_by).toBe('joey')
   })
 
+  test('WO-197 (Chiron mesh 12852): `on` as a function is asked at each new Action (a connector named at runtime has its Actions on from then)', async () => {
+    const s = standIn()
+    let named = false
+    const a = new OnsenActions({ req: s.req, log, on: () => named })
+    expect(a.on).toBe(false)
+    expect(a.open(perm, 'kf1')).toBeNull()
+    named = true
+    expect(a.on).toBe(true)
+    const h = a.open(perm, 'kf2')!
+    await h.tail
+    expect(h.state).toBe('open')
+    expect(s.calls.filter(c => c.path === '/v1/actions')).toHaveLength(1)
+  })
+
   test('newestOpen: the newest Action still open of a kind', async () => {
     const s = standIn()
     const a = new OnsenActions({ req: s.req, log })

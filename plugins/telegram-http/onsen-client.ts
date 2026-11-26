@@ -1408,9 +1408,10 @@ export class OnsenActions {
   private byId = new Map<string, ActionHandle>()
   private credWarnAt = 0
   private callErr = ''
-  constructor(readonly o: { req: ActionReq; log: Log; on?: boolean; timeoutMs?: number; retryMs?: number[]; keep?: number }) {}
-  /** making new Actions (ONSEN_ACTIONS); the calls about one that exists go on either way */
-  get on(): boolean { return this.o.on !== false }
+  constructor(readonly o: { req: ActionReq; log: Log; on?: boolean | (() => boolean); timeoutMs?: number; retryMs?: number[]; keep?: number }) {}
+  /** making new Actions (ONSEN_ACTIONS); the calls about one that exists go on either way. WO-197 (Chiron mesh 12852): a function is asked each time
+   *  (server.ts: a connector's Actions are on whatever ONSEN_ACTIONS says, from the moment it is named) */
+  get on(): boolean { const v = this.o.on; return typeof v === 'function' ? v() !== false : v !== false }
 
   /** a new Action (returns at once; Onsen makes it in the background). `made`: called once Onsen gave it an id. null: off, or not a valid Action */
   open(a: NewAction, key: string, made?: (h: ActionHandle) => void): ActionHandle | null {
