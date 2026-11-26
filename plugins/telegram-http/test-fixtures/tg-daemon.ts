@@ -25,7 +25,8 @@ export type TgDaemon = { port: number; stateDir: string; ws: string; home: strin
   client: () => Promise<Client>; call: (name: string, args: Record<string, unknown>) => Promise<{ text: string; isError: boolean }> }
 
 /** root: the test's temp dir (kept across a restart: the same root gives the same state); joey: the allowlisted Telegram user id */
-export async function startTgDaemon(api: BotApiMock, root: string, joey: number, env: Record<string, string> = {}): Promise<TgDaemon> {
+export async function startTgDaemon(api: BotApiMock, root: string, joey: number, env: Record<string, string> = {},
+  ready: (h: any) => boolean = h => h?.polling === true): Promise<TgDaemon> {   // WO-197: a connector never polls (ready: its /healthz answers)
   const home = join(root, 'home'), ws = join(root, 'ws'), stateDir = join(ws, '.telegram-state')
   for (const d of [home, ws, stateDir, join(ws, '.lanes')]) mkdirSync(d, { recursive: true })
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: [String(joey)], groups: {}, pending: {}, ackReaction: '' }))
@@ -43,7 +44,7 @@ export async function startTgDaemon(api: BotApiMock, root: string, joey: number,
     stdout: 'ignore', stderr: 'ignore',
   })
   const health = () => fetch(`http://127.0.0.1:${port}/healthz`).then(r => r.json()).catch(() => null) as Promise<any>
-  if (!await until(async () => (await health())?.polling === true, 20000)) throw new Error('tg daemon did not start polling')
+  if (!await until(async () => ready(await health()), 20000)) throw new Error('tg daemon did not start polling')
   let c: Client | null = null
   const client = async (): Promise<Client> => {
     if (c) return c

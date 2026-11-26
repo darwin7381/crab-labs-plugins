@@ -17,8 +17,17 @@ export type OnsenStandin = {
   say: (who: Who, chat: string, text: string, attachments?: any[], reply_to?: any) => number
   /** any item into the inbox of `who` (a peer's call, for instance); its seq */
   put: (who: Who, kind: string, payload: any, dedupe: string) => number
-  /** per credential: Onsen's version (default 0.31.0), POST /messages answering 500, a delay before A is answered (ms) */
-  st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number }
+  /** per credential: Onsen's version (default 0.31.0), POST /messages answering 500, a delay before A is answered (ms). WO-197: `bridge[who]`: a
+   *  Telegram bridge carries that agent (its messages are written pending and reported sent after delayMs with the next Telegram numbers, one per
+   *  ~4000 characters of text and one per file); off: they stay pending (bridgeOn() draws them later) */
+  st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number; bridge: Record<Who, { on: boolean; delayMs: number; next: number }> }
+  /** WO-197: the connector's writes (POST /v1/messages), reactions (POST /v1/messages/<id>/reactions) and edits (PUT /v1/messages/<id>) */
+  connector: Array<{ who: Who; kind: 'message' | 'reaction' | 'edit'; id: number; body: any }>
+  /** WO-197: the bridge of `who` comes on: what waits pending is drawn now */
+  bridgeOn: (who: Who) => void
+  /** WO-197: the conversation of a chat (made the first time); a person's message in it from Telegram (as the bridge writes it: its number an alias) */
+  conv: (chat: string) => string
+  heard: (who: Who, chat: string, n: number, text: string) => number
   writes: (who: Who) => Msg[]
   reports: (who: Who, id?: number) => Seen[]
   stop: () => void
@@ -47,7 +56,22 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       ...(it.forward_from ? { forward_from: it.forward_from } : {}), ...(it.meta?.forward_date ? { forward_date: it.meta.forward_date } : {}),
       ...(it.meta?.media_group_id ? { media_group_id: it.meta.media_group_id } : {}) }
   }
-  const st: OnsenStandin['st'] = { version: {}, a500: {}, aDelayMs: 0 }
+  const st: OnsenStandin['st'] = { version: {}, a500: {}, aDelayMs: 0, bridge: {} }
+  const connector: OnsenStandin['connector'] = []
+  // WO-197: a connector's conversations: one per chat (id 700 + n); `onsen:<id>` chats have no client (nothing draws them)
+  const convs: string[] = []
+  const convOf = (chat: string): number => { let i = convs.indexOf(chat); if (i < 0) { convs.push(chat); i = convs.length - 1 } return 700 + i }
+  const chatOf = (cid: number): string | undefined => convs[cid - 700]
+  const draw = (m: Msg): void => {
+    const b = st.bridge[m.who]
+    if (!b || !b.on || m.delivery?.state !== 'pending') return
+    setTimeout(() => {
+      if (m.delivery?.state !== 'pending') return
+      const n = Math.max(1, Math.ceil(String(m.item.body ?? '').length / 4000)) + (m.item.attachment_file_ids?.length ?? 0)
+      for (let i = 0; i < n; i++) m.aliases.push(String(b.next++))
+      m.delivery = { state: 'sent', delivered_at: new Date().toISOString() }
+    }, b.delayMs)
+  }
   let next = 4000
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
   const full = (m: Msg) => ({ id: m.id, agent: m.item.agent, chat: m.item.chat, at: m.item.sent_at, direction: m.item.direction, sender: m.item.direction === 'out' ? `agent:${m.item.agent}` : m.item.sender,
@@ -80,9 +104,41 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       files.set(key, had)
       return Response.json({ api_version: 1, data: { id: had.id, bytes: raw.length, url: `http://127.0.0.1:${server.port}/api/onsen/v1/files/${had.id}` } }, { status: 201 })
     }
-    const body = req.method === 'POST' ? await req.json().catch(() => null) : undefined
+    const body = req.method === 'POST' || req.method === 'PUT' ? await req.json().catch(() => null) : undefined
     seen.push({ who, method: req.method, path, body, headers, at: Date.now() })
     if (path === '/v1/meta') return Response.json({ api_version: 1, data: { server_version: st.version[who] ?? '0.31.0', commit: 'test', deployed_at: '2026-11-26T10:00:43Z' } })
+    // WO-197: the connector's side of CONTRACT §7d (Onsen 0.35.2)
+    const bc = path.match(/^\/v1\/conversations\/by-chat\/([^/]+)$/)
+    if (bc) {
+      const chat = decodeURIComponent(bc[1]!)
+      if (!msgs.some(m => m.who === who && String(m.item.chat) === chat) && !convs.includes(chat)) return Response.json({ error: { code: 'not_found', message: `no ${chat}` } }, { status: 404 })
+      return Response.json({ api_version: 1, data: { id: String(convOf(chat)), kind: 'direct' } })
+    }
+    const bm = path.match(/^\/v1\/conversations\/(\d+)\/messages\/by-client-id\/([^/]+)$/)
+    if (bm) {
+      const chat = chatOf(Number(bm[1])), n = decodeURIComponent(bm[2]!)
+      const m = chat == null ? undefined : msgs.find(x => x.who === who && String(x.item.chat) === chat && (x.aliases.includes(n) || `form-${x.id}` === n))
+      return m ? Response.json({ api_version: 1, data: { id: String(m.id), conversation_id: bm[1] } }) : Response.json({ error: { code: 'not_found', message: `no ${n}` } }, { status: 404 })
+    }
+    if (path === '/v1/messages' && req.method === 'POST') {
+      if (st.a500[who]) return Response.json({ error: { message: 'database is down' } }, { status: 500 })
+      const bad = ['client', 'chat', 'delivery', 'client_msg_id', 'backfilled', 'deliver'].filter(k => k in (body ?? {}))
+      if (bad.length || (body?.conversation_id == null) === (body?.to == null)) return Response.json({ error: { message: `with conversation_id / to, no ${bad.join(', ')}` } }, { status: 400 })
+      const had = msgs.find(m => m.who === who && m.item.idem_key === body.idem_key)
+      if (had) return Response.json({ api_version: 1, data: { message_id: String(had.id), conversation_id: String(body.conversation_id), duplicate: true, delivery: had.delivery?.state ?? 'sent' } })
+      const cid = Number(body.conversation_id), chat = chatOf(cid) ?? `onsen-${cid}`
+      const drawn = chatOf(cid) != null && !!st.bridge[who]
+      const m: Msg = { id: next++, who, item: { ...body, chat, agent: 'adam', direction: 'out', status: 'ok' }, at: Date.now(), path: '/messages', aliases: [],
+        files: body.attachment_file_ids ?? [], delivery: drawn ? { state: 'pending' } : { state: 'sent', delivered_at: new Date().toISOString() } }
+      msgs.push(m)
+      connector.push({ who, kind: 'message', id: m.id, body })
+      draw(m)
+      return Response.json({ api_version: 1, data: { message_id: String(m.id), conversation_id: String(cid), duplicate: false, delivery: m.delivery!.state } }, { status: 201 })
+    }
+    const cr = path.match(/^\/v1\/messages\/(\d+)\/reactions$/)
+    if (cr && req.method === 'POST') { connector.push({ who, kind: 'reaction', id: Number(cr[1]), body }); return Response.json({ api_version: 1, data: { message_id: cr[1], emojis: body?.emojis } }) }
+    const ce = path.match(/^\/v1\/messages\/(\d+)$/)
+    if (ce && req.method === 'PUT') { connector.push({ who, kind: 'edit', id: Number(ce[1]), body }); return Response.json({ api_version: 1, data: { message_id: ce[1], changed: true } }) }
     if (path === '/messages' && req.method === 'POST') {
       if (st.aDelayMs) await sleep(st.aDelayMs)
       if (st.a500[who]) return Response.json({ detail: 'database is down' }, { status: 500 })
@@ -137,7 +193,11 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
   return {
-    port: server.port!, msgs, seen, files, st, inbox, put,
+    port: server.port!, msgs, seen, files, st, inbox, put, connector,
+    conv: chat => String(convOf(chat)),
+    heard: (who, chat, n, text) => { convOf(chat); const m: Msg = { id: next++, who, item: { chat, agent: 'adam', direction: 'in', sender: `tg:${chat}`, body: text, kind: 'text' }, at: Date.now(),
+      path: '/messages', aliases: [String(n)], files: [], delivery: null }; msgs.push(m); return m.id },
+    bridgeOn: who => { const b = st.bridge[who] ?? (st.bridge[who] = { on: true, delayMs: 50, next: 900 }); b.on = true; for (const m of msgs) if (m.who === who) draw(m) },
     say: (who, chat, text, attachments = [], reply_to = null) => {
       const id = next++
       return put(who, 'person_message', { message_id: String(id), conversation_id: '1', from: 'joey', via: 'web', text, kind: 'text', sent_at: new Date().toISOString(), attachments,
