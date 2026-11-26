@@ -22,9 +22,9 @@ const CALLER: Record<string, string> = { [CRED]: 'adam', [CRED2]: 'bea' }
 
 // ------------------------------------------------------------------ the stand-in Onsen
 type ACall = { caller: string; method: string; path: string; body: any; idem: string | null; at: number; refused?: boolean }
-// the fields Onsen 0.24.x takes on each write (onsen_actions.py; body_json refuses any other with 400 「不收的欄位」)
+// the fields Onsen 0.24.3 takes on each write (onsen_actions.py; body_json refuses any other with 400 「不收的欄位」)
 const FIELDS: Record<string, string[]> = { create: ['kind', 'source', 'requested_by', 'session_id', 'assignees', 'summary', 'body', 'options', 'expires_at', 'refs',
-  'menu_kind', 'state', 'selected_option_id', 'resolved_by', 'note', 'action_id'], resolve: ['option_id', 'expected_version', 'note', 'resolved_by', 'session_id'],
+  'menu_kind', 'state', 'selected_option_id', 'resolved_by', 'note', 'action_id', 'opened_at', 'resolved_at'], resolve: ['option_id', 'expected_version', 'note', 'resolved_by', 'session_id', 'at'],
   applied: ['at', 'option_id', 'resolved_by'], cancel: ['expected_version', 'reason'] }
 const calls: ACall[] = []
 const actions = new Map<string, any>()
@@ -69,7 +69,7 @@ function startOnsen(): void {
       if (op === 'resolve') {
         if (a.state !== 'open') return err(409, 'version_conflict', `動作 ${a.id} 已經${a.state}`)
         if (body.expected_version !== a.version) return err(409, 'version_conflict', '版本對不上')
-        if (!a.assignees.includes(body.resolved_by)) return err(400, 'invalid_request', 'resolved_by')
+        if (!a.assignees.includes(body.resolved_by) && body.resolved_by !== 'duty-officer') return err(400, 'invalid_request', 'resolved_by')   // 0.24.3: the officer as it is
         Object.assign(a, { state: 'resolved', selected_option_id: body.option_id, resolved_by: body.resolved_by, version: a.version + 1 })
         return Response.json({ data: a })
       }
@@ -224,10 +224,9 @@ test('pressed in Telegram: Claude Code is answered; the Action is resolved by th
   expect(await until(() => s.perms.length === 1)).toBe(true)
   expect(s.perms[0]).toEqual({ request_id: 'bcdef', behavior: 'allow' })
   expect(await until(() => of(id, 'applied').length === 1)).toBe(true)
-  expect(of(id, 'resolve')[0]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test' })
-  // r3: the press time went first (`at`); Onsen 0.24.x refused that field, so the same resolve went without it, and every later one too (one log line)
-  expect(calls.filter(c => c.path === `/v1/actions/${id}/resolve` && c.refused).map(c => c.body.at)).toEqual([expect.stringMatching(/^\d{4}-\d\d-\d\dT/)])
-  expect((tg.log().match(/Onsen does not take the press times yet/g) ?? []).length).toBe(1)
+  // r3 (Onsen 0.24.3): the resolve carries when it was pressed (`at`), and nothing Onsen refuses
+  expect(of(id, 'resolve')[0]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test', at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) })
+  expect(calls.some(c => c.refused)).toBe(false)
   expect(of(id, 'applied')[0]!.body).toEqual({ at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) })
   expect(actions.get(id)).toMatchObject({ state: 'resolved', selected_option_id: 'allow', resolved_by: 'joey-test' })
   expect(await until(() => api.of('editMessageText').length === e0 + 1)).toBe(true)

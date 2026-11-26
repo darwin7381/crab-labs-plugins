@@ -1634,8 +1634,8 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
     open: (f, key, made) => { acts.open({ source: 'menu', ...f }, key, h => { if (h.id) made(h.id, h.version) }) },
     pressed: (f, option_id, key, times) => { acts.open({ source: 'menu', ...f, resolved: { option_id, by: 'duty-officer', ...(times ?? {}) } }, key) },
     // WO-176 r3 (Chiron 04:42Z): the officer pressed the permission prompt on the main's screen itself: the prompt's own Action (the channel's, or after a
-    // restart Onsen's open one) is resolved by duty-officer (joined to it first: resolved_by is an assignee), at the press time, then applied; its
-    // Telegram copies close the way a tap closes one; no second Action
+    // restart Onsen's open one) is resolved by duty-officer through the requester's path (Onsen 0.24.3: no join, its assignees stay who was asked), at
+    // the press time, then applied; its Telegram copies close the way a tap closes one; no second Action
     pressedPermission: async (t, option, o) => {
       if (!own() || t.tmux !== own()) return false
       let best: PermPrompt | null = null
@@ -1651,9 +1651,7 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
         savePermOpen()
         permCopiesDone(best, option, `值班員按的：「${o.choose}」`)
       }
-      acts.join(h, ['duty-officer'])
-      const hh = h
-      acts.pressedElsewhere(h, option, 'duty-officer', o.at, true, () => acts.cancel(hh, '值班員在畫面上按掉了（沒能記成它按的）'))
+      acts.pressedElsewhere(h, option, 'duty-officer', o.at, true)
       permScreenPressed()                                                // any other prompt still open: over too (as before)
       return true
     },
