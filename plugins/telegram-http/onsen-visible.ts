@@ -268,7 +268,9 @@ export class StatusPin {
   private saved: { chats: Record<string, { message_id: number; pinned: boolean; text: string | null }>; since?: { state: string; since: number; at: number } }
   private warnAt = new Map<string, number>()
   readonly stats = { sent: 0, edits: 0, pin_checks: 0, stopped: 0, errors: 0 }
-  constructor(readonly o: { dir: string; api: PinApi; log: Log; now?: Now; minEditMs?: number; pinCheckMs?: number; retryMs?: number }) {
+  constructor(readonly o: { dir: string; api: PinApi; log: Log; now?: Now; minEditMs?: number; pinCheckMs?: number; retryMs?: number
+    /** WO-197: true while the agent is a connector (the bridge draws the pin): nothing is sent, edited, pinned or checked, and what waited is dropped */
+    paused?: () => boolean }) {
     this.file = join(o.dir, 'status-pin.json')
     this.saved = { chats: {} }
     try { const j = JSON.parse(readFileSync(this.file, 'utf8')); if (j && typeof j === 'object' && j.chats) this.saved = j } catch {}
@@ -353,6 +355,7 @@ export class StatusPin {
     void this.pump(chat, s)
   }
   private async pump(chat: string, s: Slot): Promise<void> {
+    if (this.o.paused?.()) { if (s.timer) { clearTimeout(s.timer); s.timer = null } s.want = null; return }   // WO-197 (lab: plutus refused every 5 s after the switch)
     if (s.busy || s.want == null || this.slots.get(chat) !== s) return
     const now = this.now()
     if (s.message_id == null) {

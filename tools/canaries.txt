@@ -379,3 +379,5 @@ plugins/telegram-http/onsen-client.ts::export const isRoamerEnv = (env: NodeJS.P
 plugins/telegram-http/onsen-client.ts::if (!recordOn(env) || isRoamerEnv(env)) return false
 plugins/telegram-http/server.ts::onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool
 plugins/telegram-http/onsen-spool-skip.test.ts::1.58.32: a roamer records nothing into the spool
+plugins/telegram-http/onsen-visible.ts::if (this.o.paused?.()) { if (s.timer) { clearTimeout(s.timer); s.timer = null } s.want = null; return }
+plugins/telegram-http/server.ts::const pin = new OnsenVisible.StatusPin({ dir: join(STATE_DIR, 'onsen'), log, paused: () => connectorNow(), api: {

@@ -227,6 +227,23 @@ describe('the pinned status message', () => {
       edit: async (c, id, t) => { note(`edit ${c} ${id} ${t}`) }, pinnedId: async () => 901 }
     return { pin: new StatusPin({ dir: mkdtempSync(join(tmpdir(), 'onsen-vis-pinr-')), api, log, minEditMs: 300 }), calls, at }
   }
+  test('WO-197: paused (the agent is a connector, the bridge draws the pin): nothing sent, edited, pinned or checked; what waited is dropped (lab: plutus refused every 5 s after the switch)', async () => {
+    const calls: string[] = []; let paused = false
+    const api: PinApi = { send: async (c, t) => { calls.push(`send ${c} ${t}`); return 901 }, pin: async (c, id) => { calls.push(`pin ${c} ${id}`) },
+      edit: async (c, id, t) => { calls.push(`edit ${c} ${id} ${t}`) }, pinnedId: async c => { calls.push(`getChat ${c}`); return 901 } }
+    const pin = new StatusPin({ dir: mkdtempSync(join(tmpdir(), 'onsen-vis-pinp-')), api, log, minEditMs: 300, paused: () => paused })
+    pin.update('1828', 'A'); await sleep(50)
+    const before = calls.length
+    expect(calls.some(c => c.startsWith('send 1828'))).toBe(true)
+    pin.update('1828', 'B')                 // inside minEditMs: it waits for the timer
+    paused = true                           // the switch happens meanwhile
+    await sleep(600)
+    pin.update('1828', 'C'); await sleep(600)
+    expect(calls.length).toBe(before)       // B never edited, C never edited, no pin check
+    paused = false
+    pin.update('1828', 'D'); await sleep(600)
+    expect(calls.at(-1)).toBe('edit 1828 901 D')
+  })
   test('1.48.2: the 「不要顯示這則」 button: dismiss deletes the message, writes the marker, and nothing is sent or edited there again (a restart too)', async () => {
     const { pin, calls, dir, clock } = mk()
     const dels: string[] = []

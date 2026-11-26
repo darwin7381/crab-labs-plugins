@@ -6273,7 +6273,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
 function statusPinSetup(): { pin: OnsenVisible.StatusPin; show: (v: OnsenStatus.StatusView) => void } {
   const T = 15_000
   const bounded = <X>(p: Promise<X>, what: string): Promise<X> => Promise.race([p, new Promise<never>((_, rej) => { const t = setTimeout(() => rej(new Error(`${what}: no answer in ${T / 1000} s`)), T); (t as any).unref?.() })])
-  const pin = new OnsenVisible.StatusPin({ dir: join(STATE_DIR, 'onsen'), log, api: {
+  const pin = new OnsenVisible.StatusPin({ dir: join(STATE_DIR, 'onsen'), log, paused: () => connectorNow(), api: {   // WO-197: a connector's pin is the bridge's
     // outside every topic (lanes-topics: explicitly the ordinary conversation): the status is about the agent, not about one line of work
     send: async (chat, text) => (await Onsen.withSender('system:status', () => bot.api.sendMessage(chat, text, { disable_notification: true, reply_markup: STATUS_PIN_KB, ...topicFields({ chat, topic: '0' }) }))).message_id,
     pin: (chat, id) => bounded(bot.api.pinChatMessage(chat, id, { disable_notification: true }), 'pinChatMessage'),
