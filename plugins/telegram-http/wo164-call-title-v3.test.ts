@@ -12,7 +12,7 @@ const LONG = 'WO-167 的設計貼好了，你在等這個才能動手做第二�
 const L30 = 'WO-167 的設計貼好了，你在等這個才能動手做第二段的程式'
 
 test('a call\'s title drops the 「因為：」 head its sender\'s daemon writes; 30 characters of the sentence after it', () => {
-  expect(TITLE_V).toBe(3)
+  expect(TITLE_V).toBe(4)                                                         // 4 (1.58.13): only DM titles changed since
   const text = `因為：${LONG}。\n設計稿在 WO-167 的留言`
   expect(threadTitle('item', 'mesh-200144', { kind: 'peer_call', from: 'chiron', text })).toBe(`chiron：${L30}`)
   expect(threadTitle('peer_call', 'chiron#t-1a2b', { kind: 'peer_call', from: 'chiron', text })).toBe(`chiron：${L30}`)

@@ -138,7 +138,7 @@ plugins/telegram-http/lanes.ts::function retitleThreads
 plugins/telegram-http/lanes.ts::note: typeof note === 'string' && note ? note : undefined
 plugins/telegram-http/fleet-text.ts::export const ONSEN_TEXT_FORMAT = 'Onsen 的文字預設是 markdown rich（GFM）
 plugins/telegram-http/lanes-threads.ts::export const callBody
-plugins/telegram-http/lanes-threads.ts::export const TITLE_V = 3
+plugins/telegram-http/lanes-threads.ts::export const TITLE_V = 4
 plugins/telegram-http/screen-status.ts::export function publishView(v: ScreenVerdict
 plugins/telegram-http/screen-judge-jev.ts::export class JevJudge implements ScreenJudge
 plugins/telegram-http/server.ts::onsenStatusCompute = currentStatus
@@ -184,3 +184,7 @@ plugins/telegram-http/lanes-wake-rules.json::"id": "mention",
 plugins/telegram-http/lanes.ts::if (batchRule(v.rule, cfg)) return { id, match: {}, to: 'main', batch: true }
 plugins/telegram-http/server.ts::if (it.kind === 'mention' && !(typeof p.text === 'string' && p.text.trim())) p.text = mentionItemText(it)
 plugins/telegram-http/wake-decide.ts::'lane_exit', 'own', 'mention', 'other'] as const
+plugins/telegram-http/lanes-threads.ts::return clip80(topic ? `${who} 私訊／${String(it.topic_name ?? '').trim() || `#${topic}`}` : `${who} 私訊`)
+plugins/telegram-http/lanes.ts::export function refreshDmTitles(): number {
+plugins/telegram-http/server.ts::const dmPerson = (chat: string): string | null => dmNames.personOf(chat)
+plugins/telegram-http/onsen-client.ts::export class MemberNames {

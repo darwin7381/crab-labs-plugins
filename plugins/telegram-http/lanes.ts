@@ -171,6 +171,9 @@ export interface LanesDeps {
    *  此刻 line, the same-matter gate, the Esc wrap-up (and, in server.ts, the wake rows' member_state); null = no status here (Onsen step 3 off): the
    *  old path decides */
   mainStatus?: () => { state: string; detail?: Record<string, unknown> } | null
+  /** 1.58.13: the person on a Telegram DM account (its chat id), for its thread's title: display name, else member name; null: not known yet (server.ts
+   *  asks Onsen once and then calls refreshDmTitles) */
+  dmPerson?: (chat: string) => string | null
   agent: string
   workspaceDir: string
   transcriptDir: string
@@ -1182,7 +1185,7 @@ function bindThread(ev: InEvent, d: Decision, kind: string): void {
   t.state = 'open'
   if (!t.title) {                                                            // WO-164 titles: from the key (lanes-threads.ts threadTitle), set when the thread opens
     t.title = threadTitle(t.key_kind!, t.key!, { kind, from: ev.from, text: ev.text, title: ev.source === 'mail' ? ev.title : null,
-      topic_name: ev.meta?.topic_name ?? topicName(ev.message_thread_id) ?? null }) || titleOf(ev.text)
+      topic_name: ev.meta?.topic_name ?? topicName(ev.message_thread_id) ?? null, ...(t.key_kind === 'tg' ? { person: dmPersonOf(t.key!) } : {}) }) || titleOf(ev.text)
     t.title_v = TITLE_V
   }
   t.last_item = { id: ev.id, kind, at: nowIso(), preview: previewOf(ev.text) }
@@ -1256,12 +1259,29 @@ function freshRunOnThread(t: Thread): void {
  *  event of the change carries the title; the start handshake treats the daemon as authoritative); what Onsen was told before is kept as the old title. A
  *  closed thread keeps its title. A thread of its own (key item) keeps it too, except a call a reflex lane took (mesh-<n>, its peer known: Chiron #200144).
  *  Titled by 1.57.2 (title_v 2): only a call's changed since: its 「<對方>：因為：…」 loses the 「因為：」. At start, and for the threads a handshake takes in. */
-function retitleThreads(why: 'start' | 'handshake'): number {
+function retitleThreads(why: 'start' | 'handshake' | 'person'): number {
   if (!threadKeysOn() || !S?.threads) return 0
   const changed: Array<{ thread: string; key: string; was: string | null; title: string }> = []
   const self = String(D.agent ?? '').toLowerCase()
   for (const t of Object.values(S.threads)) {
     if (!t.key_kind || !t.key || t.alias_of || t.state === 'closed' || t.title_v === TITLE_V) continue
+    if (dmKey(t)) {
+      // 1.58.13 (title_v 4): a DM is named after the person on that account; not known yet (server.ts asks Onsen): refreshDmTitles retitles it then
+      const person = dmPersonOf(t.key)
+      if (person === null && D.dmPerson) continue
+      t.title_v = TITLE_V
+      const was = t.title ?? null, topic = String(t.key).split(':')[2]
+      // a topic keeps its name: the topic table's, else the one its title already carries (「… 私訊／<話題名>」)
+      const named = topic ? topicName(topic) ?? (was?.includes('／') ? was.slice(was.indexOf('／') + 1) : null) : null
+      const title = threadTitle('tg', t.key, { person, topic_name: named })
+      if (!title || title === was) continue
+      const sent = S.thread_sent?.[t.id]
+      if (sent && sent.title === undefined) sent.title = was
+      t.title = title
+      changed.push({ thread: t.id, key: `${t.key_kind}:${t.key}`, was, title })
+      continue
+    }
+    if (t.title_v === 3) { t.title_v = TITLE_V; continue }                  // title_v 4 (1.58.13): only a DM's title changed since 3
     const keyPeer = t.key_kind === 'peer_call' ? String(t.key).split('#')[0].toLowerCase() : ''
     // the peer of a call: a peer's thread (its id's agent), else the one that opened it (the reflex case writes it on a fresh thread)
     const peer = t.key_kind === 'peer_call' ? (t.peer ?? (keyPeer && keyPeer !== self ? keyPeer : null)) : t.key_kind === 'item' && String(t.key).startsWith('mesh-') ? t.peer : null
@@ -1291,6 +1311,22 @@ function retitleThreads(why: 'start' | 'handshake'): number {
     D.log('info', `lanes: ${changed.length} open thread(s) retitled from their key (${why}): ${changed.slice(0, 5).map(c => `${c.key} 「${c.title}」`).join('; ')}`)
   }
   return changed.length
+}
+/** a thread of a Telegram DM (key tg:<chat>[:topic], not a group's negative id) */
+const dmKey = (t: Thread): boolean => t.key_kind === 'tg' && !!t.key && !String(t.key).startsWith('tg:-')
+/** the person on a DM's Telegram account (LanesDeps.dmPerson); null: not known yet, or no such dep (then 「Joey」, as before) */
+function dmPersonOf(key: string): string | null {
+  const chat = String(key).split(':')[1] ?? ''
+  if (!chat || chat.startsWith('-')) return null
+  try { return D.dmPerson?.(chat) ?? null } catch { return null }
+}
+/** 1.58.13: the open DM threads are titled again with their person (server.ts, once Onsen answered who the account is); the number retitled */
+export function refreshDmTitles(): number {
+  if (!threadKeysOn() || !S?.threads) return 0
+  for (const t of Object.values(S.threads)) if (dmKey(t) && !t.alias_of && t.state !== 'closed') delete t.title_v
+  const n = retitleThreads('person')
+  saveState()
+  return n
 }
 /** the fresh tokens the thread's budget counts (WO-164: since its current lane was opened on it) */
 const threadFresh = (t: Thread | undefined | null): number => Math.max(0, (t?.fresh ?? 0) - (t?.fresh_base ?? 0))

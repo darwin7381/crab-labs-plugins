@@ -169,14 +169,18 @@ export function titleOf(text: string): string {
 // A schedule's thread was titled by its first run's whole line ([scheduled][wo164-acc][run:7170431][P3]…), and every later run and Onsen's open threads
 // showed it. Titles now come from the key (and, where the key does not say it, the item that opens the thread): schedule 「排程 <名字>」 (the name in the
 // header's second square bracket), ticket 「WO-<n>」 (「WO-<n> <title>」 when the item carries the ticket's title), alert 「事故 <host>」 (refs.incident
-// before '#'), mail the first mail's title, call 「<對方>：<第一句前 30 字>」, Joey 「Joey 私訊」 (「Joey 私訊／<話題名>」 in a topic of his DM). Anything
+// before '#'), mail the first mail's title, call 「<對方>：<第一句前 30 字>」, a DM 「<那個帳號的人> 私訊」 (「… 私訊／<話題名>」 in a topic of it). Anything
 // else (a thread of its own) keeps the first line of its first item; a call or a mail that is a thread of its own is still a call or a mail.
 /** the version of the titles: a thread titled by threadTitle carries it (lanes.ts title_v); the start retitles the open threads without it, once.
- *  3 (Chiron #200144): a call's title drops the 「因為：」 head, and a call a reflex lane took (key item, mesh-<n>, its peer known) is titled as a call */
-export const TITLE_V = 3
+ *  3 (Chiron #200144): a call's title drops the 「因為：」 head, and a call a reflex lane took (key item, mesh-<n>, its peer known) is titled as a call.
+ *  4 (1.58.13): a DM's title names the person on that Telegram account (its Onsen member's display name, else the member name; lab-relay's test
+ *  account is not 「Joey」), not a fixed 「Joey 私訊」; only the DM threads change */
+export const TITLE_V = 4
 /** what a title is made of besides the key: the item that opens the thread (its kind as decideWake reads it, its sender, its text; a mail's own title; the
  *  name of the topic it was written in) */
-export type TitleItem = { kind?: string | null; from?: string | null; text?: string | null; title?: string | null; topic_name?: string | null }
+export type TitleItem = { kind?: string | null; from?: string | null; text?: string | null; title?: string | null; topic_name?: string | null
+  /** a DM's person (server.ts dmPerson: the Onsen member of that Telegram account, by its display name, else the member name); none: Joey */
+  person?: string | null }
 const clip80 = (s: string): string => Array.from(s.replace(/\s+/g, ' ').trim()).slice(0, 80).join('')
 const firstLine = (text: unknown): string => String(text ?? '').split('\n').map(s => s.trim()).find(Boolean) ?? ''
 /** the schedule's name: the header's second square bracket (`[scheduled][wo164-acc][run:…]` → wo164-acc); null = none (an empty tag, no header) */
@@ -228,8 +232,8 @@ export function threadTitle(kk: KeyKind, key: string, it: TitleItem): string {
     case 'tg': {
       const m = String(key).match(/^tg:([^:]*)(?::(.+))?$/)
       if (m && m[1].startsWith('-')) return titleOf(String(it.text ?? ''))      // a group, not his DM: as before
-      const topic = m?.[2]
-      return clip80(topic ? `Joey 私訊／${String(it.topic_name ?? '').trim() || `#${topic}`}` : 'Joey 私訊')
+      const topic = m?.[2], who = String(it.person ?? '').trim() || 'Joey'
+      return clip80(topic ? `${who} 私訊／${String(it.topic_name ?? '').trim() || `#${topic}`}` : `${who} 私訊`)
     }
     default:
       if (it.kind === 'peer_call') return clip80(callTitle(it))

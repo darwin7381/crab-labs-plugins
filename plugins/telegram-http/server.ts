@@ -1647,6 +1647,14 @@ function mainPerson(): string | null {
   if (Date.now() - personMemo.at > 5_000) { try { personMemo.v = Onsen.assigneesOf(opsRecipients(loadAccess()))[0] ?? null } catch {} ; personMemo.at = Date.now() }
   return personMemo.v
 }
+/** 1.58.13: the person on a Telegram DM account, for its thread's title (lanes-threads.ts): the Onsen member that account is (the mapping the blockers'
+ *  person and every Action's assignees go through: Onsen.memberOfTg; an account that is no member: Onsen's guest name tg-<id>), by its display name
+ *  (GET /v1/members/<name>), else its member name. null: not known yet — asked once; the answer retitles the open DM threads (Lanes.refreshDmTitles) */
+const dmNames = new Onsen.MemberNames({
+  get: async name => onsen ? await onsen.request('GET', `/v1/members/${encodeURIComponent(name)}`, undefined, 5_000) : null,
+  changed: () => { try { if (Lanes.LANES_ON) Lanes.refreshDmTitles() } catch {} },
+  log: m => log('warn', m) })
+const dmPerson = (chat: string): string | null => dmNames.personOf(chat)
 /** WO-176: a status blocker's Action (screen-status.ts RecordFacts.actionFor): the newest open permission prompt's, else the duty officer's open ask on the
  *  main's pane for that menu; null: none */
 function openActionFor(menu: string | null): string | null {
@@ -4566,6 +4574,7 @@ if (Lanes.LANES_ON) {
   Lanes.lanesInit({
     // WO-157 (Chiron 13:46Z): the one state source: the status record computed now (what goes to Onsen; WO-169: currentStatus()); null = no status here
     mainStatus: () => onsenStatusCompute ? onsenStatusCompute() : null,
+    dmPerson,                                                             // 1.58.13: a DM thread's title names the person on that account
     role: INBOX_ONLY ? 'inbox' : 'tg',
     agent: process.env.LANES_AGENT ?? INBOX_SELF,
     workspaceDir: AGENT_WORKSPACE_DIR,

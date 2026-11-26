@@ -1157,6 +1157,33 @@ export type ActionControl = { action_id: string; option_id: string; version: num
 /** Telegram user ids → Onsen member names (fleet-core onsen.py HUMAN_ALIASES); anyone else has no name Onsen knows */
 export const TG_MEMBERS: Readonly<Record<string, string>> = { '1828173984': 'joey', '6736970916': 'joey-test' }
 export const memberOfTg = (id: unknown): string | null => TG_MEMBERS[String(id ?? '')] ?? null
+/** 1.58.13: the person on a Telegram account, for a DM thread's title (lanes-threads.ts): the Onsen member that account is (memberOfTg, the mapping the
+ *  blockers' person and every Action's assignees go through; an account that is no member: Onsen's guest name tg-<id>), by its display name (GET
+ *  /v1/members/<name>), else its member name. personOf → null while it is not known yet: asked once per member; when the answer (or no answer) is in,
+ *  `changed` runs (server.ts: Lanes.refreshDmTitles) */
+export class MemberNames {
+  private names = new Map<string, string | null>()                      // member → display name ('' none, or not answered; null: being asked)
+  constructor(readonly o: { get: (name: string) => Promise<{ status: number; json: any } | null>; changed: () => void; log?: (m: string) => void }) {}
+  personOf(chat: string): string | null {
+    const member = memberOfTg(chat) ?? `tg-${chat}`
+    if (!this.names.has(member)) {
+      this.names.set(member, null)
+      void (async () => {
+        let d = ''
+        try {
+          const r = await this.o.get(member)
+          const m = r && r.status === 200 ? (r.json?.data ?? r.json) : null
+          if (m && typeof m.display_name === 'string') d = m.display_name.replace(/\s+/g, ' ').trim().slice(0, 40)
+        } catch (e) { this.o.log?.(`onsen: the display name of ${member}: no answer (${errText(e)}); its member name is used`) }
+        this.names.set(member, d)
+        try { this.o.changed() } catch {}
+      })()
+      return null
+    }
+    const d = this.names.get(member)
+    return d == null ? null : (d || member)
+  }
+}
 /** the assignees of a question sent to these Telegram chats: the members among them (in order, once each), else joey */
 export function assigneesOf(chats: unknown[]): string[] {
   const out: string[] = []
