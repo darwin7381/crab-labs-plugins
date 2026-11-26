@@ -2286,6 +2286,14 @@ function paneObserved(t: PickerTarget, picker: DetectedPicker | null, at: number
     if (open.some(p => p.opened > was.since)) for (const p of open) if (p.opened <= was.since) permOffScreen(p, '畫面上已經換成下一個詢問（這一個在畫面上回答了）')
   }
 }
+/** WO-197 (Chiron lab round 3A): the panes with an Onsen Action of this daemon still open, for a prompt (the main's pane) or a menu: looked at every 2 s,
+ *  so one answered on the screen is closed in Onsen within ~4 s (two looks without it), not 8–16 s */
+function hotPanes(): string[] {
+  const out = new Set<string>()
+  for (const [tmux, pa] of pickerAsks) if (!pa.ended && (pa.h.state === 'pending' || pa.h.state === 'open')) out.add(tmux)
+  if (ownPane() && openMainPrompts().some(p => p.action && (p.action.state === 'pending' || p.action.state === 'open'))) out.add(ownPane())
+  return [...out]
+}
 function permOffScreen(p: PermPrompt, reason: string): void {
   log('info', `permission ${p.request_id} (${p.tool_name}): not on the main's screen any more (answered there, or timed out); its Action is closed (cancel), nothing pressed`)
   pendingPermissions.delete(p.request_id)
@@ -3496,6 +3504,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
     listTargets: paneWatchTargets,
     skip: tmux => dutyOfficer?.handles(tmux) ?? false,
     observe: paneObserved,                           // WO-197: what left the screen, its Onsen Action closed (a pane the duty officer handles too)
+    hot: hotPanes,                                   // WO-197 (round 3A): a pane with an open Action of ours is looked at every 2 s
     surface: ({ title, buttons, picker }) => Onsen.withSender('system:startup-picker', () => {   // Onsen (WO-139)
       // WO-197 (lab 16:38–16:49Z): the menu as an Onsen Action (ONSEN_ACTIONS), whatever the mode; the channel's permission prompt is carried by its own
       // Action (no second one). A connector sends nothing to Telegram (the bridge draws the Action); otherwise Telegram as before

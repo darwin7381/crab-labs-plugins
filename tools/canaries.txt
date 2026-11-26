@@ -303,3 +303,7 @@ plugins/telegram-http/server.ts::if (entry.keys.length) inboundStore?.finish(ent
 plugins/telegram-http/server.ts::function restartAlbumItems(chat: string, mgid: string): void {
 plugins/telegram-http/onsen-inbound.ts::export const albumItem = (f: Pick<Facts, 'mgid' | 'image' | 'attachment' | 'fromReply'>): boolean =>
 plugins/telegram-http/onsen-album-restart-daemon.test.ts::killed while their photos are fetched; restarted: one tag with the three, once
+plugins/telegram-http/startup-picker.ts::hot?: () => Iterable<string>
+plugins/telegram-http/server.ts::hot: hotPanes,
+plugins/telegram-http/server.ts::function hotPanes(): string[] {
+plugins/telegram-http/onsen-screen-fast-daemon.test.ts::its Action is cancelled within ~5 s of the answer

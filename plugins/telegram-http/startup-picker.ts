@@ -278,12 +278,18 @@ export function startStartupPickerWatchdog(opts: {
    *  it (rearmStartupPicker). An owned menu is not sent from here unless its owner re-armed it, and it is not marked surfaced (once the owner lets
    *  go, it is a menu like any other). Unset (lanes off), or a call that throws: every menu is the watchdog's, as before. */
   owner?: (t: PickerTarget, picker: DetectedPicker) => string | null
+  /** WO-197 (Chiron lab round 3A, 1.58.27: a prompt answered on the screen took 8–14 s to be closed in Onsen, two 8 s looks): the panes to look at
+   *  every `fastMs` (2 s) as well, between the polls: those with an Onsen Action of this daemon still open (a prompt, a menu). None: the poll alone */
+  hot?: () => Iterable<string>
+  fastMs?: number
 }): void {
   const pollMs = opts.pollMs ?? (Number(process.env.STARTUP_PICKER_POLL_MS) || 8_000)   // the env: tests only
+  const fastMs = Math.min(pollMs, opts.fastMs ?? (Number(process.env.STARTUP_PICKER_FAST_MS) || 2_000))
   const capture = opts.capture ?? capturePane
-  const tick = async (): Promise<void> => {
+  const tick = async (only?: Set<string>): Promise<void> => {
     let targets: PickerTarget[] = []
     try { targets = await opts.listTargets() } catch { return }
+    if (only) targets = targets.filter(t => only.has(t.tmux))
     for (const t of targets) {
       const skipped = opts.skip?.(t.tmux) ?? false
       if (skipped && !opts.observe) continue
@@ -328,8 +334,26 @@ export function startStartupPickerWatchdog(opts: {
       }
     }
   }
-  setInterval(() => { void tick() }, pollMs).unref()
-  opts.log('info', `startup-picker interceptor ON (poll=${pollMs / 1000}s)`)
+  if (!opts.hot) {
+    setInterval(() => { void tick() }, pollMs).unref()
+    opts.log('info', `startup-picker interceptor ON (poll=${pollMs / 1000}s)`)
+    return
+  }
+  // WO-197: the poll every pollMs as before; between, every fastMs, only the hot panes (one look at a time: a slow capture never overlaps the next)
+  let last = Date.now(), running = false
+  setInterval(() => {
+    if (running) return
+    const now = Date.now()
+    let only: Set<string> | undefined
+    if (now - last >= pollMs - fastMs / 2) last = now
+    else {
+      try { only = new Set(opts.hot!()) } catch { only = new Set() }
+      if (!only.size) return
+    }
+    running = true
+    void tick(only).finally(() => { running = false })
+  }, fastMs).unref()
+  opts.log('info', `startup-picker interceptor ON (poll=${pollMs / 1000}s; ${fastMs / 1000}s for a pane with an open Onsen Action)`)
 }
 
 /**
