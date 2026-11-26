@@ -13,7 +13,7 @@
 // --setup makes the clean home (config with no MCP / plugins / skills, the login linked, the sessions carried over).
 // No tmux anywhere. Run: bun test codex-runner/codex-runner.test.ts
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -185,7 +185,8 @@ describe('a Call', () => {
     const [start] = codexLog().filter(x => x.ev === 'start')
     const folder = join(cfg.root, 'cv-chiron', 'call-71')
     expect(start.dir).toBe(folder)
-    expect(start.cwd).toBe(folder)
+    // the process's cwd is the resolved path: macOS's tmpdir /var/folders is a link to /private/var/folders (Sonn #200387)
+    expect(realpathSync(start.cwd)).toBe(realpathSync(folder))
     expect(start.stdin_null).toBe(true)
     expect(start.argv.slice(0, 11)).toEqual(['exec', '--skip-git-repo-check', '-s', 'workspace-write', '-C', folder, '--json', '-o', join(folder, 'last-1.txt'), '-i', join(folder, 'ref.png')])
     expect(start.argv.at(-2)).toBe('--')
