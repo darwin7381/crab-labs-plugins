@@ -30,13 +30,18 @@ const k2 = (chat: string, id: string): string => `${chat}\u0000${id}`
 export type TurnFields = { turn_id?: string | null; outcome?: TurnOutcome; bound?: string[] }
 const turnFields = (t?: TurnFields): Partial<DeliveryFact> => !t ? {} : { ...(t.turn_id ? { turn_id: t.turn_id } : {}), ...(t.outcome ? { outcome: t.outcome } : {}),
   ...(t.bound ? { bound: [...t.bound] } : {}) }
+/** WO-177: the member states of a record that shows the main's turn still running (a Stop another Stop hook pushed back) */
+const TURN_RUNNING: ReadonlySet<string> = new Set(['busy', 'stuck', 'compacting'])
 export class DeliveryFacts {
   /** idem keys spooled by this daemon (bounded): each fact is written once per daemon life; across lives Onsen answers duplicate */
   private sent = new Map<string, true>()
   /** an album: the first message's id (the one the delivery carries) → every message id of it */
   private groups = new Map<string, string[]>()
-  /** the main's turn closed these at a Stop; written once that turn stayed closed for settleMs (another Stop hook can still hold it) */
-  private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; turn?: TurnFields; timer: ReturnType<typeof setTimeout> }>()
+  /** the main's turn closed these at a Stop (stopMs: when); written when the status record shows that turn over (turnOver), or a new turn began
+   *  (flushLater). WO-172 (Chiron 02:43Z; WO-177 1.58.3): no timer. Until 1.58.2 they waited ONSEN_TURN_SETTLE_MS (60 s) in case another Stop hook held
+   *  the Stop, and Onsen showed every normal turn's message 「not done」 for 15–60 s. A turn another Stop hook pushed back keeps the record busy (the
+   *  screen shows it going on), and its next hook event takes the fact back (cancelTurnEnd, turn_continued) */
+  private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; turn?: TurnFields; stopMs: number }>()
   /** Joey's messages taken in and not yet into a turn (lanes off: the queued count). session: handed to the session (in_session), sessionAt when;
    *  turn: into a turn (seen, or WO-162's turnBegan for the count alone) */
   private open = new Map<string, { at: number; session: boolean; turn: boolean; sessionAt?: number }>()
@@ -44,7 +49,7 @@ export class DeliveryFacts {
    *  (an album: every item), the recipient named; a repeat too (the caller keeps its own once) */
   /** changed (WO-162): the queued count may have changed (a message taken in, written into the stream, into a turn, its turn ended): the status is
    *  computed again now rather than at the next 2 s tick */
-  constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; settleMs?: number; now?: Now; max?: number
+  constructor(readonly o: { agent: string; sink: (f: DeliveryFact) => void; now?: Now; max?: number
     onSeen?: (chat: string, id: string, by: string) => void; changed?: () => void }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   private changed(): void { try { this.o.changed?.() } catch {} }
@@ -110,16 +115,18 @@ export class DeliveryFacts {
   }
   turnEndLater(chat: string, id: string | number, by: string, at: string, detail?: Record<string, unknown>, turn?: TurnFields): void {
     const s = String(id), key = `${k2(chat, s)}\u0000${by}`
-    const was = this.later.get(key)
-    if (was) clearTimeout(was.timer)
-    const timer = setTimeout(() => { const l = this.later.get(key); if (l) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail, l.turn) }, this.o.settleMs ?? 60_000)
-    ;(timer as any).unref?.()
-    this.later.set(key, { chat, id: s, by, at, ...(detail ? { detail } : {}), ...(turn ? { turn } : {}), timer })
+    this.later.set(key, { chat, id: s, by, at, ...(detail ? { detail } : {}), ...(turn ? { turn } : {}), stopMs: this.now() })
   }
   /** the turn went on after that Stop: no turn_end yet */
   cancelTurnEnd(chat: string, id: string | number, by: string): void {
-    const key = `${k2(chat, String(id))}\u0000${by}`, l = this.later.get(key)
-    if (l) { clearTimeout(l.timer); this.later.delete(key) }
+    this.later.delete(`${k2(chat, String(id))}\u0000${by}`)
+  }
+  /** WO-172 / WO-177 (Chiron 02:43Z: 「Stop 之後，狀態紀錄顯示這個回合結束了（idle，或開了新的回合）就送；被擋回去繼續做的，紀錄還是 busy，不送」): the
+   *  status record handed out now (server.ts feed), as its member state (onsen-wake memberStateOf). A record that shows no turn running (none of busy,
+   *  stuck, compacting) makes final what a Stop before it closed */
+  statusRecord(member: string, atMs = this.now()): void {
+    if (TURN_RUNNING.has(member)) return
+    for (const l of [...this.later.values()]) if (l.stopMs <= atMs) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail, l.turn)
   }
   /** a new turn began (or the daemon stops): what waited to settle is final */
   flushLater(by?: string): void {
@@ -302,9 +309,9 @@ export class StatusFacts {
     try { p = this.o.since.remote() } catch { return }
     void p.then(r => {
       if (!r || typeof r.state !== 'string' || typeof r.since !== 'string' || Number.isNaN(Date.parse(r.since))) return
-      const s = this.sent
-      if (!s || s.state !== r.state || s.since !== this.firstSince || s.since === r.since) return
-      s.since = r.since; this.firstSince = r.since
+      const s = this.sent, since = new Date(r.since).toISOString()          // Onsen's spelling (+00:00, µs) in this daemon's (Z, ms): the same instant
+      if (!s || s.state !== r.state || s.since !== this.firstSince || s.since === since) return
+      s.since = since; this.firstSince = since
       try { this.o.since?.save({ state: s.state, since: s.since }) } catch {}
     }).catch(() => {})
   }

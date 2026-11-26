@@ -142,7 +142,6 @@ plugins/telegram-http/server.ts::onsenStatusCompute = currentStatus
 plugins/telegram-http/lanes.ts::export function mainStatusChanged
 plugins/telegram-http/screen-status.ts::export function composeRecord(
 plugins/telegram-http/server.ts::observation: lastObservation,
-plugins/telegram-http/onsen-client.ts::...(ctx.turn_id ? { turn_id: ctx.turn_id } : {})
 plugins/telegram-http/onsen-status.ts::export type TurnEnded =
 plugins/telegram-http/onsen-avatar.ts::export class AvatarSync
 plugins/telegram-http/screen-status.ts::interrupted_is_latest_output: latestIs(INTERRUPTED, [COMMAND, INCOMING]),
@@ -156,3 +155,6 @@ plugins/telegram-http/screen-judge-jev.ts::export function contradiction(
 plugins/telegram-http/onsen-wake.ts::row.decided_by === 'new' && isUrgency(row.wake_urgency)
 plugins/telegram-http/screen-status.ts::version?(): string | null
 plugins/telegram-http/onsen-status.ts::remote?(): Promise<{ state?: unknown; since?: unknown } | null>
+plugins/telegram-http/onsen-client.ts::...(ctx.turn_id ? { turn_id: String(ctx.turn_id).slice(0, 120) } : {}),
+plugins/telegram-http/onsen-status.ts::statusRecord(member: string, atMs = this.now()): void {
+plugins/telegram-http/server.ts::try { facts.statusRecord(member) } catch {}

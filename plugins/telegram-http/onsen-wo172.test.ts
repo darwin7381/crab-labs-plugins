@@ -1,5 +1,6 @@
 // WO-172 (Chiron; Onsen contract v1 §2, §4; mapping A-4, B-3): three facts, no decision changed.
-//   1 a message an agent sends carries the turn it was sent in (meta.turn_id: the main's prompt id, a lane's run id); the daemon's own notices none
+//   1 a message an agent sends carries the turn it was sent in (turn_id, a field of the message itself since 1.58.3 — Chiron WO-172 02:43Z: Onsen reads
+//     the item's turn_id; 1.58.2 put it in meta: the main's prompt id, a lane's run id); the daemon's own notices none
 //   2 turn_end carries outcome (done / interrupted / failed) and bound (Joey's client_msg_id, a colleague's msg id), computed once per turn: the same
 //     value on every fact of the turn and on the observation's last_turn; seen and turn_end carry turn_id (Chiron WO-171 01:52Z). Fields of the fact
 //     itself, as Onsen 0.16.0 reads them (delivery_events.turn_id / outcome / bound), not its detail
@@ -12,18 +13,20 @@ import { AvatarSync, imageType, largest, type AvatarDeps } from './onsen-avatar.
 
 describe('1 turn_id on what is sent', () => {
   const pay = { chat_id: 1828, text: 'hi' }
-  test('a message sent in a turn carries it in meta; one sent with none (a notice of the daemon\'s own) carries none; an edit or a reaction is no message', () => {
+  test('a message sent in a turn carries it as its own field (top level, not meta); one sent with none (a notice of the daemon\'s own) carries none; an edit or a reaction is no message', () => {
     const r = outboundRecord('adam', { sender: 'main', turn_id: 'p-1' }, 'sendMessage', pay, { message_id: 7, date: 1 }) as any
-    expect(r.k).toBe('m'); expect(r.r.meta).toEqual({ turn_id: 'p-1' })
+    expect(r.k).toBe('m'); expect(r.r.turn_id).toBe('p-1'); expect(r.r.meta).toBeUndefined()
     const lane = outboundRecord('adam', { sender: 'adam.reflex.3', turn_id: 'adam.reflex.3.r2', part: 1, parts: 2 }, 'sendRichMessage', { chat_id: 1828, rich_message: { markdown: 'x' } }, { message_id: 8 }) as any
-    expect(lane.r.meta).toEqual({ turn_id: 'adam.reflex.3.r2', part: 1, parts: 2 })
-    expect((outboundRecord('adam', { sender: 'system:status' }, 'sendMessage', pay, { message_id: 9 }) as any).r.meta).toBeUndefined()
-    expect((outboundRecord('adam', { sender: 'router' }, 'sendMessage', pay, { message_id: 10 }) as any).r.meta).toBeUndefined()
+    expect(lane.r.turn_id).toBe('adam.reflex.3.r2'); expect(lane.r.meta).toEqual({ part: 1, parts: 2 })
+    for (const sender of ['system:status', 'router']) {
+      const x = (outboundRecord('adam', { sender }, 'sendMessage', pay, { message_id: 9 }) as any).r
+      expect(x.meta).toBeUndefined(); expect('turn_id' in x).toBe(false)
+    }
     expect(JSON.stringify(outboundRecord('adam', { sender: 'main', turn_id: 'p-1' }, 'editMessageText', { chat_id: 1828, message_id: 7, text: 'y' }, true))).not.toContain('turn_id')
   })
   test('withSender keeps it for every part of one send', () => {
     const r = withSender('main', () => withPart(2, 3, () => outboundRecord('adam', sendCtx()!, 'sendMessage', pay, { message_id: 11 })), { turn_id: 'p-9' }) as any
-    expect(r.r.meta).toEqual({ turn_id: 'p-9', part: 2, parts: 3 })
+    expect(r.r.turn_id).toBe('p-9'); expect(r.r.meta).toEqual({ part: 2, parts: 3 })
     expect(withSender('system:ack', () => sendCtx())).toEqual({ sender: 'system:ack' })
   })
 })
@@ -32,7 +35,7 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
   function rig() {
     let gen: any = { rec: 'main', id: 'g1', state: 'idle', pid: 7 }
     const sent: any[] = [], ended: TurnEnded[] = []
-    const facts = new DeliveryFacts({ agent: 'adam', sink: f => sent.push(f), settleMs: 60_000 })
+    const facts = new DeliveryFacts({ agent: 'adam', sink: f => sent.push(f) })
     const joey = (m: any) => m?.chat_id && m?.user === 'joey' ? { chat: String(m.chat_id), id: String(m.message_id) } : null
     const tap = new LanesTap({ facts, joey, gen: () => gen, changed: () => {}, turnEnded: t => ended.push(t) })
     const main = (state: string, prompt: string | null, ts: string, extra: Record<string, unknown> = {}) => {
@@ -126,6 +129,60 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     expect(sent.filter(f => f.state === 'turn_end')).toEqual([expect.objectContaining({ client_msg_id: '695', turn_id: tid, outcome: 'done', bound: ['695', '71006'] })])
     expect(sent.filter(f => f.state === 'seen')).toEqual([expect.objectContaining({ client_msg_id: '695', turn_id: tid })])
     expect(ended).toEqual([expect.objectContaining({ session: 'main', outcome: 'done', bound: ['695', '71006'], facts: 1 })])
+  })
+})
+
+describe('2b WO-177 (Chiron WO-172 02:43Z): a normal turn_end goes when the status record shows the turn over, no 60 s wait; a pushed-back turn sends nothing until its real end', () => {
+  function rig() {
+    let gen: any = { rec: 'main', id: 'g1', state: 'idle', pid: 7 }
+    const sent: any[] = []
+    const facts = new DeliveryFacts({ agent: 'adam', sink: f => sent.push(f) })
+    const joey = (m: any) => m?.chat_id && m?.user === 'joey' ? { chat: String(m.chat_id), id: String(m.message_id) } : null
+    const tap = new LanesTap({ facts, joey, gen: () => gen, changed: () => {} })
+    const main = (state: string, prompt: string | null, ts: string, extra: Record<string, unknown> = {}) => {
+      gen = { ...gen, state, prompt_id: prompt, ts }; tap.journal({ ...gen } as any, { state, ...(prompt ? { prompt_id: prompt } : {}), ...extra })
+    }
+    const item = (id: string, mid: string) => ({ rec: 'msg', id, kind: 'joey', notif: { params: { meta: { chat_id: '1828', message_id: mid, user: 'joey' } } } })
+    const line = (row: any, state: string, f: Record<string, unknown> = {}) => tap.journal({ ...row, state, ...f, ts: '2026-11-26T03:00:00.000Z' } as any, { state, ...f })
+    return { facts, main, item, line, turnEnds: () => sent.filter(f => f.state === 'turn_end') }
+  }
+  test('the normal case: Stop; while the record still says busy nothing is sent; the first record that shows the turn over (idle) sends it at once, done', async () => {
+    const r = rig(), j = r.item('n1', '801')
+    r.line(j, 'offered'); r.line(j, 'bound', { prompt_id: 'q1' }); r.main('in_turn', 'q1', '2026-11-26T03:00:01.000Z')
+    r.line(j, 'done', { prompt_id: 'q1' }); r.main('idle', null, '2026-11-26T03:00:05.000Z', { stopped_prompt: 'q1' })
+    r.facts.statusRecord('busy')                                            // the screen not judged again yet: the record still busy
+    await new Promise(res => setTimeout(res, 50))
+    expect(r.turnEnds()).toHaveLength(0)                                   // no timer sends it either
+    expect(r.facts.pendingLater()).toBe(1)
+    r.facts.statusRecord('idle')
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '801', turn_id: 'q1', outcome: 'done', bound: ['801'], at: '2026-11-26T03:00:00.000Z' })])
+    r.facts.statusRecord('idle')
+    expect(r.turnEnds()).toHaveLength(1)                                   // once
+  })
+  test('the pushed-back case: Stop, another Stop hook holds it: the record stays busy (nothing sent), the turn goes on (taken back), its real Stop and an idle record: one turn_end', () => {
+    const r = rig(), j = r.item('n2', '802')
+    r.line(j, 'bound', { prompt_id: 'q2' }); r.main('in_turn', 'q2', '2026-11-26T03:01:00.000Z')
+    r.line(j, 'done', { prompt_id: 'q2' }); r.main('idle', null, '2026-11-26T03:01:04.000Z', { stopped_prompt: 'q2' })
+    r.facts.statusRecord('busy'); r.facts.statusRecord('stuck'); r.facts.statusRecord('compacting')
+    expect(r.turnEnds()).toHaveLength(0)
+    r.main('in_turn', 'q2', '2026-11-26T03:01:06.000Z'); r.line(j, 'bound', { prompt_id: 'q2', reason: 'turn_continued' })   // lanes-main continueTurn
+    expect(r.facts.pendingLater()).toBe(0)
+    r.facts.statusRecord('idle')                                           // nothing pending: nothing sent
+    expect(r.turnEnds()).toHaveLength(0)
+    r.line(j, 'done', { prompt_id: 'q2' }); r.main('idle', null, '2026-11-26T03:01:30.000Z', { stopped_prompt: 'q2' })
+    r.facts.statusRecord('waiting')                                        // a menu after the end: the turn is over too
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '802', turn_id: 'q2', outcome: 'done' })])
+  })
+  test('an interrupted turn still sends at once (no record needed); a new prompt still ends the last one\'s wait', () => {
+    const r = rig(), a = r.item('n3', '803'), b = r.item('n4', '804'), c = r.item('n5', '805')
+    r.line(a, 'bound', { prompt_id: 'q3' }); r.main('in_turn', 'q3', '2026-11-26T03:02:00.000Z')
+    r.line(a, 'queued', { reason: 'interrupted', prompt_id: null, cut_at: 'x' }); r.main('idle', null, '2026-11-26T03:02:03.000Z', { ended_by: 'interrupted' })
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '803', outcome: 'interrupted' })])
+    r.line(b, 'bound', { prompt_id: 'q4' }); r.main('in_turn', 'q4', '2026-11-26T03:03:00.000Z')
+    r.line(b, 'done', { prompt_id: 'q4' }); r.main('idle', null, '2026-11-26T03:03:02.000Z', { stopped_prompt: 'q4' })
+    r.facts.statusRecord('busy')
+    r.line(c, 'bound', { prompt_id: 'q5' }); r.main('in_turn', 'q5', '2026-11-26T03:03:03.000Z')    // a new prompt: q4's Stop was its end
+    expect(r.turnEnds().map(f => f.client_msg_id)).toEqual(['803', '804'])
   })
 })
 

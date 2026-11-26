@@ -35,6 +35,9 @@ export type OnsenItem = {
   kind: 'text' | 'command' | 'voice' | 'photo' | 'document' | 'video' | 'sticker' | 'rich'
   sent_at: string; client_msg_id?: string; reply_to_client_msg_id?: string; thread?: string; forward_from?: string
   attachments?: OnsenAttachment[]; status: 'ok' | 'failed'; error?: string; backfilled?: false; meta?: Record<string, unknown>
+  /** WO-172 (Chiron 02:43Z; Onsen app/onsen.py reads the item's own turn_id into messages.turn_id): an outbound message's turn, a field of the item itself
+   *  as on seen and turn_end (not in meta) */
+  turn_id?: string
 }
 export type OnsenEvent = {
   idem_key: string; agent: string; client: 'telegram'; chat: string; target_client_msg_id: string
@@ -232,7 +235,6 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
   const attachments: OnsenAttachment[] | undefined = kind === 'text' || kind === 'rich' ? undefined
     : [{ ...(fname ? { name: String(fname) } : {}), ...(f?.mime_type ? { mime: f.mime_type } : {}), ...(f?.file_size != null ? { size: Number(f.file_size) } : {}), ...(f?.file_id ? { file_id: f.file_id } : {}) }]
   const meta: Record<string, unknown> = {
-    ...(ctx.turn_id ? { turn_id: ctx.turn_id } : {}),                       // WO-172: the turn it was sent in (Onsen stores meta as it is)
     ...(ctx.parts && ctx.parts > 1 ? { part: ctx.part, parts: ctx.parts } : {}),
     ...(payload.disable_notification ? { silent: true } : {}),
     ...(payload.reply_markup ? { buttons: true } : {}),
@@ -247,6 +249,7 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
     ...(attachments && Object.keys(attachments[0]).length ? { attachments } : {}),
     status: id != null ? 'ok' : 'failed', ...(id == null ? { error: err !== undefined ? errText(err) : 'Telegram answered without a message_id' } : {}),
     backfilled: false, ...(Object.keys(meta).length ? { meta } : {}),
+    ...(ctx.turn_id ? { turn_id: String(ctx.turn_id).slice(0, 120) } : {}),   // WO-172: the turn it was sent in, top level (WO-177 1.58.3: was meta.turn_id)
   } }
 }
 

@@ -24,7 +24,7 @@ L.lanesInit(deps)
 const facts: DeliveryFact[] = []
 const reacted: string[] = []
 const R = new SeenReactor({ log: () => {}, react: async (c, id) => { reacted.push(`${c}:${id}`) } })
-const F = new DeliveryFacts({ agent: 'adam', sink: f => facts.push(f), settleMs: 40, onSeen: (c, id, by) => R.seen(c, id, by) })
+const F = new DeliveryFacts({ agent: 'adam', sink: f => facts.push(f), onSeen: (c, id, by) => R.seen(c, id, by) })
 // server.ts onsenJoeyOf: a page answer (via web-form, form-<n>) is Joey's message too
 const joeyOf: JoeyOf = m => m && m.user_id === JOEY && m.chat_id && (/^\d+$/.test(String(m.message_id ?? '')) || ((m.via === 'web-form' || m.via === 'onsen') && /^form-\d+$/.test(String(m.message_id))))
   ? { chat: String(m.chat_id), id: String(m.message_id) } : null
@@ -59,7 +59,7 @@ test('a page answer: to the main (rule web-form, M1 item kind joey), seen by mai
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, session_id: sid, prompt_id: 'p1', dids: [it.id] })
   expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:in_session:main', 'form-77:seen:main'])
   await L.__mainEvent({ event: 'Stop', pid: proc.pid, session_id: sid, prompt_id: 'p1', phase: 'final' })
-  await sleep(120)
+  F.statusRecord('idle')                                                           // WO-177: the record shows the turn over
   expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toEqual(['form-77:in_session:main', 'form-77:seen:main', 'form-77:turn_end:main'])
   expect(reacted).toEqual([])
 })
@@ -87,7 +87,7 @@ test('WO-159: a message Joey wrote in Onsen (via onsen): to the main (rule onsen
   await L.__mainEvent({ event: 'UserPromptSubmit', pid: proc.pid, session_id: sid, prompt_id: 'p9', dids: [it.id] })
   expect(facts.map(f => `${f.client_msg_id}:${f.state}:${f.by}`)).toContain('form-88:seen:main')
   await L.__mainEvent({ event: 'Stop', pid: proc.pid, session_id: sid, prompt_id: 'p9', phase: 'final' })
-  await sleep(120)
+  F.statusRecord('idle')
 })
 
 test('Joey\'s Telegram message: ✍ at the moment M1 binds it to the main\'s turn (not when it is only offered)', async () => {

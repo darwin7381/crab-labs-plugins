@@ -128,9 +128,9 @@ describe('the spool: delivery facts and status lines, in order, the same guarant
 })
 
 describe('delivery facts', () => {
-  test('one per (message, state); an album: every item; turn_end waits for the turn to stay closed, a continued turn cancels it, a new prompt flushes it', async () => {
+  test('one per (message, state); an album: every item; turn_end waits for the status record to show the turn over (WO-177: no timer), a continued turn cancels it, a new prompt flushes it', async () => {
     const out: DeliveryFact[] = []
-    const F = new DeliveryFacts({ agent: AGENT, sink: f => out.push(f), settleMs: 80 })
+    const F = new DeliveryFacts({ agent: AGENT, sink: f => out.push(f) })
     F.album(JOEY, ['10', '11', '12'])
     for (const id of [10, 11, 12]) F.delivered(JOEY, id)
     F.inSession(JOEY, 10, 'main')                                                 // WO-165: handed to the session, not in a turn yet
@@ -145,12 +145,12 @@ describe('delivery facts', () => {
     expect(out.filter(f => f.state === 'in_session').length).toBe(3)
     expect(out.find(f => f.state === 'in_session')).toMatchObject({ by: 'main', idem_key: `tg:${AGENT}:${JOEY}:dlv:10:in_session` })
     F.turnEndLater(JOEY, 10, 'main', '2026-11-25T10:00:00.000Z')
-    await sleep(30)
+    F.statusRecord('busy')                                                       // the record still shows the turn running: nothing yet
     F.cancelTurnEnd(JOEY, 10, 'main')                                            // the turn went on (another Stop hook held it)
-    await sleep(120)
+    F.statusRecord('idle')
     expect(out.some(f => f.state === 'turn_end')).toBe(false)
     F.turnEndLater(JOEY, 10, 'main', '2026-11-25T10:05:00.000Z', { reason: 'asked_restart' })
-    await sleep(150)
+    F.statusRecord('idle')
     const te = out.filter(f => f.state === 'turn_end')
     expect(te.map(f => f.client_msg_id)).toEqual(['10', '11', '12'])
     expect(te[0]).toMatchObject({ at: '2026-11-25T10:05:00.000Z', by: 'main', detail: { reason: 'asked_restart' }, idem_key: `tg:${AGENT}:${JOEY}:dlv:10:turn_end` })
@@ -601,7 +601,7 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
     notifySession: async (sid: string) => open.has(sid), streamOpen: (sid: string) => open.has(sid), sendBot: async () => 100, joeyChatId: () => JOEY }
   L.lanesInit(deps)
   const facts: DeliveryFact[] = []
-  const F = new DeliveryFacts({ agent: AGENT, sink: f => facts.push(f), settleMs: 60 })
+  const F = new DeliveryFacts({ agent: AGENT, sink: f => facts.push(f) })
   const joeyOf: JoeyOf = m => m && m.user_id === JOEY && m.chat_id && /^\d+$/.test(String(m.message_id ?? '')) ? { chat: String(m.chat_id), id: String(m.message_id) } : null
   let changes = 0
   const tap = new LanesTap({ facts: F, joey: joeyOf, gen: () => L.mainGenRow(), changed: () => { changes++ } })
@@ -629,7 +629,7 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
   // 1.45.1: the state is the registry's (a stand-in here: busy unless said); the tap gives the detail
   const view = (status = 'busy') => statusOf({ main: { status }, last_activity_at: null, queued_joey: L.mainQueuedJoey(), walled: tap.walled(), compacting: tap.compacting(), turn: tap.turnDetail() })
 
-  test('no main: no turn; a queued Joey message counts; offered is not seen; bound (the turn took it in) is seen by main; the tool as detail; Stop: turn_end after it settles', async () => {
+  test('no main: no turn; a queued Joey message counts; offered is not seen; bound (the turn took it in) is seen by main; the tool as detail; Stop: turn_end when the record shows the turn over', async () => {
     expect(L.mainGenRow()).toBe(null); expect(tap.turnDetail()).toBe(null)
     await joey(901)
     expect(L.mainQueuedJoey()).toBe(1)
@@ -667,15 +667,17 @@ describe('lanes on: M1, M2 and the lane runs, read through the tap', async () =>
     await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
     expect(tap.turnDetail()).toBe(null)
     expect(F.pendingLater()).toBe(2)
+    F.statusRecord('busy')                                                        // WO-177: the record shows the turn going on: nothing is sent
     await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply' })   // continueTurn: bound again
     expect(F.pendingLater()).toBe(0)
-    await sleep(100)
+    F.statusRecord('idle')
     expect(of(901)).toEqual(['in_session:main', 'seen:main'])                    // no turn_end: that Stop was not the end
     expect(tap.turnDetail()).not.toBe(null)
     expect((view().detail as any).turn_started_at).toBe((v.detail as any).turn_started_at)   // the same turn
     await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__reply', tool_input: { text: 'ok' }, tool_response: 'sent' })
     await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
-    await sleep(100)
+    expect(of(901)).toEqual(['in_session:main', 'seen:main'])
+    F.statusRecord('idle')                                                        // the record shows the turn over: sent now
     expect(of(901)).toEqual(['in_session:main', 'seen:main', 'turn_end:main'])
     expect(of(902)).toEqual(['in_session:main', 'seen:main', 'turn_end:main'])
     expect(changes).toBeGreaterThan(0)

@@ -4442,7 +4442,7 @@ const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callbac
 /** the status pin of this daemon (null: ONSEN_STATUS_PIN off), for the button's callback */
 let statusPinRef: OnsenVisible.StatusPin | null = null
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
-  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f), settleMs: Number(process.env.ONSEN_TURN_SETTLE_MS ?? 60_000),
+  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f),
     ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}),   // WO-145: ✍ when the main takes it in (WO-165: into a turn)
     changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
@@ -4485,7 +4485,10 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen).
     // WO-177 一: and M1 offers what it held the moment the record says the main can take it: the edge is the member state (decideWake's: a wall or a
     // compaction in an idle view's detail is one too)
-    const edge = `${OnsenWake.memberStateOf(pub, null)}|${pub.state}|${pub.detail?.interrupted === true}`
+    const member = OnsenWake.memberStateOf(pub, null)
+    const edge = `${member}|${pub.state}|${pub.detail?.interrupted === true}`
+    // WO-172 (Chiron 02:43Z) / WO-177: a normal turn's turn_end goes when this record shows the turn over (not busy, stuck or compacting), not 60 s later
+    try { facts.statusRecord(member) } catch {}
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
   // WO-172: each turn that ended (the main's, a lane run): one line. Its outcome and bound ride every turn_end fact of a Joey message in it (Onsen keeps

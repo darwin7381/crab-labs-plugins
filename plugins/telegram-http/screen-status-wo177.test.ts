@@ -197,7 +197,7 @@ describe('六 /healthz since after a restart: Onsen\'s, while the state has not 
     since: { load: () => load, save: x => { saved.push(x) }, remote } })
   test('no local file (the first start of a version that keeps it): since = the first report; Onsen answers the same state → its since, and it is saved', async () => {
     const saved: any[] = []
-    const f = facts(null, async () => ({ state: 'idle', since: '2026-11-25T22:00:00.000Z' }), saved)
+    const f = facts(null, async () => ({ state: 'idle', since: '2026-11-25T22:00:00.000000+00:00' }), saved)   // Onsen's spelling
     f.update(prog('idle'))
     expect(f.current()!.since).toBe(new Date(T0).toISOString())
     await wait(5)
