@@ -1,0 +1,19 @@
+│ improving these safeguards to reduce the amount of incorrectly flagged
+│ messages. Switch to Opus 4.8 and keep going whenever this happens? You can
+│ change this later in /config.
+❯ 1. Switch automatically
+     Continue on Opus 4.8 now, and switch without asking from now on
+  2. Stay on Opus 5.5
+     Stop here without switching, and ask me each time a message is flagged
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel
+✻ Waiting for API response · will retry in 2m 40s · check your network
+  93 tasks (55 done, 18 in progress, 20 open)
+  ◼ task 1
+  ◼ task 2
+  ◼ task 3
+  ◼ task 4
+  ◼ task 5
+   … +13 in progress, 20 pending, 55 completed

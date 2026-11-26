@@ -99,7 +99,9 @@ export function tpe(ms: number): string {
 const WAITING: Record<string, string> = { 'permission prompt': '權限詢問', 'dialog open': '選單', 'input needed': '它問了問題',
   // WO-165 A: the menu kinds Jev names (Chiron's questions file, `menu`)
   permission: '權限詢問', model_picker: '模型選單', trust_folder: '要不要信任這個資料夾', usage_limit_options: '撞上限後的選項', resume_picker: '選要接哪段對話',
-  plan_or_question: '它問了問題', login: '要登入', other: '選單' }
+  plan_or_question: '它問了問題', login: '要登入', other: '選單',
+  // WO-168 item 6: Chiron's questions v8 (screen-eval/v8/README.md)
+  refusal_fallback: '安全機制擋下後的選單', switch_confirm: '換模型／思考強度的確認' }
 const OFFLINE: Record<string, string> = { no_registration: '沒有 session', pid_gone: '行程不在了', pid_reused: '行程不在了', not_connected: '連不上' }
 /** line 1: what statusOf says, in Joey's words. `sinceMs`: when this state began; `now` for stuck's minutes. Precedence: offline, then the usage wall,
  *  then the state (compacting before stuck: a compaction writes nothing for minutes). */

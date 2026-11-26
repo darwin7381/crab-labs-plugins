@@ -209,7 +209,8 @@ describe('questions file', () => {
     expect(q).not.toBeNull()
     const opts = Object.keys(q.questions.state.criteria), menus = Object.keys(q.questions.menu.criteria)
     for (const m of VERDICT_STATES) expect(opts).toContain(m)
-    for (const m of VERDICT_MENUS) expect(menus).toContain(m)
+    // WO-168 item 6: refusal_fallback and switch_confirm are known to the daemon before Chiron publishes questions v8 (the file may not have them yet)
+    for (const m of VERDICT_MENUS) if (m !== 'refusal_fallback' && m !== 'switch_confirm') expect(menus).toContain(m)
   })
 })
 

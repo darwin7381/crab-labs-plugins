@@ -168,7 +168,9 @@ describe('2 the composition order: offline → starting → usage limit → wait
     const wall = { walled: { until: '2026-11-26T05:00:00.000Z', kind: 'session' } }
     for (const s of ['working', 'idle', 'waiting_for_human', 'compacting'] as const)
       expect(publishView(V(s, 0.9, s === 'waiting_for_human' ? 'model_picker' : 'none'), st, prog('busy', { ...wall, ...TURN }))).toEqual({ state: 'walled',
-        detail: { queued_joey: 0, walled: wall.walled, judged_by: 'jev', judge_p: 0.9 }, last_activity_at: '2026-11-26T02:59:00.000Z' })
+        // WO-168 (Chiron 05:24:56Z, 紀錄要補的 5): a menu open while walled keeps its kind and question in the record
+        detail: { queued_joey: 0, walled: wall.walled, judged_by: 'jev', judge_p: 0.9, ...(s === 'waiting_for_human' ? { waitingFor: 'model_picker', waiting_text: expect.any(String) } : {}) },
+        last_activity_at: '2026-11-26T02:59:00.000Z' })
     expect(publishView(V('usage_limit', 0.9, 'usage_limit_options'), st, prog('idle'))).toMatchObject({ state: 'walled', detail: { walled: { until: null } } })
   })
   test("a limit the program cleared, still the latest output on the screen, is not a wall (11-26 07:13Z: three agents held as walled after probe_after_switch)", () => {
@@ -207,13 +209,15 @@ describe('3 the interface holds, and the switch', () => {
     }
     expect(isVerdict(V('idle'))).toBe(true)
   })
-  test('JevJudge: an option Chiron adds to questions.json but not to the lists does not reach the record (and is an exception)', async () => {
+  // WO-168 item 6 (Chiron 05:54Z): such an option no longer drops the verdict: it is taken as `other`, the judge's word kept as menu_raw (still an exception)
+  test('JevJudge: a menu option Chiron adds to questions.json but not to the lists is taken as other with menu_raw (and is an exception)', async () => {
     const ref: { s?: ScreenStatus } = {}, h: { j: ScreenJudge | null } = { j: null }
     const r = reader(() => h.j, { opts: { activeCheckMs: 0 } })
     h.j = jevJudge(r.dir, () => ({ answers: { state: { choice: 'idle', probabilities: { idle: 0.9 } }, fits_any: { noul: 0.9 }, menu: { choice: 'effort_picker', probabilities: { effort_picker: 0.7 } } }, ms: 5 }), ref, () => r.st.program)
     ref.s = r.s; r.s.active()
     r.s.sample(IDLE, '2.1.322'); await wait(20)
-    expect(r.s.view(r.st.program).detail!.judged_by).toBe('program')
+    expect(r.s.view(r.st.program).detail!.judged_by).toBe('jev')
+    expect(r.s.health()).toMatchObject({ answer: { state: 'idle', menu: 'other', menu_raw: 'effort_picker' } })
     expect(lines(join(r.dir, 'run', 'screen-exceptions.jsonl')).map(e => e.kinds)).toEqual([['menu_unmapped:effort_picker']])
   })
   test('SCREEN_JUDGE: jev (default, and for a name it does not know), program; the switch point', () => {

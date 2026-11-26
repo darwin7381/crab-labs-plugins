@@ -1,0 +1,18 @@
+✻ Waiting for 1 background agent to finish
+● Agent "Run sleep 25 and report" is waiting on its own background work · 7s
+● 子 agent 還在等它自己的背景 sleep 25（任務 bl5xbs4oh），這次的結果只是中間狀態。它完成後會再通知我，到時我回「好」給 Joey。
+✻ Sautéed for 12s · done 上午4:10
+● Agent "Run sleep 25 and report" finished · 32s
+  Called plugin:telegram-http:telegram-http
+● 已回「好」到 Telegram（660）。子 agent 回報結束碼 0、完成。
+✻ Crunched for 2s · done 上午4:10
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.
+     1. Default (recommended)  Sonnet 5.5 · Efficient for routine tasks
+     2. Sonnet                 Sonnet 5.5 · Efficient for routine tasks
+     3. Fable                  Fable 5.2 · Most capable for your hardest and longest-running tasks
+     4. Opus                   Opus 5.5 · Best for everyday, complex tasks
+   ❯ 5. Haiku ✔                Haiku 5.5 · Fastest for quick answers
+   ◐ Medium effort (default) ←/→ to adjust
+   Enter to set as default · s to use this session only · Esc to cancel

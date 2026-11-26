@@ -19,8 +19,9 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
   notifySession: async (sid: string, notif: any) => { if (!open.has(sid)) return false; offers.push({ sid, notif }); return true },
   streamOpen: (sid: string) => open.has(sid), toolsChanged: (sid: string) => { toolsChanged.push(sid) },
   sendBot: async (_c: string, text: string) => { sent.push(text); return 300 + sent.length }, joeyChatId: () => '1',
-  mainPicker: { capture: async () => pane.text, detect: (p: string) => /limit/.test(p) ? { key: 'generic-1', title: 'limit', options: ['Wait here, then continue automatically', 'Upgrade your plan'] } : null,
-    drive: async () => { pane.drives++; return 'ok' as const }, rearm: () => {} }, usageWall: () => uwMode } as any)
+  // WO-168: the menu on the main's pane comes from server.ts (the status record and the duty officer); lanes never press a key (drives stays 0)
+  mainMenu: async () => /limit/.test(pane.text) ? { text: '它停在一個選單：1. Wait here, then continue automatically｜2. Upgrade your plan；選項已再傳給你。', asks: true } : null,
+  usageWall: () => uwMode } as any)
 L.__setWallProbe(3_600_000)
 const procs: any[] = []
 const stuck0 = MAIN_STUCK_MS

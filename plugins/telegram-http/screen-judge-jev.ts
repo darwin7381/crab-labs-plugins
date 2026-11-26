@@ -61,13 +61,15 @@ export function decide(j: JevRead, q: Pick<Questions, 'menuRule'>): JevRead {
   if (!r || !j.menu || j.menu === 'none' || j.menu_p == null || j.menu_p < r.threshold || j.state === r.state) return j
   return { ...j, state: r.state, p: j.menu_p, by_menu: { state: j.state, p: j.p } }
 }
-/** the program's collection of Jev's reading (after decide()) into the fixed output: the state and the menu must be options of the two lists
- *  (screen-status.ts VERDICT_STATES / VERDICT_MENUS) and the state's p at least the file's threshold; anything else is no verdict (null). No menu answer:
- *  'other' for a waiting state (the menu could not be named), else 'none' */
+/** the program's collection of Jev's reading (after decide()) into the fixed output: the state must be an option of VERDICT_STATES and its p at least the
+ *  file's threshold, else no verdict (null); a menu outside VERDICT_MENUS is `other` with menu_raw (WO-168). No menu answer: 'other' for a waiting state
+ *  (the menu could not be named), else 'none' */
 export function verdictOf(j: JevRead, threshold: number): ScreenVerdict | null {
   if (!isVerdictState(j.state) || !(j.p >= threshold) || j.p > 1) return null
   const menu = j.menu ?? (j.state === 'waiting_for_human' ? 'other' : 'none')
-  if (!isVerdictMenu(menu)) return null
+  // WO-168 item 6 (Chiron 05:54Z): a menu kind this daemon does not know (a questions file newer than the daemon) is taken as `other`, the judge's word
+  // kept (menu_raw): the screen keeps its verdict (waiting for a human, when the menu rule made it so) instead of losing it. Before: no verdict
+  if (!isVerdictMenu(menu)) return typeof menu === 'string' && menu ? { state: j.state, menu: 'other', p: j.p, by: 'jev', menu_raw: menu.slice(0, 60) } : null
   return { state: j.state, menu, p: j.p, by: 'jev' }
 }
 /** WO-177 二 (Chiron's ticket): a verdict the record would hold the main's items on must agree with the program's own facts, here, where Jev's answer

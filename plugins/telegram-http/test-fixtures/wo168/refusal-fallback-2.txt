@@ -1,0 +1,23 @@
+ Session paused
+
+  Opus 5.5's safeguards flagged this session. You may be seeing this for the
+  first time on an Opus model: Opus 5.5 is more capable and has stronger
+  safeguards as a result, which can sometimes flag non-cybersecurity work.
+  We're improving these safeguards to reduce the amount of incorrectly flagged
+  messages. Edit and retry, or continue with Opus 4.8. Send feedback with
+  /feedback or learn more
+
+  Details: `[cyber]`
+
+  ❯ 1. Switch to Opus 4.8
+    2. Edit prompt and retry with Opus 5.5
+
+✻ Waiting for API response · will retry in 2m 40s · check your network
+
+  13 tasks (2 done, 2 in progress, 9 open)
+  ◼ task 1
+  ◼ task 2
+  ◻ task 3
+  ◻ task 4
+  ◻ task 5
+   … +6 pending, 2 completed

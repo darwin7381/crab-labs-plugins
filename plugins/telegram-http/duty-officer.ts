@@ -38,6 +38,7 @@ import {
 } from 'node:fs'
 import { homedir, hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { PaneLook } from './pane-look.ts'
 
 // ---------------------------------------------------------------- constants (Chiron's interim values)
 export const MODEL = 'claude-opus-5-5'
@@ -117,7 +118,9 @@ export function isRateLimitMenu(lines: string[]): boolean {
   const t = lines.join('\n')
   return RATE_LIMIT.test(t) && CONFIRM.test(t)
 }
-const STATUSY = /tokens.*[·↓↑]|[·↓↑].*tokens|until auto-compact/
+// WO-168: and the two countdowns a menu can sit over (a permission prompt's 「automatically block this request in 1:59」, the refusal picker's 「will retry in
+// 2m 40s」): with their digits counted, the screen changed every second and never stood still long enough to be a stall
+const STATUSY = /tokens.*[·↓↑]|[·↓↑].*tokens|until auto-compact|will retry in|automatically block this request in/
 /** Hash of the tail; only status lines (token counters, timers) have their digits masked. */
 export function thash(lines: string[]): string {
   const norm = lines.map(l => STATUSY.test(l) ? l.replace(/\d+(?:\.\d+)?/g, '#') : l)
@@ -344,12 +347,15 @@ export function transcriptMtime(projectsDir: string | null | undefined): number 
 // ---------------------------------------------------------------- tmux
 export interface PaneInfo { cmd: string; inMode: boolean; path: string }
 export interface Tmux {
+  /** WO-168: roamer panes only when the officer has its own pane's reader (OfficerDeps.ownPane): the own pane is read through the record's one capture */
   capture(target: string, scrollback?: number): Promise<string | null>
   /** Last key pressed by any attached tmux client, epoch ms; null = nobody attached. Keys sent with
    *  `send-keys -t` (ours, the supervisor's) do not move it; keys typed through a client do. */
   clientActivity(target: string): Promise<number | null>
   info(target: string): Promise<PaneInfo | null>
   sendKey(target: string, key: string): Promise<void>
+  /** WO-168 item 6: type text literally (send-keys -l): the refusal rule's notice line; absent: nothing is typed */
+  sendText?(target: string, text: string): Promise<void>
   cancelMode(target: string): Promise<void>
 }
 function run(argv: string[], timeoutMs = 8000): Promise<{ code: number; out: string }> {
@@ -384,6 +390,7 @@ export const realTmux: Tmux = {
     return r.code === 0 && ts.length ? Math.max(...ts) * 1000 : null
   },
   async sendKey(t, key) { await run(['tmux', '-u', 'send-keys', '-t', t, key]) },
+  async sendText(t, text) { await run(['tmux', '-u', 'send-keys', '-t', t, '-l', text]) },
   async cancelMode(t) { await run(['tmux', '-u', 'send-keys', '-t', t, '-X', 'cancel']) },
 }
 
@@ -697,6 +704,12 @@ export interface OfficerDeps {
   onLook?(tmux: string, cmd: string, pane: string): void
   /** WO-176: this daemon's menus as Onsen Actions; absent: none (the officer works exactly as before) */
   actions?: MenuActions
+  /** WO-168 stage two: the daemon's own pane, read through the status record's one capture and judged by the record. Absent: every pane is looked at and
+   *  classified here, as before (roamer panes always are) */
+  ownPane?: OwnPane
+  /** WO-168 item 6: the refusal-fallback rule's alert on the 3rd picker within 30 min (BTCC chart session.flagged, as modal-guard raises it); its answer
+   *  for the log. Absent: logged only */
+  alert?(a: { node: string; chart: string; severity: string; value: string; info: string }): Promise<string>
   now?(): number
   sleep?(ms: number): Promise<void>
 }
@@ -712,8 +725,12 @@ interface Config {
   claude_cmds: string[]
   // model asked when MODEL refuses on its safeguards; null = no second try (Joey gets the raw screen)
   fallback_model: string | null
+  // WO-168 item 6: who handles the refusal-fallback picker on the own pane: 'officer' (its program rule) or 'modal-guard' (Hephaestus's script, until stage
+  // three retires its branch); null: modal-guard where its script is installed (the Mac mini), else the officer. One of them, never both
+  refusal_fallback: 'officer' | 'modal-guard' | null
 }
-const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null, claude_cmds: [], fallback_model: FALLBACK_MODEL }
+const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test_recipients: [], test_rulings_to: null, claude_cmds: [], fallback_model: FALLBACK_MODEL,
+  refusal_fallback: null }
 interface Rec { action: string; t: number; askId?: string; resolved?: boolean | null }
 interface PaneState { hash: string; state: State; since: number; rec: Rec | null; attendedLogged?: boolean }
 interface Ask {
@@ -740,6 +757,8 @@ interface Ask {
   perm_bind?: PermBinding
   /** WO-168: Joey's choice is not mailed to Chiron as a ruling (the usage-limit menu: his resource decision each time, never a rule to write down) */
   no_ruling?: true
+  /** WO-168 (own pane): the record's screen hash when it was asked: a tap presses only on that screen */
+  screen_hash?: string | null
 }
 // ---------------------------------------------------------------- WO-176: the menus as Onsen Actions
 /** a menu's Action as an ask keeps it: the key it was made with, and Onsen's id and version once known */
@@ -804,7 +823,46 @@ export function askBody(text: string): string {
   return tool < 0 ? `${text.slice(0, cut)}\n\n畫面最後幾行：\n${fence(rest)}`
     : `${text.slice(0, cut)}\n\n畫面最後幾行：\n${fence(rest.slice(0, tool))}\n\n等待中的工具呼叫：\n${fence(rest.slice(tool + '\n\n— 等待中的工具呼叫 —\n'.length))}`
 }
-type Look = { state: State; hash: string; lines: string[]; info: PaneInfo; pane: string } | null
+/** WO-168: the menu the status record names on the own pane: its kind, its options as the screen shows them, its question */
+export type MenuSeen = { kind: string; options: Array<{ n: number | null; text: string; cursor: boolean }>; question: string }
+/** WO-168 stage two: the own pane through the status record (server.ts: pane-look.ts PaneReader and screen-status.ts recordOf) */
+export interface OwnPane {
+  tmux: string
+  /** a look of the record's one capture, at most maxAgeMs old (0: taken now) */
+  look(maxAgeMs: number): Promise<PaneLook | null>
+  /** the record for exactly this look's screen, and that screen's hash; null: no record of the screen here (JEV_SCREEN does not list this agent): the officer
+   *  reads the look as it reads a roamer pane */
+  recordOf(look: PaneLook): { view: { state: string; detail?: Record<string, unknown> }; hash: string } | null
+}
+/** the record's state as the officer's four: a menu open (waiting, or a menu kept while walled or starting) is OTHER, busy / stuck WORKING, idle / walled
+ *  IDLE, starting / offline STARTING */
+export function stateOfRecord(v: { state: string; detail?: Record<string, unknown> }): { state: State; menu: MenuSeen | null } {
+  const d = (v.detail ?? {}) as Record<string, any>
+  const w = typeof d.waitingFor === 'string' && d.waitingFor && d.waitingFor !== 'none' ? d.waitingFor : null
+  if (v.state === 'waiting' || (w && (v.state === 'walled' || v.state === 'starting'))) {
+    const kind = w && /^[a-z_]+$/.test(w) ? w : w && /permission/i.test(w) ? 'permission' : 'other'
+    const options = Array.isArray(d.menu_options) ? d.menu_options.filter((o: any) => o && typeof o.text === 'string')
+      .map((o: any) => ({ n: typeof o.n === 'number' ? o.n : null, text: String(o.text), cursor: o.cursor === true })) : []
+    return { state: 'OTHER', menu: { kind, options, question: typeof d.waiting_text === 'string' ? d.waiting_text : '' } }
+  }
+  if (v.state === 'busy' || v.state === 'stuck') return { state: 'WORKING', menu: null }
+  if (v.state === 'idle' || v.state === 'walled') return { state: 'IDLE', menu: null }
+  return { state: 'STARTING', menu: null }
+}
+/** a menu's options as buttons: the keys move from the live cursor (a numbered menu only, as numberedMenu: an unnumbered list gets no keys) */
+export function optionButtons(options: MenuSeen['options']): Array<{ button: string; keys: string[] | null }> {
+  const at = options.findIndex(o => o.cursor), numbered = options.length >= 2 && options.every(o => o.n != null)
+  return options.map((o, i) => ({ button: `${o.n != null ? `${o.n}. ` : ''}${o.text}`.slice(0, 60),
+    keys: numbered && at >= 0 ? [...Array(Math.abs(i - at)).fill(i > at ? 'Down' : 'Up'), 'Enter'] : null }))
+}
+/** modal-guard's refusal rule (ratelimit-modal-guard.sh:39-40, 143-149), moved into the officer as it is (Chiron's rulings 3, WO-168) */
+export const REFUSAL = { graceMs: 120_000, debounceMs: 300_000, windowMs: 1_800_000, max: 3 }
+export const REFUSAL_NOTICE = '[modal-guard] Your last turn was stopped by a safety classifier (refusal-fallback picker, cancelled with Esc; you stay on your pinned model). Do not redo or reword the flagged step. Drop that approach and reach the goal another legitimate way, or report that this step needs a different path.'
+type Look = { state: State; hash: string; lines: string[]; info: PaneInfo; pane: string
+  /** WO-168 (own pane): the capture's scrollback and visible text (the model bundle's screen), the record's screen hash, the menu the record names */
+  full?: string; screenHash?: string | null; menu?: MenuSeen | null
+  /** WO-168 (own pane): the record's detail.input_typed (null: not known) */
+  typed?: boolean | null } | null
 
 export class DutyOfficer {
   readonly dir: string
@@ -859,6 +917,7 @@ export class DutyOfficer {
             claude_cmds: Array.isArray(j.claude_cmds) ? j.claude_cmds.map(String) : [],
             fallback_model: j.fallback_model === null || j.fallback_model === '' ? null
               : typeof j.fallback_model === 'string' ? j.fallback_model : FALLBACK_MODEL,
+            refusal_fallback: j.refusal_fallback === 'officer' || j.refusal_fallback === 'modal-guard' ? j.refusal_fallback : null,
           }
         } catch (e) { this.d.log('warn', `duty-officer: config.json unreadable (${String(e).slice(0, 80)}) — off`) }
       }
@@ -886,6 +945,31 @@ export class DutyOfficer {
   handles(tmux: string): boolean { return this.enabledNow.has(tmux) }
 
   private claimPath(tmux: string) { return join(this.dir, 'claims', tmux.replace(/[^A-Za-z0-9._-]/g, '_')) }
+  // WO-168 (lanes' usage-limit menu reader retired; Chiron 05:24:56Z): the own pane's usage-limit menu is the officer's (its program rule asks Joey). The
+  // two programs outside the plugin that stand aside from it read this file, unchanged since lanes-golive C8 (lanes.ts publishMenuOwner wrote it until
+  // now): ratelimit-modal-guard.sh menu_owned_by_lanes (Hephaestus) and the delivery watchdog's usage_wall_read.menu_owned (type_resume). Both read
+  // only its mtime (fresh under 120 s) and `pid` (alive), so the path and fields stay; owner names the officer. Written every 30 s while the officer
+  // watches its own pane, removed when it stops (switched off, the daemon's exit)
+  private ownerAt = new Map<string, number>()
+  private ownerFile(tmux: string): string { return join(this.home, '.claude', 'lanes', 'menu-owner', `${tmux.replace(/[^A-Za-z0-9._-]/g, '_')}.json`) }
+  private publishOwner(tmux: string, label: string): void {
+    const now = Date.now()
+    if (now - (this.ownerAt.get(tmux) ?? 0) < 30_000) return
+    this.ownerAt.set(tmux, now)
+    const p = this.ownerFile(tmux)
+    try {
+      mkdirSync(join(this.home, '.claude', 'lanes', 'menu-owner'), { recursive: true })
+      writeFileSync(`${p}.tmp`, JSON.stringify({ owner: 'duty-officer', menus: ['usage-limit'], agent: label, tmux, pid: process.pid, at: iso(now) }), { mode: 0o644 })
+      renameSync(`${p}.tmp`, p)
+    } catch {}
+    if (this.ownerAt.size === 1 && !this.exitHook) { this.exitHook = true; process.once('exit', () => { for (const t of this.ownerAt.keys()) this.dropOwner(t) }) }
+  }
+  private exitHook = false
+  private dropOwner(tmux: string): void {
+    if (!this.ownerAt.delete(tmux)) return
+    const p = this.ownerFile(tmux)
+    try { if (JSON.parse(readFileSync(p, 'utf8'))?.pid === process.pid) unlinkSync(p) } catch {}
+  }
   /** Claim the pane for this process unless another live process holds a fresh claim. */
   claim(tmux: string): boolean {
     const p = this.claimPath(tmux)
@@ -940,13 +1024,34 @@ export class DutyOfficer {
   }
 
   // ---- looking at a pane
-  async look(tmux: string): Promise<Look> {
+  /** `maxAgeMs` (WO-168, the own pane): a look of the record's capture at most this old is enough (the loop's look); 0, the default: taken now (before and
+   *  after a key, a follow-up dialog) */
+  async look(tmux: string, maxAgeMs = 0): Promise<Look> {
+    const own = this.d.ownPane && tmux === this.d.ownPane.tmux ? this.d.ownPane : null
+    if (own) return this.lookOwn(own, maxAgeMs)
     const [info, pane] = await Promise.all([this.d.tmux.info(tmux), this.d.tmux.capture(tmux)])
     if (!info || pane == null) return null
     try { this.d.onLook?.(tmux, info.cmd, pane) } catch {}
     const lines = tailLines(pane)
     const extra = new Set([...this.extra, ...this.config().claude_cmds])
     return { state: classify(lines, info.cmd, extra), hash: thash(lines), lines, info, pane }
+  }
+  /** WO-168 stage two: the own pane through the status record. The state, the menu's kind and its options are the record's for exactly this look; the
+   *  officer keeps its own tail hash (the stall clock, the check before a key) and adds the record's screen hash to that check. A pane whose foreground is
+   *  not Claude Code, or no record of the screen (JEV_SCREEN off), is read as before */
+  private async lookOwn(own: OwnPane, maxAgeMs: number): Promise<Look> {
+    let l: PaneLook | null = null
+    try { l = await own.look(maxAgeMs) } catch { l = null }
+    if (!l) return null
+    const info: PaneInfo = { cmd: l.cmd, inMode: l.inMode, path: l.path }
+    const lines = tailLines(l.visible)
+    const extra = new Set([...this.extra, ...this.config().claude_cmds])
+    let rec: ReturnType<OwnPane['recordOf']> = null
+    try { rec = own.recordOf(l) } catch { rec = null }
+    const base = { hash: thash(lines), lines, info, pane: l.visible, full: l.text, screenHash: rec?.hash ?? null }
+    if (!rec || !isClaudeCmd(l.cmd, extra)) return { ...base, state: classify(lines, info.cmd, extra), menu: null }
+    const it = (rec.view.detail as Record<string, unknown> | undefined)?.input_typed
+    return { ...base, ...stateOfRecord(rec.view), typed: typeof it === 'boolean' ? it : null }
   }
 
   private async targets(cfg: Config): Promise<Target[]> {
@@ -1006,8 +1111,9 @@ export class DutyOfficer {
         }
         if (!this.claim(t.tmux)) continue
         on.add(t.tmux)
+        if (this.d.ownPane && t.tmux === this.d.ownPane.tmux) this.publishOwner(t.tmux, t.label)
         if (this.busy.has(t.tmux)) continue
-        const lk = await this.look(t.tmux)
+        const lk = await this.look(t.tmux, this.L.pollMs / 2)
         if (!lk) {
           // a pane we cannot read is said once an hour, never skipped silently
           const last = this.lookFailed.get(t.tmux) ?? 0
@@ -1017,7 +1123,7 @@ export class DutyOfficer {
         }
         await this.step(t, lk, now)
       }
-      for (const tmux of this.enabledNow) if (!on.has(tmux)) this.release(tmux)
+      for (const tmux of this.enabledNow) if (!on.has(tmux)) { this.release(tmux); this.dropOwner(tmux) }
       this.enabledNow = on
     } catch (e) {
       this.event('error', { where: 'tick', error: String(e).slice(0, 300) })
@@ -1034,12 +1140,30 @@ export class DutyOfficer {
       if (prevAsk && state !== 'OTHER') void this.closeGone(prevAsk, state)
       s = { hash, state, since: now, rec: null }
       this.st.set(t.tmux, s)
-      if (state === 'OTHER') this.event('seen_other', { agent: t.label, tmux: t.tmux, screen_hash: hash })
+      if (state === 'OTHER') this.event('seen_other', { agent: t.label, tmux: t.tmux, screen_hash: hash, ...(lk.menu ? { menu: lk.menu.kind } : {}) })
     }
+    // WO-168 item 6: the refusal-fallback picker has its own clock (modal-guard's: from first seen, whatever else on the screen moves); gone, it starts again
+    if (lk.menu?.kind === 'refusal_fallback') { await this.refusalRule(t, lk, s, now); return }
+    this.refusalGone(t)
     if (state !== 'OTHER' || now - s.since < this.L.stallMs) return
     // a raw notice held back by the hourly cap: after the hour, look again (the model may be back)
     if (s.rec?.action === 'suppressed' && now - s.rec.t >= this.L.renotifyMs) s.rec = null
-    if (!s.rec) {
+    // WO-168: the program's rules for the menus the record names on the own pane (Chiron's rulings, as code, not for the model):
+    //   usage_limit_options  no option chosen, no key pressed, no leaning: the options as they are go to Joey; only his tap presses, and only that one
+    //   switch_confirm       a /model or /effort confirm still up after the stall: no program is taking it: Esc (No, go back); model and effort unchanged
+    //   refusal_fallback     above (refusalRule)
+    if (!s.rec && lk.menu && (lk.menu.kind === 'usage_limit_options' || lk.menu.kind === 'switch_confirm')) {
+      const who = await this.attended(t.tmux)
+      if (who != null) {
+        if (!s.attendedLogged) { s.attendedLogged = true; this.event('attended', { agent: t.label, tmux: t.tmux, screen_hash: hash, last_key_s_ago: Math.round((now - who) / 1000), tail: lines }) }
+        return
+      }
+      if (lk.menu.kind === 'usage_limit_options') { await this.usageLimitRule(t, lk); return }
+      await this.programPress(t, lk, s, ['Esc'], 'switch_confirm', `${t.label}：換模型／思考強度的確認沒有程式在接，值班員按了 Esc（No, go back），維持原樣`)
+      return
+    }
+    // the lanes' owner hook and the rate-limit rule below read the screen's text; on the own pane the record names the menu (above)
+    if (!s.rec && !lk.menu) {
       const owner = this.d.owner?.(t, lines) ?? null
       if (owner) {
         s.rec = { action: 'left_to_owner', t: now }
@@ -1047,7 +1171,7 @@ export class DutyOfficer {
         return
       }
     }
-    if (!s.rec && isRateLimitMenu(lines)) {
+    if (!s.rec && !lk.menu && isRateLimitMenu(lines)) {
       s.rec = { action: 'left_to_modal_guard', t: now }
       this.event('left_to_modal_guard', { agent: t.label, tmux: t.tmux, screen_hash: hash, tail: lines })
       return
@@ -1110,8 +1234,10 @@ export class DutyOfficer {
     const at = this.now()
     let bundle: Record<string, unknown>
     try {
-      const screen = await this.d.tmux.capture(t.tmux, SCREEN_LINES)
+      // WO-168: the own pane's screen is the look's (the record's capture takes the scrollback the bundle reads); a roamer pane is captured here as before
+      const screen = lk.full != null ? lk.full : await this.d.tmux.capture(t.tmux, SCREEN_LINES)
       bundle = buildBundle({ target: t, at, screen, panePath: lk.info.path || null, rulings: rules.rulings, home: this.home })
+      if (lk.menu) bundle._menu_kind = lk.menu.kind                       // the record's kind, for the menu's Action (askModelCli drops `_` keys)
     } catch (e) {
       this.event('error', { agent: t.label, tmux: t.tmux, where: 'bundle', error: String(e).slice(0, 300) })
       await this.rawAsk(t, lk, 'could not build the evidence bundle')
@@ -1168,12 +1294,13 @@ export class DutyOfficer {
   }
 
   /** Press `keys` if the screen is still the one that was judged; returns the screen afterwards. */
-  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean, byJoey = false): Promise<{ ok: false; now: Look; off?: boolean; attended?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number }> {
+  /** WO-168: `screenHash`, the record's screen hash the decision was made on (the own pane): the screen must still be that one too */
+  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean, byJoey = false, screenHash: string | null = null): Promise<{ ok: false; now: Look; off?: boolean; attended?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number }> {
     if (!this.stillOn(tmux)) return { ok: false, now: null, off: true }
     // Joey's tap on a button is his decision, not the duty officer's: a person at the terminal does not hold it back
     if (!byJoey && await this.attended(tmux) != null) return { ok: false, now: null, attended: true }
     const before = await this.look(tmux)
-    if (!before || before.hash !== hash) return { ok: false, now: before }
+    if (!before || before.hash !== hash || (screenHash != null && before.screenHash !== screenHash)) return { ok: false, now: before }
     if (dry) return { ok: true, after: before, leftMode: false, at: this.now() }
     let leftMode = false
     if (before.info.inMode) { await this.d.tmux.cancelMode(tmux); leftMode = true } // keys would go to copy mode
@@ -1189,9 +1316,10 @@ export class DutyOfficer {
   private async press(t: Target, lk: NonNullable<Look>, appeared: number, step: number, d: Decision, keys: string[], bundle: Record<string, unknown>): Promise<void> {
     const dry = this.config().dry_keys
     const pane = dry ? null : this.actionPane(t, bundle)               // WO-176: the menu as it is before the keys (its Action, made after a press)
-    // WO-176 r4: the permission prompt it is about to press, taken now (the screen pressKeys checks is this one; the next prompt comes after the keys)
+    // WO-176 r4: the permission prompt it is about to press, taken now (the screen pressKeys checks is this one; the next prompt comes after the keys).
+    // WO-168: that check is the officer's tail hash and the record's screen hash of the same look the bundle (and so the binding) was built from
     const bound = pane?.menu_kind === 'permission' ? this.bindPerm(t, bundle) : null
-    const r = await this.pressKeys(t.tmux, lk.hash, keys, dry)
+    const r = await this.pressKeys(t.tmux, lk.hash, keys, dry, false, lk.screenHash ?? null)
     const base = { agent: t.label, tmux: t.tmux, step, choose: d.choose, keys, screen_hash: lk.hash }
     if (!r.ok && r.off) {
       this.event('aborted', { ...base, why: 'switched off before pressing' })
@@ -1258,7 +1386,8 @@ export class DutyOfficer {
   private newAsk(t: Target, lk: NonNullable<Look>, kind: Ask['kind'], reason: string, text: string, options: Ask['options'], d: Decision | null,
     bundle?: Record<string, unknown>): Ask {
     const ask: Ask = { id: randomBytes(4).toString('hex'), tmux: t.tmux, label: t.label, host: this.host, hash: lk.hash,
-      created: iso(this.now()), kind, ...(t.test ? { test: true } : {}), reason, text, options, decision: d, screen_tail: redact(lk.lines.join('\n')), messages: [], notified: [] }
+      created: iso(this.now()), kind, ...(t.test ? { test: true } : {}), reason, text, options, decision: d, screen_tail: redact(lk.lines.join('\n')), messages: [], notified: [],
+      ...(lk.screenHash ? { screen_hash: lk.screenHash } : {}) }
     // WO-176: this pane's menus are this agent's Actions: the ask gets one (made when it is first sent)
     const pane = this.actionPane(t, bundle)
     if (pane) Object.assign(ask, { action_key: `menu:${this.host}:ask:${ask.id}`, menu_kind: pane.menu_kind, session_id: pane.session_id })
@@ -1492,6 +1621,100 @@ export class DutyOfficer {
     return ask
   }
 
+  /** WO-168 (Chiron 05:24:56Z, the program rule, verbatim): 用量上限的選單（usage_limit_options）：值班員不選任何選項、不按任何鍵，也不套用「沒有規矩可循時的
+   *  傾向」；把選項原樣問 Joey（Action＋Telegram 按鈕），他選了才按那一個。No model is asked; his choice is not mailed as a ruling (it is his resource
+   *  decision each time) */
+  private async usageLimitRule(t: Target, lk: NonNullable<Look>): Promise<void> {
+    const menu = lk.menu!
+    const options = menu.options.length ? optionButtons(menu.options) : (numberedMenu(lk.pane) ?? []).map(m => ({ button: m.button, keys: m.keys }))
+    const ask = await this.programAsk(t, lk, `${t.label} 停在用量上限的選單，等你選`,
+      `${t.label} 停在用量上限的選單。額度怎麼用是你的決定：值班員不選、不按任何鍵；你按了哪一個，我才按那一個。`, options,
+      { noRuling: true, bundle: { _menu_kind: 'usage_limit_options' } })
+    this.event('usage_limit_asked', { agent: t.label, tmux: t.tmux, ask: ask.id, screen_hash: lk.hash, record_hash: lk.screenHash ?? null, options: options.map(o => o.button) })
+  }
+
+  /** WO-168: keys the program's rule presses itself (no model): pressed only if the screen is still the one seen (the officer's tail hash and the record's
+   *  screen hash), the screen looked at after; the press is recorded as an Action resolved by the duty officer. Returns the screen after, null: not pressed */
+  private async programPress(t: Target, lk: NonNullable<Look>, s: PaneState, keys: string[], rule: string, summary: string): Promise<Look | 'not_pressed'> {
+    s.rec = { action: `program:${rule}`, t: this.now() }
+    const dry = this.config().dry_keys
+    this.busy.add(t.tmux)
+    try {
+      const r = await this.pressKeys(t.tmux, lk.hash, keys, dry, false, lk.screenHash ?? null)
+      if (!r.ok) {
+        this.event('aborted', { agent: t.label, tmux: t.tmux, rule, keys, why: r.off ? 'switched off before pressing' : r.attended ? 'a person started typing before pressing' : 'screen changed before pressing' })
+        this.setRec(t.tmux, lk.hash, null)
+        return 'not_pressed'
+      }
+      this.event('pressed', { agent: t.label, tmux: t.tmux, rule, keys, screen_hash: lk.hash, record_hash: lk.screenHash ?? null, pressed_at: iso(r.at),
+        ...(dry ? { dry_keys: true } : { after_state: r.after?.state ?? null, after_tail: r.after?.lines ?? null }) })
+      const acts = this.d.actions
+      const pane = dry ? null : this.actionPane(t, { _menu_kind: lk.menu?.kind ?? null })
+      if (acts && pane && !dry) {
+        try {
+          acts.pressed({ menu_kind: pane.menu_kind, session_id: pane.session_id, assignees: ['duty-officer'], summary,
+            body: `${summary}\n\n（值班員的程式規則・${t.label}・${this.host}）`, options: [{ id: '1', label: keys.join(' ') }] },
+            '1', `menu:${this.host}:rule:${t.tmux}:${lk.hash}:${r.at}`, { at: iso(r.at), opened_at: iso(Math.min(s.since, r.at)) })
+        } catch (e) { this.event('error', { agent: t.label, tmux: t.tmux, where: 'action pressed', error: String(e).slice(0, 200) }) }
+      }
+      return dry ? null : r.after
+    } finally { this.busy.delete(t.tmux) }
+  }
+
+  // ---- WO-168 item 6: the refusal-fallback picker (Chiron's rulings 3; modal-guard's branch moved here, its numbers unchanged)
+  private readonly refusal = new Map<string, { seenAt: number | null; lastEsc: number; hits: number[]; escalated: boolean }>()
+  /** who handles the refusal picker on this machine now: the officer, or modal-guard while its script is installed (config refusal_fallback overrides) */
+  refusalOwner(): 'officer' | 'modal-guard' {
+    const c = this.config().refusal_fallback
+    if (c) return c
+    return existsSync(join(this.home, '.claude', 'scripts', 'ratelimit-modal-guard.sh')) ? 'modal-guard' : 'officer'
+  }
+  /** 處理：按 Esc 取消，留在原本的模型。不選任何「Switch …」，不選「Edit prompt and retry」；取消之後對那一隻打一句提醒（modal-guard 那一句）。次數：第一次看到後等
+   *  120 秒才按；同一隻 5 分鐘最多按一次；30 分鐘內第 3 次不按、不打字，發警報（session.flagged）, and hands off until the picker is gone */
+  private async refusalRule(t: Target, lk: NonNullable<Look>, s: PaneState, now: number): Promise<void> {
+    if (this.refusalOwner() === 'modal-guard') {
+      if (s.rec?.action !== 'left_to_modal_guard') { s.rec = { action: 'left_to_modal_guard', t: now }; this.event('left_to_modal_guard', { agent: t.label, tmux: t.tmux, menu: 'refusal_fallback', screen_hash: lk.hash, tail: lk.lines }) }
+      return
+    }
+    const r = this.refusal.get(t.tmux) ?? { seenAt: null, lastEsc: 0, hits: [], escalated: false }
+    this.refusal.set(t.tmux, r)
+    if (r.escalated) return
+    if (r.seenAt == null) { r.seenAt = now; this.event('refusal_seen', { agent: t.label, tmux: t.tmux, screen_hash: lk.hash }); return }
+    if (now - r.seenAt < REFUSAL.graceMs || (r.lastEsc && now - r.lastEsc < REFUSAL.debounceMs)) return
+    if (await this.attended(t.tmux) != null) return                       // someone at the terminal can choose
+    r.hits = [...r.hits.filter(h => now - h < REFUSAL.windowMs), now]
+    r.lastEsc = now
+    if (r.hits.length >= REFUSAL.max) {
+      r.escalated = true
+      const n = r.hits.length, agent = t.tmux.replace(/^claude-/, '')
+      const info = `tmux session ${t.tmux} hit the refusal-fallback picker ${n} times within 30 min: the session itself is flagged and retrying is useless. The duty officer stopped pressing Esc and typing notices; the picker is left up so queued inbound messages wait. Fix: open a fresh session (remove --continue from that agent's .cc-agent.json once, kill tmux session ${t.tmux} so the supervisor starts a new one, then put --continue back). The officer's count resets by itself once the picker is gone.`
+      let res = 'no alert sender in this daemon'
+      if (this.d.alert) { try { res = await this.d.alert({ node: `agent:${agent}`, chart: 'session.flagged', severity: 'critical', value: `${n} refusal pickers in 30 min`, info }) } catch (e) { res = `failed: ${String(e).slice(0, 120)}` } }
+      this.event('refusal_escalated', { agent: t.label, tmux: t.tmux, hits: n, alert: res, screen_hash: lk.hash })
+      return
+    }
+    const after = await this.programPress(t, lk, s, ['Esc'], 'refusal_fallback', `${t.label}：安全機制擋下這一回合，值班員按了 Esc（不換模型、不改寫重送），並提醒它換一條路`)
+    if (after === 'not_pressed') { r.hits.pop(); r.lastEsc = 0; return }
+    if (this.config().dry_keys) return
+    await this.sleep(2000)                                                // modal-guard's 2 s
+    // the notice goes into the input box only: never typed into a menu (a digit there picks an option) or over text someone typed
+    const x = await this.look(t.tmux)
+    if (!x || x.state !== 'IDLE' || x.typed === true || !this.d.tmux.sendText) {
+      this.event('refusal_notice_skipped', { agent: t.label, tmux: t.tmux, why: !x ? 'pane unreadable' : x.state !== 'IDLE' ? `screen is ${x.state}` : x.typed ? 'text typed in the input box' : 'no way to type', tail: x?.lines ?? null })
+      return
+    }
+    await this.d.tmux.sendText(t.tmux, REFUSAL_NOTICE)
+    await this.d.tmux.sendKey(t.tmux, KEYMAP.Enter)
+    this.event('refusal_notice', { agent: t.label, tmux: t.tmux, hits: r.hits.length })
+  }
+  /** the refusal picker is not on this pane: a new picker starts its 120 s again; after an escalation the count starts anew (modal-guard's RESET) */
+  private refusalGone(t: Target): void {
+    const r = this.refusal.get(t.tmux)
+    if (!r) return
+    if (r.escalated) { this.refusal.delete(t.tmux); this.event('refusal_reset', { agent: t.label, tmux: t.tmux }); return }
+    r.seenAt = null
+  }
+
   /** WO-168 item 5 (Chiron 05:24:56Z 「先修」): another program in this daemon told Joey a menu's options were sent to him again (lanes: the main's stuck
    *  alarm, the walled main's probe). Until now that re-armed the startup-picker, which skips every pane the officer handles, so the sentence reached Joey
    *  with no buttons (17 times 11-25 22:40Z–11-26 00:07Z). The officer keeps the promise: its question still open on the pane is sent again (Telegram
@@ -1516,9 +1739,12 @@ export class DutyOfficer {
       if (!lk) return { result: 'unreadable', options: [] }
       if (lk.state !== 'OTHER') return { result: 'no_menu', options: [] }
       const t: Target = { label: this.labels.get(tmux) ?? tmux, tmux, projectsDir: null }
-      const menu = numberedMenu(lk.pane) ?? []
-      const ask = await this.programAsk(t, lk, `${t.label} 停在一個選單，等你選`, `${t.label} 停在一個選單，選項在下面；按了我才送那一個鍵。`,
-        menu.map(m => ({ button: m.button, keys: m.keys })))
+      // WO-168: the own pane's options are the record's (as the screen shows them); a roamer pane's, read from its text as before
+      const menu = lk.menu?.options.length ? optionButtons(lk.menu.options) : (numberedMenu(lk.pane) ?? []).map(m => ({ button: m.button, keys: m.keys as string[] | null }))
+      const usage = lk.menu?.kind === 'usage_limit_options'
+      const ask = await this.programAsk(t, lk, usage ? `${t.label} 停在用量上限的選單，等你選` : `${t.label} 停在一個選單，等你選`,
+        usage ? `${t.label} 停在用量上限的選單。額度怎麼用是你的決定：值班員不選、不按任何鍵；你按了哪一個，我才按那一個。` : `${t.label} 停在一個選單，選項在下面；按了我才送那一個鍵。`,
+        menu, { ...(usage ? { noRuling: true } : {}), ...(lk.menu ? { bundle: { _menu_kind: lk.menu.kind } } : {}) })
       this.event('rearm', { agent: t.label, tmux, ask: ask.id, how: 'asked', screen_hash: lk.hash, options: menu.map(m => m.button) })
       return { result: 'asked', options: menu.map(m => m.button) }
     } finally { this.busy.delete(tmux) }
@@ -1590,7 +1816,7 @@ export class DutyOfficer {
     const opt = a.options[idx]!
     this.busy.add(a.tmux)
     try {
-      const r = await this.pressKeys(a.tmux, a.hash, opt.keys!, false, true)
+      const r = await this.pressKeys(a.tmux, a.hash, opt.keys!, false, true, a.screen_hash ?? null)
       const who = typeof by === 'string' ? by : await by
       if (via === 'onsen') member = who === 'Onsen' ? null : who
       let result: string

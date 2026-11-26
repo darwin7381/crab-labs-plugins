@@ -94,8 +94,9 @@ test('WO-168 item 5: no menu on the screen, or a pane the officer does not watch
   expect(r.sent).toEqual([])
 })
 
-test('WO-168 item 5 server.ts: the lanes re-arm goes to the duty officer when it watches the main\'s pane, else to the startup-picker as before', () => {
+test('WO-168 item 5 server.ts: the lanes\' menu sentence comes from the duty officer\'s re-arm (the probe: asked once; a stuck alarm: sent again); the startup-picker is not re-armed', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain('if (!dutyOfficer?.handles(own)) { rearmStartupPicker(own); return }')
-  expect(src).toContain('void dutyOfficer.rearm(own).then(')
+  expect(src).toContain('await dutyOfficer.rearm(ownPaneTmux, { resend: !drive })')
+  expect(src).toContain('mainMenu: (drive: boolean) => mainMenuNotice(drive)')
+  expect(src).not.toContain('rearmStartupPicker(')
 })

@@ -1,0 +1,19 @@
+  -100000000000）測我收不收得到指令，我照 HARD RULE 先 react
+  👍、再回一句確認：Atlas 在群裡指令收得到，營運事項可在群 @我 或直接說。
+
+  privacy 已修（群訊息現在進得來），這條營運群管道正式可用。
+
+✻ Cooked for 59s
+
+← telegram-http · Advac777: 在？
+
+  Called plugin:telegram-http:telegram-http
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Fable 5
+   means the full history gets re-read on your next message.
+
+   ❯ 1. Yes, switch to Fable 5
+     2. No, go back

@@ -22,6 +22,7 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readSync, renameSync, s
 import { join } from 'node:path'
 import { redact } from './duty-officer.ts'
 import type { StatusView } from './onsen-status.ts'
+import type { PaneLook } from './pane-look.ts'
 
 // ------------------------------------------------------------------ regions (port of jev_screen.py regions(), 2026-11-26)
 const RULE = /^\s*[─━]{20,}\s*$/
@@ -117,6 +118,134 @@ export function screenActivity(st: Pick<Regions, 'found_by_program'>): { busy: b
   return { busy: live || f.tool_running_line || f.esc_to_interrupt, compacting: live && /Compacting/i.test(f.live_activity_line ?? '') }
 }
 
+// ------------------------------------------------------------------ WO-168 stage two: the program's facts of a screen, for the record
+// Chiron 05:24:56Z (WO-168): the record shows a menu even with no judge (Jev down, SCREEN_JUDGE=program), as 1.58.7's activity facts show working and
+// compacting: a menu is open when the screen has no input box and its last rows are a selection footer. The program also reads, from the same screen, each
+// option as the screen shows it (its number, its text, the cursor on it), the question above them, and whether real text is typed in the input box (the
+// capture keeps the escapes: dim text there is Claude Code's suggestion). The menu's kind is the judge's; the program names a kind only where a reader that
+// is retired here had a rule for it (the usage-limit options: the duty officer's and modal-guard's; the resume list: the busy checks'), else null
+export type MenuOption = { n: number | null; text: string; cursor: boolean }
+export type ScreenFacts = {
+  menu_open: boolean
+  menu_kind: Exclude<VerdictMenu, 'none'> | null
+  /** the menu's text above its options (rule rows dropped); '' with no menu */
+  question: string
+  options: MenuOption[]
+  /** real text in the input box (not dim); null: no input box, or a screen captured without escapes */
+  input_typed: boolean | null
+}
+/** the footer Claude Code draws under a menu, a dialog or a panel (Enter to confirm · Esc to cancel, Esc to cancel · Tab to amend, Enter to select, the
+ *  model picker's Enter to set as default, the autocompact offer's enter confirm · esc not now, a panel's Esc to cancel) */
+const MENU_FOOTER = /\b[Ee]sc to (cancel|exit|go back|close)\b|\b[Ee]nter to (confirm|select|set|continue)\b|\benter confirm\b|\besc not now\b/
+const FOOTER_PART = /^\s*(·|↑\/↓|←\/→)/                    // the footer's first part when it wraps, or a hint row above it (◐ Medium effort ←/→ to adjust)
+// the border a menu or a dialog is drawn under; Claude Code may right-align its effort hint on it (「▔▔▔…▔  ◐ medium · /effort」: real screen, 2.1.322)
+const MENU_TOP = /^\s*(?:▔{8,}|[─━]{20,})(?:\s.*)?$/
+const RULE_ROW = /^\s*[─━╌┄▔]{8,}\s*$/                   // a rule inside it
+const NUM_OPT = /^(\s*)([❯›▶>])?(\s*)(\d+)\.\s+(.*?)\s*$/
+const CUR_OPT = /^(\s*)❯\s+(\S.*?)\s*$/
+const RATE_LIMIT_MENU = /Stop and wait|Switch to usage credits|Upgrade your plan/     // duty-officer.ts isRateLimitMenu, ratelimit-modal-guard.sh
+const RATE_LIMIT_FOOTER = /Esc.*cancel|Enter.*confirm/
+const RESUME_MENU = /Resume session/                                                 // channel-bot-control.ts isPickerOpen
+const indentOf = (r: string): number => r.length - r.trimStart().length
+const tidy = (s: string): string => s.replace(/[│╮╯╰╭]+\s*$/, '').replace(/^\s*[│]\s?/, '').trim()
+/** the options of a menu block: the last clean 1..N numbered run with a live cursor on one of them; else, with no numbered run, the rows at the cursor
+ *  row's column (the trust prompt, the autocompact offer), n null; fewer than two: none. An option is its own row: a row under it at the label's column
+ *  is a description in some menus (the refusal picker's 「Continue on Opus 4.8 now, …」) and a wrapped label in others, and the plain text cannot tell
+ *  them apart, so neither is joined. `first`: the block index of the first option */
+export function menuOptions(block: string[]): { options: MenuOption[]; first: number } {
+  type R = { i: number; n: number; text: string; cursor: boolean }
+  const rows: R[] = []
+  block.forEach((r, i) => { const m = NUM_OPT.exec(r); if (m) rows.push({ i, n: parseInt(m[4]!, 10), text: m[5]!, cursor: !!m[2] }) })
+  let run: R[] = []
+  for (const x of rows) { if (x.n === 1) run = [x]; else if (run.length && x.n === run[run.length - 1]!.n + 1) run.push(x) }
+  if (run.length >= 2 && run.some(x => x.cursor)) return { options: run.map(x => ({ n: x.n, text: tidy(x.text), cursor: x.cursor })), first: run[0]!.i }
+  let ci = -1
+  for (let i = block.length - 1; i >= 0; i--) if (CUR_OPT.test(block[i]!)) { ci = i; break }
+  if (ci < 0) return { options: [], first: -1 }
+  const col = block[ci]!.indexOf(CUR_OPT.exec(block[ci]!)![2]!)
+  const at = (r: string): boolean => !!r.trim() && (indentOf(r) === col || (CUR_OPT.test(r) && r.indexOf(CUR_OPT.exec(r)![2]!) === col))
+  let first = ci
+  for (let i = ci - 1; i >= 0; i--) { const r = block[i]!; if (!r.trim()) continue; if (at(r)) first = i; else if (indentOf(r) < col) break }
+  const opts: MenuOption[] = []
+  for (let i = first; i < block.length; i++) {
+    const r = block[i]!
+    if (!r.trim()) continue
+    if (at(r)) { const m = CUR_OPT.exec(r); opts.push({ n: null, text: tidy(m ? m[2]! : r), cursor: !!m }) }
+    else if (indentOf(r) < col) break
+  }
+  return opts.length >= 2 ? { options: opts, first } : { options: [], first: -1 }
+}
+/** real text in the input box: the box's rows as captured (escapes kept), the prompt glyph and the box border left out, dim text left out */
+export function inputTyped(boxAnsi: string[]): boolean {
+  for (let k = 0; k < boxAnsi.length; k++) {
+    let dim = false, text = ''
+    const row = boxAnsi[k]!
+    const re = /\x1b\[([0-9;:]*)m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;:?<=>]*[ -/]*[@-~]|([^\x1b]+)/g
+    for (let m = re.exec(row); m; m = re.exec(row)) {
+      if (m[2] != null) { if (!dim) text += m[2]; continue }
+      if (m[1] == null) continue                                           // another sequence: not text
+      const ps = m[1] === '' ? ['0'] : m[1].split(/[;:]/)
+      for (const p of ps) { if (p === '2') dim = true; else if (p === '0' || p === '22' || p === '') dim = false }
+    }
+    let t = text.replace(/ /g, ' ').replace(/[│]/g, ' ').trim()
+    if (k === 0 || /^[❯>!]\s/.test(t) || t === '❯' || t === '>' || t === '!') t = t.replace(/^[❯>!](\s|$)/, '').trim()
+    if (t) return true
+  }
+  return false
+}
+// the two layouts of the refusal-fallback picker, anchored as ratelimit-modal-guard.sh:106-107 anchors them (option rows at column 0-4, so the same words
+// inside tool output, indented further, never match); layout 2 draws no footer
+const REFUSAL_1 = [/^(❯ |  )[0-9]\. Switch automatically/m, /^(❯ |  )[0-9]\. Stay on (Opus|Fable|Sonnet)/m, /^Enter to select .*Esc to cancel/m]
+const REFUSAL_2 = [/^ {0,4}Session paused/m, /^ {0,4}(❯ +)?[0-9]\. Switch to (Opus|Fable|Sonnet|Haiku)/m, /^ {0,4}(❯ +)?[0-9]\. Edit prompt and retry/m]
+// the Yes / No confirm of /model and /effort (channel-bot-control.ts isYesNoConfirmPickerOpen); it draws no footer either
+const CONFIRM = [/^ {0,4}(Switch model\?|Change effort level\?)/m, /❯\s*1\.\s*Yes/i, /No,\s*go\s*back/i]
+const FOOTER_ROWS = 12                                   // a footer is one of the last 12 non-blank rows (a task list or a retry line can sit under a menu)
+/** the program's facts of one screen: `visible` its rows (plain), `visibleAnsi` the same rows as captured (null: no escapes: input_typed unknown) */
+export function screenFacts(visible: string, visibleAnsi: string | null, st: Pick<Regions, 'has_input_box'>): ScreenFacts {
+  const rows = String(visible ?? '').replace(/\n$/, '').split('\n').map(r => r.replace(/\s+$/, ''))
+  const none: ScreenFacts = { menu_open: false, menu_kind: null, question: '', options: [], input_typed: null }
+  if (st.has_input_box) {
+    if (visibleAnsi == null) return none
+    const idx: number[] = []
+    rows.forEach((r, i) => { if (RULE.test(r)) idx.push(i) })
+    const ansiRows = String(visibleAnsi).replace(/\n$/, '').split('\n').map(r => r.replace(/\s+$/, ''))
+    if (idx.length < 2 || ansiRows.length !== rows.length) return none
+    return { ...none, input_typed: inputTyped(ansiRows.slice(idx[idx.length - 2]! + 1, idx[idx.length - 1]!)) }
+  }
+  const ne: number[] = []
+  rows.forEach((r, i) => { if (r.trim()) ne.push(i) })
+  if (!ne.length) return none
+  const tail30 = ne.slice(-30).map(i => rows[i]!).join('\n')
+  const refusal = REFUSAL_1.every(r => r.test(tail30)) || REFUSAL_2.every(r => r.test(tail30))
+  const confirm = CONFIRM.every(r => r.test(tail30))
+  // the footer: the lowest of the last FOOTER_ROWS non-blank rows that reads as one, at a menu's indent (its wrapped first part, the row above, joins it)
+  let footer = -1
+  for (const i of ne.slice(-FOOTER_ROWS).reverse()) { if (indentOf(rows[i]!) <= 8 && MENU_FOOTER.test(rows[i]!)) { footer = i; break } }
+  if (footer < 0 && !refusal && !confirm) return none
+  let end = footer >= 0 ? footer : ne[ne.length - 1]! + 1
+  if (footer >= 0) { const k = ne.indexOf(footer); if (k > 0 && FOOTER_PART.test(rows[ne[k - 1]!]!) && !NUM_OPT.test(rows[ne[k - 1]!]!)) end = ne[k - 1]! }
+  const from = Math.max(0, end - 40)
+  const win = rows.slice(from, end)
+  const topAbove = (i: number): number => { for (let j = i - 1; j >= 0; j--) if (MENU_TOP.test(win[j]!)) return j; return -1 }
+  // the options: a numbered run anywhere in the window (a rule between two options, as in the refusal picker, is inside the menu); with none, an
+  // unnumbered list under the menu's top border only (a `❯ /command` echo above the border is history, not a cursor)
+  let { options, first } = menuOptions(win)
+  let top: number
+  if (options.length && options[0]!.n != null) top = topAbove(first)
+  else {
+    top = topAbove(win.length)
+    const r = menuOptions(win.slice(top + 1))
+    options = r.options; first = r.first >= 0 ? r.first + top + 1 : -1
+  }
+  const qRows = win.slice(top + 1, first >= 0 ? first : win.length).filter(r => r.trim() && !RULE_ROW.test(r)).map(r => tidy(r)).filter(Boolean)
+  const question = qRows.join('\n')
+  const said = [question, ...options.map(o => o.text)].join('\n')
+  const kind = refusal ? 'refusal_fallback' as const : confirm ? 'switch_confirm' as const
+    : RATE_LIMIT_MENU.test(said) && footer >= 0 && RATE_LIMIT_FOOTER.test(rows[footer]!) ? 'usage_limit_options' as const
+    : RESUME_MENU.test(question) ? 'resume_picker' as const : null
+  return { menu_open: true, menu_kind: kind, question, options, input_typed: null }
+}
+
 // ------------------------------------------------------------------ the hash: what can change the answer
 const digits = (s: string): string => s.replace(/\d+(?:[.,:]\d+)*/g, '#')
 const AGENT_ROW = /^\s*◯\s+(\S+)/                          // a running sub-agent row: its kind stays, its live activity text changes all the time
@@ -173,11 +302,17 @@ export function rawHash(p: Parts): string {
 /** the states a judge may answer. An option Chiron adds to questions.json is added here as well; one that is not does not reach the record */
 export const VERDICT_STATES = ['working', 'idle', 'idle_background_running', 'waiting_for_human', 'interrupted', 'usage_limit', 'compacting', 'starting'] as const
 /** the menus a judge may name */
-export const VERDICT_MENUS = ['none', 'permission', 'model_picker', 'trust_folder', 'usage_limit_options', 'resume_picker', 'plan_or_question', 'login', 'other'] as const
+// WO-168 item 6 (Chiron's questions v8 draft, 05:54Z): refusal_fallback (the picker after Claude Code's safeguards flagged the session) and switch_confirm
+// ("Switch model?" / "Change effort level?" Yes / No, go back). The daemon knows them before v8 is published; with v7 a judge never names them
+export const VERDICT_MENUS = ['none', 'permission', 'model_picker', 'trust_folder', 'usage_limit_options', 'resume_picker', 'plan_or_question', 'login',
+  'refusal_fallback', 'switch_confirm', 'other'] as const
 export type VerdictState = typeof VERDICT_STATES[number]
 export type VerdictMenu = typeof VERDICT_MENUS[number]
 /** what a judge answers for one screen: one of the states, one of the menus, how sure (0–1), who judged (a label: nothing below reads it to decide) */
-export type ScreenVerdict = { state: VerdictState; menu: VerdictMenu; p: number; by: 'jev' | 'program' }
+export type ScreenVerdict = { state: VerdictState; menu: VerdictMenu; p: number; by: 'jev' | 'program'
+  /** WO-168 item 6: a menu kind the judge named that is not in VERDICT_MENUS (a newer questions file): the verdict is taken with menu `other` and the
+   *  judge's word kept here (detail.menu_raw), so a new kind never blanks a screen's verdict */
+  menu_raw?: string }
 const STATES: ReadonlySet<string> = new Set(VERDICT_STATES), MENUS: ReadonlySet<string> = new Set(VERDICT_MENUS)
 export const isVerdictState = (s: unknown): s is VerdictState => typeof s === 'string' && STATES.has(s)
 export const isVerdictMenu = (s: unknown): s is VerdictMenu => typeof s === 'string' && MENUS.has(s)
@@ -185,10 +320,10 @@ export const isVerdictMenu = (s: unknown): s is VerdictMenu => typeof s === 'str
 export function isVerdict(v: unknown): v is ScreenVerdict {
   const x = v as ScreenVerdict | null
   return !!x && typeof x === 'object' && isVerdictState(x.state) && isVerdictMenu(x.menu) && typeof x.p === 'number' && Number.isFinite(x.p) && x.p >= 0
-    && x.p <= 1 && (x.by === 'jev' || x.by === 'program')
+    && x.p <= 1 && (x.by === 'jev' || x.by === 'program') && (x.menu_raw === undefined || (typeof x.menu_raw === 'string' && x.menu === 'other'))
 }
 /** the four fields only (/healthz, the question bank) */
-export const verdictFields = (v: ScreenVerdict): ScreenVerdict => ({ state: v.state, menu: v.menu, p: v.p, by: v.by })
+export const verdictFields = (v: ScreenVerdict): ScreenVerdict => ({ state: v.state, menu: v.menu, p: v.p, by: v.by, ...(v.menu_raw !== undefined ? { menu_raw: v.menu_raw } : {}) })
 
 // ------------------------------------------------------------------ 二 the replaceable piece: ScreenJudge, and the switch point
 export interface ScreenJudge {
@@ -288,6 +423,10 @@ const BLOCKER_SUMMARY: Record<BlockerReason, string> = { permission: '等待權�
 const menuReason = (m: string | null): BlockerReason => m === 'permission' ? 'permission' : m === 'usage_limit_options' ? 'usage_limit' : 'input_required'
 /** statusOf's waitingFor (Claude Code's registry: "permission prompt", "dialog open") as a menu kind, when no verdict names it */
 const registryMenu = (w: unknown): Exclude<VerdictMenu, 'none'> => /permission/i.test(String(w ?? '')) ? 'permission' : 'other'
+/** WO-168: the menu kinds Onsen's observation takes (fleet-core app/v1_status.py MENUS; it answers 400 to the whole observation for any other, CONTRACT v1).
+ *  A kind the daemon knows and Onsen does not yet (refusal_fallback, switch_confirm) goes to the observation as `other` until Onsen lists it */
+const OBSERVATION_MENUS: ReadonlySet<string> = new Set(['permission', 'model_picker', 'trust_folder', 'usage_limit_options', 'resume_picker', 'plan_or_question', 'login', 'other'])
+const obsMenu = (m: Exclude<VerdictMenu, 'none'> | null): Exclude<VerdictMenu, 'none'> | null => m == null || OBSERVATION_MENUS.has(m) ? m : 'other'
 const isoMs = (ms: number): string => new Date(ms).toISOString()
 /** WO-176: a blocker's Action from the daemon (never fails the observation) */
 const actionOf = (f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): string | null => { if (!m || !f.actionFor) return null; try { return f.actionFor(m) ?? null } catch { return null } }
@@ -321,8 +460,13 @@ function assigned(f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): { ass
  *  downstream decides by them.
  *  The same call gives the observation (CONTRACT v1 §3; Chiron's table, WO-169 00:29Z) from the same inputs: presence, lifecycle, the main's session
  *  (its activity, turn and trigger, doing, blockers, last turn), one session per running lane, the screen's background counts, the queue, the evidence */
-export function composeRecord(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts = {}): { view: StatusView; observation: Observation } {
-  const view = recordView(v, st, prog, f)
+/** WO-168 stage two: the screen a record is composed for. `hash`/`seen_at`: which screen and when it was looked at (detail.screen: anything that presses
+ *  keys compares it with a look of its own first); `facts`: the program's facts of that screen (screenFacts) */
+export type ScreenCtx = { hash: string; seen_at: number; facts: ScreenFacts | null
+  /** the screen came from a look of the one capture (detail.screen is written); false: a screen's text handed in (tests), no look time */
+  look?: boolean }
+export function composeRecord(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts = {}, sc?: ScreenCtx | null): { view: StatusView; observation: Observation } {
+  const view = recordView(v, st, prog, f, sc ?? null)
   return { view, observation: observe(v, st, prog, view, f) }
 }
 /** the record alone (composeRecord's view) */
@@ -330,38 +474,58 @@ export function publishView(v: ScreenVerdict | null, st: Regions | null, prog: S
   return composeRecord(v, st, prog, f).view
 }
 /** WO-177 ⑤ (Chiron 03:41Z): the program's own verdict when no judge's is there: working, or compacting, on an activity fact of the screen
- *  (screenActivity), else none. It goes the same way as a judge's (the order below), so the record holds items and turn_end the same with Jev up or down */
-export function programVerdict(st: Regions): ScreenVerdict | null {
+ *  (screenActivity), else none. It goes the same way as a judge's (the order below), so the record holds items and turn_end the same with Jev up or down.
+ *  WO-168 (Chiron 05:24:56Z, 紀錄要補的 7): a menu open by the program's facts (screenFacts: no input box and a selection footer, or a layout the program
+ *  knows) is waiting for a human, its kind the program's (null: other) */
+export function programVerdict(st: Regions, facts?: ScreenFacts | null): ScreenVerdict | null {
+  if (facts?.menu_open && !st.has_input_box) return { state: 'waiting_for_human', menu: facts.menu_kind ?? 'other', p: 1, by: 'program' }
   const a = screenActivity(st)
   return a.busy ? { state: a.compacting ? 'compacting' : 'working', menu: 'none', p: 1, by: 'program' } : null
 }
 const flat = (s: string): string => s.replace(/\s+/g, ' ').trim()
-function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts): StatusView {
+/** WO-168: the menu's kind for the record: the judge's, unless it could only say `other` and the program knows the layout */
+const menuKindOf = (v: ScreenVerdict, facts: ScreenFacts | null): Exclude<VerdictMenu, 'none'> =>
+  v.state === 'waiting_for_human' && v.menu !== 'none' && v.menu !== 'other' ? v.menu : facts?.menu_kind ?? (v.menu === 'none' ? 'other' : v.menu)
+/** WO-168: what the record says about the open menu: its kind (waitingFor), its question (waiting_text, every kind: the program's reading of the menu, else
+ *  the bottom of the screen as before), its options as the screen shows them (menu_options), the judge's own word for a kind it does not know (menu_raw) */
+function menuDetail(v: ScreenVerdict, st: Regions, facts: ScreenFacts | null): Record<string, unknown> {
+  const text = facts?.question ? facts.question : st.has_input_box ? st.above_input_box ?? '' : st.screen_bottom ?? ''
+  const q = noPct(redact(text))
+  return { waitingFor: menuKindOf(v, facts), waiting_text: facts?.question ? cutTail(q, 300) : cut(q, 200),
+    ...(facts?.options.length ? { menu_options: facts.options.map(o => ({ n: o.n, text: cut(noPct(redact(o.text)), 200), cursor: o.cursor })) } : {}),
+    ...(v.menu_raw !== undefined ? { menu_raw: v.menu_raw } : {}) }
+}
+const cutTail = (s: string, n: number): string => { const a = Array.from(s); return a.length <= n ? s : '…' + a.slice(a.length - n + 1).join('') }
+function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts, sc: ScreenCtx | null = null): StatusView {
   if (gone(prog)) return programView(prog)
-  const v = judged ?? (st ? programVerdict(st) : null)
+  const facts = st && sc ? sc.facts : null
+  const v = judged ?? (st ? programVerdict(st, facts) : null)
+  // WO-168: which screen this record is for, and whether real text is typed in its input box
+  const seen = st && sc ? { ...(sc.look !== false ? { screen: { hash: sc.hash, seen_at: isoMs(sc.seen_at) } } : {}), ...(st.has_input_box && facts?.input_typed != null ? { input_typed: facts.input_typed } : {}) } : {}
   const pd = (prog.detail ?? {}) as Record<string, any>
   const registering = prog.state === 'offline' && pd.reason === 'no_registration' && (!!v || f.alive === true)
   const base = { ...pick(pd, ['queued_joey', 'walled', 'lanes']), ...(prog.state === 'offline' ? { program_offline: pd.reason ?? null } : {}) }
   if (!v || !st) {
-    if (!registering) return programView(prog)
-    return { state: 'starting', detail: { ...base, judged_by: 'program' }, last_activity_at: prog.last_activity_at ?? null }
+    if (!registering) { const pv = programView(prog); return st && sc ? { ...pv, detail: { ...pv.detail, ...seen } } : pv }
+    return { state: 'starting', detail: { ...base, judged_by: 'program', ...seen }, last_activity_at: prog.last_activity_at ?? null }
   }
   const turn = prog.state === 'busy' || prog.state === 'stuck' || prog.state === 'waiting' ? pick(pd, ['turn_started_at', 'tool']) : {}
   const J = { judged_by: v.by, judge_p: r2(v.p) }
   const c = st.counted_by_program
-  const out = (state: StatusView['state'], detail: Record<string, unknown>): StatusView => ({ state, detail: { ...detail, ...J }, last_activity_at: prog.last_activity_at ?? null })
-  if (registering || v.state === 'starting') return out('starting', { ...base })
+  const out = (state: StatusView['state'], detail: Record<string, unknown>): StatusView => ({ state, detail: { ...detail, ...J, ...seen }, last_activity_at: prog.last_activity_at ?? null })
+  // WO-168: a menu open on this screen keeps its kind, question and options in the record while the state is starting or walled (the order is unchanged)
+  const menuOpen = v.state === 'waiting_for_human' || (!!facts?.menu_open && !st.has_input_box)
+  const mv: ScreenVerdict = v.state === 'waiting_for_human' ? v : { ...v, menu: facts?.menu_kind ?? 'other' }
+  const md = menuOpen ? menuDetail(mv, st, facts) : {}
+  if (registering || v.state === 'starting') return out('starting', { ...base, ...md })
   // the wall is the program's (WO-168 layer table). The screen's usage_limit (WO-177 二: the limit message is the latest output) stands for a wall the
   // program missed, never for one it cleared: the same message is still the latest output until the next turn, and every delivery is held while the
   // record says walled, so that turn never comes (11-26 07:13Z, three agents)
   const clearedOnScreen = v.state === 'usage_limit' && !pd.walled && !!f.cleared_limit_text
     && flat(`${st.above_input_box ?? ''}\n${st.screen_bottom ?? ''}`).includes(flat(f.cleared_limit_text))
   if (clearedOnScreen) return out('idle', { ...base, cleared_limit_on_screen: true })
-  if (v.state === 'usage_limit' || pd.walled) return out('walled', { ...base, walled: { until: pd.walled?.until ?? null, ...(pd.walled?.kind ? { kind: pd.walled.kind } : {}) } })
-  if (v.state === 'waiting_for_human') {
-    const text = st.has_input_box ? st.above_input_box ?? '' : st.screen_bottom ?? ''
-    return out('waiting', { waitingFor: v.menu, ...(v.menu === 'other' ? { waiting_text: cut(noPct(redact(text)), 200) } : {}), ...turn, ...base })
-  }
+  if (v.state === 'usage_limit' || pd.walled) return out('walled', { ...base, walled: { until: pd.walled?.until ?? null, ...(pd.walled?.kind ? { kind: pd.walled.kind } : {}) }, ...md })
+  if (v.state === 'waiting_for_human') return out('waiting', { ...md, ...turn, ...base })
   if (v.state === 'compacting') return out('busy', { compacting: true, ...turn, ...base })
   if (v.state === 'working' && prog.state === 'stuck') return out('stuck', { threshold_s: pd.threshold_s ?? null, ...turn, subagents: c.running_agents, ...base })
   if (v.state === 'working') return out('busy', { ...turn, subagents: c.running_agents, ...base })
@@ -397,8 +561,10 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
       const workAt = since('main.work', works ? 'work' : 'none')                     // one turn through busy → compacting → busy (lab 04:08:49Z)
       const startMs = typeof vd.turn_started_at === 'string' && !Number.isNaN(Date.parse(vd.turn_started_at)) ? Date.parse(vd.turn_started_at) : Date.parse(workAt)
       const t = f.turn ?? (works ? { id: `turn-${startMs}`, started_at: isoMs(startMs), trigger: { kind: 'other' as const } } : null)
-      const menu: Exclude<VerdictMenu, 'none'> | null = view.state === 'waiting' ? (v?.state === 'waiting_for_human' ? (v.menu === 'none' ? null : v.menu) : registryMenu(vd.waitingFor))
-        : view.state === 'idle' && vd.dialog_open === true ? 'other' : null                 // statusOf: a dialog open outside a turn
+      // WO-168: a waiting record without a judge's verdict names its menu in waitingFor (the program's kind, or the registry's words)
+      const menu: Exclude<VerdictMenu, 'none'> | null = obsMenu(view.state === 'waiting' ? (v?.state === 'waiting_for_human' ? (v.menu === 'none' ? null : v.menu)
+        : isVerdictMenu(vd.waitingFor) && vd.waitingFor !== 'none' ? vd.waitingFor : registryMenu(vd.waitingFor))
+        : view.state === 'idle' && vd.dialog_open === true ? 'other' : null)                 // statusOf: a dialog open outside a turn
       // WO-180 (Chiron 04:42Z, 3): a blocker lasts while each record in a row shows it (the same reason and menu kind); a record with none ends it, so
       // the next menu is a new blocker (a new id, since = when it appeared), not the one before it (/status took /theme's id and since across a
       // `blockers: []` record). Its assignee and Action may change while it lasts (the duty officer asks a person): the same blocker
@@ -498,7 +664,8 @@ export interface ScreenDeps {
   judge(): ScreenJudge | null
   /** SCREEN_JUDGE as it reads now (the log only) */
   judgeSetting?(): string
-  snap(): Promise<{ cmd: string; pane: string } | null>
+  /** WO-168: a look of the one capture (pane-look.ts PaneReader.look: its listener hands the look to sample() too, once), or the old text-and-command shape */
+  snap(): Promise<PaneLook | { cmd: string; pane: string } | null>
   /** the pane's foreground command is Claude Code */
   isClaude(cmd: string): boolean
   /** statusOf's view now (the program's side) */
@@ -524,9 +691,12 @@ export const SCREEN_DEFAULTS: ScreenOpts = { pollMs: 1000, maxPerMin: 20, pokeMs
 const CACHE_MAX = 16
 /** the question bank's file is rotated past this; at start (and at a new day) its last BANK_TAIL bytes are read for the day's hashes */
 const BANK_MAX = 20 * 1024 * 1024, BANK_TAIL = 8 * 1024 * 1024
-type Cur = { hash: string; raw: string; parts: Parts; cmd: string; alive: boolean; at: number }
+/** WO-168: facts, the program's facts of the screen (screenFacts); seq, the look's number in pane-look.ts's reader (0: a look handed in as text) */
+type Cur = { hash: string; raw: string; parts: Parts; cmd: string; alive: boolean; at: number; facts: ScreenFacts; seq: number }
 /** an answer, and the judge's version it was given under (WO-177 五) */
-type Ans = { hash: string; at: number; v: ScreenVerdict | null; parts: Parts; seq: number; ver: string | null }
+type Ans = { hash: string; at: number; v: ScreenVerdict | null; parts: Parts; seq: number; ver: string | null
+  /** WO-168: the screen it was given for: when that screen was looked at, and its program facts */
+  seenAt: number; facts: ScreenFacts; look: boolean }
 const iso = (ms: number): string => new Date(ms).toISOString()
 
 export class ScreenStatus {
@@ -617,22 +787,27 @@ export class ScreenStatus {
   async lookNow(): Promise<void> {
     if (this.looking || !this.act.listed) return
     this.looking = true
-    let s: { cmd: string; pane: string } | null = null
+    let s: PaneLook | { cmd: string; pane: string } | null = null
     try { s = await this.d.snap() } catch {} finally { this.looking = false }
-    if (s) this.sample(s.pane, s.cmd)
+    if (s) { if ('visible' in s) this.sample(s); else this.sample(s.pane, s.cmd) }
     else if (this.cur) { this.cur = null; this.d.publish() }                           // the pane cannot be read: statusOf
   }
-  /** one look at the pane (ours, or the duty officer's) */
-  sample(pane: string, cmd: string): void {
+  /** one look at the pane: WO-168, a look of the one capture (pane-look.ts PaneReader: ours, the duty officer's, a busy check's; each one once), or a
+   *  screen's text and foreground command handed in as before */
+  sample(pane: string | PaneLook, cmd?: string): void {
     if (!this.act.listed) return
+    const look = typeof pane === 'string' ? null : pane
+    if (look && look.seq && look.seq === this.cur?.seq) return
+    const text = look ? look.visible : pane as string
     const now = this.now()
     this.lastLookAt = now
     this.stats.looks++
-    const parts = regionParts(pane)
+    const parts = regionParts(text)
     const hash = screenHash(parts)
-    const alive = this.d.isClaude(cmd)
+    const fg = look ? look.cmd : cmd ?? ''
+    const alive = this.d.isClaude(fg)
     const prev = this.cur
-    this.cur = { hash, raw: rawHash(parts), parts, cmd, alive, at: now }
+    this.cur = { hash, raw: rawHash(parts), parts, cmd: fg, alive, at: look?.at ?? now, facts: screenFacts(text, look ? look.visibleAnsi : null, parts.st), seq: look?.seq ?? 0 }
     if (!prev || prev.hash !== hash || prev.alive !== alive) {
       this.stats.changes++
       this.maybeAsk()
@@ -693,7 +868,7 @@ export class ScreenStatus {
       return
     }
     this.failed = null
-    const a: Ans = { hash: c.hash, at: this.now(), v, parts: c.parts, seq: ++this.seq, ver }
+    const a: Ans = { hash: c.hash, at: this.now(), v, parts: c.parts, seq: ++this.seq, ver, seenAt: c.at, facts: c.facts, look: c.seq > 0 }
     this.answer = a
     this.cache.delete(a.hash); this.cache.set(a.hash, a)
     if (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value!)
@@ -714,8 +889,25 @@ export class ScreenStatus {
     const ok = this.act.on && !!c && c.alive && !gone(p) && !!a?.v && (a.hash === c.hash || !!this.inflight)
     if (fed && this.act.listed) { if (ok && a!.v!.by === 'jev') this.stats.judged_jev++; else this.stats.judged_program++ }
     const seen = this.act.listed && c ? c : null
-    const r = composeRecord(ok ? a!.v! : null, ok ? a!.parts.st : seen?.alive ? seen.parts.st : null, p, { ...f, alive: seen ? seen.alive : null })
+    // WO-168: the screen the record is for (detail.screen). While a newer screen is judged the last verdict stands, with its own screen's facts; the verdict
+    // of the screen showing now takes that screen's own look (its text may differ from the judged one only in what the hash masks: a digit, a timer)
+    const own = ok && a!.hash !== c!.hash
+    const sc: ScreenCtx | null = ok ? (own ? { hash: a!.hash, seen_at: a!.seenAt, facts: a!.facts, look: a!.look } : { hash: c!.hash, seen_at: c!.at, facts: c!.facts, look: c!.seq > 0 })
+      : seen?.alive ? { hash: seen.hash, seen_at: seen.at, facts: seen.facts, look: seen.seq > 0 } : null
+    const r = composeRecord(ok ? a!.v! : null, ok ? (own ? a!.parts.st : c!.parts.st) : seen?.alive ? seen.parts.st : null, p, { ...f, alive: seen ? seen.alive : null }, sc)
     return { view: this.act.listed ? r.view : p, observation: r.observation }
+  }
+  /** WO-168 stage two: the record for exactly this look's screen (the one a reader is about to act on): its own verdict when the judge has answered for its
+   *  hash (the answer in use, or one cached within cacheMs), else the program's facts of it; never the verdict of another screen. null when JEV_SCREEN does
+   *  not list this agent (no record of the screen: the caller reads the screen as it did before) */
+  recordOf(look: PaneLook, p: StatusView, f: RecordFacts = {}): { view: StatusView; hash: string; facts: ScreenFacts; alive: boolean } | null {
+    if (!this.act.listed) return null
+    const parts = regionParts(look.visible), hash = screenHash(parts), alive = this.d.isClaude(look.cmd)
+    const facts = screenFacts(look.visible, look.visibleAnsi, parts.st)
+    const a = this.answer?.hash === hash ? this.answer : this.cache.get(hash) ?? null
+    const fresh = !!a && (a === this.answer || this.now() - a.at < this.o.cacheMs)
+    const v = this.act.on && alive && !gone(p) && fresh && a?.v ? a.v : null
+    return { view: composeRecord(v, alive ? parts.st : null, p, { ...f, alive }, alive ? { hash, seen_at: look.at, facts } : null).view, hash, facts, alive }
   }
   /** the screen with this hash is still the one showing and this verdict is the one in use for it (a judge's own check, a moment later) */
   holds(hash: string, v: ScreenVerdict): boolean { return this.cur?.hash === hash && this.answer?.hash === hash && this.answer.v === v }
