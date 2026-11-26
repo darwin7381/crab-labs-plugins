@@ -86,6 +86,21 @@ const outText = (sender: string, id: number, text: string, method = 'sendRichMes
     { message_id: id, date: 1764020000 + id }))!
 
 describe('records', () => {
+  test('WO-179: an incoming record carries chat_title (groups only) and sender_name as its own fields; an outgoing one neither', () => {
+    const g = inboundItem(AGENT, tgMsg(9001, '群組裡說話', { chat: { id: -1003883107701, type: 'supergroup', title: 'Onsen 測試群' },
+      from: { id: 777308933, is_bot: false, first_name: 'Alice', last_name: 'Wang', username: 'alicew' } }), '群組裡說話')
+    expect(g.chat_title).toBe('Onsen 測試群')
+    expect(g.sender_name).toBe('Alice Wang')
+    const p = inboundItem(AGENT, tgMsg(9002, '私訊'), '私訊')
+    expect(p.chat_title).toBeUndefined()
+    expect(p.sender_name).toBe('J')
+    const u = inboundItem(AGENT, tgMsg(9003, '只有帳號', { from: { id: 5, is_bot: false, username: 'onlyuser' } }), '只有帳號')
+    expect(u.sender_name).toBe('@onlyuser')
+    const none = inboundItem(AGENT, tgMsg(9004, '沒名字', { from: { id: 6, is_bot: false } }), '沒名字')
+    expect('sender_name' in none).toBe(false)
+    expect(outText('main', 9005, '送出的')).not.toHaveProperty('chat_title')
+    expect(outText('main', 9006, '送出的')).not.toHaveProperty('sender_name')
+  })
   test('inbound: direction in, sender tg:<from>, idem_key tg:<agent>:<chat>:in:<id>, reply / forward / topic / file fields', () => {
     const a = inboundItem(AGENT, tgMsg(2166, '你看這個', { reply_to_message: { message_id: 2161 } }), '你看這個')
     expect(a).toMatchObject({ idem_key: `tg:${AGENT}:${JOEY}:in:2166`, agent: AGENT, client: 'telegram', chat: JOEY, direction: 'in', sender: `tg:${JOEY}`,

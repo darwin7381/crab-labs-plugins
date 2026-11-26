@@ -38,6 +38,10 @@ export type OnsenItem = {
   /** WO-172 (Chiron 02:43Z; Onsen app/onsen.py reads the item's own turn_id into messages.turn_id): an outbound message's turn, a field of the item itself
    *  as on seen and turn_end (not in meta) */
   turn_id?: string
+  /** WO-179 (Chiron; Onsen 0.22.2 keeps them for display only, never to tell who is who): on an INCOMING message, the group's name (chat.title, only for
+   *  group / supergroup) and the speaker's Telegram name (first_name + last_name, else @username). Fields of the item itself, not meta. */
+  chat_title?: string
+  sender_name?: string
 }
 export type OnsenEvent = {
   idem_key: string; agent: string; client: 'telegram'; chat: string; target_client_msg_id: string
@@ -180,13 +184,23 @@ export function inboundItem(agent: string, m: any, body: string): OnsenItem {
     ...(m?.forward_date || m?.forward_origin?.date ? { forward_date: iso(m.forward_origin?.date ?? m.forward_date) } : {}),
     ...(m?.chat?.type && m.chat.type !== 'private' ? { chat_type: m.chat.type, ...(m.chat.title ? { chat_title: m.chat.title } : {}) } : {}),
   }
+  const chatTitle = (m?.chat?.type === 'group' || m?.chat?.type === 'supergroup') && typeof m?.chat?.title === 'string' && m.chat.title.trim() ? m.chat.title.trim() : undefined
+  const senderName = displayName(m?.from)
   return {
     idem_key: idemIn(agent, chat, id), agent, client: 'telegram', chat, direction: 'in', sender: `tg:${m?.from?.id ?? '?'}`,
     body: String(body ?? ''), kind: shape.kind, sent_at: iso(m?.date), client_msg_id: str(id),
     ...(replyTo ? { reply_to_client_msg_id: replyTo } : {}), ...(thread ? { thread } : {}), ...(fwd ? { forward_from: fwd } : {}),
     ...(shape.attachments ? { attachments: shape.attachments } : {}), status: 'ok', backfilled: false,
     ...(Object.keys(meta).length ? { meta } : {}),
+    ...(chatTitle ? { chat_title: chatTitle } : {}), ...(senderName ? { sender_name: senderName } : {}),
   }
+}
+
+/** WO-179: a Telegram user's display name: first_name + ' ' + last_name (or first_name alone); @username only when neither is there */
+export function displayName(u: any): string | undefined {
+  const full = [u?.first_name, u?.last_name].filter((x: unknown) => typeof x === 'string' && x.trim()).map((x: string) => x.trim()).join(' ')
+  if (full) return full
+  return typeof u?.username === 'string' && u.username.trim() ? `@${u.username.trim()}` : undefined
 }
 
 /** an allowlisted person edited a message they sent (Telegram edited_message): an edit event, the new full text. Keyed by edit_date: a re-delivered update is
