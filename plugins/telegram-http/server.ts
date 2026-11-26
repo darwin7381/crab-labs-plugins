@@ -4170,7 +4170,15 @@ if (Lanes.LANES_ON) {
       capture: () => capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
       detect: detectStartupPicker,
       drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key),
-      rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
+      // WO-168 item 5: 「選項已再傳給你」 is kept by the duty officer when it watches the main's pane (its open question again, or the menu put to Joey now:
+      // an Onsen Action and Telegram buttons); the startup-picker it used to re-arm skips that pane, so the sentence went out with no buttons
+      rearm: () => {
+        const own = process.env.CHANNEL_BOT_TMUX_SESSION!
+        if (!dutyOfficer?.handles(own)) { rearmStartupPicker(own); return }
+        void dutyOfficer.rearm(own).then(r => log(r.result === 'resent' || r.result === 'asked' || r.result === 'open' ? 'info' : 'warn',
+          `lanes: the main's menu re-armed through the duty officer: ${r.result}${r.options.length ? ` (${r.options.join(' | ')})` : ''}`),
+          e => log('warn', `lanes: the duty officer's re-arm failed: ${e}`))
+      },
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,

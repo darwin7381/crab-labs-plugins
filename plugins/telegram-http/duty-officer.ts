@@ -717,7 +717,8 @@ const NO_CONFIG: Config = { enabled: [], dry_keys: false, test_targets: {}, test
 interface Rec { action: string; t: number; askId?: string; resolved?: boolean | null }
 interface PaneState { hash: string; state: State; since: number; rec: Rec | null; attendedLogged?: boolean }
 interface Ask {
-  id: string; tmux: string; label: string; host: string; hash: string; created: string; kind: 'ask_joey' | 'unreadable'; test?: boolean
+  /** WO-168: program, a question the program asks with no model (a re-arm another program promised Joey; the usage-limit menu's rule) */
+  id: string; tmux: string; label: string; host: string; hash: string; created: string; kind: 'ask_joey' | 'unreadable' | 'program'; test?: boolean
   reason: string; text: string; options: Array<{ button: string; keys: string[] | null; means?: string
     /** WO-176 r2: the option as the screen shows it (the decision's on_screen) */
     screen?: string }>
@@ -737,6 +738,8 @@ interface Ask {
   assignees?: string[]
   /** WO-176 r4: the permission prompt this question is about, taken when it was asked (MenuActions.bindPermission) */
   perm_bind?: PermBinding
+  /** WO-168: Joey's choice is not mailed to Chiron as a ruling (the usage-limit menu: his resource decision each time, never a rule to write down) */
+  no_ruling?: true
 }
 // ---------------------------------------------------------------- WO-176: the menus as Onsen Actions
 /** a menu's Action as an ask keeps it: the key it was made with, and Onsen's id and version once known */
@@ -1331,7 +1334,8 @@ export class DutyOfficer {
     const options = a.options.map((o, i) => o.keys ? { id: optionIdOf(i), label: ACTION_LABEL(o.button) || optionIdOf(i) } : null)
       .filter((o): o is { id: string; label: string } => !!o).slice(0, 10)
     if (!options.length) { this.event('action_skipped', { agent: a.label, tmux: a.tmux, ask: a.id, why: 'no option with keys' }); return }
-    const summary = a.kind === 'ask_joey' && a.decision?.what ? `${a.label}：${a.decision.what}` : `${a.label} 停在一個要按鍵的畫面，值班員判斷不了（${a.reason}）`
+    const summary = a.kind === 'ask_joey' && a.decision?.what ? `${a.label}：${a.decision.what}` : a.kind === 'program' ? a.reason
+      : `${a.label} 停在一個要按鍵的畫面，值班員判斷不了（${a.reason}）`
     try {
       acts.open({ menu_kind: a.menu_kind ?? null, session_id: a.session_id ?? null, assignees: acts.assignees(chats), summary, body: askBody(a.text), options },
         a.action_key, (id, version) => {
@@ -1471,6 +1475,55 @@ export class DutyOfficer {
     await this.deliver(ask)
   }
 
+  /** WO-168: a question the program asks with no model: the menu's options as they are on the screen, one button each (only a numbered menu with a live
+   *  cursor has keys to press), its Action in Onsen; nothing is pressed until Joey taps one. `summary`: its one line (the Action's summary) */
+  private async programAsk(t: Target, lk: NonNullable<Look>, summary: string, lead: string, options: Array<{ button: string; keys: string[] | null }>,
+    o: { noRuling?: boolean; bundle?: Record<string, unknown> } = {}): Promise<Ask> {
+    let text = `${lead}\n\n（值班員・${t.label}・${this.host}）`
+    if (!options.some(x => x.keys)) text += '\n畫面上沒有能直接按的編號選項：要處理的話跟它說，或找 Epeius。'
+    text += this.screenBlock(lk.lines)
+    const ask = this.newAsk(t, lk, 'program', summary, text.slice(0, 3900), options, null, o.bundle)
+    if (o.noRuling) ask.no_ruling = true
+    const s = this.st.get(t.tmux)
+    const rec: Rec = { action: 'ask_joey', t: this.now(), askId: ask.id }
+    if (s && s.hash === lk.hash) s.rec = rec
+    else this.st.set(t.tmux, { hash: lk.hash, state: lk.state, since: this.now(), rec })
+    await this.deliver(ask)
+    return ask
+  }
+
+  /** WO-168 item 5 (Chiron 05:24:56Z 「先修」): another program in this daemon told Joey a menu's options were sent to him again (lanes: the main's stuck
+   *  alarm, the walled main's probe). Until now that re-armed the startup-picker, which skips every pane the officer handles, so the sentence reached Joey
+   *  with no buttons (17 times 11-25 22:40Z–11-26 00:07Z). The officer keeps the promise: its question still open on the pane is sent again (Telegram
+   *  buttons; its Action stays open), or, with none open, the menu on the screen is put to Joey now with its options as they are (an Action and buttons;
+   *  nothing is pressed until he taps). resend false: an open question is left as it is. `options`: the menu's labels as Joey gets them */
+  async rearm(tmux: string, o: { resend?: boolean } = {}): Promise<{ result: 'resent' | 'open' | 'asked' | 'busy' | 'no_menu' | 'unreadable' | 'off'; options: string[] }> {
+    if (!this.handles(tmux) || !this.stillOn(tmux)) return { result: 'off', options: [] }
+    // the question asked about the screen the officer last saw on this pane (an older menu's question that was never closed is not this one)
+    const cur = this.st.get(tmux)
+    const open = cur?.rec?.askId ? this.loadAsk(cur.rec.askId) : null
+    if (open && !open.closed) {
+      const labels = open.options.map(x => x.button)
+      if (o.resend === false) return { result: 'open', options: labels }
+      this.event('rearm', { agent: open.label, tmux, ask: open.id, how: 'resent' })
+      await this.deliver(open, '（選項再傳一次）\n')
+      return { result: 'resent', options: labels }
+    }
+    if (this.busy.has(tmux)) return { result: 'busy', options: [] }   // it is judging or pressing this pane now: its question or its press follows
+    this.busy.add(tmux)
+    try {
+      const lk = await this.look(tmux)
+      if (!lk) return { result: 'unreadable', options: [] }
+      if (lk.state !== 'OTHER') return { result: 'no_menu', options: [] }
+      const t: Target = { label: this.labels.get(tmux) ?? tmux, tmux, projectsDir: null }
+      const menu = numberedMenu(lk.pane) ?? []
+      const ask = await this.programAsk(t, lk, `${t.label} 停在一個選單，等你選`, `${t.label} 停在一個選單，選項在下面；按了我才送那一個鍵。`,
+        menu.map(m => ({ button: m.button, keys: m.keys })))
+      this.event('rearm', { agent: t.label, tmux, ask: ask.id, how: 'asked', screen_hash: lk.hash, options: menu.map(m => m.button) })
+      return { result: 'asked', options: menu.map(m => m.button) }
+    } finally { this.busy.delete(tmux) }
+  }
+
   private async closeGone(id: string, state: State): Promise<void> {
     const a = this.loadAsk(id)
     if (!a || a.closed) return
@@ -1560,7 +1613,7 @@ export class DutyOfficer {
         this.event('joey_answered', { agent: a.label, tmux: a.tmux, ask: a.id, by: who, choice: opt.button, keys: opt.keys, via, resolved, after_state: x?.state ?? null, after_tail: x?.lines ?? null })
         a.closed = { how: 'answered', at: iso(this.now()), by: who, choice: opt.button, result, ...this.closedOption(a, idx), member, via }
         if (x) this.st.set(a.tmux, { hash: x.hash, state: x.state, since: this.now(), rec: resolved ? null : { action: 'joey', t: this.now() } })
-        void this.mailRuling(a, opt.button, result, afterTail)
+        if (!a.no_ruling) void this.mailRuling(a, opt.button, result, afterTail)
         const at = iso(r.at), oid = this.actionOptionOf(a, idx)
         // a shared permission Action whose option this is not (neither allow nor deny): the prompt is over on the screen all the same (cancelled)
         this.actionCall(a, (acts, ref) => oid == null ? acts.cancel(ref, `在畫面上按了「${opt.button}」`)
