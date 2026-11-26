@@ -16,6 +16,13 @@ export const MENTION_LIMIT = 20
 /** Chiron's title, verbatim, with the count */
 export const mentionTitle = (n: number): string => `〔點名你的動態｜${n} 則。別人在你的單或你名下的串上說了什麼；只讓你知道，要看全文用 feed_open〕`
 export const mentionMore = (n: number): string => `還有 ${n} 則沒列出，下一次附上`
+/** WO-181 (Chiron 06:19Z): the line of Onsen's mention item (kind mention, no text; one while one is not taken; its post_id in refs or the payload). The
+ *  item is the batch's reason to reach the main (lanes-wake-rules.json `mention`); the lines are the block that rides the same delivery */
+export function mentionItemText(it: { refs?: unknown; payload?: unknown; post_id?: unknown }): string {
+  const r = (it.refs ?? {}) as Record<string, unknown>, pl = (it.payload ?? {}) as Record<string, unknown>
+  const post = [it.post_id, r.post_id, pl.post_id].find(x => x != null && /^\d{1,18}$/.test(String(x)))
+  return `〔點名你的動態〕有人在動態上點名你${post != null ? `（貼文 ${post}）` : ''}；那幾行在這一次附上的「點名你的動態」區塊，要看全文用 feed_open`
+}
 /** the block the digest carries and the posts it names (marked read once it reached the main) */
 export type MentionBlock = { text: string; posts: string[]; count: number }
 export type MentionReq = (method: 'GET' | 'PUT', path: string, body: unknown, timeoutMs: number) => Promise<{ status: number; json: any } | null>

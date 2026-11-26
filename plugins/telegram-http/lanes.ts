@@ -1724,13 +1724,19 @@ function wakeItemOf(ev: InEvent, cfg: RouterCfg): WakeItem {
 const verdictRow = (v: WakeVerdict): { wake_target: string; wake_urgency: string } => ({ wake_target: v.target, wake_urgency: v.urgency })
 /** the route row's rule on the new path: wake:<decideWake rule>, and /<the rule the doing code returned> when that one differs (a gate or merge inside it) */
 const wakeRuleTag = (v: WakeVerdict, did?: string): string => `wake:${v.rule}${did && did !== `wake:${v.rule}` && did !== v.rule ? `/${did}` : ''}`
+/** the rule's main map is `batch` (lanes-wake-rules.json, or this agent's own wake_rules): the main gets it batched (WO-164, WO-181) */
+function batchRule(id: string, cfg: RouterCfg): boolean {
+  if (id === 'owner-mail-main') return true
+  try { return [...agentWakeRules(cfg), ...wakeTable().rules].find(r => r.id === id)?.map === 'batch' } catch { return false }
+}
 /** the verdict as the Rule applyRule does (the doing code of today's router.json `to`) */
 function ruleForVerdict(v: WakeVerdict, ev: InEvent, item: WakeItem, st: WakeState, cfg: RouterCfg): Rule {
   const id = `wake:${v.rule}`
   if (item.kind === 'mail_event') return { id, match: {}, to: 'mail_event' }                    // the mailbox's events: mailDecision / mailDue choose lane, main or ledger
   const dest = v.target.startsWith('held:') ? (v.then ?? 'main') : v.target
   if (dest === 'ledger') return { id, match: {}, to: 'ledger', trigger: 'no_reply' }
-  if (v.rule === 'owner-mail-main') return { id, match: {}, to: 'main', batch: true }                // WO-164: a mail on the main's thread, batched
+  // WO-164: a mail on the main's thread, batched (owner-mail-main); WO-181: a mention item (mention). Any rule whose map is `batch` is (the table says it)
+  if (batchRule(v.rule, cfg)) return { id, match: {}, to: 'main', batch: true }
   const byOwner = v.rule === 'owner' || v.rule === 'owner-rest' || v.rule === 'joey-owner' || (v.origin.startsWith('legacy:') && st.owner && dest === `lane:${st.owner}`)
   if (byOwner && ev.source === 'telegram') return { id, match: {}, to: ev.reply_to_message_id && S.botmsgs[ev.reply_to_message_id] ? 'quoted_lane' : 'topic_worker', trigger: 'joey' }
   if (byOwner && st.owner && (ev.tkey?.thread || ev.tkey?.lane)) {

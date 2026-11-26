@@ -67,7 +67,7 @@ import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.t
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { ObservationPut } from './onsen-observation.ts'
-import { MentionCards } from './onsen-mentions.ts'
+import { MentionCards, mentionItemText } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
@@ -5288,6 +5288,9 @@ async function deliverPulled(it: PullItem): Promise<HandResult> {
     ...(it.refs && typeof it.refs === 'object' ? { refs: it.refs } : {}),
     // WO-175: Onsen's call id (0.24.1: on every Call item; null before the Call exists, and for other kinds)
     ...((it as { call_id?: unknown }).call_id != null ? { call_id: String((it as { call_id?: unknown }).call_id) } : {}) } as InboundBody
+  // WO-181 (Chiron 06:19Z): Onsen's item of a mention (kind mention, no text, only a post_id) is the batch's reason to reach the main; the lines
+  // are the mention block that rides the delivery (lanes-main.ts). It gets one line of its own, so it can be delivered at all
+  if (it.kind === 'mention' && !(typeof p.text === 'string' && p.text.trim())) p.text = mentionItemText(it)
   const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
   const sender = String(it.sender ?? 'unknown').slice(0, 64)
   const unverified = it.unverified === true

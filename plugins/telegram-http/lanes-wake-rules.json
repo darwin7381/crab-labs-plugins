@@ -24,6 +24,7 @@
     "batch": "ordered",
     "lane_exit": "ordered",
     "own": "ordered",
+    "mention": "ordered",
     "other": "ordered"
   },
   "maps": {
@@ -176,6 +177,20 @@
         "#3 toMainForm"
       ],
       "doc": "Joey's message: the main (now when idle, after this step when busy; held and told where it is when waiting, stuck or offline)."
+    },
+    {
+      "id": "mention",
+      "when": {
+        "kind": [
+          "mention"
+        ]
+      },
+      "to": "main",
+      "map": "batch",
+      "replaces": [
+        "nothing before WO-181: a mention reached the main only with whatever delivery came next (1.58.12), with no ceiling"
+      ],
+      "doc": "WO-181 (Chiron 06:19Z): Onsen's item of a mention for this agent (kind mention, only a post_id; one while it is not taken) goes to the main batched: it never wakes the main alone, it rides the next delivery to the main (the mention block rides that delivery: lanes-main.ts, LANES_MENTION_CARDS), and after LANES_DEFER_MAX_WAIT_S (the decision cards' 45 minutes) it leads one delivery for the batch. No timer of its own."
     },
     {
       "id": "owner-mail-main",
