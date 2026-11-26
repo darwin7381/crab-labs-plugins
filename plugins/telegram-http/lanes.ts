@@ -186,7 +186,9 @@ export interface LanesDeps {
   /** MCP session `sid` has its stream open */
   streamOpen?: (sid: string) => boolean
   /** tg role: bot calls. `label`: the text's first line is this lane label (〔agent·…〕), kept as its own first line when the text is rendered */
-  sendBot?: (chat_id: string, text: string, opts: { silent?: boolean; topic?: number; replyTo?: number; label?: string; laneId?: string }) => Promise<number>   // Onsen (WO-139): laneId = who sends (none: the router)
+  sendBot?: (chat_id: string, text: string, opts: { silent?: boolean; topic?: number; replyTo?: number; label?: string; laneId?: string
+    /** WO-192: the Telegram ids once a background resend ends (a line written into Onsen first whose Telegram send failed) */
+    late?: (ids: number[]) => void }) => Promise<number>   // Onsen (WO-139): laneId = who sends (none: the router). WO-192: may throw an error with heldInOnsen (said in Onsen, Telegram later)
   createTopic?: (chat_id: string, name: string) => Promise<number>
   /** lanes-topics (item 1): may the bot open a work topic now (lanes-topics.ts topicVerdict over a fresh getMe)? usable false = the main does the work */
   topicsUsable?: () => Promise<TopicVerdict>
@@ -5125,15 +5127,22 @@ function joeyReplyTo(ev: InEvent | undefined): number | undefined {
   if (chat != null && D.joeyChatId && String(chat) !== String(D.joeyChatId())) return undefined
   return Number(ev.meta.message_id)
 }
-async function pushJoey(lane: Lane | undefined, text: string, silent: boolean, replyTo?: number, owner?: string): Promise<number | null> {
+/** `held` (WO-192, ONSEN_FIRST): set when the line is written into Onsen and Telegram has not taken it yet (null is returned: no Telegram id): its
+ *  sentence, for a caller that tells the lane (sendLine); the line is said, never to be sent again */
+async function pushJoey(lane: Lane | undefined, text: string, silent: boolean, replyTo?: number, owner?: string, held?: { said?: string }): Promise<number | null> {
   if (!D.sendBot || !D.joeyChatId) return null
   // the true owner of the event is stamped on the message whenever it is not the lane that writes (M3; a wrong claim in the text is corrected here)
   const head = lane ? `〔${D.agent}·${laneLabel(lane)}${owner && owner !== laneLabel(lane) ? `｜負責：${owner}` : ''}〕` : `〔${D.agent}·分流器〕`
+  // WO-192: a line sent later (Telegram failed first) is the lane's too, for Joey's replies to it
+  const late = (ids: number[]): void => { if (lane && ids.length) { for (const x of ids) S.botmsgs[String(x)] = lane.id; saveState() } }
   try {
-    const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { silent, topic: lane?.topic, label: head, ...(replyTo ? { replyTo } : {}), ...(lane ? { laneId: lane.id } : {}) })   // Onsen (WO-139): laneId
+    const id = await D.sendBot(D.joeyChatId(), `${head}\n${text}`, { late, silent, topic: lane?.topic, label: head, ...(replyTo ? { replyTo } : {}), ...(lane ? { laneId: lane.id } : {}) })   // Onsen (WO-139): laneId; WO-192: late
     if (lane) { S.botmsgs[String(id)] = lane.id; saveState() }
     return id
-  } catch (e) { D.log('error', `lanes: push to Joey failed: ${e}`); return null }
+  } catch (e) {
+    if ((e as any)?.heldInOnsen === true) { if (held) held.said = String((e as Error).message); D.log('warn', `lanes: push to Joey: ${(e as Error).message}`); return null }
+    D.log('error', `lanes: push to Joey failed: ${e}`); return null
+  }
 }
 function laneLabel(l: Lane): string { return `${KIND_NAME[l.kind]}#${l.n}` }
 
@@ -5528,7 +5537,8 @@ export function mainReplyTier(a: { reply_to?: unknown; chat_id?: unknown }): Mai
   return { silent: true, rule: `turn ${x.turn.prompt}: ${tiers[0].rule}`, events: x.about.map(e => e.id) }
 }
 /** server.ts: the main's Telegram reply went out (messageId; null = it did not): a request against its target events (replyTargets) */
-export function mainReplied(t: MainTier | null, messageId: number | null, replyTo?: unknown, text?: string, chat?: unknown): void {
+/** messageId: the Telegram id of its first message; WO-192: `onsen:<id>` for a reply written into Onsen whose Telegram send is still to come (said) */
+export function mainReplied(t: MainTier | null, messageId: number | string | null, replyTo?: unknown, text?: string, chat?: unknown): void {
   if (D?.role !== 'tg' || !S || !events) return
   // WO-148 (item 3): the main's latest reply to Joey (his DM), what a long turn's 「在處理」 reads (mainNewest); kept in the state, saved with it
   if (messageId != null && text?.trim() && (chat == null || !D.joeyChatId || String(chat) === String(D.joeyChatId()))) S.main_reply = { text: clip(text.trim(), 300), at: nowIso() }
@@ -6139,15 +6149,19 @@ async function sendLine(tok: RunTok, lane: Lane, h: HeldLine): Promise<string> {
     events.result(evId, h.obId, true, { ref: 'ledger' }); note(); logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule })
     return decision ? 'recorded in the ledger (this kind of notice never reaches Joey)' : 'recorded in the ledger'
   }
-  const id = await pushJoey(lane, body, r.tier === 'silent', joeyReplyTo(replyEventFor(tok)), ownerOf(evId))
-  events.result(evId, h.obId, id != null, { ref: id, why: 'the Telegram send failed' })                      // PL2: met on the delivery, not before it
-  note({ message_id: id, delivered: id != null })
-  if (id == null) throw new Error(`send failed: Joey did not get it; the ${decision ? 'question' : 'line'} is still owed (${decision ? 'ask' : 'send it'} again)`)
+  const held: { said?: string } = {}
+  const id = await pushJoey(lane, body, r.tier === 'silent', joeyReplyTo(replyEventFor(tok)), ownerOf(evId), held)
+  // WO-192 (ONSEN_FIRST): no Telegram id but written into Onsen (said: Joey sees it on the page; the daemon sends it to Telegram again): met, not owed
+  const said = id == null && !!held.said
+  events.result(evId, h.obId, id != null || said, { ref: said ? 'onsen' : id, why: 'the Telegram send failed' })        // PL2: met on the delivery, not before it
+  note({ message_id: id, delivered: id != null || said, ...(said ? { onsen_first: 'telegram-pending' } : {}) })
+  if (id == null && !said) throw new Error(`send failed: Joey did not get it; the ${decision ? 'question' : 'line'} is still owed (${decision ? 'ask' : 'send it'} again)`)
   tok.reported = true; if (decision) tok.askedJoey = true                   // WO-148 (item 2): what a held refusal waits for (stepsHeld's report step, owner_claim's ask)
-  void promiseCheck({ who: lane.id, to: 'joey', text, ev: evId, thread: lane.thread, ref: id, tok, detail: lane.transcript })   // 002w (F, gap 16): what a lane tells Joey it will do
+  void promiseCheck({ who: lane.id, to: 'joey', text, ev: evId, thread: lane.thread, ref: said ? 'onsen' : id, tok, detail: lane.transcript })   // 002w (F, gap 16): what a lane tells Joey it will do
   if (r.tier === 'push') S.pushes[lane.thread] = [...(S.pushes[lane.thread] ?? []).filter(t => Date.now() - t < 3600_000), Date.now()]
   saveState()
-  logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule, message_id: id })
+  logos('lane.notify', { ...rec, tier: r.tier, tier_rule: r.rule, message_id: id, ...(said ? { onsen_first: 'telegram-pending' } : {}) })
+  if (said) return held.said!
   return decision ? `sent to Joey (message_id ${id}). The main will read it in its next digest; do not hand it to the main as well.`
     : `sent to Joey (message_id ${id}${lane.topic ? `, topic ${lane.topic}` : ''}${r.body !== toJoey ? '; a routine event with a normal outcome reaches him as its first line, the whole text is in the ledger' : ''})`
 }

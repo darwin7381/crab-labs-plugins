@@ -8,8 +8,9 @@ export type BotApiMock = {
   polls: Array<{ start: number; end?: number }>
   /** calls this returns true for are never answered (the request stays open) */
   hang: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
-  /** calls this returns true for are answered 400 (as a markdown the rich renderer cannot take; `desc`: another description) */
-  fail: { fn: ((method: string, body: Record<string, any>) => boolean) | null; desc?: string }
+  /** calls this returns true for are answered 400 (as a markdown the rich renderer cannot take; `desc`: another description; WO-192: `code` another
+   *  status, e.g. 502 for Telegram unreachable, 429 with `retryAfter`) */
+  fail: { fn: ((method: string, body: Record<string, any>) => boolean) | null; desc?: string; code?: number; retryAfter?: number }
   /** WO-145: the pinned message per chat (pinChatMessage / unpinChatMessage; getChat shows it); messages deleted by the user (an edit of one is refused
    *  "message to edit not found") */
   pinned: Map<string, number>
@@ -65,7 +66,8 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     for (const k of ['reply_parameters', 'reply_markup', 'rich_message']) if (typeof body[k] === 'string') { try { body[k] = JSON.parse(body[k]) } catch {} }
     if (method !== 'getUpdates') calls.push({ method, body, at: Date.now() })
     if (hang.fn?.(method, body)) return new Promise<Response>(() => {})
-    if (fail.fn?.(method, body)) return Response.json({ ok: false, error_code: 400, description: fail.desc ?? "Bad Request: can't parse the rich message" }, { status: 400 })
+    if (fail.fn?.(method, body)) return Response.json({ ok: false, error_code: fail.code ?? 400, description: fail.desc ?? "Bad Request: can't parse the rich message",
+      ...(fail.retryAfter ? { parameters: { retry_after: fail.retryAfter } } : {}) }, { status: fail.code ?? 400 })
     switch (method) {
       case 'getMe': return ok({ ...state })
       case 'getUserProfilePhotos': return ok(photo.bytes && Number(body.user_id) === state.id

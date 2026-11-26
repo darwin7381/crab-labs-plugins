@@ -30,7 +30,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, randomUUID, timingSafeEqual } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, openSync, closeSync, readSync, existsSync } from 'fs'
 import { homedir, hostname } from 'os'
-import { join, extname, sep, dirname } from 'path'
+import { join, extname, sep, dirname, basename } from 'path'
 import { execFile, spawnSync } from 'child_process'
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'http'
 import {
@@ -88,6 +88,7 @@ import * as OnsenStatus from './onsen-status.ts'
 import * as OnsenVisible from './onsen-visible.ts'
 import * as OnsenAttach from './onsen-attachments.ts'
 import * as OnsenFiles from './onsen-files.ts'
+import * as OnsenFirst from './onsen-first.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
@@ -439,6 +440,61 @@ function onsenFilesOn(): boolean {
   try { return !!onsen && onsen.cfg.record && OnsenFiles.filesOn(liveSetting('ONSEN_FILES'), ONSEN_AGENT) } catch { return false }
 }
 const onsenUpload: OnsenFiles.Upload = (bytes, o) => onsen ? onsen.uploadFile(bytes, o) : Promise.resolve({ error: 'Onsen is off here' })
+/** WO-192 (onsen-first.ts): Onsen's version (the new path needs ≥ 0.31.0), read from the first moment ONSEN_FIRST is on for this agent, then every
+ *  10 min (recording on, the Telegram daemon); with the switch off nothing is asked */
+const onsenVersion: OnsenFirst.OnsenVersion | null = onsen && onsen.cfg.record && !INBOX_ONLY
+  ? new OnsenFirst.OnsenVersion({ request: (m, p, b, t) => onsen!.request(m, p, b, t), log }) : null
+/** WO-192: tests only (the waits, in ms, comma lists): ONSEN_FIRST_RETRY_MS (A's tries), ONSEN_FIRST_RESEND_MS (Telegram's resends) */
+const msList = (v: string | undefined): number[] | undefined => { const l = String(v ?? '').split(',').map(x => Number(x.trim())).filter(x => Number.isFinite(x) && x >= 0); return l.length ? l : undefined }
+const onsenFirst: OnsenFirst.FirstSender | null = onsenVersion ? new OnsenFirst.FirstSender({
+  request: (m, p, b, t) => onsen!.request(m, p, b, t), log,
+  report: (id, r) => { if (!onsen!.recordDeliveryReport(id, r)) throw new Error('the spool did not take it') },
+  isTimeout: e => e instanceof SendTimeoutError || (e as any)?.cause instanceof SendTimeoutError,
+  retryMs: msList(process.env.ONSEN_FIRST_RETRY_MS), resendMs: msList(process.env.ONSEN_FIRST_RESEND_MS),
+}) : null
+/** WO-192 (ONSEN_FIRST: a comma list of agent names or `*`; unset, empty or 0 = off; the plist, else the machine config read again at most every 30 s):
+ *  this agent's words to a person go into Onsen before Telegram. Recording on and Onsen ≥ 0.31.0 (its version not known yet: the first read is
+ *  waited for, 3 s at most); otherwise the path as before */
+async function onsenFirstNow(): Promise<boolean> {
+  try {
+    if (!onsenFirst || !onsenVersion || !onsen?.cfg.record || !OnsenFirst.firstOn(liveSetting('ONSEN_FIRST'), ONSEN_AGENT)) return false
+    onsenVersion.start()                                   // once: the first read, then every 10 min
+    return await onsenVersion.ensure(3_000)
+  } catch { return false }
+}
+/** WO-192: one reply (the main's, a lane's line, a router notice) the new way: its files into Onsen (ONSEN_FILES on; before A, since A carries them),
+ *  A, the Telegram steps (their Bot API calls not recorded), B. Throws 「Onsen 沒收下…」 when Onsen did not take it (nothing went to Telegram) */
+async function sendOnsenFirst(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; parseMode?: string
+  files: string[]; steps: OnsenFirst.Step[]; replyTo?: number; thread?: number; silent?: boolean; turn_id?: string | null; late?: (ids: number[]) => void }): Promise<OnsenFirst.Outcome> {
+  const idem = OnsenFirst.idemPre(ONSEN_AGENT, o.chat)
+  const body = Onsen.redactText(o.text, o.redact)
+  const rows: Onsen.OnsenAttachment[] = o.files.map(f => {
+    const name = basename(f), mime = OnsenFiles.mimeOf(name)
+    let size: number | undefined
+    try { size = statSync(f).size } catch {}
+    return { name, ...(mime ? { mime } : {}), ...(size != null ? { size } : {}) }
+  })
+  // each file: its own Idempotency-Key (idem, or idem:<i> with more than one); a file not stored is left out (storeFiles logs why) and keeps its row
+  const stored: Array<string | null> = []
+  for (let i = 0; i < o.files.length; i++) {
+    if (!onsenFilesOn()) { stored.push(null); continue }
+    const f = o.files[i]!, one = { idem_key: OnsenFiles.fileKey(idem, i, o.files.length), kind: 'document', attachments: [rows[i]!] } as Onsen.OnsenItem
+    const got = await OnsenFiles.storeFiles(one, [async () => OnsenFiles.localFile(f)], onsenUpload, log).catch(() => [] as string[])
+    stored.push(got[0] ?? null)
+  }
+  const fileKind = (f: string): Onsen.OnsenItem['kind'] => PHOTO_EXTS.has(extname(f).toLowerCase()) ? 'photo' : 'document'
+  const kind: Onsen.OnsenItem['kind'] = body.trim() || !o.files.length ? (o.rich ? 'rich' : 'text') : fileKind(o.files[0]!)
+  const meta: Record<string, unknown> = { ...(o.silent ? { silent: true } : {}), ...(o.parseMode ? { parse_mode: o.parseMode } : {}) }
+  const head = { idem_key: idem, agent: ONSEN_AGENT, client: 'telegram' as const, chat: o.chat, direction: 'out' as const, sender: o.sender, body, kind,
+    sent_at: new Date().toISOString(), ...(o.replyTo != null ? { reply_to_client_msg_id: String(o.replyTo) } : {}),
+    ...(o.thread != null ? { thread: String(o.thread) } : {}), status: 'ok' as const, backfilled: false as const, ...(Object.keys(meta).length ? { meta } : {}),
+    ...(o.turn_id ? { turn_id: String(o.turn_id).slice(0, 120) } : {}), delivery: { client: 'telegram' as const, state: 'pending' as const } }
+  // a stored file is listed once, as its Onsen file (attachment_file_ids); one not stored as its name (attachments): never both (v1 lists each)
+  const ids = stored.filter((x): x is string => !!x), left = rows.filter((_, i) => !stored[i])
+  const item: OnsenFirst.FirstItem = { ...head, ...(left.length ? { attachments: left } : {}), ...(ids.length ? { attachment_file_ids: ids } : {}) }
+  const bare: OnsenFirst.FirstItem | undefined = ids.length ? { ...head, attachments: rows } : undefined
+  return onsenFirst!.send({ item, bare, steps: o.steps, late: o.late })
+}
 /** WO-190: the inbox copies of the photos being handled (message:photo), so the upload takes the copy the agent gets */
 const photoCopies = new OnsenFiles.PhotoCopies()
 /** WO-190: where a person's file comes from for Onsen: a photo's inbox copy once the daemon has it, else Telegram (fetched by the daemon itself, in
@@ -1008,7 +1064,7 @@ async function sendTextParts(chat_id: string, parts: { rich: string[]; plain: st
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    throw new Error(`${o.what} failed after ${sentIds.length} of ${n} chunk(s) sent: ${msg}`)
+    throw new Error(`${o.what} failed after ${sentIds.length} of ${n} chunk(s) sent: ${msg}`, { cause: err })   // WO-192: the cause (a timeout, a 429's retry_after)
   }
   return sentIds
 }
@@ -2666,28 +2722,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // lanes-topics (item 7): one line per message the reply delivered (method, chat, id, topic, ms; never the text), so an incident can be read from the log
         const sentLog = (method: string, id: unknown, t0: number): void =>
           log('info', `reply sent: method=${method} chat=${chat_id} message=${id ?? '?'} topic=${topicF.message_thread_id ?? '-'} ms=${Date.now() - t0}`)
-        // the one text send (sendTextParts), shared with the lane lines
-        const sentIds = await Onsen.withSender('main', () => sendTextParts(chat_id, { rich: chunks, plain: chunks }, { what: 'reply', useRich, parseMode, quiet, topicF, sentLog,   // Onsen (WO-139)
-          replyParams: reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined, replyAll: replyMode === 'all' }), { redact: fl.redact, turn_id: mainTurnNow() })
-
+        const replyParams = reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
-        for (const f of files) {
-          const ext = extname(f).toLowerCase()
+        const fileArgs = (f: string) => {
           const input = new InputFile(f)
           const base = reply_to != null && replyMode !== 'off'
             ? { reply_parameters: { message_id: reply_to }, ...quiet }
             : (handoffTier?.silent ? quiet : undefined)
           const opts = topicF.message_thread_id != null ? { ...(base ?? {}), ...topicF } : base
-          const t0 = Date.now(), method = PHOTO_EXTS.has(ext) ? 'sendPhoto' : 'sendDocument'
-          try {
-            const sent = await Onsen.withSender('main', () => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts), { turn_id: mainTurnNow(), file: f })   // Onsen (WO-139); WO-172: its turn; WO-190: the file into Onsen too
-            sentIds.push(sent.message_id)
+          return { input, opts, method: PHOTO_EXTS.has(extname(f).toLowerCase()) ? 'sendPhoto' as const : 'sendDocument' as const }
+        }
+        let sentIds: number[]
+        if (await onsenFirstNow()) {
+          // WO-192 (ONSEN_FIRST): written into Onsen first (A, the whole reply and its files), then Telegram exactly as below (each part rich → plain,
+          // each file its own message; their Bot API calls not recorded: the message is in Onsen already), then B. Onsen not taking it: the tool fails,
+          // nothing goes to Telegram. Telegram failing: the tool does not fail (the message is said: Onsen has it); it is sent again in the background
+          const steps: OnsenFirst.Step[] = chunks.map((part, i) => ({ what: chunks.length > 1 ? `第 ${i + 1} 段（共 ${chunks.length} 段）` : '文字',
+            run: async () => (await Onsen.withoutRecord(() => sendTextParts(chat_id, { rich: [part], plain: [part] }, { what: 'reply', useRich, parseMode, quiet, topicF, sentLog,
+              replyParams: i === 0 || replyMode === 'all' ? replyParams : undefined })))[0]! }))
+          for (const f of files) steps.push({ what: `檔案 ${basename(f)}`, run: async () => {
+            const { input, opts, method } = fileArgs(f), t0 = Date.now()
+            const sent = await Onsen.withoutRecord(() => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts))
             sentLog(method, sent.message_id, t0)
-          } catch (fe) {
-            // item 7: a file that got no answer says what had already gone out
-            if (fe instanceof SendTimeoutError) throw new Error(`reply failed after ${sentIds.length} of ${chunks.length + files.length} part(s) sent: ${fe.message}`)
-            throw fe
+            return sent.message_id
+          } })
+          const r = await sendOnsenFirst({ chat: chat_id, sender: 'main', text: fl.text, redact: fl.redact, rich: useRich, parseMode, files, steps,
+            replyTo: replyParams?.message_id, thread: topicF.message_thread_id, silent: !!handoffTier?.silent, turn_id: mainTurnNow(),
+            late: ids => sentIn(chat_id, ids, topicF) })
+          if ('held' in r) {
+            // the main has said it (Onsen has it): its turn's Joey line is met on the Onsen message (the Stop check does not hold the turn)
+            if (Lanes.LANES_ON && !INBOX_ONLY) Lanes.mainReplied(handoffTier, `onsen:${r.onsenId}`, lanesReplyTo, text, chat_id)
+            sentIn(chat_id, r.ids, topicF)
+            return { content: [{ type: 'text', text: r.held }] }
+          }
+          sentIds = r.ids
+        } else {
+          // the one text send (sendTextParts), shared with the lane lines
+          sentIds = await Onsen.withSender('main', () => sendTextParts(chat_id, { rich: chunks, plain: chunks }, { what: 'reply', useRich, parseMode, quiet, topicF, sentLog,   // Onsen (WO-139)
+            replyParams, replyAll: replyMode === 'all' }), { redact: fl.redact, turn_id: mainTurnNow() })
+
+          for (const f of files) {
+            const { input, opts, method } = fileArgs(f), t0 = Date.now()
+            try {
+              const sent = await Onsen.withSender('main', () => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts), { turn_id: mainTurnNow(), file: f })   // Onsen (WO-139); WO-172: its turn; WO-190: the file into Onsen too
+              sentIds.push(sent.message_id)
+              sentLog(method, sent.message_id, t0)
+            } catch (fe) {
+              // item 7: a file that got no answer says what had already gone out
+              if (fe instanceof SendTimeoutError) throw new Error(`reply failed after ${sentIds.length} of ${chunks.length + files.length} part(s) sent: ${fe.message}`)
+              throw fe
+            }
           }
         }
 
@@ -4815,11 +4900,25 @@ if (Lanes.LANES_ON) {
         const lt = label && fl.text.startsWith(`${label}\n`) ? fl.text.slice(label.length + 1) : label ? text.slice(label.length + 1) : fl.text
         // Onsen (WO-139): a lane's line is the lane's (its id), the router's own notices the router's
         // WO-172: a lane's line carries its run (the turn it is sent in); the router's notices carry none
-        const ids = await Onsen.withSender(o.laneId || 'router', () => sendTextParts(chat, laneLineParts(label, lt, limit, useRich), {
-          what: 'lane line', useRich, quiet: o.silent ? { disable_notification: true } : {}, topicF: tf,
-          replyParams: o.replyTo ? { message_id: o.replyTo, allow_sending_without_reply: true } : undefined,   // 002k (E4): a deleted message must not lose the notice
-          sentLog: (method, id, t0) => log('info', `lane line sent: method=${method} chat=${chat} message=${id ?? '?'} topic=${tf.message_thread_id ?? '-'} ms=${Date.now() - t0}`),
-        }), { redact: fl.redact, turn_id: o.laneId ? Lanes.runOfLane(o.laneId) : null })
+        const parts = laneLineParts(label, lt, limit, useRich), quiet = o.silent ? { disable_notification: true } : {}
+        const replyParams = o.replyTo ? { message_id: o.replyTo, allow_sending_without_reply: true } : undefined   // 002k (E4): a deleted message must not lose the notice
+        const sentLog = (method: string, id: unknown, t0: number) => log('info', `lane line sent: method=${method} chat=${chat} message=${id ?? '?'} topic=${tf.message_thread_id ?? '-'} ms=${Date.now() - t0}`)
+        const sender = o.laneId || 'router', turn_id = o.laneId ? Lanes.runOfLane(o.laneId) : null
+        if (await onsenFirstNow()) {
+          // WO-192 (ONSEN_FIRST): the line is written into Onsen first (A, the whole line), then each part to Telegram (not recorded), then B. Onsen
+          // not taking it: throws (nothing went out; the lane is told it is still owed). Telegram failing: OnsenFirst.HeldInOnsen (said; pushJoey reads it; sent again later)
+          const steps: OnsenFirst.Step[] = parts.plain.map((_, i) => ({ what: parts.plain.length > 1 ? `第 ${i + 1} 段（共 ${parts.plain.length} 段）` : '文字',
+            run: async () => (await Onsen.withoutRecord(() => sendTextParts(chat, { rich: [parts.rich[i]!], plain: [parts.plain[i]!] }, {
+              what: 'lane line', useRich, quiet, topicF: tf, replyParams: i === 0 ? replyParams : undefined, sentLog })))[0]! }))
+          const r = await sendOnsenFirst({ chat, sender, text: fl.text, redact: fl.redact, rich: useRich, files: [], steps, replyTo: o.replyTo,
+            thread: tf.message_thread_id, silent: !!o.silent, turn_id, late: ids => { sentIn(chat, ids, tf); o.late?.(ids) } })
+          sentIn(chat, r.ids, tf)
+          if ('held' in r) throw new OnsenFirst.HeldInOnsen(r.held, r.onsenId, r.ids)
+          return r.ids[0]!
+        }
+        const ids = await Onsen.withSender(o.laneId || 'router', () => sendTextParts(chat, parts, {
+          what: 'lane line', useRich, quiet, topicF: tf, replyParams, sentLog,
+        }), { redact: fl.redact, turn_id })
         sentIn(chat, ids, tf)
         return ids[0]
       },
@@ -4877,13 +4976,15 @@ if (Lanes.LANES_ON) {
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 /** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
  *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way. WO-180: ONSEN_OBSERVATION
- *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way. WO-190: ONSEN_FILES (the files of Telegram messages go into Onsen) too */
-type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS' | 'ONSEN_FILES'
+ *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way. WO-190: ONSEN_FILES (the files of Telegram messages go into Onsen) too.
+ *  WO-192: ONSEN_FIRST (an agent's words to a person go into Onsen before Telegram) too */
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS' | 'ONSEN_FILES' | 'ONSEN_FIRST'
 const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
   SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE,
   ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION,
   LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS,   // WO-181
-  ONSEN_FILES: fleetConfigApplied.includes('ONSEN_FILES') ? undefined : process.env.ONSEN_FILES }   // WO-190
+  ONSEN_FILES: fleetConfigApplied.includes('ONSEN_FILES') ? undefined : process.env.ONSEN_FILES,   // WO-190
+  ONSEN_FIRST: fleetConfigApplied.includes('ONSEN_FIRST') ? undefined : process.env.ONSEN_FIRST }   // WO-192
 let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
 function liveSetting(k: LiveKey): string | undefined {
   if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
@@ -5467,7 +5568,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         ...(Lanes.LANES_ON && !INBOX_ONLY ? { mailbox_decide_listed: decideListed } : {}),   // WO-126: the main listed mailbox_decide (when, which session)
         // Onsen (WO-139): recording on, bytes waiting in the spool, last sync; step 3 (WO-143): deliveries_recorded, status_recorded, the status now
         ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}),
-          ...(onsenActions ? { actions: onsenActions.health() } : {}), ...(mentionCards ? { mentions: mentionCards.health() } : {}) } } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed); WO-181: the mention cards'
+          ...(onsenActions ? { actions: onsenActions.health() } : {}), ...(mentionCards ? { mentions: mentionCards.health() } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed); WO-181: the mention cards'
+          // WO-192: the switch now, Onsen's version as last read, A / Telegram / resend counts
+          ...(onsenFirst && onsenVersion ? { first: { on: OnsenFirst.firstOn(liveSetting('ONSEN_FIRST'), ONSEN_AGENT), ...onsenVersion.health(), ...onsenFirst.stats } } : {}) } } : {}),
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,

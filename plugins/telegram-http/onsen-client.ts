@@ -20,6 +20,8 @@
 //   - WO-145 (the half Joey sees, onsen-visible.ts): a send context may carry `redact` (a reply's page links with their one-time form keys → the links as the
 //     agent wrote them): the record keeps the text WITHOUT the keys. A form answer's ack that Onsen did not take directly goes through the spool (k 'a',
 //     POST /forms/ack). `observe` lets the daemon read every line it appends (the pinned status's local counts). `request`: one call with the credential.
+//   - WO-192 (onsen-first.ts, ONSEN_FIRST): a reply written into Onsen before Telegram (A, directly) has its delivery report (B, k 'r', POST
+//     /messages/<id>/delivery) go through the same spool, in order; 409 (already delivered) is settled, not rejected.
 // The credential (the agent's mesh credential, read from the agent-inbox daemon's state dir) is never logged, printed or written anywhere.
 
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -82,7 +84,12 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
   /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
   | { k: 'c'; r: CallStateLine }
-const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c'])
+  /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
+  | { k: 'r'; r: DeliveryReportLine }
+const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
+/** WO-192 (Onsen 0.31.0, WO-191 B): one delivery report: the Onsen message A wrote, and the body Onsen takes */
+export type DeliveryReportLine = { message_id: number
+  body: { client: 'telegram'; state: 'sent' | 'failed'; client_msg_ids: string[]; at: string; error?: string } }
 /** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
 export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
@@ -387,7 +394,8 @@ export class OnsenClient {
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
     lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0,
     thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0,
-    files_uploaded: 0, files_upload_failed: 0, files_late: 0, files_lost: 0, files_refused: 0 }
+    files_uploaded: 0, files_upload_failed: 0, files_late: 0, files_lost: 0, files_refused: 0,
+    delivery_reports: 0, delivery_reported: 0, delivery_conflicts: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -495,6 +503,13 @@ export class OnsenClient {
   /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
   recordDelivery(f: DeliveryFact): void { if (this.append({ k: 'd', r: f })) this.stats.deliveries_recorded++ }
   recordStatus(f: StatusFact): void { if (this.append({ k: 's', r: f })) { this.stats.status_recorded++; this.fastStatus(f) } }
+  /** WO-192: what Telegram did with a reply written into Onsen first (B), through the same spool: in order before a later edit or reaction of that
+   *  message (Onsen finds their target by the numbers B gives it), and kept across a restart. false = not spooled */
+  recordDeliveryReport(messageId: number, body: DeliveryReportLine['body']): boolean {
+    const ok = this.append({ k: 'r', r: { message_id: messageId, body } })
+    if (ok) this.stats.delivery_reports++
+    return ok
+  }
   /** WO-147: one wake decision (onsen-wake.ts wakeItem), through the same spool; false = not spooled (recording off, or the append failed) */
   recordWake(w: WakeItem): boolean { const ok = this.append({ k: 'w', r: w }); if (ok) this.stats.wake_recorded++; return ok }
   /** WO-164: thread events (lanes-threads.ts threadEvents), one spool line each, posted in order as /threads/events batches; false = not all spooled */
@@ -829,6 +844,18 @@ export class OnsenClient {
           this.settleCall(c.idem, { fate: 'refused', status: r.status, said: callSaid(r.json) })
         }
         else return this.failStatus(r, `/v1/calls/${id}/state`)
+        this.writeCursor(t.end); this.ok(); i++
+        continue
+      }
+      if (t.line.k === 'r') {
+        // WO-192 (B): a reply written into Onsen first: what Telegram did with it. The same report again is a duplicate (200); 409: the message is
+        // already delivered (a later failure is not taken) or was not written for delivery: settled either way, never retried
+        const { message_id: mid, body } = t.line.r
+        const r = await this.post(`/messages/${encodeURIComponent(String(mid))}/delivery`, body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        if (r.status >= 200 && r.status < 300) { if (r.json?.duplicate) this.stats.duplicates++; else this.stats.delivery_reported++ }
+        else if (r.status === 409) { this.stats.delivery_conflicts++; this.cfg.log('info', `onsen: delivery ${body.state} of Onsen message ${mid}: Onsen answered 409 (${callSaid(r.json)}); taken as delivered`) }
+        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `POST /messages/${mid}/delivery: HTTP ${r.status} ${callSaid(r.json)}`)
+        else return this.failStatus(r, `/messages/${mid}/delivery`)
         this.writeCursor(t.end); this.ok(); i++
         continue
       }

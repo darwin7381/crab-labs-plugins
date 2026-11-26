@@ -199,3 +199,14 @@ plugins/telegram-http/server.ts::if (line?.k === 'm' && file && OnsenFiles.wants
 plugins/telegram-http/server.ts::download: () => photoCopies.track(ctx.message, downloadPhotoToInbox(ctx, best)),
 plugins/telegram-http/server.ts::{ turn_id: mainTurnNow(), file: f }
 plugins/telegram-http/server.ts::ONSEN_FILES: fleetConfigApplied.includes('ONSEN_FILES') ? undefined : process.env.ONSEN_FILES
+plugins/telegram-http/onsen-first.ts::export function firstOn(value: string | undefined, agent: string): boolean {
+plugins/telegram-http/onsen-first.ts::export const idemPre = (agent: string, chat: string): string => `tg:${agent}:${chat}:out:pre:${randomUUID()}`
+plugins/telegram-http/onsen-first.ts::export const NOT_TAKEN = 'Onsen 沒收下，這一則沒有送出'
+plugins/telegram-http/onsen-first.ts::const r = await this.o.request('GET', '/v1/meta', undefined, 5_000)
+plugins/telegram-http/onsen-client.ts::recordDeliveryReport(messageId: number, body: DeliveryReportLine['body']): boolean {
+plugins/telegram-http/onsen-client.ts::const r = await this.post(`/messages/${encodeURIComponent(String(mid))}/delivery`, body, cred)
+plugins/telegram-http/server.ts::const r = await sendOnsenFirst({ chat: chat_id, sender: 'main', text: fl.text, redact: fl.redact
+plugins/telegram-http/server.ts::if ('held' in r) throw new OnsenFirst.HeldInOnsen(r.held, r.onsenId, r.ids)
+plugins/telegram-http/server.ts::run: async () => (await Onsen.withoutRecord(() => sendTextParts(chat_id, { rich: [part], plain: [part] }
+plugins/telegram-http/server.ts::ONSEN_FIRST: fleetConfigApplied.includes('ONSEN_FIRST') ? undefined : process.env.ONSEN_FIRST
+plugins/telegram-http/lanes.ts::if ((e as any)?.heldInOnsen === true) { if (held) held.said = String((e as Error).message)
