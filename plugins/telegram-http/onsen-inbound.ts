@@ -92,10 +92,14 @@ export type Facts = {
  *  the delivered copy by), source (the tag's origin, Claude Code's), topic (the reply tool's topic and the router's lane: a reply lands there), user_id
  *  (whose message it is: the allowlist check of its delivery facts). Everything else the bridge sends wins over what the connector derived */
 export const CLIENT_META_FIXED: ReadonlySet<string> = new Set(['chat_id', 'message_id', 'ts', 'source', 'topic', 'user_id'])
+/** and image_path, image_path_<n>: a file on this machine the agent is told to Read, written only by this daemon (sonn, 16:3xZ): a client_meta that
+ *  named one could point the agent at any local file. The bridge never sends it */
+export const CLIENT_META_LOCAL = /^image_path(_\d+)?$/
+export const clientMetaFixed = (k: string): boolean => CLIENT_META_FIXED.has(k) || CLIENT_META_LOCAL.test(k)
 /** WO-197 (rule A): client.meta onto a tag, last, by whatever builds it (finishInbound; an album's flushAlbum, with its first item's): each key as is,
- *  over the tag's own value (a new key comes last), except CLIENT_META_FIXED */
+ *  over the tag's own value (a new key comes last), except CLIENT_META_FIXED and a local image path */
 export function applyClientMeta(meta: Record<string, string>, cm: Record<string, string> | null | undefined): void {
-  for (const [k, v] of Object.entries(cm ?? {})) if (!CLIENT_META_FIXED.has(k)) meta[k] = v
+  for (const [k, v] of Object.entries(cm ?? {})) if (!clientMetaFixed(k)) meta[k] = v
 }
 
 /** WO-197: client.meta as tag attributes: every key shaped as an attribute name (letters, digits, _; not starting with a digit), its value as is (a

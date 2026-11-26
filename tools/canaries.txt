@@ -263,7 +263,8 @@ plugins/telegram-http/server.ts::await handledHere(self, 'permission', async () 
 plugins/telegram-http/server.ts::const handled = await handledHere(ownSlash, 'command', () => handleControlSlash(
 plugins/telegram-http/server.ts::const handled = await handledHere(ownSlash, 'command', () => handleRoamerSlash(text, replyToTg), h => h !== false)
 plugins/telegram-http/onsen-inbound.ts::export const CLIENT_META_FIXED: ReadonlySet<string> = new Set(['chat_id', 'message_id', 'ts', 'source', 'topic', 'user_id'])
-plugins/telegram-http/onsen-inbound.ts::for (const [k, v] of Object.entries(cm ?? {})) if (!CLIENT_META_FIXED.has(k)) meta[k] = v
+plugins/telegram-http/onsen-inbound.ts::for (const [k, v] of Object.entries(cm ?? {})) if (!clientMetaFixed(k)) meta[k] = v
+plugins/telegram-http/onsen-inbound.ts::export const CLIENT_META_LOCAL = /^image_path(_\d+)?$/
 plugins/telegram-http/server.ts::OnsenInbound.applyClientMeta(meta, f.clientMeta)
 plugins/telegram-http/server.ts::OnsenInbound.applyClientMeta(meta, entry.clientMeta)
 plugins/telegram-http/tg-fetch.ts::export class TelegramFetch {
