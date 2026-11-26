@@ -1,7 +1,11 @@
 // WO-169 part 2 (Chiron 00:29Z; Onsen contract v1 §3): the composition that gives the status record also gives the observation, from the verdict and the
 // program's facts, per Chiron's table. Every observation here passes the contract's Status rules (test-fixtures/status-v1-check.ts, the part of
-// rescue-site/onsen-ui/fixtures/v1/validate.py this daemon observes). Synthetic screens only.
+// rescue-site/onsen-ui/fixtures/v1/status_v1_check.py this daemon observes; and that file itself at the end, when it is here). Synthetic screens only.
 import { describe, expect, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { Since, composeRecord, regions, type RecordFacts, type ScreenVerdict, type TurnFact } from './screen-status.ts'
 import { DeliveryFacts, LanesTap, TurnWatch, type StatusView } from './onsen-status.ts'
 import { checkObservation } from './test-fixtures/status-v1-check.ts'
@@ -16,9 +20,11 @@ const prog = (state: StatusView['state'], detail: Record<string, unknown> = {}):
 const TURN: TurnFact = { id: 'p-1', started_at: '2026-11-26T00:58:00.000Z', trigger: { kind: 'message', conversation_id: '1828173984', message_id: '9001' } }
 const TOOL = { turn_started_at: TURN.started_at, tool: { name: 'Bash', since: '2026-11-26T00:59:30.000Z' }, subagents: 0 }
 const F = (o: RecordFacts = {}): RecordFacts => ({ now: NOW, session_id: 'sess-1', queue: { pending: 1, unread_by_member: 0 }, ...o })
+const ALL: unknown[] = []                                   // every observation made here, for Chiron's own checker at the end
 const obs = (v: ScreenVerdict | null, st: any, p: StatusView, f: RecordFacts = F()) => {
   const r = composeRecord(v, st, p, f)
   expect(checkObservation(r.observation)).toEqual([])
+  ALL.push(JSON.parse(JSON.stringify(r.observation)))
   return r.observation
 }
 const main = (o: any) => o.sessions.find((s: any) => s.kind === 'main')
@@ -166,6 +172,29 @@ describe('the program facts behind turn, trigger and last_turn', () => {
     r.tap.journal({ rec: 'msg', id: 'm702', kind: 'joey', notif: { params: { meta: { chat_id: '1828', message_id: 'm702' } } }, ts: 'x' } as any, { state: 'bound', prompt_id: 'p10', via_pull: true })
     expect(r.tap.turnFacts()!.trigger).toEqual({ kind: 'other' })
   })
+  test("a turn that goes on after its Stop (another Stop hook held it; chiron 01:23–01:42Z, Chiron WO-169 01:47Z B): never its own last_turn", () => {
+    const r = tapRig()
+    const o = () => { const t = r.tap.turnFacts()                           // as server.ts recordFacts() hands them over
+      return obs(V('working'), ST, prog('busy', TOOL), F({ turn: t && { id: t.id, started_at: t.started_at, trigger: t.trigger }, turn_thread: t?.thread ?? null, last_turn: r.tap.lastTurn() })) }
+    r.main('in_turn', 'p0', '2026-11-26T01:20:00.000Z'); r.main('idle', null, '2026-11-26T01:21:00.000Z')
+    r.bind('joey', 'p1', 'm1'); r.main('in_turn', 'p1', '2026-11-26T01:23:39.000Z')
+    r.main('idle', null, '2026-11-26T01:27:00.000Z')                         // the Stop: as far as anyone can tell then, p1 ended
+    expect(r.tap.lastTurn()).toEqual({ id: 'p1', outcome: 'done', ended_at: '2026-11-26T01:27:00.000Z' })
+    r.main('in_turn', 'p1', '2026-11-26T01:27:08.000Z')                      // lanes-main continueTurn: the same prompt runs again
+    expect(main(o())).toMatchObject({ activity: 'running', turn: { id: 'p1', started_at: '2026-11-26T01:23:39.000Z' },
+      last_turn: { id: 'p0', outcome: 'done', ended_at: '2026-11-26T01:21:00.000Z' } })   // obs(): the contract's rule holds (checkObservation)
+    r.main('idle', null, '2026-11-26T01:42:00.000Z')                         // its real end
+    expect(r.tap.lastTurn()).toEqual({ id: 'p1', outcome: 'done', ended_at: '2026-11-26T01:42:00.000Z' })
+    r.main('in_turn', 'p2', '2026-11-26T01:43:00.000Z')
+    expect(main(o()).last_turn).toEqual({ id: 'p1', outcome: 'done', ended_at: '2026-11-26T01:42:00.000Z' })
+    // the first turn of the daemon's life goes on: no turn before it, no last_turn
+    const q = tapRig()
+    q.main('in_turn', 'p5', '2026-11-26T01:50:00.000Z'); q.main('idle', null, '2026-11-26T01:50:30.000Z'); q.main('in_turn', 'p5', '2026-11-26T01:50:31.000Z')
+    expect(q.tap.lastTurn()).toBeNull()
+    const bad = o(), m = main(bad)
+    m.turn = { ...m.turn, id: 'p1' }                                        // what chiron showed at 01:37Z: the checker's port catches it
+    expect(checkObservation(bad)).toEqual(['sess-1: the open turn p1 is also last_turn'])
+  })
   test('lanes off: the transcript\'s turn, opened by the first Joey message it took in; turn_duration ends it as done', () => {
     const facts = new DeliveryFacts({ agent: 'adam', sink: () => {} })
     const w = new TurnWatch({ dir: () => null, facts, joey: (m: any) => m?.chat_id ? { chat: String(m.chat_id), id: String(m.message_id) } : null, changed: () => {} })
@@ -183,4 +212,18 @@ describe('the program facts behind turn, trigger and last_turn', () => {
     facts.inSession('1828', '2', 'main', new Date().toISOString()); facts.inSession('1828', '3', 'main', new Date().toISOString()); facts.seen('1828', '3', 'main', new Date().toISOString())
     expect(facts.counts()).toEqual({ pending: 1, unread_by_member: 1 })
   })
+})
+
+// the rules' one copy (Chiron WO-169 01:47Z: rescue-site/onsen-ui/fixtures/v1/status_v1_check.py, which validate.py calls), when it is on this machine:
+// every observation the tests above made passes it too (the tests run in order within this file)
+const CHECKER = join(homedir(), 'rescue-site', 'onsen-ui', 'fixtures', 'v1', 'status_v1_check.py')
+const PY = spawnSync('python3', ['-c', 'print(1)'], { encoding: 'utf8' }).status === 0
+test.skipIf(!PY || !existsSync(CHECKER))("every observation above passes Chiron's status_v1_check.py (--observation)", () => {
+  expect(ALL.length).toBeGreaterThan(20)
+  const prog = 'import json,sys,importlib.util\nspec=importlib.util.spec_from_file_location("c",sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n' +
+    'print(json.dumps([m.check_status(o,observation=True)[0] for o in json.load(sys.stdin)],ensure_ascii=False))'
+  const r = spawnSync('python3', ['-I', '-c', prog, CHECKER], { input: JSON.stringify(ALL), encoding: 'utf8', maxBuffer: 16 << 20 })
+  expect(r.status).toBe(0)
+  const got = JSON.parse(r.stdout) as string[][]
+  expect(got.map((p, i) => p.length ? { i, p, o: ALL[i] } : null).filter(Boolean)).toEqual([])
 })

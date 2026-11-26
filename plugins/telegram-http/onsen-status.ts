@@ -353,6 +353,8 @@ export class LanesTap {
   private lead: string | null = null
   private leadOpen = true
   private last: { id: string; outcome: TurnOutcome; ended_at: string } | null = null
+  /** the turn that ended before `last`: `last` again when the turn `last` names goes on (a Stop that was not its end) */
+  private before: { id: string; outcome: TurnOutcome; ended_at: string } | null = null
   private failed = false
   /** WO-172: each prompt's bound items (M1 row ids) and their message ids (bound), the outcome its first ending line gave, how many facts it gave */
   private boundOf = new Map<string, { rows: Set<string>; ids: string[]; ending: TurnOutcome | null; facts: number }>()
@@ -452,7 +454,15 @@ export class LanesTap {
         this.subagents = 0
         F.flushLater('main')                                                      // a new prompt: the last turn's Stop was its end
       }
-      else if (row.state === 'in_turn' && row.prompt_id && row.prompt_id === this.turn?.prompt && !this.open) this.open = true   // the same turn went on
+      else if (row.state === 'in_turn' && row.prompt_id && row.prompt_id === this.turn?.prompt && !this.open) {
+        // the same turn went on (another Stop hook held its Stop: lanes-main continueTurn): it never ended. An open turn is never its own last_turn,
+        // last_turn goes back to the one before it (Chiron WO-169 01:47Z B; chiron 01:27Z: turn and last_turn both 1dbb40a3…), and how it ended is
+        // decided again at its real end (WO-172: that Stop's turn_end facts were taken back, turn_continued)
+        this.open = true
+        if (this.last?.id === this.turn.prompt) this.last = this.before
+        const b = this.boundOf.get(this.turn.prompt)
+        if (b) { b.ending = null; b.facts = 0 }
+      }
       if (row.state !== 'in_turn') {
         this.tool = null; this.subagents = 0
         if (this.open && this.turn) this.closeTurn(line.ended_by === 'interrupted' ? 'interrupted' : row.state === 'walled' || this.failed ? 'failed' : 'done', row.ts)
@@ -467,6 +477,7 @@ export class LanesTap {
   private closeTurn(fallback: TurnOutcome, at: string): void {
     const p = this.turn!.prompt, b = this.boundOf.get(p)
     const outcome = b?.ending ?? fallback
+    if (this.last?.id !== p) this.before = this.last
     this.last = { id: p, outcome, ended_at: at }
     this.ended({ session: 'main', turn_id: p, outcome, bound: [...(b?.ids ?? [])], ended_at: at, facts: b?.facts ?? 0 })
   }

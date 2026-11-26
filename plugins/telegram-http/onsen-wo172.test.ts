@@ -79,6 +79,22 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     expect(r.tap.lastTurn()).toMatchObject({ id: 'p4', outcome: 'failed' })
     expect(r.ended.at(-1)).toMatchObject({ outcome: 'failed', bound: ['693'] })
   })
+  test('a turn that went on after its Stop (another Stop hook held it) is decided at its real end: the Stop\'s done is taken back, last_turn stays on the turn before', () => {
+    const r = rig()
+    r.main('in_turn', 'p5', '2026-11-26T02:04:50.000Z'); r.main('idle', null, '2026-11-26T02:04:55.000Z')
+    const j = r.item('m6', 'joey', '696')
+    r.line(j, 'bound', { prompt_id: 'p6' }); r.main('in_turn', 'p6', '2026-11-26T02:05:00.000Z')
+    r.line(j, 'done', { prompt_id: 'p6' }); r.main('idle', null, '2026-11-26T02:05:09.000Z')        // the Stop
+    expect(r.tap.lastTurn()).toMatchObject({ id: 'p6', outcome: 'done' })
+    r.main('in_turn', 'p6', '2026-11-26T02:05:12.000Z'); r.line(j, 'bound', { reason: 'turn_continued' })   // lanes-main continueTurn
+    expect(r.tap.lastTurn()).toMatchObject({ id: 'p5', outcome: 'done' })
+    r.event({ event: 'StopFailure', error: 'server_error' })
+    r.line(j, 'queued', { reason: 'stop_failure:server_error', prompt_id: null }); r.main('idle', null, '2026-11-26T02:05:40.000Z')
+    r.facts.flushLater()
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '696', detail: { outcome: 'failed', bound: ['696'] } })])   // one fact, the real end's
+    expect(r.ended.at(-1)).toEqual({ session: 'main', turn_id: 'p6', outcome: 'failed', bound: ['696'], ended_at: '2026-11-26T02:05:40.000Z', facts: 1 })
+    expect(r.tap.lastTurn()).toEqual({ id: 'p6', outcome: 'failed', ended_at: '2026-11-26T02:05:40.000Z' })
+  })
   test("a lane's run is its turn: a colleague's call alone gives no fact (Onsen takes delivery facts for Telegram messages only) but its turn ends with its msg id bound", () => {
     const r = rig()
     const call = { id: 'mesh-71005', source: 'mesh', from: 'eve', btcc_msg_id: '71005', meta: { user: 'eve' } }

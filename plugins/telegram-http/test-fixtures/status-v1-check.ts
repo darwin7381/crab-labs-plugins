@@ -1,4 +1,5 @@
-// WO-169 part 2: the rules of Onsen contract v1 §3 (rescue-site/onsen-ui/fixtures/v1/validate.py, its Status part) for what this daemon observes.
+// WO-169 part 2: the rules of Onsen contract v1 §3 (rescue-site/onsen-ui/fixtures/v1/status_v1_check.py, the one copy validate.py calls) for what this
+// daemon observes.
 // Left out, as Onsen adds them or they need its data: valid_until, rollup, phrase / line, action_id's Action and the member / thread / message
 // references. Returns the list of what is wrong ([] = it passes).
 const KEYS = 'presence presence_reason lifecycle main_session_id sessions background queue last_activity_at reported_at evidence'
@@ -46,6 +47,8 @@ export function checkObservation(s: any): string[] {
       const tr = x.turn?.trigger
       check(['message', 'thread', 'schedule', 'other'].includes(tr?.kind), `trigger ${tr?.kind}`)
       if (tr) keys(tr, ({ message: 'kind conversation_id message_id', thread: 'kind thread_id', schedule: 'kind', other: 'kind' } as Record<string, string>)[tr.kind] ?? 'kind', `${x.id} trigger`)
+      // status_v1_check.py 11-26 01:38Z (Chiron WO-169 01:47Z B): the open turn is not over, so it is not last_turn
+      if (x.last_turn) check(x.last_turn.id !== x.turn?.id, `${x.id}: the open turn ${x.turn?.id} is also last_turn`)
     }
     if (x.activity === 'running') check(!x.blockers?.length && x.doing !== null, `${x.id}: running with a blocker or without doing`)
     else if (x.activity === 'paused' || x.activity === 'stuck') {
