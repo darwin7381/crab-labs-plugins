@@ -4896,6 +4896,12 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-169 part 2 (Chiron 00:29Z): the same composition also gives the observation (Onsen contract v1 §3) from the program's facts: the main's session,
   // its open turn and what opened it, its last turn, its queue, which menus the duty officer takes on this pane
   const sinceMem = new Since()
+  // the limit message of a wall usage_wall.py cleared after the newest limit it found in the transcript (screen-status.ts recordView)
+  const clearedLimitText = (): string | null => {
+    let w: WallState | null = null
+    try { w = wallReader.state() } catch { return null }
+    return w && !w.walled && w.text && w.clearedMs != null && w.clearedMs >= (w.lastWallMs ?? w.sinceMs ?? Infinity) ? w.text : null
+  }
   const recordFacts = (): RecordFacts => {
     const now = Date.now()
     const t = tap ? tap.turnFacts() : watch?.turnFacts() ?? null
@@ -4909,7 +4915,8 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
       // WO-180 (Chiron 04:42Z): who a menu waits on (screen-status.ts assigned): the duty officer while it watches the pane, the person it asked once it
       // asked (that question's Action), a permission prompt the person it went to on Telegram; the person is access.json's, as the Actions' assignees
       dutyWatches: !!ownTmux && !!dutyOfficer?.handles(ownTmux), person: mainPerson(),
-      asked: m => ownTmux && dutyOfficer ? dutyOfficer.openAskFor(ownTmux, m) : null, actionFor: m => openActionFor(m) }   // WO-176: actionFor
+      asked: m => ownTmux && dutyOfficer ? dutyOfficer.openAskFor(ownTmux, m) : null, actionFor: m => openActionFor(m),   // WO-176: actionFor
+      cleared_limit_text: clearedLimitText() }
   }
   onsenStatusCompute = currentStatus                                    // WO-157 / WO-169: the lanes' one state source (decideWake, 此刻, the same-matter gate, the Esc wrap-up)
   // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's

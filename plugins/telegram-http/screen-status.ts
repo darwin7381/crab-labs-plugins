@@ -252,6 +252,9 @@ export type Observation = { presence: 'online' | 'offline'; presence_reason: nul
   evidence: { source: 'classifier' | 'runtime'; confidence: number | null } }
 /** what the program knows beside statusOf's view and the screen, for the record and its observation */
 export type RecordFacts = {
+  /** the text of a limit the program (usage_wall.py's state) cleared after the newest limit message in the transcript: that same text still on the
+   *  screen is the cleared wall's, not a new one (11-26 07:13Z: chiron, eurymedon, angelia held as walled for 20 min after probe_after_switch) */
+  cleared_limit_text?: string | null
   /** the main's pane runs Claude Code (the reader's last look); null: not looked at */
   alive?: boolean | null
   /** now (ms): reported_at, and the moment a since begins */
@@ -332,6 +335,7 @@ export function programVerdict(st: Regions): ScreenVerdict | null {
   const a = screenActivity(st)
   return a.busy ? { state: a.compacting ? 'compacting' : 'working', menu: 'none', p: 1, by: 'program' } : null
 }
+const flat = (s: string): string => s.replace(/\s+/g, ' ').trim()
 function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts): StatusView {
   if (gone(prog)) return programView(prog)
   const v = judged ?? (st ? programVerdict(st) : null)
@@ -347,6 +351,12 @@ function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: Stat
   const c = st.counted_by_program
   const out = (state: StatusView['state'], detail: Record<string, unknown>): StatusView => ({ state, detail: { ...detail, ...J }, last_activity_at: prog.last_activity_at ?? null })
   if (registering || v.state === 'starting') return out('starting', { ...base })
+  // the wall is the program's (WO-168 layer table). The screen's usage_limit (WO-177 二: the limit message is the latest output) stands for a wall the
+  // program missed, never for one it cleared: the same message is still the latest output until the next turn, and every delivery is held while the
+  // record says walled, so that turn never comes (11-26 07:13Z, three agents)
+  const clearedOnScreen = v.state === 'usage_limit' && !pd.walled && !!f.cleared_limit_text
+    && flat(`${st.above_input_box ?? ''}\n${st.screen_bottom ?? ''}`).includes(flat(f.cleared_limit_text))
+  if (clearedOnScreen) return out('idle', { ...base, cleared_limit_on_screen: true })
   if (v.state === 'usage_limit' || pd.walled) return out('walled', { ...base, walled: { until: pd.walled?.until ?? null, ...(pd.walled?.kind ? { kind: pd.walled.kind } : {}) } })
   if (v.state === 'waiting_for_human') {
     const text = st.has_input_box ? st.above_input_box ?? '' : st.screen_bottom ?? ''

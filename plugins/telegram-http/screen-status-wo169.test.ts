@@ -171,6 +171,18 @@ describe('2 the composition order: offline → starting → usage limit → wait
         detail: { queued_joey: 0, walled: wall.walled, judged_by: 'jev', judge_p: 0.9 }, last_activity_at: '2026-11-26T02:59:00.000Z' })
     expect(publishView(V('usage_limit', 0.9, 'usage_limit_options'), st, prog('idle'))).toMatchObject({ state: 'walled', detail: { walled: { until: null } } })
   })
+  test("a limit the program cleared, still the latest output on the screen, is not a wall (11-26 07:13Z: three agents held as walled after probe_after_switch)", () => {
+    const lim = regions(LIMIT_SCREEN)
+    const cleared = "You've hit your session limit · resets 5am (UTC)"
+    expect(publishView(V('usage_limit', 0.9, 'usage_limit_options'), lim, prog('idle'), { cleared_limit_text: cleared })).toMatchObject({ state: 'idle', detail: { cleared_limit_on_screen: true } })
+    // a different limit message is a new wall the program may have missed: the screen's verdict stands
+    expect(publishView(V('usage_limit', 0.9, 'usage_limit_options'), lim, prog('idle'), { cleared_limit_text: "You've hit your weekly limit · resets Dec 2 at 3pm (Asia/Taipei)" })).toMatchObject({ state: 'walled' })
+    // no cleared wall known: as before
+    expect(publishView(V('usage_limit', 0.9, 'usage_limit_options'), lim, prog('idle'))).toMatchObject({ state: 'walled' })
+    // the program's own wall always wins
+    const wall = { walled: { until: '2026-11-26T05:00:00.000Z', kind: 'session' } }
+    expect(publishView(V('usage_limit', 0.9, 'usage_limit_options'), lim, prog('idle', wall), { cleared_limit_text: cleared })).toMatchObject({ state: 'walled' })
+  })
   test('offline: the process gone is statusOf\'s view whatever the verdict; a session this daemon cannot see is the screen\'s, with the reason', () => {
     for (const s of VERDICT_STATES) expect(publishView(V(s), st, prog('offline', { reason: 'pid_gone' }))).toEqual(programView(prog('offline', { reason: 'pid_gone' })))
     expect(publishView(V('idle'), st, prog('offline', { reason: 'not_connected' }))).toMatchObject({ state: 'idle', detail: { program_offline: 'not_connected' } })

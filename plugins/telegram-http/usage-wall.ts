@@ -38,6 +38,8 @@ export type WallState = {
   key: string
   sinceMs: number | null
   clearedMs: number | null
+  /** the newest limit message usage_wall.py found in the transcript (last_transcript_wall, else last_wall_at) */
+  lastWallMs: number | null
 }
 
 /** Which state file is this daemon's: any of tmux == CHANNEL_BOT_TMUX_SESSION, agent == AGENT_INBOX_SELF,
@@ -64,6 +66,7 @@ function toState(st: any, key: string): WallState {
     walled: st.in_wall === true, episode: st.episode, since: str(st.since), kind: str(st.kind), text: str(st.text),
     resets_at: str(st.resets_at), cleared_at: str(st.cleared_at), cleared_by: str(st.cleared_by), agent: str(st.agent),
     tmux: str(st.tmux), session: str(st.session), key, sinceMs: toMs(st.since), clearedMs: toMs(st.cleared_at),
+    lastWallMs: toMs(st.last_transcript_wall) ?? toMs(st.last_wall_at),
   }
 }
 
