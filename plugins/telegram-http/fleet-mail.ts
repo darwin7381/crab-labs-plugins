@@ -122,13 +122,13 @@ export const FLEET_TOOLS = [
   },
   {
     name: 'feed_ask',
-    description: '問牆。一句話寫你要處理什麼；跟它有關、你還沒讀過的貼文全文直接給你，給了就算讀過。',
+    description: '問牆。一句話寫你要處理什麼；跟它有關、你還沒讀過的貼文會給你：少的直接給全文（給了就算讀過）；多的先給一行一則的短卡，要讀哪幾則用 feed_open 打開（打開才算讀過）。',   // WO-167 (Chiron 01:14Z, his words)
     inputSchema: {
       type: 'object',
       required: ['about'],
       properties: {
         about: { type: 'string', description: '一句話：你要處理什麼，或想知道什麼。例：「要改 Cloudflare 上 ton 開頭那幾個網域的設定」' },
-        cursor: { type: 'string', description: '選填：上一次 feed_ask 給的 cursor，看下一頁短卡（about 照填）' },   // WO-167 section four (c)
+        cursor: { type: 'string', description: '看下一頁短卡時帶上一頁給的那個值。' },   // WO-167 section four (c); words: Chiron 01:14Z
       },
     },
   },
@@ -275,8 +275,11 @@ function card(p: any): string {
   return extra.length ? `${s}\n　${extra.join('　')}` : s
 }
 
+/** WO-167 (Chiron 01:14Z item 18): the full text's first line is the post's own `line`, the same as on the card route, so a post has one
+ *  number and one way of writing time. An Onsen that doesn't send `line` yet: the old card. */
 function full(p: any): string {
-  return `${card(p)}\n\n${p.body}${p.links?.length ? `\n${p.links.join('\n')}` : ''}`
+  const head = typeof p.line === 'string' && p.line.trim() ? p.line : card(p)
+  return `${head}\n\n${p.body}${p.links?.length ? `\n${p.links.join('\n')}` : ''}`
 }
 
 const ASK_TIMEOUT_MS = 20000

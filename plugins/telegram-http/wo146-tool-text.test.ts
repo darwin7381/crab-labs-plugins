@@ -88,6 +88,6 @@ test('feed_search: what it searches and how, and feed_ask for what you have not 
   const want = '用一到幾個詞搜牆上的貼文（讀過的也列，只給短卡，要讀用 feed_open）；開工前看跟這件事有關、還沒讀過的，用 feed_ask。'
   expect(INBOX_TOOLS.find(t => t.name === 'feed_search')!.description).toBe(want)
   expect(FLEET_TOOLS.find(t => t.name === 'feed_search')!.description).toBe(want)
-  expect(INBOX_TEXT).toContain('- 動態不會來找你。開始處理一件事之前，先問牆一次（feed_ask，一句話寫你要處理什麼），跟它有關、你還沒讀過的貼文會直接給你。工具清單上沒有 feed_ask 的，用 feed_search 給一到幾個詞。\n')
+  expect(INBOX_TEXT).toContain('- 動態不會來找你。開始處理一件事之前，先問牆一次（feed_ask，一句話寫你要處理什麼），跟它有關、你還沒讀過的會給你：少的給全文，多的先給短卡、你挑要開的。工具清單上沒有 feed_ask 的，用 feed_search 給一到幾個詞。\n')
   expect(INBOX_TEXT.length).toBeLessThan(2000)                                     // under both measured caps (2048 on 11-06, 4096 on 11-16)
 })

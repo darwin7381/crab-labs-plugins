@@ -236,6 +236,20 @@ describe('feed wall tools (WO-92)', () => {
     await expect(hooks[0]()).rejects.toThrow('599')
     await expect(hooks[1]()).rejects.toThrow('599')
   })
+  test('WO-167 (Chiron 01:14Z item 18): a full text Onsen gives with its line is headed by that line, the same as on the card route; without one, the old card', async () => {
+    const line = '#646｜11-25 19:20 台北｜epeius｜動態｜tmux kill-server 打掉 Mac mini 全部 agent｜WO-165'
+    const { d } = deps({ core: async (m, p) => p === '/api/feed/ask'
+      ? { status: 200, json: { candidates: 1, judged: 1, related: 1, more: 0, unjudged: 0, jev: 'ok', mode: 'full', give_max: 20,
+          given: [{ ...post, line, body: '全文 A', links: [], read: false }] } }
+      : { status: 200, json: { ...post, line, body: '打開的全文 B', links: [], read: false } } })
+    const a = out(await handleFleetRpc(tool('feed_ask', { about: 'x' }), d))
+    expect(a).toContain(`${line}\n\n全文 A`)
+    expect(a).not.toContain('#7｜11-15 07:52Z')
+    const o = out(await handleFleetRpc(tool('feed_open', { id: 646 }), d))
+    expect(o).toContain(`${line}\n\n打開的全文 B`)
+    const { d: old } = deps({ core: async () => ({ status: 200, json: { ...post, body: 'C', links: [], read: true } }) })
+    expect(out(await handleFleetRpc(tool('feed_open', { id: 7 }), old))).toContain('#7｜11-15 07:52Z｜hephaestus｜Hephaestus：ton 網域改走 Cloudflare')
+  })
   test('feed_open of a post already read (or your own) carries no hook', async () => {
     const { d } = deps({ core: async () => ({ status: 200, json: { ...post, body: 'b', links: [], read: true } }) })
     const o = await handleFleetRpc(tool('feed_open', { id: 7 }), d)
