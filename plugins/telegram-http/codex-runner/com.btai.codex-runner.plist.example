@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- codex-runner (WO-184 part 2): Codex's part in Onsen, on the Mac mini. See README.md beside this file.
+     Install: sed "s#__HOME__#$HOME#g" com.btai.codex-runner.plist.example > ~/Library/LaunchAgents/com.btai.codex-runner.plist
+     The program is the live plugin checkout's copy (updated by its git pull). ONSEN_BASE: the code's default unless set here. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.btai.codex-runner</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/.bun/bin/bun</string>
+		<string>run</string>
+		<string>__HOME__/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/codex-runner/codex-runner.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__HOME__/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/codex-runner</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>__HOME__/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>ONSEN_HOST</key>
+		<string>macmini</string>
+		<key>CODEX_RUNNER_CREDENTIAL_FILE</key>
+		<string>__HOME__/.config/mesh/codex.credential</string>
+		<key>CODEX_RUNNER_ROOT</key>
+		<string>__HOME__/onsen-codex</string>
+		<key>CODEX_RUNNER_MAX</key>
+		<string>3</string>
+		<key>CODEX_RUNNER_TIMEOUT_S</key>
+		<string>1800</string>
+		<key>CODEX_BIN</key>
+		<string>/opt/homebrew/bin/codex</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<!-- the codex runs live in their own process groups; a restart of the runner leaves them running and the next start follows them -->
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__HOME__/onsen-codex/.runner/launchd.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/onsen-codex/.runner/launchd.err.log</string>
+</dict>
+</plist>
