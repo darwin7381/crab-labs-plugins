@@ -254,3 +254,5 @@ plugins/telegram-http/server.ts::async function connectorFile(fileId: string): P
 plugins/telegram-http/server.ts::if (!c && connectorNow() && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`
 plugins/telegram-http/onsen-inbound.ts::export function clientMetaOf(client: unknown): Record<string, string> | null {
 plugins/telegram-http/server.ts::for (const [k, v] of Object.entries(f.clientMeta ?? {})) if (!(k in meta)) meta[k] = v
+plugins/telegram-http/onsen-inbound.ts::export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
+plugins/telegram-http/server.ts::...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),

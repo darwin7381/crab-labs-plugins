@@ -97,6 +97,9 @@ export function clientMetaOf(client: unknown): Record<string, string> | null {
   }
   return Object.keys(out).length ? out : null
 }
+/** WO-197 (lab 1007): the name a file is stored under in Onsen when the person's Telegram message gave it none: Telegram's own, the last part of its
+ *  file path (voice/file_7.oga → file_7.oga; onsen-files.ts telegramFile). Not a name the person gave: no attachment_name on the tag */
+export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
 export type InItem = OnsenItem & { deliver: true }
 export type Job = { key: string; item: InItem; at: number; tries: number; held: boolean; topic?: number }
 /** point 8: an edit event (POST /events) of the message `of`, written after that message (it waits behind it in the same queue) */

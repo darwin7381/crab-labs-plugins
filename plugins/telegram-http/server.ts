@@ -5774,8 +5774,13 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
 function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts {
   const c = p.client ?? {}
   const atts: any[] = Array.isArray(p.attachments) ? p.attachments.filter((a: unknown) => a && typeof a === 'object') : []
-  const a = atts[0], kind = String(p.kind ?? 'text'), text = String(p.text ?? ''), voice = kind === 'voice'
-  const label: Record<string, string> = { photo: '(photo)', voice: '(voice message)', video: '(video)', sticker: '(sticker)', document: `(document: ${safeName(a?.name ?? undefined) ?? 'file'})` }
+  const a = atts[0], kind = String(p.kind ?? 'text'), text = String(p.text ?? ''), voice = kind === 'voice', sticker = kind === 'sticker'
+  // WO-197 (lab 1007): attachment_name only where the path before has one, the file_name of the person's message (a document, an audio file, a video, an
+  // animation; message:document / :audio / :video / :animation). A voice note, a video note, a sticker carry none, and what the bridge stores a nameless
+  // file under is Telegram's own file_<n>.<ext> (the file path's last part: a voice note's file_7.oga), not a name: left out. A sticker's name in Onsen
+  // is its emoji, which the path before puts in the text: (sticker 👍); a sticker is never a photo, and has no mime (Telegram gives none)
+  const name = a?.name != null && String(a.name) !== '' && !OnsenInbound.TG_OWN_FILE_NAME.test(String(a.name)) ? safeName(String(a.name)) : undefined
+  const label: Record<string, string> = { photo: '(photo)', voice: '(voice message)', video: '(video)', sticker: `(sticker${name ? ` ${name}` : ''})`, document: `(document: ${name ?? 'file'})` }
   const rfm: Record<string, string> = {}
   const rt = p.reply_to
   if (rt?.client_msg_id != null) {
@@ -5789,7 +5794,7 @@ function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts
     if (p.forward_date && Number.isFinite(Date.parse(p.forward_date))) rfm.forward_date = new Date(p.forward_date).toISOString()
   }
   if (p.media_group_id) rfm.media_group_id = String(p.media_group_id)
-  const photo = !!a && (a.kind === 'photo' || /^image\//i.test(String(a.mime ?? '')))
+  const photo = !!a && !sticker && (a.kind === 'photo' || /^image\//i.test(String(a.mime ?? '')))
   const tg = a?.client_ref ? String(a.client_ref) : ''
   const size = Number.isFinite(Number(a?.bytes)) && a?.bytes != null ? Number(a.bytes) : undefined
   const date = Math.floor(Date.parse(String(p.sent_at ?? '')) / 1000)
@@ -5797,8 +5802,8 @@ function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts
     chat_id: chat, ...(/^\d+$/.test(ref) ? { msgId: Number(ref) } : {}), text: voice ? '(voice message)' : text || label[kind] || '',
     from: { id: Number(c.user_id) || 0, ...(c.user != null && String(c.user) !== String(c.user_id) ? { username: String(c.user) } : {}) }, date: Number.isFinite(date) ? date : 0,
     ...(photo && tg ? { image: { file_id: tg, file_unique_id: `onsen-${String(p.message_id).replace(/\D/g, '')}`, ...(size != null ? { size } : {}) } } : {}),
-    ...(a && !photo && tg ? { attachment: { kind: voice ? 'voice' : String(a.kind || kind), file_id: tg, ...(size != null ? { size } : {}),
-      ...(a.mime ? { mime: String(a.mime) } : {}), ...(a.name ? { name: safeName(String(a.name))! } : {}) } } : {}),
+    ...(a && !photo && tg ? { attachment: { kind: voice ? 'voice' : sticker ? 'sticker' : String(a.kind || kind), file_id: tg, ...(size != null ? { size } : {}),
+      ...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
     ...(a && !tg && a.url ? { onsenFiles: [a] } : {}),
     fromReply: false, ...(voice && text ? { voiceTranscript: metaExcerpt(text, 500) } : {}),
     ...(c.thread != null && /^\d+$/.test(String(c.thread)) ? { inTopic: Number(c.thread) } : {}),

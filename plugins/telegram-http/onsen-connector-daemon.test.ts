@@ -193,3 +193,35 @@ test('11. client.meta (the bridge\'s client_meta): every key an attribute of the
   expect(Object.keys(withMeta).slice(-2)).toEqual(['a', 'b'])
   expect(Object.keys(withMeta).filter(k => !(k in without)).sort()).toEqual(['a', 'b'])
 })
+
+test('12. attachment_name as the path before has it: a voice note, a video note and a sticker carry none (Onsen\'s file_7.oga is Telegram\'s own name); a PDF, an audio file keep theirs', async () => {
+  const base = { conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', reply_to: null, sent_at: new Date().toISOString() }
+  const cl = (n: string) => ({ name: 'telegram', chat: String(JOEY), msg_id: n, user: 'joey', user_id: String(JOEY) })
+  const url = `http://127.0.0.1:${onsen.port}/api/onsen/v1/files/`
+  const sent: Array<[string, Record<string, unknown>]> = [
+    ['1021', { kind: 'voice', text: '', attachments: [{ kind: 'voice', name: 'file_7.oga', mime: 'audio/ogg', bytes: 4, url: url + 'v', client_ref: 'AwVoice1' }] }],
+    ['1022', { kind: 'video', text: '', attachments: [{ kind: 'video', name: 'file_9.mp4', mime: 'video/mp4', bytes: 4, url: url + 'n', client_ref: 'DQNote1' }] }],
+    ['1023', { kind: 'sticker', text: '', attachments: [{ kind: 'photo', name: '👍', mime: 'image/webp', bytes: 4, url: url + 's', client_ref: 'CAStick1' }] }],
+    ['1024', { kind: 'document', text: '', attachments: [{ kind: 'document', name: 'r.pdf', mime: 'application/pdf', bytes: 4, url: url + 'p', client_ref: 'BQDoc2' }] }],
+    ['1025', { kind: 'voice', text: '', attachments: [{ kind: 'voice', name: 'song.mp3', mime: 'audio/mpeg', bytes: 4, url: url + 'a', client_ref: 'CQAudio1' }] }],
+  ]
+  for (const [i, [n, p]] of sent.entries()) expect(await person({ ...base, ...p, message_id: String(6021 + i), client: cl(n) }, 21 + i)).toBe(200)
+  expect(await until(() => sent.every(([n]) => got.some(g => g.meta.message_id === n)), 8000)).toBe(true)
+  const tag = (n: string) => got.find(g => g.meta.message_id === n)!
+  const voice = tag('1021').meta
+  expect(voice.attachment_kind).toBe('voice')
+  expect(voice.attachment_file_id).toBe('AwVoice1')
+  expect(voice.attachment_mime).toBe('audio/ogg')
+  expect('attachment_name' in voice).toBe(false)
+  expect(tag('1021').content).toBe('(voice message)')
+  expect('attachment_name' in tag('1022').meta).toBe(false)
+  const st = tag('1023')
+  expect(st.meta.attachment_kind).toBe('sticker')
+  expect(st.meta.attachment_file_id).toBe('CAStick1')
+  expect('attachment_name' in st.meta || 'attachment_mime' in st.meta || 'image_path' in st.meta).toBe(false)
+  expect(st.content).toBe('(sticker 👍)')
+  expect(tag('1024').meta.attachment_name).toBe('r.pdf')
+  expect(tag('1024').content).toBe('(document: r.pdf)')
+  expect(tag('1025').meta.attachment_name).toBe('song.mp3')
+  expect(api.calls).toEqual([]); expect(api.downloads).toEqual([])
+})
