@@ -90,7 +90,7 @@ import * as OnsenAttach from './onsen-attachments.ts'
 import * as OnsenFiles from './onsen-files.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
-import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
+import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
@@ -1233,7 +1233,8 @@ function onWallChange(prev: WallState | null, next: WallState | null): void {
   wallHeldKeys = new Set()
   heldSidecar.update(next, true)            // the clear: what is held, snapshotted before anything drains
   log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh (as before WO-120)'} — delivering the held items once each, in order`)
-  // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now)
+  // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now);
+  // WO-175 item 3: and the main's items M1 held for the wall are offered in this step (lanes.ts usageWallChanged)
   if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
   setImmediate(() => { sweepDeliveries(); void drainPendingIfLive() })
 }
@@ -5023,11 +5024,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // its open turn and what opened it, its last turn, its queue, which menus the duty officer takes on this pane
   const sinceMem = new Since()
   // the limit message of a wall usage_wall.py cleared after the newest limit it found in the transcript (screen-status.ts recordView)
-  const clearedLimitText = (): string | null => {
-    let w: WallState | null = null
-    try { w = wallReader.state() } catch { return null }
-    return w && !w.walled && w.text && w.clearedMs != null && w.clearedMs >= (w.lastWallMs ?? w.sinceMs ?? Infinity) ? w.text : null
-  }
+  const clearedLimitText = (): string | null => { try { return clearedLimitTextOf(wallReader.state()) } catch { return null } }
   const recordFacts = (): RecordFacts => {
     const now = Date.now()
     const t = tap ? tap.turnFacts() : watch?.turnFacts() ?? null

@@ -3882,10 +3882,15 @@ function followUsageWall(why: 'probe' | 'clear', u: { walled: boolean; clearedMs
   armProbe(0)
   return 'probe'
 }
-/** server.ts onWallChange: the daemon's usage wall was walled and now is not (cleared, or its state no longer fresh: `state` null) */
+/** server.ts onWallChange: the daemon's usage wall was walled and now is not (cleared, or its state no longer fresh: `state` null). Everything the wall held
+ *  here goes on in this one step: the lanes' wall follows (WO-141 follow-up), and M1 is asked now for the main's items it held (WO-175 item 3): the
+ *  record it asks reads the cleared wall already (a cleared limit still on the screen is not a wall, 1.58.14), a gen the wall walled takes its one offer of
+ *  this clear (WO-120). Before, M1 heard of the clear only at the record's next change or its own tick; on 1.58.12 the record stayed walled until a /clear
+ *  redrew the screen (nestor 11-26: Call 401 held:wall 07:07:10Z, the clear 07:12:26Z, offered 07:25:31Z) */
 export function usageWallChanged(state: { walled: boolean; clearedMs: number | null; by: string | null } | null): void {
-  if (!S?.wall || D?.role !== 'tg') return
-  try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) }
+  if (D?.role !== 'tg') return
+  if (S?.wall) { try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) } }
+  if (main) { try { main.statusChanged() } catch (e) { D.log('warn', `lanes: the usage wall's clear to M1: ${e}`) } }
 }
 async function wallDown(by: string): Promise<void> {
   const w = S.wall

@@ -147,6 +147,12 @@ export class WallReader {
   }
 }
 
+/** 1.58.14: the limit message of a wall usage_wall.py cleared after the newest limit message it found in the transcript (the screen's verdict is not a wall
+ *  while that same message is still the latest output: screen-status.ts recordView); null: no such clear. The one rule; server.ts reads it for the record */
+export function clearedLimitTextOf(w: WallState | null): string | null {
+  return w && !w.walled && w.text && w.clearedMs != null && w.clearedMs >= (w.lastWallMs ?? w.sinceMs ?? Infinity) ? w.text : null
+}
+
 /** Did the wall eat a delivery made at atMs? True when the wall's episode overlaps [atMs, now] (it is walled now, or
  *  it cleared after atMs) and no genuine answer came between the delivery and the wall's start (newestGenuineMs, the
  *  consumption evidence the sweep already reads). Unknown state → false (as before). */
