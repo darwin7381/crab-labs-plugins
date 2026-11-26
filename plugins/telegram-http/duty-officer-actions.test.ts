@@ -148,7 +148,7 @@ describe('the duty officer\'s menus as Actions', () => {
     await r.advance(0)
     await r.advance(9000)
     await r.settle()
-    expect(r.keys).toEqual(['Enter'])
+    expect(r.keys).toEqual(['Enter', 'Enter'])                                                               // WO-97: unchanged after 15 s, the same key once more
     expect(f.ops()).toEqual(['open'])
     expect(r.sent).toHaveLength(1)
   })

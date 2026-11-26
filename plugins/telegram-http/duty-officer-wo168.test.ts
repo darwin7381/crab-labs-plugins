@@ -120,6 +120,22 @@ describe('the own pane through the record', () => {
   })
 })
 
+describe('text typed and left in the input box (rulings §2: a /clear with its completion list open)', () => {
+  test('the record says idle (the box is there); the officer reads that screen as it always did, so the model and its ruling still see it', async () => {
+    const typed = ['────────────────────────────────────────', '❯\u00a0/clear', '────────────────────────────────────────',
+      '  ❯ /clear                          Start a new session with empty context;', '                                    previous session stays on disk (resumable…',
+      '    /compact                        Clear conversation history but keep a summary', '    /config                         Open config panel',
+      '    /context                        Visualize current context usage', '    /cost                           Show the total cost and duration',
+      '    /doctor                         Diagnose and verify your installation', '    /exit                           Exit the REPL',
+      '    /export                         Export the conversation', '    /help                           Show help'].join('\n')
+    const r = rig({ screen: typed, onKey: (k, p) => { if (k === 'Enter') p.screen = IDLE },
+      model: () => ({ decision: decision({ what: '打好的 /clear', choose: '送出', options: [{ on_screen: '❯ /clear', means: '送出', button: '送出', keys: ['Enter'] }] }), meta: {}, fail: null }) })
+    await r.advance(0); await r.advance(9000)
+    expect(r.calls()).toBe(1); expect(r.keys).toEqual(['Enter'])
+    expect(r.log().find(e => e.event === 'pressed')).toMatchObject({ resolved: true })
+  })
+})
+
 describe('program rule: the usage-limit options (Chiron\'s rule, verbatim, as code)', () => {
   test('no model, no key, no leaning: the options as they are go to Joey with buttons and an Action; only his tap presses, and only that one; no ruling mail', async () => {
     const r = rig({ screen: fx('lab-limit-options-menu.txt'), onKey: (k, p) => { if (k === 'Enter') p.screen = IDLE } })

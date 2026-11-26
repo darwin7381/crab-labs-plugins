@@ -70,6 +70,8 @@ const SCRUB_ENV = ['CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSI
 export interface Limits {
   pollMs: number; stallMs: number; modelTimeoutMs: number; callsPerHour: number; callsPerTargetHour: number
   renotifyMs: number; maxChain: number; keyGapMs: number; verifyAfterMs: number; settleMaxMs: number
+  /** WO-97 (Chiron 07:46Z): after the keys the screen is looked at every changePollMs until it changes, up to changeWaitMs from the keys */
+  changeWaitMs: number; changePollMs: number
   claimFreshMs: number; attendedMs: number
 }
 /** WO-176 r4: DUTY_OFFICER_HOURLY_CAP_AGENTS (`agent:N[,agent:N…]`): this agent's hourly judging cap a pane (1–600), else null (the default) */
@@ -83,6 +85,8 @@ export function hourlyCapFor(value: string | undefined, agent: string): number |
 export const DEFAULT_LIMITS: Limits = {
   pollMs: 3000, stallMs: 8000, modelTimeoutMs: 60_000, callsPerHour: 30, callsPerTargetHour: 6,
   renotifyMs: 3_600_000, maxChain: 3, keyGapMs: 200, verifyAfterMs: 2000, settleMaxMs: 30_000,
+  // a /clear runs its start hooks first: claude-kot 11-26 07:22:21Z Enter → the screen changed at 07:22:34Z (13 s); the officer looked at 2 s only
+  changeWaitMs: 15_000, changePollMs: 1000,
   claimFreshMs: 30_000,
   // someone at the terminal (a tmux client pressed a key this recently): hands off. Same grace as modal-guard's
   // model-switch menu (ratelimit-modal-guard.sh :74); Chiron btcc 9592
@@ -1051,7 +1055,11 @@ export class DutyOfficer {
     const base = { hash: thash(lines), lines, info, pane: l.visible, full: l.text, screenHash: rec?.hash ?? null }
     if (!rec || !isClaudeCmd(l.cmd, extra)) return { ...base, state: classify(lines, info.cmd, extra), menu: null }
     const it = (rec.view.detail as Record<string, unknown> | undefined)?.input_typed
-    return { ...base, ...stateOfRecord(rec.view), typed: typeof it === 'boolean' ? it : null }
+    const r = stateOfRecord(rec.view)
+    // text typed and left in the input box (rulings §2: a /clear with its completion list open, nobody sending it) is not a state the record has: the
+    // record says idle (the box is there). The officer reads that screen as it always did, so its rulings for it stay as they are
+    if (r.state === 'IDLE' && it === true) return { ...base, state: classify(lines, info.cmd, extra), menu: null, typed: true }
+    return { ...base, ...r, typed: typeof it === 'boolean' ? it : null }
   }
 
   private async targets(cfg: Config): Promise<Target[]> {
@@ -1298,7 +1306,9 @@ export class DutyOfficer {
 
   /** Press `keys` if the screen is still the one that was judged; returns the screen afterwards. */
   /** WO-168: `screenHash`, the record's screen hash the decision was made on (the own pane): the screen must still be that one too */
-  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean, byJoey = false, screenHash: string | null = null): Promise<{ ok: false; now: Look; off?: boolean; attended?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number }> {
+  private async pressKeys(tmux: string, hash: string, keys: string[], dry: boolean, byJoey = false, screenHash: string | null = null): Promise<{ ok: false; now: Look; off?: boolean; attended?: boolean } | { ok: true; after: Look; leftMode: boolean; at: number
+    /** WO-97: the keys were sent a second time (the screen had not changed after the first) */
+    retried?: boolean; waitedMs?: number }> {
     if (!this.stillOn(tmux)) return { ok: false, now: null, off: true }
     // Joey's tap on a button is his decision, not the duty officer's: a person at the terminal does not hold it back
     if (!byJoey && await this.attended(tmux) != null) return { ok: false, now: null, attended: true }
@@ -1308,12 +1318,37 @@ export class DutyOfficer {
     let leftMode = false
     if (before.info.inMode) { await this.d.tmux.cancelMode(tmux); leftMode = true } // keys would go to copy mode
     const at = this.now()
-    for (let i = 0; i < keys.length; i++) {
-      if (i) await this.sleep(this.L.keyGapMs)
-      await this.d.tmux.sendKey(tmux, KEYMAP[keys[i]])
+    const send = async (): Promise<void> => {
+      for (let i = 0; i < keys.length; i++) {
+        if (i) await this.sleep(this.L.keyGapMs)
+        await this.d.tmux.sendKey(tmux, KEYMAP[keys[i]])
+      }
     }
+    await send()
+    // WO-97 (Chiron 07:46Z; claude-kot 11-26 07:18Z, ask 67ecdc67: a /clear's screen changed 13 s after the Enter, the officer looked once at 2 s and told
+    // Joey 「畫面沒變」): the screen is looked at until it changes, up to changeWaitMs. Unchanged, the screen is still the one judged: the same keys once
+    // more (the first may only have picked the completion), and the same wait; only then is it unchanged
+    const moved = (x: Look): boolean => !x || x.hash !== hash || x.state === 'IDLE' || x.state === 'WORKING' || (screenHash != null && x.screenHash !== screenHash)
+    let after = await this.waitForChange(tmux, moved)
+    let retried = false
+    if (after && !moved(after) && this.stillOn(tmux)) {
+      retried = true
+      if (after.info.inMode) await this.d.tmux.cancelMode(tmux)
+      await send()
+      after = await this.waitForChange(tmux, moved)
+    }
+    return { ok: true, after, leftMode, at, retried, waitedMs: this.now() - at }
+  }
+  /** WO-97: the screen after the keys: the first look verifyAfterMs later, then one every changePollMs until `moved` says it changed or changeWaitMs passed */
+  private async waitForChange(tmux: string, moved: (x: Look) => boolean): Promise<Look> {
+    const from = this.now()
     await this.sleep(this.L.verifyAfterMs)
-    return { ok: true, after: await this.look(tmux), leftMode, at }
+    let x = await this.look(tmux)
+    while (x && !moved(x) && this.now() - from < this.L.changeWaitMs) {
+      await this.sleep(this.L.changePollMs)
+      x = await this.look(tmux)
+    }
+    return x
   }
 
   private async press(t: Target, lk: NonNullable<Look>, appeared: number, step: number, d: Decision, keys: string[], bundle: Record<string, unknown>): Promise<void> {
@@ -1351,13 +1386,15 @@ export class DutyOfficer {
       await this.recordPress(t, lk, d, pane, r.at, appeared, bound)
       return
     }
-    const resolved = a.state === 'IDLE' || a.state === 'WORKING' || a.hash !== lk.hash
+    const resolved = a.state === 'IDLE' || a.state === 'WORKING' || a.hash !== lk.hash || (lk.screenHash != null && a.screenHash !== lk.screenHash)
     this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10,
-      left_copy_mode: r.leftMode, before_tail: lk.lines, after_tail: a.lines, after_state: a.state, resolved, to_joey_draft: d.to_joey })
+      left_copy_mode: r.leftMode, before_tail: lk.lines, after_tail: a.lines, after_state: a.state, resolved, to_joey_draft: d.to_joey,
+      ...(r.retried ? { retried: true } : {}), waited_s: Math.round((r.waitedMs ?? 0) / 100) / 10 })
     this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved })
     if (resolved) await this.recordPress(t, lk, d, pane, r.at, appeared, bound)
     if (!resolved) {
-      await this.askJoey(t, lk, bundle, d, 'pressed the keys, the screen did not change', keys)
+      await this.askJoey(t, lk, bundle, d, r.retried ? 'pressed the keys twice, the screen did not change' : 'pressed the keys, the screen did not change', keys,
+        { retried: !!r.retried, waitedS: Math.round((r.waitedMs ?? 0) / 1000) })
       return
     }
     if (a.state !== 'OTHER') return
@@ -1565,7 +1602,8 @@ export class DutyOfficer {
     return s
   }
 
-  private async askJoey(t: Target, lk: NonNullable<Look>, bundle: Record<string, unknown>, d: Decision, reason: string, pressed?: string[]): Promise<void> {
+  private async askJoey(t: Target, lk: NonNullable<Look>, bundle: Record<string, unknown>, d: Decision, reason: string, pressed?: string[],
+    how: { retried: boolean; waitedS: number } = { retried: false, waitedS: 0 }): Promise<void> {
     const options = (d.options ?? []).map(o => ({ button: String(o.button ?? '').trim() || String(o.on_screen ?? '?').slice(0, 20), keys: fixedKeys(o.keys), means: o.means,
       ...(o.on_screen ? { screen: String(o.on_screen).slice(0, 120) } : {}) }))
     const typing = options.filter(o => !o.keys).map(o => o.button)
@@ -1575,7 +1613,8 @@ export class DutyOfficer {
       ? String(d.to_joey).trim()
       : `${t.label}：${d.what}\n${d.why_now}\n沒人答會怎樣：${d.if_nobody_answers}\n建議選「${d.choose}」：${d.reason}`
     let text = `${note}\n\n（值班員・${t.label}・${this.host}）`
-    if (pressed) text += `\n我先按了 ${pressed.join(' ')}，畫面沒變，所以轉給你。`
+    if (pressed) text += how.retried ? `\n我先按了 ${pressed.join(' ')}，畫面沒變又按了一次，前後等了 ${how.waitedS} 秒畫面都沒變，所以轉給你。`
+      : `\n我先按了 ${pressed.join(' ')}，畫面沒變，所以轉給你。`
     if (typing.length) text += `\n要打字的選項沒有按鈕（${typing.join('、')}）：要選它的話跟 ${t.label} 說。`
     text += this.screenBlock(lk.lines, bundle)
     const ask = this.newAsk(t, lk, 'ask_joey', reason, text.slice(0, 3900), options, d, bundle)
@@ -1840,8 +1879,11 @@ export class DutyOfficer {
         this.actionCall(a, (acts, ref) => acts.cancel(ref, result))
       } else {
         const x = r.after
-        const resolved = !!x && (x.state === 'IDLE' || x.state === 'WORKING' || x.hash !== a.hash)
-        result = !x ? '按了，之後看不到畫面（可能重開了）' : resolved ? '按了，畫面已經往下走' : '按了，但畫面沒變'
+        const resolved = !!x && (x.state === 'IDLE' || x.state === 'WORKING' || x.hash !== a.hash || (a.screen_hash != null && x.screenHash !== a.screen_hash))
+        // WO-97 (Chiron 07:46Z, 3): written once the wait is over (the keys, then up to changeWaitMs; unchanged, once more and the same wait)
+        const secs = Math.round((r.waitedMs ?? 0) / 1000)
+        result = !x ? '按了，之後看不到畫面（可能重開了）' : resolved ? (r.retried ? '按了（第一下畫面沒變，又按了一次），畫面已經往下走' : '按了，畫面已經往下走')
+          : r.retried ? `按了兩次，前後等了 ${secs} 秒畫面都沒變` : '按了，但畫面沒變'
         afterTail = x ? x.lines.slice(-8).join('\n') : ''
         this.event('joey_answered', { agent: a.label, tmux: a.tmux, ask: a.id, by: who, choice: opt.button, keys: opt.keys, via, resolved, after_state: x?.state ?? null, after_tail: x?.lines ?? null })
         a.closed = { how: 'answered', at: iso(this.now()), by: who, choice: opt.button, result, ...this.closedOption(a, idx), member, via }

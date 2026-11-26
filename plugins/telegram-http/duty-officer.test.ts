@@ -260,7 +260,7 @@ describe('officer', () => {
     expect(r.sent[0].text).toContain('判斷不了（timeout 60s）')
     expect(r.sent[0].buttons.map((x: any) => x[0].text)).toEqual(['1. Resume from summary', '2. Resume full session', "3. Don't ask me again"])
     await r.o.onTap(r.sent[0].buttons[2][0].callback_data, 'Advac777')
-    expect(r.keys).toEqual(['Down', 'Enter'])
+    expect(r.keys).toEqual(['Down', 'Enter', 'Down', 'Enter'])                // WO-97: this fake menu never moves: the same keys once more, then 「按了兩次」
   })
 
   test('over the per-pane budget: no model call, raw screen to Joey', async () => {
