@@ -332,3 +332,6 @@ plugins/telegram-http/server.ts::if (connectorNow()) return                     
 plugins/telegram-http/onsen-connector.ts::export const MEMBER_CHAT = /^member:([a-z0-9][a-z0-9_.-]{0,63})$/
 plugins/telegram-http/onsen-connector.ts::export function withoutOnsenLabel(text: string, sender: string, agent: string, kindName: (k: string) => string): string {
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the line by conversation_id at the /clear
+plugins/telegram-http/server.ts::async function albumHeldItems(entry: AlbumEntry, key: string): Promise<void> {
+plugins/telegram-http/server.ts::if (count != null) entry.expect = Math.max(entry.expect ?? 0, count)
+plugins/telegram-http/onsen-album-crash-daemon.test.ts::one tag, three files, media_group_count 3, nothing twice

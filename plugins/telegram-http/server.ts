@@ -5031,6 +5031,8 @@ type AlbumEntry = {
   expect: number | null
   first: number
   cap: ReturnType<typeof setTimeout> | null
+  /** WO-197 (lab 19:24Z): its flush has begun (the items this daemon holds are being added): nothing else flushes it */
+  flushing?: boolean
   /** WO-197 (Chiron mesh 12852): its items' kept facts (inboundStore keys: chat:message_id, pm:<Onsen id>), finished once the album is delivered */
   keys: string[]
   /** WO-197 segment 2: the topic the router knows the album by (dispatchInbound routeTopic) */
@@ -5062,12 +5064,14 @@ function bufferAlbumItem(
                      docKind: item.docKind, docMime: item.docMime, docName: item.docName,
                      ...(/^\d+$/.test(item.meta.message_id ?? '') ? { n: Number(item.meta.message_id) } : {}), ...(item.caption ? { caption: item.caption } : {}),
                      meta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}) })
-  if (count != null && entry.expect == null) entry.expect = count
+  // WO-197 (lab 19:24Z: an album of 3 delivered with media_group_count 2): the album's count is the largest any of its items' facts knew, never fewer
+  if (count != null) entry.expect = Math.max(entry.expect ?? 0, count)
   albumWait(key, entry)
 }
 /** WO-197: what the album waits for now: all its items (its count known: flushed the moment the last one is in, or at the cap), the count from its
  *  arrival (the arrival window still open in this process: the cap meanwhile), or the window after its last item (not known) */
 function albumWait(key: string, entry: AlbumEntry): void {
+  if (entry.flushing) return
   const flush = (why: 'window' | 'all' | 'cap') => { void flushAlbum(key, why).catch(e => log('error', `album ${key}: flush failed: ${e}`)) }
   if (entry.expect != null && entry.items.length >= entry.expect) { flush('all'); return }
   if (entry.expect != null || albumArrivals.has(key)) {
@@ -5075,6 +5079,25 @@ function albumWait(key: string, entry: AlbumEntry): void {
     return
   }
   entry.timer = setTimeout(() => flush('window'), ALBUM_WINDOW_MS)
+}
+/** WO-197 (lab 19:24Z): the items of this album whose facts this daemon keeps and that are not in it (not back from the inbox yet, or left by a
+ *  restart): added now, in its buffer (finishInbound with their keys: finished when the album goes); one being handed over right now is left to it */
+async function albumHeldItems(entry: AlbumEntry, key: string): Promise<void> {
+  if (!inboundStore) return
+  const mgid = key.slice(entry.chatId.length + 1)
+  const mine = (k: string): OnsenInbound.Facts | undefined => {
+    const f = inboundStore!.get(k)
+    return f && OnsenInbound.albumItem(f) && f.chat_id === entry.chatId && f.mgid === mgid && !albumHeld.has(k) && !inboundStore!.isDone(k) ? f : undefined
+  }
+  for (const k of [...restartLeft]) if (mine(k)) restartLeft.delete(k)
+  let n = 0
+  for (const k of inboundStore.waiting()) {
+    const f = mine(k)
+    if (!f || personBusy.has(k)) continue
+    if (f.albumCount) entry.expect = Math.max(entry.expect ?? 0, f.albumCount)
+    try { if (await finishInbound(f, 'local', undefined, [k])) n++ } catch (e) { log('warn', `album ${key}: ${k} (held here) not added: ${e instanceof Error ? e.message : e}`) }
+  }
+  if (n) log('info', `album ${key}: ${n} more item(s) whose facts this daemon holds (not back from the inbox yet) go with it`)
 }
 /** WO-197 (Chiron mesh 12823: the switch off with ONSEN_INBOUND on, the path the fleet runs): an album item Telegram brought to this daemon, written
  *  into Onsen to come back one by one. Its arrival is grouped as the path before groups it (ALBUM_WINDOW_MS after the last item); when that closes,
@@ -5091,17 +5114,22 @@ function albumArriving(chatId: string, mgid: string, key: string): void {
     for (const x of a.keys) inboundStore?.update(x, f => { f.albumCount = n })
     log('info', `album ${k}: ${n} item(s) came from Telegram; delivered as one tag when ${n === 1 ? 'it comes' : 'they come'} back from Onsen`)
     const entry = albumBuffers.get(k)
-    if (entry) { if (entry.expect == null) entry.expect = n; if (entry.timer) clearTimeout(entry.timer); entry.timer = null; albumWait(k, entry) }
+    if (entry) { entry.expect = Math.max(entry.expect ?? 0, n); if (entry.timer) clearTimeout(entry.timer); entry.timer = null; albumWait(k, entry) }
   }, ALBUM_WINDOW_MS)
   albumArrivals.set(k, a)
 }
 
 async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<void> {
   const entry = albumBuffers.get(key)
-  if (!entry) return
-  albumBuffers.delete(key)
+  if (!entry || entry.flushing) return
+  entry.flushing = true
   if (entry.timer) clearTimeout(entry.timer)
   if (entry.cap) clearTimeout(entry.cap)
+  // WO-197 (lab 19:23–19:24Z, 1.58.28 item 2: killed after the first item came back; after the restart a1 + a3 went at the cap, a2 alone 20 s later
+  // through A.1): every item of this album whose facts this daemon holds goes with it, back from the inbox or not (its kept arrival facts, the ones a
+  // restart left); its late person_message, the inbox's retry, A.1 find it delivered. Never two tags for one album, nobody waits for a retry
+  await albumHeldItems(entry, key)
+  albumBuffers.delete(key)
   // WO-197: the count known: one line (the cap: what came, of how many); the photos still being taken are waited for (each gives its path, or none: a
   // failed download, image_error as before)
   if (why === 'cap') log('warn', `album ${key}: ${entry.items.length} of ${entry.expect ?? '?'} item(s) in ${Math.round(ALBUM_CAP_MS / 1000)} s after the first; delivered with what came`)
