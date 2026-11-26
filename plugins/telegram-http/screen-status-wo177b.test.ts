@@ -49,7 +49,7 @@ describe('③ every verdict that makes the record not idle needs a program fact'
     for (const s of ['idle', 'idle_background_running'] as const) for (const t of [IDLE, THINKING]) expect(contradiction(V(s), regions(t), prog('idle'))).toBeNull()   // an idle record needs none
   })
   const EVAL = join(homedir(), 'cc-workspaces', 'claude-chiron', 'knowledge', 'tg-dialogue', 'screen-eval')
-  test.skipIf(!existsSync(join(EVAL, 'labels.json')) || !existsSync(join(EVAL, 'regions-v7.json')))("Chiron's 64 labelled screens: the facts are regions-v7.json's; working and compacting have them, the others none; no labelled verdict is contradicted", () => {
+  test.skipIf(!existsSync(join(EVAL, 'labels.json')) || !existsSync(join(EVAL, 'regions-v7.json')))("Chiron's labelled screens (as many as regions-v7.json has): the facts are regions-v7.json's; working and compacting have them, the others none; no labelled verdict is contradicted", () => {
     const labels = JSON.parse(readFileSync(join(EVAL, 'labels.json'), 'utf8')) as Record<string, { state: string }>
     const v7 = JSON.parse(readFileSync(join(EVAL, 'regions-v7.json'), 'utf8')).regions as Record<string, unknown>
     const by: Record<string, number> = {}
@@ -62,8 +62,9 @@ describe('③ every verdict that makes the record not idle needs a program fact'
       if ((VERDICT_STATES as readonly string[]).includes(l.state)) expect([f, contradiction(V(l.state as ScreenVerdict['state']), st, prog('idle'))]).toEqual([f, null])
       by[l.state] = (by[l.state] ?? 0) + 1
     }
-    expect(Object.keys(labels).length).toBe(64)
-    expect(by.working).toBe(6); expect(by.compacting).toBe(2)
+    // the count is the fixture's (Chiron adds screens: 64, then 71 on 11-26): every labelled screen has its regions, and no region file is unlabelled
+    expect(Object.keys(labels).sort()).toEqual(Object.keys(v7).sort())
+    expect(by.working).toBeGreaterThan(0); expect(by.compacting).toBeGreaterThan(0)
   })
 })
 
