@@ -113,20 +113,20 @@ test('the item\'s call id rides into the lane (its record) and names the Call; a
   expect(lines.filter(l => l.event === ev.id).every(l => l.call_id === '344')).toBe(true)
 })
 
-test('a lane that hands the item to the main: no end from the lane (a change of hands, not failed); the main\'s turn takes it and ends it', async () => {
+test('a lane that hands the item to the main: accepted, session main, at the hand-over (Onsen 0.25.1: one writer); no end from the lane; the main\'s turn takes it and ends it', async () => {
   const ev = call()
   const { lane, tok } = await start(ev)
   await L.callLaneTool(tok, 'handoff_main', { text: 'Eve 要改設定，要主線決定' })
+  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`, 'accepted:main'])           // the main holds it while it waits
   await end(lane)
-  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`])
+  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`, 'accepted:main'])
   const it = itemOf(ev.id)
   expect(it).toBeTruthy()
   await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: `p175-${++p}`, dids: [it.id] })
-  // Onsen took the change of hands from the lane's exit row (back to accepted, recipient main): the main's turn is its running
-  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`, 'running:main'])
+  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`, 'accepted:main', 'running:main'])
   await stop()
   calls.statusRecord('idle')
-  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`, 'running:main', 'completed:main'])
+  expect(of(ev.id)).toEqual([`accepted:${lane}`, `running:${lane}`, 'accepted:main', 'running:main', 'completed:main'])
 })
 
 test('the main (an unverified caller goes to the main): accepted main → running when bound into its turn → completed once the record shows the turn over; a turn the Stop hook sent back does not end it', async () => {

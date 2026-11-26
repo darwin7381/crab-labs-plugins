@@ -174,7 +174,8 @@ plugins/telegram-http/onsen-client.ts::if (t.line.k === 'c') {
 plugins/telegram-http/lanes.ts::export function callRefOf(ev: InEvent): CallRef | null
 plugins/telegram-http/lanes.ts::function callsEnded(laneId: string
 plugins/telegram-http/server.ts::const CALL_STATE = Lanes.LANES_ON
-plugins/telegram-http/onsen-status.ts::handedOver(event: string): void
+plugins/telegram-http/onsen-status.ts::handedOver(event: string, call: CallRef, at = iso(this.now())): void
+plugins/telegram-http/onsen-status.ts::this.emit(event, call, 'accepted', 'main', at, undefined, false, true)
 plugins/telegram-http/lanes.ts::its receipt goes to BTCC /complete (WO-175: the one case left)
 plugins/telegram-http/onsen-status.ts::async receipt(event: string, call: CallRef
 plugins/telegram-http/onsen-client.ts::callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS)

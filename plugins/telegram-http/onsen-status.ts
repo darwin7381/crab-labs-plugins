@@ -161,8 +161,10 @@ export class DeliveryFacts {
  *    completed   the main's turn that took it ended (once the status record shows it over, as a Joey message's turn_end: completeLater / statusRecord;
  *                a turn that goes on takes it back: cancelLater); a lane's run ended for good owing nothing (lanes.ts runEnded), its summary as the
  *                result (a scheduled run's receipt outcome as result.outcome; a failed receipt: failed)
- *    handedOver  a lane handed it to the main (the event's main obligation opened: LanesTap): nothing is sent (Onsen records the change of hands from
- *                the lane's exit row: recipient main, accepted), and the main's turn then reports running
+ *    handedOver  a lane handed it to the main (the event's main obligation opened: LanesTap; handoff_main, the exit rule): accepted, session main
+ *                (the step back from running). Onsen 0.25.1 (35e5242) has one writer for a Call the daemon reports (calls.reported_at, set by its first
+ *                accepted): it no longer takes state, session or result from the exit and wake rows, so the change of hands is ours to send; the main
+ *                then holds the Call while it waits, and its turn reports running and the end as for any Call of the main
  *  A lane run that hands the item to the main sends no end: a change of hands, not an end. Only forward:
  *  a moment at or behind the last one sent is not sent again (a completed Call takes a result once more, when the first had none). */
 export const CALL_LEDGER_RESULT = '只記錄，沒有交給任何一條 session'
@@ -182,15 +184,17 @@ export class CallFacts {
   private now(): number { return (this.o.now ?? Date.now)() }
   /** putBack: the one step back (running → accepted); any other moment at or behind the last one is not sent */
   /** the line's idem key, or null: not sent (at or behind the last moment) */
-  private emit(event: string, call: CallRef, state: CallStateName, session: string | null, at: string, result?: CallResult, putBack = false): string | null {
+  private emit(event: string, call: CallRef, state: CallStateName, session: string | null, at: string, result?: CallResult, putBack = false, hand = false): string | null {
     const was = this.sent.get(event)
+    // a hand-over (handedOver): accepted with the new session, from running or from an accepted of another session
+    const handed = hand && !!was && was.session !== session && (was.state === 'running' || was.state === 'accepted') && state === 'accepted'
     const body = result && (result.outcome || result.text) && state === 'completed'          // failed takes no result (Onsen)
       ? { ...(result.outcome ? { outcome: result.outcome } : {}), ...(result.text ? { body: { format: 'markdown' as const, text: result.text.slice(0, 4000) } } : {}) } : undefined
-    const back = putBack && was?.state === 'running' && state === 'accepted'
+    const back = (putBack && was?.state === 'running' && state === 'accepted') || handed
     const fill = was?.state === 'completed' && state === 'completed' && !was.result && !!body
     if (was && !back && !fill && CALL_RANK[state] <= CALL_RANK[was.state]) { this.stats.skipped++; return null }
     if (was && (was.state === 'completed' || was.state === 'failed') && !fill) { this.stats.skipped++; return null }
-    const idem = `call:${event}:${state}:${back ? 'back:' : ''}${fill ? 'fill:' : ''}${at}`
+    const idem = `call:${event}:${state}:${handed ? 'hand:' : back ? 'back:' : ''}${fill ? 'fill:' : ''}${at}`
     this.sent.set(event, { state, result: !!body || !!was?.result, session, idem })
     if (this.sent.size > (this.o.max ?? 20_000)) for (const k of [...this.sent.keys()].slice(0, 5_000)) this.sent.delete(k)
     this.stats.moments++
@@ -209,12 +213,13 @@ export class CallFacts {
     if (!this.sent.has(event)) this.emit(event, call, 'accepted', session, at)
     this.emit(event, call, 'running', session, at)
   }
-  /** the item was handed to the main while a lane had it running (handoff_main, the exit rule: a change of hands, not an end): Onsen takes the
-   *  change from the lane's exit row (recipient main, back to accepted: the main has not started), so nothing is sent; what was sent is now that,
-   *  and the main's turn reports running again */
-  handedOver(event: string): void {
+  /** the item was handed to the main while a lane had it (handoff_main, the exit rule: a change of hands, not an end): accepted, session main (Onsen
+   *  0.25.1: the daemon is the one writer of a Call it reports; the main has not started), once; the main's turn then reports running and the end */
+  handedOver(event: string, call: CallRef, at = iso(this.now())): void {
     const w = this.sent.get(event)
-    if (w && w.state === 'running' && w.session !== 'main') this.sent.set(event, { state: 'accepted', result: false, session: 'main' })
+    if (!w || w.session === 'main' || (w.state !== 'running' && w.state !== 'accepted')) return
+    this.later.delete(event)
+    this.emit(event, call, 'accepted', 'main', at, undefined, false, true)
   }
   putBack(event: string, call: CallRef, session: string, at = iso(this.now())): void {
     this.later.delete(event)
@@ -593,8 +598,8 @@ export class LanesTap {
       }
     } else if (row.rec === 'event' && this.o.calls) {
       // WO-175: the event is handed to the main (its main obligation open): a lane's Call changes hands
-      if (((row.obligations ?? []) as Array<{ kind?: string; state?: string }>).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested')) && this.callOf(row.id))
-        this.o.calls.handedOver(String(row.id))
+      const call = ((row.obligations ?? []) as Array<{ kind?: string; state?: string }>).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested')) ? this.callOf(row.id) : null
+      if (call) this.o.calls.handedOver(String(row.id), call)
     } else if (row.rec === 'run') {
       const all = [row.ev, ...(Array.isArray(row.extra) ? row.extra : []), ...(Array.isArray(row.steered) ? row.steered : [])].filter((e: any) => e)
       const evs = all.filter((e: any) => e.source === 'telegram').map((e: any) => this.o.joey(e.meta)).filter((x): x is { chat: string; id: string } => !!x)

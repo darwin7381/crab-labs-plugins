@@ -59,15 +59,23 @@ describe('CallFacts: the moments, only forward', () => {
     f.running('mesh-2', PEER, 'main')
     expect(states()).toEqual(['mesh-2:accepted:main', 'mesh-2:running:main', 'mesh-2:accepted:main', 'mesh-2:running:main'])
   })
-  test('handed to the main while a lane ran it: nothing sent then; the main\'s turn reports running (Onsen made it accepted, recipient main, from the lane\'s exit row)', () => {
-    const { f, states } = facts()
+  test('handed to the main while a lane ran it (Onsen 0.25.1: the daemon is the one writer): accepted, session main, once; the main\'s turn reports running', () => {
+    const { f, states, out } = facts()
     f.routed('mesh-h', PEER, 'x.reflex.3'); f.running('mesh-h', PEER, 'x.reflex.3')
-    f.handedOver('mesh-h')
-    expect(states()).toEqual(['mesh-h:accepted:x.reflex.3', 'mesh-h:running:x.reflex.3'])
+    f.handedOver('mesh-h', PEER)
+    expect(states()).toEqual(['mesh-h:accepted:x.reflex.3', 'mesh-h:running:x.reflex.3', 'mesh-h:accepted:main'])
+    expect(out.at(-1)!.idem).toMatch(/^call:mesh-h:accepted:hand:/)
+    f.handedOver('mesh-h', PEER)                                                 // the event row written again: nothing more
     f.running('mesh-h', PEER, 'main')
-    f.handedOver('mesh-h')                                                       // the main's own: nothing changes
+    f.handedOver('mesh-h', PEER)                                                 // the main's own: nothing changes
     f.running('mesh-h', PEER, 'main')
-    expect(states()).toEqual(['mesh-h:accepted:x.reflex.3', 'mesh-h:running:x.reflex.3', 'mesh-h:running:main'])
+    f.ended('mesh-h', PEER, 'main', 'completed')
+    expect(states()).toEqual(['mesh-h:accepted:x.reflex.3', 'mesh-h:running:x.reflex.3', 'mesh-h:accepted:main', 'mesh-h:running:main', 'mesh-h:completed:main'])
+    const g = facts()                                                            // handed before its run started: from the lane's accepted
+    g.f.routed('mesh-h2', PEER, 'x.reflex.4'); g.f.handedOver('mesh-h2', PEER)
+    expect(g.states()).toEqual(['mesh-h2:accepted:x.reflex.4', 'mesh-h2:accepted:main'])
+    const n = facts(); n.f.handedOver('mesh-h3', PEER)                            // nothing sent for it before: nothing to hand over
+    expect(n.states()).toEqual([])
   })
   test('a scheduled run: outcome and body; a completed Call with no result takes one once more (a late receipt); failed takes none', () => {
     const { f, out } = facts()
