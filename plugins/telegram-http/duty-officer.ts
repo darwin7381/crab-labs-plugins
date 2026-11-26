@@ -687,6 +687,8 @@ export interface OfficerDeps {
   log(level: 'info' | 'warn' | 'error', msg: string): void
   /** WO-165 A: every look at a pane (its foreground command and visible text), for the screen-status reader of that pane */
   onLook?(tmux: string, cmd: string, pane: string): void
+  /** WO-176: this daemon's menus as Onsen Actions; absent: none (the officer works exactly as before) */
+  actions?: MenuActions
   now?(): number
   sleep?(ms: number): Promise<void>
 }
@@ -710,7 +712,53 @@ interface Ask {
   id: string; tmux: string; label: string; host: string; hash: string; created: string; kind: 'ask_joey' | 'unreadable'; test?: boolean
   reason: string; text: string; options: Array<{ button: string; keys: string[] | null; means?: string }>
   decision: Decision | null; screen_tail: string; messages: Sent[]; notified: number[]
-  closed?: { how: 'answered' | 'gone'; at: string; by?: string; choice?: string; result?: string }
+  closed?: { how: 'answered' | 'gone'; at: string; by?: string; choice?: string; result?: string
+    /** WO-176: the option pressed (its Action option id), the member who pressed it, and where (Telegram or Onsen) */
+    option_id?: string; member?: string | null; via?: 'telegram' | 'onsen' }
+  /** WO-176: its Action in Onsen. action_key: set when this pane's menus are this agent's Actions (MenuActions.pane); action_id / action_version: once
+   *  Onsen made it; menu_kind / session_id: the menu and session it answers. An option's Action id is its index + 1 (only options with keys) */
+  action_key?: string; action_id?: string; action_version?: number; menu_kind?: string | null; session_id?: string | null
+  /** WO-176: its Action was cancelled when the daemon started again (the officer looks at the pane afresh and asks again if the menu is still there) */
+  action_closed?: true
+}
+// ---------------------------------------------------------------- WO-176: the menus as Onsen Actions
+/** a menu's Action as an ask keeps it: the key it was made with, and Onsen's id and version once known */
+export interface ActionRef { key: string; id?: string; version?: number }
+export interface MenuActionFields { menu_kind: string | null; session_id: string | null; assignees: string[]; summary: string; body: string | null
+  options: Array<{ id: string; label: string }> }
+/** WO-176: what the duty officer tells Onsen about its menus (server.ts gives Onsen's, onsen-client.ts OnsenActions). Every call returns at once; Onsen
+ *  being slow or down never holds a message, a key or a tap */
+export interface MenuActions {
+  /** this pane's menus are this agent's Actions: the session it shows and the menu on it now (`bundle`: what the officer judged); null: not this agent's */
+  pane(t: { tmux: string; test?: boolean }, bundle?: Record<string, unknown>): { session_id: string | null; menu_kind: string | null } | null
+  /** the members these Telegram chats are (the assignees of a question sent to them) */
+  assignees(chats: string[]): string[]
+  /** a question to a person: an open Action; `made` hears its id and version once Onsen made it */
+  open(f: MenuActionFields, key: string, made: (id: string, version: number) => void): void
+  /** the officer pressed it itself: an Action made resolved (assignees duty-officer, the option it pressed) */
+  pressed(f: MenuActionFields, option_id: string, key: string): void
+  /** pressed from Telegram by `member` (resolve, then applied; Onsen answered first: applied with what was pressed here) */
+  answered(ref: ActionRef, option_id: string, member: string | null, at: string): void
+  /** the press Onsen's control asked for was made; or Telegram's press came first (option_id, resolved_by: what was really pressed) */
+  applied(ref: ActionRef, o: { at?: string; option_id?: string; resolved_by?: string }): void
+  /** nothing was pressed: the menu went away, the screen changed, the officer is off */
+  cancel(ref: ActionRef, reason: string): void
+  /** keys went to this pane's menu of this kind (a permission prompt answered on the screen: the channel's own prompt for it is over) */
+  screenPressed?(tmux: string, menu_kind: string | null): void
+}
+/** an Action option id ↔ the ask's option index */
+export const optionIdOf = (i: number): string => String(i + 1)
+export const optionIndexOf = (id: string): number => /^[1-9]\d?$/.test(id) ? Number(id) - 1 : -1
+const ACTION_LABEL = (s: string): string => s.replace(/\s+/g, ' ').trim().slice(0, 80)
+/** the ask's text as an Action body (markdown): the screen lines in a code block */
+export function askBody(text: string): string {
+  const cut = text.indexOf('\n\n— 畫面最後幾行 —\n')
+  if (cut < 0) return text
+  const fence = (s: string) => '```\n' + s.replace(/```/g, "'''") + '\n```'
+  const rest = text.slice(cut + '\n\n— 畫面最後幾行 —\n'.length)
+  const tool = rest.indexOf('\n\n— 等待中的工具呼叫 —\n')
+  return tool < 0 ? `${text.slice(0, cut)}\n\n畫面最後幾行：\n${fence(rest)}`
+    : `${text.slice(0, cut)}\n\n畫面最後幾行：\n${fence(rest.slice(0, tool))}\n\n等待中的工具呼叫：\n${fence(rest.slice(tool + '\n\n— 等待中的工具呼叫 —\n'.length))}`
 }
 type Look = { state: State; hash: string; lines: string[]; info: PaneInfo; pane: string } | null
 
@@ -872,6 +920,30 @@ export class DutyOfficer {
     this.timer = setInterval(() => { void this.tick() }, this.L.pollMs)
     this.timer.unref?.()
     this.d.log('info', `duty-officer ON (poll=${this.L.pollMs / 1000}s, stall=${this.L.stallMs / 1000}s, switch=${join(this.dir, 'config.json')})`)
+    this.cancelOrphans()
+  }
+  /** WO-176: the questions this daemon's panes had open when it last stopped: their Actions are cancelled (a restarted officer looks at each pane afresh
+   *  and asks again if the menu is still there, so the old one would wait in Joey's list for nothing). Telegram is not touched: its buttons work as before */
+  cancelOrphans(): number {
+    if (!this.d.actions) return 0
+    let n = 0
+    try {
+      const dir = join(this.dir, 'ask'), since = Date.now() - 2 * 86_400_000
+      const names = readdirSync(dir).filter(x => /^[0-9a-f]{8}\.json$/.test(x)).map(x => { try { return { x, m: statSync(join(dir, x)).mtimeMs } } catch { return { x, m: 0 } } })
+        .filter(f => f.m >= since).sort((a, b) => b.m - a.m).slice(0, 500)
+      for (const { x } of names) {
+        let a: Ask
+        try { a = JSON.parse(readFileSync(join(dir, x), 'utf8')) as Ask } catch { continue }
+        if (a.host !== this.host || a.closed || !a.action_id || a.action_closed || !this.actionPane({ tmux: a.tmux, test: a.test })) continue
+        this.actionCall(a, (acts, ref) => acts.cancel(ref, '常駐程式重開了：值班員會重新看這個畫面，還在的話會再問一次'))
+        a.action_closed = true
+        this.saveAsk(a)
+        this.asks.set(a.id, a)
+        n++
+      }
+    } catch {}
+    if (n) this.event('actions_cancelled_at_start', { count: n })
+    return n
   }
 
   async tick(): Promise<void> {
@@ -1071,6 +1143,7 @@ export class DutyOfficer {
 
   private async press(t: Target, lk: NonNullable<Look>, appeared: number, step: number, d: Decision, keys: string[], bundle: Record<string, unknown>): Promise<void> {
     const dry = this.config().dry_keys
+    const pane = dry ? null : this.actionPane(t, bundle)               // WO-176: the menu as it is before the keys (its Action, made after a press)
     const r = await this.pressKeys(t.tmux, lk.hash, keys, dry)
     const base = { agent: t.label, tmux: t.tmux, step, choose: d.choose, keys, screen_hash: lk.hash }
     if (!r.ok && r.off) {
@@ -1097,12 +1170,14 @@ export class DutyOfficer {
     if (!a) {
       this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10, resolved: null, why: 'pane gone after pressing' })
       this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved: null })
+      this.recordPress(t, lk, d, pane, r.at)
       return
     }
     const resolved = a.state === 'IDLE' || a.state === 'WORKING' || a.hash !== lk.hash
     this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10,
       left_copy_mode: r.leftMode, before_tail: lk.lines, after_tail: a.lines, after_state: a.state, resolved, to_joey_draft: d.to_joey })
     this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved })
+    if (resolved) this.recordPress(t, lk, d, pane, r.at)
     if (!resolved) {
       await this.askJoey(t, lk, bundle, d, 'pressed the keys, the screen did not change', keys)
       return
@@ -1133,11 +1208,19 @@ export class DutyOfficer {
   }
 
   // ---- asking Joey
-  private newAsk(t: Target, lk: NonNullable<Look>, kind: Ask['kind'], reason: string, text: string, options: Ask['options'], d: Decision | null): Ask {
+  private newAsk(t: Target, lk: NonNullable<Look>, kind: Ask['kind'], reason: string, text: string, options: Ask['options'], d: Decision | null,
+    bundle?: Record<string, unknown>): Ask {
     const ask: Ask = { id: randomBytes(4).toString('hex'), tmux: t.tmux, label: t.label, host: this.host, hash: lk.hash,
       created: iso(this.now()), kind, ...(t.test ? { test: true } : {}), reason, text, options, decision: d, screen_tail: redact(lk.lines.join('\n')), messages: [], notified: [] }
+    // WO-176: this pane's menus are this agent's Actions: the ask gets one (made when it is first sent)
+    const pane = this.actionPane(t, bundle)
+    if (pane) Object.assign(ask, { action_key: `menu:${this.host}:ask:${ask.id}`, menu_kind: pane.menu_kind, session_id: pane.session_id })
     this.asks.set(ask.id, ask)
     return ask
+  }
+  private actionPane(t: { tmux: string; test?: boolean }, bundle?: Record<string, unknown>): { session_id: string | null; menu_kind: string | null } | null {
+    if (!this.d.actions) return null
+    try { return this.d.actions.pane(t, bundle) } catch { return null }
   }
   private saveAsk(a: Ask) {
     try { writeFileSync(join(this.dir, 'ask', `${a.id}.json`), JSON.stringify(a, null, 1)) } catch {}
@@ -1173,6 +1256,76 @@ export class DutyOfficer {
     a.notified.push(this.now())
     this.saveAsk(a)
     this.event('notified', { agent: a.label, tmux: a.tmux, ask: a.id, kind: a.kind, to: sent.map(s => s.chat), messages: sent.map(s => s.msg), reminder: !!prefix })
+    if (!prefix) this.openAction(a, chats)
+  }
+  /** WO-176: the ask as an open Action in Onsen: its options with keys (the buttons Telegram shows), assigned to the people it went to */
+  private openAction(a: Ask, chats: string[]): void {
+    const acts = this.d.actions
+    if (!acts || !a.action_key || a.action_id) return
+    const options = a.options.map((o, i) => o.keys ? { id: optionIdOf(i), label: ACTION_LABEL(o.button) || optionIdOf(i) } : null)
+      .filter((o): o is { id: string; label: string } => !!o).slice(0, 10)
+    if (!options.length) { this.event('action_skipped', { agent: a.label, tmux: a.tmux, ask: a.id, why: 'no option with keys' }); return }
+    const summary = a.kind === 'ask_joey' && a.decision?.what ? `${a.label}：${a.decision.what}` : `${a.label} 停在一個要按鍵的畫面，值班員判斷不了（${a.reason}）`
+    try {
+      acts.open({ menu_kind: a.menu_kind ?? null, session_id: a.session_id ?? null, assignees: acts.assignees(chats), summary, body: askBody(a.text), options },
+        a.action_key, (id, version) => {
+          a.action_id = id; a.action_version = version
+          this.saveAsk(a)
+          this.event('action', { agent: a.label, tmux: a.tmux, ask: a.id, action_id: id })
+        })
+    } catch (e) { this.event('error', { agent: a.label, tmux: a.tmux, where: 'action open', error: String(e).slice(0, 200) }) }
+  }
+  /** WO-176: the officer pressed a menu itself (a ruling covered it): one Action made resolved, assignees duty-officer, the option it pressed */
+  private recordPress(t: Target, lk: NonNullable<Look>, d: Decision, pane: { session_id: string | null; menu_kind: string | null } | null, at: number): void {
+    const acts = this.d.actions
+    if (!acts || !pane) return
+    const opts = (d.options ?? []).slice(0, 10)
+    const idx = opts.findIndex(o => o && o.button === d.choose)
+    if (idx < 0) return
+    const options = opts.map((o, i) => ({ id: optionIdOf(i), label: ACTION_LABEL(String(o?.button ?? '') || String(o?.on_screen ?? '')) || optionIdOf(i) }))
+    const body = `值班員照規矩按了「${d.choose}」：${d.reason}${d.covered_by ? `\n\n適用的規矩：${d.covered_by}` : ''}\n\n（值班員・${t.label}・${this.host}）`
+    try {
+      acts.pressed({ menu_kind: pane.menu_kind, session_id: pane.session_id, assignees: ['duty-officer'], summary: `${t.label}：${d.what}`, body, options },
+        optionIdOf(idx), `menu:${this.host}:press:${t.tmux}:${lk.hash}:${at}`)
+      acts.screenPressed?.(t.tmux, pane.menu_kind)
+    } catch (e) { this.event('error', { agent: t.label, tmux: t.tmux, where: 'action pressed', error: String(e).slice(0, 200) }) }
+  }
+  private refOf(a: Ask): ActionRef | null {
+    return a.action_key ? { key: a.action_key, ...(a.action_id ? { id: a.action_id } : {}), ...(a.action_version ? { version: a.action_version } : {}) } : null
+  }
+  private actionCall(a: Ask, fn: (acts: MenuActions, ref: ActionRef) => void): void {
+    const acts = this.d.actions, ref = this.refOf(a)
+    if (!acts || !ref) return
+    try { fn(acts, ref) } catch (e) { this.event('error', { agent: a.label, tmux: a.tmux, where: 'action', error: String(e).slice(0, 200) }) }
+  }
+  /** WO-176: the ask whose Action this is (this process's, else the ask files of the last two days); null: none */
+  askOfAction(actionId: string): Ask | null {
+    for (const a of this.asks.values()) if (a.action_id === actionId) return a
+    let names: Array<{ n: string; m: number }> = []
+    try {
+      const dir = join(this.dir, 'ask'), since = Date.now() - 2 * 86_400_000
+      names = readdirSync(dir).filter(n => /^[0-9a-f]{8}\.json$/.test(n)).map(n => { try { return { n, m: statSync(join(dir, n)).mtimeMs } } catch { return { n, m: 0 } } })
+        .filter(x => x.m >= since).sort((x, y) => y.m - x.m).slice(0, 500)
+    } catch {}
+    for (const { n } of names) {
+      const id = n.slice(0, 8)
+      if (this.asks.has(id)) continue
+      try {
+        const a = JSON.parse(readFileSync(join(this.dir, 'ask', n), 'utf8')) as Ask
+        if (a.action_id === actionId && a.host === this.host) { this.asks.set(a.id, a); return a }
+      } catch {}
+    }
+    return null
+  }
+  /** WO-176: the newest ask still open on this pane with an Action for this menu (a status blocker's action_id); null: none */
+  openActionFor(tmux: string, menu: string | null): string | null {
+    let best: Ask | null = null
+    for (const a of this.asks.values()) {
+      if (a.tmux !== tmux || a.closed || !a.action_id) continue
+      if (menu && a.menu_kind && a.menu_kind !== menu) continue
+      if (!best || a.created >= best.created) best = a
+    }
+    return best?.action_id ?? null
   }
 
   private screenBlock(lines: string[], bundle?: Record<string, unknown>): string {
@@ -1194,7 +1347,7 @@ export class DutyOfficer {
     if (pressed) text += `\n我先按了 ${pressed.join(' ')}，畫面沒變，所以轉給你。`
     if (typing.length) text += `\n要打字的選項沒有按鈕（${typing.join('、')}）：要選它的話跟 ${t.label} 說。`
     text += this.screenBlock(lk.lines, bundle)
-    const ask = this.newAsk(t, lk, 'ask_joey', reason, text.slice(0, 3900), options, d)
+    const ask = this.newAsk(t, lk, 'ask_joey', reason, text.slice(0, 3900), options, d, bundle)
     this.setRec(t.tmux, lk.hash, { action: 'ask_joey', t: this.now(), askId: ask.id })
     await this.deliver(ask)
   }
@@ -1218,7 +1371,7 @@ export class DutyOfficer {
     let text = `${t.label} 停在一個要按鍵的畫面，值班員判斷不了（${why}），要你決定。\n這台（${this.host}）接下來一小時其他停住的畫面不再一則一則通知，紀錄在 ~/.claude/duty-officer/log.jsonl。\n\n（值班員・${t.label}・${this.host}）`
     text += menu ? '\n下面的按鈕照畫面上的選項排，按了我才送鍵。' : '\n畫面上沒有能直接按的編號選項：要處理的話跟它說，或找 Epeius。'
     text += this.screenBlock(lk.lines, bundle)
-    const ask = this.newAsk(t, lk, 'unreadable', why, text.slice(0, 3900), (menu ?? []).map(m => ({ button: m.button, keys: m.keys })), null)
+    const ask = this.newAsk(t, lk, 'unreadable', why, text.slice(0, 3900), (menu ?? []).map(m => ({ button: m.button, keys: m.keys })), null, bundle)
     this.setRec(t.tmux, lk.hash, { action: 'unreadable', t: this.now(), askId: ask.id })
     await this.deliver(ask)
   }
@@ -1229,13 +1382,14 @@ export class DutyOfficer {
     a.closed = { how: 'gone', at: iso(this.now()), result: state }
     this.saveAsk(a)
     this.event('ask_gone', { agent: a.label, tmux: a.tmux, ask: a.id, now_state: state })
+    this.actionCall(a, (acts, ref) => acts.cancel(ref, `畫面已經離開這個選單（現在${state === 'IDLE' ? '閒著' : state === 'WORKING' ? '在做事' : '在啟動'}）`))
     for (const m of a.messages) {
       await this.d.edit(m, fit(a.text, `\n\n— 不用選了：畫面已經離開這個選單（${hmz(this.now())}，現在${state === 'IDLE' ? '閒著' : state === 'WORKING' ? '在做事' : '在啟動'}）。`)).catch(() => {})
     }
   }
 
-  /** Joey tapped `duty:<id>:<idx>`. Returns the short text for the tap's toast. */
-  async onTap(data: string, by: string): Promise<string> {
+  /** Joey tapped `duty:<id>:<idx>`. Returns the short text for the tap's toast. `member` (WO-176): his Onsen member name, for the Action */
+  async onTap(data: string, by: string, member: string | null = null): Promise<string> {
     const [, id, idxRaw] = data.split(':')
     const a = id ? this.loadAsk(id) : null
     const idx = parseInt(idxRaw ?? '', 10)
@@ -1244,35 +1398,80 @@ export class DutyOfficer {
     const opt = a.options[idx]
     if (!opt || !opt.keys) return '這個選項沒有對應的按鍵，沒有按。'
     if (this.busy.has(a.tmux)) return '值班員正在處理這個畫面，幾秒後再按一次。'
+    return (await this.answer(a, idx, by, member, 'telegram')).result
+  }
+
+  /** WO-176: option `optionId` of this daemon's menu Action was pressed in Onsen (its control item, handed over by the inbox daemon). The same press as a
+   *  tap: the screen checked again, the option's keys, every copy edited the same way and ending 「從 Onsen 按的」; Onsen then hears it was applied. A
+   *  menu Telegram answered first: Onsen hears what was really pressed. The menu gone, the screen changed, the officer off or still busy after 20 s:
+   *  nothing is pressed and the Action is cancelled. 'unknown': not an ask of this daemon (the caller cancels it). `by`: who pressed it in Onsen */
+  async onOnsen(actionId: string, optionId: string, version: number, by: Promise<string | null> | null = null): Promise<string> {
+    const a = this.askOfAction(actionId)
+    if (!a) return 'unknown'
+    if (version > (a.action_version ?? 0)) a.action_version = version
+    if (a.action_closed && !a.closed) { this.actionCall(a, (acts, ref) => acts.cancel(ref, '常駐程式重開過，這個選單已經重新判斷，沒有按')); return 'gone' }
+    const settled = (): string | null => {
+      if (!a.closed) return null
+      if (a.closed.how === 'answered' && a.closed.option_id) {
+        this.actionCall(a, (acts, ref) => acts.applied(ref, { option_id: a.closed!.option_id, ...(a.closed!.member ? { resolved_by: a.closed!.member } : {}) }))
+        return `answered in ${a.closed.via ?? 'telegram'} before (${a.closed.option_id})`
+      }
+      this.actionCall(a, (acts, ref) => acts.cancel(ref, a.closed!.how === 'answered' ? '已經在 Telegram 處理過了' : '畫面已經離開這個選單，沒有按'))
+      return 'gone'
+    }
+    const done = settled()
+    if (done) return done
+    const idx = optionIndexOf(optionId)
+    if (!a.options[idx]?.keys) { this.actionCall(a, (acts, ref) => acts.cancel(ref, `選項 ${optionId} 沒有對應的按鍵，沒有按`)); return 'no such option' }
+    for (let i = 0; i < 80 && this.busy.has(a.tmux); i++) await this.sleep(250)   // the officer is judging or pressing this pane: wait for it (20 s)
+    const later = settled()
+    if (later) return later
+    if (this.busy.has(a.tmux)) { this.actionCall(a, (acts, ref) => acts.cancel(ref, '值班員正在處理這個畫面，沒有按')); return 'busy' }
+    const who = (by ?? Promise.resolve(null)).then(x => x || 'Onsen', () => 'Onsen')
+    const out = await this.answer(a, idx, who, null, 'onsen')
+    if (out.off) this.actionCall(a, (acts, ref) => acts.cancel(ref, '值班員已經關掉，沒有按'))
+    return out.result
+  }
+
+  /** press option `idx` of an ask for a person (a tap, or a press in Onsen), edit every copy, tell Onsen. The caller checked it is open and has keys */
+  private async answer(a: Ask, idx: number, by: string | Promise<string>, member: string | null, via: 'telegram' | 'onsen'): Promise<{ result: string; off?: boolean }> {
+    const opt = a.options[idx]!
     this.busy.add(a.tmux)
     try {
-      const r = await this.pressKeys(a.tmux, a.hash, opt.keys, false, true)
+      const r = await this.pressKeys(a.tmux, a.hash, opt.keys!, false, true)
+      const who = typeof by === 'string' ? by : await by
+      if (via === 'onsen') member = who === 'Onsen' ? null : who
       let result: string
       let afterTail = ''
       if (!r.ok && r.off) {
-        this.event('joey_tap_off', { agent: a.label, tmux: a.tmux, ask: a.id, by, choice: opt.button })
-        return '值班員已經關掉，沒有按。'
+        this.event('joey_tap_off', { agent: a.label, tmux: a.tmux, ask: a.id, by: who, choice: opt.button, via })
+        return { result: '值班員已經關掉，沒有按。', off: true }
       }
       if (!r.ok) {
         result = '畫面已經變了，沒有按'
         afterTail = r.now ? r.now.lines.slice(-8).join('\n') : '（看不到畫面）'
-        this.event('joey_tap_stale', { agent: a.label, tmux: a.tmux, ask: a.id, by, choice: opt.button, now_tail: r.now?.lines ?? null })
-        a.closed = { how: 'gone', at: iso(this.now()), by, choice: opt.button, result }
+        this.event('joey_tap_stale', { agent: a.label, tmux: a.tmux, ask: a.id, by: who, choice: opt.button, via, now_tail: r.now?.lines ?? null })
+        a.closed = { how: 'gone', at: iso(this.now()), by: who, choice: opt.button, result, option_id: optionIdOf(idx), member, via }
+        this.actionCall(a, (acts, ref) => acts.cancel(ref, result))
       } else {
         const x = r.after
         const resolved = !!x && (x.state === 'IDLE' || x.state === 'WORKING' || x.hash !== a.hash)
         result = !x ? '按了，之後看不到畫面（可能重開了）' : resolved ? '按了，畫面已經往下走' : '按了，但畫面沒變'
         afterTail = x ? x.lines.slice(-8).join('\n') : ''
-        this.event('joey_answered', { agent: a.label, tmux: a.tmux, ask: a.id, by, choice: opt.button, keys: opt.keys, resolved, after_state: x?.state ?? null, after_tail: x?.lines ?? null })
-        a.closed = { how: 'answered', at: iso(this.now()), by, choice: opt.button, result }
+        this.event('joey_answered', { agent: a.label, tmux: a.tmux, ask: a.id, by: who, choice: opt.button, keys: opt.keys, via, resolved, after_state: x?.state ?? null, after_tail: x?.lines ?? null })
+        a.closed = { how: 'answered', at: iso(this.now()), by: who, choice: opt.button, result, option_id: optionIdOf(idx), member, via }
         if (x) this.st.set(a.tmux, { hash: x.hash, state: x.state, since: this.now(), rec: resolved ? null : { action: 'joey', t: this.now() } })
         void this.mailRuling(a, opt.button, result, afterTail)
+        const at = iso(r.at)
+        this.actionCall(a, (acts, ref) => via === 'onsen' ? acts.applied(ref, { at }) : acts.answered(ref, optionIdOf(idx), member, at))
+        if (a.menu_kind !== undefined) { try { this.d.actions?.screenPressed?.(a.tmux, a.menu_kind ?? null) } catch {} }
       }
       this.saveAsk(a)
+      const end = via === 'onsen' ? '\n從 Onsen 按的' : ''
       for (const m of a.messages) {
-        await this.d.edit(m, fit(a.text, `\n\n— ${by} 選了「${opt.button}」（${hmz(this.now())}）：${result}。${afterTail ? `\n\n— 之後的畫面 —\n${redact(afterTail)}` : ''}`)).catch(() => {})
+        await this.d.edit(m, fit(a.text, `\n\n— ${who} 選了「${opt.button}」（${hmz(this.now())}）：${result}。${afterTail ? `\n\n— 之後的畫面 —\n${redact(afterTail)}` : ''}${end}`)).catch(() => {})
       }
-      return result
+      return { result }
     } finally {
       this.busy.delete(a.tmux)
     }

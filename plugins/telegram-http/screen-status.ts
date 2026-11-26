@@ -231,7 +231,8 @@ export type TurnFact = { id: string; started_at: string; trigger: Trigger }
 export type LastTurn = { id: string; outcome: 'done' | 'interrupted' | 'failed'; ended_at: string }
 export type BlockerReason = 'permission' | 'input_required' | 'usage_limit' | 'dependency' | 'stalled'
 export type Blocker = { id: string; reason: BlockerReason; since: string; until: string | null; menu_kind: Exclude<VerdictMenu, 'none'> | null; assignee: string | null
-  action_id: null; summary: string }
+  /** WO-176: the open Action for this menu when the daemon knows it (RecordFacts.actionFor), else null (Onsen matches it itself) */
+  action_id: string | null; summary: string }
 export type ObsSession = { id: string; kind: 'main' | 'lane'; thread_id: string | null; activity: 'idle' | 'running' | 'paused' | 'stuck' | 'unknown'
   activity_since: string | null; turn: TurnFact | null; doing: { kind: 'thinking' | 'tool' | 'compacting' | 'waiting_subagents'; tool: string | null; since: string } | null
   blockers: Blocker[]; last_turn: LastTurn | null }
@@ -260,6 +261,8 @@ export type RecordFacts = {
   scheduleThread?: (thread: string) => boolean
   /** the duty officer handles this menu on this pane (it watches the pane and its rule files cover the kind): assignee duty-officer, else joey */
   dutyHandles?: (menu: Exclude<VerdictMenu, 'none'>) => boolean
+  /** WO-176: the open Action this daemon made for a menu of this kind on the main (a permission prompt, the duty officer's question); null: none */
+  actionFor?: (menu: Exclude<VerdictMenu, 'none'>) => string | null
 }
 /** the menus the duty officer's rule files cover (JCS duty-officer/aide_prompt.md 「Joey 的規矩」: 預設全放行 → a permission prompt; 不自動換成比較弱的
  *  模型、結果要等於登記的那一個 → the model picker). Every other menu (the trust prompt, a resume list, a login, a plan or question, the usage-limit
@@ -271,6 +274,8 @@ const menuReason = (m: string | null): BlockerReason => m === 'permission' ? 'pe
 /** statusOf's waitingFor (Claude Code's registry: "permission prompt", "dialog open") as a menu kind, when no verdict names it */
 const registryMenu = (w: unknown): Exclude<VerdictMenu, 'none'> => /permission/i.test(String(w ?? '')) ? 'permission' : 'other'
 const isoMs = (ms: number): string => new Date(ms).toISOString()
+/** WO-176: a blocker's Action from the daemon (never fails the observation) */
+const actionOf = (f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): string | null => { if (!m || !f.actionFor) return null; try { return f.actionFor(m) ?? null } catch { return null } }
 
 /** the one status record, from a verdict (null: no verdict) and the program's facts: the regions' counts and statusOf's (the process, the usage wall,
  *  the turn's start and tool, stuck). The order is fixed (Chiron WO-169, 00:29Z): offline (the process is gone: statusOf's view) → starting (the
@@ -339,7 +344,7 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
       const block = (reason: BlockerReason, menu_kind: Exclude<VerdictMenu, 'none'> | null, until: string | null = null): Blocker => {
         const at = since(`main.blocker`, `${reason}|${menu_kind ?? ''}`)
         return { id: `${mainId}:${reason}:${menu_kind ?? '-'}:${Date.parse(at).toString(36)}`, reason, since: at, until, menu_kind,
-          assignee: menu_kind ? (f.dutyHandles?.(menu_kind) ? 'duty-officer' : 'joey') : null, action_id: null, summary: BLOCKER_SUMMARY[reason] }
+          assignee: menu_kind ? (f.dutyHandles?.(menu_kind) ? 'duty-officer' : 'joey') : null, action_id: actionOf(f, menu_kind), summary: BLOCKER_SUMMARY[reason] }
       }
       if (starting) s.activity = 'idle'
       else if (view.state === 'walled') {

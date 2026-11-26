@@ -95,6 +95,8 @@ test('every other path names its author (source pins)', () => {
     "if (ctx.callbackQuery) return Onsen.withSender('system:button', () => next())",
     "Onsen.withoutRecord(() => ctx.reply(",
     "Onsen.withSender('system:permission', () => bot.api.setMessageReaction(chat_id, msgId,",
+    // WO-176: a press in Onsen edits every copy of a permission prompt
+    "Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg,",
     "Onsen.withSender('system:ack', () => bot.api",
     "Onsen.sendCtx() ?? Onsen.DEFAULT_CTX",
   ]) expect(src).toContain(s)

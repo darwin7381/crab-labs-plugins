@@ -64,8 +64,8 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
-import { DUTY_MENUS, ScreenStatus, Since, composeRecord, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type MenuActions } from './duty-officer.ts'
+import { DUTY_MENUS, ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
@@ -1511,6 +1511,160 @@ const pendingPermissions = new Map<string, {
   input_preview: string
   server: Server
 }>()
+// WO-176 (board, Onsen contract v1 §6): each permission prompt is also an Action in Onsen (assignees: the people it went to; options allow / deny), and
+// the duty officer's menus too (menuActions). Per prompt: its Telegram copies (an answer in Onsen edits every copy; a tap still edits only the tapped one,
+// as before), its Action, and how it ended. Kept while open and for a day after it ended (a control item that comes late still finds what happened).
+// Every Onsen call is in the background (onsen-client.ts OnsenActions): the prompt goes to Telegram and the answer to Claude Code exactly as before,
+// Onsen up or down. ONSEN_ACTIONS=0: no new Action (the stop switch)
+type PermCopy = { chat: string; msg: number; text: string }
+type PermPrompt = { request_id: string; tool_name: string; copies: PermCopy[]; action: Onsen.ActionHandle | null; opened: number
+  ended: { how: 'answered' | 'gone'; option?: 'allow' | 'deny'; member?: string | null; via: 'telegram' | 'onsen' | 'daemon'; at: number } | null }
+const permPrompts = new Map<string, PermPrompt>()
+const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log,
+  on: Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
+// A prompt lives only in this process (Claude Code's channel answer goes to the session that asked): after a restart none of them can be answered here
+// any more. The open ones' Action ids are kept in a file; the next start cancels them, so Joey's list never keeps a prompt nobody can press
+const PERM_OPEN_FILE = join(STATE_DIR, 'onsen', 'open-permission-actions.json')
+function savePermOpen(): void {
+  const open: Record<string, number> = {}
+  for (const p of permPrompts.values()) if (!p.ended && p.action?.id) open[p.action.id] = p.action.version
+  try { mkdirSync(dirname(PERM_OPEN_FILE), { recursive: true }); writeFileSync(PERM_OPEN_FILE, JSON.stringify(open)) } catch {}
+}
+if (onsenActions) {
+  let left: Record<string, unknown> = {}
+  try { left = JSON.parse(readFileSync(PERM_OPEN_FILE, 'utf8')) } catch {}
+  const ids = Object.entries(left).filter(([id, v]) => /^\d{1,18}$/.test(id) && Number.isInteger(v))
+  if (ids.length) log('info', `onsen action: ${ids.length} permission prompt(s) open when this daemon last stopped; cancelling their Actions (nobody can answer them here now)`)
+  for (const [id, v] of ids) onsenActions.cancel(onsenActions.adopt(id, v as number), '常駐程式重開了，這個權限詢問已經按不到了')
+  try { if (ids.length) writeFileSync(PERM_OPEN_FILE, '{}') } catch {}
+}
+const PERM_OPTIONS = [{ id: 'allow', label: '允許' }, { id: 'deny', label: '拒絕' }]
+function permPrompt(request_id: string, tool_name: string): PermPrompt {
+  const now = Date.now()
+  for (const [k, p] of permPrompts) if (p.ended && now - p.ended.at > 86_400_000) permPrompts.delete(k)
+  while (permPrompts.size >= 300) permPrompts.delete(permPrompts.keys().next().value!)
+  const p: PermPrompt = { request_id, tool_name, copies: [], action: null, opened: now, ended: null }
+  permPrompts.set(request_id, p)
+  return p
+}
+/** the prompt's Action (after its Telegram copies went out; made in the background) */
+function permAction(p: PermPrompt, description: string, input_preview: string, recipients: string[]): void {
+  if (!onsenActions?.on) return
+  let input = input_preview
+  try { input = JSON.stringify(JSON.parse(input_preview), null, 2) } catch {}
+  const body = `**${p.tool_name}**\n\n${description}\n\n\`\`\`\n${input.replace(/```/g, "'''").slice(0, 3500)}\n\`\`\``
+  p.action = onsenActions.open({ source: 'permission', menu_kind: 'permission', session_id: 'main', assignees: Onsen.assigneesOf(recipients),
+    summary: `${p.tool_name}：${description}`, body, options: PERM_OPTIONS }, `perm:${ONSEN_AGENT}:${p.request_id}:${p.opened}`, () => { if (!p.ended) savePermOpen() })
+}
+/** answered in Telegram (a button or `yes xxxxx`) by this Telegram user: the Action resolved, then applied */
+function permAnswered(request_id: string, behavior: 'allow' | 'deny', senderId: string): void {
+  const p = permPrompts.get(request_id)
+  if (!p || p.ended) return
+  const member = Onsen.memberOfTg(senderId)
+  p.ended = { how: 'answered', option: behavior, member, via: 'telegram', at: Date.now() }
+  onsenActions?.pressedElsewhere(p.action, behavior, member ?? '', new Date().toISOString())
+  if (p.action?.id) savePermOpen()
+}
+/** the prompt's session closed or was evicted, or its prompt was answered on the screen: nothing will be pressed (cancelled) */
+function permGone(request_id: string, reason: string): void {
+  const p = permPrompts.get(request_id)
+  if (!p || p.ended) return
+  p.ended = { how: 'gone', via: 'daemon', at: Date.now() }
+  onsenActions?.cancel(p.action, reason)
+  if (p.action?.id) savePermOpen()
+}
+/** the duty officer's keys went to a permission prompt on the main's screen: the channel's prompts open now are over (their Telegram copies stay) */
+function permScreenPressed(): void {
+  for (const p of permPrompts.values()) if (!p.ended && p.action) permGone(p.request_id, '在畫面上按掉了（值班員）')
+}
+/** WO-176: a status blocker's Action (screen-status.ts RecordFacts.actionFor): the newest open permission prompt's, else the duty officer's open ask on the
+ *  main's pane for that menu; null: none */
+function openActionFor(menu: string | null): string | null {
+  if (!onsenActions) return null
+  if (menu === 'permission') { const h = onsenActions.newestOpen(x => x.source === 'permission'); if (h?.id) return h.id }
+  const own = (process.env.CHANNEL_BOT_TMUX_SESSION ?? '').trim()
+  return own && dutyOfficer ? dutyOfficer.openActionFor(own, menu) : null
+}
+/** WO-176: the menu on the pane now, for its Action: the main's pane: the status record's (a waiting record names it); else a tool call waiting in the
+ *  transcript under a menu: a question or a plan (AskUserQuestion, ExitPlanMode), any other tool a permission prompt; null: not known */
+function menuKindNow(own: boolean, bundle?: Record<string, unknown>): string | null {
+  if (own) {
+    try {
+      const v = onsenStatusCompute?.()
+      const w = v?.state === 'waiting' ? String(v.detail?.waitingFor ?? '') : ''
+      if (w && w !== 'none' && isVerdictMenu(w)) return w
+      if (/permission/i.test(w)) return 'permission'
+    } catch {}
+  }
+  const p = bundle?.pending_tool_call as { tool?: unknown } | null | undefined
+  if (!p) return null
+  return /^(AskUserQuestion|ExitPlanMode)$/.test(String(p.tool ?? '')) ? 'plan_or_question' : 'permission'
+}
+/** WO-176: the duty officer's menus as Actions (duty-officer.ts MenuActions): its own pane's (session `main`) and a test pane's it owns */
+function menuActions(acts: Onsen.OnsenActions): MenuActions {
+  const own = (): string => (process.env.CHANNEL_BOT_TMUX_SESSION ?? '').trim()
+  const handle = (ref: ActionRef): Onsen.ActionHandle | undefined => ref.id ? acts.adopt(ref.id, ref.version ?? 1, ref.key) : acts.find(ref.key)
+  return {
+    pane: (t, bundle) => {
+      const mine = !!own() && t.tmux === own()
+      if (!mine && !t.test) return null
+      return { session_id: mine ? 'main' : null, menu_kind: menuKindNow(mine, bundle) }   // CONTRACT v1: the main session is written `main`
+    },
+    assignees: chats => Onsen.assigneesOf(chats),
+    open: (f, key, made) => { acts.open({ source: 'menu', ...f }, key, h => { if (h.id) made(h.id, h.version) }) },
+    pressed: (f, option_id, key) => { acts.open({ source: 'menu', ...f, resolved: { option_id, by: 'duty-officer' } }, key) },
+    answered: (ref, option_id, member, at) => acts.pressedElsewhere(handle(ref), option_id, member ?? '', at),
+    applied: (ref, o) => { const h = handle(ref); acts.applied(h, o.option_id && h ? { ...o, resolved_by: h.assignee(o.resolved_by) } : o) },
+    cancel: (ref, reason) => acts.cancel(handle(ref), reason),
+    screenPressed: (tmux, menu) => { if (menu === 'permission' && tmux === own()) permScreenPressed() },
+  }
+}
+/** WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by the agent-inbox daemon
+ *  (POST /onsen/action): pressed here as a press in Telegram would be, then reported applied; a prompt that is gone: cancelled, nothing pressed */
+async function applyActionControl(c: Onsen.ActionControl): Promise<void> {
+  const acts = onsenActions
+  if (!acts) return
+  const p = [...permPrompts.values()].find(x => x.action?.id === c.action_id)
+  const h = acts.adopt(c.action_id, c.version)
+  if (p) { await applyPermissionControl(p, h, c); return }
+  if (dutyOfficer) {
+    const out = await dutyOfficer.onOnsen(c.action_id, c.option_id, c.version, acts.resolver(c.action_id))
+    if (out !== 'unknown') { log('info', `onsen action ${c.action_id}: duty-officer menu, ${c.option_id} pressed in Onsen: ${out}`); return }
+  }
+  log('warn', `onsen action ${c.action_id}: Onsen pressed ${c.option_id} on an Action this daemon has no prompt or menu for (gone, or made before a restart); nothing pressed, cancelled`)
+  acts.cancel(h, '選單已經不在了（常駐程式沒有這個詢問）')
+}
+async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+  const acts = onsenActions!
+  if (p.ended?.how === 'answered') { acts.applied(h, { option_id: p.ended.option, resolved_by: h.assignee(p.ended.member) }); return }
+  const pending = pendingPermissions.get(p.request_id)
+  if (p.ended || !pending) {
+    if (!p.ended) p.ended = { how: 'gone', via: 'daemon', at: Date.now() }
+    acts.cancel(h, '權限詢問已經不在了（對話關了或重開了，或在畫面上按掉了），沒有按')
+    return
+  }
+  if (c.option_id !== 'allow' && c.option_id !== 'deny') { acts.cancel(h, `不認得的選項 ${c.option_id}`); return }
+  const behavior = c.option_id
+  pendingPermissions.delete(p.request_id)
+  p.ended = { how: 'answered', option: behavior, member: null, via: 'onsen', at: Date.now() }
+  savePermOpen()
+  try {
+    await Promise.race([pending.server.notification({ method: 'notifications/claude/channel/permission', params: { request_id: p.request_id, behavior } }),
+      new Promise((_, rej) => { const t = setTimeout(() => rej(new Error('no answer in 5 s')), 5000); (t as any).unref?.() })])
+  } catch (err) {
+    log('error', `permission reply notify (pressed in Onsen, action ${c.action_id}) failed: ${err}`)
+    p.ended = { how: 'gone', via: 'daemon', at: Date.now() }
+    acts.cancel(h, '權限的回答送不回那個對話（對話已經斷了）')
+    return
+  }
+  acts.applied(h, { at: new Date().toISOString() })
+  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  for (const cp of p.copies) {
+    void Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg, `${cp.text}\n\n${label}\n從 Onsen 按的`, { reply_markup: { inline_keyboard: [] } }))
+      .catch(e => log('warn', `permission edit ${cp.chat}/${cp.msg} (pressed in Onsen) failed: ${e}`))
+  }
+  log('info', `permission ${p.request_id}: ${behavior} pressed in Onsen (action ${c.action_id}); answered Claude Code, ${p.copies.length} Telegram cop${p.copies.length === 1 ? 'y' : 'ies'} edited`)
+}
 
 // ---- A2A mesh (agent-inbox mode) -------------------------------------------
 // Fleet registry: agent name -> inbox inject URL. One JSON file per machine;
@@ -2097,11 +2251,16 @@ function buildServer(): Server {
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
-    for (const chat_id of opsRecipients(access)) {
-      void Onsen.withSender('system:permission', () => bot.api.sendMessage(chat_id, text, { reply_markup: keyboard })).catch(e => {   // Onsen (WO-139)
-        log('error', `permission_request send to ${chat_id} failed: ${e}`)
-      })
+    const prompt = permPrompt(request_id, tool_name)                         // WO-176
+    const recipients = opsRecipients(access)
+    for (const chat_id of recipients) {
+      void Onsen.withSender('system:permission', () => bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }))   // Onsen (WO-139)
+        .then(m => { prompt.copies.push({ chat: chat_id, msg: m.message_id, text }) })   // WO-176: kept, so a press in Onsen edits every copy
+        .catch(e => {
+          log('error', `permission_request send to ${chat_id} failed: ${e}`)
+        })
     }
+    permAction(prompt, description, input_preview, recipients)           // WO-176: its Action, in the background (after the sends started)
   },
 )
 
@@ -2571,6 +2730,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
     }),
     tmux: realTmux,
     model: askModelCli,
+    ...(onsenActions ? { actions: menuActions(onsenActions) } : {}),        // WO-176: its menus as Onsen Actions
     recipients: () => opsRecipients(loadAccess()),
     send: (chats, text, buttons) => Onsen.withSender('system:duty-officer', async () => {   // Onsen (WO-139)
       const kb = buttons ? (() => {
@@ -2881,7 +3041,7 @@ bot.on('callback_query:data', async ctx => {
     }
     const who = ctx.from.username ? `@${ctx.from.username}` : senderId
     let toast = ''
-    try { toast = await dutyOfficer.onTap(data, who) }
+    try { toast = await dutyOfficer.onTap(data, who, Onsen.memberOfTg(senderId)) }   // WO-176: his member name, for the Action
     catch (err) { toast = '處理時出錯，沒有按'; log('warn', `duty-officer tap failed: ${err instanceof Error ? err.message : err}`) }
     await ctx.answerCallbackQuery({ text: toast.slice(0, 190) }).catch(() => {})
     return
@@ -3011,6 +3171,9 @@ bot.on('callback_query:data', async ctx => {
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
     await ctx.editMessageText(expanded, { reply_markup: keyboard }).catch(() => {})
+    { const cm: any = ctx.callbackQuery.message                            // WO-176: that copy's text now (a press in Onsen edits it from here)
+      const cp = permPrompts.get(request_id)?.copies.find(c => c.chat === String(cm?.chat?.id) && c.msg === cm?.message_id)
+      if (cp) cp.text = expanded }
     await ctx.answerCallbackQuery().catch(() => {})
     return
   }
@@ -3025,6 +3188,7 @@ bot.on('callback_query:data', async ctx => {
       params: { request_id, behavior },
     }).catch(err => log('error', `permission reply notify failed: ${err}`))
     pendingPermissions.delete(request_id)
+    permAnswered(request_id, behavior as 'allow' | 'deny', senderId)       // WO-176: the Action follows (background)
   } else {
     log('warn', `permission callback for unknown request_id=${request_id} (session may have already disconnected)`)
   }
@@ -3419,6 +3583,7 @@ async function handleInbound(
         params: { request_id: reqId, behavior },
       }).catch(err => log('error', `permission text-reply notify failed: ${err}`))
       pendingPermissions.delete(reqId)
+      permAnswered(reqId, behavior, String(from.id))                        // WO-176: the Action follows (background)
     } else {
       log('warn', `permission text-reply for unknown request_id=${reqId}`)
     }
@@ -3935,7 +4100,7 @@ function evictZombieSession(sid: string, reason: string): void {
   sessionLastActiveAt.delete(sid)
   if (srv) {
     for (const [reqId, p] of pendingPermissions) {
-      if (p.server === srv) pendingPermissions.delete(reqId)
+      if (p.server === srv) { pendingPermissions.delete(reqId); permGone(reqId, '對話斷了（常駐程式清掉了這個 session）') }   // WO-176: its Action cancelled
     }
   }
   forgetIssuedSession(sid)
@@ -4186,7 +4351,7 @@ async function openSession(resumeId?: string): Promise<StreamableHTTPServerTrans
       if (Lanes.LANES_ON) Lanes.forgetMcpSession(transport.sessionId)
       log('info', `MCP session closed: ${transport.sessionId} (active=${activeServers.size})`)
       for (const [reqId, p] of pendingPermissions) {
-        if (p.server === server) pendingPermissions.delete(reqId)
+        if (p.server === server) { pendingPermissions.delete(reqId); permGone(reqId, '對話關了') }   // WO-176: its Action cancelled
       }
       if (isRoamerEnabled()) {
         roamerOnMcpSessionClosed(transport.sessionId)
@@ -4558,7 +4723,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     return { now, since: (k, val) => sinceMem.at(k, val, now), session_id: sid, turn: t ? { id: t.id, started_at: t.started_at, trigger: t.trigger } : null,
       turn_thread: t?.thread ?? null, last_turn: tap ? tap.lastTurn() : watch?.lastTurn() ?? null,
       queue: tap ? Lanes.mainQueueCounts() : facts.counts(), scheduleThread: th => Lanes.LANES_ON && Lanes.threadKeyKind(th) === 'schedule',
-      dutyHandles: m => DUTY_MENUS.has(m) && !!ownTmux && !!dutyOfficer?.handles(ownTmux) }
+      dutyHandles: m => DUTY_MENUS.has(m) && !!ownTmux && !!dutyOfficer?.handles(ownTmux), actionFor: m => openActionFor(m) }   // WO-176: actionFor
   }
   onsenStatusCompute = currentStatus                                    // WO-157 / WO-169: the lanes' one state source (decideWake, 此刻, the same-matter gate, the Esc wrap-up)
   // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's
@@ -4917,6 +5082,8 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function deliverPulled(it: PullItem): Promise<HandResult> {
+  // WO-176: Onsen's control item (a press in Onsen, no text) is for this agent's Telegram daemon, never for a session: no comms row, no router, no wake row
+  if (it.kind === Onsen.ACTION_CONTROL_KIND) return controlPulled(it)
   // the sender's facts in Onsen's own fields (0.9.3) count as much as the payload's: an item whose no_reply is only a top-level fact is still a
   // no-reply answer to the router (Chiron WO-158 11:56Z: a no_reply peer_call sent that way opened a lane)
   const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}),
@@ -4934,6 +5101,45 @@ async function deliverPulled(it: PullItem): Promise<HandResult> {
   const ok = out.json.injected === true || out.json.ignored != null
   log(ok ? 'info' : 'warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) from ${verdict.sender}${it.relay ? ` via ${it.relay}` : ''}${unverified ? ' (unverified)' : ''}${key ? ` ${key}` : ' (no key)'}: ${ok ? 'handed on' : `not delivered ${JSON.stringify(out.json).slice(0, 160)}`}`)
   return ok ? 'delivered' : 'undelivered'
+}
+/** WO-176: an action_control item (sender onsen: a person pressed an option of one of this agent's Actions in Onsen). Handed to this agent's Telegram
+ *  daemon (POST /onsen/action on LANES_TG_PORT, the loopback token), which presses it. Not taken: the item stays pending and is tried again
+ *  (ONSEN_ACTION_FORWARD_GAPS_MS, default 10 s and 20 s later: three tries in ~30 s; the inbox waits meanwhile); after the last try it is acked and its
+ *  Action cancelled ("daemon could not apply"), so an agent's messages never stall behind it. Anything else of that kind: dropped, nothing pressed */
+const ACTION_FORWARD_GAPS_MS = (process.env.ONSEN_ACTION_FORWARD_GAPS_MS ?? '10000,20000').split(',').map(x => Number(x.trim())).filter(n => Number.isFinite(n) && n >= 0)
+let inboxActions: Onsen.OnsenActions | null = null
+async function controlPulled(it: PullItem): Promise<HandResult> {
+  const c = it.sender === Onsen.ACTION_CONTROL_SENDER && it.unverified !== true ? Onsen.actionControlOf(it.payload) : null
+  if (!c) {
+    log('warn', `onsen inbox: item ${it.seq} (${it.kind}) from ${String(it.sender ?? '?').slice(0, 64)}: not a control item as Onsen sends it; dropped, nothing pressed`)
+    return 'undelivered'
+  }
+  const key = itemKey(it)
+  if (key && onsenInbox?.seen(key)) return 'duplicate'
+  const port = Number(process.env.LANES_TG_PORT ?? 0)
+  let why = port ? '' : 'LANES_TG_PORT is not set (no Telegram daemon to hand it to)'
+  for (let i = 0; port && i <= ACTION_FORWARD_GAPS_MS.length; i++) {
+    if (i) await new Promise(r => setTimeout(r, ACTION_FORWARD_GAPS_MS[i - 1]))
+    let tok = ''
+    try { tok = readFileSync(join(process.env.MCP_TOKEN_DIR ?? join(homedir(), '.claude', 'agent-inbox', 'mcp-tokens'), String(port)), 'utf8').trim() } catch {}
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/onsen/action`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+        body: JSON.stringify(c), signal: AbortSignal.timeout(5000) })
+      if (r.status === 202 || r.status === 200) {
+        if (key) onsenInbox?.record(key)
+        log('info', `onsen inbox: item ${it.seq} (action_control) action ${c.action_id} ${c.option_id} v${c.version}: handed to the Telegram daemon (:${port})`)
+        return 'delivered'
+      }
+      why = `HTTP ${r.status}`
+    } catch (e) { why = String(e instanceof Error ? e.message : e).slice(0, 120) }
+    log('warn', `onsen inbox: item ${it.seq} (action_control) action ${c.action_id}: the Telegram daemon did not take it (try ${i + 1} of ${ACTION_FORWARD_GAPS_MS.length + 1}: ${why})`)
+  }
+  log('warn', `onsen inbox: item ${it.seq} (action_control) action ${c.action_id} ${c.option_id}: not handed over (${why}); acked, nothing pressed, the Action is cancelled`)
+  if (onsenReq) {
+    inboxActions ??= new Onsen.OnsenActions({ req: onsenReq, log })
+    inboxActions.cancel(inboxActions.adopt(c.action_id, c.version), 'daemon could not apply')
+  }
+  return 'undelivered'
 }
 
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
@@ -5052,6 +5258,23 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       for (const k of ['limit', 'since', 'until', 'q', 'id', 'chat']) { const v = u.searchParams.get(k); if (v) args[k] = k === 'limit' ? Number(v) : v }
       const text = await onsen.queryHistory(args, 'hook').catch(e => `chat_history failed: ${e instanceof Error ? e.message : e}`)
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(text)
+      return
+    }
+    // WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by this agent's agent-inbox daemon
+    // (its Onsen pull). Same loopback token as /mcp. Taken at once (202) and pressed here in the background, so the inbox never waits for a key
+    if (!INBOX_ONLY && u.pathname === '/onsen/action' && req.method === 'POST') {
+      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {
+        const r = refusal(req.headers['authorization'] as string | undefined)
+        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
+        return
+      }
+      const c = Onsen.actionControlOf(await readJsonBody(req).catch(() => null))
+      if (!c || !onsenActions) {
+        res.writeHead(c ? 503 : 400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: c ? 'no Onsen client in this daemon' : 'body is {action_id, option_id, version}' }))
+        return
+      }
+      res.writeHead(202, { 'content-type': 'application/json' }).end(JSON.stringify({ accepted: true }))
+      void applyActionControl(c).catch(e => log('warn', `onsen action ${c.action_id}: applying the press from Onsen failed: ${e instanceof Error ? e.message : e}`))
       return
     }
     // WO-126 (1.38.1): the main's mailbox_decide, handed over by this agent's Telegram daemon (its tool lives there); same loopback token as /mcp

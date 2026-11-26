@@ -473,12 +473,13 @@ export class OnsenClient {
   private headers(cred: string, extra: Record<string, string> = {}): Record<string, string> {
     return { 'Content-Type': 'application/json', Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}`, ...extra }
   }
-  /** WO-145: one call to Onsen with this agent's credential (null: no credential); throws on a network error or the timeout */
-  async request(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 15_000): Promise<{ status: number; json: any } | null> {
+  /** WO-145: one call to Onsen with this agent's credential (null: no credential); throws on a network error or the timeout. `headers` (WO-176): extra
+   *  request headers (an Idempotency-Key) */
+  async request(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>): Promise<{ status: number; json: any } | null> {
     const cred = this.cfg.credential()
     if (!cred) return null
-    if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs)
-    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred), signal: AbortSignal.timeout(timeoutMs) })
+    if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs, headers)
+    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, headers), signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
@@ -492,8 +493,8 @@ export class OnsenClient {
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
-  private async post(path: string, body: unknown, cred: string, timeoutMs?: number): Promise<{ status: number; json: any }> {
-    const r = await this.f(`${this.cfg.base}${path}`, { method: 'POST', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
+  private async post(path: string, body: unknown, cred: string, timeoutMs?: number, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
+    const r = await this.f(`${this.cfg.base}${path}`, { method: 'POST', headers: this.headers(cred, headers), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
@@ -1016,3 +1017,222 @@ export function recordFor(env: NodeJS.ProcessEnv, agent: string): boolean {
   return list.includes('*') || list.includes(agent)
 }
 export const onsenBase = (env: NodeJS.ProcessEnv): string => ((env.ONSEN_BASE ?? '').trim() || 'https://core.kbro.ai/api/onsen').replace(/\/+$/, '')
+
+// ------------------------------------------------------------------ WO-176: Actions (Onsen client API v1 /v1/actions; fleet-core onsen_actions.py)
+// A thing waiting on a person's decision that this daemon relays: a Claude Code permission prompt, a menu the duty officer asks about; and a menu the duty
+// officer pressed itself (made resolved, assignees duty-officer). The daemon makes the Action, reports a press in Telegram (resolve, then applied; Onsen
+// answered first: applied with what was really pressed), a press it made for Onsen (applied), and a menu that went away (cancel). Every call is
+// best-effort: it runs in the background (nothing here is awaited by a Telegram send or by Claude Code's answer), 5 s each, two more tries after a
+// transport failure, a 5xx or a 429; it never throws. The calls of one Action run in order, its create first; an Action Onsen never made takes no other
+// call. ONSEN_ACTIONS (a comma list of agent names or `*`; unset = every agent; 0 = none) is the stop switch for making new ones.
+export const ACTION_CONTROL_KIND = 'action_control'
+export const ACTION_CONTROL_SENDER = 'onsen'
+export type ActionOption = { id: string; label: string }
+export type ActionSource = 'permission' | 'menu'
+export type NewAction = { source: ActionSource; menu_kind?: string | null; session_id?: string | null; assignees: string[]; summary: string
+  body?: string | null; options: ActionOption[]
+  /** the duty officer's own press: made resolved (the option it pressed, resolved_by duty-officer), applied at once */
+  resolved?: { option_id: string; by: string } }
+export type ActionReq = (method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number, headers?: Record<string, string>) => Promise<{ status: number; json: any } | null>
+export type ActionState = 'pending' | 'open' | 'resolved' | 'expired' | 'cancelled' | 'failed'
+/** an Action control item's payload (onsen_actions.py _control) */
+export type ActionControl = { action_id: string; option_id: string; version: number }
+/** Telegram user ids → Onsen member names (fleet-core onsen.py HUMAN_ALIASES); anyone else has no name Onsen knows */
+export const TG_MEMBERS: Readonly<Record<string, string>> = { '1828173984': 'joey', '6736970916': 'joey-test' }
+export const memberOfTg = (id: unknown): string | null => TG_MEMBERS[String(id ?? '')] ?? null
+/** the assignees of a question sent to these Telegram chats: the members among them (in order, once each), else joey */
+export function assigneesOf(chats: unknown[]): string[] {
+  const out: string[] = []
+  for (const c of chats) { const m = memberOfTg(c); if (m && !out.includes(m)) out.push(m) }
+  return out.length ? out : ['joey']
+}
+/** ONSEN_ACTIONS: unset or empty = on; 0 / off / false / no = off; else a comma list of agent names or `*` */
+export function actionsOn(env: NodeJS.ProcessEnv, agent: string): boolean {
+  const v = (env.ONSEN_ACTIONS ?? '').trim()
+  if (!v) return true
+  if (['0', 'off', 'false', 'no'].includes(v.toLowerCase())) return false
+  const list = v.split(',').map(x => x.trim()).filter(Boolean)
+  return list.includes('*') || list.includes(agent)
+}
+/** an action_control item's payload, checked: {action_id (digits), option_id, version}; null when it is not one */
+export function actionControlOf(p: unknown): ActionControl | null {
+  const o = (p ?? {}) as Record<string, unknown>
+  const id = typeof o.action_id === 'number' ? String(o.action_id) : o.action_id
+  if (typeof id !== 'string' || !/^\d{1,18}$/.test(id)) return null
+  if (typeof o.option_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,39}$/.test(o.option_id)) return null
+  if (typeof o.version !== 'number' || !Number.isInteger(o.version) || o.version < 1) return null
+  return { action_id: id, option_id: o.option_id, version: o.version }
+}
+/** one line of at most n characters */
+export const actionLine = (s: unknown, n: number): string => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length <= n ? t : t.slice(0, n - 1) + '…' }
+
+/** one Action as this daemon follows it. id / version: null / 0 until Onsen made it; `tail`: its calls, in order */
+export class ActionHandle {
+  id: string | null = null
+  version = 0
+  state: ActionState = 'pending'
+  appliedAt: string | null = null
+  tail: Promise<void> = Promise.resolve()
+  constructor(readonly key: string, readonly source: ActionSource | null, readonly assignees: string[], readonly menu_kind: string | null, readonly made = Date.now()) {}
+  /** a name in its assignees: `who` when it is one, else the first */
+  assignee(who: string | null | undefined): string { return who && this.assignees.includes(who) ? who : this.assignees[0] ?? (who || 'joey') }
+}
+type CallResult = { status: number; json: any } | null
+
+export class OnsenActions {
+  readonly stats = { created: 0, resolved: 0, applied: 0, cancelled: 0, conflicts: 0, failed: 0, skipped: 0, last_error: null as string | null }
+  private byKey = new Map<string, ActionHandle>()
+  private byId = new Map<string, ActionHandle>()
+  private credWarnAt = 0
+  private callErr = ''
+  constructor(readonly o: { req: ActionReq; log: Log; on?: boolean; timeoutMs?: number; retryMs?: number[]; keep?: number }) {}
+  /** making new Actions (ONSEN_ACTIONS); the calls about one that exists go on either way */
+  get on(): boolean { return this.o.on !== false }
+
+  /** a new Action (returns at once; Onsen makes it in the background). `made`: called once Onsen gave it an id. null: off, or not a valid Action */
+  open(a: NewAction, key: string, made?: (h: ActionHandle) => void): ActionHandle | null {
+    if (!this.on) return null
+    const why = !a.assignees.length ? 'no assignee' : !a.options.length ? 'no option' : a.options.length > 10 ? 'more than 10 options' : !actionLine(a.summary, 200) ? 'no summary' : ''
+    if (why) { this.stats.skipped++; this.o.log('info', `onsen action: not made (${why}): ${key}`); return null }
+    const h = new ActionHandle(key, a.source, a.assignees, a.menu_kind ?? null)
+    this.keep(h)
+    this.queue(h, async () => {
+      const body: Record<string, unknown> = { source: a.source, assignees: a.assignees, summary: actionLine(a.summary, 200),
+        options: a.options.map(x => ({ id: x.id, label: actionLine(x.label, 80) || x.id })) }
+      if (a.menu_kind !== undefined) body.menu_kind = a.menu_kind
+      if (a.session_id) body.session_id = String(a.session_id).slice(0, 120)
+      if (a.body) body.body = { format: 'markdown', text: a.body.length > 4000 ? a.body.slice(0, 3999) + '…' : a.body }
+      if (a.resolved) Object.assign(body, { state: 'resolved', selected_option_id: a.resolved.option_id, resolved_by: a.resolved.by })
+      const r = await this.call('POST', '/v1/actions', body, { 'Idempotency-Key': key })
+      if (r && (r.status === 201 || r.status === 200) && r.json?.data?.id != null) {
+        this.take(h, r.json.data)
+        this.stats.created++
+        this.o.log('info', `onsen action ${h.id}: made (${a.source}${a.menu_kind ? ` ${a.menu_kind}` : ''}, ${h.state}${a.resolved ? ` ${a.resolved.option_id} by ${a.resolved.by}` : ''}, for ${a.assignees.join(',')})`)
+        try { made?.(h) } catch {}
+      } else {
+        h.state = 'failed'
+        this.fail(`create ${key}`, r)
+      }
+    })
+    return h
+  }
+  /** the handle of an Action this process did not make (a control item, an ask kept on disk): the one it has, else a new one at that version */
+  adopt(id: string, version: number, key?: string): ActionHandle {
+    const had = this.byId.get(id) ?? (key ? this.byKey.get(key) : undefined)
+    if (had) { if (had.id == null) { had.id = id; this.byId.set(id, had) } if (version > had.version) had.version = version; return had }
+    const h = new ActionHandle(key ?? `adopted:${id}`, null, [], null)
+    h.id = id; h.version = version; h.state = 'open'
+    this.keep(h)
+    return h
+  }
+  find(key?: string | null, id?: string | null): ActionHandle | undefined { return (key ? this.byKey.get(key) : undefined) ?? (id ? this.byId.get(id) : undefined) }
+
+  /** pressed in Telegram by `by` (a member): resolve, then applied; Onsen answered first (409): applied with what was really pressed */
+  pressedElsewhere(h: ActionHandle | null | undefined, option_id: string, by: string, at?: string): void {
+    if (!h) return
+    this.queue(h, async () => {
+      if (!h.id) return
+      const who = h.assignee(by)
+      const r = await this.call('POST', `/v1/actions/${h.id}/resolve`, { option_id, expected_version: h.version, resolved_by: who })
+      if (r?.status === 200) { this.take(h, r.json?.data); this.stats.resolved++; this.o.log('info', `onsen action ${h.id}: resolved ${option_id} by ${who} (pressed in Telegram)`) }
+      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: answered in Onsen first (${errOf(r)}); reporting what was pressed in Telegram (${option_id})`) }
+      else { this.fail(`resolve ${h.id}`, r); return }
+      await this.appliedNow(h, { ...(at ? { at } : {}), ...(r?.status === 409 ? { option_id, resolved_by: who } : {}) })
+    })
+  }
+  /** this daemon pressed the answer (for Onsen's control item, or the answer Telegram gave before it came: option_id and resolved_by) */
+  applied(h: ActionHandle | null | undefined, o: { at?: string; option_id?: string; resolved_by?: string } = {}): void {
+    if (!h) return
+    this.queue(h, () => this.appliedNow(h, o))
+  }
+  /** the menu went away, the session closed, or nothing was pressed: cancelled (an open Action, or one answered in Onsen and not applied). A version that
+   *  moved meanwhile is read once and tried again */
+  cancel(h: ActionHandle | null | undefined, reason: string): void {
+    if (!h) return
+    this.queue(h, async () => {
+      if (!h.id || h.state === 'cancelled' || h.state === 'expired' || h.appliedAt) return
+      let r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: actionLine(reason, 300) })
+      if (r?.status === 409) {
+        const g = await this.call('GET', `/v1/actions/${h.id}`)
+        const d = g?.status === 200 ? g.json?.data : null
+        if (d && (d.state === 'open' || (d.state === 'resolved' && !d.applied_at)) && Number(d.version) !== h.version) {
+          this.take(h, d)
+          r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: actionLine(reason, 300) })
+        } else if (d) this.take(h, d)
+      }
+      if (r?.status === 200) { this.take(h, r.json?.data); this.stats.cancelled++; this.o.log('info', `onsen action ${h.id}: cancelled (${actionLine(reason, 120)})`) }
+      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: not cancelled, already over (${errOf(r)})`) }
+      else this.fail(`cancel ${h.id}`, r)
+    })
+  }
+  /** who answered it in Onsen (resolved_by), for the closing line in Telegram; null: not known within 3 s */
+  async resolver(id: string): Promise<string | null> {
+    try {
+      const r = await this.o.req('GET', `/v1/actions/${id}`, undefined, 3000)
+      const d = r?.status === 200 ? r.json?.data : null
+      return d && typeof d.resolved_by === 'string' ? d.resolved_by : null
+    } catch { return null }
+  }
+  /** the newest Action still open of these (made by this process, Onsen has it) */
+  newestOpen(pred: (h: ActionHandle) => boolean): ActionHandle | null {
+    let best: ActionHandle | null = null
+    for (const h of this.byKey.values()) if (h.id && h.state === 'open' && pred(h) && (!best || h.made >= best.made)) best = h
+    return best
+  }
+  health(): Record<string, unknown> { return { on: this.on, ...this.stats, followed: this.byKey.size } }
+
+  private async appliedNow(h: ActionHandle, o: { at?: string; option_id?: string; resolved_by?: string }): Promise<void> {
+    if (!h.id) return
+    const r = await this.call('POST', `/v1/actions/${h.id}/applied`, o)
+    if (r?.status === 200) { this.take(h, r.json?.data); this.stats.applied++; this.o.log('info', `onsen action ${h.id}: applied${o.option_id ? ` ${o.option_id}` : ''}`) }
+    else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: applied not recorded (${errOf(r)})`) }
+    else this.fail(`applied ${h.id}`, r)
+  }
+  private take(h: ActionHandle, d: any): void {
+    if (!d || typeof d !== 'object') return
+    if (d.id != null && h.id == null) { h.id = String(d.id); this.byId.set(h.id, h) }
+    if (Number.isInteger(d.version)) h.version = d.version
+    if (typeof d.state === 'string') h.state = d.state as ActionState
+    if (d.applied_at !== undefined) h.appliedAt = d.applied_at ?? null
+  }
+  private keep(h: ActionHandle): void {
+    this.byKey.set(h.key, h)
+    if (h.id) this.byId.set(h.id, h)
+    const max = this.o.keep ?? 500
+    while (this.byKey.size > max) {
+      const k = this.byKey.keys().next().value!
+      const old = this.byKey.get(k)
+      this.byKey.delete(k)
+      if (old?.id && this.byId.get(old.id) === old) this.byId.delete(old.id)
+    }
+  }
+  private queue(h: ActionHandle, fn: () => Promise<void>): void {
+    h.tail = h.tail.then(fn).catch(e => { this.stats.failed++; this.o.log('warn', `onsen action ${h.id ?? h.key}: ${e instanceof Error ? e.message : e}`) })
+  }
+  /** one call, tried again after a transport failure, a 5xx or a 429 (retryMs, default 1 s and 4 s); null: no credential, or every try failed */
+  private async call(method: 'GET' | 'POST', path: string, body?: unknown, headers?: Record<string, string>): Promise<CallResult> {
+    const waits = this.o.retryMs ?? [1000, 4000]
+    let last: CallResult = null, lastErr = ''
+    this.callErr = ''
+    for (let i = 0; i <= waits.length; i++) {
+      if (i) await new Promise(r => { const t = setTimeout(r, waits[i - 1]); (t as any).unref?.() })
+      try {
+        const r = await this.o.req(method, path, body, this.o.timeoutMs ?? 5000, headers)
+        if (!r) {
+          if (Date.now() - this.credWarnAt > HOUR) { this.credWarnAt = Date.now(); this.o.log('warn', 'onsen action: no mesh credential; Actions are not reported to Onsen') }
+          return null
+        }
+        last = r
+        if (r.status < 500 && r.status !== 429) return r
+      } catch (e) { lastErr = e instanceof Error ? e.message : String(e) }
+    }
+    if (!last && lastErr) this.callErr = lastErr.slice(0, 160)
+    return last
+  }
+  private fail(what: string, r: CallResult): void {
+    this.stats.failed++
+    this.stats.last_error = `${what}: ${r ? `HTTP ${r.status} ${errOf(r)}` : this.callErr || 'no answer'}`.slice(0, 200)
+    this.o.log('warn', `onsen action: ${this.stats.last_error}`)
+  }
+}
+const errOf = (r: CallResult): string => { const e = r?.json?.error; return e && typeof e === 'object' ? `${e.code ?? ''} ${actionLine(e.message, 140)}`.trim() : actionLine(r?.json?.detail ?? '', 140) }

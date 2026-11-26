@@ -31,6 +31,8 @@ export type Answer = { status: number; json: any } | null
 export type Req = (method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs?: number) => Promise<Answer>
 
 /** one item of the caller's inbox, as GET /inbox gives it (onsen5.py _item). `dedupe`: the sender's key, when Onsen returns it */
+/** `kind` (WO-176): `action_control` (sender onsen, payload {action_id, option_id, version}, no text) is a press in Onsen for this agent's Telegram daemon,
+ *  never handed to a session (server.ts controlPulled) */
 export type PullItem = { seq: number; sender: string; relay?: string | null; kind?: string; payload: Record<string, unknown>; at?: string; given?: number
   dedupe?: string | null; dedupe_key?: string | null
   /** Onsen 0.9.4: a relay passed on a name it could not verify (a BTCC console release); the daemon delivers it as verified=false */
