@@ -3,7 +3,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { InboundStore, InboundWriter, inboundOn, inboundEffective, hasInboxPartner, clientMetaOf, heldText, type Job, type Facts } from './onsen-inbound.ts'
+import { InboundStore, InboundWriter, inboundOn, inboundEffective, hasInboxPartner, clientMetaOf, applyClientMeta, CLIENT_META_FIXED, TG_OWN_FILE_NAME, heldText, type Job, type Facts } from './onsen-inbound.ts'
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const until = async (fn: () => boolean, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await sleep(10) } return false }
@@ -34,6 +34,21 @@ test('WO-197: the switch takes effect only with an agent-inbox partner (LANES_IN
 test('WO-197: client.meta → tag attributes: every key as is (no key named here); other JSON values as their text; not an attribute name: left out', () => {
   expect(clientMetaOf({ meta: { a: '1', b: 'x y', reply_to_user_id: '42', n: 3, o: { k: 1 } } })).toEqual({ a: '1', b: 'x y', reply_to_user_id: '42', n: '3', o: '{"k":1}' })
   for (const c of [null, {}, { meta: null }, { meta: [] }, { meta: {} }, { meta: { '1x': 'a', 'a-b': 'b', z: null } }]) expect(clientMetaOf(c)).toBe(null)
+})
+
+test('WO-197 rule A (Chiron 16:1xZ): client.meta over the tag\'s own values, a new key last; the fixed list (chat_id, message_id, ts, source, topic, user_id) never', () => {
+  const meta: Record<string, string> = { chat_id: '1828', message_id: '5', user: 'joey', user_id: '1828', ts: 'T', topic: '3', reply_to_user: 'joey-test', reply_to_text: 'x' }
+  applyClientMeta(meta, { reply_to_user: 'awesometon5', chat_id: '9', message_id: '9', ts: 'U', source: 's', topic: '9', user_id: '9', forward_origin: 'user' })
+  expect(meta).toEqual({ chat_id: '1828', message_id: '5', user: 'joey', user_id: '1828', ts: 'T', topic: '3', reply_to_user: 'awesometon5', reply_to_text: 'x', forward_origin: 'user' })
+  expect(Object.keys(meta).at(-1)).toBe('forward_origin')
+  expect([...CLIENT_META_FIXED].sort()).toEqual(['chat_id', 'message_id', 'source', 'topic', 'ts', 'user_id'])
+  applyClientMeta(meta, null); applyClientMeta(meta, undefined)
+  expect(meta.reply_to_user).toBe('awesometon5')
+})
+
+test('WO-197 (lab 1007): Telegram\'s own file name (a nameless file\'s, the file path\'s last part) is told from a name the person gave', () => {
+  for (const n of ['file_7.oga', 'file_9.mp4', 'file_12', 'file_0.jpg']) expect(TG_OWN_FILE_NAME.test(n)).toBe(true)
+  for (const n of ['r.pdf', 'song.mp3', 'file_7.oga.pdf', 'my file_7.oga', 'file_x.oga', '👍']) expect(TG_OWN_FILE_NAME.test(n)).toBe(false)
 })
 
 test('the store: facts kept on disk until delivered; then remembered (a second hand-over is a duplicate), across a restart', () => {

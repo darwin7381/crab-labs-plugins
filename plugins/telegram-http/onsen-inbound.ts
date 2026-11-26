@@ -80,9 +80,22 @@ export type Facts = {
   caption?: string
   /** not from Telegram's own message: built from a person_message payload (its picture may be in Onsen only) */
   onsenFiles?: Array<{ kind?: string | null; name?: string | null; mime?: string | null; bytes?: number | null; url?: string | null }>
-  /** WO-197 (Chiron 15:27Z): the person_message's client.meta (what the bridge sent as client_meta; Onsen does not read it): each key an attribute of
-   *  the tag of the same name, as is, last; a key the tag already sets from its own facts keeps the tag's value */
+  /** WO-197 (Chiron 15:27Z; 16:1xZ mesh-12795, rule A): the person_message's client.meta (what the bridge sent as client_meta; Onsen does not read
+   *  it): each key an attribute of the tag of the same name, as is; it overrides what the tag derived from the person_message (reply_to_*, forward_*,
+   *  attachment_*, voice_transcript, …), except the attributes of CLIENT_META_FIXED; a key the tag does not have comes last */
   clientMeta?: Record<string, string>
+}
+
+/** WO-197 (Chiron 16:1xZ, mesh-12795): the tag attributes client.meta never overrides, the one exclusion list. They say where the message is and
+ *  whose it is, what the tools and the router act on, so a bad client_meta can never redirect a reply or pass a message off as another:
+ *  chat_id, message_id (reply / react / edit_message target them; the router's event id), ts (with chat_id and message_id, the key receipt.ts finds
+ *  the delivered copy by), source (the tag's origin, Claude Code's), topic (the reply tool's topic and the router's lane: a reply lands there), user_id
+ *  (whose message it is: the allowlist check of its delivery facts). Everything else the bridge sends wins over what the connector derived */
+export const CLIENT_META_FIXED: ReadonlySet<string> = new Set(['chat_id', 'message_id', 'ts', 'source', 'topic', 'user_id'])
+/** WO-197 (rule A): client.meta onto a tag, last, by whatever builds it (finishInbound; an album's flushAlbum, with its first item's): each key as is,
+ *  over the tag's own value (a new key comes last), except CLIENT_META_FIXED */
+export function applyClientMeta(meta: Record<string, string>, cm: Record<string, string> | null | undefined): void {
+  for (const [k, v] of Object.entries(cm ?? {})) if (!CLIENT_META_FIXED.has(k)) meta[k] = v
 }
 
 /** WO-197: client.meta as tag attributes: every key shaped as an attribute name (letters, digits, _; not starting with a digit), its value as is (a

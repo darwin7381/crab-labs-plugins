@@ -253,7 +253,6 @@ plugins/telegram-http/server.ts::agent: CONNECTOR_AGENT,
 plugins/telegram-http/server.ts::async function connectorFile(fileId: string): Promise<string> {
 plugins/telegram-http/server.ts::if (!c && connectorNow() && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`
 plugins/telegram-http/onsen-inbound.ts::export function clientMetaOf(client: unknown): Record<string, string> | null {
-plugins/telegram-http/server.ts::for (const [k, v] of Object.entries(f.clientMeta ?? {})) if (!(k in meta)) meta[k] = v
 plugins/telegram-http/onsen-inbound.ts::export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
 plugins/telegram-http/server.ts::...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
 plugins/telegram-http/onsen-status.ts::export const HANDLED_HERE = 'daemon'
@@ -263,3 +262,7 @@ plugins/telegram-http/server.ts::() => Onsen.withSender('system:control', () => 
 plugins/telegram-http/server.ts::await handledHere(self, 'permission', async () => {
 plugins/telegram-http/server.ts::const handled = await handledHere(ownSlash, 'command', () => handleControlSlash(
 plugins/telegram-http/server.ts::const handled = await handledHere(ownSlash, 'command', () => handleRoamerSlash(text, replyToTg), h => h !== false)
+plugins/telegram-http/onsen-inbound.ts::export const CLIENT_META_FIXED: ReadonlySet<string> = new Set(['chat_id', 'message_id', 'ts', 'source', 'topic', 'user_id'])
+plugins/telegram-http/onsen-inbound.ts::for (const [k, v] of Object.entries(cm ?? {})) if (!CLIENT_META_FIXED.has(k)) meta[k] = v
+plugins/telegram-http/server.ts::OnsenInbound.applyClientMeta(meta, f.clientMeta)
+plugins/telegram-http/server.ts::OnsenInbound.applyClientMeta(meta, entry.clientMeta)

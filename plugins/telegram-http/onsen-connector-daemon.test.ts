@@ -179,10 +179,10 @@ test('10. a permission prompt: only the Action (no Telegram message); the Bot AP
   expect((await health(d)).connector.bot_api_refused).toEqual({})
 })
 
-test('11. client.meta (the bridge\'s client_meta): every key an attribute of the tag as is, last; a key the tag sets itself keeps its value; none: nothing added', async () => {
+test('11. client.meta (the bridge\'s client_meta): every key an attribute of the tag as is; over what the tag derived (Chiron 16:1xZ, rule A), a new key last; never chat_id; none: nothing added', async () => {
   const base = { conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', kind: 'text', attachments: [], reply_to: null }
   expect(await person({ ...base, message_id: '6011', text: '帶 meta', sent_at: new Date().toISOString(),
-    client: { name: 'telegram', chat: String(JOEY), msg_id: '1011', user: 'joey', user_id: String(JOEY), meta: { a: '1', b: 'x y', chat_id: 'not-this' } } }, 11)).toBe(200)
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1011', user: 'joey', user_id: String(JOEY), meta: { a: '1', b: 'x y', chat_id: 'not-this', user: 'joey_tg' } } }, 11)).toBe(200)
   expect(await person({ ...base, message_id: '6012', text: '沒有 meta', sent_at: new Date().toISOString(),
     client: { name: 'telegram', chat: String(JOEY), msg_id: '1012', user: 'joey', user_id: String(JOEY) } }, 12)).toBe(200)
   expect(await until(() => got.some(g => g.meta.message_id === '1011') && got.some(g => g.meta.message_id === '1012'), 8000)).toBe(true)
@@ -190,6 +190,8 @@ test('11. client.meta (the bridge\'s client_meta): every key an attribute of the
   expect(withMeta.a).toBe('1')
   expect(withMeta.b).toBe('x y')
   expect(withMeta.chat_id).toBe(String(JOEY))
+  expect(withMeta.user).toBe('joey_tg')                       // derived from Onsen's client.user: the bridge's value wins (a87d381 kept the tag's)
+  expect(without.user).toBe('joey')
   expect(Object.keys(withMeta).slice(-2)).toEqual(['a', 'b'])
   expect(Object.keys(withMeta).filter(k => !(k in without)).sort()).toEqual(['a', 'b'])
 })
@@ -224,4 +226,41 @@ test('12. attachment_name as the path before has it: a voice note, a video note 
   expect(tag('1024').content).toBe('(document: r.pdf)')
   expect(tag('1025').meta.attachment_name).toBe('song.mp3')
   expect(api.calls).toEqual([]); expect(api.downloads).toEqual([])
+})
+
+test('13. rule A (Chiron 16:1xZ): client_meta.reply_to_user "awesometon5" over Onsen\'s reply_to.from "joey-test"; the routing and identity attributes (chat_id, message_id, ts, topic, user_id, source) never taken from it', async () => {
+  expect(await person({ conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', kind: 'text', attachments: [], message_id: '6031', text: '回你那則',
+    sent_at: new Date().toISOString(), reply_to: { message_id: '6011', client_msg_id: '1011', from: 'joey-test', text: '帶 meta' },
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1031', user: 'joey', user_id: String(JOEY),
+      meta: { reply_to_user: 'awesometon5', reply_to_user_id: '6736970916', chat_id: '999', message_id: '1', ts: '2000-01-01T00:00:00.000Z', topic: '77', user_id: '4242', source: 'x' } } }, 31)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.message_id === '1031'), 8000)).toBe(true)
+  const m = got.find(g => g.meta.message_id === '1031')!.meta
+  expect(m.reply_to_user).toBe('awesometon5')
+  expect(m.reply_to_user_id).toBe('6736970916')
+  expect(m.reply_to_message_id).toBe('1011')
+  expect(m.chat_id).toBe(String(JOEY))
+  expect(m.user_id).toBe(String(JOEY))
+  expect(m.ts).not.toBe('2000-01-01T00:00:00.000Z')
+  expect('topic' in m || 'source' in m).toBe(false)
+  // a reply to it goes where the message is, whatever client_meta said
+  expect((await d.call('reply', { chat_id: m.chat_id, text: '收到', reply_to: m.message_id })).isError).toBe(false)
+  expect(onsen.connector.at(-1)!.body.conversation_id).toBe(onsen.conv(String(JOEY)))
+})
+
+test('14. rule A on an album: the first item\'s client_meta media_group_count (the bridge\'s album) over the count of the items that came; the files stay positional', async () => {
+  const base = `http://127.0.0.1:${onsen.port}/api/onsen/v1/files/`
+  const one = (i: number, meta?: Record<string, string>) => ({ conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', text: '', kind: 'photo',
+    sent_at: new Date().toISOString(), reply_to: null, media_group_id: 'mg-14', message_id: String(6040 + i),
+    attachments: [{ kind: 'photo', name: null, mime: 'image/jpeg', bytes: 4, url: base + fileOf(`alb${i}`, [0xff, 0xd8, 0xff, i]), client_ref: `AgAlb${i}` }],
+    client: { name: 'telegram', chat: String(JOEY), msg_id: String(1040 + i), user: 'joey', user_id: String(JOEY), ...(meta ? { meta } : {}) } })
+  expect(await person(one(1, { media_group_count: '3' }), 41)).toBe(200)
+  expect(await person(one(2, { media_group_count: '3' }), 42)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.media_group_id === 'mg-14'), 8000)).toBe(true)
+  await sleep(500)
+  const albums = got.filter(g => g.meta.media_group_id === 'mg-14')
+  expect(albums.length).toBe(1)
+  expect(albums[0]!.meta.media_group_count).toBe('3')
+  expect(albums[0]!.meta.image_path).toBeTruthy()
+  expect(albums[0]!.meta.image_path_2).toBeTruthy()
+  expect(albums[0]!.content).toBe('(album: 2 photos)')
 })

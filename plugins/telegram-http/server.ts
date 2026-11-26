@@ -4455,8 +4455,9 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
     // that N album photos belong together.
     ...f.rfm,
   }
-  // WO-197 (Chiron 15:27Z): the bridge's client.meta, each key an attribute as is, last; the tag's own value wins on a key it already set
-  for (const [k, v] of Object.entries(f.clientMeta ?? {})) if (!(k in meta)) meta[k] = v
+  // WO-197 (Chiron 15:27Z; 16:1xZ rule A): the bridge's client.meta, each key an attribute as is, over what the tag derived from the person_message
+  // (a new key last); never the routing and identity attributes (OnsenInbound.CLIENT_META_FIXED)
+  OnsenInbound.applyClientMeta(meta, f.clientMeta)
 
   // #6: photos sharing a media_group_id are ONE album — buffer them briefly
   // and deliver a SINGLE notification carrying image_path / image_path_2 / …
@@ -4480,7 +4481,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
         ? { imagePath, fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
             docMime: attachment!.mime, docName: attachment!.name }),
-      meta,
+      meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}),
     })
     return
   }
@@ -4574,6 +4575,8 @@ type AlbumEntry = {
   items: Array<{ imagePath?: string; fileId: string; size?: number;
                  docKind?: string; docMime?: string; docName?: string }>
   baseMeta: Record<string, string>
+  /** WO-197 (rule A): the first item's client.meta, applied again after the album's own fields (media_group_count, the positional files) are built */
+  clientMeta?: Record<string, string>
   timer: ReturnType<typeof setTimeout> | null
 }
 const albumBuffers = new Map<string, AlbumEntry>()
@@ -4582,12 +4585,12 @@ function bufferAlbumItem(
   chatId: string,
   mgid: string,
   item: { caption?: string; imagePath?: string; fileId: string; size?: number;
-          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string> },
+          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string> },
 ): void {
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
-    entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, timer: null }
+    entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null }
     albumBuffers.set(key, entry)
   }
   if (item.meta.message_id) entry.ids.push(item.meta.message_id)
@@ -4630,6 +4633,7 @@ function flushAlbum(key: string): void {
       if (it.size != null) meta[`attachment_size${suffix}`] = String(it.size)
     }
   })
+  OnsenInbound.applyClientMeta(meta, entry.clientMeta)   // WO-197 (rule A): the bridge's media_group_count (its album) wins over the items that came
   const docNames = entry.items.filter(it => it.docKind).map(it => it.docName ?? 'file')
   const nPhotos = entry.items.filter(it => it.imagePath || !it.docKind).length
   const content = entry.captions.length > 0
