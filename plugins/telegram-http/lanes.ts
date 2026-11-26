@@ -406,6 +406,7 @@ function mainEnv() {
     woke: mainWoke,                                                                 // WO-128 (item 9): one main_wake row per wake (switch on)
     mailbox: async (): Promise<string> => deferDecisionsOn() ? mailboxContext() : '',   // WO-128 (item 4): what waits in the mailbox, when the main gets its context back
     bound: mainTookItems,                                                           // lanes-golive (C3): the main has it: a scheduler run's start receipt                                                         // 002w (D): one receipt per scheduler run, the main included                                                         // 002w (D): the main's own completion of a scheduler run
+    memberState: memberNow,                                                         // WO-177 一: 「can the main take an item now」 is the status record's (decideWake's member)
   }
 }
 
@@ -1628,8 +1629,25 @@ function idleCheck(): void {
     if (main.statusIdle(v.state === 'idle', Date.now(), interruptedSince) && g) { try { onsenTap?.mainEvent?.({ event: 'Stop', phase: 'final', pid: Number(g.pid), interrupted: true }) } catch {} }
   } catch (e) { D.log('warn', `lanes: idle check: ${e}`) }
 }
-/** WO-169: the status record changed (server.ts, at each record it hands out whose state or interruption differs): the Esc wrap-up reads it now */
-export function mainStatusChanged(): void { idleCheck() }
+/** WO-169: the status record changed (server.ts, at each record it hands out whose member state or interruption differs): the Esc wrap-up reads it now.
+ *  WO-177 一: and M1, which offers an item it held the moment the record says the main can take one */
+export function mainStatusChanged(): void {
+  idleCheck()
+  if (D?.role === 'tg' && main) { try { main.statusChanged() } catch (e) { D.log('warn', `lanes: status change: ${e}`) } }
+}
+/** WO-177 一: a hand-over's event-keyed wake line says what M1 does with its item now (lanes-main deliveryNow: offered to an idle main the status record
+ *  says can take one; otherwise it waits, and why), the same answer the offer itself asks */
+function handWake(): { state: 'wake' | 'no_wake'; tail: string } {
+  const dn = main.deliveryNow()
+  return dn === 'offer' ? { state: 'wake', tail: 'M1 offers it' } : { state: 'no_wake', tail: `main ${dn}, pulled or offered when it is idle` }
+}
+/** WO-177 一 (Chiron's ticket; Joey TG chiron:2485, 2515): the one answer to 「can the main take an item now」: the status record's member state is idle (idle
+ *  with background and interrupted included). M1 (lanes-main canTake) asks it for the offer, its lease and the stuck alarms; null: no status record here
+ *  (Onsen step 3 off), where M2's idle answers as before */
+export function mainCanTake(): boolean | null {
+  if (D?.role !== 'tg' || !main) return null
+  return memberNow() == null ? null : main.mainCanTake()
+}
 /** WO-157 (Chiron 13:46Z): the main's status now (WO-169: the status record, server.ts currentStatus()), or null when this daemon computes none */
 function mainStatusNow(): { state: string; detail?: Record<string, unknown> } | null {
   try { return D?.mainStatus?.() ?? null } catch { return null }
@@ -1639,14 +1657,17 @@ function memberNow(): string | null {
   const v = mainStatusNow()
   return v?.state ? memberStateOf(v as any, null) : null
 }
-/** this agent's lane runs in progress, for the status report's detail.lanes (Chiron 13:46Z, 5) */
-export function runningLanes(): Array<{ id: string; run: string; kind?: string; since: string; thread?: string }> {
+/** this agent's lane runs in progress, for the status report's detail.lanes (Chiron 13:46Z, 5). WO-177 六: `tool` = the tool call the run has open now
+ *  (from its stream: the newest tool_use whose tool_result has not come back), the observation's doing */
+export function runningLanes(): Array<{ id: string; run: string; kind?: string; since: string; thread?: string; tool?: { name: string; since: string } }> {
   // WO-164 point 6: each carries the thread its run is on (the run's item's thread, else the lane's own), so Onsen's /status sessions show it
   const keyed = threadKeysOn()
   return [...running.entries()].map(([id, r]) => {
     const th = keyed ? queue.get(r.evId)?.ev.tkey?.thread ?? S?.lanes?.[id]?.thread : undefined
     const t = th ? S?.threads?.[th] : undefined
-    return { id, run: r.runId, ...(S?.lanes?.[id]?.kind ? { kind: S.lanes[id].kind } : {}), since: r.at, ...(th ? { thread: t?.alias_of ?? th } : {}) }
+    const open = r.tools?.size ? [...r.tools.values()].at(-1) : undefined
+    return { id, run: r.runId, ...(S?.lanes?.[id]?.kind ? { kind: S.lanes[id].kind } : {}), since: r.at, ...(th ? { thread: t?.alias_of ?? th } : {}),
+      ...(open ? { tool: { name: open.name, since: open.since } } : {}) }
   })
 }
 /** the state half: one member state, the hook state for now / after this step, and what the router's own tables say about this event */
@@ -1681,6 +1702,9 @@ function wakeItemOf(ev: InEvent, cfg: RouterCfg): WakeItem {
     refs: { event_id: ev.id, ...(ev.thread ? { thread: ev.thread } : {}), ...(ev.reply_to_id ? { reply_to: ev.reply_to_id } : {}),
       ...(ev.btcc_msg_id ? { btcc_msg_id: ev.btcc_msg_id } : {}), ...(ev.meta?.run_id ? { run_id: String(ev.meta.run_id) } : {}) } }
 }
+/** WO-177 三: what a route row decided on the new path carries of the verdict: its target and its urgency (the wake row in Onsen takes both from here,
+ *  so its urgency is the one the decision used, not one onsen-wake derives again) */
+const verdictRow = (v: WakeVerdict): { wake_target: string; wake_urgency: string } => ({ wake_target: v.target, wake_urgency: v.urgency })
 /** the route row's rule on the new path: wake:<decideWake rule>, and /<the rule the doing code returned> when that one differs (a gate or merge inside it) */
 const wakeRuleTag = (v: WakeVerdict, did?: string): string => `wake:${v.rule}${did && did !== `wake:${v.rule}` && did !== v.rule ? `/${did}` : ''}`
 /** the verdict as the Rule applyRule does (the doing code of today's router.json `to`) */
@@ -1729,12 +1753,12 @@ function decideFor(ev: InEvent, cfg: RouterCfg, extra: Partial<WakeState> = {}):
   return { v: decideWake(item, st, wakeTable(), agentWakeRules(cfg)), item, st }
 }
 /** the main's own lane tools and a lane's follow-up name their lane: decideWake's `own` rule (the same lane) on the new path, for the row's decided_by */
-function ownTag(rule: string, laneId: string): { rule: string; decided_by: 'new' | 'old'; wake_target?: string } {
+function ownTag(rule: string, laneId: string): { rule: string; decided_by: 'new' | 'old'; wake_target?: string; wake_urgency?: string } {
   if (!wakeDecideOn() || !mainStatusNow()) return { rule, decided_by: 'old' }
   try {
     const kind = S.lanes[laneId]?.kind ?? 'reflex'
     const v = decideWake({ kind: 'own', sender: 'main' }, wakeStateOf(null, { owner: LANE_KIND_SET.has(kind) ? kind : 'reflex' }), wakeTable(), [])
-    return { rule: wakeRuleTag(v, rule), decided_by: 'new', wake_target: v.target }
+    return { rule: wakeRuleTag(v, rule), decided_by: 'new', ...verdictRow(v) }
   } catch { return { rule, decided_by: 'old' } }
 }
 /** keep-warm on a busy main (keepwarm-busy) and anything else the table records with no doing code of its own: the route row only (no digest line, no
@@ -1742,7 +1766,7 @@ function ownTag(rule: string, laneId: string): { rule: string; decided_by: 'new'
 function recordOnlyRow(ev: InEvent, v: WakeVerdict): Decision {
   const d: Decision = { rule: wakeRuleTag(v), target: 'ledger', note: `recorded only (${v.rule}; status ${memberNow() ?? '-'})` }
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
-    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, ...(ev.wake ? { wake: ev.wake } : {}), decided_by: 'new', wake_target: v.target }, ev)
+    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, ...(ev.wake ? { wake: ev.wake } : {}), decided_by: 'new', ...verdictRow(v) }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → recorded only`)
   return d
 }
@@ -1757,7 +1781,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   // message after /lanes off went to the ledger: A07 e6), no Jev screen, no rule. Lanes already running finish their event and report.
   if (D.role === 'tg' && S?.master_off) {
     const dm = decideFor(ev, cfg)                                          // WO-157: lanes-off-ring / lanes-off (the same two outcomes)
-    const tagged = (rule: string, target: string) => dm ? { rule: wakeRuleTag(dm.v), decided_by: 'new', wake_target: dm.v.target } : { rule, decided_by: 'old', wake_target: target }
+    const tagged = (rule: string, target: string) => dm ? { rule: wakeRuleTag(dm.v), decided_by: 'new', ...verdictRow(dm.v) } : { rule, decided_by: 'old', wake_target: target }
     // WO-141 phase 2: the mailbox's ring (wake mail, meta ring, server.ts /inject) exists to wake a mail lane; switched off there is none, and
     // the main is not woken for it (an agent without lanes keeps the watchdog's hourly 讀信箱 reminder, which carries no ring): recorded only
     if (dm ? dm.v.target === 'ledger' : ev.wake === 'mail' && ev.meta?.ring === 'true') {
@@ -1793,7 +1817,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     if (g) {
       const dg = decideFor(ev, cfg, { gate: g.rule })                      // WO-157: the gate said no; decideWake's gate rule records it
       routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: dg ? wakeRuleTag(dg.v, g.rule) : g.rule, target: 'ledger', lane: null, thread: null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: g.note, episode: g.episode,
-        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, decided_by: dg ? 'new' : 'old', ...(dg ? { wake_target: dg.v.target } : {}) }, ev)
+        class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, decided_by: dg ? 'new' : 'old', ...(dg ? verdictRow(dg.v) : {}) }, ev)
       D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${g.rule} → ledger — ${g.note}`)
       noteInbound(ev, { rule: g.rule, target: 'ledger' })
       // M3 (PL1): a gated message has its record too: information (no obligations), riding on its episode's head, which carries the episode
@@ -1862,7 +1886,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: d.lane ?? null,
     thread: d.thread ?? (d.lane ? S.lanes[d.lane]?.thread : null) ?? null, peer_thread: ev.thread ?? null, hop: ev.hop ?? null, note: d.note ?? null,
     class: cls, base_tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: ev.meta?.message_id ?? null,
-    decided_by: decided ? 'new' : 'old', ...(decided ? { wake_target: decided.v.target } : {}) }, ev)
+    decided_by: decided ? 'new' : 'old', ...(decided ? verdictRow(decided.v) : {}) }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ${d.target}${d.lane ? ' ' + d.lane : ''}${d.note ? ' — ' + d.note : ''}`)
   // 002j (A5): the same event is shown to Jev AFTER the decision and both are written side by side (run/triage-shadow.jsonl).
   // Not awaited and never read back: the table above is the only thing that routes.
@@ -1883,7 +1907,7 @@ function routeWake(ev: InEvent, v?: WakeVerdict): Decision {
   if (ev.wake === 'mail') return routeMailWake(ev, v)
   const d: Decision = { rule: v ? wakeRuleTag(v) : `wake-${ev.wake}`, target: 'main', note: `fleet wake-up line (${ev.wake}): the main` }
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
-    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: ev.wake, decided_by: v ? 'new' : 'old', ...(v ? { wake_target: v.target } : {}) }, ev)
+    class: null, base_tier: null, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: ev.wake, decided_by: v ? 'new' : 'old', ...(v ? verdictRow(v) : {}) }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → main`)
   toMain(ev, d, { owesOnlyMain: true })
   return d
@@ -1989,7 +2013,7 @@ function routeMailWake(ev: InEvent, v?: WakeVerdict): Decision {
   } else d = dispatch(ev, lane, { rule })
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: d.lane ?? null, thread: lane.thread, peer_thread: null, hop: null,
     note: d.note ?? null, class: 'mail', base_tier: tierFor('mail', false).tier, btcc_msg_id: ev.btcc_msg_id ?? null, tg_message_id: null, wake: 'mail',
-    decided_by: v ? 'new' : 'old', ...(v ? { wake_target: v.target } : {}) }, ev)
+    decided_by: v ? 'new' : 'old', ...(v ? verdictRow(v) : {}) }, ev)
   D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${d.rule} → ${d.target} ${d.lane ?? ''}${d.note ? ' — ' + d.note : ''}`)
   return d
 }
@@ -2207,7 +2231,7 @@ function batchTickRun(now: number): void {
   ledger({ lane: 'router', event: id, kind: 'fyi', text: `信箱有 ${cards.length} 件等得起的事（${cards.map(m => `#${m}`).join('、')}）主線還沒看過，最早一件放進來 ${mins} 分鐘了：叫醒主線一次（一批；沒處理不推 Joey）。`,
     refs: { batch: id, cards, waited_s: Math.round((now - first) / 1000) } })
   appendJsonl('lanes.jsonl', { lane: 'main', kind: 'batch_wake', batch: id, cards, first_at: new Date(first).toISOString(), waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
-  journal.write('wake', id, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `cards that can wait (${cards.map(m => `#${m}`).join(', ')}) not told for ${mins} min: the batch wake${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  { const hw = handWake(); journal.write('wake', id, hw.state, { reason: `cards that can wait (${cards.map(m => `#${m}`).join(', ')}) not told for ${mins} min: the batch wake: ${hw.tail}` }) }
   logos('lane.batch_wake', { batch: id, cards, waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
 }
 /** WO-137 甲: the batch wake's item (the list itself is the digest that rides it: 「信箱有 N 件等你決定」 and one line per card) */
@@ -2447,7 +2471,7 @@ export function toMainForm(ev: InEvent): Decision | null {
     note: onsen ? `Joey wrote it in Onsen: to the main` : `a page answer (form ${ev.meta?.form_id ?? '?'}): to the main` }
   if (df && fev.tkey) { ev.tkey = fev.tkey; bindThread(ev, d, String(df.item.kind)) }     // WO-164: Joey's chat thread
   routeRow({ event: ev.id, source: ev.source, from: ev.from, text: ev.text, rule: d.rule, target: d.target, lane: null, thread: null, peer_thread: null, hop: null, note: d.note,
-    class: null, base_tier: null, btcc_msg_id: null, tg_message_id: ev.meta?.message_id ?? null, decided_by: df ? 'new' : 'old', ...(df ? { wake_target: df.v.target } : {}) }, ev)
+    class: null, base_tier: null, btcc_msg_id: null, tg_message_id: ev.meta?.message_id ?? null, decided_by: df ? 'new' : 'old', ...(df ? verdictRow(df.v) : {}) }, ev)
   D.log('info', `lanes: route ${ev.id} (${did} from ${ev.from}) rule=${d.rule} → main`)
   toMain(ev, d)
   return d
@@ -3319,7 +3343,9 @@ export function failedHandoffText(it: { attempts: number; ev: { from: string; te
     + (deaths.length && deaths.length < it.attempts ? `\n- 其餘 ${it.attempts - deaths.length} 次沒有被 daemon 看到結束（daemon 重啟或租約到期）` : '')
 }
 const queue = new Map<string, QItem>()          // event id → item
-const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string }>()  // lane id → run (WO-132: `at` = when it started)
+/** WO-177 六: the tool calls of a run whose result has not come back yet (its stream's tool_use → tool_result): tool_use id → name, since when */
+type OpenTools = Map<string, { name: string; since: string }>
+const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string; tools?: OpenTools }>()  // lane id → run (WO-132: `at` = when it started)
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string; commitments?: number
   /** lanes-golive (C2): how many mails this mail-lane run opened (an opened mail owes Joey the run's one line) */
   mailOpened?: number
@@ -4721,7 +4747,8 @@ function startRun(it: QItem): void {
     logos('lane.timeout', { lane: lane.id, run: runId, event: it.ev.id, after_s: Math.round(LANE_MAX_RUN_MS / 1000), attempt: it.attempts })
     try { child.kill('SIGKILL') } catch {}
   }, LANE_MAX_RUN_MS)
-  running.set(lane.id, { child, evId: it.ev.id, runId, tok, at: nowIso() })
+  const openTools: OpenTools = new Map()                                // WO-177 六: what the run is doing now (runningLanes: the observation's doing)
+  running.set(lane.id, { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools })
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
@@ -4766,6 +4793,7 @@ function startRun(it: QItem): void {
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') {
             tools.push({ id: c.id ? String(c.id) : undefined, name: c.name, input: c.input })
+            if (c.id) openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso() })
             if (!String(c.name).startsWith('mcp__lane__')) (tok.calls ??= []).push({ name: c.name, input: c.input })   // the lane stop's model aid (its lane tools: callLaneTool)
             const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
             if (c.name === 'Bash' && prodChangeOn()) for (const pc of remoteChanges(String(c.input?.command ?? ''))) prodChanges.push({ ...pc, cmd: clip(String(c.input?.command ?? ''), 300) })
@@ -4797,6 +4825,7 @@ function startRun(it: QItem): void {
       if (j.type === 'user' && Array.isArray(j.message?.content)) {      // 002l (D8): tool results, for the partial of a run that is cut
         for (const c of j.message.content) {
           if (c?.type !== 'tool_result') continue
+          openTools.delete(String(c.tool_use_id ?? ''))
           const body = typeof c.content === 'string' ? c.content : Array.isArray(c.content) ? c.content.map((x: any) => x?.text ?? '').join(' ') : ''
           const rst = restarts.get(String(c.tool_use_id ?? ''))
           if (rst) {
@@ -5184,7 +5213,7 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
     : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: handoffContent(evId, hid, body),
       meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, o => o.id === hid, { item, ...(w.woke ? { woke: w.woke, woke_at: nowIso() } : {}) })
-  journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `owed to the main (${hid})${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  { const hw = handWake(); journal.write('wake', evId, hw.state, { reason: `owed to the main (${hid}): ${hw.tail}` }) }
   logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase() })
   return hid
 }
@@ -5213,7 +5242,7 @@ function wakeDeferred(evId: string, cause: 'urgent' | 'due', lane: Lane | undefi
     : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: handoffContent(evId, hid, body),
       meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, x => x.id === o.id, { item, woke: cause, woke_at: nowIso(), due_at: Date.now() + HANDOFF_DUE_MS(), ...(cause === 'urgent' ? { what: body.slice(0, 600) } : {}) })
-  journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `${cause === 'due' ? 'due soon' : 'cannot wait after all'}: the main is woken for ${hid}${main.mainPhase() === 'idle' ? ': M1 offers it' : `: main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  { const hw = handWake(); journal.write('wake', evId, hw.state, { reason: `${cause === 'due' ? 'due soon' : 'cannot wait after all'}: the main is woken for ${hid}: ${hw.tail}` }) }
   logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase(), woke: cause })
   return hid
 }
@@ -5230,7 +5259,7 @@ function addToMain(evId: string, o: Ob, lane: Lane, text: string, carry?: { cont
     : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: handoffContent(evId, hid, body),
       meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, x => x.id === o.id, { item })
-  journal.write('wake', evId, main.mainPhase() === 'idle' ? 'wake' : 'no_wake', { reason: `more for ${hid} (${lane.id}): ${main.mainPhase() === 'idle' ? 'M1 offers it' : `main ${main.mainPhase()}, pulled or offered when it is idle`}` })
+  { const hw = handWake(); journal.write('wake', evId, hw.state, { reason: `more for ${hid} (${lane.id}): ${hw.tail}` }) }
   logos('lane.handoff', { lane: lane.id, thread: lane.thread, event: evId, handoff: hid, main_phase: main.mainPhase(), woke: 'urgent', added: true })
   return hid
 }
@@ -8111,7 +8140,8 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
 
 /** /healthz extras */
 export function lanesHealth(): Record<string, unknown> {
-  return { lanes_on: true, main_phase: D?.role === 'tg' ? main?.mainPhase() : undefined, main_session: D?.role === 'tg' ? main?.mainSession()?.session_id ?? null : undefined,
+  return { lanes_on: true, main_phase: D?.role === 'tg' ? main?.mainPhase() : undefined, main_delivery: D?.role === 'tg' ? main?.deliveryNow() : undefined,   // WO-177 一
+    main_session: D?.role === 'tg' ? main?.mainSession()?.session_id ?? null : undefined,
     lanes_running: D?.role === 'tg' ? running.size : undefined, lane_slots: D?.role === 'tg' && LANES_DIR ? laneSlots() : undefined, lanes_queued: D?.role === 'tg' ? [...queue.values()].filter(i => i.state === 'queued').length : undefined,
     followups_pending: D?.role === 'tg' ? Object.values(S?.followups ?? {}).filter(f => f.state === 'pending').length : undefined,
     handoffs_pending: D?.role === 'tg' && events ? events.rows(e => e.state === 'open').filter(e => (e.obligations ?? []).some((o: Ob) => o.kind === 'main' && o.state === 'open')).length : undefined,

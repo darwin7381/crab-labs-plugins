@@ -8,8 +8,9 @@
 //              reader asks once more after its retryMs)
 //   logs       run/jev-calls.jsonl (every call, Jev's raw answers and usage); run/screen-questions-<sha>.json (each version asked);
 //              run/screen-exceptions.jsonl: other, p below the threshold, fits_any < 0.5, the menu rule overrode a confident state, background counts
-//              disagree, waiting with no menu, an option not mapped, the call failed, and (settleMs later, the screen still showing) the record differs
-//              from statusOf's
+//              disagree, waiting with no menu, an option not mapped, the call failed, a verdict the program's facts contradict (WO-177 二:
+//              contradicts_program, no verdict), and (settleMs later, the screen still showing) the record differs from statusOf's
+//   version    the questions file's sha (WO-177 五): a new one is a new judge to the reader (its answers dropped, the screen asked again)
 import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -68,6 +69,19 @@ export function verdictOf(j: JevRead, threshold: number): ScreenVerdict | null {
   const menu = j.menu ?? (j.state === 'waiting_for_human' ? 'other' : 'none')
   if (!isVerdictMenu(menu)) return null
   return { state: j.state, menu, p: j.p, by: 'jev' }
+}
+/** WO-177 二 (Chiron's ticket): a verdict the record would hold the main's items on must agree with the program's own facts, here, where Jev's answer
+ *  becomes a ScreenVerdict, and nowhere else. waiting_for_human: no input box (a menu or a permission prompt replaces it: 64 screens of the question bank
+ *  and the lab's 21 waiting rows have none; idle, working and interrupted all have one); usage_limit: the limit message is the latest output, or the
+ *  program's own wall (a StopFailure that walled M2, usage_wall.py: statusOf's detail.walled); interrupted: Interrupted is the latest output. The facts are
+ *  found_by_program's (questions v7, regions()). Returns the fact the verdict lacks (null: they agree, or a state these facts do not bear on) */
+export function contradiction(v: Pick<ScreenVerdict, 'state'>, st: Regions, prog: StatusView | null): string | null {
+  const f = st.found_by_program
+  if (v.state === 'waiting_for_human' && st.has_input_box !== false) return 'has_input_box === false'
+  if (v.state === 'usage_limit' && f.limit_message_is_latest_output !== true && !(prog?.detail as Record<string, unknown> | undefined)?.walled)
+    return 'limit_message_is_latest_output === true, or the program\'s wall'
+  if (v.state === 'interrupted' && f.interrupted_is_latest_output !== true) return 'interrupted_is_latest_output === true'
+  return null
 }
 /** the exceptions an answer shows by itself (the comparison with statusOf is made settleMs later, once the screen held) */
 export function answerExceptions(j: JevRead, st: Regions, threshold: number): string[] {
@@ -128,6 +142,8 @@ export class JevJudge implements ScreenJudge {
     return !this.d.hasKey() ? 'no TypeSafe key (.secrets/typesafe.env)' : !this.questions() ? `no readable questions file (${this.d.questionsPath})` : ''
   }
   notBefore(): number { return this.backoffUntil }
+  /** WO-177 五: what it judges by: the questions file's sha (null: no readable file) */
+  version(): string | null { return this.questions()?.sha ?? null }
   health(): Record<string, unknown> {
     const q = this.q?.v
     return { exceptions: this.stats.exceptions, questions: q ? { version: q.version, sha: q.sha } : null,
@@ -167,16 +183,20 @@ export class JevJudge implements ScreenJudge {
       this.exception(['call_failed'], parts, st, null, q, { error: r.error ?? 'no answers', ms: r.ms })
       throw new Error(`Jev: ${r.error ?? 'no answers'}`)
     }
-    const v = verdictOf(jev, q.threshold)
+    let v = verdictOf(jev, q.threshold)
     const kinds = answerExceptions(jev, parts.st, q.threshold)
     const model = r.model ?? q.model
+    // WO-177 二: a verdict the program's facts contradict is no verdict (the record is statusOf's for this screen), recorded as contradicts_program
+    const against = v ? contradiction(v, parts.st, this.d.program()) : null
+    const contra = against ? { state: v!.state, menu: v!.menu, p: r2(v!.p), needs: against } : null
+    if (contra) { kinds.push('contradicts_program'); v = null }
     // the comparison with statusOf: settleMs later, and only if the screen held (the registry and the screen move within ~0.5 s of each other;
     // comparing at once would write every turn's edge as a disagreement)
     const t = setTimeout(() => {
       const k = [...kinds]
       const prog = this.d.program()
       if (v && this.d.holds(hash, v) && publishView(v, parts.st, prog).state !== prog.state) k.push('differs_from_program')
-      if (k.length) this.exception(k, parts, st, jev, q, { ms: r.ms, model }, prog)
+      if (k.length) this.exception(k, parts, st, jev, q, { ms: r.ms, model, ...(contra ? { contradicts: contra } : {}) }, prog)
     }, this.o.settleMs)
     ;(t as any).unref?.()
     return v

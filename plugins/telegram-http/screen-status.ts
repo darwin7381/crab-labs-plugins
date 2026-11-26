@@ -193,6 +193,10 @@ export interface ScreenJudge {
   notBefore?(): number
   /** its own counts, for /healthz */
   health?(): Record<string, unknown>
+  /** WO-177 五 (Chiron's ticket): what it judges by now (JevJudge: the questions file's sha); null or absent: one version only. A new version is a new
+   *  judge to the reader: the answers and the cache are dropped and the screen is asked again at the next look; the question bank writes the same screen
+   *  again under the new version */
+  version?(): string | null
 }
 export const SCREEN_JUDGE_NAMES = ['jev', 'program'] as const
 export type ScreenJudgeName = typeof SCREEN_JUDGE_NAMES[number]
@@ -367,9 +371,11 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
     const thread = typeof l.thread === 'string' && l.thread ? l.thread : null
     const at = typeof l.since === 'string' ? l.since : isoMs(now)
     const trigger: Trigger = thread && f.scheduleThread?.(thread) ? { kind: 'schedule' } : thread ? { kind: 'thread', thread_id: thread } : { kind: 'other' }
+    // WO-177 六: the tool the run has open now (lanes.ts runningLanes, from the run's own stream), else thinking
+    const tool = l.tool && typeof l.tool === 'object' && typeof l.tool.name === 'string' && l.tool.name ? l.tool as { name: string; since?: unknown } : null
     sessions.push(presence === 'online'
       ? { id: String(l.id), kind: 'lane', thread_id: thread, activity: 'running', activity_since: at, turn: { id: String(l.run ?? l.id), started_at: at, trigger },
-          doing: { kind: 'thinking', tool: null, since: at }, blockers: [], last_turn: null }
+          doing: tool ? { kind: 'tool', tool: tool.name, since: typeof tool.since === 'string' ? tool.since : at } : { kind: 'thinking', tool: null, since: at }, blockers: [], last_turn: null }
       : { id: String(l.id), kind: 'lane', thread_id: thread, activity: 'unknown', activity_since: null, turn: null, doing: null, blockers: [], last_turn: null })
   }
   const c = st?.counted_by_program
@@ -447,7 +453,8 @@ const CACHE_MAX = 16
 /** the question bank's file is rotated past this; at start (and at a new day) its last BANK_TAIL bytes are read for the day's hashes */
 const BANK_MAX = 20 * 1024 * 1024, BANK_TAIL = 8 * 1024 * 1024
 type Cur = { hash: string; raw: string; parts: Parts; cmd: string; alive: boolean; at: number }
-type Ans = { hash: string; at: number; v: ScreenVerdict | null; parts: Parts; seq: number }
+/** an answer, and the judge's version it was given under (WO-177 五) */
+type Ans = { hash: string; at: number; v: ScreenVerdict | null; parts: Parts; seq: number; ver: string | null }
 const iso = (ms: number): string => new Date(ms).toISOString()
 
 export class ScreenStatus {
@@ -469,7 +476,7 @@ export class ScreenStatus {
   private pokes = new Set<number>()
   private progKey: string | null = null
   /** listed: JEV_SCREEN lists the agent; judge: the one SCREEN_JUDGE picks; on: listed, a judge, and it is ready */
-  private act: { on: boolean; listed: boolean; judge: ScreenJudge | null; at: number; why: string } = { on: false, listed: false, judge: null, at: -Infinity, why: 'not checked' }
+  private act: { on: boolean; listed: boolean; judge: ScreenJudge | null; at: number; why: string; ver: string | null } = { on: false, listed: false, judge: null, at: -Infinity, why: 'not checked', ver: null }
   private seq = 0
   /** the question bank: the hashes written today (UTC) */
   private bank: { day: string; hashes: Set<string> } | null = null
@@ -480,7 +487,8 @@ export class ScreenStatus {
 
   // ---- on / off
   /** the switch, the judge and its readiness, checked at most every activeCheckMs; a change is logged once. A new judge starts from nothing (the
-   *  verdicts held were the other one's) */
+   *  verdicts held were the other one's); WO-177 五: so does a new version of the same judge (Chiron's questions file changed: the answers held were given
+   *  to the old questions; a screen that does not change is asked again at the next look) */
   active(): boolean {
     const now = this.now()
     if (now - this.act.at < this.o.activeCheckMs) return this.act.on
@@ -488,12 +496,15 @@ export class ScreenStatus {
     const judge = listed ? this.d.judge() : null
     const why = !listed ? 'JEV_SCREEN does not list this agent' : !judge ? `SCREEN_JUDGE=${this.d.judgeSetting?.() || 'program'}: no screen judge` : judge.ready?.() ?? ''
     const on = !why
-    if (on !== this.act.on || why !== this.act.why || judge !== this.act.judge) {
-      this.d.log('info', on ? `screen-status: ON for ${this.d.agent} (judge ${judge!.name}; poll ${this.o.pollMs} ms)`
+    const ver = on ? judgeVersion(judge!) : null
+    const newVer = on && this.act.on && judge === this.act.judge && ver !== this.act.ver
+    if (on !== this.act.on || why !== this.act.why || judge !== this.act.judge || newVer) {
+      this.d.log('info', newVer ? `screen-status: judge ${judge!.name} now judges by version ${ver ?? '-'} (was ${this.act.ver ?? '-'}): its answers are dropped, the screen is asked again`
+        : on ? `screen-status: ON for ${this.d.agent} (judge ${judge!.name}${ver ? ` version ${ver}` : ''}; poll ${this.o.pollMs} ms)`
         : `screen-status: off for ${this.d.agent} (${why}): the status is statusOf's${listed ? ' (judged_by program)' : ', unchanged'}`)
-      if (!on || judge !== this.act.judge) { this.answer = null; this.cur = null; this.failed = null; this.cache.clear() }
+      if (!on || judge !== this.act.judge || newVer) { this.answer = null; this.cur = null; this.failed = null; this.cache.clear() }
     }
-    this.act = { on, listed, judge, at: now, why }
+    this.act = { on, listed, judge, at: now, why, ver }
     return on
   }
 
@@ -584,9 +595,9 @@ export class ScreenStatus {
     if (refresh) this.stats.refreshes++
     this.lastAsk = { at: now, raw: c.raw }
     this.inflight = { hash: c.hash, at: now }
-    void this.ask(c, j)
+    void this.ask(c, j, this.act.ver)
   }
-  private async ask(c: Cur, j: ScreenJudge): Promise<void> {
+  private async ask(c: Cur, j: ScreenJudge, ver: string | null): Promise<void> {
     let v: ScreenVerdict | null = null, failed = false
     try {
       const r = await j.judge(c.parts)
@@ -598,6 +609,8 @@ export class ScreenStatus {
     this.inflight = null
     this.stats.calls++
     if (j !== this.act.judge) { this.maybeAsk(); return }      // SCREEN_JUDGE changed while it judged: that answer is not the new judge's
+    // WO-177 五: its version changed while it judged: that answer is the old version's. The change is taken now (as active() would) and asked again
+    if (judgeVersion(j) !== ver) { this.act.at = -Infinity; this.active(); this.maybeAsk(); return }
     if (failed) {
       this.stats.failed++
       this.failed = { hash: c.hash, tries: this.failed?.hash === c.hash ? this.failed.tries + 1 : 1, at: this.now() }
@@ -606,11 +619,11 @@ export class ScreenStatus {
       return
     }
     this.failed = null
-    const a: Ans = { hash: c.hash, at: this.now(), v, parts: c.parts, seq: ++this.seq }
+    const a: Ans = { hash: c.hash, at: this.now(), v, parts: c.parts, seq: ++this.seq, ver }
     this.answer = a
     this.cache.delete(a.hash); this.cache.set(a.hash, a)
     if (this.cache.size > CACHE_MAX) this.cache.delete(this.cache.keys().next().value!)
-    if (v) this.bankIt(c, v)
+    if (v) this.bankIt(c, v, ver)
     this.d.publish()
     if (this.cur && this.cur.hash !== c.hash) this.maybeAsk()                           // the screen moved on while it was judged: ask once more
   }
@@ -635,22 +648,24 @@ export class ScreenStatus {
   /** for /healthz: the reader, its judge's own counts, the screen now, the verdict in use (ScreenVerdict's four fields) */
   health(): Record<string, unknown> {
     const j = this.act.judge, a = this.answer
-    return { on: this.act.on, ...(this.act.on ? {} : { why: this.act.why }), judge: j?.name ?? null, poll_ms: this.o.pollMs, ...this.stats, ...(j?.health?.() ?? {}),
+    return { on: this.act.on, ...(this.act.on ? {} : { why: this.act.why }), judge: j?.name ?? null, judge_version: this.act.ver, poll_ms: this.o.pollMs, ...this.stats, ...(j?.health?.() ?? {}),
       screen: this.cur ? { hash: this.cur.hash, alive: this.cur.alive, at: iso(this.cur.at) } : null,
-      answer: a?.v ? verdictFields(a.v) : null, answered: a ? { hash: a.hash, at: iso(a.at), verdict: !!a.v } : null, in_flight: !!this.inflight }
+      answer: a?.v ? verdictFields(a.v) : null, answered: a ? { hash: a.hash, at: iso(a.at), verdict: !!a.v, judge_version: a.ver } : null, in_flight: !!this.inflight }
   }
 
   // ---- 五 the question bank
-  /** a screen hash's first verdict of the day (UTC): one line of run/screen-verdicts.jsonl, its regions masked as the exception log masks them. The day's
-   *  hashes are read back from the file's tail at start and when the day turns, so a restart does not write a screen twice */
-  private bankIt(c: Cur, v: ScreenVerdict): void {
+  /** a screen hash's first verdict of the day (UTC) under each version of the judge (WO-177 五: the same screen again under new questions, the row
+   *  carrying the version): one line of run/screen-verdicts.jsonl, its regions masked as the exception log masks them. The day's hash-and-version keys
+   *  are read back from the file's tail at start and when the day turns, so a restart does not write a screen twice */
+  private bankIt(c: Cur, v: ScreenVerdict, ver: string | null): void {
     const now = this.now(), day = iso(now).slice(0, 10)
     const f = join(this.d.lanesDir, 'run', 'screen-verdicts.jsonl')
     if (!this.bank || this.bank.day !== day) this.bank = { day, hashes: bankedOn(f, day) }
-    if (this.bank.hashes.has(c.hash)) return
-    this.bank.hashes.add(c.hash)
+    const key = bankKey(c.hash, ver)
+    if (this.bank.hashes.has(key)) return
+    this.bank.hashes.add(key)
     const st = redactRegions(c.parts.st)
-    const rec = { ts: iso(now), agent: this.d.agent, hash: c.hash, has_input_box: st.has_input_box, screen: screenRegions(st),
+    const rec = { ts: iso(now), agent: this.d.agent, hash: c.hash, judge_version: ver, has_input_box: st.has_input_box, screen: screenRegions(st),
       counted_by_program: st.counted_by_program, found_by_program: st.found_by_program, verdict: verdictFields(v) }
     try {
       mkdirSync(join(this.d.lanesDir, 'run'), { recursive: true })
@@ -660,7 +675,11 @@ export class ScreenStatus {
     } catch {}
   }
 }
-/** the hashes the question bank already has for `day` (its file's last BANK_TAIL bytes; every line starts with its ts) */
+/** a judge's version now (null: it has one version only, or it could not say) */
+const judgeVersion = (j: ScreenJudge): string | null => { try { return j.version?.() ?? null } catch { return null } }
+/** the question bank's key: the screen's hash under the judge's version (a row from before WO-177 has no version: '') */
+const bankKey = (hash: string, ver: string | null | undefined): string => `${hash}|${ver ?? ''}`
+/** the hash-and-version keys the question bank already has for `day` (its file's last BANK_TAIL bytes; every line starts with its ts) */
 function bankedOn(f: string, day: string): Set<string> {
   const out = new Set<string>()
   let text = ''
@@ -675,7 +694,7 @@ function bankedOn(f: string, day: string): Set<string> {
   const head = `{"ts":"${day}`
   for (const l of text.split('\n')) {
     if (!l.startsWith(head)) continue
-    try { const h = JSON.parse(l).hash; if (typeof h === 'string') out.add(h) } catch {}
+    try { const j = JSON.parse(l); if (typeof j.hash === 'string') out.add(bankKey(j.hash, typeof j.judge_version === 'string' ? j.judge_version : null)) } catch {}
   }
   return out
 }

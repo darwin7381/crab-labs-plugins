@@ -4453,7 +4453,13 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 1_000),
     heartbeatMs: Number.isFinite(hbS) && hbS >= 0 ? hbS * 1000 : OnsenStatus.HEARTBEAT_MS,
     since: { load: () => { try { return JSON.parse(readFileSync(sinceFile, 'utf8')) } catch { return null } },
-      save: x => { try { mkdirSync(join(STATE_DIR, 'onsen'), { recursive: true }); writeFileSync(sinceFile, JSON.stringify(x)) } catch {} } } })
+      save: x => { try { mkdirSync(join(STATE_DIR, 'onsen'), { recursive: true }); writeFileSync(sinceFile, JSON.stringify(x)) } catch {} },
+      // WO-177 六: Onsen's record of this agent (its state and since), asked once after start: /healthz keeps Onsen's since while the state has not changed
+      remote: async () => {
+        const r = await onsen.request('GET', `/status?agent=${encodeURIComponent(ONSEN_AGENT)}`, undefined, 10_000)
+        const a = r?.status === 200 && Array.isArray(r.json?.agents) ? r.json.agents.find((x: any) => String(x?.agent ?? '').toLowerCase() === ONSEN_AGENT.toLowerCase()) : null
+        return a ? { state: a.state, since: a.since } : null
+      } } })
   onsenFacts = facts
   let kickTimer: ReturnType<typeof setTimeout> | null = null
   // WO-157b (status-latency-lab 「會判錯的」 8): lanes off, read the transcript before the status a change kicks (the message that began the turn is marked
@@ -4476,8 +4482,10 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     lastView = pub; lastObservation = r.observation
     status.update(pub); try { pin?.show(pub) } catch (e) { log('warn', `onsen: status pin: ${e}`) }
     screenStatus?.programChanged(v)
-    // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen)
-    const edge = `${pub.state}|${pub.detail?.interrupted === true}`
+    // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen).
+    // WO-177 一: and M1 offers what it held the moment the record says the main can take it: the edge is the member state (decideWake's: a wall or a
+    // compaction in an idle view's detail is one too)
+    const edge = `${OnsenWake.memberStateOf(pub, null)}|${pub.state}|${pub.detail?.interrupted === true}`
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
   // WO-172: each turn that ended (the main's, a lane run): one line. Its outcome and bound ride every turn_end fact of a Joey message in it (Onsen keeps

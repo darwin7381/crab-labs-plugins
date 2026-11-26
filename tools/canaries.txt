@@ -150,3 +150,9 @@ plugins/telegram-http/onsen-status.ts::if (this.last?.id === this.turn.prompt) t
 plugins/telegram-http/onsen-status.ts::...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}), ...turnFields(turn) })
 plugins/telegram-http/server.ts::turn_id: String(extra.turn_id).slice(0, 120)
 plugins/telegram-http/lanes.ts::if (p === '/lanes/turn' && req.method === 'GET')
+plugins/telegram-http/lanes-main.ts::if (!probe && (g.state !== 'idle' || !canTake(g))) return
+plugins/telegram-http/lanes.ts::memberState: memberNow,
+plugins/telegram-http/screen-judge-jev.ts::export function contradiction(
+plugins/telegram-http/onsen-wake.ts::row.decided_by === 'new' && isUrgency(row.wake_urgency)
+plugins/telegram-http/screen-status.ts::version?(): string | null
+plugins/telegram-http/onsen-status.ts::remote?(): Promise<{ state?: unknown; since?: unknown } | null>

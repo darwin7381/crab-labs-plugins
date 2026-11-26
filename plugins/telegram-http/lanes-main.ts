@@ -14,6 +14,8 @@
  *     and any later hook event of that prompt in that gen re-opens the turn: M2 back to in_turn, the items done at that Stop back to bound
  *     (reason turn_continued). They end at the turn's next Stop like any bound item. An idle main is offered one item (it opens the turn); a busy main is never pushed to: its hook
  *     pulls queued items at the next tool boundary (PostToolUse) or at Stop, and they are bound to that prompt at that moment.
+ *     WO-177 一: WHETHER the main can take an item now is the status record's (canTake: its member state is idle); M2 says only HOW (offer to an idle gen,
+ *     pull into a turn) and keeps the turn's edges. Held items stay queued and are offered the moment the record turns idle.
  * One writer: the tg daemon. Information (the digest) is never offered alone: it rides the next offer or pull.
  */
 import type { Journal, Row } from './lanes-state.ts'
@@ -86,6 +88,10 @@ export type MainEnv = {
   /** WO-128 (item 4): what waits on the main's decision in its mailbox, as lines for the context the main gets back (registration, a resumed main's first
    *  prompt, after a compaction); '' = nothing to add */
   mailbox?: () => Promise<string>
+  /** WO-177 一 (Chiron's ticket; Joey TG chiron:2485, 2515): the status record's member state now, as decideWake reads it (lanes.ts memberNow: statusOf's
+   *  state through the screen judge, its detail's walled / compacting as states of their own). It is the one answer to 「can the main take an item now」
+   *  (canTake: 'idle', which takes in idle with background and interrupted). null: no status record here (Onsen step 3 off): M2's phase answers */
+  memberState?: () => string | null
 }
 
 export type MainEvent = {
@@ -155,7 +161,7 @@ export function createMain(E: MainEnv) {
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
-    cur = null; stuck = null; offering = false
+    cur = null; stuck = null; offering = false; takeSince = null
     lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear(); openTools.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
@@ -184,6 +190,36 @@ export function createMain(E: MainEnv) {
   /** the main's process is about to end for this reason (/restart and /kill_stuck: asked; /main renew: replaced) */
   function markEnd(reason: EndReason): void { if (cur) pendingEnd.set(cur, reason) }
 
+  // ------------------------------------------------------------------ WO-177 一: can the main take an item now (the status record)
+  /** the status record's member state now (null: no record here) */
+  function member(): string | null { try { return E.memberState?.() ?? null } catch { return null } }
+  /** since when the status record has said, without a break, that gen `gen` can take an item (ms). The offer's lease and the untaken items' clock count
+   *  only this time (null: it does not say so now, or there is no record) */
+  let takeSince: { gen: string; at: number } | null = null
+  /** the one answer to 「can the main take an item now」 (WO-177 一): the status record says idle (idle with background and interrupted included). The
+   *  offer, its lease and the stuck alarms ask this; M2's phase only says HOW an item reaches the main (an idle gen is offered one, which opens its turn;
+   *  a gen in a turn pulls at its next tool boundary or Stop) and keeps the turn's edges. No record here (Onsen step 3 off): M2 idle, as before */
+  function canTake(g: Row, now = Date.now()): boolean {
+    const m = member()
+    if (m == null) { takeSince = null; return g.state === 'idle' }
+    if (m !== 'idle') { takeSince = null; return false }
+    if (!takeSince || takeSince.gen !== g.id) takeSince = { gen: g.id, at: now }
+    return true
+  }
+  /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
+  function mainCanTake(): boolean { const g = currentGen(); return !!g && canTake(g) }
+  /** WO-177 一: what M1 does with an item for the main now: 'offer' (an idle gen the record says can take one), else why it waits: M2's phase (in_turn: it
+   *  pulls at its next boundary; walled; starting; gone) or, for an idle gen, the record's member state (waiting, walled, compacting, busy, …) */
+  function deliveryNow(): string {
+    const g = currentGen()
+    if (!g) return 'gone'
+    if (g.state !== 'idle') return String(g.state)
+    return canTake(g) ? 'offer' : member() ?? String(g.state)
+  }
+  /** WO-177 一: the status record changed (lanes.ts mainStatusChanged, at each record server.ts hands out whose member state or interruption differs): an
+   *  item held while the main could not take it is offered at that moment, not at the next tick */
+  function statusChanged(): void { const g = currentGen(); if (g) canTake(g); void pump() }
+
   // ------------------------------------------------------------------ M1
   let didSeq = 0
   const newId = (): string => `m-${Date.now().toString(36)}-${(++didSeq).toString(36)}`
@@ -201,6 +237,7 @@ export function createMain(E: MainEnv) {
     if (kind === 'digest') J().write('wake', id, 'no_wake', { reason: 'information: rides the next delivery' })
     else if (o.batched) J().write('wake', id, 'no_wake', { reason: `batched: rides the next delivery to the main and never wakes it alone${batchWaitMs() ? ` (it leads one after ${Math.round(batchWaitMs() / 60_000)} min)` : ''}` })
     else if (!g || g.state !== 'idle') J().write('wake', id, 'no_wake', { reason: !g ? 'main gone: offered to the next gen' : g.state === 'in_turn' ? 'main in a turn: pulled at its next tool boundary or Stop' : `main ${g.state}` })
+    else if (!canTake(g)) J().write('wake', id, 'no_wake', { reason: `main ${member()} (the status record): offered when the record says it can take it` })   // WO-177 一
     if (kind !== 'digest') void pump()
     return id
   }
@@ -272,7 +309,9 @@ export function createMain(E: MainEnv) {
       if (uw?.walled) probe = false
       else if (uw?.clearedMs != null && uw.clearedMs > Number(g.uw_clear_used ?? 0)) { probe = true; clearUsed = uw.clearedMs }
     }
-    if (g.state !== 'idle' && !probe) return
+    // WO-177 一: an item is offered only when the status record says the main can take one (canTake); held items stay `queued` and go out the moment the
+    // record turns idle (statusChanged). M2 says how: an idle gen is offered (it opens a turn), a gen in a turn pulls at its next boundary (main_after_step)
+    if (!probe && (g.state !== 'idle' || !canTake(g))) return
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
@@ -642,10 +681,14 @@ export function createMain(E: MainEnv) {
     if (!E) return
     const g = currentGen()
     if (g && !E.pidAlive(Number(g.pid))) { endGen(g, pendingEnd.get(g.id) ?? 'killed'); return }
+    // WO-177 一 (Chiron: 「它有自己的 blocker：選單歸值班員或 Joey、上限有 until」): while the status record says the main waits on a menu or on the wall, that
+    // blocker is the record's own (the observation names who takes it, and the wall its until): no stuck alarm is sent for it
+    const m = member()
+    const held = m === 'waiting' || m === 'walled'
     // 002w (E, gaps 4, 11): owed items queued past MAIN_STUCK_MS that nobody could take: no live gen, or a live gen that is neither in a turn (it would
     // pull them), nor walled (its wall notice told Joey), nor holding an offer (an offer it does not take is the silence rule below), and could not be
     // offered them. One alarm per episode, with the count; the next delivery ends it.
-    if (!stuck && (!g || ((g.state === 'idle' || g.state === 'starting') && !items(r => r.state === 'offered' && r.gen === g.id).length))) {
+    if (!stuck && !held && (!g || ((g.state === 'idle' || g.state === 'starting') && !items(r => r.state === 'offered' && r.gen === g.id).length))) {
       const owedNow = items(r => r.state === 'queued' && owed(r) && !heldCut(r) && !batchedRider(r, now))     // WO-157c: a held item waits for a delivery, not for a stream (WO-164: a batched one too)
       if (owedNow.some(r => now - Date.parse(String(r.ts)) > MAIN_STUCK_MS)) {
         stuck = { gen: g?.id ?? null, prompt: null, at: now, undelivered: true }
@@ -664,14 +707,24 @@ export function createMain(E: MainEnv) {
       // like any other after MAIN_STUCK_MS. A dead process is kill -0's. One rule: the gen owes a hook event (a turn is open, or an offer is
       // not taken) and has sent none for longer than it could legitimately be silent
       const owes = g.state === 'in_turn' || ((g.state === 'idle' || g.state === 'walled') && offered.length > 0)
-      const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt)
+      // WO-177 一: an idle gen's silence counts only while the status record says it can take an item (from when it last turned so): the time it could not
+      // (a menu, a compaction, the wall) is not silence. `take`: it can now
+      const take = g.state === 'idle' && canTake(g, now)
+      const from = take && takeSince?.gen === g.id ? takeSince.at : 0
+      const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt, from)
       const limit = g.state === 'in_turn' && g.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
       // 002x: the offer's own bound. An idle gen's offer still unbound after OFFER_LEASE_MS of silence goes back to `queued` (reason offer_untaken)
       // and the pump below writes it once more. `reoffered` on the item names the gen that got it twice: the lease does it once per gen, and the
       // stuck episode below does not write such an item a third time (a client that is frozen, not deaf, takes every copy when it runs again).
-      const untaken = g.state === 'idle' ? offered.filter(r => r.reoffered !== g.id) : []
+      // WO-177 一: only an offer the record said the main could take for the whole lease was 「可以拿卻沒拿」 (a menu open: Claude Code holds the copy and
+      // gives it the moment the menu closes; a second copy would be a second prompt)
+      const untaken = take ? offered.filter(r => r.reoffered !== g.id) : []
       if (untaken.length && now - since > OFFER_LEASE_MS && now - since <= limit) {
         for (const r of untaken) J().write('msg', r.id, 'queued', { reason: backReason(r, 'offer_untaken'), gen: null, prompt_id: null, via_pull: null, reoffered: g.id })
+      } else if (owes && held && now - since > limit) {
+        // WO-177 一: the record names the blocker (a menu, the wall): no stuck episode, nobody told. A walled gen's probe item goes back to wait for its
+        // next probe time (a probe offer is the one way its own hook events resume), as the episode below would have put it back
+        if (g.state === 'walled') for (const r of offered) J().write('msg', r.id, 'queued', { reason: backReason(r, 'probe_untaken'), gen: null, prompt_id: null, via_pull: null })
       } else if (owes && now - since > limit) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         // what the episode writes again: a walled gen's probe item (its next probe), an idle gen's item the lease has not written again yet
@@ -690,11 +743,11 @@ export function createMain(E: MainEnv) {
         // Once per episode (the alarm does not fire again until a hook event ends it), and no timer of its own. A walled gen's probe item waits for
         // its next retry time like any probe.
         for (const r of again) J().write('msg', r.id, 'queued', { reason: backReason(r, 'stuck_unbound'), gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
-      } else if (g.state === 'idle' && !offered.length) {
+      } else if (take && !offered.length) {
         // WO-157c (Chiron 15:25Z, 1): a colleague's, a scheduler's or an alert's item of an interrupted turn that no new turn took within MAIN_STUCK_MS goes
         // the untaken path above: Joey is told (the same words) and it is offered once more, now leading an offer (with Chiron's line in front). Joey's own
-        // items never go this way: they wait for the next delivery.
-        const cutOld = items(r => heldCut(r) && owed(r) && r.kind !== 'joey' && forGen(r, g) && now - Date.parse(String(r.cut_at ?? r.ts)) > MAIN_STUCK_MS)
+        // items never go this way: they wait for the next delivery. WO-177 一: only while the record says the main can take one, counted from then
+        const cutOld = items(r => heldCut(r) && owed(r) && r.kind !== 'joey' && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), from) > MAIN_STUCK_MS)
         if (cutOld.length) {
           stuck = { gen: g.id, prompt: null, at: now }
           for (const r of cutOld) J().write('msg', r.id, 'queued', { reason: 'interrupted_untaken' })
@@ -724,7 +777,7 @@ export function createMain(E: MainEnv) {
   }
 
   return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, statusIdle, turnWork, turnStart, openTool,
-    replaceQueued, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
+    replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 
 // ------------------------------------------------------------------ registration text (the main-only rules travel with the architecture)

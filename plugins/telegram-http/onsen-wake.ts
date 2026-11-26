@@ -14,7 +14,8 @@
 //
 // The row (the contract of onsen4.py):
 //   source_kind  what kind of thing reached the daemon (sourceKindOf)
-//   urgency      how urgent today's rules make it (urgencyOf): interrupt | ordered | silent | state (keep-warm, stall, restart, resume: a state crossed)
+//   urgency      interrupt | ordered | silent | state (keep-warm, stall, restart, resume: a state crossed): a decided row's is the decision's (WO-177 三:
+//                the route row's wake_urgency); a row no decision made: how today's rules make it (urgencyOf)
 //   target       whom it was given to (targetOf): main_now | main_after_step | lane:<kind> | ledger | held:<wall|starting|offline> | none
 //   rule, note   the routing.jsonl rule id (a routeWake kind is its rule: wake-keepwarm, wake-mail, …) and note
 //   member_state the agent's status at that moment (statusOf's view as the daemon last computed it; walled when the view carries a wall)
@@ -96,7 +97,10 @@ export function sourceKindOf(row: Record<string, unknown>, ev: InEvent | null, o
   return 'external'                                                       // a sender not in the roster (iris-slack, reply-watch, …)
 }
 
-/** how urgent today's rules make it (nothing here is read by any rule): a wake-up line for a state crossed (keep-warm, stall, restart, resume) is `state`;
+const URGENCIES: ReadonlySet<string> = new Set(['interrupt', 'ordered', 'silent', 'state'])
+const isUrgency = (u: unknown): u is Urgency => typeof u === 'string' && URGENCIES.has(u)
+/** WO-177 三: only for a row no decideWake made (decided_by old: the old router, the fixed paths); a decided row carries the decision's urgency (wakeItem).
+ *  How urgent today's rules make it (nothing here is read by any rule): a wake-up line for a state crossed (keep-warm, stall, restart, resume) is `state`;
  *  the mailbox reminder and the ring, a mail, a scheduled run, the mailbox's events are `ordered`; Joey is `interrupt`; a mesh push follows its line
  *  (feed silent, mail ordered, a push with none a call: interrupt), and a no_reply notice that is not an alert sender's is `silent` (today's mesh-no-reply
  *  files it in the ledger). The main's own tools and a follow-up are `ordered`; the digest is `silent`; a /lanes command and a refused registration have none. */
@@ -181,7 +185,9 @@ export function wakeItem(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'e
   o: { agent: string; host: string; at: string; idem: string; memberState: string | null }): WakeItem {
   const ev = ctx.ev
   const kind = sourceKindOf(row, ev, ctx)
-  const urgency = urgencyOf(kind, row, ev, ctx.alertSenders)
+  // WO-177 三 (Chiron's ticket; wo169-acceptance 「跟預期不同」 4: a no_reply call recorded silent while the decision used interrupt): a row decideWake made
+  // carries the urgency the decision used (lanes.ts verdictRow); urgencyOf describes only the rows no decision made (the old router, the fixed paths)
+  const urgency = row.decided_by === 'new' && isUrgency(row.wake_urgency) ? row.wake_urgency : urgencyOf(kind, row, ev, ctx.alertSenders)
   const text = typeof row.text === 'string' ? row.text : typeof ev?.text === 'string' ? ev.text : ''
   const sender = row.from ?? ev?.from
   return {

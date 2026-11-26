@@ -31,6 +31,8 @@ const MENU = ['', '   Select model', '   Switch between Claude models.', '   ❯
   '   Enter to set as default · s to use this session only · Esc to cancel', ''].join('\n')
 const INTERRUPTED = screen(['✻ Churned for 6s · done 12:07 AM', '  ⎿  Interrupted · What should Claude do instead?'])
 const COMPACT = screen(['✻ Compacting conversation… (12s)'])
+// WO-177 二: a usage_limit verdict holds only where the limit message is the latest output (or the program has its own wall)
+const LIMIT_SCREEN = screen(['⏺ Working on it.', "  ⎿  You've hit your session limit · resets 5am (UTC)"])
 const SECRET = screen(['⏺ The key is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA and mail joey.example@example.com', '', '✻ Worked for 3s · done 1:00 AM'])
 const SIX: Array<[string, string, ScreenVerdict['state'], ScreenVerdict['menu']]> = [
   ['a busy', BUSY, 'working', 'none'], ['b background shell', SHELL, 'idle_background_running', 'none'], ['c sub-agent', SUB, 'working', 'none'],
@@ -91,7 +93,7 @@ describe('1 the interface: JevRead only in JevJudge; publishView takes a ScreenV
 
   test('a fake ScreenJudge and JevJudge returning the same verdict: the same record, field by field, for every state × statusOf context, and the same report to Onsen', async () => {
     let checked = 0
-    for (const [, text, state, menu] of [...SIX, ['idle', IDLE, 'idle', 'none'] as const, ['starting', MENU, 'starting', 'none'] as const, ['limit', IDLE, 'usage_limit', 'usage_limit_options'] as const]) {
+    for (const [, text, state, menu] of [...SIX, ['idle', IDLE, 'idle', 'none'] as const, ['starting', MENU, 'starting', 'none'] as const, ['limit', LIMIT_SCREEN, 'usage_limit', 'usage_limit_options'] as const]) {
       for (const [, p] of PROGS) {
         const v = V(state, 0.87, menu)
         const fake = new FakeJudge(() => ({ ...v }))
@@ -294,7 +296,7 @@ describe('5 run/screen-verdicts.jsonl: the question bank', () => {
     expect(bank).toHaveLength(7)
     expect(new Set(bank.map(b => b.hash)).size).toBe(7)
     for (const b of bank) {
-      expect(Object.keys(b)).toEqual(['ts', 'agent', 'hash', 'has_input_box', 'screen', 'counted_by_program', 'found_by_program', 'verdict'])
+      expect(Object.keys(b)).toEqual(['ts', 'agent', 'hash', 'judge_version', 'has_input_box', 'screen', 'counted_by_program', 'found_by_program', 'verdict'])   // WO-177 五: the judge's version
       expect(Object.keys(b.verdict).sort()).toEqual(['by', 'menu', 'p', 'state'])
     }
     const byState = Object.fromEntries(bank.map(b => [b.verdict.state + (b.verdict.state === 'working' ? `:${b.counted_by_program.running_agents}` : ''), b]))

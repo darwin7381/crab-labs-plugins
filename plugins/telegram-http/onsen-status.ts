@@ -243,8 +243,14 @@ export class StatusFacts {
    *  HEARTBEAT_MS; 0 = no heartbeat, no heartbeat_s); freshMs: the heartbeat repeats the latest view only if it was handed in within the larger of
    *  this (default 5 s; the daemon computes one every 2 s) and heartbeatMs; since (WO-169): where the last report's state and since are kept across a
    *  restart (a first report in the same state keeps that since, as Onsen does) */
+  /** WO-177 六: the since of this daemon's first report: Onsen's since (remote()) is taken while the state has not changed since that report */
+  private firstSince: string | null = null
+  private remoteAsked = false
   constructor(readonly o: { agent: string; sink: (f: StatusFact) => void; throttleMs?: number; heartbeatMs?: number; freshMs?: number; now?: Now
-    since?: { load(): { state?: unknown; since?: unknown } | null; save(x: { state: string; since: string }): void } }) {}
+    since?: { load(): { state?: unknown; since?: unknown } | null; save(x: { state: string; since: string }): void
+      /** WO-177 六 (Chiron's ticket: after the fleet's restart athena's and sandwich-master's /healthz since was the restart, Onsen's was right): the
+       *  record as Onsen holds it now (GET /status: its state and since), asked once after start; null: not known */
+      remote?(): Promise<{ state?: unknown; since?: unknown } | null> } }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   private get beatMs(): number { const n = Number(this.o.heartbeatMs ?? HEARTBEAT_MS); return Number.isFinite(n) && n > 0 ? n : 0 }
   /** the status as the daemon sees it now. WO-162 (2): a new state or any change of the detail (a tool starting or ending, waitingFor, dialog_open, a
@@ -278,12 +284,29 @@ export class StatusFacts {
     this.arm()
   }
   private noteSent(v: StatusView, ms: number, detail: Record<string, unknown> | undefined): void {
+    const first = !this.sent
     let prev: { state?: unknown; since?: unknown } | null = this.sent
     if (!prev) { try { prev = this.o.since?.load() ?? null } catch { prev = null } }
     const keep = !!prev && prev.state === v.state && typeof prev.since === 'string' && !Number.isNaN(Date.parse(prev.since))
     const since = keep ? String(prev!.since) : iso(ms)
     this.sent = { state: v.state, at: iso(ms), since, detail: detail ?? {}, last_activity_at: v.last_activity_at ?? this.sent?.last_activity_at ?? null }
     if (!keep) { try { this.o.since?.save({ state: v.state, since }) } catch {} }
+    if (first) { this.firstSince = since; this.askRemote() }
+  }
+  /** WO-177 六: once after start, Onsen's record (its state and since). While this daemon's state has not changed since its first report, Onsen's since is
+   *  this record's since too (Onsen keeps since while the state stays; the local file is only what this daemon last saved, and may be missing or old) */
+  private askRemote(): void {
+    if (this.remoteAsked || !this.o.since?.remote) return
+    this.remoteAsked = true
+    let p: Promise<{ state?: unknown; since?: unknown } | null>
+    try { p = this.o.since.remote() } catch { return }
+    void p.then(r => {
+      if (!r || typeof r.state !== 'string' || typeof r.since !== 'string' || Number.isNaN(Date.parse(r.since))) return
+      const s = this.sent
+      if (!s || s.state !== r.state || s.since !== this.firstSince || s.since === r.since) return
+      s.since = r.since; this.firstSince = r.since
+      try { this.o.since?.save({ state: s.state, since: s.since }) } catch {}
+    }).catch(() => {})
   }
   /** the heartbeat: heartbeatMs after the last report, the latest view again, if one was handed in within that time; otherwise nothing (the next
    *  update() reports at once, the beat being overdue) */
