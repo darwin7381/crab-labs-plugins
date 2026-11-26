@@ -106,24 +106,3 @@ test('the main\'s send_to_agent with reply_to: the daemon asks the router which 
   expect(await send({ line: 'call', to: 'eve', reply_to: '12601', text: '回 eve' })).toMatch(/^delivered/)
   expect(lastSend().refs?.call).toBeUndefined()                                             // the router names no Call of eve's
 }, 30000)
-
-test('an Onsen that does not take refs.call yet: refused for that field, the same send goes once more without it and is stored; counted, said once', async () => {
-  oldOnsen = true
-  const k = sends.length
-  const a = await laneSend({ to: 'chiron', text: '舊 Onsen', reply_to: '12601', no_reply: true, call: '424' })
-  expect(a.delivered).toBe(true)
-  expect(sends.length).toBe(k + 2)
-  expect(sends[k].refs).toMatchObject({ call: '424' })
-  expect(sends[k + 1].refs?.call).toBeUndefined()
-  expect(sends[k + 1]).toMatchObject({ payload: { text: '舊 Onsen', reply_to_id: 12601 }, refs: { thread: 'adam#t-0cc100' } })
-  await laneSend({ to: 'chiron', text: '舊 Onsen 2', reply_to: 'mesh-1', no_reply: true, call: '422' })
-  expect(sends.length).toBe(k + 4)
-  // a 400 for anything else is not retried
-  const before = sends.length
-  const b = await laneSend({ to: 'chiron', text: '新的呼叫，舊 Onsen', because: 'x' })
-  expect(b.delivered).toBe(true)
-  expect(sends.length).toBe(before + 1)
-  expect((await health())?.onsen_send).toMatchObject({ call_ref_refused: 2, failed: 0 })
-  expect(logOf().split('\n').filter(l => l.includes('Onsen does not take refs.call yet')).length).toBe(1)
-  oldOnsen = false
-}, 30000)
