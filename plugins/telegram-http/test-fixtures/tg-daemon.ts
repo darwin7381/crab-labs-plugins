@@ -22,6 +22,8 @@ export function freePort(): Promise<number> {
   })
 }
 export type TgDaemon = { port: number; stateDir: string; ws: string; home: string; log: () => string; stop: () => Promise<void>
+  /** WO-197: killed at once (SIGKILL: no shutdown handler runs), as a crash or a machine's restart */
+  kill: () => Promise<void>
   client: () => Promise<Client>; call: (name: string, args: Record<string, unknown>) => Promise<{ text: string; isError: boolean }> }
 
 /** root: the test's temp dir (kept across a restart: the same root gives the same state); joey: the allowlisted Telegram user id */
@@ -57,6 +59,7 @@ export async function startTgDaemon(api: BotApiMock, root: string, joey: number,
     port, stateDir, ws, home,
     log: () => { try { return readFileSync(join(stateDir, 'server.log'), 'utf8') } catch { return '' } },
     stop: async () => { try { await c?.close() } catch {}; c = null; proc.kill(); await proc.exited.catch(() => {}); await sleep(100) },
+    kill: async () => { proc.kill(9); await proc.exited.catch(() => {}); c = null; await sleep(100) },
     client,
     call: async (name, args) => {
       const r: any = await (await client()).callTool({ name, arguments: args })

@@ -567,6 +567,10 @@ async function onsenInboundNow(): Promise<boolean> {
 }
 /** WO-194: the facts each message's tag is built from, kept until its person_message comes back (and what was delivered, so nothing is twice) */
 const inboundStore: OnsenInbound.InboundStore | null = onsen && !INBOX_ONLY ? new OnsenInbound.InboundStore({ file: join(STATE_DIR, 'onsen', 'inbound-store.json'), log }) : null
+/** WO-197 (Chiron mesh 12852): an album item's kept-facts key → its album, while the album waits: the inbox handing the item again, or A.1, finds it
+ *  here (delivered with its album, never a second time); its facts stay on disk until then, so a daemon stopped before the album goes delivers it after
+ *  its restart (A.1's restart path) */
+const albumHeld = new Map<string, string>()
 /** WO-194: the edited Telegram messages whose edit comes back from Onsen as a person_edit (chat:message_id → the edited message; 200 kept) */
 const inboundEdits = new Map<string, any>()
 /** WO-194: edits not to be delivered again when their person_edit comes (chat:message_id:edit_date → why): made while their message waited to be
@@ -589,7 +593,8 @@ const inboundWriter: OnsenInbound.InboundWriter | null = onsen && !INBOX_ONLY ? 
     const f = inboundStore?.get(job.key)
     if (!f || inboundStore!.isDone(job.key)) return
     if (f.msgId != null) inboundAck(f.chat_id, f.msgId)
-    void finishInbound(f, 'local').then(() => inboundStore!.finish([job.key])).catch(e => log('error', `onsen inbound: delivering ${job.key} here: ${e}`))
+    void finishInbound(f, 'local', undefined, [job.key]).then(inAlbum => { if (!inAlbum) inboundStore!.finish([job.key]) })
+      .catch(e => log('error', `onsen inbound: delivering ${job.key} here: ${e}`))
   },
 }) : null
 /** WO-194: A took the message: 👀 (as the arrival set it before), and its file into Onsen (ONSEN_FILES: uploaded now and hung on the message's
@@ -623,13 +628,14 @@ function inboundBackLater(key: string, onsenId: number | null, tries = 0): void 
 async function inboundBack(key: string, onsenId: number | null, tries: number): Promise<void> {
   if (!inboundStore || inboundStore.isDone(key)) return
   if (personBusy.has(key)) { inboundBackLater(key, onsenId, tries); return }     // coming back from the inbox right now: looked at again later
+  if (albumHeld.has(key)) return                                                 // WO-197: back already, waiting in its album (finished when it goes)
   const f = inboundStore.get(key)
   if (!f) return
   personBusy.add(key)
   try {
     log('warn', `onsen inbound: ${key} not back from the inbox ${Math.round(INBOUND_BACK_MS / 1000)} s after it was written into Onsen${onsenId != null ? ` (message ${onsenId})` : ''}: delivered here from the facts it kept`)
-    await finishInbound(f, 'local')
-    inboundStore.finish([key, ...(onsenId != null ? [`pm:${onsenId}`] : [])])
+    const keys = [key, ...(onsenId != null ? [`pm:${onsenId}`] : [])]
+    if (!await finishInbound(f, 'local', undefined, keys)) inboundStore.finish(keys)   // WO-197: an album item's keys are finished when its album goes
     inboundStore.stats.here++
     deliveredHere.add(key)
     if (deliveredHere.size > 200) deliveredHere.delete(deliveredHere.values().next().value!)
@@ -650,10 +656,28 @@ function editBackLater(ek: string): void {
     void deliverEditedMessage(m).catch(err => log('warn', `onsen inbound: delivering the edit of tg:${m.message_id} here failed: ${err instanceof Error ? err.message : err}`))
   }, INBOUND_BACK_MS); (t as any).unref?.()
 }
+/** WO-197 (Chiron mesh 12852): the album items kept from before the last stop and not delivered yet (A.1's restart path delivers them 20 s after the
+ *  start). An item of the same album handed over before that pulls them into its album now (restartAlbumItems), so the album is one tag */
+const restartLeft = new Set<string>()
+function restartAlbumItems(chat: string, mgid: string): void {
+  for (const k of [...restartLeft]) {
+    const f = inboundStore?.get(k)
+    if (!f || inboundStore!.isDone(k) || albumHeld.has(k)) { restartLeft.delete(k); continue }
+    if (f.chat_id !== chat || f.mgid !== mgid || !OnsenInbound.albumItem(f) || personBusy.has(k)) continue
+    restartLeft.delete(k)
+    log('info', `onsen inbound: ${k}, kept from before the last stop, joins its album now (another item of it came)`)
+    void finishInbound(f, 'local', undefined, [k]).then(inAlbum => { if (!inAlbum) inboundStore!.finish([k]) })
+      .catch(e => log('error', `onsen inbound: delivering ${k} here: ${e instanceof Error ? e.message : e}`))
+  }
+}
 // A.1 after a restart: what was written before it and has not come back is looked at 20 s after the start (not what still waits to be written)
 if (inboundStore && inboundWriter) {
   const left = inboundStore.waiting().filter(k => !inboundWriter!.pending(k))
-  if (left.length) log('info', `onsen inbound: ${left.length} message(s) written into Onsen before the last stop and not back yet: delivered here in ${Math.round(INBOUND_BACK_MS / 1000)} s unless they come back first`)
+  for (const k of left) if (OnsenInbound.albumItem(inboundStore.get(k) ?? { fromReply: false })) restartLeft.add(k)
+  // WO-197 (Chiron mesh 12852): an album item back from Onsen keeps its facts until its album is delivered, so a daemon that stopped between the two
+  // (a fleet version change restarts every daemon) delivers it here, once, with the rest of its album
+  const albums = left.filter(k => OnsenInbound.albumItem(inboundStore!.get(k) ?? { fromReply: false })).length
+  if (left.length) log('info', `onsen inbound: ${left.length} message(s) kept from before the last stop and not delivered yet (written into Onsen and not back${albums ? `; ${albums} album item(s) whose album did not go` : ''}): delivered here in ${Math.round(INBOUND_BACK_MS / 1000)} s unless they come back first`)
   for (const k of left) inboundBackLater(k, null)
 }
 /** the arrival's 👀 (access.json ackReaction) on one message; ✍ never lands under it (WO-145) */
@@ -4538,11 +4562,14 @@ function inboundFacts(ctx: Context, text: string, image: ImageSource | undefined
 /** WO-194: the rest of a person's Telegram message once it is delivered: its <channel> tag, the album wait, the router. One function whichever way the
  *  message came (how: 'local', the path before; 'onsen', back from Onsen with the facts its arrival kept, or rebuilt from the person_message), so the
  *  tag is the same. `got`: the photo already taken (the path before takes it before the transcript); else it is taken here. */
-async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?: { imagePath?: string; imageError?: string }): Promise<void> {
+async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?: { imagePath?: string; imageError?: string }, keys: string[] = []): Promise<boolean> {
   const chat_id = f.chat_id, msgId = f.msgId, text = f.text, image = f.image, attachment = f.attachment, inTopic = f.inTopic
   const voiceTranscript = f.voiceTranscript, attachmentFromReply = f.fromReply
-  // #6: an item of an album (photos or documents sharing a media_group_id; never a replied-to message's file) is buffered below, not delivered alone
-  const inAlbum = !!(f.mgid && (image || attachment) && !attachmentFromReply)
+  // #6: an item of an album (photos or documents sharing a media_group_id; never a replied-to message's file) is buffered below, not delivered alone.
+  // WO-197 (Chiron mesh 12852): true is returned then, and its kept facts' keys (`keys`) are finished when the album is delivered (flushAlbum), not now
+  const inAlbum = OnsenInbound.albumItem(f)
+  // WO-197: a connector's album item kept across a restart: its files are in Onsen (the cache of this process may not have them)
+  if (f.fileUrls && connectorNow()) for (const [ref, u] of Object.entries(f.fileUrls)) if (!connectorFiles.has(ref)) connectorFiles.set(ref, u)
   let imagePath = got?.imagePath
   let imageError = got?.imageError
   // WO-197 (lab 17:12Z): an album item's photo is taken while the item already waits in the album buffer: the hand-over (POST /onsen/person) is
@@ -4633,15 +4660,17 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
         ? { imagePath, ...(photo ? { photo } : {}), fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
             docMime: attachment!.mime, docName: attachment!.name }),
-      meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}),
+      meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys,
     }, OnsenInbound.albumCountOf(f))
-    return
+    restartAlbumItems(chat_id, String(mgid))
+    return true
   }
 
   await dispatchInbound(chat_id, {
     method: 'notifications/claude/channel',
     params: { content: text, meta },
   })
+  return false
 }
 
 // Route one inbound notification: roamer target session when ROAMER_MODE is
@@ -4732,7 +4761,9 @@ type AlbumEntry = {
   captions: string[]
   /** `photo`: the item's photo still being taken (an album item back from Onsen); the flush waits for it */
   items: Array<{ imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
-                 docKind?: string; docMime?: string; docName?: string }>
+                 docKind?: string; docMime?: string; docName?: string
+                 /** WO-197: its Telegram message id, caption, tag and client.meta (an album put together across a restart is put in order at the flush) */
+                 n?: number; caption?: string; meta?: Record<string, string>; clientMeta?: Record<string, string> }>
   baseMeta: Record<string, string>
   /** WO-197 (rule A): the first item's client.meta, applied again after the album's own fields (media_group_count, the positional files) are built */
   clientMeta?: Record<string, string>
@@ -4741,6 +4772,8 @@ type AlbumEntry = {
   expect: number | null
   first: number
   cap: ReturnType<typeof setTimeout> | null
+  /** WO-197 (Chiron mesh 12852): its items' kept facts (inboundStore keys: chat:message_id, pm:<Onsen id>), finished once the album is delivered */
+  keys: string[]
 }
 const albumBuffers = new Map<string, AlbumEntry>()
 
@@ -4748,22 +4781,26 @@ function bufferAlbumItem(
   chatId: string,
   mgid: string,
   item: { caption?: string; imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
-          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string> },
+          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; keys?: string[] },
   count: number | null = null,
 ): void {
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
     entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null,
-      expect: null, first: Date.now(), cap: null }
+      expect: null, first: Date.now(), cap: null, keys: [] }
     albumBuffers.set(key, entry)
   }
+  if (item.keys?.some(k => albumHeld.get(k) === key)) { log('info', `album ${key}: ${item.keys.join(', ')} is in it already: not added again`); return }
+  for (const k of item.keys ?? []) { if (!entry.keys.includes(k)) entry.keys.push(k); albumHeld.set(k, key) }
   if (item.meta.message_id) entry.ids.push(item.meta.message_id)
   if (entry.timer) clearTimeout(entry.timer)
   entry.timer = null
   if (item.caption) entry.captions.push(item.caption)
   entry.items.push({ imagePath: item.imagePath, ...(item.photo ? { photo: item.photo } : {}), fileId: item.fileId, size: item.size,
-                     docKind: item.docKind, docMime: item.docMime, docName: item.docName })
+                     docKind: item.docKind, docMime: item.docMime, docName: item.docName,
+                     ...(/^\d+$/.test(item.meta.message_id ?? '') ? { n: Number(item.meta.message_id) } : {}), ...(item.caption ? { caption: item.caption } : {}),
+                     meta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}) })
   if (count != null && entry.expect == null) entry.expect = count
   albumWait(key, entry)
 }
@@ -4809,6 +4846,15 @@ async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<v
   if (why === 'cap') log('warn', `album ${key}: ${entry.items.length} of ${entry.expect ?? '?'} item(s) in ${Math.round(ALBUM_CAP_MS / 1000)} s after the first; delivered with what came`)
   else if (entry.expect != null) log('info', `album ${key}: all ${entry.items.length} item(s) in; delivered as one tag`)
   await Promise.all(entry.items.map(async it => { if (it.photo) { it.imagePath = await it.photo; delete it.photo } }))
+  // WO-197 (Chiron mesh 12852): items kept from before a restart join the album after one handed over since (restartAlbumItems): in Telegram's order
+  // again (its message ids), the first item's tag and client.meta the album's, as they are when the items come in order
+  if (entry.items.every(it => it.n != null) && entry.items.some((it, i) => i > 0 && it.n! < entry.items[i - 1]!.n!)) {
+    entry.items.sort((a, b) => a.n! - b.n!)
+    entry.baseMeta = entry.items[0]!.meta ?? entry.baseMeta
+    if (entry.items[0]!.clientMeta) entry.clientMeta = entry.items[0]!.clientMeta
+    entry.captions = entry.items.flatMap(it => it.caption ? [it.caption] : [])
+    entry.ids = entry.items.flatMap(it => it.meta?.message_id ? [it.meta.message_id] : [])
+  }
   const meta: Record<string, string> = { ...entry.baseMeta }
   // Per-item image fields are rebuilt positionally below — drop the first
   // item's own copies (incl. its failure markers) from the base.
@@ -4846,10 +4892,15 @@ async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<v
       ? `(album: ${entry.items.length} items — ${docNames.join(', ')}${nPhotos > 0 ? ` + ${nPhotos} photo(s)` : ''})`
       : `(album: ${entry.items.length} photos)`
   onsenFacts?.album(entry.chatId, entry.ids)          // Onsen step 3 (WO-143): seen / turn_end of the delivery are every item's
-  void dispatchInbound(entry.chatId, {
-    method: 'notifications/claude/channel',
-    params: { content, meta },
-  }).catch(err => log('error', `album flush dispatch failed: ${err}`))
+  try {
+    await dispatchInbound(entry.chatId, {
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+  } catch (err) { log('error', `album flush dispatch failed: ${err}`) }
+  // WO-197 (Chiron mesh 12852): delivered: its items' kept facts go now (a restart before this line delivers the album from them, once)
+  for (const k of entry.keys) albumHeld.delete(k)
+  if (entry.keys.length) inboundStore?.finish(entry.keys)
 }
 
 // ---- Voice transcription (#12, opt-in) --------------------------------------
@@ -5966,6 +6017,11 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
     log('info', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} (${shown}) came back from the inbox ${!edit && deliveredHere.has(key) ? 'after it was delivered here (not back in time, A.1)' : 'already delivered'}: not delivered again`)
     return { code: 200, json: { duplicate: true } }
   }
+  if (!edit && albumHeld.has(key)) {                         // WO-197: in its album already (it goes with the album)
+    inboundStore.stats.duplicates++
+    log('info', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} (${shown}) came back from the inbox again while its album waits: not buffered again`)
+    return { code: 200, json: { duplicate: true, album: true } }
+  }
   // busy: the same item, or (A.1) the same message being delivered here because it was not back in time
   if (personBusy.has(own) || (!edit && personBusy.has(key))) return { code: 409, json: { busy: true } }
   const busy = edit ? [own] : [own, key]
@@ -6013,8 +6069,17 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
     }
     const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
     if (cm) f = { ...f, clientMeta: cm }
-    await finishInbound(f, 'onsen')
-    inboundStore.finish([key, own])
+    // WO-197 (Chiron mesh 12852): an album item is answered 200 (the inbox acks it) before its album goes (up to TELEGRAM_ALBUM_CAP_MS): what rebuilds
+    // its tag is kept on disk until then (the arrival's facts with client.meta; a connector's, rebuilt from the person_message, with where Onsen keeps
+    // its files), so a daemon stopped meanwhile delivers it after its restart, once
+    if (OnsenInbound.albumItem(f)) {
+      const urls: Record<string, { url: string; name?: string; mime?: string }> = {}
+      for (const a of Array.isArray(p.attachments) ? p.attachments : []) if (a?.client_ref && a?.url)
+        urls[String(a.client_ref)] = { url: String(a.url), ...(a.name ? { name: String(a.name) } : {}), ...(a.mime ? { mime: String(a.mime) } : {}) }
+      f = { ...f, ...(Object.keys(urls).length ? { fileUrls: urls } : {}) }
+      inboundStore.park(key, f)
+    }
+    if (!await finishInbound(f, 'onsen', undefined, [key, own])) inboundStore.finish([key, own])
     log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
     return { code: 200, json: { delivered: true } }
   } finally { for (const b of busy) personBusy.delete(b) }

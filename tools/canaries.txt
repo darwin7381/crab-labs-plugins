@@ -297,3 +297,9 @@ plugins/telegram-http/onsen-client.ts::get on(): boolean { const v = this.o.on; 
 plugins/telegram-http/onsen-connector-actions-daemon.test.ts::named at runtime (the machine config), ONSEN_ACTIONS=0
 plugins/telegram-http/server.ts::const OFFICER_ON_SCREEN = 'on the screen by the duty officer'
 plugins/telegram-http/onsen-client.ts::resolved ${option_id} by ${who} (pressed ${where})
+plugins/telegram-http/server.ts::const albumHeld = new Map<string, string>()
+plugins/telegram-http/server.ts::if (!await finishInbound(f, 'onsen', undefined, [key, own])) inboundStore.finish([key, own])
+plugins/telegram-http/server.ts::if (entry.keys.length) inboundStore?.finish(entry.keys)
+plugins/telegram-http/server.ts::function restartAlbumItems(chat: string, mgid: string): void {
+plugins/telegram-http/onsen-inbound.ts::export const albumItem = (f: Pick<Facts, 'mgid' | 'image' | 'attachment' | 'fromReply'>): boolean =>
+plugins/telegram-http/onsen-album-restart-daemon.test.ts::killed while their photos are fetched; restarted: one tag with the three, once
