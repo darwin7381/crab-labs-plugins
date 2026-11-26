@@ -1143,7 +1143,7 @@ export class DutyOfficer {
       if (state === 'OTHER') this.event('seen_other', { agent: t.label, tmux: t.tmux, screen_hash: hash, ...(lk.menu ? { menu: lk.menu.kind } : {}) })
     }
     // WO-168 item 6: the refusal-fallback picker has its own clock (modal-guard's: from first seen, whatever else on the screen moves); gone, it starts again
-    if (lk.menu?.kind === 'refusal_fallback') { await this.refusalRule(t, lk, s, now); return }
+    if (lk.menu?.kind === 'refusal_fallback') { void this.refusalRule(t, lk, s, now).catch(e => this.event('error', { agent: t.label, tmux: t.tmux, where: 'refusal rule', error: String(e).slice(0, 300) })); return }
     this.refusalGone(t)
     if (state !== 'OTHER' || now - s.since < this.L.stallMs) return
     // a raw notice held back by the hourly cap: after the hour, look again (the model may be back)
@@ -1159,7 +1159,10 @@ export class DutyOfficer {
         return
       }
       if (lk.menu.kind === 'usage_limit_options') { await this.usageLimitRule(t, lk); return }
-      await this.programPress(t, lk, s, ['Esc'], 'switch_confirm', `${t.label}：換模型／思考強度的確認沒有程式在接，值班員按了 Esc（No, go back），維持原樣`)
+      // the press does not hold the loop (other panes); the pane is busy until it is done
+      this.busy.add(t.tmux)
+      void this.programPress(t, lk, s, ['Esc'], 'switch_confirm', `${t.label}：換模型／思考強度的確認沒有程式在接，值班員按了 Esc（No, go back），維持原樣`)
+        .catch(e => this.event('error', { agent: t.label, tmux: t.tmux, where: 'switch_confirm', error: String(e).slice(0, 300) })).finally(() => this.busy.delete(t.tmux))
       return
     }
     // the lanes' owner hook and the rate-limit rule below read the screen's text; on the own pane the record names the menu (above)
@@ -1638,8 +1641,7 @@ export class DutyOfficer {
   private async programPress(t: Target, lk: NonNullable<Look>, s: PaneState, keys: string[], rule: string, summary: string): Promise<Look | 'not_pressed'> {
     s.rec = { action: `program:${rule}`, t: this.now() }
     const dry = this.config().dry_keys
-    this.busy.add(t.tmux)
-    try {
+    {
       const r = await this.pressKeys(t.tmux, lk.hash, keys, dry, false, lk.screenHash ?? null)
       if (!r.ok) {
         this.event('aborted', { agent: t.label, tmux: t.tmux, rule, keys, why: r.off ? 'switched off before pressing' : r.attended ? 'a person started typing before pressing' : 'screen changed before pressing' })
@@ -1658,7 +1660,7 @@ export class DutyOfficer {
         } catch (e) { this.event('error', { agent: t.label, tmux: t.tmux, where: 'action pressed', error: String(e).slice(0, 200) }) }
       }
       return dry ? null : r.after
-    } finally { this.busy.delete(t.tmux) }
+    }
   }
 
   // ---- WO-168 item 6: the refusal-fallback picker (Chiron's rulings 3; modal-guard's branch moved here, its numbers unchanged)
@@ -1693,6 +1695,11 @@ export class DutyOfficer {
       this.event('refusal_escalated', { agent: t.label, tmux: t.tmux, hits: n, alert: res, screen_hash: lk.hash })
       return
     }
+    if (this.busy.has(t.tmux)) { r.hits.pop(); r.lastEsc = 0; return }
+    this.busy.add(t.tmux)                                                  // the pane is the rule's until the notice is in (the loop skips it)
+    try { await this.refusalPress(t, lk, s, r) } finally { this.busy.delete(t.tmux) }
+  }
+  private async refusalPress(t: Target, lk: NonNullable<Look>, s: PaneState, r: { hits: number[]; lastEsc: number }): Promise<void> {
     const after = await this.programPress(t, lk, s, ['Esc'], 'refusal_fallback', `${t.label}：安全機制擋下這一回合，值班員按了 Esc（不換模型、不改寫重送），並提醒它換一條路`)
     if (after === 'not_pressed') { r.hits.pop(); r.lastEsc = 0; return }
     if (this.config().dry_keys) return
