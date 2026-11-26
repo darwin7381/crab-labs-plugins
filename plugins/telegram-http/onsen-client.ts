@@ -54,9 +54,11 @@ export type OnsenEvent = {
 }
 /** step 2 (WO-142): Joey's /clear draws a line (POST /restart-lines); idem_key tg:<agent>:<chat>:line:<the /clear message id> */
 export type RestartLineDraw = { agent: string; client: 'telegram'; chat: string; idem_key: string; at: string; by?: string; client_msg_id?: string }
+  /** WO-197 segment 2 (Onsen 0.35.8, CONTRACT §7d 「重新開始線屬於對話」): the conversation instead of agent / client / chat (never both: 400) */
+  | { conversation_id: string; idem_key: string; at: string; by?: string; client_msg_id?: string }
 /** step 2: his button lifts it (POST /restart-lines/lift). draw_idem (local only, never posted): a lift queued behind a draw still in the spool, resolved
  *  to that draw's line id when the spool reaches it */
-export type RestartLineLift = { agent: string; client: 'telegram'; chat: string; at: string; by?: string; line_id?: number; draw_idem?: string }
+export type RestartLineLift = { agent?: string; client?: 'telegram'; chat?: string; conversation_id?: string; at: string; by?: string; line_id?: number; draw_idem?: string }
 /** a line this daemon drew, kept in lines.json (the spool's answer filters by it); id null: not yet in Onsen */
 export type LocalLine = { chat: string; at: string; idem_key: string; client_msg_id?: string; by?: string; id: number | null; lifted_at: string | null
   lifted_by?: string | null; rejected?: boolean }
@@ -970,13 +972,16 @@ export class OnsenClient {
 
   /** Joey's /clear (message `clientMsgId` in `chat`, by `tg:<id>`): draw the line now. Directly with a short timeout; Onsen silent or refusing: into
    *  the spool (synced in order; the idem_key keeps it single). Recording off: null (nothing is drawn). Never throws. */
-  async drawLine(o: { chat: string; clientMsgId: string | number; by: string; at?: string; timeoutMs?: number }): Promise<{ id: number | null; spooled: boolean; idem_key: string } | null> {
+  async drawLine(o: { chat: string; clientMsgId: string | number; by: string; at?: string; timeoutMs?: number; conversationId?: string }): Promise<{ id: number | null; spooled: boolean; idem_key: string } | null> {
     if (!this.cfg.record) return null
     const idem_key = idemLine(this.cfg.agent, o.chat, o.clientMsgId)
-    const body: RestartLineDraw = { agent: this.cfg.agent, client: 'telegram', chat: o.chat, idem_key, at: o.at ?? new Date().toISOString(), by: o.by, client_msg_id: String(o.clientMsgId) }
+    // WO-197 segment 2: a connector names the conversation (Onsen 0.35.8); off the connector the old client / chat form, as before
+    const body: RestartLineDraw = o.conversationId
+      ? { conversation_id: o.conversationId, idem_key, at: o.at ?? new Date().toISOString(), ...(o.by ? { by: o.by } : {}), client_msg_id: String(o.clientMsgId) }
+      : { agent: this.cfg.agent, client: 'telegram', chat: o.chat, idem_key, at: o.at ?? new Date().toISOString(), by: o.by, client_msg_id: String(o.clientMsgId) }
     // first locally: the spool's answer respects the line at once, whatever Onsen does
     const all = this.readLines().filter(x => x.idem_key !== idem_key)
-    all.push({ chat: o.chat, at: body.at, idem_key, client_msg_id: body.client_msg_id, by: o.by, id: null, lifted_at: null })
+    all.push({ chat: o.chat, at: body.at, idem_key, client_msg_id: String(o.clientMsgId), by: o.by, id: null, lifted_at: null })
     this.writeLines(all)
     let why = ''
     const cred = this.cfg.credential()
@@ -1001,7 +1006,7 @@ export class OnsenClient {
 
   /** Joey's button: lift line `lineId` (else the line his /clear `clientMsgId` drew, else the newest of the chat). Locally at once; Onsen directly, or
    *  through the spool behind a draw that is still there. nothing: there was no line to lift. Never throws. */
-  async liftLine(o: { chat: string; lineId?: number | null; clientMsgId?: string | number | null; by: string; timeoutMs?: number }): Promise<{ lifted: boolean; spooled: boolean; nothing: boolean }> {
+  async liftLine(o: { chat: string; lineId?: number | null; clientMsgId?: string | number | null; by: string; timeoutMs?: number; conversationId?: string }): Promise<{ lifted: boolean; spooled: boolean; nothing: boolean }> {
     const at = new Date().toISOString()
     const all = this.readLines()
     const idem = o.clientMsgId != null && o.clientMsgId !== '' ? idemLine(this.cfg.agent, o.chat, o.clientMsgId) : undefined
@@ -1010,7 +1015,8 @@ export class OnsenClient {
     if (local?.rejected) return { lifted: false, spooled: false, nothing: true }            // Onsen refused that draw: there is no line
     if (local) { local.lifted_at = at; local.lifted_by = o.by; this.writeLines(all) }
     const lineId = o.lineId ?? local?.id ?? null
-    const body: RestartLineLift = { agent: this.cfg.agent, client: 'telegram', chat: o.chat, at, by: o.by, ...(lineId != null ? { line_id: lineId } : {}) }
+    const body: RestartLineLift = { ...(o.conversationId ? { conversation_id: o.conversationId } : { agent: this.cfg.agent, client: 'telegram' as const, chat: o.chat }), at, by: o.by,
+      ...(lineId != null ? { line_id: lineId } : {}) }
     // its draw is still in the spool: the lift goes behind it, in order (resolved to the draw's id when the spool reaches it)
     if (lineId == null && local && this.cfg.record) {
       this.append({ k: 'u', r: { ...body, draw_idem: local.idem_key } })
@@ -1351,6 +1357,8 @@ export type ActionOption = { id: string; label: string }
 export type ActionSource = 'permission' | 'menu'
 export type NewAction = { source: ActionSource; menu_kind?: string | null; session_id?: string | null; assignees: string[]; summary: string
   body?: string | null; options: ActionOption[]
+  /** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」): when it stops being an answer (the creator cancels it then, with what happens) */
+  expires_at?: string
   /** the duty officer's own press: made resolved (the option it pressed, resolved_by duty-officer), applied at once; `at` (WO-176 r3, Onsen 0.24.3):
    *  when the keys were sent (resolved_at and applied_at), `opened_at`: when the menu appeared (created_at) */
   resolved?: { option_id: string; by: string; at?: string; opened_at?: string } }
@@ -1462,6 +1470,7 @@ export class OnsenActions {
       if (a.menu_kind !== undefined) body.menu_kind = a.menu_kind
       if (a.session_id) body.session_id = String(a.session_id).slice(0, 120)
       if (a.body) body.body = { format: 'markdown', text: a.body.length > 4000 ? a.body.slice(0, 3999) + '…' : a.body }
+      if (a.expires_at) body.expires_at = a.expires_at
       if (a.resolved) Object.assign(body, { state: 'resolved', selected_option_id: a.resolved.option_id, resolved_by: a.resolved.by })
       if (a.resolved?.at) body.resolved_at = a.resolved.at
       if (a.resolved?.opened_at) body.opened_at = a.resolved.opened_at
@@ -1516,13 +1525,15 @@ export class OnsenActions {
     if (!h) return
     this.queue(h, async () => {
       if (!h.id || h.state === 'cancelled' || h.state === 'expired' || h.appliedAt) return
-      let r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: actionLine(reason, 300) })
+      // WO-197 (Onsen 0.35.8, CONTRACT §7d): `note` is what the Action shows (the bridge draws it; without it only 「→ 已取消」); `reason` its event's
+      const why = actionLine(reason, 300)
+      let r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: why, note: why })
       if (r?.status === 409) {
         const g = await this.call('GET', `/v1/actions/${h.id}`)
         const d = g?.status === 200 ? g.json?.data : null
         if (d && (d.state === 'open' || (d.state === 'resolved' && !d.applied_at)) && Number(d.version) !== h.version) {
           this.take(h, d)
-          r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: actionLine(reason, 300) })
+          r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: why, note: why })
         } else if (d) this.take(h, d)
       }
       if (r?.status === 200) { this.take(h, r.json?.data); this.stats.cancelled++; this.o.log('info', `onsen action ${h.id}: cancelled (${actionLine(reason, 120)})`) }

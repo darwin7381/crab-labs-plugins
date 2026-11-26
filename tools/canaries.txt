@@ -312,3 +312,5 @@ plugins/telegram-http/server.ts::try { r = turn ? await Onsen.withAnswering(turn
 plugins/telegram-http/onsen-status.ts::{ outcome, ...(turnId ? { turn_id: turnId } : {}) })
 plugins/telegram-http/onsen-client.ts::export function forwardName(v: unknown): string {
 plugins/telegram-http/onsen-client.ts::m.forward_from ? `轉傳自 ${forwardName(m.forward_from)}` : ''
+plugins/telegram-http/onsen-client.ts::let r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: why, note: why })
+plugins/telegram-http/onsen-client.ts::if (a.expires_at) body.expires_at = a.expires_at

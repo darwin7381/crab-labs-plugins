@@ -10,7 +10,7 @@ import { checkObservation } from './test-fixtures/status-v1-check.ts'
 type Call = { method: string; path: string; body: any; headers?: Record<string, string>; at: number }
 const CREATE = new Set(['kind', 'source', 'requested_by', 'session_id', 'assignees', 'summary', 'body', 'options', 'expires_at', 'refs', 'menu_kind', 'state',
   'selected_option_id', 'resolved_by', 'note', 'opened_at', 'resolved_at'])
-const RESOLVE = new Set(['option_id', 'expected_version', 'note', 'resolved_by', 'session_id', 'at']), APPLIED = new Set(['at', 'option_id', 'resolved_by']), CANCEL = new Set(['expected_version', 'reason'])
+const RESOLVE = new Set(['option_id', 'expected_version', 'note', 'resolved_by', 'session_id', 'at']), APPLIED = new Set(['at', 'option_id', 'resolved_by']), CANCEL = new Set(['expected_version', 'reason', 'note'])
 const tick = async (n = 30) => { for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 1)) }
 
 /** a stand-in Onsen: one Action store, the fields each route takes (anything else: 400, as body_json) */
@@ -152,9 +152,9 @@ describe('OnsenActions', () => {
     a.cancel(h, 'the session closed')
     await h.tail
     expect(s.calls.slice(1).map(c => `${c.method} ${c.path} ${c.body ? JSON.stringify(c.body) : ''}`)).toEqual([
-      'POST /v1/actions/1/cancel {"expected_version":1,"reason":"the session closed"}',
+      'POST /v1/actions/1/cancel {"expected_version":1,"reason":"the session closed","note":"the session closed"}',
       'GET /v1/actions/1 ',
-      'POST /v1/actions/1/cancel {"expected_version":2,"reason":"the session closed"}'])
+      'POST /v1/actions/1/cancel {"expected_version":2,"reason":"the session closed","note":"the session closed"}'])
     expect(h.state).toBe('cancelled')
     const n = s.calls.length
     a.cancel(h, 'again')
@@ -169,7 +169,7 @@ describe('OnsenActions', () => {
     expect(ad.version).toBe(2)
     a.cancel(ad, 'gone')
     await ad.tail
-    expect(s.calls.at(-1)!.body).toEqual({ expected_version: 2, reason: 'gone' })
+    expect(s.calls.at(-1)!.body).toEqual({ expected_version: 2, reason: 'gone', note: 'gone' })   // Onsen 0.35.8: the note is what the Action shows
     const fresh = a.adopt('77', 3)
     expect([fresh.id, fresh.version, fresh.state]).toEqual(['77', 3, 'open'])
   })

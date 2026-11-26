@@ -25,7 +25,7 @@ type ACall = { caller: string; method: string; path: string; body: any; idem: st
 // the fields Onsen 0.24.3 takes on each write (onsen_actions.py; body_json refuses any other with 400 「不收的欄位」)
 const FIELDS: Record<string, string[]> = { create: ['kind', 'source', 'requested_by', 'session_id', 'assignees', 'summary', 'body', 'options', 'expires_at', 'refs',
   'menu_kind', 'state', 'selected_option_id', 'resolved_by', 'note', 'action_id', 'opened_at', 'resolved_at'], resolve: ['option_id', 'expected_version', 'note', 'resolved_by', 'session_id', 'at'],
-  applied: ['at', 'option_id', 'resolved_by'], cancel: ['expected_version', 'reason'] }
+  applied: ['at', 'option_id', 'resolved_by'], cancel: ['expected_version', 'reason', 'note'] }   // Onsen 0.35.8: note
 const calls: ACall[] = []
 const actions = new Map<string, any>()
 const mode = { actions: 'ok' as 'ok' | 'down' | 'slow' }
@@ -328,7 +328,7 @@ test('the session closed with the prompt open: the Action is cancelled; a contro
   await s.transport.terminateSession()
   await s.client.close()
   expect(await until(() => of(id, 'cancel').length === 1)).toBe(true)
-  expect(of(id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '對話關了' })
+  expect(of(id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '對話關了', note: '對話關了' })
   expect(actions.get(id).state).toBe('cancelled')
   // r4 (Chiron 06:00Z): its Telegram copies close too: the reason, the buttons gone
   expect(await until(() => api.of('editMessageText').filter(e => e.body.text === '🔐 Permission: Bash\n\n— 不用按了：對話關了（沒有按）').length === 2)).toBe(true)
@@ -353,7 +353,7 @@ test('r4: the conversation went away (its stream closed, the GC not yet): a tap 
   const e0 = api.of('editMessageText').length
   tap(JOEY, 'perm:allow:mnpqr', 7200, '🔐 Permission: Bash')
   expect(await until(() => of(id, 'cancel').length === 1)).toBe(true)
-  expect(of(id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '對話已經不在了' })
+  expect(of(id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '對話已經不在了', note: '對話已經不在了' })
   expect(of(id, 'resolve')).toHaveLength(0)
   expect(of(id, 'applied')).toHaveLength(0)
   expect(await until(() => api.of('editMessageText').slice(e0).filter(e => String(e.body.text).endsWith('— 不用按了：對話已經不在了（沒有按）')).length === 2)).toBe(true)

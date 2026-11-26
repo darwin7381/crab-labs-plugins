@@ -80,7 +80,7 @@ beforeAll(async () => {
   const env = { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude',
     TMUX_TMPDIR: sock, STARTUP_PICKER_POLL_MS: '400' }
   ;[conn, poll] = await Promise.all([
-    startTgDaemon(apiC, join(root, 'c'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'), CHANNEL_BOT_TMUX_SESSION: panes.c.name },
+    startTgDaemon(apiC, join(root, 'c'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'), CHANNEL_BOT_TMUX_SESSION: panes.c.name },
       h => h?.ok === true),
     startTgDaemon(apiP, join(root, 'p'), JOEY, { ...env, ONSEN_CREDENTIAL_FILE: join(root, 'cred-p'), CHANNEL_BOT_TMUX_SESSION: panes.p.name }),
   ])
@@ -133,7 +133,7 @@ test('2a connector: that prompt answered on the screen (Enter, as the duty offic
   tm('send-keys', '-t', panes.c.name, 'Enter')
   expect(await until(() => chosen(panes.c).some(x => x.id === 'p1'), 5000)).toBe(true)
   expect(await until(() => calls('c', a.id, 'cancel').length === 1, 8000)).toBe(true)
-  expect(calls('c', a.id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: expect.stringContaining('畫面上已經沒有這個詢問') })
+  expect(calls('c', a.id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: expect.stringContaining('畫面上已經沒有這個詢問'), note: expect.stringContaining('畫面上已經沒有這個詢問') })
   expect(onsen.actions.get(a.id).state).toBe('cancelled')
   await sleep(2000)
   expect(calls('c', a.id, 'cancel')).toHaveLength(1)                              // once
