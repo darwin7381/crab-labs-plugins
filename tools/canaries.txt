@@ -147,3 +147,6 @@ plugins/telegram-http/onsen-status.ts::export type TurnEnded =
 plugins/telegram-http/onsen-avatar.ts::export class AvatarSync
 plugins/telegram-http/screen-status.ts::limit_message_is_latest_output: limitLatest,
 plugins/telegram-http/onsen-status.ts::if (this.last?.id === this.turn.prompt) this.last = this.before
+plugins/telegram-http/onsen-status.ts::...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}), ...turnFields(turn) })
+plugins/telegram-http/server.ts::turn_id: String(extra.turn_id).slice(0, 120)
+plugins/telegram-http/lanes.ts::if (p === '/lanes/turn' && req.method === 'GET')

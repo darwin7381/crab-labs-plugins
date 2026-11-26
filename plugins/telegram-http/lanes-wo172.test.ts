@@ -1,6 +1,6 @@
-// WO-172 item 1 in the lanes: a lane's run is its turn (runOfLane: its Telegram lines carry it as meta.turn_id). A call to a colleague (reply_agent) does
-// NOT carry turn_id: Onsen's /send is strict (an unknown payload or refs key is a 400; lab 11-26 01:29:44Z: two reply_agent calls refused) and does not
-// take it yet. The tg daemon's /lanes/ routes run behind a real HTTP server here. A fake lane binary that waits, a mesh stub; no model.
+// WO-172 item 1 in the lanes: what a lane sends to a colleague (reply_agent) carries its run as turn_id; the router's own notices carry none; the main's
+// turn is asked of the tg daemon by the inbox daemon (its send_to_agent) through /lanes/turn. The tg daemon's /lanes/ routes run behind a real HTTP
+// server here and an inbox-role instance asks them as the inbox daemon does. A fake lane binary that waits, a mesh stub; no model.
 import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, writeFileSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
@@ -39,7 +39,7 @@ afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; L.__setClaudeBin(rest
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
 
-test("runOfLane names a running lane's run (its turn), nothing once it is over; its reply_agent call carries no turn_id (Onsen /send does not take one yet)", async () => {
+test("a lane's reply_agent carries the lane's run (its turn); runOfLane names it; nothing once the run is over", async () => {
   const ev = { id: 'mesh-172-1', source: 'mesh', from: 'eve', verified: true, text: '週報的數字對嗎？', btcc_msg_id: '74001', meta: {},
     notif: { method: 'notifications/claude/channel', params: { content: '週報的數字對嗎？', meta: {} } } } as any
   const d = await L.routeEvent(ev)
@@ -50,11 +50,24 @@ test("runOfLane names a running lane's run (its turn), nothing once it is over; 
   const k = meshOut.length
   await L.callLaneTool(tok, 'reply_agent', { line: 'call', to: 'eve', text: '對，已核過。', reply_to: '74001' })
   const sent = meshOut.slice(k).find(b => b.to === 'eve' && b.urgency !== 'silent')
-  expect(sent).toMatchObject({ lane: d.lane })
-  expect(sent.turn_id).toBeUndefined()
+  expect(sent).toMatchObject({ lane: d.lane, turn_id: tok.runId })
   writeFileSync(GO, 'ok')
   expect(await until(() => !L.__runTok(d.lane!))).toBe(true)
   expect(L.runOfLane(d.lane!)).toBeNull()
   // the router's own notices (silent) carry no turn
   for (const b of meshOut.filter(b => b.urgency === 'silent')) expect(b.turn_id).toBeUndefined()
+})
+
+test("the main's turn: here (tg role) and as the inbox daemon asks it (/lanes/turn) for the main's send_to_agent; none out of a turn", async () => {
+  L.__setMainConnected('mcp-main')
+  const pid = process.pid
+  await L.__mainEvent({ event: 'Stop', pid })
+  expect(await L.mainTurnId()).toBeNull()
+  expect(await I.mainTurnId()).toBeNull()
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: 'p-172' })
+  expect(await L.mainTurnId()).toBe('p-172')
+  expect(await I.mainTurnId()).toBe('p-172')
+  await L.__mainEvent({ event: 'Stop', pid, prompt_id: 'p-172', phase: 'final' })
+  expect(await until(() => L.__main().mainPhase() === 'idle')).toBe(true)
+  expect(await I.mainTurnId()).toBeNull()
 })

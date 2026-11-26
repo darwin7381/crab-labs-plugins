@@ -56,7 +56,9 @@ export type LocalLine = { chat: string; at: string; idem_key: string; client_msg
  *  that item alone (400 in its result: logged, rejected.jsonl); the rest of the batch goes in. */
 export type DeliveryState = 'delivered' | 'in_session' | 'seen' | 'turn_end'
 export type DeliveryFact = { idem_key: string; agent: string; client: 'telegram'; chat: string; client_msg_id: string; state: DeliveryState; at: string; by?: string
-  detail?: Record<string, unknown> }
+  detail?: Record<string, unknown>
+  /** WO-172 (Onsen 0.16.0, WO-171): seen and turn_end: the turn (the observation's sessions[].turn.id); turn_end: how it ended and what was bound into it */
+  turn_id?: string; outcome?: 'done' | 'interrupted' | 'failed'; bound?: string[] }
 /** step 3: the main's status (POST /status/batch). 1.45.1: the state is Claude Code's own session registry's (onsen-status.ts statusOf); last_activity_at =
  *  the newest write to the main's transcript or its subagents' (null = none found) */
 export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck' | 'walled' | 'starting'   // walled, starting: WO-165 A (Jev reads the screen; Onsen 0.12.5)

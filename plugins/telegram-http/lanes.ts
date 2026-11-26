@@ -192,7 +192,7 @@ export interface LanesDeps {
   joeyChatId?: () => string
   /** inbox role: mesh send with lane extras; resolves the minted btcc id */
   meshSend?: (to: string, text: string, replyTo: number | undefined, noReply: boolean,
-              extra: { thread?: string; hop?: number; lane?: string; owner?: string; urgency?: 'silent' },
+              extra: { thread?: string; hop?: number; lane?: string; owner?: string; urgency?: 'silent'; turn_id?: string },
               /** lanes-golive (C2): the line and its fields (fleet-mail.ts send_to_agent); absent = a call (the router's own replies) */
               send?: LaneSendFields) => Promise<{ text: string; msgId?: number; delivered: boolean; isError?: boolean }>
   /** inbox role, lanes-golive (C2): one of the agent's mailbox tools for the mail lane `lane` (fleet-mail.ts callInboxTool); `to` = the original sender of a
@@ -6038,7 +6038,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       { const pd = await peerDisclosureCheck(lane.id, to, text, 'reply_agent', { thread: lane.thread, event: tok.evId, once: `${tok.runId}:reply_agent:${to}`, answersRequest: true, lane: true }); if (pd.refuse) { events.result(tok.evId, v.ob?.id, false, { why: 'refused by the disclosure check' }); throw new Error(pd.refuse) } }
       if (th && call) { th.hops = hop; th.last = nowIso(); if (gate.count) th.ask_cls = tok.cls; if (!th.peer) th.peer = to }
       saveState()
-      const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: noReply, ...(call ? { thread: lane.thread, hop } : {}), lane: lane.id, owner: ownerOf(tok.evId), ...f })
+      const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: noReply, ...(call ? { thread: lane.thread, hop } : {}), lane: lane.id, owner: ownerOf(tok.evId), turn_id: tok.runId, ...f })   // WO-172: the run is its turn
       if (call && r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
       else if (f.line === 'mail' && r?.msgId != null) sentMailThread(String(r.msgId), lane.id, false, f.title ?? null)   // WO-164 (9): the lane's new mail opens its conversation
       const ok = r?.delivered === true
@@ -7856,6 +7856,17 @@ export async function checkPeerSend(from: string, to: string, text: string, answ
   const r = await peerCall(TG_PORT, '/lanes/peer-check', 'POST', { from, to, text, answers_request: answersRequest === true })
   return r && typeof r.refuse === 'string' && r.refuse ? r.refuse : null
 }
+/** WO-172: the main's turn now (its prompt id while M2 holds a turn open), in this daemon (tg role) */
+function mainTurnIdHere(): string | null {
+  try { const g = main?.currentGen(); return g && String(g.state) === 'in_turn' && g.prompt_id ? String(g.prompt_id) : null } catch { return null }
+}
+/** WO-172: the main's turn now, for what the main sends: here (tg role), or asked of the tg daemon (inbox role: the main's send_to_agent); null: no
+ *  turn open, or nobody to ask */
+export async function mainTurnId(): Promise<string | null> {
+  if (D?.role === 'tg') return mainTurnIdHere()
+  const r = await peerCall(TG_PORT, '/lanes/turn', 'GET')
+  return r && typeof r.main === 'string' && r.main ? r.main : null
+}
 /** WO-172: a lane's run now (its turn id: what the lane sends in it carries it); null: the lane runs nothing */
 export function runOfLane(id: string): string | null {
   try { return running.get(id)?.runId ?? null } catch { return null }
@@ -8009,6 +8020,7 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
     }
     if (p === '/lanes/not-main' && req.method === 'POST') { const b = await readBody(req); sendJson(res, 200, { not_main: pidNotMain(Number(b.pid)) }); return true }   // 002w (G): asked by the inbox daemon
     // the state journal, folded: the interface the lab reads
+    if (p === '/lanes/turn' && req.method === 'GET') { sendJson(res, 200, { main: mainTurnIdHere() }); return true }   // WO-172: asked by the inbox daemon for the main's sends
     if (p === '/lanes/state' && req.method === 'GET') { sendJson(res, 200, journal.snapshot({ current_gen: main.currentGen()?.id ?? null, wall: S.wall ?? null })); return true }
     if (p === '/lanes/outbound' && req.method === 'POST') {
       const b = await readBody(req)
@@ -8058,7 +8070,8 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const replyTo = b.reply_to != null && /^\d+$/.test(String(b.reply_to)) ? Number(b.reply_to) : undefined
       const line = lineOf(b.line)
       const r = await D.meshSend!(String(b.to ?? ''), String(b.text ?? ''), replyTo, b.no_reply === true,
-        { thread: b.thread, hop: Number(b.hop) || undefined, lane: b.lane, ...(b.owner ? { owner: String(b.owner).slice(0, 48) } : {}), ...(b.urgency === 'silent' ? { urgency: 'silent' as const } : {}) },
+        { thread: b.thread, hop: Number(b.hop) || undefined, lane: b.lane, ...(b.owner ? { owner: String(b.owner).slice(0, 48) } : {}), ...(b.urgency === 'silent' ? { urgency: 'silent' as const } : {}),
+          ...(typeof b.turn_id === 'string' && b.turn_id ? { turn_id: b.turn_id.slice(0, 120) } : {}) },          // WO-172: the turn the lane sends it in
         line ? { line, ...Object.fromEntries(['title', 'ask', 'because', 'deadline', 'ref'].filter(k => typeof b[k] === 'string' && b[k]).map(k => [k, String(b[k])])),
           ...(Array.isArray(b.touches) ? { touches: b.touches.map(String).slice(0, 5) } : {}) } : undefined)
       sendJson(res, 200, r); return true

@@ -1,7 +1,8 @@
 // WO-172 (Chiron; Onsen contract v1 §2, §4; mapping A-4, B-3): three facts, no decision changed.
 //   1 a message an agent sends carries the turn it was sent in (meta.turn_id: the main's prompt id, a lane's run id); the daemon's own notices none
 //   2 turn_end carries outcome (done / interrupted / failed) and bound (Joey's client_msg_id, a colleague's msg id), computed once per turn: the same
-//     value on every fact of the turn and on the observation's last_turn
+//     value on every fact of the turn and on the observation's last_turn; seen and turn_end carry turn_id (Chiron WO-171 01:52Z). Fields of the fact
+//     itself, as Onsen 0.16.0 reads them (delivery_events.turn_id / outcome / bound), not its detail
 //   3 the bot's own profile photo as the agent's Onsen avatar: uploaded when its hash changes, nothing without a photo, one log line on a failure
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
@@ -40,7 +41,7 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     const item = (id: string, kind: 'joey' | 'peer', mid: string) => ({ rec: 'msg', id, kind, notif: { params: { meta: kind === 'joey' ? { chat_id: '1828', message_id: mid, user: 'joey' } : { user: 'eve', btcc_msg_id: mid } } } })
     const line = (row: any, state: string, f: Record<string, unknown> = {}) => tap.journal({ ...row, state, ...f, ts: '2026-11-26T02:00:00.000Z' } as any, { state, ...f })
     const turnEnds = () => sent.filter(f => f.state === 'turn_end')
-    return { tap, facts, main, item, line, ended, turnEnds, event: (b: any) => tap.mainEvent({ pid: 7, ...b }) }
+    return { tap, facts, main, item, line, ended, turnEnds, facts0: () => sent, event: (b: any) => tap.mainEvent({ pid: 7, ...b }) }
   }
   test('a normal turn: done; bound = Joey\'s message and the colleague\'s item it took in; the same outcome on the fact, the callback and last_turn', () => {
     const r = rig()
@@ -51,7 +52,9 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     r.main('idle', null, '2026-11-26T02:00:09.000Z')
     expect(r.turnEnds()).toHaveLength(0)                                    // the main's turn_end settles first (a Stop that was not the end)
     r.facts.flushLater()
-    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '691', by: 'main', detail: { outcome: 'done', bound: ['691', '71001'] } })])
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '691', by: 'main', turn_id: 'p1', outcome: 'done', bound: ['691', '71001'] })])
+    expect(r.turnEnds()[0].detail).toBeUndefined()                         // Onsen reads them as the fact's own fields (0.16.0), not its detail
+    expect(r.facts0().filter(f => f.state === 'seen')).toEqual([expect.objectContaining({ client_msg_id: '691', by: 'main', turn_id: 'p1' })])   // seen carries its turn too
     expect(r.ended).toEqual([{ session: 'main', turn_id: 'p1', outcome: 'done', bound: ['691', '71001'], ended_at: '2026-11-26T02:00:09.000Z', facts: 1 }])
     expect(r.tap.lastTurn()).toEqual({ id: 'p1', outcome: 'done', ended_at: '2026-11-26T02:00:09.000Z' })
   })
@@ -61,7 +64,7 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     r.line(j, 'bound', { prompt_id: 'p2' }); r.main('in_turn', 'p2', '2026-11-26T02:01:00.000Z')
     r.line(j, 'queued', { reason: 'interrupted', prompt_id: null, cut_at: 'x' })
     r.main('idle', null, '2026-11-26T02:01:05.000Z', { ended_by: 'interrupted' })
-    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '692', detail: { outcome: 'interrupted', bound: ['692'] } })])
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '692', turn_id: 'p2', outcome: 'interrupted', bound: ['692'] })])
     expect(r.ended.at(-1)).toMatchObject({ turn_id: 'p2', outcome: 'interrupted', facts: 1 })
     expect(r.tap.lastTurn()).toMatchObject({ id: 'p2', outcome: 'interrupted' })
     r.main('in_turn', 'p3', '2026-11-26T02:02:00.000Z')
@@ -75,7 +78,7 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     r.event({ event: 'StopFailure', error: 'rate_limit' })
     r.line(j, 'queued', { reason: 'stop_failure:rate_limit', prompt_id: null })
     r.main('walled', null, '2026-11-26T02:03:02.000Z')
-    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '693', detail: { outcome: 'failed', bound: ['693'] } })])
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '693', turn_id: 'p4', outcome: 'failed', bound: ['693'] })])
     expect(r.tap.lastTurn()).toMatchObject({ id: 'p4', outcome: 'failed' })
     expect(r.ended.at(-1)).toMatchObject({ outcome: 'failed', bound: ['693'] })
   })
@@ -91,7 +94,7 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     r.event({ event: 'StopFailure', error: 'server_error' })
     r.line(j, 'queued', { reason: 'stop_failure:server_error', prompt_id: null }); r.main('idle', null, '2026-11-26T02:05:40.000Z')
     r.facts.flushLater()
-    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '696', detail: { outcome: 'failed', bound: ['696'] } })])   // one fact, the real end's
+    expect(r.turnEnds()).toEqual([expect.objectContaining({ client_msg_id: '696', turn_id: 'p6', outcome: 'failed', bound: ['696'] })])   // one fact, the real end's
     expect(r.ended.at(-1)).toEqual({ session: 'main', turn_id: 'p6', outcome: 'failed', bound: ['696'], ended_at: '2026-11-26T02:05:40.000Z', facts: 1 })
     expect(r.tap.lastTurn()).toEqual({ id: 'p6', outcome: 'failed', ended_at: '2026-11-26T02:05:40.000Z' })
   })
@@ -106,7 +109,8 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     const jm = { id: 'tg-1828-694', source: 'telegram', from: 'joey', meta: { chat_id: '1828', message_id: '694', user: 'joey' } }
     r.tap.journal({ rec: 'run', id: 'tg#b', run: 'adam.worker.1.r3', lane: 'adam.worker.1', ev: jm, steered: [call], ts: 't' } as any, { state: 'running' })
     r.tap.journal({ rec: 'run', id: 'tg#b', run: 'adam.worker.1.r3', lane: 'adam.worker.1', ev: jm, steered: [call], reason: 'died', ts: 't2' } as any, { state: 'exited' })
-    expect(r.turnEnds().at(-1)).toMatchObject({ client_msg_id: '694', by: 'adam.worker.1', detail: { reason: 'died', outcome: 'failed', bound: ['694', '71005'] } })
+    expect(r.turnEnds().at(-1)).toMatchObject({ client_msg_id: '694', by: 'adam.worker.1', detail: { reason: 'died' }, turn_id: 'adam.worker.1.r3', outcome: 'failed', bound: ['694', '71005'] })
+    expect(r.facts0().filter(f => f.state === 'seen').at(-1)).toMatchObject({ client_msg_id: '694', by: 'adam.worker.1', turn_id: 'adam.worker.1.r3' })
     expect(r.ended.at(-1)).toMatchObject({ turn_id: 'adam.worker.1.r3', outcome: 'failed', facts: 1 })
     expect([runOutcome('normal'), runOutcome('closed'), runOutcome('wall:rate_limit'), runOutcome('timeout'), runOutcome('cap_turns')]).toEqual(['done', 'interrupted', 'failed', 'failed', 'failed'])
   })
@@ -118,7 +122,9 @@ describe('2 turn_end: outcome and bound, once per turn', () => {
     const mesh = `<channel source="plugin:agent-inbox:agent-inbox" user="eve" btcc_msg_id="71006" ts="x">\n在嗎\n</channel>`
     w.handle({ type: 'user', message: { role: 'user', content: `${tg}\n${mesh}` }, timestamp: '2026-11-26T02:05:00.000Z' })
     w.handle({ type: 'system', subtype: 'turn_duration', durationMs: 800, timestamp: '2026-11-26T02:05:04.000Z' })
-    expect(sent.filter(f => f.state === 'turn_end')).toEqual([expect.objectContaining({ client_msg_id: '695', detail: { outcome: 'done', bound: ['695', '71006'] } })])
+    const tid = `turn-${Date.parse('2026-11-26T02:05:00.000Z')}`               // the observation's turn.id with lanes off
+    expect(sent.filter(f => f.state === 'turn_end')).toEqual([expect.objectContaining({ client_msg_id: '695', turn_id: tid, outcome: 'done', bound: ['695', '71006'] })])
+    expect(sent.filter(f => f.state === 'seen')).toEqual([expect.objectContaining({ client_msg_id: '695', turn_id: tid })])
     expect(ended).toEqual([expect.objectContaining({ session: 'main', outcome: 'done', bound: ['695', '71006'], facts: 1 })])
   })
 })

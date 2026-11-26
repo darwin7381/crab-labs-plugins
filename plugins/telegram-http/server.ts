@@ -1765,8 +1765,9 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
       // 1.34.2: a call that carries reply_to answers that call
       { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null); if (refused) return refused }
       let minted: number | undefined, delivered = false
+      const turnId = await Lanes.mainTurnId()                                // WO-172: the main's turn, as the tg daemon has it
       const result = await sendToAgent(to, text, replyTo, noReply, op, 'call',
-        { thread, hop, lane: `${INBOX_SELF}.main`, minted: (id, ok) => { minted = id; delivered = ok } })
+        { thread, hop, lane: `${INBOX_SELF}.main`, turn_id: turnId, minted: (id, ok) => { minted = id; delivered = ok } })
       await Lanes.noteMainOutbound(minted, thread, hop, to, text, replyTo, delivered)   // PL2: met on the delivery
       return result + (thread ? ` [thread ${thread} hop ${hop}]` : '')
     },
@@ -1873,7 +1874,9 @@ const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 // in the comms log and the /inject body, and `minted` reports the BTCC id + delivery outcome.
 type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: string; minted?: (id: number | undefined, delivered: boolean) => void
   /** WO-157 (decision 1): a notice of the daemon's own (the router's interim, a thread-stop notice, the flood reply): the receiver records it only */
-  urgency?: 'silent' }
+  urgency?: 'silent'
+  /** WO-172: the turn the call is sent in (the main's prompt id, a lane's run id); Onsen keeps it in the call's payload. A notice of the daemon's own: none */
+  turn_id?: string | null }
 function laneFields(extra?: LaneSendExtra): Record<string, unknown> {
   if (!extra) return {}
   return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}), ...(extra.owner ? { owner: extra.owner } : {}) }
@@ -1959,9 +1962,9 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     ...(opRef ? { op: opRef } : {}),
     ...(noReply ? { no_reply: true } : {}),
     ...laneFields(extra),
-    ...(extra?.urgency === 'silent' ? { urgency: 'silent' } : {}) }        // WO-157: the receiver's decideWake reads it (record only); not in the BTCC row
-  // WO-172: no turn_id here: Onsen's /send is strict (0.9.3, WO-151: an unknown key in payload or refs is a 400) and does not list it yet; it goes in
-  // once Onsen takes it (lab 11-26 01:29:44Z: a lane's two reply_agent calls with it were refused)
+    ...(extra?.urgency === 'silent' ? { urgency: 'silent' } : {}),         // WO-157: the receiver's decideWake reads it (record only); not in the BTCC row
+    ...(extra?.turn_id && extra.urgency !== 'silent' ? { turn_id: String(extra.turn_id).slice(0, 120) } : {}) }   // WO-172: the turn it was sent in (Onsen 0.17.1
+  // keeps payload.turn_id, a string of 1–120); not in the BTCC row. The main's sends with lanes off carry none: its inbox daemon has no tg daemon to ask
   if (pushUrl) {
     try {
       const r = await fetch(pushUrl, {

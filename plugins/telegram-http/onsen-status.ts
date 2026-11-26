@@ -24,13 +24,19 @@ const iso = (ms: number): string => new Date(ms).toISOString()
 const k2 = (chat: string, id: string): string => `${chat}\u0000${id}`
 
 // ------------------------------------------------------------------ delivery facts
+/** WO-172 / WO-171 (Onsen 0.16.0 delivery_events turn_id, outcome, bound: top-level fields of a fact, not its detail; Chiron WO-171 01:52Z): the turn
+ *  a seen or turn_end fact belongs to (the observation's sessions[].turn.id: the main's prompt id, lanes off `turn-<ms>`, a lane's run id), and on
+ *  turn_end how that turn ended and what was bound into it */
+export type TurnFields = { turn_id?: string | null; outcome?: TurnOutcome; bound?: string[] }
+const turnFields = (t?: TurnFields): Partial<DeliveryFact> => !t ? {} : { ...(t.turn_id ? { turn_id: t.turn_id } : {}), ...(t.outcome ? { outcome: t.outcome } : {}),
+  ...(t.bound ? { bound: [...t.bound] } : {}) }
 export class DeliveryFacts {
   /** idem keys spooled by this daemon (bounded): each fact is written once per daemon life; across lives Onsen answers duplicate */
   private sent = new Map<string, true>()
   /** an album: the first message's id (the one the delivery carries) → every message id of it */
   private groups = new Map<string, string[]>()
   /** the main's turn closed these at a Stop; written once that turn stayed closed for settleMs (another Stop hook can still hold it) */
-  private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; timer: ReturnType<typeof setTimeout> }>()
+  private later = new Map<string, { chat: string; id: string; by: string; at: string; detail?: Record<string, unknown>; turn?: TurnFields; timer: ReturnType<typeof setTimeout> }>()
   /** Joey's messages taken in and not yet into a turn (lanes off: the queued count). session: handed to the session (in_session), sessionAt when;
    *  turn: into a turn (seen, or WO-162's turnBegan for the count alone) */
   private open = new Map<string, { at: number; session: boolean; turn: boolean; sessionAt?: number }>()
@@ -51,7 +57,7 @@ export class DeliveryFacts {
     if (this.groups.size > 500) this.groups.delete(this.groups.keys().next().value!)
   }
   private idsOf(chat: string, id: string): string[] { return this.groups.get(k2(chat, id)) ?? [id] }
-  private emit(chat: string, id: string, state: DeliveryState, by: string | undefined, at: string | undefined, detail?: Record<string, unknown>): void {
+  private emit(chat: string, id: string, state: DeliveryState, by: string | undefined, at: string | undefined, detail?: Record<string, unknown>, turn?: TurnFields): void {
     for (const mid of this.idsOf(chat, id)) {
       const idem = idemDelivery(this.o.agent, chat, mid, state)
       if (this.sent.has(idem)) continue
@@ -59,7 +65,7 @@ export class DeliveryFacts {
       if (this.sent.size > (this.o.max ?? 20_000)) for (const k of [...this.sent.keys()].slice(0, 5_000)) this.sent.delete(k)
       try {
         this.o.sink({ idem_key: idem, agent: this.o.agent, client: 'telegram', chat, client_msg_id: mid, state, at: at ?? iso(this.now()),
-          ...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}) })
+          ...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}), ...turnFields(turn) })
       } catch {}
     }
   }
@@ -81,9 +87,9 @@ export class DeliveryFacts {
   /** WO-165: it entered a turn (lanes on: M1 bound it to a prompt, a lane run started with it; lanes off: the main's transcript shows it taken in, as
    *  the prompt of a turn or absorbed mid-turn). Until WO-165 this was the in_session moment. quiet: the fact only, no onSeen (the transcript's tail
    *  read again at start: a message taken in before this daemon began) */
-  seen(chat: string, id: string | number, by: string, at?: string, quiet = false): void {
+  seen(chat: string, id: string | number, by: string, at?: string, quiet = false, turnId?: string | null): void {
     const s = String(id)
-    this.emit(chat, s, 'seen', by, at)
+    this.emit(chat, s, 'seen', by, at, undefined, turnId ? { turn_id: turnId } : undefined)
     for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.session = true; e.turn = true } }
     if (this.o.onSeen && !quiet) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
     this.changed()
@@ -95,20 +101,20 @@ export class DeliveryFacts {
   turnBegan(at: number, slackMs = 100): void {
     for (const e of this.open.values()) if (e.session && !e.turn && e.sessionAt != null && e.sessionAt <= at + slackMs) e.turn = true
   }
-  turnEnd(chat: string, id: string | number, by: string, at?: string, detail?: Record<string, unknown>): void {
+  turnEnd(chat: string, id: string | number, by: string, at?: string, detail?: Record<string, unknown>, turn?: TurnFields): void {
     const s = String(id)
     this.cancelTurnEnd(chat, s, by)
-    this.emit(chat, s, 'turn_end', by, at, detail)
+    this.emit(chat, s, 'turn_end', by, at, detail, turn)
     for (const m of this.idsOf(chat, s)) this.open.delete(k2(chat, m))
     this.changed()
   }
-  turnEndLater(chat: string, id: string | number, by: string, at: string, detail?: Record<string, unknown>): void {
+  turnEndLater(chat: string, id: string | number, by: string, at: string, detail?: Record<string, unknown>, turn?: TurnFields): void {
     const s = String(id), key = `${k2(chat, s)}\u0000${by}`
     const was = this.later.get(key)
     if (was) clearTimeout(was.timer)
-    const timer = setTimeout(() => { const l = this.later.get(key); if (l) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail) }, this.o.settleMs ?? 60_000)
+    const timer = setTimeout(() => { const l = this.later.get(key); if (l) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail, l.turn) }, this.o.settleMs ?? 60_000)
     ;(timer as any).unref?.()
-    this.later.set(key, { chat, id: s, by, at, ...(detail ? { detail } : {}), timer })
+    this.later.set(key, { chat, id: s, by, at, ...(detail ? { detail } : {}), ...(turn ? { turn } : {}), timer })
   }
   /** the turn went on after that Stop: no turn_end yet */
   cancelTurnEnd(chat: string, id: string | number, by: string): void {
@@ -117,7 +123,7 @@ export class DeliveryFacts {
   }
   /** a new turn began (or the daemon stops): what waited to settle is final */
   flushLater(by?: string): void {
-    for (const l of [...this.later.values()]) if (!by || l.by === by) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail)
+    for (const l of [...this.later.values()]) if (!by || l.by === by) this.turnEnd(l.chat, l.id, l.by, l.at, l.detail, l.turn)
   }
   pendingLater(): number { return this.later.size }
   /** Joey's messages taken in by the daemon and not yet into a turn (mode seen: the main's transcript is read) / not yet handed to the session (mode
@@ -386,7 +392,7 @@ export class LanesTap {
         // (turn_continued): that Stop was not the turn's end. WO-165: a pulled item reaches the session as it is bound (in_session the same moment;
         // an offered one has it already, this daemon writes each fact once)
         if (line.reason === 'turn_continued') F.cancelTurnEnd(j.chat, j.id, 'main')
-        else { F.inSession(j.chat, j.id, 'main', row.ts); F.seen(j.chat, j.id, 'main', row.ts) }
+        else { F.inSession(j.chat, j.id, 'main', row.ts); F.seen(j.chat, j.id, 'main', row.ts, false, line.prompt_id ? String(line.prompt_id) : this.turn?.prompt ?? null) }
       }
       // WO-172: how the turn ended, from its items: done at its Stop; queued again because it was cut (interrupted) or ended in StopFailure (failed; any
       // other requeue of a bound item: the gen ended under it, failed). The first such line of a prompt sets the turn's outcome; each Joey message in it
@@ -398,9 +404,10 @@ export class LanesTap {
         const outcome: TurnOutcome = line.state === 'done' ? 'done' : line.reason === 'interrupted' ? 'interrupted' : 'failed'
         if (!b.ending) b.ending = outcome
         if (j) {
-          const detail = { ...(row.reason && line.state === 'done' ? { reason: String(row.reason) } : {}), outcome: b.ending, bound: [...b.ids] }
-          if (line.state === 'done') F.turnEndLater(j.chat, j.id, 'main', row.ts, detail)
-          else F.turnEnd(j.chat, j.id, 'main', row.ts, detail)
+          const detail = row.reason && line.state === 'done' ? { reason: String(row.reason) } : undefined
+          const turn: TurnFields = { turn_id: endP, outcome: b.ending, bound: [...b.ids] }
+          if (line.state === 'done') F.turnEndLater(j.chat, j.id, 'main', row.ts, detail, turn)
+          else F.turnEnd(j.chat, j.id, 'main', row.ts, detail, turn)
           b.facts++
         }
       }
@@ -428,7 +435,7 @@ export class LanesTap {
       const lane = String(row.lane ?? 'lane')
       if (line.state === 'running') {
         this.runs.add(row.id)
-        for (const e of evs) { F.inSession(e.chat, e.id, lane, row.ts); F.seen(e.chat, e.id, lane, row.ts) }   // spawned with it in its prompt, or steered into it
+        for (const e of evs) { F.inSession(e.chat, e.id, lane, row.ts); F.seen(e.chat, e.id, lane, row.ts, false, String(row.run ?? row.id)) }   // spawned with it in its prompt, or steered into it
       } else if (line.state === 'exited' && this.runs.has(row.id)) {
         this.runs.delete(row.id)
         // WO-172: the run is the lane's turn: its outcome from the exit reason, bound = its items (Joey's client_msg_id, a colleague's msg id)
@@ -439,7 +446,7 @@ export class LanesTap {
           const mid = j ? j.id : e.btcc_msg_id != null && String(e.btcc_msg_id) !== '' ? String(e.btcc_msg_id) : null
           if (mid && !bound.includes(mid)) bound.push(mid)
         }
-        for (const e of evs) F.turnEnd(e.chat, e.id, lane, row.ts, { ...(row.reason ? { reason: String(row.reason) } : {}), outcome, bound: [...bound] })
+        for (const e of evs) F.turnEnd(e.chat, e.id, lane, row.ts, row.reason ? { reason: String(row.reason) } : undefined, { turn_id: String(row.run ?? row.id), outcome, bound })
         this.ended({ session: lane, turn_id: String(row.run ?? row.id), outcome, bound, ended_at: String(row.ts), facts: evs.length })
       }
     } else if (row.rec === 'main') {
@@ -672,7 +679,7 @@ export class TurnWatch {
       if (!j) continue
       this.taken.set(k2(j.chat, j.id), j)
       if (!this.firstTaken && this.inTurn) this.firstTaken = j
-      if (!(t < this.emitFloor)) this.o.facts.seen(j.chat, j.id, 'main', at, t < this.bornMs)
+      if (!(t < this.emitFloor)) this.o.facts.seen(j.chat, j.id, 'main', at, t < this.bornMs, this.inTurn && this.turnAt ? turnIdOf(this.turnAt) : null)
     }
   }
   private end(ts: string): boolean {
@@ -681,7 +688,8 @@ export class TurnWatch {
     // WO-172: a turn the transcript shows ending (turn_duration) ended done; bound = the Joey messages and the colleagues' items it took in
     const bound = [...[...this.taken.values()].map(j => j.id), ...this.peerIds.filter(id => ![...this.taken.values()].some(j => j.id === id))]
     let facts = 0
-    if (!(t < this.emitFloor)) for (const j of this.taken.values()) { this.o.facts.turnEnd(j.chat, j.id, 'main', ts, { outcome: 'done', bound: [...bound] }); facts++ }
+    const turn_id = this.turnAt ? turnIdOf(this.turnAt) : null
+    if (!(t < this.emitFloor)) for (const j of this.taken.values()) { this.o.facts.turnEnd(j.chat, j.id, 'main', ts, undefined, { turn_id, outcome: 'done', bound }); facts++ }
     if (this.turnAt) {
       this.lastEnded = { id: turnIdOf(this.turnAt), outcome: 'done', ended_at: ts }
       try { this.o.turnEnded?.({ session: 'main', turn_id: this.lastEnded.id, outcome: 'done', bound, ended_at: ts, facts }) } catch {}
