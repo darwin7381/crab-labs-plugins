@@ -30,12 +30,18 @@
 //   restart   a run the state file says is running: its process still alive → followed to its end; gone → completed when its events show the turn
 //             completed and the last message is there, else failed with a note. Reports a restart interrupted are sent again (each is idempotent).
 //   scope     never starts anything on its own, never reads a mailbox, never posts on the wall; the credential goes only to Onsen and is never logged.
+//   answers   every item it runs gets its answer back to the caller (Chiron WO-184 08:49Z: a reply_to follow-up's answer reached no one): the incoming
+//             no_reply means the caller owes Codex no answer, never that Codex's answer is kept back. With Onsen 0.29.2 Codex takes work
+//             (members.takes_work, declared at start): a reply to its answer is a Call like any other (accepted, running, completed, its files).
+//   codex     its own Codex home (Chiron's note 2): CODEX_HOME=~/onsen-codex/.codex-home and HOME=<it>/home for the child, a config.toml with no MCP
+//             servers, no plugins, no skills, no hooks, no memories, no personal instructions; the login is the personal home's auth.json through a
+//             symlink (one login, one refresh token; Codex writes through the link and locks auth.lock, linked too). `--setup` makes it.
 //
 // Run: bun codex-runner.ts (launchd com.btai.codex-runner, see README.md). One-shot: --whoami, --profile (sets Codex's display name and role in Onsen).
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, appendFileSync, lstatSync } from 'node:fs'
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, appendFileSync, lstatSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
-import { basename, extname, join, relative } from 'node:path'
+import { basename, dirname, extname, join, relative } from 'node:path'
 import { OnsenInbox, OnsenPuller, itemKey, type HandResult, type PullItem } from '../onsen-inbox.ts'
 import { ObservationPut } from '../onsen-observation.ts'
 import type { Observation } from '../screen-status.ts'
@@ -52,7 +58,11 @@ export type Cfg = {
   agent: string; base: string; credentialFile: string; host: string; root: string; stateDir: string; logFile: string
   codexBin: string; sandbox: string; max: number; timeoutMs: number; killGraceMs: number; waitS: number
   maxFiles: number; maxFileBytes: number; lookupDelayMs: number; retryMs: number; adoptPollMs: number
-  log?: (level: 'info' | 'warn' | 'error', msg: string) => void; now?: () => number; heartbeatMs?: number
+  /** Codex's own home (CODEX_HOME for the child) and the HOME it runs with; null: the inherited ones (CODEX_RUNNER_CODEX_HOME=inherit) */
+  codexHome: string | null; childHome: string | null
+  /** --setup: the personal Codex home whose login (auth.json) is linked */
+  authFrom: string
+  log?: (level: 'info' | 'warn' | 'error', msg: string) => void; now?: () => number; heartbeatMs?: number; declareRetryMs?: number
 }
 const num = (v: string | undefined, d: number): number => { const n = Number(v); return v != null && v.trim() !== '' && Number.isFinite(n) && n > 0 ? n : d }
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
@@ -69,7 +79,80 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
     max: Math.floor(num(env.CODEX_RUNNER_MAX, 3)), timeoutMs: num(env.CODEX_RUNNER_TIMEOUT_S, 1800) * 1000,
     killGraceMs: num(env.CODEX_RUNNER_KILL_GRACE_S, 10) * 1000, waitS: num(env.CODEX_RUNNER_WAIT_S, 25),
     maxFiles: 20, maxFileBytes: 25 * 1024 * 1024, lookupDelayMs: 35_000, retryMs: 15_000, adoptPollMs: 2_000,
+    ...codexHomes(env, root), authFrom: env.CODEX_RUNNER_AUTH_FROM || join(home, '.codex'),
   }
+}
+function codexHomes(env: NodeJS.ProcessEnv, root: string): { codexHome: string | null; childHome: string | null } {
+  const v = (env.CODEX_RUNNER_CODEX_HOME ?? '').trim()
+  if (v === 'inherit') return { codexHome: null, childHome: null }
+  const codexHome = (v || join(root, '.codex-home')).replace(/\/+$/, '')
+  return { codexHome, childHome: (env.CODEX_RUNNER_CHILD_HOME || '').trim() || join(codexHome, 'home') }
+}
+
+// ------------------------------------------------------------------ Codex's own home (--setup)
+/** the config.toml of Codex's own home: nothing of the Mac's personal setup but the model it uses */
+export function cleanConfig(personal: string): string {
+  const keep = personal.split('\n').filter(l => /^\s*(model|model_reasoning_effort)\s*=\s*"[^"\n]*"\s*$/.test(l))
+  return ['# codex-runner: the Onsen member codex runs with this Codex home, not the Mac\'s personal one (WO-184 part 2, Chiron 08:49Z note 2).',
+    '# No MCP servers, no plugins, no apps, no skills, no hooks, no memories, no browser or computer use, no personal instructions (no AGENTS.md).',
+    ...(keep.length ? ['# the model, as the personal config has it', ...keep.map(l => l.trim())] : []),
+    '', '[features]', 'image_generation = true', 'plugins = false', 'apps = false', 'hooks = false', 'memories = false', 'browser_use = false',
+    'computer_use = false', 'in_app_browser = false', '', '[skills.bundled]', 'enabled = false', ''].join('\n')
+}
+/** make (or check) Codex's own home: the folders, config.toml, auth.json and auth.lock linked to the personal home's (the login is never read or
+ *  printed here), and the rollouts of the sessions the runner already has, so they resume. Returns the lines to print. */
+export function setupCodexHome(cfg: Cfg, o: { force?: boolean } = {}): string[] {
+  if (!cfg.codexHome || !cfg.childHome) return ['CODEX_RUNNER_CODEX_HOME=inherit: Codex runs with the inherited home; nothing to set up']
+  const out: string[] = []
+  for (const d of [cfg.codexHome, cfg.childHome]) mkdirSync(d, { recursive: true, mode: 0o700 })
+  const conf = join(cfg.codexHome, 'config.toml')
+  if (!existsSync(conf) || o.force) {
+    let personal = ''
+    try { personal = readFileSync(join(cfg.authFrom, 'config.toml'), 'utf8') } catch {}
+    writeFileSync(conf, cleanConfig(personal), { mode: 0o600 })
+    out.push(`wrote ${conf}`)
+  } else out.push(`kept ${conf} (--force writes it again)`)
+  for (const f of ['auth.json', 'auth.lock']) {
+    const link = join(cfg.codexHome, f), target = join(cfg.authFrom, f)
+    let st: ReturnType<typeof lstatSync> | null = null
+    try { st = lstatSync(link) } catch {}
+    if (st?.isSymbolicLink() && readlinkSync(link) === target) { out.push(`kept ${link} -> ${target}`); continue }
+    if (st && !o.force) { out.push(`left ${link}: it is there and not a link to ${target} (--force replaces it)`); continue }
+    if (f === 'auth.json' && !existsSync(target)) { out.push(`no ${target}: log Codex in first (codex login), then --setup again`); continue }
+    if (f === 'auth.lock' && !existsSync(target)) writeFileSync(target, '', { mode: 0o600 })
+    if (st) rmSync(link, { force: true })
+    symlinkSync(target, link)
+    out.push(`linked ${link} -> ${target}`)
+  }
+  // the sessions the runner has: their rollouts copied, so a thread started before the switch still resumes
+  let ids: string[] = []
+  try { ids = Object.values(JSON.parse(readFileSync(join(cfg.stateDir, 'state.json'), 'utf8')).sessions ?? {}).map((x: any) => x?.session_id).filter(Boolean) } catch {}
+  let copied = 0
+  const from = join(cfg.authFrom, 'sessions')
+  const walk = (d: string): void => {
+    let names: string[] = []
+    try { names = readdirSync(d) } catch { return }
+    for (const n of names) {
+      const p = join(d, n)
+      let s2
+      try { s2 = lstatSync(p) } catch { continue }
+      if (s2.isDirectory()) walk(p)
+      else if (s2.isFile() && ids.some(id => n.endsWith(`-${id}.jsonl`))) {
+        const dest = join(cfg.codexHome!, 'sessions', relative(from, p))
+        if (!existsSync(dest)) { mkdirSync(dirname(dest), { recursive: true, mode: 0o700 }); copyFileSync(p, dest); copied++ }
+      }
+    }
+  }
+  if (ids.length) walk(from)
+  out.push(`sessions: ${ids.length} the runner knows, ${copied} rollout file(s) copied into ${join(cfg.codexHome, 'sessions')}`)
+  return out
+}
+/** Codex's own home is there: its config and a login it can read */
+export function codexHomeReady(cfg: Cfg): string | null {
+  if (!cfg.codexHome) return null
+  if (!existsSync(join(cfg.codexHome, 'config.toml'))) return `Codex 的專用設定還沒建好（${cfg.codexHome}/config.toml 不在）：在 Mac mini 跑 codex-runner.ts --setup`
+  if (!existsSync(join(cfg.codexHome, 'auth.json'))) return `Codex 的專用設定沒有登入（${cfg.codexHome}/auth.json 不在或連不到）：在 Mac mini 跑 codex-runner.ts --setup`
+  return null
 }
 
 // ------------------------------------------------------------------ Onsen, with the codex credential
@@ -291,11 +374,26 @@ export class CodexRunner {
     this.state.idle_since ??= this.iso()
     this.log('info', `codex-runner up: ${this.cfg.agent} on ${this.cfg.host}, Onsen ${this.cfg.base}, at most ${this.cfg.max} at once, timeout ${this.cfg.timeoutMs / 1000} s, folders under ${this.cfg.root}`)
     if (!this.onsen.token()) this.log('warn', `no mesh credential in ${this.cfg.credentialFile}: nothing is taken until it is there (read again on every request)`)
+    const notReady = codexHomeReady(this.cfg)
+    if (notReady) this.log('error', `${notReady}: every item fails with this note until it is there`)
+    else this.log('info', this.cfg.codexHome ? `Codex runs with its own home ${this.cfg.codexHome} (HOME ${this.cfg.childHome})` : 'Codex runs with the inherited home (CODEX_RUNNER_CODEX_HOME=inherit)')
     this.recover()
     this.puller.start()
     this.formsLoop = this.pullForms()
     this.changed()
     this.pump()
+    this.later(1_000, () => void this.declareWork(0))
+  }
+  /** Onsen 0.29.2: codex takes work (members.takes_work), so a reply to its answer is a Call of its own. Declared once at start (its first status
+   *  report makes the member: a 404 is asked again); an Onsen that does not know the field (400) is told once: follow-ups are then taken without a
+   *  Call, as before */
+  async declareWork(tries: number): Promise<void> {
+    let r: Answer = null
+    try { r = await this.onsen.req('PUT', `/v1/members/${encodeURIComponent(this.cfg.agent)}/profile`, { takes_work: true }) } catch {}
+    if (r?.status === 200) { this.log('info', `${this.cfg.agent} takes work in Onsen (a reply to its answer is a Call)`); return }
+    if (r?.status === 400) { this.log('warn', `Onsen does not take takes_work (before 0.29.2): a reply to Codex's answer is a follow-up without a Call`); return }
+    if (tries >= 20) { this.log('warn', `takes_work not declared after ${tries} tries (${r ? `HTTP ${r.status}` : 'no answer'})`); return }
+    this.later(this.cfg.declareRetryMs ?? 20_000, () => void this.declareWork(tries + 1))
   }
   /** stop taking work; a clean stop reports offline. Runs going on are left to finish (their own process group): the next start follows them. */
   async stop(o: { offline?: boolean } = {}): Promise<void> {
@@ -471,6 +569,8 @@ export class CodexRunner {
       j.before = snapshot(conv.dir)
       j.started_at = this.iso()
       if (this.stopped) return                                      // stopping: still 'starting' on disk, queued again at the next start
+      const notReady = codexHomeReady(this.cfg)                     // Codex's own home missing: this item fails with the note, never runs elsewhere
+      if (notReady) throw new Error(notReady)
       if (j.source === 'call') await this.callState(j, 'running')
       else void this.facts(j, ['in_session', 'seen'])
       if (this.stopped) return
@@ -537,12 +637,19 @@ export class CodexRunner {
     const text = [j.text.trim() || '（只有附件）', ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
     return ['exec', '--skip-git-repo-check', '-s', this.cfg.sandbox, '-C', j.dir!, ...(j.resumed ? ['resume', j.resumed] : []), ...out, ...imgs, '--', text]
   }
+  /** the child's environment: the runner's, without its own settings (CODEX_RUNNER_*, ONSEN_*), with Codex's own home and HOME */
+  childEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {}
+    for (const [k, v] of Object.entries(process.env)) if (!/^(CODEX_RUNNER_|ONSEN_)/.test(k)) env[k] = v
+    if (this.cfg.codexHome && this.cfg.childHome) { env.CODEX_HOME = this.cfg.codexHome; env.HOME = this.cfg.childHome }
+    return env
+  }
   private spawnRun(j: Job): void {
     const meta = join(j.dir!, '.codex-runner')
     const out = openSync(join(meta, `run-${j.n}.jsonl`), 'a', 0o600), err = openSync(join(meta, `run-${j.n}.stderr`), 'a', 0o600)
     let child: ChildProcess
     try {
-      child = spawn(this.cfg.codexBin, this.argv(j), { cwd: j.dir!, detached: true, stdio: ['ignore', out, err], env: process.env })
+      child = spawn(this.cfg.codexBin, this.argv(j), { cwd: j.dir!, detached: true, stdio: ['ignore', out, err], env: this.childEnv() })
     } finally { closeSync(out); closeSync(err) }
     j.pid = child.pid ?? null
     j.state = 'running'
@@ -570,6 +677,8 @@ export class CodexRunner {
   private exited(j: Job, code: number | null, signal: string | null): void {
     if (j.state !== 'running' || this.stopped) return              // stopped: the next start follows it (restart)
     this.procs.delete(j.id)
+    // what codex started dies with it, however it ended (Chiron 08:49Z note 3: after a SIGKILL its `sleep 120` lived on)
+    if (j.pid) { const pid = j.pid; killGroup(pid, 'SIGTERM'); this.later(this.cfg.killGraceMs, () => killGroup(pid, 'SIGKILL')) }
     j.exit = code; j.signal = signal; j.ended_at = this.iso()
     const meta = join(j.dir!, '.codex-runner')
     const ev = readEvents(join(meta, `run-${j.n}.jsonl`))
@@ -652,7 +761,8 @@ export class CodexRunner {
           j.steps.state = true; this.save()
         }
         if (!j.steps.reply) {
-          if (j.kind === 'peer_call' && this.replyNumber(j) != null && !j.no_reply) {
+          // always: the incoming no_reply says the caller owes Codex no answer, not that Codex's answer to this work is kept back (Chiron 08:49Z)
+          if (j.kind === 'peer_call' && this.replyNumber(j) != null) {
             const r = await this.reply(j, ids, fileLines)
             if (r === 'retry') return void (retry = true)
           }
@@ -846,10 +956,18 @@ async function main(): Promise<void> {
   const cfg = configFromEnv()
   const args = process.argv.slice(2)
   const onsen = new Onsen(cfg.base, cfg.credentialFile)
+  if (args.includes('--setup')) {
+    for (const l of setupCodexHome(cfg, { force: args.includes('--force') })) console.log(l)
+    const bad = codexHomeReady(cfg)
+    console.log(bad ? `not ready: ${bad}` : `ready: CODEX_HOME=${cfg.codexHome} HOME=${cfg.childHome}`)
+    process.exit(bad ? 1 : 0)
+  }
   if (args.includes('--whoami') || args.includes('--profile')) {
     if (!onsen.token()) { console.error(`no mesh credential in ${cfg.credentialFile}`); process.exit(2) }
     if (args.includes('--profile')) {
-      const r = await onsen.req('PUT', `/v1/members/${cfg.agent}/profile`, { display_name: process.env.CODEX_RUNNER_DISPLAY_NAME || DISPLAY_NAME, role: process.env.CODEX_RUNNER_ROLE || ROLE })
+      const prof = { display_name: process.env.CODEX_RUNNER_DISPLAY_NAME || DISPLAY_NAME, role: process.env.CODEX_RUNNER_ROLE || ROLE }
+      let r = await onsen.req('PUT', `/v1/members/${cfg.agent}/profile`, { ...prof, takes_work: true })
+      if (r?.status === 400) { console.error('this Onsen does not take takes_work (before 0.29.2): the profile without it'); r = await onsen.req('PUT', `/v1/members/${cfg.agent}/profile`, prof) }
       console.log(`PUT profile: HTTP ${r?.status} ${r?.json?.data?.line ?? JSON.stringify(r?.json?.error ?? '')}`)
       if (r?.status === 404) console.error(`${cfg.agent} is not an Onsen member yet: start the runner first (its first status report makes the member), then run --profile again`)
       if (r?.status !== 200) process.exit(1)

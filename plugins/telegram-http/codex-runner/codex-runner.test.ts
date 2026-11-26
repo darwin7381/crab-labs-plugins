@@ -8,13 +8,16 @@
 // [6] status: idle, running 「codex exec」, idle again, offline at a clean stop (each one a valid observation);
 // Joey on the page (forms inbox say): the answer recorded in his conversation with its files, the delivery facts; restart: a run that went on is
 // followed, one that is gone is settled; what is not work is acked and left alone; the credential never goes off Onsen's origin.
+// Chiron 08:49Z: every item's answer reaches the caller (no_reply kept back nothing); a reply_to follow-up that Onsen 0.29.2 makes a Call runs
+// as one; codex runs with its own home (CODEX_HOME, HOME, none of the runner's settings), what it started dies with it; takes_work declared;
+// --setup makes the clean home (config with no MCP / plugins / skills, the login linked, the sessions carried over).
 // No tmux anywhere. Run: bun test codex-runner/codex-runner.test.ts
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { CodexRunner, configFromEnv, madeBy, readEvents, safeName, snapshot, type Cfg } from './codex-runner.ts'
+import { CodexRunner, cleanConfig, codexHomeReady, configFromEnv, madeBy, readEvents, safeName, setupCodexHome, snapshot, type Cfg } from './codex-runner.ts'
 import { checkObservation } from '../test-fixtures/status-v1-check.ts'
 
 const FAKE = join(import.meta.dir, 'fake-codex.ts')
@@ -38,6 +41,7 @@ class FakeOnsen {
   facts: any[] = []
   observations: any[] = []
   profiles: any[] = []
+  profileStatus: number[] = []                                                // answers to give the profile PUTs, in order (then 200)
   unauthorized = 0
   messagesKnowAttachments = true
   fileSeq = 900
@@ -112,6 +116,7 @@ class FakeOnsen {
       return this.j(200, { id: 5000 + this.records.length, duplicate: dup, ...(b.attachment_file_ids?.length && this.messagesKnowAttachments && !dup ? { attachments: b.attachment_file_ids.length } : {}) })
     }
     if (m === 'POST' && p === '/deliveries/batch') { const b = await req.json() as any; this.facts.push(...b.items); return this.j(200, { results: b.items.map((_: any, i: number) => ({ id: i })) }) }
+    if (m === 'PUT' && p === '/v1/members/codex/profile') { this.profiles.push(await req.json()); const st = this.profileStatus.shift() ?? 200; return this.j(st, st === 200 ? { data: { name: 'codex' } } : { error: { code: 'not_found' } }) }
     if (m === 'PUT' && p === '/v1/members/codex/observation') { this.observations.push(await req.json()); return this.j(200, { data: { name: 'codex' } }) }
     return this.j(404, { error: { code: 'not_found', message: `${m} ${p}` } })
   }
@@ -139,7 +144,12 @@ function setup(over: Partial<Cfg> = {}, o?: FakeOnsen): { onsen: FakeOnsen; cfg:
   const log: string[] = []
   const cfg: Cfg = { ...configFromEnv({ HOME: dir }), base: onsen.base, credentialFile: join(dir, 'cred'), host: 'macmini', root: join(dir, 'onsen-codex'),
     stateDir: join(dir, 'onsen-codex', '.runner'), logFile: join(dir, 'runner.log'), codexBin: FAKE, waitS: 1, retryMs: 150, adoptPollMs: 100,
-    lookupDelayMs: 200, heartbeatMs: 300, log: (l, m) => { log.push(`${l} ${m}`) }, ...over }
+    lookupDelayMs: 200, heartbeatMs: 300, declareRetryMs: 100, log: (l, m) => { log.push(`${l} ${m}`) }, ...over }
+  if (cfg.codexHome && !('codexHome' in over)) {                              // Codex's own home, as --setup leaves it (a stand-in login)
+    mkdirSync(cfg.childHome!, { recursive: true })
+    writeFileSync(join(cfg.codexHome, 'config.toml'), cleanConfig(''))
+    writeFileSync(join(cfg.codexHome, 'auth.json'), '{"stand-in": true}', { mode: 0o600 })
+  }
   const codexLog = (): any[] => { try { return readFileSync(join(dir, 'codex.log'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
   return { onsen, cfg, dir, log, codexLog }
 }
@@ -313,6 +323,130 @@ describe('a Call', () => {
     let open = 0, most = 0
     for (const e of ev) { open += e.d; most = Math.max(most, open) }
     expect(most).toBeLessThanOrEqual(3)
+  })
+})
+
+describe('answers, follow-ups and the process group (Chiron 08:49Z)', () => {
+  test('no_reply on the item keeps nothing back: the answer goes to the caller', async () => {
+    const { onsen, cfg } = setup()
+    onsen.call('121', 'chiron', 1601)
+    onsen.push({ sender: 'chiron', payload: { text: 'do it', msg_id: 1601, no_reply: true }, no_reply: true, dedupe: 'msg:1601', call_id: '121' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '121')() && onsen.sends.length === 1, 10_000, 'the Call and its reply')
+    expect(onsen.sends[0]).toMatchObject({ to: 'chiron', payload: { reply_to_id: 1601 } })
+  })
+
+  test('criterion 3: a reply_to of the answer that Onsen made a Call (0.29.2): its moments, the same session, the file back to the caller', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    onsen.call('131', 'chiron', 1701)
+    onsen.push({ sender: 'chiron', payload: { text: '生一張圖 IMG:capy.png', msg_id: 1701 }, dedupe: 'msg:1701', call_id: '131' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '131')() && onsen.sends.length === 1, 10_000, 'item 2')
+    const T = onsen.sends[0].payload.thread
+    // Chiron's reply_to (his daemon: no_reply, the thread filled in): Onsen 0.29.2 makes it Call 132
+    onsen.call('132', 'chiron', 1702)
+    onsen.push({ sender: 'chiron', payload: { text: '把剛才那張的水改成晚上 IMG:capy-night.png', msg_id: 1702, reply_to_id: 12535, thread: T, hop: 2, no_reply: true },
+      refs: { btcc_msg_id: 1702, thread: T }, no_reply: true, dedupe: 'msg:1702', call_id: '132' })
+    await until(() => done(onsen, '132')() && onsen.sends.length === 2, 10_000, 'the follow-up')
+    expect(onsen.statesOf('132')).toEqual(['accepted', 'running', 'completed'])
+    const fin = onsen.puts.find(p => p.call === '132' && p.state === 'completed')!
+    expect(fin.result.attachment_file_ids.map((id: string) => onsen.files.get(id)!.name)).toEqual(['capy-night.png'])
+    const starts = codexLog().filter(x => x.ev === 'start')
+    expect(starts[1].resume).toBe(readEvents(join(starts[0].dir, '.codex-runner', 'run-1.jsonl')).session)
+    expect(starts[1].dir).toBe(starts[0].dir)
+    const back = onsen.sends[1]
+    expect(back).toMatchObject({ to: 'chiron', payload: { reply_to_id: 1702, thread: T }, refs: { thread: T }, dedupe: 'codex-reply:132' })
+    expect(back.attachment_file_ids).toEqual(fin.result.attachment_file_ids)
+  })
+
+  test('what codex started dies with it when it ends on its own', async () => {
+    const { onsen, cfg, codexLog } = setup({ killGraceMs: 300 })
+    onsen.call('141', 'chiron', 1801)
+    onsen.push({ sender: 'chiron', payload: { text: 'KID then done', msg_id: 1801 }, dedupe: 'msg:1801', call_id: '141' })
+    const r = runner(cfg)
+    await r.start()
+    await until(done(onsen, '141'), 10_000, 'Call 141')
+    const kid = codexLog().find(x => x.ev === 'kid').kid
+    const gone = (): boolean => { try { process.kill(kid, 0); return false } catch { return true } }
+    await until(gone, 3_000, 'the sleep it left')
+    expect(onsen.statesOf('141')).toEqual(['accepted', 'running', 'completed'])
+  })
+})
+
+describe('Codex\'s own home (Chiron 08:49Z note 2)', () => {
+  test('codex runs with CODEX_HOME and HOME of its own, without the runner\'s settings', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    process.env.CODEX_RUNNER_TEST_ONLY = 'x'; process.env.ONSEN_TEST_ONLY = 'y'
+    try {
+      onsen.call('151', 'chiron', 1901)
+      onsen.push({ sender: 'chiron', payload: { text: 'env', msg_id: 1901 }, dedupe: 'msg:1901', call_id: '151' })
+      const r = runner(cfg)
+      await r.start()
+      await until(done(onsen, '151'), 10_000, 'Call 151')
+      const st = codexLog().find(x => x.ev === 'start')
+      expect(st.codex_home).toBe(cfg.codexHome)
+      expect(st.home).toBe(cfg.childHome)
+      expect(st.runner_env).toEqual([])
+    } finally { delete process.env.CODEX_RUNNER_TEST_ONLY; delete process.env.ONSEN_TEST_ONLY }
+  })
+
+  test('not set up: the item fails with the note, nothing runs', async () => {
+    const { onsen, cfg, codexLog, dir } = setup({ codexHome: '', childHome: '' } as any)
+    cfg.codexHome = join(dir, 'empty-home'); cfg.childHome = join(dir, 'empty-home', 'home')
+    expect(codexHomeReady(cfg)).toContain('--setup')
+    onsen.call('161', 'chiron', 2001)
+    onsen.push({ sender: 'chiron', payload: { text: 'x', msg_id: 2001 }, dedupe: 'msg:2001', call_id: '161' })
+    const r = runner(cfg)
+    await r.start()
+    await until(done(onsen, '161'), 10_000, 'Call 161')
+    expect(onsen.statesOf('161')).toEqual(['accepted', 'failed'])
+    expect(onsen.puts.at(-1)!.result.body.text).toContain('Codex 的專用設定還沒建好')
+    expect(codexLog()).toEqual([])
+  })
+
+  test('--setup: a config with none of the personal setup but its model, the login linked (never copied), the sessions carried over', () => {
+    const d = mkdtempSync(join(tmpdir(), 'codex-runner-setup-'))
+    tmps.push(d)
+    const personal = join(d, 'personal')
+    mkdirSync(join(personal, 'sessions', '2026', '11', '26'), { recursive: true })
+    writeFileSync(join(personal, 'config.toml'), ['personality = "pragmatic"', 'model = "gpt-6.1-sol"', 'model_reasoning_effort = "medium"', 'notify = ["x"]',
+      '[mcp_servers.node_repl]', 'command = "node"', '[plugins."context7@claude-plugins-official"]', 'enabled = true', ''].join('\n'))
+    writeFileSync(join(personal, 'auth.json'), '{"tokens": "SECRET-NOT-PRINTED"}', { mode: 0o600 })
+    writeFileSync(join(personal, 'sessions', '2026', '11', '26', 'rollout-2026-11-26T08-00-00-sess-aaa.jsonl'), '{"a":1}\n')
+    writeFileSync(join(personal, 'sessions', '2026', '11', '26', 'rollout-2026-11-26T08-00-00-sess-zzz.jsonl'), '{"z":1}\n')
+    const cfg: Cfg = { ...configFromEnv({ HOME: d, CODEX_RUNNER_AUTH_FROM: personal }) }
+    mkdirSync(cfg.stateDir, { recursive: true })
+    writeFileSync(join(cfg.stateDir, 'state.json'), JSON.stringify({ v: 1, sessions: { 't:codex#t-1': { session_id: 'sess-aaa' } } }))
+    const out = setupCodexHome(cfg)
+    expect(out.join('\n')).not.toContain('SECRET')
+    const conf = readFileSync(join(cfg.codexHome!, 'config.toml'), 'utf8')
+    expect(conf).toContain('model = "gpt-6.1-sol"')
+    expect(conf).toContain('model_reasoning_effort = "medium"')
+    for (const no of ['mcp_servers', 'context7', 'personality', 'notify', 'node']) expect(conf).not.toContain(no)
+    for (const yes of ['plugins = false', 'apps = false', 'hooks = false', 'memories = false', '[skills.bundled]', 'enabled = false', 'image_generation = true']) expect(conf).toContain(yes)
+    expect(lstatSync(join(cfg.codexHome!, 'auth.json')).isSymbolicLink()).toBe(true)
+    expect(readlinkSync(join(cfg.codexHome!, 'auth.json'))).toBe(join(personal, 'auth.json'))
+    expect(readlinkSync(join(cfg.codexHome!, 'auth.lock'))).toBe(join(personal, 'auth.lock'))
+    expect(existsSync(join(cfg.childHome!))).toBe(true)
+    expect(existsSync(join(cfg.codexHome!, 'sessions', '2026', '11', '26', 'rollout-2026-11-26T08-00-00-sess-aaa.jsonl'))).toBe(true)
+    expect(existsSync(join(cfg.codexHome!, 'sessions', '2026', '11', '26', 'rollout-2026-11-26T08-00-00-sess-zzz.jsonl'))).toBe(false)
+    expect(codexHomeReady(cfg)).toBeNull()
+    const again = setupCodexHome(cfg)                                          // a second run keeps everything
+    expect(again.filter(l => l.startsWith('kept'))).toHaveLength(3)
+    expect(configFromEnv({ HOME: d, CODEX_RUNNER_CODEX_HOME: 'inherit' })).toMatchObject({ codexHome: null, childHome: null })
+  })
+
+  test('takes_work is declared at start; a member not there yet is asked again', async () => {
+    const { onsen, cfg } = setup()
+    onsen.profileStatus.push(404)
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.profiles.length === 2, 5_000, 'two profile PUTs')
+    expect(onsen.profiles).toEqual([{ takes_work: true }, { takes_work: true }])
+    await Bun.sleep(300)
+    expect(onsen.profiles).toHaveLength(2)
   })
 })
 

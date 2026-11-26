@@ -6,7 +6,9 @@
 //   MANY:<n>     write n small files                                SLEEP:<s>    take s seconds
 //   FAIL         40 lines of stderr, turn.failed, exit 3            HANG         never end (SIGTERM ends it)
 //   HANGHARD     never end, SIGTERM ignored (only SIGKILL ends it)  NOLAST       no -o file
+//   KID          leave a `sleep 30` behind in its process group and end (its pid in the log)
 // FAKE_CODEX_LIVE: a folder holding one file per running fake (the test counts them).
+import { spawn } from 'node:child_process'
 import { appendFileSync, fstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -29,7 +31,8 @@ const live = process.env.FAKE_CODEX_LIVE
 let liveNow = 0
 if (live) { mkdirSync(live, { recursive: true }); writeFileSync(join(live, String(process.pid)), ''); liveNow = readdirSync(live).length }
 const session = resume ?? `sess-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
-log({ ev: 'start', pid: process.pid, cwd: process.cwd(), argv, dir, out, resume, images, text, stdin_null: stdinNull, live: liveNow, at: Date.now() })
+log({ ev: 'start', pid: process.pid, cwd: process.cwd(), argv, dir, out, resume, images, text, stdin_null: stdinNull, live: liveNow, at: Date.now(),
+  codex_home: process.env.CODEX_HOME ?? null, home: process.env.HOME ?? null, runner_env: Object.keys(process.env).filter(k => /^(CODEX_RUNNER_|ONSEN_)/.test(k)) })
 const done = (code: number): never => {
   if (live) rmSync(join(live, String(process.pid)), { force: true })
   log({ ev: 'end', pid: process.pid, code, at: Date.now() })
@@ -42,6 +45,7 @@ const PNG = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000
 async function main(): Promise<void> {
   if (/\bHANGHARD\b/.test(text)) { process.on('SIGTERM', () => {}); await new Promise(() => setInterval(() => {}, 1000)) }
   if (/\bHANG\b/.test(text)) { process.on('SIGTERM', () => done(143)); await new Promise(() => setInterval(() => {}, 1000)) }
+  if (/\bKID\b/.test(text)) { const k = spawn('sleep', ['30'], { stdio: 'ignore' }); k.unref(); log({ ev: 'kid', pid: process.pid, kid: k.pid }) }
   const sl = /SLEEP:(\d+(?:\.\d+)?)/.exec(text)
   if (sl) await new Promise(r => setTimeout(r, Number(sl[1]) * 1000))
   if (/\bFAIL\b/.test(text)) {
