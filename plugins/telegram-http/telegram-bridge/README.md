@@ -94,6 +94,8 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
 - **observation.** The pinned status of that DM (`onsen-visible.ts StatusPin`, `PendingTracker`, `statusLine`). Onsen's status is mapped to the daemon's words, so it reads as today.
   - The first time, the daemon's own `<state dir>/onsen/status-pin.json` and its `status-pin-off-*` markers are copied into the bridge's state. The message already pinned is the one edited, and a chat Joey turned off stays off.
   - Only the newest observation of a batch is drawn; one older than 15 min is dropped.
+  - **Onsen decides offline.** The pin draws `presence` / `presence_reason` as given. A kept observation past its `valid_until` (observations come only when they change) is not read as offline.
+  - Each pin check (at most once a minute, before an edit) logs what Telegram's `getChat` says is pinned. If it is not the status message, the chat is turned off and the message is no longer edited.
 
 ## Onsen calls (exact)
 
@@ -179,6 +181,7 @@ TELEGRAM_BRIDGE_MACHINE=macmini bun telegram-bridge.ts --once     # which agents
 | `TELEGRAM_BRIDGE_RETRY_S` | `10,30,120` | send retries |
 | `TELEGRAM_BRIDGE_SETTINGS_S` / `_ENDPOINTS_S` / `_REGISTER_S` / `_MEMBERS_S` / `_CONFLICT_RETRY_S` | 30 / 30 / 300 / 300 / 300 | |
 | `TELEGRAM_BRIDGE_POLL_TIMEOUT_S` / `_FEED_WAIT_S` | 50 / 50 | |
+| `TELEGRAM_BRIDGE_PIN_CHECK_S` / `TELEGRAM_BRIDGE_PIN_EDIT_MS` | 60 / 5000 | the pinned status's pin check and edit spacing (StatusPin's defaults; tests shorten them) |
 | `TELEGRAM_SEND_TIMEOUT_S` / `TELEGRAM_UPLOAD_TIMEOUT_S` | 45 / 300 | |
 
 ## Tests

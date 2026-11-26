@@ -35,6 +35,8 @@ export class Agent {
   readonly status = new Map<string, { status: any; at: number }>()
   constructor(readonly member: string, readonly stateDir: string, readonly source: string, token: { token: string; mtime: number }, readonly o: {
     bridgeDir: string; tgOptions: TgOptions; log: Log; now?: () => number
+    /** StatusPin's pin check and edit spacing (its defaults: 60 s, 5 s); tests shorten them */
+    pinCheckMs?: number; pinMinEditMs?: number
   }) {
     this.tg = new Tg(token.token, o.tgOptions)
     this.tokenMtime = token.mtime
@@ -61,12 +63,20 @@ export class Agent {
       } catch (e) { this.o.log('warn', `${this.member}: the daemon's pinned-status record was not copied (${(e as Error).message}); a new status message is pinned`) }
     }
     const kb = { inline_keyboard: [[{ text: '不要顯示這則', callback_data: 'opin:off' }]] }
-    this.pinObj = new StatusPin({ dir, log: this.o.log, now: this.o.now, api: {
+    this.pinObj = new StatusPin({ dir, log: this.o.log, now: this.o.now, pinCheckMs: this.o.pinCheckMs, minEditMs: this.o.pinMinEditMs, api: {
       send: async (chat, text) => Number((await this.tg.call('sendMessage', { chat_id: chat, text, disable_notification: true, reply_markup: kb })).message_id),
       pin: (chat, id) => this.tg.call('pinChatMessage', { chat_id: chat, message_id: id, disable_notification: true }),
       edit: (chat, id, text) => this.tg.call('editMessageText', { chat_id: chat, message_id: id, text, reply_markup: kb }),
       del: (chat, id) => this.tg.call('deleteMessage', { chat_id: chat, message_id: id }),
-      pinnedId: async chat => { const c: any = await this.tg.call('getChat', { chat_id: chat }); return c?.pinned_message?.message_id ?? null },
+      // the pin check (StatusPin, at most once a minute, only when it is about to edit): what Telegram says is pinned in this chat, one line each
+      // time, so a pin the person took away is seen in the log even when Telegram's answer does not show it (WO-197 lab round 2)
+      pinnedId: async chat => {
+        const c: any = await this.tg.call('getChat', { chat_id: chat })
+        const id = c?.pinned_message?.message_id ?? null
+        const ours = this.pinObj?.view()[chat]?.message_id ?? null
+        this.o.log('info', `${this.member}: pin check in chat ${chat}: Telegram says ${id == null ? 'nothing is pinned' : `message ${id} is pinned`} (the status message is ${ours ?? 'none'})`)
+        return id == null ? null : Number(id)
+      },
     } })
     this.since = new SinceTracker({ ...this.pinObj.sinceStore(), now: this.o.now })
     return this.pinObj
@@ -98,10 +108,12 @@ export function statusView(st: any, now: number): { view: { state: any; detail: 
   const main = sessions.find(s => s?.id === st.main_session_id) ?? sessions.find(s => s?.kind === 'main') ?? null
   const since = main?.activity_since ? Date.parse(main.activity_since) : NaN
   const sinceMs = Number.isFinite(since) ? since : null
-  const expired = st.valid_until ? Date.parse(st.valid_until) <= now : false
+  // Onsen decides offline (Chiron, WO-197 lab round 2): observations are queued only when they change, so the one kept is older than its
+  // valid_until (reported_at + 45 s) whenever the member is quiet; presence and presence_reason are drawn as Onsen gave them, never inferred
+  void now
   const last = st.last_activity_at ?? null
-  if (st.presence === 'offline' || st.presence === 'unknown' || expired) {
-    const r = OFFLINE_OF[String(st.presence_reason ?? '')] ?? (expired ? 'not_connected' : 'no_registration')
+  if (st.presence === 'offline' || st.presence === 'unknown') {
+    const r = OFFLINE_OF[String(st.presence_reason ?? '')] ?? 'no_registration'
     return { view: { state: 'offline', detail: { reason: r }, last_activity_at: last }, since: sinceMs }
   }
   const detail: Record<string, unknown> = {}

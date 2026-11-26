@@ -1,7 +1,7 @@
 // telegram-bridge-stage2.test.ts (board WO-196 part B, stage two: the command menu, threads and topics, the restart line, the person's
 // reactions, groups). Same fakes as stage one (fakes.ts); a home of its own.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
@@ -39,6 +39,7 @@ beforeAll(async () => {
     CRAB_LABS_PLUGINS_ENV: join(home, '.config', 'crab-labs-plugins', 'env'), TELEGRAM_BRIDGE_CREDENTIAL_FILE: join(root, 'cred'), TELEGRAM_BRIDGE_PLATFORM: 'linux',
     TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '1',
     CHANNEL_BOT_TRANSCRIBE_CMD: join(root, 'fake-whisper.sh'),
+    TELEGRAM_BRIDGE_PIN_CHECK_S: '0.3', TELEGRAM_BRIDGE_PIN_EDIT_MS: '100',
   }), { log: (l, m) => logs.push(`${l} ${m}`) })
   await b.start()
   let on = true
@@ -205,5 +206,48 @@ describe('stage two', () => {
     await until(() => onsen.messages.some(x => x.client_msg_id === '903'), 4000, '903 written')
     expect(onsen.messages.find(x => x.client_msg_id === '903').client_meta).toEqual({ forward_origin: 'user', forward_from_id: '777', forward_from_username: 'orig' })
     expect(onsen.messages.find(x => x.client_msg_id === '903').forward_from).toBe('orig')                 // displayName() as the daemon's tag (its @username first)
+  }, T)
+
+  test('the pinned status: an old observation (past its valid_until) with a receipt stays as it was, never ⚫; Onsen\'s offline is drawn', async () => {
+    const pinDir = join(root, 'state', 'pins', 'gamma')
+    const old = new Date(Date.now() - 120_000).toISOString(), stale = new Date(Date.now() - 75_000).toISOString()
+    const idle = { presence: 'online', presence_reason: null, lifecycle: 'ready', main_session_id: 'main', reported_at: old, valid_until: stale,
+      sessions: [{ id: 'main', kind: 'main', activity: 'idle', activity_since: old, blockers: [] }] }
+    onsen.push({ type: 'observation', member: 'gamma', conversation_id: 'cv', chat, status: idle })
+    await until(() => tg.bots.get(TOK)!.pinned.has(chat), 3000, 'pinned')
+    const pid = tg.bots.get(TOK)!.pinned.get(chat)!
+    const pinTexts = () => [tg.sentTo(TOK, chat).find(x => x.message_id === pid)!.text!, ...tg.callsOf(TOK, 'editMessageText').filter(p => p.message_id === pid).map(p => String(p.text))]
+    expect(pinTexts()[0]).toMatch(/^🟢 閒置/)
+    const mid = tg.text(TOK, JOEY, 'are you there')
+    await until(() => onsen.messages.some(x => x.client_msg_id === String(mid)), 3000, 'written')
+    onsen.push({ type: 'receipt', member: 'gamma', conversation_id: 'cv', chat, message_id: 'x', client_msg_id: String(mid), state: 'delivered' })
+    onsen.push({ type: 'receipt', member: 'gamma', conversation_id: 'cv', chat, message_id: 'x', client_msg_id: String(mid), state: 'in_session' })
+    await until(() => pinTexts().some(t => t.includes('看到了還沒回')), 3000, 'line 2 redrawn')
+    expect(pinTexts().every(t => !t.startsWith('⚫'))).toBe(true)                               // Onsen decides offline, not the kept observation's age
+    expect(pinTexts().at(-1)).toMatch(/^🟢 閒置/)
+    onsen.push({ type: 'observation', member: 'gamma', conversation_id: 'cv', chat, status: { ...idle, presence: 'offline', presence_reason: 'process_gone', sessions: [{ id: 'main', kind: 'main', activity: 'unknown', blockers: [] }] } })
+    await until(() => pinTexts().at(-1)!.startsWith('⚫ 失連') && pinTexts().at(-1)!.includes('行程不在了'), 3000, 'offline drawn')
+    expect(existsSync(join(pinDir, `status-pin-off-${chat}.json`))).toBe(false)
+  }, T)
+
+  test('the person unpins the status message: the next redraw after the pin check stops editing it, writes the off file, logs it', async () => {
+    const pinDir = join(root, 'state', 'pins', 'gamma')
+    const pid = tg.bots.get(TOK)!.pinned.get(chat)!
+    tg.bots.get(TOK)!.pinned.delete(chat)                                                       // unpinned in Telegram: getChat has no pinned_message
+    await Bun.sleep(400)                                                                         // past the pin check interval (0.3 s here, 60 s live)
+    const edits = () => tg.callsOf(TOK, 'editMessageText').filter(p => p.message_id === pid).length
+    const before = edits()
+    const busy = (n: string) => ({ presence: 'online', presence_reason: null, lifecycle: 'ready', main_session_id: 'main',
+      sessions: [{ id: 'main', kind: 'main', activity: 'running', activity_since: new Date().toISOString(), doing: { kind: 'tool', tool: n, since: new Date().toISOString() }, blockers: [] }] })
+    onsen.push({ type: 'observation', member: 'gamma', conversation_id: 'cv', chat, status: busy('Bash') })
+    await until(() => existsSync(join(pinDir, `status-pin-off-${chat}.json`)), 3000, 'off file')
+    expect(JSON.parse(readFileSync(join(pinDir, `status-pin-off-${chat}.json`), 'utf8'))).toMatchObject({ chat, why: 'unpinned', message_id: pid })
+    expect(edits()).toBe(before)                                                                 // not edited once the check saw it gone
+    expect(logs.filter(l => l.includes(`status message ${pid} in chat ${chat} was unpinned`)).length).toBe(1)
+    expect(logs.some(l => l.includes(`pin check in chat ${chat}: Telegram says nothing is pinned (the status message is ${pid})`))).toBe(true)
+    onsen.push({ type: 'observation', member: 'gamma', conversation_id: 'cv', chat, status: busy('Read') })
+    await Bun.sleep(500)
+    expect(edits()).toBe(before)
+    expect(tg.sentTo(TOK, chat).filter(x => x.params.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data === 'opin:off').length).toBe(1)   // no new one either
   }, T)
 })

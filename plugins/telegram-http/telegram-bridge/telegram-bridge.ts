@@ -40,7 +40,7 @@ export type Config = {
   machine: string; name: string; base: string; credentialFile: string; stateDir: string; home: string; platform: string
   env: NodeJS.ProcessEnv; settingsFile: string
   settingsMs: number; endpointsMs: number; registerMs: number; membersMs: number; conflictRetryMs: number; feedWaitS: number; pollTimeoutS: number
-  tg: TgOptions; useRich: boolean; version: string; onsenTimeoutMs: number; sorryMs: number; retryDelaysMs: number[]
+  tg: TgOptions; useRich: boolean; version: string; pinCheckMs?: number; pinMinEditMs?: number; onsenTimeoutMs: number; sorryMs: number; retryDelaysMs: number[]
   voice: { on: boolean; cmd: string; whisper: string; model: string; dir: string }
 }
 
@@ -72,6 +72,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
       uploadTimeoutMs: num(env.TELEGRAM_UPLOAD_TIMEOUT_S, 300, 1) * 1000 },
     useRich: isRich(env),
     onsenTimeoutMs: num(env.TELEGRAM_BRIDGE_ONSEN_TIMEOUT_MS, 15_000, 100),
+    ...(env.TELEGRAM_BRIDGE_PIN_CHECK_S ? { pinCheckMs: num(env.TELEGRAM_BRIDGE_PIN_CHECK_S, 60, 0.05) * 1000 } : {}),
+    ...(env.TELEGRAM_BRIDGE_PIN_EDIT_MS ? { pinMinEditMs: num(env.TELEGRAM_BRIDGE_PIN_EDIT_MS, 5000, 0) } : {}),
     sorryMs: num(env.TELEGRAM_BRIDGE_SORRY_S, 15, 0) * 1000,
     retryDelaysMs: ((env.TELEGRAM_BRIDGE_RETRY_S ?? '').trim() || '10,30,120').split(',').map(x => Number(x.trim()) * 1000).filter(n => Number.isFinite(n) && n >= 0),
     version: pluginVersion(),
@@ -221,7 +223,8 @@ export class Bridge {
         if (!have.username) await this.getMe(have)
         continue
       }
-      const a = new Agent(m, w.stateDir, w.source, tok, { bridgeDir: this.cfg.stateDir, tgOptions: { ...this.cfg.tg, fetch: this.deps.fetch }, log: (l, msg) => this.log(l, msg), now: this.deps.now })
+      const a = new Agent(m, w.stateDir, w.source, tok, { bridgeDir: this.cfg.stateDir, tgOptions: { ...this.cfg.tg, fetch: this.deps.fetch }, log: (l, msg) => this.log(l, msg), now: this.deps.now,
+        pinCheckMs: this.cfg.pinCheckMs, pinMinEditMs: this.cfg.pinMinEditMs })
       a.accepted = this.state.data.accepted.includes(m)
       a.displayName = this.known?.get(m) ?? null
       this.agents.set(m, a)
