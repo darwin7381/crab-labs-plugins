@@ -325,7 +325,8 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
   const presence: Observation['presence'] = goneNow || disconnected || (view.state === 'offline' && !starting) ? 'offline' : 'online'
   const presence_reason: Observation['presence_reason'] = presence === 'online' ? null : goneNow || f.alive === false ? 'process_gone' : 'disconnected'
   const lifecycle: Observation['lifecycle'] = presence_reason === 'process_gone' ? 'stopped' : starting ? 'starting' : 'ready'
-  const mainId = f.session_id || 'main'
+  // CONTRACT v1 (Chiron 03:07Z, CONTRACT.md:211): the main session is written `main`, a lane its full id (<agent>.<kind>.<n>), in every place (sessions[].id, main_session_id)
+  const mainId = 'main'
   const known = !!f.session_id || presence === 'online'                    // a main this daemon has seen: no idle main is made up
   const sessions: ObsSession[] = []
   if (known) {

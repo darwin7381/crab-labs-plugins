@@ -31,7 +31,7 @@ const main = (o: any) => o.sessions.find((s: any) => s.kind === 'main')
 
 describe("Chiron's table, field by field", () => {
   test('presence / presence_reason / lifecycle', () => {
-    expect(obs(null, null, prog('idle'))).toMatchObject({ presence: 'online', presence_reason: null, lifecycle: 'ready', main_session_id: 'sess-1' })
+    expect(obs(null, null, prog('idle'))).toMatchObject({ presence: 'online', presence_reason: null, lifecycle: 'ready', main_session_id: 'main' })
     const g = obs(V('working'), ST, prog('offline', { reason: 'pid_gone' }), F({ turn: TURN }))
     expect(g).toMatchObject({ presence: 'offline', presence_reason: 'process_gone', lifecycle: 'stopped', background: null })
     expect(main(g)).toMatchObject({ activity: 'unknown', turn: null, doing: null, blockers: [] })
@@ -48,7 +48,7 @@ describe("Chiron's table, field by field", () => {
   })
   test('activity: running (busy, compacting), paused (a menu or the wall in a turn), stuck, idle (else); busy with no turn known: unknown', () => {
     const run = main(obs(V('working'), ST, prog('busy', TOOL), F({ turn: TURN })))
-    expect(run).toMatchObject({ id: 'sess-1', kind: 'main', activity: 'running', turn: TURN, doing: { kind: 'tool', tool: 'Bash', since: TOOL.tool.since }, blockers: [] })
+    expect(run).toMatchObject({ id: 'main', kind: 'main', activity: 'running', turn: TURN, doing: { kind: 'tool', tool: 'Bash', since: TOOL.tool.since }, blockers: [] })
     expect(main(obs(V('working'), ST, prog('idle'), F({ turn: TURN }))).doing).toEqual({ kind: 'thinking', tool: null, since: '2026-11-26T01:00:00.000Z' })
     expect(main(obs(V('compacting'), ST, prog('busy', TOOL), F({ turn: TURN }))).doing).toMatchObject({ kind: 'compacting', tool: null })
     expect(main(obs(null, null, prog('busy', TOOL), F({ turn: TURN })))).toMatchObject({ activity: 'running', doing: { kind: 'tool', tool: 'Bash' } })
@@ -90,7 +90,7 @@ describe("Chiron's table, field by field", () => {
     const lanes = [{ id: 'lab-relay.reflex.3', run: 'lab-relay.reflex.3.r1', kind: 'reflex', since: '2026-11-26T00:59:10.000Z', thread: 'lab-relay#t-sch1' },
       { id: 'lab-relay.mail.1', run: 'lab-relay.mail.1.r2', kind: 'mail', since: '2026-11-26T00:59:20.000Z', thread: 'lab-relay#t-mail' }]
     const o = obs(V('waiting_for_human', 'model_picker'), MENU, prog('idle', { lanes, dialog_open: true }), F({ scheduleThread: t => t === 'lab-relay#t-sch1' }))
-    expect(o.sessions.map((s: any) => [s.id, s.kind, s.activity])).toEqual([['sess-1', 'main', 'idle'], ['lab-relay.reflex.3', 'lane', 'running'], ['lab-relay.mail.1', 'lane', 'running']])
+    expect(o.sessions.map((s: any) => [s.id, s.kind, s.activity])).toEqual([['main', 'main', 'idle'], ['lab-relay.reflex.3', 'lane', 'running'], ['lab-relay.mail.1', 'lane', 'running']])
     expect(o.sessions[0].blockers[0]).toMatchObject({ menu_kind: 'model_picker' })
     expect(o.sessions[1]).toMatchObject({ thread_id: 'lab-relay#t-sch1', activity_since: lanes[0]!.since, turn: { id: 'lab-relay.reflex.3.r1', started_at: lanes[0]!.since, trigger: { kind: 'schedule' } }, doing: { kind: 'thinking' } })
     expect(o.sessions[2].turn.trigger).toEqual({ kind: 'thread', thread_id: 'lab-relay#t-mail' })
@@ -193,7 +193,7 @@ describe('the program facts behind turn, trigger and last_turn', () => {
     expect(q.tap.lastTurn()).toBeNull()
     const bad = o(), m = main(bad)
     m.turn = { ...m.turn, id: 'p1' }                                        // what chiron showed at 01:37Z: the checker's port catches it
-    expect(checkObservation(bad)).toEqual(['sess-1: the open turn p1 is also last_turn'])
+    expect(checkObservation(bad)).toEqual(['main: the open turn p1 is also last_turn'])
   })
   test('lanes off: the transcript\'s turn, opened by the first Joey message it took in; turn_duration ends it as done', () => {
     const facts = new DeliveryFacts({ agent: 'adam', sink: () => {} })
