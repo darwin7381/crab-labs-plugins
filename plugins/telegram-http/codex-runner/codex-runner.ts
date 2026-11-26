@@ -7,6 +7,13 @@
 //             and the follow-ups in a Codex thread, and the forms inbox (GET /forms/inbox?wait=25, POST /forms/ack) for what Joey says on the page
 //             (items marked `say`). Every item is first written to this program's state file, then acked. Not taken as work: a silent notice, a mail
 //             bell, a press, a poke that is no Call.
+//   person    (WO-196 stage one, Onsen 0.33.0 person_message / 0.35.0 new-style writes) a person's message (a bridge carried it in from Telegram,
+//             or the page wrote it) comes on the same inbox as an item of kind `person_message`: a job as a page `say` is (the same session, folder,
+//             run, delivery facts), its text possibly empty (a photo with no caption), its attachments fetched when they have a url and named in the
+//             prompt as not available when they do not. Its answer is written new-style into its conversation (POST /messages with
+//             conversation_id, no agent / client / chat): Onsen decides which bridge draws it. Its delivery facts are keyed on the message's own
+//             client numbers (via telegram: the bridge's chat and msg_id, which Onsen turns into the bridge's receipts; via web: form-<message id>).
+//             A `person_edit` is logged and acked: no job.
 //   session   (Chiron's ruling, mesh 12527, 11-26 08:21Z: a Codex session belongs to a thread, not to the whole conversation, as a thread belongs to one
 //             session of our own agents) an agent's item that carries a thread (payload.thread / refs.thread) belongs to that thread's session: the
 //             first one starts it, the next ones resume it. One that carries none starts a new session with a new thread `codex#t-<hex>`; its answer
@@ -22,7 +29,8 @@
 //             listed in result.attachment_file_ids. A non-zero exit, or CODEX_RUNNER_TIMEOUT_S (1800) without finishing (SIGTERM to its process
 //             group, SIGKILL 10 s later): failed, result.body = the error and the last lines of stderr. A peer's Call also gets a reply (POST /send,
 //             peer_call, reply_to_id = its number, the session's thread) so the answer reaches the caller as every Call's answer does; a page message gets the
-//             answer recorded in Joey's conversation with Codex (POST /messages, its files attached) and its delivery facts.
+//             answer recorded in Joey's conversation with Codex (POST /messages, its files attached) and its delivery facts; a person_message the same,
+//             written new-style (conversation_id).
 //   at most   CODEX_RUNNER_MAX (3) at once, across sessions; the rest stay `queued` in Onsen (queued is Onsen's own state: no PUT until one is
 //             started). Two items of one session never run at once (two resumes would interleave its history): the second waits for the first.
 //   status    PUT /v1/members/codex/observation (onsen-observation.ts, at each change and every 15 s): online while alive; the main session running
@@ -207,19 +215,26 @@ export class Onsen {
 // ------------------------------------------------------------------ state
 export type Att = { name: string | null; mime: string | null; kind: string | null; url: string | null }
 export type JobState = 'lookup' | 'queued' | 'starting' | 'running' | 'finishing' | 'done' | 'failed' | 'skipped'
+/** a person_message's delivery-fact key: the message's own numbers on its client (POST /deliveries/batch client, chat, client_msg_id) */
+export type FactRef = { client: string; chat: string; client_msg_id: string }
 export type Job = {
-  id: string; source: 'call' | 'say'; key: string; text: string; attachments: Att[]; state: JobState; received_at: string
+  /** call: a Call or a follow-up (the inbox); say: Joey on the page (the forms inbox); person: a person's message (the inbox, person_message) */
+  id: string; source: 'call' | 'say' | 'person'; key: string; text: string; attachments: Att[]; state: JobState; received_at: string
   call_id?: string | null; number?: number | null; caller?: string; kind?: string; no_reply?: boolean; lookup_at?: string
   /** the session's thread (an agent's item); hop: the item's hop, the answer's is one more */
   thread?: string; thread_given?: boolean; hop?: number
   message_id?: string; chat?: string
+  /** person: its Onsen conversation (the answer goes there), via telegram | web, the key of its delivery facts (null: none can be written),
+   *  what the prompt says besides the text (the message it replies to, the quote, where it was forwarded from) */
+  conversation_id?: string; via?: string; fact_ref?: FactRef | null; context?: string[]
   dir?: string; n?: number; resumed?: string | null; images?: string[]; notes?: string[]
   started_at?: string; ended_at?: string; pid?: number | null; exit?: number | null; signal?: string | null; timed_out?: boolean
   before?: Record<string, string>
   outcome?: 'completed' | 'failed'; result_text?: string; files?: string[]; skipped_files?: string[]
   uploads?: Record<string, string>; steps?: Record<string, boolean>; why?: string
 }
-/** one Codex session: an agent's thread (key t:<thread>) or Joey's DM (key say:<chat>) */
+/** one Codex session: an agent's thread (key t:<thread>) or a person's conversation (key say:<chat>: the page's say rows and that chat's
+ *  person_message items alike, one conversation; conv:<conversation id> for a person_message with no client chat) */
 export type Sess = { dir: string; conversation_id: string | null; session_id: string | null; runs: number; thread: string | null; first_number: number | null }
 export type State = { v: 1; seq: number; jobs: Job[]; sessions: Record<string, Sess>; says: string[]
   span: { id: string; started_at: string; trigger: any } | null; last_turn: { id: string; outcome: 'done' | 'failed'; ended_at: string } | null
@@ -250,6 +265,28 @@ export const newThread = (agent: string): string => `${agent}#t-${Array.from(cry
 export function threadOf(it: { payload?: Record<string, unknown>; refs?: Record<string, unknown> | null }): string | null {
   for (const v of [it.payload?.thread, it.refs?.thread]) if (typeof v === 'string' && v.length <= 120 && THREAD_RE.test(v.trim())) return v.trim()
   return null
+}
+/** the delivery-fact key of a person_message (payload as onsen_person.payload_of writes it): the message's own numbers on its client. via
+ *  telegram (any bridge's client): client.name, client.chat, client.msg_id (the alias the bridge wrote, which /deliveries/batch resolves to the
+ *  message and turns into the bridge's receipt); via web: the conversation's client and chat with form-<message id>, as the page's say rows
+ *  have it. null: no client side (a conversation said in Onsen only) or no number */
+export function factRefOf(p: Record<string, any>, mid: string): FactRef | null {
+  const cl = p.client && typeof p.client === 'object' ? p.client as Record<string, any> : null
+  const client = typeof cl?.name === 'string' && cl.name ? cl.name : null
+  const chat = cl?.chat != null && String(cl.chat) !== '' ? String(cl.chat) : null
+  if (!client || !chat) return null
+  if (p.via === 'web') return { client, chat, client_msg_id: `form-${mid}` }
+  const n = cl!.msg_id != null && String(cl!.msg_id) !== '' ? String(cl!.msg_id) : null
+  return n ? { client, chat, client_msg_id: n } : null
+}
+/** what a person_message says besides its text, as lines of the prompt: the message it replies to, the passage quoted, where it was forwarded from */
+export function contextOf(p: Record<string, any>): string[] {
+  const out: string[] = []
+  const r = p.reply_to && typeof p.reply_to === 'object' ? p.reply_to as Record<string, any> : null
+  if (r) out.push(`（這一則回覆${typeof r.from === 'string' && r.from ? ` ${r.from} ` : ''}的一則訊息${typeof r.text === 'string' && r.text.trim() ? `：「${cut(r.text.trim(), 500)}」` : ''}）`)
+  if (typeof p.reply_quote === 'string' && p.reply_quote.trim()) out.push(`（引用其中這一段：「${cut(p.reply_quote.trim(), 1000)}」）`)
+  if (typeof p.forward_from === 'string' && p.forward_from.trim()) out.push(`（轉傳自 ${cut(p.forward_from.trim(), 200)}）`)
+  return out
 }
 /** a key as a folder name */
 const folderOf = (s: string): string => s.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'conversation'
@@ -326,7 +363,7 @@ export class CodexRunner {
   private stopped = false
   private formsLoop: Promise<void> | null = null
   private formsWake: (() => void) | null = null
-  readonly stats = { taken: 0, ignored: 0, says: 0, runs: 0, completed: 0, failed: 0, reports_retried: 0, last_error: null as string | null }
+  readonly stats = { taken: 0, ignored: 0, says: 0, persons: 0, edits: 0, runs: 0, completed: 0, failed: 0, reports_retried: 0, last_error: null as string | null }
 
   constructor(readonly cfg: Cfg) {
     this.onsen = new Onsen(cfg.base, cfg.credentialFile)
@@ -423,6 +460,14 @@ export class CodexRunner {
     if (this.stopped) throw new Error('stopping: left pending for the next start')   // the puller keeps it, in order
     const key = itemKey(it)
     if (key && this.inbox.seen(key)) return 'duplicate'
+    if (it.kind === 'person_message') return this.takePerson(it, key)
+    if (it.kind === 'person_edit') {
+      const e = (it.payload ?? {}) as Record<string, any>
+      this.stats.edits++
+      this.log('info', `inbox seq ${it.seq} from ${it.sender}: person_edit of message ${e.message_id ?? '?'} (${String(e.text ?? '').length} chars, edited ${e.edited_at ?? '?'}): noted, no job`)
+      if (key) this.inbox.record(key)
+      return 'delivered'
+    }
     const p = (it.payload ?? {}) as Record<string, any>
     const callId = (it as any).call_id != null ? String((it as any).call_id) : null
     if (callId && this.state.jobs.some(j => j.call_id === callId)) { if (key) this.inbox.record(key); return 'duplicate' }
@@ -473,6 +518,39 @@ export class CodexRunner {
     }
     this.changed()
     this.pump()
+  }
+
+  // ---------------------------------------------------------------- take: a person's message (person_message, WO-193 / WO-196)
+  /** a person_message item → a job as a page say is (written before the ack); one without its message or conversation id is acked and left */
+  private takePerson(it: PullItem, key: string | null): HandResult {
+    const p = (it.payload ?? {}) as Record<string, any>
+    const mid = p.message_id != null ? String(p.message_id) : ''
+    const conv = p.conversation_id != null ? String(p.conversation_id) : ''
+    if (!mid || !conv) {
+      this.stats.ignored++
+      this.log('warn', `inbox seq ${it.seq} from ${it.sender}: a person_message without ${mid ? 'conversation_id' : 'message_id'}: not taken`)
+      if (key) this.inbox.record(key)
+      return 'delivered'
+    }
+    if (this.state.jobs.some(j => j.message_id === mid) || this.state.says.includes(mid)) { if (key) this.inbox.record(key); return 'duplicate' }
+    const cl = p.client && typeof p.client === 'object' ? p.client as Record<string, any> : null
+    const chat = cl?.chat != null && String(cl.chat) !== '' ? String(cl.chat) : null
+    const raw: any[] = Array.isArray(p.attachments) ? p.attachments : Array.isArray((it as any).attachments) ? (it as any).attachments : []
+    const atts: Att[] = raw.map((a: any) => ({ name: a?.name ?? null, mime: a?.mime ?? null, kind: a?.kind ?? null, url: a?.url ?? null }))
+    // the session: the chat's (the same as the page's say rows of that chat: one conversation), else the conversation's
+    const j: Job = { id: `j${++this.state.seq}`, source: 'person', key: chat ? `say:${chat}` : `conv:${conv}`, text: String(p.text ?? ''), attachments: atts,
+      state: 'queued', received_at: this.iso(), message_id: mid, conversation_id: conv, via: String(p.via ?? ''), kind: String(p.kind ?? 'text'),
+      caller: String(p.from ?? it.sender ?? ''), fact_ref: factRefOf(p, mid), context: contextOf(p), ...(chat ? { chat } : {}) }
+    this.state.jobs.push(j)
+    this.stats.persons++
+    this.log('info', `${j.id}: message ${mid} from ${j.caller} via ${j.via || '?'} (conversation ${conv}${chat ? `, chat ${chat}` : ''}), ${atts.length} attachment(s)`
+      + `${atts.some(a => !a.url) ? ` (${atts.filter(a => !a.url).length} without a url)` : ''}: queued`)
+    if (!j.fact_ref) this.log('warn', `${j.id}: no client numbers on message ${mid} (client ${JSON.stringify(cl)}): no delivery facts for it`)
+    void this.facts(j, ['delivered'])
+    this.changed()                                                // the job is on disk before its key is
+    if (key) this.inbox.record(key)
+    this.pump()
+    return 'delivered'
   }
 
   // ---------------------------------------------------------------- take: what Joey says on the page
@@ -539,7 +617,8 @@ export class CodexRunner {
     if (this.state.span) return
     const c = this.state.sessions[j.key]
     this.state.span = { id: `codex-turn-${this.now()}`, started_at: this.iso(),
-      trigger: j.source === 'say' && j.message_id ? { kind: 'message', conversation_id: c?.conversation_id ?? null, message_id: j.message_id } : { kind: 'other' } }
+      trigger: j.source !== 'call' && j.message_id ? { kind: 'message', conversation_id: j.conversation_id ?? c?.conversation_id ?? null, message_id: j.message_id }
+        : { kind: 'other' } }
   }
   private closeSpanIfIdle(outcome: 'done' | 'failed'): void {
     if (this.busy().length || !this.state.span) return
@@ -584,21 +663,23 @@ export class CodexRunner {
       void this.report(j)
     }
   }
-  /** the job's session (state.sessions: t:<thread>, say:<chat>), made at its first item: the folder ~/onsen-codex/<Onsen conversation id>/<sub>,
-   *  sub = the item's thread, or call-<id> for a session a Call with no thread started, or dm for Joey's DM; the conversation id asked once */
+  /** the job's session (state.sessions: t:<thread>, say:<chat>, conv:<conversation id>), made at its first item: the folder
+   *  ~/onsen-codex/<Onsen conversation id>/<sub>, sub = the item's thread, or call-<id> for a session a Call with no thread started, or dm for a
+   *  person's conversation (Joey's DM); the conversation id asked once (a person_message carries it) */
   private async session(j: Job): Promise<Sess> {
     let c = this.state.sessions[j.key]
     if (c) return c
-    let cid: string | null = null
-    try {
-      const r = j.source === 'say' ? (j.message_id ? await this.onsen.req('GET', `/v1/messages/${encodeURIComponent(j.message_id)}`) : null)
+    let cid: string | null = j.source === 'person' && j.conversation_id ? j.conversation_id : null
+    if (!cid) try {
+      const r = j.source !== 'call' ? (j.message_id ? await this.onsen.req('GET', `/v1/messages/${encodeURIComponent(j.message_id)}`) : null)
         : j.call_id ? await this.onsen.req('GET', `/v1/calls/${encodeURIComponent(j.call_id)}`)
           : await this.onsen.req('GET', `/v1/calls?caller=${encodeURIComponent(j.caller ?? '')}&recipient=${encodeURIComponent(this.cfg.agent)}&limit=1`)
       const v = r?.status !== 200 ? null : (r.json?.data?.conversation_id ?? (Array.isArray(r.json?.items) ? r.json.items[0]?.conversation_id : null))
       if (typeof v === 'string' && v || typeof v === 'number') cid = String(v)
     } catch {}
-    const top = folderOf(cid ?? (j.source === 'say' ? `dm-${j.chat}` : `call-${j.caller}`))
-    const sub = j.source === 'say' ? 'dm' : j.thread_given ? folderOf(j.thread!) : folderOf(j.call_id ? `call-${j.call_id}` : j.id)
+    const dm = j.source !== 'call'
+    const top = folderOf(cid ?? (dm ? `dm-${j.chat}` : `call-${j.caller}`))
+    const sub = dm ? 'dm' : j.thread_given ? folderOf(j.thread!) : folderOf(j.call_id ? `call-${j.call_id}` : j.id)
     const dir = join(this.cfg.root, top, sub)
     c = this.state.sessions[j.key] = { dir, conversation_id: cid, session_id: null, runs: existsSync(dir) ? this.runsIn(dir) : 0,
       thread: j.thread ?? null, first_number: j.number ?? null }
@@ -613,7 +694,10 @@ export class CodexRunner {
     const taken = new Set<string>()
     for (const [i, a] of j.attachments.entries()) {
       let name = safeName(a.name, `attachment-${j.id}-${i + 1}${extname(String(a.name ?? '')) || ''}`)
-      if (!a.url) { j.notes.push(`附件 ${name} 沒有網址（Onsen 沒存那個檔）`); continue }
+      if (!a.url) {                                             // a file only the client has (a Telegram photo Onsen keeps no copy of): named, not available
+        j.notes.push(`附件 ${a.name ? name : `一個沒有檔名的 ${a.kind ?? '檔案'}`} 拿不到：沒有網址，Onsen 沒存那個檔${j.via && j.via !== 'web' ? `，只在 ${j.via} 上` : ''}`)
+        continue
+      }
       let dest = join(j.dir!, name)
       for (let k = 1; (existsSync(dest) || taken.has(dest)) && k < 100; k++) {
         const e = extname(name), b = name.slice(0, name.length - e.length)
@@ -634,7 +718,9 @@ export class CodexRunner {
   argv(j: Job): string[] {
     const out = ['--json', '-o', join(j.dir!, `last-${j.n}.txt`)]
     const imgs = (j.images ?? []).flatMap(p => ['-i', p])
-    const text = [j.text.trim() || '（只有附件）', ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
+    // a person's message may have no text (a photo with no caption); one with neither text nor attachments says its kind
+    const head = j.text.trim() || (j.source === 'person' && !j.attachments.length ? `（一則沒有文字的 ${j.kind ?? 'text'} 訊息）` : '（只有附件）')
+    const text = [head, ...(j.context?.length ? ['', ...j.context] : []), ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
     return ['exec', '--skip-git-repo-check', '-s', this.cfg.sandbox, '-C', j.dir!, ...(j.resumed ? ['resume', j.resumed] : []), ...out, ...imgs, '--', text]
   }
   /** the child's environment: the runner's, without its own settings (CODEX_RUNNER_*, ONSEN_*), with Codex's own home and HOME */
@@ -854,10 +940,37 @@ export class CodexRunner {
     this.log('warn', `${j.id}: reply to ${j.caller}: ${r ? `HTTP ${r.status}` : 'no answer'}; sent again later`)
     return 'retry'
   }
-  /** the answer to what Joey said on the page: recorded in his conversation with Codex, its files attached (POST /messages) */
-  private async answer(j: Job, ids: string[]): Promise<'ok' | 'retry'> {
+  /** the answer's text in a conversation: the last message, and the files that did not go along */
+  private answerBody(j: Job): string {
     const more = j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : ''
-    const body = cut(j.result_text ?? '', SAY_MAX) + more
+    return cut(j.result_text ?? '', SAY_MAX) + more
+  }
+  /** the answer to a person's message (person_message): written new-style into its conversation (Onsen 0.35.0, CONTRACT §7d 連接器這一頭):
+   *  conversation_id, no agent / client / chat / client_msg_id / delivery. Onsen decides which bridge draws it (delivery pending until that
+   *  bridge reports; sent at write when none has to) */
+  private async answerNew(j: Job, ids: string[]): Promise<'ok' | 'retry'> {
+    const rec = { conversation_id: j.conversation_id, idem_key: `codex:out:${j.id}`, sent_at: j.ended_at ?? this.iso(), body: this.answerBody(j),
+      sender: 'main', turn_id: `codex-${j.id}`, ...(ids.length ? { attachment_file_ids: ids } : {}) }
+    let r: Answer = null
+    try { r = await this.onsen.req('POST', '/messages', rec) } catch (e) { this.stats.last_error = String(e) }
+    if (r?.status === 200) {
+      const d = r.json?.data ?? r.json ?? {}                        // /api/onsen/messages answers {id, duplicate, conversation_id, delivery}
+      this.log('info', `${j.id}: answer ${d.message_id ?? d.id ?? '?'} written into conversation ${d.conversation_id ?? j.conversation_id}`
+        + `${d.duplicate ? ' (already there)' : ''}${d.delivery ? `, delivery ${d.delivery}` : ''}${ids.length ? `, ${ids.length} file(s)` : ''}`)
+      return 'ok'
+    }
+    if (r && r.status >= 400 && r.status < 500 && ![401, 408, 425, 429].includes(r.status)) {
+      this.log('warn', `${j.id}: answer not written into conversation ${j.conversation_id}: HTTP ${r.status} ${JSON.stringify(r.json?.detail ?? r.json?.error ?? '').slice(0, 200)}; not sent again`)
+      return 'ok'
+    }
+    this.log('warn', `${j.id}: answer into conversation ${j.conversation_id}: ${r ? `HTTP ${r.status}` : 'no answer'}; sent again later`)
+    return 'retry'
+  }
+  /** the answer to what Joey said on the page: recorded in his conversation with Codex, its files attached (POST /messages); a person_message's:
+   *  answerNew */
+  private async answer(j: Job, ids: string[]): Promise<'ok' | 'retry'> {
+    if (j.source === 'person') return this.answerNew(j, ids)
+    const body = this.answerBody(j)
     const rec = { agent: this.cfg.agent, client: 'telegram', chat: j.chat, direction: 'out', idem_key: `codex:out:${j.id}`, sent_at: j.ended_at ?? this.iso(),
       body, sender: 'main', client_msg_id: `cx-${j.id}`, turn_id: `codex-${j.id}`, ...(ids.length ? { attachment_file_ids: ids } : {}) }
     let r: Answer = null
@@ -879,13 +992,24 @@ export class CodexRunner {
     }
     return 'retry'
   }
-  /** delivery facts on a page message (POST /deliveries/batch; each idempotent by its key): delivered at take; in_session and seen when its run
-   *  starts (its turn codex-<job>); turn_end when it ends (done / failed, bound to it). True when Onsen took them */
+  /** the key of a job's delivery facts: a page message's form-<id> in its chat; a person_message's own client numbers (fact_ref), idempotent
+   *  under pm-<Onsen message id> (a Telegram number repeats across chats); null: none */
+  private factKey(j: Job): { idem: string; client: string; chat: string; ref: string } | null {
+    if (!j.message_id) return null
+    if (j.source === 'say') return { idem: `form-${j.message_id}`, client: 'telegram', chat: j.chat ?? '', ref: `form-${j.message_id}` }
+    if (j.source === 'person' && j.fact_ref) return { idem: `pm-${j.message_id}`, client: j.fact_ref.client, chat: j.fact_ref.chat, ref: j.fact_ref.client_msg_id }
+    return null
+  }
+  /** delivery facts on a page message or a person's message (POST /deliveries/batch; each idempotent by its key): delivered at take; in_session
+   *  and seen when its run starts (its turn codex-<job>); turn_end when it ends (done / failed, bound to it). Onsen turns those of a message a
+   *  bridge brought in (its alias) into that bridge's receipts (onsen_bridge.on_fact: delivered, seen → in_session, turn_end). True when Onsen
+   *  took them */
   async facts(j: Job, states: Array<'delivered' | 'in_session' | 'seen' | 'turn_end'>): Promise<boolean> {
-    if (j.source !== 'say' || !j.message_id) return true
-    const ref = `form-${j.message_id}`
+    const k = this.factKey(j)
+    if (!k) return true
+    const ref = k.ref
     const at = (s: string): string => s === 'delivered' ? j.received_at : s === 'turn_end' ? (j.ended_at ?? this.iso()) : (j.started_at ?? this.iso())
-    const items = states.filter(s => s !== 'turn_end' || j.ended_at).map(s => ({ idem_key: `codex:${ref}:${s}`, agent: this.cfg.agent, client: 'telegram', chat: j.chat,
+    const items = states.filter(s => s !== 'turn_end' || j.ended_at).map(s => ({ idem_key: `codex:${k.idem}:${s}`, agent: this.cfg.agent, client: k.client, chat: k.chat,
       client_msg_id: ref, state: s, at: at(s), by: 'main', ...(s !== 'delivered' ? { turn_id: `codex-${j.id}` } : {}),
       ...(s === 'turn_end' ? { outcome: j.outcome === 'completed' ? 'done' : 'failed', bound: [ref] } : {}) }))
     if (!items.length) return true

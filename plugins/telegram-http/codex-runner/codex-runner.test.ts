@@ -44,6 +44,7 @@ class FakeOnsen {
   profileStatus: number[] = []                                                // answers to give the profile PUTs, in order (then 200)
   unauthorized = 0
   messagesKnowAttachments = true
+  newStyleStatus: number[] = []                                               // answers to give the next new-style writes, in order (then 200)
   fileSeq = 900
   constructor() {
     this.server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: req => this.handle(req) })
@@ -53,6 +54,8 @@ class FakeOnsen {
   call(id: string, caller: string, number: number | null): void { this.calls.set(id, { id, caller, state: 'queued', number }) }
   seq = 0
   push(item: Record<string, any>): void { this.inbox.push({ seq: ++this.seq, relay: null, kind: 'peer_call', refs: null, given: 1, ...item }) }
+  /** a person_message item as onsen_person.put_message writes it (sender the person, dedupe pm:<message id>, no call_id) */
+  pushPerson(payload: Record<string, any>): void { this.push({ sender: payload.from ?? 'joey', kind: 'person_message', payload, dedupe: `pm:${payload.message_id}`, call_id: null }) }
   file(id: string, name: string, bytes: Buffer, mime = 'image/png'): string { this.files.set(id, { name, mime, bytes, by: 'joey' }); return `${this.base}/v1/files/${id}` }
   statesOf(call: string): string[] { return this.puts.filter(p => p.call === call).map(p => p.state) }
   private j(status: number, body: unknown): Response { return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }) }
@@ -111,9 +114,18 @@ class FakeOnsen {
     if (m === 'POST' && p === '/send') { const b = await req.json() as any; this.sends.push(b); return this.j(200, { results: [{ to: b.to, seq: 1, duplicate: false, pulling: true }] }) }
     if (m === 'POST' && p === '/messages') {
       const b = await req.json() as any
+      // Onsen 0.35.0 (onsen_bridge.check_new_style): with conversation_id / to, none of client / chat / delivery / client_msg_id / backfilled /
+      // deliver, direction out, agent the caller's own; answered {id, duplicate, conversation_id, delivery}
+      const isNew = b.conversation_id != null || b.to != null
+      if (isNew) {
+        const bad = ['client', 'chat', 'delivery', 'client_msg_id', 'backfilled', 'deliver'].filter(k => k in b)
+        if (bad.length || (b.direction ?? 'out') !== 'out' || (b.agent ?? 'codex') !== 'codex') return this.j(400, { detail: `with conversation_id / to, no ${bad.join(', ')}` })
+        if (this.newStyleStatus.length) { const st = this.newStyleStatus.shift()!; return this.j(st, { detail: 'not now' }) }
+      }
       const dup = this.records.some(r => r.idem_key === b.idem_key)
       if (!dup) this.records.push(b)
-      return this.j(200, { id: 5000 + this.records.length, duplicate: dup, ...(b.attachment_file_ids?.length && this.messagesKnowAttachments && !dup ? { attachments: b.attachment_file_ids.length } : {}) })
+      return this.j(200, { id: 5000 + this.records.length, duplicate: dup, ...(isNew && !dup ? { conversation_id: Number(b.conversation_id), delivery: 'pending' } : {}),
+        ...(b.attachment_file_ids?.length && this.messagesKnowAttachments && !dup ? { attachments: b.attachment_file_ids.length } : {}) })
     }
     if (m === 'POST' && p === '/deliveries/batch') { const b = await req.json() as any; this.facts.push(...b.items); return this.j(200, { results: b.items.map((_: any, i: number) => ({ id: i })) }) }
     if (m === 'PUT' && p === '/v1/members/codex/profile') { this.profiles.push(await req.json()); const st = this.profileStatus.shift() ?? 200; return this.j(st, st === 200 ? { data: { name: 'codex' } } : { error: { code: 'not_found' } }) }
@@ -509,6 +521,8 @@ describe('Joey on the page', () => {
     expect(onsen.records).toHaveLength(1)
     const rec = onsen.records[0]
     expect(rec).toMatchObject({ agent: 'codex', client: 'telegram', chat: '1828173984', direction: 'out', sender: 'main' })
+    expect(rec.client_msg_id).toMatch(/^cx-j\d+$/)                            // the old record, unchanged (WO-196 writes new-style only for person_message)
+    expect(rec.conversation_id).toBeUndefined()
     expect(rec.body).toContain('answer to: 照這張畫')
     expect(rec.attachment_file_ids).toHaveLength(1)
     expect(onsen.files.get(rec.attachment_file_ids[0])!.name).toBe('capy.png')
@@ -516,7 +530,7 @@ describe('Joey on the page', () => {
     expect(job).toMatch(/^codex-j\d+$/)
     const byState = Object.fromEntries(onsen.facts.map(f => [f.state, f]))
     expect(Object.keys(byState).sort()).toEqual(['delivered', 'in_session', 'seen', 'turn_end'])
-    expect(byState.seen).toMatchObject({ client_msg_id: 'form-801', chat: '1828173984', by: 'main', turn_id: job })
+    expect(byState.seen).toMatchObject({ client_msg_id: 'form-801', chat: '1828173984', client: 'telegram', by: 'main', turn_id: job, idem_key: 'codex:form-801:seen' })
     expect(byState.turn_end).toMatchObject({ outcome: 'done', bound: ['form-801'], turn_id: job })
     expect(Date.parse(byState.delivered.at)).toBeLessThanOrEqual(Date.parse(byState.seen.at))
     expect(Date.parse(byState.seen.at)).toBeLessThanOrEqual(Date.parse(byState.turn_end.at))
@@ -534,6 +548,142 @@ describe('Joey on the page', () => {
     await until(() => onsen.records.length === 2, 10_000, 'two records')
     expect(onsen.records[1].body).toContain('沒能附上')
     expect(onsen.records[1].body).toContain('a.png')
+  })
+})
+
+// a person_message's payload as onsen_person.payload_of writes it (WO-193; CONTRACT §4)
+const pm = (mid: number, over: Record<string, any> = {}): Record<string, any> => ({ message_id: String(mid), conversation_id: '7001', from: 'joey', via: 'telegram',
+  text: 'hello', kind: 'text', sent_at: new Date().toISOString(), attachments: [],
+  client: { name: 'telegram', chat: '1828173984', msg_id: String(mid - 7000), user: 'Advac777', user_id: '1828173984' }, reply_to: null, ...over })
+const NEW_STYLE_KEYS = ['attachment_file_ids', 'body', 'conversation_id', 'idem_key', 'sender', 'sent_at', 'turn_id']
+const factsOf = (o: FakeOnsen, prefix: string): Record<string, any> => Object.fromEntries(o.facts.filter(f => f.idem_key.startsWith(prefix)).map(f => [f.state, f]))
+
+describe('a person\'s message (person_message, WO-196 stage one)', () => {
+  test('from Telegram with a photo: run in its conversation\'s folder, answered new-style into the conversation, the facts on its Telegram numbers', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    const photo = onsen.file('31', 'photo.png', PNG)
+    onsen.pushPerson(pm(8001, { text: '照這張改 IMG:out.png', kind: 'photo',
+      attachments: [{ kind: 'photo', name: 'photo.png', mime: 'image/png', bytes: PNG.length, url: photo, client_ref: 'AgACAgUAAx0' }],
+      client: { name: 'telegram', chat: '1828173984', msg_id: '4711', user: 'Advac777', user_id: '1828173984' },
+      reply_to: { message_id: '7990', client_msg_id: '4700', from: 'codex', text: 'the earlier picture' }, reply_quote: 'the water' }))
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.facts.some(f => f.state === 'turn_end') && r.state.jobs[0]?.state === 'done', 10_000, 'turn_end')
+    await until(() => onsen.acked >= 1, 3_000, 'the ack')
+    const folder = join(cfg.root, '7001', 'dm')
+    const start = codexLog().find(x => x.ev === 'start')
+    expect(start.dir).toBe(folder)
+    expect(start.images).toEqual([join(folder, 'photo.png')])
+    expect(start.text).toContain('照這張改')
+    expect(start.text).toContain('（這一則回覆 codex 的一則訊息：「the earlier picture」）')
+    expect(start.text).toContain('（引用其中這一段：「the water」）')
+    // the answer: new-style into the conversation (Onsen 0.35.0), none of the old record's fields
+    expect(onsen.records).toHaveLength(1)
+    const rec = onsen.records[0]
+    expect(Object.keys(rec).sort()).toEqual(NEW_STYLE_KEYS)
+    expect(rec).toMatchObject({ conversation_id: '7001', sender: 'main' })
+    expect(rec.idem_key).toMatch(/^codex:out:j\d+$/)
+    expect(rec.turn_id).toBe(`codex-${rec.idem_key.split(':')[2]}`)
+    expect(Number.isNaN(Date.parse(rec.sent_at))).toBe(false)
+    expect(rec.body).toContain('answer to: 照這張改')
+    expect(rec.attachment_file_ids.map((id: string) => onsen.files.get(id)!.name)).toEqual(['out.png'])
+    // the facts on the message's own Telegram numbers (the bridge's alias, which Onsen turns into its receipts), idempotent under pm-<id>
+    const f = factsOf(onsen, 'codex:pm-8001:')
+    expect(Object.keys(f).sort()).toEqual(['delivered', 'in_session', 'seen', 'turn_end'])
+    for (const s of Object.values(f)) expect(s).toMatchObject({ agent: 'codex', client: 'telegram', chat: '1828173984', client_msg_id: '4711', by: 'main' })
+    expect(onsen.facts.every(x => x.idem_key.startsWith('codex:pm-8001:'))).toBe(true)
+    expect(f.delivered.turn_id).toBeUndefined()
+    expect(f.seen.turn_id).toBe(rec.turn_id)
+    expect(f.turn_end).toMatchObject({ outcome: 'done', bound: ['4711'], turn_id: rec.turn_id })
+    expect(Date.parse(f.delivered.at)).toBeLessThanOrEqual(Date.parse(f.seen.at))
+    expect(Date.parse(f.seen.at)).toBeLessThanOrEqual(Date.parse(f.turn_end.at))
+    // no Call, nothing in anyone's inbox; its turn names the message
+    expect(onsen.puts).toEqual([])
+    expect(onsen.sends).toEqual([])
+    expect(onsen.observations.some(o => o.sessions[0].turn?.trigger?.kind === 'message' && o.sessions[0].turn.trigger.message_id === '8001'
+      && o.sessions[0].turn.trigger.conversation_id === '7001')).toBe(true)
+    expect(r.state.jobs[0]).toMatchObject({ source: 'person', key: 'say:1828173984' })
+  })
+
+  test('no text: a photo with a url is handed over, one only Telegram has (url null) is named as not available; neither is dropped', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    const photo = onsen.file('32', 'cat.png', PNG)
+    onsen.pushPerson(pm(8101, { text: '', kind: 'photo', attachments: [{ kind: 'photo', name: 'cat.png', mime: 'image/png', bytes: PNG.length, url: photo, client_ref: 'AgAC1' }] }))
+    onsen.pushPerson(pm(8102, { text: '', kind: 'photo', attachments: [{ kind: 'photo', name: null, mime: null, bytes: null, url: null, client_ref: 'AgAC2' }] }))
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.records.length === 2 && r.state.jobs.every(j => j.state === 'done'), 10_000, 'two answers')
+    const starts = codexLog().filter(x => x.ev === 'start')
+    expect(starts).toHaveLength(2)
+    const folder = join(cfg.root, '7001', 'dm')
+    expect(starts[0].images).toEqual([join(folder, 'cat.png')])
+    expect(starts[0].text.split('\n')[0]).toBe('（只有附件）')
+    expect(starts[1].images).toEqual([])
+    expect(starts[1].text).toContain('（附件 一個沒有檔名的 photo 拿不到：沒有網址，Onsen 沒存那個檔，只在 telegram 上）')
+    expect(starts[1].resume).toBe(readEvents(join(folder, '.codex-runner', 'run-1.jsonl')).session)   // one conversation, one session
+    expect(onsen.records.every(x => x.conversation_id === '7001' && !('chat' in x) && !('client' in x))).toBe(true)
+    expect(onsen.acked).toBe(2)
+  })
+
+  test('a person_edit is acked and starts nothing', async () => {
+    const { onsen, cfg, codexLog, log } = setup()
+    onsen.push({ sender: 'joey', kind: 'person_edit', payload: { message_id: '8001', client: pm(8001).client, text: 'fixed a typo', edited_at: new Date().toISOString() }, dedupe: 'pe:91' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.acked >= 1, 5_000, 'acked')
+    await Bun.sleep(200)
+    expect(r.state.jobs).toEqual([])
+    expect(codexLog()).toEqual([])
+    expect([onsen.records, onsen.facts, onsen.puts, onsen.sends]).toEqual([[], [], [], []])
+    expect(log.filter(l => l.includes('person_edit of message 8001') && l.includes('no job'))).toHaveLength(1)
+  })
+
+  test('from the page (via web): the facts on form-<message id>; a conversation said in Onsen only (client null): answered, no facts', async () => {
+    const { onsen, cfg } = setup()
+    onsen.pushPerson(pm(8201, { via: 'web', text: 'from the page', client: { name: 'telegram', chat: '1828173984', msg_id: 'form-8201', user: 'Advac777', user_id: '1828173984' } }))
+    onsen.pushPerson(pm(8202, { via: 'web', conversation_id: '7002', text: 'onsen only', client: null }))
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.records.length === 2 && r.state.jobs.every(j => j.state === 'done'), 10_000, 'both answered')
+    const f = factsOf(onsen, 'codex:pm-8201:')
+    expect(Object.keys(f).sort()).toEqual(['delivered', 'in_session', 'seen', 'turn_end'])
+    expect(f.seen).toMatchObject({ client: 'telegram', chat: '1828173984', client_msg_id: 'form-8201' })
+    expect(f.turn_end.bound).toEqual(['form-8201'])
+    expect(onsen.facts.filter(x => x.idem_key.startsWith('codex:pm-8202:'))).toEqual([])
+    expect(onsen.records.map(x => x.conversation_id).sort()).toEqual(['7001', '7002'])
+    expect(onsen.records.every(x => Object.keys(x).sort().join() === NEW_STYLE_KEYS.filter(k => k !== 'attachment_file_ids').join())).toBe(true)
+    expect(r.state.sessions['conv:7002']!.dir).toBe(join(cfg.root, '7002', 'dm'))
+  })
+
+  test('the page\'s say and a Telegram message of the same chat are one conversation: one session, one folder', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    onsen.forms.push({ id: 7999, form_id: 5, chat: '1828173984', title: '', body: 'first on the page', at: new Date().toISOString(), say: true })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.records.length === 1 && r.state.jobs[0]?.state === 'done', 10_000, 'the page answer')
+    onsen.pushPerson(pm(8301, { conversation_id: '4242', text: 'then on Telegram' }))
+    await until(() => onsen.records.length === 2, 10_000, 'the Telegram answer')
+    const starts = codexLog().filter(x => x.ev === 'start')
+    expect(starts[1].dir).toBe(starts[0].dir)
+    expect(starts[1].resume).toBe(readEvents(join(starts[0].dir, '.codex-runner', 'run-1.jsonl')).session)
+    expect(onsen.records[0]).toMatchObject({ agent: 'codex', client: 'telegram', chat: '1828173984' })   // the say: the old record
+    expect(onsen.records[1]).toMatchObject({ conversation_id: '4242' })                                  // the person_message: new-style
+    expect(onsen.records[1].chat).toBeUndefined()
+  })
+
+  test('Onsen not taking the new-style write for a moment: written again later, once; given twice, one job', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    onsen.newStyleStatus.push(503)
+    onsen.pushPerson(pm(8401, { text: 'again' }))
+    onsen.pushPerson(pm(8401, { text: 'again' }))
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.records.length === 1 && r.state.jobs[0]?.state === 'done', 10_000, 'written')
+    await Bun.sleep(300)
+    expect(onsen.records).toHaveLength(1)
+    expect(r.state.jobs).toHaveLength(1)
+    expect(codexLog().filter(x => x.ev === 'start')).toHaveLength(1)
+    expect(r.stats.reports_retried).toBeGreaterThanOrEqual(1)
   })
 })
 
