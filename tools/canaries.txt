@@ -136,3 +136,7 @@ plugins/telegram-http/lanes.ts::note: typeof note === 'string' && note ? note : 
 plugins/telegram-http/fleet-text.ts::export const ONSEN_TEXT_FORMAT = 'Onsen 的文字預設是 markdown rich（GFM）
 plugins/telegram-http/lanes-threads.ts::export const callBody
 plugins/telegram-http/lanes-threads.ts::export const TITLE_V = 3
+plugins/telegram-http/screen-status.ts::export function publishView(v: ScreenVerdict
+plugins/telegram-http/screen-judge-jev.ts::export class JevJudge implements ScreenJudge
+plugins/telegram-http/server.ts::onsenStatusCompute = currentStatus
+plugins/telegram-http/lanes.ts::export function mainStatusChanged

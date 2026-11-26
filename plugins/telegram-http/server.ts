@@ -65,7 +65,8 @@ import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsA
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
-import { QUESTIONS_PATH_DEFAULT, ScreenStatus, snapPane } from './screen-status.ts'
+import { ScreenStatus, judgeFor, screenJudgeName, snapPane } from './screen-status.ts'
+import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
@@ -435,8 +436,8 @@ let onsenPeer: ((sid: string, req: IncomingMessage) => void) | null = null
 let onsenStatusNow: (() => unknown) | null = null
 /** WO-147 (ONSEN_WAKE_LOG): the route tap is attached (set up with step 3) */
 let onsenWakeLog = false
-/** WO-157 (Chiron 13:46Z): the main's status computed now, the one statusOf the daemon reports to Onsen (local reads, no network); null: Onsen step 3 off
- *  for this agent (no status is computed here, and the lanes keep the old path) */
+/** WO-157 (Chiron 13:46Z): the main's status computed now, the one record the daemon reports to Onsen (local reads, no network; WO-169: currentStatus(),
+ *  statusOf's view through the screen reader); null: Onsen step 3 off for this agent (no status is computed here, and the lanes keep the old path) */
 let onsenStatusCompute: (() => { state: string; detail?: Record<string, unknown> }) | null = null
 const onsenAllow = { at: 0, ids: [] as string[] }
 /** Onsen step 3: Joey's Telegram message behind these meta (a sender on the DM allowlist, a chat, a message id), or null. The allowlist is read at most
@@ -4223,7 +4224,7 @@ if (Lanes.LANES_ON) {
     return got.length === want.length && timingSafeEqual(got, want)
   }
   Lanes.lanesInit({
-    // WO-157 (Chiron 13:46Z): the one state source: statusOf computed now (what goes to Onsen); null = no status here (the lanes keep the old path)
+    // WO-157 (Chiron 13:46Z): the one state source: the status record computed now (what goes to Onsen; WO-169: currentStatus()); null = no status here
     mainStatus: () => onsenStatusCompute ? onsenStatusCompute() : null,
     role: INBOX_ONLY ? 'inbox' : 'tg',
     agent: process.env.LANES_AGENT ?? INBOX_SELF,
@@ -4409,18 +4410,21 @@ if (Lanes.LANES_ON) {
 //              main's M2 row and hook events (the tool, subagents, PreCompact, its own wall); lanes off, the transcript's turn; both, the usage-wall
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 /** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
- *  agent off needs no restart) */
-const JEV_SCREEN_PLIST = fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN
-let jevScreenFile: { at: number; v: string | undefined } = { at: -Infinity, v: undefined }
-function jevScreenValue(): string | undefined {
-  if (JEV_SCREEN_PLIST !== undefined) return JEV_SCREEN_PLIST
-  if (Date.now() - jevScreenFile.at >= 30_000) {
-    let v: string | undefined
-    try { v = parseFleetConfig(readFileSync(FLEET_CONFIG_PATH, 'utf8')).JEV_SCREEN } catch {}
-    jevScreenFile = { at: Date.now(), v }
+ *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way */
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE'
+const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
+  SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE }
+let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
+function liveSetting(k: LiveKey): string | undefined {
+  if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
+  if (Date.now() - liveFile.at >= 30_000) {
+    let v: Record<string, string> = {}
+    try { v = parseFleetConfig(readFileSync(FLEET_CONFIG_PATH, 'utf8')) } catch {}
+    liveFile = { at: Date.now(), v }
   }
-  return jevScreenFile.v
+  return liveFile.v[k]
 }
+const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 /** WO-145 point 5 (Chiron 06:04Z): one button under the status message; it stops the message in that chat and deletes it */
 const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callback_data: 'opin:off' }]] }
 /** the status pin of this daemon (null: ONSEN_STATUS_PIN off), for the button's callback */
@@ -4432,8 +4436,12 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
   // ONSEN_STATUS_HEARTBEAT_S (15 s; 0 = none), each carrying detail.heartbeat_s
   const hbS = Number(process.env.ONSEN_STATUS_HEARTBEAT_S ?? OnsenStatus.HEARTBEAT_MS / 1000)
+  // WO-169: the last report's state and since kept across a restart (Onsen keeps since while the state stays), so /healthz onsen.status shows Onsen's
+  const sinceFile = join(STATE_DIR, 'onsen', 'status-since.json')
   const status = new OnsenStatus.StatusFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordStatus(f), throttleMs: Number(process.env.ONSEN_STATUS_THROTTLE_MS ?? 1_000),
-    heartbeatMs: Number.isFinite(hbS) && hbS >= 0 ? hbS * 1000 : OnsenStatus.HEARTBEAT_MS })
+    heartbeatMs: Number.isFinite(hbS) && hbS >= 0 ? hbS * 1000 : OnsenStatus.HEARTBEAT_MS,
+    since: { load: () => { try { return JSON.parse(readFileSync(sinceFile, 'utf8')) } catch { return null } },
+      save: x => { try { mkdirSync(join(STATE_DIR, 'onsen'), { recursive: true }); writeFileSync(sinceFile, JSON.stringify(x)) } catch {} } } })
   onsenFacts = facts
   let kickTimer: ReturnType<typeof setTimeout> | null = null
   // WO-157b (status-latency-lab 「會判錯的」 8): lanes off, read the transcript before the status a change kicks (the message that began the turn is marked
@@ -4442,14 +4450,19 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-145 (ONSEN_STATUS_PIN): the same view, shown in a pinned silent message in each DM chat of an allowlisted person (onsen-visible.ts StatusPin)
   const pin = ONSEN_VISIBLE.pin ? statusPinSetup() : null
   statusPinRef = pin?.pin ?? null
-  let lastView: OnsenStatus.StatusView | null = null                  // WO-147: the agent's state a wake row carries (member_state)
-  // WO-165 A: with JEV_SCREEN on, what Onsen and the pin get is the screen reader's view (Jev's reading, or statusOf's with judged_by: program); the
-  // lanes (onsenStatusCompute) and the wake rows (lastView) keep statusOf's. A change of statusOf's view is an event: the screen is looked at at once
+  let lastView: OnsenStatus.StatusView | null = null                  // WO-169: the record last handed out (a wake row's member_state when it cannot be computed)
+  let lastEdge: string | null = null
+  // WO-169 (WO-165 A): the one status record. With JEV_SCREEN on it is the screen reader's (its verdict's record, or statusOf's with judged_by: program);
+  // off, statusOf's view untouched. Onsen, the pin, /healthz, the lanes (onsenStatusCompute: decideWake, the 此刻 line, the same-matter gate, the Esc
+  // wrap-up) and the wake rows' member_state all take this one. A change of statusOf's view is an event: the screen is looked at at once
   const feed = (v: OnsenStatus.StatusView): void => {
-    lastView = v
-    const pub = screenStatus ? screenStatus.view(v) : v
+    const pub = screenStatus ? screenStatus.view(v, true) : v
+    lastView = pub
     status.update(pub); try { pin?.show(pub) } catch (e) { log('warn', `onsen: status pin: ${e}`) }
     screenStatus?.programChanged(v)
+    // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen)
+    const edge = `${pub.state}|${pub.detail?.interrupted === true}`
+    if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
   const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
@@ -4498,7 +4511,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     if (tap && v.detail && Number(v.detail.queued_joey) > 0 && v.state !== 'idle' && v.state !== 'offline') v.detail.queued_joey = Lanes.mainQueuedJoey({ offered: false })
     return v
   }
-  onsenStatusCompute = compute                                          // WO-157: the lanes' one state source (decideWake, 此刻, the same-matter gate)
+  /** WO-169: the one status record now: statusOf's view, through the screen reader when JEV_SCREEN lists this agent */
+  const currentStatus = (): OnsenStatus.StatusView => { const v = compute(); return screenStatus ? screenStatus.view(v) : v }
+  onsenStatusCompute = currentStatus                                    // WO-157 / WO-169: the lanes' one state source (decideWake, 此刻, the same-matter gate, the Esc wrap-up)
   // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's
   // value, else the machine config's, re-read every 30 s), its TypeSafe key and Chiron's questions file (JCS screen-status/questions.json): Jev reads the
   // bottom of the main's pane and its reading is reported. One look a second (JEV_SCREEN_POLL_MS) and at each change of statusOf's view; Jev only when the
@@ -4507,13 +4522,26 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   if (ownPane) {
     const lanesDir = process.env.LANES_DIR ?? join(AGENT_WORKSPACE_DIR, '.lanes')
     const envMs = (k: string, d: number): number => { const n = Number(process.env[k]); return process.env[k] && Number.isFinite(n) && n > 0 ? n : d }
-    screenStatus = new ScreenStatus({ agent: ONSEN_AGENT, lanesDir, switchOn: () => switchOn(jevScreenValue(), ONSEN_AGENT), hasKey: () => !!jevKey(),
-      questionsPath: (process.env.JEV_SCREEN_QUESTIONS ?? '').trim() || QUESTIONS_PATH_DEFAULT(homedir()), snap: () => snapPane(ownPane),
-      isClaude: cmd => isClaudeCmd(cmd, new Set(dutyOfficer?.config().claude_cmds ?? [])), program: () => compute(),
-      publish: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } },
+    // WO-169: the judging step is a ScreenJudge; SCREEN_JUDGE picks it (jev: JevJudge, Jev asked and its answer collected into a ScreenVerdict |
+    // program: none yet, statusOf's view judged_by program). Jev's own shapes stay inside JevJudge and its logs
+    const jev = new JevJudge({ agent: ONSEN_AGENT, lanesDir, hasKey: () => !!jevKey(),
+      questionsPath: (process.env.JEV_SCREEN_QUESTIONS ?? '').trim() || QUESTIONS_PATH_DEFAULT(homedir()),
       ask: (state, questions, timeoutMs, model) => jevAsk(state, questions, 'kbro-screen-status/1', timeoutMs, undefined, model),
-      logCall: rec => jevLog(lanesDir, rec), log: (lv, m) => log(lv, m) },
-      { pollMs: envMs('JEV_SCREEN_POLL_MS', 1000), timeoutMs: envMs('JEV_SCREEN_TIMEOUT_MS', 3000), maxPerMin: envMs('JEV_SCREEN_MAX_PER_MIN', 20) })
+      logCall: rec => jevLog(lanesDir, rec), log: (lv, m) => log(lv, m), program: () => compute(),
+      published: p => screenStatus ? screenStatus.view(p) : p, holds: (h, v) => !!screenStatus?.holds(h, v) },
+      { timeoutMs: envMs('JEV_SCREEN_TIMEOUT_MS', 3000) })
+    let judgeWarned = ''
+    screenStatus = new ScreenStatus({ agent: ONSEN_AGENT, lanesDir, switchOn: () => switchOn(jevScreenValue(), ONSEN_AGENT),
+      judge: () => {
+        const n = screenJudgeName(liveSetting('SCREEN_JUDGE'))
+        if (n.unknown && n.unknown !== judgeWarned) { judgeWarned = n.unknown; log('warn', `screen-status: SCREEN_JUDGE=${n.unknown} names no judge (jev | program): jev`) }
+        return judgeFor(n.name, { jev, program: null })
+      },
+      judgeSetting: () => liveSetting('SCREEN_JUDGE') ?? 'jev',
+      snap: () => snapPane(ownPane), isClaude: cmd => isClaudeCmd(cmd, new Set(dutyOfficer?.config().claude_cmds ?? [])), program: () => compute(),
+      publish: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, log: (lv, m) => log(lv, m) },
+      { pollMs: envMs('JEV_SCREEN_POLL_MS', 1000), maxPerMin: envMs('JEV_SCREEN_MAX_PER_MIN', 20) })
+    screenStatus.active()                                               // the switch and the judge known before the first record (the first look is jittered)
     screenStatus.start()
   }
   registry.start()
@@ -4540,9 +4568,11 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     const boot = randomBytes(3).toString('hex')
     let seq = 0, warnAt = 0
     const warn = (e: unknown): void => { if (Date.now() - warnAt > 3600_000) { warnAt = Date.now(); log('warn', `onsen: wake row dropped (${e instanceof Error ? e.message : e}); routing unchanged`) } }
+    /** WO-169: a wake row's member_state is the status record at that moment (the one decideWake read), else the one last handed out */
+    const recordNow = (): OnsenStatus.StatusView | null => { try { return currentStatus() } catch { return lastView } }
     Lanes.observeRoutes((row, ctx) => {
       const now = Date.now(), at = new Date(now).toISOString(), n = ++seq
-      const memberState = OnsenWake.memberStateOf(lastView, ctx.main)
+      const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
       queueMicrotask(() => {
         try {
           const ok = onsen.recordWake(OnsenWake.wakeItem(row, { ...ctx, did: ctx.did() }, { agent: ONSEN_AGENT, host, at, idem: OnsenWake.idemWake(ONSEN_AGENT, boot, n, now), memberState }))
@@ -4554,7 +4584,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // event-keyed wake line of the state journal (onsen-wake.ts handItem; at = the line's ts)
     Lanes.observeWakes((line, ctx) => {
       const now = Date.now(), n = ++seq
-      const memberState = OnsenWake.memberStateOf(lastView, ctx.main)
+      const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
       queueMicrotask(() => {
         try {
           const ok = onsen.recordWake(OnsenWake.handItem(line, ctx, { agent: ONSEN_AGENT, host, idem: OnsenWake.idemWake(ONSEN_AGENT, boot, n, now), memberState }))

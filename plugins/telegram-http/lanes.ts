@@ -164,8 +164,10 @@ type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
 
 export interface LanesDeps {
   role: 'tg' | 'inbox'
-  /** WO-157 (Chiron 13:46Z): the main's status now: statusOf, the one value the daemon reports to Onsen, computed locally (no network). The one state
-   *  source of decideWake, the 此刻 line and the same-matter gate; null = no status here (Onsen step 3 off): the old path decides */
+  /** WO-157 (Chiron 13:46Z): the main's status now, the one value the daemon reports to Onsen, computed locally (no network; WO-169: the status record,
+   *  server.ts currentStatus(): the screen judge's verdict composed with statusOf's facts, or statusOf's view). The one state source of decideWake, the
+   *  此刻 line, the same-matter gate, the Esc wrap-up (and, in server.ts, the wake rows' member_state); null = no status here (Onsen step 3 off): the
+   *  old path decides */
   mainStatus?: () => { state: string; detail?: Record<string, unknown> } | null
   agent: string
   workspaceDir: string
@@ -1577,19 +1579,25 @@ function kindRoster(): string[] {
   try { names = D?.registryNames?.() ?? [] } catch {}
   return D?.agent && !names.includes(D.agent) ? [...names, D.agent] : names
 }
-/** WO-157b (Chiron status-latency-lab 「會判錯的」 3; fleet-wide, not behind LANES_WAKE_DECIDE): M2 keeps a turn open when no Stop comes (Esc). statusOf is read
- *  every 2 s; idle twice, MAIN_IDLE_CONFIRM_MS apart, with no hook event between: M1 closes the turn as interrupted and the held items are offered. The
- *  status tap is told as if a final Stop came (its turn edges and tool) */
+/** WO-157b (Chiron status-latency-lab 「會判錯的」 3; fleet-wide, not behind LANES_WAKE_DECIDE): M2 keeps a turn open when no Stop comes (Esc). The status
+ *  record is read every 2 s (WO-169: and at each change of it); idle twice, MAIN_IDLE_CONFIRM_MS apart, with no hook event between: M1 closes the turn as
+ *  interrupted and the held items are offered. WO-169: a record that says idle and interrupted (the screen shows the turn cut) since after the turn's
+ *  last hook event closes it at once. The status tap is told as if a final Stop came (its turn edges and tool) */
+let interruptedSince: number | null = null
 function idleCheck(): void {
   if (D?.role !== 'tg' || !main) return
   try {
     const v = mainStatusNow()
     if (!v) return
+    const intr = v.state === 'idle' && (v.detail as Record<string, unknown> | undefined)?.interrupted === true
+    interruptedSince = intr ? interruptedSince ?? Date.now() : null
     const g = main.currentGen()
-    if (main.statusIdle(v.state === 'idle') && g) { try { onsenTap?.mainEvent?.({ event: 'Stop', phase: 'final', pid: Number(g.pid), interrupted: true }) } catch {} }
+    if (main.statusIdle(v.state === 'idle', Date.now(), interruptedSince) && g) { try { onsenTap?.mainEvent?.({ event: 'Stop', phase: 'final', pid: Number(g.pid), interrupted: true }) } catch {} }
   } catch (e) { D.log('warn', `lanes: idle check: ${e}`) }
 }
-/** WO-157 (Chiron 13:46Z): the main's status now (statusOf through server.ts), or null when this daemon computes none */
+/** WO-169: the status record changed (server.ts, at each record it hands out whose state or interruption differs): the Esc wrap-up reads it now */
+export function mainStatusChanged(): void { idleCheck() }
+/** WO-157 (Chiron 13:46Z): the main's status now (WO-169: the status record, server.ts currentStatus()), or null when this daemon computes none */
 function mainStatusNow(): { state: string; detail?: Record<string, unknown> } | null {
   try { return D?.mainStatus?.() ?? null } catch { return null }
 }

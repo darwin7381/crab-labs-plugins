@@ -5,7 +5,8 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MAPPED, ScreenStatus, answerExceptions, decide, parseQuestions, publishView, readAnswers, regionParts, regions, screenHash, type JevAnswer, type ScreenDeps } from './screen-status.ts'
+import { ScreenStatus, VERDICT_MENUS, VERDICT_STATES, programView, publishView, regionParts, regions, screenHash, type ScreenDeps, type ScreenVerdict } from './screen-status.ts'
+import { JevJudge, answerExceptions, decide, parseQuestions, readAnswers, verdictOf, type JevAnswer, type JevJudgeDeps } from './screen-judge-jev.ts'
 import { jevAsk } from './lanes-triage.ts'
 import type { StatusView } from './onsen-status.ts'
 
@@ -157,38 +158,42 @@ describe('questions file', () => {
     expect(parseQuestions(JSON.stringify({ ...good, publish_when_state_probability_at_least: 7 }), '/x')!.threshold).toBe(0.6)
   })
   const jcs = join(homedir(), 'Development', 'Joey-Crablabs-Skills', 'screen-status', 'questions.json')
-  test.skipIf(!existsSync(jcs))("the JCS file parses, and every state option it has but this program does not map is one Chiron can see as an exception", () => {
+  test.skipIf(!existsSync(jcs))("the JCS file parses; every verdict state and menu is one of its options (an option it has that the lists do not is an exception)", () => {
     const q = parseQuestions(readFileSync(jcs, 'utf8'), jcs)!
     expect(q).not.toBeNull()
-    const opts = Object.keys(q.questions.state.criteria)
-    for (const m of MAPPED) expect(opts).toContain(m)
+    const opts = Object.keys(q.questions.state.criteria), menus = Object.keys(q.questions.menu.criteria)
+    for (const m of VERDICT_STATES) expect(opts).toContain(m)
+    for (const m of VERDICT_MENUS) expect(menus).toContain(m)
   })
 })
 
 const prog = (state: StatusView['state'], detail: Record<string, unknown> = {}): StatusView => ({ state, detail: { queued_joey: 0, ...detail }, last_activity_at: '2026-11-26T00:00:00.000Z' })
 const ans = (state: string, p = 0.9, menu = 'none', fits = 0.9) => readAnswers({ state: { choice: state, confidence: p, probabilities: { [state]: p } }, fits_any: { noul: fits },
   menu: { choice: menu, probabilities: { [menu]: 0.8 } } })
-describe('publish mapping (point 5)', () => {
+const V = (state: ScreenVerdict['state'], p = 0.9, menu: ScreenVerdict['menu'] = 'none', by: ScreenVerdict['by'] = 'jev'): ScreenVerdict => ({ state, menu, p, by })
+describe('publish mapping (point 5; WO-169: from a ScreenVerdict)', () => {
   const st = regions(BG_AGENTS())
   test('each state', () => {
     const turn = { turn_started_at: '2026-11-26T00:00:01.000Z', tool: { name: 'Bash', since: '2026-11-26T00:00:02.000Z' }, subagents: 0 }
-    expect(publishView(ans('working', 0.91), st, prog('busy', turn))).toEqual({ state: 'busy', detail: { turn_started_at: turn.turn_started_at, tool: turn.tool, subagents: 2,
+    expect(publishView(V('working', 0.91), st, prog('busy', turn))).toEqual({ state: 'busy', detail: { turn_started_at: turn.turn_started_at, tool: turn.tool, subagents: 2,
       queued_joey: 0, judged_by: 'jev', judge_p: 0.91 }, last_activity_at: '2026-11-26T00:00:00.000Z' })
-    expect(publishView(ans('working'), st, prog('idle')).detail).toEqual({ subagents: 2, queued_joey: 0, judged_by: 'jev', judge_p: 0.9 })
-    expect(publishView(ans('idle'), st, prog('busy', turn))).toMatchObject({ state: 'idle', detail: { queued_joey: 0, judged_by: 'jev' } })
-    expect(publishView(ans('idle'), st, prog('busy', turn)).detail).not.toHaveProperty('tool')
-    expect(publishView(ans('idle_background_running'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { background: { agents: 2, shells: 1, monitors: 0, tasks: 0 } } })
-    expect(publishView(ans('idle_background_running'), regions(BG_TASKS), prog('idle')).detail!.background).toEqual({ agents: 1, shells: 0, monitors: 0, tasks: 2 })
-    expect(publishView(ans('waiting_for_human', 0.8, 'model_picker'), regions(MENU()), prog('waiting', { waitingFor: 'dialog open' }))).toMatchObject({ state: 'waiting', detail: { waitingFor: 'model_picker', judged_by: 'jev' } })
-    const other = publishView(ans('waiting_for_human', 0.8, 'other'), regions(MENU()), prog('waiting'))
+    expect(publishView(V('working'), st, prog('idle')).detail).toEqual({ subagents: 2, queued_joey: 0, judged_by: 'jev', judge_p: 0.9 })
+    expect(publishView(V('idle'), st, prog('busy', turn))).toMatchObject({ state: 'idle', detail: { queued_joey: 0, judged_by: 'jev' } })
+    expect(publishView(V('idle'), st, prog('busy', turn)).detail).not.toHaveProperty('tool')
+    expect(publishView(V('idle_background_running'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { background: { agents: 2, shells: 1, monitors: 0, tasks: 0 } } })
+    expect(publishView(V('idle_background_running'), regions(BG_TASKS), prog('idle')).detail!.background).toEqual({ agents: 1, shells: 0, monitors: 0, tasks: 2 })
+    expect(publishView(V('waiting_for_human', 0.8, 'model_picker'), regions(MENU()), prog('waiting', { waitingFor: 'dialog open' }))).toMatchObject({ state: 'waiting', detail: { waitingFor: 'model_picker', judged_by: 'jev' } })
+    const other = publishView(V('waiting_for_human', 0.8, 'other'), regions(MENU()), prog('waiting'))
     expect(other.detail!.waitingFor).toBe('other'); expect(String(other.detail!.waiting_text)).toContain('Select model')
-    expect(publishView(ans('interrupted'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { interrupted: true } })
-    expect(publishView(ans('usage_limit'), st, prog('busy', { walled: { until: '2026-11-26T03:00:00.000Z', kind: 'session' } })))
+    expect(publishView(V('interrupted'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { interrupted: true } })
+    expect(publishView(V('usage_limit'), st, prog('busy', { walled: { until: '2026-11-26T03:00:00.000Z', kind: 'session' } })))
       .toMatchObject({ state: 'walled', detail: { walled: { until: '2026-11-26T03:00:00.000Z', kind: 'session' }, judged_by: 'jev' } })
-    expect(publishView(ans('usage_limit'), st, prog('idle'))).toMatchObject({ state: 'walled', detail: { walled: { until: null } } })
-    expect(publishView(ans('compacting'), st, prog('busy'))).toMatchObject({ state: 'busy', detail: { compacting: true } })
-    expect(publishView(ans('starting'), st, prog('offline'))).toMatchObject({ state: 'starting', detail: { judged_by: 'jev' } })
-    expect(publishView(ans('not_claude'), st, prog('idle'))).toMatchObject({ state: 'idle', detail: { judged_by: 'program' } })
+    expect(publishView(V('usage_limit'), st, prog('idle'))).toMatchObject({ state: 'walled', detail: { walled: { until: null } } })
+    expect(publishView(V('compacting'), st, prog('busy'))).toMatchObject({ state: 'busy', detail: { compacting: true } })
+    expect(publishView(V('starting'), st, prog('offline'))).toMatchObject({ state: 'starting', detail: { judged_by: 'jev' } })
+    // an option no list has is no verdict (JevJudge's collection): the record is statusOf's
+    expect(verdictOf(ans('not_claude'), 0.6)).toBeNull()
+    expect(programView(prog('idle'))).toMatchObject({ state: 'idle', detail: { judged_by: 'program' } })
   })
 })
 
@@ -210,7 +215,7 @@ describe('exceptions an answer shows by itself (point 6)', () => {
     const d = decide(readAnswers({ state: { choice: 'starting', probabilities: { starting: 0.7 } }, menu: { choice: 'resume_picker', probabilities: { resume_picker: 0.8 } }, fits_any: { noul: 0.9 } }), rule)
     expect(d).toMatchObject({ state: 'waiting_for_human', p: 0.8, menu: 'resume_picker', by_menu: { state: 'starting', p: 0.7 } })
     expect(answerExceptions(d, regions(MENU()), 0.6)).toEqual(['menu_overrode_state:starting'])
-    expect(publishView(d, regions(MENU()), prog('idle'))).toMatchObject({ state: 'waiting', detail: { waitingFor: 'resume_picker', judge_p: 0.8 } })
+    expect(publishView(verdictOf(d, 0.6)!, regions(MENU()), prog('idle'))).toMatchObject({ state: 'waiting', detail: { waitingFor: 'resume_picker', judge_p: 0.8 } })
     const low = readAnswers({ state: { choice: 'idle', probabilities: { idle: 0.9 } }, menu: { choice: 'model_picker', probabilities: { model_picker: 0.5 } } })
     expect(decide(low, rule).state).toBe('idle')
     const none = readAnswers({ state: { choice: 'idle', probabilities: { idle: 0.9 } }, menu: { choice: 'none', probabilities: { none: 0.99 } } })
@@ -219,29 +224,35 @@ describe('exceptions an answer shows by itself (point 6)', () => {
   })
 })
 
-// ------------------------------------------------------------------ the reader, with fakes
-type Rig = { s: ScreenStatus; calls: Array<{ state: any; model: string | null }>; logs: any[]; published: number; dir: string
-  pane: { text: string; cmd: string }; program: StatusView; resolve: Array<(a: JevAnswer) => void>; exceptions: () => any[]; deps: ScreenDeps }
-function rig(o: { answer?: (state: any) => JevAnswer | null; opts?: Record<string, number>; switchOn?: () => boolean; questions?: string | null } = {}): Rig {
+// ------------------------------------------------------------------ the reader, with fakes (WO-169: the reader with a JevJudge)
+type Rig = { s: ScreenStatus; judge: JevJudge; calls: Array<{ state: any; model: string | null }>; logs: any[]; published: number; dir: string
+  pane: { text: string; cmd: string }; program: StatusView; resolve: Array<(a: JevAnswer) => void>; exceptions: () => any[]; deps: ScreenDeps; jdeps: JevJudgeDeps }
+function rig(o: { answer?: (state: any) => JevAnswer | null; opts?: Record<string, any>; switchOn?: () => boolean; questions?: string | null } = {}): Rig {
   const dir = mkdtempSync(join(tmpdir(), 'screen-status-'))
   const qp = join(dir, 'questions.json')
   if (o.questions !== null) writeFileSync(qp, o.questions ?? JSON.stringify({
     version: 1, model: 'jev-1.14.0', setting: 'S', publish_when_state_probability_at_least: 0.6,
     questions: { state: { type: 'choice', instructions: 'x', criteria: { working: 'a', idle: 'b', other: 'c' } }, fits_any: { type: 'noul', instructions: 'y' },
       menu: { type: 'choice', instructions: 'z', criteria: { none: 'n', other: 'o' } } } }))
-  const r: Rig = { s: null as any, calls: [], logs: [], published: 0, dir, pane: { text: IDLE, cmd: '2.1.322' }, program: prog('idle'), resolve: [], deps: null as any,
+  const r: Rig = { s: null as any, judge: null as any, calls: [], logs: [], published: 0, dir, pane: { text: IDLE, cmd: '2.1.322' }, program: prog('idle'), resolve: [],
+    deps: null as any, jdeps: null as any,
     exceptions: () => { try { return readFileSync(join(dir, 'run', 'screen-exceptions.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } } }
-  r.deps = {
-    agent: 'lab-test', lanesDir: dir, switchOn: o.switchOn ?? (() => true), hasKey: () => true, questionsPath: qp,
-    snap: async () => ({ cmd: r.pane.cmd, pane: r.pane.text }), isClaude: c => c !== 'zsh', program: () => r.program, publish: () => { r.published++ },
+  r.jdeps = {
+    agent: 'lab-test', lanesDir: dir, hasKey: () => true, questionsPath: qp,
     ask: (state, _q, _t, model) => {
       r.calls.push({ state, model })
       const a = o.answer?.(state)
       return a ? Promise.resolve(a) : new Promise(res => r.resolve.push(res))
     },
-    logCall: rec => r.logs.push(rec), log: () => {},
+    logCall: rec => r.logs.push(rec), log: () => {}, program: () => r.program, published: p => r.s.view(p), holds: (h, v) => r.s.holds(h, v),
   }
-  r.s = new ScreenStatus(r.deps, { settleMs: 5, retryMs: 30, backoffMs: 50, ...(o.opts ?? {}) })
+  const { settleMs = 5, backoffMs = 50, ...ropts } = o.opts ?? {}
+  r.judge = new JevJudge(r.jdeps, { settleMs, backoffMs })
+  r.deps = {
+    agent: 'lab-test', lanesDir: dir, switchOn: o.switchOn ?? (() => true), judge: () => r.judge,
+    snap: async () => ({ cmd: r.pane.cmd, pane: r.pane.text }), isClaude: c => c !== 'zsh', program: () => r.program, publish: () => { r.published++ }, log: () => {},
+  }
+  r.s = new ScreenStatus(r.deps, { retryMs: 30, ...ropts })
   return r
 }
 const jevIdle = (p = 0.9): JevAnswer => ({ answers: { state: { choice: 'idle', confidence: p, probabilities: { idle: p, working: 1 - p } }, fits_any: { noul: 0.95 },

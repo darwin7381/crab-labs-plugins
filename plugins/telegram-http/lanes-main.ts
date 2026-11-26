@@ -609,14 +609,21 @@ export function createMain(E: MainEnv) {
   /** WO-157b: the main's statusOf as the daemon reads it now (idle: true when its state is idle). Two readings at least MAIN_IDLE_CONFIRM_MS apart that
    *  both say idle while M2 holds the turn open, and no hook event of the gen between them: the turn ended without a Stop (Esc). It is closed as
    *  interrupted (cutTurn, as beginTurn does for a turn that never got Stop or StopFailure), M2 goes idle, the items that came in meanwhile are offered
-   *  and the cut ones ride with the next delivery (WO-157c). Returns true when it closed a turn. */
+   *  and the cut ones ride with the next delivery (WO-157c). Returns true when it closed a turn.
+   *  WO-169: `interruptedAt` (ms): since when the status record has said the screen shows this turn interrupted (the judge read 「Interrupted · What
+   *  should Claude do instead?」). Seen after the gen's last hook event, it is the evidence the second reading waits for: the turn is closed at once. Seen
+   *  before it (a record not yet re-judged after a new turn began), it is not: the two readings as above */
   let idleSeen: { gen: string; at: number; ev: number } | null = null
-  function statusIdle(isIdle: boolean, now = Date.now()): boolean {
+  function statusIdle(isIdle: boolean, now = Date.now(), interruptedAt: number | null = null): boolean {
     const g = currentGen()
     if (!g || g.state !== 'in_turn' || !isIdle) { idleSeen = null; return false }
     const ev = lastEventAt.get(g.id) ?? 0
-    if (!idleSeen || idleSeen.gen !== g.id || idleSeen.ev !== ev) { idleSeen = { gen: g.id, at: now, ev }; return false }
-    if (now - idleSeen.at < MAIN_IDLE_CONFIRM_MS) return false
+    const seen = interruptedAt != null && interruptedAt > ev
+    if (seen) idleSeen = { gen: g.id, at: now, ev }
+    else {
+      if (!idleSeen || idleSeen.gen !== g.id || idleSeen.ev !== ev) { idleSeen = { gen: g.id, at: now, ev }; return false }
+      if (now - idleSeen.at < MAIN_IDLE_CONFIRM_MS) return false
+    }
     const heldS = Math.round((now - idleSeen.at) / 1000)
     idleSeen = null
     const back = cutTurn(g).filter(r => owed(r))
@@ -624,7 +631,7 @@ export function createMain(E: MainEnv) {
     setMain(g, 'idle', { prompt_id: null, tool_open: null, stopped_prompt: null })
     // WO-157c (Chiron 15:25Z, 1): the cut items are held, not offered on their own (1.55.1 offered them and the main began again 4 s after Esc); what
     // came in during the turn and never reached the conversation is offered now, with them riding
-    E.log('info', `lanes: main gen ${g.id}: its turn ended without a Stop (statusOf idle for ${heldS} s, no hook event): closed as interrupted, ${back.length} item(s) held to ride the next delivery`)
+    E.log('info', `lanes: main gen ${g.id}: its turn ended without a Stop (${seen ? 'the status record shows it interrupted' : `statusOf idle for ${heldS} s`}, no hook event): closed as interrupted, ${back.length} item(s) held to ride the next delivery`)
     void pump()
     return true
   }

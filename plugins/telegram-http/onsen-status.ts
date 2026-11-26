@@ -223,10 +223,15 @@ export class StatusFacts {
   /** the last view handed in, and when: the heartbeat repeats it only while it is fresh (a compute loop that stopped is not reported as alive) */
   private latest: { v: StatusView; ms: number } | null = null
   private stopped = false
+  /** WO-169: the last report as Onsen keeps it (member_status_now): its state, at, detail as sent, since (the at of the first report of this state),
+   *  last_activity_at (the newest one any report carried) */
+  private sent: { state: StatusState; at: string; since: string; detail: Record<string, unknown>; last_activity_at: string | null } | null = null
   /** throttleMs: last_activity_at alone moving is written at most this often (default 1 s); heartbeatMs: the longest gap between two reports (default
    *  HEARTBEAT_MS; 0 = no heartbeat, no heartbeat_s); freshMs: the heartbeat repeats the latest view only if it was handed in within the larger of
-   *  this (default 5 s; the daemon computes one every 2 s) and heartbeatMs */
-  constructor(readonly o: { agent: string; sink: (f: StatusFact) => void; throttleMs?: number; heartbeatMs?: number; freshMs?: number; now?: Now }) {}
+   *  this (default 5 s; the daemon computes one every 2 s) and heartbeatMs; since (WO-169): where the last report's state and since are kept across a
+   *  restart (a first report in the same state keeps that since, as Onsen does) */
+  constructor(readonly o: { agent: string; sink: (f: StatusFact) => void; throttleMs?: number; heartbeatMs?: number; freshMs?: number; now?: Now
+    since?: { load(): { state?: unknown; since?: unknown } | null; save(x: { state: string; since: string }): void } }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   private get beatMs(): number { const n = Number(this.o.heartbeatMs ?? HEARTBEAT_MS); return Number.isFinite(n) && n > 0 ? n : 0 }
   /** the status as the daemon sees it now. WO-162 (2): a new state or any change of the detail (a tool starting or ending, waitingFor, dialog_open, a
@@ -256,7 +261,16 @@ export class StatusFacts {
     const detail = beat ? { ...(v.detail ?? {}), heartbeat_s: beat / 1000 } : v.detail
     try { this.o.sink({ idem_key: idemStatus(this.o.agent, ms, v.state), agent: this.o.agent, state: v.state, at: iso(ms), ...(detail ? { detail } : {}),
       last_activity_at: v.last_activity_at ?? null }) } catch {}
+    this.noteSent(v, ms, detail)
     this.arm()
+  }
+  private noteSent(v: StatusView, ms: number, detail: Record<string, unknown> | undefined): void {
+    let prev: { state?: unknown; since?: unknown } | null = this.sent
+    if (!prev) { try { prev = this.o.since?.load() ?? null } catch { prev = null } }
+    const keep = !!prev && prev.state === v.state && typeof prev.since === 'string' && !Number.isNaN(Date.parse(prev.since))
+    const since = keep ? String(prev!.since) : iso(ms)
+    this.sent = { state: v.state, at: iso(ms), since, detail: detail ?? {}, last_activity_at: v.last_activity_at ?? this.sent?.last_activity_at ?? null }
+    if (!keep) { try { this.o.since?.save({ state: v.state, since }) } catch {} }
   }
   /** the heartbeat: heartbeatMs after the last report, the latest view again, if one was handed in within that time; otherwise nothing (the next
    *  update() reports at once, the beat being overdue) */
@@ -272,7 +286,10 @@ export class StatusFacts {
     }, beat)
     ;(this.beat as any).unref?.()
   }
-  current(): { state: StatusState; at: string } | null { return this.last ? { state: this.last.state, at: iso(this.last.ms) } : null }
+  /** WO-169: the last report as Onsen holds it (/status: state, since, at, detail, last_activity_at) */
+  current(): { state: StatusState; at: string; since: string; detail: Record<string, unknown>; last_activity_at: string | null } | null {
+    return this.sent ? { ...this.sent, detail: { ...this.sent.detail } } : null
+  }
   stop(): void {
     this.stopped = true
     if (this.timer) clearTimeout(this.timer); this.timer = null; this.pending = null
