@@ -106,6 +106,16 @@ export function regionParts(text: string): Parts {
 }
 /** the state Chiron's script hands to Jev for one screen (jev_screen.py regions()) */
 export const regions = (text: string): Regions => regionParts(text).st
+/** WO-177 (Chiron 03:41Z, ③ and ⑤): what the program's own cut says about work on the screen, the one reading of found_by_program's activity facts.
+ *  busy: a live activity line with no finished marker after it, a "Running…" line, or "esc to interrupt"; compacting: that live activity line says
+ *  Compacting. On Chiron's 64 labelled screens (screen-eval, regions-v7.json) the 6 working and 2 compacting ones have them, the 56 others (idle,
+ *  background running, interrupted, usage limit, waiting, a shell) none. Read by JevJudge (a working / compacting verdict needs them: contradiction) and by
+ *  the record when there is no verdict (recordView: busy, judged_by program) */
+export function screenActivity(st: Pick<Regions, 'found_by_program'>): { busy: boolean; compacting: boolean } {
+  const f = st.found_by_program
+  const live = !!f.live_activity_line && !f.finished_marker_comes_after_it
+  return { busy: live || f.tool_running_line || f.esc_to_interrupt, compacting: live && /Compacting/i.test(f.live_activity_line ?? '') }
+}
 
 // ------------------------------------------------------------------ the hash: what can change the answer
 const digits = (s: string): string => s.replace(/\d+(?:[.,:]\d+)*/g, '#')
@@ -283,7 +293,8 @@ const actionOf = (f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): strin
  *  verdict says so, or statusOf's wall) → waiting (a menu) → compacting → stuck (the verdict says working and statusOf counted the turn silent past
  *  its threshold: stuck stays, with the turn's start and tool) → busy → idle. No verdict: past offline and starting, statusOf's view as it is. The
  *  program's own detail stays: queued_joey, the wall, lane runs, the reason statusOf has for an offline the screen contradicts (a session this daemon
- *  has no stream with, one still registering). detail.judged_by = verdict.by (program: no verdict) and judge_p = verdict.p are labels: nothing
+ *  has no stream with, one still registering). WO-177 ⑤: no judge's verdict but a screen that shows work: the program's own (programVerdict: working or
+ *  compacting, judged_by program, judge_p 1). detail.judged_by = verdict.by (program: no verdict) and judge_p = verdict.p are labels: nothing
  *  downstream decides by them.
  *  The same call gives the observation (CONTRACT v1 §3; Chiron's table, WO-169 00:29Z) from the same inputs: presence, lifecycle, the main's session
  *  (its activity, turn and trigger, doing, blockers, last turn), one session per running lane, the screen's background counts, the queue, the evidence */
@@ -295,8 +306,15 @@ export function composeRecord(v: ScreenVerdict | null, st: Regions | null, prog:
 export function publishView(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts = {}): StatusView {
   return composeRecord(v, st, prog, f).view
 }
-function recordView(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts): StatusView {
+/** WO-177 ⑤ (Chiron 03:41Z): the program's own verdict when no judge's is there: working, or compacting, on an activity fact of the screen
+ *  (screenActivity), else none. It goes the same way as a judge's (the order below), so the record holds items and turn_end the same with Jev up or down */
+export function programVerdict(st: Regions): ScreenVerdict | null {
+  const a = screenActivity(st)
+  return a.busy ? { state: a.compacting ? 'compacting' : 'working', menu: 'none', p: 1, by: 'program' } : null
+}
+function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts): StatusView {
   if (gone(prog)) return programView(prog)
+  const v = judged ?? (st ? programVerdict(st) : null)
   const pd = (prog.detail ?? {}) as Record<string, any>
   const registering = prog.state === 'offline' && pd.reason === 'no_registration' && (!!v || f.alive === true)
   const base = { ...pick(pd, ['queued_joey', 'walled', 'lanes']), ...(prog.state === 'offline' ? { program_offline: pd.reason ?? null } : {}) }
@@ -338,7 +356,14 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
     const s: ObsSession = { id: mainId, kind: 'main', thread_id: null, activity: 'unknown', activity_since: null, turn: null, doing: null, blockers: [], last_turn: f.last_turn ?? null }
     if (s.last_turn && vd.interrupted === true && s.last_turn.outcome === 'done') s.last_turn = { ...s.last_turn, outcome: 'interrupted' }   // the screen shows the cut
     if (presence === 'online') {
-      const t = f.turn ?? null
+      // WO-177 (Chiron 04:01Z item 1; status_v1_check.py 03:59Z: online, an activity is never unknown): a record that says the main works (busy, a
+      // compaction, stuck) with no turn the program has open (a compaction while idle: only PreCompact fires; a turn a Stop hook sent back) is a turn of
+      // its own: started when statusOf says the turn began (turn_started_at), else when the record turned so; id turn-<ms> (the daemon's form for a turn
+      // known by its start, as TurnWatch's); trigger other
+      const works = view.state === 'busy' || view.state === 'stuck'
+      const workAt = since('main.work', works ? 'work' : 'none')                     // one turn through busy → compacting → busy (lab 04:08:49Z)
+      const startMs = typeof vd.turn_started_at === 'string' && !Number.isNaN(Date.parse(vd.turn_started_at)) ? Date.parse(vd.turn_started_at) : Date.parse(workAt)
+      const t = f.turn ?? (works ? { id: `turn-${startMs}`, started_at: isoMs(startMs), trigger: { kind: 'other' as const } } : null)
       const menu: Exclude<VerdictMenu, 'none'> | null = view.state === 'waiting' ? (v?.state === 'waiting_for_human' ? (v.menu === 'none' ? null : v.menu) : registryMenu(vd.waitingFor))
         : view.state === 'idle' && vd.dialog_open === true ? 'other' : null                 // statusOf: a dialog open outside a turn
       const block = (reason: BlockerReason, menu_kind: Exclude<VerdictMenu, 'none'> | null, until: string | null = null): Blocker => {
@@ -362,9 +387,12 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
       if (s.activity === 'running' || s.activity === 'paused' || s.activity === 'stuck') { s.turn = t; s.thread_id = f.turn_thread ?? (t?.trigger.kind === 'thread' ? t.trigger.thread_id : null) }
       if (s.activity === 'running') {
         const tool = vd.tool && typeof vd.tool === 'object' && vd.tool.name ? vd.tool : null
-        s.doing = vd.compacting === true ? { kind: 'compacting', tool: null, since: since('main.doing', `compacting|${t!.id}`) }
-          : tool ? { kind: 'tool', tool: String(tool.name), since: typeof tool.since === 'string' ? tool.since : since('main.doing', `tool|${tool.name}|${t!.id}`) }
-          : { kind: 'thinking', tool: null, since: since('main.doing', `thinking|${t!.id}`) }
+        // WO-177 (Chiron 04:01Z item 2): the doing's since is when THIS doing began. The tool branch took statusOf's tool.since and left the memory at the
+        // thinking before it, so the thinking after the tool came back with the turn's start: every doing now goes through the one memory
+        const at = since('main.doing', vd.compacting === true ? `compacting|${t!.id}` : tool ? `tool|${tool.name}|${t!.id}` : `thinking|${t!.id}`)
+        s.doing = vd.compacting === true ? { kind: 'compacting', tool: null, since: at }
+          : tool ? { kind: 'tool', tool: String(tool.name), since: typeof tool.since === 'string' ? tool.since : at }
+          : { kind: 'thinking', tool: null, since: at }
       }
       if (s.activity === 'unknown' || s.activity === 'idle') s.blockers = s.activity === 'idle' ? s.blockers : []
       s.activity_since = since('main.activity', s.activity)
@@ -381,7 +409,8 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
     const tool = l.tool && typeof l.tool === 'object' && typeof l.tool.name === 'string' && l.tool.name ? l.tool as { name: string; since?: unknown } : null
     sessions.push(presence === 'online'
       ? { id: String(l.id), kind: 'lane', thread_id: thread, activity: 'running', activity_since: at, turn: { id: String(l.run ?? l.id), started_at: at, trigger },
-          doing: tool ? { kind: 'tool', tool: tool.name, since: typeof tool.since === 'string' ? tool.since : at } : { kind: 'thinking', tool: null, since: at }, blockers: [], last_turn: null }
+          doing: tool ? { kind: 'tool', tool: tool.name, since: typeof tool.since === 'string' ? tool.since : at }
+            : { kind: 'thinking', tool: null, since: typeof l.thinking_since === 'string' ? l.thinking_since : at }, blockers: [], last_turn: null }   // WO-177: thinking since its last tool came back
       : { id: String(l.id), kind: 'lane', thread_id: thread, activity: 'unknown', activity_since: null, turn: null, doing: null, blockers: [], last_turn: null })
   }
   const c = st?.counted_by_program
@@ -481,7 +510,8 @@ export class ScreenStatus {
   private firstTimer: ReturnType<typeof setTimeout> | null = null
   private pokes = new Set<number>()
   private progKey: string | null = null
-  /** listed: JEV_SCREEN lists the agent; judge: the one SCREEN_JUDGE picks; on: listed, a judge, and it is ready */
+  /** listed: JEV_SCREEN lists the agent (the pane is read: WO-177 ⑤, with or without a judge); judge: the one SCREEN_JUDGE picks; on: listed, a judge, and it
+   *  is ready (the judge is asked) */
   private act: { on: boolean; listed: boolean; judge: ScreenJudge | null; at: number; why: string; ver: string | null } = { on: false, listed: false, judge: null, at: -Infinity, why: 'not checked', ver: null }
   private seq = 0
   /** the question bank: the hashes written today (UTC) */
@@ -507,7 +537,7 @@ export class ScreenStatus {
     if (on !== this.act.on || why !== this.act.why || judge !== this.act.judge || newVer) {
       this.d.log('info', newVer ? `screen-status: judge ${judge!.name} now judges by version ${ver ?? '-'} (was ${this.act.ver ?? '-'}): its answers are dropped, the screen is asked again`
         : on ? `screen-status: ON for ${this.d.agent} (judge ${judge!.name}${ver ? ` version ${ver}` : ''}; poll ${this.o.pollMs} ms)`
-        : `screen-status: off for ${this.d.agent} (${why}): the status is statusOf's${listed ? ' (judged_by program)' : ', unchanged'}`)
+        : `screen-status: off for ${this.d.agent} (${why}): the status is statusOf's${listed ? ' and the screen\'s activity facts (judged_by program)' : ', unchanged'}`)
       if (!on || judge !== this.act.judge || newVer) { this.answer = null; this.cur = null; this.failed = null; this.cache.clear() }
     }
     this.act = { on, listed, judge, at: now, why, ver }
@@ -526,13 +556,14 @@ export class ScreenStatus {
     if (this.timer) clearInterval(this.timer); this.timer = null
   }
   tick(): void {
-    if (!this.active()) return
+    this.active()
+    if (!this.act.listed) return                                                       // WO-177 ⑤: the pane is read with or without a judge
     if (this.now() - this.lastLookAt < this.o.pollMs * 0.6) return                     // the duty officer looked a moment ago
     void this.lookNow()
   }
   /** the main's state changed (a hook, the registry, a tool): look now and once more a moment later, without waiting for the poll */
   poke(): void {
-    if (!this.act.on) return
+    if (!this.act.listed) return
     for (const ms of this.o.pokeMs) {
       if (this.pokes.has(ms)) continue
       this.pokes.add(ms)
@@ -547,7 +578,7 @@ export class ScreenStatus {
     this.progKey = k
   }
   async lookNow(): Promise<void> {
-    if (this.looking || !this.act.on) return
+    if (this.looking || !this.act.listed) return
     this.looking = true
     let s: { cmd: string; pane: string } | null = null
     try { s = await this.d.snap() } catch {} finally { this.looking = false }
@@ -556,7 +587,7 @@ export class ScreenStatus {
   }
   /** one look at the pane (ours, or the duty officer's) */
   sample(pane: string, cmd: string): void {
-    if (!this.act.on) return
+    if (!this.act.listed) return
     const now = this.now()
     this.lastLookAt = now
     this.stats.looks++
@@ -645,7 +676,7 @@ export class ScreenStatus {
     const c = this.cur, a = this.answer
     const ok = this.act.on && !!c && c.alive && !gone(p) && !!a?.v && (a.hash === c.hash || !!this.inflight)
     if (fed && this.act.listed) { if (ok && a!.v!.by === 'jev') this.stats.judged_jev++; else this.stats.judged_program++ }
-    const seen = this.act.on && c ? c : null
+    const seen = this.act.listed && c ? c : null
     const r = composeRecord(ok ? a!.v! : null, ok ? a!.parts.st : seen?.alive ? seen.parts.st : null, p, { ...f, alive: seen ? seen.alive : null })
     return { view: this.act.listed ? r.view : p, observation: r.observation }
   }
@@ -654,7 +685,7 @@ export class ScreenStatus {
   /** for /healthz: the reader, its judge's own counts, the screen now, the verdict in use (ScreenVerdict's four fields) */
   health(): Record<string, unknown> {
     const j = this.act.judge, a = this.answer
-    return { on: this.act.on, ...(this.act.on ? {} : { why: this.act.why }), judge: j?.name ?? null, judge_version: this.act.ver, poll_ms: this.o.pollMs, ...this.stats, ...(j?.health?.() ?? {}),
+    return { on: this.act.on, ...(this.act.on ? {} : { why: this.act.why }), reading: this.act.listed, judge: j?.name ?? null, judge_version: this.act.ver, poll_ms: this.o.pollMs, ...this.stats, ...(j?.health?.() ?? {}),
       screen: this.cur ? { hash: this.cur.hash, alive: this.cur.alive, at: iso(this.cur.at) } : null,
       answer: a?.v ? verdictFields(a.v) : null, answered: a ? { hash: a.hash, at: iso(a.at), verdict: !!a.v, judge_version: a.ver } : null, in_flight: !!this.inflight }
   }

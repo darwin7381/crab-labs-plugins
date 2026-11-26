@@ -46,16 +46,21 @@ describe("Chiron's table, field by field", () => {
     expect(obs(null, null, prog('offline', { reason: 'no_registration' }), F({ session_id: null }))).toMatchObject({ presence: 'offline', presence_reason: 'disconnected', sessions: [], main_session_id: null })
     expect(obs(null, null, prog('offline', { reason: 'no_registration' }), F({ session_id: null, alive: false }))).toMatchObject({ presence_reason: 'process_gone', lifecycle: 'stopped' })
   })
-  test('activity: running (busy, compacting), paused (a menu or the wall in a turn), stuck, idle (else); busy with no turn known: unknown', () => {
+  test('activity: running (busy, compacting), paused (a menu or the wall in a turn), stuck, idle (else); busy or stuck with no turn open: the record\'s own turn (WO-177: online is never unknown)', () => {
     const run = main(obs(V('working'), ST, prog('busy', TOOL), F({ turn: TURN })))
     expect(run).toMatchObject({ id: 'main', kind: 'main', activity: 'running', turn: TURN, doing: { kind: 'tool', tool: 'Bash', since: TOOL.tool.since }, blockers: [] })
     expect(main(obs(V('working'), ST, prog('idle'), F({ turn: TURN }))).doing).toEqual({ kind: 'thinking', tool: null, since: '2026-11-26T01:00:00.000Z' })
     expect(main(obs(V('compacting'), ST, prog('busy', TOOL), F({ turn: TURN }))).doing).toMatchObject({ kind: 'compacting', tool: null })
     expect(main(obs(null, null, prog('busy', TOOL), F({ turn: TURN })))).toMatchObject({ activity: 'running', doing: { kind: 'tool', tool: 'Bash' } })
-    expect(main(obs(V('working'), ST, prog('busy', TOOL), F({ turn: null })))).toMatchObject({ activity: 'unknown', turn: null, doing: null })
+    // WO-177 (Chiron 04:01Z item 1, status_v1_check.py 03:59Z): no turn the program has open: the turn statusOf says began (turn_started_at), id turn-<ms>, trigger other
+    const own = { id: `turn-${Date.parse(TURN.started_at)}`, started_at: TURN.started_at, trigger: { kind: 'other' } }
+    expect(main(obs(V('working'), ST, prog('busy', TOOL), F({ turn: null })))).toMatchObject({ activity: 'running', turn: own, doing: { kind: 'tool', tool: 'Bash' } })
     const st = main(obs(V('working'), ST, prog('stuck', { threshold_s: 600, ...TOOL }), F({ turn: TURN })))
     expect(st).toMatchObject({ activity: 'stuck', turn: TURN, doing: null, blockers: [{ reason: 'stalled', menu_kind: null, assignee: null, until: null }] })
-    expect(main(obs(null, null, prog('stuck', { threshold_s: 600, ...TOOL }), F({ turn: null })))).toMatchObject({ activity: 'unknown', blockers: [] })
+    expect(main(obs(null, null, prog('stuck', { threshold_s: 600, ...TOOL }), F({ turn: null })))).toMatchObject({ activity: 'stuck', turn: own, doing: null, blockers: [{ reason: 'stalled' }] })
+    // a compaction while idle (no turn: only PreCompact fired): running, doing compacting, a turn from when the record turned compacting
+    const cmp = main(obs(V('compacting'), ST, prog('idle'), F({ turn: null })))
+    expect(cmp).toMatchObject({ activity: 'running', turn: { id: `turn-${NOW}`, started_at: new Date(NOW).toISOString(), trigger: { kind: 'other' } }, doing: { kind: 'compacting', tool: null } })
     for (const v of [V('idle'), V('interrupted'), V('idle_background_running')]) expect(main(obs(v, ST, prog('idle'), F({ turn: TURN })))).toMatchObject({ activity: 'idle', turn: null, blockers: [] })
   })
   test('blockers (criterion 10): a permission prompt in a turn: paused, permission; /model opened while idle: idle, input_required, model_picker, assignee duty-officer when it takes that menu', () => {

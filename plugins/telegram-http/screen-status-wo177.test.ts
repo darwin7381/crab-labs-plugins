@@ -66,7 +66,7 @@ describe('二 a verdict that would hold items must agree with the program\'s fac
     expect(contradiction(V('interrupted'), regions(INTERRUPTED), prog('idle'))).toBeNull()
     expect(contradiction(V('interrupted'), regions(OLD_INTERRUPTED), prog('idle'))).toBe('interrupted_is_latest_output === true')
     expect(contradiction(V('interrupted'), regions(IDLE), prog('idle'))).toBe('interrupted_is_latest_output === true')
-    for (const s of ['working', 'idle', 'idle_background_running', 'compacting', 'starting'] as const) expect(contradiction(V(s), regions(IDLE), prog('idle'))).toBeNull()
+    for (const s of ['idle', 'idle_background_running'] as const) expect(contradiction(V(s), regions(IDLE), prog('idle'))).toBeNull()   // WO-177 ③: working, compacting, starting are checked too (screen-status-wo177b)
   })
 
   for (const [name, text, v, p] of [

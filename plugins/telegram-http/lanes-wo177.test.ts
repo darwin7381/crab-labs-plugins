@@ -173,6 +173,38 @@ test('一 a compaction while the main is idle (no hook for it beyond PreCompact)
   expect(offeredLines(itemOf(m.id).id)).toHaveLength(1)
 })
 
+test('② (Chiron 03:41Z) the record says working while M2 is idle (a turn the Stop hook sent back, no hook since): items held past MAIN_STUCK_MS — the push stays, its sentence says what the record shows (not the channel)', async () => {
+  M.__setMainStuckMs(200)
+  idleNow()
+  const WORK = screen(['⏺ Checking once more.', '', '✻ Pondering… (2m 3s · ↓ 4.1k tokens)'])
+  shown = WORK; verdict = V('working'); changed()
+  expect(L.__main().mainPhase()).toBe('idle')
+  expect(L.mainCanTake()).toBe(false)
+  const a = joey('畫面在忙時進來的一則'), b = joey('第二則')
+  await L.routeEvent(a); await L.routeEvent(b)
+  const before = sent.length
+  await sleep(300)
+  await L.__main().tick()
+  const told = sent.slice(before).filter(t => /主線/.test(t))
+  expect(told.length).toBe(1)
+  expect(told[0].split('\n').at(-1)).toBe('主線的畫面顯示在處理中，但 1 分鐘沒有任何回合事件；有 2 件排著還沒交進去。')   // the lab's 200 ms MAIN_STUCK_MS; 10 分鐘 at 600 s
+  expect(told.join('')).not.toContain('通道')
+  expect(itemOf(a.id).state).toBe('queued')
+  // the record turns idle: both go in, once; with MAIN_STUCK_MS 600 s the same words say 10 分鐘
+  M.__setMainStuckMs(600_000)
+  idleNow()
+  expect(await until(() => itemOf(a.id).state === 'offered', 1000)).toBe(true)
+  await take(a.id)                                                          // b rides into a's turn at its Stop (the main's own pull)
+  expect(['bound', 'done']).toContain(itemOf(b.id).state)
+  await stop()
+})
+
+test('② the channel sentence stays for a record that says the main can take items and nothing went in (here: no stream to offer on)', () => {
+  const src = readFileSync(join(import.meta.dir, 'lanes-main.ts'), 'utf8')
+  expect(src).toContain("m === 'busy' || m === 'stuck' ? `主線的畫面顯示在處理中，但 ${Math.max(1, Math.round(MAIN_STUCK_MS / 60_000))} 分鐘沒有任何回合事件；有 ${owedNow.length} 件排著還沒交進去。`")
+  expect(src).toContain('`主線收不到訊息：${owedNow.length} 則訊息送不進主線（它的訊息通道沒有開')
+})
+
 test('一 no status record here (Onsen step 3 off): M2 decides as before — an idle main is offered at once', async () => {
   noRecord = true
   try {
@@ -218,6 +250,11 @@ test('六 a lane run\'s open tool reaches runningLanes() and the observation: do
   expect(await until(() => L.runningLanes().some(l => l.id === lane.id && !l.tool), 3000)).toBe(true)
   obs = composeRecord(null, regions(IDLE), prog(), { session_id: 'a20fb7c0-f35a-4365-9a21-9e16e9f78fed', queue: L.mainQueueCounts() }).observation
   expect(obs.sessions.find(x => x.id === lane.id)!.doing).toMatchObject({ kind: 'thinking', tool: null })
+  // WO-177 (Chiron 04:01Z item 2): thinking since the tool came back, not since the run began
+  const back = L.runningLanes().find(l => l.id === lane.id)!
+  expect(back.thinking_since).toBeTruthy()
+  expect(Date.parse(back.thinking_since!)).toBeGreaterThan(Date.parse(lane.tool!.since))
+  expect(obs.sessions.find(x => x.id === lane.id)!.doing!.since).toBe(back.thinking_since!)
   expect(checkObservation(obs)).toEqual([])
   expect(await until(() => !L.runningLanes().some(l => l.id === lane.id), 4000)).toBe(true)
 })

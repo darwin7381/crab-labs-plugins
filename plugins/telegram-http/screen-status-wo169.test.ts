@@ -212,12 +212,13 @@ describe('3 the interface holds, and the switch', () => {
     expect(judgeFor('jev', { jev: f, program: null })).toBe(f)
     expect(judgeFor('program', { jev: f, program: null })).toBeNull()
   })
-  test('program (no judge): nothing looked at or asked, the record is statusOf\'s judged_by program; JEV_SCREEN off: statusOf untouched', async () => {
+  // WO-177 ⑤ (Chiron 03:41Z): with no judge the pane is still read (the program's own cut); nothing is asked; an idle screen leaves statusOf's record
+  test('program (no judge): the pane read, nothing asked, the record is statusOf\'s judged_by program on an idle screen; JEV_SCREEN off: statusOf untouched', async () => {
     const r = reader(() => null)
     expect(r.s.active()).toBe(false)
-    expect(r.s.health()).toMatchObject({ on: false, judge: null })
+    expect(r.s.health()).toMatchObject({ on: false, reading: true, judge: null })
     r.s.sample(IDLE, '2.1.322'); await wait(2)
-    expect(r.s.health().looks).toBe(0)
+    expect(r.s.health()).toMatchObject({ looks: 1, calls: 0 })
     expect(r.s.view(r.st.program)).toEqual(programView(r.st.program))
     const off = reader(() => new FakeJudge(() => V('idle')), { switchOn: () => false })
     expect(off.s.view(off.st.program)).toBe(off.st.program)

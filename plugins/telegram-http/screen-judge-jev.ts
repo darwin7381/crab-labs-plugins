@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { StatusView } from './onsen-status.ts'
-import { cut, isVerdictMenu, isVerdictState, lastLines, publishView, redactRegions, screenHash, screenRegions, type Parts, type Regions, type ScreenJudge,
+import { cut, isVerdictMenu, isVerdictState, lastLines, publishView, redactRegions, screenActivity, screenHash, screenRegions, type Parts, type Regions, type ScreenJudge,
   type ScreenVerdict } from './screen-status.ts'
 
 // ------------------------------------------------------------------ Chiron's questions file
@@ -74,9 +74,15 @@ export function verdictOf(j: JevRead, threshold: number): ScreenVerdict | null {
  *  becomes a ScreenVerdict, and nowhere else. waiting_for_human: no input box (a menu or a permission prompt replaces it: 64 screens of the question bank
  *  and the lab's 21 waiting rows have none; idle, working and interrupted all have one); usage_limit: the limit message is the latest output, or the
  *  program's own wall (a StopFailure that walled M2, usage_wall.py: statusOf's detail.walled); interrupted: Interrupted is the latest output. The facts are
- *  found_by_program's (questions v7, regions()). Returns the fact the verdict lacks (null: they agree, or a state these facts do not bear on) */
+ *  found_by_program's (questions v7, regions()). WO-177 ③ (Chiron 03:41Z: 「任何會讓紀錄不是 idle 的 verdict，都要有一個程式事實撐著」): working needs an
+ *  activity fact (a live activity line with no finished marker after it, tool_running_line or esc_to_interrupt), compacting that live line saying
+ *  Compacting, starting no input box (screenActivity: 0 exceptions on the 64 labelled screens). Returns the fact the verdict lacks (null: they agree, or a
+ *  state the record keeps idle: idle, idle_background_running, interrupted's own fact above) */
 export function contradiction(v: Pick<ScreenVerdict, 'state'>, st: Regions, prog: StatusView | null): string | null {
   const f = st.found_by_program
+  if (v.state === 'working' && !screenActivity(st).busy) return 'an activity fact (live_activity_line with no finished marker after it, tool_running_line, or esc_to_interrupt)'
+  if (v.state === 'compacting' && !screenActivity(st).compacting) return 'live_activity_line saying Compacting, with no finished marker after it'
+  if (v.state === 'starting' && st.has_input_box !== false) return 'has_input_box === false'
   if (v.state === 'waiting_for_human' && st.has_input_box !== false) return 'has_input_box === false'
   if (v.state === 'usage_limit' && f.limit_message_is_latest_output !== true && !(prog?.detail as Record<string, unknown> | undefined)?.walled)
     return 'limit_message_is_latest_output === true, or the program\'s wall'
@@ -186,7 +192,7 @@ export class JevJudge implements ScreenJudge {
     let v = verdictOf(jev, q.threshold)
     const kinds = answerExceptions(jev, parts.st, q.threshold)
     const model = r.model ?? q.model
-    // WO-177 二: a verdict the program's facts contradict is no verdict (the record is statusOf's for this screen), recorded as contradicts_program
+    // WO-177 二 / ③: a verdict the program's facts contradict is no verdict (the record is statusOf's and the screen's activity facts), recorded as contradicts_program
     const against = v ? contradiction(v, parts.st, this.d.program()) : null
     const contra = against ? { state: v!.state, menu: v!.menu, p: r2(v!.p), needs: against } : null
     if (contra) { kinds.push('contradicts_program'); v = null }

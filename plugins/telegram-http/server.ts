@@ -5164,7 +5164,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         sessions_with_open_sse: [...sseOpen.values()].filter(Boolean).length,  // issue #3: live vs zombie
         ...(Lanes.LANES_ON && !INBOX_ONLY ? { mailbox_decide_listed: decideListed } : {}),   // WO-126: the main listed mailbox_decide (when, which session)
         // Onsen (WO-139): recording on, bytes waiting in the spool, last sync; step 3 (WO-143): deliveries_recorded, status_recorded, the status now
-        ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}) } } : {}),
+        ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}),
+          ...(onsenActions ? { actions: onsenActions.health() } : {}) } } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed)
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,

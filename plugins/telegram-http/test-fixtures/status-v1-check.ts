@@ -55,6 +55,8 @@ export function checkObservation(s: any): string[] {
       check(x.doing === null && x.blockers?.length, `${x.id}: ${x.activity} without a blocker`)
       check(x.blockers?.some((b: any) => b.reason === 'stalled') === (x.activity === 'stuck'), `${x.id}: stalled blocker does not match ${x.activity}`)
     }
+    // status_v1_check.py 11-26 03:59Z (Chiron WO-177 04:01Z item 1): online, a session's activity is never unknown (a compaction is running, doing compacting)
+    if (s.presence === 'online') check(x.activity !== 'unknown', `${x.id}: online with activity unknown (a compaction is running, doing compacting)`)
     if (s.presence === 'offline') check(x.activity === 'unknown' && !x.blockers?.length, `${x.id}: offline with current work`)
     if (x.doing) {
       keys(x.doing, 'kind tool since', `${x.id} doing`)

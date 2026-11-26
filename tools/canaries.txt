@@ -128,7 +128,10 @@ plugins/telegram-http/lanes-main.ts::batchedRider
 plugins/telegram-http/onsen-client.ts::/threads/events
 plugins/telegram-http/onsen-inbox.ts::export function recipientNote
 plugins/telegram-http/onsen-inbox.ts::的主線現在不在線上。例行的事它的分身照常處理；要主線決定的，等它回來才會看到。
-plugins/telegram-http/lanes.ts::自動不用回。只在有結果、做不了、或要對方補東西時回
+plugins/telegram-http/lanes.ts::找別的 agent。**先判要不要送**。只有三種情況才送：有結果要交給它、你做不了、要它補東西。
+plugins/telegram-http/lanes-events.ts::function closeAccount(
+plugins/telegram-http/lanes.ts::寄件者標了不用回（no_reply）
+plugins/telegram-http/lanes.ts::function hopDelivered(
 plugins/telegram-http/lanes.ts::function laneOfRun
 plugins/telegram-http/lanes-threads.ts::export function threadTitle
 plugins/telegram-http/lanes.ts::function retitleThreads
@@ -158,3 +161,10 @@ plugins/telegram-http/onsen-status.ts::remote?(): Promise<{ state?: unknown; sin
 plugins/telegram-http/onsen-client.ts::...(ctx.turn_id ? { turn_id: String(ctx.turn_id).slice(0, 120) } : {}),
 plugins/telegram-http/onsen-status.ts::statusRecord(member: string, atMs = this.now()): void {
 plugins/telegram-http/server.ts::try { facts.statusRecord(member) } catch {}
+plugins/telegram-http/screen-status.ts::export function screenActivity(
+plugins/telegram-http/screen-judge-jev.ts::if (v.state === 'working' && !screenActivity(st).busy)
+plugins/telegram-http/lanes-main.ts::主線的畫面顯示在處理中，但
+plugins/telegram-http/server.ts::...(onsenActions ? { actions: onsenActions.health() } : {})
+plugins/telegram-http/lanes-events.ts::else if (ob.state === 'handed' || (main && owing(main))) refused
+plugins/telegram-http/screen-status.ts::const workAt = since('main.work'
+plugins/telegram-http/lanes.ts::r.back ? { thinking_since: r.back }

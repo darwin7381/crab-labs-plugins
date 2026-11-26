@@ -427,8 +427,10 @@ describe('the reader', () => {
     // the screen moved on before the comparison: no comparison
     r.program = prog('idle')
     r.s.sample(BUSY(), '2.1.322'); r.s.sample(IDLE, '2.1.322'); await wait(30)
-    // BUSY's answer came back with IDLE showing: not compared; IDLE (answered `working` by this fake) is compared and differs
-    expect(r.exceptions().filter(e => e.kinds.includes('differs_from_program'))).toHaveLength(2)
+    // BUSY's answer came back with IDLE showing: not compared; IDLE (answered `working` by this fake): WO-177 ③, no activity fact on that screen → no
+    // verdict (contradicts_program), nothing to compare
+    expect(r.exceptions().filter(e => e.kinds.includes('differs_from_program'))).toHaveLength(1)
+    expect(r.exceptions().filter(e => e.kinds.includes('contradicts_program'))).toHaveLength(1)
   })
   test('starting: statusOf offline (no registration / no stream yet) while Claude Code runs in the pane → asked; its reason stays in the detail', async () => {
     const r = rig({ answer: () => jevSays('starting', 0.8) })

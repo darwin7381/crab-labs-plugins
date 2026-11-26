@@ -10,6 +10,7 @@
  * An obligation is open → requested (the outbound call was accepted and is being delivered) → met on the delivery result (the Telegram message
  * id, the mesh `delivered`, the scheduler's answer), or back to open with `failed` when the delivery failed. handed: one hand-over transition
  * (handOver) gave it to the main. dropped: the event's thread was stopped before it ran. merged: it was handled in another event's run.
+ * waived (WO-177): an answer to a peer the lane closed its run without sending: it judged the item needed none (closeAccount).
  * The one rule: every outbound tool call of a lane is a request to meet an obligation of its event. Meeting an open one is accepted; raising it
  * (a line to a decision, or a line whose outcome changed) is accepted; repeating a met or requested one is refused, and the refusal names what is
  * still open. The router (lanes.ts) picks the tier and format from class × obligation × outcome. One sweep acts on obligations past their due time.
@@ -20,7 +21,7 @@ import type { Journal, Row } from './lanes-state.ts'
 export type EvClass = 'scheduled' | 'followup' | 'peer' | 'joey' | 'alert' | 'critical'
 export type ObKind = 'joey' | 'main' | 'peer' | 'receipt'
 export type Outcome = 'normal' | 'changed' | 'failed'
-export type ObState = 'open' | 'requested' | 'met' | 'handed' | 'dropped' | 'merged'
+export type ObState = 'open' | 'requested' | 'met' | 'handed' | 'dropped' | 'merged' | 'waived'
 export type Ob = { id: string; kind: ObKind; level: string; state: ObState; by?: string; owner?: string
   /** WO-128: a hand-over that can wait (a decision card): the main's, but no M1 item and no due time until it is woken (`woke`: urgent | due); `card`: the
    *  hand-over is a decision card's (not listed in open-handoffs.md: the mailbox is the list) */
@@ -144,7 +145,10 @@ export function createEvents(J: Journal, changed?: () => void) {
         if (!ob && want.level === 'line' && out === 'normal' && e.class !== 'joey')
           refused = 'this event owes Joey no line, and your line reports nothing new since the last run (a routine check tells him only when something changed, a part reports to the main): it goes in your receipt, not to Joey'
         else if (!ob) { ob = { id: obId('joey'), kind: 'joey', level: want.level, state: 'open' }; obs.push(ob); raised = true; ask(ob, want.level) }
-        else if (ob.state === 'handed') refused = obs.some(o => o.kind === 'main' && o.defer && !o.woke && owing(o))       // WO-128: a card that can wait
+        // WO-177 (Chiron 04:01Z item 3: the lane's 「完成」 03:52:00, Onsen 42072, and the main's 03:52:02, 42073, for one event): while the event is handed
+        // to the main (its main obligation owed), the line to Joey is the main's (every hand-over says 「由你回報 Joey 一次」), also when the lane had met
+        // its own line before it handed over (that line stays met; a raise of it is not the lane's any more)
+        else if (ob.state === 'handed' || (main && owing(main))) refused = obs.some(o => o.kind === 'main' && o.defer && !o.woke && owing(o))       // WO-128: a card that can wait
           ? 'this matter waits on the main\'s decision in its mailbox (a card that can wait; the main is not woken for it): the run that finishes it after the decision tells Joey, once. Put what you did in your receipt'
           : 'this event is handed to the main: the main reports to Joey'
         else if (ob.state === 'requested') refused = 'a line about this event is being sent to Joey right now'
@@ -164,6 +168,7 @@ export function createEvents(J: Journal, changed?: () => void) {
         ob = obs.find(o => o.kind === 'peer' && o.to === want.to && (o.owner ?? 'lane') === 'lane')
         if (!ob) { ob = { id: obId('peer'), kind: 'peer', level: 'message', to: want.to, state: 'open' }; obs.push(ob); ask(ob, 'message') }   // an agent the event did not owe: its own obligation
         else if (ob.state === 'open') ask(ob, ob.level)
+        else if (ob.state === 'waived') { ob.state = 'open'; delete ob.by; ask(ob, ob.level) }   // WO-177: a send after the receipt undoes the waiver (owed until delivered)
         else refused = ob.state === 'requested' ? `a message to ${want.to} about this event is being delivered right now`
           : ob.state === 'handed' ? `this event is handed to the main: the main answers ${want.to}`
           : ob.level === 'message' ? `${want.to} already got a message about this event` : `${want.to} already has the answer to this event`
@@ -231,6 +236,23 @@ export function createEvents(J: Journal, changed?: () => void) {
     write(e, obs, { tool: h.by, refused: null })
     return ob
   }
+  /** WO-177 (Chiron 02:22Z, 六 last point): THE rule for an answer a lane owes a peer. The router opens one for every peer item that is not marked no_reply
+   *  (the sender's flag is the router's to read: eventObligations); whether the item needs one (a result for the sender, a thing the lane cannot do,
+   *  something it needs from the sender) only its reader can tell. The lane's receipt closes its account of the run (the card: the last call, after every
+   *  send): an answer it has not sent by then, it judged not owed (waived, by receipt). Still owed: an answer it tried to send and could not deliver
+   *  (`failed`: it had something for the sender), and every answer when its receipt says it could not do the thing (outcome failed: the sender is owed
+   *  word of that). A send after the receipt is an answer like any other (request). A run that ends without its receipt (cut, a cap, failed) closed
+   *  no account: what it owes goes to the main as before (the exit rule). Returns the record when something was waived. */
+  function closeAccount(id: string, outcome: string): Row | null {
+    if (outcome === 'failed') return null
+    const e = get(id)
+    if (!e) return null
+    const obs = obsOf(e)
+    const hit = obs.filter(o => o.kind === 'peer' && o.level === 'answer' && o.state === 'open' && !o.failed && (o.owner ?? 'lane') === 'lane')
+    if (!hit.length) return null
+    for (const o of hit) { o.state = 'waived'; o.by = 'receipt' }
+    return write(e, obs, { tool: 'receipt' })
+  }
   /** the event will not run: its thread was stopped (dropped) or another run handles it (merged into `into`). What it owed says so; nothing is met */
   function settleUnrun(id: string, how: 'dropped' | 'merged', by: string, into?: string): Row | null {
     const e = get(id)
@@ -271,6 +293,6 @@ export function createEvents(J: Journal, changed?: () => void) {
     }
     return out
   }
-  return { open, get, obsOf, openObs, mainObs, openText, request, result, handOver, settleUnrun, set, add, note, push, due, receiptMet,
+  return { open, get, obsOf, openObs, mainObs, openText, request, result, handOver, closeAccount, settleUnrun, set, add, note, push, due, receiptMet,
     rows: (pred: (r: Row) => boolean = () => true) => J.rows('event', pred) }
 }

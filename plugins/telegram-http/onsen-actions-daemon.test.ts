@@ -199,6 +199,11 @@ test('a permission prompt: Telegram as before (a copy per person, the same three
   expect(c.body).toEqual({ source: 'permission', menu_kind: 'permission', session_id: 'main', assignees: ['joey', 'joey-test'], summary: 'Bash：git push origin main',
     body: { format: 'markdown', text: '**Bash**\n\ngit push origin main\n\n```\n{\n  "command": "git push origin main"\n}\n```' },
     options: [{ id: 'allow', label: '允許' }, { id: 'deny', label: '拒絕' }] })
+  // the Actions client's own counts are on /healthz (onsen.actions: OnsenActions.health(), wired in 1.58.7)
+  const h = await fetch(`http://127.0.0.1:${tg.port}/healthz`).then(r => r.json()) as any
+  expect(h.onsen.actions).toMatchObject({ on: true, failed: 0 })
+  expect(h.onsen.actions.created).toBeGreaterThanOrEqual(1)
+  expect(typeof h.onsen.actions.followed).toBe('number')
 }, 30000)
 
 test('pressed in Telegram: Claude Code is answered; the Action is resolved by the presser, then applied; only the tapped copy is edited, as before', async () => {

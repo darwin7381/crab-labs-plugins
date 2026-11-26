@@ -693,7 +693,10 @@ export function createMain(E: MainEnv) {
       if (owedNow.some(r => now - Date.parse(String(r.ts)) > MAIN_STUCK_MS)) {
         stuck = { gen: g?.id ?? null, prompt: null, at: now, undelivered: true }
         const mins = Math.max(1, Math.round((now - Math.min(...owedNow.map(r => Date.parse(String(r.ts))))) / 60_000))
+        // WO-177 ② (Chiron 03:41Z, verbatim): the record says the main is working (busy, stuck) while M2 has had no turn: the items wait on the record, not on
+        // a channel. The push stays; its sentence says that (the channel sentence is for a record that says it can take them and still nothing went in)
         E.tellJoey(!g ? `主線不在：現在沒有登記中的主線，${owedNow.length} 則訊息等它（最久的等了 ${mins} 分鐘）。警報和同事的事由車道照常處理；主線一登記我就交給它並告訴你。`
+          : m === 'busy' || m === 'stuck' ? `主線的畫面顯示在處理中，但 ${Math.max(1, Math.round(MAIN_STUCK_MS / 60_000))} 分鐘沒有任何回合事件；有 ${owedNow.length} 件排著還沒交進去。`
           : `主線收不到訊息：${owedNow.length} 則訊息送不進主線（它的訊息通道沒有開，最久的等了 ${mins} 分鐘；行程還活著）。警報和同事的事由車道照常處理；一送進去我會告訴你。`, 'main-undelivered')
       }
     }

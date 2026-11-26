@@ -205,11 +205,16 @@ test.skipIf(!HAS_TMUX)("lanes on (LANES_WAKE_DECIDE, ONSEN_WAKE_LOG): a menu on 
   } finally { await b.stop(); api2.stop() }
 }, 60000)
 
-test.skipIf(!HAS_TMUX)('SCREEN_JUDGE=program: no judge; the record is statusOf\'s, judged_by program; Jev never asked; the screen not read', async () => {
-  expect(tmux('new-session', '-d', '-s', 'jevtest-cyd', '-x', '100', '-y', '30', `cat ${join(root, 'screen.txt')}; exec sleep 3600`).status).toBe(0)
+// WO-177 ⑤ (Chiron 03:41Z): with no judge the program's own cut of the screen is still read: Jev is never asked, the record is judged_by program, and a pane
+// that shows work (an activity fact) keeps it busy
+test.skipIf(!HAS_TMUX)('SCREEN_JUDGE=program: no judge; Jev never asked; the record judged_by program — statusOf\'s on an idle pane, busy on a pane that shows work (WO-177 ⑤: the pane is read)', async () => {
+  const cydScreen = join(root, 'screen-cyd.txt')
+  writeFileSync(cydScreen, IDLE)
+  expect(tmux('new-session', '-d', '-s', 'jevtest-cyd', '-x', '100', '-y', '30', `cat ${cydScreen}; exec sleep 3600`).status).toBe(0)
   const api3 = startBotApiMock({}, { pollHoldMs: 300 })
   mkdirSync(join(root, 'cyd', 'home', '.claude', 'duty-officer'), { recursive: true })                 // the pane counts as Claude Code: still not read
   writeFileSync(join(root, 'cyd', 'home', '.claude', 'duty-officer', 'config.json'), JSON.stringify({ enabled: [], claude_cmds: ['sleep'] }))
+  register(join(root, 'cyd'))                                                        // registered (not connected): past "starting"
   const n0 = asked.length
   const c = await startTgDaemon(api3, join(root, 'cyd'), JOEY, { GENESIS_LANES: '0', LANES_AGENT: 'cyd', AGENT_INBOX_SELF: 'cyd', SCREEN_JUDGE: 'program',
     ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'), ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0',
@@ -221,8 +226,14 @@ test.skipIf(!HAS_TMUX)('SCREEN_JUDGE=program: no judge; the record is statusOf\'
     expect(statuses('cyd').every(s => s.detail?.judged_by === 'program')).toBe(true)
     expect(asked.length).toBe(n0)
     const h = await fetch(`http://127.0.0.1:${c.port}/healthz`).then(r => r.json()) as any
-    expect(h.onsen.status.screen_status).toMatchObject({ on: false, judge: null, looks: 0, answer: null })
+    expect(h.onsen.status.screen_status).toMatchObject({ on: false, reading: true, judge: null, answer: null })
+    expect(h.onsen.status.screen_status.looks).toBeGreaterThan(0)                // the pane is read (WO-177 ⑤)
     expect(String(h.onsen.status.screen_status.why)).toContain('SCREEN_JUDGE=program')
     expect(c.log()).toContain('screen-status: off for cyd (SCREEN_JUDGE=program: no screen judge)')
+    // the pane now shows work: an activity line with no finished marker after it → busy, judged_by program, Jev still not asked
+    writeFileSync(cydScreen, ['⏺ Reading the logs.', '', '✻ Pondering… (12s · ↓ 1.2k tokens)', '', R, '❯ ', R, '  Opus 5.5 · 7d 71%', '  ⏵⏵ bypass permissions on'].join('\n'))
+    expect(tmux('respawn-pane', '-k', '-t', 'jevtest-cyd', `cat ${cydScreen}; exec sleep 3600`).status).toBe(0)
+    expect(await until(() => statuses('cyd').some(s => s.state === 'busy' && s.detail?.judged_by === 'program'), 15000)).toBe(true)
+    expect(asked.length).toBe(n0)
   } finally { await c.stop(); api3.stop() }
 }, 60000)
