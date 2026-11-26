@@ -1174,6 +1174,8 @@ function onWallChange(prev: WallState | null, next: WallState | null): void {
   wallHeldKeys = new Set()
   heldSidecar.update(next, true)            // the clear: what is held, snapshotted before anything drains
   log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh (as before WO-120)'} — delivering the held items once each, in order`)
+  // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now)
+  if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
   setImmediate(() => { sweepDeliveries(); void drainPendingIfLive() })
 }
 setInterval(() => heldSidecar.update(wallReader.state()), Math.max(250, wallReader.cacheMs())).unref()
@@ -4525,8 +4527,8 @@ if (Lanes.LANES_ON) {
       const w = wallReader.state()
       if (!w) return null
       if (w.walled) return { walled: true, clearedMs: null }
-      return w.clearedMs != null && w.clearedMs >= wallSinceMs - 60_000 ? { walled: false, clearedMs: w.clearedMs } : null
-    },   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes
+      return w.clearedMs != null && w.clearedMs >= wallSinceMs - 60_000 ? { walled: false, clearedMs: w.clearedMs, by: w.cleared_by } : null
+    },   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes; WO-141 follow-up: the lanes' wall reads it too (by: cleared_by)
     ...(INBOX_ONLY ? {
       meshSend: async (to, text, replyTo, noReply, extra, send) => {
         let msgId: number | undefined, delivered = false

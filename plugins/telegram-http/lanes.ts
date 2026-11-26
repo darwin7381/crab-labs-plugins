@@ -214,8 +214,10 @@ export interface LanesDeps {
   /** WO-120 (server.ts mainWallNoticeOwned): true = the usage-wall alerts (system-alert WallAlerts) tell Joey about this wall of the main, so the
    *  main-wall-up / main-wall-down notice goes to the ledger only. Absent / false = pushed as before. The wall records themselves are untouched. */
   wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
-  /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall) */
-  usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
+  /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall); WO-141 follow-up:
+   *  the lanes' wall reads it too (followUsageWall). `by`: the clear's cleared_by (usage_wall.py: ok_turn | probe_after_reset | probe_after_switch |
+   *  probe_retry) */
+  usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null; by?: string | null } | null
   /** Onsen (WO-139): the chat_history tool's answer (server.ts: onsen-client.ts queryHistory); absent = no Onsen here */
   chatHistory?: (args: Record<string, unknown>) => Promise<string>
   /** WO-153: form_close's answer (server.ts: onsen-tool.ts formClose, POST /forms/close); absent = Onsen recording off here, and lanes do not list the tool */
@@ -776,6 +778,7 @@ type State = {
   followups: Record<string, Followup>                                  // 002c: scheduled follow-ups (due = simulated ms)
   alert_fp?: Record<string, AlertFp>                                   // 002k (B12): alert fingerprint → the thread that handles it
   wall?: Wall                                                          // 002j: the model wall is up (usage limit, overload)
+  wall_clear_used?: number                                             // WO-141 follow-up: the daemon's usage-wall clear (ms) the lanes' wall last followed
   master_off?: { since: string; by: string }                           // 002k: /lanes off — every event goes to the main, no lane starts
   notify_profile?: 'default' | 'tiered'                                // 002k: /lanes notify <profile>; unset = LANES_NOTIFY_PROFILE
   renew?: { new_sid: string; old_sid: string; old_pid: number; at: string; by: string; old_tokens: number }   // 002k: /main renew in progress
@@ -3660,6 +3663,7 @@ function armProbe(ms: number): void {
  *  the next event happened to arrive, and every critical alert until then was rung through as "no lane can look". */
 function probeTick(): void {
   if (!S?.wall || D.role !== 'tg') return
+  if (followUsageWall('probe') !== 'own') return          // WO-141 follow-up: the daemon's usage-wall state decides first
   if (running.size > 0) { armProbe(1000); return }        // a run is still out: its result is the probe
   if ([...queue.values()].some(i => i.state === 'queued')) {
     S.wall.probe_at = 0; pump()
@@ -3785,6 +3789,49 @@ function menuSentence(m: MenuResult): string {
   if (m.chose) return `主線停在一個選單（${labels}），選了「${m.chose.label}」但選單還在，選項已再傳給你，請點一個。`
   return `主線停在一個選單（${labels}），我挑不出一個安全的選項（不碰要付費或換方案的），選項已再傳給你，請點一個。`
 }
+// ------------------------------------------------------------------ WO-141 follow-up (Epeius, mail #200294; WO-141 05:04Z): the lanes' wall follows the daemon's
+// plutus 11-26 (#200159, alert-dispatcher, 96 min): the daemon's usage wall (usage_wall.py's state, server.ts wallReader) cleared at 00:16:54Z (an
+// account switch, its keeper's probe); the lanes kept their own wall until their own probe, backing off 10/20/30 min, came round at 00:22:34Z, and the
+// queued mail lane started 00:23:06Z. One source now: the daemon's state (the one decider; M2 follows it the same way, lanes-main offerNext).
+//  - while it says walled, the lanes probe nothing of their own: no probe run, no bare probe (its keeper probes: a reset time, an account switch, its back-off);
+//  - its clear ends the lanes' wall in the same step (server.ts onWallChange → usageWallChanged) when a model call got through for it (cleared_by ok_turn:
+//    the main's own turn; probe_*: the keeper's probe answered); a clear nothing backs (the state no longer fresh, an unknown cleared_by) makes the lanes
+//    probe at once (armProbe(0)): one run or a bare probe, then their wall comes down as before;
+//  - each clear is followed once (wall_clear_used): a lane run that walls again after it is the lanes' own wall, with their own probe and back-off;
+//  - no fresh state (keeper off, USAGE_WALL_READ=0), or a clear older than the lanes' wall: their own probe and back-off, as before.
+const BACKED_CLEAR = /^(ok_turn|probe_)/
+/** the daemon's usage-wall state for the lanes' wall now up (server.ts usageWall: walled, or a clear since about when it went up); null: none to follow */
+function daemonWall(): { walled: boolean; clearedMs: number | null; by: string | null } | null {
+  if (!S?.wall || !D?.usageWall) return null
+  try {
+    const u = D.usageWall(Date.parse(S.wall.since) || 0)
+    return u ? { walled: u.walled === true, clearedMs: u.clearedMs ?? null, by: u.by ?? null } : null
+  } catch { return null }
+}
+/** the lanes' wall against the daemon's state: 'walled' (its keeper probes; looked at again in a minute), 'down' (its clear, backed, ends the wall),
+ *  'probe' (a clear nothing backs: the lanes probe now), 'own' (nothing to follow: the lanes' own probe). `why`: where it was asked (the log row) */
+function followUsageWall(why: 'probe' | 'clear', u: { walled: boolean; clearedMs: number | null; by: string | null } | null = daemonWall()): 'walled' | 'down' | 'probe' | 'own' {
+  const w = S?.wall
+  if (!w || D?.role !== 'tg') return 'own'
+  if (u?.walled) { if (why === 'probe') armProbe(60_000); return 'walled' }
+  const fresh = u && u.clearedMs != null && u.clearedMs > (S.wall_clear_used ?? 0)
+  if (!fresh && !(why === 'clear' && !u)) return 'own'
+  if (u?.clearedMs != null) { S.wall_clear_used = u.clearedMs; saveState() }
+  const backed = !!u && BACKED_CLEAR.test(u.by ?? '')
+  const row = { why, cleared_at: u?.clearedMs != null ? new Date(u.clearedMs).toISOString() : null, cleared_by: u?.by ?? null, since: w.since, wall: w.kind,
+    then: backed ? 'down' : 'probe' }
+  appendJsonl('lanes.jsonl', { lane: 'router', kind: 'wall_follow', ...row })
+  logos('lane.wall_follow', row)
+  if (backed) { void wallDown('usage-wall'); return 'down' }
+  w.probe_at = 0; saveState()
+  armProbe(0)
+  return 'probe'
+}
+/** server.ts onWallChange: the daemon's usage wall was walled and now is not (cleared, or its state no longer fresh: `state` null) */
+export function usageWallChanged(state: { walled: boolean; clearedMs: number | null; by: string | null } | null): void {
+  if (!S?.wall || D?.role !== 'tg') return
+  try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) }
+}
 async function wallDown(by: string): Promise<void> {
   const w = S.wall
   if (!w) return
@@ -3838,6 +3885,7 @@ export function laneSlots(): number {
 }
 function pump(): void {
   if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
+  if (S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
   const slots = laneSlots()                               // 002l (D13)
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
