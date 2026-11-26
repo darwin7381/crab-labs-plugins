@@ -315,6 +315,19 @@ describe('OnsenActions', () => {
     expect(s.calls.find(c => c.path === '/v1/actions/2/resolve')!.body.resolved_by).toBe('joey')
   })
 
+  test('WO-197 (lab 18:0xZ): the log says where it was pressed: the duty officer on the screen is not "in Telegram"; a Telegram press is', async () => {
+    const s = standIn()
+    const a = new OnsenActions({ req: s.req, log })
+    const h = a.open(perm, 'kw1')!
+    a.pressedElsewhere(h, 'allow', 'duty-officer', undefined, true, 'on the screen by the duty officer')
+    await h.tail
+    expect(logs).toContain(`onsen action ${h.id}: resolved allow by duty-officer (pressed on the screen by the duty officer)`)
+    const h2 = a.open(perm, 'kw2')!
+    a.pressedElsewhere(h2, 'deny', 'joey')
+    await h2.tail
+    expect(logs).toContain(`onsen action ${h2.id}: resolved deny by joey (pressed in Telegram)`)
+  })
+
   test('WO-197 (Chiron mesh 12852): `on` as a function is asked at each new Action (a connector named at runtime has its Actions on from then)', async () => {
     const s = standIn()
     let named = false

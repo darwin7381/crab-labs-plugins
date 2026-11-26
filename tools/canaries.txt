@@ -295,3 +295,5 @@ plugins/telegram-http/onsen-screen-menu-daemon.test.ts::its Action is cancelled 
 plugins/telegram-http/server.ts::on: () => connectorNow() || Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
 plugins/telegram-http/onsen-client.ts::get on(): boolean { const v = this.o.on; return typeof v === 'function' ? v() !== false : v !== false }
 plugins/telegram-http/onsen-connector-actions-daemon.test.ts::named at runtime (the machine config), ONSEN_ACTIONS=0
+plugins/telegram-http/server.ts::const OFFICER_ON_SCREEN = 'on the screen by the duty officer'
+plugins/telegram-http/onsen-client.ts::resolved ${option_id} by ${who} (pressed ${where})

@@ -1455,15 +1455,16 @@ export class OnsenActions {
 
   /** pressed in Telegram by `by` (a member): resolve, then applied; Onsen answered first (409): applied with what was really pressed. `at` (Onsen
    *  0.24.3): when it was pressed (resolved_at, and applied's at). `asIs` (WO-176 r3): `by` is sent as it is, not taken for an assignee (the duty
-   *  officer pressing a permission prompt on the screen: Onsen 0.24.3 takes resolved_by duty-officer on a permission / menu Action) */
-  pressedElsewhere(h: ActionHandle | null | undefined, option_id: string, by: string, at?: string, asIs = false): void {
+   *  officer pressing a permission prompt on the screen: Onsen 0.24.3 takes resolved_by duty-officer on a permission / menu Action). `where`
+   *  (WO-197, lab 18:0xZ): where it was pressed, for the log line (`in Telegram`; the duty officer's press: `on the screen by the duty officer`) */
+  pressedElsewhere(h: ActionHandle | null | undefined, option_id: string, by: string, at?: string, asIs = false, where = 'in Telegram'): void {
     if (!h) return
     this.queue(h, async () => {
       if (!h.id) return
       const who = asIs ? by : h.assignee(by)
       const r = await this.call('POST', `/v1/actions/${h.id}/resolve`, { option_id, expected_version: h.version, resolved_by: who, ...(at ? { at } : {}) })
-      if (r?.status === 200) { this.take(h, r.json?.data); this.stats.resolved++; this.o.log('info', `onsen action ${h.id}: resolved ${option_id} by ${who} (pressed in Telegram)`) }
-      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: answered in Onsen first (${errOf(r)}); reporting what was pressed in Telegram (${option_id})`) }
+      if (r?.status === 200) { this.take(h, r.json?.data); this.stats.resolved++; this.o.log('info', `onsen action ${h.id}: resolved ${option_id} by ${who} (pressed ${where})`) }
+      else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: answered in Onsen first (${errOf(r)}); reporting what was pressed ${where} (${option_id})`) }
       else { this.fail(`resolve ${h.id}`, r); return }
       await this.appliedNow(h, { ...(at ? { at } : {}), ...(r?.status === 409 ? { option_id, resolved_by: who } : {}) })
     })

@@ -2008,6 +2008,8 @@ function menuKindNow(own: boolean, bundle?: Record<string, unknown>): string | n
   if (!p) return null
   return /^(AskUserQuestion|ExitPlanMode)$/.test(String(p.tool ?? '')) ? 'plan_or_question' : 'permission'
 }
+/** WO-197 (lab 18:0xZ): where the duty officer's press of a permission prompt was made, for the Actions log line (not Telegram) */
+const OFFICER_ON_SCREEN = 'on the screen by the duty officer'
 /** WO-176: the duty officer's menus as Actions (duty-officer.ts MenuActions): its own pane's (session `main`) and a test pane's it owns */
 function menuActions(acts: Onsen.OnsenActions): MenuActions {
   const own = (): string => (process.env.CHANNEL_BOT_TMUX_SESSION ?? '').trim()
@@ -2042,7 +2044,7 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
         p.ended = { how: 'answered', option, member: 'duty-officer', via: 'officer', at: Date.now() }
         savePermOpen()
         permCopiesDone(p.copies, option, `值班員按的：「${o.choose}」`)
-        acts.pressedElsewhere(p.action, option, 'duty-officer', o.at, true)
+        acts.pressedElsewhere(p.action, option, 'duty-officer', o.at, true, OFFICER_ON_SCREEN)
         return 'done'
       }
       const r = await remotePrompt(acts, o.bound.lookup)
@@ -2050,7 +2052,7 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
       const left = r.id ? permLeftover.get(r.id) : undefined
       if (r.id && permLeftover.delete(r.id)) savePermOpen()
       if (left) permCopiesDone(left.copies, option, `值班員按的：「${o.choose}」`)
-      acts.pressedElsewhere(r, option, 'duty-officer', o.at, true)
+      acts.pressedElsewhere(r, option, 'duty-officer', o.at, true, OFFICER_ON_SCREEN)
       return 'done'
     },
     answered: (ref, option_id, member, at) => {
