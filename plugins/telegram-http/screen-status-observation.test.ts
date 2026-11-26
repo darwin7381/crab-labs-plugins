@@ -42,6 +42,10 @@ describe("Chiron's table, field by field", () => {
       expect(o).toMatchObject({ presence: 'online', lifecycle: 'starting' })
       expect(main(o)).toMatchObject({ activity: 'idle', turn: null, doing: null })
     }
+    // not connected yet while the screen says starting (07:12–07:14Z, 11-26: eight agents restarting after the account switch): online, starting, the main idle
+    const nc = obs(V('starting'), ST, prog('offline', { reason: 'not_connected' }), F({ session_id: 'abc' }))
+    expect(nc).toMatchObject({ presence: 'online', presence_reason: null, lifecycle: 'starting' })
+    expect(main(nc)).toMatchObject({ activity: 'idle', turn: null, doing: null })
     // no registration and nothing seen of the process: no main is made up
     expect(obs(null, null, prog('offline', { reason: 'no_registration' }), F({ session_id: null }))).toMatchObject({ presence: 'offline', presence_reason: 'disconnected', sessions: [], main_session_id: null })
     expect(obs(null, null, prog('offline', { reason: 'no_registration' }), F({ session_id: null, alive: false }))).toMatchObject({ presence_reason: 'process_gone', lifecycle: 'stopped' })

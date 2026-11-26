@@ -375,7 +375,10 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
   const pd = (prog.detail ?? {}) as Record<string, any>, vd = (view.detail ?? {}) as Record<string, any>
   const goneNow = gone(prog), disconnected = prog.state === 'offline' && pd.reason === 'not_connected'
   const starting = view.state === 'starting'
-  const presence: Observation['presence'] = goneNow || disconnected || (view.state === 'offline' && !starting) ? 'offline' : 'online'
+  // a Claude Code still starting is online whether or not it has reached the daemon yet (no_registration, or not_connected while the screen says
+  // starting: the fleet's restart after the 11-26 07:12Z account switch). Offline + starting cannot be written: offline leaves the main unknown,
+  // starting needs it idle (status_v1_check)
+  const presence: Observation['presence'] = goneNow || (disconnected && !starting) || (view.state === 'offline' && !starting) ? 'offline' : 'online'
   const presence_reason: Observation['presence_reason'] = presence === 'online' ? null : goneNow || f.alive === false ? 'process_gone' : 'disconnected'
   const lifecycle: Observation['lifecycle'] = presence_reason === 'process_gone' ? 'stopped' : starting ? 'starting' : 'ready'
   // CONTRACT v1 (Chiron 03:07Z, CONTRACT.md:211): the main session is written `main`, a lane its full id (<agent>.<kind>.<n>), in every place (sessions[].id, main_session_id)
