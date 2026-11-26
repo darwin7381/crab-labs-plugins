@@ -66,6 +66,7 @@ import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type MenuActions } from './duty-officer.ts'
 import { DUTY_MENUS, ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { ObservationPut } from './onsen-observation.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
@@ -4662,10 +4663,12 @@ if (Lanes.LANES_ON) {
 //              main's M2 row and hook events (the tool, subagents, PreCompact, its own wall); lanes off, the transcript's turn; both, the usage-wall
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 /** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
- *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way */
-type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE'
+ *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way. WO-180: ONSEN_OBSERVATION
+ *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way */
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION'
 const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
-  SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE }
+  SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE,
+  ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION }
 let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
 function liveSetting(k: LiveKey): string | undefined {
   if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
@@ -4714,6 +4717,15 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // off, statusOf's view untouched. Onsen, the pin, /healthz, the lanes (onsenStatusCompute: decideWake, the 此刻 line, the same-matter gate, the Esc
   // wrap-up) and the wake rows' member_state all take this one. A change of statusOf's view is an event: the screen is looked at at once
   let lastObservation: Observation | null = null                       // WO-169 part 2: the observation composed with the record last handed out
+  // WO-180 (Chiron's ticket; Joey TG chiron:2549): that observation, as /healthz shows it, goes to Onsen (onsen-observation.ts): PUT
+  // /v1/members/<agent>/observation with the credential of /status/batch, as the record is handed out (feed) when it changed, else every 15 s (the
+  // record computed again); one in flight, the newest after it, nothing queued, no spool. ONSEN_OBSERVATION lists the agent (re-read as JEV_SCREEN)
+  const obsExceptions = join(process.env.LANES_DIR ?? join(AGENT_WORKSPACE_DIR, '.lanes'), 'run', 'screen-exceptions.jsonl')
+  const obsPut = new ObservationPut({ agent: ONSEN_AGENT, on: () => switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT),
+    put: (body, timeoutMs) => onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/observation`, new TextEncoder().encode(JSON.stringify(body)), 'application/json', timeoutMs),
+    refresh: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } },
+    exception: line => { try { mkdirSync(dirname(obsExceptions), { recursive: true }); appendFileSync(obsExceptions, JSON.stringify(line) + '\n') } catch {} },
+    log: (lv, m) => log(lv, m) })
   const feed = (v: OnsenStatus.StatusView): void => {
     let f: RecordFacts = {}
     try { f = recordFacts() } catch (e) { log('warn', `onsen: status facts: ${e}`) }
@@ -4721,6 +4733,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     const pub = r.view
     lastView = pub; lastObservation = r.observation
     status.update(pub); try { pin?.show(pub) } catch (e) { log('warn', `onsen: status pin: ${e}`) }
+    obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
     screenStatus?.programChanged(v)
     // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen).
     // WO-177 一: and M1 offers what it held the moment the record says the main can take it: the edge is the member state (decideWake's: a wall or a
@@ -4840,9 +4853,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
   }
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop(); avatarSync?.stop() }
-  // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; Onsen's endpoint for it is Epeius's to open)
-  onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation,
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); obsPut.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop(); avatarSync?.stop() }
+  // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; WO-180: the one obsPut sends to Onsen)
+  onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation, put: obsPut.health(),   // WO-180: is it being sent (sent, rejected, …)
     mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
     turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}),
     // WO-145: the visible half (only what is on)
