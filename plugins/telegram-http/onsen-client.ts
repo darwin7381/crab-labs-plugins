@@ -1072,8 +1072,10 @@ export class ActionHandle {
   version = 0
   state: ActionState = 'pending'
   appliedAt: string | null = null
+  /** the option Onsen has as answered (selected_option_id) */
+  selected: string | null = null
   tail: Promise<void> = Promise.resolve()
-  constructor(readonly key: string, readonly source: ActionSource | null, readonly assignees: string[], readonly menu_kind: string | null, readonly made = Date.now()) {}
+  constructor(readonly key: string, public source: ActionSource | null, public assignees: string[], public menu_kind: string | null, readonly made = Date.now()) {}
   /** a name in its assignees: `who` when it is one, else the first */
   assignee(who: string | null | undefined): string { return who && this.assignees.includes(who) ? who : this.assignees[0] ?? (who || 'joey') }
 }
@@ -1165,6 +1167,35 @@ export class OnsenActions {
       else this.fail(`cancel ${h.id}`, r)
     })
   }
+  /** WO-176 r2 (Onsen 0.24.0 join): a question to people about an Action that already stands for it (the duty officer asking about a permission prompt):
+   *  the ones not yet assignees are added (POST /v1/actions {action_id, assignees}, 200 with the Action; a change moves its version, which the handle
+   *  follows). Nothing to add, or the Action not open: no call. `done` hears the handle after the join (or at once when there was nothing to add) */
+  join(h: ActionHandle | null | undefined, assignees: string[], done?: (h: ActionHandle) => void): void {
+    if (!h) return
+    this.queue(h, async () => {
+      const add = assignees.filter(x => !h.assignees.includes(x))
+      if (h.id && h.state === 'open' && add.length) {
+        const r = await this.call('POST', '/v1/actions', { action_id: h.id, assignees })
+        if (r?.status === 200) { this.take(h, r.json?.data); this.o.log('info', `onsen action ${h.id}: joined by ${add.join(',')} (v${h.version})`) }
+        else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: not joined, not open (${errOf(r)})`) }
+        else this.fail(`join ${h.id}`, r)
+      }
+      try { done?.(h) } catch {}
+    })
+  }
+  /** WO-176 r2: the newest open Action this agent asked that `pred` takes (GET /v1/actions?requested_by=<agent>&state=open, one try, 3 s), as a handle
+   *  (its key `<prefix><id>`); null: none, or Onsen did not answer */
+  async findOpen(agent: string, pred: (d: any) => boolean, keyPrefix = 'adopted:'): Promise<ActionHandle | null> {
+    try {
+      const r = await this.o.req('GET', `/v1/actions?requested_by=${encodeURIComponent(agent)}&state=open`, undefined, 3000)
+      const items: any[] = r?.status === 200 && Array.isArray(r.json?.items) ? r.json.items : []
+      const d = items.filter(x => x && x.state === 'open' && /^\d{1,18}$/.test(String(x.id ?? '')) && pred(x)).sort((a, b) => Number(b.id) - Number(a.id))[0]
+      if (!d) return null
+      const h = this.adopt(String(d.id), Number(d.version) || 1, `${keyPrefix}${d.id}`)
+      this.take(h, d)
+      return h
+    } catch { return null }
+  }
   /** who answered it in Onsen (resolved_by), for the closing line in Telegram; null: not known within 3 s */
   async resolver(id: string): Promise<string | null> {
     try {
@@ -1183,6 +1214,7 @@ export class OnsenActions {
 
   private async appliedNow(h: ActionHandle, o: { at?: string; option_id?: string; resolved_by?: string }): Promise<void> {
     if (!h.id) return
+    if (h.appliedAt && (!o.option_id || o.option_id === h.selected)) return   // WO-176 r2: applied is reported once
     const r = await this.call('POST', `/v1/actions/${h.id}/applied`, o)
     if (r?.status === 200) { this.take(h, r.json?.data); this.stats.applied++; this.o.log('info', `onsen action ${h.id}: applied${o.option_id ? ` ${o.option_id}` : ''}`) }
     else if (r?.status === 409) { this.stats.conflicts++; this.o.log('info', `onsen action ${h.id}: applied not recorded (${errOf(r)})`) }
@@ -1194,6 +1226,10 @@ export class OnsenActions {
     if (Number.isInteger(d.version)) h.version = d.version
     if (typeof d.state === 'string') h.state = d.state as ActionState
     if (d.applied_at !== undefined) h.appliedAt = d.applied_at ?? null
+    if (d.selected_option_id !== undefined) h.selected = d.selected_option_id ?? null
+    if (Array.isArray(d.assignees) && d.assignees.every((x: unknown) => typeof x === 'string')) h.assignees = d.assignees
+    if (h.source == null && (d.source === 'permission' || d.source === 'menu')) h.source = d.source
+    if (h.menu_kind == null && typeof d.menu_kind === 'string') h.menu_kind = d.menu_kind
   }
   private keep(h: ActionHandle): void {
     this.byKey.set(h.key, h)

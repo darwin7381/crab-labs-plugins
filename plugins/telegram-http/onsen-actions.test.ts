@@ -26,8 +26,20 @@ function standIn(o: { fail?: (c: Call, n: number) => 'throw' | 503 | 429 | null;
     const f = o.fail?.(c, n)
     if (f === 'throw') throw new Error('connect ECONNREFUSED')
     if (f) return { status: f, json: { error: { code: 'service_unavailable', message: 'x' } } }
-    const allowed = path === '/v1/actions' ? CREATE : path.endsWith('/resolve') ? RESOLVE : path.endsWith('/applied') ? APPLIED : path.endsWith('/cancel') ? CANCEL : null
+    const allowed = path === '/v1/actions' ? (body?.action_id != null ? new Set(['action_id', 'assignees', 'requested_by']) : CREATE) : path.endsWith('/resolve') ? RESOLVE : path.endsWith('/applied') ? APPLIED : path.endsWith('/cancel') ? CANCEL : null
     if (method === 'POST' && allowed && Object.keys(body ?? {}).some(k => !allowed.has(k))) return { status: 400, json: { error: { code: 'invalid_request', message: 'field' } } }
+    if (method === 'POST' && path === '/v1/actions' && body?.action_id != null) {   // Onsen 0.24.0 join
+      const a = acts.get(String(body.action_id))
+      if (!a) return { status: 404, json: { error: { code: 'not_found', message: 'no' } } }
+      if (a.state !== 'open') return { status: 409, json: { error: { code: 'version_conflict', message: 'not open' } } }
+      const add = (body.assignees ?? []).filter((x: string) => !a.assignees.includes(x))
+      if (add.length) Object.assign(a, { assignees: [...a.assignees, ...add], version: a.version + 1 })
+      return { status: 200, json: { data: a } }
+    }
+    if (method === 'GET' && path.startsWith('/v1/actions?')) {
+      const q = new URLSearchParams(path.split('?')[1])
+      return { status: 200, json: { items: [...acts.values()].filter(a => (!q.get('state') || a.state === q.get('state')) && (!q.get('requested_by') || (a.requested_by ?? 'adam') === q.get('requested_by'))), next_cursor: null } }
+    }
     if (method === 'POST' && path === '/v1/actions') {
       const id = String(++next)
       const a = { id, version: 1, state: body.state ?? 'open', applied_at: body.state === 'resolved' ? new Date().toISOString() : null, selected_option_id: body.selected_option_id ?? null,
@@ -202,6 +214,69 @@ describe('OnsenActions', () => {
     await tick()
     expect(s.calls).toEqual([])
     expect(a.stats.skipped).toBe(3)
+  })
+
+  test('applied is reported once (WO-176 r2): the same answer again makes no call; another option than the recorded one still does', async () => {
+    const s = standIn()
+    const a = new OnsenActions({ req: s.req, log })
+    const h = a.open(perm, 'k')!
+    await h.tail
+    Object.assign(s.acts.get('1'), { state: 'resolved', selected_option_id: 'deny', resolved_by: 'joey', version: 2 })
+    a.applied(h, { at: '2026-11-26T04:10:00.000Z' })
+    a.applied(h, {})
+    a.applied(h, { option_id: 'deny', resolved_by: 'joey' })
+    await h.tail
+    expect(s.calls.filter(c => c.path === '/v1/actions/1/applied')).toHaveLength(1)
+    expect(h.selected).toBe('deny')
+    a.applied(h, { option_id: 'allow', resolved_by: 'joey' })          // what was really pressed differs: Onsen hears it (and answers 409: applied already)
+    await h.tail
+    expect(s.calls.filter(c => c.path === '/v1/actions/1/applied')).toHaveLength(2)
+    // two cancels queued for one Action (the officer's closeGone and the channel's close): one call
+    const h2 = a.open(perm, 'k2')!
+    a.cancel(h2, 'menu gone'); a.cancel(h2, 'session closed')
+    await h2.tail
+    expect(s.calls.filter(c => c.path === '/v1/actions/2/cancel')).toHaveLength(1)
+  })
+
+  test('join (Onsen 0.24.0): only the people not assignees yet, behind the create; the handle follows the new version and assignees; nothing to add: no call', async () => {
+    const s = standIn({ delayMs: 10 })
+    const a = new OnsenActions({ req: s.req, log })
+    const h = a.open(perm, 'k')!                                        // assignees [joey]
+    let seen = -1
+    a.join(h, ['joey'], x => { seen = x.version })
+    await h.tail
+    expect(s.calls.filter(c => c.body?.action_id != null)).toHaveLength(0)
+    expect(seen).toBe(1)
+    a.join(h, ['joey', 'joey-test'], x => { seen = x.version })
+    await h.tail
+    const j = s.calls.filter(c => c.body?.action_id != null)
+    expect(j).toHaveLength(1)
+    expect(j[0]!.body).toEqual({ action_id: '1', assignees: ['joey', 'joey-test'] })
+    expect([h.version, h.assignees, seen]).toEqual([2, ['joey', 'joey-test'], 2])
+    // the next resolve carries the joined version; the presser joey-test is an assignee now
+    a.pressedElsewhere(h, 'allow', 'joey-test')
+    await h.tail
+    expect(s.calls.find(c => c.path === '/v1/actions/1/resolve')!.body).toEqual({ option_id: 'allow', expected_version: 2, resolved_by: 'joey-test' })
+    // not open any more: no join call
+    const n = s.calls.length
+    a.join(h, ['someone'])
+    await h.tail
+    expect(s.calls.length).toBe(n)
+  })
+
+  test('findOpen: the newest open Action of this agent that the test takes, as a handle (one GET, 3 s); none: null', async () => {
+    const s = standIn()
+    const a = new OnsenActions({ req: s.req, log })
+    const h1 = a.open(perm, 'k1')!; await h1.tail
+    const h2 = a.open({ ...perm, session_id: 'adam.lane.3' }, 'k2')!; await h2.tail
+    const h3 = a.open({ ...perm, source: 'menu', menu_kind: 'model_picker' }, 'k3')!; await h3.tail
+    const b = new OnsenActions({ req: s.req, log })                    // a restarted daemon: it holds none of them
+    const f = await b.findOpen('adam', d => d.source === 'permission' && (d.session_id ?? 'main') === 'main', 'perm:adam:adopted:')
+    expect(f).toMatchObject({ id: '1', version: 1, state: 'open', key: 'perm:adam:adopted:1', source: 'permission', assignees: ['joey'] })
+    expect(s.calls.at(-1)).toMatchObject({ method: 'GET', path: '/v1/actions?requested_by=adam&state=open' })
+    expect(b.find(null, '1')).toBe(f!)
+    expect(await b.findOpen('adam', d => d.source === 'card')).toBeNull()
+    expect(await new OnsenActions({ req: async () => { throw new Error('down') }, log }).findOpen('adam', () => true)).toBeNull()
   })
 
   test('newestOpen: the newest Action still open of a kind', async () => {

@@ -255,10 +255,10 @@ test('pressed in Onsen: Claude Code is answered, the Action applied, every copy 
     expect(e.body.reply_markup).toEqual({ inline_keyboard: [] })
   }
   expect(of(id, 'resolve')).toHaveLength(0)                            // Onsen resolved it; the daemon only reports applied
-  // the same control again (a redelivery): applied (no change), nothing pressed or edited twice
+  // the same control again (a redelivery): nothing pressed, edited or reported twice (WO-176 r2: applied is reported once)
   expect((await control(c)).status).toBe(202)
-  expect(await until(() => of(id, 'applied').length === 2)).toBe(true)
-  await sleep(300)
+  await sleep(600)
+  expect(of(id, 'applied')).toHaveLength(1)
   expect(s.perms).toHaveLength(1)
   expect(api.of('editMessageText').length).toBe(e0 + 2)
   // a tap after that: Claude Code is not answered twice
@@ -304,9 +304,8 @@ test('Onsen answered first, then Telegram was pressed: Onsen hears what Telegram
   expect(actions.get(id)).toMatchObject({ selected_option_id: 'allow', resolved_by: 'joey' })
   expect(actions.get(id).applied_at).toBeTruthy()
   expect((await control(c)).status).toBe(202)
-  expect(await until(() => of(id, 'applied').length === 2)).toBe(true)
-  expect(of(id, 'applied')[1]!.body).toMatchObject({ option_id: 'allow', resolved_by: 'joey' })
-  await sleep(300)
+  await sleep(600)
+  expect(of(id, 'applied')).toHaveLength(1)                            // WO-176 r2: what Telegram pressed is reported once
   expect(s.perms).toHaveLength(1)
 }, 30000)
 
@@ -394,7 +393,7 @@ test('the Telegram daemon does not take it: three tries, then acked, the Action 
   expect(ib.log()).toContain('not handed over')
 }, 60000)
 
-test('the Telegram daemon restarts with a prompt open: its Action is cancelled at the next start (nobody can answer it there any more)', async () => {
+test('the Telegram daemon restarts with a prompt open: its Action is cancelled after the restart grace (nobody took it over; nobody can answer it there any more)', async () => {
   const s = await session(tg.port, tok)
   await ask(s, 'kmnpq', 'Bash', 'kubectl apply')
   expect(await until(() => !!created('Bash：kubectl apply'))).toBe(true)
@@ -406,8 +405,14 @@ test('the Telegram daemon restarts with a prompt open: its Action is cancelled a
   expect(Object.keys(open).every(k => actions.get(k)?.state === 'open')).toBe(true)
   await tg.stop()
   tg = await startTgDaemon(api, join(root, 'tg'), JOEY, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_RECORD: '0',
-    ONSEN_CREDENTIAL_FILE: join(root, 'cred'), AGENT_INBOX_REGISTRY: join(root, 'registry.json') })
+    ONSEN_CREDENTIAL_FILE: join(root, 'cred'), AGENT_INBOX_REGISTRY: join(root, 'registry.json'), ONSEN_PERM_RESTART_GRACE_MS: '3000' })
+  const up = Date.now()
+  // within the grace: still open (a duty officer asking about the prompt still on the screen would take it over); kept in the file
+  await sleep(1000)
+  expect(of(id, 'cancel')).toHaveLength(0)
+  expect(JSON.parse(readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8'))[id]).toBe(1)
   expect(await until(() => of(id, 'cancel').length === 1, 15000)).toBe(true)
+  expect(Date.now() - up).toBeGreaterThanOrEqual(2500)
   expect(of(id, 'cancel')[0]!.body).toMatchObject({ expected_version: 1, reason: expect.stringContaining('常駐程式重開了') })
   expect(await until(() => Object.keys(open).every(k => actions.get(k)?.state === 'cancelled'), 10000)).toBe(true)
   expect(JSON.parse(readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8'))).toEqual({})

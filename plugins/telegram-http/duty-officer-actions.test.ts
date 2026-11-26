@@ -10,7 +10,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DutyOfficer, askBody, optionIdOf, optionIndexOf, type Decision, type MenuActions, type ModelResult, type OfficerDeps, type PaneInfo, type Sent, type Tmux } from './duty-officer.ts'
+import { DutyOfficer, askBody, optionIdOf, optionIndexOf, permOptionOf, type Decision, type MenuActions, type ModelResult, type OfficerDeps, type PaneInfo, type Sent, type Tmux } from './duty-officer.ts'
 
 const DIALOG = [
   '╭──────────────────────────────────────────────╮',
@@ -32,7 +32,7 @@ const decision = (over: Partial<Decision> = {}): Decision => ({
 })
 
 type ACall = { op: string; [k: string]: any }
-function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean } = {}) {
+function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?: MenuActions['shared'] } = {}) {
   const calls: ACall[] = []
   let next = 40
   const guard = (op: string) => { if (o.throws) throw new Error(`boom ${op}`) }
@@ -45,8 +45,10 @@ function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean } = {}) {
     applied: (ref, x) => { guard('applied'); calls.push({ op: 'applied', ref, ...x }) },
     cancel: (ref, reason) => { guard('cancel'); calls.push({ op: 'cancel', ref, reason }) },
     screenPressed: (tmux, menu) => { calls.push({ op: 'screen', tmux, menu }) },
+    ...(o.shared ? { shared: (t: { tmux: string; test?: boolean }, menu: string | null, assignees: string[], joined: (v: number) => void) => {
+      calls.push({ op: 'shared', tmux: t.tmux, menu, assignees }); return o.shared!(t, menu, assignees, joined) } } : {}),
   }
-  return { acts, calls, ops: () => calls.filter(c => c.op !== 'pane').map(c => c.op) }
+  return { acts, calls, ops: () => calls.filter(c => c.op !== 'pane' && c.op !== 'shared').map(c => c.op) }
 }
 
 function rig(opts: { model?: (n: number) => ModelResult; onKey?: (k: string, p: { pane: string }) => void; actions?: MenuActions; dir?: string } = {}) {
@@ -292,6 +294,118 @@ describe('the duty officer\'s menus as Actions', () => {
     expect(r.o.openActionFor('other', 'permission')).toBeNull()
     await r.o.onTap(r.sent[0]!.buttons[0][0].callback_data, '@Advac777', 'joey')
     expect(r.o.openActionFor('claude-x', 'permission')).toBeNull()
+  })
+
+  // ---- WO-176 r2 (CONTRACT §6 「畫面上同一個詢問只有一個 Action」): a question about a permission prompt uses the channel's Action for it
+  const PERM_KEY = 'perm:adam:abcde:1700000000000'
+  const sharing = (o: { id?: string; joinTo?: number; async?: boolean } = { id: '7' }) => fakeActions({ shared: (_t, menu, _as, joined) => {
+    const r = menu === 'permission' ? { key: PERM_KEY, ...(o.id ? { id: o.id, version: 1 } : {}) } : null
+    if (r && o.joinTo) setTimeout(() => joined(o.joinTo!), 5)                 // the join moved its version
+    return o.async ? Promise.resolve(r) : r
+  } })
+  const permDecision = (extra: any[] = []) => decision({ action: 'ask_joey', to_joey: 'claude-x 要刪 build cache，要你決定。',
+    options: [{ on_screen: '1. Yes', means: '執行', button: '可以', keys: ['Enter'] }, { on_screen: "2. Yes, and don't ask again for rm commands", means: '以後都可以', button: '以後都可以', keys: ['Down', 'Enter'] },
+      { on_screen: '3. No, and tell Claude what to do differently (esc)', means: '不執行', button: '不要', keys: ['Down', 'Down', 'Enter'] }, ...extra] })
+  async function sharedAsk(f = sharing(), extra: any[] = []) {
+    const r = rig({ model: () => ({ decision: permDecision(extra), meta: {}, fail: null }), onKey: (k, p) => { if (k === 'Enter') p.pane = IDLE }, actions: f.acts })
+    await r.advance(0); await r.advance(9000); await r.settle()
+    return r
+  }
+
+  test('r2: a question about the permission prompt the channel made an Action for opens no second Action; the ask uses that one (key, id)', async () => {
+    const f = sharing()
+    const r = await sharedAsk(f)
+    expect(r.sent).toHaveLength(1)                                       // Telegram exactly as before
+    expect(f.ops()).toEqual([])                                          // no open
+    expect(f.calls.find(c => c.op === 'shared')).toEqual({ op: 'shared', tmux: 'claude-x', menu: 'permission', assignees: ['joey', 'joey-test'] })   // the people it asks
+    expect(r.askFile()).toMatchObject({ action_key: PERM_KEY, action_id: '7', action_version: 1, action_shared: 'permission', menu_kind: 'permission' })
+    expect(r.log().some(e => e.event === 'action' && e.action_id === '7' && e.shared === 'permission')).toBe(true)
+    expect(r.o.openActionFor('claude-x', 'permission')).toBe('7')
+  })
+
+  test('r2: found after a restart (async), joined by the people it asks: the ask follows the version the join returned; the tap resolves at it', async () => {
+    const f = sharing({ id: '7', joinTo: 2, async: true })
+    const r = await sharedAsk(f)
+    await new Promise(x => setTimeout(x, 20)); await r.settle()
+    expect(r.askFile()).toMatchObject({ action_id: '7', action_version: 2, action_shared: 'permission' })
+    await r.o.onTap(r.sent[0]!.buttons[0][0].callback_data, '@Advac777', 'joey-test')
+    expect(f.calls.find(c => c.op === 'answered')).toMatchObject({ ref: { key: PERM_KEY, id: '7', version: 2 }, option_id: 'allow', member: 'joey-test' })
+  })
+
+  test('r2: its tap resolves that same Action as allow / deny (the screen\'s Yes… / No…); Telegram\'s text as before', async () => {
+    for (const [i, want] of [[0, 'allow'], [1, 'allow'], [2, 'deny']] as const) {
+      const f = sharing()
+      const r = await sharedAsk(f)
+      expect(await r.o.onTap(r.sent[0]!.buttons[i][0].callback_data, '@Advac777', 'joey')).toBe('按了，畫面已經往下走')
+      expect(f.calls.filter(c => c.op === 'answered')).toEqual([{ op: 'answered', ref: { key: PERM_KEY, id: '7', version: 1 }, option_id: want, member: 'joey', at: expect.any(String) }])
+      expect(f.calls.some(c => c.op === 'open' || c.op === 'cancel')).toBe(false)
+      expect(r.askFile().closed).toMatchObject({ how: 'answered', option_id: want, via: 'telegram' })
+      expect(r.edits.every(e => e.text.includes('@Advac777 選了') && !e.text.includes('從 Onsen 按的'))).toBe(true)
+    }
+  })
+
+  test('r2: an option that is neither allow nor deny: the prompt is over on the screen, so the shared Action is cancelled (once)', async () => {
+    const f = sharing()
+    const r = await sharedAsk(f, [{ on_screen: '4. Explain this command', means: '解釋', button: '解釋', keys: ['Down', 'Down', 'Down', 'Enter'] }])
+    await r.o.onTap(r.sent[0]!.buttons[3][0].callback_data, '@Advac777', 'joey')
+    expect(f.calls.filter(c => c.op === 'cancel')).toEqual([{ op: 'cancel', ref: expect.objectContaining({ key: PERM_KEY, id: '7' }), reason: '在畫面上按了「解釋」' }])
+    expect(f.calls.some(c => c.op === 'answered')).toBe(false)
+  })
+
+  test('r2: the screen leaves the prompt: one cancel of the shared Action (the daemon reports it once, whoever sees the end first)', async () => {
+    const f = sharing()
+    const r = await sharedAsk(f)
+    r.pane.pane = IDLE
+    await r.advance(3000); await r.settle()
+    expect(f.calls.filter(c => c.op === 'cancel')).toEqual([{ op: 'cancel', ref: expect.objectContaining({ key: PERM_KEY, id: '7' }), reason: '畫面已經離開這個選單（現在閒著）' }])
+    expect(r.edits[0]!.text).toContain('不用選了')                          // Telegram as before
+  })
+
+  test('r2: the channel\'s Action not made yet (no id): the ask follows it by key; Onsen\'s control for it (the channel prompt gone) presses the matching option', async () => {
+    const f = sharing({})
+    const r = await sharedAsk(f)
+    expect(r.askFile()).toMatchObject({ action_key: PERM_KEY, action_shared: 'permission' })
+    expect(r.askFile().action_id).toBeUndefined()
+    await r.o.onTap(r.sent[0]!.buttons[2][0].callback_data, '@Advac777', 'joey')
+    expect(f.calls.find(c => c.op === 'answered')).toMatchObject({ ref: { key: PERM_KEY }, option_id: 'deny' })
+    // with an id: Onsen pressed allow on it and the daemon had no channel prompt left for it → the officer presses the Yes option
+    const f2 = sharing()
+    const r2 = await sharedAsk(f2)
+    expect(await r2.o.onOnsen('7', 'allow', 2, Promise.resolve('joey'))).toBe('按了，畫面已經往下走')
+    expect(r2.keys).toEqual(['Enter'])
+    expect(f2.calls.filter(c => c.op === 'applied')).toEqual([{ op: 'applied', ref: expect.objectContaining({ id: '7', version: 2 }), at: expect.any(String), option_id: 'allow' }])
+    expect(r2.edits.every(e => e.text.endsWith('\n從 Onsen 按的'))).toBe(true)
+    const f3 = sharing()
+    const r3 = await sharedAsk(f3)
+    expect(await r3.o.onOnsen('7', '1', 2)).toBe('no such option')    // the shared Action's options are allow / deny
+    expect(r3.keys).toEqual([])
+  })
+
+  test('r2: no channel Action for it (shared null), or not a permission prompt: its own Action as before; a restart hands a shared one\'s cancel to MenuActions', async () => {
+    const f = fakeActions({ shared: () => null })
+    const r = await sharedAsk(f)
+    expect(f.ops()).toEqual(['open'])
+    expect(r.askFile().action_shared).toBeUndefined()
+    const f2 = fakeActions({ pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }), shared: () => ({ key: PERM_KEY, id: '7', version: 1 }) })
+    await sharedAsk(f2)
+    expect(f2.calls.some(c => c.op === 'shared')).toBe(false)           // asked only for a permission prompt
+    expect(f2.ops()).toEqual(['open'])
+    // a restart: a shared ask's cancel goes to MenuActions too, which leaves it alone while it is still the channel's (server.ts: the restart grace)
+    const r3 = await sharedAsk(sharing())
+    const f4 = sharing()
+    expect(rig({ dir: r3.dir, actions: f4.acts }).o.cancelOrphans()).toBe(1)
+    expect(f4.calls.filter(c => c.op === 'cancel')).toEqual([{ op: 'cancel', ref: expect.objectContaining({ key: PERM_KEY, id: '7' }), reason: expect.stringContaining('常駐程式重開了') }])
+  })
+
+  test('permOptionOf: Claude Code\'s permission options as allow / deny', () => {
+    expect(permOptionOf({ screen: '1. Yes' })).toBe('allow')
+    expect(permOptionOf({ screen: "❯ 2. Yes, and don't ask again for git commands in /repo" })).toBe('allow')
+    expect(permOptionOf({ screen: '3. No, and tell Claude what to do differently (esc)' })).toBe('deny')
+    expect(permOptionOf({ button: '允許' })).toBe('allow')
+    expect(permOptionOf({ button: 'Deny' })).toBe('deny')
+    expect(permOptionOf({ screen: '4. Explain', button: '解釋' })).toBeNull()
+    expect(permOptionOf({ screen: '', button: '2. No' })).toBe('deny')
+    expect(permOptionOf(undefined)).toBeNull()
   })
 
   test('helpers: option ids are index + 1; the body puts the screen in code blocks', () => {
