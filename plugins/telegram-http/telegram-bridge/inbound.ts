@@ -58,6 +58,8 @@ export type PollerDeps = {
   pollTimeoutS?: number
   /** the Onsen-down sentence after this long (default SORRY_MS, 15 s) */
   sorryMs?: number
+  /** a member leaving the list got Telegram's 409 (its daemon polls the bot now): the bridge lets it go (called once, after this loop ended) */
+  onHandover?: (a: Agent) => void
   /** shared by the bridge's pollers: until when client_meta is left out (an Onsen that does not take it yet answered 400 naming it) */
   clientMeta?: { offUntil: number }
 }
@@ -163,7 +165,12 @@ export class Poller {
   private blocked(): boolean { for (const e of this.entries.values()) if (!e.done && e.kind === 'write') return true; return false }
   pendingWrites(): number { let n = 0; for (const e of this.entries.values()) if (!e.done && e.kind === 'write') n++; return n }
 
+  handedOver = false
   private async loop(): Promise<void> {
+    await this.loopInner()
+    if (this.handedOver) queueMicrotask(() => this.d.onHandover?.(this.a))
+  }
+  private async loopInner(): Promise<void> {
     while (this.running) {
       const blocked = this.blocked()
       let ups: any[] = []
@@ -175,6 +182,9 @@ export class Poller {
       } catch (e) {
         if (!this.running) break
         const conflict = e instanceof TgError && e.code === 409
+        // handing over (off the list): a 409 is its daemon polling the bot again, the signal to let go, not a poller to wait out. No more
+        // getUpdates from here (another would end the daemon's): what was done was confirmed by the calls before this one
+        if (conflict && this.a.leaving) { this.handedOver = true; this.running = false; break }
         if (conflict) { this.stats.conflicts++; if (!this.a.telegramConflict) this.d.log('warn', `${this.a.member}: Telegram 409: another program is polling @${this.a.username}; waiting for it to stop`); this.a.telegramConflict = true }
         else this.d.log('warn', `${this.a.member}: getUpdates failed: ${errText(e)}`)
         // a 409 is another poller still on the bot (a daemon handing it over): look again every 3 s, so the handover gap is seconds, not ~50 s of

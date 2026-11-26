@@ -97,7 +97,7 @@ export class Drawer {
         case 'action_resolved': return await this.drawResolved(a, item)
         case 'observation': {
           if (this.now() - Date.parse(item.at) > OLD_MS) return
-          a.observe(String(item.chat), item.status)
+          a.observe(String(item.chat), item.status, item.at)
           return
         }
         default:

@@ -7,6 +7,8 @@ import { join } from 'node:path'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
 import { LIFTED_TEXT, LINE_TEXT, menuOf } from './stage-two.ts'
 import { Bridge, configFromEnv } from './telegram-bridge.ts'
+import { pinLine } from './agent.ts'
+import { SinceTracker } from '../onsen-visible.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'tgb2-'))
 const home = join(root, 'home')
@@ -40,6 +42,7 @@ beforeAll(async () => {
     TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '1',
     CHANNEL_BOT_TRANSCRIBE_CMD: join(root, 'fake-whisper.sh'),
     TELEGRAM_BRIDGE_PIN_CHECK_S: '0.3', TELEGRAM_BRIDGE_PIN_EDIT_MS: '100',
+    TELEGRAM_BRIDGE_HANDOVER_S: '2',
   }), { log: (l, m) => logs.push(`${l} ${m}`) })
   await b.start()
   let on = true
@@ -295,5 +298,47 @@ describe('stage two', () => {
     await Bun.sleep(3500)
     expect(tg.callsOf(TOK, 'editMessageReplyMarkup').filter(p => p.message_id === m2.message_id).length).toBeLessThanOrEqual(1)
     expect(tg.callsOf(TOK, 'editMessageText').find(p => p.message_id === m2.message_id).rich_message.markdown).toBe('🔐 Bash\n\n→ Allow（Joey）')
+  }, T)
+
+  test('offline in the pin reads from when it went offline: presence_since, else the observation\'s own time, not the idle stretch before', () => {
+    const now = Date.parse('2026-11-26T18:50:00Z'), since = new SinceTracker({ now: () => now })
+    const st = { presence: 'offline', presence_reason: 'process_gone', main_session_id: 'main', sessions: [{ id: 'main', kind: 'main', activity: 'unknown', activity_since: '2026-11-26T18:39:00Z' }] }
+    expect(pinLine(st, since, now, Date.parse('2026-11-26T18:46:00Z'))).toBe('⚫ 失連（02:46 起）：行程不在了')
+    expect(pinLine({ ...st, presence_since: '2026-11-26T18:45:00Z' }, since, now, Date.parse('2026-11-26T18:46:00Z'))).toBe('⚫ 失連（02:45 起）：行程不在了')
+  })
+
+  test('off the list: carried until Telegram answers 409 (its daemon polls the bot), then let go; no 409: let go at the hand-over time; back on the list meanwhile: kept', async () => {
+    const env = join(home, '.config', 'crab-labs-plugins', 'env')
+    const carried = () => b.agents.has('gamma') && b.pollers.get('gamma')?.running === true
+    const recs = () => (onsen.lists.get('telegram-bridge-txmonster') ?? []).map((r: any) => `${r.id}:${r.state}`)
+    // 1. off the list, then the daemon polls: still drawn meanwhile, then let go on the 409
+    put(env, 'ONSEN_BRIDGE=someone-else\n')
+    await until(() => !!b.agents.get('gamma')?.leaving, 2000, 'leaving')
+    expect(carried()).toBe(true); expect(recs()).toEqual(['gamma:ok'])
+    onsen.push(msgItem('h1', 'during the hand-over'))
+    await until(() => onsen.reports.some(r => r.id === 'h1'), 3000, 'still drawn')
+    const daemon = (async () => { for (let i = 0; i < 6 && b.agents.has('gamma'); i++) await fetch(`${tg.root}/bot${TOK}/getUpdates`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ timeout: 1 }) }).then(r => r.text()) })()
+    await until(() => !b.agents.has('gamma'), 1800, 'let go on the 409 (before the 2 s hand-over time)')
+    await daemon
+    expect(logs.filter(l => l.includes('gamma: not carried any more (its daemon polls the bot again (Telegram 409): handed over)')).length).toBe(1)
+    await until(() => !recs().includes('gamma:ok'), 2000, 'record gone')
+    // 2. back on the list, off again, no 409: let go at the hand-over time
+    put(env, 'ONSEN_BRIDGE=*\n')
+    await until(() => carried(), 4000, 'carried again')
+    const t0 = Date.now()
+    put(env, 'ONSEN_BRIDGE=someone-else\n')
+    await until(() => !b.agents.has('gamma'), 5000, 'let go at the hand-over time')
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(1800)
+    expect(logs.some(l => l.includes('gamma: not carried any more (off the list and no Telegram 409 in 2 s: let go)'))).toBe(true)
+    // 3. off and back on within the hand-over: kept, never let go
+    put(env, 'ONSEN_BRIDGE=*\n')
+    await until(() => carried(), 4000, 'carried again')
+    put(env, 'ONSEN_BRIDGE=someone-else\n')
+    await until(() => !!b.agents.get('gamma')?.leaving, 2000, 'leaving again')
+    put(env, 'ONSEN_BRIDGE=*\n')
+    await until(() => b.agents.get('gamma')?.leaving === null, 2000, 'back on the list')
+    await Bun.sleep(2500)
+    expect(carried()).toBe(true)
+    expect(logs.some(l => l.includes('gamma: back on the list during its hand-over: kept'))).toBe(true)
   }, T)
 })

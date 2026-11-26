@@ -40,7 +40,7 @@ export type Config = {
   machine: string; name: string; base: string; credentialFile: string; stateDir: string; home: string; platform: string
   env: NodeJS.ProcessEnv; settingsFile: string
   settingsMs: number; endpointsMs: number; registerMs: number; membersMs: number; conflictRetryMs: number; feedWaitS: number; pollTimeoutS: number
-  tg: TgOptions; useRich: boolean; version: string; pinCheckMs?: number; pinMinEditMs?: number; onsenTimeoutMs: number; sorryMs: number; retryDelaysMs: number[]
+  tg: TgOptions; useRich: boolean; version: string; handoverMs: number; pinCheckMs?: number; pinMinEditMs?: number; onsenTimeoutMs: number; sorryMs: number; retryDelaysMs: number[]
   voice: { on: boolean; cmd: string; whisper: string; model: string; dir: string }
 }
 
@@ -72,6 +72,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
       uploadTimeoutMs: num(env.TELEGRAM_UPLOAD_TIMEOUT_S, 300, 1) * 1000 },
     useRich: isRich(env),
     onsenTimeoutMs: num(env.TELEGRAM_BRIDGE_ONSEN_TIMEOUT_MS, 15_000, 100),
+    handoverMs: num(env.TELEGRAM_BRIDGE_HANDOVER_S, 60, 0.05) * 1000,
     ...(env.TELEGRAM_BRIDGE_PIN_CHECK_S ? { pinCheckMs: num(env.TELEGRAM_BRIDGE_PIN_CHECK_S, 60, 0.05) * 1000 } : {}),
     ...(env.TELEGRAM_BRIDGE_PIN_EDIT_MS ? { pinMinEditMs: num(env.TELEGRAM_BRIDGE_PIN_EDIT_MS, 5000, 0) } : {}),
     sorryMs: num(env.TELEGRAM_BRIDGE_SORRY_S, 15, 0) * 1000,
@@ -199,7 +200,11 @@ export class Bridge {
     this.missing.clear()
     for (const [m, a] of [...this.agents]) {
       const w = want.get(m)
-      if (!w || w.stateDir !== a.stateDir || (this.known && !this.known.has(m))) await this.drop(m, !w ? 'no longer listed' : w.stateDir !== a.stateDir ? 'its state dir changed' : 'Onsen does not know it')
+      // off the list: carried on until its daemon takes the bot back (Telegram 409) or the hand-over time is up (tick); back on the list meanwhile: kept
+      if (!w && !a.leaving) { a.leaving = { since: this.now() }; this.log('info', `${m}: off the list: still carried until its daemon polls @${a.username} (Telegram 409) or ${Math.round(this.cfg.handoverMs / 1000)} s`); continue }
+      if (!w) continue
+      if (a.leaving) { a.leaving = null; this.log('info', `${m}: back on the list during its hand-over: kept`) }
+      if (w.stateDir !== a.stateDir || (this.known && !this.known.has(m))) await this.drop(m, w.stateDir !== a.stateDir ? 'its state dir changed' : 'Onsen does not know it')
     }
     for (const [m, w] of want) {
       if (this.known && !this.known.has(m)) { this.missing.set(m, { stateDir: w.stateDir, source: w.source, why: 'Onsen 沒有這個成員' }); continue }
@@ -264,6 +269,7 @@ export class Bridge {
     const p = new Poller(a, {
       onsen: this.onsen, state: this.state, log: (l, msg) => this.log(l, msg), now: this.deps.now, pollTimeoutS: this.cfg.pollTimeoutS,
       buttonKey: k => this.state.data.keys[k] ?? null, reRegister: () => { this.endpointsDirty = true; this.needRegister = true },
+      onHandover: ag => { void this.drop(ag.member, 'its daemon polls the bot again (Telegram 409): handed over') },
       voice: this.cfg.voice, sorryMs: this.cfg.sorryMs, clientMeta: this.clientMeta, onButton: (ag, cq) => this.two.button(ag, cq),
       noteTopic: (m, c, t, n) => this.two.noteTopic(m, c, t, n), topicName: (m, c, t) => this.two.topicName(m, c, t), ...(this.deps.pollerExtra ?? {}),
     })
@@ -395,6 +401,7 @@ export class Bridge {
       if (!had && this.known) await this.reconcile()
     }
     const now = this.recordsKey()
+    for (const a of [...this.agents.values()]) if (a.leaving && t - a.leaving.since >= this.cfg.handoverMs) await this.drop(a.member, `off the list and no Telegram 409 in ${Math.round(this.cfg.handoverMs / 1000)} s: let go`)
     const conflictDue = [...this.agents.values()].some(a => a.state === 'conflict' && t - (this.conflictAt.get(a.member) ?? 0) >= this.cfg.conflictRetryMs)
     if (this.endpointsDirty || conflictDue || now !== this.lastEndpoints || t - this.endpointsAt >= this.cfg.endpointsMs) await this.syncEndpoints()
     if (t - this.approvalsAt >= 5_000) { this.approvalsAt = t; for (const p of this.pollers.values()) if (p.running) await p.approvals() }

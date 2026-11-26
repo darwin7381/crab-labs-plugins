@@ -64,7 +64,7 @@ function mkBridge(machine: 'macmini' | 'mbp', stateDir: string, extra: Record<st
     HOME: home, TELEGRAM_BRIDGE_MACHINE: machine, ONSEN_BASE: onsen.base, TELEGRAM_API_ROOT: tg.root, TELEGRAM_BRIDGE_STATE_DIR: stateDir,
     CRAB_LABS_PLUGINS_ENV: settingsFile, TELEGRAM_BRIDGE_PLATFORM: 'darwin', TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1',
     TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '0', TELEGRAM_BRIDGE_SORRY_S: '1.5', TELEGRAM_BRIDGE_RETRY_S: '0.2,0.3,0.4',
-    TELEGRAM_BRIDGE_ONSEN_TIMEOUT_MS: '2000', TELEGRAM_BRIDGE_CONFLICT_RETRY_S: '0.5', ...extra,
+    TELEGRAM_BRIDGE_ONSEN_TIMEOUT_MS: '2000', TELEGRAM_BRIDGE_CONFLICT_RETRY_S: '0.5', TELEGRAM_BRIDGE_HANDOVER_S: '0.5', ...extra,
   }
   return new Bridge(configFromEnv(env), { log: (l, m) => logs.push(`${l} ${m}`) })
 }
