@@ -161,11 +161,20 @@ test('WO-197 segment 2 (sonn\'s ruling 9): a thread Onsen refuses (a Telegram to
   expect(await ids.thread('1828', '7002')).toBe('302')
 })
 
-test('WO-197 segment 2 (sonn\'s ruling 4): the lane\'s or router\'s label line Onsen draws itself is dropped from the text; another first line stays', () => {
+test('WO-197 segment 2 (sonn\'s ruling 4; Chiron mesh 12916 point 4): the lane\'s or router\'s label Onsen draws itself leaves the text; what follows it on the line is the first line; another first line stays', () => {
   const kind = (k: string) => ({ worker: '工作線', fork: '分身線' } as Record<string, string>)[k] ?? k
+  // equal: the line dropped (as before)
   expect(withoutOnsenLabel('〔adam·工作線#1〕\n做完了', 'adam.worker.1', 'adam', kind)).toBe('做完了')
   expect(withoutOnsenLabel('〔adam·分流器〕\n收到', 'router', 'adam', kind)).toBe('收到')
-  expect(withoutOnsenLabel('〔adam·工作線#1｜負責：主線〕\n做完了', 'adam.worker.1', 'adam', kind)).toBe('〔adam·工作線#1｜負責：主線〕\n做完了')
+  expect(withoutOnsenLabel('〔adam·工作線#1〕', 'adam.worker.1', 'adam', kind)).toBe('〔adam·工作線#1〕')   // only the label: kept, never an empty text
+  // starts with the label: the label goes, 「負責：X」 (no leading 「｜」) is the first line
+  expect(withoutOnsenLabel('〔adam·工作線#1〕｜負責：主線\n做完了', 'adam.worker.1', 'adam', kind)).toBe('負責：主線\n做完了')
+  expect(withoutOnsenLabel('〔adam·工作線#1｜負責：主線〕\n做完了\n第二行', 'adam.worker.1', 'adam', kind)).toBe('負責：主線\n做完了\n第二行')   // lanes.ts pushJoey's head
+  expect(withoutOnsenLabel('〔adam·工作線#1〕｜負責：主線', 'adam.worker.1', 'adam', kind)).toBe('負責：主線')
+  // does not start with it: unchanged
+  expect(withoutOnsenLabel('〔adam·工作線#12〕\nx', 'adam.worker.1', 'adam', kind)).toBe('〔adam·工作線#12〕\nx')
+  expect(withoutOnsenLabel('〔adam·工作線#12｜負責：主線〕\nx', 'adam.worker.1', 'adam', kind)).toBe('〔adam·工作線#12｜負責：主線〕\nx')
+  expect(withoutOnsenLabel('前言〔adam·工作線#1〕\nx', 'adam.worker.1', 'adam', kind)).toBe('前言〔adam·工作線#1〕\nx')
   expect(withoutOnsenLabel('〔adam·分身線#2〕\nx', 'adam.worker.2', 'adam', kind)).toBe('〔adam·分身線#2〕\nx')
   expect(withoutOnsenLabel('一行', 'adam.worker.1', 'adam', kind)).toBe('一行')
   expect(withoutOnsenLabel('〔adam·工作線#1〕\nx', 'main', 'adam', kind)).toBe('〔adam·工作線#1〕\nx')

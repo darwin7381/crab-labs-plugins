@@ -250,11 +250,18 @@ export function numbersOf(m: any): string[] {
 
 /** WO-197 segment 2 (sonn's ruling 4): Onsen draws a lane's or the router's label itself (fleet-core onsen_bridge.author_label of the sender part:
  *  〔agent·工作線#n〕 for <agent>.worker.<n>, 〔agent·分流器〕 for router), so the same line first in the text is dropped: the bridge does not draw it twice.
- *  Another first line (the 「｜負責：X」 variant) stays. `kindName`: a lane kind's name (lanes.ts KIND_NAME, Onsen's LANE_NAMES) */
+ *  Chiron mesh 12916 point 4: a first line that starts with the label loses the label; what is left of the line, without its leading 「｜」, is the
+ *  first line (「〔agent·工作線#n〕｜負責：X」 and lanes.ts pushJoey's 「〔agent·工作線#n｜負責：X〕」 both → 「負責：X」). The header is drawn once, by
+ *  author_label. A first line that does not start with it stays. `kindName`: a lane kind's name (lanes.ts KIND_NAME, Onsen's LANE_NAMES) */
 export function withoutOnsenLabel(text: string, sender: string, agent: string, kindName: (k: string) => string): string {
-  const nl = text.indexOf('\n')
-  if (nl < 0) return text
   const m = /^([a-z0-9][a-z0-9-]*)\.([a-z_]+)\.(\d+)$/.exec(sender)
   const label = sender === 'router' ? `〔${agent}·分流器〕` : m ? `〔${m[1]}·${kindName(m[2]!)}#${m[3]}〕` : null
-  return label && text.slice(0, nl) === label ? text.slice(nl + 1) : text
+  if (!label) return text
+  const nl = text.indexOf('\n'), first = nl < 0 ? text : text.slice(0, nl), after = nl < 0 ? null : text.slice(nl + 1)
+  const open = label.slice(0, -1) + '｜'                                    // the owner inside the label's brackets (lanes.ts pushJoey's head)
+  const left = first.startsWith(label) ? first.slice(label.length) : first.startsWith(open) && first.endsWith('〕') ? first.slice(open.length - 1, -1) : null
+  if (left === null) return text
+  const rest = left.replace(/^\s*｜?\s*/, '').trimEnd()
+  if (!rest) return after ?? text                                           // the label alone: the line dropped (a text that is only the label stays)
+  return after === null ? rest : `${rest}\n${after}`
 }
