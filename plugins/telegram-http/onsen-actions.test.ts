@@ -14,7 +14,7 @@ const RESOLVE = new Set(['option_id', 'expected_version', 'note', 'resolved_by']
 const tick = async (n = 30) => { for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 1)) }
 
 /** a stand-in Onsen: one Action store, the fields each route takes (anything else: 400, as body_json) */
-function standIn(o: { fail?: (c: Call, n: number) => 'throw' | 503 | 429 | null; delayMs?: number } = {}) {
+function standIn(o: { fail?: (c: Call, n: number) => 'throw' | 503 | 429 | null; delayMs?: number; times?: boolean } = {}) {
   const calls: Call[] = []
   const acts = new Map<string, any>()
   let next = 0, n = 0
@@ -26,8 +26,11 @@ function standIn(o: { fail?: (c: Call, n: number) => 'throw' | 503 | 429 | null;
     const f = o.fail?.(c, n)
     if (f === 'throw') throw new Error('connect ECONNREFUSED')
     if (f) return { status: f, json: { error: { code: 'service_unavailable', message: 'x' } } }
-    const allowed = path === '/v1/actions' ? (body?.action_id != null ? new Set(['action_id', 'assignees', 'requested_by']) : CREATE) : path.endsWith('/resolve') ? RESOLVE : path.endsWith('/applied') ? APPLIED : path.endsWith('/cancel') ? CANCEL : null
-    if (method === 'POST' && allowed && Object.keys(body ?? {}).some(k => !allowed.has(k))) return { status: 400, json: { error: { code: 'invalid_request', message: 'field' } } }
+    // o.times: an Onsen that takes the press times (create resolved_at / opened_at, resolve at); else 0.24.x, which refuses them as body_json does
+    const allowed0 = path === '/v1/actions' ? (body?.action_id != null ? new Set(['action_id', 'assignees', 'requested_by']) : CREATE) : path.endsWith('/resolve') ? RESOLVE : path.endsWith('/applied') ? APPLIED : path.endsWith('/cancel') ? CANCEL : null
+    const allowed = allowed0 && o.times ? new Set([...allowed0, ...(path === '/v1/actions' ? ['resolved_at', 'opened_at'] : path.endsWith('/resolve') ? ['at'] : [])]) : allowed0
+    const bad = method === 'POST' && allowed ? Object.keys(body ?? {}).filter(k => !allowed.has(k)) : []
+    if (bad.length) return { status: 400, json: { error: { code: 'invalid_request', message: `不收的欄位：${bad.join('、')}；收：${[...allowed!].join('、')}` } } }
     if (method === 'POST' && path === '/v1/actions' && body?.action_id != null) {   // Onsen 0.24.0 join
       const a = acts.get(String(body.action_id))
       if (!a) return { status: 404, json: { error: { code: 'not_found', message: 'no' } } }
@@ -110,13 +113,13 @@ describe('OnsenActions', () => {
   })
 
   test('pressed in Telegram: resolve (the presser, an assignee), then applied; the calls wait for the create', async () => {
-    const s = standIn({ delayMs: 20 })
+    const s = standIn({ delayMs: 20, times: true })
     const a = new OnsenActions({ req: s.req, log })
     const h = a.open({ ...perm, assignees: ['joey', 'joey-test'] }, 'k1')!
     a.pressedElsewhere(h, 'allow', 'joey-test', '2026-11-26T03:00:00.000Z')   // before the create answered
     await h.tail; await h.tail
     expect(s.calls.map(c => c.path)).toEqual(['/v1/actions', '/v1/actions/1/resolve', '/v1/actions/1/applied'])
-    expect(s.calls[1]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test' })
+    expect(s.calls[1]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test', at: '2026-11-26T03:00:00.000Z' })   // r3: when it was pressed
     expect(s.calls[2]!.body).toEqual({ at: '2026-11-26T03:00:00.000Z' })
     expect(s.acts.get('1')).toMatchObject({ state: 'resolved', selected_option_id: 'allow', resolved_by: 'joey-test' })
     // a presser who is not an assignee: the first assignee
@@ -277,6 +280,57 @@ describe('OnsenActions', () => {
     expect(b.find(null, '1')).toBe(f!)
     expect(await b.findOpen('adam', d => d.source === 'card')).toBeNull()
     expect(await new OnsenActions({ req: async () => { throw new Error('down') }, log }).findOpen('adam', () => true)).toBeNull()
+  })
+
+  test('r3 press times: sent when Onsen takes them (create resolved_at / opened_at, resolve at); a 0.24.x that refuses them gets the same call without, once', async () => {
+    const T = { at: '2026-11-26T04:18:03.388Z', opened_at: '2026-11-26T04:17:42.000Z' }
+    const yes = standIn({ times: true })
+    const a = new OnsenActions({ req: yes.req, log })
+    const h = a.open({ source: 'menu', menu_kind: 'model_picker', assignees: ['duty-officer'], summary: 'm', options: [{ id: '1', label: 'Opus' }], resolved: { option_id: '1', by: 'duty-officer', ...T } }, 'k')!
+    await h.tail
+    expect(yes.calls[0]!.body).toMatchObject({ state: 'resolved', resolved_at: T.at, opened_at: T.opened_at })
+    const h2 = a.open(perm, 'k2')!
+    a.pressedElsewhere(h2, 'allow', 'joey', T.at)
+    await h2.tail
+    expect(yes.calls.find(c => c.path === '/v1/actions/2/resolve')!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey', at: T.at })
+    expect(yes.calls.find(c => c.path === '/v1/actions/2/applied')!.body).toEqual({ at: T.at })
+    // Onsen 0.24.x: refused for those fields → the same call without them; then without from the start (one log line)
+    const no = standIn()
+    const n0 = logs.length
+    const b = new OnsenActions({ req: no.req, log })
+    const g = b.open({ source: 'menu', menu_kind: 'model_picker', assignees: ['duty-officer'], summary: 'm', options: [{ id: '1', label: 'Opus' }], resolved: { option_id: '1', by: 'duty-officer', ...T } }, 'k')!
+    await g.tail
+    expect(no.calls.map(c => [c.path, 'resolved_at' in (c.body ?? {})])).toEqual([['/v1/actions', true], ['/v1/actions', false]])
+    expect(no.calls.map(c => c.headers?.['Idempotency-Key'])).toEqual(['k', 'k'])
+    expect([g.id, g.state]).toEqual(['1', 'resolved'])
+    const g2 = b.open(perm, 'k2')!
+    b.pressedElsewhere(g2, 'allow', 'joey', T.at)
+    await g2.tail
+    expect(no.calls.filter(c => c.path === '/v1/actions/2/resolve').map(c => c.body)).toEqual([{ option_id: 'allow', expected_version: 1, resolved_by: 'joey' }])
+    expect(logs.slice(n0).filter(l => /does not take the press times/.test(l))).toHaveLength(1)
+    // another 400 is not taken for that (no retry)
+    const other = standIn()
+    const c = new OnsenActions({ req: async (...x) => x[1] === '/v1/actions' ? { status: 400, json: { error: { code: 'invalid_request', message: 'assignees：沒有 x 這個成員' } } } : other.req(...x), log })
+    const g3 = c.open({ ...perm, resolved: { option_id: 'allow', by: 'joey', ...T } }, 'k')!
+    await g3.tail
+    expect(g3.state).toBe('failed')
+  })
+
+  test('r3 strict: the presser (duty-officer) must be an assignee by then: joined first, then resolved as it; not joined: nothing resolved, onMissing', async () => {
+    const s = standIn()
+    const a = new OnsenActions({ req: s.req, log })
+    const h = a.open(perm, 'k')!
+    a.join(h, ['duty-officer'])
+    a.pressedElsewhere(h, 'deny', 'duty-officer', undefined, true)
+    await h.tail
+    expect(s.calls.find(c => c.path === '/v1/actions/1/resolve')!.body).toEqual({ option_id: 'deny', expected_version: 2, resolved_by: 'duty-officer' })
+    expect(s.acts.get('1')).toMatchObject({ state: 'resolved', resolved_by: 'duty-officer', selected_option_id: 'deny', assignees: ['joey', 'duty-officer'] })
+    const h2 = a.open(perm, 'k2')!
+    let missing = 0
+    a.pressedElsewhere(h2, 'allow', 'duty-officer', undefined, true, () => { missing++ })
+    await h2.tail
+    expect(missing).toBe(1)
+    expect(s.calls.some(c => c.path === '/v1/actions/2/resolve')).toBe(false)
   })
 
   test('newestOpen: the newest Action still open of a kind', async () => {

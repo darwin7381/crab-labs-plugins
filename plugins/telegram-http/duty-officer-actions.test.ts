@@ -32,7 +32,7 @@ const decision = (over: Partial<Decision> = {}): Decision => ({
 })
 
 type ACall = { op: string; [k: string]: any }
-function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?: MenuActions['shared'] } = {}) {
+function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?: MenuActions['shared']; ownPerm?: boolean | 'async' } = {}) {
   const calls: ACall[] = []
   let next = 40
   const guard = (op: string) => { if (o.throws) throw new Error(`boom ${op}`) }
@@ -40,7 +40,9 @@ function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?:
     pane: (t, bundle) => { calls.push({ op: 'pane', tmux: t.tmux, test: !!t.test, bundle: !!bundle }); guard('pane'); return o.pane ? o.pane(t, bundle) : { session_id: 'sess-1', menu_kind: 'permission' } },
     assignees: chats => chats.map(c => c === '1828173984' ? 'joey' : c === '6736970916' ? 'joey-test' : 'joey'),
     open: (f, key, made) => { guard('open'); calls.push({ op: 'open', f, key }); const id = String(++next); setTimeout(() => made(id, 1), 0) },
-    pressed: (f, option_id, key) => { guard('pressed'); calls.push({ op: 'pressed', f, option_id, key }) },
+    pressed: (f, option_id, key, times) => { guard('pressed'); calls.push({ op: 'pressed', f, option_id, key, times }) },
+    ...(o.ownPerm !== undefined ? { pressedPermission: (t: { tmux: string }, option: string, x: any) => {
+      calls.push({ op: 'ownPerm', tmux: t.tmux, option, ...x }); const r = o.ownPerm === 'async' ? Promise.resolve(true) : !!o.ownPerm; return r } } : {}),
     answered: (ref, option_id, member, at) => { guard('answered'); calls.push({ op: 'answered', ref, option_id, member, at }) },
     applied: (ref, x) => { guard('applied'); calls.push({ op: 'applied', ref, ...x }) },
     cancel: (ref, reason) => { guard('cancel'); calls.push({ op: 'cancel', ref, reason }) },
@@ -406,6 +408,51 @@ describe('the duty officer\'s menus as Actions', () => {
     expect(permOptionOf({ screen: '4. Explain', button: '解釋' })).toBeNull()
     expect(permOptionOf({ screen: '', button: '2. No' })).toBe('deny')
     expect(permOptionOf(undefined)).toBeNull()
+  })
+
+  // ---- WO-176 r3 (Chiron 04:42Z)
+  test('r3: its own press carries the real moments: the keys sent (at) and the menu first seen (opened_at)', async () => {
+    const f = fakeActions({ pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
+    const r = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f.acts })
+    await r.advance(0)                                                     // the menu is first seen at T0
+    await r.advance(9000)
+    await r.settle()
+    const p = f.calls.find(c => c.op === 'pressed')!
+    const pressedAt = r.log().find(e => e.event === 'pressed').pressed_at
+    expect(p.times).toEqual({ at: pressedAt, opened_at: new Date(T0).toISOString() })
+    expect(Date.parse(p.times.at)).toBeGreaterThan(T0)
+  })
+
+  test('r3: it pressed a permission prompt itself: the prompt\'s own Action takes the answer (allow / deny, the press moments); no second Action', async () => {
+    for (const [choose, want] of [['Yes', 'allow'], ['No', 'deny']] as const) {
+      for (const mode of [true, 'async'] as const) {
+        const f = fakeActions({ ownPerm: mode })
+        const r = rig({ model: () => ({ decision: decision({ choose }), meta: {}, fail: null }), onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f.acts })
+        await r.advance(0); await r.advance(9000); await r.settle()
+        expect(r.keys.at(-1)).toBe('Enter')
+        const o = f.calls.find(c => c.op === 'ownPerm')!
+        expect(o).toMatchObject({ tmux: 'claude-x', option: want, choose, opened_at: new Date(T0).toISOString() })
+        expect(o.at).toBe(r.log().find(e => e.event === 'pressed').pressed_at)
+        expect(f.ops()).toEqual(['ownPerm'])                               // no pressed (no second Action), no screenPressed from the officer
+        expect(r.log().some(e => e.event === 'action' && e.pressed === want)).toBe(true)
+      }
+    }
+  })
+
+  test('r3: no Action of the prompt to take it (pressedPermission false), an option that is neither allow nor deny, or not a permission prompt: its own record, as before', async () => {
+    const f = fakeActions({ ownPerm: false })
+    const r = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f.acts })
+    await r.advance(0); await r.advance(9000); await r.settle()
+    expect(f.ops()).toEqual(['ownPerm', 'pressed', 'screen'])
+    const f2 = fakeActions({ ownPerm: true })
+    const r2 = rig({ model: () => ({ decision: decision({ choose: 'Explain', options: [{ on_screen: '1. Explain', means: '解釋', button: 'Explain', keys: ['Enter'] }] }), meta: {}, fail: null }),
+      onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f2.acts })
+    await r2.advance(0); await r2.advance(9000); await r2.settle()
+    expect(f2.ops()).toEqual(['pressed', 'screen'])                      // neither: not offered to the prompt's Action
+    const f3 = fakeActions({ ownPerm: true, pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
+    const r3 = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f3.acts })
+    await r3.advance(0); await r3.advance(9000); await r3.settle()
+    expect(f3.ops()).toEqual(['pressed', 'screen'])
   })
 
   test('helpers: option ids are index + 1; the body puts the screen in code blocks', () => {

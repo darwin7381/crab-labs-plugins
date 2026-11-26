@@ -740,8 +740,13 @@ export interface MenuActions {
   assignees(chats: string[]): string[]
   /** a question to a person: an open Action; `made` hears its id and version once Onsen made it */
   open(f: MenuActionFields, key: string, made: (id: string, version: number) => void): void
-  /** the officer pressed it itself: an Action made resolved (assignees duty-officer, the option it pressed) */
-  pressed(f: MenuActionFields, option_id: string, key: string): void
+  /** the officer pressed it itself: an Action made resolved (assignees duty-officer, the option it pressed); `times` (r3): when the keys were sent
+   *  (`at`) and when the menu appeared (`opened_at`) */
+  pressed(f: MenuActionFields, option_id: string, key: string, times?: { at: string; opened_at: string }): void
+  /** WO-176 r3 (Chiron 04:42Z): the officer pressed a permission prompt itself: the prompt's own Action takes the answer (resolved by duty-officer,
+   *  `option` allow / deny, at the press time) and its Telegram copies are closed; true: done so; false: there is no such Action (the officer records
+   *  its own, as before) */
+  pressedPermission?(t: { tmux: string; test?: boolean }, option: 'allow' | 'deny', o: { choose: string; at: string; opened_at: string }): Promise<boolean> | boolean
   /** pressed from Telegram by `member` (resolve, then applied; Onsen answered first: applied with what was pressed here) */
   answered(ref: ActionRef, option_id: string, member: string | null, at: string): void
   /** the press Onsen's control asked for was made; or Telegram's press came first (option_id, resolved_by: what was really pressed) */
@@ -1191,14 +1196,14 @@ export class DutyOfficer {
     if (!a) {
       this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10, resolved: null, why: 'pane gone after pressing' })
       this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved: null })
-      this.recordPress(t, lk, d, pane, r.at)
+      await this.recordPress(t, lk, d, pane, r.at, appeared)
       return
     }
     const resolved = a.state === 'IDLE' || a.state === 'WORKING' || a.hash !== lk.hash
     this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10,
       left_copy_mode: r.leftMode, before_tail: lk.lines, after_tail: a.lines, after_state: a.state, resolved, to_joey_draft: d.to_joey })
     this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved })
-    if (resolved) this.recordPress(t, lk, d, pane, r.at)
+    if (resolved) await this.recordPress(t, lk, d, pane, r.at, appeared)
     if (!resolved) {
       await this.askJoey(t, lk, bundle, d, 'pressed the keys, the screen did not change', keys)
       return
@@ -1313,9 +1318,21 @@ export class DutyOfficer {
     } catch (e) { this.event('error', { agent: a.label, tmux: a.tmux, where: 'action open', error: String(e).slice(0, 200) }) }
   }
   /** WO-176: the officer pressed a menu itself (a ruling covered it): one Action made resolved, assignees duty-officer, the option it pressed */
-  private recordPress(t: Target, lk: NonNullable<Look>, d: Decision, pane: { session_id: string | null; menu_kind: string | null } | null, at: number): void {
+  private async recordPress(t: Target, lk: NonNullable<Look>, d: Decision, pane: { session_id: string | null; menu_kind: string | null } | null, at: number,
+    appeared: number): Promise<void> {
     const acts = this.d.actions
     if (!acts || !pane) return
+    const times = { at: iso(at), opened_at: iso(Math.min(appeared, at)) }   // r3: the real moments (the keys sent; the menu first seen)
+    // WO-176 r3 (Chiron 04:42Z, 「同一個詢問只有一個 Action」): a permission prompt it pressed itself is answered on the prompt's own Action
+    if (pane.menu_kind === 'permission' && acts.pressedPermission) {
+      const chosen = (d.options ?? []).find(o => o && o.button === d.choose)
+      const option = permOptionOf({ button: d.choose, ...(chosen?.on_screen ? { screen: String(chosen.on_screen) } : {}) })
+      if (option) {
+        let done = false
+        try { done = await acts.pressedPermission({ tmux: t.tmux, test: t.test }, option, { choose: d.choose, ...times }) } catch {}
+        if (done) { this.event('action', { agent: t.label, tmux: t.tmux, shared: 'permission', pressed: option, pressed_at: times.at }); return }
+      }
+    }
     const opts = (d.options ?? []).slice(0, 10)
     const idx = opts.findIndex(o => o && o.button === d.choose)
     if (idx < 0) return
@@ -1323,7 +1340,7 @@ export class DutyOfficer {
     const body = `值班員照規矩按了「${d.choose}」：${d.reason}${d.covered_by ? `\n\n適用的規矩：${d.covered_by}` : ''}\n\n（值班員・${t.label}・${this.host}）`
     try {
       acts.pressed({ menu_kind: pane.menu_kind, session_id: pane.session_id, assignees: ['duty-officer'], summary: `${t.label}：${d.what}`, body, options },
-        optionIdOf(idx), `menu:${this.host}:press:${t.tmux}:${lk.hash}:${at}`)
+        optionIdOf(idx), `menu:${this.host}:press:${t.tmux}:${lk.hash}:${at}`, times)
       acts.screenPressed?.(t.tmux, pane.menu_kind)
     } catch (e) { this.event('error', { agent: t.label, tmux: t.tmux, where: 'action pressed', error: String(e).slice(0, 200) }) }
   }

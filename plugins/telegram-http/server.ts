@@ -1518,7 +1518,7 @@ const pendingPermissions = new Map<string, {
 // Onsen up or down. ONSEN_ACTIONS=0: no new Action (the stop switch)
 type PermCopy = { chat: string; msg: number; text: string }
 type PermPrompt = { request_id: string; tool_name: string; copies: PermCopy[]; action: Onsen.ActionHandle | null; opened: number
-  ended: { how: 'answered' | 'gone'; option?: 'allow' | 'deny'; member?: string | null; via: 'telegram' | 'onsen' | 'daemon'; at: number } | null }
+  ended: { how: 'answered' | 'gone'; option?: 'allow' | 'deny'; member?: string | null; via: 'telegram' | 'onsen' | 'daemon' | 'officer'; at: number } | null }
 const permPrompts = new Map<string, PermPrompt>()
 const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log,
   on: Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
@@ -1588,6 +1588,15 @@ function permGone(request_id: string, reason: string): void {
 function permScreenPressed(): void {
   for (const p of permPrompts.values()) if (!p.ended && p.action) permGone(p.request_id, '在畫面上按掉了（值班員）')
 }
+/** WO-176: every Telegram copy of a prompt answered somewhere other than a tap on that copy: the same edit a tap makes (the outcome, the buttons gone),
+ *  and a closing line saying where it was answered (「從 Onsen 按的」; r3: the duty officer on the screen, or on its question) */
+function permCopiesDone(p: PermPrompt, behavior: 'allow' | 'deny', end: string): void {
+  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  for (const cp of p.copies) {
+    void Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg, `${cp.text}\n\n${label}\n${end}`, { reply_markup: { inline_keyboard: [] } }))
+      .catch(e => log('warn', `permission edit ${cp.chat}/${cp.msg} (${end}) failed: ${e}`))
+  }
+}
 /** WO-176: a status blocker's Action (screen-status.ts RecordFacts.actionFor): the newest open permission prompt's, else the duty officer's open ask on the
  *  main's pane for that menu; null: none */
 function openActionFor(menu: string | null): string | null {
@@ -1623,13 +1632,39 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
     },
     assignees: chats => Onsen.assigneesOf(chats),
     open: (f, key, made) => { acts.open({ source: 'menu', ...f }, key, h => { if (h.id) made(h.id, h.version) }) },
-    pressed: (f, option_id, key) => { acts.open({ source: 'menu', ...f, resolved: { option_id, by: 'duty-officer' } }, key) },
+    pressed: (f, option_id, key, times) => { acts.open({ source: 'menu', ...f, resolved: { option_id, by: 'duty-officer', ...(times ?? {}) } }, key) },
+    // WO-176 r3 (Chiron 04:42Z): the officer pressed the permission prompt on the main's screen itself: the prompt's own Action (the channel's, or after a
+    // restart Onsen's open one) is resolved by duty-officer (joined to it first: resolved_by is an assignee), at the press time, then applied; its
+    // Telegram copies close the way a tap closes one; no second Action
+    pressedPermission: async (t, option, o) => {
+      if (!own() || t.tmux !== own()) return false
+      let best: PermPrompt | null = null
+      for (const p of permPrompts.values()) if (!p.ended && p.action && (p.action.state === 'pending' || p.action.state === 'open') && (!best || p.opened >= best.opened)) best = p
+      let h: Onsen.ActionHandle | null = best?.action ?? null
+      if (!h) {
+        h = await acts.findOpen(ONSEN_AGENT, d => d.source === 'permission' && (d.session_id ?? 'main') === 'main', `perm:${ONSEN_AGENT}:adopted:`)
+        if (h?.id && permLeftover.delete(h.id)) savePermOpen()
+      }
+      if (!h) return false
+      if (best) {
+        best.ended = { how: 'answered', option, member: 'duty-officer', via: 'officer', at: Date.now() }
+        savePermOpen()
+        permCopiesDone(best, option, `值班員按的：「${o.choose}」`)
+      }
+      acts.join(h, ['duty-officer'])
+      const hh = h
+      acts.pressedElsewhere(h, option, 'duty-officer', o.at, true, () => acts.cancel(hh, '值班員在畫面上按掉了（沒能記成它按的）'))
+      permScreenPressed()                                                // any other prompt still open: over too (as before)
+      return true
+    },
     answered: (ref, option_id, member, at) => {
       const h = handle(ref), p = promptOf(h)
       if (p) {                                                           // WO-176 r2: the channel's prompt's Action, answered on the screen through the officer
         if (p.ended) return                                              // answered or over already: reported once
-        p.ended = { how: 'answered', option: option_id === 'deny' ? 'deny' : 'allow', member, via: 'telegram', at: Date.now() }
+        const behavior: 'allow' | 'deny' = option_id === 'deny' ? 'deny' : 'allow'
+        p.ended = { how: 'answered', option: behavior, member, via: 'telegram', at: Date.now() }
         savePermOpen()
+        permCopiesDone(p, behavior, '在值班員的詢問上按的')                 // r3: its own copies close too (no buttons left on an answered prompt)
       }
       acts.pressedElsewhere(h, option_id, member ?? '', at)
     },
@@ -1704,11 +1739,7 @@ async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: O
     return
   }
   acts.applied(h, { at: new Date().toISOString() })
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  for (const cp of p.copies) {
-    void Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg, `${cp.text}\n\n${label}\n從 Onsen 按的`, { reply_markup: { inline_keyboard: [] } }))
-      .catch(e => log('warn', `permission edit ${cp.chat}/${cp.msg} (pressed in Onsen) failed: ${e}`))
-  }
+  permCopiesDone(p, behavior, '從 Onsen 按的')
   log('info', `permission ${p.request_id}: ${behavior} pressed in Onsen (action ${c.action_id}); answered Claude Code, ${p.copies.length} Telegram cop${p.copies.length === 1 ? 'y' : 'ies'} edited`)
 }
 

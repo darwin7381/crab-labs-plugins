@@ -21,7 +21,11 @@ const CRED = 'mesh_ACTIONSsecretSECRETsecretSECRET012345', CRED2 = 'mesh_ACTIONS
 const CALLER: Record<string, string> = { [CRED]: 'adam', [CRED2]: 'bea' }
 
 // ------------------------------------------------------------------ the stand-in Onsen
-type ACall = { caller: string; method: string; path: string; body: any; idem: string | null; at: number }
+type ACall = { caller: string; method: string; path: string; body: any; idem: string | null; at: number; refused?: boolean }
+// the fields Onsen 0.24.x takes on each write (onsen_actions.py; body_json refuses any other with 400 「不收的欄位」)
+const FIELDS: Record<string, string[]> = { create: ['kind', 'source', 'requested_by', 'session_id', 'assignees', 'summary', 'body', 'options', 'expires_at', 'refs',
+  'menu_kind', 'state', 'selected_option_id', 'resolved_by', 'note', 'action_id'], resolve: ['option_id', 'expected_version', 'note', 'resolved_by', 'session_id'],
+  applied: ['at', 'option_id', 'resolved_by'], cancel: ['expected_version', 'reason'] }
 const calls: ACall[] = []
 const actions = new Map<string, any>()
 const mode = { actions: 'ok' as 'ok' | 'down' | 'slow' }
@@ -43,8 +47,12 @@ function startOnsen(): void {
     if (!caller) return Response.json({ detail: 'auth' }, { status: 401 })
     const body: any = req.method === 'POST' ? await req.json().catch(() => ({})) : undefined
     if (path.startsWith('/v1/actions')) {
-      calls.push({ caller, method: req.method, path, body, idem: req.headers.get('idempotency-key'), at: Date.now() })
+      const call: ACall = { caller, method: req.method, path, body, idem: req.headers.get('idempotency-key'), at: Date.now() }
+      calls.push(call)
       if (mode.actions === 'down') return err(503, 'service_unavailable', 'down')
+      const which = path === '/v1/actions' ? 'create' : path.match(/\/(resolve|applied|cancel)$/)?.[1]
+      const bad = req.method === 'POST' && which ? Object.keys(body ?? {}).filter(k => !FIELDS[which]!.includes(k)) : []
+      if (bad.length) { call.refused = true; return err(400, 'invalid_request', `不收的欄位：${bad.join('、')}；收：${FIELDS[which!]!.join('、')}`) }
       if (mode.actions === 'slow') await sleep(8000)
       if (path === '/v1/actions' && req.method === 'POST') {
         const id = String(++nextAction), now = new Date().toISOString()
@@ -110,8 +118,8 @@ function pressInOnsen(id: string, option: string, by = 'joey', recipient?: strin
   if (recipient) put(recipient, 'onsen', 'action_control', { version: a.version, action_id: id, option_id: option }, `action:${id}:v${a.version}`)
   return c
 }
-const of = (id: string, op?: string) => calls.filter(c => c.path === `/v1/actions/${id}${op ? `/${op}` : ''}` && c.method === 'POST')
-const created = (summary: string) => calls.find(c => c.path === '/v1/actions' && c.body?.summary === summary)
+const of = (id: string, op?: string) => calls.filter(c => c.path === `/v1/actions/${id}${op ? `/${op}` : ''}` && c.method === 'POST' && !c.refused)
+const created = (summary: string) => calls.find(c => c.path === '/v1/actions' && c.body?.summary === summary && !c.refused)
 const idOf = (summary: string): string => [...actions.values()].find(a => a.summary === summary)!.id
 
 // ------------------------------------------------------------------ the daemons
@@ -217,6 +225,9 @@ test('pressed in Telegram: Claude Code is answered; the Action is resolved by th
   expect(s.perms[0]).toEqual({ request_id: 'bcdef', behavior: 'allow' })
   expect(await until(() => of(id, 'applied').length === 1)).toBe(true)
   expect(of(id, 'resolve')[0]!.body).toEqual({ option_id: 'allow', expected_version: 1, resolved_by: 'joey-test' })
+  // r3: the press time went first (`at`); Onsen 0.24.x refused that field, so the same resolve went without it, and every later one too (one log line)
+  expect(calls.filter(c => c.path === `/v1/actions/${id}/resolve` && c.refused).map(c => c.body.at)).toEqual([expect.stringMatching(/^\d{4}-\d\d-\d\dT/)])
+  expect((tg.log().match(/Onsen does not take the press times yet/g) ?? []).length).toBe(1)
   expect(of(id, 'applied')[0]!.body).toEqual({ at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) })
   expect(actions.get(id)).toMatchObject({ state: 'resolved', selected_option_id: 'allow', resolved_by: 'joey-test' })
   expect(await until(() => api.of('editMessageText').length === e0 + 1)).toBe(true)
