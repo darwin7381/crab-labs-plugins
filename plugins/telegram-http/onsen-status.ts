@@ -122,6 +122,13 @@ export class DeliveryFacts {
   pendingLater(): number { return this.later.size }
   /** Joey's messages taken in by the daemon and not yet into a turn (mode seen: the main's transcript is read) / not yet handed to the session (mode
    *  in_session: no transcript to read); older than 6 h: dropped. WO-165 renamed the modes with the facts; the counts are what 'taken' / 'seen' were */
+  /** WO-169 (the observation's queue): Joey's messages not yet handed into the session / handed in and not yet in a turn */
+  counts(): { pending: number; unread_by_member: number } {
+    const old = this.now() - 6 * 3600_000
+    let pending = 0, unread = 0
+    for (const e of this.open.values()) { if (e.at < old) continue; if (!e.session) pending++; else if (!e.turn) unread++ }
+    return { pending, unread_by_member: unread }
+  }
   queued(mode: 'seen' | 'in_session'): number {
     const old = this.now() - 6 * 3600_000
     let n = 0
@@ -312,6 +319,8 @@ export class TurnStarts {
 }
 
 // ------------------------------------------------------------------ lanes on: the journal and the main's hook events
+/** WO-169: what opened a turn (Onsen contract v1 §3 Trigger) */
+export type TurnTrigger = { kind: 'message'; conversation_id: string; message_id: string } | { kind: 'thread'; thread_id: string } | { kind: 'schedule' } | { kind: 'other' }
 /** Joey's Telegram message behind these meta (allowlisted sender, not an edit's re-delivery), or null */
 export type JoeyOf = (meta: Record<string, unknown> | undefined | null) => { chat: string; id: string } | null
 const AGENT_TOOLS = new Set(['Agent', 'Task'])
@@ -328,7 +337,17 @@ export class LanesTap {
   /** WO-157: the main's last turn start and last final Stop (ms), for statusOf's stale-registry rule */
   private startedAt: number | null = null
   private endedAt: number | null = null
-  constructor(readonly o: { facts: DeliveryFacts; joey: JoeyOf; gen: () => Row | null; changed: () => void; now?: Now }) {}
+  /** WO-169 (the observation): the M2 turn open now (its prompt id stays in this.turn), the first item bound to each prompt (what opened that turn), the
+   *  last turn that ended and how; a StopFailure seen before the M2 row that ends its turn */
+  private open = false
+  private opened: { prompt: string; trigger: TurnTrigger; thread: string | null; lead: boolean } | null = null
+  private lead: string | null = null
+  private leadOpen = true
+  private last: { id: string; outcome: 'done' | 'interrupted' | 'failed'; ended_at: string } | null = null
+  private failed = false
+  /** trigger (WO-169): an M1 item as the trigger of the turn it opened, and its thread (lanes.ts knows the threads) */
+  constructor(readonly o: { facts: DeliveryFacts; joey: JoeyOf; gen: () => Row | null; changed: () => void; now?: Now
+    trigger?: (row: Row) => { trigger: TurnTrigger; thread: string | null } | null }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
 
   journal(row: Row, line: Record<string, unknown>): void {
@@ -345,6 +364,20 @@ export class LanesTap {
       } else if (j && line.state === 'done') {
         F.turnEndLater(j.chat, j.id, 'main', row.ts, row.reason ? { reason: String(row.reason) } : undefined)
       }
+      // WO-169: what opened a turn: the item M1 offered it (the offer's lead: M1 writes `offered` for the lead first, then for the items riding it —
+      // an interrupted turn's, the digest — with no other line between), else the first item bound to the prompt; an item pulled into a turn already
+      // running opened nothing
+      if (line.state === 'offered') { if (this.leadOpen && row.kind !== 'digest') { this.lead = String(row.id); this.leadOpen = false } }
+      else this.leadOpen = true
+      const P = line.prompt_id ? String(line.prompt_id) : null
+      if (line.state === 'bound' && line.reason !== 'turn_continued' && P && !line.via_pull && row.kind !== 'digest') {
+        const lead = row.id === this.lead
+        if (this.opened?.prompt !== P || (lead && !this.opened.lead)) {
+          let t: { trigger: TurnTrigger; thread: string | null } | null = null
+          try { t = this.o.trigger?.(row) ?? null } catch {}
+          this.opened = { prompt: P, trigger: t?.trigger ?? { kind: 'other' }, thread: t?.thread ?? null, lead }
+        }
+      }
     } else if (row.rec === 'run') {
       const evs = [row.ev, ...(Array.isArray(row.extra) ? row.extra : []), ...(Array.isArray(row.steered) ? row.steered : [])]
         .filter((e: any) => e && e.source === 'telegram').map((e: any) => this.o.joey(e.meta)).filter((x): x is { chat: string; id: string } => !!x)
@@ -357,14 +390,22 @@ export class LanesTap {
         for (const e of evs) F.turnEnd(e.chat, e.id, lane, row.ts, row.reason ? { reason: String(row.reason) } : undefined)
       }
     } else if (row.rec === 'main') {
+      this.leadOpen = true
       if (typeof line.tool_open === 'string') this.tool = { name: line.tool_open, started_at: row.ts }
       else if ('tool_open' in line) this.tool = null
       if (row.state === 'in_turn' && row.prompt_id && row.prompt_id !== this.turn?.prompt) {
+        // WO-169: a new prompt while the last one never ended (no Stop: it was cut, as M2's beginTurn closes it) ends that one as interrupted
+        if (this.open && this.turn) this.last = { id: this.turn.prompt, outcome: 'interrupted', ended_at: row.ts }
         this.turn = { prompt: String(row.prompt_id), at: row.ts }
+        this.open = true; this.failed = false
         this.subagents = 0
         F.flushLater('main')                                                      // a new prompt: the last turn's Stop was its end
       }
-      if (row.state !== 'in_turn') { this.tool = null; this.subagents = 0 }
+      if (row.state !== 'in_turn') {
+        this.tool = null; this.subagents = 0
+        if (this.open && this.turn) this.last = { id: this.turn.prompt, outcome: row.state === 'walled' || this.failed ? 'failed' : 'done', ended_at: row.ts }
+        this.open = false; this.failed = false
+      }
     }
     this.o.changed()
   }
@@ -380,6 +421,9 @@ export class LanesTap {
     else this.compactingAt = null
     if (ev === 'UserPromptSubmit' || ev === 'PreToolUse') this.startedAt = this.now()
     else if ((ev === 'Stop' && b.phase === 'final') || ev === 'StopFailure') this.endedAt = this.now()
+    // WO-169: how the last turn ended. A StopFailure comes before M2's row; the Esc wrap-up tells its Stop (interrupted) after M2 closed the turn
+    if (ev === 'StopFailure') { if (this.open) this.failed = true; else if (this.last) this.last = { ...this.last, outcome: 'failed' } }
+    if (ev === 'Stop' && b.interrupted === true && !this.open && this.last && this.last.id === this.turn?.prompt) this.last = { ...this.last, outcome: 'interrupted' }
     const tool = String(b.tool_name ?? '')
     if (ev === 'PreToolUse') this.toolTimeout = { name: tool, s: Number(b.tool_timeout_ms) > 0 ? Number(b.tool_timeout_ms) / 1000 : null }
     else if (ev === 'PostToolUse' || ev === 'Stop' || ev === 'StopFailure') this.toolTimeout = null
@@ -389,6 +433,15 @@ export class LanesTap {
     this.o.changed()
   }
 
+  /** WO-169: the main's open turn (M2 in_turn): its prompt id, when it began, what opened it (the first item bound to the prompt; none: other) */
+  turnFacts(): { id: string; started_at: string; trigger: TurnTrigger; thread: string | null } | null {
+    const g = this.o.gen()
+    if (String(g?.state ?? '') !== 'in_turn' || !g?.prompt_id) return null
+    const p = String(g.prompt_id), o = this.opened?.prompt === p ? this.opened : null
+    return { id: p, started_at: this.turn?.prompt === p ? this.turn.at : String(g.ts ?? new Date(this.now()).toISOString()), trigger: o?.trigger ?? { kind: 'other' }, thread: o?.thread ?? null }
+  }
+  /** WO-169: the last turn of the main that ended: done (Stop), interrupted (cut: Esc, or a new prompt with no Stop), failed (StopFailure, the wall) */
+  lastTurn(): { id: string; outcome: 'done' | 'interrupted' | 'failed'; ended_at: string } | null { return this.last }
   /** 1.45.1, detail only: the main's turn as M2 and its hook events show it (null = M2 has it out of a turn) */
   turnDetail(): BusyInput | null {
     const g = this.o.gen()
@@ -421,6 +474,8 @@ export function channelTags(text: string): Array<Record<string, string>> {
 }
 const LOCAL_CMD = /^\s*(<(command-name|command-message|command-args|local-command-stdout|local-command-stderr|local-command-caveat)>|Caveat: )/
 
+/** a turn read from the transcript has no prompt id: its id is its start */
+const turnIdOf = (at: string): string => `turn-${Date.parse(at) || at}`
 export class TurnWatch {
   private file: string | null = null
   private offset = 0
@@ -430,6 +485,9 @@ export class TurnWatch {
   private emitFloor = 0
   private inTurn = false
   private turnAt: string | null = null
+  /** WO-169: the first Joey message taken into the open turn, and the last turn that ended (turn_duration) */
+  private firstTaken: { chat: string; id: string } | null = null
+  private lastEnded: { id: string; outcome: 'done'; ended_at: string } | null = null
   private tools = new Map<string, { name: string; at: string; agent: boolean; timeout_s: number | null }>()
   private taken = new Map<string, { chat: string; id: string }>()
   /** WO-165: the newest own timestamp of a record read from this transcript (ms), and when this watch began (a message taken in before it is the last
@@ -529,7 +587,7 @@ export class TurnWatch {
   }
   private begin(ts: string): boolean {
     if (this.inTurn) return false
-    this.inTurn = true; this.turnAt = ts; this.tools.clear(); this.taken.clear()
+    this.inTurn = true; this.turnAt = ts; this.tools.clear(); this.taken.clear(); this.firstTaken = null
     return true
   }
   /** WO-165: the Joey messages of a record that took them into a turn: seen at `at` (that record's moment) */
@@ -540,6 +598,7 @@ export class TurnWatch {
       const j = this.o.joey(a)
       if (!j) continue
       this.taken.set(k2(j.chat, j.id), j)
+      if (!this.firstTaken && this.inTurn) this.firstTaken = j
       if (!(t < this.emitFloor)) this.o.facts.seen(j.chat, j.id, 'main', at, t < this.bornMs)
     }
   }
@@ -547,9 +606,17 @@ export class TurnWatch {
     if (!this.inTurn) return false
     const t = Date.parse(ts)
     if (!(t < this.emitFloor)) for (const j of this.taken.values()) this.o.facts.turnEnd(j.chat, j.id, 'main', ts)
-    this.inTurn = false; this.turnAt = null; this.tools.clear(); this.taken.clear()
+    if (this.turnAt) this.lastEnded = { id: turnIdOf(this.turnAt), outcome: 'done', ended_at: ts }
+    this.inTurn = false; this.turnAt = null; this.tools.clear(); this.taken.clear(); this.firstTaken = null
     return true
   }
+  /** WO-169: the open turn as the transcript shows it (its id from its start), and what opened it: the first Joey message it took in, else other */
+  turnFacts(): { id: string; started_at: string; trigger: TurnTrigger; thread: null } | null {
+    if (!this.inTurn || !this.turnAt) return null
+    const j = this.firstTaken
+    return { id: turnIdOf(this.turnAt), started_at: this.turnAt, trigger: j ? { kind: 'message', conversation_id: j.chat, message_id: j.id } : { kind: 'other' }, thread: null }
+  }
+  lastTurn(): { id: string; outcome: 'done'; ended_at: string } | null { return this.lastEnded }
   busy(): BusyInput | null {
     if (!this.inTurn) return null
     let last: { name: string; at: string; timeout_s: number | null } | null = null

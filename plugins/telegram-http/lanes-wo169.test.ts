@@ -131,3 +131,27 @@ test('the Esc wrap-up: idle with no interruption seen still takes two readings M
   expect(phase()).toBe('in_turn')
   verdict = null; await stop()
 })
+
+test('WO-169 part 2: the trigger of the turn an item opens (triggerOfItem): Joey\'s message → message (his chat, its id); a colleague\'s call on a thread → thread; the main\'s queue counts', async () => {
+  await stop()
+  program = { state: 'busy', detail: { queued_joey: 0 }, last_activity_at: new Date().toISOString() }; verdict = null
+  await turn()                                                              // in a turn: what comes in queues for the main
+  const meta = { chat_id: '1', message_id: '16950', user: 'joey_lab' }
+  const m = { id: 'tg-1-16950', source: 'telegram', from: 'joey', text: '幫我看一下', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '幫我看一下', meta } } }
+  await L.routeEvent(m as any)
+  const row = L.__main().items((r: any) => r.event === m.id)[0]
+  const t = L.triggerOfItem(row)
+  expect(t.trigger).toEqual({ kind: 'message', conversation_id: '1', message_id: '16950' })
+  expect(typeof t.thread).toBe('string')
+  expect(L.threadKeyKind(t.thread!)).toBe('tg')
+  const c = mesh('eve', '這件事你看一下', { verified: false })
+  await L.routeEvent(c)
+  const crow = L.__main().items((r: any) => r.event === c.id)[0]
+  const ct = L.triggerOfItem(crow)
+  expect(ct.trigger.kind).toBe('thread')
+  expect((ct.trigger as any).thread_id).toBe(ct.thread)
+  expect(L.mainQueueCounts()).toMatchObject({ pending: expect.any(Number), unread_by_member: expect.any(Number) })
+  expect(L.mainQueueCounts()!.pending).toBeGreaterThanOrEqual(2)
+  expect(L.triggerOfItem({ kind: 'alert', event: c.id, notif: { params: { meta: {} } } }).trigger).toEqual({ kind: 'other' })
+  await stop()
+})

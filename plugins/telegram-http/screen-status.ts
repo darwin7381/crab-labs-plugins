@@ -191,11 +191,55 @@ const pick = (o: Record<string, unknown>, ks: string[]): Record<string, unknown>
 export const programView = (p: StatusView): StatusView => ({ ...p, detail: { ...(p.detail ?? {}), judged_by: 'program' } })
 /** the remaining-quota percentage stays out of the record (JCS screen-status/README.md) */
 const noPct = (s: string): string => s.replace(/\d+(?:[.,]\d+)?\s*%/g, '#%')
-/** what the program knows beside statusOf's view, for the record */
+// ------------------------------------------------------------------ the observation (WO-169 part 2, Chiron 00:29Z: CONTRACT v1 section 3's shape)
+/** Onsen's contract v1 (rescue-site/onsen-ui/CONTRACT.md §3), the part this daemon observes; Onsen adds valid_until, rollup, phrase and line, and turns
+ *  a reporter that went quiet into unknown itself */
+export type Trigger = { kind: 'message'; conversation_id: string; message_id: string } | { kind: 'thread'; thread_id: string } | { kind: 'schedule' } | { kind: 'other' }
+export type TurnFact = { id: string; started_at: string; trigger: Trigger }
+export type LastTurn = { id: string; outcome: 'done' | 'interrupted' | 'failed'; ended_at: string }
+export type BlockerReason = 'permission' | 'input_required' | 'usage_limit' | 'dependency' | 'stalled'
+export type Blocker = { id: string; reason: BlockerReason; since: string; until: string | null; menu_kind: Exclude<VerdictMenu, 'none'> | null; assignee: string | null
+  action_id: null; summary: string }
+export type ObsSession = { id: string; kind: 'main' | 'lane'; thread_id: string | null; activity: 'idle' | 'running' | 'paused' | 'stuck' | 'unknown'
+  activity_since: string | null; turn: TurnFact | null; doing: { kind: 'thinking' | 'tool' | 'compacting' | 'waiting_subagents'; tool: string | null; since: string } | null
+  blockers: Blocker[]; last_turn: LastTurn | null }
+export type Observation = { presence: 'online' | 'offline'; presence_reason: null | 'disconnected' | 'process_gone'; lifecycle: 'ready' | 'starting' | 'stopped'
+  main_session_id: string | null; sessions: ObsSession[]; background: { agents: number | null; shells: number | null; tasks: number | null; monitors: number | null } | null
+  queue: { pending: number | null; unread_by_member: number | null }; last_activity_at: string | null; reported_at: string
+  evidence: { source: 'classifier' | 'runtime'; confidence: number | null } }
+/** what the program knows beside statusOf's view and the screen, for the record and its observation */
 export type RecordFacts = {
   /** the main's pane runs Claude Code (the reader's last look); null: not looked at */
   alive?: boolean | null
+  /** now (ms): reported_at, and the moment a since begins */
+  now?: number
+  /** when `key` first had `value` (ms; a value that changes starts again): activity_since, a blocker's or a doing's since */
+  since?: (key: string, value: string) => number
+  /** the main's Claude Code session (the registry's, else the lanes'); null: none known */
+  session_id?: string | null
+  /** the main's open turn as the program knows it (lanes on: M2 and its hooks; off: the transcript); null: none open */
+  turn?: TurnFact | null
+  /** the thread of the item that opened that turn (any kind); null: none known */
+  turn_thread?: string | null
+  last_turn?: LastTurn | null
+  /** the main's queue: not yet handed into its conversation / handed in, not yet in a turn; null: not known */
+  queue?: { pending: number | null; unread_by_member: number | null } | null
+  /** a lane's thread is a schedule's (its run's trigger is the schedule) */
+  scheduleThread?: (thread: string) => boolean
+  /** the duty officer handles this menu on this pane (it watches the pane and its rule files cover the kind): assignee duty-officer, else joey */
+  dutyHandles?: (menu: Exclude<VerdictMenu, 'none'>) => boolean
 }
+/** the menus the duty officer's rule files cover (JCS duty-officer/aide_prompt.md 「Joey 的規矩」: 預設全放行 → a permission prompt; 不自動換成比較弱的
+ *  模型、結果要等於登記的那一個 → the model picker). Every other menu (the trust prompt, a resume list, a login, a plan or question, the usage-limit
+ *  options: 額度、帳號是 Joey 的資源決定, anything else) is Joey's. One table: a ruling Chiron adds for a kind is one line here */
+export const DUTY_MENUS: ReadonlySet<string> = new Set(['permission', 'model_picker'])
+const BLOCKER_SUMMARY: Record<BlockerReason, string> = { permission: '等待權限核准', input_required: '選單等待選擇', usage_limit: '用量受限，等待恢復',
+  dependency: '等待外部作業', stalled: '回合停滯，沒有動靜' }
+const menuReason = (m: string | null): BlockerReason => m === 'permission' ? 'permission' : m === 'usage_limit_options' ? 'usage_limit' : 'input_required'
+/** statusOf's waitingFor (Claude Code's registry: "permission prompt", "dialog open") as a menu kind, when no verdict names it */
+const registryMenu = (w: unknown): Exclude<VerdictMenu, 'none'> => /permission/i.test(String(w ?? '')) ? 'permission' : 'other'
+const isoMs = (ms: number): string => new Date(ms).toISOString()
+
 /** the one status record, from a verdict (null: no verdict) and the program's facts: the regions' counts and statusOf's (the process, the usage wall,
  *  the turn's start and tool, stuck). The order is fixed (Chiron WO-169, 00:29Z): offline (the process is gone: statusOf's view) → starting (the
  *  process is there and not registered yet: statusOf's no_registration with Claude Code in the pane, or the verdict says starting) → usage limit (the
@@ -203,8 +247,18 @@ export type RecordFacts = {
  *  its threshold: stuck stays, with the turn's start and tool) → busy → idle. No verdict: past offline and starting, statusOf's view as it is. The
  *  program's own detail stays: queued_joey, the wall, lane runs, the reason statusOf has for an offline the screen contradicts (a session this daemon
  *  has no stream with, one still registering). detail.judged_by = verdict.by (program: no verdict) and judge_p = verdict.p are labels: nothing
- *  downstream decides by them */
+ *  downstream decides by them.
+ *  The same call gives the observation (CONTRACT v1 §3; Chiron's table, WO-169 00:29Z) from the same inputs: presence, lifecycle, the main's session
+ *  (its activity, turn and trigger, doing, blockers, last turn), one session per running lane, the screen's background counts, the queue, the evidence */
+export function composeRecord(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts = {}): { view: StatusView; observation: Observation } {
+  const view = recordView(v, st, prog, f)
+  return { view, observation: observe(v, st, prog, view, f) }
+}
+/** the record alone (composeRecord's view) */
 export function publishView(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts = {}): StatusView {
+  return composeRecord(v, st, prog, f).view
+}
+function recordView(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts): StatusView {
   if (gone(prog)) return programView(prog)
   const pd = (prog.detail ?? {}) as Record<string, any>
   const registering = prog.state === 'offline' && pd.reason === 'no_registration' && (!!v || f.alive === true)
@@ -229,6 +283,82 @@ export function publishView(v: ScreenVerdict | null, st: Regions | null, prog: S
   if (v.state === 'idle_background_running') return out('idle', { background: { agents: c.running_agents, shells: c.shells, monitors: c.monitors, tasks: c.background_tasks }, ...base })
   if (v.state === 'interrupted') return out('idle', { interrupted: true, ...base })
   return out('idle', { ...base })
+}
+function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, view: StatusView, f: RecordFacts): Observation {
+  const now = f.now ?? Date.now()
+  const since = (k: string, val: string): string => isoMs(f.since ? f.since(k, val) : now)
+  const pd = (prog.detail ?? {}) as Record<string, any>, vd = (view.detail ?? {}) as Record<string, any>
+  const goneNow = gone(prog), disconnected = prog.state === 'offline' && pd.reason === 'not_connected'
+  const starting = view.state === 'starting'
+  const presence: Observation['presence'] = goneNow || disconnected || (view.state === 'offline' && !starting) ? 'offline' : 'online'
+  const presence_reason: Observation['presence_reason'] = presence === 'online' ? null : goneNow || f.alive === false ? 'process_gone' : 'disconnected'
+  const lifecycle: Observation['lifecycle'] = presence_reason === 'process_gone' ? 'stopped' : starting ? 'starting' : 'ready'
+  const mainId = f.session_id || 'main'
+  const known = !!f.session_id || presence === 'online'                    // a main this daemon has seen: no idle main is made up
+  const sessions: ObsSession[] = []
+  if (known) {
+    const s: ObsSession = { id: mainId, kind: 'main', thread_id: null, activity: 'unknown', activity_since: null, turn: null, doing: null, blockers: [], last_turn: f.last_turn ?? null }
+    if (s.last_turn && vd.interrupted === true && s.last_turn.outcome === 'done') s.last_turn = { ...s.last_turn, outcome: 'interrupted' }   // the screen shows the cut
+    if (presence === 'online') {
+      const t = f.turn ?? null
+      const menu: Exclude<VerdictMenu, 'none'> | null = view.state === 'waiting' ? (v?.state === 'waiting_for_human' ? (v.menu === 'none' ? null : v.menu) : registryMenu(vd.waitingFor))
+        : view.state === 'idle' && vd.dialog_open === true ? 'other' : null                 // statusOf: a dialog open outside a turn
+      const block = (reason: BlockerReason, menu_kind: Exclude<VerdictMenu, 'none'> | null, until: string | null = null): Blocker => {
+        const at = since(`main.blocker`, `${reason}|${menu_kind ?? ''}`)
+        return { id: `${mainId}:${reason}:${menu_kind ?? '-'}:${Date.parse(at).toString(36)}`, reason, since: at, until, menu_kind,
+          assignee: menu_kind ? (f.dutyHandles?.(menu_kind) ? 'duty-officer' : 'joey') : null, action_id: null, summary: BLOCKER_SUMMARY[reason] }
+      }
+      if (starting) s.activity = 'idle'
+      else if (view.state === 'walled') {
+        const um = v?.state === 'waiting_for_human' || v?.state === 'usage_limit' ? (v.menu === 'usage_limit_options' ? 'usage_limit_options' as const : null) : null
+        s.blockers = [block('usage_limit', um, typeof vd.walled?.until === 'string' ? vd.walled.until : null)]
+        s.activity = t ? 'paused' : 'idle'
+      } else if (view.state === 'waiting' || menu) {
+        s.blockers = [block(menuReason(menu), menu)]
+        s.activity = view.state === 'waiting' && t ? 'paused' : 'idle'
+      } else if (view.state === 'stuck') {
+        s.activity = t ? 'stuck' : 'unknown'
+        if (t) s.blockers = [block('stalled', null)]
+      } else if (view.state === 'busy') s.activity = t ? 'running' : 'unknown'
+      else if (view.state === 'idle') s.activity = 'idle'
+      if (s.activity === 'running' || s.activity === 'paused' || s.activity === 'stuck') { s.turn = t; s.thread_id = f.turn_thread ?? (t?.trigger.kind === 'thread' ? t.trigger.thread_id : null) }
+      if (s.activity === 'running') {
+        const tool = vd.tool && typeof vd.tool === 'object' && vd.tool.name ? vd.tool : null
+        s.doing = vd.compacting === true ? { kind: 'compacting', tool: null, since: since('main.doing', `compacting|${t!.id}`) }
+          : tool ? { kind: 'tool', tool: String(tool.name), since: typeof tool.since === 'string' ? tool.since : since('main.doing', `tool|${tool.name}|${t!.id}`) }
+          : { kind: 'thinking', tool: null, since: since('main.doing', `thinking|${t!.id}`) }
+      }
+      if (s.activity === 'unknown' || s.activity === 'idle') s.blockers = s.activity === 'idle' ? s.blockers : []
+      s.activity_since = since('main.activity', s.activity)
+    }
+    sessions.push(s)
+  }
+  // one session per running lane run (statusOf's detail.lanes): running, its trigger its thread's (a schedule's run: schedule)
+  for (const l of Array.isArray(pd.lanes) ? pd.lanes as Array<Record<string, any>> : []) {
+    if (!l?.id || sessions.some(x => x.id === l.id)) continue
+    const thread = typeof l.thread === 'string' && l.thread ? l.thread : null
+    const at = typeof l.since === 'string' ? l.since : isoMs(now)
+    const trigger: Trigger = thread && f.scheduleThread?.(thread) ? { kind: 'schedule' } : thread ? { kind: 'thread', thread_id: thread } : { kind: 'other' }
+    sessions.push(presence === 'online'
+      ? { id: String(l.id), kind: 'lane', thread_id: thread, activity: 'running', activity_since: at, turn: { id: String(l.run ?? l.id), started_at: at, trigger },
+          doing: { kind: 'thinking', tool: null, since: at }, blockers: [], last_turn: null }
+      : { id: String(l.id), kind: 'lane', thread_id: thread, activity: 'unknown', activity_since: null, turn: null, doing: null, blockers: [], last_turn: null })
+  }
+  const c = st?.counted_by_program
+  return { presence, presence_reason, lifecycle, main_session_id: known ? mainId : null, sessions,
+    background: c && presence === 'online' ? { agents: c.running_agents, shells: c.shells, tasks: c.background_tasks, monitors: c.monitors } : null,
+    queue: { pending: f.queue?.pending ?? null, unread_by_member: f.queue?.unread_by_member ?? null }, last_activity_at: prog.last_activity_at ?? null,
+    reported_at: isoMs(now), evidence: v ? { source: v.by === 'jev' ? 'classifier' : 'runtime', confidence: v.p } : { source: 'runtime', confidence: null } }
+}
+/** a since memory: when each key first had its present value (a value that changes starts again) */
+export class Since {
+  private m = new Map<string, { v: string; at: number }>()
+  at(key: string, value: string, now = Date.now()): number {
+    const x = this.m.get(key)
+    if (x && x.v === value) return x.at
+    this.m.set(key, { v: value, at: now })
+    return now
+  }
 }
 
 // ------------------------------------------------------------------ one look at the pane: one tmux call
@@ -458,12 +588,16 @@ export class ScreenStatus {
   /** the record for statusOf's view `p` now: `p` untouched when JEV_SCREEN does not list this agent; the verdict's record (publishView) when the screen
    *  showing now has one (while a newer screen is being judged, the last verdict stands); else statusOf's view, judged_by program. `fed`: this is the
    *  one handed out (counted) */
-  view(p: StatusView, fed = false): StatusView {
-    if (!this.act.listed) return p
+  view(p: StatusView, fed = false): StatusView { return this.record(p, {}, fed).view }
+  /** the record (as view()) and its observation, from the one composition (composeRecord): the verdict in use, the screen showing now (its counts are
+   *  the observation's background even with no verdict), whether the pane runs Claude Code, and the program's facts `f` */
+  record(p: StatusView, f: RecordFacts = {}, fed = false): { view: StatusView; observation: Observation } {
     const c = this.cur, a = this.answer
     const ok = this.act.on && !!c && c.alive && !gone(p) && !!a?.v && (a.hash === c.hash || !!this.inflight)
-    if (fed) { if (ok && a!.v!.by === 'jev') this.stats.judged_jev++; else this.stats.judged_program++ }
-    return ok ? publishView(a!.v!, a!.parts.st, p) : publishView(null, null, p, { alive: this.act.on && c ? c.alive : null })
+    if (fed && this.act.listed) { if (ok && a!.v!.by === 'jev') this.stats.judged_jev++; else this.stats.judged_program++ }
+    const seen = this.act.on && c ? c : null
+    const r = composeRecord(ok ? a!.v! : null, ok ? a!.parts.st : seen?.alive ? seen.parts.st : null, p, { ...f, alive: seen ? seen.alive : null })
+    return { view: this.act.listed ? r.view : p, observation: r.observation }
   }
   /** the screen with this hash is still the one showing and this verdict is the one in use for it (a judge's own check, a moment later) */
   holds(hash: string, v: ScreenVerdict): boolean { return this.cur?.hash === hash && this.answer?.hash === hash && this.answer.v === v }

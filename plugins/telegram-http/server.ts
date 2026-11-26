@@ -65,7 +65,7 @@ import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsA
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
-import { ScreenStatus, judgeFor, screenJudgeName, snapPane } from './screen-status.ts'
+import { DUTY_MENUS, ScreenStatus, Since, composeRecord, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
@@ -4455,16 +4455,20 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-169 (WO-165 A): the one status record. With JEV_SCREEN on it is the screen reader's (its verdict's record, or statusOf's with judged_by: program);
   // off, statusOf's view untouched. Onsen, the pin, /healthz, the lanes (onsenStatusCompute: decideWake, the 此刻 line, the same-matter gate, the Esc
   // wrap-up) and the wake rows' member_state all take this one. A change of statusOf's view is an event: the screen is looked at at once
+  let lastObservation: Observation | null = null                       // WO-169 part 2: the observation composed with the record last handed out
   const feed = (v: OnsenStatus.StatusView): void => {
-    const pub = screenStatus ? screenStatus.view(v, true) : v
-    lastView = pub
+    let f: RecordFacts = {}
+    try { f = recordFacts() } catch (e) { log('warn', `onsen: status facts: ${e}`) }
+    const r = screenStatus ? screenStatus.record(v, f, true) : { view: v, observation: composeRecord(null, null, v, f).observation }
+    const pub = r.view
+    lastView = pub; lastObservation = r.observation
     status.update(pub); try { pin?.show(pub) } catch (e) { log('warn', `onsen: status pin: ${e}`) }
     screenStatus?.programChanged(v)
     // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen)
     const edge = `${pub.state}|${pub.detail?.interrupted === true}`
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
-  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick }) : null
+  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row) }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
@@ -4513,6 +4517,21 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   }
   /** WO-169: the one status record now: statusOf's view, through the screen reader when JEV_SCREEN lists this agent */
   const currentStatus = (): OnsenStatus.StatusView => { const v = compute(); return screenStatus ? screenStatus.view(v) : v }
+  // WO-169 part 2 (Chiron 00:29Z): the same composition also gives the observation (Onsen contract v1 §3) from the program's facts: the main's session,
+  // its open turn and what opened it, its last turn, its queue, which menus the duty officer takes on this pane
+  const sinceMem = new Since()
+  const recordFacts = (): RecordFacts => {
+    const now = Date.now()
+    const t = tap ? tap.turnFacts() : watch?.turnFacts() ?? null
+    let sid: string | null = null
+    try { sid = registry.mainSessionId() } catch {}
+    if (!sid && Lanes.LANES_ON) { try { sid = Lanes.mainSessionId() } catch {} }
+    const ownTmux = (process.env.CHANNEL_BOT_TMUX_SESSION ?? '').trim()
+    return { now, since: (k, val) => sinceMem.at(k, val, now), session_id: sid, turn: t ? { id: t.id, started_at: t.started_at, trigger: t.trigger } : null,
+      turn_thread: t?.thread ?? null, last_turn: tap ? tap.lastTurn() : watch?.lastTurn() ?? null,
+      queue: tap ? Lanes.mainQueueCounts() : facts.counts(), scheduleThread: th => Lanes.LANES_ON && Lanes.threadKeyKind(th) === 'schedule',
+      dutyHandles: m => DUTY_MENUS.has(m) && !!ownTmux && !!dutyOfficer?.handles(ownTmux) }
+  }
   onsenStatusCompute = currentStatus                                    // WO-157 / WO-169: the lanes' one state source (decideWake, 此刻, the same-matter gate, the Esc wrap-up)
   // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's
   // value, else the machine config's, re-read every 30 s), its TypeSafe key and Chiron's questions file (JCS screen-status/questions.json): Jev reads the
@@ -4554,7 +4573,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   }
   setTimeout(kick, 1_000).unref?.()
   onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop() }
-  onsenStatusNow = () => ({ ...(status.current() ?? {}), mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
+  // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; Onsen's endpoint for it is Epeius's to open)
+  onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation,
+    mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
     turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}),
     // WO-145: the visible half (only what is on)
     ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),

@@ -16,6 +16,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { startBotApiMock, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
+import { checkObservation } from './test-fixtures/status-v1-check.ts'
 
 const HAS_TMUX = spawnSync('tmux', ['-V'], { encoding: 'utf8' }).status === 0
 const JOEY = 1828
@@ -142,6 +143,19 @@ test.skipIf(!HAS_TMUX)("JEV_SCREEN on: Onsen gets Jev's reading of the pane, it 
   }
   expect({ state: hz.state, since: hz.since, at: hz.at, detail: hz.detail, last_activity_at: hz.last_activity_at }).toEqual(onsenNow('adam'))
   expect(hz).toMatchObject({ state: 'waiting', detail: { waitingFor: 'model_picker', judged_by: 'jev' } })
+  // WO-169 part 2: /healthz carries the observation (contract v1 §3). Registered, no stream of it here: offline, disconnected, nothing current
+  expect(checkObservation(hz.observation)).toEqual([])
+  expect(hz.observation).toMatchObject({ presence: 'offline', presence_reason: 'disconnected', lifecycle: 'ready', evidence: { source: 'classifier', confidence: 0.9 } })
+  expect(hz.observation.sessions.map((x: any) => x.activity)).toEqual(['unknown'])
+  // a stream opens (the main connected): online; the /model menu open with no turn: the main idle, blocked by the menu (the duty officer is off here: Joey's)
+  await d!.client()
+  expect(await until(async () => (await fetch(`http://127.0.0.1:${d!.port}/healthz`).then(r => r.json()) as any).onsen.status.observation?.presence === 'online', 10000)).toBe(true)
+  const ob = (await fetch(`http://127.0.0.1:${d!.port}/healthz`).then(r => r.json()) as any).onsen.status.observation
+  expect(checkObservation(ob)).toEqual([])
+  expect(ob).toMatchObject({ presence: 'online', presence_reason: null, lifecycle: 'ready', background: { agents: 0, shells: 0, tasks: 0, monitors: 0 }, queue: { pending: 0, unread_by_member: 0 } })
+  expect(ob.sessions).toHaveLength(1)
+  expect(ob.sessions[0]).toMatchObject({ kind: 'main', activity: 'idle', turn: null, doing: null, blockers: [{ reason: 'input_required', menu_kind: 'model_picker', assignee: 'joey', action_id: null }] })
+  expect(ob.main_session_id).toBe(ob.sessions[0].id)
   // WO-169: the question bank: the idle screen and the menu, one line each, and the screens shown again add none
   const bank = () => lines(join(d!.ws, '.lanes', 'run', 'screen-verdicts.jsonl'))
   expect(bank().map(b => b.verdict.state).sort()).toEqual(['idle', 'waiting_for_human'])
@@ -181,6 +195,13 @@ test.skipIf(!HAS_TMUX)("lanes on (LANES_WAKE_DECIDE, ONSEN_WAKE_LOG): a menu on 
     expect(await until(() => wakes.filter(w => w.agent === 'bea' && w.source_kind === 'peer_call').length >= 2, 15000)).toBe(true)
     for (const w of wakes.filter(w => w.agent === 'bea' && w.source_kind === 'peer_call')) expect(w.member_state).toBe('waiting')
     expect(onsenNow('bea')).toMatchObject({ state: 'waiting' })
+    // WO-169 part 2: the observation of the lanes daemon: the held call is in the main's queue, the main blocked by the menu
+    await b.client()
+    expect(await until(async () => (await fetch(`http://127.0.0.1:${b.port}/healthz`).then(r => r.json()) as any).onsen.status.observation?.presence === 'online', 10000)).toBe(true)
+    const ob = (await fetch(`http://127.0.0.1:${b.port}/healthz`).then(r => r.json()) as any).onsen.status.observation
+    expect(checkObservation(ob)).toEqual([])
+    expect(ob.sessions.find((x: any) => x.kind === 'main')).toMatchObject({ activity: 'idle', blockers: [{ reason: 'input_required', menu_kind: 'model_picker' }] })
+    expect(ob.queue.pending).toBeGreaterThanOrEqual(1)
   } finally { await b.stop(); api2.stop() }
 }, 60000)
 

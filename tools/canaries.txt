@@ -140,3 +140,5 @@ plugins/telegram-http/screen-status.ts::export function publishView(v: ScreenVer
 plugins/telegram-http/screen-judge-jev.ts::export class JevJudge implements ScreenJudge
 plugins/telegram-http/server.ts::onsenStatusCompute = currentStatus
 plugins/telegram-http/lanes.ts::export function mainStatusChanged
+plugins/telegram-http/screen-status.ts::export function composeRecord(
+plugins/telegram-http/server.ts::observation: lastObservation,

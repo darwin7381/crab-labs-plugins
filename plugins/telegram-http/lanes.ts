@@ -24,6 +24,7 @@
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
+import type { TurnTrigger } from './onsen-status.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
@@ -1172,7 +1173,39 @@ function bindThread(ev: InEvent, d: Decision, kind: string): void {
   t.last = nowIso()
   k.thread = t.id
   d.thread = t.id
+  noteEventThread(ev.id, t.id)
   saveState()
+}
+/** WO-169 (the observation): each routed event's thread, so the turn an item opens names it (the last 2000 events, this daemon's life) */
+const eventThreads = new Map<string, string>()
+function noteEventThread(ev: string, thread: string): void {
+  eventThreads.delete(ev); eventThreads.set(ev, thread)
+  if (eventThreads.size > 2000) eventThreads.delete(eventThreads.keys().next().value!)
+}
+/** WO-169: a thread's key kind (schedule, ticket, mail, …); null: not a keyed thread here */
+export function threadKeyKind(id: string): string | null {
+  const t = S?.threads?.[id]
+  const r = t?.alias_of ? S.threads[t.alias_of] : t
+  return r?.key_kind ?? null
+}
+/** WO-169 (Chiron 00:29Z, the observation's turn.trigger): an M1 item as the trigger of the main's turn it opened. Joey's message: message (his chat,
+ *  the message's own id: Onsen maps it to its conversation); a colleague's call, a mail, a board item: its thread; a schedule's run: schedule;
+ *  anything else (an alert, a wake-up line, the item of no thread): other. `thread`: the item's thread, whatever its kind */
+export function triggerOfItem(row: Record<string, any>): { trigger: TurnTrigger; thread: string | null } {
+  const meta = (row?.notif?.params?.meta ?? {}) as Record<string, unknown>
+  const thread = row?.event ? eventThreads.get(String(row.event)) ?? null : null
+  const tk = thread ? threadKeyKind(thread) : null
+  if (row?.kind === 'joey' && meta.chat_id != null && meta.message_id != null) return { trigger: { kind: 'message', conversation_id: String(meta.chat_id), message_id: String(meta.message_id) }, thread }
+  if (tk === 'schedule' || (meta.run_id != null && !thread)) return { trigger: { kind: 'schedule' }, thread }
+  if (row?.kind !== 'alert' && thread && !meta.wake) return { trigger: { kind: 'thread', thread_id: thread }, thread }
+  return { trigger: { kind: 'other' }, thread }
+}
+/** WO-169 (the observation's queue): the main's items not yet handed into its conversation (queued) / handed in, not yet in a turn (offered) */
+export function mainQueueCounts(): { pending: number; unread_by_member: number } | null {
+  try {
+    if (D?.role !== 'tg' || !main) return null
+    return { pending: main.items(r => r.kind !== 'digest' && r.state === 'queued').length, unread_by_member: main.items(r => r.kind !== 'digest' && r.state === 'offered').length }
+  } catch { return null }
 }
 /** WO-164 point 4: a schedule's run ended: the thread lets its lane go (the next run opens a reflex lane of its own on it; no session is resumed for a schedule) */
 function releaseScheduleThread(lane: Lane | undefined, it: QItem): void {
