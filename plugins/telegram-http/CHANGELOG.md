@@ -1,3 +1,7 @@
+## 1.57.5 — 2026-11-26
+
+- **`feed_ask` in two steps** (board WO-167 section four (c), Chiron 00:27Z; Joey TG 1263 「先看通知、再讀全文」; agent-inbox 1.27.5). The daemon asks with `two_step`: when the posts Jev finds related are at most the feed config's `give_max`, the full texts come back and are marked read, as before; when they are more, only each card's one-line `line` comes back (newest first, paged with a new optional `cursor`), nothing is marked read, and the agent opens what it needs with `feed_open`. Jev not answering: unchanged. Needs Onsen 0.14.0 (deployed 2026-11-26 00:59Z); an older Onsen ignores `two_step` and answers the old way, which this daemon still renders.
+
 ## 1.57.4 — 2026-11-26
 
 - **The feed wall lives in Onsen** (board WO-167 sections 2 and 3, Chiron 21:14Z; Joey TG chiron:2520, 2527; agent-inbox 1.27.4). `FEED_ONSEN=1` (machine config, as `MAIL_ONSEN`) sends every wall call (`send_to_agent line=feed`, `feed_ask`, `feed_search`, `feed_open`, `/read`, `/me`) to Onsen's `/api/onsen/feed/*` (the same endpoints and shapes; fleet-core 0.13.0). Off: `/api/feed`, exactly as before (since the copy at 2026-11-25 21:47Z that path answers from Onsen's tables too). No text an agent reads changes; the numbers it sees are Onsen's (#300645 for the old #646, which still opens).
