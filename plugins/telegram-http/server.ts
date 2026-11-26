@@ -581,8 +581,10 @@ function commandMenuKind(datas: string[]): string {
 /** a command's choice asked in Onsen: the Action → the callback data of each option (1…n) and where the command was typed */
 type KeyboardAsk = { h: Onsen.ActionHandle; chat: string; datas: string[]; where?: Lanes.TopicAsk; ended: boolean }
 const keyboardAsks = new Map<string, KeyboardAsk>()
-/** Chiron mesh 12916 point 3: a command's choice is good for 10 minutes (expires_at); Onsen marks it expired then (not /clear's 5 s one) */
+/** Chiron mesh 12916 point 3: a command's choice is good for 10 minutes (expires_at); Onsen marks it expired then and writes COMMAND_NOT_CHOSEN into its
+ *  note (expiry_note, Onsen 0.36.0; not /clear's 5 s one) */
 const COMMAND_CHOICE_S = 600
+const COMMAND_NOT_CHOSEN = '沒選：沒有更動'
 /** a connector's answer (sendTextWithMaybeKeyboard): with buttons, one Action (source menu, its text the body, its buttons the options, the owner
  *  asked; CONTRACT §7d: no second message); without, one Onsen message (the sender as the caller named it, system:control by default; the turn of a
  *  message the daemon answers itself, so it is that message's response). An Action that cannot be made: the text as a message */
@@ -607,7 +609,8 @@ function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: L
   const ten = btns.slice(0, 10), body = text.trim(), summary = body.split('\n')[0] || '請選一個'
   const datas = ten.map(b => b.callback_data!)
   const h = acts.open({ source: 'menu', menu_kind: commandMenuKind(datas), session_id: 'main', assignees, summary, ...(body ? { body } : {}),
-    options: ten.map((b, i) => ({ id: String(i + 1), label: b.text })), expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString() },
+    options: ten.map((b, i) => ({ id: String(i + 1), label: b.text })), expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString(),
+    expiry_note: COMMAND_NOT_CHOSEN },
     `cmd:${ONSEN_AGENT}:${chat}:${Date.now()}:${randomBytes(3).toString('hex')}`)
   if (!h) return false
   keyboardAsks.set(h.key, { h, chat, datas, ...(where ? { where } : {}), ended: false })
@@ -1003,9 +1006,10 @@ function clearHooks(chat: string, msgId: number | undefined, fromId: string, her
     },
   }
 }
-/** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」, Chiron mesh 12869 point 3, 12878): a connector's /clear. The reply is one Onsen message (the
- *  /clear's response: its turn); the choice 「不要讓它看到之前的」 is one Action with one option, expires_at 5 s later (the bridge draws the seconds left),
- *  which this daemon cancels then with the note of what happens because nobody pressed (CLEAR_NOT_PRESSED). Pressed inside the 5 s: the line drawn at
+/** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」, Chiron mesh 12869 point 3, 12878, 12916 point 1): a connector's /clear. The reply is one Onsen
+ *  message (the /clear's response: its turn); the choice 「不要讓它看到之前的」 is one Action with one option, expires_at 5 s later (the bridge draws the
+ *  seconds left) and expiry_note CLEAR_NOT_PRESSED (Onsen 0.36.0): expiry is Onsen's, which marks it expired then and writes the note; this daemon sends
+ *  no cancel for it (its own 5 s cancel came 0.6 s after Onsen's expiry on the lab: version_conflict, Action 211). Pressed inside the 5 s: the line drawn at
  *  the /clear's time in its conversation (POST /restart-lines with conversation_id, Onsen 0.35.8: a person with no app account too); Onsen queues
  *  restart_line, the bridge draws the line and its lift button; a lift made elsewhere is not told to the daemon (Onsen applies it when asked) */
 const CLEAR_OPTION = '不要讓它看到之前的'        // Chiron mesh 12878: no 「（5 秒內）」; the bridge draws the seconds left from expires_at
@@ -1022,19 +1026,19 @@ function connectorClearHooks(chat: string, clearMsgId: string, by: string, here?
       if (!acts?.on || !assignees.length) { log('warn', `connector: /clear ${clearMsgId} in chat ${chat}: no Action for 「不要讓它看到之前的」 (${!acts?.on ? 'Actions off' : 'no owner'}); the default stands`); return true }
       const until = Date.now() + CLEAR_KEEP_S * 1000
       const h = acts.open({ source: 'menu', menu_kind: 'other', session_id: 'main', assignees, summary: '要不要讓它看到 /clear 之前的對話？',
-        options: [{ id: 'line', label: CLEAR_OPTION }], expires_at: new Date(until).toISOString() }, `clear:${ONSEN_AGENT}:${chat}:${clearMsgId}`)
+        options: [{ id: 'line', label: CLEAR_OPTION }], expires_at: new Date(until).toISOString(), expiry_note: CLEAR_NOT_PRESSED }, `clear:${ONSEN_AGENT}:${chat}:${clearMsgId}`)
       if (!h) return true
       const ca: ClearAsk = { h, chat, clearMsgId, at, until, by, done: false }
       clearAsks.set(h.key, ca)
       while (clearAsks.size > 100) clearAsks.delete(clearAsks.keys().next().value!)
-      const t = setTimeout(() => { if (!ca.done) { ca.done = true; acts.cancel(h, CLEAR_NOT_PRESSED) } }, CLEAR_KEEP_S * 1000); (t as any).unref?.()
       log('info', `connector: /clear ${clearMsgId} in chat ${chat}: no restart line (it still reads what came before); 「不要讓它看到之前的」 asked in Onsen for ${CLEAR_KEEP_S} s`)
       return true
     },
   }
 }
-/** a press in Onsen on /clear's choice: inside its 5 s (+1 s, as the Telegram button): the line at the /clear's time, then applied; later: cancelled with
- *  what stands */
+/** a press in Onsen on /clear's choice: inside its 5 s (+1 s, as the Telegram button): the line at the /clear's time, then applied; later (Onsen took the
+ *  press inside the window, its control came late), or a second one: cancelled with what stands. A press after expires_at never comes here: Onsen
+ *  refuses it (409), the Action is expired with its expiry_note */
 async function applyClearControl(ca: ClearAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
   const acts = onsenActions!
   if (ca.done || c.option_id !== 'line' || Date.now() > ca.until + 1000) { ca.done = true; acts.cancel(h, CLEAR_NOT_PRESSED); return }

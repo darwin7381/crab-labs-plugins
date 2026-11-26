@@ -139,6 +139,8 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
         const k = `${who}:${headers['idempotency-key'] ?? ''}`
         const had = headers['idempotency-key'] ? actions.get(actionKeys.get(k) ?? '') : undefined
         if (had) return Response.json({ data: had })
+        // Onsen 0.36.0 (onsen_actions.py create): expiry_note only with state open and expires_at
+        if (body?.expiry_note != null && ((body?.state ?? 'open') !== 'open' || !body?.expires_at)) return aerr(400, 'expiry_note 只跟 state open 與 expires_at 一起送')
         const id = String(++nextAction), now = new Date().toISOString()
         const a = { id, version: 1, requested_by: who, state: body?.state ?? 'open', resolved_by: body?.resolved_by ?? null, selected_option_id: body?.selected_option_id ?? null,
           applied_at: body?.state === 'resolved' ? now : null, created_at: now, ...body }

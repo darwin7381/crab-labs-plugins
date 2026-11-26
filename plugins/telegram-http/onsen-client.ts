@@ -1357,8 +1357,11 @@ export type ActionOption = { id: string; label: string }
 export type ActionSource = 'permission' | 'menu'
 export type NewAction = { source: ActionSource; menu_kind?: string | null; session_id?: string | null; assignees: string[]; summary: string
   body?: string | null; options: ActionOption[]
-  /** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」): when it stops being an answer (the creator cancels it then, with what happens) */
+  /** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」): when it stops being an answer; Onsen marks it expired then (Onsen 0.36.0: expiry is Onsen's) */
   expires_at?: string
+  /** Onsen 0.36.0 (WO-196, Chiron mesh 12917): the line Onsen writes into its note when nobody answered by expires_at (what happens then); one line,
+   *  2000 characters at most; sent only with expires_at on an open Action (anything else is Onsen's 400), else dropped */
+  expiry_note?: string
   /** the duty officer's own press: made resolved (the option it pressed, resolved_by duty-officer), applied at once; `at` (WO-176 r3, Onsen 0.24.3):
    *  when the keys were sent (resolved_at and applied_at), `opened_at`: when the menu appeared (created_at) */
   resolved?: { option_id: string; by: string; at?: string; opened_at?: string } }
@@ -1429,6 +1432,8 @@ export function actionControlOf(p: unknown): ActionControl | null {
   return { action_id: id, option_id: o.option_id, version: o.version }
 }
 /** one line of at most n characters */
+/** Onsen 0.36.0 NOTE_MAX: an expiry_note's length at most */
+export const EXPIRY_NOTE_MAX = 2000
 export const actionLine = (s: unknown, n: number): string => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length <= n ? t : t.slice(0, n - 1) + '…' }
 
 /** one Action as this daemon follows it. id / version: null / 0 until Onsen made it; `tail`: its calls, in order */
@@ -1471,6 +1476,8 @@ export class OnsenActions {
       if (a.session_id) body.session_id = String(a.session_id).slice(0, 120)
       if (a.body) body.body = { format: 'markdown', text: a.body.length > 4000 ? a.body.slice(0, 3999) + '…' : a.body }
       if (a.expires_at) body.expires_at = a.expires_at
+      const xnote = a.expires_at && !a.resolved ? actionLine(a.expiry_note, EXPIRY_NOTE_MAX) : ''
+      if (xnote) body.expiry_note = xnote
       if (a.resolved) Object.assign(body, { state: 'resolved', selected_option_id: a.resolved.option_id, resolved_by: a.resolved.by })
       if (a.resolved?.at) body.resolved_at = a.resolved.at
       if (a.resolved?.opened_at) body.opened_at = a.resolved.opened_at

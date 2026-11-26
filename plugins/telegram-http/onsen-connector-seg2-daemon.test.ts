@@ -4,7 +4,7 @@
 //   commands   the list setMyCommands gives Telegram is PUT /v1/members/<agent>/commands (no /start, /help: the bridge's own); /status from Onsen is
 //              answered by today's handler as one Onsen message in the command's turn; /model is one Action (menu model_picker, the answer its body,
 //              no second message), a press runs what the Telegram tap runs; a page message "/status" is a command too; an unknown slash goes on
-//   /clear     the reply one message; 「不要讓它看到之前的」 an Action that expires in 5 s, cancelled then with the note of what stands; pressed inside:
+//   /clear     the reply one message; 「不要讓它看到之前的」 an Action that expires in 5 s with its expiry_note (Onsen 0.36.0; no cancel from the daemon); pressed inside:
 //              the line drawn by conversation_id (never client / chat) at the /clear's time
 //   threads    a person's message in a thread: the tag's topic / topic_name as the person's message carried them, the router's topic Onsen's thread;
 //              reply(topic=<the tag's>) is written with that thread; a thread Onsen refuses is dropped and the reply written
@@ -109,6 +109,7 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
   const sent = onsen.acalls.find(c => c.who === 'k' && c.method === 'POST' && c.path === '/v1/actions' && c.body?.menu_kind === 'model_picker')!
   const ahead = Date.parse(sent.body.expires_at) - sent.at
   expect(ahead).toBeGreaterThan(595_000); expect(ahead).toBeLessThanOrEqual(600_000)
+  expect(sent.body.expiry_note).toBe('沒選：沒有更動')                     // Onsen 0.36.0: what Onsen writes into its note when it expires
   await sleep(500)
   expect(said().length).toBe(before)                                       // CONTRACT §7d: no second message
   expect(await control(k, onsen.press(a.id, '2'))).toBe(202)
@@ -118,7 +119,7 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 }, 40000)
 
-test('4. /clear: typed on the pane; the reply one message (its turn); 「不要讓它看到之前的」 an Action expiring in 5 s, cancelled then with the note; pressed inside: the line by conversation_id at the /clear\'s time', async () => {
+test('4. /clear: typed on the pane; the reply one message (its turn); 「不要讓它看到之前的」 an Action expiring in 5 s with its expiry_note, no cancel from the daemon (expiry is Onsen\'s); pressed inside: the line by conversation_id at the /clear\'s time', async () => {
   const t0 = new Date().toISOString()
   expect((await hand(k, cmd(2003, '/clear', { sent_at: t0 }), 3)).json.handled_here).toBe(true)
   expect(await until(() => said().some(b => String(b.body).includes('已送 `/clear`') && b.turn_id === `daemon:${JOEY}:2003`), 8000)).toBe(true)
@@ -128,8 +129,19 @@ test('4. /clear: typed on the pane; the reply one message (its turn); 「不要�
   expect(a).toMatchObject({ source: 'menu', menu_kind: 'other', options: [{ id: 'line', label: '不要讓它看到之前的' }], assignees: ['joey'] })
   const left = Date.parse(a.expires_at) - Date.now()
   expect(left).toBeGreaterThan(2500); expect(left).toBeLessThanOrEqual(5100)
-  expect(await until(() => acall(a.id, 'cancel').length === 1, 8000)).toBe(true)
-  expect(acall(a.id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '沒按：新的一段看得到之前的對話', note: '沒按：新的一段看得到之前的對話' })
+  // Onsen 0.36.0 (Chiron mesh 12916 point 1): the create carries expires_at 5 s ahead and expiry_note; at 5 s (and after) no cancel comes from the daemon
+  const sent = onsen.acalls.find(c => c.who === 'k' && c.method === 'POST' && c.path === '/v1/actions' && c.body?.options?.[0]?.id === 'line')!
+  expect(sent.body.expiry_note).toBe('沒按：新的一段看得到之前的對話')
+  const ahead = Date.parse(sent.body.expires_at) - sent.at
+  expect(ahead).toBeGreaterThan(3000); expect(ahead).toBeLessThanOrEqual(5000)
+  await sleep(Math.max(0, Date.parse(a.expires_at) + 2000 - Date.now()))
+  expect(acall(a.id, 'cancel')).toHaveLength(0)
+  expect(onsen.actions.get(a.id)!.state).toBe('open')                     // the stand-in has no expiry sweep: nobody but Onsen ends it
+  expect(onsen.lines.filter(l => l.who === 'k')).toHaveLength(0)
+  // a press whose control comes after the window (+1 s): as today, no line; cancelled with what stands
+  expect(await control(k, onsen.press(a.id, 'line'))).toBe(202)
+  expect(await until(() => acall(a.id, 'cancel').length === 1, 5000)).toBe(true)
+  expect(acall(a.id, 'cancel')[0]!.body).toMatchObject({ note: '沒按：新的一段看得到之前的對話' })
   expect(onsen.lines.filter(l => l.who === 'k')).toHaveLength(0)
   // the second /clear, pressed inside its 5 s
   const t1 = new Date(Date.now() - 300).toISOString()

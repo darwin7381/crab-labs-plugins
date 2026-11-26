@@ -342,5 +342,13 @@ plugins/telegram-http/connector-poll-start-daemon.test.ts::the next try does not
 plugins/telegram-http/onsen-connector.ts::const open = label.slice(0, -1) + '｜'
 plugins/telegram-http/onsen-connector.test.ts::starts with the label: the label goes, 「負責：X」 (no leading 「｜」) is the first line
 plugins/telegram-http/server.ts::const COMMAND_CHOICE_S = 600
-plugins/telegram-http/server.ts::expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString() },
+plugins/telegram-http/server.ts::expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString(),
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::a command's choice expires 10 minutes after it is opened (the create body the stand-in got)
+plugins/telegram-http/onsen-client.ts::const xnote = a.expires_at && !a.resolved ? actionLine(a.expiry_note, EXPIRY_NOTE_MAX) : ''
+plugins/telegram-http/onsen-client.ts::export const EXPIRY_NOTE_MAX = 2000
+plugins/telegram-http/server.ts::expires_at: new Date(until).toISOString(), expiry_note: CLEAR_NOT_PRESSED }
+plugins/telegram-http/server.ts::const COMMAND_NOT_CHOSEN = '沒選：沒有更動'
+plugins/telegram-http/server.ts::    expiry_note: COMMAND_NOT_CHOSEN },
+plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::at 5 s (and after) no cancel comes from the daemon
+plugins/telegram-http/onsen-actions.test.ts::Onsen 0.36.0: expiry_note goes with expires_at on an open Action, one line, 2000 characters at most
+plugins/telegram-http/test-fixtures/onsen-standin.ts::Onsen 0.36.0 (onsen_actions.py create): expiry_note only with state open and expires_at

@@ -9,7 +9,7 @@ import { checkObservation } from './test-fixtures/status-v1-check.ts'
 
 type Call = { method: string; path: string; body: any; headers?: Record<string, string>; at: number }
 const CREATE = new Set(['kind', 'source', 'requested_by', 'session_id', 'assignees', 'summary', 'body', 'options', 'expires_at', 'refs', 'menu_kind', 'state',
-  'selected_option_id', 'resolved_by', 'note', 'opened_at', 'resolved_at'])
+  'selected_option_id', 'resolved_by', 'note', 'opened_at', 'resolved_at', 'expiry_note'])
 const RESOLVE = new Set(['option_id', 'expected_version', 'note', 'resolved_by', 'session_id', 'at']), APPLIED = new Set(['at', 'option_id', 'resolved_by']), CANCEL = new Set(['expected_version', 'reason', 'note'])
 const tick = async (n = 30) => { for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 1)) }
 
@@ -43,6 +43,8 @@ function standIn(o: { fail?: (c: Call, n: number) => 'throw' | 503 | 429 | null;
       return { status: 200, json: { items: [...acts.values()].filter(a => (!q.get('state') || a.state === q.get('state')) && (!q.get('requested_by') || (a.requested_by ?? 'adam') === q.get('requested_by'))), next_cursor: null } }
     }
     if (method === 'POST' && path === '/v1/actions') {
+      // Onsen 0.36.0: expiry_note only with state open and expires_at
+      if (body.expiry_note != null && ((body.state ?? 'open') !== 'open' || !body.expires_at)) return { status: 400, json: { error: { code: 'invalid_request', message: 'expiry_note 只跟 state open 與 expires_at 一起送' } } }
       const id = String(++next)
       const a = { id, version: 1, state: body.state ?? 'open', applied_at: body.state === 'resolved' ? new Date().toISOString() : null, selected_option_id: body.selected_option_id ?? null,
         resolved_by: body.resolved_by ?? null, ...body }
@@ -109,6 +111,25 @@ describe('OnsenActions', () => {
     expect(b.summary.includes('\n')).toBe(false)
     expect('session_id' in b || 'body' in b).toBe(false)              // null: not sent
     expect(h.state).toBe('resolved')
+  })
+
+  test('Onsen 0.36.0: expiry_note goes with expires_at on an open Action, one line, 2000 characters at most; never without expires_at, never on a resolved one', async () => {
+    const s = standIn()
+    const a = new OnsenActions({ req: s.req, log })
+    const at = '2026-11-27T20:00:05.000Z', menu = { source: 'menu' as const, menu_kind: 'other', session_id: 'main', assignees: ['joey'], summary: 's', options: [{ id: 'line', label: 'x' }] }
+    const h1 = a.open({ ...menu, expires_at: at, expiry_note: '沒按：新的一段\n看得到之前的對話' }, 'x1')!
+    const h2 = a.open({ ...menu, expiry_note: '沒選：沒有更動' }, 'x2')!                                    // no expires_at: dropped
+    const h3 = a.open({ ...menu, expires_at: at, expiry_note: 'y'.repeat(2500) }, 'x3')!
+    const h4 = a.open({ ...menu, expires_at: at, expiry_note: 'z', resolved: { option_id: 'line', by: 'duty-officer' } }, 'x4')!   // resolved: dropped
+    const h5 = a.open({ ...menu, expires_at: at, expiry_note: '  ' }, 'x5')!                                  // blank: not sent
+    for (const h of [h1, h2, h3, h4, h5]) await h.tail
+    const body = (k: number) => s.calls.filter(c => c.path === '/v1/actions')[k]!.body
+    expect(body(0)).toMatchObject({ expires_at: at, expiry_note: '沒按：新的一段 看得到之前的對話' })
+    expect('expiry_note' in body(1) || 'expires_at' in body(1)).toBe(false)
+    expect(body(2).expiry_note.length).toBe(2000)
+    expect('expiry_note' in body(3)).toBe(false); expect(body(3).state).toBe('resolved')
+    expect('expiry_note' in body(4)).toBe(false)
+    expect([h1, h2, h3, h4, h5].map(h => h.state)).toEqual(['open', 'open', 'open', 'resolved', 'open'])   // Onsen took every one (no 400)
   })
 
   test('pressed in Telegram: resolve (the presser, an assignee), then applied; the calls wait for the create', async () => {
