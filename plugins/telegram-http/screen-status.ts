@@ -28,11 +28,18 @@ const RULE = /^\s*[─━]{20,}\s*$/
 const ACT = /^\s*[*·✢✳✶✻✽]\s+\S.*…\s*(\(.*)?$/          // a live activity line: glyph, text, …, an optional parenthesis
 const FIN = /^\s*[*·✢✳✶✻✽]\s+\S+ for .*· done /          // a turn's end: ✻ Worked for 17s · done 1:37 AM
 const GLYPH = /^\s*[*·✢✳✶✻✽]\s+\S/                        // either, or any other glyph line (✻ Waiting for 2 background agents to finish)
+// Chiron's jev_screen.py 11-26 01:35Z (mtime 01:35:01Z): the effort hint right-aligned on the row above the input box is interface text, not output
+const CHROME = /^\s*[◐◑◒◓○●◔◕]\s+\w+\s+·\s+\/effort\s*$/
+const LIMIT = /You've hit your .{0,40}limit|Claude Code will continue automatically at|^\s*❯\s*\/rate-limit-options/   // what Claude Code prints at a limit
+const REPLY = /^\s*[●⏺]\s*\S/                             // the model's reply or a tool call line
+const ZERO = / for 0s · done /                              // the blocked turn's own finished marker, right under the limit line
 /** Python's s[:n]: n code points */
 export const cut = (s: string, n: number): string => { const a = Array.from(s); return a.length <= n ? s : a.slice(0, n).join('') }
 
 export type Counted = { running_agents: number; shells: number; monitors: number; background_tasks: number }
-export type Found = { live_activity_line: string | null; finished_marker_comes_after_it: boolean; tool_running_line: boolean; esc_to_interrupt: boolean }
+/** limit_message_is_latest_output: null with no limit text above the input box (key order as Chiron's, it is the JSON Jev reads) */
+export type Found = { live_activity_line: string | null; limit_message_is_latest_output: boolean | null; finished_marker_comes_after_it: boolean
+  tool_running_line: boolean; esc_to_interrupt: boolean }
 export type Regions = {
   has_input_box: boolean; above_input_box?: string; input_box?: string; below_input_box?: string; screen_bottom?: string
   counted_by_program: Counted; found_by_program: Found
@@ -48,7 +55,7 @@ export function regionParts(text: string): Parts {
   let st: Omit<Regions, 'counted_by_program' | 'found_by_program'>
   if (idx.length >= 2) {
     const top = idx[idx.length - 2]!, bot = idx[idx.length - 1]!
-    above = keep(rows.slice(0, top)).slice(-14)
+    above = keep(rows.slice(0, top).filter(r => !CHROME.test(r))).slice(-14)   // 「◐ medium · /effort」: interface text (box branch only, as Chiron's)
     box = keep(rows.slice(top + 1, bot))
     below = keep(rows.slice(bot + 1))
     st = { has_input_box: true, above_input_box: above.join('\n'), input_box: cut(box.join('\n'), 300), below_input_box: below.join('\n') }
@@ -57,7 +64,9 @@ export function regionParts(text: string): Parts {
     st = { has_input_box: false, screen_bottom: above.join('\n') }
   }
   const blob = [...above, ...below].join('\n')
-  const src = below.join('\n') || blob
+  // the counts are read below the input box only (Chiron's jev_screen.py, 11-26 01:30Z: with no box, nothing; a menu over the text above it read
+  // 「ran 1 shell command」 as a running shell: eval screen lab-limit-options-menu.txt)
+  const src = below.join('\n')
   let m = /(\d+) shells?/.exec(src); const shells = m ? parseInt(m[1]!, 10) : 0
   m = /(\d+) monitors?/.exec(src); const monitors = m ? parseInt(m[1]!, 10) : 0
   m = /(\d+) background tasks?/.exec(src); const background_tasks = m ? parseInt(m[1]!, 10) : 0   // v3 (Chiron 19:21Z): "· 2 background tasks · ctrl+t to show tasks"
@@ -69,8 +78,14 @@ export function regionParts(text: string): Parts {
   if (m) agents = Math.max(agents, parseInt(m[1]!, 10))
   const actI: number[] = [], finI: number[] = []
   above.forEach((r, i) => { if (ACT.test(r)) actI.push(i); if (FIN.test(r)) finI.push(i) })
+  // is the limit message the latest output: a reply or tool line (● ⏺), a live activity line or another turn's finished marker after it means it is
+  // over; the blocked turn's own "✻ … for 0s · done" right under it does not count (Chiron 01:35Z; lab-relay 11-26 00:16–00:47Z, eight screens)
+  const limI: number[] = []
+  above.forEach((r, i) => { if (LIMIT.test(r)) limI.push(i) })
+  const limitLatest = limI.length ? !above.slice(limI[limI.length - 1]! + 1).some(r => REPLY.test(r) || ACT.test(r) || (FIN.test(r) && !ZERO.test(r))) : null
   const found: Found = {
     live_activity_line: actI.length ? above[actI[actI.length - 1]!]!.trim() : null,
+    limit_message_is_latest_output: limitLatest,
     finished_marker_comes_after_it: !!(actI.length && finI.length && finI[finI.length - 1]! > actI[actI.length - 1]!),
     tool_running_line: above.slice(-10).some(r => r.includes('Running…')),
     esc_to_interrupt: blob.includes('esc to interrupt'),
@@ -105,14 +120,14 @@ function hashRows(rows: string[]): string[] {
   return out
 }
 /** the lines the hash is taken of: Chiron's list (WO-165 19:23Z, "only what can change the answer"; digits masked): has_input_box; whether there is
- *  an activity line, a finished marker after it, a "Running…", an "esc to interrupt"; the four counts; below_input_box in full; the last 2 lines above
- *  the input box; with no input box, screen_bottom in full. Masks on top, for the same purpose: a live activity line's text (and its wrapped tail), a
- *  ◯ sub-agent row's activity text (its kind stays; how many rows there are is a count), notices and whitespace runs are not part of it (exported
- *  for the tests) */
+ *  an activity line, a finished marker after it, a "Running…", an "esc to interrupt" (and, since his 11-26 01:35Z fact, whether a limit message is the
+ *  latest output); the four counts; below_input_box in full; the last 2 lines above the input box; with no input box, screen_bottom in full. Masks
+ *  on top, for the same purpose: a live activity line's text (and its wrapped tail), a ◯ sub-agent row's activity text (its kind stays; how many
+ *  rows there are is a count), notices and whitespace runs are not part of it (exported for the tests) */
 export function hashLines(p: Parts): string[] {
   const f = p.st.found_by_program, c = p.st.counted_by_program
   const out: string[] = [p.st.has_input_box ? 'box' : 'nobox',
-    JSON.stringify([!!f.live_activity_line, f.finished_marker_comes_after_it, f.tool_running_line, f.esc_to_interrupt]),
+    JSON.stringify([!!f.live_activity_line, f.finished_marker_comes_after_it, f.tool_running_line, f.esc_to_interrupt, f.limit_message_is_latest_output]),
     JSON.stringify([c.running_agents, c.shells, c.monitors, c.background_tasks])]
   if (p.st.has_input_box) {
     out.push(...hashRows(p.above).slice(-2))

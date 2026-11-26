@@ -145,3 +145,4 @@ plugins/telegram-http/server.ts::observation: lastObservation,
 plugins/telegram-http/onsen-client.ts::...(ctx.turn_id ? { turn_id: ctx.turn_id } : {})
 plugins/telegram-http/onsen-status.ts::export type TurnEnded =
 plugins/telegram-http/onsen-avatar.ts::export class AvatarSync
+plugins/telegram-http/screen-status.ts::limit_message_is_latest_output: limitLatest,

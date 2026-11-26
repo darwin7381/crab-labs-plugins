@@ -39,7 +39,7 @@ describe('regions (port of jev_screen.py)', () => {
     expect(r.counted_by_program).toEqual({ running_agents: 2, shells: 1, monitors: 0, background_tasks: 0 })
     expect(r.found_by_program.live_activity_line).toBeNull()
     const b = regions(BUSY())
-    expect(b.found_by_program).toEqual({ live_activity_line: '✳ Cerebrating… (5m 4s · ↓ 24.2k tokens)', finished_marker_comes_after_it: false, tool_running_line: false, esc_to_interrupt: false })
+    expect(b.found_by_program).toEqual({ live_activity_line: '✳ Cerebrating… (5m 4s · ↓ 24.2k tokens)', limit_message_is_latest_output: null, finished_marker_comes_after_it: false, tool_running_line: false, esc_to_interrupt: false })
     expect(regions(IDLE_SHELL).counted_by_program).toEqual({ running_agents: 0, shells: 1, monitors: 0, background_tasks: 0 })
     // v3 (Chiron 19:21Z): the newer status line
     expect(regions(BG_TASKS).counted_by_program).toEqual({ running_agents: 1, shells: 0, monitors: 0, background_tasks: 2 })
@@ -61,6 +61,29 @@ describe('regions (port of jev_screen.py)', () => {
   test('"Waiting for N background agents" counts only as the last marker line (Chiron 20:23Z: the old line stays after they finish)', () => {
     expect(regions(screen(['✻ Waiting for 2 background agents to finish'])).counted_by_program.running_agents).toBe(2)
     expect(regions(screen(['✻ Waiting for 1 background agent to finish', 'the agent reported back', '✻ Crunched for 2s · done 4:11 AM'])).counted_by_program.running_agents).toBe(0)
+  })
+  // questions v6 (JCS 0cd8920): cut_by_program / counted_by_program / found_by_program are what the program computes before the judge (Chiron WO-169 01:47Z A)
+  test('v6 cut: the effort hint on the row above the input box is interface text, dropped before the last 14 lines are taken', () => {
+    const r = regions(screen([...Array.from({ length: 14 }, (_, i) => `line ${i}`), '                                                   ◐ medium · /effort']))
+    expect(r.above_input_box!.split('\n')).toEqual(Array.from({ length: 14 }, (_, i) => `line ${i}`))
+    expect(regions(screen(['⏺ It said ◐ medium · /effort in a sentence'])).above_input_box).toContain('/effort')     // not the hint: text around it
+  })
+  test('v6 counts: below the input box only; with no input box nothing is counted', () => {
+    expect(regions(screen(['  Called plugin:telegram-http:telegram-http, ran 1 shell command', '✻ Worked for 3s · done 1:00 AM'])).counted_by_program.shells).toBe(0)
+    expect(regions(['  Called x, ran 1 shell command', '  2 shells · 1 monitor', '   ❯ 1. Stop and wait for limit to reset', '   Enter to confirm · Esc to cancel'].join('\n'))
+      .counted_by_program).toEqual({ running_agents: 0, shells: 0, monitors: 0, background_tasks: 0 })
+  })
+  test("v6 fact: limit_message_is_latest_output (null with no limit text; the blocked turn's own 0s marker does not end it)", () => {
+    const LIM = "  ⎿  You've hit your weekly limit · resets Dec 1, 9am"
+    const fact = (above: string[]) => regions(screen(above)).found_by_program.limit_message_is_latest_output
+    expect(fact(['⏺ Done.', '✻ Worked for 17s · done 1:37 AM'])).toBeNull()
+    expect(fact(['❯ go on', LIM, '✻ Worked for 0s · done 1:37 AM'])).toBe(true)
+    expect(fact(['❯ go on', LIM, '✻ Worked for 0s · done 1:37 AM', '❯ again', '● 。'])).toBe(false)              // the model replied after it
+    expect(fact(['❯ go on', LIM, '❯ again', '✶ Thinking… (3s)'])).toBe(false)                                   // a turn is running after it
+    expect(fact(['❯ go on', LIM, '❯ again', '✻ Worked for 12s · done 1:50 AM'])).toBe(false)                    // another turn finished after it
+    expect(fact(['❯ /rate-limit-options', '  ⎿  Rate limit options dialog dismissed'])).toBe(true)
+    expect(regions(screen(['❯ go on', LIM])).found_by_program).toEqual({ live_activity_line: null, limit_message_is_latest_output: true,
+      finished_marker_comes_after_it: false, tool_running_line: false, esc_to_interrupt: false })                 // Chiron's key order: the JSON Jev reads
   })
   const dir = join(homedir(), 'cc-workspaces', 'claude-chiron', 'knowledge', 'tg-dialogue')
   const evalDir = join(dir, 'screen-eval')
@@ -85,6 +108,14 @@ describe('regions (port of jev_screen.py)', () => {
     const files = readdirSync(evalDir).filter(f => f.endsWith('.txt'))
     expect(Object.keys(want).length).toBe(files.length)
     for (const f of files) expect({ f, r: regions(readFileSync(join(evalDir, f), 'utf8')) }).toEqual({ f, r: want[f] })
+  })
+  // Chiron's fixture (WO-169 01:47Z A): what each of his screens must hand the judge under questions v6, field by field and in the same key order
+  test.skipIf(!existsSync(join(evalDir, 'regions-v6.json')))("Chiron's regions-v6.json: every screen gives exactly the fixture's regions", () => {
+    const fx = JSON.parse(readFileSync(join(evalDir, 'regions-v6.json'), 'utf8')) as { questions_version: number; regions: Record<string, unknown> }
+    expect(fx.questions_version).toBe(6)
+    const names = Object.keys(fx.regions)
+    expect(names.length).toBeGreaterThanOrEqual(63)
+    for (const f of names) expect({ f, r: JSON.stringify(regions(readFileSync(join(evalDir, f), 'utf8'))) }).toEqual({ f, r: JSON.stringify(fx.regions[f]) })
   })
 })
 
