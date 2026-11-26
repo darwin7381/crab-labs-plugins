@@ -157,7 +157,7 @@ export interface ScreenJudge {
   /** its name as SCREEN_JUDGE names it */
   readonly name: string
   /** the verdict for this screen; null: it cannot tell this time (the record is statusOf's for this screen; asked about it again only by the 60 s
-   *  re-ask). Rejected: the judging failed (asked once more after retryMs, never a third time) */
+   *  re-ask). Rejected: the judging failed (asked again after retryMs, then every refreshMs, until it answers or the screen changes) */
   judge(parts: Parts): Promise<ScreenVerdict | null>
   /** why it cannot judge now ('' or absent: it can) */
   ready?(): string
@@ -540,7 +540,10 @@ export class ScreenStatus {
       if (hit && now - hit.at < this.o.cacheMs) { this.stats.cache_hits++; this.answer = hit; this.d.publish(); return }
     }
     if (now < (j.notBefore?.() ?? 0)) return
-    if (!refresh && this.failed?.hash === c.hash && (this.failed.tries >= 2 || now - this.failed.at < this.o.retryMs)) return
+    // a failed call is not given up on (WO-169 criterion 13, Chiron 00:57Z: Jev down 00:07–00:40Z, 27 agents whose screen did not change stayed on
+    // program 36 min after it came back): the second try after retryMs, then one every refreshMs (the 60 s re-ask), until a verdict or a new screen.
+    // A judge that answered and could not tell (null) is not asked again for that screen (the cache)
+    if (!refresh && this.failed?.hash === c.hash && now - this.failed.at < (this.failed.tries >= 2 ? this.o.refreshMs : this.o.retryMs)) return
     if (gone(this.d.program())) return                        // the process is gone (the OS says so): offline, not asked
     this.calls = this.calls.filter(t => now - t < 60_000)
     if (this.calls.length >= this.o.maxPerMin) {

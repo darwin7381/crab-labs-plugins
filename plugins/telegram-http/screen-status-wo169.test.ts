@@ -335,3 +335,41 @@ describe('5 run/screen-verdicts.jsonl: the question bank', () => {
     expect(b.verdict).toEqual({ state: 'idle', menu: 'none', p: 0.9, by: 'jev' })
   })
 })
+
+describe('13 a failed call is not given up on (Chiron 00:57Z: Jev down 00:07–00:40Z; the screens that did not change stayed on program)', () => {
+  test('a judge that fails for 3 minutes, then answers: asked at 0 s, 10 s, then every 60 s; judged_by back to jev within 60 s of its recovery; the state never moves', async () => {
+    const clock = { t: T0 }
+    let calls: number[] = []
+    const judge = new FakeJudge(() => { calls.push(clock.t - T0); return clock.t - T0 < 180_000 ? Promise.reject(new Error('HTTP 400 Unknown model')) : V('idle', 0.97) })
+    const r = reader(() => judge, { clock, opts: { retryMs: 10_000 } })
+    const seen: Array<{ s: number; state: string; by: unknown }> = []
+    for (let s = 0; s <= 300; s++) {                                         // the reader's own look, once a second, the screen unchanged
+      clock.t = T0 + s * 1000
+      r.s.sample(IDLE, '2.1.322')
+      await new Promise(res => setTimeout(res, 0))
+      const v = r.s.view(r.st.program)
+      seen.push({ s, state: v.state, by: v.detail?.judged_by })
+    }
+    expect(calls.slice(0, 5)).toEqual([0, 10_000, 70_000, 130_000, 190_000])
+    expect(calls).toHaveLength(5)                                             // once it answered, the same screen is not asked again
+    const firstJev = seen.find(x => x.by === 'jev')!
+    expect(firstJev.s).toBe(190)
+    expect(firstJev.s - 180).toBeLessThanOrEqual(60)
+    expect(new Set(seen.map(x => x.state))).toEqual(new Set(['idle']))         // no flip while it recovered
+    expect(seen.filter(x => x.s < 190).every(x => x.by === 'program')).toBe(true)
+    expect(seen.filter(x => x.s >= 190).every(x => x.by === 'jev')).toBe(true)
+    expect(r.s.health()).toMatchObject({ failed: 4, answer: { state: 'idle', by: 'jev' } })
+  })
+  test('a judge that answers but cannot tell (null) is not asked again for that screen; a new screen is asked at once even while failing', async () => {
+    const clock = { t: T0 }
+    let n = 0
+    const r = reader(() => new FakeJudge(() => { n++; return null }), { clock })
+    for (let s = 0; s <= 200; s += 5) { clock.t = T0 + s * 1000; r.s.sample(IDLE, '2.1.322'); await new Promise(res => setTimeout(res, 0)) }
+    expect(n).toBe(1)
+    let m = 0
+    const f = reader(() => new FakeJudge(() => { m++; return Promise.reject(new Error('down')) }), { clock: { t: T0 } })
+    f.s.sample(IDLE, '2.1.322'); await new Promise(res => setTimeout(res, 0))
+    f.s.sample(BUSY, '2.1.322'); await new Promise(res => setTimeout(res, 0))
+    expect(m).toBe(2)
+  })
+})

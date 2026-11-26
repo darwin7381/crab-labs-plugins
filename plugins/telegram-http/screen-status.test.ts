@@ -342,7 +342,7 @@ describe('the reader', () => {
     expect(ex[0].jev).toMatchObject({ state: 'idle', state_p: 0.5 })
     expect(ex[0].program).toMatchObject({ state: 'idle' })
     expect(ex[1].jev.error).toContain('timed out')
-    // a failed screen is asked once more after retryMs, never again after that
+    // a failed screen is asked once more after retryMs, then only every refreshMs (WO-169 criterion 13: 60 s here, not within the next 35 ms)
     r.s.sample(IDLE_SHELL, '2.1.322'); expect(r.calls).toHaveLength(2)
     await wait(35); r.s.sample(IDLE_SHELL, '2.1.322'); await wait(2); expect(r.calls).toHaveLength(3)
     await wait(35); r.s.sample(IDLE_SHELL, '2.1.322'); await wait(2); expect(r.calls).toHaveLength(3)
