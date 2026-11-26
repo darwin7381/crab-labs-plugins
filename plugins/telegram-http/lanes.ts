@@ -356,7 +356,13 @@ function mainEnv() {
         return wallNotice(text, rule, !!S?.wall)                                    // 002q: one notice per limit, lanes and main together
       }
       ledger({ lane: 'router', kind: 'notify', text: `[push] ${text}`, refs: { tier: 'push', tier_rule: rule, escalated: true, ...(evs.length ? { events: evs } : {}) } })
-      void pushJoey(undefined, text, false).then(id => { routerToldJoey(evs, id, rule); logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id, events: evs }) })
+      // WO-192 point 5 (Chiron 11:10Z): a notice written into Onsen whose Telegram send is still to come is said, as a lane's line (sendLine): it answers
+      const held: { said?: string } = {}
+      void pushJoey(undefined, text, false, undefined, undefined, held).then(id => {
+        const said = id == null && !!held.said
+        routerToldJoey(evs, said ? 'onsen' : id, rule)
+        logos('lane.notify', { escalated: true, tier: 'push', tier_rule: rule, message_id: id, events: evs, ...(said ? { onsen_first: 'telegram-pending' } : {}) })
+      })
     },
     wallBackoff: (kind: string, probes: number) => wallBackoffMs(kind, probes),
     usageWall: (wallSinceMs: number) => D.usageWall?.(wallSinceMs) ?? null,   // WO-120: the keeper probes, not an item fed to the wall
@@ -990,6 +996,8 @@ export function mainQueuedJoey(o: { offered?: boolean } = {}): number {
 export const __main = (): MainApi => main
 export const __journal = (): Journal => journal
 export const __events = (): EventsApi => events
+/** test only (WO-192 point 5): the router's notice to Joey for these events, as the main's machinery sends it (mainEnv().tellJoey) */
+export const __tellJoey = (text: string, rule: string, evs: string[]): void => mainEnv().tellJoey(text, rule, evs)
 /** tests only: the shared wall goes up / comes down (as a walled run or a probe would make it) */
 export const __wallUp = (kind: string, text: string, by = 'test'): void => wallUp({ kind, text }, by)
 export const __wallDown = (by = 'test'): Promise<void> => wallDown(by)
@@ -5560,7 +5568,7 @@ export function mainReplied(t: MainTier | null, messageId: number | string | nul
 }
 /** 002q (T8-R): a router line that is about named events (the asked-restart notice) is their Joey line: delivered, it meets each one's Joey line still owed
  *  (`by: router (<rule>)`) and the event records it (`router_sends`) */
-function routerToldJoey(ids: string[], messageId: number | null, rule: string): void {
+function routerToldJoey(ids: string[], messageId: number | 'onsen' | null, rule: string): void {   // 'onsen' (WO-192): said in Onsen, Telegram later
   if (!events || messageId == null) return
   for (const id of ids) {
     const e = events.get(id)
