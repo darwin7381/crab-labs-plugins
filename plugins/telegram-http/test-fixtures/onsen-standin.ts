@@ -2,12 +2,19 @@
 // (POST /messages with delivery pending) and the old records (POST /messages/batch, client_msg_id) are kept; POST /messages/<id>/delivery moves a
 // message's delivery as Onsen does (sent: its numbers become aliases; the same state again: duplicate; sent → failed: 409); GET /alias/telegram/...
 // and GET /messages/<id> answer from them (chat_history's tg:<id>); POST /v1/files keeps the bytes. Each daemon has its own credential (`who`).
+// WO-193 (Onsen 0.33.0, for WO-194): a message written `deliver: true` (direction in) puts one person_message item (dedupe pm:<id>) in the writer's
+// inbox (GET /inbox long poll, POST /inbox/ack, as onsen5); a person's edit event (POST /events kind edit) of such a message puts a person_edit
+// (pe:<event id>); say() puts a page message (via web). The payload is onsen_person.py's.
 export type Who = string
 export type Msg = { id: number; who: Who; item: any; at: number; path: '/messages' | '/messages/batch'; aliases: string[]; files: string[]
   delivery: null | { state: 'pending' | 'sent' | 'failed'; delivered_at?: string; failed_at?: string; error?: string } }
 export type Seen = { who: Who; method: string; path: string; body: any; headers: Record<string, string>; at: number }
 export type OnsenStandin = {
   port: number; msgs: Msg[]; seen: Seen[]; files: Map<string, { id: string; bytes: Uint8Array; at: number }>
+  /** WO-193: each credential's inbox (the agent-inbox daemon of the same credential pulls it) */
+  inbox: Array<{ who: Who; seq: number; kind: string; sender: string; payload: any; dedupe: string; acked: boolean; at: number }>
+  /** WO-193: a page message (via web) for the agent of `who` */
+  say: (who: Who, chat: string, text: string, attachments?: any[]) => number
   /** per credential: Onsen's version (default 0.31.0), POST /messages answering 500, a delay before A is answered (ms) */
   st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number }
   writes: (who: Who) => Msg[]
@@ -18,6 +25,26 @@ export type OnsenStandin = {
 export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenStandin {
   const msgs: Msg[] = [], seen: Seen[] = []
   const files = new Map<string, { id: string; bytes: Uint8Array; at: number }>()
+  const inbox: OnsenStandin['inbox'] = []
+  const put = (who: Who, kind: string, payload: any, dedupe: string): number => {
+    const had = inbox.find(i => i.who === who && i.dedupe === dedupe)
+    if (had) return had.seq
+    const seq = inbox.filter(i => i.who === who).length + 1
+    inbox.push({ who, seq, kind, sender: 'joey', payload, dedupe, acked: false, at: Date.now() })
+    return seq
+  }
+  const person = (m: Msg): any => {
+    const it = m.item, uid = String(it.sender ?? '').replace(/^tg:/, '')
+    const rt = it.reply_to_client_msg_id != null ? msgs.find(x => x.who === m.who && String(x.item.chat) === String(it.chat) && x.aliases.includes(String(it.reply_to_client_msg_id))) : undefined
+    return { message_id: String(m.id), conversation_id: '1', from: 'joey', via: 'telegram', text: it.body ?? '', kind: it.kind, sent_at: it.sent_at,
+      attachments: (it.attachments ?? []).map((a: any) => ({ kind: it.kind === 'photo' ? 'photo' : it.kind, name: a.name ?? null, mime: a.mime ?? null, bytes: a.size ?? null, url: null, client_ref: a.file_id ?? null })),
+      client: { name: 'telegram', chat: String(it.chat), msg_id: it.client_msg_id, user: it.meta?.user ?? uid, user_id: uid, ...(it.thread ? { thread: String(it.thread) } : {}) },
+      reply_to: it.reply_to_client_msg_id == null ? null : rt ? { message_id: String(rt.id), client_msg_id: String(it.reply_to_client_msg_id), from: 'joey', text: String(rt.item.body ?? '').slice(0, 500) }
+        : { message_id: null, client_msg_id: String(it.reply_to_client_msg_id), from: it.meta?.reply_to_user ?? null, text: it.meta?.reply_to_text ?? null },
+      ...(it.meta?.reply_quote ? { reply_quote: it.meta.reply_quote } : {}), ...(it.meta?.topic_name ? { topic_name: it.meta.topic_name } : {}),
+      ...(it.forward_from ? { forward_from: it.forward_from } : {}), ...(it.meta?.forward_date ? { forward_date: it.meta.forward_date } : {}),
+      ...(it.meta?.media_group_id ? { media_group_id: it.meta.media_group_id } : {}) }
+  }
   const st: OnsenStandin['st'] = { version: {}, a500: {}, aDelayMs: 0 }
   let next = 4000
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
@@ -34,6 +61,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     const m: Msg = { id: next++, who, item: it, at: Date.now(), path, aliases: it.client_msg_id ? [String(it.client_msg_id)] : [], files: it.attachment_file_ids ?? [],
       delivery: it.delivery ? { state: 'pending' } : null }
     msgs.push(m)
+    if (it.deliver === true && it.direction === 'in' && it.status === 'ok') put(who, 'person_message', person(m), `pm:${m.id}`)
     return { id: m.id, duplicate: false, ...(m.files.length ? { attachments: m.files.length } : {}) }
   }
   const server = Bun.serve({ port, hostname: '127.0.0.1', idleTimeout: 60, async fetch(req) {
@@ -81,12 +109,38 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     const gm = path.match(/^\/messages\/(\d+)$/)
     if (gm) { const m = msgs.find(x => x.id === Number(gm[1])); return m ? Response.json(full(m)) : Response.json({ detail: 'no message' }, { status: 404 }) }
     if (path === '/deliveries/batch' || path === '/status/batch' || path === '/wake/batch' || path === '/threads/events') return Response.json({ results: (body?.items ?? body?.events ?? []).map(() => ({ id: next++, duplicate: false })) })
-    if (path === '/events') return Response.json({ id: next++, duplicate: false })
+    if (path === '/events') {
+      const eid = next++
+      const t = body?.kind === 'edit' ? msgs.find(x => x.who === who && String(x.item.chat) === String(body.chat) && x.aliases.includes(String(body.target_client_msg_id))) : undefined
+      const given = t && inbox.find(i => i.who === who && i.dedupe === `pm:${t.id}`)
+      if (t && given && body.actor === t.item.sender) put(who, 'person_edit', { message_id: String(t.id), client: given.payload.client, text: body.body ?? '', edited_at: body.at }, `pe:${eid}`)
+      return Response.json({ id: eid, duplicate: false })
+    }
+    if (path === '/inbox' && req.method === 'GET') {
+      const after = Number(u.searchParams.get('after') ?? 0), wait = Math.min(1, Number(u.searchParams.get('wait') ?? 0))
+      const mine = () => inbox.filter(i => i.who === who)
+      const last = mine().length
+      if (after > last) return Response.json({ agent: who, items: [], reset: true, continue_after: last, last_seq: last })
+      const end = Date.now() + wait * 1000
+      let rows = mine().filter(i => i.seq > after)
+      while (!rows.length && Date.now() < end) { await sleep(10); rows = mine().filter(i => i.seq > after) }
+      return Response.json({ agent: who, last_seq: mine().length, acked_seq: 0, items: rows.map(i => ({ seq: i.seq, sender: i.sender, relay: null, kind: i.kind, payload: i.payload,
+        dedupe: i.dedupe, unverified: false, at: new Date(i.at).toISOString(), given: 1 })) })
+    }
+    if (path === '/inbox/ack' && req.method === 'POST') {
+      for (const i of inbox) if (i.who === who && i.seq <= Number(body?.upto ?? 0)) i.acked = true
+      return Response.json({ acked: true })
+    }
     if (path === '/messages' && req.method === 'GET') return Response.json({ agent: u.searchParams.get('agent'), total: 0, messages: [] })
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
   return {
-    port: server.port!, msgs, seen, files, st,
+    port: server.port!, msgs, seen, files, st, inbox,
+    say: (who, chat, text, attachments = []) => {
+      const id = next++
+      return put(who, 'person_message', { message_id: String(id), conversation_id: '1', from: 'joey', via: 'web', text, kind: 'text', sent_at: new Date().toISOString(), attachments,
+        client: { name: 'telegram', chat, msg_id: `form-${id}`, user: 'joey', user_id: chat }, reply_to: null }, `pm:${id}`)
+    },
     writes: who => msgs.filter(m => m.who === who),
     reports: (who, id) => seen.filter(s => s.who === who && /^\/messages\/\d+\/delivery$/.test(s.path) && (id == null || s.path === `/messages/${id}/delivery`)),
     stop: () => server.stop(true),

@@ -89,6 +89,7 @@ import * as OnsenVisible from './onsen-visible.ts'
 import * as OnsenAttach from './onsen-attachments.ts'
 import * as OnsenFiles from './onsen-files.ts'
 import * as OnsenFirst from './onsen-first.ts'
+import * as OnsenInbound from './onsen-inbound.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
@@ -494,6 +495,70 @@ async function sendOnsenFirst(o: { chat: string; sender: string; text: string; r
   const item: OnsenFirst.FirstItem = { ...head, ...(left.length ? { attachments: left } : {}), ...(ids.length ? { attachment_file_ids: ids } : {}) }
   const bare: OnsenFirst.FirstItem | undefined = ids.length ? { ...head, attachments: rows } : undefined
   return onsenFirst!.send({ item, bare, steps: o.steps, late: o.late })
+}
+/** WO-194 (onsen-inbound.ts; ONSEN_INBOUND: a comma list of agent names or `*`; unset, empty or 0 = off; the plist, else the machine config read again at
+ *  most every 30 s): a person's Telegram message, past the allowlist, is written into Onsen to be delivered from there (deliver: true) and reaches the
+ *  router when its person_message comes back (POST /onsen/person, from this agent's agent-inbox daemon). Recording on, the Telegram daemon, and Onsen
+ *  ≥ 0.33.0 (the version read the first time the switch is on, then every 10 min; unknown or older: the path before) */
+async function onsenInboundNow(): Promise<boolean> {
+  try {
+    if (!onsen?.cfg.record || INBOX_ONLY || !onsenVersion || !OnsenInbound.inboundOn(liveSetting('ONSEN_INBOUND'), ONSEN_AGENT)) return false
+    onsenVersion.start()
+    await onsenVersion.ensure(3_000)
+    return onsenVersion.version != null && OnsenFirst.versionAtLeast(onsenVersion.version, OnsenInbound.MIN_ONSEN)
+  } catch { return false }
+}
+/** WO-194: the facts each message's tag is built from, kept until its person_message comes back (and what was delivered, so nothing is twice) */
+const inboundStore: OnsenInbound.InboundStore | null = onsen && !INBOX_ONLY ? new OnsenInbound.InboundStore({ file: join(STATE_DIR, 'onsen', 'inbound-store.json'), log }) : null
+/** WO-194: the edited Telegram messages whose edit comes back from Onsen as a person_edit (chat:message_id → the edited message; 200 kept) */
+const inboundEdits = new Map<string, any>()
+/** WO-194: edits made while their message waited to be written into Onsen (chat:message_id:edit_date): already in what is delivered */
+const absorbedEdits = new Set<string>()
+/** WO-194 A: each message written into Onsen in arrival order; 👀 once written; 15 s not written: the person is told once; refused: delivered here */
+const inboundWriter: OnsenInbound.InboundWriter | null = onsen && !INBOX_ONLY ? new OnsenInbound.InboundWriter({
+  file: join(STATE_DIR, 'onsen', 'inbound-queue.json'), request: (m, p, b, t) => onsen!.request(m, p, b, t), log,
+  retryMs: msList(process.env.ONSEN_INBOUND_RETRY_MS), heldMs: Number(process.env.ONSEN_INBOUND_HELD_MS) || undefined,
+  laterMs: Number(process.env.ONSEN_INBOUND_LATER_MS) || undefined,
+  written: (job, id, _dup, late) => inboundWritten(job, id, late),
+  held: job => {
+    const f = inboundStore?.get(job.key)
+    if (!f || f.msgId == null) return
+    void Onsen.withSender('system:onsen-held', () => bot.api.sendMessage(f.chat_id, OnsenInbound.heldText(ONSEN_AGENT), {
+      reply_parameters: { message_id: f.msgId!, allow_sending_without_reply: true }, ...topicFields({ chat: f.chat_id, topic: f.inTopic }) }))
+      .catch(e => log('warn', `onsen inbound: the held notice for ${job.key} did not go: ${e instanceof Error ? e.message : e}`))
+  },
+  refused: job => {
+    const f = inboundStore?.get(job.key)
+    if (!f || inboundStore!.isDone(job.key)) return
+    if (f.msgId != null) inboundAck(f.chat_id, f.msgId)
+    void finishInbound(f, 'local').then(() => inboundStore!.finish([job.key])).catch(e => log('error', `onsen inbound: delivering ${job.key} here: ${e}`))
+  },
+}) : null
+/** WO-194: A took the message: 👀 (as the arrival set it before), and its file into Onsen (ONSEN_FILES: uploaded now and hung on the message's
+ *  attachment row, POST /messages/<id>/attachments, Onsen ≥ 0.33.1: A never waits for a file) */
+function inboundWritten(job: OnsenInbound.Job, onsenId: number, late: boolean): void {
+  // from the job itself: its facts may be gone already (A timed out here but Onsen had it, and it came back before the retry's duplicate)
+  inboundAck(String(job.item.chat), Number(job.item.client_msg_id))
+  if (late) log('info', `onsen inbound: ${job.key} is in Onsen now (it was held); it is delivered when it comes back`)
+  const att = job.item.attachments?.[0]
+  if (att?.file_id && onsenFilesOn()) {
+    void (async () => {
+      const ids = await OnsenFiles.storeFiles(job.item, [async () => OnsenFiles.telegramFile({ fileId: String(att.file_id), size: att.size, getFile: id => bot.api.getFile(id),
+        fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}` })], onsenUpload, log)
+      if (!ids[0]) return
+      const r = await onsen!.request('POST', `/messages/${onsenId}/attachments`, { position: 0, file_id: ids[0] }, 10_000)
+      if (!r || r.status >= 300) log('warn', `onsen inbound: file ${ids[0]} not hung on message ${onsenId} (${r ? `HTTP ${r.status}` : 'no credential'})`)
+    })().catch(e => log('warn', `onsen inbound: file of ${job.key}: ${e instanceof Error ? e.message : e}`))
+  }
+}
+/** the arrival's 👀 (access.json ackReaction) on one message; ✍ never lands under it (WO-145) */
+function inboundAck(chat: string, msgId: number): void {
+  let emoji = ''
+  try { emoji = loadAccess().ackReaction ?? '' } catch {}
+  if (!emoji || !Number.isFinite(msgId)) return
+  const ack = Onsen.withSender('system:ack', () => bot.api.setMessageReaction(chat, msgId, [{ type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] }]))
+  void ack.catch(() => {})
+  seenReactor?.ack(chat, msgId, ack)
 }
 /** WO-190: the inbox copies of the photos being handled (message:photo), so the upload takes the copy the agent gets */
 const photoCopies = new OnsenFiles.PhotoCopies()
@@ -3173,23 +3238,46 @@ bot.use(async (ctx, next) => {
 // Onsen (WO-139): an allowlisted person edits a message they sent: an edit event on it (the new full text).
 // Onsen step 2 (WO-142): and, with recording on for this agent, the edit reaches the agent (onsen-edit.ts): the original's unseen queued copy takes the new
 // text, else a new inbound 〔Joey 改了他 HH:MMZ 那一則（tg:N）〕 + the new text goes the way a normal message goes. Anyone else's edit: unchanged.
+// WO-194: the edit of a message that went into Onsen to be delivered from there is not delivered here: Onsen gives it back as a person_edit (the
+// edited message is kept for it, inboundEdits). Still waiting to be written into Onsen: it is written, and delivered, with the new text; the edit
+// event is recorded all the same (A may already be on its way with the old text), and its person_edit is not delivered again (absorbedEdits).
 bot.on('edited_message', ctx => {
   const m: any = ctx.editedMessage
   if (!onsen || !m?.from) return
   let ok = false
+  const key = `${m.chat?.id ?? ''}:${m.message_id}`
   try {
     const a = loadAccess(), chat = String(m.chat?.id ?? '')
     ok = m.chat?.type === 'private' ? a.allowFrom.includes(String(m.from.id)) : !!a.groups?.[chat] && (a.groups[chat]!.allowFrom.length === 0 || a.groups[chat]!.allowFrom.includes(String(m.from.id)))
+    if (ok && !m.from.is_bot && inboundWriter?.pending(key)) {
+      const text = editedText(m)
+      inboundWriter.rewrite(key, text)
+      inboundStore?.update(key, f => { f.text = text; if (f.caption != null) f.caption = text })
+      absorbedEdits.add(`${key}:${m.edit_date ?? ''}`)
+      if (absorbedEdits.size > 200) absorbedEdits.delete(absorbedEdits.values().next().value!)
+      log('info', `onsen inbound: edit of tg:${m.message_id} while it waits to be written into Onsen: it is written and delivered with the new text`)
+    }
     if (ok) onsen.recordEvent(Onsen.inboundEdit(ONSEN_AGENT, m))
   } catch {}
+  if (absorbedEdits.has(`${key}:${m.edit_date ?? ''}`)) return
+  if (ok && onsen.cfg.record && !m.from.is_bot && inboundStore?.viaOnsen(key)) {
+    inboundEdits.set(`${key}:${m.edit_date ?? ''}`, m)
+    if (inboundEdits.size > 200) inboundEdits.delete(inboundEdits.keys().next().value!)
+    log('info', `onsen inbound: edit of tg:${m.message_id}: recorded; it reaches the agent when Onsen gives it back (person_edit)`)
+    return
+  }
   if (ok && onsen.cfg.record && !m.from.is_bot) void deliverEditedMessage(m).catch(err => log('warn', `onsen: delivering the edit of tg:${m.message_id} failed: ${err instanceof Error ? err.message : err}`))
 })
+/** the text of an edited message as the agent reads it (deliverEditedMessage's) */
+function editedText(m: any): string {
+  return m.text != null ? expandHiddenEntities(String(m.text), m.entities) : m.caption != null ? expandHiddenEntities(String(m.caption), m.caption_entities)
+    : m.rich_message ? (richToMarkdown(m.rich_message) || '') : ''
+}
 /** Onsen step 2 (WO-142): the Telegram messages handleInbound delivered into the conversation (an edit of one of them reaches the agent) */
 const editIndex = new OnsenEdit.DeliveredIndex()
 async function deliverEditedMessage(m: any): Promise<void> {
   if (!onsen) return
-  const text = m.text != null ? expandHiddenEntities(String(m.text), m.entities) : m.caption != null ? expandHiddenEntities(String(m.caption), m.caption_entities)
-    : m.rich_message ? (richToMarkdown(m.rich_message) || '') : ''
+  const text = editedText(m)
   await OnsenEdit.deliverEdit(m, text, {
     // delivered by this daemon (its index; after a restart, its spool: an `in` item that is not a command)
     delivered: (chat, id) => editIndex.has(chat, id) || (() => { const it = onsen!.findInbound(chat, id); return !!it && it.kind !== 'command' })(),
@@ -3569,8 +3657,8 @@ bot.on('message:text', async ctx => {
 // Download a Telegram photo (largest size) to the inbox. Shared by the
 // message:photo handler and replyAttachment. Throws on any failure so the
 // caller can mark image_error instead of silently losing the picture (#2).
-async function downloadPhotoToInbox(ctx: Context, best: { file_id: string; file_unique_id: string }): Promise<string> {
-  const file = await ctx.api.getFile(best.file_id)
+async function downloadPhotoToInbox(ctx: Context | null, best: { file_id: string; file_unique_id: string }): Promise<string> {
+  const file = await (ctx ? ctx.api : bot.api).getFile(best.file_id)   // WO-194: no ctx = a message back from Onsen
   if (!file.file_path) throw new Error('getFile returned no file_path')
   const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
   const res = await fetch(url)
@@ -3596,6 +3684,7 @@ bot.on('message:photo', async ctx => {
       file_id: best.file_id,
       size: best.file_size,
       download: () => photoCopies.track(ctx.message, downloadPhotoToInbox(ctx, best)),
+      unique: best.file_unique_id,
     })
   } finally { photoCopies.done(ctx.message) }
 })
@@ -3837,6 +3926,8 @@ type ImageSource = {
   file_id: string
   size?: number
   download: () => Promise<string>
+  /** WO-194: Telegram's file_unique_id (a message back from Onsen takes the photo then, under the same name) */
+  unique?: string
 }
 
 // When a message replies to another message that carries a file (e.g. user
@@ -3879,6 +3970,7 @@ function replyAttachment(ctx: Context): {
         file_id: best.file_id,
         size: best.file_size,
         download: () => downloadPhotoToInbox(ctx, best),
+        unique: best.file_unique_id,
       },
     }
   }
@@ -3922,10 +4014,16 @@ async function handleInbound(
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
+  // WO-194 (ONSEN_INBOUND): the message is written into Onsen to be delivered from there; it reaches the router when it comes back (finishInbound).
+  // A permission reply, and a slash text while the control plane or the roamer is on (it may be theirs), go the way they went before.
+  const viaOnsen = msgId != null && OnsenInbound.inboundOn(liveSetting('ONSEN_INBOUND'), ONSEN_AGENT) && !PERMISSION_REPLY_RE.test(text)
+    && !((isControlEnabled() || isRoamerEnabled()) && text.trim().startsWith('/')) && await onsenInboundNow()
   // Onsen (WO-139): the human's message, recorded once it passed the gate and before anything routes it (main or a lane alike). Its own file only, never
   // the replied-to message's; a voice note is recorded below, with its transcript.
   const onsenVoice = ctx.message?.voice != null || ctx.message?.audio != null
-  if (!onsenVoice) onsenIn(ctx.message, text)
+  if (!viaOnsen) {                     // WO-194: a message going into Onsen is written there to be delivered (A), not recorded here
+    if (!onsenVoice) onsenIn(ctx.message, text)
+  }
 
   // Permission-reply intercept: if this looks like "yes xxxxx" for a
   // pending permission request, emit the structured event instead of
@@ -3972,7 +4070,8 @@ async function handleInbound(
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
-  if (access.ackReaction && msgId != null) {
+  // WO-194: a message going into Onsen gets it once Onsen has it (inboundWritten)
+  if (access.ackReaction && msgId != null && !viaOnsen) {
     const ack = Onsen.withSender('system:ack', () => bot.api   // Onsen (WO-139)
       .setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
@@ -4020,6 +4119,30 @@ async function handleInbound(
     // routes via roamerGetCurrentTargetMcpSessionId().
   }
 
+  // WO-194: the arrival half of a message going into Onsen. What its tag is built from is kept (inboundStore, on disk) and A is queued (inboundWriter:
+  // in arrival order, synchronous POST /messages with deliver: true). A voice note's transcript is its text in Onsen, so it is made first. The rest
+  // (the photo taken, the tag, the album wait, the router) is finishInbound when the person_message comes back (POST /onsen/person).
+  if (viaOnsen && inboundStore && inboundWriter) {
+    const m: any = ctx.message
+    const voiceTranscript = await maybeTranscribeVoice(attachment)
+    const facts = inboundFacts(ctx, text, image, attachment, attachmentFromReply, voiceTranscript, inTopic)
+    const kind = Onsen.inboundShape(m).kind
+    const body = onsenVoice ? (voiceTranscript ?? (m?.caption != null ? text : '')) : (kind === 'text' || kind === 'command' || kind === 'rich' || m?.caption != null ? text : '')
+    const item = Onsen.inboundItem(ONSEN_AGENT, m, body)
+    const rt = m?.reply_to_message
+    const topicName = inTopic != null ? Lanes.topicName(inTopic) : undefined
+    // what Onsen's person_message carries besides today's record (WO-193): the quoted passage, the topic's name, what the bridge saw of the replied-to message
+    const extra: Record<string, unknown> = {
+      ...(m?.quote?.text ? { reply_quote: String(m.quote.text) } : {}), ...(topicName ? { topic_name: topicName } : {}),
+      ...(facts.rfm.reply_to_message_id ? { reply_to_text: String(rt?.text ?? rt?.caption ?? facts.rfm.reply_to_text ?? '') || undefined, reply_to_user: facts.rfm.reply_to_user } : {}),
+    }
+    for (const k of Object.keys(extra)) if (extra[k] == null) delete extra[k]
+    const key = `${chat_id}:${msgId}`
+    inboundStore.park(key, facts)
+    inboundWriter.enqueue({ key, item: { ...item, deliver: true, ...(Object.keys(extra).length ? { meta: { ...(item.meta ?? {}), ...extra } } : {}) }, at: Date.now(), tries: 0, held: false })
+    return
+  }
+
   // #2: a failed photo download used to vanish silently (no image_path, no
   // marker, no file_id — the agent couldn't even tell a photo existed). Now
   // the failure is MARKED (image_error) and the photo's file_id survives as
@@ -4039,6 +4162,49 @@ async function handleInbound(
   const voiceTranscript = await maybeTranscribeVoice(attachment)
   if (onsenVoice) onsenIn(ctx.message, text, voiceTranscript ?? (ctx.message?.caption != null ? text : ''))   // Onsen (WO-139)
 
+  // WO-194: the tag, the album wait and the router are one function (finishInbound), the same for a message back from Onsen
+  await finishInbound(inboundFacts(ctx, text, image, attachment, attachmentFromReply, voiceTranscript, inTopic), 'local', { imagePath, imageError })
+}
+
+/** WO-194: everything the <channel> tag of one Telegram message is built from (plain JSON: kept on disk while the message is in Onsen) */
+function inboundFacts(ctx: Context, text: string, image: ImageSource | undefined, attachment: AttachmentMeta | undefined, attachmentFromReply: boolean,
+  voiceTranscript: string | undefined, inTopic: number | undefined): OnsenInbound.Facts {
+  const m: any = ctx.message, from = ctx.from!
+  return {
+    chat_id: String(ctx.chat!.id), ...(m?.message_id != null ? { msgId: m.message_id } : {}), text,
+    from: { id: from.id, ...(from.username != null ? { username: from.username } : {}) }, date: m?.date ?? 0,
+    ...(image ? { image: { file_id: image.file_id, file_unique_id: image.unique ?? image.file_id, ...(image.size != null ? { size: image.size } : {}) } } : {}),
+    ...(attachment ? { attachment: { ...attachment } } : {}), fromReply: attachmentFromReply,
+    ...(voiceTranscript ? { voiceTranscript } : {}), ...(inTopic != null ? { inTopic } : {}),
+    // Reply-root / forward-origin / album context (2026-07-10) — see replyForwardMeta.
+    // lanes-topics: with lanes on, the topic's creation service message (what a message typed in a topic replies to) is not a reply of Joey's
+    rfm: replyForwardMeta(ctx, attachmentFromReply && !!(attachment || image), Lanes.LANES_ON),
+    ...(m?.media_group_id ? { mgid: String(m.media_group_id) } : {}),
+    // When a real caption exists, `text` is its entity-expanded form (top of handleInbound) — album captions keep their hidden URLs.
+    ...(m?.caption != null ? { caption: text } : {}),
+  }
+}
+
+/** WO-194: the rest of a person's Telegram message once it is delivered: its <channel> tag, the album wait, the router. One function whichever way the
+ *  message came (how: 'local', the path before; 'onsen', back from Onsen with the facts its arrival kept, or rebuilt from the person_message), so the
+ *  tag is the same. `got`: the photo already taken (the path before takes it before the transcript); else it is taken here. */
+async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?: { imagePath?: string; imageError?: string }): Promise<void> {
+  const chat_id = f.chat_id, msgId = f.msgId, text = f.text, image = f.image, attachment = f.attachment, inTopic = f.inTopic
+  const voiceTranscript = f.voiceTranscript, attachmentFromReply = f.fromReply
+  let imagePath = got?.imagePath
+  let imageError = got?.imageError
+  if (!got && image) {
+    try {
+      imagePath = await downloadPhotoToInbox(null, { file_id: image.file_id, file_unique_id: image.file_unique_id })
+    } catch (err) {
+      log('error', `photo download failed: ${err instanceof Error ? err.message : err}`)
+      imageError = 'download failed'
+    }
+  }
+  // WO-194: a file only Onsen has (a person_message rebuilt without Telegram's file id): taken from Onsen as a page message's is (WO-189)
+  const fromOnsen = !got && f.onsenFiles?.length && onsen
+    ? await OnsenAttach.attachmentMeta(f.onsenFiles, { get: (u, max) => onsen!.getFile(u, max), dir: INBOX_DIR, saved: onsenSaved, log: m => log('warn', m) }) : {}
+
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   //
@@ -4053,9 +4219,9 @@ async function handleInbound(
   const meta: Record<string, string> = {
     chat_id,
     ...(msgId != null ? { message_id: String(msgId) } : {}),
-    user: from.username ?? String(from.id),
-    user_id: String(from.id),
-    ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+    user: f.from.username ?? String(f.from.id),
+    user_id: String(f.from.id),
+    ts: new Date((f.date ?? 0) * 1000).toISOString(),
     ...(imagePath ? { image_path: imagePath } : {}),
     ...(imageError && image ? {
       image_error: imageError,
@@ -4074,6 +4240,7 @@ async function handleInbound(
       ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
       ...(attachment.name ? { attachment_name: attachment.name } : {}),
     } : {}),
+    ...fromOnsen,
     ...(voiceTranscript ? { voice_transcript: voiceTranscript } : {}),
     // 002: the topic a message was sent in (worker lanes are bound to topics)
     // lanes-golive: a message inside a private-chat topic (Bot API 9.3+/10.5: is_topic_message, message_thread_id) belongs to that topic's worker lane
@@ -4085,8 +4252,7 @@ async function handleInbound(
     // replyForwardMeta. Without these the agent couldn't tell WHAT was
     // being replied to, WHO originally wrote a forwarded message, or
     // that N album photos belong together.
-    // lanes-topics: with lanes on, the topic's creation service message (what a message typed in a topic replies to) is not a reply of Joey's
-    ...replyForwardMeta(ctx, attachmentFromReply && !!(attachment || image), Lanes.LANES_ON),
+    ...f.rfm,
   }
 
   // #6: photos sharing a media_group_id are ONE album — buffer them briefly
@@ -4094,11 +4260,11 @@ async function handleInbound(
   // instead of N disjoint messages. Single photos (no media_group_id) are
   // completely unaffected. Reply-sourced images never aggregate (the album id
   // belongs to the outer message, not the root's photo).
-  const mgid = ctx.message?.media_group_id
-  editIndex.note(chat_id, msgId, ctx.message?.date)   // Onsen step 2 (WO-142): delivered into the conversation; an edit of it reaches the agent
+  const mgid = f.mgid
+  editIndex.note(chat_id, msgId, f.date)   // Onsen step 2 (WO-142): delivered into the conversation; an edit of it reaches the agent
   // Onsen step 3 (WO-143): the daemon took Joey's message in (it goes to the router / the queues next): `delivered`, after the message's own record
   // (onsenIn above). A command the daemon answered itself and a permission reply returned before this line: they are not delivered to the agent.
-  if (onsenFacts && msgId != null) { try { if (onsenJoeyOf({ chat_id, message_id: String(msgId), user_id: String(from.id) })) onsenFacts.delivered(chat_id, msgId) } catch {} }
+  if (onsenFacts && msgId != null) { try { if (onsenJoeyOf({ chat_id, message_id: String(msgId), user_id: String(f.from.id) })) onsenFacts.delivered(chat_id, msgId) } catch {} }
   // Documents aggregate too (2026-08-23, Atlas lost 2 of 3 album statements):
   // a document album previously fell through here one-by-one — each item got
   // media_group_id in meta but never media_group_count/numbered fields, so the
@@ -4106,9 +4272,7 @@ async function handleInbound(
   // the only unacceptable option.
   if (mgid && (image || attachment) && !attachmentFromReply) {
     bufferAlbumItem(chat_id, String(mgid), {
-      // When a real caption exists, `text` is its entity-expanded form (top of
-      // this function) — pass that so album captions keep their hidden URLs.
-      caption: ctx.message?.caption != null ? text : undefined,
+      caption: f.caption,
       ...(image
         ? { imagePath, fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
@@ -4978,13 +5142,14 @@ if (Lanes.LANES_ON) {
  *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way. WO-180: ONSEN_OBSERVATION
  *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way. WO-190: ONSEN_FILES (the files of Telegram messages go into Onsen) too.
  *  WO-192: ONSEN_FIRST (an agent's words to a person go into Onsen before Telegram) too */
-type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS' | 'ONSEN_FILES' | 'ONSEN_FIRST'
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS' | 'ONSEN_FILES' | 'ONSEN_FIRST' | 'ONSEN_INBOUND'
 const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
   SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE,
   ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION,
   LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS,   // WO-181
   ONSEN_FILES: fleetConfigApplied.includes('ONSEN_FILES') ? undefined : process.env.ONSEN_FILES,   // WO-190
-  ONSEN_FIRST: fleetConfigApplied.includes('ONSEN_FIRST') ? undefined : process.env.ONSEN_FIRST }   // WO-192
+  ONSEN_FIRST: fleetConfigApplied.includes('ONSEN_FIRST') ? undefined : process.env.ONSEN_FIRST,   // WO-192
+  ONSEN_INBOUND: fleetConfigApplied.includes('ONSEN_INBOUND') ? undefined : process.env.ONSEN_INBOUND }   // WO-194
 let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
 function liveSetting(k: LiveKey): string | undefined {
   if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
@@ -5266,7 +5431,7 @@ function statusPinSetup(): { pin: OnsenVisible.StatusPin; show: (v: OnsenStatus.
 /** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
  *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
  *  not allowlisted (acked and dropped, logged). */
-async function deliverFormAnswer(it: OnsenVisible.FormItem): Promise<boolean> {
+async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main'): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}))) {
     log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
@@ -5286,12 +5451,115 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem): Promise<boolean> {
   const notification = { method: 'notifications/claude/channel', params: { content: it.say ? it.body : OnsenVisible.formBodyText(it.body), meta } }
   // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
-  if (Lanes.LANES_ON) {
+  // WO-194: a page message that came as a person_message with ONSEN_INBOUND on goes the way a Telegram message goes (the router's rules)
+  if (Lanes.LANES_ON && route === 'main') {
     const ev: Lanes.InEvent = { id: `tg-${chat}-${ref}`, source: 'telegram', from: uid, text: String(notification.params.content), meta, notif: notification, verified: true }
     if (Lanes.toMainForm(ev)) return true
   }
   await dispatchInbound(chat, notification)
   return true
+}
+/** WO-194: a person_message / person_edit of this agent's Onsen inbox (onsen_person.py), handed over by its agent-inbox daemon (POST /onsen/person).
+ *  Answered 200 once delivered (the inbox acks it then: never before), or when it is not to be delivered (its chat not on the allowlist; delivered
+ *  already: duplicate); 409 while the same message is being delivered (the inbox hands it again later). A Telegram message: its tag from the facts its
+ *  arrival kept (finishInbound, the tag of the path before), or rebuilt from the payload when none were kept. A page message (via web): as the forms
+ *  inbox's `say` item is delivered (deliverFormAnswer: via="onsen", its files from Onsen), by the router's rules when ONSEN_INBOUND is on here (else
+ *  to the main, as before), then echoed 〔你在 Onsen 傳的〕. Delivered whatever the switch: what Onsen gives to deliver is never dropped */
+const personBusy = new Set<string>()
+async function personArrived(it: { kind?: string; seq?: number; dedupe?: string | null; payload?: any }): Promise<{ code: number; json: Record<string, unknown> }> {
+  const p = it.payload && typeof it.payload === 'object' ? it.payload : {}
+  const c = p.client && typeof p.client === 'object' ? p.client : null
+  if (!inboundStore || !c?.chat || c.msg_id == null) {
+    log('warn', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} has no Telegram chat or number (client ${JSON.stringify(c).slice(0, 120)}): not delivered (acked)`)
+    return { code: 200, json: { dropped: 'no Telegram chat' } }
+  }
+  const chat = String(c.chat), ref = String(c.msg_id), access = loadAccess()
+  if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}))) {
+    log('warn', `onsen inbound: ${it.kind} ${p.message_id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
+    return { code: 200, json: { dropped: 'chat not allowlisted' } }
+  }
+  const edit = it.kind === 'person_edit'
+  const key = `${chat}:${ref}`, own = String(it.dedupe || (edit ? `pe:${p.message_id}:${p.edited_at}` : `pm:${p.message_id}`))
+  if (inboundStore.isDone(own) || (!edit && inboundStore.isDone(key))) { inboundStore.stats.duplicates++; return { code: 200, json: { duplicate: true } } }
+  if (personBusy.has(own)) return { code: 409, json: { busy: true } }
+  personBusy.add(own)
+  try {
+    const shown = p.via === 'web' ? ref : `tg:${ref}`
+    if (edit) {
+      log('info', `onsen inbound: person_edit of ${shown} received from the inbox`)
+      const at = Math.floor(Date.parse(String(p.edited_at ?? '')) / 1000)
+      if (absorbedEdits.delete(`${key}:${Number.isFinite(at) ? at : ''}`)) {
+        inboundStore.finish([own])
+        log('info', `onsen inbound: person_edit of ${shown}: made before the message was in Onsen, already in what was delivered`)
+        return { code: 200, json: { delivered: true, absorbed: true } }
+      }
+      const m = inboundEdits.get(`${key}:${Number.isFinite(at) ? at : ''}`) ?? { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
+        from: { id: Number(c.user_id) || 0, is_bot: false, ...(c.user ? { username: String(c.user) } : {}) }, text: String(p.text ?? ''), ...(Number.isFinite(at) ? { edit_date: at } : {}),
+        ...(c.thread != null ? { is_topic_message: true, message_thread_id: Number(c.thread) } : {}) }
+      if (/^\d+$/.test(ref)) await deliverEditedMessage(m)
+      inboundEdits.delete(`${key}:${Number.isFinite(at) ? at : ''}`)
+      inboundStore.finish([own])
+      log('info', `onsen inbound: person_edit of ${shown} handed on`)
+      return { code: 200, json: { delivered: true } }
+    }
+    log('info', `onsen inbound: person_message ${p.message_id} (${shown}) received from the inbox`)
+    if (p.via === 'web') {
+      const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
+        ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}) }
+      await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main')
+      inboundStore.finish([key, own])
+      log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
+      await echoFormAnswer(fi).catch(e => log('warn', `onsen inbound: echo of ${shown} failed: ${e instanceof Error ? e.message : e}`))
+      return { code: 200, json: { delivered: true } }
+    }
+    let f = inboundStore.take(key)
+    if (!f) {
+      f = factsFromPayload(p, chat, ref)
+      inboundStore.stats.rebuilt++
+      log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
+    }
+    await finishInbound(f, 'onsen')
+    inboundStore.finish([key, own])
+    log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
+    return { code: 200, json: { delivered: true } }
+  } finally { personBusy.delete(own) }
+}
+/** WO-194: a Telegram message's facts from its person_message alone (the arrival's were not kept): the restoration table of the ticket. What Onsen does
+ *  not carry is missing (reply_to_user_id, forward_origin and forward_from_id, attachment_origin, a voice note's caption) and the sender's name is
+ *  Onsen's (meta.user: the username, else the first name) */
+function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts {
+  const c = p.client ?? {}
+  const atts: any[] = Array.isArray(p.attachments) ? p.attachments.filter((a: unknown) => a && typeof a === 'object') : []
+  const a = atts[0], kind = String(p.kind ?? 'text'), text = String(p.text ?? ''), voice = kind === 'voice'
+  const label: Record<string, string> = { photo: '(photo)', voice: '(voice message)', video: '(video)', sticker: '(sticker)', document: `(document: ${safeName(a?.name ?? undefined) ?? 'file'})` }
+  const rfm: Record<string, string> = {}
+  const rt = p.reply_to
+  if (rt?.client_msg_id != null) {
+    rfm.reply_to_message_id = String(rt.client_msg_id)
+    if (rt.from) rfm.reply_to_user = safeName(String(rt.from)) || String(rt.from)
+    if (rt.text) rfm.reply_to_text = metaExcerpt(String(rt.text))
+  }
+  if (p.reply_quote) rfm.reply_quote = metaExcerpt(String(p.reply_quote))
+  if (p.forward_from) {
+    rfm.forward_from = metaExcerpt(String(p.forward_from))
+    if (p.forward_date && Number.isFinite(Date.parse(p.forward_date))) rfm.forward_date = new Date(p.forward_date).toISOString()
+  }
+  if (p.media_group_id) rfm.media_group_id = String(p.media_group_id)
+  const photo = !!a && (a.kind === 'photo' || /^image\//i.test(String(a.mime ?? '')))
+  const tg = a?.client_ref ? String(a.client_ref) : ''
+  const size = Number.isFinite(Number(a?.bytes)) && a?.bytes != null ? Number(a.bytes) : undefined
+  const date = Math.floor(Date.parse(String(p.sent_at ?? '')) / 1000)
+  return {
+    chat_id: chat, ...(/^\d+$/.test(ref) ? { msgId: Number(ref) } : {}), text: voice ? '(voice message)' : text || label[kind] || '',
+    from: { id: Number(c.user_id) || 0, ...(c.user != null && String(c.user) !== String(c.user_id) ? { username: String(c.user) } : {}) }, date: Number.isFinite(date) ? date : 0,
+    ...(photo && tg ? { image: { file_id: tg, file_unique_id: `onsen-${String(p.message_id).replace(/\D/g, '')}`, ...(size != null ? { size } : {}) } } : {}),
+    ...(a && !photo && tg ? { attachment: { kind: voice ? 'voice' : String(a.kind || kind), file_id: tg, ...(size != null ? { size } : {}),
+      ...(a.mime ? { mime: String(a.mime) } : {}), ...(a.name ? { name: safeName(String(a.name))! } : {}) } } : {}),
+    ...(a && !tg && a.url ? { onsenFiles: [a] } : {}),
+    fromReply: false, ...(voice && text ? { voiceTranscript: metaExcerpt(text, 500) } : {}),
+    ...(c.thread != null && /^\d+$/.test(String(c.thread)) ? { inTopic: Number(c.thread) } : {}),
+    rfm, ...(p.media_group_id ? { mgid: String(p.media_group_id) } : {}), ...(text && !voice && a ? { caption: text } : {}),
+  }
 }
 /** WO-145: what Joey sees for his page answer: 〔你在頁面送出的｜title〕 and the body, without a notification; recorded as system:form-echo's */
 async function echoFormAnswer(it: OnsenVisible.FormItem): Promise<void> {
@@ -5482,6 +5750,8 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
 async function deliverPulled(it: PullItem): Promise<HandResult> {
   // WO-176: Onsen's control item (a press in Onsen, no text) is for this agent's Telegram daemon, never for a session: no comms row, no router, no wake row
   if (it.kind === Onsen.ACTION_CONTROL_KIND) return controlPulled(it)
+  // WO-194: a person's message Onsen gives this agent to deliver (person_message / person_edit) is its Telegram daemon's to deliver, never a peer message
+  if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it)
   // the sender's facts in Onsen's own fields (0.9.3) count as much as the payload's: an item whose no_reply is only a top-level fact is still a
   // no-reply answer to the router (Chiron WO-158 11:56Z: a no_reply peer_call sent that way opened a lane)
   const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}),
@@ -5504,6 +5774,35 @@ async function deliverPulled(it: PullItem): Promise<HandResult> {
   const ok = out.json.injected === true || out.json.ignored != null
   log(ok ? 'info' : 'warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) from ${verdict.sender}${it.relay ? ` via ${it.relay}` : ''}${unverified ? ' (unverified)' : ''}${key ? ` ${key}` : ' (no key)'}: ${ok ? 'handed on' : `not delivered ${JSON.stringify(out.json).slice(0, 160)}`}`)
   return ok ? 'delivered' : 'undelivered'
+}
+/** WO-194: a person_message / person_edit item (onsen_person.py: a person's message, from Telegram or Onsen's page, given to this agent to deliver). Handed
+ *  to this agent's Telegram daemon (POST /onsen/person on LANES_TG_PORT, the loopback token), which builds its <channel> tag and routes it, and answers
+ *  once it is delivered; never handed to a session from here, whatever ONSEN_INBOUND says. Not taken: tried again 1 s and 3 s later, then it stays
+ *  pending (thrown: the pull backs off, 2 s doubling to 60 s, and hands it on again; what is behind it waits): never acked undelivered */
+const PERSON_FORWARD_GAPS_MS = (process.env.ONSEN_PERSON_FORWARD_GAPS_MS ?? '1000,3000').split(',').map(x => Number(x.trim())).filter(n => Number.isFinite(n) && n >= 0)
+async function personPulled(it: PullItem): Promise<HandResult> {
+  const key = itemKey(it)
+  if (key && onsenInbox?.seen(key)) return 'duplicate'
+  const port = Number(process.env.LANES_TG_PORT ?? 0)
+  let why = port ? '' : 'LANES_TG_PORT is not set (no Telegram daemon to hand it to)'
+  for (let i = 0; port && i <= PERSON_FORWARD_GAPS_MS.length; i++) {
+    if (i) await new Promise(r => setTimeout(r, PERSON_FORWARD_GAPS_MS[i - 1]))
+    let tok = ''
+    try { tok = readFileSync(join(process.env.MCP_TOKEN_DIR ?? join(homedir(), '.claude', 'agent-inbox', 'mcp-tokens'), String(port)), 'utf8').trim() } catch {}
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/onsen/person`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+        body: JSON.stringify(it), signal: AbortSignal.timeout(60_000) })
+      const j = await r.json().catch(() => ({})) as Record<string, unknown>
+      if (r.status === 200) {
+        if (key) onsenInbox?.record(key)
+        log('info', `onsen inbox: item ${it.seq} (${it.kind}) ${key ?? ''}: handed to the Telegram daemon (:${port}): ${j.duplicate ? 'already delivered' : j.dropped ? `not delivered there (${j.dropped})` : 'delivered'}`)
+        return j.duplicate ? 'duplicate' : 'delivered'
+      }
+      why = `HTTP ${r.status}${j.error ? ` ${String(j.error).slice(0, 120)}` : ''}`
+    } catch (e) { why = String(e instanceof Error ? e.message : e).slice(0, 120) }
+  }
+  log('warn', `onsen inbox: item ${it.seq} (${it.kind}) not taken by the Telegram daemon (${why}): kept, handed on again`)
+  throw new Error(`${it.kind} ${it.seq}: the Telegram daemon did not take it (${why})`)
 }
 /** WO-176: an action_control item (sender onsen: a person pressed an option of one of this agent's Actions in Onsen). Handed to this agent's Telegram
  *  daemon (POST /onsen/action on LANES_TG_PORT, the loopback token), which presses it. Not taken: the item stays pending and is tried again
@@ -5570,7 +5869,9 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}),
           ...(onsenActions ? { actions: onsenActions.health() } : {}), ...(mentionCards ? { mentions: mentionCards.health() } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed); WO-181: the mention cards'
           // WO-192: the switch now, Onsen's version as last read, A / Telegram / resend counts
-          ...(onsenFirst && onsenVersion ? { first: { on: OnsenFirst.firstOn(liveSetting('ONSEN_FIRST'), ONSEN_AGENT), ...onsenVersion.health(), ...onsenFirst.stats } } : {}) } } : {}),
+          ...(onsenFirst && onsenVersion ? { first: { on: OnsenFirst.firstOn(liveSetting('ONSEN_FIRST'), ONSEN_AGENT), ...onsenVersion.health(), ...onsenFirst.stats } } : {}),
+          // WO-194: a person's message written into Onsen and delivered from there
+          ...(inboundWriter && inboundStore ? { inbound: { on: OnsenInbound.inboundOn(liveSetting('ONSEN_INBOUND'), ONSEN_AGENT), write: inboundWriter.health(), back: inboundStore.health() } } : {}) } } : {}),
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,
@@ -5681,6 +5982,23 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       }
       res.writeHead(202, { 'content-type': 'application/json' }).end(JSON.stringify({ accepted: true }))
       void applyActionControl(c).catch(e => log('warn', `onsen action ${c.action_id}: applying the press from Onsen failed: ${e instanceof Error ? e.message : e}`))
+      return
+    }
+    // WO-194: a person_message / person_edit of this agent's Onsen inbox, handed over by its agent-inbox daemon; same loopback token as /mcp.
+    // Answered once delivered (personArrived), so the inbox acks it only then
+    if (!INBOX_ONLY && u.pathname === '/onsen/person' && req.method === 'POST') {
+      if (!mcpGate.check(req.headers['authorization'] as string | undefined, req.method ?? '?', req.headers['user-agent'] as string | undefined)) {
+        const r = refusal(req.headers['authorization'] as string | undefined)
+        res.writeHead(r.status, { 'content-type': 'application/json' }).end(r.body)
+        return
+      }
+      const b = await readJsonBody(req).catch(() => null) as any
+      if (!b || !OnsenInbound.ITEM_KINDS.includes(String(b.kind))) {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'body is an inbox item of kind person_message or person_edit' }))
+        return
+      }
+      const out = await personArrived(b).catch(e => ({ code: 500, json: { error: String(e instanceof Error ? e.message : e).slice(0, 200) } }))
+      res.writeHead(out.code, { 'content-type': 'application/json' }).end(JSON.stringify(out.json))
       return
     }
     // WO-126 (1.38.1): the main's mailbox_decide, handed over by this agent's Telegram daemon (its tool lives there); same loopback token as /mcp
