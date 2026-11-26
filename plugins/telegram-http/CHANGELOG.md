@@ -1,3 +1,16 @@
+## 1.58.19 — 2026-11-26 (/clear: by default the agent still reads what came before)
+
+- **`/clear` from Telegram draws no restart line; the button is now 「不要讓它看到之前的」 and counts down 5 s** (board WO-185, Chiron; Joey TG chiron:2645 「應該預設能讓他們看到之前的，出現的按鈕應該是／不要讓他看到之前的／且倒數五秒／五秒沒按的話就直接用預設」). Replaces 1.42's line-first `/clear` (the line drawn before `/clear` reached the pane, the reply offering 「讓它看得到之前的」).
+  - `/clear` is typed into the TUI as before; no line, so `chat_history` and the start-of-session 「最近的問答」 still show what came before. The reply: 「✅ 已送 `/clear` 到 <tmux>。它還查得到之前的對話。」 with one button 「不要讓它看到之前的（5）」; its number goes 4, 3, 2, 1 once a second (one edit a second), then the button goes and the text stays.
+  - Pressed while it stands: the line is drawn at the `/clear` message's own time (`at`; `idem_key` as before from that message id; `by` the person who pressed); through the spool when Onsen is silent. The reply becomes 「…已畫線：這之前的對話它看不到了（你引用的那一則照樣看得到）。」 with the existing 「讓它看得到之前的」 (`olift:`, no countdown).
+  - Pressed later (a button left by a daemon restart): 「已經過了，照預設：它看得到之前的」, the button goes, no line. Lateness is the reply's own Telegram date in the callback (more than 6 s: 5 s and one for Telegram's whole seconds), not a timer in memory.
+  - `/clear` that fails to reach the pane: the failure sentence, no button. Allowlisted users only (as `olift:`).
+- `channel-bot-control.ts`: `ClearHooks.afterClear(okText)` (sends the reply with its button; false = the plain reply) replaces `beforeClear`/`undo`. `server.ts`: `clearHooks`, `CLEAR_KEEP_S`, the `oline:` callback.
+- Tests: onsen-step2 (the hook order), onsen-step2-daemon (no line at /clear; the countdown's five edits ending in no button; a late press; a stranger's press; a press inside: the line at the /clear's time, the reply, `olift:` lifts it).
+- A countdown edit that fails is logged (`onsen: /clear <id> countdown edit (<n>) … failed: …`): a Telegram 429 shows in the daemon log (criterion 5).
+- Also in this version: Epeius's codex-runner `5c04c0d` (its answer to a caller is no_reply; a separate program, nothing the daemons run changes).
+- Roll back: 1.58.18.
+
 ## 1.58.18 — 2026-11-26 (a mention item is a notice, not a call)
 
 - **Onsen's mention item owes nobody anything and is not a call** (board WO-175 / WO-181, Chiron's lab 08:28–08:45Z, mesh 12543: 「kind mention 的件不能帶義務…交進去的就是區塊，跟車道摘要一樣只讓它知道」). 1.58.16 handed it to the main as a peer's item: obligations main + a Joey line (`kind joey, level line`), class peer, the agent-inbox channel tag of the sender `onsen` with `line="call"`; the main took it for a call and answered Joey 「沒有要我做的事」 (lab-relay msg 881). Fleet-wide every comment naming an agent would have made it write to Joey.
