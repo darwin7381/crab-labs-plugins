@@ -2,7 +2,7 @@
 // state the daemon reports. WO-169 (Joey TG chiron:2547, 2520: 「Jev頂替只是程式邏輯判斷的部分…後面還是要根據他的輸出選項結果再經過一個程式輸出，
 // 然後輸出的東西才擺在各種應該擺的位置」「不是把它當成 Agent 而是把它當成就是一個小程式的一小段」) fixes the interface around the judging step:
 //
-//   above     this file, no Jev: the look (one tmux call), regions() (Chiron's jev_screen.py, ported line for line), the counts and facts the program
+//   above     this file, no Jev: the look (WO-168: pane-look.ts, the one capture), regions() (Chiron's jev_screen.py, ported line for line), the counts and facts the program
 //             reads (counted_by_program, found_by_program), the hash of what can change the answer, the cadence (ask only when the hash changed, one in
 //             flight, the cache, the 60 s re-ask, the cap a minute)
 //   middle    a ScreenJudge: judge(parts) → ScreenVerdict | null. The one in use is JevJudge (screen-judge-jev.ts: Jev asked, its answer collected by the
@@ -16,7 +16,6 @@
 //
 // statusOf (onsen-status.ts) stays exactly as it is: it is still computed, it is the trigger (its change makes the screen be looked at at once), the
 // fallback (no verdict) and the side every verdict is compared with (JevJudge's exception log).
-import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { appendFileSync, closeSync, mkdirSync, openSync, readSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -634,25 +633,8 @@ export class Since {
   }
 }
 
-// ------------------------------------------------------------------ one look at the pane: one tmux call
-/** the pane's foreground command and its visible text, in ONE tmux client run (display-message ; capture-pane); null when the pane cannot be read.
- *  `-u` as the duty officer: a launchd daemon has no UTF-8 locale. Killed (SIGKILL) at timeoutMs */
-export function snapPane(tmux: string, timeoutMs = 3000): Promise<{ cmd: string; pane: string } | null> {
-  return new Promise(resolve => {
-    let out = '', done = false
-    let p: ReturnType<typeof spawn>
-    try { p = spawn('tmux', ['-u', 'display-message', '-p', '-t', tmux, '#{pane_current_command}', ';', 'capture-pane', '-p', '-t', tmux], { stdio: ['ignore', 'pipe', 'ignore'] }) } catch { return resolve(null) }
-    const end = (v: { cmd: string; pane: string } | null) => { if (!done) { done = true; clearTimeout(t); resolve(v) } }
-    const t = setTimeout(() => { try { p.kill('SIGKILL') } catch {}; end(null) }, timeoutMs)
-    p.stdout?.on('data', (b: Buffer) => { out += b.toString('utf8') })
-    p.on('error', () => end(null))
-    p.on('close', code => {
-      if (code !== 0) return end(null)
-      const i = out.indexOf('\n')
-      end(i < 0 ? null : { cmd: out.slice(0, i).trim(), pane: out.slice(i + 1) })
-    })
-  })
-}
+// ------------------------------------------------------------------ one look at the pane
+// WO-168 stage two: the look is pane-look.ts's (the one capture of the own pane: PaneReader, snapPaneLook); this file's own snapPane is gone
 
 // ------------------------------------------------------------------ the reader
 export interface ScreenDeps {
