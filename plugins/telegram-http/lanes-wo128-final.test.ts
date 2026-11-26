@@ -51,7 +51,7 @@ const H = 3600_000
 const iso = (ms: number) => new Date(ms).toISOString()
 async function btcc(method: 'GET' | 'POST', path: string, body?: any): Promise<{ status: number; json: any }> {
   btccSeen.push({ method, path, body })
-  let m = path.match(/^\/api\/mesh\/mail\/(\d+)\?by=lane$/)
+  let m = path.match(/^\/api\/mesh\/mail\/(\d+)\?by=lane(?:&lane=[^&]+)?$/)   // WO-173: a lane's read may name the lane
   if (method === 'GET' && m) {
     if (btccGetFails) return { status: 503, json: { detail: 'down' } }
     const x = mails.get(Number(m[1]))
@@ -230,7 +230,7 @@ test('WO-128 final 三: a board notice (no deadline) with a can-wait card, the m
   // the lanes asked for the default; the agent-inbox daemon read the mail (by=lane), found no deadline and gave the card an hour before BTCC saw it
   expect(mailCalls.at(-1).args.default_deadline_h).toBe(L.CARD_DEFAULT_DEADLINE_H)
   const seen = btccSeen.filter(x => x.path.startsWith('/api/mesh/mail/8911'))
-  expect(seen.map(x => `${x.method} ${x.path}`)).toEqual(['GET /api/mesh/mail/8911?by=lane', 'POST /api/mesh/mail/8911/card?by=lane'])
+  expect(seen.map(x => `${x.method} ${x.path}`)).toEqual([`GET /api/mesh/mail/8911?by=lane&lane=${encodeURIComponent(w.lane)}`, 'POST /api/mesh/mail/8911/card?by=lane'])
   const dl = Date.parse(seen[1].body.card.deadline)
   expect(dl).toBeGreaterThanOrEqual(t0 + H); expect(dl).toBeLessThanOrEqual(t1 + H)
   expect(Object.keys(seen[1].body.card).sort()).toEqual(['deadline', 'decide', 'recommend', 'then'])   // BTCC's boxes only (default_deadline_h is not one)
@@ -259,7 +259,7 @@ test('WO-128 final 三: a board notice (no deadline) with a can-wait card, the m
 test('WO-128 final 三: the card\'s deadline: its own if given (no read); else the mail\'s (BTCC falls back to it); a mail without one: an hour; the mail unreadable: an hour; without default_deadline_h (the switch off, or an older tg daemon) as before', async () => {
   const deps = (lane = 'adam.mail.1') => ({ call: async () => '', core: async () => ({ status: 200, json: {} }), openBy: 'lane' as const, lane, btcc })
   const posted = (id: number) => btccSeen.filter(x => x.method === 'POST' && x.path === `/api/mesh/mail/${id}/card?by=lane`).at(-1)!.body.card
-  const gets = (id: number) => btccSeen.filter(x => x.method === 'GET' && x.path === `/api/mesh/mail/${id}?by=lane`).length
+  const gets = (id: number) => btccSeen.filter(x => x.method === 'GET' && x.path.startsWith(`/api/mesh/mail/${id}?by=lane`)).length
   const own = iso(Date.now() + 3 * H)
   board(8921); await callInboxTool('mailbox_card', { id: 8921, card: { decide: 'd', recommend: 'r', deadline: own }, default_deadline_h: 1 }, deps(), false)
   expect(posted(8921).deadline).toBe(own); expect(gets(8921)).toBe(0)                                     // its own
@@ -367,7 +367,7 @@ test('WO-128 final, LANES_DEFER_DECISIONS=0 = 1.40.0: #11046\'s line 3; a mail c
     await call(w, 'mailbox_open', { id: 8931 })
     expect(await call(w, 'mailbox_card', { id: 8931, card: { decide: '驗收 WO-141', recommend: '驗收' }, urgent_because: '寄件人在等' })).toContain('Hand it to the main with handoff_main')
     expect(mailCalls.at(-1).args).toEqual({ id: 8931, card: { decide: '驗收 WO-141', recommend: '驗收' }, thread: L.__lanesState().lanes[w.lane].thread })
-    expect(btccSeen.filter(x => x.method === 'GET' && x.path === '/api/mesh/mail/8931?by=lane').length).toBe(0)
+    expect(btccSeen.filter(x => x.method === 'GET' && x.path.startsWith('/api/mesh/mail/8931?by=lane')).length).toBe(0)
     expect(Date.parse(mails.get(8931)!.card.deadline) - Date.now()).toBeGreaterThan(23 * H)
     expect(String(L.laneStop(w.tok))).toContain('put decision cards on #8931 but has not handed them to the main')
     expect(itemsOf(w.id)).toEqual([])

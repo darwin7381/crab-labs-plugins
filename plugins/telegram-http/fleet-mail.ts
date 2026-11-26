@@ -233,6 +233,10 @@ function hoursOrIso(v: unknown): string | number | undefined {
   return /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : s
 }
 
+/** WO-173: a lane's read of a mail names the lane, so Onsen records which session read it first (v1 read_by_session). Onsen 0.17.1+ reads `lane`;
+ *  an older Onsen or BTCC ignores it, and the read itself never depends on it. */
+export const laneOpenQuery = (lane?: string): string => lane ? `?by=lane&lane=${encodeURIComponent(lane)}` : '?by=lane'
+
 /** WO-128 (telegram-http 1.41.0, Chiron on the ticket 2026-11-24 13:00Z): the card always carries a deadline, since the due wake is 15 minutes before it:
  *  the card's own; else the mail's (BTCC falls back to it); a mail without one (a program's mail, e.g. a board notice: 「期限 —」): `hours` from now. BTCC
  *  would give that card `mail_deadline_h` (24) and the main would not be woken for a day. Only when the lanes ask for it (`default_deadline_h`, sent with
@@ -240,7 +244,7 @@ function hoursOrIso(v: unknown): string | number | undefined {
 async function cardDeadline(id: number, card: any, hours: unknown, deps: FleetDeps): Promise<any> {
   const h = Number(hours)
   if (!(h > 0) || (card.deadline != null && String(card.deadline).trim() !== '')) return card
-  const m = await deps.btcc('GET', `/api/mesh/mail/${id}?by=lane`).catch(() => null)
+  const m = await deps.btcc('GET', `/api/mesh/mail/${id}${laneOpenQuery(deps.lane)}`).catch(() => null)
   if (m?.status === 200 && m.json?.deadline) return card
   return { ...card, deadline: new Date(Date.now() + h * 3600_000).toISOString() }
 }
@@ -369,7 +373,7 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const id = intId(args.id)
       if (!id) return text('mailbox_open: id 要填信的編號', true)
       // WO-124: the mail lane's open is 車道讀過 (by=lane); the main's own open makes it read, even after the lane read it
-      const r = await deps.btcc('GET', `/api/mesh/mail/${id}${deps.openBy === 'lane' ? '?by=lane' : ''}`)
+      const r = await deps.btcc('GET', `/api/mesh/mail/${id}${deps.openBy === 'lane' ? laneOpenQuery(deps.lane) : ''}`)
       if (r.status !== 200) return text(errText(r), true)
       const m = r.json
       const who = deps.openBy === 'lane' ? '｜車道讀過（寄件人看到的是車道讀過，不是主線已讀）'

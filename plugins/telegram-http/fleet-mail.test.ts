@@ -136,6 +136,10 @@ describe('fleet MCP server', () => {
     lane.openBy = 'lane'
     const lo = out(await handleFleetRpc(tool('mailbox_open', { id: 21 }), lane))
     expect(seen.at(-1)).toBe('/api/mesh/mail/21?by=lane')
+    // WO-173: a lane that knows its id names it, so Onsen records which session read the mail first
+    lane.lane = 'chiron.mail.3'
+    await handleFleetRpc(tool('mailbox_open', { id: 21 }), lane)
+    expect(seen.at(-1)).toBe('/api/mesh/mail/21?by=lane&lane=chiron.mail.3')
     expect(lo).toContain('車道讀過（寄件人看到的是車道讀過，不是主線已讀）')
     const main = deps({ btcc }).d
     const mo = out(await handleFleetRpc(tool('mailbox_open', { id: 21 }), main))

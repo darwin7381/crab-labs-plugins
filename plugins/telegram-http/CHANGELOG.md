@@ -1,3 +1,8 @@
+## 1.58.1 — 2026-11-26
+
+- **A lane's read of a mail names the lane** (board WO-173 criterion 2, Chiron; agent-inbox 1.28.1). Every lane read of a mail (`mailbox_open` from the mail lane, the card's deadline read, the read before a lane's reply, the no_reply read after a card) now sends `?by=lane&lane=<lane id>` instead of `?by=lane`, so Onsen records which session read it first (v1 `read_by_session`; until now 133 of 188 lane-first reads named no lane). Needs Onsen 0.17.1 (deployed 2026-11-26 01:51Z) to be recorded; an older Onsen or BTCC ignores the parameter, and Onsen never fails the read over it (a lane id that is not the caller's own is logged and not stored). No text an agent reads changes. `laneOpenQuery()` in `fleet-mail.ts`.
+- Roll back: the daemon back to 1.58.0 (the read is unchanged, only the lane is not recorded).
+
 ## 1.58.0 — 2026-11-26
 
 - **The judging step of the screen reader has a fixed interface; Jev is one replaceable implementation of it** (board WO-169, Chiron; Joey TG chiron:2547 「Jev頂替只是程式邏輯判斷的部分…後面還是要根據他的輸出選項結果再經過一個程式輸出，然後輸出的東西才擺在各種應該擺的位置…之後…只是把Jev那段換回程式／但輸出和接口都不…被影響」, 2520 「不是把它當成 Agent 而是把它當成就是一個小程式的一小段」; agent-inbox carries the same code). Only for the agents in `JEV_SCREEN`; every other agent is unchanged. No text an agent reads and no signal Joey sees changes (the 此刻 line's words are Chiron's; its `waitingFor` value is now the record's, e.g. `model_picker`).

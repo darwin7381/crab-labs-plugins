@@ -116,7 +116,7 @@ test('tool shapes: the main\'s list is unchanged (mailbox_decide is added by ser
   expect(src).toContain("const out: any = await callInboxTool('mailbox_decide', b, laneMainDeps(b), false)")
   expect(src).toContain("mailbox_decide_listed: decideListed")
   // Sonn #11115: the mail lane's read before a reply is 車道讀過 (by=lane); the card answer's no_reply (BTCC 6bd7fc2) saves the extra read
-  expect(src).toContain("const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}?by=lane`).catch(() => null)")
+  expect(src).toContain("const m = await btccMail('GET', `/api/mesh/mail/${Number(args.id)}${laneOpenQuery(lane)}`).catch(() => null)")
   expect(src).toContain("let noReply: boolean | undefined = typeof j?.no_reply === 'boolean' ? j.no_reply : undefined")
   expect(src).toContain("mailEvent: (decided: any) => mailEvents.emit(decisionEvent(decided))")
   expect(src).toContain("btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`)")

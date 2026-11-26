@@ -391,6 +391,6 @@ test('WO-131 C: a decision on a card whose mail was sent no_reply says 「這封
   await end(b)
   // the agent-inbox side: after BTCC's card answer, the mail record (GET by=lane: the card already made it lane_read) gives no_reply
   const srv = readFileSync(join(import.meta.dir, 'server.ts')).toString('latin1')
-  expect(srv).toContain("btccMail('GET', `/api/mesh/mail/${j.id}?by=lane`)")
+  expect(srv).toContain("btccMail('GET', `/api/mesh/mail/${j.id}${laneOpenQuery(lane)}`)")
   expect(srv).toContain('...(noReply !== undefined ? { no_reply: noReply } : {})')
 }, 30000)
