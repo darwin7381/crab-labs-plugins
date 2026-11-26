@@ -200,7 +200,7 @@ describe('feed wall tools (WO-92)', () => {
       given: [{ ...post, body: 'ton 開頭的網域 DNS 已搬到 Cloudflare', links: ['https://x'], read: false }, { ...post, id: 6, body: '第二則', links: [], read: false }] } } } })
     const res = await handleFleetRpc(tool('feed_ask', { about: '要改 ton 網域' }), d)
     const t = out(res)
-    expect(seen[0]).toEqual(['POST', '/api/feed/ask', { about: '要改 ton 網域' }, 20000])
+    expect(seen[0]).toEqual(['POST', '/api/feed/ask', { about: '要改 ton 網域', two_step: true }, 20000])
     expect(t).toContain('跟這件事有關的 2 則')
     expect(t).toContain('#7｜11-15 07:52Z｜hephaestus｜Hephaestus：ton 網域改走 Cloudflare\n　動到：ton-dns、cloudflare　連動：WO-25\n\nton 開頭的網域 DNS 已搬到 Cloudflare\nhttps://x')
     expect(t).toContain('另有 1 則有關的，再問一次接著給。')
@@ -253,6 +253,53 @@ describe('feed wall tools (WO-92)', () => {
     r = await handleFleetRpc(tool('feed_ask', { about: 'x' }), d)
     expect(r.result.isError).toBe(true)
     expect(out(r)).toContain('feed_search')
+  })
+  // WO-167 section four (c), Chiron 00:27Z: more related than give_max → Onsen gives each post's line only; nothing given in full, nothing marked
+  const LINES = { about: '要改 ton 網域', candidates: 40, judged: 39, related: 25, given: [], more: 0, unjudged: 1, jev: 'ok', mode: 'lines', give_max: 20,
+    offset: 0, ask_id: 9, next_cursor: 'ask.9.2', lines: [
+      { id: 300690, line: '#300690｜2026-11-26 08:10（Asia/Taipei）｜hephaestus｜動態｜Hephaestus：ton DNS｜WO-25｜動到：ton-dns' },
+      { id: 300645, line: '#646｜2026-11-24 16:05（Asia/Taipei）｜epeius｜動態｜Mac mini: TUIs dropped｜WO-126｜動到：tmux' }] }
+  test('feed_ask: over give_max, the lines only; open them with feed_open; nothing marked', async () => {
+    const seen: any[] = []
+    const { d } = deps({ core: async (m, p, b, t) => { seen.push([m, p, b, t]); return { status: 200, json: LINES } } })
+    const res = await handleFleetRpc(tool('feed_ask', { about: '要改 ton 網域' }), d)
+    const t = out(res)
+    expect(seen[0]).toEqual(['POST', '/api/feed/ask', { about: '要改 ton 網域', two_step: true }, 20000])
+    expect(t).toBe([
+      '跟這件事有關的有 25 則，比一次給全文的 20 則多，先給短卡（新的在前；列出短卡不算讀）：',
+      LINES.lines[0].line, LINES.lines[1].line, '',
+      '要讀哪幾則，用 feed_open 打開（打開才算讀過）。',
+      '還有 23 則短卡：再用 feed_ask，about 照填，加 cursor「ask.9.2」看下一頁。',
+      '另外 1 則 Jev 沒判到，可以用 feed_search 找。'].join('\n'))
+    expect(res.result.isError).toBeUndefined()
+    expect(takeAfterSend([res]).length).toBe(0)
+    expect(seen.length).toBe(1)
+  })
+  test('feed_ask with a cursor: the next page; the last page says no more; a cursor Onsen refuses is an error', async () => {
+    const seen: any[] = []
+    let reply: any = { status: 200, json: { ...LINES, offset: 2, next_cursor: null, unjudged: 1, lines: [LINES.lines[0]] } }
+    const { d } = deps({ core: async (m, p, b) => { seen.push(b); return reply } })
+    const t = out(await handleFleetRpc(tool('feed_ask', { about: '要改 ton 網域', cursor: 'ask.9.2' }), d))
+    expect(seen[0]).toEqual({ about: '要改 ton 網域', two_step: true, cursor: 'ask.9.2' })
+    expect(t).toBe(['接著的短卡（第 3–3 則，共 25 則）：', LINES.lines[0].line, '', '要讀哪幾則，用 feed_open 打開（打開才算讀過）。'].join('\n'))
+    reply = { status: 400, json: { detail: 'cursor 對不上：不是你問過、還有下一頁的那一次' } }
+    const r = await handleFleetRpc(tool('feed_ask', { about: 'x', cursor: 'ask.1.0' }), d)
+    expect(r.result.isError).toBe(true)
+    expect(out(r)).toBe('cursor 對不上：不是你問過、還有下一頁的那一次')
+  })
+  test('feed_ask: at or under give_max the full texts as before (mode full); an Onsen without two steps (no mode) as before', async () => {
+    const full = { candidates: 2, judged: 2, related: 1, more: 0, unjudged: 0, jev: 'ok', given: [{ ...post, body: '全文', links: [], read: false }] }
+    for (const json of [{ ...full, mode: 'full', give_max: 20 }, full]) {
+      const { d } = deps({ core: async () => ({ status: 200, json }) })
+      const res = await handleFleetRpc(tool('feed_ask', { about: 'x' }), d)
+      expect(out(res).startsWith('跟這件事有關的 1 則（全文，新的在前；給了就算讀過）：')).toBe(true)
+      expect(takeAfterSend([res]).length).toBe(1)
+    }
+  })
+  test('feed_ask takes an optional cursor; about stays required', () => {
+    const ask = FLEET_TOOLS.find(t => t.name === 'feed_ask')!
+    expect(ask.inputSchema.required).toEqual(['about'])
+    expect(Object.keys(ask.inputSchema.properties)).toEqual(['about', 'cursor'])
   })
   test('feed_search lists cards (not bodies, marks read and superseded); feed_open gives the full text', async () => {
     const seen: any[] = []

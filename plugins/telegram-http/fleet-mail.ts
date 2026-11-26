@@ -126,7 +126,10 @@ export const FLEET_TOOLS = [
     inputSchema: {
       type: 'object',
       required: ['about'],
-      properties: { about: { type: 'string', description: '一句話：你要處理什麼，或想知道什麼。例：「要改 Cloudflare 上 ton 開頭那幾個網域的設定」' } },
+      properties: {
+        about: { type: 'string', description: '一句話：你要處理什麼，或想知道什麼。例：「要改 Cloudflare 上 ton 開頭那幾個網域的設定」' },
+        cursor: { type: 'string', description: '選填：上一次 feed_ask 給的 cursor，看下一頁短卡（about 照填）' },   // WO-167 section four (c)
+      },
     },
   },
   {
@@ -273,6 +276,21 @@ function full(p: any): string {
 }
 
 const ASK_TIMEOUT_MS = 20000
+
+/** WO-167 section four (c), Chiron 00:27Z (Joey TG 1263: first the notices, then the full text): more related posts than the wall gives in
+ *  full (give_max) → Onsen answers with each one's line only (newest first, a page at a time), nothing given in full and nothing marked;
+ *  the agent opens what it needs with feed_open. A server before this answers without `mode`, and the old rendering below is used. */
+function askLines(j: any): string {
+  const lines = (j.lines ?? []) as any[]
+  const from = Number(j.offset ?? 0)
+  const head = from === 0
+    ? `跟這件事有關的有 ${j.related} 則，比一次給全文的 ${j.give_max} 則多，先給短卡（新的在前；列出短卡不算讀）：`
+    : `接著的短卡（第 ${from + 1}–${from + lines.length} 則，共 ${j.related} 則）：`
+  const tail = ['要讀哪幾則，用 feed_open 打開（打開才算讀過）。']
+  if (j.next_cursor) tail.push(`還有 ${Math.max(0, j.related - from - lines.length)} 則短卡：再用 feed_ask，about 照填，加 cursor「${j.next_cursor}」看下一頁。`)
+  if (from === 0 && j.unjudged) tail.push(`另外 ${j.unjudged} 則 Jev 沒判到，可以用 feed_search 找。`)
+  return [head, ...lines.map((x: any) => String(x.line)), '', ...tail].join('\n')
+}
 // A post counts as read only when its text reached the agent. The tool result carries an `_afterSend`
 // hook instead of marking anything; the /fleet route runs it only after the HTTP response has been
 // handed to the agent's socket ('finish'). A request the agent dropped (timeout, interrupt, disconnect)
@@ -450,10 +468,14 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
     case 'feed_ask': {
       const about = String(args.about ?? '').trim()
       if (!about) return text('feed_ask: about 要填一句話：你要處理什麼', true)
-      const r = await deps.core('POST', '/api/feed/ask', { about }, ASK_TIMEOUT_MS)
+      const cursor = args.cursor != null && String(args.cursor).trim() ? String(args.cursor).trim() : undefined
+      // two_step: tells Onsen this daemon renders lines (a daemon that does not send it gets the full texts as before; an Onsen before it ignores it)
+      const r = await deps.core('POST', '/api/feed/ask', { about, two_step: true, ...(cursor ? { cursor } : {}) }, ASK_TIMEOUT_MS)
       if (r.status === 403) return text(`${coreErr(r)}`, true)
+      if (cursor && r.status === 400) return text(`${coreErr(r)}`, true)
       if (r.status !== 200) return text(`Jev 沒回，改用搜尋：牆現在問不了（${coreErr(r)}）。用 feed_search 給一到幾個詞，看短卡，再用 feed_open 打開要讀的。`)
       const j = r.json
+      if (j.mode === 'lines') return text(askLines(j))      // nothing to mark: no full text was given
       if (!j.candidates) return text('牆上沒有你還沒讀過的貼文。')
       if (!['ok', 'partial'].includes(j.jev)) {
         return text('Jev 沒回，改用搜尋：用 feed_search 給一到幾個詞（搜全文加短卡），先看短卡，再用 feed_open 打開要讀的。')
