@@ -6,6 +6,13 @@ Writes ../fleet-text.ts next to server.ts. h3 → a line, p → a paragraph, li 
 """
 import html, json, os, re, subprocess, sys
 
+# Retired (2026-11-26, Epeius): since WO-99 FLEET_TEXT is verbatim from Chiron's knowledge/a2a-rewrite-20261116/fleet-text.md, and
+# fleet-text.ts also holds ONSEN_TEXT_FORMAT / ONSEN_TEXT_DEFAULT / withOnsenFormat that this script would drop (fleet-mail.ts and
+# inbox-text.ts import them). Running it read inbox-tiers.html and wiped them. Edit fleet-text.ts by hand from Chiron's words.
+if "--force-old-generator" not in sys.argv:
+    sys.exit("gen-fleet-text.py is retired: FLEET_TEXT comes from Chiron's fleet-text.md (WO-99) and fleet-text.ts holds other exports; edit it by hand")
+sys.argv.remove("--force-old-generator")
+
 src = sys.argv[1]
 s = open(src, encoding="utf-8").read()
 i = s.index('id="text"')
