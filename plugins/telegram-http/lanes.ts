@@ -24,7 +24,8 @@
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
-import type { TurnTrigger } from './onsen-status.ts'
+import type { CallFacts, TurnTrigger } from './onsen-status.ts'
+import type { CallRef } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
@@ -461,6 +462,8 @@ export let __ackHook: ((runId: string) => void) | null = null
 export const __setAckHook = (f: ((runId: string) => void) | null): void => { __ackHook = f }          // tests only
 function mainTookItems(items: Row[]): void {
   cardsTold(items.filter(r => r.kind !== 'digest'))                               // WO-137 甲 (item 2): a digest taken in with these items (pulled, or bound to a turn)
+  // WO-175: with the Call moments on, a run bound into the main's turn is its Call's `running` (the tap): BTCC reads that as the start receipt
+  if (onsenTap?.calls) return
   for (const it of items) {
     const e = it.event ? events?.get(String(it.event)) : undefined
     for (const o of ((e?.obligations ?? []) as Ob[])) if (o.kind === 'receipt' && o.run_id && !ackedRuns.has(String(o.run_id))) {
@@ -833,7 +836,9 @@ export const __mainEvent = (b: any) => mainEventIn(b)
 // Onsen step 3 (WO-143): read-only taps for the Telegram daemon's delivery facts and the main's status (server.ts, onsen-status.ts). They observe; they
 // change nothing in M1, M2 or the runs. `journal`: every journal write (the folded row and the line); `mainEvent`: every hook event of /lanes/main-event,
 // before M2 handles it.
-type OnsenTap = { journal?: (row: Row, line: Record<string, unknown>) => void; mainEvent?: (b: any) => void }
+type OnsenTap = { journal?: (row: Row, line: Record<string, unknown>) => void; mainEvent?: (b: any) => void
+  /** WO-175: the Call moments the router and a lane run's end decide (routed, ended); the turn moments come from the journal tap */
+  calls?: CallFacts | null }
 let onsenTap: OnsenTap | null = null
 export function observeLanes(t: OnsenTap): void {
   onsenTap = t
@@ -1454,6 +1459,8 @@ export type InEvent = {
   refs?: ThreadRefs
   /** WO-164: the thread the router resolved this item to (resolveThread; agents in LANES_WAKE_DECIDE) */
   tkey?: ThreadKeyRes
+  /** WO-175: the Onsen Call this item is (the call id its pulled item carries, Onsen 0.24.1; none before its Call exists, or for other kinds) */
+  call_id?: string
 }
 /** WO-127: a decision the router hands a lane run: the mail, the main's decision, where it came from (the event of the run that asked, and how: a lane item
  *  opened by decide_later or a card on a colleague's mail) */
@@ -3528,7 +3535,7 @@ const endWords = (reason: string, it: QItem): string => reason === 'normal' ? '�
  *    not an attempt (the event is queued again as it was);
  *  - the lanes' wall: up on a wall; down on any other exit of a run that reached the model (it wrote a result record or made a model call);
  *  - otherwise, and after MAX_ATTEMPTS, the run's work has ended: a task lane's own duty (endTask), then the exit rule over the set. */
-function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string }): void {
+function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
   const wall = e.reason.startsWith('wall:') ? e.reason.slice(5) : null
   const retryable = !!wall || e.reason === 'died' || e.reason === 'timeout' || e.reason === 'restore'
   if (wall) it.attempts = Math.max(0, it.attempts - 1)                      // nothing was tried: not an attempt
@@ -3546,6 +3553,26 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?:
     endTask(it, lane, endWords(e.reason, it), e.reached ?? '')
     exitRule(lane, it, gaveUp ? failedHandoffText(it) : e.said ?? '', gaveUp ? HANDOVER_RECORD_MAX : 1000)
   })
+  callsEnded(lane?.id ?? it.lane, it, e.receipt)
+}
+/** WO-175 (Chiron 02:58Z): the run's work is over (runEnded, past the re-run): the Call of each item it ran ends here — unless the item is the main's now
+ *  (the exit rule or a handoff_main handed it over: a change of hands, not an end; Onsen records it from the lane's exit row, and the main's turn
+ *  ends it). Completed, with the lane's own summary of it (its receipt's line on the event's record) as the result, and a scheduled run's receipt
+ *  outcome as result.outcome (ok / nothing_to_do); a receipt that says it failed: failed */
+function callsEnded(laneId: string, it: QItem, receipt?: { outcome: string }): void {
+  const calls = onsenTap?.calls
+  if (!calls || !events) return
+  for (const ev of runEvents(it)) {
+    const call = callOfEvent(ev.id), rec = events.get(ev.id)
+    if (!call || !rec) continue
+    if (((rec.obligations ?? []) as Ob[]).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested'))) continue
+    const out = String(receipt?.outcome ?? '')
+    try {
+      if (out === 'failed') calls.ended(ev.id, call, laneId, 'failed')
+      else calls.ended(ev.id, call, laneId, 'completed', undefined, { text: typeof rec.did === 'string' ? rec.did : null,
+        ...(call.kind === 'scheduled' && out ? { outcome: out === 'nothing-to-do' ? 'nothing_to_do' : 'ok' } : {}) })
+    } catch {}
+  }
 }
 /** a lane process left by the previous daemon: stop it if it is really that run (the pid may belong to something else by now) */
 function reapOrphan(pid: number, run: string): void {
@@ -4975,7 +5002,7 @@ function startRun(it: QItem): void {
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
         text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
     }
-    runEnded(lane, it, { reason, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId })
+    runEnded(lane, it, { reason, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
     saveState()
     pump()
   }
@@ -5104,8 +5131,23 @@ let events: EventsApi
 const evClassOf = (ev: InEvent, lane?: Lane): EvClass =>
   ev.klass ?? (ev.source === 'telegram' && !ev.synthetic ? 'joey' : lane?.critical || /-critical$/.test(ev.trigger ?? '') ? 'critical' : ev.source === 'telegram' || ['joey', 'worker', 'fork'].includes(ev.trigger ?? lane?.kind ?? '') ? 'joey'
     : ev.trigger === 'scheduled' ? 'scheduled' : /^alert/.test(ev.trigger ?? '') ? 'alert' : 'peer')
+/** WO-175 (Onsen contract v1 §4; Onsen 0.24.1): the Call an inbound item is: a peer's call that is not a reply, a scheduled run, a paged alert, an
+ *  urgent board item (Onsen's item kinds), named by the call id the pulled item carries (null before its Call exists, and for any other kind: no
+ *  Call to report). Not a Call: a reply, the daemons' own silent notices, the watchdog's wake lines, an item from anywhere but the mesh */
+export function callRefOf(ev: InEvent): CallRef | null {
+  const k = ev.item_kind
+  if (ev.source !== 'mesh' || ev.synthetic || ev.wake || ev.reply_to_id || ev.urgency === 'silent') return null
+  if (k !== 'peer_call' && k !== 'scheduled' && k !== 'alert' && k !== 'board') return null
+  return ev.call_id && /^\d{1,18}$/.test(ev.call_id) ? { kind: k, id: ev.call_id } : null
+}
+/** WO-175: the Call of an event, from its record (the router wrote it there: what travels with the item into a lane and to the main) */
+export function callOfEvent(id: string): CallRef | null {
+  const c = events?.get(id)?.call as CallRef | undefined
+  return c && typeof c === 'object' && c.id ? c : null
+}
 /** what the router marked on an event, as fields of its record (PL1) */
 const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
+  ...((c => c ? { call: c } : {})(callRefOf(ev))),                                           // WO-175: the Call it is, on its record
   ...(ev.screen_p != null ? { screen_p: ev.screen_p } : {}),
   ...(ev.incident_of ? { incident_of: ev.incident_of, incident: ev.incident_key ?? null } : {}),        // WO-132 (item 2): merged into its incident's lane
   ...(ev.source === 'telegram' && !ev.synthetic ? { tg: { message_id: ev.meta?.message_id ?? null, chat_id: ev.meta?.chat_id ?? null, topic: ev.message_thread_id ?? null } } : {}) })   // 002t: Joey's own message
@@ -5127,6 +5169,9 @@ function recordRoute(ev: InEvent, d: Decision): void {
   if (!events || D.role !== 'tg') return
   const lane = d.lane && S.lanes[d.lane] ? d.lane : null
   recordInbound(ev, { owner: d.target === 'main' ? 'main' : d.target === 'lane' && lane ? lane : 'router', lane, thread: d.thread ?? (lane ? S.lanes[lane].thread : ev.thread ?? null) })
+  // WO-175: the Call is handed to a session (main, or the lane's full id), or recorded only (no session: accepted and completed at once)
+  const call = callOfEvent(ev.id)
+  if (call) { try { onsenTap?.calls?.routed(ev.id, call, d.target === 'main' ? 'main' : d.target === 'lane' && lane ? lane : null) } catch {} }
 }
 /** the obligations an event opens with, from its class and the router's own fields (never from the prompt text), whoever gets it (a lane, or the main:
  *  toMain hands them over): Joey a line (a critical event's line rings, due CRITICAL_DEADLINE_MS), the asking peer an answer, the scheduler run its receipt.
@@ -7037,6 +7082,20 @@ export async function completeRun(tok: RunTok, runId: string, outcome: string, n
   if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
     logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
+  }
+  // WO-175 二 (Chiron 02:58Z: the receipt is the run's Call): a run that is a Call this daemon reports completes as that Call — completed with result
+  // {outcome ok | nothing_to_do, body: the note}, or failed — through the spool; BTCC's scheduler reads it (call_sweep). The scheduler's own /complete is
+  // only for a run whose item carried no Call (lab-relay 05:07Z: the lane's /complete could not reach BTCC, the lane handed the run to the main)
+  const calls = onsenTap?.calls, call = calls ? callOfEvent(tok.evId) : null
+  if (calls && call?.kind === 'scheduled') {
+    const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
+      const o = btccOutcome(outcome)
+      calls.ended(tok.evId, call, tok.lane, o === 'failed' ? 'failed' : 'completed', nowIso(),
+        o === 'failed' ? undefined : { outcome: o === 'nothing-to-do' ? 'nothing_to_do' : 'ok', text: typeof note === 'string' && note ? note : null })
+      return { ok: true, text: JSON.stringify({ ok: true, state: 'completed', outcome: o, call_id: call.id, via: 'onsen' }) }
+    })
+    logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok, call: call.id })
+    return { ok: c.ok, text: c.text }
   }
   const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
     // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422

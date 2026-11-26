@@ -16,7 +16,7 @@ import { spawn, spawnSync } from 'child_process'
 import { closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, watch, writeFileSync, writeSync,
   type FSWatcher } from 'fs'
 import { basename, join } from 'path'
-import { idemDelivery, idemStatus, type DeliveryFact, type DeliveryState, type StatusFact, type StatusState } from './onsen-client.ts'
+import { idemDelivery, idemStatus, type CallRef, type CallStateLine, type CallStateName, type DeliveryFact, type DeliveryState, type StatusFact, type StatusState } from './onsen-client.ts'
 import type { Row } from './lanes-state.ts'
 
 type Now = () => number
@@ -148,6 +148,89 @@ export class DeliveryFacts {
     for (const [k, e] of this.open) { if (e.at < old) { this.open.delete(k); continue } if (!(mode === 'seen' ? e.turn : e.session)) n++ }
     return n
   }
+}
+
+// ------------------------------------------------------------------ WO-175: the Calls this agent received
+/** WO-175 (Chiron's ticket 一 and his 02:58Z ruling; Onsen contract v1 §4): the moments of each Call this agent received (a peer's call that is not a
+ *  reply, a scheduled run, a paged alert, an urgent board item), as its daemon knows them, sent as PUT /v1/calls/<id>/state through the spool. One
+ *  owner of the rules; the facts come from where they are decided:
+ *    routed      the router gave it to a session (lanes.ts recordRoute): accepted, session main or the lane's full id; recorded only (no session):
+ *                accepted with no session and completed at once, result 「只記錄，沒有交給任何一條 session」
+ *    running     in a turn: the main's M1 item bound to a turn (LanesTap), a lane's run running (LanesTap)
+ *    putBack     the main's turn was cut and the item went back to the queue: accepted (the one step back Onsen takes), only after running
+ *    completed   the main's turn that took it ended (once the status record shows it over, as a Joey message's turn_end: completeLater / statusRecord;
+ *                a turn that goes on takes it back: cancelLater); a lane's run ended for good owing nothing (lanes.ts runEnded), its summary as the
+ *                result (a scheduled run's receipt outcome as result.outcome; a failed receipt: failed)
+ *    handedOver  a lane handed it to the main (the event's main obligation opened: LanesTap): nothing is sent (Onsen records the change of hands from
+ *                the lane's exit row: recipient main, accepted), and the main's turn then reports running
+ *  A lane run that hands the item to the main sends no end: a change of hands, not an end. Only forward:
+ *  a moment at or behind the last one sent is not sent again (a completed Call takes a result once more, when the first had none). */
+export const CALL_LEDGER_RESULT = '只記錄，沒有交給任何一條 session'
+export type CallResult = { outcome?: string; text?: string | null }
+const CALL_RANK: Record<CallStateName, number> = { accepted: 1, running: 2, completed: 3, failed: 3 }
+export class CallFacts {
+  private sent = new Map<string, { state: CallStateName; result: boolean; session: string | null }>()
+  private later = new Map<string, { call: CallRef; session: string; at: string; stopMs: number; result?: CallResult }>()
+  readonly stats = { moments: 0, skipped: 0, ledger: 0 }
+  constructor(readonly o: { sink: (line: CallStateLine) => void; now?: Now; max?: number }) {}
+  private now(): number { return (this.o.now ?? Date.now)() }
+  /** putBack: the one step back (running → accepted); any other moment at or behind the last one is not sent */
+  private emit(event: string, call: CallRef, state: CallStateName, session: string | null, at: string, result?: CallResult, putBack = false): boolean {
+    const was = this.sent.get(event)
+    const body = result && (result.outcome || result.text) && state === 'completed'          // failed takes no result (Onsen)
+      ? { ...(result.outcome ? { outcome: result.outcome } : {}), ...(result.text ? { body: { format: 'markdown' as const, text: result.text.slice(0, 4000) } } : {}) } : undefined
+    const back = putBack && was?.state === 'running' && state === 'accepted'
+    const fill = was?.state === 'completed' && state === 'completed' && !was.result && !!body
+    if (was && !back && !fill && CALL_RANK[state] <= CALL_RANK[was.state]) { this.stats.skipped++; return false }
+    if (was && (was.state === 'completed' || was.state === 'failed') && !fill) { this.stats.skipped++; return false }
+    this.sent.set(event, { state, result: !!body || !!was?.result, session })
+    if (this.sent.size > (this.o.max ?? 20_000)) for (const k of [...this.sent.keys()].slice(0, 5_000)) this.sent.delete(k)
+    this.stats.moments++
+    try {
+      this.o.sink({ call_id: call.id, kind: call.kind, event, idem: `call:${event}:${state}:${back ? 'back:' : ''}${at}`,
+        body: { state, session_id: session, ...(body ? { result: body } : {}), at } })
+    } catch {}
+    return true
+  }
+  routed(event: string, call: CallRef, session: string | null, at = iso(this.now())): void {
+    this.emit(event, call, 'accepted', session, at)
+    if (session == null) { this.stats.ledger++; this.emit(event, call, 'completed', null, at, { text: CALL_LEDGER_RESULT }) }
+  }
+  running(event: string, call: CallRef, session: string, at = iso(this.now())): void {
+    this.later.delete(event)
+    // a session that is in its turn with it was handed it first: a lane's run starts inside the routing step, before the router's record of it
+    if (!this.sent.has(event)) this.emit(event, call, 'accepted', session, at)
+    this.emit(event, call, 'running', session, at)
+  }
+  /** the item was handed to the main while a lane had it running (handoff_main, the exit rule: a change of hands, not an end): Onsen takes the
+   *  change from the lane's exit row (recipient main, back to accepted: the main has not started), so nothing is sent; what was sent is now that,
+   *  and the main's turn reports running again */
+  handedOver(event: string): void {
+    const w = this.sent.get(event)
+    if (w && w.state === 'running' && w.session !== 'main') this.sent.set(event, { state: 'accepted', result: false, session: 'main' })
+  }
+  putBack(event: string, call: CallRef, session: string, at = iso(this.now())): void {
+    this.later.delete(event)
+    if (this.sent.get(event)?.state === 'running') this.emit(event, call, 'accepted', session, at, undefined, true)
+  }
+  ended(event: string, call: CallRef, session: string, how: 'completed' | 'failed', at = iso(this.now()), result?: CallResult): void {
+    this.later.delete(event)
+    this.emit(event, call, how, session, at, result)
+  }
+  /** the main's turn that took it ended at its Stop: final once the status record shows no turn running (statusRecord), or when a new turn begins */
+  completeLater(event: string, call: CallRef, session: string, at: string): void {
+    this.later.set(event, { call, session, at, stopMs: this.now() })
+    if (this.later.size > 2_000) this.later.delete(this.later.keys().next().value!)
+  }
+  /** the turn went on after that Stop (another Stop hook held it): not over yet */
+  cancelLater(event: string): void { this.later.delete(event) }
+  statusRecord(member: string, atMs = this.now()): void {
+    if (TURN_RUNNING.has(member)) return
+    for (const [ev, l] of [...this.later]) if (l.stopMs <= atMs) this.ended(ev, l.call, l.session, 'completed', l.at, l.result)
+  }
+  flushLater(): void { for (const [ev, l] of [...this.later]) this.ended(ev, l.call, l.session, 'completed', l.at, l.result) }
+  pendingLater(): number { return this.later.size }
+  health(): Record<string, unknown> { return { ...this.stats, settling: this.later.size, followed: this.sent.size } }
 }
 
 // ------------------------------------------------------------------ status
@@ -394,10 +477,15 @@ export class LanesTap {
   private failed = false
   /** WO-172: each prompt's bound items (M1 row ids) and their message ids (bound), the outcome its first ending line gave, how many facts it gave */
   private boundOf = new Map<string, { rows: Set<string>; ids: string[]; ending: TurnOutcome | null; facts: number }>()
+  /** WO-175: the M1 items whose Call this tap reported running (an item put back after it: its Call goes back to accepted) */
+  private callBound = new Set<string>()
   /** trigger (WO-169): an M1 item as the trigger of the turn it opened, and its thread (lanes.ts knows the threads); turnEnded (WO-172): each turn of the
-   *  main or of a lane that ended, once */
+   *  main or of a lane that ended, once; calls / callOf (WO-175): the Calls' turn moments (an M1 item bound, done, put back; a lane run running) and the
+   *  Call an event is (lanes.ts callOfEvent) */
   constructor(readonly o: { facts: DeliveryFacts; joey: JoeyOf; gen: () => Row | null; changed: () => void; now?: Now
-    trigger?: (row: Row) => { trigger: TurnTrigger; thread: string | null } | null; turnEnded?: (t: TurnEnded) => void }) {}
+    trigger?: (row: Row) => { trigger: TurnTrigger; thread: string | null } | null; turnEnded?: (t: TurnEnded) => void
+    calls?: CallFacts | null; callOf?: (event: string) => CallRef | null }) {}
+  private callOf(event: unknown): CallRef | null { try { return event && this.o.calls && this.o.callOf ? this.o.callOf(String(event)) : null } catch { return null } }
   private turnBound(prompt: string) {
     let b = this.boundOf.get(prompt)
     if (!b) { b = { rows: new Set(), ids: [], ending: null, facts: 0 }; this.boundOf.set(prompt, b); if (this.boundOf.size > 50) this.boundOf.delete(this.boundOf.keys().next().value!) }
@@ -415,6 +503,17 @@ export class LanesTap {
   journal(row: Row, line: Record<string, unknown>): void {
     const F = this.o.facts
     if (row.rec === 'msg') {
+      // WO-175: a Call's turn moments on the main: bound into a turn → running; the turn ended (its Stop, final once the record shows it over) →
+      // completed; bound again after that Stop (the turn went on) → not yet; back in the queue after it was in a turn (cut, failed, its gen gone) → accepted
+      const call = row.kind !== 'digest' ? this.callOf(row.event) : null
+      if (call) {
+        const C = this.o.calls!, ev = String(row.event), rid = String(row.id)
+        if (line.state === 'bound' && line.reason === 'turn_continued') C.cancelLater(ev)
+        else if (line.state === 'bound') { this.callBound.add(rid); C.running(ev, call, 'main', row.ts) }
+        else if (line.state === 'done') { this.callBound.delete(rid); C.completeLater(ev, call, 'main', row.ts) }
+        else if (line.state === 'queued' && this.callBound.delete(rid)) C.putBack(ev, call, 'main', row.ts)
+        if (this.callBound.size > 2_000) this.callBound.delete(this.callBound.values().next().value!)
+      }
       const j = this.o.joey((row.notif?.params as any)?.meta)
       if (j && line.state === 'offered') F.inSession(j.chat, j.id, 'main', row.ts)   // WO-165: written into the idle main's stream
       else if (j && line.state === 'bound') {
@@ -459,6 +558,10 @@ export class LanesTap {
           this.opened = { prompt: P, trigger: t?.trigger ?? { kind: 'other' }, thread: t?.thread ?? null, lead }
         }
       }
+    } else if (row.rec === 'event' && this.o.calls) {
+      // WO-175: the event is handed to the main (its main obligation open): a lane's Call changes hands
+      if (((row.obligations ?? []) as Array<{ kind?: string; state?: string }>).some(o => o.kind === 'main' && (o.state === 'open' || o.state === 'requested')) && this.callOf(row.id))
+        this.o.calls.handedOver(String(row.id))
     } else if (row.rec === 'run') {
       const all = [row.ev, ...(Array.isArray(row.extra) ? row.extra : []), ...(Array.isArray(row.steered) ? row.steered : [])].filter((e: any) => e)
       const evs = all.filter((e: any) => e.source === 'telegram').map((e: any) => this.o.joey(e.meta)).filter((x): x is { chat: string; id: string } => !!x)
@@ -466,6 +569,7 @@ export class LanesTap {
       if (line.state === 'running') {
         this.runs.add(row.id)
         for (const e of evs) { F.inSession(e.chat, e.id, lane, row.ts); F.seen(e.chat, e.id, lane, row.ts, false, String(row.run ?? row.id)) }   // spawned with it in its prompt, or steered into it
+        for (const e of all) { const call = this.callOf(e.id); if (call) this.o.calls!.running(String(e.id), call, lane, row.ts) }   // WO-175: the lane run is in its turn
       } else if (line.state === 'exited' && this.runs.has(row.id)) {
         this.runs.delete(row.id)
         // WO-172: the run is the lane's turn: its outcome from the exit reason, bound = its items (Joey's client_msg_id, a colleague's msg id)
@@ -490,6 +594,7 @@ export class LanesTap {
         this.open = true; this.failed = false
         this.subagents = 0
         F.flushLater('main')                                                      // a new prompt: the last turn's Stop was its end
+        this.o.calls?.flushLater()                                                // WO-175: so were its Calls'
       }
       else if (row.state === 'in_turn' && row.prompt_id && row.prompt_id === this.turn?.prompt && !this.open) {
         // the same turn went on (another Stop hook held its Stop: lanes-main continueTurn): it never ended. An open turn is never its own last_turn,

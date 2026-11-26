@@ -76,7 +76,16 @@ export type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | {
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
-const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't'])
+  /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
+  | { k: 'c'; r: CallStateLine }
+const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c'])
+/** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
+export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
+export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
+/** one PUT /v1/calls/<id>/state, as spooled: the Call, the body Onsen takes (state, session_id, result, at), the event and an idem key (local only:
+ *  what moment of which item this is) */
+export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
+  body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
 /** the batch route of each kind that is posted in runs (≤500 a batch) */
 const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch', t: '/threads/events' }
 
@@ -340,7 +349,7 @@ export class OnsenClient {
   private observers: Array<(line: SpoolLine) => void> = []
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
     lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0,
-    thread_events: 0, thread_conflicts: 0 }
+    thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -367,6 +376,8 @@ export class OnsenClient {
     if (ok) this.stats.thread_events += evs.length
     return ok
   }
+  /** WO-175: one moment of a Call (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state when the spool reaches it. false = not spooled */
+  recordCall(c: CallStateLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
   /** WO-145: form answers queued for the main whose ack Onsen did not take directly: POST /forms/ack when the spool reaches it. false = not spooled */
   recordFormAck(ids: number[]): boolean {
     const ok = ids.length > 0 && this.append({ k: 'a', r: { ids, at: new Date().toISOString() } })
@@ -493,6 +504,13 @@ export class OnsenClient {
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
+  /** WO-175: a JSON PUT with this agent's credential (a Call's state) */
+  private async put(path: string, body: unknown, cred: string, timeoutMs?: number): Promise<{ status: number; json: any }> {
+    const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
+    let json: any = null
+    try { json = await r.json() } catch {}
+    return { status: r.status, json }
+  }
   private async post(path: string, body: unknown, cred: string, timeoutMs?: number, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { method: 'POST', headers: this.headers(cred, headers), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
     let json: any = null
@@ -585,6 +603,20 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `HTTP ${r.status} ${String(r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`)
         else return this.failStatus(r, '/forms/ack')
+        this.writeCursor(t.end); this.ok(); i++
+        continue
+      }
+      if (t.line.k === 'c') {
+        // WO-175: one moment of a received Call (the id its pulled item carried)
+        const c = t.line.r, id = c.call_id
+        const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, c.body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        if (r.status >= 200 && r.status < 300) {
+          const st = r.json?.data?.state
+          if (st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++
+        }
+        // a step Onsen already has past (it took a reply, or a lane's exit row, first) or a Call that is over: refused as a whole, not retried
+        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${String(r.json?.error?.message ?? r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`)
+        else return this.failStatus(r, `/v1/calls/${id}/state`)
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
@@ -1048,6 +1080,15 @@ export function assigneesOf(chats: unknown[]): string[] {
   return out.length ? out : ['joey']
 }
 /** ONSEN_ACTIONS: unset or empty = on; 0 / off / false / no = off; else a comma list of agent names or `*` */
+/** WO-175: ONSEN_CALL_STATE, the stop switch of the Call moments this agent's daemon reports (on unless 0 / off / false / no; a comma list: those
+ *  agents, or `*`). On, the two old start receipts (a lane taking a scheduled run, the main binding it into a turn) are gone: the moments replace them */
+export function callStateOn(env: NodeJS.ProcessEnv, agent: string): boolean {
+  const v = (env.ONSEN_CALL_STATE ?? '').trim()
+  if (!v) return true
+  if (['0', 'off', 'false', 'no'].includes(v.toLowerCase())) return false
+  const list = v.split(',').map(x => x.trim()).filter(Boolean)
+  return list.includes('*') || list.includes(agent)
+}
 export function actionsOn(env: NodeJS.ProcessEnv, agent: string): boolean {
   const v = (env.ONSEN_ACTIONS ?? '').trim()
   if (!v) return true

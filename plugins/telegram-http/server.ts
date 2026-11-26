@@ -370,6 +370,9 @@ bot.api.config.use((prev, method, payload, signal) =>
 // Telegram daemon only. ONSEN_BASE / ONSEN_RECORD / ONSEN_AGENTS / ONSEN_CREDENTIAL_FILE come from the plist or the machine config (fleet-config.ts).
 // The credential is the agent's mesh credential, kept by its agent-inbox daemon (<workspace>/.agent-inbox-state/mesh-credential); never logged.
 const ONSEN_AGENT = Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
+/** WO-175: this agent's daemons report the moments of the Calls it receives (lanes on, recording on, ONSEN_CALL_STATE not off): the two old start receipts
+ *  (the agent-inbox daemon's when a lane takes a scheduled run, the main's M1 bind) are off then: the Call's `running` is the start receipt BTCC reads */
+const CALL_STATE = Lanes.LANES_ON && Onsen.recordFor(process.env, ONSEN_AGENT) && Onsen.callStateOn(process.env, ONSEN_AGENT)
 const ONSEN_CRED_FILE = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim() || join(process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR), '.agent-inbox-state', 'mesh-credential')
 const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({ fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
   dir: join(STATE_DIR, 'onsen'), base: Onsen.onsenBase(process.env), agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
@@ -2033,14 +2036,16 @@ async function inboxDecide(args: Record<string, unknown>): Promise<{ text: strin
 // field yet (wakeKind: the watchdog's marker).
 /** WO-157: what the sender wrote as fields for the receiver's decideWake (an Onsen item's kind, the urgency of a daemon's own notice). Never put in the
  *  meta: the session reads the meta as the channel tag's attributes, and nothing an agent reads changes */
-type WakeFacts = { item_kind?: string; urgency?: 'interrupt' | 'ordered' | 'silent'; refs?: ThreadRefs }
+type WakeFacts = { item_kind?: string; urgency?: 'interrupt' | 'ordered' | 'silent'; refs?: ThreadRefs; call_id?: string }
 const URGENCY_FIELDS = new Set(['interrupt', 'ordered', 'silent'])
 function wakeFactsOf(body: Record<string, unknown> | null | undefined): WakeFacts {
   const k = typeof body?.item_kind === 'string' && /^[a-z_]{1,24}$/.test(body.item_kind) ? body.item_kind : undefined
   const u = typeof body?.urgency === 'string' && URGENCY_FIELDS.has(body.urgency) ? body.urgency as WakeFacts['urgency'] : undefined
   // WO-164: the sender's thread-key fields (an Onsen item's refs, an /inject body's refs): the router reads them, never the session (not in the meta)
   const refs = threadRefsOf(body?.refs)
-  return { ...(k ? { item_kind: k } : {}), ...(u ? { urgency: u } : {}), ...(refs ? { refs } : {}) }
+  // WO-175: the Call the item is (Onsen's call id on the pulled item, when it carries one): it rides the event into the router and the lane
+  const call = body?.call_id != null && /^\d{1,18}$/.test(String(body.call_id)) ? String(body.call_id) : undefined
+  return { ...(k ? { item_kind: k } : {}), ...(u ? { urgency: u } : {}), ...(refs ? { refs } : {}), ...(call ? { call_id: call } : {}) }
 }
 function laneEventOf(n: { method: string; params: unknown }, verified?: boolean, facts: WakeFacts = {}): Lanes.InEvent {
   const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
@@ -2078,7 +2083,7 @@ async function laneDeliverMesh(n: { method: string; params: unknown }, verified?
   // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
   // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
   if (!d) { if (fallback) broadcastNotification(n) }
-  else if (d.target === 'lane') maybeAutoAckScheduled(ev.meta?.run_id)    // 開工回執: a lane took the scheduled run (its run id from the meta)
+  else if (d.target === 'lane' && !CALL_STATE) maybeAutoAckScheduled(ev.meta?.run_id)    // 開工回執: a lane took the scheduled run (WO-175: the Call's running, when on)
   return d
 }
 
@@ -4685,6 +4690,9 @@ const STATUS_PIN_KB = { inline_keyboard: [[{ text: '不要顯示這則', callbac
 /** the status pin of this daemon (null: ONSEN_STATUS_PIN off), for the button's callback */
 let statusPinRef: OnsenVisible.StatusPin | null = null
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
+  // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
+  // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
+  const calls = CALL_STATE ? new OnsenStatus.CallFacts({ sink: line => { onsen.recordCall(line) } }) : null
   const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f),
     ...(seenReactor ? { onSeen: (chat: string, id: string, by: string) => seenReactor.seen(chat, id, by) } : {}),   // WO-145: ✍ when the main takes it in (WO-165: into a turn)
     changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
@@ -4742,14 +4750,16 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     const edge = `${member}|${pub.state}|${pub.detail?.interrupted === true}`
     // WO-172 (Chiron 02:43Z) / WO-177: a normal turn's turn_end goes when this record shows the turn over (not busy, stuck or compacting), not 60 s later
     try { facts.statusRecord(member) } catch {}
+    try { calls?.statusRecord(member) } catch {}                          // WO-175: a main turn's Calls end with it, the same way
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
   // WO-172: each turn that ended (the main's, a lane run): one line. Its outcome and bound ride every turn_end fact of a Joey message in it (Onsen keeps
   // the fact's detail); a turn with no Joey message in it (a colleague's call alone) has no fact to ride: Onsen takes delivery facts for Telegram
   // messages only, so this line is its record here
   const turnEnded = (t: OnsenStatus.TurnEnded): void => log('info', `onsen: turn_end ${t.session} ${t.turn_id} ${t.outcome} bound=[${t.bound.join(',')}] facts=${t.facts}`)
-  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded }) : null
-  if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
+  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded,
+    calls, callOf: id => Lanes.callOfEvent(id) }) : null
+  if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b), calls })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
@@ -4857,7 +4867,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; WO-180: the one obsPut sends to Onsen)
   onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation, put: obsPut.health(),   // WO-180: is it being sent (sent, rejected, …)
     mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
-    turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}),
+    turn_end_settling: facts.pendingLater(), ...(screenStatus ? { screen_status: screenStatus.health() } : {}), ...(calls ? { calls: calls.health() } : {}),
     // WO-145: the visible half (only what is on)
     ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),
     ...(formInbox ? { forms: formInbox.stats } : {}), ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
@@ -5006,7 +5016,7 @@ async function echoFormAnswer(it: OnsenVisible.FormItem): Promise<void> {
 // (onsen-inbox.json; claimed while it runs, so two arrivals of one key cannot both pass); a refused one (a ring with no router) leaves it free.
 type InboundBody = { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
   msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
-  no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown }
+  no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown; call_id?: string }
 type InboundAnswer = { code: number; json: Record<string, unknown> }
 async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { holdUnsigned: boolean; trusted: boolean; src: 'inject' | 'onsen' }): Promise<InboundAnswer> {
   const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
@@ -5178,7 +5188,9 @@ async function deliverPulled(it: PullItem): Promise<HandResult> {
     // WO-157: the item's kind (Onsen's WO-147 names) is the sender's field the receiver's decideWake reads; the payload's own kind field, if any, wins
     ...(typeof it.kind === 'string' && !(it.payload as Record<string, unknown> | undefined)?.item_kind ? { item_kind: it.kind } : {}),
     // WO-164: the item's refs (Onsen's own field: the thread keys, the scheduler's run_id, the board's ticket) go on as the body's refs (the router reads them)
-    ...(it.refs && typeof it.refs === 'object' ? { refs: it.refs } : {}) } as InboundBody
+    ...(it.refs && typeof it.refs === 'object' ? { refs: it.refs } : {}),
+    // WO-175: Onsen's call id (0.24.1: on every Call item; null before the Call exists, and for other kinds)
+    ...((it as { call_id?: unknown }).call_id != null ? { call_id: String((it as { call_id?: unknown }).call_id) } : {}) } as InboundBody
   const relay: Verdict['relay'] = !it.relay ? 'direct' : it.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
   const sender = String(it.sender ?? 'unknown').slice(0, 64)
   const unverified = it.unverified === true
