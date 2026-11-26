@@ -80,6 +80,9 @@ export function tagForwardFrom(m: any): string | null {
   return null
 }
 
+/** a Telegram 409 (another program still polls the bot, e.g. its daemon handing it over): look again this often (Chiron 18:00Z) */
+export const TG_CONFLICT_RETRY_MS = 3_000
+
 export function clientMetaOf(m: any, o: { fromReply?: boolean; transcript?: string | null; imageError?: boolean; albumCount?: number } = {}): Record<string, string> {
   const out: Record<string, string> = {}
   const rt = m?.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
@@ -174,7 +177,9 @@ export class Poller {
         const conflict = e instanceof TgError && e.code === 409
         if (conflict) { this.stats.conflicts++; if (!this.a.telegramConflict) this.d.log('warn', `${this.a.member}: Telegram 409: another program is polling @${this.a.username}; waiting for it to stop`); this.a.telegramConflict = true }
         else this.d.log('warn', `${this.a.member}: getUpdates failed: ${errText(e)}`)
-        this.backoff = Math.min(30_000, Math.max(conflict ? 5_000 : 1_000, this.backoff * 2))
+        // a 409 is another poller still on the bot (a daemon handing it over): look again every 3 s, so the handover gap is seconds, not ~50 s of
+        // doubling (Chiron 18:00Z); other failures back off doubling to 30 s
+        this.backoff = conflict ? TG_CONFLICT_RETRY_MS : Math.min(30_000, Math.max(1_000, this.backoff * 2))
         await this.sleep(this.backoff)
         continue
       }
