@@ -172,6 +172,7 @@ export class Poller {
   // ---- what an update is -----------------------------------------------------------------------------------------------------------
   private async classify(e: Entry): Promise<void> {
     const u = e.u, a = this.a
+    if (process.env.TELEGRAM_BRIDGE_DEBUG) this.d.log('info', `${a.member}: update ${e.id} keys=${Object.keys(u).join(',')} chat=${u.message?.chat?.id ?? ''} from=${u.message?.from?.id ?? ''} text=${typeof u.message?.text === 'string' ? u.message.text.length : '-'}`)
     if (u.callback_query) { await this.button(u.callback_query); e.done = true; return }
     if (u.edited_message) {
       const m = u.edited_message, acc = a.access()
@@ -198,7 +199,7 @@ export class Poller {
       e.done = true; return
     }
     const g = gate(a.stateDir, m, a.username)
-    if (g.action === 'drop') { e.done = true; return }
+    if (g.action === 'drop') { if (process.env.TELEGRAM_BRIDGE_DEBUG) this.d.log('info', `${a.member}: update ${e.id} dropped by the gate`); e.done = true; return }
     if (g.action === 'pair') {
       a.stats.pairing++
       await this.send(String(m.chat.id), pairingText(g, this.now()))

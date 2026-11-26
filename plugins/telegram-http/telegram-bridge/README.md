@@ -208,3 +208,7 @@ These are imported unchanged:
 - `rich-inbound.ts`, `entities.ts`.
 
 No file outside this folder is changed.
+
+## Debugging
+
+`TELEGRAM_BRIDGE_DEBUG=1` in the unit's environment logs one line per Telegram update the bridge takes (its kinds, chat, sender, text length; never the text) and each one the allowlist drops. Off by default.
