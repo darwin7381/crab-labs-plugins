@@ -1,3 +1,12 @@
+## 1.58.17 — 2026-11-26 (Linux: a Claude Code started in the box's first 46 minutes is not pid_reused)
+
+- **The start-time check compares like with like** (board WO-187, Chiron 08:11Z, urgent). On Linux Claude Code writes the registry's `procStart` as `/proc/<pid>/stat` field 22 (clock ticks since boot: builder's `"3154"`), but `osProcStart` read `ps -o lstart=` (a date), and `sameStart` sent both to `Date.parse`: Bun reads `"3154 UTC"` as the year 3154, a finite date far from today, so every Claude Code started within 2,757.6 s (about 46 minutes) of a Linux boot was judged `offline / pid_reused` until that process restarted, and one started later was compared with nothing (a real reuse went unseen). txmonster rebooted 07:45:41Z: all 17 agents offline on Onsen (process_gone), `main_delivery: offline`, hand-overs held.
+  - `osProcStart`: on Linux `/proc/<pid>/stat` field 22 (the 20th field after the last `)`), digits only, the same thing Claude Code writes there; macOS as before (`ps -o lstart=` in UTC).
+  - `sameStart`: two tick counts: the same number; a tick count and a date: two wordings that cannot be compared, not taken as different; two dates: as before. A tick count never goes to `Date.parse`.
+  - Checked on txmonster: the 17 registry files' `procStart` equal their processes' field 22.
+- Tests: onsen-step3 (+2, +1 on Linux only): the cases of the ticket (`("Thu Nov 26 07:46:12 2026","3154")` true, `("3154","3154")` true, `("3154","9999")` false), a registry on ticks (same: idle; another: `pid_reused`), `osProcStart` of this process on Linux.
+- Roll back: 1.58.16 (txmonster's agents then stay offline until each Claude Code restarts after the box's first 46 minutes).
+
 ## 1.58.16 — 2026-11-26 (WO-175: the receipt's one path; WO-181's mention item; the hand-over's accepted main; DM titles; the avatar upload removed)
 
 - **A lane's receipt of a scheduled run goes to Onsen only** (board WO-175, Chiron's ruling 05:55Z; the same four rules as btcc-receipt, BTCC `8608a27`). With the Call moments on (`ONSEN_CALL_STATE`), `completeRun` ends the run's Call through the spool (the item's Call, else the run's Call as Onsen lists it: `GET /v1/calls?ref_kind=run&ref_value=<run>`) and waits for what Onsen says (≤10 s: the first try and three more, whatever the spool's backoff):

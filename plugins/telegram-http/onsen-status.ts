@@ -963,19 +963,33 @@ export function compareRegistry(files: RegEntry[], cli: RegEntry[], workspace: s
 /** how long a dead pid's registry file may linger before the reason is pid_gone rather than a normal close (no_registration) */
 export const DEAD_GRACE_MS = 3_000
 export function pidAlive(pid: number): boolean { try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' } }
-/** the process's start time as `ps` gives it in UTC (the registry's procStart is written the same way), or null */
+/** the process's start time in the form Claude Code writes the registry's procStart on this platform, or null. Linux: /proc/<pid>/stat field 22
+ *  (starttime, clock ticks since boot; the 20th field after the last `)`), as Claude Code writes it there (WO-187: builder's procStart "3154" = its
+ *  /proc stat field 22). macOS: `ps -o lstart=` in UTC */
 export function osProcStart(pid: number): string | null {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const v = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? ''
+      return /^\d+$/.test(v) ? v : null
+    } catch { return null }
+  }
   try {
     const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 3_000, env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] })
     const out = String(r.stdout ?? '').trim()
     return r.status === 0 && out ? out : null
   } catch { return null }
 }
-/** the same start time: the same text, or (another platform's wording) the same second within 2 s; text neither can read is not taken as different */
+/** the same start time: the same text; two tick counts (Linux): the same number; a tick count and a date: two wordings that cannot be compared, not
+ *  taken as different; two dates (another platform's wording): the same second within 2 s; dates neither can read are not taken as different. A tick
+ *  count never goes to Date.parse (Bun reads "3154 UTC" as the year 3154: every Claude Code started in a Linux box's first 46 minutes was pid_reused,
+ *  txmonster 11-26 07:45Z, WO-187) */
 export function sameStart(a: string, b: string): boolean {
   const n = (s: string) => s.replace(/\s+/g, ' ').trim()
-  if (n(a) === n(b)) return true
-  const x = Date.parse(`${n(a)} UTC`), y = Date.parse(`${n(b)} UTC`)
+  const A = n(a), B = n(b), tick = (s: string) => /^\d+$/.test(s)
+  if (A === B) return true
+  if (tick(A) || tick(B)) return !(tick(A) && tick(B))
+  const x = Date.parse(`${A} UTC`), y = Date.parse(`${B} UTC`)
   return !(Number.isFinite(x) && Number.isFinite(y)) || Math.abs(x - y) <= 2_000
 }
 

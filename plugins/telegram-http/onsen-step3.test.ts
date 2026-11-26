@@ -8,7 +8,7 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
 import { OnsenClient, idemDelivery, idemStatus, inboundItem, type DeliveryFact, type StatusFact } from './onsen-client.ts'
-import { DeliveryFacts, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
+import { DeliveryFacts, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, osProcStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
   type RegEntry, type StatusInputs, type StatusSource } from './onsen-status.ts'
 
 const CRED = 'mesh_STEP3************************************'
@@ -335,6 +335,26 @@ describe('the registry: which session is the main, offline and why, files vs the
     expect(sameStart('Tue Nov  4 08:06:31 2026', 'Tue Nov 4 08:06:32 2026')).toBe(true)
     expect(sameStart('Tue Nov 24 18:16:31 2026', 'Tue Nov 24 18:16:51 2026')).toBe(false)
     expect(sameStart('Tue Nov 24 18:16:31 2026', '1795544191')).toBe(true)                      // a wording neither side can read: not taken as reused
+    // WO-187: Linux's procStart is /proc stat field 22 (ticks since boot); a tick count never goes to Date.parse ("3154 UTC" = the year 3154)
+    expect(sameStart('Thu Nov 26 07:46:12 2026', '3154')).toBe(true)                              // a tick count and a date: cannot be compared
+    expect(sameStart('3154', '3154')).toBe(true)
+    expect(sameStart('3154', '9999')).toBe(false)                                                  // another process on that pid
+    for (const v of ['1600', '21100', '99999', '275760']) expect(sameStart(v, v)).toBe(true)
+  })
+
+  test('WO-187 pid_reused on Linux: the registry\'s tick count against the OS tick count, the same: not reused; another: pid_reused', () => {
+    let t = 1_000_000, osStart: string | null = '3154'
+    const dir = mkdtempSync(join(tmpdir(), 'onsen-reg-'))
+    const R = new Registry({ dir, workspace: WS, transcripts: () => null, connected: () => true, alive: () => true, procStart: () => osStart, now: () => t })
+    writeFileSync(join(dir, '32.json'), JSON.stringify(reg(32, { procStart: '3154' })))
+    expect(statusOf(R.inputs({ queuedJoey: 0, wall: null })).state).toBe('idle')
+    osStart = '9999'
+    t += 30_001
+    expect(statusOf(R.inputs({ queuedJoey: 0, wall: null }))).toMatchObject({ state: 'offline', detail: { reason: 'pid_reused' } })
+  })
+
+  test.skipIf(process.platform !== 'linux')('WO-187 osProcStart on Linux: this process\'s /proc stat field 22, digits only', () => {
+    expect(osProcStart(process.pid)).toMatch(/^\d+$/)
   })
 
   test('the registry\'s status: idle, shell (idle, background_shell), waiting (waitingFor), busy; a file read while written keeps its last reading', () => {
