@@ -128,15 +128,27 @@ export type SendCtx = { sender: string; part?: number; parts?: number; richAttem
    *  own has none */
   turn_id?: string | null
   /** WO-190: the local file this send carries (the reply tool's `files`, one per send): stored in Onsen too once Telegram took it (ONSEN_FILES) */
-  file?: string }
+  file?: string
+  /** WO-197 (Chiron lab round 3A: /status's receipt listed no response): the turn of a person's message the daemon answers itself (withAnswering):
+   *  every message sent inside carries it, so Onsen links the answer to the message (its turn_end names the same turn). `named`: false while the
+   *  sender is the scope's default (an inner withDefaultSender names it) */
+  answering?: string; named?: boolean }
 const als = new AsyncLocalStorage<SendCtx>()
 /** the author of a Telegram call made outside every named send path (server.ts records it all the same) */
 export const DEFAULT_CTX: SendCtx = { sender: 'system:daemon' }
 /** run `fn` with `sender` as the author of every Telegram call it makes; `extra` (WO-145): `redact` for the record */
 export function withSender<T>(sender: string, fn: () => T, extra?: Pick<SendCtx, 'redact' | 'turn_id' | 'file'>): T {
+  const answering = als.getStore()?.answering                            // WO-197: inside a command the daemon answers, its turn goes on
   return als.run({ sender, ...(extra?.redact?.length ? { redact: extra.redact } : {}), ...(extra?.turn_id ? { turn_id: extra.turn_id } : {}),
-    ...(extra?.file ? { file: extra.file } : {}) }, fn)
+    ...(extra?.file ? { file: extra.file } : {}), ...(answering ? { answering } : {}) }, fn)
 }
+/** WO-197 (round 3A): everything `fn` sends answers the person's message whose handling turn is `turn` (the daemon's own command, a permission reply) */
+export function withAnswering<T>(turn: string, fn: () => T): T {
+  const c = als.getStore()
+  return als.run(c ? { ...c, answering: turn } : { ...DEFAULT_CTX, answering: turn, named: false }, fn)
+}
+/** the turn a message sent in this context belongs to: its own (a session's), else the self-answered message's (withAnswering) */
+export const turnOfCtx = (c: SendCtx | undefined): string | null => c?.turn_id ?? c?.answering ?? null
 /** WO-145: the text as Onsen keeps it: every [sent, kept] pair of the send context applied */
 export function redactText(s: string, redact?: Array<[string, string]>): string {
   if (!redact?.length) return s
@@ -144,7 +156,10 @@ export function redactText(s: string, redact?: Array<[string, string]>): string 
   return s
 }
 /** `sender` unless a caller already named the author (a shared helper: its callers name themselves) */
-export function withDefaultSender<T>(sender: string, fn: () => T): T { return als.getStore() ? fn() : als.run({ sender }, fn) }
+export function withDefaultSender<T>(sender: string, fn: () => T): T {
+  const c = als.getStore()
+  return !c ? als.run({ sender }, fn) : c.named === false ? als.run({ ...c, sender, named: true }, fn) : fn()
+}
 /** the Telegram calls `fn` makes are not recorded (a stranger's pairing: not part of any conversation Onsen keeps) */
 export function withoutRecord<T>(fn: () => T): T { return als.run({ sender: '', skip: true }, fn) }
 /** inside a send: this call is part i of n of one text */
@@ -296,7 +311,7 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
     ...(attachments && Object.keys(attachments[0]).length ? { attachments } : {}),
     status: id != null ? 'ok' : 'failed', ...(id == null ? { error: err !== undefined ? errText(err) : 'Telegram answered without a message_id' } : {}),
     backfilled: false, ...(Object.keys(meta).length ? { meta } : {}),
-    ...(ctx.turn_id ? { turn_id: String(ctx.turn_id).slice(0, 120) } : {}),   // WO-172: the turn it was sent in, top level (WO-177 1.58.3: was meta.turn_id)
+    ...(turnOfCtx(ctx) ? { turn_id: String(turnOfCtx(ctx)).slice(0, 120) } : {}),   // WO-172: the turn it was sent in, top level (WO-177 1.58.3: was meta.turn_id); WO-197: a self-answered message's
   } }
 }
 

@@ -307,3 +307,6 @@ plugins/telegram-http/startup-picker.ts::hot?: () => Iterable<string>
 plugins/telegram-http/server.ts::hot: hotPanes,
 plugins/telegram-http/server.ts::function hotPanes(): string[] {
 plugins/telegram-http/onsen-screen-fast-daemon.test.ts::its Action is cancelled within ~5 s of the answer
+plugins/telegram-http/onsen-client.ts::export function withAnswering<T>(turn: string, fn: () => T): T {
+plugins/telegram-http/server.ts::try { r = turn ? await Onsen.withAnswering(turn, run) : await run() } catch (e) {
+plugins/telegram-http/onsen-status.ts::{ outcome, ...(turnId ? { turn_id: turnId } : {}) })

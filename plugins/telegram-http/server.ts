@@ -753,14 +753,19 @@ type SelfWho = { chat: string; id: number | undefined; from: string }
 async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
   const j = who && onsenFacts && who.id != null ? onsenJoeyOf({ chat_id: who.chat, message_id: String(who.id), user_id: who.from }) : null
   if (j) { try { onsenFacts!.took(j.chat, j.id) } catch {} }
+  // WO-197 (Chiron lab round 3A: /status, Onsen 43858, response_message_ids []): what the handler sends is in this message's own turn (its turn_end
+  // names it), so Onsen lists the answer as the message's response, on Telegram (the switch off) and in Onsen (the connector) alike
+  const turn = j ? handledTurn(j.chat, j.id) : null
   let r: T | undefined
-  try { r = await run() } catch (e) {
-    if (j && mine(undefined)) { try { onsenFacts!.handledHere(j.chat, j.id, 'failed', how) } catch {} }
+  try { r = turn ? await Onsen.withAnswering(turn, run) : await run() } catch (e) {
+    if (j && mine(undefined)) { try { onsenFacts!.handledHere(j.chat, j.id, 'failed', how, undefined, turn) } catch {} }
     throw e
   }
-  if (j && mine(r)) { try { onsenFacts!.handledHere(j.chat, j.id, 'done', how) } catch {} }
+  if (j && mine(r)) { try { onsenFacts!.handledHere(j.chat, j.id, 'done', how, undefined, turn) } catch {} }
   return r as T
 }
+/** WO-197: the turn of a person's message the daemon handles itself (one per message) */
+const handledTurn = (chat: string, id: string | number): string => `daemon:${chat}:${id}`.slice(0, 120)
 /** WO-197: the Telegram messages that reached handleInbound (a command bot.command did not take goes on there: handleInbound reports it) */
 const reachedInbound = new WeakSet<object>()
 /** WO-185 (Joey TG chiron:2645): how long the button 「不要讓它看到之前的」 stays under a /clear reply, in seconds (its label counts down once a second) */

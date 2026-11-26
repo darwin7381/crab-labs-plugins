@@ -44,7 +44,7 @@ function expectHandledHere(n: number, how: string): void {
   expect(fs.map((f: any) => `${f.state}${f.by ? `:${f.by}` : ''}`)).toEqual(['delivered', `turn_end:${HANDLED_HERE}`])
   const [del, end] = fs
   expect(end).toMatchObject({ agent: 'adam', client: 'telegram', outcome: 'done', detail: { handled_here: how } })
-  expect(end.turn_id).toBeUndefined()
+  expect(end.turn_id).toBe(`daemon:${JOEY}:${n}`)                    // WO-197 (round 3A): its answer is in this turn (Onsen links it)
   expect(end.bound).toBeUndefined()
   expect(Date.parse(del.at)).toBeLessThanOrEqual(Date.parse(end.at))
   // the message's own record first, then its facts (Onsen finds what a fact is about)
@@ -60,13 +60,27 @@ test('/clear (the control plane): the stand-in gets delivered and turn_end (done
   expectHandledHere(7100, 'command')
 }, 30000)
 
-test('/status (bot.command, answered by the daemon): delivered and turn_end done', async () => {
+/** the bot's own messages Onsen got recorded (the answers), with their turn */
+const outs = () => onsen.seen.filter(s => s.path === '/messages/batch').flatMap(s => s.body?.items ?? []).filter((i: any) => i.direction === 'out')
+
+test('/status (bot.command, answered by the daemon): delivered and turn_end done; the answer is recorded in the message\'s turn (Onsen lists it as the response)', async () => {
   api.push(dm(JOEY, 7101, '/status', { command: true }))
   expect(await until(() => api.of('sendMessage').some(c => String(c.body.text).startsWith('Paired as')), 15000)).toBe(true)
   expect(await until(() => factsOf(7101).some((f: any) => f.state === 'turn_end'), 10000)).toBe(true)
   await sleep(300)
   expectHandledHere(7101, 'command')
+  expect(await until(() => outs().some((i: any) => String(i.body).startsWith('Paired as')), 8000)).toBe(true)
+  const ans = outs().find((i: any) => String(i.body).startsWith('Paired as'))!
+  expect(ans.turn_id).toBe(`daemon:${JOEY}:7101`)
+  expect(ans.reply_to_client_msg_id).toBeUndefined()                     // Onsen links a turn's message that quotes nothing to every message of the turn
+  expect(ans.sender).toBe('system:control')                               // the author as before
 }, 30000)
+
+test('/clear\'s answer is in its turn too; a plain message\'s turn is not given to anything the daemon says', async () => {
+  expect(await until(() => outs().some((i: any) => String(i.body).includes('已送 `/clear`')), 8000)).toBe(true)
+  expect(outs().find((i: any) => String(i.body).includes('已送 `/clear`'))!.turn_id).toBe(`daemon:${JOEY}:7100`)
+  expect(outs().filter((i: any) => String(i.turn_id ?? '').startsWith('daemon:')).every((i: any) => /^daemon:1828:710[01]$/.test(i.turn_id))).toBe(true)
+}, 15000)
 
 test('a permission reply (yes <id>): the session gets the answer; the message itself: delivered and turn_end done', async () => {
   const c = await d.client()

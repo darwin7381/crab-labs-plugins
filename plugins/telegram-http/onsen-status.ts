@@ -90,8 +90,9 @@ export class DeliveryFacts {
   /** WO-197: its handler finished: turn_end with how (done; failed: the handler threw); Onsen's receipt: handling completed / failed, started_at null
    *  (no turn read it), read_at null. `by` HANDLED_HERE, not a session: Onsen reads a session's later turn_end (main, a lane id) as that session having
    *  moved on, and would end the main's running message with it. No turn, nothing bound. detail.handled_here: which path */
-  handledHere(chat: string, id: string | number, outcome: 'done' | 'failed', how: string, at?: string): void {
-    this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome })
+  handledHere(chat: string, id: string | number, outcome: 'done' | 'failed', how: string, at?: string, turnId?: string | null): void {
+    // WO-197 (round 3A): the turn its answer was sent in (Onsen links the messages of that turn to it: response_message_ids)
+    this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome, ...(turnId ? { turn_id: turnId } : {}) })
   }
   /** WO-165: handed to a session (lanes off: written into the main's stream, where Claude Code may queue it; lanes on: M1 offered it, or bound it at a
    *  boundary; a lane run started with it). Not seen: the ✍ waits for seen */
