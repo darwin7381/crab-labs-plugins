@@ -20,7 +20,7 @@ const AGENTS = [
   { pid: 401, cwd: '/w/f', kind: 'interactive', startedAt: 6, status: 'idle' },
   null,
 ]
-const PANES = 'one\t100\ntwo\t300\nthree\t999\n'
+const PANES = '100:one\n300:two\n999:three\n'
 const PS = '101 100\n100 1\n201 1\n301 300\n300 1\n'
 
 /** a runner answering the three listings from fixtures, recording every argv */
@@ -41,7 +41,7 @@ describe('read-only listings', () => {
   test('the listings it may run', () => {
     expect(isReadOnlyListing(['claude', 'agents', '--json'])).toBe(true)
     expect(isReadOnlyListing(['/home/x/.local/bin/claude', 'agents', '--json'])).toBe(true)
-    expect(isReadOnlyListing(['tmux', 'list-panes', '-a', '-F', '#{session_name}\t#{pane_pid}'])).toBe(true)
+    expect(isReadOnlyListing(['tmux', 'list-panes', '-a', '-F', '#{pane_pid}:#{session_name}'])).toBe(true)
     expect(isReadOnlyListing(['tmux', '-S', '/tmp/s', 'list-panes', '-a'])).toBe(true)
     expect(isReadOnlyListing(['tmux', 'list-sessions'])).toBe(true)
     expect(isReadOnlyListing(['ps', '-o', 'pid=,ppid=', '-A'])).toBe(true)
@@ -84,7 +84,7 @@ describe('the listings', () => {
     expect(f.calls[0]).toEqual(['/opt/claude', 'agents', '--json'])
   })
   test('listPanes: tmux order, a pane without a numeric pid left out; null when tmux fails; the private socket goes first', async () => {
-    expect(await listPanes({ run: fake({ panes: 'a\t1\nb\tx\nc\t\nno tab\n\t5\n' }).run })).toEqual([{ session: 'a', panePid: 1 }, { session: '', panePid: 5 }])
+    expect(await listPanes({ run: fake({ panes: '1:a\nx:b\n:c\nno sep\n5:\n7:d e\n' }).run })).toEqual([{ session: 'a', panePid: 1 }, { session: 'd e', panePid: 7 }])
     expect(await listPanes({ run: fake({ panesExit: 1 }).run })).toBeNull()
     const f = fake()
     await listPanes({ run: f.run, tmuxArgs: ['-S', '/tmp/sock'] })
@@ -147,6 +147,14 @@ describe('a private tmux server (txmonster; -S, TMUX unset)', () => {
       expect(tm('new-session', '-d', '-s', 'wo183-finder', 'sleep 60').status).toBe(0)
       const panes = await listPanes({ tmuxArgs: ['-S', sock] })
       expect(panes!.length).toBe(1)
+      // launchd and systemd give no UTF-8 locale: tmux then prints a tab in a format as "_" (the Mac mini install found 0 panes, 10:13Z)
+      const saved = { LANG: process.env.LANG, LC_ALL: process.env.LC_ALL, LC_CTYPE: process.env.LC_CTYPE }
+      try {
+        process.env.LANG = 'C'; process.env.LC_ALL = 'C'; delete process.env.LC_CTYPE
+        expect(await listPanes({ tmuxArgs: ['-S', sock] })).toEqual(panes)
+      } finally {
+        for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v
+      }
       expect(panes![0].session).toBe('wo183-finder')
       const pid = panes![0].panePid
       const run: Runner = (argv, ms) => argv[1] === 'agents'

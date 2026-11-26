@@ -29,7 +29,7 @@ const agents = [
   { pid: 5901, cwd: '/srv/dc', kind: 'interactive', startedAt: 10, sessionId: 'dc-1', status: 'busy' },                            // claimed by a Discord roamer: still listed
   { pid: 6001, kind: 'interactive', startedAt: 11, sessionId: 'nocwd-1', status: 'idle' },                                        // no cwd: left out
 ]
-const panes = ['zeta\t9999', 'alpha-tmux\t5100', 'beta\t5699', 'gamma\t5700', 'claimed-tmux\t5800', 'badpid\tx', 'nopid\t']
+const panes = ['9999:zeta', '5100:alpha-tmux', '5699:beta', '5700:gamma', '5800:claimed-tmux', 'x:badpid', ':nopid', 'nosep']
 const ps = ['  5101  5100', ' 5100     1', '5301 1', '5701 5700', '5700 5699', '5699 1', '5801 5800', '5800 1', '5901 1', '9999 1', '5201 1']
 
 beforeAll(async () => {

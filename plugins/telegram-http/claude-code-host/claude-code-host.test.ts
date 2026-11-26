@@ -314,7 +314,7 @@ describe('the loop, against a fake Onsen', () => {
       calls.push(argv)
       const r = (stdout: string): RunResult => ({ exitCode: 0, stdout, stderr: '' })
       if (argv[1] === 'agents') return r(JSON.stringify([{ pid: 11, cwd: ws('claude-alpha'), kind: 'interactive', startedAt: 1, sessionId: 's-1', status: 'idle' }]))
-      if (argv[0] === 'tmux') return r('claude-alpha\t10\n')
+      if (argv[0] === 'tmux') return r('10:claude-alpha\n')
       return r('11 10\n10 1\n')
     }
     const hh = join(root, 'roamer-home')

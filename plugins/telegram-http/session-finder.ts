@@ -127,15 +127,16 @@ export async function listAgents(o: FinderOptions = {}): Promise<AgentEntry[] | 
 
 /** every pane of the tmux server, in tmux's order: its session and the pid of its process; null when tmux failed (no server included) */
 export async function listPanes(o: FinderOptions = {}): Promise<Pane[] | null> {
-  const r = await runner(o)(['tmux', ...(o.tmuxArgs ?? []), 'list-panes', '-a', '-F', '#{session_name}\t#{pane_pid}'], 5000)
+  // <pid>:<session>, printable only: without a UTF-8 locale (launchd, systemd) tmux prints a tab in a format as "_", and a session name
+  // never contains ":" (tmux refuses it), so the first ":" splits the line under any locale
+  const r = await runner(o)(['tmux', ...(o.tmuxArgs ?? []), 'list-panes', '-a', '-F', '#{pane_pid}:#{session_name}'], 5000)
   if (r.exitCode !== 0) return null
   const out: Pane[] = []
   for (const line of r.stdout.split('\n')) {
-    if (!line.includes('\t')) continue
-    const [session, pid] = line.split('\t')
-    if (!pid) continue
-    const panePid = parseInt(pid, 10)
-    if (Number.isFinite(panePid)) out.push({ session, panePid })
+    const m = line.match(/^(\d+):(.+)$/)
+    if (!m) continue
+    const panePid = parseInt(m[1], 10)
+    if (Number.isFinite(panePid)) out.push({ session: m[2], panePid })
   }
   return out
 }
