@@ -146,7 +146,6 @@ plugins/telegram-http/lanes.ts::export function mainStatusChanged
 plugins/telegram-http/screen-status.ts::export function composeRecord(
 plugins/telegram-http/server.ts::observation: lastObservation,
 plugins/telegram-http/onsen-status.ts::export type TurnEnded =
-plugins/telegram-http/onsen-avatar.ts::export class AvatarSync
 plugins/telegram-http/screen-status.ts::interrupted_is_latest_output: latestIs(INTERRUPTED, [COMMAND, INCOMING]),
 plugins/telegram-http/onsen-status.ts::if (this.last?.id === this.turn.prompt) this.last = this.before
 plugins/telegram-http/onsen-status.ts::...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}), ...turnFields(turn) })

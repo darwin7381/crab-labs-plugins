@@ -69,7 +69,6 @@ import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudg
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards, mentionItemText } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
-import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
@@ -2860,8 +2859,6 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
 // WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of
 // the main's pane are handed to it, so the screen is not captured twice
 let screenStatus: ScreenStatus | null = null
-/** WO-172 (ONSEN_AVATAR): the bot's profile photo as this agent's Onsen avatar; null: off */
-let avatarSync: AvatarSync | null = null
 let dutyOfficer: DutyOfficer | null = null
 /** WO-176 r4 (Chiron 06:00Z: the test bench needs room to run 「值班員依序按三個權限」 again): DUTY_OFFICER_HOURLY_CAP_AGENTS (plist or machine config,
  *  read at start), `agent:N[,agent:N…]`: this agent's duty officer may judge N times an hour per pane (and the machine-wide count it checks is at least
@@ -4969,7 +4966,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
   }
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop(); obsPut.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop(); avatarSync?.stop() }
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); obsPut.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop() }
   // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; WO-180: the one obsPut sends to Onsen)
   onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation, put: obsPut.health(),   // WO-180: is it being sent (sent, rejected, …)
     mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
@@ -4978,31 +4975,6 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),
     ...(formInbox ? { forms: formInbox.stats } : {}), ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
   log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
-  // WO-172 (ONSEN_AVATAR, off by default: Onsen's upload is WO-170's): this bot's own profile photo as this agent's Onsen avatar, at start (a random
-  // moment of the first minute) and every 24 h, uploaded only when its sha256 differs from the last upload (onsen-avatar.ts)
-  if (switchOn(process.env.ONSEN_AVATAR, ONSEN_AGENT)) {
-    const avatarFile = join(STATE_DIR, 'onsen', 'avatar.json')
-    avatarSync = new AvatarSync({ agent: ONSEN_AGENT,
-      botId: async () => (await bot.api.getMe()).id,
-      photoSizes: async id => ((await bot.api.getUserProfilePhotos(id, { limit: 1 })).photos?.[0] ?? []) as PhotoSize[],
-      download: async fileId => {
-        const f = await bot.api.getFile(fileId)
-        if (!f.file_path) throw new Error('getFile returned no file_path')
-        const r = await fetch(`${API_ROOT}/file/bot${TOKEN}/${f.file_path}`, { signal: AbortSignal.timeout(20_000) })
-        if (!r.ok) throw new Error(`the photo's download answered HTTP ${r.status}`)
-        return new Uint8Array(await r.arrayBuffer())
-      },
-      put: async (bytes, type) => {
-        const r = await onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/avatar`, bytes, type)
-        return r ? { status: r.status, detail: r.status >= 300 ? JSON.stringify(r.json?.error ?? r.json ?? null) : undefined } : { status: 0, detail: 'no mesh credential' }
-      },
-      load: () => { try { return JSON.parse(readFileSync(avatarFile, 'utf8')) } catch { return null } },
-      save: x => { try { mkdirSync(join(STATE_DIR, 'onsen'), { recursive: true }); writeFileSync(avatarFile, JSON.stringify(x)) } catch {} },
-      log: (lv, m) => log(lv, m) })
-    const firstMs = Number(process.env.ONSEN_AVATAR_FIRST_MS)
-    avatarSync.start(Number.isFinite(firstMs) && firstMs >= 0 && process.env.ONSEN_AVATAR_FIRST_MS ? firstMs : 5_000 + Math.floor(Math.random() * 55_000))
-    log('info', `onsen: avatar on for ${ONSEN_AGENT} (the bot's profile photo → PUT ${onsen.cfg.base}/v1/members/${ONSEN_AGENT}/avatar when it changes; checked at start and every 24 h)`)
-  }
   // WO-147 (Onsen step 4a, ONSEN_WAKE_LOG): every route record (routing.jsonl line) as one wake row in Onsen (onsen-wake.ts), through the spool. Read only:
   // the row is built from the record the router already wrote and appended to the spool after the router's own step (a microtask: toMain has given the
   // event its M1 item by then, and nothing of the route waits for it); any failure is logged once an hour and that row is dropped.

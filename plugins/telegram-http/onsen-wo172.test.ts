@@ -4,12 +4,11 @@
 //   2 turn_end carries outcome (done / interrupted / failed) and bound (Joey's client_msg_id, a colleague's msg id), computed once per turn: the same
 //     value on every fact of the turn and on the observation's last_turn; seen and turn_end carry turn_id (Chiron WO-171 01:52Z). Fields of the fact
 //     itself, as Onsen 0.16.0 reads them (delivery_events.turn_id / outcome / bound), not its detail
-//   3 the bot's own profile photo as the agent's Onsen avatar: uploaded when its hash changes, nothing without a photo, one log line on a failure
+//   3 (the bot's photo as the Onsen avatar) was cancelled (Chiron 06:51Z, Joey: avatars regenerated with Codex, uploaded once by Chiron): removed in 1.58.16
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { DeliveryFacts, LanesTap, TurnWatch, runOutcome, type TurnEnded } from './onsen-status.ts'
 import { outboundRecord, sendCtx, withPart, withSender } from './onsen-client.ts'
-import { AvatarSync, imageType, largest, type AvatarDeps } from './onsen-avatar.ts'
 
 describe('1 turn_id on what is sent', () => {
   const pay = { chat_id: 1828, text: 'hi' }
@@ -183,47 +182,5 @@ describe('2b WO-177 (Chiron WO-172 02:43Z): a normal turn_end goes when the stat
     r.facts.statusRecord('busy')
     r.line(c, 'bound', { prompt_id: 'q5' }); r.main('in_turn', 'q5', '2026-11-26T03:03:03.000Z')    // a new prompt: q4's Stop was its end
     expect(r.turnEnds().map(f => f.client_msg_id)).toEqual(['803', '804'])
-  })
-})
-
-describe('3 the avatar', () => {
-  const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]), PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 9])
-  function rig(o: { sizes?: any[]; bytes?: Uint8Array; status?: number; throws?: string } = {}) {
-    const puts: Array<{ bytes: Uint8Array; type: string }> = [], logs: string[] = []
-    let stored: any = null
-    const d: AvatarDeps = { agent: 'adam', botId: async () => 999,
-      photoSizes: async id => { if (o.throws) throw new Error(o.throws); expect(id).toBe(999); return o.sizes ?? [{ file_id: 'small', width: 160, height: 160 }, { file_id: 'big', width: 640, height: 640 }] },
-      download: async id => { expect(id).toBe('big'); return o.bytes ?? JPEG },
-      put: async (bytes, type) => { puts.push({ bytes, type }); return { status: o.status ?? 200, ...(o.status && o.status >= 300 ? { detail: 'not_found' } : {}) } },
-      load: () => stored, save: x => { stored = x }, log: (_l, m) => logs.push(m) }
-    return { s: new AvatarSync(d), puts, logs, stored: () => stored, d }
-  }
-  test('the largest size, uploaded once; the same photo again: not uploaded; a new one: uploaded', async () => {
-    const r = rig()
-    expect(await r.s.syncOnce()).toBe('uploaded')
-    expect(r.puts).toEqual([{ bytes: JPEG, type: 'image/jpeg' }])
-    expect(r.stored()).toMatchObject({ sha256: createHash('sha256').update(JPEG).digest('hex'), bytes: JPEG.length })
-    expect(await r.s.syncOnce()).toBe('same')
-    expect(r.puts).toHaveLength(1)
-    const again = new AvatarSync({ ...r.d, download: async () => PNG })
-    expect(await again.syncOnce()).toBe('uploaded')
-    expect(r.puts.at(-1)!.type).toBe('image/png')
-  })
-  test('no photo: nothing sent; a refusal or a failure: one line, nothing stored (tried again at the next check)', async () => {
-    const none = rig({ sizes: [] })
-    expect(await none.s.syncOnce()).toBe('no_photo'); expect(none.puts).toHaveLength(0)
-    const refused = rig({ status: 404 })
-    expect(await refused.s.syncOnce()).toBe('failed'); expect(refused.stored()).toBeNull()
-    expect(refused.logs).toEqual([expect.stringContaining('answered 404')])
-    const down = rig({ throws: 'getUserProfilePhotos: 502' })
-    expect(await down.s.syncOnce()).toBe('failed'); expect(down.logs).toHaveLength(1)
-    const notImage = rig({ bytes: new Uint8Array([1, 2, 3, 4]) })
-    expect(await notImage.s.syncOnce()).toBe('failed'); expect(notImage.puts).toHaveLength(0)
-  })
-  test('helpers: the image type from the first bytes; the largest size', () => {
-    expect([imageType(JPEG), imageType(PNG), imageType(new TextEncoder().encode('RIFF\0\0\0\0WEBPx')), imageType(new TextEncoder().encode('GIF89a')), imageType(new Uint8Array([0]))])
-      .toEqual(['image/jpeg', 'image/png', 'image/webp', 'image/gif', null])
-    expect(largest([{ file_id: 'a', width: 160, height: 160 }, { file_id: 'b', width: 640, height: 640 }, { file_id: 'c', width: 320, height: 320 }])!.file_id).toBe('b')
-    expect(largest([])).toBeNull()
   })
 })
