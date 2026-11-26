@@ -3,21 +3,28 @@
 // part of it that takes work. An agent hands it work with send_to_agent(to: "codex", line: "call"), Joey talks to it on the Onsen page; the request, the
 // progress and the result (the files it makes included) all live in Onsen.
 //
-//   take      the codex credential, the pull every daemon uses (onsen-inbox.ts OnsenPuller: GET /inbox?after=&wait=25, POST /inbox/ack) for the Calls,
-//             and the forms inbox (GET /forms/inbox?wait=25, POST /forms/ack) for what Joey says on the page (items marked `say`). Every item is first
-//             written to this program's state file, then acked. Not taken as work: a reply, a silent notice, a mail bell, a press, a poke that is no Call.
-//   accept    PUT /v1/calls/<id>/state accepted; the folder ~/onsen-codex/<Onsen conversation id>/ (its .codex-runner/ holds this program's files);
-//             the item's attachments downloaded into it with the credential (only from Onsen's own origin).
+//   take      the codex credential, the pull every daemon uses (onsen-inbox.ts OnsenPuller: GET /inbox?after=&wait=25, POST /inbox/ack) for the Calls
+//             and the follow-ups in a Codex thread, and the forms inbox (GET /forms/inbox?wait=25, POST /forms/ack) for what Joey says on the page
+//             (items marked `say`). Every item is first written to this program's state file, then acked. Not taken as work: a silent notice, a mail
+//             bell, a press, a poke that is no Call.
+//   session   (Chiron's ruling, mesh 12527, 11-26 08:21Z: a Codex session belongs to a thread, not to the whole conversation, as a thread belongs to one
+//             session of our own agents) an agent's item that carries a thread (payload.thread / refs.thread) belongs to that thread's session: the
+//             first one starts it, the next ones resume it. One that carries none starts a new session with a new thread `codex#t-<hex>`; its answer
+//             carries that thread (the reply's payload.thread and refs.thread, a line in the Call's result), so the caller's reply_to (its daemon fills
+//             in the thread of the message it answers) or a send with that thread resumes it. Joey on the page: his DM's one session, ongoing.
+//   accept    PUT /v1/calls/<id>/state accepted (a follow-up that is a reply has no Call in Onsen: no state); the session's folder
+//             ~/onsen-codex/<Onsen conversation id>/<thread, or call-<id> for a session a Call started>/ (the DM's: <conversation id>/dm/; its
+//             .codex-runner/ holds this program's files); the item's attachments downloaded into it with the credential (only from Onsen's origin).
 //   run       PUT running, then `codex exec --skip-git-repo-check -s workspace-write -C <dir> --json -o <dir>/last-<n>.txt [-i <image>…] -- "<text>"`,
-//             stdin /dev/null; from the second item of the same Onsen conversation on, `… resume <that conversation's first session id> …` (the
-//             session id is thread.started's thread_id in the --json events). stdout and stderr go to files, so a restart can pick the run up.
+//             stdin /dev/null; the next items of the session `… resume <its session id> …` (thread.started's thread_id in the --json events).
+//             stdout and stderr go to files, so a restart can pick the run up.
 //   finish    completed: result.body = the last message, the files new or changed in the folder by this run (≤ 20, each ≤ 25 MB) POST /files-ed and
 //             listed in result.attachment_file_ids. A non-zero exit, or CODEX_RUNNER_TIMEOUT_S (1800) without finishing (SIGTERM to its process
 //             group, SIGKILL 10 s later): failed, result.body = the error and the last lines of stderr. A peer's Call also gets a reply (POST /send,
-//             peer_call, reply_to_id = its number) so the answer reaches the caller's session as every Call's answer does; a page message gets the
+//             peer_call, reply_to_id = its number, the session's thread) so the answer reaches the caller as every Call's answer does; a page message gets the
 //             answer recorded in Joey's conversation with Codex (POST /messages, its files attached) and its delivery facts.
-//   at most   CODEX_RUNNER_MAX (3) at once; the rest stay `queued` in Onsen (queued is Onsen's own state: no PUT until one is started). Two items of
-//             one conversation never run at once: the second resumes the session of the first, so it waits for it.
+//   at most   CODEX_RUNNER_MAX (3) at once, across sessions; the rest stay `queued` in Onsen (queued is Onsen's own state: no PUT until one is
+//             started). Two items of one session never run at once (two resumes would interleave its history): the second waits for the first.
 //   status    PUT /v1/members/codex/observation (onsen-observation.ts, at each change and every 15 s): online while alive; the main session running
 //             with doing {kind: tool, tool: "codex exec"} while any item is being worked on, else idle; offline at a clean stop.
 //   restart   a run the state file says is running: its process still alive → followed to its end; gone → completed when its events show the turn
@@ -120,6 +127,8 @@ export type JobState = 'lookup' | 'queued' | 'starting' | 'running' | 'finishing
 export type Job = {
   id: string; source: 'call' | 'say'; key: string; text: string; attachments: Att[]; state: JobState; received_at: string
   call_id?: string | null; number?: number | null; caller?: string; kind?: string; no_reply?: boolean; lookup_at?: string
+  /** the session's thread (an agent's item); hop: the item's hop, the answer's is one more */
+  thread?: string; thread_given?: boolean; hop?: number
   message_id?: string; chat?: string
   dir?: string; n?: number; resumed?: string | null; images?: string[]; notes?: string[]
   started_at?: string; ended_at?: string; pid?: number | null; exit?: number | null; signal?: string | null; timed_out?: boolean
@@ -127,8 +136,9 @@ export type Job = {
   outcome?: 'completed' | 'failed'; result_text?: string; files?: string[]; skipped_files?: string[]
   uploads?: Record<string, string>; steps?: Record<string, boolean>; why?: string
 }
-export type Conv = { dir: string; conversation_id: string | null; session_id: string | null; runs: number }
-export type State = { v: 1; seq: number; jobs: Job[]; convs: Record<string, Conv>; says: string[]
+/** one Codex session: an agent's thread (key t:<thread>) or Joey's DM (key say:<chat>) */
+export type Sess = { dir: string; conversation_id: string | null; session_id: string | null; runs: number; thread: string | null; first_number: number | null }
+export type State = { v: 1; seq: number; jobs: Job[]; sessions: Record<string, Sess>; says: string[]
   span: { id: string; started_at: string; trigger: any } | null; last_turn: { id: string; outcome: 'done' | 'failed'; ended_at: string } | null
   idle_since: string | null; last_activity_at: string | null }
 const BUSY: ReadonlySet<JobState> = new Set(['starting', 'running', 'finishing'])
@@ -149,6 +159,14 @@ export function safeName(name: string | null, fallback: string): string {
   n = n.replace(/^\.+/, '')
   if (!n || /^last-\d+\.txt$/.test(n)) n = fallback
   return n.slice(0, 200)
+}
+/** a thread as the lanes write it (telegram-http lanes: <agent>#t-<hex>, what a daemon carries over to a reply); Codex's new ones are codex#t-<12 hex> */
+export const THREAD_RE = /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i
+export const newThread = (agent: string): string => `${agent}#t-${Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, '0')).join('')}`
+/** an item's thread: payload.thread, else refs.thread (a string the lanes would write); null: none */
+export function threadOf(it: { payload?: Record<string, unknown>; refs?: Record<string, unknown> | null }): string | null {
+  for (const v of [it.payload?.thread, it.refs?.thread]) if (typeof v === 'string' && v.length <= 120 && THREAD_RE.test(v.trim())) return v.trim()
+  return null
 }
 /** a key as a folder name */
 const folderOf = (s: string): string => s.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'conversation'
@@ -249,7 +267,7 @@ export class CodexRunner {
 
   // ---------------------------------------------------------------- state file
   private load(): State {
-    const empty: State = { v: 1, seq: 0, jobs: [], convs: {}, says: [], span: null, last_turn: null, idle_since: null, last_activity_at: null }
+    const empty: State = { v: 1, seq: 0, jobs: [], sessions: {}, says: [], span: null, last_turn: null, idle_since: null, last_activity_at: null }
     try {
       const j = JSON.parse(readFileSync(join(this.cfg.stateDir, 'state.json'), 'utf8'))
       if (j && j.v === 1 && Array.isArray(j.jobs)) return { ...empty, ...j }
@@ -311,12 +329,14 @@ export class CodexRunner {
     const callId = (it as any).call_id != null ? String((it as any).call_id) : null
     if (callId && this.state.jobs.some(j => j.call_id === callId)) { if (key) this.inbox.record(key); return 'duplicate' }
     const n = Number.isInteger(p.msg_id) ? p.msg_id : Number.isInteger(it.refs?.btcc_msg_id) ? it.refs!.btcc_msg_id as number : null
+    const thread = threadOf(it as any)
+    // a reply to Codex's answer (reply_to_id) is no Call in Onsen (it answers no Call Codex made): it is the caller's next item in that thread
+    const followUp = !callId && it.kind === 'peer_call' && p.reply_to_id != null
     let why: string | null = null
     if (it.kind === 'action_control') why = 'a press for a Telegram daemon'
-    else if (p.reply_to_id != null) why = 'a reply (codex calls nobody)'
     else if (p.urgency === 'silent') why = 'a silent notice'
     else if (it.kind === 'peer_mail') why = 'a mail bell (codex reads no mailbox)'
-    else if (!callId && !(it.kind === 'peer_call' && n != null)) why = 'not a Call'
+    else if (!callId && !followUp && !(it.kind === 'peer_call' && n != null)) why = 'not a Call'
     if (why) {
       this.stats.ignored++
       this.log('info', `inbox seq ${it.seq} from ${it.sender} (${it.kind ?? '?'}): not taken: ${why}`)
@@ -324,13 +344,16 @@ export class CodexRunner {
       return 'delivered'
     }
     const atts: Att[] = Array.isArray((it as any).attachments) ? (it as any).attachments.map((a: any) => ({ name: a?.name ?? null, mime: a?.mime ?? null, kind: a?.kind ?? null, url: a?.url ?? null })) : []
-    const j: Job = { id: `j${++this.state.seq}`, source: 'call', key: `call:${it.sender}`, text: String(p.text ?? ''), attachments: atts,
-      state: callId ? 'queued' : 'lookup', received_at: this.iso(), call_id: callId, number: n, caller: it.sender, kind: it.kind ?? 'peer_call',
-      no_reply: (it as any).no_reply === true || p.no_reply === true }
-    if (!callId) j.lookup_at = this.iso(this.now() + this.cfg.lookupDelayMs)
+    // the session: the item's thread's, else a new one (a new thread). A follow-up with no thread its caller's daemon could fill in: a new session too
+    const t = thread ?? newThread(this.cfg.agent)
+    const j: Job = { id: `j${++this.state.seq}`, source: 'call', key: `t:${t}`, thread: t, thread_given: !!thread, text: String(p.text ?? ''), attachments: atts,
+      state: callId || followUp ? 'queued' : 'lookup', received_at: this.iso(), call_id: callId, number: n, caller: it.sender, kind: it.kind ?? 'peer_call',
+      no_reply: (it as any).no_reply === true || p.no_reply === true, hop: Number.isInteger(p.hop) && p.hop > 0 ? p.hop : 0 }
+    if (!callId && !followUp) j.lookup_at = this.iso(this.now() + this.cfg.lookupDelayMs)
     this.state.jobs.push(j)
     this.stats.taken++
-    this.log('info', `${j.id}: ${callId ? `Call ${callId}` : `peer_call #${n} without a Call yet (looked up in ${Math.round(this.cfg.lookupDelayMs / 1000)} s)`} from ${it.sender}, ${atts.length} attachment(s): queued`)
+    this.log('info', `${j.id}: ${callId ? `Call ${callId}` : followUp ? `a reply to #${p.reply_to_id} (no Call)` : `peer_call #${n} without a Call yet (looked up in ${Math.round(this.cfg.lookupDelayMs / 1000)} s)`} from ${it.sender}, thread ${t}${thread ? (this.state.sessions[j.key] ? ' (its session)' : ' (a new session)') : ' (new)'}, ${atts.length} attachment(s): ${j.state}`)
+    if (!thread && followUp) this.log('warn', `${j.id}: a reply with no thread: Codex cannot tell which session it continues (the caller's daemon fills the thread in for a reply_to it remembers; thread=<codex#t-…> always works): a new session`)
     this.changed()                                                // the job is on disk before its key is (a crash between: taken again, not lost)
     if (key) this.inbox.record(key)
     if (!callId) this.later(this.cfg.lookupDelayMs, () => void this.lookup(j))
@@ -416,7 +439,7 @@ export class CodexRunner {
   }
   private openSpan(j: Job): void {
     if (this.state.span) return
-    const c = this.state.convs[j.key]
+    const c = this.state.sessions[j.key]
     this.state.span = { id: `codex-turn-${this.now()}`, started_at: this.iso(),
       trigger: j.source === 'say' && j.message_id ? { kind: 'message', conversation_id: c?.conversation_id ?? null, message_id: j.message_id } : { kind: 'other' } }
   }
@@ -434,7 +457,7 @@ export class CodexRunner {
     this.state.last_activity_at = this.iso()
     this.changed()
     try {
-      const conv = await this.conversation(j)
+      const conv = await this.session(j)
       if (j.source === 'call') {
         const ok = await this.callState(j, 'accepted')
         if (ok === 'gone') { j.state = 'skipped'; j.why = 'the Call is over (cancelled, or done elsewhere) before it started'; this.log('info', `${j.id}: ${j.why}`); this.after(j); return }
@@ -461,19 +484,24 @@ export class CodexRunner {
       void this.report(j)
     }
   }
-  /** the conversation's folder and session (state.convs, keyed call:<caller> / say:<chat>); its Onsen id asked once */
-  private async conversation(j: Job): Promise<Conv> {
-    let c = this.state.convs[j.key]
+  /** the job's session (state.sessions: t:<thread>, say:<chat>), made at its first item: the folder ~/onsen-codex/<Onsen conversation id>/<sub>,
+   *  sub = the item's thread, or call-<id> for a session a Call with no thread started, or dm for Joey's DM; the conversation id asked once */
+  private async session(j: Job): Promise<Sess> {
+    let c = this.state.sessions[j.key]
     if (c) return c
     let cid: string | null = null
     try {
-      const r = j.source === 'call' && j.call_id ? await this.onsen.req('GET', `/v1/calls/${encodeURIComponent(j.call_id)}`)
-        : j.message_id ? await this.onsen.req('GET', `/v1/messages/${encodeURIComponent(j.message_id)}`) : null
-      const v = r?.status === 200 ? r.json?.data?.conversation_id : null
+      const r = j.source === 'say' ? (j.message_id ? await this.onsen.req('GET', `/v1/messages/${encodeURIComponent(j.message_id)}`) : null)
+        : j.call_id ? await this.onsen.req('GET', `/v1/calls/${encodeURIComponent(j.call_id)}`)
+          : await this.onsen.req('GET', `/v1/calls?caller=${encodeURIComponent(j.caller ?? '')}&recipient=${encodeURIComponent(this.cfg.agent)}&limit=1`)
+      const v = r?.status !== 200 ? null : (r.json?.data?.conversation_id ?? (Array.isArray(r.json?.items) ? r.json.items[0]?.conversation_id : null))
       if (typeof v === 'string' && v || typeof v === 'number') cid = String(v)
     } catch {}
-    const dir = join(this.cfg.root, folderOf(cid ?? j.key.replace(':', '-')))
-    c = this.state.convs[j.key] = { dir, conversation_id: cid, session_id: null, runs: existsSync(dir) ? this.runsIn(dir) : 0 }
+    const top = folderOf(cid ?? (j.source === 'say' ? `dm-${j.chat}` : `call-${j.caller}`))
+    const sub = j.source === 'say' ? 'dm' : j.thread_given ? folderOf(j.thread!) : folderOf(j.call_id ? `call-${j.call_id}` : j.id)
+    const dir = join(this.cfg.root, top, sub)
+    c = this.state.sessions[j.key] = { dir, conversation_id: cid, session_id: null, runs: existsSync(dir) ? this.runsIn(dir) : 0,
+      thread: j.thread ?? null, first_number: j.number ?? null }
     if (this.state.span && this.state.span.trigger?.kind === 'message' && this.state.span.trigger.conversation_id == null && cid) this.state.span.trigger.conversation_id = cid
     return c
   }
@@ -545,7 +573,7 @@ export class CodexRunner {
     j.exit = code; j.signal = signal; j.ended_at = this.iso()
     const meta = join(j.dir!, '.codex-runner')
     const ev = readEvents(join(meta, `run-${j.n}.jsonl`))
-    const conv = this.state.convs[j.key]
+    const conv = this.state.sessions[j.key]
     if (ev.session && conv && !conv.session_id) conv.session_id = ev.session
     let last = ''
     try { last = readFileSync(join(j.dir!, `last-${j.n}.txt`), 'utf8').trim() } catch {}
@@ -614,7 +642,7 @@ export class CodexRunner {
       if (j.source === 'call') {
         if (!j.steps.state && j.call_id) {
           const st = j.outcome === 'completed' ? 'completed' : 'failed'
-          const body = cut(j.result_text ?? '', RESULT_MAX) + (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '')
+          const body = cut(j.result_text ?? '', RESULT_MAX) + (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '') + this.threadLine(j)
           let r = await this.put(j, st, { body: { format: 'markdown', text: body }, ...(ids.length ? { attachment_file_ids: ids } : {}) })
           if (r === 'gone' && ids.length) {                   // its files refused (swept after a long outage): the words still land
             r = await this.put(j, st, { body: { format: 'markdown', text: `${body}\n\n（${ids.length} 個檔案沒能附上；在 Mac mini 的 ${j.dir}）` } })
@@ -624,7 +652,7 @@ export class CodexRunner {
           j.steps.state = true; this.save()
         }
         if (!j.steps.reply) {
-          if (j.kind === 'peer_call' && j.number != null && !j.no_reply) {
+          if (j.kind === 'peer_call' && this.replyNumber(j) != null && !j.no_reply) {
             const r = await this.reply(j, ids, fileLines)
             if (r === 'retry') return void (retry = true)
           }
@@ -683,18 +711,28 @@ export class CodexRunner {
     }
     return r
   }
-  /** the answer to a peer's Call, in its inbox (it reaches the caller's session as every Call's answer does) */
+  /** the line that names the session's thread (a Call's result, the reply): how the caller goes on in it */
+  private threadLine(j: Job): string {
+    return j.thread ? `\n\n（Codex 對話串 ${j.thread}：要它在同一段接著做，reply_to 這一則，或送的時候帶 thread=${j.thread}；不帶的是新的一段）` : ''
+  }
+  /** what the reply answers: the item's own number; a follow-up with none, the number of the Call that started its session (never new: a peer_call
+   *  without reply_to_id would be a new Call from Codex) */
+  private replyNumber(j: Job): number | null {
+    return j.number ?? this.state.sessions[j.key]?.first_number ?? null
+  }
+  /** the answer to a peer's Call or follow-up, in its inbox (it reaches the caller as every Call's answer does), carrying the session's thread */
   private async reply(j: Job, ids: string[], files: string[]): Promise<'ok' | 'retry'> {
     const list = files.length ? `\n\n附件（Onsen 的檔，用你的憑證取；Mac mini 上的路徑在後）：\n${files.map((rel, i) => `- ${basename(rel)}：${join(j.dir!, rel)}\n  ${this.cfg.base}/v1/files/${ids[i]}`).join('\n')}` : ''
-    const more = j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : ''
-    const note = '\n\n（全文在 Onsen 這一通呼叫的結果）'
+    const more = (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '') + this.threadLine(j)
+    const note = j.call_id ? '\n\n（全文在 Onsen 這一通呼叫的結果）' : `\n\n（全文在 Mac mini 的 ${join(j.dir ?? '', `last-${j.n}.txt`)}）`
     let text = (j.result_text ?? '') + list + more
     if (text.length > SEND_TEXT_MAX) text = cut(j.result_text ?? '', SEND_TEXT_MAX - list.length - more.length - note.length - 1) + note + list + more
     text = cut(text, SEND_TEXT_MAX)
     let r: Answer = null
     try {
-      r = await this.onsen.req('POST', '/send', { to: j.caller, kind: 'peer_call', payload: { text, reply_to_id: j.number }, dedupe: `codex-reply:${j.call_id ?? j.id}`,
-        ...(ids.length ? { attachment_file_ids: ids } : {}) })
+      r = await this.onsen.req('POST', '/send', { to: j.caller, kind: 'peer_call', dedupe: `codex-reply:${j.call_id ?? j.id}`,
+        payload: { text, reply_to_id: this.replyNumber(j), ...(j.thread ? { thread: j.thread, hop: (j.hop ?? 0) + 1 } : {}) },
+        ...(j.thread ? { refs: { thread: j.thread } } : {}), ...(ids.length ? { attachment_file_ids: ids } : {}) })
     } catch (e) { this.stats.last_error = String(e) }
     if (r?.status === 200) return 'ok'
     if (r && r.status >= 400 && r.status < 500 && ![401, 408, 425, 429].includes(r.status)) {

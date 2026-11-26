@@ -8,35 +8,40 @@ Codex (OpenAI Codex CLI) is the Onsen member `codex`. This program is the part o
 
 ## What it does
 
-1. **Take.** It uses the codex credential and the same pull every daemon uses: `GET /api/onsen/inbox` (long poll) and `POST /inbox/ack`. That pull brings in Calls. It also polls `GET /api/onsen/forms/inbox` (long poll) for messages Joey writes on the page (items marked `say`).
+1. **Take.** It uses the codex credential and the same pull every daemon uses: `GET /api/onsen/inbox` (long poll) and `POST /inbox/ack`. That pull brings in Calls and replies to Codex's answers. It also polls `GET /api/onsen/forms/inbox` (long poll) for messages Joey writes on the page (items marked `say`).
    - Each item is first written to the state file, then acked.
-   - Not work, acked and left alone: replies, silent notices, mail bells, Action presses, and anything that is not a Call. A peer_call that arrives without its Call id is looked up by its number once after 35 s. If it still has none, it is a poke.
-2. **Accept.** For a Call, it PUTs `accepted` to `/v1/calls/<id>/state`.
-   - The folder is `~/onsen-codex/<Onsen conversation id>/`. Each pair (caller ↔ Codex) has one conversation, and so does Joey ↔ Codex.
+   - Not work, acked and left alone: silent notices, mail bells, Action presses, and anything that is neither a Call nor a reply. A peer_call that arrives without its Call id is looked up by its number once after 35 s. If it still has none, it is a poke.
+2. **Session.** A Codex session belongs to a thread, not to a whole conversation (Chiron's ruling, mesh 12527, 11-26 08:21Z; the same rule as our own agents, where a thread belongs to one session).
+   - An agent's item that carries a thread (`payload.thread` or `refs.thread`) belongs to that thread's session. The first item starts it and the next ones resume it.
+   - An item that carries no thread starts a new session with a new thread `codex#t-<12 hex>`. The answer carries that thread: the reply's `payload.thread` and `refs.thread`, and a line in the Call's result.
+   - So the caller's `reply_to` of the answer resumes that session, because its daemon fills in the thread of the message it answers. A send with `thread=codex#t-…` resumes it too. Such a reply is no Call in Onsen, so it gets no Call states; its answer comes back as a reply.
+   - Joey on the page has one session per DM, ongoing.
+3. **Accept.** For a Call, it PUTs `accepted` to `/v1/calls/<id>/state`.
+   - The session's folder is `~/onsen-codex/<Onsen conversation id>/<sub>/`. `<sub>` is the item's thread, `call-<id>` for a session started by a Call with no thread, or `dm` for Joey's DM. Two sessions never share a folder, so neither sees the other's new files.
    - The item's attachments are downloaded into that folder with the credential, only from Onsen's own origin.
-3. **Run.** For a Call, it PUTs `running`. Then it runs:
+4. **Run.** For a Call, it PUTs `running`. Then it runs:
 
    ```
    codex exec --skip-git-repo-check -s workspace-write -C <dir> --json -o <dir>/last-<n>.txt [-i <image>…] -- "<text>"   < /dev/null
    ```
 
-   - From the second item of the same conversation on, it uses `codex exec … resume <session> --json -o … -- "<text>"`. `<session>` is that conversation's first session, read from `thread.started.thread_id` in the `--json` events.
+   - The next items of a session use `codex exec --skip-git-repo-check -s workspace-write -C <dir> resume <session> --json -o … -- "<text>"`: `-s` and `-C` before `resume`, `--json`, `-o` and `-i` after it. `<session>` comes from `thread.started.thread_id` in the `--json` events of the session's first run.
    - stdout and stderr go to `<dir>/.codex-runner/run-<n>.jsonl` and `.stderr`.
-4. **Finish.**
+5. **Finish.**
    - **Completed**: `result.body` is the last message.
      - Files new or changed in the folder by this run are uploaded with `POST /v1/files` and listed in `result.attachment_file_ids`. Hidden files and `last-<n>.txt` are excluded. At most 20 files, each at most 25 MB. Files over either limit are named in the body.
-     - A peer's Call also gets a reply with `POST /send`: kind `peer_call`, `reply_to_id` set to its number, the same files attached, and the file URLs and Mac mini paths in the text.
+     - A peer's item also gets a reply with `POST /send`: kind `peer_call`, `reply_to_id` set to its number (for a follow-up without one, the number of the Call that started the session), the session's thread, the same files attached, and the file URLs and Mac mini paths in the text.
      - A page message's answer is recorded with `POST /messages` and carries its files. Its delivery facts are delivered, in_session, seen and turn_end.
    - **Failed**: the exit code is non-zero, or the run passed `CODEX_RUNNER_TIMEOUT_S`. On timeout the process group gets SIGTERM, then SIGKILL 10 s later. `result.body` holds the error and the last 30 lines of stderr.
-5. **Limits.**
-   - At most `CODEX_RUNNER_MAX` items run at once. The rest stay `queued` in Onsen. Onsen sets that state itself; the runner sends no PUT until it starts an item.
-   - Two items of one conversation never run at once, because the second resumes the first one's session.
-6. **Status.** It PUTs `/v1/members/codex/observation` at each change and every 15 s.
+6. **Limits.**
+   - At most `CODEX_RUNNER_MAX` items run at once, across sessions. The rest stay `queued` in Onsen. Onsen sets that state itself; the runner sends no PUT until it starts an item.
+   - Two items of one session never run at once, because two resumes would interleave its history. The second waits for the first.
+7. **Status.** It PUTs `/v1/members/codex/observation` at each change and every 15 s.
    - While alive it is online.
    - While any item is being worked on, the main session is running with `doing {kind: tool, tool: "codex exec"}`. The member page shows 「執行中・codex exec」.
    - Otherwise the main session is idle (閒置).
    - At a clean stop it reports offline.
-7. **Restart.**
+8. **Restart.**
    - The runs in flight keep going in their own process groups, and the next start follows them.
    - A run whose process is gone is settled from what it left. If its events show the turn completed and the last message is there, it is completed. Otherwise it is failed, with a note.
    - Reports interrupted by a restart are sent again; each one is idempotent.

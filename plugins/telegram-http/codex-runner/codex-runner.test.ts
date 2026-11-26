@@ -1,8 +1,10 @@
 // codex-runner (WO-184 part 2): Chiron's done criteria 2–6 as far as fakes allow, against a fake Onsen (Bun.serve) and a fake codex (fake-codex.ts).
 // [2] a Call: accepted → running → completed, its attachment downloaded and handed to codex with -i, the picture codex made uploaded and on the
-//     result, the answer sent back to the caller (reply_to_id); [3] the second Call of the same conversation resumes the first one's session;
+//     result, the answer sent back to the caller (reply_to_id) carrying the new session's thread (codex#t-…);
+// [3] Chiron's ruling (mesh 12527): a session belongs to a thread: the caller's reply_to of that answer (its daemon fills in the thread) resumes it,
+//     as does a Call sent with that thread; two items of one session wait for each other;
 // [4] a failing command → failed with the stderr tail; the 30-minute limit (short here) → SIGTERM, SIGKILL, failed;
-// [5] five at once → at most three running, the rest left queued (no PUT) until a slot frees, all done; one conversation never runs two at once;
+// [5] five Calls at once with no thread (one caller, one conversation) → five sessions: three running, two left queued (no PUT) until a slot frees;
 // [6] status: idle, running 「codex exec」, idle again, offline at a clean stop (each one a valid observation);
 // Joey on the page (forms inbox say): the answer recorded in his conversation with its files, the delivery facts; restart: a run that went on is
 // followed, one that is gone is settled; what is not work is acked and left alone; the credential never goes off Onsen's origin.
@@ -74,8 +76,9 @@ class FakeOnsen {
       return c ? this.j(200, { data: { id: c.id, state: c.state, caller: c.caller, recipient: 'codex', number: c.number, conversation_id: `cv-${c.caller}` } }) : this.j(404, { error: { code: 'not_found' } })
     }
     if (m === 'GET' && p === '/v1/calls') {
-      const n = Number(u.searchParams.get('number'))
-      return this.j(200, { items: [...this.calls.values()].filter(c => c.number === n).map(c => ({ id: c.id, state: c.state })) })
+      const n = u.searchParams.get('number'), caller = u.searchParams.get('caller')
+      return this.j(200, { items: [...this.calls.values()].filter(c => (n == null || c.number === Number(n)) && (n != null || !caller || c.caller === caller))
+        .map(c => ({ id: c.id, state: c.state, conversation_id: `cv-${c.caller}` })) })
     }
     mm = /^\/v1\/calls\/([^/]+)\/state$/.exec(p)
     if (m === 'PUT' && mm) {
@@ -167,9 +170,10 @@ describe('a Call', () => {
     expect(up.name).toBe('capy.png')
     expect(up.mime).toBe('image/png')
     expect(Buffer.compare(up.bytes, PNG)).toBe(0)
-    // the folder: ~/onsen-codex/<Onsen conversation id>/, the attachment downloaded into it and handed over with -i, stdin /dev/null
+    // the folder: ~/onsen-codex/<Onsen conversation id>/call-<id>/ (a session this Call started), the attachment downloaded into it and handed
+    // over with -i, stdin /dev/null
     const [start] = codexLog().filter(x => x.ev === 'start')
-    const folder = join(cfg.root, 'cv-chiron')
+    const folder = join(cfg.root, 'cv-chiron', 'call-71')
     expect(start.dir).toBe(folder)
     expect(start.cwd).toBe(folder)
     expect(start.stdin_null).toBe(true)
@@ -188,29 +192,67 @@ describe('a Call', () => {
     expect(s.payload.text).toContain(join(folder, 'capy.png'))
     expect(s.attachment_file_ids).toEqual(fin.result.attachment_file_ids)
     expect(s.dedupe).toBe('codex-reply:71')
+    // the session's thread: on the reply (what the caller's daemon fills in when it reply_to's it) and named in the result
+    expect(s.payload.thread).toMatch(/^codex#t-[0-9a-f]{12}$/)
+    expect(s.refs).toEqual({ thread: s.payload.thread })
+    expect(s.payload.hop).toBe(1)
+    expect(fin.result.body.text).toContain(`Codex 對話串 ${s.payload.thread}`)
+    expect(s.payload.text).toContain(`thread=${s.payload.thread}`)
     await until(() => onsen.acked >= 1, 3_000, 'the ack')
     expect(onsen.unauthorized).toBe(0)
   })
 
-  test('[3] the second Call of the same conversation resumes the first one\'s session, in the same folder', async () => {
+  test('[3] a session belongs to a thread: the reply_to of its answer resumes it, a Call with its thread too; one item of a session at a time', async () => {
     const { onsen, cfg, codexLog } = setup()
-    onsen.call('81', 'chiron', 601); onsen.call('82', 'chiron', 602)
+    onsen.call('81', 'chiron', 601)
     onsen.push({ sender: 'chiron', payload: { text: '生一張圖 IMG:capy.png', msg_id: 601 }, dedupe: 'msg:601', call_id: '81' })
-    onsen.push({ sender: 'chiron', payload: { text: '把剛才那張的水改成晚上 IMG:capy.png', msg_id: 602 }, dedupe: 'msg:602', call_id: '82' })
     const r = runner(cfg)
     await r.start()
-    await until(() => done(onsen, '81')() && done(onsen, '82')(), 10_000, 'both Calls')
-    const starts = codexLog().filter(x => x.ev === 'start'), ends = codexLog().filter(x => x.ev === 'end')
-    expect(starts).toHaveLength(2)
-    const first = readEvents(join(starts[0].dir, '.codex-runner', 'run-1.jsonl')).session
+    await until(() => done(onsen, '81')() && onsen.sends.length === 1, 10_000, 'Call 81 and its reply')
+    const T = onsen.sends[0].payload.thread as string
+    const folder = join(cfg.root, 'cv-chiron', 'call-81')
+    // the caller reply_to's the answer: no Call in Onsen (it answers none of Codex's), its daemon filled in the thread
+    onsen.push({ sender: 'chiron', payload: { text: '把剛才那張的水改成晚上 IMG:capy.png', msg_id: 602, reply_to_id: 4711, thread: T, hop: 1 }, dedupe: 'msg:602' })
+    await until(() => onsen.sends.length === 2, 10_000, 'the follow-up\'s reply')
+    let starts = codexLog().filter(x => x.ev === 'start')
+    const first = readEvents(join(folder, '.codex-runner', 'run-1.jsonl')).session
     expect(first).toMatch(/^sess-/)
     expect(starts[1].resume).toBe(first)
-    expect(starts[1].argv.slice(6, 12)).toEqual(['resume', first, '--json', '-o', join(starts[0].dir, 'last-2.txt'), '--'])
-    expect(starts[1].dir).toBe(starts[0].dir)
-    expect(starts[1].at).toBeGreaterThanOrEqual(ends[0].at)                   // one conversation: never two at once
-    // capy.png changed in place by the second run: it is the second result's file too
-    expect(onsen.puts.find(p => p.call === '82' && p.state === 'completed')!.result.attachment_file_ids).toHaveLength(1)
-    expect(onsen.puts.find(p => p.call === '82' && p.state === 'completed')!.result.body.text).toContain('resumed=yes')
+    expect(starts[1].argv.slice(0, 12)).toEqual(['exec', '--skip-git-repo-check', '-s', 'workspace-write', '-C', folder, 'resume', first, '--json', '-o',
+      join(folder, 'last-2.txt'), '--'])                                       // -s / -C before resume; --json, -o after it
+    expect(starts[1].dir).toBe(folder)
+    const f = onsen.sends[1]
+    expect(f.payload.reply_to_id).toBe(602)                                    // the follow-up's own number
+    expect(f.payload.thread).toBe(T)
+    expect(f.payload.hop).toBe(2)
+    expect(f.payload.text).toContain('resumed=yes')
+    expect(f.attachment_file_ids).toHaveLength(1)                              // capy.png changed in place: this run's file too
+    expect(onsen.puts.filter(p => p.call !== '81')).toEqual([])                // no Call, no state
+    // a Call sent with the thread resumes it too; two of them at once: the second waits for the first
+    onsen.call('83', 'chiron', 603); onsen.call('84', 'chiron', 604)
+    onsen.push({ sender: 'chiron', payload: { text: 'SLEEP:0.4 again', msg_id: 603, thread: T }, refs: { thread: T }, dedupe: 'msg:603', call_id: '83' })
+    onsen.push({ sender: 'chiron', payload: { text: 'and again', msg_id: 604 }, refs: { thread: T }, dedupe: 'msg:604', call_id: '84' })
+    await until(() => done(onsen, '83')() && done(onsen, '84')(), 10_000, 'Calls 83 and 84')
+    starts = codexLog().filter(x => x.ev === 'start')
+    const ends = codexLog().filter(x => x.ev === 'end')
+    expect(starts.slice(2).map(x => x.resume)).toEqual([first, first])
+    expect(starts.slice(2).every(x => x.dir === folder)).toBe(true)
+    expect(starts[3].at).toBeGreaterThanOrEqual(ends[2].at)                   // one session: never two at once
+    expect(onsen.statesOf('83')).toEqual(['accepted', 'running', 'completed'])
+    expect(onsen.statesOf('84')).toEqual(['accepted', 'running', 'completed'])
+    expect(Object.keys(r.state.sessions)).toEqual([`t:${T}`])
+  })
+
+  test('a reply with no thread its daemon could fill in: a new session, answered with its own number', async () => {
+    const { onsen, cfg, codexLog } = setup()
+    onsen.push({ sender: 'athena', payload: { text: 'about your last answer', msg_id: 1501, reply_to_id: 4712 }, dedupe: 'msg:1501' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.sends.length === 1, 10_000, 'the reply')
+    expect(codexLog().find(x => x.ev === 'start').resume).toBeNull()
+    expect(onsen.sends[0].payload.reply_to_id).toBe(1501)
+    expect(onsen.sends[0].payload.thread).toMatch(/^codex#t-[0-9a-f]{12}$/)
+    expect(onsen.puts).toEqual([])
   })
 
   test('[4] a failing command: failed, the last lines of stderr in result.body; the caller is told', async () => {
@@ -246,10 +288,10 @@ describe('a Call', () => {
     expect(gone).toBe(true)
   })
 
-  test('[5] five at once: at most three running, the rest queued (no PUT) until a slot frees; all done', async () => {
+  test('[5] five Calls at once with no thread, one caller: five sessions, three running, the rest queued (no PUT) until a slot frees; all done', async () => {
     const { onsen, cfg, codexLog } = setup()
-    const callers = ['a1', 'a2', 'a3', 'a4', 'a5']
-    callers.forEach((c, i) => { onsen.call(`10${i}`, c, 800 + i); onsen.push({ sender: c, payload: { text: `SLEEP:0.6 job ${i}`, msg_id: 800 + i }, dedupe: `msg:${800 + i}`, call_id: `10${i}` }) })
+    const callers = ['chiron', 'chiron', 'chiron', 'chiron', 'chiron']
+    callers.forEach((c, i) => { onsen.call(`10${i}`, c, 800 + i); onsen.push({ sender: c, payload: { text: `SLEEP:0.6 avatar ${i}`, msg_id: 800 + i }, dedupe: `msg:${800 + i}`, call_id: `10${i}` }) })
     const r = runner(cfg)
     await r.start()
     await until(() => onsen.statesOf('100').includes('running') && onsen.statesOf('101').includes('running') && onsen.statesOf('102').includes('running'), 5_000, 'three running')
@@ -261,6 +303,11 @@ describe('a Call', () => {
     await until(() => callers.every((_, i) => done(onsen, `10${i}`)()), 15_000, 'all five')
     expect(Math.max(...codexLog().filter(x => x.ev === 'start').map(x => x.live))).toBe(3)
     callers.forEach((_, i) => expect(onsen.statesOf(`10${i}`)).toEqual(['accepted', 'running', 'completed']))
+    // five sessions, five folders, no resume: two sessions running at once never see each other's new files
+    const starts = codexLog().filter(x => x.ev === 'start')
+    expect(new Set(starts.map(x => x.dir)).size).toBe(5)
+    expect(starts.every(x => x.resume === null && x.dir.startsWith(join(cfg.root, 'cv-chiron', 'call-10')))).toBe(true)
+    expect(new Set(onsen.sends.map(x => x.payload.thread)).size).toBe(5)
     // at no moment were more than three Calls between accepted and their end
     const ev = onsen.puts.map(p => ({ at: p.at, d: p.state === 'accepted' ? 1 : p.state === 'running' ? 0 : -1 })).sort((a, b) => a.at - b.at || a.d - b.d)
     let open = 0, most = 0
@@ -320,8 +367,8 @@ describe('Joey on the page', () => {
     await until(() => onsen.facts.some(f => f.state === 'turn_end'), 10_000, 'turn_end')
     expect(onsen.formsAcked.has(801)).toBe(true)
     const start = codexLog().find(x => x.ev === 'start')
-    expect(start.dir).toBe(join(cfg.root, '4242'))
-    expect(start.images).toEqual([join(cfg.root, '4242', 'cat.png')])
+    expect(start.dir).toBe(join(cfg.root, '4242', 'dm'))
+    expect(start.images).toEqual([join(cfg.root, '4242', 'dm', 'cat.png')])
     expect(onsen.records).toHaveLength(1)
     const rec = onsen.records[0]
     expect(rec).toMatchObject({ agent: 'codex', client: 'telegram', chat: '1828173984', direction: 'out', sender: 'main' })
@@ -370,7 +417,9 @@ describe('restart', () => {
     expect(onsen.statesOf('301')).toEqual(['accepted', 'running', 'completed'])
     const fin = onsen.puts.at(-1)!
     expect(fin.result.attachment_file_ids).toHaveLength(1)
-    expect(onsen.sends).toHaveLength(1)
+    await until(() => onsen.sends.length >= 1, 5_000, 'the reply')            // the reply goes after the Call's state
+    await Bun.sleep(300)
+    expect(onsen.sends).toHaveLength(1)                                       // once: the stopped runner sent nothing
   })
 
   test('a run whose process is gone: completed when its events show it finished, else failed with a note', async () => {
@@ -386,34 +435,35 @@ describe('restart', () => {
     writeFileSync(join(d2, '.codex-runner', 'run-1.stderr'), 'killed somewhere\n')
     mkdirSync(cfg.stateDir, { recursive: true })
     const t = new Date(Date.now() - 5000).toISOString()
-    const job = (id: string, call: string, key: string, dir: string, n: number) => ({ id, source: 'call', key, text: 'x', attachments: [], state: 'running', received_at: t,
-      call_id: call, number: n, caller: key.slice(5), kind: 'peer_call', dir, n: 1, started_at: t, pid: dead, before: {} })
-    writeFileSync(join(cfg.stateDir, 'state.json'), JSON.stringify({ v: 1, seq: 2, jobs: [job('j1', '401', 'call:chiron', d1, 1101), job('j2', '402', 'call:athena', d2, 1102)],
-      convs: { 'call:chiron': { dir: d1, conversation_id: 'c1', session_id: null, runs: 1 }, 'call:athena': { dir: d2, conversation_id: 'c2', session_id: null, runs: 1 } },
+    const job = (id: string, call: string, thread: string, caller: string, dir: string, n: number) => ({ id, source: 'call', key: `t:${thread}`, thread, text: 'x',
+      attachments: [], state: 'running', received_at: t, call_id: call, number: n, caller, kind: 'peer_call', dir, n: 1, started_at: t, pid: dead, before: {} })
+    const sess = (dir: string, thread: string, n: number) => ({ dir, conversation_id: 'c', session_id: null, runs: 1, thread, first_number: n })
+    writeFileSync(join(cfg.stateDir, 'state.json'), JSON.stringify({ v: 1, seq: 2,
+      jobs: [job('j1', '401', 'codex#t-000000000001', 'chiron', d1, 1101), job('j2', '402', 'codex#t-000000000002', 'athena', d2, 1102)],
+      sessions: { 't:codex#t-000000000001': sess(d1, 'codex#t-000000000001', 1101), 't:codex#t-000000000002': sess(d2, 'codex#t-000000000002', 1102) },
       says: [], span: { id: 'codex-turn-1', started_at: t, trigger: { kind: 'other' } }, last_turn: null, idle_since: null, last_activity_at: t }))
     const r = runner(cfg)
     await r.start()
     await until(() => done(onsen, '401')() && done(onsen, '402')(), 10_000, 'both settled')
     expect(onsen.statesOf('401')).toEqual(['completed'])
-    expect(onsen.puts.find(p => p.call === '401')!.result.body.text).toBe('finished while the runner was down')
+    expect(onsen.puts.find(p => p.call === '401')!.result.body.text).toBe('finished while the runner was down\n\n（Codex 對話串 codex#t-000000000001：要它在同一段接著做，reply_to 這一則，或送的時候帶 thread=codex#t-000000000001；不帶的是新的一段）')
     expect(onsen.statesOf('402')).toEqual(['failed'])
     expect(onsen.puts.find(p => p.call === '402')!.result.body.text).toContain('codex-runner 重新啟動時，這一件的 codex 程序已經不在')
-    expect(r.state.convs['call:chiron']!.session_id).toBe('s-1')
+    expect(r.state.sessions['t:codex#t-000000000001']!.session_id).toBe('s-1')
     await until(() => onsen.observations.at(-1)?.sessions[0].activity === 'idle', 3_000, 'idle')
   })
 })
 
 describe('what is not work, and what is not Onsen', () => {
-  test('a mail bell, a reply, a silent notice, a poke with no Call: acked, nothing run', async () => {
+  test('a mail bell, a silent notice, a poke with no Call, a press: acked, nothing run', async () => {
     const { onsen, cfg, codexLog } = setup()
     onsen.push({ sender: 'board', kind: 'peer_mail', payload: { text: 'you have mail', msg_id: 1 }, dedupe: 'msg:1' })
-    onsen.push({ sender: 'chiron', payload: { text: 'thanks', msg_id: 2, reply_to_id: 501 }, dedupe: 'msg:2' })
     onsen.push({ sender: 'chiron', payload: { text: 'interim', msg_id: 3, urgency: 'silent' }, dedupe: 'msg:3' })
     onsen.push({ sender: 'watchdog', payload: { text: '保溫', msg_id: 4 }, dedupe: 'msg:4' })       // a peer_call with a number, no Call
     onsen.push({ sender: 'onsen', kind: 'action_control', payload: { action_id: '1' }, dedupe: 'ac:1' })
     const r = runner(cfg)
     await r.start()
-    await until(() => onsen.acked >= 5, 5_000, 'acked')
+    await until(() => onsen.acked >= 4, 5_000, 'acked')
     await until(() => r.state.jobs.every(j => j.state === 'skipped'), 3_000, 'the poke looked up')
     expect(r.state.jobs).toHaveLength(1)
     expect(codexLog()).toEqual([])
