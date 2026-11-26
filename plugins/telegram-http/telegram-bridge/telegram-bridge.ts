@@ -75,7 +75,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     sorryMs: num(env.TELEGRAM_BRIDGE_SORRY_S, 15, 0) * 1000,
     retryDelaysMs: ((env.TELEGRAM_BRIDGE_RETRY_S ?? '').trim() || '10,30,120').split(',').map(x => Number(x.trim()) * 1000).filter(n => Number.isFinite(n) && n >= 0),
     version: pluginVersion(),
-    voice: { on: onOff(env.TELEGRAM_BRIDGE_VOICE, true), cmd: (env.CHANNEL_BOT_TRANSCRIBE_CMD ?? '').trim(), whisper: (env.CHANNEL_BOT_WHISPER_BIN ?? '').trim() || 'whisper',
+    voice: { on: onOff(env.TELEGRAM_BRIDGE_VOICE, (env.CHANNEL_BOT_VOICE_TRANSCRIBE ?? '').trim() === '1'),   // as the daemon: off unless that machine turns it on (Chiron 12794)
+      cmd: (env.CHANNEL_BOT_TRANSCRIBE_CMD ?? '').trim(), whisper: (env.CHANNEL_BOT_WHISPER_BIN ?? '').trim() || 'whisper',
       model: (env.CHANNEL_BOT_WHISPER_MODEL ?? '').trim() || 'small', dir: stateDir },
   }
 }

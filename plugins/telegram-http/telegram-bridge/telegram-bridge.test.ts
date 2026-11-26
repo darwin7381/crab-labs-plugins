@@ -479,3 +479,13 @@ describe('the bridge, end to end against the fakes', () => {
     expect(readFileSync(join(macDir, 'state.json'), 'utf8').includes('SECRET')).toBe(false)
   }, T)
 })
+
+describe('voice transcription follows the daemon (Chiron 12794)', () => {
+  test('off unless CHANNEL_BOT_VOICE_TRANSCRIBE=1 or TELEGRAM_BRIDGE_VOICE=1, as the daemon', () => {
+    const base = { HOME: home, TELEGRAM_BRIDGE_MACHINE: 'macmini' }
+    expect(configFromEnv(base as any).voice!.on).toBe(false)
+    expect(configFromEnv({ ...base, CHANNEL_BOT_VOICE_TRANSCRIBE: '1' } as any).voice!.on).toBe(true)
+    expect(configFromEnv({ ...base, TELEGRAM_BRIDGE_VOICE: '1' } as any).voice!.on).toBe(true)
+    expect(configFromEnv({ ...base, CHANNEL_BOT_VOICE_TRANSCRIBE: '1', TELEGRAM_BRIDGE_VOICE: '0' } as any).voice!.on).toBe(false)
+  })
+})

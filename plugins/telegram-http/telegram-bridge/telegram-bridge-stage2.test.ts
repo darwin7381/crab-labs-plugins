@@ -171,7 +171,7 @@ describe('stage two', () => {
     tg.push(TOK, { message: { message_id: 807, from, chat: dm, date: now, caption: '聽這段', voice: { file_id: 'VO2', file_unique_id: 'v2', duration: 2, mime_type: 'audio/ogg', file_size: 3 } } })
     await until(() => ['801', '802', '803', '804', '805', '806', '807'].every(id => onsen.messages.some(x => x.client_msg_id === id)), 8000, 'all six written')
     const w = (id: string) => onsen.messages.find(x => x.client_msg_id === id)
-    expect(w('801').client_meta).toEqual({ reply_to_user_id: '555', attachment_origin: 'reply' })
+    expect(w('801').client_meta).toEqual({ reply_to_user_id: '555', reply_to_user: 'ann', attachment_origin: 'reply' })   // reply_to_user: Chiron 12794
     expect(w('801')).toMatchObject({ kind: 'text', text: 'see this', reply_to_client_msg_id: '700', reply_to_user: 'ann', reply_to_text: 'the pdf',
       attachments: [{ kind: 'document', name: 'a.pdf', mime: 'application/pdf', bytes: 3, client_ref: 'DOC7' }] })
     expect(w('801').attachment_file_ids.length).toBe(1)                                         // the replied-to file, stored in Onsen

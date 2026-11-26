@@ -84,6 +84,9 @@ export function clientMetaOf(m: any, o: { fromReply?: boolean; transcript?: stri
   const out: Record<string, string> = {}
   const rt = m?.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
   if (rt?.from) out.reply_to_user_id = String(rt.from.id)                          // server.ts replyForwardMeta (1.58.24 :3937)
+  // the tag's reply_to_user (the Telegram name); the standard field carries the same, but the person_message's reply_to.from is the member
+  // name when Onsen has the replied-to message, so the connector lets this key win (Chiron 12794, WO-197 check 3)
+  if (rt) { const ru = rt.from ? displayName(rt.from) : rt.sender_chat ? (safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)) : null; if (ru) out.reply_to_user = ru }
   if (rt && o.fromReply) out.attachment_origin = 'reply'                             // :3947
   const fo = m?.forward_origin
   if (fo) {
