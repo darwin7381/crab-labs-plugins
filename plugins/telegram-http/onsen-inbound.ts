@@ -16,6 +16,12 @@
 //            finishInbound), so it is the tag of the switch off. Lost (a deleted state dir): built from the payload (server.ts factsFromPayload).
 //   once     the store remembers what it delivered (chat:message_id and pm:<Onsen id>, 5000 kept): a person_message handed over twice (the inbox's
 //            retry after a slow answer) is delivered once.
+//   back     A.1 (Chiron 11:35Z): written into Onsen and not back from the inbox within BACK_MS (20 s; the agent-inbox daemon down or not pulling):
+//            this daemon delivers it once itself from the facts it kept (server.ts inboundBack); the person_message that comes back later is a
+//            duplicate (not delivered again). After a restart, every message whose facts are still kept and that is not waiting to be written is
+//            looked at 20 s after the start the same way.
+//   edits    point 8: an edit of a message still waiting to be written goes into the same queue behind it (InboundWriter.after: POST /events once the
+//            message is written), so Onsen ends with the new text.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
 import type { OnsenItem } from './onsen-client.ts'
@@ -29,6 +35,8 @@ export const RETRY_MS = [1_000, 3_000, 10_000]
 export const HELD_MS = 15_000
 export const LATER_MS = 30_000
 export const TRY_MS = 5_000
+/** A.1: written into Onsen and not back from the inbox this long after: delivered here from the facts kept (server.ts inboundBack) */
+export const BACK_MS = 20_000
 export const ITEM_KINDS = ['person_message', 'person_edit']
 /** the one system message the person gets when their message is not in Onsen 15 s after it came */
 export const heldText = (agent: string): string => `Onsen 現在連不上，這一則還沒交給 ${agent}；連上會自動補交，不用重傳。`
@@ -66,6 +74,10 @@ export type Facts = {
 }
 export type InItem = OnsenItem & { deliver: true }
 export type Job = { key: string; item: InItem; at: number; tries: number; held: boolean; topic?: number }
+/** point 8: an edit event (POST /events) of the message `of`, written after that message (it waits behind it in the same queue) */
+export type EventJob = { key: string; of: string; event: Record<string, unknown>; at: number; tries: number; held: true }
+type AnyJob = Job | EventJob
+const isEvent = (j: AnyJob): j is EventJob => 'event' in j
 
 function atomicWrite(file: string, v: unknown): void {
   mkdirSync(dirname(file), { recursive: true })
@@ -81,7 +93,7 @@ export const DONE_MAX = 5000
 export class InboundStore {
   private parked = new Map<string, { facts: Facts; at: number }>()
   private done = new Map<string, number>()
-  readonly stats = { parked: 0, taken: 0, rebuilt: 0, duplicates: 0, save_errors: 0 }
+  readonly stats = { parked: 0, taken: 0, rebuilt: 0, duplicates: 0, here: 0, save_errors: 0 }
   constructor(private o: { file: string; log: Log; now?: () => number }) {
     try {
       const j = JSON.parse(readFileSync(o.file, 'utf8'))
@@ -111,6 +123,8 @@ export class InboundStore {
     this.prune(); this.save()
   }
   isDone(key: string): boolean { return this.done.has(key) }
+  /** the keys whose facts are kept (not delivered yet) */
+  waiting(): string[] { return [...this.parked.keys()] }
   /** the message went into Onsen to be delivered from there (an edit of it comes back as a person_edit) */
   viaOnsen(key: string): boolean { return this.parked.has(key) || this.done.has(key) }
   health(): Record<string, unknown> { return { ...this.stats, waiting: this.parked.size, remembered: this.done.size } }
@@ -118,10 +132,10 @@ export class InboundStore {
 
 // ------------------------------------------------------------------ A: written into Onsen, in arrival order
 export class InboundWriter {
-  private q: Job[] = []
+  private q: AnyJob[] = []
   private running = false
   private wake: (() => void) | null = null
-  readonly stats = { written: 0, duplicates: 0, retries: 0, held: 0, refused: 0, late: 0, last_error: null as string | null }
+  readonly stats = { written: 0, duplicates: 0, retries: 0, held: 0, refused: 0, late: 0, edits_after: 0, last_error: null as string | null }
   constructor(private o: { file: string; request: Request; log: Log
     /** A took it (or had it: duplicate); id = the Onsen message id */
     written: (job: Job, id: number, duplicate: boolean, late: boolean) => void
@@ -132,25 +146,33 @@ export class InboundWriter {
     retryMs?: number[]; heldMs?: number; laterMs?: number; tryMs?: number; now?: () => number }) {
     try {
       const j = JSON.parse(readFileSync(o.file, 'utf8'))
-      if (Array.isArray(j.jobs)) this.q = j.jobs.filter((x: any) => x && typeof x.key === 'string' && x.item)
+      if (Array.isArray(j.jobs)) this.q = j.jobs.filter((x: any) => x && typeof x.key === 'string' && (x.item || x.event))
     } catch {}
     if (this.q.length) { o.log('info', `onsen inbound: ${this.q.length} message(s) not yet written into Onsen before the last stop: writing them first`); this.kick() }
   }
   private now(): number { return this.o.now ? this.o.now() : Date.now() }
   private save(): void { try { atomicWrite(this.o.file, { v: 1, jobs: this.q }) } catch (e) { this.o.log('warn', `onsen inbound: ${this.o.file} not written (${errText(e)})`) } }
   get size(): number { return this.q.length }
-  pending(key: string): Job | undefined { return this.q.find(j => j.key === key) }
+  pending(key: string): Job | undefined { return this.q.find((j): j is Job => !isEvent(j) && j.key === key) }
   /** an edit of a message still waiting: it is written with the new text (saved) */
   rewrite(key: string, body: string): boolean { const j = this.pending(key); if (!j) return false; j.item = { ...j.item, body }; this.save(); return true }
   enqueue(job: Job): void { this.q.push(job); this.save(); this.kick() }
+  /** point 8: the edit event of a message still waiting goes into the queue behind it (written after the message: Onsen ends with the new text);
+   *  false = the message is not waiting here (the caller records the event the usual way) */
+  after(of: string, event: Record<string, unknown>): boolean {
+    if (!this.pending(of)) return false
+    this.q.push({ key: `${of}:event:${String(event.idem_key ?? this.q.length)}`, of, event, at: this.now(), tries: 0, held: true })
+    this.save(); this.kick()
+    return true
+  }
   private kick(): void { if (this.running) { this.wake?.(); return } this.running = true; void this.loop().finally(() => { this.running = false; if (this.q.length) this.kick() }) }
   /** one try of A: ok (id, duplicate), refused (4xx, no credential: never tried again), or not now (Onsen not answering, 5xx, 408, 429) */
-  private async tryOnce(job: Job): Promise<{ ok: true; id: number; duplicate: boolean } | { ok: false; refused: boolean; why: string }> {
+  private async tryOnce(job: AnyJob): Promise<{ ok: true; id: number; duplicate: boolean } | { ok: false; refused: boolean; why: string }> {
     try {
-      const r = await this.o.request('POST', '/messages', job.item, this.o.tryMs ?? TRY_MS)
+      const r = await this.o.request('POST', isEvent(job) ? '/events' : '/messages', isEvent(job) ? job.event : job.item, this.o.tryMs ?? TRY_MS)
       if (!r) return { ok: false, refused: true, why: 'no mesh credential' }
       const id = Number(r.json?.id)
-      if (r.status >= 200 && r.status < 300 && Number.isFinite(id)) return { ok: true, id, duplicate: r.json?.duplicate === true }
+      if (r.status >= 200 && r.status < 300 && (Number.isFinite(id) || isEvent(job))) return { ok: true, id, duplicate: r.json?.duplicate === true }
       const why = `HTTP ${r.status}${r.json?.detail ? ` ${String(r.json.detail).slice(0, 120)}` : ''}`
       return { ok: false, refused: r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429, why }
     } catch (e) { return { ok: false, refused: false, why: errText(e) } }
@@ -160,7 +182,7 @@ export class InboundWriter {
     const heldMs = this.o.heldMs ?? HELD_MS
     let changed = false
     for (const j of this.q) {
-      if (j.held || this.now() - j.at < heldMs) continue
+      if (isEvent(j) || j.held || this.now() - j.at < heldMs) continue
       j.held = true; changed = true; this.stats.held++
       this.o.log('warn', `onsen inbound: ${j.key} not written into Onsen ${Math.round((this.now() - j.at) / 1000)} s after it came (${this.stats.last_error ?? '?'}): the person is told; trying again until it is`)
       try { this.o.held(j) } catch (e) { this.o.log('warn', `onsen inbound: telling the person about ${j.key} failed: ${errText(e)}`) }
@@ -177,6 +199,7 @@ export class InboundWriter {
       const r = await this.tryOnce(job)
       if (r.ok) {
         this.q.shift(); this.save()
+        if (isEvent(job)) { this.stats.edits_after++; this.o.log('info', `onsen inbound: the edit of ${job.of} made while it waited to be written is in Onsen now, after the message`); continue }
         if (r.duplicate) this.stats.duplicates++; else this.stats.written++
         if (job.held) this.stats.late++
         this.o.log('info', `onsen inbound: ${job.key} written to Onsen (message ${r.id}${r.duplicate ? ', already there' : ''}${job.tries ? `, after ${job.tries} retr${job.tries === 1 ? 'y' : 'ies'}` : ''})`)
@@ -185,7 +208,9 @@ export class InboundWriter {
       }
       this.stats.last_error = r.why
       if (r.refused) {
-        this.q.shift(); this.save(); this.stats.refused++
+        this.q.shift(); this.save()
+        if (isEvent(job)) { this.o.log('warn', `onsen inbound: the edit of ${job.of} not taken by Onsen (${r.why}): dropped`); continue }
+        this.stats.refused++
         this.o.log('warn', `onsen inbound: ${job.key} not taken by Onsen (${r.why}): delivered here the way it was before`)
         try { this.o.refused(job, r.why) } catch (e) { this.o.log('warn', `onsen inbound: delivering ${job.key} here failed: ${errText(e)}`) }
         continue

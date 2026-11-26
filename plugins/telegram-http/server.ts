@@ -512,8 +512,9 @@ async function onsenInboundNow(): Promise<boolean> {
 const inboundStore: OnsenInbound.InboundStore | null = onsen && !INBOX_ONLY ? new OnsenInbound.InboundStore({ file: join(STATE_DIR, 'onsen', 'inbound-store.json'), log }) : null
 /** WO-194: the edited Telegram messages whose edit comes back from Onsen as a person_edit (chat:message_id → the edited message; 200 kept) */
 const inboundEdits = new Map<string, any>()
-/** WO-194: edits made while their message waited to be written into Onsen (chat:message_id:edit_date): already in what is delivered */
-const absorbedEdits = new Set<string>()
+/** WO-194: edits not to be delivered again when their person_edit comes (chat:message_id:edit_date → why): made while their message waited to be
+ *  written into Onsen (already in what is delivered), or delivered here because they were not back from the inbox in 20 s (A.1) */
+const absorbedEdits = new Map<string, 'absorbed' | 'here'>()
 /** WO-194 A: each message written into Onsen in arrival order; 👀 once written; 15 s not written: the person is told once; refused: delivered here */
 const inboundWriter: OnsenInbound.InboundWriter | null = onsen && !INBOX_ONLY ? new OnsenInbound.InboundWriter({
   file: join(STATE_DIR, 'onsen', 'inbound-queue.json'), request: (m, p, b, t) => onsen!.request(m, p, b, t), log,
@@ -540,6 +541,7 @@ function inboundWritten(job: OnsenInbound.Job, onsenId: number, late: boolean): 
   // from the job itself: its facts may be gone already (A timed out here but Onsen had it, and it came back before the retry's duplicate)
   inboundAck(String(job.item.chat), Number(job.item.client_msg_id))
   if (late) log('info', `onsen inbound: ${job.key} is in Onsen now (it was held); it is delivered when it comes back`)
+  inboundBackLater(job.key, onsenId)
   const att = job.item.attachments?.[0]
   if (att?.file_id && onsenFilesOn()) {
     void (async () => {
@@ -550,6 +552,52 @@ function inboundWritten(job: OnsenInbound.Job, onsenId: number, late: boolean): 
       if (!r || r.status >= 300) log('warn', `onsen inbound: file ${ids[0]} not hung on message ${onsenId} (${r ? `HTTP ${r.status}` : 'no credential'})`)
     })().catch(e => log('warn', `onsen inbound: file of ${job.key}: ${e instanceof Error ? e.message : e}`))
   }
+}
+/** WO-194 A.1 (Chiron 11:35Z): a message written into Onsen and not back from the inbox BACK_MS (20 s) after (its agent-inbox daemon down or not
+ *  pulling): delivered here once from the facts it kept (finishInbound, the tag of the path before); the store remembers it, so the person_message
+ *  that comes back later is a duplicate. One log line each. ONSEN_INBOUND_BACK_MS: tests only */
+const INBOUND_BACK_MS = Number(process.env.ONSEN_INBOUND_BACK_MS) || OnsenInbound.BACK_MS
+const INBOUND_BACK_TRIES = 10
+/** the keys A.1 delivered here (for the log line of the late person_message) */
+const deliveredHere = new Set<string>()
+function inboundBackLater(key: string, onsenId: number | null, tries = 0): void {
+  const t = setTimeout(() => { void inboundBack(key, onsenId, tries) }, INBOUND_BACK_MS); (t as any).unref?.()
+}
+async function inboundBack(key: string, onsenId: number | null, tries: number): Promise<void> {
+  if (!inboundStore || inboundStore.isDone(key)) return
+  if (personBusy.has(key)) { inboundBackLater(key, onsenId, tries); return }     // coming back from the inbox right now: looked at again later
+  const f = inboundStore.get(key)
+  if (!f) return
+  personBusy.add(key)
+  try {
+    log('warn', `onsen inbound: ${key} not back from the inbox ${Math.round(INBOUND_BACK_MS / 1000)} s after it was written into Onsen${onsenId != null ? ` (message ${onsenId})` : ''}: delivered here from the facts it kept`)
+    await finishInbound(f, 'local')
+    inboundStore.finish([key, ...(onsenId != null ? [`pm:${onsenId}`] : [])])
+    inboundStore.stats.here++
+    deliveredHere.add(key)
+    if (deliveredHere.size > 200) deliveredHere.delete(deliveredHere.values().next().value!)
+  } catch (e) {
+    log('error', `onsen inbound: delivering ${key} here (not back from the inbox) failed: ${e instanceof Error ? e.message : e}${tries + 1 < INBOUND_BACK_TRIES ? '; trying again' : ''}`)
+    if (tries + 1 < INBOUND_BACK_TRIES) inboundBackLater(key, onsenId, tries + 1)
+  } finally { personBusy.delete(key) }
+}
+/** A.1 for an edit (the same rule): an edit recorded to come back as a person_edit and not back BACK_MS after it was made is delivered here once */
+function editBackLater(ek: string): void {
+  const t = setTimeout(() => {
+    const m = inboundEdits.get(ek)
+    if (!m) return                                                               // came back (person_edit), or pushed out
+    inboundEdits.delete(ek)
+    absorbedEdits.set(ek, 'here')
+    if (absorbedEdits.size > 200) absorbedEdits.delete(absorbedEdits.keys().next().value!)
+    log('warn', `onsen inbound: edit of tg:${m.message_id} not back from the inbox ${Math.round(INBOUND_BACK_MS / 1000)} s after it was made: delivered here`)
+    void deliverEditedMessage(m).catch(err => log('warn', `onsen inbound: delivering the edit of tg:${m.message_id} here failed: ${err instanceof Error ? err.message : err}`))
+  }, INBOUND_BACK_MS); (t as any).unref?.()
+}
+// A.1 after a restart: what was written before it and has not come back is looked at 20 s after the start (not what still waits to be written)
+if (inboundStore && inboundWriter) {
+  const left = inboundStore.waiting().filter(k => !inboundWriter!.pending(k))
+  if (left.length) log('info', `onsen inbound: ${left.length} message(s) written into Onsen before the last stop and not back yet: delivered here in ${Math.round(INBOUND_BACK_MS / 1000)} s unless they come back first`)
+  for (const k of left) inboundBackLater(k, null)
 }
 /** the arrival's 👀 (access.json ackReaction) on one message; ✍ never lands under it (WO-145) */
 function inboundAck(chat: string, msgId: number): void {
@@ -2059,7 +2107,8 @@ const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
 const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
-  deliver: it => deliverPulled(it), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
+  deliver: (it, again) => deliverPulled(it, again), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
+  ...(Number(process.env.ONSEN_PERSON_RETRY_MS) > 0 ? { laterMs: Number(process.env.ONSEN_PERSON_RETRY_MS) } : {}),   // WO-194 A.2: tests only
   ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
   ...(process.env.ONSEN_PULL_BACKOFF_MS ? { minBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS), maxBackoffMs: Number(process.env.ONSEN_PULL_BACKOFF_MS) * 4 } : {}) }) : null
 const onsenSender: OnsenSender | null = ONSEN_SEND_ON && onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
@@ -3249,21 +3298,25 @@ bot.on('edited_message', ctx => {
   try {
     const a = loadAccess(), chat = String(m.chat?.id ?? '')
     ok = m.chat?.type === 'private' ? a.allowFrom.includes(String(m.from.id)) : !!a.groups?.[chat] && (a.groups[chat]!.allowFrom.length === 0 || a.groups[chat]!.allowFrom.includes(String(m.from.id)))
+    let behind = false
     if (ok && !m.from.is_bot && inboundWriter?.pending(key)) {
       const text = editedText(m)
       inboundWriter.rewrite(key, text)
       inboundStore?.update(key, f => { f.text = text; if (f.caption != null) f.caption = text })
-      absorbedEdits.add(`${key}:${m.edit_date ?? ''}`)
-      if (absorbedEdits.size > 200) absorbedEdits.delete(absorbedEdits.values().next().value!)
+      absorbedEdits.set(`${key}:${m.edit_date ?? ''}`, 'absorbed')
+      if (absorbedEdits.size > 200) absorbedEdits.delete(absorbedEdits.keys().next().value!)
+      // point 8 (Chiron 11:35Z): its edit event goes into the same queue behind it, so it reaches Onsen after the message (Onsen ends with the new text)
+      behind = inboundWriter.after(key, Onsen.inboundEdit(ONSEN_AGENT, m))
       log('info', `onsen inbound: edit of tg:${m.message_id} while it waits to be written into Onsen: it is written and delivered with the new text`)
     }
-    if (ok) onsen.recordEvent(Onsen.inboundEdit(ONSEN_AGENT, m))
+    if (ok && !behind) onsen.recordEvent(Onsen.inboundEdit(ONSEN_AGENT, m))
   } catch {}
   if (absorbedEdits.has(`${key}:${m.edit_date ?? ''}`)) return
   if (ok && onsen.cfg.record && !m.from.is_bot && inboundStore?.viaOnsen(key)) {
     inboundEdits.set(`${key}:${m.edit_date ?? ''}`, m)
     if (inboundEdits.size > 200) inboundEdits.delete(inboundEdits.keys().next().value!)
-    log('info', `onsen inbound: edit of tg:${m.message_id}: recorded; it reaches the agent when Onsen gives it back (person_edit)`)
+    editBackLater(`${key}:${m.edit_date ?? ''}`)
+    log('info', `onsen inbound: edit of tg:${m.message_id}: recorded; it reaches the agent when Onsen gives it back (person_edit), else here in ${Math.round(INBOUND_BACK_MS / 1000)} s`)
     return
   }
   if (ok && onsen.cfg.record && !m.from.is_bot) void deliverEditedMessage(m).catch(err => log('warn', `onsen: delivering the edit of tg:${m.message_id} failed: ${err instanceof Error ? err.message : err}`))
@@ -5480,24 +5533,36 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
   }
   const edit = it.kind === 'person_edit'
   const key = `${chat}:${ref}`, own = String(it.dedupe || (edit ? `pe:${p.message_id}:${p.edited_at}` : `pm:${p.message_id}`))
-  if (inboundStore.isDone(own) || (!edit && inboundStore.isDone(key))) { inboundStore.stats.duplicates++; return { code: 200, json: { duplicate: true } } }
-  if (personBusy.has(own)) return { code: 409, json: { busy: true } }
-  personBusy.add(own)
+  const shown = p.via === 'web' ? ref : `tg:${ref}`
+  if (inboundStore.isDone(own) || (!edit && inboundStore.isDone(key))) {
+    inboundStore.stats.duplicates++
+    log('info', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} (${shown}) came back from the inbox ${!edit && deliveredHere.has(key) ? 'after it was delivered here (not back in time, A.1)' : 'already delivered'}: not delivered again`)
+    return { code: 200, json: { duplicate: true } }
+  }
+  // busy: the same item, or (A.1) the same message being delivered here because it was not back in time
+  if (personBusy.has(own) || (!edit && personBusy.has(key))) return { code: 409, json: { busy: true } }
+  const busy = edit ? [own] : [own, key]
+  for (const b of busy) personBusy.add(b)
   try {
-    const shown = p.via === 'web' ? ref : `tg:${ref}`
     if (edit) {
       log('info', `onsen inbound: person_edit of ${shown} received from the inbox`)
       const at = Math.floor(Date.parse(String(p.edited_at ?? '')) / 1000)
-      if (absorbedEdits.delete(`${key}:${Number.isFinite(at) ? at : ''}`)) {
+      const ek = `${key}:${Number.isFinite(at) ? at : ''}`
+      const why = absorbedEdits.get(ek)
+      if (why) {
+        absorbedEdits.delete(ek)
         inboundStore.finish([own])
-        log('info', `onsen inbound: person_edit of ${shown}: made before the message was in Onsen, already in what was delivered`)
+        log('info', why === 'here' ? `onsen inbound: person_edit of ${shown}: delivered here already (not back in time, A.1): not delivered again`
+          : `onsen inbound: person_edit of ${shown}: made before the message was in Onsen, already in what was delivered`)
         return { code: 200, json: { delivered: true, absorbed: true } }
       }
-      const m = inboundEdits.get(`${key}:${Number.isFinite(at) ? at : ''}`) ?? { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
+      // taken out before it is delivered, so A.1's timer for the same edit finds nothing (never twice); put back when the delivery throws
+      const kept = inboundEdits.get(ek)
+      inboundEdits.delete(ek)
+      const m = kept ?? { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
         from: { id: Number(c.user_id) || 0, is_bot: false, ...(c.user ? { username: String(c.user) } : {}) }, text: String(p.text ?? ''), ...(Number.isFinite(at) ? { edit_date: at } : {}),
         ...(c.thread != null ? { is_topic_message: true, message_thread_id: Number(c.thread) } : {}) }
-      if (/^\d+$/.test(ref)) await deliverEditedMessage(m)
-      inboundEdits.delete(`${key}:${Number.isFinite(at) ? at : ''}`)
+      try { if (/^\d+$/.test(ref)) await deliverEditedMessage(m) } catch (e) { if (kept) inboundEdits.set(ek, kept); throw e }
       inboundStore.finish([own])
       log('info', `onsen inbound: person_edit of ${shown} handed on`)
       return { code: 200, json: { delivered: true } }
@@ -5505,7 +5570,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
     log('info', `onsen inbound: person_message ${p.message_id} (${shown}) received from the inbox`)
     if (p.via === 'web') {
       const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
-        ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}) }
+        ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}), }
       await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main')
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
@@ -5522,7 +5587,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
     inboundStore.finish([key, own])
     log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
     return { code: 200, json: { delivered: true } }
-  } finally { personBusy.delete(own) }
+  } finally { for (const b of busy) personBusy.delete(b) }
 }
 /** WO-194: a Telegram message's facts from its person_message alone (the arrival's were not kept): the restoration table of the ticket. What Onsen does
  *  not carry is missing (reply_to_user_id, forward_origin and forward_from_id, attachment_origin, a voice note's caption) and the sender's name is
@@ -5747,11 +5812,11 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  WO-158: an item Onsen 0.9.4 marks `unverified: true` (only a relay can: a name it passes on without vouching for it, e.g. a BTCC console release) gets
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
-async function deliverPulled(it: PullItem): Promise<HandResult> {
+async function deliverPulled(it: PullItem, again = false): Promise<HandResult> {
   // WO-176: Onsen's control item (a press in Onsen, no text) is for this agent's Telegram daemon, never for a session: no comms row, no router, no wake row
   if (it.kind === Onsen.ACTION_CONTROL_KIND) return controlPulled(it)
   // WO-194: a person's message Onsen gives this agent to deliver (person_message / person_edit) is its Telegram daemon's to deliver, never a peer message
-  if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it)
+  if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it, again)
   // the sender's facts in Onsen's own fields (0.9.3) count as much as the payload's: an item whose no_reply is only a top-level fact is still a
   // no-reply answer to the router (Chiron WO-158 11:56Z: a no_reply peer_call sent that way opened a lane)
   const p = { ...((it.payload ?? {}) as InboundBody), ...((it as { no_reply?: unknown }).no_reply === true ? { no_reply: true } : {}),
@@ -5777,15 +5842,15 @@ async function deliverPulled(it: PullItem): Promise<HandResult> {
 }
 /** WO-194: a person_message / person_edit item (onsen_person.py: a person's message, from Telegram or Onsen's page, given to this agent to deliver). Handed
  *  to this agent's Telegram daemon (POST /onsen/person on LANES_TG_PORT, the loopback token), which builds its <channel> tag and routes it, and answers
- *  once it is delivered; never handed to a session from here, whatever ONSEN_INBOUND says. Not taken: tried again 1 s and 3 s later, then it stays
- *  pending (thrown: the pull backs off, 2 s doubling to 60 s, and hands it on again; what is behind it waits): never acked undelivered */
+ *  once it is delivered; never handed to a session from here, whatever ONSEN_INBOUND says. Not taken: tried again 1 s and 3 s later, then `later`
+ *  (A.2, Chiron 11:35Z): it stays pending in its place (never acked undelivered) and is tried again (once) every 30 s, while the items behind it go on */
 const PERSON_FORWARD_GAPS_MS = (process.env.ONSEN_PERSON_FORWARD_GAPS_MS ?? '1000,3000').split(',').map(x => Number(x.trim())).filter(n => Number.isFinite(n) && n >= 0)
-async function personPulled(it: PullItem): Promise<HandResult> {
+async function personPulled(it: PullItem, again = false): Promise<HandResult> {
   const key = itemKey(it)
   if (key && onsenInbox?.seen(key)) return 'duplicate'
   const port = Number(process.env.LANES_TG_PORT ?? 0)
   let why = port ? '' : 'LANES_TG_PORT is not set (no Telegram daemon to hand it to)'
-  for (let i = 0; port && i <= PERSON_FORWARD_GAPS_MS.length; i++) {
+  for (let i = 0; port && i <= (again ? 0 : PERSON_FORWARD_GAPS_MS.length); i++) {
     if (i) await new Promise(r => setTimeout(r, PERSON_FORWARD_GAPS_MS[i - 1]))
     let tok = ''
     try { tok = readFileSync(join(process.env.MCP_TOKEN_DIR ?? join(homedir(), '.claude', 'agent-inbox', 'mcp-tokens'), String(port)), 'utf8').trim() } catch {}
@@ -5802,7 +5867,7 @@ async function personPulled(it: PullItem): Promise<HandResult> {
     } catch (e) { why = String(e instanceof Error ? e.message : e).slice(0, 120) }
   }
   log('warn', `onsen inbox: item ${it.seq} (${it.kind}) not taken by the Telegram daemon (${why}): kept, handed on again`)
-  throw new Error(`${it.kind} ${it.seq}: the Telegram daemon did not take it (${why})`)
+  return 'later'
 }
 /** WO-176: an action_control item (sender onsen: a person pressed an option of one of this agent's Actions in Onsen). Handed to this agent's Telegram
  *  daemon (POST /onsen/action on LANES_TG_PORT, the loopback token), which presses it. Not taken: the item stays pending and is tried again

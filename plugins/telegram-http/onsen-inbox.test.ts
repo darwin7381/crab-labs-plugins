@@ -230,6 +230,74 @@ describe('the pull', () => {
   })
 })
 
+describe('an item answered later (WO-194 A.2, Chiron 11:35Z)', () => {
+  test('a person_message its Telegram daemon does not take stays in its place (not acked) and is tried again every 30 s; the items behind it go on', async () => {
+    const on = standIn(), got: string[] = [], logs: string[] = [], tries: Array<{ text: string; again: boolean; at: number }> = []
+    let clock = 1_000_000, tgUp = false
+    const b = new OnsenInbox({ file: join(dir(), 'i.json'), now: () => clock })
+    b.baseline(0)
+    const p = new OnsenPuller({ req: on.req, base: 'test', inbox: b, log: (_l, m) => logs.push(m), host: 'h', waitS: 25, minBackoffMs: 5, maxBackoffMs: 20, now: () => clock,
+      deliver: async (it, again) => {
+        const text = String(it.payload.text)
+        if (text.startsWith('person')) { tries.push({ text, again: !!again, at: clock }); if (!tgUp) return 'later' }
+        const k = itemKey(it); if (k && !b.claim(k)) return 'duplicate'
+        got.push(text); if (k) b.record(k); return 'delivered'
+      } })
+    on.put('person 1', 'pm:1'); on.put('call 2', 'c2'); on.put('person 3', 'pm:3'); on.put('call 4', 'c4')
+    await p.once()
+    // the two calls behind are delivered at once; both person items are kept, in their place; nothing is acked past the first kept one
+    expect(got).toEqual(['call 2', 'call 4'])
+    expect(b.pending.map(i => i.seq)).toEqual([1, 3])
+    expect(on.acked).toBe(0)
+    expect(p.health()).toMatchObject({ held: 2, holding: 2, pending: 2 })
+    expect(logs.filter(l => /not taken: kept in its place \(not acked\), tried again every 30 s/.test(l)).length).toBe(2)
+    // the long poll waits no longer than the first one's retry (25 s asked, 30 s left: 25; then 5)
+    clock += 10_000
+    await p.once()
+    expect(tries.length).toBe(2)                          // 10 s later: not tried again
+    on.put('call 5', 'c5')
+    await p.once()
+    expect(got).toEqual(['call 2', 'call 4', 'call 5'])   // a new item behind them still goes on
+    expect(on.acked).toBe(0)
+    clock += 20_000                                       // 30 s after: tried again (once each, marked as a retry), still not taken
+    await p.once()
+    expect(tries.map(t => [t.text, t.again])).toEqual([['person 1', false], ['person 3', false], ['person 1', true], ['person 3', true]])
+    expect(logs.filter(l => /not taken: kept/.test(l)).length).toBe(2)   // logged once each
+    tgUp = true
+    clock += 30_000
+    await p.once()
+    expect(got).toEqual(['call 2', 'call 4', 'call 5', 'person 1', 'person 3'])
+    expect(b.pending.length).toBe(0)
+    expect(on.acked).toBe(5)                              // now everything is acked
+    expect(p.health()).toMatchObject({ held: 2, held_then_delivered: 2, holding: 0 })
+    expect(logs.some(l => /item 1 \(call\) handed on after it was kept \(delivered\)/.test(l))).toBe(true)
+  })
+  test('a restart tries a kept item at once; the long poll wait is cut to the kept item\'s retry', async () => {
+    const on = standIn(), asked: string[] = []
+    let clock = 5_000_000
+    const req: Req = async (m, path, body, t) => { if (m === 'GET') asked.push(path); return on.req(m, path, body, t) }
+    const f = join(dir(), 'i.json')
+    const b = new OnsenInbox({ file: f, now: () => clock }); b.baseline(0)
+    on.put('person 1', 'pm:1')
+    const p = new OnsenPuller({ req, base: 'test', inbox: b, log: quiet, host: 'h', waitS: 25, minBackoffMs: 5, maxBackoffMs: 20, now: () => clock, laterMs: 7_000,
+      deliver: async () => 'later' })
+    await p.once()
+    expect(asked.at(-1)).toContain('wait=25')             // nothing kept yet: the usual wait; the item taken is kept, due in 7 s
+    await p.once()
+    expect(asked.at(-1)).toContain('wait=7')
+    clock += 5_000
+    await p.once()
+    expect(asked.at(-1)).toContain('wait=2')
+    const b2 = new OnsenInbox({ file: f, now: () => clock })
+    expect(b2.pending.map(i => i.seq)).toEqual([1])        // on disk, still pending
+    let tried = 0
+    const p2 = new OnsenPuller({ req: on.req, base: 'test', inbox: b2, log: quiet, host: 'h', waitS: 0, minBackoffMs: 5, maxBackoffMs: 20, now: () => clock,
+      deliver: async () => { tried++; return 'delivered' } })
+    await p2.once()
+    expect([tried, b2.pending.length, on.acked]).toEqual([1, 0, 1])
+  })
+})
+
 describe('the sender', () => {
   test('stored / duplicate / pulling from Onsen\'s answer; a failure never throws and says why', async () => {
     const sent: any[] = []

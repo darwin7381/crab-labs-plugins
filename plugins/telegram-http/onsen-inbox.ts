@@ -14,6 +14,10 @@
 //               bounded list of the dedupe keys already delivered (5000, oldest dropped first, each with its time).
 //   dedupe      one key per message in both paths (dedupeKeyOf): the sender's explicit `dedupe`, else `msg:<msg_id>` when msg_id is an integer (Onsen's
 //               own rule). Whichever path delivers first records it; the other finds it and is dropped (counted). No key: cannot be matched, delivered.
+//   later       WO-194 A.2 (Chiron 11:35Z): an item its delivery answers `later` (a person_message the Telegram daemon did not take) stays pending, in
+//               its place, and is tried again every 30 s (LATER_MS); the items behind it are handed on meanwhile (they never wait behind it). The ack is
+//               Onsen's cumulative `upto`, so it stops just before the held item: nothing is acked past what was not handed on (the items behind it,
+//               delivered and keyed, are acked when it goes).
 //   Onsen down  the loop backs off (2 s doubling to 60 s); Onsen keeps what is not acked (and /inject keeps working for local senders). One base: ONSEN_BASE
 //               (Chiron 11:05Z, Joey TG chiron:2407: no standby switching here).
 //   send (3b)   OnsenSender: POST /send, awaited; WO-158: the only write of a call (server.ts sendToAgent). Stored and `pulling` (0.9.1: the
@@ -174,7 +178,10 @@ export class OnsenInbox {
 }
 
 // ------------------------------------------------------------------ take (3a)
-export type HandResult = 'delivered' | 'duplicate' | 'undelivered'
+/** later (WO-194 A.2): not taken now; it stays pending in its place and is tried again LATER_MS later, while the items behind it go on */
+export type HandResult = 'delivered' | 'duplicate' | 'undelivered' | 'later'
+/** WO-194 A.2: how long an item answered `later` waits before it is tried again */
+export const LATER_MS = 30_000
 
 export class OnsenPuller {
   private running = false
@@ -183,10 +190,13 @@ export class OnsenPuller {
   private warnAt = 0
   private credWarnAt = 0
   private wake: (() => void) | null = null
+  /** WO-194 A.2: the pending items answered `later` (seq → when they are tried again); in memory: a restart tries every pending item at once */
+  private held = new Map<number, number>()
   readonly stats = { last_poll_at: null as string | null, polls: 0, taken: 0, delivered: 0, dup_dropped: 0, undelivered: 0, unkeyed: 0, replayed: 0,
-    resets: 0, errors: 0, last_error: null as string | null, baseline: null as number | null }
-  constructor(readonly o: { req: Req; base: string; inbox: OnsenInbox; deliver: (it: PullItem) => Promise<HandResult>; log: Log; host: string
-    waitS?: number; limit?: number; minBackoffMs?: number; maxBackoffMs?: number; now?: () => number; noCredentialRetryMs?: number }) {}
+    resets: 0, errors: 0, last_error: null as string | null, baseline: null as number | null, held: 0, held_then_delivered: 0 }
+  /** deliver's `again`: the item was answered `later` before (a retry: its delivery may try once instead of its own retry series) */
+  constructor(readonly o: { req: Req; base: string; inbox: OnsenInbox; deliver: (it: PullItem, again?: boolean) => Promise<HandResult>; log: Log; host: string
+    waitS?: number; limit?: number; minBackoffMs?: number; maxBackoffMs?: number; now?: () => number; noCredentialRetryMs?: number; laterMs?: number }) {}
   private now(): number { return this.o.now ? this.o.now() : Date.now() }
 
   start(): void {
@@ -201,19 +211,42 @@ export class OnsenPuller {
     return new Promise(res => { const t = setTimeout(() => { this.wake = null; res() }, ms); (t as any).unref?.(); this.wake = () => { clearTimeout(t); this.wake = null; res() } })
   }
 
-  /** hand on every pending item, in seq order; a throw stops here (the item stays pending, in order) */
+  /** hand on every pending item, in seq order; a throw stops here (the item stays pending, in order). WO-194 A.2: an item answered `later` stays
+   *  pending in its place and is skipped until LATER_MS has passed; the ones behind it are handed on */
   async drain(): Promise<void> {
     const inbox = this.o.inbox
-    while (inbox.pending.length) {
-      const it = inbox.pending[0]!
+    for (let i = 0; i < inbox.pending.length;) {
+      const it = inbox.pending[i]!
+      const due = this.held.get(it.seq)
+      if (due != null && due > this.now()) { i++; continue }
       const replay = !this.stats.polls
-      const r = await this.o.deliver(it)
+      const r = await this.o.deliver(it, due != null)
       if (replay) this.stats.replayed++
+      if (r === 'later') {
+        if (due == null) {
+          this.stats.held++
+          this.o.log('warn', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) not taken: kept in its place (not acked), tried again every ${Math.round((this.o.laterMs ?? LATER_MS) / 1000)} s; the items behind it go on`)
+        }
+        this.held.set(it.seq, this.now() + (this.o.laterMs ?? LATER_MS))
+        i++
+        continue
+      }
+      if (due != null) {
+        this.held.delete(it.seq); this.stats.held_then_delivered++
+        this.o.log('info', `onsen inbox: item ${it.seq} (${it.kind ?? '?'}) handed on after it was kept (${r})`)
+      }
       if (r === 'delivered') { this.stats.delivered++; if (!itemKey(it)) this.stats.unkeyed++ }
       else if (r === 'duplicate') this.stats.dup_dropped++
       else this.stats.undelivered++
-      inbox.handed(it.seq)
+      inbox.handed(it.seq)                                    // out of pending: the next one is now at i
     }
+  }
+  /** WO-194 A.2: seconds until the first held item is due (null: none held); the long poll waits no longer than that */
+  private heldDueS(): number | null {
+    if (!this.held.size) return null
+    for (const seq of this.held.keys()) if (!this.o.inbox.pending.some(p => p.seq === seq)) this.held.delete(seq)
+    if (!this.held.size) return null
+    return Math.max(0, Math.ceil((Math.min(...this.held.values()) - this.now()) / 1000))
   }
   private async ack(): Promise<void> {
     const upto = this.o.inbox.ackable()
@@ -228,7 +261,8 @@ export class OnsenPuller {
     if (!this.o.inbox.based) { await this.baseline(); return }
     await this.drain()
     await this.ack()
-    const inbox = this.o.inbox, waitS = this.o.waitS ?? 25
+    const due = this.heldDueS()
+    const inbox = this.o.inbox, waitS = due == null ? this.o.waitS ?? 25 : Math.min(this.o.waitS ?? 25, due)
     const path = `/inbox?after=${inbox.lastSeq}&wait=${waitS}&limit=${this.o.limit ?? 100}&host=${encodeURIComponent(this.o.host)}`
     const r = await this.o.req('GET', path, undefined, (waitS + 15) * 1000)
     if (!r) throw new NoCredential()
@@ -301,7 +335,7 @@ export class OnsenPuller {
   }
   health(): Record<string, unknown> {
     return { base: this.o.base, last_seq: this.o.inbox.lastSeq, acked_seq: this.o.inbox.ackedSeq,
-      pending: this.o.inbox.pending.length, ...this.stats, backoff_s: Math.round(this.backoffMs / 1000) }
+      pending: this.o.inbox.pending.length, ...this.stats, backoff_s: Math.round(this.backoffMs / 1000), holding: this.held.size }
   }
 }
 class NoCredential extends Error {}

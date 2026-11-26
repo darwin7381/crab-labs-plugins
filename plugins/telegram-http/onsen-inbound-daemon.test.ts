@@ -16,11 +16,14 @@ import { startOnsenStandin, type OnsenStandin } from './test-fixtures/onsen-stan
 import { heldText } from './onsen-inbound.ts'
 
 const JOEY = 1828
+/** A.1's 20 s, shortened for `on` (its agent-inbox answers within ~1 s here) */
+const BACK = 4000
 const CRED = { on: 'mesh_INBOUNDonSECRETsecretSECRETsecret01', off: 'mesh_INBOUNDoffSECRETsecretSECRETsecret1', lanes: 'mesh_INBOUNDlanesSECRETsecretSECRETsec1' }
 type Got = { at: number; content: string; meta: Record<string, string> }
 let onsen: OnsenStandin, root = '', apiOn: BotApiMock, apiOff: BotApiMock, apiLanes: BotApiMock, on: TgDaemon, off: TgDaemon, lanes: TgDaemon
 const got: Record<string, Got[]> = { on: [], off: [] }
 const procs: Array<{ kill(): void }> = []
+const inboxProc: Record<string, { kill(): void; exited: Promise<number> }> = {}
 let inboxLog = () => ''
 
 async function bootInbox(name: string, cred: string, tgPort: number, extra: Record<string, string> = {}): Promise<() => string> {
@@ -37,7 +40,7 @@ async function bootInbox(name: string, cred: string, tgPort: number, extra: Reco
       LANES_TG_PORT: String(tgPort), ...extra },
     stdout: 'ignore', stderr: 'ignore',
   })
-  procs.push(proc)
+  procs.push(proc); inboxProc[name] = proc
   const health = () => fetch(`http://127.0.0.1:${port}/healthz`).then(r => r.json()).catch(() => null) as Promise<any>
   if (!await until(async () => (await health())?.ok === true, 20000)) throw new Error(`inbox daemon ${name} did not start`)
   return () => { try { return readFileSync(join(stateDir, 'server.log'), 'utf8') } catch { return '' } }
@@ -65,7 +68,7 @@ beforeAll(async () => {
   const env = { ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude',
     CHANNEL_BOT_VOICE_TRANSCRIBE: '1', CHANNEL_BOT_TRANSCRIBE_CMD: tx, ONSEN_INBOUND_RETRY_MS: '100,100,100', ONSEN_INBOUND_HELD_MS: '1500', ONSEN_INBOUND_LATER_MS: '300' }
   ;[on, off, lanes] = await Promise.all([
-    startTgDaemon(apiOn, join(root, 'on'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'on'), ONSEN_INBOUND: 'someone, adam' }),
+    startTgDaemon(apiOn, join(root, 'on'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'on'), ONSEN_INBOUND: 'someone, adam', ONSEN_INBOUND_BACK_MS: String(BACK) }),
     startTgDaemon(apiOff, join(root, 'off'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'off') }),
     startTgDaemon(apiLanes, join(root, 'lanes'), JOEY, { ...env, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'lanes'), ONSEN_INBOUND: '*' }),
   ])
@@ -199,10 +202,15 @@ test('4 an edit: of a message not yet written into Onsen, the edited text is wha
   // Onsen: written once (the old text when A was already on its way), and the edit recorded on it; its person_edit is not delivered again
   expect(writesOf('on', 401).length).toBe(1)
   expect(await until(() => onsen.seen.some(x => x.who === 'on' && x.path === '/events' && x.body?.target_client_msg_id === '401' && x.body?.body === '改過的字'), 8000)).toBe(true)
-  // (a person_edit comes only when the event reached Onsen after the message: then it is not delivered again)
-  await sleep(1500)
+  // point 8 (Chiron 11:35Z): the edit event went into the same queue behind the message, so it reached Onsen after the message was written (Onsen
+  // ends with the new text), and its person_edit (it comes because the event came after the message) is not delivered again
+  const ev = onsen.seen.find(x => x.who === 'on' && x.path === '/events' && x.body?.target_client_msg_id === '401')!
+  expect(ev.at).toBeGreaterThanOrEqual(writesOf('on', 401)[0]!.at)
+  expect(on.log()).toMatch(/the edit of 1828:401 made while it waited to be written is in Onsen now, after the message/)
+  expect(await until(() => onsen.inbox.some(i => i.who === 'on' && i.kind === 'person_edit' && i.payload.text === '改過的字'), 5000)).toBe(true)
+  expect(await until(() => /person_edit of tg:401: made before the message was in Onsen/.test(on.log()), 5000)).toBe(true)
+  await sleep(500)
   expect(byId('on', '401').length).toBe(1)
-  if (onsen.inbox.some(i => i.who === 'on' && i.kind === 'person_edit' && i.payload.text === '改過的字')) expect(on.log()).toMatch(/person_edit of tg:401: made before the message was in Onsen/)
   // delivered, then edited: the edit comes back from Onsen (person_edit) and reaches the session once, as the switch off delivers it
   const d = now()
   both({ message: { message_id: 402, date: d, chat, from, text: '第一版' } })
@@ -252,11 +260,46 @@ test('7 speed: Telegram arrival → in session, the median of 10, off vs on (sta
   expect(med(lat.on)).toBeLessThan(2000)
 }, 60000)
 
-test('the agent-inbox daemon: a person_message is its Telegram daemon\'s, never a peer message to a session; the Telegram daemon not taking it: kept (not acked), handed on again', async () => {
+test('the agent-inbox daemon (A.2): a person_message its Telegram daemon does not take stays in its place, not acked, tried again every 30 s (here 0.6 s); a peer\'s call behind it is handed on', async () => {
   const dead = await freePort()
-  const ilog = await bootInbox('dead', CRED.off, dead, { ONSEN_PERSON_FORWARD_GAPS_MS: '100' })
+  const ilog = await bootInbox('dead', CRED.off, dead, { ONSEN_PERSON_FORWARD_GAPS_MS: '100', ONSEN_PERSON_RETRY_MS: '600' })
   const seq = onsen.say('off', String(JOEY), '交不出去的一句')
-  expect(await until(() => (ilog().match(/item \d+ \(person_message\) not taken by the Telegram daemon/g) ?? []).length >= 2, 15000)).toBe(true)
-  expect(onsen.inbox.find(i => i.who === 'off' && i.seq === seq)!.acked).toBe(false)
+  const call = onsen.put('off', 'call', { text: '同事的一則（排在後面）', msg_id: 99001 }, 'msg:99001')
+  expect(call).toBe(seq + 1)
+  expect(await until(() => new RegExp(`item ${call} \\(call\\) from joey`).test(ilog()), 15000)).toBe(true)   // not stuck behind the person_message
+  expect(ilog()).toMatch(new RegExp(`item ${seq} \\(person_message\\) not taken: kept in its place \\(not acked\\), tried again every 1 s`))
+  expect(await until(() => (ilog().match(new RegExp(`item ${seq} \\(person_message\\) not taken by the Telegram daemon`, 'g')) ?? []).length >= 4, 15000)).toBe(true)
+  expect(onsen.inbox.find(i => i.who === 'off' && i.seq === seq)!.acked).toBe(false)   // never acked undelivered (Onsen's ack is `upto`: the call waits for it)
+  expect(onsen.inbox.find(i => i.who === 'off' && i.seq === call)!.acked).toBe(false)
   expect(ilog()).not.toMatch(/\(person_message\) from joey/)                     // never the peer path (deliverInbound)
 }, 30000)
+
+test('A.1 (Chiron\'s lab check): the agent-inbox daemon stopped, a sentence reaches the session ~20 s (here 4 s) later from the facts kept, then an edit; started again: no second delivery', async () => {
+  inboxProc.on!.kill(); await inboxProc.on!.exited
+  const t0 = Date.now()
+  both({ message: { message_id: 801, date: now(), chat, from, text: '收件程式停了的時候' } })
+  await sleep(2500)
+  expect(byId('on', '801').length).toBe(0)                                     // written into Onsen, not back: waits
+  const g = await same('801', 15000)                                           // the tag of the switch off
+  expect(g.at - t0).toBeGreaterThanOrEqual(BACK - 500)
+  expect(on.log()).toMatch(/onsen inbound: 1828:801 not back from the inbox 4 s after it was written into Onsen \(message \d+\): delivered here from the facts it kept/)
+  expect(writesOf('on', 801).length).toBe(1)
+  // an edit of it while the inbox is still down: its person_edit does not come back either; delivered here 4 s after, as the switch off delivers it
+  const d = now()
+  both({ edited_message: { message_id: 801, date: d, edit_date: d + 5, chat, from, text: '收件程式停了的時候（改）' } })
+  expect(await until(() => got.on.filter(x => x.meta.message_id === '801').length === 2 && got.off.filter(x => x.meta.message_id === '801').length === 2, 15000)).toBe(true)
+  const [eo, ef] = [got.on.filter(x => x.meta.message_id === '801')[1]!, got.off.filter(x => x.meta.message_id === '801')[1]!]
+  expect(norm(eo)).toEqual(norm(ef))
+  expect(on.log()).toMatch(/edit of tg:801 not back from the inbox 4 s after it was made: delivered here/)
+  // the agent-inbox daemon again: it takes the person_message and the person_edit, the Telegram daemon recognises both, both acked, nothing twice
+  const pm = onsen.inbox.find(i => i.who === 'on' && i.kind === 'person_message' && i.payload.client?.msg_id === '801')!
+  expect(pm.acked).toBe(false)
+  await bootInbox('on', CRED.on, on.port)
+  expect(await until(() => pm.acked && onsen.inbox.filter(i => i.who === 'on' && i.kind === 'person_edit' && String(i.payload.client?.msg_id) === '801').every(i => i.acked), 20000)).toBe(true)
+  await sleep(800)
+  expect(got.on.filter(x => x.meta.message_id === '801').length).toBe(2)
+  expect(on.log()).toMatch(new RegExp(`person_message ${pm.payload.message_id} \\(tg:801\\) came back from the inbox after it was delivered here \\(not back in time, A\\.1\\): not delivered again`))
+  if (onsen.inbox.some(i => i.who === 'on' && i.kind === 'person_edit' && String(i.payload.client?.msg_id) === '801')) expect(on.log()).toMatch(/person_edit of tg:801: delivered here already \(not back in time, A\.1\): not delivered again/)
+  const h = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
+  expect(h.onsen.inbound.back).toMatchObject({ here: 1 })
+}, 60000)

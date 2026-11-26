@@ -15,6 +15,8 @@ export type OnsenStandin = {
   inbox: Array<{ who: Who; seq: number; kind: string; sender: string; payload: any; dedupe: string; acked: boolean; at: number }>
   /** WO-193: a page message (via web) for the agent of `who` */
   say: (who: Who, chat: string, text: string, attachments?: any[]) => number
+  /** any item into the inbox of `who` (a peer's call, for instance); its seq */
+  put: (who: Who, kind: string, payload: any, dedupe: string) => number
   /** per credential: Onsen's version (default 0.31.0), POST /messages answering 500, a delay before A is answered (ms) */
   st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number }
   writes: (who: Who) => Msg[]
@@ -135,7 +137,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
   return {
-    port: server.port!, msgs, seen, files, st, inbox,
+    port: server.port!, msgs, seen, files, st, inbox, put,
     say: (who, chat, text, attachments = []) => {
       const id = next++
       return put(who, 'person_message', { message_id: String(id), conversation_id: '1', from: 'joey', via: 'web', text, kind: 'text', sent_at: new Date().toISOString(), attachments,

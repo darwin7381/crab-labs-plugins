@@ -212,13 +212,24 @@ plugins/telegram-http/server.ts::ONSEN_FIRST: fleetConfigApplied.includes('ONSEN
 plugins/telegram-http/lanes.ts::if ((e as any)?.heldInOnsen === true) { if (held) held.said = String((e as Error).message)
 plugins/telegram-http/onsen-inbound.ts::export const heldText = (agent: string): string => `Onsen 現在連不上，這一則還沒交給 ${agent}；連上會自動補交，不用重傳。`
 plugins/telegram-http/onsen-inbound.ts::export function inboundOn(value: string | undefined, agent: string): boolean {
-plugins/telegram-http/onsen-inbound.ts::const r = await this.o.request('POST', '/messages', job.item, this.o.tryMs ?? TRY_MS)
+plugins/telegram-http/onsen-inbound.ts::const r = await this.o.request('POST', isEvent(job) ? '/events' : '/messages', isEvent(job) ? job.event : job.item, this.o.tryMs ?? TRY_MS)
 plugins/telegram-http/server.ts::ONSEN_INBOUND: fleetConfigApplied.includes('ONSEN_INBOUND') ? undefined : process.env.ONSEN_INBOUND
 plugins/telegram-http/server.ts::if (!viaOnsen) {                     // WO-194: a message going into Onsen is written there to be delivered (A), not recorded here
 plugins/telegram-http/server.ts::inboundWriter.enqueue({ key, item: { ...item, deliver: true
 plugins/telegram-http/server.ts::await finishInbound(inboundFacts(ctx, text, image, attachment, attachmentFromReply, voiceTranscript, inTopic), 'local', { imagePath, imageError })
-plugins/telegram-http/server.ts::if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it)
+plugins/telegram-http/server.ts::if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it, again)
 plugins/telegram-http/server.ts::const r = await fetch(`http://127.0.0.1:${port}/onsen/person`
 plugins/telegram-http/server.ts::if (!INBOX_ONLY && u.pathname === '/onsen/person' && req.method === 'POST') {
 plugins/telegram-http/server.ts::if (ok && onsen.cfg.record && !m.from.is_bot && inboundStore?.viaOnsen(key)) {
 plugins/telegram-http/server.ts::await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main')
+plugins/telegram-http/onsen-inbound.ts::export const BACK_MS = 20_000
+plugins/telegram-http/onsen-inbound.ts::after(of: string, event: Record<string, unknown>): boolean {
+plugins/telegram-http/server.ts::const INBOUND_BACK_MS = Number(process.env.ONSEN_INBOUND_BACK_MS) || OnsenInbound.BACK_MS
+plugins/telegram-http/server.ts::async function inboundBack(key: string, onsenId: number | null, tries: number): Promise<void> {
+plugins/telegram-http/server.ts::  inboundBackLater(job.key, onsenId)
+plugins/telegram-http/server.ts::function editBackLater(ek: string): void {
+plugins/telegram-http/server.ts::behind = inboundWriter.after(key, Onsen.inboundEdit(ONSEN_AGENT, m))
+plugins/telegram-http/server.ts::if (personBusy.has(own) || (!edit && personBusy.has(key))) return { code: 409, json: { busy: true } }
+plugins/telegram-http/onsen-inbox.ts::export type HandResult = 'delivered' | 'duplicate' | 'undelivered' | 'later'
+plugins/telegram-http/onsen-inbox.ts::if (due != null && due > this.now()) { i++; continue }
+plugins/telegram-http/server.ts::  return 'later'

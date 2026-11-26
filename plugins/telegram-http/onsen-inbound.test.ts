@@ -88,3 +88,49 @@ test('A: the queue is on disk: a restart writes what was not written yet, first;
   expect(bodies).toEqual(['edited'])
   expect(await until(() => b.size === 0)).toBe(true)
 })
+
+test('point 8: an edit of a message still waiting to be written goes into the same queue behind it (POST /events after the message, on disk); refused: dropped', async () => {
+  const file = join(dir(), 'q.json'), calls: string[] = [], written: string[] = [], logs: string[] = []
+  let down = true
+  const ev = (id: number, body: string) => ({ idem_key: `tg:adam:1828:edit:${id}:9`, agent: 'adam', client: 'telegram', chat: '1828', target_client_msg_id: String(id), kind: 'edit', actor: 'tg:1828', body, at: '2026-11-26T00:00:09.000Z' })
+  const request = async (_m: string, path: string, body: any) => {
+    calls.push(`${path} ${body.client_msg_id ?? body.target_client_msg_id}:${body.body}${down ? ' (down)' : ''}`)
+    if (down) return { status: 503, json: {} }
+    if (path === '/events' && body.target_client_msg_id === '3') return { status: 404, json: { detail: 'no message' } }
+    return { status: 200, json: path === '/events' ? { id: 77, duplicate: false } : { id: 900 + Number(body.client_msg_id), duplicate: false } }
+  }
+  const opts = { file, log: (_l: string, m: string) => logs.push(m), retryMs: [20, 20, 20], heldMs: 10_000, laterMs: 40,
+    written: (j: Job) => written.push(j.key), held: () => {}, refused: () => {} }
+  let gone = false                                                  // the first daemon stops: its requests never come back
+  const w = new InboundWriter({ ...opts, request: (m, p, b) => gone ? new Promise(() => {}) : request(m, p, b) })
+  w.enqueue(job(1)); w.enqueue(job(2))
+  expect(await until(() => calls.length >= 1)).toBe(true)
+  // the edit of 1 while it waits (A already tried with the old text): rewritten, and its event queued behind 1 and 2
+  expect(w.rewrite('1828:1', 't1 改')).toBe(true)
+  expect(w.after('1828:1', ev(1, 't1 改'))).toBe(true)
+  expect(w.after('1828:9', ev(9, 'x'))).toBe(false)               // not waiting here: the caller records it the usual way
+  expect(w.pending('1828:1')?.key).toBe('1828:1')                  // pending() finds messages only
+  expect(w.size).toBe(3)
+  gone = true
+  // a restart while Onsen is down: the event job is read back from disk, behind its message
+  const w2 = new InboundWriter({ ...opts, request })
+  expect(w2.size).toBe(3)
+  down = false
+  expect(await until(() => w2.size === 0)).toBe(true)
+  const at = (s: string) => calls.indexOf(s)
+  expect(at('/messages 1:t1 改')).toBeGreaterThan(-1)
+  expect(at('/messages 1:t1 改')).toBeLessThan(at('/events 1:t1 改'))
+  expect(at('/messages 2:t2')).toBeLessThan(at('/events 1:t1 改'))    // in arrival order: the edit came after 2 was queued
+  expect(calls.filter(c => c.startsWith('/events') && !c.endsWith('(down)')).length).toBe(1)
+  expect(w2.health()).toMatchObject({ edits_after: 1, waiting: 0 })
+  expect(written).toEqual(['1828:1', '1828:2'])                     // written() is for messages only
+  expect(logs.some(l => /the edit of 1828:1 made while it waited to be written is in Onsen now, after the message/.test(l))).toBe(true)
+  // an edit event Onsen refuses (4xx): dropped, nothing else happens
+  down = true
+  w2.enqueue(job(3))
+  expect(w2.after('1828:3', ev(3, 't3 改'))).toBe(true)
+  down = false
+  expect(await until(() => w2.size === 0)).toBe(true)
+  expect(logs.some(l => /the edit of 1828:3 not taken by Onsen \(HTTP 404 no message\): dropped/.test(l))).toBe(true)
+  expect(written).toEqual(['1828:1', '1828:2', '1828:3'])
+})
