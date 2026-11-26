@@ -1224,12 +1224,12 @@ async function forwardInputPassthrough(
 }
 
 /**
- * Onsen step 2 (WO-142): what the caller does around `/clear`. beforeClear runs BEFORE the keys are typed (Joey's restart line is drawn first: the
- * SessionStart hook of the cleared session asks Onsen for it the moment the TUI clears); its keyboard goes on the reply, and `undo` runs when typing
- * /clear failed (the line was for a clear that did not happen). Absent (roamer, Onsen off): /clear behaves exactly as before.
+ * WO-185 (Joey TG chiron:2645): what the caller does after `/clear` was typed. /clear draws no restart line: by default the agent still reads what came
+ * before. afterClear sends the success reply itself (「…它還查得到之前的對話。」 with the 5 s button 「不要讓它看到之前的」) and answers true; false (or
+ * absent: roamer, Onsen off): the plain reply. A failed /clear gets the failure line only. (WO-142's beforeClear, which drew the line first, is gone.)
  */
 export type ClearHooks = {
-  beforeClear?: () => Promise<{ keyboard?: InlineButton[][]; undo?: () => Promise<void> } | null | undefined>
+  afterClear?: (okText: string) => Promise<boolean>
 }
 
 /**
@@ -1290,17 +1290,19 @@ export async function forwardSharedTuiSlash(
     // so handleControlSlash's /resume <id> branch gets it. (Joey 2026-05-26 msg
     // 1656/1657: inline-keyboard button clicks were a no-op because of this.)
     if (cmd === '/resume' && args) return false
-    // Onsen step 2 (WO-142): /clear draws Joey's restart line FIRST (bounded by the hook itself), then the keys are typed as before
-    let line: Awaited<ReturnType<NonNullable<ClearHooks['beforeClear']>>> = null
-    if (cmd === '/clear' && hooks?.beforeClear) {
-      try { line = await hooks.beforeClear() } catch { line = null }
-    }
+    let typed = false
     try {
       await tmuxSendKeys(cmd, tmuxName, true)  // clearFirst: drop any draft so the command isn't polluted
-      await replyToTg(`✅ 已送 \`${cmd}\` 到 ${tmuxName}`, line?.keyboard ? { keyboard: line.keyboard } : undefined)
+      typed = true
     } catch (err) {
-      if (line?.undo) { try { await line.undo() } catch {} }
-      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)
+      await replyToTg(`❌ ${cmd} 失敗: ${err instanceof Error ? err.message : err}`)    // WO-185: a failed /clear gets no button
+    }
+    if (typed) {
+      const ok = `✅ 已送 \`${cmd}\` 到 ${tmuxName}`
+      // WO-185: /clear's reply comes from the caller (its 5 s button); the plain reply when it has none or could not send
+      let sent = false
+      if (cmd === '/clear' && hooks?.afterClear) { try { sent = await hooks.afterClear(ok) } catch { sent = false } }
+      if (!sent) await replyToTg(ok)
     }
     return true
   }

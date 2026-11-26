@@ -458,20 +458,46 @@ const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
   if (Date.now() - onsenAllow.at > 5_000) { try { onsenAllow.ids = loadAccess().allowFrom.map(String) } catch {} ; onsenAllow.at = Date.now() }
   return onsenAllow.ids.includes(uid) ? { chat, id } : null
 }
-/** Onsen step 2 (WO-142): what /clear (Joey's message `msgId` in `chat`, from `fromId`) does around the keys: draw the restart line FIRST (directly, ~2.5 s at
- *  most; else into the spool, and /clear still goes on time), put the button 「讓它看得到之前的」 on the reply, and lift the line again if typing /clear
- *  failed. Recording off for this agent (ONSEN_RECORD / ONSEN_AGENTS): undefined, /clear exactly as before. */
-function clearHooks(chat: string, msgId: number | undefined, fromId: string): ClearHooks | undefined {
+/** WO-185 (Joey TG chiron:2645): how long the button 「不要讓它看到之前的」 stays under a /clear reply, in seconds (its label counts down once a second) */
+const CLEAR_KEEP_S = 5
+/** WO-185: replies whose button was pressed (chat:message), so the countdown leaves them alone; each entry goes 10 s later */
+const clearPressed = new Set<string>()
+/** WO-185: the 5 s button under a /clear reply: oline:<the /clear message id>:<its Telegram date, seconds> */
+const clearButton = (n: number, clearMsgId: number, atSec: number) =>
+  new InlineKeyboard().text(`不要讓它看到之前的（${n}）`, `oline:${clearMsgId}:${atSec}`)
+/** WO-185 (Joey TG chiron:2645, replacing WO-142's line-first /clear): /clear draws no restart line, so by default the agent still reads what came before.
+ *  The reply says so and carries 「不要讓它看到之前的（5）」, counting down once a second; at 5 s the button goes and the default stands. A press inside
+ *  the 5 s draws the line at the /clear's own time (the oline: callback). Recording off for this agent (ONSEN_RECORD / ONSEN_AGENTS): undefined, the
+ *  plain reply. `atSec`: the /clear message's Telegram date. */
+function clearHooks(chat: string, msgId: number | undefined, fromId: string, here?: Lanes.TopicAsk, atSec?: number): ClearHooks | undefined {
   if (!onsen || !onsen.cfg.record || msgId == null) return undefined
+  const at = Number.isFinite(atSec) && atSec! > 0 ? Math.floor(atSec!) : Math.floor(Date.now() / 1000)
   return {
-    beforeClear: async () => {
-      const r = await onsen!.drawLine({ chat, clientMsgId: msgId, by: `tg:${fromId}` })
-      if (!r) return null
-      log('info', `onsen: restart line drawn in chat ${chat} for /clear ${msgId} (${r.spooled ? 'Onsen silent: in the spool' : `line ${r.id}`})`)
-      return {
-        keyboard: [[{ text: '讓它看得到之前的', callback_data: Onsen.liftData(r.id, msgId) }]],
-        undo: async () => { await onsen!.liftLine({ chat, lineId: r.id, clientMsgId: msgId, by: 'system:daemon' }) },
+    afterClear: async okText => {
+      const tf = here ? topicFields(here) : {}
+      let mid: number | undefined
+      try {
+        const m = await Onsen.withDefaultSender('system:control', () =>
+          bot.api.sendMessage(chat, `${okText}。它還查得到之前的對話。`, { ...tf, reply_markup: clearButton(CLEAR_KEEP_S, msgId, at) }))
+        mid = m?.message_id
+        if (here) sentIn(chat, [mid], tf)
+      } catch (err) {
+        log('warn', `onsen: /clear ${msgId} reply with its button failed (${err instanceof Error ? err.message : err}); the plain reply goes instead`)
+        return false
       }
+      if (mid == null) return true
+      const key = `${chat}:${mid}`
+      // one edit a second: (4) (3) (2) (1), then the button goes (5 edits); a pressed reply is left alone
+      for (let n = CLEAR_KEEP_S - 1; n >= 0; n--) {
+        const t = setTimeout(() => {
+          if (clearPressed.has(key)) return
+          void Onsen.withDefaultSender('system:control', () =>
+            bot.api.editMessageReplyMarkup(chat, mid!, { reply_markup: n > 0 ? clearButton(n, msgId, at) : { inline_keyboard: [] } })).catch(() => {})
+        }, (CLEAR_KEEP_S - n) * 1000)
+        ;(t as any).unref?.()
+      }
+      log('info', `onsen: /clear ${msgId} in chat ${chat}: no restart line (it still reads what came before); 「不要讓它看到之前的」 offered for ${CLEAR_KEEP_S} s`)
+      return true
     },
   }
 }
@@ -3265,6 +3291,46 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: '不再顯示這則' }).catch(() => {})
     return
   }
+  // WO-185: 「不要讓它看到之前的（n）」 under a /clear reply (oline:<the /clear message id>:<its date, s>). Pressed while it stands (the reply's own
+  // Telegram date, not a timer in memory, decides: a button left by a restart is past its 5 s too): draw the restart line at the /clear's time (into
+  // the spool when Onsen is silent) and offer 「讓它看得到之前的」 (olift:). Pressed later: the default stands, the button goes. Allowlisted users only.
+  if (data.startsWith('oline:')) {
+    const senderId = String(ctx.from.id)
+    if (!loadAccess().allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const mm = /^oline:(\d+):(\d+)$/.exec(data)
+    const cbm: any = ctx.callbackQuery.message
+    const chat = String(cbm?.chat?.id ?? ctx.chat?.id ?? senderId)
+    if (!onsen || !mm || cbm?.message_id == null) {
+      await ctx.answerCallbackQuery({ text: '這個按鈕已經不能用了' }).catch(() => {})
+      return
+    }
+    const key = `${chat}:${cbm.message_id}`
+    if (clearPressed.has(key)) { await ctx.answerCallbackQuery().catch(() => {}); return }
+    clearPressed.add(key)
+    setTimeout(() => clearPressed.delete(key), 10_000)
+    const ageS = Date.now() / 1000 - Number(cbm.date ?? 0)
+    if (!(ageS <= CLEAR_KEEP_S + 1)) {             // + 1 s: Telegram's date is whole seconds
+      log('info', `onsen: 「不要讓它看到之前的」 for /clear ${mm[1]} pressed ${Math.round(ageS)} s after the reply: past its ${CLEAR_KEEP_S} s, no line`)
+      await ctx.answerCallbackQuery({ text: '已經過了，照預設：它看得到之前的' }).catch(() => {})
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+      return
+    }
+    const r = await onsen.drawLine({ chat, clientMsgId: mm[1], by: `tg:${senderId}`, at: new Date(Number(mm[2]) * 1000).toISOString() })
+    if (!r) {
+      clearPressed.delete(key)
+      await ctx.answerCallbackQuery({ text: '沒畫上：這一隻沒有記錄到 Onsen' }).catch(() => {})
+      return
+    }
+    log('info', `onsen: restart line drawn by tg:${senderId} in chat ${chat} for /clear ${mm[1]} at its own time (${r.spooled ? 'Onsen silent: in the spool' : `line ${r.id}`})`)
+    const base = String(cbm.text ?? '').replace(/。?它還查得到之前的對話。?\s*$/, '')
+    await ctx.editMessageText(`${base}。已畫線：這之前的對話它看不到了（你引用的那一則照樣看得到）。`,
+      { reply_markup: new InlineKeyboard().text('讓它看得到之前的', Onsen.liftData(r.id, mm[1])) }).catch(() => {})
+    await ctx.answerCallbackQuery({ text: r.spooled ? '已畫線（Onsen 恢復後同步）' : '已畫線' }).catch(() => {})
+    return
+  }
   if (data.startsWith('olift:')) {
     const senderId = String(ctx.from.id)
     if (!loadAccess().allowFrom.includes(senderId)) {
@@ -3790,7 +3856,7 @@ async function handleInbound(
       async (msg: string, opts?: ReplyOptions) => {
         await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard, here)     // lanes-topics: answered where it was typed
       },
-      clearHooks(chat_id, msgId, String(from.id)),   // Onsen step 2 (WO-142): /clear draws Joey's restart line before it is typed
+      clearHooks(chat_id, msgId, String(from.id), here, ctx.message?.date),   // WO-185: /clear keeps what came before; its reply offers 「不要讓它看到之前的」 for 5 s
     )
     if (handled) {
       log('info', `channel-bot-control handled slash: ${text.slice(0, 60)}`)

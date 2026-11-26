@@ -290,41 +290,35 @@ describe('/clear: the line first, then the keys; the button on the reply', () =>
   const saved = { TMUX: process.env.TMUX, TMUX_TMPDIR: process.env.TMUX_TMPDIR }
   afterAll(() => { tm('kill-server'); process.env.TMUX_TMPDIR = saved.TMUX_TMPDIR ?? ''; if (saved.TMUX) process.env.TMUX = saved.TMUX; if (!saved.TMUX_TMPDIR) delete process.env.TMUX_TMPDIR })
 
-  test('order: the draw is awaited before /clear is typed; the reply carries the keyboard; a failed /clear lifts the line again; no hooks: as before', async () => {
+  test('WO-185: /clear is typed first, then afterClear sends the reply (its button); false or a throw: the plain reply; a failed /clear: the failure only; no hooks: as before', async () => {
     process.env.TMUX_TMPDIR = sock; delete process.env.TMUX
     const { forwardSharedTuiSlash } = await import('./channel-bot-control.ts')
     const name = `onsen-step2-${process.pid}`
     const made = tm('new-session', '-d', '-s', name, '-x', '80', '-y', '10', 'cat')
     if (made.status !== 0) throw new Error(`tmux: ${made.stderr}`)
     const pane = () => tm('capture-pane', '-p', '-t', name).stdout
-    const order: string[] = []
     const replies: Array<{ msg: string; opts?: any }> = []
     const reply = async (msg: string, opts?: any) => { replies.push({ msg, opts }) }
-    let undone = 0
-    const hooks = { beforeClear: async () => {
-      order.push(`draw start, pane has /clear: ${pane().includes('/clear')}`)
-      await Bun.sleep(300)
-      order.push(`draw end, pane has /clear: ${pane().includes('/clear')}`)
-      return { keyboard: [[{ text: '讓它看得到之前的', callback_data: 'olift:7:500' }]], undo: async () => { undone++ } }
-    } }
+    const after: Array<{ ok: string; paneHadClear: boolean }> = []
+    const hooks = { afterClear: async (ok: string) => { after.push({ ok, paneHadClear: pane().includes('/clear') }); return true } }
     expect(await forwardSharedTuiSlash('/clear', name, reply, undefined, hooks)).toBe(true)
     await Bun.sleep(200)
-    expect(order).toEqual(['draw start, pane has /clear: false', 'draw end, pane has /clear: false'])
-    expect(pane()).toContain('/clear')
-    expect(replies.at(-1)).toEqual({ msg: `✅ 已送 \`/clear\` 到 ${name}`, opts: { keyboard: [[{ text: '讓它看得到之前的', callback_data: 'olift:7:500' }]] } })
-    expect(undone).toBe(0)
-    // typing fails (no such pane): the line it drew is lifted again, the reply says it failed (no button)
+    expect(after).toEqual([{ ok: `✅ 已送 \`/clear\` 到 ${name}`, paneHadClear: true }])     // typed first, then the reply
+    expect(replies).toEqual([])                                                               // the hook sent it
+    // the hook could not send (false) or threw: the plain reply
+    expect(await forwardSharedTuiSlash('/clear', name, reply, undefined, { afterClear: async () => false })).toBe(true)
+    expect(replies.at(-1)).toEqual({ msg: `✅ 已送 \`/clear\` 到 ${name}`, opts: undefined })
+    expect(await forwardSharedTuiSlash('/clear', name, reply, undefined, { afterClear: async () => { throw new Error('boom') } })).toBe(true)
+    expect(replies.at(-1)!.msg).toStartWith('✅')
+    // typing fails (no such pane): the failure line only, the hook never runs (no button)
+    const n0 = after.length
     expect(await forwardSharedTuiSlash('/clear', `${name}-gone`, reply, undefined, hooks)).toBe(true)
-    expect(undone).toBe(1)
+    expect(after.length).toBe(n0)
     expect(replies.at(-1)!.msg).toStartWith('❌ /clear 失敗'); expect(replies.at(-1)!.opts).toBeUndefined()
     // no hooks (roamer, Onsen off) and other commands: exactly as before
     expect(await forwardSharedTuiSlash('/clear', name, reply)).toBe(true)
     expect(replies.at(-1)).toEqual({ msg: `✅ 已送 \`/clear\` 到 ${name}`, opts: undefined })
-    const calls0 = order.length
     expect(await forwardSharedTuiSlash('/compact', name, reply, undefined, hooks)).toBe(true)
-    expect(order.length).toBe(calls0)                                                       // only /clear draws
-    // a hook that throws does not stop /clear
-    expect(await forwardSharedTuiSlash('/clear', name, reply, undefined, { beforeClear: async () => { throw new Error('boom') } })).toBe(true)
-    expect(replies.at(-1)!.msg).toStartWith('✅')
+    expect(after.length).toBe(n0)                                                              // only /clear
   }, 20000)
 })
