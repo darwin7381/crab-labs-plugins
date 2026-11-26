@@ -2120,8 +2120,10 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
       { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null); if (refused) return refused }
       let minted: number | undefined, delivered = false
       const turnId = await Lanes.mainTurnId()                                // WO-172: the main's turn, as the tg daemon has it
+      // WO-175 item 2: the Call it answers, from the reply_to the main gave as it gave it (a BTCC number, an event id, its delivery's did), asked of the router
+      const call = await Lanes.callForReply(to, args.reply_to ?? replyTo)
       const result = await sendToAgent(to, text, replyTo, noReply, op, 'call',
-        { thread, hop, lane: `${INBOX_SELF}.main`, turn_id: turnId, minted: (id, ok) => { minted = id; delivered = ok } })
+        { thread, hop, lane: `${INBOX_SELF}.main`, turn_id: turnId, ...(call ? { call } : {}), minted: (id, ok) => { minted = id; delivered = ok } })
       await Lanes.noteMainOutbound(minted, thread, hop, to, text, replyTo, delivered)   // PL2: met on the delivery
       return result + (thread ? ` [thread ${thread} hop ${hop}]` : '')
     },
@@ -2232,7 +2234,9 @@ type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: str
   /** WO-157 (decision 1): a notice of the daemon's own (the router's interim, a thread-stop notice, the flood reply): the receiver records it only */
   urgency?: 'silent'
   /** WO-172: the turn the call is sent in (the main's prompt id, a lane's run id); Onsen keeps it in the call's payload. A notice of the daemon's own: none */
-  turn_id?: string | null }
+  turn_id?: string | null
+  /** WO-175 item 2: the Onsen Call this send answers (lanes.ts callAnswered: from the reply_to its sender named); it goes in /send's refs as `call` */
+  call?: string }
 function laneFields(extra?: LaneSendExtra): Record<string, unknown> {
   if (!extra) return {}
   return { ...(extra.thread ? { thread: extra.thread } : {}), ...(extra.hop ? { hop: extra.hop } : {}), ...(extra.lane ? { lane: extra.lane } : {}), ...(extra.owner ? { owner: extra.owner } : {}) }
@@ -2344,7 +2348,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     // the recipient another way with the same key is delivered once (onsen-inbox.ts dedupe). Stored and the recipient's daemon pulling (Onsen 0.9.1
     // `pulling`: it polled in the last 90 s) = delivered; stored, not pulling = queued; not stored = failed, with Onsen's reason.
     const onsenKey = msgId != null ? `msg:${msgId}` : `call:${randomUUID()}`
-    const facts = { refs: { ...(msgId != null ? { btcc_msg_id: msgId } : {}), ...(extra?.thread ? { thread: extra.thread } : {}), ...(opRef ? { op: opRef } : {}) },
+    const facts = { refs: { ...(msgId != null ? { btcc_msg_id: msgId } : {}), ...(extra?.thread ? { thread: extra.thread } : {}), ...(opRef ? { op: opRef } : {}),
+      ...(extra?.call ? { call: extra.call } : {}) },                    // WO-175 item 2 (CONTRACT §4): a reply names the Call it answers; Onsen takes it before the BTCC number
       no_reply: !!noReply }
     const o = await onsenSender!.send(target, 'peer_call', payload, onsenKey, facts)
     recipient = o.recipient ?? null

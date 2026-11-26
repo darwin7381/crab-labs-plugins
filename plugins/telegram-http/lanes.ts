@@ -196,7 +196,7 @@ export interface LanesDeps {
   joeyChatId?: () => string
   /** inbox role: mesh send with lane extras; resolves the minted btcc id */
   meshSend?: (to: string, text: string, replyTo: number | undefined, noReply: boolean,
-              extra: { thread?: string; hop?: number; lane?: string; owner?: string; urgency?: 'silent'; turn_id?: string },
+              extra: { thread?: string; hop?: number; lane?: string; owner?: string; urgency?: 'silent'; turn_id?: string; call?: string },
               /** lanes-golive (C2): the line and its fields (fleet-mail.ts send_to_agent); absent = a call (the router's own replies) */
               send?: LaneSendFields) => Promise<{ text: string; msgId?: number; delivered: boolean; isError?: boolean }>
   /** inbox role, lanes-golive (C2): one of the agent's mailbox tools for the mail lane `lane` (fleet-mail.ts callInboxTool); `to` = the original sender of a
@@ -2589,6 +2589,7 @@ function stopThread(ev: InEvent, t: Thread | null, gate: { why: 'hop' | 'budget'
   ledger({ lane: laneId ?? 'router', thread: t?.id ?? ev.thread ?? null, event: ev.id, kind: 'stop', text })
   // 002r (C04): the peer is told once, in the router's fixed words, marked no_reply (as a flood is): its last message is with the main, this line ends the exchange
   if (owesPeer && D.role === 'tg' && events) void laneMeshSend({ to: ev.from, no_reply: true, urgency: 'silent', reply_to: ev.btcc_msg_id, thread: t?.id ?? ev.thread ?? undefined, lane: 'router',
+    ...((c => c ? { call: c.id } : {})(callAnswered(ev.from, ev.id))),        // WO-175 item 2: the notice answers that Call (Onsen keeps it as an event on it)
     text: stopNoticeText(gate.why) }).then(r => {
       if (r?.delivered === true) events.add(ev.id, { kind: 'peer', level: 'stop-notice', to: ev.from.toLowerCase(), owner: 'router', state: 'met', by: 'router', ref: String(r.msgId ?? '') }, { tool: 'router' })
     }).catch(() => {})
@@ -5247,6 +5248,30 @@ export function callOfEvent(id: string): CallRef | null {
   const c = events?.get(id)?.call as CallRef | undefined
   return c && typeof c === 'object' && c.id ? c : null
 }
+/** WO-175 item 2 (Chiron 08:53Z; CONTRACT §4: 「回一件帶 call_id 的呼叫時，回覆的 refs 帶 {kind: "call", value: <call_id>}」): the Call a send to `to` answers,
+ *  from what its sender named as reply_to: a BTCC number (the event mesh-<n>), the event id itself (mesh-…: an item that came with no BTCC number, Chiron's
+ *  lab 08:29Z: reply_to=mesh-1795681792065-0cc1 and Onsen opened Call 423), or the main's M1 item (m-…, the did of its delivery). One owner: the event's
+ *  record (the router wrote the Call on it; the journal keeps it across a restart, so an answer hours later still names it). Only a Call of that same
+ *  agent (the answer goes back to the one who called); anything else: none. Telegram daemon only (the records are its) */
+export function callAnswered(to: string, replyTo: unknown): CallRef | null {
+  const rt = String(replyTo ?? '').trim(), peer = String(to ?? '').trim().toLowerCase()
+  if (!rt || !peer || !events || D?.role !== 'tg') return null
+  for (const part of rt.split(',').map(x => x.trim()).filter(Boolean).slice(0, 8)) {
+    const id = /^\d{1,18}$/.test(part) ? `mesh-${part}` : /^m-[0-9a-z]+-[0-9a-z]+$/.test(part) ? String(journal?.get('msg', part)?.event ?? '') : part
+    const e = id ? events.get(id) : undefined
+    const c = e ? callOfEvent(id) : null
+    if (c && String(e!.from ?? '').trim().toLowerCase() === peer) return { kind: c.kind, id: String(c.id) }
+  }
+  return null
+}
+/** WO-175 item 2: callAnswered from either daemon. The agent-inbox daemon (the main's send_to_agent) asks the Telegram daemon, which holds the records;
+ *  null: nothing named, no Call, or the Telegram daemon cannot be asked (the send goes as before, without it) */
+export async function callForReply(to: string, replyTo: unknown): Promise<string | null> {
+  if (replyTo == null || String(replyTo).trim() === '' || !String(to ?? '').trim()) return null
+  if (D?.role === 'tg') return callAnswered(to, replyTo)?.id ?? null
+  const r = await peerCall(TG_PORT, '/lanes/call-answered', 'POST', { to, reply_to: String(replyTo) })
+  return r && typeof r.call === 'string' && /^\d{1,18}$/.test(r.call) ? r.call : null
+}
 /** what the router marked on an event, as fields of its record (PL1) */
 const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
   ...((c => c ? { call: c } : {})(callRefOf(ev))),                                           // WO-175: the Call it is, on its record
@@ -5595,7 +5620,8 @@ async function interimToPeer(lane: Lane, tok: RunTok, hid: string, dueAt?: numbe
   if (th) { th.last = nowIso(); if (!th.peer) th.peer = from }
   // WO-140 (Chiron): the interim owes the peer nothing (the main's answer comes later): it goes out no_reply, so the peer's end-of-turn check asks for no answer
   // WO-157 (decision 1): a notice of the daemon's own, marked by its sender: the receiver records it, wakes nobody (urgency silent; the text unchanged)
-  const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, no_reply: true, urgency: 'silent', thread: lane.thread, hop, lane: lane.id, owner: '主線' })
+  const r = await laneMeshSend({ to: from, text, reply_to: ev.btcc_msg_id, no_reply: true, urgency: 'silent', thread: lane.thread, hop, lane: lane.id, owner: '主線',
+    ...((c => c ? { call: c.id } : {})(callAnswered(from, ev.id))) })      // WO-175 item 2: the interim answers that Call (Onsen keeps it as an event on it)
   hopDelivered(th, hop, r)
   if (r?.msgId != null) S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }
   // the answer is the main's now, with a due time; the router's line is its own obligation (met on the delivery)
@@ -6148,12 +6174,15 @@ export function laneSendArgs(a: any): { ok: true; f: LaneSendFields; to: string;
  *  that carries its btcc_msg_id, sent to that same peer (case-insensitive): the answer to the call goes back as a call, reply_to = the call's btcc_msg_id
  *  (an explicit reply_to is kept). An explicit line is always honoured; everything else is unchanged (no line = mail). Before: 2026-11-24T22:14:42Z
  *  sonn.reflex.9, running on chiron's call mesh-11413, answered with reply_agent(to, title, ask, text) and no line: laneSendArgs made it a mail, the peer
- *  check refused it, and the 22:14:49Z resend was a mail again; chiron's call got no answer on its own line. */
+ *  check refused it, and the 22:14:49Z resend was a mail again; chiron's call got no answer on its own line.
+ *  WO-175 item 2: a call that came with no BTCC number but is an Onsen Call (its record names the Call) is answered the same way, reply_to = its event id
+ *  (callAnswered names the Call from it). Chiron's lab 08:29Z: lab-relay.reflex.38's first reply_agent (no line) to Call 422 became a mail and was refused. */
 export function answerToCallArgs(a: any, ev: InEvent | undefined): any {
   const has = (v: unknown) => v != null && String(v).trim() !== ''
-  if (has(a?.line) || !ev || ev.source !== 'mesh' || (ev.line ?? 'call') !== 'call' || ev.no_reply || !has(ev.btcc_msg_id)) return a   // a call marked no_reply owes no answer: a send to it stays a mail
+  if (has(a?.line) || !ev || ev.source !== 'mesh' || (ev.line ?? 'call') !== 'call' || ev.no_reply) return a   // a call marked no_reply owes no answer: a send to it stays a mail
+  if (!has(ev.btcc_msg_id) && !callOfEvent(ev.id)) return a
   if (String(ev.from ?? '').trim().toLowerCase() !== String(a?.to ?? '').trim().toLowerCase()) return a
-  return { ...a, line: 'call', reply_to: has(a?.reply_to) ? a.reply_to : String(ev.btcc_msg_id) }
+  return { ...a, line: 'call', reply_to: has(a?.reply_to) ? a.reply_to : has(ev.btcc_msg_id) ? String(ev.btcc_msg_id) : ev.id }
 }
 // WO-148 (review of WO-153, the coordinator): form_close takes a question off Joey's 「等你決定」 and his old link then says it is closed, with no way back for
 // the lane; Onsen's "only your own" is the agent's (main and lanes share the credential), so a lane can close a form the main sent. For a lane it is now:
@@ -6225,7 +6254,9 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       { const pd = await peerDisclosureCheck(lane.id, to, text, 'reply_agent', { thread: lane.thread, event: tok.evId, once: `${tok.runId}:reply_agent:${to}`, answersRequest: true, lane: true }); if (pd.refuse) { events.result(tok.evId, v.ob?.id, false, { why: 'refused by the disclosure check' }); throw new Error(pd.refuse) } }
       if (th && call) { th.last = nowIso(); if (gate.count) th.ask_cls = tok.cls; if (!th.peer) th.peer = to }
       saveState()
-      const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: noReply, ...(call ? { thread: lane.thread, hop } : {}), lane: lane.id, owner: ownerOf(tok.evId), turn_id: tok.runId, ...f })   // WO-172: the run is its turn
+      const answered = call ? callAnswered(to, a.reply_to) : null           // WO-175 item 2: the Call this answers, named in the send's refs
+      const r = await laneMeshSend({ to, text, reply_to: a.reply_to, no_reply: noReply, ...(call ? { thread: lane.thread, hop } : {}), lane: lane.id, owner: ownerOf(tok.evId), turn_id: tok.runId,
+        ...(answered ? { call: answered.id } : {}), ...f })   // WO-172: the run is its turn
       if (call) hopDelivered(th, hop, r)
       if (call && r?.msgId != null) { S.outbound[String(r.msgId)] = { owner: lane.id, thread: lane.thread, cls: tok.cls }; saveState() }
       else if (f.line === 'mail' && r?.msgId != null) sentMailThread(String(r.msgId), lane.id, false, f.title ?? null)   // WO-164 (9): the lane's new mail opens its conversation
@@ -8276,6 +8307,10 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
         lane: !!S?.lanes?.[String(b.from ?? '')] })                       // WO-148: a lane's mailbox_reply (from = the lane id) has no free second pass
       sendJson(res, 200, { refuse: r.refuse ?? null, which: r.which ?? null }); return true
     }
+    if (p === '/lanes/call-answered' && req.method === 'POST') {          // WO-175 item 2: the Call the main's send_to_agent answers (callForReply, inbox role)
+      const b = await readBody(req)
+      sendJson(res, 200, { call: callAnswered(String(b.to ?? ''), b.reply_to)?.id ?? null }); return true
+    }
     if (p === '/lanes/outbound-check' && req.method === 'POST') {        // the main's send_to_agent on a thread, asked by the inbox daemon (002w C: the one gate)
       const b = await readBody(req)
       const t = S.threads[String(b.thread)]
@@ -8297,7 +8332,8 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const line = lineOf(b.line)
       const r = await D.meshSend!(String(b.to ?? ''), String(b.text ?? ''), replyTo, b.no_reply === true,
         { thread: b.thread, hop: Number(b.hop) || undefined, lane: b.lane, ...(b.owner ? { owner: String(b.owner).slice(0, 48) } : {}), ...(b.urgency === 'silent' ? { urgency: 'silent' as const } : {}),
-          ...(typeof b.turn_id === 'string' && b.turn_id ? { turn_id: b.turn_id.slice(0, 120) } : {}) },          // WO-172: the turn the lane sends it in
+          ...(typeof b.turn_id === 'string' && b.turn_id ? { turn_id: b.turn_id.slice(0, 120) } : {}),          // WO-172: the turn the lane sends it in
+          ...(b.call != null && /^\d{1,18}$/.test(String(b.call)) ? { call: String(b.call) } : {}) },      // WO-175 item 2: the Call it answers (the router's callAnswered)
         line ? { line, ...Object.fromEntries(['title', 'ask', 'because', 'deadline', 'ref'].filter(k => typeof b[k] === 'string' && b[k]).map(k => [k, String(b[k])])),
           ...(Array.isArray(b.touches) ? { touches: b.touches.map(String).slice(0, 5) } : {}) } : undefined)
       sendJson(res, 200, r); return true

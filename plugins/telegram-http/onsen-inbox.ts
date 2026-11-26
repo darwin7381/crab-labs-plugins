@@ -312,7 +312,11 @@ export const BASELINE_AFTER = Number.MAX_SAFE_INTEGER
 // Onsen 0.9.3: WO-147's source kinds (/send refuses any other name with 400)
 export type SendKind = 'peer_call' | 'peer_mail'
 /** the sender's facts in their own fields (Onsen 0.9.3, Chiron WO-151 11:15Z); the text stays as the agent reads it */
-export type SendFacts = { refs?: { btcc_msg_id?: number; thread?: string; op?: string }; no_reply?: boolean }
+export type SendFacts = { refs?: { btcc_msg_id?: number; thread?: string; op?: string
+    /** WO-175 item 2 (CONTRACT §4): the Call a reply answers (its call id) */
+    call?: string }; no_reply?: boolean }
+/** WO-175 item 2: an Onsen that does not know refs.call yet refuses the whole send (fleet-core onsen5.py _facts: 400 「unknown field call in refs; allowed: …」) */
+const CALL_REF_REFUSED = /unknown fields? [^;]*\bcall\b[^;]* in refs/
 
 /** error: why it was not stored (only when stored is false) */
 export type SendOutcome = { stored: boolean; duplicate: boolean; pulling: boolean; error?: string
@@ -345,16 +349,27 @@ export function recipientNote(to: string, rec: unknown): string {
 }
 export class OnsenSender {
   /** sent: stored (new or already there); not_pulling: stored while the recipient's daemon was not polling (queued); failed: not stored */
-  readonly stats = { sent: 0, duplicate: 0, not_pulling: 0, failed: 0, last_error: null as string | null }
+  readonly stats = { sent: 0, duplicate: 0, not_pulling: 0, failed: 0, last_error: null as string | null, call_ref_refused: 0 }
   private warnAt = 0
+  private callRefWarned = false
   constructor(readonly o: { req: Req; log: Log; now?: () => number }) {}
   /** POST /send; never throws. stored: Onsen has it (new or already had it); pulling (Onsen 0.9.1): the recipient's daemon asked for its inbox in the
    *  last 90 s, so it will take it; not pulling: it takes it when it polls again */
   async send(to: string, kind: SendKind, payload: Record<string, unknown>, dedupe: string | null, facts: SendFacts = {}): Promise<SendOutcome> {
     try {
-      const refs = facts.refs && Object.keys(facts.refs).length ? facts.refs : undefined
-      const r = await this.o.req('POST', '/send', { to, kind, payload, ...(dedupe ? { dedupe } : {}), ...(refs ? { refs } : {}),
+      let refs = facts.refs && Object.keys(facts.refs).length ? facts.refs : undefined
+      const post = () => this.o.req('POST', '/send', { to, kind, payload, ...(dedupe ? { dedupe } : {}), ...(refs ? { refs } : {}),
         ...(facts.no_reply ? { no_reply: true } : {}) }, 10_000)
+      let r = await post()
+      // WO-175 item 2: an Onsen that does not take refs.call yet refused the send for that field alone: the same send once more without it, as before it
+      // (the reply then finds its Call by the BTCC number, if it has one). Said once in the log; counted (call_ref_refused)
+      if (r?.status === 400 && refs?.call != null && CALL_REF_REFUSED.test(String(r.json?.detail ?? ''))) {
+        this.stats.call_ref_refused++
+        if (!this.callRefWarned) { this.callRefWarned = true; this.o.log('warn', `onsen send: Onsen does not take refs.call yet (${String(r.json?.detail ?? '').slice(0, 80)}): sent without it`) }
+        const { call: _c, ...rest } = refs
+        refs = Object.keys(rest).length ? rest : undefined
+        r = await post()
+      }
       const res = r?.status === 200 && Array.isArray(r.json?.results) ? r.json.results : null
       if (res) {
         this.stats.sent++
