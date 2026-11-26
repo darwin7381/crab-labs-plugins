@@ -5,13 +5,13 @@
 //   a 403 for one record: skipped in the same pass (rejected.jsonl, one log line, /healthz onsen.skipped), the facts behind it posted
 //   chiron's spool: seven caller-state Calls, three moments each, between facts: every fact posted in one pass, 21 skipped; a recipient's Call still PUT
 //   401 (the credential itself) and a 403 that says not_authenticated: kept and tried again, nothing thrown away; flushed once the credential is taken
-//   which statuses are refused for good; the Call an answer names (refs.call)
+//   which statuses are refused for good; the Call an answer names (refs.call); a roamer records nothing
 import { afterAll, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { startOnsenStandin } from './test-fixtures/onsen-standin.ts'
-import { OnsenClient, answeredCall, credentialRefused, refusedForGood, type CallStateLine, type DeliveryFact } from './onsen-client.ts'
+import { OnsenClient, answeredCall, credentialRefused, isRoamerEnv, recordFor, refusedForGood, type CallStateLine, type DeliveryFact } from './onsen-client.ts'
 
 const CRED = 'mesh_SKIPchironSECRETsecretSECRET01234', SONN = 'mesh_SKIPsonnSECRETsecretSECRET0123456'
 const on = startOnsenStandin({ [CRED]: 'chiron', [SONN]: 'sonn' })
@@ -144,5 +144,26 @@ describe('1.58.32: an answer that names the Call it answers is no Call of this a
     expect(answeredCall({ call: '541' })).toBe('541'); expect(answeredCall({ call: 485 })).toBe('485')
     expect(answeredCall({ thread: 't', call: ' 616 ' })).toBe('616')
     for (const v of [undefined, null, {}, [], { call: '' }, { call: 'x1' }, { call: null }, { thread: 'lab-relay#t-1' }, 'call']) expect(answeredCall(v)).toBeNull()
+  })
+})
+
+describe('1.58.32: a roamer records nothing into the spool', () => {
+  test('ROAMER_MODE=1: recording off whatever ONSEN_RECORD / ONSEN_AGENTS say; nothing appended; the spool an older version left is kept', async () => {
+    expect(isRoamerEnv({ ROAMER_MODE: '1' })).toBe(true); expect(isRoamerEnv({})).toBe(false); expect(isRoamerEnv({ ROAMER_MODE: '0' })).toBe(false)
+    expect(recordFor({ ROAMER_MODE: '1' }, 'roamer-space-roamers')).toBe(false)
+    expect(recordFor({ ROAMER_MODE: '1', ONSEN_RECORD: '1', ONSEN_AGENTS: '*' }, 'x')).toBe(false)
+    expect(recordFor({}, 'chiron')).toBe(true)
+    expect(recordFor({ ROAMER_MODE: '0' }, 'chiron')).toBe(true)
+    // a roamer's client (record from recordFor): every record kind is dropped, the spool file never grows, no sync loop runs
+    const dir = mkdtempSync(join(tmpdir(), 'onsen-roamer-'))
+    const c = new OnsenClient({ dir, base: BASE, agent: 'roamer-space-roamers', record: recordFor({ ROAMER_MODE: '1' }, 'roamer-space-roamers'), credential: () => null,
+      log: () => {}, intervalMs: 3_600_000 })
+    c.start()
+    c.recordDelivery(fact()); c.recordCall(call('9', 'accepted')); c.recordEvent({ idem_key: 'e1', agent: 'r', client: 'telegram', chat: '1', target_client_msg_id: '1', kind: 'reaction', actor: 'main', at: new Date().toISOString() })
+    expect(c.recordWake({ idem_key: 'w1' } as any)).toBe(false)
+    expect(await c.drawLine({ chat: '1', clientMsgId: 5, by: 'tg:1' })).toBeNull()
+    expect(existsSync(join(dir, 'spool.jsonl'))).toBe(false)
+    expect((c.health() as any).recorded).toBe(0)
+    c.stop()
   })
 })

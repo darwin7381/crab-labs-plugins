@@ -375,3 +375,7 @@ plugins/telegram-http/server.ts::const answers = Onsen.answeredCall(body?.refs) 
 plugins/telegram-http/server.ts::const call = !answers && body?.call_id != null
 plugins/telegram-http/onsen-client.ts::export function answeredCall(refs: unknown): string | null {
 plugins/telegram-http/lanes-wo175.test.ts::1.58.32: the answer to a Call this agent made (refs.call → answers_call
+plugins/telegram-http/onsen-client.ts::export const isRoamerEnv = (env: NodeJS.ProcessEnv): boolean => (env.ROAMER_MODE ?? '').trim() === '1'
+plugins/telegram-http/onsen-client.ts::if (!recordOn(env) || isRoamerEnv(env)) return false
+plugins/telegram-http/server.ts::onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool
+plugins/telegram-http/onsen-spool-skip.test.ts::1.58.32: a roamer records nothing into the spool

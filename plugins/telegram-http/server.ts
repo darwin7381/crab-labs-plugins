@@ -398,6 +398,8 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
+// 1.58.32 (Chiron): a roamer posts nothing to Onsen, so it adds nothing to the spool; what an older version left there stays as it is (not ours to delete)
+if (onsen && Onsen.isRoamerEnv(process.env)) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)
 // Onsen step 3, the half Joey sees (WO-145, onsen-visible.ts): three switches (ONSEN_REACT_SEEN, ONSEN_STATUS_PIN, ONSEN_FORM_LINKS: a comma list of agent
 // names or `*`, from the plist or the machine config; unset or empty = off). Each also needs recording on for this agent; the agent-inbox daemon has none.
 const visibleOn = (name: OnsenVisible.Switch): boolean => !!onsen && onsen.cfg.record && !INBOX_ONLY && OnsenVisible.switchOn(process.env, name, ONSEN_AGENT)
