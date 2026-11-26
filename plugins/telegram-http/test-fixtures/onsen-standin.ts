@@ -42,6 +42,8 @@ export type OnsenStandin = {
   /** the bridge drew thread `thread` as client topic `client_thread` (PUT /v1/bridge/threads) */
   mapThread: (thread: string, client_thread: string) => void
   lines: Array<{ who: Who; body: any; at: number }>
+  /** 1.58.32: the Calls Onsen has, by id → their recipient (PUT /v1/calls/<id>/state: the recipient only, else 403 not_authorized; none: 404) */
+  calls: Record<string, Who>
   /** WO-197: the conversation of a chat (made the first time); a person's message in it from Telegram (as the bridge writes it: its number an alias) */
   conv: (chat: string) => string
   heard: (who: Who, chat: string, n: number, text: string) => number
@@ -74,6 +76,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       ...(it.meta?.media_group_id ? { media_group_id: it.meta.media_group_id } : {}) }
   }
   const st: OnsenStandin['st'] = { version: {}, a500: {}, aDelayMs: 0, bridge: {} }
+  const calls: OnsenStandin['calls'] = {}
   const actions = new Map<string, any>(), acalls: OnsenStandin['acalls'] = [], actionKeys = new Map<string, string>()
   let nextAction = 160
   const aerr = (status: number, message: string) => Response.json({ error: { code: status === 409 ? 'version_conflict' : 'not_found', message } }, { status })
@@ -135,6 +138,14 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     }
     const body = req.method === 'POST' || req.method === 'PUT' ? await req.json().catch(() => null) : undefined
     seen.push({ who, method: req.method, path, body, headers, at: Date.now() })
+    // 1.58.32: a Call's state (fleet-core onsen_calls.py put_state): only its recipient writes it (403 not_authorized), a Call Onsen does not have: 404
+    const cs = req.method === 'PUT' ? path.match(/^\/v1\/calls\/(\d+)\/state$/) : null
+    if (cs) {
+      const rcp = calls[cs[1]!]
+      if (!rcp) return Response.json({ error: { code: 'not_found', message: `沒有 ${cs[1]} 這一通呼叫`, retryable: false } }, { status: 404 })
+      if (rcp !== who) return Response.json({ error: { code: 'not_authorized', message: `只有收件人 ${rcp} 的常駐程式能回報這一通的狀態`, retryable: false } }, { status: 403 })
+      return Response.json({ data: { id: cs[1], recipient: rcp, state: body?.state ?? null } })
+    }
     if (path.startsWith('/v1/actions')) {
       acalls.push({ who, method: req.method, path, body, at: Date.now() })
       if (path === '/v1/actions' && req.method === 'POST') {
@@ -302,7 +313,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
   return {
-    port: server.port!, msgs, seen, files, st, inbox, put, connector, actions, acalls, commands, threads, lines,
+    port: server.port!, msgs, seen, files, st, inbox, put, connector, actions, acalls, commands, threads, lines, calls,
     mapThread: (thread, client_thread) => { const t = threads.find(x => x.thread === thread); if (t) t.client_thread = client_thread },
     press: (id, option, by = 'joey') => {
       const a = actions.get(id)!

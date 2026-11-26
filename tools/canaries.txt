@@ -362,3 +362,11 @@ plugins/telegram-http/server.ts::text = `${text}\n${choiceNotOffered(text)}`
 plugins/telegram-http/server.ts::function choiceNotOffered(text: string): string {
 plugins/telegram-http/server.ts::Onsen did not make the Action (${h.state}); the answer sent as a message
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::3b. bare /model with no Action (Onsen refused it)
+plugins/telegram-http/onsen-client.ts::const RETRYABLE_4XX = new Set([401, 408, 425, 429])
+plugins/telegram-http/onsen-client.ts::export const refusedForGood = (r: { status: number; json: any }): boolean =>
+plugins/telegram-http/onsen-client.ts::export const credentialRefused = (r: { status: number; json: any }): boolean => r.status === 401 || (r.status === 403 && errCode(r.json) === 'not_authenticated')
+plugins/telegram-http/onsen-client.ts::skipped: { count: this.skipped.count, last: this.skipped.last }
+plugins/telegram-http/onsen-client.ts::{ kind: 'c', path: `/v1/calls/${id}/state`, status: r.status, code: errCode(r.json) })
+plugins/telegram-http/onsen-client.ts::    if (credentialRefused(r)) {
+plugins/telegram-http/test-fixtures/onsen-standin.ts::只有收件人 ${rcp} 的常駐程式能回報這一通的狀態
+plugins/telegram-http/onsen-spool-skip.test.ts::calls 541/546/573/580/590/598/616, all caller state, three moments each

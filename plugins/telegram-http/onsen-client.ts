@@ -4,8 +4,9 @@
 //   - records: recordMessage / recordEvent append one line to a local spool (<STATE_DIR>/onsen/spool.jsonl) and return. They never throw and never touch
 //     the network, so a send to Telegram is never slowed or failed by Onsen.
 //   - syncs: a loop (every 5 s, and right after an append, coalesced) posts the unsent lines IN ORDER (messages via /messages/batch, events via /events),
-//     then moves a cursor (<STATE_DIR>/onsen/cursor.json, byte offset). Network error / 5xx / 401 / 403 / 408 / 429: kept, retried with backoff (cap 60 s).
-//     A 4xx for one item: logged and moved to rejected.jsonl (never retried forever). `duplicate` counts as sent (the server dedupes by idem_key), so a
+//     then moves a cursor (<STATE_DIR>/onsen/cursor.json, byte offset). Network error / 5xx / 401 (the credential) / 408 / 425 / 429: kept, retried
+//     with backoff (cap 60 s). Any other 4xx (1.58.32: 403 too) for one record: logged and moved to rejected.jsonl, never retried, never holding the
+//     queue (/healthz onsen.skipped). `duplicate` counts as sent (the server dedupes by idem_key), so a
 //     crash between the POST and the cursor write costs nothing. The spool IS the queue: a daemon restart resumes from the cursor.
 //   - answers chat_history: GET /messages (or one message) with this agent's mesh credential; Onsen silent for ~4 s: the local spool answers, and says so.
 //   - knows who sent each Telegram call: server.ts runs a send inside `withSender(<who>, …)` (AsyncLocalStorage); the Bot API wrappers read it.
@@ -363,7 +364,23 @@ export function noteInbound(rows: any[], set: Set<string> | undefined): void {
   }
 }
 
-const RETRYABLE_4XX = new Set([401, 403, 408, 425, 429])
+// 1.58.32 (Chiron, Joey: a refused record never blocks the queue). Onsen (CONTRACT §1; fleet-core webauth.py / auth.py) answers a credential it
+// does not know, or none, with 401 not_authenticated, and a known credential not allowed to do this one thing with 403 not_authorized: a Call state
+// written by its caller (「只有收件人 X 的常駐程式能回報」), another agent's conversation, a message it did not write. The spool waits on and tries
+// again only what can pass later unchanged: the credential itself (401, or a 403 whose code says not_authenticated), a timeout (408), too early
+// (425), too fast (429). Every other 4xx (403, 404, 409, 400, 422 …) is Onsen refusing that one record for good: rejected.jsonl, one log line,
+// counted in `skipped`, and the cursor moves on, so one such record never holds the ones behind it (until 1.58.31 a 403 was retried forever:
+// chiron's daemon stood 5½ h on /v1/calls/541/state, sonn's on 485).
+const RETRYABLE_4XX = new Set([401, 408, 425, 429])
+/** the code of Onsen's error answer ({error: {code}}), '' for the older shapes */
+const errCode = (j: any): string => { const e = j?.error; return e && typeof e === 'object' && typeof e.code === 'string' ? e.code.slice(0, 60) : '' }
+/** 1.58.32: the credential itself was not accepted (401; a 403 that says not_authenticated): kept and tried again, never thrown away */
+export const credentialRefused = (r: { status: number; json: any }): boolean => r.status === 401 || (r.status === 403 && errCode(r.json) === 'not_authenticated')
+/** 1.58.32: Onsen refused this one record for good (a 4xx that is not the credential, a timeout, too early or too fast) */
+export const refusedForGood = (r: { status: number; json: any }): boolean =>
+  r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status) && !credentialRefused(r)
+/** 1.58.32: what Onsen refused, as /healthz onsen.skipped shows it */
+export type SkippedInfo = { kind: string; path: string; status: number; code?: string }
 const HOUR = 3600_000
 const READ_WINDOW = 1 << 20          // bytes read from the cursor per pass
 /** WO-190: Onsen's own limit for one file (ONSEN_FILE_MAX_BYTES, 25 MB): a bigger one is not sent */
@@ -373,6 +390,11 @@ export const FILES_WAIT_MS = 120_000
 /** WO-190: a header value that is plain ASCII: a file's name, percent-encoded (Onsen decodes X-File-Name) */
 const headerName = (name: string): string => encodeURIComponent(name.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()).slice(0, 1000)
 
+/** a spool line's key for a log line: its record's idem_key (a Call state's `idem`; a delivery report's Onsen message), never its content */
+function lineKey(line: unknown): string {
+  const l = line as any
+  return String(l?.r?.idem_key ?? l?.r?.idem ?? (l?.r?.message_id != null ? `delivery:${l.r.message_id}` : '?')).slice(0, 200)
+}
 /** what Onsen said in an error answer ({error: {code, message}}, or older shapes) */
 function callSaid(j: any): string {
   const e = j?.error
@@ -413,6 +435,8 @@ export class OnsenClient {
     thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0,
     files_uploaded: 0, files_upload_failed: 0, files_late: 0, files_lost: 0, files_refused: 0,
     delivery_reports: 0, delivery_reported: 0, delivery_conflicts: 0 }
+  /** 1.58.32: the records Onsen refused for good (a 4xx; also counted in `rejected`) and the last of them; /healthz onsen.skipped */
+  readonly skipped = { count: 0, last: null as (SkippedInfo & { at: string; key: string }) | null }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -512,7 +536,7 @@ export class OnsenClient {
     const { attachment_file_ids: _files, ...bare } = item
     const s = await this.post('/messages', bare, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
     if (s.status >= 200 && s.status < 300) { if (s.json?.duplicate) this.stats.duplicates++; else this.stats.posted++; return true }
-    if (s.status >= 400 && s.status < 500 && !RETRYABLE_4XX.has(s.status)) { this.reject(line, `HTTP ${s.status} ${String(s.json?.error ?? s.json?.detail ?? '').slice(0, 200)}`); return true }
+    if (refusedForGood(s)) { this.reject(line, `HTTP ${s.status} ${callSaid(s.json)}`, { kind: 'm', path: '/messages', status: s.status, code: errCode(s.json) }); return true }
     return s
   }
   recordEvent(ev: OnsenEvent): void { this.append({ k: 'e', r: ev }) }
@@ -691,17 +715,24 @@ export class OnsenClient {
     this.stats.last_error = why
   }
   private ok(): void { this.backoffMs = 0; this.nextTryAt = 0; this.stats.last_ok_at = new Date().toISOString(); this.stats.last_error = null }
-  private reject(line: unknown, why: string): void {
+  /** `skip` (1.58.32): Onsen refused it (a 4xx, an item's own refusal in a batch): counted in `skipped`, the last one kept for /healthz */
+  private reject(line: unknown, why: string, skip?: SkippedInfo): void {
     this.stats.rejected++
     try { appendFileSync(this.rejected, JSON.stringify({ at: new Date().toISOString(), why, line }) + '\n', { mode: 0o600 }) } catch {}
-    const key = (line as any)?.r?.idem_key ?? '?'
+    const key = lineKey(line)
+    if (skip) this.noteSkipped(1, skip, key)
     this.cfg.log('warn', `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
   }
   /** step 3: a whole batch refused: each line to rejected.jsonl, one log line for the lot */
-  private rejectRun(lines: unknown[], why: string): void {
+  private rejectRun(lines: unknown[], why: string, skip?: SkippedInfo): void {
     this.stats.rejected += lines.length
     try { appendFileSync(this.rejected, lines.map(line => JSON.stringify({ at: new Date().toISOString(), why, line })).join('\n') + '\n', { mode: 0o600 }) } catch {}
+    if (skip) this.noteSkipped(lines.length, skip, lineKey(lines[lines.length - 1]))
     this.cfg.log('warn', `onsen: rejected ${lines.length} line(s) (${why}); moved to rejected.jsonl, not retried`)
+  }
+  private noteSkipped(n: number, s: SkippedInfo, key: string): void {
+    this.skipped.count += n
+    this.skipped.last = { at: new Date().toISOString(), kind: s.kind, path: s.path, status: s.status, ...(s.code ? { code: s.code } : {}), key }
   }
   private headers(cred: string, extra: Record<string, string> = {}): Record<string, string> {
     return { 'Content-Type': 'application/json', Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}`, ...extra }
@@ -821,7 +852,8 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300 && Array.isArray(r.json?.results) && r.json.results.length === run.length) {
           r.json.results.forEach((res: any, n: number) => {
             if (res && res.error == null && res.id != null) { if (res.duplicate) this.stats.duplicates++; else this.stats.posted++ }
-            else this.reject(run[n]!.line, `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}${res?.status != null ? ` (${res.status})` : ''}`)
+            else this.reject(run[n]!.line, `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}${res?.status != null ? ` (${res.status})` : ''}`,
+              { kind: k, path, status: Number(res?.status ?? 0) || 0 })
             if (k === 't' && this.cfg.onThread && (res?.conflict === true || res?.error != null)) {
               if (res?.conflict === true) this.stats.thread_conflicts++
               try { this.cfg.onThread((run[n]!.line as any).r, res) } catch (e) { this.cfg.log('warn', `onsen: thread answer hook: ${errText(e)}`) }
@@ -830,9 +862,10 @@ export class OnsenClient {
           this.writeCursor(run[run.length - 1]!.end); this.ok()
           continue
         }
-        if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
+        if (refusedForGood(r)) {
           // refused as a whole (no single-item route for these): every line to rejected.jsonl, one log line, so the messages behind them are not held
-          this.rejectRun(run.map(x => x.line), `${path} answered HTTP ${r.status} ${String(r.json?.error ?? JSON.stringify(r.json?.detail ?? '')).slice(0, 200)}`)
+          this.rejectRun(run.map(x => x.line), `${path} answered HTTP ${r.status} ${errCode(r.json) ? callSaid(r.json) : String(r.json?.error ?? JSON.stringify(r.json?.detail ?? '')).slice(0, 200)}`,
+            { kind: k, path, status: r.status, code: errCode(r.json) })
           this.writeCursor(run[run.length - 1]!.end); this.ok()
           continue
         }
@@ -842,7 +875,7 @@ export class OnsenClient {
         // WO-145: a form answers' ack (the answers are already queued for the main; unacked, Onsen would hand them out again)
         const r = await this.post('/forms/ack', { ids: t.line.r.ids }, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) this.stats.posted++
-        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `HTTP ${r.status} ${String(r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`)
+        else if (refusedForGood(r)) this.reject(t.line, `HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'a', path: '/forms/ack', status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, '/forms/ack')
         this.writeCursor(t.end); this.ok(); i++
         continue
@@ -856,9 +889,11 @@ export class OnsenClient {
           if (st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++
           this.settleCall(c.idem, { fate: 'took', state: st ?? null })
         }
-        // a step Onsen already has past (it took a reply, or a lane's exit row, first) or a Call that is over: refused as a whole, not retried
-        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
-          this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${callSaid(r.json)}`)
+        // a step Onsen already has past (it took a reply, or a lane's exit row, first), a Call that is over, or (1.58.32) one this agent is not the
+        // recipient of (403 not_authorized), a Call Onsen does not have (404): refused for good, not retried, nothing behind it held
+        else if (refusedForGood(r)) {
+          this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${callSaid(r.json)}`,
+            { kind: 'c', path: `/v1/calls/${id}/state`, status: r.status, code: errCode(r.json) })
           this.settleCall(c.idem, { fate: 'refused', status: r.status, said: callSaid(r.json) })
         }
         else return this.failStatus(r, `/v1/calls/${id}/state`)
@@ -872,7 +907,8 @@ export class OnsenClient {
         const r = await this.post(`/messages/${encodeURIComponent(String(mid))}/delivery`, body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) { if (r.json?.duplicate) this.stats.duplicates++; else this.stats.delivery_reported++ }
         else if (r.status === 409) { this.stats.delivery_conflicts++; this.cfg.log('info', `onsen: delivery ${body.state} of Onsen message ${mid}: Onsen answered 409 (${callSaid(r.json)}); taken as delivered`) }
-        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `POST /messages/${mid}/delivery: HTTP ${r.status} ${callSaid(r.json)}`)
+        else if (refusedForGood(r)) this.reject(t.line, `POST /messages/${mid}/delivery: HTTP ${r.status} ${callSaid(r.json)}`,
+          { kind: 'r', path: `/messages/${mid}/delivery`, status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, `/messages/${mid}/delivery`)
         this.writeCursor(t.end); this.ok(); i++
         continue
@@ -880,7 +916,7 @@ export class OnsenClient {
       if (t.line.k === 'e') {
         const r = await this.post('/events', t.line.r, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) { if (r.json?.duplicate) this.stats.duplicates++; else this.stats.posted++ }
-        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `HTTP ${r.status} ${String(r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`)
+        else if (refusedForGood(r)) this.reject(t.line, `HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'e', path: '/events', status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, '/events')
         this.writeCursor(t.end); this.ok(); i++
         continue
@@ -895,7 +931,7 @@ export class OnsenClient {
           const res = r.json.results[k]
           if (res && res.error == null && res.id != null) { if (res.duplicate) this.stats.duplicates++; else this.stats.posted++; continue }
           const said = `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}`
-          if (!items[k]!.attachment_file_ids) { this.reject(run[k]!.line, said); continue }
+          if (!items[k]!.attachment_file_ids) { this.reject(run[k]!.line, said, { kind: 'm', path: '/messages/batch', status: Number(res?.status ?? 0) || 0 }); continue }
           // WO-190: refused with its files: once more without them; Onsen not answering holds the spool at this line (the ones before it are in;
           // those after it went in too and come back as duplicates)
           const s = await this.withoutFiles(run[k]!.line, items[k]!, said, cred)
@@ -904,15 +940,15 @@ export class OnsenClient {
         this.writeCursor(run[run.length - 1]!.end); this.ok()
         continue
       }
-      if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
+      if (refusedForGood(r)) {
         // the batch as a whole was refused: one by one, so one bad item does not hold the others
         for (let k = 0; k < run.length; k++) {
           const x = run[k]!
           const s = await this.post('/messages', items[k], cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
           if (s.status >= 200 && s.status < 300) { if (s.json?.duplicate) this.stats.duplicates++; else this.stats.posted++ }
-          else if (s.status >= 400 && s.status < 500 && !RETRYABLE_4XX.has(s.status)) {
-            const said = `HTTP ${s.status} ${String(s.json?.error ?? s.json?.detail ?? '').slice(0, 200)}`
-            if (!items[k]!.attachment_file_ids) this.reject(x.line, said)
+          else if (refusedForGood(s)) {
+            const said = `HTTP ${s.status} ${callSaid(s.json)}`
+            if (!items[k]!.attachment_file_ids) this.reject(x.line, said, { kind: 'm', path: '/messages', status: s.status, code: errCode(s.json) })
             else { const w = await this.withoutFiles(x.line, items[k]!, said, cred); if (w !== true) return this.failStatus(w, '/messages') }   // WO-190
           }
           else return this.failStatus(s, '/messages')
@@ -925,7 +961,7 @@ export class OnsenClient {
     this.again = true          // more may be past the read window, or appended meanwhile
   }
   private failStatus(r: { status: number; json: any }, path: string): void {
-    if (r.status === 401 || r.status === 403) {
+    if (credentialRefused(r)) {
       if (Date.now() - this.authWarnAt > HOUR) { this.authWarnAt = Date.now(); this.cfg.log('warn', `onsen: ${path} answered ${r.status}: the credential was not accepted`) }
     }
     this.fail(r.status ? `${path} answered HTTP ${r.status}` : `${path} unreachable (${String(r.json?.error ?? '').slice(0, 120)})`)
@@ -942,6 +978,7 @@ export class OnsenClient {
 
   health(): Record<string, unknown> {
     return { record: this.cfg.record, base: this.cfg.base, pending_bytes: this.pendingBytes(), backoff_s: Math.round(this.backoffMs / 1000), ...this.stats,
+      skipped: { count: this.skipped.count, last: this.skipped.last },        // 1.58.32: what Onsen refused for good, and the last of them
       active_lines: this.readLines().filter(l => !l.lifted_at && !l.rejected).length }
   }
 
@@ -1051,8 +1088,9 @@ export class OnsenClient {
         if (r.json?.duplicate) this.stats.duplicates++; else { this.stats.posted++; this.stats.lines_drawn++ }
         return true
       }
-      if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
-        this.reject(line, `HTTP ${r.status} ${String(r.json?.error ?? JSON.stringify(r.json?.detail ?? '')).slice(0, 200)}`)
+      if (refusedForGood(r)) {
+        this.reject(line, `HTTP ${r.status} ${errCode(r.json) ? callSaid(r.json) : String(r.json?.error ?? JSON.stringify(r.json?.detail ?? '')).slice(0, 200)}`,
+          { kind: 'l', path: '/restart-lines', status: r.status, code: errCode(r.json) })
         this.updateLine(line.r.idem_key, l => { l.rejected = true })
         return true
       }
@@ -1067,7 +1105,7 @@ export class OnsenClient {
     const r = await this.post('/restart-lines/lift', body, cred).catch(fail)
     if (r.status >= 200 && r.status < 300) { this.stats.posted++; this.stats.lines_lifted++; return true }
     if (r.status === 404) { this.cfg.log('info', `onsen: lift in chat ${body.chat}: no line to lift`); return true }
-    if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) { this.reject(line, `HTTP ${r.status}`); return true }
+    if (refusedForGood(r)) { this.reject(line, `HTTP ${r.status}`, { kind: 'u', path: '/restart-lines/lift', status: r.status, code: errCode(r.json) }); return true }
     return r
   }
 
