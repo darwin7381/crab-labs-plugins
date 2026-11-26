@@ -80,6 +80,22 @@ export type Facts = {
   caption?: string
   /** not from Telegram's own message: built from a person_message payload (its picture may be in Onsen only) */
   onsenFiles?: Array<{ kind?: string | null; name?: string | null; mime?: string | null; bytes?: number | null; url?: string | null }>
+  /** WO-197 (Chiron 15:27Z): the person_message's client.meta (what the bridge sent as client_meta; Onsen does not read it): each key an attribute of
+   *  the tag of the same name, as is, last; a key the tag already sets from its own facts keeps the tag's value */
+  clientMeta?: Record<string, string>
+}
+
+/** WO-197: client.meta as tag attributes: every key shaped as an attribute name (letters, digits, _; not starting with a digit), its value as is (a
+ *  string; another JSON value as its JSON text). Which keys is the bridge's business: none is named here. null: none */
+export function clientMetaOf(client: unknown): Record<string, string> | null {
+  const m = (client as any)?.meta
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return null
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(m)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(k) || v == null) continue
+    out[k] = typeof v === 'string' ? v : JSON.stringify(v)
+  }
+  return Object.keys(out).length ? out : null
 }
 export type InItem = OnsenItem & { deliver: true }
 export type Job = { key: string; item: InItem; at: number; tries: number; held: boolean; topic?: number }

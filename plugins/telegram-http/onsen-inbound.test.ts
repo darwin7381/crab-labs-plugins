@@ -3,7 +3,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { InboundStore, InboundWriter, inboundOn, inboundEffective, hasInboxPartner, heldText, type Job, type Facts } from './onsen-inbound.ts'
+import { InboundStore, InboundWriter, inboundOn, inboundEffective, hasInboxPartner, clientMetaOf, heldText, type Job, type Facts } from './onsen-inbound.ts'
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const until = async (fn: () => boolean, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await sleep(10) } return false }
@@ -29,6 +29,11 @@ test('WO-197: the switch takes effect only with an agent-inbox partner (LANES_IN
   expect(inboundEffective('*', 'adam', true)).toBe(true)
   expect(inboundEffective('0', 'adam', true)).toBe(false)
   expect(inboundEffective('lab-relay', 'adam', true)).toBe(false)
+})
+
+test('WO-197: client.meta → tag attributes: every key as is (no key named here); other JSON values as their text; not an attribute name: left out', () => {
+  expect(clientMetaOf({ meta: { a: '1', b: 'x y', reply_to_user_id: '42', n: 3, o: { k: 1 } } })).toEqual({ a: '1', b: 'x y', reply_to_user_id: '42', n: '3', o: '{"k":1}' })
+  for (const c of [null, {}, { meta: null }, { meta: [] }, { meta: {} }, { meta: { '1x': 'a', 'a-b': 'b', z: null } }]) expect(clientMetaOf(c)).toBe(null)
 })
 
 test('the store: facts kept on disk until delivered; then remembered (a second hand-over is a duplicate), across a restart', () => {

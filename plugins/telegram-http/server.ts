@@ -4424,6 +4424,8 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
     // that N album photos belong together.
     ...f.rfm,
   }
+  // WO-197 (Chiron 15:27Z): the bridge's client.meta, each key an attribute as is, last; the tag's own value wins on a key it already set
+  for (const [k, v] of Object.entries(f.clientMeta ?? {})) if (!(k in meta)) meta[k] = v
 
   // #6: photos sharing a media_group_id are ONE album — buffer them briefly
   // and deliver a SINGLE notification carrying image_path / image_path_2 / …
@@ -5758,6 +5760,8 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       inboundStore.stats.rebuilt++
       log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
     }
+    const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
+    if (cm) f = { ...f, clientMeta: cm }
     await finishInbound(f, 'onsen')
     inboundStore.finish([key, own])
     log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)

@@ -178,3 +178,18 @@ test('10. a permission prompt: only the Action (no Telegram message); the Bot AP
   expect(api.calls).toEqual([]); expect(api.polls).toEqual([])
   expect((await health(d)).connector.bot_api_refused).toEqual({})
 })
+
+test('11. client.meta (the bridge\'s client_meta): every key an attribute of the tag as is, last; a key the tag sets itself keeps its value; none: nothing added', async () => {
+  const base = { conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', kind: 'text', attachments: [], reply_to: null }
+  expect(await person({ ...base, message_id: '6011', text: '帶 meta', sent_at: new Date().toISOString(),
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1011', user: 'joey', user_id: String(JOEY), meta: { a: '1', b: 'x y', chat_id: 'not-this' } } }, 11)).toBe(200)
+  expect(await person({ ...base, message_id: '6012', text: '沒有 meta', sent_at: new Date().toISOString(),
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1012', user: 'joey', user_id: String(JOEY) } }, 12)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.message_id === '1011') && got.some(g => g.meta.message_id === '1012'), 8000)).toBe(true)
+  const withMeta = got.find(g => g.meta.message_id === '1011')!.meta, without = got.find(g => g.meta.message_id === '1012')!.meta
+  expect(withMeta.a).toBe('1')
+  expect(withMeta.b).toBe('x y')
+  expect(withMeta.chat_id).toBe(String(JOEY))
+  expect(Object.keys(withMeta).slice(-2)).toEqual(['a', 'b'])
+  expect(Object.keys(withMeta).filter(k => !(k in without)).sort()).toEqual(['a', 'b'])
+})
