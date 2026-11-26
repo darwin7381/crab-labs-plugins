@@ -352,3 +352,8 @@ plugins/telegram-http/server.ts::    expiry_note: COMMAND_NOT_CHOSEN },
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::at 5 s (and after) no cancel comes from the daemon
 plugins/telegram-http/onsen-actions.test.ts::Onsen 0.36.0: expiry_note goes with expires_at on an open Action, one line, 2000 characters at most
 plugins/telegram-http/test-fixtures/onsen-standin.ts::Onsen 0.36.0 (onsen_actions.py create): expiry_note only with state open and expires_at
+plugins/telegram-http/server.ts::summary: '要不要讓它看到 /clear 之前的對話？', body: said,
+plugins/telegram-http/server.ts::if (!h.id) { ca.done = true; clearAsks.delete(h.key); return alone(`Onsen did not make it (${h.state})`) }
+plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the reply sentence is the Action's body; no Onsen message for it
+plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::4b. /clear with no Action (Onsen refused it)
+plugins/telegram-http/test-fixtures/onsen-standin.ts::if (st.actionRefuse?.[who]) return

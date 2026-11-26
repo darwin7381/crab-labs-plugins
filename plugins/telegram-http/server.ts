@@ -1006,9 +1006,12 @@ function clearHooks(chat: string, msgId: number | undefined, fromId: string, her
     },
   }
 }
-/** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」, Chiron mesh 12869 point 3, 12878, 12916 point 1): a connector's /clear. The reply is one Onsen
- *  message (the /clear's response: its turn); the choice 「不要讓它看到之前的」 is one Action with one option, expires_at 5 s later (the bridge draws the
- *  seconds left) and expiry_note CLEAR_NOT_PRESSED (Onsen 0.36.0): expiry is Onsen's, which marks it expired then and writes the note; this daemon sends
+/** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」, Chiron mesh 12869 point 3, 12878, 12916 point 1, rule 18:48Z point 2): a connector's /clear is
+ *  ONE message: the choice 「不要讓它看到之前的」 is one Action whose body is the reply (「✅ 已送 /clear …。它還查得到之前的對話。」; the bridge draws a
+ *  menu Action as one message, body and buttons), no reply message beside it; the /clear's response is the Action, as /model's. No Action (Actions
+ *  off, no owner, Onsen refused it): the reply as one Onsen message (the /clear's response: its turn), as before, so the sentence always arrives. The
+ *  Action has one option, expires_at 5 s later (the bridge draws the seconds left) and expiry_note CLEAR_NOT_PRESSED (Onsen 0.36.0): expiry is Onsen's,
+ *  which marks it expired then and writes the note; this daemon sends
  *  no cancel for it (its own 5 s cancel came 0.6 s after Onsen's expiry on the lab: version_conflict, Action 211). Pressed inside the 5 s: the line drawn at
  *  the /clear's time in its conversation (POST /restart-lines with conversation_id, Onsen 0.35.8: a person with no app account too); Onsen queues
  *  restart_line, the bridge draws the line and its lift button; a lift made elsewhere is not told to the daemon (Onsen applies it when asked) */
@@ -1021,17 +1024,24 @@ function connectorClearHooks(chat: string, clearMsgId: string, by: string, here?
   const at = atIso && Number.isFinite(Date.parse(atIso)) ? new Date(atIso).toISOString() : new Date().toISOString()
   return {
     afterClear: async okText => {
-      await sendTextWithMaybeKeyboard(chat, `${okText}。它還查得到之前的對話。`, undefined, here)
+      const said = `${okText}。它還查得到之前的對話。`
+      const alone = async (why: string): Promise<true> => {                // no Action: the sentence as its own message (the default stands)
+        log('warn', `connector: /clear ${clearMsgId} in chat ${chat}: no Action for 「不要讓它看到之前的」 (${why}); the reply sent as a message, the default stands`)
+        await sendTextWithMaybeKeyboard(chat, said, undefined, here)
+        return true
+      }
       const acts = onsenActions, assignees = askees([chat])
-      if (!acts?.on || !assignees.length) { log('warn', `connector: /clear ${clearMsgId} in chat ${chat}: no Action for 「不要讓它看到之前的」 (${!acts?.on ? 'Actions off' : 'no owner'}); the default stands`); return true }
+      if (!acts?.on || !assignees.length) return alone(!acts?.on ? 'Actions off' : 'no owner')
       const until = Date.now() + CLEAR_KEEP_S * 1000
-      const h = acts.open({ source: 'menu', menu_kind: 'other', session_id: 'main', assignees, summary: '要不要讓它看到 /clear 之前的對話？',
+      const h = acts.open({ source: 'menu', menu_kind: 'other', session_id: 'main', assignees, summary: '要不要讓它看到 /clear 之前的對話？', body: said,
         options: [{ id: 'line', label: CLEAR_OPTION }], expires_at: new Date(until).toISOString(), expiry_note: CLEAR_NOT_PRESSED }, `clear:${ONSEN_AGENT}:${chat}:${clearMsgId}`)
-      if (!h) return true
+      if (!h) return alone('not a valid Action')
       const ca: ClearAsk = { h, chat, clearMsgId, at, until, by, done: false }
       clearAsks.set(h.key, ca)
       while (clearAsks.size > 100) clearAsks.delete(clearAsks.keys().next().value!)
-      log('info', `connector: /clear ${clearMsgId} in chat ${chat}: no restart line (it still reads what came before); 「不要讓它看到之前的」 asked in Onsen for ${CLEAR_KEEP_S} s`)
+      await h.tail                                                             // the create's answer: Onsen refused it → the sentence alone
+      if (!h.id) { ca.done = true; clearAsks.delete(h.key); return alone(`Onsen did not make it (${h.state})`) }
+      log('info', `connector: /clear ${clearMsgId} in chat ${chat}: no restart line (it still reads what came before); the reply and 「不要讓它看到之前的」 one Action in Onsen (${h.id}) for ${CLEAR_KEEP_S} s`)
       return true
     },
   }

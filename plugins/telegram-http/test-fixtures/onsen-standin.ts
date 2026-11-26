@@ -22,7 +22,9 @@ export type OnsenStandin = {
    *  ~4000 characters of text and one per file); off: they stay pending (bridgeOn() draws them later) */
   st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number; bridge: Record<Who, { on: boolean; delayMs: number; next: number }>
     /** WO-197 (defect 3): a delay before a stored file is served (GET /v1/files/<id>: a large photo) */
-    fileDelayMs?: number }
+    fileDelayMs?: number
+    /** a status POST /v1/actions (a create) answers with for that credential (Onsen refuses to make the Action) */
+    actionRefuse?: Record<Who, number> }
   /** WO-197: the connector's writes (POST /v1/messages), reactions (POST /v1/messages/<id>/reactions) and edits (PUT /v1/messages/<id>) */
   connector: Array<{ who: Who; kind: 'message' | 'reaction' | 'edit'; id: number; body: any }>
   /** WO-197 (defects 1, 2): Actions (CONTRACT §6, fleet-core onsen_actions.py as onsen-actions-daemon.test.ts has it): POST /v1/actions (made open,
@@ -139,6 +141,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
         const k = `${who}:${headers['idempotency-key'] ?? ''}`
         const had = headers['idempotency-key'] ? actions.get(actionKeys.get(k) ?? '') : undefined
         if (had) return Response.json({ data: had })
+        if (st.actionRefuse?.[who]) return Response.json({ error: { code: 'invalid_request', message: 'refused (test)' } }, { status: st.actionRefuse[who]! })
         // Onsen 0.36.0 (onsen_actions.py create): expiry_note only with state open and expires_at
         if (body?.expiry_note != null && ((body?.state ?? 'open') !== 'open' || !body?.expires_at)) return aerr(400, 'expiry_note 只跟 state open 與 expires_at 一起送')
         const id = String(++nextAction), now = new Date().toISOString()

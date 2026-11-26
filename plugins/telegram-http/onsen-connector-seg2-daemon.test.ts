@@ -4,7 +4,7 @@
 //   commands   the list setMyCommands gives Telegram is PUT /v1/members/<agent>/commands (no /start, /help: the bridge's own); /status from Onsen is
 //              answered by today's handler as one Onsen message in the command's turn; /model is one Action (menu model_picker, the answer its body,
 //              no second message), a press runs what the Telegram tap runs; a page message "/status" is a command too; an unknown slash goes on
-//   /clear     the reply one message; 「不要讓它看到之前的」 an Action that expires in 5 s with its expiry_note (Onsen 0.36.0; no cancel from the daemon); pressed inside:
+//   /clear     one message: 「不要讓它看到之前的」 an Action whose body is the reply (no Action: the reply alone, as before); it expires in 5 s with its expiry_note (Onsen 0.36.0; no cancel from the daemon); pressed inside:
 //              the line drawn by conversation_id (never client / chat) at the /clear's time
 //   threads    a person's message in a thread: the tag's topic / topic_name as the person's message carried them, the router's topic Onsen's thread;
 //              reply(topic=<the tag's>) is written with that thread; a thread Onsen refuses is dropped and the reply written
@@ -119,14 +119,18 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 }, 40000)
 
-test('4. /clear: typed on the pane; the reply one message (its turn); 「不要讓它看到之前的」 an Action expiring in 5 s with its expiry_note, no cancel from the daemon (expiry is Onsen\'s); pressed inside: the line by conversation_id at the /clear\'s time', async () => {
+test('4. /clear: typed on the pane; ONE message: 「不要讓它看到之前的」 an Action whose body is the reply, no reply message beside it; expiring in 5 s with its expiry_note, no cancel from the daemon (expiry is Onsen\'s); pressed inside: the line by conversation_id at the /clear\'s time', async () => {
   const t0 = new Date().toISOString()
+  const replies = () => said().filter(b => String(b.body).includes('已送 `/clear`'))
   expect((await hand(k, cmd(2003, '/clear', { sent_at: t0 }), 3)).json.handled_here).toBe(true)
-  expect(await until(() => said().some(b => String(b.body).includes('已送 `/clear`') && b.turn_id === `daemon:${JOEY}:2003`), 8000)).toBe(true)
-  expect(said().find(b => b.turn_id === `daemon:${JOEY}:2003`)!.body).toContain('它還查得到之前的對話。')
-  expect(await until(() => made('k', x => x.options?.[0]?.id === 'line').length === 1, 5000)).toBe(true)
+  expect(await until(() => made('k', x => x.options?.[0]?.id === 'line').length === 1, 8000)).toBe(true)
   const a = made('k', x => x.options?.[0]?.id === 'line')[0]!
   expect(a).toMatchObject({ source: 'menu', menu_kind: 'other', options: [{ id: 'line', label: '不要讓它看到之前的' }], assignees: ['joey'] })
+  // Chiron's rule 18:48Z point 2 (lab round 5 on 1.58.29): the reply sentence is the Action's body; no Onsen message for it
+  expect(a.body).toEqual({ format: 'markdown', text: expect.stringContaining('已送 `/clear`') })
+  expect(a.body.text.endsWith('。它還查得到之前的對話。')).toBe(true)
+  await sleep(1000)
+  expect(replies()).toHaveLength(0)
   const left = Date.parse(a.expires_at) - Date.now()
   expect(left).toBeGreaterThan(2500); expect(left).toBeLessThanOrEqual(5100)
   // Onsen 0.36.0 (Chiron mesh 12916 point 1): the create carries expires_at 5 s ahead and expiry_note; at 5 s (and after) no cancel comes from the daemon
@@ -156,9 +160,25 @@ test('4. /clear: typed on the pane; the reply one message (its turn); 「不要�
   expect(await until(() => acall(b.id, 'applied').length === 1, 5000)).toBe(true)
   await sleep(5500)
   expect(acall(b.id, 'cancel')).toHaveLength(0)
+  expect(b.body.text).toContain('已送 `/clear`')
+  expect(replies()).toHaveLength(0)                                          // neither /clear wrote the reply as a message
   expect(tm('capture-pane', '-t', pane, '-p').stdout).toContain('/clear')
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 }, 40000)
+
+test('4b. /clear with no Action (Onsen refused it): the reply is one Onsen message in the /clear\'s turn, as before; the person always gets the sentence', async () => {
+  // a connector's Actions are on whatever ONSEN_ACTIONS says (connectorNow): the no-Action path a connector meets is Onsen refusing (or no owner)
+  onsen.st.actionRefuse = { k: 400 }
+  try {
+    expect((await hand(k, cmd(2041, '/clear'), 41)).json.handled_here).toBe(true)
+    expect(await until(() => said().some(b => String(b.body).includes('已送 `/clear`') && b.turn_id === `daemon:${JOEY}:2041`), 10000)).toBe(true)
+    expect(said().find(b => b.turn_id === `daemon:${JOEY}:2041`)!.body).toContain('它還查得到之前的對話。')
+    expect(onsen.acalls.some(c => c.who === 'k' && c.method === 'POST' && c.path === '/v1/actions' && String(c.body?.body?.text ?? '').includes('已送 `/clear`'))).toBe(true)
+    expect(k.log()).toContain('no Action for 「不要讓它看到之前的」 (Onsen did not make it (failed)); the reply sent as a message, the default stands')
+    expect(said().filter(b => String(b.body).includes('已送 `/clear`'))).toHaveLength(1)
+  } finally { onsen.st.actionRefuse = {} }
+  expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
+}, 30000)
 
 test('5. a page message "/status" (via web, kind text) is a command too; "/nosuch x" goes on to the session as a message', async () => {
   const web = { ...cmd(2005, '/status'), via: 'web', kind: 'text', client: { name: 'telegram', chat: String(JOEY), msg_id: 'form-6105', user: 'joey', user_id: String(JOEY) } }
