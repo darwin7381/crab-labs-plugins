@@ -27,7 +27,7 @@ beforeAll(async () => {
   const env = { ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude', ONSEN_BRIDGE_RETRY_MS: '50,50' }
   ;[d, sw] = await Promise.all([
     // named in the plist, no token: a connector from the start
-    startTgDaemon(api, join(root, 'c'), JOEY, { ...env, GENESIS_LANES: '0', TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'lab-relay, adam', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'),
+    startTgDaemon(api, join(root, 'c'), JOEY, { ...env, GENESIS_LANES: '0', TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'lab-relay, adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'),
         TELEGRAM_ALBUM_CAP_MS: '3000' },
       h => h?.ok === true),
     // the machine config's line, read again: not named at first (polls), then named, then taken off

@@ -50,13 +50,15 @@ export function bridgeOn(value: string | undefined, agent: string): boolean {
 export class BridgeSwitch {
   private at = -Infinity
   private v: string | undefined
-  constructor(private o: { agent: string; plist?: string; file: string; everyMs?: number; read?: (f: string) => string; now?: () => number }) {}
+  constructor(private o: { agent: string; plist?: string; file: string; everyMs?: number; read?: (f: string) => string; now?: () => number
+    /** WO-197 segment 2: the machine config's key (default ONSEN_BRIDGE; ONSEN_OWNER: the agent's owner) */
+    key?: string }) {}
   value(): string | undefined {
     if (this.o.plist !== undefined) return this.o.plist
     const now = (this.o.now ?? Date.now)()
     if (now - this.at >= (this.o.everyMs ?? 30_000)) {
       let v: string | undefined
-      try { v = parseFleetConfig((this.o.read ?? (f => readFileSync(f, 'utf8')))(this.o.file)).ONSEN_BRIDGE } catch {}
+      try { v = parseFleetConfig((this.o.read ?? (f => readFileSync(f, 'utf8')))(this.o.file))[this.o.key ?? 'ONSEN_BRIDGE'] } catch {}
       this.v = v; this.at = now
     }
     return this.v
@@ -114,6 +116,22 @@ export class OnsenIds {
     this.msg.set(key, { id: String(id), at: (this.o.now ?? Date.now)() })
     return String(id)
   }
+  /** WO-197 segment 2: the conversation a chat stands for, as Onsen answered a write (`member:<name>` → their direct conversation) */
+  know(chat: string, id: string): void { this.conv.set(chat, { id, at: (this.o.now ?? Date.now)() }) }
+  /** WO-197 segment 2: a conversation's thread for a client thread (the topic number a person's message carried): person_message's own `thread`
+   *  (learned as they come), else GET /v1/conversations/<id>/threads?client_thread=<n>; null when Onsen has none */
+  private threads = new Map<string, { id: string; at: number }>()
+  learnThread(cid: string, clientThread: string, thread: string): void { this.threads.set(`${cid}:${clientThread}`, { id: thread, at: (this.o.now ?? Date.now)() }) }
+  async thread(chat: string, clientThread: string): Promise<string | null> {
+    const cid = await this.conversation(chat)
+    const key = `${cid}:${clientThread}`, had = this.threads.get(key)
+    if (had && this.fresh(had)) return had.id
+    const r = await this.o.request('GET', `/v1/conversations/${cid}/threads?client_thread=${encodeURIComponent(clientThread)}`, undefined, TRY_MS)
+    const it = r && r.status === 200 ? (r.json?.items ?? r.json?.data?.items ?? [])[0] : undefined
+    if (!it?.thread) return null
+    this.learnThread(cid, clientThread, String(it.thread))
+    return String(it.thread)
+  }
   /** the numbers a message became on its client are known (the bridge's report): each stands for it */
   learn(cid: string, nums: string[], id: string): void {
     const at = (this.o.now ?? Date.now)()
@@ -125,21 +143,26 @@ export class OnsenIds {
 export type Said = { onsenId: string; conversationId: string; ids: string[]; held: boolean; why?: string }
 export type SayAsk = { chat: string; sender: string; text: string; kind?: string; turn_id?: string | null; replyTo?: string | null; thread?: string | null
   silent?: boolean; fileIds?: string[]; attachments?: Array<{ name: string; mime?: string; size?: number }> }
+/** WO-197 segment 2: a chat that names a person rather than a conversation (`member:<name>`): written with `to` (their direct conversation with this
+ *  agent, CONTRACT §7d), for what has no chat of its own (the agent's owner: system warnings, ops notices) */
+export const MEMBER_CHAT = /^member:([a-z0-9][a-z0-9_.-]{0,63})$/
+export const memberChat = (name: string): string => `member:${name}`
 
 /** what the agent says, written into Onsen; then the bridge's report waited for (WAIT_MS) */
 export class ConnectorSay {
-  readonly stats = { written: 0, duplicates: 0, retries: 0, refused: 0, delivered: 0, held: 0, direct: 0, reply_unknown: 0, reacted: 0, edited: 0 }
+  readonly stats = { written: 0, duplicates: 0, retries: 0, refused: 0, delivered: 0, held: 0, direct: 0, reply_unknown: 0, reacted: 0, edited: 0, thread_dropped: 0 }
   constructor(private o: { request: Request; ids: OnsenIds; agent: string; log: Log; waitMs?: number; pollMs?: number; retryMs?: number[] }) {}
   private sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
   async say(a: SayAsk): Promise<Said> {
-    const cid = await this.o.ids.conversation(a.chat)
+    const to = MEMBER_CHAT.exec(String(a.chat))?.[1]
+    const cid = to ? '' : await this.o.ids.conversation(a.chat)
     let reply: string | null = null
-    if (a.replyTo != null && String(a.replyTo) !== '') {
+    if (!to && a.replyTo != null && String(a.replyTo) !== '') {
       reply = await this.o.ids.message(a.chat, String(a.replyTo)).catch(e => { this.o.log('warn', `connector: reply_to ${a.replyTo}: ${e instanceof Error ? e.message : e}`); return null })
       if (reply == null) { this.stats.reply_unknown++; this.o.log('info', `connector: reply_to ${a.replyTo} is not a message Onsen knows in chat ${a.chat}: written without it`) }
     }
-    const body: Record<string, unknown> = { conversation_id: cid, idem_key: `c:${this.o.agent}:${cid}:out:${randomUUID()}`, sender: a.sender, body: a.text,
+    const body: Record<string, unknown> = { ...(to ? { to } : { conversation_id: cid }), idem_key: `c:${this.o.agent}:${to ? `to-${to}` : cid}:out:${randomUUID()}`, sender: a.sender, body: a.text,
       kind: a.kind ?? 'text', sent_at: new Date().toISOString(), ...(reply != null ? { reply_to_message_id: reply } : {}),
       ...(a.thread ? { thread: String(a.thread) } : {}), ...(a.silent ? { urgency: 'silent', meta: { silent: true } } : {}),
       ...(a.turn_id ? { turn_id: String(a.turn_id).slice(0, 120) } : {}),
@@ -149,6 +172,15 @@ export class ConnectorSay {
     for (let i = 0; ; i++) {
       try { r = await this.o.request('POST', '/v1/messages', body, TRY_MS); err = '' } catch (e) { r = null; err = e instanceof Error ? e.message : String(e) }
       if (r && r.status < 300) break
+      // WO-197 (segment 2, sonn's ruling 9): a thread Onsen does not have in this conversation (a Telegram topic number a lane kept from before the
+      // switch): written again without it, once
+      if (r && r.status === 400 && body.thread != null && /thread/i.test(why(r))) {
+        this.o.log('warn', `connector: Onsen refused thread ${body.thread} (${why(r)}): written without a thread`)
+        delete body.thread
+        this.stats.thread_dropped++
+        i--
+        continue
+      }
       if (r && r.status >= 400 && r.status < 500) { this.stats.refused++; throw new Error(`${NOT_TAKEN}（${why(r)}）`) }
       if (!r && !err) { this.stats.refused++; throw new Error(`${NOT_TAKEN}（no mesh credential）`) }
       if (i >= waits.length) { this.stats.refused++; throw new Error(`${NOT_TAKEN}（${err || why(r)}）`) }
@@ -157,6 +189,7 @@ export class ConnectorSay {
     }
     const d = r!.json?.data ?? r!.json ?? {}
     const id = String(d.message_id ?? d.id), conv = String(d.conversation_id ?? cid)
+    if (to && conv) this.o.ids.know(a.chat, conv)                        // the owner's conversation, for what follows
     if (d.duplicate) this.stats.duplicates++; else this.stats.written++
     if (d.delivery === 'sent') { this.stats.direct++; return { onsenId: id, conversationId: conv, ids: [], held: false } }   // nothing draws it
     return this.waitReport(id, conv)
@@ -211,4 +244,15 @@ export function numbersOf(m: any): string[] {
     if (n && !out.includes(n)) out.push(n)
   }
   return out.sort((x, y) => (/^\d+$/.test(x) && /^\d+$/.test(y) ? Number(x) - Number(y) : x < y ? -1 : x > y ? 1 : 0))
+}
+
+/** WO-197 segment 2 (sonn's ruling 4): Onsen draws a lane's or the router's label itself (fleet-core onsen_bridge.author_label of the sender part:
+ *  〔agent·工作線#n〕 for <agent>.worker.<n>, 〔agent·分流器〕 for router), so the same line first in the text is dropped: the bridge does not draw it twice.
+ *  Another first line (the 「｜負責：X」 variant) stays. `kindName`: a lane kind's name (lanes.ts KIND_NAME, Onsen's LANE_NAMES) */
+export function withoutOnsenLabel(text: string, sender: string, agent: string, kindName: (k: string) => string): string {
+  const nl = text.indexOf('\n')
+  if (nl < 0) return text
+  const m = /^([a-z0-9][a-z0-9-]*)\.([a-z_]+)\.(\d+)$/.exec(sender)
+  const label = sender === 'router' ? `〔${agent}·分流器〕` : m ? `〔${m[1]}·${kindName(m[2]!)}#${m[3]}〕` : null
+  return label && text.slice(0, nl) === label ? text.slice(nl + 1) : text
 }

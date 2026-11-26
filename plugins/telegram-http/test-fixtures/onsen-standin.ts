@@ -33,6 +33,13 @@ export type OnsenStandin = {
   press: (id: string, option: string, by?: string) => { action_id: string; option_id: string; version: number }
   /** WO-197: the bridge of `who` comes on: what waits pending is drawn now */
   bridgeOn: (who: Who) => void
+  /** WO-197 segment 2 (CONTRACT §7d 「連接器這一頭」): each connector's command list (PUT /v1/members/<name>/commands), the threads it opened
+   *  (POST /v1/conversations/<id>/threads; PUT …/threads/<t>; GET …/threads?client_thread=), its restart lines (the old POST /restart-lines) */
+  commands: Array<{ who: Who; name: string; body: any; at: number }>
+  threads: Array<{ who: Who; cid: string; thread: string; name: string; state: string; client_thread: string | null; history: any[] }>
+  /** the bridge drew thread `thread` as client topic `client_thread` (PUT /v1/bridge/threads) */
+  mapThread: (thread: string, client_thread: string) => void
+  lines: Array<{ who: Who; body: any; at: number }>
   /** WO-197: the conversation of a chat (made the first time); a person's message in it from Telegram (as the bridge writes it: its number an alias) */
   conv: (chat: string) => string
   heard: (who: Who, chat: string, n: number, text: string) => number
@@ -69,6 +76,8 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
   let nextAction = 160
   const aerr = (status: number, message: string) => Response.json({ error: { code: status === 409 ? 'version_conflict' : 'not_found', message } }, { status })
   const connector: OnsenStandin['connector'] = []
+  const commands: OnsenStandin['commands'] = [], threads: OnsenStandin['threads'] = [], lines: OnsenStandin['lines'] = []
+  let nextThread = 300
   // WO-197: a connector's conversations: one per chat (id 700 + n); `onsen:<id>` chats have no client (nothing draws them)
   const convs: string[] = []
   const convOf = (chat: string): number => { let i = convs.indexOf(chat); if (i < 0) { convs.push(chat); i = convs.length - 1 } return 700 + i }
@@ -177,13 +186,51 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       const m = chat == null ? undefined : msgs.find(x => x.who === who && String(x.item.chat) === chat && (x.aliases.includes(n) || `form-${x.id}` === n))
       return m ? Response.json({ api_version: 1, data: { id: String(m.id), conversation_id: bm[1] } }) : Response.json({ error: { code: 'not_found', message: `no ${n}` } }, { status: 404 })
     }
+    const cm = path.match(/^\/v1\/members\/([^/]+)\/commands$/)
+    if (cm && req.method === 'PUT') {
+      if (decodeURIComponent(cm[1]!) !== who && !(who.length <= 2)) return Response.json({ error: { code: 'not_authorized', message: 'own commands only' } }, { status: 403 })
+      const ok = Array.isArray(body?.commands) && body.commands.length <= 100 && body.commands.every((x: any) => x && Object.keys(x).sort().join() === 'description,name'
+        && /^[a-z0-9_]{1,32}$/.test(x.name) && typeof x.description === 'string' && x.description.trim() && !x.description.includes('\n') && x.description.length <= 256)
+      if (!ok) return Response.json({ error: { code: 'invalid_request', message: 'commands: {name, description}' } }, { status: 400 })
+      commands.push({ who, name: decodeURIComponent(cm[1]!), body, at: Date.now() })
+      return Response.json({ api_version: 1, data: { member: decodeURIComponent(cm[1]!), commands: body.commands } })
+    }
+    const ct = path.match(/^\/v1\/conversations\/(\d+)\/threads(?:\/(\d+))?$/)
+    if (ct) {
+      const cid = ct[1]!
+      if (req.method === 'POST' && !ct[2]) {
+        if (typeof body?.name !== 'string' || !body.name.trim() || body.name.length > 128 || body.name.includes('\n')) return Response.json({ error: { code: 'invalid_request', message: 'name' } }, { status: 400 })
+        const t = { who, cid, thread: String(++nextThread), name: body.name.trim(), state: 'open', client_thread: null, history: [{ op: 'open', name: body.name.trim() }] }
+        threads.push(t)
+        return Response.json({ api_version: 1, data: { thread: t.thread } }, { status: 201 })
+      }
+      if (req.method === 'PUT' && ct[2]) {
+        const t = threads.find(x => x.cid === cid && x.thread === ct[2])
+        if (!t) return Response.json({ error: { code: 'not_found', message: `no thread ${ct[2]}` } }, { status: 404 })
+        if (!['open', 'closed'].includes(body?.state)) return Response.json({ error: { code: 'invalid_request', message: 'state' } }, { status: 400 })
+        t.state = body.state; if (body.name) t.name = body.name; t.history.push({ op: body.state, ...(body.name ? { name: body.name } : {}) })
+        return Response.json({ api_version: 1, data: { thread: t.thread, name: t.name, state: t.state } })
+      }
+      if (req.method === 'GET' && !ct[2]) {
+        const q = u.searchParams.get('client_thread')
+        return Response.json({ api_version: 1, items: threads.filter(x => x.cid === cid && (q == null || x.client_thread === q)).map(x => ({ thread: x.thread, name: x.name, state: x.state, client_thread: x.client_thread })), next_cursor: null })
+      }
+    }
+    if (path === '/restart-lines' && req.method === 'POST') {      // Onsen 0.35.8: conversation_id, or the old agent / client / chat; both: 400
+      if (body?.conversation_id != null && (body.client != null || body.chat != null || body.agent != null)) return Response.json({ detail: 'conversation_id or client / chat, not both' }, { status: 400 })
+      lines.push({ who, body, at: Date.now() }); return Response.json({ id: 900 + lines.length, at: body?.at ?? new Date().toISOString(), duplicate: false })
+    }
     if (path === '/v1/messages' && req.method === 'POST') {
       if (st.a500[who]) return Response.json({ error: { message: 'database is down' } }, { status: 500 })
       const bad = ['client', 'chat', 'delivery', 'client_msg_id', 'backfilled', 'deliver'].filter(k => k in (body ?? {}))
       if (bad.length || (body?.conversation_id == null) === (body?.to == null)) return Response.json({ error: { message: `with conversation_id / to, no ${bad.join(', ')}` } }, { status: 400 })
       const had = msgs.find(m => m.who === who && m.item.idem_key === body.idem_key)
       if (had) return Response.json({ api_version: 1, data: { message_id: String(had.id), conversation_id: String(body.conversation_id), duplicate: true, delivery: had.delivery?.state ?? 'sent' } })
-      const cid = Number(body.conversation_id), chat = chatOf(cid) ?? `onsen-${cid}`
+      // WO-197 segment 2: `to` (a person: their direct conversation with this agent, one per person); a thread must be one of the conversation's
+      const cref = body.to != null ? String(convOf(`to:${body.to}`)) : String(body.conversation_id)
+      if (body.thread != null && !threads.some(x => x.cid === cref && x.thread === String(body.thread)))
+        return Response.json({ error: { code: 'invalid_request', message: `thread ${body.thread}: not a thread of conversation ${cref}` } }, { status: 400 })
+      const cid = Number(cref), chat = chatOf(cid) ?? `onsen-${cid}`
       const drawn = chatOf(cid) != null && !!st.bridge[who]
       const m: Msg = { id: next++, who, item: { ...body, chat, agent: 'adam', direction: 'out', status: 'ok' }, at: Date.now(), path: '/messages', aliases: [],
         files: body.attachment_file_ids ?? [], delivery: drawn ? { state: 'pending' } : { state: 'sent', delivered_at: new Date().toISOString() } }
@@ -250,7 +297,8 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
   return {
-    port: server.port!, msgs, seen, files, st, inbox, put, connector, actions, acalls,
+    port: server.port!, msgs, seen, files, st, inbox, put, connector, actions, acalls, commands, threads, lines,
+    mapThread: (thread, client_thread) => { const t = threads.find(x => x.thread === thread); if (t) t.client_thread = client_thread },
     press: (id, option, by = 'joey') => {
       const a = actions.get(id)!
       Object.assign(a, { state: 'resolved', selected_option_id: option, resolved_by: by, version: a.version + 1 })

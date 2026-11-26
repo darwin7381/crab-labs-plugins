@@ -53,7 +53,7 @@ test('server.ts: a topic message is taken by its thread id (is_topic_message), t
   // lanes-topics (item 2): topicOfMessage, the one reader (inbound and callback messages); the meta shows it as topic="…" (lanes-topics-send.test.ts)
   expect(src).toContain("return m?.message_thread_id != null && m?.is_topic_message !== false ? Lanes.topicId(m.message_thread_id) : undefined")
   expect(src).toContain('const inTopic = Lanes.LANES_ON ? topicOfMessage(ctx.message) : undefined')
-  expect(src).toContain('message_thread_id: meta.topic,')
+  expect(src).toContain('message_thread_id: routeTopic ?? meta.topic,')     // WO-197 segment 2: a connector's router topic is Onsen's thread
   const f = src.slice(src.indexOf('async function laneTopicsAtStart('), src.indexOf('// Board ops room'))
   // lanes-topics (item 1): the one decision (lanes-topics.ts topicModeAtStart: enable sends both fields in one call; lanes-topics-mode.test.ts)
   expect(f).toContain('await topicModeAtStart(topicMode(), me as TopicMe, {')

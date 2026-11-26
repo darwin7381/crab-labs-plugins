@@ -76,7 +76,7 @@ import { parseFleetConfig } from './fleet-config.ts'
 // (GENESIS_LANES=1); with it unset the daemon runs the fleet code paths unchanged. In lanes mode nothing here delivers to
 // the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
 import * as Lanes from './lanes.ts'
-import { topicMode, topicModeAtStart, topicVerdict, type TopicMe } from './lanes-topics.ts'
+import { topicLink, topicMode, topicModeAtStart, topicVerdict, type TopicMe } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
@@ -517,7 +517,6 @@ async function sendOnsenFirst(o: { chat: string; sender: string; text: string; r
 /** WO-197 (connector mode): one thing the agent says (the main's reply, a lane's line, a router notice), written into Onsen with conversation_id: its
  *  files stored in Onsen first (always: the bridge takes them from there), then the bridge's report waited for (3 s). Throws 「Onsen 沒收下…」 when Onsen
  *  did not take it (or one of its files). A Telegram topic has no Onsen thread known here yet (segment 2: threads): written without one */
-const connectorTopicSaid = new Set<string>()
 async function connectorReply(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; files: string[]
   replyTo?: string | number | null; topic?: number; silent?: boolean; turn_id?: string | null }): Promise<Connector.Said> {
   if (!connectorSay) throw new Error(`${Connector.NOT_TAKEN}（connector mode: this daemon has no Onsen client）`)
@@ -534,13 +533,202 @@ async function connectorReply(o: { chat: string; sender: string; text: string; r
     if (!got[0]) throw new Error(`${Connector.NOT_TAKEN}（檔案 ${name} 沒存進 Onsen）`)
     ids.push(got[0]); rows.push(row)
   }
-  if (o.topic != null && !connectorTopicSaid.has(`${o.chat}:${o.topic}`)) {
-    connectorTopicSaid.add(`${o.chat}:${o.topic}`)
-    log('warn', `connector: topic ${o.topic} in chat ${o.chat} has no Onsen thread known here (threads are segment 2): written without a thread`)
-  }
+  // WO-197 segment 2: the topic is Onsen's thread (the lanes keep Onsen's ids; the reply tool's topic is turned into it first: connectorTopicArg); one
+  // Onsen does not have in this conversation is dropped by ConnectorSay (a Telegram topic kept from before the switch)
   const kind = body.trim() || !o.files.length ? (o.rich ? 'rich' : 'text') : PHOTO_EXTS.has(extname(o.files[0]!).toLowerCase()) ? 'photo' : 'document'
   return connectorSay.say({ chat: o.chat, sender: o.sender, text: body, kind, turn_id: o.turn_id, replyTo: o.replyTo != null ? String(o.replyTo) : null,
-    silent: o.silent, ...(ids.length ? { fileIds: ids, attachments: rows } : {}) })
+    silent: o.silent, ...(o.topic != null ? { thread: String(o.topic) } : {}), ...(ids.length ? { fileIds: ids, attachments: rows } : {}) })
+}
+// ---- WO-197 segment 2 (Chiron; CONTRACT §7d 「連接器這一頭」, the rulings of mesh 12869): what the daemon still said on Telegram goes through Onsen ----
+/** CONTRACT §7d 「這個成員的負責人」: ONSEN_OWNER, an Onsen member name: the member's own setting (the plist) first, then the machine config (read again at
+ *  most every 30 s); unset: the person access.json maps to (alertTo, else allowFrom, through Onsen.TG_MEMBERS: the mapping every Action's assignees go
+ *  through). Neither: one error line, /healthz connector.owner null, and nothing goes to an owner: never a guessed name (no member is named here) */
+const ownerSetting = new Connector.BridgeSwitch({ agent: CONNECTOR_AGENT, file: FLEET_CONFIG_PATH, key: 'ONSEN_OWNER',
+  ...(fleetConfigApplied.includes('ONSEN_OWNER') || process.env.ONSEN_OWNER === undefined ? {} : { plist: process.env.ONSEN_OWNER }) })
+let ownerMissingSaid = false
+function connectorOwner(): string | null {
+  const set = String(ownerSetting.value() ?? '').trim()
+  if (set) { ownerMissingSaid = false; return set }
+  let mapped: string | null = null
+  try { for (const c of opsRecipients(loadAccess())) { const m = Onsen.memberOfTg(c); if (m) { mapped = m; break } } } catch {}
+  if (mapped) { ownerMissingSaid = false; return mapped }
+  if (!ownerMissingSaid) {
+    ownerMissingSaid = true
+    log('error', `connector: ${CONNECTOR_AGENT} has no owner: ONSEN_OWNER is not set (plist, machine config) and access.json's people map to no Onsen member; nothing is written to an owner and no Action is asked`)
+  }
+  return null
+}
+/** who an Action is assigned to: a connector's owner (CONTRACT §7d), none when it has none; else the people of the Telegram chats (as before) */
+function askees(chats: unknown[]): string[] {
+  if (!connectorNow()) return Onsen.assigneesOf(chats)
+  const o = connectorOwner()
+  return o ? [o] : []
+}
+/** what has no chat of its own and went to the owner's Telegram chats (system warnings, the login watchdog, ops notices): one Onsen message with `to` */
+async function ownerSay(sender: string, text: string): Promise<void> {
+  const o = connectorOwner()
+  if (!o) { log('error', `connector: ${sender} not written into Onsen (no owner): ${text.replace(/\s+/g, ' ').slice(0, 160)}`); return }
+  try { await connectorReply({ chat: Connector.memberChat(o), sender, text, redact: [], rich: false, files: [] }) }
+  catch (e) { log('error', `connector: ${sender} to ${o} not written into Onsen: ${e instanceof Error ? e.message : e}`) }
+}
+/** CONTRACT §7d 「指令要人選的選項」: the menu_kind of a command's choice, by its buttons: /model model_picker, which session to resume resume_picker,
+ *  everything else other (one place: a different ruling changes this line) */
+function commandMenuKind(datas: string[]): string {
+  if (datas.some(d => d.startsWith('model:'))) return 'model_picker'
+  if (datas.some(d => d.startsWith('resume:'))) return 'resume_picker'
+  return 'other'
+}
+/** a command's choice asked in Onsen: the Action → the callback data of each option (1…n) and where the command was typed */
+type KeyboardAsk = { h: Onsen.ActionHandle; chat: string; datas: string[]; where?: Lanes.TopicAsk; ended: boolean }
+const keyboardAsks = new Map<string, KeyboardAsk>()
+/** a connector's answer (sendTextWithMaybeKeyboard): with buttons, one Action (source menu, its text the body, its buttons the options, the owner
+ *  asked; CONTRACT §7d: no second message); without, one Onsen message (the sender as the caller named it, system:control by default; the turn of a
+ *  message the daemon answers itself, so it is that message's response). An Action that cannot be made: the text as a message */
+async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: Lanes.TopicAsk): Promise<void> {
+  const ctx = Onsen.sendCtx()
+  const sender = ctx?.sender && ctx.named !== false && !ctx.skip ? ctx.sender : 'system:control'
+  const btns = (keyboard ?? []).flat().filter(b => b && b.callback_data)
+  if (btns.length && keyboardAsk(chat, text, btns, where)) return
+  const tf = where ? topicFields(where) : {}
+  try {
+    const r = await connectorReply({ chat, sender, text, redact: [], rich: false, files: [], topic: tf.message_thread_id, turn_id: Onsen.turnOfCtx(ctx) })
+    if (where) sentIn(chat, r.ids.map(Number), tf)
+  } catch (e) { log('warn', `connector: answer in chat ${chat} not written into Onsen: ${e instanceof Error ? e.message : e}`) }
+}
+function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: Lanes.TopicAsk): boolean {
+  const acts = onsenActions
+  if (!acts?.on) return false
+  const assignees = askees([chat])
+  if (!assignees.length) return false
+  if (btns.length > 10) log('warn', `connector: a choice of ${btns.length} options in chat ${chat}: an Action takes 10; the first 10 are asked`)
+  // Chiron mesh 12878: a menu Action is drawn as one message: its body (the command's whole answer) and the buttons; the summary is Onsen's one line
+  const ten = btns.slice(0, 10), body = text.trim(), summary = body.split('\n')[0] || '請選一個'
+  const datas = ten.map(b => b.callback_data!)
+  const h = acts.open({ source: 'menu', menu_kind: commandMenuKind(datas), session_id: 'main', assignees, summary, ...(body ? { body } : {}),
+    options: ten.map((b, i) => ({ id: String(i + 1), label: b.text })) }, `cmd:${ONSEN_AGENT}:${chat}:${Date.now()}:${randomBytes(3).toString('hex')}`)
+  if (!h) return false
+  keyboardAsks.set(h.key, { h, chat, datas, ...(where ? { where } : {}), ended: false })
+  while (keyboardAsks.size > 200) keyboardAsks.delete(keyboardAsks.keys().next().value!)
+  log('info', `connector: a command's choice in chat ${chat} asked in Onsen as an Action (${commandMenuKind(datas)}, ${ten.length} options)`)
+  return true
+}
+/** a press in Onsen on a command's choice: what the Telegram tap on that button does (runControlCallback), then applied */
+async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+  const acts = onsenActions!
+  const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
+  if (ka.ended || idx < 0 || idx >= ka.datas.length) { acts.cancel(h, ka.ended ? '這個選項已經按過了' : `不認得的選項 ${c.option_id}`); return }
+  ka.ended = true
+  const here = ka.where                                                       // answered where the command was typed
+  const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(ka.chat, msg, opts?.keyboard, here)
+  try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply)) }
+  catch (e) { log('warn', `connector: the choice ${c.option_id} of action ${c.action_id} failed: ${e instanceof Error ? e.message : e}`) }
+  acts.applied(h, { at: new Date().toISOString() })
+  log('info', `connector: action ${c.action_id} (a command's choice): option ${c.option_id} pressed in Onsen, done as a tap on it`)
+}
+/** PUT /members/<agent>/commands (CONTRACT §7d 「指令」): the commands this connector takes, the list setMyCommands gives Telegram (the bridge adds its
+ *  /start and /help itself); at start and whenever the agent is named. The menu order is the bridge's (bot-menu.ts) */
+let commandsPut = '', commandsTriedAt = 0
+async function reportCommands(): Promise<void> {
+  if (!onsen) return
+  commandsTriedAt = Date.now()
+  const commands = botMenu().filter(c => c.command !== 'start' && c.command !== 'help')
+    .map(c => ({ name: c.command, description: String(c.description).replace(/\s+/g, ' ').trim().slice(0, 256) || c.command }))
+  const key = JSON.stringify(commands)
+  if (key === commandsPut) return
+  const r = await onsen.request('PUT', `/v1/members/${encodeURIComponent(CONNECTOR_AGENT)}/commands`, { commands }, 10_000).catch(() => null)
+  if (r && r.status >= 200 && r.status < 300) { commandsPut = key; log('info', `connector: ${commands.length} command(s) reported to Onsen (the client's command menu)`) }
+  else log('warn', `connector: the command list was not taken by Onsen (${Connector.why(r)}); tried again in a minute`)
+}
+/** WO-197 segment 2 (CONTRACT §7d 「指令」): a person's slash command that came from Onsen to a connector, run by the handler the Telegram path runs
+ *  (bot.command's /start /help /status, /main /lanes with lanes on; then the control plane, then the roamer's). Its answer is one Onsen message, or
+ *  one Action when it offers a choice (sendTextWithMaybeKeyboard → connectorAnswer); its receipt goes to the end and the answer is its response
+ *  (handledHere). /clear's reply and choice: connectorClearHooks. false: no handler took it (it goes on to the session as a message) */
+async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
+  via?: string): Promise<boolean> {
+  const t = text.trim()
+  if (!/^\/[A-Za-z]/.test(t)) return false
+  const cmd = t.split(/\s+/)[0]!.toLowerCase().replace(/@\S+$/, '')
+  const here: Lanes.TopicAsk = { chat, ...(topic != null ? { topic } : {}) }
+  const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(chat, msg, opts?.keyboard, here)
+  const name = user || userId
+  return handledHere({ chat, id: ref, from: userId, ...(via ? { via } : {}) }, 'command', () => Onsen.withSender('system:control', async () => {
+    if (cmd === '/start') { await reply(START_TEXT); return true }
+    if (cmd === '/help') { await reply(HELP_TEXT); return true }
+    if (cmd === '/status') { await reply(await pairedStatusText(user ? `@${user}` : userId)); return true }
+    if (Lanes.LANES_ON && cmd === '/main') {
+      const sub = t.split(/\s+/)[1] ?? ''
+      await reply(sub === 'renew' ? await Lanes.mainRenew(name) : '用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）')
+      return true
+    }
+    if (Lanes.LANES_ON && cmd === '/lanes') { await reply(await Lanes.lanesCommand(t, name)); return true }
+    if (isControlEnabled() && await handleControlSlash(t, String(HTTP_PORT), reply, connectorClearHooks(chat, ref, userId ? `tg:${userId}` : name, here, atIso))) return true
+    if (isRoamerEnabled() && await handleRoamerSlash(t, reply) !== false) return true
+    return false
+  }), h => h !== false)
+}
+/** WO-197 segment 2 (CONTRACT §7d): the Onsen thread a connector's person_message is in: its own `thread` (Onsen ≥ the field; learned for the reply
+ *  tool's topic), else its client.thread looked up (GET /conversations/<id>/threads?client_thread=); undefined: outside threads, or not known */
+async function connectorThreadOf(p: any, c: any, chat: string): Promise<number | undefined> {
+  const own = p?.thread != null && /^\d+$/.test(String(p.thread)) ? Number(p.thread) : undefined
+  const ct = c?.thread != null && String(c.thread) !== '' ? String(c.thread) : undefined
+  if (own != null) { if (ct && p.conversation_id != null && connectorIds) connectorIds.learnThread(String(p.conversation_id), ct, String(own)); return own }
+  if (!ct || !connectorIds) return undefined
+  try { const t = await connectorIds.thread(chat, ct); return t != null && /^\d+$/.test(t) ? Number(t) : undefined }
+  catch (e) { log('warn', `connector: the thread of topic ${ct} in chat ${chat} is not known (${e instanceof Error ? e.message : e})`); return undefined }
+}
+/** WO-197 segment 2: the topic an agent gives the reply tool (the tag's topic: client.thread) as the Onsen thread the lanes know; "0" (outside) as is */
+async function connectorTopicArg(chat: string, topic: unknown): Promise<unknown> {
+  if (topic == null || String(topic).trim() === '' || String(topic).trim() === '0' || !connectorIds) return topic
+  try { return (await connectorIds.thread(chat, String(topic).trim().replace(/^#/, ''))) ?? topic } catch { return topic }
+}
+/** WO-197 segment 2: the conversation a lane's topic opens in (the owner's chat: lanes' joeyChatId) */
+async function connectorConversation(chat: string): Promise<string> {
+  if (!connectorIds) throw new Error('connector mode: no Onsen client')
+  return connectorIds.conversation(chat)
+}
+/** WO-197 segment 2 (CONTRACT §7d 「串」, Chiron mesh 12869 point 5): open_worker's topic is an Onsen thread (POST /conversations/<id>/threads); the
+ *  bridge draws it (createForumTopic) or, when it cannot, puts its messages in the main chat with its name first. Never fails for Telegram */
+async function connectorOpenThread(chat: string, name: string): Promise<number> {
+  const cid = await connectorConversation(chat)
+  const r = await onsen!.request('POST', `/v1/conversations/${cid}/threads`, { name: name.slice(0, 128) }, 10_000)
+  const t = r && r.status < 300 ? (r.json?.data?.thread ?? r.json?.thread) : undefined
+  if (t == null || !/^\d+$/.test(String(t))) throw new Error(`Onsen did not open the thread (${Connector.why(r)})`)
+  log('info', `connector: thread ${t} 「${name}」 opened in conversation ${cid} (the bridge draws it)`)
+  return Number(t)
+}
+async function connectorThreadState(chat: string, thread: number, state: 'open' | 'closed', name?: string): Promise<string> {
+  const cid = await connectorConversation(chat)
+  const r = await onsen!.request('PUT', `/v1/conversations/${cid}/threads/${thread}`, { state, ...(name ? { name: name.slice(0, 128) } : {}) }, 10_000)
+  if (!r || r.status >= 300) throw new Error(`Onsen did not take the thread's ${state} (${Connector.why(r)})`)
+  return `thread ${thread} ${state} in Onsen (the bridge sets the topic's icon)`
+}
+/** WO-197 segment 2 (Chiron mesh 12869 point 5): the link open_worker gives for a thread: Telegram's once the bridge reported its topic (within 3 s,
+ *  with the bot's username known), else the Onsen page's */
+const bridgeBot = { at: 0, name: '' }
+/** the bot's username as the bridge carrying this agent reports it (its `endpoints` record of this member: attributes.username; CONTRACT §7b: a member
+ *  reads the records whose member is itself), asked at most every 10 min; '' not known */
+async function bridgeBotName(): Promise<string> {
+  if (Date.now() - bridgeBot.at < 600_000) return bridgeBot.name
+  bridgeBot.at = Date.now()
+  const r = await onsen?.request('GET', `/v1/members/${encodeURIComponent(CONNECTOR_AGENT)}/extension-records`, undefined, 3_000).catch(() => null)
+  const recs: any[] = r && r.status === 200 ? (r.json?.items ?? r.json?.data?.items ?? []) : []
+  const u = recs.find(x => x?.collection === 'endpoints' && x?.attributes?.username)?.attributes?.username
+  bridgeBot.name = typeof u === 'string' ? u.replace(/^@/, '') : ''
+  return bridgeBot.name
+}
+async function connectorThreadLink(chat: string, thread: number): Promise<string | null> {
+  let cid = ''
+  try { cid = await connectorConversation(chat) } catch { return null }
+  const end = Date.now() + 3_000
+  const bot = botUsername || await bridgeBotName()
+  while (bot) {
+    const r = await onsen!.request('GET', `/v1/conversations/${cid}/threads?limit=100`, undefined, 3_000).catch(() => null)
+    const it = (r?.json?.items ?? r?.json?.data?.items ?? []).find((x: any) => String(x?.thread) === String(thread))
+    if (it?.client_thread) return topicLink(bot, Number(it.client_thread))
+    if (Date.now() + 500 > end) break
+    await new Promise(res => setTimeout(res, 500))
+  }
+  return `${Onsen.onsenBase(process.env).replace(/\/api\/onsen$/, '')}/onsen/next/#/conversation/${cid}`
 }
 /** WO-194 (onsen-inbound.ts; ONSEN_INBOUND: a comma list of agent names or `*`; unset, empty or 0 = off; the plist, else the machine config read again at
  *  most every 30 s): a person's Telegram message, past the allowlist, is written into Onsen to be delivered from there (deliver: true) and reaches the
@@ -584,7 +772,7 @@ const inboundWriter: OnsenInbound.InboundWriter | null = onsen && !INBOX_ONLY ? 
   written: (job, id, _dup, late) => inboundWritten(job, id, late),
   held: job => {
     const f = inboundStore?.get(job.key)
-    if (!f || f.msgId == null) return
+    if (!f || f.msgId == null || connectorNow()) return            // WO-197 segment 2: the bridge says it (its own Onsen-down sentence)
     void Onsen.withSender('system:onsen-held', () => bot.api.sendMessage(f.chat_id, OnsenInbound.heldText(ONSEN_AGENT), {
       reply_parameters: { message_id: f.msgId!, allow_sending_without_reply: true }, ...topicFields({ chat: f.chat_id, topic: f.inTopic }) }))
       .catch(e => log('warn', `onsen inbound: the held notice for ${job.key} did not go: ${e instanceof Error ? e.message : e}`))
@@ -605,7 +793,7 @@ function inboundWritten(job: OnsenInbound.Job, onsenId: number, late: boolean): 
   if (late) log('info', `onsen inbound: ${job.key} is in Onsen now (it was held); it is delivered when it comes back`)
   inboundBackLater(job.key, onsenId)
   const att = job.item.attachments?.[0]
-  if (att?.file_id && onsenFilesOn()) {
+  if (att?.file_id && onsenFilesOn() && !connectorNow()) {           // WO-197 segment 2: a connector takes nothing from Telegram (a job left from before it was named)
     void (async () => {
       const ids = await OnsenFiles.storeFiles(job.item, [async () => OnsenFiles.telegramFile({ fileId: String(att.file_id), size: att.size, getFile: id => bot.api.getFile(id),
         fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}`, fetch: tgFetch.fetch as typeof fetch })], onsenUpload, log)
@@ -749,9 +937,9 @@ const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
  *  (start, help, status; main, lanes with lanes on), the control plane's slash commands, the roamer's, a permission reply (`yes abcde`). `mine(r)`:
  *  whether it turned out to be the daemon's own (a slash text the control plane does not know goes on to the session: delivered only, its turn
  *  reports the rest). Only a message recorded as the person's (onsenJoeyOf: an allowlisted sender); who null: nothing reported */
-type SelfWho = { chat: string; id: number | undefined; from: string }
+type SelfWho = { chat: string; id: number | string | undefined; from: string; via?: string }
 async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
-  const j = who && onsenFacts && who.id != null ? onsenJoeyOf({ chat_id: who.chat, message_id: String(who.id), user_id: who.from }) : null
+  const j = who && onsenFacts && who.id != null ? onsenJoeyOf({ chat_id: who.chat, message_id: String(who.id), user_id: who.from, ...(who.via ? { via: who.via } : {}) }) : null
   if (j) { try { onsenFacts!.took(j.chat, j.id) } catch {} }
   // WO-197 (Chiron lab round 3A: /status, Onsen 43858, response_message_ids []): what the handler sends is in this message's own turn (its turn_end
   // names it), so Onsen lists the answer as the message's response, on Telegram (the switch off) and in Onsen (the connector) alike
@@ -811,6 +999,50 @@ function clearHooks(chat: string, msgId: number | undefined, fromId: string, her
       return true
     },
   }
+}
+/** WO-197 segment 2 (CONTRACT §7d 「幾秒內有效的選項」, Chiron mesh 12869 point 3, 12878): a connector's /clear. The reply is one Onsen message (the
+ *  /clear's response: its turn); the choice 「不要讓它看到之前的」 is one Action with one option, expires_at 5 s later (the bridge draws the seconds left),
+ *  which this daemon cancels then with the note of what happens because nobody pressed (CLEAR_NOT_PRESSED). Pressed inside the 5 s: the line drawn at
+ *  the /clear's time in its conversation (POST /restart-lines with conversation_id, Onsen 0.35.8: a person with no app account too); Onsen queues
+ *  restart_line, the bridge draws the line and its lift button; a lift made elsewhere is not told to the daemon (Onsen applies it when asked) */
+const CLEAR_OPTION = '不要讓它看到之前的'        // Chiron mesh 12878: no 「（5 秒內）」; the bridge draws the seconds left from expires_at
+const CLEAR_NOT_PRESSED = '沒按：新的一段看得到之前的對話'
+type ClearAsk = { h: Onsen.ActionHandle; chat: string; clearMsgId: string; at: string; until: number; by: string; done: boolean }
+const clearAsks = new Map<string, ClearAsk>()
+function connectorClearHooks(chat: string, clearMsgId: string, by: string, here?: Lanes.TopicAsk, atIso?: string): ClearHooks | undefined {
+  if (!onsen || !onsen.cfg.record) return undefined
+  const at = atIso && Number.isFinite(Date.parse(atIso)) ? new Date(atIso).toISOString() : new Date().toISOString()
+  return {
+    afterClear: async okText => {
+      await sendTextWithMaybeKeyboard(chat, `${okText}。它還查得到之前的對話。`, undefined, here)
+      const acts = onsenActions, assignees = askees([chat])
+      if (!acts?.on || !assignees.length) { log('warn', `connector: /clear ${clearMsgId} in chat ${chat}: no Action for 「不要讓它看到之前的」 (${!acts?.on ? 'Actions off' : 'no owner'}); the default stands`); return true }
+      const until = Date.now() + CLEAR_KEEP_S * 1000
+      const h = acts.open({ source: 'menu', menu_kind: 'other', session_id: 'main', assignees, summary: '要不要讓它看到 /clear 之前的對話？',
+        options: [{ id: 'line', label: CLEAR_OPTION }], expires_at: new Date(until).toISOString() }, `clear:${ONSEN_AGENT}:${chat}:${clearMsgId}`)
+      if (!h) return true
+      const ca: ClearAsk = { h, chat, clearMsgId, at, until, by, done: false }
+      clearAsks.set(h.key, ca)
+      while (clearAsks.size > 100) clearAsks.delete(clearAsks.keys().next().value!)
+      const t = setTimeout(() => { if (!ca.done) { ca.done = true; acts.cancel(h, CLEAR_NOT_PRESSED) } }, CLEAR_KEEP_S * 1000); (t as any).unref?.()
+      log('info', `connector: /clear ${clearMsgId} in chat ${chat}: no restart line (it still reads what came before); 「不要讓它看到之前的」 asked in Onsen for ${CLEAR_KEEP_S} s`)
+      return true
+    },
+  }
+}
+/** a press in Onsen on /clear's choice: inside its 5 s (+1 s, as the Telegram button): the line at the /clear's time, then applied; later: cancelled with
+ *  what stands */
+async function applyClearControl(ca: ClearAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+  const acts = onsenActions!
+  if (ca.done || c.option_id !== 'line' || Date.now() > ca.until + 1000) { ca.done = true; acts.cancel(h, CLEAR_NOT_PRESSED); return }
+  ca.done = true
+  let conversationId: string | undefined
+  try { conversationId = await connectorConversation(ca.chat) } catch (e) { log('warn', `connector: /clear ${ca.clearMsgId}: no conversation for chat ${ca.chat} (${e instanceof Error ? e.message : e})`) }
+  if (!conversationId) { acts.cancel(h, '沒畫上：Onsen 沒有這段對話'); return }
+  const r = await onsen!.drawLine({ chat: ca.chat, clientMsgId: ca.clearMsgId, by: ca.by, at: ca.at, conversationId })
+  if (!r) { acts.cancel(h, '沒畫上：這一隻沒有記錄到 Onsen'); return }
+  acts.applied(h, { at: new Date().toISOString() })
+  log('info', `connector: restart line drawn in chat ${ca.chat} for /clear ${ca.clearMsgId} at its own time, pressed in Onsen (action ${c.action_id}; ${r.spooled ? 'Onsen silent: in the spool' : `line ${r.id}`})`)
 }
 // Onsen (WO-139): the one place every grammy Bot API call passes (callBotApi has its own). Every message sent, edited or reacted to is recorded after
 // Telegram answers, under the send context's author (Onsen.withSender; system:daemon outside every named path; Onsen.withoutRecord: not at all): a message with its message_id, an edit / a reaction as an event, a failure as a failed message. Recording
@@ -1092,6 +1324,7 @@ function isMentioned(ctx: Context, extraPatterns?: string[]): boolean {
 // chatId == senderId, so we can send directly without stashing chatId.
 
 function checkApprovals(): void {
+  if (connectorNow()) return                       // WO-197 segment 2: the bridge confirms a pairing (approved/<id>, README); left for it, not removed
   let files: string[]
   try {
     files = readdirSync(APPROVED_DIR)
@@ -1233,6 +1466,7 @@ async function sendTextWithMaybeKeyboard(
   /** lanes-topics: where it answers (the topic a command was typed in, the message a button was on); lanes off: ignored */
   where?: Lanes.TopicAsk,
 ): Promise<void> {
+  if (connectorNow()) { await connectorAnswer(chatId, text, keyboardSpec, where); return }   // WO-197 segment 2: one Onsen message, or one Action
   const chunks = chunk(text, 4000, 'newline')
   const kb = keyboardSpec
     ? (() => {
@@ -1934,7 +2168,7 @@ function permAction(p: PermPrompt, description: string, input_preview: string, r
   let input = input_preview
   try { input = JSON.stringify(JSON.parse(input_preview), null, 2) } catch {}
   const body = `**${p.tool_name}**\n\n${description}\n\n\`\`\`\n${input.replace(/```/g, "'''").slice(0, 3500)}\n\`\`\``
-  p.action = onsenActions.open({ source: 'permission', menu_kind: 'permission', session_id: 'main', assignees: Onsen.assigneesOf(recipients),
+  p.action = onsenActions.open({ source: 'permission', menu_kind: 'permission', session_id: 'main', assignees: askees(recipients),
     summary: `${p.tool_name}：${description}`, body, options: PERM_OPTIONS }, `perm:${ONSEN_AGENT}:${p.request_id}:${p.opened}`, () => { if (!p.ended) savePermOpen() })
   // WO-197: the dialog's menu asked about from the screen before this request came (past the grace): this prompt's Action carries it now (one per prompt)
   const pa = pickerAsks.get(ownPane())
@@ -2003,7 +2237,7 @@ function permCopiesDone(copies: PermCopy[], behavior: 'allow' | 'deny', end: str
  *  alertTo, else allowFrom) through Onsen.assigneesOf, the mapping every Action's assignees go through (lab-relay: joey-test). Read at most every 5 s */
 const personMemo = { at: 0, v: null as string | null }
 function mainPerson(): string | null {
-  if (Date.now() - personMemo.at > 5_000) { try { personMemo.v = Onsen.assigneesOf(opsRecipients(loadAccess()))[0] ?? null } catch {} ; personMemo.at = Date.now() }
+  if (Date.now() - personMemo.at > 5_000) { try { personMemo.v = askees(opsRecipients(loadAccess()))[0] ?? null } catch {} ; personMemo.at = Date.now() }
   return personMemo.v
 }
 /** 1.58.13: the person on a Telegram DM account, for its thread's title (lanes-threads.ts): the Onsen member that account is (the mapping the blockers'
@@ -2049,7 +2283,7 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
       if (!mine && !t.test) return null
       return { session_id: mine ? 'main' : null, menu_kind: menuKindNow(mine, bundle) }   // CONTRACT v1: the main session is written `main`
     },
-    assignees: chats => Onsen.assigneesOf(chats),
+    assignees: chats => askees(chats),                                  // WO-197 segment 2: a connector's owner
     open: (f, key, made) => { acts.open({ source: 'menu', ...f }, key, h => { if (h.id) made(h.id, h.version) }) },
     pressed: (f, option_id, key, times) => { acts.open({ source: 'menu', ...f, resolved: { option_id, by: 'duty-officer', ...(times ?? {}) } }, key) },
     // WO-176 r4 (Chiron 06:00Z): the permission prompt this pane shows, taken when the officer decides (its prompts open now, that came by now, by the
@@ -2134,6 +2368,10 @@ async function applyActionControl(c: Onsen.ActionControl): Promise<void> {
   if (p) { await applyPermissionControl(p, h, c); return }
   const pa = [...pickerAsks.values()].find(x => x.h.id === c.action_id)   // WO-197: a screen menu this daemon asked about in Onsen
   if (pa) { await applyPickerControl(pa, h, c); return }
+  const ka = [...keyboardAsks.values()].find(x => x.h.id === c.action_id)   // WO-197 segment 2: a command's choice
+  if (ka) { await applyKeyboardControl(ka, h, c); return }
+  const ca = [...clearAsks.values()].find(x => x.h.id === c.action_id)      // WO-197 segment 2: /clear's 「不要讓它看到之前的」
+  if (ca) { await applyClearControl(ca, h, c); return }
   if (dutyOfficer) {
     const out = await dutyOfficer.onOnsen(c.action_id, c.option_id, c.version, acts.resolver(c.action_id))
     if (out !== 'unknown') { log('info', `onsen action ${c.action_id}: duty-officer menu, ${c.option_id} pressed in Onsen: ${out}`); return }
@@ -2239,7 +2477,7 @@ function openPickerAsk(pk: PickerSpec, title: string): void {
   const summary = `${where}：${pk.title.replace(/^🔀\s*/, '').replace(/，請選擇：$/m, '').replace(/\s*\n\s*/g, '：').trim() || 'claude 停在一個選單'}`
   const body = `${title}\n\n${pk.options.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n\n（${where} 的畫面；按了就照 Telegram 上點的那樣按鍵）`
   const h = acts.open({ source: 'menu', menu_kind: (() => { try { return menuKindNow(mine) } catch { return null } })(), session_id: mine ? 'main' : null,
-    assignees: Onsen.assigneesOf(opsRecipients(loadAccess())), summary, body, options }, `picker:${ONSEN_AGENT}:${pk.tmux}:${pk.key}:${Date.now()}`)
+    assignees: askees(opsRecipients(loadAccess())), summary, body, options }, `picker:${ONSEN_AGENT}:${pk.tmux}:${pk.key}:${Date.now()}`)
   if (!h) return
   pickerAsks.set(pk.tmux, { ...pk, h, opened: Date.now(), ended: false })
   log('info', `startup picker '${pk.key}' on pane ${pk.tmux}: asked in Onsen as an Action (${options.length} options)`)
@@ -3083,7 +3321,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const handoffTier = Lanes.LANES_ON && !INBOX_ONLY ? Lanes.mainReplyTier({ reply_to: lanesReplyTo, chat_id }) : null
         const quiet = handoffTier?.silent ? { disable_notification: true } : {}
         // lanes-topics (item 2): every part of the reply (each chunk, each file) carries the one topic decision; lanes off: {}
-        const topicF = topicFields({ chat: chat_id, topic: args.topic, replyTo: reply_to, turn: true })
+        // WO-197 segment 2: a connector turns the tag's topic (the client's) into the Onsen thread the lanes know first
+        const topicF = topicFields({ chat: chat_id, topic: connectorNow() ? await connectorTopicArg(chat_id, args.topic) : args.topic, replyTo: reply_to, turn: true })
 
         for (const f of files) {
           assertSendable(f)
@@ -3340,6 +3579,7 @@ if (isSystemAlertEnabled()) {
       enterNote: Lanes.LANES_ON ? () => lanesEnterNote(Lanes.mainHeldCount()) : undefined })),
     keeperAlive: () => wallKeeperAlive(),   // WO-120: an agent's first wall is waited for, not sent raw beside the enter alert
     notify: text => Onsen.withSender('system:alert', () => {   // Onsen (WO-139): TUI warnings, ops alerts, usage-wall enter / clear
+      if (connectorNow()) { void ownerSay('system:alert', text); return }   // WO-197 segment 2: one Onsen message to the owner
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
         // Log the success too (2026-09-10, Hephaestus 3451): "forwarded" alone
@@ -3535,6 +3775,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
   startLoginExpiredWatchdog({
     listTargets: paneWatchTargets,
     notify: text => Onsen.withSender('system:login-watchdog', () => {   // Onsen (WO-139)
+      if (connectorNow()) { void ownerSay('system:login-watchdog', text); return }   // WO-197 segment 2: one Onsen message to the owner
       const access = loadAccess()
       for (const chat_id of opsRecipients(access)) {
         void bot.api.sendMessage(chat_id, text).catch(e => {
@@ -3691,26 +3932,28 @@ function replaceQueuedEdit(chat: string, id: string, rw: (p: OnsenEdit.Params) =
   return n > 0
 }
 
+const START_TEXT = `This bot bridges Telegram to a Claude Code session.\n\n` +
+  `To pair:\n` +
+  `1. DM me anything — you'll get a 6-char code\n` +
+  `2. In Claude Code: /telegram:access pair <code>\n\n` +
+  `After that, DMs here reach that session.`
+const HELP_TEXT = `Messages you send here route to a paired Claude Code session. ` +
+  `Text and photos are forwarded; replies and reactions come back.\n\n` +
+  `/start — pairing instructions\n` +
+  `/status — check your pairing state`
 bot.command('start', async ctx => {
   if (!dmCommandGate(ctx)) return
-  await ctx.reply(
-    `This bot bridges Telegram to a Claude Code session.\n\n` +
-    `To pair:\n` +
-    `1. DM me anything — you'll get a 6-char code\n` +
-    `2. In Claude Code: /telegram:access pair <code>\n\n` +
-    `After that, DMs here reach that session.`
-  )
+  await ctx.reply(START_TEXT)
 })
 
 bot.command('help', async ctx => {
   if (!dmCommandGate(ctx)) return
-  await ctx.reply(
-    `Messages you send here route to a paired Claude Code session. ` +
-    `Text and photos are forwarded; replies and reactions come back.\n\n` +
-    `/start — pairing instructions\n` +
-    `/status — check your pairing state`
-  )
+  await ctx.reply(HELP_TEXT)
 })
+/** /status for someone paired (bot.command; WO-197 segment 2: a connector's /status from Onsen): paired as …, and the control plane's status block */
+async function pairedStatusText(name: string): Promise<string> {
+  return isControlEnabled() ? `Paired as ${name}.\n\n📊 channel-bot status\n\n${await controlStatusText(String(HTTP_PORT))}` : `Paired as ${name}.`
+}
 
 // 002k: /lanes — list, close, master switch, notify profile (lanes.ts lanesCommand). Answered by the daemon, never forwarded to a session.
 // 002k: /main renew — hand the main role to a fresh session (lanes.ts mainRenew). Answered by the daemon.
@@ -3757,12 +4000,7 @@ bot.command('status', async ctx => {
     // users in control mode only ever saw "Paired as X". Merge the daemon +
     // claude TUI health block in here. Pairing flow (pending / not-paired
     // branches below) is untouched.
-    if (isControlEnabled()) {
-      const s = await controlStatusText(String(HTTP_PORT))
-      await ctx.reply(`Paired as ${name}.\n\n📊 channel-bot status\n\n${s}`)
-    } else {
-      await ctx.reply(`Paired as ${name}.`)
-    }
+    await ctx.reply(await pairedStatusText(name))
     return
   }
 
@@ -3777,6 +4015,26 @@ bot.command('status', async ctx => {
 
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
+
+/** the choice a command offered (resume: roam: model: effort:), pressed: what the press does (a Telegram tap, or WO-197 segment 2: the Onsen Action's
+ *  option, action_control) */
+async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>): Promise<void> {
+  // Roamer /model + /effort picker taps carry `@<hash6>` — validate + drive
+  // the CURRENT target (issue #7). Plain model:/effort: stays channel-bot.
+  if (isRoamerEnabled() && (data.startsWith('model:') || data.startsWith('effort:')) && data.includes('@')) {
+    const prefix = data.startsWith('model:') ? 'model:' : 'effort:'
+    const at = data.lastIndexOf('@')
+    const value = data.slice(prefix.length, at).trim()
+    const hash = data.slice(at + 1).trim()
+    const cmd = prefix === 'model:' ? '/model' as const : '/effort' as const
+    if (await handleModelCallbackForCurrentTarget(value, hash, reply, cmd)) return
+  }
+  if (isRoamerEnabled() && !data.startsWith('model:') && !data.startsWith('effort:')) {
+    await handleRoamerCallback(data, reply)
+  } else if (data.startsWith('resume:') || data.startsWith('model:') || data.startsWith('effort:')) {
+    await handleCallbackData(data, httpPort, reply)
+  }
+}
 
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
@@ -3834,23 +4092,8 @@ bot.on('callback_query:data', async ctx => {
     const replyToTg = async (msg: string, opts?: ReplyOptions) => {
       await sendTextWithMaybeKeyboard(chatId, msg, opts?.keyboard, { chat: chatId, topic: topicOfMessage(cbm), replyTo: cbm?.message_id })
     }
-    try {
-      // Roamer /model + /effort picker taps carry `@<hash6>` — validate + drive
-      // the CURRENT target (issue #7). Plain model:/effort: stays channel-bot.
-      if (isRoamerEnabled() && (data.startsWith('model:') || data.startsWith('effort:')) && data.includes('@')) {
-        const prefix = data.startsWith('model:') ? 'model:' : 'effort:'
-        const at = data.lastIndexOf('@')
-        const value = data.slice(prefix.length, at).trim()
-        const hash = data.slice(at + 1).trim()
-        const cmd = prefix === 'model:' ? '/model' as const : '/effort' as const
-        if (await handleModelCallbackForCurrentTarget(value, hash, replyToTg, cmd)) return
-      }
-      if (isRoamerEnabled() && !data.startsWith('model:') && !data.startsWith('effort:')) {
-        await handleRoamerCallback(data, replyToTg)
-      } else if (data.startsWith('resume:') || data.startsWith('model:') || data.startsWith('effort:')) {
-        await handleCallbackData(data, httpPort, replyToTg)
-      }
-    } catch (err) {
+    try { await runControlCallback(data, httpPort, replyToTg) }       // WO-197 segment 2: one function, a press in Onsen (action_control) runs it too
+    catch (err) {
       log('warn', `callback dispatch failed: ${err instanceof Error ? err.message : err}`)
     }
     await ctx.answerCallbackQuery().catch(() => {})
@@ -4639,7 +4882,8 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
     // 002: the topic a message was sent in (worker lanes are bound to topics)
     // lanes-golive: a message inside a private-chat topic (Bot API 9.3+/10.5: is_topic_message, message_thread_id) belongs to that topic's worker lane
     // lanes-topics (item 2): the <channel> tag shows it as topic="<thread id>" (the reply tool's `topic`) and, when known, topic_name
-    ...(inTopic != null ? { topic: String(inTopic), ...(Lanes.topicName(inTopic) ? { topic_name: metaExcerpt(Lanes.topicName(inTopic)!, 128) } : {}) } : {}),
+    // WO-197 segment 2: a connector's tag: the topic and name the person's message carried (inTopic is Onsen's thread there)
+    ...(inTopic != null ? { topic: f.clientTopic ?? String(inTopic), ...((f.topicName ?? Lanes.topicName(inTopic)) ? { topic_name: metaExcerpt((f.topicName ?? Lanes.topicName(inTopic))!, 128) } : {}) } : {}),
     // the line of work behind the topic: its hand-over (anchor) file and whether its lane is still open (a finished topic's messages come to the main)
     ...(inTopic != null && Lanes.topicLine(inTopic) ? (t => ({ topic_state: t.state, ...(t.anchor ? { topic_anchor: t.anchor } : {}) }))(Lanes.topicLine(inTopic)!) : {}),
     // Reply-root / forward-origin / album context (2026-07-10) — see
@@ -4674,7 +4918,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
         ? { imagePath, ...(photo ? { photo } : {}), fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
             docMime: attachment!.mime, docName: attachment!.name }),
-      meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys,
+      meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys, ...(inTopic != null ? { routeTopic: String(inTopic) } : {}),
     }, OnsenInbound.albumCountOf(f))
     restartAlbumItems(chat_id, String(mgid))
     return true
@@ -4683,7 +4927,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
   await dispatchInbound(chat_id, {
     method: 'notifications/claude/channel',
     params: { content: text, meta },
-  })
+  }, inTopic != null ? String(inTopic) : undefined)
   return false
 }
 
@@ -4693,7 +4937,8 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
 /** Sonn #11516 (3): edit_date is in seconds: two edits of one message in the same second got the same lanes event id (events.open kept the first, the
  *  queue entry was overwritten). A per-process counter makes each edit's event its own. */
 let editEventSeq = 0
-async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }): Promise<void> {
+/** `routeTopic` (WO-197 segment 2): the topic the router and the lanes know the message by, when it is not the tag's (a connector: Onsen's thread) */
+async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }, routeTopic?: string): Promise<void> {
   // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
   // everything else → the registered main only). Never a broadcast.
   if (Lanes.LANES_ON) {
@@ -4707,7 +4952,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
       // Onsen step 2 (WO-142): Joey's edit carries the original's message_id; its event is its own (edited_at)
       id: `tg-${chat_id}-${meta.message_id ?? Date.now()}${meta.edited_at ? `-edit-${Date.parse(meta.edited_at) || Date.now()}-${++editEventSeq}` : ''}`, source: 'telegram', from: meta.user ?? 'joey',
       text: String(p.content ?? ''), meta, notif: notification, verified: true,
-      reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: meta.topic,
+      reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: routeTopic ?? meta.topic,
     }
     const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
     if (!d) Lanes.toMainDirect(ev)                                       // 002w (D): the router decided nothing: the main gets it through the one builder
@@ -4788,6 +5033,8 @@ type AlbumEntry = {
   cap: ReturnType<typeof setTimeout> | null
   /** WO-197 (Chiron mesh 12852): its items' kept facts (inboundStore keys: chat:message_id, pm:<Onsen id>), finished once the album is delivered */
   keys: string[]
+  /** WO-197 segment 2: the topic the router knows the album by (dispatchInbound routeTopic) */
+  routeTopic?: string
 }
 const albumBuffers = new Map<string, AlbumEntry>()
 
@@ -4795,14 +5042,14 @@ function bufferAlbumItem(
   chatId: string,
   mgid: string,
   item: { caption?: string; imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
-          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; keys?: string[] },
+          docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; keys?: string[]; routeTopic?: string },
   count: number | null = null,
 ): void {
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
     entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null,
-      expect: null, first: Date.now(), cap: null, keys: [] }
+      expect: null, first: Date.now(), cap: null, keys: [], ...(item.routeTopic ? { routeTopic: item.routeTopic } : {}) }
     albumBuffers.set(key, entry)
   }
   if (item.keys?.some(k => albumHeld.get(k) === key)) { log('info', `album ${key}: ${item.keys.join(', ')} is in it already: not added again`); return }
@@ -4910,7 +5157,7 @@ async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<v
     await dispatchInbound(entry.chatId, {
       method: 'notifications/claude/channel',
       params: { content, meta },
-    })
+    }, entry.routeTopic)
   } catch (err) { log('error', `album flush dispatch failed: ${err}`) }
   // WO-197 (Chiron mesh 12852): delivered: its items' kept facts go now (a restart before this line delivers the album from them, once)
   for (const k of entry.keys) albumHeld.delete(k)
@@ -5194,20 +5441,8 @@ async function pollLoop(): Promise<void> {
           // Baseline commands (everyone gets these). Channel-bot mode
           // appends the TUI-control commands so /resume_list, /restart,
           // etc. appear in Telegram's autocomplete.
-          const baseCommands = [
-            { command: 'start', description: 'Welcome and setup guide' },
-            { command: 'help', description: 'What this bot can do' },
-            { command: 'status', description: 'Check your pairing status' },
-          ]
           const controlCommands = controlCommandsForBotApi()
           const roamerCommands = roamerCommandsForBotApi()
-          // De-dupe: control / roamer lists may override baseline (e.g. 'status').
-          const merged = [...baseCommands]
-          for (const c of [...controlCommands, ...roamerCommands]) {
-            const idx = merged.findIndex(b => b.command === c.command)
-            if (idx >= 0) merged[idx] = c
-            else merged.push(c)
-          }
           if (controlCommands.length > 0) {
             log('info', `channel-bot control mode ON: registering ${controlCommands.length} TUI-control slash commands`)
           }
@@ -5217,7 +5452,7 @@ async function pollLoop(): Promise<void> {
           // Register to both default and all_private_chats scopes so
           // the autocomplete shows up in DMs regardless of any BotFather-
           // era placeholder scope leftover.
-          const menu = orderBotMenu(merged)                 // /clear first, /model second (Joey TG 7727)
+          const menu = botMenu()                            // /clear first, /model second (Joey TG 7727)
           void bot.api.setMyCommands(menu).catch(() => {})
           void bot.api.setMyCommands(menu, { scope: { type: 'all_private_chats' } }).catch(() => {})
         },
@@ -5245,6 +5480,21 @@ async function pollLoop(): Promise<void> {
   }
 }
 
+/** the bot's command menu: the baseline, then the control plane's and the roamer's (which may override it, e.g. 'status'), in the fleet order (/clear
+ *  first, /model second). setMyCommands sends it (onStart); WO-197 segment 2: a connector reports it to Onsen (reportCommands) */
+function botMenu(): Array<{ command: string; description: string }> {
+  const merged = [
+    { command: 'start', description: 'Welcome and setup guide' },
+    { command: 'help', description: 'What this bot can do' },
+    { command: 'status', description: 'Check your pairing status' },
+  ]
+  for (const c of [...controlCommandsForBotApi(), ...roamerCommandsForBotApi()]) {
+    const idx = merged.findIndex(b => b.command === c.command)
+    if (idx >= 0) merged[idx] = c
+    else merged.push(c)
+  }
+  return orderBotMenu(merged)
+}
 // WO-197: the long poll runs only while this agent is not in ONSEN_BRIDGE (and it has a token). The switch is looked at every 5 s (the machine config
 // itself is read at most every 30 s): named → the poll is stopped (its offset saved: connectorHandover) and nothing more goes to Telegram; taken off →
 // the poll starts again
@@ -5272,6 +5522,8 @@ async function connectorTick(): Promise<void> {
   if (connectorHandingOver) return                    // WO-197: a hand-over waits for the requests on their way (up to 15 s): one at a time
   const on = connectorNow()
   const turnedOn = on && connectorWas === false
+  // WO-197 segment 2: the command list at start and whenever it is named (not taken: again a minute later)
+  if (on && (connectorWas !== true || (!commandsPut && Date.now() - commandsTriedAt > 60_000))) void reportCommands().catch(() => {})
   if (on !== connectorWas) {
     log('info', on ? `connector mode (ONSEN_BRIDGE names ${CONNECTOR_AGENT}): no Telegram long poll, no Bot API call; everything goes through Onsen and the Telegram bridge`
       : connectorWas == null ? 'ONSEN_BRIDGE does not name this agent: Telegram as before' : `ONSEN_BRIDGE no longer names ${CONNECTOR_AGENT}: polling Telegram again${TOKEN ? '' : ' (no bot token: cannot)'}`)
@@ -5587,7 +5839,7 @@ if (Lanes.LANES_ON) {
         if (connectorNow()) {
           // WO-197: the line written into Onsen (its label as its first line, as recorded today); the bridge draws it. Not reported within 3 s: said
           // (OnsenFirst.HeldInOnsen: pushJoey / sendLine count it as told, the lane owes nothing)
-          const r = await connectorReply({ chat, sender, text: fl.text, redact: fl.redact, rich: useRich, files: [], replyTo: o.replyTo ?? null,
+          const r = await connectorReply({ chat, sender, text: Connector.withoutOnsenLabel(fl.text, sender, ONSEN_AGENT, Lanes.kindName), redact: fl.redact, rich: useRich, files: [], replyTo: o.replyTo ?? null,
             topic: tf.message_thread_id, silent: !!o.silent, turn_id })
           if (r.held || !r.ids.length) throw new OnsenFirst.HeldInOnsen(r.held ? Connector.HELD : `sent (id: onsen:${r.onsenId})`, Number(r.onsenId), [])
           const ids = r.ids.map(Number)
@@ -5613,20 +5865,27 @@ if (Lanes.LANES_ON) {
         return ids[0]
       },
       // lanes-golive: a worker lane's topic in Joey's private chat (Bot API: the bot's topic mode on, createForumTopic with the user's chat id)
-      createTopic: async (chat, name) => (await bot.api.createForumTopic(chat, name)).message_thread_id,
+      // WO-197 segment 2: a connector's work topic is an Onsen thread (the bridge draws it)
+      createTopic: async (chat, name) => connectorNow() ? connectorOpenThread(chat, name) : (await bot.api.createForumTopic(chat, name)).message_thread_id,
       // lanes-topics (item 1): the topic mode as getMe shows it now (one decision, lanes-topics.ts)
-      topicsUsable: async () => topicVerdict((await bot.api.getMe()) as unknown as TopicMe),
+      // WO-197 segment 2 (Chiron mesh 12869 point 5): a connector does not ask any client's topic mode: an Onsen thread can always be opened
+      topicsUsable: async () => connectorNow() ? { usable: true, why: 'connector: an Onsen thread (the bridge draws it, or its messages in the main chat)' }
+        : topicVerdict((await bot.api.getMe()) as unknown as TopicMe),
       // lanes-topics (item 4): the topic link's username; a finished topic gets the ✅ icon (its id from getForumTopicIconStickers, looked up once and kept;
       // none there: the icon is left as it is). Never deleteForumTopic: it removes the topic's messages.
       botUsername: () => botUsername,
       topicDone: async (chat, thread) => {
+        if (connectorNow()) return connectorThreadState(chat, thread, 'closed')    // WO-197 segment 2: the bridge sets the ✅ icon
         checkIconId ??= ((await bot.api.getForumTopicIconStickers()) as Array<{ emoji?: string; custom_emoji_id?: string }>)
           .find(s => s.emoji?.replace(/️/g, '') === '✅')?.custom_emoji_id
         if (!checkIconId) return 'getForumTopicIconStickers has no ✅: the icon was left as it is'
         await bot.api.editForumTopic(chat, thread, { icon_custom_emoji_id: checkIconId })
         return `the icon was set to ✅ (${checkIconId})`
       },
-      joeyChatId: () => String(loadAccess().allowFrom[0] ?? ''),
+      topicLinkFor: async (chat, thread) => connectorNow() ? connectorThreadLink(chat, thread) : topicLink(botUsername, thread),
+      // WO-197 segment 2 (Chiron mesh 12869 point 1): the first allowlisted chat while access.json has one (by-chat gives the DM `to` would); a connector
+      // without one writes to its owner (member:<owner>, `to`)
+      joeyChatId: () => { const c = String(loadAccess().allowFrom[0] ?? ''); if (c || !connectorNow()) return c; const o = connectorOwner(); return o ? Connector.memberChat(o) : '' },
       chatHistory: (a: Record<string, unknown>) => onsen ? onsen.queryHistory(a) : Promise.resolve('chat_history：這個常駐程式沒有接上 Onsen。'),   // Onsen (WO-139)
       ...(onsen?.cfg.record ? { formClose: async (a: Record<string, unknown>) => (await Onsen.formClose((m, p, b, t) => onsen.request(m, p, b, t), a)).text } : {}),   // WO-153
       // WO-144: the block of a lane run's opening: the same query (the default chat, Joey's restart line applied, the spool when Onsen is silent), with the
@@ -6065,6 +6324,15 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       return { code: 200, json: { delivered: true } }
     }
     log('info', `onsen inbound: person_message ${p.message_id} (${shown}) received from the inbox`)
+    // WO-197 segment 2 (CONTRACT §7d 「指令」; sonn's ruling 7): a connector runs a person's slash command itself (the bridge's kind command, or a page
+    // message whose text is one), with today's handler; one it does not know goes on as a message
+    const thread = connectorNow() ? await connectorThreadOf(p, c, chat) : undefined
+    if (connectorNow() && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
+      && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined)) {
+      inboundStore.finish([key, own])
+      log('info', `onsen inbound: ${shown} is a command; the connector handled it itself`)
+      return { code: 200, json: { delivered: true, handled_here: true } }
+    }
     if (p.via === 'web' || Connector.ONSEN_CHAT.test(chat)) {
       const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
         ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
@@ -6077,7 +6345,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
     }
     let f = inboundStore.take(key)
     if (!f) {
-      f = factsFromPayload(p, chat, ref)
+      f = factsFromPayload(p, chat, ref, thread)
       inboundStore.stats.rebuilt++
       log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
     }
@@ -6101,7 +6369,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
 /** WO-194: a Telegram message's facts from its person_message alone (the arrival's were not kept): the restoration table of the ticket. What Onsen does
  *  not carry is missing (reply_to_user_id, forward_origin and forward_from_id, attachment_origin, a voice note's caption) and the sender's name is
  *  Onsen's (meta.user: the username, else the first name) */
-function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts {
+function factsFromPayload(p: any, chat: string, ref: string, thread?: number): OnsenInbound.Facts {
   const c = p.client ?? {}
   const atts: any[] = Array.isArray(p.attachments) ? p.attachments.filter((a: unknown) => a && typeof a === 'object') : []
   const a = atts[0], kind = String(p.kind ?? 'text'), text = String(p.text ?? ''), voice = kind === 'voice', sticker = kind === 'sticker'
@@ -6136,7 +6404,10 @@ function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts
       ...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
     ...(a && !tg && a.url ? { onsenFiles: [a] } : {}),
     fromReply: false, ...(voice && text ? { voiceTranscript: metaExcerpt(text, 500) } : {}),
-    ...(c.thread != null && /^\d+$/.test(String(c.thread)) ? { inTopic: Number(c.thread) } : {}),
+    // WO-197 segment 2: a connector's lanes know the thread by Onsen's id (`thread`, the router's and the lanes' topic); the tag keeps the topic the
+    // person's message carried (client.thread, clientTopic) and its name. Off the connector: the Telegram topic, as before
+    ...(thread != null ? { inTopic: thread, ...(c.thread != null ? { clientTopic: String(c.thread) } : {}), ...(p.topic_name ? { topicName: String(p.topic_name) } : {}) }
+      : c.thread != null && /^\d+$/.test(String(c.thread)) ? { inTopic: Number(c.thread) } : {}),
     rfm, ...(p.media_group_id ? { mgid: String(p.media_group_id) } : {}), ...(text && !voice && a ? { caption: text } : {}),
   }
 }
@@ -6443,6 +6714,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         agent: CONNECTOR_AGENT,               // WO-197 (Chiron #200436): the fleet is scanned by bot_username; a connector has no bot
         // WO-197: ONSEN_BRIDGE names this agent (no Telegram: the bridge carries its bot); Bot API calls refused by the guard, by method; the says
         ...(!INBOX_ONLY ? { connector: { on: connectorNow(), token: !!TOKEN, bot_api_refused: connectorBlocked, ...(connectorSay ? { ...connectorSay.stats, ids: connectorIds!.size } : {}),
+          // WO-197 segment 2: the owner (CONTRACT §7d: null = none set and none mapped: nothing goes to an owner), the command list as reported
+          ...(connectorNow() ? { owner: connectorOwner(), commands_reported: commandsPut ? JSON.parse(commandsPut).length : null } : {}),
           telegram_http: { in_flight: tgFetch.inFlight, peak: tgFetch.peak, closing: tgFetch.closing, ...tgFetch.stats } } } : {}),
         uptime_s: Math.floor(process.uptime()),
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),

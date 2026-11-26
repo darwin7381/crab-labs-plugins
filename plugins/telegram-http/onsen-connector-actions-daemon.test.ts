@@ -60,9 +60,9 @@ beforeAll(async () => {
   const env = { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude',
     TMUX_TMPDIR: sock, STARTUP_PICKER_POLL_MS: '400', ONSEN_ACTIONS: '0' }
   ;[named, sw] = await Promise.all([
-    startTgDaemon(apiN, join(root, 'n'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_CREDENTIAL_FILE: join(root, 'cred-n'), CHANNEL_BOT_TMUX_SESSION: panes.n },
+    startTgDaemon(apiN, join(root, 'n'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-n'), CHANNEL_BOT_TMUX_SESSION: panes.n },
       h => h?.ok === true),
-    startTgDaemon(apiS, join(root, 's'), JOEY, { ...env, CRAB_LABS_PLUGINS_ENV: machine, ONSEN_BRIDGE_TICK_MS: '200', ONSEN_CREDENTIAL_FILE: join(root, 'cred-s'),
+    startTgDaemon(apiS, join(root, 's'), JOEY, { ...env, CRAB_LABS_PLUGINS_ENV: machine, ONSEN_BRIDGE_TICK_MS: '200', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-s'),
       CHANNEL_BOT_TMUX_SESSION: panes.s }),
   ])
 }, 60000)

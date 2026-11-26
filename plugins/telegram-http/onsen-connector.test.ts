@@ -1,7 +1,7 @@
 // WO-197 onsen-connector.ts: the switch (list or *, the machine config read again every 30 s), the numbers turned into Onsen's ids by asking Onsen
 // (cached, onsen:<id> as it is), a reply written with conversation_id and the bridge's report waited for (3 s), reactions and edits
 import { test, expect } from 'bun:test'
-import { BridgeSwitch, bridgeOn, ConnectorSay, OnsenIds, numbersOf, reactionOk, HELD, NOT_TAKEN, type Request } from './onsen-connector.ts'
+import { BridgeSwitch, bridgeOn, ConnectorSay, OnsenIds, numbersOf, reactionOk, withoutOnsenLabel, memberChat, HELD, NOT_TAKEN, type Request } from './onsen-connector.ts'
 
 const noLog = () => {}
 
@@ -100,4 +100,73 @@ test('react / edit: the Telegram number turned into Onsen\'s message, then POST 
   expect(await f.say.react('1828', 'onsen:4002', '👍')).toBe('4002')
   await expect(f.say.edit('1828', '1', 'x')).rejects.toThrow(/not a message Onsen knows/)
   expect(numbersOf({ aliases: [{ client_ref: '1:12' }, { client_ref: '1:3' }, { client_ref: '1:12' }] })).toEqual(['3', '12'])
+})
+
+test('WO-197 segment 2: the machine config key is the reader\'s own (ONSEN_OWNER), read again as ONSEN_BRIDGE is; the plist\'s wins', () => {
+  let file = 'ONSEN_BRIDGE=adam\nONSEN_OWNER=amy\n', t = 0
+  const o = new BridgeSwitch({ agent: 'adam', file: 'x', key: 'ONSEN_OWNER', now: () => t, read: () => file })
+  expect(o.value()).toBe('amy')
+  file = 'ONSEN_OWNER=bob\n'; t = 30_000
+  expect(o.value()).toBe('bob')
+  expect(new BridgeSwitch({ agent: 'adam', file: 'x', key: 'ONSEN_OWNER', plist: 'carl', read: () => file }).value()).toBe('carl')
+  expect(new BridgeSwitch({ agent: 'adam', file: 'x', key: 'ONSEN_OWNER', read: () => 'ONSEN_BRIDGE=adam\n' }).value()).toBeUndefined()
+})
+
+test('WO-197 segment 2: a chat member:<name> is written with `to` (the person\'s direct conversation), no conversation asked, no reply; the conversation Onsen answers is kept', async () => {
+  const calls: Array<{ m: string; p: string; b: any }> = []
+  const request: Request = async (m, p, b) => {
+    calls.push({ m, p, b })
+    if (p === '/v1/messages' && m === 'POST') return { status: 201, json: { data: { message_id: '5100', conversation_id: '88', duplicate: false, delivery: 'sent' } } }
+    if (p === '/v1/conversations/88/messages/by-client-id/12') return { status: 200, json: { data: { id: '4100' } } }
+    return { status: 404, json: {} }
+  }
+  const ids = new OnsenIds({ request })
+  const say = new ConnectorSay({ request, ids, agent: 'adam', log: noLog, waitMs: 200, pollMs: 50 })
+  expect(memberChat('amy')).toBe('member:amy')
+  const r = await say.say({ chat: 'member:amy', sender: 'system:alert', text: '⚠️ 系統警告', replyTo: '12' })
+  expect(r).toMatchObject({ onsenId: '5100', conversationId: '88', held: false })
+  expect(calls.map(c => c.p)).toEqual(['/v1/messages'])
+  const w = calls[0]!.b
+  expect(w.to).toBe('amy')
+  expect('conversation_id' in w || 'reply_to_message_id' in w).toBe(false)
+  expect(w.idem_key).toMatch(/^c:adam:to-amy:out:/)
+  expect(await ids.conversation('member:amy')).toBe('88')                // kept: no by-chat asked for it
+})
+
+test('WO-197 segment 2 (sonn\'s ruling 9): a thread Onsen refuses (a Telegram topic kept from before the switch) is dropped once and the message written; thread lookup by client_thread', async () => {
+  const calls: Array<{ m: string; p: string; b: any }> = []
+  const request: Request = async (m, p, b) => {
+    calls.push({ m, p, b: b && JSON.parse(JSON.stringify(b)) })
+    if (p === '/v1/conversations/by-chat/1828') return { status: 200, json: { data: { id: '77' } } }
+    if (p === '/v1/messages' && m === 'POST') return b.thread != null ? { status: 400, json: { error: { code: 'invalid_request', message: `thread ${b.thread}: not a thread of conversation 77` } } }
+      : { status: 201, json: { data: { message_id: '5200', conversation_id: '77', duplicate: false, delivery: 'sent' } } }
+    if (p === '/v1/conversations/77/threads?client_thread=7001') return { status: 200, json: { items: [{ thread: '301', name: 'x', state: 'open', client_thread: '7001' }] } }
+    if (p.startsWith('/v1/conversations/77/threads?client_thread=')) return { status: 200, json: { items: [] } }
+    return { status: 404, json: {} }
+  }
+  const logs: string[] = []
+  const ids = new OnsenIds({ request })
+  const say = new ConnectorSay({ request, ids, agent: 'adam', log: (_l, m) => logs.push(m), waitMs: 200, pollMs: 50 })
+  const r = await say.say({ chat: '1828', sender: 'adam.worker.1', text: 'x', thread: '7401' })
+  expect(r.onsenId).toBe('5200')
+  const posts = calls.filter(c => c.p === '/v1/messages')
+  expect(posts.map(c => c.b.thread ?? null)).toEqual(['7401', null])
+  expect(say.stats.thread_dropped).toBe(1)
+  expect(logs.some(l => l.includes('Onsen refused thread 7401'))).toBe(true)
+  expect(await ids.thread('1828', '7001')).toBe('301')
+  expect(await ids.thread('1828', '7001')).toBe('301')
+  expect(calls.filter(c => c.p.includes('client_thread=7001'))).toHaveLength(1)    // cached
+  expect(await ids.thread('1828', '7999')).toBeNull()
+  ids.learnThread('77', '7002', '302')
+  expect(await ids.thread('1828', '7002')).toBe('302')
+})
+
+test('WO-197 segment 2 (sonn\'s ruling 4): the lane\'s or router\'s label line Onsen draws itself is dropped from the text; another first line stays', () => {
+  const kind = (k: string) => ({ worker: '工作線', fork: '分身線' } as Record<string, string>)[k] ?? k
+  expect(withoutOnsenLabel('〔adam·工作線#1〕\n做完了', 'adam.worker.1', 'adam', kind)).toBe('做完了')
+  expect(withoutOnsenLabel('〔adam·分流器〕\n收到', 'router', 'adam', kind)).toBe('收到')
+  expect(withoutOnsenLabel('〔adam·工作線#1｜負責：主線〕\n做完了', 'adam.worker.1', 'adam', kind)).toBe('〔adam·工作線#1｜負責：主線〕\n做完了')
+  expect(withoutOnsenLabel('〔adam·分身線#2〕\nx', 'adam.worker.2', 'adam', kind)).toBe('〔adam·分身線#2〕\nx')
+  expect(withoutOnsenLabel('一行', 'adam.worker.1', 'adam', kind)).toBe('一行')
+  expect(withoutOnsenLabel('〔adam·工作線#1〕\nx', 'main', 'adam', kind)).toBe('〔adam·工作線#1〕\nx')
 })

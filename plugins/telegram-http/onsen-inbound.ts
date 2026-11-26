@@ -88,6 +88,10 @@ export type Facts = {
    *  switch off, ONSEN_INBOUND on: stamped on every item's kept facts when the album's arrival window closed). When they come back from Onsen one by
    *  one, the album is delivered as one tag once that many are in (server.ts bufferAlbumItem), however far apart they are handed over */
   albumCount?: number
+  /** WO-197 segment 2: a connector's message in a topic: inTopic is Onsen's thread (the router's, the lanes'); the tag's topic stays the one the
+   *  person's message carried (client.thread) and its name (person_message.topic_name) */
+  clientTopic?: string
+  topicName?: string
   /** WO-197 (Chiron mesh 12852): a connector's album item kept until its album is delivered (server.ts personArrived): where Onsen keeps each of its
    *  files, by the Telegram file id the tag carries (the attachment's client_ref), so a restart takes them from Onsen again */
   fileUrls?: Record<string, { url: string; name?: string; mime?: string }>

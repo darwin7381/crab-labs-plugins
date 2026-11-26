@@ -195,6 +195,9 @@ export interface LanesDeps {
   /** lanes-topics (item 4): the bot's username (the topic link), and a finished topic's ✅ icon (editForumTopic; the result says what was done) */
   botUsername?: () => string
   topicDone?: (chat_id: string, thread: number) => Promise<string>
+  /** WO-197 segment 2: the link of a work topic when the daemon has its own way to it (a connector: Telegram's once the bridge reported the topic,
+   *  else the Onsen page's); unset: t.me/<bot username>/<topic> */
+  topicLinkFor?: (chat_id: string, thread: number) => Promise<string | null>
   joeyChatId?: () => string
   /** inbox role: mesh send with lane extras; resolves the minted btcc id */
   meshSend?: (to: string, text: string, replyTo: number | undefined, noReply: boolean,
@@ -736,6 +739,8 @@ export async function mainRenew(who: string): Promise<string> {
 type LaneKind = 'reflex' | 'worker' | 'fork' | 'curator' | 'synthesis' | 'mail'
 /** the lane kinds by name (lanes-golive C2: 讀信線, the mail lane, reads the mailbox) */
 const KIND_NAME: Record<LaneKind, string> = { reflex: '反射線', worker: '工作線', fork: '分身線', curator: '整理線', synthesis: '綜合線', mail: '讀信線' }
+/** a lane kind's name as its label shows it (〔agent·工作線#n〕) */
+export const kindName = (k: string): string => (KIND_NAME as Record<string, string>)[k] ?? k
 type Lane = {
   id: string; kind: LaneKind; n: number; session_id: string; thread: string
   status: 'new' | 'running' | 'idle' | 'closed'
@@ -7716,7 +7721,7 @@ export async function callMainTool(name: string, a: any, mcpSid: string | undefi
       enqueue(ev, lane.id, 3)
       routeRow({ event: ev.id, source: 'main', from: 'main', ...ownTag('open_worker', lane.id), target: 'lane', lane: lane.id, thread: lane.thread, note: `topic ${lane.topic}` }, ev)
       // lanes-topics (item 4): the link that opens the topic, and the name as stored (= as Joey sees it: emoji dropped)
-      const link = topicLink(D.botUsername?.(), lane.topic!)
+      const link = D.topicLinkFor ? await D.topicLinkFor(D.joeyChatId?.() ?? '', lane.topic!).catch(() => null) : topicLink(D.botUsername?.(), lane.topic!)
       return `worker ${lane.id} opened in topic #${lane.topic} 「${lane.topic_name ?? title}」 (${link ?? 'link: the bot username is not known yet'}); thread ${lane.thread}. `
         + 'Joey can talk to it inside that topic. When the work is done, close it with lane_close: the topic gets a ✅ icon and stays (never deleted); what he types there afterwards comes to you, and your reply lands in that topic.'
         + (lane.anchor ? ` Its anchor file is ${lane.anchor} (the worker writes it; nothing else under knowledge/): list it in knowledge/REANCHOR.md now, one line「${lane.topic_name ?? title}：定錨檔：${lane.anchor}」(you are REANCHOR.md's only writer), and take it off when the line is closed and done.`

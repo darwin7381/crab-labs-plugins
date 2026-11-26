@@ -314,3 +314,21 @@ plugins/telegram-http/onsen-client.ts::export function forwardName(v: unknown): 
 plugins/telegram-http/onsen-client.ts::m.forward_from ? `轉傳自 ${forwardName(m.forward_from)}` : ''
 plugins/telegram-http/onsen-client.ts::let r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: why, note: why })
 plugins/telegram-http/onsen-client.ts::if (a.expires_at) body.expires_at = a.expires_at
+plugins/telegram-http/server.ts::if (connectorNow()) { await connectorAnswer(chatId, text, keyboardSpec, where); return }
+plugins/telegram-http/server.ts::async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: Lanes.TopicAsk): Promise<void> {
+plugins/telegram-http/server.ts::function commandMenuKind(datas: string[]): string {
+plugins/telegram-http/server.ts::async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
+plugins/telegram-http/server.ts::async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>): Promise<void> {
+plugins/telegram-http/server.ts::async function reportCommands(): Promise<void> {
+plugins/telegram-http/server.ts::function connectorOwner(): string | null {
+plugins/telegram-http/server.ts::if (connectorNow()) { void ownerSay('system:alert', text); return }
+plugins/telegram-http/server.ts::if (connectorNow()) { void ownerSay('system:login-watchdog', text); return }
+plugins/telegram-http/server.ts::function connectorClearHooks(chat: string, clearMsgId: string, by: string, here?: Lanes.TopicAsk, atIso?: string): ClearHooks | undefined {
+plugins/telegram-http/server.ts::const CLEAR_NOT_PRESSED = '沒按：新的一段看得到之前的對話'
+plugins/telegram-http/server.ts::createTopic: async (chat, name) => connectorNow() ? connectorOpenThread(chat, name) : (await bot.api.createForumTopic(chat, name)).message_thread_id,
+plugins/telegram-http/server.ts::if (connectorNow()) return connectorThreadState(chat, thread, 'closed')
+plugins/telegram-http/server.ts::message_thread_id: routeTopic ?? meta.topic,
+plugins/telegram-http/server.ts::if (connectorNow()) return                       // WO-197 segment 2: the bridge confirms a pairing
+plugins/telegram-http/onsen-connector.ts::export const MEMBER_CHAT = /^member:([a-z0-9][a-z0-9_.-]{0,63})$/
+plugins/telegram-http/onsen-connector.ts::export function withoutOnsenLabel(text: string, sender: string, agent: string, kindName: (k: string) => string): string {
+plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the line by conversation_id at the /clear
