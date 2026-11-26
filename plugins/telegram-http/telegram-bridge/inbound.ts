@@ -68,6 +68,18 @@ const META_UNKNOWN = /(不收的欄位|unknown)[^；;]*client_meta/i
 
 /** the facts of a person's Telegram message that §7d's named fields do not carry, under the attribute names server.ts puts on the <channel> tag
  *  (CONTRACT §7d client_meta; the connector turns each key into that attribute). Values as the daemon writes them (strings). */
+/** forward_from as the daemon's <channel> tag writes it (server.ts replyForwardMeta): the person's display name, a hidden sender's name, the
+ *  chat's or channel's title; the kind, ids and username stay in client_meta (Chiron 15:40Z: one standard field, no second raw key) */
+export function tagForwardFrom(m: any): string | null {
+  const fo = m?.forward_origin
+  if (!fo) return forwardFrom(m) ?? null                                   // an older update shape: what the record path gave
+  if (fo.type === 'user' && fo.sender_user) return displayName(fo.sender_user)
+  if (fo.type === 'hidden_user') return safeName(fo.sender_user_name) ?? 'hidden'
+  if (fo.type === 'chat' && fo.sender_chat) return safeName(fo.sender_chat.title ?? fo.sender_chat.username) || String(fo.sender_chat.id)
+  if (fo.type === 'channel' && fo.chat) return safeName(fo.chat.title ?? fo.chat.username) || String(fo.chat.id)
+  return null
+}
+
 export function clientMetaOf(m: any, o: { fromReply?: boolean; transcript?: string | null; imageError?: boolean; albumCount?: number } = {}): Record<string, string> {
   const out: Record<string, string> = {}
   const rt = m?.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
@@ -378,7 +390,7 @@ export class Poller {
         reply_to_user: rt ? (rt.from ? displayName(rt.from) : rt.sender_chat ? (safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)) : null) : null,
         client_thread: thread,
         topic_name: thread ? (m.reply_to_message?.forum_topic_created?.name ?? this.d.topicName?.(a.member, chat, thread) ?? null) : null,
-        forward_from: forwardFrom(m) ?? null,
+        forward_from: tagForwardFrom(m),                                   // the daemon tag's value (Chiron 15:40Z ruling, §7d)
         forward_date: fo?.date || m.forward_date ? new Date(Number(fo?.date ?? m.forward_date) * 1000).toISOString() : null,
         media_group_id: m.media_group_id ? String(m.media_group_id) : null,
         idem_key: `tg:${a.member}:${chat}:${m.message_id}`,
@@ -398,7 +410,8 @@ export class Poller {
       }
       if (e.cache.got && (m.voice || m.audio) && this.d.voice?.on && e.cache.transcript === undefined) {
         e.cache.transcript = await transcribe(e.cache.got.bytes, `${chat}-${m.message_id}`, this.d.voice, this.d.log) ?? null
-        if (e.cache.transcript) body.text = e.cache.transcript
+        // Chiron 15:40Z: a voice note with a caption keeps the caption as its text; the transcript then rides only in client_meta.voice_transcript
+        if (e.cache.transcript && !(typeof m.caption === 'string' && m.caption.trim())) body.text = e.cache.transcript
       }
       if (e.cache.got && !e.cache.fileDone) {
         const r = await this.d.onsen.upload(e.cache.got.bytes, { key: body.idem_key, name: att.name ?? e.cache.got.name ?? null, mime: att.mime })

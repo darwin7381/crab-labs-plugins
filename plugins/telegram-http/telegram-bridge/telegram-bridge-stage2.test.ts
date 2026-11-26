@@ -166,15 +166,21 @@ describe('stage two', () => {
     tg.push(TOK, { message: { message_id: 804, from, chat: dm, date: now, media_group_id: 'AL1', caption: 'two', photo: [{ file_id: 'P1', file_unique_id: 'p1', file_size: 3 }] } })
     tg.push(TOK, { message: { message_id: 805, from, chat: dm, date: now, media_group_id: 'AL1', photo: [{ file_id: 'P2GONE', file_unique_id: 'p2', file_size: 3 }] } })
     tg.push(TOK, { message: { message_id: 806, from, chat: dm, date: now, text: 'plain' } })
-    await until(() => ['801', '802', '803', '804', '805', '806'].every(id => onsen.messages.some(x => x.client_msg_id === id)), 8000, 'all six written')
+    // Chiron 15:40Z: a voice note with a caption keeps the caption as its text; the transcript only in client_meta
+    tg.files.set('f/VO2', new Uint8Array([4, 5, 7]))
+    tg.push(TOK, { message: { message_id: 807, from, chat: dm, date: now, caption: '聽這段', voice: { file_id: 'VO2', file_unique_id: 'v2', duration: 2, mime_type: 'audio/ogg', file_size: 3 } } })
+    await until(() => ['801', '802', '803', '804', '805', '806', '807'].every(id => onsen.messages.some(x => x.client_msg_id === id)), 8000, 'all six written')
     const w = (id: string) => onsen.messages.find(x => x.client_msg_id === id)
     expect(w('801').client_meta).toEqual({ reply_to_user_id: '555', attachment_origin: 'reply' })
     expect(w('801')).toMatchObject({ kind: 'text', text: 'see this', reply_to_client_msg_id: '700', reply_to_user: 'ann', reply_to_text: 'the pdf',
       attachments: [{ kind: 'document', name: 'a.pdf', mime: 'application/pdf', bytes: 3, client_ref: 'DOC7' }] })
     expect(w('801').attachment_file_ids.length).toBe(1)                                         // the replied-to file, stored in Onsen
     expect(w('802').client_meta).toEqual({ forward_origin: 'channel', forward_from_id: '-100555', forward_from_username: 'newsch', forward_channel_message_id: '42' })
+    expect(w('802').forward_from).toBe('News')                                                   // the tag's value: the channel's title (Chiron 15:40Z)
     expect(w('803').client_meta).toEqual({ voice_transcript: '你好，看一下' })
     expect(w('803')).toMatchObject({ kind: 'voice', text: '你好，看一下' })
+    expect(w('807')).toMatchObject({ kind: 'voice', text: '聽這段' })
+    expect(w('807').client_meta).toEqual({ voice_transcript: '你好，看一下' })
     expect(w('804').client_meta).toEqual({ media_group_count: '2' })
     expect(w('805').client_meta).toEqual({ media_group_count: '2', image_error: 'download failed' })
     expect('client_meta' in w('806')).toBe(false)                                                // nothing beyond the named fields: none sent
@@ -198,5 +204,6 @@ describe('stage two', () => {
     tg.push(TOK, fwd(903))
     await until(() => onsen.messages.some(x => x.client_msg_id === '903'), 4000, '903 written')
     expect(onsen.messages.find(x => x.client_msg_id === '903').client_meta).toEqual({ forward_origin: 'user', forward_from_id: '777', forward_from_username: 'orig' })
+    expect(onsen.messages.find(x => x.client_msg_id === '903').forward_from).toBe('orig')                 // displayName() as the daemon's tag (its @username first)
   }, T)
 })
