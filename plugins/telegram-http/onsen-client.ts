@@ -584,6 +584,24 @@ export class OnsenClient {
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
+  /** WO-189: a file Onsen keeps (an attachment's `url`, Onsen's File.url) with this agent's credential. Only Onsen's own address (the origin and path of
+   *  this client's base): the credential never goes anywhere else, another address throws. null: no credential. Throws on a network error, the
+   *  timeout, or a body over `maxBytes` (its Content-Length, else what arrived) */
+  async getFile(url: string, maxBytes: number, timeoutMs = 20_000): Promise<{ status: number; bytes: Uint8Array | null; mime: string | null } | null> {
+    let u: URL, b: URL
+    try { u = new URL(url); b = new URL(this.cfg.base) } catch { throw new Error('not an address') }
+    if (u.origin !== b.origin || !u.pathname.startsWith(`${b.pathname.replace(/\/+$/, '')}/`)) throw new Error("not Onsen's own address")
+    const cred = this.cfg.credential()
+    if (!cred) return null
+    const r = await this.f(u.toString(), { headers: { Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}` }, signal: AbortSignal.timeout(timeoutMs) })
+    const mime = r.headers.get('content-type')
+    if (!r.ok) { try { await r.body?.cancel() } catch {} return { status: r.status, bytes: null, mime } }
+    const len = Number(r.headers.get('content-length') ?? NaN)
+    if (Number.isFinite(len) && len > maxBytes) { try { await r.body?.cancel() } catch {} throw new Error(`too large (${len} bytes)`) }
+    const bytes = new Uint8Array(await r.arrayBuffer())
+    if (bytes.byteLength > maxBytes) throw new Error(`too large (${bytes.byteLength} bytes)`)
+    return { status: r.status, bytes, mime }
+  }
   /** WO-175: a JSON PUT with this agent's credential (a Call's state) */
   private async put(path: string, body: unknown, cred: string, timeoutMs?: number): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })

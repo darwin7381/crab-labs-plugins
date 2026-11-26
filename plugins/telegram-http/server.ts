@@ -86,6 +86,7 @@ import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
 import * as OnsenVisible from './onsen-visible.ts'
+import * as OnsenAttach from './onsen-attachments.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
@@ -149,6 +150,8 @@ if (!TOKEN && !INBOX_ONLY) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+/** WO-189: the files of Joey's Onsen messages taken into INBOX_DIR, by their attachment_file_id (onsen:<file id>): download_attachment answers with them */
+const onsenSaved = new Map<string, string>()
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 const LOCK_FILE = join(STATE_DIR, 'bot.lock')
 const LOG_FILE = join(STATE_DIR, 'server.log')
@@ -2681,6 +2684,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'download_attachment': {
         const file_id = args.file_id as string
+        // WO-189: a file of Joey's Onsen message (attachment_file_id onsen:<id>): the copy taken when it arrived, else taken now with this agent's credential
+        if (/^onsen:\d+$/.test(String(file_id))) {
+          const have = onsenSaved.get(file_id)
+          if (have && existsSync(have)) return { content: [{ type: 'text', text: have }] }
+          if (!onsen) throw new Error('Onsen is off for this agent: the file cannot be taken')
+          const got = await OnsenAttach.takeOne((u, max) => onsen!.getFile(u, max), `${onsen.cfg.base}/v1/files/${file_id.slice(6)}`, file_id.slice(6), null, null, INBOX_DIR)
+          if ('why' in got) throw new Error(`download failed: ${got.why}`)
+          onsenSaved.set(file_id, got.path)
+          return { content: [{ type: 'text', text: got.path }] }
+        }
         const file = await bot.api.getFile(file_id)
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
         const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
@@ -5128,6 +5141,12 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem): Promise<boolean> {
   // WO-159: a message Joey wrote in Onsen: his message as he typed it, with via="onsen" and nothing else added (Chiron: the only difference an agent sees)
   const meta: Record<string, string> = it.say ? { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts, via: 'onsen' }
     : { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts, via: 'web-form', form_title: metaExcerpt(it.title, 128), form_id: String(it.form_id) }
+  // WO-189 (Chiron, ruling A): the files of a message he wrote in Onsen, taken now with this agent's credential (Onsen's own address only), carried as a
+  // Telegram message's are: image_path (_2, …), the attachment set with attachment_file_id onsen:<id>; a picture not taken: image_error, the text all the same
+  if (it.say && Array.isArray(it.attachments) && it.attachments.length && onsen) {
+    Object.assign(meta, await OnsenAttach.attachmentMeta(it.attachments, { get: (u, max) => onsen!.getFile(u, max), dir: INBOX_DIR, saved: onsenSaved, log: m => log('warn', m) }))
+    if (onsenSaved.size > 500) for (const k of [...onsenSaved.keys()].slice(0, onsenSaved.size - 500)) onsenSaved.delete(k)
+  }
   const notification = { method: 'notifications/claude/channel', params: { content: it.say ? it.body : OnsenVisible.formBodyText(it.body), meta } }
   // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }

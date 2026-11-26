@@ -187,3 +187,6 @@ plugins/telegram-http/lanes-threads.ts::return clip80(topic ? `${who} 私訊／$
 plugins/telegram-http/lanes.ts::export function refreshDmTitles(): number {
 plugins/telegram-http/server.ts::const dmPerson = (chat: string): string | null => dmNames.personOf(chat)
 plugins/telegram-http/onsen-client.ts::export class MemberNames {
+plugins/telegram-http/server.ts::Object.assign(meta, await OnsenAttach.attachmentMeta(it.attachments
+plugins/telegram-http/server.ts::if (/^onsen:\d+$/.test(String(file_id))) {
+plugins/telegram-http/onsen-client.ts::async getFile(url: string, maxBytes: number

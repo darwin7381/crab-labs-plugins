@@ -51,6 +51,13 @@ function startOnsen(): void {
       return Response.json({ error: 'no such open form' }, { status: 404 })
     }
     if (path === '/forms/ack') { let n = 0; for (const i of inbox) if (i.for === who && body.ids.includes(i.id) && !i.acked) { i.acked = true; n++ } return Response.json({ acked: n }) }
+    // WO-189: Onsen's files (GET /v1/files/<id>, File.url): this agent's credential; 403 for one it may not see
+    const fm = /^\/v1\/files\/(\d+)$/.exec(path)
+    if (fm && req.method === 'GET') {
+      if (fm[1] === '403') return Response.json({ error: 'not_authorized' }, { status: 403 })
+      if (fm[1] === '11') return new Response('# 筆記\n第二行', { headers: { 'content-type': 'text/markdown' } })
+      return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, Number(fm[1])]), { headers: { 'content-type': 'image/png' } })
+    }
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
 }
@@ -254,4 +261,29 @@ test('WO-153 form_close: listed with recording on, its answer is Onsen\'s (close
     expect((await c0.listTools()).tools.some(t => t.name === 'chat_history')).toBe(true)
     await c0.close()
   } finally { await d0.stop(); api0.stop() }
+}, 60000)
+
+test('WO-189: a message Joey wrote in Onsen with files: each taken with this agent\'s credential; image_path (by position), the .md as the attachment set with onsen:<id> (download_attachment answers it), a picture it may not see: image_error, the text all the same', async () => {
+  const inbound: Array<{ content: string; meta: any }> = []
+  const c = await connect(on, inbound)
+  const F = `http://127.0.0.1:${onsenPort}/api/onsen/v1/files`
+  inbox.push({ for: 'on', id: 9101, form_id: 601, chat: String(JOEY), title: '', body: '看這兩張\n〔圖片 a.png〕〔檔案 notes.md〕〔圖片 c.png〕', at: new Date().toISOString(),
+    say: true, attachments: [{ kind: 'photo', name: 'a.png', mime: 'image/png', bytes: 5, url: `${F}/21` }, { kind: 'document', name: 'notes.md', mime: 'text/markdown', bytes: 16, url: `${F}/11` },
+      { kind: 'photo', name: 'c.png', mime: 'image/png', bytes: 5, url: `${F}/403` }] } as any)
+  expect(await until(() => inbound.some(x => x.meta.message_id === 'form-9101'), 30000)).toBe(true)
+  const m = inbound.find(x => x.meta.message_id === 'form-9101')!
+  expect(m.content).toBe('看這兩張\n〔圖片 a.png〕〔檔案 notes.md〕〔圖片 c.png〕')                      // the preview words stay
+  expect(m.meta).toMatchObject({ via: 'onsen', media_group_count: '3', attachment_kind_2: 'document', attachment_file_id_2: 'onsen:11', attachment_name_2: 'notes.md',
+    attachment_mime_2: 'text/markdown', image_error_3: 'HTTP 403', attachment_file_id_3: 'onsen:403', attachment_kind_3: 'photo' })
+  expect(m.meta.image_path.startsWith(join(on.stateDir, 'inbox'))).toBe(true)
+  expect([...readFileSync(m.meta.image_path)]).toEqual([0x89, 0x50, 0x4e, 0x47, 21])
+  expect(got.filter(g => g.who === 'on' && g.path.startsWith('/v1/files/')).map(g => g.path).sort()).toEqual(['/v1/files/11', '/v1/files/21', '/v1/files/403'])
+  const d = await call(c, 'download_attachment', { file_id: 'onsen:11' })
+  expect(d.isError).toBe(false)
+  expect(readFileSync(d.text, 'utf8')).toBe('# 筆記\n第二行')
+  const bad = await call(c, 'download_attachment', { file_id: 'onsen:403' })                      // the retry: Onsen still refuses
+  expect(bad.isError).toBe(true)
+  expect(bad.text).toContain('HTTP 403')
+  expect(await until(() => inbox.find(i => i.id === 9101)!.acked === true, 10000)).toBe(true)
+  await c.close()
 }, 60000)
