@@ -67,6 +67,7 @@ import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.t
 import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { ObservationPut } from './onsen-observation.ts'
+import { MentionCards } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
@@ -4481,6 +4482,14 @@ try { mcpToken = ensureToken(HTTP_PORT as number) } catch (e) {
 }
 const mcpGate = makeGate(mcpToken, MCP_REQUIRE_TOKEN, msg => log('warn', msg))
 
+// WO-181 (Chiron; onsen-mentions.ts): the unread mentions of this agent ride the main's deliveries with the lanes digest. LANES_MENTION_CARDS lists the
+// agent (read as JEV_SCREEN: the plist, else the machine config, every 30 s); this agent's own credential; marked read once the delivery reached the main
+const mentionCards: MentionCards | null = INBOX_ONLY || !onsen ? null : new MentionCards({
+  on: () => switchOn(liveSetting('LANES_MENTION_CARDS'), ONSEN_AGENT),
+  req: (method, path, body, timeoutMs) => method === 'GET' ? onsen.request('GET', path, undefined, timeoutMs)
+    : onsen.putBytes(path, new TextEncoder().encode(JSON.stringify(body ?? {})), 'application/json', timeoutMs),
+  timeoutMs: () => Number(process.env.LANES_MENTION_TIMEOUT_MS ?? 2_000),
+  log: (lv, m) => log(lv, m) })
 // 002 lanes wiring (inert unless GENESIS_LANES=1)
 let checkIconId: string | undefined                // lanes-topics (item 4): the ✅ topic icon's custom emoji id, once found
 if (Lanes.LANES_ON) {
@@ -4522,6 +4531,7 @@ if (Lanes.LANES_ON) {
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
+    ...(mentionCards ? { mentions: () => mentionCards.fetchIfOn(), mentionsRead: (posts: string[]) => mentionCards.read(posts) } : {}),   // WO-181
     // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)
     usageWall: (wallSinceMs: number) => {
       const w = wallReader.state()
@@ -4679,10 +4689,11 @@ if (Lanes.LANES_ON) {
 /** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
  *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way. WO-180: ONSEN_OBSERVATION
  *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way */
-type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION'
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS'
 const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
   SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE,
-  ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION }
+  ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION,
+  LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS }   // WO-181
 let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
 function liveSetting(k: LiveKey): string | undefined {
   if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
@@ -5277,7 +5288,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         ...(Lanes.LANES_ON && !INBOX_ONLY ? { mailbox_decide_listed: decideListed } : {}),   // WO-126: the main listed mailbox_decide (when, which session)
         // Onsen (WO-139): recording on, bytes waiting in the spool, last sync; step 3 (WO-143): deliveries_recorded, status_recorded, the status now
         ...(onsen ? { onsen: { ...onsen.health(), ...(onsenStatusNow ? { status: onsenStatusNow() } : {}),
-          ...(onsenActions ? { actions: onsenActions.health() } : {}) } } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed)
+          ...(onsenActions ? { actions: onsenActions.health() } : {}), ...(mentionCards ? { mentions: mentionCards.health() } : {}) } } : {}),   // WO-176 (Epeius): the Actions client's own counts (on, created … failed, followed); WO-181: the mention cards'
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,

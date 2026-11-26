@@ -218,6 +218,11 @@ export interface LanesDeps {
    *  the lanes' wall reads it too (followUsageWall). `by`: the clear's cleared_by (usage_wall.py: ok_turn | probe_after_reset | probe_after_switch |
    *  probe_retry) */
   usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null; by?: string | null } | null
+  /** WO-181 (server.ts onsen-mentions.ts MentionCards): the block of this agent's unread mentions for a delivery to the main (resolves null: none, no answer);
+   *  null at once: switched off */
+  mentions?: () => Promise<{ text: string; posts: string[] } | null> | null
+  /** WO-181: the delivery carrying these mention posts reached the main: mark them read in Onsen */
+  mentionsRead?: (posts: string[]) => void
   /** Onsen (WO-139): the chat_history tool's answer (server.ts: onsen-client.ts queryHistory); absent = no Onsen here */
   chatHistory?: (args: Record<string, unknown>) => Promise<string>
   /** WO-153: form_close's answer (server.ts: onsen-tool.ts formClose, POST /forms/close); absent = Onsen recording off here, and lanes do not list the tool */
@@ -330,6 +335,8 @@ function mainEnv() {
     },
     streamOpen: (pid: number): boolean => { const sid = sessionOfPid(pid); return !!sid && !!D.streamOpen?.(sid) },
     info: digestInfo,
+    // WO-181: the unread mentions ride the main's deliveries with the digest (onsen-mentions.ts, server.ts); the main only: a lane's run gets none
+    ...(D.mentions ? { mentions: () => D.mentions!(), mentionsDelivered: (posts: string[]) => D.mentionsRead?.(posts) } : {}),
     done: itemDone,
     undone: itemUndone,
     tellJoey: (text: string, rule: string, evs: string[] = []) => {

@@ -92,6 +92,12 @@ export type MainEnv = {
    *  state through the screen judge, its detail's walled / compacting as states of their own). It is the one answer to 「can the main take an item now」
    *  (canTake: 'idle', which takes in idle with background and interrupted). null: no status record here (Onsen step 3 off): M2's phase answers */
   memberState?: () => string | null
+  /** WO-181 (Chiron): the unread mentions of this agent in Onsen (onsen-mentions.ts), fetched when a delivery is about to go to the main, as one block that
+   *  rides with the digest (the same place, the same go); resolves null: none, or Onsen did not answer in time. Returns null at once when switched off
+   *  (nothing is awaited: the delivery goes exactly as without it). Never wakes the main by itself */
+  mentions?: () => Promise<{ text: string; posts: string[] } | null> | null
+  /** WO-181: the delivery carrying these mention posts reached the main (offered into its session, or pulled into its turn): they are marked read */
+  mentionsDelivered?: (posts: string[]) => void
 }
 
 export type MainEvent = {
@@ -256,19 +262,34 @@ export function createMain(E: MainEnv) {
   const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : r.reason === 'batched' ? 'batched' : why
   /** an item that was in an interrupted turn: Chiron's line goes in front of it each time it reaches the main (cut_at, set when the turn was cut) */
   const cutText = (r: Row, text: string): string => r.cut_at ? `${INTERRUPTED_LINE}\n${text}` : text
-  /** the digest that rides this delivery: the one queued digest item, refreshed, or a new one; null = nothing to tell */
-  function attachInfo(): Row | null {
+  /** the digest that rides this delivery: the one queued digest item, refreshed, or a new one; null = nothing to tell. WO-181: `mb`, the unread mentions
+   *  fetched for this delivery, ride in it as one block after the digest's own text (alone when the digest has nothing); the item keeps their posts
+   *  (`mentions`), marked read once it reached the main */
+  function attachInfo(mb: { text: string; posts: string[] } | null = null): Row | null {
     const inf = E.info()
-    if (!inf) return null
+    if (!inf && !mb) return null
+    const text = [inf?.text, mb?.text].filter(Boolean).join('\n')
+    const fields = { ...(inf?.fields ?? {}), mentions: mb ? mb.posts : null }
     const q = items(r => r.kind === 'digest' && r.state === 'queued')
-    const notif = { method: 'notifications/claude/channel', params: { content: inf.text, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'digest', no_reply: 'true' } } }
+    const notif = { method: 'notifications/claude/channel', params: { content: text, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'digest', no_reply: 'true' } } }
     if (q.length) {
       const d = q[q.length - 1]
-      J().write('msg', d.id, 'queued', { notif: { ...notif, params: { ...notif.params, meta: { ...notif.params.meta, did: d.id } } }, ...inf.fields })
+      J().write('msg', d.id, 'queued', { notif: { ...notif, params: { ...notif.params, meta: { ...notif.params.meta, did: d.id } } }, ...fields })
       return J().get('msg', d.id)!
     }
-    const id = enqueue('digest', notif, { fields: inf.fields })
+    const id = enqueue('digest', notif, { fields })
     return J().get('msg', id)!
+  }
+  /** WO-181: the fetch of the unread mentions for a delivery about to go to the main; null: switched off (nothing to wait for). Never rejects */
+  function mentionsNow(): Promise<{ text: string; posts: string[] } | null> | null {
+    let p: Promise<{ text: string; posts: string[] } | null> | null = null
+    try { p = E.mentions ? E.mentions() : null } catch (e) { E.log('warn', `lanes: mention cards: ${e}`) }
+    return p ? p.catch(e => { E.log('warn', `lanes: mention cards: ${e}`); return null }) : null
+  }
+  /** WO-181: the digest `dg` reached the main: the mention posts it carried are marked read */
+  function mentionsReached(dg: Row | null): void {
+    const ps = dg && Array.isArray(dg.mentions) ? (dg.mentions as unknown[]).map(String).filter(Boolean) : []
+    if (ps.length) { try { E.mentionsDelivered?.(ps) } catch (e) { E.log('warn', `lanes: mention cards: ${e}`) } }
   }
   function contentOf(r: Row): string { return String((r.notif?.params as any)?.content ?? '') }
   /** the turn of prompt `p` of gen `g`, for the main's aids */
@@ -316,8 +337,18 @@ export function createMain(E: MainEnv) {
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
-    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r))
+    let cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r))
     if (!cands.length) return
+    // WO-181: the unread mentions ride this offer with the digest; fetched now (≤ LANES_MENTION_TIMEOUT_MS), and what the wait changed is looked at again
+    const mp = mentionsNow()
+    const mb = mp ? await mp : null
+    if (mp) {
+      const g2 = currentGen()
+      if (!g2 || g2.id !== g.id || (!probe && (g2.state !== 'idle' || !canTake(g2)))) return
+      if (items(r => r.state === 'offered' && r.gen === g.id).length) return
+      cands = cands.filter(r => J().get('msg', r.id)?.state === 'queued')
+      if (!cands.length) return
+    }
     if (probe) {
       const menu = E.menu ? await E.menu(true).catch(() => null) : null
       // 002q (T7-R 1016): a menu Joey must choose on is told now; one the probe dealt with asks nothing of him: it rides the episode's one wall-down notice
@@ -329,7 +360,7 @@ export function createMain(E: MainEnv) {
     const down = new Set<string>()
     for (const it of cands) {
       if (down.has(String(it.via))) continue
-      const dg = attachInfo()
+      const dg = attachInfo(mb)
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
       const riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g))   // WO-164: and the batched
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
@@ -353,6 +384,7 @@ export function createMain(E: MainEnv) {
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
       for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
+      mentionsReached(dg)                                                                     // WO-181: in its session now: the mentions it carried are read
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) of an interrupted turn riding` : ''}` })
       for (const r of riders) J().write('wake', r.id, 'wake', { reason: r.reason === 'batched' ? `batched: rides the offer of ${it.id} (gen ${g.id})` : `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
       try { E.woke?.(J().get('msg', it.id)!, { gen: g.id, probe }) } catch (e) { E.log('warn', `lanes: woke hook: ${e}`) }
@@ -367,15 +399,18 @@ export function createMain(E: MainEnv) {
     E.tellJoey('主線接到訊息了：等著的訊息現在交給它。', 'main-delivered')
   }
 
-  /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary */
-  function pull(g: Row, prompt: string): Row[] {
+  /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary. `mb` (WO-181): the unread mentions
+   *  fetched for it (pullable() first said there is something to pull) */
+  const pullable = (g: Row): boolean => items(r => r.state === 'queued' && owed(r) && forGen(r, g)).length > 0
+  function pull(g: Row, prompt: string, mb: { text: string; posts: string[] } | null = null): Row[] {
     const got = items(r => r.state === 'queued' && owed(r) && forGen(r, g))
     if (!got.length) return []
-    const dg = attachInfo()
+    const dg = attachInfo(mb)
     const all = dg ? [...got, dg] : got
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true })
     for (const r of got) J().write('wake', r.id, 'wake', { reason: `pulled into the running turn ${prompt}` })
     try { E.bound?.(got.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }
+    mentionsReached(dg)                                                                       // WO-181: bound into its turn: the mentions it carried are read
     delivered()
     return all.map(r => J().get('msg', r.id)!)
   }
@@ -530,14 +565,16 @@ export function createMain(E: MainEnv) {
         { const list = calls.get(p) ?? calls.set(p, []).get(p)!; list.push({ name: n, input: b.tool_input ?? {}, result: String(b.tool_response ?? ''), error: !!b.tool_error }); if (list.length > 40) list.shift() }
         setMain(J().get('main', g.id)!, 'in_turn', { tool_open: null }); openTools.delete(g.id)
         try { E.toolDone?.(n, b.tool_input ?? {}, String(b.tool_response ?? ''), !!b.tool_error) } catch (e) { E.log('warn', `lanes: toolDone ${n}: ${e}`) }
-        const got = pull(J().get('main', g.id)!, p)
+        const mp = pullable(g) ? mentionsNow() : null                                       // WO-181: only when something is pulled now
+        const got = pull(J().get('main', g.id)!, p, mp ? await mp : null)
         return got.length ? { additionalContext: renderPulled(got) } : {}
       }
       case 'Stop': {
         if (!p) return {}
         beginTurn(g, p)
         if (b.phase !== 'final') {
-          const got = pull(J().get('main', g.id)!, p)
+          const mp = pullable(g) ? mentionsNow() : null                                     // WO-181: only when something is pulled now
+          const got = pull(J().get('main', g.id)!, p, mp ? await mp : null)
           if (got.length) return { block: '這一輪先不要結束。' + renderPulled(got) }
           const t = turnWork(g, p)
           // 002q (M3), 002w (B): the main's turn may not end silently while it still owes what the turn works on, the rule the lane stop applies to a
