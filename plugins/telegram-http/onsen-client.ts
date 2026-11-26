@@ -691,10 +691,11 @@ export class OnsenClient {
   }
   /** WO-145: one call to Onsen with this agent's credential (null: no credential); throws on a network error or the timeout. `headers` (WO-176): extra
    *  request headers (an Idempotency-Key) */
-  async request(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>): Promise<{ status: number; json: any } | null> {
+  async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>): Promise<{ status: number; json: any } | null> {
     const cred = this.cfg.credential()
     if (!cred) return null
     if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs, headers)
+    if (method === 'PUT') return this.put(path, body ?? {}, cred, timeoutMs)      // WO-197: the connector's edit (PUT /v1/messages/<id>)
     const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, headers), signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
     try { json = await r.json() } catch {}
