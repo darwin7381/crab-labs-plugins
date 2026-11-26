@@ -199,6 +199,7 @@ describe('a Call', () => {
     expect(s.to).toBe('chiron')
     expect(s.kind).toBe('peer_call')
     expect(s.payload.reply_to_id).toBe(501)
+    expect(s.payload.no_reply).toBe(true)                                   // the answer owes the caller nothing (Chiron mesh 12558)
     expect(s.payload.text).toContain('answer to:')
     expect(s.payload.text).toContain(join(folder, 'capy.png'))
     expect(s.attachment_file_ids).toEqual(fin.result.attachment_file_ids)
@@ -234,6 +235,7 @@ describe('a Call', () => {
     expect(starts[1].dir).toBe(folder)
     const f = onsen.sends[1]
     expect(f.payload.reply_to_id).toBe(602)                                    // the follow-up's own number
+    expect(f.payload.no_reply).toBe(true)                                   // the answer owes the caller nothing (Chiron mesh 12558)
     expect(f.payload.thread).toBe(T)
     expect(f.payload.hop).toBe(2)
     expect(f.payload.text).toContain('resumed=yes')

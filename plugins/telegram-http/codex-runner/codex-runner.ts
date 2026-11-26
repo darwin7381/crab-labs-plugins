@@ -841,7 +841,9 @@ export class CodexRunner {
     let r: Answer = null
     try {
       r = await this.onsen.req('POST', '/send', { to: j.caller, kind: 'peer_call', dedupe: `codex-reply:${j.call_id ?? j.id}`,
-        payload: { text, reply_to_id: this.replyNumber(j), ...(j.thread ? { thread: j.thread, hop: (j.hop ?? 0) + 1 } : {}) },
+        // no_reply: the answer is the result; the caller owes Codex nothing for it, and an answer to it would be new work for Codex (takes_work), answered
+        // again, up to the hop limit (Chiron mesh 12558: his lanes held each result as a call owed an answer)
+        payload: { text, reply_to_id: this.replyNumber(j), no_reply: true, ...(j.thread ? { thread: j.thread, hop: (j.hop ?? 0) + 1 } : {}) },
         ...(j.thread ? { refs: { thread: j.thread } } : {}), ...(ids.length ? { attachment_file_ids: ids } : {}) })
     } catch (e) { this.stats.last_error = String(e) }
     if (r?.status === 200) return 'ok'
