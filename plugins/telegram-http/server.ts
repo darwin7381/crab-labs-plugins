@@ -3252,7 +3252,8 @@ if (isControlEnabled() || isRoamerEnabled()) {
     model: askModelCli,
     ...(onsenActions ? { actions: menuActions(onsenActions) } : {}),        // WO-176: its menus as Onsen Actions
     recipients: () => opsRecipients(loadAccess()),
-    send: (chats, text, buttons) => connectorNow() ? Promise.resolve([]) : Onsen.withSender('system:duty-officer', async () => {   // Onsen (WO-139); WO-197: a connector: the Action only
+    send: (chats, text, buttons) => Onsen.withSender('system:duty-officer', async () => {   // Onsen (WO-139)
+      if (connectorNow()) return []                  // WO-197: a connector asks only through the Action (the bridge draws its buttons)
       const kb = buttons ? (() => {
         const k = new InlineKeyboard()
         buttons.forEach((row, i) => { if (i > 0) k.row(); for (const b of row) k.text(b.text, b.callback_data) })
