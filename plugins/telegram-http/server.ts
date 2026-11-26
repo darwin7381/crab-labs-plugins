@@ -713,6 +713,27 @@ const onsenJoeyOf: OnsenStatus.JoeyOf = meta => {
   if (Date.now() - onsenAllow.at > 5_000) { try { onsenAllow.ids = loadAccess().allowFrom.map(String) } catch {} ; onsenAllow.at = Date.now() }
   return onsenAllow.ids.includes(uid) ? { chat, id } : null
 }
+/** WO-197 (Chiron, WO-197 15:45Z: Joey's /clear to nestor, prometheus, hephaestus, Onsen 43345 / 43357 / 43369: the receipt stayed at accepted_at,
+ *  delivered_at null, not_started): a person's Telegram message the daemon handles itself is never handed to a session, so it had no delivery facts.
+ *  Its receipt now goes to the end through the path and keys of every message (DeliveryFacts → deliveries/batch, the Telegram chat and message id):
+ *  delivered when the daemon takes it, and when `run` finished, handled (done; failed: it threw). Every such path runs through here: bot.command
+ *  (start, help, status; main, lanes with lanes on), the control plane's slash commands, the roamer's, a permission reply (`yes abcde`). `mine(r)`:
+ *  whether it turned out to be the daemon's own (a slash text the control plane does not know goes on to the session: delivered only, its turn
+ *  reports the rest). Only a message recorded as the person's (onsenJoeyOf: an allowlisted sender); who null: nothing reported */
+type SelfWho = { chat: string; id: number | undefined; from: string }
+async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
+  const j = who && onsenFacts && who.id != null ? onsenJoeyOf({ chat_id: who.chat, message_id: String(who.id), user_id: who.from }) : null
+  if (j) { try { onsenFacts!.took(j.chat, j.id) } catch {} }
+  let r: T | undefined
+  try { r = await run() } catch (e) {
+    if (j && mine(undefined)) { try { onsenFacts!.handledHere(j.chat, j.id, 'failed', how) } catch {} }
+    throw e
+  }
+  if (j && mine(r)) { try { onsenFacts!.handledHere(j.chat, j.id, 'done', how) } catch {} }
+  return r as T
+}
+/** WO-197: the Telegram messages that reached handleInbound (a command bot.command did not take goes on there: handleInbound reports it) */
+const reachedInbound = new WeakSet<object>()
 /** WO-185 (Joey TG chiron:2645): how long the button 「不要讓它看到之前的」 stays under a /clear reply, in seconds (its label counts down once a second) */
 const CLEAR_KEEP_S = 5
 /** WO-185: replies whose button was pressed (chat:message), so the countdown leaves them alone; each entry goes 10 s later */
@@ -3380,7 +3401,9 @@ bot.use(async (ctx, next) => {
   try { allowed = m.chat.type === 'private' && loadAccess().allowFrom.includes(String(m.from?.id)) } catch {}
   if (!allowed) return Onsen.withoutRecord(() => next())
   onsenIn(m, m.text!)
-  return Onsen.withSender('system:control', () => next())
+  // WO-197: answered here, never delivered: its receipt goes to the end (handledHere); one bot.command did not take went on to handleInbound
+  return handledHere({ chat: String(m.chat.id), id: m.message_id, from: String(m.from?.id ?? '') }, 'command',
+    () => Onsen.withSender('system:control', () => next()), () => !reachedInbound.has(m))
 })
 // Onsen (WO-139): an allowlisted person edits a message they sent: an edit event on it (the new full text).
 // Onsen step 2 (WO-142): and, with recording on for this agent, the edit reaches the agent (onsen-edit.ts): the original's unseen queued copy takes the new
@@ -4157,6 +4180,7 @@ async function handleInbound(
    *  attachment_origin="reply" so the agent knows whose file this is. */
   attachmentFromReply = false,
 ): Promise<void> {
+  if (ctx.message) reachedInbound.add(ctx.message)        // WO-197: the bot.command middleware leaves its receipt to this function
   // Expand hidden-payload entities (text_link URLs etc. — see entities.ts) so
   // the channel text is self-contained. Guarded by identity: only when the
   // text we were handed IS the message text/caption — synthetic strings like
@@ -4200,31 +4224,35 @@ async function handleInbound(
   // relaying as chat. The sender is already gate()-approved at this point
   // (non-allowlisted senders were dropped above), so we trust the reply.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
+  // WO-197: the message itself is handled here (never delivered as chat): its receipt goes to the end (handledHere)
+  const self: SelfWho = { chat: chat_id, id: msgId, from: String(from.id) }
   if (permMatch) {
-    const reqId = permMatch[2]!.toLowerCase()
-    const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
-    const pending = pendingPermissions.get(reqId)
-    if (pending && !permLive(pending.server)) {                          // WO-176 r4: its conversation is gone: cancelled, nothing sent
-      pendingPermissions.delete(reqId)
-      permGone(reqId, '對話已經不在了')
-      return
-    }
-    if (pending) {
-      void pending.server.notification({
-        method: 'notifications/claude/channel/permission',
-        params: { request_id: reqId, behavior },
-      }).catch(err => log('error', `permission text-reply notify failed: ${err}`))
-      pendingPermissions.delete(reqId)
-      permAnswered(reqId, behavior, String(from.id))                        // WO-176: the Action follows (background)
-    } else {
-      log('warn', `permission text-reply for unknown request_id=${reqId}`)
-    }
-    if (msgId != null) {
-      const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
-      void Onsen.withSender('system:permission', () => bot.api.setMessageReaction(chat_id, msgId, [   // Onsen (WO-139)
-        { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
-      ])).catch(() => {})
-    }
+    await handledHere(self, 'permission', async () => {
+      const reqId = permMatch[2]!.toLowerCase()
+      const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+      const pending = pendingPermissions.get(reqId)
+      if (pending && !permLive(pending.server)) {                          // WO-176 r4: its conversation is gone: cancelled, nothing sent
+        pendingPermissions.delete(reqId)
+        permGone(reqId, '對話已經不在了')
+        return
+      }
+      if (pending) {
+        void pending.server.notification({
+          method: 'notifications/claude/channel/permission',
+          params: { request_id: reqId, behavior },
+        }).catch(err => log('error', `permission text-reply notify failed: ${err}`))
+        pendingPermissions.delete(reqId)
+        permAnswered(reqId, behavior, String(from.id))                        // WO-176: the Action follows (background)
+      } else {
+        log('warn', `permission text-reply for unknown request_id=${reqId}`)
+      }
+      if (msgId != null) {
+        const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
+        void Onsen.withSender('system:permission', () => bot.api.setMessageReaction(chat_id, msgId, [   // Onsen (WO-139)
+          { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
+        ])).catch(() => {})
+      }
+    })
     return
   }
 
@@ -4255,15 +4283,18 @@ async function handleInbound(
   // and acts on the claude TUI directly (tmux send-keys / launchctl /
   // pkill / wrapper-args-file + restart) — instead of forwarding the slash
   // to claude as ordinary chat content.
+  // WO-197: a slash text here (never one going into Onsen: viaOnsen leaves it to the control plane and the roamer) that either handles: its receipt goes
+  // to the end (handledHere); one neither knows goes on to the session, delivered as any message
+  const ownSlash = text.trim().startsWith('/') ? self : null
   if (isControlEnabled()) {
-    const handled = await handleControlSlash(
+    const handled = await handledHere(ownSlash, 'command', () => handleControlSlash(
       text,
       String(HTTP_PORT),
       async (msg: string, opts?: ReplyOptions) => {
         await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard, here)     // lanes-topics: answered where it was typed
       },
       clearHooks(chat_id, msgId, String(from.id), here, ctx.message?.date),   // WO-185: /clear keeps what came before; its reply offers 「不要讓它看到之前的」 for 5 s
-    )
+    ), h => h !== false)
     if (handled) {
       log('info', `channel-bot-control handled slash: ${text.slice(0, 60)}`)
       return
@@ -4280,7 +4311,7 @@ async function handleInbound(
     const replyToTg = async (msg: string, opts?: ReplyOptions) => {
       await sendTextWithMaybeKeyboard(String(chat_id), msg, opts?.keyboard, here)
     }
-    const handled = await handleRoamerSlash(text, replyToTg)
+    const handled = await handledHere(ownSlash, 'command', () => handleRoamerSlash(text, replyToTg), h => h !== false)   // WO-197
     if (handled) {
       log('info', `roamer handled slash: ${text.slice(0, 60)}`)
       return

@@ -30,6 +30,8 @@ const k2 = (chat: string, id: string): string => `${chat}\u0000${id}`
 export type TurnFields = { turn_id?: string | null; outcome?: TurnOutcome; bound?: string[] }
 const turnFields = (t?: TurnFields): Partial<DeliveryFact> => !t ? {} : { ...(t.turn_id ? { turn_id: t.turn_id } : {}), ...(t.outcome ? { outcome: t.outcome } : {}),
   ...(t.bound ? { bound: [...t.bound] } : {}) }
+/** WO-197: the `by` of the turn_end of a message the daemon handled itself (DeliveryFacts.handledHere): not main, not a lane */
+export const HANDLED_HERE = 'daemon'
 /** WO-177: the member states of a record that shows the main's turn still running (a Stop another Stop hook pushed back) */
 const TURN_RUNNING: ReadonlySet<string> = new Set(['busy', 'stuck', 'compacting'])
 export class DeliveryFacts {
@@ -80,6 +82,16 @@ export class DeliveryFacts {
     if (!this.open.has(k2(chat, s))) this.open.set(k2(chat, s), { at: this.now(), session: false, turn: false })
     if (this.open.size > 2_000) this.open.delete(this.open.keys().next().value!)
     this.changed()
+  }
+  /** WO-197 (Chiron, WO-197 15:45Z: Joey's /clear to nestor, prometheus, hephaestus, Onsen 43345 / 43357 / 43369, stayed at accepted_at, not_started):
+   *  a person's message the daemon handles itself (its own command, a permission reply) is never handed to a session. took: the daemon took it
+   *  (delivered, at that moment), not counted as queued (a message that turns out not to be the daemon's own goes on and is counted by delivered()) */
+  took(chat: string, id: string | number, at?: string): void { this.emit(chat, String(id), 'delivered', undefined, at) }
+  /** WO-197: its handler finished: turn_end with how (done; failed: the handler threw); Onsen's receipt: handling completed / failed, started_at null
+   *  (no turn read it), read_at null. `by` HANDLED_HERE, not a session: Onsen reads a session's later turn_end (main, a lane id) as that session having
+   *  moved on, and would end the main's running message with it. No turn, nothing bound. detail.handled_here: which path */
+  handledHere(chat: string, id: string | number, outcome: 'done' | 'failed', how: string, at?: string): void {
+    this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome })
   }
   /** WO-165: handed to a session (lanes off: written into the main's stream, where Claude Code may queue it; lanes on: M1 offered it, or bound it at a
    *  boundary; a lane run started with it). Not seen: the ✍ waits for seen */

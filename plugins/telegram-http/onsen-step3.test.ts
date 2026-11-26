@@ -8,7 +8,7 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
 import { OnsenClient, idemDelivery, idemStatus, inboundItem, type DeliveryFact, type StatusFact } from './onsen-client.ts'
-import { DeliveryFacts, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, osProcStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
+import { DeliveryFacts, HANDLED_HERE, StatusFacts, statusOf, LanesTap, TurnWatch, Registry, Streams, channelTags, compareRegistry, pickMain, regEntry, sameStart, osProcStart, SharedCli, runCli, pidAlive, REG_SETTLE_MS, type JoeyOf,
   type RegEntry, type StatusInputs, type StatusSource } from './onsen-status.ts'
 
 const CRED = 'mesh_STEP3************************************'
@@ -128,6 +128,30 @@ describe('the spool: delivery facts and status lines, in order, the same guarant
 })
 
 describe('delivery facts', () => {
+  test('WO-197: a message the daemon handled itself: delivered (took) and turn_end by daemon with how it ended; never queued, no ✍, no turn, nothing bound', () => {
+    const out: DeliveryFact[] = [], seen: string[] = []
+    let changed = 0
+    const F = new DeliveryFacts({ agent: AGENT, sink: f => out.push(f), onSeen: (_c, id) => seen.push(id), changed: () => { changed++ } })
+    F.took(JOEY, 30, '2026-11-26T15:00:00.000Z')
+    expect(F.queued('in_session')).toBe(0); expect(F.queued('seen')).toBe(0)
+    F.handledHere(JOEY, 30, 'done', 'command', '2026-11-26T15:00:01.000Z')
+    F.took(JOEY, 31); F.handledHere(JOEY, 31, 'failed', 'permission')
+    F.handledHere(JOEY, 31, 'done', 'permission')                                 // once per (message, state): the first stands
+    expect(out.map(f => `${f.client_msg_id}:${f.state}${f.by ? `:${f.by}` : ''}`)).toEqual(['30:delivered', `30:turn_end:${HANDLED_HERE}`, '31:delivered', `31:turn_end:${HANDLED_HERE}`])
+    expect(out[0]).toMatchObject({ at: '2026-11-26T15:00:00.000Z', idem_key: `tg:${AGENT}:${JOEY}:dlv:30:delivered` })
+    expect(out[0].by).toBeUndefined()
+    expect(out[1]).toMatchObject({ at: '2026-11-26T15:00:01.000Z', outcome: 'done', detail: { handled_here: 'command' }, idem_key: `tg:${AGENT}:${JOEY}:dlv:30:turn_end` })
+    expect(out[3]).toMatchObject({ outcome: 'failed', detail: { handled_here: 'permission' } })
+    expect(out.some(f => f.turn_id != null || f.bound != null)).toBe(false)
+    expect(HANDLED_HERE).not.toBe('main')
+    expect(seen).toEqual([]); expect(changed).toBe(0)
+    expect(F.counts()).toEqual({ pending: 0, unread_by_member: 0 })
+    // not the daemon's own after all (a slash text it does not know): took, then delivered by the path of every message: counted from there, one fact
+    F.took(JOEY, 32); F.delivered(JOEY, 32)
+    expect(out.filter(f => f.client_msg_id === '32').map(f => f.state)).toEqual(['delivered'])
+    expect(F.queued('in_session')).toBe(1)
+  })
+
   test('one per (message, state); an album: every item; turn_end waits for the status record to show the turn over (WO-177: no timer), a continued turn cancels it, a new prompt flushes it', async () => {
     const out: DeliveryFact[] = []
     const F = new DeliveryFacts({ agent: AGENT, sink: f => out.push(f) })

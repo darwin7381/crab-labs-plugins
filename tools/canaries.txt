@@ -256,3 +256,10 @@ plugins/telegram-http/onsen-inbound.ts::export function clientMetaOf(client: unk
 plugins/telegram-http/server.ts::for (const [k, v] of Object.entries(f.clientMeta ?? {})) if (!(k in meta)) meta[k] = v
 plugins/telegram-http/onsen-inbound.ts::export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
 plugins/telegram-http/server.ts::...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
+plugins/telegram-http/onsen-status.ts::export const HANDLED_HERE = 'daemon'
+plugins/telegram-http/onsen-status.ts::this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome })
+plugins/telegram-http/server.ts::async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
+plugins/telegram-http/server.ts::() => Onsen.withSender('system:control', () => next()), () => !reachedInbound.has(m))
+plugins/telegram-http/server.ts::await handledHere(self, 'permission', async () => {
+plugins/telegram-http/server.ts::const handled = await handledHere(ownSlash, 'command', () => handleControlSlash(
+plugins/telegram-http/server.ts::const handled = await handledHere(ownSlash, 'command', () => handleRoamerSlash(text, replyToTg), h => h !== false)
