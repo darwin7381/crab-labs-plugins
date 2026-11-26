@@ -1,3 +1,8 @@
+## 1.58.5 — 2026-11-26
+
+- **An incoming message's record carries the group's name and the speaker's name** (board WO-179, Chiron; agent-inbox 1.28.5). `inboundItem` adds two top-level fields (not in `meta`): `chat_title` (Telegram `chat.title`, only for group / supergroup chats) and `sender_name` (`first_name` + `last_name`, else `@username`; left out when neither is there). Outgoing records carry neither. Onsen 0.22.2 (deployed 2026-11-26 03:36Z) stores them for display only: the conversation's `title` (renames follow) and an outside account's (guest's) `display_name`; a fleet member's name is never changed. No text an agent reads changes. `displayName()` in `onsen-client.ts`.
+- Roll back: the daemon back to 1.58.4 (the names stop arriving; what Onsen already has stays).
+
 ## 1.58.4 — 2026-11-26
 
 - **「Can the main take an item now」 has one answer: the status record** (board WO-177 section 一, Chiron; Joey TG chiron:2485 「你是不是把它搞得到處都是補丁很複雜？」, 2515, 2547). Lanes on, Telegram daemon. The record's member state (the one `decideWake` reads: `statusOf` through the screen judge, a wall or a compaction in an idle view's detail as states of their own) must be `idle` (idle with background and interrupted included) before M1 offers an item. M2 (the main's hook record) only says how an item reaches the main (an idle gen is offered one, which opens its turn; a gen in a turn pulls at its next tool boundary or Stop, unchanged) and keeps the turn's edges. No record (Onsen step 3 off): M2 as before.
