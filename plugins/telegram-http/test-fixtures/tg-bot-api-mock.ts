@@ -4,8 +4,8 @@
 export type Call = { method: string; body: Record<string, any>; at: number }
 export type BotApiMock = {
   url: string; token: string; calls: Call[]; me: Record<string, any>
-  /** every getUpdates: when it came and when it was answered (ms) */
-  polls: Array<{ start: number; end?: number }>
+  /** every getUpdates: when it came and when it was answered (ms); port: the caller's (one TCP connection, one port: WO-197 counts connections) */
+  polls: Array<{ start: number; end?: number; port?: number }>
   /** calls this returns true for are never answered (the request stays open) */
   hang: { fn: ((method: string, body: Record<string, any>) => boolean) | null }
   /** calls this returns true for are answered 400 (as a markdown the rich renderer cannot take; `desc`: another description; WO-192: `code` another
@@ -26,11 +26,12 @@ export type BotApiMock = {
 }
 export const ICON_CHECK = '5237699328843200968'
 
-/** pollHoldMs: how long an empty getUpdates is held open (a real long poll holds up to its timeout) */
-export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: number } = {}): BotApiMock {
+/** pollHoldMs: how long an empty getUpdates is held open (a real long poll holds up to its timeout). idleTimeout (s; WO-197): how long an idle
+ *  keep-alive connection stays open (Bun's default 10; 0: never closed by this side, as Telegram keeps them) */
+export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: number; idleTimeout?: number } = {}): BotApiMock {
   const token = '123456:TEST-not-a-real-token'
   const calls: Call[] = []
-  const polls: Array<{ start: number; end?: number }> = []
+  const polls: Array<{ start: number; end?: number; port?: number }> = []
   const hang: BotApiMock['hang'] = { fn: null }
   const fail: BotApiMock['fail'] = { fn: null }
   const pinned = new Map<string, number>(), deleted = new Set<number>()
@@ -46,7 +47,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     return { message_id: ++nextMsg, date: Math.floor(Date.now() / 1000), chat: { id: Number(b.chat_id), type: 'private' }, from: { id: state.id, is_bot: true, first_name: 'lab' },
       ...(b.text != null ? { text: String(b.text) } : {}), ...(thread != null ? { message_thread_id: thread, is_topic_message: true } : {}) }
   }
-  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
+  const server = Bun.serve({ port: 0, hostname: '127.0.0.1', ...(o.idleTimeout != null ? { idleTimeout: o.idleTimeout } : {}), async fetch(req, srv) {
     const fm = new URL(req.url).pathname.match(/^\/file\/bot([^/]+)\/(.+)$/)
     if (fm) {
       downloads.push(fm[2])
@@ -85,7 +86,8 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
         if (deleted.has(Number(body.message_id))) return Response.json({ ok: false, error_code: 400, description: 'Bad Request: message to edit not found' }, { status: 400 })
         return ok(true)
       case 'getUpdates': {
-        const offset = Number(body.offset ?? 0), p: { start: number; end?: number } = { start: Date.now() }
+        const offset = Number(body.offset ?? 0), port = srv.requestIP(req)?.port
+        const p: { start: number; end?: number; port?: number } = { start: Date.now(), ...(port != null ? { port } : {}) }
         polls.push(p)
         const hold = o.pollHoldMs ?? 500
         while (Date.now() - p.start < hold) {

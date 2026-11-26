@@ -91,6 +91,8 @@ import * as OnsenFiles from './onsen-files.ts'
 import * as OnsenFirst from './onsen-first.ts'
 import * as OnsenInbound from './onsen-inbound.ts'
 import * as Connector from './onsen-connector.ts'
+import { TelegramFetch, type FetchFn } from './tg-fetch.ts'
+import nodeFetch from 'node-fetch'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
@@ -339,9 +341,11 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 // code paths typecheck, but polling never starts and no API call is ever made.
 // genesis lab: grammy must use the same API root as callBotApi/file downloads, so a
 // TELEGRAM_API_ROOT mock receives getUpdates/sendMessage too (upstream passes no client option).
-// Unset (every fleet daemon): no client option, the fleet's constructor exactly.
+// WO-197 (Chiron 16:1xZ): every request to Telegram (grammy's through the node-fetch shim it uses, callBotApi, file downloads) goes through tgFetch, so
+// the hand-over to the bridge can close every pooled connection to Telegram (tg-fetch.ts)
+const tgFetch = new TelegramFetch({ root: process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org', log: m => log('info', m) })
 const bot = new Bot(INBOX_ONLY || !TOKEN ? (TOKEN || '0:agent-inbox-no-telegram') : TOKEN,   // WO-197: a connector may have no token
-  process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : undefined)
+  { client: { ...(process.env.TELEGRAM_API_ROOT ? { apiRoot: process.env.TELEGRAM_API_ROOT } : {}), fetch: tgFetch.wrap(nodeFetch as unknown as FetchFn) as any } })
 let botUsername = ''
 
 // lanes-topics (item 7, always on, lanes on or off): a send never hangs forever. 2026-11-23 19:19 TPE the channel bot's reply (rich text, callBotApi's bare
@@ -599,7 +603,7 @@ function inboundWritten(job: OnsenInbound.Job, onsenId: number, late: boolean): 
   if (att?.file_id && onsenFilesOn()) {
     void (async () => {
       const ids = await OnsenFiles.storeFiles(job.item, [async () => OnsenFiles.telegramFile({ fileId: String(att.file_id), size: att.size, getFile: id => bot.api.getFile(id),
-        fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}` })], onsenUpload, log)
+        fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}`, fetch: tgFetch.fetch as typeof fetch })], onsenUpload, log)
       if (!ids[0]) return
       const r = await onsen!.request('POST', `/messages/${onsenId}/attachments`, { position: 0, file_id: ids[0] }, 10_000)
       if (!r || r.status >= 300) log('warn', `onsen inbound: file ${ids[0]} not hung on message ${onsenId} (${r ? `HTTP ${r.status}` : 'no credential'})`)
@@ -670,7 +674,8 @@ function inboundFileSource(m: object, a: Onsen.OnsenAttachment): OnsenFiles.Sour
   return async () => {
     const copy = await photoCopies.of(m)
     if (copy) { const got = OnsenFiles.localFile(copy); if (!('why' in got)) return got }
-    return OnsenFiles.telegramFile({ fileId: String(a.file_id), size: a.size, getFile: id => bot.api.getFile(id), fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}` })
+    return OnsenFiles.telegramFile({ fileId: String(a.file_id), size: a.size, getFile: id => bot.api.getFile(id), fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}`,
+      fetch: tgFetch.fetch as typeof fetch })
   }
 }
 /** Onsen (WO-139): a human's Telegram message that passed the gate. body: the text (a file's caption, '' without one; a voice note's transcript).
@@ -1148,7 +1153,7 @@ async function callBotApi(method: string, payload: Record<string, unknown>): Pro
   if (connectorRefuses(method)) throw new Connector.NoTelegram(method)     // WO-197: a connector never calls Telegram
   // lanes-topics (item 7): the raw sends (sendRichMessage, editMessageText) have the same bound as grammy's (boundedSend)
   const data = await boundedSend(method, async signal => {
-    const res = await fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
+    const res = await tgFetch.fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -3043,7 +3048,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const file = await bot.api.getFile(file_id)
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
         const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url)
+        const res = await tgFetch.fetch(url)
         if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
         const buf = Buffer.from(await res.arrayBuffer())
         // file_path is from Telegram (trusted), but strip to safe chars anyway
@@ -3854,7 +3859,7 @@ async function downloadPhotoToInbox(ctx: Context | null, best: { file_id: string
   const file = await (ctx ? ctx.api : bot.api).getFile(best.file_id)   // WO-194: no ctx = a message back from Onsen
   if (!file.file_path) throw new Error('getFile returned no file_path')
   const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
-  const res = await fetch(url)
+  const res = await tgFetch.fetch(url)
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   const buf = Buffer.from(await res.arrayBuffer())
   const ext = file.file_path.split('.').pop() ?? 'jpg'
@@ -4723,7 +4728,7 @@ async function maybeTranscribeVoice(attachment: AttachmentMeta | undefined): Pro
     const file = await bot.api.getFile(attachment.file_id)
     if (!file.file_path) throw new Error('getFile returned no file_path')
     const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
-    const res = await fetch(url)
+    const res = await tgFetch.fetch(url)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const buf = Buffer.from(await res.arrayBuffer())
     const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'oga'
@@ -4998,18 +5003,30 @@ function startPolling(): void {
   })()
 }
 let connectorWas: boolean | null = null
+let connectorHandingOver = false
 async function connectorTick(): Promise<void> {
+  if (connectorHandingOver) return                    // WO-197: a hand-over waits for the requests on their way (up to 15 s): one at a time
   const on = connectorNow()
+  const turnedOn = on && connectorWas === false
   if (on !== connectorWas) {
     log('info', on ? `connector mode (ONSEN_BRIDGE names ${CONNECTOR_AGENT}): no Telegram long poll, no Bot API call; everything goes through Onsen and the Telegram bridge`
       : connectorWas == null ? 'ONSEN_BRIDGE does not name this agent: Telegram as before' : `ONSEN_BRIDGE no longer names ${CONNECTOR_AGENT}: polling Telegram again${TOKEN ? '' : ' (no bot token: cannot)'}`)
     connectorWas = on
   }
-  if (on && bot.isRunning()) {
-    connectorHandover = true
-    try { await bot.stop() } catch (e) { log('warn', `connector: saving the poll's offset on hand-over failed: ${e instanceof Error ? e.message : e}`) }
-    finally { connectorHandover = false; botUsername = '' }
-  } else if (!on) startPolling()
+  // WO-197 (Chiron 16:1xZ): named while polling (or just named, having talked to Telegram): the poll stops (its last getUpdates saves the offset), and no
+  // connection to Telegram is left: every request from here carries Connection: close, then the pool is drained (tg-fetch.ts)
+  if (on && (bot.isRunning() || (turnedOn && tgFetch.stats.requests > 0))) {
+    connectorHandingOver = true
+    tgFetch.beginClose()
+    try {
+      if (bot.isRunning()) {
+        connectorHandover = true
+        try { await bot.stop() } catch (e) { log('warn', `connector: saving the poll's offset on hand-over failed: ${e instanceof Error ? e.message : e}`) }
+        finally { connectorHandover = false; botUsername = '' }
+      }
+      await tgFetch.endClose().catch(e => log('warn', `connector: closing the connections to Telegram failed: ${e instanceof Error ? e.message : e}`))
+    } finally { connectorHandingOver = false }
+  } else if (!on) { tgFetch.reopen(); startPolling() }
 }
 if (!INBOX_ONLY) {
   void connectorTick()
@@ -6147,7 +6164,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         bot_username: botUsername || null,
         agent: CONNECTOR_AGENT,               // WO-197 (Chiron #200436): the fleet is scanned by bot_username; a connector has no bot
         // WO-197: ONSEN_BRIDGE names this agent (no Telegram: the bridge carries its bot); Bot API calls refused by the guard, by method; the says
-        ...(!INBOX_ONLY ? { connector: { on: connectorNow(), token: !!TOKEN, bot_api_refused: connectorBlocked, ...(connectorSay ? { ...connectorSay.stats, ids: connectorIds!.size } : {}) } } : {}),
+        ...(!INBOX_ONLY ? { connector: { on: connectorNow(), token: !!TOKEN, bot_api_refused: connectorBlocked, ...(connectorSay ? { ...connectorSay.stats, ids: connectorIds!.size } : {}),
+          telegram_http: { in_flight: tgFetch.inFlight, peak: tgFetch.peak, closing: tgFetch.closing, ...tgFetch.stats } } } : {}),
         uptime_s: Math.floor(process.uptime()),
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         active_sessions: activeServers.size,

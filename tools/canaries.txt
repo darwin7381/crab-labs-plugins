@@ -266,3 +266,8 @@ plugins/telegram-http/onsen-inbound.ts::export const CLIENT_META_FIXED: Readonly
 plugins/telegram-http/onsen-inbound.ts::for (const [k, v] of Object.entries(cm ?? {})) if (!CLIENT_META_FIXED.has(k)) meta[k] = v
 plugins/telegram-http/server.ts::OnsenInbound.applyClientMeta(meta, f.clientMeta)
 plugins/telegram-http/server.ts::OnsenInbound.applyClientMeta(meta, entry.clientMeta)
+plugins/telegram-http/tg-fetch.ts::export class TelegramFetch {
+plugins/telegram-http/tg-fetch.ts::if (close) { const h = new Headers((opts?.headers ?? undefined) as HeadersInit | undefined); h.set('connection', 'close'); opts = { ...(opts ?? {}), headers: h } }
+plugins/telegram-http/server.ts::fetch: tgFetch.wrap(nodeFetch as unknown as FetchFn) as any } })
+plugins/telegram-http/server.ts::const res = await tgFetch.fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
+plugins/telegram-http/server.ts::await tgFetch.endClose().catch(e => log('warn', `connector: closing the connections to Telegram failed: ${e instanceof Error ? e.message : e}`))
