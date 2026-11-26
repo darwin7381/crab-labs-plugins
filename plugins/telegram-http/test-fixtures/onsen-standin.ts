@@ -104,6 +104,12 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       files.set(key, had)
       return Response.json({ api_version: 1, data: { id: had.id, bytes: raw.length, url: `http://127.0.0.1:${server.port}/api/onsen/v1/files/${had.id}` } }, { status: 201 })
     }
+    const gf = req.method === 'GET' ? path.match(/^\/v1\/files\/(\d+)$/) : null      // WO-197: a stored file, as the bridge stored it
+    if (gf) {
+      const f = [...files.values()].find(x => x.id === gf[1])
+      seen.push({ who, method: 'GET', path, body: null, headers, at: Date.now() })
+      return f ? new Response(f.bytes, { headers: { 'content-type': 'application/octet-stream' } }) : Response.json({ error: { message: 'no file' } }, { status: 404 })
+    }
     const body = req.method === 'POST' || req.method === 'PUT' ? await req.json().catch(() => null) : undefined
     seen.push({ who, method: req.method, path, body, headers, at: Date.now() })
     if (path === '/v1/meta') return Response.json({ api_version: 1, data: { server_version: st.version[who] ?? '0.31.0', commit: 'test', deployed_at: '2026-11-26T10:00:43Z' } })

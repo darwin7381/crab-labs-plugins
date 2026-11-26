@@ -403,7 +403,8 @@ if (ONSEN_VISIBLE.seen || ONSEN_VISIBLE.pin || ONSEN_VISIBLE.forms) log('info', 
 /** WO-145 (ONSEN_REACT_SEEN): ✍ on Joey's message at the moment the main takes it in (DeliveryFacts onSeen, by main: WO-165, the moment it enters a turn,
  *  not the moment it reaches the session); the reaction is recorded in Onsen as system:seen's */
 const seenReactor: OnsenVisible.SeenReactor | null = ONSEN_VISIBLE.seen ? new OnsenVisible.SeenReactor({ log,
-  react: (chat, id) => Onsen.withSender('system:seen', () => bot.api.setMessageReaction(chat, id, [{ type: 'emoji', emoji: OnsenVisible.SEEN_EMOJI as ReactionTypeEmoji['emoji'] }])) }) : null
+  react: (chat, id) => connectorNow() ? Promise.resolve(true)        // WO-197: the bridge draws ✍ from the receipt (in_session); nothing pressed here
+    : Onsen.withSender('system:seen', () => bot.api.setMessageReaction(chat, id, [{ type: 'emoji', emoji: OnsenVisible.SEEN_EMOJI as ReactionTypeEmoji['emoji'] }])) }) : null
 /** WO-145 (ONSEN_FORM_LINKS): the echo message of each page answer (chat:form-<id> → its Telegram id), so the main's reply_to / react on form-<id> lands on it */
 const formEchoes = new Map<string, number>()
 const formEchoOf = (chat: string, ref: string): number | undefined => formEchoes.get(`${chat}:${ref}`)
@@ -653,6 +654,7 @@ if (inboundStore && inboundWriter) {
 }
 /** the arrival's 👀 (access.json ackReaction) on one message; ✍ never lands under it (WO-145) */
 function inboundAck(chat: string, msgId: number): void {
+  if (connectorNow()) return                       // WO-197: the bridge puts 👀 once Onsen took the message
   let emoji = ''
   try { emoji = loadAccess().ackReaction ?? '' } catch {}
   if (!emoji || !Number.isFinite(msgId)) return
@@ -2700,7 +2702,8 @@ function buildServer(): Server {
       .text('❌ Deny', `perm:deny:${request_id}`)
     const prompt = permPrompt(request_id, tool_name)                         // WO-176
     const recipients = opsRecipients(access)
-    for (const chat_id of recipients) {
+    // WO-197: a connector asks only through the Action (the bridge draws its buttons; a press comes back as action_control)
+    for (const chat_id of connectorNow() ? [] : recipients) {
       void Onsen.withSender('system:permission', () => bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }))   // Onsen (WO-139)
         .then(m => { prompt.copies.push({ chat: chat_id, msg: m.message_id, text }) })   // WO-176: kept, so a press in Onsen edits every copy
         .catch(e => {
@@ -3015,6 +3018,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           onsenSaved.set(file_id, got.path)
           return { content: [{ type: 'text', text: got.path }] }
         }
+        if (connectorNow()) return { content: [{ type: 'text', text: await connectorFile(String(file_id)) }] }   // WO-197: from Onsen
         const file = await bot.api.getFile(file_id)
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
         const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
@@ -3248,7 +3252,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
     model: askModelCli,
     ...(onsenActions ? { actions: menuActions(onsenActions) } : {}),        // WO-176: its menus as Onsen Actions
     recipients: () => opsRecipients(loadAccess()),
-    send: (chats, text, buttons) => Onsen.withSender('system:duty-officer', async () => {   // Onsen (WO-139)
+    send: (chats, text, buttons) => connectorNow() ? Promise.resolve([]) : Onsen.withSender('system:duty-officer', async () => {   // Onsen (WO-139); WO-197: a connector: the Action only
       const kb = buttons ? (() => {
         const k = new InlineKeyboard()
         buttons.forEach((row, i) => { if (i > 0) k.row(); for (const b of row) k.text(b.text, b.callback_data) })
@@ -3264,6 +3268,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
       return out
     }),
     edit: async (s, text) => {
+      if (connectorNow()) return                     // WO-197: no Telegram copies
       try { await Onsen.withSender('system:duty-officer', () => bot.api.editMessageText(s.chat, s.msg, text, { reply_markup: { inline_keyboard: [] } })) }   // Onsen (WO-139)
       catch (e) { log('warn', `duty-officer edit ${s.chat}/${s.msg} failed: ${e}`) }
     },
@@ -3802,7 +3807,26 @@ bot.on('message:text', async ctx => {
 // Download a Telegram photo (largest size) to the inbox. Shared by the
 // message:photo handler and replyAttachment. Throws on any failure so the
 // caller can mark image_error instead of silently losing the picture (#2).
+/** WO-197: a person's file as the bridge stored it in Onsen, by its Telegram file id (the person_message's attachment client_ref → url): a connector
+ *  takes the file from Onsen (WO-189's way), never from Telegram. Kept for the files of the last 500 messages */
+const connectorFiles = new Map<string, { url: string; name?: string; mime?: string }>()
+function connectorFilesOf(p: any): void {
+  for (const a of Array.isArray(p?.attachments) ? p.attachments : []) {
+    if (!a?.client_ref || !a?.url) continue
+    connectorFiles.set(String(a.client_ref), { url: String(a.url), ...(a.name ? { name: String(a.name) } : {}), ...(a.mime ? { mime: String(a.mime) } : {}) })
+    if (connectorFiles.size > 2000) connectorFiles.delete(connectorFiles.keys().next().value!)
+  }
+}
+async function connectorFile(fileId: string): Promise<string> {
+  const f = connectorFiles.get(fileId)
+  if (!f || !onsen) throw new Error('檔案不在 Onsen（the Telegram bridge did not store it, or this daemon has not seen its message since it started）')
+  const id = f.url.match(/\/files\/(\d+)/)?.[1] ?? fileId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40)
+  const got = await OnsenAttach.takeOne((u, max) => onsen!.getFile(u, max), f.url, id, f.name ?? null, f.mime ?? null, INBOX_DIR)
+  if ('why' in got) throw new Error(`download failed: ${got.why}`)
+  return got.path
+}
 async function downloadPhotoToInbox(ctx: Context | null, best: { file_id: string; file_unique_id: string }): Promise<string> {
+  if (!ctx && connectorNow()) return connectorFile(best.file_id)      // WO-197
   const file = await (ctx ? ctx.api : bot.api).getFile(best.file_id)   // WO-194: no ctx = a message back from Onsen
   if (!file.file_path) throw new Error('getFile returned no file_path')
   const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
@@ -5604,7 +5628,7 @@ function statusPinSetup(): { pin: OnsenVisible.StatusPin; show: (v: OnsenStatus.
   const holdUntil = Date.now() + Math.max(0, Number(process.env.ONSEN_STATUS_PIN_HOLD_MS ?? 20_000) || 0)
   log('info', `onsen: status pin on (DM chats of the allowlist; ${n} spool line(s) read for the counts; stop markers ${join(STATE_DIR, 'onsen')}/status-pin-off-<chat>.json)`)
   return { pin, show: v => {
-    if (Date.now() < holdUntil) return
+    if (Date.now() < holdUntil || connectorNow()) return      // WO-197: a connector sends only the observation (the bridge draws the pin)
     const at = since.track(v.state), now = Date.now()
     let chats: string[] = []
     try { chats = loadAccess().allowFrom.map(String).filter(x => /^\d+$/.test(x)) } catch {}
@@ -5616,7 +5640,7 @@ function statusPinSetup(): { pin: OnsenVisible.StatusPin; show: (v: OnsenStatus.
  *  not allowlisted (acked and dropped, logged). */
 async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main'): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
-  if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}))) {
+  if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && connectorNow()))) {
     log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
     return false
   }
@@ -5666,13 +5690,17 @@ function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Recor
 const personBusy = new Set<string>()
 async function personArrived(it: { kind?: string; seq?: number; dedupe?: string | null; payload?: any }): Promise<{ code: number; json: Record<string, unknown> }> {
   const p = it.payload && typeof it.payload === 'object' ? it.payload : {}
-  const c = p.client && typeof p.client === 'object' ? p.client : null
+  let c = p.client && typeof p.client === 'object' ? p.client : null
+  // WO-197: a person with no app account (client null) says it in Onsen only: in connector mode its chat is the Onsen conversation (onsen:<id>), its
+  // number form-<id> (as a page message's), delivered as a page message
+  if (!c && connectorNow() && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`, msg_id: `form-${p.message_id}`, user: p.from ?? null, user_id: null }
+  if (c?.chat && connectorNow()) connectorFilesOf(p)
   if (!inboundStore || !c?.chat || c.msg_id == null) {
     log('warn', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} has no Telegram chat or number (client ${JSON.stringify(c).slice(0, 120)}): not delivered (acked)`)
     return { code: 200, json: { dropped: 'no Telegram chat' } }
   }
   const chat = String(c.chat), ref = String(c.msg_id), access = loadAccess()
-  if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}))) {
+  if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && connectorNow()))) {
     log('warn', `onsen inbound: ${it.kind} ${p.message_id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
     return { code: 200, json: { dropped: 'chat not allowlisted' } }
   }
@@ -5713,7 +5741,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       return { code: 200, json: { delivered: true } }
     }
     log('info', `onsen inbound: person_message ${p.message_id} (${shown}) received from the inbox`)
-    if (p.via === 'web') {
+    if (p.via === 'web' || Connector.ONSEN_CHAT.test(chat)) {
       const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
         ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
         ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
@@ -5774,6 +5802,7 @@ function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts
 }
 /** WO-145: what Joey sees for his page answer: 〔你在頁面送出的｜title〕 and the body, without a notification; recorded as system:form-echo's */
 async function echoFormAnswer(it: OnsenVisible.FormItem): Promise<void> {
+  if (connectorNow()) return                       // WO-197: the bridge draws the echo from the feed
   const parts = chunk(OnsenVisible.formEchoText(it), 4000, 'newline')
   let first: number | undefined
   for (const p of parts) {
@@ -6073,7 +6102,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         bot_username: botUsername || null,
         agent: CONNECTOR_AGENT,               // WO-197 (Chiron #200436): the fleet is scanned by bot_username; a connector has no bot
         // WO-197: ONSEN_BRIDGE names this agent (no Telegram: the bridge carries its bot); Bot API calls refused by the guard, by method; the says
-        ...(!INBOX_ONLY ? { connector: { on: connectorNow(), token: !!TOKEN, refused: connectorBlocked, ...(connectorSay ? { ...connectorSay.stats, ids: connectorIds!.size } : {}) } } : {}),
+        ...(!INBOX_ONLY ? { connector: { on: connectorNow(), token: !!TOKEN, bot_api_refused: connectorBlocked, ...(connectorSay ? { ...connectorSay.stats, ids: connectorIds!.size } : {}) } } : {}),
         uptime_s: Math.floor(process.uptime()),
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         active_sessions: activeServers.size,

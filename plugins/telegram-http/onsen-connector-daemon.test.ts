@@ -124,3 +124,57 @@ test('7. the machine config: not named → polls; named → the poll stops (offs
   writeFileSync(machine, 'ONSEN_BRIDGE=0\n')
   expect(await until(async () => (await health(sw)).polling === true, 35000)).toBe(true)
 }, 90000)
+
+type Got = { content: string; meta: Record<string, string> }
+const got: Got[] = []
+const person = async (payload: Record<string, unknown>, seq: number) => (await fetch(`http://127.0.0.1:${d.port}/onsen/person`, { method: 'POST',
+  headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'person_message', seq, dedupe: `pm:${payload.message_id}`, payload }) })).status
+const fileOf = (key: string, bytes: number[]) => { onsen.files.set(`c:${key}`, { id: String(8000 + onsen.files.size), bytes: new Uint8Array(bytes), at: Date.now() }); return onsen.files.get(`c:${key}`)!.id }
+
+test('8. a person\'s Telegram message comes as a person_message (the bridge wrote it): delivered with its tag; its photo taken from Onsen, not Telegram; no 👀', async () => {
+  const c = await d.client()
+  c.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push({ content: String((n.params as any).content), meta: (n.params as any).meta }) }
+  writeFileSync(join(d.stateDir, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: [String(JOEY)], groups: {}, pending: {}, ackReaction: '👀' }))
+  const fid = fileOf('photo1', [0xff, 0xd8, 0xff, 1])
+  const base = `http://127.0.0.1:${onsen.port}/api/onsen/v1/files/`
+  expect(await person({ message_id: '6001', conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', text: '看這張', kind: 'photo', sent_at: new Date().toISOString(),
+    attachments: [{ kind: 'photo', name: 'p.jpg', mime: 'image/jpeg', bytes: 4, url: base + fid, client_ref: 'AgPhoto1' }],
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1001', user: 'joey', user_id: String(JOEY) }, reply_to: null }, 1)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.message_id === '1001'), 8000)).toBe(true)
+  const g = got.find(x => x.meta.message_id === '1001')!
+  expect(g.meta.chat_id).toBe(String(JOEY))
+  expect(g.meta.image_path).toBeTruthy()
+  expect(onsen.seen.some(s => s.method === 'GET' && s.path === `/v1/files/${fid}`)).toBe(true)
+  // a PDF: download_attachment by its Telegram file id takes it from Onsen; one Onsen never had: 「檔案不在 Onsen」
+  const pid = fileOf('pdf1', [0x25, 0x50, 0x44, 0x46])
+  expect(await person({ message_id: '6002', conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', text: '', kind: 'document', sent_at: new Date().toISOString(),
+    attachments: [{ kind: 'document', name: 'r.pdf', mime: 'application/pdf', bytes: 4, url: base + pid, client_ref: 'BQDoc1' }],
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1002', user: 'joey', user_id: String(JOEY) }, reply_to: null }, 2)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.message_id === '1002'), 8000)).toBe(true)
+  expect(got.find(x => x.meta.message_id === '1002')!.meta.attachment_file_id).toBe('BQDoc1')
+  const dl = await d.call('download_attachment', { file_id: 'BQDoc1' })
+  expect(dl.isError).toBe(false)
+  expect([...new Uint8Array(await Bun.file(dl.text).arrayBuffer())]).toEqual([0x25, 0x50, 0x44, 0x46])
+  const none = await d.call('download_attachment', { file_id: 'BQnever' })
+  expect(none.isError).toBe(true)
+  expect(none.text).toMatch(/檔案不在 Onsen/)
+  expect(api.calls).toEqual([]); expect(api.polls).toEqual([]); expect(api.downloads).toEqual([])
+})
+
+test('9. a person with no app account (client null): the tag\'s chat_id is onsen:<conversation>, its number form-<id>; the reply goes back there', async () => {
+  expect(await person({ message_id: '6003', conversation_id: '4243', from: 'guest-1', via: 'web', text: '我只用網頁', kind: 'text', sent_at: new Date().toISOString(),
+    attachments: [], client: null, reply_to: null }, 3)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.chat_id === 'onsen:4243'), 8000)).toBe(true)
+  expect(got.find(g => g.meta.chat_id === 'onsen:4243')!.meta.message_id).toBe('form-6003')
+  expect((await d.call('reply', { chat_id: 'onsen:4243', text: '收到' })).isError).toBe(false)
+  expect(onsen.connector.at(-1)!.body.conversation_id).toBe('4243')
+})
+
+test('10. a permission prompt: only the Action (no Telegram message); the Bot API stand-in still saw nothing', async () => {
+  const c = await d.client()
+  await c.notification({ method: 'notifications/claude/channel/permission_request', params: { request_id: 'abcde', tool_name: 'Bash', description: 'run ls', input_preview: '{"command":"ls"}' } })
+  expect(await until(() => onsen.seen.some(s => s.method === 'POST' && s.path === '/v1/actions' && s.body?.source === 'permission'), 8000)).toBe(true)
+  await sleep(500)
+  expect(api.calls).toEqual([]); expect(api.polls).toEqual([])
+  expect((await health(d)).connector.bot_api_refused).toEqual({})
+})
