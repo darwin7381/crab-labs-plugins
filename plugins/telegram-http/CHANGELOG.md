@@ -1,4 +1,4 @@
-## (next) — WO-176 daemon side, round three
+## 1.58.9 — 2026-11-26 (WO-176 daemon side, round three)
 
 - **The duty officer pressing a permission prompt itself answers that prompt's own Action** (board WO-176, Chiron 04:42Z; CONTRACT v1 §6 「畫面上同一個詢問只有一個 Action」; Onsen 0.24.3). Until now its own press cancelled the channel's permission Action and made a second one (`duty-officer`, resolved). Now the prompt's Action (the channel's; after a restart, Onsen's open one) is resolved through the requester's path with `resolved_by: duty-officer` (Onsen 0.24.3 takes it on a permission / menu Action; the assignees stay who was asked) and the option it pressed as `allow` / `deny` (the screen's 「Yes…」 / 「No…」), then reported applied; no second Action. No Action for the prompt, or a key that is neither allow nor deny: its own resolved record, as before.
 - **Its Telegram copies close** the way a tap closes one (the outcome, the buttons removed), ending 「值班員按的：「<the option>」」; a press on the officer's question about the prompt closes them too, ending 「在值班員的詢問上按的」. Joey no longer sees an answered prompt with live buttons. A press in Onsen: as before (「從 Onsen 按的」).
