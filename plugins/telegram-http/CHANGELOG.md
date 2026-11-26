@@ -1,3 +1,8 @@
+## 1.58.15 — 2026-11-26 (the delivery check sees the cleared limit too)
+
+- 1.58.14 made the published record `idle` for a cleared limit still on the screen, but `currentStatus()` (the lanes' delivery check, decideWake, the 此刻 line) composed the record without that fact and still answered `walled`, so the main's deliveries stayed held (the channel bot, 07:52Z). It now composes with `cleared_limit_text`, the same as the published record.
+- Roll back: 1.58.14.
+
 ## 1.58.14 — 2026-11-26 (a cleared limit still on the screen is not a wall)
 
 - **A limit the program cleared is not a wall because its message is still on the screen.** The screen judge's `usage_limit` (WO-177 二: the limit message is the latest output above the input box) made the record `walled` even after usage_wall.py had cleared the episode (probe_after_switch). The message stays the latest output until the next turn, and every delivery is held while the record says walled, so that turn never came. 11-26 06:57Z the Mac mini fleet hit the weekly limit; the account was switched and the probe cleared chiron, eurymedon and angelia at 07:12:21Z, but their records stayed `walled` (judged by Jev, p 0.92) with deliveries held for 20 minutes and more.

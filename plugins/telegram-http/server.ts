@@ -4892,7 +4892,9 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     return v
   }
   /** WO-169: the one status record now: statusOf's view, through the screen reader when JEV_SCREEN lists this agent */
-  const currentStatus = (): OnsenStatus.StatusView => { const v = compute(); return screenStatus ? screenStatus.view(v) : v }
+  // the lanes' and the wake decision's view is the published one: the same composition with the facts the view depends on (1.58.15: without
+  // cleared_limit_text it still said walled while the published record said idle, so deliveries stayed held on the channel bot after 1.58.14)
+  const currentStatus = (): OnsenStatus.StatusView => { const v = compute(); return screenStatus ? screenStatus.record(v, { cleared_limit_text: clearedLimitText() }).view : v }
   // WO-169 part 2 (Chiron 00:29Z): the same composition also gives the observation (Onsen contract v1 §3) from the program's facts: the main's session,
   // its open turn and what opened it, its last turn, its queue, which menus the duty officer takes on this pane
   const sinceMem = new Since()
