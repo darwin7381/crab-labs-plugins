@@ -236,3 +236,19 @@ plugins/telegram-http/server.ts::  return 'later'
 plugins/telegram-http/server.ts::function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Record<string, string> {
 plugins/telegram-http/server.ts::if (it.say && it.reply_to && typeof it.reply_to === 'object') Object.assign(meta, pageReplyMeta(it.reply_to))
 plugins/telegram-http/server.ts::...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
+plugins/telegram-http/onsen-inbound.ts::export const hasInboxPartner = (env: Record<string, string | undefined>): boolean => Number(env.LANES_INBOX_PORT ?? 0) > 0
+plugins/telegram-http/server.ts::return OnsenInbound.inboundEffective(v, ONSEN_AGENT, INBOX_PARTNER)
+plugins/telegram-http/onsen-connector.ts::export class BridgeSwitch {
+plugins/telegram-http/onsen-connector.ts::async waitReport(id: string, conv: string): Promise<Said> {
+plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`
+plugins/telegram-http/server.ts::const connectorNow = (): boolean => !INBOX_ONLY && bridgeSwitch.on()
+plugins/telegram-http/server.ts::if (!TOKEN && !INBOX_ONLY && !connectorNow()) {
+plugins/telegram-http/server.ts::  if (connectorRefuses(method)) throw new Connector.NoTelegram(method)
+plugins/telegram-http/server.ts::async function connectorTick(): Promise<void> {
+plugins/telegram-http/server.ts::async function connectorReply(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; files: string[]
+plugins/telegram-http/server.ts::if (!Connector.reactionOk(emoji)) throw new Error(`setMessageReaction: 400 Bad Request: REACTION_INVALID
+plugins/telegram-http/server.ts::await connectorSay!.edit(String(args.chat_id), String(args.message_id ?? ''), String(args.text ?? ''))
+plugins/telegram-http/server.ts::if (r.held || !r.ids.length) throw new OnsenFirst.HeldInOnsen(
+plugins/telegram-http/server.ts::agent: CONNECTOR_AGENT,
+plugins/telegram-http/server.ts::async function connectorFile(fileId: string): Promise<string> {
+plugins/telegram-http/server.ts::if (!c && connectorNow() && p.conversation_id != null && p.message_id != null) c = { chat: `onsen:${p.conversation_id}`
