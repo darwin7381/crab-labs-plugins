@@ -6120,7 +6120,7 @@ function factsFromPayload(p: any, chat: string, ref: string): OnsenInbound.Facts
   }
   if (p.reply_quote) rfm.reply_quote = metaExcerpt(String(p.reply_quote))
   if (p.forward_from) {
-    rfm.forward_from = metaExcerpt(String(p.forward_from))
+    rfm.forward_from = metaExcerpt(Onsen.forwardName(p.forward_from))      // WO-197: the daemon's one-line origin (tg:<id> @user Name) is the name the tag shows
     if (p.forward_date && Number.isFinite(Date.parse(p.forward_date))) rfm.forward_date = new Date(p.forward_date).toISOString()
   }
   if (p.media_group_id) rfm.media_group_id = String(p.media_group_id)

@@ -271,3 +271,13 @@ test('14. an album whose count is known (client_meta.media_group_count 3) and on
   expect(albums[0]!.content).toBe('(album: 2 photos)')
   expect(d.log()).toContain(`album ${JOEY}:mg-14: 2 of 3 item(s) in 3 s after the first; delivered with what came`)
 })
+
+test('15. WO-197 (Chiron 18:46Z): a forward whose origin Onsen gives in the daemon\'s one-line form (tg:<id> @user Name) is tagged with the name the tag shows', async () => {
+  expect(await person({ conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', kind: 'text', attachments: [], message_id: '6051', text: '轉給你',
+    sent_at: new Date().toISOString(), reply_to: null, forward_from: 'tg:6736970916 @awesometon5 awesometon5', forward_date: '2026-11-26T16:31:53Z',
+    client: { name: 'telegram', chat: String(JOEY), msg_id: '1051', user: 'joey', user_id: String(JOEY) } }, 51)).toBe(200)
+  expect(await until(() => got.some(g => g.meta.message_id === '1051'), 8000)).toBe(true)
+  const m = got.find(g => g.meta.message_id === '1051')!.meta
+  expect(m.forward_from).toBe('awesometon5')
+  expect(m.forward_date).toBe('2026-11-26T16:31:53.000Z')
+})

@@ -310,3 +310,5 @@ plugins/telegram-http/onsen-screen-fast-daemon.test.ts::its Action is cancelled 
 plugins/telegram-http/onsen-client.ts::export function withAnswering<T>(turn: string, fn: () => T): T {
 plugins/telegram-http/server.ts::try { r = turn ? await Onsen.withAnswering(turn, run) : await run() } catch (e) {
 plugins/telegram-http/onsen-status.ts::{ outcome, ...(turnId ? { turn_id: turnId } : {}) })
+plugins/telegram-http/onsen-client.ts::export function forwardName(v: unknown): string {
+plugins/telegram-http/onsen-client.ts::m.forward_from ? `轉傳自 ${forwardName(m.forward_from)}` : ''

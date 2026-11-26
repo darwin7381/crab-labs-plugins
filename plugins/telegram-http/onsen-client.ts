@@ -1276,10 +1276,31 @@ export function formatList(rows: any[], total: number, joey = '', cutAt = CUT): 
   const shown = [...rows].reverse().map(m => lineOf(m, joey, cutAt))
   return `${shown.join('\n')}\n共 ${total} 則，顯示 ${rows.length} 則`
 }
+/** WO-197 (Chiron 18:46Z: chat_history printed 「轉傳自 [object Object]」 for tg:1159 and tg:1139): who a forwarded message came from, as the tag's
+ *  forward_from names them. Onsen keeps forward_from as an object (fleet-core onsen._forward): {origin: <one line>} from the daemon's record
+ *  ("tg:<id> @user Name", "hidden:<name>", "chat:<id> <title> (signature)", forwardFrom above) or the bridge's (the display name itself), or an object
+ *  as sent; person_message gives the origin as one string. The username, else the name; the chat's title; the hidden sender's name; else as given */
+export function forwardName(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    for (const k of ['username', 'name', 'title', 'display_name']) if (typeof o[k] === 'string' && (o[k] as string).trim()) return (o[k] as string).trim()
+    if (o.origin != null) return forwardName(o.origin)
+    return JSON.stringify(v)
+  }
+  const t = String(v).trim()
+  const tg = /^tg:(\d+)(?: @(\S+))?(?: (.+))?$/.exec(t)
+  if (tg) return tg[2] ?? tg[3]?.trim() ?? tg[1]!
+  const hid = /^hidden:(.*)$/.exec(t)
+  if (hid) return hid[1]!.trim() || 'hidden'
+  const ch = /^chat:(-?\d+)(?: (.*?))?(?: \([^)]*\))?$/.exec(t)
+  if (ch) return ch[2]?.trim() || ch[1]!
+  return t
+}
 /** one message in full: a header line, the whole body, then its events */
 export function formatFull(m: any, joey = ''): string {
   const extra = [m.kind && m.kind !== 'text' ? m.kind : '', m.status === 'failed' ? `沒送出${m.error ? `：${m.error}` : ''}` : '', m.edited ? '改過' : '',
-    m.reply_to_client_msg_id != null ? `回覆 tg:${m.reply_to_client_msg_id}` : '', m.forward_from ? `轉傳自 ${m.forward_from}` : '', m.thread ? `話題 ${m.thread}` : '']
+    m.reply_to_client_msg_id != null ? `回覆 tg:${m.reply_to_client_msg_id}` : '', m.forward_from ? `轉傳自 ${forwardName(m.forward_from)}` : '', m.thread ? `話題 ${m.thread}` : '']
     .filter(Boolean).join('，')
   const att = Array.isArray(m.attachments) && m.attachments.length ? `\n附件：${m.attachments.map((x: any) => x.name ?? x.mime ?? x.file_id ?? '?').join('、')}` : ''
   const evs = Array.isArray(m.events) ? m.events : []

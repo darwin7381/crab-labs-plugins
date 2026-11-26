@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  OnsenClient, inboundItem, outboundRecord, withSender, withPart, richAttempt, sendCtx, recordFor, agentName, parseWhen, formatList, formatFull,
+  OnsenClient, inboundItem, outboundRecord, withSender, withPart, richAttempt, sendCtx, recordFor, agentName, parseWhen, formatList, formatFull, forwardName,
   CHAT_HISTORY_TOOL, type OnsenItem, type OnsenEvent,
 } from './onsen-client.ts'
 import { LANE_TOOLS, laneToolsFor } from './lanes.ts'
@@ -355,6 +355,21 @@ describe('chat_history', () => {
       .toBe('11-24 21:54Z｜main｜#15200 tg:538\nb')
     expect(formatFull({ id: 1, at: '2026-11-24T21:54:34Z', direction: 'out', sender: 'agent:epeius', sender_part: 'epeius.reflex.1', body: 'x', aliases: [{ client: 'telegram', client_ref: '1:77' }] }))
       .toBe('11-24 21:54Z｜epeius.reflex.1｜#1 tg:77\nx')
+  })
+
+  test('WO-197 (Chiron 18:46Z, 「轉傳自 [object Object]」): a forwarded message names who it came from as the tag does, whatever shape Onsen keeps it in', () => {
+    // GET /api/onsen/messages/<id>: forward_from is JSONB (fleet-core onsen._forward): {origin: <the daemon's one-line form>} (switch off, tg:1159),
+    // {origin: <the bridge's display name>} (connector, tg:1139)
+    const row = (forward_from: unknown) => ({ id: 43683, at: '2026-11-26T17:49:57Z', direction: 'in', sender: 'joey-test', body: 'R4：只回一個字：好', client_msg_id: '1159', forward_from, events: [] })
+    expect(formatFull(row({ origin: 'tg:6736970916 @awesometon5 awesometon5' }))).toBe('11-26 17:49Z｜joey-test｜#43683 tg:1159｜轉傳自 awesometon5\nR4：只回一個字：好')
+    expect(formatFull(row({ origin: 'awesometon5' }))).toContain('｜轉傳自 awesometon5\n')
+    expect(formatFull(row({ origin: 'tg:42 Mary Ann' }))).toContain('｜轉傳自 Mary Ann\n')
+    expect(formatFull(row({ origin: 'hidden:Old Friend' }))).toContain('｜轉傳自 Old Friend\n')
+    expect(formatFull(row({ origin: 'chat:-1001234 Crypto News (editor)' }))).toContain('｜轉傳自 Crypto News\n')
+    expect(formatFull(row('tg:6736970916 @awesometon5'))).toContain('｜轉傳自 awesometon5\n')
+    expect(formatFull(row({ username: 'someone', id: 5 }))).toContain('｜轉傳自 someone\n')
+    expect(formatFull(row({ origin: 'x' }))).not.toContain('[object Object]')
+    expect(forwardName(null)).toBe('')
   })
 
   test('chat_history is listed for the main (server.ts) and for every lane kind (lanes.ts); the old "ask them to paste" sentence is gone', () => {
