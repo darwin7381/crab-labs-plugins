@@ -2,7 +2,7 @@
 # txmonster (systemd --user):
 #   install -m 644 claude-code-host.service ~/.config/systemd/user/claude-code-host.service
 #   systemctl --user daemon-reload && systemctl --user enable --now claude-code-host
-# The program is the live plugin checkout's copy (updated by its git pull; restart it after one). ONSEN_BASE: the code's default.
+# The program runs from its own pinned checkout ~/.claude/claude-code-host (not the live plugin checkout); to update: fetch, checkout --detach <commit>, restart. ONSEN_BASE: the code's default.
 # No PrivateTmp: tmux's default socket is /tmp/tmux-<uid>/default, the one the agents' tmux server uses.
 [Unit]
 Description=claude-code-host: Onsen's list of this machine's Claude Code sessions (WO-183; read-only)
@@ -11,8 +11,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/claude-code-host
-ExecStart=%h/.bun/bin/bun run %h/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/claude-code-host/claude-code-host.ts
+WorkingDirectory=%h/.claude/claude-code-host/plugins/telegram-http/claude-code-host
+ExecStart=%h/.bun/bin/bun run %h/.claude/claude-code-host/plugins/telegram-http/claude-code-host/claude-code-host.ts
 Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CLAUDE_CODE_HOST_MACHINE=txmonster
 Environment=CLAUDE_CODE_HOST_CREDENTIAL_FILE=%h/.config/mesh/claude-code-host-txmonster.credential

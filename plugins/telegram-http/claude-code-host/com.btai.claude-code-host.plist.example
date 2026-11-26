@@ -3,7 +3,7 @@
 <!-- claude-code-host (WO-183): Onsen's list of this machine's Claude Code sessions. Read-only. See README.md beside this file.
      Mac mini: sed -e "s#__HOME__#$HOME#g" -e "s#__MACHINE__#macmini#g" com.btai.claude-code-host.plist.example > ~/Library/LaunchAgents/com.btai.claude-code-host.plist
      MBP:      sed -e "s#__HOME__#$HOME#g" -e "s#__MACHINE__#mbp#g"     com.btai.claude-code-host.plist.example > ~/Library/LaunchAgents/com.btai.claude-code-host.plist
-     The program is the live plugin checkout's copy (updated by its git pull; restart it after one). ONSEN_BASE: the code's default unless set here.
+     The program runs from its own pinned checkout ~/.claude/claude-code-host (not the live plugin checkout, so a fleet pull or wave never changes it); to update: git -C ~/.claude/claude-code-host fetch origin && checkout --detach <commit>, then restart. ONSEN_BASE: the code's default unless set here.
      PATH must reach claude (~/.local/bin), tmux (Homebrew) and ps (/bin). -->
 <plist version="1.0">
 <dict>
@@ -13,10 +13,10 @@
 	<array>
 		<string>__HOME__/.bun/bin/bun</string>
 		<string>run</string>
-		<string>__HOME__/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/claude-code-host/claude-code-host.ts</string>
+		<string>__HOME__/.claude/claude-code-host/plugins/telegram-http/claude-code-host/claude-code-host.ts</string>
 	</array>
 	<key>WorkingDirectory</key>
-	<string>__HOME__/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/claude-code-host</string>
+	<string>__HOME__/.claude/claude-code-host/plugins/telegram-http/claude-code-host</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>HOME</key>

@@ -70,7 +70,14 @@ It never sends a key, and it never starts, stops, signals or restarts anything. 
 
 Put the token in `~/.config/mesh/claude-code-host-<machine>.credential`, mode 600, on that machine. Onsen picks the identity up from BTCC's credential table within 5 minutes.
 
-**2. Check it**, from `plugins/telegram-http/claude-code-host` in the plugin checkout:
+**2. Its own checkout.** It runs from a pinned checkout, `~/.claude/claude-code-host`, not the live plugin checkout, so a fleet pull or wave never changes it:
+
+```sh
+git clone https://github.com/darwin7381/crab-labs-plugins.git ~/.claude/claude-code-host   # or a worktree of a clone you have
+git -C ~/.claude/claude-code-host checkout --detach <commit>
+```
+
+**Check it**, from `~/.claude/claude-code-host/plugins/telegram-http/claude-code-host`:
 
 ```sh
 CLAUDE_CODE_HOST_MACHINE=macmini bun claude-code-host.ts --whoami   # "claude-code-host-macmini (system)", exit 0
@@ -100,7 +107,7 @@ CLAUDE_CODE_HOST_MACHINE=macmini bun claude-code-host.ts --once     # the regist
 - `GET /api/onsen/v1/extensions/claude-code-host-<machine>/collections/sessions` gives the list.
 - `GET /api/onsen/v1/members/<agent>/extension-records` gives an agent's main.
 
-**Restart after a code update** (a git pull of the plugin checkout):
+**Update the code**: `git -C ~/.claude/claude-code-host fetch origin && git -C ~/.claude/claude-code-host checkout --detach <commit>`, then restart:
 - launchd: `launchctl kickstart -k gui/$(id -u)/com.btai.claude-code-host`
 - systemd: `systemctl --user restart claude-code-host`
 
@@ -114,7 +121,7 @@ It is not part of `rollout-fleet.sh`'s wave.
 
   Onsen marks the machine's list stale after 45 s and keeps showing the last one. Nothing else depends on this program; no agent, daemon or session changes.
 - **Remove.** Stop it, then delete the plist or unit. Revoke the credential with `mesh_admin revoke claude-code-host-<machine> --all`.
-- **A bad release.** Put the plugin checkout back to the commit before it, then restart as above.
+- **A bad release.** Check `~/.claude/claude-code-host` out at the commit before it, then restart as above.
 - **Onsen side.** `ONSEN_EXTENSIONS=0` on fleet-core refuses every extension write (503) and keeps answering reads.
 
 ## Environment
