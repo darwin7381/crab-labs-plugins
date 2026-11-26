@@ -190,3 +190,12 @@ plugins/telegram-http/onsen-client.ts::export class MemberNames {
 plugins/telegram-http/server.ts::Object.assign(meta, await OnsenAttach.attachmentMeta(it.attachments
 plugins/telegram-http/server.ts::if (/^onsen:\d+$/.test(String(file_id))) {
 plugins/telegram-http/onsen-client.ts::async getFile(url: string, maxBytes: number
+plugins/telegram-http/onsen-files.ts::export function filesOn(value: string | undefined, agent: string): boolean {
+plugins/telegram-http/onsen-client.ts::recordWithFiles(item: OnsenItem, upload: () => Promise<string[]>): void {
+plugins/telegram-http/onsen-client.ts::const items = await this.withFiles(run.map(x => x.line))
+plugins/telegram-http/onsen-client.ts::const s = await this.withoutFiles(run[k]!.line, items[k]!, said, cred)
+plugins/telegram-http/server.ts::if (OnsenFiles.wantsFiles(item) && onsenFilesOn()) onsen.recordWithFiles(item
+plugins/telegram-http/server.ts::if (line?.k === 'm' && file && OnsenFiles.wantsFiles(line.r) && onsenFilesOn()) {
+plugins/telegram-http/server.ts::download: () => photoCopies.track(ctx.message, downloadPhotoToInbox(ctx, best)),
+plugins/telegram-http/server.ts::{ turn_id: mainTurnNow(), file: f }
+plugins/telegram-http/server.ts::ONSEN_FILES: fleetConfigApplied.includes('ONSEN_FILES') ? undefined : process.env.ONSEN_FILES

@@ -16,6 +16,9 @@ export type BotApiMock = {
   deleted: Set<number>
   /** WO-172: the bot's own profile photo (getUserProfilePhotos → getFile → /file/bot<token>/<path>); null: it has none */
   photo: { bytes: Uint8Array | null }
+  /** WO-190: files a test puts behind file ids (getFile gives their path; /file/bot<token>/<path> serves them), and every file path fetched */
+  files: Map<string, { path: string; bytes: Uint8Array }>
+  downloads: string[]
   push: (u: Record<string, any>) => void
   of: (method: string) => Call[]
   stop: () => void
@@ -31,6 +34,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
   const fail: BotApiMock['fail'] = { fn: null }
   const pinned = new Map<string, number>(), deleted = new Set<number>()
   const photo: BotApiMock['photo'] = { bytes: null }
+  const files: BotApiMock['files'] = new Map(), downloads: string[] = []
   const updates: Record<string, any>[] = []
   let nextUpdate = 1, nextMsg = 5000, nextTopic = 7000
   const state = { id: 999, is_bot: true, first_name: 'lab', username: 'lab_test_bot', has_topics_enabled: false, allows_users_to_create_topics: false, ...me }
@@ -43,7 +47,12 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
   }
   const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
     const fm = new URL(req.url).pathname.match(/^\/file\/bot([^/]+)\/(.+)$/)
-    if (fm) return fm[1] === token && photo.bytes && fm[2] === 'photos/self.jpg' ? new Response(photo.bytes) : new Response('not found', { status: 404 })
+    if (fm) {
+      downloads.push(fm[2])
+      const f = fm[1] === token ? [...files.values()].find(x => x.path === fm[2]) : undefined
+      if (f) return new Response(f.bytes)
+      return fm[1] === token && photo.bytes && fm[2] === 'photos/self.jpg' ? new Response(photo.bytes) : new Response('not found', { status: 404 })
+    }
     const m = new URL(req.url).pathname.match(/^\/bot([^/]+)\/(\w+)$/)
     if (!m || m[1] !== token) return Response.json({ ok: false, error_code: 404, description: 'Not Found' }, { status: 404 })
     const method = m[2]
@@ -62,7 +71,11 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
       case 'getUserProfilePhotos': return ok(photo.bytes && Number(body.user_id) === state.id
         ? { total_count: 1, photos: [[{ file_id: 'self-s', file_unique_id: 'us', width: 160, height: 160 }, { file_id: 'self-l', file_unique_id: 'ul', width: 640, height: 640, file_size: photo.bytes.length }]] }
         : { total_count: 0, photos: [] })
-      case 'getFile': return ok({ file_id: String(body.file_id), file_unique_id: 'u', ...(photo.bytes ? { file_size: photo.bytes.length, file_path: 'photos/self.jpg' } : {}) })
+      case 'getFile': {
+        const f = files.get(String(body.file_id))
+        if (f) return ok({ file_id: String(body.file_id), file_unique_id: `u-${body.file_id}`, file_size: f.bytes.length, file_path: f.path })
+      }
+      return ok({ file_id: String(body.file_id), file_unique_id: 'u', ...(photo.bytes ? { file_size: photo.bytes.length, file_path: 'photos/self.jpg' } : {}) })
       case 'pinChatMessage': pinned.set(String(body.chat_id), Number(body.message_id)); return ok(true)
       case 'unpinChatMessage': if (body.message_id == null || pinned.get(String(body.chat_id)) === Number(body.message_id)) pinned.delete(String(body.chat_id)); return ok(true)
       case 'getChat': { const p = pinned.get(String(body.chat_id)); return ok({ id: Number(body.chat_id), type: 'private', first_name: 'J', ...(p != null ? { pinned_message: { message_id: p, date: 0, chat: { id: Number(body.chat_id), type: 'private' } } } : {}) }) }
@@ -93,7 +106,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     }
   } })
   return {
-    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail, pinned, deleted, photo,
+    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail, pinned, deleted, photo, files, downloads,
     push: (u) => { updates.push({ update_id: nextUpdate++, ...u }) },
     of: (method) => calls.filter(c => c.method === method),
     stop: () => server.stop(true),

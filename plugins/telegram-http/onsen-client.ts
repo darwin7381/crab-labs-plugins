@@ -42,6 +42,9 @@ export type OnsenItem = {
    *  group / supergroup) and the speaker's Telegram name (first_name + last_name, else @username). Fields of the item itself, not meta. */
   chat_title?: string
   sender_name?: string
+  /** WO-190 (Onsen ≥ 0.29.1 on `out`, ≥ 0.29.4 on `in`): the files Onsen keeps for this message (POST /v1/files ids, this agent's own uploads), in
+   *  `attachments` order. Never in the spool line itself: the sync joins them when it sends a line marked `fw` (OnsenClient.recordWithFiles) */
+  attachment_file_ids?: string[]
 }
 export type OnsenEvent = {
   idem_key: string; agent: string; client: 'telegram'; chat: string; target_client_msg_id: string
@@ -72,7 +75,8 @@ export type StatusState = 'offline' | 'idle' | 'busy' | 'waiting' | 'stuck' | 'w
 export type StatusFact = { idem_key: string; agent: string; state: StatusState; at: string; detail?: Record<string, unknown>; last_activity_at?: string | null }
 /** WO-145: the form answers this daemon queued for the main (POST /forms/ack), when Onsen did not take the ack directly */
 export type FormAck = { ids: number[]; at: string }
-export type SpoolLine = { k: 'm'; r: OnsenItem } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
+/** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
+export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
@@ -115,13 +119,16 @@ export type SendCtx = { sender: string; part?: number; parts?: number; richAttem
   redact?: Array<[string, string]>
   /** WO-172: the turn the message is sent in (the main's prompt id, a lane's run id; the observation's sessions[].turn.id); a notice of the daemon's
    *  own has none */
-  turn_id?: string | null }
+  turn_id?: string | null
+  /** WO-190: the local file this send carries (the reply tool's `files`, one per send): stored in Onsen too once Telegram took it (ONSEN_FILES) */
+  file?: string }
 const als = new AsyncLocalStorage<SendCtx>()
 /** the author of a Telegram call made outside every named send path (server.ts records it all the same) */
 export const DEFAULT_CTX: SendCtx = { sender: 'system:daemon' }
 /** run `fn` with `sender` as the author of every Telegram call it makes; `extra` (WO-145): `redact` for the record */
-export function withSender<T>(sender: string, fn: () => T, extra?: Pick<SendCtx, 'redact' | 'turn_id'>): T {
-  return als.run({ sender, ...(extra?.redact?.length ? { redact: extra.redact } : {}), ...(extra?.turn_id ? { turn_id: extra.turn_id } : {}) }, fn)
+export function withSender<T>(sender: string, fn: () => T, extra?: Pick<SendCtx, 'redact' | 'turn_id' | 'file'>): T {
+  return als.run({ sender, ...(extra?.redact?.length ? { redact: extra.redact } : {}), ...(extra?.turn_id ? { turn_id: extra.turn_id } : {}),
+    ...(extra?.file ? { file: extra.file } : {}) }, fn)
 }
 /** WO-145: the text as Onsen keeps it: every [sent, kept] pair of the send context applied */
 export function redactText(s: string, redact?: Array<[string, string]>): string {
@@ -313,6 +320,8 @@ export type OnsenConfig = {
   /** WO-164: Onsen's answer to each thread event the spool posted (/threads/events): `conflict` (another thread is open on its key; nothing stored) and a
    *  refusal (a 4xx for that item) go back to the lanes (lanes.ts threadConflict / threadRefused) */
   onThread?: (ev: any, res: any) => void
+  /** WO-190: how long the sync waits for a message's files to be stored before it sends the message without them (default FILES_WAIT_MS) */
+  filesWaitMs?: number
 }
 export type HistoryArgs = { limit?: unknown; since?: unknown; until?: unknown; q?: unknown; id?: unknown; chat?: unknown }
 /** WO-144: a caller's own bounds on one query (the lane opening's block): how long Onsen gets before the spool answers, and where a body is cut */
@@ -333,6 +342,12 @@ export function noteInbound(rows: any[], set: Set<string> | undefined): void {
 const RETRYABLE_4XX = new Set([401, 403, 408, 425, 429])
 const HOUR = 3600_000
 const READ_WINDOW = 1 << 20          // bytes read from the cursor per pass
+/** WO-190: Onsen's own limit for one file (ONSEN_FILE_MAX_BYTES, 25 MB): a bigger one is not sent */
+export const ONSEN_FILE_MAX = 25 * 1024 * 1024
+/** WO-190: the longest the sync holds a message for its files (the Telegram fetch and the upload are each bounded inside it) */
+export const FILES_WAIT_MS = 120_000
+/** WO-190: a header value that is plain ASCII: a file's name, percent-encoded (Onsen decodes X-File-Name) */
+const headerName = (name: string): string => encodeURIComponent(name.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()).slice(0, 1000)
 
 /** what Onsen said in an error answer ({error: {code, message}}, or older shapes) */
 function callSaid(j: any): string {
@@ -365,9 +380,14 @@ export class OnsenClient {
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
   private callFates = new Map<string, CallLineFate>()
   private callWaits = new Map<string, Array<(f: CallLineFate) => void>>()
+  /** WO-190: a message's files being stored (its idem_key → when the upload started, and its end), and the ids once known ([] = none: failed, late,
+   *  lost with a restart, or refused by Onsen) */
+  private fileJobs = new Map<string, { at: number; p: Promise<void> }>()
+  private fileIds = new Map<string, string[]>()
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
     lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0,
-    thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0 }
+    thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0,
+    files_uploaded: 0, files_upload_failed: 0, files_late: 0, files_lost: 0, files_refused: 0 }
 
   constructor(readonly cfg: OnsenConfig) {
     this.spool = join(cfg.dir, 'spool.jsonl')
@@ -380,6 +400,96 @@ export class OnsenClient {
 
   // ---------------------------------------------------------------- recording (the send path: never throws, never waits)
   recordMessage(item: OnsenItem): void { this.append({ k: 'm', r: item }) }
+  /** WO-190: a message whose files go into Onsen too. The line goes into the spool NOW, in its place in the order (marked fw), exactly as
+   *  recordMessage would write it; `upload` starts at once and gives the files' Onsen ids in `attachments` order (a file not stored is left out; the
+   *  upload logs why); the sync joins them as attachment_file_ids when it sends the line (filesOf). Never throws, never waits. Recording off:
+   *  nothing is recorded or uploaded */
+  recordWithFiles(item: OnsenItem, upload: () => Promise<string[]>): void {
+    if (!this.cfg.record) return
+    const idem = item.idem_key
+    const p = (async () => {
+      try { return await upload() }
+      catch (e) { this.cfg.log('warn', `onsen: files: ${idem}: ${errText(e)}; recorded with the name and Telegram id only`); return [] as string[] }
+    })().then(ids => {
+      if (!this.fileIds.has(idem)) this.keepIds(idem, ids.filter(x => typeof x === 'string' && x))
+      this.fileJobs.delete(idem)
+      this.kick()
+    })
+    this.fileJobs.set(idem, { at: Date.now(), p })
+    this.append({ k: 'm', r: item, fw: 1 })
+  }
+  private keepIds(idem: string, ids: string[]): void {
+    this.fileIds.set(idem, ids)
+    if (this.fileIds.size > 2_000) this.fileIds.delete(this.fileIds.keys().next().value!)
+  }
+  /** WO-190: one file into Onsen's own storage: POST /v1/files, the bytes as the body (Onsen 0.28.0, app/onsen_files.py upload), the type in
+   *  Content-Type (an image's is left to Onsen, which reads it from the bytes), the name in X-File-Name (percent-encoded), Idempotency-Key `key` (the
+   *  same key and file answer the same File: a retry never stores it twice). Over ONSEN_FILE_MAX (25 MB) or empty: not sent. This agent's credential,
+   *  Onsen's own base only. Never throws: the File's id, or why not */
+  async uploadFile(bytes: Uint8Array, o: { key: string; name?: string | null; mime?: string | null }, timeoutMs = 90_000): Promise<{ id: string; url: string | null } | { error: string }> {
+    const no = (error: string) => { this.stats.files_upload_failed++; return { error } }
+    if (!bytes.byteLength) return no('the file is empty')
+    if (bytes.byteLength > ONSEN_FILE_MAX) return no(`over Onsen's 25 MB (${bytes.byteLength} bytes)`)
+    const cred = this.cfg.credential()
+    if (!cred) return no(this.noCredText())
+    const declared = String(o.mime ?? '').split(';')[0]!.trim().toLowerCase()
+    const type = !declared || /^image\/(png|jpe?g|pjpeg|gif|webp)$/.test(declared) ? 'application/octet-stream' : declared
+    const headers: Record<string, string> = { Authorization: `Bearer ${cred}`, 'User-Agent': `onsen-telegram/${this.cfg.agent}`, 'Content-Type': type,
+      'Idempotency-Key': o.key.slice(0, 200), ...(o.name && headerName(o.name) ? { 'X-File-Name': headerName(o.name) } : {}) }
+    try {
+      const r = await this.f(`${this.cfg.base}/v1/files`, { method: 'POST', headers, body: bytes, signal: AbortSignal.timeout(timeoutMs) })
+      let json: any = null
+      try { json = await r.json() } catch {}
+      const d = json?.data ?? json
+      if (r.status >= 200 && r.status < 300 && d?.id != null && /^\d{1,18}$/.test(String(d.id))) {
+        this.stats.files_uploaded++
+        return { id: String(d.id), url: typeof d.url === 'string' ? d.url : null }
+      }
+      return no(`POST /v1/files answered HTTP ${r.status}${json ? ` (${callSaid(json)})` : ''}`)
+    } catch (e) { return no(`POST /v1/files: ${errText(e)}`) }
+  }
+  /** WO-190: the ids to send with a message marked fw: known ones at once; an upload still running is waited for up to filesWaitMs from its start;
+   *  none (its upload was lost with a restart, or did not end in time): [] and one log line, the message goes without them */
+  private async filesOf(idem: string): Promise<string[]> {
+    const known = this.fileIds.get(idem)
+    if (known) return known
+    const job = this.fileJobs.get(idem)
+    if (!job) {
+      this.keepIds(idem, []); this.stats.files_lost++
+      this.cfg.log('warn', `onsen: files: ${idem}: its upload did not finish in this daemon (a restart); recorded with the name and Telegram id only`)
+      return []
+    }
+    const wait = this.cfg.filesWaitMs ?? FILES_WAIT_MS, left = job.at + wait - Date.now()
+    if (left > 0) await Promise.race([job.p, new Promise(r => { const t = setTimeout(r, left); (t as any).unref?.() })])
+    const got = this.fileIds.get(idem)
+    if (got) return got
+    this.keepIds(idem, []); this.stats.files_late++
+    this.cfg.log('warn', `onsen: files: ${idem}: not stored within ${Math.round(wait / 1000)} s; recorded with the name and Telegram id only (a late file is left to Onsen's 24 h sweep)`)
+    return []
+  }
+  /** WO-190: the items to post for a run of message lines: a line marked fw carries its files' ids (attachment_file_ids), when there are any */
+  private async withFiles(lines: SpoolLine[]): Promise<OnsenItem[]> {
+    const out: OnsenItem[] = []
+    for (const l of lines) {
+      const item = l.r as OnsenItem
+      if (l.k !== 'm' || !l.fw) { out.push(item); continue }
+      const ids = await this.filesOf(item.idem_key)
+      out.push(ids.length ? { ...item, attachment_file_ids: ids } : item)
+    }
+    return out
+  }
+  /** WO-190 (Epeius on the ticket, 09:46Z): Onsen refused a message that carried files (an older Onsen on an `in` message, a file swept or not this
+   *  agent's): the same message once more without them, as it was recorded before WO-190 (name and Telegram id); one log line. true: settled (taken,
+   *  or refused on its own: rejected.jsonl); else Onsen's answer (no answer, 5xx): the caller holds the spool at this line */
+  private async withoutFiles(line: SpoolLine, item: OnsenItem, said: string, cred: string): Promise<true | { status: number; json: any }> {
+    this.keepIds(item.idem_key, []); this.stats.files_refused++
+    this.cfg.log('warn', `onsen: files: ${item.idem_key}: Onsen refused it with its files (${said.slice(0, 200)}); recorded again without them (name and Telegram id only)`)
+    const { attachment_file_ids: _files, ...bare } = item
+    const s = await this.post('/messages', bare, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+    if (s.status >= 200 && s.status < 300) { if (s.json?.duplicate) this.stats.duplicates++; else this.stats.posted++; return true }
+    if (s.status >= 400 && s.status < 500 && !RETRYABLE_4XX.has(s.status)) { this.reject(line, `HTTP ${s.status} ${String(s.json?.error ?? s.json?.detail ?? '').slice(0, 200)}`); return true }
+    return s
+  }
   recordEvent(ev: OnsenEvent): void { this.append({ k: 'e', r: ev }) }
   recordLine(line: SpoolLine | null): void { if (line) this.append(line) }
   /** step 3 (WO-143): a delivery fact / a status of the main, through the same spool (in order behind the message they are about) */
@@ -733,21 +843,33 @@ export class OnsenClient {
       // a run of messages: one batch (≤500)
       const run: Array<{ line: SpoolLine; end: number }> = []
       while (i < todo.length && run.length < 500 && todo[i]!.line?.k === 'm') { run.push({ line: todo[i]!.line!, end: todo[i]!.end }); i++ }
-      const r = await this.post('/messages/batch', { items: run.map(x => x.line.r) }, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+      const items = await this.withFiles(run.map(x => x.line))         // WO-190: a message's files (attachment_file_ids), once stored
+      const r = await this.post('/messages/batch', { items }, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
       if (r.status >= 200 && r.status < 300 && Array.isArray(r.json?.results) && r.json.results.length === run.length) {
-        r.json.results.forEach((res: any, k: number) => {
-          if (res && res.error == null && res.id != null) { if (res.duplicate) this.stats.duplicates++; else this.stats.posted++ }
-          else this.reject(run[k]!.line, `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}`)
-        })
+        for (let k = 0; k < run.length; k++) {
+          const res = r.json.results[k]
+          if (res && res.error == null && res.id != null) { if (res.duplicate) this.stats.duplicates++; else this.stats.posted++; continue }
+          const said = `item refused: ${String(res?.error ?? 'no id in the answer').slice(0, 200)}`
+          if (!items[k]!.attachment_file_ids) { this.reject(run[k]!.line, said); continue }
+          // WO-190: refused with its files: once more without them; Onsen not answering holds the spool at this line (the ones before it are in;
+          // those after it went in too and come back as duplicates)
+          const s = await this.withoutFiles(run[k]!.line, items[k]!, said, cred)
+          if (s !== true) { if (k > 0) this.writeCursor(run[k - 1]!.end); return this.failStatus(s, '/messages') }
+        }
         this.writeCursor(run[run.length - 1]!.end); this.ok()
         continue
       }
       if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
         // the batch as a whole was refused: one by one, so one bad item does not hold the others
-        for (const x of run) {
-          const s = await this.post('/messages', x.line.r, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        for (let k = 0; k < run.length; k++) {
+          const x = run[k]!
+          const s = await this.post('/messages', items[k], cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
           if (s.status >= 200 && s.status < 300) { if (s.json?.duplicate) this.stats.duplicates++; else this.stats.posted++ }
-          else if (s.status >= 400 && s.status < 500 && !RETRYABLE_4XX.has(s.status)) this.reject(x.line, `HTTP ${s.status} ${String(s.json?.error ?? s.json?.detail ?? '').slice(0, 200)}`)
+          else if (s.status >= 400 && s.status < 500 && !RETRYABLE_4XX.has(s.status)) {
+            const said = `HTTP ${s.status} ${String(s.json?.error ?? s.json?.detail ?? '').slice(0, 200)}`
+            if (!items[k]!.attachment_file_ids) this.reject(x.line, said)
+            else { const w = await this.withoutFiles(x.line, items[k]!, said, cred); if (w !== true) return this.failStatus(w, '/messages') }   // WO-190
+          }
           else return this.failStatus(s, '/messages')
           this.writeCursor(x.end); this.ok()
         }

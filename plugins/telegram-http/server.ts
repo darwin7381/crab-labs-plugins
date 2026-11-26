@@ -87,6 +87,7 @@ import * as OnsenEdit from './onsen-edit.ts'
 import * as OnsenStatus from './onsen-status.ts'
 import * as OnsenVisible from './onsen-visible.ts'
 import * as OnsenAttach from './onsen-attachments.ts'
+import * as OnsenFiles from './onsen-files.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
 import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive } from './usage-wall.ts'
@@ -422,15 +423,43 @@ async function formLinks(chat: string, text: string, who: string): Promise<{ tex
 function onsenNote(ctx: Onsen.SendCtx, method: string, payload: unknown, result: unknown, err?: unknown): void {
   if (!onsen) return
   if (err !== undefined && ctx.richAttempt && !(err instanceof SendTimeoutError)) return
-  try { onsen.recordLine(Onsen.outboundRecord(ONSEN_AGENT, ctx, method, payload, result, err)) } catch {}
+  try {
+    const line = Onsen.outboundRecord(ONSEN_AGENT, ctx, method, payload, result, err)
+    // WO-190 (ONSEN_FILES): a file the reply tool sent, taken by Telegram: the original goes into Onsen too (after the send: the send is never slowed)
+    const file = ctx.file
+    if (line?.k === 'm' && file && OnsenFiles.wantsFiles(line.r) && onsenFilesOn()) {
+      const item = line.r
+      onsen.recordWithFiles(item, () => OnsenFiles.storeFiles(item, [async () => OnsenFiles.localFile(file)], onsenUpload, log))
+    } else onsen.recordLine(line)
+  } catch {}
 }
-/** Onsen (WO-139): a human's Telegram message that passed the gate. body: the text (a file's caption, '' without one; a voice note's transcript) */
+/** WO-190 (ONSEN_FILES: a comma list of agent names or `*`; unset, empty or 0 = off; the plist, else the machine config read again at most every 30 s,
+ *  so turning it on or off needs no restart): the files of this agent's Telegram messages, both ways, go into Onsen too. Recording must be on */
+function onsenFilesOn(): boolean {
+  try { return !!onsen && onsen.cfg.record && OnsenFiles.filesOn(liveSetting('ONSEN_FILES'), ONSEN_AGENT) } catch { return false }
+}
+const onsenUpload: OnsenFiles.Upload = (bytes, o) => onsen ? onsen.uploadFile(bytes, o) : Promise.resolve({ error: 'Onsen is off here' })
+/** WO-190: the inbox copies of the photos being handled (message:photo), so the upload takes the copy the agent gets */
+const photoCopies = new OnsenFiles.PhotoCopies()
+/** WO-190: where a person's file comes from for Onsen: a photo's inbox copy once the daemon has it, else Telegram (fetched by the daemon itself, in
+ *  memory, never into the agent's inbox) */
+function inboundFileSource(m: object, a: Onsen.OnsenAttachment): OnsenFiles.Source {
+  return async () => {
+    const copy = await photoCopies.of(m)
+    if (copy) { const got = OnsenFiles.localFile(copy); if (!('why' in got)) return got }
+    return OnsenFiles.telegramFile({ fileId: String(a.file_id), size: a.size, getFile: id => bot.api.getFile(id), fileUrl: p => `${API_ROOT}/file/bot${TOKEN}/${p}` })
+  }
+}
+/** Onsen (WO-139): a human's Telegram message that passed the gate. body: the text (a file's caption, '' without one; a voice note's transcript).
+ *  WO-190 (ONSEN_FILES): its own file goes into Onsen too (the record keeps its place; the ids join it when the spool sends it) */
 function onsenIn(m: any, text: string, transcript?: string): void {
   if (!onsen || !m) return
   try {
     const kind = Onsen.inboundShape(m).kind
     const body = transcript ?? (kind === 'text' || kind === 'command' || kind === 'rich' || m.caption != null ? text : '')
-    onsen.recordMessage(Onsen.inboundItem(ONSEN_AGENT, m, body))
+    const item = Onsen.inboundItem(ONSEN_AGENT, m, body)
+    if (OnsenFiles.wantsFiles(item) && onsenFilesOn()) onsen.recordWithFiles(item, () => OnsenFiles.storeFiles(item, [inboundFileSource(m, item.attachments![0]!)], onsenUpload, log))
+    else onsen.recordMessage(item)
   } catch {}
 }
 // Onsen step 3 (WO-143): delivery facts (delivered / seen / turn_end of Joey's messages) and the main's status, recorded only (onsen-status.ts). Set up
@@ -2646,7 +2675,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const opts = topicF.message_thread_id != null ? { ...(base ?? {}), ...topicF } : base
           const t0 = Date.now(), method = PHOTO_EXTS.has(ext) ? 'sendPhoto' : 'sendDocument'
           try {
-            const sent = await Onsen.withSender('main', () => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts), { turn_id: mainTurnNow() })   // Onsen (WO-139); WO-172: its turn
+            const sent = await Onsen.withSender('main', () => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts), { turn_id: mainTurnNow(), file: f })   // Onsen (WO-139); WO-172: its turn; WO-190: the file into Onsen too
             sentIds.push(sent.message_id)
             sentLog(method, sent.message_id, t0)
           } catch (fe) {
@@ -3470,11 +3499,14 @@ bot.on('message:photo', async ctx => {
   // Largest size is last in the array.
   const photos = ctx.message.photo
   const best = photos[photos.length - 1]
-  await handleInbound(ctx, caption, {
-    file_id: best.file_id,
-    size: best.file_size,
-    download: () => downloadPhotoToInbox(ctx, best),
-  })
+  photoCopies.open(ctx.message)              // WO-190: Onsen's copy of the photo is the inbox copy the agent gets
+  try {
+    await handleInbound(ctx, caption, {
+      file_id: best.file_id,
+      size: best.file_size,
+      download: () => photoCopies.track(ctx.message, downloadPhotoToInbox(ctx, best)),
+    })
+  } finally { photoCopies.done(ctx.message) }
 })
 
 // NOTE: registered BEFORE message:document — Telegram animation messages also
@@ -4839,12 +4871,13 @@ if (Lanes.LANES_ON) {
 //              state and Joey's held messages. last_activity_at: the newest write to the main's transcript or its subagents'.
 /** WO-165 A: JEV_SCREEN as the plist sets it (fixed for the daemon's life), else the machine config's line, read again at most every 30 s (taking an
  *  agent off needs no restart). WO-169: SCREEN_JUDGE (which judge reads the screen: jev, the default | program) the same way. WO-180: ONSEN_OBSERVATION
- *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way */
-type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS'
+ *  (the observation goes to Onsen: a comma list of agent names or `*`) the same way. WO-190: ONSEN_FILES (the files of Telegram messages go into Onsen) too */
+type LiveKey = 'JEV_SCREEN' | 'SCREEN_JUDGE' | 'ONSEN_OBSERVATION' | 'LANES_MENTION_CARDS' | 'ONSEN_FILES'
 const LIVE_PLIST: Record<LiveKey, string | undefined> = { JEV_SCREEN: fleetConfigApplied.includes('JEV_SCREEN') ? undefined : process.env.JEV_SCREEN,
   SCREEN_JUDGE: fleetConfigApplied.includes('SCREEN_JUDGE') ? undefined : process.env.SCREEN_JUDGE,
   ONSEN_OBSERVATION: fleetConfigApplied.includes('ONSEN_OBSERVATION') ? undefined : process.env.ONSEN_OBSERVATION,
-  LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS }   // WO-181
+  LANES_MENTION_CARDS: fleetConfigApplied.includes('LANES_MENTION_CARDS') ? undefined : process.env.LANES_MENTION_CARDS,   // WO-181
+  ONSEN_FILES: fleetConfigApplied.includes('ONSEN_FILES') ? undefined : process.env.ONSEN_FILES }   // WO-190
 let liveFile: { at: number; v: Record<string, string> } = { at: -Infinity, v: {} }
 function liveSetting(k: LiveKey): string | undefined {
   if (LIVE_PLIST[k] !== undefined) return LIVE_PLIST[k]
