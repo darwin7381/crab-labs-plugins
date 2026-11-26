@@ -2484,7 +2484,12 @@ export function mailChecked(m: number, by: string): number {
  *  offers or the main's hook pulls next (lanes-main.ts). `owesOnlyMain`: the item is all it owes (a wake-up line: no Joey line, no answer, no receipt). */
 function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}): void {
   if (d.target !== 'main' || D.role !== 'tg' || !main) return
-  const p = (ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
+  // Onsen's mention item (WO-181) is a notice, as the lanes digest is: it owes nobody anything (no Joey line, no answer) and is not a call. It reaches the
+  // main as the lanes' own message (chat lanes, no_reply), its mention block riding with it. As a peer's call it carried a Joey line, and the main answered
+  // Joey 「沒有要我做的事」 (Chiron's WO-175 lab, 08:42Z, lab-relay msg 881): fleet-wide, every comment naming an agent would have made it write to Joey
+  const notice = ev.item_kind === 'mention'
+  const p = (notice ? { content: String(ev.text ?? ''), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'mention', no_reply: 'true' } }
+    : ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
     : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text ?? ''), meta: { ...(p.meta ?? {}) } } }
   const kind: ItemKind = ev.source === 'telegram' ? 'joey' : routerCfg().alert_senders.includes(ev.from) ? 'alert' : 'peer'
@@ -2493,9 +2498,9 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   // main, those are `handed` (the main meets them: its reply meets the Joey line and rings a critical one's ring, the due sweep rings it if nobody did)
   ev.trigger ??= triggerClass(undefined, ev) || undefined
   const cls = evClassOf(ev)
-  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
+  recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain || notice ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
-  main.enqueue(kind, notif, { via: ev.source === 'telegram' ? 'tg' : 'inbox', event: ev.id, ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
+  main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
 }
 /** Onsen step 2 (WO-142, server.ts): Joey edited Telegram message `messageId` in `chat` and the main has not seen it yet (its M1 item still queued, never
  *  offered): that item is rewritten (lanes-main.ts replaceQueued; server.ts gives the new text). true = replaced; false = the edit goes as a new message. */

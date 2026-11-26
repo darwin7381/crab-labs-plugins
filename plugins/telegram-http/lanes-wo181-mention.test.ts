@@ -90,3 +90,28 @@ test('the ceiling: a mention item that has waited LANES_DEFER_MAX_WAIT_S leads o
     expect(await until(() => items(m.id)[0].state === 'offered', 2000)).toBe(true)
   } finally { delete process.env.LANES_DEFER_MAX_WAIT_S; await takeTurn() }
 })
+
+test('a mention item is a notice, not a call (Chiron WO-175 lab 08:42Z, lab msg 881): it owes nobody anything; the lanes\' own message (chat lanes, no_reply), not the sender\'s call', async () => {
+  expect(waiting().length).toBe(0)
+  const m = mentionItem(300958)
+  m.notif.params.meta = { user: 'onsen', line: 'call', chat_id: 'onsen' }                     // as agent-inbox renders Onsen's item
+  await L.routeEvent(m)
+  const ev = L.__events().get(m.id)!
+  expect((ev.obligations ?? []).map((o: any) => o.kind)).toEqual(['main'])                  // no Joey line, no answer
+  const it = items(m.id)[0]
+  expect(it.via).toBe('tg')
+  expect((it.notif as any).params.meta).toMatchObject({ chat_id: 'lanes', user: 'lanes', via: 'lanes', kind: 'mention', no_reply: 'true' })
+  expect((it.notif as any).params.meta.line).toBeUndefined()
+  expect((it.notif as any).params.content).toBe(mentionItemText({ refs: { post_id: 300958 } }))
+  // pulled into a turn it is told as the digest is (only for the main to know), not as a message to handle
+  const p = `p-m-${++turns}`
+  await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p })
+  process.env.LANES_DEFER_MAX_WAIT_S = '1'
+  try {
+    await new Promise(res => setTimeout(res, 1100))
+    const r = await L.__mainEvent({ event: 'PostToolUse', pid, prompt_id: p, tool_name: 'Bash', tool_input: {}, tool_response: '' }) as any
+    const ctx = String(r?.additionalContext ?? '')
+    expect(ctx).toContain('〔點名你的動態〕')
+    expect(ctx).not.toContain('<channel')
+  } finally { delete process.env.LANES_DEFER_MAX_WAIT_S; await L.__mainEvent({ event: 'Stop', pid, prompt_id: p, phase: 'final' }) }
+})

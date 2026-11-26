@@ -1,3 +1,12 @@
+## 1.58.18 — 2026-11-26 (a mention item is a notice, not a call)
+
+- **Onsen's mention item owes nobody anything and is not a call** (board WO-175 / WO-181, Chiron's lab 08:28–08:45Z, mesh 12543: 「kind mention 的件不能帶義務…交進去的就是區塊，跟車道摘要一樣只讓它知道」). 1.58.16 handed it to the main as a peer's item: obligations main + a Joey line (`kind joey, level line`), class peer, the agent-inbox channel tag of the sender `onsen` with `line="call"`; the main took it for a call and answered Joey 「沒有要我做的事」 (lab-relay msg 881). Fleet-wide every comment naming an agent would have made it write to Joey.
+  - Now (`lanes.ts` toMain): an item of kind `mention` owes only the main (the item itself: no Joey line, no answer), and reaches it as the lanes' own message: chat `lanes`, user `lanes`, `kind="mention"`, `no_reply="true"`, through the Telegram stream (as the digest), its one line 「〔點名你的動態〕…」 after the digest and its mention block. Pulled into a turn it is told with the digest (only for the main to know), not as a message to handle (`lanes-main.ts` renderPulled).
+  - The batching (WO-181 第 3 條, passed in the lab): unchanged — never a wake of its own, rides the next delivery, leads one after `LANES_DEFER_MAX_WAIT_S`.
+- Tests: lanes-wo181-mention (+1: the event's obligations are only `main`; the item's meta is the lanes' own, no `line`; pulled into a turn it is not a `<channel>` message).
+- Also in this version: Epeius's `codex-runner/` (WO-184 part 2, commits 0b9a846, e266f5d, 4583a16): a separate program (launchd `com.btai.codex-runner` on the Mac mini); nothing the daemons run changes.
+- Roll back: 1.58.17.
+
 ## 1.58.17 — 2026-11-26 (Linux: a Claude Code started in the box's first 46 minutes is not pid_reused)
 
 - **The start-time check compares like with like** (board WO-187, Chiron 08:11Z, urgent). On Linux Claude Code writes the registry's `procStart` as `/proc/<pid>/stat` field 22 (clock ticks since boot: builder's `"3154"`), but `osProcStart` read `ps -o lstart=` (a date), and `sameStart` sent both to `Date.parse`: Bun reads `"3154 UTC"` as the year 3154, a finite date far from today, so every Claude Code started within 2,757.6 s (about 46 minutes) of a Linux boot was judged `offline / pid_reused` until that process restarted, and one started later was compared with nothing (a real reuse went unseen). txmonster rebooted 07:45:41Z: all 17 agents offline on Onsen (process_gone), `main_delivery: offline`, hand-overs held.
