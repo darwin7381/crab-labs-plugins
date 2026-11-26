@@ -162,3 +162,122 @@ describe('the spool: PUT /v1/calls/<id>/state', () => {
     expect(c.pendingBytes()).toBe(0)
   })
 })
+
+// Chiron's WO-175 ruling of 05:55Z: a receipt goes to Onsen only. Onsen not answering or 5xx: the first try and three more, all within 10 s, then
+// not recorded; a refused step: Onsen's sentence (recorded when the Call is already there: a resend); no credential: a broken setup; only a run
+// Onsen has no Call for goes to BTCC (lanes-wo175.test.ts). Here the client's half (what Onsen said to a spooled line; a run's Call) and CallFacts.receipt.
+describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the line, a run\'s Call', () => {
+  const CRED = 'mesh_CALLSTESTsecret'
+  function onsen(o: { put?: (id: string, body: any) => { status: number; json?: any }; list?: (q: URLSearchParams) => { status: number; json?: any }
+    one?: (id: string) => { status: number; json?: any } } = {}) {
+    const log: Array<{ m: string; path: string; body: any; at: number }> = []
+    const t0 = Date.now()
+    const f = (async (u: any, init?: any) => {
+      const url = new URL(String(u)), path = url.pathname.replace(/^\/api\/onsen/, '') + url.search
+      const body = init?.body ? JSON.parse(init.body) : null
+      log.push({ m: init?.method ?? 'GET', path, body, at: Date.now() - t0 })
+      const json = (s: number, j: unknown) => new Response(JSON.stringify(j ?? {}), { status: s, headers: { 'content-type': 'application/json' } })
+      if (init?.headers?.Authorization !== `Bearer ${CRED}`) return json(401, {})
+      const m = /\/v1\/calls\/(\d+)\/state$/.exec(url.pathname)
+      if (init?.method === 'PUT' && m) { const r = o.put?.(m[1]!, body); return json(r?.status ?? 200, r?.json ?? { data: { id: m[1], state: body.state } }) }
+      if ((init?.method ?? 'GET') === 'GET' && url.pathname.endsWith('/v1/calls')) { const r = o.list?.(url.searchParams) ?? { status: 200, json: { items: [], next_cursor: null } }; return json(r.status, r.json) }
+      const one = /\/v1\/calls\/(\d+)$/.exec(url.pathname)
+      if ((init?.method ?? 'GET') === 'GET' && one) { const r = o.one?.(one[1]!) ?? { status: 404 }; return json(r.status, r.json) }
+      return json(404, {})
+    }) as typeof fetch
+    return { f, log }
+  }
+  const client = (f: typeof fetch, cred: string | null = CRED) => new OnsenClient({ dir: mkdtempSync(join(tmpdir(), 'onsen-calls-r-')), base: 'https://onsen.test/api/onsen',
+    agent: 'lab-relay', record: true, credential: () => cred, log: () => {}, fetch: f, intervalMs: 3_600_000 })
+  const said = { error: { code: 'invalid_transition', message: '呼叫已經是 failed，不能改成 completed' } }
+  test('took: the PUT answered 2xx (Onsen\'s state); refused: a 4xx with Onsen\'s sentence; a fate is kept for a line asked about again', async () => {
+    let put = (id: string, b: any) => ({ status: 200, json: { data: { id, state: b.state } } }) as { status: number; json: any }
+    const o = onsen({ put: (id, b) => put(id, b) }), c = client(o.f)
+    c.recordCall({ call_id: '350', kind: 'scheduled', event: 'e1', idem: 'k1', body: { state: 'completed', session_id: 'x.reflex.1', at: new Date().toISOString() } })
+    expect(await c.callFate('k1')).toEqual({ fate: 'took', state: 'completed' })
+    expect(await c.callFate('k1')).toEqual({ fate: 'took', state: 'completed' })
+    put = () => ({ status: 400, json: said })
+    c.recordCall({ call_id: '351', kind: 'scheduled', event: 'e2', idem: 'k2', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
+    expect(await c.callFate('k2')).toEqual({ fate: 'refused', status: 400, said: '呼叫已經是 failed，不能改成 completed' })
+    expect(o.log.filter(x => x.m === 'PUT')).toHaveLength(2)                        // a refused step is not tried again
+  })
+  test('Onsen answering 503: the first try and three more within 10 s, whatever the spool\'s backoff; then pending, the line still in the spool', async () => {
+    const o = onsen({ put: () => ({ status: 503, json: {} }) }), c = client(o.f)
+    c.start()
+    c.recordCall({ call_id: '352', kind: 'scheduled', event: 'e3', idem: 'k3', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
+    const t0 = Date.now(), f = await c.callFate('k3')
+    c.stop()
+    expect(f).toEqual({ fate: 'pending', why: expect.stringContaining('HTTP 503') })
+    expect(Date.now() - t0).toBeLessThan(10_500)
+    const puts = o.log.filter(x => x.m === 'PUT')
+    expect(puts.length).toBe(4)
+    expect(puts.at(-1)!.at).toBeLessThan(10_000)
+    expect(c.pendingBytes()).toBeGreaterThan(0)
+  }, 20_000)
+  test('no mesh credential: nocred at once, nothing sent', async () => {
+    const o = onsen(), c = client(o.f, null)
+    c.recordCall({ call_id: '353', kind: 'scheduled', event: 'e4', idem: 'k4', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
+    expect((await c.callFate('k4')).fate).toBe('nocred')
+    expect((await c.findRunCall('7')).fate).toBe('nocred')
+    expect(o.log).toEqual([])
+  })
+  test('a run\'s Call: found, none, a refused lookup, and Onsen not answering (tried again within the wait)', async () => {
+    let list = (q: URLSearchParams) => ({ status: 200, json: { items: q.get('ref_value') === '7221' ? [{ id: 374, state: 'running', result: null }] : [], next_cursor: null } }) as any
+    const o = onsen({ list: q => list(q) }), c = client(o.f)
+    expect(await c.findRunCall('7221')).toEqual({ found: { id: '374', state: 'running', result: null } })
+    expect(o.log[0]!.path).toBe('/v1/calls?ref_kind=run&ref_value=7221&limit=5')
+    expect(await c.findRunCall('7222')).toEqual({ none: true })
+    list = () => ({ status: 403, json: { error: { code: 'forbidden', message: 'not your call' } } })
+    expect(await c.findRunCall('7223')).toEqual({ fate: 'refused', status: 403, said: 'not your call' })
+    list = () => ({ status: 502, json: {} })
+    o.log.length = 0
+    expect(await c.findRunCall('7224', 1_500)).toEqual({ fate: 'pending', why: expect.stringContaining('HTTP 502') })
+    expect(o.log.map(x => x.at >= 900)).toEqual([false, true])                      // the first try and one more inside 1.5 s
+  })
+})
+
+describe('CallFacts.receipt: a scheduled run\'s receipt as its Call\'s end, and what Onsen said to it', () => {
+  type Fate = import('./onsen-client.ts').CallLineFate
+  function rig() {
+    const out: CallStateLine[] = [], fates = new Map<string, Fate>()
+    let next: Fate = { fate: 'took', state: 'completed' }, now: { state: string | null; result: unknown } | null = null
+    const f = new CallFacts({ sink: l => out.push(l), client: { callFate: async idem => fates.get(idem) ?? (fates.set(idem, next), next),
+      findRunCall: async () => ({ none: true }), getCall: async () => now } })
+    return { f, out, set: (x: Fate) => { next = x }, onsenHas: (x: typeof now) => { now = x }, fates }
+  }
+  const RES = { outcome: 'ok', text: '磁碟 41%' }
+  test('taken: recorded; the same receipt again: recorded (a resend), no second line', async () => {
+    const r = rig()
+    r.f.running('ev1', SCHED, 'x.reflex.1')
+    expect(await r.f.receipt('ev1', SCHED, 'x.reflex.1', 'completed', RES)).toEqual({ ok: true, state: 'completed' })
+    expect(await r.f.receipt('ev1', SCHED, 'x.reflex.1', 'completed', RES)).toEqual({ ok: true, state: 'completed', resend: true })
+    expect(r.out.filter(l => l.body.state === 'completed')).toHaveLength(1)
+  })
+  test('refused: recorded when Onsen has the Call where the receipt puts it (a resend), else Onsen\'s sentence and the Call\'s state', async () => {
+    const r = rig()
+    r.set({ fate: 'refused', status: 409, said: 'result already set' }); r.onsenHas({ state: 'completed', result: { outcome: 'ok' } })
+    expect(await r.f.receipt('ev2', SCHED, 'main', 'completed', RES)).toEqual({ ok: true, state: 'completed', resend: true })
+    const q = rig()
+    q.set({ fate: 'refused', status: 400, said: '呼叫已經是 failed' }); q.onsenHas({ state: 'failed', result: null })
+    expect(await q.f.receipt('ev3', SCHED, 'main', 'completed', RES)).toEqual({ ok: false, fate: 'refused', why: 'Onsen refused it (HTTP 400): 呼叫已經是 failed; the Call is failed' })
+  })
+  test('pending (Onsen not answering): not recorded; filed again once the spool has sent it: recorded, still one line', async () => {
+    const r = rig()
+    r.set({ fate: 'pending', why: '/v1/calls/350/state answered HTTP 503' })
+    expect(await r.f.receipt('ev4', SCHED, 'main', 'completed', RES)).toEqual({ ok: false, fate: 'pending', why: '/v1/calls/350/state answered HTTP 503' })
+    const idem = r.out.at(-1)!.idem
+    r.fates.set(idem, { fate: 'took', state: 'completed' })                         // the spool sent it later
+    expect(await r.f.receipt('ev4', SCHED, 'main', 'completed', RES)).toEqual({ ok: true, state: 'completed', resend: true })
+    expect(r.out).toHaveLength(1)
+  })
+  test('no credential: nocred; a receipt after the Call ended otherwise (failed here): over, nothing sent', async () => {
+    const r = rig()
+    r.set({ fate: 'nocred', why: 'no mesh credential' })
+    expect(await r.f.receipt('ev5', SCHED, 'main', 'completed', RES)).toMatchObject({ ok: false, fate: 'nocred' })
+    const q = rig()
+    q.f.ended('ev6', SCHED, 'x.reflex.2', 'failed')
+    const n = q.out.length
+    expect(await q.f.receipt('ev6', SCHED, 'x.reflex.2', 'completed', RES)).toMatchObject({ ok: false, fate: 'over' })
+    expect(q.out.length).toBe(n)
+  })
+})

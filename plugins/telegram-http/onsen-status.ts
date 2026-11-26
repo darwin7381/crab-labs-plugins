@@ -16,7 +16,7 @@ import { spawn, spawnSync } from 'child_process'
 import { closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, watch, writeFileSync, writeSync,
   type FSWatcher } from 'fs'
 import { basename, join } from 'path'
-import { idemDelivery, idemStatus, type CallRef, type CallStateLine, type CallStateName, type DeliveryFact, type DeliveryState, type StatusFact, type StatusState } from './onsen-client.ts'
+import { idemDelivery, idemStatus, type CallLineFate, type CallRef, type CallStateLine, type CallStateName, type DeliveryFact, type DeliveryState, type RunCallLookup, type StatusFact, type StatusState } from './onsen-client.ts'
 import type { Row } from './lanes-state.ts'
 
 type Now = () => number
@@ -167,30 +167,37 @@ export class DeliveryFacts {
  *  a moment at or behind the last one sent is not sent again (a completed Call takes a result once more, when the first had none). */
 export const CALL_LEDGER_RESULT = '只記錄，沒有交給任何一條 session'
 export type CallResult = { outcome?: string; text?: string | null }
+/** WO-175 (Chiron 05:55Z): what a receipt needs of the Onsen client (onsen-client.ts OnsenClient): what Onsen said to a spooled line, a run's Call */
+export type CallClient = { callFate(idem: string): Promise<CallLineFate>; findRunCall(run: string): Promise<RunCallLookup>
+  getCall(id: string): Promise<{ state: string | null; result: unknown } | null> }
+/** a receipt as its Call's end: recorded (`resend`: the Call was there already), or why not (refused: Onsen's sentence; pending: Onsen did not
+ *  answer within the wait, the line stays in the spool; nocred: no mesh credential; over: the Call ended otherwise) */
+export type CallReceipt = { ok: true; state: string | null; resend?: boolean } | { ok: false; fate: 'refused' | 'pending' | 'nocred' | 'over'; why: string }
 const CALL_RANK: Record<CallStateName, number> = { accepted: 1, running: 2, completed: 3, failed: 3 }
 export class CallFacts {
-  private sent = new Map<string, { state: CallStateName; result: boolean; session: string | null }>()
+  private sent = new Map<string, { state: CallStateName; result: boolean; session: string | null; idem?: string }>()
   private later = new Map<string, { call: CallRef; session: string; at: string; stopMs: number; result?: CallResult }>()
   readonly stats = { moments: 0, skipped: 0, ledger: 0 }
-  constructor(readonly o: { sink: (line: CallStateLine) => void; now?: Now; max?: number }) {}
+  constructor(readonly o: { sink: (line: CallStateLine) => void; now?: Now; max?: number; client?: CallClient | null }) {}
   private now(): number { return (this.o.now ?? Date.now)() }
   /** putBack: the one step back (running → accepted); any other moment at or behind the last one is not sent */
-  private emit(event: string, call: CallRef, state: CallStateName, session: string | null, at: string, result?: CallResult, putBack = false): boolean {
+  /** the line's idem key, or null: not sent (at or behind the last moment) */
+  private emit(event: string, call: CallRef, state: CallStateName, session: string | null, at: string, result?: CallResult, putBack = false): string | null {
     const was = this.sent.get(event)
     const body = result && (result.outcome || result.text) && state === 'completed'          // failed takes no result (Onsen)
       ? { ...(result.outcome ? { outcome: result.outcome } : {}), ...(result.text ? { body: { format: 'markdown' as const, text: result.text.slice(0, 4000) } } : {}) } : undefined
     const back = putBack && was?.state === 'running' && state === 'accepted'
     const fill = was?.state === 'completed' && state === 'completed' && !was.result && !!body
-    if (was && !back && !fill && CALL_RANK[state] <= CALL_RANK[was.state]) { this.stats.skipped++; return false }
-    if (was && (was.state === 'completed' || was.state === 'failed') && !fill) { this.stats.skipped++; return false }
-    this.sent.set(event, { state, result: !!body || !!was?.result, session })
+    if (was && !back && !fill && CALL_RANK[state] <= CALL_RANK[was.state]) { this.stats.skipped++; return null }
+    if (was && (was.state === 'completed' || was.state === 'failed') && !fill) { this.stats.skipped++; return null }
+    const idem = `call:${event}:${state}:${back ? 'back:' : ''}${fill ? 'fill:' : ''}${at}`
+    this.sent.set(event, { state, result: !!body || !!was?.result, session, idem })
     if (this.sent.size > (this.o.max ?? 20_000)) for (const k of [...this.sent.keys()].slice(0, 5_000)) this.sent.delete(k)
     this.stats.moments++
     try {
-      this.o.sink({ call_id: call.id, kind: call.kind, event, idem: `call:${event}:${state}:${back ? 'back:' : ''}${at}`,
-        body: { state, session_id: session, ...(body ? { result: body } : {}), at } })
+      this.o.sink({ call_id: call.id, kind: call.kind, event, idem, body: { state, session_id: session, ...(body ? { result: body } : {}), at } })
     } catch {}
-    return true
+    return idem
   }
   routed(event: string, call: CallRef, session: string | null, at = iso(this.now())): void {
     this.emit(event, call, 'accepted', session, at)
@@ -213,10 +220,36 @@ export class CallFacts {
     this.later.delete(event)
     if (this.sent.get(event)?.state === 'running') this.emit(event, call, 'accepted', session, at, undefined, true)
   }
-  ended(event: string, call: CallRef, session: string, how: 'completed' | 'failed', at = iso(this.now()), result?: CallResult): void {
+  ended(event: string, call: CallRef, session: string, how: 'completed' | 'failed', at = iso(this.now()), result?: CallResult): string | null {
     this.later.delete(event)
-    this.emit(event, call, how, session, at, result)
+    return this.emit(event, call, how, session, at, result)
   }
+  /** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): a scheduled run's receipt (lanes.ts completeRun) as its Call's end, through the spool,
+   *  then what Onsen said (the client waits ≤10 s: the first try and three more). A refused step is recorded when the Call is already where the
+   *  receipt puts it (a resend); so is a receipt this daemon sent before, once Onsen took that line */
+  async receipt(event: string, call: CallRef, session: string, how: 'completed' | 'failed', result?: CallResult, at = iso(this.now())): Promise<CallReceipt> {
+    const was = this.sent.get(event)
+    const wanted = (state: string | null | undefined, res: unknown): boolean => how === 'failed' ? state === 'failed' : state === 'completed' && res != null
+    let idem = this.ended(event, call, session, how, at, result), resend = false
+    if (!idem) {
+      if (!was || !(how === 'failed' ? was.state === 'failed' : was.state === 'completed' && was.result))
+        return { ok: false, fate: 'over', why: `the Call is already ${was?.state ?? 'past this step'} (this daemon reported that before); this receipt changes nothing` }
+      if (!was.idem) return { ok: true, state: was.state, resend: true }
+      idem = was.idem; resend = true
+    }
+    const client = this.o.client
+    if (!client) return { ok: true, state: how, ...(resend ? { resend } : {}) }
+    const f = await client.callFate(idem)
+    if (f.fate === 'took') return { ok: true, state: f.state, ...(resend ? { resend } : {}) }
+    if (f.fate === 'refused') {
+      const now = await client.getCall(call.id).catch(() => null)
+      if (now && wanted(now.state, now.result)) return { ok: true, state: now.state, resend: true }
+      return { ok: false, fate: 'refused', why: `Onsen refused it (HTTP ${f.status}): ${f.said}${now?.state ? `; the Call is ${now.state}` : ''}` }
+    }
+    return { ok: false, fate: f.fate, why: f.why }
+  }
+  /** WO-175: run `run`'s Call in Onsen, for a receipt whose item named none (no client: none) */
+  findRun(run: string): Promise<RunCallLookup> { return this.o.client ? this.o.client.findRunCall(run) : Promise.resolve({ none: true }) }
   /** the main's turn that took it ended at its Stop: final once the status record shows no turn running (statusRecord), or when a new turn begins */
   completeLater(event: string, call: CallRef, session: string, at: string): void {
     this.later.set(event, { call, session, at, stopMs: this.now() })

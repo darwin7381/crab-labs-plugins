@@ -7133,33 +7133,56 @@ export function receiptLeftForMain(runId: string): boolean {
 const LEFT_FOR_MAIN_LINE = (run: string): string => `排程 run ${run} 沒有在這裡完成：這件事交給主線了，主線做完由它回執。`
 const leftForMainText = (run: string): string => `scheduler run ${run} is left for the main: this matter was handed to it, so the main completes run ${run} `
   + `(btcc-receipt complete ${run}) when the work is done. Nothing was sent to the scheduler; do not complete it yourself. Your part is recorded.`
+/** WO-175 (Chiron 05:55Z): why a receipt did not land in Onsen, as the lane reads it (meetReceipt quotes it) */
+function receiptNotRecorded(why: string, fate: 'refused' | 'pending' | 'nocred' | 'over'): string {
+  if (fate === 'pending') return `Onsen did not answer (${why}): this receipt waits in this daemon's spool and goes to Onsen when it answers; not sent to BTCC (a receipt goes to Onsen only)`
+  if (fate === 'nocred') return `${why}: this daemon cannot reach Onsen (a broken setup); not sent to BTCC`
+  return fate === 'refused' ? `${why}; not sent to BTCC` : why
+}
 export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
   if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
     logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
   }
-  // WO-175 二 (Chiron 02:58Z: the receipt is the run's Call): a run that is a Call this daemon reports completes as that Call — completed with result
-  // {outcome ok | nothing_to_do, body: the note}, or failed — through the spool; BTCC's scheduler reads it (call_sweep). The scheduler's own /complete is
-  // only for a run whose item carried no Call (lab-relay 05:07Z: the lane's /complete could not reach BTCC, the lane handed the run to the main)
-  const calls = onsenTap?.calls, call = calls ? callOfEvent(tok.evId) : null
-  if (calls && call?.kind === 'scheduled') {
-    const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
-      const o = btccOutcome(outcome)
-      calls.ended(tok.evId, call, tok.lane, o === 'failed' ? 'failed' : 'completed', nowIso(),
-        o === 'failed' ? undefined : { outcome: o === 'nothing-to-do' ? 'nothing_to_do' : 'ok', text: typeof note === 'string' && note ? note : null })
-      return { ok: true, text: JSON.stringify({ ok: true, state: 'completed', outcome: o, call_id: call.id, via: 'onsen' }) }
-    })
-    logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok, call: call.id })
-    return { ok: c.ok, text: c.text }
-  }
-  const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
-    // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422
-    // receipt note (btcc-ack-auth): the line goes as `note`, the field BTCC reads (it was sent as `summary`, which BTCC never read: the result sentence was dropped)
+  // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422
+  // receipt note (btcc-ack-auth): the line goes as `note`, the field BTCC reads (it was sent as `summary`, which BTCC never read: the result sentence was dropped)
+  const viaBtcc = async (): Promise<RunAnswer | null> => {
     const r = await inboxPost('/lanes/scheduler', { run_id: runId, action: 'complete', outcome: btccOutcome(outcome), note: typeof note === 'string' && note ? note : undefined })
     if (!r) return null
     const text = String(r.text ?? JSON.stringify(r))
     return { ...schedulerAnswerOk(text), ...(typeof r.ok === 'boolean' ? { ok: r.ok } : {}), text }
-  })
+  }
+  // WO-175 二 (Chiron 02:58Z: the receipt is the run's Call) and his 05:55Z ruling (one path): with the Call moments on (ONSEN_CALL_STATE), a
+  // scheduled run's receipt is its Call's end and goes to Onsen only: the item's Call, else the run's Call as Onsen lists it, through the spool,
+  // then what Onsen said (≤10 s: the first try and three more). Onsen not answering, a step it refuses (unless the Call is already there: a
+  // resend), no credential: not completed, said so, nothing to BTCC. Only a run Onsen has no Call for still goes to BTCC's /complete, with one
+  // log line (the run, the agent): their count decides when BTCC's old receipt routes go. ONSEN_CALL_STATE=0 is the way back (BTCC, as before)
+  const calls = onsenTap?.calls
+  if (calls) {
+    const seen = { call: null as string | null }
+    const c = await meetReceipt(tok.evId, runId, outcome, via, async () => {
+      let call = callOfEvent(tok.evId), key = tok.evId
+      if (call?.kind !== 'scheduled') {
+        const l = await calls.findRun(runId)
+        if ('none' in l) {
+          D.log('info', `lanes: no Onsen Call for run ${runId} (agent ${D.agent}, ${tok.lane}): its receipt goes to BTCC /complete (WO-175: the one case left)`)
+          logos('lane.receipt_no_call', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
+          return viaBtcc()
+        }
+        if ('fate' in l) return { ok: false, text: receiptNotRecorded(l.fate === 'refused' ? `Onsen refused the lookup of run ${runId}'s Call (HTTP ${l.status}): ${l.said}` : l.why, l.fate) }
+        call = { kind: 'scheduled', id: l.found.id }; key = `run:${runId}`
+      }
+      seen.call = call.id
+      const o = btccOutcome(outcome)
+      const r = await calls.receipt(key, call, tok.lane, o === 'failed' ? 'failed' : 'completed',
+        o === 'failed' ? undefined : { outcome: o === 'nothing-to-do' ? 'nothing_to_do' : 'ok', text: typeof note === 'string' && note ? note : null })
+      if (r.ok) return { ok: true, text: JSON.stringify({ ok: true, state: 'completed', outcome: o, call_id: call.id, via: 'onsen' }) }
+      return { ok: false, text: receiptNotRecorded(r.why, r.fate) }
+    })
+    logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok, ...(seen.call ? { call: seen.call } : {}) })
+    return { ok: c.ok, text: c.text }
+  }
+  const c = await meetReceipt(tok.evId, runId, outcome, via, viaBtcc)
   logos(c.dup ? 'lane.receipt_dup' : 'lane.receipt', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome, answered: c.ok })
   return { ok: c.ok, text: c.text }
 }

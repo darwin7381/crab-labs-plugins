@@ -11,7 +11,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { programView } from './screen-status.ts'
 import { CallFacts, DeliveryFacts, LanesTap, type StatusView } from './onsen-status.ts'
-import type { CallStateLine } from './onsen-client.ts'
+import type { CallLineFate, CallStateLine, RunCallLookup } from './onsen-client.ts'
 
 const AGENT = 'wo175test'
 process.env.LANES_WAKE_DECIDE = AGENT
@@ -50,12 +50,16 @@ L.__setRetryBackoff(20)
 let program: StatusView = { state: 'idle', detail: { queued_joey: 0 }, last_activity_at: new Date().toISOString() }
 const sent: string[] = [], mesh: any[] = []
 L.__setMeshSend(async b => { mesh.push(b); return { text: `sent to ${b.to}`, msgId: 75000 + mesh.length, delivered: true } })
-L.lanesInit({ role: 'tg', agent: AGENT, workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false,
+const logs: string[] = []
+L.lanesInit({ role: 'tg', agent: AGENT, workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: (_l: string, m: string) => { logs.push(m) }, deliverToMain: () => {}, authOk: () => false,
   registryNames: () => ['chiron', 'eve', 'sonn'], sendBot: async (_c: string, text: string) => { sent.push(text); return 700 + sent.length }, joeyChatId: () => '1',
   mainStatus: () => programView(program), notifySession: async () => true, streamOpen: () => true } as any)
 L.__setMainConnected('mcp-main')
 const lines: CallStateLine[] = []
-const calls = new CallFacts({ sink: l => lines.push(l) })
+// what Onsen says (CallFacts' client, as onsen-client.ts OnsenClient answers it): to a spooled line, a run's lookup, one Call. Default: took, none
+const onsenSays: { fate?: CallLineFate; run?: RunCallLookup; now?: { state: string | null; result: unknown } | null; looked: string[] } = { looked: [] }
+const calls = new CallFacts({ sink: l => lines.push(l), client: { callFate: async () => onsenSays.fate ?? { fate: 'took', state: 'completed' },
+  findRunCall: async run => { onsenSays.looked.push(run); return onsenSays.run ?? { none: true } }, getCall: async () => onsenSays.now ?? null } })
 const tap = new LanesTap({ facts: new DeliveryFacts({ agent: AGENT, sink: () => {} }), joey: () => null, gen: () => L.mainGenRow(), changed: () => {}, calls, callOf: id => L.callOfEvent(id) })
 L.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b), calls })
 const acks: string[] = []
@@ -198,4 +202,83 @@ test('a scheduled run the main takes into its turn: no M1 start receipt (its Cal
   expect(of(ev.id)).toEqual(['accepted:main', 'running:main'])
   expect(acks).toEqual([])
   await stop()
+})
+
+// Chiron's WO-175 ruling of 05:55Z: the lane's receipt of a scheduled run goes to Onsen only, the same four rules as btcc-receipt
+const schedEv = (run: string, callId: string | null) => ({ id: `mesh-sch-${run}`, source: 'mesh', from: 'scheduler', verified: true, text: `[scheduled][disk-check][run:${run}][P3][routine] disk-check`,
+  item_kind: 'scheduled', ...(callId ? { call_id: callId } : {}), meta: { user: 'scheduler', run_id: run }, refs: { run_id: run, schedule: '12' },
+  notif: { method: 'notifications/claude/channel', params: { content: 'disk-check', meta: { run_id: run } } } }) as any
+const receiptOf = (tok: any, run: string) => L.callLaneTool(tok, 'receipt', { run_id: run, outcome: 'done', happened: '例行磁碟檢查', did: '41%，沒事', promised: '無', needs_main: '無' })
+const owed = (ev: string) => (L.__events().get(ev)?.obligations ?? []).find((o: any) => o.kind === 'receipt')
+
+test('Onsen not answering (pending after its 10 s): not completed, said so, nothing to BTCC; filed again once Onsen took it: recorded', async () => {
+  const run = '9180', ev = schedEv(run, '4180')
+  const { lane, tok } = await start(ev)
+  onsenSays.fate = { fate: 'pending', why: '/v1/calls/4180/state answered HTTP 503' }
+  const a = String(await receiptOf(tok, run))
+  expect(a).toContain(`scheduler run ${run} is NOT completed`)
+  expect(a).toContain('Onsen did not answer (/v1/calls/4180/state answered HTTP 503)')
+  expect(a).toContain('not sent to BTCC')
+  expect(sched.filter(x => x.run_id === run)).toEqual([])
+  expect(owed(ev.id)?.state).not.toBe('met')
+  onsenSays.fate = { fate: 'took', state: 'completed' }
+  expect(String(await receiptOf(tok, run))).toContain('"state":"completed"')
+  expect(of(ev.id).filter(x => x.startsWith('completed'))).toHaveLength(1)                // the spooled line, sent once
+  expect(owed(ev.id)).toMatchObject({ state: 'met' })
+  await end(lane)
+  delete onsenSays.fate
+})
+
+test('Onsen refusing the step: its sentence, nothing to BTCC; the Call already where the receipt puts it (a resend): recorded', async () => {
+  const run = '9181', ev = schedEv(run, '4181')
+  const { lane, tok } = await start(ev)
+  onsenSays.fate = { fate: 'refused', status: 400, said: '呼叫已經是 failed，不能改成 completed' }; onsenSays.now = { state: 'failed', result: null }
+  const a = String(await receiptOf(tok, run))
+  expect(a).toContain('Onsen refused it (HTTP 400): 呼叫已經是 failed，不能改成 completed; the Call is failed; not sent to BTCC')
+  expect(sched.filter(x => x.run_id === run)).toEqual([])
+  await end(lane)
+  const run2 = '9182', ev2 = schedEv(run2, '4182')
+  const s2 = await start(ev2)
+  onsenSays.now = { state: 'completed', result: { outcome: 'ok' } }
+  expect(String(await receiptOf(s2.tok, run2))).toContain('"state":"completed"')
+  expect(owed(ev2.id)).toMatchObject({ state: 'met' })
+  await end(s2.lane)
+  delete onsenSays.fate; delete onsenSays.now
+})
+
+test('no mesh credential: a broken setup, not completed, nothing to BTCC', async () => {
+  const run = '9183', ev = schedEv(run, '4183')
+  const { lane, tok } = await start(ev)
+  onsenSays.fate = { fate: 'nocred', why: 'no mesh credential at /x/.agent-inbox-state/mesh-credential' }
+  const a = String(await receiptOf(tok, run))
+  expect(a).toContain('no mesh credential at /x/.agent-inbox-state/mesh-credential: this daemon cannot reach Onsen (a broken setup); not sent to BTCC')
+  expect(sched.filter(x => x.run_id === run)).toEqual([])
+  await end(lane)
+  delete onsenSays.fate
+})
+
+test('an item that named no Call: the run\'s Call is looked up in Onsen; found: that Call, nothing to BTCC; none: BTCC /complete with one log line (the run, the agent)', async () => {
+  const run = '9184', ev = schedEv(run, null)
+  const { lane, tok } = await start(ev)
+  onsenSays.run = { found: { id: '4184', state: 'running', result: null } }
+  expect(String(await receiptOf(tok, run))).toContain('"call_id":"4184","via":"onsen"')
+  expect(onsenSays.looked).toContain(run)
+  expect(lines.filter(l => l.event === `run:${run}`).map(l => `${l.call_id}:${l.body.state}`)).toEqual(['4184:completed'])
+  expect(sched.filter(x => x.run_id === run)).toEqual([])
+  await end(lane)
+  const run2 = '9185', ev2 = schedEv(run2, null)
+  const s2 = await start(ev2)
+  onsenSays.run = { none: true }
+  const a = String(await receiptOf(s2.tok, run2))
+  expect(a).toContain('receipt recorded')
+  expect(sched.filter(x => x.run_id === run2).map(x => `${x.path} ${x.action} ${x.outcome}`)).toEqual(['/lanes/scheduler complete ok'])
+  expect(logs.filter(m => m.includes(`no Onsen Call for run ${run2}`))).toEqual([`lanes: no Onsen Call for run ${run2} (agent ${AGENT}, ${s2.lane}): its receipt goes to BTCC /complete (WO-175: the one case left)`])
+  await end(s2.lane)
+  const run3 = '9186', ev3 = schedEv(run3, null)
+  const s3 = await start(ev3)
+  onsenSays.run = { fate: 'pending', why: 'GET /v1/calls answered HTTP 502' }                // the lookup not answered: not BTCC either
+  expect(String(await receiptOf(s3.tok, run3))).toContain('Onsen did not answer (GET /v1/calls answered HTTP 502)')
+  expect(sched.filter(x => x.run_id === run3)).toEqual([])
+  await end(s3.lane)
+  delete onsenSays.run
 })

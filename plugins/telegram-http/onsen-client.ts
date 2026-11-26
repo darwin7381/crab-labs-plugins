@@ -86,6 +86,16 @@ export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
  *  what moment of which item this is) */
 export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
+/** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): what became of one spooled Call line. took: Onsen answered 2xx (its state then);
+ *  refused: a 4xx (Onsen's sentence; the line is in rejected.jsonl); pending: no answer, or 5xx, within the wait (the line stays in the spool and
+ *  goes when Onsen answers); nocred: this daemon has no mesh credential (a broken setup) */
+export type CallLineFate = { fate: 'took'; state: string | null } | { fate: 'refused'; status: number; said: string } | { fate: 'pending'; why: string }
+  | { fate: 'nocred'; why: string }
+/** a run's Call as Onsen lists it (GET /v1/calls?ref_kind=run&ref_value=<run>), or why there is none to say */
+export type RunCallLookup = { found: { id: string; state: string | null; result: unknown } } | { none: true } | CallLineFate
+/** btcc-receipt's budget (Chiron 05:55Z): the first try and three more, all within 10 s */
+export const CALL_RECEIPT_WAIT_MS = 10_000
+const CALL_RETRY_AT = [0, 1_000, 3_000, 7_000]
 /** the batch route of each kind that is posted in runs (≤500 a batch) */
 const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch', t: '/threads/events' }
 
@@ -324,6 +334,11 @@ const RETRYABLE_4XX = new Set([401, 403, 408, 425, 429])
 const HOUR = 3600_000
 const READ_WINDOW = 1 << 20          // bytes read from the cursor per pass
 
+/** what Onsen said in an error answer ({error: {code, message}}, or older shapes) */
+function callSaid(j: any): string {
+  const e = j?.error
+  return String((e && typeof e === 'object' ? e.message ?? e.code : e) ?? j?.detail ?? '').slice(0, 300) || 'no reason given'
+}
 export class OnsenClient {
   readonly spool: string
   readonly spoolOld: string
@@ -347,6 +362,9 @@ export class OnsenClient {
   private appendWarnAt = 0
   private authWarnAt = 0
   private observers: Array<(line: SpoolLine) => void> = []
+  /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
+  private callFates = new Map<string, CallLineFate>()
+  private callWaits = new Map<string, Array<(f: CallLineFate) => void>>()
   readonly stats = { recorded: 0, posted: 0, duplicates: 0, rejected: 0, last_ok_at: null as string | null, last_error: null as string | null,
     lines_drawn: 0, lines_lifted: 0, lines_spooled: 0, edits_delivered: 0, deliveries_recorded: 0, status_recorded: 0, form_acks_spooled: 0, wake_recorded: 0,
     thread_events: 0, thread_conflicts: 0, calls_spooled: 0, calls_put: 0, calls_unchanged: 0 }
@@ -378,6 +396,68 @@ export class OnsenClient {
   }
   /** WO-175: one moment of a Call (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state when the spool reaches it. false = not spooled */
   recordCall(c: CallStateLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
+  /** WO-175 (Chiron 05:55Z): wait for what Onsen says to Call line `idem` (spooled already): the spool is tried at once and three more times within
+   *  `ms`, whatever its backoff, as btcc-receipt does. A line sent before keeps its fate; one still unsent after `ms` stays in the spool (pending) */
+  callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS): Promise<CallLineFate> {
+    const known = this.callFates.get(idem)
+    if (known) return Promise.resolve(known)
+    if (!this.cfg.record) return Promise.resolve({ fate: 'pending', why: 'recording to Onsen is off' })
+    if (!this.cfg.credential()) return Promise.resolve({ fate: 'nocred', why: this.noCredText() })
+    return new Promise(resolve => {
+      const timers: Array<ReturnType<typeof setTimeout>> = []
+      let done = false
+      const finish = (f: CallLineFate): void => {
+        if (done) return
+        done = true
+        for (const t of timers) clearTimeout(t)
+        const ws = (this.callWaits.get(idem) ?? []).filter(w => w !== finish)
+        if (ws.length) this.callWaits.set(idem, ws); else this.callWaits.delete(idem)
+        resolve(f)
+      }
+      this.callWaits.set(idem, [...(this.callWaits.get(idem) ?? []), finish])
+      for (const at of CALL_RETRY_AT) if (at < ms) timers.push(setTimeout(() => { if (!done) void this.syncNow(true) }, at))
+      timers.push(setTimeout(() => finish({ fate: 'pending', why: this.stats.last_error ?? 'Onsen did not answer' }), ms))
+      for (const t of timers) (t as any).unref?.()
+    })
+  }
+  private settleCall(idem: string, f: CallLineFate): void {
+    this.callFates.set(idem, f)
+    if (this.callFates.size > 2_000) this.callFates.delete(this.callFates.keys().next().value!)
+    for (const w of this.callWaits.get(idem) ?? []) { try { w(f) } catch {} }
+  }
+  private noCredText(): string { return `no mesh credential${this.cfg.credentialWhere ? ` at ${this.cfg.credentialWhere}` : ''}` }
+  /** WO-175 (Chiron 05:55Z): run `run`'s Call in Onsen (this agent's own Calls), tried again while Onsen does not answer or answers 5xx, within `ms` */
+  async findRunCall(run: string, ms = CALL_RECEIPT_WAIT_MS): Promise<RunCallLookup> {
+    if (!this.cfg.credential()) return { fate: 'nocred', why: this.noCredText() }
+    const r = await this.retried(`/v1/calls?ref_kind=run&ref_value=${encodeURIComponent(run)}&limit=5`, ms)
+    if ('fate' in r) return r
+    const items = Array.isArray(r.json?.items) ? r.json.items.filter((c: any) => c && c.id != null) : []
+    return items.length ? { found: { id: String(items[0].id), state: items[0].state ?? null, result: items[0].result ?? null } } : { none: true }
+  }
+  /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
+  async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown } | null> {
+    const r = await this.retried(`/v1/calls/${encodeURIComponent(id)}`, ms).catch(() => null)
+    if (!r || 'fate' in r) return null
+    const c = r.json?.data ?? r.json
+    return c && typeof c === 'object' ? { state: c.state ?? null, result: c.result ?? null } : null
+  }
+  /** a GET tried at CALL_RETRY_AT while Onsen does not answer or answers 5xx (408, 429), all within `ms`: the 2xx answer, or a fate */
+  private async retried(path: string, ms: number): Promise<{ status: number; json: any } | CallLineFate> {
+    const t0 = Date.now()
+    let why = 'Onsen did not answer'
+    for (let n = 0; n < CALL_RETRY_AT.length; n++) {
+      const wait = t0 + CALL_RETRY_AT[n]! - Date.now()
+      if (wait > 0) await new Promise(r => setTimeout(r, wait))
+      const left = t0 + ms - Date.now()
+      if (left <= 100) break
+      const r = await this.request('GET', path, undefined, Math.min(3_000, left - 50)).catch(e => ({ status: 0, json: { error: errText(e) } }))
+      if (!r) return { fate: 'nocred', why: this.noCredText() }
+      if (r.status >= 200 && r.status < 300) return r
+      if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) return { fate: 'refused', status: r.status, said: callSaid(r.json) }
+      why = r.status ? `GET ${path.split('?')[0]} answered HTTP ${r.status}` : `GET ${path.split('?')[0]} unreachable (${String(r.json?.error ?? '').slice(0, 120)})`
+    }
+    return { fate: 'pending', why }
+  }
   /** WO-145: form answers queued for the main whose ack Onsen did not take directly: POST /forms/ack when the spool reaches it. false = not spooled */
   recordFormAck(ids: number[]): boolean {
     const ok = ids.length > 0 && this.append({ k: 'a', r: { ids, at: new Date().toISOString() } })
@@ -613,9 +693,13 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300) {
           const st = r.json?.data?.state
           if (st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++
+          this.settleCall(c.idem, { fate: 'took', state: st ?? null })
         }
         // a step Onsen already has past (it took a reply, or a lane's exit row, first) or a Call that is over: refused as a whole, not retried
-        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${String(r.json?.error?.message ?? r.json?.error ?? r.json?.detail ?? '').slice(0, 200)}`)
+        else if (r.status >= 400 && r.status < 500 && !RETRYABLE_4XX.has(r.status)) {
+          this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${callSaid(r.json)}`)
+          this.settleCall(c.idem, { fate: 'refused', status: r.status, said: callSaid(r.json) })
+        }
         else return this.failStatus(r, `/v1/calls/${id}/state`)
         this.writeCursor(t.end); this.ok(); i++
         continue
