@@ -14,7 +14,7 @@ import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
 import { drainLeftoverDoorbells } from './hub-sync.ts'
-import { callInboxTool, feedPath, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, laneOpenQuery, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
+import { callInboxTool, feedPath, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, isReplyRef, laneOpenQuery, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { ONSEN_TEXT_DEFAULT, withOnsenFormat } from './fleet-text.ts'
 import { MailEvents, decisionEvent, WITHIN_S as MAIL_DUE_WITHIN_S } from './mail-events.ts'
 import { INBOX_TEXT } from './inbox-text.ts'
@@ -2118,7 +2118,7 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
       }
       // 002k (K2): disclosure check before anything is sent, as for a lane's reply_agent; a refusal is an isError result (callInboxTool: not "delivered").
       // 1.34.2: a call that carries reply_to answers that call
-      { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null); if (refused) return refused }
+      { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null || isReplyRef(args.reply_to)); if (refused) return refused }   // WO-175: a reply named by event id / did too
       let minted: number | undefined, delivered = false
       const turnId = await Lanes.mainTurnId()                                // WO-172: the main's turn, as the tg daemon has it
       // WO-175 item 2: the Call it answers, from the reply_to the main gave as it gave it (a BTCC number, an event id, its delivery's did), asked of the router

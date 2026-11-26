@@ -385,6 +385,13 @@ describe('send_to_agent (three lines)', () => {
     expect(r.calls[0].text).toBe('因為：Joey 在等\n看一下')
     await sendToAgent({ line: 'call', to: 'chiron', reply_to: '9651', text: '好了' }, r.d, true)
     expect(r.calls[1]).toMatchObject({ text: '好了', replyTo: 9651, noReply: true })
+    // WO-175 (Chiron 10:27Z): an item with no BTCC number is answered by its event id or its delivery's did, a reply alike (no because, no_reply)
+    await sendToAgent({ line: 'call', to: 'chiron', reply_to: 'mesh-1795681792065-0cc1', text: '161' }, r.d, true)
+    expect(r.calls[2]).toMatchObject({ text: '161', noReply: true })
+    expect(r.calls[2].replyTo).toBeUndefined()
+    await sendToAgent({ line: 'call', to: 'chiron', reply_to: 'm-mwxe4iq6-9', text: '收到結果' }, r.d, true)
+    expect(r.calls[3]).toMatchObject({ text: '收到結果', noReply: true })
+    expect(msg(await sendToAgent({ line: 'call', to: 'chiron', reply_to: 'not an id', text: 'x' }, r.d, true))).toBe(BECAUSE_MISSING)
   })
   test('feed: a wall post, text as the body', async () => {
     const r = mk()

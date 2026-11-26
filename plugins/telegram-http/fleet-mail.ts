@@ -253,6 +253,11 @@ function intId(v: unknown): number | null {
   const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10)
   return Number.isInteger(n) && n > 0 ? n : null
 }
+/** WO-175 item 2 (Chiron 10:27Z): a call's reply_to names what it answers in any of the three forms an agent sees: a BTCC number, an event id (mesh-…),
+ *  a delivery's did (m-…). Each is a reply alike: no `because`, marked no_reply; the router finds the Call from it (lanes.ts callAnswered) */
+export function isReplyRef(v: unknown): boolean {
+  return intId(v) != null || /^(mesh|m)-[A-Za-z0-9_-]{1,80}$/.test(String(v ?? '').trim())
+}
 
 function errText(r: { status: number; json: any }): string {
   const d = r.json?.detail
@@ -330,8 +335,8 @@ export async function callTool(name: string, args: Record<string, unknown>, deps
       const body = String(args.text ?? '').trim()
       if (!to || !body) return text('call: to 和 text 都要填', true)
       const replyTo = intId(args.reply_to) ?? undefined
-      // 回呼叫的那一則也是呼叫，而且到此為止（spec #t-call）
-      const r = await deps.call(to, body, replyTo, replyTo != null, args.op ? String(args.op) : undefined)
+      // 回呼叫的那一則也是呼叫，而且到此為止（spec #t-call）；WO-175: reply_to as an event id or a did is a reply as well
+      const r = await deps.call(to, body, replyTo, isReplyRef(args.reply_to), args.op ? String(args.op) : undefined)
       return text(r, !SENT_RE.test(r))
     }
     case 'send_mail': {
@@ -586,8 +591,7 @@ export async function sendToAgent(args: Record<string, unknown>, deps: FleetDeps
     return callTool('send_mail', { to: args.to, title: args.title, body: args.text, ask: args.ask, deadline: args.deadline, no_reply: args.no_reply, op: args.op }, deps)
   }
   if (line === 'call') {
-    const replyTo = intId(args.reply_to)
-    if (!has(args.because) && replyTo == null) return text(BECAUSE_MISSING, true)
+    if (!has(args.because) && !isReplyRef(args.reply_to)) return text(BECAUSE_MISSING, true)
     if (!has(args.to) || !has(args.text)) return text('line=call 要填 to、because、text。', true)
     // the receiver reads why it can't wait before anything else: one line ahead of the text
     const body = has(args.because) ? `因為：${String(args.because).trim()}\n${String(args.text).trim()}` : String(args.text).trim()
