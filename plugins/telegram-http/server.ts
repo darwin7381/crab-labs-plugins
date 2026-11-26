@@ -500,9 +500,20 @@ async function sendOnsenFirst(o: { chat: string; sender: string; text: string; r
  *  most every 30 s): a person's Telegram message, past the allowlist, is written into Onsen to be delivered from there (deliver: true) and reaches the
  *  router when its person_message comes back (POST /onsen/person, from this agent's agent-inbox daemon). Recording on, the Telegram daemon, and Onsen
  *  ≥ 0.33.0 (the version read the first time the switch is on, then every 10 min; unknown or older: the path before) */
+/** WO-197: ONSEN_INBOUND names this agent AND it has an agent-inbox partner (LANES_INBOX_PORT; a roamer has none: off whatever the list says) */
+const INBOX_PARTNER = OnsenInbound.hasInboxPartner(process.env)
+let inboundNoPartnerSaid = false
+function inboundSwitch(): boolean {
+  const v = liveSetting('ONSEN_INBOUND')
+  if (!INBOX_PARTNER && OnsenInbound.inboundOn(v, ONSEN_AGENT) && !inboundNoPartnerSaid) {
+    inboundNoPartnerSaid = true
+    log('info', 'onsen inbound: ONSEN_INBOUND names this agent but it has no agent-inbox daemon (LANES_INBOX_PORT unset): off here (the path before)')
+  }
+  return OnsenInbound.inboundEffective(v, ONSEN_AGENT, INBOX_PARTNER)
+}
 async function onsenInboundNow(): Promise<boolean> {
   try {
-    if (!onsen?.cfg.record || INBOX_ONLY || !onsenVersion || !OnsenInbound.inboundOn(liveSetting('ONSEN_INBOUND'), ONSEN_AGENT)) return false
+    if (!onsen?.cfg.record || INBOX_ONLY || !onsenVersion || !inboundSwitch()) return false
     onsenVersion.start()
     await onsenVersion.ensure(3_000)
     return onsenVersion.version != null && OnsenFirst.versionAtLeast(onsenVersion.version, OnsenInbound.MIN_ONSEN)
@@ -4069,7 +4080,7 @@ async function handleInbound(
   const msgId = ctx.message?.message_id
   // WO-194 (ONSEN_INBOUND): the message is written into Onsen to be delivered from there; it reaches the router when it comes back (finishInbound).
   // A permission reply, and a slash text while the control plane or the roamer is on (it may be theirs), go the way they went before.
-  const viaOnsen = msgId != null && OnsenInbound.inboundOn(liveSetting('ONSEN_INBOUND'), ONSEN_AGENT) && !PERMISSION_REPLY_RE.test(text)
+  const viaOnsen = msgId != null && inboundSwitch() && !PERMISSION_REPLY_RE.test(text)
     && !((isControlEnabled() || isRoamerEnabled()) && text.trim().startsWith('/')) && await onsenInboundNow()
   // Onsen (WO-139): the human's message, recorded once it passed the gate and before anything routes it (main or a lane alike). Its own file only, never
   // the replied-to message's; a voice note is recorded below, with its transcript.
@@ -5952,7 +5963,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
           // WO-192: the switch now, Onsen's version as last read, A / Telegram / resend counts
           ...(onsenFirst && onsenVersion ? { first: { on: OnsenFirst.firstOn(liveSetting('ONSEN_FIRST'), ONSEN_AGENT), ...onsenVersion.health(), ...onsenFirst.stats } } : {}),
           // WO-194: a person's message written into Onsen and delivered from there
-          ...(inboundWriter && inboundStore ? { inbound: { on: OnsenInbound.inboundOn(liveSetting('ONSEN_INBOUND'), ONSEN_AGENT), write: inboundWriter.health(), back: inboundStore.health() } } : {}) } } : {}),
+          ...(inboundWriter && inboundStore ? { inbound: { on: inboundSwitch(), partner: INBOX_PARTNER, write: inboundWriter.health(), back: inboundStore.health() } } : {}) } } : {}),
         max_queue_depth: Math.max(0, ...[...memQueue.values()].map(q => q.length)),
         last_update_id: lastUpdateId,
         mcp_auth: mcpGate.stats,

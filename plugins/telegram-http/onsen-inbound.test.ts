@@ -3,7 +3,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { InboundStore, InboundWriter, inboundOn, heldText, type Job, type Facts } from './onsen-inbound.ts'
+import { InboundStore, InboundWriter, inboundOn, inboundEffective, hasInboxPartner, heldText, type Job, type Facts } from './onsen-inbound.ts'
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const until = async (fn: () => boolean, ms = 5000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await sleep(10) } return false }
@@ -19,6 +19,16 @@ test('the switch: off by default; a list of agents or *', () => {
   expect(inboundOn('lab-relay', 'adam')).toBe(false)
   expect(inboundOn('*', 'adam')).toBe(true)
   expect(heldText('adam')).toBe('Onsen 現在連不上，這一則還沒交給 adam；連上會自動補交，不用重傳。')
+})
+
+test('WO-197: the switch takes effect only with an agent-inbox partner (LANES_INBOX_PORT): a roamer named by * stays on the path before', () => {
+  expect(hasInboxPartner({ LANES_INBOX_PORT: '17680' })).toBe(true)
+  for (const v of [undefined, '', '0', 'x']) expect(hasInboxPartner({ LANES_INBOX_PORT: v })).toBe(false)
+  expect(inboundEffective('*', 'roamer-mbp', false)).toBe(false)
+  expect(inboundEffective('roamer-mbp', 'roamer-mbp', false)).toBe(false)
+  expect(inboundEffective('*', 'adam', true)).toBe(true)
+  expect(inboundEffective('0', 'adam', true)).toBe(false)
+  expect(inboundEffective('lab-relay', 'adam', true)).toBe(false)
 })
 
 test('the store: facts kept on disk until delivered; then remembered (a second hand-over is a duplicate), across a restart', () => {

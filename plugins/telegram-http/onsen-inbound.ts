@@ -49,6 +49,15 @@ export function inboundOn(value: string | undefined, agent: string): boolean {
   return list.includes('*') || list.includes(agent)
 }
 
+/** WO-197 (sonn 14:4xZ): the switch takes effect only on a daemon that has an agent-inbox partner: the daemon its person_message items come back
+ *  from. The one signal is LANES_INBOX_PORT (that partner's loopback port, set on every Telegram daemon whose agent has an agent-inbox daemon; the
+ *  same variable mailbox_decide reads). Without it (a roamer: lanes off, no agent-inbox) a message written with deliver would only come back through
+ *  the 20 s fallback (A.1), so `*` (or its name) leaves such a daemon on the path before. */
+export const hasInboxPartner = (env: Record<string, string | undefined>): boolean => Number(env.LANES_INBOX_PORT ?? 0) > 0
+export function inboundEffective(value: string | undefined, agent: string, partner: boolean): boolean {
+  return partner && inboundOn(value, agent)
+}
+
 /** what the arrival knew of one Telegram message (all the <channel> tag is built from; plain JSON, kept on disk) */
 export type Facts = {
   chat_id: string
