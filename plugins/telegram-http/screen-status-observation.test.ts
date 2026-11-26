@@ -63,23 +63,63 @@ describe("Chiron's table, field by field", () => {
     expect(cmp).toMatchObject({ activity: 'running', turn: { id: `turn-${NOW}`, started_at: new Date(NOW).toISOString(), trigger: { kind: 'other' } }, doing: { kind: 'compacting', tool: null } })
     for (const v of [V('idle'), V('interrupted'), V('idle_background_running')]) expect(main(obs(v, ST, prog('idle'), F({ turn: TURN })))).toMatchObject({ activity: 'idle', turn: null, blockers: [] })
   })
-  test('blockers (criterion 10): a permission prompt in a turn: paused, permission; /model opened while idle: idle, input_required, model_picker, assignee duty-officer when it takes that menu', () => {
-    const duty = (m: string) => m === 'permission' || m === 'model_picker'
-    const perm = main(obs(V('waiting_for_human', 'permission'), ST, prog('busy', TOOL), F({ turn: TURN, dutyHandles: duty })))
-    expect(perm).toMatchObject({ activity: 'paused', turn: TURN, doing: null, blockers: [{ reason: 'permission', menu_kind: 'permission', assignee: 'duty-officer', action_id: null, until: null, summary: '等待權限核准' }] })
-    const model = main(obs(V('waiting_for_human', 'model_picker'), MENU, prog('idle', { dialog_open: true }), F({ turn: null, dutyHandles: duty })))
+  test('blockers (criterion 10): a permission prompt in a turn: paused, permission, the person it went to on Telegram; /model opened while idle: idle, input_required, model_picker, the duty officer while it watches the pane', () => {
+    const perm = main(obs(V('waiting_for_human', 'permission'), ST, prog('busy', TOOL), F({ turn: TURN, dutyWatches: true, person: 'joey-test' })))
+    expect(perm).toMatchObject({ activity: 'paused', turn: TURN, doing: null, blockers: [{ reason: 'permission', menu_kind: 'permission', assignee: 'joey-test', action_id: null, until: null, summary: '等待權限核准' }] })
+    const model = main(obs(V('waiting_for_human', 'model_picker'), MENU, prog('idle', { dialog_open: true }), F({ turn: null, dutyWatches: true, person: 'joey-test' })))
     expect(model).toMatchObject({ activity: 'idle', turn: null, blockers: [{ reason: 'input_required', menu_kind: 'model_picker', assignee: 'duty-officer', summary: '選單等待選擇' }] })
-    // a menu the duty officer does not take (or it does not watch this pane): Joey's
-    expect(main(obs(V('waiting_for_human', 'resume_picker'), MENU, prog('idle'), F({ dutyHandles: duty }))).blockers[0]).toMatchObject({ reason: 'input_required', menu_kind: 'resume_picker', assignee: 'joey' })
-    expect(main(obs(V('waiting_for_human', 'model_picker'), MENU, prog('idle'), F())).blockers[0].assignee).toBe('joey')
     expect(main(obs(V('waiting_for_human', 'usage_limit_options'), MENU, prog('idle'), F())).blockers[0]).toMatchObject({ reason: 'usage_limit', menu_kind: 'usage_limit_options' })
     // no verdict (Jev down): Claude Code's registry says waiting for a permission prompt in a turn / a dialog open outside one
-    expect(main(obs(null, null, prog('waiting', { waitingFor: 'permission prompt', ...TOOL }), F({ turn: TURN, dutyHandles: duty })))).toMatchObject({ activity: 'paused', blockers: [{ reason: 'permission', menu_kind: 'permission', assignee: 'duty-officer' }] })
-    expect(main(obs(null, null, prog('idle', { dialog_open: true }), F()))).toMatchObject({ activity: 'idle', blockers: [{ reason: 'input_required', menu_kind: 'other', assignee: 'joey' }] })
-    // the wall: paused in a turn, idle out of one; until = the wall's time
+    expect(main(obs(null, null, prog('waiting', { waitingFor: 'permission prompt', ...TOOL }), F({ turn: TURN, dutyWatches: true, person: 'joey-test' })))).toMatchObject({ activity: 'paused', blockers: [{ reason: 'permission', menu_kind: 'permission', assignee: 'joey-test' }] })
+    expect(main(obs(null, null, prog('idle', { dialog_open: true }), F({ dutyWatches: true })))).toMatchObject({ activity: 'idle', blockers: [{ reason: 'input_required', menu_kind: 'other', assignee: 'duty-officer' }] })
+    // the wall: paused in a turn, idle out of one; until = the wall's time; no menu: nobody
     const wall = { walled: { until: '2026-11-26T03:00:00.000Z', kind: 'session' } }
-    expect(main(obs(V('working'), ST, prog('busy', { ...wall, ...TOOL }), F({ turn: TURN })))).toMatchObject({ activity: 'paused', blockers: [{ reason: 'usage_limit', until: '2026-11-26T03:00:00.000Z', menu_kind: null, assignee: null }] })
-    expect(main(obs(V('usage_limit', 'usage_limit_options'), MENU, prog('idle', wall), F()))).toMatchObject({ activity: 'idle', blockers: [{ reason: 'usage_limit', menu_kind: 'usage_limit_options', assignee: 'joey' }] })
+    expect(main(obs(V('working'), ST, prog('busy', { ...wall, ...TOOL }), F({ turn: TURN, dutyWatches: true })))).toMatchObject({ activity: 'paused', blockers: [{ reason: 'usage_limit', until: '2026-11-26T03:00:00.000Z', menu_kind: null, assignee: null }] })
+    expect(main(obs(V('usage_limit', 'usage_limit_options'), MENU, prog('idle', wall), F({ dutyWatches: true })))).toMatchObject({ activity: 'idle', blockers: [{ reason: 'usage_limit', menu_kind: 'usage_limit_options', assignee: 'duty-officer' }] })
+  })
+  test('WO-180 (Chiron 04:42Z, 1, 2): every menu is the duty officer\'s first while it watches the pane; once it asked, the person asked with that Action; not watched: the person (access.json\'s, never a fixed name); a permission prompt: the person it went to on Telegram, with its Action', () => {
+    const menus = ['model_picker', 'other', 'resume_picker', 'trust_folder', 'plan_or_question', 'login', 'usage_limit_options'] as const
+    for (const m of menus) {
+      const b = main(obs(V('waiting_for_human', m), MENU, prog('idle'), F({ dutyWatches: true, person: 'joey-test' }))).blockers[0]
+      expect([m, b.assignee, b.action_id]).toEqual([m, 'duty-officer', null])
+      expect(main(obs(V('waiting_for_human', m), MENU, prog('idle'), F({ dutyWatches: false, person: 'joey-test' }))).blockers[0].assignee).toBe('joey-test')
+    }
+    expect(main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), F())).blockers[0].assignee).toBe('joey')          // no person given: the owner, as assigneesOf
+    // the duty officer asks a person about /theme: from then on that person and the question's Action; the same blocker (id, since)
+    const mem = new Since(); let now = NOW
+    const f = (o: RecordFacts = {}) => F({ dutyWatches: true, person: 'joey-test', since: (k, v) => mem.at(k, v, now), now, ...o })
+    const before = main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f())).blockers[0]
+    now += 9_000
+    const asked = (m: string) => m === 'other' ? { action_id: '22', assignee: 'joey-test' } : null
+    const after = main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f({ asked }))).blockers[0]
+    expect([before.assignee, before.action_id]).toEqual(['duty-officer', null])
+    expect(after).toMatchObject({ id: before.id, since: before.since, assignee: 'joey-test', action_id: '22' })
+    expect(main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f({ asked: () => ({ action_id: '23', assignee: null }) }))).blockers[0].assignee).toBe('joey-test')   // asked nobody named: the person
+    expect(main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f({ asked: () => { throw new Error('x') } }))).blockers[0]).toMatchObject({ assignee: 'duty-officer', action_id: null })
+    // a permission prompt: the person it went to on Telegram and its own Action, the duty officer watching or not, asked or not
+    const perm = main(obs(V('waiting_for_human', 'permission'), ST, prog('busy', TOOL), f({ turn: TURN, asked: () => ({ action_id: '99', assignee: 'x' }), actionFor: m => m === 'permission' ? '40' : null }))).blockers[0]
+    expect(perm).toMatchObject({ reason: 'permission', assignee: 'joey-test', action_id: '40' })
+  })
+  test('WO-180 (Chiron 04:42Z, 3; acceptance 10): /theme then /status: two blockers, a new id and since for each, a record with none between them; one menu across records keeps its id and since', () => {
+    const mem = new Since(); let now = Date.parse('2026-11-26T04:19:48.245Z')
+    const f = () => F({ dutyWatches: true, person: 'joey-test', since: (k, v) => mem.at(k, v, now), now })
+    const theme = main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f())).blockers[0]
+    now += 4_000
+    expect(main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f())).blockers[0]).toMatchObject({ id: theme.id, since: theme.since })   // the same menu
+    now = Date.parse('2026-11-26T04:20:12.000Z')
+    expect(main(obs(V('idle'), ST, prog('idle'), f())).blockers).toEqual([])                                                 // the duty officer pressed Esc
+    now = Date.parse('2026-11-26T04:22:14.411Z')
+    const status = main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), f())).blockers[0]
+    expect(theme).toMatchObject({ since: '2026-11-26T04:19:48.245Z', assignee: 'duty-officer' })
+    expect(status).toMatchObject({ since: '2026-11-26T04:22:14.411Z', assignee: 'duty-officer' })
+    expect(status.id).not.toBe(theme.id)
+    // statusOf's own view between them (no verdict, nothing open) ends it too; so does the main going offline
+    const a = main(obs(null, null, prog('idle', { dialog_open: true }), f())).blockers[0]
+    now += 30_000
+    obs(null, null, prog('offline', { reason: 'pid_gone' }), f())
+    now += 1_000
+    const b = main(obs(null, null, prog('idle', { dialog_open: true }), f())).blockers[0]
+    expect([a.since === status.since, b.since === new Date(now).toISOString(), b.id !== a.id]).toEqual([true, true, true])
   })
   test('turn and trigger (criterion 9) come from the program: Joey\'s message, a thread, a schedule; last_turn as it ended; the screen\'s Interrupted marks it interrupted (criterion 12)', () => {
     const thread: TurnFact = { ...TURN, trigger: { kind: 'thread', thread_id: 'lab-relay#t-aa01' } }

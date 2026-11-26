@@ -20,6 +20,7 @@ import { checkObservation } from './test-fixtures/status-v1-check.ts'
 
 const HAS_TMUX = spawnSync('tmux', ['-V'], { encoding: 'utf8' }).status === 0
 const JOEY = 1828
+const TEST_ACCOUNT = 6736970916                          // WO-180 (Chiron 04:42Z, 2): adam's access.json allows the test account: its blocker's person is joey-test
 const CRED = 'mesh_SCREENDAEMONsecretSECRETsecret01234'
 const R = '─'.repeat(60)
 const IDLE = ['⏺ Done.', '', '✻ Worked for 17s · done 1:37 AM', '', R, '❯ ', R, '  Opus 5.5 · 7d 71%', '  ⏵⏵ bypass permissions on'].join('\n')
@@ -97,7 +98,7 @@ beforeAll(async () => {
   // the duty officer off for every pane; the stand-in pane runs `sleep`, which counts as Claude Code here (its config's claude_cmds)
   mkdirSync(join(root, 'd', 'home', '.claude', 'duty-officer'), { recursive: true })
   writeFileSync(join(root, 'd', 'home', '.claude', 'duty-officer', 'config.json'), JSON.stringify({ enabled: [], claude_cmds: ['sleep'] }))
-  d = await startTgDaemon(api, join(root, 'd'), JOEY, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'),
+  d = await startTgDaemon(api, join(root, 'd'), TEST_ACCOUNT, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'),
     ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0', CHANNEL_BOT_TMUX_SESSION: 'jevtest-adam', ...tmuxEnv, JEV_SCREEN: 'adam', JEV_SCREEN_QUESTIONS: join(root, 'questions.json'),
     TYPESAFE_API_KEY: 'test-key-not-real', TYPESAFE_KEY_FILE: '', TYPESAFE_BASE_URL: `http://127.0.0.1:${jevPort}` })
 }, 40000)
@@ -147,14 +148,15 @@ test.skipIf(!HAS_TMUX)("JEV_SCREEN on: Onsen gets Jev's reading of the pane, it 
   expect(checkObservation(hz.observation)).toEqual([])
   expect(hz.observation).toMatchObject({ presence: 'offline', presence_reason: 'disconnected', lifecycle: 'ready', evidence: { source: 'classifier', confidence: 0.9 } })
   expect(hz.observation.sessions.map((x: any) => x.activity)).toEqual(['unknown'])
-  // a stream opens (the main connected): online; the /model menu open with no turn: the main idle, blocked by the menu (the duty officer is off here: Joey's)
+  // a stream opens (the main connected): online; the /model menu open with no turn: the main idle, blocked by the menu (the duty officer is off here: the
+  // person's, access.json's as the Actions' assignees: joey-test, not a fixed joey)
   await d!.client()
   expect(await until(async () => (await fetch(`http://127.0.0.1:${d!.port}/healthz`).then(r => r.json()) as any).onsen.status.observation?.presence === 'online', 10000)).toBe(true)
   const ob = (await fetch(`http://127.0.0.1:${d!.port}/healthz`).then(r => r.json()) as any).onsen.status.observation
   expect(checkObservation(ob)).toEqual([])
   expect(ob).toMatchObject({ presence: 'online', presence_reason: null, lifecycle: 'ready', background: { agents: 0, shells: 0, tasks: 0, monitors: 0 }, queue: { pending: 0, unread_by_member: 0 } })
   expect(ob.sessions).toHaveLength(1)
-  expect(ob.sessions[0]).toMatchObject({ kind: 'main', activity: 'idle', turn: null, doing: null, blockers: [{ reason: 'input_required', menu_kind: 'model_picker', assignee: 'joey', action_id: null }] })
+  expect(ob.sessions[0]).toMatchObject({ kind: 'main', activity: 'idle', turn: null, doing: null, blockers: [{ reason: 'input_required', menu_kind: 'model_picker', assignee: 'joey-test', action_id: null }] })
   expect(ob.main_session_id).toBe(ob.sessions[0].id)
   // WO-169: the question bank: the idle screen and the menu, one line each, and the screens shown again add none
   const bank = () => lines(join(d!.ws, '.lanes', 'run', 'screen-verdicts.jsonl'))

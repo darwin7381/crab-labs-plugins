@@ -725,6 +725,8 @@ interface Ask {
   /** WO-176 r2 (CONTRACT §6 「畫面上同一個詢問只有一個 Action」): the Action is the channel's permission prompt's, not one of its own; its options are
    *  allow / deny (permOptionOf maps the ask's options) */
   action_shared?: 'permission'
+  /** WO-180 (Chiron 04:42Z, 1): the members the question went to (its Action's assignees, MenuActions.assignees of the chats it was sent to) */
+  assignees?: string[]
 }
 // ---------------------------------------------------------------- WO-176: the menus as Onsen Actions
 /** a menu's Action as an ask keeps it: the key it was made with, and Onsen's id and version once known */
@@ -1288,6 +1290,7 @@ export class DutyOfficer {
   private async openAction(a: Ask, chats: string[]): Promise<void> {
     const acts = this.d.actions
     if (!acts || !a.action_key || a.action_id) return
+    try { a.assignees = acts.assignees(chats) } catch {}                  // WO-180: whom it asked (a status blocker's assignee once the Action is there)
     // WO-176 r2: a question about a permission prompt the channel already made an Action for uses that Action (one per prompt on the screen), with the
     // people it asks joined to it
     if (a.menu_kind === 'permission' && acts.shared) {
@@ -1376,14 +1379,24 @@ export class DutyOfficer {
     return had
   }
   /** WO-176: the newest ask still open on this pane with an Action for this menu (a status blocker's action_id); null: none */
-  openActionFor(tmux: string, menu: string | null): string | null {
+  openActionFor(tmux: string, menu: string | null): string | null { return this.openAsk(tmux, menu)?.action_id ?? null }
+  /** WO-180 (Chiron 04:42Z, 1): the officer asked a person about the menu on this pane: that question's Action and the first person it went to (a
+   *  status blocker's assignee and action_id from then on); null: it asked nobody (the menu is the officer's own) */
+  openAskFor(tmux: string, menu: string | null): { action_id: string; assignee: string | null } | null {
+    const a = this.openAsk(tmux, menu)
+    if (!a?.action_id) return null
+    let who = a.assignees
+    if (!who?.length) { try { who = this.d.actions?.assignees(this.chatsFor(a)) } catch {} }   // an ask written before WO-180 kept no assignees
+    return { action_id: a.action_id, assignee: who?.[0] ?? null }
+  }
+  private openAsk(tmux: string, menu: string | null): Ask | null {
     let best: Ask | null = null
     for (const a of this.asks.values()) {
-      if (a.tmux !== tmux || a.closed || !a.action_id) continue
+      if (a.tmux !== tmux || a.closed || a.action_closed || !a.action_id) continue
       if (menu && a.menu_kind && a.menu_kind !== menu) continue
       if (!best || a.created >= best.created) best = a
     }
-    return best?.action_id ?? null
+    return best
   }
 
   private screenBlock(lines: string[], bundle?: Record<string, unknown>): string {

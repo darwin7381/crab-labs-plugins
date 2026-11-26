@@ -65,7 +65,7 @@ import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsA
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type MenuActions } from './duty-officer.ts'
-import { DUTY_MENUS, ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
 import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
@@ -1600,6 +1600,13 @@ function permCopiesDone(p: PermPrompt, behavior: 'allow' | 'deny', end: string):
     void Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg, `${cp.text}\n\n${label}\n${end}`, { reply_markup: { inline_keyboard: [] } }))
       .catch(e => log('warn', `permission edit ${cp.chat}/${cp.msg} (${end}) failed: ${e}`))
   }
+}
+/** WO-180 (Chiron 04:42Z, 2): the person the main's questions go to on Telegram, as an Onsen member: the permission prompt's recipients (access.json:
+ *  alertTo, else allowFrom) through Onsen.assigneesOf, the mapping every Action's assignees go through (lab-relay: joey-test). Read at most every 5 s */
+const personMemo = { at: 0, v: null as string | null }
+function mainPerson(): string | null {
+  if (Date.now() - personMemo.at > 5_000) { try { personMemo.v = Onsen.assigneesOf(opsRecipients(loadAccess()))[0] ?? null } catch {} ; personMemo.at = Date.now() }
+  return personMemo.v
 }
 /** WO-176: a status blocker's Action (screen-status.ts RecordFacts.actionFor): the newest open permission prompt's, else the duty officer's open ask on the
  *  main's pane for that menu; null: none */
@@ -4821,7 +4828,10 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     return { now, since: (k, val) => sinceMem.at(k, val, now), session_id: sid, turn: t ? { id: t.id, started_at: t.started_at, trigger: t.trigger } : null,
       turn_thread: t?.thread ?? null, last_turn: tap ? tap.lastTurn() : watch?.lastTurn() ?? null,
       queue: tap ? Lanes.mainQueueCounts() : facts.counts(), scheduleThread: th => Lanes.LANES_ON && Lanes.threadKeyKind(th) === 'schedule',
-      dutyHandles: m => DUTY_MENUS.has(m) && !!ownTmux && !!dutyOfficer?.handles(ownTmux), actionFor: m => openActionFor(m) }   // WO-176: actionFor
+      // WO-180 (Chiron 04:42Z): who a menu waits on (screen-status.ts assigned): the duty officer while it watches the pane, the person it asked once it
+      // asked (that question's Action), a permission prompt the person it went to on Telegram; the person is access.json's, as the Actions' assignees
+      dutyWatches: !!ownTmux && !!dutyOfficer?.handles(ownTmux), person: mainPerson(),
+      asked: m => ownTmux && dutyOfficer ? dutyOfficer.openAskFor(ownTmux, m) : null, actionFor: m => openActionFor(m) }   // WO-176: actionFor
   }
   onsenStatusCompute = currentStatus                                    // WO-157 / WO-169: the lanes' one state source (decideWake, 此刻, the same-matter gate, the Esc wrap-up)
   // WO-165 A (Joey TG chiron:2485; Chiron's WO-165 comment 18:26Z): JEV_SCREEN on for this agent (a comma list of names or `*`, as ONSEN_PULL; the plist's

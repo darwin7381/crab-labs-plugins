@@ -353,22 +353,27 @@ describe('helpers', () => {
   })
 })
 
-describe('status blockers name their Action (screen-status.ts RecordFacts.actionFor)', () => {
+describe('status blockers name their Action (screen-status.ts RecordFacts.actionFor / asked)', () => {
   const MENU = regions(['', '   Select model', '   ❯ 1. Default', '   Enter to set as default · Esc to cancel', ''].join('\n'))
   const V = (state: ScreenVerdict['state'], menu: ScreenVerdict['menu']): ScreenVerdict => ({ state, menu, p: 0.9, by: 'jev' })
   const prog = { state: 'idle' as const, detail: { queued_joey: 0, dialog_open: true }, last_activity_at: '2026-11-26T00:59:00.000Z' }
-  const f = (actionFor?: (m: string) => string | null) => ({ now: Date.parse('2026-11-26T01:00:00.000Z'), session_id: 'sess-1', ...(actionFor ? { actionFor } : {}) })
-  const blocker = (v: ScreenVerdict, af?: (m: string) => string | null) => {
-    const o = composeRecord(v, MENU, prog, f(af)).observation
-    expect(checkObservation(o)).toEqual([])
-    return o.sessions[0]!.blockers[0]!
+  const f = (o: Record<string, unknown> = {}) => ({ now: Date.parse('2026-11-26T01:00:00.000Z'), session_id: 'sess-1', ...o })
+  const blocker = (v: ScreenVerdict, o: Record<string, unknown> = {}) => {
+    const ob = composeRecord(v, MENU, prog, f(o)).observation
+    expect(checkObservation(ob)).toEqual([])
+    return ob.sessions[0]!.blockers[0]!
   }
-  test('the open Action the daemon made for that menu; none known, no actionFor, or actionFor throwing: null', () => {
+  test('a permission prompt: its own Action (actionFor); another menu: the duty officer\'s question about it (asked); none known, none given, or throwing: null', () => {
     const seen: string[] = []
-    expect(blocker(V('waiting_for_human', 'model_picker'), m => { seen.push(m); return m === 'model_picker' ? '41' : null })).toMatchObject({ menu_kind: 'model_picker', action_id: '41' })
-    expect(seen).toEqual(['model_picker'])
-    expect(blocker(V('waiting_for_human', 'resume_picker'), () => null).action_id).toBeNull()
+    expect(blocker(V('waiting_for_human', 'permission'), { actionFor: (m: string) => { seen.push(m); return m === 'permission' ? '40' : null } })).toMatchObject({ menu_kind: 'permission', action_id: '40' })
+    expect(seen).toEqual(['permission'])
+    expect(blocker(V('waiting_for_human', 'model_picker'), { asked: (m: string) => { seen.push(m); return m === 'model_picker' ? { action_id: '41', assignee: 'joey-test' } : null } }))
+      .toMatchObject({ menu_kind: 'model_picker', action_id: '41', assignee: 'joey-test' })
+    expect(seen).toEqual(['permission', 'model_picker'])
+    expect(blocker(V('waiting_for_human', 'model_picker'), { actionFor: () => '41' }).action_id).toBeNull()   // actionFor is the permission prompt's only
+    expect(blocker(V('waiting_for_human', 'resume_picker'), { asked: () => null }).action_id).toBeNull()
     expect(blocker(V('waiting_for_human', 'resume_picker')).action_id).toBeNull()
-    expect(blocker(V('waiting_for_human', 'login'), () => { throw new Error('x') }).action_id).toBeNull()
+    expect(blocker(V('waiting_for_human', 'login'), { asked: () => { throw new Error('x') } }).action_id).toBeNull()
+    expect(blocker(V('waiting_for_human', 'permission'), { actionFor: () => { throw new Error('x') } }).action_id).toBeNull()
   })
 })

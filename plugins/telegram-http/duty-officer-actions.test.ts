@@ -124,6 +124,23 @@ describe('the duty officer\'s menus as Actions', () => {
     expect(r.sent).toEqual([])                                         // Telegram: nothing, as before
   })
 
+  test('WO-180 (Chiron 04:42Z, 1): openAskFor names the question\'s Action and the first person it went to while it is open; its own press, another menu, or answered: none', async () => {
+    const own = fakeActions({ pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
+    const p = rig({ onKey: (k, x) => { if (k === 'Enter') x.pane = WORKING }, actions: own.acts })
+    await p.advance(0); await p.advance(9000); await p.settle()
+    expect(own.ops()).toEqual(['pressed', 'screen'])
+    expect(p.o.openAskFor('claude-x', 'model_picker')).toBeNull()                                            // its own press: no question to anybody
+    const g = fakeActions({ pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
+    const r = await asked(g)
+    expect(r.o.openAskFor('claude-x', 'model_picker')).toEqual({ action_id: '41', assignee: 'joey' })      // recipients 1828173984, 6736970916 → joey, joey-test
+    expect(r.askFile().assignees).toEqual(['joey', 'joey-test'])
+    expect(r.o.openAskFor('claude-x', 'resume_picker')).toBeNull()
+    expect(r.o.openAskFor('claude-y', 'model_picker')).toBeNull()
+    expect(r.o.openActionFor('claude-x', 'model_picker')).toBe('41')
+    await r.o.onTap(r.sent[0]!.buttons[0][0].callback_data, '@Advac777', 'joey')
+    expect(r.o.openAskFor('claude-x', 'model_picker')).toBeNull()                                            // answered: the menu is nobody's question now
+  })
+
   test('its own press that did not move the screen: no resolved Action (it goes to Joey as a question, with its own Action)', async () => {
     const f = fakeActions()
     const r = rig({ onKey: () => {}, actions: f.acts })

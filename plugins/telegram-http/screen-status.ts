@@ -269,15 +269,17 @@ export type RecordFacts = {
   queue?: { pending: number | null; unread_by_member: number | null } | null
   /** a lane's thread is a schedule's (its run's trigger is the schedule) */
   scheduleThread?: (thread: string) => boolean
-  /** the duty officer handles this menu on this pane (it watches the pane and its rule files cover the kind): assignee duty-officer, else joey */
-  dutyHandles?: (menu: Exclude<VerdictMenu, 'none'>) => boolean
-  /** WO-176: the open Action this daemon made for a menu of this kind on the main (a permission prompt, the duty officer's question); null: none */
+  /** WO-180 (Chiron 04:42Z, 1): the duty officer watches the main's pane: every menu on it is the officer's first */
+  dutyWatches?: boolean
+  /** WO-180 (Chiron 04:42Z, 2): the person the main's questions go to on Telegram, as an Onsen member: access.json's recipients through the mapping the
+   *  Actions' assignees use (Onsen.assigneesOf; lab-relay: joey-test). Not given: the owner (assigneesOf's own fallback) */
+  person?: string | null
+  /** WO-180 (Chiron 04:42Z, 1): the duty officer's open question to a person about a menu of this kind on the main (its Action, once Onsen made it, and
+   *  the first person asked); null: it asked nobody */
+  asked?: (menu: Exclude<VerdictMenu, 'none'>) => { action_id: string; assignee: string | null } | null
+  /** WO-176: the open Action of the main's permission prompt (the channel's; the duty officer's question about it uses the same one); null: none */
   actionFor?: (menu: Exclude<VerdictMenu, 'none'>) => string | null
 }
-/** the menus the duty officer's rule files cover (JCS duty-officer/aide_prompt.md 「Joey 的規矩」: 預設全放行 → a permission prompt; 不自動換成比較弱的
- *  模型、結果要等於登記的那一個 → the model picker). Every other menu (the trust prompt, a resume list, a login, a plan or question, the usage-limit
- *  options: 額度、帳號是 Joey 的資源決定, anything else) is Joey's. One table: a ruling Chiron adds for a kind is one line here */
-export const DUTY_MENUS: ReadonlySet<string> = new Set(['permission', 'model_picker'])
 const BLOCKER_SUMMARY: Record<BlockerReason, string> = { permission: '等待權限核准', input_required: '選單等待選擇', usage_limit: '用量受限，等待恢復',
   dependency: '等待外部作業', stalled: '回合停滯，沒有動靜' }
 const menuReason = (m: string | null): BlockerReason => m === 'permission' ? 'permission' : m === 'usage_limit_options' ? 'usage_limit' : 'input_required'
@@ -286,6 +288,24 @@ const registryMenu = (w: unknown): Exclude<VerdictMenu, 'none'> => /permission/i
 const isoMs = (ms: number): string => new Date(ms).toISOString()
 /** WO-176: a blocker's Action from the daemon (never fails the observation) */
 const actionOf = (f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): string | null => { if (!m || !f.actionFor) return null; try { return f.actionFor(m) ?? null } catch { return null } }
+/** the owner, when the facts name no person (Onsen.assigneesOf falls back to it the same way) */
+const OWNER = 'joey'
+/** WO-180 (Chiron 04:42Z, 1 and 2; CONTRACT §3 「有選單時必有明確成員」「同一選單的 action assignees 包含 blocker.assignee」): who a blocker of the main waits
+ *  on, and its Action. One rule:
+ *  - a permission prompt: the person it went to on Telegram, with that prompt's Action (its assignees are those people);
+ *  - any other menu: the duty officer, whatever the kind, while it watches the pane (it handles each one first: by a ruling, or by its leaning when none
+ *    covers it); once it asked a person, that question's Action and the person asked; the pane not watched: the person;
+ *  - no menu (a wall without its options, a stalled turn): nobody.
+ *  The person is never a fixed name: access.json's, as the Actions' assignees (lab-relay: joey-test) */
+function assigned(f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): { assignee: string | null; action_id: string | null } {
+  if (!m) return { assignee: null, action_id: null }
+  const person = f.person || OWNER
+  if (m === 'permission') return { assignee: person, action_id: actionOf(f, m) }
+  let q: { action_id: string; assignee: string | null } | null = null
+  try { q = f.asked?.(m) ?? null } catch {}
+  if (q?.action_id) return { assignee: q.assignee || person, action_id: q.action_id }
+  return { assignee: f.dutyWatches ? 'duty-officer' : person, action_id: null }
+}
 
 /** the one status record, from a verdict (null: no verdict) and the program's facts: the regions' counts and statusOf's (the process, the usage wall,
  *  the turn's start and tool, stuck). The order is fixed (Chiron WO-169, 00:29Z): offline (the process is gone: statusOf's view) → starting (the
@@ -366,10 +386,13 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
       const t = f.turn ?? (works ? { id: `turn-${startMs}`, started_at: isoMs(startMs), trigger: { kind: 'other' as const } } : null)
       const menu: Exclude<VerdictMenu, 'none'> | null = view.state === 'waiting' ? (v?.state === 'waiting_for_human' ? (v.menu === 'none' ? null : v.menu) : registryMenu(vd.waitingFor))
         : view.state === 'idle' && vd.dialog_open === true ? 'other' : null                 // statusOf: a dialog open outside a turn
+      // WO-180 (Chiron 04:42Z, 3): a blocker lasts while each record in a row shows it (the same reason and menu kind); a record with none ends it, so
+      // the next menu is a new blocker (a new id, since = when it appeared), not the one before it (/status took /theme's id and since across a
+      // `blockers: []` record). Its assignee and Action may change while it lasts (the duty officer asks a person): the same blocker
       const block = (reason: BlockerReason, menu_kind: Exclude<VerdictMenu, 'none'> | null, until: string | null = null): Blocker => {
         const at = since(`main.blocker`, `${reason}|${menu_kind ?? ''}`)
         return { id: `${mainId}:${reason}:${menu_kind ?? '-'}:${Date.parse(at).toString(36)}`, reason, since: at, until, menu_kind,
-          assignee: menu_kind ? (f.dutyHandles?.(menu_kind) ? 'duty-officer' : 'joey') : null, action_id: actionOf(f, menu_kind), summary: BLOCKER_SUMMARY[reason] }
+          ...assigned(f, menu_kind), summary: BLOCKER_SUMMARY[reason] }
       }
       if (starting) s.activity = 'idle'
       else if (view.state === 'walled') {
@@ -399,6 +422,7 @@ function observe(v: ScreenVerdict | null, st: Regions | null, prog: StatusView, 
     }
     sessions.push(s)
   }
+  if (!sessions[0]?.blockers.length) since('main.blocker', '')             // WO-180 (04:42Z, 3): no blocker in this record: the next one is new
   // one session per running lane run (statusOf's detail.lanes): running, its trigger its thread's (a schedule's run: schedule)
   for (const l of Array.isArray(pd.lanes) ? pd.lanes as Array<Record<string, any>> : []) {
     if (!l?.id || sessions.some(x => x.id === l.id)) continue
