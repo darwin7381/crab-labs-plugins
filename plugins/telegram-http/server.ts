@@ -492,7 +492,8 @@ function clearHooks(chat: string, msgId: number | undefined, fromId: string, her
         const t = setTimeout(() => {
           if (clearPressed.has(key)) return
           void Onsen.withDefaultSender('system:control', () =>
-            bot.api.editMessageReplyMarkup(chat, mid!, { reply_markup: n > 0 ? clearButton(n, msgId, at) : { inline_keyboard: [] } })).catch(() => {})
+            bot.api.editMessageReplyMarkup(chat, mid!, { reply_markup: n > 0 ? clearButton(n, msgId, at) : { inline_keyboard: [] } }))
+            .catch(err => log('warn', `onsen: /clear ${msgId} countdown edit (${n}) in chat ${chat} failed: ${err instanceof Error ? err.message : err}`))   // a 429 shows here
         }, (CLEAR_KEEP_S - n) * 1000)
         ;(t as any).unref?.()
       }
