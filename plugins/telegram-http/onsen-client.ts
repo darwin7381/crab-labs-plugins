@@ -1232,15 +1232,22 @@ export class OnsenActions {
   /** WO-176 r2: the newest open Action this agent asked that `pred` takes (GET /v1/actions?requested_by=<agent>&state=open, one try, 3 s), as a handle
    *  (its key `<prefix><id>`); null: none, or Onsen did not answer */
   async findOpen(agent: string, pred: (d: any) => boolean, keyPrefix = 'adopted:'): Promise<ActionHandle | null> {
+    const d = (await this.listOpen(agent)).filter(pred).sort((a, b) => Number(b.id) - Number(a.id))[0]
+    return d ? this.adoptData(d, keyPrefix) : null
+  }
+  /** WO-176 r4: this agent's open Actions as Onsen has them (one GET, 3 s; [] when Onsen does not answer) */
+  async listOpen(agent: string): Promise<any[]> {
     try {
       const r = await this.o.req('GET', `/v1/actions?requested_by=${encodeURIComponent(agent)}&state=open`, undefined, 3000)
       const items: any[] = r?.status === 200 && Array.isArray(r.json?.items) ? r.json.items : []
-      const d = items.filter(x => x && x.state === 'open' && /^\d{1,18}$/.test(String(x.id ?? '')) && pred(x)).sort((a, b) => Number(b.id) - Number(a.id))[0]
-      if (!d) return null
-      const h = this.adopt(String(d.id), Number(d.version) || 1, `${keyPrefix}${d.id}`)
-      this.take(h, d)
-      return h
-    } catch { return null }
+      return items.filter(x => x && x.state === 'open' && /^\d{1,18}$/.test(String(x.id ?? '')))
+    } catch { return [] }
+  }
+  /** a handle for an Action as Onsen gave it (listOpen's item) */
+  adoptData(d: any, keyPrefix = 'adopted:'): ActionHandle {
+    const h = this.adopt(String(d.id), Number(d.version) || 1, `${keyPrefix}${d.id}`)
+    this.take(h, d)
+    return h
   }
   /** who answered it in Onsen (resolved_by), for the closing line in Telegram; null: not known within 3 s */
   async resolver(id: string): Promise<string | null> {
@@ -1318,3 +1325,40 @@ export class OnsenActions {
   }
 }
 const errOf = (r: CallResult): string => { const e = r?.json?.error; return e && typeof e === 'object' ? `${e.code ?? ''} ${actionLine(e.message, 140)}`.trim() : actionLine(r?.json?.detail ?? '', 140) }
+
+// ------------------------------------------------------------------ WO-176 r4: which permission prompt the duty officer is pressing
+/** a channel permission prompt still open, as the binder sees it: its key (the prompt's Action key), its tool, its input preview, when its request came */
+export type OpenPrompt = { key: string; tool: string; preview: string; opened: number }
+const toolTail = (t: string): string => t.split('__').pop() ?? t
+const sameTool = (a: string, b: string): boolean => !!a && !!b && (a === b || toolTail(a) === toolTail(b))
+/** the waiting call's input fits a prompt's input preview (Claude Code's input_preview: JSON, maybe cut): each field the preview shows starts the same */
+export function previewFits(preview: string, input: unknown): boolean {
+  if (!input || typeof input !== 'object') return false
+  const inp = input as Record<string, unknown>
+  const head = (v: unknown): string => (typeof v === 'string' ? v : JSON.stringify(v) ?? '').replace(/…$/, '').slice(0, 60)
+  try {
+    const pv = JSON.parse(preview)
+    if (pv && typeof pv === 'object' && !Array.isArray(pv)) {
+      const keys = Object.keys(pv)
+      return keys.length > 0 && keys.every(k => k in inp && (head(inp[k]).startsWith(head(pv[k]).slice(0, 40)) || head(pv[k]).startsWith(head(inp[k]).slice(0, 40))))
+    }
+  } catch {}
+  const p = String(preview ?? '').slice(0, 60)
+  return !!p && JSON.stringify(inp).includes(p.slice(1, 40))
+}
+/** WO-176 r4 (Chiron 06:00Z: 「值班員決定要按的那一刻就記下它看的是哪一個詢問…按完只結那一個；找不到對應的就什麼都不記」): the permission prompt the duty
+ *  officer is looking at when it decides to press. Only prompts whose request came by `now` (the moment of deciding: a prompt the next screen brings is
+ *  never it) count; the tool call waiting in the transcript (the officer's evidence) picks by its tool, then by its input when several share the tool;
+ *  with no such evidence, only a single open prompt. One that fits: its key. None open: 'none' (nothing of the channel's to answer). Several, or
+ *  none that fits: 'unsure' (nothing is recorded on any of them; the channel's own close or cancel ends them) */
+export function bindPrompt(prompts: OpenPrompt[], waiting: { tool?: unknown; input?: unknown } | null | undefined, now: number): { key: string } | 'none' | 'unsure' {
+  const c = prompts.filter(p => p.opened <= now + 1000)
+  if (!c.length) return 'none'
+  const tool = typeof waiting?.tool === 'string' ? waiting.tool : ''
+  if (!tool) return c.length === 1 ? { key: c[0]!.key } : 'unsure'
+  const byTool = c.filter(p => sameTool(p.tool, tool))
+  if (byTool.length === 1) return { key: byTool[0]!.key }
+  if (!byTool.length) return 'unsure'
+  const byInput = byTool.filter(p => previewFits(p.preview, waiting?.input))
+  return byInput.length === 1 ? { key: byInput[0]!.key } : 'unsure'
+}

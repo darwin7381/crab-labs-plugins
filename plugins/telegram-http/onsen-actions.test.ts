@@ -3,7 +3,7 @@
 // a press in Telegram (resolve then applied; 409: applied with what was pressed), cancel (a version that moved: read once, tried again), retries on a
 // transport failure / 5xx / 429 only, never a throw, the stop switch; and the helpers (control payload, members, ONSEN_ACTIONS).
 import { describe, expect, test } from 'bun:test'
-import { OnsenActions, actionControlOf, actionsOn, assigneesOf, memberOfTg, type ActionReq } from './onsen-client.ts'
+import { OnsenActions, actionControlOf, actionsOn, assigneesOf, bindPrompt, memberOfTg, previewFits, type ActionReq, type OpenPrompt } from './onsen-client.ts'
 import { composeRecord, regions, type ScreenVerdict } from './screen-status.ts'
 import { checkObservation } from './test-fixtures/status-v1-check.ts'
 
@@ -375,5 +375,40 @@ describe('status blockers name their Action (screen-status.ts RecordFacts.action
     expect(blocker(V('waiting_for_human', 'resume_picker')).action_id).toBeNull()
     expect(blocker(V('waiting_for_human', 'login'), { asked: () => { throw new Error('x') } }).action_id).toBeNull()
     expect(blocker(V('waiting_for_human', 'permission'), { actionFor: () => { throw new Error('x') } }).action_id).toBeNull()
+  })
+})
+
+describe('r4: which permission prompt the duty officer is pressing (bindPrompt)', () => {
+  const t0 = Date.parse('2026-11-26T05:27:30.000Z')
+  const P = (key: string, tool: string, opened: number, preview = '{}'): OpenPrompt => ({ key, tool, preview, opened })
+  test('Chiron 06:00Z: react, then Bash, then reply: bound when it decides, each is the one on the screen; the next one\'s request comes after', () => {
+    const react = P('react', 'mcp__plugin_telegram-http_telegram-http__react', t0), bash = P('bash', 'Bash', t0 + 19_957), reply = P('reply', 'mcp__plugin_telegram-http_telegram-http__reply', t0 + 40_000)
+    // decides on react at 05:27:48.9 (Bash's request comes at 49.957, after its key at 49.378)
+    expect(bindPrompt([react], { tool: react.tool }, t0 + 18_900)).toEqual({ key: 'react' })
+    // had it looked after the key, the newest open would have been Bash: a prompt whose request came after the decision is never it
+    expect(bindPrompt([react, bash], { tool: react.tool }, t0 + 18_900)).toEqual({ key: 'react' })
+    expect(bindPrompt([bash], { tool: 'Bash', input: { command: 'touch /tmp/x' } }, t0 + 38_000)).toEqual({ key: 'bash' })
+    expect(bindPrompt([reply], { tool: reply.tool }, t0 + 60_000)).toEqual({ key: 'reply' })
+  })
+  test('the waiting tool picks (MCP names by their last part too); then its input among several of one tool; else unsure; nothing open: none', () => {
+    const a = P('a', 'Bash', t0, '{"command":"ls -la"}'), b = P('b', 'Bash', t0 + 1, '{"command":"rm -rf build"}'), c = P('c', 'react', t0 + 2)
+    expect(bindPrompt([a, c], { tool: 'Bash' }, t0 + 10)).toEqual({ key: 'a' })
+    expect(bindPrompt([c], { tool: 'mcp__x__react' }, t0 + 10)).toEqual({ key: 'c' })
+    expect(bindPrompt([a, b], { tool: 'Bash', input: { command: 'rm -rf build' } }, t0 + 10)).toEqual({ key: 'b' })
+    expect(bindPrompt([a, b], { tool: 'Bash', input: { command: 'make' } }, t0 + 10)).toBe('unsure')
+    expect(bindPrompt([a, b], { tool: 'Bash' }, t0 + 10)).toBe('unsure')
+    expect(bindPrompt([a, b], null, t0 + 10)).toBe('unsure')            // no evidence and two open: nobody is named
+    expect(bindPrompt([a], null, t0 + 10)).toEqual({ key: 'a' })        // no evidence, one open
+    expect(bindPrompt([c], { tool: 'Bash' }, t0 + 10)).toBe('unsure')   // the screen's tool is not the open prompt's
+    expect(bindPrompt([], { tool: 'Bash' }, t0 + 10)).toBe('none')
+    expect(bindPrompt([P('late', 'Bash', t0 + 5000)], { tool: 'Bash' }, t0)).toBe('none')   // came after the decision
+  })
+  test('previewFits: the preview\'s fields start like the waiting input\'s (cut previews too)', () => {
+    expect(previewFits('{"command":"git push origin main"}', { command: 'git push origin main', description: 'push' })).toBe(true)
+    expect(previewFits('{"command":"git push origin main"}', { command: 'git pull' })).toBe(false)
+    expect(previewFits('{"file_path":"/a/b.ts","content":"' + 'x'.repeat(30) + '"}', { file_path: '/a/b.ts', content: 'x'.repeat(5000) })).toBe(true)
+    expect(previewFits('{"command":"echo hi', { command: 'echo hi there' })).toBe(true)      // a cut preview: its text inside the input
+    expect(previewFits('{}', { a: 1 })).toBe(false)
+    expect(previewFits('{"a":1}', null)).toBe(false)
   })
 })

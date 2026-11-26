@@ -10,7 +10,8 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DutyOfficer, askBody, optionIdOf, optionIndexOf, permOptionOf, type Decision, type MenuActions, type ModelResult, type OfficerDeps, type PaneInfo, type Sent, type Tmux } from './duty-officer.ts'
+import { bindPrompt, type OpenPrompt } from './onsen-client.ts'
+import { DutyOfficer, askBody, hourlyCapFor, optionIdOf, optionIndexOf, permOptionOf, type Decision, type MenuActions, type ModelResult, type OfficerDeps, type PaneInfo, type Sent, type Tmux } from './duty-officer.ts'
 
 const DIALOG = [
   '╭──────────────────────────────────────────────╮',
@@ -32,7 +33,8 @@ const decision = (over: Partial<Decision> = {}): Decision => ({
 })
 
 type ACall = { op: string; [k: string]: any }
-function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?: MenuActions['shared']; ownPerm?: boolean | 'async' } = {}) {
+function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?: MenuActions['shared']; ownPerm?: 'done' | 'unsure' | 'none' | 'async'
+  bind?: MenuActions['bindPermission'] } = {}) {
   const calls: ACall[] = []
   let next = 40
   const guard = (op: string) => { if (o.throws) throw new Error(`boom ${op}`) }
@@ -42,15 +44,15 @@ function fakeActions(o: { pane?: MenuActions['pane']; throws?: boolean; shared?:
     open: (f, key, made) => { guard('open'); calls.push({ op: 'open', f, key }); const id = String(++next); setTimeout(() => made(id, 1), 0) },
     pressed: (f, option_id, key, times) => { guard('pressed'); calls.push({ op: 'pressed', f, option_id, key, times }) },
     ...(o.ownPerm !== undefined ? { pressedPermission: (t: { tmux: string }, option: string, x: any) => {
-      calls.push({ op: 'ownPerm', tmux: t.tmux, option, ...x }); const r = o.ownPerm === 'async' ? Promise.resolve(true) : !!o.ownPerm; return r } } : {}),
+      calls.push({ op: 'ownPerm', tmux: t.tmux, option, ...x }); return o.ownPerm === 'async' ? Promise.resolve('done' as const) : o.ownPerm! } } : {}),
+    ...(o.bind ? { bindPermission: (t: { tmux: string; test?: boolean }, b?: Record<string, unknown>) => { const r = o.bind!(t, b); calls.push({ op: 'bind', tmux: t.tmux, r }); return r } } : {}),
     answered: (ref, option_id, member, at) => { guard('answered'); calls.push({ op: 'answered', ref, option_id, member, at }) },
     applied: (ref, x) => { guard('applied'); calls.push({ op: 'applied', ref, ...x }) },
     cancel: (ref, reason) => { guard('cancel'); calls.push({ op: 'cancel', ref, reason }) },
-    screenPressed: (tmux, menu) => { calls.push({ op: 'screen', tmux, menu }) },
     ...(o.shared ? { shared: (t: { tmux: string; test?: boolean }, menu: string | null, assignees: string[], joined: (v: number) => void) => {
       calls.push({ op: 'shared', tmux: t.tmux, menu, assignees }); return o.shared!(t, menu, assignees, joined) } } : {}),
   }
-  return { acts, calls, ops: () => calls.filter(c => c.op !== 'pane' && c.op !== 'shared').map(c => c.op) }
+  return { acts, calls, ops: () => calls.filter(c => c.op !== 'pane' && c.op !== 'shared' && c.op !== 'bind').map(c => c.op) }
 }
 
 function rig(opts: { model?: (n: number) => ModelResult; onKey?: (k: string, p: { pane: string }) => void; actions?: MenuActions; dir?: string } = {}) {
@@ -109,7 +111,7 @@ describe('the duty officer\'s menus as Actions', () => {
     await r.advance(9000)
     await r.settle()
     expect(r.keys).toEqual(['Enter'])
-    expect(f.ops()).toEqual(['pressed', 'screen'])
+    expect(f.ops()).toEqual(['pressed'])
     const p = f.calls.find(c => c.op === 'pressed')!
     expect(p.option_id).toBe('1')
     expect(p.key).toMatch(/^menu:mini:press:claude-x:/)
@@ -120,7 +122,6 @@ describe('the duty officer\'s menus as Actions', () => {
     const paneAt = f.calls.findIndex(c => c.op === 'pane'), pressedAt = f.calls.findIndex(c => c.op === 'pressed')
     expect(paneAt).toBeGreaterThanOrEqual(0)
     expect(paneAt).toBeLessThan(pressedAt)
-    expect(f.calls.find(c => c.op === 'screen')).toEqual({ op: 'screen', tmux: 'claude-x', menu: 'model_picker' })
     expect(r.sent).toEqual([])                                         // Telegram: nothing, as before
   })
 
@@ -128,7 +129,7 @@ describe('the duty officer\'s menus as Actions', () => {
     const own = fakeActions({ pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
     const p = rig({ onKey: (k, x) => { if (k === 'Enter') x.pane = WORKING }, actions: own.acts })
     await p.advance(0); await p.advance(9000); await p.settle()
-    expect(own.ops()).toEqual(['pressed', 'screen'])
+    expect(own.ops()).toEqual(['pressed'])                              // r4: no screenPressed hook any more (no blanket end of other prompts)
     expect(p.o.openAskFor('claude-x', 'model_picker')).toBeNull()                                            // its own press: no question to anybody
     const g = fakeActions({ pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
     const r = await asked(g)
@@ -173,7 +174,6 @@ describe('the duty officer\'s menus as Actions', () => {
     expect(typeof ans.at).toBe('string')
     expect(r.edits).toHaveLength(2)
     expect(r.edits.every(e => e.text.includes('@Advac777 選了「No」') && !e.text.includes('從 Onsen 按的'))).toBe(true)   // Telegram's text as before
-    expect(f.calls.find(c => c.op === 'screen')).toEqual({ op: 'screen', tmux: 'claude-x', menu: 'permission' })
     expect(r.askFile().closed).toMatchObject({ how: 'answered', option_id: '2', member: 'joey', via: 'telegram' })
   })
 
@@ -440,36 +440,109 @@ describe('the duty officer\'s menus as Actions', () => {
     expect(Date.parse(p.times.at)).toBeGreaterThan(T0)
   })
 
-  test('r3: it pressed a permission prompt itself: the prompt\'s own Action takes the answer (allow / deny, the press moments); no second Action', async () => {
+  test('r4: it pressed a permission prompt itself: the prompt bound before the keys takes the answer (allow / deny, the press moments); no second Action', async () => {
     for (const [choose, want] of [['Yes', 'allow'], ['No', 'deny']] as const) {
-      for (const mode of [true, 'async'] as const) {
-        const f = fakeActions({ ownPerm: mode })
+      for (const mode of ['done', 'async'] as const) {
+        const f = fakeActions({ ownPerm: mode, bind: () => ({ key: 'perm:adam:abcde:1' }) })
         const r = rig({ model: () => ({ decision: decision({ choose }), meta: {}, fail: null }), onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f.acts })
         await r.advance(0); await r.advance(9000); await r.settle()
         expect(r.keys.at(-1)).toBe('Enter')
+        // bound before any key was sent
+        const bindAt = f.calls.findIndex(c => c.op === 'bind')
+        expect(bindAt).toBeGreaterThanOrEqual(0)
         const o = f.calls.find(c => c.op === 'ownPerm')!
-        expect(o).toMatchObject({ tmux: 'claude-x', option: want, choose, opened_at: new Date(T0).toISOString() })
+        expect(o).toMatchObject({ tmux: 'claude-x', option: want, choose, opened_at: new Date(T0).toISOString(), bound: { key: 'perm:adam:abcde:1' } })
         expect(o.at).toBe(r.log().find(e => e.event === 'pressed').pressed_at)
-        expect(f.ops()).toEqual(['ownPerm'])                               // no pressed (no second Action), no screenPressed from the officer
+        expect(f.ops()).toEqual(['ownPerm'])                               // no pressed (no second Action)
         expect(r.log().some(e => e.event === 'action' && e.pressed === want)).toBe(true)
       }
     }
   })
 
-  test('r3: no Action of the prompt to take it (pressedPermission false), an option that is neither allow nor deny, or not a permission prompt: its own record, as before', async () => {
-    const f = fakeActions({ ownPerm: false })
+  test('r4: it could not tell which prompt it was (unsure), or the key is neither allow nor deny: nothing recorded at all; no channel prompt (none): its own record', async () => {
+    const f = fakeActions({ ownPerm: 'done', bind: () => 'unsure' })
     const r = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f.acts })
     await r.advance(0); await r.advance(9000); await r.settle()
-    expect(f.ops()).toEqual(['ownPerm', 'pressed', 'screen'])
-    const f2 = fakeActions({ ownPerm: true })
+    expect(r.keys).toEqual(['Enter'])                                    // the key still goes: the record is what is held back
+    expect(f.ops()).toEqual([])
+    expect(r.log().find(e => e.event === 'action_unbound')).toMatchObject({ why: 'could not tell which permission prompt it was', bound: 'unsure' })
+    const f2 = fakeActions({ ownPerm: 'done', bind: () => ({ key: 'perm:k' }) })
     const r2 = rig({ model: () => ({ decision: decision({ choose: 'Explain', options: [{ on_screen: '1. Explain', means: '解釋', button: 'Explain', keys: ['Enter'] }] }), meta: {}, fail: null }),
       onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f2.acts })
     await r2.advance(0); await r2.advance(9000); await r2.settle()
-    expect(f2.ops()).toEqual(['pressed', 'screen'])                      // neither: not offered to the prompt's Action
-    const f3 = fakeActions({ ownPerm: true, pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
+    expect(f2.ops()).toEqual([])                                         // neither: no record on the prompt, no second one
+    expect(r2.log().some(e => e.event === 'action_unbound')).toBe(true)
+    const f3 = fakeActions({ ownPerm: 'none', bind: () => ({ key: 'perm:k' }) })   // bound, but the daemon finds no Action of it
     const r3 = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f3.acts })
     await r3.advance(0); await r3.advance(9000); await r3.settle()
-    expect(f3.ops()).toEqual(['pressed', 'screen'])
+    expect(f3.ops()).toEqual(['ownPerm', 'pressed'])
+    const f4 = fakeActions({ ownPerm: 'done', bind: () => 'none' })        // the channel has no prompt at all
+    const r4 = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f4.acts })
+    await r4.advance(0); await r4.advance(9000); await r4.settle()
+    expect(f4.ops()).toEqual(['pressed'])
+    const f5 = fakeActions({ ownPerm: 'done', bind: () => ({ key: 'perm:k' }), pane: () => ({ session_id: 'main', menu_kind: 'model_picker' }) })
+    const r5 = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f5.acts })
+    await r5.advance(0); await r5.advance(9000); await r5.settle()
+    expect(f5.ops()).toEqual(['pressed'])                                // not a permission prompt: not bound at all
+    expect(f5.calls.some(c => c.op === 'bind')).toBe(false)
+  })
+
+  test('r4: three permission prompts in a row (Chiron 06:00Z: react, Bash, reply): each press is recorded on the prompt that was on the screen, never on the next', async () => {
+    // Claude Code asks one at a time: the next prompt's request comes right after the key that answered the one before (before the officer's report)
+    const screens = ['react', 'Bash', 'reply'].map(tool => DIALOG.replace('Bash command', `${tool} call   `).replace('rm -rf /tmp/build-cache && make', `${tool} the thing`.padEnd(31)))
+    const prompts: Array<OpenPrompt & { ended?: boolean }> = []
+    let clock0 = Date.now(), step = 0
+    const open = (i: number) => prompts.push({ key: `perm:adam:${['aaaaa', 'bbbbb', 'ccccc'][i]}:${i}`, tool: ['react', 'Bash', 'reply'][i]!, preview: '{}', opened: clock0 + i })
+    open(0)
+    const resolved: Array<{ key: string; option: string }> = []
+    const f = fakeActions({
+      bind: () => bindPrompt(prompts.filter(p => !p.ended), null, Date.now()),
+      ownPerm: 'done',
+    })
+    // the fake daemon resolves exactly the bound prompt (server.ts pressedPermission)
+    ;(f.acts as any).pressedPermission = (_t: any, option: string, x: any) => {
+      f.calls.push({ op: 'ownPerm', option, ...x })
+      const p = prompts.find(q => q.key === x.bound?.key)
+      if (!p || p.ended) return 'unsure'
+      p.ended = true
+      resolved.push({ key: p.key, option })
+      return 'done'
+    }
+    const r = rig({ model: () => ({ decision: decision({ choose: 'Yes' }), meta: {}, fail: null }), actions: f.acts,
+      onKey: (k, p) => {
+        if (k !== 'Enter') return
+        step++
+        if (step < 3) { p.pane = screens[step]!; open(step) }                 // the next prompt is on the screen and its request has come
+        else p.pane = WORKING
+      } })
+    r.pane.pane = screens[0]!
+    for (let i = 0; i < 3; i++) { await r.advance(0); await r.advance(9000); await r.settle(); await r.advance(1000); await r.settle() }
+    expect(r.keys.filter(k => k === 'Enter')).toHaveLength(3)
+    expect(resolved).toEqual([{ key: 'perm:adam:aaaaa:0', option: 'allow' }, { key: 'perm:adam:bbbbb:1', option: 'allow' }, { key: 'perm:adam:ccccc:2', option: 'allow' }])
+    expect(f.ops().filter(o => o === 'pressed')).toEqual([])              // never a second Action
+    // what each press was bound to: the prompt open when it decided (one at a time), so never the next one
+    expect(f.calls.filter(c => c.op === 'bind').map(c => c.r)).toEqual([{ key: 'perm:adam:aaaaa:0' }, { key: 'perm:adam:bbbbb:1' }, { key: 'perm:adam:ccccc:2' }])
+  })
+
+  test('r4: two prompts open at once with nothing to tell them apart: nothing recorded on either; a stale one beside the right tool: the right one', async () => {
+    const now = Date.now()
+    const two: OpenPrompt[] = [{ key: 'k1', tool: 'Bash', preview: '{"command":"ls"}', opened: now - 5000 }, { key: 'k2', tool: 'Bash', preview: '{"command":"rm x"}', opened: now - 1000 }]
+    const f = fakeActions({ ownPerm: 'done', bind: () => bindPrompt(two, null, Date.now()) })
+    const r = rig({ onKey: (k, p) => { if (k === 'Enter') p.pane = WORKING }, actions: f.acts })
+    await r.advance(0); await r.advance(9000); await r.settle()
+    expect(f.ops()).toEqual([])
+    expect(bindPrompt(two, { tool: 'Bash', input: { command: 'rm x' } }, now)).toEqual({ key: 'k2' })
+    expect(bindPrompt([{ key: 'old', tool: 'react', preview: '{}', opened: now - 60_000 }, two[0]!], { tool: 'Bash', input: { command: 'ls' } }, now)).toEqual({ key: 'k1' })
+  })
+
+  test('r4: DUTY_OFFICER_HOURLY_CAP_AGENTS: this agent\'s cap a pane, else none (the default stays)', () => {
+    expect(hourlyCapFor('lab-relay:60', 'lab-relay')).toBe(60)
+    expect(hourlyCapFor('chiron:20, lab-relay:60', 'lab-relay')).toBe(60)
+    expect(hourlyCapFor('lab-relay:60', 'epeius')).toBeNull()
+    expect(hourlyCapFor(undefined, 'lab-relay')).toBeNull()
+    expect(hourlyCapFor('lab-relay:0', 'lab-relay')).toBeNull()
+    expect(hourlyCapFor('lab-relay:9999', 'lab-relay')).toBeNull()
+    expect(hourlyCapFor('lab-relay=60', 'lab-relay')).toBeNull()
   })
 
   test('helpers: option ids are index + 1; the body puts the screen in code blocks', () => {

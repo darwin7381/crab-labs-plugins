@@ -330,12 +330,50 @@ test('the session closed with the prompt open: the Action is cancelled; a contro
   expect(await until(() => of(id, 'cancel').length === 1)).toBe(true)
   expect(of(id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '對話關了' })
   expect(actions.get(id).state).toBe('cancelled')
+  // r4 (Chiron 06:00Z): its Telegram copies close too: the reason, the buttons gone
+  expect(await until(() => api.of('editMessageText').filter(e => e.body.text === '🔐 Permission: Bash\n\n— 不用按了：對話關了（沒有按）').length === 2)).toBe(true)
+  for (const e of api.of('editMessageText').filter(e => String(e.body.text).includes('不用按了：對話關了'))) expect(e.body.reply_markup).toEqual({ inline_keyboard: [] })
+  await sleep(300)
   const e0 = api.of('editMessageText').length
   expect((await control({ action_id: id, option_id: 'allow', version: 2 })).status).toBe(202)
   await sleep(600)
   expect(s.perms).toHaveLength(0)
   expect(api.of('editMessageText').length).toBe(e0)
   expect(of(id, 'cancel')).toHaveLength(1)                             // over already: no second call
+}, 30000)
+
+test('r4: the conversation went away (its stream closed, the GC not yet): a tap or a press in Onsen counts as the prompt gone: cancelled, copies closed, nothing sent', async () => {
+  const s = await session(tg.port, tok)
+  await ask(s, 'mnpqr', 'Bash', 'npm test')
+  expect(await until(() => !!created('Bash：npm test') && permSends('Bash').filter(c => c.at >= Date.now() - 5000).length >= 2)).toBe(true)
+  const id = idOf('Bash：npm test')
+  await sleep(300)
+  await s.client.close()                                                 // the stream goes; no DELETE: the session waits for the 120 s GC
+  await sleep(500)
+  const e0 = api.of('editMessageText').length
+  tap(JOEY, 'perm:allow:mnpqr', 7200, '🔐 Permission: Bash')
+  expect(await until(() => of(id, 'cancel').length === 1)).toBe(true)
+  expect(of(id, 'cancel')[0]!.body).toEqual({ expected_version: 1, reason: '對話已經不在了' })
+  expect(of(id, 'resolve')).toHaveLength(0)
+  expect(of(id, 'applied')).toHaveLength(0)
+  expect(await until(() => api.of('editMessageText').slice(e0).filter(e => String(e.body.text).endsWith('— 不用按了：對話已經不在了（沒有按）')).length === 2)).toBe(true)
+  expect(api.of('answerCallbackQuery').at(-1)!.body.text).toBe('這個權限詢問已經不在了，沒有送出')
+  await sleep(300)
+  expect(s.perms).toHaveLength(0)
+  // the same for a press in Onsen on another prompt of a gone conversation
+  const s2 = await session(tg.port, tok)
+  await ask(s2, 'npqrs', 'Bash', 'npm run build')
+  expect(await until(() => !!created('Bash：npm run build'))).toBe(true)
+  const id2 = idOf('Bash：npm run build')
+  await sleep(300)
+  await s2.client.close()
+  await sleep(500)
+  expect((await control(pressInOnsen(id2, 'allow'))).status).toBe(202)
+  expect(await until(() => of(id2, 'cancel').length === 1)).toBe(true)
+  expect(of(id2, 'cancel')[0]!.body).toMatchObject({ expected_version: 2 })
+  expect(of(id2, 'applied')).toHaveLength(0)
+  await sleep(300)
+  expect(s2.perms).toHaveLength(0)
 }, 30000)
 
 test('a control for an Action this daemon has no prompt or menu for: cancelled (at the control\'s version), nothing pressed; a bad body or no token: refused', async () => {
@@ -409,9 +447,10 @@ test('the Telegram daemon restarts with a prompt open: its Action is cancelled a
   expect(await until(() => !!created('Bash：kubectl apply'))).toBe(true)
   const id = idOf('Bash：kubectl apply')
   await sleep(300)
-  const open = JSON.parse(readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8'))
-  expect(open[id]).toBe(1)
-  expect(open[idOf('Bash：git push origin main')]).toBe(1)             // the first test's prompt, never answered, is open too
+  const openRaw = readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8')
+  const open = JSON.parse(openRaw)
+  expect(open[id]).toMatchObject({ v: 1, copies: [expect.objectContaining({ text: '🔐 Permission: Bash' }), expect.objectContaining({ text: '🔐 Permission: Bash' })] })   // r4: its copies too
+  expect(open[idOf('Bash：git push origin main')]).toMatchObject({ v: 1 })   // the first test's prompt, never answered, is open too
   expect(Object.keys(open).every(k => actions.get(k)?.state === 'open')).toBe(true)
   await tg.stop()
   tg = await startTgDaemon(api, join(root, 'tg'), JOEY, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_RECORD: '0',
@@ -420,10 +459,15 @@ test('the Telegram daemon restarts with a prompt open: its Action is cancelled a
   // within the grace: still open (a duty officer asking about the prompt still on the screen would take it over); kept in the file
   await sleep(1000)
   expect(of(id, 'cancel')).toHaveLength(0)
-  expect(JSON.parse(readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8'))[id]).toBe(1)
+  expect(JSON.parse(readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8'))[id]).toMatchObject({ v: 1 })
+  const e0 = api.of('editMessageText').length
   expect(await until(() => of(id, 'cancel').length === 1, 15000)).toBe(true)
   expect(Date.now() - up).toBeGreaterThanOrEqual(2500)
   expect(of(id, 'cancel')[0]!.body).toMatchObject({ expected_version: 1, reason: expect.stringContaining('常駐程式重開了') })
   expect(await until(() => Object.keys(open).every(k => actions.get(k)?.state === 'cancelled'), 10000)).toBe(true)
   expect(JSON.parse(readFileSync(join(tg.stateDir, 'onsen', 'open-permission-actions.json'), 'utf8'))).toEqual({})
+  // r4: the copies of every prompt it cancelled close (they came from the old process; kept in the file)
+  const msgs = new Set(Object.values(JSON.parse(openRaw)).flatMap((x: any) => x.copies.map((c: any) => c.msg)))   // a fresh parse (the matchers above touched `open`)
+  expect(msgs.size).toBe(4)
+  expect(await until(() => api.of('editMessageText').slice(e0).filter(e => msgs.has(Number(e.body.message_id)) && String(e.body.text).includes('不用按了：常駐程式重開了')).length === msgs.size)).toBe(true)
 }, 60000)

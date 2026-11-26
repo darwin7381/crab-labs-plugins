@@ -71,6 +71,14 @@ export interface Limits {
   renotifyMs: number; maxChain: number; keyGapMs: number; verifyAfterMs: number; settleMaxMs: number
   claimFreshMs: number; attendedMs: number
 }
+/** WO-176 r4: DUTY_OFFICER_HOURLY_CAP_AGENTS (`agent:N[,agent:N…]`): this agent's hourly judging cap a pane (1–600), else null (the default) */
+export function hourlyCapFor(value: string | undefined, agent: string): number | null {
+  for (const part of String(value ?? '').split(',')) {
+    const m = /^\s*([A-Za-z0-9_.-]+)\s*:\s*(\d{1,3})\s*$/.exec(part)
+    if (m && m[1] === agent) { const n = Number(m[2]); return n >= 1 && n <= 600 ? n : null }
+  }
+  return null
+}
 export const DEFAULT_LIMITS: Limits = {
   pollMs: 3000, stallMs: 8000, modelTimeoutMs: 60_000, callsPerHour: 30, callsPerTargetHour: 6,
   renotifyMs: 3_600_000, maxChain: 3, keyGapMs: 200, verifyAfterMs: 2000, settleMaxMs: 30_000,
@@ -727,6 +735,8 @@ interface Ask {
   action_shared?: 'permission'
   /** WO-180 (Chiron 04:42Z, 1): the members the question went to (its Action's assignees, MenuActions.assignees of the chats it was sent to) */
   assignees?: string[]
+  /** WO-176 r4: the permission prompt this question is about, taken when it was asked (MenuActions.bindPermission) */
+  perm_bind?: PermBinding
 }
 // ---------------------------------------------------------------- WO-176: the menus as Onsen Actions
 /** a menu's Action as an ask keeps it: the key it was made with, and Onsen's id and version once known */
@@ -745,24 +755,28 @@ export interface MenuActions {
   /** the officer pressed it itself: an Action made resolved (assignees duty-officer, the option it pressed); `times` (r3): when the keys were sent
    *  (`at`) and when the menu appeared (`opened_at`) */
   pressed(f: MenuActionFields, option_id: string, key: string, times?: { at: string; opened_at: string }): void
-  /** WO-176 r3 (Chiron 04:42Z): the officer pressed a permission prompt itself: the prompt's own Action takes the answer (resolved by duty-officer,
-   *  `option` allow / deny, at the press time) and its Telegram copies are closed; true: done so; false: there is no such Action (the officer records
-   *  its own, as before) */
-  pressedPermission?(t: { tmux: string; test?: boolean }, option: 'allow' | 'deny', o: { choose: string; at: string; opened_at: string }): Promise<boolean> | boolean
+  /** WO-176 r4 (Chiron 06:00Z): which permission prompt this pane shows, taken when the officer decides (before any key: a prompt the next screen
+   *  brings is never it). The answer is the daemon's own token, handed back with pressedPermission / shared */
+  bindPermission?(t: { tmux: string; test?: boolean }, bundle?: Record<string, unknown>): PermBinding
+  /** WO-176 r3 / r4: the officer pressed a permission prompt itself: the prompt it was bound to (`bound`) takes the answer (resolved by duty-officer,
+   *  `option` allow / deny, at the press time) and its Telegram copies close. 'done': so; 'unsure': it could not tell which prompt it was (nothing is
+   *  recorded); 'none': the channel has no prompt for it (the officer records its own, as before) */
+  pressedPermission?(t: { tmux: string; test?: boolean }, option: 'allow' | 'deny', o: { choose: string; at: string; opened_at: string; bound: PermBinding }):
+    Promise<'done' | 'unsure' | 'none'> | 'done' | 'unsure' | 'none'
   /** pressed from Telegram by `member` (resolve, then applied; Onsen answered first: applied with what was pressed here) */
   answered(ref: ActionRef, option_id: string, member: string | null, at: string): void
   /** the press Onsen's control asked for was made; or Telegram's press came first (option_id, resolved_by: what was really pressed) */
   applied(ref: ActionRef, o: { at?: string; option_id?: string; resolved_by?: string }): void
   /** nothing was pressed: the menu went away, the screen changed, the officer is off */
   cancel(ref: ActionRef, reason: string): void
-  /** keys went to this pane's menu of this kind (a permission prompt answered on the screen: the channel's own prompt for it is over) */
-  screenPressed?(tmux: string, menu_kind: string | null): void
   /** WO-176 r2 (CONTRACT §6 「畫面上同一個詢問只有一個 Action」): the open Action that already stands for the menu on this pane (the channel's
    *  permission prompt for that session; after a restart, Onsen's open one), which a question to `assignees` uses instead of a new one, joining
    *  them to it (Onsen 0.24.0) when one is not an assignee yet; `joined` hears the version after that. id / version once Onsen made it; null: none */
-  shared?(t: { tmux: string; test?: boolean }, menu_kind: string | null, assignees: string[], joined: (version: number) => void):
+  shared?(t: { tmux: string; test?: boolean }, menu_kind: string | null, assignees: string[], joined: (version: number) => void, bound?: PermBinding):
     Promise<{ key: string; id?: string; version?: number } | null> | { key: string; id?: string; version?: number } | null
 }
+/** WO-176 r4: the daemon's token for the permission prompt a screen shows (MenuActions.bindPermission); kept as it is, also in the ask file */
+export type PermBinding = { key: string } | { lookup: { tool: string | null; before: string } } | 'none' | 'unsure' | null
 /** an Action option id ↔ the ask's option index */
 export const optionIdOf = (i: number): string => String(i + 1)
 /** WO-176 r2: a permission prompt's option as the channel's Action names it: Claude Code's 「Yes…」 (also 「Yes, and don't ask again…」) allow, 「No…」
@@ -1172,6 +1186,8 @@ export class DutyOfficer {
   private async press(t: Target, lk: NonNullable<Look>, appeared: number, step: number, d: Decision, keys: string[], bundle: Record<string, unknown>): Promise<void> {
     const dry = this.config().dry_keys
     const pane = dry ? null : this.actionPane(t, bundle)               // WO-176: the menu as it is before the keys (its Action, made after a press)
+    // WO-176 r4: the permission prompt it is about to press, taken now (the screen pressKeys checks is this one; the next prompt comes after the keys)
+    const bound = pane?.menu_kind === 'permission' ? this.bindPerm(t, bundle) : null
     const r = await this.pressKeys(t.tmux, lk.hash, keys, dry)
     const base = { agent: t.label, tmux: t.tmux, step, choose: d.choose, keys, screen_hash: lk.hash }
     if (!r.ok && r.off) {
@@ -1198,14 +1214,14 @@ export class DutyOfficer {
     if (!a) {
       this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10, resolved: null, why: 'pane gone after pressing' })
       this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved: null })
-      await this.recordPress(t, lk, d, pane, r.at, appeared)
+      await this.recordPress(t, lk, d, pane, r.at, appeared, bound)
       return
     }
     const resolved = a.state === 'IDLE' || a.state === 'WORKING' || a.hash !== lk.hash
     this.event('pressed', { ...base, pressed_at: iso(r.at), appeared_to_press_s: Math.round((r.at - appeared) / 100) / 10,
       left_copy_mode: r.leftMode, before_tail: lk.lines, after_tail: a.lines, after_state: a.state, resolved, to_joey_draft: d.to_joey })
     this.setRec(t.tmux, lk.hash, { action: 'do', t: this.now(), resolved })
-    if (resolved) await this.recordPress(t, lk, d, pane, r.at, appeared)
+    if (resolved) await this.recordPress(t, lk, d, pane, r.at, appeared, bound)
     if (!resolved) {
       await this.askJoey(t, lk, bundle, d, 'pressed the keys, the screen did not change', keys)
       return
@@ -1243,12 +1259,17 @@ export class DutyOfficer {
     // WO-176: this pane's menus are this agent's Actions: the ask gets one (made when it is first sent)
     const pane = this.actionPane(t, bundle)
     if (pane) Object.assign(ask, { action_key: `menu:${this.host}:ask:${ask.id}`, menu_kind: pane.menu_kind, session_id: pane.session_id })
+    if (pane?.menu_kind === 'permission') { const b = this.bindPerm(t, bundle); if (b != null) ask.perm_bind = b }   // r4: the prompt it is asking about
     this.asks.set(ask.id, ask)
     return ask
   }
   private actionPane(t: { tmux: string; test?: boolean }, bundle?: Record<string, unknown>): { session_id: string | null; menu_kind: string | null } | null {
     if (!this.d.actions) return null
     try { return this.d.actions.pane(t, bundle) } catch { return null }
+  }
+  private bindPerm(t: { tmux: string; test?: boolean }, bundle?: Record<string, unknown>): PermBinding {
+    if (!this.d.actions?.bindPermission) return null
+    try { return this.d.actions.bindPermission(t, bundle) ?? null } catch { return 'unsure' }
   }
   private saveAsk(a: Ask) {
     try { writeFileSync(join(this.dir, 'ask', `${a.id}.json`), JSON.stringify(a, null, 1)) } catch {}
@@ -1298,7 +1319,7 @@ export class DutyOfficer {
       try {
         sh = await acts.shared({ tmux: a.tmux, test: a.test }, 'permission', acts.assignees(chats), version => {
           if (a.action_shared && version > (a.action_version ?? 0)) { a.action_version = version; this.saveAsk(a) }
-        })
+        }, a.perm_bind ?? null)
       } catch {}
       if (sh) {
         Object.assign(a, { action_key: sh.key, action_shared: 'permission', ...(sh.id ? { action_id: sh.id } : {}), ...(sh.version ? { action_version: sh.version } : {}) })
@@ -1322,18 +1343,21 @@ export class DutyOfficer {
   }
   /** WO-176: the officer pressed a menu itself (a ruling covered it): one Action made resolved, assignees duty-officer, the option it pressed */
   private async recordPress(t: Target, lk: NonNullable<Look>, d: Decision, pane: { session_id: string | null; menu_kind: string | null } | null, at: number,
-    appeared: number): Promise<void> {
+    appeared: number, bound: PermBinding = null): Promise<void> {
     const acts = this.d.actions
     if (!acts || !pane) return
     const times = { at: iso(at), opened_at: iso(Math.min(appeared, at)) }   // r3: the real moments (the keys sent; the menu first seen)
-    // WO-176 r3 (Chiron 04:42Z, 「同一個詢問只有一個 Action」): a permission prompt it pressed itself is answered on the prompt's own Action
-    if (pane.menu_kind === 'permission' && acts.pressedPermission) {
+    // WO-176 r3 / r4 (Chiron 04:42Z, 06:00Z, 「同一個詢問只有一個 Action」): a permission prompt it pressed itself is answered on that prompt's own Action,
+    // the one taken before the keys (bound); when it cannot tell which one it was, nothing is recorded on any
+    if (pane.menu_kind === 'permission' && acts.pressedPermission && bound != null && bound !== 'none') {
       const chosen = (d.options ?? []).find(o => o && o.button === d.choose)
       const option = permOptionOf({ button: d.choose, ...(chosen?.on_screen ? { screen: String(chosen.on_screen) } : {}) })
-      if (option) {
-        let done = false
-        try { done = await acts.pressedPermission({ tmux: t.tmux, test: t.test }, option, { choose: d.choose, ...times }) } catch {}
-        if (done) { this.event('action', { agent: t.label, tmux: t.tmux, shared: 'permission', pressed: option, pressed_at: times.at }); return }
+      let out: 'done' | 'unsure' | 'none' = 'unsure'
+      if (option && bound !== 'unsure') { try { out = await acts.pressedPermission({ tmux: t.tmux, test: t.test }, option, { choose: d.choose, ...times, bound }) } catch {} }
+      if (out === 'done') { this.event('action', { agent: t.label, tmux: t.tmux, shared: 'permission', pressed: option, pressed_at: times.at }); return }
+      if (out === 'unsure') {
+        this.event('action_unbound', { agent: t.label, tmux: t.tmux, why: !option ? `「${d.choose}」 is neither allow nor deny` : 'could not tell which permission prompt it was', bound })
+        return
       }
     }
     const opts = (d.options ?? []).slice(0, 10)
@@ -1344,7 +1368,6 @@ export class DutyOfficer {
     try {
       acts.pressed({ menu_kind: pane.menu_kind, session_id: pane.session_id, assignees: ['duty-officer'], summary: `${t.label}：${d.what}`, body, options },
         optionIdOf(idx), `menu:${this.host}:press:${t.tmux}:${lk.hash}:${at}`, times)
-      acts.screenPressed?.(t.tmux, pane.menu_kind)
     } catch (e) { this.event('error', { agent: t.label, tmux: t.tmux, where: 'action pressed', error: String(e).slice(0, 200) }) }
   }
   private refOf(a: Ask): ActionRef | null {
@@ -1542,7 +1565,6 @@ export class DutyOfficer {
         // a shared permission Action whose option this is not (neither allow nor deny): the prompt is over on the screen all the same (cancelled)
         this.actionCall(a, (acts, ref) => oid == null ? acts.cancel(ref, `在畫面上按了「${opt.button}」`)
           : via === 'onsen' ? acts.applied(ref, { at, ...(a.action_shared ? { option_id: oid } : {}) }) : acts.answered(ref, oid, member, at))
-        if (a.menu_kind !== undefined) { try { this.d.actions?.screenPressed?.(a.tmux, a.menu_kind ?? null) } catch {} }
       }
       this.saveAsk(a)
       const end = via === 'onsen' ? '\n從 Onsen 按的' : ''

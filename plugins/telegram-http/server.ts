@@ -64,7 +64,7 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type MenuActions } from './duty-officer.ts'
+import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards } from './onsen-mentions.ts'
@@ -1524,7 +1524,7 @@ const pendingPermissions = new Map<string, {
 // Every Onsen call is in the background (onsen-client.ts OnsenActions): the prompt goes to Telegram and the answer to Claude Code exactly as before,
 // Onsen up or down. ONSEN_ACTIONS=0: no new Action (the stop switch)
 type PermCopy = { chat: string; msg: number; text: string }
-type PermPrompt = { request_id: string; tool_name: string; copies: PermCopy[]; action: Onsen.ActionHandle | null; opened: number
+type PermPrompt = { request_id: string; tool_name: string; preview: string; copies: PermCopy[]; action: Onsen.ActionHandle | null; opened: number
   ended: { how: 'answered' | 'gone'; option?: 'allow' | 'deny'; member?: string | null; via: 'telegram' | 'onsen' | 'daemon' | 'officer'; at: number } | null }
 const permPrompts = new Map<string, PermPrompt>()
 const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log,
@@ -1534,22 +1534,28 @@ const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({
 // about the prompt still on the screen takes the Action over (MenuActions.shared, WO-176 r2: one Action per prompt); what nobody took is cancelled
 // then, so Joey's list never keeps a prompt nobody can press
 const PERM_OPEN_FILE = join(STATE_DIR, 'onsen', 'open-permission-actions.json')
-/** the previous process's open permission Actions not taken over or cancelled yet: id → version */
-const permLeftover = new Map<string, number>()
+/** the previous process's open permission Actions not taken over or cancelled yet: id → its version and (r4) its Telegram copies */
+const permLeftover = new Map<string, { v: number; copies: PermCopy[] }>()
 function savePermOpen(): void {
-  const open: Record<string, number> = Object.fromEntries(permLeftover)
-  for (const p of permPrompts.values()) if (!p.ended && p.action?.id) open[p.action.id] = p.action.version
+  const open: Record<string, { v: number; copies: PermCopy[] }> = Object.fromEntries(permLeftover)
+  for (const p of permPrompts.values()) if (!p.ended && p.action?.id) open[p.action.id] = { v: p.action.version, copies: p.copies }
   try { mkdirSync(dirname(PERM_OPEN_FILE), { recursive: true }); writeFileSync(PERM_OPEN_FILE, JSON.stringify(open)) } catch {}
 }
 if (onsenActions) {
   let left: Record<string, unknown> = {}
   try { left = JSON.parse(readFileSync(PERM_OPEN_FILE, 'utf8')) } catch {}
-  for (const [id, v] of Object.entries(left)) if (/^\d{1,18}$/.test(id) && Number.isInteger(v)) permLeftover.set(id, v as number)
+  for (const [id, x] of Object.entries(left)) {
+    if (!/^\d{1,18}$/.test(id)) continue
+    const o = x as any
+    if (Number.isInteger(o)) permLeftover.set(id, { v: o, copies: [] })                  // 1.58.8–1.58.11's form: the version alone
+    else if (o && Number.isInteger(o.v)) permLeftover.set(id, { v: o.v, copies: Array.isArray(o.copies) ? o.copies.filter((c: any) => c && c.chat && Number.isInteger(c.msg)) : [] })
+  }
   if (permLeftover.size) {
     const grace = Number(process.env.ONSEN_PERM_RESTART_GRACE_MS ?? 180_000)
     log('info', `onsen action: ${permLeftover.size} permission prompt(s) open when this daemon last stopped; cancelled in ${Math.round(grace / 1000)} s unless the duty officer takes one over`)
     const t = setTimeout(() => {
-      for (const [id, v] of permLeftover) onsenActions.cancel(onsenActions.adopt(id, v), '常駐程式重開了，這個權限詢問已經按不到了')
+      const why = '常駐程式重開了，這個權限詢問已經按不到了'
+      for (const [id, x] of permLeftover) { onsenActions.cancel(onsenActions.adopt(id, x.v), why); permCopiesGone(x.copies, why) }   // r4: the copies close too
       permLeftover.clear()
       savePermOpen()
     }, Number.isFinite(grace) && grace >= 0 ? grace : 180_000)
@@ -1561,12 +1567,13 @@ function permPrompt(request_id: string, tool_name: string): PermPrompt {
   const now = Date.now()
   for (const [k, p] of permPrompts) if (p.ended && now - p.ended.at > 86_400_000) permPrompts.delete(k)
   while (permPrompts.size >= 300) permPrompts.delete(permPrompts.keys().next().value!)
-  const p: PermPrompt = { request_id, tool_name, copies: [], action: null, opened: now, ended: null }
+  const p: PermPrompt = { request_id, tool_name, preview: '', copies: [], action: null, opened: now, ended: null }
   permPrompts.set(request_id, p)
   return p
 }
 /** the prompt's Action (after its Telegram copies went out; made in the background) */
 function permAction(p: PermPrompt, description: string, input_preview: string, recipients: string[]): void {
+  p.preview = input_preview                                              // r4: which prompt the officer is looking at (bindPrompt)
   if (!onsenActions?.on) return
   let input = input_preview
   try { input = JSON.stringify(JSON.parse(input_preview), null, 2) } catch {}
@@ -1583,23 +1590,52 @@ function permAnswered(request_id: string, behavior: 'allow' | 'deny', senderId: 
   onsenActions?.pressedElsewhere(p.action, behavior, member ?? '', new Date().toISOString())
   if (p.action?.id) savePermOpen()
 }
-/** the prompt's session closed or was evicted, or its prompt was answered on the screen: nothing will be pressed (cancelled) */
+/** the prompt's session closed or was evicted, or the prompt left the screen: nothing will be pressed (cancelled); r4 (Chiron 06:00Z): its Telegram
+ *  copies close too (the reason, the buttons gone), so nobody presses a prompt that is not there */
 function permGone(request_id: string, reason: string): void {
   const p = permPrompts.get(request_id)
   if (!p || p.ended) return
   p.ended = { how: 'gone', via: 'daemon', at: Date.now() }
   onsenActions?.cancel(p.action, reason)
   if (p.action?.id) savePermOpen()
+  permCopiesGone(p.copies, reason)
 }
-/** the duty officer's keys went to a permission prompt on the main's screen: the channel's prompts open now are over (their Telegram copies stay) */
-function permScreenPressed(): void {
-  for (const p of permPrompts.values()) if (!p.ended && p.action) permGone(p.request_id, '在畫面上按掉了（值班員）')
+function permCopiesGone(copies: PermCopy[], reason: string): void {
+  for (const cp of copies) {
+    void Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg, `${cp.text}\n\n— 不用按了：${reason}（沒有按）`, { reply_markup: { inline_keyboard: [] } }))
+      .catch(e => log('warn', `permission edit ${cp.chat}/${cp.msg} (gone) failed: ${e}`))
+  }
+}
+/** r4 (Chiron 06:00Z): the session that asked still has its stream open (Claude Code can still take the answer); a session whose stream went away is
+ *  waiting for the grace GC (SESSION_GRACE_MS), and a press on its prompt in that time is a prompt that is gone */
+function permLive(server: Server): boolean {
+  const sid = serverSessionId.get(server)
+  return !!sid && activeServers.has(server) && sseOpen.get(sid) === true
+}
+/** r4: the open prompts as bindPrompt sees them */
+function openPrompts(): Onsen.OpenPrompt[] {
+  const out: Onsen.OpenPrompt[] = []
+  for (const p of permPrompts.values()) if (!p.ended && p.action && (p.action.state === 'pending' || p.action.state === 'open'))
+    out.push({ key: p.action.key, tool: p.tool_name, preview: p.preview, opened: p.opened })
+  return out
+}
+const promptByKey = (key: string): PermPrompt | undefined => { for (const p of permPrompts.values()) if (p.action?.key === key) return p; return undefined }
+/** r4: after a restart (no prompt in this process), the open permission Action Onsen has for what the officer saw: of this session, made by `before`,
+ *  of that tool; exactly one, or none ('none'), or several ('unsure') */
+async function remotePrompt(acts: Onsen.OnsenActions, lookup: { tool: string | null; before: string }): Promise<Onsen.ActionHandle | 'none' | 'unsure'> {
+  const before = Date.parse(lookup.before) + 1000
+  const items = (await acts.listOpen(ONSEN_AGENT)).filter(d => d.source === 'permission' && (d.session_id ?? 'main') === 'main' && Date.parse(d.created_at ?? '') <= before
+    && (!lookup.tool || String(d.summary ?? '').startsWith(`${lookup.tool}：`)))
+  if (!items.length) return 'none'
+  if (items.length > 1) return 'unsure'
+  const h = acts.adoptData(items[0], `perm:${ONSEN_AGENT}:adopted:`)
+  return h
 }
 /** WO-176: every Telegram copy of a prompt answered somewhere other than a tap on that copy: the same edit a tap makes (the outcome, the buttons gone),
  *  and a closing line saying where it was answered (「從 Onsen 按的」; r3: the duty officer on the screen, or on its question) */
-function permCopiesDone(p: PermPrompt, behavior: 'allow' | 'deny', end: string): void {
+function permCopiesDone(copies: PermCopy[], behavior: 'allow' | 'deny', end: string): void {
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  for (const cp of p.copies) {
+  for (const cp of copies) {
     void Onsen.withSender('system:permission', () => bot.api.editMessageText(cp.chat, cp.msg, `${cp.text}\n\n${label}\n${end}`, { reply_markup: { inline_keyboard: [] } }))
       .catch(e => log('warn', `permission edit ${cp.chat}/${cp.msg} (${end}) failed: ${e}`))
   }
@@ -1647,27 +1683,37 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
     assignees: chats => Onsen.assigneesOf(chats),
     open: (f, key, made) => { acts.open({ source: 'menu', ...f }, key, h => { if (h.id) made(h.id, h.version) }) },
     pressed: (f, option_id, key, times) => { acts.open({ source: 'menu', ...f, resolved: { option_id, by: 'duty-officer', ...(times ?? {}) } }, key) },
-    // WO-176 r3 (Chiron 04:42Z): the officer pressed the permission prompt on the main's screen itself: the prompt's own Action (the channel's, or after a
-    // restart Onsen's open one) is resolved by duty-officer through the requester's path (Onsen 0.24.3: no join, its assignees stay who was asked), at
-    // the press time, then applied; its Telegram copies close the way a tap closes one; no second Action
+    // WO-176 r4 (Chiron 06:00Z): the permission prompt this pane shows, taken when the officer decides (its prompts open now, that came by now, by the
+    // waiting tool and its input); none in this process after a restart: what to ask Onsen for after the keys
+    bindPermission: (t, bundle) => {
+      if (!own() || t.tmux !== own()) return null
+      const waiting = bundle?.pending_tool_call as { tool?: unknown; input?: unknown } | null | undefined
+      const b = Onsen.bindPrompt(openPrompts(), waiting, Date.now())
+      if (b === 'none' && permLeftover.size) return { lookup: { tool: typeof waiting?.tool === 'string' ? waiting.tool : null, before: new Date().toISOString() } }
+      return b
+    },
+    // WO-176 r3 / r4: the officer pressed the permission prompt it was bound to: that prompt's Action (and no other) is resolved by duty-officer through
+    // the requester's path (Onsen 0.24.3), at the press time, then applied; its Telegram copies close the way a tap closes one; no second Action
     pressedPermission: async (t, option, o) => {
-      if (!own() || t.tmux !== own()) return false
-      let best: PermPrompt | null = null
-      for (const p of permPrompts.values()) if (!p.ended && p.action && (p.action.state === 'pending' || p.action.state === 'open') && (!best || p.opened >= best.opened)) best = p
-      let h: Onsen.ActionHandle | null = best?.action ?? null
-      if (!h) {
-        h = await acts.findOpen(ONSEN_AGENT, d => d.source === 'permission' && (d.session_id ?? 'main') === 'main', `perm:${ONSEN_AGENT}:adopted:`)
-        if (h?.id && permLeftover.delete(h.id)) savePermOpen()
-      }
-      if (!h) return false
-      if (best) {
-        best.ended = { how: 'answered', option, member: 'duty-officer', via: 'officer', at: Date.now() }
+      if (!own() || t.tmux !== own() || o.bound == null || o.bound === 'none') return 'none'
+      if (o.bound === 'unsure') return 'unsure'
+      if ('key' in o.bound) {
+        const p = promptByKey(o.bound.key)
+        if (!p?.action) return 'unsure'
+        if (p.ended) return 'done'                                       // answered or over already (Telegram, Onsen, its close): reported once
+        p.ended = { how: 'answered', option, member: 'duty-officer', via: 'officer', at: Date.now() }
         savePermOpen()
-        permCopiesDone(best, option, `值班員按的：「${o.choose}」`)
+        permCopiesDone(p.copies, option, `值班員按的：「${o.choose}」`)
+        acts.pressedElsewhere(p.action, option, 'duty-officer', o.at, true)
+        return 'done'
       }
-      acts.pressedElsewhere(h, option, 'duty-officer', o.at, true)
-      permScreenPressed()                                                // any other prompt still open: over too (as before)
-      return true
+      const r = await remotePrompt(acts, o.bound.lookup)
+      if (typeof r === 'string') return r
+      const left = r.id ? permLeftover.get(r.id) : undefined
+      if (r.id && permLeftover.delete(r.id)) savePermOpen()
+      if (left) permCopiesDone(left.copies, option, `值班員按的：「${o.choose}」`)
+      acts.pressedElsewhere(r, option, 'duty-officer', o.at, true)
+      return 'done'
     },
     answered: (ref, option_id, member, at) => {
       const h = handle(ref), p = promptOf(h)
@@ -1676,7 +1722,7 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
         const behavior: 'allow' | 'deny' = option_id === 'deny' ? 'deny' : 'allow'
         p.ended = { how: 'answered', option: behavior, member, via: 'telegram', at: Date.now() }
         savePermOpen()
-        permCopiesDone(p, behavior, '在值班員的詢問上按的')                 // r3: its own copies close too (no buttons left on an answered prompt)
+        permCopiesDone(p.copies, behavior, '在值班員的詢問上按的')                 // r3: its own copies close too (no buttons left on an answered prompt)
       }
       acts.pressedElsewhere(h, option_id, member ?? '', at)
     },
@@ -1687,17 +1733,15 @@ function menuActions(acts: Onsen.OnsenActions): MenuActions {
       if (ref.id && permLeftover.has(ref.id)) return                     // the previous process's prompt: its restart grace decides
       acts.cancel(h, reason)
     },
-    screenPressed: (tmux, menu) => { if (menu === 'permission' && tmux === own()) permScreenPressed() },
-    // WO-176 r2 (CONTRACT §6 「畫面上同一個詢問只有一個 Action」): a question about the permission prompt on the main's screen uses the channel's Action
-    // for it (the newest open one: Claude Code shows one prompt at a time)
-    shared: async (t, menu, assignees, joined) => {
-      if (menu !== 'permission' || !own() || t.tmux !== own()) return null
-      let best: PermPrompt | null = null
-      for (const p of permPrompts.values()) if (!p.ended && p.action && (p.action.state === 'pending' || p.action.state === 'open') && (!best || p.opened >= best.opened)) best = p
-      let h: Onsen.ActionHandle | null = best?.action ?? null
-      if (!h) {                                                          // after a restart: Onsen's open permission Action of this session
-        h = await acts.findOpen(ONSEN_AGENT, d => d.source === 'permission' && (d.session_id ?? 'main') === 'main', `perm:${ONSEN_AGENT}:adopted:`)
-        if (h?.id && permLeftover.delete(h.id)) savePermOpen()            // the officer's question holds it now
+    // WO-176 r2 / r4 (CONTRACT §6 「畫面上同一個詢問只有一個 Action」): a question about the permission prompt on the main's screen uses that prompt's
+    // Action: the one bound when it was asked (r4: never "the newest open one"); after a restart, Onsen's open one for what it saw
+    shared: async (t, menu, assignees, joined, bound) => {
+      if (menu !== 'permission' || !own() || t.tmux !== own() || bound == null || bound === 'none' || bound === 'unsure') return null
+      let h: Onsen.ActionHandle | null = null
+      if ('key' in bound) { const p = promptByKey(bound.key); h = p && !p.ended ? p.action : null }
+      else {
+        const r = await remotePrompt(acts, bound.lookup)
+        if (typeof r !== 'string') { h = r; if (r.id && permLeftover.delete(r.id)) savePermOpen() }   // the officer's question holds it now
       }
       if (!h) return null
       acts.join(h, assignees, x => joined(x.version))                    // only when one of them is not an assignee yet
@@ -1731,9 +1775,10 @@ async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: O
   const acts = onsenActions!
   if (p.ended?.how === 'answered') { acts.applied(h, { option_id: p.ended.option, resolved_by: h.assignee(p.ended.member) }); return }
   const pending = pendingPermissions.get(p.request_id)
-  if (p.ended || !pending) {
-    if (!p.ended) p.ended = { how: 'gone', via: 'daemon', at: Date.now() }
-    acts.cancel(h, '權限詢問已經不在了（對話關了或重開了，或在畫面上按掉了），沒有按')
+  if (pending && !permLive(pending.server)) pendingPermissions.delete(p.request_id)   // r4: its session's stream is gone (waiting for the GC): the prompt is gone
+  if (p.ended || !pending || !permLive(pending.server)) {
+    if (!p.ended) permGone(p.request_id, '權限詢問已經不在了（對話斷了或重開了）')   // cancelled (at the control's version: the same handle) and its copies closed
+    else acts.cancel(h, '權限詢問已經不在了（對話關了或重開了，或在畫面上按掉了），沒有按')
     return
   }
   if (c.option_id !== 'allow' && c.option_id !== 'deny') { acts.cancel(h, `不認得的選項 ${c.option_id}`); return }
@@ -1751,7 +1796,7 @@ async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: O
     return
   }
   acts.applied(h, { at: new Date().toISOString() })
-  permCopiesDone(p, behavior, '從 Onsen 按的')
+  permCopiesDone(p.copies, behavior, '從 Onsen 按的')
   log('info', `permission ${p.request_id}: ${behavior} pressed in Onsen (action ${c.action_id}); answered Claude Code, ${p.copies.length} Telegram cop${p.copies.length === 1 ? 'y' : 'ies'} edited`)
 }
 
@@ -2810,6 +2855,15 @@ let screenStatus: ScreenStatus | null = null
 /** WO-172 (ONSEN_AVATAR): the bot's profile photo as this agent's Onsen avatar; null: off */
 let avatarSync: AvatarSync | null = null
 let dutyOfficer: DutyOfficer | null = null
+/** WO-176 r4 (Chiron 06:00Z: the test bench needs room to run 「值班員依序按三個權限」 again): DUTY_OFFICER_HOURLY_CAP_AGENTS (plist or machine config,
+ *  read at start), `agent:N[,agent:N…]`: this agent's duty officer may judge N times an hour per pane (and the machine-wide count it checks is at least
+ *  N); everyone else keeps DEFAULT_LIMITS (6 a pane, 30 a machine) */
+function dutyCapOpts(): { limits?: Partial<Limits> } {
+  const n = hourlyCapFor(process.env.DUTY_OFFICER_HOURLY_CAP_AGENTS, ONSEN_AGENT)
+  if (n == null) return {}
+  log('info', `duty-officer: hourly cap ${n} a pane for ${ONSEN_AGENT} (DUTY_OFFICER_HOURLY_CAP_AGENTS)`)
+  return { limits: { callsPerTargetHour: n, callsPerHour: Math.max(DEFAULT_LIMITS.callsPerHour, n) } }
+}
 if (isControlEnabled() || isRoamerEnabled()) {
   dutyOfficer = new DutyOfficer({
     onLook: (tmux, cmd, pane) => { if (screenStatus && tmux === process.env.CHANNEL_BOT_TMUX_SESSION) screenStatus.sample(pane, cmd) },
@@ -2866,7 +2920,7 @@ if (isControlEnabled() || isRoamerEnabled()) {
       } catch (e) { return `failed: ${String(e).slice(0, 120)}` }
     },
     log,
-  })
+  }, dutyCapOpts())
   dutyOfficer.start()
 }
 
@@ -3273,6 +3327,12 @@ bot.on('callback_query:data', async ctx => {
   // not all sessions. The asking server was captured when the permission_request
   // notification arrived (see setNotificationHandler in buildServer()).
   const pending = pendingPermissions.get(request_id)
+  if (pending && !permLive(pending.server)) {                            // WO-176 r4 (Chiron 06:00Z): its conversation is gone (the GC has not evicted it yet)
+    pendingPermissions.delete(request_id)
+    permGone(request_id, '對話已經不在了')                                 // cancelled, every copy closed; nothing sent
+    await ctx.answerCallbackQuery({ text: '這個權限詢問已經不在了，沒有送出' }).catch(() => {})
+    return
+  }
   if (pending) {
     void pending.server.notification({
       method: 'notifications/claude/channel/permission',
@@ -3668,6 +3728,11 @@ async function handleInbound(
     const reqId = permMatch[2]!.toLowerCase()
     const behavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
     const pending = pendingPermissions.get(reqId)
+    if (pending && !permLive(pending.server)) {                          // WO-176 r4: its conversation is gone: cancelled, nothing sent
+      pendingPermissions.delete(reqId)
+      permGone(reqId, '對話已經不在了')
+      return
+    }
     if (pending) {
       void pending.server.notification({
         method: 'notifications/claude/channel/permission',
