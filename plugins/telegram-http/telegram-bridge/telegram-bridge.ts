@@ -135,6 +135,8 @@ export class Bridge {
   readonly two: StageTwo
   readonly agents = new Map<string, Agent>()
   readonly pollers = new Map<string, Poller>()
+  /** client_meta left out until (an Onsen before 0.35.4 refuses it; shared by every poller) */
+  readonly clientMeta = { offUntil: 0 }
   /** listed but not carried (no token, a token Telegram refuses, two daemons): member → why; shown as records with member null */
   readonly missing = new Map<string, { stateDir: string; source: string; why: string }>()
   private conflictAt = new Map<string, number>()
@@ -257,7 +259,7 @@ export class Bridge {
     const p = new Poller(a, {
       onsen: this.onsen, state: this.state, log: (l, msg) => this.log(l, msg), now: this.deps.now, pollTimeoutS: this.cfg.pollTimeoutS,
       buttonKey: k => this.state.data.keys[k] ?? null, reRegister: () => { this.endpointsDirty = true; this.needRegister = true },
-      voice: this.cfg.voice, sorryMs: this.cfg.sorryMs, onButton: (ag, cq) => this.two.button(ag, cq),
+      voice: this.cfg.voice, sorryMs: this.cfg.sorryMs, clientMeta: this.clientMeta, onButton: (ag, cq) => this.two.button(ag, cq),
       noteTopic: (m, c, t, n) => this.two.noteTopic(m, c, t, n), topicName: (m, c, t) => this.two.topicName(m, c, t), ...(this.deps.pollerExtra ?? {}),
     })
     this.pollers.set(a.member, p)

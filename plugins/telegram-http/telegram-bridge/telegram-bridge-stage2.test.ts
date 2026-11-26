@@ -1,7 +1,7 @@
 // telegram-bridge-stage2.test.ts (board WO-196 part B, stage two: the command menu, threads and topics, the restart line, the person's
 // reactions, groups). Same fakes as stage one (fakes.ts); a home of its own.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
@@ -32,11 +32,13 @@ beforeAll(async () => {
   put(join(home, '.config', 'systemd', 'user', 'telegram-daemon.gamma.service.d', 'lanes.conf'), '[Service]\nEnvironment=LANES_AGENT=gamma\n')
   put(join(home, '.config', 'crab-labs-plugins', 'env'), 'ONSEN_BRIDGE=*\n')
   put(join(root, 'cred'), CRED)
+  put(join(root, 'fake-whisper.sh'), '#!/bin/sh\ntest -s "$1" && echo "你好，看一下"\n'); chmodSync(join(root, 'fake-whisper.sh'), 0o755)
   tg.addBot(TOK, 'gamma_bot')
   b = new Bridge(configFromEnv({
     HOME: home, TELEGRAM_BRIDGE_MACHINE: 'txmonster', ONSEN_BASE: onsen.base, TELEGRAM_API_ROOT: tg.root, TELEGRAM_BRIDGE_STATE_DIR: join(root, 'state'),
     CRAB_LABS_PLUGINS_ENV: join(home, '.config', 'crab-labs-plugins', 'env'), TELEGRAM_BRIDGE_CREDENTIAL_FILE: join(root, 'cred'), TELEGRAM_BRIDGE_PLATFORM: 'linux',
-    TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '0',
+    TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '1',
+    CHANNEL_BOT_TRANSCRIBE_CMD: join(root, 'fake-whisper.sh'),
   }), { log: (l, m) => logs.push(`${l} ${m}`) })
   await b.start()
   let on = true
@@ -152,5 +154,49 @@ describe('stage two', () => {
     expect(tg.bots.get(TOK)!.pinned.has(String(GROUP))).toBe(false)
     expect(onsen.bad).toEqual([])
     for (const l of logs) expect(l.includes(TOK.split(':')[1]!)).toBe(false)
+  }, T)
+
+  test('client_meta: a reply to a file, a forward, a voice note, an album → exactly the tag attributes the daemon writes', async () => {
+    const now = Math.floor(Date.now() / 1000), from = { id: JOEY, is_bot: false, first_name: 'Joey', username: 'joey' }, dm = { id: JOEY, type: 'private' }
+    tg.files.set('f/DOC7', new Uint8Array([1, 2, 3])); tg.files.set('f/VO1', new Uint8Array([4, 5, 6])); tg.files.set('f/P1', new Uint8Array([7, 8, 9]))
+    tg.push(TOK, { message: { message_id: 801, from, chat: dm, date: now, text: 'see this', reply_to_message: { message_id: 700, from: { id: 555, is_bot: false, first_name: 'Ann', username: 'ann' },
+      chat: dm, date: now - 60, caption: 'the pdf', document: { file_id: 'DOC7', file_unique_id: 'd7', file_name: 'a.pdf', mime_type: 'application/pdf', file_size: 3 } } } })
+    tg.push(TOK, { message: { message_id: 802, from, chat: dm, date: now, text: 'fwd', forward_origin: { type: 'channel', chat: { id: -100555, type: 'channel', title: 'News', username: 'newsch' }, message_id: 42, date: now - 3600 } } })
+    tg.push(TOK, { message: { message_id: 803, from, chat: dm, date: now, voice: { file_id: 'VO1', file_unique_id: 'v1', duration: 2, mime_type: 'audio/ogg', file_size: 3 } } })
+    tg.push(TOK, { message: { message_id: 804, from, chat: dm, date: now, media_group_id: 'AL1', caption: 'two', photo: [{ file_id: 'P1', file_unique_id: 'p1', file_size: 3 }] } })
+    tg.push(TOK, { message: { message_id: 805, from, chat: dm, date: now, media_group_id: 'AL1', photo: [{ file_id: 'P2GONE', file_unique_id: 'p2', file_size: 3 }] } })
+    tg.push(TOK, { message: { message_id: 806, from, chat: dm, date: now, text: 'plain' } })
+    await until(() => ['801', '802', '803', '804', '805', '806'].every(id => onsen.messages.some(x => x.client_msg_id === id)), 8000, 'all six written')
+    const w = (id: string) => onsen.messages.find(x => x.client_msg_id === id)
+    expect(w('801').client_meta).toEqual({ reply_to_user_id: '555', attachment_origin: 'reply' })
+    expect(w('801')).toMatchObject({ kind: 'text', text: 'see this', reply_to_client_msg_id: '700', reply_to_user: 'ann', reply_to_text: 'the pdf',
+      attachments: [{ kind: 'document', name: 'a.pdf', mime: 'application/pdf', bytes: 3, client_ref: 'DOC7' }] })
+    expect(w('801').attachment_file_ids.length).toBe(1)                                         // the replied-to file, stored in Onsen
+    expect(w('802').client_meta).toEqual({ forward_origin: 'channel', forward_from_id: '-100555', forward_from_username: 'newsch', forward_channel_message_id: '42' })
+    expect(w('803').client_meta).toEqual({ voice_transcript: '你好，看一下' })
+    expect(w('803')).toMatchObject({ kind: 'voice', text: '你好，看一下' })
+    expect(w('804').client_meta).toEqual({ media_group_count: '2' })
+    expect(w('805').client_meta).toEqual({ media_group_count: '2', image_error: 'download failed' })
+    expect('client_meta' in w('806')).toBe(false)                                                // nothing beyond the named fields: none sent
+    for (const id of ['801', '802', '803', '804', '805']) expect(new TextEncoder().encode(JSON.stringify(w(id).client_meta)).length).toBeLessThanOrEqual(4096)
+    expect(onsen.bad).toEqual([])
+  }, T)
+
+  test('an Onsen that does not take client_meta yet (400 naming it): the message goes again without it, and none is sent for 5 min', async () => {
+    onsen.refuseClientMeta = true
+    const now = Math.floor(Date.now() / 1000), from = { id: JOEY, is_bot: false, first_name: 'Joey' }, dm = { id: JOEY, type: 'private' }
+    const fwd = (id: number) => ({ message: { message_id: id, from, chat: dm, date: now, text: 'f', forward_origin: { type: 'user', sender_user: { id: 777, is_bot: false, first_name: 'O', username: 'orig' }, date: now } } })
+    tg.push(TOK, fwd(901))
+    await until(() => onsen.messages.some(x => x.client_msg_id === '901'), 4000, '901 written')
+    expect('client_meta' in onsen.messages.find(x => x.client_msg_id === '901')).toBe(false)
+    expect(b.clientMeta.offUntil).toBeGreaterThan(Date.now() + 200_000)
+    tg.push(TOK, fwd(902))
+    await until(() => onsen.messages.some(x => x.client_msg_id === '902'), 4000, '902 written')
+    expect(logs.filter(l => l.includes('does not take client_meta')).length).toBe(1)
+    await until(() => tg.callsOf(TOK, 'setMessageReaction').some(p => p.message_id === 902), 3000, '👀 on 902')
+    onsen.refuseClientMeta = false; b.clientMeta.offUntil = 0
+    tg.push(TOK, fwd(903))
+    await until(() => onsen.messages.some(x => x.client_msg_id === '903'), 4000, '903 written')
+    expect(onsen.messages.find(x => x.client_msg_id === '903').client_meta).toEqual({ forward_origin: 'user', forward_from_id: '777', forward_from_username: 'orig' })
   }, T)
 })

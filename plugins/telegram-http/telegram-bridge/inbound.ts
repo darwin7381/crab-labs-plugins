@@ -58,6 +58,43 @@ export type PollerDeps = {
   pollTimeoutS?: number
   /** the Onsen-down sentence after this long (default SORRY_MS, 15 s) */
   sorryMs?: number
+  /** shared by the bridge's pollers: until when client_meta is left out (an Onsen that does not take it yet answered 400 naming it) */
+  clientMeta?: { offUntil: number }
+}
+/** how long an album's items are waited for after its newest one arrived (server.ts ALBUM_WINDOW_MS, 1.5 s), so media_group_count is known */
+export const ALBUM_MS = 1_500
+const CLIENT_META_MAX = 4_000
+const META_UNKNOWN = /(不收的欄位|unknown)[^；;]*client_meta/i
+
+/** the facts of a person's Telegram message that §7d's named fields do not carry, under the attribute names server.ts puts on the <channel> tag
+ *  (CONTRACT §7d client_meta; the connector turns each key into that attribute). Values as the daemon writes them (strings). */
+export function clientMetaOf(m: any, o: { fromReply?: boolean; transcript?: string | null; imageError?: boolean; albumCount?: number } = {}): Record<string, string> {
+  const out: Record<string, string> = {}
+  const rt = m?.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
+  if (rt?.from) out.reply_to_user_id = String(rt.from.id)                          // server.ts replyForwardMeta (1.58.24 :3937)
+  if (rt && o.fromReply) out.attachment_origin = 'reply'                             // :3947
+  const fo = m?.forward_origin
+  if (fo) {
+    out.forward_origin = String(fo.type)                                             // :3953
+    if (fo.type === 'user' && fo.sender_user) {
+      out.forward_from_id = String(fo.sender_user.id)                                // :3956
+      if (fo.sender_user.username) out.forward_from_username = safeName(fo.sender_user.username)!   // :3957
+    } else if (fo.type === 'chat' && fo.sender_chat) {
+      out.forward_from_id = String(fo.sender_chat.id)                                // :3962
+    } else if (fo.type === 'channel' && fo.chat) {
+      out.forward_from_id = String(fo.chat.id)                                       // :3965
+      if (fo.chat.username) out.forward_from_username = safeName(fo.chat.username)!  // :3966
+      if (fo.message_id != null) out.forward_channel_message_id = String(fo.message_id)   // :3967
+    }
+  }
+  if (o.imageError) out.image_error = 'download failed'                             // :4280 (one photo), :4478 (an album's)
+  if (o.albumCount && o.albumCount > 0 && m?.media_group_id) out.media_group_count = String(o.albumCount)   // flushAlbum :4465
+  if (o.transcript) out.voice_transcript = o.transcript                             // :4297 (maybeTranscribeVoice :4582: metaExcerpt, 500)
+  // ≤ 4 KB as JSON (Onsen's limit; counted in UTF-8 bytes): the transcript, the only long value, is cut until it fits (… marks the cut)
+  const bytes = () => new TextEncoder().encode(JSON.stringify(out)).length
+  while (bytes() > CLIENT_META_MAX && out.voice_transcript && out.voice_transcript.length > 1) out.voice_transcript = out.voice_transcript.slice(0, Math.floor(out.voice_transcript.length * 0.9)) + '…'
+  if (bytes() > CLIENT_META_MAX) delete out.voice_transcript
+  return out
 }
 
 const defaultSleep = (ms: number, signal: AbortSignal): Promise<void> => new Promise(r => {
@@ -163,10 +200,25 @@ export class Poller {
       }
       if (e.done) continue
       if (e.kind === 'write') {
-        if (!held && this.now() >= e.nextAt) await this.write(e)
+        if (!held && this.albumReady(e) && this.now() >= e.nextAt) await this.write(e)
         if (!e.done) { held = true; await this.maybeSorry(e) }
       }
     }
+  }
+
+  /** an album's item is written once its album is complete: ALBUM_MS after the newest item of it arrived; its count kept for every item */
+  private albums = new Map<string, number>()
+  private albumReady(e: Entry): boolean {
+    const m = e.u.message
+    if (!m?.media_group_id) return true
+    const key = `${m.chat?.id}:${m.media_group_id}`
+    if (this.albums.has(key)) return true
+    const same = [...this.entries.values()].filter(x => x.u.message?.media_group_id === m.media_group_id && String(x.u.message?.chat?.id) === String(m.chat?.id))
+    const newest = Math.max(...same.map(x => x.arrivedAt))
+    if (this.now() - newest < ALBUM_MS) { e.nextAt = Math.max(e.nextAt, newest + ALBUM_MS); return false }
+    this.albums.set(key, same.length)
+    if (this.albums.size > 500) this.albums.delete(this.albums.keys().next().value!)
+    return true
   }
 
   // ---- what an update is -----------------------------------------------------------------------------------------------------------
@@ -306,14 +358,20 @@ export class Poller {
       else text = ''
       const rt = m.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
       const thread = m.message_thread_id != null && m.is_topic_message !== false ? String(m.message_thread_id) : null
-      const att = shape.attachments?.[0] ?? null
+      let att = shape.attachments?.[0] ?? null, attK = attKind(shape.kind)
+      // a text (or rich) message with no file of its own that replies to one with a file: that file comes with it (server.ts replyAttachment; the
+      // tag then says attachment_origin="reply")
+      if (!att && rt && (m.text != null || m.rich_message)) {
+        const rs = inboundShape(rt)
+        if (rs.attachments?.[0]?.file_id && rs.kind !== 'sticker') { att = rs.attachments[0]; attK = attKind(rs.kind); e.cache.fromReply = true; e.cache.photo = rs.kind === 'photo' }
+      } else e.cache.photo = shape.kind === 'photo'
       const fo = m.forward_origin
       e.cache.body = {
         member: a.member, client_user_id: String(m.from.id),
         client_user: { username: m.from.username ?? null, display_name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || null },
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
         kind: shape.kind, attachment_file_ids: [] as string[],
-        attachments: att ? [{ kind: attKind(shape.kind), name: att.name ?? null, mime: att.mime ?? mimeOf(att.name) ?? null, bytes: att.size ?? null, client_ref: att.file_id ?? null }] : [],
+        attachments: att ? [{ kind: attK, name: att.name ?? null, mime: att.mime ?? mimeOf(att.name) ?? null, bytes: att.size ?? null, client_ref: att.file_id ?? null }] : [],
         reply_to_client_msg_id: rt ? String(rt.message_id) : null,
         reply_quote: m.quote?.text ? metaExcerpt(m.quote.text) : null,
         reply_to_text: rt ? ((t => t ? metaExcerpt(t) : null)(rt.text ?? rt.caption ?? (rt.rich_message ? richToMarkdown(rt.rich_message) || undefined : undefined) ?? mediaKindLabel(rt))) : null,
@@ -335,7 +393,7 @@ export class Poller {
         const got = await telegramFile({ fileId: att.client_ref, size: att.bytes ?? undefined, getFile: id => a.tg.getFile(id), fileUrl: p => a.tg.fileUrl(p) })
         if ('why' in got) {
           this.d.log('warn', `${a.member}: the file of tg:${m.message_id} is not stored in Onsen: ${got.why}; written with its name and Telegram id only`)
-          e.cache.fileDone = true
+          e.cache.fileDone = true; e.cache.notStored = true
         } else e.cache.got = got
       }
       if (e.cache.got && (m.voice || m.audio) && this.d.voice?.on && e.cache.transcript === undefined) {
@@ -346,10 +404,21 @@ export class Poller {
         const r = await this.d.onsen.upload(e.cache.got.bytes, { key: body.idem_key, name: att.name ?? e.cache.got.name ?? null, mime: att.mime })
         if ('id' in r) { body.attachment_file_ids = [r.id]; e.cache.fileDone = true; e.cache.got = null }
         else if (r.retry) return { status: 503, json: { error: { code: 'service_unavailable', message: r.error } } }
-        else { this.d.log('warn', `${a.member}: the file of tg:${m.message_id} is not stored in Onsen: ${r.error}`); e.cache.fileDone = true; e.cache.got = null }
+        else { this.d.log('warn', `${a.member}: the file of tg:${m.message_id} is not stored in Onsen: ${r.error}`); e.cache.fileDone = true; e.cache.got = null; e.cache.notStored = true }
       }
     }
-    return this.d.onsen.req('POST', '/bridge/messages', body, { idem: body.idem_key })
+    const meta = clientMetaOf(m, { fromReply: e.cache.fromReply, transcript: e.cache.transcript ?? null, imageError: !!(e.cache.photo && e.cache.notStored),
+      albumCount: m.media_group_id ? this.albums.get(`${chat}:${m.media_group_id}`) : undefined })
+    const cm = this.d.clientMeta
+    const withMeta = Object.keys(meta).length > 0 && !(cm && this.now() < cm.offUntil)
+    const ans = await this.d.onsen.req('POST', '/bridge/messages', withMeta ? { ...body, client_meta: meta } : body, { idem: body.idem_key })
+    // an Onsen that does not take client_meta yet (before 0.35.4) answers 400 naming it: the message goes again without it, and for 5 min none is sent
+    if (withMeta && ans.status === 400 && META_UNKNOWN.test(errSaid(ans))) {
+      if (cm) cm.offUntil = this.now() + 300_000
+      this.d.log('warn', `${a.member}: Onsen does not take client_meta yet (${errSaid(ans).slice(0, 80)}): tg:${m.message_id} sent again without it; none sent for 5 min`)
+      return this.d.onsen.req('POST', '/bridge/messages', body, { idem: body.idem_key })
+    }
+    return ans
   }
   async writeEdit(e: Entry): Promise<Answer> {
     const m = e.u.edited_message

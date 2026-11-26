@@ -44,7 +44,8 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
   1. Its file is fetched from Telegram (≤ 20 MB) and stored with `POST /v1/files`.
   2. A voice note is transcribed locally (`CHANNEL_BOT_TRANSCRIBE_CMD`, else `whisper` on CPU; `TELEGRAM_BRIDGE_VOICE=0` turns it off). The transcript is the text.
   3. `POST /v1/bridge/messages`.
-  4. Only when Onsen answers 2xx: 👀 (`access.json ackReaction`; unset gives 👀, `''` gives none), and the update is done.
+  4. `client_meta` carries the facts §7d's named fields don't, under the exact attribute names `server.ts` puts on the `<channel>` tag (the connector turns each key into that attribute): `reply_to_user_id`, `attachment_origin` (`reply`: the file is the replied-to message's, which comes with a text reply as the daemon's `replyAttachment` did), `forward_origin`, `forward_from_id`, `forward_from_username`, `forward_channel_message_id`, `image_error` (`download failed`: a photo not stored), `media_group_count` (album items wait 1.5 s after the newest one, as the daemon's album window did), `voice_transcript`. It is sent only when non-empty and kept ≤ 4 KB. If Onsen answers 400 naming `client_meta` (before 0.35.4), the message goes again without it, and none is sent for 5 min.
+  5. Only when Onsen answers 2xx: 👀 (`access.json ackReaction`; unset gives 👀, `''` gives none), and the update is done.
 - **Order.** Writes go strictly in order, one at a time per bot.
 - **Edits and reactions.** An edit goes to `POST /v1/bridge/messages/edit`; the person's reaction to `POST /v1/bridge/reactions`. Onsen answering 404 (a message it never had) drops it.
 - **Onsen down** (no answer, 5xx, 429, 401, 404 `no_endpoint`):

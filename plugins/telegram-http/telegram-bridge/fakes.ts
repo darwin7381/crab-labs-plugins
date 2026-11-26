@@ -135,6 +135,8 @@ export class FakeOnsen {
   /** (client_user_id) → member */
   identities = new Map<string, string>([['1828173984', 'joey']])
   notPeople = new Set<string>()
+  /** answer client_meta with 400 as an Onsen before 0.35.4 does */
+  refuseClientMeta = false
   actionDeliveries: Array<{ id: string; body: any }> = []
   members: Array<{ name: string; display_name: string; kind: string }> = []
   messages: any[] = []
@@ -237,7 +239,13 @@ export class FakeOnsen {
       return f ? new Response(f.bytes, { headers: { 'content-type': f.mime } }) : this.e(404, 'not_found', 'no file')
     }
     if (p === '/v1/bridge/messages' && req.method === 'POST') {
-      const keys = Object.keys(body ?? {}).sort()
+      if ('client_meta' in (body ?? {})) {
+        if (this.refuseClientMeta) return this.e(400, 'invalid_request', `不收的欄位：client_meta；收：${BRIDGE_MSG_KEYS.join('、')}`)   // Onsen before 0.35.4
+        const cm = body.client_meta
+        this.check(cm && typeof cm === 'object' && !Array.isArray(cm) && Object.values(cm).every(v => v === null || ['string', 'number', 'boolean'].includes(typeof v)), 'client_meta shape')
+        this.check(new TextEncoder().encode(JSON.stringify(cm)).length <= 4096, 'client_meta ≤ 4 KB')
+      }
+      const keys = Object.keys(body ?? {}).filter(k => k !== 'client_meta').sort()
       this.check(keys.join(',') === [...BRIDGE_MSG_KEYS].sort().join(','), `bridge message keys ${keys.join(',')}`)
       for (const k of BRIDGE_MSG_KEYS) this.check(body[k] !== undefined && (body[k] !== null || NULLABLE.has(k)), `bridge message ${k} missing or null`)
       this.check(typeof body.text === 'string' && typeof body.kind === 'string' && Array.isArray(body.attachments) && Array.isArray(body.attachment_file_ids), 'bridge message types')
