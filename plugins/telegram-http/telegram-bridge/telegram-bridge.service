@@ -1,0 +1,26 @@
+# telegram-bridge (WO-196 part B): one per machine; carries the bots of the agents named in ONSEN_BRIDGE (~/.config/crab-labs-plugins/env)
+# between Telegram and Onsen's bridge interface. See README.md beside this file.
+# txmonster (systemd --user):
+#   install -m 644 telegram-bridge.service ~/.config/systemd/user/telegram-bridge.service
+#   systemctl --user daemon-reload && systemctl --user enable --now telegram-bridge
+# The program runs from its own pinned checkout ~/.claude/telegram-bridge (not the live plugin checkout); to update: fetch, checkout --detach
+# <commit>, restart. ONSEN_BASE: the code's default. No bot token is in this file: each one is read from its agent's own .telegram-state/.env.
+[Unit]
+Description=telegram-bridge: the Telegram bots of this machine's agents, carried to and from Onsen (WO-196)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.claude/telegram-bridge/plugins/telegram-http/telegram-bridge
+ExecStart=%h/.bun/bin/bun run %h/.claude/telegram-bridge/plugins/telegram-http/telegram-bridge/telegram-bridge.ts
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TELEGRAM_BRIDGE_MACHINE=txmonster
+Environment=TELEGRAM_BRIDGE_CREDENTIAL_FILE=%h/.config/mesh/telegram-bridge-txmonster.credential
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
