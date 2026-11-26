@@ -3,6 +3,7 @@
 - **No Call state for a Call this agent made**: an answer that names the Call it answers (`refs.call`, with no reply_to: our own main answering by event id or delivery id, lab-relay) reaches the caller with that Call's id (Onsen 0.33.1), and the daemon took it for a Call it received and wrote accepted / running / completed for it (403). Such an item is no Call of this agent's now (`answers_call`); a Call this agent received is reported as before.
 - **Roamers record nothing**: a roamer's daemon (`ROAMER_MODE=1`) speaks for no Onsen member and could never post (the four roamers held ~1.6 MB each, posted 0); it records nothing into the spool and runs no sync, and says so once at start with the bytes an older version left there (kept, not deleted).
 - `onsen-client.ts` `RETRYABLE_4XX`, `credentialRefused`, `refusedForGood`, `skipped`, `answeredCall`, `isRoamerEnv` / `recordFor`; `server.ts` `wakeFactsOf`, the roamer start line; `lanes.ts` `InEvent.answers_call`, `callRefOf`. Tests: onsen-spool-skip (new, 8), lanes-wo175 (+1); the Onsen stand-in has `PUT /v1/calls/<id>/state`.
+- Also in this version: Epeius's `telegram-bridge/` (2026478: take first, let go last — a member taken off the list is carried until its daemon polls again); a separate program, nothing the daemons run changes.
 - Roll back: 1.58.31.
 
 ## 1.58.31 — 2026-11-27 (WO-197 segment 2 follow-up, Chiron lab round 5 on 1.58.29, rule 18:48Z point 2: a connector's /clear is one message)
