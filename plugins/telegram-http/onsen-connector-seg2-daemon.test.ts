@@ -95,7 +95,7 @@ test('2. /status from Onsen (kind command): today\'s handler answers it with one
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 })
 
-test('3. bare /model: one Action (source menu, menu_kind model_picker, the answer its body, its buttons the options, the owner asked), no second message; a press runs the tap\'s /model <value>', async () => {
+test('3. bare /model: one Action (source menu, menu_kind model_picker, the answer its body, its buttons the options, the owner asked, expires_at 10 min ahead), no second message; a press runs the tap\'s /model <value>', async () => {
   const before = said().length
   expect((await hand(k, cmd(2002, '/model'), 2)).json.handled_here).toBe(true)
   expect(await until(() => made('k', a => a.menu_kind === 'model_picker').length === 1, 8000)).toBe(true)
@@ -105,6 +105,10 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
   expect(a.summary).toBe(a.body.text.split('\n')[0])
   expect(a.options.length).toBeGreaterThanOrEqual(2)
   expect(a.options[0]).toEqual({ id: '1', label: expect.any(String) })
+  // Chiron mesh 12916 point 3: a command's choice expires 10 minutes after it is opened (the create body the stand-in got)
+  const sent = onsen.acalls.find(c => c.who === 'k' && c.method === 'POST' && c.path === '/v1/actions' && c.body?.menu_kind === 'model_picker')!
+  const ahead = Date.parse(sent.body.expires_at) - sent.at
+  expect(ahead).toBeGreaterThan(595_000); expect(ahead).toBeLessThanOrEqual(600_000)
   await sleep(500)
   expect(said().length).toBe(before)                                       // CONTRACT §7d: no second message
   expect(await control(k, onsen.press(a.id, '2'))).toBe(202)

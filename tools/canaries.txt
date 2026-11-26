@@ -341,3 +341,6 @@ plugins/telegram-http/onsen-connector.ts::fresh(): boolean { this.at = -Infinity
 plugins/telegram-http/connector-poll-start-daemon.test.ts::the next try does not start it (no getMe, deleteWebhook or getUpdates sent)
 plugins/telegram-http/onsen-connector.ts::const open = label.slice(0, -1) + '｜'
 plugins/telegram-http/onsen-connector.test.ts::starts with the label: the label goes, 「負責：X」 (no leading 「｜」) is the first line
+plugins/telegram-http/server.ts::const COMMAND_CHOICE_S = 600
+plugins/telegram-http/server.ts::expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString() },
+plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::a command's choice expires 10 minutes after it is opened (the create body the stand-in got)

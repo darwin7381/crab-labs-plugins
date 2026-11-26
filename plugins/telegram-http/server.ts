@@ -581,6 +581,8 @@ function commandMenuKind(datas: string[]): string {
 /** a command's choice asked in Onsen: the Action → the callback data of each option (1…n) and where the command was typed */
 type KeyboardAsk = { h: Onsen.ActionHandle; chat: string; datas: string[]; where?: Lanes.TopicAsk; ended: boolean }
 const keyboardAsks = new Map<string, KeyboardAsk>()
+/** Chiron mesh 12916 point 3: a command's choice is good for 10 minutes (expires_at); Onsen marks it expired then (not /clear's 5 s one) */
+const COMMAND_CHOICE_S = 600
 /** a connector's answer (sendTextWithMaybeKeyboard): with buttons, one Action (source menu, its text the body, its buttons the options, the owner
  *  asked; CONTRACT §7d: no second message); without, one Onsen message (the sender as the caller named it, system:control by default; the turn of a
  *  message the daemon answers itself, so it is that message's response). An Action that cannot be made: the text as a message */
@@ -605,7 +607,8 @@ function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: L
   const ten = btns.slice(0, 10), body = text.trim(), summary = body.split('\n')[0] || '請選一個'
   const datas = ten.map(b => b.callback_data!)
   const h = acts.open({ source: 'menu', menu_kind: commandMenuKind(datas), session_id: 'main', assignees, summary, ...(body ? { body } : {}),
-    options: ten.map((b, i) => ({ id: String(i + 1), label: b.text })) }, `cmd:${ONSEN_AGENT}:${chat}:${Date.now()}:${randomBytes(3).toString('hex')}`)
+    options: ten.map((b, i) => ({ id: String(i + 1), label: b.text })), expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString() },
+    `cmd:${ONSEN_AGENT}:${chat}:${Date.now()}:${randomBytes(3).toString('hex')}`)
   if (!h) return false
   keyboardAsks.set(h.key, { h, chat, datas, ...(where ? { where } : {}), ended: false })
   while (keyboardAsks.size > 200) keyboardAsks.delete(keyboardAsks.keys().next().value!)
