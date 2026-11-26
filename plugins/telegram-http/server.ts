@@ -1059,10 +1059,21 @@ bot.api.config.use(async (prev, method, payload, signal) => {
 // daemon, and nothing is recorded for it. The one exception: the long poll's last getUpdates while it is being handed over (grammy's bot.stop() saves
 // the offset), so the updates this daemon already handled are not given to the bridge again
 let connectorHandover = false
+/** the long poll's loop is running (startPolling) */
+let pollRunning = false
 const connectorBlocked: Record<string, number> = {}
+/** WO-197 (Chiron 19:21Z: switched off then on, bot_api_refused {deleteWebhook: 1}, no log line): what the long poll itself sends to start and run
+ *  (grammy's bot.start: getMe, deleteWebhook, getUpdates) while the poll is still winding down after the hand-over began. Not sent and not counted
+ *  as a refusal (nothing tried to talk to Telegram); one log line per method and hand-over */
+const POLL_OWN = new Set(['getMe', 'deleteWebhook', 'getUpdates'])
+const pollCutSaid = new Set<string>()
 function connectorRefuses(method: string): boolean {
   if (!(INBOX_ONLY ? false : !TOKEN || connectorNow())) return false
   if (connectorHandover && method === 'getUpdates' && TOKEN) return false
+  if (pollRunning && POLL_OWN.has(method)) {
+    if (!pollCutSaid.has(method)) { pollCutSaid.add(method); log('info', `connector: the long poll's ${method} after the hand-over began was not sent (the poll is stopping)`) }
+    return true
+  }
   connectorBlocked[method] = (connectorBlocked[method] ?? 0) + 1
   return true
 }
@@ -5459,6 +5470,9 @@ bot.catch(err => {
 async function pollLoop(): Promise<void> {
   for (let attempt = 1; ; attempt++) {
     if (connectorNow() || !TOKEN) return              // WO-197: the bridge polls this bot now
+    // WO-197 (Chiron 19:21Z): the machine config read now, not the 30 s copy: a poll is not started (deleteWebhook…) just after the agent was named
+    if (bridgeSwitch.fresh()) return
+    pollCutSaid.clear()
     try {
       await bot.start({
         onStart: info => {
@@ -5526,7 +5540,6 @@ function botMenu(): Array<{ command: string; description: string }> {
 // WO-197: the long poll runs only while this agent is not in ONSEN_BRIDGE (and it has a token). The switch is looked at every 5 s (the machine config
 // itself is read at most every 30 s): named → the poll is stopped (its offset saved: connectorHandover) and nothing more goes to Telegram; taken off →
 // the poll starts again
-let pollRunning = false
 function startPolling(): void {
   if (INBOX_ONLY || pollRunning || shuttingDown || !TOKEN || connectorNow()) return
   pollRunning = true

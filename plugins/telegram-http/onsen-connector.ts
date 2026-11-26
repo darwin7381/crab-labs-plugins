@@ -64,6 +64,8 @@ export class BridgeSwitch {
     return this.v
   }
   on(): boolean { return bridgeOn(this.value(), this.o.agent) }
+  /** WO-197 (Chiron 19:21Z): the machine config read now (before a poll starts), the value kept for the next 30 s */
+  fresh(): boolean { this.at = -Infinity; return this.on() }
 }
 
 /** a Bot API call the connector refused to make (its bot is the bridge's now) */

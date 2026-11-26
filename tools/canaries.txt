@@ -335,3 +335,7 @@ plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the line by conversat
 plugins/telegram-http/server.ts::async function albumHeldItems(entry: AlbumEntry, key: string): Promise<void> {
 plugins/telegram-http/server.ts::if (count != null) entry.expect = Math.max(entry.expect ?? 0, count)
 plugins/telegram-http/onsen-album-crash-daemon.test.ts::one tag, three files, media_group_count 3, nothing twice
+plugins/telegram-http/server.ts::if (bridgeSwitch.fresh()) return
+plugins/telegram-http/server.ts::const POLL_OWN = new Set(['getMe', 'deleteWebhook', 'getUpdates'])
+plugins/telegram-http/onsen-connector.ts::fresh(): boolean { this.at = -Infinity; return this.on() }
+plugins/telegram-http/connector-poll-start-daemon.test.ts::the next try does not start it (no getMe, deleteWebhook or getUpdates sent)
