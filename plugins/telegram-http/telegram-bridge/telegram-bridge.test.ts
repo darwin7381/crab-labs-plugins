@@ -171,16 +171,18 @@ describe('drawing helpers', () => {
     expect(statusView(main({ activity: 'stuck', turn: { started_at: '2026-11-26T11:40:00Z' } }), now)!.view.state).toBe('stuck')
   })
   test('a 409 names its member in any of its shapes', () => {
+    expect(takenOf({ error: { code: 'endpoint_taken', message: '…', taken: [{ member: 'alpha', bridge: 'telegram-bridge-mbp' }] } }, ['alpha', 'beta'])).toEqual({ members: ['alpha'], holder: 'telegram-bridge-mbp' })   // Onsen 0.35.0
     expect(takenOf({ error: { code: 'endpoint_taken', member: 'alpha', by: 'telegram-bridge-mbp' } }, ['alpha', 'beta'])).toEqual({ members: ['alpha'], holder: 'telegram-bridge-mbp' })
     expect(takenOf({ error: { code: 'endpoint_taken', taken: [{ member: 'beta', by: 'x' }] } }, ['alpha', 'beta'])).toEqual({ members: ['beta'], holder: 'x' })
     expect(takenOf({ error: { code: 'endpoint_taken', message: 'beta 已經由 telegram-bridge-mbp 帶著' } }, ['alpha', 'beta']).members).toEqual(['beta'])
     expect(takenOf({ error: { code: 'endpoint_taken', message: 'taken' } }, ['alpha']).members).toEqual([])
   })
-  test('an endpoint record: one line, the bot and its state; conflict and error carry no member', () => {
+  test('an endpoint record: one line, the bot and its state; a conflict keeps its member (it claims nothing), an error has none', () => {
     const base = { member: 'alpha', username: 'alpha_bot', botId: '7', holder: null, lastError: null, telegramConflict: false, lastUpdateAt: null, stateDir: '/s', source: 'p', accepted: true, displayName: 'Alpha 號' }
     const ok = endpointRecord({ ...base, state: 'ok' }) as any
     expect(ok).toMatchObject({ id: 'alpha', member: 'alpha', state: 'ok', title: 'Alpha 號（@alpha_bot）', line: '@alpha_bot｜alpha｜收發中' })
-    expect((endpointRecord({ ...base, state: 'conflict', holder: 'telegram-bridge-mbp' }) as any)).toMatchObject({ member: null, line: '@alpha_bot｜alpha｜另一支橋接帶著｜由 telegram-bridge-mbp 帶' })
+    expect((endpointRecord({ ...base, state: 'conflict', holder: 'telegram-bridge-mbp' }) as any)).toMatchObject({ member: 'alpha', state: 'conflict', line: '@alpha_bot｜alpha｜另一支橋接帶著｜由 telegram-bridge-mbp 帶' })
+    expect((endpointRecord({ ...base, state: 'error', lastError: 'Telegram 不認這個 token（getMe 401）' }) as any)).toMatchObject({ member: null, state: 'error' })
     expect(Drawer.coalesce([{ type: 'observation', member: 'a', chat: '1', seq: '1' }, { type: 'message', seq: '2' }, { type: 'observation', member: 'a', chat: '1', seq: '3' }]).map(x => x.seq)).toEqual(['2', '3'])
   })
 })
@@ -230,14 +232,15 @@ describe('the bridge, end to end against the fakes', () => {
     await until(() => !existsSync(join(sd('alpha'), 'approved', '555')), 2000, 'marker removed')
   }, T)
 
-  test('a second bridge listing the same member: 409 endpoint_taken, its record has no member, its bot is never polled, nothing doubles on Telegram', async () => {
+  test('a second bridge listing the same member: 409 endpoint_taken, its record says conflict (claiming nothing), its bot is never polled, nothing doubles on Telegram', async () => {
     const callsBefore = tg.bots.get(TOK.alpha)!.getUpdatesCalls
     const sentBefore = tg.sent.length
     const mbp = mkBridge('mbp', join(root, 'state-mbp'), { ONSEN_BRIDGE: 'alpha' })
     const stopMbp = await run(mbp)
     await until(() => (onsen.lists.get('telegram-bridge-mbp') ?? []).length === 1, 4000, 'mbp list')
     const r = onsen.lists.get('telegram-bridge-mbp')![0]
-    expect(r).toMatchObject({ id: 'alpha', member: null, state: 'conflict' })
+    expect(r).toMatchObject({ id: 'alpha', member: 'alpha', state: 'conflict' })
+    expect(onsen.holders.get('alpha')).toBe('telegram-bridge-macmini')
     expect(r.line).toBe('@alpha_bot｜alpha｜另一支橋接帶著｜由 telegram-bridge-macmini 帶')
     await Bun.sleep(1200)                                                                       // past its conflict retry (0.5 s): asked again, refused again
     expect(mbp.stats.endpoint_conflicts).toBeGreaterThanOrEqual(2)
@@ -365,10 +368,11 @@ describe('the bridge, end to end against the fakes', () => {
     await until(() => tg.callsOf(t, 'answerCallbackQuery').some(p => p.callback_query_id === 'cq1' && p.text === '已送出：✅ Allow'), 3000, 'toast')
     tg.push(t, { callback_query: { id: 'cq2', from: { id: 555 }, data: kb[0][1].callback_data, message: { message_id: am.message_id, chat: { id: JOEY, type: 'private' } } } })
     await until(() => tg.callsOf(t, 'answerCallbackQuery').some(p => p.callback_query_id === 'cq2' && p.text === 'Not authorized.'), 3000, 'stranger refused')
-    onsen.push({ type: 'action_resolved', member: 'alpha', conversation_id: 'cv', chat, action_id: 'act9', outcome: '✅ Allowed', by: 'joey', client_msg_ids: [] })
+    expect(onsen.actionDeliveries.find(d => d.id === 'act9')!.body).toEqual({ client_user_id: chat, client_msg_ids: [String(am.message_id)] })
+    onsen.push({ type: 'action_resolved', member: 'alpha', conversation_id: 'cv', chat, action_id: 'act9', outcome: 'resolved', option_id: 'allow', option_label: '✅ Allow', by: 'joey', client_msg_ids: [String(am.message_id)] })
     await until(() => tg.callsOf(t, 'editMessageText').some(p => p.message_id === am.message_id), 3000, 'resolved drawn')
     const ed = tg.callsOf(t, 'editMessageText').find(p => p.message_id === am.message_id)
-    expect(ed.rich_message.markdown).toBe('🔐 Bash: rm -rf build\n\n✅ Allowed（joey）'); expect(ed.reply_markup.inline_keyboard).toEqual([])
+    expect(ed.rich_message.markdown).toBe('🔐 Bash: rm -rf build\n\n→ ✅ Allow（joey）'); expect(ed.reply_markup.inline_keyboard).toEqual([])
     // the pinned status: sent and pinned silently, then edited
     onsen.push({ type: 'observation', member: 'alpha', conversation_id: 'cv', chat, status: { presence: 'online', lifecycle: 'ready', main_session_id: 'main', sessions: [{ id: 'main', kind: 'main', activity: 'idle', blockers: [], activity_since: new Date().toISOString() }] } })
     await until(() => tg.bots.get(t)!.pinned.has(chat), 3000, 'pinned')

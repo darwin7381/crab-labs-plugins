@@ -12,7 +12,8 @@
 //   Onsen down a write Onsen does not take (no answer, 5xx, 429, 401, 404 no_endpoint) is tried again (2 s, 4 s, then every 5 s) and holds every
 //             later write of this bot. A person's message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 <agent>；
 //             連上會自動補交，不用重傳。」 (once per message, remembered across restarts). Nothing is dropped and nothing written twice (the idem_key).
-//   refused   403 unknown_identity / not_allowed, 400: not tried again (it would never pass); one reply saying it was not handed over; done.
+//   refused   403 not_allowed (unknown_identity before Onsen 0.35.1): not tried again, nothing answered, done. 400: not tried again; in a DM one reply
+//             saying it was not handed over.
 //   local     /start and /help in a DM: the bridge answers (the daemon's text). Any other /command goes to Onsen as a message, kind `command`.
 //             A button: an Action's option → POST /v1/bridge/actions/<id>/resolve; 「不要顯示這則」 under the pinned status → dismissed here.
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -242,13 +243,13 @@ export class Poller {
       e.nextAt = this.now() + (e.tries <= 1 ? 2_000 : e.tries === 2 ? 4_000 : 5_000)
       return
     }
-    // refused for good: never tried again
+    // refused for good: never tried again. 403 (not_allowed: the account is an agent or a system member; unknown_identity before Onsen 0.35.1):
+    // nothing is answered, the update is done. 400 (the bridge sent something Onsen does not take): the person is told it was not handed over (a DM).
     this.a.stats.refused++
-    this.d.log('warn', `${this.a.member}: Onsen refused ${this.ref(e)}: HTTP ${ans.status} ${code} ${errSaid(ans)}; not handed over`)
-    if (what === 'message') {
+    this.d.log(ans.status === 403 ? 'warn' : 'error', `${this.a.member}: Onsen refused ${this.ref(e)}: HTTP ${ans.status} ${code} ${errSaid(ans)}; not handed over, not tried again`)
+    if (what === 'message' && ans.status !== 403 && e.u.message.chat?.type === 'private') {
       const m = e.u.message
-      const why = code === 'unknown_identity' ? 'Onsen 不認得這個帳號' : code === 'not_allowed' ? '這個帳號不能跟它說話' : `Onsen 收不下（${code || ans.status}）`
-      await this.send(String(m.chat.id), `${why}，這一則沒有交給 ${this.a.name()}。`, { reply_parameters: { message_id: m.message_id, allow_sending_without_reply: true } })
+      await this.send(String(m.chat.id), `Onsen 收不下這一則（${code || ans.status}），沒有交給 ${this.a.name()}。`, { reply_parameters: { message_id: m.message_id, allow_sending_without_reply: true } })
     }
     e.done = true
     this.ok()

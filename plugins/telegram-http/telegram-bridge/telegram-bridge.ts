@@ -10,8 +10,8 @@
 //              installed daemons). Each token from that agent's own .telegram-state/.env, in memory only.
 //   endpoints  PUT /v1/extensions/<name>/collections/endpoints, one record per carried agent (see endpointRecord), when it changed and every
 //              30 s (ttl 120 s). A bot is polled only once Onsen's list took its member from this bridge. 409 endpoint_taken: that member is
-//              another bridge's: its record goes with member null and state conflict, its bot is not polled, and it is asked for again every
-//              5 min. Onsen not answering at start: the members it took last time (state.json) are polled meanwhile.
+//              another bridge's (error.taken [{member, bridge}]): its record goes with state conflict (which claims nothing), its bot is not
+//              polled, and it is asked for again every 5 min. Onsen not answering at start: the members it took last time (state.json) are polled meanwhile.
 //   in         inbound.ts (one long poll per bot, all in this process). out: outbound.ts, from one long poll of GET /v1/bridge/feed (the cursor
 //              in state.json; a restart goes on from it).
 import { mkdirSync, readFileSync } from 'node:fs'
@@ -22,6 +22,7 @@ import { carried, discover, MEMBER_RE, readSettings, readToken, settingsPath, ty
 import { Poller, type PollerDeps } from './inbound.ts'
 import { errCode, errSaid, OnsenClient } from './onsen.ts'
 import { Drawer } from './outbound.ts'
+import { StageTwo } from './stage-two.ts'
 import { StateStore } from './state.ts'
 import { isRich } from './tg-format.ts'
 import { errText, TgError, type TgOptions } from './tg.ts'
@@ -96,7 +97,7 @@ export function endpointRecord(a: { member: string; username: string; botId: str
     id: a.member,
     title: oneLine(`${a.displayName || a.member}（${bot}）`, LIMIT.title),
     line: oneLine([bot, a.member, STATE_ZH[a.state] ?? a.state, why].filter(Boolean).join('｜'), LIMIT.line),
-    member: a.state === 'ok' ? a.member : null,
+    member: a.state === 'error' ? null : a.member,                 // Onsen 0.35.0: a conflict record claims nothing; an error one must not claim either
     state: a.state,
     attributes: {
       bot_id: a.botId || null, username: a.username || null, state_dir: a.stateDir.slice(0, LIMIT.attr), found_by: a.source.slice(0, LIMIT.attr),
@@ -120,7 +121,7 @@ export function takenOf(json: any, ours: string[]): { members: string[]; holder:
   visit(e)
   const msg = String(e.message ?? '')
   for (const m of ours) if (new RegExp(`(^|[^a-z0-9-])${m.replace(/[-]/g, '\\-')}([^a-z0-9-]|$)`).test(msg)) found.add(m)
-  const h = e.by ?? e.holder ?? e.held_by ?? e.taken_by ?? e.extension ?? (Array.isArray(e.taken) ? e.taken[0]?.by ?? e.taken[0]?.extension : null)
+  const h = (Array.isArray(e.taken) ? e.taken[0]?.bridge ?? e.taken[0]?.by : null) ?? e.by ?? e.holder ?? e.bridge ?? e.extension
   return { members: [...found], holder: typeof h === 'string' ? h : null }
 }
 
@@ -131,6 +132,7 @@ export class Bridge {
   readonly onsen: OnsenClient
   readonly state: StateStore
   readonly drawer: Drawer
+  readonly two: StageTwo
   readonly agents = new Map<string, Agent>()
   readonly pollers = new Map<string, Poller>()
   /** listed but not carried (no token, a token Telegram refuses, two daemons): member → why; shown as records with member null */
@@ -159,8 +161,9 @@ export class Bridge {
     this.onsen = new OnsenClient(cfg.base, cfg.credentialFile, cfg.onsenTimeoutMs, deps.fetch ?? fetch)
     mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 })
     this.state = new StateStore(cfg.stateDir, (l, m) => this.log(l as any, m))
+    this.two = new StageTwo({ onsen: this.onsen, state: this.state, log: (l, m) => this.log(l, m), now: deps.now })
     this.drawer = new Drawer({ onsen: this.onsen, state: this.state, log: (l, m) => this.log(l, m), agentOf: m => this.agents.get(m) ?? null, useRich: cfg.useRich,
-      now: deps.now, nameOf: m => this.known?.get(m) ?? m, retryDelaysMs: cfg.retryDelaysMs })
+      now: deps.now, nameOf: m => this.known?.get(m) ?? m, retryDelaysMs: cfg.retryDelaysMs, extra: (a, item) => this.two.draw(a, item) })
   }
   now(): number { return (this.deps.now ?? Date.now)() }
   /** a log line; a warning with the same key at most once in 5 minutes */
@@ -205,7 +208,12 @@ export class Bridge {
         if (have.tokenMtime !== tok.mtime) {
           const was = have.botId
           have.setToken(tok)
-          if (have.botId !== was) { this.log('info', `${m}: its .env has another bot now (${was} → ${have.botId}); polling it`); await this.restartPoller(m) }
+          if (have.botId !== was) {
+            this.log('info', `${m}: its .env has another bot now (${was} → ${have.botId}); polling that one`)
+            have.username = ''; have.accepted = false; this.endpointsDirty = true
+            await this.getMe(have)
+            await this.restartPoller(m)
+          }
         }
         if (!have.username) await this.getMe(have)
         continue
@@ -249,7 +257,8 @@ export class Bridge {
     const p = new Poller(a, {
       onsen: this.onsen, state: this.state, log: (l, msg) => this.log(l, msg), now: this.deps.now, pollTimeoutS: this.cfg.pollTimeoutS,
       buttonKey: k => this.state.data.keys[k] ?? null, reRegister: () => { this.endpointsDirty = true; this.needRegister = true },
-      voice: this.cfg.voice, sorryMs: this.cfg.sorryMs, ...(this.deps.pollerExtra ?? {}),
+      voice: this.cfg.voice, sorryMs: this.cfg.sorryMs, onButton: (ag, cq) => this.two.button(ag, cq),
+      noteTopic: (m, c, t, n) => this.two.noteTopic(m, c, t, n), topicName: (m, c, t) => this.two.topicName(m, c, t), ...(this.deps.pollerExtra ?? {}),
     })
     this.pollers.set(a.member, p)
     p.start()

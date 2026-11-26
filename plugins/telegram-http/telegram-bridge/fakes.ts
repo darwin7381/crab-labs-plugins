@@ -134,6 +134,8 @@ export class FakeOnsen {
   namesMember = true
   /** (client_user_id) → member */
   identities = new Map<string, string>([['1828173984', 'joey']])
+  notPeople = new Set<string>()
+  actionDeliveries: Array<{ id: string; body: any }> = []
   members: Array<{ name: string; display_name: string; kind: string }> = []
   messages: any[] = []
   edits: any[] = []
@@ -158,7 +160,7 @@ export class FakeOnsen {
   stop(): void { this.server.stop(true) }
   /** a BridgeItem into the feed (seq assigned here) */
   push(item: any): string {
-    const seq = String(++this.seq)
+    const seq = `7.${++this.seq}`                                           // opaque to the bridge, like Onsen's "<txid>.<id>"
     this.feed.push({ seq, at: new Date().toISOString(), ...item })
     for (const w of this.feedWaiters.splice(0)) w()
     return seq
@@ -210,13 +212,14 @@ export class FakeOnsen {
         this.check(r.member === null || typeof r.member === 'string', 'record member')
         this.check(Object.keys(r.attributes ?? {}).length <= 50 && JSON.stringify(r.attributes).length <= 4096, 'record attributes')
       }
-      const taken = recs.filter(r => r.member && this.holders.has(r.member) && this.holders.get(r.member) !== name)
+      const claims = recs.filter(r => r.member && r.state !== 'conflict')          // Onsen 0.35.0: a conflict record claims nothing
+      const taken = claims.filter(r => this.holders.has(r.member) && this.holders.get(r.member) !== name)
       if (taken.length) {
-        const by = this.holders.get(taken[0].member)
-        return this.e(409, 'endpoint_taken', `這個成員已經由另一支橋接帶著（${by}）`, this.namesMember ? { member: taken[0].member, by } : {})
+        const held = taken.map(r => ({ member: r.member, bridge: this.holders.get(r.member) }))
+        return this.e(409, 'endpoint_taken', held.map(h => `${h.member} 在 telegram 上已經由橋接 ${h.bridge} 帶著`).join('、'), this.namesMember ? { taken: held } : {})
       }
       for (const [mem, ext] of [...this.holders]) if (ext === name) this.holders.delete(mem)
-      for (const r of recs) if (r.member) this.holders.set(r.member, name)
+      for (const r of claims) this.holders.set(r.member, name)
       this.lists.set(name, recs)
       return this.d({ name })
     }
@@ -241,8 +244,10 @@ export class FakeOnsen {
       this.check(typeof body.client_user === 'object' && 'username' in body.client_user && 'display_name' in body.client_user, 'client_user shape')
       for (const a of body.attachments ?? []) this.check(Object.keys(a).sort().join(',') === 'bytes,client_ref,kind,mime,name', `attachment keys ${Object.keys(a).sort().join(',')}`)
       if (this.holders.get(body.member) !== who) return this.e(404, 'no_endpoint', `${who} 沒有帶 ${body.member}`)
-      const from = this.identities.get(String(body.client_user_id))
+      let from = this.identities.get(String(body.client_user_id))
+      if (!from && body.chat !== body.client_user_id) { from = `tg-${body.client_user_id}`; this.identities.set(String(body.client_user_id), from) }   // a group: a guest
       if (!from) return this.e(403, 'unknown_identity', '不認得這個帳號')
+      if (this.notPeople.has(String(body.client_user_id))) return this.e(403, 'not_allowed', '這個帳號是 agent')
       const dup = this.messages.find(x => x.idem_key === body.idem_key)
       if (dup) return this.d({ message_id: dup.id, conversation_id: `cv_${body.member}`, from, duplicate: true })
       const id = String(9000 + this.messages.length + 1)
@@ -281,18 +286,24 @@ export class FakeOnsen {
       const after = u.searchParams.get('after'), wait = Math.min(55, Number(u.searchParams.get('wait') ?? 0)), limit = Math.min(100, Number(u.searchParams.get('limit') ?? 100))
       for (const k of u.searchParams.keys()) this.check(['after', 'wait', 'limit'].includes(k), `feed param ${k}`)
       const mine = (it: any) => this.holders.get(it.member) === who
-      const from = after == null ? this.seq : Number(after)          // no `after`: from now on
-      const ready = () => this.feed.filter(it => Number(it.seq) > from && mine(it)).slice(0, limit)
+      const num = (c: string) => Number(c.split('.')[1])
+      const from = after == null ? this.seq : num(after)          // no `after`: from now on
+      const ready = () => this.feed.filter(it => num(it.seq) > from && mine(it)).slice(0, limit)
       let items = ready()
       const deadline = Date.now() + wait * 1000
       while (!items.length && Date.now() < deadline && !req.signal.aborted) {
         await new Promise<void>(r => { const t = setTimeout(r, Math.max(1, deadline - Date.now())); this.feedWaiters.push(() => { clearTimeout(t); r() }) })
         items = ready()
       }
-      const next = items.length ? items[items.length - 1].seq : String(from)
+      const next = items.length ? items[items.length - 1].seq : `7.${from}`
       return Response.json({ items, next })
     }
-    if ((m = /^\/messages\/([^/]+)\/delivery$/.exec(p)) && req.method === 'POST') {
+    if ((m = /^\/v1\/bridge\/actions\/([^/]+)\/delivery$/.exec(p)) && req.method === 'POST') {
+      this.check(Object.keys(body ?? {}).sort().join(',') === 'client_msg_ids,client_user_id', `action delivery keys ${Object.keys(body ?? {}).sort().join(',')}`)
+      this.actionDeliveries.push({ id: decodeURIComponent(m[1]!), body })
+      return this.d({ id: m[1] })
+    }
+    if ((m = /^(?:\/v1)?\/messages\/([^/]+)\/delivery$/.exec(p)) && req.method === 'POST') {
       this.check(Object.keys(body ?? {}).sort().join(',') === 'at,client,client_msg_ids,error,state', `delivery keys ${Object.keys(body ?? {}).sort().join(',')}`)
       this.check(body.client === 'telegram' && ['sent', 'failed'].includes(body.state), 'delivery client/state')
       this.reports.push({ id: m[1]!, body })

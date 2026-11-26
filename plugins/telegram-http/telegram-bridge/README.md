@@ -24,14 +24,14 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 | field | value |
 |---|---|
 | `id` | the member |
-| `member` | the member when state is `ok`; `null` for `conflict` and `error`, so Onsen routes nothing to a bot this bridge doesn't poll |
+| `member` | the member for `ok` and `conflict` (a `conflict` record claims nothing, Onsen 0.35.0); `null` for `error`, so Onsen routes nothing to a bot this bridge doesn't poll |
 | `state` | `ok` (Onsen took it from this bridge; polled) · `conflict` (another bridge carries it) · `error` (no token, Telegram refuses the token, getMe failed, Onsen doesn't know the member) |
 | `title` | `{display name}（@bot）` |
 | `line` | `@bot｜member｜收發中 / 另一支橋接帶著 / 有問題｜why` (e.g. `由 telegram-bridge-mbp 帶`, `Telegram 409：另一支程式在收這個 bot`, `2 則等 Onsen 收`) |
 | `attributes` | `bot_id, username, state_dir, found_by, last_update_at, error, telegram_conflict, held_by, writes_waiting, onsen_failing_since` |
 
 **A bot is polled only after Onsen's list took its member from this bridge.**
-- On 409 `endpoint_taken`, that member is marked `conflict` and its bot is not polled. It is asked for again every 5 min.
+- On 409 `endpoint_taken` (`error.taken: [{member, bridge}]`), that member is marked `conflict` and its bot is not polled. It is asked for again every 5 min.
 - If the 409 doesn't say which member, the bridge asks one member at a time to find it.
 - At start, if Onsen doesn't answer, the members Onsen took last time (`state.json`) are polled meanwhile, so the Onsen-down sentence still reaches people.
 
@@ -51,7 +51,9 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
   - The write is tried again after 2 s, 4 s, then every 5 s, and every later write of that bot waits behind it.
   - A message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 \<agent\>；連上會自動補交，不用重傳。」 That happens once per message, remembered across restarts.
   - When Onsen is back, the messages are written once (`idem_key` `tg:<agent>:<chat>:<message id>`), in order, then 👀.
-- **Refused for good** (403 `unknown_identity` / `not_allowed`, 400). The message isn't tried again; one reply says it wasn't handed over.
+- **Refused for good.**
+  - 403 `not_allowed` (the account is an agent or a system member), or `unknown_identity` (before Onsen 0.35.1; a stranger in a group becomes a guest). The update is done, nothing is answered, and one log line is written.
+  - 400. The update isn't tried again; in a DM, one reply says it wasn't handed over.
 - **Commands.** `/start` and `/help` in a DM are answered by the bridge (the daemon's text). Every other `/command` is written as a message with `kind: "command"`.
 - **Buttons.**
   - An Action's option (`oa:<key>`) calls `POST /v1/bridge/actions/<id>/resolve`, and the toast says the result.
@@ -67,15 +69,27 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
   - **Files.** Each file follows as its own message (`sendPhoto` for a picture, else `sendDocument`). It is taken from Onsen with the bridge's credential, from Onsen's own address only.
   - **Reply and topic.** `reply_to_client_msg_id` goes on the first part (`replyToMode`); `client_thread` becomes the topic.
   - **Silent** when Onsen says so, when the item is older than 15 min, and for an echo. An echo is the person's own message from another client (`origin_client` not `telegram`), drawn as 「〔你在 Onsen 傳的〕」 plus the text.
-  - **Delivery report.** Then `POST /api/onsen/messages/<id>/delivery`.
-  - **Retries.** A failed send is tried again 10 s, 30 s and 2 min later (a 429 waits its `retry_after`), sending only the parts not yet out; then the report is `failed`. A part Telegram didn't answer in time isn't sent again, since it may have arrived; it is `failed` at once. A report Onsen doesn't take is sent again every 10 s.
+  - **Delivery report.** Then `POST /api/onsen/v1/messages/<id>/delivery`.
+  - **Retries.** A failed send is tried again 10 s, 30 s and 2 min later (a 429 waits its `retry_after`), sending only the parts not yet out; then the report is `failed`. A part Telegram didn't answer in time isn't sent again, since it may have arrived; it is `failed` at once, with an `error` starting `timeout` (Onsen records `bridge_unknown`). A report Onsen doesn't take is sent again every 10 s.
 - **message_edit.** The parts are edited in place; extra old parts are deleted, and extra new parts are sent silently.
 - **reaction.** The member's reaction goes on the person's message (one emoji, the bot limit). ✍ never lands on top of it.
 - **receipt.**
   - `delivered` shows typing.
   - `in_session` sets ✍ (`onsen-visible.ts SeenReactor`) and shows typing.
   - Older than 15 min: dropped. Typing shows only within 10 s.
-- **action.** The summary and body, with a button per option (or a link button for a form). On **action_resolved**, the buttons give way to `outcome（by）`.
+- **action** (one per assignee, in their DM). The summary and body, with a button per option (or a link button for a form). Then `POST /v1/bridge/actions/<id>/delivery` reports the messages it became.
+- **action_resolved** (`outcome` is the Action's state). The buttons give way to `→ <option_label>（<who>）`, or `→ 已取消` / `→ 已過期`. The messages come from `client_msg_ids`, else from `state.json`.
+- **commands** (stage two). The bot's command menu: the bridge's `/start` and `/help` plus the connector's commands, in the fleet order (`/clear` first, `/model` second; `bot-menu.ts`). It is set with `setMyCommands` for the default scope and `all_private_chats`. An item has no chat.
+- **thread** (stage two).
+  - A thread opened with no topic yet: `createForumTopic` (the name without emoji, `lanes-topics.ts plainTopicName`), then `PUT /v1/bridge/threads`.
+  - Renamed: `editForumTopic` with the new name.
+  - Closed: the ✅ icon. A private chat has no `closeForumTopic`, and a topic is never deleted (that removes its messages).
+  - Opened again: the icon is cleared.
+  - A message with `client_thread` goes into that topic. A message typed in a topic carries `client_thread` and `topic_name`.
+- **restart_line** (stage two). A drawn line becomes a silent message 「已畫線：這之前的對話它看不到了（你引用的那一則照樣看得到）。」 with 「讓它看得到之前的」.
+  - Pressing it calls `POST /v1/bridge/restart-lines/<id>/lift`.
+  - `lifted: true`, from anywhere, turns the message into 「已拿掉線：它查得到之前的對話了。」.
+  - With a `lift_until`, the button counts down once a second and then goes (the 1.58.19 `/clear` countdown). Onsen 0.35.0 always sends null, so the button stays.
 - **observation.** The pinned status of that DM (`onsen-visible.ts StatusPin`, `PendingTracker`, `statusLine`). Onsen's status is mapped to the daemon's words, so it reads as today.
   - The first time, the daemon's own `<state dir>/onsen/status-pin.json` and its `status-pin-off-*` markers are copied into the bridge's state. The message already pinned is the one edited, and a chat Joey turned off stays off.
   - Only the newest observation of a batch is drawn; one older than 15 min is dropped.
@@ -92,8 +106,20 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
 | `POST /api/onsen/v1/bridge/messages/edit` | `{member, chat, client_msg_id, text, edited_at}` |
 | `POST /api/onsen/v1/bridge/reactions` | `{member, chat, client_msg_id, client_user_id, emojis, at}` |
 | `POST /api/onsen/v1/bridge/actions/<id>/resolve` | `{client_user_id, option, at}` |
-| `GET /api/onsen/v1/bridge/feed?after=&wait=50&limit=100` | answer `{items, next}` (also read inside a `data` envelope) |
-| `POST /api/onsen/messages/<id>/delivery` | `{client:"telegram", state:"sent"/"failed", client_msg_ids, at, error}` (`error` null when sent) |
+| `GET /api/onsen/v1/bridge/feed?after=&wait=50&limit=100` | answer `{items, next}` (no envelope; `next` kept as an opaque string) |
+| `POST /api/onsen/v1/messages/<id>/delivery` | `{client:"telegram", state:"sent"/"failed", client_msg_ids, at, error}` (`error` null when sent; `timeout…` when Telegram didn't answer) |
+| `POST /api/onsen/v1/bridge/actions/<id>/delivery` | `{client_user_id, client_msg_ids}` (after an Action's buttons are drawn; Onsen 0.35.1) |
+| `PUT /api/onsen/v1/bridge/threads` | `{member, chat, thread, client_thread}` (stage two) |
+| `POST /api/onsen/v1/bridge/restart-lines/<id>/lift` | `{client_user_id}` (stage two) |
+
+## Readings of §7d
+
+The places where the bridge had to pick a reading, as checked against Onsen 0.35.0 (`fleet-core` `app/onsen_bridge.py`):
+- **Files.** A Telegram message carries at most one file. If it can't be stored (over 20 MB, Telegram refused), `attachments` still describes it and `attachment_file_ids` is empty: the ids are a prefix of `attachments`.
+- **The restart line.** Onsen has only "lift", and `lift_until` is null. So a line is drawn with 「讓它看得到之前的」 and the button lifts it. WO-185's default for `/clear` (no line; 「不要讓它看到之前的」 draws one) is the connector's to keep: it draws a line only when asked.
+- **`author_label`.** Drawn verbatim as the first line. Onsen 0.35.0 sends the sender part (a lane id, `system:…`), so the label is what Onsen gives.
+- **Echo label.** In a DM 「〔你在 Onsen 傳的〕」; in a group 「〔<display name> 在 Onsen 傳的〕」.
+- **Stale.** "Old" is 15 min for messages (drawn silent), receipts and observations (dropped). Typing shows only within 10 s.
 
 ## Install (per machine)
 
@@ -159,7 +185,7 @@ TELEGRAM_BRIDGE_MACHINE=macmini bun telegram-bridge.ts --once     # which agents
 Run these on txmonster only, with `TMUX` unset. From `plugins/telegram-http/telegram-bridge`:
 
 ```sh
-bun test telegram-bridge.test.ts     # fakes.ts: a fake Bot API and a fake Onsen that checks every request against §7b / §7d
+bun test telegram-bridge.test.ts telegram-bridge-stage2.test.ts   # fakes.ts: a fake Bot API and a fake Onsen that checks every request against §7b / §7d
 bun measure-memory.ts                # RSS with 1 and with 27 fake bots
 ```
 
@@ -171,11 +197,14 @@ No test reaches the real Telegram or Onsen; every token is fake.
 - `tg-access.ts`: `gate`, `dmCommandGate`, `isMentioned`, pairing, approvals;
 - `tg-format.ts`: `chunk`, the label line, `sendTextParts`, the rich edit;
 - `inbound.ts`: voice transcription, the `/start` and `/help` text.
+- `stage-two.ts`: the `/clear` countdown (`clearHooks`).
 
 These are imported unchanged:
 - `onsen-client.ts`: `inboundShape`, `forwardFrom`, `agentName`;
 - `onsen-files.ts`: `telegramFile`, `mimeOf`;
 - `onsen-visible.ts`: `SeenReactor`, `StatusPin`, `PendingTracker`, `SinceTracker`, `statusLine`, `pendingLine`;
+- `bot-menu.ts`: `orderBotMenu`;
+- `lanes-topics.ts`: `plainTopicName`;
 - `rich-inbound.ts`, `entities.ts`.
 
 No file outside this folder is changed.

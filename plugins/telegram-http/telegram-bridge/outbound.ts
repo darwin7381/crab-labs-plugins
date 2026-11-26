@@ -5,19 +5,21 @@
 //                   the first line, then each file as its own message (sendPhoto for a picture, else sendDocument; the file taken from Onsen with
 //                   the bridge's credential, Onsen's own address only), reply_to on the first part (access.json replyToMode), silent when Onsen
 //                   says so, when it is older than 15 min, and for an echo. An echo: the person's own message said in another client
-//                   (origin_client is not telegram), drawn 「〔你在 Onsen 傳的〕」 + the text. Then POST /api/onsen/messages/<id>/delivery
+//                   (origin_client is not telegram), drawn 「〔你在 Onsen 傳的〕」 + the text. Then POST /v1/messages/<id>/delivery
 //                   {client:"telegram", state:"sent", client_msg_ids, at, error:null}. A send that fails is tried again 10 s, 30 s and 2 min
 //                   later (a 429: its retry_after), only the parts not yet out; then `failed` with the ids that did go. A part Telegram did not
-//                   answer in time is not sent again (it may have arrived): failed at once. A report Onsen does not take is sent again every 10 s.
+//                   answer in time is not sent again (it may have arrived): failed at once, its error starting `timeout` (Onsen: bridge_unknown).
+//                   A report Onsen does not take is sent again every 10 s.
 //   message_edit    the parts edited in place (rich, then plain); fewer parts: the extra ones deleted; more: the rest sent silently
 //   reaction        the member's reaction on the person's message (one emoji: a bot's limit); the ✍ never lands on top of it
 //   receipt         delivered: typing; in_session: ✍ (the daemon's SeenReactor) and typing; turn_end: nothing. Older than 15 min: dropped;
 //                   typing only within 10 s. The pinned status's line 2 counts from these.
-//   action          its summary and body, a button per option (oa:<key>), or a link button for a form; action_resolved: the buttons give
-//                   way to the outcome line
+//   action          its summary and body, a button per option (oa:<key>), or a link button for a form, in the assignee's DM; then
+//                   POST /v1/bridge/actions/<id>/delivery {client_user_id, client_msg_ids}; action_resolved: the buttons give way to the line
+//                   「→ <option label>（<who>）」 (已取消 / 已過期)
 //   observation     the pinned status message of that DM (onsen-visible.ts StatusPin: sent and pinned silently once, then edited at most every
 //                   5 s); only the newest of a batch; one older than 15 min dropped
-//   restart_line, thread, commands: stage two (stage-two.ts)
+//   restart_line, thread, commands: stage-two.ts (DrawDeps.extra)
 import type { Agent } from './agent.ts'
 import { retryable, errSaid, type OnsenClient } from './onsen.ts'
 import type { Progress, RetryRec, StateStore } from './state.ts'
@@ -119,7 +121,7 @@ export class Drawer {
     const chat = String(item.chat)
     const echo = !!item.origin_client && item.origin_client !== 'telegram'
     const isDm = /^\d+$/.test(chat)
-    const label: string | null = echo ? (isDm ? `〔你在 ${clientName(item.origin_client)} 傳的〕` : `〔${a.displayName && msg.from === a.member ? a.displayName : msg.from} 在 ${clientName(item.origin_client)} 傳的〕`) : (item.author_label ?? null)
+    const label: string | null = echo ? (isDm ? `〔你在 ${clientName(item.origin_client)} 傳的〕` : `〔${this.d.nameOf?.(String(msg.from)) ?? msg.from} 在 ${clientName(item.origin_client)} 傳的〕`) : (item.author_label ?? null)
     const old = this.now() - Date.parse(item.at) > OLD_MS
     const silent = !!item.silent || echo || old
     const c = this.conf(a)
@@ -170,7 +172,7 @@ export class Drawer {
 
   private async sendFailed(a: Agent, item: any, progress: Progress, rec: RetryRec | undefined, e: unknown): Promise<void> {
     const id = String(item.message.id)
-    const why = errText(e)
+    const why = (e instanceof TgTimeout ? 'timeout: ' : '') + errText(e)        // CONTRACT §7d: a timeout's error starts with `timeout` (Onsen: bridge_unknown)
     const attempt = (rec?.attempt ?? 0) + 1
     const timeout = e instanceof TgTimeout
     const permanent = e instanceof Permanent || (e instanceof TgError && (e.code === 400 || e.code === 403 || e.code === 401 || e.code === 404))
@@ -194,11 +196,11 @@ export class Drawer {
     this.d.log('warn', `${a.member}: message ${id} to chat ${item.chat}: ${why}; tried again in ${Math.round(delay / 1000)} s (try ${attempt + 1})`)
   }
 
-  /** POST /api/onsen/messages/<id>/delivery; one Onsen does not take now is kept and sent again */
+  /** POST /api/onsen/v1/messages/<id>/delivery; one Onsen does not take now is kept and sent again */
   async report(messageId: string, body: Record<string, unknown>, tries = 0): Promise<boolean> {
     let ok = false, keep = false, said = ''
     try {
-      const r = await this.d.onsen.req('POST', `/messages/${encodeURIComponent(messageId)}/delivery`, body, { root: true })
+      const r = await this.d.onsen.req('POST', `/messages/${encodeURIComponent(messageId)}/delivery`, body)
       ok = r.status >= 200 && r.status < 300
       keep = !ok && retryable(r)
       said = `HTTP ${r.status || 'no credential'} ${errSaid(r)}`
@@ -282,16 +284,19 @@ export class Drawer {
   async drawAction(a: Agent, item: any): Promise<void> {
     const act = item.action ?? {}, chat = String(item.chat), aid = String(act.id ?? '')
     if (!aid) return
-    if (this.st.actions[aid]?.chat === chat) return                              // drawn already (a restart inside the batch)
+    const key = `${aid}:${chat}`
+    if (this.st.actions[key]) return                                           // drawn already (a restart inside the batch)
+    // the person it is drawn for: assignee_client_user_id (Onsen 0.35.1), else the first of assignee_client_user_ids (0.35.0), else the DM's chat
+    const who = String(item.assignee_client_user_id ?? (Array.isArray(item.assignee_client_user_ids) ? item.assignee_client_user_ids[0] : null) ?? chat)
     const text = [String(act.summary ?? '').trim(), String(act.body?.text ?? '').trim()].filter(Boolean).join('\n\n') || '（要你決定的事）'
     let keyboard: Button[][] | undefined
     if (act.state === 'open' || act.state == null) {
       if (act.kind === 'form' && act.form?.url) keyboard = [[{ text: '打開表單', url: String(act.form.url) }]]
       else if (Array.isArray(act.options) && act.options.length) {
         const btns = act.options.map((o: any) => {
-          const key = (++this.st.keySeq).toString(36)
-          this.st.keys[key] = { member: a.member, action: aid, option: String(o.id), label: String(o.label ?? o.id), at: this.now() }
-          return { text: String(o.label ?? o.id).slice(0, 60), callback_data: `oa:${key}` }
+          const k = (++this.st.keySeq).toString(36)
+          this.st.keys[k] = { member: a.member, action: aid, option: String(o.id), label: String(o.label ?? o.id), at: this.now() }
+          return { text: String(o.label ?? o.id).slice(0, 60), callback_data: `oa:${k}` }
         })
         const short = btns.length <= 3 && btns.every((b: Button) => [...b.text].length <= 12)
         keyboard = short ? [btns] : btns.map((b: Button) => [b])
@@ -300,18 +305,22 @@ export class Drawer {
     const c = this.conf(a)
     const parts = labelParts(null, text, c.limit, this.d.useRich, c.mode)
     const ids = await sendTextParts(a.tg, chat, parts, { useRich: this.d.useRich, keyboard, silent: this.now() - Date.parse(item.at) > OLD_MS })
-    this.st.actions[aid] = { member: a.member, chat, msgs: ids, text, at: this.now() }
+    this.st.actions[key] = { member: a.member, chat, msgs: ids, text, at: this.now() }
     this.d.state.dirty()
+    // CONTRACT §7d: which messages it became, so action_resolved can name them (after a restart too)
+    try {
+      const r = await this.d.onsen.req('POST', `/bridge/actions/${encodeURIComponent(aid)}/delivery`, { client_user_id: who, client_msg_ids: ids.map(String) })
+      if (r.status < 200 || r.status >= 300) this.d.log('warn', `${a.member}: POST /bridge/actions/${aid}/delivery: HTTP ${r.status} ${errSaid(r)}`)
+    } catch (e) { this.d.log('warn', `${a.member}: POST /bridge/actions/${aid}/delivery: ${errText(e)}`) }
   }
 
   async drawResolved(a: Agent, item: any): Promise<void> {
     const aid = String(item.action_id ?? ''), chat = String(item.chat)
-    const rec = this.st.actions[aid]
+    const rec = this.st.actions[`${aid}:${chat}`]
     const ids: number[] = (Array.isArray(item.client_msg_ids) && item.client_msg_ids.length ? item.client_msg_ids : rec?.msgs ?? []).map(Number).filter((n: number) => n > 0)
     const last = ids[ids.length - 1]
     if (last == null) return
-    const by = item.by ? (this.d.nameOf?.(String(item.by)) ?? String(item.by)) : ''
-    const line = `${String(item.outcome ?? '已回答')}${by ? `（${by}）` : ''}`
+    const line = resolvedLine(item, m => this.d.nameOf?.(m) ?? m)
     if (rec) {
       const c = this.conf(a)
       const parts = labelParts(null, `${rec.text}\n\n${line}`, c.limit, this.d.useRich, c.mode)
@@ -319,7 +328,17 @@ export class Drawer {
       await editText(a.tg, chat, last, { rich: parts.rich[i]!, plain: parts.plain[i]! }, this.d.useRich, null)
       rec.done = true; this.d.state.dirty()
     } else {
-      await a.tg.call('editMessageReplyMarkup', { chat_id: chat, message_id: last, reply_markup: { inline_keyboard: [] } })
+      // drawn before a restart that lost its text: the buttons go, the outcome follows as a silent reply to it
+      await a.tg.call('editMessageReplyMarkup', { chat_id: chat, message_id: last, reply_markup: { inline_keyboard: [] } }).catch(() => {})
+      await a.tg.call('sendMessage', { chat_id: chat, text: line, disable_notification: true, reply_parameters: { message_id: last, allow_sending_without_reply: true } })
     }
   }
+}
+
+/** the line under an Action that ended: the option chosen and who chose it; cancelled / expired as such (outcome is the Action's state) */
+export function resolvedLine(item: any, nameOf: (m: string) => string): string {
+  const by = item.by ? nameOf(String(item.by)) : ''
+  const o = String(item.outcome ?? '')
+  const what = o === 'cancelled' ? '已取消' : o === 'expired' ? '已過期' : String(item.option_label ?? item.option_id ?? (o && o !== 'resolved' ? o : '已回答'))
+  return `→ ${what}${by && o !== 'expired' ? `（${by}）` : ''}`
 }

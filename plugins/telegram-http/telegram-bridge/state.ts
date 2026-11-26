@@ -11,7 +11,8 @@
 //   retries   feed `message` items whose send failed, waiting for their next try (10 s, 30 s, 2 min; a 429's retry_after)
 //   reports   delivery reports Onsen did not take yet (sent again every 10 s)
 //   sorry     the messages that got the Onsen-down sentence (once each, across restarts)
-//   topics    stage two: thread → topic
+//   topics    stage two: a thread → its Telegram topic (member:chat:thread)
+//   lines     stage two: a restart line → its message with the lift button (member:line id)
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -22,7 +23,7 @@ export type Progress = { text: number[]; files: number[] }
 export type RetryRec = { item: any; attempt: number; due: number; progress: Progress; lastError: string }
 export type ReportRec = { message_id: string; body: Record<string, unknown>; tries: number; due: number }
 export type TopicRec = { member: string; chat: string; thread: string; client_thread: string; name: string; state: string; at: number }
-export type LineRec = { member: string; chat: string; msg: number; lift_until: number | null; lifted: boolean; at: number }
+export type LineRec = { member: string; chat: string; msg: number; lift_until: number | null; lifted: boolean; at: number; id: string; pressed?: boolean }
 
 export type StateData = {
   feed: { after: string | null; drawn: string[] }
