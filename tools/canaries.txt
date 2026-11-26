@@ -157,7 +157,7 @@ plugins/telegram-http/screen-judge-jev.ts::export function contradiction(
 plugins/telegram-http/onsen-wake.ts::row.decided_by === 'new' && isUrgency(row.wake_urgency)
 plugins/telegram-http/screen-status.ts::version?(): string | null
 plugins/telegram-http/onsen-status.ts::remote?(): Promise<{ state?: unknown; since?: unknown } | null>
-plugins/telegram-http/onsen-client.ts::...(ctx.turn_id ? { turn_id: String(ctx.turn_id).slice(0, 120) } : {}),
+plugins/telegram-http/onsen-client.ts::...(turnOfCtx(ctx) ? { turn_id: String(turnOfCtx(ctx)).slice(0, 120) } : {}),
 plugins/telegram-http/onsen-status.ts::statusRecord(member: string, atMs = this.now()): void {
 plugins/telegram-http/server.ts::try { facts.statusRecord(member) } catch {}
 plugins/telegram-http/screen-status.ts::export function screenActivity(
@@ -256,7 +256,7 @@ plugins/telegram-http/onsen-inbound.ts::export function clientMetaOf(client: unk
 plugins/telegram-http/onsen-inbound.ts::export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
 plugins/telegram-http/server.ts::...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
 plugins/telegram-http/onsen-status.ts::export const HANDLED_HERE = 'daemon'
-plugins/telegram-http/onsen-status.ts::this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome })
+plugins/telegram-http/onsen-status.ts::this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome, ...(turnId ? { turn_id: turnId } : {}) })
 plugins/telegram-http/server.ts::async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
 plugins/telegram-http/server.ts::() => Onsen.withSender('system:control', () => next()), () => !reachedInbound.has(m))
 plugins/telegram-http/server.ts::await handledHere(self, 'permission', async () => {
