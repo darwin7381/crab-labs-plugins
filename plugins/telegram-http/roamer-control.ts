@@ -35,6 +35,8 @@ import {
   type InlineButton as CBCInlineButton,
 } from './channel-bot-control.ts'
 import { versionLine } from './version-check.ts'
+// WO-183: the session finder (claudeAgents, findTmuxForPid) moved to session-finder.ts, the one copy, shared with claude-code-host.ts
+import { claudeAgents, findTmuxForPid, type ClaudeAgent } from './session-finder.ts'
 
 // ---- env-var configuration -----------------------------------------------
 
@@ -58,16 +60,6 @@ export type InlineButton = { text: string; callback_data: string }
 
 export type ReplyOptions = {
   keyboard?: InlineButton[][]
-}
-
-type ClaudeAgent = {
-  pid: number
-  cwd: string
-  kind: 'interactive' | 'background'
-  startedAt: number
-  sessionId: string
-  status: 'idle' | 'busy'
-  name?: string
 }
 
 type RoamerRegistryEntry = {
@@ -176,50 +168,7 @@ async function tmuxSessionExists(name: string): Promise<boolean> {
 
 // ---- session detection --------------------------------------------------
 
-async function claudeAgents(): Promise<ClaudeAgent[]> {
-  const r = await runCommand(['claude', 'agents', '--json'], 8000)
-  if (r.exitCode !== 0) return []
-  try {
-    const parsed = JSON.parse(r.stdout)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((a: any) => a.kind === 'interactive' && a.pid && a.sessionId && a.cwd)
-  } catch { return [] }
-}
-
-async function findTmuxForPid(pid: number): Promise<string | null> {
-  const r = await runCommand(
-    ['tmux', 'list-panes', '-a', '-F', '#{session_name}\t#{pane_pid}'],
-    5000,
-  )
-  if (r.exitCode !== 0) return null
-  const panes = r.stdout.split('\n').filter(l => l.includes('\t'))
-  for (const line of panes) {
-    const [session, panePid] = line.split('\t')
-    if (!panePid) continue
-    const isDesc = await isProcessDescendant(pid, parseInt(panePid, 10))
-    if (isDesc) return session
-  }
-  return null
-}
-
-async function isProcessDescendant(pid: number, ancestor: number): Promise<boolean> {
-  if (pid === ancestor) return true
-  const r = await runCommand(['ps', '-o', 'pid=,ppid=', '-A'], 3000)
-  if (r.exitCode !== 0) return false
-  const parentOf: Map<number, number> = new Map()
-  for (const line of r.stdout.split('\n')) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)/)
-    if (m) parentOf.set(parseInt(m[1], 10), parseInt(m[2], 10))
-  }
-  let cur = pid
-  for (let i = 0; i < 50; i++) {
-    if (cur === ancestor) return true
-    const p = parentOf.get(cur)
-    if (!p || p === cur || p === 1) return false
-    cur = p
-  }
-  return false
-}
+// claudeAgents and findTmuxForPid (with isProcessDescendant, which it used): session-finder.ts since WO-183, unchanged in what they return.
 
 function projectName(cwd: string): string {
   return cwd.split('/').filter(Boolean).pop() ?? cwd

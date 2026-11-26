@@ -34,7 +34,9 @@ TG message ──► roamer daemon (server.ts + roamer-control.ts, ROAMER_MODE=1
 Key implementation points (full detail in `roamer-control.ts` header + CHANGELOG 1.4.0/1.5.0):
 
 - **Discovery** wraps `claude agents --json`, filters out cc-workspaces / channel-bot /
-  agy workspaces, and computes tmux membership per PID (parent-chain walk).
+  agy workspaces, and computes tmux membership per PID (parent-chain walk). Since WO-183 the
+  finding itself (`claudeAgents`, `findTmuxForPid`) lives in `session-finder.ts`, shared with
+  `claude-code-host/`; the /roam filter stays in `roamer-control.ts`.
 - **Takeover** respawns the target with `--channels` so it connects to *this* daemon's
   port (`TELEGRAM_HTTP_PORT` is interpolated into the plugin's `.mcp.json` URL).
   If the live session is empty, it auto-resumes the project's latest non-empty jsonl.

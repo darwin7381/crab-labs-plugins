@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- claude-code-host (WO-183): Onsen's list of this machine's Claude Code sessions. Read-only. See README.md beside this file.
+     Mac mini: sed -e "s#__HOME__#$HOME#g" -e "s#__MACHINE__#macmini#g" com.btai.claude-code-host.plist.example > ~/Library/LaunchAgents/com.btai.claude-code-host.plist
+     MBP:      sed -e "s#__HOME__#$HOME#g" -e "s#__MACHINE__#mbp#g"     com.btai.claude-code-host.plist.example > ~/Library/LaunchAgents/com.btai.claude-code-host.plist
+     The program is the live plugin checkout's copy (updated by its git pull; restart it after one). ONSEN_BASE: the code's default unless set here.
+     PATH must reach claude (~/.local/bin), tmux (Homebrew) and ps (/bin). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.btai.claude-code-host</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOME__/.bun/bin/bun</string>
+		<string>run</string>
+		<string>__HOME__/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/claude-code-host/claude-code-host.ts</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__HOME__/.claude/plugins/marketplaces/crab-labs-plugins/plugins/telegram-http/claude-code-host</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>__HOME__/.local/bin:__HOME__/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>CLAUDE_CODE_HOST_MACHINE</key>
+		<string>__MACHINE__</string>
+		<key>CLAUDE_CODE_HOST_CREDENTIAL_FILE</key>
+		<string>__HOME__/.config/mesh/claude-code-host-__MACHINE__.credential</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/claude-code-host.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/claude-code-host.err.log</string>
+</dict>
+</plist>
