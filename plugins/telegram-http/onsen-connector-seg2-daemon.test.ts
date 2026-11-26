@@ -3,7 +3,7 @@
 // the hand-over of a person's item (POST /onsen/person) and of a press (POST /onsen/action) is the test's (the agent-inbox daemon's place).
 //   commands   the list setMyCommands gives Telegram is PUT /v1/members/<agent>/commands (no /start, /help: the bridge's own); /status from Onsen is
 //              answered by today's handler as one Onsen message in the command's turn; /model is one Action (menu model_picker, the answer its body,
-//              no second message), a press runs what the Telegram tap runs; a page message "/status" is a command too; an unknown slash goes on
+//              no second message; no Action made: the answer as one message with the line that the choice could not be offered), a press runs what the Telegram tap runs; a page message "/status" is a command too; an unknown slash goes on
 //   /clear     one message: 「不要讓它看到之前的」 an Action whose body is the reply (no Action: the reply alone, as before); it expires in 5 s with its expiry_note (Onsen 0.36.0; no cancel from the daemon); pressed inside:
 //              the line drawn by conversation_id (never client / chat) at the /clear's time
 //   threads    a person's message in a thread: the tag's topic / topic_name as the person's message carried them, the router's topic Onsen's thread;
@@ -118,6 +118,22 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
   expect(k.log()).toContain(`connector: action ${a.id} (a command's choice): option 2 pressed in Onsen, done as a tap on it`)
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 }, 40000)
+
+test('3b. bare /model with no Action (Onsen refused it): the answer is one Onsen message in the command\'s turn, with the line that the choice could not be offered and the handler\'s own `/model <id>`', async () => {
+  onsen.st.actionRefuse = { k: 400 }
+  try {
+    expect((await hand(k, cmd(2042, '/model'), 42)).json.handled_here).toBe(true)
+    expect(await until(() => said().some(b => b.turn_id === `daemon:${JOEY}:2042`), 10000)).toBe(true)
+    const mine = said().filter(b => b.turn_id === `daemon:${JOEY}:2042`)
+    expect(mine).toHaveLength(1)
+    expect(mine[0]!.body).toContain('點一個模型切換')
+    expect(mine[0]!.body.endsWith('\n（選項沒辦法列出來；可以直接打 `/model <id>`）')).toBe(true)
+    expect(onsen.acalls.some(c => c.who === 'k' && c.method === 'POST' && c.path === '/v1/actions' && c.body?.menu_kind === 'model_picker'
+      && String(c.body?.body?.text ?? '').includes('點一個模型切換') && c.at > Date.now() - 15000)).toBe(true)
+    expect(k.log()).toContain('Onsen did not make the Action (failed); the answer sent as a message')
+  } finally { onsen.st.actionRefuse = {} }
+  expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
+}, 30000)
 
 test('4. /clear: typed on the pane; ONE message: 「不要讓它看到之前的」 an Action whose body is the reply, no reply message beside it; expiring in 5 s with its expiry_note, no cancel from the daemon (expiry is Onsen\'s); pressed inside: the line by conversation_id at the /clear\'s time', async () => {
   const t0 = new Date().toISOString()

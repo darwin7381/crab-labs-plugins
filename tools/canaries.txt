@@ -357,3 +357,8 @@ plugins/telegram-http/server.ts::if (!h.id) { ca.done = true; clearAsks.delete(h
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the reply sentence is the Action's body; no Onsen message for it
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::4b. /clear with no Action (Onsen refused it)
 plugins/telegram-http/test-fixtures/onsen-standin.ts::if (st.actionRefuse?.[who]) return
+plugins/telegram-http/server.ts::if (await keyboardAsk(chat, text, btns, where)) return
+plugins/telegram-http/server.ts::text = `${text}\n${choiceNotOffered(text)}`
+plugins/telegram-http/server.ts::function choiceNotOffered(text: string): string {
+plugins/telegram-http/server.ts::Onsen did not make the Action (${h.state}); the answer sent as a message
+plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::3b. bare /model with no Action (Onsen refused it)

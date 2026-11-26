@@ -587,23 +587,36 @@ const COMMAND_CHOICE_S = 600
 const COMMAND_NOT_CHOSEN = '沒選：沒有更動'
 /** a connector's answer (sendTextWithMaybeKeyboard): with buttons, one Action (source menu, its text the body, its buttons the options, the owner
  *  asked; CONTRACT §7d: no second message); without, one Onsen message (the sender as the caller named it, system:control by default; the turn of a
- *  message the daemon answers itself, so it is that message's response). An Action that cannot be made: the text as a message */
+ *  message the daemon answers itself, so it is that message's response). No Action made (no owner, not a valid Action, Onsen refused it): the text as
+ *  that message, with one line that the choice could not be offered (and the handler's own `/cmd <arg>` hint, when its text has one), so the person
+ *  always gets the answer */
 async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: Lanes.TopicAsk): Promise<void> {
   const ctx = Onsen.sendCtx()
   const sender = ctx?.sender && ctx.named !== false && !ctx.skip ? ctx.sender : 'system:control'
   const btns = (keyboard ?? []).flat().filter(b => b && b.callback_data)
-  if (btns.length && keyboardAsk(chat, text, btns, where)) return
+  if (btns.length) {
+    if (await keyboardAsk(chat, text, btns, where)) return
+    text = `${text}\n${choiceNotOffered(text)}`
+  }
   const tf = where ? topicFields(where) : {}
   try {
     const r = await connectorReply({ chat, sender, text, redact: [], rich: false, files: [], topic: tf.message_thread_id, turn_id: Onsen.turnOfCtx(ctx) })
     if (where) sentIn(chat, r.ids.map(Number), tf)
   } catch (e) { log('warn', `connector: answer in chat ${chat} not written into Onsen: ${e instanceof Error ? e.message : e}`) }
 }
-function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: Lanes.TopicAsk): boolean {
+/** the line a command's answer carries when its choice could not be asked as an Action: the handler's own typed form (a `/cmd <arg>` its text already
+ *  names, e.g. /model's 「或手動 `/model <id>`」), else none */
+function choiceNotOffered(text: string): string {
+  const typed = [...new Set([...text.matchAll(/`(\/[a-z_]+ <[^<>`\n]+>)`/g)].map(m => m[1]!))]
+  return typed.length ? `（選項沒辦法列出來；可以直接打 ${typed.map(t => `\`${t}\``).join('、')}）` : '（選項沒辦法列出來）'
+}
+/** a command's choice as one Action; false: none made (Actions off, no owner, not a valid Action, or Onsen did not make it: the create's answer is
+ *  awaited), the caller writes the answer as a message */
+async function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: Lanes.TopicAsk): Promise<boolean> {
   const acts = onsenActions
-  if (!acts?.on) return false
+  if (!acts?.on) { log('warn', `connector: a command's choice in chat ${chat}: no Action (Actions off); the answer sent as a message`); return false }
   const assignees = askees([chat])
-  if (!assignees.length) return false
+  if (!assignees.length) { log('warn', `connector: a command's choice in chat ${chat}: no Action (no owner); the answer sent as a message`); return false }
   if (btns.length > 10) log('warn', `connector: a choice of ${btns.length} options in chat ${chat}: an Action takes 10; the first 10 are asked`)
   // Chiron mesh 12878: a menu Action is drawn as one message: its body (the command's whole answer) and the buttons; the summary is Onsen's one line
   const ten = btns.slice(0, 10), body = text.trim(), summary = body.split('\n')[0] || '請選一個'
@@ -612,10 +625,17 @@ function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: L
     options: ten.map((b, i) => ({ id: String(i + 1), label: b.text })), expires_at: new Date(Date.now() + COMMAND_CHOICE_S * 1000).toISOString(),
     expiry_note: COMMAND_NOT_CHOSEN },
     `cmd:${ONSEN_AGENT}:${chat}:${Date.now()}:${randomBytes(3).toString('hex')}`)
-  if (!h) return false
-  keyboardAsks.set(h.key, { h, chat, datas, ...(where ? { where } : {}), ended: false })
+  if (!h) { log('warn', `connector: a command's choice in chat ${chat}: not a valid Action; the answer sent as a message`); return false }
+  const ka: KeyboardAsk = { h, chat, datas, ...(where ? { where } : {}), ended: false }
+  keyboardAsks.set(h.key, ka)
   while (keyboardAsks.size > 200) keyboardAsks.delete(keyboardAsks.keys().next().value!)
-  log('info', `connector: a command's choice in chat ${chat} asked in Onsen as an Action (${commandMenuKind(datas)}, ${ten.length} options)`)
+  await h.tail                                                               // the create's answer: Onsen refused it → the answer as a message
+  if (!h.id) {
+    ka.ended = true; keyboardAsks.delete(h.key)
+    log('warn', `connector: a command's choice in chat ${chat}: Onsen did not make the Action (${h.state}); the answer sent as a message`)
+    return false
+  }
+  log('info', `connector: a command's choice in chat ${chat} asked in Onsen as an Action (${commandMenuKind(datas)}, ${ten.length} options; ${h.id})`)
   return true
 }
 /** a press in Onsen on a command's choice: what the Telegram tap on that button does (runControlCallback), then applied */
