@@ -118,6 +118,10 @@ export function discover(home: string, platform: string): { found: Map<string, F
   for (const u of units) {
     const sd = (u.env.TELEGRAM_STATE_DIR ?? '').trim()
     if (!sd || !isAbsolute(sd) || u.env.CHANNEL_INBOX_ONLY === '1') continue
+    // an agent-inbox unit sets TELEGRAM_STATE_DIR too (its own .agent-inbox-state): only a unit whose state dir holds a bot token is a
+    // Telegram daemon (the Mac mini canary found every member "claimed twice": its telegram-daemon and its agent-inbox plist)
+    // a roamer's daemon (telegram-daemon.roamer-*) carries a bot lent to any session, not a member's: not this bridge's (not this wave)
+    if (/agent-inbox/.test(u.source) || /roamer/.test(u.source) || !readToken(sd)) continue
     const member = agentName(u.env, (u.env.AGENT_WORKSPACE_DIR ?? '').trim() || dirname(sd))
     if (!MEMBER_RE.test(member)) continue
     const had = found.get(member)

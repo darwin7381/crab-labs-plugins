@@ -46,6 +46,12 @@ beforeAll(() => {
   put(join(root, 'lab-state', 'access.json'), { dmPolicy: 'allowlist', allowFrom: [String(JOEY)], groups: {}, pending: {} })
   // an agent-inbox daemon and a moved agent's manifest: neither is a bot here
   put(join(home, 'Library', 'LaunchAgents', 'com.btai.agent-inbox.alpha.plist'), plist('x', { TELEGRAM_STATE_DIR: join(ws('alpha'), '.agent-inbox-state'), CHANNEL_INBOX_ONLY: '1', LANES_AGENT: 'alpha' }))
+  // as the Mac mini's really are (11-26 canary): an agent-inbox plist with TELEGRAM_STATE_DIR and no CHANNEL_INBOX_ONLY; its dir has no bot token
+  put(join(home, 'Library', 'LaunchAgents', 'com.btai.agent-inbox.beta.plist'), plist('com.btai.agent-inbox.beta', { TELEGRAM_STATE_DIR: join(ws('beta'), '.agent-inbox-state'), LANES_AGENT: 'beta', AGENT_WORKSPACE_DIR: ws('beta') }))
+  put(join(ws('beta'), '.agent-inbox-state', 'access.json'), { dmPolicy: 'allowlist', allowFrom: [], groups: {}, pending: {} })
+  // a roamer's daemon: its own bot, lent to sessions; not a member's
+  put(join(home, '.claude', 'channels', 'roamer-x', '.env'), 'TELEGRAM_BOT_TOKEN=7000000021:RRroamSECRETroamSECRETroam00\n')
+  put(join(home, 'Library', 'LaunchAgents', 'com.btai.telegram-daemon.roamer-x.plist'), plist('com.btai.telegram-daemon.roamer-x', { TELEGRAM_STATE_DIR: join(home, '.claude', 'channels', 'roamer-x') }))
   put(join(ws('moved'), '.cc-agent.json'), { name: 'claude-moved', enabled: false, channels: { telegram: { state_dir: sd('moved') } } })
   tg.addBot(TOK.alpha, 'alpha_bot'); tg.addBot(TOK.beta, 'beta_bot'); tg.addBot(TOK.codex, 'lab_test_bot')
   put(join(home, '.config', 'mesh', 'telegram-bridge-macmini.credential'), CRED.mac + '\n')
@@ -98,8 +104,13 @@ describe('which agents', () => {
     const h = join(root, 'linuxhome'), u = join(h, '.config', 'systemd', 'user')
     put(join(u, 'telegram-daemon.a.service'), '[Service]\nEnvironment=TELEGRAM_STATE_DIR=%h/a/.telegram-state\nEnvironment="TELEGRAM_HTTP_PORT=1" X=2\n')
     put(join(u, 'telegram-daemon.a.service.d', 'lanes.conf'), '[Service]\nEnvironment=LANES_AGENT=aaa\n')
-    put(join(u, 'telegram-daemon.b.service'), '[Service]\nEnvironment=TELEGRAM_STATE_DIR=/x/claude-bee/.telegram-state\n')
-    put(join(u, 'telegram-daemon.c.service'), '[Service]\nEnvironment=TELEGRAM_STATE_DIR=/y/claude-bee/.telegram-state\n')
+    const bx = join(root, 'x', 'claude-bee', '.telegram-state'), by = join(root, 'y', 'claude-bee', '.telegram-state')
+    put(join(h, 'a', '.telegram-state', '.env'), 'TELEGRAM_BOT_TOKEN=7000000011:AAaaaaSECRETaaaaSECRETaaaa00\n')
+    put(join(bx, '.env'), 'TELEGRAM_BOT_TOKEN=7000000012:BBbbbbSECRETbbbbSECRETbbbb00\n')
+    put(join(by, '.env'), 'TELEGRAM_BOT_TOKEN=7000000013:CCccccSECRETccccSECRETcccc00\n')
+    put(join(u, 'telegram-daemon.b.service'), `[Service]\nEnvironment=TELEGRAM_STATE_DIR=${bx}\n`)
+    put(join(u, 'telegram-daemon.c.service'), `[Service]\nEnvironment=TELEGRAM_STATE_DIR=${by}\n`)
+    put(join(u, 'telegram-daemon.d.service'), '[Service]\nEnvironment=TELEGRAM_STATE_DIR=/nowhere/claude-dee/.telegram-state\n')   // no token: not a bot here
     put(join(u, 'agent-inbox.a.service'), '[Service]\nEnvironment=CHANNEL_INBOX_ONLY=1 TELEGRAM_STATE_DIR=/z/.s\n')
     const d = discover(h, 'linux')
     expect([...d.found.keys()]).toEqual(['aaa'])
