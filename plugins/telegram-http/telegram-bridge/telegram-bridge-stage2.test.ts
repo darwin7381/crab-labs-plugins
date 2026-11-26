@@ -250,4 +250,50 @@ describe('stage two', () => {
     expect(edits()).toBe(before)
     expect(tg.sentTo(TOK, chat).filter(x => x.params.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data === 'opin:off').length).toBe(1)   // no new one either
   }, T)
+
+  test('a thread the bot cannot open as a topic: its messages go in the main chat under 〔串：name〕, delivered, no error; topics not asked again in that chat', async () => {
+    tg.fail.set('createForumTopic', { code: 400, description: 'Bad Request: the chat is not a forum', times: 5 })
+    const before = tg.callsOf(TOK, 'createForumTopic').length, puts = onsen.threads.length
+    onsen.push({ type: 'thread', member: 'gamma', conversation_id: 'cv', chat, thread: 'th_9', name: '查 WO-197', state: 'open', client_thread: null })
+    await until(() => tg.callsOf(TOK, 'createForumTopic').length === before + 1, 3000, 'createForumTopic tried')
+    onsen.push({ ...msgItem('nt1', 'in the thread'), thread: 'th_9' })
+    await until(() => onsen.reports.some(r => r.id === 'nt1'), 3000, 'nt1 drawn')
+    const r = onsen.reports.find(r => r.id === 'nt1')!.body
+    expect(r).toMatchObject({ state: 'sent', error: null })
+    const sent = tg.sent.find(x => String(x.message_id) === r.client_msg_ids[0])!
+    expect(sent.markdown).toBe('〔串：查 WO-197〕\n\nin the thread'); expect(sent.params.message_thread_id).toBeUndefined()
+    onsen.push({ type: 'thread', member: 'gamma', conversation_id: 'cv', chat, thread: 'th_10', name: '另一件', state: 'open', client_thread: null })
+    onsen.push({ ...msgItem('nt2', 'second'), thread: 'th_10' })
+    await until(() => onsen.reports.some(r => r.id === 'nt2'), 3000, 'nt2 drawn')
+    expect(tg.callsOf(TOK, 'createForumTopic').length).toBe(before + 1)                        // not asked again within the hour
+    expect(onsen.threads.length).toBe(puts)                                                     // no topic: nothing reported to Onsen
+    expect(tg.sent.find(x => String(x.message_id) === onsen.reports.find(r => r.id === 'nt2')!.body.client_msg_ids[0])!.markdown).toBe('〔串：另一件〕\n\nsecond')
+    expect(tg.sentTo(TOK, chat).some(x => /串|topic|話題/.test(x.text ?? '') && !x.markdown)).toBe(false)   // nothing told to the person
+    tg.fail.delete('createForumTopic')
+  }, T)
+
+  test('an Action ending in under 60 s counts down on its buttons, the buttons go at 0, and its note shows when it is cancelled; a menu is its body and buttons in one message', async () => {
+    onsen.push({ type: 'action', member: 'gamma', conversation_id: 'cv', chat, assignee_client_user_id: chat, action: { id: 'cl1', kind: 'choice', source: 'menu', state: 'open',
+      summary: '要不要讓它看到之前的', body: { format: 'markdown', text: '✅ 已送 `/clear`。它還查得到之前的對話。' }, options: [{ id: 'hide', label: '不要讓它看到之前的' }],
+      expires_at: new Date(Date.now() + 3000).toISOString(), version: 1 } })
+    await until(() => tg.sentTo(TOK, chat).some(x => x.markdown === '✅ 已送 `/clear`。它還查得到之前的對話。'), 3000, 'drawn')
+    const m = tg.sentTo(TOK, chat).find(x => x.markdown === '✅ 已送 `/clear`。它還查得到之前的對話。')!
+    expect(m.params.reply_markup.inline_keyboard[0][0].text).toBe('不要讓它看到之前的（3）')       // body + buttons, one message; no summary line
+    const marks = () => tg.callsOf(TOK, 'editMessageReplyMarkup').filter(p => p.message_id === m.message_id).map(p => p.reply_markup.inline_keyboard[0]?.[0]?.text ?? 'none')
+    await until(() => marks().includes('none'), 4500, 'countdown to 0')
+    expect(marks()).toEqual(['不要讓它看到之前的（2）', '不要讓它看到之前的（1）', 'none'])
+    onsen.push({ type: 'action_resolved', member: 'gamma', conversation_id: 'cv', chat, action_id: 'cl1', outcome: 'cancelled', by: 'gamma', option_id: null, option_label: null,
+      note: '沒按：新的一段看得到之前的對話', client_msg_ids: [String(m.message_id)] })
+    await until(() => tg.callsOf(TOK, 'editMessageText').some(p => p.message_id === m.message_id), 3000, 'resolved drawn')
+    expect(tg.callsOf(TOK, 'editMessageText').find(p => p.message_id === m.message_id).rich_message.markdown).toBe('✅ 已送 `/clear`。它還查得到之前的對話。\n\n→ 沒按：新的一段看得到之前的對話')
+    // pressed before the end: the countdown stops (the resolved line, no buttons come back)
+    onsen.push({ type: 'action', member: 'gamma', conversation_id: 'cv', chat, assignee_client_user_id: chat, action: { id: 'cl2', kind: 'choice', source: 'permission', state: 'open',
+      summary: '🔐 Bash', body: null, options: [{ id: 'allow', label: 'Allow' }], expires_at: new Date(Date.now() + 3000).toISOString(), version: 1 } })
+    await until(() => tg.sentTo(TOK, chat).some(x => x.markdown === '🔐 Bash'), 3000, 'cl2 drawn')
+    const m2 = tg.sentTo(TOK, chat).find(x => x.markdown === '🔐 Bash')!
+    onsen.push({ type: 'action_resolved', member: 'gamma', conversation_id: 'cv', chat, action_id: 'cl2', outcome: 'resolved', by: 'joey', option_id: 'allow', option_label: 'Allow', client_msg_ids: [String(m2.message_id)] })
+    await Bun.sleep(3500)
+    expect(tg.callsOf(TOK, 'editMessageReplyMarkup').filter(p => p.message_id === m2.message_id).length).toBeLessThanOrEqual(1)
+    expect(tg.callsOf(TOK, 'editMessageText').find(p => p.message_id === m2.message_id).rich_message.markdown).toBe('🔐 Bash\n\n→ Allow（Joey）')
+  }, T)
 })

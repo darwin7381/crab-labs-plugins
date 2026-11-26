@@ -78,7 +78,7 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
   - `delivered` shows typing.
   - `in_session` sets ✍ (`onsen-visible.ts SeenReactor`) and shows typing.
   - Older than 15 min: dropped. Typing shows only within 10 s.
-- **action** (one per assignee, in their DM). The summary and body, with a button per option (or a link button for a form). Then `POST /v1/bridge/actions/<id>/delivery` reports the messages it became.
+- **action** (one per assignee, in their DM). The summary and body (a `source: "menu"` Action is its body alone), with a button per option (or a link button for a form), as one message. An open Action whose `expires_at` is under 60 s away shows the seconds left on each button 「…（5）」, edited once a second; the buttons go at 0. A cancelled or expired Action with a `note` shows 「→ <note>」. Then `POST /v1/bridge/actions/<id>/delivery` reports the messages it became.
 - **action_resolved** (`outcome` is the Action's state). The buttons give way to `→ <option_label>（<who>）`, or `→ 已取消` / `→ 已過期`. The messages come from `client_msg_ids`, else from `state.json`.
 - **commands** (stage two). The bot's command menu: the bridge's `/start` and `/help` plus the connector's commands, in the fleet order (`/clear` first, `/model` second; `bot-menu.ts`). It is set with `setMyCommands` for the default scope and `all_private_chats`. An item has no chat.
 - **thread** (stage two).
@@ -87,6 +87,7 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
   - Closed: the ✅ icon. A private chat has no `closeForumTopic`, and a topic is never deleted (that removes its messages).
   - Opened again: the icon is cleared.
   - A message with `client_thread` goes into that topic. A message typed in a topic carries `client_thread` and `topic_name`.
+  - **No topic possible** (no topics mode; `createForumTopic` refused): the thread stays in Onsen. A message of it (`item.thread`) is drawn in the main chat under 「〔串：<name>〕」 and reported `sent`; nobody is told of an error. That chat isn't asked for a topic again for an hour (or until a restart).
 - **restart_line** (stage two). A drawn line becomes a silent message 「已畫線：這之前的對話它看不到了（你引用的那一則照樣看得到）。」 with 「讓它看得到之前的」.
   - Pressing it calls `POST /v1/bridge/restart-lines/<id>/lift`.
   - `lifted: true`, from anywhere, turns the message into 「已拿掉線：它查得到之前的對話了。」.

@@ -44,6 +44,10 @@ export type DrawDeps = {
   nameOf?: (member: string) => string
   /** stage two: the item types this file does not draw */
   extra?: (a: Agent, item: any) => Promise<boolean>
+  /** a thread's topic in a chat, or the label its messages are drawn under when it has none (stage-two.ts threadOf) */
+  threadOf?: (member: string, chat: string, thread: string) => { client_thread: string | null; label: string | null }
+  /** the countdown's tick (1 s; tests may shorten it) */
+  tickMs?: number
   /** the waits before the 2nd, 3rd, 4th try of a send (default RETRY_DELAYS_MS) */
   retryDelaysMs?: number[]
 }
@@ -121,12 +125,19 @@ export class Drawer {
     const chat = String(item.chat)
     const echo = !!item.origin_client && item.origin_client !== 'telegram'
     const isDm = /^\d+$/.test(chat)
-    const label: string | null = echo ? (isDm ? `〔你在 ${clientName(item.origin_client)} 傳的〕` : `〔${this.d.nameOf?.(String(msg.from)) ?? msg.from} 在 ${clientName(item.origin_client)} 傳的〕`) : (item.author_label ?? null)
+    let label: string | null = echo ? (isDm ? `〔你在 ${clientName(item.origin_client)} 傳的〕` : `〔${this.d.nameOf?.(String(msg.from)) ?? msg.from} 在 ${clientName(item.origin_client)} 傳的〕`) : (item.author_label ?? null)
     const old = this.now() - Date.parse(item.at) > OLD_MS
     const silent = !!item.silent || echo || old
     const c = this.conf(a)
     const replyTo = c.replyMode !== 'off' && /^\d+$/.test(String(item.reply_to_client_msg_id ?? '')) ? Number(item.reply_to_client_msg_id) : null
-    const threadId = /^\d+$/.test(String(item.client_thread ?? '')) ? Number(item.client_thread) : null
+    let threadId = /^\d+$/.test(String(item.client_thread ?? '')) ? Number(item.client_thread) : null
+    // a message of a thread (item.thread, Onsen's thread id) with no topic given: the bridge's own topic for it, else the main chat under the
+    // thread's name (CONTRACT §7d: a thread a client cannot draw stays in Onsen; its messages are drawn in the main chat with the thread's name)
+    if (threadId == null && item.thread != null && this.d.threadOf) {
+      const t = this.d.threadOf(a.member, chat, String(item.thread))
+      if (t.client_thread && /^\d+$/.test(t.client_thread)) threadId = Number(t.client_thread)
+      else if (t.label) label = label ? `${t.label} ${label}` : t.label
+    }
     const text = String(msg.body?.text ?? '')
     const files: any[] = Array.isArray(msg.attachments) ? msg.attachments : []
     const parts = text || label || !files.length ? labelParts(label, text, c.limit, this.d.useRich, c.mode) : { rich: [], plain: [] }
@@ -288,7 +299,14 @@ export class Drawer {
     if (this.st.actions[key]) return                                           // drawn already (a restart inside the batch)
     // the person it is drawn for: assignee_client_user_id (Onsen 0.35.1), else the first of assignee_client_user_ids (0.35.0), else the DM's chat
     const who = String(item.assignee_client_user_id ?? (Array.isArray(item.assignee_client_user_ids) ? item.assignee_client_user_ids[0] : null) ?? chat)
-    const text = [String(act.summary ?? '').trim(), String(act.body?.text ?? '').trim()].filter(Boolean).join('\n\n') || '（要你決定的事）'
+    // a connector's menu (source menu: /model and the like) is the one message: its body and the buttons; anything else: the summary above the body
+    const bodyText = String(act.body?.text ?? '').trim()
+    const text = (act.source === 'menu' && bodyText ? bodyText : [String(act.summary ?? '').trim(), bodyText].filter(Boolean).join('\n\n')) || '（要你決定的事）'
+    // an open Action that ends in less than 60 s: each button shows the seconds left, counted down once a second (the 1.58.19 /clear countdown)
+    const exp = act.expires_at ? Date.parse(String(act.expires_at)) : NaN
+    const left0 = Number.isFinite(exp) ? Math.ceil((exp - this.now()) / 1000) : null
+    const counting = left0 != null && left0 > 0 && left0 < 60 && act.kind !== 'form'
+    let rows: Array<Array<{ text: string; callback_data: string }>> = []
     let keyboard: Button[][] | undefined
     if (act.state === 'open' || act.state == null) {
       if (act.kind === 'form' && act.form?.url) keyboard = [[{ text: '打開表單', url: String(act.form.url) }]]
@@ -299,7 +317,8 @@ export class Drawer {
           return { text: String(o.label ?? o.id).slice(0, 60), callback_data: `oa:${k}` }
         })
         const short = btns.length <= 3 && btns.every((b: Button) => [...b.text].length <= 12)
-        keyboard = short ? [btns] : btns.map((b: Button) => [b])
+        rows = short ? [btns] : btns.map((b: Button) => [b])
+        keyboard = counting ? withLeft(rows, left0!) : rows
       }
     }
     const c = this.conf(a)
@@ -307,6 +326,17 @@ export class Drawer {
     const ids = await sendTextParts(a.tg, chat, parts, { useRich: this.d.useRich, keyboard, silent: this.now() - Date.parse(item.at) > OLD_MS })
     this.st.actions[key] = { member: a.member, chat, msgs: ids, text, at: this.now() }
     this.d.state.dirty()
+    if (counting && rows.length && ids.length) {
+      const last = ids[ids.length - 1]!, tick = this.d.tickMs ?? 1000
+      for (let n = left0! - 1; n >= 0; n--) {
+        const t = setTimeout(() => {
+          if (this.st.actions[key]?.done) return                               // answered or ended meanwhile: action_resolved draws it
+          void a.tg.call('editMessageReplyMarkup', { chat_id: chat, message_id: last, reply_markup: { inline_keyboard: n > 0 ? withLeft(rows, n) : [] } })
+            .catch(e => this.d.log('warn', `${a.member}: Action ${aid} countdown (${n}) in chat ${chat}: ${errText(e)}`))
+        }, (left0! - n) * tick)
+        ;(t as any).unref?.()
+      }
+    }
     // CONTRACT §7d: which messages it became, so action_resolved can name them (after a restart too)
     try {
       const r = await this.d.onsen.req('POST', `/bridge/actions/${encodeURIComponent(aid)}/delivery`, { client_user_id: who, client_msg_ids: ids.map(String) })
@@ -322,11 +352,11 @@ export class Drawer {
     if (last == null) return
     const line = resolvedLine(item, m => this.d.nameOf?.(m) ?? m)
     if (rec) {
+      rec.done = true; this.d.state.dirty()                                    // first: a countdown edit still to come leaves it alone
       const c = this.conf(a)
       const parts = labelParts(null, `${rec.text}\n\n${line}`, c.limit, this.d.useRich, c.mode)
       const i = parts.plain.length - 1
       await editText(a.tg, chat, last, { rich: parts.rich[i]!, plain: parts.plain[i]! }, this.d.useRich, null)
-      rec.done = true; this.d.state.dirty()
     } else {
       // drawn before a restart that lost its text: the buttons go, the outcome follows as a silent reply to it
       await a.tg.call('editMessageReplyMarkup', { chat_id: chat, message_id: last, reply_markup: { inline_keyboard: [] } }).catch(() => {})
@@ -335,10 +365,18 @@ export class Drawer {
   }
 }
 
-/** the line under an Action that ended: the option chosen and who chose it; cancelled / expired as such (outcome is the Action's state) */
+/** the buttons with the seconds left after each label: 「✅ Allow（5）」 */
+export function withLeft(rows: Array<Array<{ text: string; callback_data: string }>>, n: number): Button[][] {
+  return rows.map(r => r.map(b => ({ ...b, text: `${b.text}（${n}）` })))
+}
+
+/** the line under an Action that ended: the option chosen and who chose it; cancelled / expired with the Action's note when it has one (what
+ *  happens instead, e.g. 「沒按：新的一段看得到之前的對話」), else as such (outcome is the Action's state) */
 export function resolvedLine(item: any, nameOf: (m: string) => string): string {
   const by = item.by ? nameOf(String(item.by)) : ''
   const o = String(item.outcome ?? '')
+  const note = String(item.note ?? item.action?.note ?? '').replace(/\s+/g, ' ').trim()
+  if ((o === 'cancelled' || o === 'expired') && note) return `→ ${note}`
   const what = o === 'cancelled' ? '已取消' : o === 'expired' ? '已過期' : String(item.option_label ?? item.option_id ?? (o && o !== 'resolved' ? o : '已回答'))
   return `→ ${what}${by && o !== 'expired' ? `（${by}）` : ''}`
 }

@@ -25,6 +25,8 @@ export const BASE_COMMANDS = [
   { command: 'start', description: 'Welcome and setup guide' },
   { command: 'help', description: 'What this bot can do' },
 ]
+/** a chat where createForumTopic failed is asked again after this long */
+export const TOPIC_RETRY_MS = 3_600_000
 export const LINE_TEXT = '已畫線：這之前的對話它看不到了（你引用的那一則照樣看得到）。'
 export const LIFTED_TEXT = '已拿掉線：它查得到之前的對話了。'
 const liftLabel = (n: number | null): string => n == null ? '讓它看得到之前的' : `讓它看得到之前的（${n}）`
@@ -45,6 +47,8 @@ export function menuOf(commands: Array<{ name?: unknown; description?: unknown }
 
 export class StageTwo {
   private iconId: string | null | undefined
+  /** member:chat → when a topic could not be opened there */
+  private noTopicAt = new Map<string, number>()
   private names = new Map<string, string>()              // member:chat:client_thread → the topic's name
   constructor(readonly d: { onsen: OnsenClient; state: StateStore; log: Log; now?: () => number; tick?: number }) {
     for (const t of Object.values(d.state.data.topics)) this.names.set(`${t.member}:${t.chat}:${t.client_thread}`, t.name)
@@ -54,6 +58,12 @@ export class StageTwo {
   noteTopic(member: string, chat: string, clientThread: string, name: string): void { this.names.set(`${member}:${chat}:${clientThread}`, name); if (this.names.size > 5000) this.names.delete(this.names.keys().next().value!) }
   topicName(member: string, chat: string, clientThread: string): string | null { return this.names.get(`${member}:${chat}:${clientThread}`) ?? null }
 
+  /** a message of a thread: its topic, or, for a thread with no topic in that chat, the label it is drawn under */
+  threadOf(member: string, chat: string, thread: string): { client_thread: string | null; label: string | null } {
+    const r = this.st.topics[`${member}:${chat}:${thread}`]
+    if (!r) return { client_thread: null, label: null }
+    return r.client_thread ? { client_thread: r.client_thread, label: null } : { client_thread: null, label: `〔串：${r.name}〕` }
+  }
   /** Drawer.extra: true = drawn here */
   async draw(a: Agent, item: any): Promise<boolean> {
     switch (item.type) {
@@ -78,8 +88,20 @@ export class StageTwo {
     const rec = this.st.topics[key]
     let ct: string | null = item.client_thread != null ? String(item.client_thread) : rec?.client_thread ?? null
     if (item.state === 'open' && !ct) {
-      const r = await a.tg.call('createForumTopic', { chat_id: chat, name }).catch(e => { this.d.log('warn', `${a.member}: no topic for thread ${thread} in chat ${chat} (${errText(e)}): its messages stay outside topics`); return null })
-      if (!r?.message_thread_id) return
+      // a chat that could not open a topic (no topics mode, createForumTopic refused) is not asked again for an hour (or until a restart);
+      // the thread stays in Onsen, and its messages are drawn in the main chat under 「〔串：name〕」 (drawMessage), no error to anyone
+      const failed = this.noTopicAt.get(`${a.member}:${chat}`)
+      const r = failed != null && this.now() - failed < TOPIC_RETRY_MS ? null
+        : await a.tg.call('createForumTopic', { chat_id: chat, name }).catch(e => {
+          this.noTopicAt.set(`${a.member}:${chat}`, this.now())
+          this.d.log('warn', `${a.member}: no topic for thread ${thread} in chat ${chat} (${errText(e)}): its messages go in the main chat under 〔串：${name}〕; topics not tried again in this chat for an hour`)
+          return null
+        })
+      if (!r?.message_thread_id) {
+        this.st.topics[key] = { member: a.member, chat, thread, client_thread: '', name, state: 'open', at: this.now() }
+        this.d.state.dirty()
+        return
+      }
       ct = String(r.message_thread_id)
       this.st.topics[key] = { member: a.member, chat, thread, client_thread: ct, name, state: 'open', at: this.now() }
       this.d.state.dirty()

@@ -168,7 +168,8 @@ export class Bridge {
     this.state = new StateStore(cfg.stateDir, (l, m) => this.log(l as any, m))
     this.two = new StageTwo({ onsen: this.onsen, state: this.state, log: (l, m) => this.log(l, m), now: deps.now })
     this.drawer = new Drawer({ onsen: this.onsen, state: this.state, log: (l, m) => this.log(l, m), agentOf: m => this.agents.get(m) ?? null, useRich: cfg.useRich,
-      now: deps.now, nameOf: m => this.known?.get(m) ?? m, retryDelaysMs: cfg.retryDelaysMs, extra: (a, item) => this.two.draw(a, item) })
+      now: deps.now, nameOf: m => this.known?.get(m) ?? m, retryDelaysMs: cfg.retryDelaysMs, extra: (a, item) => this.two.draw(a, item),
+      threadOf: (m, c, t) => this.two.threadOf(m, c, t) })
   }
   now(): number { return (this.deps.now ?? Date.now)() }
   /** a log line; a warning with the same key at most once in 5 minutes */
