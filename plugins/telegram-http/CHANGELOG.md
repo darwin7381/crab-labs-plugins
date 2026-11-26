@@ -1,3 +1,12 @@
+## 1.58.20 — 2026-11-26 (the files Joey sends from Onsen's page reach the agent)
+
+- **A message Joey writes in Onsen with files: the agent gets the files, as from Telegram** (board WO-189, Chiron; ruling A 09:21Z). Onsen's page (the paper clip in every DM) sends a `say` item with `attachments: [{kind, name, mime, bytes, url}]` (Onsen's Message.attachments); the daemon read only its text, so the agent saw 〔圖片 x.png〕 and said it could not see the picture (lab-relay, WO-188 2).
+  - Each file is taken when the message arrives (`deliverFormAnswer`), with **this agent's own credential**, **only from Onsen's own address** (the origin and path of `ONSEN_BASE`; any other address is refused before anything is sent), at most 25 MB (Onsen's limit; a larger `bytes` is not asked for), into `<STATE_DIR>/inbox/` (`<ms>-onsen-<id>.<ext>`).
+  - The <channel> tag carries a Telegram message's attributes, by position as an album: a picture `image_path` (`image_path_2`, …); any other file `attachment_kind`, `attachment_file_id` = `onsen:<file id>`, `attachment_name`, `attachment_mime`, `attachment_size`; more than one file: `media_group_count`. `download_attachment("onsen:<id>")` answers with the copy taken on arrival (taken again with the credential when it is gone). A picture not taken (403, the timeout, too large, no credential): `image_error` and its `onsen:` id to retry with; the text is delivered all the same. The preview words 〔圖片 x.png〕 stay in the text. No new word for the agent, no new tool, no instruction changed.
+  - `onsen-client.ts` `getFile`; new `onsen-attachments.ts`; `onsen-visible.ts` FormItem.attachments.
+- Tests: onsen-attachments (4: the address check, the credential, no credential, 403, the limit; two pictures and a .md by position; one picture; a picture refused), onsen-visible-daemon (+1: a say item with two pictures and a .md through the daemon, download_attachment on `onsen:11`, a 403 picture's image_error).
+- Roll back: 1.58.19.
+
 ## 1.58.19 — 2026-11-26 (/clear: by default the agent still reads what came before)
 
 - **`/clear` from Telegram draws no restart line; the button is now 「不要讓它看到之前的」 and counts down 5 s** (board WO-185, Chiron; Joey TG chiron:2645 「應該預設能讓他們看到之前的，出現的按鈕應該是／不要讓他看到之前的／且倒數五秒／五秒沒按的話就直接用預設」). Replaces 1.42's line-first `/clear` (the line drawn before `/clear` reached the pane, the reply offering 「讓它看得到之前的」).
