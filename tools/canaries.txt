@@ -280,3 +280,15 @@ plugins/telegram-http/server.ts::if (inAlbum) photo = take
 plugins/telegram-http/server.ts::await Promise.all(entry.items.map(async it => { if (it.photo) { it.imagePath = await it.photo; delete it.photo } }))
 plugins/telegram-http/onsen-inbound.ts::export function albumCountOf(
 plugins/telegram-http/onsen-album-daemon.test.ts::one tag with three image paths, one router event
+plugins/telegram-http/startup-picker.ts::try { opts.observe?.(t, picker, at) } catch (e) { opts.log('warn', `startup picker observer failed: ${e}`) }
+plugins/telegram-http/startup-picker.ts::picker: { tmux: t.tmux, label: t.label, key: picker.key, title: picker.title, options: picker.options },
+plugins/telegram-http/startup-picker.ts::export function permissionShaped(options: string[]): boolean {
+plugins/telegram-http/server.ts::observe: paneObserved,
+plugins/telegram-http/server.ts::const carried = !!picker && permissionCarried(picker)
+plugins/telegram-http/server.ts::if (connectorNow()) return
+plugins/telegram-http/server.ts::if (pa) { await applyPickerControl(pa, h, c); return }
+plugins/telegram-http/server.ts::try { res = await driveStartupPicker(pa.tmux, idx, pa.key) } finally { pa.ended = true; pa.pressing = false }
+plugins/telegram-http/server.ts::for (const p of openMainPrompts()) if (p.opened + PERM_DRAW_GRACE_MS <= sinceBoth) permOffScreen(p,
+plugins/telegram-http/server.ts::if (open.some(p => p.opened > was.since)) for (const p of open) if (p.opened <= was.since) permOffScreen(p,
+plugins/telegram-http/server.ts::(tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')
+plugins/telegram-http/onsen-screen-menu-daemon.test.ts::its Action is cancelled once, with the reason; nothing pressed from here

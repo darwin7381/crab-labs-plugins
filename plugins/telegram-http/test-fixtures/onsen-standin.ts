@@ -25,6 +25,12 @@ export type OnsenStandin = {
     fileDelayMs?: number }
   /** WO-197: the connector's writes (POST /v1/messages), reactions (POST /v1/messages/<id>/reactions) and edits (PUT /v1/messages/<id>) */
   connector: Array<{ who: Who; kind: 'message' | 'reaction' | 'edit'; id: number; body: any }>
+  /** WO-197 (defects 1, 2): Actions (CONTRACT §6, fleet-core onsen_actions.py as onsen-actions-daemon.test.ts has it): POST /v1/actions (made open,
+   *  version 1; Idempotency-Key: the same one again), GET /v1/actions/<id>, POST …/resolve | applied | cancel (versions checked: 409); each call kept */
+  actions: Map<string, any>
+  acalls: Array<{ who: Who; method: string; path: string; body: any; at: number }>
+  /** a person resolves it in Onsen (the record moves, v+1): the control that Onsen would put in the requester's inbox */
+  press: (id: string, option: string, by?: string) => { action_id: string; option_id: string; version: number }
   /** WO-197: the bridge of `who` comes on: what waits pending is drawn now */
   bridgeOn: (who: Who) => void
   /** WO-197: the conversation of a chat (made the first time); a person's message in it from Telegram (as the bridge writes it: its number an alias) */
@@ -59,6 +65,9 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
       ...(it.meta?.media_group_id ? { media_group_id: it.meta.media_group_id } : {}) }
   }
   const st: OnsenStandin['st'] = { version: {}, a500: {}, aDelayMs: 0, bridge: {} }
+  const actions = new Map<string, any>(), acalls: OnsenStandin['acalls'] = [], actionKeys = new Map<string, string>()
+  let nextAction = 160
+  const aerr = (status: number, message: string) => Response.json({ error: { code: status === 409 ? 'version_conflict' : 'not_found', message } }, { status })
   const connector: OnsenStandin['connector'] = []
   // WO-197: a connector's conversations: one per chat (id 700 + n); `onsen:<id>` chats have no client (nothing draws them)
   const convs: string[] = []
@@ -115,6 +124,45 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     }
     const body = req.method === 'POST' || req.method === 'PUT' ? await req.json().catch(() => null) : undefined
     seen.push({ who, method: req.method, path, body, headers, at: Date.now() })
+    if (path.startsWith('/v1/actions')) {
+      acalls.push({ who, method: req.method, path, body, at: Date.now() })
+      if (path === '/v1/actions' && req.method === 'POST') {
+        const k = `${who}:${headers['idempotency-key'] ?? ''}`
+        const had = headers['idempotency-key'] ? actions.get(actionKeys.get(k) ?? '') : undefined
+        if (had) return Response.json({ data: had })
+        const id = String(++nextAction), now = new Date().toISOString()
+        const a = { id, version: 1, requested_by: who, state: body?.state ?? 'open', resolved_by: body?.resolved_by ?? null, selected_option_id: body?.selected_option_id ?? null,
+          applied_at: body?.state === 'resolved' ? now : null, created_at: now, ...body }
+        actions.set(id, a)
+        if (headers['idempotency-key']) actionKeys.set(k, id)
+        return Response.json({ data: a }, { status: 201 })
+      }
+      if (path === '/v1/actions' && req.method === 'GET') return Response.json({ items: [...actions.values()].filter(a => a.requested_by === (u.searchParams.get('requested_by') ?? who)
+        && (u.searchParams.get('state') ?? 'open') === a.state) })
+      const am = /^\/v1\/actions\/(\d+)(?:\/(\w+))?$/.exec(path)
+      const a = am ? actions.get(am[1]!) : null
+      if (!a) return aerr(404, `沒有 ${am?.[1]} 這個動作`)
+      if (req.method === 'GET') return Response.json({ data: a })
+      const op = am![2]
+      if (op === 'resolve') {
+        if (a.state !== 'open') return aerr(409, `動作 ${a.id} 已經${a.state}`)
+        if (body?.expected_version !== a.version) return aerr(409, '版本對不上')
+        Object.assign(a, { state: 'resolved', selected_option_id: body.option_id, resolved_by: body.resolved_by, version: a.version + 1 })
+        return Response.json({ data: a })
+      }
+      if (op === 'applied') {
+        if (a.state !== 'resolved') return aerr(409, `動作 ${a.id} 是 ${a.state}`)
+        if (!a.applied_at) Object.assign(a, { applied_at: body?.at ?? new Date().toISOString(), version: a.version + 1 })
+        return Response.json({ data: a })
+      }
+      if (op === 'cancel') {
+        if (!(a.state === 'open' || (a.state === 'resolved' && !a.applied_at))) return aerr(409, `動作 ${a.id} 已經${a.state}`)
+        if (body?.expected_version !== a.version) return aerr(409, '版本對不上')
+        Object.assign(a, { state: 'cancelled', cancel_reason: body?.reason ?? null, version: a.version + 1 })
+        return Response.json({ data: a })
+      }
+      return aerr(404, 'no route')
+    }
     if (path === '/v1/meta') return Response.json({ api_version: 1, data: { server_version: st.version[who] ?? '0.31.0', commit: 'test', deployed_at: '2026-11-26T10:00:43Z' } })
     // WO-197: the connector's side of CONTRACT §7d (Onsen 0.35.2)
     const bc = path.match(/^\/v1\/conversations\/by-chat\/([^/]+)$/)
@@ -202,7 +250,12 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     return Response.json({ error: 'no route' }, { status: 404 })
   } })
   return {
-    port: server.port!, msgs, seen, files, st, inbox, put, connector,
+    port: server.port!, msgs, seen, files, st, inbox, put, connector, actions, acalls,
+    press: (id, option, by = 'joey') => {
+      const a = actions.get(id)!
+      Object.assign(a, { state: 'resolved', selected_option_id: option, resolved_by: by, version: a.version + 1 })
+      return { action_id: id, option_id: option, version: a.version }
+    },
     conv: chat => String(convOf(chat)),
     heard: (who, chat, n, text) => { convOf(chat); const m: Msg = { id: next++, who, item: { chat, agent: 'adam', direction: 'in', sender: `tg:${chat}`, body: text, kind: 'text' }, at: Date.now(),
       path: '/messages', aliases: [String(n)], files: [], delivery: null }; msgs.push(m); return m.id },

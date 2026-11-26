@@ -64,7 +64,7 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
+import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isDutyCallback, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards, mentionItemText } from './onsen-mentions.ts'
@@ -77,7 +77,7 @@ import { parseFleetConfig } from './fleet-config.ts'
 // the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
 import * as Lanes from './lanes.ts'
 import { topicMode, topicModeAtStart, topicVerdict, type TopicMe } from './lanes-topics.ts'
-import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules } from './startup-picker.ts'
+import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
@@ -1905,6 +1905,9 @@ function permAction(p: PermPrompt, description: string, input_preview: string, r
   const body = `**${p.tool_name}**\n\n${description}\n\n\`\`\`\n${input.replace(/```/g, "'''").slice(0, 3500)}\n\`\`\``
   p.action = onsenActions.open({ source: 'permission', menu_kind: 'permission', session_id: 'main', assignees: Onsen.assigneesOf(recipients),
     summary: `${p.tool_name}：${description}`, body, options: PERM_OPTIONS }, `perm:${ONSEN_AGENT}:${p.request_id}:${p.opened}`, () => { if (!p.ended) savePermOpen() })
+  // WO-197: the dialog's menu asked about from the screen before this request came (past the grace): this prompt's Action carries it now (one per prompt)
+  const pa = pickerAsks.get(ownPane())
+  if (p.action && pa && !pa.ended && !pa.pressing && permissionShaped(pa.options)) { pa.ended = true; onsenActions.cancel(pa.h, '這個選單是權限詢問，由權限詢問那一件接手') }
 }
 /** answered in Telegram (a button or `yes xxxxx`) by this Telegram user: the Action resolved, then applied */
 function permAnswered(request_id: string, behavior: 'allow' | 'deny', senderId: string): void {
@@ -2096,6 +2099,8 @@ async function applyActionControl(c: Onsen.ActionControl): Promise<void> {
   const p = [...permPrompts.values()].find(x => x.action?.id === c.action_id)
   const h = acts.adopt(c.action_id, c.version)
   if (p) { await applyPermissionControl(p, h, c); return }
+  const pa = [...pickerAsks.values()].find(x => x.h.id === c.action_id)   // WO-197: a screen menu this daemon asked about in Onsen
+  if (pa) { await applyPickerControl(pa, h, c); return }
   if (dutyOfficer) {
     const out = await dutyOfficer.onOnsen(c.action_id, c.option_id, c.version, acts.resolver(c.action_id))
     if (out !== 'unknown') { log('info', `onsen action ${c.action_id}: duty-officer menu, ${c.option_id} pressed in Onsen: ${out}`); return }
@@ -2131,6 +2136,132 @@ async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: O
   acts.applied(h, { at: new Date().toISOString() })
   permCopiesDone(p.copies, behavior, '從 Onsen 按的')
   log('info', `permission ${p.request_id}: ${behavior} pressed in Onsen (action ${c.action_id}); answered Claude Code, ${p.copies.length} Telegram cop${p.copies.length === 1 ? 'y' : 'ies'} edited`)
+}
+
+// ---- WO-197 (defects 1, 2; lab 16:38–16:50Z): the screen's menus as Onsen Actions; what left the screen closed in Onsen ----------------------------
+// 1. A menu the startup-picker watchdog finds on a pane (the menu relay) is an Onsen Action (source menu, its options the menu's, the people the relay
+//    asks), whatever the mode (ONSEN_ACTIONS on; CONTRACT §3: a menu put to a person has its Action); a press in Onsen (action_control) presses the
+//    keys exactly as a Telegram tap on that menu does (driveStartupPicker: the same menu still there, Down × n, Enter), then applied. The channel's
+//    permission prompt (its dialog on the main's pane) is carried by its own Action: none made here. A connector sends nothing to Telegram.
+// 2. Claude Code tells the channel nothing when a prompt is answered on the screen (the duty officer, a person at the TUI, its own timeout): the
+//    daemon learns it from the main's pane (the watchdog's looks, the duty officer's panes too). No menu on two looks in a row, both after the prompt
+//    came (+2 s: drawn by then): the prompt is not waiting; another permission dialog up now while an open prompt came after the one before was first
+//    seen: the prompts from before that one are not waiting. Each such prompt is closed once as its creator closes it (CONTRACT §6 「畫面上的詢問不在了由
+//    常駐程式取消」: POST /actions/<id>/cancel with the reason; permGone, its Telegram copies too); one answered first (Telegram, Onsen, the duty officer)
+//    is over already and never touched (OnsenActions.cancel does nothing on one applied). A menu asked about from here is cancelled the same way when
+//    another menu or none (two looks) is on its pane. Roamer targets: only menus (their permission prompts are not tied to a pane here)
+/** a menu as the relay found it (startup-picker.ts SurfaceSpec.picker) */
+type PickerSpec = { tmux: string; label: string; key: string; title: string; options: string[] }
+type PickerAsk = PickerSpec & { h: Onsen.ActionHandle; opened: number; ended: boolean; pressing?: boolean }
+/** tmux → the menu on it this daemon asked about in Onsen (the newest) */
+const pickerAsks = new Map<string, PickerAsk>()
+const PICKER_PERM_GRACE_MS = Number(process.env.ONSEN_PICKER_PERM_GRACE_MS) || 2000
+const PERM_DRAW_GRACE_MS = 2000
+const ownPane = (): string => (process.env.CHANNEL_BOT_TMUX_SESSION ?? '').trim()
+/** the channel's permission prompts still waiting (nothing answered or closed them) of the main's sessions (the ones the main's pane shows) */
+function openMainPrompts(): PermPrompt[] {
+  const out: PermPrompt[] = []
+  for (const p of permPrompts.values()) {
+    if (p.ended) continue
+    const srv = pendingPermissions.get(p.request_id)?.server
+    if (srv && Lanes.sessionNotMain(serverSessionId.get(srv))) continue
+    out.push(p)
+  }
+  return out
+}
+/** a menu that is the channel's permission prompt: a permission dialog on the main's pane while a prompt with its Action is waiting */
+function permissionCarried(pk: { tmux: string; options: string[] }): boolean {
+  return !!ownPane() && pk.tmux === ownPane() && permissionShaped(pk.options) && openMainPrompts().some(p => p.action)
+}
+/** the relay found a menu: its Action (a permission dialog nothing carries yet: looked at again after PICKER_PERM_GRACE_MS, its request may still come) */
+function pickerAsk(pk: PickerSpec, title: string): void {
+  if (!onsenActions?.on) {
+    if (connectorNow()) log('warn', `startup picker '${pk.key}' on pane ${pk.tmux}: connector mode and ONSEN_ACTIONS off for ${ONSEN_AGENT}: asked nowhere (no Telegram, no Action)`)
+    return
+  }
+  if (pk.tmux === ownPane() && permissionShaped(pk.options)) {
+    const t = setTimeout(() => { void (async () => {
+      if (permissionCarried(pk)) { log('info', `startup picker '${pk.key}' on pane ${pk.tmux} is the permission prompt (its request came): its own Action carries it`); return }
+      const live = detectStartupPicker(await capturePane(pk.tmux).catch(() => ''))
+      if (live?.key !== pk.key) return
+      openPickerAsk(pk, title)
+    })().catch(e => log('warn', `startup picker '${pk.key}': ${e}`)) }, PICKER_PERM_GRACE_MS)
+    ;(t as any).unref?.()
+    return
+  }
+  openPickerAsk(pk, title)
+}
+function openPickerAsk(pk: PickerSpec, title: string): void {
+  const acts = onsenActions
+  if (!acts?.on) return
+  const had = pickerAsks.get(pk.tmux)
+  if (had && !had.ended) {
+    if (had.key === pk.key) return                                       // the same menu, asked already
+    had.ended = true
+    acts.cancel(had.h, '畫面換了一個選單，這個已經不在了，沒有按')
+  }
+  const mine = pk.tmux === ownPane()
+  const where = mine ? pk.tmux : pk.label
+  const options = pk.options.slice(0, 10).map((label, i) => ({ id: optionIdOf(i), label }))
+  const summary = `${where}：${pk.title.replace(/^🔀\s*/, '').replace(/，請選擇：$/m, '').replace(/\s*\n\s*/g, '：').trim() || 'claude 停在一個選單'}`
+  const body = `${title}\n\n${pk.options.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n\n（${where} 的畫面；按了就照 Telegram 上點的那樣按鍵）`
+  const h = acts.open({ source: 'menu', menu_kind: (() => { try { return menuKindNow(mine) } catch { return null } })(), session_id: mine ? 'main' : null,
+    assignees: Onsen.assigneesOf(opsRecipients(loadAccess())), summary, body, options }, `picker:${ONSEN_AGENT}:${pk.tmux}:${pk.key}:${Date.now()}`)
+  if (!h) return
+  pickerAsks.set(pk.tmux, { ...pk, h, opened: Date.now(), ended: false })
+  log('info', `startup picker '${pk.key}' on pane ${pk.tmux}: asked in Onsen as an Action (${options.length} options)`)
+}
+/** a press in Onsen on a menu's Action: the keys pressed as a Telegram tap presses them (the same menu still on the pane, or nothing), then applied */
+async function applyPickerControl(pa: PickerAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+  const acts = onsenActions!
+  const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
+  if (pa.ended || pa.pressing) { acts.cancel(h, '選單已經不在畫面上了，沒有按'); return }
+  if (idx < 0 || idx >= pa.options.length) { acts.cancel(h, `不認得的選項 ${c.option_id}，沒有按`); return }
+  pa.pressing = true
+  let res: 'ok' | 'gone' | 'stuck' = 'gone'
+  try { res = await driveStartupPicker(pa.tmux, idx, pa.key) } finally { pa.ended = true; pa.pressing = false }
+  if (res === 'gone') {
+    log('info', `startup picker '${pa.key}' on pane ${pa.tmux}: ${c.option_id} pressed in Onsen (action ${c.action_id}), but the menu is not there any more: nothing pressed, cancelled`)
+    acts.cancel(h, '選單已經不在畫面上了（在別處選過、逾時、或畫面已變），沒有按')
+    return
+  }
+  acts.applied(h, { at: new Date().toISOString() })
+  log('info', `startup picker '${pa.key}' on pane ${pa.tmux}: 「${pa.options[idx]}」 pressed in Onsen (action ${c.action_id})${res === 'stuck' ? '; the menu is still up' : ''}`)
+}
+/** a Telegram tap on the relay's buttons pressed option idx of this menu: its Action is resolved by the presser, then applied */
+function pickerPressedHere(tmux: string, key: string, idx: number, member: string): void {
+  const pa = pickerAsks.get(tmux)
+  if (!pa || pa.ended || pa.key !== key) return
+  pa.ended = true
+  onsenActions?.pressedElsewhere(pa.h, optionIdOf(idx), member, new Date().toISOString())
+}
+/** tmux → the menu on it at the last look (null: none), since when that menu (or none) has been there, the looks in a row without one */
+const paneLooks = new Map<string, { key: string | null; perm: boolean; since: number; absent: number[] }>()
+function paneObserved(t: PickerTarget, picker: DetectedPicker | null, at: number): void {
+  const key = picker?.key ?? null, was = paneLooks.get(t.tmux)
+  const look = { key, perm: !!picker && permissionShaped(picker.options), since: was && was.key === key ? was.since : at,
+    absent: key ? [] : [...(was?.absent ?? []), at].slice(-4) }
+  paneLooks.set(t.tmux, look)
+  const pa = pickerAsks.get(t.tmux)
+  if (pa && !pa.ended && !pa.pressing && ((key && key !== pa.key) || look.absent.length >= 2)) {
+    pa.ended = true
+    log('info', `startup picker '${pa.key}' on pane ${t.tmux}: ${key ? 'another menu is up now' : 'no menu on the screen any more'}; its Action is cancelled`)
+    onsenActions?.cancel(pa.h, key ? '畫面換了一個選單，這個已經不在了，沒有按' : '選單已經不在畫面上了（在畫面上選過，或逾時），沒有按')
+  }
+  if (!ownPane() || t.tmux !== ownPane()) return
+  if (!key) {
+    if (look.absent.length < 2) return
+    const sinceBoth = look.absent[look.absent.length - 2]!
+    for (const p of openMainPrompts()) if (p.opened + PERM_DRAW_GRACE_MS <= sinceBoth) permOffScreen(p, '畫面上已經沒有這個詢問了（在畫面上回答了，或逾時）')
+  } else if (look.perm && was?.perm && was.key && was.key !== key) {
+    const open = openMainPrompts()
+    if (open.some(p => p.opened > was.since)) for (const p of open) if (p.opened <= was.since) permOffScreen(p, '畫面上已經換成下一個詢問（這一個在畫面上回答了）')
+  }
+}
+function permOffScreen(p: PermPrompt, reason: string): void {
+  log('info', `permission ${p.request_id} (${p.tool_name}): not on the main's screen any more (answered there, or timed out); its Action is closed (cancel), nothing pressed`)
+  pendingPermissions.delete(p.request_id)
+  permGone(p.request_id, reason)
 }
 
 // ---- A2A mesh (agent-inbox mode) -------------------------------------------
@@ -3336,7 +3467,14 @@ if (isControlEnabled() || isRoamerEnabled()) {
   startStartupPickerWatchdog({
     listTargets: paneWatchTargets,
     skip: tmux => dutyOfficer?.handles(tmux) ?? false,
-    surface: ({ title, buttons }) => Onsen.withSender('system:startup-picker', () => {   // Onsen (WO-139)
+    observe: paneObserved,                           // WO-197: what left the screen, its Onsen Action closed (a pane the duty officer handles too)
+    surface: ({ title, buttons, picker }) => Onsen.withSender('system:startup-picker', () => {   // Onsen (WO-139)
+      // WO-197 (lab 16:38–16:49Z): the menu as an Onsen Action (ONSEN_ACTIONS), whatever the mode; the channel's permission prompt is carried by its own
+      // Action (no second one). A connector sends nothing to Telegram (the bridge draws the Action); otherwise Telegram as before
+      const carried = !!picker && permissionCarried(picker)
+      if (carried) log('info', `startup picker '${picker!.key}' on pane ${picker!.tmux} is the permission prompt: its own Action carries it, no second one${connectorNow() ? ', nothing to Telegram' : ''}`)
+      else if (picker) pickerAsk(picker, title)
+      if (connectorNow()) return
       const access = loadAccess()
       const keyboard = buttons.map(b => [b])
       for (const chat_id of opsRecipients(access)) {
@@ -3634,7 +3772,8 @@ bot.on('callback_query:data', async ctx => {
     const chatId = String(ctx.chat?.id ?? senderId)
     const cbm: any = ctx.callbackQuery.message           // lanes-topics: the answer goes where the button was
     const reply = async (msg: string) => { await sendTextWithMaybeKeyboard(chatId, msg, undefined, { chat: chatId, topic: topicOfMessage(cbm), replyTo: cbm?.message_id }) }
-    try { await handleStartupPickerCallback(data, paneWatchTargets, reply) }
+    // WO-197: the menu's Onsen Action (asked there too) is resolved by the presser once the keys went in
+    try { await handleStartupPickerCallback(data, paneWatchTargets, reply, (tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')) }
     catch (err) { log('warn', `startup-picker callback failed: ${err instanceof Error ? err.message : err}`) }
     await ctx.answerCallbackQuery().catch(() => {})
     return

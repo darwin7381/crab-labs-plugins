@@ -216,6 +216,11 @@ export async function driveStartupPicker(tmux: string, idx: number, expectKey: s
   return 'stuck'
 }
 
+/** WO-197: a Claude Code permission dialog as the pane shows it (its first option Yes…, its last No…): the channel's permission prompt carries it */
+export function permissionShaped(options: string[]): boolean {
+  return options.length >= 2 && /^Yes\b/i.test(options[0] ?? '') && /^No\b/i.test(options[options.length - 1] ?? '')
+}
+
 // A 6-char stable hash of a string (djb2) — used for both the tmux-name pin and
 // the picker-key pin embedded in callback_data.
 function hash6(s: string): string {
@@ -235,6 +240,8 @@ export function pickerCallback(tmux: string, key: string, idx: number): string {
 export interface SurfaceSpec {
   title: string
   buttons: { text: string; callback_data: string }[]
+  /** WO-197: the menu itself (its pane, the pane's label, its key and option labels), for its Onsen Action */
+  picker?: { tmux: string; label: string; key: string; title: string; options: string[] }
 }
 
 /**
@@ -263,22 +270,29 @@ export function startStartupPickerWatchdog(opts: {
   skip?: (tmux: string) => boolean
   /** tests: the pane reader */
   capture?: (tmux: string) => Promise<string>
+  /** WO-197: every look at a pane (skipped ones too: they are captured for this), the menu on it now or null, when it was captured. A pane that could
+   *  not be read is not reported. The daemon closes the Onsen Actions of what is no longer on the screen from these */
+  observe?: (t: PickerTarget, picker: DetectedPicker | null, at: number) => void
   /** 002y (X-1, 002x T7-R): who else owns this menu now (a name), or null. With lanes on, the main's limit menu in its wall episode is the lanes
    *  main-wall mechanism's (lanes.ts mainMenuOwned): it chooses the option that waits or continues, or puts the menu in front of Joey by re-arming
    *  it (rearmStartupPicker). An owned menu is not sent from here unless its owner re-armed it, and it is not marked surfaced (once the owner lets
    *  go, it is a menu like any other). Unset (lanes off), or a call that throws: every menu is the watchdog's, as before. */
   owner?: (t: PickerTarget, picker: DetectedPicker) => string | null
 }): void {
-  const pollMs = opts.pollMs ?? 8_000
+  const pollMs = opts.pollMs ?? (Number(process.env.STARTUP_PICKER_POLL_MS) || 8_000)   // the env: tests only
   const capture = opts.capture ?? capturePane
   const tick = async (): Promise<void> => {
     let targets: PickerTarget[] = []
     try { targets = await opts.listTargets() } catch { return }
     for (const t of targets) {
-      if (opts.skip?.(t.tmux)) continue
+      const skipped = opts.skip?.(t.tmux) ?? false
+      if (skipped && !opts.observe) continue
+      const at = Date.now()
       const pane = await capture(t.tmux)
       if (!pane) continue
       const picker = detectStartupPicker(pane)
+      try { opts.observe?.(t, picker, at) } catch (e) { opts.log('warn', `startup picker observer failed: ${e}`) }
+      if (skipped) continue
       if (picker) {
         if (!surfaced.get(t.tmux)) {
           let by: string | null = null
@@ -303,6 +317,7 @@ export function startStartupPickerWatchdog(opts: {
               text: `${i + 1}. ${label}`,
               callback_data: pickerCallback(t.tmux, picker.key, i),
             })),
+            picker: { tmux: t.tmux, label: t.label, key: picker.key, title: picker.title, options: picker.options },
           })
         }
       } else if (deferred.delete(t.tmux)) {
@@ -328,6 +343,8 @@ export async function handleStartupPickerCallback(
   data: string,
   listTargets: () => Promise<PickerTarget[]>,
   reply: (msg: string) => Promise<void>,
+  /** WO-197: the keys were sent (ok: the menu cleared; stuck: still up) for option idx of this menu on this pane: its Onsen Action follows */
+  pressed?: (tmux: string, key: string, idx: number, res: DriveResult) => void,
 ): Promise<boolean> {
   if (!data.startsWith('spick:')) return false
   const [, tmuxHash, keyHash, idxRaw] = data.split(':')
@@ -347,6 +364,7 @@ export async function handleStartupPickerCallback(
   }
 
   const res = await driveStartupPicker(target.tmux, idx, live.key)
+  if (res !== 'gone') { try { pressed?.(target.tmux, live.key, idx, res) } catch {} }
   await reply(
     res === 'ok' ? `✅ 已選好，claude 繼續了（${target.label}）`
     : res === 'gone' ? `⚠️ 剛要選時選單已消失（可能同時在別處被選掉）— 沒有動作`

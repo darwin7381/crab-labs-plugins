@@ -90,7 +90,7 @@ test('every other path names its author (source pins)', () => {
     "notify: text => Onsen.withSender('system:alert', () => {",
     "send: (chats, text, buttons) => Onsen.withSender('system:duty-officer', async () => {",
     "Onsen.withSender('system:duty-officer', () => bot.api.editMessageText(s.chat, s.msg, text,",
-    "surface: ({ title, buttons }) => Onsen.withSender('system:startup-picker', () => {",
+    "surface: ({ title, buttons, picker }) => Onsen.withSender('system:startup-picker', () => {",
     "notify: text => Onsen.withSender('system:login-watchdog', () => {",
     "if (ctx.callbackQuery) return Onsen.withSender('system:button', () => next())",
     "Onsen.withoutRecord(() => ctx.reply(",
