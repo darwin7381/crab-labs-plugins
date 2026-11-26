@@ -1522,6 +1522,9 @@ export type InEvent = {
   tkey?: ThreadKeyRes
   /** WO-175: the Onsen Call this item is (the call id its pulled item carries, Onsen 0.24.1; none before its Call exists, or for other kinds) */
   call_id?: string
+  /** 1.58.32: the Call this item answers (its refs.call, Onsen 0.33.1): a Call this agent made. Onsen gives the answer that Call's id, but its state is
+   *  the recipient's to write (PUT …/state from the caller: 403), so the item is no Call of this agent's (callRefOf) */
+  answers_call?: string
 }
 /** WO-127: a decision the router hands a lane run: the mail, the main's decision, where it came from (the event of the run that asked, and how: a lane item
  *  opened by decide_later or a card on a colleague's mail) */
@@ -5263,10 +5266,11 @@ const evClassOf = (ev: InEvent, lane?: Lane): EvClass =>
     : ev.trigger === 'scheduled' ? 'scheduled' : /^alert/.test(ev.trigger ?? '') ? 'alert' : 'peer')
 /** WO-175 (Onsen contract v1 §4; Onsen 0.24.1): the Call an inbound item is: a peer's call that is not a reply, a scheduled run, a paged alert, an
  *  urgent board item (Onsen's item kinds), named by the call id the pulled item carries (null before its Call exists, and for any other kind: no
- *  Call to report). Not a Call: a reply, the daemons' own silent notices, the watchdog's wake lines, an item from anywhere but the mesh */
+ *  Call to report). Not a Call: a reply (reply_to, or 1.58.32: refs.call naming the Call it answers, one this agent made: its state is the
+ *  recipient's, CONTRACT PUT /calls/<id>/state), the daemons' own silent notices, the watchdog's wake lines, an item from anywhere but the mesh */
 export function callRefOf(ev: InEvent): CallRef | null {
   const k = ev.item_kind
-  if (ev.source !== 'mesh' || ev.synthetic || ev.wake || ev.reply_to_id || ev.urgency === 'silent') return null
+  if (ev.source !== 'mesh' || ev.synthetic || ev.wake || ev.reply_to_id || ev.answers_call || ev.urgency === 'silent') return null
   if (k !== 'peer_call' && k !== 'scheduled' && k !== 'alert' && k !== 'board') return null
   return ev.call_id && /^\d{1,18}$/.test(ev.call_id) ? { kind: k, id: ev.call_id } : null
 }

@@ -370,3 +370,8 @@ plugins/telegram-http/onsen-client.ts::{ kind: 'c', path: `/v1/calls/${id}/state
 plugins/telegram-http/onsen-client.ts::    if (credentialRefused(r)) {
 plugins/telegram-http/test-fixtures/onsen-standin.ts::只有收件人 ${rcp} 的常駐程式能回報這一通的狀態
 plugins/telegram-http/onsen-spool-skip.test.ts::calls 541/546/573/580/590/598/616, all caller state, three moments each
+plugins/telegram-http/lanes.ts::ev.reply_to_id || ev.answers_call || ev.urgency === 'silent'
+plugins/telegram-http/server.ts::const answers = Onsen.answeredCall(body?.refs) ?? undefined
+plugins/telegram-http/server.ts::const call = !answers && body?.call_id != null
+plugins/telegram-http/onsen-client.ts::export function answeredCall(refs: unknown): string | null {
+plugins/telegram-http/lanes-wo175.test.ts::1.58.32: the answer to a Call this agent made (refs.call → answers_call

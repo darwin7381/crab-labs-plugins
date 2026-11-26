@@ -173,6 +173,21 @@ test('not Calls: a reply (reply_to) and a daemon\'s silent notice send nothing',
   expect(of(a.id)).toEqual([]); expect(of(b.id)).toEqual([])
 })
 
+test('1.58.32: the answer to a Call this agent made (refs.call → answers_call; Onsen gives it that Call\'s id) writes no state; the recipient\'s own Call still does', async () => {
+  // sonn's Call 485, chiron's 541: lab-relay answered by naming the Call (refs.call), no reply_to; Onsen gave the answer the Call's id and the daemon
+  // wrote accepted / running / completed for a Call its agent was the caller of (403, the spool held for hours)
+  const ans = call({ answers_call: '485', call_id: '485', no_reply: true })
+  expect(L.callRefOf(ans)).toBeNull()
+  await L.routeEvent(ans)
+  expect(of(ans.id)).toEqual([])
+  const ans2 = call({ answers_call: '541', call_id: '541', no_reply: true })
+  await L.routeEvent(ans2)
+  expect(lines.filter(l => l.call_id === '541' || l.event === ans2.id)).toEqual([])
+  const mine = call({ no_reply: true })                                       // a Call this agent received: as before
+  await L.routeEvent(mine)
+  expect(of(mine.id)).toEqual(['accepted:-', 'completed:-:{"body":{"format":"markdown","text":"只記錄，沒有交給任何一條 session"}}'])
+})
+
 test('a scheduled run in a lane: running is the start receipt (no auto-ack); its receipt is the run\'s Call (completed, outcome nothing_to_do, the line), not BTCC\'s /complete', async () => {
   const run = '9175'
   const ev = { id: 'mesh-sch-175', source: 'mesh', from: 'scheduler', verified: true, text: `[scheduled][disk-check][run:${run}][P3][routine] disk-check`, item_kind: 'scheduled', call_id: '4175',

@@ -105,6 +105,14 @@ export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: str
  *  goes when Onsen answers); nocred: this daemon has no mesh credential (a broken setup) */
 export type CallLineFate = { fate: 'took'; state: string | null } | { fate: 'refused'; status: number; said: string } | { fate: 'pending'; why: string }
   | { fate: 'nocred'; why: string }
+/** 1.58.32: the Call an item answers, from its refs (`call`: the id the answer names; CONTRACT §4 「回覆的 refs 帶 {kind: "call", value: <call_id>}」,
+ *  Onsen's /send refs.call): Onsen links it only to a Call its recipient made (fleet-core onsen_calls.py _named_call), so the agent that receives it
+ *  is that Call's caller and never writes its state. null: it names none */
+export function answeredCall(refs: unknown): string | null {
+  if (!refs || typeof refs !== 'object' || Array.isArray(refs)) return null
+  const v = (refs as Record<string, unknown>).call
+  return (typeof v === 'string' || typeof v === 'number') && /^\d{1,18}$/.test(String(v).trim()) ? String(v).trim() : null
+}
 /** a run's Call as Onsen lists it (GET /v1/calls?ref_kind=run&ref_value=<run>), or why there is none to say */
 export type RunCallLookup = { found: { id: string; state: string | null; result: unknown } } | { none: true } | CallLineFate
 /** btcc-receipt's budget (Chiron 05:55Z): the first try and three more, all within 10 s */

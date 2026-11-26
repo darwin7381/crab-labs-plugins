@@ -5,13 +5,13 @@
 //   a 403 for one record: skipped in the same pass (rejected.jsonl, one log line, /healthz onsen.skipped), the facts behind it posted
 //   chiron's spool: seven caller-state Calls, three moments each, between facts: every fact posted in one pass, 21 skipped; a recipient's Call still PUT
 //   401 (the credential itself) and a 403 that says not_authenticated: kept and tried again, nothing thrown away; flushed once the credential is taken
-//   which statuses are refused for good
+//   which statuses are refused for good; the Call an answer names (refs.call)
 import { afterAll, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { startOnsenStandin } from './test-fixtures/onsen-standin.ts'
-import { OnsenClient, credentialRefused, refusedForGood, type CallStateLine, type DeliveryFact } from './onsen-client.ts'
+import { OnsenClient, answeredCall, credentialRefused, refusedForGood, type CallStateLine, type DeliveryFact } from './onsen-client.ts'
 
 const CRED = 'mesh_SKIPchironSECRETsecretSECRET01234', SONN = 'mesh_SKIPsonnSECRETsecretSECRET0123456'
 const on = startOnsenStandin({ [CRED]: 'chiron', [SONN]: 'sonn' })
@@ -136,5 +136,13 @@ describe('1.58.32: a record Onsen refuses never holds the spool', () => {
     for (const x of [r(401), r(401, 'not_authenticated'), r(403, 'not_authenticated'), r(408), r(425), r(429, 'rate_limited'), r(500), r(503), r(0), r(200)]) expect(refusedForGood(x)).toBe(false)
     expect(credentialRefused(r(401))).toBe(true); expect(credentialRefused(r(403, 'not_authenticated'))).toBe(true)
     expect(credentialRefused(r(403, 'not_authorized'))).toBe(false); expect(credentialRefused(r(403))).toBe(false)
+  })
+})
+
+describe('1.58.32: an answer that names the Call it answers is no Call of this agent\'s', () => {
+  test('refs.call (a string or a number of digits) is the Call answered; anything else names none', () => {
+    expect(answeredCall({ call: '541' })).toBe('541'); expect(answeredCall({ call: 485 })).toBe('485')
+    expect(answeredCall({ thread: 't', call: ' 616 ' })).toBe('616')
+    for (const v of [undefined, null, {}, [], { call: '' }, { call: 'x1' }, { call: null }, { thread: 'lab-relay#t-1' }, 'call']) expect(answeredCall(v)).toBeNull()
   })
 })

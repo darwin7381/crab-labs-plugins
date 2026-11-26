@@ -2885,7 +2885,7 @@ async function inboxDecide(args: Record<string, unknown>): Promise<{ text: strin
 // field yet (wakeKind: the watchdog's marker).
 /** WO-157: what the sender wrote as fields for the receiver's decideWake (an Onsen item's kind, the urgency of a daemon's own notice). Never put in the
  *  meta: the session reads the meta as the channel tag's attributes, and nothing an agent reads changes */
-type WakeFacts = { item_kind?: string; urgency?: 'interrupt' | 'ordered' | 'silent'; refs?: ThreadRefs; call_id?: string }
+type WakeFacts = { item_kind?: string; urgency?: 'interrupt' | 'ordered' | 'silent'; refs?: ThreadRefs; call_id?: string; answers_call?: string }
 const URGENCY_FIELDS = new Set(['interrupt', 'ordered', 'silent'])
 function wakeFactsOf(body: Record<string, unknown> | null | undefined): WakeFacts {
   const k = typeof body?.item_kind === 'string' && /^[a-z_]{1,24}$/.test(body.item_kind) ? body.item_kind : undefined
@@ -2893,8 +2893,12 @@ function wakeFactsOf(body: Record<string, unknown> | null | undefined): WakeFact
   // WO-164: the sender's thread-key fields (an Onsen item's refs, an /inject body's refs): the router reads them, never the session (not in the meta)
   const refs = threadRefsOf(body?.refs)
   // WO-175: the Call the item is (Onsen's call id on the pulled item, when it carries one): it rides the event into the router and the lane
-  const call = body?.call_id != null && /^\d{1,18}$/.test(String(body.call_id)) ? String(body.call_id) : undefined
-  return { ...(k ? { item_kind: k } : {}), ...(u ? { urgency: u } : {}), ...(refs ? { refs } : {}), ...(call ? { call_id: call } : {}) }
+  // 1.58.32: an answer that names the Call it answers (refs.call; Onsen 0.33.1 takes it only for a Call this agent made) carries that Call's id too,
+  // but it is no Call of this agent's: its state is the recipient's (a caller's PUT …/state is 403); the event keeps answers_call, not call_id
+  const answers = Onsen.answeredCall(body?.refs) ?? undefined
+  const call = !answers && body?.call_id != null && /^\d{1,18}$/.test(String(body.call_id)) ? String(body.call_id) : undefined
+  return { ...(k ? { item_kind: k } : {}), ...(u ? { urgency: u } : {}), ...(refs ? { refs } : {}), ...(call ? { call_id: call } : {}),
+    ...(answers ? { answers_call: answers } : {}) }
 }
 function laneEventOf(n: { method: string; params: unknown }, verified?: boolean, facts: WakeFacts = {}): Lanes.InEvent {
   const p = (n.params ?? {}) as { content?: unknown; meta?: Record<string, string> }
