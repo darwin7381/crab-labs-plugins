@@ -4345,6 +4345,7 @@ async function handleInbound(
     for (const k of Object.keys(extra)) if (extra[k] == null) delete extra[k]
     const key = `${chat_id}:${msgId}`
     inboundStore.park(key, facts)
+    if (facts.mgid && (facts.image || facts.attachment) && !facts.fromReply) albumArriving(chat_id, facts.mgid, key)   // WO-197: its count, for the way back
     inboundWriter.enqueue({ key, item: { ...item, deliver: true, ...(Object.keys(extra).length ? { meta: { ...(item.meta ?? {}), ...extra } } : {}) }, at: Date.now(), tries: 0, held: false })
     return
   }
@@ -4397,15 +4398,18 @@ function inboundFacts(ctx: Context, text: string, image: ImageSource | undefined
 async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?: { imagePath?: string; imageError?: string }): Promise<void> {
   const chat_id = f.chat_id, msgId = f.msgId, text = f.text, image = f.image, attachment = f.attachment, inTopic = f.inTopic
   const voiceTranscript = f.voiceTranscript, attachmentFromReply = f.fromReply
+  // #6: an item of an album (photos or documents sharing a media_group_id; never a replied-to message's file) is buffered below, not delivered alone
+  const inAlbum = !!(f.mgid && (image || attachment) && !attachmentFromReply)
   let imagePath = got?.imagePath
   let imageError = got?.imageError
+  // WO-197 (lab 17:12Z): an album item's photo is taken while the item already waits in the album buffer: the hand-over (POST /onsen/person) is
+  // answered at once and the inbox hands the next item on, the photos come in side by side, and the album's flush waits for them
+  let photo: Promise<string | undefined> | undefined
   if (!got && image) {
-    try {
-      imagePath = await downloadPhotoToInbox(null, { file_id: image.file_id, file_unique_id: image.file_unique_id })
-    } catch (err) {
-      log('error', `photo download failed: ${err instanceof Error ? err.message : err}`)
-      imageError = 'download failed'
-    }
+    const take = downloadPhotoToInbox(null, { file_id: image.file_id, file_unique_id: image.file_unique_id })
+      .catch(err => { log('error', `photo download failed: ${err instanceof Error ? err.message : err}`); return undefined })
+    if (inAlbum) photo = take
+    else { imagePath = await take; if (!imagePath) imageError = 'download failed' }
   }
   // WO-194: a file only Onsen has (a person_message rebuilt without Telegram's file id): taken from Onsen as a page message's is (WO-189)
   const fromOnsen = !got && f.onsenFiles?.length && onsen
@@ -4479,15 +4483,15 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
   // media_group_id in meta but never media_group_count/numbered fields, so the
   // receiving agent had no way to know the album was incomplete. Silent was
   // the only unacceptable option.
-  if (mgid && (image || attachment) && !attachmentFromReply) {
+  if (inAlbum) {
     bufferAlbumItem(chat_id, String(mgid), {
       caption: f.caption,
       ...(image
-        ? { imagePath, fileId: image.file_id, size: image.size }
+        ? { imagePath, ...(photo ? { photo } : {}), fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
             docMime: attachment!.mime, docName: attachment!.name }),
       meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}),
-    })
+    }, OnsenInbound.albumCountOf(f))
     return
   }
 
@@ -4571,45 +4575,97 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
 // A failed item keeps its position: image_error[_k] + attachment_file_id[_k].
 // Base meta (message_id/ts/reply/forward context) comes from the FIRST item.
 const ALBUM_WINDOW_MS = 1500
+// WO-197 (lab 17:12Z, Chiron mesh 12823): an album that comes back from Onsen comes one person_message at a time, each handed over when the one before
+// is (its photo fetched from Onsen: ~1.4 s for a large PNG), so 1.5 s after the last item split one album into three tags. Where the path knows the
+// album's size (the connector: the bridge's client_meta.media_group_count; the switch off with ONSEN_INBOUND on: the count its arrival stamped on the
+// kept facts, albumArriving), the album waits until that many items are in, then goes as one tag, however far apart they come; at most
+// ALBUM_CAP_MS (10 s) from its first item, then it goes with what came (logged). The count not known: the window, as before
+const ALBUM_CAP_MS = Number(process.env.TELEGRAM_ALBUM_CAP_MS) || 10_000
 
 type AlbumEntry = {
   chatId: string
   /** Onsen step 3 (WO-143): every item's Telegram message id (the delivery carries the first's: what happens to it happens to each) */
   ids: string[]
   captions: string[]
-  items: Array<{ imagePath?: string; fileId: string; size?: number;
+  /** `photo`: the item's photo still being taken (an album item back from Onsen); the flush waits for it */
+  items: Array<{ imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
                  docKind?: string; docMime?: string; docName?: string }>
   baseMeta: Record<string, string>
   /** WO-197 (rule A): the first item's client.meta, applied again after the album's own fields (media_group_count, the positional files) are built */
   clientMeta?: Record<string, string>
   timer: ReturnType<typeof setTimeout> | null
+  /** WO-197: how many items the album has (null: not known: the window decides); when its first item came; the cap's timer */
+  expect: number | null
+  first: number
+  cap: ReturnType<typeof setTimeout> | null
 }
 const albumBuffers = new Map<string, AlbumEntry>()
 
 function bufferAlbumItem(
   chatId: string,
   mgid: string,
-  item: { caption?: string; imagePath?: string; fileId: string; size?: number;
+  item: { caption?: string; imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
           docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string> },
+  count: number | null = null,
 ): void {
   const key = `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
-    entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null }
+    entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null,
+      expect: null, first: Date.now(), cap: null }
     albumBuffers.set(key, entry)
   }
   if (item.meta.message_id) entry.ids.push(item.meta.message_id)
   if (entry.timer) clearTimeout(entry.timer)
+  entry.timer = null
   if (item.caption) entry.captions.push(item.caption)
-  entry.items.push({ imagePath: item.imagePath, fileId: item.fileId, size: item.size,
+  entry.items.push({ imagePath: item.imagePath, ...(item.photo ? { photo: item.photo } : {}), fileId: item.fileId, size: item.size,
                      docKind: item.docKind, docMime: item.docMime, docName: item.docName })
-  entry.timer = setTimeout(() => flushAlbum(key), ALBUM_WINDOW_MS)
+  if (count != null && entry.expect == null) entry.expect = count
+  albumWait(key, entry)
+}
+/** WO-197: what the album waits for now: all its items (its count known: flushed the moment the last one is in, or at the cap), the count from its
+ *  arrival (the arrival window still open in this process: the cap meanwhile), or the window after its last item (not known) */
+function albumWait(key: string, entry: AlbumEntry): void {
+  const flush = (why: 'window' | 'all' | 'cap') => { void flushAlbum(key, why).catch(e => log('error', `album ${key}: flush failed: ${e}`)) }
+  if (entry.expect != null && entry.items.length >= entry.expect) { flush('all'); return }
+  if (entry.expect != null || albumArrivals.has(key)) {
+    if (!entry.cap) entry.cap = setTimeout(() => flush('cap'), Math.max(0, entry.first + ALBUM_CAP_MS - Date.now()))
+    return
+  }
+  entry.timer = setTimeout(() => flush('window'), ALBUM_WINDOW_MS)
+}
+/** WO-197 (Chiron mesh 12823: the switch off with ONSEN_INBOUND on, the path the fleet runs): an album item Telegram brought to this daemon, written
+ *  into Onsen to come back one by one. Its arrival is grouped as the path before groups it (ALBUM_WINDOW_MS after the last item); when that closes,
+ *  how many came is stamped on every item's kept facts (albumCount, on disk with them) and told to the album waiting on the way back */
+const albumArrivals = new Map<string, { keys: string[]; timer: ReturnType<typeof setTimeout> }>()
+function albumArriving(chatId: string, mgid: string, key: string): void {
+  const k = `${chatId}:${mgid}`
+  const a = albumArrivals.get(k) ?? { keys: [] as string[], timer: null as any }
+  clearTimeout(a.timer)
+  if (!a.keys.includes(key)) a.keys.push(key)
+  a.timer = setTimeout(() => {
+    albumArrivals.delete(k)
+    const n = a.keys.length
+    for (const x of a.keys) inboundStore?.update(x, f => { f.albumCount = n })
+    log('info', `album ${k}: ${n} item(s) came from Telegram; delivered as one tag when ${n === 1 ? 'it comes' : 'they come'} back from Onsen`)
+    const entry = albumBuffers.get(k)
+    if (entry) { if (entry.expect == null) entry.expect = n; if (entry.timer) clearTimeout(entry.timer); entry.timer = null; albumWait(k, entry) }
+  }, ALBUM_WINDOW_MS)
+  albumArrivals.set(k, a)
 }
 
-function flushAlbum(key: string): void {
+async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<void> {
   const entry = albumBuffers.get(key)
   if (!entry) return
   albumBuffers.delete(key)
+  if (entry.timer) clearTimeout(entry.timer)
+  if (entry.cap) clearTimeout(entry.cap)
+  // WO-197: the count known: one line (the cap: what came, of how many); the photos still being taken are waited for (each gives its path, or none: a
+  // failed download, image_error as before)
+  if (why === 'cap') log('warn', `album ${key}: ${entry.items.length} of ${entry.expect ?? '?'} item(s) in ${Math.round(ALBUM_CAP_MS / 1000)} s after the first; delivered with what came`)
+  else if (entry.expect != null) log('info', `album ${key}: all ${entry.items.length} item(s) in; delivered as one tag`)
+  await Promise.all(entry.items.map(async it => { if (it.photo) { it.imagePath = await it.photo; delete it.photo } }))
   const meta: Record<string, string> = { ...entry.baseMeta }
   // Per-item image fields are rebuilt positionally below — drop the first
   // item's own copies (incl. its failure markers) from the base.
@@ -4620,7 +4676,7 @@ function flushAlbum(key: string): void {
   delete meta.attachment_size
   delete meta.attachment_mime
   delete meta.attachment_name
-  meta.media_group_count = String(entry.items.length)
+  meta.media_group_count = String(Math.max(entry.items.length, entry.expect ?? 0))   // WO-197: at the cap, the album's count (fewer files = incomplete)
   entry.items.forEach((it, i) => {
     const suffix = i === 0 ? '' : `_${i + 1}`
     if (it.imagePath) {

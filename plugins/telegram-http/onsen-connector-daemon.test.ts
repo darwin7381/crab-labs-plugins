@@ -27,7 +27,8 @@ beforeAll(async () => {
   const env = { ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude', ONSEN_BRIDGE_RETRY_MS: '50,50' }
   ;[d, sw] = await Promise.all([
     // named in the plist, no token: a connector from the start
-    startTgDaemon(api, join(root, 'c'), JOEY, { ...env, GENESIS_LANES: '0', TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'lab-relay, adam', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c') },
+    startTgDaemon(api, join(root, 'c'), JOEY, { ...env, GENESIS_LANES: '0', TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'lab-relay, adam', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'),
+        TELEGRAM_ALBUM_CAP_MS: '3000' },
       h => h?.ok === true),
     // the machine config's line, read again: not named at first (polls), then named, then taken off
     startTgDaemon(apiSw, join(root, 's'), JOEY, { ...env, GENESIS_LANES: '0', CRAB_LABS_PLUGINS_ENV: machine, ONSEN_BRIDGE_TICK_MS: '200', ONSEN_CREDENTIAL_FILE: join(root, 'cred-s') }),
@@ -247,20 +248,26 @@ test('13. rule A (Chiron 16:1xZ): client_meta.reply_to_user "awesometon5" over O
   expect(onsen.connector.at(-1)!.body.conversation_id).toBe(onsen.conv(String(JOEY)))
 })
 
-test('14. rule A on an album: the first item\'s client_meta media_group_count (the bridge\'s album) over the count of the items that came; the files stay positional', async () => {
+test('14. an album whose count is known (client_meta.media_group_count 3) and only 2 items come: not flushed at the 1.5 s window, flushed at the cap with the 2; rule A: media_group_count is the bridge\'s 3, the files stay positional', async () => {
   const base = `http://127.0.0.1:${onsen.port}/api/onsen/v1/files/`
   const one = (i: number, meta?: Record<string, string>) => ({ conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', text: '', kind: 'photo',
     sent_at: new Date().toISOString(), reply_to: null, media_group_id: 'mg-14', message_id: String(6040 + i),
     attachments: [{ kind: 'photo', name: null, mime: 'image/jpeg', bytes: 4, url: base + fileOf(`alb${i}`, [0xff, 0xd8, 0xff, i]), client_ref: `AgAlb${i}` }],
     client: { name: 'telegram', chat: String(JOEY), msg_id: String(1040 + i), user: 'joey', user_id: String(JOEY), ...(meta ? { meta } : {}) } })
+  const t0 = Date.now()
   expect(await person(one(1, { media_group_count: '3' }), 41)).toBe(200)
   expect(await person(one(2, { media_group_count: '3' }), 42)).toBe(200)
+  await sleep(2000)
+  expect(got.filter(g => g.meta.media_group_id === 'mg-14')).toHaveLength(0)          // the window (1.5 s) is not what ends a known album
   expect(await until(() => got.some(g => g.meta.media_group_id === 'mg-14'), 8000)).toBe(true)
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(2900)                                    // the cap (3 s here; 10 s by default) from the first item
   await sleep(500)
   const albums = got.filter(g => g.meta.media_group_id === 'mg-14')
   expect(albums.length).toBe(1)
   expect(albums[0]!.meta.media_group_count).toBe('3')
   expect(albums[0]!.meta.image_path).toBeTruthy()
   expect(albums[0]!.meta.image_path_2).toBeTruthy()
+  expect('image_path_3' in albums[0]!.meta).toBe(false)
   expect(albums[0]!.content).toBe('(album: 2 photos)')
+  expect(d.log()).toContain(`album ${JOEY}:mg-14: 2 of 3 item(s) in 3 s after the first; delivered with what came`)
 })

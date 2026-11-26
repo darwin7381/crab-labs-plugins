@@ -84,6 +84,16 @@ export type Facts = {
    *  it): each key an attribute of the tag of the same name, as is; it overrides what the tag derived from the person_message (reply_to_*, forward_*,
    *  attachment_*, voice_transcript, …), except the attributes of CLIENT_META_FIXED; a key the tag does not have comes last */
   clientMeta?: Record<string, string>
+  /** WO-197 (lab 17:12Z, Chiron mesh 12823): how many items the album this message belongs to had when Telegram brought them to this daemon (the
+   *  switch off, ONSEN_INBOUND on: stamped on every item's kept facts when the album's arrival window closed). When they come back from Onsen one by
+   *  one, the album is delivered as one tag once that many are in (server.ts bufferAlbumItem), however far apart they are handed over */
+  albumCount?: number
+}
+/** WO-197: an album's size as a path knows it: the count its arrival stamped on the kept facts (albumCount), else the bridge's client_meta
+ *  media_group_count (connector); a Telegram album has 2 to 10 items. null: not known (the album waits the window, as before) */
+export function albumCountOf(f: Pick<Facts, 'albumCount' | 'clientMeta'>): number | null {
+  const n = f.albumCount ?? (f.clientMeta?.media_group_count != null && /^\d{1,2}$/.test(f.clientMeta.media_group_count) ? Number(f.clientMeta.media_group_count) : NaN)
+  return Number.isInteger(n) && n >= 2 && n <= 10 ? n : null
 }
 
 /** WO-197 (Chiron 16:1xZ, mesh-12795): the tag attributes client.meta never overrides, the one exclusion list. They say where the message is and

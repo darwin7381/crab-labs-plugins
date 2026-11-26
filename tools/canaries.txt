@@ -272,3 +272,11 @@ plugins/telegram-http/tg-fetch.ts::if (close) { const h = new Headers((opts?.hea
 plugins/telegram-http/server.ts::fetch: tgFetch.wrap(nodeFetch as unknown as FetchFn) as any } })
 plugins/telegram-http/server.ts::const res = await tgFetch.fetch(`${API_ROOT}/bot${TOKEN}/${method}`, {
 plugins/telegram-http/server.ts::await tgFetch.endClose().catch(e => log('warn', `connector: closing the connections to Telegram failed: ${e instanceof Error ? e.message : e}`))
+plugins/telegram-http/server.ts::const ALBUM_CAP_MS = Number(process.env.TELEGRAM_ALBUM_CAP_MS) || 10_000
+plugins/telegram-http/server.ts::if (entry.expect != null && entry.items.length >= entry.expect) { flush('all'); return }
+plugins/telegram-http/server.ts::if (facts.mgid && (facts.image || facts.attachment) && !facts.fromReply) albumArriving(chat_id, facts.mgid, key)
+plugins/telegram-http/server.ts::for (const x of a.keys) inboundStore?.update(x, f => { f.albumCount = n })
+plugins/telegram-http/server.ts::if (inAlbum) photo = take
+plugins/telegram-http/server.ts::await Promise.all(entry.items.map(async it => { if (it.photo) { it.imagePath = await it.photo; delete it.photo } }))
+plugins/telegram-http/onsen-inbound.ts::export function albumCountOf(
+plugins/telegram-http/onsen-album-daemon.test.ts::one tag with three image paths, one router event

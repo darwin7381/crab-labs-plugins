@@ -20,7 +20,9 @@ export type OnsenStandin = {
   /** per credential: Onsen's version (default 0.31.0), POST /messages answering 500, a delay before A is answered (ms). WO-197: `bridge[who]`: a
    *  Telegram bridge carries that agent (its messages are written pending and reported sent after delayMs with the next Telegram numbers, one per
    *  ~4000 characters of text and one per file); off: they stay pending (bridgeOn() draws them later) */
-  st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number; bridge: Record<Who, { on: boolean; delayMs: number; next: number }> }
+  st: { version: Record<Who, string>; a500: Record<Who, boolean>; aDelayMs: number; bridge: Record<Who, { on: boolean; delayMs: number; next: number }>
+    /** WO-197 (defect 3): a delay before a stored file is served (GET /v1/files/<id>: a large photo) */
+    fileDelayMs?: number }
   /** WO-197: the connector's writes (POST /v1/messages), reactions (POST /v1/messages/<id>/reactions) and edits (PUT /v1/messages/<id>) */
   connector: Array<{ who: Who; kind: 'message' | 'reaction' | 'edit'; id: number; body: any }>
   /** WO-197: the bridge of `who` comes on: what waits pending is drawn now */
@@ -108,6 +110,7 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
     if (gf) {
       const f = [...files.values()].find(x => x.id === gf[1])
       seen.push({ who, method: 'GET', path, body: null, headers, at: Date.now() })
+      if (st.fileDelayMs) await sleep(st.fileDelayMs)
       return f ? new Response(f.bytes, { headers: { 'content-type': 'application/octet-stream' } }) : Response.json({ error: { message: 'no file' } }, { status: 404 })
     }
     const body = req.method === 'POST' || req.method === 'PUT' ? await req.json().catch(() => null) : undefined
