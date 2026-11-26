@@ -750,7 +750,7 @@ test('WO-162, lanes on: 1.55.1\'s rule (the offered item is the turn\'s once the
     J.write('run', 'r1', 'exited', { event: ev(960).id, lane: 'worker-a', reason: 'normal' })
     expect(of(960)).toEqual(['in_session:worker-a', 'seen:worker-a', 'turn_end:worker-a'])
     expect(of(961)).toEqual(['in_session:worker-a', 'seen:worker-a', 'turn_end:worker-a'])
-    expect(facts.find(f => f.client_msg_id === '960' && f.state === 'turn_end')!.detail).toEqual({ reason: 'normal' })
+    expect(facts.find(f => f.client_msg_id === '960' && f.state === 'turn_end')!.detail).toEqual({ reason: 'normal', outcome: 'done', bound: ['960', '961'] })   // WO-172
     J.write('run', 'r2', 'queued', { event: ev(970).id, lane: 'worker-b', ev: ev(970) })
     J.write('run', 'r2', 'exited', { event: ev(970).id, lane: 'worker-b', reason: 'merged' })
     expect(of(970)).toEqual([])

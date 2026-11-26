@@ -84,13 +84,16 @@ export const idemStatus = (agent: string, ms: number, state: StatusState): strin
 // ------------------------------------------------------------------ who is sending (server.ts sets it around each send path)
 export type SendCtx = { sender: string; part?: number; parts?: number; richAttempt?: boolean; skip?: boolean
   /** WO-145: [what Telegram got, what Onsen records] pairs applied to the recorded text, in order (a page link with its one-time key → the link without) */
-  redact?: Array<[string, string]> }
+  redact?: Array<[string, string]>
+  /** WO-172: the turn the message is sent in (the main's prompt id, a lane's run id; the observation's sessions[].turn.id); a notice of the daemon's
+   *  own has none */
+  turn_id?: string | null }
 const als = new AsyncLocalStorage<SendCtx>()
 /** the author of a Telegram call made outside every named send path (server.ts records it all the same) */
 export const DEFAULT_CTX: SendCtx = { sender: 'system:daemon' }
 /** run `fn` with `sender` as the author of every Telegram call it makes; `extra` (WO-145): `redact` for the record */
-export function withSender<T>(sender: string, fn: () => T, extra?: Pick<SendCtx, 'redact'>): T {
-  return als.run(extra?.redact?.length ? { sender, redact: extra.redact } : { sender }, fn)
+export function withSender<T>(sender: string, fn: () => T, extra?: Pick<SendCtx, 'redact' | 'turn_id'>): T {
+  return als.run({ sender, ...(extra?.redact?.length ? { redact: extra.redact } : {}), ...(extra?.turn_id ? { turn_id: extra.turn_id } : {}) }, fn)
 }
 /** WO-145: the text as Onsen keeps it: every [sent, kept] pair of the send context applied */
 export function redactText(s: string, redact?: Array<[string, string]>): string {
@@ -227,6 +230,7 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
   const attachments: OnsenAttachment[] | undefined = kind === 'text' || kind === 'rich' ? undefined
     : [{ ...(fname ? { name: String(fname) } : {}), ...(f?.mime_type ? { mime: f.mime_type } : {}), ...(f?.file_size != null ? { size: Number(f.file_size) } : {}), ...(f?.file_id ? { file_id: f.file_id } : {}) }]
   const meta: Record<string, unknown> = {
+    ...(ctx.turn_id ? { turn_id: ctx.turn_id } : {}),                       // WO-172: the turn it was sent in (Onsen stores meta as it is)
     ...(ctx.parts && ctx.parts > 1 ? { part: ctx.part, parts: ctx.parts } : {}),
     ...(payload.disable_notification ? { silent: true } : {}),
     ...(payload.reply_markup ? { buttons: true } : {}),
@@ -456,6 +460,15 @@ export class OnsenClient {
     if (!cred) return null
     if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs)
     const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred), signal: AbortSignal.timeout(timeoutMs) })
+    let json: any = null
+    try { json = await r.json() } catch {}
+    return { status: r.status, json }
+  }
+  /** WO-172: a PUT whose body is bytes (an avatar), with this agent's credential; null: no credential; throws on a network error or the timeout */
+  async putBytes(path: string, bytes: Uint8Array, contentType: string, timeoutMs = 20_000): Promise<{ status: number; json: any } | null> {
+    const cred = this.cfg.credential()
+    if (!cred) return null
+    const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred, { 'Content-Type': contentType }), body: bytes, signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }

@@ -628,7 +628,7 @@ export function createMain(E: MainEnv) {
     idleSeen = null
     const back = cutTurn(g).filter(r => owed(r))
     openTools.delete(g.id)
-    setMain(g, 'idle', { prompt_id: null, tool_open: null, stopped_prompt: null })
+    setMain(g, 'idle', { prompt_id: null, tool_open: null, stopped_prompt: null, ended_by: 'interrupted' })   // WO-172: the turn's end, for its turn_end facts
     // WO-157c (Chiron 15:25Z, 1): the cut items are held, not offered on their own (1.55.1 offered them and the main began again 4 s after Esc); what
     // came in during the turn and never reached the conversation is offered now, with them riding
     E.log('info', `lanes: main gen ${g.id}: its turn ended without a Stop (${seen ? 'the status record shows it interrupted' : `statusOf idle for ${heldS} s`}, no hook event): closed as interrupted, ${back.length} item(s) held to ride the next delivery`)

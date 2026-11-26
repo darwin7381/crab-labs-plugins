@@ -142,3 +142,6 @@ plugins/telegram-http/server.ts::onsenStatusCompute = currentStatus
 plugins/telegram-http/lanes.ts::export function mainStatusChanged
 plugins/telegram-http/screen-status.ts::export function composeRecord(
 plugins/telegram-http/server.ts::observation: lastObservation,
+plugins/telegram-http/onsen-client.ts::...(ctx.turn_id ? { turn_id: ctx.turn_id } : {})
+plugins/telegram-http/onsen-status.ts::export type TurnEnded =
+plugins/telegram-http/onsen-avatar.ts::export class AvatarSync

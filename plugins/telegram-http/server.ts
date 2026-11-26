@@ -67,6 +67,7 @@ import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.t
 import { DutyOfficer, askModelCli, isClaudeCmd, isDutyCallback, isRateLimitMenu, realTmux } from './duty-officer.ts'
 import { DUTY_MENUS, ScreenStatus, Since, composeRecord, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
+import { AvatarSync, type PhotoSize } from './onsen-avatar.ts'
 import { jevAsk, jevKey, jevLog } from './lanes-triage.ts'
 import { LocalKeepwarm, SENDER as SENDER_KEEPWARM } from './keepwarm-local.ts'
 import { parseFleetConfig } from './fleet-config.ts'
@@ -439,6 +440,9 @@ let onsenWakeLog = false
 /** WO-157 (Chiron 13:46Z): the main's status computed now, the one record the daemon reports to Onsen (local reads, no network; WO-169: currentStatus(),
  *  statusOf's view through the screen reader); null: Onsen step 3 off for this agent (no status is computed here, and the lanes keep the old path) */
 let onsenStatusCompute: (() => { state: string; detail?: Record<string, unknown> }) | null = null
+/** WO-172: the main's turn now (its prompt id with lanes on, `turn-<ms>` from its transcript with lanes off: the observation's sessions[].turn.id);
+ *  null: no turn open, or Onsen step 3 off here. What the main sends in a turn carries it */
+let mainTurnNow: () => string | null = () => null
 const onsenAllow = { at: 0, ids: [] as string[] }
 /** Onsen step 3: Joey's Telegram message behind these meta (a sender on the DM allowlist, a chat, a message id), or null. The allowlist is read at most
  *  every 5 s (it is consulted on every lanes journal write). */
@@ -1956,6 +1960,8 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
     ...(noReply ? { no_reply: true } : {}),
     ...laneFields(extra),
     ...(extra?.urgency === 'silent' ? { urgency: 'silent' } : {}) }        // WO-157: the receiver's decideWake reads it (record only); not in the BTCC row
+  // WO-172: no turn_id here: Onsen's /send is strict (0.9.3, WO-151: an unknown key in payload or refs is a 400) and does not list it yet; it goes in
+  // once Onsen takes it (lab 11-26 01:29:44Z: a lane's two reply_agent calls with it were refused)
   if (pushUrl) {
     try {
       const r = await fetch(pushUrl, {
@@ -2292,7 +2298,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           log('info', `reply sent: method=${method} chat=${chat_id} message=${id ?? '?'} topic=${topicF.message_thread_id ?? '-'} ms=${Date.now() - t0}`)
         // the one text send (sendTextParts), shared with the lane lines
         const sentIds = await Onsen.withSender('main', () => sendTextParts(chat_id, { rich: chunks, plain: chunks }, { what: 'reply', useRich, parseMode, quiet, topicF, sentLog,   // Onsen (WO-139)
-          replyParams: reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined, replyAll: replyMode === 'all' }), { redact: fl.redact })
+          replyParams: reply_to != null && replyMode !== 'off' ? { message_id: reply_to } : undefined, replyAll: replyMode === 'all' }), { redact: fl.redact, turn_id: mainTurnNow() })
 
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
@@ -2305,7 +2311,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const opts = topicF.message_thread_id != null ? { ...(base ?? {}), ...topicF } : base
           const t0 = Date.now(), method = PHOTO_EXTS.has(ext) ? 'sendPhoto' : 'sendDocument'
           try {
-            const sent = await Onsen.withSender('main', () => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts))   // Onsen (WO-139)
+            const sent = await Onsen.withSender('main', () => method === 'sendPhoto' ? bot.api.sendPhoto(chat_id, input, opts) : bot.api.sendDocument(chat_id, input, opts), { turn_id: mainTurnNow() })   // Onsen (WO-139); WO-172: its turn
             sentIds.push(sent.message_id)
             sentLog(method, sent.message_id, t0)
           } catch (fe) {
@@ -2548,6 +2554,8 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
 // WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of
 // the main's pane are handed to it, so the screen is not captured twice
 let screenStatus: ScreenStatus | null = null
+/** WO-172 (ONSEN_AVATAR): the bot's profile photo as this agent's Onsen avatar; null: off */
+let avatarSync: AvatarSync | null = null
 let dutyOfficer: DutyOfficer | null = null
 if (isControlEnabled() || isRoamerEnabled()) {
   dutyOfficer = new DutyOfficer({
@@ -4349,11 +4357,12 @@ if (Lanes.LANES_ON) {
         const fl = o.laneId ? await formLinks(chat, text, o.laneId) : { text, redact: [] as Array<[string, string]> }
         const lt = label && fl.text.startsWith(`${label}\n`) ? fl.text.slice(label.length + 1) : label ? text.slice(label.length + 1) : fl.text
         // Onsen (WO-139): a lane's line is the lane's (its id), the router's own notices the router's
+        // WO-172: a lane's line carries its run (the turn it is sent in); the router's notices carry none
         const ids = await Onsen.withSender(o.laneId || 'router', () => sendTextParts(chat, laneLineParts(label, lt, limit, useRich), {
           what: 'lane line', useRich, quiet: o.silent ? { disable_notification: true } : {}, topicF: tf,
           replyParams: o.replyTo ? { message_id: o.replyTo, allow_sending_without_reply: true } : undefined,   // 002k (E4): a deleted message must not lose the notice
           sentLog: (method, id, t0) => log('info', `lane line sent: method=${method} chat=${chat} message=${id ?? '?'} topic=${tf.message_thread_id ?? '-'} ms=${Date.now() - t0}`),
-        }), { redact: fl.redact })
+        }), { redact: fl.redact, turn_id: o.laneId ? Lanes.runOfLane(o.laneId) : null })
         sentIn(chat, ids, tf)
         return ids[0]
       },
@@ -4468,12 +4477,17 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     const edge = `${pub.state}|${pub.detail?.interrupted === true}`
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
-  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row) }) : null
+  // WO-172: each turn that ended (the main's, a lane run): one line. Its outcome and bound ride every turn_end fact of a Joey message in it (Onsen keeps
+  // the fact's detail); a turn with no Joey message in it (a colleague's call alone) has no fact to ride: Onsen takes delivery facts for Telegram
+  // messages only, so this line is its record here
+  const turnEnded = (t: OnsenStatus.TurnEnded): void => log('info', `onsen: turn_end ${t.session} ${t.turn_id} ${t.outcome} bound=[${t.bound.join(',')}] facts=${t.facts}`)
+  const tap = Lanes.LANES_ON ? new OnsenStatus.LanesTap({ facts, joey: onsenJoeyOf, gen: () => Lanes.mainGenRow(), changed: kick, trigger: row => Lanes.triggerOfItem(row), turnEnded }) : null
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
-    session: () => { try { return registry.mainSessionId() } catch { return null } } })
+    session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
+  mainTurnNow = () => { try { return (tap ? tap.turnFacts()?.id : watch?.turnFacts()?.id) ?? null } catch { return null } }   // WO-172
   // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
   // (every open stream counts as the main's)
   const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
@@ -4572,7 +4586,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
   }
   setTimeout(kick, 1_000).unref?.()
-  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop() }
+  onsenStep3Stop = () => { facts.flushLater(); status.stop(); registry.stop(); pin?.pin.stopTimers(); formInbox?.stop(); screenStatus?.stop(); avatarSync?.stop() }
   // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; Onsen's endpoint for it is Epeius's to open)
   onsenStatusNow = () => ({ ...(status.current() ?? {}), observation: lastObservation,
     mode: tap ? 'lanes' : watch?.watching() ? 'transcript' : 'stream-only', registry: registry.mode(),
@@ -4581,6 +4595,31 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     ...(seenReactor ? { react_seen: seenReactor.stats } : {}), ...(pin ? { status_pin: { ...pin.pin.stats, chats: pin.pin.view() } } : {}),
     ...(formInbox ? { forms: formInbox.stats } : {}), ...(onsenWakeLog ? { wake_log: { on: true, recorded: onsen.stats.wake_recorded } } : {}) })
   log('info', `onsen: step 3 on (delivery facts and the main's status: Claude Code's session registry; detail from ${tap ? 'the lanes journal' : 'the transcript'})`)
+  // WO-172 (ONSEN_AVATAR, off by default: Onsen's upload is WO-170's): this bot's own profile photo as this agent's Onsen avatar, at start (a random
+  // moment of the first minute) and every 24 h, uploaded only when its sha256 differs from the last upload (onsen-avatar.ts)
+  if (switchOn(process.env.ONSEN_AVATAR, ONSEN_AGENT)) {
+    const avatarFile = join(STATE_DIR, 'onsen', 'avatar.json')
+    avatarSync = new AvatarSync({ agent: ONSEN_AGENT,
+      botId: async () => (await bot.api.getMe()).id,
+      photoSizes: async id => ((await bot.api.getUserProfilePhotos(id, { limit: 1 })).photos?.[0] ?? []) as PhotoSize[],
+      download: async fileId => {
+        const f = await bot.api.getFile(fileId)
+        if (!f.file_path) throw new Error('getFile returned no file_path')
+        const r = await fetch(`${API_ROOT}/file/bot${TOKEN}/${f.file_path}`, { signal: AbortSignal.timeout(20_000) })
+        if (!r.ok) throw new Error(`the photo's download answered HTTP ${r.status}`)
+        return new Uint8Array(await r.arrayBuffer())
+      },
+      put: async (bytes, type) => {
+        const r = await onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/avatar`, bytes, type)
+        return r ? { status: r.status, detail: r.status >= 300 ? JSON.stringify(r.json?.error ?? r.json ?? null) : undefined } : { status: 0, detail: 'no mesh credential' }
+      },
+      load: () => { try { return JSON.parse(readFileSync(avatarFile, 'utf8')) } catch { return null } },
+      save: x => { try { mkdirSync(join(STATE_DIR, 'onsen'), { recursive: true }); writeFileSync(avatarFile, JSON.stringify(x)) } catch {} },
+      log: (lv, m) => log(lv, m) })
+    const firstMs = Number(process.env.ONSEN_AVATAR_FIRST_MS)
+    avatarSync.start(Number.isFinite(firstMs) && firstMs >= 0 && process.env.ONSEN_AVATAR_FIRST_MS ? firstMs : 5_000 + Math.floor(Math.random() * 55_000))
+    log('info', `onsen: avatar on for ${ONSEN_AGENT} (the bot's profile photo → PUT ${onsen.cfg.base}/v1/members/${ONSEN_AGENT}/avatar when it changes; checked at start and every 24 h)`)
+  }
   // WO-147 (Onsen step 4a, ONSEN_WAKE_LOG): every route record (routing.jsonl line) as one wake row in Onsen (onsen-wake.ts), through the spool. Read only:
   // the row is built from the record the router already wrote and appended to the spool after the router's own step (a microtask: toMain has given the
   // event its M1 item by then, and nothing of the route waits for it); any failure is logged once an hour and that row is dropped.

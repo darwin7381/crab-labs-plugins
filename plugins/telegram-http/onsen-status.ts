@@ -319,6 +319,15 @@ export class TurnStarts {
 }
 
 // ------------------------------------------------------------------ lanes on: the journal and the main's hook events
+/** WO-172: how a turn ended — computed once (LanesTap for the main and the lanes, TurnWatch for a main with no lanes), the same value on every
+ *  turn_end fact of that turn and on the observation's last_turn. done: it ended with Stop (a lane's run: exited normally); interrupted: cut (Esc, a
+ *  new prompt with no Stop; a lane closed while it ran); failed: StopFailure, the wall, a lane run that died, timed out or hit a cap */
+export type TurnOutcome = 'done' | 'interrupted' | 'failed'
+/** WO-172: one turn that ended: whose (main, a lane id), which (the prompt id / run id: sessions[].turn.id), how, and the messages bound into it
+ *  (Joey's by their client_msg_id, a colleague's item by its msg id); `facts`: how many turn_end facts it gave (one per Joey message in it) */
+export type TurnEnded = { session: string; turn_id: string; outcome: TurnOutcome; bound: string[]; ended_at: string; facts: number }
+/** a lane run's exit reason (lanes.ts exitReason; closed: its lane closed while it ran) as the turn's outcome */
+export const runOutcome = (reason: unknown): TurnOutcome => { const r = String(reason ?? ''); return r === 'normal' ? 'done' : r === 'closed' ? 'interrupted' : 'failed' }
 /** WO-169: what opened a turn (Onsen contract v1 §3 Trigger) */
 export type TurnTrigger = { kind: 'message'; conversation_id: string; message_id: string } | { kind: 'thread'; thread_id: string } | { kind: 'schedule' } | { kind: 'other' }
 /** Joey's Telegram message behind these meta (allowlisted sender, not an edit's re-delivery), or null */
@@ -343,11 +352,26 @@ export class LanesTap {
   private opened: { prompt: string; trigger: TurnTrigger; thread: string | null; lead: boolean } | null = null
   private lead: string | null = null
   private leadOpen = true
-  private last: { id: string; outcome: 'done' | 'interrupted' | 'failed'; ended_at: string } | null = null
+  private last: { id: string; outcome: TurnOutcome; ended_at: string } | null = null
   private failed = false
-  /** trigger (WO-169): an M1 item as the trigger of the turn it opened, and its thread (lanes.ts knows the threads) */
+  /** WO-172: each prompt's bound items (M1 row ids) and their message ids (bound), the outcome its first ending line gave, how many facts it gave */
+  private boundOf = new Map<string, { rows: Set<string>; ids: string[]; ending: TurnOutcome | null; facts: number }>()
+  /** trigger (WO-169): an M1 item as the trigger of the turn it opened, and its thread (lanes.ts knows the threads); turnEnded (WO-172): each turn of the
+   *  main or of a lane that ended, once */
   constructor(readonly o: { facts: DeliveryFacts; joey: JoeyOf; gen: () => Row | null; changed: () => void; now?: Now
-    trigger?: (row: Row) => { trigger: TurnTrigger; thread: string | null } | null }) {}
+    trigger?: (row: Row) => { trigger: TurnTrigger; thread: string | null } | null; turnEnded?: (t: TurnEnded) => void }) {}
+  private turnBound(prompt: string) {
+    let b = this.boundOf.get(prompt)
+    if (!b) { b = { rows: new Set(), ids: [], ending: null, facts: 0 }; this.boundOf.set(prompt, b); if (this.boundOf.size > 50) this.boundOf.delete(this.boundOf.keys().next().value!) }
+    return b
+  }
+  /** an item's message id as `bound` names it: Joey's message by its client_msg_id, a colleague's item by its msg id; none for what has neither */
+  private msgIdOf(row: Row, j: { chat: string; id: string } | null): string | null {
+    if (j) return j.id
+    const m = ((row.notif?.params as any)?.meta ?? {}) as Record<string, unknown>
+    return m.btcc_msg_id != null && String(m.btcc_msg_id) !== '' ? String(m.btcc_msg_id) : null
+  }
+  private ended(t: TurnEnded): void { try { this.o.turnEnded?.(t) } catch {} }
   private now(): number { return (this.o.now ?? Date.now)() }
 
   journal(row: Row, line: Record<string, unknown>): void {
@@ -361,8 +385,22 @@ export class LanesTap {
         // an offered one has it already, this daemon writes each fact once)
         if (line.reason === 'turn_continued') F.cancelTurnEnd(j.chat, j.id, 'main')
         else { F.inSession(j.chat, j.id, 'main', row.ts); F.seen(j.chat, j.id, 'main', row.ts) }
-      } else if (j && line.state === 'done') {
-        F.turnEndLater(j.chat, j.id, 'main', row.ts, row.reason ? { reason: String(row.reason) } : undefined)
+      }
+      // WO-172: how the turn ended, from its items: done at its Stop; queued again because it was cut (interrupted) or ended in StopFailure (failed; any
+      // other requeue of a bound item: the gen ended under it, failed). The first such line of a prompt sets the turn's outcome; each Joey message in it
+      // gets its turn_end fact with the outcome and everything bound into the turn
+      const endP = line.state === 'done' ? (row.prompt_id ? String(row.prompt_id) : this.turn?.prompt ?? null)
+        : line.state === 'queued' && this.turn && this.boundOf.get(this.turn.prompt)?.rows.has(String(row.id)) ? this.turn.prompt : null
+      if (endP) {
+        const b = this.turnBound(endP)
+        const outcome: TurnOutcome = line.state === 'done' ? 'done' : line.reason === 'interrupted' ? 'interrupted' : 'failed'
+        if (!b.ending) b.ending = outcome
+        if (j) {
+          const detail = { ...(row.reason && line.state === 'done' ? { reason: String(row.reason) } : {}), outcome: b.ending, bound: [...b.ids] }
+          if (line.state === 'done') F.turnEndLater(j.chat, j.id, 'main', row.ts, detail)
+          else F.turnEnd(j.chat, j.id, 'main', row.ts, detail)
+          b.facts++
+        }
       }
       // WO-169: what opened a turn: the item M1 offered it (the offer's lead: M1 writes `offered` for the lead first, then for the items riding it —
       // an interrupted turn's, the digest — with no other line between), else the first item bound to the prompt; an item pulled into a turn already
@@ -370,6 +408,10 @@ export class LanesTap {
       if (line.state === 'offered') { if (this.leadOpen && row.kind !== 'digest') { this.lead = String(row.id); this.leadOpen = false } }
       else this.leadOpen = true
       const P = line.prompt_id ? String(line.prompt_id) : null
+      if (line.state === 'bound' && line.reason !== 'turn_continued' && P && row.kind !== 'digest') {           // WO-172: what is bound into the turn
+        const b = this.turnBound(P), mid = this.msgIdOf(row, j)
+        if (!b.rows.has(String(row.id))) { b.rows.add(String(row.id)); if (mid && !b.ids.includes(mid)) b.ids.push(mid) }
+      }
       if (line.state === 'bound' && line.reason !== 'turn_continued' && P && !line.via_pull && row.kind !== 'digest') {
         const lead = row.id === this.lead
         if (this.opened?.prompt !== P || (lead && !this.opened.lead)) {
@@ -379,15 +421,24 @@ export class LanesTap {
         }
       }
     } else if (row.rec === 'run') {
-      const evs = [row.ev, ...(Array.isArray(row.extra) ? row.extra : []), ...(Array.isArray(row.steered) ? row.steered : [])]
-        .filter((e: any) => e && e.source === 'telegram').map((e: any) => this.o.joey(e.meta)).filter((x): x is { chat: string; id: string } => !!x)
+      const all = [row.ev, ...(Array.isArray(row.extra) ? row.extra : []), ...(Array.isArray(row.steered) ? row.steered : [])].filter((e: any) => e)
+      const evs = all.filter((e: any) => e.source === 'telegram').map((e: any) => this.o.joey(e.meta)).filter((x): x is { chat: string; id: string } => !!x)
       const lane = String(row.lane ?? 'lane')
       if (line.state === 'running') {
         this.runs.add(row.id)
         for (const e of evs) { F.inSession(e.chat, e.id, lane, row.ts); F.seen(e.chat, e.id, lane, row.ts) }   // spawned with it in its prompt, or steered into it
       } else if (line.state === 'exited' && this.runs.has(row.id)) {
         this.runs.delete(row.id)
-        for (const e of evs) F.turnEnd(e.chat, e.id, lane, row.ts, row.reason ? { reason: String(row.reason) } : undefined)
+        // WO-172: the run is the lane's turn: its outcome from the exit reason, bound = its items (Joey's client_msg_id, a colleague's msg id)
+        const outcome = runOutcome(row.reason)
+        const bound: string[] = []
+        for (const e of all) {
+          const j = e.source === 'telegram' ? this.o.joey(e.meta) : null
+          const mid = j ? j.id : e.btcc_msg_id != null && String(e.btcc_msg_id) !== '' ? String(e.btcc_msg_id) : null
+          if (mid && !bound.includes(mid)) bound.push(mid)
+        }
+        for (const e of evs) F.turnEnd(e.chat, e.id, lane, row.ts, { ...(row.reason ? { reason: String(row.reason) } : {}), outcome, bound: [...bound] })
+        this.ended({ session: lane, turn_id: String(row.run ?? row.id), outcome, bound, ended_at: String(row.ts), facts: evs.length })
       }
     } else if (row.rec === 'main') {
       this.leadOpen = true
@@ -395,21 +446,30 @@ export class LanesTap {
       else if ('tool_open' in line) this.tool = null
       if (row.state === 'in_turn' && row.prompt_id && row.prompt_id !== this.turn?.prompt) {
         // WO-169: a new prompt while the last one never ended (no Stop: it was cut, as M2's beginTurn closes it) ends that one as interrupted
-        if (this.open && this.turn) this.last = { id: this.turn.prompt, outcome: 'interrupted', ended_at: row.ts }
+        if (this.open && this.turn) this.closeTurn('interrupted', row.ts)
         this.turn = { prompt: String(row.prompt_id), at: row.ts }
         this.open = true; this.failed = false
         this.subagents = 0
         F.flushLater('main')                                                      // a new prompt: the last turn's Stop was its end
       }
+      else if (row.state === 'in_turn' && row.prompt_id && row.prompt_id === this.turn?.prompt && !this.open) this.open = true   // the same turn went on
       if (row.state !== 'in_turn') {
         this.tool = null; this.subagents = 0
-        if (this.open && this.turn) this.last = { id: this.turn.prompt, outcome: row.state === 'walled' || this.failed ? 'failed' : 'done', ended_at: row.ts }
+        if (this.open && this.turn) this.closeTurn(line.ended_by === 'interrupted' ? 'interrupted' : row.state === 'walled' || this.failed ? 'failed' : 'done', row.ts)
         this.open = false; this.failed = false
       }
     }
     this.o.changed()
   }
 
+  /** WO-169 / WO-172: the main's open turn ended. Its outcome is the one its items' lines gave (the one each turn_end fact carried), else `fallback`
+   *  (a turn with nothing bound: M2's row) */
+  private closeTurn(fallback: TurnOutcome, at: string): void {
+    const p = this.turn!.prompt, b = this.boundOf.get(p)
+    const outcome = b?.ending ?? fallback
+    this.last = { id: p, outcome, ended_at: at }
+    this.ended({ session: 'main', turn_id: p, outcome, bound: [...(b?.ids ?? [])], ended_at: at, facts: b?.facts ?? 0 })
+  }
   /** a hook event of the main (before M2 handles it): compacting and the subagent count */
   mainEvent(b: any): void {
     if (!b || b.sub) return
@@ -495,8 +555,10 @@ export class TurnWatch {
   private latestMs = 0
   private readonly bornMs: number
   /** session (WO-165): the main's session id when known (the registry's), its transcript read in preference to the newest file */
+  /** WO-172: a colleague's items the open turn took in (their msg ids), for its bound */
+  private peerIds: string[] = []
   constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now
-    session?: () => string | null }) {
+    session?: () => string | null; turnEnded?: (t: TurnEnded) => void }) {
     this.bornMs = this.now()
   }
   private now(): number { return (this.o.now ?? Date.now)() }
@@ -587,14 +649,14 @@ export class TurnWatch {
   }
   private begin(ts: string): boolean {
     if (this.inTurn) return false
-    this.inTurn = true; this.turnAt = ts; this.tools.clear(); this.taken.clear(); this.firstTaken = null
+    this.inTurn = true; this.turnAt = ts; this.tools.clear(); this.taken.clear(); this.firstTaken = null; this.peerIds = []
     return true
   }
   /** WO-165: the Joey messages of a record that took them into a turn: seen at `at` (that record's moment) */
   private takeIn(text: string, at: string): void {
     const t = Date.parse(at)
     for (const a of channelTags(text)) {
-      if (!/telegram/.test(a.source ?? '')) continue
+      if (!/telegram/.test(a.source ?? '')) { if (a.btcc_msg_id && this.inTurn && !this.peerIds.includes(a.btcc_msg_id)) this.peerIds.push(a.btcc_msg_id); continue }   // WO-172
       const j = this.o.joey(a)
       if (!j) continue
       this.taken.set(k2(j.chat, j.id), j)
@@ -605,9 +667,15 @@ export class TurnWatch {
   private end(ts: string): boolean {
     if (!this.inTurn) return false
     const t = Date.parse(ts)
-    if (!(t < this.emitFloor)) for (const j of this.taken.values()) this.o.facts.turnEnd(j.chat, j.id, 'main', ts)
-    if (this.turnAt) this.lastEnded = { id: turnIdOf(this.turnAt), outcome: 'done', ended_at: ts }
-    this.inTurn = false; this.turnAt = null; this.tools.clear(); this.taken.clear(); this.firstTaken = null
+    // WO-172: a turn the transcript shows ending (turn_duration) ended done; bound = the Joey messages and the colleagues' items it took in
+    const bound = [...[...this.taken.values()].map(j => j.id), ...this.peerIds.filter(id => ![...this.taken.values()].some(j => j.id === id))]
+    let facts = 0
+    if (!(t < this.emitFloor)) for (const j of this.taken.values()) { this.o.facts.turnEnd(j.chat, j.id, 'main', ts, { outcome: 'done', bound: [...bound] }); facts++ }
+    if (this.turnAt) {
+      this.lastEnded = { id: turnIdOf(this.turnAt), outcome: 'done', ended_at: ts }
+      try { this.o.turnEnded?.({ session: 'main', turn_id: this.lastEnded.id, outcome: 'done', bound, ended_at: ts, facts }) } catch {}
+    }
+    this.inTurn = false; this.turnAt = null; this.tools.clear(); this.taken.clear(); this.firstTaken = null; this.peerIds = []
     return true
   }
   /** WO-169: the open turn as the transcript shows it (its id from its start), and what opened it: the first Joey message it took in, else other */

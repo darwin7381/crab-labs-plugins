@@ -14,6 +14,8 @@ export type BotApiMock = {
    *  "message to edit not found") */
   pinned: Map<string, number>
   deleted: Set<number>
+  /** WO-172: the bot's own profile photo (getUserProfilePhotos → getFile → /file/bot<token>/<path>); null: it has none */
+  photo: { bytes: Uint8Array | null }
   push: (u: Record<string, any>) => void
   of: (method: string) => Call[]
   stop: () => void
@@ -28,6 +30,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
   const hang: BotApiMock['hang'] = { fn: null }
   const fail: BotApiMock['fail'] = { fn: null }
   const pinned = new Map<string, number>(), deleted = new Set<number>()
+  const photo: BotApiMock['photo'] = { bytes: null }
   const updates: Record<string, any>[] = []
   let nextUpdate = 1, nextMsg = 5000, nextTopic = 7000
   const state = { id: 999, is_bot: true, first_name: 'lab', username: 'lab_test_bot', has_topics_enabled: false, allows_users_to_create_topics: false, ...me }
@@ -39,6 +42,8 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
       ...(b.text != null ? { text: String(b.text) } : {}), ...(thread != null ? { message_thread_id: thread, is_topic_message: true } : {}) }
   }
   const server = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) {
+    const fm = new URL(req.url).pathname.match(/^\/file\/bot([^/]+)\/(.+)$/)
+    if (fm) return fm[1] === token && photo.bytes && fm[2] === 'photos/self.jpg' ? new Response(photo.bytes) : new Response('not found', { status: 404 })
     const m = new URL(req.url).pathname.match(/^\/bot([^/]+)\/(\w+)$/)
     if (!m || m[1] !== token) return Response.json({ ok: false, error_code: 404, description: 'Not Found' }, { status: 404 })
     const method = m[2]
@@ -54,6 +59,10 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     if (fail.fn?.(method, body)) return Response.json({ ok: false, error_code: 400, description: fail.desc ?? "Bad Request: can't parse the rich message" }, { status: 400 })
     switch (method) {
       case 'getMe': return ok({ ...state })
+      case 'getUserProfilePhotos': return ok(photo.bytes && Number(body.user_id) === state.id
+        ? { total_count: 1, photos: [[{ file_id: 'self-s', file_unique_id: 'us', width: 160, height: 160 }, { file_id: 'self-l', file_unique_id: 'ul', width: 640, height: 640, file_size: photo.bytes.length }]] }
+        : { total_count: 0, photos: [] })
+      case 'getFile': return ok({ file_id: String(body.file_id), file_unique_id: 'u', ...(photo.bytes ? { file_size: photo.bytes.length, file_path: 'photos/self.jpg' } : {}) })
       case 'pinChatMessage': pinned.set(String(body.chat_id), Number(body.message_id)); return ok(true)
       case 'unpinChatMessage': if (body.message_id == null || pinned.get(String(body.chat_id)) === Number(body.message_id)) pinned.delete(String(body.chat_id)); return ok(true)
       case 'getChat': { const p = pinned.get(String(body.chat_id)); return ok({ id: Number(body.chat_id), type: 'private', first_name: 'J', ...(p != null ? { pinned_message: { message_id: p, date: 0, chat: { id: Number(body.chat_id), type: 'private' } } } : {}) }) }
@@ -84,7 +93,7 @@ export function startBotApiMock(me: Record<string, any> = {}, o: { pollHoldMs?: 
     }
   } })
   return {
-    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail, pinned, deleted,
+    url: `http://127.0.0.1:${server.port}`, token, calls, me: state, polls, hang, fail, pinned, deleted, photo,
     push: (u) => { updates.push({ update_id: nextUpdate++, ...u }) },
     of: (method) => calls.filter(c => c.method === method),
     stop: () => server.stop(true),

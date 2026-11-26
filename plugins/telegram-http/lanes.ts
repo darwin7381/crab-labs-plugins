@@ -7856,6 +7856,10 @@ export async function checkPeerSend(from: string, to: string, text: string, answ
   const r = await peerCall(TG_PORT, '/lanes/peer-check', 'POST', { from, to, text, answers_request: answersRequest === true })
   return r && typeof r.refuse === 'string' && r.refuse ? r.refuse : null
 }
+/** WO-172: a lane's run now (its turn id: what the lane sends in it carries it); null: the lane runs nothing */
+export function runOfLane(id: string): string | null {
+  try { return running.get(id)?.runId ?? null } catch { return null }
+}
 /** inbox role: hop gate for a main send in a thread (002w C: a no_reply send passes a stopped or over-limit thread) */
 export async function checkMainSend(thread: string, hop: number, noReply = false): Promise<{ ok: boolean; hop: number; why?: string }> {
   const r = await peerCall(TG_PORT, '/lanes/outbound-check', 'POST', { thread, hop, no_reply: noReply })
