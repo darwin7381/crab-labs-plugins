@@ -102,5 +102,6 @@ test('named at runtime (the machine config), ONSEN_ACTIONS=0: none before (Teleg
   expect(made('s', a => a.source === 'menu')).toHaveLength(1)
   expect(made('s', a => a.source === 'permission')).toHaveLength(1)
   expect(apiS.calls.length).toBe(calls)
-  expect((await health(sw)).connector.bot_api_refused).toEqual({})
+  // nothing tried to reach Telegram for the prompt or the menu; the poll's own last getUpdates may be refused once at the hand-over (segment 1, load)
+  expect(Object.keys((await health(sw)).connector.bot_api_refused).filter(k => k !== 'getUpdates')).toEqual([])
 }, 70000)
