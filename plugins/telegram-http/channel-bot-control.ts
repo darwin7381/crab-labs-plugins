@@ -143,8 +143,38 @@ async function tmuxSendCtrlKey(key: string, tmuxName: string = TMUX_SESSION): Pr
   }
 }
 
-/** tmux capture-pane → returns plain text (with ANSI stripped). */
+// ---- WO-168 stage two (item 8; Chiron 05:24:56Z): the daemon's own pane is read through the status record's one capture (server.ts usePaneRecord:
+// pane-look.ts PaneReader, and screen-status.ts recordOf for that look). The state part of the checks before a command reads the record (busy or not, the
+// resume list, the Yes/No confirm and its options); the printed-output checks (the "Set model/effort" line, /codexgate's echo) read that look's text. A
+// roamer pane, or no record (JEV_SCREEN does not list the agent): its own capture and the rules below, as before
+export type PaneRecordRead = { text: string; state: string; detail: Record<string, any> }
+let paneRecord: ((tmux: string) => Promise<PaneRecordRead | null>) | null = null
+export function usePaneRecord(fn: ((tmux: string) => Promise<PaneRecordRead | null>) | null): void { paneRecord = fn }
+async function recordRead(tmux: string): Promise<PaneRecordRead | null> {
+  if (!paneRecord) return null
+  try { return await paneRecord(tmux) } catch { return null }
+}
+type RecOpt = { n: number | null; text: string; cursor: boolean }
+const recOptions = (r: PaneRecordRead): RecOpt[] => Array.isArray(r.detail.menu_options) ? r.detail.menu_options.filter((o: any) => o && typeof o.text === 'string') : []
+const recMenu = (r: PaneRecordRead): string | null => typeof r.detail.waitingFor === 'string' && r.detail.waitingFor !== 'none' ? r.detail.waitingFor : null
+/** the record says the TUI is at its prompt and nothing is open: idle, or walled with no menu (a command typed during a wall still runs: /model) */
+export function recordIdle(r: { state: string; detail: Record<string, any> }): boolean {
+  return (r.state === 'idle' || r.state === 'walled') && !(typeof r.detail?.waitingFor === 'string' && r.detail.waitingFor !== 'none')
+}
+/** the record's Yes/No confirm (the switch_confirm layout): its first option 「Yes…」 under the cursor (a bare Enter confirms it) and a 「No, go back」;
+ *  `keyword`: the command's own (its question or options carry it) */
+export function recordYesNo(r: { state: string; detail: Record<string, any> }, keyword?: RegExp): boolean {
+  const rr = r as PaneRecordRead
+  if (!recMenu(rr) || recMenu(rr) === 'resume_picker') return false
+  const opts = recOptions(rr)
+  if (!(opts.some(o => o.n === 1 && o.cursor && /^Yes/i.test(o.text)) && opts.some(o => /No,\s*go\s*back/i.test(o.text)))) return false
+  return keyword ? keyword.test([String(rr.detail.waiting_text ?? ''), ...opts.map(o => o.text)].join('\n')) : true
+}
+
+/** tmux capture-pane → returns plain text (with ANSI stripped). WO-168: the own pane's text is the record's look */
 async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string> {
+  const rec = await recordRead(tmuxName)
+  if (rec) return rec.text
   const { exitCode, stdout } = await runCommand(
     ['tmux', 'capture-pane', '-t', tmuxName, '-p'],
   )
@@ -169,6 +199,8 @@ async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string>
  * dismissal) omit it.
  */
 async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION, requiredKeyword?: RegExp): Promise<boolean> {
+  const rec = await recordRead(tmuxName)
+  if (rec) return recordYesNo(rec, requiredKeyword)                     // WO-168: the record's menu and options
   const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-25).join('\n')
   if (/Resume session/.test(tail)) return false // handled separately
@@ -896,6 +928,8 @@ async function runCodexGate(tmuxName: string, notify: (msg: string) => Promise<v
 
 /** Is claude TUI's `/resume` picker overlay currently rendered? */
 async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const rec = await recordRead(tmuxName)
+  if (rec) return recMenu(rec) === 'resume_picker'                      // WO-168: the record's menu kind
   const pane = await tmuxCapturePane(tmuxName)
   return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
 }
@@ -929,6 +963,8 @@ const BUSY_PANE_MARKERS: readonly RegExp[] = [
 
 /** Is claude TUI mid-tool-call / mid-turn (not at the idle ❯ prompt)? */
 async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const rec = await recordRead(tmuxName)
+  if (rec) return !recordIdle(rec)                                     // WO-168: the record's state
   const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-15).join('\n')
 

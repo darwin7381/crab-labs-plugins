@@ -38,6 +38,7 @@ import {
   controlCommandsForBotApi,
   controlStatusText,
   startLoginExpiredWatchdog,
+  usePaneRecord,
   type WatchTarget,
   type InlineButton,
   type ReplyOptions,
@@ -4587,6 +4588,13 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // WO-168: every look of the own pane (the officer's, a busy check's, its own) goes to the record once; and the record for exactly one look, for them
     ownPaneReader?.onLook(l => { if (l) { try { screenStatus?.sample(l) } catch (e) { log('warn', `screen-status: sample: ${e}`) } } })
     ownRecordOf = l => { const r = screenStatus?.recordOf(l, compute()); return r ? { view: r.view, hash: r.hash } : null }
+    // WO-168 item 8: the checks before a Telegram command read the own pane's state from the record of a look taken now (the text checks read its text)
+    usePaneRecord(async tmux => {
+      if (!ownPaneReader || tmux !== ownPaneTmux || !ownRecordOf) return null
+      const l = await ownPaneReader.fresh(250)
+      const r = l ? ownRecordOf(l) : null
+      return l && r ? { text: l.visible, state: r.view.state, detail: (r.view.detail ?? {}) as Record<string, any> } : null
+    })
   }
   registry.start()
   setInterval(() => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()

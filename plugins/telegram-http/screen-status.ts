@@ -491,11 +491,12 @@ const menuKindOf = (v: ScreenVerdict, facts: ScreenFacts | null): Exclude<Verdic
 function menuDetail(v: ScreenVerdict, st: Regions, facts: ScreenFacts | null): Record<string, unknown> {
   const text = facts?.question ? facts.question : st.has_input_box ? st.above_input_box ?? '' : st.screen_bottom ?? ''
   const q = noPct(redact(text))
-  return { waitingFor: menuKindOf(v, facts), waiting_text: facts?.question ? cutTail(q, 300) : cut(q, 200),
+  return { waitingFor: menuKindOf(v, facts), waiting_text: facts?.question ? cutMid(q, 300) : cut(q, 200),
     ...(facts?.options.length ? { menu_options: facts.options.map(o => ({ n: o.n, text: cut(noPct(redact(o.text)), 200), cursor: o.cursor })) } : {}),
     ...(v.menu_raw !== undefined ? { menu_raw: v.menu_raw } : {}) }
 }
-const cutTail = (s: string, n: number): string => { const a = Array.from(s); return a.length <= n ? s : '…' + a.slice(a.length - n + 1).join('') }
+/** a long question keeps its head (the title: 「Switch model?」) and its tail (the ask: 「Do you want to proceed?」), n code points in all */
+const cutMid = (s: string, n: number): string => { const a = Array.from(s); return a.length <= n ? s : a.slice(0, 100).join('') + '…' + a.slice(a.length - (n - 101)).join('') }
 function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts, sc: ScreenCtx | null = null): StatusView {
   if (gone(prog)) return programView(prog)
   const facts = st && sc ? sc.facts : null

@@ -123,6 +123,33 @@ async function tmuxSendCtrlKey(key: string, tmuxName: string = TMUX_SESSION): Pr
   }
 }
 
+// ---- WO-168 stage two (item 8; KEEP IN SYNC with telegram-http channel-bot-control.ts): the pane's state before a command is the status record of the
+// agent's telegram daemon, read from its /healthz (onsen.status: the record and the screen it is for). CHANNEL_BOT_STATUS_URL names that /healthz (e.g.
+// http://127.0.0.1:17631/healthz); unset, unreadable, another pane, or a record not about a screen seen in the last 5 s: the screen rules below, as before.
+// The printed-output checks ("Set model/effort", /codexgate's echo) read this daemon's own capture as before
+type StatusRead = { state: string; detail: Record<string, any> }
+async function statusRead(tmuxName: string): Promise<StatusRead | null> {
+  const url = (process.env.CHANNEL_BOT_STATUS_URL ?? '').trim()
+  if (!url || tmuxName !== TMUX_SESSION) return null
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(2000) })
+    if (!r.ok) return null
+    const s = ((await r.json()) as any)?.onsen?.status
+    const seen = Date.parse(String(s?.detail?.screen?.seen_at ?? ''))
+    if (!s || typeof s.state !== 'string' || !Number.isFinite(seen) || Date.now() - seen > 5000) return null
+    return { state: s.state, detail: s.detail ?? {} }
+  } catch { return null }
+}
+const statusMenu = (r: StatusRead): string | null => typeof r.detail.waitingFor === 'string' && r.detail.waitingFor !== 'none' ? r.detail.waitingFor : null
+const statusIdle = (r: StatusRead): boolean => (r.state === 'idle' || r.state === 'walled') && !statusMenu(r)
+function statusYesNo(r: StatusRead, keyword?: RegExp): boolean {
+  if (!statusMenu(r) || statusMenu(r) === 'resume_picker') return false
+  const opts: Array<{ n: number | null; text: string; cursor: boolean }> = Array.isArray(r.detail.menu_options) ? r.detail.menu_options : []
+  if (!(opts.some(o => o?.n === 1 && o.cursor && /^Yes/i.test(String(o.text))) && opts.some(o => /No,\s*go\s*back/i.test(String(o?.text))))) return false
+  return keyword ? keyword.test([String(r.detail.waiting_text ?? ''), ...opts.map(o => String(o?.text))].join('\n')) : true
+}
+
+export const __wo168 = { statusRead, statusIdle, statusYesNo }
 async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string> {
   const { exitCode, stdout } = await runCommand(
     ['tmux', 'capture-pane', '-t', tmuxName, '-p'],
@@ -134,6 +161,8 @@ async function tmuxCapturePane(tmuxName: string = TMUX_SESSION): Promise<string>
 // Yes/No confirmation picker detector + auto-confirm. KEEP IN SYNC with telegram-http.
 // Joey 2026-05-26 msg 1696/1700.
 async function isYesNoConfirmPickerOpen(tmuxName: string = TMUX_SESSION, requiredKeyword?: RegExp): Promise<boolean> {
+  const rec = await statusRead(tmuxName)
+  if (rec) return statusYesNo(rec, requiredKeyword)                     // WO-168: the record's menu and options
   const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-25).join('\n')
   if (/Resume session/.test(tail)) return false
@@ -793,11 +822,15 @@ async function runCodexGate(tmuxName: string, notify: (msg: string) => Promise<v
 }
 
 async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const rec = await statusRead(tmuxName)
+  if (rec) return statusMenu(rec) === 'resume_picker'                   // WO-168: the record's menu kind
   const pane = await tmuxCapturePane(tmuxName)
   return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
 }
 
 async function isClaudeBusy(tmuxName: string = TMUX_SESSION): Promise<boolean> {
+  const rec = await statusRead(tmuxName)
+  if (rec) return !statusIdle(rec)                                     // WO-168: the record's state
   const pane = await tmuxCapturePane(tmuxName)
   const tail = pane.split('\n').slice(-15).join('\n')
 
