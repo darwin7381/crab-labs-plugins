@@ -471,7 +471,9 @@ export async function rewriteFormLinks(text: string, o: { hosts: Set<string>; ch
 
 export type FormItem = { id: number; form_id: number; chat: string; title: string; body: string; at?: string; say?: boolean   // say (WO-159): Joey wrote it in Onsen
   /** WO-189: the files of a `say` item (Onsen's Message.attachments: kind, name, mime, bytes, url) */
-  attachments?: Array<{ kind?: string | null; name?: string | null; mime?: string | null; bytes?: number | null; url?: string | null }> }
+  attachments?: Array<{ kind?: string | null; name?: string | null; mime?: string | null; bytes?: number | null; url?: string | null }>
+  /** WO-194 (Chiron, mesh 12695): the message a page message (person_message via web) replies to, as Onsen gives it */
+  reply_to?: { message_id?: string | number | null; client_msg_id?: string | number | null; from?: string | null; text?: string | null } }
 /** a form answer's body as text: JSON (an object of plain values: `key: value` lines; anything else pretty-printed); a JSON string its text; else as sent */
 export function formBodyText(body: unknown): string {
   const s = String(body ?? '')

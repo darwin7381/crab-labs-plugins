@@ -14,7 +14,7 @@ export type OnsenStandin = {
   /** WO-193: each credential's inbox (the agent-inbox daemon of the same credential pulls it) */
   inbox: Array<{ who: Who; seq: number; kind: string; sender: string; payload: any; dedupe: string; acked: boolean; at: number }>
   /** WO-193: a page message (via web) for the agent of `who` */
-  say: (who: Who, chat: string, text: string, attachments?: any[]) => number
+  say: (who: Who, chat: string, text: string, attachments?: any[], reply_to?: any) => number
   /** any item into the inbox of `who` (a peer's call, for instance); its seq */
   put: (who: Who, kind: string, payload: any, dedupe: string) => number
   /** per credential: Onsen's version (default 0.31.0), POST /messages answering 500, a delay before A is answered (ms) */
@@ -138,10 +138,10 @@ export function startOnsenStandin(creds: Record<string, Who>, port = 0): OnsenSt
   } })
   return {
     port: server.port!, msgs, seen, files, st, inbox, put,
-    say: (who, chat, text, attachments = []) => {
+    say: (who, chat, text, attachments = [], reply_to = null) => {
       const id = next++
       return put(who, 'person_message', { message_id: String(id), conversation_id: '1', from: 'joey', via: 'web', text, kind: 'text', sent_at: new Date().toISOString(), attachments,
-        client: { name: 'telegram', chat, msg_id: `form-${id}`, user: 'joey', user_id: chat }, reply_to: null }, `pm:${id}`)
+        client: { name: 'telegram', chat, msg_id: `form-${id}`, user: 'joey', user_id: chat }, reply_to }, `pm:${id}`)
     },
     writes: who => msgs.filter(m => m.who === who),
     reports: (who, id) => seen.filter(s => s.who === who && /^\/messages\/\d+\/delivery$/.test(s.path) && (id == null || s.path === `/messages/${id}/delivery`)),

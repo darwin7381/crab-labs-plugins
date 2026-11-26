@@ -190,6 +190,27 @@ test('3 a page message (via web): the same path; delivered as before (via="onsen
   expect(logLine(L, /person_message \d+ \(tg:301\) received/)).toBeLessThan(logLine(L, /lanes: route tg-1828-301 /))
 }, 45000)
 
+test('3b a page message replying to a message (Chiron, mesh 12695): reply_to_message_id (its Telegram id, else onsen:<id>), reply_to_user, reply_to_text (≤ 500), last, as a Telegram reply', async () => {
+  const meta = async (text: string, reply_to: any) => {
+    const seq = onsen.say('on', String(JOEY), text, [], reply_to)
+    const ref = onsen.inbox.find(i => i.who === 'on' && i.seq === seq)!.payload.client.msg_id
+    expect(await until(() => got.on.some(g => g.meta.message_id === ref))).toBe(true)
+    return got.on.find(g => g.meta.message_id === ref)!.meta
+  }
+  // a reply to the agent's own Telegram message: its Telegram id, the bot's name (what a Telegram reply to it shows), the text
+  const a = await meta('回那一則', { message_id: '43029', client_msg_id: '8812', from: 'agent:adam', text: 'lab-relay 的回覆\n第二行' })
+  expect(Object.keys(a)).toEqual(['chat_id', 'message_id', 'user', 'user_id', 'ts', 'via', 'reply_to_message_id', 'reply_to_user', 'reply_to_text'])
+  expect(a).toMatchObject({ via: 'onsen', reply_to_message_id: '8812', reply_to_user: 'lab_test_bot', reply_to_text: 'lab-relay 的回覆 第二行' })
+  // a message only Onsen has (no Telegram id): onsen:<id>; another member: the name Onsen gives; the text cut at 500
+  const b = await meta('回網頁那一則', { message_id: '43091', client_msg_id: null, from: 'joey', text: '字'.repeat(600) })
+  expect(b).toMatchObject({ reply_to_message_id: 'onsen:43091', reply_to_user: 'joey' })
+  expect(b.reply_to_text!.length).toBe(500)
+  expect(b.reply_to_text!.endsWith('…')).toBe(true)
+  // without reply_to: none of them (test 3: the six attributes only)
+  const c = await meta('沒有回覆誰', null)
+  expect(Object.keys(c).filter(k => k.startsWith('reply_to'))).toEqual([])
+}, 30000)
+
 test('4 an edit: of a message not yet written into Onsen, the edited text is what goes in (once); of one delivered, one edit notice, identical to the switch off', async () => {
   onsen.st.aDelayMs = 1500                                                      // Onsen slow: the message waits to be written
   both({ message: { message_id: 401, date: now(), chat, from, text: '原本的字' } })

@@ -5501,6 +5501,8 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rul
     Object.assign(meta, await OnsenAttach.attachmentMeta(it.attachments, { get: (u, max) => onsen!.getFile(u, max), dir: INBOX_DIR, saved: onsenSaved, log: m => log('warn', m) }))
     if (onsenSaved.size > 500) for (const k of [...onsenSaved.keys()].slice(0, onsenSaved.size - 500)) onsenSaved.delete(k)
   }
+  // WO-194 (Chiron, mesh 12695): a page message that replies to a message carries what a Telegram reply carries (last, as there)
+  if (it.say && it.reply_to && typeof it.reply_to === 'object') Object.assign(meta, pageReplyMeta(it.reply_to))
   const notification = { method: 'notifications/claude/channel', params: { content: it.say ? it.body : OnsenVisible.formBodyText(it.body), meta } }
   // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
@@ -5511,6 +5513,19 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rul
   }
   await dispatchInbound(chat, notification)
   return true
+}
+/** WO-194 (Chiron, mesh 12695): the reply attributes of a page message (Onsen's reply_to {message_id, client_msg_id, from, text}), as a Telegram reply
+ *  has them: reply_to_message_id = the replied message's Telegram id (client_msg_id), else onsen:<its Onsen id>; reply_to_user = its sender (this agent
+ *  itself, `agent:<name>` or `<name>`: the bot's username, what a Telegram reply to the bot's message shows; anyone else: the name Onsen gives);
+ *  reply_to_text = its text, at most 500 characters */
+function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Record<string, string> {
+  const out: Record<string, string> = {}
+  const tg = r.client_msg_id != null ? String(r.client_msg_id).trim() : '', oid = r.message_id != null ? String(r.message_id).trim() : ''
+  if (tg || oid) out.reply_to_message_id = safeName(tg || `onsen:${oid}`)!
+  const from = r.from != null ? String(r.from).trim() : ''
+  if (from) out.reply_to_user = (from === ONSEN_AGENT || from === `agent:${ONSEN_AGENT}`) && botUsername ? safeName(botUsername)! : metaExcerpt(from, 128)
+  if (r.text != null && String(r.text).trim()) out.reply_to_text = metaExcerpt(String(r.text), 500)
+  return out
 }
 /** WO-194: a person_message / person_edit of this agent's Onsen inbox (onsen_person.py), handed over by its agent-inbox daemon (POST /onsen/person).
  *  Answered 200 once delivered (the inbox acks it then: never before), or when it is not to be delivered (its chat not on the allowlist; delivered
@@ -5570,7 +5585,8 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
     log('info', `onsen inbound: person_message ${p.message_id} (${shown}) received from the inbox`)
     if (p.via === 'web') {
       const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
-        ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}), }
+        ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
+        ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
       await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main')
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)

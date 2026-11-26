@@ -233,3 +233,6 @@ plugins/telegram-http/server.ts::if (personBusy.has(own) || (!edit && personBusy
 plugins/telegram-http/onsen-inbox.ts::export type HandResult = 'delivered' | 'duplicate' | 'undelivered' | 'later'
 plugins/telegram-http/onsen-inbox.ts::if (due != null && due > this.now()) { i++; continue }
 plugins/telegram-http/server.ts::  return 'later'
+plugins/telegram-http/server.ts::function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Record<string, string> {
+plugins/telegram-http/server.ts::if (it.say && it.reply_to && typeof it.reply_to === 'object') Object.assign(meta, pageReplyMeta(it.reply_to))
+plugins/telegram-http/server.ts::...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
