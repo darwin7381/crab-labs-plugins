@@ -29,6 +29,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs'
 import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
+import { OnsenIds } from './onsen-connector.ts'
 import type { WakeItem } from './onsen-wake.ts'
 
 // ------------------------------------------------------------------ records (the contract posted on WO-139)
@@ -87,14 +88,18 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
   /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
   | { k: 'c'; r: CallStateLine }
+  | { k: 'blocked'; r: BlockedReceipt }
   /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
   | { k: 'r'; r: DeliveryReportLine }
-const SPOOL_KINDS = new Set(['m', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
+type BlockedReceipt = ({ message_id: string } | { chat: string; client_msg_id: string }) & { retry_after: string | null }
+const SPOOL_KINDS = new Set(['blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
 /** WO-192 (Onsen 0.31.0, WO-191 B): one delivery report: the Onsen message A wrote, and the body Onsen takes */
 export type DeliveryReportLine = { message_id: number
   body: { client: 'telegram'; state: 'sent' | 'failed'; client_msg_ids: string[]; at: string; error?: string } }
 /** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
+export type CallWait = 'wall' | 'offline' | 'restart'
+export type CallCheck = { final: string } | 'open' | 'wait'
 export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
 /** one PUT /v1/calls/<id>/state, as spooled: the Call, the body Onsen takes (state, session_id, result, at), the event and an idem key (local only:
  *  what moment of which item this is) */
@@ -569,6 +574,7 @@ export class OnsenClient {
     return ok
   }
   /** WO-175: one moment of a Call (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state when the spool reaches it. false = not spooled */
+  recordBlocked(r: BlockedReceipt): boolean { return this.append({ k: 'blocked', r }) }
   recordCall(c: CallStateLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
   /** WO-175 (Chiron 05:55Z): wait for what Onsen says to Call line `idem` (spooled already): the spool is tried at once and three more times within
    *  `ms`, whatever its backoff, as btcc-receipt does. A line sent before keeps its fate; one still unsent after `ms` stays in the spool (pending) */
@@ -609,11 +615,32 @@ export class OnsenClient {
     return items.length ? { found: { id: String(items[0].id), state: items[0].state ?? null, result: items[0].result ?? null } } : { none: true }
   }
   /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
-  async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown } | null> {
+  async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string } | null> {
     const r = await this.retried(`/v1/calls/${encodeURIComponent(id)}`, ms).catch(() => null)
     if (!r || 'fate' in r) return null
     const c = r.json?.data ?? r.json
-    return c && typeof c === 'object' ? { state: c.state ?? null, result: c.result ?? null } : null
+    return c && typeof c === 'object' ? { state: c.state ?? null, result: c.result ?? null,
+      thread_id: c.thread_id, conversation_id: c.conversation_id, caller: c.caller } : null
+  }
+  /** Validate a delayed delivery. The stable key also covers a restart between recording the line and closing M1's item. */
+  async checkWaitingCall(id: string, why: CallWait, thread?: string): Promise<CallCheck> {
+    const call = await this.getCall(id)
+    if (!call?.state) return 'wait'
+    if (!['failed', 'cancelled', 'completed', 'expired'].includes(call.state)) return 'open'
+    const when = { wall: '上限解除時', offline: '主線恢復連線時', restart: '重新啟動時' }
+    const text = `${when[why]}這件已經是 ${call.state}，沒有交給主線`
+    const key = `waited-call:${id}:${call.state}`
+    if (thread) {
+      const at = new Date().toISOString()
+      return this.recordThreads([{ thread, event: 'item', at, dedupe: key,
+        item: { id: key, kind: 'notice', at, text } }]) ? { final: call.state } : 'wait'
+    }
+    if (!call.conversation_id) return 'wait'
+    const r = await this.request('POST', `/v1/conversations/${encodeURIComponent(call.conversation_id)}/messages`, {
+      type: 'system', body: { format: 'markdown', text }, to: call.caller ? [call.caller] : [],
+      thread_ids: call.thread_id ? [call.thread_id] : [], call_id: id, client_message_id: key,
+    })
+    return r && r.status >= 200 && r.status < 300 ? { final: call.state } : 'wait'
   }
   /** a GET tried at CALL_RETRY_AT while Onsen does not answer or answers 5xx (408, 429), all within `ms`: the 2xx answer, or a fate */
   private async retried(path: string, ms: number): Promise<{ status: number; json: any } | CallLineFate> {
@@ -885,6 +912,19 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (refusedForGood(r)) this.reject(t.line, `HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'a', path: '/forms/ack', status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, '/forms/ack')
+        this.writeCursor(t.end); this.ok(); i++
+        continue
+      }
+      if (t.line.k === 'blocked') {
+        const receipt = t.line.r
+        const ids = new OnsenIds({ request: (m, p, b, ms) => this.request(m, p, b, ms) })
+        const id = 'message_id' in receipt ? receipt.message_id : /^form-(\d+)$/.exec(receipt.client_msg_id)?.[1] ?? await ids.message(receipt.chat, receipt.client_msg_id)
+        const path = id ? `/v1/messages/${encodeURIComponent(id)}/receipt` : ''
+        const r = id ? await this.put(path, { handling: { state: 'blocked', blocked_by: 'usage_limit', retry_after: receipt.retry_after } }, cred)
+          : { status: 404, json: { error: 'message no longer exists' } }
+        if (r.status >= 200 && r.status < 300) this.stats.posted++
+        else if (refusedForGood(r)) this.reject(t.line, `blocked receipt: HTTP ${r.status} ${callSaid(r.json)}`)
+        else return this.failStatus(r, path)
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
