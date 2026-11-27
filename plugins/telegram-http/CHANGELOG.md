@@ -1,3 +1,9 @@
+## 1.59.8 — 2026-11-28 (Onsen words for the agent-facing texts; two usage-wall log lines)
+
+- **The agent-facing texts say "this conversation in Onsen", not "Telegram"** (Chiron mail #200891, his list `onsen-words-20261128/EDITS.md`, passages 6–10, 12–22, 24, verbatim; Joey TG chiron:2993). The MCP instructions' first two sentences, the main's lanes rules and the 〔Joey 原話｜分流器收到的原文…〕 label they cite (`lanes.ts`, same version), the hand-over wrapper, the not-main notice, react / edit_message / download_attachment, chat_history (its parameters and main description), notify_joey, the worker-lane rules, open_worker, the four INBOX_TEXT sentences, the two lane hooks' missed-message label. Codex call-914 (d297584, d0d39dd, 5ec2d1c, 4c5becb).
+- **Passage 11 left out**: the `reply` description stays word for word (Chiron #200897; WO-164; Joey TG chiron:2515, 2520). Its tests pin it again.
+- **Usage-wall log lines** (Chiron, 1.59.7 lab): a clear the keeper writes after its state had gone stale now has its own line (the reader reports a new clear as a change); the "no longer fresh" line says what happens without PL4 (nothing is released until a clear or a person's message probes).
+
 ## 1.59.7 — 2026-11-28 (WO-209 item half; PL4 removed; the undelivered episode survives a restart)
 
 - **An item the model had answered when its process died goes at the next receivable moment** (Chiron's 1.59.5 lab case 2: it waited 600 s; mail #200855). An item held with `cut_by: gen_end` is a candidate as soon as a gen can take a program item (the moment WO-209's bare-turn line goes), leading an offer or riding one, with 「〔這一則你做到一半被打斷了（對話結束）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕」; an account cut released at the clear carries the same line with 用量上限. Esc, non-account StopFailure and session_start cuts keep the 600 s path and INTERRUPTED_LINE.

@@ -1198,8 +1198,13 @@ function mainWallNoticeOwned(rule: 'main-wall-up' | 'main-wall-down', kind: stri
 function onWallChange(prev: WallState | null, next: WallState | null): void {
   // 1.59.4 (WO-204 part 2): one line per transition (the WO-120 parking that used to log these is gone); what waits and what goes is M1's (lanes-main)
   if (!prev?.walled && next?.walled) log('info', `usage wall: ${next.episode} (${next.kind ?? '?'}, since ${next.since}) — a person's message is the probe (WO-200); programs wait for the clear`)
+  // 1.59.8 (Chiron, 1.59.7 lab 20:31:23Z): a clear the keeper writes after its state had gone stale (prev not walled) gets its own line, so a later offer
+  // lines up with it; a clear read at start (older than a minute) is not logged
+  if (!prev?.walled && next && !next.walled && next.clearedMs != null && next.clearedMs !== prev?.clearedMs && Date.now() - next.clearedMs < 60_000)
+    log('info', `usage wall: ${next.episode} cleared (${next.cleared_by ?? '?'}) after the keeper's state had gone stale — M1 offers what the wall held`)
   if (!prev?.walled || next?.walled) return
-  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh'} — the main's probe releases what the wall held`)
+  // 1.59.8 (Chiron, 1.59.7 lab 20:30:07Z): with PL4 gone a stale state releases nothing; the line says what happens instead
+  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'}) — the main's probe releases what the wall held` : "no longer fresh — nothing is released until the keeper reports a clear or a person's message probes (WO-200)"}`)
   // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now);
   // WO-175 item 3: and the main's items M1 held for the wall are offered in this step (lanes.ts usageWallChanged)
   if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
@@ -2589,7 +2594,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     {
       name: 'reply',
       description:
-        '在這段對話裡說一句。寫進 Onsen 就算說出口：對方在 Telegram 和 Onsen 的網頁都看得到；送到他用的軟體是橋接的事，一時送不到它會自己補送。這是對方唯一看得到的輸出，也是唯一會讓他手機響的訊號，所以結果、長任務的每個新階段、要他決定的事，都發新的一則。chat_id 照進來那一則的填；reply_to（message_id）接在某一則下面；files 給絕對路徑，附圖或檔。',
+        'Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone, so a result, each new stage of a long task, and anything they must decide goes out as a new reply. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {

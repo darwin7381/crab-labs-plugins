@@ -29,8 +29,8 @@ function instructions(lanesOn: boolean): string {
   return arr.join('\n')
 }
 
-test('reply: a reply is visible in Onsen and each new stage goes out as a new message', () => {
-  expect(SRC).toContain("'在這段對話裡說一句。寫進 Onsen 就算說出口：對方在 Telegram 和 Onsen 的網頁都看得到；送到他用的軟體是橋接的事，一時送不到它會自己補送。這是對方唯一看得到的輸出，也是唯一會讓他手機響的訊號，所以結果、長任務的每個新階段、要他決定的事，都發新的一則。chat_id 照進來那一則的填；reply_to（message_id）接在某一則下面；files 給絕對路徑，附圖或檔。'")
+test('reply: the first sentence says it is the only output and the only push; the rest of the description is kept', () => {
+  expect(SRC).toContain("'Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone, so a result, each new stage of a long task, and anything they must decide goes out as a new reply. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.'")
   expect(SRC).not.toContain("'Reply on Telegram. Pass chat_id")
 })
 

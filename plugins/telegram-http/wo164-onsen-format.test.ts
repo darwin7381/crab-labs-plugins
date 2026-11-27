@@ -34,7 +34,7 @@ test('telegram-http reply and edit_message: the text field carries the format an
   const r = tgTool('reply'), e = tgTool('edit_message')
   expect(r.text).toBe(CHIRON)
   expect(e.text).toBe(CHIRON)
-  expect(r.description).toBe('在這段對話裡說一句。寫進 Onsen 就算說出口：對方在 Telegram 和 Onsen 的網頁都看得到；送到他用的軟體是橋接的事，一時送不到它會自己補送。這是對方唯一看得到的輸出，也是唯一會讓他手機響的訊號，所以結果、長任務的每個新階段、要他決定的事，都發新的一則。chat_id 照進來那一則的填；reply_to（message_id）接在某一則下面；files 給絕對路徑，附圖或檔。')
+  expect(r.description).toBe('Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone, so a result, each new stage of a long task, and anything they must decide goes out as a new reply. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.')
   expect(e.description).toBe('改你先前說的一則。靜默（不推播）：只用在同一個階段裡補細節；新的階段、結果、對方一定要看到的事，發新的一則。')
 })
 test('format (rich): the three modes only; the plain branch as it was', () => {
