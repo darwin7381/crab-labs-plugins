@@ -1,11 +1,6 @@
-// WO-120 end to end: a real agent-inbox daemon (server.ts, CHANNEL_INBOX_ONLY=1) with a temp HOME, a real MCP client
-// as the session, and a usage-wall state file this test writes the way usage_wall.py does.
-//   walled  → /inject items park in inbox/pending, nothing reaches the session, a delivery the wall ate is re-persisted,
-//             nothing quarantined, the held sidecar says how many;
-//   cleared → each held item reaches the session once, in order; the sidecar stays with count 0;
-//   stale / OFF → delivered at once, as before.
+// WO-204: the lanes-off inbox daemon delivers through its open MCP stream during a wall and after the clear.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { createServer } from 'net'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -20,7 +15,6 @@ const wallDir = join(root, 'usage-wall')
 const tdir = join(home, '.claude', 'projects', ws.replace(/[^a-zA-Z0-9]/g, '-'))
 const transcript = join(tdir, 's1.jsonl')
 const pendingDir = join(stateDir, 'inbox', 'pending')
-const undeliverableDir = join(stateDir, 'inbox', 'undeliverable')
 const statePath = join(wallDir, 'claude-wallbot.json')
 const heldFile = join(wallDir, 'claude-wallbot.held-inbox.json')
 const EPISODE = 'wallbot-20261123T080000Z'
@@ -54,7 +48,6 @@ const inject = (text: string) => fetch(`http://127.0.0.1:${port}/inject`, {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, from: 'tester' }),
 }).then(r => r.json())
 const pending = () => { try { return readdirSync(pendingDir).filter(f => f.endsWith('.json')).length } catch { return 0 } }
-const quarantined = () => { try { return readdirSync(undeliverableDir).length } catch { return 0 } }
 const health = () => fetch(`http://127.0.0.1:${port}/healthz`).then(r => r.json()).catch(() => null)
 
 beforeAll(async () => {
@@ -88,48 +81,31 @@ afterAll(async () => {
   else try { rmSync(root, { recursive: true, force: true }) } catch {}
 })
 
-describe('daemon: hold, then deliver once each', () => {
+describe('lanes-off daemon delivery', () => {
   test('no state: delivered at once (as before)', async () => {
     await inject('a0')
     expect(await until(() => received.includes('a0'))).toBe(true)
   }, 15000)
 
-  test('walled: nothing reaches the session; held items park; the eaten one is re-persisted; nothing quarantined', async () => {
-    // a0 was answered (a genuine record after it); e0 goes in just before the wall and is never answered
-    appendFileSync(transcript, JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(),
-      message: { model: 'claude-opus-5-5', content: [{ type: 'text', text: 'done' }] } }) + '\n')
-    await sleep(20)
-    await inject('e0')
-    expect(await until(() => received.includes('e0'))).toBe(true)
-    await sleep(20)
+  test('walled: an open stream receives input immediately', async () => {
     writeState({})
-    expect(await until(() => existsSync(heldFile))).toBe(true)   // first wall seen: sidecar written
-    expect(await until(() => pending() === 1)).toBe(true)        // e0 re-persisted (the wall ate it)
-    for (const t of ['h1', 'h2', 'h3', 'h2']) expect((await inject(t)).injected).toBe(true)   // h2 re-sent: held once
-    expect((await health())?.usage_wall).toMatchObject({ walled: true, episode: EPISODE, key: 'claude-wallbot' })
-    await sleep(1200)
-    expect(received).toEqual(['a0', 'e0'])
-    expect(pending()).toBe(4)
-    expect(quarantined()).toBe(0)
-    writeState({ since: JSON.parse(readFileSync(statePath, 'utf8')).since })   // keeper heartbeat
-    expect(await until(() => JSON.parse(readFileSync(heldFile, 'utf8')).count === 4)).toBe(true)
-    const h = JSON.parse(readFileSync(heldFile, 'utf8'))
-    expect(h).toMatchObject({ redelivers: true, role: 'inbox', episode: EPISODE, count: 4, held_at_clear: null })
-  }, 20000)
+    expect(await until(async () => (await health())?.usage_wall?.walled === true)).toBe(true)
+    await inject('h1')
+    expect(await until(() => received.includes('h1'))).toBe(true)
+    expect(pending()).toBe(0)
+    expect(existsSync(heldFile)).toBe(false)
+  }, 15000)
 
-  test('cleared: each held item once, in order; the sidecar stays, count 0', async () => {
+  test('clear: the previously delivered input is not replayed', async () => {
     const since = JSON.parse(readFileSync(statePath, 'utf8')).since
     writeState({ since, in_wall: false, cleared_at: new Date().toISOString(), cleared_by: 'probe_after_reset' })
-    expect(await until(() => received.length >= 6)).toBe(true)
-    await sleep(1000)
-    expect(received).toEqual(['a0', 'e0', 'e0', 'h1', 'h2', 'h3'])
+    expect(await until(async () => (await health())?.usage_wall?.walled === false)).toBe(true)
+    await inject('after')
+    expect(await until(() => received.includes('after'))).toBe(true)
+    expect(received).toEqual(['a0', 'h1', 'after'])
     expect(pending()).toBe(0)
-    expect(quarantined()).toBe(0)
-    expect(await until(() => JSON.parse(readFileSync(heldFile, 'utf8')).count === 0)).toBe(true)
-    const h = JSON.parse(readFileSync(heldFile, 'utf8'))
-    expect(h).toMatchObject({ redelivers: true, count: 0, held_at_clear: 4, episode: EPISODE })
-    expect(h.drained_at).toBeTruthy()
-  }, 20000)
+    expect(existsSync(heldFile)).toBe(false)
+  }, 15000)
 
   test('stale state or OFF: delivered at once, as before', async () => {
     writeState({ episode: 'wallbot-2', updated_at: new Date(Date.now() - 200_000).toISOString() })

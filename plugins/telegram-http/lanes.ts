@@ -3712,8 +3712,7 @@ function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string
 // that arrives meanwhile is rung through at once, with the reason nobody can look into it.
 // All of it is code: the wall is recognised from the run's own result record (`is_error` + `api_error_status`), never guessed.
 export function wallActive(): boolean { return !!S?.wall }
-/** WO-120 (server.ts heldNow, tg daemon): the items M1 holds for the main right now (queued or offered, digests aside); the usage-wall clear alert
- *  counts them with the daemons' own held items. Read only. */
+/** Items M1 currently holds for the main, for the usage-wall enter notice. */
 export function mainHeldCount(): number {
   try { return D?.role === 'tg' && main ? main.items(r => r.kind !== 'digest' && (r.state === 'queued' || r.state === 'offered')).length : 0 } catch { return 0 }
 }

@@ -1,11 +1,11 @@
-// WO-120: usage-wall.ts (reader rule, identity match, wallAte, held sidecar, enter/clear alerts).
+// WO-120: usage-wall.ts (reader rule, identity match, enter/clear alerts).
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  ALERTS_FILE, HeldSidecar, WallAlerts, WallReader, clearText, enterText, heldPath, heldTotal, isWallRecordLine,
-  readHeld, readWallState, wallAte, wallCovers, wallKey, lanesEnterNote, wallKeeperAlive, type WallState,
+  ALERTS_FILE, WallAlerts, WallReader, clearText, enterText, isWallRecordLine,
+  readWallState, wallCovers, wallKey, lanesEnterNote, wallKeeperAlive, type WallState,
 } from './usage-wall.ts'
 
 const NOW = Date.parse('2026-11-23T08:00:00Z')
@@ -71,84 +71,14 @@ describe('reader rule and identity', () => {
     const changes: string[] = []
     const r = new WallReader({ tmux: 'claude-nestor' }, { dir, cacheMs: 5000, now: () => t, env: env(),
       onChange: (p, n) => changes.push(`${p?.walled ?? null}->${n?.walled ?? null}`) })
-    expect(r.walled()).toBe(true)
+    expect(r.state()?.walled).toBe(true)
     writeFileSync(join(dir, 'claude-nestor.json'), JSON.stringify(st({ in_wall: false, cleared_at: iso(NOW), cleared_by: 'ok_turn', updated_at: iso(NOW) })))
     t += 4000
-    expect(r.walled()).toBe(true)             // cached
+    expect(r.state()?.walled).toBe(true)             // cached
     t += 2000
-    expect(r.walled()).toBe(false)
-    expect(r.walled()).toBe(false)
+    expect(r.state()?.walled).toBe(false)
+    expect(r.state()?.walled).toBe(false)
     expect(changes).toEqual(['null->true', 'true->false'])
-  })
-})
-
-describe('wallAte', () => {
-  const w = (over: Partial<WallState> = {}): WallState => ({ walled: true, episode: 'e', since: null, kind: null, text: null,
-    resets_at: null, cleared_at: null, cleared_by: null, agent: 'a', tmux: 't', session: null, key: 't',
-    sinceMs: NOW - 60_000, clearedMs: null, ...over })
-  test('a push shortly before the flip, or inside the wall, was eaten', () => {
-    expect(wallAte(w(), NOW - 65_000, 0, NOW)).toBe(true)
-    expect(wallAte(w(), NOW - 30_000, 0, NOW)).toBe(true)
-  })
-  test('answered before the wall began: not eaten', () => {
-    expect(wallAte(w(), NOW - 65_000, NOW - 62_000, NOW)).toBe(false)
-  })
-  test('after the clear: only pushes made before the clear', () => {
-    const c = w({ walled: false, clearedMs: NOW - 10_000 })
-    expect(wallAte(c, NOW - 65_000, NOW - 5_000, NOW)).toBe(true)     // a post-clear answer is not consumption of it
-    expect(wallAte(c, NOW - 5_000, 0, NOW)).toBe(false)
-  })
-  test('unknown state: never', () => {
-    expect(wallAte(null, NOW - 1000, 0, NOW)).toBe(false)
-  })
-})
-
-describe('held sidecar', () => {
-  const state = (dir: string, over: Record<string, unknown> = {}) => {
-    writeFileSync(join(dir, 'claude-nestor.json'), JSON.stringify(st({ updated_at: iso(Date.now()), ...over })))
-    return readWallState({ tmux: 'claude-nestor' }, { dir, env: env() })
-  }
-  test('written at the first wall, follows the count, snapshots at the clear, 0 after the drain, never removed', () => {
-    const dir = wallDirWith()
-    let held = { count: 0, oldestMs: null as number | null }
-    const sc = new HeldSidecar({ dir: () => dir, role: 'inbox', held: () => held, redelivers: () => true, log: () => {} })
-    const p = heldPath(dir, 'claude-nestor', 'inbox')
-    sc.update(state(dir, { in_wall: false, cleared_at: iso(NOW - 3600_000), cleared_by: 'ok_turn' }))
-    expect(existsSync(p)).toBe(false)                  // never walled here: no file
-    const walled = state(dir)
-    sc.update(walled)
-    expect(readHeld(p)).toMatchObject({ redelivers: true, role: 'inbox', episode: walled!.episode, count: 0, held_at_clear: null })
-    held = { count: 2, oldestMs: NOW - 120_000 }
-    sc.update(walled)
-    expect(readHeld(p)).toMatchObject({ count: 2, oldest: iso(NOW - 120_000) })
-    expect(JSON.parse(readFileSync(p, 'utf8')).redelivers).toBe(true)
-    const cleared = state(dir, { in_wall: false, cleared_at: iso(Date.now()), cleared_by: 'probe_after_reset' })
-    sc.update(cleared, true)
-    expect(readHeld(p)).toMatchObject({ count: 2, held_at_clear: 2, drained_at: null })
-    held = { count: 0, oldestMs: null }
-    sc.update(cleared)
-    const after = readHeld(p)!
-    expect(after).toMatchObject({ count: 0, held_at_clear: 2, oldest: null })
-    expect(after.drained_at).not.toBeNull()
-    expect(existsSync(p)).toBe(true)
-    expect(heldTotal(dir, 'claude-nestor', walled!.episode)).toBe(2)
-  })
-  test('a copy the keeper saved over ours is put right at the next update', () => {
-    const dir = wallDirWith()
-    const sc = new HeldSidecar({ dir: () => dir, role: 'tg', held: () => ({ count: 4, oldestMs: null }), redelivers: () => true, log: () => {} })
-    const walled = state(dir)
-    sc.update(walled)
-    const p = heldPath(dir, 'claude-nestor', 'tg')
-    writeFileSync(p, JSON.stringify({ ...readHeld(p), count: 1, updated_at: iso(NOW) }))   // keeper's stale save
-    sc.update(walled)
-    expect(readHeld(p)!.count).toBe(4)
-  })
-  test('heldTotal: both roles, this episode only; held_at_clear wins over count', () => {
-    const dir = wallDirWith()
-    writeFileSync(heldPath(dir, 'k', 'tg'), JSON.stringify({ count: 1, episode: 'e1', held_at_clear: null }))
-    writeFileSync(heldPath(dir, 'k', 'inbox'), JSON.stringify({ count: 0, episode: 'e1', held_at_clear: 3 }))
-    expect(heldTotal(dir, 'k', 'e1')).toBe(4)
-    expect(heldTotal(dir, 'k', 'e2')).toBe(0)
   })
 })
 
@@ -157,14 +87,14 @@ describe('alerts: two per episode', () => {
     const wdir = wallDirWith()
     const sdir = mkdtempSync(join(tmpdir(), 'uwa-'))
     const sent: string[] = []
-    const make = () => new WallAlerts({ stateDir: sdir, dir: () => wdir, notify: t => sent.push(t), log: () => {}, now: () => NOW })
+    const make = () => new WallAlerts({ stateDir: sdir, notify: t => sent.push(t), log: () => {}, now: () => NOW })
     const w = (over: Record<string, unknown> = {}) => {
       writeFileSync(join(wdir, 'claude-nestor.json'), JSON.stringify(st({ updated_at: iso(Date.now()), ...over })))
       return readWallState({ tmux: 'claude-nestor' }, { dir: wdir, env: env() })
     }
     return { wdir, sdir, sent, make, w }
   }
-  test('enter once, nothing in between, clear once with the held count of both daemons', () => {
+  test('enter once, nothing in between, clear once with the time and reason', () => {
     const r = rig()
     const a = r.make()
     const walled = r.w()
@@ -172,12 +102,10 @@ describe('alerts: two per episode', () => {
     for (let i = 0; i < 20; i++) expect(a.tick(r.w({ walls: 10 + i }))).toBeNull()
     expect(r.sent.length).toBe(1)
     expect(r.sent[0]).toBe(`⚠️ 系統警告（claude TUI 自身輸出，非 AI 回覆）\nYou're out of usage credits\n(usage-wall nestor)`)
-    writeFileSync(heldPath(r.wdir, 'claude-nestor', 'tg'), JSON.stringify({ count: 1, episode: walled!.episode }))
-    writeFileSync(heldPath(r.wdir, 'claude-nestor', 'inbox'), JSON.stringify({ count: 0, episode: walled!.episode, held_at_clear: 2 }))
     const cleared = r.w({ in_wall: false, cleared_at: '2026-11-23T07:59:00Z', cleared_by: 'probe_after_reset' })
     expect(a.tick(cleared)).toBe('clear')
     expect(a.tick(cleared)).toBeNull()
-    expect(r.sent[1]).toBe('✅ nestor 用量上限解除（15:59，額度重置）；卡住期間累積 3 件，現在逐一送進去。')
+    expect(r.sent[1]).toBe('✅ nestor 用量上限解除（15:59，額度重置）。')
     expect(r.sent.length).toBe(2)
   })
   test('a restarted daemon does not alert the same episode again', () => {
@@ -203,7 +131,7 @@ describe('alerts: two per episode', () => {
   })
   test('lanes already pushed this wall\'s enter (before the state existed): the enter is recorded, not pushed; the clear still goes', () => {
     const r = rig()
-    const a = new WallAlerts({ stateDir: r.sdir, dir: () => r.wdir, notify: t => r.sent.push(t), log: () => {}, now: () => NOW,
+    const a = new WallAlerts({ stateDir: r.sdir, notify: t => r.sent.push(t), log: () => {}, now: () => NOW,
       enterToldElsewhere: () => 'lanes main-wall-up' })
     expect(a.tick(r.w())).toBeNull()
     expect(a.tick(r.w())).toBeNull()
@@ -219,10 +147,10 @@ describe('alerts: two per episode', () => {
     expect(a.tick(r.w({ in_wall: false, cleared_at: '2026-11-23T07:00:00Z', cleared_by: 'ok_turn' }))).toBeNull()
     expect(r.sent).toEqual([])
   })
-  test('texts: each way out; nothing held; no error line', () => {
+  test('texts: each way out; no error line', () => {
     const base = readWallState({ tmux: 'claude-nestor' }, { dir: wallDirWith({ 'claude-nestor': st({ updated_at: iso(NOW) }) }), now: NOW, env: env() })!
-    const c = (by: string) => clearText({ ...base, walled: false, cleared_by: by, clearedMs: Date.parse('2026-11-23T01:05:00Z') }, 0)
-    expect(c('ok_turn')).toBe('✅ nestor 用量上限解除（09:05，恢復回應）；卡住期間沒有累積的件。')
+    const c = (by: string) => clearText({ ...base, walled: false, cleared_by: by, clearedMs: Date.parse('2026-11-23T01:05:00Z') })
+    expect(c('ok_turn')).toBe('✅ nestor 用量上限解除（09:05，恢復回應）。')
     expect(c('probe_after_switch')).toContain('換帳號')
     expect(c('probe_retry')).toContain('重試通了')
     expect(enterText({ ...base, text: null, kind: 'weekly' })).toContain('用量上限（weekly）')
