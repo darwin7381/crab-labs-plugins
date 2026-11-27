@@ -31,7 +31,7 @@ export const CACHE_MS = 10 * 60_000
 export const HELD = '已寫進 Onsen（網頁看得到）；Telegram 還沒送到，會再送'
 export const NOT_TAKEN = 'Onsen 沒收下，這一則沒有送出'
 export const ONSEN_CHAT = /^onsen:(\d+)$/
-/** Telegram's reaction set (Bot API ReactionTypeEmoji; @grammyjs/types): the bridge can draw nothing else */
+/** Telegram's reaction set (the Bot API's ReactionTypeEmoji): the bridge can draw nothing else */
 export const REACTIONS = new Set(['👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱',
   '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆', '💔', '🤨', '😐', '🍓', '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀', '🎃',
   '🙈', '😇', '😨', '🤝', '✍', '🤗', '🫡', '🎅', '🎄', '☃', '💅', '🤪', '🗿', '🆒', '💘', '🙉', '🦄', '😘', '💊', '🙊', '😎', '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡'])

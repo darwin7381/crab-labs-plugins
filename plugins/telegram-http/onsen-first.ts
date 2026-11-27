@@ -60,7 +60,7 @@ const errText = (e: unknown): string => {
 }
 const said = (j: any): string => { const e = j?.error ?? j?.detail; return e == null ? '' : ` (${String(typeof e === 'object' ? e.message ?? e.code ?? JSON.stringify(e) : e).slice(0, 200)})` }
 const RETRYABLE_4XX = new Set([401, 403, 408, 425, 429])
-/** a 429's wait, in seconds (grammy's GrammyError.parameters, else the description "retry after N"); 0 = none */
+/** a 429's wait, in seconds (the Bot API error's parameters.retry_after, else the description "retry after N"); 0 = none */
 export function retryAfterS(e: unknown): number {
   for (let x: any = e, n = 0; x && n < 3; x = x.cause, n++) {
     const p = Number(x?.parameters?.retry_after)

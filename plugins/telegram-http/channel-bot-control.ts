@@ -2000,10 +2000,10 @@ export function startLoginExpiredWatchdog(opts: {
 // ---- daemon health (for /status) -----------------------------------------
 
 /**
- * #8 (2026-07-10): exported so server.ts's `bot.command('status')` (grammy
- * command middleware runs BEFORE message:text, so /status NEVER reached
- * handleControlSlash's /status branch) can merge the daemon/TUI health block
- * into the paired-user reply in control mode.
+ * #8 (2026-07-10): exported so the /status command handler (roamer-telegram.ts;
+ * the library's command middleware runs BEFORE message:text, so /status NEVER
+ * reached handleControlSlash's /status branch) and a connector's /status from
+ * Onsen can merge the daemon/TUI health block into the paired-user reply.
  */
 export async function controlStatusText(httpPort: string): Promise<string> {
   return daemonStatus(httpPort)
