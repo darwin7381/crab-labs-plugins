@@ -2,8 +2,8 @@
 //   it reads state, menu kind, options and freshness from the status record of the look it acts on (no capture of its own on that pane), and keeps
 //   its rulings: /model, /resume and trust-folder menus judged and handled as before (ticket criterion 6)
 //   program rules, as code, not for the model:
-//     usage_limit_options  no option chosen, no key pressed, no leaning: the options as they are go to Joey (buttons and an Action); only his tap presses,
-//                          and only that one; no ruling mail
+//     usage_limit_options  not the officer's (Chiron's v3, 11-27: the lanes main-wall probe takes it, choosing 「停下來等」): left to that owner; lanes off,
+//                          left to modal-guard, as before
 //     switch_confirm       still up after the stall (no program took it): Esc (No, go back)
 //     refusal_fallback     modal-guard's rule moved in: 120 s from first seen, then Esc and its notice; once per 5 min; the 3rd in 30 min: no Esc, no
 //                          notice, the alert; left to modal-guard while its script is installed (one of them, never both)
@@ -28,7 +28,7 @@ const decision = (over: Partial<Decision> = {}): Decision => ({
   to_joey: '', unsure: [], options: [{ on_screen: 'Esc to cancel', means: '關掉', button: 'Esc', keys: ['Esc'] }], ...over })
 
 function rig(o: { screen?: string; verdict?: (t: string) => ScreenVerdict | null; model?: () => ModelResult; config?: Record<string, unknown>; modalGuard?: boolean
-  onKey?: (k: string, p: { screen: string }) => void; prog?: StatusView } = {}) {
+  onKey?: (k: string, p: { screen: string }) => void; prog?: StatusView; owner?: boolean } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'do168-home-')), dir = join(home, 'do'), rules = mkdtempSync(join(tmpdir(), 'do168-rules-'))
   mkdirSync(dir, { recursive: true })
   if (o.modalGuard) { mkdirSync(join(home, '.claude', 'scripts'), { recursive: true }); writeFileSync(join(home, '.claude', 'scripts', 'ratelimit-modal-guard.sh'), '#!/bin/sh\n') }
@@ -57,7 +57,7 @@ function rig(o: { screen?: string; verdict?: (t: string) => ScreenVerdict | null
     model: async () => { calls++; return o.model ? o.model() : { decision: decision(), meta: {}, fail: null } },
     send: async (_c, text, buttons) => { sent.push({ text, buttons }); return [{ chat: '1828173984', msg: 100 + sent.length }] }, edit: async () => {},
     mail: async (title) => { mails.push(title); return '#1' }, recipients: () => ['1828173984'], log: () => {}, now: () => clock, sleep: async ms => { clock += ms },
-    alert: async a => { alerts.push(a); return 'HTTP 200' } }
+    alert: async a => { alerts.push(a); return 'HTTP 200' }, ...(o.owner ? { owner: () => 'the lanes main-wall probe' } : {}) }
   const off = new DutyOfficer(deps, { dir, rulesDirs: [rules], home, host: 'mini', limits: { claimFreshMs: 30_000 } })
   const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r => setTimeout(r, 0)) }
   const advance = async (ms: number) => { clock += ms; await off.tick(); await settle() }
@@ -136,31 +136,25 @@ describe('text typed and left in the input box (rulings §2: a /clear with its c
   })
 })
 
-describe('program rule: the usage-limit options (Chiron\'s rule, verbatim, as code)', () => {
-  test('no model, no key, no leaning: the options as they are go to Joey with buttons and an Action; only his tap presses, and only that one; no ruling mail', async () => {
-    const r = rig({ screen: fx('lab-limit-options-menu.txt'), onKey: (k, p) => { if (k === 'Enter') p.screen = IDLE } })
-    await r.advance(0); await r.advance(4000)
-    expect(r.sent).toEqual([])                                                          // the stall time first, as for any menu
-    await r.advance(5000)
-    expect(r.calls()).toBe(0); expect(r.keys).toEqual([])
-    expect(r.sent.length).toBe(1)
-    expect(r.sent[0]!.text).toContain('額度怎麼用是你的決定：值班員不選、不按任何鍵')
-    expect(r.sent[0]!.buttons.map((row: any) => row[0].text)).toEqual(['1. Stop and wait for limit to reset', '2. Wait here, then continue automatically at Dec 1, 6am'])
-    expect(r.acts).toEqual(['open:usage_limit_options:1. Stop and wait for limit to reset|2. Wait here, then continue automatically at Dec 1, 6am'])
-    for (let i = 0; i < 20; i++) await r.advance(60_000)                               // nobody answers: still nothing pressed (no default after a while)
-    expect(r.keys).toEqual([])
-    const res = await r.off.onTap(r.sent[0]!.buttons[1][0].callback_data, 'Advac777', 'joey')
-    expect(r.keys).toEqual(['Down', 'Enter'])
-    expect(res).toBe('按了，畫面已經往下走')
-    await r.settle()
-    expect(r.mails).toEqual([])                                                         // his resource decision, not a ruling
+describe('the usage-limit menu is not the officer\'s (Chiron\'s v3, 11-27 11:52Z: the lanes main-wall probe takes it, 「停下來等」)', () => {
+  test('lanes on (the owner hook): the record names it, the officer leaves it to the probe: no model, no key, nothing sent, no Action', async () => {
+    const r = rig({ owner: true, screen: fx('lab-limit-options-menu.txt') })
+    await r.advance(0); await r.advance(9000); await r.advance(60_000)
+    expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([]); expect(r.acts).toEqual([])
+    expect(r.log().find(e => e.event === 'left_to_owner')).toMatchObject({ owner: 'the lanes main-wall probe' })
   })
-  test('the same with Jev\'s verdict naming it (v7 and v8 both have the kind); while walled the record still names the menu', async () => {
-    const r = rig({ screen: fx('lab-limit-options-menu.txt'), verdict: () => ({ state: 'waiting_for_human', menu: 'usage_limit_options', p: 1, by: 'jev' }),
+  test('the same with Jev\'s verdict naming it, while walled', async () => {
+    const r = rig({ owner: true, screen: fx('lab-limit-options-menu.txt'), verdict: () => ({ state: 'waiting_for_human', menu: 'usage_limit_options', p: 1, by: 'jev' }),
       prog: { state: 'idle', detail: { queued_joey: 0, walled: { until: '2026-12-01T06:00:00Z', kind: 'weekly' } }, last_activity_at: null } })
     await r.advance(0); await r.advance(9000)
-    expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent.length).toBe(1)
-    expect(r.log().find(e => e.event === 'usage_limit_asked')).toBeTruthy()
+    expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([])
+    expect(r.log().find(e => e.event === 'left_to_owner')).toBeTruthy()
+  })
+  test('lanes off (no owner): left to modal-guard as on main, nothing pressed or sent', async () => {
+    const r = rig({ screen: fx('lab-limit-options-menu.txt') })
+    await r.advance(0); await r.advance(9000)
+    expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([])
+    expect(r.log().find(e => e.event === 'left_to_modal_guard')).toBeTruthy()
   })
 })
 
@@ -229,18 +223,12 @@ describe('program rule: the refusal-fallback picker (Chiron\'s rulings 3; modal-
   })
 })
 
-describe('the menu-owner file and the re-arm on the own pane', () => {
+describe('the re-arm on the own pane', () => {
   test('the re-arm of a usage-limit menu on the own pane uses the record\'s options and asks with the usage rule\'s words', async () => {
     const r = rig({ screen: fx('lab-limit-options-menu.txt') })
     await r.advance(0)
     const out = await r.off.rearm('claude-x')
     expect(out).toEqual({ result: 'asked', options: ['1. Stop and wait for limit to reset', '2. Wait here, then continue automatically at Dec 1, 6am'] })
     expect(r.sent[0]!.text).toContain('額度怎麼用是你的決定'); expect(r.keys).toEqual([])
-  })
-  test('the officer writes ~/.claude/lanes/menu-owner/<tmux>.json for its own pane (fields modal-guard and the watchdog read: mtime, pid)', async () => {
-    const r = rig()
-    await r.advance(0)
-    const j = JSON.parse(readFileSync(join(r.home, '.claude', 'lanes', 'menu-owner', 'claude-x.json'), 'utf8'))
-    expect(j).toMatchObject({ owner: 'duty-officer', menus: ['usage-limit'], tmux: 'claude-x', pid: process.pid })
   })
 })

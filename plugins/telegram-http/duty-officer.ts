@@ -949,31 +949,6 @@ export class DutyOfficer {
   handles(tmux: string): boolean { return this.enabledNow.has(tmux) }
 
   private claimPath(tmux: string) { return join(this.dir, 'claims', tmux.replace(/[^A-Za-z0-9._-]/g, '_')) }
-  // WO-168 (lanes' usage-limit menu reader retired; Chiron 05:24:56Z): the own pane's usage-limit menu is the officer's (its program rule asks Joey). The
-  // two programs outside the plugin that stand aside from it read this file, unchanged since lanes-golive C8 (lanes.ts publishMenuOwner wrote it until
-  // now): ratelimit-modal-guard.sh menu_owned_by_lanes (Hephaestus) and the delivery watchdog's usage_wall_read.menu_owned (type_resume). Both read
-  // only its mtime (fresh under 120 s) and `pid` (alive), so the path and fields stay; owner names the officer. Written every 30 s while the officer
-  // watches its own pane, removed when it stops (switched off, the daemon's exit)
-  private ownerAt = new Map<string, number>()
-  private ownerFile(tmux: string): string { return join(this.home, '.claude', 'lanes', 'menu-owner', `${tmux.replace(/[^A-Za-z0-9._-]/g, '_')}.json`) }
-  private publishOwner(tmux: string, label: string): void {
-    const now = Date.now()
-    if (now - (this.ownerAt.get(tmux) ?? 0) < 30_000) return
-    this.ownerAt.set(tmux, now)
-    const p = this.ownerFile(tmux)
-    try {
-      mkdirSync(join(this.home, '.claude', 'lanes', 'menu-owner'), { recursive: true })
-      writeFileSync(`${p}.tmp`, JSON.stringify({ owner: 'duty-officer', menus: ['usage-limit'], agent: label, tmux, pid: process.pid, at: iso(now) }), { mode: 0o644 })
-      renameSync(`${p}.tmp`, p)
-    } catch {}
-    if (this.ownerAt.size === 1 && !this.exitHook) { this.exitHook = true; process.once('exit', () => { for (const t of this.ownerAt.keys()) this.dropOwner(t) }) }
-  }
-  private exitHook = false
-  private dropOwner(tmux: string): void {
-    if (!this.ownerAt.delete(tmux)) return
-    const p = this.ownerFile(tmux)
-    try { if (JSON.parse(readFileSync(p, 'utf8'))?.pid === process.pid) unlinkSync(p) } catch {}
-  }
   /** Claim the pane for this process unless another live process holds a fresh claim. */
   claim(tmux: string): boolean {
     const p = this.claimPath(tmux)
@@ -1119,7 +1094,6 @@ export class DutyOfficer {
         }
         if (!this.claim(t.tmux)) continue
         on.add(t.tmux)
-        if (this.d.ownPane && t.tmux === this.d.ownPane.tmux) this.publishOwner(t.tmux, t.label)
         if (this.busy.has(t.tmux)) continue
         const lk = await this.look(t.tmux, this.L.pollMs / 2)
         if (!lk) {
@@ -1131,7 +1105,7 @@ export class DutyOfficer {
         }
         await this.step(t, lk, now)
       }
-      for (const tmux of this.enabledNow) if (!on.has(tmux)) { this.release(tmux); this.dropOwner(tmux) }
+      for (const tmux of this.enabledNow) if (!on.has(tmux)) this.release(tmux)
       this.enabledNow = on
     } catch (e) {
       this.event('error', { where: 'tick', error: String(e).slice(0, 300) })
@@ -1157,24 +1131,26 @@ export class DutyOfficer {
     // a raw notice held back by the hourly cap: after the hour, look again (the model may be back)
     if (s.rec?.action === 'suppressed' && now - s.rec.t >= this.L.renotifyMs) s.rec = null
     // WO-168: the program's rules for the menus the record names on the own pane (Chiron's rulings, as code, not for the model):
-    //   usage_limit_options  no option chosen, no key pressed, no leaning: the options as they are go to Joey; only his tap presses, and only that one
     //   switch_confirm       a /model or /effort confirm still up after the stall: no program is taking it: Esc (No, go back); model and effort unchanged
     //   refusal_fallback     above (refusalRule)
-    if (!s.rec && lk.menu && (lk.menu.kind === 'usage_limit_options' || lk.menu.kind === 'switch_confirm')) {
+    //   usage_limit_options  not the officer's: Chiron's v3 (design-v3.md, 11-27 11:52Z: 上限選單算撞上限，連接器收掉、選「停下來等」) gives it to the lanes
+    //                        main-wall probe (the owner hook below); lanes off, modal-guard's, as before
+    if (!s.rec && lk.menu && lk.menu.kind === 'switch_confirm') {
       const who = await this.attended(t.tmux)
       if (who != null) {
         if (!s.attendedLogged) { s.attendedLogged = true; this.event('attended', { agent: t.label, tmux: t.tmux, screen_hash: hash, last_key_s_ago: Math.round((now - who) / 1000), tail: lines }) }
         return
       }
-      if (lk.menu.kind === 'usage_limit_options') { await this.usageLimitRule(t, lk); return }
       // the press does not hold the loop (other panes); the pane is busy until it is done
       this.busy.add(t.tmux)
       void this.programPress(t, lk, s, ['Esc'], 'switch_confirm', `${t.label}：換模型／思考強度的確認沒有程式在接，值班員按了 Esc（No, go back），維持原樣`)
         .catch(e => this.event('error', { agent: t.label, tmux: t.tmux, where: 'switch_confirm', error: String(e).slice(0, 300) })).finally(() => this.busy.delete(t.tmux))
       return
     }
-    // the lanes' owner hook and the rate-limit rule below read the screen's text; on the own pane the record names the menu (above)
-    if (!s.rec && !lk.menu) {
+    // the lanes' owner hook and the rate-limit rule below read the screen's text; on the own pane the record names the menu (above), and a usage-limit
+    // menu it names goes the same way
+    const usage = lk.menu?.kind === 'usage_limit_options'
+    if (!s.rec && (!lk.menu || usage)) {
       const owner = this.d.owner?.(t, lines) ?? null
       if (owner) {
         s.rec = { action: 'left_to_owner', t: now }
@@ -1182,7 +1158,7 @@ export class DutyOfficer {
         return
       }
     }
-    if (!s.rec && !lk.menu && isRateLimitMenu(lines)) {
+    if (!s.rec && (usage || (!lk.menu && isRateLimitMenu(lines)))) {
       s.rec = { action: 'left_to_modal_guard', t: now }
       this.event('left_to_modal_guard', { agent: t.label, tmux: t.tmux, screen_hash: hash, tail: lines })
       return
@@ -1661,18 +1637,6 @@ export class DutyOfficer {
     else this.st.set(t.tmux, { hash: lk.hash, state: lk.state, since: this.now(), rec })
     await this.deliver(ask)
     return ask
-  }
-
-  /** WO-168 (Chiron 05:24:56Z, the program rule, verbatim): 用量上限的選單（usage_limit_options）：值班員不選任何選項、不按任何鍵，也不套用「沒有規矩可循時的
-   *  傾向」；把選項原樣問 Joey（Action＋Telegram 按鈕），他選了才按那一個。No model is asked; his choice is not mailed as a ruling (it is his resource
-   *  decision each time) */
-  private async usageLimitRule(t: Target, lk: NonNullable<Look>): Promise<void> {
-    const menu = lk.menu!
-    const options = menu.options.length ? optionButtons(menu.options) : (numberedMenu(lk.pane) ?? []).map(m => ({ button: m.button, keys: m.keys }))
-    const ask = await this.programAsk(t, lk, `${t.label} 停在用量上限的選單，等你選`,
-      `${t.label} 停在用量上限的選單。額度怎麼用是你的決定：值班員不選、不按任何鍵；你按了哪一個，我才按那一個。`, options,
-      { noRuling: true, bundle: { _menu_kind: 'usage_limit_options' } })
-    this.event('usage_limit_asked', { agent: t.label, tmux: t.tmux, ask: ask.id, screen_hash: lk.hash, record_hash: lk.screenHash ?? null, options: options.map(o => o.button) })
   }
 
   /** WO-168: keys the program's rule presses itself (no model): pressed only if the screen is still the one seen (the officer's tail hash and the record's

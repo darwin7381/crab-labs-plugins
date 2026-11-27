@@ -217,9 +217,8 @@ export interface LanesDeps {
   authOk: (authz: string | undefined) => boolean
   /** 002m (LG1): tell one MCP session that its tool list changed (server.ts: notifications/tools/list_changed), so it lists again */
   toolsChanged?: (mcpSid: string) => void
-  /** WO-168 (lanes' usage-limit menu reader retired; Chiron 05:24:56Z): the menu on the main's pane, as the status record names it, and the duty officer
-   *  putting it to Joey (server.ts). Nothing here reads the pane or presses a key */
-  mainMenu?: MainMenu
+  /** 002k (G16): the main's pane and the startup picker on it (server.ts builds it from startup-picker.ts when it knows the main's tmux target) */
+  mainPicker?: MainPicker
   /** WO-120 (server.ts mainWallNoticeOwned): true = the usage-wall alerts (system-alert WallAlerts) tell Joey about this wall of the main, so the
    *  main-wall-up / main-wall-down notice goes to the ledger only. Absent / false = pushed as before. The wall records themselves are untouched. */
   wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
@@ -243,9 +242,14 @@ export interface LanesDeps {
    *  the query fills with the keys of the listed messages that came in from a person (onsen-client.ts HistoryOpts.inbound) */
   mainChat?: (a: { limit: number }, o: { timeoutMs: number; cut: number; inbound?: Set<string> }) => Promise<string>
 }
-/** WO-168: the menu on the main's pane for a lanes notice. drive (the walled main's probe): the duty officer asks Joey once if it has not; otherwise (a
- *  stuck alarm) its question is sent to him again. A sentence for the notice and whether it asks something of Joey; null: no menu on the pane */
-export type MainMenu = (drive: boolean) => Promise<{ text: string; asks: boolean } | null>
+/** the main's startup picker as the daemon uses it: read the pane, recognise a menu, drive one option (the live pane is re-checked before any key),
+ *  or put the menu in front of Joey again with a fresh debounce */
+export type MainPicker = {
+  capture: () => Promise<string>
+  detect: (pane: string) => { key: string; title: string; options: string[] } | null
+  drive: (idx: number, key: string) => Promise<'ok' | 'gone' | 'stuck'>
+  rearm: () => void
+}
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
@@ -324,7 +328,7 @@ export function lanesInit(deps: LanesDeps): void {
     // lanes-topics (item 4): a worker closed before the previous daemon stopped, its topic not finished yet (only `pending` ones: older closed lanes untouched)
     setTimeout(() => { for (const l of Object.values(S.lanes)) if (l.status === 'closed' && l.topic_close === 'pending' && !l.topic_done && !running.has(l.id)) void finishTopic(l, '關閉時 daemon 重啟，開機後補上') },
       num('LANES_TOPIC_SWEEP_MS', 3_000)).unref()
-    // WO-168: the menu-owner file (lanes-golive C8) is written by the duty officer now (duty-officer.ts publishOwner)
+    if (deps.mainPicker && process.env.CHANNEL_BOT_TMUX_SESSION) publishMenuOwner(process.env.CHANNEL_BOT_TMUX_SESSION)   // lanes-golive (C8)
   }
   deps.log('info', `lanes: ON (role=${deps.role} agent=${deps.agent} dir=${LANES_DIR} model=${MODEL} cap=${MAX_RUNNING} hop_limit=${HOP_LIMIT})`)
 }
@@ -388,11 +392,15 @@ function mainEnv() {
       for (const [s] of mcpSessionPid) { try { D.toolsChanged?.(s) } catch {} }
       logos('lane.main_gen', { pid, role: D.role })
     },
-    // WO-168: the record and the duty officer (server.ts mainMenu); nothing is chosen here (Chiron: the usage-limit menu is Joey's, the officer asks him)
     menu: async (drive = false) => {
-      const m = D.mainMenu ? await D.mainMenu(drive).catch(() => null) : null
-      if (m && !m.asks) ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${m.text}`, refs: { tier: 'ledger', tier_rule: 'main-menu+asked' } })
-      return m
+      const m = await inspectMainMenu(drive, drive ? 'main-probe' : 'main-stuck')
+      if (!m) return null
+      if (!drive) return { text: `它停在一個選單：${m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')}；選項已再傳給你。`, asks: true }
+      // 002q (T7-R 1016): a limit menu the probe dealt with (chosen, or already gone) asks nothing of Joey: it is part of the wall episode and rides its
+      // one wall-down notice (lanes-main). A menu Joey must choose on is told now.
+      const handled = !!m.chose && (m.result === 'ok' || m.result === 'gone')
+      if (handled) ledger({ lane: 'router', kind: 'notify', text: `[ledger] ${menuSentence(m)}`, refs: { tier: 'ledger', tier_rule: 'main-menu+handled' } })
+      return { text: menuSentence(m), asks: !handled }
     },
     context: mainContext,
     // PL7 (M4): an item is owed to the main (offered, pulled, wakes) only while its event carries an open main obligation
@@ -3792,10 +3800,95 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
   child.on('exit', code => { clearTimeout(limit); finish(code === 0) })
 }
 
-// ------------------------------------------------------------------ 002k (G16): a main parked on a menu reads nothing
-// WO-168 (Chiron 05:24:56Z): the limit menu's own reader here (inspectMainMenu, pickContinueOption, mainMenuOwned, the menu-owner file) is retired. The
-// status record names the menu on the main's pane and the duty officer handles it: the usage-limit options go to Joey as they are, nothing is chosen for
-// him (server.ts mainMenu; duty-officer.ts usageLimitRule). The menu-owner file the programs outside the plugin read is the officer's now.
+// ------------------------------------------------------------------ 002k (G16, 002j group G): a main parked on a menu reads nothing
+// The limit menu is a TUI state no hook reports, so it stays one pane read:
+//  (a) before the walled main's probe offer (M1, PL4), the main's pane is looked at, before anything is offered to it. A menu there is driven
+//      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that CONTINUES or WAITS, never to one that spends money
+//      or changes the plan; with no safe option, or when it did not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
+//  (b) an idle main that does not take its offer is the M2 stuck rule (lanes-main.ts); the pane is read for that notice;
+//  (c) every menu found is logged with its real option labels (the picker log used to carry only the count).
+const NEVER_PICK = /upgrade|extra usage|switch|request more|add funds|purchase|\bbuy\b|billing|payment|\bpay\b|credit|[$€£¥]|\bplan\b|opus|sonnet|haiku|fable|\bmodel\b|don[’']?t continue|do not continue|never|exit|quit|trust|delete|remove/i
+const PICK_CONTINUE = /continue automatically|resume automatically|keep going|\bcontinue\b/i
+const PICK_WAIT = /stop and wait|wait here|wait for|^wait\b/i
+/** The option that continues or waits: "Wait here, then continue automatically at 3 PM" first, then "Stop and wait for limit to reset". An option that
+ *  upgrades, switches model or plan, buys usage or says do not continue is never picked. null = no safe option. */
+export function pickContinueOption(options: string[]): number | null {
+  const ok = (l: string): boolean => !NEVER_PICK.test(l)
+  let i = options.findIndex(l => ok(l) && PICK_CONTINUE.test(l))
+  if (i < 0) i = options.findIndex(l => ok(l) && PICK_WAIT.test(l))
+  return i >= 0 ? i : null
+}
+export type MenuResult = { key: string; options: string[]; chose?: { idx: number; label: string }; result?: 'ok' | 'gone' | 'stuck' | 'error'; resurfaced: boolean }
+/** Look at the main's pane. drive=true: drive the continue / wait option of a LIMIT menu (the pane must speak of a limit, so another menu that happens to
+ *  say "continue" is not touched). A menu that is not driven, or did not clear, is re-armed for Joey. null = no pane, or no menu on it. */
+async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult | null> {
+  const mp = D?.mainPicker
+  if (!mp) return null
+  let pane = ''
+  try { pane = await mp.capture() } catch (e) { D.log('warn', `lanes: main pane not readable (${why}): ${e}`); return null }
+  const pk = mp.detect(pane)
+  if (!pk) return null
+  const labels = pk.options.map((l, i) => `${i + 1}. ${l}`).join(' | ')
+  D.log('warn', `lanes: the main is parked on a menu '${pk.key}' (${why}): ${labels}`)
+  const res: MenuResult = { key: pk.key, options: pk.options, resurfaced: false }
+  const idx = drive && /limit|usage|reset/i.test(pane) ? pickContinueOption(pk.options) : null
+  if (idx != null) {
+    res.chose = { idx, label: pk.options[idx] }
+    try { res.result = await mp.drive(idx, pk.key) } catch (e) { res.result = 'error'; D.log('warn', `lanes: driving the main's menu failed: ${e}`) }
+    if (res.result === 'stuck' || res.result === 'error') { mp.rearm(); res.resurfaced = true }
+  } else { mp.rearm(); res.resurfaced = true }
+  logos('lane.main_menu', { why, key: pk.key, options: pk.options, chose: res.chose ?? null, result: res.result ?? null, resurfaced: res.resurfaced })
+  return res
+}
+/** 002y (X-1, 002x T7-R, every play): ONE owner of the main's limit menu. The startup-picker watchdog rang Joey with the menu's buttons seconds after
+ *  the main walled, and the probe below then chose 「Wait here, then continue automatically」 itself: Joey was asked to pick what the router picked.
+ *  With lanes on (server.ts passes this as the watchdog's `owner` for the main's pane) the menu is this mechanism's while the main's wall episode is
+ *  open (`wall_since`: walled, or in its probe's turn), and a limit menu (an option speaks of a limit, usage or a reset) on a main still in its turn:
+ *  the menu is drawn when the limit cuts the turn, and the StopFailure that walls the gen can reach the daemon after the watchdog's poll. The probe
+ *  drives the option that waits or continues (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
+ *  reads it too (lanes-main). Any other menu (a starting main's resume menu, an idle main's prompt) stays the watchdog's. */
+// lanes-golive (C8): one owner of the main's usage-limit menu. With lanes on it is the lanes main-wall probe (inspectMainMenu, driven from M2). The other
+// actors stand aside: the startup-picker watchdog and the duty officer in this daemon by their `owner` hooks (server.ts), and the programs outside the
+// plugin (Hephaestus's ratelimit-modal-guard, Epeius's delivery watchdog's resume line) by this file, refreshed every 30 s while the daemon runs:
+//   ~/.claude/lanes/menu-owner/<tmux session>.json  {owner: "lanes-wall", menus: ["usage-limit"], agent, tmux, pid, at}
+// fresh (mtime under 120 s) and its pid alive = do not press keys on that pane's usage-limit menu.
+export const MENU_OWNER_FRESH_S = 120
+export function menuOwnerFile(tmux: string, home = process.env.HOME || homedir()): string {
+  return join(home, '.claude', 'lanes', 'menu-owner', `${tmux.replace(/[^A-Za-z0-9._-]/g, '_')}.json`)
+}
+function publishMenuOwner(tmux: string): void {
+  const p = menuOwnerFile(tmux)
+  const write = (): void => {
+    try { mkdirSync(dirname(p), { recursive: true }); writeJsonAtomic(p, { owner: 'lanes-wall', menus: ['usage-limit'], agent: D.agent, tmux, pid: process.pid, at: nowIso() }, 0o644) }
+    catch (e) { D.log('warn', `lanes: menu owner file ${p}: ${e}`) }
+  }
+  write()
+  setInterval(write, 30_000).unref()
+  const drop = (): void => { try { if (readJson<any>(p, {})?.pid === process.pid) rmSync(p) } catch {} }
+  process.once('exit', drop)
+}
+/** lanes-golive (C8): the owner of this pane's limit menu when it is not the caller, by the published file (for an in-plugin caller of another daemon) */
+export function menuOwnerOf(tmux: string): string | null {
+  try {
+    const p = menuOwnerFile(tmux), o = readJson<any>(p, null)
+    if (!o?.pid || (Date.now() - statSync(p).mtimeMs) / 1000 > MENU_OWNER_FRESH_S || !pidAlive(Number(o.pid))) return null
+    return String(o.owner ?? 'lanes-wall')
+  } catch { return null }
+}
+const LIMIT_OPTION = /limit|usage|reset/i
+export function mainMenuOwned(options: string[]): boolean {
+  if (D?.role !== 'tg' || !D.mainPicker) return false
+  const g = main?.currentGen()
+  if (!g || g.state === 'gone') return false
+  return !!g.wall_since || (g.state === 'in_turn' && options.some(o => LIMIT_OPTION.test(o)))
+}
+function menuSentence(m: MenuResult): string {
+  const labels = m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')
+  if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，它繼續了。`
+  if (m.chose && m.result === 'gone') return `主線停在一個選單（${labels}），要選「${m.chose.label}」時選單已經不在了（可能別處已經選掉），沒有動作。`
+  if (m.chose) return `主線停在一個選單（${labels}），選了「${m.chose.label}」但選單還在，選項已再傳給你，請點一個。`
+  return `主線停在一個選單（${labels}），我挑不出一個安全的選項（不碰要付費或換方案的），選項已再傳給你，請點一個。`
+}
 // ------------------------------------------------------------------ WO-141 follow-up (Epeius, mail #200294; WO-141 05:04Z): the lanes' wall follows the daemon's
 // plutus 11-26 (#200159, alert-dispatcher, 96 min): the daemon's usage wall (usage_wall.py's state, server.ts wallReader) cleared at 00:16:54Z (an
 // account switch, its keeper's probe); the lanes kept their own wall until their own probe, backing off 10/20/30 min, came round at 00:22:34Z, and the

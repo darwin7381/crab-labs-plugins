@@ -63,7 +63,7 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
+import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, type Observation, type RecordFacts } from './screen-status.ts'
 import { PaneReader, snapPaneLook, type PaneLook } from './pane-look.ts'   // WO-168 stage two: the one capture of the own pane
 import { ObservationPut } from './onsen-observation.ts'
@@ -77,7 +77,7 @@ import { parseFleetConfig } from './fleet-config.ts'
 // the main: the tg daemon's delivery ledger (lanes-main.ts) does, through notifySession below.
 import * as Lanes from './lanes.ts'
 import { topicLink } from './lanes-topics.ts'
-import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'   // WO-168: its own-pane looks are pane-look's
+import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'   // WO-168: its own-pane looks are pane-look's
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
 import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
@@ -3094,6 +3094,8 @@ const ownPaneReader: PaneReader | null = ownPaneTmux ? new PaneReader(ownPaneTmu
 let ownRecordOf: ((l: PaneLook) => { view: OnsenStatus.StatusView; hash: string } | null) | null = null
 /** WO-168 × WO-197: how old a look of the own pane the startup-picker's observer takes (the record looks every second; a fresher one is not asked for) */
 const PICKER_OWN_LOOK_MS = 1000
+/** WO-168: how old a look of the own pane the lanes' main-wall probe takes (it looks right before it presses: a fresh one) */
+const MAIN_PICKER_LOOK_MS = 250
 if (isControlEnabled() || isRoamerEnabled()) {
   dutyOfficer = new DutyOfficer({
     // WO-168: its own pane through the record's capture and the record (no capture of its own there); roamer panes as before
@@ -3124,7 +3126,13 @@ if (isControlEnabled() || isRoamerEnabled()) {
       try { await tg.editText(s.chat, s.msg, text, { clearKeyboard: true }) }
       catch (e) { log('warn', `duty-officer edit ${s.chat}/${s.msg} failed: ${e}`) }
     },
-    // WO-168: the lanes' owner hook (C8) is gone: the main's usage-limit menu is the duty officer's own (its program rule asks Joey)
+    // lanes-golive (C8): the main's usage-limit menu is the lanes main-wall probe's (one owner); the duty officer leaves it alone. WO-168 × Chiron's v3
+    // (design-v3.md 11:52Z: 上限選單算撞上限，連接器收掉、選「停下來等」): kept; the officer reads the menu from the record, the probe owns the press
+    ...(Lanes.LANES_ON && !INBOX_ONLY ? { owner: (t: { tmux: string }, lines: string[]) => {
+      if (t.tmux !== process.env.CHANNEL_BOT_TMUX_SESSION) return null
+      const pk = detectStartupPicker(lines.join('\n'))
+      return isRateLimitMenu(lines) || (pk && Lanes.mainMenuOwned(pk.options)) ? 'the lanes main-wall probe' : null
+    } } : {}),
     mail: async (title, body, to) => {
       let cred = ''
       try { cred = readFileSync(DUTY_CREDENTIAL, 'utf8').trim() } catch {}
@@ -3145,29 +3153,6 @@ if (isControlEnabled() || isRoamerEnabled()) {
     log,
   }, dutyCapOpts())
   dutyOfficer.start()
-}
-
-/** WO-168 (lanes' usage-limit menu reader retired; Chiron 05:24:56Z): the lanes' sentence about a menu on the main's pane (lanes.ts MainMenu). The duty
- *  officer puts the menu to Joey: drive (the walled main's probe) asks once if it has not (no extra push: the sentence rides the wall-down notice);
- *  otherwise (a stuck alarm) its question is sent to him again, so 「選項已再傳給你」 is true. Nothing is chosen or pressed here. null: no menu on the pane */
-async function mainMenuNotice(drive: boolean): Promise<{ text: string; asks: boolean } | null> {
-  if (!ownPaneTmux) return null
-  const r = dutyOfficer ? await dutyOfficer.rearm(ownPaneTmux, { resend: !drive }) : { result: 'off' as const, options: [] as string[] }
-  if (r.result === 'no_menu' || r.result === 'unreadable') return null
-  if (r.result === 'off') {
-    // the officer does not watch the pane (switched off): the record still says whether a menu is up; nobody puts it to Joey
-    const l = ownPaneReader ? await ownPaneReader.fresh(1000) : null
-    const rec = l && ownRecordOf ? ownRecordOf(l) : null
-    if (rec?.view.state !== 'waiting') return null
-    const opts = Array.isArray(rec.view.detail?.menu_options) ? (rec.view.detail!.menu_options as Array<{ n: number | null; text: string }>).map(o => `${o.n != null ? `${o.n}. ` : ''}${o.text}`) : []
-    return { text: `它停在一個選單${opts.length ? `：${opts.join('｜')}` : ''}；值班員沒有在看這個畫面，選項沒有傳給你。`, asks: true }
-  }
-  const labels = r.options.length ? `：${r.options.join('｜')}` : ''
-  if (r.result === 'busy') return { text: `它停在一個選單；值班員正在處理這個選單。`, asks: false }
-  if (drive) return { text: `主線停在一個選單${labels}；值班員已把選項傳給你，等你選。`, asks: false }
-  // WO-197: a connector's question is its open Onsen Action (the bridge's buttons); it is not sent again, so the sentence does not say it was
-  if (r.result === 'open') return { text: `它停在一個選單${labels}；值班員問你的那一則還開著，等你選。`, asks: true }
-  return { text: `它停在一個選單${labels}；選項已再傳給你。`, asks: true }
 }
 
 // Startup-picker interceptor (Joey 2026-07-13): surface claude's boot-time
@@ -4216,8 +4201,23 @@ if (Lanes.LANES_ON) {
         void s.sendToolListChanged().catch(err => log('warn', `lanes: tools/list_changed to ${sid} failed: ${err}`))
       }
     },
-    // WO-168 (lanes' usage-limit menu reader retired): the menu on the main's pane as the status record names it, put to Joey by the duty officer
-    ...(ownPaneTmux ? { mainMenu: (drive: boolean) => mainMenuNotice(drive) } : {}),
+    // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice. WO-168: its look is pane-look's one capture
+    // (the record's), not a capture of its own; the menu and the press stay the probe's (Chiron's v3, WO-204)
+    ...(process.env.CHANNEL_BOT_TMUX_SESSION ? { mainPicker: {
+      capture: () => ownPaneReader ? ownPaneReader.fresh(MAIN_PICKER_LOOK_MS).then(l => l?.visible ?? '') : capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
+      detect: detectStartupPicker,
+      drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key,
+        ownPaneReader ? () => ownPaneReader.fresh(0).then(l => l?.visible ?? '') : undefined),   // WO-168: a new look each time, through the one capture
+      // WO-168 item 5: 「選項已再傳給你」 is kept by the duty officer when it watches the main's pane (its open question again, or the menu put to Joey now:
+      // an Onsen Action, and Telegram buttons on a roamer); the startup-picker it used to re-arm skips that pane, so the sentence went out with no buttons
+      rearm: () => {
+        const own = process.env.CHANNEL_BOT_TMUX_SESSION!
+        if (!dutyOfficer?.handles(own)) { rearmStartupPicker(own); return }
+        void dutyOfficer.rearm(own).then(r => log(r.result === 'resent' || r.result === 'asked' || r.result === 'open' ? 'info' : 'warn',
+          `lanes: the main's menu re-armed through the duty officer: ${r.result}${r.options.length ? ` (${r.options.join(' | ')})` : ''}`),
+          e => log('warn', `lanes: the duty officer's re-arm failed: ${e}`))
+      },
+    } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
     blocked: (item, retryAfter) => {

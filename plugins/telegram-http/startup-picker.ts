@@ -197,8 +197,9 @@ export type DriveResult = 'ok' | 'gone' | 'stuck'
  *   'ok'    — drove it and the picker cleared
  *   'stuck' — drove it but the picker is still up
  */
-export async function driveStartupPicker(tmux: string, idx: number, expectKey: string): Promise<DriveResult> {
-  const { stdout: pane } = await runCommand(['tmux', 'capture-pane', '-t', tmux, '-p'])
+/** `capture`: how the pane is read before and after the keys (default capture-pane). The daemon's own pane is read through pane-look's one capture (WO-168) */
+export async function driveStartupPicker(tmux: string, idx: number, expectKey: string, capture: (tmux: string) => Promise<string> = capturePane): Promise<DriveResult> {
+  const pane = await capture(tmux)
   const live = detectStartupPicker(pane)
   if (!live || live.key !== expectKey || idx < 0 || idx >= live.options.length) return 'gone'
 
@@ -210,8 +211,7 @@ export async function driveStartupPicker(tmux: string, idx: number, expectKey: s
   await runCommand(['tmux', 'send-keys', '-t', tmux, 'Enter'])
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise((r) => setTimeout(r, 400))
-    const { stdout } = await runCommand(['tmux', 'capture-pane', '-t', tmux, '-p'])
-    if (!detectStartupPicker(stdout)) return 'ok'
+    if (!detectStartupPicker(await capture(tmux))) return 'ok'
   }
   return 'stuck'
 }

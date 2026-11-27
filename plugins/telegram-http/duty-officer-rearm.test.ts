@@ -107,10 +107,10 @@ test('WO-168 item 5: no menu on the screen, or a pane the officer does not watch
   expect(r.sent).toEqual([])
 })
 
-test('WO-168 item 5 server.ts: the lanes\' menu sentence comes from the duty officer\'s re-arm (the probe: asked once; a stuck alarm: sent again); the startup-picker is not re-armed', () => {
+test('WO-168 item 5 server.ts: the lanes\' re-arm of the main\'s menu goes through the duty officer when it watches the pane; the probe reads through the one capture', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain('await dutyOfficer.rearm(ownPaneTmux, { resend: !drive })')
-  expect(src).toContain('mainMenu: (drive: boolean) => mainMenuNotice(drive)')
-  expect(src).not.toContain('rearmStartupPicker(')
-  expect(src).toContain("if (r.result === 'open') return { text: `它停在一個選單${labels}；值班員問你的那一則還開著，等你選。`, asks: true }")
+  expect(src).toContain("if (!dutyOfficer?.handles(own)) { rearmStartupPicker(own); return }")
+  expect(src).toContain('void dutyOfficer.rearm(own).then(')
+  expect(src).toContain("capture: () => ownPaneReader ? ownPaneReader.fresh(MAIN_PICKER_LOOK_MS).then(l => l?.visible ?? '') : capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),")
+  expect(src).toContain("ownPaneReader ? () => ownPaneReader.fresh(0).then(l => l?.visible ?? '') : undefined),")
 })
