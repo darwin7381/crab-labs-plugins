@@ -254,11 +254,12 @@ export function createMain(E: MainEnv) {
     return { active, person: active && personCanProbe(last || null), clear, probe }
   }
   const accountRefusal = (reason: unknown): boolean => typeof reason === 'string' && reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(reason.slice('stop_failure:'.length))
+  const waitingForClear = (r: Row): boolean => accountRefusal(r.reason) || (heldCut(r) && accountRefusal(r.cut_by))
   /** An item already refused or interrupted by this wall waits for the clear. */
   function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
     if (!wall.active) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
-    const refused = accountRefusal(r.reason) || (heldCut(r) && accountRefusal(r.cut_by))
+    const refused = waitingForClear(r)
     return wall.person && r.kind === 'joey' && !refused
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
@@ -470,7 +471,10 @@ export function createMain(E: MainEnv) {
     // Recheck after driving the menu: real work can arrive while it closes. Try the fallback last,
     // so a final Call or a disconnected stream cannot consume the episode's only usable probe.
     const resume = cands.find(r => r.wall_resume)
-    const ordered = resume ? [...candidates().filter(r => !r.wall_resume), resume] : cands
+    // A refused item leads when it can, so every account cut can ride that same offer.
+    const ordered = (resume ? candidates().filter(r => !r.wall_resume) : cands)
+      .sort((a, b) => Number(heldCut(a)) - Number(heldCut(b)))
+    if (resume) ordered.push(resume)
     for (const it of ordered) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
@@ -920,7 +924,7 @@ export function createMain(E: MainEnv) {
         const resume = items(r => r.wall_resume === since)[0]
         if (resume?.state === 'queued') {
           J().write('msg', resume.id, 'queued', { notif: { ...resume.notif, params: { ...resume.notif.params, content: resumeText(refusedAt) } } })
-        } else if (!resume && !back.some(owed)) {
+        } else if (!resume && !items(r => r.state === 'queued' && forGen(r, g) && owed(r) && waitingForClear(r)).length) {
           enqueueResume(cur)
         }
         return {}

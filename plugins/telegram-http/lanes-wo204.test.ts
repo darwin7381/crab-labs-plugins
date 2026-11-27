@@ -134,7 +134,6 @@ test('a person can finish the episode while walled and retire its queued resume'
   await Bun.sleep(0); await d.main.tick()
   expect(d.offers.map(o => o.ids)).toEqual([[person]])
   await d.hook('UserPromptSubmit', 'human', { dids: [person] })
-  await d.clear()
   expect((await d.hook('PostToolUse', 'human')).additionalContext).toBeUndefined()
   expect((await d.hook('Stop', 'human')).block).toBeUndefined()
   await d.hook('Stop', 'human', { phase: 'final' })
@@ -150,4 +149,54 @@ test('an existing 1.59.2 refusal can resume on a clear after upgrade', async () 
   await d.clear()
   expect(d.resumes()).toHaveLength(1)
   expect(d.offers.map(o => o.ids)).toEqual([[d.resumes()[0].id]])
+})
+
+test('a refused item leads the same clear offer as an older item cut after output', async () => {
+  const d = setup(), a = d.add('joey', 'first')
+  await Bun.sleep(0)
+  await d.hook('UserPromptSubmit', 'p', { dids: [a] })
+  const b = d.add('peer', 'later')
+  await d.hook('PostToolUse', 'p', { tool_name: 'Read' }) // output for a, then pull b
+  await d.refuse('p')
+  expect(d.journal.get('msg', a)?.reason).toBe('interrupted')
+  expect(d.journal.get('msg', b)?.reason).toBe('stop_failure:rate_limit')
+  await d.clear(); await d.main.tick()
+  expect(d.offers.map(o => o.ids)).toEqual([[a], [b, a]])
+  expect(d.offers[1].text.split(INTERRUPTED_LINE)).toHaveLength(2)
+  expect(d.resumes()).toHaveLength(0)
+})
+
+test('a peer arriving while the probe drives the menu takes the resume offer', async () => {
+  const d = setup()
+  await d.refuse('p')
+  let closed!: () => void
+  d.env.menu = () => new Promise(resolve => { closed = () => resolve({ text: '選單已收', asks: false }) })
+  await d.clear()
+  const id = d.add('peer', 'arrived during menu')
+  closed(); await Bun.sleep(0)
+  expect(d.offers.map(o => o.ids)).toEqual([[id]])
+  expect(d.resumes()[0]?.reason).toBe('wall_resume_superseded')
+})
+
+test('a Call which ended while walled leaves the resume available', async () => {
+  const d = setup()
+  await d.refuse('p')
+  const id = d.main.enqueue('peer', { method: 'notifications/claude/channel', params: { content: 'Call' } },
+    { event: 'call-9', fields: { call_id: '9' } })
+  d.env.checkCall = async () => ({ final: 'completed' })
+  await d.clear()
+  expect(d.journal.get('msg', id)).toMatchObject({ state: 'done', reason: 'call_already_final' })
+  expect(d.offers.map(o => o.ids)).toEqual([[d.resumes()[0].id]])
+})
+
+test('a second bare refusal leaves the episode’s earlier account cut as its only probe', async () => {
+  const d = setup(), id = d.add('joey', 'original')
+  await Bun.sleep(0)
+  await d.hook('UserPromptSubmit', 'work', { dids: [id] })
+  await d.hook('PreToolUse', 'work', { tool_name: 'Read' })
+  await d.refuse('work')
+  await d.refuse('another typed prompt')
+  expect(d.resumes()).toHaveLength(0)
+  await d.clear()
+  expect(d.offers.map(o => o.ids)).toEqual([[id], [id]])
 })
