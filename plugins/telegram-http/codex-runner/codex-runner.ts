@@ -74,6 +74,8 @@ export type Cfg = {
   /** the runner's own model and reasoning effort (CODEX_RUNNER_MODEL / CODEX_RUNNER_EFFORT), given to every run; null: Codex's own home's
    *  config.toml decides. Never the personal config's (Chiron mesh 13227; Joey TG chiron:2884 「開發任務你多分一些給 codex 的頂級模型」) */
   model: string | null; effort: string | null
+  /** the effort of a #dev item (Chiron #200750: max; CODEX_RUNNER_DEV_EFFORT): the ordinary calls keep `effort` */
+  devEffort: string | null
   /** #dev items (Chiron mesh 13257): their own time limit (CODEX_RUNNER_DEV_TIMEOUT_S, 3600), the repo names that stand for a local path
    *  (CODEX_RUNNER_DEV_REPOS name=path,…; an absolute path to any local git repo works too), the throwaway PostgreSQL the brief names */
   devTimeoutMs: number; devRepos: Record<string, string>; devPg: string
@@ -103,6 +105,8 @@ export function devAsk(text: string): { repo: string; branch: string | null } | 
   return { repo, branch }
 }
 const num = (v: string | undefined, d: number): number => { const n = Number(v); return v != null && v.trim() !== '' && Number.isFinite(n) && n > 0 ? n : d }
+/** the reasoning efforts the Codex CLI lists (models_cache.json, CLI 0.169.0: low, medium, high, xhigh, max, ultra; minimal older); null: not set or unknown */
+export const effortOf = (v: string | undefined): string | null => /^(minimal|low|medium|high|xhigh|max|ultra)$/.test((v ?? '').trim()) ? v!.trim() : null
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
   const home = env.HOME || homedir()
   const root = (env.CODEX_RUNNER_ROOT || join(home, 'onsen-codex')).replace(/\/+$/, '')
@@ -122,7 +126,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
     devRepos: devRepos(env.CODEX_RUNNER_DEV_REPOS, home),
     devPg: (env.CODEX_RUNNER_DEV_PG || 'postgresql://postgres@127.0.0.1:55432').trim(),
     model: /^[A-Za-z0-9._:-]{1,80}$/.test((env.CODEX_RUNNER_MODEL ?? '').trim()) ? env.CODEX_RUNNER_MODEL!.trim() : null,
-    effort: /^(minimal|low|medium|high|xhigh)$/.test((env.CODEX_RUNNER_EFFORT ?? '').trim()) ? env.CODEX_RUNNER_EFFORT!.trim() : null,
+    effort: effortOf(env.CODEX_RUNNER_EFFORT),
+    // Chiron #200750 (11-27; Joey told, TG chiron:2929 and 2884): a #dev item thinks at max; ultra is accepted but not the default (its sharding
+    // with the sandbox and the time limit is not measured)
+    devEffort: effortOf(env.CODEX_RUNNER_DEV_EFFORT) ?? 'max',
   }
 }
 function codexHomes(env: NodeJS.ProcessEnv, root: string): { codexHome: string | null; childHome: string | null } {
@@ -837,7 +844,8 @@ export class CodexRunner {
     const head = j.text.trim() || (j.source === 'person' && !j.attachments.length ? `（一則沒有文字的 ${j.kind ?? 'text'} 訊息）` : '（只有附件）')
     const brief = j.dev ? [this.devBrief(j), ''] : []
     const text = [...brief, head, ...(j.context?.length ? ['', ...j.context] : []), ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
-    const model = [...(this.cfg.model ? ['-m', this.cfg.model] : []), ...(this.cfg.effort ? ['-c', `model_reasoning_effort="${this.cfg.effort}"`] : []),
+    const effort = j.dev ? this.cfg.devEffort ?? this.cfg.effort : this.cfg.effort     // Chiron #200750: #dev at max, the rest as set
+    const model = [...(this.cfg.model ? ['-m', this.cfg.model] : []), ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : []),
       ...(j.dev ? ['-c', 'sandbox_workspace_write.network_access=true'] : [])]   // #dev: 127.0.0.1 and the throwaway PG (it opens the internet too)
     return ['exec', '--skip-git-repo-check', '-s', this.cfg.sandbox, '-C', j.dir!, ...model, ...(j.resumed ? ['resume', j.resumed] : []), ...out, ...imgs, '--', text]
   }

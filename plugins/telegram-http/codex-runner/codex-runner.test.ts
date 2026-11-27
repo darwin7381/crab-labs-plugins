@@ -303,6 +303,22 @@ describe('the model is the runner\'s own (Chiron mesh 13227)', () => {
   }, 30_000)
 })
 
+describe('#dev thinks at max (Chiron #200750)', () => {
+  test('a #dev item runs at CODEX_RUNNER_DEV_EFFORT (default max), an ordinary one at CODEX_RUNNER_EFFORT; max and ultra are accepted, a word the CLI does not list is not', () => {
+    expect(configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_EFFORT: 'high' }).devEffort).toBe('max')
+    expect(configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_EFFORT: 'max' }).effort).toBe('max')
+    expect(configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_DEV_EFFORT: 'ultra' }).devEffort).toBe('ultra')
+    expect(configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_DEV_EFFORT: 'turbo; rm' }).devEffort).toBe('max')
+    expect(configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_EFFORT: 'extreme' }).effort).toBeNull()
+    const cfg = { ...configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_MODEL: 'gpt-6.2-astra', CODEX_RUNNER_EFFORT: 'high' }) }
+    const r = runner(cfg)
+    const job = (dev: boolean): any => ({ id: 'j1', call_id: '9960', n: 1, dir: '/tmp/x/j1', text: '做一件事', attachments: [], images: [],
+      ...(dev ? { dev: { repo: 'fleet-core', branch: 'codex/call-9960', base: 'origin/main' } } : {}) })
+    expect(r.argv(job(true)).join(' ')).toContain('-m gpt-6.2-astra -c model_reasoning_effort="max"')
+    expect(r.argv(job(false)).join(' ')).toContain('-m gpt-6.2-astra -c model_reasoning_effort="high"')
+  })
+})
+
 describe('a long answer (Chiron mesh 13227: over 4000, the Call never completed and the caller got nothing)', () => {
   for (const n of [5000, 15000]) test(`${n} characters: the Call completes with a body within 4000, the whole answer attached; the reply goes back`, async () => {
     const { onsen, cfg } = setup()
