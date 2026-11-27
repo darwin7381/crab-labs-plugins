@@ -268,7 +268,7 @@ export function startStartupPickerWatchdog(opts: {
   pollMs?: number
   /** Panes someone else is handling now (the duty officer, WO-97): not looked at. */
   skip?: (tmux: string) => boolean
-  /** tests: the pane reader */
+  /** the pane reader (default: capture-pane). The daemon passes one so its own pane is read through pane-look's one capture (WO-168); tests a stand-in */
   capture?: (tmux: string) => Promise<string>
   /** WO-197: every look at a pane (skipped ones too: they are captured for this), the menu on it now or null, when it was captured. A pane that could
    *  not be read is not reported. The daemon closes the Onsen Actions of what is no longer on the screen from these */

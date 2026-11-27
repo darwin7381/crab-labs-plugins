@@ -21,7 +21,7 @@ const decision = (over: Partial<Decision> = {}): Decision => ({
   options: [{ on_screen: '1. Stop and wait for limit to reset', means: '等', button: '1. Stop', keys: ['Enter'] },
     { on_screen: '2. Wait here, then continue automatically', means: '自動繼續', button: '2. Wait', keys: ['Down', 'Enter'] }], ...over })
 
-function rig(o: { model?: () => ModelResult; enabled?: string[]; owner?: boolean; pane?: string } = {}) {
+function rig(o: { model?: () => ModelResult; enabled?: string[]; owner?: boolean; pane?: string; connector?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'do-rearm-')), rules = mkdtempSync(join(tmpdir(), 'do-rearm-rules-'))
   writeFileSync(join(rules, 'aide_prompt.md'), 'SYSTEM'); writeFileSync(join(rules, 'rulings.md'), 'RULINGS')
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ enabled: o.enabled ?? ['claude-x'] }))
@@ -36,7 +36,8 @@ function rig(o: { model?: () => ModelResult; enabled?: string[]; owner?: boolean
     cancel: (_r, why) => { acts.push(`cancel:${why}`) } }
   const deps: OfficerDeps = { listTargets: async () => [{ label: 'claude-x', tmux: 'claude-x', projectsDir: null }], tmux,
     model: async () => { calls++; return o.model ? o.model() : { decision: decision(), meta: {}, fail: null } },
-    send: async (_c, text, buttons) => { sent.push({ text, buttons }); return [{ chat: '1828173984', msg: 100 + sent.length }] }, edit: async () => {},
+    // connector (WO-197): server.ts's send returns nothing (no Telegram; the bridge draws the Action)
+    send: async (_c, text, buttons) => { if (o.connector) return []; sent.push({ text, buttons }); return [{ chat: '1828173984', msg: 100 + sent.length }] }, edit: async () => {},
     mail: async () => '#1', recipients: () => ['1828173984'], log: () => {}, now: () => clock, sleep: async ms => { clock += ms }, actions,
     ...(o.owner ? { owner: () => 'the lanes main-wall probe' } : {}) }
   const off = new DutyOfficer(deps, { dir, rulesDirs: [rules], home: dir, host: 'mini', limits: { claimFreshMs: 30_000 } })
@@ -85,6 +86,18 @@ test('WO-168 item 5: the officer\'s question already open on the pane is sent ag
   expect(r.keys).toEqual([])
 })
 
+test('WO-168 × WO-197: a connector\'s open question is its Action: a re-arm sends nothing again and says it is open, not resent', async () => {
+  const r = rig({ connector: true, pane: DIALOG, model: () => ({ decision: decision({ choose: 'Yes', options: [{ on_screen: '1. Yes', means: '執行', button: '1. Stop', keys: ['Enter'] },
+    { on_screen: '2. No', means: '不執行', button: '2. Wait', keys: ['Down', 'Enter'] }] }), meta: {}, fail: null }) })
+  await r.advance(0); await r.advance(9000)
+  expect(r.acts.filter(a => a.startsWith('open:')).length).toBe(1)
+  expect(await r.off.rearm('claude-x')).toEqual({ result: 'open', options: ['1. Stop', '2. Wait'] })
+  expect(r.sent).toEqual([])
+  expect(r.acts.filter(a => a.startsWith('open:')).length).toBe(1)
+  expect(r.log().filter(e => e.event === 'rearm').map(e => e.how)).toEqual(['open'])
+  expect(r.keys).toEqual([])
+})
+
 test('WO-168 item 5: no menu on the screen, or a pane the officer does not watch: nothing is sent and the caller hears why', async () => {
   const r = rig()
   r.pane.pane = IDLE
@@ -99,4 +112,5 @@ test('WO-168 item 5 server.ts: the lanes\' menu sentence comes from the duty off
   expect(src).toContain('await dutyOfficer.rearm(ownPaneTmux, { resend: !drive })')
   expect(src).toContain('mainMenu: (drive: boolean) => mainMenuNotice(drive)')
   expect(src).not.toContain('rearmStartupPicker(')
+  expect(src).toContain("if (r.result === 'open') return { text: `它停在一個選單${labels}；值班員問你的那一則還開著，等你選。`, asks: true }")
 })

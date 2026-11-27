@@ -1951,7 +1951,8 @@ function pickerAsk(pk: PickerSpec, title: string): void {
   if (pk.tmux === ownPane() && permissionShaped(pk.options)) {
     const t = setTimeout(() => { void (async () => {
       if (permissionCarried(pk)) { log('info', `startup picker '${pk.key}' on pane ${pk.tmux} is the permission prompt (its request came): its own Action carries it`); return }
-      const live = detectStartupPicker(await capturePane(pk.tmux).catch(() => ''))
+      // WO-168: the own pane through the one capture (pane-look)
+      const live = detectStartupPicker(ownPaneReader && pk.tmux === ownPaneTmux ? ((await ownPaneReader.fresh(0))?.visible ?? '') : await capturePane(pk.tmux).catch(() => ''))
       if (live?.key !== pk.key) return
       openPickerAsk(pk, title)
     })().catch(e => log('warn', `startup picker '${pk.key}': ${e}`)) }, PICKER_PERM_GRACE_MS)
@@ -3164,6 +3165,8 @@ async function mainMenuNotice(drive: boolean): Promise<{ text: string; asks: boo
   const labels = r.options.length ? `：${r.options.join('｜')}` : ''
   if (r.result === 'busy') return { text: `它停在一個選單；值班員正在處理這個選單。`, asks: false }
   if (drive) return { text: `主線停在一個選單${labels}；值班員已把選項傳給你，等你選。`, asks: false }
+  // WO-197: a connector's question is its open Onsen Action (the bridge's buttons); it is not sent again, so the sentence does not say it was
+  if (r.result === 'open') return { text: `它停在一個選單${labels}；值班員問你的那一則還開著，等你選。`, asks: true }
   return { text: `它停在一個選單${labels}；選項已再傳給你。`, asks: true }
 }
 

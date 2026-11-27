@@ -1774,9 +1774,12 @@ export class DutyOfficer {
     if (open && !open.closed) {
       const labels = open.options.map(x => x.button)
       if (o.resend === false) return { result: 'open', options: labels }
-      this.event('rearm', { agent: open.label, tmux, ask: open.id, how: 'resent' })
+      const before = open.messages.length
       await this.deliver(open, '（選項再傳一次）\n')
-      return { result: 'resent', options: labels }
+      // WO-168 × WO-197: a connector sends nothing to Telegram (its question is the open Action, drawn by the bridge): nothing went again, it is open
+      const how = open.messages.length > before ? 'resent' : 'open'
+      this.event('rearm', { agent: open.label, tmux, ask: open.id, how })
+      return { result: how, options: labels }
     }
     if (this.busy.has(tmux)) return { result: 'busy', options: [] }   // it is judging or pressing this pane now: its question or its press follows
     this.busy.add(tmux)
