@@ -25,6 +25,9 @@ export type ReportRec = { message_id: string; body: Record<string, unknown>; tri
 export type TopicRec = { member: string; chat: string; thread: string; client_thread: string; name: string; state: string; at: number }
 export type LineRec = { member: string; chat: string; msg: number; lift_until: number | null; lifted: boolean; at: number; id: string; pressed?: boolean }
 
+/** WO-199: the ⚠️ line a bridge put under a person's message blocked by a usage limit (removed once the message is taken in again) */
+export type BlockedRec = { member: string; chat: string; msg: number; at: number }
+
 export type StateData = {
   feed: { after: string | null; drawn: string[] }
   accepted: string[]
@@ -37,8 +40,9 @@ export type StateData = {
   sorry: Record<string, number>
   topics: Record<string, TopicRec>
   lines: Record<string, LineRec>
+  blocked: Record<string, BlockedRec>
 }
-const empty = (): StateData => ({ feed: { after: null, drawn: [] }, accepted: [], sent: {}, actions: {}, keys: {}, keySeq: 0, retries: [], reports: [], sorry: {}, topics: {}, lines: {} })
+const empty = (): StateData => ({ feed: { after: null, drawn: [] }, accepted: [], sent: {}, actions: {}, keys: {}, keySeq: 0, retries: [], reports: [], sorry: {}, topics: {}, lines: {}, blocked: {} })
 
 /** keep the newest `max` of a record keyed map (by .at) */
 function trim<T extends { at: number }>(m: Record<string, T>, max: number): void {
@@ -69,7 +73,7 @@ export class StateStore {
   flush(): void {
     if (this.timer) { clearTimeout(this.timer); this.timer = null }
     const d = this.data
-    trim(d.sent, 3000); trim(d.actions, 1000); trim(d.keys, 3000); trim(d.topics, 2000); trim(d.lines, 500)
+    trim(d.sent, 3000); trim(d.actions, 1000); trim(d.keys, 3000); trim(d.topics, 2000); trim(d.lines, 500); trim(d.blocked ?? {}, 500)
     const sk = Object.keys(d.sorry)
     if (sk.length > 2000) { sk.sort((a, b) => d.sorry[a]! - d.sorry[b]!); for (const k of sk.slice(0, sk.length - 2000)) delete d.sorry[k] }
     try {

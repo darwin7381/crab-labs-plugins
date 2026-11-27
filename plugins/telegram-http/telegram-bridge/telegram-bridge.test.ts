@@ -422,6 +422,33 @@ describe('the bridge, end to end against the fakes', () => {
     expect(onsen.bad).toEqual([])
   }, T)
 
+  test('blocked (WO-199): one silent ⚠️ line under the person\'s message, its reaction untouched; deleted once it is taken in again', async () => {
+    const t = TOK.alpha, chat = String(JOEY)
+    const lines = () => tg.callsOf(t, 'sendMessage').filter(p => String(p.chat_id) === chat && String(p.text ?? '').startsWith('⚠️'))
+    const r0 = tg.callsOf(t, 'setMessageReaction').length
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b1', client_msg_id: '7001', state: 'blocked',
+      blocked_by: 'usage_limit', retry_after: '2026-12-03T15:00:00Z' })
+    await until(() => lines().length === 1, 3000, 'the ⚠️ line')
+    const l = lines()[0]
+    expect(l.text).toBe('⚠️ 被額度上限擋下，通了自動重送（重置 12/3 23:00）')
+    expect(l.disable_notification).toBe(true)
+    expect(l.reply_parameters?.message_id).toBe(7001)
+    expect(tg.callsOf(t, 'setMessageReaction').length).toBe(r0)
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b1', client_msg_id: '7001', state: 'blocked',
+      blocked_by: 'usage_limit', retry_after: null })
+    await Bun.sleep(400)
+    expect(lines().length).toBe(1)                    // one line per message
+    const sent = tg.sentTo(t, chat).find(x => String(x.text ?? '').startsWith('⚠️'))!
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b1', client_msg_id: '7001', state: 'in_session' })
+    await until(() => tg.callsOf(t, 'deleteMessage').some(p => Number(p.message_id) === sent.message_id), 3000, 'the line deleted')
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b2', client_msg_id: '7002', state: 'blocked', blocked_by: 'usage_limit' })
+    await until(() => lines().length === 2, 3000, 'a second message: its own line')
+    expect(lines()[1].text).toBe('⚠️ 被額度上限擋下，通了自動重送')
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b3', client_msg_id: '7003', state: 'paused' })
+    await until(() => logs.some(x => x.includes('receipt state paused on tg:7003')), 3000, 'an unknown state: one log line, nothing drawn')
+    expect(onsen.bad).toEqual([])
+  }, T)
+
   test('a send that fails is tried again (10 s / 30 s / 2 min; 0.2/0.3/0.4 s here; a 429 waits its retry_after), then reported failed', async () => {
     const chat = String(JOEY)
     tg.fail.set('sendRichMessage', { code: 500, description: 'Internal Server Error', times: 2 })

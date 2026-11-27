@@ -285,11 +285,45 @@ export class Drawer {
       a.pending.fact({ chat, client_msg_id: id, state: 'delivered', at: item.at } as any)
       if (fresh) await typing()
     } else if (item.state === 'in_session') {
+      await this.unblock(a, chat, id)
       a.pending.fact({ chat, client_msg_id: id, state: 'seen', at: item.at } as any)
       a.seen.seen(chat, id, 'main')
       if (fresh) await typing()
+    } else if (item.state === 'blocked') {
+      await this.block(a, chat, id, item)
+    } else if (item.state === 'turn_end') {
+      await this.unblock(a, chat, id)
+    } else if (item.state != null) {
+      this.d.log('info', `${a.member}: receipt state ${String(item.state).slice(0, 20)} on tg:${id} in chat ${chat} is not drawn by this version`)
     }
     a.redrawPin(chat)
+  }
+
+  /** WO-199 (Chiron 07:10Z; Joey TG chiron:2865 ⚠️, which Telegram refuses as a reaction): a person's message blocked by a usage limit gets one
+   *  silent line under it, quoting it — 「⚠️ 被額度上限擋下，通了自動重送」 (and the reset, when Onsen knows it); its reaction is not touched. Once
+   *  the message is taken in again (in_session) or its turn ends, that line is deleted. One line per message: a second blocked keeps it. */
+  async block(a: Agent, chat: string, id: string, item: any): Promise<void> {
+    const key = `${a.member}:${chat}:${id}`
+    if (!this.st.blocked) this.st.blocked = {}
+    if (this.st.blocked[key]) return
+    const why = item.blocked_by === 'usage_limit' ? '被額度上限擋下，通了自動重送' : '被擋下，阻礙解除後自動重送'
+    const until = item.retry_after ? Date.parse(String(item.retry_after)) : NaN
+    const d = new Date(until + 8 * 3_600_000), p2 = (n: number) => String(n).padStart(2, '0')
+    const reset = Number.isFinite(until) ? `（重置 ${d.getUTCMonth() + 1}/${d.getUTCDate()} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}）` : ''
+    try {
+      const m = await a.tg.call('sendMessage', { chat_id: chat, text: `⚠️ ${why}${reset}`, disable_notification: true,
+        ...(/^\d+$/.test(id) ? { reply_parameters: { message_id: Number(id), allow_sending_without_reply: true } } : {}) })
+      this.st.blocked[key] = { member: a.member, chat, msg: Number(m.message_id), at: this.now() }
+      this.d.state.dirty()
+    } catch (e) { this.d.log('warn', `${a.member}: the ⚠️ line under tg:${id} in chat ${chat} was not sent: ${errText(e)}`) }
+  }
+  async unblock(a: Agent, chat: string, id: string): Promise<void> {
+    const key = `${a.member}:${chat}:${id}`, rec = this.st.blocked?.[key]
+    if (!rec) return
+    delete this.st.blocked![key]
+    this.d.state.dirty()
+    await a.tg.call('deleteMessage', { chat_id: chat, message_id: rec.msg }).catch(e =>
+      this.d.log('warn', `${a.member}: the ⚠️ line ${rec.msg} in chat ${chat} was not deleted: ${errText(e)}`))
   }
 
   async drawAction(a: Agent, item: any): Promise<void> {
