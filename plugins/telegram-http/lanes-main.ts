@@ -937,7 +937,15 @@ export function createMain(E: MainEnv) {
         // WO-201 (Chiron mesh-13184): an item whose turn a dead process, another session or a StopFailure cut after the model had answered it (`cut_by`) goes
         // this way too, Joey's own included: an Esc is Joey stopping it; a process that died is not, and with no next delivery nothing else would wake it
         const cutOld = items(r => heldCut(r) && owed(r) && (r.kind !== 'joey' || !!r.cut_by) && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), from) > MAIN_STUCK_MS)
-        if (cutOld.length) {
+        // WO-201 (Chiron mesh-13191): when every such item is one a dead process, another session or a StopFailure cut (`cut_by`), it is not stuck: an
+        // interrupted turn waited MAIN_STUCK_MS with nothing coming in to ride. It is offered alone once and nobody is told: no main-stuck push, no stuck
+        // episode (so no main-unstuck either); before 1.59.1 such an item was offered again at once and Joey heard nothing. Any item without `cut_by`
+        // (Esc-cut, a turn with no Stop: WO-157c) keeps the stuck path exactly as before
+        const quiet = cutOld.length > 0 && cutOld.every(r => !!r.cut_by)
+        if (quiet) {
+          for (const r of cutOld) J().write('msg', r.id, 'queued', { reason: 'interrupted_untaken' })
+          E.log('info', `lanes: main gen ${g.id}: ${cutOld.length} item(s) of a turn cut by ${[...new Set(cutOld.map(r => String(r.cut_by)))].join(', ')} had no delivery to ride for ${Math.round(MAIN_STUCK_MS / 1000)} s: offered alone once; not a stuck main, nobody told (WO-201)`)
+        } else if (cutOld.length) {
           stuck = { gen: g.id, prompt: null, at: now }
           for (const r of cutOld) J().write('msg', r.id, 'queued', { reason: 'interrupted_untaken' })
           const menu = E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null

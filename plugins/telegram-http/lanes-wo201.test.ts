@@ -34,6 +34,8 @@ const M = () => L.__main(), E = () => L.__events()
 const row = (id: string) => M().items(r => r.id === id)[0]
 const state = (id: string) => row(id)?.state
 const offeredTimes = (id: string) => linesOf('msg', id).filter(l => l.state === 'offered').length
+/** the router's notify lines of one rule (the ledger records every push to Joey with its tier_rule, before it is sent) */
+const notifies = (rule: string): any[] => { try { return readFileSync(join(dir, 'ledger.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(x => x.kind === 'notify' && x.refs?.tier_rule === rule) } catch { return [] } }
 let np = 0
 const P = () => `p201-${++np}`
 
@@ -422,7 +424,7 @@ test('WO-201 (h2): a non-account StopFailure after the model answered: an interr
   settleAll()
 })
 
-test(`WO-201 (i): the process ends after the model answered and no next delivery comes within MAIN_STUCK_MS (${MAIN_STUCK_MS / 1000} s): the item is delivered alone, once, the interrupted line first; Joey's own message too (an Esc-cut one of his never is: lanes-esc-hold)`, async () => {
+test(`WO-201 (i): the process ends after the model answered and no next delivery comes within MAIN_STUCK_MS (${MAIN_STUCK_MS / 1000} s): the item is delivered alone, once, the interrupted line first; Joey's own message too (an Esc-cut one of his never is: lanes-esc-hold); not a stuck main (Chiron mesh-13191): no main-stuck push, no stuck episode, so no main-unstuck either`, async () => {
   const g = await startMain()
   const id = await joey('i: 幫我把簡報改成英文')
   const p = P()
@@ -431,7 +433,7 @@ test(`WO-201 (i): the process ends after the model answered and no next delivery
   await kill(g)
   expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
   const g2 = await startMain()
-  const k = offers.length, t = sent.length
+  const k = offers.length, t = sent.length, ns = notifies('main-stuck').length, nu = notifies('main-unstuck').length
   await M().tick(Date.now() + MAIN_STUCK_MS - 60_000)
   expect(offers.length).toBe(k)                                                            // within MAIN_STUCK_MS: it waits for a delivery to ride
   await M().tick(Date.now() + MAIN_STUCK_MS + 1_000)
@@ -440,15 +442,49 @@ test(`WO-201 (i): the process ends after the model answered and no next delivery
   expect(String(n.params.meta.did).split(',')[0]).toBe(id)
   expect(String(n.params.content)).toContain(`${INTERRUPTED_LINE}\ni: 幫我把簡報改成英文`)
   expect(row(id)).toMatchObject({ state: 'offered', reason: 'interrupted_untaken' })
-  await M().tick(Date.now() + MAIN_STUCK_MS + 30_000); await M().tick(Date.now() + 2 * MAIN_STUCK_MS)
-  expect(offers.length).toBe(k + 1)                                                        // once
   await sleep(20)
-  expect(sent.slice(t).filter(s => s.includes('主線疑似卡死')).length).toBe(1)             // the Esc path's own notice (WO-157c), as for a colleague's cut item
+  expect(sent.slice(t).filter(s => s.includes('主線疑似卡死'))).toEqual([])                 // mesh-13191: not stuck, nobody told (the first 1.59.1 pushed main-stuck here)
+  expect(notifies('main-stuck').length).toBe(ns)
   const p2 = P()
-  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })
+  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })   // its next hook event: no stuck episode was open
   await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
   expect(state(id)).toBe('done'); expect(offeredTimes(id)).toBe(2)
+  await M().tick(Date.now() + MAIN_STUCK_MS + 30_000); await M().tick(Date.now() + 2 * MAIN_STUCK_MS)
+  expect(offeredTimes(id)).toBe(2)                                                         // once
+  await sleep(20)
+  expect(sent.slice(t).filter(s => s.includes('疑似卡死'))).toEqual([])                     // neither 主線疑似卡死 nor 疑似卡死解除
+  expect(notifies('main-stuck').length).toBe(ns); expect(notifies('main-unstuck').length).toBe(nu)
   await kill(g2)
+  settleAll()
+})
+
+test('WO-201 (i2): the alone delivery of an item with no cut_by (a colleague\'s item of a turn that never got its Stop: WO-157c) stays the stuck path, unchanged: main-stuck pushed, the stuck episode open, its next hook event pushes main-unstuck', async () => {
+  const g = await startMain()
+  E().open('ev-201i2', { class: 'peer', owner: 'main', from: 'eve', text: 'i2', obligations: [{ kind: 'main', level: 'handed', owner: 'main', handoff: 'ho-201i2' }] })
+  const id = M().enqueue('peer', { method: 'notifications/claude/channel', params: { content: 'i2: eve 要上週的備份報告', meta: { chat_id: 'eve', user: 'eve', btcc_msg_id: '92011' } } }, { via: 'tg', event: 'ev-201i2' })
+  await M().pump(); await sleep(10)                                                        // enqueue's own pump may be the one that offers it
+  expect(state(id)).toBe('offered')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  answers(g)
+  const p2 = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p2 })                                     // a new prompt, no Stop for p: cutTurn (cut_by cleared)
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted' }); expect(row(id).cut_by).toBeUndefined()
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  const t = sent.length, ns = notifies('main-stuck').length, nu = notifies('main-unstuck').length
+  await M().tick(Date.now() + MAIN_STUCK_MS + 1_000)
+  expect(row(id)).toMatchObject({ state: 'offered', reason: 'interrupted_untaken' })
+  await sleep(20)
+  expect(notifies('main-stuck').length).toBe(ns + 1)
+  expect(sent.slice(t).filter(s => s.includes('主線疑似卡死：交給它的訊息')).length).toBe(1)
+  const p3 = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p3, dids: [id] })                          // the episode was open: its next hook event ends it
+  await sleep(20)
+  expect(notifies('main-unstuck').length).toBe(nu + 1)
+  expect(sent.slice(t).filter(s => s.includes('疑似卡死解除')).length).toBe(1)
+  await hook(g, 'Stop', { prompt_id: p3, phase: 'final' })
+  expect(state(id)).toBe('done')
+  await kill(g)
   settleAll()
 })
 
