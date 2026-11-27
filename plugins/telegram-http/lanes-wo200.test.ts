@@ -261,6 +261,9 @@ async function bareRefusal() {
 test('WO-204 (a,d) the menu precedes a bare resume, once across repeated refusals and daemon restart', async () => {
   const d = await bareRefusal()
   const episode = d.main.currentGen()!.wall_since
+  setSystemTime(T + 60_000)
+  await d.hook('UserPromptSubmit', 'another')
+  await d.hook('StopFailure', 'another', { error: 'billing_error' })
   const steps: string[] = []
   d.env.menu = async drive => { if (drive) steps.push('menu'); return null }
   d.env.offer = async (n, via, pid) => {
@@ -273,7 +276,7 @@ test('WO-204 (a,d) the menu precedes a bare resume, once across repeated refusal
   await d.main.tick()
   expect(steps).toEqual([])
   d.clear(); await Bun.sleep(0)
-  expect(steps).toEqual(['menu', 'tg/123 ' + resumeText])
+  expect(steps).toEqual(['menu', 'tg/123 ' + resumeText.replace('11:00', '11:01')])
   expect(d.main.currentGen()).toMatchObject({ state: 'in_turn', prompt_id: 'resume', resume_sent: episode })
   expect(d.journal.rows('msg')).toEqual([])
 
@@ -353,4 +356,37 @@ test('WO-204 a failed stream write leaves the bare resume available on the same 
   await d.main.tick(); await d.main.tick()
   expect(d.texts).toEqual([resumeText])
   expect(d.main.currentGen()?.resume_sent).toBe(d.main.currentGen()?.wall_since)
+})
+
+test('WO-204 a person can finish during the wall while an older account cut still waits for the clear', async () => {
+  const d = daemon(), cut = d.add('joey', '123')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'work', { dids: [cut] })
+  await d.hook('PreToolUse', 'work', { tool_name: 'Read' })
+  await d.hook('StopFailure', 'work', { error: 'rate_limit' })
+  setSystemTime(T + 60_001)
+  const person = d.add('joey', '124')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'person', { dids: [person] })
+  await d.hook('Stop', 'person', { phase: 'final' })
+  await d.flush()
+  expect(d.offers).toEqual([[cut], [person]])
+  d.clear(); await Bun.sleep(0)
+  expect(d.offers).toEqual([[cut], [person], [cut]])
+  expect(d.texts[2]).toStartWith(INTERRUPTED_LINE)
+})
+
+test('WO-204 a Call queued while the menu closes takes precedence; an unknown Call keeps the clear available', async () => {
+  const d = await bareRefusal()
+  let call: string
+  d.env.menu = async () => {
+    call ??= d.add('peer', '8')
+    return null
+  }
+  d.clear(); await Bun.sleep(0)
+  expect(d.offers).toEqual([])
+  expect(d.main.currentGen()?.resume_sent).toBeUndefined()
+  d.calls.set('8', 'accepted')
+  await d.main.tick()
+  expect(d.offers).toEqual([[call!]])
 })
