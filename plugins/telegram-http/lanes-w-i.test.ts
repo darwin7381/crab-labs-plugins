@@ -34,7 +34,7 @@ st.threads['adam#t-wi'] = { id: 'adam#t-wi', lane: LANE, peer: null, hops: 0, to
 st.topics[TOPIC] = LANE
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
-const HEAD = '〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕'
+const HEAD = '〔Joey 原話｜分流器收到的原文，不是車道的轉述〕'
 const SAID = '記住：週三 14:00 是 mock-api 的維護窗口，那段時間的告警不用叫我。'
 let pid = ''
 test('setup: Joey writes in the worker\'s topic; the lane files his 「記住」 as a memory proposal in its own words', async () => {

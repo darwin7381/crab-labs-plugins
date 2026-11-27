@@ -298,7 +298,7 @@ Fields:
     read M3 and never saw it), and a lane's text only in a run of Joey's;
   - `tg`: `{message_id, topic}` on Joey's own Telegram message (002t). **His own words travel with everything the main gets from his message**
     (002w I, 002v round 2 D02): ONE renderer (`joeyWords`) writes them from this record (`tg` and `text`, the router's transcript of the message),
-    marked 〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕, and every such item uses it: the hand-over of the event (after the lane's text),
+    marked 〔Joey 原話｜分流器收到的原文，不是車道的轉述〕, and every such item uses it: the hand-over of the event (after the lane's text),
     the digest line and activity-list line of the event, and a memory proposal filed in a run whose event set holds his message (`joey_event` on the
     proposal: its standing digest line, its `memory_proposal` ledger row that ledger_query(kind=memory_proposal) shows, and the memory gate's listing,
     the `joey_words` of the Stop check's `proposals`). 002t put them on the hand-over only: in D02 the lane filed Joey's 「記住」 in its own words and the
