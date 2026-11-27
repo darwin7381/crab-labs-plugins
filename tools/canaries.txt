@@ -77,9 +77,9 @@ plugins/telegram-http/lanes.ts::export function claudePidOf(
 plugins/telegram-http/lanes.ts::export function mainSameState(doing: string, event: Record<string, unknown>, from: 'turn' | 'newest' = 'turn')
 plugins/telegram-http/lanes-boundary.ts::）。這件交給主線：用 handoff_main，寫你查到的、你本來要做什麼。
 # WO-146 (telegram-http 1.47.4, agent-inbox 1.17.4): the tool descriptions carry the detail (Chiron's words)
-plugins/telegram-http/server.ts::Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone
-plugins/telegram-http/server.ts::✅ ❌ 💪 🔍 are rejected.
-plugins/telegram-http/server.ts::Edits are silent (no push): use them for detail inside one stage
+plugins/telegram-http/server.ts::這是對方唯一看得到的輸出，也是唯一會讓他手機響的訊號
+plugins/telegram-http/server.ts::✅ ❌ 💪 🔍 不收。
+plugins/telegram-http/server.ts::靜默（不推播）：只用在同一個階段裡補細節
 plugins/telegram-http/onsen-tool.ts::這裡只有講過的話；你做了什麼（工具呼叫、改了哪些檔、指令的輸出）不在這裡
 plugins/telegram-http/lanes.ts::goes to a sub-agent (Agent tool) instead.
 plugins/telegram-http/inbox-text.ts::工具清單上沒有 feed_ask 的，用 feed_search 給一到幾個詞。

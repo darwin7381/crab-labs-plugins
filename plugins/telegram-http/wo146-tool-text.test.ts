@@ -29,8 +29,8 @@ function instructions(lanesOn: boolean): string {
   return arr.join('\n')
 }
 
-test('reply: the first sentence says it is the only output and the only push; the rest of the description is kept', () => {
-  expect(SRC).toContain("'Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone, so a result, each new stage of a long task, and anything they must decide goes out as a new reply. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.'")
+test('reply: a reply is visible in Onsen and each new stage goes out as a new message', () => {
+  expect(SRC).toContain("'在這段對話裡說一句。寫進 Onsen 就算說出口：對方在 Telegram 和 Onsen 的網頁都看得到；送到他用的軟體是橋接的事，一時送不到它會自己補送。這是對方唯一看得到的輸出，也是唯一會讓他手機響的訊號，所以結果、長任務的每個新階段、要他決定的事，都發新的一則。chat_id 照進來那一則的填；reply_to（message_id）接在某一則下面；files 給絕對路徑，附圖或檔。'")
   expect(SRC).not.toContain("'Reply on Telegram. Pass chat_id")
 })
 
@@ -45,12 +45,12 @@ test('files: no .md attachments, TKG instead', () => {
 })
 
 test('react: a silent mark, our set, the rejected four', () => {
-  expect(SRC).toContain("description: 'Add an emoji reaction to a Telegram message: a silent status mark, never a report. Telegram accepts only its fixed set; for our use: 🫡 received or starting, 👍 agree, 💯 well done, 🎉 done, 🤔 looking into it, 😢 stuck, 🔥 found it (👀 is added automatically when a message arrives). ✅ ❌ 💪 🔍 are rejected.'")
+  expect(SRC).toContain("description: '在對方的一則訊息上按一個表情：靜默的狀態記號，不是回報。只用這一組（每一種客戶端都畫得出來）：🫡 收到或開工、👍 認同、💯 漂亮、🎉 完成、🤔 在查、😢 卡住、🔥 發現（👀 是訊息進來時自動加的）。✅ ❌ 💪 🔍 不收。'")
   expect(SRC).not.toContain('fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc)')
 })
 
 test('edit_message: detail inside one stage; a stage, the result, what they must see is a new reply', () => {
-  expect(SRC).toContain("description: 'Edit a message the bot previously sent. Edits are silent (no push): use them for detail inside one stage; a new stage, the result, or anything they must see goes out as a new reply.'")
+  expect(SRC).toContain("description: '改你先前說的一則。靜默（不推播）：只用在同一個階段裡補細節；新的階段、結果、對方一定要看到的事，發新的一則。'")
   expect(SRC).not.toContain('Useful for interim progress updates')
 })
 
