@@ -194,12 +194,19 @@ export function statusView(st: any, now: number, itemAt: number | null = null): 
 }
 
 /** line 1 of the pinned status: the daemon's statusLine on the mapped view; a state it has no words for: ⚪ and Onsen's own phrase */
+/** the pinned line 1: the state's mark, then Onsen's own status.phrase (the one sentence the page shows too: Chiron mesh 13273 / 13285), then
+ *  since when; a usage limit's phrase carries its own time (撞上限（重置 …）；…), so no since there. No phrase from Onsen: statusLine as before */
 export function pinLine(st: any, since: SinceTracker, now: number, itemAt: number | null = null): string {
   const v = statusView(st, now, itemAt)
+  const phrase = typeof st?.phrase === 'string' ? st.phrase.replace(/\s+/g, ' ').trim().slice(0, 120) : ''
   if (!v) {
     const at = since.track('unknown')
-    return `⚪ ${String(st?.phrase ?? '狀態不明').replace(/\s+/g, ' ').slice(0, 80)}（${tpe(at)} 起）`
+    return `⚪ ${phrase || '狀態不明'}（${tpe(at)} 起）`
   }
   const at = since.track(v.view.state)
-  return statusLine(v.view as any, v.since ?? at, now)
+  if (!phrase) return statusLine(v.view as any, v.since ?? at, now)
+  const d = (v.view.detail ?? {}) as Record<string, any>
+  const mark = v.view.state === 'offline' ? '⚫' : d.walled ? '🔴' : v.view.state === 'starting' ? '⚪' : v.view.state === 'idle' ? '🟢'
+    : v.view.state === 'waiting' ? '🟠' : '🟡'
+  return d.walled ? `${mark} ${phrase}` : `${mark} ${phrase}（${tpe(v.since ?? at)} 起）`
 }
