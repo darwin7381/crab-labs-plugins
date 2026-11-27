@@ -2495,9 +2495,9 @@ function buildServer(): Server {
       instructions: [
         // Claude Code truncates MCP server instructions at 2048 chars, silently (measured 2026-11-06). Keep this under 2000.
         // WO-164 (Chiron 21:10Z): the one sentence on Onsen's text format; the whole of it is on the text fields (fleet-text.ts ONSEN_TEXT_FORMAT)
-        'The sender reads Telegram, not this session: anything they should see must go through the reply tool (pass chat_id back). Use reply_to only to quote an earlier message, not for normal replies. ' + ONSEN_TEXT_DEFAULT,
+        '這是你和對方的對話，存在 Onsen；對方用 Telegram 或 Onsen 的網頁看它，看不到你的 session。要讓對方看到的，只有 reply（chat_id 照進來那一則的填）。reply_to 只在要引用先前某一則時用。' + ONSEN_TEXT_DEFAULT,
         '',
-        'Messages arrive as <channel source="telegram" chat_id message_id user ts>. Attributes:',
+        '訊息進來的樣子：<channel source="telegram" chat_id message_id user ts>；對方從 Onsen 的網頁傳的多一個 via="onsen"，一樣是他。屬性：',
         '- image_path: Read it (a photo they sent). image_error: the photo did NOT come through; say so explicitly, never answer as if you saw it; retry with download_attachment(attachment_file_id).',
         '- attachment_file_id: call download_attachment, then Read the returned path.',
         '- reply_to_text/reply_to_user/reply_to_message_id: the message being replied to (attachment_origin="reply": the attachment came from it). reply_quote: the passage they quoted.',
@@ -2589,7 +2589,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     {
       name: 'reply',
       description:
-        'Reply on Telegram: the only output the sender sees and the only signal that pushes to their phone, so a result, each new stage of a long task, and anything they must decide goes out as a new reply. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        '在這段對話裡說一句。寫進 Onsen 就算說出口：對方在 Telegram 和 Onsen 的網頁都看得到；送到他用的軟體是橋接的事，一時送不到它會自己補送。這是對方唯一看得到的輸出，也是唯一會讓他手機響的訊號，所以結果、長任務的每個新階段、要他決定的事，都發新的一則。chat_id 照進來那一則的填；reply_to（message_id）接在某一則下面；files 給絕對路徑，附圖或檔。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2616,7 +2616,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'react',
-      description: 'Add an emoji reaction to a Telegram message: a silent status mark, never a report. Telegram accepts only its fixed set; for our use: 🫡 received or starting, 👍 agree, 💯 well done, 🎉 done, 🤔 looking into it, 😢 stuck, 🔥 found it (👀 is added automatically when a message arrives). ✅ ❌ 💪 🔍 are rejected.',
+      description: '在對方的一則訊息上按一個表情：靜默的狀態記號，不是回報。只用這一組（每一種客戶端都畫得出來）：🫡 收到或開工、👍 認同、💯 漂亮、🎉 完成、🤔 在查、😢 卡住、🔥 發現（👀 是訊息進來時自動加的）。✅ ❌ 💪 🔍 不收。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2629,7 +2629,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'download_attachment',
-      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      description: '把對方那一則的附件取到本機 inbox：<channel> 有 attachment_file_id 時用，回本機路徑，接著 Read。檔在 Onsen 裡；對方傳的時候沒能存進 Onsen 的（太大、當時失敗），會直接告訴你取不到。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2640,7 +2640,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent. Edits are silent (no push): use them for detail inside one stage; a new stage, the result, or anything they must see goes out as a new reply.',
+      description: '改你先前說的一則。靜默（不推播）：只用在同一個階段裡補細節；新的階段、結果、對方一定要看到的事，發新的一則。',
       inputSchema: {
         type: 'object',
         properties: {
