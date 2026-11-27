@@ -231,6 +231,23 @@ describe('#dev items (Chiron mesh 13257)', () => {
     expect(onsen.calls.get('9962')!.state).toBe('failed')
     expect(onsen.puts.find(p => p.call === '9962' && p.state === 'failed')!.result.body.text).toContain('不認得這個名字')
   }, 40_000)
+  test('a ./repo the runner did not make is moved aside, never reused; the base is origin\'s default branch', async () => {
+    const { local } = repos()
+    const { onsen, cfg, codexLog } = setup()
+    const pre = join(cfg.root, 'cv-chiron', 'call-9964', 'repo')
+    mkdirSync(pre, { recursive: true }); writeFileSync(join(pre, 'work.txt'), 'codex made this before #dev')
+    onsen.call('9964', 'chiron', 9964)
+    onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${local}\nCOMMIT:b.txt`, msg_id: 9964 }, dedupe: 'msg:9964', call_id: '9964' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '9964')(), 20_000, 'Call 9964')
+    const dir = join(cfg.root, 'cv-chiron', 'call-9964')
+    const aside = readdirSync(dir).find(n => n.startsWith('repo-before-'))!
+    expect(readFileSync(join(dir, aside, 'work.txt'), 'utf8')).toBe('codex made this before #dev')
+    expect(existsSync(join(dir, 'repo', '.git'))).toBe(true)
+    expect(codexLog().find(x => x.ev === 'start')!.text).toContain(`已經移到 ${aside}`)
+    expect(onsen.puts.at(-1)!.result.body.text).toContain('從 origin/main 開')
+  }, 40_000)
   test('stopped at its limit: it goes on once in the same session instead of failing', async () => {
     const { local } = repos()
     const { onsen, cfg, codexLog, log } = setup({ devTimeoutMs: 1200, killGraceMs: 300 })

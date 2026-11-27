@@ -724,11 +724,24 @@ export class CodexRunner {
     let origin = ''
     try { origin = git(['remote', 'get-url', 'origin'], local) } catch { origin = local }
     const clone = join(j.dir!, 'repo')
+    const mark = join(j.dir!, '.codex-runner', 'dev-clone.json')
     const branch = ask.branch || `codex/${folderOf(j.call_id ? `call-${j.call_id}` : j.id)}`
-    if (!existsSync(join(clone, '.git'))) git(['clone', '--quiet', '--reference', local, origin, clone])
-    else git(['fetch', '--quiet', 'origin'], clone)
+    // a ./repo the runner did not make (Codex cloned one itself before #dev existed: Call 774) is moved aside, never reused: its origin and
+    // base are unknown. Nothing in it is lost; the brief names where it went.
+    let movedAside: string | null = null
+    if (existsSync(clone) && !existsSync(mark)) {
+      movedAside = join(j.dir!, `repo-before-${new Date(this.now()).toISOString().replace(/[:.]/g, '-')}`)
+      renameSync(clone, movedAside)
+    }
+    if (!existsSync(join(clone, '.git'))) {
+      git(['clone', '--quiet', '--reference', local, origin, clone])
+      writeFileSync(mark, JSON.stringify({ origin, local, at: this.iso() }) + '\n', { mode: 0o600 })
+    } else git(['fetch', '--quiet', 'origin'], clone)
+    // the base: origin's own default branch (`ls-remote --symref`), not a symbolic ref a copied clone may carry
     let base = ''
-    try { base = git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], clone) } catch { base = 'origin/main' }
+    try { base = `origin/${/^ref: refs\/heads\/(\S+)\s+HEAD/m.exec(git(['ls-remote', '--symref', 'origin', 'HEAD'], clone))?.[1] ?? ''}` } catch {}
+    if (base === 'origin/') try { base = git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], clone) } catch { base = 'origin/main' }
+    if (movedAside) (j.notes ??= []).push(`這一件資料夾裡原本有一個不是 runner 開的 ./repo，已經移到 ${basename(movedAside)}，沒有刪`)
     const onOrigin = (() => { try { git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], clone); return true } catch { return false } })()
     const here = (() => { try { git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], clone); return true } catch { return false } })()
     if (here) git(['checkout', '--quiet', branch], clone)
