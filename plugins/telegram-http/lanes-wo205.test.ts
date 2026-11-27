@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createMain, type MainEnv, type Notif } from './lanes-main.ts'
@@ -98,4 +98,27 @@ test('WO-205 (e) a lane, a different workspace and a different tmux session cann
     expect(d.main.currentGen()).toBeNull()
   }
   expect(d.notices).toBeEmpty()
+})
+
+test('WO-209 (10) the earlier gen was cut bare; one registry adoption gives its continuation to the already-running TUI', async () => {
+  const d = daemon(), oldSid = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+  d.env.expectedSession = () => [oldSid, sid]
+  await d.main.mainEvent({ event: 'SessionStart', session_id: oldSid, pid: 456 })
+  await d.main.mainEvent({ event: 'UserPromptSubmit', session_id: oldSid, pid: 456, prompt_id: 'cut' })
+  const sub = join(d.dir, oldSid, 'subagents')
+  mkdirSync(sub, { recursive: true })
+  writeFileSync(join(sub, 'agent-one.jsonl'), '{}\n')
+  await d.main.mainEvent({ event: 'SessionEnd', session_id: oldSid, pid: 456 })
+  d.put()
+  const journal = new Journal(d.journal.path)
+  journal.load()
+  const restarted = createMain({ ...d.env, journal })
+  restarted.initMain()
+  await restarted.tick()
+  restarted.registryChanged()
+  await restarted.tick()
+  expect(restarted.currentGen()).toMatchObject({ pid, session_id: sid, source: 'adopt', state: 'idle', resumes: 1 })
+  expect(d.offers).toHaveLength(1)
+  expect((d.offers[0].params as any).content).toContain('當時有 1 個背景工作在跑，重開後已經不在。')
+  expect(journal.rows('msg')).toBeEmpty()
 })

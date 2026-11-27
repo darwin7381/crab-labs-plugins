@@ -35,6 +35,7 @@ export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry
 export type Via = 'tg' | 'inbox'
 export type MainPhase = 'starting' | 'idle' | 'in_turn' | 'walled' | 'gone'
 export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
+type CutTurn = { at: number; why: string; retry_at?: number; background_agents?: number }
 
 export type MainEnv = {
   journal: Journal
@@ -64,7 +65,7 @@ export type MainEnv = {
   blocked?: (item: Row, retryAfter: string | null) => void
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
-  registry?: Pick<Registry, 'mainForAdoption'>
+  registry?: Pick<Registry, 'mainForAdoption' | 'backgroundAgents'>
   /** 002v: the accepted main's session id is the expected one from now on (.lanes/main-expected): a /clear's new session survives a restart */
   expect?: (sid: string) => void
   pidAlive: (pid: number) => boolean
@@ -187,6 +188,8 @@ export function createMain(E: MainEnv) {
   /** the stuck episode: a live gen silent too long; or (002w E) `undelivered`: owed items nobody could take (no live gen, or one that cannot be offered them) */
   let stuck: { gen: string | null; prompt: string | null; at: number; undelivered?: boolean } | null = null
   let offering = false
+  // A final Stop can arrive during an awaited stream write. Its cleared guard must stay cleared.
+  let finalStops = 0
   let wallWakePending = false
   let seq = 0
   let restoredThrough = 0
@@ -291,6 +294,8 @@ export function createMain(E: MainEnv) {
   let didSeq = 0
   const newId = (): string => `m-${Date.now().toString(36)}-${(++didSeq).toString(36)}`
   const items = (pred: (r: Row) => boolean): Row[] => J().rows('msg', pred)
+  const itemCount = (rs: Row[]): number => rs.filter(r => r.kind !== 'digest').length
+  const unsettled = (g: Row, p?: string): Row[] => items(r => (r.state === 'offered' || r.state === 'bound') && r.gen === g.id && (!p || r.prompt_id === p))
   const metaOf = (n: Notif): Record<string, string> => (((n?.params ?? {}) as any).meta ?? {}) as Record<string, string>
   /** queue an item for the main. `target` = only the gen with this session id may take it (a renew brief is for the new main). */
   function enqueue(kind: ItemKind, notif: Notif, o: { via?: Via; event?: string | null; target?: string; fields?: Record<string, unknown>; batched?: boolean } = {}): string {
@@ -328,6 +333,7 @@ export function createMain(E: MainEnv) {
   /** WO-201 (point 4): an item whose turn failed (failTurn) waiting for its retry time (`fail_retry_at`), or parked at the cap (reason stop_failure_cap):
    *  neither offered nor pulled nor riding until then (the gen's next final Stop lets them go at once: releaseFailed) */
   const waitsRetry = (r: Row, now = Date.now()): boolean => r.state === 'queued' && (r.reason === 'stop_failure_cap' || Number(r.fail_retry_at ?? 0) > now)
+  const queuedForOffer = (r: Row, g: Row): boolean => r.state === 'queued' && owed(r) && forGen(r, g) && !batchedRider(r) && !waitsRetry(r)
   /** the reason an offered item goes back with when nobody took the offer: a held item keeps its hold (it rides the next offer again) */
   const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : r.reason === 'batched' ? 'batched' : why
   /** an item that was in an interrupted turn: Chiron's line goes in front of it each time it reaches the main (cut_at, set when the turn was cut) */
@@ -438,14 +444,13 @@ export function createMain(E: MainEnv) {
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
-    const accountClear = probe && (wall.clear ?? 0) > Number(g.uw_clear_used ?? 0) && ACCOUNT_WALL.has(g.kind)
-    const episode = g.wall_since
-    const resume = accountClear && episode && g.resume_sent !== episode && Number.isFinite(g.wall_refused_at)
+    const cut: CutTurn | undefined = g.cut_turn
+    const resume = cut && g.resume_sent !== cut.at && (probe || !wall.active) && Date.now() >= (cut.retry_at ?? 0)
     // A person's successful turn can end M2's episode while an earlier cut still waits in M1.
     // The keeper timestamps clears to whole seconds, as in statusChanged.
     const releasedCut = (r: Row) => wall.clear != null && accountFailure(r.cut_by)
       && wall.clear >= Math.floor(Date.parse(r.cut_at ?? r.ts) / 1000) * 1000
-    const candidates = () => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !batchedRider(r) && !waitsRetry(r) && eligible(r)
+    const candidates = () => items(r => queuedForOffer(r, g) && eligible(r)
       && (!heldCut(r) || releasedCut(r)))
     const cands = candidates()
     if (!cands.length && !resume) return
@@ -465,7 +470,7 @@ export function createMain(E: MainEnv) {
     })
     const down = new Set<string>()
     // Work can arrive while the probe is driving the menu. It takes precedence over a bare resume.
-    for (const it of accountClear ? candidates() : cands) {
+    for (const it of probe ? candidates() : cands) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
       // Interrupted and batched items ride the lead, along with every refusal released by this clear.
       let riders = items(r => r.id !== it.id && r.state === 'queued' && (heldCut(r) || r.reason === 'batched' || (wall.clear != null && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))
@@ -511,14 +516,19 @@ export function createMain(E: MainEnv) {
     }
     // A final Call has been closed by checked(). A disconnected stream or an unverified Call is still owed.
     if (resume && !candidates().length && stillReady()) {
-      const content = `額度通了，上一回合 ${hhmmTaipei(g.wall_refused_at)}（台北）被用量上限打斷，接著做沒做完的；沒有要接的就直接結束這一回合。`
+      const reason = ACCOUNT_WALL.has(cut.why) ? '用量上限' : cut.why === 'gen_end' ? '對話結束' : `模型回應錯誤 ${cut.why}`
+      const background = cut.background_agents ? `當時有 ${cut.background_agents} 個背景工作在跑，重開後已經不在。` : ''
+      const content = `上一回合 ${hhmmTaipei(cut.at)}（台北）被打斷（${reason}），接著做沒做完的；沒有要接的就直接結束這一回合。${background}`
       const notif = { method: 'notifications/claude/channel', params: { content, meta: { chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' } } }
-      const sent = await E.offer(notif, 'tg', Number(g.pid)).catch(e => { E.log('warn', `lanes: resume probe failed: ${e}`); return false })
-      // A hook may already have opened the turn or refused it again during the write. Keep its M2 phase and backoff.
-      const now = currentGen()
-      if (sent && now && now.wall_since === episode) {
-        if (now === g && now.version === version) advanceProbe(now, { resume_sent: episode })
-        else J().write('main', now.id, now.state, { resume_sent: episode })
+      const before = finalStops
+      const sent = await E.offer(notif, 'tg', Number(g.pid)).catch(e => { E.log('warn', `lanes: resume offer failed: ${e}`); return false })
+      if (sent) {
+        // Hooks may already have refused this turn, replaced its gen, or finished it. Count every write
+        // on the agent's latest gen. Only a still-open interval between final Stops needs the guard.
+        const now = J().lastMain ?? g
+        const fields = { resumes: (now.resumes ?? 0) + 1, ...(before === finalStops ? { cut_turn: cut, resume_sent: cut.at } : {}) }
+        if (probe && now === g && now.version === version) advanceProbe(now, fields)
+        else J().write('main', now.id, now.state, fields)
       }
     }
     // With no keeper, an attempted PL4 probe uses its retry slot even if every stream was down.
@@ -663,7 +673,7 @@ export function createMain(E: MainEnv) {
       capped.push(r)
     }
     const held = holdCut(hold, why, outBy)
-    if (held.length || capped.length) E.log('info', `lanes: ${why} of gen ${g.id}: ${held.length} item(s) the model had answered held as an interrupted turn's (they ride the next delivery), ${capped.length} cut twice with no output (closed), ${back.length} queued again`)
+    if (held.length || capped.length) E.log('info', `lanes: ${why} of gen ${g.id}: ${itemCount(held)} item(s) the model had answered held as an interrupted turn's (they ride the next delivery), ${itemCount(capped)} cut twice with no output (closed), ${itemCount(back)} queued again`)
     return { back, held, capped }
   }
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
@@ -684,8 +694,9 @@ export function createMain(E: MainEnv) {
    *  stop_failure_gave_up) and Joey is told which. An item offered and never bound was not in the turn: queued again as before. The gen is idle, as before */
   function failTurn(g: Row, p: string, err: string): void {
     const now = Date.now()
+    const rs = unsettled(g, p)
     const parked: Row[] = [], closed: Row[] = [], hold: Row[] = [], outBy = new Map<string, string>()
-    for (const r of items(x => (x.state === 'offered' || x.state === 'bound') && x.gen === g.id && (!p || x.prompt_id === p))) {
+    for (const r of rs) {
       const back = { gen: null, prompt_id: null, via_pull: null }
       if (r.state !== 'bound') { J().write('msg', r.id, 'queued', { reason: `stop_failure:${err}`, ...back }); continue }
       const out = outputOf(g, r)
@@ -697,9 +708,9 @@ export function createMain(E: MainEnv) {
       else { closeItem(r, { reason: 'stop_failure_gave_up', fails, gen: null }); closed.push(r) }
     }
     const held = holdCut(hold, `stop_failure:${err}`, outBy)
-    setMain(J().get('main', g.id)!, 'idle', { error: err, prompt_id: null, tool_open: null, stopped_prompt: null })   // not a wall: idle; other items go as usual
+    setMain(g, 'idle', { error: err, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: bareCut(g, rs, err, now) })
     const waiting = items(r => r.state === 'queued' && typeof r.reason === 'string' && r.reason === `stop_failure:${err}` && Number(r.fail_retry_at ?? 0) > now)
-    E.log('info', `lanes: main gen ${g.id}: turn ${p || '(none)'} ended in StopFailure ${err}: ${waiting.length} item(s) wait ${Math.round(backoff(err, 0) / 1000)} s or the next good turn, ${parked.length} parked at the cap (${MAIN_FAIL_MAX}), ${closed.length} closed, ${held.length} the model had answered held as an interrupted turn's`)
+    E.log('info', `lanes: main gen ${g.id}: turn ${p || '(none)'} ended in StopFailure ${err}: ${itemCount(waiting)} item(s) wait ${Math.round(backoff(err, 0) / 1000)} s or the next good turn, ${itemCount(parked)} parked at the cap (${MAIN_FAIL_MAX}), ${itemCount(closed)} closed, ${itemCount(held)} the model had answered held as an interrupted turn's`)
     if (parked.length) {
       const queued = items(r => r.state === 'queued' && owed(r)).length
       const text = `主線疑似卡死：${parked.length} 則訊息交給它 ${MAIN_FAIL_MAX} 次，${MAIN_FAIL_MAX} 次回合都以錯誤結束（${err}），先不再交給它：${parked.filter(r => r.kind !== 'digest').map(r => `「${contentOf(r).replace(/\s+/g, ' ').slice(0, 60)}」`).join('、')}。主線下一次正常結束一個回合，我會再交給它一次。有 ${queued} 則訊息等它。`
@@ -717,6 +728,16 @@ export function createMain(E: MainEnv) {
   }
 
   // ------------------------------------------------------------------ M2 transitions
+  /** Included in the same journal write as the turn end. An undefined field keeps the previous fact. */
+  function bareCut(g: Row, rs: Row[], why: string, at = Date.now()): CutTurn | undefined {
+    if (g.resume_sent != null || itemCount(rs)) return
+    if (why === 'gen_end') {
+      let n: number | null | undefined
+      try { if (g.session_id) n = E.registry?.backgroundAgents(g.session_id) } catch {}
+      return { at, why, ...(n && n > 0 ? { background_agents: n } : {}) }
+    }
+    return ACCOUNT_WALL.has(why) ? { at, why } : { at, why, retry_at: at + backoff(why, 0) }
+  }
   function setMain(g: Row, state: MainPhase, fields: Record<string, unknown> = {}): void { J().write('main', g.id, state, fields) }
   function endGen(g: Row, why: EndReason): void {
     if (g.state === 'gone') return
@@ -725,8 +746,11 @@ export function createMain(E: MainEnv) {
     const cut = why === 'asked' && g.prompt_id ? finish(r => r.gen === g.id && r.prompt_id === g.prompt_id, { reason: 'asked_restart' }) : []
     // WO-201 (inventory L6; Chiron mesh-13184): the end of a process is no reason by itself. What it was given and never took goes to the next gen; what it
     // took and had answered rides the next delivery as an interrupted turn's; what it took and died on before saying anything goes once more (settle)
-    const { back, capped } = settle(g, items(r => (r.state === 'offered' || r.state === 'bound') && r.gen === g.id), 'gen_end')
-    setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null, stopped_prompt: null })
+    const rs = unsettled(g)
+    const cutFact = why !== 'asked' && g.prompt_id && (g.state === 'in_turn' || (g.state === 'walled' && !g.cut_turn))
+      ? bareCut(g, rs.filter(r => !r.prompt_id || r.prompt_id === g.prompt_id), 'gen_end') : undefined
+    const { back, capped } = settle(g, rs, 'gen_end')
+    setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: cutFact })
     if (cur === g.id) cur = null
     pendingEnd.delete(g.id); lastEventAt.delete(g.id); work.delete(g.id)
     if (stuck?.gen === g.id && !stuck.undelivered) stuck = null              // 002w (E): what nobody could take is still waiting: that episode goes on
@@ -885,8 +909,12 @@ export function createMain(E: MainEnv) {
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
         openTools.delete(g.id)
-        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, resume_sent: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
-        if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
+        finalStops++
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, cut_turn: null, resume_sent: null, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
+        if (since) {
+          const n = items(r => queuedForOffer(r, was) && (!heldCut(r) || accountCut(r))).length
+          E.tellJoey(`主線恢復了。這次從 ${hhmmTaipei(Date.parse(since))}（台北）起不能用模型。${n ? `保留的 ${n} 則訊息等著交給它。` : ''}${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')
+        }
         void pump()
         return {}
       }
@@ -897,7 +925,7 @@ export function createMain(E: MainEnv) {
         // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn). The account wall below is unchanged
         if (!ACCOUNT_WALL.has(err)) { if (p) outputs.delete(p); failTurn(g, p, err); return {} }
         const reason = `stop_failure:${err}`
-        const back = items(r => (r.state === 'bound' || r.state === 'offered') && r.gen === g.id && (!p || r.prompt_id === p))
+        const back = unsettled(g, p)
         const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
         for (const r of back) {
           const output = r.state === 'bound' && r.kind !== 'digest' ? outputOf(g, r) : null
@@ -915,8 +943,8 @@ export function createMain(E: MainEnv) {
         // the main's own wall: one episode (wall_since) until its next Stop; each failed probe backs off
         const first = !cur.wall_since, probes = first ? 0 : Number(cur.probes ?? 0) + 1
         setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null, probes,
-          retry_at: Date.now() + backoff(err, probes) })
-        if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
+          cut_turn: bareCut(cur, back, err), retry_at: Date.now() + backoff(err, probes) })
+        if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}
       }
       case 'SessionEnd': {
@@ -963,13 +991,15 @@ export function createMain(E: MainEnv) {
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const since = ended.map(r => String(r.wall_since)).sort()[0]
-    const carry = since ? { wall_since: since, resume_sent: ended.find(r => r.resume_sent === since)?.resume_sent ?? null, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
+    const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
+    const previous = same ?? J().lastMain
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, probes: null, retry_at: null, wall_menu: null })
     // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
     // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)
     const carried = ['startup', 'clear', 'compact'].includes(String(b.source ?? ''))
     J().write('main', id, goesOn ? 'in_turn' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
-      source: b.source ?? null, ...(goesOn ? {} : { prompt_id: null, tool_open: null, stopped_prompt: null }), end_reason: null, rules_shown: carried ? sid : null, ...carry })
+      source: b.source ?? null, ...(goesOn ? {} : { prompt_id: null, tool_open: null, stopped_prompt: null }), end_reason: null, rules_shown: carried ? sid : null, ...carry,
+      cut_turn: previous?.cut_turn ?? null, resume_sent: previous?.resume_sent ?? null, resumes: previous?.resumes ?? 0 })
     cur = id
     registryGap = null
     lastEventAt.set(id, Date.now())

@@ -19,6 +19,8 @@ export type Row = { ts: string; rec: RecKind; id: string; state: string; created
 
 export class Journal {
   readonly t: Record<Table, Map<string, Row>> = { msg: new Map(), main: new Map(), event: new Map(), run: new Map() }
+  /** Last registered gen, including after it ended. Map insertion order is not registration order when a pid is reused. */
+  lastMain: Row | null = null
   private n = 0
   /** Onsen step 3 (WO-143): read-only observers of each write (the folded row after it, and the line as written); not called by load(). Never throw into a write. */
   private observers: Array<(row: Row, line: Record<string, unknown>) => void> = []
@@ -60,6 +62,7 @@ export class Journal {
     let row = tab.get(line.id)
     if (!row) { row = { created: line.ts, n: ++this.n, version: 0 } as Row; tab.set(line.id, row) }
     for (const [k, v] of Object.entries(line)) { if (k === 'version') continue; if (v === null) delete row[k]; else row[k] = v }
+    if (line.rec === 'main' && line.pid != null) this.lastMain = row
     row.version++
     return row
   }
