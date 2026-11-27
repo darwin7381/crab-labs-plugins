@@ -245,11 +245,12 @@ export function createMain(E: MainEnv) {
   function wallDelivery(g = currentGen()) {
     const wall = E.usageWall?.(Date.parse(String(g?.wall_since ?? '')) || 0)
     const refused = Number(g?.wall_refused_at ?? 0)
-    const clear = !wall?.walled && wall?.clearedMs != null && wall.clearedMs >= refused ? wall.clearedMs : null
+    const observed = g?.wall_clear_at as number | null | undefined
+    const clear = wall?.walled ? null : wall?.clearedMs != null && wall.clearedMs >= refused ? wall.clearedMs : observed ?? null
     const active = !!wall?.walled || (g?.state === 'walled' && clear == null) || member() === 'walled'
     const last = Math.max(wall?.lastWallMs ?? 0, refused)
     // If the keeper is absent, M2 retains its existing account probe. A keeper clear authorizes one offer.
-    const probe = g?.state === 'walled' && !wall?.walled && (Date.now() >= Number(g.retry_at ?? Infinity) || (clear ?? 0) > Number(g.uw_clear_used ?? 0))
+    const probe = g?.state === 'walled' && !wall?.walled && ((!wall && Date.now() >= Number(g.retry_at ?? Infinity)) || (clear ?? 0) > Number(g.uw_clear_used ?? 0))
     return { active, person: active && personCanProbe(last || null), clear, probe }
   }
   /** An item already refused or interrupted by this wall waits for the clear. */
@@ -271,7 +272,16 @@ export function createMain(E: MainEnv) {
   }
   /** WO-177 一: the status record changed (lanes.ts mainStatusChanged, at each record server.ts hands out whose member state or interruption differs): an
    *  item held while the main could not take it is offered at that moment, not at the next tick */
-  function statusChanged(): void { const g = currentGen(); if (g) canTake(g); void pump() }
+  function statusChanged(clearedMs?: number | null): void {
+    const g = currentGen()
+    // The keeper timestamps a clear to whole seconds. Preserve an observed transition even when
+    // the local refusal has milliseconds in that same second, and after the keeper file ages out.
+    if (g?.state === 'walled' && clearedMs != null && clearedMs >= Math.floor(Number(g.wall_refused_at ?? 0) / 1000) * 1000) {
+      J().write('main', g.id, 'walled', { wall_clear_at: clearedMs })
+    }
+    if (g) canTake(g)
+    void pump()
+  }
 
   // ------------------------------------------------------------------ M1
   let didSeq = 0
@@ -836,7 +846,7 @@ export function createMain(E: MainEnv) {
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
         openTools.delete(g.id)
-        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, wall_refused_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
         if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
         void pump()
         return {}
@@ -865,7 +875,7 @@ export function createMain(E: MainEnv) {
         const cur = J().get('main', g.id)!
         // the main's own wall: one episode (wall_since) until its next Stop; each failed probe backs off
         const first = !cur.wall_since, probes = first ? 0 : Number(cur.probes ?? 0) + 1
-        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), probes,
+        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null, probes,
           retry_at: Date.now() + backoff(err, probes) })
         if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}

@@ -638,7 +638,7 @@ export class OnsenClient {
     if (!call.conversation_id) return 'wait'
     const r = await this.request('POST', `/v1/conversations/${encodeURIComponent(call.conversation_id)}/messages`, {
       type: 'system', body: { format: 'markdown', text }, to: call.caller ? [call.caller] : [],
-      thread_ids: call.thread_id ? [call.thread_id] : [], call_id: id, client_message_id: key,
+      thread_ids: call.thread_id ? [call.thread_id] : [], client_message_id: key,
     })
     return r && r.status >= 200 && r.status < 300 ? { final: call.state } : 'wait'
   }

@@ -93,7 +93,7 @@ import * as Connector from './onsen-connector.ts'
 import type { RoamerTelegram, RoamerHost } from './roamer-telegram.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
-import { HeldSidecar, WallAlerts, WallReader, wallAte, personCanProbe, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
+import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
@@ -1096,12 +1096,6 @@ const PENDING_DIR = join(STATE_DIR, 'inbox', 'pending')
 const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
 mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 let persistSeq = 0
-// Only the person_message entrance supplies these ids. Keep them with a disk copy, outside the channel tag.
-const pendingPerson = new WeakMap<object, { ids: string[]; refused?: boolean }>()
-function waitsForWall(notif: object): boolean {
-  const wall = wallReader.state(), person = pendingPerson.get(notif)
-  return !!wall?.walled && (!person || !!person.refused || !personCanProbe(wall.lastWallMs))
-}
 
 // atMs (WO-120): name the file by this time instead of now, so the drain (sorted by name) keeps the original order.
 function persistInbound(notif: { method: string; params: unknown }, atMs?: number): string | null {
@@ -1111,7 +1105,7 @@ function persistInbound(notif: { method: string; params: unknown }, atMs?: numbe
     const filename = `${ts}-${seq}.json`
     const tmpPath = join(PENDING_DIR, filename + '.tmp')
     const finalPath = join(PENDING_DIR, filename)
-    writeFileSync(tmpPath, JSON.stringify({ ...notif, person_delivery: pendingPerson.get(notif) }), { mode: 0o600 })
+    writeFileSync(tmpPath, JSON.stringify(notif), { mode: 0o600 })
     renameSync(tmpPath, finalPath)  // atomic on POSIX
     return finalPath
   } catch (err) {
@@ -1353,23 +1347,7 @@ function sweepDeliveries(): void {
     // WO-120: a delivery the usage wall ate (made before the state flipped, no genuine answer before the wall began) is
     // re-persisted once, named by its own time so the drain keeps the order, and that push is not counted toward
     // MAX_REDELIVERIES (never quarantined). The drain delivers it after the clear and tracks that copy from there.
-    const person = pendingPerson.get(d.notif)
-    const refused = !person || ((wall?.lastWallMs ?? wall?.sinceMs ?? 0) >= d.at && newest <= d.at)
-    if (refused && wallAte(wall, d.at, newest, now)) {
-      if (person) {
-        person.refused = true
-        if (!notReceived) {
-          for (const id of person.ids) onsen?.recordBlocked({ message_id: id, retry_after: wall?.resets_at ?? null })
-        }
-        if (d.pendingPath) {
-          // Replace the earlier unconsumed copy with one held until clear, retaining its place in the drain.
-          const tmp = d.pendingPath + '.wall.tmp'
-          try {
-            writeFileSync(tmp, JSON.stringify({ ...d.notif, person_delivery: person }), { mode: 0o600 })
-            renameSync(tmp, d.pendingPath)
-          } catch { d.pendingPath = null }
-        }
-      }
+    if (wallAte(wall, d.at, newest, now)) {
       if (!d.pendingPath) {
         const k = deliveryKey(d.notif)
         deliveryAttempts.set(k, Math.max(0, (deliveryAttempts.get(k) ?? 1) - 1))
@@ -1439,7 +1417,7 @@ function sweepDeliveries(): void {
  *  dispatchInbound (routeEvent, and the main through the one builder if the router throws); anything else as a mesh event */
 async function laneRedeliver(notif: { method: string; params: unknown }): Promise<boolean> {
   const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
-  if (!INBOX_ONLY && meta.via !== 'local-inject') { await dispatchInbound(String(meta.chat_id ?? loadAccess().allowFrom[0] ?? ''), notif, undefined, pendingPerson.get(notif)?.ids); return true }
+  if (!INBOX_ONLY && meta.via !== 'local-inject') { await dispatchInbound(String(meta.chat_id ?? loadAccess().allowFrom[0] ?? ''), notif); return true }
   return (await laneDeliverMesh(notif, undefined, false)) != null
 }
 let replayRunning = false
@@ -1450,6 +1428,7 @@ const REPLAY_LOCK_MS = 60_000
 let replayBusySince = 0
 async function replayPendingFromDisk(server: Server): Promise<number> {
   if (!Lanes.LANES_ON) {
+    if (wallReader.walled()) return 0
     if (Date.now() - replayBusySince < REPLAY_LOCK_MS) return 0
     replayBusySince = Date.now()
     try { return await replayPendingFromDiskLocked(server) } finally { replayBusySince = 0 }
@@ -1484,16 +1463,13 @@ async function replayPendingFromDiskLocked(server: Server): Promise<number> {
     const fullPath = join(PENDING_DIR, file)
     let notif: { method: string; params: unknown }
     try {
-      const { person_delivery, ...saved } = JSON.parse(readFileSync(fullPath, 'utf8'))
-      notif = saved
-      if (Array.isArray(person_delivery?.ids) && person_delivery.ids.length) pendingPerson.set(notif, person_delivery)
+      notif = JSON.parse(readFileSync(fullPath, 'utf8'))
     } catch (err) {
       log('warn', `pending unreadable, removing: ${file}: ${err}`)
       try { rmSync(fullPath) } catch {}
       continue
     }
     try {
-      if (!Lanes.LANES_ON && waitsForWall(notif)) continue
       if (Lanes.LANES_ON) {
         // lanes-golive (C3): a parked delivery goes back through the one entrance (the router), never straight into whichever session is open
         if (!(await laneRedeliver(notif))) break
@@ -1501,7 +1477,7 @@ async function replayPendingFromDiskLocked(server: Server): Promise<number> {
         await server.notification(notif as Parameters<Server['notification']>[0])
         recordDelivery(notif)
       }
-      try { rmSync(fullPath); wallHeldKeys.delete(heldKey(notif)) } catch {}
+      try { rmSync(fullPath) } catch {}
       replayed++
     } catch (err) {
       log('warn', `disk-replay failed for ${file}: ${err} — keeping for retry`)
@@ -3231,10 +3207,7 @@ function replaceQueuedEdit(chat: string, id: string, rw: (p: OnsenEdit.Params) =
   const rewrite = (notif: { method: string; params: unknown }): { method: string; params: unknown } => {
     const p = (notif.params ?? {}) as Record<string, any>
     const nw = rw({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })
-    const updated = { ...notif, params: { ...p, content: nw.content, meta: nw.meta } }
-    const person = pendingPerson.get(notif)
-    if (person) pendingPerson.set(updated, person)
-    return updated
+    return { method: notif.method, params: { ...p, content: nw.content, meta: nw.meta } }
   }
   if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.replaceQueuedMain(chat, id, rw)) n++
   const pushed = (notif: unknown): boolean => recentDeliveries.some(d => d.notif === notif)
@@ -3562,7 +3535,6 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
 let editEventSeq = 0
 /** `routeTopic` (WO-197 segment 2): the topic the router and the lanes know the message by, when it is not the tag's (a connector: Onsen's thread) */
 async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }, routeTopic?: string, personIds?: string[]): Promise<void> {
-  if (personIds?.length) pendingPerson.set(notification, { ids: personIds })
   // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
   // everything else → the registered main only). Never a broadcast.
   if (Lanes.LANES_ON) {
@@ -3823,7 +3795,7 @@ function stampDid(notif: { method: string; params: unknown }): void {
 function broadcastNotification(notif: { method: string; params: unknown }): void {
   // WO-120: inside a usage wall nothing is written into the session: park it (no re-delivery attempt is counted); the
   // drain after the clear delivers it once, in order. With lanes on this is the fallback path (no router could be asked), so the hold stays here.
-  if (waitsForWall(notif)) {
+  if (wallReader.walled()) {
     if (holdForWall(notif)) heldSidecar.update(wallReader.state())
     return
   }
@@ -5496,10 +5468,13 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         if (boundServer && sseOpen.get(sessionId)) {    // closed during the wait → leave it all parked
           const queued = memQueue.get(sessionId) ?? []
           memQueue.delete(sessionId)                    // take ownership before the first await
-          if (queued.length > 0) {
+          if (queued.length > 0 && wallReader.walled()) {
+            // WO-120: inside a usage wall they park on disk instead; the drain after the clear delivers them
+            for (const notif of queued) holdForWall(notif)
+            log('info', `usage wall: ${queued.length} mem-queued notif(s) for session ${sessionId} parked in inbox/pending until the wall clears`)
+          } else if (queued.length > 0) {
             log('info', `flushing ${queued.length} mem-queued notif(s) for session ${sessionId}`)
             for (const notif of queued) {
-              if (waitsForWall(notif)) { holdForWall(notif); continue }
               try {
                 await boundServer.notification(notif as Parameters<Server['notification']>[0])
                 recordDelivery(notif)

@@ -81,6 +81,31 @@ test('WO-200 (c) program waits through a human probe and is offered once on clea
   expect(d.offers).toEqual([[person], [call]])
 })
 
+test('WO-200 M2 timer holds a program with a fresh wall and probes once without keeper state', async () => {
+  const d = daemon()
+  d.calls.set('9', 'accepted')
+  const item = d.add('peer', '9')
+  setSystemTime(T + 3_600_001)
+  await d.main.tick(); await d.flush()
+  expect(d.offers).toEqual([])
+  d.env.usageWall = () => null
+  await d.main.tick(); await d.flush(); await d.main.tick()
+  expect(d.offers).toEqual([[item]])
+})
+
+test('WO-200 a keeper clear in the same second releases a refused message', async () => {
+  const d = daemon(), item = d.add('joey', '108')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'p', { dids: [item] })
+  setSystemTime(T + 123)
+  await d.hook('StopFailure', 'p', { error: 'rate_limit' })
+  d.wall.walled = false
+  d.wall.clearedMs = T
+  d.main.statusChanged(T)
+  await d.flush()
+  expect(d.offers).toEqual([[item], [item]])
+})
+
 test('WO-200 (d) two refusals write blocked receipts and replay in order once', async () => {
   const d = daemon(), ids: string[] = []
   for (const n of ['101', '102']) {

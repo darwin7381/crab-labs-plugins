@@ -3935,7 +3935,7 @@ function followUsageWall(why: 'probe' | 'clear', u: { walled: boolean; clearedMs
 export function usageWallChanged(state: { walled: boolean; clearedMs: number | null; by: string | null } | null): void {
   if (D?.role !== 'tg') return
   if (S?.wall) { try { followUsageWall('clear', state) } catch (e) { D.log('warn', `lanes: following the usage wall: ${e}`) } }
-  if (main) { try { main.statusChanged() } catch (e) { D.log('warn', `lanes: the usage wall's clear to M1: ${e}`) } }
+  if (main) { try { main.statusChanged(state?.walled === false ? state.clearedMs : null) } catch (e) { D.log('warn', `lanes: the usage wall's clear to M1: ${e}`) } }
 }
 async function wallDown(by: string): Promise<void> {
   const w = S.wall
