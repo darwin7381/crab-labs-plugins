@@ -269,7 +269,8 @@ plugins/telegram-http/server.ts::observe: paneObserved,
 plugins/telegram-http/server.ts::const carried = !!picker && permissionCarried(picker)
 plugins/telegram-http/server.ts::is the permission prompt: its own Action carries it, no second one${!tg ? ', nothing to Telegram' : ''}
 plugins/telegram-http/server.ts::if (pa) { await applyPickerControl(pa, h, c); return }
-plugins/telegram-http/server.ts::try { res = await driveStartupPicker(pa.tmux, idx, pa.key) } finally { pa.ended = true; pa.pressing = false }
+plugins/telegram-http/server.ts::try { res = await driveStartupPicker(pa.tmux, idx, pa.key, ownLookFor(pa.tmux)) }
+plugins/telegram-http/server.ts::finally { pa.ended = true; pa.pressing = false }
 plugins/telegram-http/server.ts::for (const p of openMainPrompts()) if (p.opened + PERM_DRAW_GRACE_MS <= sinceBoth) permOffScreen(p,
 plugins/telegram-http/server.ts::if (open.some(p => p.opened > was.since)) for (const p of open) if (p.opened <= was.since) permOffScreen(p,
 plugins/telegram-http/server.ts::(tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')
