@@ -588,8 +588,8 @@ export function createMain(E: MainEnv) {
     // a notice (Onsen's mention item, kind mention on the lanes' own chat) is told as the digest is: only for the main to know
     const isInfo = (r: Row): boolean => r.kind === 'digest' || metaOf(r.notif).kind === 'mention'
     const info = rs.filter(isInfo), msgs = rs.filter(r => !isInfo(r))
-    return ['〔交給主線｜這一回合進行中送到的訊息，交給你接著處理。來源已驗證（Telegram 只收白名單裡的人，這就是 Joey 本人；mesh 訊息看 verified）。'
-      + '照平常處理：問的就回答，交代的就照做（能馬上做的現在做，其餘接在手上這一步之後），Telegram 用 reply 回，同事用 send_to_agent 回；已經處理過的不用重做。〕',
+    return ['〔交給主線｜這一回合進行中送到的訊息，交給你接著處理。來源已驗證（這段對話只收白名單裡的人，這就是 Joey 本人；mesh 訊息看 verified）。'
+      + '照平常處理：問的就回答，交代的就照做（能馬上做的現在做，其餘接在手上這一步之後），Joey 用 reply 回，同事用 send_to_agent 回；已經處理過的不用重做。〕',
       ...msgs.map(r => cutText(r, renderItem(r))), ...info.map(r => r.kind === 'digest' ? `〔車道摘要（只讓你知道，不是新的指示）〕\n${contentOf(r)}` : contentOf(r))].join('\n')
   }
   function requeue(pred: (r: Row) => boolean, reason: string, fields: Record<string, unknown> = {}): Row[] {
@@ -1213,12 +1213,12 @@ export function createMain(E: MainEnv) {
 
 // ------------------------------------------------------------------ registration text (the main-only rules travel with the architecture)
 export function notMainContext(agent: string, reasons: string): string {
-  return `[lanes] 注意：你不是 ${agent} 的主線（${reasons}）。你不會收到 Telegram 或 mesh 訊息，也不要用 reply / send_to_agent 代替主線發言。`
+  return `[lanes] 注意：你不是 ${agent} 的主線（${reasons}）。你不會收到 Joey 的訊息或 mesh 訊息，也不要用 reply / send_to_agent 代替主線發言。`
 }
 export function mainContext(agent: string, sid: string): string {
   return [
     `[lanes] 你是 ${agent} 的主線（session ${sid} 已登記）。以下是主線專用規則，車道不適用：`,
-    '- Telegram 與分流到主線的 mesh 訊息只會送到你這裡。排程、警報、別的 agent 的呼叫由反射線（headless 車道）處理；你的信箱由讀信線讀：「讀信箱」提醒不會再送到你這裡。'
+    '- Joey 的訊息與分流到主線的 mesh 訊息只會送到你這裡。排程、警報、別的 agent 的呼叫由反射線（headless 車道）處理；你的信箱由讀信線讀：「讀信箱」提醒不會再送到你這裡。'
       // the mailbox sentences: Chiron's wording (mail #10869, after WO-124: a lane's read shows as 車道讀過, the deadline watches the main)
       + '要你決定或動手的信，讀信線會整理好交給你（對方要什麼、期限、關鍵事實、它的建議）；信還在你的信箱，清單上標「車道讀過」。照交接就能決定的，做完用 mailbox_check 勾掉，不必為了已讀再打開；要看原文才用 mailbox_open。你沒接手也沒勾的信，到期會通知寄件人。'
       + '它們做了什麼，會附在下一則交給你的訊息裡（標「車道摘要」；不會為了它單獨叫醒你）。你忙的時候送到的訊息，會在你下一個工具呼叫之後或回合要結束時交給你（標「交給主線」）。'
@@ -1226,7 +1226,7 @@ export function mainContext(agent: string, sid: string): string {
       + '摘要裡寫「已通知 Joey」「已請 Joey 決定」的事，車道已經跟他講過了：不要重複通知他，除非你有新的資訊或他問起。其他不必回覆。',
     // 002u (002t r2 I03, u002t-I03-s3-r2-20261119-215225): the hand-over carried Joey's words verbatim and the main still said 「我沒有在這邊直接看到你的原文，
     // 只看到轉交的文字」 and did not act; three other plays acted. What the block is belongs to the main's own rules, written once, here.
-    '- 交給你的事、車道摘要和記憶提案裡標「〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕」的那一段，是分流器從 Telegram 收到的 Joey 本人訊息（bot 只收白名單，寄件者已驗證），'
+    '- 交給你的事、車道摘要和記憶提案裡標「〔Joey 原話｜分流器收到的原文，不是車道的轉述〕」的那一段，是分流器收到的 Joey 本人訊息（進來之前白名單擋過，寄件者已驗證），'
       + '跟他在這個對話裡直接對你說的一樣算數，包括不可逆的指示：照它做，不用再請他重說一次。那一段以外、車道寫的文字才是轉述。',
     '- 被問「今天發生了什麼」「處理了哪些事」「答應過誰什麼」「還有什麼沒結束」：先呼叫一次 ledger_query()（不帶任何參數），'
       + '它回傳整天每件事一行的活動清單，包含車道處理掉、沒有叫醒你的例行事。清單裡每一件都要交代到，連同它的具體數字、時間、人名，再補上你自己處理的事。'

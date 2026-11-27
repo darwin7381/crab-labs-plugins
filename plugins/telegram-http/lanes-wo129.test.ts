@@ -255,7 +255,7 @@ test('WO-129 #5: steps not done: the run\'s notify_joey ends with 〔系統〕�
 test('WO-129 #5 (words), verbatim: the identity card\'s receipt line and the persona line', () => {
   const card = L.identityCard({ kind: 'reflex' }).split('\n')
   expect(card).toContain('  - receipt(run_id, outcome, steps)：例行排程的執行回執（outcome=nothing-to-do｜done｜failed）。steps 必填：指示裡的每一步照順序列一項（step＝那一步是什麼，done＝true｜false，note＝發生了什麼或為什麼沒做）。條件沒成立所以不用做的步驟算做了（done=true，note 寫條件沒成立）。指示只有一件事就列一項。')
-  const persona = card.find(l => l.startsWith('- 人格檔裡「用 Telegram reply 回報 Joey」'))!
+  const persona = card.find(l => l.startsWith('- 人格檔裡「用 reply 回報 Joey」（或「在 Telegram 回報 Joey」）'))!
   expect(persona).toContain('排程回執用 receipt(run_id, outcome, steps)；人格檔或排程訊息裡寫的 btcc-receipt complete，對你來說就是 receipt 工具（開工的 btcc-receipt ack 照舊）。人格檔中標示「主線專用」的規則不適用於你。')
   expect(persona).not.toContain('也會經由分流器完成同一個回執')
 })
