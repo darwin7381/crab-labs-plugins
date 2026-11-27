@@ -78,7 +78,7 @@ test('002n, PL4: a turn that ends in StopFailure never makes its item done: back
   await kill(g)
 })
 
-test('002n T6/T8, 002m L6G1/L6T1, 002g: the main killed five times inside the turn that took the message: every new gen gets it again; done exactly once; no 疑似卡死, nothing quarantined', async () => {
+test('002n T6/T8, 002m L6G1/L6T1, 002g: the main killed five times inside the turn that took the message: every new gen gets it again; done exactly once; no 疑似卡死, nothing quarantined. WO-201: these mains name no transcript, so whether the item was received cannot be told: as before (the known cases, received or cut twice: lanes-wo201.test.ts)', async () => {
   const id = await joey('幫我查 mock-api 的錯誤率')
   for (let i = 0; i < 5; i++) {
     const g = await startMain()
@@ -97,7 +97,7 @@ test('002n T6/T8, 002m L6G1/L6T1, 002g: the main killed five times inside the tu
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
   expect(state(id)).toBe('done')
   expect(linesOf('msg', id).filter(l => l.state === 'done').length).toBe(1)
-  expect(linesOf('msg', id).filter(l => l.state === 'offered').length).toBe(6)            // re-offer per gen IS the design; there is no cap
+  expect(linesOf('msg', id).filter(l => l.state === 'offered').length).toBe(6)            // cannot tell (no transcript): re-offered per gen as before; WO-201's cap needs the fact
   expect(sent.some(s => s.includes('疑似卡死'))).toBe(false)
   expect(existsSync(join(dir, 'inbox', 'undeliverable'))).toBe(false)
   await kill(g)
