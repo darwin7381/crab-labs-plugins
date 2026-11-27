@@ -174,6 +174,26 @@ async function until(cond: () => boolean, ms = 10_000, what = 'condition'): Prom
 }
 const done = (o: FakeOnsen, id: string) => () => ['completed', 'failed'].includes(o.calls.get(id)?.state ?? '')
 
+describe('the model is the runner\'s own (Chiron mesh 13227)', () => {
+  test('CODEX_RUNNER_MODEL / _EFFORT: every run gets -m and the effort; --setup writes them, never the personal config\'s model', async () => {
+    const env = { HOME: '/tmp/x', CODEX_RUNNER_MODEL: 'gpt-6.2-astra', CODEX_RUNNER_EFFORT: 'high' }
+    const c = configFromEnv(env)
+    expect(c.model).toBe('gpt-6.2-astra'); expect(c.effort).toBe('high')
+    expect(configFromEnv({ HOME: '/tmp/x', CODEX_RUNNER_MODEL: 'bad model; rm', CODEX_RUNNER_EFFORT: 'max' }).model).toBeNull()
+    expect(cleanConfig('model = "personal-one"\nmodel_reasoning_effort = "low"\n', { model: 'gpt-6.2-astra', effort: 'high' }))
+      .toContain('model = "gpt-6.2-astra"\nmodel_reasoning_effort = "high"')
+    expect(cleanConfig('model = "kept"\n')).toContain('model = "kept"')        // no own setting: this home's own line stays
+    const { onsen, cfg, codexLog } = setup({ model: 'gpt-6.2-astra', effort: 'high' })
+    onsen.call('9950', 'chiron', 9950)
+    onsen.push({ sender: 'chiron', payload: { text: '做一件事', msg_id: 9950 }, dedupe: 'msg:9950', call_id: '9950' })
+    const r = runner(cfg)
+    await r.start()
+    await until(done(onsen, '9950'), 10_000, 'Call 9950')
+    const args = (codexLog().find(x => x.ev === 'start' || x.argv)?.argv ?? codexLog()[0]?.argv ?? []) as string[]
+    expect(args.join(' ')).toContain('-m gpt-6.2-astra -c model_reasoning_effort="high"')
+  }, 30_000)
+})
+
 describe('a long answer (Chiron mesh 13227: over 4000, the Call never completed and the caller got nothing)', () => {
   for (const n of [5000, 15000]) test(`${n} characters: the Call completes with a body within 4000, the whole answer attached; the reply goes back`, async () => {
     const { onsen, cfg } = setup()
@@ -487,7 +507,7 @@ describe('Codex\'s own home (Chiron 08:49Z note 2)', () => {
     expect(codexLog()).toEqual([])
   })
 
-  test('--setup: a config with none of the personal setup but its model, the login linked (never copied), the sessions carried over', () => {
+  test('--setup: a config with none of the personal setup, the model the runner\'s own (never the personal one), the login linked (never copied), the sessions carried over', () => {
     const d = mkdtempSync(join(tmpdir(), 'codex-runner-setup-'))
     tmps.push(d)
     const personal = join(d, 'personal')
@@ -497,14 +517,15 @@ describe('Codex\'s own home (Chiron 08:49Z note 2)', () => {
     writeFileSync(join(personal, 'auth.json'), '{"tokens": "SECRET-NOT-PRINTED"}', { mode: 0o600 })
     writeFileSync(join(personal, 'sessions', '2026', '11', '26', 'rollout-2026-11-26T08-00-00-sess-aaa.jsonl'), '{"a":1}\n')
     writeFileSync(join(personal, 'sessions', '2026', '11', '26', 'rollout-2026-11-26T08-00-00-sess-zzz.jsonl'), '{"z":1}\n')
-    const cfg: Cfg = { ...configFromEnv({ HOME: d, CODEX_RUNNER_AUTH_FROM: personal }) }
+    const cfg: Cfg = { ...configFromEnv({ HOME: d, CODEX_RUNNER_AUTH_FROM: personal, CODEX_RUNNER_MODEL: 'gpt-6.2-astra', CODEX_RUNNER_EFFORT: 'high' }) }
     mkdirSync(cfg.stateDir, { recursive: true })
     writeFileSync(join(cfg.stateDir, 'state.json'), JSON.stringify({ v: 1, sessions: { 't:codex#t-1': { session_id: 'sess-aaa' } } }))
     const out = setupCodexHome(cfg)
     expect(out.join('\n')).not.toContain('SECRET')
     const conf = readFileSync(join(cfg.codexHome!, 'config.toml'), 'utf8')
-    expect(conf).toContain('model = "gpt-6.1-sol"')
-    expect(conf).toContain('model_reasoning_effort = "medium"')
+    expect(conf).toContain('model = "gpt-6.2-astra"')
+    expect(conf).toContain('model_reasoning_effort = "high"')
+    expect(conf).not.toContain('gpt-6.1-sol')                                 // the personal config's model is never copied (Chiron mesh 13227)
     for (const no of ['mcp_servers', 'context7', 'personality', 'notify', 'node']) expect(conf).not.toContain(no)
     for (const yes of ['plugins = false', 'apps = false', 'hooks = false', 'memories = false', '[skills.bundled]', 'enabled = false', 'image_generation = true']) expect(conf).toContain(yes)
     expect(lstatSync(join(cfg.codexHome!, 'auth.json')).isSymbolicLink()).toBe(true)

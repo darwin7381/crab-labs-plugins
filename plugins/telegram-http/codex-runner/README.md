@@ -112,6 +112,7 @@ bun codex-runner.ts --profile       # once: display name Codex, role 外部模�
 | `CODEX_RUNNER_TIMEOUT_S` | `1800` | a run's limit; `CODEX_RUNNER_KILL_GRACE_S` (10) between SIGTERM and SIGKILL |
 | `CODEX_BIN` | `codex` | the plist gives the Homebrew path |
 | `CODEX_RUNNER_SANDBOX` | `workspace-write` | `-s` |
+| `CODEX_RUNNER_MODEL`, `CODEX_RUNNER_EFFORT` | unset | the runner's own model and reasoning effort (`minimal`…`xhigh`): every run gets `-m <model> -c model_reasoning_effort="<effort>"`, and `--setup` writes them into Codex's own `config.toml`. Never the personal `~/.codex/config.toml`'s (Chiron mesh 13227). Unset: Codex's own home's config decides |
 | `CODEX_RUNNER_AGENT` | `codex` | the member name (must be the credential's identity) |
 | `CODEX_RUNNER_WAIT_S` | `25` | the long polls |
 | `CODEX_RUNNER_CODEX_HOME` | `<root>/.codex-home` | Codex's own home (`CODEX_HOME` for the child); `inherit`: the inherited one |

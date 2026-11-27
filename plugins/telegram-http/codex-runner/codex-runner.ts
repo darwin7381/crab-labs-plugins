@@ -71,6 +71,9 @@ export type Cfg = {
   codexHome: string | null; childHome: string | null
   /** --setup: the personal Codex home whose login (auth.json) is linked */
   authFrom: string
+  /** the runner's own model and reasoning effort (CODEX_RUNNER_MODEL / CODEX_RUNNER_EFFORT), given to every run; null: Codex's own home's
+   *  config.toml decides. Never the personal config's (Chiron mesh 13227; Joey TG chiron:2884 「開發任務你多分一些給 codex 的頂級模型」) */
+  model: string | null; effort: string | null
   log?: (level: 'info' | 'warn' | 'error', msg: string) => void; now?: () => number; heartbeatMs?: number; declareRetryMs?: number
 }
 const num = (v: string | undefined, d: number): number => { const n = Number(v); return v != null && v.trim() !== '' && Number.isFinite(n) && n > 0 ? n : d }
@@ -89,6 +92,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
     killGraceMs: num(env.CODEX_RUNNER_KILL_GRACE_S, 10) * 1000, waitS: num(env.CODEX_RUNNER_WAIT_S, 25),
     maxFiles: 20, maxFileBytes: 25 * 1024 * 1024, lookupDelayMs: 35_000, retryMs: 15_000, adoptPollMs: 2_000,
     ...codexHomes(env, root), authFrom: env.CODEX_RUNNER_AUTH_FROM || join(home, '.codex'),
+    model: /^[A-Za-z0-9._:-]{1,80}$/.test((env.CODEX_RUNNER_MODEL ?? '').trim()) ? env.CODEX_RUNNER_MODEL!.trim() : null,
+    effort: /^(minimal|low|medium|high|xhigh)$/.test((env.CODEX_RUNNER_EFFORT ?? '').trim()) ? env.CODEX_RUNNER_EFFORT!.trim() : null,
   }
 }
 function codexHomes(env: NodeJS.ProcessEnv, root: string): { codexHome: string | null; childHome: string | null } {
@@ -99,12 +104,16 @@ function codexHomes(env: NodeJS.ProcessEnv, root: string): { codexHome: string |
 }
 
 // ------------------------------------------------------------------ Codex's own home (--setup)
-/** the config.toml of Codex's own home: nothing of the Mac's personal setup but the model it uses */
-export function cleanConfig(personal: string): string {
-  const keep = personal.split('\n').filter(l => /^\s*(model|model_reasoning_effort)\s*=\s*"[^"\n]*"\s*$/.test(l))
+/** the config.toml of Codex's own home: nothing of the Mac's personal setup. Its model: the runner's own (CODEX_RUNNER_MODEL / _EFFORT), else what
+ *  this home's config.toml already says (`current`); never the personal config's (Chiron mesh 13227) */
+export function cleanConfig(current: string, own: { model?: string | null; effort?: string | null } = {}): string {
+  const line = (k: string, v: string | null | undefined): string[] => v ? [`${k} = "${v}"`] : []
+  const keep = own.model || own.effort
+    ? [...line('model', own.model), ...line('model_reasoning_effort', own.effort)]
+    : current.split('\n').filter(l => /^\s*(model|model_reasoning_effort)\s*=\s*"[^"\n]*"\s*$/.test(l)).map(l => l.trim())
   return ['# codex-runner: the Onsen member codex runs with this Codex home, not the Mac\'s personal one (WO-184 part 2, Chiron 08:49Z note 2).',
     '# No MCP servers, no plugins, no apps, no skills, no hooks, no memories, no browser or computer use, no personal instructions (no AGENTS.md).',
-    ...(keep.length ? ['# the model, as the personal config has it', ...keep.map(l => l.trim())] : []),
+    ...(keep.length ? ['# the model: the runner\'s own (CODEX_RUNNER_MODEL / CODEX_RUNNER_EFFORT; every run is also given them), never the personal config\'s', ...keep] : []),
     '', '[features]', 'image_generation = true', 'plugins = false', 'apps = false', 'hooks = false', 'memories = false', 'browser_use = false',
     'computer_use = false', 'in_app_browser = false', '', '[skills.bundled]', 'enabled = false', ''].join('\n')
 }
@@ -116,9 +125,9 @@ export function setupCodexHome(cfg: Cfg, o: { force?: boolean } = {}): string[] 
   for (const d of [cfg.codexHome, cfg.childHome]) mkdirSync(d, { recursive: true, mode: 0o700 })
   const conf = join(cfg.codexHome, 'config.toml')
   if (!existsSync(conf) || o.force) {
-    let personal = ''
-    try { personal = readFileSync(join(cfg.authFrom, 'config.toml'), 'utf8') } catch {}
-    writeFileSync(conf, cleanConfig(personal), { mode: 0o600 })
+    let current = ''
+    try { current = readFileSync(conf, 'utf8') } catch {}
+    writeFileSync(conf, cleanConfig(current, { model: cfg.model, effort: cfg.effort }), { mode: 0o600 })
     out.push(`wrote ${conf}`)
   } else out.push(`kept ${conf} (--force writes it again)`)
   for (const f of ['auth.json', 'auth.lock']) {
@@ -722,7 +731,8 @@ export class CodexRunner {
     // a person's message may have no text (a photo with no caption); one with neither text nor attachments says its kind
     const head = j.text.trim() || (j.source === 'person' && !j.attachments.length ? `（一則沒有文字的 ${j.kind ?? 'text'} 訊息）` : '（只有附件）')
     const text = [head, ...(j.context?.length ? ['', ...j.context] : []), ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
-    return ['exec', '--skip-git-repo-check', '-s', this.cfg.sandbox, '-C', j.dir!, ...(j.resumed ? ['resume', j.resumed] : []), ...out, ...imgs, '--', text]
+    const model = [...(this.cfg.model ? ['-m', this.cfg.model] : []), ...(this.cfg.effort ? ['-c', `model_reasoning_effort="${this.cfg.effort}"`] : [])]
+    return ['exec', '--skip-git-repo-check', '-s', this.cfg.sandbox, '-C', j.dir!, ...model, ...(j.resumed ? ['resume', j.resumed] : []), ...out, ...imgs, '--', text]
   }
   /** the child's environment: the runner's, without its own settings (CODEX_RUNNER_*, ONSEN_*), with Codex's own home and HOME */
   childEnv(): NodeJS.ProcessEnv {

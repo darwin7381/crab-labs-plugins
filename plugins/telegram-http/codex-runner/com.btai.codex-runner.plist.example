@@ -29,6 +29,10 @@
 		<string>__HOME__/onsen-codex</string>
 		<key>CODEX_RUNNER_MAX</key>
 		<string>3</string>
+		<key>CODEX_RUNNER_MODEL</key>
+		<string>gpt-6.2-astra</string>
+		<key>CODEX_RUNNER_EFFORT</key>
+		<string>high</string>
 		<key>CODEX_RUNNER_TIMEOUT_S</key>
 		<string>1800</string>
 		<key>CODEX_BIN</key>
