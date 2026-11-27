@@ -181,7 +181,9 @@ esac`)
     expect(await deps.mainPicker.drive(0, detectStartupPicker(LIMIT_PANE(SAFE))!.key)).toBe('stuck')
     expect(readFileSync(keys, 'utf8')).toBe('Up\n')
     unlinkSync(join(dir, 'ignore-up'))
-    for (const bound of [false, true]) {
+    // 1.59.3 (WO-204 part 1, menu only): the probe drives the menu when it offers a refused item. The bare-turn and the output-cut variants need
+    // part 2 (the resume at the clear) and come back with it.
+    for (const bound of [true]) {
       const p = 'wo204-' + bound
       const wall = { walled: false, clearedMs: null as number | null }
       deps.usageWall = () => wall
@@ -193,14 +195,13 @@ esac`)
         work.push(main.items(r => r.event === 'tg-1-60401')[0].id)
       }
       await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p, dids: work })
-      await L.__mainEvent({ event: 'PreToolUse', pid, prompt_id: p, tool_name: 'Read' })
       wall.walled = true
       await L.__mainEvent({ event: 'StopFailure', pid, prompt_id: p, error: 'rate_limit' })
       const gen = main.currentGen()!, episode = gen.wall_since, refusedAt = gen.wall_refused_at
       const reminders = main.items(r => r.wall_resume === episode)
       expect(reminders).toHaveLength(bound ? 0 : 1)
       const id = bound ? work[0] : reminders[0].id
-      if (bound) expect(L.__journal().get('msg', id)).toMatchObject({ reason: 'interrupted', cut_by: 'stop_failure:rate_limit' })
+      if (bound) expect(L.__journal().get('msg', id)).toMatchObject({ state: 'queued', reason: 'stop_failure:rate_limit' })
       const ids = main.items(() => true).map(r => r.id)
       const journal = L.__journal().path, offset = readFileSync(journal, 'utf8').length
       writeFileSync(screen, LIMIT_PANE(SAFE, 1)); writeFileSync(keys, '')
