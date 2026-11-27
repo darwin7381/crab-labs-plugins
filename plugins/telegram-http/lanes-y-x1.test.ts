@@ -20,7 +20,6 @@ copyFileSync(ROUTER, join(dir, 'router.json'))
 const T = join(dir, 'main.jsonl')
 writeFileSync(join(dir, 'main.json'), JSON.stringify({ session_id: 'b31fc8d0-a35a-4365-9a21-9e16e9f78fed', transcript_path: T, claude_pid: process.pid, registered_at: new Date().toISOString() }))
 writeFileSync(T, '')
-L.__setWallProbe(100)
 
 // the limit menu as Claude Code draws it, with the options of the T7-R plays (u002x-T7-s6-r3 events.jsonl 222, lane.main_menu)
 const LIMIT = "You've hit your weekly limit · resets Nov 21, 7:42am (Asia/Taipei)"
@@ -38,7 +37,7 @@ L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, 
     drive: async (idx: number, key: string) => { drives.push({ idx, key }); pane[MAIN] = NORMAL; return 'ok' },
     rearm: () => rearmStartupPicker(MAIN) } } as any)
 L.__setMainConnected('mcp-main')
-afterAll(() => { for (const k of Object.keys(pane)) pane[k] = NORMAL; L.__setWallProbe(300_000) })
+afterAll(() => { for (const k of Object.keys(pane)) pane[k] = NORMAL })
 
 // the watchdog as server.ts starts it: with GENESIS_LANES=1 the owner of a menu on the main's pane is asked first; with lanes off there is no owner
 const rung: Array<{ title: string; buttons: string[] }> = []
@@ -61,7 +60,7 @@ async function turn(text: string): Promise<{ pid: number; p: string; item: strin
   await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p, dids: [item.id] })
   return { pid, p, item: item.id }
 }
-/** the probe offer at the walled main's retry time; the main takes it and its Stop ends the episode (the wall-down notice) */
+/** The main takes the keeper-authorized offer and its Stop ends the wall episode. */
 async function probeAndRecover(pid: number, item: string, k: number): Promise<void> {
   expect(await until(() => { void L.__main().tick(); return L.__main().items(r => r.id === item)[0].state === 'offered' })).toBe(true)
   const p2 = `p-x1-${++n}`
@@ -82,6 +81,7 @@ test('002y X-1 (T7-R): the main walls on the limit menu: the main-wall probe cho
   expect(rung.length).toBe(r0)
   expect(wlog.some(m => m.includes('the lanes main-wall probe owns it'))).toBe(true)
   drives.length = 0
+  L.__main().statusChanged(Date.now())
   await probeAndRecover(pid, item, k)
   expect(drives).toEqual([{ idx: 0, key: expect.stringMatching(/^generic-/) }])               // option 1, no automatic continuation
   await sleep(80)
@@ -100,6 +100,7 @@ test('002y X-1: a limit menu whose only options could spend money: the probe cho
   await sleep(120)
   expect(rung.length).toBe(r0)                                                                // the main-wall mechanism's until its probe
   drives.length = 0
+  L.__main().statusChanged(Date.now())
   expect(await until(() => { void L.__main().tick(); return rung.length > r0 })).toBe(true)  // the probe found no safe option: re-armed for Joey
   expect(drives).toEqual([])
   expect(rung.slice(r0).map(r => r.buttons)).toEqual([['1. Switch to extra usage', '2. Upgrade your plan']])
@@ -129,6 +130,7 @@ test('002y X-1: what the main-wall mechanism does not own is the watchdog\'s as 
   expect(await until(() => rung.length === r0 + 2)).toBe(true)                                 // another pane in the main's wall: rung
   expect(rung.at(-1)!.title).toContain('session resume')
   pane[OTHER] = NORMAL; await sleep(80)
+  L.__main().statusChanged(Date.now())
   await probeAndRecover(pid, item, k)
   expect(rung.length).toBe(r0 + 2)                                                            // and nothing for the main's own limit menu
 })

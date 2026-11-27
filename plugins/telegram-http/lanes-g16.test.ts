@@ -27,8 +27,7 @@ const script = (name: string, body: string) => { const p = join(dir, name); writ
 const WALLED = script('walled.sh', `echo '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You have hit your weekly limit · resets 5:48pm (Asia/Taipei)"}'\nexit 1`)
 const OK = script('ok.sh', `echo '{"type":"result","subtype":"success","is_error":false,"result":"OK"}'\nexit 0`)
 const restore = L.__setClaudeBin(WALLED)
-L.__setWallProbe(100)
-afterAll(() => { L.__setClaudeBin(restore); L.__setWallProbe(300_000) })
+afterAll(() => { L.__setClaudeBin(restore) })
 
 // the pane: the limit menu as claude 2.1.322 draws it (labels from its own menu code), then the normal prompt once a key has been sent
 const LIMIT_PANE = (opts: string[], cursor = 0) => `\n You've hit your weekly limit · resets 5:48pm (Asia/Taipei)\n\n What do you want to do?\n\n${opts.map((o, i) => ` ${i === cursor ? '❯' : ' '} ${i + 1}. ${o}`).join('\n')}\n\n Enter to confirm · Esc to cancel\n`
@@ -126,6 +125,7 @@ test('G16a, PL4: the walled main\'s probe with the main on its limit menu: the p
   expect(notice.split('〔adam·分流器〕').length - 1).toBe(2)                                   // 002q (T7-R 1016): up and down; the handled menu rides the down notice
   expect(notice.indexOf('主線停在一個選單')).toBeGreaterThan(notice.indexOf('主線恢復了'))
   expect(state.rearms).toBe(0)
+  expect(await until(() => logos.some(r => r.kind === 'lane.main_menu'))).toBe(true)
   const m = logos.filter(r => r.kind === 'lane.main_menu').at(-1)
   expect(m).toMatchObject({ why: 'main-probe', chose: { idx: 0 }, result: 'ok', resurfaced: false }); expect(m.options).toEqual(SAFE)   // the labels are in the daemon's record
   expect(order[0]).toBe('drive')                                                                   // before the offer
