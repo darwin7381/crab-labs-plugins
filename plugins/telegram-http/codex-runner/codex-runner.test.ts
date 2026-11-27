@@ -192,6 +192,24 @@ describe('a long answer (Chiron mesh 13227: over 4000, the Call never completed 
     expect(fin.result.attachment_file_ids?.length).toBeGreaterThanOrEqual(1)
     expect(String(onsen.sends[0].payload.text).length).toBeLessThanOrEqual(4000)
   }, 30_000)
+  test('199 files left out (call 752): the answer keeps its room; the list is cut to a few lines and a count', async () => {
+    const { onsen, cfg } = setup({ maxFiles: 2 })
+    process.env.FAKE_CODEX_ANSWER = 'z'.repeat(3000)
+    onsen.call('9900', 'chiron', 9900)
+    onsen.push({ sender: 'chiron', payload: { text: '改很多檔 MANY:60', msg_id: 9900 }, dedupe: 'msg:9900', call_id: '9900' })
+    const r = runner(cfg)
+    await r.start()
+    try {
+      await until(() => done(onsen, '9900')() && onsen.sends.length === 1, 15_000, 'Call 9900 and its reply')
+    } finally { delete process.env.FAKE_CODEX_ANSWER }
+    const t = onsen.puts.at(-1)!.result.body.text as string
+    expect(t.length).toBeLessThanOrEqual(4000)
+    expect(t).toContain('z'.repeat(2500))
+    expect(t).toMatch(/- …另外 \d+ 個沒有附上/)
+    const rt = String(onsen.sends[0].payload.text)
+    expect(rt.length).toBeLessThanOrEqual(4000)
+    expect(rt).toContain('z'.repeat(2000))
+  }, 30_000)
   test('Onsen refusing even that (a lower limit): a short body ends the Call, and the reply still goes back', async () => {
     const { onsen, cfg, log } = setup()
     onsen.bodyMax = 2000

@@ -888,7 +888,7 @@ export class CodexRunner {
   /** the result body: the answer cut to fit, a note that the whole answer is attached when it is, then the files left out and the thread line;
    *  never longer than max (Onsen refuses a longer one with 400) */
   private resultBody(j: Job, max: number): string {
-    const extras = (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '') + this.threadLine(j)
+    const extras = this.skippedList(j, Math.min(800, Math.floor(max / 4))) + this.threadLine(j)
     const text = j.result_text ?? ''
     const whole = (j.files ?? []).includes(`last-${j.n}.txt`)
     if (text.length + extras.length <= max) return text + extras
@@ -932,6 +932,21 @@ export class CodexRunner {
     }
     return r
   }
+  /** the files that were not attached, as list lines within `budget` characters; the rest counted in one line (where they are). 199 such lines
+   *  (call 752, 11-27) took 9870 characters and left the answer itself no room */
+  private skippedList(j: Job, budget: number): string {
+    const sk = j.skipped_files ?? []
+    if (!sk.length) return ''
+    const lines: string[] = []
+    let used = 0
+    for (const x of sk) {
+      const l = `- ${x}`
+      if (used + l.length + 1 > budget) break
+      lines.push(l); used += l.length + 1
+    }
+    const rest = sk.length - lines.length
+    return `\n\n${lines.join('\n')}${rest ? `${lines.length ? '\n' : ''}- …另外 ${rest} 個沒有附上（在 Mac mini 的 ${j.dir ?? '它的資料夾'}）` : ''}`
+  }
   /** the line that names the session's thread (a Call's result, the reply): how the caller goes on in it */
   private threadLine(j: Job): string {
     return j.thread ? `\n\n（Codex 對話串 ${j.thread}：要它在同一段接著做，reply_to 這一則，或送的時候帶 thread=${j.thread}；不帶的是新的一段）` : ''
@@ -944,10 +959,10 @@ export class CodexRunner {
   /** the answer to a peer's Call or follow-up, in its inbox (it reaches the caller as every Call's answer does), carrying the session's thread */
   private async reply(j: Job, ids: string[], files: string[]): Promise<'ok' | 'retry'> {
     const list = files.length ? `\n\n附件（Onsen 的檔，用你的憑證取；Mac mini 上的路徑在後）：\n${files.map((rel, i) => `- ${basename(rel)}：${join(j.dir!, rel)}\n  ${this.cfg.base}/v1/files/${ids[i]}`).join('\n')}` : ''
-    const more = (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '') + this.threadLine(j)
+    const more = this.skippedList(j, 800) + this.threadLine(j)
     const note = j.call_id ? '\n\n（全文在 Onsen 這一通呼叫的結果）' : `\n\n（全文在 Mac mini 的 ${join(j.dir ?? '', `last-${j.n}.txt`)}）`
     let text = (j.result_text ?? '') + list + more
-    if (text.length > SEND_TEXT_MAX) text = cut(j.result_text ?? '', SEND_TEXT_MAX - list.length - more.length - note.length - 1) + note + list + more
+    if (text.length > SEND_TEXT_MAX) text = cut(j.result_text ?? '', Math.max(200, SEND_TEXT_MAX - list.length - more.length - note.length - 1)) + note + list + more
     text = cut(text, SEND_TEXT_MAX)
     let r: Answer = null
     try {
@@ -967,8 +982,8 @@ export class CodexRunner {
   }
   /** the answer's text in a conversation: the last message, and the files that did not go along */
   private answerBody(j: Job): string {
-    const more = j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : ''
-    return cut(j.result_text ?? '', SAY_MAX) + more
+    const more = this.skippedList(j, 800)
+    return cut(cut(j.result_text ?? '', SAY_MAX - more.length) + more, SAY_MAX)
   }
   /** the answer to a person's message (person_message): written new-style into its conversation (Onsen 0.35.0, CONTRACT §7d 連接器這一頭):
    *  conversation_id, no agent / client / chat / client_msg_id / delivery. Onsen decides which bridge draws it (delivery pending until that
