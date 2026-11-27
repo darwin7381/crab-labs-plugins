@@ -1,6 +1,6 @@
-// WO-168 stage two × WO-197: the startup-picker is retired on the daemon's own pane (the duty officer handles its menus through the record), but WO-197's
-// observer still has to see that pane (it closes the Onsen Actions and the channel's permission prompts that left the screen). The own pane is therefore
-// skipped for surfacing and read for the observer through the capture the daemon hands in (pane-look's one capture); a roamer pane is as before.
+// WO-168 stage two × WO-197: on the daemon's own pane the startup-picker surfaces nothing while the duty officer handles it (the officer takes its menus
+// through the record), but WO-197's observer still has to see that pane (it closes the Onsen Actions and the channel's permission prompts that left the
+// screen). A skipped pane is read for the observer through the capture the daemon hands in (pane-look's one capture); a roamer pane is as before.
 // No tmux: capture is a stand-in.
 import { expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
@@ -28,10 +28,9 @@ test('the own pane: observed through the capture handed in, never surfaced; a ro
   expect(surfaced.every(t => t === ROAM)).toBe(true)                                   // only the roamer pane is put to anyone from here
 })
 
-test('server.ts: the own pane is skipped and read through the one capture; the permission recheck and a picker tap leave it alone too', () => {
+test('server.ts: the own pane is skipped while the duty officer handles it, and read through the one capture (the observer, the permission recheck)', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  expect(src).toContain('skip: tmux => (!!ownPaneTmux && tmux === ownPaneTmux) || (dutyOfficer?.handles(tmux) ?? false),')
+  expect(src).toContain('skip: tmux => dutyOfficer?.handles(tmux) ?? false,')
   expect(src).toContain('capture: tmux => ownPaneReader && tmux === ownPaneTmux ? ownPaneReader.fresh(PICKER_OWN_LOOK_MS).then(l => l?.visible ?? \'\') : capturePane(tmux),')
   expect(src).toContain("ownPaneReader && pk.tmux === ownPaneTmux ? ((await ownPaneReader.fresh(0))?.visible ?? '') : await capturePane(pk.tmux)")
-  expect(src).toContain('handleStartupPickerCallback(data, async () => (await paneWatchTargets()).filter(t => !ownPaneTmux || t.tmux !== ownPaneTmux), reply, ')
 })

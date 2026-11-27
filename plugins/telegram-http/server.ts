@@ -1989,7 +1989,9 @@ async function applyPickerControl(pa: PickerAsk, h: Onsen.ActionHandle, c: Onsen
   if (idx < 0 || idx >= pa.options.length) { acts.cancel(h, `不認得的選項 ${c.option_id}，沒有按`); return }
   pa.pressing = true
   let res: 'ok' | 'gone' | 'stuck' = 'gone'
-  try { res = await driveStartupPicker(pa.tmux, idx, pa.key) } finally { pa.ended = true; pa.pressing = false }
+  // WO-168: the own pane is read through the one capture (pane-look), before and after the keys
+  const look = ownPaneReader && pa.tmux === ownPaneTmux ? () => ownPaneReader.fresh(0).then(l => l?.visible ?? '') : undefined
+  try { res = await driveStartupPicker(pa.tmux, idx, pa.key, look) } finally { pa.ended = true; pa.pressing = false }
   if (res === 'gone') {
     log('info', `startup picker '${pa.key}' on pane ${pa.tmux}: ${c.option_id} pressed in Onsen (action ${c.action_id}), but the menu is not there any more: nothing pressed, cancelled`)
     acts.cancel(h, '選單已經不在畫面上了（在別處選過、逾時、或畫面已變），沒有按')
@@ -3163,9 +3165,10 @@ if (isControlEnabled() || isRoamerEnabled()) {
 if (isControlEnabled() || isRoamerEnabled()) {
   startStartupPickerWatchdog({
     listTargets: paneWatchTargets,
-    // WO-168 item 7 (Chiron 05:24:56Z): retired on the own pane (the duty officer handles its menus through the record); roamer panes as before. WO-197's
-    // observer still sees the own pane (its Actions and the channel's permission prompts closed when they leave the screen), through the one capture
-    skip: tmux => (!!ownPaneTmux && tmux === ownPaneTmux) || (dutyOfficer?.handles(tmux) ?? false),
+    // WO-168 item 7 (Chiron 05:24:56Z): on the own pane it surfaces nothing while the duty officer handles that pane (the officer takes its menus through the
+    // record; the officer is on everywhere); with the officer off, WO-197's Actions for a menu or a permission dialog stay the fallback. Its observer
+    // sees the own pane (Actions and the channel's permission prompts closed when they leave the screen) through the one capture
+    skip: tmux => dutyOfficer?.handles(tmux) ?? false,
     capture: tmux => ownPaneReader && tmux === ownPaneTmux ? ownPaneReader.fresh(PICKER_OWN_LOOK_MS).then(l => l?.visible ?? '') : capturePane(tmux),
     observe: paneObserved,                           // WO-197: what left the screen, its Onsen Action closed (a pane the duty officer handles too)
     hot: hotPanes,                                   // WO-197 (round 3A): a pane with an open Action of ours is looked at every 2 s
@@ -4010,8 +4013,7 @@ if (tg) {
       catch (err) { log('warn', `duty-officer tap failed: ${err instanceof Error ? err.message : err}`); return '處理時出錯，沒有按' }
     },
     // WO-197: the menu's Onsen Action (asked there too) is resolved by the presser once the keys went in
-    // WO-168: the startup-picker is roamer-only: a button for the own pane drives nothing
-    pickerTap: (data, senderId, reply) => handleStartupPickerCallback(data, async () => (await paneWatchTargets()).filter(t => !ownPaneTmux || t.tmux !== ownPaneTmux), reply, (tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')),
+    pickerTap: (data, senderId, reply) => handleStartupPickerCallback(data, paneWatchTargets, reply, (tmux, key, idx) => pickerPressedHere(tmux, key, idx, Onsen.memberOfTg(senderId) ?? '')),
     runControlCallback,
     finishInbound: (f, got) => finishInbound(f, 'local', got),
     replyForwardMeta, safeName, metaExcerpt,
