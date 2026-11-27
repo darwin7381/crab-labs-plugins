@@ -58,9 +58,9 @@ export type MainEnv = {
    *  keeper probes outside the session, so no item is fed to the wall; cleared (clearedMs) = its probe (or a genuine turn) got an answer: one
    *  offer now, once per clear (a failed offer then waits for retry_at or a newer clear); null = no fresh state: the PL4 probe as before */
   usageWall?: (wallSinceMs: number) => MainWall | null
-  /** Persist the blocked receipt for a person's bound delivery, ordered with its other delivery facts. */
-  callId?: (item: Row) => string | undefined
+  callId?: (event: string) => string | undefined
   checkCall?: (id: string, why: CallWait, item: Row) => Promise<CallCheck>
+  /** Persist the blocked receipt for a person's bound delivery, ordered with its other delivery facts. */
   blocked?: (item: Row, retryAfter: string | null) => void
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
@@ -185,6 +185,7 @@ export function createMain(E: MainEnv) {
   /** the stuck episode: a live gen silent too long; or (002w E) `undelivered`: owed items nobody could take (no live gen, or one that cannot be offered them) */
   let stuck: { gen: string | null; prompt: string | null; at: number; undelivered?: boolean } | null = null
   let offering = false
+  let offerAgain = false
   let seq = 0
   let restoredThrough = 0
 
@@ -244,14 +245,19 @@ export function createMain(E: MainEnv) {
   function wallDelivery(g = currentGen()) {
     const wall = E.usageWall?.(Date.parse(String(g?.wall_since ?? '')) || 0)
     const refused = Number(g?.wall_refused_at ?? 0)
-    const clear = wall?.clearedMs != null && wall.clearedMs >= refused ? wall.clearedMs : null
-    const active = !!wall?.walled || (clear == null && (g?.state === 'walled' || member() === 'walled'))
+    const clear = !wall?.walled && wall?.clearedMs != null && wall.clearedMs >= refused ? wall.clearedMs : null
+    const active = !!wall?.walled || (g?.state === 'walled' && clear == null) || member() === 'walled'
     const last = Math.max(wall?.lastWallMs ?? 0, refused)
-    return { active, person: active && personCanProbe(last || null), clear, keeper: !!wall?.walled }
+    // If the keeper is absent, M2 retains its existing account probe. A keeper clear authorizes one offer.
+    const probe = g?.state === 'walled' && !wall?.walled && (Date.now() >= Number(g.retry_at ?? Infinity) || (clear ?? 0) > Number(g.uw_clear_used ?? 0))
+    return { active, person: active && personCanProbe(last || null), clear, probe }
   }
   /** An item already refused or interrupted by this wall waits for the clear. */
   function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
-    return !wall.active || (wall.person && r.kind === 'joey' && !r.wall_blocked && !heldCut(r))
+    if (!wall.active) return true
+    // A queued refusal from an older journal only carries its stop_failure reason.
+    const refused = typeof r.reason === 'string' && r.reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(r.reason.slice('stop_failure:'.length))
+    return wall.person && r.kind === 'joey' && !refused
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
   function mainCanTake(): boolean { const g = currentGen(); return !!g && canTake(g) }
@@ -278,8 +284,13 @@ export function createMain(E: MainEnv) {
     const params = { ...((notif.params ?? {}) as Record<string, unknown>) }
     params.meta = { ...metaOf(notif), did: id }
     const g = currentGen()
-    const wait: CallWait | null = !g || g.state === 'starting' || member() === 'offline' ? 'offline' : wallDelivery(g).active ? 'wall' : null
-    J().write('msg', id, 'queued', { kind, ...(wait ? { waited: wait } : {}), queued_gen: g?.id, via: o.via ?? 'tg', event: o.event ?? null, ...(o.target ? { target: o.target } : {}), notif: { method: notif.method, params }, ...(o.fields ?? {}),
+    const callId = o.fields?.call_id ?? (o.event ? E.callId?.(o.event) : undefined)
+    let waited: CallWait | undefined
+    if (callId) {
+      if (!g || g.state === 'starting' || member() === 'offline') waited = 'offline'
+      else if (wallDelivery(g).active) waited = 'wall'
+    }
+    J().write('msg', id, 'queued', { kind, ...(callId ? { call_id: callId, queued_gen: g?.id, waited } : {}), via: o.via ?? 'tg', event: o.event ?? null, ...(o.target ? { target: o.target } : {}), notif: { method: notif.method, params }, ...(o.fields ?? {}),
       ...(o.batched ? { reason: 'batched', batched_at: new Date().toISOString() } : {}) })
     seq++
     if (kind === 'digest') J().write('wake', id, 'no_wake', { reason: 'information: rides the next delivery' })
@@ -359,12 +370,13 @@ export function createMain(E: MainEnv) {
     const pending: Promise<void>[] = []
     const skip = new Set<string>()
     for (const r of rows) {
-      const id = E.callId?.(r)
+      const id = r.call_id ?? (r.event ? E.callId?.(String(r.event)) : undefined)
       if (!id || !E.checkCall) continue
       const why: CallWait | undefined = r.waited ?? (r.n <= restoredThrough ? 'restart'
         : r.queued_gen !== g.id || r.last_no_wake === 'unreachable' ? 'offline'
         : clear != null && clear >= Date.parse(r.created) ? 'wall' : undefined)
       if (!why) continue
+      if (!r.waited) J().write('msg', r.id, 'queued', { waited: why })
       const version = r.version
       pending.push(E.checkCall(id, why, r).then(result => {
         if (r.state !== 'queued' || r.version !== version || result !== 'open') skip.add(r.id)
@@ -378,9 +390,12 @@ export function createMain(E: MainEnv) {
 
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
   async function pump(): Promise<void> {
-    if (!E || offering) return
+    if (!E) return
+    if (offering) { offerAgain = true; return }
     offering = true                                                   // one offer at a time: the decision and the write are one transition
-    try { await offerNext() } finally { offering = false }
+    try {
+      do { offerAgain = false; await offerNext() } while (offerAgain)
+    } finally { offering = false }
   }
   async function offerNext(): Promise<void> {
     const g = currentGen()
@@ -388,58 +403,42 @@ export function createMain(E: MainEnv) {
     // PL4: a walled gen is offered one item when its retry time comes: its probe. Its own hook events then take it out of `walled` (and a
     // StopFailure walls it again, with a longer backoff). A limit menu it is parked on is driven first (002k G16a).
     const wall = wallDelivery(g)
-    let probe = g.state === 'walled' && Date.now() >= Number(g.retry_at ?? Infinity)
-    let clearUsed: number | null = null
-    if (g.state === 'walled') {
-      // WO-120: with a fresh usage-wall state the keeper is the probe (outside the session, nothing eaten, no false run ack): while it says
-      // walled no item is offered; a clear the gen has not used yet sends the one offer now. Once per clear: if that offer walls again while
-      // the state still shows the same clear (reader lag, a wall kind the state does not record), the next one waits for retry_at as before.
-      if (wall.keeper) probe = false
-      else if (wall.clear != null && wall.clear > Number(g.uw_clear_used ?? 0)) { probe = true; clearUsed = wall.clear }
-    }
-    // WO-177 一: an item is offered only when the status record says the main can take one (canTake); held items stay `queued` and go out the moment the
-    // record turns idle (statusChanged). M2 says how: an idle gen is offered (it opens a turn), a gen in a turn pulls at its next boundary (main_after_step)
-    const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : g.state === 'idle' && canTake(g)))
+    const probe = wall.probe
+    const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : canTake(g)))
     if (!mayOffer()) return
-    const eligible = (r: Row) => wallAllows(r, wall) || (probe && !wall.keeper)
+    const version = g.version
+    const stillReady = () => {
+      const fresh = wallDelivery(g)
+      return currentGen() === g && g.version === version && fresh.active === wall.active && fresh.person === wall.person
+        && fresh.probe === probe && mayOffer()
+    }
+    const eligible = (r: Row) => probe || wallAllows(r, wall)
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
-    let cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
-    const verified = checked(cands, g, wall.clear)
-    if (verified instanceof Promise) {
-      cands = await verified
-      if (currentGen()?.id !== g.id || !mayOffer() || items(r => r.state === 'offered' && r.gen === g.id).length) return
-    }
+    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
     if (!cands.length) return
-    // WO-181: the unread mentions ride this offer with the digest; fetched now (≤ LANES_MENTION_TIMEOUT_MS), and what the wait changed is looked at again
     const mp = wall.active && !probe ? null : mentionsNow()
     const mb = mp ? await mp : null
-    if (mp) {
-      const g2 = currentGen()
-      if (!g2 || g2.id !== g.id || !mayOffer()) return
-      if (items(r => r.state === 'offered' && r.gen === g.id).length) return
-      cands = cands.filter(r => J().get('msg', r.id)?.state === 'queued')
-      if (!cands.length) return
-    }
-    if (probe) {
-      const menu = E.menu ? await E.menu(true).catch(() => null) : null
-      // 002q (T7-R 1016): a menu Joey must choose on is told now; one the probe dealt with asks nothing of him: it rides the episode's one wall-down notice
+    if (mp && !stillReady()) return
+    let menu: { text: string; asks: boolean } | null = null
+    if (probe && E.menu) {
+      menu = await E.menu(true).catch(() => null)
+      if (!stillReady()) return
       if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
-      const w = J().get('main', g.id)!
-      setMain(w, 'walled', { retry_at: Date.now() + backoff(String(w.kind ?? ''), Number(w.probes ?? 0)), ...(menu && !menu.asks ? { wall_menu: menu.text } : {}),
-        ...(clearUsed != null ? { uw_clear_used: clearUsed } : {}) })   // one probe offer per retry time (WO-120: and per usage-wall clear)
     }
     const down = new Set<string>()
     for (const it of cands) {
-      if (down.has(String(it.via))) continue
+      if (it.state !== 'queued' || down.has(String(it.via))) continue
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
       let riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
-      const checkedRiders = checked(riders, g, wall.clear)
-      if (checkedRiders instanceof Promise) {
-        riders = await checkedRiders
-        if (currentGen()?.id !== g.id || !mayOffer() || it.state !== 'queued') return
+      const checkedGroup = checked([it, ...riders], g, wall.clear)
+      if (checkedGroup instanceof Promise) {
+        const group = await checkedGroup
+        if (!stillReady()) return
+        if (!group.includes(it) || it.state !== 'queued') continue
+        riders = group.filter(r => r !== it && r.state === 'queued')
       }
       const dg = wall.active && !probe ? null : attachInfo(mb)
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
@@ -460,9 +459,14 @@ export function createMain(E: MainEnv) {
         if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
         continue
       }
+      // Consume the keeper's clear only after a write. A failed lookup or a disconnected stream still owes this offer.
+      if (probe && now.state === 'walled' && now.version === version) {
+        setMain(now, 'walled', { retry_at: Date.now() + backoff(String(now.kind ?? ''), Number(now.probes ?? 0)),
+          ...(menu && !menu.asks ? { wall_menu: menu.text } : {}), ...(wall.clear != null ? { uw_clear_used: wall.clear } : {}) })
+      }
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
-      for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null })
+      for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null, person_wall_offer: wall.active && !probe || null })
       mentionsReached(dg)                                                                     // WO-181: in its session now: the mentions it carried are read
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) of an interrupted turn riding` : ''}` })
       for (const r of riders) J().write('wake', r.id, 'wake', { reason: r.reason === 'batched' ? `batched: rides the offer of ${it.id} (gen ${g.id})` : `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
@@ -487,10 +491,12 @@ export function createMain(E: MainEnv) {
     const verified = checked(got, g, wall.clear)
     if (verified instanceof Promise) {
       got = await verified
-      if (currentGen()?.id !== g.id || g.prompt_id !== prompt || g.state !== 'in_turn') return []
+      if (currentGen() !== g || g.prompt_id !== prompt || g.state !== 'in_turn') return []
+      const fresh = wallDelivery(g)
+      got = got.filter(r => r.state === 'queued' && wallAllows(r, fresh))
     }
     if (!got.length) return []
-    const dg = wall.active ? null : attachInfo(mb)
+    const dg = wallDelivery(g).active ? null : attachInfo(mb)
     const all = dg ? [...got, dg] : got
     const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true, bound_at: at })
@@ -850,7 +856,7 @@ export function createMain(E: MainEnv) {
             holdCut([r], reason, new Map([[r.id, outputBy(output)]]))
             continue
           }
-          const refused = r.state === 'bound' && r.kind === 'joey' && (err === 'rate_limit' || wall?.walled)
+          const refused = r.state === 'bound' && r.kind === 'joey'
           if (refused) E.blocked?.(r, wall?.resets_at ?? null)
           J().write('msg', r.id, 'queued', { reason, gen: null, prompt_id: null, via_pull: null, waited: 'wall',
             ...(refused ? { wall_blocked: p || r.id } : {}) })
@@ -970,7 +976,8 @@ export function createMain(E: MainEnv) {
     // WO-177 一 (Chiron: 「它有自己的 blocker：選單歸值班員或 Joey、上限有 until」): while the status record says the main waits on a menu or on the wall, that
     // blocker is the record's own (the observation names who takes it, and the wall its until): no stuck alarm is sent for it
     const m = member()
-    const held = m === 'waiting' || m === 'walled'
+    const wall = wallDelivery(g)
+    const held = m === 'waiting' || wall.active
     // 002w (E, gaps 4, 11): owed items queued past MAIN_STUCK_MS that nobody could take: no live gen, or a live gen that is neither in a turn (it would
     // pull them), nor walled (its wall notice told Joey), nor holding an offer (an offer it does not take is the silence rule below), and could not be
     // offered them. One alarm per episode, with the count; the next delivery ends it.
@@ -998,7 +1005,7 @@ export function createMain(E: MainEnv) {
       const owes = g.state === 'in_turn' || ((g.state === 'idle' || g.state === 'walled') && offered.length > 0)
       // WO-177 一: an idle gen's silence counts only while the status record says it can take an item (from when it last turned so): the time it could not
       // (a menu, a compaction, the wall) is not silence. `take`: it can now
-      const take = g.state === 'idle' && canTake(g, now)
+      const take = !wall.active && g.state === 'idle' && canTake(g, now)
       const from = take && takeSince?.gen === g.id ? takeSince.at : 0
       const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt, from)
       const limit = g.state === 'in_turn' && g.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
@@ -1013,7 +1020,7 @@ export function createMain(E: MainEnv) {
       } else if (owes && held && now - since > limit) {
         // WO-177 一: the record names the blocker (a menu, the wall): no stuck episode, nobody told. A walled gen's probe item goes back to wait for its
         // next probe time (a probe offer is the one way its own hook events resume), as the episode below would have put it back
-        if (g.state === 'walled') for (const r of offered) J().write('msg', r.id, 'queued', { reason: backReason(r, 'probe_untaken'), gen: null, prompt_id: null, via_pull: null })
+        if (g.state === 'walled') for (const r of offered.filter(r => !r.person_wall_offer)) J().write('msg', r.id, 'queued', { reason: backReason(r, 'probe_untaken'), gen: null, prompt_id: null, via_pull: null })
       } else if (owes && now - since > limit) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         // what the episode writes again: a walled gen's probe item (its next probe), an idle gen's item the lease has not written again yet
@@ -1032,13 +1039,12 @@ export function createMain(E: MainEnv) {
         // Once per episode (the alarm does not fire again until a hook event ends it), and no timer of its own. A walled gen's probe item waits for
         // its next retry time like any probe.
         for (const r of again) J().write('msg', r.id, 'queued', { reason: backReason(r, 'stuck_unbound'), gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
-      } else if ((take || (g.state === 'walled' && wallDelivery(g).clear != null)) && !offered.length) {
+      } else if ((take || (g.state === 'walled' && wall.clear != null)) && !offered.length) {
         // WO-157c (Chiron 15:25Z, 1): a colleague's, a scheduler's or an alert's item of an interrupted turn that no new turn took within MAIN_STUCK_MS goes
         // the untaken path above: Joey is told (the same words) and it is offered once more, now leading an offer (with Chiron's line in front). Joey's own
         // items never go this way: they wait for the next delivery. WO-177 一: only while the record says the main can take one, counted from then.
         // WO-201 (Chiron mesh-13184): an item whose turn a dead process, another session or a StopFailure cut after the model had answered it (`cut_by`) goes
         // this way too, Joey's own included: an Esc is Joey stopping it; a process that died is not, and with no next delivery nothing else would wake it
-        const wall = wallDelivery(g)
         const quietFrom = Math.max(from, wall.clear ?? 0)
         const cutOld = items(r => !wall.active && heldCut(r) && owed(r) && (r.kind !== 'joey' || !!r.cut_by) && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), quietFrom) > MAIN_STUCK_MS)
         // WO-201 (Chiron mesh-13191): when every such item is one a dead process, another session or a StopFailure cut (`cut_by`), it is not stuck: an

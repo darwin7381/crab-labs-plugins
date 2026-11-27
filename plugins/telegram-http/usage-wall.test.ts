@@ -33,7 +33,9 @@ describe('reader rule and identity', () => {
     expect(readWallState({ transcriptDirs: ['/p/-ws-atlas/'] }, o)?.agent).toBe('atlas')
     expect(readWallState({ agent: 'hermes', transcriptDirs: ['/p/-ws-hermes'] }, o)).toBeNull()
     expect(readWallState({}, o)).toBeNull()
+    writeFileSync(join(dir, 'claude-nestor.json'), JSON.stringify(st({ last_wall_at: iso(NOW - 10_000), last_transcript_wall: iso(NOW - 300_000) })))
     const w = readWallState({ tmux: 'claude-nestor' }, o)!
+    expect(w.lastWallMs).toBe(NOW - 10_000)
     expect(w.walled).toBe(true)
     expect(w.key).toBe('claude-nestor')
     expect(w.sinceMs).toBe(NOW - 600_000)

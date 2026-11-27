@@ -1358,7 +1358,17 @@ function sweepDeliveries(): void {
     if (refused && wallAte(wall, d.at, newest, now)) {
       if (person) {
         person.refused = true
-        for (const id of person.ids) onsen?.recordBlocked({ message_id: id, retry_after: wall?.resets_at ?? null })
+        if (!notReceived) {
+          for (const id of person.ids) onsen?.recordBlocked({ message_id: id, retry_after: wall?.resets_at ?? null })
+        }
+        if (d.pendingPath) {
+          // Replace the earlier unconsumed copy with one held until clear, retaining its place in the drain.
+          const tmp = d.pendingPath + '.wall.tmp'
+          try {
+            writeFileSync(tmp, JSON.stringify({ ...d.notif, person_delivery: person }), { mode: 0o600 })
+            renameSync(tmp, d.pendingPath)
+          } catch { d.pendingPath = null }
+        }
       }
       if (!d.pendingPath) {
         const k = deliveryKey(d.notif)
@@ -1483,7 +1493,7 @@ async function replayPendingFromDiskLocked(server: Server): Promise<number> {
       continue
     }
     try {
-      if (waitsForWall(notif) && !Lanes.LANES_ON) continue
+      if (!Lanes.LANES_ON && waitsForWall(notif)) continue
       if (Lanes.LANES_ON) {
         // lanes-golive (C3): a parked delivery goes back through the one entrance (the router), never straight into whichever session is open
         if (!(await laneRedeliver(notif))) break
@@ -1491,7 +1501,7 @@ async function replayPendingFromDiskLocked(server: Server): Promise<number> {
         await server.notification(notif as Parameters<Server['notification']>[0])
         recordDelivery(notif)
       }
-      try { rmSync(fullPath) } catch {}
+      try { rmSync(fullPath); wallHeldKeys.delete(heldKey(notif)) } catch {}
       replayed++
     } catch (err) {
       log('warn', `disk-replay failed for ${file}: ${err} — keeping for retry`)

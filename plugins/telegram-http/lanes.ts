@@ -348,8 +348,8 @@ function mainEnv() {
     // WO-181: the unread mentions ride the main's deliveries with the digest (onsen-mentions.ts, server.ts); the main only: a lane's run gets none
     ...(D.mentions ? { mentions: () => D.mentions!(), mentionsDelivered: (posts: string[]) => D.mentionsRead?.(posts) } : {}),
     blocked: D.blocked,
-    callId: (r: Row) => callOfEvent(String(r.event))?.id ?? r.call_id,
-    checkCall: D.checkWaitingCall && ((id: string, why: CallWait, r: Row) => D.checkWaitingCall!(id, why, events?.get(String(r.event))?.thread ?? undefined)),
+    callId: (event: string) => callOfEvent(event)?.id ?? events?.get(event)?.call_id,
+    checkCall: D.checkWaitingCall && ((id: string, why: CallWait, r: Row) => D.checkWaitingCall!(id, why, eventThreads.get(String(r.event)) ?? events?.get(String(r.event))?.thread ?? undefined)),
     done: itemDone,
     undone: itemUndone,
     tellJoey: (text: string, rule: string, evs: string[] = []) => {
@@ -882,7 +882,7 @@ export type RouteTapCtx = {
   /** the event the row is about (null: a row with no event, e.g. a refused registration, a digest, a /lanes command) */
   ev: InEvent | null
   /** the main's M2 record at this moment (null: no gen); offered = an item already offered to it (one offer opens one turn) */
-  main: { state: string; offered: boolean; personProbe?: boolean } | null
+  main: { state: string; offered: boolean; personTarget?: WakeState['personTarget'] } | null
   /** the kind of the row's lane (reflex | worker | fork | curator | synthesis | mail), null without one */
   laneKind: string | null
   /** the router's alert senders (router.json, as last read; never read again for the tap) */
@@ -902,16 +902,24 @@ function lastMainItem(id: string): { id: string; n: number } | null {
   for (const r of main.items(x => x.event === id)) if (!best || r.n > best.n) best = r
   return best ? { id: best.id, n: best.n } : null
 }
+function personTarget(ev: InEvent | null | undefined, state: string, ready: boolean, offered: boolean): WakeState['personTarget'] {
+  if (ev?.source !== 'telegram' || ev.synthetic) return undefined
+  if (state === 'starting') return 'held:starting'
+  if (!ready) return 'held:wall'
+  return state === 'in_turn' || offered ? 'main_after_step' : 'main_now'
+}
 function tapRoute(row: Record<string, unknown>, ev?: InEvent): void {
   try {
     const g = D?.role === 'tg' && main ? main.currentGen() : null
     const evId = String(row.event ?? '')
-    const wall = main?.wallDelivery(g)
+    const wall = g ? main.wallDelivery(g) : null
+    const offered = !!g && main.items(r => r.state === 'offered' && r.gen === g.id).length > 0
     const before = row.target === 'main' ? lastMainItem(evId) : null
     const lane = typeof row.lane === 'string' && S?.lanes ? S.lanes[row.lane] : undefined
     routeTap!(row, {
       ev: ev ?? null,
-      main: g ? { state: wall?.active ? 'walled' : String(g.state), personProbe: !!wall?.person && ev?.source === 'telegram' && !ev.synthetic, offered: main.items(r => r.state === 'offered' && r.gen === g.id).length > 0 } : null,
+      main: g ? { state: wall?.active ? 'walled' : String(g.state), offered,
+        personTarget: wall?.active ? personTarget(ev, g.state, wall.person, offered) : undefined } : null,
       laneKind: lane?.kind ?? null,
       alertSenders: routerCache?.cfg.alert_senders ?? ['alert-dispatcher'],
       roster: () => kindRoster(),
@@ -1752,12 +1760,13 @@ export function runningLanes(): Array<{ id: string; run: string; kind?: string; 
 function wakeStateOf(ev: InEvent | null, extra: Partial<WakeState> = {}): WakeState {
   // the one state: statusOf (no MainPhase, no M1 offer state: the hook keeps only the delivery moment)
   const st: WakeState = { member: memberNow() ?? 'offline', lane_free: running.size < MAX_RUNNING, ...extra }
-  if (ev && main?.currentGen()) {
-    const wall = main.wallDelivery()
+  const g = main?.currentGen()
+  if (ev && g) {
+    const wall = main.wallDelivery(g)
     if (wall.active) {
       st.member = 'walled'
       if (ev.source === 'telegram' && !ev.synthetic) {
-        st.personProbe = wall.person
+        st.personTarget = personTarget(ev, g.state, wall.person, main.items(r => r.state === 'offered' && r.gen === g.id).length > 0)
       }
     }
   }
@@ -5323,6 +5332,7 @@ export async function callForReply(to: string, replyTo: unknown): Promise<string
 }
 /** what the router marked on an event, as fields of its record (PL1) */
 const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
+  ...(ev.call_id && !ev.answers_call ? { call_id: ev.call_id } : {}),
   ...((c => c ? { call: c } : {})(callRefOf(ev))),                                           // WO-175: the Call it is, on its record
   ...(ev.screen_p != null ? { screen_p: ev.screen_p } : {}),
   ...(ev.incident_of ? { incident_of: ev.incident_of, incident: ev.incident_key ?? null } : {}),        // WO-132 (item 2): merged into its incident's lane

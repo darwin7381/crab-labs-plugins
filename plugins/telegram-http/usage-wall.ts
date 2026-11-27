@@ -43,7 +43,7 @@ export type WallState = {
   key: string
   sinceMs: number | null
   clearedMs: number | null
-  /** the newest limit message usage_wall.py found in the transcript (last_transcript_wall, else last_wall_at) */
+  /** Latest local refusal. During an active wall the hook can be newer than the keeper's last transcript scan. */
   lastWallMs: number | null
 }
 
@@ -67,11 +67,13 @@ const toMs = (s: unknown): number | null => {
 const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null)
 
 function toState(st: any, key: string): WallState {
+  const transcript = toMs(st.last_transcript_wall), hook = toMs(st.last_wall_at)
+  const lastWallMs = st.in_wall && transcript != null && hook != null ? Math.max(transcript, hook) : transcript ?? hook
   return {
     walled: st.in_wall === true, episode: st.episode, since: str(st.since), kind: str(st.kind), text: str(st.text),
     resets_at: str(st.resets_at), cleared_at: str(st.cleared_at), cleared_by: str(st.cleared_by), agent: str(st.agent),
     tmux: str(st.tmux), session: str(st.session), key, sinceMs: toMs(st.since), clearedMs: toMs(st.cleared_at),
-    lastWallMs: toMs(st.last_transcript_wall) ?? toMs(st.last_wall_at),
+    lastWallMs,
   }
 }
 
