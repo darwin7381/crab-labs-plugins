@@ -35,7 +35,7 @@ import {
   handleControlSlash,
   handleCallbackData,
   isControlEnabled,
-  controlCommandsForBotApi,
+  controlCommandsForBotApi, sharedTuiCommands,
   controlStatusText,
   startLoginExpiredWatchdog,
   type WatchTarget,
@@ -64,6 +64,7 @@ import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { ItemReceiver } from './onsen-receive.ts'
 import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
 import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
@@ -521,17 +522,19 @@ async function keyboardAsk(chat: string, text: string, btns: InlineButton[], whe
   return true
 }
 /** a press in Onsen on a command's choice: what the Telegram tap on that button does (runControlCallback), then applied */
-async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<boolean> {
   const acts = onsenActions!
   const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
-  if (ka.ended || idx < 0 || idx >= ka.datas.length) { acts.cancel(h, ka.ended ? '這個選項已經按過了' : `不認得的選項 ${c.option_id}`); return }
+  if (ka.ended || idx < 0 || idx >= ka.datas.length) { acts.cancel(h, ka.ended ? '這個選項已經按過了' : `不認得的選項 ${c.option_id}`); return false }
   ka.ended = true
   const here = ka.where                                                       // answered where the command was typed
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(ka.chat, msg, opts?.keyboard, here)
+  let ok = true
   try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply)) }
-  catch (e) { log('warn', `connector: the choice ${c.option_id} of action ${c.action_id} failed: ${e instanceof Error ? e.message : e}`) }
+  catch (e) { ok = false; log('warn', `connector: the choice ${c.option_id} of action ${c.action_id} failed: ${e instanceof Error ? e.message : e}`) }
   acts.applied(h, { at: new Date().toISOString() })
   log('info', `connector: action ${c.action_id} (a command's choice): option ${c.option_id} pressed in Onsen, done as a tap on it`)
+  return ok
 }
 /** PUT /members/<agent>/commands (CONTRACT §7d 「指令」): the commands this connector takes, the list setMyCommands gives Telegram (the bridge adds its
  *  /start and /help itself); at start and whenever the agent is named. The menu order is the bridge's (bot-menu.ts) */
@@ -552,14 +555,21 @@ async function reportCommands(): Promise<void> {
  *  one Action when it offers a choice (sendTextWithMaybeKeyboard → connectorAnswer); its receipt goes to the end and the answer is its response
  *  (handledHere). /clear's reply and choice: connectorClearHooks. false: no handler took it (it goes on to the session as a message) */
 async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
-  via?: string): Promise<boolean> {
+  via?: string, item?: ItemRef, commandId?: string): Promise<boolean> {
   const t = text.trim()
   if (!/^\/[A-Za-z]/.test(t)) return false
   const cmd = t.split(/\s+/)[0]!.toLowerCase().replace(/@\S+$/, '')
   const here: Lanes.TopicAsk = { chat, ...(topic != null ? { topic } : {}) }
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(chat, msg, opts?.keyboard, here)
   const name = user || userId
-  return handledHere({ chat, id: ref, from: userId, ...(via ? { via } : {}) }, 'command', () => Onsen.withSender('system:control', async () => {
+  if (item) {
+    const control = isControlEnabled() && (sharedTuiCommands().includes(cmd) || controlCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/kill-stuck', '/sessions', '/list'].includes(cmd))
+    if (!control && !['/start', '/help', '/status', '/main', '/lanes'].includes(cmd)) return false
+    if (!itemReceiver || !(await itemReceiver.receive([item])).given.has(item.onsen_item_id)) throw new Error('command item not available')
+  }
+  let handled = false
+  try {
+    handled = await handledHere({ chat, id: ref, from: userId, ...(via ? { via } : {}) }, 'command', () => Onsen.withSender('system:control', async () => {
     if (cmd === '/start') { await reply(START_TEXT); return true }
     if (cmd === '/help') { await reply(HELP_TEXT); return true }
     if (cmd === '/status') { await reply(await pairedStatusText(user ? `@${user}` : userId)); return true }
@@ -573,6 +583,8 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
     if (isRoamerEnabled() && await handleRoamerSlash(t, reply) !== false) return true
     return false
   }), h => h !== false)
+    return handled
+  } finally { if (item) itemReceiver?.report([item], handled ? 'completed' : 'not_applied') }
 }
 /** WO-197 segment 2 (CONTRACT §7d): the Onsen thread a connector's person_message is in: its own `thread` (Onsen ≥ the field; learned for the reply
  *  tool's topic), else its client.thread looked up (GET /conversations/<id>/threads?client_thread=); undefined: outside threads, or not known */
@@ -817,17 +829,18 @@ function connectorClearHooks(chat: string, clearMsgId: string, by: string, here?
 /** a press in Onsen on /clear's choice: inside its 5 s (+1 s, as the Telegram button): the line at the /clear's time, then applied; later (Onsen took the
  *  press inside the window, its control came late), or a second one: cancelled with what stands. A press after expires_at never comes here: Onsen
  *  refuses it (409), the Action is expired with its expiry_note */
-async function applyClearControl(ca: ClearAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+async function applyClearControl(ca: ClearAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<boolean> {
   const acts = onsenActions!
-  if (ca.done || c.option_id !== 'line' || Date.now() > ca.until + 1000) { ca.done = true; acts.cancel(h, CLEAR_NOT_PRESSED); return }
+  if (ca.done || c.option_id !== 'line' || Date.now() > ca.until + 1000) { ca.done = true; acts.cancel(h, CLEAR_NOT_PRESSED); return false }
   ca.done = true
   let conversationId: string | undefined
   try { conversationId = await connectorConversation(ca.chat) } catch (e) { log('warn', `connector: /clear ${ca.clearMsgId}: no conversation for chat ${ca.chat} (${e instanceof Error ? e.message : e})`) }
-  if (!conversationId) { acts.cancel(h, '沒畫上：Onsen 沒有這段對話'); return }
+  if (!conversationId) { acts.cancel(h, '沒畫上：Onsen 沒有這段對話'); return false }
   const r = await onsen!.drawLine({ chat: ca.chat, clientMsgId: ca.clearMsgId, by: ca.by, at: ca.at, conversationId })
-  if (!r) { acts.cancel(h, '沒畫上：這一隻沒有記錄到 Onsen'); return }
+  if (!r) { acts.cancel(h, '沒畫上：這一隻沒有記錄到 Onsen'); return false }
   acts.applied(h, { at: new Date().toISOString() })
   log('info', `connector: restart line drawn in chat ${ca.chat} for /clear ${ca.clearMsgId} at its own time, pressed in Onsen (action ${c.action_id}; ${r.spooled ? 'Onsen silent: in the spool' : `line ${r.id}`})`)
+  return true
 }
 
 type PendingEntry = {
@@ -1784,37 +1797,39 @@ function promptOf(h: Onsen.ActionHandle | null | undefined): PermPrompt | undefi
 }
 /** WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by the agent-inbox daemon
  *  (POST /onsen/action): pressed here as a press in Telegram would be, then reported applied; a prompt that is gone: cancelled, nothing pressed */
-async function applyActionControl(c: Onsen.ActionControl): Promise<void> {
+async function applyActionControl(c: Onsen.ActionControl): Promise<boolean> {
   const acts = onsenActions
-  if (!acts) return
+  if (!acts) return false
   const p = [...permPrompts.values()].find(x => x.action?.id === c.action_id)
   const h = acts.adopt(c.action_id, c.version)
-  if (p) { await applyPermissionControl(p, h, c); return }
+  if (p) return applyPermissionControl(p, h, c)
   const pa = [...pickerAsks.values()].find(x => x.h.id === c.action_id)   // WO-197: a screen menu this daemon asked about in Onsen
-  if (pa) { await applyPickerControl(pa, h, c); return }
+  if (pa) return applyPickerControl(pa, h, c)
   const ka = [...keyboardAsks.values()].find(x => x.h.id === c.action_id)   // WO-197 segment 2: a command's choice
-  if (ka) { await applyKeyboardControl(ka, h, c); return }
+  if (ka) return applyKeyboardControl(ka, h, c)
   const ca = [...clearAsks.values()].find(x => x.h.id === c.action_id)      // WO-197 segment 2: /clear's 「不要讓它看到之前的」
-  if (ca) { await applyClearControl(ca, h, c); return }
+  if (ca) return applyClearControl(ca, h, c)
   if (dutyOfficer) {
-    const out = await dutyOfficer.onOnsen(c.action_id, c.option_id, c.version, acts.resolver(c.action_id))
-    if (out !== 'unknown') { log('info', `onsen action ${c.action_id}: duty-officer menu, ${c.option_id} pressed in Onsen: ${out}`); return }
+    let applied = false
+    const out = await dutyOfficer.onOnsen(c.action_id, c.option_id, c.version, acts.resolver(c.action_id), () => { applied = true })
+    if (out !== 'unknown') { log('info', `onsen action ${c.action_id}: duty-officer menu, ${c.option_id} pressed in Onsen: ${out}`); return applied }
   }
   log('warn', `onsen action ${c.action_id}: Onsen pressed ${c.option_id} on an Action this daemon has no prompt or menu for (gone, or made before a restart); nothing pressed, cancelled`)
   if (permLeftover.delete(c.action_id)) savePermOpen()
   acts.cancel(h, '選單已經不在了（常駐程式沒有這個詢問）')
+  return false
 }
-async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<boolean> {
   const acts = onsenActions!
-  if (p.ended?.how === 'answered') { acts.applied(h, { option_id: p.ended.option, resolved_by: h.assignee(p.ended.member) }); return }
+  if (p.ended?.how === 'answered') { acts.applied(h, { option_id: p.ended.option, resolved_by: h.assignee(p.ended.member) }); return true }
   const pending = pendingPermissions.get(p.request_id)
   if (pending && !permLive(pending.server)) pendingPermissions.delete(p.request_id)   // r4: its session's stream is gone (waiting for the GC): the prompt is gone
   if (p.ended || !pending || !permLive(pending.server)) {
     if (!p.ended) permGone(p.request_id, '權限詢問已經不在了（對話斷了或重開了）')   // cancelled (at the control's version: the same handle) and its copies closed
     else acts.cancel(h, '權限詢問已經不在了（對話關了或重開了，或在畫面上按掉了），沒有按')
-    return
+    return false
   }
-  if (c.option_id !== 'allow' && c.option_id !== 'deny') { acts.cancel(h, `不認得的選項 ${c.option_id}`); return }
+  if (c.option_id !== 'allow' && c.option_id !== 'deny') { acts.cancel(h, `不認得的選項 ${c.option_id}`); return false }
   const behavior = c.option_id
   pendingPermissions.delete(p.request_id)
   p.ended = { how: 'answered', option: behavior, member: null, via: 'onsen', at: Date.now() }
@@ -1826,11 +1841,12 @@ async function applyPermissionControl(p: PermPrompt, h: Onsen.ActionHandle, c: O
     log('error', `permission reply notify (pressed in Onsen, action ${c.action_id}) failed: ${err}`)
     p.ended = { how: 'gone', via: 'daemon', at: Date.now() }
     acts.cancel(h, '權限的回答送不回那個對話（對話已經斷了）')
-    return
+    return false
   }
   acts.applied(h, { at: new Date().toISOString() })
   permCopiesDone(p.copies, behavior, '從 Onsen 按的')
   log('info', `permission ${p.request_id}: ${behavior} pressed in Onsen (action ${c.action_id}); answered Claude Code, ${p.copies.length} Telegram cop${p.copies.length === 1 ? 'y' : 'ies'} edited`)
+  return true
 }
 
 // ---- WO-197 (defects 1, 2; lab 16:38–16:50Z): the screen's menus as Onsen Actions; what left the screen closed in Onsen ----------------------------
@@ -1907,21 +1923,22 @@ function openPickerAsk(pk: PickerSpec, title: string): void {
   log('info', `startup picker '${pk.key}' on pane ${pk.tmux}: asked in Onsen as an Action (${options.length} options)`)
 }
 /** a press in Onsen on a menu's Action: the keys pressed as a Telegram tap presses them (the same menu still on the pane, or nothing), then applied */
-async function applyPickerControl(pa: PickerAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<void> {
+async function applyPickerControl(pa: PickerAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl): Promise<boolean> {
   const acts = onsenActions!
   const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
-  if (pa.ended || pa.pressing) { acts.cancel(h, '選單已經不在畫面上了，沒有按'); return }
-  if (idx < 0 || idx >= pa.options.length) { acts.cancel(h, `不認得的選項 ${c.option_id}，沒有按`); return }
+  if (pa.ended || pa.pressing) { acts.cancel(h, '選單已經不在畫面上了，沒有按'); return false }
+  if (idx < 0 || idx >= pa.options.length) { acts.cancel(h, `不認得的選項 ${c.option_id}，沒有按`); return false }
   pa.pressing = true
   let res: 'ok' | 'gone' | 'stuck' = 'gone'
   try { res = await driveStartupPicker(pa.tmux, idx, pa.key) } finally { pa.ended = true; pa.pressing = false }
   if (res === 'gone') {
     log('info', `startup picker '${pa.key}' on pane ${pa.tmux}: ${c.option_id} pressed in Onsen (action ${c.action_id}), but the menu is not there any more: nothing pressed, cancelled`)
     acts.cancel(h, '選單已經不在畫面上了（在別處選過、逾時、或畫面已變），沒有按')
-    return
+    return false
   }
   acts.applied(h, { at: new Date().toISOString() })
   log('info', `startup picker '${pa.key}' on pane ${pa.tmux}: 「${pa.options[idx]}」 pressed in Onsen (action ${c.action_id})${res === 'stuck' ? '; the menu is still up' : ''}`)
+  return true
 }
 /** a Telegram tap on the relay's buttons pressed option idx of this menu: its Action is resolved by the presser, then applied */
 function pickerPressedHere(tmux: string, key: string, idx: number, member: string): void {
@@ -2032,6 +2049,7 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
 const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
 let itemPeek: ItemPeek | undefined
+let itemReceiver: ItemReceiver | undefined
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
@@ -4668,7 +4686,7 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     // message whose text is one), with today's handler; one it does not know goes on as a message
     const thread = CONNECTOR ? await connectorThreadOf(p, c, chat) : undefined
     if (CONNECTOR && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
-      && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined)) {
+      && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, it.item, String(p.message_id))) {
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} is a command; the connector handled it itself`)
       return { code: 200, json: { delivered: true, handled_here: true } }
@@ -4933,7 +4951,16 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
     await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     return
   }
-  if (row.kind === 'control') return
+  if (row.kind === 'control') {
+    const receiver = itemReceiver
+    if (!receiver || !(await receiver.receive([item])).given.has(row.id)) return
+    let applied = false
+    try {
+      const c = Onsen.actionControlOf(payload)
+      if (c && c.action_id === row.action_id) applied = await applyActionControl(c)
+    } finally { receiver.report([item], applied ? 'completed' : 'not_applied') }
+    return
+  }
   const kinds: Record<string, string> = { call: 'peer_call', mail: 'peer_mail', schedule: 'scheduled', keepwarm: 'wd_keepwarm' }
   if (row.call_id != null) payload.call_id = row.call_id
   await deliverPulled({ seq: row.number, kind: kinds[row.kind] ?? row.kind, sender: row.from, relay: row.relay,

@@ -37,7 +37,11 @@ export type MainPhase = 'starting' | 'idle' | 'in_turn' | 'walled' | 'gone'
 export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 type CutTurn = { at: number; why: string; retry_at?: number; background_agents?: number }
 
+import type { ItemRef } from './onsen-items.ts'
+import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
+
 export type MainEnv = {
+  itemReceiver?: () => ItemReceiver | undefined
   journal: Journal
   agent: string
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -340,7 +344,7 @@ export function createMain(E: MainEnv) {
   /** WO-201 (point 4): an item whose turn failed (failTurn) waiting for its retry time (`fail_retry_at`), or parked at the cap (reason stop_failure_cap):
    *  neither offered nor pulled nor riding until then (the gen's next final Stop lets them go at once: releaseFailed) */
   const waitsRetry = (r: Row, now = Date.now()): boolean => r.state === 'queued' && (r.reason === 'stop_failure_cap' || Number(r.fail_retry_at ?? 0) > now)
-  const queuedForOffer = (r: Row, g: Row): boolean => r.state === 'queued' && owed(r) && forGen(r, g) && !batchedRider(r) && !waitsRetry(r)
+  const queuedForOffer = (r: Row, g: Row): boolean => r.state === 'queued' && !(r.onsen_items && r.missed_state === deliveryNow() && r.missed_gen === g.id) && owed(r) && forGen(r, g) && !batchedRider(r) && !waitsRetry(r)
   /** the reason an offered item goes back with when nobody took the offer: a held item keeps its hold (it rides the next offer again) */
   const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : r.reason === 'batched' ? 'batched' : why
   /** an item that was in an interrupted turn: Chiron's line goes in front of it each time it reaches the main (cut_at, set when the turn was cut) */
@@ -437,6 +441,27 @@ export function createMain(E: MainEnv) {
       } while (wallWakePending)
     } finally { offering = false }
   }
+  function readyInTurn(r: Row): boolean {
+    const refs: ItemRef[] | undefined = r.onsen_items
+    return !refs || refs.every(ref => ref.kind === 'message' || ref.kind === 'call' || ref.kind === 'control' || Date.parse(ref.deadline ?? '') <= Date.now())
+  }
+
+  /** An album is one notification. If just some of its rows were given, return the claims without writing it. */
+  async function receiveRows(rows: Row[], hook: boolean, ready: () => boolean): Promise<Row[]> {
+    const receiver = E.itemReceiver?.()
+    const refs: ItemRef[] = rows.flatMap(r => r.onsen_items ?? [])
+    if (!receiver) return rows.filter(r => !r.onsen_items)
+    const { given, gone } = await receiver.receive(refs, hook)
+    const valid = ready()
+    return rows.filter(r => {
+      const own: ItemRef[] | undefined = r.onsen_items
+      if (!own) return valid
+      if (valid && r.state === 'queued' && own.every(ref => given.has(ref.onsen_item_id))) return true
+      receiver.report(own.filter(ref => given.has(ref.onsen_item_id)), 'not_taken')
+      if (own.some(ref => gone.has(ref.onsen_item_id))) closeItem(r, { reason: 'onsen_no_longer_waiting' })
+      return false
+    })
+  }
   async function offerNext(): Promise<void> {
     const g = currentGen()
     if (!g) return
@@ -492,6 +517,15 @@ export function createMain(E: MainEnv) {
         if (!group.includes(it) || it.state !== 'queued') continue
         riders = group.filter(r => r !== it && r.state === 'queued')
       }
+      if (it.onsen_items || riders.some(r => r.onsen_items)) {
+        if (it.via === 'tg' && !E.streamOpen(Number(g.pid))) continue
+        const group = await receiveRows([it, ...riders], false, stillReady)
+        if (!group.includes(it)) {
+          for (const r of group) if (r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'not_taken')
+          continue
+        }
+        riders = group.filter(r => r !== it)
+      }
       const dg = wall.active && !probe ? null : attachInfo(mb)
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
       const p = (it.notif?.params ?? {}) as Record<string, any>
@@ -507,6 +541,7 @@ export function createMain(E: MainEnv) {
       const now = currentGen()
       if (!now || now.id !== g.id) return
       if (!ok) {
+        for (const r of [it, ...riders]) if (r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'not_taken')
         down.add(String(it.via))
         if (it.last_no_wake !== 'unreachable') { J().write('msg', it.id, 'queued', { last_no_wake: 'unreachable' }); J().write('wake', it.id, 'no_wake', { reason: `main gen ${g.id} has no open ${it.via} stream` }) }
         continue
@@ -517,7 +552,7 @@ export function createMain(E: MainEnv) {
       }
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
-      for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null, person_wall_offer: wall.active && !probe || null })
+      for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null, person_wall_offer: wall.active && !probe || null, ...(it.onsen_items && probe ? { keeper_probe: true } : {}) })
       mentionsReached(dg)                                                                     // WO-181: in its session now: the mentions it carried are read
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) riding` : ''}` })
       for (const r of riders) J().write('wake', r.id, 'wake', { reason: `${r.reason}: rides the offer of ${it.id} (gen ${g.id})` })
@@ -567,11 +602,16 @@ export function createMain(E: MainEnv) {
       const fresh = wallDelivery(g)
       got = got.filter(r => r.state === 'queued' && wallAllows(r, fresh))
     }
+    if (got.some(r => r.onsen_items)) {
+      got = got.filter(readyInTurn)
+      if (got.some(r => r.onsen_items)) got = await receiveRows(got, true, () => currentGen() === g && g.prompt_id === prompt && g.state === 'in_turn' && !['compacting', 'starting', 'waiting', 'offline', 'walled'].includes(member() ?? ''))
+    }
     if (!got.length) return []
     const dg = wallDelivery(g).active ? null : attachInfo(mb)
     const all = dg ? [...got, dg] : got
     const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true, bound_at: at })
+    for (const r of got) if (r.onsen_items) E.itemReceiver?.()?.bind(r.onsen_items, 'main', prompt, g.session_id)
     for (const r of got) J().write('wake', r.id, 'wake', { reason: `pulled into the running turn ${prompt}` })
     try { E.bound?.(got.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }
     mentionsReached(dg)                                                                       // WO-181: bound into its turn: the mentions it carried are read
@@ -688,6 +728,7 @@ export function createMain(E: MainEnv) {
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
    *  given to the main again. It is the line about each (it meets their Joey line, as the asked-restart notice) */
   function tellClosed(rs: Row[], what: (r: Row) => string): void {
+    if (E.itemReceiver?.()?.mode.active) return
     const told = rs.filter(r => r.kind !== 'digest')
     if (!told.length) return
     const lines = Array.from(Map.groupBy(told, what), ([sentence, group]) =>
@@ -792,9 +833,12 @@ export function createMain(E: MainEnv) {
     const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
     // what the prompt names (its did="…"), and whatever was offered to this gen: one offer opens one turn, so it is this turn's
     const bind = items(r => (r.state === 'offered' && r.gen === g.id) || (ids.has(r.id) && r.state === 'queued' && forGen(r, g)))
-    const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
-    for (const r of bind) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at })
-    if (bind.length) { try { E.bound?.(bind.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }; delivered() }
+    const receiver = E.itemReceiver?.()
+    const accepted = bind.filter(r => !r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id)))
+    for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, 'main', prompt, g.session_id)
+    const at = new Date().toISOString()
+    for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at })
+    if (accepted.length) { try { E.bound?.(accepted.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }; delivered() }
   }
   /** the prompt the gen last stopped is running again: a Stop hook other than ours blocked that Stop. The turn was not over: it re-opens, and
    *  what that Stop closed is bound to it again. An item offered in the gap is not this turn's: it opens its own prompt (beginTurn). */
@@ -836,6 +880,11 @@ export function createMain(E: MainEnv) {
     if (p && (ev === 'PreToolUse' || ev === 'PostToolUse' || ev === 'Stop')) noteOutput(g, p, ev)
     switch (ev) {
       case 'UserPromptSubmit': {
+        if (p && b.dids?.length) {
+          const ids = new Set(b.dids.flatMap(id => String(id).split(',')))
+          const late = items(r => ids.has(r.id) && r.onsen_items && r.state === 'queued')
+          if (late.length) await receiveRows(late, true, () => currentGen() === g)
+        }
         if (p) beginTurn(g, p, b.dids)
         // lanes-golive (Chiron line8-delivery-20261122: on --resume a SessionStart hook's context reached the conversation in 25 of 334 resumes; startup, clear
         // and compact do get it): the main-only rules go with the session's first prompt (a typed one, or a delivered item's) when its SessionStart could
@@ -1139,7 +1188,7 @@ export function createMain(E: MainEnv) {
       // stuck episode below does not write such an item a third time (a client that is frozen, not deaf, takes every copy when it runs again).
       // WO-177 一: only an offer the record said the main could take for the whole lease was 「可以拿卻沒拿」 (a menu open: Claude Code holds the copy and
       // gives it the moment the menu closes; a second copy would be a second prompt)
-      const untaken = take ? offered.filter(r => r.reoffered !== g.id) : []
+      const untaken = take ? offered.filter(r => !r.onsen_items && r.reoffered !== g.id) : []
       if (untaken.length && now - since > OFFER_LEASE_MS && now - since <= limit) {
         for (const r of untaken) J().write('msg', r.id, 'queued', { reason: backReason(r, 'offer_untaken'), gen: null, prompt_id: null, via_pull: null, reoffered: g.id })
       } else if (owes && held && now - since > limit) {
@@ -1210,7 +1259,13 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
-  return { wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
+  function offerMissed(id: string): void {
+    const g = currentGen()
+    for (const r of items(r => (r.state === 'offered' || r.state === 'queued') && r.onsen_items?.some((ref: ItemRef) => ref.onsen_item_id === id))) {
+      J().write('msg', r.id, 'queued', { reason: 'offer_untaken', gen: null, prompt_id: null, missed_state: deliveryNow(), missed_gen: g?.id })
+    }
+  }
+  return { offerMissed, wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

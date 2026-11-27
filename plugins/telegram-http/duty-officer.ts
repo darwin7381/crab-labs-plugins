@@ -1500,7 +1500,7 @@ export class DutyOfficer {
    *  tap: the screen checked again, the option's keys, every copy edited the same way and ending 「從 Onsen 按的」; Onsen then hears it was applied. A
    *  menu Telegram answered first: Onsen hears what was really pressed. The menu gone, the screen changed, the officer off or still busy after 20 s:
    *  nothing is pressed and the Action is cancelled. 'unknown': not an ask of this daemon (the caller cancels it). `by`: who pressed it in Onsen */
-  async onOnsen(actionId: string, optionId: string, version: number, by: Promise<string | null> | null = null): Promise<string> {
+  async onOnsen(actionId: string, optionId: string, version: number, by: Promise<string | null> | null = null, applied?: () => void): Promise<string> {
     const a = this.askOfAction(actionId)
     if (!a) return 'unknown'
     if (version > (a.action_version ?? 0)) a.action_version = version
@@ -1509,6 +1509,7 @@ export class DutyOfficer {
       if (!a.closed) return null
       if (a.closed.how === 'answered' && a.closed.option_id) {
         this.actionCall(a, (acts, ref) => acts.applied(ref, { option_id: a.closed!.option_id, ...(a.closed!.member ? { resolved_by: a.closed!.member } : {}) }))
+        applied?.()
         return `answered in ${a.closed.via ?? 'telegram'} before (${a.closed.option_id})`
       }
       this.actionCall(a, (acts, ref) => acts.cancel(ref, a.closed!.how === 'answered' ? '已經在 Telegram 處理過了' : '畫面已經離開這個選單，沒有按'))
@@ -1525,6 +1526,7 @@ export class DutyOfficer {
     const who = (by ?? Promise.resolve(null)).then(x => x || 'Onsen', () => 'Onsen')
     const out = await this.answer(a, idx, who, null, 'onsen')
     if (out.off) this.actionCall(a, (acts, ref) => acts.cancel(ref, '值班員已經關掉，沒有按'))
+    if (a.closed?.how === 'answered' && a.closed.option_id) applied?.()
     return out.result
   }
 

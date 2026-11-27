@@ -344,7 +344,7 @@ let main: MainApi
 /** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
 function mainEnv() {
   return {
-    journal, agent: D.agent, log: D.log, registry: D.registry,
+    journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver,
     // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
     registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
       void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
@@ -3422,6 +3422,9 @@ function threadSummary(thread: string): string {
 }
 
 // ================================================================== lane queue + runner
+let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
+export function useItemReceiver(receiver: typeof itemReceiver): void { itemReceiver = receiver }
+export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
 export function observeItemGates(open?: () => void): void { onGateOpen = open }
 
@@ -4027,6 +4030,7 @@ export function laneSlots(): number {
   }
   return n
 }
+const startingItems = new Set<string>()
 function pump(): void {
   if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
   if (S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
@@ -4034,15 +4038,15 @@ function pump(): void {
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
-    if (running.has(it.lane) || chatFetching.has(it.lane)) continue    // one process per lane; this event waits for it (WO-144: or for the block of its run)
+    if (it.state !== 'queued' || startingItems.has(it.lane) || running.has(it.lane) || chatFetching.has(it.lane)) continue    // one process per lane; this event waits for it (WO-144: or for the block of its run)
     if (it.not_before && Date.now() < it.not_before) { setTimeout(pump, it.not_before - Date.now() + 10); continue }   // 002f: the backoff after a death
-    if (running.size + chatFetching.size >= slots) {                    // WO-144: a run whose block is being fetched holds its slot
+    if (running.size + chatFetching.size + startingItems.size >= slots) {                    // WO-144: a run whose block is being fetched holds its slot
       D.log('info', `lanes: ${slots} slot(s) in use (cap ${MAX_RUNNING}${slots < MAX_RUNNING ? `, quota ${Math.round((quotaUsed() ?? 0) * 100)}%` : ''}) — ${it.ev.id} for ${it.lane} waits in queue`)
       break
     }
     if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
     if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
-      if (running.size > 0 || chatFetching.size > 0) return
+      if (running.size > 0 || chatFetching.size > 0 || startingItems.size > 0) return
       if (mainChatPending(it)) return                     // WO-144: its block first; the fetch's end pumps again
       S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
       startRun(it)
@@ -4896,7 +4900,7 @@ function sessionBusy(it: QItem): boolean {
   if (!busyRetry) { busyRetry = setTimeout(() => { busyRetry = null; pump() }, SESSION_BUSY_RETRY_MS()); (busyRetry as any).unref?.() }
   return true
 }
-function startRun(it: QItem): void {
+function startRun(it: QItem, acquired = false): void {
   const lane = S.lanes[it.lane]
   if (!lane) {                                                             // 002w (A, gap 22): what its event set owes goes to the main
     endRun(it, 'died', { why: 'lane gone' })
@@ -4924,6 +4928,21 @@ function startRun(it: QItem): void {
     endRun(it, 'closed', { why: 'its lane was closed before it ran' })
     runEnded(lane, it, { reason: 'closed', said: `${lane.id} 在這件事開始處理之前被關閉了` })
     saveState(); return
+  }
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  if (refs.length && !acquired) {
+    if (!itemReceiver?.mode.active) return
+    const receiver = itemReceiver
+    startingItems.add(lane.id)
+    void receiver.receive(refs).then(({ given, gone }) => {
+      if (it.state === 'queued' && lane.status !== 'closed' && !sessionBusy(it) && refs.every(ref => given.has(ref.onsen_item_id))) {
+        startRun(it, true)
+      } else {
+        receiver.report(refs.filter(ref => given.has(ref.onsen_item_id)), 'not_taken')
+        if (gone.size && it.state === 'queued') endRun(it, 'dropped', { why: 'Onsen item no longer waiting' })
+      }
+    }).catch(e => D.log('warn', 'lanes: item take: ' + e)).finally(() => { startingItems.delete(lane.id) })
+    return
   }
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
@@ -4970,6 +4989,7 @@ function startRun(it: QItem): void {
     try { child.kill('SIGKILL') } catch {}
   }, LANE_MAX_RUN_MS)
   const openTools: OpenTools = new Map()                                // WO-177 六: what the run is doing now (runningLanes: the observation's doing)
+  if (refs.length) itemReceiver?.bind(refs, lane.id, runId)
   running.set(lane.id, { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools })
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
