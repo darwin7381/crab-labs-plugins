@@ -666,7 +666,10 @@ from the offer when that came later. The alarm names the open tool.
 - **Owed items nobody can take** (002w E, gaps 4, 11) are an episode of the same rule: owed items queued for longer than `LANES_MAIN_STUCK_MS` while
   there is no live gen (「主線不在」), or while the live gen is `idle` or `starting`, holds no offer and could not be offered them (its stream is down:
   「主線收不到訊息」). One alarm per episode with the queued count (`main-undelivered`); the next delivery (an offer written, or items bound or pulled into
-  a turn) ends it and Joey is told once (`main-delivered`). The end of a gen does not end it. 2a936a7 counted only a gen in a turn or holding an offer:
+  a turn) ends it and Joey is told once (`main-delivered`). M2 stores the opening time in milliseconds as `undelivered_since` on the
+  current or last registered gen. Before the first registration a `gone` record named `unregistered` holds it. A new gen inherits the
+  field, daemon startup restores it, and delivery clears it on the latest gen. Silent-gen episodes keep their in-memory lifetime.
+  2a936a7 counted only a gen in a turn or holding an offer:
   a stream that never opened, or no main at all, left Joey's messages waiting with nobody told (his own messages have no `due_at`).
 - Nothing else moves this clock: a frozen main (SIGSTOP) is alarmed once and re-offered once; it gets what was written into it when it runs again.
 

@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createMain, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
+import { createMain, MAIN_STUCK_MS, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { OnsenClient } from './onsen-client.ts'
 import { DeliveryFacts, LanesTap } from './onsen-status.ts'
@@ -666,4 +666,65 @@ test.each(['SessionEnd', 'StopFailure'])('WO-209 %s log counts the answered item
   await d.hook(event, 'both', { error: 'server_error' })
   expect(logs.find(l => l.includes('the model had answered'))).toMatch(/1 (?:item\(s\) )?the model had answered/)
   expect(d.journal.lastMain?.cut_turn).toBeUndefined()
+})
+
+test.each(['closed stream', 'last gen gone', 'never registered'])('WO-209 one undelivered episode across two daemon restarts (%s)', async start => {
+  const d = daemon(0, start === 'never registered' ? 'offline' : 'idle')
+  d.wall.walled = false
+  let open = false
+  const notices: string[] = []
+  d.env.streamOpen = () => open
+  d.env.offer = async () => open
+  d.env.tellJoey = text => notices.push(text)
+  if (start === 'last gen gone') await d.hook('SessionEnd', '')
+  const item = d.add('joey', '等待投遞')
+  await d.flush()
+  const since = T + MAIN_STUCK_MS + 1_000
+  setSystemTime(since)
+  await d.main.tick(since)
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toStartWith(start === 'closed stream' ? '主線收不到訊息' : '主線不在')
+  expect(d.journal.rows('main', r => r.undelivered_since === since)).toHaveLength(1)
+
+  const restart = () => {
+    const journal = new Journal(d.journal.path)
+    journal.load()
+    const main = createMain({ ...d.env, journal })
+    main.initMain()
+    return main
+  }
+  let main = restart()
+  await main.tick()
+  await main.mainEvent({ event: 'SessionStart', pid: 124, session_id: sid })
+  expect(main.currentGen()).toMatchObject({ state: 'starting', undelivered_since: since })
+  main = restart()
+  await main.tick()
+  expect(notices).toHaveLength(1)
+  open = true
+  main.streamOpened(124)
+  await Bun.sleep(0)
+  expect(main.items(r => r.id === item)[0].state).toBe('offered')
+  expect(main.currentGen()?.undelivered_since).toBeUndefined()
+  await main.mainEvent({ event: 'UserPromptSubmit', pid: 124, session_id: sid, prompt_id: 'take', dids: [item] })
+  await main.mainEvent({ event: 'Stop', pid: 124, session_id: sid, prompt_id: 'take', phase: 'final' })
+  expect(notices).toHaveLength(2)
+  expect(notices[1]).toStartWith('主線接到訊息了')
+  main = restart()
+  await main.mainEvent({ event: 'SessionStart', pid: 123, session_id: sid })  // reuse an earlier pid
+  expect(main.currentGen()?.undelivered_since).toBeUndefined()
+  expect(notices).toHaveLength(2)
+})
+
+test('WO-209 a silent open turn keeps its in-memory stuck episode', async () => {
+  const d = liveMain()
+  await d.hook('UserPromptSubmit', 'silent')
+  await d.main.tick(T + MAIN_STUCK_MS + 1_000)
+  expect(d.notices).toEqual(['main-stuck'])
+  expect(d.journal.lastMain?.undelivered_since).toBeUndefined()
+  const journal = new Journal(d.journal.path)
+  journal.load()
+  const main = createMain({ ...d.env, journal })
+  main.initMain()
+  await main.mainEvent({ event: 'PreToolUse', pid: 123, session_id: sid, prompt_id: 'silent', tool_name: 'Read' })
+  expect(d.notices).toEqual(['main-stuck'])
 })
