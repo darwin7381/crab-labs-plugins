@@ -211,6 +211,8 @@ export interface LanesDeps {
   /** receipt note (btcc-ack-auth): `note` is the run's one line, BTCC's field (scheduler.py complete_run reads note, stores outcome_note; it never read summary) */
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
   /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
+  inboundLog?: (body: Record<string, unknown>) => Promise<number | undefined>
+  schedulerTaken?: (runId?: string) => void
   registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
@@ -256,6 +258,8 @@ export type MainPicker = {
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
+import type { ItemRef } from './onsen-items.ts'
+
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
 const nowIso = () => new Date().toISOString()
@@ -1486,6 +1490,7 @@ function runBoundary(): BoundaryCard | null { return boundaryCardOn() ? boundary
 
 // ================================================================== router
 export type InEvent = {
+  onsen_items?: ItemRef[]
   id: string; source: 'telegram' | 'mesh' | 'mail'; from: string; text: string
   meta: Record<string, string>; notif: Notif
   verified?: boolean; thread?: string; hop?: number; lane_marker?: string
@@ -1879,6 +1884,11 @@ function recordOnlyRow(ev: InEvent, v: WakeVerdict): Decision {
 
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
+  if (ev.onsen_items?.some(r => r.main)) {
+    const d: Decision = { target: 'main', rule: 'onsen-main' }
+    toMain(ev, d)
+    return d
+  }
   const cfg = routerCfg()
   // lanes-topics (item 2): where Joey's message is (a topic, or outside topics): a reply to it goes there (targetTopic)
   if (D.role === 'tg' && S && ev.source === 'telegram' && !ev.synthetic) noteMsgTopic(ev.meta?.chat_id, ev.meta?.message_id, ev.message_thread_id ?? null)
@@ -2549,7 +2559,7 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   const cls = evClassOf(ev)
   recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain || notice ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
-  main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
+  main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(ev.onsen_items ? { fields: { person_message_ids: ev.person_message_ids, onsen_items: ev.onsen_items } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
 }
 /** Onsen step 2 (WO-142, server.ts): Joey edited Telegram message `messageId` in `chat` and the main has not seen it yet (its M1 item still queued, never
  *  offered): that item is rewritten (lanes-main.ts replaceQueued; server.ts gives the new text). true = replaced; false = the edit goes as a new message. */
@@ -2904,7 +2914,7 @@ const sampleOf = (arr: string[], ev: InEvent): void => { if (arr.length < 3) arr
 function endHold(peer: string, how: string): PeerHold | null {
   const h = S.holds?.[peer]
   if (!h) return null
-  delete S.holds![peer]; saveState()
+  delete S.holds![peer]; saveState(); onGateOpen?.()
   if (h.first) events?.note(h.first, { hold: { peer, count: h.count, reason: h.reason, ended: how, last: h.last ?? null } })   // M3 (PL1): the episode's head says how it ended
   ledger({ lane: 'router', kind: 'fyi',
     text: `peer_hold ${peer} 結束（${how}）：暫停期間擋下 ${h.count} 則${h.first ? `（第一則 ${h.first}、最後一則 ${h.last}）` : ''}；樣本：${h.samples.join(' ｜ ') || '（沒有）'}。原因：${h.reason}`,
@@ -2997,6 +3007,7 @@ export function floodTick(now = Date.now()): void {
     ledger({ lane: 'router', kind: 'fyi',
       text: `peer_flood ${peer}：${e.count} 則超過限制的訊息被合併（${windowS} 秒內，${stamp(e.start)} 起），第一則 ${e.first}、最後一則 ${e.last}；樣本：${e.samples.join(' ｜ ')}。同一段時間有 ${e.answered} 則照常開了車道，${e.count} 則只進帳本，估計省下約 ${avoided} token。`,
       refs: { peer_flood: peer, count: e.count, window_s: windowS, start: e.start, first: e.first, last: e.last, samples: e.samples, answered: e.answered, ledger_only: e.count, tokens_avoided: avoided, reasons: e.reasons } })
+    onGateOpen?.()
     logos('lane.peer_flood', { peer, phase: 'end', count: e.count, answered: e.answered, tokens_avoided: avoided })
     void pushJoey(undefined, `〔流量管制結束〕${peer} 安靜下來了：${windowS} 秒內共 ${e.count + e.answered} 則，${e.answered} 則開了車道回覆，${e.count} 則只進帳本，估計省下約 ${avoided} token。細節在帳本 peer_flood ${peer}。`, notifyProfile() === 'tiered')
   }
@@ -3411,6 +3422,34 @@ function threadSummary(thread: string): string {
 }
 
 // ================================================================== lane queue + runner
+let onGateOpen: (() => void) | undefined
+export function observeItemGates(open?: () => void): void { onGateOpen = open }
+
+export function editWaitingItem(item: ItemRef, content: string, at: string): void {
+  if (main.replaceQueued('', '', p => ({ content, meta: { ...p.meta, edited_at: at } }), item).length) return
+  for (const run of queue.values()) {
+    if (run.state !== 'queued') continue
+    for (const ev of runEvents(run)) {
+      const ref = ev.onsen_items?.find(r => r.onsen_item_id === item.onsen_item_id)
+      if (!ref) continue
+      Object.assign(ref, item)
+      ev.text = content
+      runRec(run, 'queued', { ev: lightEv(run.ev), extra: run.extra?.map(lightEv) })
+      return
+    }
+  }
+}
+
+/** initMain and restoreRuns have folded these two journals before the first peek. */
+export function itemIndex(): Map<string, number> {
+  const known = new Map<string, number>()
+  const add = (refs?: ItemRef[]) => { for (const ref of refs ?? []) known.set(ref.onsen_item_id, ref.onsen_version) }
+  for (const row of main.items(r => ['queued', 'offered', 'bound'].includes(r.state))) add(row.onsen_items)
+  for (const run of queue.values()) for (const ev of runEvents(run)) add(ev.onsen_items)
+  for (const list of Object.values(S.steering ?? {})) for (const record of list) add(record.ev.onsen_items)
+  return known
+}
+
 /** the in-memory view of an event's current run record (M5): the journal is its state; this is what pump and the tools read */
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; attempts: number; priority: number; summary?: string; enqueued: string
   /** the M5 record id of this event's current run; the process and lane run of a leased one */
@@ -8023,7 +8062,7 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
   if (sub === 'off' || sub === 'on') {
     if (sub === 'off') {
       if (!S.master_off) S.master_off = { since: nowIso(), by: who }
-    } else delete S.master_off
+    } else { delete S.master_off; onGateOpen?.() }
     saveState()
     const n = running.size
     // M3 (PL1): Joey's command is an inbound event too: its record tells the main the lanes are off (information, nobody owes anything)
@@ -8194,7 +8233,7 @@ async function peerCall(port: number | undefined, path: string, method: 'GET' | 
 }
 const TG_PORT = Number(process.env.LANES_TG_PORT ?? 0) || undefined
 const INBOX_PORT = Number(process.env.LANES_INBOX_PORT ?? 0) || undefined
-const inboxPost = (p: string, b: unknown) => peerCall(INBOX_PORT, p, 'POST', b)
+export const inboxPost = (p: string, b: unknown) => peerCall(INBOX_PORT, p, 'POST', b)
 const inboxGet = (p: string) => peerCall(INBOX_PORT, p, 'GET')
 
 /** inbox role: ask the tg router what to do with a mesh inbound. null = router unreachable → main. */
@@ -8464,6 +8503,14 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const sid = sessionOfPid(Number(b.pid))
       const offered = !!sid && !!b.notif && !!D.notifySession && await D.notifySession(sid, b.notif)
       sendJson(res, 200, { offered }); return true
+    }
+    if (p === '/lanes/inbound-log' && req.method === 'POST') {
+      const body = await readBody(req)
+      sendJson(res, 200, { id: await D.inboundLog?.(body) }); return true
+    }
+    if (p === '/lanes/scheduler-taken' && req.method === 'POST') {
+      D.schedulerTaken?.((await readBody(req)).run_id)
+      sendJson(res, 200, { ok: true }); return true
     }
     if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
       const b = await readBody(req)

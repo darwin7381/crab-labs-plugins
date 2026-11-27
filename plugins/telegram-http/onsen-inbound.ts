@@ -60,6 +60,7 @@ export function inboundEffective(value: string | undefined, agent: string, partn
 
 /** what the arrival knew of one Telegram message (all the <channel> tag is built from; plain JSON, kept on disk) */
 export type Facts = {
+  item?: import('./onsen-items.ts').ItemRef
   chat_id: string
   msgId?: number
   /** the content as the agent reads it (entities expanded; a file's placeholder such as (photo) when it has no caption) */
