@@ -27,8 +27,7 @@ const script = (name: string, body: string) => { const p = join(dir, name); writ
 const WALLED = script('walled.sh', `echo '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You have hit your weekly limit · resets 5:48pm (Asia/Taipei)"}'\nexit 1`)
 const OK = script('ok.sh', `echo '{"type":"result","subtype":"success","is_error":false,"result":"OK"}'\nexit 0`)
 const restore = L.__setClaudeBin(WALLED)
-L.__setWallProbe(100)
-afterAll(() => { L.__setClaudeBin(restore); L.__setWallProbe(300_000) })
+afterAll(() => { L.__setClaudeBin(restore) })
 
 // the pane: the limit menu as claude 2.1.322 draws it (labels from its own menu code), then the normal prompt once a key has been sent
 const LIMIT_PANE = (opts: string[], cursor = 0) => `\n You've hit your weekly limit · resets 5:48pm (Asia/Taipei)\n\n What do you want to do?\n\n${opts.map((o, i) => ` ${i === cursor ? '❯' : ' '} ${i + 1}. ${o}`).join('\n')}\n\n Enter to confirm · Esc to cancel\n`
@@ -53,7 +52,7 @@ const apiErr = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), isAp
 const turnEnd = (ms: number) => rec({ type: 'system', subtype: 'turn_duration', timestamp: iso(ms) })
 const genuine = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'end_turn', content: [{ type: 'text', text: '好' }] } })
 const toolUse = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'tuX', name: 'Bash', input: { command: 'make report' } }] } })
-/** PL4: the main's turn ends in StopFailure rate_limit (ITS wall: the lanes' wall is another record); at its retry time the probe offer comes, and a menu
+/** PL4: the main's turn ends in StopFailure rate_limit (ITS wall: the lanes' wall is another record); the keeper's clear enables an offer, and a menu
  *  on its pane is dealt with BEFORE that offer; the main takes the offer and its Stop ends the episode. Returns what Joey was told meanwhile. */
 let cyc = 0
 async function wallCycle(): Promise<string> {
@@ -66,6 +65,7 @@ async function wallCycle(): Promise<string> {
   await L.__mainEvent({ event: 'StopFailure', pid, prompt_id: p, error: 'rate_limit', reason: LIMIT })
   expect(L.__main().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(false)                // its own wall, not the lanes'
   state.drives = []; state.rearms = 0; order.length = 0
+  L.__main().statusChanged(Date.now())
   expect(await until(() => { void L.__main().tick(); return L.__main().items(r => r.id === item.id)[0].state === 'offered' })).toBe(true)   // the probe offer
   const p2 = `p-${Math.random().toString(36).slice(2)}`
   await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p2, dids: [item.id] }); await L.__mainEvent({ event: 'Stop', pid, prompt_id: p2, phase: 'final' })
@@ -125,6 +125,7 @@ test('G16a, PL4: the walled main\'s probe with the main on its limit menu: the p
   expect(notice.split('〔adam·分流器〕').length - 1).toBe(2)                                   // 002q (T7-R 1016): up and down; the handled menu rides the down notice
   expect(notice.indexOf('主線停在一個選單')).toBeGreaterThan(notice.indexOf('主線恢復了'))
   expect(state.rearms).toBe(0)
+  expect(await until(() => logos.some(r => r.kind === 'lane.main_menu'))).toBe(true)
   const m = logos.filter(r => r.kind === 'lane.main_menu').at(-1)
   expect(m).toMatchObject({ why: 'main-probe', chose: { idx: 0 }, result: 'ok', resurfaced: false }); expect(m.options).toEqual(SAFE)   // the labels are in the daemon's record
   expect(order[0]).toBe('drive')                                                                   // before the offer
@@ -212,7 +213,7 @@ esac`)
       expect(readFileSync(keys, 'utf8').trim().split('\n')).toEqual(['Up', 'Enter'])
       expect(readFileSync(screen, 'utf8')).toBe(NORMAL)
       expect(main.statusIdle(true, Date.now(), Date.now())).toBe(false)
-      expect(gen).toMatchObject({ state: 'walled', wall_since: episode, wall_refused_at: refusedAt, probes: 0 })
+      expect(gen).toMatchObject({ state: 'walled', wall_since: episode, wall_refused_at: refusedAt, uw_clear_used: wall.clearedMs })
       const lines = readFileSync(journal, 'utf8').slice(offset).trim().split('\n').map(l => JSON.parse(l))
       expect(lines.filter(l => l.wall_refused_at || l.ended_by === 'interrupted' || l.cut_by)).toEqual([])
       expect(lines.filter(l => l.rec === 'msg' && l.state === 'offered').map(l => l.id)).toEqual([id])

@@ -393,6 +393,8 @@ export class Poller {
         member: a.member, client_user_id: String(m.from.id),
         client_user: { username: m.from.username ?? null, display_name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || null },
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
+        // WO-179 (Onsen 0.39.5): a group's own name, for display (the conversation's title); null in a DM
+        chat_title: (m.chat?.type === 'group' || m.chat?.type === 'supergroup') && typeof m.chat.title === 'string' && m.chat.title.trim() ? m.chat.title : null,
         kind: shape.kind, attachment_file_ids: [] as string[],
         attachments: att ? [{ kind: attK, name: att.name ?? null, mime: att.mime ?? mimeOf(att.name) ?? null, bytes: att.size ?? null, client_ref: att.file_id ?? null }] : [],
         reply_to_client_msg_id: rt ? String(rt.message_id) : null,

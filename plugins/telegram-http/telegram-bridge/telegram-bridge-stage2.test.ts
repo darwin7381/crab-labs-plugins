@@ -142,7 +142,7 @@ describe('stage two', () => {
     tg.push(TOK, { message: { message_id: 503, from: { id: GUEST, is_bot: false, first_name: 'Guest' }, chat: g, date: Math.floor(Date.now() / 1000), text: '@gamma_bot hi', entities: [{ type: 'mention', offset: 0, length: 10 }] } })
     await until(() => tg.unconfirmed(TOK) === 0, 5000, 'all done')
     const inGroup = onsen.messages.slice(before)
-    expect(inGroup.map(x => [x.client_msg_id, x.chat])).toEqual([['502', String(GROUP)], ['503', String(GROUP)]])
+    expect(inGroup.map(x => [x.client_msg_id, x.chat, x.chat_title])).toEqual([['502', String(GROUP), 'Lab'], ['503', String(GROUP), 'Lab']])   // WO-179: the group's name
     expect(onsen.identities.get(String(GUEST))).toBe(`tg-${GUEST}`)                            // Onsen made the stranger a guest
     expect(tg.sentTo(TOK, String(GROUP)).length).toBe(0)
     onsen.push({ ...msgItem('g1', 'to the group'), chat: String(GROUP) })

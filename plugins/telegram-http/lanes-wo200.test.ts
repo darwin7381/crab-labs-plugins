@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createMain, INTERRUPTED_LINE, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
+import { createMain, MAIN_STUCK_MS, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { OnsenClient } from './onsen-client.ts'
 import { DeliveryFacts, LanesTap } from './onsen-status.ts'
@@ -28,7 +28,7 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
       return Response.json(id ? { data: { state: calls.get(id), thread_id: '9', conversation_id: '2', caller: 'scheduler' } }
         : path === '/deliveries/batch' ? { results: body.items.map(() => ({})) } : {})
     }) as typeof fetch })
-  if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid, retry_at: T + 3_600_000 })
+  if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid })
   const env: MainEnv = { journal, agent: 'adam', usageWall: () => wall, memberState: () => wall.walled ? 'walled' : 'idle',
     offer: async n => { const p = n.params as any; offers.push(p.meta.did?.split(',') ?? []); texts.push(p.content); return true },
     streamOpen: () => true, pidAlive: () => true, info: () => null, done: () => {}, undone: () => {},
@@ -108,7 +108,7 @@ test('WO-200 a human probe and a keeper clear each wake an overlapping offer pas
   }
 })
 
-test('WO-200 M2 timer offers nothing while keeper state is fresh', async () => {
+test('WO-200 a program item waits while the keeper reports a wall', async () => {
   const d = daemon()
   d.calls.set('9', 'accepted')
   d.add('peer', '9')
@@ -118,25 +118,25 @@ test('WO-200 M2 timer offers nothing while keeper state is fresh', async () => {
   expect(d.requests).toEqual([])
 })
 
-test('WO-200 M2 timer keeps the existing probe and backoff without fresh keeper state', async () => {
+test('WO-209 a walled gen without a keeper never spends a timed probe, even with a legacy deadline', async () => {
   const d = daemon()
   d.env.usageWall = () => null
+  // Replay an M2 record from 1.59.5 whose scheduled probe is now overdue.
+  d.journal.write('main', '123', 'walled', { retry_at: T + 3_600_000 })
   d.calls.set('9', 'accepted')
   const item = d.add('peer', '9')
+  let menuReads = 0
+  d.env.menu = async () => { menuReads++; return null }
   await d.flush()
+  setSystemTime(T + 86_400_000)
+  await d.main.tick(); await d.main.tick()
   expect(d.offers).toEqual([])
-  setSystemTime(T + 3_600_000)
-  const offer = d.env.offer
-  let attempts = 0
-  d.env.offer = async () => { attempts++; return false }
-  await d.main.tick(); await d.flush()
-  d.env.offer = offer
-  await d.main.tick(); await d.flush()
-  expect(attempts).toBe(1)
-  expect(d.offers).toEqual([])
-  setSystemTime(Number(d.main.currentGen()!.retry_at))
-  await d.main.tick(); await d.flush(); await d.main.tick()
-  expect(d.offers).toEqual([[item]])
+  expect(menuReads).toBe(0)
+  expect(d.requests).toEqual([])
+  expect(d.journal.get('msg', item)?.state).toBe('queued')
+  const person = d.add('joey', 'person')
+  await d.flush()
+  expect(d.offers).toEqual([[person]])
 })
 
 test('WO-200 a keeper clear in the same second releases a refused message', async () => {
@@ -149,6 +149,21 @@ test('WO-200 a keeper clear in the same second releases a refused message', asyn
   d.wall.clearedMs = T
   d.main.statusChanged(T)
   await d.flush()
+  expect(d.offers).toEqual([[item], [item]])
+})
+
+test('WO-209 a same-millisecond refusal still needs a newer keeper clear for another program offer', async () => {
+  const d = daemon()
+  d.calls.set('9', 'accepted')
+  const item = d.add('peer', '9')
+  d.clear(); await d.flush()
+  expect(d.offers).toEqual([[item]])
+  await d.hook('UserPromptSubmit', 'probe', { dids: [item] })
+  await d.hook('StopFailure', 'probe', { error: 'rate_limit' })
+  await d.main.tick()
+  expect(d.offers).toEqual([[item]])
+  setSystemTime(T + 1_000)
+  d.clear(); await d.flush()
   expect(d.offers).toEqual([[item], [item]])
 })
 
@@ -181,6 +196,8 @@ test('WO-200 (d) two refusals write blocked receipts and replay in order once', 
   expect(d.notices).toEqual(['main-wall-up', 'main-wall-down'])
 })
 
+const accountCutLine = '〔這一則你做到一半被打斷了（用量上限）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕'
+
 test('WO-200 (e) the keeper clear immediately offers an account cut with the interrupted line', async () => {
   const d = daemon(), item = d.add('joey', '107')
   await d.flush()
@@ -192,8 +209,7 @@ test('WO-200 (e) the keeper clear immediately offers an account cut with the int
   expect(d.offers).toEqual([[item]])
   d.clear(); await Bun.sleep(0)
   expect(d.offers).toEqual([[item], [item]])
-  expect(d.texts[1]).toStartWith(INTERRUPTED_LINE)
-  expect(d.texts[1]).not.toContain('接著做沒做完的')
+  expect(d.texts[1]).toStartWith(accountCutLine)
 })
 
 test('WO-200 (f) final Call gets one thread line and only the open Call reaches main', async () => {
@@ -311,8 +327,7 @@ test('WO-204 (c) both orders of refusal and account cut reach the same clear off
     }
     d.clear(); await Bun.sleep(0)
     expect(d.offers).toEqual([[ids[0]], [ids[1]], ids])
-    expect(d.texts[2].split(INTERRUPTED_LINE)).toHaveLength(2)
-    expect(d.texts[2]).not.toContain('接著做沒做完的')
+    expect(d.texts[2].split(accountCutLine)).toHaveLength(2)
   }
 })
 
@@ -373,7 +388,7 @@ test('WO-204 a person can finish during the wall while an older account cut stil
   expect(d.offers).toEqual([[cut], [person]])
   d.clear(); await Bun.sleep(0)
   expect(d.offers).toEqual([[cut], [person], [cut]])
-  expect(d.texts[2]).toStartWith(INTERRUPTED_LINE)
+  expect(d.texts[2]).toStartWith(accountCutLine)
 })
 
 test('WO-204 a Call queued while the menu closes takes precedence; an unknown Call keeps the clear available', async () => {
@@ -396,6 +411,77 @@ function liveMain() {
   d.wall.walled = false
   return d
 }
+
+test('WO-209 an answered process cut waits through a human wall probe, then goes once and closes on a second crash', async () => {
+  const d = liveMain()
+  const told: string[] = []
+  d.env.tellJoey = (text, rule) => { if (rule === 'main-cut') told.push(text) }
+  const item = d.add('joey', '半途的工作')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'work', { dids: [item] })
+  await d.hook('PreToolUse', 'work', { tool_name: 'Bash' })
+  await d.hook('SessionEnd', '')
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'queued', cut_by: 'gen_end', output_by: 'hook:PreToolUse', cuts: 1 })
+  d.wall.walled = true
+  setSystemTime(T + 60_000)
+  await d.hook('SessionStart', '', { pid: 124 })
+  await d.flush()
+  const person = d.add('joey', '新的訊息')
+  await d.flush()
+  expect(d.offers).toEqual([[item], [person]])
+  await d.hook('UserPromptSubmit', 'person', { dids: [person], pid: 124 })
+  expect((await d.hook('PostToolUse', 'person', { tool_name: 'Read', pid: 124 })).additionalContext).toBeUndefined()
+  await d.hook('Stop', 'person', { phase: 'final', pid: 124 })
+  await d.flush()
+  expect(d.offers).toHaveLength(2)
+  d.clear()
+  await Bun.sleep(0)
+  expect(d.offers).toEqual([[item], [person], [item]])
+  expect(d.texts[2]).toBe('〔這一則你做到一半被打斷了（對話結束）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕\n半途的工作')
+  await d.hook('UserPromptSubmit', 'retry', { dids: [item], pid: 124 })
+  await d.hook('PreToolUse', 'retry', { tool_name: 'Read', pid: 124 })
+  await d.hook('SessionEnd', '', { pid: 124 })
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
+  expect(told).toHaveLength(1)
+  expect(told[0]).toContain('處理到一半就結束了')
+  expect(told[0]).toContain('「半途的工作」')
+  await d.hook('SessionStart', '', { pid: 125 })
+  await d.main.tick()
+  expect(d.offers).toHaveLength(3)
+})
+
+test('WO-209 an answered item held by 1.59.5 keeps its first cut across upgrade', async () => {
+  const d = liveMain(), id = 'old-item'
+  d.journal.write('msg', id, 'queued', { kind: 'joey', reason: 'interrupted', cut_by: 'gen_end', cut_at: new Date(T - 1).toISOString(),
+    output_by: 'transcript', via: 'tg', notif: { method: 'notifications/claude/channel', params: { content: '舊訊息' } } })
+  await d.main.pump()
+  expect(d.offers).toEqual([[id]])
+  await d.hook('UserPromptSubmit', 'retry', { dids: [id] })
+  await d.hook('PreToolUse', 'retry', { tool_name: 'Read' })
+  await d.hook('SessionEnd', '')
+  expect(d.journal.get('msg', id)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
+})
+
+test('WO-209 one close notice describes the answered and unanswered items of the same crash', async () => {
+  const d = liveMain(), told: string[] = []
+  d.env.tellJoey = (text, rule) => { if (rule === 'main-cut') told.push(text) }
+  d.env.genuineAfter = () => 0
+  await d.hook('SessionStart', '', { transcript_path: 'test-transcript' })
+  const first = d.add('joey', '先到')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'retry', { dids: [first] })
+  const late = d.add('joey', '後到')
+  await d.hook('PostToolUse', 'retry', { tool_name: 'Read' })  // evidence for first, then pulls late
+  for (const id of [first, late]) {
+    expect(d.journal.get('msg', id)?.state).toBe('bound')
+    d.journal.write('msg', id, 'bound', { cuts: 1 })
+  }
+  await d.hook('SessionEnd', '')
+  for (const id of [first, late]) expect(d.journal.get('msg', id)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
+  expect(told).toHaveLength(1)
+  expect(told[0]).toMatch(/處理到一半就[^\n]*「先到」/)
+  expect(told[0]).toMatch(/還沒有任何輸出就[^\n]*「後到」/)
+})
 
 test('WO-209 (1,4) a bare turn killed before final Stop gets exactly one line on the next idle stream', async () => {
   const d = liveMain(), meta = { chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' }
@@ -601,4 +687,65 @@ test.each(['SessionEnd', 'StopFailure'])('WO-209 %s log counts the answered item
   await d.hook(event, 'both', { error: 'server_error' })
   expect(logs.find(l => l.includes('the model had answered'))).toMatch(/1 (?:item\(s\) )?the model had answered/)
   expect(d.journal.lastMain?.cut_turn).toBeUndefined()
+})
+
+test.each(['closed stream', 'last gen gone', 'never registered'])('WO-209 one undelivered episode across two daemon restarts (%s)', async start => {
+  const d = daemon(0, start === 'never registered' ? 'offline' : 'idle')
+  d.wall.walled = false
+  let open = false
+  const notices: string[] = []
+  d.env.streamOpen = () => open
+  d.env.offer = async () => open
+  d.env.tellJoey = text => notices.push(text)
+  if (start === 'last gen gone') await d.hook('SessionEnd', '')
+  const item = d.add('joey', '等待投遞')
+  await d.flush()
+  const since = T + MAIN_STUCK_MS + 1_000
+  setSystemTime(since)
+  await d.main.tick(since)
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toStartWith(start === 'closed stream' ? '主線收不到訊息' : '主線不在')
+  expect(d.journal.rows('main', r => r.undelivered_since === since)).toHaveLength(1)
+
+  const restart = () => {
+    const journal = new Journal(d.journal.path)
+    journal.load()
+    const main = createMain({ ...d.env, journal })
+    main.initMain()
+    return main
+  }
+  let main = restart()
+  await main.tick()
+  await main.mainEvent({ event: 'SessionStart', pid: 124, session_id: sid })
+  expect(main.currentGen()).toMatchObject({ state: 'starting', undelivered_since: since })
+  main = restart()
+  await main.tick()
+  expect(notices).toHaveLength(1)
+  open = true
+  main.streamOpened(124)
+  await Bun.sleep(0)
+  expect(main.items(r => r.id === item)[0].state).toBe('offered')
+  expect(main.currentGen()?.undelivered_since).toBeUndefined()
+  await main.mainEvent({ event: 'UserPromptSubmit', pid: 124, session_id: sid, prompt_id: 'take', dids: [item] })
+  await main.mainEvent({ event: 'Stop', pid: 124, session_id: sid, prompt_id: 'take', phase: 'final' })
+  expect(notices).toHaveLength(2)
+  expect(notices[1]).toStartWith('主線接到訊息了')
+  main = restart()
+  await main.mainEvent({ event: 'SessionStart', pid: 123, session_id: sid })  // reuse an earlier pid
+  expect(main.currentGen()?.undelivered_since).toBeUndefined()
+  expect(notices).toHaveLength(2)
+})
+
+test('WO-209 a silent open turn keeps its in-memory stuck episode', async () => {
+  const d = liveMain()
+  await d.hook('UserPromptSubmit', 'silent')
+  await d.main.tick(T + MAIN_STUCK_MS + 1_000)
+  expect(d.notices).toEqual(['main-stuck'])
+  expect(d.journal.lastMain?.undelivered_since).toBeUndefined()
+  const journal = new Journal(d.journal.path)
+  journal.load()
+  const main = createMain({ ...d.env, journal })
+  main.initMain()
+  await main.mainEvent({ event: 'PreToolUse', pid: 123, session_id: sid, prompt_id: 'silent', tool_name: 'Read' })
+  expect(d.notices).toEqual(['main-stuck'])
 })

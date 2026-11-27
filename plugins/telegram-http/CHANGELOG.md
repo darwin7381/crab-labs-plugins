@@ -1,11 +1,19 @@
-## 1.59.7 — 2026-11-28 (WO-168 stage two: one capture of the own pane, the record read by its readers)
+## 1.59.8 — 2026-11-28 (WO-168 stage two: one capture of the own pane, the record read by its readers)
 
 - **One capture of the daemon's own pane** (`pane-look.ts`, Joey TG chiron:2515 「不要補丁式」): the status record, the duty officer, the startup-picker's observer, the lanes main-wall probe's looks and presses, and the busy checks before a Telegram command read the own pane only through it; every look goes to the record. Roamer panes as before.
 - **The record carries more** (`screen-status.ts`): `menu_options`, `input_typed`, `waiting_text` for every menu, which screen it is for (`detail.screen`), a menu kept while walled or starting, a menu with no judge (the program's kind: `usage_limit_options`, `resume_picker`, `refusal_fallback`, `switch_confirm`, else `other`). `recordOf(look)`: the record for exactly one look, for readers that act.
 - **The duty officer reads the record on its own pane**, with Chiron's program rules (switch_confirm Esc, the refusal-fallback rule from modal-guard, its 3rd-strike BTCC alert). After its keys it looks until the screen changes (WO-97 gap). The lanes re-arm of the main's menu goes through it (item 5).
 - **A usage-limit screen is never the duty officer's** (Chiron #200727; Joey TG chiron:2918): neither the menu nor the line left after its 2nd option. The menu stays the lanes main-wall probe's, with WO-204's rule (the passive wait option, highlighted option verified before Enter); its looks are the one capture's, and a look that fails is never a menu that went away (`stuck`, nothing pressed before the keys).
 - The login monitor is retired on the own pane (system-alert covers it).
-- Merged with main at 1.59.6 (WO-204, WO-205, WO-207, WO-209).
+- Merged with main at 1.59.7 (WO-204, WO-205, WO-207, WO-209; 1.59.7 also the bridge chat_title and the pre-push canary fix).
+
+## 1.59.7 — 2026-11-28 (WO-209 item half; PL4 removed; the undelivered episode survives a restart)
+
+- **An item the model had answered when its process died goes at the next receivable moment** (Chiron's 1.59.5 lab case 2: it waited 600 s; mail #200855). An item held with `cut_by: gen_end` is a candidate as soon as a gen can take a program item (the moment WO-209's bare-turn line goes), leading an offer or riding one, with 「〔這一則你做到一半被打斷了（對話結束）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕」; an account cut released at the clear carries the same line with 用量上限. Esc, non-account StopFailure and session_start cuts keep the 600 s path and INTERRUPTED_LINE.
+- **One counter, one close rule**: `settle` counts a cut on the same `cuts` for an item with output and without (`CUT_REOFFERS` 1, then `cut_twice`); the no-output side is unchanged. Joey's close line says 「處理到一半」 or 「還沒有任何輸出」 per item, one notice for a mixed batch. A held item from 1.59.5 (cut_by, no cuts) counts as cut once.
+- **PL4 removed** (WO-206's keeper liveness pages now): no timed probe for a walled main; a keeper clear releases one program offer, a person's message still probes (WO-200). Gone: the `!wall && retry_at` probe arm, `advanceProbe`, the walled gen's `retry_at` / `probes` and their resets, the "no keeper" retry-slot line. `backoff()` stays for `fail_retry_at` and `cut_turn.retry_at`.
+- **The 「主線不在／收不到訊息」 episode is on the M2 record** (`undelivered_since`): read back at start and carried to a new gen, so a daemon restart does not tell Joey again (Chiron: 45961/45962/45964); before any registration it lives on an `unregistered` gone row.
+- Codex (call-882): 3a9a312, 155af9c, 43dced8, 107cc21, 7ca2a8e; branch tokens vs 20d8078 +77 / −76 (lanes-main.ts).
 
 ## 1.59.6 — 2026-11-28 (WO-207 plugin half: voice is transcribed once, on Onsen)
 

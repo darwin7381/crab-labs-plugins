@@ -53,7 +53,15 @@ ended decides, four cases only:
 | a normal end (its final `Stop`) | `done` (`received: stop`) |
 | a compaction inside it (SessionStart `source: compact` from the gen's own process while `in_turn`) | the turn goes on under the same `prompt_id` (measured 2026-11-27: 82 of 82 on the lanes journals of the Mac mini and txmonster): the gen stays `in_turn` with its prompt, nothing is queued again |
 | no normal end, and **no** genuine output after the item was bound | offered once more (`cuts: 1`); a second such end closes it (`done`, `reason: cut_twice`) with one line to Joey (`main-cut`). For a non-account StopFailure: the backoff and cap below |
-| no normal end, output **already** there (the process gone, another session, a non-account StopFailure) | an interrupted turn's, the Esc path's (`cutTurn` / `holdCut`): `queued`, `reason: interrupted`, `cut_at`, `cut_by` (`gen_end`, `session_start`, `stop_failure:<error>`). It rides the next delivery (an offer, or a pull into a running turn) with `INTERRUPTED_LINE` in front; with no next delivery within `MAIN_STUCK_MS` (600 s) of the main being able to take it, it is offered alone, once (`interrupted_untaken`, the WO-157c path) and nobody is told: no `main-stuck` push, no stuck episode, so no `main-unstuck` (Chiron mesh-13191: not a stuck main; before 1.59.1 such an item was offered again at once and Joey heard nothing). When the items going alone include any without `cut_by` (Esc-cut, a turn with no Stop), the WO-157c stuck path runs as before. Joey's own item cut this way goes alone too (one cut by Esc does not: Joey stopped it) |
+| no normal end, output **already** there | `holdCut` queues it with `reason: interrupted`, `cut_at`, `cut_by` and its output evidence. After process loss (`gen_end`) it rides or leads the next offer the main can take with the wall down. An account cut is released at the keeper's clear. Both carry instructions to finish the work and avoid repeating actions, with the reason 對話結束 or 用量上限. |
+
+A session change (`session_start`) or non-account StopFailure keeps `INTERRUPTED_LINE`. These items ride the next delivery or, after 600 s
+of receivable time, lead one quiet offer (`interrupted_untaken`). Esc cuts retain their own rule. Joey's Esc-cut item only rides, while a
+colleague's can lead after 600 s with the usual stuck notice.
+
+Process loss and session changes share one bound-item counter, `cuts`, regardless of output. The second known cut closes the item with
+`reason: cut_twice`. Joey's `main-cut` notice says whether work had started. A held process or session cut from 1.59.5 already records
+the first cut in `cut_by`.
 
 - **Output after the binding**: the item reached `done` at a final `Stop` before (`received: stop`, kept when its turn goes on: `turn_continued`), or M2
   itself received a hook event of the main for the item's own prompt, in its gen, after the item was bound (`noteOutput`, mesh-13196: PreToolUse /
@@ -61,8 +69,7 @@ ended decides, four cases only:
   the response that was already streaming; a subagent's event never: received live, so the last second the transcript may not have on disk yet when the gen
   ends is not missed; in memory, so after a daemon restart the transcript alone answers), or the gen's transcript has a genuine assistant record after the item's `bound_at` (liveness.ts `genuineAssistantAfterFile`: the fleet's one predicate
   `isGenuineAssistant`, i.e. not `isApiErrorMessage`, not model `<synthetic>`; and a response begun after `bound_at`: a block of a response already
-  streaming then, same `message.id`, does not count, because Claude Code runs a tool while its response still streams). Output means the work started,
-  not that it finished: such an item is never `done` without the turn's Stop. The held item's line says which fact it was (`output_by`: `stop`,
+  streaming then, same `message.id`, does not count, because Claude Code runs a tool while its response still streams). Output means the work started. The held item's line records the evidence (`output_by`: `stop`,
   `hook:<event>`, `transcript`).
 - **Where it is decided**: the end of a gen (kill -0, SessionEnd, another process taking the role) and another session in the same process while a turn is
   open (`/clear`, `/resume`; not a compaction) settle each item of that gen (`settle`); a non-account StopFailure, its turn's items (`failTurn`). An item
@@ -200,13 +207,13 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
    its answer to that peer is marked (002w B, turnWork). The stop's hand-over tells the main its answer will be marked.
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
-- An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once
+- An account-kind StopFailure walls the gen and records `wall_refused_at` plus the episode's original `wall_since`. Joey is told once
   (`main-wall-up`). Any other StopFailure (`server_error`, an overload, `unknown`) does not wall: the gen is `idle`
   with `error`; the turn's items are an interrupted turn's when the model had answered them, otherwise offered again after a backoff, with a cap (WO-201, above).
-- At `retry_at` M1 offers the walled gen one item: its probe (a limit menu on its pane is driven first, and Joey is told what was chosen,
-  `main-menu`). The gen leaves `walled` only on its own next hook event (the probe's UserPromptSubmit, or a SessionStart). A StopFailure in that
-  turn is the same episode: `probes` + 1, a longer `retry_at`, no new notice. The episode ends at the gen's next final Stop: `wall_since`,
-  `probes` and `retry_at` are cleared and Joey is told once (`main-wall-down`).
+- A keeper clear permits one program offer. M1 drives any limit menu first and records `uw_clear_used` after a successful stream write.
+  With no fresh keeper state the walled gen waits for a clear or a person's message eligible under WO-200.
+  Its own hook event takes it out of `walled`. A further refusal belongs to the same episode. Its next final Stop ends the episode
+  and sends one recovery notice (`main-wall-down`).
 - A new gen starts `idle` or `starting`, whatever the lanes' wall says.
 - **The wall episode is the agent's, not a gen's** (002w E, gap 13): a gen that ends while walled (killed, replaced, restarted) hands its open episode
   (`wall_since`, `wall_menu`) to the next gen at its SessionStart (the ended record's fields are cleared); that gen's first final Stop ends it with the
@@ -649,7 +656,7 @@ from the offer when that came later. The alarm names the open tool.
   too: a limit menu there is the main-wall mechanism's, not the watchdog's, and with no StopFailure this alarm is what puts it in front of Joey).
 - **The episode is M1's recovery signal** (002q, H02/H03: a notification lost on the client side under host load stayed lost, and the play never
   started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)
-  and M1 offers again at once (a walled gen at its next probe time). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
+  and M1 offers again at once (a walled gen on a new keeper clear). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
 - **The offer has its own bound** (002x; 002w r1 A05 and r2 I04: an offer written half a second after the gen's stream opened was never bound and
   waited for the stuck episode, which is ten minutes outside the lab): an idle gen's offer still unbound after `LANES_OFFER_LEASE_MS` of silence
   (20 s; the 1,304 offers of 002v and 002w were bound within 1.6 s) goes back to `queued` (`reason: offer_untaken`, `reoffered: <gen>`) and M1
@@ -659,7 +666,10 @@ from the offer when that came later. The alarm names the open tool.
 - **Owed items nobody can take** (002w E, gaps 4, 11) are an episode of the same rule: owed items queued for longer than `LANES_MAIN_STUCK_MS` while
   there is no live gen (「主線不在」), or while the live gen is `idle` or `starting`, holds no offer and could not be offered them (its stream is down:
   「主線收不到訊息」). One alarm per episode with the queued count (`main-undelivered`); the next delivery (an offer written, or items bound or pulled into
-  a turn) ends it and Joey is told once (`main-delivered`). The end of a gen does not end it. 2a936a7 counted only a gen in a turn or holding an offer:
+  a turn) ends it and Joey is told once (`main-delivered`). M2 stores the opening time in milliseconds as `undelivered_since` on the
+  current or last registered gen. Before the first registration a `gone` record named `unregistered` holds it. A new gen inherits the
+  field, daemon startup restores it, and delivery clears it on the latest gen. Silent-gen episodes keep their in-memory lifetime.
+  2a936a7 counted only a gen in a turn or holding an offer:
   a stream that never opened, or no main at all, left Joey's messages waiting with nobody told (his own messages have no `due_at`).
 - Nothing else moves this clock: a frozen main (SIGSTOP) is alarmed once and re-offered once; it gets what was written into it when it runs again.
 

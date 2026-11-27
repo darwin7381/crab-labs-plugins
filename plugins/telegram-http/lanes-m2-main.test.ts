@@ -166,7 +166,6 @@ test('002l N7: a turn cut right after it took a channel message in (before any t
 })
 
 // PL4 (AUD P11/P13/P12, T7-R, T6-R, T8-R, G07): the main's wall and the lanes' wall are two records. M2's moves only on the main's own hook events.
-const wallLines = (g: Gen) => mainLines(g.pid).filter(l => l.state === 'walled')
 test('PL4 P11/P13 (T7-R 1247.3): the lanes\' wall going up or down never moves the main: a walled main stays walled, an idle main stays idle', async () => {
   await drained()
   const g = await startMain()
@@ -177,7 +176,7 @@ test('PL4 P11/P13 (T7-R 1247.3): the lanes\' wall going up or down never moves t
   expect(state(id)).toBe('offered')                                                           // it is offered: the main has its own wall, and none
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
   await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: 'API Error: Request rejected (429)' })
-  expect(M().mainPhase()).toBe('walled'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', kind: 'rate_limit', probes: 0 })
+  expect(M().mainPhase()).toBe('walled'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', kind: 'rate_limit' })
   expect(mainLines(g.pid).at(-1).wall_since).toBeTruthy(); expect(state(id)).toBe('queued')
   await L.__wallDown('adam.reflex.4.r1'); await sleep(20)                                      // P11: a lane run gets through: the LANES' wall comes down ...
   expect(M().mainPhase()).toBe('walled'); expect(state(id)).toBe('queued')                    // ... and the main is not taken out of its own (no main signal)
@@ -210,24 +209,24 @@ test('002q G07: one subscription limit gives Joey one notice up and one down, fo
   await killed(g)
 })
 
-test('PL4: the walled main is offered one item at its retry time (its probe); it leaves walled on its own hook event; a second StopFailure is the same episode (no notice, longer backoff); its Stop ends the episode with one notice', async () => {
+test('PL4: the walled main is offered one item per keeper clear; it leaves walled on its own hook event; a second StopFailure is the same episode; its Stop ends the episode with one notice', async () => {
   await drained()
-  L.__setWallProbe(40)
   const g = await startMain()
   const k = sent.length
   const id = await joey('今天的報告呢？')
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
   await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: '429' })
   expect(state(id)).toBe('queued')
-  await M().pump(); expect(state(id)).toBe('queued')                                           // not before its retry time
-  await sleep(60); await M().tick()
+  await M().pump(); expect(state(id)).toBe('queued')
+  const firstClear = Date.now()
+  M().statusChanged(firstClear); await sleep(0)
   expect(state(id)).toBe('offered'); expect(M().mainPhase()).toBe('walled')                  // the probe offer: still walled until the main itself moves
   const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] })
   expect(M().mainPhase()).toBe('in_turn')                                                     // its own hook event
   await hook(g, 'StopFailure', { prompt_id: p2, error: 'rate_limit', reason: '429' })
-  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled', probes: 1 })
-  expect(mainLines(g.pid).at(-1).retry_at - Date.now()).toBeGreaterThan(40)                  // backed off
-  await sleep(120); await M().tick()
+  expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'walled' })
+  await M().tick(); expect(state(id)).toBe('queued')
+  M().statusChanged(Math.max(Date.now(), firstClear + 1)); await sleep(0)
   expect(state(id)).toBe('offered')
   const p3 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p3, dids: [id] }); await hook(g, 'Stop', { prompt_id: p3, phase: 'final' })
   expect(state(id)).toBe('done'); expect(M().mainPhase()).toBe('idle')
@@ -235,33 +234,29 @@ test('PL4: the walled main is offered one item at its retry time (its probe); it
   await sleep(20)
   expect(sent.slice(k).filter(s => s.startsWith('〔adam·分流器〕\n主線模型額度用完了')).length).toBe(1)   // one up ...
   expect(sent.slice(k).filter(s => s.includes('主線恢復了')).length).toBe(1)                  // ... one down, for one episode
-  L.__setWallProbe(3_600_000)
   await killed(g)
 })
 
-test('WO-120: with a fresh usage-wall state the walled main is not fed its PL4 probe; each new clear sends one offer at once, a failed one does not bypass the backoff', async () => {
+test('WO-120: a fresh keeper wall holds the main, each new clear permits one offer even after another refusal', async () => {
   await drained()
-  L.__setWallProbe(40)
   const g = await startMain()
   const id = await joey('週報呢？')
   const p = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
   await hook(g, 'StopFailure', { prompt_id: p, error: 'rate_limit', reason: '429' })
   expect(M().mainPhase()).toBe('walled')
   uwMode = { walled: true, clearedMs: null }
-  await sleep(80); await M().tick(); await M().pump()
-  expect(state(id)).toBe('queued')                                                             // retry time passed, but the keeper probes: nothing offered
-  L.__setWallProbe(3_600_000)
+  await M().tick(); await M().pump()
+  expect(state(id)).toBe('queued')
   const p0 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p0, dids: [] }); await hook(g, 'StopFailure', { prompt_id: p0, error: 'rate_limit', reason: '429' })
-  expect(Number(mainLines(g.pid).at(-1).retry_at) - Date.now()).toBeGreaterThan(60_000)        // next PL4 retry far away
   const c1 = Date.now()
   uwMode = { walled: false, clearedMs: c1 }
   await M().tick(); await M().pump()
-  expect(state(id)).toBe('offered')                                                            // cleared: offered now, not at retry_at
-  // the offer walls again while the state still shows the same clear (reader lag): no second immediate offer, retry_at governs
+  expect(state(id)).toBe('offered')
+  // the offer walls again while the state still shows the same clear (reader lag): only a newer clear permits another offer
   const p1 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p1, dids: [id] }); await hook(g, 'StopFailure', { prompt_id: p1, error: 'rate_limit', reason: '429' })
   expect(M().mainPhase()).toBe('walled'); expect(state(id)).toBe('queued')
   await M().tick(); await M().pump(); await M().pump()
-  expect(state(id)).toBe('queued')                                                             // same clear used once: no bypass of the backoff
+  expect(state(id)).toBe('queued')
   uwMode = { walled: false, clearedMs: c1 + 1000 }                                              // a newer clear: one offer now
   await M().tick(); await M().pump()
   expect(state(id)).toBe('offered')
