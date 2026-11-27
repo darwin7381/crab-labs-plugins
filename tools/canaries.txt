@@ -370,3 +370,16 @@ plugins/telegram-http/server.ts::const ROAMER = !INBOX_ONLY && Onsen.isRoamerEnv
 plugins/telegram-http/server.ts::if (!got[0]) throw new Error(`${Connector.NOT_TAKEN}（檔案 ${name} 沒存進 Onsen）`)
 plugins/telegram-http/wo197-final.test.ts::(b) the search: no daemon source but roamer-telegram.ts mentions grammy, api.telegram.org, bot.api or getUpdates
 plugins/telegram-http/test-fixtures/no-telegram-probe.ts::must not be loaded by this daemon
+# WO-201 (telegram-http 1.59.1, Chiron resend audit 2026-11-27 rule 3): an item is offered to the main again only on a fact. None removed: the two
+# requeue lines replaced (endGen's gen_end, sessionStart's session_start) held no canary. Added so a stale copy cannot bring "gen changed = re-offer all" back,
+# nor the first 1.59.1's "output = done" (Chiron mesh-13184: output already there = an interrupted turn's, holdCut; a dead process's cut item goes alone too).
+plugins/telegram-http/lanes-main.ts::function settle(g: Row, rs: Row[], why: string)
+plugins/telegram-http/lanes-main.ts::const goesOn = !!same && same.state === 'in_turn' && !!same.prompt_id && b.source === 'compact'
+plugins/telegram-http/lanes-main.ts::function failTurn(g: Row, p: string, err: string)
+plugins/telegram-http/lanes-main.ts::function holdCut(rs: Row[], by: string, outBy: Map<string, string>
+plugins/telegram-http/lanes-main.ts::(r.kind !== 'joey' || !!r.cut_by)
+plugins/telegram-http/lanes-main.ts::const quiet = cutOld.length > 0 && cutOld.every(r => !!r.cut_by)
+plugins/telegram-http/lanes-main.ts::function noteOutput(g: Row, p: string, ev: string): void
+plugins/telegram-http/lanes-main.ts::if (p && (ev === 'PreToolUse' || ev === 'PostToolUse' || ev === 'Stop')) noteOutput(g, p, ev)
+plugins/telegram-http/liveness.ts::export function genuineAssistantAfterFile(path: string, sinceMs: number): number | null
+plugins/telegram-http/lanes.ts::function mainCannotAct(): boolean
