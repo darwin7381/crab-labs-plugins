@@ -45,7 +45,7 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
     { fields: kind === 'joey' ? { person_message_ids: [n] } : { call_id: n }, batched })
   const flush = async () => { await Bun.sleep(0); await main.pump(); await Bun.sleep(0) }
   const hook = (event: string, prompt_id: string, other: object = {}) => main.mainEvent({ event, prompt_id, session_id: sid, pid: 123, ...other })
-  const clear = () => { wall.walled = false; wall.clearedMs = Date.now(); main.statusChanged() }
+  const clear = () => { wall.walled = false; wall.clearedMs = Date.now(); main.statusChanged(wall.clearedMs) }
   return { env, journal, main, add, wall, offers, texts, notices, requests, calls, client, hook, clear, flush }
 }
 
@@ -79,6 +79,33 @@ test('WO-200 (c) program waits through a human probe and is offered once on clea
   expect(d.offers).toEqual([[person]])
   d.clear(); await d.flush(); await d.main.tick()
   expect(d.offers).toEqual([[person], [call]])
+})
+
+test('WO-200 ordinary registration keeps an older handoff out of a prompt naming a human message', async () => {
+  const d = daemon(0, 'offline')
+  d.wall.walled = false
+  const handoff = d.main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: 'handoff', meta: {} } })
+  // As in the daemon, stream registration and SessionStart can both ask M1 to offer in the same turn of the event loop.
+  d.main.streamOpened(123)
+  await d.hook('SessionStart', '', { source: 'startup' })
+  const weekly = d.add('joey', 'weekly')
+  await d.hook('UserPromptSubmit', 'p-weekly', { dids: [weekly] })
+  const bound = d.main.turnWork(d.main.currentGen()!, 'p-weekly').items.map(r => r.id)
+  expect(bound).toEqual([weekly])
+  expect(d.journal.get('msg', handoff)?.state).toBe('offered')
+})
+
+test('WO-200 a human probe and a keeper clear each wake an overlapping offer pass', async () => {
+  for (const wake of ['person', 'clear']) {
+    const d = daemon()
+    d.calls.set('9', 'accepted')
+    const program = d.add('peer', '9')
+    // The first pass is still in flight. No manual pump or timer drives the second delivery.
+    const expected = wake === 'person' ? d.add('joey', '109') : program
+    if (wake === 'clear') d.clear()
+    await Bun.sleep(0)
+    expect(d.offers).toEqual([[expected]])
+  }
 })
 
 test('WO-200 M2 timer offers nothing while keeper state is fresh', async () => {

@@ -185,7 +185,7 @@ export function createMain(E: MainEnv) {
   /** the stuck episode: a live gen silent too long; or (002w E) `undelivered`: owed items nobody could take (no live gen, or one that cannot be offered them) */
   let stuck: { gen: string | null; prompt: string | null; at: number; undelivered?: boolean } | null = null
   let offering = false
-  let offerAgain = false
+  let wallWakePending = false
   let seq = 0
   let restoredThrough = 0
 
@@ -280,7 +280,7 @@ export function createMain(E: MainEnv) {
       J().write('main', g.id, 'walled', { wall_clear_at: clearedMs })
     }
     if (g) canTake(g)
-    void pump()
+    void pump(clearedMs != null ? 'wall-clear' : undefined)
   }
 
   // ------------------------------------------------------------------ M1
@@ -307,7 +307,7 @@ export function createMain(E: MainEnv) {
     else if (o.batched) J().write('wake', id, 'no_wake', { reason: `batched: rides the next delivery to the main and never wakes it alone${batchWaitMs() ? ` (it leads one after ${Math.round(batchWaitMs() / 60_000)} min)` : ''}` })
     else if (!g || g.state !== 'idle') J().write('wake', id, 'no_wake', { reason: !g ? 'main gone: offered to the next gen' : g.state === 'in_turn' ? 'main in a turn: pulled at its next tool boundary or Stop' : `main ${g.state}` })
     else if (!canTake(g)) J().write('wake', id, 'no_wake', { reason: `main ${member()} (the status record): offered when the record says it can take it` })   // WO-177 一
-    if (kind !== 'digest') void pump()
+    if (kind !== 'digest') void pump(kind === 'joey' ? 'person' : undefined)
     return id
   }
   const owed = (r: Row): boolean => E.owed ? E.owed(r) : r.kind !== 'digest'
@@ -399,12 +399,20 @@ export function createMain(E: MainEnv) {
   }
 
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
-  async function pump(): Promise<void> {
+  async function pump(wake?: 'person' | 'wall-clear'): Promise<void> {
     if (!E) return
-    if (offering) { offerAgain = true; return }
-    offering = true                                                   // one offer at a time: the decision and the write are one transition
+    if (offering) {
+      // Only a person's wall probe or the keeper's clear needs an immediate pass after this one.
+      // Stream registration and ordinary enqueues keep the existing one-offer ordering.
+      if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
+      return
+    }
+    offering = true
     try {
-      do { offerAgain = false; await offerNext() } while (offerAgain)
+      do {
+        wallWakePending = false
+        await offerNext()
+      } while (wallWakePending)
     } finally { offering = false }
   }
   async function offerNext(): Promise<void> {
