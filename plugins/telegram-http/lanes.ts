@@ -210,6 +210,8 @@ export interface LanesDeps {
   mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string; no_reply?: boolean }>
   /** receipt note (btcc-ack-auth): `note` is the run's one line, BTCC's field (scheduler.py complete_run reads note, stores outcome_note; it never read summary) */
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
+  /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
+  registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
   mailWaiting?: () => Promise<{ ok: boolean; items?: Array<{ id: number; title?: string; decide?: string; deadline?: string; overdue?: boolean }>; why?: string }>
@@ -339,6 +341,10 @@ let main: MainApi
 function mainEnv() {
   return {
     journal, agent: D.agent, log: D.log, registry: D.registry,
+    // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
+    registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
+      void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
+    },
     offer: async (notif: Notif, via: Via, pid: number): Promise<boolean> => {
       if (via === 'inbox') return !!(await inboxPost('/lanes/offer', { pid, notif }))?.offered
       const sid = sessionOfPid(pid)
@@ -8458,6 +8464,13 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const sid = sessionOfPid(Number(b.pid))
       const offered = !!sid && !!b.notif && !!D.notifySession && await D.notifySession(sid, b.notif)
       sendJson(res, 200, { offered }); return true
+    }
+    if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
+      const b = await readBody(req)
+      const state = b.state === 'open' ? 'open' : 'clear'
+      const text = D.registryAlert ? await D.registryAlert({ state, ...(state === 'open' ? { session: String(b.session ?? '').slice(0, 64), pid: Number(b.pid) || 0, why: String(b.why ?? '').slice(0, 120) } : {}) })
+        : 'no BTCC alert path on this daemon'
+      sendJson(res, 200, { text, ok: /^HTTP 2/.test(text) }); return true
     }
     if (p === '/lanes/scheduler' && req.method === 'POST') {
       const b = await readBody(req)

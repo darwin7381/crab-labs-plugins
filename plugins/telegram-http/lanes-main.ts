@@ -66,6 +66,9 @@ export type MainEnv = {
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
   registry?: Pick<Registry, 'mainForAdoption' | 'backgroundAgents'>
+  /** WO-205 (Chiron mesh-13475): the registry shows this agent's live main while M2 has no gen for REG_SETTLE_MS (`open`), or a gen registered
+   *  (`clear`): a BTCC page alert to the connector's maintainer, relayed by the agent-inbox daemon with its mesh credential. Fire and forget */
+  registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => void
   /** 002v: the accepted main's session id is the expected one from now on (.lanes/main-expected): a /clear's new session survives a restart */
   expect?: (sid: string) => void
   pidAlive: (pid: number) => boolean
@@ -173,6 +176,7 @@ export type MainApi = ReturnType<typeof createMain>
 export function createMain(E: MainEnv) {
   let cur: string | null = null                           // the live gen (id = pid as text)
   let registryGap: { since: number; told: boolean } | null = null
+  let registryAlertOpen: boolean | null = null              // WO-205: the registry alert is open; null = not known since this daemon started
   const lastEventAt = new Map<string, number>()          // gen → ms of its last hook event (silence = the stuck rule)
   const toolBound = new Map<string, number>()            // gen → ms the open tool may stay silent: its own declared timeout (0 = it declares none)
   const pendingEnd = new Map<string, EndReason>()        // gen → why it is about to end (asked: /restart; replaced: /main renew)
@@ -199,7 +203,7 @@ export function createMain(E: MainEnv) {
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
-    cur = null; registryGap = null; stuck = null; offering = false; takeSince = null; hookOut.clear()
+    cur = null; registryGap = null; registryAlertOpen = null; stuck = null; offering = false; takeSince = null; hookOut.clear()
     lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear(); openTools.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
@@ -1002,6 +1006,8 @@ export function createMain(E: MainEnv) {
       cut_turn: previous?.cut_turn ?? null, resume_sent: previous?.resume_sent ?? null, resumes: previous?.resumes ?? 0 })
     cur = id
     registryGap = null
+    // the alert's recovery; after a daemon start it is not known whether one is open (BTCC treats a clear with none open as nothing)
+    if (registryAlertOpen !== false) { registryAlertOpen = false; try { E.registryAlert?.({ state: 'clear' }) } catch (e) { E.log('warn', `lanes: registry alert: ${e}`) } }
     lastEventAt.set(id, Date.now())
     try { E.expect?.(sid) } catch {}                                       // 002v: the main's session now (a /clear changed it): the next launch's id
     E.log('info', `lanes: main gen ${id} (session ${sid}, ${b.source ?? 'startup'})`)
@@ -1031,9 +1037,10 @@ export function createMain(E: MainEnv) {
     registryGap ??= { since: now, told: false }
     if (!registryGap.told && now - registryGap.since >= REG_SETTLE_MS) {
       registryGap.told = true
-      const text = `${E.agent} 的主線出現在 session registry，但 M2 尚未接手（session=${sessionId} pid=${pid}，${why}）。`
-      E.log('warn', text)
-      E.tellJoey(text, 'main-registry-disagreement')
+      E.log('warn', `${E.agent} 的主線出現在 session registry，但 M2 尚未接手（session=${sessionId} pid=${pid}，${why}）。`)
+      // Chiron mesh-13475: not a line to Joey (no new Joey-facing signal without his ruling): a BTCC page alert to the connector's maintainer
+      registryAlertOpen = true
+      try { E.registryAlert?.({ state: 'open', session: sessionId, pid, why }) } catch (e) { E.log('warn', `lanes: registry alert: ${e}`) }
     }
   }
   /** the tg daemon's MCP stream of the main opened: a starting gen can now be offered */

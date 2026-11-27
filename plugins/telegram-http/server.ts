@@ -4209,6 +4209,17 @@ if (Lanes.LANES_ON) {
           return `${action} run ${runId}: HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}`}`
         } catch (e) { return `${action} run ${runId} failed: ${e}` }
       },
+      // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
+      // BTCC names the agent from this daemon's mesh credential
+      registryAlert: async a => {
+        if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
+        const machine = ((process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
+        try {
+          const r = await fetch(`${BTCC_API_BASE}/api/fleet/main-registry`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() }, body: JSON.stringify({ machine, ...a }), signal: AbortSignal.timeout(6000) })
+          return `HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}`}`
+        } catch (e) { return `failed: ${e}` }
+      },
     } : {
       sendBot: async (chat, text, o) => {
         // lanes-topics (item 2): a lane's line carries its lane's topic (explicit); the router's notices the topic of the message they answer, if any
