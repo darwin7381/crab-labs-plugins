@@ -163,6 +163,8 @@ export const CUT_REOFFERS = 1
 export let MAIN_FAIL_MAX = num('LANES_MAIN_FAIL_MAX', 3)
 export const __setMainFailMax = (n: number): void => { MAIN_FAIL_MAX = n }
 const BODY_MAX = 4000
+// Before the first registration there is no pid to own an undelivered episode. This M2 row is always gone.
+const UNREGISTERED = 'unregistered'
 /** the first words of an event's text (the Stop check names each event it holds the turn for) */
 const firstWords = (t: string): string => { const s = String(t ?? '').replace(/\s+/g, ' ').trim(); return s.length > 30 ? `${s.slice(0, 30)}…` : s }
 const WALL_WORD: Record<string, string> = { rate_limit: '模型額度用完了', authentication_failed: '模型登入失效', billing_error: '模型帳務出錯', account_on_hold: '模型帳號被暫停',
@@ -207,6 +209,8 @@ export function createMain(E: MainEnv) {
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
     const g = live[live.length - 1]
     if (g) { cur = g.id; lastEventAt.set(g.id, Date.now()) }
+    const at = latestMain()?.undelivered_since
+    if (at != null) stuck = { gen: cur, prompt: null, at, undelivered: true }
     const restored = J().rows('msg')
     restoredThrough = restored.at(-1)?.n ?? 0
     seq = restored.length
@@ -214,6 +218,7 @@ export function createMain(E: MainEnv) {
 
   // ------------------------------------------------------------------ M2 queries (everything else asks these)
   function currentGen(): Row | null { return cur ? J().get('main', cur) ?? null : null }
+  function latestMain(): Row | undefined { return currentGen() ?? J().lastMain ?? J().get('main', UNREGISTERED) }
   function mainPid(): number | null { const g = currentGen(); return g ? Number(g.pid) : null }
   function mainPhase(): MainPhase { return (currentGen()?.state as MainPhase) ?? 'gone' }
   /** WO-132 (item 3): when the main's running turn started (this daemon saw its first hook event), or null (not in a turn, or begun before this daemon) */
@@ -540,8 +545,13 @@ export function createMain(E: MainEnv) {
   /** 002w (E, gaps 4, 11): an item reached the main (offered, or bound at a boundary): an episode of owed items nobody could take is over */
   function delivered(): void {
     if (!stuck?.undelivered) return
+    recordUndelivered(null)
     stuck = null
     E.tellJoey('主線接到訊息了：等著的訊息現在交給它。', 'main-delivered')
+  }
+  function recordUndelivered(since: number | null): void {
+    const g = latestMain()
+    J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { undelivered_since: since })
   }
 
   /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary. `mb` (WO-181): the unread mentions
@@ -995,14 +1005,15 @@ export function createMain(E: MainEnv) {
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const since = ended.map(r => String(r.wall_since)).sort()[0]
     const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
-    const previous = same ?? J().lastMain
+    const previous = latestMain()
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, wall_menu: null })
     // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
     // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)
     const carried = ['startup', 'clear', 'compact'].includes(String(b.source ?? ''))
     J().write('main', id, goesOn ? 'in_turn' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
       source: b.source ?? null, ...(goesOn ? {} : { prompt_id: null, tool_open: null, stopped_prompt: null }), end_reason: null, rules_shown: carried ? sid : null, ...carry,
-      cut_turn: previous?.cut_turn ?? null, resume_sent: previous?.resume_sent ?? null, resumes: previous?.resumes ?? 0 })
+      cut_turn: previous?.cut_turn ?? null, resume_sent: previous?.resume_sent ?? null, resumes: previous?.resumes ?? 0,
+      undelivered_since: previous?.undelivered_since ?? null })
     cur = id
     registryGap = null
     // the alert's recovery; after a daemon start it is not known whether one is open (BTCC treats a clear with none open as nothing)
@@ -1098,6 +1109,7 @@ export function createMain(E: MainEnv) {
     if (!stuck && !held && (!g || ((g.state === 'idle' || g.state === 'starting') && !items(r => r.state === 'offered' && r.gen === g.id).length))) {
       const owedNow = items(r => r.state === 'queued' && owed(r) && !heldCut(r) && !batchedRider(r, now) && !waitsRetry(r, now))     // WO-157c: a held item waits for a delivery, not for a stream (WO-164: a batched one too; WO-201: a failed turn's, its retry time)
       if (owedNow.some(r => now - Date.parse(String(r.ts)) > MAIN_STUCK_MS)) {
+        recordUndelivered(now)
         stuck = { gen: g?.id ?? null, prompt: null, at: now, undelivered: true }
         const mins = Math.max(1, Math.round((now - Math.min(...owedNow.map(r => Date.parse(String(r.ts))))) / 60_000))
         // WO-177 ② (Chiron 03:41Z, verbatim): the record says the main is working (busy, stuck) while M2 has had no turn: the items wait on the record, not on
