@@ -412,7 +412,7 @@ export type RecordFacts = {
   scheduleThread?: (thread: string) => boolean
   /** WO-180 (Chiron 04:42Z, 1): the duty officer watches the main's pane: every menu on it is the officer's first */
   dutyWatches?: boolean
-  /** this agent's own Onsen member name: a usage-limit menu waits on its own connector (WO-168, Chiron #200727) */
+  /** this agent's own Onsen member name: a usage-limit menu waits on its own connector (WO-168, Chiron #200727). ScreenStatus fills it with its agent */
   self?: string | null
   /** WO-180 (Chiron 04:42Z, 2): the person the main's questions go to on Telegram, as an Onsen member: access.json's recipients through the mapping the
    *  Actions' assignees use (Onsen.assigneesOf; lab-relay: joey-test). Not given: the owner (assigneesOf's own fallback) */
@@ -890,7 +890,7 @@ export class ScreenStatus {
     const own = ok && a!.hash !== c!.hash
     const sc: ScreenCtx | null = ok ? (own ? { hash: a!.hash, seen_at: a!.seenAt, facts: a!.facts, look: a!.look } : { hash: c!.hash, seen_at: c!.at, facts: c!.facts, look: c!.seq > 0 })
       : seen?.alive ? { hash: seen.hash, seen_at: seen.at, facts: seen.facts, look: seen.seq > 0 } : null
-    const r = composeRecord(ok ? a!.v! : null, ok ? (own ? a!.parts.st : c!.parts.st) : seen?.alive ? seen.parts.st : null, p, { ...f, alive: seen ? seen.alive : null }, sc)
+    const r = composeRecord(ok ? a!.v! : null, ok ? (own ? a!.parts.st : c!.parts.st) : seen?.alive ? seen.parts.st : null, p, { self: this.d.agent, ...f, alive: seen ? seen.alive : null }, sc)
     return { view: this.act.listed ? r.view : p, observation: r.observation }
   }
   /** WO-168 stage two: the record for exactly this look's screen (the one a reader is about to act on): its own verdict when the judge has answered for its
@@ -903,7 +903,7 @@ export class ScreenStatus {
     const a = this.answer?.hash === hash ? this.answer : this.cache.get(hash) ?? null
     const fresh = !!a && (a === this.answer || this.now() - a.at < this.o.cacheMs)
     const v = this.act.on && alive && !gone(p) && fresh && a?.v ? a.v : null
-    return { view: composeRecord(v, alive ? parts.st : null, p, { ...f, alive }, alive ? { hash, seen_at: look.at, facts } : null).view, hash, facts, alive }
+    return { view: composeRecord(v, alive ? parts.st : null, p, { self: this.d.agent, ...f, alive }, alive ? { hash, seen_at: look.at, facts } : null).view, hash, facts, alive }
   }
   /** the screen with this hash is still the one showing and this verdict is the one in use for it (a judge's own check, a moment later) */
   holds(hash: string, v: ScreenVerdict): boolean { return this.cur?.hash === hash && this.answer?.hash === hash && this.answer.v === v }
