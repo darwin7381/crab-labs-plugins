@@ -338,6 +338,8 @@ export class StatusPin {
     delete this.saved.chats[chat]
     this.persist()
   }
+  /** the next update in this chat sends at once, not after the wait a failed send set (telegram-bridge: the person wrote to the bot) */
+  retryNow(chat: string): void { const s = this.slots.get(chat); if (s) s.retryAt = 0 }
   /** the text this chat's status message should show now */
   update(chat: string, text: string): void {
     if (this.isOff(chat)) {

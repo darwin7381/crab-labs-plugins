@@ -394,6 +394,34 @@ describe('the bridge, end to end against the fakes', () => {
     expect(onsen.bad).toEqual([])
   }, T)
 
+  test('the pinned status: only in a DM of a person on allowFrom; chat not found → not tried again until the person writes (WO-196, Chiron 11-27 05:36Z)', async () => {
+    const t = TOK.alpha
+    const acc = (allow: string[]) => put(join(sd('alpha'), 'access.json'), { dmPolicy: 'pairing', allowFrom: allow, groups: { '-100777': { requireMention: true, allowFrom: [] } }, pending: {} })
+    const obs = (chat: string, activity = 'idle') => onsen.push({ type: 'observation', member: 'alpha', conversation_id: 'cv', chat, status: { presence: 'online', lifecycle: 'ready', main_session_id: 'main',
+      sessions: [{ id: 'main', kind: 'main', activity, blockers: [], activity_since: new Date().toISOString() }] } })
+    const to = (m: string, chat: string) => tg.callsOf(t, m).filter(p => String(p.chat_id) === chat).length
+    obs('777')                                        // not on allowFrom: nothing sent there
+    await Bun.sleep(800)
+    expect(to('sendMessage', '777')).toBe(0)
+    acc([String(JOEY), '888'])
+    tg.fail.set('sendMessage', { code: 400, description: 'Bad Request: chat not found', times: 1 })
+    obs('888')
+    await until(() => to('sendMessage', '888') === 1, 3000, 'tried once')
+    tg.fail.clear()
+    obs('888', 'busy')                                // marked: not tried again
+    await Bun.sleep(800)
+    expect(to('sendMessage', '888')).toBe(1)
+    tg.push(t, { message: { message_id: 8801, from: { id: 888, is_bot: false, first_name: 'P' }, chat: { id: 888, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'hi' } })
+    await until(() => tg.bots.get(t)!.pinned.has('888'), 5000, 'pinned once the person wrote')
+    await Bun.sleep(300)
+    acc([String(JOEY)])                               // taken off the list: the status in that chat is no longer edited
+    const e0 = to('editMessageText', '888') + to('sendMessage', '888')
+    obs('888', 'busy'); await Bun.sleep(400); obs('888', 'idle')
+    await Bun.sleep(800)
+    expect(to('editMessageText', '888') + to('sendMessage', '888')).toBe(e0)
+    expect(onsen.bad).toEqual([])
+  }, T)
+
   test('a send that fails is tried again (10 s / 30 s / 2 min; 0.2/0.3/0.4 s here; a 429 waits its retry_after), then reported failed', async () => {
     const chat = String(JOEY)
     tg.fail.set('sendRichMessage', { code: 500, description: 'Internal Server Error', times: 2 })

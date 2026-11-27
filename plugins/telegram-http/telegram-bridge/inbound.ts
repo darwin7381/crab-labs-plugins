@@ -275,6 +275,9 @@ export class Poller {
       e.done = true; return
     }
     const cmd = typeof m.text === 'string' && m.text.startsWith('/') ? m.text.slice(1).split(/[\s@]/)[0]!.toLowerCase() : ''
+    // WO-196 (Chiron 11-27): the person wrote to the bot in a DM (/start included), so the chat exists: a chat marked gone for the pinned status
+    // has it again (pinAllowed still asks allowFrom)
+    if (m.chat?.type === 'private') a.chatAlive(String(m.chat.id))
     if (cmd === 'start' || cmd === 'help') {
       // the bridge answers these two itself, in a DM, to whoever the daemon answered (no pairing side effects); never written (as the daemon)
       if (dmCommandGate(a.stateDir, m)) await this.send(String(m.chat.id), cmd === 'start' ? START_TEXT : HELP_TEXT)
