@@ -253,11 +253,12 @@ export function createMain(E: MainEnv) {
     const probe = g?.state === 'walled' && !wall?.walled && ((!wall && Date.now() >= Number(g.retry_at ?? Infinity)) || (clear ?? 0) > Number(g.uw_clear_used ?? 0))
     return { active, person: active && personCanProbe(last || null), clear, probe }
   }
+  const accountRefusal = (reason: unknown): boolean => typeof reason === 'string' && reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(reason.slice('stop_failure:'.length))
   /** An item already refused or interrupted by this wall waits for the clear. */
   function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
     if (!wall.active) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
-    const refused = typeof r.reason === 'string' && r.reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(r.reason.slice('stop_failure:'.length))
+    const refused = accountRefusal(r.reason) || (heldCut(r) && accountRefusal(r.cut_by))
     return wall.person && r.kind === 'joey' && !refused
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
@@ -434,8 +435,9 @@ export function createMain(E: MainEnv) {
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
-    // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
-    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
+    // A keeper clear lets this episode's interrupted items lead the probe. Older journals only have cut_by.
+    const clearedCut = (r: Row) => wall.clear != null && accountRefusal(r.cut_by) && (!r.cut_wall_since || !g.wall_since || r.cut_wall_since === g.wall_since)
+    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && (!heldCut(r) || clearedCut(r)) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
     if (!cands.length) return
     const mp = wall.active && !probe ? null : mentionsNow()
     const mb = mp ? await mp : null
@@ -557,10 +559,10 @@ export function createMain(E: MainEnv) {
    *  process started another session, a non-account StopFailure): an interrupted turn, the Esc path's shape (cutTurn). Held (reason interrupted, cut_at)
    *  to ride the next delivery with INTERRUPTED_LINE in front; `cut_by` names what cut it, so that with no next delivery within MAIN_STUCK_MS it is
    *  delivered alone once (tick), Joey's own messages included: an Esc is Joey stopping it, a dead process is not */
-  function holdCut(rs: Row[], by: string, outBy: Map<string, string> = new Map()): Row[] {
+  function holdCut(rs: Row[], by: string, outBy: Map<string, string> = new Map(), wallSince?: string): Row[] {
     if (!rs.length) return []
     const at = new Date().toISOString()
-    for (const r of rs) J().write('msg', r.id, 'queued', { reason: 'interrupted', gen: null, prompt_id: null, via_pull: null, cut_at: at, cut_by: by, ...(outBy.has(r.id) ? { output_by: outBy.get(r.id) } : {}) })
+    for (const r of rs) J().write('msg', r.id, 'queued', { reason: 'interrupted', gen: null, prompt_id: null, via_pull: null, cut_at: at, cut_by: by, cut_wall_since: wallSince ?? null, ...(outBy.has(r.id) ? { output_by: outBy.get(r.id) } : {}) })
     return rs
   }
   function finish(pred: (r: Row) => boolean, how: Record<string, unknown> = {}): Row[] {
@@ -870,13 +872,15 @@ export function createMain(E: MainEnv) {
         const err = String(b.error ?? 'unknown')
         // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn). The account wall below is unchanged
         if (!ACCOUNT_WALL.has(err)) { if (p) outputs.delete(p); failTurn(g, p, err); return {} }
+        const refusedAt = Date.now()
+        const since = g.wall_since ?? new Date(refusedAt).toISOString()
         const reason = `stop_failure:${err}`
         const back = items(r => (r.state === 'bound' || r.state === 'offered') && r.gen === g.id && (!p || r.prompt_id === p))
         const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
         for (const r of back) {
           const output = r.state === 'bound' && r.kind !== 'digest' ? outputOf(g, r) : null
           if (hasOutput(output)) {
-            holdCut([r], reason, new Map([[r.id, outputBy(output)]]))
+            holdCut([r], reason, new Map([[r.id, outputBy(output)]]), since)
             continue
           }
           const refused = r.state === 'bound' && r.kind === 'joey'
@@ -888,7 +892,7 @@ export function createMain(E: MainEnv) {
         const cur = J().get('main', g.id)!
         // the main's own wall: one episode (wall_since) until its next Stop; each failed probe backs off
         const first = !cur.wall_since, probes = first ? 0 : Number(cur.probes ?? 0) + 1
-        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null, probes,
+        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: since, wall_refused_at: refusedAt, wall_clear_at: null, probes,
           retry_at: Date.now() + backoff(err, probes) })
         if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}

@@ -182,27 +182,20 @@ test('WO-200 (d) two refusals write blocked receipts and replay in order once', 
   expect(d.notices).toEqual(['main-wall-up', 'main-wall-down'])
 })
 
-test('WO-200 (e) output before refusal rides the next item or waits a quiet period from clear', async () => {
-  for (const ride of [false, true]) {
-    const d = daemon(), item = d.add('joey', '107')
-    await d.flush()
-    await d.hook('UserPromptSubmit', 'work', { dids: [item] })
-    await d.hook('PreToolUse', 'work', { tool_name: 'Read' })
-    await d.hook('StopFailure', 'work', { error: 'rate_limit' })
-    expect(d.journal.get('msg', item)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'stop_failure:rate_limit' })
-    setSystemTime(T + 2 * MAIN_STUCK_MS)
-    d.clear(); await d.flush(); await d.main.tick()
-    expect(d.offers).toEqual([[item]])
-    if (ride) {
-      const next = d.add('joey', '108'); await d.flush()
-      expect(d.offers[1]).toEqual([next, item])
-    } else {
-      setSystemTime(Date.now() + MAIN_STUCK_MS + 1)
-      await d.main.tick(); await d.flush()
-      expect(d.offers).toEqual([[item], [item]])
-    }
-    expect(d.texts[1]).toContain(INTERRUPTED_LINE)
-  }
+test('WO-200 (e), revised by WO-204: an account cut waits through the wall and leads the clear immediately', async () => {
+  const d = daemon(), item = d.add('joey', '107')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'work', { dids: [item] })
+  await d.hook('PreToolUse', 'work', { tool_name: 'Read' })
+  await d.hook('StopFailure', 'work', { error: 'rate_limit' })
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'stop_failure:rate_limit' })
+  setSystemTime(T + 2 * MAIN_STUCK_MS)
+  await d.main.tick()
+  expect(d.offers).toEqual([[item]])
+  d.clear(); await d.flush()
+  expect(d.offers).toEqual([[item], [item]])
+  expect(d.texts[1]).toContain(INTERRUPTED_LINE)
+  expect(d.notices).not.toContain('main-stuck')
 })
 
 test('WO-200 (f) final Call gets one thread line and only the open Call reaches main', async () => {
