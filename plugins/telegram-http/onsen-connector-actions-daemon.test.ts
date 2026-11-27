@@ -1,9 +1,9 @@
-// WO-197 (Chiron mesh 12852, 「不靠第二張名單對齊」): an agent named in ONSEN_BRIDGE has its Actions on, whatever ONSEN_ACTIONS says (a connector asks
-// people only through Actions: it has no Telegram). Real daemons (server.ts, lanes off, control mode on a tmux pane on its own socket dir) against the
-// Bot API stand-in and the Onsen stand-in; ONSEN_ACTIONS=0 on both (unset is on already, so 0 is what makes the test mean something):
-//   named   ONSEN_BRIDGE in the plist (a connector from the start, no token): a permission prompt is one Action, a menu on its pane is one Action
-//   switch  the machine config: not named at first (polling: ONSEN_ACTIONS=0 holds, no Action, Telegram as before); named at runtime (the 5 s check):
-//           from then a permission prompt is one Action and a menu one Action; no Bot API call after the hand-over
+// WO-197 (Chiron mesh 12852, 「不靠第二張名單對齊」): a connector has its Actions on, whatever ONSEN_ACTIONS says (a connector asks people only through
+// Actions: it has no Telegram). Real daemons (server.ts, lanes off, control mode on a tmux pane on its own socket dir) against the Bot API stand-in and
+// the Onsen stand-in; ONSEN_ACTIONS=0 on both (unset is on already, so 0 is what makes the test mean something):
+//   named   ONSEN_BRIDGE in the plist, no token: a permission prompt is one Action, a menu on its pane is one Action
+//   no list 1.59.0 (no switch: every daemon but a roamer is a connector): no ONSEN_BRIDGE anywhere, the machine config naming someone else: the same
+//           (the 1.58.x test of being named at runtime, the hand-over, is gone with the switch)
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -60,9 +60,8 @@ beforeAll(async () => {
   const env = { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude',
     TMUX_TMPDIR: sock, STARTUP_PICKER_POLL_MS: '400', ONSEN_ACTIONS: '0' }
   ;[named, sw] = await Promise.all([
-    startTgDaemon(apiN, join(root, 'n'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-n'), CHANNEL_BOT_TMUX_SESSION: panes.n },
-      h => h?.ok === true),
-    startTgDaemon(apiS, join(root, 's'), JOEY, { ...env, CRAB_LABS_PLUGINS_ENV: machine, ONSEN_BRIDGE_TICK_MS: '200', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-s'),
+    startTgDaemon(apiN, join(root, 'n'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-n'), CHANNEL_BOT_TMUX_SESSION: panes.n }),
+    startTgDaemon(apiS, join(root, 's'), JOEY, { ...env, CRAB_LABS_PLUGINS_ENV: machine, ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-s'),
       CHANNEL_BOT_TMUX_SESSION: panes.s }),
   ])
 }, 60000)
@@ -82,18 +81,11 @@ test('named at start, ONSEN_ACTIONS=0: a permission prompt is one Action and a m
   expect((await health(named)).connector.bot_api_refused).toEqual({})
 }, 30000)
 
-test('named at runtime (the machine config), ONSEN_ACTIONS=0: none before (Telegram as before); from the hand-over a permission prompt is one Action and a menu one Action', async () => {
-  expect((await health(sw)).polling).toBe(true)
-  expect((await health(sw)).onsen.actions.on).toBe(false)
-  await ask(sw, 'sperm1', 'ls /before')
-  expect(await until(() => apiS.of('sendMessage').some(c => c.body.text === '🔐 Permission: Bash'), 8000)).toBe(true)
-  await sleep(500)
-  expect(made('s', () => true)).toHaveLength(0)                                   // off the connector ONSEN_ACTIONS=0 holds
-  writeFileSync(machine, 'ONSEN_BRIDGE=adam\n')
-  expect(await until(async () => { const h = await health(sw); return h.polling === false && h.connector.on === true }, 35000)).toBe(true)
-  expect((await health(sw)).onsen.actions.on).toBe(true)
-  await sleep(600)
-  const calls = apiS.calls.length
+test('1.59.0: no ONSEN_BRIDGE (the machine config names someone else), ONSEN_ACTIONS=0: a connector all the same; a permission prompt is one Action and a menu one Action; no Bot API call', async () => {
+  const h = await health(sw)
+  expect(h.polling).toBe(false)
+  expect(h.connector.on).toBe(true)
+  expect(h.onsen.actions.on).toBe(true)
   await ask(sw, 'sperm2', 'ls /after')
   expect(await until(() => made('s', a => a.source === 'permission' && a.summary === 'Bash：ls /after').length === 1, 8000)).toBe(true)
   writeFileSync(menus.s, JSON.stringify({ id: 'ms', title: 'Select effort', options: ['Low', 'Medium', 'High'] }))
@@ -101,7 +93,6 @@ test('named at runtime (the machine config), ONSEN_ACTIONS=0: none before (Teleg
   await sleep(1500)
   expect(made('s', a => a.source === 'menu')).toHaveLength(1)
   expect(made('s', a => a.source === 'permission')).toHaveLength(1)
-  expect(apiS.calls.length).toBe(calls)
-  // nothing tried to reach Telegram (the poll's own calls while it winds down after the hand-over are not refusals: Chiron 19:21Z)
+  expect(apiS.calls).toEqual([]); expect(apiS.polls).toEqual([])
   expect((await health(sw)).connector.bot_api_refused).toEqual({})
-}, 70000)
+}, 40000)

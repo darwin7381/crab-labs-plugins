@@ -1,6 +1,8 @@
 // Onsen step 3 (WO-143) end to end: real Telegram daemons (server.ts) against the Bot API stand-in and a stand-in Onsen (a local HTTP server; nothing
 // reaches core.kbro.ai), in temp dirs (their HOME too). Facts only: what Joey sees on Telegram is not looked at here because nothing of it changes.
-//   lanes off: delivered when the daemon takes the message in (after its own record), in_session when it is written into the session's stream (WO-165;
+// 1.59.0: the daemon is a connector: Joey's messages come as the bridge hands them over (person_message, test-fixtures/tg-daemon.ts); their own records
+// are the bridge's.
+//   lanes off: delivered when the daemon takes the message in, in_session when it is written into the session's stream (WO-165;
 //              seen until then), seen when the transcript shows it taken into a turn, turn_end at the transcript's turn_duration; 1.45.1: the status from Claude Code's session registry (a stand-in under the daemon's HOME): offline
 //              no_registration → not_connected → idle → busy (the transcript's tool as detail) → stuck → idle → waiting → offline pid_gone / pid_reused;
 //              last_activity_at; the latency from a registry write to the status line in the spool, measured; /healthz (the registry read and its check)
@@ -41,7 +43,6 @@ function startOnsen(): void {
 const facts = (agentChat: string, id: number) => got.filter(g => g.path === '/deliveries/batch' && g.item.client_msg_id === String(id) && g.item.chat === agentChat)
 const states = (id: number) => facts(String(JOEY), id).map(g => `${g.item.state}${g.item.by ? `:${g.item.by}` : ''}`)
 const statuses = (agent: string) => got.filter(g => g.path === '/status/batch' && g.item.agent === agent).map(g => g.item)
-const msgSeq = (id: number) => got.find(g => g.path === '/messages/batch' && g.item.direction === 'in' && g.item.client_msg_id === String(id))?.seq ?? Infinity
 
 beforeAll(async () => {
   api = startBotApiMock({}, { pollHoldMs: 300 })
@@ -78,7 +79,7 @@ test('lanes off: delivered (after the message), in_session when written into the
   // no session: the message is parked (delivered, not seen)
   api.push(dm(JOEY, 5001, '還沒有人在'))
   expect(await until(() => states(5001).includes('delivered'), 10000)).toBe(true)
-  expect(facts(String(JOEY), 5001)[0]!.seq).toBeGreaterThan(msgSeq(5001))      // the message's own record first
+  // 1.59.0: the message's own record is the bridge's (a connector records no Telegram message of its own): no order to check here
   await Bun.sleep(300)
   expect(states(5001)).toEqual(['delivered'])
   // the main registers (Claude Code's registry file): it holds no stream here yet: offline not_connected
@@ -176,7 +177,6 @@ test('lanes on: delivered after the message; no main registered: offline no_regi
     expect(await until(() => got.some(g => g.path === '/deliveries/batch' && g.item.agent === 'eve' && g.item.client_msg_id === '6001'), 10000)).toBe(true)
     const d = got.filter(g => g.path === '/deliveries/batch' && g.item.agent === 'eve' && g.item.client_msg_id === '6001')
     expect(d.map(g => g.item.state)).toEqual(['delivered'])
-    expect(d[0]!.seq).toBeGreaterThan(got.find(g => g.path === '/messages/batch' && g.item.agent === 'eve' && g.item.client_msg_id === '6001')!.seq)
     const h = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
     expect(h.onsen.status).toMatchObject({ state: 'offline', mode: 'lanes' })
   } finally { await on?.stop(); api2.stop() }

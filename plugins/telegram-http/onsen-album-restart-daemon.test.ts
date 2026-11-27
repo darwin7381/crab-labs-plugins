@@ -5,8 +5,8 @@
 //   connector    (a) all three handed over, killed while their photos are fetched → restarted: one tag with the three, 1.5 s after (A.1's restart
 //                path, ONSEN_INBOUND_BACK_MS); the inbox handing one again: a duplicate; killed again after it went → nothing delivered again
 //                (b) two handed over, killed, restarted, the third handed over: one tag with the three in Telegram's order (the kept two join it)
-//   switch off   ONSEN_INBOUND on, polling: an album of three from Telegram written into Onsen, two of its person_messages handed back, killed →
-//                restarted: one tag with the three; the third's person_message, and the first's again: duplicates
+// (1.59.0: the 「switch off, ONSEN_INBOUND on」 case, an album from Telegram written into Onsen by this daemon, is gone: no daemon but a roamer takes
+// Telegram updates, and a roamer records nothing into Onsen)
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -107,34 +107,4 @@ test('connector (b): two handed over, killed; restarted, the third handed over: 
   expect(tags[0]!.meta.image_path_2).toContain('onsen-8202')
   expect(tags[0]!.meta.image_path_3).toContain('onsen-8203')
   expect(d.log()).toContain('joins its album now')
-}, 60000)
-
-test('switch off, ONSEN_INBOUND on: an album of three from Telegram, two of its person_messages handed back, killed; restarted: one tag with the three, once; the rest come as duplicates', async () => {
-  const opts = (back: number) => ({ ...envBase(), ONSEN_INBOUND: 'adam', ONSEN_INBOUND_BACK_MS: String(back), ONSEN_CREDENTIAL_FILE: join(root, 'cred-w') })
-  const withFiles = () => { const a = api(); for (const i of [1, 2, 3]) a.files.set(`AgR${i}`, { path: `photos/r${i}.jpg`, bytes: new Uint8Array([0xff, 0xd8, 0xff, i]) }); return a }
-  const a1 = withFiles()
-  let d = await startTgDaemon(a1, join(root, 'w'), JOEY, opts(120000)); daemons.push(d)
-  const date = Math.floor(Date.now() / 1000)
-  const chat = { id: JOEY, type: 'private', first_name: 'J' }, from = { id: JOEY, is_bot: false, first_name: 'J', username: 'joey' }
-  for (const i of [1, 2, 3]) a1.push({ message: { message_id: 2300 + i, date, chat, from, media_group_id: 'mg-r',
-    photo: [{ file_id: `AgR${i}`, file_unique_id: `ur${i}`, width: 90, height: 90, file_size: 4 }] } })
-  const pms = () => onsen.inbox.filter(i => i.who === 'w' && i.kind === 'person_message' && i.payload?.media_group_id === 'mg-r').sort((x, y) => x.seq - y.seq)
-  expect(await until(() => pms().length === 3, 15000)).toBe(true)
-  expect(await until(() => d.log().includes(`album ${JOEY}:mg-r: 3 item(s) came from Telegram`), 5000)).toBe(true)
-  for (const it of pms().slice(0, 2)) expect((await hand(d, { kind: it.kind, seq: it.seq, dedupe: it.dedupe, payload: it.payload })).status).toBe(200)
-  await sleep(800)
-  expect(routes(d, ['2301', '2302', '2303'])).toHaveLength(0)            // waiting for the third
-  await d.kill()
-  // Telegram does not give the album again (its updates were confirmed): a fresh Bot API stand-in
-  d = await startTgDaemon(withFiles(), join(root, 'w'), JOEY, opts(1500)); daemons.push(d)
-  expect(await until(() => routes(d, ['2301', '2302', '2303']).length >= 1, 12000)).toBe(true)
-  await sleep(1500)
-  expect(routes(d, ['2301', '2302', '2303'])).toHaveLength(1)
-  const tags = queued(d, 'mg-r')
-  expect(tags).toHaveLength(1)
-  expect(tags[0]!.meta).toMatchObject({ message_id: '2301', media_group_count: '3', media_group_id: 'mg-r' })
-  for (const k of ['image_path', 'image_path_2', 'image_path_3']) expect(tags[0]!.meta[k]).toBeTruthy()
-  for (const it of [pms()[2]!, pms()[0]!]) expect(await hand(d, { kind: it.kind, seq: it.seq, dedupe: it.dedupe, payload: it.payload })).toMatchObject({ status: 200, json: { duplicate: true } })
-  await sleep(500)
-  expect(routes(d, ['2301', '2302', '2303'])).toHaveLength(1)
 }, 60000)

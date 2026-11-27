@@ -39,7 +39,7 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 're
 `)
   chmodSync(bin, 0o755)
   api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
-  d = await startTgDaemon(api, root, JOEY, { LANES_AGENT: 'sonn_lab', AGENT_INBOX_SELF: 'sonn_lab', LANES_CLAUDE_BIN: bin, TELEGRAM_SEND_TIMEOUT_S: '1',
+  d = await startTgDaemon(api, root, JOEY, { ROAMER_MODE: '1', LANES_AGENT: 'sonn_lab', AGENT_INBOX_SELF: 'sonn_lab', LANES_CLAUDE_BIN: bin, TELEGRAM_SEND_TIMEOUT_S: '1',
     LANES_RETRY_BACKOFF_MS: '600000', LANES_CLOSE_GRACE_MS: '300' })
 }, 40000)
 afterAll(async () => { await d?.stop(); api?.stop() })

@@ -6,9 +6,10 @@
 //              that arrives mid-turn, enqueue … queue-operation remove (absorbed_mid_turn) at the next tool boundary, then an attachment
 //              queued_command whose timestamp is the ENQUEUE time (seen = the newest own timestamp before it, not the attachment's)
 //   lanes on   in_session: M1 offered it (or bound it at a boundary: a pull hands it over and binds it at once); seen: M1 bound it (onsen-step3 tests)
-//   ✍ (ONSEN_REACT_SEEN) goes with seen; a transcript tail read again at start writes seen (Onsen keeps the first) without ✍.
-// Unit tests, the spool against an Onsen that does not list in_session yet, then a real daemon (server.ts, lanes off) against the Bot API stand-in,
-// a stand-in Onsen, a registry and a transcript the test writes, and an MCP client standing in for the main session.
+//   ✍ (ONSEN_REACT_SEEN) goes with seen (DeliveryFacts onSeen: the unit tests; 1.59.0: the daemon draws no ✍ on Telegram, the bridge does from the
+//   receipt); a transcript tail read again at start writes seen (Onsen keeps the first) without ✍.
+// Unit tests, the spool against an Onsen that does not list in_session yet, then a real daemon (server.ts, lanes off; a connector: Joey's messages come
+// as the bridge hands them over) against a stand-in Onsen, a registry and a transcript the test writes, and an MCP client standing in for the main session.
 import { test, expect, describe, afterAll, beforeAll } from 'bun:test'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { spawnSync } from 'child_process'
@@ -204,17 +205,16 @@ beforeAll(async () => {
   mkdirSync(join(root, 'cred'), { recursive: true })
   writeFileSync(join(root, 'cred', 'mesh-credential'), CRED + '\n')
   d = await startTgDaemon(api, root, JOEY, { ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'),
-    GENESIS_LANES: '0', ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0', ONSEN_REACT_SEEN: AGENT })
+    GENESIS_LANES: '0', ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0' })
 }, 40000)
 afterAll(async () => { for (const p of procs) { try { p.kill('SIGKILL') } catch {} } await d?.stop(); api?.stop(); up?.stop(true) })
 
-test('daemon, lanes off: two messages while the main runs a long tool: in_session at once, unseen (no seen, no ✍, queued_joey 2) until the boundary that takes them in; seen ≥ it, then ✍', async () => {
+test('daemon, lanes off: two messages while the main runs a long tool: in_session at once, unseen (no seen, queued_joey 2) until the boundary that takes them in; seen ≥ it (1.59.0: the ✍ is the bridge\'s, from the receipt)', async () => {
   const sessions = join(d.home, '.claude', 'sessions'), tdir = join(d.home, '.claude', 'projects', d.ws.replace(/[^a-zA-Z0-9]/g, '-'))
   mkdirSync(sessions, { recursive: true }); mkdirSync(tdir, { recursive: true })
   const spool = join(d.stateDir, 'onsen', 'spool.jsonl')
   const st = () => existsSync(spool) ? readFileSync(spool, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(l => l.k === 's').map(l => l.r) : []
   const of = (id: string) => facts.filter(x => x.client_msg_id === id).map(x => x.state)
-  const react = () => api.of('setMessageReaction').filter(c => c.body.reaction?.[0]?.emoji === '✍').map(c => Number(c.body.message_id))
   const main = Bun.spawn(['sleep', '600']); procs.push(main)
   const lstart = String(spawnSync('ps', ['-o', 'lstart=', '-p', String(main.pid)], { encoding: 'utf8', env: { ...process.env, TZ: 'UTC' } }).stdout).trim()
   const sid = randomUUID(), tf = join(tdir, `${sid}.jsonl`)
@@ -243,7 +243,6 @@ test('daemon, lanes off: two messages while the main runs a long tool: in_sessio
   put({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'long1', name: 'Bash', input: { command: 'python3 -c "..."', timeout: 120000 } }] } })
   expect(await until(() => of('9001').includes('seen'), 3000)).toBe(true)
   expect(facts.find(x => x.client_msg_id === '9001' && x.state === 'seen')!.at).toBe(turnStart)
-  expect(await until(() => react().includes(9001), 3000)).toBe(true)
 
   // two messages while the tool runs: written into the stream (in_session) and queued by Claude Code (enqueue)
   for (const id of [9002, 9003]) {
@@ -254,14 +253,13 @@ test('daemon, lanes off: two messages while the main runs a long tool: in_sessio
   expect(await until(() => of('9002').includes('in_session') && of('9003').includes('in_session'), 5000)).toBe(true)
   const enq = { '9002': facts.find(x => x.client_msg_id === '9002' && x.state === 'in_session')!.at, '9003': facts.find(x => x.client_msg_id === '9003' && x.state === 'in_session')!.at }
   expect(await until(() => st().at(-1)?.detail?.queued_joey === 2, 5000)).toBe(true)
-  // the tool keeps running: still unseen (the lab's 13–17 s, shortened); no ✍; queued_joey stays 2
+  // the tool keeps running: still unseen (the lab's 13–17 s, shortened); queued_joey stays 2
   const t0 = Date.now()
   while (Date.now() - t0 < 2500) {
     expect(of('9002')).toEqual(['delivered', 'in_session']); expect(of('9003')).toEqual(['delivered', 'in_session'])
     expect(st().at(-1)?.detail?.queued_joey).toBe(2)
     await sleep(250)
   }
-  expect(react()).toEqual([9001])
 
   // the tool ends; Claude Code absorbs both at that boundary (remove, then the attachments carrying their enqueue time)
   const toolEnd = iso()
@@ -285,7 +283,6 @@ test('daemon, lanes off: two messages while the main runs a long tool: in_sessio
     expect(s.by).toBe('main')
   }
   expect(await until(() => st().at(-1)?.detail?.queued_joey === 0, 3000)).toBe(true)
-  expect(await until(() => react().includes(9002) && react().includes(9003), 3000)).toBe(true)
   console.log(`WO-165 bench: absorbed → seen at the stand-in Onsen ${lag} ms (transcript poll 250 ms); seen.at = the remove record (${absorbed}), the attachments said ${enq['9002']} / ${enq['9003']}`)
 
   // the turn ends: turn_end; every message's facts in order

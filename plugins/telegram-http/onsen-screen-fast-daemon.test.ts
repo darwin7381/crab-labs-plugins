@@ -1,4 +1,4 @@
-// WO-197 (Chiron lab round 3A on 1.58.27, the switch off): a prompt answered on the screen took 8–14 s to be cancelled in Onsen (its Telegram buttons
+// WO-197 (Chiron lab round 3A on 1.58.27, the switch off; 1.59.0: a roamer, ROAMER_MODE=1, the only daemon with Telegram copies of a prompt): a prompt answered on the screen took 8–14 s to be cancelled in Onsen (its Telegram buttons
 // still there meanwhile): the menu relay's 8 s poll, and two looks without the menu are needed. A pane with an open Onsen Action of this daemon (a
 // prompt, a menu) is looked at every 2 s as well, so the cancel comes within ~4 s; the two-looks rule stays. A real daemon (server.ts, lanes off,
 // control mode, the poll at its default 8 s) against the Bot API stand-in and the Onsen stand-in; the pane runs a fake TUI.
@@ -57,7 +57,7 @@ beforeAll(async () => {
   onsen.st.version.p = '0.35.3'
   writeFileSync(join(root, 'cred'), CRED + '\n')
   api = startBotApiMock({}, { pollHoldMs: 200 })
-  d = await startTgDaemon(api, join(root, 'p'), JOEY, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0',
+  d = await startTgDaemon(api, join(root, 'p'), JOEY, { ROAMER_MODE: '1', GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0',
     ONSEN_CLAUDE_BIN: '/nonexistent/claude', TMUX_TMPDIR: sock, ONSEN_CREDENTIAL_FILE: join(root, 'cred'), CHANNEL_BOT_TMUX_SESSION: pane })
 }, 60000)
 afterAll(async () => { await d?.stop(); api?.stop(); onsen?.stop(); tm('kill-server'); try { rmSync(sock, { recursive: true }) } catch {} })

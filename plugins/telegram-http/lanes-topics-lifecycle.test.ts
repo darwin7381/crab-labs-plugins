@@ -136,7 +136,7 @@ test('a close a daemon restart cut off is finished at boot; a lane closed before
 test('daemon: createForumTopic with the plain name; the close looks the ✅ up, sets it with editForumTopic, posts the closing line in the topic', async () => {
   const api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
   const root = mkdtempSync(join(tmpdir(), 'lanes-topics-lifecycle-d-'))
-  const d = await startTgDaemon(api, root, 1828, { LANES_CLOSE_GRACE_MS: '300', LANES_RETRY_BACKOFF_MS: '60000' })
+  const d = await startTgDaemon(api, root, 1828, { ROAMER_MODE: '1', LANES_CLOSE_GRACE_MS: '300', LANES_RETRY_BACKOFF_MS: '60000' })
   try {
     const tok = readFileSync(join(root, 'tok', String(d.port)), 'utf8').trim()
     const text = '[board][WO-77] ✅ 請 adam 整理 🚀 名單'

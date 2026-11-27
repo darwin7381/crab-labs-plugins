@@ -21,7 +21,7 @@ describe('lanes on', () => {
   beforeAll(async () => {
     api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
     root = mkdtempSync(join(tmpdir(), 'lanes-topics-send-'))
-    d = await startTgDaemon(api, root, JOEY)
+    d = await startTgDaemon(api, root, JOEY, { ROAMER_MODE: '1' })
   }, 40000)
   afterAll(async () => { await d?.stop(); api?.stop() })
 
@@ -90,44 +90,62 @@ describe('lanes on', () => {
 
   test('a daemon restart: a reply to Joey\'s topic message still goes into the topic', async () => {
     await d.stop()
-    d = await startTgDaemon(api, root, JOEY)
+    d = await startTgDaemon(api, root, JOEY, { ROAMER_MODE: '1' })
     const n0 = api.of('sendRichMessage').length
     await d.call('reply', { chat_id: String(JOEY), text: '重啟後', reply_to: '55' })
     expect(thread(api.of('sendRichMessage')[n0])).toBe(7001)
   }, 40000)
 })
 
-test('server.ts: every Telegram send goes through the one topic decision, except the named ops notices that are about no topic', () => {
+test('every Telegram send (roamer-telegram.ts) carries the one topic decision (server.ts topicFields), except the named ops notices that are about no topic', () => {
+  // 1.59.0: the sends themselves are roamer-telegram.ts's; each takes the topic fields its caller decided. server.ts decides them (topicFields) for
+  // every call of the Telegram side
+  const rt = readFileSync(join(import.meta.dir, 'roamer-telegram.ts'), 'utf8')
+  const RT_EXEMPT = [
+    "this.bot.api.sendMessage(senderId, 'Paired! Say hi to Claude.')",              // pairing approved
+  ]
+  const rtRe = /this\.bot\.api\.(sendMessage|sendPhoto|sendDocument|sendChatAction)\(|this\.callBotApi\('send/g
+  const rtUnrouted: string[] = []
+  for (const m of rt.matchAll(rtRe)) {
+    const at = m.index!, line = rt.slice(rt.lastIndexOf('\n', at) + 1, rt.indexOf('\n', at) + 1)
+    if (RT_EXEMPT.some(e => line.includes(e))) continue
+    const win = rt.slice(at, at + 420)
+    if (/\.\.\.topicF\b|\.\.\.tf\b|\(o\.topicF \?\? \{\}\)|, opts\)|, tf\)/.test(win)) continue
+    rtUnrouted.push(line.trim())
+  }
+  expect(rtUnrouted).toEqual([])
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   // ops traffic to opsRecipients / a pairing: not an answer to anything in a topic
   const EXEMPT = [
-    'bot.api.sendMessage(senderId, "Paired! Say hi to Claude.")',                  // pairing approved
-    'bot.api.sendMessage(chat_id, text, { reply_markup: keyboard })',               // permission prompt
-    'void bot.api.sendMessage(chat_id, text).then(m => {',                         // system alert
-    'const m = await bot.api.sendMessage(chat, text, kb ? { reply_markup: kb } : {})',   // duty officer
-    'void bot.api.sendMessage(chat_id, text).catch(e => {',                        // login expired
+    'void tg!.sendText(chat_id, text, { keyboard })',                               // permission prompt
+    'void tg.sendText(chat_id, text).then(id => {',                                 // system alert
+    'try { out.push({ chat, msg: await tg.sendText(chat, text, buttons ? { keyboard: buttons } : {}) }) }',   // duty officer
+    'void tg.sendText(chat_id, text).catch(e => {',                                 // login expired
     'void sendTextWithMaybeKeyboard(chat_id, title, keyboard).catch(e =>',          // startup picker
     'await sendTextWithMaybeKeyboard(String(chat_id), msg)\n',                      // roamer: target not connected
   ]
-  const re = /bot\.api\.(sendMessage|sendPhoto|sendDocument|sendChatAction)\(|callBotApi\('send|(?<!function )sendTextWithMaybeKeyboard\(/g
+  const re = /tg!?\.(sendText|sendChunks|sendParts|sendReply|typing)\(|(?<!function )sendTextWithMaybeKeyboard\(/g
   const unrouted: string[] = []
   for (const m of src.matchAll(re)) {
     const at = m.index!, line = src.slice(src.lastIndexOf('\n', at) + 1, src.indexOf('\n', at) + 1)
     if (EXEMPT.some(e => line.includes(e.replace(/\n$/, '')) && (!e.endsWith('\n') || line.trimEnd().endsWith(e.trim())))) continue
     const win = src.slice(at, at + 420)
-    if (/\.\.\.topicF\b|\.\.\.tf\b|topicFields\(|, opts\)|, here\)|\{ chat: chatId, topic: topicOfMessage\(cbm\)/.test(win)) continue
+    if (/\.\.\.topicF\b|\.\.\.tf\b|topicF[,: ]|, tf\)|topicFields\(|, opts\)|, here\)|, where\)|\{ chat: chatId, topic: topicOfMessage\(cbm\)/.test(win)) continue
     unrouted.push(line.trim())
   }
   expect(unrouted).toEqual([])
+  // the Telegram side's own callers (its handlers) answer through the host's sendText, where the message was
+  expect(rt).toContain('await h.sendText(chat_id, msg, opts?.keyboard, here)')
   // nothing else builds the field
   expect([...src.matchAll(/\{ message_thread_id: /g)].length).toBe(1)             // the one in topicFields (the other is the router event's field)
+  expect([...rt.matchAll(/\{ message_thread_id: /g)].length).toBe(0)
 })
 
 describe('lanes off: the fleet\'s behaviour', () => {
   let api: BotApiMock, d: TgDaemon
   beforeAll(async () => {
     api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
-    d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-send-off-')), JOEY, { GENESIS_LANES: '0' })
+    d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-send-off-')), JOEY, { ROAMER_MODE: '1', GENESIS_LANES: '0' })
   }, 40000)
   afterAll(async () => { await d?.stop(); api?.stop() })
 

@@ -1,8 +1,10 @@
 // Onsen step 2 (WO-142) end to end: a real Telegram daemon (server.ts, lanes off, control mode on a tmux pane) against the Bot API stand-in and a stand-in
 // Onsen (a local HTTP server; nothing reaches core.kbro.ai). tmux runs on its own socket dir: the machine's tmux server is never touched.
-//   - Joey's /clear (WO-185): no line; the reply keeps the past and offers 「不要讓它看到之前的」 for 5 s; a press draws the line at the /clear time; 「讓它看得到之前的」 lifts it
 //   - Joey edits a message the session has not seen yet (parked: no session): the parked copy takes the new text, delivered once
-//   - Joey edits a message the session already has: a new inbound 〔J 改了他 HH:MMZ 那一則（tg:N）〕 + the new text; edit_delivered in Onsen
+//   - Joey edits a message the session already has: a new inbound 〔… 改了他 HH:MMZ 那一則（tg:N）〕 + the new text; edit_delivered in Onsen
+// 1.59.0: the daemon is a connector: Joey's messages and edits come as the bridge hands them over (person_message, person_edit:
+// test-fixtures/tg-daemon.ts). The 1.58.x /clear case (its Telegram reply with the 5 s button 「不要讓它看到之前的」, the oline: / olift: presses) is gone:
+// a connector's /clear offers that choice as an Action (onsen-connector-seg2-daemon.test.ts 4, 4b).
 import { test, expect, afterAll, beforeAll } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -12,7 +14,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { startBotApiMock, dm, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { startTgDaemon, until, freePort, type TgDaemon } from './test-fixtures/tg-daemon.ts'
-import { originalTime } from './onsen-edit.ts'
 
 const JOEY = 1828
 const CRED = 'mesh_STEP2DAEMONsecretSECRETsecret0123456'
@@ -82,53 +83,6 @@ const pendingFiles = () => { try { return readdirSync(join(d.stateDir, 'inbox', 
 const editOf = (id: number, date: number, text: string) => ({ edited_message: { message_id: id, date, edit_date: Math.floor(Date.now() / 1000),
   chat: { id: JOEY, type: 'private', first_name: 'J' }, from: { id: JOEY, is_bot: false, first_name: 'J', username: 'joey' }, text } })
 
-test('WO-185 /clear: no line; the reply keeps the past and offers 「不要讓它看到之前的」 for 5 s (counting down); a press inside draws the line at the /clear time; later: the default', async () => {
-  const msg0 = dm(JOEY, 4100, '/clear', { command: true })
-  const clearDate = msg0.message.date
-  api.push(msg0)
-  expect(await until(() => api.of('sendMessage').some(c => String(c.body.text).includes('已送 `/clear`')), 15000)).toBe(true)
-  const replyCall = api.of('sendMessage').find(c => String(c.body.text).includes('已送 `/clear`'))!
-  expect(String(replyCall.body.text)).toMatch(/^✅ 已送 `\/clear` 到 .+。它還查得到之前的對話。$/)
-  expect(replyCall.body.reply_markup).toEqual({ inline_keyboard: [[{ text: '不要讓它看到之前的（5）', callback_data: `oline:4100:${clearDate}` }]] })
-  expect(got.some(g => g.path === '/restart-lines')).toBe(false)                         // /clear itself draws no line
-  expect(await until(() => pane().includes('/clear'), 5000)).toBe(true)
-  // not pressed: (4) (3) (2) (1), then the button goes; still no line
-  expect(await until(() => api.of('editMessageReplyMarkup').length >= 5, 9000)).toBe(true)
-  const marks = api.of('editMessageReplyMarkup').map(c => c.body.reply_markup)
-  expect(marks.slice(0, 4).map((m: any) => m.inline_keyboard[0][0].text)).toEqual(['不要讓它看到之前的（4）', '不要讓它看到之前的（3）', '不要讓它看到之前的（2）', '不要讓它看到之前的（1）'])
-  expect(marks[4]).toEqual({ inline_keyboard: [] })
-  expect(got.some(g => g.path === '/restart-lines')).toBe(false)
-  const okText = String(replyCall.body.text)
-  // a press after the 5 s (a reply sent 10 s ago, e.g. a button left by a restart): the default stands, the button goes, no line
-  const old = { message_id: 5554, date: Math.floor(Date.now() / 1000) - 10, chat: { id: JOEY, type: 'private' }, from: { id: 999, is_bot: true, first_name: 'lab' }, text: okText }
-  api.push({ callback_query: { id: 'cqL', chat_instance: 'x', from: { id: JOEY, is_bot: false, first_name: 'J' }, message: old, data: `oline:4100:${clearDate}` } })
-  expect(await until(() => api.of('answerCallbackQuery').some(c => c.body.callback_query_id === 'cqL'), 10000)).toBe(true)
-  expect(api.of('answerCallbackQuery').find(c => c.body.callback_query_id === 'cqL')!.body.text).toBe('已經過了，照預設：它看得到之前的')
-  expect(got.some(g => g.path === '/restart-lines')).toBe(false)
-  // someone not on the allowlist presses a live one: refused
-  const msg = { message_id: 5555, date: Math.floor(Date.now() / 1000), chat: { id: JOEY, type: 'private' }, from: { id: 999, is_bot: true, first_name: 'lab' }, text: okText }
-  api.push({ callback_query: { id: 'cq0', chat_instance: 'x', from: { id: 4242, is_bot: false, first_name: 'X' }, message: msg, data: `oline:4100:${clearDate}` } })
-  expect(await until(() => api.of('answerCallbackQuery').some(c => c.body.callback_query_id === 'cq0'), 10000)).toBe(true)
-  expect(api.of('answerCallbackQuery').find(c => c.body.callback_query_id === 'cq0')!.body.text).toBe('Not authorized.')
-  // Joey presses inside the 5 s: the line is drawn at the /clear's own time; the reply says so and offers 「讓它看得到之前的」
-  api.push({ callback_query: { id: 'cq1', chat_instance: 'x', from: { id: JOEY, is_bot: false, first_name: 'J' }, message: msg, data: `oline:4100:${clearDate}` } })
-  expect(await until(() => got.some(g => g.path === '/restart-lines') && api.of('editMessageText').length > 0, 10000)).toBe(true)
-  const draw = got.find(g => g.path === '/restart-lines')!
-  expect(draw.body).toMatchObject({ agent: 'adam', client: 'telegram', chat: String(JOEY), idem_key: `tg:adam:${JOEY}:line:4100`, by: `tg:${JOEY}`, client_msg_id: '4100' })
-  expect(Date.parse(String(draw.body.at))).toBe(clearDate * 1000)
-  const ed = api.of('editMessageText')[0]!.body
-  expect(ed).toMatchObject({ chat_id: JOEY, message_id: 5555 })
-  expect(String(ed.text)).toBe(okText.replace('。它還查得到之前的對話。', '。已畫線：這之前的對話它看不到了（你引用的那一則照樣看得到）。'))
-  expect(ed.reply_markup).toEqual({ inline_keyboard: [[{ text: '讓它看得到之前的', callback_data: `olift:${lines[0].id}:4100` }]] })
-  // 「讓它看得到之前的」 lifts THAT line, as before
-  const msg2 = { ...msg, text: String(ed.text) }
-  api.push({ callback_query: { id: 'cq2', chat_instance: 'x', from: { id: JOEY, is_bot: false, first_name: 'J' }, message: msg2, data: `olift:${lines[0].id}:4100` } })
-  expect(await until(() => got.some(g => g.path === '/restart-lines/lift'), 10000)).toBe(true)
-  expect(got.find(g => g.path === '/restart-lines/lift')!.body).toMatchObject({ agent: 'adam', chat: String(JOEY), line_id: lines[0].id, by: `tg:${JOEY}` })
-  expect(await until(() => api.of('editMessageText').length > 1, 10000)).toBe(true)
-  expect(String(api.of('editMessageText')[1]!.body.text)).toBe(`${ed.text}\n已拿掉線：它查得到之前的對話了`)
-}, 60000)
-
 test('an edit of a message no session has seen yet (parked): the parked copy takes the new text; the session gets it once, already corrected', async () => {
   const m = dm(JOEY, 4300, '還沒看到的原文')
   api.push(m)
@@ -153,16 +107,18 @@ test('an edit of a message the session already has: a new inbound under one line
   api.push(editOf(4400, m.message.date, '改過的字\n第二行'))
   expect(await until(() => received.some(r => r.meta.message_id === '4400' && r.meta.edited === 'true'), 15000)).toBe(true)
   const e = received.find(r => r.meta.message_id === '4400' && r.meta.edited === 'true')!
-  expect(e.content).toBe(`〔J 改了他 ${originalTime(m.message.date)} 那一則（tg:4400）〕\n改過的字\n第二行`)
+  // the person_edit carries the person's username (not Telegram's first name) and not the original's time (Onsen's payload has edited_at only)
+  expect(e.content).toBe(`〔@joey 改了他 ??:??Z 那一則（tg:4400）〕\n改過的字\n第二行`)
   expect(e.meta).toMatchObject({ chat_id: String(JOEY), user: 'joey', user_id: String(JOEY) })
   expect(Date.parse(e.meta.ts)).toBeGreaterThanOrEqual(m.message.date * 1000)
   expect(await until(() => evs().some(x => x.kind === 'edit_delivered' && x.target_client_msg_id === '4400'), 10000)).toBe(true)
   expect(evs().find(x => x.kind === 'edit_delivered' && x.target_client_msg_id === '4400')!.data).toEqual({ replaced_in_queue: false })
-  expect(evs().some(x => x.kind === 'edit' && x.target_client_msg_id === '4400' && x.body === '改過的字\n第二行')).toBe(true)   // recorded as before
-  // the edit of a command the daemon answered itself (/clear) is recorded, never delivered
+  // the edit of a command the daemon answered itself (/clear) is never delivered
+  api.push(dm(JOEY, 4100, '/clear', { command: true }))
+  expect(await until(() => d.log().includes('onsen inbound: tg:4100 is a command; the connector handled it itself'), 15000)).toBe(true)
   const n = received.length
   api.push(editOf(4100, Math.floor(Date.now() / 1000) - 60, '/clear 改'))
-  expect(await until(() => evs().some(x => x.kind === 'edit' && x.target_client_msg_id === '4100'), 10000)).toBe(true)
+  expect(await until(() => d.log().includes('onsen inbound: person_edit of tg:4100 handed on'), 10000)).toBe(true)
   await Bun.sleep(500)
   expect(received.length).toBe(n)
   expect(evs().some(x => x.kind === 'edit_delivered' && x.target_client_msg_id === '4100')).toBe(false)

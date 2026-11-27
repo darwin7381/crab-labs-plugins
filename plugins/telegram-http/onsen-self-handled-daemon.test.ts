@@ -2,7 +2,10 @@
 // handling not_started): a person's Telegram message the daemon handles itself is never handed to a session; its receipt now goes to the end through
 // deliveries/batch, keyed as every message's (the Telegram chat and message id): delivered when the daemon took it, turn_end (outcome done; by
 // `daemon`, not a session) when its handler finished. A real daemon (server.ts, lanes off, control mode on a tmux pane on its own socket dir), the Bot
-// API stand-in and the Onsen stand-in (test-fixtures/onsen-standin.ts); recording on.
+// API stand-in and the Onsen stand-in (test-fixtures/onsen-standin.ts); recording on. 1.59.0: the daemon is a connector: the commands come as the bridge
+// hands them over (person_message, test-fixtures/tg-daemon.ts), the answers are Onsen messages (POST /v1/messages) in the command's turn. A permission
+// reply typed as text (`yes abcde`) is a roamer's only (a connector's prompt is answered by its Action: onsen-connector-daemon.test.ts 10): its 1.58.x
+// case here is gone.
 import { test, expect, afterAll, beforeAll } from 'bun:test'
 import { mkdtempSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -28,16 +31,18 @@ beforeAll(async () => {
   if (made.status !== 0) throw new Error(`tmux: ${made.stderr}`)
   onsen = startOnsenStandin({ [CRED]: 'adam' }, await freePort())
   writeFileSync(join(root, 'cred'), CRED + '\n')
+  onsen.conv(String(JOEY))                                               // the conversation of Joey's chat (the bridge made it)
+  onsen.st.bridge.adam = { on: true, delayMs: 20, next: 900 }              // the bridge draws what the connector says
   d = await startTgDaemon(api, root, JOEY, { GENESIS_LANES: '0', CHANNEL_BOT_TMUX_SESSION: TMUX, TMUX_TMPDIR: sock,
     ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred'), ONSEN_PEER_LOOKUP: '0' })
 }, 40000)
 afterAll(async () => { await d?.stop(); api?.stop(); onsen?.stop(); tm('kill-server') })
 
+/** what the connector said in Onsen (the answers: POST /v1/messages), with their turn */
+const outs = () => onsen.connector.filter(x => x.who === 'adam' && x.kind === 'message').map(x => x.body)
 /** every delivery fact the stand-in received for Telegram message n (in the order it got them) */
 const factsOf = (n: number) => onsen.seen.filter(s => s.path === '/deliveries/batch').flatMap(s => s.body?.items ?? [])
   .filter((f: any) => f.chat === String(JOEY) && f.client_msg_id === String(n))
-const recordIdx = (n: number) => onsen.seen.findIndex(s => s.path === '/messages/batch' && (s.body?.items ?? []).some((i: any) => i.direction === 'in' && i.client_msg_id === String(n)))
-const factIdx = (n: number, state: string) => onsen.seen.findIndex(s => s.path === '/deliveries/batch' && (s.body?.items ?? []).some((f: any) => f.client_msg_id === String(n) && f.state === state))
 
 function expectHandledHere(n: number, how: string): void {
   const fs = factsOf(n)
@@ -47,32 +52,27 @@ function expectHandledHere(n: number, how: string): void {
   expect(end.turn_id).toBe(`daemon:${JOEY}:${n}`)                    // WO-197 (round 3A): its answer is in this turn (Onsen links it)
   expect(end.bound).toBeUndefined()
   expect(Date.parse(del.at)).toBeLessThanOrEqual(Date.parse(end.at))
-  // the message's own record first, then its facts (Onsen finds what a fact is about)
-  expect(recordIdx(n)).toBeGreaterThanOrEqual(0)
-  expect(recordIdx(n)).toBeLessThanOrEqual(factIdx(n, 'delivered'))
+  // 1.59.0: the message's own record is the bridge's (a connector records no Telegram message of its own)
 }
 
 test('/clear (the control plane): the stand-in gets delivered and turn_end (done, by daemon) for that Telegram message id; nothing reaches a session', async () => {
   api.push(dm(JOEY, 7100, '/clear', { command: true }))
-  expect(await until(() => api.of('sendMessage').some(c => String(c.body.text).includes('已送 `/clear`')), 15000)).toBe(true)
+  expect(await until(() => outs().some((i: any) => String(i.body).includes('已送 `/clear`')), 15000)).toBe(true)
   expect(await until(() => factsOf(7100).some((f: any) => f.state === 'turn_end'), 10000)).toBe(true)
   await sleep(300)
   expectHandledHere(7100, 'command')
 }, 30000)
 
-/** the bot's own messages Onsen got recorded (the answers), with their turn */
-const outs = () => onsen.seen.filter(s => s.path === '/messages/batch').flatMap(s => s.body?.items ?? []).filter((i: any) => i.direction === 'out')
-
 test('/status (bot.command, answered by the daemon): delivered and turn_end done; the answer is recorded in the message\'s turn (Onsen lists it as the response)', async () => {
   api.push(dm(JOEY, 7101, '/status', { command: true }))
-  expect(await until(() => api.of('sendMessage').some(c => String(c.body.text).startsWith('Paired as')), 15000)).toBe(true)
+  expect(await until(() => outs().some((i: any) => String(i.body).startsWith('Paired as')), 15000)).toBe(true)
   expect(await until(() => factsOf(7101).some((f: any) => f.state === 'turn_end'), 10000)).toBe(true)
   await sleep(300)
   expectHandledHere(7101, 'command')
   expect(await until(() => outs().some((i: any) => String(i.body).startsWith('Paired as')), 8000)).toBe(true)
   const ans = outs().find((i: any) => String(i.body).startsWith('Paired as'))!
   expect(ans.turn_id).toBe(`daemon:${JOEY}:7101`)
-  expect(ans.reply_to_client_msg_id).toBeUndefined()                     // Onsen links a turn's message that quotes nothing to every message of the turn
+  expect(ans.reply_to_message_id).toBeUndefined()                        // Onsen links a turn's message that quotes nothing to every message of the turn
   expect(ans.sender).toBe('system:control')                               // the author as before
 }, 30000)
 
@@ -81,19 +81,6 @@ test('/clear\'s answer is in its turn too; a plain message\'s turn is not given 
   expect(outs().find((i: any) => String(i.body).includes('已送 `/clear`'))!.turn_id).toBe(`daemon:${JOEY}:7100`)
   expect(outs().filter((i: any) => String(i.turn_id ?? '').startsWith('daemon:')).every((i: any) => /^daemon:1828:710[01]$/.test(i.turn_id))).toBe(true)
 }, 15000)
-
-test('a permission reply (yes <id>): the session gets the answer; the message itself: delivered and turn_end done', async () => {
-  const c = await d.client()
-  const answers: any[] = []
-  c.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel/permission') answers.push(n.params) }
-  await c.notification({ method: 'notifications/claude/channel/permission_request', params: { request_id: 'abcde', tool_name: 'Bash', description: 'run ls', input_preview: '{"command":"ls"}' } })
-  await sleep(500)
-  api.push(dm(JOEY, 7102, 'yes abcde'))
-  expect(await until(() => answers.some(a => a.request_id === 'abcde' && a.behavior === 'allow'), 10000)).toBe(true)
-  expect(await until(() => factsOf(7102).some((f: any) => f.state === 'turn_end'), 10000)).toBe(true)
-  await sleep(300)
-  expectHandledHere(7102, 'permission')
-}, 30000)
 
 test('not the daemon\'s own (a plain text; a slash text the control plane does not know): delivered, and no turn_end from the daemon', async () => {
   api.push(dm(JOEY, 7103, '一般的一句'))

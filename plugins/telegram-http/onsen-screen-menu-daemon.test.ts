@@ -5,8 +5,8 @@
 //      second one (also when the dialog is drawn before the request comes), no Telegram
 //   2  a permission prompt answered on the screen (the duty officer, a person at the TUI): its Action is cancelled once (CONTRACT §6: the screen's
 //      question gone, the daemon cancels it); one pressed in Onsen first is applied and never cancelled after; a menu asked about in Onsen that left
-//      the screen is cancelled. The same off the connector (ONSEN_ACTIONS on, polling): its Telegram copies close too; the menu relay's Telegram
-//      message as before, and its Action (resolved by the presser when tapped in Telegram)
+//      the screen is cancelled. The same off the connector (ONSEN_ACTIONS on, polling; 1.59.0: a roamer, ROAMER_MODE=1, the only daemon that still
+//      polls): its Telegram copies close too; the menu relay's Telegram message as before, and its Action (resolved by the presser when tapped in Telegram)
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -82,7 +82,7 @@ beforeAll(async () => {
   ;[conn, poll] = await Promise.all([
     startTgDaemon(apiC, join(root, 'c'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'), CHANNEL_BOT_TMUX_SESSION: panes.c.name },
       h => h?.ok === true),
-    startTgDaemon(apiP, join(root, 'p'), JOEY, { ...env, ONSEN_CREDENTIAL_FILE: join(root, 'cred-p'), CHANNEL_BOT_TMUX_SESSION: panes.p.name }),
+    startTgDaemon(apiP, join(root, 'p'), JOEY, { ...env, ROAMER_MODE: '1', ONSEN_CREDENTIAL_FILE: join(root, 'cred-p'), CHANNEL_BOT_TMUX_SESSION: panes.p.name }),
   ])
   for (const k of ['c', 'p'] as const) {
     const c = await (k === 'c' ? conn : poll).client()

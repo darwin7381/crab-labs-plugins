@@ -1,6 +1,7 @@
 // WO-176 (daemon side) end to end: a real Telegram daemon (server.ts, lanes off) and real agent-inbox daemons against the Bot API stand-in and a stand-in
 // Onsen (fleet-core onsen_actions.py's contract: /v1/actions create, resolve, applied, cancel, GET; the inbox pull), in temp dirs (their HOME too).
-// Nothing reaches core.kbro.ai; no tmux.
+// Nothing reaches core.kbro.ai; no tmux. 1.59.0: the Telegram daemon is a roamer (ROAMER_MODE=1; recording off, as here before): a prompt's Telegram copies
+// are a roamer's only (a connector asks through its Action alone: onsen-connector-daemon.test.ts 10, onsen-connector-actions-daemon.test.ts).
 //   permission prompt    Telegram exactly as before (one copy per person, See more / Allow / Deny); an Action (permission, allow / deny, the people it
 //                        went to). A tap: Claude Code answered, the Action resolved by the presser then applied, only the tapped copy edited (as before).
 //                        A press in Onsen (POST /onsen/action): Claude Code answered, applied, every copy edited ending 「從 Onsen 按的」. Onsen first and
@@ -179,7 +180,7 @@ beforeAll(async () => {
   writeFileSync(join(root, 'registry.json'), JSON.stringify({ adam: { url: 'http://127.0.0.1:9/inject' } }))
   writeFileSync(join(root, 'cred'), CRED + '\n')
   api = startBotApiMock({}, { pollHoldMs: 300 })
-  tg = await startTgDaemon(api, join(root, 'tg'), JOEY, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_RECORD: '0',
+  tg = await startTgDaemon(api, join(root, 'tg'), JOEY, { ROAMER_MODE: '1', GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_RECORD: '0',
     ONSEN_CREDENTIAL_FILE: join(root, 'cred'), AGENT_INBOX_REGISTRY: join(root, 'registry.json') })
   // two people get ops traffic: Joey and his test account (two copies of each prompt)
   const af = join(tg.stateDir, 'access.json')
@@ -453,7 +454,7 @@ test('the Telegram daemon restarts with a prompt open: its Action is cancelled a
   expect(open[idOf('Bash：git push origin main')]).toMatchObject({ v: 1 })   // the first test's prompt, never answered, is open too
   expect(Object.keys(open).every(k => actions.get(k)?.state === 'open')).toBe(true)
   await tg.stop()
-  tg = await startTgDaemon(api, join(root, 'tg'), JOEY, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_RECORD: '0',
+  tg = await startTgDaemon(api, join(root, 'tg'), JOEY, { ROAMER_MODE: '1', GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_RECORD: '0',
     ONSEN_CREDENTIAL_FILE: join(root, 'cred'), AGENT_INBOX_REGISTRY: join(root, 'registry.json'), ONSEN_PERM_RESTART_GRACE_MS: '3000' })
   const up = Date.now()
   // within the grace: still open (a duty officer asking about the prompt still on the screen would take it over); kept in the file

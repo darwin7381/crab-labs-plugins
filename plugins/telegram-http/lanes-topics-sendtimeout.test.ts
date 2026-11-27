@@ -2,7 +2,8 @@
 // reply (rich text: callBotApi's bare fetch) had no result for over 120 s, with nothing in the log. Every send to a chat has TELEGRAM_SEND_TIMEOUT_S
 // (default 45; 1 here): the tool call errors with words that say the message MAY have been delivered, nothing is sent again (no rich → plain retry), one
 // log line per timeout; every reply message delivered is one info line (never the text). Long polling (getUpdates) is not bounded.
-// A real tg daemon with lanes OFF, against the Bot API stand-in.
+// A real tg daemon with lanes OFF, against the Bot API stand-in. 1.59.0: a roamer (ROAMER_MODE=1): the only daemon that sends to Telegram itself
+// (roamer-telegram.ts); a connector's words are drawn by the bridge.
 import { test, expect, afterAll, beforeAll } from 'bun:test'
 import { mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -14,7 +15,7 @@ const JOEY = 1828
 let api: BotApiMock, d: TgDaemon
 beforeAll(async () => {
   api = startBotApiMock({}, { pollHoldMs: 2500 })
-  d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-sendtimeout-')), JOEY, { GENESIS_LANES: '0', TELEGRAM_SEND_TIMEOUT_S: '1', TELEGRAM_UPLOAD_TIMEOUT_S: '3' })
+  d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-sendtimeout-')), JOEY, { ROAMER_MODE: '1', GENESIS_LANES: '0', TELEGRAM_SEND_TIMEOUT_S: '1', TELEGRAM_UPLOAD_TIMEOUT_S: '3' })
 }, 40000)
 afterAll(async () => { await d?.stop(); api?.stop() })
 const timed = async (name: string, args: Record<string, unknown>) => { const t0 = Date.now(); const r = await d.call(name, args); return { ...r, ms: Date.now() - t0 } }
@@ -78,12 +79,14 @@ test('long polling is not bounded: a getUpdates held 2.5 s (longer than the 1 s 
   expect(await until(() => api.of('sendChatAction').length > n0, 8000)).toBe(true)
 }, 25000)
 
-test('server.ts: the bound is not behind the lanes switch; callBotApi and every grammy send go through it', () => {
-  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  const at = src.indexOf('bot.api.config.use((prev, method, payload, signal) =>')
+test('roamer-telegram.ts: the bound is not behind the lanes switch; the raw POST and every Bot API send go through it', () => {
+  // 1.59.0: the Telegram code is roamer-telegram.ts (loaded by a roamer only); server.ts has none of it
+  const src = readFileSync(join(import.meta.dir, 'roamer-telegram.ts'), 'utf8')
+  const at = src.indexOf('this.bot.api.config.use((prev, method, payload, signal) =>')
   expect(at).toBeGreaterThan(0)
-  expect(src.slice(src.lastIndexOf('\n', at - 2), at)).not.toContain('LANES_ON')
+  expect(src.slice(src.lastIndexOf('constructor(', at), at)).not.toContain('LANES_ON')
   expect(src).toContain("const BOUNDED_SENDS = new Set(['sendMessage', 'sendRichMessage', 'sendPhoto', 'sendDocument', 'sendChatAction', 'editMessageText', 'setMessageReaction',")
   expect(src).not.toMatch(/BOUNDED_SENDS = new Set\([^)]*getUpdates/)
-  expect(src.slice(src.indexOf('async function callBotApi('), src.indexOf('async function callBotApi(') + 400)).toContain('const data = await boundedSend(method, async signal => {')
+  expect(src.slice(src.indexOf('async callBotApi('), src.indexOf('async callBotApi(') + 400)).toContain('const data = await this.boundedSend(method, async signal => {')
+  expect(readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')).not.toContain('BOUNDED_SENDS')
 })

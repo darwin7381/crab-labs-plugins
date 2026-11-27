@@ -45,7 +45,7 @@ describe('through a daemon', () => {
   const items = (): any[] => {
     try { return readFileSync(join(d.stateDir, 'lanes', 'state.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(r => r.rec === 'msg' && r.notif) } catch { return [] }
   }
-  beforeAll(async () => { api = startBotApiMock({}); d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'rich-inbound-')), JOEY) }, 40000)
+  beforeAll(async () => { api = startBotApiMock({}); d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'rich-inbound-')), JOEY, { ROAMER_MODE: '1' }) }, 40000)
   afterAll(async () => { await d?.stop(); api?.stop() })
 
   test('a message that is only a rich message reaches the session as its text; the log says kind=rich', async () => {

@@ -1,12 +1,12 @@
 // WO-145 end to end: real Telegram daemons (server.ts, lanes off) against their own Bot API stand-ins and one stand-in Onsen (a local HTTP server;
 // nothing reaches core.kbro.ai or Telegram), in temp dirs (their HOME too).
-//   on  (ONSEN_REACT_SEEN, ONSEN_STATUS_PIN, ONSEN_FORM_LINKS = adam): the pinned status (sent and pinned silently, edited on a change ≥ 5 s apart, line 2
-//       from the facts, recorded as system:status's); ✍ when the parked message enters a turn (WO-165: the transcript shows it; written into the
-//       session alone is in_session and leaves it; recorded as system:seen's); a reply's page
-//       link keyed on Telegram and recorded without the key; a page answer from the inbox to the session (via web-form, form-<id>), echoed silently
-//       (system:form-echo), acked, its facts; a reply_to form-<id> threads under the echo; the status message deleted → off, a marker file
-//   off (no switch): the same steps change nothing: no ✍, no status message, no getChat / pin, the link as written, no /forms or /forms/inbox call
-//   lanes on (ONSEN_FORM_LINKS = adam): a page answer goes to the main through the lanes (route rule web-form, an M1 item of kind joey), echoed, acked
+// 1.59.0: the daemons are connectors. What WO-145 drew on Telegram is the bridge's (it draws it from Onsen): the pinned status, the ✍ when a message
+// enters a turn, the echo of a page answer, a reply threaded under that echo; their 1.58.x cases here are gone (the pin and ✍ switches, set below,
+// change nothing). What stays the daemon's: the forms inbox (ONSEN_FORM_LINKS).
+//   on  (ONSEN_REACT_SEEN, ONSEN_STATUS_PIN, ONSEN_FORM_LINKS = adam): a page answer from the inbox to the session (via web-form, form-<id>), acked, its
+//       facts; nothing to Telegram (no status message, no ✍, no echo)
+//   off (ONSEN_FORM_LINKS names someone else): no /forms or /forms/inbox call
+//   lanes on (ONSEN_FORM_LINKS = adam): a page answer goes to the main through the lanes (route rule web-form, an M1 item of kind joey), acked
 import { test, expect, afterAll, beforeAll } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -103,120 +103,46 @@ afterAll(async () => { await on?.stop(); await off?.stop(); await lanes?.stop();
 const L1 = /^⚫ 失連（\d\d:\d\d 起）：沒有 session$/
 const URL_TEXT = '## 請選方案\n選好按送出：[打開頁面](https://ops.fud.city/wo/145?a=1#pick)，或 https://example.com/x'
 
-test('on: the pinned status, ✍, a keyed link recorded without the key, a page answer to the session; deleted → off', async () => {
-  const pinMsg = () => apiOn.of('sendMessage').find(c => L1.test(String(c.body.text).split('\n')[0]!))
-  // the status message: sent silently, pinned silently, recorded as system:status's (the main has no session: offline no_registration)
-  expect(await until(() => !!pinMsg() && apiOn.of('pinChatMessage').length > 0, 15000)).toBe(true)
-  const sent = pinMsg()!
-  expect(sent.body).toMatchObject({ chat_id: String(JOEY), disable_notification: true })
-  expect(String(sent.body.text)).toMatch(L1)
-  const pinId = Number(apiOn.of('pinChatMessage')[0]!.body.message_id)
-  expect(apiOn.of('pinChatMessage')[0]!.body).toMatchObject({ chat_id: String(JOEY), disable_notification: true })
-  expect(apiOn.pinned.get(String(JOEY))).toBe(pinId)
-  expect(await until(() => msgs('on').some((m: any) => m.sender === 'system:status' && m.client_msg_id === String(pinId) && m.meta?.silent === true), 10000)).toBe(true)
-  const tPin = Date.now()
-  // Joey's message, no session: parked (delivered, not seen) → line 2, at least 5 s after the send
-  apiOn.push(dm(JOEY, 8001, '請看一下'))
-  expect(await until(() => facts('on', '8001').includes('delivered'), 10000)).toBe(true)
-  expect(await until(() => apiOn.of('editMessageText').some(c => Number(c.body.message_id) === pinId && /\n你傳的：1 則還沒進去$/.test(String(c.body.text))), 15000)).toBe(true)
-  const e1 = apiOn.of('editMessageText').find(c => Number(c.body.message_id) === pinId)!
-  expect(e1.at - tPin).toBeGreaterThan(4000)
-  expect(apiOn.of('setMessageReaction').length).toBe(0)                                  // no 👀 configured, nothing seen yet: no reaction
-  // a session opens: the parked message is written into it: in_session by main (WO-165), no ✍ yet; it enters a turn (the transcript shows it): seen by
-  // main → ✍ on it, recorded as system:seen's
+test('on: a page answer to the session (via web-form, form-<id>), acked, its facts; the status message, ✍ and the echo are not the daemon\'s (nothing to Telegram)', async () => {
   const inbound: Array<{ content: string; meta: any }> = []
   const c = await connect(on, inbound)
-  expect(await until(() => inbound.some(x => x.meta.message_id === '8001'), 15000)).toBe(true)
-  expect(await until(() => facts('on', '8001').includes('in_session:main'), 10000)).toBe(true)
-  await sleep(1500)
-  expect(facts('on', '8001')).toEqual(['delivered', 'in_session:main'])
-  expect(apiOn.of('setMessageReaction').length).toBe(0)
-  takeIn(on, '8001')
-  expect(await until(() => facts('on', '8001').includes('seen:main'), 10000)).toBe(true)
-  expect(await until(() => apiOn.of('setMessageReaction').length === 1, 5000)).toBe(true)
-  expect(apiOn.of('setMessageReaction')[0]!.body).toMatchObject({ chat_id: String(JOEY), message_id: 8001, reaction: [{ type: 'emoji', emoji: '✍' }] })
-  expect(apiOn.of('setMessageReaction')[0]!.body.is_big).toBeFalsy()
-  expect(await until(() => evs('on').some(e => e.kind === 'reaction' && e.actor === 'system:seen' && e.target_client_msg_id === '8001' && e.data?.emoji === '✍'), 10000)).toBe(true)
-  expect(await until(() => apiOn.of('editMessageText').some(c => Number(c.body.message_id) === pinId && /\n你傳的：1 則看到了還沒回$/.test(String(c.body.text))), 15000)).toBe(true)
-  // the agent reacts itself: its reaction stands (no ✍ over it)
-  expect((await call(c, 'react', { chat_id: String(JOEY), message_id: '8001', emoji: '👍' })).isError).toBe(false)
-  await sleep(300)
-  expect(apiOn.of('setMessageReaction').map(x => x.body.reaction[0].emoji)).toEqual(['✍', '👍'])
-  // the main's reply with a page link: Telegram gets the key (before the #fragment, after the query), Onsen records the text as written
-  const r = await call(c, 'reply', { chat_id: String(JOEY), text: URL_TEXT })
-  expect(r.isError).toBe(false)
-  const form = got.find(g => g.who === 'on' && g.path === '/forms')!
-  expect(form.body).toEqual({ chat: String(JOEY), title: '選好按送出：打開頁面，或', url: 'https://ops.fud.city/wo/145?a=1#pick' })   // WO-153: the link as written, no key
-  const tg = apiOn.of('sendRichMessage').at(-1)!.body.rich_message.markdown
-  expect(tg).toBe('## 請選方案\n選好按送出：[打開頁面](https://ops.fud.city/wo/145?a=1&k=onsenform_TEST1-k_y#pick)，或 https://example.com/x')
-  expect(await until(() => msgs('on').some((m: any) => m.sender === 'main' && m.body === URL_TEXT), 10000)).toBe(true)
-  expect(JSON.stringify(got.filter(g => g.path === '/messages/batch' || g.path === '/events'))).not.toContain('onsenform_TEST1')
-  expect(on.log()).not.toContain('onsenform_TEST1')
-  // answered: line 2 goes
-  expect(await until(() => apiOn.of('editMessageText').some(c => Number(c.body.message_id) === pinId && L1.test(String(c.body.text))), 15000)).toBe(true)
-  // a page answer: into the session as Joey's message (via web-form, form-<id>), echoed silently, acked; its facts
+  // a page answer: into the session as Joey's message (via web-form, form-<id>), acked; its facts
   inbox.push({ for: 'on', id: 9001, form_id: 501, chat: String(JOEY), title: '選方案', body: '{"choice":"B","note":"快"}', at: new Date().toISOString() })
   expect(await until(() => inbound.some(x => x.meta.message_id === 'form-9001'), 30000)).toBe(true)
   const fa = inbound.find(x => x.meta.message_id === 'form-9001')!
   expect(fa.content).toBe('choice: B\nnote: 快')
   expect(fa.meta).toMatchObject({ chat_id: String(JOEY), via: 'web-form', form_title: '選方案', form_id: '501', user_id: String(JOEY) })
   expect(await until(() => inbox.find(i => i.id === 9001)!.acked === true, 10000)).toBe(true)
-  const echo = apiOn.of('sendMessage').find(c => String(c.body.text).startsWith('〔你在頁面送出的｜選方案〕'))!
-  expect(echo.body).toMatchObject({ chat_id: String(JOEY), text: '〔你在頁面送出的｜選方案〕\nchoice: B\nnote: 快', disable_notification: true })
-  expect(await until(() => msgs('on').some((m: any) => m.sender === 'system:form-echo' && m.meta?.silent === true), 10000)).toBe(true)
   expect(await until(() => facts('on', 'form-9001').join(',') === 'delivered,in_session:main', 10000)).toBe(true)
   takeIn(on, 'form-9001', ' via="web-form" form_title="選方案" form_id="501"')
   expect(await until(() => facts('on', 'form-9001').join(',') === 'delivered,in_session:main,seen:main', 10000)).toBe(true)
-  expect(apiOn.of('setMessageReaction').length).toBe(2)                                  // no ✍ for a page answer (no Telegram message)
-  // the main answers it: reply_to form-9001 threads under the echo on Telegram
-  const echoId = Number(msgs('on').find((m: any) => m.sender === 'system:form-echo')!.client_msg_id)
-  expect((await call(c, 'reply', { chat_id: String(JOEY), text: '收到 B', reply_to: 'form-9001' })).isError).toBe(false)
-  const rr = apiOn.of('sendRichMessage').at(-1)!.body
-  expect(rr.rich_message.markdown).toBe('收到 B')
-  expect(rr.reply_parameters).toMatchObject({ message_id: echoId })
-  expect((await call(c, 'react', { chat_id: String(JOEY), message_id: 'form-9001', emoji: '👍' })).isError).toBe(false)
-  expect(apiOn.of('setMessageReaction').at(-1)!.body).toMatchObject({ message_id: echoId, reaction: [{ type: 'emoji', emoji: '👍' }] })
-  // the status message deleted by Joey: the next edit is refused → off (a marker), nothing more in that chat
-  apiOn.deleted.add(pinId)
-  apiOn.push(dm(JOEY, 8002, '再一則'))                                                      // line 2 changes
-  const marker = join(on.stateDir, 'onsen', `status-pin-off-${JOEY}.json`)
-  expect(await until(() => existsSync(marker), 20000)).toBe(true)
-  expect(JSON.parse(readFileSync(marker, 'utf8'))).toMatchObject({ why: 'deleted', message_id: pinId })
-  const n = apiOn.calls.filter(x => ['editMessageText', 'getChat', 'pinChatMessage'].includes(x.method)).length
-  apiOn.push(dm(JOEY, 8003, '第三則'))
-  await sleep(6500)
-  expect(apiOn.calls.filter(x => ['editMessageText', 'getChat', 'pinChatMessage'].includes(x.method)).length).toBe(n)
-  expect(apiOn.of('sendMessage').filter(c => L1.test(String(c.body.text).split('\n')[0]!)).length).toBe(1)   // never a second status message
+  // a message of Joey's taken into a turn: seen, and no ✍ from the daemon (the bridge draws it from the receipt)
+  apiOn.push(dm(JOEY, 8001, '請看一下'))
+  expect(await until(() => inbound.some(x => x.meta.message_id === '8001'), 15000)).toBe(true)
+  takeIn(on, '8001')
+  expect(await until(() => facts('on', '8001').includes('seen:main'), 10000)).toBe(true)
+  await sleep(1500)
+  expect(apiOn.calls).toEqual([]); expect(apiOn.polls).toEqual([])
+  expect(msgs('on').filter((m: any) => m.sender === 'system:status' || m.sender === 'system:form-echo' || m.sender === 'system:seen')).toEqual([])
+  expect(evs('on').filter((e: any) => e.actor === 'system:seen')).toEqual([])
   const h = await fetch(`http://127.0.0.1:${on.port}/healthz`).then(r => r.json()) as any
-  // WO-165: 8002 and 8003 reached the session and never entered a turn (no transcript record): in_session, no ✍ (until 1.56.0: ✍ on both)
-  expect(facts('on', '8003')).toEqual(['delivered', 'in_session:main'])
-  expect(h.onsen.status).toMatchObject({ react_seen: { reacted: 1, skipped_agent: 0, refused: false }, status_pin: { sent: 1, stopped: 1 }, forms: { delivered: 1, acked: 1 } })
+  expect(h.onsen.status.react_seen).toBeUndefined(); expect(h.onsen.status.status_pin).toBeUndefined()
+  expect(h.onsen.status).toMatchObject({ forms: { delivered: 1, acked: 1 } })
+  expect(existsSync(join(on.stateDir, 'onsen', 'status-pin.json'))).toBe(false)
   await c.close()
 }, 120000)
 
-test('off: the same steps change nothing (no ✍, no status message, no pin / getChat, the link as written, no forms call)', async () => {
+test('off (ONSEN_FORM_LINKS names someone else): no forms call', async () => {
   apiOff.push(dm(JOEY, 8601, '請看一下'))
   expect(await until(() => facts('off', '8601').includes('delivered'), 10000)).toBe(true)
-  const inbound: Array<{ content: string; meta: any }> = []
-  const c = await connect(off, inbound)
-  expect(await until(() => inbound.some(x => x.meta.message_id === '8601'), 15000)).toBe(true)
-  takeIn(off, '8601')
-  expect(await until(() => facts('off', '8601').includes('seen:main'), 10000)).toBe(true)
-  expect((await call(c, 'reply', { chat_id: String(JOEY), text: URL_TEXT })).isError).toBe(false)
-  expect(apiOff.of('sendRichMessage').at(-1)!.body.rich_message.markdown).toBe(URL_TEXT)
   await sleep(1500)
-  expect(apiOff.calls.map(x => x.method).filter(m => !['getMe', 'deleteWebhook', 'setMyCommands', 'sendChatAction', 'getMyCommands', 'setMyDescription', 'setChatMenuButton'].includes(m)))
-    .toEqual(['sendRichMessage'])
   expect(got.filter(g => g.who === 'off' && g.path.startsWith('/forms')).length).toBe(0)
-  expect(msgs('off').filter((m: any) => m.direction === 'out').map((m: any) => m.sender)).toEqual(['main'])
-  expect(evs('off').length).toBe(0)
+  expect(apiOff.calls).toEqual([])
   const h = await fetch(`http://127.0.0.1:${off.port}/healthz`).then(r => r.json()) as any
   expect(h.onsen.status.react_seen).toBeUndefined(); expect(h.onsen.status.status_pin).toBeUndefined(); expect(h.onsen.status.forms).toBeUndefined()
-  expect(existsSync(join(off.stateDir, 'onsen', 'status-pin.json'))).toBe(false)
-  await c.close()
 }, 60000)
 
-test('lanes on: a page answer goes to the main through the lanes (rule web-form, an M1 item of kind joey), echoed silently, acked', async () => {
+test('lanes on: a page answer goes to the main through the lanes (rule web-form, an M1 item of kind joey), acked', async () => {
   inbox.push({ for: 'lanes', id: 9101, form_id: 601, chat: String(JOEY), title: '排程', body: '週四 10:00', at: new Date().toISOString() })
   expect(await until(() => inbox.find(i => i.id === 9101)!.acked === true, 30000)).toBe(true)
   const jl = (f: string) => { try { return readFileSync(join(lanes.ws, '.lanes', f), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) } catch { return [] } }
@@ -225,9 +151,7 @@ test('lanes on: a page answer goes to the main through the lanes (rule web-form,
   const item = journal.find(r => r.rec === 'msg' && r.notif?.params?.meta?.message_id === 'form-9101')
   expect(item).toMatchObject({ kind: 'joey', state: 'queued', notif: { params: { content: '週四 10:00', meta: { via: 'web-form', form_title: '排程', form_id: '601' } } } })
   expect(await until(() => facts('lanes', 'form-9101').includes('delivered'), 10000)).toBe(true)
-  expect(apiLanes.of('sendMessage').find(c => String(c.body.text).startsWith('〔你在頁面送出的｜排程〕'))!.body).toMatchObject({ text: '〔你在頁面送出的｜排程〕\n週四 10:00', disable_notification: true })
-  expect(apiLanes.of('setMessageReaction').length).toBe(0)                               // ONSEN_REACT_SEEN off here
-  expect(apiLanes.of('pinChatMessage').length).toBe(0)                                   // ONSEN_STATUS_PIN off here
+  expect(apiLanes.calls).toEqual([])
 }, 60000)
 
 test('WO-153 form_close: listed with recording on, its answer is Onsen\'s (closed, already, 404, 403), a call without id or url never reaches Onsen; recording off: not listed', async () => {

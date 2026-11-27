@@ -1,7 +1,7 @@
 // WO-197 segment 1, against a real daemon (server.ts), the Bot API stand-in and the Onsen stand-in (its bridge simulated): an agent named in
 // ONSEN_BRIDGE starts without a bot token, never polls, makes no Bot API call at all (the stand-in sees none), and says, reacts and edits only in
-// Onsen (POST /v1/messages with conversation_id; the bridge's report gives `sent (id: …)`, none in 3 s gives the held sentence). A daemon taken off
-// the list polls Telegram again; named while polling: its poll stops.
+// Onsen (POST /v1/messages with conversation_id; the bridge's report gives `sent (id: …)`, none in 3 s gives the held sentence). 1.59.0: the list is
+// no switch for the daemon any more (the 1.58.x test 7, taken off the list → polls again, named while polling → the poll stops, is gone with it).
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -13,7 +13,7 @@ import { HELD } from './onsen-connector.ts'
 
 const JOEY = 1828
 const CRED = { c: 'mesh_CONNECTORsecretSECRETsecretSECRET01', s: 'mesh_CONNECTORswitchSECRETsecretSECRET1' }
-let root = '', api: BotApiMock, apiSw: BotApiMock, onsen: OnsenStandin, d: TgDaemon, sw: TgDaemon, machine = ''
+let root = '', api: BotApiMock, onsen: OnsenStandin, d: TgDaemon
 const health = (x: TgDaemon) => fetch(`http://127.0.0.1:${x.port}/healthz`).then(r => r.json()) as Promise<any>
 
 beforeAll(async () => {
@@ -21,20 +21,13 @@ beforeAll(async () => {
   onsen = startOnsenStandin({ [CRED.c]: 'c', [CRED.s]: 's' }, await freePort())
   for (const w of ['c', 's']) onsen.st.version[w] = '0.35.3'
   writeFileSync(join(root, 'cred-c'), CRED.c + '\n'); writeFileSync(join(root, 'cred-s'), CRED.s + '\n')
-  api = startBotApiMock({}, { pollHoldMs: 200 }); apiSw = startBotApiMock({}, { pollHoldMs: 200 })
-  machine = join(root, 'machine.env')
-  writeFileSync(machine, 'ONSEN_BRIDGE=someone\n')
+  api = startBotApiMock({}, { pollHoldMs: 200 })
   const env = { ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude', ONSEN_BRIDGE_RETRY_MS: '50,50' }
-  ;[d, sw] = await Promise.all([
-    // named in the plist, no token: a connector from the start
-    startTgDaemon(api, join(root, 'c'), JOEY, { ...env, GENESIS_LANES: '0', TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'lab-relay, adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'),
-        TELEGRAM_ALBUM_CAP_MS: '3000' },
-      h => h?.ok === true),
-    // the machine config's line, read again: not named at first (polls), then named, then taken off
-    startTgDaemon(apiSw, join(root, 's'), JOEY, { ...env, GENESIS_LANES: '0', CRAB_LABS_PLUGINS_ENV: machine, ONSEN_BRIDGE_TICK_MS: '200', ONSEN_CREDENTIAL_FILE: join(root, 'cred-s') }),
-  ])
+  // named in the plist, no token: a connector from the start (1.59.0: a connector named or not)
+  d = await startTgDaemon(api, join(root, 'c'), JOEY, { ...env, GENESIS_LANES: '0', TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'lab-relay, adam', ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-c'),
+    TELEGRAM_ALBUM_CAP_MS: '3000' })
 }, 60000)
-afterAll(async () => { await Promise.all([d?.stop(), sw?.stop()]); api?.stop(); apiSw?.stop(); onsen?.stop() })
+afterAll(async () => { await d?.stop(); api?.stop(); onsen?.stop() })
 
 test('1. named, no token: it starts; /healthz has the agent and connector on; not polling; the Bot API stand-in sees no call at all', async () => {
   const h = await health(d)
@@ -111,20 +104,6 @@ test('6. chat_id onsen:<conversation id> (a person with no app account): written
   expect(r.text).toMatch(/^sent \(id: onsen:\d+\)$/)
   expect(onsen.connector.at(-1)!.body.conversation_id).toBe('4242')
 })
-
-test('7. the machine config: not named → polls; named → the poll stops (offset saved once) and no call after; taken off → polls again', async () => {
-  expect((await health(sw)).polling).toBe(true)
-  writeFileSync(machine, 'ONSEN_BRIDGE=adam\n')
-  expect(await until(async () => (await health(sw)).polling === false && (await health(sw)).connector.on === true, 35000)).toBe(true)
-  await sleep(600)
-  const calls = apiSw.calls.length, polls = apiSw.polls.length
-  expect(await sw.call('react', { chat_id: String(JOEY), message_id: '1', emoji: '👍' }).then(r => r.isError)).toBe(true)   // nothing in Onsen for it
-  await sleep(1500)
-  expect(apiSw.calls.length).toBe(calls)
-  expect(apiSw.polls.length).toBe(polls)
-  writeFileSync(machine, 'ONSEN_BRIDGE=0\n')
-  expect(await until(async () => (await health(sw)).polling === true, 35000)).toBe(true)
-}, 90000)
 
 type Got = { content: string; meta: Record<string, string> }
 const got: Got[] = []

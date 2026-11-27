@@ -104,7 +104,7 @@ afterAll(async () => { for (const r of roots) await r.stop() })
 
 test('daemon, LANES_WORKER_TOPICS=enable, the bot\'s topic mode off: ONE setMySettings with both fields, then getMe; usable', async () => {
   const api = startBotApiMock({ has_topics_enabled: false, allows_users_to_create_topics: false })
-  const d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-mode-d1-')), 1828, { LANES_WORKER_TOPICS: 'enable' })
+  const d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-mode-d1-')), 1828, { ROAMER_MODE: '1', LANES_WORKER_TOPICS: 'enable' })
   roots.push({ stop: async () => { await d.stop(); api.stop() } })
   expect(await until(() => d.log().includes('lanes: worker topics enable'))).toBe(true)
   const sets = api.of('setMySettings')
@@ -117,7 +117,7 @@ test('daemon, LANES_WORKER_TOPICS=enable, the bot\'s topic mode off: ONE setMySe
 
 test('daemon, auto, getMe shows the broken mode: nothing is changed, one clear warning', async () => {
   const api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: true })
-  const d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-mode-d2-')), 1828, {})
+  const d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-mode-d2-')), 1828, { ROAMER_MODE: '1' })
   roots.push({ stop: async () => { await d.stop(); api.stop() } })
   expect(await until(() => d.log().includes('lanes: worker topics auto'))).toBe(true)
   expect(api.of('setMySettings')).toEqual([])

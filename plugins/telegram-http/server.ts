@@ -3986,7 +3986,7 @@ if (tg) {
   void reportCommands().catch(() => {})
   setInterval(() => { if (!commandsPut && Date.now() - commandsTriedAt > 60_000) void reportCommands().catch(() => {}) }, 5_000).unref?.()
 } else {
-  log('info', 'agent-inbox mode: no Telegram — serving /mcp + /inject only')
+  log('info', 'agent-inbox mode: Telegram polling disabled — serving /mcp + /inject only')
 }
 
 // ============================================================================
