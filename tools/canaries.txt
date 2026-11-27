@@ -387,3 +387,6 @@ plugins/telegram-http/lanes.ts::function mainCannotAct(): boolean
 plugins/telegram-http/lanes-main.ts::function wallDelivery(
 plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
 plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
+# WO-204 part 2 (1.59.4)
+plugins/telegram-http/lanes-main.ts::advanceProbe(now, { resume_sent: episode })
+plugins/telegram-http/lanes-main.ts::(!heldCut(r) || releasedCut(r))
