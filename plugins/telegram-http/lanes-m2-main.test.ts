@@ -546,7 +546,7 @@ test('the main-only rules: ledger_query before answering what happened (one line
   expect(ctx.split('\n').filter(l => l.includes('ledger_query')).length).toBe(1)
   expect(ctx).toContain('不要重複通知他'); expect(ctx).toContain('車道摘要'); expect(ctx).toContain('不會為了它單獨叫醒你')
   expect(ctx).toContain('fan_out(tasks, conclusion)'); expect(ctx).toContain('commitment(who, what, by, due)'); expect(ctx).toContain('ToolSearch')
-  expect(ctx).toContain('〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕'); expect(ctx).toContain('包括不可逆的指示')   // 002u: the router's transcript of Joey's own message counts as his word
+  expect(ctx).toContain('〔Joey 原話｜分流器收到的原文，不是車道的轉述〕'); expect(ctx).toContain('包括不可逆的指示')   // 002u: the router's transcript of Joey's own message counts as his word
   const names = L.mainToolDefs().map((t: any) => t.name)
   for (const n of ['fan_out', 'commitment', 'commitment_done', 'curate_memory', 'curate_stop', 'memory_decide', 'open_worker', 'fork', 'peer_hold']) expect(names).toContain(n)
   const card = L.identityCard({ kind: 'reflex' } as any)

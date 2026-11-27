@@ -1200,8 +1200,13 @@ function mainWallNoticeOwned(rule: 'main-wall-up' | 'main-wall-down', kind: stri
 function onWallChange(prev: WallState | null, next: WallState | null): void {
   // 1.59.4 (WO-204 part 2): one line per transition (the WO-120 parking that used to log these is gone); what waits and what goes is M1's (lanes-main)
   if (!prev?.walled && next?.walled) log('info', `usage wall: ${next.episode} (${next.kind ?? '?'}, since ${next.since}) — a person's message is the probe (WO-200); programs wait for the clear`)
+  // 1.59.8 (Chiron, 1.59.7 lab 20:31:23Z): a clear the keeper writes after its state had gone stale (prev not walled) gets its own line, so a later offer
+  // lines up with it; a clear read at start (older than a minute) is not logged
+  if (!prev?.walled && next && !next.walled && next.clearedMs != null && next.clearedMs !== prev?.clearedMs && Date.now() - next.clearedMs < 60_000)
+    log('info', `usage wall: ${next.episode} cleared (${next.cleared_by ?? '?'}) after the keeper's state had gone stale — M1 offers what the wall held`)
   if (!prev?.walled || next?.walled) return
-  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh'} — the main's probe releases what the wall held`)
+  // 1.59.8 (Chiron, 1.59.7 lab 20:30:07Z): with PL4 gone a stale state releases nothing; the line says what happens instead
+  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'}) — the main's probe releases what the wall held` : "no longer fresh — nothing is released until the keeper reports a clear or a person's message probes (WO-200)"}`)
   // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now);
   // WO-175 item 3: and the main's items M1 held for the wall are offered in this step (lanes.ts usageWallChanged)
   if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
@@ -2357,7 +2362,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // 'joey' is a log-only target: the boss has no inbox daemon — he reads the BTCC
   // Messenger thread, so logging the message IS the delivery (fills his dm thread).
   if (target === 'joey' || target === 'joey (btcc)') {
-    if (!BTCC_API_BASE) return 'send to joey FAILED: "joey" is a log-only target and BTCC_API_BASE is not configured on this machine — nothing was sent. Use your Telegram reply tools.'
+    if (!BTCC_API_BASE) return 'send to joey FAILED: "joey" is a log-only target and BTCC_API_BASE is not configured on this machine — nothing was sent. Use reply to tell Joey directly.'
     try {
       const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
         method: 'POST',
@@ -2369,7 +2374,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
         signal: AbortSignal.timeout(8000),
       })
-      if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use your Telegram reply tools instead."
+      if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use reply in your conversation with him instead."
       return `send to joey FAILED (BTCC log ${r.status})`
     } catch (e) {
       return `send to joey FAILED (${e})`
@@ -2511,9 +2516,9 @@ function buildServer(): Server {
       instructions: [
         // Claude Code truncates MCP server instructions at 2048 chars, silently (measured 2026-11-06). Keep this under 2000.
         // WO-164 (Chiron 21:10Z): the one sentence on Onsen's text format; the whole of it is on the text fields (fleet-text.ts ONSEN_TEXT_FORMAT)
-        'The sender reads Telegram, not this session: anything they should see must go through the reply tool (pass chat_id back). Use reply_to only to quote an earlier message, not for normal replies. ' + ONSEN_TEXT_DEFAULT,
+        '這是你和對方的對話，存在 Onsen；對方用 Telegram 或 Onsen 的網頁看它，看不到你的 session。要讓對方看到的，只有 reply（chat_id 照進來那一則的填）。reply_to 只在要引用先前某一則時用。' + ONSEN_TEXT_DEFAULT,
         '',
-        'Messages arrive as <channel source="telegram" chat_id message_id user ts>. Attributes:',
+        '訊息進來的樣子：<channel source="telegram" chat_id message_id user ts>；對方從 Onsen 的網頁傳的多一個 via="onsen"，一樣是他。屬性：',
         '- image_path: Read it (a photo they sent). image_error: the photo did NOT come through; say so explicitly, never answer as if you saw it; retry with download_attachment(attachment_file_id).',
         '- attachment_file_id: call download_attachment, then Read the returned path.',
         '- reply_to_text/reply_to_user/reply_to_message_id: the message being replied to (attachment_origin="reply": the attachment came from it). reply_quote: the passage they quoted.',
@@ -2632,7 +2637,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'react',
-      description: 'Add an emoji reaction to a Telegram message: a silent status mark, never a report. Telegram accepts only its fixed set; for our use: 🫡 received or starting, 👍 agree, 💯 well done, 🎉 done, 🤔 looking into it, 😢 stuck, 🔥 found it (👀 is added automatically when a message arrives). ✅ ❌ 💪 🔍 are rejected.',
+      description: '在對方的一則訊息上按一個表情：靜默的狀態記號，不是回報。只用這一組（每一種客戶端都畫得出來）：🫡 收到或開工、👍 認同、💯 漂亮、🎉 完成、🤔 在查、😢 卡住、🔥 發現（👀 是訊息進來時自動加的）。✅ ❌ 💪 🔍 不收。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2645,7 +2650,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'download_attachment',
-      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      description: '把對方那一則的附件取到本機 inbox：<channel> 有 attachment_file_id 時用，回本機路徑，接著 Read。檔在 Onsen 裡；對方傳的時候沒能存進 Onsen 的（太大、當時失敗），會直接告訴你取不到。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2656,7 +2661,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent. Edits are silent (no push): use them for detail inside one stage; a new stage, the result, or anything they must see goes out as a new reply.',
+      description: '改你先前說的一則。靜默（不推播）：只用在同一個階段裡補細節；新的階段、結果、對方一定要看到的事，發新的一則。',
       inputSchema: {
         type: 'object',
         properties: {

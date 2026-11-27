@@ -1,11 +1,20 @@
-## 1.59.8 — 2026-11-28 (WO-168 stage two: one capture of the own pane, the record read by its readers)
+## 1.59.9 — 2026-11-28 (WO-168 stage two: one capture of the own pane, the record read by its readers)
 
 - **One capture of the daemon's own pane** (`pane-look.ts`, Joey TG chiron:2515 「不要補丁式」): the status record, the duty officer, the startup-picker's observer, the lanes main-wall probe's looks and presses, and the busy checks before a Telegram command read the own pane only through it; every look goes to the record. Roamer panes as before.
 - **The record carries more** (`screen-status.ts`): `menu_options`, `input_typed`, `waiting_text` for every menu, which screen it is for (`detail.screen`), a menu kept while walled or starting, a menu with no judge (the program's kind: `usage_limit_options`, `resume_picker`, `refusal_fallback`, `switch_confirm`, else `other`). `recordOf(look)`: the record for exactly one look, for readers that act.
 - **The duty officer reads the record on its own pane**, with Chiron's program rules (switch_confirm Esc, the refusal-fallback rule from modal-guard, its 3rd-strike BTCC alert). After its keys it looks until the screen changes (WO-97 gap). The lanes re-arm of the main's menu goes through it (item 5).
 - **A usage-limit screen is never the duty officer's** (Chiron #200727; Joey TG chiron:2918): neither the menu nor the line left after its 2nd option. The menu stays the lanes main-wall probe's, with WO-204's rule (the passive wait option, highlighted option verified before Enter); its looks are the one capture's, and a look that fails is never a menu that went away (`stuck`, nothing pressed before the keys).
 - The login monitor is retired on the own pane (system-alert covers it).
-- Merged with main at 1.59.7 (WO-204, WO-205, WO-207, WO-209; 1.59.7 also the bridge chat_title and the pre-push canary fix).
+- Merged with main at 1.59.8 (WO-204, WO-205, WO-207, WO-209; 1.59.7 also the bridge chat_title and the pre-push canary fix; 1.59.8 the Onsen words for the agent-facing texts).
+- **Also ships the three sentences main left unreleased for this version** (d4b6b07, below, as written there):
+  - The last three agent-facing "Telegram" sentences of the Onsen-words wave (Chiron, 1.59.8 lab; mail #200891 「同一類、頁面上沒列到的四處」): `send_to_agent` to `joey` with no BTCC base 「Use reply to tell Joey directly.」, its delivered line 「use reply in your conversation with him instead.」, a worker lane's steer 「這段對話只收白名單裡的人」. No version bump: they ship with WO-168 part 2 (1.59.9).
+  - Not listed in 1.59.8: the telegram-bridge sends a group's `chat_title` (Epeius 466ecc3, WO-179; bridge-only, it went live with 1.59.8's pull).
+
+## 1.59.8 — 2026-11-28 (Onsen words for the agent-facing texts; two usage-wall log lines)
+
+- **The agent-facing texts say "this conversation in Onsen", not "Telegram"** (Chiron mail #200891, his list `onsen-words-20261128/EDITS.md`, passages 6–10, 12–22, 24, verbatim; Joey TG chiron:2993). The MCP instructions' first two sentences, the main's lanes rules and the 〔Joey 原話｜分流器收到的原文…〕 label they cite (`lanes.ts`, same version), the hand-over wrapper, the not-main notice, react / edit_message / download_attachment, chat_history (its parameters and main description), notify_joey, the worker-lane rules, open_worker, the four INBOX_TEXT sentences, the two lane hooks' missed-message label. Codex call-914 (d297584, d0d39dd, 5ec2d1c, 4c5becb).
+- **Passage 11 left out**: the `reply` description stays word for word (Chiron #200897; WO-164; Joey TG chiron:2515, 2520). Its tests pin it again.
+- **Usage-wall log lines** (Chiron, 1.59.7 lab): a clear the keeper writes after its state had gone stale now has its own line (the reader reports a new clear as a change); the "no longer fresh" line says what happens without PL4 (nothing is released until a clear or a person's message probes).
 
 ## 1.59.7 — 2026-11-28 (WO-209 item half; PL4 removed; the undelivered episode survives a restart)
 

@@ -51,7 +51,7 @@ test('open_worker in a turn on Joey\'s message: the anchor file is created with 
   const text = readFileSync(join(dir, rel), 'utf8')
   expect(text).toContain('# 定錨檔：整理 Q3 報表')
   expect(text).toContain('https://t.me/lab_test_bot/7501')
-  expect(text).toContain('〔Joey 原話｜分流器從 Telegram 收到的原文，不是車道的轉述〕message_id 2001：「這件開一條線：把 Q3 報表整理好，週五前」')
+  expect(text).toContain('〔Joey 原話｜分流器收到的原文，不是車道的轉述〕message_id 2001：「這件開一條線：把 Q3 報表整理好，週五前」')
   expect(text).toContain('目標：Q3 報表。限制：不改原始資料。完成：貼結論。')
   for (const h of ['## 要交出什麼（Joey 原話）', '## 已定的／被否決的', '## 做到哪、產物在哪', '## 背景在跑什麼', '## 下一步']) expect(text).toContain(h)
   // the lane's block names it, with the instruction; a reflex lane's has none

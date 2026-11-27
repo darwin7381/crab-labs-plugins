@@ -113,7 +113,7 @@ export function readWallState(id: WallIdentity, opts: { dir?: string; now?: numb
 }
 
 /** Cached reader (re-reads at most every cacheMs; env USAGE_WALL_CACHE_MS, default 5 s). onChange runs synchronously
- *  inside state() when the walled flag or the walled episode changes, before the caller acts on the new state. */
+ *  inside state() when the walled flag or the walled episode changes, or a new clear appears, before the caller acts on the new state. */
 export class WallReader {
   private at = -Infinity
   private cur: WallState | null = null
@@ -136,7 +136,9 @@ export class WallReader {
     let next: WallState | null = null
     try { next = readWallState(this.id, { dir: this.opts.dir, now, env: this.opts.env }) } catch { next = null }
     this.cur = next
-    if ((prev?.walled ?? false) !== (next?.walled ?? false) || (next?.walled && prev?.episode !== next.episode)) {
+    // 1.59.8 (Chiron, 1.59.7 lab): a new clear is a change too (after a stale state, prev null, neither the flag nor the episode moves)
+    if ((prev?.walled ?? false) !== (next?.walled ?? false) || (next?.walled && prev?.episode !== next.episode)
+      || (!!next && !next.walled && next.clearedMs != null && next.clearedMs !== prev?.clearedMs)) {
       try { this.opts.onChange?.(prev, next) } catch {}
     }
     return next

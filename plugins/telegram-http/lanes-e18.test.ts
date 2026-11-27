@@ -102,7 +102,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   expect(out.script).toBe('lane-steer-hook.py')
   expect(out.out.hookSpecificOutput.hookEventName).toBe('PostToolUse')
   expect(out.out.hookSpecificOutput.additionalContext).toContain('先只看 /v2/payments 的請求。')
-  expect(out.out.hookSpecificOutput.additionalContext).toContain('message_id 2001')
+  expect(out.out.hookSpecificOutput.additionalContext).toContain('joey 的訊息（message_id 2001）')
   expect(out.out.hookSpecificOutput.additionalContext).toContain('Joey 本人')
   expect(await until(() => steerRows('delivered').length === 1)).toBe(true)                  // the daemon wrote the delivery
   const del = steerRows('delivered')[0]
@@ -162,7 +162,7 @@ test('E18: a run that ends while the message is undelivered hands it over at the
   // 002t: the run ended without answering it: the steered message is handed over as itself (its own event and text), not on the run's event
   const hos = L.__main().items((r: any) => r.kind === 'handoff' && r.event === 'tg-e18-6')
   expect(hos.length).toBe(1); expect(JSON.stringify(hos[0])).toContain('順便也算一下錯誤率。')
-  expect(JSON.stringify(hos[0])).toContain('〔Joey 原話｜分流器從 Telegram 收到的原文')          // his words as the router got them, not only the lane's retelling
+  expect(JSON.stringify(hos[0])).toContain('〔Joey 原話｜分流器收到的原文')          // his words as the router got them, not only the lane's retelling
   expect(JSON.stringify(L.__main().items((r: any) => r.kind === 'handoff' && r.event === 'tg-e18-5'))).not.toContain('順便也算一下錯誤率。')
 })
 

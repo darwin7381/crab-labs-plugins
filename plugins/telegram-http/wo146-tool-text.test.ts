@@ -45,12 +45,12 @@ test('files: no .md attachments, TKG instead', () => {
 })
 
 test('react: a silent mark, our set, the rejected four', () => {
-  expect(SRC).toContain("description: 'Add an emoji reaction to a Telegram message: a silent status mark, never a report. Telegram accepts only its fixed set; for our use: 🫡 received or starting, 👍 agree, 💯 well done, 🎉 done, 🤔 looking into it, 😢 stuck, 🔥 found it (👀 is added automatically when a message arrives). ✅ ❌ 💪 🔍 are rejected.'")
+  expect(SRC).toContain("description: '在對方的一則訊息上按一個表情：靜默的狀態記號，不是回報。只用這一組（每一種客戶端都畫得出來）：🫡 收到或開工、👍 認同、💯 漂亮、🎉 完成、🤔 在查、😢 卡住、🔥 發現（👀 是訊息進來時自動加的）。✅ ❌ 💪 🔍 不收。'")
   expect(SRC).not.toContain('fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc)')
 })
 
 test('edit_message: detail inside one stage; a stage, the result, what they must see is a new reply', () => {
-  expect(SRC).toContain("description: 'Edit a message the bot previously sent. Edits are silent (no push): use them for detail inside one stage; a new stage, the result, or anything they must see goes out as a new reply.'")
+  expect(SRC).toContain("description: '改你先前說的一則。靜默（不推播）：只用在同一個階段裡補細節；新的階段、結果、對方一定要看到的事，發新的一則。'")
   expect(SRC).not.toContain('Useful for interim progress updates')
 })
 
