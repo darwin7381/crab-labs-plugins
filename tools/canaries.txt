@@ -387,3 +387,7 @@ plugins/telegram-http/lanes.ts::function mainCannotAct(): boolean
 plugins/telegram-http/lanes-main.ts::function wallDelivery(
 plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
 plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
+# WO-204 (1.59.3): account cuts can lead the clear, and real work supersedes the episode's resume.
+plugins/telegram-http/lanes-main.ts::(!heldCut(r) || clearedCut(r))
+plugins/telegram-http/lanes-main.ts::closeItem(resume, { reason: 'wall_resume_superseded' })
+plugins/telegram-http/lanes-main.ts::closeItem(r, { reason: 'wall_resume_moot' })
