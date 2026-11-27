@@ -977,7 +977,10 @@ export function compareRegistry(files: RegEntry[], cli: RegEntry[], workspace: s
 }
 /** how long a dead pid's registry file may linger before the reason is pid_gone rather than a normal close (no_registration) */
 export const DEAD_GRACE_MS = 3_000
-export function pidAlive(pid: number): boolean { try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' } }
+export function pidAlive(pid: number | null | undefined): boolean {
+  if (!pid) return false
+  try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' }
+}
 /** the process's start time in the form Claude Code writes the registry's procStart on this platform, or null. Linux: /proc/<pid>/stat field 22
  *  (starttime, clock ticks since boot; the 20th field after the last `)`), as Claude Code writes it there (WO-187: builder's procStart "3154" = its
  *  /proc stat field 22). macOS: `ps -o lstart=` in UTC */
@@ -999,14 +1002,15 @@ export function osProcStart(pid: number): string | null {
  *  taken as different; two dates (another platform's wording): the same second within 2 s; dates neither can read are not taken as different. A tick
  *  count never goes to Date.parse (Bun reads "3154 UTC" as the year 3154: every Claude Code started in a Linux box's first 46 minutes was pid_reused,
  *  txmonster 11-26 07:45Z, WO-187) */
-export function sameStart(a: string, b: string): boolean {
+function compareStart(a: string, b: string): boolean | null {
   const n = (s: string) => s.replace(/\s+/g, ' ').trim()
   const A = n(a), B = n(b), tick = (s: string) => /^\d+$/.test(s)
   if (A === B) return true
-  if (tick(A) || tick(B)) return !(tick(A) && tick(B))
+  if (tick(A) || tick(B)) return tick(A) && tick(B) ? false : null
   const x = Date.parse(`${A} UTC`), y = Date.parse(`${B} UTC`)
-  return !(Number.isFinite(x) && Number.isFinite(y)) || Math.abs(x - y) <= 2_000
+  return Number.isFinite(x) && Number.isFinite(y) ? Math.abs(x - y) <= 2_000 : null
 }
+export const sameStart = (a: string, b: string): boolean => compareStart(a, b) !== false
 
 /** a run's own deadline (1.48.4): `perl -e 'alarm N; exec …'` arms SIGALRM in the process that becomes `bin`, so the run ends at N s even when the daemon
  *  that started it is gone (a crash, a SIGKILL during a wave), when nothing else would ever kill it. Without perl: `bin` as is (the daemon's timer only) */
@@ -1195,6 +1199,7 @@ export class Registry implements StatusSource {
   start(): void {
     this.started = true
     this.watchDir()
+    if (!this.o.cli) return  // files() retries the watch; only CLI comparisons need timers
     const next = (ms: number) => {
       this.checkTimer = setTimeout(() => { this.watchDir(); void this.crossCheck().finally(() => { if (this.started) next(this.jitter(this.o.checkMs ?? 600_000)) }) }, ms)
       ;(this.checkTimer as any).unref?.()
@@ -1311,8 +1316,22 @@ export class Registry implements StatusSource {
   }
   mode(): Via { return this.v }
 
-  main(): RegEntry | null {
-    return (this.lastMain = pickMain(this.entries(), { workspace: this.o.workspace, tmux: this.o.tmux ?? null, sessionId: this.o.sessionId?.() ?? null, alive: p => this.alive(p) }))
+  private pick(entries: RegEntry[]): RegEntry | null {
+    return pickMain(entries, { workspace: this.o.workspace, tmux: this.o.tmux, sessionId: this.o.sessionId?.(), alive: p => this.alive(p) })
+  }
+  main(): RegEntry | null { return (this.lastMain = this.pick(this.entries())) }
+  /** M2 can adopt the status source's candidate only with positive process identity. The CLI can omit entrypoint,
+   *  tmux and procStart. Confirm its selection against the same session file and a fresh OS read (pids can be reused). */
+  mainForAdoption() {
+    const e = this.main()
+    if (!e || !this.alive(e.pid)) return null
+    const file = this.v.via === 'files' ? e : this.files().entries.find(f => f.pid === e.pid && f.sessionId === e.sessionId)
+    if (file && file !== e && !this.pick([file])) return null
+    const start = (this.o.procStart ?? osProcStart)(e.pid)
+    const match = start && file?.procStart ? compareStart(start, file.procStart) : null
+    const dir = this.o.transcripts()
+    return { pid: e.pid, sessionId: e.sessionId, transcript: dir ? join(dir, `${e.sessionId}.jsonl`) : undefined,
+      issue: match === true ? null : match === false ? 'procStart mismatch' : 'procStart unavailable or incomparable' }
   }
   /** WO-165: the main as last read (no read of its own: the status computes it every 2 s and at each change); TurnWatch follows its transcript */
   private lastMain: RegEntry | null = null

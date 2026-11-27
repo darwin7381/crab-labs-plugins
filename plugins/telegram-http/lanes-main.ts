@@ -2,8 +2,7 @@
  * lanes-main.ts — M1 (the delivery ledger) and M2 (the main record). docs/state-journal.md has the journal shapes.
  *
  * M2. The main is one record per process ("gen", id = its pid): starting | idle | in_turn(prompt_id, tool_open) | walled(kind) | gone(end_reason).
- *     It moves only on the main's own hook events (lanes-hooks/main-hook.py posts every one of them to /lanes/main-event) and on one
- *     `kill -0` of its pid (SIGKILL fires no hook). Nothing reads the transcript.
+ *     The session registry can supply a missing gen. Its turn edges come from the main's hooks, and a dead pid ends it even without a hook.
  *     The main's wall is ITS record (PL4): an account-kind StopFailure walls it and starts a wall episode (wall_since); it leaves `walled` only on its
  *     own next hook event, and the episode ends at its next Stop. The lanes' wall (lanes.ts S.wall) is another record and never moves this one.
  *     A walled gen is offered one item when its retry time comes (its probe): that offer is how the main's own hook events resume.
@@ -26,6 +25,7 @@ import { BOUNDARY_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, defe
 import { genuineAssistantAfterFile } from './liveness.ts'
 
 import type { CallCheck, CallWait } from './onsen-client.ts'
+import { REG_SETTLE_MS, type Registry } from './onsen-status.ts'
 import { hhmmTaipei, personCanProbe } from './usage-wall.ts'
 
 export type MainWall = { walled: boolean; clearedMs: number | null; lastWallMs?: number | null; resets_at?: string | null }
@@ -64,6 +64,7 @@ export type MainEnv = {
   blocked?: (item: Row, retryAfter: string | null) => void
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
+  registry?: Pick<Registry, 'mainForAdoption'>
   /** 002v: the accepted main's session id is the expected one from now on (.lanes/main-expected): a /clear's new session survives a restart */
   expect?: (sid: string) => void
   pidAlive: (pid: number) => boolean
@@ -170,6 +171,7 @@ export type MainApi = ReturnType<typeof createMain>
 /** one M1 + M2 per lanes instance (the tg daemon has one; tests load several) */
 export function createMain(E: MainEnv) {
   let cur: string | null = null                           // the live gen (id = pid as text)
+  let registryGap: { since: number; told: boolean } | null = null
   const lastEventAt = new Map<string, number>()          // gen → ms of its last hook event (silence = the stuck rule)
   const toolBound = new Map<string, number>()            // gen → ms the open tool may stay silent: its own declared timeout (0 = it declares none)
   const pendingEnd = new Map<string, EndReason>()        // gen → why it is about to end (asked: /restart; replaced: /main renew)
@@ -194,7 +196,7 @@ export function createMain(E: MainEnv) {
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
-    cur = null; stuck = null; offering = false; takeSince = null; hookOut.clear()
+    cur = null; registryGap = null; stuck = null; offering = false; takeSince = null; hookOut.clear()
     lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear(); openTools.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
@@ -969,6 +971,7 @@ export function createMain(E: MainEnv) {
     J().write('main', id, goesOn ? 'in_turn' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
       source: b.source ?? null, ...(goesOn ? {} : { prompt_id: null, tool_open: null, stopped_prompt: null }), end_reason: null, rules_shown: carried ? sid : null, ...carry })
     cur = id
+    registryGap = null
     lastEventAt.set(id, Date.now())
     try { E.expect?.(sid) } catch {}                                       // 002v: the main's session now (a /clear changed it): the next launch's id
     E.log('info', `lanes: main gen ${id} (session ${sid}, ${b.source ?? 'startup'})`)
@@ -977,6 +980,31 @@ export function createMain(E: MainEnv) {
     try { E.genChanged(pid) } catch {}
     void pump()
     return carried ? { accepted: true, additionalContext: E.context(E.agent, sid) } : { accepted: true }
+  }
+  /** Run on a registry change and on the existing M2 tick (also covers a missed watch event at startup). */
+  function registryChanged(now = Date.now()): void {
+    if (currentGen()) return
+    const candidate = E.registry?.mainForAdoption()
+    if (!candidate) {
+      if (!registryGap?.told) registryGap = null
+      return
+    }
+    const { sessionId, pid, transcript } = candidate
+    let why = candidate.issue
+    if (!why) {
+      if (!E.expectedSession().includes(sessionId)) why = 'not expected (main-expected)'
+      else if (sessionStart({ event: 'SessionStart', source: 'adopt', session_id: sessionId, transcript_path: transcript }, pid).accepted) {
+        E.log('info', `lanes: main adopted from the session registry session=${sessionId} pid=${pid}`)
+        return
+      } else why = 'adoption refused'
+    }
+    registryGap ??= { since: now, told: false }
+    if (!registryGap.told && now - registryGap.since >= REG_SETTLE_MS) {
+      registryGap.told = true
+      const text = `${E.agent} 的主線出現在 session registry，但 M2 尚未接手（session=${sessionId} pid=${pid}，${why}）。`
+      E.log('warn', text)
+      E.tellJoey(text, 'main-registry-disagreement')
+    }
   }
   /** the tg daemon's MCP stream of the main opened: a starting gen can now be offered */
   function streamOpened(pid: number): void {
@@ -1019,8 +1047,10 @@ export function createMain(E: MainEnv) {
     `主線疑似卡死：交給它的訊息 ${mins} 分鐘沒有被接手（行程還活著，但沒有開始新的回合）。${menu ?? ''}有 ${queued} 則訊息等它，${again ? '我再交給它一次' : '已經再交給它一次，還是沒有被接手'}。`
   async function tick(now = Date.now()): Promise<void> {
     if (!E) return
+    const previous = currentGen()
+    if (previous && !E.pidAlive(Number(previous.pid))) endGen(previous, pendingEnd.get(previous.id) ?? 'killed')
+    registryChanged(now)
     const g = currentGen()
-    if (g && !E.pidAlive(Number(g.pid))) { endGen(g, pendingEnd.get(g.id) ?? 'killed'); return }
     // WO-177 一 (Chiron: 「它有自己的 blocker：選單歸值班員或 Joey、上限有 until」): while the status record says the main waits on a menu or on the wall, that
     // blocker is the record's own (the observation names who takes it, and the wall its until): no stuck alarm is sent for it
     const m = member()
@@ -1131,7 +1161,7 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
-  return { wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, statusIdle, turnWork, turnStart, openTool,
+  return { wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

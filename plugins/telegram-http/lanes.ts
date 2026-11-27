@@ -23,8 +23,8 @@
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
-import { createMain, mainContext, type MainApi, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
-import type { CallFacts, TurnTrigger } from './onsen-status.ts'
+import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
+import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
 import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
@@ -171,6 +171,7 @@ export interface LanesDeps {
    *  此刻 line, the same-matter gate, the Esc wrap-up (and, in server.ts, the wake rows' member_state); null = no status here (Onsen step 3 off): the
    *  old path decides */
   mainStatus?: () => { state: string; detail?: Record<string, unknown> } | null
+  registry?: MainEnv['registry']
   /** 1.58.13: the person on a Telegram DM account (its chat id), for its thread's title: display name, else member name; null: not known yet (server.ts
    *  asks Onsen once and then calls refreshDmTitles) */
   dmPerson?: (chat: string) => string | null
@@ -337,7 +338,7 @@ let main: MainApi
 /** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
 function mainEnv() {
   return {
-    journal, agent: D.agent, log: D.log,
+    journal, agent: D.agent, log: D.log, registry: D.registry,
     offer: async (notif: Notif, via: Via, pid: number): Promise<boolean> => {
       if (via === 'inbox') return !!(await inboxPost('/lanes/offer', { pid, notif }))?.offered
       const sid = sessionOfPid(pid)
@@ -602,10 +603,6 @@ function toolsChangedForPid(pid: number): void {
   for (const [s, p] of mcpSessionPid) if (p === pid) { try { D.toolsChanged?.(s) } catch {} }
 }
 export function isMainMcpSession(sid: string | undefined): boolean { const pid = main?.mainPid(); return !!sid && !!pid && mcpSessionPid.get(sid) === pid }
-function pidAlive(pid: number | null | undefined): boolean {
-  if (!pid) return false
-  try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' }
-}
 export function mainTranscript(): string | null { return main?.mainSession()?.transcript_path || null }
 /** lanes-golive (C4): the main's session id, either daemon: the tg daemon's registered main, else .lanes/main-expected (the launcher writes it before a
  *  start, the tg daemon keeps it current after each accepted SessionStart). null = no main known. */
@@ -1721,6 +1718,7 @@ export function mainStatusChanged(): void {
   idleCheck()
   if (D?.role === 'tg' && main) { try { main.statusChanged() } catch (e) { D.log('warn', `lanes: status change: ${e}`) } }
 }
+export function mainRegistryChanged(): void { main?.registryChanged() }
 /** WO-177 一: a hand-over's event-keyed wake line says what M1 does with its item now (lanes-main deliveryNow: offered to an idle main the status record
  *  says can take one; otherwise it waits, and why), the same answer the offer itself asks */
 function handWake(): { state: 'wake' | 'no_wake'; tail: string } {

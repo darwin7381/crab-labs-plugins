@@ -4051,6 +4051,30 @@ const mentionCards: MentionCards | null = INBOX_ONLY || !onsen ? null : new Ment
     : onsen.putBytes(path, new TextEncoder().encode(JSON.stringify(body ?? {})), 'application/json', timeoutMs),
   timeoutMs: () => Number(process.env.LANES_MENTION_TIMEOUT_MS ?? 2_000),
   log: (lv, m) => log(lv, m) })
+// M2 and status read the same local session registry, including when status reporting is off.
+let registryStatusChanged: (() => void) | undefined
+// which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
+// (every open stream counts as the main's)
+const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
+const registry = new OnsenStatus.Registry({
+  dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
+  tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
+  connected: pid => streams.connected(pid), changed: () => { registryStatusChanged?.(); Lanes.mainRegistryChanged() }, log: m => log('info', m),
+  // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
+  ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
+  // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
+  // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s (1.48.4: by its own
+  // deadline too, so a run whose daemon died still ends).
+  // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
+  ...(!onsen?.cfg.record || INBOX_ONLY || process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
+    const claudeBin = process.env.ONSEN_CLAUDE_BIN || [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'].find(p => existsSync(p)) || 'claude'
+    const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
+      // the run's own deadline (perl alarm, 15 s) holds even if this daemon dies mid-run; this daemon's SIGKILL at 18 s is the second line
+      run: onSpawn => OnsenStatus.runCli(...OnsenStatus.withDeadline(claudeBin, ['agents', '--json'], OnsenStatus.CLI_DEADLINE_S), 18_000, { onSpawn }) })
+    return (notBefore: number) => shared.read(notBefore)
+  })() }),
+})
+
 // 002 lanes wiring (inert unless GENESIS_LANES=1)
 if (Lanes.LANES_ON) {
   const tokOk = (a: string | undefined) => {
@@ -4061,6 +4085,7 @@ if (Lanes.LANES_ON) {
   Lanes.lanesInit({
     // WO-157 (Chiron 13:46Z): the one state source: the status record computed now (what goes to Onsen; WO-169: currentStatus()); null = no status here
     mainStatus: () => onsenStatusCompute ? onsenStatusCompute() : null,
+    registry,
     dmPerson,                                                             // 1.58.13: a DM thread's title names the person on that account
     role: INBOX_ONLY ? 'inbox' : 'tg',
     agent: process.env.LANES_AGENT ?? INBOX_SELF,
@@ -4290,6 +4315,7 @@ function liveSetting(k: LiveKey): string | undefined {
   return liveFile.v[k]
 }
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
+if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
   // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
@@ -4363,28 +4389,8 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
   mainTurnNow = () => { try { return (tap ? tap.turnFacts()?.id : watch?.turnFacts()?.id) ?? null } catch { return null } }   // WO-172
-  // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
-  // (every open stream counts as the main's)
-  const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
   onsenPeer = process.env.ONSEN_PEER_LOOKUP === '0' ? null : (sid, req) => streams.note(sid, Lanes.claudePidOf(req, HTTP_PORT!))
-  const claudeBin = process.env.ONSEN_CLAUDE_BIN || [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'].find(p => existsSync(p)) || 'claude'
-  const registry = new OnsenStatus.Registry({
-    dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
-    tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
-    connected: pid => streams.connected(pid), changed: kick, log: m => log('info', m),
-    // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
-    ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
-    // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
-    // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s (1.48.4: by its own
-    // deadline too, so a run whose daemon died still ends).
-    // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
-    ...(process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
-      const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
-        // the run's own deadline (perl alarm, 15 s) holds even if this daemon dies mid-run; this daemon's SIGKILL at 18 s is the second line
-        run: onSpawn => OnsenStatus.runCli(...OnsenStatus.withDeadline(claudeBin, ['agents', '--json'], OnsenStatus.CLI_DEADLINE_S), 18_000, { onSpawn }) })
-      return (notBefore: number) => shared.read(notBefore)
-    })() }),
-  })
+  registryStatusChanged = kick
   const source: OnsenStatus.StatusSource = registry
   const turnStarts = new OnsenStatus.TurnStarts()
   const compute = (): OnsenStatus.StatusView => {
@@ -4460,7 +4466,6 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     screenStatus.active()                                               // the switch and the judge known before the first record (the first look is jittered)
     screenStatus.start()
   }
-  registry.start()
   setInterval(() => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   // WO-162 (2), lanes off: the transcript is read every ONSEN_TRANSCRIPT_POLL_MS (250 ms; a stat when nothing was written) and a change of the turn (a
   // tool starting or ending, a message taken in) is computed and written at once; until 1.55.0 it was read with the 2 s status tick

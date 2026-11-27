@@ -390,3 +390,6 @@ plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'per
 # WO-204 part 2 (1.59.4)
 plugins/telegram-http/lanes-main.ts::advanceProbe(now, { resume_sent: episode })
 plugins/telegram-http/lanes-main.ts::(!heldCut(r) || releasedCut(r))
+# WO-205 (1.59.5)
+plugins/telegram-http/onsen-status.ts::mainForAdoption()
+plugins/telegram-http/lanes-main.ts::main adopted from the session registry
