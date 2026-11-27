@@ -207,7 +207,7 @@ describe('the bridge, end to end against the fakes', () => {
     await until(() => onsen.messages.some(m => m.client_msg_id === String(mid)), 5000, 'written')
     const w = onsen.messages.find(m => m.client_msg_id === String(mid))
     expect(w).toMatchObject({ member: 'alpha', client_user_id: String(JOEY), chat: String(JOEY), text: 'hello [link](x)', kind: 'text', attachments: [], attachment_file_ids: [],
-      reply_to_client_msg_id: null, client_thread: null, idem_key: `tg:alpha:${JOEY}:${mid}`, client_user: { username: 'joey', display_name: 'Joey' } })
+      reply_to_client_msg_id: null, client_thread: null, idem_key: `tg:alpha:${JOEY}:${mid}`, client_user: { username: 'joey', display_name: 'Joey' }, chat_title: null })
     await until(() => tg.callsOf(TOK.alpha, 'setMessageReaction').some(p => p.message_id === mid && p.reaction[0].emoji === '👀'), 3000, '👀')
     await until(() => tg.unconfirmed(TOK.alpha) === 0, 4000, 'confirmed')
     expect(onsen.bad).toEqual([])

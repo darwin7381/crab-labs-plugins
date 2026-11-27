@@ -119,8 +119,10 @@ export class FakeTelegram {
 // ---------------------------------------------------------------------------------------------------------------------------------------
 type Endpoint = { extension: string; records: any[] }
 const BRIDGE_MSG_KEYS = ['member', 'client_user_id', 'client_user', 'chat', 'client_msg_id', 'sent_at', 'text', 'kind', 'attachment_file_ids', 'attachments',
-  'reply_to_client_msg_id', 'reply_quote', 'reply_to_text', 'reply_to_user', 'client_thread', 'topic_name', 'forward_from', 'forward_date', 'media_group_id', 'idem_key']
-const NULLABLE = new Set(['reply_to_client_msg_id', 'reply_quote', 'reply_to_text', 'reply_to_user', 'client_thread', 'topic_name', 'forward_from', 'forward_date', 'media_group_id'])
+  'reply_to_client_msg_id', 'reply_quote', 'reply_to_text', 'reply_to_user', 'client_thread', 'topic_name', 'forward_from', 'forward_date', 'media_group_id', 'idem_key',
+  'chat_title']
+const NULLABLE = new Set(['reply_to_client_msg_id', 'reply_quote', 'reply_to_text', 'reply_to_user', 'client_thread', 'topic_name', 'forward_from', 'forward_date', 'media_group_id',
+  'chat_title'])
 
 export class FakeOnsen {
   server: ReturnType<typeof Bun.serve>
