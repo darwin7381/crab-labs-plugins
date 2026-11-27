@@ -171,6 +171,58 @@ function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string
     kind: 'command', text, client: { chat: '1', msg_id: tgId, user: 'joey', user_id: '1' } } })
 }
 
+test('closing a queued mail lane releases the same waiting version to the next peek without a claim or handoff', async () => {
+  const d = await daemon({ LANES_MAX: '1' }, 200, scriptedLane)
+  const busy = d.f.add('busy', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] occupy slot', line: 'call' } })
+  await waitFor(() => d.f.history.some(h => h.item_id === busy.id && h.body.outcome === 'in_session'))
+  const mail = d.f.add('waiting-mail', 'mail', { from: 'eve', payload: { text: 'read the mail', line: 'mail', no_reply: true } })
+  const version = mail.version
+  const routes = () => d.journal().filter(r => r.rec === 'run' && r.state === 'queued' && r.ev?.onsen_items?.[0]?.onsen_item_id === mail.id)
+  await waitFor(() => routes().length > 0)
+  const old = routes()[0]
+  const before = d.f.calls.length
+  command(d, 'close-mail', '/lanes close ' + old.lane, '82')
+  await waitFor(() => routes().some(r => r.lane !== old.lane))
+  const next = routes().find(r => r.lane !== old.lane)
+  expect(d.f.calls.slice(before).some(c => c.query.has('wait') && !c.query.has('changed_after'))).toBe(true)
+  expect([mail.state, mail.version]).toEqual(['waiting', version])
+  expect(d.f.history.filter(h => h.item_id === mail.id)).toHaveLength(0)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(mail.id))).toHaveLength(0)
+  expect(next.ev.id).not.toBe(old.ev.id)
+  expect(d.journal().some(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === mail.id))).toBe(false)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => mail.state === 'completed')
+  const reports = d.f.history.filter(h => h.item_id === mail.id)
+  expect(reports.map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(reports[0]!.body.session_id).toBe(next.lane)
+}, 14000)
+
+test('closing between take and lane start reports one reassignment with no in_session', async () => {
+  const d = await daemon({}, 200, scriptedLane)
+  d.f.delayTake(1400)
+  const mail = d.f.add('taken-mail', 'mail', { from: 'eve', payload: { text: 'mail', line: 'mail', no_reply: true } })
+  await waitFor(() => mail.state === 'claimed')
+  const route = d.journal().find(r => r.rec === 'run' && r.ev?.onsen_items?.[0]?.onsen_item_id === mail.id)
+  d.f.delayTake(0)
+  command(d, 'close-taken', '/lanes close ' + route.lane, '83')
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === mail.id))
+  const reports = d.f.history.filter(h => h.item_id === mail.id)
+  expect(reports.map(h => h.body.outcome)).toEqual(['reassigned'])
+  expect(reports[0]!.body.note).toContain(route.lane)
+})
+
+test('closing after in_session lets a lane that finishes its work report completed', async () => {
+  const d = await daemon({}, 200, scriptedLane)
+  const mail = d.f.add('bound-mail', 'mail', { from: 'eve', payload: { text: 'mail', line: 'mail', no_reply: true } })
+  const reports = () => d.f.history.filter(h => h.item_id === mail.id)
+  await waitFor(() => reports().some(h => h.body.outcome === 'in_session'))
+  const close = command(d, 'close-bound', '/lanes close ' + reports()[0]!.body.session_id, '84')
+  await waitFor(() => close.state === 'completed')
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => mail.state !== 'claimed')
+  expect(reports().map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+})
+
 test('SIGKILL and restart restores the held id on the first observation and drains the terminal report before peeking', async () => {
   const d = await daemon()
   d.f.holdReports(true)

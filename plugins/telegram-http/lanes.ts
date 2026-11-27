@@ -1884,10 +1884,10 @@ function recordOnlyRow(ev: InEvent, v: WakeVerdict): Decision {
 
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
-  if (ev.onsen_items?.length) ev.id = 'item-' + ev.onsen_items[0]!.onsen_item_id + '-v' + ev.onsen_items[0]!.onsen_version
   if (ev.onsen_items?.some(r => r.main)) {
     return routeMainItem(ev)
   }
+  if (ev.onsen_items?.length) ev.id = itemEventId(ev.onsen_items[0]!)
   const cfg = routerCfg()
   // lanes-topics (item 2): where Joey's message is (a topic, or outside topics): a reply to it goes there (targetTopic)
   if (D.role === 'tg' && S && ev.source === 'telegram' && !ev.synthetic) noteMsgTopic(ev.meta?.chat_id, ev.meta?.message_id, ev.message_thread_id ?? null)
@@ -2560,12 +2560,18 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
   return main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(ev.onsen_items ? { fields: { person_message_ids: ev.person_message_ids, onsen_items: ev.onsen_items } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
 }
+function itemEventId(ref: ItemRef): string {
+  const id = 'item-' + ref.onsen_item_id + '-v' + ref.onsen_version
+  // A full peek can route this same version again. Its former lane's obligations are closed.
+  const previous = events?.get(id)?.lane
+  return S.lanes[previous]?.status === 'closed' ? id + '-' + shortId() : id
+}
 function routeMainItem(ev: InEvent): Decision {
   const ref = ev.onsen_items![0]!
   // Reattach the original lane's open obligations to the notification Onsen hands back.
   const waiting = (o: Ob) => o.kind === 'main' && o.state === 'open' && !!o.handoff && !o.item
   const prior = ref.main && events.rows(e => e.onsen_items?.some((r: ItemRef) => r.onsen_item_id === ref.onsen_item_id) && e.obligations?.some(waiting)).at(-1)
-  ev.id = prior ? prior.id : 'item-' + ref.onsen_item_id + '-v' + ref.onsen_version
+  ev.id = prior ? prior.id : itemEventId(ref)
   const d: Decision = { target: 'main', rule: 'onsen-main' }
   const item = toMain(ev, d)
   if (prior && item) events.set(ev.id, waiting, { item })
@@ -3619,6 +3625,21 @@ function endRun(it: QItem, reason: string, f: Record<string, unknown> = {}): voi
   it.state = 'done'
   if (queue.get(it.ev.id) === it) queue.delete(it.ev.id)
 }
+function releaseLaneItem(ev: InEvent): void {
+  events.settleUnrun(ev.id, 'dropped', 'lane closed before take')
+}
+/** Retire this local route while the original Items are still waiting in Onsen. */
+function releaseClosedQueue(it: QItem): boolean {
+  const members = runEvents(it)
+  const released = members.filter(ev => ev.onsen_items?.length)
+  if (!released.length) return false
+  endRun(it, 'closed', { why: 'lane closed before take' })
+  for (const ev of released) releaseLaneItem(ev)
+  const [ev, ...extra] = members.filter(ev => !ev.onsen_items?.length)
+  if (ev) queueRun({ ...it, ev, extra, steered: undefined })
+  onGateOpen?.()
+  return true
+}
 /** M5: how a run ended, from its result JSON and its exit code */
 const statusKind = (s: unknown): string => { const n = Number(s); return n === 429 ? 'rate_limit' : n === 401 || n === 403 ? 'authentication_failed' : n >= 500 ? 'server_error' : 'api_error' }
 export function exitReason(r: { result: any; code: number | null; signal: string | null; timedOut?: boolean; budget?: boolean }): string {
@@ -3640,7 +3661,10 @@ function restoreRuns(): void {
     const it: QItem = { ev: r.ev, lane: String(r.lane), state: 'queued', attempts: r.state === 'queued' ? Number(r.attempt) - 1 : Number(r.attempt), priority: Number(r.priority ?? 5),
       summary: r.summary ?? undefined, enqueued: String(r.enqueued ?? r.created), rid: r.id, ...(r.extra ? { extra: r.extra } : {}), ...(r.deaths ? { deaths: r.deaths } : {}),
       ...(r.steered ? { steered: r.steered } : {}) }
-    if (r.state === 'queued') { queue.set(it.ev.id, it); continue }
+    if (r.state === 'queued') {
+      if (S.lanes[it.lane]?.status === 'closed' && releaseClosedQueue(it)) continue
+      queue.set(it.ev.id, it); continue
+    }
     // 002f, 002k G11: it was running under the previous daemon: that run cannot report any more. Its process is stopped, it gets the exit
     // row it never could write, and the event is run again (an attempt like any death).
     reapOrphan(Number(r.pid), String(r.run ?? ''))
@@ -3706,7 +3730,7 @@ const endWords = (reason: string, it: QItem): string => reason === 'normal' ? '�
  *    not an attempt (the event is queued again as it was);
  *  - the lanes' wall: up on a wall; down on any other exit of a run that reached the model (it wrote a result record or made a model call);
  *  - otherwise, and after MAX_ATTEMPTS, the run's work has ended: a task lane's own duty (endTask), then the exit rule over the set. */
-function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
+function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; processExit?: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
   const wall = e.reason.startsWith('wall:') ? e.reason.slice(5) : null
   const retryable = !!wall || e.reason === 'died' || e.reason === 'timeout' || e.reason === 'restore'
   if (wall) it.attempts = Math.max(0, it.attempts - 1)                      // nothing was tried: not an attempt
@@ -3719,20 +3743,17 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?:
   if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
   else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
   if (again) return
-  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) {
-    const outcome = wall ? (['server_error', 'api_error'].includes(wall) ? 'error' : 'usage_limit') : 'cut'
-    itemReceiver?.report(refs, outcome)
-  }
+  const itemExit = e.processExit ?? e.reason
+  const outcome = itemExit === 'normal' ? 'completed' : itemExit.startsWith('wall:') ? (['wall:server_error', 'wall:api_error'].includes(itemExit) ? 'error' : 'usage_limit') : 'cut'
+  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) itemReceiver?.report(refs, outcome)
   releaseScheduleThread(lane, it)                                           // WO-164 point 4: a schedule's run is over: its thread lets the lane go
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
   asWake({ kind: 'lane_exit', rule: gaveUp ? 'exit-failed' : 'exit-owes', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => {   // WO-147
     endTask(it, lane, endWords(e.reason, it), e.reached ?? '')
     exitRule(lane, it, gaveUp ? failedHandoffText(it) : e.said ?? '', gaveUp ? HANDOVER_RECORD_MAX : 1000)
   })
-  if (refs.length) {
-    if (e.reason === 'normal') itemReceiver?.report(refs, 'completed')
-    else if (e.reason === 'closed' || e.reason === 'gone') itemReceiver?.report(refs, 'reassigned', { note: e.said || endWords(e.reason, it) })
-  }
+  // A bound row follows its run's actual exit unless exitRule handed it to main.
+  if (refs.length && (e.reason === 'normal' || e.reason === 'closed')) itemReceiver?.report(refs, outcome)
   callsEnded(lane?.id ?? it.lane, it, e.receipt)
 }
 /** WO-175 (Chiron 02:58Z): the run's work is over (runEnded, past the re-run): the Call of each item it ran ends here — unless the item is the main's now
@@ -4985,6 +5006,7 @@ function startRun(it: QItem, acquired = false): void {
   }
   if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
   if (lane.status === 'closed') {                                          // PL7 (P21): its lane was closed while it waited: closed, and the one end
+    if (releaseClosedQueue(it)) return
     endRun(it, 'closed', { why: 'its lane was closed before it ran' })
     runEnded(lane, it, { reason: 'closed', said: `${lane.id} 在這件事開始處理之前被關閉了` })
     saveState(); return
@@ -5195,7 +5217,8 @@ function startRun(it: QItem, acquired = false): void {
       'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done'].includes(t.name))
       .map(t => t.name.replace('mcp__lane__', ''))
     // PL7 (P21): a run whose lane was closed while it ran ends `closed`, an exit reason like the others: the exit rule below handles it
-    const reason = lane.status === 'closed' ? 'closed' : exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
+    const processExit = exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
+    const reason = lane.status === 'closed' ? 'closed' : processExit
     // WO-125 (observation points, ticket item 8): per run, what the guard refused (still counting at the end), the steps the receipt marked, the card's length
     const bf = blockFactsOn() ? blockedFacts(tok.blocked) : null
     if (blockFactsOn()) noteBlocked(tok)                                // the run's line in the main's digest carries the final count
@@ -5277,7 +5300,7 @@ function startRun(it: QItem, acquired = false): void {
         text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
     }
     if (waitingSteeringLanes.delete(lane.id)) onGateOpen?.()
-    runEnded(lane, it, { reason, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
+    runEnded(lane, it, { reason, processExit, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
     saveState()
     pump()
   }
@@ -8057,6 +8080,7 @@ function closeLane(l: Lane, who: string, via: 'joey' | 'main'): { running: boole
   for (const [k, v] of Object.entries(S.tickets)) if (v === l.id) delete S.tickets[k]
   if (l.kind === 'worker' && l.topic != null && !l.topic_done) l.topic_close = 'pending'      // lanes-topics (item 4): its topic is finished (now, or when the run ends)
   saveState()
+  for (const it of [...queue.values()]) if (it.lane === l.id && it.state === 'queued') releaseClosedQueue(it)
   appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: !!run, title: l.title ?? null, grace_ms: run ? CLOSE_GRACE_MS() : 0 })
   const who2 = via === 'joey' ? 'Joey 用 /lanes close' : '主線用 lane_close'
   if (!run) void finishTopic(l, who2)
