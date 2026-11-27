@@ -41,14 +41,12 @@ export type Config = {
   env: NodeJS.ProcessEnv; settingsFile: string
   settingsMs: number; endpointsMs: number; registerMs: number; membersMs: number; conflictRetryMs: number; feedWaitS: number; pollTimeoutS: number
   tg: TgOptions; useRich: boolean; version: string; handoverMs: number; pinCheckMs?: number; pinMinEditMs?: number; onsenTimeoutMs: number; sorryMs: number; retryDelaysMs: number[]
-  voice: { on: boolean; cmd: string; whisper: string; model: string; dir: string }
 }
 
 function pluginVersion(): string {
   try { return String(JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8')).version || '') || 'unknown' } catch { return 'unknown' }
 }
 const num = (v: string | undefined, d: number, min: number): number => { const n = Number(v); return Number.isFinite(n) && n >= min ? n : d }
-const onOff = (v: string | undefined, d: boolean): boolean => { const t = (v ?? '').trim().toLowerCase(); return t ? !['0', 'off', 'false', 'no'].includes(t) : d }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
   const home = env.HOME || homedir()
@@ -78,9 +76,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     sorryMs: num(env.TELEGRAM_BRIDGE_SORRY_S, 15, 0) * 1000,
     retryDelaysMs: ((env.TELEGRAM_BRIDGE_RETRY_S ?? '').trim() || '10,30,120').split(',').map(x => Number(x.trim()) * 1000).filter(n => Number.isFinite(n) && n >= 0),
     version: pluginVersion(),
-    voice: { on: onOff(env.TELEGRAM_BRIDGE_VOICE, (env.CHANNEL_BOT_VOICE_TRANSCRIBE ?? '').trim() === '1'),   // as the daemon: off unless that machine turns it on (Chiron 12794)
-      cmd: (env.CHANNEL_BOT_TRANSCRIBE_CMD ?? '').trim(), whisper: (env.CHANNEL_BOT_WHISPER_BIN ?? '').trim() || 'whisper',
-      model: (env.CHANNEL_BOT_WHISPER_MODEL ?? '').trim() || 'small', dir: stateDir },
   }
 }
 
@@ -270,7 +265,7 @@ export class Bridge {
       onsen: this.onsen, state: this.state, log: (l, msg) => this.log(l, msg), now: this.deps.now, pollTimeoutS: this.cfg.pollTimeoutS,
       buttonKey: k => this.state.data.keys[k] ?? null, reRegister: () => { this.endpointsDirty = true; this.needRegister = true },
       onHandover: ag => { void this.drop(ag.member, 'its daemon polls the bot again (Telegram 409): handed over') },
-      voice: this.cfg.voice, sorryMs: this.cfg.sorryMs, clientMeta: this.clientMeta, onButton: (ag, cq) => this.two.button(ag, cq),
+      sorryMs: this.cfg.sorryMs, clientMeta: this.clientMeta, onButton: (ag, cq) => this.two.button(ag, cq),
       noteTopic: (m, c, t, n) => this.two.noteTopic(m, c, t, n), topicName: (m, c, t) => this.two.topicName(m, c, t), ...(this.deps.pollerExtra ?? {}),
     })
     this.pollers.set(a.member, p)

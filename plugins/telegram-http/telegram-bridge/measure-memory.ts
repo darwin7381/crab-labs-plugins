@@ -31,7 +31,7 @@ async function measure(n: number): Promise<{ n: number; rssMb: number[]; written
   const settings = join(root, 'env'); writeFileSync(settings, `ONSEN_BRIDGE=${names.join(',')}\nONSEN_BRIDGE_STATE_DIRS=${pairs.join(',')}\n`)
   const p = Bun.spawn([process.execPath, join(import.meta.dir, 'telegram-bridge.ts')], {
     env: { PATH: process.env.PATH ?? '', HOME: join(root, 'home'), TELEGRAM_BRIDGE_MACHINE: 'memtest', ONSEN_BASE: onsen.base, TELEGRAM_API_ROOT: tg.root,
-      TELEGRAM_BRIDGE_STATE_DIR: join(root, 'state'), CRAB_LABS_PLUGINS_ENV: settings, TELEGRAM_BRIDGE_CREDENTIAL_FILE: credFile, TELEGRAM_BRIDGE_VOICE: '0' },
+      TELEGRAM_BRIDGE_STATE_DIR: join(root, 'state'), CRAB_LABS_PLUGINS_ENV: settings, TELEGRAM_BRIDGE_CREDENTIAL_FILE: credFile },
     stdout: 'ignore', stderr: 'ignore',
   })
   try {
