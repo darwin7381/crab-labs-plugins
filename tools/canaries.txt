@@ -52,7 +52,7 @@ plugins/telegram-http/inbox-text.ts::send_to_agent：找別隻 agent 只有這�
 plugins/telegram-http/fleet-mail.ts::export async function sendToAgent
 plugins/telegram-http/channel-bot-control.ts::hooks.afterClear(ok)
 plugins/telegram-http/server.ts::reply, connectorClearHooks(chat, ref,
-plugins/telegram-http/server.ts::deliverEditedMessage(m)
+plugins/telegram-http/server.ts::await deliverEditedMessage(m, [String(p.message_id)])
 plugins/telegram-http/onsen-client.ts::async drawLine(
 plugins/telegram-http/server.ts::onsenFacts.delivered(chat_id, msgId)
 plugins/telegram-http/server.ts::Lanes.observeLanes({ journal:
@@ -151,7 +151,7 @@ plugins/telegram-http/onsen-status.ts::if (this.last?.id === this.turn.prompt) t
 plugins/telegram-http/onsen-status.ts::...(by ? { by } : {}), ...(detail && Object.keys(detail).length ? { detail } : {}), ...turnFields(turn) })
 plugins/telegram-http/server.ts::turn_id: String(extra.turn_id).slice(0, 120)
 plugins/telegram-http/lanes.ts::if (p === '/lanes/turn' && req.method === 'GET')
-plugins/telegram-http/lanes-main.ts::if (!probe && (g.state !== 'idle' || !canTake(g))) return
+plugins/telegram-http/lanes-main.ts::const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : canTake(g)))
 plugins/telegram-http/lanes.ts::memberState: memberNow,
 plugins/telegram-http/screen-judge-jev.ts::export function contradiction(
 plugins/telegram-http/onsen-wake.ts::row.decided_by === 'new' && isUrgency(row.wake_urgency)
@@ -209,7 +209,7 @@ plugins/telegram-http/roamer-telegram.ts::await h.finishInbound(this.inboundFact
 plugins/telegram-http/server.ts::if (it.kind === 'person_message' || it.kind === 'person_edit') return personPulled(it, again)
 plugins/telegram-http/server.ts::const r = await fetch(`http://127.0.0.1:${port}/onsen/person`
 plugins/telegram-http/server.ts::if (!INBOX_ONLY && u.pathname === '/onsen/person' && req.method === 'POST') {
-plugins/telegram-http/server.ts::await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main')
+plugins/telegram-http/server.ts::await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main', [String(p.message_id)])
 plugins/telegram-http/onsen-inbound.ts::export const BACK_MS = 20_000
 plugins/telegram-http/onsen-inbound.ts::after(of: string, event: Record<string, unknown>): boolean {
 plugins/telegram-http/server.ts::const INBOUND_BACK_MS = Number(process.env.ONSEN_INBOUND_BACK_MS) || OnsenInbound.BACK_MS
@@ -383,3 +383,7 @@ plugins/telegram-http/lanes-main.ts::function noteOutput(g: Row, p: string, ev: 
 plugins/telegram-http/lanes-main.ts::if (p && (ev === 'PreToolUse' || ev === 'PostToolUse' || ev === 'Stop')) noteOutput(g, p, ev)
 plugins/telegram-http/liveness.ts::export function genuineAssistantAfterFile(path: string, sinceMs: number): number | null
 plugins/telegram-http/lanes.ts::function mainCannotAct(): boolean
+# WO-200 (1.59.2): a person's message reaches a walled main; a refused one is reported blocked; a delayed Call is checked against Onsen first
+plugins/telegram-http/lanes-main.ts::function wallDelivery(
+plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
+plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
