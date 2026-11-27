@@ -2,8 +2,8 @@
 // an item is offered to the main again only when a fact says the last offer did not reach a turn that completed. A compaction, a resume, a new session,
 // a process ending are not reasons by themselves. Chiron mesh-13184: how the turn ended decides — a final Stop: done; a compaction: the turn goes on; no
 // normal end and no genuine output after the binding: once more, a second such end closes it; no normal end with output already there (the process gone,
-// another session, a non-account StopFailure): an interrupted turn's (the Esc path: it rides the next delivery with INTERRUPTED_LINE; alone after
-// MAIN_STUCK_MS, once). Measured before (11-23 10:15Z → 11-27): 171 copies of items already answered were answered again
+// another session, a non-account StopFailure): held with the cut's instructions. WO-209 lets a process cut lead the next delivery.
+// Session changes and non-account StopFailure cuts can lead after MAIN_STUCK_MS. Measured before (11-23 10:15Z → 11-27): 171 copies of items already answered were answered again
 // (session_start 112, gen_end 23, stop_failure:rate_limit 44 — the last is the wall's, WO-200, not this ticket's).
 // Played through the main's own hook events (what main-hook.py posts) against real processes standing in for the main (`sleep`, killed with SIGKILL) and
 // real transcript files: "genuine output after the binding" is liveness.ts's predicate, read from the file the hook names.
@@ -23,6 +23,7 @@ const deps: any = { role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir:
   notifySession: async (sid: string, notif: any) => { if (!open.has(sid)) return false; offers.push({ sid, notif }); return true },
   streamOpen: (sid: string) => open.has(sid), sendBot: async (_c: string, text: string) => { sent.push(text); return 100 + sent.length }, joeyChatId: () => '1' }
 L.lanesInit(deps)
+const processCutLine = '〔這一則你做到一半被打斷了（對話結束）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕'
 const WALL = 3_600_000                                         // LANES_WALL_PROBE_MS here: the wall's base, which a failed turn's backoff derives from
 L.__setWallProbe(WALL)
 const procs: any[] = []
@@ -78,7 +79,7 @@ function settleAll(): void {
   for (const e of E().rows(r => r.state === 'open')) E().set(e.id, () => true, { state: 'met', by: 'test' })
 }
 
-test('WO-201 (a): an item answered (genuine output after it was bound), then a compaction SessionStart inside its turn: not offered again; the turn goes on under its prompt and the item is done at its Stop; answered then compacted then killed: held as an interrupted turn\'s, not offered to the next gen at once', async () => {
+test('WO-201 (a): an item answered (genuine output after it was bound), then a compaction SessionStart inside its turn: not offered again; the turn goes on under its prompt and the item is done at its Stop; after process loss the next gen takes the interrupted item', async () => {
   const g = await startMain()
   const id = await joey('a: 幫我看一下週報的數字')
   expect(state(id)).toBe('offered')
@@ -101,8 +102,7 @@ test('WO-201 (a): an item answered (genuine output after it was bound), then a c
   expect(offeredTimes(id)).toBe(1)
   await kill(g)
   expect(state(id)).toBe('done')
-  // answered, compacted inside the turn, then the process is killed before the turn's Stop: output was there, so an interrupted turn's (mesh-13184; the
-  // first 1.59.1 closed it done, reason received), not offered to the next gen at once
+  // A later process loss ends the compacted turn and the next gen takes the interrupted item.
   const g2 = await startMain()
   const id2 = await joey('a2: 那上週的呢？')
   const p2 = P()
@@ -113,13 +113,13 @@ test('WO-201 (a): an item answered (genuine output after it was bound), then a c
   await kill(g2)
   expect(row(id2)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' }); expect(typeof row(id2).cut_at).toBe('string')
   const g3 = await startMain()
-  await M().tick()
-  expect(offeredTimes(id2)).toBe(1)
+  expect(offeredTimes(id2)).toBe(2)
+  expect(String(offers.at(-1)!.notif.params.content)).toContain(processCutLine)
   await kill(g3)
   settleAll()
 })
 
-test('WO-201 (b): an item answered, then /clear (a new session in the same process) and then a process restart (the gen ends): not offered again at once, held as an interrupted turn\'s; it rides the next delivery (1.59.0 queued both again: session_start, gen_end; the first 1.59.1 closed them done)', async () => {
+test('WO-201 (b): an item answered, then /clear (a new session in the same process) and then a process restart: a session cut rides the next delivery and shares the second-cut cap', async () => {
   const g = await startMain()
   const id = await joey('b: 把 api-gw 的 timeout 調成 30 秒')
   const p = P()
@@ -131,7 +131,7 @@ test('WO-201 (b): an item answered, then /clear (a new session in the same proce
   const sid2 = randomUUID(), tr2 = join(dir, `${sid2}.jsonl`)
   writeFileSync(tr2, JSON.stringify({ type: 'user', timestamp: at(Date.now()), message: { role: 'user', content: '/clear' } }) + '\n')
   expect((await L.__mainEvent({ event: 'SessionStart', pid: g.pid, session_id: sid2, source: 'clear', transcript_path: tr2 })).accepted).toBe(true)
-  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'session_start' })
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'session_start', cuts: 1 })
   expect(linesOf('msg', id).some(l => l.state === 'queued' && l.reason === 'session_start')).toBe(false)
   expect(offeredTimes(id)).toBe(1)
   const g2: Gen = { ...g, sid: sid2, tr: tr2 }
@@ -146,11 +146,11 @@ test('WO-201 (b): an item answered, then /clear (a new session in the same proce
   answers(g2)
   await kill(g2)
   expect(row(id2)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
-  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
-  const g3 = await startMain()                                                            // tui-restart: the next main
-  await M().tick()
-  expect(offeredTimes(id)).toBe(2); expect(offeredTimes(id2)).toBe(1)                     // nothing more: no copy offered to g3 at its start
-  expect(offers.some(o => o.sid === `mcp-${g3.pid}` && String(o.notif.params.meta.did).split(',').some((d: string) => d === id || d === id2))).toBe(false)
+  expect(row(id)).toMatchObject({ state: 'done', reason: 'cut_twice', cut_by: 'gen_end', cuts: 2 })
+  const g3 = await startMain()
+  expect(offeredTimes(id)).toBe(2); expect(offeredTimes(id2)).toBe(2)
+  const ids = String(offers.at(-1)!.notif.params.meta.did).split(',')
+  expect(ids).toContain(id2); expect(ids).not.toContain(id)
   await kill(g3)
   settleAll()
 })
@@ -173,7 +173,7 @@ test(`WO-201 (c): an item bound and the process dies with no genuine output afte
   expect(row(id)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2, cut_by: 'gen_end' })
   await sleep(20)
   const told = sent.slice(k).filter(s => s.includes('主線兩次在讀進下面的訊息之後') && s.includes('c: 查 mock-api 的錯誤率'))
-  expect(told.length).toBe(1); expect(told[0]).toContain('還要處理的話請再說一次')
+  expect(told.length).toBe(1); expect(told[0]).toContain('還沒有任何輸出就結束了（行程不在了）'); expect(told[0]).toContain('還要處理的話請再說一次')
   const g3 = await startMain()
   await M().tick()
   expect(offeredTimes(id)).toBe(2)
@@ -361,7 +361,7 @@ test('WO-201 (g): an API-error assistant record after the binding (isApiErrorMes
   settleAll()
 })
 
-test('WO-201 (h): the process ends after the model answered, with no Stop: not offered again at once (1.59.0 offered it to the next gen; the first 1.59.1 closed it done); the next delivery carries it with the interrupted line, one prompt binds both', async () => {
+test('WO-201 (h): the process ends after the model answered, with no Stop: an already queued message leads the next delivery and carries the process-cut line, one prompt binds both', async () => {
   const g = await startMain()
   const id = await joey('h: 把 11 月的帳對完，對完跟我說')
   const p = P()
@@ -370,16 +370,14 @@ test('WO-201 (h): the process ends after the model answered, with no Stop: not o
   await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
   await kill(g)                                                                            // the process dies mid-work
   expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
-  const g2 = await startMain()
-  await M().pump(); await M().tick()
-  expect(offeredTimes(id)).toBe(1)                                                         // nothing offered at its start
   const k = sent.length
   const j = await joey('h2: 對到哪了？')
+  const g2 = await startMain()
   const n = offers.at(-1)!.notif
   expect(String(n.params.meta.did).split(',').slice(0, 2)).toEqual([j, id])                // the new message leads, the cut one rides it
   const c = String(n.params.content)
-  expect(c.indexOf(INTERRUPTED_LINE)).toBeGreaterThan(c.indexOf('h2: 對到哪了？'))
-  expect(c.indexOf(INTERRUPTED_LINE)).toBeLessThan(c.indexOf('h: 把 11 月的帳對完'))       // the line in front of the cut item
+  expect(c.indexOf(processCutLine)).toBeGreaterThan(c.indexOf('h2: 對到哪了？'))
+  expect(c.indexOf(processCutLine)).toBeLessThan(c.indexOf('h: 把 11 月的帳對完'))       // the line in front of the cut item
   const p2 = P()
   await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })
   expect(state(id)).toBe('bound'); expect(state(j)).toBe('bound')
@@ -424,15 +422,15 @@ test('WO-201 (h2): a non-account StopFailure after the model answered: an interr
   settleAll()
 })
 
-test(`WO-201 (i): the process ends after the model answered and no next delivery comes within MAIN_STUCK_MS (${MAIN_STUCK_MS / 1000} s): the item is delivered alone, once, the interrupted line first; Joey's own message too (an Esc-cut one of his never is: lanes-esc-hold); not a stuck main (Chiron mesh-13191): no main-stuck push, no stuck episode, so no main-unstuck either`, async () => {
+test.each(['session_start', 'stop_failure:server_error'])('WO-201 (i): an answered %s cut waits 600 seconds to go alone with the Esc line and no stuck episode', async why => {
   const g = await startMain()
   const id = await joey('i: 幫我把簡報改成英文')
   const p = P()
   await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
   answers(g)
-  await kill(g)
-  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
-  const g2 = await startMain()
+  if (why === 'session_start') await hook(g, 'SessionStart', { source: 'resume', transcript_path: g.tr })
+  else await hook(g, 'StopFailure', { prompt_id: p, error: 'server_error' })
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: why })
   const k = offers.length, t = sent.length, ns = notifies('main-stuck').length, nu = notifies('main-unstuck').length
   await M().tick(Date.now() + MAIN_STUCK_MS - 60_000)
   expect(offers.length).toBe(k)                                                            // within MAIN_STUCK_MS: it waits for a delivery to ride
@@ -446,15 +444,15 @@ test(`WO-201 (i): the process ends after the model answered and no next delivery
   expect(sent.slice(t).filter(s => s.includes('主線疑似卡死'))).toEqual([])                 // mesh-13191: not stuck, nobody told (the first 1.59.1 pushed main-stuck here)
   expect(notifies('main-stuck').length).toBe(ns)
   const p2 = P()
-  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })   // its next hook event: no stuck episode was open
-  await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
+  await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })   // its next hook event: no stuck episode was open
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
   expect(state(id)).toBe('done'); expect(offeredTimes(id)).toBe(2)
   await M().tick(Date.now() + MAIN_STUCK_MS + 30_000); await M().tick(Date.now() + 2 * MAIN_STUCK_MS)
   expect(offeredTimes(id)).toBe(2)                                                         // once
   await sleep(20)
   expect(sent.slice(t).filter(s => s.includes('疑似卡死'))).toEqual([])                     // neither 主線疑似卡死 nor 疑似卡死解除
   expect(notifies('main-stuck').length).toBe(ns); expect(notifies('main-unstuck').length).toBe(nu)
-  await kill(g2)
+  await kill(g)
   settleAll()
 })
 
@@ -488,7 +486,7 @@ test('WO-201 (i2): the alone delivery of an item with no cut_by (a colleague\'s 
   settleAll()
 })
 
-test('WO-201 (j): the transcript has nothing after the binding yet (its last second not on disk when the gen ends: Chiron mesh-13196, m-mwyr8ssj-1), but M2 received a tool call of that prompt after the binding: an interrupted turn\'s (output_by hook:PreToolUse), not queued again, no cuts; an item pulled into that turn counts only a Stop (a tool call after the pull may be the response already streaming), and a subagent\'s tool call counts for nothing: both take the no-output path', async () => {
+test('WO-201 (j): the transcript has nothing after the binding yet (its last second not on disk when the gen ends: Chiron mesh-13196, m-mwyr8ssj-1), but M2 received a tool call of that prompt after the binding: an interrupted turn\'s (output_by hook:PreToolUse), held with one cut; an item pulled into that turn counts only a Stop (a tool call after the pull may be the response already streaming), and a subagent\'s tool call counts for nothing: both take the no-output path', async () => {
   const g = await startMain()
   const id = await joey('j: 幫我回 Eve 說好')
   const p = P()
@@ -504,13 +502,13 @@ test('WO-201 (j): the transcript has nothing after the binding yet (its last sec
   expect(readFileSync(g.tr, 'utf8').trim().split('\n').length).toBe(1)                     // nothing in the transcript after the binding
   await kill(g)                                                                            // 0.6 s later
   expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end', output_by: 'hook:PreToolUse' })
-  expect(row(id).cuts).toBeUndefined()                                                     // 1.59.1 before mesh-13196: gen_end, cuts 1, offered again, answered twice
+  expect(row(id).cuts).toBe(1)
   expect(row(pulled)).toMatchObject({ state: 'queued', reason: 'gen_end', cuts: 1 })
   const g2 = await startMain()
   const lead = String(offers.at(-1)!.notif.params.meta.did).split(',')
   expect(lead[0]).toBe(pulled)                                                             // the pulled one, with nothing said after it, leads the next gen's offer
-  expect(lead).toContain(id)                                                               // the held one never leads: it rides that delivery, the line in front
-  expect(row(id)).toMatchObject({ state: 'offered' }); expect(String(offers.at(-1)!.notif.params.content)).toContain(INTERRUPTED_LINE)
+  expect(lead).toContain(id)                                                               // the held one rides the existing lead
+  expect(row(id)).toMatchObject({ state: 'offered' }); expect(String(offers.at(-1)!.notif.params.content)).toContain(processCutLine)
   await kill(g2)
   settleAll()
   // a subagent's tool call after the binding is not the main's output

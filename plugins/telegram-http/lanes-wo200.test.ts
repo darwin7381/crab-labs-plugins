@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createMain, INTERRUPTED_LINE, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
+import { createMain, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { OnsenClient } from './onsen-client.ts'
 import { DeliveryFacts, LanesTap } from './onsen-status.ts'
@@ -181,6 +181,8 @@ test('WO-200 (d) two refusals write blocked receipts and replay in order once', 
   expect(d.notices).toEqual(['main-wall-up', 'main-wall-down'])
 })
 
+const accountCutLine = '〔這一則你做到一半被打斷了（用量上限）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕'
+
 test('WO-200 (e) the keeper clear immediately offers an account cut with the interrupted line', async () => {
   const d = daemon(), item = d.add('joey', '107')
   await d.flush()
@@ -192,8 +194,7 @@ test('WO-200 (e) the keeper clear immediately offers an account cut with the int
   expect(d.offers).toEqual([[item]])
   d.clear(); await Bun.sleep(0)
   expect(d.offers).toEqual([[item], [item]])
-  expect(d.texts[1]).toStartWith(INTERRUPTED_LINE)
-  expect(d.texts[1]).not.toContain('接著做沒做完的')
+  expect(d.texts[1]).toStartWith(accountCutLine)
 })
 
 test('WO-200 (f) final Call gets one thread line and only the open Call reaches main', async () => {
@@ -311,8 +312,7 @@ test('WO-204 (c) both orders of refusal and account cut reach the same clear off
     }
     d.clear(); await Bun.sleep(0)
     expect(d.offers).toEqual([[ids[0]], [ids[1]], ids])
-    expect(d.texts[2].split(INTERRUPTED_LINE)).toHaveLength(2)
-    expect(d.texts[2]).not.toContain('接著做沒做完的')
+    expect(d.texts[2].split(accountCutLine)).toHaveLength(2)
   }
 })
 
@@ -373,7 +373,7 @@ test('WO-204 a person can finish during the wall while an older account cut stil
   expect(d.offers).toEqual([[cut], [person]])
   d.clear(); await Bun.sleep(0)
   expect(d.offers).toEqual([[cut], [person], [cut]])
-  expect(d.texts[2]).toStartWith(INTERRUPTED_LINE)
+  expect(d.texts[2]).toStartWith(accountCutLine)
 })
 
 test('WO-204 a Call queued while the menu closes takes precedence; an unknown Call keeps the clear available', async () => {
@@ -396,6 +396,56 @@ function liveMain() {
   d.wall.walled = false
   return d
 }
+
+test('WO-209 an answered process cut waits through a human wall probe, then goes once and closes on a second crash', async () => {
+  const d = liveMain()
+  const told: string[] = []
+  d.env.tellJoey = (text, rule) => { if (rule === 'main-cut') told.push(text) }
+  const item = d.add('joey', '半途的工作')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'work', { dids: [item] })
+  await d.hook('PreToolUse', 'work', { tool_name: 'Bash' })
+  await d.hook('SessionEnd', '')
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'queued', cut_by: 'gen_end', output_by: 'hook:PreToolUse', cuts: 1 })
+  d.wall.walled = true
+  setSystemTime(T + 60_000)
+  await d.hook('SessionStart', '', { pid: 124 })
+  await d.flush()
+  const person = d.add('joey', '新的訊息')
+  await d.flush()
+  expect(d.offers).toEqual([[item], [person]])
+  await d.hook('UserPromptSubmit', 'person', { dids: [person], pid: 124 })
+  expect((await d.hook('PostToolUse', 'person', { tool_name: 'Read', pid: 124 })).additionalContext).toBeUndefined()
+  await d.hook('Stop', 'person', { phase: 'final', pid: 124 })
+  await d.flush()
+  expect(d.offers).toHaveLength(2)
+  d.clear()
+  await Bun.sleep(0)
+  expect(d.offers).toEqual([[item], [person], [item]])
+  expect(d.texts[2]).toBe('〔這一則你做到一半被打斷了（對話結束）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕\n半途的工作')
+  await d.hook('UserPromptSubmit', 'retry', { dids: [item], pid: 124 })
+  await d.hook('PreToolUse', 'retry', { tool_name: 'Read', pid: 124 })
+  await d.hook('SessionEnd', '', { pid: 124 })
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
+  expect(told).toHaveLength(1)
+  expect(told[0]).toContain('處理到一半就結束了')
+  expect(told[0]).toContain('「半途的工作」')
+  await d.hook('SessionStart', '', { pid: 125 })
+  await d.main.tick()
+  expect(d.offers).toHaveLength(3)
+})
+
+test('WO-209 an answered item held by 1.59.5 keeps its first cut across upgrade', async () => {
+  const d = liveMain(), id = 'old-item'
+  d.journal.write('msg', id, 'queued', { kind: 'joey', reason: 'interrupted', cut_by: 'gen_end', cut_at: new Date(T - 1).toISOString(),
+    output_by: 'transcript', via: 'tg', notif: { method: 'notifications/claude/channel', params: { content: '舊訊息' } } })
+  await d.main.pump()
+  expect(d.offers).toEqual([[id]])
+  await d.hook('UserPromptSubmit', 'retry', { dids: [id] })
+  await d.hook('PreToolUse', 'retry', { tool_name: 'Read' })
+  await d.hook('SessionEnd', '')
+  expect(d.journal.get('msg', id)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
+})
 
 test('WO-209 (1,4) a bare turn killed before final Stop gets exactly one line on the next idle stream', async () => {
   const d = liveMain(), meta = { chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' }

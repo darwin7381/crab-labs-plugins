@@ -10,7 +10,7 @@
  *     The one rule: an item is done only when the turn it was bound to ends with Stop. How a turn that had no normal end ended decides the rest
  *     (WO-201, Chiron mesh-13184): a compaction inside it is no end (the turn goes on); no genuine model output after the item was bound (liveness.ts,
  *     the shared predicate): offered once more (settle; a non-account StopFailure: after a backoff, with a cap: failTurn); output already there (the
- *     process gone, another session, a non-account StopFailure): an interrupted turn's (holdCut: it rides the next delivery with the interrupted line).
+ *     process gone, another session, a non-account StopFailure): held with a continuation line. A process loss can lead the next delivery.
  *     A turn of a prompt ends at its LAST Stop: other Stop hooks (the user's, run in parallel with ours) can block a Stop ours let through,
  *     and the turn goes on under the same prompt_id. So a Stop leaves the gen idle with `stopped_prompt`,
  *     and any later hook event of that prompt in that gen re-opens the turn: M2 back to in_turn, the items done at that Stop back to bound
@@ -155,9 +155,7 @@ export const __setOfferLeaseMs = (ms: number): void => { OFFER_LEASE_MS = ms }
 /** WO-157c (Chiron, WO-157 15:25Z, his words): the line in front of an item whose turn was interrupted (Esc, or a turn that never ended normally) when it
  *  reaches the main again */
 export const INTERRUPTED_LINE = '〔這一則你做到一半被中斷了（有人在你的畫面按了 Esc，或那一回合沒有正常結束）。中斷之後 Joey 說了新的，就照新的。沒有說，就回寄件人一句停在哪一步，不要自己把被中斷的動作重做一次。〕'
-/** WO-201 (Chiron resend audit 2026-11-27, rule 3, point 2): how many times an item read into a turn that was then cut (its gen ended, or its process started
- *  another session) before the model said anything after it is offered to the next one. Cut the same way once more, it is closed (done, reason cut_twice)
- *  and Joey is told which: it is not offered a third time */
+/** WO-209: a bound item with known output status gets one more delivery after a process loss or session change. */
 export const CUT_REOFFERS = 1
 /** WO-201 (point 4, inventory L5): the failed turns (a StopFailure that is not an account kind: server_error, an overload, unknown) an item may have
  *  before it is parked and the stuck path takes it. Between two, it waits wallBackoff(err, n): the main wall's own base for these kinds (LANES_WALL_PROBE_MS,
@@ -265,8 +263,9 @@ export function createMain(E: MainEnv) {
   const accountFailure = (reason: unknown): boolean => typeof reason === 'string' && reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(reason.slice('stop_failure:'.length))
   const accountCut = (r: Row): boolean => heldCut(r) && accountFailure(r.cut_by)
   /** An item already refused or interrupted by this wall waits for the clear. */
-  function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
-    if (!wall.active) return true
+  function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>, probe = false): boolean {
+    if (r.cut_by === 'gen_end') return !wall.active
+    if (!wall.active || probe) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
     const refused = accountFailure(r.reason) || accountCut(r)
     return wall.person && r.kind === 'joey' && !refused
@@ -341,7 +340,12 @@ export function createMain(E: MainEnv) {
   /** the reason an offered item goes back with when nobody took the offer: a held item keeps its hold (it rides the next offer again) */
   const backReason = (r: Row, why: string): string => r.reason === 'interrupted' ? 'interrupted' : r.reason === 'batched' ? 'batched' : why
   /** an item that was in an interrupted turn: Chiron's line goes in front of it each time it reaches the main (cut_at, set when the turn was cut) */
-  const cutText = (r: Row, text: string): string => r.cut_at ? `${INTERRUPTED_LINE}\n${text}` : text
+  function cutText(r: Row, text: string): string {
+    if (!r.cut_at) return text
+    const reason = r.cut_by === 'gen_end' ? '對話結束' : accountFailure(r.cut_by) ? '用量上限' : null
+    const line = reason ? `〔這一則你做到一半被打斷了（${reason}）：先看已經做了什麼，接著做沒做完的；已經送出去的回覆和已經做完的動作不要重做。〕` : INTERRUPTED_LINE
+    return `${line}\n${text}`
+  }
   /** the digest that rides this delivery: the one queued digest item, refreshed, or a new one; null = nothing to tell. WO-181: `mb`, the unread mentions
    *  fetched for this delivery, ride in it as one block after the digest's own text (alone when the digest has nothing); the item keeps their posts
    *  (`mentions`), marked read once it reached the main */
@@ -444,7 +448,7 @@ export function createMain(E: MainEnv) {
       return currentGen() === g && g.version === version && fresh.active === wall.active && fresh.person === wall.person
         && fresh.probe === probe && mayOffer()
     }
-    const eligible = (r: Row) => probe || wallAllows(r, wall)
+    const eligible = (r: Row) => wallAllows(r, wall, probe)
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
@@ -454,8 +458,12 @@ export function createMain(E: MainEnv) {
     // The keeper timestamps clears to whole seconds, as in statusChanged.
     const releasedCut = (r: Row) => wall.clear != null && accountFailure(r.cut_by)
       && wall.clear >= Math.floor(Date.parse(r.cut_at ?? r.ts) / 1000) * 1000
-    const candidates = () => items(r => queuedForOffer(r, g) && eligible(r)
-      && (!heldCut(r) || releasedCut(r)))
+    const candidates = () => {
+      const ready = items(r => queuedForOffer(r, g) && eligible(r))
+      // Keep the existing leads first. A process-cut item rides one, or leads if none can be written.
+      return ready.filter(r => !heldCut(r) || releasedCut(r))
+        .concat(ready.filter(r => heldCut(r) && r.cut_by === 'gen_end'))
+    }
     const cands = candidates()
     if (!cands.length && !resume) return
     const mp = cands.length && !(wall.active && !probe) ? mentionsNow() : null
@@ -593,15 +601,10 @@ export function createMain(E: MainEnv) {
   function cutTurn(g: Row): Row[] {
     return g.prompt_id ? requeue(r => r.gen === g.id && r.prompt_id === g.prompt_id, 'interrupted', { cut_at: new Date().toISOString(), cut_by: null }) : []
   }
-  /** WO-201 (Chiron mesh-13184, row 4): items `rs` whose turn had no normal end AFTER the model had already said something about them (its gen ended, its
-   *  process started another session, a non-account StopFailure): an interrupted turn, the Esc path's shape (cutTurn). Held (reason interrupted, cut_at)
-   *  to ride the next delivery with INTERRUPTED_LINE in front; `cut_by` names what cut it, so that with no next delivery within MAIN_STUCK_MS it is
-   *  delivered alone once (tick), Joey's own messages included: an Esc is Joey stopping it, a dead process is not */
-  function holdCut(rs: Row[], by: string, outBy: Map<string, string> = new Map()): Row[] {
-    if (!rs.length) return []
-    const at = new Date().toISOString()
-    for (const r of rs) J().write('msg', r.id, 'queued', { reason: 'interrupted', gen: null, prompt_id: null, via_pull: null, cut_at: at, cut_by: by, ...(outBy.has(r.id) ? { output_by: outBy.get(r.id) } : {}) })
-    return rs
+  /** Record the answered item's cut and its evidence together. cut_by determines when it can lead an offer. */
+  function holdCut(r: Row, by: string, output: string, cuts?: number): void {
+    J().write('msg', r.id, 'queued', { reason: 'interrupted', gen: null, prompt_id: null, via_pull: null,
+      cut_at: new Date().toISOString(), cut_by: by, output_by: output, cuts })
   }
   function finish(pred: (r: Row) => boolean, how: Record<string, unknown> = {}): Row[] {
     const rs = items(r => r.state === 'bound' && pred(r))
@@ -616,10 +619,8 @@ export function createMain(E: MainEnv) {
   // Four cases, decided by how the turn the item was bound to ended, never by "the gen changed":
   //   1. a normal end (its final Stop): done (finish, `received: stop`).
   //   2. a compaction inside the turn: the turn goes on; nothing moves (sessionStart `goesOn`).
-  //   3. no normal end, and NO genuine output after the binding: offered once more; a second such end closes it with one main-cut line (settle).
-  //   4. no normal end, output ALREADY there (the process gone, another session, a non-account StopFailure): an interrupted turn (holdCut: the Esc path).
-  // Output only means the work started: marking such an item done would leave nothing to wake the main for the rest of it; offering its full text at
-  // once mostly gets a second answer. The interrupted line rides the next delivery with it instead.
+  //   3. no normal end, and NO genuine output after the binding: queue again (settle), or back off after a model error (failTurn).
+  //   4. no normal end, output ALREADY there: hold with the cut's instructions. settle shares the cut cap across cases 3 and 4.
   const genuineAfter = (path: string, sinceMs: number): number | null => { try { return (E.genuineAfter ?? genuineAssistantAfterFile)(path, sinceMs) } catch { return null } }
   /** did the model say anything after item `r` was bound to a turn of gen `g`? 'stop': it reached done at a final Stop before (its turn then went on:
    *  turn_continued); a number: the ms of the first genuine assistant record of g's transcript after `bound_at` (liveness.ts: a response begun after the
@@ -654,30 +655,33 @@ export function createMain(E: MainEnv) {
   /** gen `g` ends, or its process starts another session that is not a compaction of the running turn, while items `rs` are offered to it or bound to
    *  its turn (no normal end: cases 3 and 4 above):
    *  - offered, never bound: it never reached a turn: queued again (`why`), as before (an item never read cannot be a second copy).
-   *  - bound, output already there: held as an interrupted turn's (holdCut, cut_by `why`): it rides the next delivery with the interrupted line.
-   *  - bound, nothing after it: queued again once (`cuts`: CUT_REOFFERS). Cut the same way again: closed (done, reason cut_twice); the caller tells Joey
-   *    which (tellCut). It is not offered a third time.
+   *  - bound, known output status: one more delivery (cuts, CUT_REOFFERS), then close with cut_twice. An answered item is held with cut_by;
+   *    one with no output is queued again as before.
    *  - bound and it cannot be told: queued again as before (the failure Chiron prefers: one copy too many, never one lost), and the log says why. */
   function settle(g: Row, rs: Row[], why: string): { back: Row[]; held: Row[]; capped: Row[] } {
-    const back: Row[] = [], hold: Row[] = [], capped: Row[] = [], outBy = new Map<string, string>()
+    const back: Row[] = [], held: Row[] = [], capped: Row[] = []
     const again = (r: Row, f: Record<string, unknown> = {}): void => { J().write('msg', r.id, 'queued', { reason: why, gen: null, prompt_id: null, via_pull: null, ...f }); back.push(r) }
     for (const r of rs) {
       if (r.state === 'offered') { again(r); continue }
       if (r.state !== 'bound') continue
       const out = outputOf(g, r)
-      if (hasOutput(out)) { hold.push(r); outBy.set(r.id, outputBy(out)); continue }
       if (out == null) {
         E.log('info', `lanes: ${why} of gen ${g.id}: cannot tell whether the model said anything after item ${r.id} (${g.transcript_path ? `transcript ${g.transcript_path} unreadable or too large` : 'no transcript path'}): queued again as before`)
         again(r)
         continue
       }
-      const cuts = Number(r.cuts ?? 0) + 1
-      if (cuts <= CUT_REOFFERS) { again(r, { cuts }); continue }
-      closeItem(r, { reason: 'cut_twice', cuts, cut_by: why })
-      capped.push(r)
+      // In older journals a held process/session cut had cut_by but no cuts yet.
+      const cuts = Number(r.cuts ?? (r.cut_by === 'gen_end' || r.cut_by === 'session_start')) + 1
+      const output = hasOutput(out) ? outputBy(out) : undefined
+      if (cuts > CUT_REOFFERS) {
+        closeItem(r, { reason: 'cut_twice', cuts, cut_by: why, output_by: output })
+        capped.push(r)
+      } else if (output) {
+        holdCut(r, why, output, cuts)
+        held.push(r)
+      } else again(r, { cuts })
     }
-    const held = holdCut(hold, why, outBy)
-    if (held.length || capped.length) E.log('info', `lanes: ${why} of gen ${g.id}: ${itemCount(held)} item(s) the model had answered held as an interrupted turn's (they ride the next delivery), ${itemCount(capped)} cut twice with no output (closed), ${itemCount(back)} queued again`)
+    if (held.length || capped.length) E.log('info', `lanes: ${why} of gen ${g.id}: ${itemCount(held)} item(s) the model had answered held, ${itemCount(capped)} closed after two cuts, ${itemCount(back)} queued again`)
     return { back, held, capped }
   }
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
@@ -688,7 +692,13 @@ export function createMain(E: MainEnv) {
     E.tellJoey(`${what}為了不一直重來，這 ${told.length} 則不會再自動交給主線：${told.map(r => `「${contentOf(r).replace(/\s+/g, ' ').slice(0, 80)}」`).join('；')}。還要處理的話請再說一次（同事的事請對方再送一次）。`,
       'main-cut', [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))])
   }
-  const tellCut = (rs: Row[], why: string): void => tellClosed(rs, `主線兩次在讀進下面的訊息之後、還沒有任何輸出就${why === 'gen_end' ? '結束了（行程不在了）' : '換了一個 session'}。`)
+  function tellCut(rs: Row[], why: string): void {
+    const end = why === 'gen_end' ? '結束了（行程不在了）' : '換了一個 session'
+    for (const answered of [false, true]) {
+      tellClosed(rs.filter(r => Boolean(r.output_by) === answered),
+        `主線兩次在讀進下面的訊息之後、${answered ? '處理到一半' : '還沒有任何輸出'}就${end}。`)
+    }
+  }
   /** WO-201 (point 4, inventory L5): turn `p` of gen `g` ended in a StopFailure that is not an account kind (server_error, an overload, unknown). An item
    *  the model had already said something about (outputOf) is an interrupted turn's (case 4: holdCut, cut_by stop_failure:<err>). One with nothing after
    *  it (or it cannot be told): the turn was refused (Chiron's rule 3): offered again, each after a backoff, wallBackoff(err, fails − 1) (for these kinds the main wall's base,
@@ -699,19 +709,18 @@ export function createMain(E: MainEnv) {
   function failTurn(g: Row, p: string, err: string): void {
     const now = Date.now()
     const rs = unsettled(g, p)
-    const parked: Row[] = [], closed: Row[] = [], hold: Row[] = [], outBy = new Map<string, string>()
+    const parked: Row[] = [], closed: Row[] = [], held: Row[] = []
     for (const r of rs) {
       const back = { gen: null, prompt_id: null, via_pull: null }
       if (r.state !== 'bound') { J().write('msg', r.id, 'queued', { reason: `stop_failure:${err}`, ...back }); continue }
       const out = outputOf(g, r)
-      if (hasOutput(out)) { hold.push(r); outBy.set(r.id, outputBy(out)); continue }      // case 4: the model had answered: an interrupted turn
+      if (hasOutput(out)) { holdCut(r, `stop_failure:${err}`, outputBy(out)); held.push(r); continue }
       if (out == null) E.log('info', `lanes: StopFailure ${err} of gen ${g.id}: cannot tell whether the model said anything after item ${r.id}: the refused-turn retry`)
       const fails = Number(r.fails ?? 0) + 1
       if (fails < MAIN_FAIL_MAX) J().write('msg', r.id, 'queued', { reason: `stop_failure:${err}`, ...back, fails, fail_retry_at: now + backoff(err, fails - 1) })
       else if (!r.fail_released) { J().write('msg', r.id, 'queued', { reason: 'stop_failure_cap', ...back, fails, fail_retry_at: null }); parked.push(r) }
       else { closeItem(r, { reason: 'stop_failure_gave_up', fails, gen: null }); closed.push(r) }
     }
-    const held = holdCut(hold, `stop_failure:${err}`, outBy)
     setMain(g, 'idle', { error: err, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: bareCut(g, rs, err, now) })
     const waiting = items(r => r.state === 'queued' && typeof r.reason === 'string' && r.reason === `stop_failure:${err}` && Number(r.fail_retry_at ?? 0) > now)
     E.log('info', `lanes: main gen ${g.id}: turn ${p || '(none)'} ended in StopFailure ${err}: ${itemCount(waiting)} item(s) wait ${Math.round(backoff(err, 0) / 1000)} s or the next good turn, ${itemCount(parked)} parked at the cap (${MAIN_FAIL_MAX}), ${itemCount(closed)} closed, ${itemCount(held)} the model had answered held as an interrupted turn's`)
@@ -934,7 +943,7 @@ export function createMain(E: MainEnv) {
         for (const r of back) {
           const output = r.state === 'bound' && r.kind !== 'digest' ? outputOf(g, r) : null
           if (hasOutput(output)) {
-            holdCut([r], reason, new Map([[r.id, outputBy(output)]]))
+            holdCut(r, reason, outputBy(output))
             continue
           }
           const refused = r.state === 'bound' && r.kind === 'joey'
@@ -1158,10 +1167,9 @@ export function createMain(E: MainEnv) {
         // WO-157c (Chiron 15:25Z, 1): a colleague's, a scheduler's or an alert's item of an interrupted turn that no new turn took within MAIN_STUCK_MS goes
         // the untaken path above: Joey is told (the same words) and it is offered once more, now leading an offer (with Chiron's line in front). Joey's own
         // items never go this way: they wait for the next delivery. WO-177 一: only while the record says the main can take one, counted from then.
-        // WO-201 (Chiron mesh-13184): an item whose turn a dead process, another session or a StopFailure cut after the model had answered it (`cut_by`) goes
-        // this way too, Joey's own included: an Esc is Joey stopping it; a process that died is not, and with no next delivery nothing else would wake it
+        // Session changes and StopFailure cuts still use the quiet timeout. Process cuts can already lead an offer.
         const quietFrom = Math.max(from, wall.clear ?? 0)
-        const cutOld = items(r => !wall.active && heldCut(r) && owed(r) && (r.kind !== 'joey' || !!r.cut_by) && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), quietFrom) > MAIN_STUCK_MS)
+        const cutOld = items(r => !wall.active && heldCut(r) && r.cut_by !== 'gen_end' && owed(r) && (r.kind !== 'joey' || !!r.cut_by) && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), quietFrom) > MAIN_STUCK_MS)
         // WO-201 (Chiron mesh-13191): when every such item is one a dead process, another session or a StopFailure cut (`cut_by`), it is not stuck: an
         // interrupted turn waited MAIN_STUCK_MS with nothing coming in to ride. It is offered alone once and nobody is told: no main-stuck push, no stuck
         // episode (so no main-unstuck either); before 1.59.1 such an item was offered again at once and Joey heard nothing. Any item without `cut_by`
