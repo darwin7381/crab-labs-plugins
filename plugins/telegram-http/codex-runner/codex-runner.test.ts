@@ -233,12 +233,13 @@ describe('#dev items (Chiron mesh 13257)', () => {
   }, 40_000)
   test('stopped at its limit: it goes on once in the same session instead of failing', async () => {
     const { local } = repos()
-    const { onsen, cfg, codexLog, log } = setup({ devTimeoutMs: 1200 })
+    const { onsen, cfg, codexLog, log } = setup({ devTimeoutMs: 1200, killGraceMs: 300 })
+    process.env.FAKE_CODEX_RESUME_SLEEP = '0.8'             // the continuation outlives the first run's SIGKILL timer: it must not be its target
     onsen.call('9963', 'chiron', 9963)
     onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${local}\n慢慢做 SLEEP:4`, msg_id: 9963 }, dedupe: 'msg:9963', call_id: '9963' })
     const r = runner(cfg)
     await r.start()
-    await until(() => done(onsen, '9963')(), 30_000, 'Call 9963')
+    try { await until(() => done(onsen, '9963')(), 30_000, 'Call 9963') } finally { delete process.env.FAKE_CODEX_RESUME_SLEEP }
     expect(onsen.calls.get('9963')!.state).toBe('completed')
     const starts = codexLog().filter(x => x.ev === 'start')
     expect(starts.length).toBe(2)

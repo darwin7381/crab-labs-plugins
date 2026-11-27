@@ -46,6 +46,7 @@ async function main(): Promise<void> {
   if (/\bHANGHARD\b/.test(text)) { process.on('SIGTERM', () => {}); await new Promise(() => setInterval(() => {}, 1000)) }
   if (/\bHANG\b/.test(text)) { process.on('SIGTERM', () => done(143)); await new Promise(() => setInterval(() => {}, 1000)) }
   if (/\bKID\b/.test(text)) { const k = spawn('sleep', ['30'], { stdio: 'ignore' }); k.unref(); log({ ev: 'kid', pid: process.pid, kid: k.pid }) }
+  if (resume && process.env.FAKE_CODEX_RESUME_SLEEP) await new Promise(r => setTimeout(r, Number(process.env.FAKE_CODEX_RESUME_SLEEP) * 1000))
   const sl = /SLEEP:(\d+(?:\.\d+)?)/.exec(text)
   if (sl) await new Promise(r => setTimeout(r, Number(sl[1]) * 1000))
   if (/\bFAIL\b/.test(text)) {

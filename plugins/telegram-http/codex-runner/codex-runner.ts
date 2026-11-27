@@ -867,8 +867,9 @@ export class CodexRunner {
       j.timed_out = true
       this.log('warn', `${j.id}: ${Math.round(this.limit(j) / 1000)} s without finishing: SIGTERM to its process group, SIGKILL in ${this.cfg.killGraceMs / 1000} s`)
       this.save()
-      killGroup(j.pid, 'SIGTERM')
-      this.later(this.cfg.killGraceMs, () => { if (j.pid) killGroup(j.pid, 'SIGKILL') })   // the whole group: what codex started dies with it
+      const pid = j.pid                                       // this run's: a #dev continuation gets a new pid before the SIGKILL fires
+      killGroup(pid, 'SIGTERM')
+      this.later(this.cfg.killGraceMs, () => killGroup(pid, 'SIGKILL'))   // the whole group: what codex started dies with it
       // an adopted run has no exit event: the poll sees it go
     })
   }
