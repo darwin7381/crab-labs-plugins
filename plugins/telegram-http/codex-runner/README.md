@@ -112,6 +112,9 @@ bun codex-runner.ts --profile       # once: display name Codex, role 外部模�
 | `CODEX_RUNNER_TIMEOUT_S` | `1800` | a run's limit; `CODEX_RUNNER_KILL_GRACE_S` (10) between SIGTERM and SIGKILL |
 | `CODEX_BIN` | `codex` | the plist gives the Homebrew path |
 | `CODEX_RUNNER_SANDBOX` | `workspace-write` | `-s` |
+| `CODEX_RUNNER_DEV_TIMEOUT_S` | `3600` | a `#dev` item's limit; stopped there, it goes on once in the same session before it counts as failed |
+| `CODEX_RUNNER_DEV_REPOS` | the four below | more `#dev` shortcuts, `name=/abs/path,…` (bt-control-center, fleet-core, crab-labs-plugins, Joey-Crablabs-Skills are built in; any absolute path to a local git repo works without one) |
+| `CODEX_RUNNER_DEV_PG` | `postgresql://postgres@127.0.0.1:55432` | the throwaway PostgreSQL the `#dev` brief names |
 | `CODEX_RUNNER_MODEL`, `CODEX_RUNNER_EFFORT` | unset | the runner's own model and reasoning effort (`minimal`…`xhigh`): every run gets `-m <model> -c model_reasoning_effort="<effort>"`, and `--setup` writes them into Codex's own `config.toml`. Never the personal `~/.codex/config.toml`'s (Chiron mesh 13227). Unset: Codex's own home's config decides |
 | `CODEX_RUNNER_AGENT` | `codex` | the member name (must be the credential's identity) |
 | `CODEX_RUNNER_WAIT_S` | `25` | the long polls |
@@ -122,3 +125,13 @@ bun codex-runner.ts --profile       # once: display name Codex, role 外部模�
 ## Tests
 
 `bun test codex-runner/codex-runner.test.ts` from `plugins/telegram-http`. The tests use a fake Onsen (`Bun.serve`) and a fake codex (`fake-codex.ts`), and nothing reaches Onsen or OpenAI. No tmux is involved.
+
+## Development items (`#dev`, Chiron mesh 13257)
+
+A Call whose first line is `#dev repo=<name or /abs/path> [branch=<name>]` is a development item:
+
+- **The clone.** Before Codex starts, the runner clones the repo into the item's folder (`./repo`, `git clone --reference <the local copy>` from its origin, so the local copy is only read) and checks out `codex/call-<id>` (or `branch=`) from origin's default branch; a branch already on origin goes on from there. A follow-up in the same session reuses the clone. A name the runner does not know, or a path that is not a git repo: the item fails, saying so.
+- **The sandbox.** `workspace-write` plus `sandbox_workspace_write.network_access=true`, so tests can listen on 127.0.0.1 and reach the throwaway PostgreSQL (`CODEX_RUNNER_DEV_PG`). This also opens outbound network; only `#dev` items get it.
+- **The brief.** Every `#dev` item starts with a fixed opening: change only `./repo`, small commits, never push or switch to main; never open credential files (`.env`, `*.credential`, `auth.json`, `.secrets`, `mesh-credential`); network only for local tests, its own database name; send nothing to anyone or any live service; the answer lists the commits, what ran here with numbers, what could not run (and why), and the questions for the owner, the two kept apart.
+- **The time.** `CODEX_RUNNER_DEV_TIMEOUT_S` (3600 s). Stopped there, the runner goes on once in the same session ("時間到了… 接著做完"); stopped again, it fails.
+- **The push.** After the run (completed or failed), the runner pushes that branch to origin: that branch only, never main, never forced. The answer always carries a block with the clone's path, the branch and its base, where it went (`推上去了：<origin> <branch> @ <sha>`) or why not, and the commits. The clone's files are not attached.

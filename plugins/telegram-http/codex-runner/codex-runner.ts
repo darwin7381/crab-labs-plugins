@@ -74,7 +74,32 @@ export type Cfg = {
   /** the runner's own model and reasoning effort (CODEX_RUNNER_MODEL / CODEX_RUNNER_EFFORT), given to every run; null: Codex's own home's
    *  config.toml decides. Never the personal config's (Chiron mesh 13227; Joey TG chiron:2884 「開發任務你多分一些給 codex 的頂級模型」) */
   model: string | null; effort: string | null
+  /** #dev items (Chiron mesh 13257): their own time limit (CODEX_RUNNER_DEV_TIMEOUT_S, 3600), the repo names that stand for a local path
+   *  (CODEX_RUNNER_DEV_REPOS name=path,…; an absolute path to any local git repo works too), the throwaway PostgreSQL the brief names */
+  devTimeoutMs: number; devRepos: Record<string, string>; devPg: string
   log?: (level: 'info' | 'warn' | 'error', msg: string) => void; now?: () => number; heartbeatMs?: number; declareRetryMs?: number
+}
+/** the #dev repo shortcuts: name → local path (Chiron mesh 13257: a shortcut, never a list that refuses the others) */
+export function devRepos(v: string | undefined, home: string): Record<string, string> {
+  const out: Record<string, string> = {
+    'bt-control-center': join(home, 'bt-control-center'),
+    'fleet-core': join(home, 'cc-workspaces', 'claude-epeius', 'repos', 'fleet-core'),
+    'crab-labs-plugins': join(home, '.claude', 'plugins', 'marketplaces', 'crab-labs-plugins'),
+    'Joey-Crablabs-Skills': join(home, 'Development', 'Joey-Crablabs-Skills'),
+  }
+  for (const part of (v ?? '').split(',')) {
+    const m = /^\s*([A-Za-z0-9._-]+)\s*=\s*(\/[^,]+?)\s*$/.exec(part)
+    if (m) out[m[1]!] = m[2]!
+  }
+  return out
+}
+/** `#dev repo=<name or /abs/path> [branch=<name>]` on an item's first line → what it asks for; null: not a dev item */
+export function devAsk(text: string): { repo: string; branch: string | null } | null {
+  const first = (text.split('\n')[0] ?? '').trim()
+  if (!/^#dev\b/.test(first)) return null
+  const repo = /\brepo=(\S+)/.exec(first)?.[1] ?? ''
+  const branch = /\bbranch=([A-Za-z0-9._\/-]{1,100})/.exec(first)?.[1] ?? null
+  return { repo, branch }
 }
 const num = (v: string | undefined, d: number): number => { const n = Number(v); return v != null && v.trim() !== '' && Number.isFinite(n) && n > 0 ? n : d }
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
@@ -92,6 +117,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
     killGraceMs: num(env.CODEX_RUNNER_KILL_GRACE_S, 10) * 1000, waitS: num(env.CODEX_RUNNER_WAIT_S, 25),
     maxFiles: 20, maxFileBytes: 25 * 1024 * 1024, lookupDelayMs: 35_000, retryMs: 15_000, adoptPollMs: 2_000,
     ...codexHomes(env, root), authFrom: env.CODEX_RUNNER_AUTH_FROM || join(home, '.codex'),
+    devTimeoutMs: num(env.CODEX_RUNNER_DEV_TIMEOUT_S, 3600) * 1000,
+    devRepos: devRepos(env.CODEX_RUNNER_DEV_REPOS, home),
+    devPg: (env.CODEX_RUNNER_DEV_PG || 'postgresql://postgres@127.0.0.1:55432').trim(),
     model: /^[A-Za-z0-9._:-]{1,80}$/.test((env.CODEX_RUNNER_MODEL ?? '').trim()) ? env.CODEX_RUNNER_MODEL!.trim() : null,
     effort: /^(minimal|low|medium|high|xhigh)$/.test((env.CODEX_RUNNER_EFFORT ?? '').trim()) ? env.CODEX_RUNNER_EFFORT!.trim() : null,
   }
@@ -242,6 +270,10 @@ export type Job = {
   before?: Record<string, string>
   outcome?: 'completed' | 'failed'; result_text?: string; files?: string[]; skipped_files?: string[]
   uploads?: Record<string, string>; steps?: Record<string, boolean>; why?: string
+  /** a #dev item (Chiron mesh 13257): the repo it asked for, the clone the runner made in its folder, the branch, the base it started from,
+   *  where the branch went (pushed: the ref and commit; push_error: why not), and whether its one automatic continuation was used */
+  dev?: { repo: string; local: string; clone: string; branch: string; base: string; origin: string; pushed?: string; push_error?: string;
+    commits?: string[]; continued?: boolean }
 }
 /** one Codex session: an agent's thread (key t:<thread>) or a person's conversation (key say:<chat>: the page's say rows and that chat's
  *  person_message items alike, one conversation; conv:<conversation id> for a person_message with no client chat) */
@@ -308,7 +340,7 @@ const size = (n: number): string => n >= 1_048_576 ? `${Math.round(n / 1_048_576
 // ------------------------------------------------------------------ the folder: what a run made
 const SCAN_MAX = 5000
 /** every regular file under dir (relative path → size:mtime), hidden names and symlinks skipped, at most SCAN_MAX */
-export function snapshot(dir: string): Record<string, string> {
+export function snapshot(dir: string, skip?: string): Record<string, string> {
   const out: Record<string, string> = {}
   let n = 0
   const walk = (d: string, depth: number): void => {
@@ -317,6 +349,7 @@ export function snapshot(dir: string): Record<string, string> {
     try { names = readdirSync(d) } catch { return }
     for (const name of names.sort()) {
       if (name.startsWith('.') || n >= SCAN_MAX) continue
+      if (skip && depth === 0 && name === skip) continue                // a #dev item's clone: its branch is the answer, not its files
       const p = join(d, name)
       let st
       try { st = lstatSync(p) } catch { continue }
@@ -329,8 +362,8 @@ export function snapshot(dir: string): Record<string, string> {
   return out
 }
 /** the files this run made or changed (not last-<n>.txt), oldest first */
-export function madeBy(dir: string, before: Record<string, string>): string[] {
-  const now = snapshot(dir)
+export function madeBy(dir: string, before: Record<string, string>, skip?: string): string[] {
+  const now = snapshot(dir, skip)
   const changed = Object.keys(now).filter(k => before[k] !== now[k] && !/^last-\d+\.txt$/.test(k))
   return changed.sort((a, b) => Number(now[a]!.split(':')[1]) - Number(now[b]!.split(':')[1]) || a.localeCompare(b))
 }
@@ -652,10 +685,12 @@ export class CodexRunner {
       j.dir = conv.dir
       mkdirSync(join(conv.dir, '.codex-runner'), { recursive: true, mode: 0o700 })
       await this.fetchAttachments(j)
+      const ask = devAsk(j.text)
+      if (ask) this.prepareDev(j, ask)                              // the clone and its branch, before Codex starts (it never pushes)
       conv.runs++
       j.n = conv.runs
       j.resumed = conv.session_id
-      j.before = snapshot(conv.dir)
+      j.before = snapshot(conv.dir, j.dev ? 'repo' : undefined)
       j.started_at = this.iso()
       if (this.stopped) return                                      // stopping: still 'starting' on disk, queued again at the next start
       const notReady = codexHomeReady(this.cfg)                     // Codex's own home missing: this item fails with the note, never runs elsewhere
@@ -673,6 +708,59 @@ export class CodexRunner {
       void this.report(j)
     }
   }
+  /** a #dev item (Chiron mesh 13257): the runner clones the repo into the item's folder (./repo, `git clone --reference` the local copy, so the
+   *  local copy is only read) and checks out its branch (codex/call-<id> unless branch= names one; an existing branch on origin goes on from
+   *  there). A follow-up in the same session reuses the clone. Throws with the reason when it cannot (the item then fails, saying so). */
+  private prepareDev(j: Job, ask: { repo: string; branch: string | null }): void {
+    const local = ask.repo.startsWith('/') ? ask.repo : this.cfg.devRepos[ask.repo]
+    if (!local) throw new Error(`#dev repo=${ask.repo}：不認得這個名字（可用 ${Object.keys(this.cfg.devRepos).join('、')}，或本機 git repo 的絕對路徑）`)
+    const git = (args: string[], cwd?: string): string => {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 300_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })
+      if (r.status !== 0) throw new Error(`git ${args.slice(0, 2).join(' ')}：${(r.stderr || r.error?.message || '').trim().slice(0, 300)}`)
+      return (r.stdout ?? '').trim()
+    }
+    try { git(['rev-parse', '--git-dir'], local) } catch { throw new Error(`#dev repo=${ask.repo}：${local} 不是本機的 git repo`) }
+    let origin = ''
+    try { origin = git(['remote', 'get-url', 'origin'], local) } catch { origin = local }
+    const clone = join(j.dir!, 'repo')
+    const branch = ask.branch || `codex/${folderOf(j.call_id ? `call-${j.call_id}` : j.id)}`
+    if (!existsSync(join(clone, '.git'))) git(['clone', '--quiet', '--reference', local, origin, clone])
+    else git(['fetch', '--quiet', 'origin'], clone)
+    let base = ''
+    try { base = git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], clone) } catch { base = 'origin/main' }
+    const onOrigin = (() => { try { git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], clone); return true } catch { return false } })()
+    const here = (() => { try { git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], clone); return true } catch { return false } })()
+    if (here) git(['checkout', '--quiet', branch], clone)
+    else git(['checkout', '--quiet', '-b', branch, onOrigin ? `origin/${branch}` : base], clone)
+    j.dev = { repo: ask.repo, local, clone, branch, base: onOrigin ? `origin/${branch}` : base, origin }
+    this.log('info', `${j.id}: #dev ${ask.repo}: clone ${clone} on ${branch} (from ${j.dev.base})`)
+  }
+  /** after a #dev run: push its branch to origin (that branch only, never main, never forced). The result says where it went or why not. */
+  private pushDev(j: Job): void {
+    const d = j.dev!
+    const run = (args: string[]): { ok: boolean; out: string } => {
+      const r = spawnSync('git', args, { cwd: d.clone, encoding: 'utf8', timeout: 180_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } })
+      return { ok: r.status === 0, out: ((r.status === 0 ? r.stdout : r.stderr || r.error?.message) ?? '').trim() }
+    }
+    const log = run(['log', '--format=%h %s', `${d.base}..HEAD`])
+    d.commits = log.ok && log.out ? log.out.split('\n').slice(0, 50) : []
+    if (!d.commits.length) { d.push_error = '這個分支沒有新的 commit'; return }
+    if (/^(main|master)$/.test(d.branch)) { d.push_error = `不推 ${d.branch}`; return }
+    const p = run(['push', '--quiet', 'origin', `HEAD:refs/heads/${d.branch}`])
+    const head = run(['rev-parse', '--short', 'HEAD']).out
+    if (p.ok) d.pushed = `${d.branch} @ ${head}`
+    else d.push_error = p.out.slice(0, 300) || 'git push 失敗'
+    this.log(p.ok ? 'info' : 'warn', `${j.id}: #dev push ${d.branch}: ${p.ok ? `ok ${head}` : d.push_error}`)
+  }
+  /** the lines a #dev item's answer always carries (kept whole when the answer is cut) */
+  private devLine(j: Job): string {
+    const d = j.dev
+    if (!d) return ''
+    const where = d.pushed ? `推上去了：${d.origin} ${d.pushed}` : `沒有推：${d.push_error ?? '還沒跑完'}（clone 留著）`
+    return `\n\n**開發任務**\n- clone：${d.clone}\n- 分支：${d.branch}（從 ${d.base} 開）\n- ${where}` +
+      (d.commits?.length ? `\n- commit：${d.commits.length} 個（${cut(d.commits.slice(0, 5).join('；'), 400)}）` : '')
+  }
+
   /** the job's session (state.sessions: t:<thread>, say:<chat>, conv:<conversation id>), made at its first item: the folder
    *  ~/onsen-codex/<Onsen conversation id>/<sub>, sub = the item's thread, or call-<id> for a session a Call with no thread started, or dm for a
    *  person's conversation (Joey's DM); the conversation id asked once (a person_message carries it) */
@@ -730,9 +818,22 @@ export class CodexRunner {
     const imgs = (j.images ?? []).flatMap(p => ['-i', p])
     // a person's message may have no text (a photo with no caption); one with neither text nor attachments says its kind
     const head = j.text.trim() || (j.source === 'person' && !j.attachments.length ? `（一則沒有文字的 ${j.kind ?? 'text'} 訊息）` : '（只有附件）')
-    const text = [head, ...(j.context?.length ? ['', ...j.context] : []), ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
-    const model = [...(this.cfg.model ? ['-m', this.cfg.model] : []), ...(this.cfg.effort ? ['-c', `model_reasoning_effort="${this.cfg.effort}"`] : [])]
+    const brief = j.dev ? [this.devBrief(j), ''] : []
+    const text = [...brief, head, ...(j.context?.length ? ['', ...j.context] : []), ...(j.notes?.length ? ['', ...j.notes.map(n => `（${n}）`)] : [])].join('\n')
+    const model = [...(this.cfg.model ? ['-m', this.cfg.model] : []), ...(this.cfg.effort ? ['-c', `model_reasoning_effort="${this.cfg.effort}"`] : []),
+      ...(j.dev ? ['-c', 'sandbox_workspace_write.network_access=true'] : [])]   // #dev: 127.0.0.1 and the throwaway PG (it opens the internet too)
     return ['exec', '--skip-git-repo-check', '-s', this.cfg.sandbox, '-C', j.dir!, ...model, ...(j.resumed ? ['resume', j.resumed] : []), ...out, ...imgs, '--', text]
+  }
+  /** the fixed opening of every #dev item (Chiron mesh 13257) */
+  devBrief(j: Job): string {
+    const d = j.dev!
+    const db = `codex_${folderOf(j.call_id ? `call_${j.call_id}` : j.id).replace(/-/g, '_')}`.toLowerCase()
+    return [`開發任務（codex-runner 已經準備好：./repo 是 ${d.repo} 的 clone，分支 ${d.branch}，從 ${d.base} 開）。規矩：`,
+      '- 只在 ./repo 裡改，小步 commit；不要 push、不要切到 main（做完 runner 會把這個分支推上去）。',
+      '- 不開任何憑證檔：.env、*.credential、auth.json、.secrets、mesh-credential。',
+      `- 網路只用在本機的測試：127.0.0.1；要資料庫用拋棄式 PostgreSQL ${this.cfg.devPg}，用你自己的 db 名（例如 ${db}）。`,
+      '- 不對任何人或任何線上服務送東西。',
+      '- 最後的回覆要有：commit 清單；在這個環境跑過的測試與數字；跑不了的（和原因）；要負責人定的問題。「跑過的」和「跑不了的」分開寫。'].join('\n')
   }
   /** the child's environment: the runner's, without its own settings (CODEX_RUNNER_*, ONSEN_*), with Codex's own home and HOME */
   childEnv(): NodeJS.ProcessEnv {
@@ -758,12 +859,13 @@ export class CodexRunner {
     child.on('exit', (code, signal) => this.exited(j, code, signal))
     this.armTimeout(j)
   }
+  private limit(j: Job): number { return j.dev ? this.cfg.devTimeoutMs : this.cfg.timeoutMs }
   private armTimeout(j: Job): void {
-    const left = Date.parse(j.started_at!) + this.cfg.timeoutMs - this.now()
+    const left = Date.parse(j.started_at!) + this.limit(j) - this.now()
     this.later(left, () => {
       if (j.state !== 'running' || !j.pid) return
       j.timed_out = true
-      this.log('warn', `${j.id}: ${Math.round(this.cfg.timeoutMs / 1000)} s without finishing: SIGTERM to its process group, SIGKILL in ${this.cfg.killGraceMs / 1000} s`)
+      this.log('warn', `${j.id}: ${Math.round(this.limit(j) / 1000)} s without finishing: SIGTERM to its process group, SIGKILL in ${this.cfg.killGraceMs / 1000} s`)
       this.save()
       killGroup(j.pid, 'SIGTERM')
       this.later(this.cfg.killGraceMs, () => { if (j.pid) killGroup(j.pid, 'SIGKILL') })   // the whole group: what codex started dies with it
@@ -783,12 +885,26 @@ export class CodexRunner {
     if (ev.session && conv && !conv.session_id) conv.session_id = ev.session
     let last = ''
     try { last = readFileSync(join(j.dir!, `last-${j.n}.txt`), 'utf8').trim() } catch {}
+    // #dev (Chiron mesh 13257): the first time its limit stops it, it goes on once in the same session instead of failing
+    if (j.timed_out && j.dev && !j.dev.continued && !j.why && conv) {
+      j.dev.continued = true
+      j.timed_out = false
+      conv.runs++
+      j.n = conv.runs
+      j.resumed = ev.session ?? conv.session_id
+      j.text = `時間到了（${dur(this.limit(j))}），你被停下來了。請在同一個分支接著把剩下的做完，做完照原本的格式回覆（commit 清單、跑過的、跑不了的、要負責人定的）。`
+      j.started_at = this.iso()
+      this.log('info', `${j.id}: #dev stopped at its limit: going on once in the same session (run ${j.n})`)
+      this.changed()
+      this.spawnRun(j)
+      return
+    }
     const adopted = code === null && signal === null && !j.why
     const ok = !j.timed_out && !j.why && (adopted ? ev.completed && !!last : code === 0)
     if (ok) {
       j.outcome = 'completed'
       j.result_text = last || '（Codex 沒有留下最後一則訊息）'
-      const made = madeBy(j.dir!, j.before ?? {})
+      const made = madeBy(j.dir!, j.before ?? {}, j.dev ? 'repo' : undefined)
       const big: string[] = [], over: string[] = []
       const files: string[] = []
       for (const rel of made.slice().reverse()) {            // the newest first when more than the limit were made
@@ -808,7 +924,7 @@ export class CodexRunner {
       j.outcome = 'failed'
       let stderr = ''
       try { stderr = readFileSync(join(meta, `run-${j.n}.stderr`), 'utf8') } catch {}
-      const why = j.why ?? (j.timed_out ? `超過 ${dur(this.cfg.timeoutMs)}沒結束，已停止`
+      const why = j.why ?? (j.timed_out ? `超過 ${dur(this.limit(j))}沒結束，已停止`
         : adopted ? 'codex-runner 重新啟動時，這一件的 codex 程序已經不在，事件裡也沒有完成的紀錄'
           : signal ? `codex 被 ${signal} 結束` : `codex 結束碼 ${code}`)
       const t = tail(stderr.trim(), 30, 3000)
@@ -817,6 +933,7 @@ export class CodexRunner {
       j.files = []; j.skipped_files = []
     }
     j.state = 'finishing'
+    if (j.dev) this.pushDev(j)                                   // whatever it committed goes up, also when the run failed
     this.log('info', `${j.id}: codex ended (${code !== null ? `exit ${code}` : signal ?? 'gone'}${j.timed_out ? ', timed out' : ''}): ${j.outcome}${j.files?.length ? `, ${j.files.length} file(s)` : ''}`)
     this.changed()
     void this.report(j)
@@ -898,7 +1015,7 @@ export class CodexRunner {
   /** the result body: the answer cut to fit, a note that the whole answer is attached when it is, then the files left out and the thread line;
    *  never longer than max (Onsen refuses a longer one with 400) */
   private resultBody(j: Job, max: number): string {
-    const extras = this.skippedList(j, Math.min(800, Math.floor(max / 4))) + this.threadLine(j)
+    const extras = this.skippedList(j, Math.min(800, Math.floor(max / 4))) + this.devLine(j) + this.threadLine(j)
     const text = j.result_text ?? ''
     const whole = (j.files ?? []).includes(`last-${j.n}.txt`)
     if (text.length + extras.length <= max) return text + extras
@@ -969,7 +1086,7 @@ export class CodexRunner {
   /** the answer to a peer's Call or follow-up, in its inbox (it reaches the caller as every Call's answer does), carrying the session's thread */
   private async reply(j: Job, ids: string[], files: string[]): Promise<'ok' | 'retry'> {
     const list = files.length ? `\n\n附件（Onsen 的檔，用你的憑證取；Mac mini 上的路徑在後）：\n${files.map((rel, i) => `- ${basename(rel)}：${join(j.dir!, rel)}\n  ${this.cfg.base}/v1/files/${ids[i]}`).join('\n')}` : ''
-    const more = this.skippedList(j, 800) + this.threadLine(j)
+    const more = this.skippedList(j, 800) + this.devLine(j) + this.threadLine(j)
     const note = j.call_id ? '\n\n（全文在 Onsen 這一通呼叫的結果）' : `\n\n（全文在 Mac mini 的 ${join(j.dir ?? '', `last-${j.n}.txt`)}）`
     let text = (j.result_text ?? '') + list + more
     if (text.length > SEND_TEXT_MAX) text = cut(j.result_text ?? '', Math.max(200, SEND_TEXT_MAX - list.length - more.length - note.length - 1)) + note + list + more
@@ -992,7 +1109,7 @@ export class CodexRunner {
   }
   /** the answer's text in a conversation: the last message, and the files that did not go along */
   private answerBody(j: Job): string {
-    const more = this.skippedList(j, 800)
+    const more = this.skippedList(j, 800) + this.devLine(j)
     return cut(cut(j.result_text ?? '', SAY_MAX - more.length) + more, SAY_MAX)
   }
   /** the answer to a person's message (person_message): written new-style into its conversation (Onsen 0.35.0, CONTRACT §7d 連接器這一頭):

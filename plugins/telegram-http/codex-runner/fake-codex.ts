@@ -8,7 +8,7 @@
 //   HANGHARD     never end, SIGTERM ignored (only SIGKILL ends it)  NOLAST       no -o file
 //   KID          leave a `sleep 30` behind in its process group and end (its pid in the log)
 // FAKE_CODEX_LIVE: a folder holding one file per running fake (the test counts them).
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { appendFileSync, fstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -55,6 +55,13 @@ async function main(): Promise<void> {
   }
   for (const m of text.matchAll(/IMG:([\w.-]+)/g)) writeFileSync(join(dir, m[1]!), PNG)
   for (const m of text.matchAll(/BIG:([\w.-]+)/g)) writeFileSync(join(dir, m[1]!), Buffer.alloc(Number(process.env.FAKE_CODEX_BIG ?? 2048), 7))
+  // COMMIT:<file>  write <file> in ./repo and commit it there (a #dev item's clone)
+  for (const m of text.matchAll(/COMMIT:([\w.-]+)/g)) {
+    const repo = join(dir, 'repo')
+    writeFileSync(join(repo, m[1]!), `made by fake codex ${m[1]}\n`)
+    spawnSync('git', ['add', m[1]!], { cwd: repo })
+    spawnSync('git', ['-c', 'user.name=fake', '-c', 'user.email=fake@example.com', 'commit', '-q', '-m', `add ${m[1]}`], { cwd: repo })
+  }
   const many = /MANY:(\d+)/.exec(text)
   if (many) for (let i = 1; i <= Number(many[1]); i++) writeFileSync(join(dir, `f${String(i).padStart(2, '0')}.txt`), `file ${i}`)
   const answer = `answer to: ${text.split('\n')[0]} | session=${session} | resumed=${resume ? 'yes' : 'no'} | images=${images.length}`

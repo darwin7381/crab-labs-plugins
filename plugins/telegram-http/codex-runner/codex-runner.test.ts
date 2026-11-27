@@ -174,6 +174,80 @@ async function until(cond: () => boolean, ms = 10_000, what = 'condition'): Prom
 }
 const done = (o: FakeOnsen, id: string) => () => ['completed', 'failed'].includes(o.calls.get(id)?.state ?? '')
 
+describe('#dev items (Chiron mesh 13257)', () => {
+  const g = (cwd: string, ...args: string[]): string => {
+    const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd, encoding: 'utf8' })
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`)
+    return (r.stdout ?? '').trim()
+  }
+  const repos = (): { local: string; bare: string } => {
+    const d = mkdtempSync(join(tmpdir(), 'codex-dev-'))
+    tmps.push(d)
+    const bare = join(d, 'origin.git'), local = join(d, 'local')
+    g(d, 'init', '-q', '--bare', '-b', 'main', bare)
+    g(d, 'clone', '-q', bare, local)
+    writeFileSync(join(local, 'README.md'), 'hi\n')
+    g(local, 'add', 'README.md'); g(local, 'commit', '-q', '-m', 'first'); g(local, 'push', '-q', 'origin', 'HEAD:main')
+    g(local, 'remote', 'set-head', 'origin', 'main')
+    return { local, bare }
+  }
+  test('the runner clones, branches, opens the sandbox to 127.0.0.1, gives the brief; Codex commits; the runner pushes that branch', async () => {
+    const { local, bare } = repos()
+    const { onsen, cfg, codexLog, log } = setup()
+    onsen.call('9960', 'chiron', 9960)
+    onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${local}\n加一個檔 COMMIT:hello.txt`, msg_id: 9960 }, dedupe: 'msg:9960', call_id: '9960' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '9960')() && onsen.sends.length === 1, 20_000, 'Call 9960 and its reply')
+    expect(onsen.calls.get('9960')!.state).toBe('completed')
+    const start = codexLog().find(x => x.ev === 'start')!
+    expect((start.argv as string[]).join(' ')).toContain('-c sandbox_workspace_write.network_access=true')
+    expect(start.text).toContain('開發任務（codex-runner 已經準備好：./repo')
+    expect(start.text).toContain('不開任何憑證檔')
+    expect(start.text).toContain('postgresql://postgres@127.0.0.1:55432')
+    const clone = join(start.dir, 'repo')
+    expect(g(clone, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('codex/call-9960')
+    expect(g(bare, 'ls-tree', '--name-only', 'codex/call-9960')).toContain('hello.txt')     // pushed: that branch only
+    expect(g(bare, 'ls-tree', '--name-only', 'main')).not.toContain('hello.txt')
+    const t = onsen.puts.at(-1)!.result.body.text as string
+    expect(t).toContain('**開發任務**')
+    expect(t).toContain('分支：codex/call-9960')
+    expect(t).toContain('推上去了')
+    expect(t).toContain('add hello.txt')
+    expect(onsen.puts.at(-1)!.result.attachment_file_ids ?? []).toHaveLength(0)            // the clone's files are not attached
+    expect(log.some(l => /#dev push codex\/call-9960: ok/.test(l))).toBe(true)
+  }, 40_000)
+  test('branch= is used; a repo nobody knows fails the item with the reason', async () => {
+    const { local, bare } = repos()
+    const { onsen, cfg } = setup()
+    onsen.call('9961', 'chiron', 9961)
+    onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${local} branch=feat/x\nCOMMIT:a.txt`, msg_id: 9961 }, dedupe: 'msg:9961', call_id: '9961' })
+    onsen.call('9962', 'chiron', 9962)
+    onsen.push({ sender: 'chiron', payload: { text: '#dev repo=nosuchrepo\n做事', msg_id: 9962 }, dedupe: 'msg:9962', call_id: '9962' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '9961')() && done(onsen, '9962')(), 20_000, 'both')
+    expect(g(bare, 'ls-tree', '--name-only', 'feat/x')).toContain('a.txt')
+    expect(onsen.calls.get('9962')!.state).toBe('failed')
+    expect(onsen.puts.find(p => p.call === '9962' && p.state === 'failed')!.result.body.text).toContain('不認得這個名字')
+  }, 40_000)
+  test('stopped at its limit: it goes on once in the same session instead of failing', async () => {
+    const { local } = repos()
+    const { onsen, cfg, codexLog, log } = setup({ devTimeoutMs: 1200 })
+    onsen.call('9963', 'chiron', 9963)
+    onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${local}\n慢慢做 SLEEP:4`, msg_id: 9963 }, dedupe: 'msg:9963', call_id: '9963' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '9963')(), 30_000, 'Call 9963')
+    expect(onsen.calls.get('9963')!.state).toBe('completed')
+    const starts = codexLog().filter(x => x.ev === 'start')
+    expect(starts.length).toBe(2)
+    expect(starts[1].resume).toBeTruthy()
+    expect(starts[1].text).toContain('時間到了')
+    expect(log.some(l => /going on once in the same session/.test(l))).toBe(true)
+  }, 40_000)
+})
+
 describe('the model is the runner\'s own (Chiron mesh 13227)', () => {
   test('CODEX_RUNNER_MODEL / _EFFORT: every run gets -m and the effort; --setup writes them, never the personal config\'s model', async () => {
     const env = { HOME: '/tmp/x', CODEX_RUNNER_MODEL: 'gpt-6.2-astra', CODEX_RUNNER_EFFORT: 'high' }
