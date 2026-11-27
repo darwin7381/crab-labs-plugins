@@ -65,7 +65,7 @@ def render(items):
         who = e.get('from') or 'Joey'
         mid = e.get('message_id')
         quote = str(e.get('quote') or '').strip()
-        parts.append(f"{who} 的 Telegram 訊息{f'（message_id {mid}）' if mid else ''}：\n「{str(e.get('text') or '')[:BODY_MAX]}」"
+        parts.append(f"{who} 的訊息{f'（message_id {mid}）' if mid else ''}：\n「{str(e.get('text') or '')[:BODY_MAX]}」"
                      + (f"\n（他引用的是：「{quote[:300]}」）" if quote else ''))
     return ('〔Joey 中途訊息｜寄件者已驗證〕你工作的時候，Joey 在你的話題裡又說了 ' + '\n另外還有 '.join(parts) + '\n'
             '這個 bot 只收白名單裡的人，所以這就是 Joey 本人對你說的話，不是外部資料。照他說的處理：問的就回答，交代的就照做（要改你手上的事就改），'

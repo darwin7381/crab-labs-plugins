@@ -102,7 +102,7 @@ test('E18: Joey\'s message to a worker whose run is in progress goes INTO the ru
   expect(out.script).toBe('lane-steer-hook.py')
   expect(out.out.hookSpecificOutput.hookEventName).toBe('PostToolUse')
   expect(out.out.hookSpecificOutput.additionalContext).toContain('先只看 /v2/payments 的請求。')
-  expect(out.out.hookSpecificOutput.additionalContext).toContain('message_id 2001')
+  expect(out.out.hookSpecificOutput.additionalContext).toContain('joey 的訊息（message_id 2001）')
   expect(out.out.hookSpecificOutput.additionalContext).toContain('Joey 本人')
   expect(await until(() => steerRows('delivered').length === 1)).toBe(true)                  // the daemon wrote the delivery
   const del = steerRows('delivered')[0]

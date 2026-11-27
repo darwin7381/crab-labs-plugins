@@ -82,7 +82,7 @@ test('a second message nobody answered is listed back to the model, once', async
   calls = []; mode = 'missed'
   const t = prompt('100', '開始做報告') + absorbed('101', '發票 4471 付了嗎？') + reply('報告做完了', '100')
   const r = await run(t)
-  expect(r.out.decision).toBe('block'); expect(r.out.reason).toContain('發票 4471 付了嗎'); expect(r.out.reason).toContain('101'); expect(r.out.reason).not.toContain('開始做報告')
+  expect(r.out.decision).toBe('block'); expect(r.out.reason).toContain('發票 4471 付了嗎'); expect(r.out.reason).toContain('joey_lab（訊息 101）'); expect(r.out.reason).not.toContain('開始做報告')
   expect(calls.length).toBe(1)
   expect(Object.keys(calls[0].questions).sort()).toEqual(['M1.answered', 'M1.deferred', 'M1.reply_needed'])   // only the message code could not settle
   expect(calls[0].state.messages).toEqual([{ id: 'M1', from: 'joey_lab', text: '發票 4471 付了嗎？' }])
