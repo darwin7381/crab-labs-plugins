@@ -254,12 +254,12 @@ export function createMain(E: MainEnv) {
     return { active, person: active && personCanProbe(last || null), clear, probe }
   }
   const accountFailure = (reason: unknown): boolean => typeof reason === 'string' && reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(reason.slice('stop_failure:'.length))
-  const heldByAccount = (r: Row): boolean => accountFailure(r.reason) || (heldCut(r) && accountFailure(r.cut_by))
+  const accountCut = (r: Row): boolean => heldCut(r) && accountFailure(r.cut_by)
   /** An item already refused or interrupted by this wall waits for the clear. */
   function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
     if (!wall.active) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
-    const refused = heldByAccount(r)
+    const refused = accountFailure(r.reason) || accountCut(r)
     return wall.person && r.kind === 'joey' && !refused
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
@@ -439,8 +439,12 @@ export function createMain(E: MainEnv) {
     const accountClear = probe && (wall.clear ?? 0) > Number(g.uw_clear_used ?? 0) && ACCOUNT_WALL.has(g.kind)
     const episode = g.wall_since
     const resume = accountClear && episode && g.resume_sent !== episode && Number.isFinite(g.wall_refused_at)
+    // A person's successful turn can end M2's episode while an earlier cut still waits in M1.
+    // The keeper timestamps clears to whole seconds, as in statusChanged.
+    const releasedCut = (r: Row) => wall.clear != null && accountFailure(r.cut_by)
+      && wall.clear >= Math.floor(Date.parse(r.cut_at ?? r.ts) / 1000) * 1000
     const candidates = () => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !batchedRider(r) && !waitsRetry(r) && eligible(r)
-      && (!heldCut(r) || (accountClear && accountFailure(r.cut_by))))
+      && (!heldCut(r) || releasedCut(r)))
     const cands = candidates()
     if (!cands.length && !resume) return
     const mp = cands.length && !(wall.active && !probe) ? mentionsNow() : null
@@ -461,8 +465,8 @@ export function createMain(E: MainEnv) {
     // Work can arrive while the probe is driving the menu. It takes precedence over a bare resume.
     for (const it of accountClear ? candidates() : cands) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
-      // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
-      let riders = items(r => r.id !== it.id && r.state === 'queued' && (heldCut(r) || r.reason === 'batched' || (accountClear && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
+      // Interrupted and batched items ride the lead, along with every refusal released by this clear.
+      let riders = items(r => r.id !== it.id && r.state === 'queued' && (heldCut(r) || r.reason === 'batched' || (wall.clear != null && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))
       const checkedGroup = checked([it, ...riders], g, wall.clear)
       if (checkedGroup instanceof Promise) {
         const group = await checkedGroup
@@ -497,8 +501,8 @@ export function createMain(E: MainEnv) {
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
       for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null, person_wall_offer: wall.active && !probe || null })
       mentionsReached(dg)                                                                     // WO-181: in its session now: the mentions it carried are read
-      J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) of an interrupted turn riding` : ''}` })
-      for (const r of riders) J().write('wake', r.id, 'wake', { reason: r.reason === 'batched' ? `batched: rides the offer of ${it.id} (gen ${g.id})` : `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
+      J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) riding` : ''}` })
+      for (const r of riders) J().write('wake', r.id, 'wake', { reason: `${r.reason}: rides the offer of ${it.id} (gen ${g.id})` })
       try { E.woke?.(J().get('msg', it.id)!, { gen: g.id, probe }) } catch (e) { E.log('warn', `lanes: woke hook: ${e}`) }
       delivered()
       return
@@ -506,11 +510,11 @@ export function createMain(E: MainEnv) {
     // A final Call has been closed by checked(). A disconnected stream or an unverified Call is still owed.
     if (resume && !candidates().length && stillReady()) {
       const content = `額度通了，上一回合 ${hhmmTaipei(g.wall_refused_at)}（台北）被用量上限打斷，接著做沒做完的；沒有要接的就直接結束這一回合。`
-      const notif = { method: 'notifications/claude/channel', params: { content, meta: { user: 'lanes', via: 'lanes', no_reply: 'true' } } }
+      const notif = { method: 'notifications/claude/channel', params: { content, meta: { chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' } } }
       const sent = await E.offer(notif, 'tg', Number(g.pid)).catch(e => { E.log('warn', `lanes: resume probe failed: ${e}`); return false })
       // A hook may already have opened the turn or refused it again during the write. Keep its M2 phase and backoff.
       const now = currentGen()
-      if (sent && now?.wall_since === episode) {
+      if (sent && now && now.wall_since === episode) {
         if (now === g && now.version === version) advanceProbe(now, { resume_sent: episode })
         else J().write('main', now.id, now.state, { resume_sent: episode })
       }
