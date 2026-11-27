@@ -1,3 +1,9 @@
+## 1.59.4 — 2026-11-27 (WO-204 part 2)
+
+- At a keeper clear, M2 drives the limit menu and sends refused messages and partially answered account-cut messages together. Each cut message carries its interruption line.
+- When no candidate remains, the probe asks the main to continue the turn interrupted at the recorded Taipei time. M2 records the successful write once per wall episode.
+- Lanes-off delivery uses the normal stream and disk replay during a usage wall. The clear notice reports the clearance time and cause. Non-account cuts retain their ten-minute quiet period and M2 retains its timer probe when keeper state is stale.
+
 ## 1.59.2 — 2026-11-27 (WO-200, Chiron's spec v2 and Joey TG chiron:2860/2865: a person's message is the wall's measurement; programs wait; a refused message is reported blocked; a Call that ended while it waited is not given)
 - **A person's message reaches a usage-walled main** (lanes-main.ts `wallDelivery`, `wallAllows`; wake-decide.ts): an item of kind `joey` (Joey, another allowed person, a bridge guest `tg-<id>`: all arrive as `joey`) is given to a walled main as to an idle one — it is the best probe of the wall (same session, account, model). Only exception: this session's own last refusal (`last_transcript_wall` / `last_wall_at`, `usage-wall.ts` `personCanProbe`) is under 60 s old → it waits until 60 s passed or the wall cleared. Programs' items (scheduler, alerts, peers' mail and calls, lane hand-overs) wait for the clear as before.
 - **M2's own walled probe**: with a fresh usage-wall state (the keeper is alive) its timer offers nothing — the keeper decides the clear; with no fresh state it keeps today's probe and backoff (the WO-120 fallback). The lanes-off path (WO-120 parking in `broadcastNotification`) is unchanged.
