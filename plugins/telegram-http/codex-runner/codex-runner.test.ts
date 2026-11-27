@@ -248,6 +248,23 @@ describe('#dev items (Chiron mesh 13257)', () => {
     expect(codexLog().find(x => x.ev === 'start')!.text).toContain(`已經移到 ${aside}`)
     expect(onsen.puts.at(-1)!.result.body.text).toContain('從 origin/main 開')
   }, 40_000)
+  test('a shallow local copy (the live plugin checkout): cloned from origin without --reference, and it still works', async () => {
+    const { local, bare } = repos()
+    const d = mkdtempSync(join(tmpdir(), 'codex-shallow-'))
+    tmps.push(d)
+    const shallow = join(d, 'shallow')
+    g(d, 'clone', '-q', '--depth', '1', `file://${bare}`, shallow)
+    expect(g(shallow, 'rev-parse', '--is-shallow-repository')).toBe('true')
+    const { onsen, cfg } = setup()
+    onsen.call('9965', 'chiron', 9965)
+    onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${shallow}\nCOMMIT:c.txt`, msg_id: 9965 }, dedupe: 'msg:9965', call_id: '9965' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => done(onsen, '9965')(), 20_000, 'Call 9965')
+    expect(onsen.calls.get('9965')!.state).toBe('completed')
+    expect(g(bare, 'ls-tree', '--name-only', 'codex/call-9965')).toContain('c.txt')
+    void local
+  }, 40_000)
   test('stopped at its limit: it goes on once in the same session instead of failing', async () => {
     const { local } = repos()
     const { onsen, cfg, codexLog, log } = setup({ devTimeoutMs: 1200, killGraceMs: 300 })

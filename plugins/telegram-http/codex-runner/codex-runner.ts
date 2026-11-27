@@ -84,7 +84,7 @@ export function devRepos(v: string | undefined, home: string): Record<string, st
   const out: Record<string, string> = {
     'bt-control-center': join(home, 'bt-control-center'),
     'fleet-core': join(home, 'cc-workspaces', 'claude-epeius', 'repos', 'fleet-core'),
-    'crab-labs-plugins': join(home, '.claude', 'plugins', 'marketplaces', 'crab-labs-plugins'),
+    'crab-labs-plugins': join(home, 'cc-workspaces', 'claude-epeius', 'repos', 'crab-labs-plugins'),   // a full clone: the live checkout is shallow
     'Joey-Crablabs-Skills': join(home, 'Development', 'Joey-Crablabs-Skills'),
   }
   for (const part of (v ?? '').split(',')) {
@@ -734,7 +734,10 @@ export class CodexRunner {
       renameSync(clone, movedAside)
     }
     if (!existsSync(join(clone, '.git'))) {
-      git(['clone', '--quiet', '--reference', local, origin, clone])
+      // --reference only from a full repo: git refuses a shallow one (Sonn #200705: the live crab-labs-plugins checkout is shallow)
+      let shallow = false
+      try { shallow = git(['rev-parse', '--is-shallow-repository'], local) === 'true' } catch {}
+      git(['clone', '--quiet', ...(shallow || origin === local ? [] : ['--reference', local]), origin, clone])
       writeFileSync(mark, JSON.stringify({ origin, local, at: this.iso() }) + '\n', { mode: 0o600 })
     } else git(['fetch', '--quiet', 'origin'], clone)
     // the base: origin's own default branch (`ls-remote --symref`), not a symbolic ref a copied clone may carry
