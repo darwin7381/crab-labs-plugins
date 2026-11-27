@@ -28,7 +28,9 @@ plugins/telegram-http/.mcp.json::headersHelper
 plugins/discord-http/.mcp.json::headersHelper
 plugins/agent-inbox/.mcp.json::headersHelper
 plugins/telegram-http/server.ts::truncates MCP server instructions at 2048
-plugins/telegram-http/server.ts::- voice="true" / voice_transcript: a voice note. Onsen turned it into text when it arrived (speech-to-text, so a name or a term can be misheard); treat the text as what they said. The audio is attached (attachment_file_id): when a word that matters looks wrong, download it and work it out yourself. voice_error: no text could be made; the audio is still attached.
+plugins/telegram-http/server.ts::- voice="true": a voice note; Onsen transcribed it
+# WO-207 (Chiron #200873): a voice note's body is Onsen's text, not the placeholder; no second copy as voice_transcript
+plugins/telegram-http/server.ts::const voiceText = (p.voice === true || p.kind === 'voice')
 plugins/discord-http/server.ts::truncates MCP server instructions at 2048
 plugins/telegram-http/server.ts::X-Mesh-Fanout
 plugins/telegram-http/inbox-text.ts::owner role:mesh-security

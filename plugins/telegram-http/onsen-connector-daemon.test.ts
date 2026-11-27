@@ -208,6 +208,34 @@ test('12. attachment_name as the path before has it: a voice note, a video note 
   expect(api.calls).toEqual([]); expect(api.downloads).toEqual([])
 })
 
+test('12b. WO-207 (Chiron #200873): a voice note\'s body is Onsen\'s text, whole; the same words are not laid over the tag again as voice_transcript', async () => {
+  const base = { conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', reply_to: null, sent_at: new Date().toISOString() }
+  const url = `http://127.0.0.1:${onsen.port}/api/onsen/v1/files/`
+  const words = '請把 Onsen 的語音轉字接到 Codex 的 dev 任務。'.repeat(40)                    // 960 characters: longer than any 500 cut
+  const cl = (n: string, meta: Record<string, string>) => ({ name: 'telegram', chat: String(JOEY), msg_id: n, user: 'joey', user_id: String(JOEY), meta })
+  const att = (n: string) => [{ kind: 'voice', name: 'file_7.oga', mime: 'audio/ogg', bytes: 4, url: url + 'v' + n, client_ref: 'AwVoiceB' + n }]
+  const sent: Array<[string, Record<string, unknown>]> = [
+    // Onsen 0.39.0 onsen_person.py _voice_payload: no caption → text = its prefix line + the transcript; client.meta voice + voice_transcript
+    ['1091', { kind: 'voice', voice: true, text: `（語音訊息，以下是轉出的文字；原音檔在附件）\n${words}`, attachments: att('91'), client: cl('1091', { voice: 'true', voice_transcript: words }) }],
+    // a caption: the caption is the text; the transcript only in client.meta (kept: it is not in the body)
+    ['1092', { kind: 'voice', voice: true, text: '看一下這個', attachments: att('92'), client: cl('1092', { voice: 'true', voice_transcript: '短的一句' }) }],
+    // nothing transcribed, no caption: the placeholder, voice_error from client.meta
+    ['1093', { kind: 'voice', voice: true, text: '', attachments: att('93'), voice_error: '沒有轉成字（逾時）', client: cl('1093', { voice: 'true', voice_error: '沒有轉成字（逾時）' }) }],
+  ]
+  for (const [i, [n, p]] of sent.entries()) expect(await person({ ...base, ...p, message_id: String(6091 + i) }, 91 + i)).toBe(200)
+  expect(await until(() => sent.every(([n]) => got.some(g => g.meta.message_id === n)), 8000)).toBe(true)
+  const tag = (n: string) => got.find(g => g.meta.message_id === n)!
+  expect(tag('1091').content).toBe(`（語音訊息，以下是轉出的文字；原音檔在附件）\n${words}`)            // whole, no cut
+  expect('voice_transcript' in tag('1091').meta).toBe(false)                                  // one copy: the body
+  expect(tag('1091').meta.voice).toBe('true')
+  expect(tag('1091').meta.attachment_file_id).toBe('AwVoiceB91')
+  expect(tag('1092').content).toBe('看一下這個')
+  expect(tag('1092').meta.voice_transcript).toBe('短的一句')
+  expect(tag('1093').content).toBe('(voice message)')
+  expect(tag('1093').meta.voice_error).toBe('沒有轉成字（逾時）')
+  expect('voice_transcript' in tag('1093').meta).toBe(false)
+})
+
 test('13. rule A (Chiron 16:1xZ): client_meta.reply_to_user "awesometon5" over Onsen\'s reply_to.from "joey-test"; the routing and identity attributes (chat_id, message_id, ts, topic, user_id, source) never taken from it', async () => {
   expect(await person({ conversation_id: onsen.conv(String(JOEY)), from: 'joey', via: 'telegram', kind: 'text', attachments: [], message_id: '6031', text: '回你那則',
     sent_at: new Date().toISOString(), reply_to: { message_id: '6011', client_msg_id: '1011', from: 'joey-test', text: '帶 meta' },

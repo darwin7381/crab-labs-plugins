@@ -2497,13 +2497,13 @@ function buildServer(): Server {
         // WO-164 (Chiron 21:10Z): the one sentence on Onsen's text format; the whole of it is on the text fields (fleet-text.ts ONSEN_TEXT_FORMAT)
         'The sender reads Telegram, not this session: anything they should see must go through the reply tool (pass chat_id back). Use reply_to only to quote an earlier message, not for normal replies. ' + ONSEN_TEXT_DEFAULT,
         '',
-        'Incoming <channel source="telegram" chat_id message_id user ts>:',
-        '- Read image_path. On image_error, report the failure and retry download_attachment(attachment_file_id) before describing the photo.',
-        '- attachment_file_id: download_attachment, then Read its path.',
-        '- reply_to_text/reply_to_user/reply_to_message_id identify the parent. attachment_origin="reply" marks its file. reply_quote is the quoted passage.',
-        '- forward_origin/forward_from/forward_date describe the original sender.',
-        '- Album = ONE message with media_group_count items. Read image_path/image_path_2/… and download EACH numbered attachment_file_id/attachment_name. With media_group_id but no count, warn it may be incomplete.',
-        '- voice="true" / voice_transcript: a voice note. Onsen turned it into text when it arrived (speech-to-text, so a name or a term can be misheard); treat the text as what they said. The audio is attached (attachment_file_id): when a word that matters looks wrong, download it and work it out yourself. voice_error: no text could be made; the audio is still attached.',
+        'Messages arrive as <channel source="telegram" chat_id message_id user ts>. Attributes:',
+        '- image_path: Read it (a photo they sent). image_error: the photo did NOT come through; say so explicitly, never answer as if you saw it; retry with download_attachment(attachment_file_id).',
+        '- attachment_file_id: call download_attachment, then Read the returned path.',
+        '- reply_to_text/reply_to_user/reply_to_message_id: the message being replied to (attachment_origin="reply": the attachment came from it). reply_quote: the passage they quoted.',
+        '- forward_origin/forward_from/forward_date: the ORIGINAL author; the outer user only forwarded it.',
+        '- Album = ONE message: media_group_count items, photos as image_path/image_path_2/…, documents as numbered attachment_file_id/attachment_name (download EACH). media_group_id without media_group_count: possibly INCOMPLETE; say so.',
+        '- voice="true": a voice note; Onsen transcribed it (names may be misheard): treat the text as what they said; if a key word looks wrong, check the attached audio. voice_error: no text made.',
         // lanes-topics (item 2): lanes on only
         ...(Lanes.LANES_ON ? ['- topic/topic_name: written in that topic; a reply to it lands there. reply(topic=…) picks one, "0" = outside.'] : []),
         '',
@@ -4661,7 +4661,12 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
     }
     const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
-    f = { ...f, onsenId: String(p.message_id), ...(cm ? { clientMeta: cm } : {}) }
+    // WO-207 (Chiron #200873, Joey TG chiron:2973): a voice note's body is Onsen's text as is (its transcript, whole, after Onsen's one prefix line; a
+    // caption when it had one), not the (voice message) placeholder; the same words are not laid over the tag again as client.meta voice_transcript.
+    // Onsen's text empty (voice_error, no caption): the placeholder, as before
+    const voiceText = (p.voice === true || p.kind === 'voice') && typeof p.text === 'string' && p.text.trim() ? p.text : null
+    if (voiceText && cm?.voice_transcript && voiceText.includes(cm.voice_transcript)) delete cm.voice_transcript
+    f = { ...f, onsenId: String(p.message_id), ...(voiceText ? { text: voiceText, voiceTranscript: undefined } : {}), ...(cm ? { clientMeta: cm } : {}) }
     // WO-197 (Chiron mesh 12852): an album item is answered 200 (the inbox acks it) before its album goes (up to TELEGRAM_ALBUM_CAP_MS): what rebuilds
     // its tag is kept on disk until then (the arrival's facts with client.meta; a connector's, rebuilt from the person_message, with where Onsen keeps
     // its files), so a daemon stopped meanwhile delivers it after its restart, once
@@ -4714,7 +4719,7 @@ function factsFromPayload(p: any, chat: string, ref: string, thread?: number): O
     ...(a && !photo && tg ? { attachment: { kind: voice ? 'voice' : sticker ? 'sticker' : String(a.kind || kind), file_id: tg, ...(size != null ? { size } : {}),
       ...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
     ...(a && !tg && a.url ? { onsenFiles: [a] } : {}),
-    fromReply: false, ...(voice && text ? { voiceTranscript: metaExcerpt(text, 500) } : {}),
+    fromReply: false,
     // WO-197 segment 2: a connector's lanes know the thread by Onsen's id (`thread`, the router's and the lanes' topic); the tag keeps the topic the
     // person's message carried (client.thread, clientTopic) and its name. Off the connector: the Telegram topic, as before
     ...(thread != null ? { inTopic: thread, ...(c.thread != null ? { clientTopic: String(c.thread) } : {}), ...(p.topic_name ? { topicName: String(p.topic_name) } : {}) }

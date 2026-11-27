@@ -33,7 +33,7 @@ and which messages belong to one album.
 | `attachment_kind` | `photo` (only on download failure) / `document` / `video` / `audio` / `voice` / `video_note` / `sticker` / `animation` |
 | `attachment_file_id` | pass to the `download_attachment` tool, then `Read` the returned path (bot downloads cap at 20MB) |
 | `attachment_size` / `attachment_mime` / `attachment_name` | as reported by Telegram (name is sanitized) |
-| `voice="true"` / `voice_transcript` / `voice_error` | Onsen transcribes the attached audio on arrival. Treat the text as what the sender said. If a name or term matters, use `attachment_file_id` to check the audio. On failure, `voice_error` gives the reason and the audio stays attached. A roamer polling Telegram directly can produce a local `voice_transcript` for voice or audio with `CHANNEL_BOT_VOICE_TRANSCRIBE=1`. |
+| `voice="true"` / `voice_error` | A voice note. Onsen transcribes the attached audio once on arrival (WO-207) and the message **body** is Onsen's text: its prefix line 「（語音訊息，以下是轉出的文字；原音檔在附件）」 and the whole transcript (1.59.6, Chiron #200873: no `(voice message)` placeholder, no second copy in `voice_transcript`). A voice note with a caption: the caption is the body and the transcript rides in `voice_transcript`. Treat the text as what the sender said; if a name or term matters, check the audio (`attachment_file_id`). `voice_error`: no text was made (the body is `(voice message)`), the audio stays attached. A roamer polling Telegram directly can still produce a local `voice_transcript` with `CHANNEL_BOT_VOICE_TRANSCRIBE=1`. |
 
 ### Reply context (message is a Telegram reply)
 
