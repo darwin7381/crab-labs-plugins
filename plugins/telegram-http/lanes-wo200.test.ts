@@ -28,7 +28,7 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
       return Response.json(id ? { data: { state: calls.get(id), thread_id: '9', conversation_id: '2', caller: 'scheduler' } }
         : path === '/deliveries/batch' ? { results: body.items.map(() => ({})) } : {})
     }) as typeof fetch })
-  if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid, retry_at: T + 3_600_000 })
+  if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid })
   const env: MainEnv = { journal, agent: 'adam', usageWall: () => wall, memberState: () => wall.walled ? 'walled' : 'idle',
     offer: async n => { const p = n.params as any; offers.push(p.meta.did?.split(',') ?? []); texts.push(p.content); return true },
     streamOpen: () => true, pidAlive: () => true, info: () => null, done: () => {}, undone: () => {},
@@ -108,7 +108,7 @@ test('WO-200 a human probe and a keeper clear each wake an overlapping offer pas
   }
 })
 
-test('WO-200 M2 timer offers nothing while keeper state is fresh', async () => {
+test('WO-200 a program item waits while the keeper reports a wall', async () => {
   const d = daemon()
   d.calls.set('9', 'accepted')
   d.add('peer', '9')
@@ -118,25 +118,25 @@ test('WO-200 M2 timer offers nothing while keeper state is fresh', async () => {
   expect(d.requests).toEqual([])
 })
 
-test('WO-200 M2 timer keeps the existing probe and backoff without fresh keeper state', async () => {
+test('WO-209 a walled gen without a keeper never spends a timed probe, even with a legacy deadline', async () => {
   const d = daemon()
   d.env.usageWall = () => null
+  // Replay an M2 record from 1.59.5 whose scheduled probe is now overdue.
+  d.journal.write('main', '123', 'walled', { retry_at: T + 3_600_000 })
   d.calls.set('9', 'accepted')
   const item = d.add('peer', '9')
+  let menuReads = 0
+  d.env.menu = async () => { menuReads++; return null }
   await d.flush()
+  setSystemTime(T + 86_400_000)
+  await d.main.tick(); await d.main.tick()
   expect(d.offers).toEqual([])
-  setSystemTime(T + 3_600_000)
-  const offer = d.env.offer
-  let attempts = 0
-  d.env.offer = async () => { attempts++; return false }
-  await d.main.tick(); await d.flush()
-  d.env.offer = offer
-  await d.main.tick(); await d.flush()
-  expect(attempts).toBe(1)
-  expect(d.offers).toEqual([])
-  setSystemTime(Number(d.main.currentGen()!.retry_at))
-  await d.main.tick(); await d.flush(); await d.main.tick()
-  expect(d.offers).toEqual([[item]])
+  expect(menuReads).toBe(0)
+  expect(d.requests).toEqual([])
+  expect(d.journal.get('msg', item)?.state).toBe('queued')
+  const person = d.add('joey', 'person')
+  await d.flush()
+  expect(d.offers).toEqual([[person]])
 })
 
 test('WO-200 a keeper clear in the same second releases a refused message', async () => {
@@ -149,6 +149,21 @@ test('WO-200 a keeper clear in the same second releases a refused message', asyn
   d.wall.clearedMs = T
   d.main.statusChanged(T)
   await d.flush()
+  expect(d.offers).toEqual([[item], [item]])
+})
+
+test('WO-209 a same-millisecond refusal still needs a newer keeper clear for another program offer', async () => {
+  const d = daemon()
+  d.calls.set('9', 'accepted')
+  const item = d.add('peer', '9')
+  d.clear(); await d.flush()
+  expect(d.offers).toEqual([[item]])
+  await d.hook('UserPromptSubmit', 'probe', { dids: [item] })
+  await d.hook('StopFailure', 'probe', { error: 'rate_limit' })
+  await d.main.tick()
+  expect(d.offers).toEqual([[item]])
+  setSystemTime(T + 1_000)
+  d.clear(); await d.flush()
   expect(d.offers).toEqual([[item], [item]])
 })
 

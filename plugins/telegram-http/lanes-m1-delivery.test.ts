@@ -52,7 +52,7 @@ async function joey(text: string): Promise<string> {
 const state = (id: string) => M().items(r => r.id === id)[0]?.state
 const P = () => `p-${++np}`
 
-test('002n, PL4: a turn that ends in StopFailure never makes its item done: back to queued, the gen walled (its own wall), nothing offered before its retry time; then offered once (the probe), done on Stop', async () => {
+test('002n, PL4: a turn that ends in StopFailure never makes its item done: back to queued, the gen walled (its own wall), queued until the keeper clears it, then offered once, done on Stop', async () => {
   const g = await startMain()
   const id = await joey('發票 4471 付了嗎？')
   expect(state(id)).toBe('offered'); expect(offers.at(-1)!.notif.params.meta.did).toContain(id)
@@ -65,11 +65,11 @@ test('002n, PL4: a turn that ends in StopFailure never makes its item done: back
   expect(M().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(false)              // PL4: the main's wall is its own record, not the lanes'
   const k = offers.length
   await M().pump(); await M().tick()
-  expect(offers.length).toBe(k)                                                          // a walled gen is offered nothing before its retry time
+  expect(offers.length).toBe(k)                                                          // the refused item waits for the clear
   await sleep(20)
   expect(sent.filter(s => s.includes('額度')).length).toBe(1)                            // Joey: one line for the wall
-  L.__journal().write('main', String(g.pid), 'walled', { retry_at: Date.now() - 1 })      // its retry time comes
-  await M().tick()
+  M().statusChanged(Date.now())
+  await sleep(0)
   expect(offers.length).toBe(k + 1); expect(offers.at(-1)!.notif.params.meta.did).toContain(id)    // offered again, once
   const p2 = P()
   await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] })

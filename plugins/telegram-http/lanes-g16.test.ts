@@ -53,7 +53,7 @@ const apiErr = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), isAp
 const turnEnd = (ms: number) => rec({ type: 'system', subtype: 'turn_duration', timestamp: iso(ms) })
 const genuine = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'end_turn', content: [{ type: 'text', text: '好' }] } })
 const toolUse = (ms: number) => rec({ type: 'assistant', timestamp: iso(ms), message: { model: 'claude-haiku-5-5', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'tuX', name: 'Bash', input: { command: 'make report' } }] } })
-/** PL4: the main's turn ends in StopFailure rate_limit (ITS wall: the lanes' wall is another record); at its retry time the probe offer comes, and a menu
+/** PL4: the main's turn ends in StopFailure rate_limit (ITS wall: the lanes' wall is another record); the keeper's clear enables an offer, and a menu
  *  on its pane is dealt with BEFORE that offer; the main takes the offer and its Stop ends the episode. Returns what Joey was told meanwhile. */
 let cyc = 0
 async function wallCycle(): Promise<string> {
@@ -66,6 +66,7 @@ async function wallCycle(): Promise<string> {
   await L.__mainEvent({ event: 'StopFailure', pid, prompt_id: p, error: 'rate_limit', reason: LIMIT })
   expect(L.__main().mainPhase()).toBe('walled'); expect(L.wallActive()).toBe(false)                // its own wall, not the lanes'
   state.drives = []; state.rearms = 0; order.length = 0
+  L.__main().statusChanged(Date.now())
   expect(await until(() => { void L.__main().tick(); return L.__main().items(r => r.id === item.id)[0].state === 'offered' })).toBe(true)   // the probe offer
   const p2 = `p-${Math.random().toString(36).slice(2)}`
   await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p2, dids: [item.id] }); await L.__mainEvent({ event: 'Stop', pid, prompt_id: p2, phase: 'final' })
@@ -212,7 +213,7 @@ esac`)
       expect(readFileSync(keys, 'utf8').trim().split('\n')).toEqual(['Up', 'Enter'])
       expect(readFileSync(screen, 'utf8')).toBe(NORMAL)
       expect(main.statusIdle(true, Date.now(), Date.now())).toBe(false)
-      expect(gen).toMatchObject({ state: 'walled', wall_since: episode, wall_refused_at: refusedAt, probes: 0 })
+      expect(gen).toMatchObject({ state: 'walled', wall_since: episode, wall_refused_at: refusedAt, uw_clear_used: wall.clearedMs })
       const lines = readFileSync(journal, 'utf8').slice(offset).trim().split('\n').map(l => JSON.parse(l))
       expect(lines.filter(l => l.wall_refused_at || l.ended_by === 'interrupted' || l.cut_by)).toEqual([])
       expect(lines.filter(l => l.rec === 'msg' && l.state === 'offered').map(l => l.id)).toEqual([id])

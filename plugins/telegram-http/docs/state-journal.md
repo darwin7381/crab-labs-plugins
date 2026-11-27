@@ -207,13 +207,13 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
    its answer to that peer is marked (002w B, turnWork). The stop's hand-over tells the main its answer will be marked.
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
-- An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once
+- An account-kind StopFailure walls the gen and records `wall_refused_at` plus the episode's original `wall_since`. Joey is told once
   (`main-wall-up`). Any other StopFailure (`server_error`, an overload, `unknown`) does not wall: the gen is `idle`
   with `error`; the turn's items are an interrupted turn's when the model had answered them, otherwise offered again after a backoff, with a cap (WO-201, above).
-- At `retry_at` M1 offers the walled gen one item: its probe (a limit menu on its pane is driven first, and Joey is told what was chosen,
-  `main-menu`). The gen leaves `walled` only on its own next hook event (the probe's UserPromptSubmit, or a SessionStart). A StopFailure in that
-  turn is the same episode: `probes` + 1, a longer `retry_at`, no new notice. The episode ends at the gen's next final Stop: `wall_since`,
-  `probes` and `retry_at` are cleared and Joey is told once (`main-wall-down`).
+- A keeper clear permits one program offer. M1 drives any limit menu first and records `uw_clear_used` after a successful stream write.
+  With no fresh keeper state the walled gen waits for a clear or a person's message eligible under WO-200.
+  Its own hook event takes it out of `walled`. A further refusal belongs to the same episode. Its next final Stop ends the episode
+  and sends one recovery notice (`main-wall-down`).
 - A new gen starts `idle` or `starting`, whatever the lanes' wall says.
 - **The wall episode is the agent's, not a gen's** (002w E, gap 13): a gen that ends while walled (killed, replaced, restarted) hands its open episode
   (`wall_since`, `wall_menu`) to the next gen at its SessionStart (the ended record's fields are cleared); that gen's first final Stop ends it with the
@@ -656,7 +656,7 @@ from the offer when that came later. The alarm names the open tool.
   too: a limit menu there is the main-wall mechanism's, not the watchdog's, and with no StopFailure this alarm is what puts it in front of Joey).
 - **The episode is M1's recovery signal** (002q, H02/H03: a notification lost on the client side under host load stayed lost, and the play never
   started): when the alarm fires on an idle or walled gen with an offer it never bound, those items go back to `queued` (`reason: stuck_unbound`)
-  and M1 offers again at once (a walled gen at its next probe time). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
+  and M1 offers again at once (a walled gen on a new keeper clear). Once per episode, no timer of its own. The alarm says so (「我再交給它一次」).
 - **The offer has its own bound** (002x; 002w r1 A05 and r2 I04: an offer written half a second after the gen's stream opened was never bound and
   waited for the stuck episode, which is ten minutes outside the lab): an idle gen's offer still unbound after `LANES_OFFER_LEASE_MS` of silence
   (20 s; the 1,304 offers of 002v and 002w were bound within 1.6 s) goes back to `queued` (`reason: offer_untaken`, `reoffered: <gen>`) and M1

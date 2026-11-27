@@ -5,7 +5,7 @@
  *     The session registry can supply a missing gen. Its turn edges come from the main's hooks, and a dead pid ends it even without a hook.
  *     The main's wall is ITS record (PL4): an account-kind StopFailure walls it and starts a wall episode (wall_since); it leaves `walled` only on its
  *     own next hook event, and the episode ends at its next Stop. The lanes' wall (lanes.ts S.wall) is another record and never moves this one.
- *     A walled gen is offered one item when its retry time comes (its probe): that offer is how the main's own hook events resume.
+ *     The keeper's clear releases one program offer. A person's new message can probe the wall under WO-200.
  * M1. One record per item meant for the main: queued → offered(gen) → bound(gen, prompt_id) → done.
  *     The one rule: an item is done only when the turn it was bound to ends with Stop. How a turn that had no normal end ended decides the rest
  *     (WO-201, Chiron mesh-13184): a compaction inside it is no end (the turn goes on); no genuine model output after the item was bound (liveness.ts,
@@ -53,11 +53,11 @@ export type MainEnv = {
   undone: (item: Row) => void
   /** a line to Joey from the router (push), with the rule that sent it; `events`: the M3 events the line is about (it meets their Joey line) */
   tellJoey: (text: string, rule: string, events?: string[]) => void
-  /** the backoff before the walled main's next probe offer (ms), after `probes` failed ones */
-  wallBackoff?: (kind: string, probes: number) => number
+  /** delay before retrying a turn that failed with a non-account error */
+  wallBackoff?: (kind: string, failures: number) => number
   /** WO-120: the agent's usage-wall state (usage_wall.py, read by usage-wall.ts) for the wall episode that began at `wallSinceMs`: 'walled' = the
    *  keeper probes outside the session, so no item is fed to the wall; cleared (clearedMs) = its probe (or a genuine turn) got an answer: one
-   *  offer now, once per clear (a failed offer then waits for retry_at or a newer clear); null = no fresh state: the PL4 probe as before */
+   *  program offer per clear. A disconnected stream can still use the clear when it opens */
   usageWall?: (wallSinceMs: number) => MainWall | null
   callId?: (event: string) => string | undefined
   checkCall?: (id: string, why: CallWait, item: Row) => Promise<CallCheck>
@@ -254,10 +254,9 @@ export function createMain(E: MainEnv) {
     const refused = Number(g?.wall_refused_at ?? 0)
     const observed = g?.wall_clear_at as number | null | undefined
     const clear = wall?.walled ? null : wall?.clearedMs != null && wall.clearedMs >= refused ? wall.clearedMs : observed ?? null
-    const active = !!wall?.walled || (g?.state === 'walled' && clear == null) || member() === 'walled'
+    const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
+    const active = !!wall?.walled || (g?.state === 'walled' && !probe) || member() === 'walled'
     const last = Math.max(wall?.lastWallMs ?? 0, refused)
-    // If the keeper is absent, M2 retains its existing account probe. A keeper clear authorizes one offer.
-    const probe = g?.state === 'walled' && !wall?.walled && ((!wall && Date.now() >= Number(g.retry_at ?? Infinity)) || (clear ?? 0) > Number(g.uw_clear_used ?? 0))
     return { active, person: active && personCanProbe(last || null), clear, probe }
   }
   const accountFailure = (reason: unknown): boolean => typeof reason === 'string' && reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(reason.slice('stop_failure:'.length))
@@ -436,8 +435,7 @@ export function createMain(E: MainEnv) {
   async function offerNext(): Promise<void> {
     const g = currentGen()
     if (!g) return
-    // PL4: a walled gen is offered one item when its retry time comes: its probe. Its own hook events then take it out of `walled` (and a
-    // StopFailure walls it again, with a longer backoff). A limit menu it is parked on is driven first (002k G16a).
+    // A keeper clear can wake the walled gen. Drive its limit menu first (002k G16a).
     const wall = wallDelivery(g)
     const probe = wall.probe
     const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : canTake(g)))
@@ -475,11 +473,7 @@ export function createMain(E: MainEnv) {
       if (!stillReady()) return
       if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
     }
-    const advanceProbe = (row: Row, fields: Record<string, unknown> = {}) => setMain(row, 'walled', {
-      ...fields,
-      retry_at: Date.now() + backoff(String(row.kind ?? ''), Number(row.probes ?? 0)),
-      ...(menu && !menu.asks ? { wall_menu: menu.text } : {}), ...(wall.clear != null ? { uw_clear_used: wall.clear } : {}),
-    })
+    const clearFields = { uw_clear_used: wall.clear, ...(menu && !menu.asks ? { wall_menu: menu.text } : {}) }
     const down = new Set<string>()
     // Work can arrive while the probe is driving the menu. It takes precedence over a bare resume.
     for (const it of probe ? candidates() : cands) {
@@ -514,7 +508,7 @@ export function createMain(E: MainEnv) {
       }
       // Consume the keeper's clear only after a write. A failed lookup or a disconnected stream still owes this offer.
       if (probe && now.state === 'walled' && now.version === version) {
-        advanceProbe(now)
+        setMain(now, 'walled', clearFields)
       }
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
@@ -539,12 +533,9 @@ export function createMain(E: MainEnv) {
         // on the agent's latest gen. Only a still-open interval between final Stops needs the guard.
         const now = J().lastMain ?? g
         const fields = { resumes: (now.resumes ?? 0) + 1, ...(before === finalStops ? { cut_turn: cut, resume_sent: cut.at } : {}) }
-        if (probe && now === g && now.version === version) advanceProbe(now, fields)
-        else J().write('main', now.id, now.state, fields)
+        J().write('main', now.id, now.state, { ...fields, ...(probe && now === g && now.version === version ? clearFields : {}) })
       }
     }
-    // With no keeper, an attempted PL4 probe uses its retry slot even if every stream was down.
-    if (probe && wall.clear == null && down.size && stillReady()) advanceProbe(g)
   }
   /** 002w (E, gaps 4, 11): an item reached the main (offered, or bound at a boundary): an episode of owed items nobody could take is over */
   function delivered(): void {
@@ -807,7 +798,7 @@ export function createMain(E: MainEnv) {
   /** PL4: the StopFailure kinds that wall the main: the account cannot be used (quota, billing, hold, login). Any other error (server_error, an
    *  overload, unknown) ends the turn: the gen is idle and its items are offered again after a backoff, with a cap (WO-201: failTurn). */
   const ACCOUNT_WALL = new Set(['rate_limit', 'billing_error', 'account_on_hold', 'authentication_failed', 'oauth_org_not_allowed', 'cloud_credential_error'])
-  const backoff = (kind: string, probes: number): number => E.wallBackoff ? E.wallBackoff(kind, probes) : Math.min(1_800_000, 300_000 * 2 ** Math.min(20, probes))
+  const backoff = (kind: string, failures: number): number => E.wallBackoff ? E.wallBackoff(kind, failures) : Math.min(1_800_000, 300_000 * 2 ** Math.min(20, failures))
 
   /** /lanes/main-event: every hook event of the main. The reply is what the hook prints. */
   async function mainEvent(b: MainEvent): Promise<MainReply> {
@@ -923,7 +914,7 @@ export function createMain(E: MainEnv) {
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
         openTools.delete(g.id)
         finalStops++
-        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, cut_turn: null, resume_sent: null, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, cut_turn: null, resume_sent: null, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, kind: null, wall_menu: null } : {}) })
         if (since) {
           const n = items(r => queuedForOffer(r, was) && (!heldCut(r) || accountCut(r))).length
           E.tellJoey(`主線恢復了。這次從 ${hhmmTaipei(Date.parse(since))}（台北）起不能用模型。${n ? `保留的 ${n} 則訊息等著交給它。` : ''}${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')
@@ -953,10 +944,9 @@ export function createMain(E: MainEnv) {
         }
         if (p) outputs.delete(p)
         const cur = J().get('main', g.id)!
-        // the main's own wall: one episode (wall_since) until its next Stop; each failed probe backs off
-        const first = !cur.wall_since, probes = first ? 0 : Number(cur.probes ?? 0) + 1
-        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null, probes,
-          cut_turn: bareCut(cur, back, err), retry_at: Date.now() + backoff(err, probes) })
+        const first = !cur.wall_since
+        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null,
+          cut_turn: bareCut(cur, back, err) })
         if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}
       }
@@ -1006,7 +996,7 @@ export function createMain(E: MainEnv) {
     const since = ended.map(r => String(r.wall_since)).sort()[0]
     const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     const previous = same ?? J().lastMain
-    for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, probes: null, retry_at: null, wall_menu: null })
+    for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, wall_menu: null })
     // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
     // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)
     const carried = ['startup', 'clear', 'compact'].includes(String(b.source ?? ''))
@@ -1143,7 +1133,7 @@ export function createMain(E: MainEnv) {
         for (const r of untaken) J().write('msg', r.id, 'queued', { reason: backReason(r, 'offer_untaken'), gen: null, prompt_id: null, via_pull: null, reoffered: g.id })
       } else if (owes && held && now - since > limit) {
         // WO-177 一: the record names the blocker (a menu, the wall): no stuck episode, nobody told. A walled gen's probe item goes back to wait for its
-        // next probe time (a probe offer is the one way its own hook events resume), as the episode below would have put it back
+        // next keeper clear, as the episode below would have put it back
         if (g.state === 'walled') for (const r of offered.filter(r => !r.person_wall_offer)) J().write('msg', r.id, 'queued', { reason: backReason(r, 'probe_untaken'), gen: null, prompt_id: null, via_pull: null })
       } else if (owes && now - since > limit) {
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
@@ -1161,7 +1151,7 @@ export function createMain(E: MainEnv) {
         // 002q (H02, H03): an offer the gen never took (no hook event for it: a notification lost on the client side, under host load) is not left to
         // wait for ever. The stuck episode is the signal: its untaken items go back to `queued` (reason stuck_unbound) and M1 offers once more, now.
         // Once per episode (the alarm does not fire again until a hook event ends it), and no timer of its own. A walled gen's probe item waits for
-        // its next retry time like any probe.
+        // its next keeper clear.
         for (const r of again) J().write('msg', r.id, 'queued', { reason: backReason(r, 'stuck_unbound'), gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
       } else if ((take || (g.state === 'walled' && wall.clear != null)) && !offered.length) {
         // WO-157c (Chiron 15:25Z, 1): a colleague's, a scheduler's or an alert's item of an interrupted turn that no new turn took within MAIN_STUCK_MS goes

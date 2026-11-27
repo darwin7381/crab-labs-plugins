@@ -397,3 +397,4 @@ plugins/telegram-http/lanes.ts::p === '/lanes/registry-alert'
 plugins/telegram-http/server.ts::/api/fleet/main-registry
 # WO-209 (1.59.5): the receipt belongs to the interrupted turn across gens
 plugins/telegram-http/lanes-main.ts::resume_sent: cut.at
+plugins/telegram-http/lanes-main.ts::const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
