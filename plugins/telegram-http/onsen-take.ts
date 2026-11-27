@@ -22,6 +22,7 @@ export async function deliveryMode(req: ActionReq, path: string, connector: stri
 export class TakeMode {
   readonly path: string
   readonly connector: string
+  checking = true
   active = false
   observationRequired = false
   private stopped = false
@@ -37,7 +38,12 @@ export class TakeMode {
   async probe(): Promise<void> {
     const mode = await deliveryMode(this.req, this.path, this.connector)
     if (this.stopped) return
-    if (mode === 'pull') { this.pause('mode probe did not return 200', 60_000); return }
+    this.checking = false
+    if (mode === 'pull') {
+      if (this.reason === 'not_current_connector') this.pause(this.reason, 45_000)
+      else this.pause('mode probe did not return 200', 60_000)
+      return
+    }
     this.reason = ''
     this.active = this.observationRequired = true
     this.log('onsen take: started ' + this.connector)

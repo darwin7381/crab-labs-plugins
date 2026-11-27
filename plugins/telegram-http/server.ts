@@ -64,6 +64,7 @@ import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
 import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
@@ -2050,6 +2051,7 @@ const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
+let itemClaims: Claims | undefined
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
@@ -2878,6 +2880,7 @@ function shutdown(reason: string): void {
   if (shuttingDown) return
   shuttingDown = true
   takeMode?.stop()
+  itemClaims?.stop()
   log('warn', `shutting down (reason: ${reason}) uptime=${process.uptime().toFixed(1)}s`)
   try { onsenStep3Stop?.() } catch {}          // Onsen step 3 (WO-143): a turn_end still settling is written now (the spool is a local append)
   try {
@@ -4365,8 +4368,12 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h) => onsen.request(m, p, b, t, h),
-      active => { if (active) itemPeek!.reset(); else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
-    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => true)
+      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
+    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at))
+    Lanes.useItemReceiver(itemReceiver)
+    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     Lanes.observeItemGates(() => itemPeek!.reset())
     void takeMode.probe()
   }
@@ -4420,9 +4427,10 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     try { f = recordFacts() } catch (e) { log('warn', `onsen: status facts: ${e}`) }
     const r = screenStatus ? screenStatus.record(v, f, true) : { view: v, observation: composeRecord(null, null, v, f).observation }
     const pub = r.view
+    if (takeMode?.active) Object.assign(r.observation, { connector: takeMode.connector, held_item_ids: itemClaims!.held() })
     lastView = pub; lastObservation = r.observation
     status.update(pub)
-    obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
+    if (!takeMode?.checking) obsPut.update(r.observation)                                          // WO-180: the same point, the same object (sent only if it changed or the beat is due)
     screenStatus?.programChanged(v)
     // the Esc wrap-up reads the record when it changes, not only at its 2 s tick (WO-169 criterion 4: the next item within 2 s of an interruption seen).
     // WO-177 一: and M1 offers what it held the moment the record says the main can take it: the edge is the member state (decideWake's: a wall or a
@@ -4943,6 +4951,11 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const item = itemRef(row)
+  if (itemClaims?.completed(row.id)) {
+    const result = await itemReceiver!.receive([item])
+    if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
+    return
+  }
   const payload = { ...row.payload }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')

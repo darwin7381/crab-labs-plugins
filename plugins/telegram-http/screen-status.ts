@@ -246,7 +246,7 @@ export type Blocker = { id: string; reason: BlockerReason; since: string; until:
 export type ObsSession = { id: string; kind: 'main' | 'lane'; thread_id: string | null; activity: 'idle' | 'running' | 'paused' | 'stuck' | 'unknown'
   activity_since: string | null; turn: TurnFact | null; doing: { kind: 'thinking' | 'tool' | 'compacting' | 'waiting_subagents'; tool: string | null; since: string } | null
   blockers: Blocker[]; last_turn: LastTurn | null }
-export type Observation = { presence: 'online' | 'offline'; presence_reason: null | 'disconnected' | 'process_gone'; lifecycle: 'ready' | 'starting' | 'stopped'
+export type Observation = { connector?: string; held_item_ids?: string[]; presence: 'online' | 'offline'; presence_reason: null | 'disconnected' | 'process_gone'; lifecycle: 'ready' | 'starting' | 'stopped'
   main_session_id: string | null; sessions: ObsSession[]; background: { agents: number | null; shells: number | null; tasks: number | null; monitors: number | null } | null
   queue: { pending: number | null; unread_by_member: number | null }; last_activity_at: string | null; reported_at: string
   evidence: { source: 'classifier' | 'runtime'; confidence: number | null } }
