@@ -195,10 +195,12 @@ export type DriveResult = 'ok' | 'gone' | 'stuck'
  * without touching the pane. Returns:
  *   'gone'  — no matching picker on the pane now (nothing sent)
  *   'ok'    — drove it and the picker cleared
- *   'stuck' — drove it but the picker is still up
+ *   'stuck' — drove it but the picker is still up, or no look after the keys could be read
+ * A pane that cannot be read before the keys throws (nothing sent): an unread pane is never taken for a picker that went away.
  */
-/** `capture`: how the pane is read before and after the keys (default capture-pane). The daemon's own pane is read through pane-look's one capture (WO-168) */
-export async function driveStartupPicker(tmux: string, idx: number, expectKey: string, capture: (tmux: string) => Promise<string> = capturePane): Promise<DriveResult> {
+/** `capture`: how the pane is read before and after the keys; it throws when the pane cannot be read (default: capture-pane, its exit code checked). The
+ *  daemon's own pane is read through pane-look's one capture (WO-168) */
+export async function driveStartupPicker(tmux: string, idx: number, expectKey: string, capture: (tmux: string) => Promise<string> = captureOrThrow): Promise<DriveResult> {
   const pane = await capture(tmux)
   const live = detectStartupPicker(pane)
   if (!live || live.key !== expectKey || idx < 0 || idx >= live.options.length) return 'gone'
@@ -211,9 +213,17 @@ export async function driveStartupPicker(tmux: string, idx: number, expectKey: s
   await runCommand(['tmux', 'send-keys', '-t', tmux, 'Enter'])
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise((r) => setTimeout(r, 400))
-    if (!detectStartupPicker(await capture(tmux))) return 'ok'
+    let after: string
+    try { after = await capture(tmux) } catch { continue }            // a look that failed says nothing about the picker
+    if (!detectStartupPicker(after)) return 'ok'
   }
   return 'stuck'
+}
+/** capture-pane that throws when tmux fails (its stdout is then empty, which would read as "no picker") */
+async function captureOrThrow(tmux: string): Promise<string> {
+  const { exitCode, stdout, stderr } = await runCommand(['tmux', 'capture-pane', '-t', tmux, '-p'])
+  if (exitCode !== 0) throw new Error(`capture-pane ${tmux} failed (${exitCode}): ${stderr.trim().slice(0, 120)}`)
+  return stdout
 }
 
 /** WO-197: a Claude Code permission dialog as the pane shows it (its first option Yes…, its last No…): the channel's permission prompt carries it */

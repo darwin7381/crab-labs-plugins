@@ -99,6 +99,5 @@ test('WO-168 item 5 server.ts: the lanes\' re-arm of the main\'s menu goes throu
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   expect(src).toContain("if (!dutyOfficer?.handles(own)) { rearmStartupPicker(own); return }")
   expect(src).toContain('void dutyOfficer.rearm(own).then(')
-  expect(src).toContain("capture: () => ownPaneReader ? ownPaneReader.fresh(MAIN_PICKER_LOOK_MS).then(l => l?.visible ?? '') : capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),")
-  expect(src).toContain("ownPaneReader ? () => ownPaneReader.fresh(0).then(l => l?.visible ?? '') : undefined),")
+  expect(src).toContain("drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key, ownLookFor(process.env.CHANNEL_BOT_TMUX_SESSION!)),")
 })

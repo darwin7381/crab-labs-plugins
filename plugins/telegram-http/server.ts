@@ -1989,9 +1989,17 @@ async function applyPickerControl(pa: PickerAsk, h: Onsen.ActionHandle, c: Onsen
   if (idx < 0 || idx >= pa.options.length) { acts.cancel(h, `不認得的選項 ${c.option_id}，沒有按`); return }
   pa.pressing = true
   let res: 'ok' | 'gone' | 'stuck' = 'gone'
-  // WO-168: the own pane is read through the one capture (pane-look), before and after the keys
-  const look = ownPaneReader && pa.tmux === ownPaneTmux ? () => ownPaneReader.fresh(0).then(l => l?.visible ?? '') : undefined
-  try { res = await driveStartupPicker(pa.tmux, idx, pa.key, look) } finally { pa.ended = true; pa.pressing = false }
+  // WO-168: the own pane is read through the one capture (pane-look), before and after the keys. A pane that could not be read before them is not taken
+  // for a menu that went away: nothing pressed, the answer said so, and the menu is looked at again (re-armed: asked anew if it is still there)
+  try { res = await driveStartupPicker(pa.tmux, idx, pa.key, ownLookFor(pa.tmux)) }
+  catch (e) {
+    pa.ended = true; pa.pressing = false
+    log('warn', `startup picker '${pa.key}' on pane ${pa.tmux}: ${c.option_id} pressed in Onsen (action ${c.action_id}), but the pane could not be read: nothing pressed; looked at again (${e})`)
+    acts.cancel(h, '這一刻讀不到畫面，沒有按；選單還在的話會再問一次')
+    rearmStartupPicker(pa.tmux)
+    return
+  }
+  finally { pa.ended = true; pa.pressing = false }
   if (res === 'gone') {
     log('info', `startup picker '${pa.key}' on pane ${pa.tmux}: ${c.option_id} pressed in Onsen (action ${c.action_id}), but the menu is not there any more: nothing pressed, cancelled`)
     acts.cancel(h, '選單已經不在畫面上了（在別處選過、逾時、或畫面已變），沒有按')
@@ -3096,6 +3104,12 @@ const ownPaneReader: PaneReader | null = ownPaneTmux ? new PaneReader(ownPaneTmu
 let ownRecordOf: ((l: PaneLook) => { view: OnsenStatus.StatusView; hash: string } | null) | null = null
 /** WO-168 × WO-197: how old a look of the own pane the startup-picker's observer takes (the record looks every second; a fresher one is not asked for) */
 const PICKER_OWN_LOOK_MS = 1000
+/** WO-168: a new look of the own pane through the one capture, for a press and its checks; it throws when the pane could not be read (an unread pane is
+ *  never "no menu"). Another pane: undefined (the caller's own capture) */
+function ownLookFor(tmux: string): ((t: string) => Promise<string>) | undefined {
+  if (!ownPaneReader || tmux !== ownPaneTmux) return undefined
+  return () => ownPaneReader.fresh(0).then(l => { if (!l) throw new Error(`pane ${tmux} could not be read`); return l.visible })
+}
 /** WO-168: how old a look of the own pane the lanes' main-wall probe takes (it looks right before it presses: a fresh one) */
 const MAIN_PICKER_LOOK_MS = 250
 if (isControlEnabled() || isRoamerEnabled()) {
@@ -4206,10 +4220,10 @@ if (Lanes.LANES_ON) {
     // 002k (G16): the main's pane and its startup picker, for the wall-down step and the deaf-main notice. WO-168: its look is pane-look's one capture
     // (the record's), not a capture of its own; the menu and the press stay the probe's (Chiron's v3, WO-204)
     ...(process.env.CHANNEL_BOT_TMUX_SESSION ? { mainPicker: {
-      capture: () => ownPaneReader ? ownPaneReader.fresh(MAIN_PICKER_LOOK_MS).then(l => l?.visible ?? '') : capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
+      // a look that failed throws (inspectMainMenu: 「main pane not readable」), never an empty screen
+      capture: () => ownPaneReader ? ownPaneReader.fresh(MAIN_PICKER_LOOK_MS).then(l => { if (!l) throw new Error('the main\'s pane could not be read'); return l.visible }) : capturePane(process.env.CHANNEL_BOT_TMUX_SESSION!),
       detect: detectStartupPicker,
-      drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key,
-        ownPaneReader ? () => ownPaneReader.fresh(0).then(l => l?.visible ?? '') : undefined),   // WO-168: a new look each time, through the one capture
+      drive: (idx: number, key: string) => driveStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!, idx, key, ownLookFor(process.env.CHANNEL_BOT_TMUX_SESSION!)),   // WO-168: through the one capture
       // WO-168 item 5: 「選項已再傳給你」 is kept by the duty officer when it watches the main's pane (its open question again, or the menu put to Joey now:
       // an Onsen Action, and Telegram buttons on a roamer); the startup-picker it used to re-arm skips that pane, so the sentence went out with no buttons
       rearm: () => {
