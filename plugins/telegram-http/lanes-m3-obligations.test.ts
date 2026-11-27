@@ -368,7 +368,7 @@ test('002j P24 / 002k C4, 002q B09: a peer\'s request handed to the main: the ro
   expect((E().get(p.id)!.main_sends as any[]).at(-1)).toMatchObject({ to: 'eve', ref: '70099', delivered: true, matched: 'thread' })   // 002r (C07): which message kept the promise
 })
 
-test('the due sweep: a promised answer past its due time tells Joey once; a hand-over the main has not finished tells Joey once; a main away past the grace makes it due at once', async () => {
+test('the due sweep: a promised answer past its due time tells Joey once; a hand-over the main has not finished is not pushed while no main is up (WO-201); a main away makes nothing due early', async () => {
   const p = await start(mk('eve', '能不能延後部署？', { btcc_msg_id: '50010' }))
   await call(p.tok, 'handoff_main', { text: 'Eve 要延後部署，要主線決定' })
   await end(p.lane)
@@ -384,8 +384,10 @@ test('the due sweep: a promised answer past its due time tells Joey once; a hand
   expect(late().length).toBe(1)      // once
   const main = ob(p.id, 'main')
   L.dueTick(main.due_at + 1); await sleep(20)
-  expect(sent.slice(k).filter(s => s.text.includes('原本交給主線處理') && s.text.includes('延後部署')).length).toBe(1)
-  expect(ob(p.id, 'main')).toMatchObject({ state: 'open', told: true })                     // still the main's: told, not taken away
+  // WO-201 (point 5), inverted: no main is up in this file (it cannot act): the hand-over is not pushed (1.59.0 told Joey once here, 「（主線現在不在線）」);
+  // the push once a main is back and has not handled it: lanes-wo201.test.ts (f)
+  expect(sent.slice(k).filter(s => s.text.includes('原本交給主線處理') && s.text.includes('延後部署')).length).toBe(0)
+  expect(ob(p.id, 'main')).toMatchObject({ state: 'open' }); expect(ob(p.id, 'main').told).toBeUndefined()   // still the main's, not taken away, not told
   const q = await start(mk('cain', '幫我看一下 ticket 12'))
   await call(q.tok, 'handoff_main', { text: 'cain 要看 ticket 12，要主線' })
   await end(q.lane)
@@ -394,7 +396,8 @@ test('the due sweep: a promised answer past its due time tells Joey once; a hand
   L.dueTick(Date.now() + 61_000); await sleep(20)
   expect(sent.slice(m).some(s => s.text.includes('cain 要看 ticket 12'))).toBe(false); expect(ob(q.id, 'main').due_at).toBe(qd)
   L.dueTick(qd + 1); await sleep(20)
-  expect(sent.slice(m).filter(s => s.text.includes('cain 要看 ticket 12') && s.text.includes('不在線')).length).toBe(1)   // at its own due time, once
+  // WO-201 (point 5), inverted: at its own due time with no main up: not pushed (1.59.0: once, with 「不在線」)
+  expect(sent.slice(m).filter(s => s.text.includes('cain 要看 ticket 12')).length).toBe(0)
   // Joey's own messages to the main carry no due time: the sweep never pushes them back to him (T7-R: 4 echoes)
   const meta = { chat_id: '1', message_id: '3001', user: 'joey_lab' }
   await L.routeEvent({ id: 'tg-1-3001', source: 'telegram', from: 'joey', text: '主線在嗎？', meta, verified: true, notif: { method: 'notifications/claude/channel', params: { content: '主線在嗎？', meta } } } as any)

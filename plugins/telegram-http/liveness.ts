@@ -84,6 +84,49 @@ export function isGenuineAssistant(r: GenuineCandidate | null | undefined): bool
   return true
 }
 
+/** WO-201 (Chiron resend audit 2026-11-27, rule 3; Joey TG chiron:2864): did the session produce GENUINE model output after `sinceMs` (an item was
+ *  bound into its turn then)? The answer M1 uses for 「that item was received」 when its gen ends or its session changes before the turn's Stop.
+ *  Returns the ms of the first such record, 0 = none, null = cannot tell (no file, unreadable, or the post-`sinceMs` span is larger than the read cap).
+ *  Same predicate as above (isGenuineAssistant: not an API error, not <synthetic>), with one refinement measured on the fleet: Claude Code runs a tool
+ *  while the response that called it is still streaming, so blocks of ONE response (one message.id) are written after a tool_result (38 times in one
+ *  7 MB main transcript of 2026-11-27). A block of a response that had begun by `sinceMs` was produced before the model saw what was bound then (a
+ *  message pulled at that tool's PostToolUse): it does not count. The read widens from the tail until it reaches 15 minutes before `sinceMs` (the
+ *  start of any response still streaming then), or the file's start. */
+export const GENUINE_AFTER_MARGIN_MS = 15 * 60_000
+const GENUINE_AFTER_WINDOWS = [TRANSCRIPT_TAIL_BYTES, 1024 * 1024, 8 * 1024 * 1024, 64 * 1024 * 1024]
+export function genuineAssistantAfterFile(path: string, sinceMs: number): number | null {
+  if (!path || !Number.isFinite(sinceMs)) return null
+  try {
+    const size = statSync(path).size
+    for (const want of GENUINE_AFTER_WINDOWS) {
+      const start = Math.max(0, size - want), len = size - start
+      if (len <= 0) return 0
+      const buf = Buffer.allocUnsafe(len)
+      const fd = openSync(path, 'r')
+      try { readSync(fd, buf, 0, len, start) } finally { closeSync(fd) }
+      const lines = buf.toString('utf8').split('\n')
+      if (start > 0) lines.shift()                                  // the partial first line
+      type Rec = GenuineCandidate & { requestId?: string; message?: { model?: string; id?: string } }
+      const recs: Array<{ r: Rec; t: number }> = []
+      for (const l of lines) {
+        if (!l) continue
+        let r: Rec
+        try { r = JSON.parse(l) } catch { continue }
+        const t = Date.parse(r?.timestamp ?? '')
+        if (Number.isFinite(t)) recs.push({ r, t })
+      }
+      const covered = start === 0 || (recs.length > 0 && recs[0].t <= sinceMs - GENUINE_AFTER_MARGIN_MS)
+      if (!covered) { if (want === GENUINE_AFTER_WINDOWS[GENUINE_AFTER_WINDOWS.length - 1]) return null; continue }
+      const begun = new Set<string>()                               // the responses that had begun by sinceMs
+      const key = (r: Rec): string => String(r?.message?.id ?? r?.requestId ?? '')
+      for (const { r, t } of recs) if (t <= sinceMs && r?.type === 'assistant' && key(r)) begun.add(key(r))
+      for (const { r, t } of recs) if (t > sinceMs && isGenuineAssistant(r) && !(key(r) && begun.has(key(r)))) return t
+      return 0
+    }
+    return null
+  } catch { return null }
+}
+
 /** lanes-topics (item 3): the model of the LAST genuine assistant record of one transcript (the session's model as it really ran), or null. Reads the
  *  tail, widening (64KB, 1MB, 8MB) until it finds one: a turn of big tool results can push the last assistant record far from the end. */
 export function genuineAssistantModelFile(path: string): string | null {

@@ -209,11 +209,12 @@ test('WO-128 #2, #8: a can-wait card nobody handles: no push before its due wake
   L.dueTick(o.due_at - 1); await sleep(20)
   expect(pushesAbout(k, m)).toEqual([])
   L.dueTick(o.due_at + 1); L.dueTick(o.due_at + 2); await sleep(20)
-  expect(pushesAbout(k, m).length).toBe(1)
-  expect(pushesAbout(k, m)[0].text).toContain(`這件事放在主線的信箱等決定（${o.handoff}；信箱 #${m}`)
-  expect(pushesAbout(k, m)[0].text).toContain('快到期叫醒主線 5 分鐘了還沒處理（主線現在不在線）')
-  L.dueTick(Date.parse(box.get(m)!.deadline) + 1); await sleep(20)                                     // the peer's answer is due at the deadline: not a second push
-  expect(pushesAbout(k, m).length).toBe(1)
+  // WO-201 (point 5), inverted: no main is up (it cannot act): the card-due push waits for one (1.59.0 pushed here: 「…5 分鐘了還沒處理（主線現在不在線）」).
+  // The push after the main is back and still has not handled it: lanes-wo201.test.ts (f)
+  expect(pushesAbout(k, m)).toEqual([]); expect(ob(r.id, 'main').told).toBeUndefined()
+  L.dueTick(Date.parse(box.get(m)!.deadline) + 1); await sleep(20)                                     // the peer's answer is due at the deadline: answer-due is not WO-201's
+  expect(pushesAbout(k, m).filter(s => s.text.includes('快到期叫醒主線'))).toEqual([])
+  expect(pushesAbout(k, m).length).toBeLessThanOrEqual(1)
   // the main comes up: the due wake reaches it (cause due); it decides
   const w0 = wakes().length
   const m0 = await mainUp()
@@ -397,6 +398,7 @@ test('WO-128: the mail lane\'s card that can wait needs no hand-over (the lane s
   await call(w3, 'receipt', { outcome: 'done', happened: '1 封', did: '附卡、交主線', promised: '無', needs_main: '#8825' })
   await end(w3)
   L.dueTick(o.due_at + 1); await sleep(20)                                                             // no main: 300 s after the wake, one push as for any hand-over
+  // (WO-201: the main record of an earlier test is still idle here (gen of a /clear session), so the main can act: the push stands)
   expect(sent.slice(k).filter(s => s.text.includes('原本交給主線處理') && s.text.includes('#8823')).length).toBe(1)
   const m0 = await mainUp()
   expect(await until(() => wakes().length > w0)).toBe(true)

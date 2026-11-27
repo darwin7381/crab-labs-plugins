@@ -5737,13 +5737,52 @@ function mainOnIt(e: Row, o: Ob): 'turn' | 'replied' | null {
   return ((e.main_sends ?? []) as Array<{ to?: string; at?: string }>).some(s => s?.to === 'joey' && (!since || String(s.at ?? '') >= since)) ? 'replied' : null
 }
 const heldDue = new Set<string>()                                        // the hand-overs whose push waited (logged once each)
+/** WO-201 (point 5; inventory L18; Chiron resend audit 2026-11-27): the main cannot act now: its own record (M2) is walled or there is no live main, or the
+ *  status record's member state is walled or offline. While so, a hand-over's handoff-due and a card's card-due are not pushed to Joey: the wall's entry
+ *  notice already told him the main's items are kept (1.59.0 pushed them anyway with 「（主線現在不能用模型）」: three in Chiron's six walled hours, TG 2834,
+ *  2835, 2838). critical-due is not affected. */
+function mainCannotAct(): boolean {
+  const ph = main?.mainPhase() ?? 'gone', m = memberNow()
+  return ph === 'walled' || ph === 'gone' || m === 'walled' || m === 'offline'
+}
+/** WO-201 (point 5): the spans this daemon saw the main unable to act (mainCannotAct, sampled at each due sweep). The due clock of a main obligation does not
+ *  count them: it pauses while the main cannot act and goes on from where it was at recovery (it does not restart from zero): the push comes at due_at +
+ *  the time the main could not act since the obligation began. Kept in memory: after a daemon restart a span before it is not known (the push can then
+ *  come earlier, at most as early as before 1.59.1, and never while the main still cannot act). */
+const mainDown: { since: number | null; spans: Array<[number, number]> } = { since: null, spans: [] }
+function noteMainDown(now: number): boolean {
+  const down = mainCannotAct()
+  if (down && mainDown.since == null) mainDown.since = now
+  else if (!down && mainDown.since != null) {
+    mainDown.spans.push([mainDown.since, Math.max(mainDown.since, now)]); mainDown.since = null
+    if (mainDown.spans.length > 500) mainDown.spans.splice(0, mainDown.spans.length - 500)
+  }
+  return down
+}
+/** the ms of [from, now] during which the main could not act (mainDown) */
+function mainDownMs(from: number, now: number): number {
+  let ms = 0
+  for (const [a, b] of mainDown.spans) ms += Math.max(0, Math.min(b, now) - Math.max(a, from))
+  if (mainDown.since != null) ms += Math.max(0, now - Math.max(mainDown.since, from))
+  return ms
+}
+export const __mainDown = (): { since: number | null; spans: Array<[number, number]> } => mainDown          // tests only
 export function dueTick(now = Date.now()): void {
   if (!events || !S) return
   try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
+  const down = noteMainDown(now)                                         // WO-201 (point 5)
   for (const { e, o } of events.due(now)) {
     if (o.kind === 'main') {                                             // 1.38.2: the main is on it (mainOnIt): no push now
       const why = mainOnIt(e, o)
       if (why) { if (!heldDue.has(o.id)) { heldDue.add(o.id); if (heldDue.size > 1000) heldDue.clear(); logos('lane.handoff_due_held', { event: e.id, handoff: o.handoff ?? o.id, why }) } continue }
+      // WO-201 (point 5): the main cannot act (walled, offline): no handoff-due / card-due push now; after it can, the clock goes on without that time
+      const from = Date.parse(String(o.woke === 'due' ? o.woke_at ?? '' : (o as Ob & { at?: string }).at ?? '')) || (o.due_at! - HANDOFF_DUE_MS())
+      const paused = down ? 0 : mainDownMs(from, now)
+      if (down || now < o.due_at! + paused) {
+        const k = `${o.id}:${down ? 'down' : 'paused'}`
+        if (!heldDue.has(k)) { heldDue.add(k); if (heldDue.size > 1000) heldDue.clear(); logos('lane.handoff_due_held', { event: e.id, handoff: o.handoff ?? o.id, why: down ? 'main_cannot_act' : 'paused', ...(down ? {} : { due_at: o.due_at! + paused }) }) }
+        continue
+      }
     }
     const lane = S.lanes[String(e.lane ?? '')]
     if (o.kind === 'joey' && o.ring) {

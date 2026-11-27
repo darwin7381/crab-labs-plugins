@@ -268,7 +268,7 @@ test('#11023-2, replay of ho-1d6dd1 (11-24 00:48:28Z): the main replied at +257 
   settleEv(r.id)
 }, 30000)
 
-test('#11023-2: the item leaves the main\'s hands unanswered (the main went away mid-turn): the hand-over\'s own due time stands: one push, as before; a hand-over nobody took is pushed once, as before', async () => {
+test('#11023-2, WO-201 (point 5): the item leaves the main\'s hands unanswered (the main went away mid-turn): no push while no main is up (1.59.0: one push 「（主線現在不在線）」); a hand-over nobody took with no main up: not pushed either (1.59.0: once)', async () => {
   const m = await mainUp()
   const k = sent.length
   const r = await start(mk('eve', '能不能把 api-gw 的 timeout 改成 30 秒？', { line: 'call' }))
@@ -280,9 +280,9 @@ test('#11023-2: the item leaves the main\'s hands unanswered (the main went away
   expect(pushes(k, 'api-gw timeout')).toEqual([])                                                    // bound to the running turn
   await m.kill()                                                                                       // the main ends: its item is queued again for the next one
   L.dueTick(ho.due_at + 2); L.dueTick(ho.due_at + 3); await sleep(20)
-  expect(pushes(k, 'api-gw timeout').length).toBe(1)
-  expect(pushes(k, 'api-gw timeout')[0].text).toContain('（主線現在不在線）')
-  // no main at all: pushed once at its due time
+  expect(M().mainPhase()).toBe('gone')
+  expect(pushes(k, 'api-gw timeout')).toEqual([])                                                    // WO-201, inverted: the main cannot act (was: 1, 「（主線現在不在線）」)
+  // no main at all: not pushed at its due time (WO-201, inverted; was: once)
   const j = sent.length
   const q = await start(mk('eve', '幫我看一下 ticket 77', { line: 'call' }))
   await call(q, 'handoff_main', { text: 'eve 要看 ticket 77，要主線' })
@@ -290,7 +290,7 @@ test('#11023-2: the item leaves the main\'s hands unanswered (the main went away
   L.dueTick(ob(q.id, 'main').due_at - 1)
   expect(pushes(j, 'ticket 77')).toEqual([])
   L.dueTick(ob(q.id, 'main').due_at + 1); L.dueTick(ob(q.id, 'main').due_at + 2); await sleep(20)
-  expect(pushes(j, 'ticket 77').length).toBe(1)
+  expect(pushes(j, 'ticket 77')).toEqual([])
   settleEv(r.id, q.id)
 }, 30000)
 

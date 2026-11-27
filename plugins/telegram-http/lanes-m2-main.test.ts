@@ -271,7 +271,7 @@ test('WO-120: with a fresh usage-wall state the walled main is not fed its PL4 p
   await killed(g)
 })
 
-test('PL4 P12: a StopFailure that is not an account kind (server_error, unknown) does not wall the main: the items queue again, the gen is idle, the next offer is the retry; no wall notice', async () => {
+test('PL4 P12: a StopFailure that is not an account kind (server_error, unknown) does not wall the main: the items queue again, the gen is idle, the retry comes after its backoff (WO-201); no wall notice', async () => {
   await drained()
   const g = await startMain()
   const k = sent.length
@@ -280,6 +280,9 @@ test('PL4 P12: a StopFailure that is not an account kind (server_error, unknown)
   await hook(g, 'StopFailure', { prompt_id: p, error: 'server_error', reason: '529 overloaded' })
   expect(M().mainPhase()).toBe('idle'); expect(mainLines(g.pid).at(-1)).toMatchObject({ state: 'idle', error: 'server_error' })
   expect(state(id)).toBe('queued')
+  // WO-201 (point 4), inverted: not at the next tick any more (1.59.0 offered it there, no gap, no cap): after its backoff
+  await M().tick(); expect(state(id)).toBe('queued')
+  L.__journal().write('msg', id, 'queued', { fail_retry_at: Date.now() - 1 })
   await M().tick(); expect(state(id)).toBe('offered')
   expect(L.wallActive()).toBe(false)                                                          // nor does it raise the lanes' wall
   expect(sent.slice(k).some(s => s.includes('額度') || s.includes('無法使用'))).toBe(false)

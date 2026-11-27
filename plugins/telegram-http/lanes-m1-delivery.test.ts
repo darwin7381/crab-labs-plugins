@@ -260,7 +260,12 @@ test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the sa
   expect(state(id)).toBe('queued'); expect(linesOf('msg', id).at(-1)).toMatchObject({ reason: 'stop_failure:server_error' })
   expect(ob().state).toBe('open')
   expect(linesOf('msg', id).map(l => l.state)).toEqual(['queued', 'offered', 'bound', 'done', 'bound', 'queued'])
-  expect(M().mainPhase()).toBe('idle')                                                      // PL4 P12: a 529 is not a wall: the gen is idle, the next offer is the retry
+  expect(M().mainPhase()).toBe('idle')                                                      // PL4 P12: a 529 is not a wall: the gen is idle
+  // WO-201 (point 4), inverted: the retry waits for its backoff (the wall's base: LANES_WALL_PROBE_MS, 1 h in this file); until 1.59.0 the next tick offered it
+  expect(linesOf('msg', id).at(-1)).toMatchObject({ fails: 1 }); expect(linesOf('msg', id).at(-1).fail_retry_at).toBeGreaterThan(Date.now() + 3_000_000)
+  await M().tick()
+  expect(state(id)).toBe('queued')
+  L.__journal().write('msg', id, 'queued', { fail_retry_at: Date.now() - 1 })              // its retry time comes
   await M().tick()
   expect(state(id)).toBe('offered')
   const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
