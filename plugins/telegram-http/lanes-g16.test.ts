@@ -2,10 +2,10 @@
 // waits, never one that spends money; otherwise the menu goes to Joey again; (b) a delivery that stays queued with the main alive and silent gets one push and a
 // lane.main_deaf record; (c) the picker log carries the option labels. Pane, drive and Logos are stand-ins; the "model" is a shell script. No network, no model.
 import { test, expect, afterAll } from 'bun:test'
-import { mkdtempSync, copyFileSync, writeFileSync, appendFileSync, chmodSync } from 'fs'
+import { mkdtempSync, copyFileSync, writeFileSync, appendFileSync, chmodSync, readFileSync, unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { detectStartupPicker, describePicker, startStartupPickerWatchdog, rearmStartupPicker } from './startup-picker.ts'
+import { capturePane, driveStartupPicker, detectStartupPicker, describePicker, startStartupPickerWatchdog, rearmStartupPicker } from './startup-picker.ts'
 
 const logos: any[] = []
 // the stand-in Logos must be up (and its URL in the environment) BEFORE lanes.ts is imported: the module reads GENESIS_LOGOS_URL once
@@ -31,7 +31,7 @@ L.__setWallProbe(100)
 afterAll(() => { L.__setClaudeBin(restore); L.__setWallProbe(300_000) })
 
 // the pane: the limit menu as claude 2.1.322 draws it (labels from its own menu code), then the normal prompt once a key has been sent
-const LIMIT_PANE = (opts: string[]) => `\n You've hit your weekly limit · resets 5:48pm (Asia/Taipei)\n\n What do you want to do?\n\n${opts.map((o, i) => ` ${i === 0 ? '❯' : ' '} ${i + 1}. ${o}`).join('\n')}\n\n Enter to confirm · Esc to cancel\n`
+const LIMIT_PANE = (opts: string[], cursor = 0) => `\n You've hit your weekly limit · resets 5:48pm (Asia/Taipei)\n\n What do you want to do?\n\n${opts.map((o, i) => ` ${i === cursor ? '❯' : ' '} ${i + 1}. ${o}`).join('\n')}\n\n Enter to confirm · Esc to cancel\n`
 const NORMAL = '\n ╭───────────────╮\n │ > \n ╰───────────────╯\n'
 const SAFE = ['Stop and wait for limit to reset', 'Wait here, then continue automatically at 5:48 PM', 'Upgrade your plan']
 const state = { pane: NORMAL, drives: [] as Array<{ idx: number; key: string }>, rearms: 0, driveResult: 'ok' as 'ok' | 'gone' | 'stuck', clears: true }
@@ -155,4 +155,75 @@ test('G16a: no menu on the pane (or no pane): the main\'s wall notices are as be
   deps.mainPicker = { ...was, capture: async () => { throw new Error('no tmux') } }
   notice = await wallCycle(); expect(notice).not.toContain('選單')
   deps.mainPicker = was
+})
+
+test('WO-204: the connector key dismisses the limit menu without another refusal, cut, or delivery item', async () => {
+  const oldPath = process.env.PATH!, picker = deps.mainPicker, usageWall = deps.usageWall
+  const screen = join(dir, 'screen'), keys = join(dir, 'keys')
+  writeFileSync(join(dir, 'wait-selected'), LIMIT_PANE(SAFE))
+  writeFileSync(join(dir, 'prompt'), NORMAL)
+  script('tmux', `cd "$(dirname "$0")" || exit 1
+[ "$3" = wo204-pane ] || exit 1
+case "$1:$4" in
+  capture-pane:-p) cat screen ;;
+  send-keys:Up) echo Up >> keys; [ -f ignore-up ] || cp wait-selected screen ;;
+  send-keys:Enter) echo Enter >> keys; cp prompt screen ;;
+  *) exit 1 ;;
+esac`)
+  try {
+    process.env.PATH = dir + ':' + oldPath
+    deps.mainPicker = { ...picker, capture: () => capturePane('wo204-pane'),
+      drive: (idx: number, key: string) => driveStartupPicker('wo204-pane', idx, key) }
+    const main = L.__main(), pid = main.mainPid()!
+    // If tmux loses the navigation key, Enter must never confirm the automatic option.
+    writeFileSync(screen, LIMIT_PANE(SAFE, 1))
+    writeFileSync(join(dir, 'ignore-up'), '1')
+    expect(await deps.mainPicker.drive(0, detectStartupPicker(LIMIT_PANE(SAFE))!.key)).toBe('stuck')
+    expect(readFileSync(keys, 'utf8')).toBe('Up\n')
+    unlinkSync(join(dir, 'ignore-up'))
+    for (const bound of [false, true]) {
+      const p = 'wo204-' + bound
+      const wall = { walled: false, clearedMs: null as number | null }
+      deps.usageWall = () => wall
+      const work: string[] = []
+      if (bound) {
+        const meta = { chat_id: '1', message_id: '60401', user: 'joey_lab' }
+        await L.routeEvent({ id: 'tg-1-60401', source: 'telegram', from: 'joey', text: '週報', meta, verified: true,
+          notif: { method: 'notifications/claude/channel', params: { content: '週報', meta } } } as any)
+        work.push(main.items(r => r.event === 'tg-1-60401')[0].id)
+      }
+      await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p, dids: work })
+      await L.__mainEvent({ event: 'PreToolUse', pid, prompt_id: p, tool_name: 'Read' })
+      wall.walled = true
+      await L.__mainEvent({ event: 'StopFailure', pid, prompt_id: p, error: 'rate_limit' })
+      const gen = main.currentGen()!, episode = gen.wall_since, refusedAt = gen.wall_refused_at
+      const reminders = main.items(r => r.wall_resume === episode)
+      expect(reminders).toHaveLength(bound ? 0 : 1)
+      const id = bound ? work[0] : reminders[0].id
+      if (bound) expect(L.__journal().get('msg', id)).toMatchObject({ reason: 'interrupted', cut_by: 'stop_failure:rate_limit' })
+      const ids = main.items(() => true).map(r => r.id)
+      const journal = L.__journal().path, offset = readFileSync(journal, 'utf8').length
+      writeFileSync(screen, LIMIT_PANE(SAFE, 1)); writeFileSync(keys, '')
+      wall.walled = false
+      wall.clearedMs = Date.now()
+      main.statusChanged(wall.clearedMs)
+      expect(await until(() => L.__journal().get('msg', id)?.state === 'offered')).toBe(true)
+      expect(readFileSync(keys, 'utf8').trim().split('\n')).toEqual(['Up', 'Enter'])
+      expect(readFileSync(screen, 'utf8')).toBe(NORMAL)
+      expect(main.statusIdle(true, Date.now(), Date.now())).toBe(false)
+      expect(gen).toMatchObject({ state: 'walled', wall_since: episode, wall_refused_at: refusedAt, probes: 0 })
+      const lines = readFileSync(journal, 'utf8').slice(offset).trim().split('\n').map(l => JSON.parse(l))
+      expect(lines.filter(l => l.wall_refused_at || l.ended_by === 'interrupted' || l.cut_by)).toEqual([])
+      expect(lines.filter(l => l.rec === 'msg' && l.state === 'offered').map(l => l.id)).toEqual([id])
+      expect(main.items(() => true).map(r => r.id)).toEqual(ids)
+      await L.__mainEvent({ event: 'UserPromptSubmit', pid, prompt_id: p + '-retry', dids: [id] })
+      await L.__mainEvent({ event: 'Stop', pid, prompt_id: p + '-retry', phase: 'final' })
+      expect(gen.state).toBe('idle')
+      expect(gen.wall_since).toBeUndefined()
+    }
+  } finally {
+    process.env.PATH = oldPath
+    deps.mainPicker = picker
+    deps.usageWall = usageWall
+  }
 })

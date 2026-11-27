@@ -85,7 +85,7 @@ const OPTION_LINE = /^\s*[❯>●*]?\s*(\d+)\.\s+(.+?)\s*$/
 // 002l (D11): design/notify 「同一件事不會連發」. ● ○ ◉ are NOT cursor glyphs: ● is the TUI's own bullet in front of every assistant
 // message, so the main's numbered summary (● 1. …) read as a menu and was sent to Joey three times (G07, #1054/#1059/#1064). The cursor must
 // also be on an option line near the bottom of the pane (a parked menu is the last thing drawn), with no input box below it.
-const CURSOR_OPTION_LINE = /^\s*[❯›▶>]\s*(\d+)\.\s+\S/
+const CURSOR_OPTION_LINE = /^\s*[❯›▶>]\s*(\d+)\.\s+(\S.*?)\s*$/
 const MENU_TAIL_LINES = 15
 const RULE_LINE = /^\s*[╭╰│]?[─━═]{10,}/          // the input box's border / the prompt's horizontal rules
 const EMPTY_PROMPT = /^\s*[│|]?\s*[>❯]\s*[│|]?\s*$/
@@ -183,8 +183,7 @@ export function describePicker(picker: DetectedPicker, tmux: string): string {
 export type DriveResult = 'ok' | 'gone' | 'stuck'
 
 /**
- * Drive the picker: from the top-anchored cursor, Down × idx then Enter.
- * (Same deterministic navigation resumePickerInlineSwitch uses.)
+ * Drive from the visible numbered cursor and verify its selection before Enter. Older pickers without a cursor start at the top.
  *
  * CRITICAL — re-verify the LIVE pane before sending ANY key (a tapped button
  * can be stale: the picker may have been answered elsewhere, timed out, or been
@@ -202,11 +201,18 @@ export async function driveStartupPicker(tmux: string, idx: number, expectKey: s
   const live = detectStartupPicker(pane)
   if (!live || live.key !== expectKey || idx < 0 || idx >= live.options.length) return 'gone'
 
-  for (let i = 0; i < idx; i++) {
-    await runCommand(['tmux', 'send-keys', '-t', tmux, 'Down'])
+  const cursor = (screen: string) => screen.split('\n').map(line => line.match(CURSOR_OPTION_LINE)).filter(Boolean).at(-1)
+  const start = cursor(pane)
+  const distance = idx - (Number(start?.[1] ?? 1) - 1)
+  for (let i = 0; i < Math.abs(distance); i++) {
+    await runCommand(['tmux', 'send-keys', '-t', tmux, distance < 0 ? 'Up' : 'Down'])
     await new Promise((r) => setTimeout(r, 100))
   }
   await new Promise((r) => setTimeout(r, 150))
+  const ready = await capturePane(tmux)
+  if (detectStartupPicker(ready)?.key !== expectKey) return 'gone'
+  const selected = cursor(ready)
+  if (start && (Number(selected?.[1]) !== idx + 1 || selected?.[2] !== live.options[idx])) return 'stuck'
   await runCommand(['tmux', 'send-keys', '-t', tmux, 'Enter'])
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise((r) => setTimeout(r, 400))
