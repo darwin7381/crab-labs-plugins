@@ -462,6 +462,27 @@ test('WO-209 an answered item held by 1.59.5 keeps its first cut across upgrade'
   expect(d.journal.get('msg', id)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
 })
 
+test('WO-209 one close notice describes the answered and unanswered items of the same crash', async () => {
+  const d = liveMain(), told: string[] = []
+  d.env.tellJoey = (text, rule) => { if (rule === 'main-cut') told.push(text) }
+  d.env.genuineAfter = () => 0
+  await d.hook('SessionStart', '', { transcript_path: 'test-transcript' })
+  const first = d.add('joey', '先到')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'retry', { dids: [first] })
+  const late = d.add('joey', '後到')
+  await d.hook('PostToolUse', 'retry', { tool_name: 'Read' })  // evidence for first, then pulls late
+  for (const id of [first, late]) {
+    expect(d.journal.get('msg', id)?.state).toBe('bound')
+    d.journal.write('msg', id, 'bound', { cuts: 1 })
+  }
+  await d.hook('SessionEnd', '')
+  for (const id of [first, late]) expect(d.journal.get('msg', id)).toMatchObject({ state: 'done', reason: 'cut_twice', cuts: 2 })
+  expect(told).toHaveLength(1)
+  expect(told[0]).toMatch(/處理到一半就[^\n]*「先到」/)
+  expect(told[0]).toMatch(/還沒有任何輸出就[^\n]*「後到」/)
+})
+
 test('WO-209 (1,4) a bare turn killed before final Stop gets exactly one line on the next idle stream', async () => {
   const d = liveMain(), meta = { chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' }
   const writes: any[] = []

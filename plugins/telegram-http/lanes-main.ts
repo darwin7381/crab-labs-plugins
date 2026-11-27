@@ -674,31 +674,30 @@ export function createMain(E: MainEnv) {
       // In older journals a held process/session cut had cut_by but no cuts yet.
       const cuts = Number(r.cuts ?? (r.cut_by === 'gen_end' || r.cut_by === 'session_start')) + 1
       const output = hasOutput(out) ? outputBy(out) : undefined
-      if (cuts > CUT_REOFFERS) {
-        closeItem(r, { reason: 'cut_twice', cuts, cut_by: why, output_by: output })
-        capped.push(r)
-      } else if (output) {
-        holdCut(r, why, output, cuts)
-        held.push(r)
-      } else again(r, { cuts })
+      if (cuts <= CUT_REOFFERS) {
+        if (output) { holdCut(r, why, output, cuts); held.push(r) }
+        else again(r, { cuts })
+        continue
+      }
+      closeItem(r, { reason: 'cut_twice', cuts, cut_by: why, output_by: output })
+      capped.push(r)
     }
     if (held.length || capped.length) E.log('info', `lanes: ${why} of gen ${g.id}: ${itemCount(held)} item(s) the model had answered held, ${itemCount(capped)} closed after two cuts, ${itemCount(back)} queued again`)
     return { back, held, capped }
   }
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
    *  given to the main again. It is the line about each (it meets their Joey line, as the asked-restart notice) */
-  function tellClosed(rs: Row[], what: string): void {
+  function tellClosed(rs: Row[], what: (r: Row) => string): void {
     const told = rs.filter(r => r.kind !== 'digest')
     if (!told.length) return
-    E.tellJoey(`${what}為了不一直重來，這 ${told.length} 則不會再自動交給主線：${told.map(r => `「${contentOf(r).replace(/\s+/g, ' ').slice(0, 80)}」`).join('；')}。還要處理的話請再說一次（同事的事請對方再送一次）。`,
+    const lines = Array.from(Map.groupBy(told, what), ([sentence, group]) =>
+      `${sentence}為了不一直重來，這 ${group.length} 則不會再自動交給主線：${group.map(r => `「${contentOf(r).replace(/\s+/g, ' ').slice(0, 80)}」`).join('；')}。`)
+    E.tellJoey(`${lines.join('\n')}還要處理的話請再說一次（同事的事請對方再送一次）。`,
       'main-cut', [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))])
   }
   function tellCut(rs: Row[], why: string): void {
     const end = why === 'gen_end' ? '結束了（行程不在了）' : '換了一個 session'
-    for (const answered of [false, true]) {
-      tellClosed(rs.filter(r => Boolean(r.output_by) === answered),
-        `主線兩次在讀進下面的訊息之後、${answered ? '處理到一半' : '還沒有任何輸出'}就${end}。`)
-    }
+    tellClosed(rs, r => `主線兩次在讀進下面的訊息之後、${r.output_by ? '處理到一半' : '還沒有任何輸出'}就${end}。`)
   }
   /** WO-201 (point 4, inventory L5): turn `p` of gen `g` ended in a StopFailure that is not an account kind (server_error, an overload, unknown). An item
    *  the model had already said something about (outputOf) is an interrupted turn's (case 4: holdCut, cut_by stop_failure:<err>). One with nothing after
@@ -731,7 +730,7 @@ export function createMain(E: MainEnv) {
       if (!stuck) { stuck = { gen: g.id, prompt: null, at: now }; E.tellJoey(text, 'main-stuck') }
       else E.log('info', `lanes: ${parked.length} item(s) parked at the StopFailure cap during an open stuck episode (Joey was told once): ${parked.map(r => r.id).join(', ')}`)
     }
-    if (closed.length) tellClosed(closed, `主線回合又以錯誤結束（${err}），這些訊息已經交給它 ${MAIN_FAIL_MAX + 1} 次都沒成功。`)
+    if (closed.length) tellClosed(closed, () => `主線回合又以錯誤結束（${err}），這些訊息已經交給它 ${MAIN_FAIL_MAX + 1} 次都沒成功。`)
   }
   /** WO-201 (point 4): the gen ended a turn with a final Stop: the model answers again. The items a failed turn left waiting go now; the parked ones go once
    *  (fail_released: parked again they are closed) */
