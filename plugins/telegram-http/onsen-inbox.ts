@@ -188,6 +188,7 @@ export class OnsenPuller {
   private stopped: Promise<void> | null = null
   private backoffMs = 0
   private warnAt = 0
+  private takeMember = false
   private credWarnAt = 0
   private wake: (() => void) | null = null
   /** WO-194 A.2: the pending items answered `later` (seq → when they are tried again); in memory: a restart tries every pending item at once */
@@ -196,7 +197,7 @@ export class OnsenPuller {
     resets: 0, errors: 0, last_error: null as string | null, baseline: null as number | null, held: 0, held_then_delivered: 0 }
   /** deliver's `again`: the item was answered `later` before (a retry: its delivery may try once instead of its own retry series) */
   constructor(readonly o: { req: Req; base: string; inbox: OnsenInbox; deliver: (it: PullItem, again?: boolean) => Promise<HandResult>; log: Log; host: string
-    waitS?: number; limit?: number; minBackoffMs?: number; maxBackoffMs?: number; now?: () => number; noCredentialRetryMs?: number; laterMs?: number }) {}
+    waitS?: number; limit?: number; minBackoffMs?: number; maxBackoffMs?: number; now?: () => number; noCredentialRetryMs?: number; laterMs?: number; takeEnabled?: boolean }) {}
   private now(): number { return this.o.now ? this.o.now() : Date.now() }
 
   start(): void {
@@ -256,6 +257,14 @@ export class OnsenPuller {
     else throw new Error(`ack ${upto}: ${r ? `HTTP ${r.status}` : 'no credential'}`)
   }
 
+  private pullPaused(status: number): boolean {
+    if (!this.o.takeEnabled) return false
+    if (status === 409 && !this.takeMember) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
+    if (status === 200 && this.takeMember) this.o.log('info', 'onsen inbox: member is on pull again')
+    if (status === 200 || status === 409) this.takeMember = status === 409
+    return status === 409
+  }
+
   /** one round: hand on what is pending, ack, one long poll, take and hand on what it gave, ack. Throws on any failure (the loop backs off). */
   async once(): Promise<void> {
     if (!this.o.inbox.based) { await this.baseline(); return }
@@ -266,6 +275,7 @@ export class OnsenPuller {
     const path = `/inbox?after=${inbox.lastSeq}&wait=${waitS}&limit=${this.o.limit ?? 100}&host=${encodeURIComponent(this.o.host)}`
     const r = await this.o.req('GET', path, undefined, (waitS + 15) * 1000)
     if (!r) throw new NoCredential()
+    if (this.pullPaused(r.status)) return
     if (r.status !== 200) throw new Error(`GET /inbox: HTTP ${r.status}${r.json?.detail ? ` ${String(r.json.detail).slice(0, 120)}` : ''}`)
     this.stats.polls++
     this.stats.last_poll_at = new Date(this.now()).toISOString()
@@ -291,12 +301,14 @@ export class OnsenPuller {
     const host = encodeURIComponent(this.o.host)
     const r = await this.o.req('GET', `/inbox?after=0&wait=0&limit=1&host=${host}`, undefined, 15_000)
     if (!r) throw new NoCredential()
+    if (this.pullPaused(r.status)) return
     if (r.status !== 200) throw new Error(`GET /inbox (first start): HTTP ${r.status}`)
     const last = Number.isInteger(r.json?.last_seq) ? r.json.last_seq as number : null
     let n: number | null = Number.isInteger(r.json?.acked_seq) ? Math.min(r.json.acked_seq, last ?? r.json.acked_seq) : null
     if (n == null) {
       const c = await this.o.req('GET', `/inbox?after=${BASELINE_AFTER}&wait=0&limit=1&host=${host}`, undefined, 15_000)
       if (!c) throw new NoCredential()
+      if (this.pullPaused(c.status)) return
       if (c.status !== 200) throw new Error(`GET /inbox (first start): HTTP ${c.status}`)
       n = c.json?.reset === true && Number.isInteger(c.json?.continue_after) ? c.json.continue_after : Number.isInteger(c.json?.last_seq) ? c.json.last_seq : null
       if (n == null) throw new Error('GET /inbox (first start): no count in the answer')
@@ -312,6 +324,7 @@ export class OnsenPuller {
     while (this.running) {
       try {
         await this.once()
+        if (this.takeMember && this.running) await this.sleep(60_000)
         if (this.backoffMs) this.o.log('info', `onsen inbox: ${this.o.base} answers again`)
         this.backoffMs = 0
       } catch (e) {

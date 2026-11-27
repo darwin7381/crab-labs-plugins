@@ -64,6 +64,7 @@ import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
+import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards, mentionItemText } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
@@ -2027,6 +2028,8 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
 // `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen); the credential is this
 // daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
 // recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
+const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
+let takeMode: TakeMode | undefined
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
@@ -2035,7 +2038,7 @@ const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
   const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
-const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
+const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ takeEnabled: ONSEN_TAKE_ON, req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
   deliver: (it, again) => deliverPulled(it, again), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
   ...(Number(process.env.ONSEN_PERSON_RETRY_MS) > 0 ? { laterMs: Number(process.env.ONSEN_PERSON_RETRY_MS) } : {}),   // WO-194 A.2: tests only
   ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
@@ -2851,6 +2854,7 @@ let shuttingDown = false
 function shutdown(reason: string): void {
   if (shuttingDown) return
   shuttingDown = true
+  takeMode?.stop()
   log('warn', `shutting down (reason: ${reason}) uptime=${process.uptime().toFixed(1)}s`)
   try { onsenStep3Stop?.() } catch {}          // Onsen step 3 (WO-143): a turn_end still settling is written now (the spool is a local append)
   try {
@@ -4218,7 +4222,7 @@ if (Lanes.LANES_ON) {
       // BTCC names the agent from this daemon's mesh credential
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
-        const machine = ((process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
+        const machine = machineName()
         try {
           const r = await fetch(`${BTCC_API_BASE}/api/fleet/main-registry`, {
             method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() }, body: JSON.stringify({ machine, ...a }), signal: AbortSignal.timeout(6000) })
@@ -4330,6 +4334,16 @@ function liveSetting(k: LiveKey): string | undefined {
   }
   return liveFile.v[k]
 }
+if (ONSEN_TAKE_ON) {
+  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, lanes: Lanes.LANES_ON, record: !!onsen?.cfg.record,
+    observation: switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT) })
+  if (reason) log('info', `onsen take: staying on pull: ${reason}`)
+  else if (onsen) {
+    takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h) => onsen.request(m, p, b, t, h),
+      () => registryStatusChanged?.(), line => log('info', line))
+    void takeMode.probe()
+  }
+}
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
@@ -4369,7 +4383,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // /v1/members/<agent>/observation with the credential of /status/batch, as the record is handed out (feed) when it changed, else every 15 s (the
   // record computed again); one in flight, the newest after it, nothing queued, no spool. ONSEN_OBSERVATION lists the agent (re-read as JEV_SCREEN)
   const obsExceptions = join(process.env.LANES_DIR ?? join(AGENT_WORKSPACE_DIR, '.lanes'), 'run', 'screen-exceptions.jsonl')
-  const obsPut = new ObservationPut({ agent: ONSEN_AGENT, on: () => switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT),
+  const obsPut = new ObservationPut({ agent: ONSEN_AGENT, on: () => takeMode?.observationRequired || switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT),
     put: (body, timeoutMs) => onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/observation`, new TextEncoder().encode(JSON.stringify(body)), 'application/json', timeoutMs),
     refresh: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } },
     exception: line => { try { mkdirSync(dirname(obsExceptions), { recursive: true }); appendFileSync(obsExceptions, JSON.stringify(line) + '\n') } catch {} },
