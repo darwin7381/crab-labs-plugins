@@ -6,7 +6,7 @@ the agent-inbox daemon). Every other component asks the tg daemon.
 | | mechanism | record | moved by |
 |---|---|---|---|
 | M1 | delivery ledger | one `msg` per item for the main | the main's hook events |
-| M2 | main record | one `main` per main process (gen = pid) | the main's hook events, plus one `kill -0` |
+| M2 | main record | one `main` per main process (gen = pid) | hook events, adoption from the session registry, and the pid check |
 | M3 | event record with obligations | one `event` per inbound event | the router, the lane's own tool calls, the run's exit |
 | M4 | wake rule | `wake` lines, which log decisions and are not folded | M2 phase × what M3 owes the main |
 | M5 | run record | one `run` per lane run | the lane process: spawn, its result JSON, its exit code |
@@ -146,6 +146,16 @@ Fields:
 Other fields: `pid`, `session_id`, `transcript_path` (read for one question only: WO-201's output after the binding, above), `source`, `error`, and `stopped_prompt` on an `idle` gen: the
 prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop"). `owed_hold` (the prompt) and
 `owed_events` (002q): the turn that the Stop check held because it still owed Joey a line, and those events (see "The main's Stop" below).
+
+With no live gen, a registry change or the five-second tick can register the status source's main with `source: 'adopt'`.
+Its session must be expected and its OS process start must match the registry file. After 60 seconds of disagreement,
+Joey gets the agent, session, pid and reason once. Registering a live gen rearms the notice.
+
+A main turn cut by StopFailure or process loss with no delivery item records `cut_turn` with `at` (epoch ms) and `why`.
+A model error adds `retry_at`. A process loss can include `background_agents` from that session at the cut.
+When program delivery is possible and there is no candidate, a successful continuation writes `resume_sent = cut_turn.at`
+and increments `resumes`. The next gen inherits all three fields. The main's own final Stop clears the cut and its receipt.
+`resumes` retains the agent's total.
 
 **What a turn of the main works on** (002w B) is one set, M1's `turnWork(gen, prompt)`: the items bound to the prompt (not the digest) and their events;
 for a turn that took in nothing (its own background task's notification opened it; Claude Code starts such turns on its own), the work the gen carries

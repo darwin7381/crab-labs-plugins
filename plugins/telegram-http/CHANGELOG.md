@@ -1,3 +1,9 @@
+## 1.59.5 — 2026-11-28 (WO-205 and WO-209)
+
+- M2 can recover a missed SessionStart from the same Claude Code session registry that supplies status. A registry change or the existing five-second tick adopts the expected interactive main after checking its process start. A disagreement lasting 60 seconds produces one notice to Joey and one log entry.
+- A bare turn cut by an account failure, a model error or the end of its process gets a continuation when the main can next take program work and the queue offers no candidate. Model errors wait for the usual item backoff. For a process loss, the line includes the ending session's background job count when available and positive.
+- The gen journal carries the interrupted turn, its delivery receipt and the lifetime `resumes` count through registration and adoption. Each successful stream write increments the count. The main's own final Stop clears the interruption and receipt. Wall recovery notices use Taipei time and report the messages still held.
+
 ## 1.59.4 — 2026-11-27 (WO-204 part 2, Chiron mesh-13338: the probe resumes the main at the clear — no new item kind; Joey TG chiron:2848 「怎麼回事？為何額度早解了也重啟了卻卡死在這？？」, chiron:2853 「你又在亂堆補丁而沒有想清楚完善簡潔可靠的機制了嗎」)
 
 - **At a keeper clear, M2's probe releases everything this account cap held, in one offer**: refused messages (no output) and partially answered account-cut messages (`cut_by: stop_failure:<account kind>`), each cut message with its interruption line, at once (no ten-minute wait for account cuts). The limit menu is driven first (1.59.3: "Stop and wait").
