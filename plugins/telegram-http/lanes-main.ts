@@ -438,6 +438,10 @@ export function createMain(E: MainEnv) {
       if (!stillReady()) return
       if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
     }
+    const advanceProbe = (row: Row) => setMain(row, 'walled', {
+      retry_at: Date.now() + backoff(String(row.kind ?? ''), Number(row.probes ?? 0)),
+      ...(menu && !menu.asks ? { wall_menu: menu.text } : {}), ...(wall.clear != null ? { uw_clear_used: wall.clear } : {}),
+    })
     const down = new Set<string>()
     for (const it of cands) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
@@ -471,8 +475,7 @@ export function createMain(E: MainEnv) {
       }
       // Consume the keeper's clear only after a write. A failed lookup or a disconnected stream still owes this offer.
       if (probe && now.state === 'walled' && now.version === version) {
-        setMain(now, 'walled', { retry_at: Date.now() + backoff(String(now.kind ?? ''), Number(now.probes ?? 0)),
-          ...(menu && !menu.asks ? { wall_menu: menu.text } : {}), ...(wall.clear != null ? { uw_clear_used: wall.clear } : {}) })
+        advanceProbe(now)
       }
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
@@ -484,6 +487,8 @@ export function createMain(E: MainEnv) {
       delivered()
       return
     }
+    // With no keeper, an attempted PL4 probe uses its retry slot even if every stream was down.
+    if (probe && wall.clear == null && down.size && stillReady()) advanceProbe(g)
   }
   /** 002w (E, gaps 4, 11): an item reached the main (offered, or bound at a boundary): an episode of owed items nobody could take is over */
   function delivered(): void {

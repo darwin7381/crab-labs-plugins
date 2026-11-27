@@ -4190,7 +4190,8 @@ if (Lanes.LANES_ON) {
       const w = wallReader.state()
       if (!w) return null
       if (w.walled) return { walled: true, clearedMs: null, lastWallMs: w.lastWallMs, resets_at: w.resets_at }
-      return w.clearedMs != null && w.clearedMs >= wallSinceMs - 60_000 ? { walled: false, clearedMs: w.clearedMs, by: w.cleared_by } : null
+      const clearedMs = w.clearedMs != null && w.clearedMs >= wallSinceMs - 60_000 ? w.clearedMs : null
+      return { walled: false, clearedMs, by: w.cleared_by }
     },   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes; WO-141 follow-up: the lanes' wall reads it too (by: cleared_by)
     ...(INBOX_ONLY ? {
       meshSend: async (to, text, replyTo, noReply, extra, send) => {

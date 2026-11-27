@@ -81,14 +81,33 @@ test('WO-200 (c) program waits through a human probe and is offered once on clea
   expect(d.offers).toEqual([[person], [call]])
 })
 
-test('WO-200 M2 timer holds a program with a fresh wall and probes once without keeper state', async () => {
+test('WO-200 M2 timer offers nothing while keeper state is fresh', async () => {
   const d = daemon()
   d.calls.set('9', 'accepted')
-  const item = d.add('peer', '9')
+  d.add('peer', '9')
   setSystemTime(T + 3_600_001)
   await d.main.tick(); await d.flush()
   expect(d.offers).toEqual([])
+  expect(d.requests).toEqual([])
+})
+
+test('WO-200 M2 timer keeps the existing probe and backoff without fresh keeper state', async () => {
+  const d = daemon()
   d.env.usageWall = () => null
+  d.calls.set('9', 'accepted')
+  const item = d.add('peer', '9')
+  await d.flush()
+  expect(d.offers).toEqual([])
+  setSystemTime(T + 3_600_000)
+  const offer = d.env.offer
+  let attempts = 0
+  d.env.offer = async () => { attempts++; return false }
+  await d.main.tick(); await d.flush()
+  d.env.offer = offer
+  await d.main.tick(); await d.flush()
+  expect(attempts).toBe(1)
+  expect(d.offers).toEqual([])
+  setSystemTime(Number(d.main.currentGen()!.retry_at))
   await d.main.tick(); await d.flush(); await d.main.tick()
   expect(d.offers).toEqual([[item]])
 })

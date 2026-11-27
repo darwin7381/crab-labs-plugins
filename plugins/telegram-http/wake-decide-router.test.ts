@@ -234,6 +234,18 @@ test('status-latency-lab 5: an idle main with a dialog open: the 此刻 line nam
   expect(L.mainNowWords({ state: 'idle', detail: { dialog_open: true } })).toBe('主線：停在一個選單上等 Joey 按（dialog open）。交給它的事要等 Joey 按了才會看到。')
 })
 
+test('WO-200 another allowed person and a bridge guest both reach M1 as joey', async () => {
+  member = 'walled'
+  try {
+    for (const from of ['alice', 'tg-123']) {
+      const ev = { id: 'person-test-' + from, source: 'telegram' as const, from, text: '在嗎？', verified: true,
+        person_message_ids: ['105'], meta: { user: from }, notif: { method: 'notifications/claude/channel', params: { content: '在嗎？', meta: { user: from } } } }
+      expect(await L.routeEvent(ev)).toMatchObject({ target: 'main' })
+      expect(items(ev.id)).toMatchObject([{ kind: 'joey', person_message_ids: ['105'] }])
+    }
+  } finally { member = 'idle' }
+})
+
 test('switch off for the agent: the old rules, decided_by old', async () => {
   process.env.LANES_WAKE_DECIDE = 'someone-else'
   try {
