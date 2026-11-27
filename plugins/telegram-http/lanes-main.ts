@@ -26,7 +26,7 @@ import { BOUNDARY_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, defe
 import { genuineAssistantAfterFile } from './liveness.ts'
 
 import type { CallCheck, CallWait } from './onsen-client.ts'
-import { personCanProbe } from './usage-wall.ts'
+import { hhmmTaipei, personCanProbe } from './usage-wall.ts'
 
 export type MainWall = { walled: boolean; clearedMs: number | null; lastWallMs?: number | null; resets_at?: string | null }
 
@@ -253,11 +253,13 @@ export function createMain(E: MainEnv) {
     const probe = g?.state === 'walled' && !wall?.walled && ((!wall && Date.now() >= Number(g.retry_at ?? Infinity)) || (clear ?? 0) > Number(g.uw_clear_used ?? 0))
     return { active, person: active && personCanProbe(last || null), clear, probe }
   }
+  const accountFailure = (reason: unknown): boolean => typeof reason === 'string' && reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(reason.slice('stop_failure:'.length))
+  const heldByAccount = (r: Row): boolean => accountFailure(r.reason) || (heldCut(r) && accountFailure(r.cut_by))
   /** An item already refused or interrupted by this wall waits for the clear. */
   function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
     if (!wall.active) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
-    const refused = typeof r.reason === 'string' && r.reason.startsWith('stop_failure:') && ACCOUNT_WALL.has(r.reason.slice('stop_failure:'.length))
+    const refused = heldByAccount(r)
     return wall.person && r.kind === 'joey' && !refused
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
@@ -434,10 +436,14 @@ export function createMain(E: MainEnv) {
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
-    // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
-    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
-    if (!cands.length) return
-    const mp = wall.active && !probe ? null : mentionsNow()
+    const accountClear = probe && (wall.clear ?? 0) > Number(g.uw_clear_used ?? 0) && ACCOUNT_WALL.has(g.kind)
+    const episode = g.wall_since
+    const resume = accountClear && episode && g.resume_sent !== episode && Number.isFinite(g.wall_refused_at)
+    const candidates = () => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !batchedRider(r) && !waitsRetry(r) && eligible(r)
+      && (!heldCut(r) || (accountClear && accountFailure(r.cut_by))))
+    const cands = candidates()
+    if (!cands.length && !resume) return
+    const mp = cands.length && !(wall.active && !probe) ? mentionsNow() : null
     const mb = mp ? await mp : null
     if (mp && !stillReady()) return
     let menu: { text: string; asks: boolean } | null = null
@@ -446,15 +452,17 @@ export function createMain(E: MainEnv) {
       if (!stillReady()) return
       if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
     }
-    const advanceProbe = (row: Row) => setMain(row, 'walled', {
+    const advanceProbe = (row: Row, fields: Record<string, unknown> = {}) => setMain(row, 'walled', {
+      ...fields,
       retry_at: Date.now() + backoff(String(row.kind ?? ''), Number(row.probes ?? 0)),
       ...(menu && !menu.asks ? { wall_menu: menu.text } : {}), ...(wall.clear != null ? { uw_clear_used: wall.clear } : {}),
     })
     const down = new Set<string>()
-    for (const it of cands) {
+    // Work can arrive while the probe is driving the menu. It takes precedence over a bare resume.
+    for (const it of accountClear ? candidates() : cands) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
-      let riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
+      let riders = items(r => r.id !== it.id && r.state === 'queued' && (heldCut(r) || r.reason === 'batched' || (accountClear && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
       const checkedGroup = checked([it, ...riders], g, wall.clear)
       if (checkedGroup instanceof Promise) {
         const group = await checkedGroup
@@ -494,6 +502,18 @@ export function createMain(E: MainEnv) {
       try { E.woke?.(J().get('msg', it.id)!, { gen: g.id, probe }) } catch (e) { E.log('warn', `lanes: woke hook: ${e}`) }
       delivered()
       return
+    }
+    // A final Call has been closed by checked(). A disconnected stream or an unverified Call is still owed.
+    if (resume && !candidates().length && stillReady()) {
+      const content = `額度通了，上一回合 ${hhmmTaipei(g.wall_refused_at)}（台北）被用量上限打斷，接著做沒做完的；沒有要接的就直接結束這一回合。`
+      const notif = { method: 'notifications/claude/channel', params: { content, meta: { user: 'lanes', via: 'lanes', no_reply: 'true' } } }
+      const sent = await E.offer(notif, 'tg', Number(g.pid)).catch(e => { E.log('warn', `lanes: resume probe failed: ${e}`); return false })
+      // A hook may already have opened the turn or refused it again during the write. Keep its M2 phase and backoff.
+      const now = currentGen()
+      if (sent && now?.wall_since === episode) {
+        if (now === g && now.version === version) advanceProbe(now, { resume_sent: episode })
+        else J().write('main', now.id, now.state, { resume_sent: episode })
+      }
     }
     // With no keeper, an attempted PL4 probe uses its retry slot even if every stream was down.
     if (probe && wall.clear == null && down.size && stillReady()) advanceProbe(g)
@@ -859,7 +879,7 @@ export function createMain(E: MainEnv) {
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
         openTools.delete(g.id)
-        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, resume_sent: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
         if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
         void pump()
         return {}
@@ -936,7 +956,8 @@ export function createMain(E: MainEnv) {
     // 002w (E, gap 13): the main's wall is an episode of the AGENT: a gen that ended walled hands its open episode to this one, whose first final Stop
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
-    const carry = ended.length ? { wall_since: ended.map(r => String(r.wall_since)).sort()[0], wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
+    const since = ended.map(r => String(r.wall_since)).sort()[0]
+    const carry = since ? { wall_since: since, resume_sent: ended.find(r => r.resume_sent === since)?.resume_sent ?? null, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, probes: null, retry_at: null, wall_menu: null })
     // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
     // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)

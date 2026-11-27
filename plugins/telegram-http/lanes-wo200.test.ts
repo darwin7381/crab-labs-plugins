@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createMain, INTERRUPTED_LINE, MAIN_STUCK_MS, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
+import { createMain, INTERRUPTED_LINE, type ItemKind, type MainEnv, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { OnsenClient } from './onsen-client.ts'
 import { DeliveryFacts, LanesTap } from './onsen-status.ts'
@@ -30,7 +30,7 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
     }) as typeof fetch })
   if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid, retry_at: T + 3_600_000 })
   const env: MainEnv = { journal, agent: 'adam', usageWall: () => wall, memberState: () => wall.walled ? 'walled' : 'idle',
-    offer: async n => { const p = n.params as any; offers.push(p.meta.did.split(',')); texts.push(p.content); return true },
+    offer: async n => { const p = n.params as any; offers.push(p.meta.did?.split(',') ?? []); texts.push(p.content); return true },
     streamOpen: () => true, pidAlive: () => true, info: () => null, done: () => {}, undone: () => {},
     tellJoey: (_s, rule) => notices.push(rule), log: () => {}, expectedSession: () => [sid], refused: () => {}, genChanged: () => {}, context: () => '',
     blocked: (r, retry_after) => { for (const id of r.person_message_ids) client.recordBlocked({ message_id: id, retry_after }) },
@@ -172,37 +172,28 @@ test('WO-200 (d) two refusals write blocked receipts and replay in order once', 
   expect(d.requests.flatMap(r => r.body?.items ?? []).some(f => f.state === 'turn_end')).toBe(false)
   expect(d.offers).toEqual(ids.map(id => [id]))
   d.clear(); await d.flush()
-  await d.hook('UserPromptSubmit', 'retry-1', { dids: [ids[0]] })
-  await d.hook('Stop', 'retry-1', { phase: 'final' }); await d.flush()
-  await d.hook('UserPromptSubmit', 'retry-2', { dids: [ids[1]] })
-  await d.hook('Stop', 'retry-2', { phase: 'final' }); await d.flush(); await d.main.tick()
-  expect(d.offers).toEqual([...ids, ...ids].map(id => [id]))
+  expect(d.offers).toEqual([[ids[0]], [ids[1]], ids])
+  await d.hook('UserPromptSubmit', 'retry', { dids: ids })
+  await d.hook('Stop', 'retry', { phase: 'final' }); await d.flush(); await d.main.tick()
+  expect(d.offers).toHaveLength(3)
   await d.client.syncNow(true)
-  expect(d.requests.flatMap(r => r.body?.items ?? []).filter(f => f.state === 'seen').map(f => f.turn_id)).toEqual(['101', '102', 'retry-1', 'retry-2'])
+  expect(d.requests.flatMap(r => r.body?.items ?? []).filter(f => f.state === 'seen').map(f => f.turn_id)).toEqual(['101', '102', 'retry', 'retry'])
   expect(d.notices).toEqual(['main-wall-up', 'main-wall-down'])
 })
 
-test('WO-200 (e) output before refusal rides the next item or waits a quiet period from clear', async () => {
-  for (const ride of [false, true]) {
-    const d = daemon(), item = d.add('joey', '107')
-    await d.flush()
-    await d.hook('UserPromptSubmit', 'work', { dids: [item] })
-    await d.hook('PreToolUse', 'work', { tool_name: 'Read' })
-    await d.hook('StopFailure', 'work', { error: 'rate_limit' })
-    expect(d.journal.get('msg', item)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'stop_failure:rate_limit' })
-    setSystemTime(T + 2 * MAIN_STUCK_MS)
-    d.clear(); await d.flush(); await d.main.tick()
-    expect(d.offers).toEqual([[item]])
-    if (ride) {
-      const next = d.add('joey', '108'); await d.flush()
-      expect(d.offers[1]).toEqual([next, item])
-    } else {
-      setSystemTime(Date.now() + MAIN_STUCK_MS + 1)
-      await d.main.tick(); await d.flush()
-      expect(d.offers).toEqual([[item], [item]])
-    }
-    expect(d.texts[1]).toContain(INTERRUPTED_LINE)
-  }
+test('WO-200 (e) the keeper clear immediately offers an account cut with the interrupted line', async () => {
+  const d = daemon(), item = d.add('joey', '107')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'work', { dids: [item] })
+  await d.hook('PreToolUse', 'work', { tool_name: 'Read' })
+  await d.hook('StopFailure', 'work', { error: 'rate_limit' })
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'stop_failure:rate_limit' })
+  await d.main.tick()
+  expect(d.offers).toEqual([[item]])
+  d.clear(); await Bun.sleep(0)
+  expect(d.offers).toEqual([[item], [item]])
+  expect(d.texts[1]).toStartWith(INTERRUPTED_LINE)
+  expect(d.texts[1]).not.toContain('額度通了')
 })
 
 test('WO-200 (f) final Call gets one thread line and only the open Call reaches main', async () => {
@@ -257,4 +248,109 @@ test('WO-200 a wall returning during Call lookup keeps the program queued', asyn
   d.env.checkCall = async () => 'open'
   d.clear(); await d.flush()
   expect(d.offers).toEqual([[item]])
+})
+
+const resumeText = '額度通了，上一回合 11:00（台北）被用量上限打斷，接著做沒做完的；沒有要接的就直接結束這一回合。'
+async function bareRefusal() {
+  const d = daemon(0, 'idle')
+  await d.hook('UserPromptSubmit', 'work')
+  await d.hook('StopFailure', 'work', { error: 'rate_limit' })
+  return d
+}
+
+test('WO-204 (a,d) the menu precedes a bare resume, once across repeated refusals and daemon restart', async () => {
+  const d = await bareRefusal()
+  const episode = d.main.currentGen()!.wall_since
+  const steps: string[] = []
+  d.env.menu = async drive => { if (drive) steps.push('menu'); return null }
+  d.env.offer = async (n, via, pid) => {
+    steps.push(`${via}/${pid} ${(n.params as any).content}`)
+    // The session can open its turn before the stream write returns.
+    await d.hook('UserPromptSubmit', 'resume')
+    return true
+  }
+  setSystemTime(T + 180_000)
+  await d.main.tick()
+  expect(steps).toEqual([])
+  d.clear(); await Bun.sleep(0)
+  expect(steps).toEqual(['menu', 'tg/123 ' + resumeText])
+  expect(d.main.currentGen()).toMatchObject({ state: 'in_turn', prompt_id: 'resume', resume_sent: episode })
+  expect(d.journal.rows('msg')).toEqual([])
+
+  d.wall.walled = true
+  await d.hook('StopFailure', 'resume', { error: 'rate_limit' })
+  setSystemTime(T + 181_000)
+  const journal = new Journal(d.journal.path)
+  journal.load()
+  const restarted = createMain({ ...d.env, journal })
+  restarted.initMain()
+  d.wall.walled = false
+  d.wall.clearedMs = Date.now()
+  restarted.statusChanged(d.wall.clearedMs)
+  await restarted.tick()
+  expect(restarted.currentGen()).toMatchObject({ state: 'walled', wall_since: episode, resume_sent: episode })
+  expect(steps).toHaveLength(2)
+})
+
+test('WO-204 (c) both orders of refusal and account cut reach the same clear offer', async () => {
+  for (const cutFirst of [true, false]) {
+    const d = daemon()
+    const ids: string[] = []
+    for (const [i, cut] of [cutFirst, !cutFirst].entries()) {
+      const id = d.add('joey', String(110 + i))
+      ids.push(id)
+      await d.flush()
+      expect(d.offers[i]).toEqual([id])
+      await d.hook('UserPromptSubmit', id, { dids: [id] })
+      if (cut) await d.hook('PreToolUse', id, { tool_name: 'Read' })
+      await d.hook('StopFailure', id, { error: 'billing_error' })
+      setSystemTime(Date.now() + 60_001)
+    }
+    d.clear(); await Bun.sleep(0)
+    expect(d.offers).toEqual([[ids[0]], [ids[1]], ids])
+    expect(d.texts[2].split(INTERRUPTED_LINE)).toHaveLength(2)
+    expect(d.texts[2]).not.toContain('額度通了')
+  }
+})
+
+test('WO-204 (e,g) a waiting Call takes the clear, a cancelled Call gets its thread line and leaves a bare resume', async () => {
+  for (const final of [false, true]) {
+    const d = await bareRefusal()
+    const item = d.add('peer', '7')
+    d.calls.set('7', final ? 'cancelled' : 'accepted')
+    await d.flush()
+    expect(d.offers).toEqual([])
+    d.clear(); await Bun.sleep(0)
+    if (final) {
+      expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', reason: 'call_already_final' })
+      expect(d.requests.filter(r => r.method === 'POST').map(r => r.body.body.text)).toEqual(['上限解除時這件已經是 cancelled，沒有交給主線'])
+      expect(d.texts).toEqual([resumeText])
+    } else {
+      expect(d.offers).toEqual([[item]])
+      expect(d.texts[0]).not.toContain('額度通了')
+    }
+  }
+})
+
+test('WO-204 (f) a successful person turn ends the episode before the keeper clears', async () => {
+  const d = await bareRefusal()
+  setSystemTime(T + 60_000)
+  const item = d.add('joey', '122')
+  await d.flush()
+  await d.hook('UserPromptSubmit', 'person', { dids: [item] })
+  await d.hook('Stop', 'person', { phase: 'final' })
+  expect(d.main.currentGen()?.wall_since).toBeUndefined()
+  d.clear(); await d.main.tick()
+  expect(d.offers).toEqual([[item]])
+})
+
+test('WO-204 a failed stream write leaves the bare resume available on the same clear', async () => {
+  const d = await bareRefusal(), offer = d.env.offer
+  d.env.offer = async () => false
+  d.clear(); await Bun.sleep(0)
+  expect(d.main.currentGen()?.resume_sent).toBeUndefined()
+  d.env.offer = offer
+  await d.main.tick(); await d.main.tick()
+  expect(d.texts).toEqual([resumeText])
+  expect(d.main.currentGen()?.resume_sent).toBe(d.main.currentGen()?.wall_since)
 })
