@@ -354,6 +354,27 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
   credential: () => readCredentialFile(ONSEN_CRED_FILE), credentialWhere: ONSEN_CRED_FILE, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
+const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
+let takeMode: TakeMode | undefined
+let itemPeek: ItemPeek | undefined
+let itemReceiver: ItemReceiver | undefined
+let itemClaims: Claims | undefined
+let registryStatusChanged: (() => void) | undefined
+if (ONSEN_TAKE_ON) {
+  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, lanes: Lanes.LANES_ON, record: !!onsen?.cfg.record,
+    observation: switchOn(process.env.ONSEN_OBSERVATION, ONSEN_AGENT) })
+  if (reason) log('info', `onsen take: staying on pull: ${reason}`)
+  else if (onsen) {
+    takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
+      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
+    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
+    Lanes.useItemReceiver(itemReceiver)
+    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
+    Lanes.observeItemGates(() => itemPeek!.reset())
+  }
+}
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
 // 1.58.32 (Chiron): a roamer posts nothing to Onsen, so it adds nothing to the spool; what an older version left there stays as it is (not ours to delete)
 if (onsen && Onsen.isRoamerEnv(process.env)) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)
@@ -420,8 +441,10 @@ async function connectorReply(o: { chat: string; sender: string; text: string; r
   // WO-197 segment 2: the topic is Onsen's thread (the lanes keep Onsen's ids; the reply tool's topic is turned into it first: connectorTopicArg); one
   // Onsen does not have in this conversation is dropped by ConnectorSay (a Telegram topic kept from before the switch)
   const kind = body.trim() || !o.files.length ? (o.rich ? 'rich' : 'text') : PHOTO_EXTS.has(extname(o.files[0]!).toLowerCase()) ? 'photo' : 'document'
-  return connectorSay.say({ chat: o.chat, sender: o.sender, text: body, kind, turn_id: o.turn_id, replyTo: o.replyTo != null ? String(o.replyTo) : null,
+  const said = await connectorSay.say({ chat: o.chat, sender: o.sender, text: body, kind, turn_id: o.turn_id, replyTo: o.replyTo != null ? String(o.replyTo) : null,
     silent: o.silent, ...(o.topic != null ? { thread: String(o.topic) } : {}), ...(ids.length ? { fileIds: ids, attachments: rows } : {}) })
+  if (o.turn_id && said.onsenId) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId, mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined)
+  return said
 }
 // ---- WO-197 segment 2 (Chiron; CONTRACT §7d 「連接器這一頭」, the rulings of mesh 12869): what the daemon still said on Telegram goes through Onsen ----
 /** CONTRACT §7d 「這個成員的負責人」: ONSEN_OWNER, an Onsen member name: the member's own setting (the plist) first, then the machine config (read again at
@@ -571,19 +594,19 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
   let handled = false
   try {
     handled = await handledHere({ chat, id: ref, from: userId, ...(via ? { via } : {}) }, 'command', () => Onsen.withSender('system:control', async () => {
-    if (cmd === '/start') { await reply(START_TEXT); return true }
-    if (cmd === '/help') { await reply(HELP_TEXT); return true }
-    if (cmd === '/status') { await reply(await pairedStatusText(user ? `@${user}` : userId)); return true }
-    if (Lanes.LANES_ON && cmd === '/main') {
-      const sub = t.split(/\s+/)[1] ?? ''
-      await reply(sub === 'renew' ? await Lanes.mainRenew(name) : '用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）')
-      return true
-    }
-    if (Lanes.LANES_ON && cmd === '/lanes') { await reply(await Lanes.lanesCommand(t, name)); return true }
-    if (isControlEnabled() && await handleControlSlash(t, String(HTTP_PORT), reply, connectorClearHooks(chat, ref, userId ? `tg:${userId}` : name, here, atIso))) return true
-    if (isRoamerEnabled() && await handleRoamerSlash(t, reply) !== false) return true
-    return false
-  }), h => h !== false)
+      if (cmd === '/start') { await reply(START_TEXT); return true }
+      if (cmd === '/help') { await reply(HELP_TEXT); return true }
+      if (cmd === '/status') { await reply(await pairedStatusText(user ? `@${user}` : userId)); return true }
+      if (Lanes.LANES_ON && cmd === '/main') {
+        const sub = t.split(/\s+/)[1] ?? ''
+        await reply(sub === 'renew' ? await Lanes.mainRenew(name) : '用法：/main renew（把主線換成新的 session，交接焦點卡與帳本）')
+        return true
+      }
+      if (Lanes.LANES_ON && cmd === '/lanes') { await reply(await Lanes.lanesCommand(t, name)); return true }
+      if (isControlEnabled() && await handleControlSlash(t, String(HTTP_PORT), reply, { ...connectorClearHooks(chat, ref, userId ? `tg:${userId}` : name, here, atIso), ...(item && commandId ? { command: { from: item.from, message_id: commandId } } : {}) })) return true
+      if (isRoamerEnabled() && await handleRoamerSlash(t, reply) !== false) return true
+      return false
+    }), h => h !== false)
     return handled
   } finally { if (item) itemReceiver?.report([item], handled ? 'completed' : 'not_applied') }
 }
@@ -2047,11 +2070,6 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
 // `*` (the plist, then the machine config), read at start; one base, ONSEN_BASE (default https://core.kbro.ai/api/onsen); the credential is this
 // daemon's mesh credential. Off: neither runs; only the dedupe keys /inject delivers are
 // recorded (onsen-inbox.json), so that turning ONSEN_PULL on later never hands on again what /inject already delivered.
-const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
-let takeMode: TakeMode | undefined
-let itemPeek: ItemPeek | undefined
-let itemReceiver: ItemReceiver | undefined
-let itemClaims: Claims | undefined
 const ONSEN_PULL_ON = INBOX_ONLY && switchOn(process.env.ONSEN_PULL, INBOX_SELF)
 const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
@@ -4087,7 +4105,7 @@ const mentionCards: MentionCards | null = INBOX_ONLY || !onsen ? null : new Ment
   timeoutMs: () => Number(process.env.LANES_MENTION_TIMEOUT_MS ?? 2_000),
   log: (lv, m) => log(lv, m) })
 // M2 and status read the same local session registry, including when status reporting is off.
-let registryStatusChanged: (() => void) | undefined
+
 // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
 // (every open stream counts as the main's)
 const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
@@ -4246,8 +4264,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      inboundLog: logPeerArrival,
-      schedulerTaken: maybeAutoAckScheduled,
+      ...(ONSEN_TAKE_ON ? { inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled } : {}),
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
@@ -4362,22 +4379,7 @@ function liveSetting(k: LiveKey): string | undefined {
   }
   return liveFile.v[k]
 }
-if (ONSEN_TAKE_ON) {
-  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, lanes: Lanes.LANES_ON, record: !!onsen?.cfg.record,
-    observation: switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT) })
-  if (reason) log('info', `onsen take: staying on pull: ${reason}`)
-  else if (onsen) {
-    takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h) => onsen.request(m, p, b, t, h),
-      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
-    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
-    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
-    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at))
-    Lanes.useItemReceiver(itemReceiver)
-    itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
-    Lanes.observeItemGates(() => itemPeek!.reset())
-    void takeMode.probe()
-  }
-}
+void takeMode?.probe()
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
@@ -4418,7 +4420,12 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // record computed again); one in flight, the newest after it, nothing queued, no spool. ONSEN_OBSERVATION lists the agent (re-read as JEV_SCREEN)
   const obsExceptions = join(process.env.LANES_DIR ?? join(AGENT_WORKSPACE_DIR, '.lanes'), 'run', 'screen-exceptions.jsonl')
   const obsPut = new ObservationPut({ agent: ONSEN_AGENT, on: () => takeMode?.observationRequired || switchOn(liveSetting('ONSEN_OBSERVATION'), ONSEN_AGENT),
-    put: (body, timeoutMs) => onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/observation`, new TextEncoder().encode(JSON.stringify(body)), 'application/json', timeoutMs),
+    put: async (body, timeoutMs) => {
+      const r = await onsen.putBytes(`/v1/members/${encodeURIComponent(ONSEN_AGENT)}/observation`, new TextEncoder().encode(JSON.stringify(body)), 'application/json', timeoutMs,
+        body.connector ? { 'Idempotency-Key': randomBytes(16).toString('hex') } : undefined)
+      if (body.connector && r?.status === 409 && r.json?.error?.code === 'not_current_connector') takeMode?.pause('not_current_connector', 45_000)
+      return r
+    },
     refresh: () => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } },
     exception: line => { try { mkdirSync(dirname(obsExceptions), { recursive: true }); appendFileSync(obsExceptions, JSON.stringify(line) + '\n') } catch {} },
     log: (lv, m) => log(lv, m) })
@@ -4439,6 +4446,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     const edge = `${member}|${pub.state}|${pub.detail?.interrupted === true}`
     // WO-172 (Chiron 02:43Z) / WO-177: a normal turn's turn_end goes when this record shows the turn over (not busy, stuck or compacting), not 60 s later
     try { facts.statusRecord(member) } catch {}
+    itemClaims?.statusRecord(member, sid => registry.backgroundAgents(sid), OnsenStatus.REGISTRY_SETTLE_MS)
     try { calls?.statusRecord(member) } catch {}                          // WO-175: a main turn's Calls end with it, the same way
     if (edge !== lastEdge) { lastEdge = edge; if (Lanes.LANES_ON) { try { Lanes.mainStatusChanged() } catch {} } }
   }
@@ -4668,6 +4676,11 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     return { code: 200, json: { duplicate: true } }
   }
   if (!edit && albumHeld.has(key)) {                         // WO-197: in its album already (it goes with the album)
+    const buffered = it.item && albumBuffers.get(albumHeld.get(key)!)?.items.find(row => row.item?.onsen_item_id === it.item!.onsen_item_id)
+    if (buffered?.item && it.item!.onsen_version > buffered.item.onsen_version) {
+      buffered.item = it.item
+      buffered.caption = String(p.text ?? '')
+    }
     inboundStore.stats.duplicates++
     log('info', `onsen inbound: ${it.kind} ${p.message_id ?? '?'} (${shown}) came back from the inbox again while its album waits: not buffered again`)
     return { code: 200, json: { duplicate: true, album: true } }
@@ -4950,6 +4963,14 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
+  // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
+  if (row.session_id === 'main' && !row.events) {
+    const r = await onsen!.request('GET', '/v1/items/' + encodeURIComponent(row.id))
+    if (r?.status === 404) return
+    if (r?.status !== 200) throw new Error('could not read item history for ' + row.id)
+    if (r.json.data.state !== 'waiting') return
+    row = r.json.data
+  }
   const item = itemRef(row)
   if (itemClaims?.completed(row.id)) {
     const result = await itemReceiver!.receive([item])
@@ -4960,8 +4981,9 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
-    if (edit) { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
-    await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
+    if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
+    const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
+    if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)
     return
   }
   if (row.kind === 'control') {
@@ -4976,8 +4998,9 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   }
   const kinds: Record<string, string> = { call: 'peer_call', mail: 'peer_mail', schedule: 'scheduled', keepwarm: 'wd_keepwarm' }
   if (row.call_id != null) payload.call_id = row.call_id
-  await deliverPulled({ seq: row.number, kind: kinds[row.kind] ?? row.kind, sender: row.from, relay: row.relay,
+  const result = await deliverPulled({ seq: row.number, kind: kinds[row.kind] ?? row.kind, sender: row.from, relay: row.relay,
     dedupe: 'item:' + row.id, refs: Object.fromEntries(row.refs.map(r => [r.kind, r.value])), payload }, false, item)
+  if (result === 'later') throw new Error('peer delivery did not reach the router for ' + row.id)
 }
 async function deliverPulled(it: PullItem, again = false, item?: ItemRef): Promise<HandResult> {
   // WO-176: Onsen's control item (a press in Onsen, no text) is for this agent's Telegram daemon, never for a session: no comms row, no router, no wake row

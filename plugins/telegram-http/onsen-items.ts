@@ -28,18 +28,22 @@ export class ItemPeek {
   private page?: string
   private pageTime?: string
   private previous = new Map<string, number>()
+  private boundary = new Map<string, number>()
   private wakeAt = Infinity
   private due?: ReturnType<typeof setTimeout>
   private timer?: ReturnType<typeof setTimeout>
   private reading = false
+  private request?: AbortController
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
     readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean) {}
 
   reset(): void {
     this.generation++
+    this.request?.abort()
     this.cursor = this.page = this.pageTime = undefined
     this.previous.clear()
+    this.boundary.clear()
     clearTimeout(this.timer)
     if (this.mode.active && !this.reading) this.schedule(0)
   }
@@ -75,7 +79,8 @@ export class ItemPeek {
       const q = new URLSearchParams({ state: 'waiting', wait: '25', connector: this.mode.connector, limit: '100' })
       if (this.cursor) q.set('changed_after', this.cursor)
       if (this.page) q.set('cursor', this.page)
-      const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, 35_000)
+      this.request = new AbortController()
+      const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, 35_000, undefined, this.request.signal)
       if (g !== this.generation || !this.mode.active) return
       if (r?.status === 409) {
         const why = r.json?.error?.code
@@ -86,22 +91,27 @@ export class ItemPeek {
       }
       if (r?.status !== 200 || !Array.isArray(r.json.items) || !r.json.as_of) { delay = 2000; return }
       const known = this.index()
-      const boundary = new Map<string, number>()
+      const asOf = this.pageTime ?? r.json.as_of
       for (const it of r.json.items as InboxItem[]) {
         if (g !== this.generation || !this.canRead()) return
         if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
         if (version === undefined || it.version > version) {
-          if (this.previous.get(it.id) !== it.version) await this.route(it, version !== undefined)
+          if (this.previous.get(it.id) !== it.version && this.boundary.get(it.id) !== it.version) await this.route(it, version !== undefined)
         }
-        boundary.set(it.id, it.version)
+        if (g !== this.generation) return
+        if (Date.parse(it.updated_at) >= Date.parse(asOf)) this.boundary.set(it.id, it.version)
       }
-      this.pageTime ??= r.json.as_of
+      // A dispatched control may lift a gate and reset the cursor while this page is being routed.
+      if (g !== this.generation) return
+      this.pageTime = asOf
       this.page = r.json.next_cursor || undefined
-      if (!this.page) { this.cursor = this.pageTime; this.pageTime = undefined }
-      this.previous = boundary
-      if (boundary.size && !this.page) delay = 100
-    } catch (err) { this.mode.log('onsen take: peek failed: ' + err); delay = 2000 }
+      if (!this.page) {
+        this.cursor = asOf; this.pageTime = undefined
+        this.previous = this.boundary; this.boundary = new Map()
+        if (r.json.items.length) delay = 100
+      }
+    } catch (err) { if (g === this.generation) this.mode.log('onsen take: peek failed: ' + err); delay = 2000 }
     finally {
       this.reading = false
       if (this.mode.active) this.schedule(g === this.generation ? delay : 0)

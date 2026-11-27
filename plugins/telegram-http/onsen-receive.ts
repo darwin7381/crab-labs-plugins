@@ -17,11 +17,13 @@ export type ClaimStore = {
   taken(row: InboxItem, ref: ItemRef): void
   bind(id: string, session: string, turn: string, registrySession?: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): void
+  finalStop(session: string, turn: string): void
+  continued(turn: string): void
 }
 
 export class ItemReceiver {
   private requesting = new Set<string>()
-  constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void) {}
+  constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void) {}
 
   report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
     for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
@@ -31,14 +33,14 @@ export class ItemReceiver {
     for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
   }
 
-  async receive(refs: ItemRef[], hook = false): Promise<ReceiveResult> {
+  async receive(refs: ItemRef[], hook = false, binding = false): Promise<ReceiveResult> {
     const result = empty()
     if (!this.mode.active || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
     const ids = [...byId.keys()]
     if (ids.some(id => this.requesting.has(id))) return result
-    for (const id of ids) if (this.claims.owns(id)) result.given.add(id)
-    const need = ids.filter(id => !result.given.has(id)).slice(0, 100)
+    if (binding) for (const id of ids) if (this.claims.owns(id)) result.given.add(id)
+    const need = ids.filter(id => !this.claims.owns(id)).slice(0, 100)
     if (!need.length) return result
     for (const id of need) this.requesting.add(id)
     const key = randomUUID()
@@ -50,9 +52,13 @@ export class ItemReceiver {
     const run = async (): Promise<ReceiveResult> => {
       let r = await take().catch(() => null)
       // The first write may have committed before the response was lost. Recover its exact result.
-      if (!r || r.status >= 500) {
+      let retry = 0
+      while ((!r || r.status >= 500 || expired && retry === 0) && this.mode.active) {
         expired = true
-        r = await take().catch(() => null)
+        if (retry) await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1000 * retry)).unref())
+        if (!this.mode.active) return empty()
+        retry++
+        if (!this.claims.blocked()) r = await take().catch(() => null)
       }
       if (r?.status === 409) {
         const why = r.json?.error?.code

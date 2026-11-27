@@ -19,6 +19,8 @@ export async function deliveryMode(req: ActionReq, path: string, connector: stri
   return r?.status === 200 ? 'take' : 'pull'
 }
 
+export type ItemRequest = (...args: [...Parameters<ActionReq>, signal?: AbortSignal]) => ReturnType<ActionReq>
+
 export class TakeMode {
   readonly path: string
   readonly connector: string
@@ -29,8 +31,9 @@ export class TakeMode {
   private timer?: ReturnType<typeof setTimeout>
   private reason = ''
 
-  constructor(readonly member: string, readonly req: ActionReq, readonly changed: (active: boolean) => void,
-    readonly log: (line: string) => void, machine = machineName()) {
+  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (active: boolean) => void,
+    readonly log: (line: string) => void, machine = machineName(),
+    readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
     this.connector = machine + '/' + member
   }
@@ -52,11 +55,12 @@ export class TakeMode {
 
   pause(reason: string, ms: number): void {
     if (this.stopped) return
+    if (this.reason === reason && this.timer) return
     if (reason !== this.reason) this.log('onsen take: ' + reason)
     this.reason = reason
     if (this.active) { this.active = false; this.changed(false) }
     clearTimeout(this.timer)
-    this.timer = setTimeout(() => { void this.probe() }, ms)
+    this.timer = this.later(() => { this.timer = undefined; void this.probe() }, ms)
     this.timer.unref()
   }
 
