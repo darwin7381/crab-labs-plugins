@@ -118,6 +118,12 @@ describe('the status texts', () => {
     expect(tpe(T0)).toBe('14:05')
     expect(tpe(Date.parse('2026-11-25T16:30:00Z'))).toBe('00:30')
   })
+  test('WO-200 pin uses the Taipei reset date and probe interval', () => {
+    const line = (until: string | null) => statusLine(v('idle', { walled: { until } }), T0, T0)
+    expect(line('2026-11-25T09:00:00Z')).toBe('🔴 撞上限，17:00 解除；每分鐘探測，通了自動放')
+    expect(line('2026-11-25T16:05:00Z')).toBe('🔴 撞上限，11/26 00:05 解除；每分鐘探測，通了自動放')
+    expect(line(null)).toBe('🔴 撞上限；每分鐘探測，通了自動放')
+  })
   test('line 1, every state', () => {
     expect(statusLine(v('idle'), T0)).toBe('🟢 閒置（14:05 起）')
     expect(statusLine(v('idle', { background_shell: true }), T0)).toBe('🟢 閒置（14:05 起）')
@@ -133,8 +139,6 @@ describe('the status texts', () => {
     expect(statusLine(v('waiting', { waitingFor: 'input needed' }), T0)).toBe('🟠 等你按（14:05 起）：它問了問題')
     expect(statusLine(v('waiting', { waitingFor: 'plan approval' }), T0)).toBe('🟠 等你按（14:05 起）：plan approval')
     expect(statusLine(v('waiting', { waitingFor: null }), T0)).toBe('🟠 等你按（14:05 起）')
-    expect(statusLine(v('idle', { walled: { until: '2026-11-25T09:00:00Z', kind: 'weekly' } }), T0)).toBe('🔴 撞上限，17:00 解除')
-    expect(statusLine(v('busy', { walled: { until: null } }), T0)).toBe('🔴 撞上限')
     expect(statusLine(v('offline', { reason: 'no_registration' }), T0)).toBe('⚫ 失連（14:05 起）：沒有 session')
     expect(statusLine(v('offline', { reason: 'pid_gone', walled: { until: null } }), T0)).toBe('⚫ 失連（14:05 起）：行程不在了')
     expect(statusLine(v('offline', { reason: 'pid_reused' }), T0)).toBe('⚫ 失連（14:05 起）：行程不在了')

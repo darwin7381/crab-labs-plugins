@@ -177,7 +177,7 @@ describe('drawing helpers', () => {
     expect(pinLine(main({ activity: 'idle', blockers: [] }), since, now)).toBe('🟢 閒置（19:50 起）')
     expect(pinLine(main({ activity: 'running', doing: { kind: 'tool', tool: 'mcp__plugin_x__reply' }, blockers: [] }), since, now)).toBe('🟡 處理中（19:50 起）：reply')
     expect(pinLine(main({ activity: 'paused', blockers: [{ reason: 'permission', menu_kind: 'permission' }] }), since, now)).toBe('🟠 等你按（19:50 起）：權限詢問')
-    expect(pinLine(main({ activity: 'idle', blockers: [{ reason: 'usage_limit', until: '2026-11-26T13:00:00Z' }] }), since, now)).toBe('🔴 撞上限，21:00 解除')
+    expect(pinLine(main({ activity: 'idle', blockers: [{ reason: 'usage_limit', until: '2026-11-26T13:00:00Z' }] }), since, now)).toBe('🔴 撞上限，21:00 解除；每分鐘探測，通了自動放')
     expect(pinLine({ presence: 'offline', presence_reason: 'process_gone', sessions: [] }, since, now)).toMatch(/^⚫ 失連（\d\d:\d\d 起）：行程不在了$/)
     expect(statusView(main({ activity: 'stuck', turn: { started_at: '2026-11-26T11:40:00Z' } }), now)!.view.state).toBe('stuck')
   })

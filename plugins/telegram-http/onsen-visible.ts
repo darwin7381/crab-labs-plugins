@@ -112,7 +112,14 @@ export function statusLine(v: StatusView, sinceMs: number, now = Date.now()): st
   }
   if (d.walled) {
     const u = d.walled.until ? Date.parse(String(d.walled.until)) : NaN
-    return Number.isFinite(u) ? `🔴 撞上限，${tpe(u)} 解除` : '🔴 撞上限'
+    let reset = ''
+    if (Number.isFinite(u)) {
+      const day = new Date(u + 8 * HOUR)
+      const today = new Date(now + 8 * HOUR)
+      const date = day.toISOString().slice(0, 10) === today.toISOString().slice(0, 10) ? '' : `${day.getUTCMonth() + 1}/${day.getUTCDate()} `
+      reset = `，${date}${tpe(u)} 解除`
+    }
+    return `🔴 撞上限${reset}；每分鐘探測，通了自動放`
   }
   if (v.state === 'starting') return `⚪ 啟動中${since}`                  // WO-165 A (Jev reads the screen)
   if (v.state === 'idle') {
