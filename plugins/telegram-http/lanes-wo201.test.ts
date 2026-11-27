@@ -1,6 +1,9 @@
 // WO-201 (Chiron resend audit 2026-11-27, design.md rule 3; inventory L5, L6, L7, L18; Joey TG chiron:2864 「所以該做好的是你的無意義過度重送機制？／都給我想清楚」):
 // an item is offered to the main again only when a fact says the last offer did not reach a turn that completed. A compaction, a resume, a new session,
-// a process ending are not reasons by themselves. Measured before (11-23 10:15Z → 11-27): 171 copies of items already answered were answered again
+// a process ending are not reasons by themselves. Chiron mesh-13184: how the turn ended decides — a final Stop: done; a compaction: the turn goes on; no
+// normal end and no genuine output after the binding: once more, a second such end closes it; no normal end with output already there (the process gone,
+// another session, a non-account StopFailure): an interrupted turn's (the Esc path: it rides the next delivery with INTERRUPTED_LINE; alone after
+// MAIN_STUCK_MS, once). Measured before (11-23 10:15Z → 11-27): 171 copies of items already answered were answered again
 // (session_start 112, gen_end 23, stop_failure:rate_limit 44 — the last is the wall's, WO-200, not this ticket's).
 // Played through the main's own hook events (what main-hook.py posts) against real processes standing in for the main (`sleep`, killed with SIGKILL) and
 // real transcript files: "genuine output after the binding" is liveness.ts's predicate, read from the file the hook names.
@@ -9,7 +12,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, appendFileSync 
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
-import { CUT_REOFFERS, MAIN_FAIL_MAX } from './lanes-main.ts'
+import { CUT_REOFFERS, MAIN_FAIL_MAX, MAIN_STUCK_MS, INTERRUPTED_LINE } from './lanes-main.ts'
 import { genuineAssistantAfterFile, GENUINE_AFTER_MARGIN_MS } from './liveness.ts'
 const L = await import('./lanes.ts?wo201-test') as typeof import('./lanes.ts')
 const dir = mkdtempSync(join(tmpdir(), 'lanes-wo201-'))
@@ -73,7 +76,7 @@ function settleAll(): void {
   for (const e of E().rows(r => r.state === 'open')) E().set(e.id, () => true, { state: 'met', by: 'test' })
 }
 
-test('WO-201 (a): an item answered (genuine output after it was bound), then a compaction SessionStart inside its turn: not offered again; the turn goes on under its prompt and the item is done at its Stop; answered then compacted then killed: done (received), not offered to the next gen', async () => {
+test('WO-201 (a): an item answered (genuine output after it was bound), then a compaction SessionStart inside its turn: not offered again; the turn goes on under its prompt and the item is done at its Stop; answered then compacted then killed: held as an interrupted turn\'s, not offered to the next gen at once', async () => {
   const g = await startMain()
   const id = await joey('a: 幫我看一下週報的數字')
   expect(state(id)).toBe('offered')
@@ -90,13 +93,14 @@ test('WO-201 (a): an item answered (genuine output after it was bound), then a c
   expect(M().currentGen()).toMatchObject({ state: 'in_turn', prompt_id: p, source: 'compact' })
   await M().pump(); await M().tick()
   expect(offers.length).toBe(k)
-  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Read' })                       // the turn goes on after the compaction, same prompt (80 of 80 measured)
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Read' })                       // the turn goes on after the compaction, same prompt (82 of 82 measured)
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
   expect(row(id)).toMatchObject({ state: 'done', received: 'stop' })
   expect(offeredTimes(id)).toBe(1)
   await kill(g)
   expect(state(id)).toBe('done')
-  // answered, compacted inside the turn, then the process is killed before the turn's Stop: received (the transcript), done, not offered again
+  // answered, compacted inside the turn, then the process is killed before the turn's Stop: output was there, so an interrupted turn's (mesh-13184; the
+  // first 1.59.1 closed it done, reason received), not offered to the next gen at once
   const g2 = await startMain()
   const id2 = await joey('a2: 那上週的呢？')
   const p2 = P()
@@ -105,7 +109,7 @@ test('WO-201 (a): an item answered (genuine output after it was bound), then a c
   await hook(g2, 'SessionStart', { source: 'compact', transcript_path: g2.tr })
   expect(state(id2)).toBe('bound')
   await kill(g2)
-  expect(row(id2)).toMatchObject({ state: 'done', reason: 'received', received_by: 'transcript', cut_by: 'gen_end' })
+  expect(row(id2)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' }); expect(typeof row(id2).cut_at).toBe('string')
   const g3 = await startMain()
   await M().tick()
   expect(offeredTimes(id2)).toBe(1)
@@ -113,7 +117,7 @@ test('WO-201 (a): an item answered (genuine output after it was bound), then a c
   settleAll()
 })
 
-test('WO-201 (b): an item answered, then /clear (a new session in the same process) and then a process restart (the gen ends): not offered again (done, reason received); 1.59.0 queued both again (session_start, gen_end)', async () => {
+test('WO-201 (b): an item answered, then /clear (a new session in the same process) and then a process restart (the gen ends): not offered again at once, held as an interrupted turn\'s; it rides the next delivery (1.59.0 queued both again: session_start, gen_end; the first 1.59.1 closed them done)', async () => {
   const g = await startMain()
   const id = await joey('b: 把 api-gw 的 timeout 調成 30 秒')
   const p = P()
@@ -125,20 +129,25 @@ test('WO-201 (b): an item answered, then /clear (a new session in the same proce
   const sid2 = randomUUID(), tr2 = join(dir, `${sid2}.jsonl`)
   writeFileSync(tr2, JSON.stringify({ type: 'user', timestamp: at(Date.now()), message: { role: 'user', content: '/clear' } }) + '\n')
   expect((await L.__mainEvent({ event: 'SessionStart', pid: g.pid, session_id: sid2, source: 'clear', transcript_path: tr2 })).accepted).toBe(true)
-  expect(row(id)).toMatchObject({ state: 'done', reason: 'received', received_by: 'transcript', cut_by: 'session_start' })
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'session_start' })
   expect(linesOf('msg', id).some(l => l.state === 'queued' && l.reason === 'session_start')).toBe(false)
+  expect(offeredTimes(id)).toBe(1)
   const g2: Gen = { ...g, sid: sid2, tr: tr2 }
-  // in the new session: a second item, answered; then the process restarts (killed: the gen ends)
+  // in the new session: a second item; its offer carries the held one with the interrupted line; answered; then the process restarts (the gen ends)
   const id2 = await joey('b2: 改好了嗎？')
   expect(state(id2)).toBe('offered')
+  const n = offers.at(-1)!.notif
+  expect(String(n.params.meta.did).split(',')).toEqual(expect.arrayContaining([id2, id]))
+  expect(String(n.params.content)).toContain(`${INTERRUPTED_LINE}\n`)
   const p2 = P()
-  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: [id2] })
+  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })
   answers(g2)
   await kill(g2)
-  expect(row(id2)).toMatchObject({ state: 'done', reason: 'received', received_by: 'transcript', cut_by: 'gen_end' })
+  expect(row(id2)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
   const g3 = await startMain()                                                            // tui-restart: the next main
   await M().tick()
-  expect(offeredTimes(id)).toBe(1); expect(offeredTimes(id2)).toBe(1)
+  expect(offeredTimes(id)).toBe(2); expect(offeredTimes(id2)).toBe(1)                     // nothing more: no copy offered to g3 at its start
   expect(offers.some(o => o.sid === `mcp-${g3.pid}` && String(o.notif.params.meta.did).split(',').some((d: string) => d === id || d === id2))).toBe(false)
   await kill(g3)
   settleAll()
@@ -346,6 +355,99 @@ test('WO-201 (g): an API-error assistant record after the binding (isApiErrorMes
   answers(g2)
   await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
   expect(state(id)).toBe('done')
+  await kill(g2)
+  settleAll()
+})
+
+test('WO-201 (h): the process ends after the model answered, with no Stop: not offered again at once (1.59.0 offered it to the next gen; the first 1.59.1 closed it done); the next delivery carries it with the interrupted line, one prompt binds both', async () => {
+  const g = await startMain()
+  const id = await joey('h: 把 11 月的帳對完，對完跟我說')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  answers(g)                                                                               // 「收到，我來處理」: the work started
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
+  await kill(g)                                                                            // the process dies mid-work
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
+  const g2 = await startMain()
+  await M().pump(); await M().tick()
+  expect(offeredTimes(id)).toBe(1)                                                         // nothing offered at its start
+  const k = sent.length
+  const j = await joey('h2: 對到哪了？')
+  const n = offers.at(-1)!.notif
+  expect(String(n.params.meta.did).split(',').slice(0, 2)).toEqual([j, id])                // the new message leads, the cut one rides it
+  const c = String(n.params.content)
+  expect(c.indexOf(INTERRUPTED_LINE)).toBeGreaterThan(c.indexOf('h2: 對到哪了？'))
+  expect(c.indexOf(INTERRUPTED_LINE)).toBeLessThan(c.indexOf('h: 把 11 月的帳對完'))       // the line in front of the cut item
+  const p2 = P()
+  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })
+  expect(state(id)).toBe('bound'); expect(state(j)).toBe('bound')
+  await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(state(j)).toBe('done')
+  expect(offeredTimes(id)).toBe(2)
+  await sleep(20)
+  expect(sent.slice(k).some(s => s.includes('疑似卡死'))).toBe(false)
+  await kill(g2)
+  settleAll()
+})
+
+test('WO-201 (h2): a non-account StopFailure after the model answered: an interrupted turn too (no backoff, no fails: it rides the next delivery with the line); an item pulled into the same turn after that answer, with nothing said after it, takes the backoff', async () => {
+  const g = await startMain()
+  const id = await joey('h2a: 幫我重跑備份並回報')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  answers(g)
+  await sleep(20)                                                                          // the next item is bound after that answer
+  const late = await joey('h2b: 順便看磁碟')
+  expect(state(late)).toBe('queued')
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })
+  expect((await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Bash' })).additionalContext).toContain('h2b: 順便看磁碟')   // pulled
+  await hook(g, 'StopFailure', { prompt_id: p, error: 'server_error', reason: 'API Error: 529 overloaded' })
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'stop_failure:server_error' })
+  expect(row(id).fails).toBeUndefined(); expect(row(id).fail_retry_at).toBeUndefined()
+  expect(row(late)).toMatchObject({ state: 'queued', reason: 'stop_failure:server_error', fails: 1 }); expect(row(late).fail_retry_at).toBeGreaterThan(Date.now() + WALL - 5_000)
+  expect(M().mainPhase()).toBe('idle')
+  await M().pump(); await M().tick()
+  expect(offeredTimes(id)).toBe(1); expect(offeredTimes(late)).toBe(0)
+  const j = await joey('h2c: 好了嗎？')
+  const n = offers.at(-1)!.notif
+  expect(String(n.params.meta.did).split(',')).toEqual(expect.arrayContaining([j, id])); expect(String(n.params.meta.did).split(',')).not.toContain(late)
+  { const c = String(n.params.content); expect(c).toContain(`${INTERRUPTED_LINE}\n<channel`); expect(c.indexOf(INTERRUPTED_LINE)).toBeLessThan(c.indexOf('h2a: 幫我重跑備份並回報')) }   // a rider: the line, then its tag
+  const p2 = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })
+  await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })                                 // a good turn: the backed-off one goes now (releaseFailed)
+  expect(state(id)).toBe('done'); expect(row(late).fail_retry_at).toBeUndefined()
+  await M().pump(); await sleep(10)
+  expect(state(late)).toBe('offered')
+  await kill(g)
+  settleAll()
+})
+
+test(`WO-201 (i): the process ends after the model answered and no next delivery comes within MAIN_STUCK_MS (${MAIN_STUCK_MS / 1000} s): the item is delivered alone, once, the interrupted line first; Joey's own message too (an Esc-cut one of his never is: lanes-esc-hold)`, async () => {
+  const g = await startMain()
+  const id = await joey('i: 幫我把簡報改成英文')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  answers(g)
+  await kill(g)
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end' })
+  const g2 = await startMain()
+  const k = offers.length, t = sent.length
+  await M().tick(Date.now() + MAIN_STUCK_MS - 60_000)
+  expect(offers.length).toBe(k)                                                            // within MAIN_STUCK_MS: it waits for a delivery to ride
+  await M().tick(Date.now() + MAIN_STUCK_MS + 1_000)
+  expect(offers.length).toBe(k + 1)
+  const n = offers.at(-1)!.notif
+  expect(String(n.params.meta.did).split(',')[0]).toBe(id)
+  expect(String(n.params.content)).toContain(`${INTERRUPTED_LINE}\ni: 幫我把簡報改成英文`)
+  expect(row(id)).toMatchObject({ state: 'offered', reason: 'interrupted_untaken' })
+  await M().tick(Date.now() + MAIN_STUCK_MS + 30_000); await M().tick(Date.now() + 2 * MAIN_STUCK_MS)
+  expect(offers.length).toBe(k + 1)                                                        // once
+  await sleep(20)
+  expect(sent.slice(t).filter(s => s.includes('主線疑似卡死')).length).toBe(1)             // the Esc path's own notice (WO-157c), as for a colleague's cut item
+  const p2 = P()
+  await hook(g2, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') })
+  await hook(g2, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(offeredTimes(id)).toBe(2)
   await kill(g2)
   settleAll()
 })

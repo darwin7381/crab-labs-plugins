@@ -6,6 +6,7 @@ import { mkdtempSync, copyFileSync, readFileSync, writeFileSync, existsSync } fr
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { randomUUID } from 'crypto'
+import { INTERRUPTED_LINE } from './lanes-main.ts'
 const L = await import('./lanes.ts?m1-test') as typeof import('./lanes.ts')
 const ROUTER = process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json'
 const dir = mkdtempSync(join(tmpdir(), 'lanes-m1-'))
@@ -239,7 +240,7 @@ const handover = (n: number, text: string) => {
   L.__events().open(`ev-h${n}`, { class: 'peer', owner: id, lane: id, from: 'eve', text, obligations: [] })   // the router recorded it (PL1)
   return L.callLaneTool({ runId: `${id}.r1`, lane: id, evId: `ev-h${n}`, closers: [], critical: false, trigger: 'peer', cls: 'peer' } as any, 'handoff_main', { text })
 }
-test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the same prompt binds its item again (turn_continued); a StopFailure then queues it again, never done; the hand-over it met is open again', async () => {
+test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the same prompt binds its item again (turn_continued); a StopFailure then queues it again, never done; the hand-over it met is open again. WO-201: the model had answered it, so it is held as an interrupted turn\'s and rides the next delivery', async () => {
   const g = await startMain()
   await handover(81, 'Eve 要主線確認週五的報告')
   const ob = () => (L.__events().get('ev-h81')!.obligations as any[]).find(o => o.kind === 'main')
@@ -257,19 +258,21 @@ test('another Stop hook blocks the turn: a final Stop, then PreToolUse of the sa
   expect(M().items(r => r.id === id)[0]).toMatchObject({ gen: String(g.pid), prompt_id: p })
   expect(ob().state).toBe('open')                                                           // the hand-over is not met while its turn runs
   await hook(g, 'StopFailure', { prompt_id: p, error: 'server_error', reason: 'API Error: 529 overloaded' })
-  expect(state(id)).toBe('queued'); expect(linesOf('msg', id).at(-1)).toMatchObject({ reason: 'stop_failure:server_error' })
+  // WO-201 (Chiron mesh-13184), inverted twice: 1.59.0 queued it again (stop_failure:server_error, offered at the next tick); the first 1.59.1 waited its
+  // backoff. Its turn had output (it reached done at that Stop): an interrupted turn's, held to ride the next delivery with the interrupted line
+  expect(state(id)).toBe('queued'); expect(linesOf('msg', id).at(-1)).toMatchObject({ reason: 'interrupted', cut_by: 'stop_failure:server_error' })
+  { const r = M().items(x => x.id === id)[0]; expect(r.fails).toBeUndefined(); expect(r.fail_retry_at).toBeUndefined() }
   expect(ob().state).toBe('open')
   expect(linesOf('msg', id).map(l => l.state)).toEqual(['queued', 'offered', 'bound', 'done', 'bound', 'queued'])
   expect(M().mainPhase()).toBe('idle')                                                      // PL4 P12: a 529 is not a wall: the gen is idle
-  // WO-201 (point 4), inverted: the retry waits for its backoff (the wall's base: LANES_WALL_PROBE_MS, 1 h in this file); until 1.59.0 the next tick offered it
-  expect(linesOf('msg', id).at(-1)).toMatchObject({ fails: 1 }); expect(linesOf('msg', id).at(-1).fail_retry_at).toBeGreaterThan(Date.now() + 3_000_000)
   await M().tick()
-  expect(state(id)).toBe('queued')
-  L.__journal().write('msg', id, 'queued', { fail_retry_at: Date.now() - 1 })              // its retry time comes
-  await M().tick()
-  expect(state(id)).toBe('offered')
-  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: [id] }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
-  expect(state(id)).toBe('done'); expect(ob().state).toBe('met')
+  expect(state(id)).toBe('queued')                                                          // not offered alone
+  const j = await joey('週五的報告好了嗎？')                                                 // the next delivery carries it
+  const n = offers.at(-1)!.notif
+  expect(String(n.params.meta.did).split(',')).toEqual(expect.arrayContaining([j, id]))
+  expect(String(n.params.content)).toContain(INTERRUPTED_LINE)
+  const p2 = P(); await hook(g, 'UserPromptSubmit', { prompt_id: p2, dids: String(n.params.meta.did).split(',') }); await hook(g, 'Stop', { prompt_id: p2, phase: 'final' })
+  expect(state(id)).toBe('done'); expect(ob().state).toBe('met'); expect(state(j)).toBe('done')
   await kill(g)
 })
 

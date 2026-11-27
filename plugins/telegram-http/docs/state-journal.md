@@ -11,8 +11,9 @@ the agent-inbox daemon). Every other component asks the tg daemon.
 | M4 | wake rule | `wake` lines, which log decisions and are not folded | M2 phase × what M3 owes the main |
 | M5 | run record | one `run` per lane run | the lane process: spawn, its result JSON, its exit code |
 
-No mechanism reads a transcript to learn a state, with one exception (WO-201, below): when a main's gen ends, or its process starts another session,
-while an item is bound to its turn, M1 asks the gen's transcript one question: did the model produce genuine output after the item was bound?
+No mechanism reads a transcript to learn a state, with one exception (WO-201, below): when a turn of the main ends with no normal end (its gen ends, its
+process starts another session, a non-account StopFailure) while an item is bound to it, M1 asks the gen's transcript one question: did the model produce
+genuine output after the item was bound?
 
 ## The file
 
@@ -43,27 +44,34 @@ while an item is bound to its turn, M1 asks the gen's transcript one question: d
 | `bound` | inside turn `prompt_id` of gen `gen` |
 | `done` | that turn ended with `Stop` |
 
-The one rule: an item is `done` when its turn ends with `Stop`, or (WO-201) once it was **received**. An item is offered again only when a fact says the
-last offer did not reach a turn that completed (Chiron's resend audit 2026-11-27, design rule 3; Joey TG chiron:2864):
-- **Received** = it reached `done` at a final `Stop` before (`received: stop`, kept when its turn goes on: `turn_continued`), or the gen's transcript has a
-  genuine assistant record after the item's `bound_at` (liveness.ts `genuineAssistantAfterFile`: the fleet's one predicate `isGenuineAssistant`, i.e. not
-  `isApiErrorMessage`, not model `<synthetic>`; and a response begun after `bound_at`: a block of a response already streaming then, same `message.id`,
-  does not count, because Claude Code runs a tool while its response still streams). A received item is never offered again: not at a compaction, a
-  resume, a new session or the end of the process.
-- **The end of a gen** (kill -0, SessionEnd, another process taking the role) and **another session in the same process while a turn is open** (`/clear`,
-  `/resume`; not a compaction) settle each item of that gen (`settle`): offered and never bound → `queued` (`gen_end` / `session_start`), as before;
-  bound and received → `done`, `reason: received` (`received_by`, `received_at`, `cut_by`); bound with no genuine output after it → `queued` once
-  (`cuts: 1`); cut that way a second time → `done`, `reason: cut_twice`, and Joey is told which (`main-cut`); bound and it cannot be told (no transcript
-  path, the file unreadable, the span after `bound_at` larger than 64 MB) → `queued` as before, and the log says why.
-- **A compaction inside a turn** (SessionStart `source: compact` from the gen's own process while it is `in_turn`) is not an end: the turn goes on under
-  the same `prompt_id` (measured: 80 of 80 on the Mac mini journals, 2026-11-27). The gen stays `in_turn` with its prompt; nothing is queued again.
-- **A StopFailure that is not an account kind** (`server_error`, an overload, `unknown`): the turn's bound items go back to `queued` (`stop_failure:<error>`)
-  with `fails` + 1 and `fail_retry_at` = now + `wallBackoffMs(error, fails − 1)` (for these kinds the wall's base, `LANES_WALL_PROBE_MS`, 300 s); they are
-  neither offered nor pulled before it. The `LANES_MAIN_FAIL_MAX`-th (3) failed turn parks the item (`reason: stop_failure_cap`, no retry time) and opens
-  the stuck episode: one `main-stuck` line to Joey. The gen's next final `Stop` (the model answers again) clears every `fail_retry_at` and lets each parked
-  item go once (`stop_failure_released`, `fail_released`); a released item that fails again is closed (`done`, `stop_failure_gave_up`) and Joey is told
-  which. The account wall (`rate_limit`, …) is unchanged.
-- An interrupted turn (Esc; a new prompt with no Stop) puts its items back to `queued`, held to ride the next delivery (`interrupted`), as before.
+The one rule: an item is `done` only when its turn ends with `Stop`. An item is offered again only when a fact says the last offer did not reach a turn
+that completed (WO-201: Chiron's resend audit 2026-11-27, design rule 3, and his ruling mesh-13184; Joey TG chiron:2864). How the turn it was bound to
+ended decides, four cases only:
+
+| how the turn ended | its items |
+|---|---|
+| a normal end (its final `Stop`) | `done` (`received: stop`) |
+| a compaction inside it (SessionStart `source: compact` from the gen's own process while `in_turn`) | the turn goes on under the same `prompt_id` (measured 2026-11-27: 82 of 82 on the lanes journals of the Mac mini and txmonster): the gen stays `in_turn` with its prompt, nothing is queued again |
+| no normal end, and **no** genuine output after the item was bound | offered once more (`cuts: 1`); a second such end closes it (`done`, `reason: cut_twice`) with one line to Joey (`main-cut`). For a non-account StopFailure: the backoff and cap below |
+| no normal end, output **already** there (the process gone, another session, a non-account StopFailure) | an interrupted turn's, the Esc path's (`cutTurn` / `holdCut`): `queued`, `reason: interrupted`, `cut_at`, `cut_by` (`gen_end`, `session_start`, `stop_failure:<error>`). It rides the next delivery (an offer, or a pull into a running turn) with `INTERRUPTED_LINE` in front; with no next delivery within `MAIN_STUCK_MS` (600 s) of the main being able to take it, it is offered alone, once (`interrupted_untaken`; the WO-157c path, its `main-stuck` line included). Joey's own item cut this way goes alone too (one cut by Esc does not: Joey stopped it) |
+
+- **Output after the binding**: the item reached `done` at a final `Stop` before (`received: stop`, kept when its turn goes on: `turn_continued`), or the
+  gen's transcript has a genuine assistant record after the item's `bound_at` (liveness.ts `genuineAssistantAfterFile`: the fleet's one predicate
+  `isGenuineAssistant`, i.e. not `isApiErrorMessage`, not model `<synthetic>`; and a response begun after `bound_at`: a block of a response already
+  streaming then, same `message.id`, does not count, because Claude Code runs a tool while its response still streams). Output means the work started,
+  not that it finished: such an item is never `done` without the turn's Stop.
+- **Where it is decided**: the end of a gen (kill -0, SessionEnd, another process taking the role) and another session in the same process while a turn is
+  open (`/clear`, `/resume`; not a compaction) settle each item of that gen (`settle`); a non-account StopFailure, its turn's items (`failTurn`). An item
+  offered and never bound never reached a turn: `queued` again (`gen_end` / `session_start` / `stop_failure:<error>`), as before. A bound item for which it
+  cannot be told (no transcript path, the file unreadable, the span after `bound_at` larger than 64 MB): `queued` again as before at a gen's end (the log
+  says why), the backoff at a StopFailure.
+- **A StopFailure that is not an account kind** (`server_error`, an overload, `unknown`), for the items with no output after them: back to `queued`
+  (`stop_failure:<error>`) with `fails` + 1 and `fail_retry_at` = now + `wallBackoffMs(error, fails − 1)` (for these kinds the wall's base,
+  `LANES_WALL_PROBE_MS`, 300 s); neither offered nor pulled before it. The `LANES_MAIN_FAIL_MAX`-th (3) failed turn parks the item (`reason:
+  stop_failure_cap`, no retry time) and opens the stuck episode: one `main-stuck` line to Joey. The gen's next final `Stop` (the model answers again) clears
+  every `fail_retry_at` and lets each parked item go once (`stop_failure_released`, `fail_released`); a released item that fails again is closed (`done`,
+  `stop_failure_gave_up`) and Joey is told which. The account wall (`rate_limit`, …) is unchanged.
+- An interrupted turn by Esc (statusIdle) or a new prompt with no Stop (beginTurn) holds its items the same way (`cut_by` cleared), as before.
 
 **A turn ends at its last Stop.** Claude Code runs every Stop hook of the session in parallel, and the turn goes on, under the same `prompt_id`,
 when any one of them blocks (decision `block` or exit 2; the next Stop then has `stop_hook_active: true`). main-hook.py cannot see the others'
@@ -108,11 +116,11 @@ Fields:
 - `notif`: the channel notification (`method`, `params.content`, `params.meta`). `meta.did` is the item id. An offer that carries the digest has
   `meta.did = "<item id>,<digest id>"`.
 - `gen` and `prompt_id`, while `offered` or `bound`. `via_pull: true` means the item was pulled at a tool boundary or at `Stop`.
-- `bound_at` (WO-201): when it was bound (what "output after it" is measured from). `received` (`stop`), `cuts`, `fails`, `fail_retry_at`, `fail_released`: above.
-- `reason`, when the item returns to `queued`: `stop_failure:<error>`, `stop_failure_cap`, `stop_failure_released`, `gen_end`, `interrupted` (a new prompt came with no Stop), `session_start`
+- `bound_at` (WO-201): when it was bound (what "output after it" is measured from). `received` (`stop`), `cuts`, `cut_by`, `fails`, `fail_retry_at`, `fail_released`: above.
+- `reason`, when the item returns to `queued`: `stop_failure:<error>`, `stop_failure_cap`, `stop_failure_released`, `gen_end`, `interrupted` (Esc, a new prompt with no Stop, or WO-201's case 4: `cut_by` says which), `interrupted_untaken` (an interrupted turn's item offered alone after `MAIN_STUCK_MS`), `session_start`
   (the same process started a new session, not a compaction, mid-turn), `stuck_unbound` (002q: offered, never bound, and the gen's stuck episode began), `offer_untaken` (002x: offered to an idle gen and not bound
   within `LANES_OFFER_LEASE_MS`: written once more). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).
-- `done` clears an earlier `reason`; it may carry `reason: asked_restart` (special case 1 below), or (WO-201) `received`, `cut_twice`, `stop_failure_gave_up`.
+- `done` clears an earlier `reason`; it may carry `reason: asked_restart` (special case 1 below), or (WO-201) `cut_twice`, `stop_failure_gave_up`.
 - Digest items also have `events` and `items`:
   - `events`: `{<event id>: <version>}`, the event records the digest shows, each at the `version` it was rendered from;
   - `proposals`: the ids of the open Joey memory proposals it carries as standing lines (002v): a digest of these that is `bound` or `done`
@@ -131,7 +139,7 @@ Fields:
 | `walled` | the MAIN's own wall: its turn ended in a StopFailure of an account kind (`kind`: `rate_limit`, `billing_error`, `account_on_hold`, `authentication_failed`, `oauth_org_not_allowed`, `cloud_credential_error`) |
 | `gone` | `end_reason`: `asked` (/restart, /kill_stuck), `killed` (`kill -0` failed), `exited` (SessionEnd), or `replaced` (another process took the role, or /main renew) |
 
-Other fields: `pid`, `session_id`, `transcript_path` (read for one question only: WO-201's received, above), `source`, `error`, and `stopped_prompt` on an `idle` gen: the
+Other fields: `pid`, `session_id`, `transcript_path` (read for one question only: WO-201's output after the binding, above), `source`, `error`, and `stopped_prompt` on an `idle` gen: the
 prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop"). `owed_hold` (the prompt) and
 `owed_events` (002q): the turn that the Stop check held because it still owed Joey a line, and those events (see "The main's Stop" below).
 
@@ -179,8 +187,8 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
 
 **The main's wall is its own record** (the lanes' wall, `wall` in `GET /lanes/state`, is another one and never moves this one):
 - An account-kind StopFailure walls the gen and starts a wall episode: `wall_since` (set once per episode), `probes`, `retry_at`. Joey is told once
-  (`main-wall-up`). Any other StopFailure (`server_error`, an overload, `unknown`) does not wall: the turn's items queue again with a backoff and a cap (WO-201, above), the gen is `idle`
-  with `error`, and the item is offered again after its backoff (WO-201).
+  (`main-wall-up`). Any other StopFailure (`server_error`, an overload, `unknown`) does not wall: the gen is `idle`
+  with `error`; the turn's items are an interrupted turn's when the model had answered them, otherwise offered again after a backoff, with a cap (WO-201, above).
 - At `retry_at` M1 offers the walled gen one item: its probe (a limit menu on its pane is driven first, and Joey is told what was chosen,
   `main-menu`). The gen leaves `walled` only on its own next hook event (the probe's UserPromptSubmit, or a SessionStart). A StopFailure in that
   turn is the same episode: `probes` + 1, a longer `retry_at`, no new notice. The episode ends at the gen's next final Stop: `wall_since`,
