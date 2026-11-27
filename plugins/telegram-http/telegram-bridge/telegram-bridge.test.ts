@@ -444,6 +444,13 @@ describe('the bridge, end to end against the fakes', () => {
     onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b2', client_msg_id: '7002', state: 'blocked', blocked_by: 'usage_limit' })
     await until(() => lines().length === 2, 3000, 'a second message: its own line')
     expect(lines()[1].text).toBe('⚠️ 被額度上限擋下，通了自動重送')
+    const second = tg.sentTo(t, chat).filter(x => String(x.text ?? '').startsWith('⚠️'))[1]!
+    tg.fail.set('deleteMessage', { code: 500, description: 'Internal Server Error', times: 1 })
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b2', client_msg_id: '7002', state: 'turn_end' })
+    await until(() => logs.some(x => x.includes(`line ${second.message_id} in chat ${chat} not deleted yet`)), 3000, 'a failed delete is kept')
+    onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b9', client_msg_id: '7009', state: 'delivered' })
+    await until(() => tg.callsOf(t, 'deleteMessage').filter(p => Number(p.message_id) === second.message_id).length === 2, 3000,
+      'tried again on the next receipt in that chat')
     onsen.push({ type: 'receipt', member: 'alpha', conversation_id: 'cv', chat, message_id: 'b3', client_msg_id: '7003', state: 'paused' })
     await until(() => logs.some(x => x.includes('receipt state paused on tg:7003')), 3000, 'an unknown state: one log line, nothing drawn')
     expect(onsen.bad).toEqual([])

@@ -26,7 +26,7 @@ export type TopicRec = { member: string; chat: string; thread: string; client_th
 export type LineRec = { member: string; chat: string; msg: number; lift_until: number | null; lifted: boolean; at: number; id: string; pressed?: boolean }
 
 /** WO-199: the ⚠️ line a bridge put under a person's message blocked by a usage limit (removed once the message is taken in again) */
-export type BlockedRec = { member: string; chat: string; msg: number; at: number }
+export type BlockedRec = { member: string; chat: string; msg: number; at: number; gone?: boolean; tries?: number }
 
 export type StateData = {
   feed: { after: string | null; drawn: string[] }

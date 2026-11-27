@@ -281,6 +281,7 @@ export class Drawer {
     if (!(age <= OLD_MS) || !id) return
     const fresh = age <= 10_000
     const typing = () => a.tg.call('sendChatAction', { chat_id: chat, action: 'typing' }).catch(() => {})
+    await this.retryUnblock(a, chat)
     if (item.state === 'delivered') {
       a.pending.fact({ chat, client_msg_id: id, state: 'delivered', at: item.at } as any)
       if (fresh) await typing()
@@ -305,7 +306,9 @@ export class Drawer {
   async block(a: Agent, chat: string, id: string, item: any): Promise<void> {
     const key = `${a.member}:${chat}:${id}`
     if (!this.st.blocked) this.st.blocked = {}
-    if (this.st.blocked[key]) return
+    const had = this.st.blocked[key]
+    if (had && !had.gone) return
+    if (had?.gone) { had.gone = false; this.d.state.dirty(); return }       // blocked again before its old line went: keep that line
     const why = item.blocked_by === 'usage_limit' ? '被額度上限擋下，通了自動重送' : '被擋下，阻礙解除後自動重送'
     const until = item.retry_after ? Date.parse(String(item.retry_after)) : NaN
     const d = new Date(until + 8 * 3_600_000), p2 = (n: number) => String(n).padStart(2, '0')
@@ -317,13 +320,31 @@ export class Drawer {
       this.d.state.dirty()
     } catch (e) { this.d.log('warn', `${a.member}: the ⚠️ line under tg:${id} in chat ${chat} was not sent: ${errText(e)}`) }
   }
+  /** the line goes once Telegram deleted it (or says it is already gone); a delete that failed is kept and tried again on the next receipt
+   *  in that chat, at most 5 times */
   async unblock(a: Agent, chat: string, id: string): Promise<void> {
     const key = `${a.member}:${chat}:${id}`, rec = this.st.blocked?.[key]
     if (!rec) return
-    delete this.st.blocked![key]
+    rec.gone = true
+    await this.dropLine(a, key, rec)
+  }
+  private async dropLine(a: Agent, key: string, rec: { chat: string; msg: number; gone?: boolean; tries?: number }): Promise<void> {
+    try {
+      await a.tg.call('deleteMessage', { chat_id: rec.chat, message_id: rec.msg })
+      delete this.st.blocked![key]
+    } catch (e) {
+      const why = errText(e)
+      rec.tries = (rec.tries ?? 0) + 1
+      if (/message to delete not found|message can't be deleted/i.test(why) || rec.tries >= 5) {
+        delete this.st.blocked![key]
+        this.d.log('warn', `${a.member}: the ⚠️ line ${rec.msg} in chat ${rec.chat} not deleted (${why}); given up after ${rec.tries} tries`)
+      } else this.d.log('warn', `${a.member}: the ⚠️ line ${rec.msg} in chat ${rec.chat} not deleted yet (${why}); tried again on the next receipt`)
+    }
     this.d.state.dirty()
-    await a.tg.call('deleteMessage', { chat_id: chat, message_id: rec.msg }).catch(e =>
-      this.d.log('warn', `${a.member}: the ⚠️ line ${rec.msg} in chat ${chat} was not deleted: ${errText(e)}`))
+  }
+  private async retryUnblock(a: Agent, chat: string): Promise<void> {
+    for (const [key, rec] of Object.entries(this.st.blocked ?? {}))
+      if (rec.gone && rec.member === a.member && rec.chat === chat) await this.dropLine(a, key, rec)
   }
 
   async drawAction(a: Agent, item: any): Promise<void> {
