@@ -55,11 +55,15 @@ ended decides, four cases only:
 | no normal end, and **no** genuine output after the item was bound | offered once more (`cuts: 1`); a second such end closes it (`done`, `reason: cut_twice`) with one line to Joey (`main-cut`). For a non-account StopFailure: the backoff and cap below |
 | no normal end, output **already** there (the process gone, another session, a non-account StopFailure) | an interrupted turn's, the Esc path's (`cutTurn` / `holdCut`): `queued`, `reason: interrupted`, `cut_at`, `cut_by` (`gen_end`, `session_start`, `stop_failure:<error>`). It rides the next delivery (an offer, or a pull into a running turn) with `INTERRUPTED_LINE` in front; with no next delivery within `MAIN_STUCK_MS` (600 s) of the main being able to take it, it is offered alone, once (`interrupted_untaken`, the WO-157c path) and nobody is told: no `main-stuck` push, no stuck episode, so no `main-unstuck` (Chiron mesh-13191: not a stuck main; before 1.59.1 such an item was offered again at once and Joey heard nothing). When the items going alone include any without `cut_by` (Esc-cut, a turn with no Stop), the WO-157c stuck path runs as before. Joey's own item cut this way goes alone too (one cut by Esc does not: Joey stopped it) |
 
-- **Output after the binding**: the item reached `done` at a final `Stop` before (`received: stop`, kept when its turn goes on: `turn_continued`), or the
-  gen's transcript has a genuine assistant record after the item's `bound_at` (liveness.ts `genuineAssistantAfterFile`: the fleet's one predicate
+- **Output after the binding**: the item reached `done` at a final `Stop` before (`received: stop`, kept when its turn goes on: `turn_continued`), or M2
+  itself received a hook event of the main for the item's own prompt, in its gen, after the item was bound (`noteOutput`, mesh-13196: PreToolUse /
+  PostToolUse, i.e. the model emitted a tool call, or Stop; for an item pulled into a running turn only Stop, since a tool call after the pull may belong to
+  the response that was already streaming; a subagent's event never: received live, so the last second the transcript may not have on disk yet when the gen
+  ends is not missed; in memory, so after a daemon restart the transcript alone answers), or the gen's transcript has a genuine assistant record after the item's `bound_at` (liveness.ts `genuineAssistantAfterFile`: the fleet's one predicate
   `isGenuineAssistant`, i.e. not `isApiErrorMessage`, not model `<synthetic>`; and a response begun after `bound_at`: a block of a response already
   streaming then, same `message.id`, does not count, because Claude Code runs a tool while its response still streams). Output means the work started,
-  not that it finished: such an item is never `done` without the turn's Stop.
+  not that it finished: such an item is never `done` without the turn's Stop. The held item's line says which fact it was (`output_by`: `stop`,
+  `hook:<event>`, `transcript`).
 - **Where it is decided**: the end of a gen (kill -0, SessionEnd, another process taking the role) and another session in the same process while a turn is
   open (`/clear`, `/resume`; not a compaction) settle each item of that gen (`settle`); a non-account StopFailure, its turn's items (`failTurn`). An item
   offered and never bound never reached a turn: `queued` again (`gen_end` / `session_start` / `stop_failure:<error>`), as before. A bound item for which it
@@ -116,7 +120,7 @@ Fields:
 - `notif`: the channel notification (`method`, `params.content`, `params.meta`). `meta.did` is the item id. An offer that carries the digest has
   `meta.did = "<item id>,<digest id>"`.
 - `gen` and `prompt_id`, while `offered` or `bound`. `via_pull: true` means the item was pulled at a tool boundary or at `Stop`.
-- `bound_at` (WO-201): when it was bound (what "output after it" is measured from). `received` (`stop`), `cuts`, `cut_by`, `fails`, `fail_retry_at`, `fail_released`: above.
+- `bound_at` (WO-201): when it was bound (what "output after it" is measured from). `received` (`stop`), `output_by`, `cuts`, `cut_by`, `fails`, `fail_retry_at`, `fail_released`: above.
 - `reason`, when the item returns to `queued`: `stop_failure:<error>`, `stop_failure_cap`, `stop_failure_released`, `gen_end`, `interrupted` (Esc, a new prompt with no Stop, or WO-201's case 4: `cut_by` says which), `interrupted_untaken` (an interrupted turn's item offered alone after `MAIN_STUCK_MS`), `session_start`
   (the same process started a new session, not a compaction, mid-turn), `stuck_unbound` (002q: offered, never bound, and the gen's stuck episode began), `offer_untaken` (002x: offered to an idle gen and not bound
   within `LANES_OFFER_LEASE_MS`: written once more). When it returns from `done` to `bound`: `turn_continued` (its turn went on after that Stop).

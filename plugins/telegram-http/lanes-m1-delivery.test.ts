@@ -79,26 +79,37 @@ test('002n, PL4: a turn that ends in StopFailure never makes its item done: back
   await kill(g)
 })
 
-test('002n T6/T8, 002m L6G1/L6T1, 002g: the main killed five times inside the turn that took the message: every new gen gets it again; done exactly once; no 疑似卡死, nothing quarantined. WO-201: these mains name no transcript, so whether the item was received cannot be told: as before (the known cases, received or cut twice: lanes-wo201.test.ts)', async () => {
+test('002n T6/T8, 002m L6G1/L6T1, 002g: the main killed five times inside the turn that took the message: done exactly once; no 疑似卡死, nothing quarantined. WO-201: killed before any tool call (no transcript to read: cannot tell), every new gen gets it again, as before; killed 0.46 s after a tool call of its prompt (M2 saw the model act: mesh-13196), it is an interrupted turn\'s: no new gen gets it at once, the next delivery carries it', async () => {
   const id = await joey('幫我查 mock-api 的錯誤率')
   for (let i = 0; i < 5; i++) {
     const g = await startMain()
     expect(state(id)).toBe('offered')
     const p = P()
-    await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
-    await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })               // killed 0.46 s after a tool call (T8-R r3): bound, no Stop
+    await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })                // bound, no Stop, no tool call
     await kill(g)                                                                   // SIGKILL: no SessionEnd; kill -0 ends the gen
     expect(state(id)).toBe('queued')
     expect(linesOf('msg', id).at(-1)).toMatchObject({ reason: 'gen_end' })
     expect(linesOf('main', String(g.pid)).at(-1)).toMatchObject({ state: 'gone', end_reason: 'killed' })
   }
-  const g = await startMain()
-  const p = P()
+  let g = await startMain()
+  expect(state(id)).toBe('offered')
+  let p = P()
   await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })                 // killed 0.46 s after a tool call (T8-R r3): bound, no Stop
+  await kill(g)
+  // WO-201, inverted (mesh-13196): the tool call is M2's own fact that the model acted on it: an interrupted turn's (until 1.59.0: gen_end, offered again)
+  expect(linesOf('msg', id).at(-1)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end', output_by: 'hook:PreToolUse' })
+  g = await startMain()
+  await M().tick()
+  expect(state(id)).toBe('queued')                                                  // not offered to the new gen at once
+  const j = await joey('查到了嗎？')                                                 // the next delivery carries it
+  expect(String(offers.at(-1)!.notif.params.meta.did).split(',')).toEqual(expect.arrayContaining([j, id]))
+  p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: String(offers.at(-1)!.notif.params.meta.did).split(',') })
   await hook(g, 'Stop', { prompt_id: p, phase: 'final' })
-  expect(state(id)).toBe('done')
+  expect(state(id)).toBe('done'); expect(state(j)).toBe('done')
   expect(linesOf('msg', id).filter(l => l.state === 'done').length).toBe(1)
-  expect(linesOf('msg', id).filter(l => l.state === 'offered').length).toBe(6)            // cannot tell (no transcript): re-offered per gen as before; WO-201's cap needs the fact
+  expect(linesOf('msg', id).filter(l => l.state === 'offered').length).toBe(7)            // 5 cut with nothing said (re-offered per gen), the 6th, the ride
   expect(sent.some(s => s.includes('疑似卡死'))).toBe(false)
   expect(existsSync(join(dir, 'inbox', 'undeliverable'))).toBe(false)
   await kill(g)

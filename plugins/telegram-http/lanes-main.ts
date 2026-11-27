@@ -183,7 +183,7 @@ export function createMain(E: MainEnv) {
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
   function initMain(): void {
-    cur = null; stuck = null; offering = false; takeSince = null
+    cur = null; stuck = null; offering = false; takeSince = null; hookOut.clear()
     lastEventAt.clear(); pendingEnd.clear(); outputs.clear(); calls.clear(); starts.clear(); work.clear(); openTools.clear()
     const live = J().rows('main', r => r.state !== 'gone')
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
@@ -462,10 +462,11 @@ export function createMain(E: MainEnv) {
    *  process started another session, a non-account StopFailure): an interrupted turn, the Esc path's shape (cutTurn). Held (reason interrupted, cut_at)
    *  to ride the next delivery with INTERRUPTED_LINE in front; `cut_by` names what cut it, so that with no next delivery within MAIN_STUCK_MS it is
    *  delivered alone once (tick), Joey's own messages included: an Esc is Joey stopping it, a dead process is not */
-  function holdCut(rs: Row[], by: string): Row[] {
+  function holdCut(rs: Row[], by: string, outBy: Map<string, string> = new Map()): Row[] {
     if (!rs.length) return []
-    const ids = new Set(rs.map(r => r.id))
-    return requeue(r => ids.has(r.id), 'interrupted', { cut_at: new Date().toISOString(), cut_by: by })
+    const at = new Date().toISOString()
+    for (const r of rs) J().write('msg', r.id, 'queued', { reason: 'interrupted', gen: null, prompt_id: null, via_pull: null, cut_at: at, cut_by: by, ...(outBy.has(r.id) ? { output_by: outBy.get(r.id) } : {}) })
+    return rs
   }
   function finish(pred: (r: Row) => boolean, how: Record<string, unknown> = {}): Row[] {
     const rs = items(r => r.state === 'bound' && pred(r))
@@ -488,13 +489,33 @@ export function createMain(E: MainEnv) {
   /** did the model say anything after item `r` was bound to a turn of gen `g`? 'stop': it reached done at a final Stop before (its turn then went on:
    *  turn_continued); a number: the ms of the first genuine assistant record of g's transcript after `bound_at` (liveness.ts: a response begun after the
    *  binding); 0: nothing; null: cannot tell (no transcript path, the file unreadable or too large) */
-  function outputOf(g: Row, r: Row): 'stop' | number | null {
+  function outputOf(g: Row, r: Row): 'stop' | string | number | null {
     if (r.received === 'stop') return 'stop'
+    const h = hookOut.get(r.id)                                       // mesh-13196: M2's own hook fact, live (the transcript's last second may not be on disk yet)
+    if (h && h.gen === g.id && h.prompt === r.prompt_id && h.at >= (Date.parse(String(r.bound_at ?? '')) || 0)) return `hook:${h.ev}`
     const tp = String(g.transcript_path ?? '')
     const since = Date.parse(String(r.bound_at ?? r.ts))            // no bound_at (bound before 1.59.1): the item's last line, later than its binding
     return tp && Number.isFinite(since) ? genuineAfter(tp, since) : null
   }
-  const hasOutput = (o: 'stop' | number | null): boolean => o === 'stop' || (typeof o === 'number' && o > 0)
+  const hasOutput = (o: 'stop' | string | number | null): boolean => typeof o === 'string' || (typeof o === 'number' && o > 0)
+  /** what said there was output, for the held item's line (output_by): stop, hook:<event>, transcript */
+  const outputBy = (o: 'stop' | string | number | null): string => typeof o === 'string' ? o : 'transcript'
+  /** WO-201 (Chiron mesh-13196, lab: m-mwyr8ssj-1 bound 09:04:15.464, M2 tool_open react at 17.737, killed 0.6 s later; settle read the transcript at
+   *  18.413 and found nothing, though three genuine records after the binding (17.398, 17.682, 18.269) were in it afterwards: the last second was not on
+   *  disk yet). M2's own fact, received live: item id → the first hook event of the main (not a subagent's) for the item's own prompt, in its gen, after
+   *  it was bound. Counted: PreToolUse / PostToolUse (the model emitted a tool call) and Stop (the model ended its response) for an item bound when its
+   *  prompt began; for an item pulled into a running turn only Stop, since a tool call after the pull may belong to the response that was already streaming
+   *  (the reason the transcript check keys on message.id). In memory: after a daemon restart the transcript alone answers, as before */
+  const hookOut = new Map<string, { gen: string; prompt: string; ev: string; at: number }>()
+  function noteOutput(g: Row, p: string, ev: string): void {
+    const now = Date.now()
+    for (const r of items(x => x.state === 'bound' && x.gen === g.id && x.prompt_id === p && (!x.via_pull || ev === 'Stop'))) {
+      const h = hookOut.get(r.id)
+      if (h && h.gen === g.id && h.prompt === p) continue
+      hookOut.set(r.id, { gen: g.id, prompt: p, ev, at: now })
+    }
+    if (hookOut.size > 2000) for (const k of [...hookOut.keys()].slice(0, hookOut.size - 2000)) hookOut.delete(k)
+  }
   /** gen `g` ends, or its process starts another session that is not a compaction of the running turn, while items `rs` are offered to it or bound to
    *  its turn (no normal end: cases 3 and 4 above):
    *  - offered, never bound: it never reached a turn: queued again (`why`), as before (an item never read cannot be a second copy).
@@ -503,13 +524,13 @@ export function createMain(E: MainEnv) {
    *    which (tellCut). It is not offered a third time.
    *  - bound and it cannot be told: queued again as before (the failure Chiron prefers: one copy too many, never one lost), and the log says why. */
   function settle(g: Row, rs: Row[], why: string): { back: Row[]; held: Row[]; capped: Row[] } {
-    const back: Row[] = [], hold: Row[] = [], capped: Row[] = []
+    const back: Row[] = [], hold: Row[] = [], capped: Row[] = [], outBy = new Map<string, string>()
     const again = (r: Row, f: Record<string, unknown> = {}): void => { J().write('msg', r.id, 'queued', { reason: why, gen: null, prompt_id: null, via_pull: null, ...f }); back.push(r) }
     for (const r of rs) {
       if (r.state === 'offered') { again(r); continue }
       if (r.state !== 'bound') continue
       const out = outputOf(g, r)
-      if (hasOutput(out)) { hold.push(r); continue }
+      if (hasOutput(out)) { hold.push(r); outBy.set(r.id, outputBy(out)); continue }
       if (out == null) {
         E.log('info', `lanes: ${why} of gen ${g.id}: cannot tell whether the model said anything after item ${r.id} (${g.transcript_path ? `transcript ${g.transcript_path} unreadable or too large` : 'no transcript path'}): queued again as before`)
         again(r)
@@ -520,7 +541,7 @@ export function createMain(E: MainEnv) {
       closeItem(r, { reason: 'cut_twice', cuts, cut_by: why })
       capped.push(r)
     }
-    const held = holdCut(hold, why)
+    const held = holdCut(hold, why, outBy)
     if (held.length || capped.length) E.log('info', `lanes: ${why} of gen ${g.id}: ${held.length} item(s) the model had answered held as an interrupted turn's (they ride the next delivery), ${capped.length} cut twice with no output (closed), ${back.length} queued again`)
     return { back, held, capped }
   }
@@ -542,19 +563,19 @@ export function createMain(E: MainEnv) {
    *  stop_failure_gave_up) and Joey is told which. An item offered and never bound was not in the turn: queued again as before. The gen is idle, as before */
   function failTurn(g: Row, p: string, err: string): void {
     const now = Date.now()
-    const parked: Row[] = [], closed: Row[] = [], hold: Row[] = []
+    const parked: Row[] = [], closed: Row[] = [], hold: Row[] = [], outBy = new Map<string, string>()
     for (const r of items(x => (x.state === 'offered' || x.state === 'bound') && x.gen === g.id && (!p || x.prompt_id === p))) {
       const back = { gen: null, prompt_id: null, via_pull: null }
       if (r.state !== 'bound') { J().write('msg', r.id, 'queued', { reason: `stop_failure:${err}`, ...back }); continue }
       const out = outputOf(g, r)
-      if (hasOutput(out)) { hold.push(r); continue }                                    // case 4: the model had answered: an interrupted turn
+      if (hasOutput(out)) { hold.push(r); outBy.set(r.id, outputBy(out)); continue }      // case 4: the model had answered: an interrupted turn
       if (out == null) E.log('info', `lanes: StopFailure ${err} of gen ${g.id}: cannot tell whether the model said anything after item ${r.id}: the refused-turn retry`)
       const fails = Number(r.fails ?? 0) + 1
       if (fails < MAIN_FAIL_MAX) J().write('msg', r.id, 'queued', { reason: `stop_failure:${err}`, ...back, fails, fail_retry_at: now + backoff(err, fails - 1) })
       else if (!r.fail_released) { J().write('msg', r.id, 'queued', { reason: 'stop_failure_cap', ...back, fails, fail_retry_at: null }); parked.push(r) }
       else { closeItem(r, { reason: 'stop_failure_gave_up', fails, gen: null }); closed.push(r) }
     }
-    const held = holdCut(hold, `stop_failure:${err}`)
+    const held = holdCut(hold, `stop_failure:${err}`, outBy)
     setMain(J().get('main', g.id)!, 'idle', { error: err, prompt_id: null, tool_open: null, stopped_prompt: null })   // not a wall: idle; other items go as usual
     const waiting = items(r => r.state === 'queued' && typeof r.reason === 'string' && r.reason === `stop_failure:${err}` && Number(r.fail_retry_at ?? 0) > now)
     E.log('info', `lanes: main gen ${g.id}: turn ${p || '(none)'} ended in StopFailure ${err}: ${waiting.length} item(s) wait ${Math.round(backoff(err, 0) / 1000)} s or the next good turn, ${parked.length} parked at the cap (${MAIN_FAIL_MAX}), ${closed.length} closed, ${held.length} the model had answered held as an interrupted turn's`)
@@ -653,6 +674,8 @@ export function createMain(E: MainEnv) {
     if (stuck && !stuck.undelivered && stuck.gen === g.id) { stuck = null; E.tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
     if (b.sub) return {}                                                    // in an open turn: a sign of life (and the all-clear), nothing else
     const p = String(b.prompt_id ?? '')
+    // WO-201 (mesh-13196): before this event binds or pulls anything, the items already bound to this prompt get M2's own output fact (noteOutput)
+    if (p && (ev === 'PreToolUse' || ev === 'PostToolUse' || ev === 'Stop')) noteOutput(g, p, ev)
     switch (ev) {
       case 'UserPromptSubmit': {
         if (p) beginTurn(g, p, b.dids)

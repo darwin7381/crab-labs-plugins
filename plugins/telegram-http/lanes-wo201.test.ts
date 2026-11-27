@@ -488,6 +488,45 @@ test('WO-201 (i2): the alone delivery of an item with no cut_by (a colleague\'s 
   settleAll()
 })
 
+test('WO-201 (j): the transcript has nothing after the binding yet (its last second not on disk when the gen ends: Chiron mesh-13196, m-mwyr8ssj-1), but M2 received a tool call of that prompt after the binding: an interrupted turn\'s (output_by hook:PreToolUse), not queued again, no cuts; an item pulled into that turn counts only a Stop (a tool call after the pull may be the response already streaming), and a subagent\'s tool call counts for nothing: both take the no-output path', async () => {
+  const g = await startMain()
+  const id = await joey('j: 幫我回 Eve 說好')
+  const p = P()
+  await hook(g, 'UserPromptSubmit', { prompt_id: p, dids: [id] })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__react' })   // M2: tool_open react, 2.3 s after the binding in the lab
+  expect(M().currentGen()).toMatchObject({ state: 'in_turn', prompt_id: p })
+  await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'mcp__plugin_telegram-http_telegram-http__react' })
+  const pulled = await joey('j2: 還有，順便問他週五有空嗎')                                  // comes while the turn runs: queued, pulled at the next boundary
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Read' })
+  expect((await hook(g, 'PostToolUse', { prompt_id: p, tool_name: 'Read' })).additionalContext).toContain('j2: 還有')
+  expect(row(pulled)).toMatchObject({ state: 'bound', prompt_id: p, via_pull: true })
+  await hook(g, 'PreToolUse', { prompt_id: p, tool_name: 'Bash' })                         // after the pull: maybe still the response that was streaming
+  expect(readFileSync(g.tr, 'utf8').trim().split('\n').length).toBe(1)                     // nothing in the transcript after the binding
+  await kill(g)                                                                            // 0.6 s later
+  expect(row(id)).toMatchObject({ state: 'queued', reason: 'interrupted', cut_by: 'gen_end', output_by: 'hook:PreToolUse' })
+  expect(row(id).cuts).toBeUndefined()                                                     // 1.59.1 before mesh-13196: gen_end, cuts 1, offered again, answered twice
+  expect(row(pulled)).toMatchObject({ state: 'queued', reason: 'gen_end', cuts: 1 })
+  const g2 = await startMain()
+  const lead = String(offers.at(-1)!.notif.params.meta.did).split(',')
+  expect(lead[0]).toBe(pulled)                                                             // the pulled one, with nothing said after it, leads the next gen's offer
+  expect(lead).toContain(id)                                                               // the held one never leads: it rides that delivery, the line in front
+  expect(row(id)).toMatchObject({ state: 'offered' }); expect(String(offers.at(-1)!.notif.params.content)).toContain(INTERRUPTED_LINE)
+  await kill(g2)
+  settleAll()
+  // a subagent's tool call after the binding is not the main's output
+  const g3 = await startMain()
+  const id3 = await joey('j3: 用子 agent 讀完 20 頁日誌')
+  const p3 = P()
+  await hook(g3, 'UserPromptSubmit', { prompt_id: p3, dids: [id3] })
+  await hook(g3, 'PreToolUse', { prompt_id: p3, tool_name: 'Read', sub: true })
+  await kill(g3)
+  expect(row(id3)).toMatchObject({ state: 'queued', reason: 'gen_end', cuts: 1 })
+  const g4 = await startMain()
+  expect(state(id3)).toBe('offered')
+  await kill(g4)
+  settleAll()
+})
+
 test('WO-201 liveness.genuineAssistantAfterFile: a block of a response begun before the binding (same message.id, written after a tool_result: Claude Code runs a tool while its response streams) does not count; a new response does; API errors and <synthetic> do not; no file: null (cannot tell)', () => {
   const f = join(dir, 'unit.jsonl'), T = Date.parse('2026-11-27T05:00:00.000Z'), iso = (ms: number) => new Date(ms).toISOString()
   const w = (rs: object[]) => writeFileSync(f, rs.map(r => JSON.stringify(r)).join('\n') + '\n')
