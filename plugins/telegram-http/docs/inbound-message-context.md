@@ -33,7 +33,7 @@ and which messages belong to one album.
 | `attachment_kind` | `photo` (only on download failure) / `document` / `video` / `audio` / `voice` / `video_note` / `sticker` / `animation` |
 | `attachment_file_id` | pass to the `download_attachment` tool, then `Read` the returned path (bot downloads cap at 20MB) |
 | `attachment_size` / `attachment_mime` / `attachment_name` | as reported by Telegram (name is sanitized) |
-| `voice_transcript` (1.14.0, opt-in) | local speech-to-text of a `voice`/`audio` attachment, ≤500 chars (truncation marked with a trailing `…`). Present only when the daemon runs with `CHANNEL_BOT_VOICE_TRANSCRIBE=1`. Treat it as what the sender said; download the audio only if you need the original. Transcription failure never blocks delivery — the message just arrives without the attribute. |
+| `voice="true"` / `voice_transcript` / `voice_error` | Onsen transcribes the attached audio on arrival. Treat the text as what the sender said. If a name or term matters, use `attachment_file_id` to check the audio. On failure, `voice_error` gives the reason and the audio stays attached. A roamer polling Telegram directly can produce a local `voice_transcript` for voice or audio with `CHANNEL_BOT_VOICE_TRANSCRIBE=1`. |
 
 ### Reply context (message is a Telegram reply)
 
@@ -108,7 +108,7 @@ silent MPEG4) is a proper attachment (`attachment_kind="animation"`).
   `re［port］＜v2＞.txt`; `\r\n` become spaces. Quote/paren characters pass
   through untouched.
 - Excerpts (`reply_to_text`, `reply_quote`, media-kind labels) are capped at
-  200 chars; `voice_transcript` at 500. Since 1.14.0 a value that was
+  200 chars. A roamer's local `voice_transcript` is capped at 500. Since 1.14.0 a value that was
   actually cut ends with `…` so truncation is visible.
 - Attributes appear only when applicable — absence of `forward_origin` means
   the message is not a forward.
