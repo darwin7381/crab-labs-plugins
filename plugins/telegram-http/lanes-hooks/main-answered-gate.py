@@ -301,7 +301,7 @@ def _missed(p, sid, d, msgs, outs):
         st[f"{sid}:{m['mid']}"] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
     if not _save(sp, st):
         return None                                      # cannot remember = would repeat on every stop: say nothing instead
-    lines = '\n'.join(f"- {m['user'] or '寄件者'}（{'Telegram' if m['kind'] == 'tg' else 'mesh'} {m['mid']}）：「{m['body'][:300]}」" for m in missed)
+    lines = '\n'.join(f"- {m['user'] or '寄件者'}（{'訊息' if m['kind'] == 'tg' else 'mesh'} {m['mid']}）：「{m['body'][:300]}」" for m in missed)
     return ('這一輪先不要結束。你這一回合收到的下面這幾則訊息，到現在沒有回應，也沒有交代什麼時候處理：\n' + lines +
             '\n請現在回應；如果要晚一點才處理，也回一句讓對方知道。已經回過的不用重回。')
 
