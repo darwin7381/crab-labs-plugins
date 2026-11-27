@@ -1,3 +1,8 @@
+## Unreleased (goes out with 1.59.9)
+
+- The last three agent-facing "Telegram" sentences of the Onsen-words wave (Chiron, 1.59.8 lab; mail #200891 「同一類、頁面上沒列到的四處」): `send_to_agent` to `joey` with no BTCC base 「Use reply to tell Joey directly.」, its delivered line 「use reply in your conversation with him instead.」, a worker lane's steer 「這段對話只收白名單裡的人」. No version bump: they ship with WO-168 part 2 (1.59.9).
+- Not listed in 1.59.8: the telegram-bridge sends a group's `chat_title` (Epeius 466ecc3, WO-179; bridge-only, it went live with 1.59.8's pull).
+
 ## 1.59.8 — 2026-11-28 (Onsen words for the agent-facing texts; two usage-wall log lines)
 
 - **The agent-facing texts say "this conversation in Onsen", not "Telegram"** (Chiron mail #200891, his list `onsen-words-20261128/EDITS.md`, passages 6–10, 12–22, 24, verbatim; Joey TG chiron:2993). The MCP instructions' first two sentences, the main's lanes rules and the 〔Joey 原話｜分流器收到的原文…〕 label they cite (`lanes.ts`, same version), the hand-over wrapper, the not-main notice, react / edit_message / download_attachment, chat_history (its parameters and main description), notify_joey, the worker-lane rules, open_worker, the four INBOX_TEXT sentences, the two lane hooks' missed-message label. Codex call-914 (d297584, d0d39dd, 5ec2d1c, 4c5becb).

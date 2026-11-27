@@ -2346,7 +2346,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // 'joey' is a log-only target: the boss has no inbox daemon — he reads the BTCC
   // Messenger thread, so logging the message IS the delivery (fills his dm thread).
   if (target === 'joey' || target === 'joey (btcc)') {
-    if (!BTCC_API_BASE) return 'send to joey FAILED: "joey" is a log-only target and BTCC_API_BASE is not configured on this machine — nothing was sent. Use your Telegram reply tools.'
+    if (!BTCC_API_BASE) return 'send to joey FAILED: "joey" is a log-only target and BTCC_API_BASE is not configured on this machine — nothing was sent. Use reply to tell Joey directly.'
     try {
       const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
         method: 'POST',
@@ -2358,7 +2358,7 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
         body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
         signal: AbortSignal.timeout(8000),
       })
-      if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use your Telegram reply tools instead."
+      if (r.ok) return "delivered to Joey's Messenger thread (BTCC). For urgent matters that need his phone to ping, use reply in your conversation with him instead."
       return `send to joey FAILED (BTCC log ${r.status})`
     } catch (e) {
       return `send to joey FAILED (${e})`
