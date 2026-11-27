@@ -217,11 +217,11 @@ describe('#dev items (Chiron mesh 13257)', () => {
     expect(onsen.puts.at(-1)!.result.attachment_file_ids ?? []).toHaveLength(0)            // the clone's files are not attached
     expect(log.some(l => /#dev push codex\/call-9960: ok/.test(l))).toBe(true)
   }, 40_000)
-  test('branch= is used; a repo nobody knows fails the item with the reason', async () => {
+  test('branch= is used, #dev found after the mesh\'s 因為 line; a repo nobody knows fails the item with the reason', async () => {
     const { local, bare } = repos()
     const { onsen, cfg } = setup()
     onsen.call('9961', 'chiron', 9961)
-    onsen.push({ sender: 'chiron', payload: { text: `#dev repo=${local} branch=feat/x\nCOMMIT:a.txt`, msg_id: 9961 }, dedupe: 'msg:9961', call_id: '9961' })
+    onsen.push({ sender: 'chiron', payload: { text: `因為：Joey 在等\n\n#dev repo=${local} branch=feat/x\nCOMMIT:a.txt`, msg_id: 9961 }, dedupe: 'msg:9961', call_id: '9961' })   // a Call's because line first (Call 774)
     onsen.call('9962', 'chiron', 9962)
     onsen.push({ sender: 'chiron', payload: { text: '#dev repo=nosuchrepo\n做事', msg_id: 9962 }, dedupe: 'msg:9962', call_id: '9962' })
     const r = runner(cfg)

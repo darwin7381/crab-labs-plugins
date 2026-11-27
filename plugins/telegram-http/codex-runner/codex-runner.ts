@@ -93,9 +93,10 @@ export function devRepos(v: string | undefined, home: string): Record<string, st
   }
   return out
 }
-/** `#dev repo=<name or /abs/path> [branch=<name>]` on an item's first line → what it asks for; null: not a dev item */
+/** `#dev repo=<name or /abs/path> [branch=<name>]` on the first line the caller wrote → what it asks for; null: not a dev item. A Call sent with
+ *  send_to_agent starts with the line the mesh adds (「因為：…」), so that line and blank ones are skipped (Chiron mesh 13262: Call 774) */
 export function devAsk(text: string): { repo: string; branch: string | null } | null {
-  const first = (text.split('\n')[0] ?? '').trim()
+  const first = text.split('\n').map(l => l.trim()).find(l => l && !/^(因為|因为|because)\s*[:：]/i.test(l)) ?? ''
   if (!/^#dev\b/.test(first)) return null
   const repo = /\brepo=(\S+)/.exec(first)?.[1] ?? ''
   const branch = /\bbranch=([A-Za-z0-9._\/-]{1,100})/.exec(first)?.[1] ?? null
