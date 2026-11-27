@@ -385,13 +385,12 @@ describe('chat_history', () => {
     expect(src).not.toContain('For earlier context, ask them to paste or summarize')
     const lanes = readFileSync(join(import.meta.dir, 'lanes.ts'), 'utf8')
     expect(lanes).toContain("case 'chat_history': return D.chatHistory ? D.chatHistory(a ?? {})")
-    // the four hooks of the first step: inbound, the main's reply (text and files), edit_message, a lane's / the router's line
-    expect(src).toContain('if (!onsenVoice) onsenIn(ctx.message, text)')
-    expect(src).toContain("await Onsen.withSender('main', () => sendTextParts(chat_id,")
-    expect(src).toContain("await Onsen.withSender('main', () => method === 'sendPhoto' ?")
-    expect(src).toContain("await Onsen.withSender('main', () => Onsen.richAttempt(() => callBotApi('editMessageText',")
-    expect(src).toContain("await Onsen.withSender('main', () => bot.api.editMessageText(")
-    expect(src).toContain("await Onsen.withSender(o.laneId || 'router', () => sendTextParts(chat,")
+    // 1.59.0: the four hooks of the first step (recording the inbound, the main's reply, edit_message, a lane's line on their way to Telegram) are gone: a
+    // connector writes each into Onsen itself (connectorReply / connectorSay, the sender named), a roamer records nothing
+    expect(src).toContain("const r = await connectorReply({ chat: chat_id, sender: 'main', text: fl.text, redact: fl.redact, rich: useRich, files,")
+    expect(src).toContain("await connectorSay!.edit(String(args.chat_id), String(args.message_id ?? ''), String(args.text ?? ''))")
+    expect(src).toContain("const sender = o.laneId || 'router', turn_id = o.laneId ? Lanes.runOfLane(o.laneId) : null")
+    for (const gone of ['onsenIn(', 'sendTextParts(', 'Onsen.richAttempt(', 'callBotApi(']) expect([gone, src.includes(gone)]).toEqual([gone, false])
     expect(lanes).toContain('...(lane ? { laneId: lane.id } : {}) })')
   })
 })

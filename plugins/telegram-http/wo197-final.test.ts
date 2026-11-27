@@ -98,9 +98,10 @@ function daemonSources(): string[] {
   walk(join(PLUGINS, 'agent-inbox'))
   return out.sort()
 }
-// the same search as a shell one-liner (CHANGELOG 1.59.0):
-//   cd plugins && grep -rnE 'grammy|api\.telegram\.org|bot\.api|getUpdates' --include='*.ts' telegram-http agent-inbox | grep -v node_modules \
-//     | grep -v '\.test\.ts:' | grep -vE '^telegram-http/(roamer-telegram\.ts|telegram-bridge/|test-fixtures/)'
+// the same search as a shell one-liner (CHANGELOG 1.59.0; /usr/bin/grep: a grep that skips "binary-looking" files, as Claude Code's shell one does,
+// silently skips server.ts):
+//   cd plugins && /usr/bin/grep -rnE 'grammy|api\.telegram\.org|bot\.api|getUpdates' --include='*.ts' telegram-http agent-inbox | /usr/bin/grep -v node_modules \
+//     | /usr/bin/grep -v '\.test\.ts:' | /usr/bin/grep -vE '^telegram-http/(roamer-telegram\.ts|telegram-bridge/|test-fixtures/)'
 test('(b) the search: no daemon source but roamer-telegram.ts mentions grammy, api.telegram.org, bot.api or getUpdates', () => {
   const files = daemonSources()
   expect(files.some(f => f.endsWith('/telegram-http/server.ts'))).toBe(true)
