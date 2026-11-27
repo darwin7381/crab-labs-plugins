@@ -306,11 +306,11 @@ test('WO-201 (f): while the main cannot act (walled; offline) handoff-due and ca
   const gid = String(g.pid)
   const ho = () => sent.slice(k).filter(s => s.includes('ho-201f1')), card = () => sent.slice(k).filter(s => s.includes('ho-201f2'))
   // walled from t0 + 1 s to t0 + 600 s (synchronous from here to the recovery: the 1-second sweep of the daemon cannot run in between)
-  L.__journal().write('main', gid, 'walled', { kind: 'rate_limit', error: 'rate_limit', wall_since: new Date(t0).toISOString(), probes: 0, retry_at: t0 + WALL })
+  L.__journal().write('main', gid, 'walled', { kind: 'rate_limit', error: 'rate_limit', wall_since: new Date(t0).toISOString() })
   expect(M().mainPhase()).toBe('walled')
   L.dueTick(t0 + 1_000)
   L.dueTick(t0 + 400_000)                                                                  // past both due times, and the critical one's
-  L.__journal().write('main', gid, 'idle', { kind: null, wall_since: null, probes: null, retry_at: null, error: null })   // the wall is down at t0 + 600 s
+  L.__journal().write('main', gid, 'idle', { kind: null, wall_since: null, error: null })   // the wall is down at t0 + 600 s
   L.dueTick(t0 + 600_000)
   await sleep(30)
   expect(ho()).toEqual([]); expect(card()).toEqual([])                                     // 1.59.0: both pushed at t0 + 300 s with 「（主線現在不能用模型）」

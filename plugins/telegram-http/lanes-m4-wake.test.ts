@@ -112,7 +112,7 @@ test('C2: handoff_main while the main is idle is offered at once (one wake); whi
   for (const id of [a, b]) expect((L.__events().get(id)!.obligations as any[]).find(o => o.kind === 'main').state).toBe('met')
 })
 
-test('inv C(4), PL4: a walled main (its own wall) gets nothing owed until its retry time; then the wake is the probe offer, once; the lanes\' wall never wakes it', async () => {
+test('inv C(4), PL4: a walled main (its own wall) gets nothing owed until the keeper clears it; then the wake is the probe offer, once; the lanes\' wall never wakes it', async () => {
   const p0 = P(); await hook('UserPromptSubmit', { prompt_id: p0 }); await hook('StopFailure', { prompt_id: p0, error: 'rate_limit', reason: '429' })
   expect(M().mainPhase()).toBe('walled')
   const k = offers.length
@@ -125,8 +125,8 @@ test('inv C(4), PL4: a walled main (its own wall) gets nothing owed until its re
   expect(journal().some(l => l.rec === 'wake' && l.id === a && l.state === 'no_wake' && /walled/.test(l.reason))).toBe(true)
   L.__wallUp('rate_limit', 'lane 429'); await L.__wallDown(); await sleep(20)                // the lanes' wall up and down: not the main's signal
   expect(offers.length).toBe(k); expect(M().mainPhase()).toBe('walled')
-  L.__journal().write('main', String(g.pid), 'walled', { retry_at: Date.now() - 1 })          // its retry time comes
-  await M().tick()
+  M().statusChanged(Date.now())
+  await sleep(0)
   expect(offers.length).toBe(k + 1); expect(offers.at(-1).params.content).toContain('Eve 要權限')
   await M().tick(); expect(offers.length).toBe(k + 1)                                         // once
   await mainTurn()
