@@ -376,7 +376,7 @@ plugins/telegram-http/test-fixtures/no-telegram-probe.ts::must not be loaded by 
 plugins/telegram-http/lanes-main.ts::function settle(g: Row, rs: Row[], why: string)
 plugins/telegram-http/lanes-main.ts::const goesOn = !!same && same.state === 'in_turn' && !!same.prompt_id && b.source === 'compact'
 plugins/telegram-http/lanes-main.ts::function failTurn(g: Row, p: string, err: string)
-plugins/telegram-http/lanes-main.ts::function holdCut(rs: Row[], by: string, outBy: Map<string, string>
+plugins/telegram-http/lanes-main.ts::function holdCut(r: Row, by: string, output: string, cuts?: number)
 plugins/telegram-http/lanes-main.ts::(r.kind !== 'joey' || !!r.cut_by)
 plugins/telegram-http/lanes-main.ts::const quiet = cutOld.length > 0 && cutOld.every(r => !!r.cut_by)
 plugins/telegram-http/lanes-main.ts::function noteOutput(g: Row, p: string, ev: string): void
@@ -388,7 +388,7 @@ plugins/telegram-http/lanes-main.ts::function wallDelivery(
 plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
 plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
 # WO-204 part 2 (1.59.4)
-plugins/telegram-http/lanes-main.ts::(!heldCut(r) || releasedCut(r))
+plugins/telegram-http/lanes-main.ts::ready.filter(r => !heldCut(r) || releasedCut(r))
 # WO-205 (1.59.5)
 plugins/telegram-http/onsen-status.ts::mainForAdoption()
 plugins/telegram-http/lanes-main.ts::main adopted from the session registry

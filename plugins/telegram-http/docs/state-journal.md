@@ -53,7 +53,15 @@ ended decides, four cases only:
 | a normal end (its final `Stop`) | `done` (`received: stop`) |
 | a compaction inside it (SessionStart `source: compact` from the gen's own process while `in_turn`) | the turn goes on under the same `prompt_id` (measured 2026-11-27: 82 of 82 on the lanes journals of the Mac mini and txmonster): the gen stays `in_turn` with its prompt, nothing is queued again |
 | no normal end, and **no** genuine output after the item was bound | offered once more (`cuts: 1`); a second such end closes it (`done`, `reason: cut_twice`) with one line to Joey (`main-cut`). For a non-account StopFailure: the backoff and cap below |
-| no normal end, output **already** there (the process gone, another session, a non-account StopFailure) | an interrupted turn's, the Esc path's (`cutTurn` / `holdCut`): `queued`, `reason: interrupted`, `cut_at`, `cut_by` (`gen_end`, `session_start`, `stop_failure:<error>`). It rides the next delivery (an offer, or a pull into a running turn) with `INTERRUPTED_LINE` in front; with no next delivery within `MAIN_STUCK_MS` (600 s) of the main being able to take it, it is offered alone, once (`interrupted_untaken`, the WO-157c path) and nobody is told: no `main-stuck` push, no stuck episode, so no `main-unstuck` (Chiron mesh-13191: not a stuck main; before 1.59.1 such an item was offered again at once and Joey heard nothing). When the items going alone include any without `cut_by` (Esc-cut, a turn with no Stop), the WO-157c stuck path runs as before. Joey's own item cut this way goes alone too (one cut by Esc does not: Joey stopped it) |
+| no normal end, output **already** there | `holdCut` queues it with `reason: interrupted`, `cut_at`, `cut_by` and its output evidence. After process loss (`gen_end`) it rides or leads the next offer the main can take with the wall down. An account cut is released at the keeper's clear. Both carry instructions to finish the work and avoid repeating actions, with the reason 對話結束 or 用量上限. |
+
+A session change (`session_start`) or non-account StopFailure keeps `INTERRUPTED_LINE`. These items ride the next delivery or, after 600 s
+of receivable time, lead one quiet offer (`interrupted_untaken`). Esc cuts retain their own rule. Joey's Esc-cut item only rides, while a
+colleague's can lead after 600 s with the usual stuck notice.
+
+Process loss and session changes share one bound-item counter, `cuts`, regardless of output. The second known cut closes the item with
+`reason: cut_twice`. Joey's `main-cut` notice says whether work had started. A held process or session cut from 1.59.5 already records
+the first cut in `cut_by`.
 
 - **Output after the binding**: the item reached `done` at a final `Stop` before (`received: stop`, kept when its turn goes on: `turn_continued`), or M2
   itself received a hook event of the main for the item's own prompt, in its gen, after the item was bound (`noteOutput`, mesh-13196: PreToolUse /
@@ -61,8 +69,7 @@ ended decides, four cases only:
   the response that was already streaming; a subagent's event never: received live, so the last second the transcript may not have on disk yet when the gen
   ends is not missed; in memory, so after a daemon restart the transcript alone answers), or the gen's transcript has a genuine assistant record after the item's `bound_at` (liveness.ts `genuineAssistantAfterFile`: the fleet's one predicate
   `isGenuineAssistant`, i.e. not `isApiErrorMessage`, not model `<synthetic>`; and a response begun after `bound_at`: a block of a response already
-  streaming then, same `message.id`, does not count, because Claude Code runs a tool while its response still streams). Output means the work started,
-  not that it finished: such an item is never `done` without the turn's Stop. The held item's line says which fact it was (`output_by`: `stop`,
+  streaming then, same `message.id`, does not count, because Claude Code runs a tool while its response still streams). Output means the work started. The held item's line records the evidence (`output_by`: `stop`,
   `hook:<event>`, `transcript`).
 - **Where it is decided**: the end of a gen (kill -0, SessionEnd, another process taking the role) and another session in the same process while a turn is
   open (`/clear`, `/resume`; not a compaction) settle each item of that gen (`settle`); a non-account StopFailure, its turn's items (`failTurn`). An item
