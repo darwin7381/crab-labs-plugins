@@ -26,12 +26,12 @@ import { BOUNDARY_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, defe
 import { genuineAssistantAfterFile } from './liveness.ts'
 
 import type { CallCheck, CallWait } from './onsen-client.ts'
-import { personCanProbe } from './usage-wall.ts'
+import { hhmmTaipei, personCanProbe } from './usage-wall.ts'
 
 export type MainWall = { walled: boolean; clearedMs: number | null; lastWallMs?: number | null; resets_at?: string | null }
 
 export type Notif = { method: string; params: unknown }
-export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry'
+export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry' | 'wall_resume'
 export type Via = 'tg' | 'inbox'
 export type MainPhase = 'starting' | 'idle' | 'in_turn' | 'walled' | 'gone'
 export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
@@ -311,7 +311,16 @@ export function createMain(E: MainEnv) {
     if (kind !== 'digest') void pump(kind === 'joey' ? 'person' : undefined)
     return id
   }
-  const owed = (r: Row): boolean => E.owed ? E.owed(r) : r.kind !== 'digest'
+  // The main's own interrupted prompt has no inbound M3 event. Its open wall episode owes the probe.
+  const owed = (r: Row): boolean => r.wall_resume ? r.wall_resume === currentGen()?.wall_since : (E.owed ? E.owed(r) : r.kind !== 'digest')
+  const resumeText = (refusedAt: number) => `額度通了，上一回合 ${hhmmTaipei(refusedAt)}（台北）被用量上限打斷，接著做沒做完的；沒有要接的就直接結束這一回合。`
+  function enqueueResume(g: Row): Row {
+    const content = resumeText(g.wall_refused_at)
+    const id = enqueue('wall_resume', { method: 'notifications/claude/channel', params: { content,
+      meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'wall_resume', no_reply: 'true' } } },
+      { fields: { wall_resume: g.wall_since, reason: `stop_failure:${g.kind}`, waited: 'wall' } })
+    return J().get('msg', id)!
+  }
   const forGen = (r: Row, g: Row): boolean => !r.target || r.target === g.session_id
   /** WO-157c (Chiron 15:25Z, 1): an item of a turn that was interrupted (Esc: statusIdle; a turn that never got Stop: beginTurn), queued again and waiting
    *  to ride the next thing the main is given (an offer, or a pull into a turn). It never opens a turn on its own: the main would start again what Joey
@@ -437,7 +446,12 @@ export function createMain(E: MainEnv) {
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     // A keeper clear lets this episode's interrupted items lead the probe. Older journals only have cut_by.
     const clearedCut = (r: Row) => wall.clear != null && accountRefusal(r.cut_by) && (!r.cut_wall_since || !g.wall_since || r.cut_wall_since === g.wall_since)
-    const cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && (!heldCut(r) || clearedCut(r)) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
+    const candidates = () => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && (!heldCut(r) || clearedCut(r)) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
+    const cands = candidates()
+    // A daemon upgraded in the middle of a wall can have the refusal but no resume item in its journal.
+    if (!cands.length && probe && wall.clear != null && g.wall_since && g.wall_refused_at && ACCOUNT_WALL.has(g.kind) && !items(r => r.wall_resume === g.wall_since).length) {
+      cands.push(enqueueResume(g))
+    }
     if (!cands.length) return
     const mp = wall.active && !probe ? null : mentionsNow()
     const mb = mp ? await mp : null
@@ -453,10 +467,14 @@ export function createMain(E: MainEnv) {
       ...(menu && !menu.asks ? { wall_menu: menu.text } : {}), ...(wall.clear != null ? { uw_clear_used: wall.clear } : {}),
     })
     const down = new Set<string>()
-    for (const it of cands) {
+    // Recheck after driving the menu: real work can arrive while it closes. Try the fallback last,
+    // so a final Call or a disconnected stream cannot consume the episode's only usable probe.
+    const resume = cands.find(r => r.wall_resume)
+    const ordered = resume ? [...candidates().filter(r => !r.wall_resume), resume] : cands
+    for (const it of ordered) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
-      let riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
+      let riders = items(r => r.id !== it.id && !r.wall_resume && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
       const checkedGroup = checked([it, ...riders], g, wall.clear)
       if (checkedGroup instanceof Promise) {
         const group = await checkedGroup
@@ -490,6 +508,7 @@ export function createMain(E: MainEnv) {
       // 002w: the offer is awaited, and the main can take it in meanwhile: its UserPromptSubmit names the item (did) and binds it. Only an item still
       // queued becomes `offered`; writing `offered` over `bound` sent a taken item back to be offered again (stuck_unbound), a second delivery.
       for (const id of ids) if (J().get('msg', id)?.state === 'queued') J().write('msg', id, 'offered', { gen: g.id, last_no_wake: null, person_wall_offer: wall.active && !probe || null })
+      if (resume && it !== resume && resume.state === 'queued') closeItem(resume, { reason: 'wall_resume_superseded' })
       mentionsReached(dg)                                                                     // WO-181: in its session now: the mentions it carried are read
       J().write('wake', it.id, 'wake', { reason: `main ${probe ? 'walled: its probe' : 'idle'} (gen ${g.id}); offered ${it.kind}${dg ? ' with the digest' : ''}${riders.length ? `, ${riders.length} item(s) of an interrupted turn riding` : ''}` })
       for (const r of riders) J().write('wake', r.id, 'wake', { reason: r.reason === 'batched' ? `batched: rides the offer of ${it.id} (gen ${g.id})` : `its turn was interrupted: rides the offer of ${it.id} (gen ${g.id})` })
@@ -509,10 +528,10 @@ export function createMain(E: MainEnv) {
 
   /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary. `mb` (WO-181): the unread mentions
    *  fetched for it (pullable() first said there is something to pull) */
-  const pullable = (g: Row): boolean => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r)).length > 0
+  const pullable = (g: Row): boolean => items(r => r.state === 'queued' && !r.wall_resume && owed(r) && forGen(r, g) && !waitsRetry(r)).length > 0
   async function pull(g: Row, prompt: string, mb: { text: string; posts: string[] } | null = null): Promise<Row[]> {
     const wall = wallDelivery(g)
-    let got = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r) && wallAllows(r, wall))     // WO-201: a failed turn's item waits for its retry time
+    let got = items(r => r.state === 'queued' && !r.wall_resume && owed(r) && forGen(r, g) && !waitsRetry(r) && wallAllows(r, wall))     // WO-201: a failed turn's item waits for its retry time
     const verified = checked(got, g, wall.clear)
     if (verified instanceof Promise) {
       got = await verified
@@ -862,7 +881,10 @@ export function createMain(E: MainEnv) {
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
         openTools.delete(g.id)
         setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
-        if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
+        if (since) {
+          for (const r of items(r => r.wall_resume === since && r.state === 'queued')) closeItem(r, { reason: 'wall_resume_moot' })
+          E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
+        }
         void pump()
         return {}
       }
@@ -870,7 +892,7 @@ export function createMain(E: MainEnv) {
         if (p) beginTurn(g, p)
         openTools.delete(g.id)
         const err = String(b.error ?? 'unknown')
-        // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn). The account wall below is unchanged
+        // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn).
         if (!ACCOUNT_WALL.has(err)) { if (p) outputs.delete(p); failTurn(g, p, err); return {} }
         const refusedAt = Date.now()
         const since = g.wall_since ?? new Date(refusedAt).toISOString()
@@ -878,7 +900,7 @@ export function createMain(E: MainEnv) {
         const back = items(r => (r.state === 'bound' || r.state === 'offered') && r.gen === g.id && (!p || r.prompt_id === p))
         const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
         for (const r of back) {
-          const output = r.state === 'bound' && r.kind !== 'digest' ? outputOf(g, r) : null
+          const output = r.state === 'bound' && r.kind !== 'digest' && !r.wall_resume ? outputOf(g, r) : null
           if (hasOutput(output)) {
             holdCut([r], reason, new Map([[r.id, outputBy(output)]]), since)
             continue
@@ -895,6 +917,12 @@ export function createMain(E: MainEnv) {
         setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: since, wall_refused_at: refusedAt, wall_clear_at: null, probes,
           retry_at: Date.now() + backoff(err, probes) })
         if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
+        const resume = items(r => r.wall_resume === since)[0]
+        if (resume?.state === 'queued') {
+          J().write('msg', resume.id, 'queued', { notif: { ...resume.notif, params: { ...resume.notif.params, content: resumeText(refusedAt) } } })
+        } else if (!resume && !back.some(owed)) {
+          enqueueResume(cur)
+        }
         return {}
       }
       case 'SessionEnd': {
