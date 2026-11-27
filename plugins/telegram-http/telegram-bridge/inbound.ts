@@ -351,6 +351,7 @@ export class Poller {
     if (what !== 'message') return
     const m = e.u.message, chat = String(m.chat.id)
     if (ans.json?.data?.duplicate) this.a.stats.duplicates++; else this.a.stats.written++
+    this.a.chatAlive(chat)                          // WO-196: a chat marked gone for the pinned status has it again
     this.a.pending.inbound({ chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), kind: e.cache.body?.kind ?? 'text' } as any)
     // 👀: Onsen has it (the daemon's ackReaction; unset: 👀; '': none)
     const ack = this.a.access()?.ackReaction ?? '👀'

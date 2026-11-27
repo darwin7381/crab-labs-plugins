@@ -4,7 +4,7 @@
 // file lives in the bridge's state dir (pins/<member>/); the first time, the daemon's record (<state dir>/onsen/status-pin.json and its
 // status-pin-off-<chat>.json markers) is copied there, so the message already pinned in Joey's chat is the one edited and a chat he turned off
 // stays off.
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PendingTracker, SEEN_EMOJI, SeenReactor, SinceTracker, StatusPin, pendingLine, statusLine, tpe } from '../onsen-visible.ts'
 import { readAccess, type Access } from './tg-access.ts'
@@ -67,7 +67,10 @@ export class Agent {
     }
     const kb = { inline_keyboard: [[{ text: '不要顯示這則', callback_data: 'opin:off' }]] }
     this.pinObj = new StatusPin({ dir, log: this.o.log, now: this.o.now, pinCheckMs: this.o.pinCheckMs, minEditMs: this.o.pinMinEditMs, api: {
-      send: async (chat, text) => Number((await this.tg.call('sendMessage', { chat_id: chat, text, disable_notification: true, reply_markup: kb })).message_id),
+      send: async (chat, text) => {
+        try { return Number((await this.tg.call('sendMessage', { chat_id: chat, text, disable_notification: true, reply_markup: kb })).message_id) }
+        catch (e) { this.markGone(chat, e); throw e }
+      },
       pin: (chat, id) => this.tg.call('pinChatMessage', { chat_id: chat, message_id: id, disable_notification: true }),
       edit: (chat, id, text) => this.tg.call('editMessageText', { chat_id: chat, message_id: id, text, reply_markup: kb }),
       del: (chat, id) => this.tg.call('deleteMessage', { chat_id: chat, message_id: id }),
@@ -84,6 +87,43 @@ export class Agent {
     this.since = new SinceTracker({ ...this.pinObj.sinceStore(), now: this.o.now })
     return this.pinObj
   }
+  /** chats where Telegram said the bot cannot write (the person never opened it, blocked it, or the account is gone): no pinned status there
+   *  until the person writes to the bot (WO-196, Chiron 11-27 05:36Z: a status sent every 10 min to a chat that does not exist). Kept in
+   *  pins/<member>/no-pin.json, so a restart does not try again. */
+  private gone: Set<string> | null = null
+  private goneSet(): Set<string> {
+    if (!this.gone) {
+      try { this.gone = new Set((JSON.parse(readFileSync(join(this.pinDir(), 'no-pin.json'), 'utf8')) as unknown[]).map(String)) }
+      catch { this.gone = new Set() }
+    }
+    return this.gone
+  }
+  private saveGone(): void {
+    try { mkdirSync(this.pinDir(), { recursive: true }); writeFileSync(join(this.pinDir(), 'no-pin.json'), JSON.stringify([...this.goneSet()])) }
+    catch (e) { this.o.log('warn', `${this.member}: no-pin.json not written (${(e as Error).message})`) }
+  }
+  markGone(chat: string, e: unknown): void {
+    if (!/chat not found|bot was blocked|user is deactivated|bot can't initiate conversation/i.test(String((e as Error)?.message ?? e))) return
+    if (this.goneSet().has(chat)) return
+    this.goneSet().add(chat)
+    this.saveGone()
+    this.o.log('info', `${this.member}: chat ${chat}: Telegram says the bot cannot write there; no pinned status in it until the person writes to the bot`)
+  }
+  /** the person wrote to the bot in this chat: a chat marked gone gets its pinned status again */
+  chatAlive(chat: string): void {
+    if (!this.goneSet().delete(chat)) return
+    this.saveGone()
+    this.o.log('info', `${this.member}: chat ${chat}: the person wrote to the bot; its pinned status comes back`)
+    this.pinObj?.retryNow(chat)
+    this.redrawPin(chat)
+  }
+  /** a chat the pinned status may be drawn in: a DM of a person on this bot's allowFrom (WO-196, Chiron 11-27 05:36Z: a person taken off
+   *  the list still had the status in their chat edited), not marked gone */
+  pinAllowed(chat: string): boolean {
+    if (!/^\d+$/.test(chat) || this.goneSet().has(chat)) return false
+    const a = this.access()
+    return !!a && a.allowFrom.map(String).includes(chat)
+  }
   /** an observation for this chat (a DM: the pinned status lives in DMs only, as today) */
   observe(chat: string, status: any, itemAt?: string): void {
     if (!/^\d+$/.test(chat)) return
@@ -93,7 +133,7 @@ export class Agent {
   }
   redrawPin(chat: string): void {
     const s = this.status.get(chat)
-    if (!s) return
+    if (!s || !this.pinAllowed(chat)) return
     const pin = this.pin()
     const l1 = pinLine(s.status, this.since!, this.now(), s.itemAt)
     const l2 = pendingLine(this.pending.counts(chat))
