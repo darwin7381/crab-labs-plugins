@@ -2,12 +2,7 @@
 // chiron:2001; design ~/cc-workspaces/claude-epeius/knowledge/wo120-usage-wall-design.md).
 //
 // The state is decided by ONE program, ~/Development/Joey-Crablabs-Skills/tools/harness/usage_wall.py (its docstring is
-// the contract), which writes ~/.claude/usage-wall/<tmux key>.json. This module only READS it, for the two daemons:
-//   - hold: while walled nothing is written into the session; deliveries park in inbox/pending (server.ts); after the
-//     clear the existing drain delivers each one once, in order;
-//   - the held count: <key>.held-<role>.json (role tg | inbox), written from the first wall this daemon sees and never
-//     removed (the Mac mini watchdog reads its existence: this daemon redelivers what a wall ate);
-//   - system-alert (tg daemon): exactly two pushes per episode, enter and clear (WallAlerts below).
+// the contract), which writes ~/.claude/usage-wall/<tmux key>.json. The daemons read it for probes and notices.
 //
 // READER RULE (mandatory): the file is trusted only while its updated_at is under 180 s old and <dir>/OFF does not
 // exist; USAGE_WALL_READ=0 turns reading off. Otherwise wallState() is null and every caller behaves exactly as before
@@ -24,8 +19,6 @@ export function personCanProbe(lastWallMs: number | null | undefined, now = Date
 }
 
 export const CACHE_MS = 5_000
-export const HELD_ROLES = ['tg', 'inbox'] as const
-export type HeldRole = typeof HELD_ROLES[number]
 
 export type WallState = {
   walled: boolean
@@ -39,7 +32,7 @@ export type WallState = {
   agent: string | null
   tmux: string | null
   session: string | null
-  /** The state file's name without .json (= the tmux key); the held sidecars are named after it. */
+  /** The state file's name without .json (= the tmux key). */
   key: string
   sinceMs: number | null
   clearedMs: number | null
@@ -148,10 +141,6 @@ export class WallReader {
     }
     return next
   }
-
-  walled(): boolean {
-    return this.state()?.walled === true
-  }
 }
 
 /** 1.58.14: the limit message of a wall usage_wall.py cleared after the newest limit message it found in the transcript (the screen's verdict is not a wall
@@ -160,116 +149,11 @@ export function clearedLimitTextOf(w: WallState | null): string | null {
   return w && !w.walled && w.text && w.clearedMs != null && w.clearedMs >= (w.lastWallMs ?? w.sinceMs ?? Infinity) ? w.text : null
 }
 
-/** Did the wall eat a delivery made at atMs? True when the wall's episode overlaps [atMs, now] (it is walled now, or
- *  it cleared after atMs) and no genuine answer came between the delivery and the wall's start (newestGenuineMs, the
- *  consumption evidence the sweep already reads). Unknown state → false (as before). */
-export function wallAte(w: WallState | null, atMs: number, newestGenuineMs: number, now = Date.now()): boolean {
-  if (!w || w.sinceMs == null || w.sinceMs > now) return false
-  if (!w.walled && (w.clearedMs == null || w.clearedMs < atMs)) return false
-  if (newestGenuineMs > atMs && newestGenuineMs < w.sinceMs) return false
-  return true
-}
-
-// ---------------------------------------------------------------- held-count sidecar
-export type HeldFile = {
-  redelivers: boolean
-  role: HeldRole
-  episode: string | null
-  /** Items this daemon holds right now (parked deliveries). 0 after the drain. */
-  count: number
-  oldest: string | null
-  /** The count at the moment this daemon saw the clear, before anything drained (what the clear alert reports). */
-  held_at_clear: number | null
-  drained_at: string | null
-  updated_at: string
-}
-
-export function heldPath(dir: string, key: string, role: HeldRole): string {
-  return join(dir, `${key}.held-${role}.json`)
-}
-
-export function readHeld(path: string): HeldFile | null {
-  try {
-    const j = JSON.parse(readFileSync(path, 'utf8'))
-    if (!j || typeof j !== 'object' || typeof j.count !== 'number') return null
-    return {
-      redelivers: j.redelivers === true, role: j.role, episode: str(j.episode), count: j.count, oldest: str(j.oldest),
-      held_at_clear: typeof j.held_at_clear === 'number' ? j.held_at_clear : null, drained_at: str(j.drained_at),
-      updated_at: str(j.updated_at) ?? '',
-    }
-  } catch { return null }
-}
-
 function writeJsonAtomic(path: string, obj: unknown): void {
   mkdirSync(dirname(path), { recursive: true })
   const tmp = `${path}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(obj, null, 1))
   renameSync(tmp, path)
-}
-
-const SAME_FIELDS = ['redelivers', 'role', 'episode', 'count', 'oldest', 'held_at_clear', 'drained_at'] as const
-
-/** Keeps <key>.held-<role>.json in step with what this daemon holds. Written on the first wall seen and never
- *  removed; rewritten whenever it differs from what it should say (usage_wall.py's keeper globs *.json and rewrites
- *  this file with its own updated_at, so a stale copy it saves is corrected at the next update). */
-export class HeldSidecar {
-  private last: HeldFile | null | undefined = undefined   // undefined = not read yet in this process; null = no file
-  private checkedAt = -Infinity
-  constructor(private readonly o: {
-    dir: () => string
-    role: HeldRole
-    held: () => { count: number; oldestMs: number | null }
-    redelivers: () => boolean
-    log: (level: 'info' | 'warn' | 'error', msg: string) => void
-    now?: () => number
-  }) {}
-
-  /** atClear: called at the moment this daemon sees the wall clear, before anything drains (WallReader onChange). */
-  update(w: WallState | null, atClear = false): void {
-    if (!w) return                                   // no fresh state: leave the file as it is
-    const now = this.o.now?.() ?? Date.now()
-    if (!w.walled && !atClear && this.last !== undefined) {
-      if (this.last === null) return                 // never walled here: no file to keep
-      // settled after a drain: look again once a minute (a keeper save racing ours could have put back a stale copy)
-      if (this.last.count === 0 && this.last.held_at_clear != null && now - this.checkedAt < 60_000) return
-    }
-    this.checkedAt = now
-    const path = heldPath(this.o.dir(), w.key, this.o.role)
-    const ex = readHeld(path)
-    const nowIso = new Date(now).toISOString()
-    const h = this.o.held()
-    const oldest = h.oldestMs != null ? new Date(h.oldestMs).toISOString() : null
-    let want: HeldFile
-    if (w.walled) {
-      want = { redelivers: this.o.redelivers(), role: this.o.role, episode: w.episode, count: h.count, oldest,
-        held_at_clear: null, drained_at: null, updated_at: nowIso }
-    } else {
-      if (!ex) { this.last = null; return }          // never walled here: nothing to keep
-      want = { ...ex, redelivers: this.o.redelivers(), role: this.o.role, updated_at: nowIso }
-      // the clear: what is about to be delivered (after a restart past the clear, the last count written in the wall)
-      if (ex.episode === w.episode && ex.held_at_clear == null) want.held_at_clear = atClear ? h.count : ex.count
-      if (ex.count > 0) { want.count = Math.min(ex.count, h.count); want.oldest = want.count ? oldest : null }
-      if (want.count === 0 && want.held_at_clear != null && !want.drained_at) want.drained_at = nowIso
-    }
-    if (ex && SAME_FIELDS.every(k => ex[k] === want![k])) { this.last = ex; return }
-    try {
-      writeJsonAtomic(path, want)
-      this.last = want
-    } catch (err) {
-      this.o.log('warn', `usage wall: could not write ${path}: ${err}`)
-    }
-  }
-}
-
-/** Items held for episode `episode` by both daemons of the agent (the held_at_clear snapshot when the daemon has
- *  already seen the clear, else its current count). */
-export function heldTotal(dir: string, key: string, episode: string): number {
-  let n = 0
-  for (const role of HELD_ROLES) {
-    const h = readHeld(heldPath(dir, key, role))
-    if (h && h.episode === episode) n += h.held_at_clear ?? h.count
-  }
-  return n
 }
 
 // ---------------------------------------------------------------- alerts (tg daemon)
@@ -299,10 +183,9 @@ export function enterText(w: WallState): string {
   return `⚠️ 系統警告（claude TUI 自身輸出，非 AI 回覆）\n${msg.slice(0, 500)}\n(usage-wall ${w.agent ?? w.tmux ?? w.key})`
 }
 
-export function clearText(w: WallState, n: number, now = Date.now()): string {
+export function clearText(w: WallState, now = Date.now()): string {
   const how = CLEARED_HOW[w.cleared_by ?? ''] ?? (w.cleared_by || '已解除')
-  const tail = n > 0 ? `卡住期間累積 ${n} 件，現在逐一送進去。` : '卡住期間沒有累積的件。'
-  return `✅ ${w.agent ?? w.tmux ?? w.key} 用量上限解除（${hhmmTaipei(w.clearedMs ?? now)}，${how}）；${tail}`
+  return `✅ ${w.agent ?? w.tmux ?? w.key} 用量上限解除（${hhmmTaipei(w.clearedMs ?? now)}，${how}）。`
 }
 
 type AlertRec = { enter_at: string; clear_for?: string; clear_at?: string; enter_by?: string }
@@ -323,7 +206,6 @@ export class WallAlerts {
   private db: Record<string, AlertRec> | null = null
   constructor(private readonly o: {
     stateDir: string
-    dir?: () => string
     /** Default sender; system-alert.ts passes its own notify pipeline to tick() instead. */
     notify?: (text: string) => void
     log: (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -375,9 +257,8 @@ export class WallAlerts {
     rec.clear_for = w.cleared_at
     rec.clear_at = new Date(now).toISOString()
     this.save(now)
-    const n = heldTotal(this.o.dir?.() ?? wallDir(), w.key, w.episode)
-    notify(clearText(w, n, now))
-    this.o.log('info', `usage wall: clear alert for ${w.episode} (${w.cleared_by}, ${n} held)`)
+    notify(clearText(w, now))
+    this.o.log('info', `usage wall: clear alert for ${w.episode} (${w.cleared_by})`)
     return 'clear'
   }
 }
