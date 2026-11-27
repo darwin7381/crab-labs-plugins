@@ -19,7 +19,7 @@ const V = (state: ScreenVerdict['state'], menu: ScreenVerdict['menu'] = 'none', 
 const prog = (state: StatusView['state'], detail: Record<string, unknown> = {}): StatusView => ({ state, detail: { queued_joey: 0, ...detail }, last_activity_at: '2026-11-26T00:59:00.000Z' })
 const TURN: TurnFact = { id: 'p-1', started_at: '2026-11-26T00:58:00.000Z', trigger: { kind: 'message', conversation_id: '1828173984', message_id: '9001' } }
 const TOOL = { turn_started_at: TURN.started_at, tool: { name: 'Bash', since: '2026-11-26T00:59:30.000Z' }, subagents: 0 }
-const F = (o: RecordFacts = {}): RecordFacts => ({ now: NOW, session_id: 'sess-1', queue: { pending: 1, unread_by_member: 0 }, ...o })
+const F = (o: RecordFacts = {}): RecordFacts => ({ now: NOW, session_id: 'sess-1', queue: { pending: 1, unread_by_member: 0 }, self: 'claude-x', ...o })   // self: WO-168 (a usage-limit menu waits on the agent itself)
 const ALL: unknown[] = []                                   // every observation made here, for Chiron's own checker at the end
 const obs = (v: ScreenVerdict | null, st: any, p: StatusView, f: RecordFacts = F()) => {
   const r = composeRecord(v, st, p, f)
@@ -79,14 +79,20 @@ describe("Chiron's table, field by field", () => {
     // the wall: paused in a turn, idle out of one; until = the wall's time; no menu: nobody
     const wall = { walled: { until: '2026-11-26T03:00:00.000Z', kind: 'session' } }
     expect(main(obs(V('working'), ST, prog('busy', { ...wall, ...TOOL }), F({ turn: TURN, dutyWatches: true })))).toMatchObject({ activity: 'paused', blockers: [{ reason: 'usage_limit', until: '2026-11-26T03:00:00.000Z', menu_kind: null, assignee: null }] })
-    expect(main(obs(V('usage_limit', 'usage_limit_options'), MENU, prog('idle', wall), F({ dutyWatches: true })))).toMatchObject({ activity: 'idle', blockers: [{ reason: 'usage_limit', menu_kind: 'usage_limit_options', assignee: 'duty-officer' }] })
+    // WO-168 (Chiron #200727): the usage-limit menu waits on the agent's own connector, never the duty officer
+    expect(main(obs(V('usage_limit', 'usage_limit_options'), MENU, prog('idle', wall), F({ dutyWatches: true, self: 'claude-x' })))).toMatchObject({ activity: 'idle', blockers: [{ reason: 'usage_limit', menu_kind: 'usage_limit_options', assignee: 'claude-x', action_id: null }] })
   })
   test('WO-180 (Chiron 04:42Z, 1, 2): every menu is the duty officer\'s first while it watches the pane; once it asked, the person asked with that Action; not watched: the person (access.json\'s, never a fixed name); a permission prompt: the person it went to on Telegram, with its Action', () => {
-    const menus = ['model_picker', 'other', 'resume_picker', 'trust_folder', 'plan_or_question', 'login', 'usage_limit_options'] as const
+    const menus = ['model_picker', 'other', 'resume_picker', 'trust_folder', 'plan_or_question', 'login'] as const
     for (const m of menus) {
       const b = main(obs(V('waiting_for_human', m), MENU, prog('idle'), F({ dutyWatches: true, person: 'joey-test' }))).blockers[0]
       expect([m, b.assignee, b.action_id]).toEqual([m, 'duty-officer', null])
       expect(main(obs(V('waiting_for_human', m), MENU, prog('idle'), F({ dutyWatches: false, person: 'joey-test' }))).blockers[0].assignee).toBe('joey-test')
+    }
+    // WO-168 (Chiron #200727): the usage-limit menu is neither the officer's nor a person's: the agent's own connector takes it, watched or not
+    for (const dutyWatches of [true, false]) {
+      const b = main(obs(V('waiting_for_human', 'usage_limit_options'), MENU, prog('idle'), F({ dutyWatches, person: 'joey-test' }))).blockers[0]
+      expect([b.assignee, b.action_id]).toEqual(['claude-x', null])
     }
     expect(main(obs(V('waiting_for_human', 'other'), MENU, prog('idle'), F())).blockers[0].assignee).toBe('joey')          // no person given: the owner, as assigneesOf
     // the duty officer asks a person about /theme: from then on that person and the question's Action; the same blocker (id, since)

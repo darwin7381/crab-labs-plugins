@@ -277,3 +277,18 @@ describe('pane-look.ts: the one capture', () => {
     } finally { t('kill-server'); rmSync(root, { recursive: true, force: true }) }
   })
 })
+
+// WO-168 (Chiron #200727; sandwich-master 11-27 13:00:34Z, Onsen Action 393): the usage-limit line left under the prompt is no menu in the record either
+import { composeRecord as compose168n, regionParts as parts168n, screenFacts as facts168n } from './screen-status.ts'
+test('the usage-limit line under the prompt: a judge\'s 「waiting, other」 is not taken; the program\'s reading stands (in a turn: busy)', () => {
+  const screen = ['     … +4 tasks (1 in progress, 1 open, 2 done)', '─'.repeat(80), '❯ ', '─'.repeat(80), '  ⚠ Usage limit reached · limit resets Dec 3 at 11pm',
+    '    Continuing automatically at Dec 3 at 11pm · Esc to cancel · /usage-credits', '    to continue now', '  Fable 5.2 · 7d 12%',
+    '  ⏵⏵ bypass permissions on · 3 shells · esc to interrupt · ctrl+t to hide tas…'].join('\n')
+  const p = parts168n(screen)
+  const f = facts168n(screen, screen, p.st)
+  expect(f.usage_notice).toBe(true)
+  const prog = { state: 'idle', detail: { queued_joey: 0 }, last_activity_at: null } as any
+  const rec = compose168n({ state: 'waiting_for_human', menu: 'other', p: 0.9, by: 'jev' }, p.st, prog, { alive: true }, { hash: 'h', seen_at: 0, facts: f }).view
+  expect(rec.state).not.toBe('waiting')
+  expect((rec.detail as any)?.waitingFor).toBeUndefined()
+})

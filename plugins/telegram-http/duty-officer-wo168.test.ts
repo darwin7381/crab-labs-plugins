@@ -136,25 +136,35 @@ describe('text typed and left in the input box (rulings §2: a /clear with its c
   })
 })
 
-describe('the usage-limit menu is not the officer\'s (Chiron\'s v3, 11-27 11:52Z: the lanes main-wall probe takes it, 「停下來等」)', () => {
-  test('lanes on (the owner hook): the record names it, the officer leaves it to the probe: no model, no key, nothing sent, no Action', async () => {
-    const r = rig({ owner: true, screen: fx('lab-limit-options-menu.txt') })
+const NOTICE_SCREEN = ['     ◼ 主力那台換 CPX62：腳本＋排練交了（Nestor #200689）', '     … +4 tasks (1 in progress, 1 open, 2 done)', '─'.repeat(80), '❯ ', '─'.repeat(80),
+  '  ⚠ Usage limit reached · limit resets Dec 3 at 11pm', '    Continuing automatically at Dec 3 at 11pm · Esc to cancel · /usage-credits', '    to continue now',
+  '  Fable 5.2 · 7d 12%', '  ⏵⏵ bypass permissions on · 3 shells · esc to interrupt · ctrl+t to hide tas…'].join('\n')
+describe('a usage-limit screen is never the officer\'s (Chiron #200727, 11-27 13:08Z; Joey TG chiron:2918; Action 393)', () => {
+  test('the menu, named by the record: no model, no key, nothing sent, no Action; one not_mine row', async () => {
+    const r = rig({ screen: fx('lab-limit-options-menu.txt') })
     await r.advance(0); await r.advance(9000); await r.advance(60_000)
     expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([]); expect(r.acts).toEqual([])
-    expect(r.log().find(e => e.event === 'left_to_owner')).toMatchObject({ owner: 'the lanes main-wall probe' })
+    expect(r.log().filter(e => e.event === 'not_mine')).toMatchObject([{ why: 'usage_limit', menu: 'usage_limit_options' }])
   })
-  test('the same with Jev\'s verdict naming it, while walled', async () => {
+  test('the same with Jev\'s verdict naming it, while walled, and with the lanes\' owner hook there', async () => {
     const r = rig({ owner: true, screen: fx('lab-limit-options-menu.txt'), verdict: () => ({ state: 'waiting_for_human', menu: 'usage_limit_options', p: 1, by: 'jev' }),
       prog: { state: 'idle', detail: { queued_joey: 0, walled: { until: '2026-12-01T06:00:00Z', kind: 'weekly' } }, last_activity_at: null } })
     await r.advance(0); await r.advance(9000)
     expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([])
-    expect(r.log().find(e => e.event === 'left_to_owner')).toBeTruthy()
+    expect(r.log().find(e => e.event === 'not_mine')).toBeTruthy()
   })
-  test('lanes off (no owner): left to modal-guard as on main, nothing pressed or sent', async () => {
+  test('the line left under the prompt (sandwich-master 13:00:34Z), even if a judge calls it a menu: not the officer\'s', async () => {
+    const r = rig({ screen: NOTICE_SCREEN, verdict: () => ({ state: 'waiting_for_human', menu: 'other', p: 0.9, by: 'jev' }) })
+    await r.advance(0); await r.advance(9000); await r.advance(60_000)
+    expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([]); expect(r.acts).toEqual([])
+    // the record does not take the judge's menu there (screen-status: usage_notice), so the officer sees no menu at all
+    expect(r.log().filter(e => e.event === 'seen_other' || e.event === 'stalled')).toEqual([])
+  })
+  test('a re-arm on a usage-limit screen puts nothing to Joey', async () => {
     const r = rig({ screen: fx('lab-limit-options-menu.txt') })
-    await r.advance(0); await r.advance(9000)
-    expect(r.calls()).toBe(0); expect(r.keys).toEqual([]); expect(r.sent).toEqual([])
-    expect(r.log().find(e => e.event === 'left_to_modal_guard')).toBeTruthy()
+    await r.advance(0)
+    expect(await r.off.rearm('claude-x')).toEqual({ result: 'not_mine', options: [] })
+    expect(r.sent).toEqual([]); expect(r.acts).toEqual([]); expect(r.keys).toEqual([])
   })
 })
 
@@ -220,15 +230,5 @@ describe('program rule: the refusal-fallback picker (Chiron\'s rulings 3; modal-
     const r = rig({ screen: fx('refusal-fallback-1.txt'), config: { refusal_fallback: 'officer' }, onKey: (k, p) => { if (k === 'Escape') p.screen = IDLE } })
     await r.advance(0); await r.advance(121_000)
     expect(r.keys).toEqual(['Escape', 'Enter']); expect(r.typed).toEqual([REFUSAL_NOTICE])
-  })
-})
-
-describe('the re-arm on the own pane', () => {
-  test('the re-arm of a usage-limit menu on the own pane uses the record\'s options and asks with the usage rule\'s words', async () => {
-    const r = rig({ screen: fx('lab-limit-options-menu.txt') })
-    await r.advance(0)
-    const out = await r.off.rearm('claude-x')
-    expect(out).toEqual({ result: 'asked', options: ['1. Stop and wait for limit to reset', '2. Wait here, then continue automatically at Dec 1, 6am'] })
-    expect(r.sent[0]!.text).toContain('額度怎麼用是你的決定'); expect(r.keys).toEqual([])
   })
 })

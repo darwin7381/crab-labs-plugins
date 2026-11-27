@@ -47,27 +47,15 @@ function rig(o: { model?: () => ModelResult; enabled?: string[]; owner?: boolean
   return { off, pane, keys, sent, acts, advance, settle, log, calls: () => calls }
 }
 
-test('WO-168 item 5: a menu another owner held (the lanes probe): the re-arm puts it to Joey now with its options as buttons and an Action; nothing pressed', async () => {
-  const r = rig({ owner: true })
-  await r.advance(0); await r.advance(9000)
-  expect(r.log().some(e => e.event === 'left_to_owner')).toBe(true)
-  expect(r.sent).toEqual([])
-  const out = await r.off.rearm('claude-x')
-  await r.settle()
-  expect(out).toEqual({ result: 'asked', options: ['1. Stop and wait for limit to reset', '2. Wait here, then continue automatically at Dec 1, 6am'] })
-  expect(r.keys).toEqual([])
-  expect(r.calls()).toBe(0)                                                           // no model: the options as they are
-  expect(r.sent.length).toBe(1)
-  expect(r.sent[0].buttons.map((row: any) => row[0].text)).toEqual(['1. Stop and wait for limit to reset', '2. Wait here, then continue automatically at Dec 1, 6am'])
-  expect(r.acts).toEqual(['open:1. Stop and wait for limit to reset|2. Wait here, then continue automatically at Dec 1, 6am:claude-x 停在一個選單，等你選'])
-  // the officer's own loop does not ask about the same screen again
-  await r.advance(3000); await r.advance(3000)
-  expect(r.sent.length).toBe(1)
-  // his tap presses that option, and only it
-  const res = await r.off.onTap(r.sent[0].buttons[1][0].callback_data, 'Advac777', 'joey')
-  expect(r.keys).toEqual(['Down', 'Enter'])
-  expect(res).toBe('按了，畫面已經往下走')
-  expect(r.acts.slice(1)).toEqual(['answered:2'])
+test('WO-168 (Chiron #200727): a usage-limit menu, held by the lanes probe or not: the re-arm puts nothing to Joey and presses nothing', async () => {
+  for (const owner of [true, false]) {
+    const r = rig({ owner })
+    await r.advance(0); await r.advance(9000)
+    expect(r.sent).toEqual([])
+    expect(await r.off.rearm('claude-x')).toEqual({ result: 'not_mine', options: [] })
+    await r.settle()
+    expect(r.keys).toEqual([]); expect(r.calls()).toBe(0); expect(r.sent).toEqual([]); expect(r.acts).toEqual([])
+  }
 })
 
 test('WO-168 item 5: the officer\'s question already open on the pane is sent again (same buttons); resend false leaves it as it is', async () => {

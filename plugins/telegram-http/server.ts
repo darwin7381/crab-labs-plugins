@@ -4555,7 +4555,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
       queue: tap ? Lanes.mainQueueCounts() : facts.counts(), scheduleThread: th => Lanes.LANES_ON && Lanes.threadKeyKind(th) === 'schedule',
       // WO-180 (Chiron 04:42Z): who a menu waits on (screen-status.ts assigned): the duty officer while it watches the pane, the person it asked once it
       // asked (that question's Action), a permission prompt the person it went to on Telegram; the person is access.json's, as the Actions' assignees
-      dutyWatches: !!ownTmux && !!dutyOfficer?.handles(ownTmux), person: mainPerson(),
+      dutyWatches: !!ownTmux && !!dutyOfficer?.handles(ownTmux), person: mainPerson(), self: ONSEN_AGENT || null,
       asked: m => ownTmux && dutyOfficer ? dutyOfficer.openAskFor(ownTmux, m) : null, actionFor: m => openActionFor(m),   // WO-176: actionFor
       cleared_limit_text: clearedLimitText() }
   }

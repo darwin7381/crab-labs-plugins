@@ -107,7 +107,8 @@ export function isClaudeCmd(cmd: string, extra: ReadonlySet<string> = new Set())
 }
 export function classify(lines: string[], cmd: string, extra: ReadonlySet<string> = new Set()): State {
   const text = lines.join('\n')
-  const dialog = hasHints(lines)
+  // WO-168 (Chiron #200727): the usage-limit line under the prompt (「… · Esc to cancel · /usage-credits …」) is not a dialog
+  const dialog = hasHints(withoutUsageNotice(lines))
   // a sub-agent's permission prompt can sit under a spinner line: the hints win
   if (text.includes('esc to interrupt') && !dialog) return 'WORKING'
   if (isClaudeCmd(cmd, extra) && FOOTER.some(f => text.includes(f)) && !dialog) return 'IDLE'
@@ -121,6 +122,19 @@ const CONFIRM = /Esc.*cancel|Enter.*confirm/
 export function isRateLimitMenu(lines: string[]): boolean {
   const t = lines.join('\n')
   return RATE_LIMIT.test(t) && CONFIRM.test(t)
+}
+// WO-168 (Chiron #200727, 11-27 13:08Z; Joey TG chiron:2918 「這個偵測也不準對吧？根本沒撞到用量上線他卻在跳」: sandwich-master's limit had cleared at
+// 10:52:54Z, the officer read the line left under its prompt and asked Joey whether to buy credits, Action 393): a usage-limit screen is never the
+// officer's. Neither the menu (usage_limit_options; the connector takes it, 「停下來等」, WO-204) nor the line Claude Code leaves under the prompt after its
+// 2nd option: 「⚠ Usage limit reached · limit resets …」 / 「Continuing automatically at … · Esc to cancel · /usage-credits」 / 「to continue now」. Whether
+// a limit is hit is the keeper's state file, never this text; the officer does nothing on it: no model, no key, no question
+const USAGE_NOTICE = /Usage limit reached|Continuing automatically at|\/usage-credits|^\s*to continue now\s*$/
+export function withoutUsageNotice(lines: string[]): string[] { return lines.filter(l => !USAGE_NOTICE.test(l)) }
+export function hasUsageNotice(lines: string[]): boolean { return lines.some(l => USAGE_NOTICE.test(l)) }
+/** a usage-limit screen: the menu (the record names it, or its text), or the line under the prompt that is the only dialog-like thing on the screen */
+export function usageLimitScreen(lines: string[], menuKind?: string | null): boolean {
+  if (menuKind === 'usage_limit_options' || isRateLimitMenu(lines)) return true
+  return hasUsageNotice(lines) && (!menuKind || menuKind === 'other') && !hasHints(withoutUsageNotice(lines))
 }
 // WO-168: and the two countdowns a menu can sit over (a permission prompt's 「automatically block this request in 1:59」, the refusal picker's 「will retry in
 // 2m 40s」): with their digits counted, the screen changed every second and never stood still long enough to be a stall
@@ -1127,14 +1141,18 @@ export class DutyOfficer {
     // WO-168 item 6: the refusal-fallback picker has its own clock (modal-guard's: from first seen, whatever else on the screen moves); gone, it starts again
     if (lk.menu?.kind === 'refusal_fallback') { void this.refusalRule(t, lk, s, now).catch(e => this.event('error', { agent: t.label, tmux: t.tmux, where: 'refusal rule', error: String(e).slice(0, 300) })); return }
     this.refusalGone(t)
+    // WO-168 (Chiron #200727): a usage-limit screen is not the officer's: nothing judged, pressed or asked, whatever the record or the text says
+    if (state === 'OTHER' && usageLimitScreen(lines, lk.menu?.kind ?? null)) {
+      if (!s.rec) { s.rec = { action: 'not_mine', t: now }; this.event('not_mine', { agent: t.label, tmux: t.tmux, why: 'usage_limit', screen_hash: hash, menu: lk.menu?.kind ?? null }) }
+      return
+    }
     if (state !== 'OTHER' || now - s.since < this.L.stallMs) return
     // a raw notice held back by the hourly cap: after the hour, look again (the model may be back)
     if (s.rec?.action === 'suppressed' && now - s.rec.t >= this.L.renotifyMs) s.rec = null
     // WO-168: the program's rules for the menus the record names on the own pane (Chiron's rulings, as code, not for the model):
     //   switch_confirm       a /model or /effort confirm still up after the stall: no program is taking it: Esc (No, go back); model and effort unchanged
     //   refusal_fallback     above (refusalRule)
-    //   usage_limit_options  not the officer's: Chiron's v3 (design-v3.md, 11-27 11:52Z: 上限選單算撞上限，連接器收掉、選「停下來等」) gives it to the lanes
-    //                        main-wall probe (the owner hook below); lanes off, modal-guard's, as before
+    //   usage_limit_options  not the officer's (above)
     if (!s.rec && lk.menu && lk.menu.kind === 'switch_confirm') {
       const who = await this.attended(t.tmux)
       if (who != null) {
@@ -1147,10 +1165,8 @@ export class DutyOfficer {
         .catch(e => this.event('error', { agent: t.label, tmux: t.tmux, where: 'switch_confirm', error: String(e).slice(0, 300) })).finally(() => this.busy.delete(t.tmux))
       return
     }
-    // the lanes' owner hook and the rate-limit rule below read the screen's text; on the own pane the record names the menu (above), and a usage-limit
-    // menu it names goes the same way
-    const usage = lk.menu?.kind === 'usage_limit_options'
-    if (!s.rec && (!lk.menu || usage)) {
+    // the lanes' owner hook and the rate-limit rule below read the screen's text; on the own pane the record names the menu (above)
+    if (!s.rec && !lk.menu) {
       const owner = this.d.owner?.(t, lines) ?? null
       if (owner) {
         s.rec = { action: 'left_to_owner', t: now }
@@ -1158,7 +1174,7 @@ export class DutyOfficer {
         return
       }
     }
-    if (!s.rec && (usage || (!lk.menu && isRateLimitMenu(lines)))) {
+    if (!s.rec && !lk.menu && isRateLimitMenu(lines)) {
       s.rec = { action: 'left_to_modal_guard', t: now }
       this.event('left_to_modal_guard', { agent: t.label, tmux: t.tmux, screen_hash: hash, tail: lines })
       return
@@ -1730,7 +1746,7 @@ export class DutyOfficer {
    *  with no buttons (17 times 11-25 22:40Z–11-26 00:07Z). The officer keeps the promise: its question still open on the pane is sent again (Telegram
    *  buttons; its Action stays open), or, with none open, the menu on the screen is put to Joey now with its options as they are (an Action and buttons;
    *  nothing is pressed until he taps). resend false: an open question is left as it is. `options`: the menu's labels as Joey gets them */
-  async rearm(tmux: string, o: { resend?: boolean } = {}): Promise<{ result: 'resent' | 'open' | 'asked' | 'busy' | 'no_menu' | 'unreadable' | 'off'; options: string[] }> {
+  async rearm(tmux: string, o: { resend?: boolean } = {}): Promise<{ result: 'resent' | 'open' | 'asked' | 'busy' | 'no_menu' | 'not_mine' | 'unreadable' | 'off'; options: string[] }> {
     if (!this.handles(tmux) || !this.stillOn(tmux)) return { result: 'off', options: [] }
     // the question asked about the screen the officer last saw on this pane (an older menu's question that was never closed is not this one)
     const cur = this.st.get(tmux)
@@ -1751,13 +1767,13 @@ export class DutyOfficer {
       const lk = await this.look(tmux)
       if (!lk) return { result: 'unreadable', options: [] }
       if (lk.state !== 'OTHER') return { result: 'no_menu', options: [] }
+      // WO-168 (Chiron #200727): a usage-limit screen is not put to Joey (the connector takes the menu; the keeper's file says whether a limit is hit)
+      if (usageLimitScreen(lk.lines, lk.menu?.kind ?? null)) { this.event('rearm', { agent: this.labels.get(tmux) ?? tmux, tmux, how: 'not_mine', why: 'usage_limit' }); return { result: 'not_mine', options: [] } }
       const t: Target = { label: this.labels.get(tmux) ?? tmux, tmux, projectsDir: null }
       // WO-168: the own pane's options are the record's (as the screen shows them); a roamer pane's, read from its text as before
       const menu = lk.menu?.options.length ? optionButtons(lk.menu.options) : (numberedMenu(lk.pane) ?? []).map(m => ({ button: m.button, keys: m.keys as string[] | null }))
-      const usage = lk.menu?.kind === 'usage_limit_options'
-      const ask = await this.programAsk(t, lk, usage ? `${t.label} 停在用量上限的選單，等你選` : `${t.label} 停在一個選單，等你選`,
-        usage ? `${t.label} 停在用量上限的選單。額度怎麼用是你的決定：值班員不選、不按任何鍵；你按了哪一個，我才按那一個。` : `${t.label} 停在一個選單，選項在下面；按了我才送那一個鍵。`,
-        menu, { ...(usage ? { noRuling: true } : {}), ...(lk.menu ? { bundle: { _menu_kind: lk.menu.kind } } : {}) })
+      const ask = await this.programAsk(t, lk, `${t.label} 停在一個選單，等你選`, `${t.label} 停在一個選單，選項在下面；按了我才送那一個鍵。`,
+        menu, lk.menu ? { bundle: { _menu_kind: lk.menu.kind } } : {})
       this.event('rearm', { agent: t.label, tmux, ask: ask.id, how: 'asked', screen_hash: lk.hash, options: menu.map(m => m.button) })
       return { result: 'asked', options: menu.map(m => m.button) }
     } finally { this.busy.delete(tmux) }

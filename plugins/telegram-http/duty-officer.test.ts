@@ -327,7 +327,7 @@ describe('officer', () => {
     expect(mailsTo).toEqual([{ title: expect.stringMatching(/^（測試）裁決：dotest-1 \(test\)｜/), to: 'epeius' }])
   })
 
-  test('the rate-limit menu is left to modal-guard, no model call', async () => {
+  test('the rate-limit menu is not the officer\'s (WO-168, Chiron #200727): no model call, nothing sent or pressed', async () => {
     const r = rig()
     r.pane.pane = ['  What do you want to do?', '❯ 1. Stop and wait for limit to reset', '  2. Switch to usage credits', '  3. Upgrade your plan', '  Enter to confirm · Esc to cancel'].join('\n')
     await r.advance(0)
@@ -335,7 +335,7 @@ describe('officer', () => {
     await r.settle()
     expect(r.calls()).toBe(0)
     expect(r.sent).toEqual([])
-    expect(r.log().filter(e => e.event === 'left_to_modal_guard').length).toBe(1)
+    expect(r.log().filter(e => e.event === 'not_mine' && e.why === 'usage_limit').length).toBe(1)
   })
 
   test('raw notices: one per machine per hour, the next pane is held and looked at again after the hour', async () => {
@@ -446,4 +446,20 @@ describe('officer', () => {
     expect(checkDo(decision({ choose: 'Maybe' }))).toEqual({ bad: "choose matches no option's button" })
     expect('bad' in checkDo(decision({ options: [{ on_screen: '', means: '', button: 'Yes', keys: Array(13).fill('Down') }] }))).toBe(true)
   })
+})
+
+// WO-168 (Chiron #200727; sandwich-master 11-27 13:00:34Z, Action 393): the line Claude Code leaves under the prompt after the usage-limit menu's 2nd
+// option has 「Esc to cancel」 in it; it is not a dialog, so the screen is what the rest says (here: in a turn)
+import { classify as classify168, usageLimitScreen as usage168, withoutUsageNotice as without168 } from './duty-officer.ts'
+test('WO-168: the usage-limit line under the prompt is not a dialog; the menu and the line are usage-limit screens; other menus are not', () => {
+  const notice = ['❯ 那磨雜湊就趕快做吧', '  ⚠ Usage limit reached · limit resets Dec 3 at 11pm', '    Continuing automatically at Dec 3 at 11pm · Esc to cancel · /usage-credits',
+    '    to continue now', '  Fable 5.2 · 7d 12%', '  ⏵⏵ bypass permissions on · 3 shells · esc to interrupt · ctrl+t to hide tas…']
+  expect(classify168(notice, 'claude')).toBe('WORKING')
+  expect(classify168(notice.filter(l => !l.includes('esc to interrupt')).concat('  ⏵⏵ bypass permissions on (shift+tab to cycle)'), 'claude')).toBe('IDLE')
+  expect(without168(notice).some(l => /Usage limit|Continuing|to continue now/.test(l))).toBe(false)
+  expect(usage168(notice)).toBe(true)
+  expect(usage168(['   What do you want to do?', '   ❯ 1. Stop and wait for limit to reset', '   Enter to confirm · Esc to cancel'])).toBe(true)
+  expect(usage168(['Select model', '❯ 1. Default', '  2. Opus', 'Enter to confirm · Esc to cancel'], 'model_picker')).toBe(false)
+  // a real menu with the old line still above it: the menu's own hints remain, so it is that menu's, not a usage-limit screen
+  expect(usage168([...notice.slice(0, 4), ' Do you want to proceed?', ' ❯ 1. Yes', '   2. No', ' Esc to cancel · Tab to amend'], 'permission')).toBe(false)
 })

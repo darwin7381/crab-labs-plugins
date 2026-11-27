@@ -37,7 +37,9 @@ test('C8: the duty officer leaves a screen another owner claims: not judged, not
   const odir = mkdtempSync(join(tmpdir(), 'golive-c8-do-')), rules = mkdtempSync(join(tmpdir(), 'golive-c8-rules-'))
   writeFileSync(join(rules, 'aide_prompt.md'), 'SYSTEM'); writeFileSync(join(rules, 'rulings.md'), 'RULINGS')
   writeFileSync(join(odir, 'config.json'), JSON.stringify({ enabled: [TMUX] }))
-  const pane = ['  What do you want to do?', '❯ 1. Stop and wait for limit to reset', '  2. Switch to usage credits', '  3. Upgrade your plan', '  Enter to confirm · Esc to cancel'].join('\n')
+  // WO-168 (Chiron #200727): a usage-limit menu is never the officer's (not_mine, before any owner); the owner hook is for the other menus a wall episode
+  // holds (lanes.ts mainMenuOwned: any menu while the main is walled), so a /model menu stands in for one here
+  const pane = [' Select model', '❯ 1. Default (recommended)', '  2. Opus', '  3. Haiku', '  Enter to confirm · Esc to cancel'].join('\n')
   const keys: string[] = [], sent: any[] = []
   let calls = 0, clock = Date.parse('2026-11-23T00:00:00Z')
   const tmux: Tmux = { capture: async () => pane, clientActivity: async () => null, info: async (): Promise<PaneInfo> => ({ cmd: '2.1.322', inMode: false, path: '/nowhere' }),
@@ -45,7 +47,7 @@ test('C8: the duty officer leaves a screen another owner claims: not judged, not
   const deps: OfficerDeps = { listTargets: async () => [{ label: TMUX, tmux: TMUX, projectsDir: null }], tmux,
     model: async () => { calls++; return { decision: null, meta: {}, fail: 'x' } }, send: async (c, t) => { sent.push(t); return [] }, edit: async () => {}, mail: async () => '#1',
     recipients: () => ['1'], log: () => {}, now: () => clock, sleep: async ms => { clock += ms },
-    owner: (t, lines) => t.tmux === TMUX && lines.some(l => /Stop and wait for limit/.test(l)) ? 'the lanes main-wall probe' : null }
+    owner: (t, lines) => t.tmux === TMUX && lines.some(l => /Select model/.test(l)) ? 'the lanes main-wall probe' : null }
   const o = new DutyOfficer(deps, { dir: odir, rulesDirs: [rules], home: odir, host: 'mini', limits: { claimFreshMs: 30_000 } })
   await o.tick(); clock += 9000; await o.tick()
   for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0))

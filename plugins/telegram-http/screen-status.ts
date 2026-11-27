@@ -19,7 +19,7 @@
 import { createHash } from 'node:crypto'
 import { appendFileSync, closeSync, mkdirSync, openSync, readSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { redact } from './duty-officer.ts'
+import { hasUsageNotice, redact } from './duty-officer.ts'
 import type { StatusView } from './onsen-status.ts'
 import type { PaneLook } from './pane-look.ts'
 
@@ -132,6 +132,9 @@ export type ScreenFacts = {
   options: MenuOption[]
   /** real text in the input box (not dim); null: no input box, or a screen captured without escapes */
   input_typed: boolean | null
+  /** WO-168 (Chiron #200727): the usage-limit line Claude Code leaves under the prompt (「Usage limit reached · … Continuing automatically at … · Esc to
+   *  cancel · /usage-credits」) with the input box there: not a menu; whether a limit is hit is the keeper's file, not this text */
+  usage_notice?: boolean
 }
 /** the footer Claude Code draws under a menu, a dialog or a panel (Enter to confirm · Esc to cancel, Esc to cancel · Tab to amend, Enter to select, the
  *  model picker's Enter to set as default, the autocompact offer's enter confirm · esc not now, a panel's Esc to cancel) */
@@ -204,6 +207,7 @@ export function screenFacts(visible: string, visibleAnsi: string | null, st: Pic
   const rows = String(visible ?? '').replace(/\n$/, '').split('\n').map(r => r.replace(/\s+$/, ''))
   const none: ScreenFacts = { menu_open: false, menu_kind: null, question: '', options: [], input_typed: null }
   if (st.has_input_box) {
+    if (hasUsageNotice(rows)) none.usage_notice = true
     if (visibleAnsi == null) return none
     const idx: number[] = []
     rows.forEach((r, i) => { if (RULE.test(r)) idx.push(i) })
@@ -408,6 +412,8 @@ export type RecordFacts = {
   scheduleThread?: (thread: string) => boolean
   /** WO-180 (Chiron 04:42Z, 1): the duty officer watches the main's pane: every menu on it is the officer's first */
   dutyWatches?: boolean
+  /** this agent's own Onsen member name: a usage-limit menu waits on its own connector (WO-168, Chiron #200727) */
+  self?: string | null
   /** WO-180 (Chiron 04:42Z, 2): the person the main's questions go to on Telegram, as an Onsen member: access.json's recipients through the mapping the
    *  Actions' assignees use (Onsen.assigneesOf; lab-relay: joey-test). Not given: the owner (assigneesOf's own fallback) */
   person?: string | null
@@ -434,6 +440,7 @@ const OWNER = 'joey'
 /** WO-180 (Chiron 04:42Z, 1 and 2; CONTRACT §3 「有選單時必有明確成員」「同一選單的 action assignees 包含 blocker.assignee」): who a blocker of the main waits
  *  on, and its Action. One rule:
  *  - a permission prompt: the person it went to on Telegram, with that prompt's Action (its assignees are those people);
+ *  - a usage-limit menu: this agent itself (its connector takes it; WO-168, Chiron #200727);
  *  - any other menu: the duty officer, whatever the kind, while it watches the pane (it handles each one first: by a ruling, or by its leaning when none
  *    covers it); once it asked a person, that question's Action and the person asked; the pane not watched: the person;
  *  - no menu (a wall without its options, a stalled turn): nobody.
@@ -442,6 +449,9 @@ function assigned(f: RecordFacts, m: Exclude<VerdictMenu, 'none'> | null): { ass
   if (!m) return { assignee: null, action_id: null }
   const person = f.person || OWNER
   if (m === 'permission') return { assignee: person, action_id: actionOf(f, m) }
+  // WO-168 (Chiron #200727, 11-27; v3): the usage-limit menu is not the duty officer's and is not put to a person: this agent's own connector takes it
+  // (「停下來等」, WO-204). The member itself, so the blocker still names who acts (CONTRACT §3: a menu has a member); no Action
+  if (m === 'usage_limit_options') return { assignee: f.self || null, action_id: null }
   let q: { action_id: string; assignee: string | null } | null = null
   try { q = f.asked?.(m) ?? null } catch {}
   if (q?.action_id) return { assignee: q.assignee || person, action_id: q.action_id }
@@ -499,7 +509,10 @@ const cutMid = (s: string, n: number): string => { const a = Array.from(s); retu
 function recordView(judged: ScreenVerdict | null, st: Regions | null, prog: StatusView, f: RecordFacts, sc: ScreenCtx | null = null): StatusView {
   if (gone(prog)) return programView(prog)
   const facts = st && sc ? sc.facts : null
-  const v = judged ?? (st ? programVerdict(st, facts) : null)
+  let v = judged ?? (st ? programVerdict(st, facts) : null)
+  // WO-168 (Chiron #200727; sandwich-master 11-27 13:00Z): a judge that calls the usage-limit line under the prompt a menu is not taken: the input box is
+  // there and nothing else on the screen is a dialog; the program's own reading of the screen stands instead
+  if (v && st && v.state === 'waiting_for_human' && st.has_input_box && facts?.usage_notice) v = programVerdict(st, facts)
   // WO-168: which screen this record is for, and whether real text is typed in its input box
   const seen = st && sc ? { ...(sc.look !== false ? { screen: { hash: sc.hash, seen_at: isoMs(sc.seen_at) } } : {}), ...(st.has_input_box && facts?.input_typed != null ? { input_typed: facts.input_typed } : {}) } : {}
   const pd = (prog.detail ?? {}) as Record<string, any>
