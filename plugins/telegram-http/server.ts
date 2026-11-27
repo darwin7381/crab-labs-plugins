@@ -1196,7 +1196,10 @@ function mainWallNoticeOwned(rule: 'main-wall-up' | 'main-wall-down', kind: stri
   return owned
 }
 function onWallChange(prev: WallState | null, next: WallState | null): void {
+  // 1.59.4 (WO-204 part 2): one line per transition (the WO-120 parking that used to log these is gone); what waits and what goes is M1's (lanes-main)
+  if (!prev?.walled && next?.walled) log('info', `usage wall: ${next.episode} (${next.kind ?? '?'}, since ${next.since}) — a person's message is the probe (WO-200); programs wait for the clear`)
   if (!prev?.walled || next?.walled) return
+  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh'} — the main's probe releases what the wall held`)
   // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now);
   // WO-175 item 3: and the main's items M1 held for the wall are offered in this step (lanes.ts usageWallChanged)
   if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
