@@ -15,7 +15,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     if ! git cat-file -e "$local_sha:$file" 2>/dev/null; then
       echo "⛔ pre-push canary FAILED: canary file $file MISSING at $local_sha" >&2
       fail=1
-    elif ! git show "$local_sha:$file" | grep -qF "$marker"; then
+    elif ! git show "$local_sha:$file" | grep -qF -- "$marker"; then
       echo "⛔ pre-push canary FAILED: '$marker' missing from $file at $local_sha" >&2
       echo "   A commit from a stale working copy may have reverted a sibling feature." >&2
       fail=1
