@@ -3803,23 +3803,20 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
 // ------------------------------------------------------------------ 002k (G16, 002j group G): a main parked on a menu reads nothing
 // The limit menu is a TUI state no hook reports, so it stays one pane read:
 //  (a) before the walled main's probe offer (M1, PL4), the main's pane is looked at, before anything is offered to it. A menu there is driven
-//      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that CONTINUES or WAITS, never to one that spends money
+//      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that waits without scheduling a turn, never to one that spends money
 //      or changes the plan; with no safe option, or when it did not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
 //  (b) an idle main that does not take its offer is the M2 stuck rule (lanes-main.ts); the pane is read for that notice;
 //  (c) every menu found is logged with its real option labels (the picker log used to carry only the count).
 const NEVER_PICK = /upgrade|extra usage|switch|request more|add funds|purchase|\bbuy\b|billing|payment|\bpay\b|credit|[$€£¥]|\bplan\b|opus|sonnet|haiku|fable|\bmodel\b|don[’']?t continue|do not continue|never|exit|quit|trust|delete|remove/i
 const PICK_CONTINUE = /continue automatically|resume automatically|keep going|\bcontinue\b/i
 const PICK_WAIT = /stop and wait|wait here|wait for|^wait\b/i
-/** The option that continues or waits: "Wait here, then continue automatically at 3 PM" first, then "Stop and wait for limit to reset". An option that
- *  upgrades, switches model or plan, buys usage or says do not continue is never picked. null = no safe option. */
+/** The connector's probe owns the retry. An automatic continuation would start another turn after the reset. */
 export function pickContinueOption(options: string[]): number | null {
-  const ok = (l: string): boolean => !NEVER_PICK.test(l)
-  let i = options.findIndex(l => ok(l) && PICK_CONTINUE.test(l))
-  if (i < 0) i = options.findIndex(l => ok(l) && PICK_WAIT.test(l))
+  const i = options.findIndex(label => PICK_WAIT.test(label) && !PICK_CONTINUE.test(label) && !NEVER_PICK.test(label))
   return i >= 0 ? i : null
 }
 export type MenuResult = { key: string; options: string[]; chose?: { idx: number; label: string }; result?: 'ok' | 'gone' | 'stuck' | 'error'; resurfaced: boolean }
-/** Look at the main's pane. drive=true: drive the continue / wait option of a LIMIT menu (the pane must speak of a limit, so another menu that happens to
+/** Look at the main's pane. drive=true: drive the passive wait option of a LIMIT menu (the pane must speak of a limit, so another menu that happens to
  *  say "continue" is not touched). A menu that is not driven, or did not clear, is re-armed for Joey. null = no pane, or no menu on it. */
 async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult | null> {
   const mp = D?.mainPicker
@@ -3845,7 +3842,7 @@ async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult 
  *  With lanes on (server.ts passes this as the watchdog's `owner` for the main's pane) the menu is this mechanism's while the main's wall episode is
  *  open (`wall_since`: walled, or in its probe's turn), and a limit menu (an option speaks of a limit, usage or a reset) on a main still in its turn:
  *  the menu is drawn when the limit cuts the turn, and the StopFailure that walls the gen can reach the daemon after the watchdog's poll. The probe
- *  drives the option that waits or continues (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
+ *  drives the passive wait option (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
  *  reads it too (lanes-main). Any other menu (a starting main's resume menu, an idle main's prompt) stays the watchdog's. */
 // lanes-golive (C8): one owner of the main's usage-limit menu. With lanes on it is the lanes main-wall probe (inspectMainMenu, driven from M2). The other
 // actors stand aside: the startup-picker watchdog and the duty officer in this daemon by their `owner` hooks (server.ts), and the programs outside the
@@ -3884,7 +3881,7 @@ export function mainMenuOwned(options: string[]): boolean {
 }
 function menuSentence(m: MenuResult): string {
   const labels = m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')
-  if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，它繼續了。`
+  if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，選單已收起。`
   if (m.chose && m.result === 'gone') return `主線停在一個選單（${labels}），要選「${m.chose.label}」時選單已經不在了（可能別處已經選掉），沒有動作。`
   if (m.chose) return `主線停在一個選單（${labels}），選了「${m.chose.label}」但選單還在，選項已再傳給你，請點一個。`
   return `主線停在一個選單（${labels}），我挑不出一個安全的選項（不碰要付費或換方案的），選項已再傳給你，請點一個。`

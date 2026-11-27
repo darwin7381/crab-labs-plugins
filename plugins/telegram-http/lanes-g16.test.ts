@@ -33,7 +33,7 @@ afterAll(() => { L.__setClaudeBin(restore); L.__setWallProbe(300_000) })
 // the pane: the limit menu as claude 2.1.322 draws it (labels from its own menu code), then the normal prompt once a key has been sent
 const LIMIT_PANE = (opts: string[]) => `\n You've hit your weekly limit · resets 5:48pm (Asia/Taipei)\n\n What do you want to do?\n\n${opts.map((o, i) => ` ${i === 0 ? '❯' : ' '} ${i + 1}. ${o}`).join('\n')}\n\n Enter to confirm · Esc to cancel\n`
 const NORMAL = '\n ╭───────────────╮\n │ > \n ╰───────────────╯\n'
-const SAFE = ['Wait here, then continue automatically at 5:48 PM', 'Upgrade your plan', 'Don’t continue automatically']
+const SAFE = ['Stop and wait for limit to reset', 'Wait here, then continue automatically at 5:48 PM', 'Upgrade your plan']
 const state = { pane: NORMAL, drives: [] as Array<{ idx: number; key: string }>, rearms: 0, driveResult: 'ok' as 'ok' | 'gone' | 'stuck', clears: true }
 const deps: any = { role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: () => false, registryNames: () => ['eve'],
   notifySession: async () => { order.push('offer'); return true }, streamOpen: () => true,                       // the main's MCP stream (PL4: the probe is an offer)
@@ -78,7 +78,7 @@ test('G16c: a picker is described with its real option labels, not only the coun
   const pk = detectStartupPicker(LIMIT_PANE(SAFE))!
   expect(pk.key).toStartWith('generic-'); expect(pk.options).toEqual(SAFE)
   const line = describePicker(pk, 'genesis-u002-adam')
-  expect(line).toContain('3 options'); expect(line).toContain('1. Wait here, then continue automatically at 5:48 PM'); expect(line).toContain('2. Upgrade your plan'); expect(line).toContain('3. Don’t continue automatically')
+  expect(line).toContain('3 options'); expect(line).toContain('1. Stop and wait for limit to reset'); expect(line).toContain('3. Upgrade your plan'); expect(line).toContain('2. Wait here, then continue automatically at 5:48 PM')
 })
 
 test('G16c: the watchdog logs the labels when it surfaces a picker, and surfaces it again after rearmStartupPicker (a fresh debounce)', async () => {
@@ -86,18 +86,18 @@ test('G16c: the watchdog logs the labels when it surfaces a picker, and surfaces
   startStartupPickerWatchdog({ listTargets: async () => [{ label: 'main', tmux: 'g16-watch' }], surface: s => surfaced.push(s), log: (_l, m) => logs.push(m), pollMs: 30, capture: async () => LIMIT_PANE(SAFE) })
   expect(await until(() => surfaced.length === 1)).toBe(true)
   const l = logs.find(m => m.includes('surfacing to TG'))!
-  expect(l).toContain('1. Wait here, then continue automatically'); expect(l).toContain('2. Upgrade your plan')
+  expect(l).toContain('1. Stop and wait'); expect(l).toContain('3. Upgrade your plan')
   expect(surfaced[0].buttons.length).toBe(3)
   await sleep(120); expect(surfaced.length).toBe(1)                                          // debounced: one episode, one surface
   rearmStartupPicker('g16-watch')
   expect(await until(() => surfaced.length === 2)).toBe(true)                                // re-armed: surfaced again
 })
 
-test('G16a: pickContinueOption picks the option that continues or waits, and never one that spends money, switches plan or model, or says do not continue', () => {
+test('G16a: pickContinueOption picks a passive wait, and never one that spends money, switches plan or model, or says do not continue', () => {
   expect(L.pickContinueOption(SAFE)).toBe(0)
   expect(L.pickContinueOption(['Stop and wait for limit to reset', 'Switch to extra usage', 'Upgrade your plan'])).toBe(0)
-  expect(L.pickContinueOption(['Upgrade your plan', 'Wait here, then continue automatically when the limit resets', 'Stop'])).toBe(1)
-  expect(L.pickContinueOption(['Wait here, then continue automatically shortly', 'Stop and wait for limit to reset'])).toBe(0)       // continue before wait
+  expect(L.pickContinueOption(['Upgrade your plan', 'Wait here, then continue automatically when the limit resets', 'Stop'])).toBeNull()
+  expect(L.pickContinueOption(['Wait here, then continue automatically shortly', 'Stop and wait for limit to reset'])).toBe(1)       // even if the automatic option comes first
   expect(L.pickContinueOption(['Upgrade your plan', 'Request more usage', 'Add funds to continue'])).toBeNull()
   expect(L.pickContinueOption(['Don’t continue automatically', 'Upgrade your plan'])).toBeNull()
   expect(L.pickContinueOption(['Switch to Sonnet and continue', 'Buy extra usage ($20)'])).toBeNull()
@@ -117,11 +117,11 @@ function resetMain(body: string, pid = process.pid) {
 }
 const quiet = async (deliveredAt: number, now = Date.now()) => L.noteMainDeaf(deliveredAt, now)
 
-test('G16a, PL4: the walled main\'s probe with the main on its limit menu: the continue option is driven BEFORE anything is offered to it, and Joey is told what was chosen', async () => {
+test('G16a, PL4: the walled main\'s probe with the main on its limit menu: the passive wait option is driven BEFORE anything is offered to it, and Joey is told what was chosen', async () => {
   state.pane = LIMIT_PANE(SAFE); state.driveResult = 'ok'
   const notice = await wallCycle()
   expect(state.drives.length).toBe(1); expect(state.drives[0].idx).toBe(0); expect(state.drives[0].key).toStartWith('generic-')
-  expect(notice).toContain('主線停在一個選單'); expect(notice).toContain('2. Upgrade your plan'); expect(notice).toContain('已選「Wait here, then continue automatically at 5:48 PM」'); expect(notice).toContain('它繼續了')
+  expect(notice).toContain('主線停在一個選單'); expect(notice).toContain('3. Upgrade your plan'); expect(notice).toContain('已選「Stop and wait for limit to reset」'); expect(notice).toContain('選單已收起')
   expect(notice.split('〔adam·分流器〕').length - 1).toBe(2)                                   // 002q (T7-R 1016): up and down; the handled menu rides the down notice
   expect(notice.indexOf('主線停在一個選單')).toBeGreaterThan(notice.indexOf('主線恢復了'))
   expect(state.rearms).toBe(0)
@@ -140,7 +140,7 @@ test('G16a: no safe option, a menu that is not about the limit, or a drive that 
   expect(state.drives.length).toBe(0); expect(state.rearms).toBe(1); expect(notice).toContain('我挑不出一個安全的選項')
   state.pane = LIMIT_PANE(SAFE); state.driveResult = 'stuck'
   notice = await wallCycle()
-  expect(state.drives.length).toBe(1); expect(state.rearms).toBe(1); expect(notice).toContain('選了「Wait here'); expect(notice).toContain('選單還在')
+  expect(state.drives.length).toBe(1); expect(state.rearms).toBe(1); expect(notice).toContain('選了「Stop and wait'); expect(notice).toContain('選單還在')
   state.pane = LIMIT_PANE(SAFE); state.driveResult = 'gone'
   notice = await wallCycle()
   expect(state.drives.length).toBe(1); expect(state.rearms).toBe(0); expect(notice).toContain('選單已經不在了')    // answered somewhere else meanwhile: no action, nothing to re-arm

@@ -209,9 +209,8 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
 - **One owner of the limit menu** (002y, X-1; 002x T7-R, every play, e.g. u002x-T7-s6-r3: main-wall-up msg 2013 @1232.0, the startup-picker
   watchdog's 「🔀 claude 停在一個選單，請選擇」 with buttons msg 2015 @1234.2, the probe's choice @1277.8). Two parts read the main's pane: the
   startup-picker watchdog (server.ts, an 8 s poll; it rang Joey with the menu at once) and this mechanism (the probe chose for him 44 s later). The
-  probe chooses option 2 of the T7-R menu, 「Wait here, then continue automatically at …」 (`pickContinueOption`: an option that continues first,
-  then one that waits; never one that could spend money or change the plan or model: upgrade, extra usage, request more, add funds, buy, billing,
-  pay, credit, a currency sign, plan, a model name, do not continue, exit, trust, delete). With lanes on, the menu is this mechanism's while the
+  probe chooses “Stop and wait for limit to reset” (option 1 on the T7-R menu). The probe delivers the retry when the keeper clears.
+  “Wait here, then continue automatically” would schedule a second wake. A menu with no safe passive wait is re-armed for Joey. With lanes on, the menu is this mechanism's while the
   gen's wall episode is open (`wall_since`), and a limit menu (an option speaks of a limit, usage or a reset) on a gen still `in_turn` (the menu is
   drawn when the limit cuts the turn; the StopFailure can reach the daemon after the watchdog's poll): `mainMenuOwned`, passed to the watchdog as
   its `owner` for the main's pane. The watchdog does not send an owned menu unless the owner re-armed it (`rearmStartupPicker`): the probe found
