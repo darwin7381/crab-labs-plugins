@@ -93,7 +93,7 @@ import * as Connector from './onsen-connector.ts'
 import type { RoamerTelegram, RoamerHost } from './roamer-telegram.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
-import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
+import { HeldSidecar, WallAlerts, WallReader, wallAte, personCanProbe, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
@@ -1096,6 +1096,12 @@ const PENDING_DIR = join(STATE_DIR, 'inbox', 'pending')
 const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
 mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 let persistSeq = 0
+// Only the person_message entrance supplies these ids. Keep them with a disk copy, outside the channel tag.
+const pendingPerson = new WeakMap<object, { ids: string[]; refused?: boolean }>()
+function waitsForWall(notif: object): boolean {
+  const wall = wallReader.state(), person = pendingPerson.get(notif)
+  return !!wall?.walled && (!person || !!person.refused || !personCanProbe(wall.lastWallMs))
+}
 
 // atMs (WO-120): name the file by this time instead of now, so the drain (sorted by name) keeps the original order.
 function persistInbound(notif: { method: string; params: unknown }, atMs?: number): string | null {
@@ -1105,7 +1111,7 @@ function persistInbound(notif: { method: string; params: unknown }, atMs?: numbe
     const filename = `${ts}-${seq}.json`
     const tmpPath = join(PENDING_DIR, filename + '.tmp')
     const finalPath = join(PENDING_DIR, filename)
-    writeFileSync(tmpPath, JSON.stringify(notif), { mode: 0o600 })
+    writeFileSync(tmpPath, JSON.stringify({ ...notif, person_delivery: pendingPerson.get(notif) }), { mode: 0o600 })
     renameSync(tmpPath, finalPath)  // atomic on POSIX
     return finalPath
   } catch (err) {
@@ -1347,7 +1353,13 @@ function sweepDeliveries(): void {
     // WO-120: a delivery the usage wall ate (made before the state flipped, no genuine answer before the wall began) is
     // re-persisted once, named by its own time so the drain keeps the order, and that push is not counted toward
     // MAX_REDELIVERIES (never quarantined). The drain delivers it after the clear and tracks that copy from there.
-    if (wallAte(wall, d.at, newest, now)) {
+    const person = pendingPerson.get(d.notif)
+    const refused = !person || ((wall?.lastWallMs ?? wall?.sinceMs ?? 0) >= d.at && newest <= d.at)
+    if (refused && wallAte(wall, d.at, newest, now)) {
+      if (person) {
+        person.refused = true
+        for (const id of person.ids) onsen?.recordBlocked({ message_id: id, retry_after: wall?.resets_at ?? null })
+      }
       if (!d.pendingPath) {
         const k = deliveryKey(d.notif)
         deliveryAttempts.set(k, Math.max(0, (deliveryAttempts.get(k) ?? 1) - 1))
@@ -1417,7 +1429,7 @@ function sweepDeliveries(): void {
  *  dispatchInbound (routeEvent, and the main through the one builder if the router throws); anything else as a mesh event */
 async function laneRedeliver(notif: { method: string; params: unknown }): Promise<boolean> {
   const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
-  if (!INBOX_ONLY && meta.via !== 'local-inject') { await dispatchInbound(String(meta.chat_id ?? loadAccess().allowFrom[0] ?? ''), notif); return true }
+  if (!INBOX_ONLY && meta.via !== 'local-inject') { await dispatchInbound(String(meta.chat_id ?? loadAccess().allowFrom[0] ?? ''), notif, undefined, pendingPerson.get(notif)?.ids); return true }
   return (await laneDeliverMesh(notif, undefined, false)) != null
 }
 let replayRunning = false
@@ -1428,7 +1440,6 @@ const REPLAY_LOCK_MS = 60_000
 let replayBusySince = 0
 async function replayPendingFromDisk(server: Server): Promise<number> {
   if (!Lanes.LANES_ON) {
-    if (wallReader.walled()) return 0
     if (Date.now() - replayBusySince < REPLAY_LOCK_MS) return 0
     replayBusySince = Date.now()
     try { return await replayPendingFromDiskLocked(server) } finally { replayBusySince = 0 }
@@ -1463,13 +1474,16 @@ async function replayPendingFromDiskLocked(server: Server): Promise<number> {
     const fullPath = join(PENDING_DIR, file)
     let notif: { method: string; params: unknown }
     try {
-      notif = JSON.parse(readFileSync(fullPath, 'utf8'))
+      const { person_delivery, ...saved } = JSON.parse(readFileSync(fullPath, 'utf8'))
+      notif = saved
+      if (Array.isArray(person_delivery?.ids) && person_delivery.ids.length) pendingPerson.set(notif, person_delivery)
     } catch (err) {
       log('warn', `pending unreadable, removing: ${file}: ${err}`)
       try { rmSync(fullPath) } catch {}
       continue
     }
     try {
+      if (waitsForWall(notif) && !Lanes.LANES_ON) continue
       if (Lanes.LANES_ON) {
         // lanes-golive (C3): a parked delivery goes back through the one entrance (the router), never straight into whichever session is open
         if (!(await laneRedeliver(notif))) break
@@ -3180,14 +3194,14 @@ function editedText(m: any): string {
 }
 /** Onsen step 2 (WO-142): the Telegram messages delivered into the conversation (finishInbound; an edit of one of them reaches the agent) */
 const editIndex = new OnsenEdit.DeliveredIndex()
-async function deliverEditedMessage(m: any): Promise<void> {
+async function deliverEditedMessage(m: any, personIds?: string[]): Promise<void> {
   if (!onsen) return
   const text = editedText(m)
   await OnsenEdit.deliverEdit(m, text, {
     // delivered by this daemon (its index; after a restart, its spool: an `in` item that is not a command)
     delivered: (chat, id) => editIndex.has(chat, id) || (() => { const it = onsen!.findInbound(chat, id); return !!it && it.kind !== 'command' })(),
     replaceQueued: (chat, id, rw) => replaceQueuedEdit(chat, id, rw),
-    dispatch: (chat, notif) => dispatchInbound(chat, notif),
+    dispatch: (chat, notif) => dispatchInbound(chat, notif, undefined, personIds),
     meta: em => {
       const inTopic = Lanes.LANES_ON ? topicOfMessage(em) : undefined
       return {
@@ -3207,7 +3221,10 @@ function replaceQueuedEdit(chat: string, id: string, rw: (p: OnsenEdit.Params) =
   const rewrite = (notif: { method: string; params: unknown }): { method: string; params: unknown } => {
     const p = (notif.params ?? {}) as Record<string, any>
     const nw = rw({ content: String(p.content ?? ''), meta: { ...(p.meta ?? {}) } })
-    return { method: notif.method, params: { ...p, content: nw.content, meta: nw.meta } }
+    const updated = { ...notif, params: { ...p, content: nw.content, meta: nw.meta } }
+    const person = pendingPerson.get(notif)
+    if (person) pendingPerson.set(updated, person)
+    return updated
   }
   if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.replaceQueuedMain(chat, id, rw)) n++
   const pushed = (notif: unknown): boolean => recentDeliveries.some(d => d.notif === notif)
@@ -3514,7 +3531,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
         ? { imagePath, ...(photo ? { photo } : {}), fileId: image.file_id, size: image.size }
         : { fileId: attachment!.file_id, size: attachment!.size, docKind: attachment!.kind,
             docMime: attachment!.mime, docName: attachment!.name }),
-      meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys, ...(inTopic != null ? { routeTopic: String(inTopic) } : {}),
+      onsenId: f.onsenId, meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys, ...(inTopic != null ? { routeTopic: String(inTopic) } : {}),
     }, OnsenInbound.albumCountOf(f))
     restartAlbumItems(chat_id, String(mgid))
     return true
@@ -3523,7 +3540,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
   await dispatchInbound(chat_id, {
     method: 'notifications/claude/channel',
     params: { content: text, meta },
-  }, inTopic != null ? String(inTopic) : undefined)
+  }, inTopic != null ? String(inTopic) : undefined, f.onsenId ? [f.onsenId] : undefined)
   return false
 }
 
@@ -3534,7 +3551,8 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
  *  queue entry was overwritten). A per-process counter makes each edit's event its own. */
 let editEventSeq = 0
 /** `routeTopic` (WO-197 segment 2): the topic the router and the lanes know the message by, when it is not the tag's (a connector: Onsen's thread) */
-async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }, routeTopic?: string): Promise<void> {
+async function dispatchInbound(chat_id: string, notification: { method: string; params: unknown }, routeTopic?: string, personIds?: string[]): Promise<void> {
+  if (personIds?.length) pendingPerson.set(notification, { ids: personIds })
   // 002: the router decides (quoted lane message → that lane; worker topic → that worker;
   // everything else → the registered main only). Never a broadcast.
   if (Lanes.LANES_ON) {
@@ -3547,7 +3565,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
     const ev: Lanes.InEvent = {
       // Onsen step 2 (WO-142): Joey's edit carries the original's message_id; its event is its own (edited_at)
       id: `tg-${chat_id}-${meta.message_id ?? Date.now()}${meta.edited_at ? `-edit-${Date.parse(meta.edited_at) || Date.now()}-${++editEventSeq}` : ''}`, source: 'telegram', from: meta.user ?? 'joey',
-      text: String(p.content ?? ''), meta, notif: notification, verified: true,
+      text: String(p.content ?? ''), meta, notif: notification, verified: true, person_message_ids: personIds,
       reply_to_message_id: meta.reply_to_message_id, reply_to_text: meta.reply_to_text, message_thread_id: routeTopic ?? meta.topic,
     }
     const d = await Lanes.routeEvent(ev).catch(err => { log('error', `lanes: router failed (${err}) — main`); return null })
@@ -3618,7 +3636,7 @@ type AlbumEntry = {
   items: Array<{ imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
                  docKind?: string; docMime?: string; docName?: string
                  /** WO-197: its Telegram message id, caption, tag and client.meta (an album put together across a restart is put in order at the flush) */
-                 n?: number; caption?: string; meta?: Record<string, string>; clientMeta?: Record<string, string> }>
+                 onsenId?: string; n?: number; caption?: string; meta?: Record<string, string>; clientMeta?: Record<string, string> }>
   baseMeta: Record<string, string>
   /** WO-197 (rule A): the first item's client.meta, applied again after the album's own fields (media_group_count, the positional files) are built */
   clientMeta?: Record<string, string>
@@ -3639,7 +3657,7 @@ const albumBuffers = new Map<string, AlbumEntry>()
 function bufferAlbumItem(
   chatId: string,
   mgid: string,
-  item: { caption?: string; imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
+  item: { onsenId?: string; caption?: string; imagePath?: string; photo?: Promise<string | undefined>; fileId: string; size?: number;
           docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; keys?: string[]; routeTopic?: string },
   count: number | null = null,
 ): void {
@@ -3656,7 +3674,7 @@ function bufferAlbumItem(
   if (entry.timer) clearTimeout(entry.timer)
   entry.timer = null
   if (item.caption) entry.captions.push(item.caption)
-  entry.items.push({ imagePath: item.imagePath, ...(item.photo ? { photo: item.photo } : {}), fileId: item.fileId, size: item.size,
+  entry.items.push({ onsenId: item.onsenId, imagePath: item.imagePath, ...(item.photo ? { photo: item.photo } : {}), fileId: item.fileId, size: item.size,
                      docKind: item.docKind, docMime: item.docMime, docName: item.docName,
                      ...(/^\d+$/.test(item.meta.message_id ?? '') ? { n: Number(item.meta.message_id) } : {}), ...(item.caption ? { caption: item.caption } : {}),
                      meta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}) })
@@ -3762,7 +3780,7 @@ async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<v
     await dispatchInbound(entry.chatId, {
       method: 'notifications/claude/channel',
       params: { content, meta },
-    }, entry.routeTopic)
+    }, entry.routeTopic, entry.items.flatMap(it => it.onsenId ? [it.onsenId] : []))
   } catch (err) { log('error', `album flush dispatch failed: ${err}`) }
   // WO-197 (Chiron mesh 12852): delivered: its items' kept facts go now (a restart before this line delivers the album from them, once)
   for (const k of entry.keys) albumHeld.delete(k)
@@ -3795,7 +3813,7 @@ function stampDid(notif: { method: string; params: unknown }): void {
 function broadcastNotification(notif: { method: string; params: unknown }): void {
   // WO-120: inside a usage wall nothing is written into the session: park it (no re-delivery attempt is counted); the
   // drain after the clear delivers it once, in order. With lanes on this is the fallback path (no router could be asked), so the hold stays here.
-  if (wallReader.walled()) {
+  if (waitsForWall(notif)) {
     if (holdForWall(notif)) heldSidecar.update(wallReader.state())
     return
   }
@@ -4173,13 +4191,23 @@ if (Lanes.LANES_ON) {
       rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
+    checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
+    blocked: (item, retryAfter) => {
+      const meta = item.notif?.params?.meta ?? {}
+      const ids = item.person_message_ids as string[] | undefined
+      if (ids?.length) {
+        for (const id of ids) onsen?.recordBlocked({ message_id: id, retry_after: retryAfter })
+      } else if (meta.chat_id && meta.message_id) {
+        onsen?.recordBlocked({ chat: String(meta.chat_id), client_msg_id: String(meta.message_id), retry_after: retryAfter })
+      }
+    },
     wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
     ...(mentionCards ? { mentions: () => mentionCards.fetchIfOn(), mentionsRead: (posts: string[]) => mentionCards.read(posts) } : {}),   // WO-181
     // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)
     usageWall: (wallSinceMs: number) => {
       const w = wallReader.state()
       if (!w) return null
-      if (w.walled) return { walled: true, clearedMs: null }
+      if (w.walled) return { walled: true, clearedMs: null, lastWallMs: w.lastWallMs, resets_at: w.resets_at }
       return w.clearedMs != null && w.clearedMs >= wallSinceMs - 60_000 ? { walled: false, clearedMs: w.clearedMs, by: w.cleared_by } : null
     },   // WO-120: WallAlerts is the one sender of the main's usage-wall pushes; WO-141 follow-up: the lanes' wall reads it too (by: cleared_by)
     ...(INBOX_ONLY ? {
@@ -4594,7 +4622,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
 /** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
  *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
  *  not allowlisted (acked and dropped, logged). */
-async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main'): Promise<boolean> {
+async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main', personIds?: string[]): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && CONNECTOR))) {
     log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
@@ -4618,10 +4646,10 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rul
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
   // WO-194: a page message that came as a person_message with ONSEN_INBOUND on goes the way a Telegram message goes (the router's rules)
   if (Lanes.LANES_ON && route === 'main') {
-    const ev: Lanes.InEvent = { id: `tg-${chat}-${ref}`, source: 'telegram', from: uid, text: String(notification.params.content), meta, notif: notification, verified: true }
+    const ev: Lanes.InEvent = { id: `tg-${chat}-${ref}`, source: 'telegram', from: uid, text: String(notification.params.content), meta, notif: notification, verified: true, person_message_ids: personIds }
     if (Lanes.toMainForm(ev)) return true
   }
-  await dispatchInbound(chat, notification)
+  await dispatchInbound(chat, notification, undefined, personIds)
   return true
 }
 /** WO-194 (Chiron, mesh 12695): the reply attributes of a page message (Onsen's reply_to {message_id, client_msg_id, from, text}), as a Telegram reply
@@ -4685,7 +4713,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       const m = { message_id: Number(ref), chat: { id: Number(chat), type: chat.startsWith('-') ? 'supergroup' : 'private' },
         from: { id: Number(c.user_id) || 0, is_bot: false, ...(c.user ? { username: String(c.user) } : {}) }, text: String(p.text ?? ''), ...(Number.isFinite(at) ? { edit_date: at } : {}),
         ...(c.thread != null ? { is_topic_message: true, message_thread_id: Number(c.thread) } : {}) }
-      if (/^\d+$/.test(ref)) await deliverEditedMessage(m)
+      if (/^\d+$/.test(ref)) await deliverEditedMessage(m, [String(p.message_id)])
       inboundStore.finish([own])
       log('info', `onsen inbound: person_edit of ${shown} handed on`)
       return { code: 200, json: { delivered: true } }
@@ -4704,7 +4732,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
         ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
         ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
-      await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main')
+      await deliverFormAnswer(fi, await onsenInboundNow() ? 'rules' : 'main', [String(p.message_id)])
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} handed to the ${Lanes.LANES_ON ? 'router' : 'session(s)'}`)
       return { code: 200, json: { delivered: true } }
@@ -4716,7 +4744,7 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
     }
     const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
-    if (cm) f = { ...f, clientMeta: cm }
+    f = { ...f, onsenId: String(p.message_id), ...(cm ? { clientMeta: cm } : {}) }
     // WO-197 (Chiron mesh 12852): an album item is answered 200 (the inbox acks it) before its album goes (up to TELEGRAM_ALBUM_CAP_MS): what rebuilds
     // its tag is kept on disk until then (the arrival's facts with client.meta; a connector's, rebuilt from the person_message, with where Onsen keeps
     // its files), so a daemon stopped meanwhile delivers it after its restart, once
@@ -5458,13 +5486,10 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         if (boundServer && sseOpen.get(sessionId)) {    // closed during the wait → leave it all parked
           const queued = memQueue.get(sessionId) ?? []
           memQueue.delete(sessionId)                    // take ownership before the first await
-          if (queued.length > 0 && wallReader.walled()) {
-            // WO-120: inside a usage wall they park on disk instead; the drain after the clear delivers them
-            for (const notif of queued) holdForWall(notif)
-            log('info', `usage wall: ${queued.length} mem-queued notif(s) for session ${sessionId} parked in inbox/pending until the wall clears`)
-          } else if (queued.length > 0) {
+          if (queued.length > 0) {
             log('info', `flushing ${queued.length} mem-queued notif(s) for session ${sessionId}`)
             for (const notif of queued) {
+              if (waitsForWall(notif)) { holdForWall(notif); continue }
               try {
                 await boundServer.notification(notif as Parameters<Server['notification']>[0])
                 recordDelivery(notif)

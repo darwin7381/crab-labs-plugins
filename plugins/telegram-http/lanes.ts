@@ -23,9 +23,9 @@
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
-import { createMain, mainContext, type MainApi, type ItemKind, type Via } from './lanes-main.ts'
+import { createMain, mainContext, type MainApi, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import type { CallFacts, TurnTrigger } from './onsen-status.ts'
-import type { CallRef } from './onsen-client.ts'
+import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
@@ -225,7 +225,9 @@ export interface LanesDeps {
   /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall); WO-141 follow-up:
    *  the lanes' wall reads it too (followUsageWall). `by`: the clear's cleared_by (usage_wall.py: ok_turn | probe_after_reset | probe_after_switch |
    *  probe_retry) */
-  usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null; by?: string | null } | null
+  usageWall?: (wallSinceMs: number) => (MainWall & { by?: string | null }) | null
+  checkWaitingCall?: (id: string, why: CallWait, thread?: string) => Promise<CallCheck>
+  blocked?: (item: Row, retryAfter: string | null) => void
   /** WO-181 (server.ts onsen-mentions.ts MentionCards): the block of this agent's unread mentions for a delivery to the main (resolves null: none, no answer);
    *  null at once: switched off */
   mentions?: () => Promise<{ text: string; posts: string[] } | null> | null
@@ -345,6 +347,9 @@ function mainEnv() {
     info: digestInfo,
     // WO-181: the unread mentions ride the main's deliveries with the digest (onsen-mentions.ts, server.ts); the main only: a lane's run gets none
     ...(D.mentions ? { mentions: () => D.mentions!(), mentionsDelivered: (posts: string[]) => D.mentionsRead?.(posts) } : {}),
+    blocked: D.blocked,
+    callId: (r: Row) => callOfEvent(String(r.event))?.id ?? r.call_id,
+    checkCall: D.checkWaitingCall && ((id: string, why: CallWait, r: Row) => D.checkWaitingCall!(id, why, events?.get(String(r.event))?.thread ?? undefined)),
     done: itemDone,
     undone: itemUndone,
     tellJoey: (text: string, rule: string, evs: string[] = []) => {
@@ -877,7 +882,7 @@ export type RouteTapCtx = {
   /** the event the row is about (null: a row with no event, e.g. a refused registration, a digest, a /lanes command) */
   ev: InEvent | null
   /** the main's M2 record at this moment (null: no gen); offered = an item already offered to it (one offer opens one turn) */
-  main: { state: string; offered: boolean } | null
+  main: { state: string; offered: boolean; personProbe?: boolean } | null
   /** the kind of the row's lane (reflex | worker | fork | curator | synthesis | mail), null without one */
   laneKind: string | null
   /** the router's alert senders (router.json, as last read; never read again for the tap) */
@@ -901,11 +906,12 @@ function tapRoute(row: Record<string, unknown>, ev?: InEvent): void {
   try {
     const g = D?.role === 'tg' && main ? main.currentGen() : null
     const evId = String(row.event ?? '')
+    const wall = main?.wallDelivery(g)
     const before = row.target === 'main' ? lastMainItem(evId) : null
     const lane = typeof row.lane === 'string' && S?.lanes ? S.lanes[row.lane] : undefined
     routeTap!(row, {
       ev: ev ?? null,
-      main: g ? { state: String(g.state), offered: main.items(r => r.state === 'offered' && r.gen === g.id).length > 0 } : null,
+      main: g ? { state: wall?.active ? 'walled' : String(g.state), personProbe: !!wall?.person && ev?.source === 'telegram' && !ev.synthetic, offered: main.items(r => r.state === 'offered' && r.gen === g.id).length > 0 } : null,
       laneKind: lane?.kind ?? null,
       alertSenders: routerCache?.cfg.alert_senders ?? ['alert-dispatcher'],
       roster: () => kindRoster(),
@@ -1522,6 +1528,7 @@ export type InEvent = {
   tkey?: ThreadKeyRes
   /** WO-175: the Onsen Call this item is (the call id its pulled item carries, Onsen 0.24.1; none before its Call exists, or for other kinds) */
   call_id?: string
+  person_message_ids?: string[]
   /** 1.58.32: the Call this item answers (its refs.call, Onsen 0.33.1): a Call this agent made. Onsen gives the answer that Call's id, but its state is
    *  the recipient's to write (PUT …/state from the caller: 403), so the item is no Call of this agent's (callRefOf) */
   answers_call?: string
@@ -1745,6 +1752,15 @@ export function runningLanes(): Array<{ id: string; run: string; kind?: string; 
 function wakeStateOf(ev: InEvent | null, extra: Partial<WakeState> = {}): WakeState {
   // the one state: statusOf (no MainPhase, no M1 offer state: the hook keeps only the delivery moment)
   const st: WakeState = { member: memberNow() ?? 'offline', lane_free: running.size < MAX_RUNNING, ...extra }
+  if (ev && main?.currentGen()) {
+    const wall = main.wallDelivery()
+    if (wall.active) {
+      st.member = 'walled'
+      if (ev.source === 'telegram' && !ev.synthetic) {
+        st.personProbe = wall.person
+      }
+    }
+  }
   if (ev && st.owner === undefined) st.owner = ev.tkey ? tkeyOwner(ev.tkey) : convOwnerOf(ev)     // WO-164: the owner of the item's thread
   if (S?.master_off) st.lanes_off = true
   return st
@@ -1938,6 +1954,8 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     d = await applyRule(ruleForVerdict(decided.v, ev, decided.item, decided.st, cfg), ev)
     d.rule = wakeRuleTag(decided.v, d.rule)
     if (ev.tkey) bindThread(ev, d, String(decided.item.kind))              // WO-164: the item is on its thread (key, owner, newest item)
+  } else if (ev.source === 'telegram' && !ev.synthetic && main?.wallDelivery().active) {
+    d = { rule: 'person-wall', target: 'main' }
   } else {
     for (const r of routerRules(cfg)) {
       if (!matches(r, ev, cfg)) continue
@@ -2510,7 +2528,7 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
     : ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
     : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text ?? ''), meta: { ...(p.meta ?? {}) } } }
-  const kind: ItemKind = ev.source === 'telegram' ? 'joey' : routerCfg().alert_senders.includes(ev.from) ? 'alert' : 'peer'
+  const kind: ItemKind = ev.source === 'telegram' && !ev.synthetic ? 'joey' : routerCfg().alert_senders.includes(ev.from) ? 'alert' : 'peer'
   // M3: an event the router gives the main owes the main (M4: that is what wakes it; M1 offers the item). 002p (T1-R E12): its class comes from the one
   // classifier (evClassOf over the event's trigger class) and what it owes from the one builder (eventObligations), exactly as a lane's event; given to the
   // main, those are `handed` (the main meets them: its reply meets the Joey line and rings a critical one's ring, the due sweep rings it if nobody did)
@@ -2518,7 +2536,7 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   const cls = evClassOf(ev)
   recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain || notice ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
-  main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
+  main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
 }
 /** Onsen step 2 (WO-142, server.ts): Joey edited Telegram message `messageId` in `chat` and the main has not seen it yet (its M1 item still queued, never
  *  offered): that item is rewritten (lanes-main.ts replaceQueued; server.ts gives the new text). true = replaced; false = the edit goes as a new message. */
@@ -5482,6 +5500,10 @@ function oweMain(id: string, kind: ItemKind, notif: Notif, o: { cls: EvClass; fr
 const metBy = (it: Row): string => `main (item ${it.id} done)`
 /** M1: an item reached done. What a digest showed needs nothing here: digestInfo reads it from the digest items themselves. */
 function itemDone(it: Row): void {
+  if (it.reason === 'call_already_final' && it.event) {
+    events.set(String(it.event), o => ['open', 'handed', 'requested'].includes(o.state), { state: 'dropped', by: `Call ${it.call_state}` })
+    return
+  }
   if (it.event && events.get(it.event)) events.set(String(it.event), o => o.kind === 'main' && o.state === 'open' && (!o.item || o.item === it.id), { state: 'met', by: metBy(it) })
 }
 /** M1: an item left done (its turn went on after the Stop that closed it): the hand-over it met is open again */

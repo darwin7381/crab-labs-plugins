@@ -64,9 +64,9 @@ export class DeliveryFacts {
     if (this.groups.size > 500) this.groups.delete(this.groups.keys().next().value!)
   }
   private idsOf(chat: string, id: string): string[] { return this.groups.get(k2(chat, id)) ?? [id] }
-  private emit(chat: string, id: string, state: DeliveryState, by: string | undefined, at: string | undefined, detail?: Record<string, unknown>, turn?: TurnFields): void {
+  private emit(chat: string, id: string, state: DeliveryState, by: string | undefined, at: string | undefined, detail?: Record<string, unknown>, turn?: TurnFields, retry?: string): void {
     for (const mid of this.idsOf(chat, id)) {
-      const idem = idemDelivery(this.o.agent, chat, mid, state)
+      const idem = idemDelivery(this.o.agent, chat, mid, state) + (retry ? `:after:${retry}` : '')
       if (this.sent.has(idem)) continue
       this.sent.set(idem, true)
       if (this.sent.size > (this.o.max ?? 20_000)) for (const k of [...this.sent.keys()].slice(0, 5_000)) this.sent.delete(k)
@@ -96,18 +96,18 @@ export class DeliveryFacts {
   }
   /** WO-165: handed to a session (lanes off: written into the main's stream, where Claude Code may queue it; lanes on: M1 offered it, or bound it at a
    *  boundary; a lane run started with it). Not seen: the ✍ waits for seen */
-  inSession(chat: string, id: string | number, by: string, at?: string): void {
+  inSession(chat: string, id: string | number, by: string, at?: string, retry?: string): void {
     const s = String(id)
-    this.emit(chat, s, 'in_session', by, at)
+    this.emit(chat, s, 'in_session', by, at, undefined, undefined, retry)
     for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.session = true; e.sessionAt = this.now() } }
     this.changed()
   }
   /** WO-165: it entered a turn (lanes on: M1 bound it to a prompt, a lane run started with it; lanes off: the main's transcript shows it taken in, as
    *  the prompt of a turn or absorbed mid-turn). Until WO-165 this was the in_session moment. quiet: the fact only, no onSeen (the transcript's tail
    *  read again at start: a message taken in before this daemon began) */
-  seen(chat: string, id: string | number, by: string, at?: string, quiet = false, turnId?: string | null): void {
+  seen(chat: string, id: string | number, by: string, at?: string, quiet = false, turnId?: string | null, retry?: string): void {
     const s = String(id)
-    this.emit(chat, s, 'seen', by, at, undefined, turnId ? { turn_id: turnId } : undefined)
+    this.emit(chat, s, 'seen', by, at, undefined, turnId ? { turn_id: turnId } : undefined, retry)
     for (const m of this.idsOf(chat, s)) { const e = this.open.get(k2(chat, m)); if (e) { e.session = true; e.turn = true } }
     if (this.o.onSeen && !quiet) for (const m of this.idsOf(chat, s)) { try { this.o.onSeen(chat, m, by) } catch {} }
     this.changed()
@@ -554,6 +554,7 @@ export class LanesTap {
   journal(row: Row, line: Record<string, unknown>): void {
     const F = this.o.facts
     if (row.rec === 'msg') {
+      if (line.reason === 'call_already_final') return  // closed before delivery; the remote Call already has its outcome
       // WO-175: a Call's turn moments on the main: bound into a turn → running; the turn ended (its Stop, final once the record shows it over) →
       // completed; bound again after that Stop (the turn went on) → not yet; back in the queue after it was in a turn (cut, failed, its gen gone) → accepted
       const call = row.kind !== 'digest' ? this.callOf(row.event) : null
@@ -565,14 +566,15 @@ export class LanesTap {
         else if (line.state === 'queued' && this.callBound.delete(rid)) C.putBack(ev, call, 'main', row.ts)
         if (this.callBound.size > 2_000) this.callBound.delete(this.callBound.values().next().value!)
       }
-      const j = this.o.joey((row.notif?.params as any)?.meta)
-      if (j && line.state === 'offered') F.inSession(j.chat, j.id, 'main', row.ts)   // WO-165: written into the idle main's stream
+      const meta = (row.notif?.params as any)?.meta
+      const j = row.person_message_ids?.length && meta?.chat_id && meta?.message_id ? { chat: meta.chat_id, id: meta.message_id } : this.o.joey(meta)
+      if (j && line.state === 'offered') F.inSession(j.chat, j.id, 'main', row.ts, row.wall_blocked)   // WO-165: written into the idle main's stream
       else if (j && line.state === 'bound') {
         // M1 bound it to a turn of the main: offered and opened the turn, or pulled at a tool boundary / Stop. bound again after its Stop
         // (turn_continued): that Stop was not the turn's end. WO-165: a pulled item reaches the session as it is bound (in_session the same moment;
         // an offered one has it already, this daemon writes each fact once)
         if (line.reason === 'turn_continued') F.cancelTurnEnd(j.chat, j.id, 'main')
-        else { F.inSession(j.chat, j.id, 'main', row.ts); F.seen(j.chat, j.id, 'main', row.ts, false, line.prompt_id ? String(line.prompt_id) : this.turn?.prompt ?? null) }
+        else { F.inSession(j.chat, j.id, 'main', row.ts, row.wall_blocked); F.seen(j.chat, j.id, 'main', row.ts, false, line.prompt_id ? String(line.prompt_id) : this.turn?.prompt ?? null, row.wall_blocked) }
       }
       // WO-172: how the turn ended, from its items: done at its Stop; queued again because it was cut (interrupted) or ended in StopFailure (failed; any
       // other requeue of a bound item: the gen ended under it, failed). The first such line of a prompt sets the turn's outcome; each Joey message in it
@@ -583,7 +585,7 @@ export class LanesTap {
         const b = this.turnBound(endP)
         const outcome: TurnOutcome = line.state === 'done' ? 'done' : line.reason === 'interrupted' ? 'interrupted' : 'failed'
         if (!b.ending) b.ending = outcome
-        if (j) {
+        if (j && !line.wall_blocked) {
           const detail = row.reason && line.state === 'done' ? { reason: String(row.reason) } : undefined
           const turn: TurnFields = { turn_id: endP, outcome: b.ending, bound: [...b.ids] }
           if (line.state === 'done') F.turnEndLater(j.chat, j.id, 'main', row.ts, detail, turn)

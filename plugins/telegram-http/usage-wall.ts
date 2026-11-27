@@ -18,6 +18,11 @@ import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
 
 export const FRESH_MS = 180_000
+/** Fresh human input can measure the account once a minute after this session's own refusal. */
+export function personCanProbe(lastWallMs: number | null | undefined, now = Date.now()): boolean {
+  return lastWallMs == null || now - lastWallMs >= 60_000
+}
+
 export const CACHE_MS = 5_000
 export const HELD_ROLES = ['tg', 'inbox'] as const
 export type HeldRole = typeof HELD_ROLES[number]

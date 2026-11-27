@@ -25,6 +25,11 @@ import type { Journal, Row } from './lanes-state.ts'
 import { BOUNDARY_MAIN_RULE, boundaryCardOn, decisionMainRule, decisionsOn, deferDecisionsOn, deferMainRule } from './lanes-boundary.ts'
 import { genuineAssistantAfterFile } from './liveness.ts'
 
+import type { CallCheck, CallWait } from './onsen-client.ts'
+import { personCanProbe } from './usage-wall.ts'
+
+export type MainWall = { walled: boolean; clearedMs: number | null; lastWallMs?: number | null; resets_at?: string | null }
+
 export type Notif = { method: string; params: unknown }
 export type ItemKind = 'joey' | 'peer' | 'alert' | 'digest' | 'handoff' | 'carry'
 export type Via = 'tg' | 'inbox'
@@ -52,7 +57,11 @@ export type MainEnv = {
   /** WO-120: the agent's usage-wall state (usage_wall.py, read by usage-wall.ts) for the wall episode that began at `wallSinceMs`: 'walled' = the
    *  keeper probes outside the session, so no item is fed to the wall; cleared (clearedMs) = its probe (or a genuine turn) got an answer: one
    *  offer now, once per clear (a failed offer then waits for retry_at or a newer clear); null = no fresh state: the PL4 probe as before */
-  usageWall?: (wallSinceMs: number) => { walled: boolean; clearedMs: number | null } | null
+  usageWall?: (wallSinceMs: number) => MainWall | null
+  /** Persist the blocked receipt for a person's bound delivery, ordered with its other delivery facts. */
+  callId?: (item: Row) => string | undefined
+  checkCall?: (id: string, why: CallWait, item: Row) => Promise<CallCheck>
+  blocked?: (item: Row, retryAfter: string | null) => void
   /** the session id the keeper launched (.lanes/main-expected), or a renew in progress */
   expectedSession: () => string[]
   /** 002v: the accepted main's session id is the expected one from now on (.lanes/main-expected): a /clear's new session survives a restart */
@@ -177,6 +186,7 @@ export function createMain(E: MainEnv) {
   let stuck: { gen: string | null; prompt: string | null; at: number; undelivered?: boolean } | null = null
   let offering = false
   let seq = 0
+  let restoredThrough = 0
 
   const J = (): Journal => E.journal
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
@@ -189,7 +199,9 @@ export function createMain(E: MainEnv) {
     for (const g of live.slice(0, -1)) endGen(g, 'replaced')            // only one gen can be live
     const g = live[live.length - 1]
     if (g) { cur = g.id; lastEventAt.set(g.id, Date.now()) }
-    seq = J().rows('msg').length
+    const restored = J().rows('msg')
+    restoredThrough = restored.at(-1)?.n ?? 0
+    seq = restored.length
   }
 
   // ------------------------------------------------------------------ M2 queries (everything else asks these)
@@ -228,6 +240,19 @@ export function createMain(E: MainEnv) {
     if (!takeSince || takeSince.gen !== g.id) takeSince = { gen: g.id, at: now }
     return true
   }
+  /** WO-200: M2 can still say walled after the keeper cleared, or be idle when the keeper first reports a wall. */
+  function wallDelivery(g = currentGen()) {
+    const wall = E.usageWall?.(Date.parse(String(g?.wall_since ?? '')) || 0)
+    const refused = Number(g?.wall_refused_at ?? 0)
+    const clear = wall?.clearedMs != null && wall.clearedMs >= refused ? wall.clearedMs : null
+    const active = !!wall?.walled || (clear == null && (g?.state === 'walled' || member() === 'walled'))
+    const last = Math.max(wall?.lastWallMs ?? 0, refused)
+    return { active, person: active && personCanProbe(last || null), clear, keeper: !!wall?.walled }
+  }
+  /** An item already refused or interrupted by this wall waits for the clear. */
+  function wallAllows(r: Row, wall: ReturnType<typeof wallDelivery>): boolean {
+    return !wall.active || (wall.person && r.kind === 'joey' && !r.wall_blocked && !heldCut(r))
+  }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
   function mainCanTake(): boolean { const g = currentGen(); return !!g && canTake(g) }
   /** WO-177 一: what M1 does with an item for the main now: 'offer' (an idle gen the record says can take one), else why it waits: M2's phase (in_turn: it
@@ -252,10 +277,11 @@ export function createMain(E: MainEnv) {
     const id = newId()
     const params = { ...((notif.params ?? {}) as Record<string, unknown>) }
     params.meta = { ...metaOf(notif), did: id }
-    J().write('msg', id, 'queued', { kind, via: o.via ?? 'tg', event: o.event ?? null, ...(o.target ? { target: o.target } : {}), notif: { method: notif.method, params }, ...(o.fields ?? {}),
+    const g = currentGen()
+    const wait: CallWait | null = !g || g.state === 'starting' || member() === 'offline' ? 'offline' : wallDelivery(g).active ? 'wall' : null
+    J().write('msg', id, 'queued', { kind, ...(wait ? { waited: wait } : {}), queued_gen: g?.id, via: o.via ?? 'tg', event: o.event ?? null, ...(o.target ? { target: o.target } : {}), notif: { method: notif.method, params }, ...(o.fields ?? {}),
       ...(o.batched ? { reason: 'batched', batched_at: new Date().toISOString() } : {}) })
     seq++
-    const g = currentGen()
     if (kind === 'digest') J().write('wake', id, 'no_wake', { reason: 'information: rides the next delivery' })
     else if (o.batched) J().write('wake', id, 'no_wake', { reason: `batched: rides the next delivery to the main and never wakes it alone${batchWaitMs() ? ` (it leads one after ${Math.round(batchWaitMs() / 60_000)} min)` : ''}` })
     else if (!g || g.state !== 'idle') J().write('wake', id, 'no_wake', { reason: !g ? 'main gone: offered to the next gen' : g.state === 'in_turn' ? 'main in a turn: pulled at its next tool boundary or Stop' : `main ${g.state}` })
@@ -328,6 +354,28 @@ export function createMain(E: MainEnv) {
     const rows = w ? items(r => w.ids.includes(r.id)) : its
     return { items: rows, events: w ? w.events : [...new Set(its.map(r => String(r.event ?? '')).filter(Boolean))], carried: !!w }
   }
+  /** Returns synchronously for ordinary deliveries. A Call lookup can overlap another hook; only the same queued version can be used. */
+  function checked(rows: Row[], g: Row, clear: number | null): Row[] | Promise<Row[]> {
+    const pending: Promise<void>[] = []
+    const skip = new Set<string>()
+    for (const r of rows) {
+      const id = E.callId?.(r)
+      if (!id || !E.checkCall) continue
+      const why: CallWait | undefined = r.waited ?? (r.n <= restoredThrough ? 'restart'
+        : r.queued_gen !== g.id || r.last_no_wake === 'unreachable' ? 'offline'
+        : clear != null && clear >= Date.parse(r.created) ? 'wall' : undefined)
+      if (!why) continue
+      const version = r.version
+      pending.push(E.checkCall(id, why, r).then(result => {
+        if (r.state !== 'queued' || r.version !== version || result !== 'open') skip.add(r.id)
+        if (r.state === 'queued' && r.version === version && typeof result === 'object') {
+          closeItem(r, { reason: 'call_already_final', call_state: result.final, gen: null, prompt_id: null })
+        }
+      }).catch(e => { skip.add(r.id); E.log('warn', `lanes: checking delayed Call ${id}: ${e}`) }))
+    }
+    return pending.length ? Promise.all(pending).then(() => rows.filter(r => !skip.has(r.id) && r.state === 'queued')) : rows
+  }
+
   /** the gen is idle and has nothing offered: offer it the oldest owed item, with the information riding on it */
   async function pump(): Promise<void> {
     if (!E || offering) return
@@ -339,31 +387,38 @@ export function createMain(E: MainEnv) {
     if (!g) return
     // PL4: a walled gen is offered one item when its retry time comes: its probe. Its own hook events then take it out of `walled` (and a
     // StopFailure walls it again, with a longer backoff). A limit menu it is parked on is driven first (002k G16a).
+    const wall = wallDelivery(g)
     let probe = g.state === 'walled' && Date.now() >= Number(g.retry_at ?? Infinity)
     let clearUsed: number | null = null
-    if (g.state === 'walled' && E.usageWall) {
+    if (g.state === 'walled') {
       // WO-120: with a fresh usage-wall state the keeper is the probe (outside the session, nothing eaten, no false run ack): while it says
       // walled no item is offered; a clear the gen has not used yet sends the one offer now. Once per clear: if that offer walls again while
       // the state still shows the same clear (reader lag, a wall kind the state does not record), the next one waits for retry_at as before.
-      const uw = E.usageWall(Date.parse(String(g.wall_since ?? '')) || 0)
-      if (uw?.walled) probe = false
-      else if (uw?.clearedMs != null && uw.clearedMs > Number(g.uw_clear_used ?? 0)) { probe = true; clearUsed = uw.clearedMs }
+      if (wall.keeper) probe = false
+      else if (wall.clear != null && wall.clear > Number(g.uw_clear_used ?? 0)) { probe = true; clearUsed = wall.clear }
     }
     // WO-177 一: an item is offered only when the status record says the main can take one (canTake); held items stay `queued` and go out the moment the
     // record turns idle (statusChanged). M2 says how: an idle gen is offered (it opens a turn), a gen in a turn pulls at its next boundary (main_after_step)
-    if (!probe && (g.state !== 'idle' || !canTake(g))) return
+    const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : g.state === 'idle' && canTake(g)))
+    if (!mayOffer()) return
+    const eligible = (r: Row) => wallAllows(r, wall) || (probe && !wall.keeper)
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     // WO-157c: an item of an interrupted turn is no candidate: it rides the offer of the next one (riders below)
-    let cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r) && !waitsRetry(r))
+    let cands = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !heldCut(r) && !batchedRider(r) && !waitsRetry(r) && eligible(r))
+    const verified = checked(cands, g, wall.clear)
+    if (verified instanceof Promise) {
+      cands = await verified
+      if (currentGen()?.id !== g.id || !mayOffer() || items(r => r.state === 'offered' && r.gen === g.id).length) return
+    }
     if (!cands.length) return
     // WO-181: the unread mentions ride this offer with the digest; fetched now (≤ LANES_MENTION_TIMEOUT_MS), and what the wait changed is looked at again
-    const mp = mentionsNow()
+    const mp = wall.active && !probe ? null : mentionsNow()
     const mb = mp ? await mp : null
     if (mp) {
       const g2 = currentGen()
-      if (!g2 || g2.id !== g.id || (!probe && (g2.state !== 'idle' || !canTake(g2)))) return
+      if (!g2 || g2.id !== g.id || !mayOffer()) return
       if (items(r => r.state === 'offered' && r.gen === g.id).length) return
       cands = cands.filter(r => J().get('msg', r.id)?.state === 'queued')
       if (!cands.length) return
@@ -379,9 +434,14 @@ export function createMain(E: MainEnv) {
     const down = new Set<string>()
     for (const it of cands) {
       if (down.has(String(it.via))) continue
-      const dg = attachInfo(mb)
       // WO-157c: the items of an interrupted turn ride this offer, after the message itself, each with Chiron's line in front
-      const riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g))   // WO-164: and the batched
+      let riders = items(r => r.id !== it.id && (heldCut(r) || (r.state === 'queued' && r.reason === 'batched')) && owed(r) && forGen(r, g) && eligible(r))   // WO-164: and the batched
+      const checkedRiders = checked(riders, g, wall.clear)
+      if (checkedRiders instanceof Promise) {
+        riders = await checkedRiders
+        if (currentGen()?.id !== g.id || !mayOffer() || it.state !== 'queued') return
+      }
+      const dg = wall.active && !probe ? null : attachInfo(mb)
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
       const p = (it.notif?.params ?? {}) as Record<string, any>
       const own = [cutText(it, String(p.content ?? '')), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
@@ -421,10 +481,16 @@ export function createMain(E: MainEnv) {
   /** bind queued owed items (and the riding information) to the running prompt: what a busy main pulls at a boundary. `mb` (WO-181): the unread mentions
    *  fetched for it (pullable() first said there is something to pull) */
   const pullable = (g: Row): boolean => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r)).length > 0
-  function pull(g: Row, prompt: string, mb: { text: string; posts: string[] } | null = null): Row[] {
-    const got = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r))     // WO-201: a failed turn's item waits for its retry time
+  async function pull(g: Row, prompt: string, mb: { text: string; posts: string[] } | null = null): Promise<Row[]> {
+    const wall = wallDelivery(g)
+    let got = items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r) && wallAllows(r, wall))     // WO-201: a failed turn's item waits for its retry time
+    const verified = checked(got, g, wall.clear)
+    if (verified instanceof Promise) {
+      got = await verified
+      if (currentGen()?.id !== g.id || g.prompt_id !== prompt || g.state !== 'in_turn') return []
+    }
     if (!got.length) return []
-    const dg = attachInfo(mb)
+    const dg = wall.active ? null : attachInfo(mb)
     const all = dg ? [...got, dg] : got
     const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
     for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true, bound_at: at })
@@ -725,7 +791,7 @@ export function createMain(E: MainEnv) {
         setMain(J().get('main', g.id)!, 'in_turn', { tool_open: null }); openTools.delete(g.id)
         try { E.toolDone?.(n, b.tool_input ?? {}, String(b.tool_response ?? ''), !!b.tool_error) } catch (e) { E.log('warn', `lanes: toolDone ${n}: ${e}`) }
         const mp = pullable(g) ? mentionsNow() : null                                       // WO-181: only when something is pulled now
-        const got = pull(J().get('main', g.id)!, p, mp ? await mp : null)
+        const got = await pull(J().get('main', g.id)!, p, mp ? await mp : null)
         return got.length ? { additionalContext: renderPulled(got) } : {}
       }
       case 'Stop': {
@@ -733,7 +799,7 @@ export function createMain(E: MainEnv) {
         beginTurn(g, p)
         if (b.phase !== 'final') {
           const mp = pullable(g) ? mentionsNow() : null                                     // WO-181: only when something is pulled now
-          const got = pull(J().get('main', g.id)!, p, mp ? await mp : null)
+          const got = await pull(J().get('main', g.id)!, p, mp ? await mp : null)
           if (got.length) return { block: '這一輪先不要結束。' + renderPulled(got) }
           const t = turnWork(g, p)
           // 002q (M3), 002w (B): the main's turn may not end silently while it still owes what the turn works on, the rule the lane stop applies to a
@@ -764,7 +830,7 @@ export function createMain(E: MainEnv) {
         // the turn may not be over: a Stop hook other than ours can still block this Stop (continueTurn); the prompt's outputs stay for its next Stop
         const was = J().get('main', g.id)!, since = was.wall_since as string | undefined, wmenu = was.wall_menu as string | undefined
         openTools.delete(g.id)
-        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
+        setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, ...(since ? { wall_since: null, wall_refused_at: null, probes: null, retry_at: null, kind: null, wall_menu: null } : {}) })
         if (since) E.tellJoey(`主線恢復了（${String(since).slice(11, 16)} UTC 起不能用模型），保留的訊息現在交給它。${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')   // PL4: the episode ends at the main's own Stop
         void pump()
         return {}
@@ -775,12 +841,25 @@ export function createMain(E: MainEnv) {
         const err = String(b.error ?? 'unknown')
         // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn). The account wall below is unchanged
         if (!ACCOUNT_WALL.has(err)) { if (p) outputs.delete(p); failTurn(g, p, err); return {} }
-        const back = requeue(r => r.gen === g.id && (!p || r.prompt_id === p), `stop_failure:${err}`)
+        const reason = `stop_failure:${err}`
+        const back = items(r => (r.state === 'bound' || r.state === 'offered') && r.gen === g.id && (!p || r.prompt_id === p))
+        const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
+        for (const r of back) {
+          const output = r.state === 'bound' && r.kind !== 'digest' ? outputOf(g, r) : null
+          if (hasOutput(output)) {
+            holdCut([r], reason, new Map([[r.id, outputBy(output)]]))
+            continue
+          }
+          const refused = r.state === 'bound' && r.kind === 'joey' && (err === 'rate_limit' || wall?.walled)
+          if (refused) E.blocked?.(r, wall?.resets_at ?? null)
+          J().write('msg', r.id, 'queued', { reason, gen: null, prompt_id: null, via_pull: null, waited: 'wall',
+            ...(refused ? { wall_blocked: p || r.id } : {}) })
+        }
         if (p) outputs.delete(p)
         const cur = J().get('main', g.id)!
         // the main's own wall: one episode (wall_since) until its next Stop; each failed probe backs off
         const first = !cur.wall_since, probes = first ? 0 : Number(cur.probes ?? 0) + 1
-        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), probes,
+        setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), probes,
           retry_at: Date.now() + backoff(err, probes) })
         if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${back.length + items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}
@@ -953,13 +1032,15 @@ export function createMain(E: MainEnv) {
         // Once per episode (the alarm does not fire again until a hook event ends it), and no timer of its own. A walled gen's probe item waits for
         // its next retry time like any probe.
         for (const r of again) J().write('msg', r.id, 'queued', { reason: backReason(r, 'stuck_unbound'), gen: null, prompt_id: null, via_pull: null, ...(g.state === 'idle' ? { reoffered: g.id } : {}) })
-      } else if (take && !offered.length) {
+      } else if ((take || (g.state === 'walled' && wallDelivery(g).clear != null)) && !offered.length) {
         // WO-157c (Chiron 15:25Z, 1): a colleague's, a scheduler's or an alert's item of an interrupted turn that no new turn took within MAIN_STUCK_MS goes
         // the untaken path above: Joey is told (the same words) and it is offered once more, now leading an offer (with Chiron's line in front). Joey's own
         // items never go this way: they wait for the next delivery. WO-177 一: only while the record says the main can take one, counted from then.
         // WO-201 (Chiron mesh-13184): an item whose turn a dead process, another session or a StopFailure cut after the model had answered it (`cut_by`) goes
         // this way too, Joey's own included: an Esc is Joey stopping it; a process that died is not, and with no next delivery nothing else would wake it
-        const cutOld = items(r => heldCut(r) && owed(r) && (r.kind !== 'joey' || !!r.cut_by) && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), from) > MAIN_STUCK_MS)
+        const wall = wallDelivery(g)
+        const quietFrom = Math.max(from, wall.clear ?? 0)
+        const cutOld = items(r => !wall.active && heldCut(r) && owed(r) && (r.kind !== 'joey' || !!r.cut_by) && forGen(r, g) && now - Math.max(Date.parse(String(r.cut_at ?? r.ts)), quietFrom) > MAIN_STUCK_MS)
         // WO-201 (Chiron mesh-13191): when every such item is one a dead process, another session or a StopFailure cut (`cut_by`), it is not stuck: an
         // interrupted turn waited MAIN_STUCK_MS with nothing coming in to ride. It is offered alone once and nobody is told: no main-stuck push, no stuck
         // episode (so no main-unstuck either); before 1.59.1 such an item was offered again at once and Joey heard nothing. Any item without `cut_by`
@@ -996,7 +1077,7 @@ export function createMain(E: MainEnv) {
     return rs.map(r => r.id)
   }
 
-  return { initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, statusIdle, turnWork, turnStart, openTool,
+  return { wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 

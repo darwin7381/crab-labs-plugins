@@ -133,7 +133,7 @@ export function targetOf(row: Record<string, unknown>, ctx: Pick<RouteTapCtx, 'm
   if (!m) return 'held:offline'
   if (m.state === 'idle') return m.offered ? 'main_after_step' : 'main_now'
   if (m.state === 'in_turn') return 'main_after_step'
-  if (m.state === 'walled') return 'held:wall'
+  if (m.state === 'walled') return m.personProbe ? (m.offered ? 'main_after_step' : 'main_now') : 'held:wall'
   if (m.state === 'starting') return 'held:starting'
   return 'held:offline'
 }

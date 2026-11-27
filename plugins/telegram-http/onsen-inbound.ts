@@ -79,6 +79,7 @@ export type Facts = {
   /** the caption an album item contributes (its own caption, entities expanded) */
   caption?: string
   /** not from Telegram's own message: built from a person_message payload (its picture may be in Onsen only) */
+  onsenId?: string
   onsenFiles?: Array<{ kind?: string | null; name?: string | null; mime?: string | null; bytes?: number | null; url?: string | null }>
   /** WO-197 (Chiron 15:27Z; 16:1xZ mesh-12795, rule A): the person_message's client.meta (what the bridge sent as client_meta; Onsen does not read
    *  it): each key an attribute of the tag of the same name, as is; it overrides what the tag derived from the person_message (reply_to_*, forward_*,

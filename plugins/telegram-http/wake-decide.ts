@@ -47,6 +47,8 @@ export type WakeItem = {
 }
 export type WakeState = {
   member: MemberState | string
+  /** The receiver classified this delivery as a person's, and the session's refusal cooldown has elapsed. */
+  personProbe?: boolean
   lane_free?: boolean
   /** the line the item's conversation belongs to (router tables: its thread, a reply to our message, the quoted lane message, the worker topic, the
    *  ticket's worker, the incident's lane, the lane that asked for a decision): 'main', a lane kind, or null */
@@ -151,6 +153,9 @@ function resolve(dest: string, mapName: string | undefined, state: WakeState, t:
 /** the one decision. `agentRules` (router.json wake_rules + legacyAgentRules) are read before the fleet table. */
 export function decideWake(item: WakeItem, state: WakeState, table: WakeTable, agentRules: WakeRule[] = []): WakeVerdict {
   const urgency = (item.urgency ?? (table.urgency_default[String(item.kind)] as Urgency | undefined) ?? 'ordered') as Urgency
+  if (state.member === 'walled' && state.personProbe != null) {
+    return { target: state.personProbe ? 'main_now' : 'held:wall', ...(!state.personProbe ? { then: 'main' } : {}), urgency, rule: 'person-wall', origin: 'fleet' }
+  }
   for (const r of [...agentRules, ...table.rules]) {
     if (!ruleMatches(r, item, state, urgency)) continue
     let dest = r.to
