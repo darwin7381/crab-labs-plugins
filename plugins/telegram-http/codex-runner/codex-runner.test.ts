@@ -37,6 +37,7 @@ class FakeOnsen {
   files = new Map<string, { name: string; mime: string; bytes: Buffer; by: string }>()
   idem = new Map<string, string>()
   sends: any[] = []
+  bodyMax = 4000                      // Onsen's result.body.text limit (onsen_calls.py RESULT_MAX)
   records: any[] = []
   facts: any[] = []
   observations: any[] = []
@@ -94,6 +95,7 @@ class FakeOnsen {
       const b = await req.json() as any
       const rank: Record<string, number> = { queued: 0, accepted: 1, running: 2, completed: 3, failed: 3, cancelled: 3 }
       if (b.state !== c.state && (rank[c.state]! >= 3 || rank[b.state]! < rank[c.state]!)) return this.j(400, { error: { code: 'invalid_request', message: `now ${c.state}` } })
+      if ((b.result?.body?.text ?? '').length > this.bodyMax) return this.j(400, { error: { code: 'invalid_request', message: `result.body.text ${b.result.body.text.length} 字，上限 ${this.bodyMax}` } })
       if (b.result?.attachment_file_ids?.some((id: string) => !this.files.has(id) || this.files.get(id)!.by !== 'codex')) return this.j(400, { error: { code: 'invalid_request', message: 'not yours' } })
       this.puts.push({ call: c.id, state: b.state, session_id: b.session_id, result: b.result, at: Date.now() })
       c.state = b.state
@@ -171,6 +173,52 @@ async function until(cond: () => boolean, ms = 10_000, what = 'condition'): Prom
   while (!cond()) { if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await Bun.sleep(20) }
 }
 const done = (o: FakeOnsen, id: string) => () => ['completed', 'failed'].includes(o.calls.get(id)?.state ?? '')
+
+describe('a long answer (Chiron mesh 13227: over 4000, the Call never completed and the caller got nothing)', () => {
+  for (const n of [5000, 15000]) test(`${n} characters: the Call completes with a body within 4000, the whole answer attached; the reply goes back`, async () => {
+    const { onsen, cfg } = setup()
+    process.env.FAKE_CODEX_ANSWER = 'x'.repeat(n)
+    onsen.call(`9${n}`, 'chiron', 9000 + n)
+    onsen.push({ sender: 'chiron', payload: { text: `寫一份很長的 ${n}`, msg_id: 9000 + n }, dedupe: `msg:${9000 + n}`, call_id: `9${n}` })
+    const r = runner(cfg)
+    await r.start()
+    try {
+      await until(() => done(onsen, `9${n}`)() && onsen.sends.length === 1, 15_000, `Call 9${n} and its reply`)
+    } finally { delete process.env.FAKE_CODEX_ANSWER }
+    expect(onsen.calls.get(`9${n}`)!.state).toBe('completed')
+    const fin = onsen.puts.at(-1)!
+    expect((fin.result.body.text as string).length).toBeLessThanOrEqual(4000)
+    expect(fin.result.body.text).toContain('（全文在附件 codex-answer-')
+    expect(fin.result.attachment_file_ids?.length).toBeGreaterThanOrEqual(1)
+    expect(String(onsen.sends[0].payload.text).length).toBeLessThanOrEqual(4000)
+  }, 30_000)
+  test('Onsen refusing even that (a lower limit): a short body ends the Call, and the reply still goes back', async () => {
+    const { onsen, cfg, log } = setup()
+    onsen.bodyMax = 2000
+    process.env.FAKE_CODEX_ANSWER = 'y'.repeat(6000)
+    onsen.call('9700', 'chiron', 9700)
+    onsen.push({ sender: 'chiron', payload: { text: '寫一份很長的', msg_id: 9700 }, dedupe: 'msg:9700', call_id: '9700' })
+    const r = runner(cfg)
+    await r.start()
+    try {
+      await until(() => done(onsen, '9700')() && onsen.sends.length === 1, 15_000, 'Call 9700 and its reply')
+    } finally { delete process.env.FAKE_CODEX_ANSWER }
+    expect((onsen.puts.at(-1)!.result.body.text as string).length).toBeLessThanOrEqual(1500)
+    expect(log.some(l => /Call 9700 completed: HTTP 400/.test(l))).toBe(true)
+    expect(log.some(l => /no reply sent/.test(l))).toBe(false)
+  }, 30_000)
+  test('a Call already over: 400 on completed is still "over" (no reply)', async () => {
+    const { onsen, cfg, log } = setup()
+    onsen.call('9800', 'chiron', 9800)
+    onsen.push({ sender: 'chiron', payload: { text: '做點事 SLEEP:2', msg_id: 9800 }, dedupe: 'msg:9800', call_id: '9800' })
+    const r = runner(cfg)
+    await r.start()
+    await until(() => onsen.calls.get('9800')!.state === 'running', 10_000, 'running')
+    onsen.calls.get('9800')!.state = 'cancelled'
+    await until(() => log.some(l => /9800.*no reply sent|the Call took no completed/.test(l)), 15_000, 'over: no reply')
+    expect(onsen.sends.length).toBe(0)
+  }, 30_000)
+})
 
 describe('a Call', () => {
   test('[2] accepted → running → completed: the attachment in, the picture out, the answer back to the caller', async () => {

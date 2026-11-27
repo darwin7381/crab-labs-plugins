@@ -59,7 +59,8 @@ export const ROLE = '外部模型（OpenAI Codex CLI）：審設計、寫程式�
 export const DISPLAY_NAME = 'Codex'
 export const TOOL = 'codex exec'
 const SEND_TEXT_MAX = 4000            // Onsen /send payload.text
-const RESULT_MAX = 30_000             // a Call's result body (the full answer is attached as a file beyond it)
+const RESULT_MAX = 4000               // a Call's result body: Onsen's result.body.text limit (onsen_calls.py RESULT_MAX); 400 beyond it
+const RESULT_ATTACH_AT = 3500         // an answer longer than this goes along whole as a file (the body keeps room for the notes)
 const SAY_MAX = 100_000               // an answer recorded in Joey's conversation (Onsen keeps up to 200 000)
 
 export type Cfg = {
@@ -787,7 +788,7 @@ export class CodexRunner {
         else if (files.length < this.cfg.maxFiles) files.push(rel)
         else over.push(rel)
       }
-      if (j.result_text.length > RESULT_MAX) {                 // the full answer goes along as a file: it takes one of the slots
+      if (j.result_text.length > RESULT_ATTACH_AT) {           // the full answer goes along as a file: it takes one of the slots
         if (files.length >= this.cfg.maxFiles) over.push(files.pop()!)
         files.unshift(`last-${j.n}.txt`)
       }
@@ -837,13 +838,17 @@ export class CodexRunner {
       if (j.source === 'call') {
         if (!j.steps.state && j.call_id) {
           const st = j.outcome === 'completed' ? 'completed' : 'failed'
-          const body = cut(j.result_text ?? '', RESULT_MAX) + (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '') + this.threadLine(j)
+          const body = this.resultBody(j, RESULT_MAX)
           let r = await this.put(j, st, { body: { format: 'markdown', text: body }, ...(ids.length ? { attachment_file_ids: ids } : {}) })
-          if (r === 'gone' && ids.length) {                   // its files refused (swept after a long outage): the words still land
-            r = await this.put(j, st, { body: { format: 'markdown', text: `${body}\n\n（${ids.length} 個檔案沒能附上；在 Mac mini 的 ${j.dir}）` } })
+          if (r === 'invalid' && ids.length) {                // its files refused (swept after a long outage): the words still land
+            r = await this.put(j, st, { body: { format: 'markdown', text: cut(`${this.resultBody(j, RESULT_MAX - 120)}\n\n（${ids.length} 個檔案沒能附上；在 Mac mini 的 ${j.dir}）`, RESULT_MAX) } })
+          }
+          if (r === 'invalid') {                              // still refused: a short body, so the Call ends; the full answer goes in the reply
+            r = await this.put(j, st, { body: { format: 'markdown', text: this.resultBody(j, 1500) } })
           }
           if (r === 'retry') return void (retry = true)
           if (r === 'gone') { j.steps.reply = true; this.log('warn', `${j.id}: the Call took no ${st} (over, or not ours): no reply sent`) }
+          else if (r === 'invalid') this.log('warn', `${j.id}: the Call refused its ${st} three times (see the lines above); the answer still goes back as a reply`)
           j.steps.state = true; this.save()
         }
         if (!j.steps.reply) {
@@ -880,7 +885,18 @@ export class CodexRunner {
     this.pump()
   }
   /** PUT /v1/calls/<id>/state; 'gone' when Onsen says the Call can no longer take it (over, not ours), 'retry' on no answer */
-  private async put(j: Job, state: string, result?: Record<string, unknown>): Promise<'ok' | 'gone' | 'retry'> {
+  /** the result body: the answer cut to fit, a note that the whole answer is attached when it is, then the files left out and the thread line;
+   *  never longer than max (Onsen refuses a longer one with 400) */
+  private resultBody(j: Job, max: number): string {
+    const extras = (j.skipped_files?.length ? `\n\n${j.skipped_files.map(s => `- ${s}`).join('\n')}` : '') + this.threadLine(j)
+    const text = j.result_text ?? ''
+    const whole = (j.files ?? []).includes(`last-${j.n}.txt`)
+    if (text.length + extras.length <= max) return text + extras
+    const note = whole ? `\n\n（全文在附件 codex-answer-${j.n}.md）` : '\n\n（太長，後面截掉了）'
+    return cut(cut(text, Math.max(200, max - extras.length - note.length - 1)) + note + extras, max)
+  }
+
+  private async put(j: Job, state: string, result?: Record<string, unknown>): Promise<'ok' | 'gone' | 'invalid' | 'retry'> {
     let r: Answer = null
     try {
       r = await this.onsen.req('PUT', `/v1/calls/${encodeURIComponent(j.call_id!)}/state`, { state, session_id: 'main', at: this.iso(),
@@ -889,6 +905,14 @@ export class CodexRunner {
     if (r?.status === 200) return 'ok'
     if (r && [400, 403, 404].includes(r.status)) {
       this.log('warn', `${j.id}: Call ${j.call_id} ${state}: HTTP ${r.status} ${JSON.stringify(r.json?.error?.message ?? r.json?.detail ?? '').slice(0, 200)}`)
+      // a 400 is either a Call already over (Onsen: 呼叫現在是 completed，不能改成 …) or what we sent was refused (too long, a file not
+      // ours): Onsen gives both invalid_request, so ask the Call. Over → 'gone'; still open → 'invalid', and the caller of put tries a
+      // smaller body; the answer is never dropped silently
+      if (r.status === 400) {
+        let st: string | undefined
+        try { st = (await this.onsen.req('GET', `/v1/calls/${encodeURIComponent(j.call_id!)}`))?.json?.data?.state } catch {}
+        if (st && !['completed', 'failed', 'cancelled'].includes(st)) return 'invalid'
+      }
       return 'gone'
     }
     this.log('warn', `${j.id}: Call ${j.call_id} ${state}: ${r ? `HTTP ${r.status}` : 'no answer'}; sent again later`)
@@ -898,6 +922,7 @@ export class CodexRunner {
   private async callState(j: Job, state: 'accepted' | 'running'): Promise<'ok' | 'gone' | 'retry'> {
     if (!j.call_id) return 'ok'
     const r = await this.put(j, state)
+    if (r === 'invalid') return 'ok'                        // no body here: nothing of ours to shrink (as before, it goes on)
     if (r === 'gone' && state === 'accepted') {
       let c: Answer = null
       try { c = await this.onsen.req('GET', `/v1/calls/${encodeURIComponent(j.call_id)}`) } catch {}
