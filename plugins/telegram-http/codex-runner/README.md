@@ -115,7 +115,8 @@ bun codex-runner.ts --profile       # once: display name Codex, role 外部模�
 | `CODEX_RUNNER_DEV_TIMEOUT_S` | `3600` | a `#dev` item's limit; stopped there, it goes on once in the same session before it counts as failed |
 | `CODEX_RUNNER_DEV_REPOS` | the four below | more `#dev` shortcuts, `name=/abs/path,…` (bt-control-center, fleet-core, crab-labs-plugins, Joey-Crablabs-Skills are built in; any absolute path to a local git repo works without one) |
 | `CODEX_RUNNER_DEV_PG` | `postgresql://postgres@127.0.0.1:55432` | the throwaway PostgreSQL the `#dev` brief names |
-| `CODEX_RUNNER_MODEL`, `CODEX_RUNNER_EFFORT` | unset | the runner's own model and reasoning effort (`minimal`…`xhigh`): every run gets `-m <model> -c model_reasoning_effort="<effort>"`, and `--setup` writes them into Codex's own `config.toml`. Never the personal `~/.codex/config.toml`'s (Chiron mesh 13227). Unset: Codex's own home's config decides |
+| `CODEX_RUNNER_MODEL`, `CODEX_RUNNER_EFFORT` | unset | the runner's own model and reasoning effort (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`: the CLI's list): every run gets `-m <model> -c model_reasoning_effort="<effort>"`, and `--setup` writes them into Codex's own `config.toml`. Never the personal `~/.codex/config.toml`'s (Chiron mesh 13227). Unset: Codex's own home's config decides |
+| `CODEX_RUNNER_DEV_EFFORT` | `max` | the effort of a `#dev` item (Chiron #200750); ordinary calls keep `CODEX_RUNNER_EFFORT`. `ultra` is accepted, not the default (not measured with the sandbox and the time limit) |
 | `CODEX_RUNNER_AGENT` | `codex` | the member name (must be the credential's identity) |
 | `CODEX_RUNNER_WAIT_S` | `25` | the long polls |
 | `CODEX_RUNNER_CODEX_HOME` | `<root>/.codex-home` | Codex's own home (`CODEX_HOME` for the child); `inherit`: the inherited one |

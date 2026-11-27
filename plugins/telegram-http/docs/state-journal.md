@@ -6,7 +6,7 @@ the agent-inbox daemon). Every other component asks the tg daemon.
 | | mechanism | record | moved by |
 |---|---|---|---|
 | M1 | delivery ledger | one `msg` per item for the main | the main's hook events |
-| M2 | main record | one `main` per main process (gen = pid) | the main's hook events, plus one `kill -0` |
+| M2 | main record | one `main` per main process (gen = pid) | hook events, adoption from the session registry, and the pid check |
 | M3 | event record with obligations | one `event` per inbound event | the router, the lane's own tool calls, the run's exit |
 | M4 | wake rule | `wake` lines, which log decisions and are not folded | M2 phase × what M3 owes the main |
 | M5 | run record | one `run` per lane run | the lane process: spawn, its result JSON, its exit code |
@@ -147,6 +147,16 @@ Other fields: `pid`, `session_id`, `transcript_path` (read for one question only
 prompt whose Stop made it idle (a later event of that prompt re-opens the turn; see "A turn ends at its last Stop"). `owed_hold` (the prompt) and
 `owed_events` (002q): the turn that the Stop check held because it still owed Joey a line, and those events (see "The main's Stop" below).
 
+With no live gen, a registry change or the five-second tick can register the status source's main with `source: 'adopt'`.
+Its session must be expected and its OS process start must match the registry file. After 60 seconds of disagreement,
+Joey gets the agent, session, pid and reason once. Registering a live gen rearms the notice.
+
+A main turn cut by StopFailure or process loss with no delivery item records `cut_turn` with `at` (epoch ms) and `why`.
+A model error adds `retry_at`. A process loss can include `background_agents` from that session at the cut.
+When program delivery is possible and there is no candidate, a successful continuation writes `resume_sent = cut_turn.at`
+and increments `resumes`. The next gen inherits all three fields. The main's own final Stop clears the cut and its receipt.
+`resumes` retains the agent's total.
+
 **What a turn of the main works on** (002w B) is one set, M1's `turnWork(gen, prompt)`: the items bound to the prompt (not the digest) and their events;
 for a turn that took in nothing (its own background task's notification opened it; Claude Code starts such turns on its own), the work the gen carries
 on: the last turn that took items in (the gen's `work`: those items' aid view, their ids and their event ids, and every output since). Every per-turn duty
@@ -209,9 +219,8 @@ that took in nothing the owed hold asked nothing, mark_no_reply marked nothing, 
 - **One owner of the limit menu** (002y, X-1; 002x T7-R, every play, e.g. u002x-T7-s6-r3: main-wall-up msg 2013 @1232.0, the startup-picker
   watchdog's 「🔀 claude 停在一個選單，請選擇」 with buttons msg 2015 @1234.2, the probe's choice @1277.8). Two parts read the main's pane: the
   startup-picker watchdog (server.ts, an 8 s poll; it rang Joey with the menu at once) and this mechanism (the probe chose for him 44 s later). The
-  probe chooses option 2 of the T7-R menu, 「Wait here, then continue automatically at …」 (`pickContinueOption`: an option that continues first,
-  then one that waits; never one that could spend money or change the plan or model: upgrade, extra usage, request more, add funds, buy, billing,
-  pay, credit, a currency sign, plan, a model name, do not continue, exit, trust, delete). With lanes on, the menu is this mechanism's while the
+  probe chooses “Stop and wait for limit to reset” (option 1 on the T7-R menu). The probe delivers the retry when the keeper clears.
+  “Wait here, then continue automatically” would schedule a second wake. A menu with no safe passive wait is re-armed for Joey. With lanes on, the menu is this mechanism's while the
   gen's wall episode is open (`wall_since`), and a limit menu (an option speaks of a limit, usage or a reset) on a gen still `in_turn` (the menu is
   drawn when the limit cuts the turn; the StopFailure can reach the daemon after the watchdog's poll): `mainMenuOwned`, passed to the watchdog as
   its `owner` for the main's pane. The watchdog does not send an owned menu unless the owner re-armed it (`rearmStartupPicker`): the probe found

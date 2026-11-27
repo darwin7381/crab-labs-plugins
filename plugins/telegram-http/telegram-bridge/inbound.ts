@@ -5,8 +5,8 @@
 //             one that needs no write (a button, /start, a pairing reply, a dropped message). The first update not done holds the offset, so
 //             nothing unwritten is ever confirmed: a restart gets it again.
 //   gate      that agent's own access.json, as its daemon reads it (tg-access.ts): DM allowlist and pairing, group policy and mentions.
-//   write     a person's message: its file fetched from Telegram (≤ 20 MB, onsen-files.ts telegramFile) and stored with POST /v1/files, a voice
-//             note's local transcript (whisper, as the daemon's CHANNEL_BOT_VOICE_TRANSCRIBE), then POST /v1/bridge/messages (idem_key
+//   write     a person's message: its file fetched from Telegram (≤ 20 MB, onsen-files.ts telegramFile) and stored with POST /v1/files,
+//             then POST /v1/bridge/messages (idem_key
 //             tg:<agent>:<chat>:<message id>). Only when Onsen took it: 👀 (access.json ackReaction; unset = 👀, '' = none) and done. An edit:
 //             POST /v1/bridge/messages/edit; a reaction: POST /v1/bridge/reactions. Writes go strictly in order, one at a time per bot.
 //   Onsen down a write Onsen does not take (no answer, 5xx, 429, 401, 404 no_endpoint) is tried again (2 s, 4 s, then every 5 s) and holds every
@@ -16,9 +16,6 @@
 //             saying it was not handed over.
 //   local     /start and /help in a DM: the bridge answers (the daemon's text). Any other /command goes to Onsen as a message, kind `command`.
 //             A button: an Action's option → POST /v1/bridge/actions/<id>/resolve; 「不要顯示這則」 under the pinned status → dismissed here.
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { execFile } from 'node:child_process'
 import { expandHiddenEntities } from '../entities.ts'
 import { forwardFrom, inboundShape } from '../onsen-client.ts'
 import { mimeOf, telegramFile, TG_BOT_FILE_MAX } from '../onsen-files.ts'
@@ -54,7 +51,6 @@ export type PollerDeps = {
   noteTopic?: (member: string, chat: string, thread: string, name: string) => void
   /** a button the outbound side owns (the restart line, stage two); true = handled */
   onButton?: (a: Agent, cq: any) => Promise<boolean>
-  voice?: { on: boolean; cmd: string; whisper: string; model: string; dir: string }
   pollTimeoutS?: number
   /** the Onsen-down sentence after this long (default SORRY_MS, 15 s) */
   sorryMs?: number
@@ -65,7 +61,6 @@ export type PollerDeps = {
 }
 /** how long an album's items are waited for after its newest one arrived (server.ts ALBUM_WINDOW_MS, 1.5 s), so media_group_count is known */
 export const ALBUM_MS = 1_500
-const CLIENT_META_MAX = 4_000
 const META_UNKNOWN = /(不收的欄位|unknown)[^；;]*client_meta/i
 
 /** the facts of a person's Telegram message that §7d's named fields do not carry, under the attribute names server.ts puts on the <channel> tag
@@ -85,7 +80,7 @@ export function tagForwardFrom(m: any): string | null {
 /** a Telegram 409 (another program still polls the bot, e.g. its daemon handing it over): look again this often (Chiron 18:00Z) */
 export const TG_CONFLICT_RETRY_MS = 3_000
 
-export function clientMetaOf(m: any, o: { fromReply?: boolean; transcript?: string | null; imageError?: boolean; albumCount?: number } = {}): Record<string, string> {
+export function clientMetaOf(m: any, o: { fromReply?: boolean; imageError?: boolean; albumCount?: number } = {}): Record<string, string> {
   const out: Record<string, string> = {}
   const rt = m?.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
   if (rt?.from) out.reply_to_user_id = String(rt.from.id)                          // server.ts replyForwardMeta (1.58.24 :3937)
@@ -109,11 +104,6 @@ export function clientMetaOf(m: any, o: { fromReply?: boolean; transcript?: stri
   }
   if (o.imageError) out.image_error = 'download failed'                             // :4280 (one photo), :4478 (an album's)
   if (o.albumCount && o.albumCount > 0 && m?.media_group_id) out.media_group_count = String(o.albumCount)   // flushAlbum :4465
-  if (o.transcript) out.voice_transcript = o.transcript                             // :4297 (maybeTranscribeVoice :4582: metaExcerpt, 500)
-  // ≤ 4 KB as JSON (Onsen's limit; counted in UTF-8 bytes): the transcript, the only long value, is cut until it fits (… marks the cut)
-  const bytes = () => new TextEncoder().encode(JSON.stringify(out)).length
-  while (bytes() > CLIENT_META_MAX && out.voice_transcript && out.voice_transcript.length > 1) out.voice_transcript = out.voice_transcript.slice(0, Math.floor(out.voice_transcript.length * 0.9)) + '…'
-  if (bytes() > CLIENT_META_MAX) delete out.voice_transcript
   return out
 }
 
@@ -419,7 +409,7 @@ export class Poller {
       if (thread && e.cache.body.topic_name) this.d.noteTopic?.(a.member, chat, thread, e.cache.body.topic_name)
     }
     const body = e.cache.body
-    // the file: fetched from Telegram once (kept across tries), stored in Onsen; a voice note's transcript from the same bytes
+    // The file is fetched from Telegram once and kept across upload retries.
     const att = body.attachments[0]
     if (att?.client_ref && !e.cache.fileDone) {
       if (!e.cache.got) {
@@ -429,11 +419,6 @@ export class Poller {
           e.cache.fileDone = true; e.cache.notStored = true
         } else e.cache.got = got
       }
-      if (e.cache.got && (m.voice || m.audio) && this.d.voice?.on && e.cache.transcript === undefined) {
-        e.cache.transcript = await transcribe(e.cache.got.bytes, `${chat}-${m.message_id}`, this.d.voice, this.d.log) ?? null
-        // Chiron 15:40Z: a voice note with a caption keeps the caption as its text; the transcript then rides only in client_meta.voice_transcript
-        if (e.cache.transcript && !(typeof m.caption === 'string' && m.caption.trim())) body.text = e.cache.transcript
-      }
       if (e.cache.got && !e.cache.fileDone) {
         const r = await this.d.onsen.upload(e.cache.got.bytes, { key: body.idem_key, name: att.name ?? e.cache.got.name ?? null, mime: att.mime })
         if ('id' in r) { body.attachment_file_ids = [r.id]; e.cache.fileDone = true; e.cache.got = null }
@@ -441,7 +426,7 @@ export class Poller {
         else { this.d.log('warn', `${a.member}: the file of tg:${m.message_id} is not stored in Onsen: ${r.error}`); e.cache.fileDone = true; e.cache.got = null; e.cache.notStored = true }
       }
     }
-    const meta = clientMetaOf(m, { fromReply: e.cache.fromReply, transcript: e.cache.transcript ?? null, imageError: !!(e.cache.photo && e.cache.notStored),
+    const meta = clientMetaOf(m, { fromReply: e.cache.fromReply, imageError: !!(e.cache.photo && e.cache.notStored),
       albumCount: m.media_group_id ? this.albums.get(`${chat}:${m.media_group_id}`) : undefined })
     const cm = this.d.clientMeta
     const withMeta = Object.keys(meta).length > 0 && !(cm && this.now() < cm.offUntil)
@@ -512,29 +497,6 @@ export class Poller {
 /** Onsen's attachment kind (CONTRACT §4) of a Telegram record kind (onsen-client.ts inboundShape) */
 export function attKind(k: string): string {
   return k === 'photo' ? 'photo' : k === 'document' ? 'document' : k === 'voice' ? 'voice' : k === 'video' ? 'video' : 'other'
-}
-
-/** a voice note's text, from local whisper (server.ts transcribeVoiceFile 4225-4254: CHANNEL_BOT_TRANSCRIBE_CMD, else `whisper` on CPU); undefined on
- *  any failure (the message goes without a transcript, as the daemon's) */
-export async function transcribe(bytes: Uint8Array, base: string, v: NonNullable<PollerDeps['voice']>, log: Log): Promise<string | undefined> {
-  const dir = join(v.dir, 'voice'), name = base.replace(/[^0-9a-zA-Z_-]/g, '_')
-  const audio = join(dir, `${name}.oga`), txt = join(dir, `${name}.txt`)
-  const run = (cmd: string, args: string[]) => new Promise<string>((res, rej) =>
-    execFile(cmd, args, { timeout: 240_000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => err ? rej(err) : res(String(out))))
-  try {
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
-    writeFileSync(audio, bytes, { mode: 0o600 })
-    let text: string
-    if (v.cmd) text = await run(v.cmd, [audio])
-    else {
-      await run(v.whisper, [audio, '--model', v.model, '--device', 'cpu', '--fp16', 'False', '--output_format', 'txt', '--output_dir', dir, '--verbose', 'False'])
-      text = readFileSync(txt, 'utf8')
-    }
-    return text.trim() ? metaExcerpt(text, 500) : undefined
-  } catch (e) {
-    log('warn', `voice transcription failed (the message goes without a transcript): ${errText(e)}`)
-    return undefined
-  } finally { for (const f of [audio, txt]) { try { rmSync(f, { force: true }) } catch {} } }
 }
 
 export { TG_BOT_FILE_MAX }

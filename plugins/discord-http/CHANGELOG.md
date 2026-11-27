@@ -1,3 +1,7 @@
+## 1.14.6 — 2026-11-28 (WO-168 item 8)
+
+- The busy and resume-list checks read the telegram daemon's status record (`/healthz`, `onsen.status`) when `CHANNEL_BOT_STATUS_URL` is set and the record's look is under 5 s old; otherwise as before. Nothing sets that env today.
+
 ## 1.14.5 — 2026-11-17
 
 - **A request without an `Authorization` header now gets 503, not 403.** Same fix as telegram-http 1.32.1 (see its entry): a token-less 401 or 403 makes Claude Code cache "needs auth" machine-wide under the server name, and sessions started within 15 min then skip the server. A wrong token still gets 403. Tests 35/0.

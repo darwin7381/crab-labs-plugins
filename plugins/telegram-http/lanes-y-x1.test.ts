@@ -71,7 +71,7 @@ async function probeAndRecover(pid: number, item: string, k: number): Promise<vo
 }
 const wallUps = (k: number) => sent.slice(k).filter(s => s.includes('主線模型額度用完了')).length
 
-test('002y X-1 (T7-R): the main walls on the limit menu: the main-wall probe chooses 「Wait here, then continue automatically」, the watchdog never rings Joey with the menu, and Joey hears the wall once', async () => {
+test('002y X-1 (T7-R): the main walls on the limit menu: the main-wall probe chooses 「Stop and wait for limit to reset」, the watchdog never rings Joey with the menu, and Joey hears the wall once', async () => {
   const k = sent.length, r0 = rung.length
   const { pid, p, item } = await turn('存取日誌 20 頁的 5xx 幫我數一下')
   pane[MAIN] = LIMIT_PANE(T7)                                                                 // the limit cuts the turn; the menu is drawn
@@ -83,13 +83,13 @@ test('002y X-1 (T7-R): the main walls on the limit menu: the main-wall probe cho
   expect(wlog.some(m => m.includes('the lanes main-wall probe owns it'))).toBe(true)
   drives.length = 0
   await probeAndRecover(pid, item, k)
-  expect(drives).toEqual([{ idx: 1, key: expect.stringMatching(/^generic-/) }])               // option 2, the T7-R choice; never 3 (Upgrade your plan)
+  expect(drives).toEqual([{ idx: 0, key: expect.stringMatching(/^generic-/) }])               // option 1, no automatic continuation
   await sleep(80)
   expect(rung.length).toBe(r0)                                                                // no menu push in the whole episode
   expect(wallUps(k)).toBe(1)
   const told = sent.slice(k)
   expect(told.length).toBe(2)                                                                 // the wall, and its recovery with what was chosen
-  expect(told[1]).toContain('已選「Wait here, then continue automatically at Nov 21, 7:42am」')
+  expect(told[1]).toContain('已選「Stop and wait for limit to reset」')
 })
 
 test('002y X-1: a limit menu whose only options could spend money: the probe chooses nothing and the menu goes to Joey once (he keeps that decision)', async () => {

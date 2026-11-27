@@ -23,8 +23,8 @@
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
-import { createMain, mainContext, type MainApi, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
-import type { CallFacts, TurnTrigger } from './onsen-status.ts'
+import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
+import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
 import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
@@ -171,6 +171,7 @@ export interface LanesDeps {
    *  此刻 line, the same-matter gate, the Esc wrap-up (and, in server.ts, the wake rows' member_state); null = no status here (Onsen step 3 off): the
    *  old path decides */
   mainStatus?: () => { state: string; detail?: Record<string, unknown> } | null
+  registry?: MainEnv['registry']
   /** 1.58.13: the person on a Telegram DM account (its chat id), for its thread's title: display name, else member name; null: not known yet (server.ts
    *  asks Onsen once and then calls refreshDmTitles) */
   dmPerson?: (chat: string) => string | null
@@ -209,6 +210,8 @@ export interface LanesDeps {
   mailTool?: (name: string, args: Record<string, unknown>, lane: string) => Promise<{ text: string; isError: boolean; to?: string; mail_id?: number; deadline?: string; no_reply?: boolean }>
   /** receipt note (btcc-ack-auth): `note` is the run's one line, BTCC's field (scheduler.py complete_run reads note, stores outcome_note; it never read summary) */
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
+  /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
+  registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
   mailWaiting?: () => Promise<{ ok: boolean; items?: Array<{ id: number; title?: string; decide?: string; deadline?: string; overdue?: boolean }>; why?: string }>
@@ -337,7 +340,11 @@ let main: MainApi
 /** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
 function mainEnv() {
   return {
-    journal, agent: D.agent, log: D.log,
+    journal, agent: D.agent, log: D.log, registry: D.registry,
+    // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
+    registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
+      void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
+    },
     offer: async (notif: Notif, via: Via, pid: number): Promise<boolean> => {
       if (via === 'inbox') return !!(await inboxPost('/lanes/offer', { pid, notif }))?.offered
       const sid = sessionOfPid(pid)
@@ -602,10 +609,6 @@ function toolsChangedForPid(pid: number): void {
   for (const [s, p] of mcpSessionPid) if (p === pid) { try { D.toolsChanged?.(s) } catch {} }
 }
 export function isMainMcpSession(sid: string | undefined): boolean { const pid = main?.mainPid(); return !!sid && !!pid && mcpSessionPid.get(sid) === pid }
-function pidAlive(pid: number | null | undefined): boolean {
-  if (!pid) return false
-  try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' }
-}
 export function mainTranscript(): string | null { return main?.mainSession()?.transcript_path || null }
 /** lanes-golive (C4): the main's session id, either daemon: the tg daemon's registered main, else .lanes/main-expected (the launcher writes it before a
  *  start, the tg daemon keeps it current after each accepted SessionStart). null = no main known. */
@@ -1721,6 +1724,7 @@ export function mainStatusChanged(): void {
   idleCheck()
   if (D?.role === 'tg' && main) { try { main.statusChanged() } catch (e) { D.log('warn', `lanes: status change: ${e}`) } }
 }
+export function mainRegistryChanged(): void { main?.registryChanged() }
 /** WO-177 一: a hand-over's event-keyed wake line says what M1 does with its item now (lanes-main deliveryNow: offered to an idle main the status record
  *  says can take one; otherwise it waits, and why), the same answer the offer itself asks */
 function handWake(): { state: 'wake' | 'no_wake'; tail: string } {
@@ -3712,8 +3716,7 @@ function enqueue(ev: InEvent, laneId: string, priority: number, summary?: string
 // that arrives meanwhile is rung through at once, with the reason nobody can look into it.
 // All of it is code: the wall is recognised from the run's own result record (`is_error` + `api_error_status`), never guessed.
 export function wallActive(): boolean { return !!S?.wall }
-/** WO-120 (server.ts heldNow, tg daemon): the items M1 holds for the main right now (queued or offered, digests aside); the usage-wall clear alert
- *  counts them with the daemons' own held items. Read only. */
+/** Items M1 currently holds for the main, for the usage-wall enter notice. */
 export function mainHeldCount(): number {
   try { return D?.role === 'tg' && main ? main.items(r => r.kind !== 'digest' && (r.state === 'queued' || r.state === 'offered')).length : 0 } catch { return 0 }
 }
@@ -3803,23 +3806,20 @@ function bareProbe(model: string, actor: string, cb: (walled: { kind: string; te
 // ------------------------------------------------------------------ 002k (G16, 002j group G): a main parked on a menu reads nothing
 // The limit menu is a TUI state no hook reports, so it stays one pane read:
 //  (a) before the walled main's probe offer (M1, PL4), the main's pane is looked at, before anything is offered to it. A menu there is driven
-//      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that CONTINUES or WAITS, never to one that spends money
+//      (driveStartupPicker re-checks the live pane and the label hash before any key) to the option that waits without scheduling a turn, never to one that spends money
 //      or changes the plan; with no safe option, or when it did not take, the menu is put in front of Joey again (a fresh debounce) and the notice says so;
 //  (b) an idle main that does not take its offer is the M2 stuck rule (lanes-main.ts); the pane is read for that notice;
 //  (c) every menu found is logged with its real option labels (the picker log used to carry only the count).
 const NEVER_PICK = /upgrade|extra usage|switch|request more|add funds|purchase|\bbuy\b|billing|payment|\bpay\b|credit|[$€£¥]|\bplan\b|opus|sonnet|haiku|fable|\bmodel\b|don[’']?t continue|do not continue|never|exit|quit|trust|delete|remove/i
 const PICK_CONTINUE = /continue automatically|resume automatically|keep going|\bcontinue\b/i
 const PICK_WAIT = /stop and wait|wait here|wait for|^wait\b/i
-/** The option that continues or waits: "Wait here, then continue automatically at 3 PM" first, then "Stop and wait for limit to reset". An option that
- *  upgrades, switches model or plan, buys usage or says do not continue is never picked. null = no safe option. */
+/** The connector's probe owns the retry. An automatic continuation would start another turn after the reset. */
 export function pickContinueOption(options: string[]): number | null {
-  const ok = (l: string): boolean => !NEVER_PICK.test(l)
-  let i = options.findIndex(l => ok(l) && PICK_CONTINUE.test(l))
-  if (i < 0) i = options.findIndex(l => ok(l) && PICK_WAIT.test(l))
+  const i = options.findIndex(label => PICK_WAIT.test(label) && !PICK_CONTINUE.test(label) && !NEVER_PICK.test(label))
   return i >= 0 ? i : null
 }
 export type MenuResult = { key: string; options: string[]; chose?: { idx: number; label: string }; result?: 'ok' | 'gone' | 'stuck' | 'error'; resurfaced: boolean }
-/** Look at the main's pane. drive=true: drive the continue / wait option of a LIMIT menu (the pane must speak of a limit, so another menu that happens to
+/** Look at the main's pane. drive=true: drive the passive wait option of a LIMIT menu (the pane must speak of a limit, so another menu that happens to
  *  say "continue" is not touched). A menu that is not driven, or did not clear, is re-armed for Joey. null = no pane, or no menu on it. */
 async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult | null> {
   const mp = D?.mainPicker
@@ -3845,7 +3845,7 @@ async function inspectMainMenu(drive: boolean, why: string): Promise<MenuResult 
  *  With lanes on (server.ts passes this as the watchdog's `owner` for the main's pane) the menu is this mechanism's while the main's wall episode is
  *  open (`wall_since`: walled, or in its probe's turn), and a limit menu (an option speaks of a limit, usage or a reset) on a main still in its turn:
  *  the menu is drawn when the limit cuts the turn, and the StopFailure that walls the gen can reach the daemon after the watchdog's poll. The probe
- *  drives the option that waits or continues (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
+ *  drives the passive wait option (never one that could spend money: pickContinueOption) or re-arms the menu for Joey; the stuck alarm
  *  reads it too (lanes-main). Any other menu (a starting main's resume menu, an idle main's prompt) stays the watchdog's. */
 // lanes-golive (C8): one owner of the main's usage-limit menu. With lanes on it is the lanes main-wall probe (inspectMainMenu, driven from M2). The other
 // actors stand aside: the startup-picker watchdog and the duty officer in this daemon by their `owner` hooks (server.ts), and the programs outside the
@@ -3884,7 +3884,7 @@ export function mainMenuOwned(options: string[]): boolean {
 }
 function menuSentence(m: MenuResult): string {
   const labels = m.options.map((l, i) => `${i + 1}. ${l}`).join('｜')
-  if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，它繼續了。`
+  if (m.chose && m.result === 'ok') return `主線停在一個選單（${labels}），已選「${m.chose.label}」，選單已收起。`
   if (m.chose && m.result === 'gone') return `主線停在一個選單（${labels}），要選「${m.chose.label}」時選單已經不在了（可能別處已經選掉），沒有動作。`
   if (m.chose) return `主線停在一個選單（${labels}），選了「${m.chose.label}」但選單還在，選項已再傳給你，請點一個。`
   return `主線停在一個選單（${labels}），我挑不出一個安全的選項（不碰要付費或換方案的），選項已再傳給你，請點一個。`
@@ -8464,6 +8464,13 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const sid = sessionOfPid(Number(b.pid))
       const offered = !!sid && !!b.notif && !!D.notifySession && await D.notifySession(sid, b.notif)
       sendJson(res, 200, { offered }); return true
+    }
+    if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
+      const b = await readBody(req)
+      const state = b.state === 'open' ? 'open' : 'clear'
+      const text = D.registryAlert ? await D.registryAlert({ state, ...(state === 'open' ? { session: String(b.session ?? '').slice(0, 64), pid: Number(b.pid) || 0, why: String(b.why ?? '').slice(0, 120) } : {}) })
+        : 'no BTCC alert path on this daemon'
+      sendJson(res, 200, { text, ok: /^HTTP 2/.test(text) }); return true
     }
     if (p === '/lanes/scheduler' && req.method === 'POST') {
       const b = await readBody(req)

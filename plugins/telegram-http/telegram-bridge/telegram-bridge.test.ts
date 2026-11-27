@@ -7,8 +7,7 @@ import { join } from 'node:path'
 import { pinLine, statusView } from './agent.ts'
 import { carried, discover, plistEnv, readSettings, readToken, unitEnv } from './agents.ts'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
-import { sorryText, START_TEXT, transcribe } from './inbound.ts'
-import { chmodSync } from 'node:fs'
+import { sorryText, START_TEXT } from './inbound.ts'
 import { Drawer } from './outbound.ts'
 import { Bridge, configFromEnv, endpointRecord, takenOf } from './telegram-bridge.ts'
 import { gate, isMentioned, mayAct, readAccess } from './tg-access.ts'
@@ -63,7 +62,7 @@ function mkBridge(machine: 'macmini' | 'mbp', stateDir: string, extra: Record<st
   const env: NodeJS.ProcessEnv = {
     HOME: home, TELEGRAM_BRIDGE_MACHINE: machine, ONSEN_BASE: onsen.base, TELEGRAM_API_ROOT: tg.root, TELEGRAM_BRIDGE_STATE_DIR: stateDir,
     CRAB_LABS_PLUGINS_ENV: settingsFile, TELEGRAM_BRIDGE_PLATFORM: 'darwin', TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1',
-    TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '0', TELEGRAM_BRIDGE_SORRY_S: '1.5', TELEGRAM_BRIDGE_RETRY_S: '0.2,0.3,0.4',
+    TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_SORRY_S: '1.5', TELEGRAM_BRIDGE_RETRY_S: '0.2,0.3,0.4',
     TELEGRAM_BRIDGE_ONSEN_TIMEOUT_MS: '2000', TELEGRAM_BRIDGE_CONFLICT_RETRY_S: '0.5', TELEGRAM_BRIDGE_HANDOVER_S: '0.5', ...extra,
   }
   return new Bridge(configFromEnv(env), { log: (l, m) => logs.push(`${l} ${m}`) })
@@ -148,18 +147,6 @@ describe('access.json (ported from server.ts)', () => {
     put(join(dir, 'access.json'), '{not json')
     expect(gate(dir, { from: { id: 1 }, chat: { id: 1, type: 'private' } }, 'bot').action).toBe('drop')       // fail closed
     expect(readFileSync(join(dir, 'access.json'), 'utf8')).toBe('{not json')                                        // and left as it is
-  })
-})
-
-describe('voice', () => {
-  test('a voice note is transcribed locally (CHANNEL_BOT_TRANSCRIBE_CMD here) and its files are removed', async () => {
-    const cmd = join(root, 'fake-whisper.sh')
-    writeFileSync(cmd, '#!/bin/sh\ntest -s "$1" && echo "  你好 <世界>  "\n'); chmodSync(cmd, 0o755)
-    const dir = join(root, 'voice-state')
-    const t = await transcribe(new Uint8Array([1, 2, 3]), '42-7', { on: true, cmd, whisper: 'whisper', model: 'small', dir }, () => {})
-    expect(t).toBe('你好 ＜世界＞')                                         // metaExcerpt, as the daemon's voice_transcript
-    expect(existsSync(join(dir, 'voice', '42-7.oga'))).toBe(false)
-    expect(await transcribe(new Uint8Array([1]), 'x', { on: true, cmd: join(root, 'nope'), whisper: 'w', model: 's', dir }, () => {})).toBeUndefined()
   })
 })
 
@@ -540,14 +527,4 @@ describe('the bridge, end to end against the fakes', () => {
     expect(existsSync(join(macDir, 'state.json'))).toBe(true)
     expect(readFileSync(join(macDir, 'state.json'), 'utf8').includes('SECRET')).toBe(false)
   }, T)
-})
-
-describe('voice transcription follows the daemon (Chiron 12794)', () => {
-  test('off unless CHANNEL_BOT_VOICE_TRANSCRIBE=1 or TELEGRAM_BRIDGE_VOICE=1, as the daemon', () => {
-    const base = { HOME: home, TELEGRAM_BRIDGE_MACHINE: 'macmini' }
-    expect(configFromEnv(base as any).voice!.on).toBe(false)
-    expect(configFromEnv({ ...base, CHANNEL_BOT_VOICE_TRANSCRIBE: '1' } as any).voice!.on).toBe(true)
-    expect(configFromEnv({ ...base, TELEGRAM_BRIDGE_VOICE: '1' } as any).voice!.on).toBe(true)
-    expect(configFromEnv({ ...base, CHANNEL_BOT_VOICE_TRANSCRIBE: '1', TELEGRAM_BRIDGE_VOICE: '0' } as any).voice!.on).toBe(false)
-  })
 })

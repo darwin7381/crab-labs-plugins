@@ -95,7 +95,7 @@ import * as Connector from './onsen-connector.ts'
 import type { RoamerTelegram, RoamerHost } from './roamer-telegram.ts'
 import * as OnsenWake from './onsen-wake.ts'
 import { refsOf as threadRefsOf, runOf, type ThreadRefs } from './lanes-threads.ts'
-import { HeldSidecar, WallAlerts, WallReader, wallAte, wallDir, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
+import { WallAlerts, WallReader, type WallState, lanesEnterNote, wallKeeperAlive, clearedLimitTextOf } from './usage-wall.ts'
 import { richToMarkdown } from './rich-inbound.ts'
 
 // lanes-golive: the 002l (D11) startup-menu rules are the lanes daemon's; lanes off, the fleet's rules (startup-picker.ts useLanesMenuRules)
@@ -1099,10 +1099,9 @@ const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
 mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 let persistSeq = 0
 
-// atMs (WO-120): name the file by this time instead of now, so the drain (sorted by name) keeps the original order.
-function persistInbound(notif: { method: string; params: unknown }, atMs?: number): string | null {
+function persistInbound(notif: { method: string; params: unknown }): string | null {
   try {
-    const ts = new Date(atMs ?? Date.now()).toISOString().replace(/[:.]/g, '-')
+    const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const seq = String(++persistSeq).padStart(4, '0')
     const filename = `${ts}-${seq}.json`
     const tmpPath = join(PENDING_DIR, filename + '.tmp')
@@ -1170,31 +1169,13 @@ const RECEIPT_CHECK = process.env.RECEIPT_CHECK !== '0'
 // parked in hub-doorbell/ is handed to the delivery once at start (startListen, drainLeftoverDoorbells).
 
 // ---- WO-120: usage wall (usage-wall.ts) --------------------------------------------------------------------------
-// One state per agent, decided by usage_wall.py (~/.claude/usage-wall/<tmux key>.json). While it says walled, nothing is
-// written into the session: deliveries park in inbox/pending (no re-delivery attempt counted, never quarantined), and a
-// delivery the wall ate before the state flipped is re-persisted once (sweep). At
-// the clear the drain delivers every held item once, in order. No fresh state (keeper dead, OFF, USAGE_WALL_READ=0)
-// → state() is null → everything below behaves exactly as before. Roamers route per target: never matched.
+// The keeper supplies the wall state for M2, the lanes, and the enter/clear notices.
 const wallReader = new WallReader(isRoamerEnabled() ? {} : {
   tmux: process.env.CHANNEL_BOT_TMUX_SESSION || undefined,
   agent: process.env.AGENT_INBOX_SELF || undefined,
   transcriptDirs: [TRANSCRIPT_DIR, process.env.CHANNEL_BOT_PROJECTS_DIR, process.env.KEEPWARM_PROJECTS_DIR]
     .map(d => (d ?? '').trim()).filter(Boolean),
 }, { onChange: (prev, next) => onWallChange(prev, next) })
-/** What this daemon holds now: parked deliveries (lanes on, Telegram daemon: also what M1 holds for the main). */
-function heldNow(): { count: number; oldestMs: number | null } {
-  let count = 0
-  let oldestMs: number | null = null
-  try {
-    for (const f of readdirSync(PENDING_DIR)) {
-      if (!f.endsWith('.json')) continue
-      count++
-      try { const m = statSync(join(PENDING_DIR, f)).mtimeMs; if (oldestMs == null || m < oldestMs) oldestMs = m } catch {}
-    }
-  } catch {}
-  if (Lanes.LANES_ON && !INBOX_ONLY) count += Lanes.mainHeldCount()   // lanes on: what M1 holds for the main (the one entrance)
-  return { count, oldestMs }
-}
 // WO-120 × lanes: with a fresh state, the usage-wall alerts (WallAlerts, tg daemon with SYSTEM_ALERT_FORWARD=1) are the one sender of a wall's two
 // pushes, so the lanes main-wall-up / main-wall-down notices go to the lanes ledger only. Owned only for the kinds usage_wall.py records
 // (rate_limit, billing_error; M2 also walls on login / hold / server errors, which stay its own push), and the down only when the up was owned or the
@@ -1216,53 +1197,16 @@ function mainWallNoticeOwned(rule: 'main-wall-up' | 'main-wall-down', kind: stri
   mainWallUpOwned = false
   return owned
 }
-// <key>.held-<tg|inbox>.json: written from the first wall seen, never removed (the Mac mini watchdog reads it as "this
-// daemon redelivers what a wall ate"); redelivers=false where the daemon can't tell (no transcript dir).
-const heldSidecar = new HeldSidecar({ dir: () => wallDir(), role: INBOX_ONLY ? 'inbox' : 'tg', held: heldNow,
-  redelivers: consumptionCheckAvailable, log })
-// The same item is held once: a sender that retries during a long wall (same content; same message_id / msg_id when it
-// has one, so two real Telegram messages with the same text stay two) is not parked a second time.
-function heldKey(notif: { method: string; params: unknown }): string {
-  const meta = (notif.params as { meta?: Record<string, unknown> } | undefined)?.meta ?? {}
-  return `${deliveryKey(notif)}|${meta.message_id ?? ''}|${meta.msg_id ?? ''}`
-}
-let wallHeldKeys = new Set<string>()
-/** Park one item for the wall; false = the same item is already held. */
-function holdForWall(notif: { method: string; params: unknown }, atMs?: number): boolean {
-  const k = heldKey(notif)
-  if (wallHeldKeys.has(k)) {
-    log('info', `usage wall: the same item is already held — not parked twice (${deliveryKey(notif).slice(0, 80)})`)
-    return false
-  }
-  wallHeldKeys.add(k)
-  const p = persistInbound(notif, atMs)
-  log('info', `usage wall: held ${notif.method} in inbox/pending until the wall clears (${p ? p.split('/').pop() : 'persist failed'})`)
-  return true
-}
 function onWallChange(prev: WallState | null, next: WallState | null): void {
-  if (next?.walled) {
-    log('info', `usage wall: ${next.episode} (${next.kind ?? '?'}, since ${next.since}) — holding every delivery into the session until it clears`)
-    wallHeldKeys = new Set()
-    try {
-      for (const f of readdirSync(PENDING_DIR)) {
-        if (!f.endsWith('.json')) continue
-        try { wallHeldKeys.add(heldKey(JSON.parse(readFileSync(join(PENDING_DIR, f), 'utf8')))) } catch {}
-      }
-    } catch {}
-    heldSidecar.update(next)
-    setImmediate(() => sweepDeliveries())   // re-persist what the wall ate before the state flipped
-    return
-  }
-  if (!prev?.walled) return
-  wallHeldKeys = new Set()
-  heldSidecar.update(next, true)            // the clear: what is held, snapshotted before anything drains
-  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh (as before WO-120)'} — delivering the held items once each, in order`)
+  // 1.59.4 (WO-204 part 2): one line per transition (the WO-120 parking that used to log these is gone); what waits and what goes is M1's (lanes-main)
+  if (!prev?.walled && next?.walled) log('info', `usage wall: ${next.episode} (${next.kind ?? '?'}, since ${next.since}) — a person's message is the probe (WO-200); programs wait for the clear`)
+  if (!prev?.walled || next?.walled) return
+  log('info', `usage wall: ${prev.episode} ${next ? `cleared (${next.cleared_by ?? '?'})` : 'no longer fresh'} — the main's probe releases what the wall held`)
   // WO-141 follow-up (Epeius #200294): the lanes' wall follows in the same step (a clear a model call backs ends it; the state gone stale: the lanes probe now);
   // WO-175 item 3: and the main's items M1 held for the wall are offered in this step (lanes.ts usageWallChanged)
   if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
-  setImmediate(() => { sweepDeliveries(); void drainPendingIfLive() })
 }
-setInterval(() => heldSidecar.update(wallReader.state()), Math.max(250, wallReader.cacheMs())).unref()
+setInterval(() => wallReader.state(), Math.max(250, wallReader.cacheMs())).unref()
 
 // Re-delivery cap. Consumption is inferred from transcript progress, so an agent
 // whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
@@ -1338,7 +1282,6 @@ function sweepDeliveries(): void {
   if (!consumptionCheckAvailable() || recentDeliveries.length === 0) return
   const now = Date.now()
   const newest = newestGenuineAssistantAt()
-  const wall = wallReader.state()   // WO-120
   // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
   const unseen = recentDeliveries.filter(d => d.keys && !d.received)
   const lines = unseen.length ? receiptLines(Math.min(...unseen.map(d => d.at))) : []
@@ -1346,19 +1289,6 @@ function sweepDeliveries(): void {
   for (let i = recentDeliveries.length - 1; i >= 0; i--) {
     const d = recentDeliveries[i]
     const notReceived = !!d.keys && !d.received
-    // WO-120: a delivery the usage wall ate (made before the state flipped, no genuine answer before the wall began) is
-    // re-persisted once, named by its own time so the drain keeps the order, and that push is not counted toward
-    // MAX_REDELIVERIES (never quarantined). The drain delivers it after the clear and tracks that copy from there.
-    if (wallAte(wall, d.at, newest, now)) {
-      if (!d.pendingPath) {
-        const k = deliveryKey(d.notif)
-        deliveryAttempts.set(k, Math.max(0, (deliveryAttempts.get(k) ?? 1) - 1))
-        log('info', `usage wall ${wall!.episode} ate a delivery made ${Math.round((now - d.at) / 1000)}s ago — re-persisted, not counted as a re-delivery; delivered once after the clear`)
-        holdForWall(d.notif, d.at)
-      }
-      recentDeliveries.splice(i, 1)
-      continue
-    }
     // Consumed = the client took THIS delivery (receipt; skipped when it has no meta.ts) and then a
     // genuine (non-API-error) assistant record came strictly after it. An assistant record alone is not
     // enough: on 11-17 it acked 35 deliveries the client had dropped (Atlas btcc 9738).
@@ -1423,14 +1353,11 @@ async function laneRedeliver(notif: { method: string; params: unknown }): Promis
   return (await laneDeliverMesh(notif, undefined, false)) != null
 }
 let replayRunning = false
-// WO-120 (lanes off): inside a usage wall the parked items stay parked (the drain after the clear delivers them), and one replay at a time (the clear
-// kicks a drain that can meet the 30 s timer's or a session-open's; a replay stuck longer than REPLAY_LOCK_MS stops blocking the next one). With lanes
-// on the replay hands each parked item to the router (laneRedeliver), the one entrance: no wall hold in front of it, and 002j's single flight below.
+// Lanes off: allow the ordinary disk replay to recover from a stalled stream write.
 const REPLAY_LOCK_MS = 60_000
 let replayBusySince = 0
 async function replayPendingFromDisk(server: Server): Promise<number> {
   if (!Lanes.LANES_ON) {
-    if (wallReader.walled()) return 0
     if (Date.now() - replayBusySince < REPLAY_LOCK_MS) return 0
     replayBusySince = Date.now()
     try { return await replayPendingFromDiskLocked(server) } finally { replayBusySince = 0 }
@@ -1438,8 +1365,7 @@ async function replayPendingFromDisk(server: Server): Promise<number> {
   // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
   // would each read the same parked file before either removed it: the same message delivered twice (fleet record
   // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
-  // lanes-golive: lanes only (lanes off: WO-120's one-at-a-time above).
-  if (Lanes.LANES_ON && replayRunning) return 0
+  if (replayRunning) return 0
   replayRunning = true
   try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
 }
@@ -1521,12 +1447,10 @@ async function drainPendingIfLive(): Promise<void> {
   // Parking is acceptable; parking SILENTLY is not. Warn once per file so a
   // stuck queue is visible without waiting for someone to stat the directory.
   const now = Date.now()
-  const wall = wallReader.state()   // WO-120: held on purpose inside a wall (no alert); after it, age counts from the clear
   for (const f of files) {
     if (parkAlerted.has(f)) continue
-    if (wall?.walled) break
     let ageMs = 0
-    try { ageMs = now - Math.max(statSync(join(PENDING_DIR, f)).mtimeMs, wall?.clearedMs ?? 0) } catch {}
+    try { ageMs = now - statSync(join(PENDING_DIR, f)).mtimeMs } catch {}
     if (ageMs > PARK_ALERT_AFTER_MS) {
       parkAlerted.add(f)
       log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
@@ -2595,7 +2519,7 @@ function buildServer(): Server {
         '- reply_to_text/reply_to_user/reply_to_message_id: the message being replied to (attachment_origin="reply": the attachment came from it). reply_quote: the passage they quoted.',
         '- forward_origin/forward_from/forward_date: the ORIGINAL author; the outer user only forwarded it.',
         '- Album = ONE message: media_group_count items, photos as image_path/image_path_2/…, documents as numbered attachment_file_id/attachment_name (download EACH). media_group_id without media_group_count: possibly INCOMPLETE; say so.',
-        '- voice_transcript: local speech-to-text of a voice note (may be truncated, trailing …); treat it as what they said; download the audio only if you need the original.',
+        '- voice="true": a voice note; Onsen transcribed it (names may be misheard): treat the text as what they said; if a key word looks wrong, check the attached audio. voice_error: no text made.',
         // lanes-topics (item 2): lanes on only
         ...(Lanes.LANES_ON ? ['- topic/topic_name: written in that topic; a reply to it lands there. reply(topic=…) picks one, "0" = outside.'] : []),
         '',
@@ -2978,7 +2902,7 @@ if (isSystemAlertEnabled()) {
     // WO-120: usage walls are one state — API errors inside one aren't forwarded one by one; enter + clear alerts (with lanes on these are the
     // main's wall notices too: mainWallNoticeOwned)
     wall: () => wallReader.state(),
-    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, dir: () => wallDir(), log,
+    wallAlerts: INBOX_ONLY ? undefined : (wallAlertsOn = true, new WallAlerts({ stateDir: STATE_DIR, log,
       enterToldElsewhere: w => (mainWallToldAt && w.sinceMs != null && Math.abs(mainWallToldAt - w.sinceMs) < 120_000 ? 'lanes main-wall-up' : null),
       // lanes on (Sonn #10731): the enter alert also says the main's messages are held, none lost; lanes off: text unchanged
       enterNote: Lanes.LANES_ON ? () => lanesEnterNote(Lanes.mainHeldCount()) : undefined })),
@@ -3201,7 +3125,10 @@ if (isControlEnabled() || isRoamerEnabled()) {
       }
     }),
     log,
-    // WO-168: the lanes main-wall owner (002y X-1) is retired with the lanes' menu reader; the own pane is not looked at here at all
+    // 002y (X-1): with lanes on, the main's limit menu in its wall is the lanes main-wall mechanism's (one owner); lanes off: no owner, as before.
+    // WO-168 × Chiron #200727: kept (the probe owns the usage-limit menu); it matters with the duty officer off, when the own pane is not skipped above
+    ...(Lanes.LANES_ON && !INBOX_ONLY ? { owner: (t: WatchTarget, pk: { options: string[] }) =>
+      t.tmux === process.env.CHANNEL_BOT_TMUX_SESSION && Lanes.mainMenuOwned(pk.options) ? 'the lanes main-wall probe' : null } : {}),
   })
 }
 
@@ -3845,12 +3772,6 @@ function stampDid(notif: { method: string; params: unknown }): void {
   } catch {}
 }
 function broadcastNotification(notif: { method: string; params: unknown }): void {
-  // WO-120: inside a usage wall nothing is written into the session: park it (no re-delivery attempt is counted); the
-  // drain after the clear delivers it once, in order. With lanes on this is the fallback path (no router could be asked), so the hold stays here.
-  if (wallReader.walled()) {
-    if (holdForWall(notif)) heldSidecar.update(wallReader.state())
-    return
-  }
   if (Lanes.LANES_ON) stampDid(notif)      // lanes-golive: lanes only; lanes off, the <channel> tag carries exactly the fleet's meta
   if (activeServers.size === 0) {
     log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
@@ -4185,6 +4106,30 @@ const mentionCards: MentionCards | null = INBOX_ONLY || !onsen ? null : new Ment
     : onsen.putBytes(path, new TextEncoder().encode(JSON.stringify(body ?? {})), 'application/json', timeoutMs),
   timeoutMs: () => Number(process.env.LANES_MENTION_TIMEOUT_MS ?? 2_000),
   log: (lv, m) => log(lv, m) })
+// M2 and status read the same local session registry, including when status reporting is off.
+let registryStatusChanged: (() => void) | undefined
+// which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
+// (every open stream counts as the main's)
+const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
+const registry = new OnsenStatus.Registry({
+  dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
+  tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
+  connected: pid => streams.connected(pid), changed: () => { registryStatusChanged?.(); Lanes.mainRegistryChanged() }, log: m => log('info', m),
+  // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
+  ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
+  // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
+  // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s (1.48.4: by its own
+  // deadline too, so a run whose daemon died still ends).
+  // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
+  ...(!onsen?.cfg.record || INBOX_ONLY || process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
+    const claudeBin = process.env.ONSEN_CLAUDE_BIN || [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'].find(p => existsSync(p)) || 'claude'
+    const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
+      // the run's own deadline (perl alarm, 15 s) holds even if this daemon dies mid-run; this daemon's SIGKILL at 18 s is the second line
+      run: onSpawn => OnsenStatus.runCli(...OnsenStatus.withDeadline(claudeBin, ['agents', '--json'], OnsenStatus.CLI_DEADLINE_S), 18_000, { onSpawn }) })
+    return (notBefore: number) => shared.read(notBefore)
+  })() }),
+})
+
 // 002 lanes wiring (inert unless GENESIS_LANES=1)
 if (Lanes.LANES_ON) {
   const tokOk = (a: string | undefined) => {
@@ -4195,6 +4140,7 @@ if (Lanes.LANES_ON) {
   Lanes.lanesInit({
     // WO-157 (Chiron 13:46Z): the one state source: the status record computed now (what goes to Onsen; WO-169: currentStatus()); null = no status here
     mainStatus: () => onsenStatusCompute ? onsenStatusCompute() : null,
+    registry,
     dmPerson,                                                             // 1.58.13: a DM thread's title names the person on that account
     role: INBOX_ONLY ? 'inbox' : 'tg',
     agent: process.env.LANES_AGENT ?? INBOX_SELF,
@@ -4328,6 +4274,17 @@ if (Lanes.LANES_ON) {
           return `${action} run ${runId}: HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}`}`
         } catch (e) { return `${action} run ${runId} failed: ${e}` }
       },
+      // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
+      // BTCC names the agent from this daemon's mesh credential
+      registryAlert: async a => {
+        if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
+        const machine = ((process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
+        try {
+          const r = await fetch(`${BTCC_API_BASE}/api/fleet/main-registry`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() }, body: JSON.stringify({ machine, ...a }), signal: AbortSignal.timeout(6000) })
+          return `HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}`}`
+        } catch (e) { return `failed: ${e}` }
+      },
     } : {
       sendBot: async (chat, text, o) => {
         // lanes-topics (item 2): a lane's line carries its lane's topic (explicit); the router's notices the topic of the message they answer, if any
@@ -4434,6 +4391,7 @@ function liveSetting(k: LiveKey): string | undefined {
   return liveFile.v[k]
 }
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
+if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
   // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
@@ -4507,28 +4465,8 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
   mainTurnNow = () => { try { return (tap ? tap.turnFacts()?.id : watch?.turnFacts()?.id) ?? null } catch { return null } }   // WO-172
-  // which claude process holds each MCP stream: the socket lookup (lanes-proc: lsof on a Mac, /proc on Linux), once per stream. ONSEN_PEER_LOOKUP=0: none
-  // (every open stream counts as the main's)
-  const streams = new OnsenStatus.Streams({ open: () => sseOpen.entries() })
   onsenPeer = process.env.ONSEN_PEER_LOOKUP === '0' ? null : (sid, req) => streams.note(sid, Lanes.claudePidOf(req, HTTP_PORT!))
-  const claudeBin = process.env.ONSEN_CLAUDE_BIN || [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'].find(p => existsSync(p)) || 'claude'
-  const registry = new OnsenStatus.Registry({
-    dir: process.env.ONSEN_SESSIONS_DIR || join(homedir(), '.claude', 'sessions'), workspace: AGENT_WORKSPACE_DIR, transcripts: () => TRANSCRIPT_DIR,
-    tmux: process.env.CHANNEL_BOT_TMUX_SESSION || null, sessionId: Lanes.LANES_ON ? () => Lanes.mainSessionId() : undefined,
-    connected: pid => streams.connected(pid), changed: kick, log: m => log('info', m),
-    // the first comparison: 10–70 s after start at random (a fleet that starts at once does not compare at once); ONSEN_REGISTRY_FIRST_CHECK_MS fixes it
-    ...(Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) >= 0 && process.env.ONSEN_REGISTRY_FIRST_CHECK_MS ? { firstCheckMs: Number(process.env.ONSEN_REGISTRY_FIRST_CHECK_MS) } : {}),
-    // the documented read of the same registry, for the comparison (~1 min after start, then every ~10 min) and the fallback (every 30 s while the
-    // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s (1.48.4: by its own
-    // deadline too, so a run whose daemon died still ends).
-    // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
-    ...(process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
-      const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
-        // the run's own deadline (perl alarm, 15 s) holds even if this daemon dies mid-run; this daemon's SIGKILL at 18 s is the second line
-        run: onSpawn => OnsenStatus.runCli(...OnsenStatus.withDeadline(claudeBin, ['agents', '--json'], OnsenStatus.CLI_DEADLINE_S), 18_000, { onSpawn }) })
-      return (notBefore: number) => shared.read(notBefore)
-    })() }),
-  })
+  registryStatusChanged = kick
   const source: OnsenStatus.StatusSource = registry
   const turnStarts = new OnsenStatus.TurnStarts()
   const compute = (): OnsenStatus.StatusView => {
@@ -4616,7 +4554,6 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
       return l && r ? { text: l.visible, state: r.view.state, detail: (r.view.detail ?? {}) as Record<string, any> } : null
     })
   }
-  registry.start()
   setInterval(() => { try { feed(compute()) } catch (e) { log('warn', `onsen: status: ${e}`) } }, 2_000).unref()
   // WO-162 (2), lanes off: the transcript is read every ONSEN_TRANSCRIPT_POLL_MS (250 ms; a stat when nothing was written) and a change of the turn (a
   // tool starting or ending, a message taken in) is computed and written at once; until 1.55.0 it was read with the 2 s status tick
@@ -4801,7 +4738,12 @@ async function personArrived(it: { kind?: string; seq?: number; dedupe?: string 
       log('warn', `onsen inbound: no facts kept for ${shown} (arrived before this daemon's state, or elsewhere): its tag is built from the person_message`)
     }
     const cm = OnsenInbound.clientMetaOf(c)                 // WO-197: the bridge's client.meta onto the tag
-    f = { ...f, onsenId: String(p.message_id), ...(cm ? { clientMeta: cm } : {}) }
+    // WO-207 (Chiron #200873, Joey TG chiron:2973): a voice note's body is Onsen's text as is (its transcript, whole, after Onsen's one prefix line; a
+    // caption when it had one), not the (voice message) placeholder; the same words are not laid over the tag again as client.meta voice_transcript.
+    // Onsen's text empty (voice_error, no caption): the placeholder, as before
+    const voiceText = (p.voice === true || p.kind === 'voice') && typeof p.text === 'string' && p.text.trim() ? p.text : null
+    if (voiceText && cm?.voice_transcript && voiceText.includes(cm.voice_transcript)) delete cm.voice_transcript
+    f = { ...f, onsenId: String(p.message_id), ...(voiceText ? { text: voiceText, voiceTranscript: undefined } : {}), ...(cm ? { clientMeta: cm } : {}) }
     // WO-197 (Chiron mesh 12852): an album item is answered 200 (the inbox acks it) before its album goes (up to TELEGRAM_ALBUM_CAP_MS): what rebuilds
     // its tag is kept on disk until then (the arrival's facts with client.meta; a connector's, rebuilt from the person_message, with where Onsen keeps
     // its files), so a daemon stopped meanwhile delivers it after its restart, once
@@ -4854,7 +4796,7 @@ function factsFromPayload(p: any, chat: string, ref: string, thread?: number): O
     ...(a && !photo && tg ? { attachment: { kind: voice ? 'voice' : sticker ? 'sticker' : String(a.kind || kind), file_id: tg, ...(size != null ? { size } : {}),
       ...(a.mime && !sticker ? { mime: String(a.mime) } : {}), ...(name && !sticker ? { name } : {}) } } : {}),
     ...(a && !tg && a.url ? { onsenFiles: [a] } : {}),
-    fromReply: false, ...(voice && text ? { voiceTranscript: metaExcerpt(text, 500) } : {}),
+    fromReply: false,
     // WO-197 segment 2: a connector's lanes know the thread by Onsen's id (`thread`, the router's and the lanes' topic); the tag keeps the topic the
     // person's message carried (client.thread, clientTopic) and its name. Off the connector: the Telegram topic, as before
     ...(thread != null ? { inTopic: thread, ...(c.thread != null ? { clientTopic: String(c.thread) } : {}), ...(p.topic_name ? { topicName: String(p.topic_name) } : {}) }
@@ -5543,11 +5485,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         if (boundServer && sseOpen.get(sessionId)) {    // closed during the wait → leave it all parked
           const queued = memQueue.get(sessionId) ?? []
           memQueue.delete(sessionId)                    // take ownership before the first await
-          if (queued.length > 0 && wallReader.walled()) {
-            // WO-120: inside a usage wall they park on disk instead; the drain after the clear delivers them
-            for (const notif of queued) holdForWall(notif)
-            log('info', `usage wall: ${queued.length} mem-queued notif(s) for session ${sessionId} parked in inbox/pending until the wall clears`)
-          } else if (queued.length > 0) {
+          if (queued.length > 0) {
             log('info', `flushing ${queued.length} mem-queued notif(s) for session ${sessionId}`)
             for (const notif of queued) {
               try {

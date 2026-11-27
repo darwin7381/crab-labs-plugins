@@ -1,7 +1,7 @@
 // telegram-bridge-stage2.test.ts (board WO-196 part B, stage two: the command menu, threads and topics, the restart line, the person's
 // reactions, groups). Same fakes as stage one (fakes.ts); a home of its own.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
@@ -34,13 +34,11 @@ beforeAll(async () => {
   put(join(home, '.config', 'systemd', 'user', 'telegram-daemon.gamma.service.d', 'lanes.conf'), '[Service]\nEnvironment=LANES_AGENT=gamma\n')
   put(join(home, '.config', 'crab-labs-plugins', 'env'), 'ONSEN_BRIDGE=*\n')
   put(join(root, 'cred'), CRED)
-  put(join(root, 'fake-whisper.sh'), '#!/bin/sh\ntest -s "$1" && echo "你好，看一下"\n'); chmodSync(join(root, 'fake-whisper.sh'), 0o755)
   tg.addBot(TOK, 'gamma_bot')
   b = new Bridge(configFromEnv({
     HOME: home, TELEGRAM_BRIDGE_MACHINE: 'txmonster', ONSEN_BASE: onsen.base, TELEGRAM_API_ROOT: tg.root, TELEGRAM_BRIDGE_STATE_DIR: join(root, 'state'),
     CRAB_LABS_PLUGINS_ENV: join(home, '.config', 'crab-labs-plugins', 'env'), TELEGRAM_BRIDGE_CREDENTIAL_FILE: join(root, 'cred'), TELEGRAM_BRIDGE_PLATFORM: 'linux',
-    TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_FEED_WAIT_S: '1', TELEGRAM_BRIDGE_VOICE: '1',
-    CHANNEL_BOT_TRANSCRIBE_CMD: join(root, 'fake-whisper.sh'),
+    TELEGRAM_BRIDGE_SETTINGS_S: '0.2', TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_FEED_WAIT_S: '1',
     TELEGRAM_BRIDGE_PIN_CHECK_S: '0.3', TELEGRAM_BRIDGE_PIN_EDIT_MS: '100',
     TELEGRAM_BRIDGE_HANDOVER_S: '2',
   }), { log: (l, m) => logs.push(`${l} ${m}`) })
@@ -160,20 +158,16 @@ describe('stage two', () => {
     for (const l of logs) expect(l.includes(TOK.split(':')[1]!)).toBe(false)
   }, T)
 
-  test('client_meta: a reply to a file, a forward, a voice note, an album → exactly the tag attributes the daemon writes', async () => {
+  test('client_meta: a reply to a file, a forward, an album → exactly the tag attributes the daemon writes', async () => {
     const now = Math.floor(Date.now() / 1000), from = { id: JOEY, is_bot: false, first_name: 'Joey', username: 'joey' }, dm = { id: JOEY, type: 'private' }
-    tg.files.set('f/DOC7', new Uint8Array([1, 2, 3])); tg.files.set('f/VO1', new Uint8Array([4, 5, 6])); tg.files.set('f/P1', new Uint8Array([7, 8, 9]))
+    tg.files.set('f/DOC7', new Uint8Array([1, 2, 3])); tg.files.set('f/P1', new Uint8Array([7, 8, 9]))
     tg.push(TOK, { message: { message_id: 801, from, chat: dm, date: now, text: 'see this', reply_to_message: { message_id: 700, from: { id: 555, is_bot: false, first_name: 'Ann', username: 'ann' },
       chat: dm, date: now - 60, caption: 'the pdf', document: { file_id: 'DOC7', file_unique_id: 'd7', file_name: 'a.pdf', mime_type: 'application/pdf', file_size: 3 } } } })
     tg.push(TOK, { message: { message_id: 802, from, chat: dm, date: now, text: 'fwd', forward_origin: { type: 'channel', chat: { id: -100555, type: 'channel', title: 'News', username: 'newsch' }, message_id: 42, date: now - 3600 } } })
-    tg.push(TOK, { message: { message_id: 803, from, chat: dm, date: now, voice: { file_id: 'VO1', file_unique_id: 'v1', duration: 2, mime_type: 'audio/ogg', file_size: 3 } } })
     tg.push(TOK, { message: { message_id: 804, from, chat: dm, date: now, media_group_id: 'AL1', caption: 'two', photo: [{ file_id: 'P1', file_unique_id: 'p1', file_size: 3 }] } })
     tg.push(TOK, { message: { message_id: 805, from, chat: dm, date: now, media_group_id: 'AL1', photo: [{ file_id: 'P2GONE', file_unique_id: 'p2', file_size: 3 }] } })
     tg.push(TOK, { message: { message_id: 806, from, chat: dm, date: now, text: 'plain' } })
-    // Chiron 15:40Z: a voice note with a caption keeps the caption as its text; the transcript only in client_meta
-    tg.files.set('f/VO2', new Uint8Array([4, 5, 7]))
-    tg.push(TOK, { message: { message_id: 807, from, chat: dm, date: now, caption: '聽這段', voice: { file_id: 'VO2', file_unique_id: 'v2', duration: 2, mime_type: 'audio/ogg', file_size: 3 } } })
-    await until(() => ['801', '802', '803', '804', '805', '806', '807'].every(id => onsen.messages.some(x => x.client_msg_id === id)), 8000, 'all six written')
+    await until(() => ['801', '802', '804', '805', '806'].every(id => onsen.messages.some(x => x.client_msg_id === id)), 8000, 'all five written')
     const w = (id: string) => onsen.messages.find(x => x.client_msg_id === id)
     expect(w('801').client_meta).toEqual({ reply_to_user_id: '555', reply_to_user: 'ann', attachment_origin: 'reply' })   // reply_to_user: Chiron 12794
     expect(w('801')).toMatchObject({ kind: 'text', text: 'see this', reply_to_client_msg_id: '700', reply_to_user: 'ann', reply_to_text: 'the pdf',
@@ -181,14 +175,10 @@ describe('stage two', () => {
     expect(w('801').attachment_file_ids.length).toBe(1)                                         // the replied-to file, stored in Onsen
     expect(w('802').client_meta).toEqual({ forward_origin: 'channel', forward_from_id: '-100555', forward_from_username: 'newsch', forward_channel_message_id: '42' })
     expect(w('802').forward_from).toBe('News')                                                   // the tag's value: the channel's title (Chiron 15:40Z)
-    expect(w('803').client_meta).toEqual({ voice_transcript: '你好，看一下' })
-    expect(w('803')).toMatchObject({ kind: 'voice', text: '你好，看一下' })
-    expect(w('807')).toMatchObject({ kind: 'voice', text: '聽這段' })
-    expect(w('807').client_meta).toEqual({ voice_transcript: '你好，看一下' })
     expect(w('804').client_meta).toEqual({ media_group_count: '2' })
     expect(w('805').client_meta).toEqual({ media_group_count: '2', image_error: 'download failed' })
     expect('client_meta' in w('806')).toBe(false)                                                // nothing beyond the named fields: none sent
-    for (const id of ['801', '802', '803', '804', '805']) expect(new TextEncoder().encode(JSON.stringify(w(id).client_meta)).length).toBeLessThanOrEqual(4096)
+    for (const id of ['801', '802', '804', '805']) expect(new TextEncoder().encode(JSON.stringify(w(id).client_meta)).length).toBeLessThanOrEqual(4096)
     expect(onsen.bad).toEqual([])
   }, T)
 

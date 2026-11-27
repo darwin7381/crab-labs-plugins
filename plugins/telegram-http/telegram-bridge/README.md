@@ -42,9 +42,9 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 - **Gate.** That agent's `access.json`, ported from `server.ts`: DM allowlist, pairing codes (written into `access.json` as before; `approved/<id>` → "Paired! Say hi to Claude."), group policy and mentions. A corrupt `access.json` refuses everything for that bot; it is not moved aside.
 - **A message.**
   1. Its file is fetched from Telegram (≤ 20 MB) and stored with `POST /v1/files`.
-  2. A voice note is transcribed locally (`CHANNEL_BOT_TRANSCRIBE_CMD`, else `whisper` on CPU; `TELEGRAM_BRIDGE_VOICE=0` turns it off). The transcript is the text.
+  2. A voice note carries the audio and its caption. Without a caption, `text` is the empty string. Onsen transcribes the audio on arrival.
   3. `POST /v1/bridge/messages`.
-  4. `client_meta` carries the facts §7d's named fields don't, under the exact attribute names `server.ts` puts on the `<channel>` tag (the connector turns each key into that attribute): `reply_to_user_id`, `attachment_origin` (`reply`: the file is the replied-to message's, which comes with a text reply as the daemon's `replyAttachment` did), `forward_origin`, `forward_from_id`, `forward_from_username`, `forward_channel_message_id`, `image_error` (`download failed`: a photo not stored), `media_group_count` (album items wait 1.5 s after the newest one, as the daemon's album window did), `voice_transcript`. It is sent only when non-empty and kept ≤ 4 KB. If Onsen answers 400 naming `client_meta` (before 0.35.4), the message goes again without it, and none is sent for 5 min.
+  4. `client_meta` carries the facts §7d's named fields don't, under the exact attribute names `server.ts` puts on the `<channel>` tag (the connector turns each key into that attribute): `reply_to_user_id`, `attachment_origin` (`reply`: the file is the replied-to message's, which comes with a text reply as the daemon's `replyAttachment` did), `forward_origin`, `forward_from_id`, `forward_from_username`, `forward_channel_message_id`, `image_error` (`download failed`: a photo not stored), `media_group_count` (album items wait 1.5 s after the newest one, as the daemon's album window did). It is sent only when non-empty. Onsen's limit is 4 KB. If Onsen answers 400 naming `client_meta` (before 0.35.4), the message goes again without it, and none is sent for 5 min.
   5. Only when Onsen answers 2xx: 👀 (`access.json ackReaction`; unset gives 👀, `''` gives none), and the update is done.
 - **Order.** Writes go strictly in order, one at a time per bot.
 - **Edits and reactions.** An edit goes to `POST /v1/bridge/messages/edit`; the person's reaction to `POST /v1/bridge/reactions`. Onsen answering 404 (a message it never had) drops it.
@@ -177,7 +177,6 @@ TELEGRAM_BRIDGE_MACHINE=macmini bun telegram-bridge.ts --once     # which agents
 | `CRAB_LABS_PLUGINS_ENV` | `~/.config/crab-labs-plugins/env` | the settings file |
 | `TELEGRAM_API_ROOT` | `https://api.telegram.org` | tests point it at a fake |
 | `TELEGRAM_RICH_MESSAGES` | on | `0` sends plain text |
-| `TELEGRAM_BRIDGE_VOICE` | on | voice transcription (`CHANNEL_BOT_TRANSCRIBE_CMD`, `CHANNEL_BOT_WHISPER_BIN`, `CHANNEL_BOT_WHISPER_MODEL`) |
 | `TELEGRAM_BRIDGE_SORRY_S` | `15` | the Onsen-down sentence |
 | `TELEGRAM_BRIDGE_RETRY_S` | `10,30,120` | send retries |
 | `TELEGRAM_BRIDGE_SETTINGS_S` / `_ENDPOINTS_S` / `_REGISTER_S` / `_MEMBERS_S` / `_CONFLICT_RETRY_S` | 30 / 30 / 300 / 300 / 300 | |
@@ -190,7 +189,7 @@ TELEGRAM_BRIDGE_MACHINE=macmini bun telegram-bridge.ts --once     # which agents
 Run these on txmonster only, with `TMUX` unset. From `plugins/telegram-http/telegram-bridge`:
 
 ```sh
-bun test telegram-bridge.test.ts telegram-bridge-stage2.test.ts   # fakes.ts: a fake Bot API and a fake Onsen that checks every request against §7b / §7d
+bun test *.test.ts                    # fake Bot API and Onsen (§7b / §7d)
 bun measure-memory.ts                # RSS with 1 and with 27 fake bots
 ```
 
@@ -201,7 +200,7 @@ No test reaches the real Telegram or Onsen; every token is fake.
 `server.ts` cannot be imported (it builds a bot and exits without a port when it loads), and WO-197 takes its Telegram code out. So these are ported here with their `server.ts` line numbers in the comments:
 - `tg-access.ts`: `gate`, `dmCommandGate`, `isMentioned`, pairing, approvals;
 - `tg-format.ts`: `chunk`, the label line, `sendTextParts`, the rich edit;
-- `inbound.ts`: voice transcription, the `/start` and `/help` text.
+- `inbound.ts`: the `/start` and `/help` text.
 - `stage-two.ts`: the `/clear` countdown (`clearHooks`).
 
 These are imported unchanged:

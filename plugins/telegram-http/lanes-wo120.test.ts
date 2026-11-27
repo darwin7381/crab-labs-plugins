@@ -1,6 +1,6 @@
 // WO-120 × lanes (1.34.1): with a fresh usage-wall state, the usage-wall alerts (system-alert WallAlerts) are the one sender of the main's wall
 // pushes. lanes' main-wall-up / main-wall-down then go to the lanes ledger only (LanesDeps.wallNoticeOwned); without it, or when it says no, they
-// are pushed as before. The wall records (M2) are not touched. mainHeldCount: what M1 holds for the main (the clear alert's N).
+// are pushed as before. The wall records (M2) are not touched. mainHeldCount: what M1 holds for the main (the enter alert's count).
 import { test, expect, afterAll } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
