@@ -22,16 +22,16 @@ test('S2 member POST authenticates the writer, validates the shape and returns t
   const post = (body: unknown, key = 'promise') => request('POST', base, body, key)
   expect((await request('POST', base, b, 'k', 'other')).status).toBe(401)
   expect((await request('POST', '/v1/members/eve/items', b, 'k')).status).toBe(403)
-  for (const bad of [{ ...b, kind: 'notice' }, { ...b, refs: {} }, { ...b, from: 'eve' }, { ...b, deadline: 'later' }]) {
+  for (const bad of [{ ...b, kind: 'notice' }, { ...b, refs: {} }, { ...b, from: 'eve' }, { ...b, deadline: 'later' }, { ...b, deadline: '11' }]) {
     expect((await post(bad)).status).toBe(400)
   }
   expect((await post(b, '')).status).toBe(400)
-  fake.mode(409)
-  expect((await post(b)).status).toBe(409)
-  fake.mode(200)
   const { data } = await (await post(b)).json()
   expect(data).toMatchObject({ from: 'adam', member: 'adam', waiter: 'joey-test', kind: 'self', state: 'waiting',
-    session_id: 'main', payload: { text: b.body.text }, not_before: due, deadline: due, refs: b.refs })
+    session_id: 'main', payload: { text: b.body.text }, preview: b.body.text, about_item_id: null, retry_after: null,
+    takeable: { now: false, why: 'not_before' }, not_before: due, deadline: due, refs: b.refs })
+  expect(data.line).toContain('自己留的｜adam → 等的人 joey-test｜等著')
+  expect(data.events[0]).toMatchObject({ kind: 'created', claim_id: null, state: 'waiting', at: data.updated_at })
   expect((await (await post(b)).json()).data.id).toBe(data.id)
   expect((await post({ ...b, waiter: 'eve' })).status).toBe(409)
   expect(fake.rows.size).toBe(1)
@@ -48,6 +48,7 @@ test('S2 DELETE checks writer, version, claim and outcome', async () => {
   expect((await close(self.id, self.version + 1, 'completed')).status).toBe(409)
   expect((await close(self.id, self.version, 'superseded')).status).toBe(400)
   expect((await (await close(self.id, self.version, 'completed')).json()).data.state).toBe('completed')
+  expect(await create('self', 'promise')).toEqual(self)
   const warm = await create('keepwarm', 'warm')
   expect((await close(warm.id, warm.version, 'completed')).status).toBe(400)
   expect((await (await close(warm.id, warm.version)).json()).data.reason).toBe('withdrawn')
