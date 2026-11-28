@@ -306,6 +306,25 @@ test.each(['UserPromptSubmit', 'PreToolUse', 'Stop'])('C4 a background notificat
   expect(r.f.calls.filter(c => c.body.outcome)).toHaveLength(0)
 })
 
+test('a pull member keeps its local offer binding when a background notification opens a turn', async () => {
+  const r = await mainRig()
+  r.mode.stop()
+  const did = r.enqueue(r.f.add('legacy-delivery'), true)
+  await until(() => r.journal.get('msg', did)?.state === 'offered')
+  await r.hook('UserPromptSubmit', { prompt_id: 'legacy-prompt', source: 'task-notification', dids: [] })
+  expect(r.journal.get('msg', did)).toMatchObject({ state: 'bound', prompt_id: 'legacy-prompt' })
+  expect(r.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
+})
+
+test('a take member ignores a delivery id quoted inside background output', async () => {
+  const r = await accountCut()
+  const did = r.enqueue(r.f.add('quoted-work', 'call'))
+  await r.hook('UserPromptSubmit', { prompt_id: 'notification', source: 'task-notification', dids: [did], channel_dids: [] })
+  await r.hook('Stop', { prompt_id: 'notification', phase: 'final' }); await r.sync()
+  expect(r.journal.get('msg', did)?.state).toBe('queued')
+  expect(r.row.state).toBe('waiting')
+})
+
 test('C4 a new prompt first seen at a tool with no origin cannot discard the interrupted prompt', async () => {
   const r = await accountCut()
   await r.hook('PreToolUse', { prompt_id: 'unidentified', tool_name: 'Read' })

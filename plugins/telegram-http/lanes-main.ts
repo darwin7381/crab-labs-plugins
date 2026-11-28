@@ -128,6 +128,8 @@ export type MainEnv = {
 
 export type MainEvent = {
   event: string; session_id?: string; prompt_id?: string; pid?: number; transcript_path?: string; source?: string
+  /** Delivery ids outside the text of a task notification, when the prompt contains one. */
+  channel_dids?: string[]
   error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_brief?: Record<string, string>; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
   /** 002r: the event fired inside a subagent of the main (the hook input's agent_id): not the main's turn */
   sub?: boolean
@@ -967,6 +969,7 @@ export function createMain(E: MainEnv) {
     if (g.stopped_prompt === prompt && g.prompt_id !== prompt) continueTurn(g, prompt)
     const open = g.prompt_id === prompt
     const receiver = E.itemReceiver?.()
+    const backgroundNotice = receiver?.mode.active && source === 'task-notification'
     if (open && (!ids?.size || !receiver?.mode.active)) return
     if (open && ids) {
       // A tool hook can bind the offer before the prompt receipt identifies which text arrived.
@@ -976,14 +979,14 @@ export function createMain(E: MainEnv) {
     const canBind = (r: Row) => {
       const named = ids && identifies(ids, r), resume = isResume(r)
       if (open && !resume && !r.carried_resume) return false
-      if ((open || source === 'task-notification' || resume && resumes.awaitingInput(r.onsen_items[0].onsen_item_id)) && !named) return false
+      if ((open || backgroundNotice || resume && resumes.awaitingInput(r.onsen_items[0].onsen_item_id)) && !named) return false
       if (resume && (ids && !named || resumes.cancelling(r.onsen_items[0].onsen_item_id))) return false
       const offered = r.state === 'offered' && r.gen === g.id
       const queued = r.state === 'queued' && forGen(r, g) && (named || !ids && resume && inFlight.has(r.id))
       return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id))
         || resume && named && resumes.awaitingInput(r.onsen_items[0].onsen_item_id))
     }
-    if (!open && source !== 'task-notification' && source !== 'StopFailure' && receiver) {
+    if (!open && !backgroundNotice && source !== 'StopFailure' && receiver?.mode.active) {
       syncResumes()
       // A named delivery identifies this turn even when re-taking it failed. Without a prompt hook,
       // an offered Item with its current claim identifies the delivery that reached this generation.
@@ -1044,7 +1047,7 @@ export function createMain(E: MainEnv) {
     switch (ev) {
       case 'UserPromptSubmit': {
         if (p) {
-          const ids = promptRefs(b.dids ?? [])
+          const ids = promptRefs((E.itemReceiver?.()?.mode.active ? b.channel_dids ?? b.dids : b.dids) ?? [])
           if (ids.size) {
             const late = items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r))
             if (late.length) await receiveRows(late, true, () => currentGen() === g, true)

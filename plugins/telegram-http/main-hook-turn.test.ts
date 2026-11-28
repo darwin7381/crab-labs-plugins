@@ -43,12 +43,12 @@ test('a background-task notification identifies its origin without forwarding it
   const w = world(), notice = '<task-notification>\n<task-id>t1</task-id>\n<result>old did="other"</result>\n</task-notification>'
   fresh()
   await hook(w, { hook_event_name: 'UserPromptSubmit', prompt: notice })
-  expect(posted[0]).toMatchObject({ source: 'task-notification', dids: [] })
+  expect(posted[0]).toMatchObject({ source: 'task-notification', dids: ['other'], channel_dids: [] })
   expect(posted[0]).not.toHaveProperty('prompt')
   fresh()
   await hook(w, { hook_event_name: 'UserPromptSubmit', prompt: '<channel did="real">someone quoted ' + notice + '</channel>' })
   expect(posted[0].source).not.toBe('task-notification')
-  expect(posted[0].dids).toContain('real')
+  expect(posted[0].channel_dids).toEqual(['real'])
 })
 
 test('PostToolUse: every tool\'s input (strings cut to 3000) and result (text, cut to 20000) and its error flag go to the daemon', async () => {
