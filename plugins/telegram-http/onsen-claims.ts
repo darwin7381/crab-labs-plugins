@@ -27,6 +27,7 @@ export class Claims implements ClaimStore {
   private rows: Record<string, Claim> = Object.create(null)
   private done: Done[] = []
   private waits = new Map<string, { state: ReceivingState; ids: string[] }>()
+  pollOffset: number | null = null
   private connector?: string
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
 
@@ -43,14 +44,21 @@ export class Claims implements ClaimStore {
       this.waits = new Map(data.waits ?? [])
       this.done = data.done ?? []
       this.connector = data.connector
+      this.pollOffset = data.pollOffset ?? null
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
   }
 
   carriedBy(connector: string): boolean { return this.connector === connector }
   rememberCarrier(connector: string): void {
     if (this.carriedBy(connector)) return
-    this.save(connector)
+    this.save(connector, null)
     this.connector = connector
+    this.pollOffset = null
+  }
+  rememberPollOffset(offset: number | null): void {
+    if (this.pollOffset === offset) return
+    this.save(this.connector, offset)
+    this.pollOffset = offset
   }
   held(): string[] { return Object.keys(this.rows) }
   owns(id: string): boolean {
@@ -60,11 +68,11 @@ export class Claims implements ClaimStore {
   blocked(): boolean { return this.spool.hasItemReports() }
   completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
 
-  private save(connector = this.connector): void {
+  private save(connector = this.connector, pollOffset = this.pollOffset): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = this.file + '.' + process.pid + '.tmp'
     this.done = this.done.filter(d => d.at > this.now() - week).slice(-5000)
-    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector, waits: [...this.waits] }), { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector, pollOffset: pollOffset ?? undefined, waits: [...this.waits] }), { mode: 0o600 })
     renameSync(tmp, this.file)
   }
   waitingSessions() { return this.waits.keys() }

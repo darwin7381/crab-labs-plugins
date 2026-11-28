@@ -368,8 +368,8 @@ if (ONSEN_TAKE_ON) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
       async active => {
         if (active && ROAMER && !CONNECTOR) {
-          itemClaims!.rememberCarrier(takeMode!.connector)
           await tg?.stop(true)
+          itemClaims!.rememberCarrier(takeMode!.connector)
           tg = null
           CONNECTOR = onsen.cfg.record = true
           if (connectorReady) { onsen.start(); startConnectorCommands(); startOnsenStatus(onsen) }
@@ -385,10 +385,13 @@ if (ONSEN_TAKE_ON) {
     if (!ROAMER) { Lanes.useItemReceiver(itemReceiver); Lanes.observeItemGates(() => itemPeek!.reset()) }
   }
 }
-if (ROAMER && takeMode) { await takeMode.probe(); requireLocalBotToken() }
+const pendingDrain = ROAMER && itemClaims?.pollOffset != null
+if (ROAMER && takeMode && !pendingDrain) await takeMode.probe()
+if (ROAMER) requireLocalBotToken()
 tg = ROAMER && !CONNECTOR
-  ? new (await import('./roamer-telegram.ts')).RoamerTelegram({ token: TOKEN!, ...(process.env.TELEGRAM_API_ROOT ? { apiRoot: process.env.TELEGRAM_API_ROOT } : {}), log })
+  ? new (await import('./roamer-telegram.ts')).RoamerTelegram({ token: TOKEN!, handover: itemClaims, ...(process.env.TELEGRAM_API_ROOT ? { apiRoot: process.env.TELEGRAM_API_ROOT } : {}), log })
   : null
+if (pendingDrain) await takeMode!.probe()
 if (onsen) { log('info', `onsen: agent=${ONSEN_AGENT} base=${onsen.cfg.base} record=${onsen.cfg.record ? 'on' : 'off'}`); onsen.start() }   // the sync loop (record on only)
 // 1.58.32 (Chiron): a roamer posts nothing to Onsen, so it adds nothing to the spool; what an older version left there stays as it is (not ours to delete)
 if (onsen && ROAMER && !CONNECTOR) log('info', `onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool; ${onsen.pendingBytes()} bytes an older version left in ${onsen.spool} are kept as they are, not sent`)

@@ -9,7 +9,7 @@ import { Journal } from './lanes-state.ts'
 import { itemRef } from './onsen-items.ts'
 import { startOnsenStandin } from './test-fixtures/onsen-standin.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
+import { dm, startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
 
 const clean: Array<() => Promise<void> | void> = []
@@ -647,6 +647,67 @@ for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, tr
     expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(named ? 1 : 0)
     expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
   })
+
+test('handover confirms the whole local batch when another update is handled during stop', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const offsets: number[] = []
+  let sending = false, release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  const proxy = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    const path = new URL(req.url).pathname
+    const body = await req.text()
+    if (/\/send(Rich)?Message$/.test(path) && !sending) { sending = true; await held }
+    if (path.endsWith('/getUpdates')) {
+      const poll = JSON.parse(body)
+      if (poll.limit === 1) { offsets.push(poll.offset); release() }
+    }
+    return fetch(bot.url + path, { method: req.method, headers: { 'Content-Type': 'application/json' }, body })
+  } })
+  clean.push(() => { release(); return proxy.stop(true) })
+  for (const id of [41, 42]) bot.push({ update_id: id, ...dm(1, id, '/help', { command: true }) })
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: 'http://127.0.0.1:' + proxy.port }, 409, roamerState)
+  await waitFor(() => sending)
+  d.f.mode(200)
+  await waitFor(async () => (await fetch(d.base + '/healthz').then(r => r.json())).connector.on)
+  expect(offsets).toEqual([42, 43])
+  expect(d.log().match(/inbound u=4[12] /g)).toHaveLength(2)
+}, 10000)
+
+test('a failed offset confirmation keeps the bridge out through restart until the exact offset succeeds', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const offsets: number[] = []
+  let reject = true
+  bot.fail.fn = (method, body) => {
+    if (method !== 'getUpdates' || Number(body.limit) !== 1) return false
+    offsets.push(Number(body.offset))
+    return reject
+  }
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url }, 409, roamerState)
+  const health = () => fetch(d.base + '/healthz').then(r => r.json())
+  const claimFile = join(d.state, 'onsen/claims.json')
+  const claims = () => JSON.parse(readFileSync(claimFile, 'utf8'))
+  bot.push({ update_id: 41, message: { message_id: 1, chat: { id: 1, type: 'private' }, from: { id: 1, first_name: 'Joey' }, date: 1, text: '/help' } })
+  await waitFor(() => d.log().includes('inbound u=41'))
+  d.f.mode(200)
+  await waitFor(() => offsets.length > 0)
+  expect((await health()).connector.on).toBe(false)
+  expect(claims().pollOffset).toBe(42)
+  expect(claims().connector).toBeUndefined()
+  const before = offsets.length
+  await d.restart()
+  await waitFor(() => offsets.length > before)
+  expect((await health()).connector.on).toBe(false)
+  expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
+  reject = false
+  await waitFor(async () => (await health()).connector.on, 12000)
+  expect((await health()).polling).toBe(false)
+  expect(claims().connector).toBe('mac-mini/' + member)
+  expect(claims().pollOffset).toBeUndefined()
+  expect(new Set(offsets)).toEqual(new Set([42]))
+  expect(d.log().match(/inbound u=41 /g)).toHaveLength(1)
+}, 22000)
 
 test('a later successful probe drains the local poll before the bridge can carry the bot', async () => {
   const bot = startBotApiMock({}, { pollHoldMs: 100 })
