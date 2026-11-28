@@ -12,12 +12,13 @@ export type InboxItem = {
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
 export type ItemRef = {
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
-  note?: string; reason?: string; half_done?: true; conversation?: string; waiter?: string
+  note?: string; reason?: string; half_done?: true; conversation?: string; waiter?: string; not_before?: string
 }
 export function itemRef(it: InboxItem): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
     ...(it.waiter ? { waiter: it.waiter } : {}),
+    ...(it.kind === 'keepwarm' && it.not_before ? { not_before: it.not_before } : {}),
     ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }

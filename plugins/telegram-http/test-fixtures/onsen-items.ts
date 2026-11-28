@@ -123,7 +123,8 @@ export function fakeItems() {
     if (path === base && req.method === 'GET') {
       const after = q.get('changed_after')
       const since = after === null ? -Infinity : Date.parse(after)
-      const select = () => [...rows.values()].filter(r => r.member === 'adam' && r.state === (q.get('state') ?? 'waiting') && Date.parse(r.updated_at) >= since)
+      const select = () => [...rows.values()].filter(r => r.member === 'adam' && (q.get('state') === 'all' || r.state === (q.get('state') ?? 'waiting'))
+        && (!q.has('kind') || r.kind === q.get('kind')) && (!q.has('session_id') || r.session_id === q.get('session_id')) && Date.parse(r.updated_at) >= since)
       const wait = Number(q.get('wait'))
       const until = Date.now() + wait * 1000
       while (!select().length && Date.now() < until && !req.signal.aborted) await new Promise<void>(resolve => {

@@ -488,7 +488,10 @@ export function createMain(E: MainEnv) {
       return currentGen() === g && g.version === version && fresh.active === wall.active && fresh.person === wall.person
         && fresh.probe === probe && mayOffer()
     }
-    const eligible = (r: Row) => wallAllows(r, wall, probe) && (!r.onsen_items || !wall.active || probe || r.onsen_items.every((ref: ItemRef) => ref.kind === 'message'))
+    const eligible = (r: Row) => {
+      if (r.onsen_items?.some((ref: ItemRef) => ref.kind === 'keepwarm') && (g.state !== 'idle' || wall.active || !canTake(g))) return false
+      return wallAllows(r, wall, probe) && (!r.onsen_items || !wall.active || probe || r.onsen_items.every((ref: ItemRef) => ref.kind === 'message'))
+    }
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.

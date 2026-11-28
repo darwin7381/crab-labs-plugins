@@ -356,6 +356,7 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
 })
 const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
+let takeKeepwarm: LocalKeepwarm | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
 let itemClaims: Claims | undefined
@@ -366,10 +367,16 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { Lanes.resumeSelfItems(); itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+      active => {
+        if (active) {
+          Lanes.resumeSelfItems(); itemClaims!.start(); itemPeek!.reset()
+          takeKeepwarm?.start(); void takeKeepwarm?.run()
+        } else { itemPeek!.stop(); takeKeepwarm?.stop() }
+        registryStatusChanged?.()
+      }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
-    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
+    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     Lanes.useItemReceiver(itemReceiver, write => onsen.recordSelfWrite(write))
     itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     Lanes.observeItemGates(() => itemPeek!.reset())
@@ -2996,11 +3003,12 @@ function keepwarmMode(): 'live' | 'dry' | 'off' {
   v = v.trim()
   return v === 'live' || v === 'dry' ? v : 'off'
 }
-if (INBOX_ONLY && keepwarmMode() !== 'off') {
-  new LocalKeepwarm({
-    name: INBOX_SELF,
+if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
+  const keepwarm = new LocalKeepwarm({
+    name: takeMode?.member ?? INBOX_SELF,
     stateDir: STATE_DIR,
-    mode: keepwarmMode,
+    take: takeMode,
+    mode: () => takeMode?.active ? 'live' : takeMode || onsenPuller?.onTake ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
     ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
@@ -3016,7 +3024,7 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
     },
     // the same line the Mac mini watchdog sends through /inject: sender fleet-watchdog, no_reply
     deliver: async (text) => {
-      if (activeServers.size === 0) return false
+      if (onsenPuller?.onTake || activeServers.size === 0) return false
       const chatId = String(loadAccess().allowFrom[0] ?? 'local-inject')
       await dispatchInbound(chatId, {
         method: 'notifications/claude/channel',
@@ -3028,7 +3036,9 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
       return true
     },
     log,
-  }).start()
+  })
+  if (takeMode) takeKeepwarm = keepwarm
+  else keepwarm.start()
 }
 
 // WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of

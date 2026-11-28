@@ -176,6 +176,27 @@ function scriptedLane(root: string) {
 }
 
 const worker = 'adam.worker.1'
+test('C5 active connector schedules its own keepwarm with the legacy local switch off, including across restart', async () => {
+  const at = Date.now() - 120_000, sid = randomUUID(), ts = (ms: number) => new Date(at + ms).toISOString()
+  const d = await daemon({}, 200, root => {
+    writeFileSync(join(root, '.lanes', 'main-expected'), sid)
+    writeFileSync(join(root, sid + '.jsonl'), [
+      { type: 'user', timestamp: ts(0), message: { content: '做這件事' } },
+      { type: 'api-request', timestamp: ts(1000), querySource: 'repl_main_thread' },
+      { type: 'assistant', timestamp: ts(2000), message: { model: 'fixture', usage: { cache_read_input_tokens: 1000 } } },
+      { type: 'system', subtype: 'turn_duration', timestamp: ts(3000) },
+    ].map(entry => JSON.stringify(entry)).join('\n'))
+    return { KEEPWARM_PROJECTS_DIR: root }
+  })
+  await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'keepwarm'))
+  const [row] = d.f.rows.values()
+  expect(row).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', not_before: ts(1000 + 50 * 60_000), deadline: null })
+  await d.restart()
+  await waitFor(() => d.f.calls.filter(c => c.query.get('kind') === 'keepwarm').length >= 2)
+  expect(d.f.calls.filter(c => c.body.kind === 'keepwarm')).toHaveLength(1)
+  expect(row!.state).toBe('waiting')
+})
+
 test('C5 converts a saved followup and delivers its self Item once to the original worker', async () => {
   const thread = 'adam#check', event = 'prior-run', id = 'fu-old', due = Date.now() + 2500
   const d = await daemon({}, 200, root => {

@@ -23,7 +23,8 @@ export type ClaimStore = {
 
 export class ItemReceiver {
   private requesting = new Set<string>()
-  constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void) {}
+  constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void,
+    readonly currentKeepwarm?: (due?: string) => boolean) {}
 
   report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
     for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
@@ -40,7 +41,15 @@ export class ItemReceiver {
     const ids = [...byId.keys()]
     if (ids.some(id => this.requesting.has(id))) return result
     if (binding) for (const id of ids) if (this.claims.owns(id)) result.given.add(id)
-    const need = ids.filter(id => !this.claims.owns(id)).slice(0, 100)
+    const need = ids.filter(id => {
+      if (this.claims.owns(id)) return false
+      const ref = byId.get(id)!
+      if (ref.kind === 'keepwarm' && this.currentKeepwarm && !this.currentKeepwarm(ref.not_before)) {
+        result.gone.add(id)
+        return false
+      }
+      return true
+    }).slice(0, 100)
     if (!need.length) return result
     for (const id of need) this.requesting.add(id)
     const key = randomUUID()
