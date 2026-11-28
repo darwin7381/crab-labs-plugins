@@ -205,6 +205,7 @@ describe('#dev items (Chiron mesh 13257)', () => {
     expect(start.text).toContain('開發任務（codex-runner 已經準備好：./repo')
     expect(start.text).toContain('不開任何憑證檔')
     expect(start.text).toContain('postgresql://postgres@127.0.0.1:55432')
+    expect(start.text).not.toContain('測試台')                                   // no bench configured: none named
     const clone = join(start.dir, 'repo')
     expect(g(clone, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('codex/call-9960')
     expect(g(bare, 'ls-tree', '--name-only', 'codex/call-9960')).toContain('hello.txt')     // pushed: that branch only
@@ -1041,5 +1042,19 @@ describe('the folder', () => {
       root: '/h/onsen-codex', stateDir: '/h/onsen-codex/.runner', max: 3, timeoutMs: 1_800_000, killGraceMs: 10_000, sandbox: 'workspace-write', codexBin: 'codex' })
     const d = configFromEnv({ HOME: '/h', CODEX_RUNNER_MAX: '2', CODEX_RUNNER_TIMEOUT_S: '60', ONSEN_BASE: 'http://x/api/onsen/', CODEX_RUNNER_CREDENTIAL_FILE: '/c' })
     expect(d).toMatchObject({ max: 2, timeoutMs: 60_000, base: 'http://x/api/onsen', credentialFile: '/c' })
+  })
+  test('#dev: a configured test bench is named in the brief, with the absolute token folder; none configured, none named', () => {
+    expect(configFromEnv({ HOME: '/h' })).toMatchObject({ devBench: '', devBenchTokens: '' })
+    const h = mkdtempSync(join(tmpdir(), 'cxr-bench-'))
+    const c = configFromEnv({ HOME: h, CODEX_RUNNER_DEV_BENCH: 'http://100.108.237.80:19230/', CODEX_RUNNER_DEV_BENCH_TOKENS: '/Users/x/.config/fleet-core-bench/' })
+    expect(c).toMatchObject({ devBench: 'http://100.108.237.80:19230', devBenchTokens: '/Users/x/.config/fleet-core-bench' })
+    const job = { id: 'j1', call_id: '5', dev: { repo: 'fleet-core', branch: 'b', base: 'origin/main' } } as any
+    const brief = new CodexRunner(c).devBrief(job)
+    expect(brief).toContain('127.0.0.1，和下一行的測試台')
+    expect(brief).toContain('測試台（只有測試資料，正式程式接不到）：http://100.108.237.80:19230。')
+    expect(brief).toContain('/Users/x/.config/fleet-core-bench/<名字>.token')
+    expect(brief).toContain('不碰正式機（core.kbro.ai）')
+    expect(new CodexRunner(configFromEnv({ HOME: h })).devBrief(job)).not.toContain('測試台')
+    rmSync(h, { recursive: true, force: true })
   })
 })

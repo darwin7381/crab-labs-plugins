@@ -79,6 +79,9 @@ export type Cfg = {
   /** #dev items (Chiron mesh 13257): their own time limit (CODEX_RUNNER_DEV_TIMEOUT_S, 3600), the repo names that stand for a local path
    *  (CODEX_RUNNER_DEV_REPOS name=path,…; an absolute path to any local git repo works too), the throwaway PostgreSQL the brief names */
   devTimeoutMs: number; devRepos: Record<string, string>; devPg: string
+  /** the test bench a #dev item may use (Joey TG chiron:3105, Chiron mesh 14129: bench acceptance goes to Codex): its URL and the folder of its
+   *  identities' tokens, by absolute path (the child's HOME is Codex's own home, so ~ would not find them); unset → the brief names no bench */
+  devBench: string; devBenchTokens: string
   log?: (level: 'info' | 'warn' | 'error', msg: string) => void; now?: () => number; heartbeatMs?: number; declareRetryMs?: number
 }
 /** the #dev repo shortcuts: name → local path (Chiron mesh 13257: a shortcut, never a list that refuses the others) */
@@ -125,6 +128,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
     devTimeoutMs: num(env.CODEX_RUNNER_DEV_TIMEOUT_S, 3600) * 1000,
     devRepos: devRepos(env.CODEX_RUNNER_DEV_REPOS, home),
     devPg: (env.CODEX_RUNNER_DEV_PG || 'postgresql://postgres@127.0.0.1:55432').trim(),
+    devBench: (env.CODEX_RUNNER_DEV_BENCH || '').trim().replace(/\/+$/, ''), devBenchTokens: (env.CODEX_RUNNER_DEV_BENCH_TOKENS || '').trim().replace(/\/+$/, ''),
     model: /^[A-Za-z0-9._:-]{1,80}$/.test((env.CODEX_RUNNER_MODEL ?? '').trim()) ? env.CODEX_RUNNER_MODEL!.trim() : null,
     effort: effortOf(env.CODEX_RUNNER_EFFORT),
     // Chiron #200750 (11-27; Joey told, TG chiron:2929 and 2884): a #dev item thinks at max; ultra is accepted but not the default (its sharding
@@ -856,7 +860,10 @@ export class CodexRunner {
     return [`開發任務（codex-runner 已經準備好：./repo 是 ${d.repo} 的 clone，分支 ${d.branch}，從 ${d.base} 開）。規矩：`,
       '- 只在 ./repo 裡改，小步 commit；不要 push、不要切到 main（做完 runner 會把這個分支推上去）。',
       '- 不開任何憑證檔：.env、*.credential、auth.json、.secrets、mesh-credential。',
-      `- 網路只用在本機的測試：127.0.0.1；要資料庫用拋棄式 PostgreSQL ${this.cfg.devPg}，用你自己的 db 名（例如 ${db}）。`,
+      `- 網路只用在本機的測試：127.0.0.1${this.cfg.devBench ? '，和下一行的測試台' : ''}；要資料庫用拋棄式 PostgreSQL ${this.cfg.devPg}，用你自己的 db 名（例如 ${db}）。`,
+      ...(this.cfg.devBench ? [`- 測試台（只有測試資料，正式程式接不到）：${this.cfg.devBench}。`
+        + (this.cfg.devBenchTokens ? `身分的 token 在 ${this.cfg.devBenchTokens}/<名字>.token；只在程式裡讀，不印、不寫進檔案、commit 或回覆。` : '')
+        + '只對測試台和 127.0.0.1 連線，不碰正式機（core.kbro.ai）。'] : []),
       '- 不對任何人或任何線上服務送東西。',
       '- 最後的回覆要有：commit 清單；在這個環境跑過的測試與數字；跑不了的（和原因）；要負責人定的問題。「跑過的」和「跑不了的」分開寫。'].join('\n')
   }
