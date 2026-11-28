@@ -23,8 +23,8 @@ export class Claims implements ClaimStore {
   private done: Done[] = []
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
 
-  constructor(readonly file: string, readonly spool: Spool, readonly missed: (id: string) => void,
-    readonly changed: () => void, readonly now = Date.now) {
+  constructor(readonly file: string, readonly spool: Spool, readonly missed: (id: string, outcome: 'not_taken' | 'superseded') => void,
+    readonly changed: () => void, readonly now = Date.now, readonly unboundOutcome: (id: string) => 'not_taken' | 'superseded' = () => 'not_taken') {
     try {
       const data = JSON.parse(readFileSync(file, 'utf8'))
       this.rows = Object.assign(Object.create(null), data.claims)
@@ -56,6 +56,7 @@ export class Claims implements ClaimStore {
     const row = this.rows[id]
     return !!row && (!row.last_outcome || intermediate.has(row.last_outcome))
   }
+  inSession(id: string): boolean { return !!this.rows[id]?.in_session_at }
   blocked(): boolean { return this.spool.hasItemReports() }
   completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
 
@@ -73,9 +74,10 @@ export class Claims implements ClaimStore {
     if (!this.owns(id) || row.in_session_at) return
     const expire = () => {
       if (!this.owns(id) || this.rows[id]?.in_session_at) return
-      try { this.report(id, 'not_taken') }
+      const outcome = this.unboundOutcome(id)
+      try { this.report(id, outcome) }
       catch { this.timers.set(id, setTimeout(expire, 1000).unref()); return }
-      this.missed(id)
+      this.missed(id, outcome)
     }
     const delay = Math.max(0, Date.parse(row.taken_at) + 20_000 - this.now())
     this.timers.set(id, setTimeout(expire, delay).unref())

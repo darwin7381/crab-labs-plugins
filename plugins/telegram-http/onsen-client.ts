@@ -85,6 +85,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
+import { isDeepStrictEqual } from 'node:util'
 import { ItemWrites, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
@@ -479,6 +480,8 @@ export class OnsenClient {
     }
   }
   hasItemReports(): boolean { return this.itemReports > 0 }
+  private itemWriteAck?: (write: ItemWrite, row?: import('./onsen-items.ts').InboxItem) => void
+  watchItemWrites(ack: NonNullable<typeof this.itemWriteAck>): void { this.itemWriteAck = ack }
   mayWithdrawKeepwarm?: (row: import('./onsen-items.ts').InboxItem) => boolean
   onItemCreateSettled?: (key: string, id?: string) => void
   hasPendingItemCreate(keys: Set<string>): boolean {
@@ -505,9 +508,14 @@ export class OnsenClient {
       if (id) write = { ...write, id }
       else if (this.hasPendingItemCreate(new Set([write.key]))) write = { ...write, pending_create: true }
     }
-    if (write.id && write.outcome === 'withdrawn' && write.item.kind === 'keepwarm') {
+    const resume = write.item.kind === 'resume'
+    if (resume || (write.id && write.outcome === 'withdrawn' && write.item.kind === 'keepwarm')) {
       for (const line of this.pendingLines()) {
-        if (line.k === 'item' && line.r.id === write.id && line.r.outcome === write.outcome && line.r.expected_version === write.expected_version) return
+        if (line.k !== 'item' && line.k !== 'self') continue
+        const pending = line.r
+        if (write.id && pending.id === write.id && pending.outcome === write.outcome && pending.expected_version === write.expected_version) return
+        if (resume && !write.outcome && !write.complete && !pending.outcome && !pending.complete
+          && pending.key === write.key && isDeepStrictEqual(pending.item, write.item)) return
       }
     }
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
@@ -540,7 +548,7 @@ export class OnsenClient {
     this.reportedThrough = this.readCursor('reportedThrough')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
     this.linesFile = join(cfg.dir, 'lines.json')
-    this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, this.request.bind(this))
+    this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, (...args) => this.request(...args))
   }
   private get f(): typeof fetch { return this.cfg.fetch ?? fetch }
 
@@ -1032,6 +1040,7 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, path)
+        this.itemWriteAck?.(t.line.r, r.status >= 200 && r.status < 300 ? r.json?.data : undefined)
         if (!t.line.r.outcome && !t.line.r.complete) this.onItemCreateSettled?.(t.line.r.key, r.status < 300 ? r.json?.data?.id : this.itemWrites.id(t.line.r.key))
         this.writeCursor(t.end)
         this.ok(); i++; continue

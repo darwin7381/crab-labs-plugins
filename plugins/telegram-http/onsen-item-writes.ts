@@ -154,7 +154,7 @@ export class ItemWrites {
     const latest = await this.req('GET', detail)
     if (latest?.status === 200) this.observe(latest.json?.data)
     // A concurrent edit left it waiting. The next spool pass reads its new version.
-    if (latest?.status === 200 && latest.json.data.state === 'waiting') return { status: 503, json: result.json }
+    if (latest?.status === 200 && latest.json.data.state === 'waiting') return latest.json.data.version === current.json.data.version ? result : { status: 503, json: result.json }
     return latest
   }
 

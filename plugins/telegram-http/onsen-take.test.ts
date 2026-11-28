@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -8,8 +8,8 @@ import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
-import { ItemReceiver } from './onsen-receive.ts'
-import { createMain, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
+import { ItemReceiver, type Outcome } from './onsen-receive.ts'
+import { createMain, MAIN_IDLE_CONFIRM_MS, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { Registry, REGISTRY_SETTLE_MS } from './onsen-status.ts'
 
@@ -27,7 +27,7 @@ function rig() {
   const mode = new TakeMode('adam', client.request.bind(client), () => {}, line => logs.push(line), 'mac-mini')
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
-  const claims = new Claims(file, client, id => { misses.push(id); main?.offerMissed(id) }, () => {}, f.now)
+  const claims = new Claims(file, client, (id, outcome) => { misses.push(id); main?.offerMissed(id, outcome) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
   client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok))
   const receiver = new ItemReceiver(mode, claims, time => deadlines.push(time))
   clean.push(() => { mode.stop(); claims.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) })
@@ -35,16 +35,19 @@ function rig() {
   return { f, client, mode, claims, file, receiver, dir, logs, misses, deadlines, outcomes, sync: () => client.syncNow(true),
     attach(m: MainApi) { main = m } }
 }
-async function mainRig() {
+async function mainRig(backoff = 300_000, onOffer = async () => true) {
   const r = rig()
   await r.mode.probe()
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
   const sid = crypto.randomUUID(), pid = 1051
   let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
-  const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return true },
+  const writer = { write: (write: import('./onsen-item-writes.ts').ItemWrite) => { r.client.recordItemWrite(write); r.client.start() } }
+  const m = createMain({ journal, agent: 'adam', takingItems: () => r.mode.active, writeItem: write => writer.write(write), writtenItemId: key => r.client.writtenItemId(key), itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
+    wallBackoff: () => backoff, registry: { mainForAdoption: () => null, backgroundAgents: () => bg },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: () => true, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {}, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
     mainOwed: ids => owes ? ids.map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })) : [], usageWall: () => wall })
+  r.client.watchItemWrites(m.itemWriteSettled)
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
   await hook('SessionStart', { source: 'startup' })
@@ -58,7 +61,7 @@ async function mainRig() {
     expect(r.outcomes(row.id)).toContain('in_session')
     return did
   }
-  return { ...r, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
+  return { ...r, writer, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
     owing(value: boolean) { owes = value } }
 }
 
@@ -91,6 +94,779 @@ test('loopback list and detail match the captured 0.40.0 envelopes and add the S
   for (const row of [list.items.find((it: any) => it.id === mail.id), detail, take])
     expect(row).toMatchObject({ kind: 'mail', mail_id: '81', note: null, payload: old.payload })
   expect(detail.events).toBeArray()
+})
+
+test('C4 a bare model error writes one resume; the normal peek takes it when due, with the WO-209 sentence', async () => {
+  const r = await mainRig(250)
+  await r.hook('UserPromptSubmit')
+  const earliest = Date.now() + 250
+  await r.hook('StopFailure', { error: 'overloaded' })
+  const latest = Date.now() + 250
+  await until(() => r.f.rows.size === 1)
+  const row = [...r.f.rows.values()][0]!
+  const writes = () => r.f.calls.filter(c => c.path === r.mode.path && c.body.kind === 'resume')
+  expect(writes()).toHaveLength(1)
+  expect(writes()[0]!.key).toBeTruthy()
+  expect(row).toMatchObject({ kind: 'resume', session_id: 'main', state: 'waiting' })
+  const due = Date.parse(row.not_before!)
+  expect(due).toBeGreaterThanOrEqual(earliest)
+  expect(due).toBeLessThanOrEqual(latest)
+  const hhmm = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' }).format(due - 250)
+  const sentence = `上一回合 ${hhmm}（台北）被打斷（模型回應錯誤 overloaded），接著做沒做完的；沒有要接的就直接結束這一回合。`
+  expect(row.payload.text).toBe(sentence)
+  const peek = new ItemPeek(r.mode, () => new Map(), async it => r.m.routeResume(itemRef(it), it.payload.text), () => true)
+  clean.push(() => peek.stop())
+  await peek.poll()
+  await r.m.pump()
+  expect(r.offers).toHaveLength(0)
+  expect(r.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
+  r.f.advance(due - r.f.now())
+  await until(() => r.offers.length === 1)
+  const { content, meta } = r.offers[0].params
+  expect(content).toBe(sentence)
+  expect(meta).toMatchObject({ chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' })
+  expect(row.state).toBe('claimed')
+  await r.hook('UserPromptSubmit', { prompt_id: 'resume', dids: [meta.did] })
+  await r.hook('Stop', { prompt_id: 'resume', phase: 'final' })
+  r.f.advance(3100); r.status('idle'); await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
+  await r.m.tick()
+  expect([writes().length, r.offers.length]).toEqual([1, 1])
+  expect(r.m.currentGen()?.resume_sent).toBeUndefined()
+})
+
+test('C4 reuses the C5 pending Item line and durable id across client restart', async () => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  const { key, create } = r.m.currentGen()!.resume_items[0]
+  const restarted = new OnsenClient(r.client.cfg)
+  for (let n = 0; n < 10; n++) {
+    await r.m.pump()
+    restarted.recordItemWrite({ key, item: create })
+  }
+  const lines = () => readFileSync(r.client.spool, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  expect(lines()).toEqual([{ k: 'item', r: { key, item: create } }])
+  await r.sync()
+  const [row] = r.f.rows.values()
+  expect(restarted.writtenItemId(key)).toBe(row!.id)
+  await r.hook('UserPromptSubmit', { prompt_id: 'continued', dids: [] })
+  await r.sync()
+  expect(lines().map(line => line.k)).toEqual(['item', 'item'])
+  expect(lines()[1].r).toMatchObject({ id: row!.id, outcome: 'superseded' })
+  expect(row).toMatchObject({ state: 'cancelled', reason: 'superseded' })
+  expect(restarted.writtenItemId(key)).toBeUndefined()
+  expect(r.f.calls.filter(call => call.body.kind === 'resume')).toHaveLength(1)
+})
+
+test('C4 a process cut records the old background count; an item failure and an asked restart create no resume', async () => {
+  const d = await mainRig()
+  d.status('busy', 2)
+  await d.hook('UserPromptSubmit')
+  await d.hook('SessionEnd')
+  await until(() => d.f.rows.size === 1)
+  const row = [...d.f.rows.values()][0]!
+  expect(row.payload.text).toContain('（對話結束），接著做沒做完的；沒有要接的就直接結束這一回合。當時有 2 個背景工作在跑，重開後已經不在。')
+  expect(row.not_before).toBeNull()
+
+  const other = await mainRig()
+  const message = other.f.add('work')
+  await other.bind(message)
+  await other.hook('StopFailure', { error: 'server_error' }); await other.sync()
+  await other.hook('StopFailure', { error: 'server_error' })
+  await other.hook('UserPromptSubmit', { prompt_id: 'typing' })
+  other.m.markEnd('asked')
+  await other.hook('SessionEnd')
+  expect(other.outcomes('work')).toContain('error')
+  expect([...other.f.rows.keys()]).toEqual(['work'])
+})
+
+async function accountCut(onOffer?: () => Promise<boolean>) {
+  const r = await mainRig(undefined, onOffer)
+  r.setWall({ walled: true, clearedMs: null })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  await until(() => !!r.m.currentGen()?.resume_items?.[0]?.id)
+  const row = [...r.f.rows.values()][0]!
+  r.m.routeResume(itemRef(row), row.payload.text)
+  return { ...r, row }
+}
+
+test('C4 switch to take imports an unsent pull cut, and waits for a pull stream write already in flight', async () => {
+  const pending = await mainRig()
+  pending.mode.pause('pull', 60_000)
+  await pending.hook('UserPromptSubmit')
+  await pending.hook('StopFailure', { error: 'overloaded' })
+  const retry = pending.m.currentGen()!.cut_turn.retry_at
+  await pending.mode.probe(); await pending.m.pump()
+  await until(() => pending.f.rows.size === 1)
+  expect([...pending.f.rows.values()][0]!.not_before).toBe(new Date(retry).toISOString())
+  expect(pending.m.currentGen()?.cut_turn).toBeUndefined()
+  expect(pending.offers).toHaveLength(0)
+
+  let finish!: (sent: boolean) => void
+  const writing = await mainRig(0, () => new Promise(resolve => { finish = resolve }))
+  writing.mode.pause('pull', 60_000)
+  await writing.hook('UserPromptSubmit')
+  await writing.hook('StopFailure', { error: 'overloaded' })
+  const receipt = writing.m.pump()
+  await until(() => writing.offers.length === 1)
+  await writing.mode.probe(); await writing.m.pump()
+  finish(true); await receipt; await writing.m.pump()
+  expect(writing.m.currentGen()!.resumes).toBe(1)
+  expect(writing.f.calls.filter(c => c.body.kind === 'resume')).toHaveLength(0)
+})
+
+test.each(['queued create', 'waiting row'])('C4 a refused new prompt shares the session’s %s', async stage => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: true, clearedMs: null })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  if (stage === 'waiting row') await r.sync()
+  const key = r.m.currentGen()!.resume_items[0].key
+  await r.hook('StopFailure', { prompt_id: 'refused-retry', error: 'rate_limit' })
+  await r.sync()
+  const rows = [...r.f.rows.values()]
+  expect(rows).toHaveLength(1)
+  expect(r.f.calls.filter(c => c.body.kind === 'resume').map(c => c.key)).toEqual([key])
+  r.m.routeResume(itemRef(rows[0]!), rows[0]!.payload.text)
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await until(() => { void r.m.pump(); return r.offers.length === 1 })
+  await r.hook('UserPromptSubmit', { prompt_id: 'received', dids: [r.offers[0].params.meta.did] })
+  await r.hook('Stop', { prompt_id: 'received', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(rows[0]!.id)).toEqual(['in_session', 'completed'])
+  expect(r.offers).toHaveLength(1)
+  await r.hook('UserPromptSubmit', { prompt_id: 'later-work', dids: [] })
+  await r.hook('StopFailure', { prompt_id: 'later-work', error: 'server_error' }); await r.sync()
+  expect([...r.f.rows.values()].map(row => row.state)).toEqual(['completed', 'waiting'])
+})
+
+test('C4 a refused resume probe belongs to its claimed row even if StopFailure is the first hook', async () => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  await r.hook('StopFailure', { prompt_id: 'probe', error: 'rate_limit' })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session', 'usage_limit_probe'])
+  expect(r.f.rows.size).toBe(1)
+})
+
+test.each(['settling', 'background'])('C4 a later itemless turn lets the delivered resume finish (%s)', async phase => {
+  const background = phase === 'background'
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  await r.hook('UserPromptSubmit', { prompt_id: 'received', dids: [r.offers[0].params.meta.did] })
+  await r.hook('Stop', { prompt_id: 'received', phase: 'final' })
+  r.f.advance(background ? REGISTRY_SETTLE_MS + 1 : 100)
+  r.status('idle', background ? 1 : 0); await r.sync()
+  const prior: Outcome[] = background ? ['in_session', 'background'] : ['in_session']
+  expect(r.outcomes(r.row.id)).toEqual(prior)
+  await r.hook('UserPromptSubmit', { prompt_id: 'notification', dids: [] })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(prior)
+  await r.hook('Stop', { prompt_id: 'notification', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual([...prior, 'completed'])
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each(['bound', 'done'])('C4 a folded %s M1 delivery protects a resume without a local claim', async state => {
+  const r = await accountCut()
+  const receipt = r.m.items(it => it.onsen_items?.[0]?.onsen_item_id === r.row.id)[0]!
+  r.journal.write('msg', receipt.id, state, { gen: r.m.currentGen()!.id, prompt_id: 'received' })
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.sync()
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
+})
+
+test('C4 an in-session claim protects a resume before the M1 bound write', async () => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  r.claims.bind(r.row.id, 'main', 'received', r.sid); await r.sync()
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] }); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session'])
+})
+
+test('C4 a delayed create acknowledgement respects an existing M1 delivery of that Item', async () => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: true, clearedMs: null })
+  const request = r.client.request.bind(r.client)
+  let release!: () => void
+  const ack = new Promise<void>(resolve => { release = resolve })
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (args[0] === 'POST' && args[1] === r.mode.path) await ack
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  const writing = r.sync()
+  await until(() => r.f.rows.size === 1)
+  const row = [...r.f.rows.values()][0]!
+  r.m.routeResume(itemRef(row), row.payload.text)
+  const receipt = r.m.items(it => it.onsen_items?.[0]?.onsen_item_id === row.id)[0]!
+  r.journal.write('msg', receipt.id, 'bound', { gen: r.m.currentGen()!.id, prompt_id: 'received' })
+  await r.hook('UserPromptSubmit', { prompt_id: 'notification', dids: [] })
+  release()
+  await writing; await r.sync()
+  expect(r.journal.get('msg', receipt.id)?.state).toBe('bound')
+  expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
+})
+
+test('C4 an offline unbound resume remembers the continuation and expires as superseded', async () => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  r.f.down(true)
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+  expect(r.client.hasItemReports()).toBe(false)
+  r.f.advance(25_000); r.claims.start()
+  await until(() => r.client.hasItemReports())
+  await r.sync()
+  r.f.down(false); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['superseded'])
+  expect(r.misses).toEqual([r.row.id])
+})
+
+test('C4 a same-prompt independent turn supersedes the waiting row at its latest version', async () => {
+  const r = await accountCut()
+  expect(r.f.calls.find(c => c.body.kind === 'resume')!.body).not.toHaveProperty('not_before')
+  await r.hook('PreToolUse', { sub: true })
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.rows.size).toBe(1)
+  r.f.change(r.row, 'updated')
+  const version = r.row.version
+  await r.hook('UserPromptSubmit', { dids: [] })
+  await until(() => r.row.state === 'cancelled')
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded')).toMatchObject([
+    { path: '/v1/items/' + r.row.id, body: { expected_version: version, outcome: 'superseded' } },
+  ])
+  await r.hook('Stop', { phase: 'final' })
+  await r.m.tick()
+  expect(r.row.reason).toBe('superseded')
+  expect(r.offers).toEqual([])
+})
+
+test.each(['UserPromptSubmit', 'PreToolUse', 'Stop'])('C4 a background notification first seen at %s preserves the waiting resume', async event => {
+  const r = await accountCut()
+  await r.hook(event, { prompt_id: 'notification', source: 'task-notification', dids: [], phase: 'final' })
+  if (event !== 'Stop') await r.hook('Stop', { prompt_id: 'notification', phase: 'final' })
+  await r.sync()
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.calls.filter(c => c.body.outcome)).toHaveLength(0)
+})
+
+test('a pull member keeps its local offer binding when a background notification opens a turn', async () => {
+  const r = await mainRig()
+  r.mode.stop()
+  const did = r.enqueue(r.f.add('legacy-delivery'), true)
+  await until(() => r.journal.get('msg', did)?.state === 'offered')
+  await r.hook('UserPromptSubmit', { prompt_id: 'legacy-prompt', source: 'task-notification', dids: [] })
+  expect(r.journal.get('msg', did)).toMatchObject({ state: 'bound', prompt_id: 'legacy-prompt' })
+  expect(r.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
+})
+
+test('a take member ignores a delivery id quoted inside background output', async () => {
+  const r = await accountCut()
+  const did = r.enqueue(r.f.add('quoted-work', 'call'))
+  await r.hook('UserPromptSubmit', { prompt_id: 'notification', source: 'task-notification', dids: [did], channel_dids: [] })
+  await r.hook('Stop', { prompt_id: 'notification', phase: 'final' }); await r.sync()
+  expect(r.journal.get('msg', did)?.state).toBe('queued')
+  expect(r.row.state).toBe('waiting')
+})
+
+test('C4 a new prompt first seen at a tool with no origin cannot discard the interrupted prompt', async () => {
+  const r = await accountCut()
+  await r.hook('PreToolUse', { prompt_id: 'unidentified', tool_name: 'Read' })
+  await r.hook('Stop', { prompt_id: 'unidentified', phase: 'final' }); await r.sync()
+  expect(r.row.state).toBe('waiting')
+})
+
+test('C4 auto-resume between the server take and its response spools superseded without a stream write', async () => {
+  const r = await accountCut()
+  r.f.delayTake(100)
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  const offer = r.m.pump()
+  await until(() => r.row.state === 'claimed')
+  const claim = r.row.claim!.id
+  await r.hook('PreToolUse', { prompt_id: 'turn', tool_name: 'Read' })
+  await offer
+  await r.sync()
+  expect(r.f.history).toMatchObject([{ item_id: r.row.id, body: { claim_id: claim, outcome: 'superseded' } }])
+  expect(r.row).toMatchObject({ state: 'cancelled', reason: 'superseded', failures: 0 })
+  expect(r.f.calls.some(c => c.body.expected_version !== undefined)).toBe(false)
+  expect(r.offers).toEqual([])
+})
+
+test('C4 a take recovered by its idempotency key reports the intervening auto-resume', async () => {
+  const r = await accountCut()
+  const request = r.mode.req
+  let lost = false
+  spyOn(r.mode, 'req').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (!lost && args[1].endsWith('/take')) {
+      lost = true
+      await r.hook('PreToolUse', { prompt_id: 'turn', tool_name: 'Read' })
+      throw Error('take response lost')
+    }
+    return reply
+  })
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump(); await r.sync()
+  const takes = r.f.calls.filter(c => c.path.endsWith('/take'))
+  expect(takes).toHaveLength(2)
+  expect(takes[0]!.key).toBe(takes[1]!.key)
+  expect(r.outcomes(r.row.id)).toEqual(['superseded'])
+  expect(r.offers).toEqual([])
+})
+
+test.each(['PreToolUse', 'Stop'])('C4 the first %s binds the offered resume claim when UserPromptSubmit was lost', async first => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  const did = r.offers[0].params.meta.did
+  expect(r.claims.owns(r.row.id)).toBe(true)
+  await r.hook(first, { prompt_id: 'by-claim', tool_name: 'Read', phase: 'final' })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session'])
+  expect(r.journal.get('msg', did)?.prompt_id).toBe('by-claim')
+  if (first !== 'Stop') await r.hook('Stop', { prompt_id: 'by-claim', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session', 'completed'])
+})
+
+test('C4 a late did whose re-take is blocked preserves the unrelated waiting resume', async () => {
+  const r = await accountCut()
+  r.client.stop()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  const prior = r.f.add('prior-claim')
+  await r.receiver.receive([itemRef(prior)])
+  r.claims.report(prior.id, 'cut')
+  const late = r.f.add('late-work', 'call'), did = r.enqueue(late)
+  expect(r.claims.blocked()).toBe(true)
+  await r.hook('UserPromptSubmit', { prompt_id: 'late', dids: [did] })
+  await r.sync(); await r.m.pump(); await r.sync()
+  expect(r.journal.get('msg', did)?.state).toBe('queued')
+  expect(r.outcomes(late.id)).toEqual([])
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
+})
+
+test.each(['item id', 'earlier did'])('C4 a prompt naming the %s binds the current receipt for that Item', async name => {
+  const r = await accountCut()
+  const row = r.f.add('named-work', 'call')
+  const old = r.enqueue(row)
+  r.journal.write('msg', old, 'done', { reason: 'old receipt' })
+  const current = r.enqueue(row)
+  await r.hook('UserPromptSubmit', { prompt_id: 'named', dids: [name === 'item id' ? row.id : old] })
+  await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session'])
+  expect(r.journal.get('msg', current)).toMatchObject({ state: 'bound', prompt_id: 'named' })
+  expect(r.row.state).toBe('waiting')
+})
+
+test('C4 a claimed offer that never reaches a turn is superseded', async () => {
+  const claimed = await accountCut()
+  claimed.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await claimed.m.pump()
+  expect(claimed.offers).toHaveLength(1)
+  await claimed.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await claimed.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+  expect(claimed.client.hasItemReports()).toBe(false)
+  claimed.f.advance(20_001); claimed.claims.start()
+  await until(() => claimed.client.hasItemReports())
+  await claimed.sync(); await claimed.m.tick()
+  expect(claimed.outcomes(claimed.row.id)).toEqual(['superseded'])
+  expect(claimed.offers).toHaveLength(1)
+})
+
+test.each(['same prompt', 'next prompt'])('settled 59: a queued resume actually enters the %s after an independent turn starts', async timing => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  const did = r.offers[0].params.meta.did, claim = r.row.claim!.id
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  if (timing === 'next prompt') await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+  await r.sync()
+  expect(r.row.state).toBe('claimed')
+  const prompt_id = timing === 'next prompt' ? 'with-text' : 'automatic'
+  await r.hook('UserPromptSubmit', { prompt_id, dids: [did] })
+  await r.hook('Stop', { prompt_id, phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session', 'completed'])
+  expect(r.f.history.every(h => h.body.claim_id === claim)).toBe(true)
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each([true, false])('settled 59: continuation during the stream write reports what reached the turn (write=%p)', async written => {
+  let finish!: (ok: boolean) => void
+  const r = await accountCut(() => new Promise(resolve => { finish = resolve }))
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  const sending = r.m.pump()
+  await until(() => r.offers.length === 1)
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual([])
+  finish(written); await sending
+  if (written) {
+    await r.hook('UserPromptSubmit', { prompt_id: 'with-text', dids: [r.offers[0].params.meta.did] })
+    await r.hook('Stop', { prompt_id: 'with-text', phase: 'final' })
+    r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle')
+  }
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(written ? ['in_session', 'completed'] : ['superseded'])
+})
+
+test.each(['late receipt', 'session end', 'confirmed idle'])('settled 59: a long independent turn leaves the queued input open for its %s', async end => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  const did = r.offers[0].params.meta.did
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  r.f.advance(20_001); r.claims.start()
+  await until(() => r.client.hasItemReports()); await r.sync()
+  expect(r.row.state).toBe('waiting')
+  expect(r.outcomes(r.row.id)).toEqual(['not_taken'])
+  if (end === 'late receipt') {
+    await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+    r.m.statusIdle(true)
+    await r.hook('UserPromptSubmit', { prompt_id: 'queued-text', dids: [did] })
+    await r.hook('Stop', { prompt_id: 'queued-text', phase: 'final' })
+    r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+    expect(r.outcomes(r.row.id)).toEqual(['not_taken', 'in_session', 'completed'])
+    expect(r.row.state).toBe('completed')
+  } else {
+    if (end === 'confirmed idle') {
+      await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+      const now = Date.now()
+      r.m.statusIdle(true, now); await r.sync()
+      expect(r.row.state).toBe('waiting')
+      r.m.statusIdle(true, now + MAIN_IDLE_CONFIRM_MS + 1)
+    } else await r.hook('SessionEnd')
+    await r.sync()
+    expect(r.row).toMatchObject({ state: 'cancelled', reason: 'superseded' })
+  }
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each(['waiting', 'claimed before the receipt', 'claimed after the receipt'])('settled 59: after a blocked claim spool the late receipt completes an Item that is %s', async state => {
+  const r = await accountCut()
+  r.client.stop()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  const did = r.offers[0].params.meta.did
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  r.f.advance(20_001); r.claims.start(); await until(() => r.claims.blocked())
+  await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+  const receiveAndStop = async () => {
+    await r.hook('UserPromptSubmit', { prompt_id: 'received-late', dids: [did] })
+    await r.hook('Stop', { prompt_id: 'received-late', phase: 'final' })
+  }
+  if (state !== 'claimed before the receipt') await receiveAndStop()
+  await r.sync()
+  if (state !== 'waiting') {
+    const held = await r.mode.req('POST', r.mode.path + '/take', { connector: r.mode.connector, item_ids: [r.row.id], wait: 0, limit: 1 },
+      3000, { 'Idempotency-Key': crypto.randomUUID() })
+    expect(held?.json.data.items).toHaveLength(1)
+    if (state === 'claimed before the receipt') await receiveAndStop()
+    await r.m.pump()
+    const takes = () => r.f.calls.filter(c => c.path.endsWith('/take')).length
+    const before = takes()
+    await r.m.pump()
+    expect(takes()).toBe(before)
+    const released = await fetch(r.f.base + '/v1/items/' + r.row.id + '/report', { method: 'PUT',
+      headers: { Authorization: 'Bearer test-member', 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+      body: JSON.stringify({ claim_id: held!.json.data.claim_id, outcome: 'not_taken', at: new Date(r.f.now()).toISOString() }) })
+    expect(await released.json()).toMatchObject({ data: { state: 'waiting' } })
+  }
+  r.m.initMain(); r.m.routeResume(itemRef(r.row), r.row.payload.text)
+  await until(() => r.claims.inSession(r.row.id)); await r.sync()
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  const expected: Outcome[] = ['not_taken', 'in_session', 'completed']
+  if (state !== 'waiting') expected.unshift('not_taken')
+  expect(r.outcomes(r.row.id)).toEqual(expected)
+  expect(r.offers).toHaveLength(1)
+})
+
+async function waitingModelCut() {
+  const r = await mainRig()
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  await until(() => !!r.m.currentGen()?.resume_items?.[0]?.id)
+  const resume = [...r.f.rows.values()][0]!
+  return { ...r, resume, line: resume.payload.text as string }
+}
+
+test('settled 59: the next delivery carries the waiting line once and its normal Stop withdraws that exact resume', async () => {
+  const r = await waitingModelCut()
+  const { key } = r.m.currentGen()!.resume_items[0]
+  await r.bind(r.f.add('message'))
+  const content = r.offers[0].params.content
+  expect(content).toContain('message')
+  expect(content.split(r.line)).toHaveLength(2)
+  expect(r.resume.state).toBe('waiting')
+  expect(r.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids?.includes(r.resume.id))).toBe(false)
+  await r.hook('Stop', { phase: 'check' }); await r.sync()
+  expect(r.resume.state).toBe('waiting')
+  expect(r.client.writtenItemId(key)).toBe(r.resume.id)
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.resume).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
+  expect(r.client.writtenItemId(key)).toBeUndefined()
+  expect(r.f.calls.filter(c => c.path === '/v1/items/' + r.resume.id && c.body.outcome)).toMatchObject([{ body: { expected_version: 1, outcome: 'withdrawn' } }])
+})
+
+test.each([false, true])('settled 59: a turn first seen at a tool withdraws its carrier only with a matching receipt (late did=%p)', async received => {
+  const r = await waitingModelCut()
+  const did = r.enqueue(r.f.add('carrier'))
+  await until(() => r.journal.get('msg', did)?.state === 'offered')
+  expect(r.offers[0].params.content).toContain(r.line)
+  await r.hook('PreToolUse', { prompt_id: 'tool-first', tool_name: 'Read' })
+  if (received) await r.hook('UserPromptSubmit', { prompt_id: 'tool-first', dids: [did] })
+  await r.hook('Stop', { prompt_id: 'tool-first', phase: 'final' }); await r.sync()
+  expect(r.resume.state).toBe(received ? 'cancelled' : 'waiting')
+  expect(r.resume.reason).toBe(received ? 'withdrawn' : null)
+})
+
+test('settled 59: when the wall clears with a message already waiting, the resume rides that message', async () => {
+  const r = await accountCut()
+  r.enqueue(r.f.add('also-waiting'))
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await until(() => { void r.m.pump(); return r.offers.length === 1 })
+  expect(r.offers).toHaveLength(1)
+  expect(r.offers[0].params.content).toContain('also-waiting')
+  expect(r.offers[0].params.content.split(r.row.payload.text)).toHaveLength(2)
+  expect(r.row.state).toBe('waiting')
+  await r.hook('UserPromptSubmit', { dids: [r.offers[0].params.meta.did] })
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.row.reason).toBe('withdrawn')
+})
+
+test.each(['PostToolUse', 'Stop'])('settled 59: a row pulled at %s carries the line into that prompt once', async boundary => {
+  const r = await waitingModelCut()
+  const turn = { prompt_id: 'background', source: 'task-notification' }
+  await r.hook('UserPromptSubmit', turn)
+  r.enqueue(r.f.add('during-task'))
+  const got = await r.hook(boundary, { ...turn, phase: 'check' })
+  expect((got.additionalContext ?? got.block)!.split(r.line)).toHaveLength(2)
+  r.enqueue(r.f.add('also-during-task')); await r.sync()
+  const more = await r.hook('PostToolUse', turn)
+  expect(more.additionalContext).toContain('also-during-task')
+  expect(more.additionalContext).not.toContain(r.line)
+  await r.hook('Stop', { ...turn, phase: 'final' }); await r.sync()
+  expect(r.resume.reason).toBe('withdrawn')
+})
+
+test('settled 59: a failed carrier and an unrelated normal Stop keep the line for the next delivery', async () => {
+  const r = await waitingModelCut()
+  await r.bind(r.f.add('first-carrier'))
+  expect(r.offers[0].params.content).toContain(r.line)
+  await r.hook('StopFailure', { error: 'server_error' }); await r.sync()
+  await r.hook('UserPromptSubmit', { prompt_id: 'background', source: 'task-notification', dids: [] })
+  await r.hook('Stop', { prompt_id: 'background', phase: 'final' }); await r.sync()
+  expect(r.resume.state).toBe('waiting')
+  await r.bind(r.f.add('second-carrier'))
+  expect(r.offers.at(-1).params.content).toContain(r.line)
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.resume.reason).toBe('withdrawn')
+})
+
+test('settled 59: an older acknowledged resume recovers its sentence from its original journal entry', async () => {
+  const r = await waitingModelCut()
+  const g = r.m.currentGen()!, { key, id, session } = g.resume_items[0]
+  r.journal.write('main', g.id, g.state, { resume_items: [{ key, id, session }] })
+  r.m.initMain()
+  await r.bind(r.f.add('after-restart'))
+  expect(r.offers[0].params.content).toContain(r.line)
+  await r.hook('Stop', { phase: 'final' }); await r.sync()
+  expect(r.resume.reason).toBe('withdrawn')
+})
+
+test('settled 59: a new session receives its row without the previous session’s resume', async () => {
+  const r = await waitingModelCut(), session_id = crypto.randomUUID()
+  await r.hook('SessionStart', { session_id, source: 'clear' })
+  const did = r.enqueue(r.f.add('another-session'))
+  await until(() => r.offers.length === 1)
+  expect(r.offers[0].params.content).not.toContain(r.line)
+  await r.hook('UserPromptSubmit', { session_id, prompt_id: 'new', dids: [did] })
+  await r.hook('Stop', { session_id, prompt_id: 'new', phase: 'final' }); await r.sync()
+  expect(r.resume.state).toBe('waiting')
+})
+
+test('settled 59: a carrier can finish before the create is acknowledged', async () => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  const line = r.m.currentGen()!.resume_items[0].create.body.text
+  const did = r.enqueue(r.f.add('early-carrier'))
+  await until(() => r.offers.length === 1)
+  expect(r.offers[0].params.content).toContain(line)
+  await r.hook('UserPromptSubmit', { prompt_id: 'early', dids: [did] })
+  await r.hook('Stop', { prompt_id: 'early', phase: 'final' })
+  expect(r.f.rows.size).toBe(1)
+  await r.sync(); await r.m.pump(); await r.sync()
+  expect([...r.f.rows.values()].find(row => row.kind === 'resume')).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
+})
+
+test('C4 a resume create acknowledged during an unrelated take preserves the delivery claim', async () => {
+  const r = await mainRig()
+  const write = r.client.request.bind(r.client), request = r.mode.req
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const reply = await write(...args)
+    if (args[0] === 'POST' && args[1] === r.mode.path) await gate
+    return reply
+  })
+  spyOn(r.mode, 'req').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (args[1].endsWith('/take')) {
+      release()
+      await until(() => r.m.currentGen()?.resume_items?.some((e: any) => !!e.id))
+    }
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  await until(() => r.f.rows.size === 1)
+  const row = r.f.add('unrelated-message'), did = r.enqueue(row)
+  await until(() => r.offers.length > 0 || r.client.hasItemReports() || r.outcomes(row.id).includes('not_taken'))
+  await r.sync()
+  expect(r.outcomes(row.id)).not.toContain('not_taken')
+  expect(r.journal.get('msg', did)?.state).toBe('offered')
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each([400, 403, 409])('C4 a permanent HTTP %i rejects one spooled create and leaves other resumes deliverable', async status => {
+  const r = await mainRig()
+  const request = r.client.request.bind(r.client)
+  let calls = 0, release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] !== 'POST' || args[1] !== r.mode.path) return request(...args)
+    calls++
+    await gate
+    return { status, json: { error: { code: 'invalid_request' } } }
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'overloaded' })
+  await until(() => calls === 1)
+  const other = r.f.add('previous-resume', 'resume', { from: 'adam', payload: { text: '之前的工作' } })
+  r.m.routeResume(itemRef(other), other.payload.text)
+  await until(() => r.offers.length === 1)
+  release()
+  await until(() => r.client.skipped.count === 1)
+  for (let i = 0; i < 10; i++) { await r.m.pump(); await r.sync() }
+  expect(calls).toBe(1)
+  expect(r.logs.filter(l => l.includes('moved to rejected.jsonl'))).toHaveLength(1)
+  expect(r.m.currentGen()?.resume_items?.some((e: any) => e.create)).toBe(false)
+  expect(r.client.pendingBytes()).toBe(0)
+  expect(JSON.parse(readFileSync(r.client.rejected, 'utf8').trim()).line.k).toBe('item')
+})
+
+test('C4 a permanently refused DELETE retires its local offer and advances the spool once', async () => {
+  const r = await accountCut()
+  r.client.stop()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  const request = r.client.request.bind(r.client)
+  let deletes = 0
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    if (args[0] !== 'DELETE') return request(...args)
+    deletes++
+    return { status: 409, json: { error: { code: 'version_conflict' } } }
+  })
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  for (let i = 0; i < 10; i++) { await r.m.pump(); await r.sync() }
+  r.m.routeResume(itemRef(r.row), r.row.payload.text)
+  expect([deletes, r.client.skipped.count, r.client.pendingBytes(), r.offers.length]).toEqual([1, 1, 0, 0])
+  expect(r.logs.filter(l => l.includes('moved to rejected.jsonl'))).toHaveLength(1)
+})
+
+test.each(['accepted', 'rejected'])('C4 an identical sentence keeps its own Item id while another create is %s', async outcome => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: true, clearedMs: null })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  const text = r.m.currentGen()!.resume_items[0].create.body.text
+  const other = r.f.add('same-sentence', 'resume', { from: 'adam', payload: { text } })
+  r.m.routeResume(itemRef(other), text)
+  if (outcome === 'rejected') {
+    const request = r.client.request.bind(r.client)
+    spyOn(r.client, 'request').mockImplementation((...args) => args[0] === 'POST' && args[1] === r.mode.path
+      ? Promise.resolve({ status: 400, json: { error: 'invalid_request' } }) : request(...args))
+  }
+  await r.sync()
+  await r.hook('UserPromptSubmit', { prompt_id: 'independent', dids: [] })
+  await r.sync()
+  const count = outcome === 'accepted' ? 2 : 1
+  expect([...r.f.rows.values()].map(row => row.reason)).toEqual(Array(count).fill('superseded'))
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded')).toHaveLength(count)
+  expect(r.offers).toHaveLength(0)
+})
+
+test('C4 a waiting peek before the create acknowledgement shares the same supersede write', async () => {
+  const r = await mainRig()
+  r.setWall({ walled: true, clearedMs: null })
+  const request = r.client.request.bind(r.client)
+  let release!: () => void
+  const ack = new Promise<void>(resolve => { release = resolve })
+  const requests = spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (args[0] === 'POST' && args[1] === r.mode.path) await ack
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  await until(() => r.f.rows.size === 1)
+  const row = [...r.f.rows.values()][0]!
+  r.m.routeResume(itemRef(row), row.payload.text)
+  await r.hook('UserPromptSubmit', { prompt_id: 'independent', dids: [] })
+  release()
+  await until(() => row.state === 'cancelled')
+  await r.sync()
+  expect(requests.mock.calls.filter(([method, path]) => method === 'GET' && path === '/v1/items/' + row.id)).toHaveLength(1)
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded')).toHaveLength(1)
+  expect(r.offers).toHaveLength(0)
+})
+
+test('C4 a lost POST response and a lost DELETE race keep the decision across retries', async () => {
+  const r = await mainRig()
+  r.writer.write = write => r.client.recordItemWrite(write)
+  const request = r.client.request.bind(r.client)
+  let losePost = true, conflict = true
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const [method, path] = args
+    if (method === 'DELETE' && conflict) {
+      conflict = false
+      r.f.change([...r.f.rows.values()][0]!, 'updated')
+    }
+    const reply = await request(...args)
+    if (method === 'POST' && path === r.mode.path && losePost) { losePost = false; throw Error('POST response lost') }
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  await r.sync()
+  expect(r.logs.some(l => l.includes('POST response lost'))).toBe(true)
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.sync() // replay the create, then encounter a newer version on the queued DELETE
+  const row = [...r.f.rows.values()][0]!
+  expect(row.state).toBe('waiting')
+  await r.sync()
+  expect(row.state).toBe('cancelled')
+  const posts = r.f.calls.filter(c => c.body.kind === 'resume')
+  expect(posts).toHaveLength(2)
+  expect(posts[0]!.key).toBe(posts[1]!.key)
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded').map(c => c.body.expected_version)).toEqual([1, 2])
+  expect(r.f.rows.size).toBe(1)
+  expect(r.offers).toEqual([])
 })
 
 test('switch, prerequisites, stable machine/member and all probe refusals', async () => {
