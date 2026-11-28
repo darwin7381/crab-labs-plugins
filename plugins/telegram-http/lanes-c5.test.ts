@@ -31,7 +31,7 @@ test('C5: a stop by the lane\'s own reply_agent (hop limit) drains the events qu
   expect((await L.routeEvent(mev('mesh-s3', 'eve', '如果會維護，能不能延到 15:00 之後？', { thread: th.id, hop: 3, reply_to_id: 'x' }))).target).toBe('lane')
   th.hops = 6                                                                                  // the next send would be hop 7 > 6
   const tok = { runId: `${d1.lane}.r1`, lane: d1.lane, evId: 'mesh-s1', closers: [], critical: false, trigger: 'peer', cls: 'peer', escalated: false, pushed: false } as any
-  expect(await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'test (the call line)', to: 'eve', text: '再說一次' })).toContain('hop limit')
+  expect(await L.callLaneTool(tok, 'reply_agent', { line: 'call', because: 'Eve 等維護時間', to: 'cain', text: '請查今天的維護時間。' })).toContain('hop limit')
   expect(th.stopped).toContain('hop 7')
   const drained = rows('ledger.jsonl').filter(r => r.refs?.drained)
   expect(drained.map(r => r.event).sort()).toEqual(['mesh-s2', 'mesh-s3'])                        // one fyi each

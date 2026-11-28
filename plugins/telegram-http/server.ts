@@ -2247,8 +2247,9 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
     ...fleetDeps,
     btcc: laneMailBtcc,
     core: laneMainCore,
+    callReply: Lanes.resolveMainCall,
     ...(mailEvents ? { mailEvent: (decided: any) => mailEvents.emit(decisionEvent(decided)) } : {}),
-    call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string) => {
+    call: async (to: string, text: string, replyTo?: number, noReply?: boolean, op?: string, call?: string) => {
       // 002: the main's sends carry thread/hop; a quote-reply continues the thread it answers
       let thread = typeof args.thread === 'string' && args.thread.trim() ? args.thread.trim() : undefined
       let hop = args.hop != null && Number(args.hop) > 0 ? Number(args.hop) : undefined
@@ -2260,11 +2261,9 @@ function laneMainDeps(args: Record<string, unknown>): FleetDeps {
       }
       // 002k (K2): disclosure check before anything is sent, as for a lane's reply_agent; a refusal is an isError result (callInboxTool: not "delivered").
       // 1.34.2: a call that carries reply_to answers that call
-      { const refused = await Lanes.checkPeerSend('main', to, text, replyTo != null || isReplyRef(args.reply_to)); if (refused) return refused }   // WO-175: a reply named by event id / did too
+      { const refused = await Lanes.checkPeerSend('main', to, text, !!call || replyTo != null || isReplyRef(args.reply_to)); if (refused) return refused }   // WO-175: a reply named by event id / did too
       let minted: number | undefined, delivered = false
       const turnId = await Lanes.mainTurnId()                                // WO-172: the main's turn, as the tg daemon has it
-      // WO-175 item 2: the Call it answers, from the reply_to the main gave as it gave it (a BTCC number, an event id, its delivery's did), asked of the router
-      const call = await Lanes.callForReply(to, args.reply_to ?? replyTo)
       const result = await sendToAgent(to, text, replyTo, noReply, op, 'call',
         { thread, hop, lane: `${INBOX_SELF}.main`, turn_id: turnId, ...(call ? { call } : {}), minted: (id, ok) => { minted = id; delivered = ok } })
       await Lanes.noteMainOutbound(minted, thread, hop, to, text, replyTo, delivered)   // PL2: met on the delivery
