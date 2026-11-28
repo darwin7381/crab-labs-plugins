@@ -34,7 +34,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import {
   handleControlSlash,
   handleCallbackData,
-  isControlEnabled,
+  isControlEnabled, restartClaudeTUI,
   controlCommandsForBotApi, sharedTuiCommands,
   controlStatusText,
   startLoginExpiredWatchdog,
@@ -4179,6 +4179,7 @@ if (Lanes.LANES_ON) {
         onsen?.recordBlocked({ chat: String(meta.chat_id), client_msg_id: String(meta.message_id), retry_after: retryAfter })
       }
     },
+    restartSession: restartClaudeTUI,
     wallNoticeOwned: (rule, m) => mainWallNoticeOwned(rule, m.kind),
     ...(mentionCards ? { mentions: () => mentionCards.fetchIfOn(), mentionsRead: (posts: string[]) => mentionCards.read(posts) } : {}),   // WO-181
     // WO-120: M1 asks the usage-wall state before its in-session probe (walled → no offer; cleared after this episode began → offer now)

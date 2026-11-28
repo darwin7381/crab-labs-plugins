@@ -226,6 +226,7 @@ export interface LanesDeps {
   mainPicker?: MainPicker
   /** WO-120 (server.ts mainWallNoticeOwned): true = the usage-wall alerts (system-alert WallAlerts) tell Joey about this wall of the main, so the
    *  main-wall-up / main-wall-down notice goes to the ledger only. Absent / false = pushed as before. The wall records themselves are untouched. */
+  restartSession?: () => Promise<string>
   wallNoticeOwned?: (rule: 'main-wall-up' | 'main-wall-down', main: { kind: string | null }) => boolean
   /** WO-120 (server.ts): the usage-wall state for the main's wall episode that began at wallSinceMs (lanes-main.ts MainEnv.usageWall); WO-141 follow-up:
    *  the lanes' wall reads it too (followUsageWall). `by`: the clear's cleared_by (usage_wall.py: ok_turn | probe_after_reset | probe_after_switch |
@@ -345,7 +346,7 @@ let main: MainApi
 /** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
 function mainEnv() {
   return {
-    journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver,
+    journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver, restartSession: D.restartSession,
     // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
     registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
       void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))

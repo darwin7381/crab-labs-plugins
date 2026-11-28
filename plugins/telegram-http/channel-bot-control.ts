@@ -1442,7 +1442,8 @@ export async function forwardSharedTuiSlash(
  * window. Net: -k was strictly worse than letting the running wrapper's
  * own tick pick up the dead session.
  */
-async function restartClaudeTUI(): Promise<string> {
+export async function restartClaudeTUI(): Promise<string> {
+  if (!TMUX_SESSION) throw new Error('CHANNEL_BOT_TMUX_SESSION is not set — no TUI to restart')
   // Step 1: kill tmux session — this triggers wrapper's "session does
   // not exist" branch and forces start_claude on next monitor tick.
   const killResult = await runCommand(['tmux', 'kill-session', '-t', TMUX_SESSION])

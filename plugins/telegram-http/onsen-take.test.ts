@@ -41,9 +41,11 @@ async function mainRig() {
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
   const sid = crypto.randomUUID(), pid = 1051
   let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
+  const restarts: string[] = []
   const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return true },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: () => true, context: () => '', info: () => null,
-    genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {}, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
+    genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {},
+    restartSession: async () => { restarts.push(sid); return sid }, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
     mainOwed: ids => owes ? ids.map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })) : [], usageWall: () => wall })
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
@@ -51,14 +53,14 @@ async function mainRig() {
   const enqueue = (row: InboxItem, old = false) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
     { method: 'notifications/claude/channel', params: { content: row.payload.text, meta: { chat_id: '1', message_id: String(row.number), user: row.from } } },
     { event: row.id, fields: old ? {} : { onsen_items: [itemRef(row)] } })
-  const bind = async (row: InboxItem) => {
+  const bind = async (row: InboxItem, prompt = 'turn') => {
     const did = enqueue(row)
     await until(() => m.items(x => x.id === did)[0]?.state === 'offered')
-    await hook('UserPromptSubmit', { dids: [did] }); await r.sync()
+    await hook('UserPromptSubmit', { dids: [did], prompt_id: prompt }); await r.sync()
     expect(r.outcomes(row.id)).toContain('in_session')
     return did
   }
-  return { ...r, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
+  return { ...r, m, journal, offers, notices, restarts, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
     owing(value: boolean) { owes = value } }
 }
 
@@ -359,13 +361,48 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
   expect([...(await receiver.receive([itemRef(row)])).given]).toEqual(['ownership'])
 })
 
-test('M2 stuck is intermediate, the lease remains open and the final Stop completes it', async () => {
-  const r = await mainRig(), row = r.f.add('stuck')
-  await r.bind(row); r.status('busy')
-  await r.m.tick(Date.now() + MAIN_STUCK_MS + 1000); await r.sync()
-  expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck']); expect(r.claims.held()).toEqual(['stuck'])
-  await r.hook('Stop', { phase: 'final' }); r.f.advance(3100); r.status('idle'); await r.sync()
-  expect(row.state).toBe('completed')
+test('one stuck turn reports each claim, restarts once, then cuts with one failure per Item', async () => {
+  const r = await mainRig(), a = r.f.add('stuck'), b = r.f.add('rider', 'call')
+  await r.bind(a)
+  r.status('busy'); r.enqueue(b); await r.hook('PostToolUse')
+  const late = Date.now() + MAIN_STUCK_MS + 1000
+  for (const blocker of ['waiting', 'compacting', 'starting']) {
+    r.status(blocker); await r.m.tick(late)
+  }
+  expect(r.restarts).toHaveLength(0)
+  r.status('stuck')
+  await Promise.all([r.m.tick(late), r.m.tick(late + 5000)])
+  await r.sync()
+  expect(r.restarts).toEqual([r.sid])
+  expect(r.claims.held().sort()).toEqual(['rider', 'stuck'])
+  await r.hook('SessionEnd'); await r.sync()
+  for (const row of [a, b]) {
+    expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck', 'cut'])
+    expect(r.f.history.find(h => h.item_id === row.id && h.body.outcome === 'cut')?.body.note).toBe('卡住重開')
+    expect(row.failures).toBe(1)
+  }
+  expect(r.notices).toEqual([])
+})
+
+test('Onsen parks on the third error and releases once after another Item completes', async () => {
+  const r = await mainRig(), row = r.f.add('failing')
+  for (let i = 1; i <= 3; i++) {
+    const prompt_id = 'failure-' + i
+    await r.bind(row, prompt_id); await r.hook('StopFailure', { prompt_id, error: 'server_error' }); await r.sync()
+    expect(row.failures).toBe(i)
+    expect(r.m.items(m => m.fails || m.fail_retry_at || m.fail_released)).toHaveLength(0)
+    r.f.advance(i * 300_000 + 1)
+  }
+  expect(row.reason).toBe('parked')
+  expect((await r.receiver.receive([itemRef(row)])).given.size).toBe(0)
+  const good = r.f.add('good')
+  await r.bind(good); await r.hook('Stop', { phase: 'final' })
+  r.f.advance(3100); r.status('idle'); await r.sync()
+  expect(row.released).toBe(true)
+  await r.bind(row, 'released'); await r.hook('StopFailure', { prompt_id: 'released', error: 'server_error' }); await r.sync()
+  expect(row.reason).toBe('gave_up')
+  expect(row.events.filter(e => e.kind === 'released')).toHaveLength(1)
+  expect(r.notices).toEqual([])
 })
 
 test('walled main leaves mail and person waiting, keeper-clear probe reports the reset time when refused', async () => {
@@ -381,6 +418,7 @@ test('walled main leaves mail and person waiting, keeper-clear probe reports the
   await r.m.pump(); await r.hook('UserPromptSubmit', { dids: [did], prompt_id: 'probe' })
   await r.hook('StopFailure', { prompt_id: 'probe', error: 'rate_limit' }); await r.sync()
   expect(r.outcomes(person.id)).toEqual(['in_session', 'usage_limit_probe'])
+  expect(r.restarts).toEqual([r.sid]); expect(r.notices).toEqual([])
   expect(r.f.history.at(-1)!.body.retry_after).toBe(reset); expect(mail.state).toBe('waiting')
 })
 
