@@ -3108,10 +3108,11 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
     mode: () => takeMode?.canReceive ? 'live' : takeMode || onsenPuller?.mode.active ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
+    ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
     ...(ROAMER && takeMode ? { transcript: roamerCurrentTranscript, session: () => {
       const target = receivingTarget()
       return target ? reportSession(target.session_id, ONSEN_AGENT) : null
-    } } : Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
+    } } : {}),
     wall: () => { const w = wallReader.state(); return w ? w.walled : null },   // WO-120: the state decides "walled"
     // this agent's own unread count, with its own credential (an agent may read only its own row)
     mail: async () => {

@@ -1539,6 +1539,7 @@ test('C2 drains pre-switch deliveries and keeps status, observation and replies 
   await waitFor(() => cmd.state === 'completed')
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
   await waitFor(() => d.f.calls.some(c => c.path === '/status/batch'))
+  await waitFor(() => d.f.calls.some(c => c.path === '/deliveries/batch'))
   expect(d.f.calls.filter(c => c.path === '/deliveries/batch').flatMap(c => c.body.items)).toEqual([delivery])
   expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
   expect(d.f.history.some(h => h.item_id === cmd.id && h.body.outcome === 'completed')).toBe(true)
