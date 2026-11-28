@@ -28,6 +28,21 @@ settled49-table 的 26 行中，A3–A5 是本步的靜默通知，A6 的 stall 
 
 實際 S4 測試台按 facts §3 驗收。人的來件遇上限，測試號收到一次「在等、動不了」及一次解除。同一列連續三次 API 錯誤，只發一次停領通知，正常完成另一件後只放回一次。connector 側直接推送應為零。
 
+本機驗證使用同一個人的 Item，在回報中看到一次 `usage_limit`、恢復後的 `in_session` 與 `completed`，connector 直推為零。三次 API 失敗後測試伺服器將原列標為 `parked`，正常完成另一列後只有一個 `released` 事件，再失敗的原因為 `gave_up`。正常結束仍欠回覆的主線與車道都只有一個 `owed`。S4 在人的收件匣實際產生幾列、橋接畫出幾則，仍須用 S4 與測試號驗收。
+
+### 第四表通知對照
+
+| 舊推送 | 接手者 |
+|---|---|
+| WallAlerts enter、main-wall-up、wall-up、main-undelivered、main-stuck | S4 `cannot_move`，人的來件依等待事件發一次 |
+| WallAlerts clear、main-wall-down、wall-down、main-delivered、main-unstuck | S4 `recovered`，對應同一段等待 |
+| cut_twice、stop_failure_gave_up、asked-restart | S4 依原列實際狀態發 `parked` 或 `cancelled`。人的指令沒有套上時發 `control_failed` |
+| main-menu | 需要人選時由 Action 的 `choose` 通知處理 |
+| critical-due | S4 按最高級警報的接手狀態發 `alert_needs_person` |
+| commitment-due、promise-due、answer-due | 人的承諾走 `promise_due`。同事的問題逾期走原列的 waiter |
+| handoff-due、card-due、peer-flood 開始／結束、一般 TUI 警告 | 第四表取消這些直推。交接與到期由原列表示，畫面警告歸值班員 |
+| fleet-block-detector | S4 `fleet_same_cause`。舊 sender 在外部 W20 |
+
 ## 待定
 
 「一般 connector 要從哪個已授權來源辨認原寄件人是 take 還是 pull？」S2 r2 設計第 67、77 行限定 delivery 讀權與 connector 探測身分，普通 Item 讀取對兩種成員都可成功。這會影響混合模式下三個原寄件人的回覆。待確認的行為須由負責人決定。

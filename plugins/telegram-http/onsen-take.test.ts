@@ -494,6 +494,26 @@ test('Onsen parks on the third error and releases once after another Item comple
   expect(r.notices).toEqual([])
 })
 
+test('a waiting person’s original row records one limit and completes after recovery with zero connector notices', async () => {
+  const r = await mainRig(), row = r.f.add('person-at-limit')
+  await r.bind(row)
+  r.setWall({ walled: true, clearedMs: null, lastWallMs: Date.now() })
+  await r.hook('StopFailure', { error: 'rate_limit' }); await r.sync()
+  expect([row.state, row.reason, row.failures]).toEqual(['waiting', 'usage_limit', 0])
+  const did = r.enqueue(row)
+  await r.m.tick(); await r.m.tick()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'usage_limit'])
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  await until(() => r.m.items(x => x.id === did)[0].state === 'offered')
+  await r.hook('UserPromptSubmit', { dids: [did], prompt_id: 'recovered' })
+  await r.hook('Stop', { phase: 'final', prompt_id: 'recovered' })
+  r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(row.state).toBe('completed')
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'usage_limit', 'in_session', 'completed'])
+  expect(r.notices).toEqual([])
+})
+
 test('walled main leaves mail and person waiting, keeper-clear probe reports the reset time when refused', async () => {
   const r = await mainRig(), first = r.f.add('first'), mail = r.f.add('blocked-mail', 'mail'), person = r.f.add('probe')
   await r.bind(first)
