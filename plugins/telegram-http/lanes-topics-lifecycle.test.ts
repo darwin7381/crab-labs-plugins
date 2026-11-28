@@ -7,8 +7,6 @@ import { mkdtempSync, copyFileSync, writeFileSync, chmodSync, readFileSync, exis
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { plainTopicName, stripEmoji, topicLink } from './lanes-topics.ts'
-import { startBotApiMock, dm, ICON_CHECK } from './test-fixtures/tg-bot-api-mock.ts'
-import { telegramWorkOrderRouter, startTgDaemon, until as untilA } from './test-fixtures/tg-daemon.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 process.env.LANES_CLOSE_GRACE_MS = '30000'
 process.env.LANES_TOPIC_SWEEP_MS = '50'
@@ -131,32 +129,3 @@ test('a close a daemon restart cut off is finished at boot; a lane closed before
   expect(done2).toEqual([7403])
   expect(sent2.filter(s => s.topic === 7403).length).toBe(1)
 }, 30000)
-
-// ---- the daemon: the real Bot API calls (a board work order opens the worker; Joey closes it with /lanes close; then he types in the topic)
-test('daemon: createForumTopic with the plain name; the close looks the ✅ up, sets it with editForumTopic, posts the closing line in the topic', async () => {
-  const api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: false })
-  const root = mkdtempSync(join(tmpdir(), 'lanes-topics-lifecycle-d-'))
-  const d = await startTgDaemon(api, root, 1828, { ROAMER_MODE: '1', FIXTURE_MEMBER_TOKEN: 'test-member', LANES_ROUTER: telegramWorkOrderRouter(root), LANES_CLOSE_GRACE_MS: '300', LANES_RETRY_BACKOFF_MS: '60000' })
-  try {
-    api.push(dm(1828, 77, '[board][WO-77] ✅ 請 adam 整理 🚀 名單'))
-    expect(await until(() => api.of('createForumTopic').length > 0)).toBe(true)
-    expect(api.of('createForumTopic').map(c => c.body)).toEqual([{ chat_id: '1828', name: '工單 WO-77' }])
-    const topic = 7001
-    api.push(dm(1828, 90, '/lanes close 工作線#1', { command: true }))
-    expect(await untilA(() => api.of('editForumTopic').length === 1, 15000)).toBe(true)
-    expect(api.of('getForumTopicIconStickers').length).toBe(1)
-    expect(api.of('editForumTopic')[0].body).toEqual({ chat_id: '1828', message_thread_id: topic, icon_custom_emoji_id: ICON_CHECK })
-    // rich lane lines: the closing line goes as a rendered message, like the main's reply (lanes-topics-richlines.test.ts)
-    expect(await untilA(() => api.of('sendRichMessage').some(c => String(c.body.rich_message?.markdown).includes('這條工作線結束了')))).toBe(true)
-    const line = api.of('sendRichMessage').find(c => String(c.body.rich_message?.markdown).includes('這條工作線結束了'))!
-    expect(line.body).toMatchObject({ message_thread_id: topic, disable_notification: true })
-    expect(api.calls.some(c => c.method === 'deleteForumTopic' || c.method === 'closeForumTopic')).toBe(false)
-    // later, in the finished topic: the main's item (no lane), its meta naming the topic
-    api.push(dm(1828, 91, '再補一句', { topic, topicName: '工單 WO-77' }))
-    const items = () => { try { return readFileSync(join(d.stateDir, 'lanes', 'state.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(x => x.rec === 'msg' && x.notif?.params?.meta?.message_id === '91') } catch { return [] } }
-    expect(await untilA(() => items().length > 0)).toBe(true)
-    expect(items()[0].notif.params.meta).toMatchObject({ topic: '7001', topic_name: '工單 WO-77' })
-    expect(items()[0].notif.params.meta.topic_state).toBe('closed')                         // the line behind the topic has ended: the main answers there
-    expect(String(items()[0].notif.params.meta.topic_anchor)).toMatch(/^knowledge\/lines\/.+\.md$/)   // and is told where that line's hand-over file is
-  } finally { await d.stop(); api.stop() }
-}, 60000)

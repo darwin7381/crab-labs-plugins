@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from 'bun:test'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { randomUUID } from 'crypto'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
@@ -40,7 +42,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   expect(await ok()).toBe(true)
 }
 async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string) => Record<string, string>) {
-  const f = fakeItems(), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
+  const f = fakeItems(env.ROAMER_MODE === '1' ? 'space-roamers' : 'adam', 'test-member', undefined, env.ROAMER_MODE === '1'), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
@@ -489,13 +491,69 @@ test('a busy lane slot leaves the next alert waiting; its run receives the claim
   expect(records().some(r => r.rec === 'msg' && (r.kind === 'handoff' || r.kind === 'carry'))).toBe(false)
 }, 18000)
 
-test('roamer stays on its local mock bot and never probes items', async () => {
+const roamerEnv = { ROAMER_MODE: '1', ROAMER_BOT_NAME: 'space_roamersbot', LANES_AGENT: '', GENESIS_LANES: '0' }
+const roamerState = (root: string) => ({ ROAMER_STATE_FILE: join(root, 'roamer-state.json') })
+
+for (const mode of [200, 409]) test('a roamer uses the common probe without a local bot, HTTP ' + mode, async () => {
   const bot = startBotApiMock()
   clean.push(() => bot.stop())
-  const d = await daemon({ ROAMER_MODE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url })
-  await waitFor(() => bot.calls.some(c => c.method === 'getMe'))
-  expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(0)
+  const d = await daemon({ ...roamerEnv, ONSEN_TAKE: '0', TELEGRAM_API_ROOT: bot.url }, mode, roamerState)
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation')))
+  const health = await (await fetch(d.base + '/healthz')).json()
+  expect(health).toMatchObject({ agent: 'space-roamers', connector: { on: true, roamer: true, token: false }, polling: false,
+    take: { active: mode === 200, reason: mode === 200 ? null : 'not_take_member' } })
+  expect(d.f.calls.some(c => c.path === '/v1/members/space-roamers/items' && c.query.get('connector') === 'mac-mini/space-roamers')).toBe(true)
+  expect(d.f.calls.some(c => c.query.has('wait'))).toBe(mode === 200)
+  expect(bot.calls).toEqual([]); expect(bot.polls).toEqual([])
 })
+
+async function target(d: Awaited<ReturnType<typeof daemon>>) {
+  const child = Bun.spawn(['sleep', '300']), tmux = randomUUID()
+  const sid = tmux
+  clean.push(async () => { child.kill(); await child.exited })
+  const cwd = join(d.root, 'lab-project')
+  const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', cwd.replaceAll('/', '-'))
+  for (const dir of [regs, project]) mkdirSync(dir, { recursive: true })
+  const status = (value: string, sessionId = sid) => writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({
+    pid: child.pid, sessionId, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
+  status('idle')
+  const transcript = join(project, sid + '.jsonl')
+  if (!existsSync(transcript)) writeFileSync(transcript, '')
+  const write = (fields: object) => appendFileSync(transcript, JSON.stringify({ entrypoint: 'cli', timestamp: new Date().toISOString(), ...fields }) + '\n')
+  const select = () => writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: { tmux, claude_pid: child.pid, cwd, session_id: sid } }))
+  const got: any[] = []
+  const client = new Client({ name: 'lab', version: '1' })
+  client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
+  clean.push(() => client.close())
+  return { sid, select, got, accept: (msg: any) => write({ type: 'user', message: { content:
+    `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
+    stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
+}
+
+test('a roamer takes only for the receiving UUID and follows its receipt across a target switch', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState)
+  const a = await target(d), b = await target(d)
+  a.select()
+  // Let the registry establish the target before the Item is created.
+  const ledger = join(d.state, 'onsen', 'claims.json')
+  await waitFor(() => existsSync(ledger) && JSON.parse(readFileSync(ledger, 'utf8')).selections?.at(-1)?.target?.session_id === a.sid)
+  const row = d.f.add('first')
+  await waitFor(() => a.got.length === 1)
+  expect(row.claim?.session_id).toBeNull()
+  b.select()
+  b.accept(a.got[0]); b.stop()
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  a.stop()
+  await waitFor(() => row.state === 'completed', 9000)
+  expect(b.got).toEqual([])
+  const next = d.f.add('next target')
+  await waitFor(() => b.got.length === 1)
+  expect(b.got[0].content).toContain(next.payload.text)
+  expect(a.got.length).toBe(1)
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+}, 20000)
 
 function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string, tgId: string) {
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',

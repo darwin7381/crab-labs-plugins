@@ -18,6 +18,8 @@ export class TakeMode {
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
   private reason = 'probing'
+  private offset = 0
+  readonly now = () => Date.now() + this.offset
   get probed(): boolean { return this.reason !== 'probing' }
 
   health(): TakeHealth {
@@ -44,6 +46,8 @@ export class TakeMode {
       return
     }
     clearTimeout(this.timer)
+    const asOf = Date.parse(r.json?.as_of)
+    if (Number.isFinite(asOf)) this.offset = asOf - Date.now()
     this.reason = ''
     this.active = true
     this.log('onsen take: started ' + this.connector)

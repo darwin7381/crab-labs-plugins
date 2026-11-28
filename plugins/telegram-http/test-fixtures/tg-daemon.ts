@@ -1,7 +1,6 @@
 // A real telegram-http daemon (server.ts) with lanes on, in temp dirs (tests only). Nothing of the machine is touched: its HOME, state dir, workspace and
 // ports are the test's; no lane runs a model (test-fixtures/no-claude.sh).
-// WO-197 final (1.59.0): a daemon is a connector unless env has ROAMER_MODE=1. A connector gets no bot token and no Bot API root (it has no Telegram);
-// A connector receives fixture updates from Onsen Items. A roamer polls the Bot API mock.
+// Every member receives bridge updates through Onsen Items.
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { createServer } from 'net'
 import { join } from 'path'
@@ -40,15 +39,6 @@ export function peerRow(d: TgDaemon, number: number, from: string, text: string,
     payload: { text, msg_id: number, logged: true, ...opts.payload } })
 }
 
-/** In the native Telegram topic tests, a message from the mock bot can open a work order. */
-export function telegramWorkOrderRouter(root: string): string {
-  const cfg = JSON.parse(readFileSync(join(PLUGIN, 'lanes-router.fleet.json'), 'utf8'))
-  const board = cfg.rules.find((r: { id: string }) => r.id === 'mesh-board')
-  cfg.rules.unshift({ ...board, id: 'tg-work-order', match: { ...board.match, source: 'telegram' } })
-  const file = join(root, 'work-order-router.json')
-  writeFileSync(file, JSON.stringify(cfg))
-  return file
-}
 export function actionRow(d: TgDaemon, payload: { action_id: string; option_id: string; version: number }) {
   return d.items.add('press-' + payload.action_id + '-' + payload.version, 'control', { action_id: payload.action_id, payload })
 }
@@ -104,26 +94,25 @@ function feedUpdates(api: BotApiMock, items: ReturnType<typeof fakeItems>) {
   return () => targets.delete(items)
 }
 
-/** root: the test's temp dir (kept across a restart: the same root gives the same state); joey: the allowlisted Telegram user id. ready: by default a
- *  connector's /healthz answering, a roamer's long poll running */
+/** root: the test's temp dir (kept across a restart: the same root gives the same state); joey: the allowlisted Telegram user id. ready: by default the
+ *  connector's /healthz answering */
 export async function startTgDaemon(api: BotApiMock, root: string, joey: number, env: Record<string, string> = {},
   ready?: (h: any) => boolean, sharedItems?: ReturnType<typeof fakeItems>): Promise<TgDaemon> {
-  const roamer = env.ROAMER_MODE === '1'
-  ready ??= roamer ? (h => h?.polling === true) : (h => h?.ok === true)
+  ready ??= h => h?.ok === true
   const home = join(root, 'home'), ws = join(root, 'ws'), stateDir = join(ws, '.telegram-state')
   for (const d of [home, ws, stateDir, join(ws, '.lanes')]) mkdirSync(d, { recursive: true })
   writeFileSync(join(stateDir, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: [String(joey)], groups: {}, pending: {}, ackReaction: '' }))
   try { copyFileSync(join(PLUGIN, 'lanes-router.fleet.json'), join(ws, '.lanes', 'router.json')) } catch {}
-  const items = sharedItems ?? fakeItems(env.LANES_AGENT ?? 'adam')
+  const items = sharedItems ?? fakeItems(env.LANES_AGENT ?? 'adam', 'test-member', undefined, true)
   const dead = await freePort(), port = await freePort()
 
   // a connector runs with test-fixtures/no-telegram-probe.ts preloaded: loading grammy or roamer-telegram.ts throws (its start fails), every daemon test
   // checks that no Telegram code is loaded
-  const proc = Bun.spawn([process.execPath, '--no-env-file', ...(env.FIXTURE_MEMBER_TOKEN ? ['--preload', join(PLUGIN, 'test-fixtures', 'item-daemon.ts')] : []), ...(roamer ? [] : ['--preload', join(PLUGIN, 'test-fixtures', 'no-telegram-probe.ts')]), join(PLUGIN, 'server.ts')], {
+  const proc = Bun.spawn([process.execPath, '--no-env-file', ...(env.FIXTURE_MEMBER_TOKEN ? ['--preload', join(PLUGIN, 'test-fixtures', 'item-daemon.ts')] : []), '--preload', join(PLUGIN, 'test-fixtures', 'no-telegram-probe.ts'), join(PLUGIN, 'server.ts')], {
     cwd: PLUGIN,
     env: {
       GIT_ALLOW_PROTOCOL: 'file', PATH: process.env.PATH ?? '', HOME: home, TMPDIR: root, FIXTURE_ITEM_BASE: items.base,
-      ONSEN_BASE: 'http://127.0.0.1:' + dead, ...(roamer ? { TELEGRAM_BOT_TOKEN: api.token, TELEGRAM_API_ROOT: api.url } : {}), TELEGRAM_HTTP_PORT: String(port),
+      ONSEN_BASE: 'http://127.0.0.1:' + dead, TELEGRAM_HTTP_PORT: String(port),
       TELEGRAM_STATE_DIR: stateDir, AGENT_WORKSPACE_DIR: ws, AGENT_INBOX_SELF: 'adam', GENESIS_LANES: '1', LANES_AGENT: 'adam',
       LANES_INBOX_PORT: String(dead), LANES_CLAUDE_BIN: join(PLUGIN, 'test-fixtures', 'no-claude.sh'), MCP_TOKEN_DIR: join(root, 'tok'),
       MCP_READY_DELAY_MS: '200', CRAB_LABS_PLUGINS_ENV: join(root, 'no-machine-config'), HUB_SYNC: '0', USAGE_WALL_READ: '0',
@@ -138,7 +127,7 @@ export async function startTgDaemon(api: BotApiMock, root: string, joey: number,
     if (!sharedItems) await items.stop()
     throw new Error(`test daemon at 127.0.0.1:${port} failed readiness (exit ${proc.exitCode})`)
   }
-  const disconnect = roamer ? () => {} : feedUpdates(api, items)
+  const disconnect = feedUpdates(api, items)
   const off = async () => { disconnect(); if (!sharedItems) await items.stop() }
   let c: Client | null = null
   const client = async (): Promise<Client> => {

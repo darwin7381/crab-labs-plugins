@@ -1,12 +1,4 @@
-// WO-197 defects 1 and 2 (lab 16:38–16:50Z, 1.58.25): real daemons (server.ts, lanes off, control mode on a tmux pane on its own socket dir) against
-// the Bot API stand-in and the Onsen stand-in (its Actions too); the pane runs a fake TUI (a menu drawn from a file, Down / Enter / Esc read raw).
-//   1  connector: a menu on the pane (/model) is ONE Onsen Action (source menu, the menu's options), no Bot API call (bot_api_refused {}); a press in
-//      Onsen (action_control) presses the keys on the pane, then applied. A permission dialog is carried by the permission prompt's own Action: no
-//      second one (also when the dialog is drawn before the request comes), no Telegram
-//   2  a permission prompt answered on the screen (the duty officer, a person at the TUI): its Action is cancelled once (CONTRACT §6: the screen's
-//      question gone, the daemon cancels it); one pressed in Onsen first is applied and never cancelled after; a menu asked about in Onsen that left
-//      the screen is cancelled. The same off the connector (ONSEN_ACTIONS on, polling; 1.59.0: a roamer, ROAMER_MODE=1, the only daemon that still
-//      polls): its Telegram copies close too; the menu relay's Telegram message as before, and its Action (resolved by the presser when tapped in Telegram)
+// A connector and a roamer with live tmux panes and loopback Onsen Actions.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -45,7 +37,7 @@ process.stdin.on('data', (b: Buffer) => {
 draw()
 `
 type Pane = { name: string; menu: string; out: string }
-let root = '', sock = '', apiC: BotApiMock, apiP: BotApiMock, onsen: OnsenStandin, conn: TgDaemon, poll: TgDaemon
+let root = '', sock = '', apiC: BotApiMock, apiP: BotApiMock, onsen: OnsenStandin, conn: TgDaemon, roamer: TgDaemon
 const panes: Record<'c' | 'p', Pane> = {} as any
 const tmuxEnv = (): Record<string, string> => { const e = { ...process.env, TMUX_TMPDIR: sock } as Record<string, string>; delete e.TMUX; return e }
 const tm = (...a: string[]) => spawnSync('tmux', a, { env: tmuxEnv(), encoding: 'utf8' })
@@ -80,17 +72,17 @@ beforeAll(async () => {
   apiC = startBotApiMock({}, { pollHoldMs: 200 }); apiP = startBotApiMock({}, { pollHoldMs: 200 })
   const env = { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude',
     TMUX_TMPDIR: sock, STARTUP_PICKER_POLL_MS: '400' }
-  ;[conn, poll] = await Promise.all([
+  ;[conn, roamer] = await Promise.all([
     startTgDaemon(apiC, join(root, 'c'), JOEY, { ...env, TELEGRAM_BOT_TOKEN: '', ONSEN_BRIDGE: 'adam', ONSEN_OWNER: 'joey', FIXTURE_MEMBER_TOKEN: CRED.c, GENESIS_LANES: '1', CHANNEL_BOT_TMUX_SESSION: panes.c.name },
       h => h?.ok === true),
-    startTgDaemon(apiP, join(root, 'p'), JOEY, { ...env, ROAMER_MODE: '1', FIXTURE_MEMBER_TOKEN: CRED.p, CHANNEL_BOT_TMUX_SESSION: panes.p.name }),
+    startTgDaemon(apiP, join(root, 'p'), JOEY, { ...env, ROAMER_MODE: '1', ROAMER_BOT_NAME: 'p_bot', ONSEN_OWNER: 'joey', FIXTURE_MEMBER_TOKEN: CRED.p, CHANNEL_BOT_TMUX_SESSION: panes.p.name }),
   ])
   for (const k of ['c', 'p'] as const) {
-    const c = await (k === 'c' ? conn : poll).client()
+    const c = await (k === 'c' ? conn : roamer).client()
     c.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel/permission') perms[k].push(n.params) }
   }
 }, 60000)
-afterAll(async () => { await Promise.all([conn?.stop(), poll?.stop()]); apiC?.stop(); apiP?.stop(); onsen?.stop(); tm('kill-server'); try { rmSync(sock, { recursive: true }) } catch {} })
+afterAll(async () => { await Promise.all([conn?.stop(), roamer?.stop()]); apiC?.stop(); apiP?.stop(); onsen?.stop(); tm('kill-server'); try { rmSync(sock, { recursive: true }) } catch {} })
 
 test('1a connector: a menu on the pane (/model) is one Onsen Action with its options; no Bot API call; a press in Onsen presses the keys on the pane, then applied', async () => {
   draw(panes.c, 'm1', 'Select model', ['Default (recommended)', 'Opus', 'Haiku'])
@@ -176,37 +168,24 @@ test('2c connector: a menu asked about in Onsen that left the screen (Esc on the
   expect((await health(conn)).connector.bot_api_refused).toEqual({})
 }, 30000)
 
-test('2d off the connector (polling, ONSEN_ACTIONS on): a prompt answered on the screen: its Action cancelled once, its Telegram copies closed; the dialog\'s relay message as before, no second Action', async () => {
-  await ask(poll, 'zxcvb', 'Bash', 'make test')
-  expect(await until(() => made('p', a => a.summary === 'Bash：make test').length === 1 && apiP.of('sendMessage').some(c => c.body.text === '🔐 Permission: Bash'), 8000)).toBe(true)
+test('2d roamer: a prompt answered on the screen closes its own Action', async () => {
+  await ask(roamer, 'zxcvb', 'Bash', 'make test')
+  expect(await until(() => made('p', a => a.summary === 'Bash：make test').length === 1)).toBe(true)
   const a = made('p', x => x.summary === 'Bash：make test')[0]!
   draw(panes.p, 'p3', 'Bash command', ['Yes', "Yes, and don't ask again for make commands", 'No'])
-  expect(await until(() => apiP.of('sendMessage').some(c => String(c.body.text).includes('claude 停在一個選單')), 8000)).toBe(true)   // Telegram as before
   await sleep(3000)
-  expect(made('p', x => x.source === 'menu')).toHaveLength(0)                      // carried by the prompt's own Action
-  const e0 = apiP.of('editMessageText').length
   tm('send-keys', '-t', panes.p.name, 'Enter')
-  expect(await until(() => calls('p', a.id, 'cancel').length === 1, 8000)).toBe(true)
-  expect(await until(() => apiP.of('editMessageText').slice(e0).some(e => String(e.body.text).startsWith('🔐 Permission: Bash\n\n— 不用按了：畫面上已經沒有這個詢問')), 5000)).toBe(true)
-  await sleep(1500)
-  expect(calls('p', a.id, 'cancel')).toHaveLength(1)
+  expect(await until(() => calls('p', a.id, 'cancel').length === 1)).toBe(true)
+  expect(made('p', x => x.source === 'menu')).toHaveLength(0)
+  expect(apiP.calls).toEqual([])
 }, 30000)
 
-test('2e off the connector: a menu: Telegram as before and its Action; a tap in Telegram presses it and resolves the Action by the presser, then applied', async () => {
+test('2e roamer: an Onsen menu choice reaches the pane', async () => {
   draw(panes.p, 'm3', 'Resume', ['Resume from summary', 'Resume full session', "Don't ask me again"])
   expect(await until(() => made('p', a => a.source === 'menu').length === 1, 10000)).toBe(true)
   const a = made('p', x => x.source === 'menu')[0]!
-  const sent = apiP.of('sendMessage').filter(c => c.body.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('spick:'))
-  expect(sent.length).toBeGreaterThanOrEqual(1)
-  const kb = sent.at(-1)!.body.reply_markup.inline_keyboard
-  expect(kb.map((r: any) => r[0].text)).toEqual(['1. Resume from summary', '2. Resume full session', "3. Don't ask me again"])
-  apiP.push({ callback_query: { id: 'cb-m3', chat_instance: 'x', data: kb[2][0].callback_data, from: { id: JOEY, is_bot: false, first_name: 'J' },
-    message: { message_id: 9001, date: Math.floor(Date.now() / 1000), chat: { id: JOEY, type: 'private' }, text: 'menu' } } })
-  expect(await until(() => chosen(panes.p).some(x => x.id === 'm3'), 10000)).toBe(true)
+  expect(await control(roamer, onsen.press(a.id, '3'))).toBe(true)
   expect(chosen(panes.p).find(x => x.id === 'm3')).toMatchObject({ idx: 2 })
-  expect(calls('p', a.id, 'applied')).toHaveLength(0)
-  expect(await until(() => calls('p', a.id, 'resolve').length === 1)).toBe(true)
-  expect(calls('p', a.id, 'resolve')[0]!.body).toMatchObject({ option_id: '3', expected_version: 1, resolved_by: 'joey' })
-  await sleep(1500)
   expect(calls('p', a.id, 'cancel')).toHaveLength(0)
+  expect(apiP.calls).toEqual([])
 }, 30000)

@@ -2,13 +2,11 @@
 // allows_users_to_create_topics true, and then every message Joey typed outside a topic opened a new topic (his chat that day). So
 // LANES_WORKER_TOPICS=enable sends both fields in one setMySettings call and checks both with getMe; auto changes nothing and, when getMe shows the
 // broken mode, warns once and opens no worker topic (the main does the work); the check is asked again when a worker opens.
-import { test, expect, afterAll } from 'bun:test'
+import { test, expect } from 'bun:test'
 import { mkdtempSync, copyFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { TOPIC_SETTINGS, USERS_CREATE_WHY, topicMode, topicModeAtStart, topicVerdict } from './lanes-topics.ts'
-import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
-import { startTgDaemon, until } from './test-fixtures/tg-daemon.ts'
 
 test('topicVerdict: usable only with topics on AND only the bot opening them; the broken mode and topics off are not; a getMe that says neither is not known', () => {
   expect(topicVerdict({ has_topics_enabled: true, allows_users_to_create_topics: false }).usable).toBe(true)
@@ -97,32 +95,3 @@ test('the mode set right (asked again at the next open): the worker opens in a t
   expect(r).toContain('opened in topic #7101')
   expect(created.length).toBe(1)
 })
-
-// ---- the daemon: the real calls at start (server.ts laneTopicsAtStart through grammy against the Bot API stand-in)
-const roots: Array<{ stop: () => Promise<void> }> = []
-afterAll(async () => { for (const r of roots) await r.stop() })
-
-test('daemon, LANES_WORKER_TOPICS=enable, the bot\'s topic mode off: ONE setMySettings with both fields, then getMe; usable', async () => {
-  const api = startBotApiMock({ has_topics_enabled: false, allows_users_to_create_topics: false })
-  const d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-mode-d1-')), 1828, { ROAMER_MODE: '1', LANES_WORKER_TOPICS: 'enable' })
-  roots.push({ stop: async () => { await d.stop(); api.stop() } })
-  expect(await until(() => d.log().includes('lanes: worker topics enable'))).toBe(true)
-  const sets = api.of('setMySettings')
-  expect(sets.length).toBe(1)
-  expect(sets[0].body).toEqual({ has_topics_enabled: true, allows_users_to_create_topics: false })
-  expect(api.calls.filter(c => c.method === 'getMe' && c.at >= sets[0].at).length).toBeGreaterThanOrEqual(1)
-  expect(api.me).toMatchObject({ has_topics_enabled: true, allows_users_to_create_topics: false })
-  expect(d.log()).toContain('lanes: worker topics enable: usable (setMySettings sent)')
-}, 40000)
-
-test('daemon, auto, getMe shows the broken mode: nothing is changed, one clear warning', async () => {
-  const api = startBotApiMock({ has_topics_enabled: true, allows_users_to_create_topics: true })
-  const d = await startTgDaemon(api, mkdtempSync(join(tmpdir(), 'lanes-topics-mode-d2-')), 1828, { ROAMER_MODE: '1' })
-  roots.push({ stop: async () => { await d.stop(); api.stop() } })
-  expect(await until(() => d.log().includes('lanes: worker topics auto'))).toBe(true)
-  expect(api.of('setMySettings')).toEqual([])
-  const warns = d.log().split('\n').filter(l => l.includes('lanes: worker topics:'))
-  expect(warns.length).toBe(1)
-  expect(warns[0]).toContain('allows_users_to_create_topics=true')
-  expect(d.log()).toContain('lanes: worker topics auto: not used')
-}, 40000)

@@ -1361,13 +1361,15 @@ export function recordOn(env: NodeJS.ProcessEnv): boolean {
   const v = (env.ONSEN_RECORD ?? '').trim().toLowerCase()
   return !(v === '0' || v === 'off' || v === 'false' || v === 'no')
 }
-/** 1.58.32 (Chiron: roamers do not write the spool): a roamer's daemon (ROAMER_MODE=1, ROAMER.md) speaks for no Onsen member: no agent name, no mesh
- *  credential of its own, so nothing it spooled was ever posted (the four roamers held ~1.6 MB each, posted 0). It records nothing */
 export const isRoamerEnv = (env: NodeJS.ProcessEnv): boolean => (env.ROAMER_MODE ?? '').trim() === '1'
-/** ONSEN_AGENTS (the canary switch): a comma list of agent names, or `*` (unset = `*`). Recording runs only for an agent in it, and only with ONSEN_RECORD on;
- *  never for a roamer (1.58.32) */
+/** The member registered for this roamer. Existing installations name their bot with underscores. */
+export function roamerMember(env: NodeJS.ProcessEnv): string | undefined {
+  if (!isRoamerEnv(env)) return
+  const name = env.LANES_AGENT?.trim() || env.ROAMER_BOT_NAME?.trim().toLowerCase().replace(/^@|_?bot$/g, '').replace(/_/g, '-')
+  if (name && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) return name
+}
 export function recordFor(env: NodeJS.ProcessEnv, agent: string): boolean {
-  if (!recordOn(env) || isRoamerEnv(env)) return false
+  if (!recordOn(env)) return false
   const list = (env.ONSEN_AGENTS ?? '*').split(',').map(x => x.trim()).filter(Boolean)
   return list.includes('*') || list.includes(agent)
 }

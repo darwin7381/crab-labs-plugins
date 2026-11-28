@@ -13,7 +13,7 @@ bot per workspace.
 ## How it works
 
 ```
-TG message ──► roamer daemon (server.ts + roamer-control.ts, ROAMER_MODE=1)
+TG message ──► Telegram bridge ──► Onsen Item ──► roamer connector (server.ts + roamer-control.ts, ROAMER_MODE=1)
                  │  /roam → list live claudes (claude agents --json, tmux-aware)
                  │  pick target → takeover:
                  │    already in tmux → tmux respawn-pane -k IN PLACE (1.12.0 —
@@ -27,8 +27,7 @@ TG message ──► roamer daemon (server.ts + roamer-control.ts, ROAMER_MODE=1
                claimed via pendingTakeover → onsessioninitialized)
                  │
                  ▼
-               inbound TG routes ONLY to the current target (sendToMcpSession,
-               not broadcast); replies/reactions flow back as usual
+               the selected session claims its Items; replies/reactions return via Onsen and the bridge
 ```
 
 Key implementation points (full detail in `roamer-control.ts` header + CHANGELOG 1.4.0/1.5.0):
@@ -70,12 +69,11 @@ Prereqs: this repo cloned as a marketplace (`~/.claude/plugins/marketplaces/crab
 1. **Create a dedicated bot** via @BotFather (`/newbot`). One bot per roamer.
    Never reuse another bridge's token.
 
-2. **State dir + token + access**:
+2. **Configure the bot token on the bridge and set up local state**:
 
    ```bash
    STATE=~/.claude/channels/roamer-<name>
    mkdir -p "$STATE" && chmod 700 "$STATE"
-   printf 'TELEGRAM_BOT_TOKEN=<token>\n' > "$STATE/.env" && chmod 600 "$STATE/.env"
    cat > "$STATE/access.json" <<'EOF'
    {
      "dmPolicy": "allowlist",
@@ -118,7 +116,7 @@ Prereqs: this repo cloned as a marketplace (`~/.claude/plugins/marketplaces/crab
 
    ```bash
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.you.telegram-daemon.roamer-myroamer.plist
-   curl -s http://127.0.0.1:<roamer-port>/healthz   # ok:true + polling:true
+   curl -s http://127.0.0.1:<roamer-port>/healthz   # ok:true, connector.on:true, connector.roamer:true, polling:false
    ```
 
    `PATH` must include the dir containing the `claude` binary — takeover shells out to it.

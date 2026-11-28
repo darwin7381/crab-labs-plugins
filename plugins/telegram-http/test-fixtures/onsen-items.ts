@@ -8,8 +8,9 @@ type Row = InboxItem & { failures: number; released: boolean; expires_at: string
 const iso = (ms: number) => new Date(ms).toISOString()
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
-export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: Request) => Promise<Response | null>) {
+export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: Request) => Promise<Response | null>, realtime = false) {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
+  const tick = () => { if (realtime) now = Math.max(now, Date.now()) }
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
   const issued = new Set<string>(), reports = new Set<string>()
@@ -20,7 +21,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
   const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
     now++
-    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ kind, note })
+    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ kind, note, at: iso(now), session_id: r.session_id })
     for (const wake of waiters) wake()
   }
   const expire = () => {
@@ -34,18 +35,20 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     }
   }
   const add = (id: string, kind = 'message', extra: Partial<Row> = {}): Row => {
+    tick()
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
     const row: Row = { id, number, member: member, from: 'joey', session_id: null, kind, refs: [], state: 'waiting', reason: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
       message_id: kind === 'message' ? 'm' + number : null, action_id: null, call_id: null, mail_id: null,
-      answered: null, response_message_ids: [], in_session_at: null, updated_at: iso(now), payload, ...extra }
+      answered: null, response_message_ids: [], in_session_at: null, created_at: iso(now), updated_at: iso(now), payload, ...extra }
     rows.set(id, row); change(row, 'created', '', extra.updated_at)
     return row
   }
   const eligible = (r?: Row) => !!r && r.state === 'waiting' && !(Date.parse(r.not_before ?? '') > now) && !(r.reason === 'parked' && !r.released)
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 60, async fetch(req) {
+    tick()
     const url = new URL(req.url), path = url.pathname, q = url.searchParams
     if (req.headers.get('authorization') !== 'Bearer ' + token) return error(401, 'not_authenticated')
     if (extra) {

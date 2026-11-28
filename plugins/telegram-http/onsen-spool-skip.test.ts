@@ -101,23 +101,11 @@ describe('1.58.32: an answer that names the Call it answers is no Call of this a
   })
 })
 
-describe('1.58.32: a roamer records nothing into the spool', () => {
-  test('ROAMER_MODE=1: recording off whatever ONSEN_RECORD / ONSEN_AGENTS say; nothing appended; the spool an older version left is kept', async () => {
-    expect(isRoamerEnv({ ROAMER_MODE: '1' })).toBe(true); expect(isRoamerEnv({})).toBe(false); expect(isRoamerEnv({ ROAMER_MODE: '0' })).toBe(false)
-    expect(recordFor({ ROAMER_MODE: '1' }, 'roamer-space-roamers')).toBe(false)
-    expect(recordFor({ ROAMER_MODE: '1', ONSEN_RECORD: '1', ONSEN_AGENTS: '*' }, 'x')).toBe(false)
-    expect(recordFor({}, 'chiron')).toBe(true)
-    expect(recordFor({ ROAMER_MODE: '0' }, 'chiron')).toBe(true)
-    // a roamer's client (record from recordFor): every record kind is dropped, the spool file never grows, no sync loop runs
-    const dir = mkdtempSync(join(tmpdir(), 'onsen-roamer-'))
-    const c = new OnsenClient({ dir, base: BASE, agent: 'roamer-space-roamers', record: recordFor({ ROAMER_MODE: '1' }, 'roamer-space-roamers'), credential: () => null,
-      log: () => {}, intervalMs: 3_600_000 })
-    c.start()
-    c.recordEvent({ idem_key: 'e1', agent: 'r', client: 'telegram', chat: '1', target_client_msg_id: '1', kind: 'reaction', actor: 'main', at: new Date().toISOString() })
-    expect(c.recordItemReport(report)).toBe(false)
-    expect(await c.drawLine({ chat: '1', clientMsgId: 5, by: 'tg:1' })).toBeNull()
-    expect(existsSync(join(dir, 'spool.jsonl'))).toBe(false)
-    expect((c.health() as any).recorded).toBe(0)
-    c.stop()
-  })
+test('roamers use the same recording settings as other members', () => {
+  expect(isRoamerEnv({ ROAMER_MODE: '1' })).toBe(true)
+  for (const ROAMER_MODE of ['0', '1']) {
+    expect(recordFor({ ROAMER_MODE }, 'space-roamers')).toBe(true)
+    expect(recordFor({ ROAMER_MODE, ONSEN_RECORD: '0' }, 'space-roamers')).toBe(false)
+    expect(recordFor({ ROAMER_MODE, ONSEN_AGENTS: 'adam' }, 'space-roamers')).toBe(false)
+  }
 })

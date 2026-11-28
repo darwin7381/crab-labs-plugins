@@ -1,7 +1,4 @@
-// WO-197 (Chiron lab round 3A on 1.58.27, the switch off; 1.59.0: a roamer, ROAMER_MODE=1, the only daemon with Telegram copies of a prompt): a prompt answered on the screen took 8–14 s to be cancelled in Onsen (its Telegram buttons
-// still there meanwhile): the menu relay's 8 s poll, and two looks without the menu are needed. A pane with an open Onsen Action of this daemon (a
-// prompt, a menu) is looked at every 2 s as well, so the cancel comes within ~4 s; the two-looks rule stays. A real daemon (server.ts, lanes off,
-// control mode, the poll at its default 8 s) against the Bot API stand-in and the Onsen stand-in; the pane runs a fake TUI.
+// The connector observes panes with open Actions on its faster polling interval.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -55,14 +52,13 @@ beforeAll(async () => {
   if (r.status !== 0) throw new Error(`tmux: ${r.stderr}`)
   onsen = startOnsenStandin({ [CRED]: 'p' }, await freePort())
   onsen.st.version.p = '0.35.3'
-  writeFileSync(join(root, 'cred'), CRED + '\n')
   api = startBotApiMock({}, { pollHoldMs: 200 })
   d = await startTgDaemon(api, join(root, 'p'), JOEY, { ROAMER_MODE: '1', GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0',
-    ONSEN_CLAUDE_BIN: '/nonexistent/claude', TMUX_TMPDIR: sock, ONSEN_CREDENTIAL_FILE: join(root, 'cred'), CHANNEL_BOT_TMUX_SESSION: pane })
+    ONSEN_CLAUDE_BIN: '/nonexistent/claude', TMUX_TMPDIR: sock, FIXTURE_MEMBER_TOKEN: CRED, ONSEN_OWNER: 'joey', CHANNEL_BOT_TMUX_SESSION: pane })
 }, 60000)
 afterAll(async () => { await d?.stop(); api?.stop(); onsen?.stop(); tm('kill-server'); try { rmSync(sock, { recursive: true }) } catch {} })
 
-test('a prompt answered on the screen (the poll at its default 8 s): its Action is cancelled within ~5 s of the answer, its Telegram copy closed', async () => {
+test('a prompt answered on the screen (the poll at its default 8 s): its Action is cancelled within ~5 s of the answer', async () => {
   expect(d.log()).toContain('startup-picker interceptor ON (poll=8s; 2s for a pane with an open Onsen Action)')
   writeFileSync(menu, JSON.stringify({ id: 'p1', title: 'Bash command', options: ['Yes', "Yes, and don't ask again for ls commands in /tmp/x", 'No'] }))
   await (await d.client()).notification({ method: 'notifications/claude/channel/permission_request', params: { request_id: 'fastp', tool_name: 'Bash',
@@ -78,7 +74,7 @@ test('a prompt answered on the screen (the poll at its default 8 s): its Action 
   const dt = cancelOf(a.id)!.at - t0
   expect(dt).toBeLessThanOrEqual(5500)
   expect(onsen.actions.get(a.id).state).toBe('cancelled')
-  expect(await until(() => api.of('editMessageText').some(e => String(e.body.text).includes('— 不用按了：畫面上已經沒有這個詢問')), 3000)).toBe(true)
+  expect(api.calls).toEqual([])
 }, 40000)
 
 test('a menu asked about in Onsen and answered on the screen (Esc): cancelled within ~5 s of the answer', async () => {

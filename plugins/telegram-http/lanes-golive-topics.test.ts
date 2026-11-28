@@ -48,18 +48,9 @@ test('no topic (the bot\'s topic mode is off: the API refuses): the work order g
   delete process.env.LANES_WORKER_TOPICS
 })
 
-test('server.ts / roamer-telegram.ts: a topic message is taken by its thread id (is_topic_message), the bot\'s topic mode is changed only with LANES_WORKER_TOPICS=enable', () => {
-  const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
-  // 1.59.0: the Telegram update handlers and the long poll's start are roamer-telegram.ts's (a roamer only)
-  const rt = readFileSync(join(import.meta.dir, 'roamer-telegram.ts'), 'utf8')
-  // lanes-topics (item 2): topicOfMessage, the one reader (inbound and callback messages); the meta shows it as topic="…" (lanes-topics-send.test.ts)
-  expect(src).toContain("return m?.message_thread_id != null && m?.is_topic_message !== false ? Lanes.topicId(m.message_thread_id) : undefined")
-  expect(src).toContain('topicOfMessage,')                                     // handed to the Telegram side (RoamerHost)
-  expect(rt).toContain('const inTopic = Lanes.LANES_ON ? h.topicOfMessage(ctx.message) : undefined')
-  expect(src).toContain('message_thread_id: routeTopic ?? meta.topic,')     // WO-197 segment 2: a connector's router topic is Onsen's thread
-  const f = rt.slice(rt.indexOf('private async laneTopicsAtStart('), rt.indexOf('// ---- inbound'))
-  // lanes-topics (item 1): the one decision (lanes-topics.ts topicModeAtStart: enable sends both fields in one call; lanes-topics-mode.test.ts)
-  expect(f).toContain('await topicModeAtStart(topicMode(), me as TopicMe, {')
-  expect(f).toContain('setMySettings: p => (this.bot.api.raw as any).setMySettings(p)')
-  expect(rt).toContain('if (Lanes.LANES_ON) void this.laneTopicsAtStart(')
+test('the bridge preserves the client thread id and the connector routes by the Onsen thread', () => {
+  const bridge = readFileSync(join(import.meta.dir, 'telegram-bridge', 'inbound.ts'), 'utf8')
+  expect(bridge).toContain('m.message_thread_id != null && m.is_topic_message !== false')
+  const daemon = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+  expect(daemon).toContain('message_thread_id: routeTopic ?? meta.topic,')
 })

@@ -1,6 +1,4 @@
-// WO-197 final (1.59.0): a preload (bun --preload) that makes the Telegram code unloadable in the process it runs in: loading grammy (or its types
-// package) or roamer-telegram.ts throws, and the path is appended to $PROBE_OUT (when set). A connector or the agent-inbox daemon started with it must
-// start and run as usual; a roamer started with it cannot start (the negative control: the probe does see the load). Tests only.
+// All daemon fixtures reject Telegram client loads. The bridge is a separate process.
 import { plugin } from 'bun'
 import { appendFileSync } from 'fs'
 

@@ -156,7 +156,7 @@ function runCommand(
   })
 }
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
   if (!pid || pid < 2) return false
   try { process.kill(pid, 0); return true } catch { return false }
 }
@@ -291,8 +291,14 @@ function readState(): RoamerState {
   catch { return { current_target: null } }
 }
 
+let selectionChanged: (() => void) | undefined
+export function onRoamerSelection(change: () => void): void { selectionChanged = change }
+export function selectionWrittenAt(): number {
+  try { return Math.floor(statSync(ROAMER_STATE_FILE).mtimeMs) } catch { return Date.now() }
+}
 function writeState(state: RoamerState): void {
   atomicWriteJson(ROAMER_STATE_FILE, state)
+  selectionChanged?.()
 }
 
 // ---- MCP session ↔ tmux mapping ----------------------------------------
@@ -544,7 +550,7 @@ const PROJECTS_ROOT = join(homedir(), '.claude', 'projects')
 function cwdSlug(cwd: string): string {
   return '-' + cwd.replace(/\//g, '-').replace(/^-+/, '')
 }
-function transcriptPath(cwd: string, sessionId: string): string {
+export function transcriptPath(cwd: string, sessionId: string): string {
   return join(PROJECTS_ROOT, cwdSlug(cwd), `${sessionId}.jsonl`)
 }
 
@@ -1303,22 +1309,26 @@ export async function handleModelCallbackForCurrentTarget(
   hash: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
   cmd: '/model' | '/effort' = '/model',
+  notApplied?: () => void,
 ): Promise<boolean> {
   // /effort gets a strict 5-level whitelist; /model keeps the id-shape check.
   const ok = cmd === '/effort'
     ? /^(low|medium|high|xhigh|max)$/.test(value)
     : /^[A-Za-z0-9._\[\]-]{1,48}$/.test(value)
   if (!ok) {
+    notApplied?.()
     await replyToTg(`❌ invalid ${cmd.slice(1)} value in callback: \`${value.slice(0, 60)}\``)
     return true
   }
   const state = readState()
   const target = state.current_target
   if (!target) {
+    notApplied?.()
     await replyToTg(`❌ 沒有連線中的 target — 先 /roam 選一個，再重開 ${cmd}`)
     return true
   }
   if (tmuxHash6(target.tmux) !== hash) {
+    notApplied?.()
     await replyToTg(`⚠️ target 已切換，這個選單是舊 target 的 — 重打 ${cmd} 開新選單`)
     return true
   }
@@ -1364,23 +1374,27 @@ async function handleTuiSlashForward(
 export async function handleRoamerCallback(
   data: string,
   replyToTg: (msg: string, opts?: ReplyOptions) => Promise<void>,
+  notApplied?: () => void,
 ): Promise<boolean> {
   if (!isRoamerEnabled()) return false
 
   if (data.startsWith('roam:')) {
     const sidPrefix = data.slice('roam:'.length).trim()
     if (!sidPrefix) {
+      notApplied?.()
       await replyToTg('❌ empty session id prefix in callback')
       return true
     }
     const sessions = await listRoamableSessions()
     const target = sessions.find(s => s.sessionId.startsWith(sidPrefix))
     if (!target) {
+      notApplied?.()
       await replyToTg(`❌ 找不到 session 開頭為 \`${sidPrefix}\` 的（可能已退出）。重新 /roam`)
       return true
     }
     await replyToTg(`🔌 連線中：${target.projectName} → ${target.cwd}`)
-    await connectToSession(target, msg => replyToTg(msg))
+    const result = await connectToSession(target, msg => replyToTg(msg))
+    if (!result.ok) notApplied?.()
     return true
   }
 
@@ -1388,11 +1402,13 @@ export async function handleRoamerCallback(
   if (data.startsWith('resume:')) {
     const sidPrefix = data.slice('resume:'.length).trim()
     if (!sidPrefix) {
+      notApplied?.()
       await replyToTg('❌ empty session id prefix in resume callback')
       return true
     }
     const state = readState()
     if (!state.current_target) {
+      notApplied?.()
       await replyToTg('⚠️ 尚未連線 target。打 /roam 選一個 session 再 resume。')
       return true
     }
@@ -1420,6 +1436,26 @@ export async function getRoamerWatchTargets(): Promise<Array<{ label: string; tm
   if (!(await tmuxSessionExists(state.current_target.tmux))) return []
   return [{ label: projectName(state.current_target.cwd), tmux: state.current_target.tmux }]
 }
+
+export function receivingTarget() {
+  const t = readState().current_target
+  if (!t?.claude_pid || !t.session_id || !t.cwd || !t.tmux) return null
+  return { session_id: t.session_id, claude_pid: t.claude_pid, tmux: t.tmux, transcript: transcriptPath(t.cwd, t.session_id) }
+}
+
+/** /clear and /resume replace the session inside the live takeover process. */
+export function refreshTargetSession(previous: NonNullable<ReturnType<typeof receivingTarget>>, sessionId: string): void {
+  const state = readState(), target = state.current_target
+  if (!target || target.claude_pid !== previous.claude_pid || target.tmux !== previous.tmux || target.session_id !== previous.session_id) return
+  const own = readRegistry()[ROAMER_BOT_NAME]
+  if (own?.daemon_pid === process.pid && own.claude_pid === target.claude_pid && own.tmux === target.tmux)
+    writeRegistryEntry(ROAMER_BOT_NAME, { ...own, session_id: sessionId, updated_at: Date.now() })
+  target.session_id = sessionId
+  writeState(state)
+}
+
+/** A stream claimed by this tmux takeover. Unmapped reconnects must prove their peer PID. */
+export const takeoverStream = (tmux: string) => tmuxToMcpSession.get(tmux)
 
 /**
  * The CURRENT roamer target's claude projects dir (session jsonl live here),

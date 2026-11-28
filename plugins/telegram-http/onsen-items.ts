@@ -2,20 +2,24 @@ import type { TakeMode } from './onsen-take.ts'
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string
-  state: string; reason: string | null; note?: string | null; version: number; updated_at: string; not_before?: string | null
+  state: string; reason: string | null; note?: string | null; released?: boolean; failures?: number; created_at?: string; version: number; updated_at: string; not_before?: string | null
   deadline?: string | null; half_done?: boolean; unverified?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
-  events?: Array<{ kind: string; note: string }>; payload: Record<string, any>
+  events?: Array<{ kind: string; note: string | null; at?: string; session_id?: string | null }>; payload: Record<string, any>
   claim?: { id: string; connector: string; taken_at: string; expires_at: string; session_id: string | null } | null
 }
 
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
+export type ReceivingState = { status: string; turn?: string | null; lastTurn?: string | null }
+export type ReceivingTarget = { session_id: string; claude_pid: number; tmux: string; transcript: string; transcriptOffset?: number; stateAtOffer?: ReceivingState }
 export type ItemRef = {
+  destination?: string | null
+  target?: ReceivingTarget
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
   note?: string; reason?: string; half_done?: true; conversation?: string
 }
 export function itemRef(it: InboxItem): ItemRef {
-  const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
+  const note = it.events?.findLast(e => e.kind === 'reassigned')?.note ?? undefined
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
     ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
@@ -36,7 +40,8 @@ export class ItemPeek {
   private request?: AbortController
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
-    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean, readonly waitSeconds = 25) {}
+    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean, readonly waitSeconds = 25,
+    readonly fullList?: (waiting: ReadonlyMap<string, number>) => void) {}
 
   reset(): void {
     this.generation++
@@ -101,6 +106,7 @@ export class ItemPeek {
       if (g !== this.generation) return
       this.page = r.json.next_cursor || undefined
       if (!this.page) {
+        if (!this.changedAfter) this.fullList?.(this.seen)
         this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined
         this.previous = this.seen; this.seen = new Map()
         if (r.json.items.length) delay = 100

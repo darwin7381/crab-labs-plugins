@@ -13,6 +13,7 @@ const dir = mkdtempSync(join(tmpdir(), 'roamer-pin-'))
 const bin = join(dir, 'bin')
 const home = homedir()
 const saved = { PATH: process.env.PATH, ROAMER_REGISTRY_FILE: process.env.ROAMER_REGISTRY_FILE, TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE }
+let otherDaemon: ReturnType<typeof Bun.spawn>
 let listRoamableSessions: () => Promise<any[]>
 
 // the machine as the fakes describe it
@@ -43,7 +44,8 @@ beforeAll(async () => {
   writeFileSync(join(bin, 'ps'), script(`echo "ps $*" >> "$D/calls.log"\nif [ "$*" = "-o pid=,ppid= -A" ]; then cat "$D/ps.txt"; exit 0; fi\nexit 1`))
   for (const b of ['claude', 'tmux', 'ps']) chmodSync(join(bin, b), 0o755)
   // the registry: another TG roamer holds claimed-1, a Discord roamer holds dc-1, a dead TG roamer held aaaa-1 (dropped at read)
-  const alive = { daemon_pid: process.ppid, claude_pid: process.pid, updated_at: 1 }
+  otherDaemon = Bun.spawn(['sleep', '60'])
+  const alive = { daemon_pid: otherDaemon.pid, claude_pid: process.pid, updated_at: 1 }
   writeFileSync(join(dir, 'registry.json'), JSON.stringify({
     other_bot: { ...alive, tmux: 'claimed-tmux', session_id: 'claimed-1', cwd: '/srv/claimed', protocol: 'telegram' },
     dc_bot: { ...alive, tmux: 'dc-tmux', session_id: 'dc-1', cwd: '/srv/dc', protocol: 'discord' },
@@ -56,7 +58,9 @@ beforeAll(async () => {
   ;({ listRoamableSessions } = await import('./roamer-control.ts'))
 })
 
-afterAll(() => {
+afterAll(async () => {
+  otherDaemon?.kill()
+  await otherDaemon?.exited
   for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v }
   rmSync(dir, { recursive: true, force: true })
 })

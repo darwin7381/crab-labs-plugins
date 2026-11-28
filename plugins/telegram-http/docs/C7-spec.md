@@ -6,6 +6,11 @@ Branch `wo213-c7` starts at `ef79d7a`. File and line references below are on tha
 
 This is the last connector change. S2 supplies take and report, S3 supplies projections, S4 and C3 must have passed the bench before switching production members, and C6 must have moved the roamers. With the existing client, switch and drain each member per rulings 24/44. Include the independent Codex runner in the handoff below. Before retiring the old code, the server owner verifies **zero GET /inbox requests across all members for 24 continuous hours**, including rejected requests. Check that old clients have finished their pending hands and acks. S5 removes the server routes after C7. Existing data on disk can be inspected by the operator during the drain. The new process never replays or erases those directories.
 
+Before switching the roamers, verify both C6 prerequisites.
+
+- [ ] The bridge carries each roamer bot.
+- [ ] C6 take and delivery passed with all four roamer identities.
+
 ## Connector changes
 
 | Mechanism | Code at the base | Behaviour after C7 |

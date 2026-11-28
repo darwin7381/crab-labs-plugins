@@ -188,21 +188,18 @@ plugins/telegram-http/onsen-client.ts::recordWithFiles(item: OnsenItem, upload: 
 plugins/telegram-http/onsen-client.ts::const items = await this.withFiles(run.map(x => x.line))
 plugins/telegram-http/onsen-client.ts::const s = await this.withoutFiles(run[k]!.line, items[k]!, said, cred)
 plugins/telegram-http/lanes.ts::if ((e as any)?.heldInOnsen === true) { if (held) held.said = String((e as Error).message)
-plugins/telegram-http/roamer-telegram.ts::await h.finishInbound(this.inboundFacts(ctx, text, image, attachment, attachmentFromReply, voiceTranscript, inTopic), { imagePath, imageError })
 plugins/telegram-http/server.ts::function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Record<string, string> {
 plugins/telegram-http/server.ts::if (it.say && it.reply_to && typeof it.reply_to === 'object') Object.assign(meta, pageReplyMeta(it.reply_to))
 plugins/telegram-http/server.ts::...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
 plugins/telegram-http/onsen-connector.ts::export class BridgeSwitch {
 plugins/telegram-http/onsen-connector.ts::async waitReport(id: string, conv: string): Promise<Said> {
 plugins/telegram-http/onsen-connector.ts::`/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`
-plugins/telegram-http/server.ts::const CONNECTOR = !INBOX_ONLY && !ROAMER
-plugins/telegram-http/server.ts::if (!TOKEN && ROAMER) {
-plugins/telegram-http/server.ts::new (await import('./roamer-telegram.ts')).RoamerTelegram(
+plugins/telegram-http/server.ts::const CONNECTOR = !INBOX_ONLY
 plugins/telegram-http/server.ts::void reportCommands().catch(() => {})
 plugins/telegram-http/server.ts::async function connectorReply(o: { chat: string; sender: string; text: string; redact: Array<[string, string]>; rich: boolean; files: string[]
 plugins/telegram-http/server.ts::if (!Connector.reactionOk(emoji)) throw new Error(`setMessageReaction: 400 Bad Request: REACTION_INVALID
 plugins/telegram-http/server.ts::await connectorSay!.edit(String(args.chat_id), String(args.message_id ?? ''), String(args.text ?? ''))
-plugins/telegram-http/server.ts::agent: CONNECTOR_AGENT,
+plugins/telegram-http/server.ts::agent: ONSEN_AGENT,
 plugins/telegram-http/server.ts::async function connectorFile(fileId: string): Promise<string> {
 plugins/telegram-http/onsen-inbound.ts::export function clientMetaOf(client: unknown): Record<string, string> | null {
 plugins/telegram-http/onsen-inbound.ts::export const TG_OWN_FILE_NAME = /^file_\d+(\.[A-Za-z0-9]+)?$/
@@ -211,9 +208,6 @@ plugins/telegram-http/onsen-status.ts::export const HANDLED_HERE = 'daemon'
 plugins/telegram-http/onsen-status.ts::this.emit(chat, String(id), 'turn_end', HANDLED_HERE, at, { handled_here: how }, { outcome, ...(turnId ? { turn_id: turnId } : {}) })
 plugins/telegram-http/server.ts::async function handledHere<T>(who: SelfWho | null, how: string, run: () => Promise<T>, mine: (r: T | undefined) => boolean = () => true): Promise<T> {
 plugins/telegram-http/server.ts::handled = await handledHere({ chat, id: ref, from: userId
-plugins/telegram-http/roamer-telegram.ts::await h.handledHere(self, 'permission', async () => {
-plugins/telegram-http/roamer-telegram.ts::const handled = await h.handledHere(ownSlash, 'command', () => handleControlSlash(text, h.httpPort,
-plugins/telegram-http/roamer-telegram.ts::const handled = await h.handledHere(ownSlash, 'command', () => handleRoamerSlash(text, async (msg: string, opts?: ReplyOptions) => {
 plugins/telegram-http/onsen-inbound.ts::export const CLIENT_META_FIXED: ReadonlySet<string> = new Set(['chat_id', 'message_id', 'ts', 'source', 'topic', 'user_id'])
 plugins/telegram-http/onsen-inbound.ts::for (const [k, v] of Object.entries(cm ?? {})) if (!clientMetaFixed(k)) meta[k] = v
 plugins/telegram-http/onsen-inbound.ts::export const CLIENT_META_LOCAL = /^image_path(_\d+)?$/
@@ -262,14 +256,13 @@ plugins/telegram-http/server.ts::async function connectorCommand(text: string, c
 plugins/telegram-http/server.ts::async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>): Promise<void> {
 plugins/telegram-http/server.ts::async function reportCommands(): Promise<void> {
 plugins/telegram-http/server.ts::function connectorOwner(): string | null {
-plugins/telegram-http/server.ts::if (CONNECTOR) { void ownerSay('system:alert', text); return }
-plugins/telegram-http/server.ts::if (CONNECTOR) { void ownerSay('system:login-watchdog', text); return }
+plugins/telegram-http/server.ts::if (CONNECTOR) void ownerSay('system:alert', text)
+plugins/telegram-http/server.ts::if (CONNECTOR) void ownerSay('system:login-watchdog', text)
 plugins/telegram-http/server.ts::function connectorClearHooks(chat: string, clearMsgId: string, by: string, here?: Lanes.TopicAsk, atIso?: string): ClearHooks | undefined {
 plugins/telegram-http/server.ts::const CLEAR_NOT_PRESSED = '沒按：新的一段看得到之前的對話'
-plugins/telegram-http/server.ts::createTopic: async (chat, name) => tg ? tg.createTopic(chat, name) : connectorOpenThread(chat, name),
-plugins/telegram-http/server.ts::topicDone: async (chat, thread) => tg ? tg.topicDone(chat, thread) : connectorThreadState(chat, thread, 'closed'),
+plugins/telegram-http/server.ts::createTopic: async (chat, name) => connectorOpenThread(chat, name),
+plugins/telegram-http/server.ts::topicDone: async (chat, thread) => connectorThreadState(chat, thread, 'closed'),
 plugins/telegram-http/server.ts::message_thread_id: routeTopic ?? meta.topic,
-plugins/telegram-http/roamer-telegram.ts::private checkApprovals(): void {
 plugins/telegram-http/onsen-connector.ts::export const MEMBER_CHAT = /^member:([a-z0-9][a-z0-9_.-]{0,63})$/
 plugins/telegram-http/onsen-connector.ts::export function withoutOnsenLabel(text: string, sender: string, agent: string, kindName: (k: string) => string): string {
 plugins/telegram-http/onsen-connector-seg2-daemon.test.ts::the line by conversation_id at the /clear
@@ -310,24 +303,15 @@ plugins/telegram-http/server.ts::const call = !answers && body?.call_id != null
 plugins/telegram-http/onsen-client.ts::export function answeredCall(refs: unknown): string | null {
 plugins/telegram-http/lanes-wo175.test.ts::1.58.32: the answer to a Call this agent made (refs.call → answers_call
 plugins/telegram-http/onsen-client.ts::export const isRoamerEnv = (env: NodeJS.ProcessEnv): boolean => (env.ROAMER_MODE ?? '').trim() === '1'
-plugins/telegram-http/onsen-client.ts::if (!recordOn(env) || isRoamerEnv(env)) return false
-plugins/telegram-http/server.ts::onsen: a roamer (ROAMER_MODE=1) records nothing into the Onsen spool
-plugins/telegram-http/onsen-spool-skip.test.ts::1.58.32: a roamer records nothing into the spool
+plugins/telegram-http/onsen-client.ts::if (!recordOn(env)) return false
+plugins/telegram-http/onsen-spool-skip.test.ts::roamers use the same recording settings as other members
 plugins/telegram-http/onsen-visible.ts::if (this.o.paused?.()) { if (s.timer) { clearTimeout(s.timer); s.timer = null } s.want = null; return }
-# WO-197 final (telegram-http 1.59.0, Chiron's ruling A): the Telegram code is roamer-telegram.ts (a roamer only); a non-roamer is always a connector.
-# Canaries of code that moved there now point at it (finishInbound of a Telegram update, handledHere of a command / a permission reply, the pairing
-# confirmations); those of the switch (connectorNow / bridgeSwitch / connectorTick / the guard) point at ROAMER / CONNECTOR, the token check, the dynamic
-# import and the command report. Removed with the paths no daemon has any more (listed in CHANGELOG 1.59.0): the daemon's own ONSEN_FILES (recordWithFiles,
-# the outbound file record, photoCopies, the ONSEN_FILES live key), ONSEN_FIRST in server.ts (sendOnsenFirst, its steps, its HeldInOnsen, the live key),
-# the Telegram→Onsen inbound writer (viaOnsen, enqueue, inboundWritten's back timer, the edit absorption, editBackLater, albumArriving and its count stamp),
-# tg-fetch.ts (the hand-over's drain) and its server.ts uses, the hand-over's poll cut (bridgeSwitch.fresh, POLL_OWN), the status pin in server.ts, the
-# two deleted test files' markers (onsen-album-crash-daemon, connector-poll-start-daemon). The modules' own canaries (onsen-first.ts, onsen-inbound.ts,
-# onsen-visible.ts, onsen-files.ts) stay: those modules are unchanged (the bridge uses several).
-plugins/telegram-http/roamer-telegram.ts::import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
-plugins/telegram-http/roamer-telegram.ts::this.bot.api.config.use((prev, method, payload, signal) =>
+# C7: every receiver uses Onsen. Telegram polling lives in the bridge.
+plugins/telegram-http/server.ts::item.destination = await roamerItems.destination(row)
+plugins/telegram-http/roamer-items.ts::this.o.claims.accept(sid, a.onsen_claims.split(','), turn, at)
 plugins/telegram-http/server.ts::const ROAMER = !INBOX_ONLY && Onsen.isRoamerEnv(process.env)
 plugins/telegram-http/server.ts::if (!got[0]) throw new Error(`${Connector.NOT_TAKEN}（檔案 ${name} 沒存進 Onsen）`)
-plugins/telegram-http/wo197-final.test.ts::(b) the search: no daemon source but roamer-telegram.ts mentions grammy, api.telegram.org, bot.api or getUpdates
+plugins/telegram-http/wo197-final.test.ts::the daemon sources have no native Telegram client or poll
 plugins/telegram-http/test-fixtures/no-telegram-probe.ts::must not be loaded by this daemon
 # WO-201 (telegram-http 1.59.1, Chiron resend audit 2026-11-27 rule 3): an item is offered to the main again only on a fact. None removed: the two
 # requeue lines replaced (endGen's gen_end, sessionStart's session_start) held no canary. Added so a stale copy cannot bring "gen changed = re-offer all" back,
