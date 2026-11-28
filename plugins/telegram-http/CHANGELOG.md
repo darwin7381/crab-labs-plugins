@@ -1,3 +1,7 @@
+## 1.59.14 — 2026-11-28 (a waited Call that is already final no longer resends a message Onsen rejects)
+
+- **`checkWaitingCall` stops the 5-second resend** (Epeius #201085): when a waited Call was already final and no local thread held the asker, it posted `type: 'system'` to `/v1/conversations/<id>/messages`; Onsen accepts only `type: message`, answered 400, and the waiter retried every 5 s (production since 2026-11-28 05:19:50Z, conversation 104). Now: no thread → one info line and the wait ends (`{ final }`); with a thread the notice goes through `recordThreads` as before. A Call GET answered with a permanent 4xx (not 408/429) also ends the wait, logged once (`http_<status>`).
+
 ## 1.59.13 — 2026-11-28 (WO-218: a no_reply answer reaches the one who asked, at once)
 
 - **An answer to a call we sent is delivered to its owner now, not at the next digest** (WO-218, Chiron; Joey TG chiron:3052: sub-agent and Codex answers reached the main up to 50 min late). Rule 6 `mesh-no-reply` sends such answers to `case 'ledger'`, which found the owner (`threadOwnerFor`) and only recorded it. Now `ledger` and `thread_owner` share one function (`toThreadOwner`): owner main → `target: main` (no batch), an open lane → that lane, a closed lane → main; a stopped thread or the hop limit → as `thread_owner`. The FYI line stays in the activity list and nothing is owed. `urgency: silent` notices and answers with no known owner stay in the ledger, as before. The decision's thread is the answer's own when our call had none (no new local thread record).
