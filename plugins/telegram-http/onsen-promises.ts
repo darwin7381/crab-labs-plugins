@@ -57,11 +57,14 @@ function timeInPhrase(words: string, at: number): number | null {
   const minute = clock[6] ? 30 : Number(clock[4] ?? clock[5] ?? 0)
   if (hour > 23 || minute > 59) return null
   const due = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + day, hour - 8, minute)
+  if ((!clock[1] || clock[1] === '今天') && !clock[2] && /[點時]/.test(clock[0]) && hour >= 1 && hour <= 12) {
+    const halfDay = 12 * 3600_000
+    const first = hour === 12 ? due - halfDay : due
+    const next = first + Math.max(0, Math.ceil((at - first) / halfDay)) * halfDay
+    const tomorrow = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1, -8)
+    return clock[1] === '今天' && next >= tomorrow ? null : next
+  }
   if (due >= at) return due
-  // At 15:00, a bare 「3 點半」 can still refer to the hour in progress.
-  const afternoon = due + 12 * 3600_000
-  if ((!clock[1] || clock[1] === '今天') && !clock[2] && /[點時]/.test(clock[0])
-    && local.getUTCHours() === hour + 12 && afternoon >= at) return afternoon
   if (weekday) return due + 7 * 86400_000
   return clock[1] ? null : due + 86400_000
 }

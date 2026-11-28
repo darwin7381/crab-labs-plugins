@@ -143,11 +143,15 @@ test('only definite times become deadlines', () => {
   expect(promiseTime('第 1 點', at)).toBeNull()
 })
 
-test('clock times belong to the promise clause and bare past clocks roll to tomorrow', async () => {
+test('clock times belong to the promise clause and bare hours use the next twelve-hour occurrence', async () => {
   const at = Date.parse('2026-11-28T15:00:00+08:00')
   expect(promiseTime('10:30 那次重啟是正常的，晚點跟你說', at)).toBeNull()
   expect(promiseTime('10 分鐘後，我會回報', at)).toBe(at + 600_000)
-  expect(promiseTime('9 點前給你', at)).toBe(Date.parse('2026-11-29T09:00:00+08:00'))
+  expect(promiseTime('9 點前給你', at)).toBe(Date.parse('2026-11-28T21:00:00+08:00'))
+  expect(promiseTime('4 點前回報', at)).toBe(at + 3600_000)
+  expect(promiseTime('2 點前回報', at)).toBe(Date.parse('2026-11-29T02:00:00+08:00'))
+  expect(promiseTime('12 點半前回報', at)).toBe(Date.parse('2026-11-29T00:30:00+08:00'))
+  expect(promiseTime('今天 2 點前回報', at)).toBeNull()
   expect(promiseTime('3 點半前回報', at)).toBe(at + 30 * 60_000)
   expect(promiseTime('今天 3 點半前回報', at)).toBe(at + 30 * 60_000)
   expect(promiseTime('今天上午 3 點半前回報', at)).toBeNull()
