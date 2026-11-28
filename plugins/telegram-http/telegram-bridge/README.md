@@ -54,6 +54,7 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
   - A message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 \<agent\>；連上會自動補交，不用重傳。」 That happens once per message, remembered across restarts.
   - When Onsen is back, each bot resumes writing in order.
 - **Deduplication.** DMs use `tg:<member>:<chat>:<message_id>`. Supergroups use `tg:<chat>:<message_id>`. Basic groups use `tg:<chat>:<from.id>:<date>:<hash>`. The hash is the first 16 hex digits of SHA-256 over the raw text or caption, including hidden link targets, rich blocks, file unique IDs, album ID, forward origin, location or contact when present.
+  Two distinct basic-group messages from the same sender in the same second can have identical content. If Telegram supplies no shared field that distinguishes them, they get the same key and appear once in Onsen. WO-217 accepts this limitation.
 - **Refused for good.**
   - 403 `not_allowed` (the account is an agent or a system member), or `unknown_identity` (before Onsen 0.35.1; a stranger in a group becomes a guest). The update is done, nothing is answered, and one log line is written.
   - 400. The update isn't tried again; in a DM, one reply says it wasn't handed over.

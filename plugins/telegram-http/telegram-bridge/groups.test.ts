@@ -107,6 +107,15 @@ test('basic group dedupes different bot-local ids by person, second and raw capt
   ].sort())
 })
 
+test('identical basic-group posts from one sender in one second share a key when only their bot-local numbers differ', async () => {
+  for (const id of [7, 8]) tg.push(a, { message: { chat: group, from, date, text: '收到', message_id: id } })
+  await confirmed()
+  expect(onsen.messages).toHaveLength(1)
+  expect(onsen.messages[0].aliases).toEqual([
+    { member: 'lab-a', chat: '-23', client_msg_id: '7' }, { member: 'lab-a', chat: '-23', client_msg_id: '8' },
+  ])
+})
+
 test('three basic-group album photos get three keys across both bots, including two without captions', async () => {
   for (const [token, offset] of [[a, 10], [b, 80]] as const) {
     for (let i = 0; i < 3; i++) {
