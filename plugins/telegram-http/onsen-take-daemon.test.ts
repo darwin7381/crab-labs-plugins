@@ -47,6 +47,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
+  writeFileSync(join(root, 'empty-config'), '')
   writeFileSync(join(state, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {}, ackReaction: '' }))
   copyFileSync(join(import.meta.dir, 'lanes-router.fleet.json'), join(lanes, 'router.json'))
   const port = await freePort()
@@ -54,7 +55,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   const childEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH, TMPDIR: root, HOME: join(root, 'home'), TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: state,
     AGENT_WORKSPACE_DIR: root, GENESIS_LANES: '1', LANES_AGENT: 'adam', ONSEN_HOST: 'Mac-Mini', ONSEN_TAKE: '*',
-    ONSEN_OBSERVATION: 'adam', ONSEN_BASE: f.base, ONSEN_REGISTRY_CLI: '0', JEV_SCREEN: '', CRAB_LABS_PLUGINS_ENV: join(root, 'no-config'),
+    ONSEN_OBSERVATION: 'adam', ONSEN_BASE: f.base, ONSEN_REGISTRY_CLI: '0', JEV_SCREEN: '', CRAB_LABS_PLUGINS_ENV: join(root, 'empty-config'),
     USAGE_WALL_READ: '0', HUB_SYNC: '0', TYPESAFE_KEY_FILE: join(root, 'no-key'), LANES_CLAUDE_BIN: join(import.meta.dir, 'test-fixtures/no-claude.sh'),
     ...env, ...settings,
   }
@@ -462,6 +463,24 @@ for (const take of [false, true]) test('C2 message, wall and wake reports on ' +
     expect(d.f.history).toEqual([])
   }
 }, 12000)
+
+test('C2 drains pre-switch deliveries and keeps status, observation and replies on take', async () => {
+  const delivery = { idem_key: 'before-switch', agent: 'adam', client: 'telegram', chat: '1', client_msg_id: '299',
+    state: 'delivered', at: new Date().toISOString() }
+  const d = await daemon({}, 200, root => {
+    const dir = join(root, 'tg/onsen')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'spool.jsonl'), JSON.stringify({ k: 'd', r: delivery }) + '\n')
+    return {}
+  })
+  const cmd = command(d, 'after-switch', '/help', '300')
+  await waitFor(() => cmd.state === 'completed')
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
+  await waitFor(() => d.f.calls.some(c => c.path === '/status/batch'))
+  expect(d.f.calls.filter(c => c.path === '/deliveries/batch').flatMap(c => c.body.items)).toEqual([delivery])
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
+  expect(d.f.history.some(h => h.item_id === cmd.id && h.body.outcome === 'completed')).toBe(true)
+})
 
 for (const take of [false, true]) test('C2 inbox scheduler start receipt on ' + (take ? 'take' : 'pull'), async () => {
   const requests: string[] = []
