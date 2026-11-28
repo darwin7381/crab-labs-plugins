@@ -178,6 +178,39 @@ function scriptedLane(root: string) {
   return { LANES_CLAUDE_BIN: bin }
 }
 
+test('C4 main hooks create a waiting resume; an independent turn after fixture restart cancels it without a take', async () => {
+  const session_id = randomUUID()
+  const d = await daemon({}, 200, root => {
+    writeFileSync(join(root, '.lanes', 'main-expected'), session_id)
+    return {}
+  })
+  const hook = async (event: string, prompt_id: string, extra = {}) => {
+    const res = await fetch(d.base + '/lanes/main-event', { method: 'POST', headers: {
+      'Content-Type': 'application/json', Authorization: 'Bearer test-loopback' },
+      body: JSON.stringify({ event, prompt_id, pid: process.pid, session_id, ...extra }) })
+    expect(res.status).toBe(200)
+  }
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  await hook('SessionStart', '', { source: 'startup' })
+  await hook('UserPromptSubmit', 'typing', { dids: [] })
+  await hook('StopFailure', 'typing', { error: 'rate_limit' })
+  await waitFor(() => d.f.rows.size === 1)
+  const row = [...d.f.rows.values()][0]!
+  await waitFor(() => d.journal().some(l => l.rec === 'msg' && l.onsen_items?.[0]?.onsen_item_id === row.id))
+  expect(row).toMatchObject({ state: 'waiting', kind: 'resume', not_before: null, session_id: 'main' })
+  expect(d.journal().find(l => l.onsen_items)?.notif.params.content).toBe(row.payload.text)
+  const probes = () => d.f.calls.filter(c => c.query.has('connector') && c.query.get('limit') === '1').length
+  const first = probes()
+  await d.restart()
+  await waitFor(() => probes() > first && d.log().includes('onsen take: started'))
+  await hook('PreToolUse', 'typing', { tool_name: 'Read' })
+  await waitFor(() => row.reason === 'superseded')
+  expect(row.state).toBe('cancelled')
+  expect(d.f.calls.filter(c => c.body.kind === 'resume')).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
+  expect(d.f.history).toHaveLength(0)
+}, 15_000)
+
 const worker = 'adam.worker.1'
 test('C5 bench: the main reply tool writes one timed promise for the test account and a report at minute five produces no waiter notice', async () => {
   const jev = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answers: { promises: { type: 'noul', noul: 0.99 } } }) })

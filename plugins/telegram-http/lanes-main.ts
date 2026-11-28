@@ -199,15 +199,18 @@ export function createMain(E: MainEnv) {
   let offering = false
   // A final Stop can arrive during an awaited stream write. Its cleared guard must stay cleared.
   let finalStops = 0
+  let localResumeInFlight: CutTurn | undefined
   let wallWakePending = false
   let seq = 0
   let restoredThrough = 0
 
   const J = (): Journal => E.journal
   const resumes = new ResumeItems(latestMain, entries => {
-    const g = latestMain()!
-    J().write('main', g.id, g.state, { resume_items: entries.length ? entries : null })
-  }, () => E.itemReceiver?.())
+    const g = latestMain()
+    J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
+  }, () => E.itemReceiver?.(), id => {
+    for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason: 'superseded' })
+  }, () => { void pump() })
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
@@ -343,8 +346,10 @@ export function createMain(E: MainEnv) {
     return id
   }
   const isResume = (r: Row): boolean => r.onsen_items?.[0]?.kind === 'resume'
-  const owed = (r: Row): boolean => isResume(r) || (E.owed ? E.owed(r) : r.kind !== 'digest')
+  const owed = (r: Row): boolean => isResume(r) ? resumes.canOffer(r.onsen_items[0].onsen_item_id) : (E.owed ? E.owed(r) : r.kind !== 'digest')
   function routeResume(ref: ItemRef, text: string): void {
+    resumes.remember(ref.onsen_item_id)
+    if (resumes.cancelling(ref.onsen_item_id)) return
     const pending = items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === ref.onsen_item_id)[0]
     if (pending) {
       if (ref.onsen_version > pending.onsen_items[0].onsen_version) J().write('msg', pending.id, pending.state, { onsen_items: [ref] })
@@ -474,11 +479,15 @@ export function createMain(E: MainEnv) {
     const refs: ItemRef[] = rows.flatMap(r => r.onsen_items ?? [])
     if (!receiver) return rows.filter(r => !r.onsen_items)
     if (!ready()) return []
-    const { given, gone } = await receiver.receive(refs, hook, binding)
+    const { given, gone } = await receiver.receive(refs, hook, binding, id => resumes.cancelling(id))
     const valid = ready()
     return rows.filter(r => {
       const own: ItemRef[] | undefined = r.onsen_items
       if (!own) return valid
+      if (isResume(r) && resumes.cancelling(own[0]!.onsen_item_id)) {
+        if (given.has(own[0]!.onsen_item_id)) receiver.report(own, 'superseded')
+        return false
+      }
       if (valid && r.state === 'queued' && own.every(ref => given.has(ref.onsen_item_id))) return true
       receiver.report(own.filter(ref => given.has(ref.onsen_item_id)), 'not_taken')
       if (own.some(ref => gone.has(ref.onsen_item_id))) {
@@ -595,7 +604,9 @@ export function createMain(E: MainEnv) {
     if (resume && localResume() && !candidates().length && stillReady()) {
       const notif = resumeNotification(resumeText(cut))
       const before = finalStops
+      localResumeInFlight = cut
       const sent = await E.offer(notif, 'tg', Number(g.pid)).catch(e => { E.log('warn', `lanes: resume offer failed: ${e}`); return false })
+      localResumeInFlight = undefined
       if (sent) {
         // Hooks may already have refused this turn, replaced its gen, or finished it. Count every write
         // on the agent's latest gen. Only a still-open interval between final Stops needs the guard.
@@ -603,6 +614,7 @@ export function createMain(E: MainEnv) {
         const fields = { resumes: (now.resumes ?? 0) + 1, ...(before === finalStops ? { cut_turn: cut, resume_sent: cut.at } : {}) }
         J().write('main', now.id, now.state, { ...fields, ...(probe && now === g && now.version === version ? clearFields : {}) })
       }
+      syncResumes()
     }
   }
   /** 002w (E, gaps 4, 11): an item reached the main (offered, or bound at a boundary): an episode of owed items nobody could take is over */
@@ -829,6 +841,8 @@ export function createMain(E: MainEnv) {
   /** Included in the same journal write as the turn end. An undefined field keeps the previous fact. */
   function bareCut(g: Row, rs: Row[], why: string, at = Date.now()): CutTurn | undefined {
     if (g.resume_sent != null || itemCount(rs)) return
+    // A replayed StopFailure can arrive after endClaim closed the prompt's M1 rows.
+    if (g.prompt_id && E.itemReceiver?.()?.mode.active && items(r => r.prompt_id === g.prompt_id && r.onsen_items).length) return
     if (why === 'gen_end') {
       let n: number | null | undefined
       try { if (g.session_id) n = E.registry?.backgroundAgents(g.session_id) } catch {}
@@ -847,7 +861,7 @@ export function createMain(E: MainEnv) {
     if (!E.itemReceiver?.()?.mode.active) return
     const g = latestMain()
     // A pull-era cut can survive an upgrade or the startup probe. Transfer only an unsent one.
-    if (g?.cut_turn && g.resume_sent !== g.cut_turn.at) setMain(g, g.state as MainPhase, { cut_turn: g.cut_turn })
+    if (g?.cut_turn && g.resume_sent !== g.cut_turn.at && localResumeInFlight?.at !== g.cut_turn.at) setMain(g, g.state as MainPhase, { cut_turn: g.cut_turn })
     else resumes.sync()
   }
   function endGen(g: Row, why: EndReason): void {
@@ -882,18 +896,28 @@ export function createMain(E: MainEnv) {
     tellCut(capped, 'gen_end')
     try { E.genChanged(null) } catch {}
   }
-  function beginTurn(g: Row, prompt: string, dids?: string[]): void {
+  function beginTurn(g: Row, prompt: string, dids?: string[], failed = false): void {
     if (g.prompt_id === prompt) return
     if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
+    const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
+    const receiver = E.itemReceiver?.()
+    const canBind = (r: Row) => {
+      const named = ids.has(r.id), resume = isResume(r)
+      if (resume && ((!named && !failed) || resumes.cancelling(r.onsen_items[0].onsen_item_id))) return false
+      const offered = r.state === 'offered' && r.gen === g.id
+      const queued = r.state === 'queued' && forGen(r, g) && (named || failed && resume && inFlight.has(r.id))
+      return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id)))
+    }
+    if (!failed && receiver) {
+      syncResumes()
+      // An offered resume can still be in Claude's input queue while it starts its own turn.
+      if (g.resume_items && !items(r => canBind(r) && r.kind !== 'digest' && (!dids || ids.has(r.id))).length) resumes.supersede(g.session_id)
+    }
     if (g.prompt_id) cutTurn(g)                                     // a turn that never got Stop or StopFailure: its items ride this turn (pull, WO-157c)
     outputs.clear(); calls.clear(); openTools.delete(g.id)                                          // the aids look at this prompt's calls only
     starts.set(g.id, { prompt, at: new Date().toISOString(), prev: starts.get(g.id)?.at ?? null })
     setMain(g, 'in_turn', { prompt_id: prompt, tool_open: null, stopped_prompt: null })
-    const ids = new Set((dids ?? []).flatMap(d => String(d).split(',')).map(s => s.trim()).filter(Boolean))
-    // what the prompt names (its did="…"), and whatever was offered to this gen: one offer opens one turn, so it is this turn's
-    const bind = items(r => (r.state === 'offered' && r.gen === g.id) || (ids.has(r.id) && r.state === 'queued' && forGen(r, g)))
-    const receiver = E.itemReceiver?.()
-    const accepted = bind.filter(r => !r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id)))
+    const accepted = items(canBind)
     for (const r of accepted) if (r.onsen_items) receiver?.bind(r.onsen_items, 'main', prompt, g.session_id)
     const at = new Date().toISOString()
     for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at })
@@ -1040,7 +1064,7 @@ export function createMain(E: MainEnv) {
         return {}
       }
       case 'StopFailure': {
-        if (p) beginTurn(g, p)
+        if (p) beginTurn(g, p, undefined, true)
         openTools.delete(g.id)
         const err = String(b.error ?? 'unknown')
         // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn). The account wall below is unchanged

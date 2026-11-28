@@ -3,7 +3,7 @@ import type { InboxItem, ItemRef } from './onsen-items.ts'
 import type { TakeMode } from './onsen-take.ts'
 
 export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied'
-  | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned'
+  | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned' | 'superseded'
 export type ReportFields = { session_id?: string; response_message_ids?: string[]; retry_after?: string | null
   half_done?: boolean; command_message_id?: string; note?: string }
 export type ItemReport = { item_id: string; body: { claim_id: string; at: string; outcome: Outcome } & ReportFields }
@@ -14,6 +14,7 @@ export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
 export type ClaimStore = {
   blocked(): boolean
   owns(id: string): boolean
+  completed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
   bind(id: string, session: string, turn: string, registrySession?: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): void
@@ -25,6 +26,7 @@ export class ItemReceiver {
   private requesting = new Set<string>()
   constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void,
     readonly currentKeepwarm?: (due?: string) => boolean) {}
+  taking(id: string): boolean { return this.requesting.has(id) }
 
   report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
     for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
@@ -34,7 +36,7 @@ export class ItemReceiver {
     for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
   }
 
-  async receive(refs: ItemRef[], hook = false, binding = false): Promise<ReceiveResult> {
+  async receive(refs: ItemRef[], hook = false, binding = false, superseded?: (id: string) => boolean): Promise<ReceiveResult> {
     const result = empty()
     if (!this.mode.active || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
@@ -88,7 +90,7 @@ export class ItemReceiver {
         if (single?.json?.data?.not_before) this.dueAt(single.json.data.not_before)
       }))
       if (expired || !this.mode.active) {
-        for (const id of need) if (result.given.has(id)) this.claims.report(id, 'not_taken')
+        for (const id of need) if (result.given.has(id)) this.claims.report(id, superseded?.(id) ? 'superseded' : 'not_taken')
         return empty()
       }
       return result

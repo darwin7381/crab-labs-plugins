@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -35,13 +35,13 @@ function rig() {
   return { f, client, mode, claims, file, receiver, dir, logs, misses, deadlines, outcomes, sync: () => client.syncNow(true),
     attach(m: MainApi) { main = m } }
 }
-async function mainRig(backoff = 300_000) {
+async function mainRig(backoff = 300_000, onOffer = async () => true) {
   const r = rig()
   await r.mode.probe()
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
   const sid = crypto.randomUUID(), pid = 1051
   let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
-  const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return true },
+  const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
     wallBackoff: () => backoff, registry: { mainForAdoption: () => null, backgroundAgents: () => bg },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: () => true, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {}, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
@@ -116,11 +116,181 @@ test('C4 a process cut records the old background count; an item failure and an 
   const message = other.f.add('work')
   await other.bind(message)
   await other.hook('StopFailure', { error: 'server_error' }); await other.sync()
+  await other.hook('StopFailure', { error: 'server_error' })
   await other.hook('UserPromptSubmit', { prompt_id: 'typing' })
   other.m.markEnd('asked')
   await other.hook('SessionEnd')
   expect(other.outcomes('work')).toContain('error')
   expect([...other.f.rows.keys()]).toEqual(['work'])
+})
+
+async function accountCut() {
+  const r = await mainRig()
+  r.setWall({ walled: true, clearedMs: null })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  await until(() => !!r.m.currentGen()?.resume_items?.[0]?.id)
+  const row = [...r.f.rows.values()][0]!
+  r.m.routeResume(itemRef(row), row.payload.text)
+  return { ...r, row }
+}
+
+test('C4 switch to take imports an unsent pull cut, and waits for a pull stream write already in flight', async () => {
+  const pending = await mainRig()
+  pending.mode.pause('pull', 60_000)
+  await pending.hook('UserPromptSubmit')
+  await pending.hook('StopFailure', { error: 'overloaded' })
+  const retry = pending.m.currentGen()!.cut_turn.retry_at
+  await pending.mode.probe(); await pending.m.pump()
+  await until(() => pending.f.rows.size === 1)
+  expect([...pending.f.rows.values()][0]!.not_before).toBe(new Date(retry).toISOString())
+  expect(pending.m.currentGen()?.cut_turn).toBeUndefined()
+  expect(pending.offers).toHaveLength(0)
+
+  let finish!: (sent: boolean) => void
+  const writing = await mainRig(0, () => new Promise(resolve => { finish = resolve }))
+  writing.mode.pause('pull', 60_000)
+  await writing.hook('UserPromptSubmit')
+  await writing.hook('StopFailure', { error: 'overloaded' })
+  const receipt = writing.m.pump()
+  await until(() => writing.offers.length === 1)
+  await writing.mode.probe(); await writing.m.pump()
+  finish(true); await receipt; await writing.m.pump()
+  expect(writing.m.currentGen()!.resumes).toBe(1)
+  expect(writing.f.calls.filter(c => c.body.kind === 'resume')).toHaveLength(0)
+})
+
+test('C4 a refused resume probe belongs to its claimed row even if StopFailure is the first hook', async () => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  await r.hook('StopFailure', { prompt_id: 'probe', error: 'rate_limit' })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session', 'usage_limit_probe'])
+  expect(r.f.rows.size).toBe(1)
+})
+
+test('C4 a held claim is marked superseded offline before its offer lease can expire', async () => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  r.f.down(true)
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  expect(r.client.hasItemReports()).toBe(true)
+  r.f.advance(25_000); r.claims.start()
+  await r.sync()
+  r.f.down(false); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['superseded'])
+  expect(r.misses).toEqual([])
+})
+
+test('C4 a same-prompt independent turn supersedes the waiting row at its latest version', async () => {
+  const r = await accountCut()
+  expect(r.f.calls.find(c => c.body.kind === 'resume')!.body).not.toHaveProperty('not_before')
+  await r.hook('PreToolUse', { sub: true })
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.rows.size).toBe(1)
+  r.f.change(r.row, 'updated')
+  const version = r.row.version
+  await r.hook('UserPromptSubmit', { dids: [] })
+  await until(() => r.row.state === 'cancelled')
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded')).toMatchObject([
+    { path: '/v1/items/' + r.row.id, body: { expected_version: version, outcome: 'superseded' } },
+  ])
+  await r.hook('Stop', { phase: 'final' })
+  await r.m.tick()
+  expect(r.row.reason).toBe('superseded')
+  expect(r.offers).toEqual([])
+})
+
+test('C4 auto-resume between the server take and its response spools superseded without a stream write', async () => {
+  const r = await accountCut()
+  r.f.delayTake(100)
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  const offer = r.m.pump()
+  await until(() => r.row.state === 'claimed')
+  const claim = r.row.claim!.id
+  await r.hook('PreToolUse', { prompt_id: 'automatic', tool_name: 'Read' })
+  await offer
+  await r.sync()
+  expect(r.f.history).toMatchObject([{ item_id: r.row.id, body: { claim_id: claim, outcome: 'superseded' } }])
+  expect(r.row).toMatchObject({ state: 'cancelled', reason: 'superseded', failures: 0 })
+  expect(r.f.calls.some(c => c.body.expected_version !== undefined)).toBe(false)
+  expect(r.offers).toEqual([])
+})
+
+test('C4 a take recovered by its idempotency key reports the intervening auto-resume', async () => {
+  const r = await accountCut()
+  const request = r.mode.req
+  let lost = false
+  spyOn(r.mode, 'req').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (!lost && args[1].endsWith('/take')) {
+      lost = true
+      await r.hook('PreToolUse', { prompt_id: 'automatic', tool_name: 'Read' })
+      throw Error('take response lost')
+    }
+    return reply
+  })
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump(); await r.sync()
+  const takes = r.f.calls.filter(c => c.path.endsWith('/take'))
+  expect(takes).toHaveLength(2)
+  expect(takes[0]!.key).toBe(takes[1]!.key)
+  expect(r.outcomes(r.row.id)).toEqual(['superseded'])
+  expect(r.offers).toEqual([])
+})
+
+test('C4 a claimed offer without its did is superseded, while a turn opened by another item leaves the resume waiting', async () => {
+  const claimed = await accountCut()
+  claimed.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await claimed.m.pump()
+  expect(claimed.offers).toHaveLength(1)
+  await claimed.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await until(() => claimed.client.hasItemReports())
+  await claimed.sync(); await claimed.m.tick()
+  expect(claimed.outcomes(claimed.row.id)).toEqual(['superseded'])
+  expect(claimed.offers).toHaveLength(1)
+
+  const other = await mainRig()
+  await other.hook('UserPromptSubmit')
+  await other.hook('StopFailure', { error: 'overloaded' })
+  await until(() => other.f.rows.size === 1)
+  const resume = [...other.f.rows.values()][0]!
+  await other.bind(other.f.add('message'))
+  await other.hook('Stop', { phase: 'final' })
+  expect(resume.state).toBe('waiting')
+})
+
+test('C4 a lost POST response and a lost DELETE race keep the decision across retries', async () => {
+  const r = await mainRig()
+  const request = r.mode.req
+  let losePost = true, conflict = true
+  spyOn(r.mode, 'req').mockImplementation(async (...args) => {
+    const [method, path] = args
+    if (method === 'DELETE' && conflict) {
+      conflict = false
+      r.f.change([...r.f.rows.values()][0]!, 'updated')
+    }
+    const reply = await request(...args)
+    if (method === 'POST' && path === r.mode.path && losePost) { losePost = false; throw Error('POST response lost') }
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  await until(() => r.logs.some(l => l.includes('POST response lost')))
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await until(() => !conflict && r.f.calls.some(c => c.body.expected_version === 1))
+  const row = [...r.f.rows.values()][0]!
+  expect(row.state).toBe('waiting')
+  await until(() => { void r.m.pump(); return row.state === 'cancelled' })
+  const posts = r.f.calls.filter(c => c.body.kind === 'resume')
+  expect(posts).toHaveLength(2)
+  expect(posts[0]!.key).toBe(posts[1]!.key)
+  expect(r.f.calls.filter(c => c.body.outcome === 'superseded').map(c => c.body.expected_version)).toEqual([1, 2])
+  expect(r.f.rows.size).toBe(1)
+  expect(r.offers).toEqual([])
 })
 
 test('switch, prerequisites, stable machine/member and all probe refusals', async () => {

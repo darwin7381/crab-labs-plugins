@@ -4995,7 +4995,7 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
-  if (row.kind === 'resume') {
+  if (row.kind === 'resume' && (row.session_id == null || row.session_id === 'main')) {
     Lanes.routeResume(item, String(payload.text ?? ''))
     return
   }
