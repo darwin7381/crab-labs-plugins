@@ -260,7 +260,7 @@ export type MainPicker = {
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
-import type { ItemRef } from './onsen-items.ts'
+import { callSenders, hasCallFrom, type ItemRef } from './onsen-items.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -3370,8 +3370,11 @@ async function takeSteering(tok: RunTok, ids: string[], res: ServerResponse) {
   const receiver = itemReceiver, lane = S.lanes[tok.lane]
   const live = () => running.get(tok.lane)?.tok === tok && lane.status !== 'closed'
   if (!receiver?.mode.active || !live()) return []
+  syncSteer(tok.lane)
+  const peers = callSenders(runEvents(queue.get(tok.evId)).flatMap(ev => ev.onsen_items ?? []))
   const requested = new Set(ids)
-  const pending = (S.steering?.[tok.lane] ?? []).filter(s => s.run === tok.runId && s.ev.onsen_items?.length && requested.has(s.ev.id))
+  const pending = (S.steering?.[tok.lane] ?? []).filter(s => s.run === tok.runId && s.ev.onsen_items?.length
+    && requested.has(s.ev.id) && !hasCallFrom(s.ev.onsen_items, peers))
   const refs = pending.flatMap(s => s.ev.onsen_items!)
   if (!refs.length) return []
   // A lane can accumulate multiple peek pages between two tool calls. All takes share this hook's 3 s window.
@@ -3462,9 +3465,14 @@ function releaseClosedSteering(lane: Lane, pending: SteerRec[]): SteerRec[] {
 /** Undelivered messages become the lane's next run, first in line. */
 function queueSteering(lane: Lane, left: SteerRec[], why: string): void {
   if (lane.status === 'closed') left = releaseClosedSteering(lane, left)
+  // The next peek considers the original row again. A take without a hook receipt is returned first.
+  const waiting = left.filter(s => s.ev.onsen_items?.length)
+  if (waiting.length) {
+    for (const s of waiting) itemReceiver?.report(s.ev.onsen_items!, 'not_taken')
+    left = left.filter(s => !s.ev.onsen_items?.length)
+    onGateOpen?.()
+  }
   if (!left.length) return
-  // A take with no hook receipt must be returned before a future run takes it again.
-  for (const s of left) itemReceiver?.report(s.ev.onsen_items ?? [], 'not_taken')
   // WO-132 (item 2): a merged alert the run never reached was looked at by nobody: it owes Joey its line now (ringing when critical), as its own run would
   for (const s of left) if (s.merged && events?.get(s.ev.id) && !events.openObs(s.ev.id).some(o => o.kind === 'joey')) {
     const crit = events.get(s.ev.id)!.class === 'critical'

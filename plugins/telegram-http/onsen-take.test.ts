@@ -218,6 +218,25 @@ test('idle main takes before offer, binds, completes only after final Stop and i
   expect(row.response_message_ids).toEqual(['message-91']); expect(r.claims.held()).toEqual([])
 })
 
+test('a peer’s waiting calls share one take; its later call waits for the next main turn', async () => {
+  const r = await mainRig()
+  r.status('busy')
+  const calls = ['first', 'second', 'later'].map(id => r.f.add(id, 'call', { from: 'eve' }))
+  const dids = calls.slice(0, 2).map(row => r.enqueue(row))
+  await r.sync()
+  r.status('idle'); await r.m.pump()
+  await until(() => r.m.items(row => row.state === 'offered').length === 2)
+  expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([['first', 'second']])
+  await r.hook('UserPromptSubmit', { dids }); await r.sync()
+  r.enqueue(calls[2]); r.status('busy')
+  await r.hook('PostToolUse', { tool_name: 'Read' }); await r.sync()
+  expect(calls[2].state).toBe('waiting')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(calls.slice(0, 2).map(row => row.state)).toEqual(['completed', 'completed'])
+  await r.m.pump()
+  await until(() => r.f.calls.some(c => c.body.item_ids?.includes('later')))
+})
+
 test('while busy mail waits, a person binds inside PostToolUse, pre-switch work finishes without an item report', async () => {
   const r = await mainRig(), old = r.f.add('legacy'), mail = r.f.add('mail', 'mail'), message = r.f.add('person')
   old.state = 'completed'

@@ -38,7 +38,7 @@ export type StopCommand = { from: string; message_id: string }
 export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 type CutTurn = { at: number; why: string; retry_at?: number; background_agents?: number }
 
-import type { ItemRef } from './onsen-items.ts'
+import { callSenders, hasCallFrom, type ItemRef } from './onsen-items.ts'
 import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 
 export type MainEnv = {
@@ -294,7 +294,7 @@ export function createMain(E: MainEnv) {
     if (!wall.active || probe) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
     const refused = accountFailure(r.reason) || accountCut(r)
-    return wall.person && r.kind === 'joey' && !refused
+    return wall.person && r.kind === 'joey' && !refused && !r.onsen_items?.some((ref: ItemRef) => ref.reason?.startsWith('usage_limit'))
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
   function mainCanTake(): boolean { const g = currentGen(); return !!g && canTake(g) }
@@ -535,7 +535,8 @@ export function createMain(E: MainEnv) {
     for (const it of probe ? candidates() : cands) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
       // Interrupted and batched items ride the lead, along with every refusal released by this clear.
-      let riders = items(r => r.id !== it.id && r.state === 'queued' && (heldCut(r) || r.reason === 'batched' || r.onsen_items?.some((ref: ItemRef) => ref.reason === 'cut_person' && it.onsen_items?.some((lead: ItemRef) => lead.kind === 'message' && lead.from === ref.from)) || (wall.clear != null && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))
+      const peers = callSenders(it.onsen_items ?? [])
+      let riders = items(r => r.id !== it.id && r.state === 'queued' && (hasCallFrom(r.onsen_items, peers) || heldCut(r) || r.reason === 'batched' || r.onsen_items?.some((ref: ItemRef) => ref.reason === 'cut_person' && it.onsen_items?.some((lead: ItemRef) => lead.kind === 'message' && lead.from === ref.from)) || (wall.clear != null && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))
       const checkedGroup = checked([it, ...riders], g, wall.clear)
       if (checkedGroup instanceof Promise) {
         const group = await checkedGroup
@@ -630,7 +631,8 @@ export function createMain(E: MainEnv) {
       got = got.filter(r => r.state === 'queued' && wallAllows(r, fresh))
     }
     if (got.some(r => r.onsen_items)) {
-      got = got.filter(r => readyInTurn(r) && !(r.onsen_items && inFlight.has(r.id)))
+      const peers = callSenders(items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === prompt).flatMap(r => r.onsen_items ?? []))
+      got = got.filter(r => !hasCallFrom(r.onsen_items, peers) && readyInTurn(r) && !(r.onsen_items && inFlight.has(r.id)))
       if (got.some(r => r.onsen_items)) got = await receiveRows(got, true, () => currentGen() === g && g.prompt_id === prompt && g.state === 'in_turn' && ['idle', 'busy'].includes(member() ?? ''))
     }
     if (!got.length) return []
@@ -1210,7 +1212,7 @@ export function createMain(E: MainEnv) {
     const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
     if (taking()) {
       // An unbound Item uses its 20 s claim deadline. Only a running turn can be stuck.
-      if (g?.state === 'in_turn' && !g.item_restart && stuck?.gen !== g.id && !held && m !== 'compacting' && m !== 'starting'
+      if (g?.state === 'in_turn' && !g.item_restart && (stuck?.gen !== g.id || stuck.undelivered) && !held && m !== 'compacting' && m !== 'starting'
           && m !== 'offline' && now - (lastEventAt.get(g.id) ?? now) > silenceLimit) {
         for (const r of unsettled(g, g.prompt_id)) if (r.state === 'bound' && r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'stuck')
         stuck = { gen: g.id, prompt: g.prompt_id, at: now }

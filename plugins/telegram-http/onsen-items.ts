@@ -14,6 +14,12 @@ export type ItemRef = {
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
   note?: string; reason?: string; half_done?: true; conversation?: string
 }
+export function callSenders(refs: ItemRef[]): Set<string> {
+  return new Set(refs.filter(r => r.kind === 'call').map(r => r.from))
+}
+export function hasCallFrom(refs: ItemRef[] | undefined, senders: Set<string>): boolean {
+  return refs?.some(r => r.kind === 'call' && senders.has(r.from)) === true
+}
 export function itemRef(it: InboxItem): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
   return { onsen_item_id: it.id, onsen_version: it.version, kind: it.kind, from: it.from,
