@@ -83,7 +83,7 @@ import * as Lanes from './lanes.ts'
 import { topicLink } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'   // WO-168: its own-pane looks are pane-look's
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
-import { expandHiddenEntities } from './entities.ts'
+import { expandHiddenEntities, telegramCommand } from './entities.ts'
 import { FORWARDERS, bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
 import { OnsenInbox, OnsenPuller, OnsenSender, dedupeKeyOf, isMailboxInject, itemKey, recipientNote, switchOn, type HandResult, type PullItem } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
@@ -577,13 +577,16 @@ async function reportCommands(): Promise<void> {
   else log('warn', `connector: the command list was not taken by Onsen (${Connector.why(r)}); tried again in a minute`)
 }
 /** Telegram identifies groups by chat id. An Onsen-only chat can also be a direct conversation. */
-async function commandChatAllows(chat: string, sender?: string): Promise<boolean> {
+async function authorizedCommandChat(chat: string, sender?: string, target?: string): Promise<'direct' | 'group' | undefined> {
   const web = Connector.ONSEN_CHAT.exec(chat)
-  if (!web && !chat.startsWith('-')) return true
-  if (sender && sender === connectorOwner()) return true
-  if (!web) return false
-  const r = await onsen?.request('GET', `/v1/conversations/${encodeURIComponent(web[1]!)}`, undefined, 3000).catch(() => null)
-  return r?.status === 200 && r.json?.data?.kind === 'direct'
+  if (!web && !chat.startsWith('-')) return 'direct'
+  if (web) {
+    const r = await onsen?.request('GET', `/v1/conversations/${encodeURIComponent(web[1]!)}`, undefined, 3000).catch(() => null)
+    const kind = r?.status === 200 && r.json?.data?.kind
+    if (kind === 'direct') return 'direct'
+    if (kind !== 'group' && kind !== 'channel') return
+  }
+  if (target && sender && sender === connectorOwner() && target.toLowerCase() === (await bridgeBotName()).toLowerCase()) return 'group'
 }
 /** WO-197 segment 2 (CONTRACT §7d 「指令」): a person's slash command that came from Onsen to a connector, run by the handler the Telegram path runs
  *  (bot.command's /start /help /status, /main /lanes with lanes on; then the control plane, then the roamer's). Its answer is one Onsen message, or
@@ -591,11 +594,12 @@ async function commandChatAllows(chat: string, sender?: string): Promise<boolean
  *  (handledHere). /clear's reply and choice: connectorClearHooks. false: no handler took it (it goes on to the session as a message) */
 async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
   via?: string, item?: ItemRef, commandId?: string, sender?: string): Promise<boolean> {
-  const t = text.trim()
-  if (!/^\/[A-Za-z]/.test(t)) return false
+  const command = telegramCommand(text)
+  if (!command) return false
   if (item?.kind === 'message' && !personMessage(item)) return false
-  if (!await commandChatAllows(chat, item ? item.from : sender)) return false
-  const cmd = t.split(/\s+/)[0]!.toLowerCase().replace(/@\S+$/, '')
+  const where = await authorizedCommandChat(chat, item ? item.from : sender, command.target)
+  if (!where) return false
+  const cmd = command.name, t = where === 'group' ? command.text : text.trim()
   const here: Lanes.TopicAsk = { chat, ...(topic != null ? { topic } : {}) }
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(chat, msg, opts?.keyboard, here)
   const name = user || userId
@@ -659,20 +663,26 @@ async function connectorThreadState(chat: string, thread: number, state: 'open' 
   if (!r || r.status >= 300) throw new Error(`Onsen did not take the thread's ${state} (${Connector.why(r)})`)
   return `thread ${thread} ${state} in Onsen (the bridge sets the topic's icon)`
 }
+/** the bot's username as the bridge carrying this agent reports it (its `endpoints` record of this member: attributes.username; CONTRACT §7b: a member
+ *  reads its own records). Check the current carrying endpoint for an addressed group command. */
+async function bridgeBotName(): Promise<string> {
+  const path = `/v1/members/${encodeURIComponent(CONNECTOR_AGENT)}/extension-records`
+  const seen = new Set<string>()
+  let cursor = ''
+  do {
+    seen.add(cursor)
+    const r = await onsen?.request('GET', path + (cursor ? '?cursor=' + encodeURIComponent(cursor) : ''), undefined, 3_000).catch(() => null)
+    const page = r?.status === 200 ? (r.json?.data ?? r.json) : null
+    if (!Array.isArray(page?.items)) return ''
+    const endpoint = page.items.find((x: any) => x?.collection === 'endpoints' && x.member === CONNECTOR_AGENT
+      && x.state === 'ok' && x.attributes?.bot_id && typeof x.attributes.username === 'string' && x.attributes.username)
+    if (endpoint) return endpoint.attributes.username.replace(/^@/, '')
+    cursor = page.next_cursor ?? ''
+  } while (cursor && !seen.has(cursor))
+  return ''
+}
 /** WO-197 segment 2 (Chiron mesh 12869 point 5): the link open_worker gives for a thread: Telegram's once the bridge reported its topic (within 3 s,
  *  with the bot's username known), else the Onsen page's */
-const bridgeBot = { at: 0, name: '' }
-/** the bot's username as the bridge carrying this agent reports it (its `endpoints` record of this member: attributes.username; CONTRACT §7b: a member
- *  reads the records whose member is itself), asked at most every 10 min; '' not known */
-async function bridgeBotName(): Promise<string> {
-  if (Date.now() - bridgeBot.at < 600_000) return bridgeBot.name
-  bridgeBot.at = Date.now()
-  const r = await onsen?.request('GET', `/v1/members/${encodeURIComponent(CONNECTOR_AGENT)}/extension-records`, undefined, 3_000).catch(() => null)
-  const recs: any[] = r && r.status === 200 ? (r.json?.items ?? r.json?.data?.items ?? []) : []
-  const u = recs.find(x => x?.collection === 'endpoints' && x?.attributes?.username)?.attributes?.username
-  bridgeBot.name = typeof u === 'string' ? u.replace(/^@/, '') : ''
-  return bridgeBot.name
-}
 async function connectorThreadLink(chat: string, thread: number): Promise<string | null> {
   let cid = ''
   try { cid = await connectorConversation(chat) } catch { return null }

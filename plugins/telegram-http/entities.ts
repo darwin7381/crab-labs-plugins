@@ -23,6 +23,15 @@ export type InboundEntity = {
   user?: { id: number }
 }
 
+/** A Telegram command addresses a bot in the first token. Its arguments keep their original text. */
+export function telegramCommand(text: string): { name: string; target?: string; text: string } | undefined {
+  const trimmed = text.trim()
+  const head = /^(\/[a-z][\w-]*)(?:@([a-z0-9_]+))?(?=\s|$)/i.exec(trimmed)
+  if (!head) return
+  const name = head[1]!.toLowerCase()
+  return { name, target: head[2], text: name + trimmed.slice(head[0].length) }
+}
+
 export function expandHiddenEntities(text: string, entities?: readonly InboundEntity[]): string {
   if (!text || !entities?.length) return text
   const hidden = entities

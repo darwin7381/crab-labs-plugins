@@ -56,7 +56,7 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 - **Refused for good.**
   - 403 `not_allowed` (the account is an agent or a system member), or `unknown_identity` (before Onsen 0.35.1; a stranger in a group becomes a guest). The update is done, nothing is answered, and one log line is written.
   - 400. The update isn't tried again; in a DM, one reply says it wasn't handed over.
-- **Commands.** `/start` and `/help` in a DM are answered by the bridge (the daemon's text). Every other `/command` is written as a message with `kind: "command"`.
+- **Commands.** The bridge answers `/start` and `/help` in a DM and forwards other DM commands to Onsen. In groups, a bare command is ordinary text. The connector runs `/command@bot` only for its owner and its own bot username.
 - **Buttons.**
   - An Action's option (`oa:<key>`) calls `POST /v1/bridge/actions/<id>/resolve`, and the toast says the result.
   - 「不要顯示這則」 under the pinned status stops it in that chat.

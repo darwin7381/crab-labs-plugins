@@ -13,9 +13,9 @@
 //             連上會自動補交，不用重傳。」 (once per message, remembered across restarts). Nothing is dropped and nothing written twice (the idem_key).
 //   refused   403 not_allowed (unknown_identity before Onsen 0.35.1): not tried again, nothing answered, done. 400: not tried again; in a DM one reply
 //             saying it was not handed over.
-//   local     /start and /help in a DM: the bridge answers (the daemon's text). Any other /command goes to Onsen as a message, kind `command`.
+//   local     /start and /help in a DM: the bridge answers (the daemon's text). Group commands need a bot target.
 //             A button: an Action's option → POST /v1/bridge/actions/<id>/resolve; 「不要顯示這則」 under the pinned status → dismissed here.
-import { expandHiddenEntities } from '../entities.ts'
+import { expandHiddenEntities, telegramCommand } from '../entities.ts'
 import { forwardFrom, inboundShape } from '../onsen-client.ts'
 import { mimeOf, telegramFile, TG_BOT_FILE_MAX } from '../onsen-files.ts'
 import { richToMarkdown } from '../rich-inbound.ts'
@@ -421,7 +421,7 @@ export class Poller {
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
         // WO-179 (Onsen 0.39.5): a group's own name, for display (the conversation's title); null in a DM
         chat_title: group && typeof m.chat.title === 'string' && m.chat.title.trim() ? m.chat.title : null,
-        kind: shape.kind, attachment_file_ids: [] as string[],
+        kind: shape.kind === 'command' && group && !telegramCommand(m.text)?.target ? 'text' : shape.kind, attachment_file_ids: [] as string[],
         attachments: att ? [{ kind: attK, name: att.name ?? null, mime: att.mime ?? mimeOf(att.name) ?? null, bytes: att.size ?? null, client_ref: att.file_id ?? null }] : [],
         reply_to_client_msg_id: rt ? String(rt.message_id) : null,
         reply_quote: m.quote?.text ? metaExcerpt(m.quote.text) : null,

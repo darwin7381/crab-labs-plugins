@@ -56,6 +56,15 @@ export function fakeItems() {
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
+    if (path === '/v1/members/adam/extension-records') {
+      if (!q.has('cursor')) return Response.json({ items: [
+        { collection: 'endpoints', member: 'adam', state: 'conflict', attributes: { username: 'other_bot', bot_id: '102' } },
+      ], next_cursor: 'page+2' })
+      if (q.get('cursor') !== 'page+2') return error(400, 'invalid_request')
+      return Response.json({ items: [
+        { collection: 'endpoints', member: 'adam', state: 'ok', attributes: { username: 'lab_a_bot', bot_id: '101' } },
+      ], next_cursor: null })
+    }
     const member = /^\/v1\/members\/([^/]+)$/.exec(path)?.[1]
     if (member && req.method === 'GET') return members.has(member) ? detail({ name: member, kind: members.get(member) }) : error(404, 'not_found')
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })

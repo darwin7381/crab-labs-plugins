@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { expandHiddenEntities } from '../entities.ts'
+import { expandHiddenEntities, telegramCommand } from '../entities.ts'
 import { richText } from '../rich-inbound.ts'
 import type { Agent } from './agent.ts'
 
@@ -66,7 +66,10 @@ function mentionAccount(entity: any, label?: string): string | undefined {
     const id = entity.user?.id ?? entity.user_id
     if (id != null) return String(id)
   }
-  if (entity.type === 'bot_command') return String(entity.bot_command ?? label ?? richText(entity.text)).match(/^\/[\w-]+(@\w+)$/)?.[1]
+  if (entity.type === 'bot_command') {
+    const target = telegramCommand(entity.bot_command ?? label ?? richText(entity.text))?.target
+    if (target) return '@' + target
+  }
 }
 
 function collectRichMentions(node: any, accounts: string[]): void {

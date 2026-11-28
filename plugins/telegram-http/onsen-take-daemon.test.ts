@@ -170,37 +170,55 @@ test('daemon handles a control at dispatch and immediately completes a re-served
   expect(d.journal().filter(l => l.onsen_items)).toHaveLength(0)
 })
 
-test('group commands use the Onsen sender: guest /clear is ordinary text and the owner can run /help', async () => {
+test('a group /clear reaches the control handler only from the owner and addressed to this bot', async () => {
   const chat = '-10042'
-  const d = await daemon({ ONSEN_OWNER: 'joey' }, 200, root => {
+  const d = await daemon({ ONSEN_OWNER: 'joey', CHANNEL_BOT_TMUX_SESSION: 'test-pane' }, 200, root => {
     writeFileSync(join(root, 'tg', 'access.json'), JSON.stringify({ allowFrom: ['1'], groups: { [chat]: { allowFrom: [] } }, pending: {} }))
-    return {}
+    writeFileSync(join(root, 'tmux'), '#!/bin/sh\necho "$*" >> "$TMPDIR/tmux-calls"\n', { mode: 0o700 })
+    return { PATH: root + ':' + process.env.PATH }
   })
-  const payload = { conversation_id: '42', kind: 'command', text: '/clear', from: 'joey', message_id: '101',
-    client: { name: 'telegram', chat, msg_id: '101', user: 'Joey', user_id: '1828173984' } }
-  const guest = d.f.add('guest-clear', 'message', { from: 'tg-42', message_id: '101', payload })
-  const notification = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === guest.id)
-  await waitFor(() => !!notification())
-  expect(notification().notif.params.content).toBe('/clear')
-  expect(guest.state).toBe('waiting')
+  const command = (id: string, from: string, text: string) => d.f.add(id, 'message', { from, message_id: id, payload: {
+    conversation_id: '42', kind: 'command', text, from: 'joey', message_id: id,
+    client: { name: 'telegram', chat, msg_id: id, user: 'Joey', user_id: '1828173984' },
+  } })
+  const ordinary = [command('101', 'tg-42', '/clear'), command('102', 'tg-42', '/clear@lab_a_bot'),
+    command('103', 'joey', '/clear'), command('104', 'joey', '/clear@other_bot')]
+  const contents = () => d.journal().filter(r => r.rec === 'msg' && r.notif && r.onsen_items).map(r => r.notif.params.content)
+  await waitFor(() => contents().length === ordinary.length)
+  expect(contents()).toEqual(ordinary.map(row => row.payload.text))
   expect(d.f.calls.filter(c => c.path.endsWith('/take') || ['/v1/messages', '/v1/actions', '/restart-lines'].includes(c.path))).toHaveLength(0)
-  const owner = d.f.add('owner-help', 'message', { from: 'joey', message_id: '102', payload: { ...payload, message_id: '102', text: '/help', client: { ...payload.client, msg_id: '102' } } })
+  const owner = command('105', 'joey', '/clear@LAB_A_BOT')
   await waitFor(() => owner.state === 'completed')
+  expect(d.f.calls.some(c => c.path.endsWith('/extension-records') && c.query.get('cursor') === 'page+2')).toBe(true)
+  expect(readFileSync(join(d.root, 'tmux-calls'), 'utf8').split('\n').filter(l => l.includes('/clear'))).toEqual(['send-keys -t test-pane /clear Enter'])
   expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
-  expect(guest.state).toBe('waiting')
+  expect(ordinary.map(row => row.state)).toEqual(ordinary.map(() => 'waiting'))
 })
 
-test('an Onsen-only group command also requires the owner, while a direct chat keeps its command handler', async () => {
+test('an Onsen group requires the owner and its bot name, while a direct chat keeps its command handler', async () => {
   const d = await daemon({ ONSEN_OWNER: 'joey' })
   d.f.conversations.set('51', 'group'); d.f.conversations.set('52', 'direct')
-  const command = (id: string) => d.f.add(id, 'message', { from: 'tg-42', message_id: id, payload: {
-    conversation_id: id, message_id: id, from: 'tg-42', via: 'web', kind: 'command', text: '/help', client: null,
+  const command = (id: string, cid: string, from: string, text: string) => d.f.add(id, 'message', { from, message_id: id, payload: {
+    conversation_id: cid, message_id: id, from, via: 'web', kind: 'command', text, client: null,
   } })
-  const group = command('51'), direct = command('52')
-  await waitFor(() => direct.state === 'completed')
-  expect(group.state).toBe('waiting')
-  expect(d.journal().find(r => r.onsen_items?.[0]?.onsen_item_id === group.id && r.notif)?.notif.params.content).toBe('/help')
-  expect(d.f.calls.filter(c => c.path === '/v1/messages').map(c => c.body.conversation_id)).toEqual(['52'])
+  const guest = command('101', '51', 'tg-42', '/help@lab_a_bot'), bare = command('102', '51', 'joey', '/help')
+  const owner = command('103', '51', 'joey', '/help@lab_a_bot'), direct = command('104', '52', 'tg-42', '/help')
+  await waitFor(() => owner.state === 'completed' && direct.state === 'completed')
+  expect([guest.state, bare.state]).toEqual(['waiting', 'waiting'])
+  expect(d.journal().filter(r => r.onsen_items && r.notif).map(r => r.notif.params.content)).toEqual(['/help@lab_a_bot', '/help'])
+  expect(d.f.calls.filter(c => c.path === '/v1/messages').map(c => c.body.conversation_id)).toEqual(['51', '52'])
+})
+
+test('a missing owner and a missing group sender cannot authorize an addressed command', async () => {
+  const d = await daemon()
+  d.f.conversations.set('51', 'group')
+  const r = await fetch(d.base + '/onsen/person', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-loopback' },
+    body: JSON.stringify({ kind: 'person_message', payload: { conversation_id: '51', message_id: '501', via: 'web', kind: 'command',
+      from: null, text: '/help@lab_a_bot', client: null } }) })
+  expect(r.status).toBe(200)
+  expect(await r.json()).toEqual({ delivered: true })
+  expect(d.journal().some(r => r.notif?.params?.content === '/help@lab_a_bot')).toBe(true)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages' || c.path.endsWith('/extension-records'))).toHaveLength(0)
 })
 
 test('a numeric Onsen chat keeps its original user metadata and replies to the conversation named by the Item', async () => {

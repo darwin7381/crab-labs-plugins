@@ -163,6 +163,15 @@ test('nested rich text keeps its basic-group key when the second bot sees more m
   expect(onsen.messages).toHaveLength(1)
 })
 
+test('a bare group slash is text and either bridge writes an addressed command for Onsen', async () => {
+  tg.text(a, from.id, '/clear', { chat: supergroup })
+  tg.text(a, from.id, '/clear@lab_b_bot', { chat: supergroup, entities: [{ type: 'bot_command', offset: 0, length: 16 }] })
+  await confirmed()
+  expect(onsen.messages.map(m => [m.text, m.kind, m.mentions])).toEqual([
+    ['/clear', 'text', []], ['/clear@lab_b_bot', 'command', ['@lab_b_bot']],
+  ])
+})
+
 test('membership transitions and migration are ordered PUTs; the new chat still needs its own allowlist entry', async () => {
   for (const u of [memberUpdate('left', 'member'), memberUpdate('member', 'administrator'), memberUpdate('administrator', 'kicked'),
     memberUpdate('left', 'member', 102), { message: { chat: group, migrate_to_chat_id: -10023, message_id: 6 } },
