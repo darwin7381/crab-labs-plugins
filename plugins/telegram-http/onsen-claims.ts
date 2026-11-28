@@ -104,6 +104,14 @@ export class Claims implements ClaimStore {
   blocked(): boolean { return this.spool.hasItemReports() }
   completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
 
+  waiting(id: string): void {
+    // A server can return an unread mail Item to waiting even after accepting its completed report.
+    if (this.done.some(d => d.item_id === id)) {
+      this.done = this.done.filter(d => d.item_id !== id)
+      this.save()
+    }
+  }
+
   private save(connector = this.connector, pollOffset = this.pollOffset): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = this.file + '.' + process.pid + '.tmp'
@@ -224,11 +232,12 @@ export class Claims implements ClaimStore {
   reportBody({ body }: ItemReport, roamerMember?: string): ItemReport['body'] {
     return body.session_id ? { ...body, session_id: reportSession(body.session_id, roamerMember) } : body
   }
-  acknowledged(line: ItemReport, accepted: boolean): void {
+  acknowledged(line: ItemReport, accepted: boolean, state?: string): void {
     const { item_id: id, body } = line
     if (intermediate.has(body.outcome)) return
-    if (accepted && ['completed', 'stopped', 'not_applied'].includes(body.outcome)) this.receivers.delete(id)
-    if (accepted && body.outcome === 'completed') {
+    if (accepted && (state === 'completed' || state === 'cancelled')) this.receivers.delete(id)
+    if (accepted && state === 'waiting') this.waiting(id)
+    if (accepted && state === 'completed') {
       if (!this.done.some(d => d.claim_id === body.claim_id && d.item_id === id))
         this.done.push({ item_id: id, claim_id: body.claim_id, at: this.now() })
       for (const [sid, wait] of this.waits) {

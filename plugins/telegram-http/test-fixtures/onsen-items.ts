@@ -53,6 +53,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
   const takes = new Map<string, { claim: string; body: unknown; result: Response }>()
   const lastClaim = new Map<string, string>(), expired = new Map<string, boolean>()
   const overdue = new Set<string>()
+  const unreadMail = new Set<string>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
@@ -267,7 +268,9 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
       else {
         expired.delete(row.id)
         terminal.set(k, b.outcome); row.claim = null
-        if (b.outcome === 'completed') {
+        if (b.outcome === 'completed' && row.kind === 'mail' && row.mail_id && unreadMail.has(String(row.mail_id))) {
+          row.state = 'waiting'; row.reason = null; row.not_before = iso(now + 3_600_000)
+        } else if (b.outcome === 'completed') {
           row.state = 'completed'; row.completed_at = b.at; row.response_message_ids = b.response_message_ids ?? []
           row.answered = ['resume', 'self', 'keepwarm'].includes(row.kind) ? null : row.response_message_ids.length > 0
           row.reason = row.reason === 'owed' && !row.answered ? 'not_answered' : null
@@ -284,7 +287,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
     if (key) writes.set(idem, { body: b, response: answer.clone() })
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, unreadMail, add, change, now: () => now,
     advance(ms: number) {
       now += ms; skew += ms; expire()
       for (const row of rows.values()) {

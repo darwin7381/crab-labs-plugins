@@ -427,8 +427,8 @@ if (ONSEN_TAKE_ON) {
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now, Lanes.unboundOutcome, t => roamerItems?.stateOf(t))
     if (ROAMER) itemClaims.upgradeCarrier(machineName() + '/' + ONSEN_AGENT, takeMode.connector)
     if (ROAMER && itemClaims.carriedBy(takeMode.connector)) CONNECTOR = onsen.cfg.record = takeMode.observationRequired = true
-    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => {
-      itemClaims!.acknowledged(line, ok)
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok, state) => {
+      itemClaims!.acknowledged(line, ok, state)
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       queueMicrotask(() => { if (!ROAMER && takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
     }, line => itemClaims!.reportBody(line, ROAMER ? ONSEN_AGENT : undefined))
@@ -5031,7 +5031,7 @@ async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { h
     return { code: 200, json: { injected: false, held: true } }
   }
   // WO-151: delivered already by the other path (or being delivered right now): dropped here, counted
-  const key = onsenInbox && !(roamerItems && o.item) ? dedupeKeyOf(body?.dedupe, body?.msg_id) : null
+  const key = onsenInbox && !o.item ? dedupeKeyOf(body?.dedupe, body?.msg_id) : null
   if (key && onsenInbox!.seen(key)) {
     if (o.src === 'inject') onsenInbox!.stats.inject_dup_dropped++
     log('info', `onsen inbox: ${o.src === 'inject' ? '/inject' : 'Onsen item'} from ${verdict.sender} (${key}) already delivered by the ${o.src === 'inject' ? 'Onsen' : '/inject'} path: dropped`)
@@ -5171,13 +5171,9 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
 async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Promise<void> {
   const ownResume = row.kind === 'resume' && row.from === row.member
   const item = itemRef(row)
+  if (row.state === 'waiting') itemClaims?.waiting(row.id)
   if (change && !roamerItems) {
     Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
-    return
-  }
-  if (itemClaims?.completed(row.id)) {
-    const result = await itemReceiver!.receive([item])
-    if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
     return
   }
   if (roamerItems) {

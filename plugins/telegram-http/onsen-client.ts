@@ -460,9 +460,9 @@ export class OnsenClient {
   private itemReports = 0
   private reportedThrough: number
   private itemBody?: (line: ItemReport) => ItemReport['body']
-  private itemAck?: (line: ItemReport, ok: boolean) => void
+  private itemAck?: (line: ItemReport, ok: boolean, state?: string) => void
 
-  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void,
+  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean, state?: string) => void,
     body?: (line: ItemReport) => ItemReport['body']): void {
     this.itemBody = body
     this.itemAck = ack
@@ -1072,7 +1072,7 @@ export class OnsenClient {
           }
         }
         if (ok) this.itemWrites.observe(r.json?.data)
-        this.itemAck?.(line, ok)
+        this.itemAck?.(line, ok, r.json?.data?.state)
         this.writeCursor(this.readCursor(), t.end)
         this.itemReports = Math.max(0, this.itemReports - 1)
         this.ok(); i++; continue

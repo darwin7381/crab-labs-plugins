@@ -1139,6 +1139,25 @@ async function target(d: Awaited<ReturnType<typeof daemon>>, resumed?: string) {
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
 
+test('an unread mailbox Item returns to its conversation after the server requeues it and the daemon restarts', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), t = await target(d)
+  t.select(); await t.connect()
+  d.f.unreadMail.add('501')
+  const row = d.f.add('mailbox-501', 'mail', { mail_id: '501', from: 'eve', payload: { text: 'read the mailbox message' } })
+  await waitFor(() => t.got.length === 1)
+  t.accept(t.got[0]); t.stop()
+  await waitFor(() => row.state === 'waiting' && !!row.not_before, 10000)
+  const file = join(d.state, 'onsen/claims.json')
+  await waitFor(() => !JSON.parse(readFileSync(file, 'utf8')).claims[row.id])
+  expect(JSON.parse(readFileSync(file, 'utf8')).done.some((r: any) => r.item_id === row.id)).toBe(false)
+  d.f.unreadMail.delete('501'); d.f.advance(3_601_000)
+  await d.restart(); await t.connect()
+  await waitFor(() => t.got.length === 2)
+  t.accept(t.got[1]); t.stop()
+  await waitFor(() => row.state === 'completed', 10000)
+  expect(d.f.history.filter(h => h.item_id === row.id && h.body.outcome === 'in_session')).toHaveLength(2)
+}, 30000)
+
 test('a roamer leaves keepwarm to the target owner and delivers its own self and resume to the addressed target', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   const time = Date.now() - 51 * 60_000

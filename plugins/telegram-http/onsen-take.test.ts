@@ -29,7 +29,7 @@ function rig() {
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
   const claims = new Claims(file, client, (id, outcome) => { misses.push(id); main?.offerMissed(id, outcome) }, () => {}, f.now, id => main?.unboundOutcome(id) ?? 'not_taken')
-  client.watchItemReports(r => claims.replay(r), (r, ok) => claims.acknowledged(r, ok), line => claims.reportBody(line))
+  client.watchItemReports(r => claims.replay(r), (r, ok, state) => claims.acknowledged(r, ok, state), line => claims.reportBody(line))
   const receiver = new ItemReceiver(mode, claims, time => deadlines.push(time))
   clean.push(() => { mode.stop(); claims.stop(); client.stop(); f.stop(); rmSync(dir, { recursive: true, force: true }) })
   const outcomes = (id: string) => f.history.filter(r => r.item_id === id).map(r => r.body.outcome)
@@ -885,7 +885,7 @@ test('a pre-C6 claim and a replayed main wire report retain the original receivi
   writeFileSync(r.file, JSON.stringify(saved))
   const claims = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
   r.client.recordItemReport({ item_id: row.id, body: { claim_id: row.claim!.id, outcome: 'in_session', session_id: 'main', at: new Date().toISOString() } })
-  r.client.watchItemReports(l => claims.replay(l), (l, ok) => claims.acknowledged(l, ok), l => claims.reportBody(l))
+  r.client.watchItemReports(l => claims.replay(l), (l, ok, state) => claims.acknowledged(l, ok, state), l => claims.reportBody(l))
   await r.sync()
   expect(row.session_id).toBe('main')
   expect(row.claim!.session_id).toBe('main')
@@ -1451,7 +1451,7 @@ test('restart renews the same connector, terminal report survives outage and blo
   const other = new TakeMode('adam', r.client.request.bind(r.client), () => {}, () => {}, 'mac-mini')
   await other.probe()
   const restored = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
-  r.client.watchItemReports(l => restored.replay(l), (l, ok) => restored.acknowledged(l, ok))
+  r.client.watchItemReports(l => restored.replay(l), (l, ok, state) => restored.acknowledged(l, ok, state))
   clean.push(() => { restored.stop(); other.stop() })
   r.f.advance(40_000)
   const renew = await r.client.putBytes('/v1/members/adam/observation', Buffer.from(JSON.stringify({ connector: other.connector, held_item_ids: restored.held() })),
