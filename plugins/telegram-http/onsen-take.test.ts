@@ -9,7 +9,7 @@ import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.t
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
-import { createMain, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
+import { createMain, MAIN_STUCK_MS, toolSilenceMs, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { REGISTRY_SETTLE_MS } from './onsen-status.ts'
 
@@ -489,6 +489,14 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
   expect(r.logs.filter(s => s.includes('not_current_connector'))).toHaveLength(1)
   r.f.advance(45_001); retry!(); await until(() => mode.active)
   expect([...(await receiver.receive([itemRef(row)])).given]).toEqual(['ownership'])
+})
+
+test('take tools respect declared timeouts and open remote calls remain active until their result', () => {
+  expect(toolSilenceMs(24000, 'mcp__lab__read')).toBe(30000)
+  expect(toolSilenceMs(800, 'WebFetch')).toBe(1000)
+  expect(toolSilenceMs(undefined, 'mcp__lab__read')).toBe(Infinity)
+  expect(toolSilenceMs(undefined, 'WebFetch')).toBe(Infinity)
+  expect(toolSilenceMs(undefined, 'Read')).toBe(0)
 })
 
 test('one stuck turn reports each claim, restarts once, then cuts with one failure per Item', async () => {

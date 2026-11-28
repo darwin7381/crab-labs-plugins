@@ -562,6 +562,34 @@ exec sleep 20
   expect(row.failures).toBe(1)
 }, 10000)
 
+test('a quiet lane with MCP and WebFetch in flight stays claimed until its last tool returns', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'waiting-tools')
+    writeFileSync(bin, `#!/bin/sh
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"m","name":"mcp__lab__lookup","input":{"timeout_ms":30000}},{"type":"tool_use","id":"w","name":"WebFetch","input":{}}]}}'
+while [ ! -f ./mcp-finished ]; do sleep 0.1; done
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"m","content":"done"}]}}'
+while [ ! -f ./fetch-finished ]; do sleep 0.1; done
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"w","content":"done"}]}}'
+exec sleep 20
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin, LANES_MAIN_STUCK_MS: '100', LANES_MAX_RUN_MS: '30000' }
+  })
+  const row = d.f.add('tool-lane', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] check tools', line: 'call' } })
+  await waitFor(() => row.in_session_at != null)
+  const claim = row.claim!.id
+  const outcomes = () => d.f.history.filter(h => h.body.claim_id === claim).map(h => h.body.outcome)
+  await Bun.sleep(5200)
+  expect(outcomes()).toEqual(['in_session'])
+  writeFileSync(join(d.root, 'mcp-finished'), '')
+  await Bun.sleep(5200)
+  expect(outcomes()).toEqual(['in_session'])
+  writeFileSync(join(d.root, 'fetch-finished'), '')
+  await waitFor(() => outcomes().includes('cut'), 6500)
+  expect(outcomes()).toEqual(['in_session', 'stuck', 'cut'])
+}, 20000)
+
 function wallFixture(root: string, mainModel: string) {
   const dir = join(root, 'walls'), bin = join(root, 'limited-lane'), sid = randomUUID()
   const transcripts = join(root, 'home', '.claude', 'projects', root.replace(/[^a-zA-Z0-9]/g, '-'))

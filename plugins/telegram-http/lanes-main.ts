@@ -142,6 +142,15 @@ export type MainReply = { item_stop?: 'check' | 'done'; accepted?: boolean; addi
   items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string; mark_reply_to?: string; deny?: string }
 type Output = { to: string; reply_to: string; text: string }
 
+/** Silence allowed by an open tool's own deadline, including its completion margin. */
+export function toolSilenceMs(declared: unknown, takeTool?: string): number {
+  const mcp = takeTool?.startsWith('mcp__')
+  const timeout = Number(declared ?? (mcp ? process.env.MCP_TOOL_TIMEOUT : undefined))
+  if (Number.isFinite(timeout) && timeout > 0) return Math.round(timeout * 1.25)
+  // These calls can be working off-process without emitting stream output until the result.
+  return mcp || takeTool === 'WebFetch' ? Infinity : 0
+}
+
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
 /** 疑似卡死: a gen that owes a hook event (a turn open, or an offer unbound) has sent none for this long */
 export let MAIN_STUCK_MS = num('LANES_MAIN_STUCK_MS', 600_000)
@@ -184,7 +193,7 @@ export function createMain(E: MainEnv) {
   let registryGap: { since: number; told: boolean } | null = null
   let registryAlertOpen: boolean | null = null              // WO-205: the registry alert is open; null = not known since this daemon started
   const lastEventAt = new Map<string, number>()          // gen → ms of its last hook event (silence = the stuck rule)
-  const toolBound = new Map<string, number>()            // gen → ms the open tool may stay silent: its own declared timeout (0 = it declares none)
+  const toolBound = new Map<string, number>()            // gen → permitted silence while its tool is in flight
   const pendingEnd = new Map<string, EndReason>()        // gen → why it is about to end (asked: /restart; replaced: /main renew)
   const outputs = new Map<string, Output[]>()            // prompt id → the reply / send_to_agent calls of that turn (answered gate)
   const calls = new Map<string, Turn['calls']>()          // prompt id → every tool call of that turn with its result (the summary gate)
@@ -963,7 +972,7 @@ export function createMain(E: MainEnv) {
         beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         // WO-148 (item 3; lab: the hook sent tool_input only for a btcc-receipt Bash): the hook's tool_brief, the field the call is about (lanes.ts masks it)
         openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_brief ?? b.tool_input ?? null, at: new Date().toISOString() })
-        toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
+        toolBound.set(g.id, toolSilenceMs(b.tool_timeout_ms, taking() ? b.tool_name : undefined))   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
         let mark: string | undefined, markReplyTo: string | null = null
@@ -1234,7 +1243,7 @@ export function createMain(E: MainEnv) {
     const m = member()
     const wall = wallDelivery(g)
     const held = m === 'waiting' || wall.active
-    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
+    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? toolSilenceMs(undefined, taking() ? g.tool_open : undefined)) : MAIN_STUCK_MS
     if (taking()) {
       // The wrapper can be healthy while the old TUI is still alive. tick already checked its pid above.
       if (g?.item_restart) {

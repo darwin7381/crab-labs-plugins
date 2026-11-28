@@ -23,7 +23,7 @@
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
-import { createMain, mainContext, MAIN_STUCK_MS, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
+import { createMain, mainContext, MAIN_STUCK_MS, toolSilenceMs, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
 import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
@@ -3623,7 +3623,7 @@ export function failedHandoffText(it: { attempts: number; ev: { from: string; te
 }
 const queue = new Map<string, QItem>()          // event id → item
 /** WO-177 六: the tool calls of a run whose result has not come back yet (its stream's tool_use → tool_result): tool_use id → name, since when */
-type OpenTools = Map<string, { name: string; since: string; timeoutMs?: number }>
+type OpenTools = Map<string, { name: string; since: string; silenceMs: number }>
 const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string; progressAt?: number; tools?: OpenTools; back?: string }>()  // lane id → run (WO-132: `at` = when it started; WO-177: `back` = when its last open tool came back)
 function checkLaneStalls(now = Date.now()): void {
   if (!takingItems()) return
@@ -3631,7 +3631,7 @@ function checkLaneStalls(now = Date.now()): void {
     const it = queue.get(run.evId)
     if (!it || it.stuckRestart || run.child.killed || run.child.exitCode != null) continue
     const last = run.progressAt ?? Date.parse(run.at)
-    const toolEnds = Array.from(run.tools?.values() ?? [], tool => Date.parse(tool.since) + (tool.timeoutMs ?? 0) * 1.25)
+    const toolEnds = Array.from(run.tools?.values() ?? [], tool => Date.parse(tool.since) + tool.silenceMs)
     if (now <= Math.max(last + MAIN_STUCK_MS, ...toolEnds)) continue
     syncSteer(it.lane)
     const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
@@ -5296,8 +5296,11 @@ function startRun(it: QItem, acquired = false): void {
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') {
             tools.push({ id: c.id ? String(c.id) : undefined, name: c.name, input: c.input })
-            if (c.id) openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso(),
-              timeoutMs: c.name === 'Bash' ? Number(c.input?.timeout ?? process.env.BASH_DEFAULT_TIMEOUT_MS ?? 120000) || 0 : 0 })
+            if (c.id) {
+              const timeout = c.tool_timeout_ms ?? c.input?.timeout_ms ??
+                (c.name === 'Bash' && !c.input?.run_in_background ? c.input?.timeout ?? process.env.BASH_DEFAULT_TIMEOUT_MS ?? 120000 : undefined)
+              openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso(), silenceMs: toolSilenceMs(timeout, c.name) })
+            }
             if (!String(c.name).startsWith('mcp__lane__')) (tok.calls ??= []).push({ name: c.name, input: c.input })   // the lane stop's model aid (its lane tools: callLaneTool)
             const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
             if (c.name === 'Bash' && prodChangeOn()) for (const pc of remoteChanges(String(c.input?.command ?? ''))) prodChanges.push({ ...pc, cmd: clip(String(c.input?.command ?? ''), 300) })
