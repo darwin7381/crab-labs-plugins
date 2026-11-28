@@ -1774,9 +1774,9 @@ export function currentSessionId(projectsDirOverride?: string): string | null {
  *  tmuxOverride, lanes on): M1 holds its offers meanwhile, so what waits goes to the session switched to; and the switch is done only when the main
  *  lanes registers is `sessionId` (its SessionStart, source resume, in the same process). ok: true / false (`now` = the session registered instead) /
  *  null (cannot tell: lanes off, or another agent's TUI) */
-export async function resumeSessionSwitch(sessionId: string, tmuxOverride?: string): Promise<{ ok: boolean | null; now: string | null }> {
+export async function resumeSessionSwitch(sessionId: string, tmuxOverride?: string, readMain: () => string | null = mainSessionId): Promise<{ ok: boolean | null; now: string | null }> {
   const tmuxName = tmuxOverride ?? TMUX_SESSION
-  const own = !tmuxOverride && !!mainSessionId()
+  const own = !tmuxOverride && !!readMain()
   const wait = (ms: number) => new Promise(r => setTimeout(r, ms))
   if (own) holdMainOffers(30_000)
   try {
@@ -1786,8 +1786,8 @@ export async function resumeSessionSwitch(sessionId: string, tmuxOverride?: stri
     await wait(600)
     await tmuxSendKeys(`/resume ${sessionId}`, tmuxName)
     if (!own) return { ok: null, now: null }
-    for (let i = 0; i < 30; i++) { await wait(500); if (mainSessionId() === sessionId) return { ok: true, now: sessionId } }
-    return { ok: false, now: mainSessionId() }
+    for (let i = 0; i < 30; i++) { await wait(500); if (readMain() === sessionId) return { ok: true, now: sessionId } }
+    return { ok: false, now: readMain() }
   } finally { if (own) holdMainOffers(0) }
 }
 /** WO-215 (2): a switch the main did not take is not reported as done */

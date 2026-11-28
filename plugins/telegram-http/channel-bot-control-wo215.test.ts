@@ -3,7 +3,7 @@
 // which the tg daemon rewrites after each accepted SessionStart. Not that id in time: ok:false with the main it is, and the reply says it did not take.
 // A real tmux pane running `cat` (ignoring the switch's C-c) stands in for Claude Code (it receives the keys); main-expected stands in for the registration.
 import { afterAll, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -17,6 +17,9 @@ process.env.TMUX_TMPDIR = sock; delete process.env.TMUX
 const C = await import('./channel-bot-control.ts?wo215') as typeof import('./channel-bot-control.ts')
 const tm = (...a: string[]) => Bun.spawnSync(['tmux', ...a], { env: { ...process.env, TMUX_TMPDIR: sock } })
 const expected = (sid: string) => writeFileSync(join(ws, '.lanes', 'main-expected'), sid)
+// the main the switch waits for, read from this test's own main-expected: lanes.ts is one module for the whole `bun test` run, and a file before this one
+// may have set its LANES_DIR (the full suite read another folder here and the switch was not `own`: ok:null twice, 2026-11-28)
+const readMain = (): string | null => { try { return readFileSync(join(ws, '.lanes', 'main-expected'), 'utf8').trim() || null } catch { return null } }
 afterAll(() => {
   tm('kill-server'); process.chdir(cwd0)
   for (const d of [sock, ws]) rmSync(d, { recursive: true, force: true })
@@ -27,11 +30,11 @@ afterAll(() => {
 
 test('WO-215: a /resume switch that does not take answers 「沒切成」 with the main it is now; one that takes answers ok with the target', async () => {
   expect(tm('new-session', '-d', '-s', OWN, '-x', '120', '-y', '10', `sh -c 'trap "" INT; cat'`).exitCode).toBe(0)   // the switch sends C-c
-  mkdirSync(join(ws, '.lanes'), { recursive: true }); process.chdir(ws)   // no lanes in this process: mainSessionId() reads ./.lanes/main-expected
+  mkdirSync(join(ws, '.lanes'), { recursive: true }); process.chdir(ws)
   try {
     const now = randomUUID(), target = randomUUID()
     expected(now)
-    const r = await C.resumeSessionSwitch(target)
+    const r = await C.resumeSessionSwitch(target, undefined, readMain)
     expect(r).toEqual({ ok: false, now })                                                  // the main never became the target: not reported as done
     expect(tm('capture-pane', '-p', '-t', OWN).stdout.toString()).toContain(`/resume ${target}`)   // by id, not by a row of the picker
     const line = C.resumeNotTaken(target, r.now)
@@ -40,6 +43,6 @@ test('WO-215: a /resume switch that does not take answers 「沒切成」 with t
 
     const t2 = randomUUID()
     setTimeout(() => expected(t2), 1500)                                                   // the new session's SessionStart registers it
-    expect(await C.resumeSessionSwitch(t2)).toEqual({ ok: true, now: t2 })
+    expect(await C.resumeSessionSwitch(t2, undefined, readMain)).toEqual({ ok: true, now: t2 })
   } finally { process.chdir(cwd0) }
 }, 40_000)
