@@ -204,7 +204,8 @@ test('ending an Item flood performs a full peek and emits one end summary for it
     urls.push(path)
     return { status: 200, json: { items, changed_after: new Date().toISOString(), next_cursor: null } }
   }, () => {}, () => {})
-  mode.active = true
+  await mode.probe()
+  urls.length = 0  // count the flood's full peeks after the mode probe
   const peek = new ItemPeek(mode, () => admitted, async row => {
     const d = await L.routeEvent(ev(row.id, peer, 'question', { onsen_items: [itemRef(row)] }))
     if (d.target !== 'ledger') admitted.set(row.id, row.version)

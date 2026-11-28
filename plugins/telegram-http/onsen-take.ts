@@ -1,6 +1,6 @@
 import { hostname } from 'os'
 import { randomUUID } from 'crypto'
-import { linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
+import { linkSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { ActionReq, OnsenClient } from './onsen-client.ts'
 
@@ -37,8 +37,9 @@ export function takeRefusal(o: { inbox: boolean; roamer: boolean; targetRouting?
 /** The connector parameter distinguishes this probe from a normal member inbox read. */
 export async function deliveryMode(req: ActionReq, path: string, connector: string, active = false) {
   const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  const mode: 'take' | 'pull' | 'not_current_connector' | 'unavailable' = r?.status === 409 && r.json?.error?.code === 'not_current_connector'
-    ? 'not_current_connector' : active && (!r || r.status >= 500) ? 'unavailable' : r?.status === 200 ? 'take' : 'pull'
+  const code = r?.json?.error?.code ?? r?.json?.detail?.code
+  const mode = r?.status === 200 ? 'take' : r?.status === 409 && code === 'not_current_connector' ? 'not_current_connector'
+    : !active || (r?.status === 409 && code === 'not_take_member') ? 'pull' : 'unavailable'
   return { mode, take: mode === 'take', status: r?.status, asOf: Date.parse(r?.json?.as_of) }
 }
 
@@ -56,29 +57,49 @@ export class TakeMode {
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
   private reason = ''
+  private readonly modeFile?: string
   private offset = 0
   readonly now = () => Date.now() + this.offset
 
   constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (canReceive: boolean) => void | Promise<void>,
-    readonly log: (line: string) => void, machine: string | { stateDir: string } = machineName(),
+    readonly log: (line: string, level?: 'info' | 'error') => void, machine: string | { stateDir: string } = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
     this.connector = typeof machine === 'string' ? machine + '/' + member : connectorId(machine.stateDir, member)
+    if (typeof machine !== 'string') {
+      this.modeFile = join(machine.stateDir, 'onsen', 'take-member')
+      try { this.active = readFileSync(this.modeFile, 'utf8') === member }
+      catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
+    }
   }
 
-  get canReceive(): boolean { return this.active && !this.stopped && !this.reason }
+  private rememberMode(take: boolean): void {
+    if (this.active === take) return
+    if (this.modeFile) {
+      const tmp = this.modeFile + '.' + process.pid
+      writeFileSync(tmp, take ? this.member : '', { mode: 0o600 })
+      renameSync(tmp, this.modeFile)
+    }
+    this.active = take
+  }
+
+  get canReceive(): boolean { return this.active && !this.checking && !this.stopped && !this.reason }
 
   async probe(): Promise<void> {
     const probe = await deliveryMode(this.req, this.path, this.connector, this.active)
     if (this.stopped) return
     this.checking = false
     if (probe.mode === 'not_current_connector') {
-      this.active = true
+      this.rememberMode(true)
       this.pause(probe.mode, 45_000)
       return
     }
-    if (probe.mode === 'unavailable') { this.pause('mode probe unavailable', 60_000); return }
-    this.active = probe.take
+    if (probe.mode === 'unavailable') {
+      if (probe.status === 401 || probe.status === 403) this.log('onsen take: ' + this.connector + ' mode probe HTTP ' + probe.status + ', retry in 60s', 'error')
+      this.pause('mode probe unavailable', 60_000)
+      return
+    }
+    this.rememberMode(probe.take)
     if (!this.active) { this.pause('mode probe: ' + (probe.status ? 'HTTP ' + probe.status : 'no response'), 60_000); return }
     if (Number.isFinite(probe.asOf)) this.offset = probe.asOf - Date.now()
     clearTimeout(this.timer)

@@ -1975,3 +1975,22 @@ test('distinct state directories on one host register distinct owners and a rest
   expect((await deliveryMode(r.mode.req, r.mode.path, first)).take).toBe(true)
   expect((await deliveryMode(r.mode.req, r.mode.path, second)).mode).toBe('not_current_connector')
 })
+
+test('a known take member keeps pull timers off on 401 and 403, including its first probe after restart', async () => {
+  const r = rig(), transitions: boolean[] = [], delays: number[] = [], errors: string[] = []
+  const open = () => new TakeMode('adam', r.mode.req, () => { transitions.push(m.active) },
+    (line, level) => { if (level === 'error') errors.push(line) }, { stateDir: r.dir },
+    (fn, ms) => { delays.push(ms); return setTimeout(fn, ms) })
+  let m = open()
+  await m.probe(); m.stop(); transitions.length = 0
+  m = open()
+  for (const status of [401, 403]) {
+    r.f.mode(status); await m.probe()
+    expect(m.active).toBe(true); expect(m.canReceive).toBe(false)
+    expect(delays.at(-1)).toBe(60000)
+    expect(errors.at(-1)).toContain('HTTP ' + status)
+  }
+  expect(transitions).not.toContain(false)
+  r.f.mode(409); await m.probe(); expect(m.active).toBe(false)
+  m.stop()
+})
