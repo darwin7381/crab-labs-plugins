@@ -499,7 +499,9 @@ test.each(['waiting', 'already claimed'])('settled 59: after a blocked claim spo
   r.m.initMain(); r.m.routeResume(itemRef(r.row), r.row.payload.text)
   await until(() => r.claims.inSession(r.row.id)); await r.sync()
   r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
-  expect(r.outcomes(r.row.id)).toEqual([...(state === 'already claimed' ? ['not_taken'] : []), 'not_taken', 'in_session', 'completed'])
+  const expected: Outcome[] = ['not_taken', 'in_session', 'completed']
+  if (state === 'already claimed') expected.unshift('not_taken')
+  expect(r.outcomes(r.row.id)).toEqual(expected)
   expect(r.offers).toHaveLength(1)
 })
 
@@ -525,6 +527,18 @@ test('settled 59: the next delivery carries the waiting line once and its normal
   await r.hook('Stop', { phase: 'final' }); await r.sync()
   expect(r.resume).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
   expect(r.f.calls.filter(c => c.path === '/v1/items/' + r.resume.id && c.body.outcome)).toMatchObject([{ body: { expected_version: 1, outcome: 'withdrawn' } }])
+})
+
+test.each([false, true])('settled 59: a turn first seen at a tool withdraws its carrier only with a matching receipt (late did=%p)', async received => {
+  const r = await waitingModelCut()
+  const did = r.enqueue(r.f.add('carrier'))
+  await until(() => r.journal.get('msg', did)?.state === 'offered')
+  expect(r.offers[0].params.content).toContain(r.line)
+  await r.hook('PreToolUse', { prompt_id: 'tool-first', tool_name: 'Read' })
+  if (received) await r.hook('UserPromptSubmit', { prompt_id: 'tool-first', dids: [did] })
+  await r.hook('Stop', { prompt_id: 'tool-first', phase: 'final' }); await r.sync()
+  expect(r.resume.state).toBe(received ? 'cancelled' : 'waiting')
+  expect(r.resume.reason).toBe(received ? 'withdrawn' : null)
 })
 
 test('settled 59: when the wall clears with a message already waiting, the resume rides that message', async () => {

@@ -677,11 +677,11 @@ export function createMain(E: MainEnv) {
   const pullable = (g: Row): boolean => items(r => r.state === 'queued' && owed(r) && forGen(r, g) && !waitsRetry(r)).length > 0
   /** Pin the exact sentence to the delivery receipt before the stream or hook can reach Claude. */
   function carryResume(g: Row, rows: Row[], prompt?: string): ResumeLine | undefined {
-    const alreadyTold = prompt && items(r => r.gen === g.id && r.prompt_id === prompt && r.state === 'bound' && r.carried_resume).length
+    const alreadyTold = prompt && items(r => r.gen === g.id && r.resume_told === prompt && r.state === 'bound').length
     const line = !alreadyTold ? resumes.line(g.session_id) : undefined
     for (const r of rows) {
       const carried = r === rows[0] ? line : undefined
-      if (carried || r.carried_resume) J().write('msg', r.id, r.state, { carried_resume: carried ?? null })
+      if (carried || r.carried_resume) J().write('msg', r.id, r.state, { carried_resume: carried ?? null, resume_told: null })
     }
     return line
   }
@@ -704,7 +704,8 @@ export function createMain(E: MainEnv) {
     const dg = wallDelivery(g).active ? null : attachInfo(mb)
     const all = dg ? [...got, dg] : got
     const at = new Date().toISOString()                                                           // WO-201: bound_at, what "output after it" is measured from
-    for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true, bound_at: at })
+    for (const r of all) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, via_pull: true, bound_at: at,
+      ...(r.carried_resume ? { resume_told: prompt } : {}) })
     for (const r of got) if (r.onsen_items) E.itemReceiver?.()?.bind(r.onsen_items, 'main', prompt, g.session_id)
     for (const r of got) J().write('wake', r.id, 'wake', { reason: `pulled into the running turn ${prompt}` })
     try { E.bound?.(got.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }
@@ -967,6 +968,11 @@ export function createMain(E: MainEnv) {
     const open = g.prompt_id === prompt
     const receiver = E.itemReceiver?.()
     if (open && (!ids?.size || !receiver?.mode.active)) return
+    if (open && ids) {
+      // A tool hook can bind the offer before the prompt receipt identifies which text arrived.
+      for (const r of items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === prompt && r.carried_resume
+        && r.resume_told !== prompt && identifies(ids, r))) J().write('msg', r.id, 'bound', { resume_told: prompt })
+    }
     const canBind = (r: Row) => {
       const named = ids && identifies(ids, r), resume = isResume(r)
       if (open && !resume && !r.carried_resume) return false
@@ -995,7 +1001,7 @@ export function createMain(E: MainEnv) {
     const at = new Date().toISOString()
     for (const r of accepted) J().write('msg', r.id, 'bound', { gen: g.id, prompt_id: prompt, bound_at: at,
       ...(isResume(r) && !receiver?.claims.owns(r.onsen_items[0].onsen_item_id) ? { resume_claim: { session: g.session_id, prompt } } : {}),
-      ...(r.carried_resume && (!ids || !identifies(ids, r)) ? { carried_resume: null } : {}) })
+      ...(r.carried_resume ? { resume_told: ids && identifies(ids, r) ? prompt : null } : {}) })
     for (const r of accepted) if (isResume(r)) resumes.resolveInput(r.onsen_items[0].onsen_item_id, true)
     if (accepted.length) { try { E.bound?.(accepted.map(r => J().get('msg', r.id)!)) } catch (e) { E.log('warn', `lanes: bound hook: ${e}`) }; delivered() }
   }
@@ -1121,7 +1127,7 @@ export function createMain(E: MainEnv) {
         }
         { // 002v: the work this turn leaves for the next (the turn's items, or the outputs it adds to the work it carried on)
           const mine = items(r => r.gen === g.id && r.prompt_id === p && (r.state === 'bound' || r.state === 'done') && r.kind !== 'digest')
-          for (const r of mine) if (r.carried_resume?.session === g.session_id && r.state === 'bound') resumes.withdraw(r.carried_resume)
+          for (const r of mine) if (r.carried_resume?.session === g.session_id && r.resume_told === p && r.state === 'bound') resumes.withdraw(r.carried_resume)
           const outs = outputs.get(p) ?? [], w = work.get(g.id)
           if (mine.length) work.set(g.id, { items: mine.map(aidItem).slice(-6), outputs: outs.slice(-12), ids: mine.map(r => r.id),
             events: [...new Set(mine.map(r => String(r.event ?? '')).filter(Boolean))] })
