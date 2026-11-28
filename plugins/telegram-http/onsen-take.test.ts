@@ -293,6 +293,39 @@ test('while busy mail waits, a person binds inside PostToolUse, pre-switch work 
   for (const id of r.claims.held()) { const it = r.f.rows.get(id)!; expect(!!it.in_session_at || r.f.now() - Date.parse(it.claim!.taken_at) < 20_000).toBe(true) }
 })
 
+test('claim invariant after every idle, busy and walled main transition', async () => {
+  const r = await mainRig()
+  const step = async (act: () => unknown) => {
+    await act(); await r.sync()
+    const held = [...r.f.rows.values()].filter(row => row.state === 'claimed')
+    expect(r.claims.held().sort()).toEqual(held.map(row => row.id).sort())
+    for (const row of held) {
+      if (row.in_session_at) expect(row.claim!.session_id).toBe('main')
+      else {
+        const offered = r.m.items(it => it.state === 'offered' && it.onsen_items?.some((ref: any) => ref.onsen_item_id === row.id))
+        expect(offered).toHaveLength(1)
+        expect(r.f.now() - Date.parse(row.claim!.taken_at)).toBeLessThan(20_000)
+      }
+    }
+  }
+  const person = r.f.add('idle-person'), mail = r.f.add('busy-mail', 'mail'), steer = r.f.add('busy-person')
+  let did = ''
+  await step(async () => { did = r.enqueue(person); await until(() => r.offers.length === 1) })
+  await step(() => r.hook('UserPromptSubmit', { dids: [did] }))
+  await step(() => r.status('busy'))
+  await step(() => r.enqueue(mail)); expect(mail.state).toBe('waiting')
+  await step(() => r.enqueue(steer)); expect(steer.state).toBe('waiting')
+  await step(() => r.hook('PostToolUse')); expect(steer.in_session_at).toBeTruthy()
+  await step(() => r.f.advance(21_000)); expect(mail.state).toBe('waiting')
+  const reset = new Date(r.f.now() + 60_000).toISOString()
+  await step(() => r.setWall({ walled: true, lastWallMs: Date.now(), clearedMs: null, resets_at: reset }))
+  await step(() => r.hook('StopFailure', { error: 'rate_limit' }))
+  const waiting = r.f.add('walled-person')
+  await step(() => r.enqueue(waiting)); await step(() => r.m.pump())
+  expect(waiting.state).toBe('waiting'); expect(mail.state).toBe('waiting')
+  expect(r.claims.held()).toEqual([])
+})
+
 test('20 s without a bind returns the offer, the same did can bind once on a new claim', async () => {
   const r = await mainRig(), row = r.f.add('miss'), did = r.enqueue(row)
   await until(() => r.offers.length === 1)
