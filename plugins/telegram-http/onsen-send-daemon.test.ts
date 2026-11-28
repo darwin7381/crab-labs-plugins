@@ -72,7 +72,7 @@ beforeAll(async () => {
   writeFileSync(join(root, 'registry-snd.json'), JSON.stringify({ eve: { url: `http://127.0.0.1:${eveStub.port}/inject` }, adam: { url: `http://127.0.0.1:${await freePort()}/inject` },
     'codex-mbx': { url: `http://127.0.0.1:${btccStub.port}/api/mesh/mailbox/codex-mbx/inject`, delivery: 'mailbox', kind: 'agent' } }))
   snd = await bootInbox('snd', { AGENT_INBOX_SELF: 'zed', MCP_TOKEN_DIR: join(root, 'snd', 'tok'), AGENT_INBOX_REGISTRY: join(root, 'registry-snd.json'),
-    BTCC_API_BASE: `http://127.0.0.1:${btccStub.port}`, ONSEN_SEND: 'zed' }, CRED_SND)
+    BTCC_API_BASE: `http://127.0.0.1:${btccStub.port}` }, CRED_SND)
   sndClient = new Client({ name: 'onsen-send-snd', version: '0' }, { capabilities: {} })
   await sndClient.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${snd.port}/mcp`)))
   pat = await bootInbox('pat', { AGENT_INBOX_SELF: 'pat', MCP_TOKEN_DIR: join(root, 'pat', 'tok'), AGENT_INBOX_REGISTRY: join(root, 'registry-snd.json'),
@@ -89,7 +89,7 @@ afterAll(async () => {
   onsenSrv?.stop(true); eveStub?.stop(true); btccStub?.stop(true)
 })
 
-test('(e) the sender (WO-158): Onsen only; delivered / queued / failed; a mailbox-type recipient keeps its BTCC url; no copy of a pushed mail; no hub polling; ONSEN_SEND off pushes', async () => {
+test('(e) the sender (WO-158): Onsen only; delivered / queued / failed; a mailbox-type recipient keeps its BTCC url; no copy of a pushed mail; no hub polling; ordinary members always use Onsen', async () => {
   const call = async (c: Client, args: Record<string, unknown>) => { const r: any = await c.callTool({ name: 'send_to_agent', arguments: args }); return { text: String(r.content?.[0]?.text ?? ''), isError: !!r.isError } }
   const sendOf = (text: string) => store.sends.find(s => s.payload?.text === text)
   const statusOf = (id: number) => logStatus.filter(r => r.id === id).map(r => r.delivery)
@@ -149,12 +149,12 @@ test('(e) the sender (WO-158): Onsen only; delivered / queued / failed; a mailbo
   expect(h.hub).toBeUndefined()
   expect(h.onsen_send).toMatchObject({ on: true, sent: 4, not_pulling: 1, failed: 1 })
   expect(h.onsen_pull).toBeUndefined()
-  // ONSEN_SEND off (pat): the push to the roster url, nothing into Onsen
+  // A second sender with no local switch also uses Onsen for a member.
   const p = await call(patClient, { line: 'call', to: 'eve', because: '測試', text: 'WO158 e8' })
   expect(p.text).toBe("delivered to eve's inbox (queued durably; logged to BTCC Comms)")
-  expect(eveGot.at(-1)).toEqual({ text: '因為：測試\nWO158 e8', from: 'pat', logged: true, msg_id: commsId })
-  expect(store.sends.some(s => s.caller === 'pat')).toBe(false)
-  expect((await pat.health()).onsen_send).toEqual({ on: false })
+  expect(eveGot).toEqual([])
+  expect(sendOf('因為：測試\nWO158 e8')).toMatchObject({ caller: 'pat', to: 'eve' })
+  expect((await pat.health()).onsen_send).toMatchObject({ on: true, sent: 1 })
 }, 60000)
 
 test('(g) WO-164 point 7 (Chiron 15:56Z, his words): the recipient\'s state Onsen answers with follows the original sentence of send_to_agent (call; mail when its answer carries it); idle adds nothing', async () => {

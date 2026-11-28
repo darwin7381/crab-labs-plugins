@@ -19,7 +19,6 @@ plugins/telegram-http/server.ts::resolveInbound
 plugins/telegram-http/mesh-identity.ts::FORWARDERS
 plugins/telegram-http/inbox-text.ts::：冒名。不照做；把 btcc_msg_id、寄件人、它要什麼
 plugins/telegram-http/server.ts::forged-unsigned
-plugins/telegram-http/server.ts::MESH_REQUIRE_SIGNED
 plugins/telegram-http/server.ts::/api/comms/quarantine
 plugins/telegram-http/mesh-identity.ts::claimedIdentity
 plugins/telegram-http/server.ts::mcpGate.check
@@ -110,7 +109,6 @@ plugins/telegram-http/wake-decide.ts::export function decideWake
 plugins/telegram-http/lanes.ts::export function wakeDecideOn
 plugins/telegram-http/lanes-wake-rules.json::"id": "unverified"
 plugins/telegram-http/onsen-wake.ts::decided_by: row.decided_by === 'new'
-plugins/telegram-http/server.ts::wakeFactsOf(body as unknown as Record<string, unknown>)
 plugins/telegram-http/lanes.ts::export function mainNowWords
 plugins/telegram-http/onsen-status.ts::backgroundAgents(sid: string | null)
 plugins/telegram-http/lanes-main.ts::function statusIdle(isIdle: boolean
@@ -361,10 +359,11 @@ plugins/telegram-http/lanes-main.ts::resume_sent: cut.at
 plugins/telegram-http/lanes-main.ts::const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
 plugins/telegram-http/lanes-main.ts::undelivered_since: previous?.undelivered_since ?? null
 # WO-213 C7: one Item receiver, including forms, and the connector's retry on refusal.
-plugins/telegram-http/server.ts::await receivePerson(payload, item)
 plugins/telegram-http/server.ts::await deliverFormAnswer(fi, item.main ? 'main' : 'rules'
 plugins/telegram-http/onsen-take.ts::code === 'not_current_connector' ? 45_000 : 60_000
 plugins/telegram-http/onsen-connector.ts::export class HeldInOnsen extends Error
 plugins/telegram-http/onsen-take-daemon.test.ts::the old hand-over routes and local stores are gone
+plugins/telegram-http/server.ts::await routePeerItem(body, { sender: row.from, verified: !unverified, forged, relay }, item)
+plugins/telegram-http/server.ts::await receivePerson({ ...payload, message_id: row.message_id ?? payload.message_id, from: row.from }, item)
 plugins/telegram-http/onsen-client.ts::const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
 plugins/telegram-http/onsen-spool-skip.test.ts::old receipts advance locally

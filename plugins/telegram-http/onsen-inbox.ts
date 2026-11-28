@@ -57,8 +57,7 @@ export class OnsenSender {
   readonly stats = { sent: 0, duplicate: 0, not_pulling: 0, failed: 0, last_error: null as string | null }
   private warnAt = 0
   constructor(readonly o: { req: Req; log: Log; now?: () => number }) {}
-  /** POST /send; never throws. stored: Onsen has it (new or already had it); pulling (Onsen 0.9.1): the recipient's daemon asked for its inbox in the
-   *  last 90 s, so it will take it; not pulling: it takes it when it polls again */
+  /** POST /send; never throws. stored: Onsen has it (new or already had it); pulling (Onsen 0.9.1): Onsen has seen the recipient’s connector within its active window (ruling 44); not pulling: it takes it when it polls again */
   async send(to: string, kind: SendKind, payload: Record<string, unknown>, dedupe: string | null, facts: SendFacts = {}): Promise<SendOutcome> {
     try {
       const refs = facts.refs && Object.keys(facts.refs).length ? facts.refs : undefined

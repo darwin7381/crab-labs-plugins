@@ -37,7 +37,7 @@ const inboxPort = await freePort()
 process.env.LANES_INBOX_PORT = String(inboxPort); process.env.MCP_TOKEN_DIR = tokDir; process.env.LANES_DIR = tgDir
 const L = await import('./lanes.ts?peer-scope') as typeof import('./lanes.ts')
 copyFileSync(process.env.LANES_TEST_ROUTER ?? '/home/god/genesis/universes/002/router.json', join(tgDir, 'router.json'))
-L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: tgDir, transcriptDir: tgDir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: (a: string | undefined) => a === 'Bearer t0k',
+L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: tgDir, transcriptDir: tgDir, httpPort: 0, log: () => {}, deliverToMain: () => {}, authOk: (a: string | undefined) => a === 'Bearer test-loopback',
   registryNames: () => ['eve'], sendBot: async () => 1, joeyChatId: () => '1' } as any)
 const st = L.__lanesState()
 st.lanes['adam.reflex.1'] = { id: 'adam.reflex.1', kind: 'reflex', n: 1, session_id: 's', thread: 'adam#t-1', status: 'running', created: '', last: '', transcript: join(tgDir, 'l1.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0 } as any
@@ -55,6 +55,7 @@ let tgBodies: any[] = []                              // what the agent-inbox da
 let btcc: { method: string; path: string; body: any }[] = []
 let mailId = 500
 let jevServer: any, tgServer: any, stub: any, proc: { kill(): void } | null = null, client: Client | null = null
+const transport = globalThis.fetch
 const reset = () => { jev = []; tgBodies = []; btcc = []; L.__clearPeerRefused() }
 const sentTo = (p: RegExp) => btcc.filter(r => p.test(`${r.method} ${r.path}`))
 
@@ -79,7 +80,15 @@ beforeAll(async () => {
     if (!await L.handleLanesHttp(u, req, res)) return new Response('{}', { status: 404 })
     return new Response(out || '{}', { status: code, headers: { 'content-type': 'application/json' } })
   } })
-  writeFileSync(join(tokDir, String(tgServer.port)), 't0k\n')
+  // Both test daemons use an in-memory token for loopback lane traffic.
+  globalThis.fetch = Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = new URL(input instanceof Request ? input.url : String(input))
+    if (url.hostname !== '127.0.0.1') throw new Error('peer test requires a loopback destination')
+    if (url.port !== String(inboxPort) || !url.pathname.startsWith('/lanes/')) return transport(input, init)
+    const headers = new Headers(init?.headers)
+    headers.set('Authorization', 'Bearer test-loopback')
+    return transport(input, { ...init, headers })
+  }, transport)
   // BTCC (mail, comms log), the wall (Fleet Core) and eve's inbox
   stub = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(r) {
     const u = new URL(r.url), body = r.method === 'POST' ? await r.json().catch(() => ({})) : undefined
@@ -89,19 +98,19 @@ beforeAll(async () => {
     if (u.pathname === '/api/comms/log') return Response.json({ id: ++mailId })
     if (u.pathname === '/api/feed/posts') return Response.json({ id: ++mailId })
     if (u.pathname === '/api/feed/me') return Response.json({ ask: false })
-    if (u.pathname === '/inject') return Response.json({ injected: true, active_sessions: 1 })
+    if (u.pathname === '/send') return Response.json({ results: [{ to: body.to, seq: mailId, pulling: true }] })
     return Response.json({})
   } })
   const registry = join(root, 'registry.json')
-  writeFileSync(registry, JSON.stringify({ eve: { url: `http://127.0.0.1:${stub.port}/inject` }, adam: { url: `http://127.0.0.1:${inboxPort}/inject` } }))
-  proc = Bun.spawn(['bun', join(import.meta.dir, 'server.ts')], {
+  writeFileSync(registry, JSON.stringify({ eve: { url: `http://127.0.0.1:${stub.port}` }, adam: { url: `http://127.0.0.1:${inboxPort}` } }))
+  proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', join(import.meta.dir, 'test-fixtures/item-daemon.ts'), join(import.meta.dir, 'server.ts')], {
     cwd: import.meta.dir,
     env: {
-      PATH: process.env.PATH ?? '', HOME: home, CHANNEL_INBOX_ONLY: '1', TELEGRAM_HTTP_PORT: String(inboxPort), TELEGRAM_STATE_DIR: stateDir,
+      GIT_ALLOW_PROTOCOL: 'file', FIXTURE_PEER_PORT: String(tgServer.port), PATH: process.env.PATH ?? '', HOME: home, CHANNEL_INBOX_ONLY: '1', TELEGRAM_HTTP_PORT: String(inboxPort), TELEGRAM_STATE_DIR: stateDir,
       AGENT_INBOX_SELF: 'adam', AGENT_WORKSPACE_DIR: ws, AGENT_INBOX_REGISTRY: registry, GENESIS_LANES: '1', LANES_AGENT: 'adam',
       LANES_TG_PORT: String(tgServer.port), LANES_INBOX_PORT: String(inboxPort), MCP_TOKEN_DIR: tokDir,
-      BTCC_API_BASE: `http://127.0.0.1:${stub.port}`, FLEET_CORE_BASE: `http://127.0.0.1:${stub.port}`,
-      TYPESAFE_BASE_URL: `http://127.0.0.1:${jevServer.port}`, TYPESAFE_KEY_FILE: '/nonexistent/typesafe.env',
+      ONSEN_BASE: `http://127.0.0.1:${stub.port}`, BTCC_API_BASE: `http://127.0.0.1:${stub.port}`, FLEET_CORE_BASE: `http://127.0.0.1:${stub.port}`,
+      TYPESAFE_BASE_URL: `http://127.0.0.1:${jevServer.port}`, TYPESAFE_KEY_FILE: join(root, 'no-key'), TYPESAFE_API_KEY: 'test-key',
       MCP_READY_DELAY_MS: '200', CRAB_LABS_PLUGINS_ENV: join(root, 'no-machine-config'), HUB_SYNC: '0', USAGE_WALL_READ: '0',
     },
     stdout: 'ignore', stderr: 'ignore',
@@ -115,7 +124,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   try { await client?.close() } catch {}
-  proc?.kill(); jevServer?.stop(true); tgServer?.stop(true); stub?.stop(true)
+  proc?.kill(); globalThis.fetch = transport; jevServer?.stop(true); tgServer?.stop(true); stub?.stop(true)
   for (const k of ENV_KEYS) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k] }
 })
 
@@ -154,7 +163,7 @@ test('(b) WO-140: a main\'s send_to_agent with reply_to that gives a hostname an
   const a = await main('send_to_agent', { line: 'call', to: 'eve', reply_to: '4242', text: HOST })
   expect(a.isError).toBe(false); expect(a.text).toMatch(/^delivered to eve/)
   expect(jev.length).toBe(1); expect(asked()).toEqual(TWO); expect(tgBodies.at(-1)).toMatchObject({ from: 'main', to: 'eve', answers_request: true })
-  expect(sentTo(/^POST \/inject$/).at(-1)?.body).toMatchObject({ text: HOST, reply_to_id: 4242 })
+  expect(sentTo(/^POST \/send$/).at(-1)?.body.payload).toMatchObject({ text: HOST, reply_to_id: 4242 })
   // the main's mailbox_reply answers a mail: asked the same two, and it goes out
   reset()
   const r = await main('mailbox_reply', { id: 77, body: HOST })
@@ -169,7 +178,7 @@ test('(c) WO-140: a lane\'s reply_agent naming a host and a port goes out on eve
   expect(c).toMatch(/^delivered to eve/)
   expect(asked()).toEqual(TWO)
   expect(jev.at(-1).questions.gives_machine_details).toBeUndefined()
-  expect(sentTo(/^POST \/inject$/).at(-1)?.body).toMatchObject({ text: `因為：eve is waiting\n${HOST}` })
+  expect(sentTo(/^POST \/send$/).at(-1)?.body.payload).toMatchObject({ text: `因為：eve is waiting\n${HOST}` })
   expect(await L.callLaneTool(tok('adam.reflex.1'), 'reply_agent', { to: 'eve', title: 'adam: db', ask: '收下', text: HOST })).toContain('eve')
   expect(asked()).toEqual(TWO); expect(sentTo(/^POST \/api\/mesh\/mail\/send$/).at(-1)?.body).toMatchObject({ to: 'eve', body: HOST })
   expect(await L.callLaneTool(tok('adam.reflex.1'), 'reply_agent', { line: 'feed', title: 'adam: db', text: HOST })).toContain('已貼出')
@@ -186,7 +195,7 @@ test('(c2) WO-140: a refusal names the rule and says to send again on the same l
   const a = await main('send_to_agent', { line: 'call', to: 'eve', reply_to: '4244', text: CRED })
   expect(a.isError).toBe(true)
   expect(a.text).toBe('send_to_agent blocked - nothing was sent: this message gives a credential (a key, token or password) (Jev 0.95). ' + RULE)
-  expect(sentTo(/\/inject$|\/api\/comms\/log$/).length).toBe(0)
+  expect(sentTo(/\/send$|\/api\/comms\/log$/).length).toBe(0)
   const b = await main('send_to_agent', { line: 'call', to: 'eve', reply_to: '4244', text: CRED })
   expect(b.isError).toBe(false); expect(b.text).toMatch(/^delivered to eve/)
   expect(jev.length).toBe(1)                                                                   // the once: no second Jev call
@@ -218,7 +227,7 @@ test('(d) a credential value is refused on every path, self-initiated included',
     expect(r.text).toContain('nothing was sent: this message gives a credential (a key, token or password) (Jev 0.95). ')
     expect(r.text).toContain("The fleet's rule: never send a credential's value (write the file path instead)")
     expect(asked()).toContain('gives_credential'); expect(asked()).toContain('hides_from_joey')
-    expect({ what, sent: sentTo(/\/inject$|\/api\/mesh\/mail\/send$|\/reply$|\/api\/feed\/posts$|\/api\/comms\/log$/).length }).toEqual({ what, sent: 0 })
+    expect({ what, sent: sentTo(/\/send$|\/api\/mesh\/mail\/send$|\/reply$|\/api\/feed\/posts$|\/api\/comms\/log$/).length }).toEqual({ what, sent: 0 })
   }
 }, 30000)
 
@@ -230,7 +239,7 @@ test('(e) the question texts are the decided ones (WO-140: the two of every mess
   expect(q.hides_from_joey.instructions).toBe('Does `message` agree to hide something from Joey, the boss of the agents?')
 })
 
-test('(f) WO-140 (1): the router\'s interim reaches the peer through the agent-inbox daemon (/lanes/send → its /inject) marked no_reply, as a reply to the request', async () => {
+test('(f) WO-140 (1): the router\'s interim reaches the peer through the agent-inbox daemon (/lanes/send → Onsen /send) marked no_reply, as a reply to the request', async () => {
   reset()
   st.lanes['adam.reflex.2'] = { id: 'adam.reflex.2', kind: 'reflex', n: 2, session_id: 's', thread: 'adam#t-3', status: 'running', created: '', last: '', transcript: join(tgDir, 'l3.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0 } as any
   st.threads['adam#t-3'] = { id: 'adam#t-3', lane: 'adam.reflex.2', peer: null, hops: 0, tokens: 0, created: '', last: '' } as any
@@ -238,7 +247,7 @@ test('(f) WO-140 (1): the router\'s interim reaches the peer through the agent-i
   L.__putQueue({ ev, lane: 'adam.reflex.2', state: 'leased', lease_until: 0, attempts: 1, priority: 1, enqueued: '' })
   const t = { runId: 'adam.reflex.2.r1', lane: 'adam.reflex.2', evId: ev.id, closers: [], critical: false, trigger: 'peer', cls: 'peer', escalated: false, pushed: false } as any
   expect(await L.callLaneTool(t, 'handoff_main', { text: 'Eve 要 10 月可用率，週五前；要主線決定答不答應' })).toContain('The router told eve')
-  const inj = sentTo(/^POST \/inject$/).filter(r => String(r.body?.text ?? '').includes('主線會在'))
+  const inj = sentTo(/^POST \/send$/).filter(r => String(r.body?.payload?.text ?? '').includes('主線會在'))
   expect(inj.length).toBe(1)
-  expect(inj[0].body).toMatchObject({ from: 'adam', reply_to_id: 4301, no_reply: true })
+  expect(inj[0].body).toMatchObject({ to: 'eve', payload: { reply_to_id: 4301, no_reply: true } })
 }, 20000)

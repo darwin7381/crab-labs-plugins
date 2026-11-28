@@ -708,18 +708,15 @@ not be found by the conversation it was made in (the level's check, and anyone a
 
 ## lanes-golive: who owns what on the fleet (one entrance into the main)
 
-With `GENESIS_LANES=1` each duty below has one owner. With lanes off none of this runs and the fleet paths are exactly 1.33.2's.
+The Telegram daemon receives Onsen Items. With `GENESIS_LANES=1` the router and M1 divide the work as follows.
 
-| Duty | Owner | Not |
-|---|---|---|
-| Deciding where an inbound item goes (Telegram, /inject, an Onsen item, wake-up line, parked delivery) | the router, `routeEvent` in the tg daemon; the agent-inbox daemon asks it (`/lanes/route`) through `laneDeliverMesh` (server.ts) | `dispatchInbound` building a Telegram event from a mesh notification |
-| Writing anything into the main session | M1 (`lanes-main.ts`: offer when idle, pull at a boundary, re-offer after `OFFER_LEASE_MS`) | `broadcastNotification`, the disk replay (they run only when no router can be asked: `laneDeliverMesh` fallback) |
-| Taking what is sent to the agent | the agent-inbox daemon's Onsen pull (`onsen-inbox.ts`, `deliverPulled` → the same delivery as /inject); hub sync (BTCC `/api/mesh/inbox/pending`, doorbells) was removed in 1.52.0 (WO-158) | |
-| Knowing the main has a delivery | M1 `bound` (the main's turn took the item); `mainTookItems` sends a scheduler run's start receipt (ack) once | `receipt.ts` / `recordDelivery` / `sweepDeliveries` (fallback broadcasts only) |
-| A run a lane takes | its start receipt when the router gives it to the lane (`laneDeliverMesh`: `maybeAutoAckScheduled`), its completion by `receipt(run_id)` / `btcc-receipt` (one per run, `toolGate`) | |
-| Parked deliveries (`inbox/pending`) | the timer drain hands each back to the router (`laneRedeliver`) | replaying them into whichever session is open |
-| Wake-up lines (keep-warm, STALL / RESTART / resume, 讀信箱) | the delivery watchdog sends them (Epeius; keepwarm-local on MBP / txmonster); the router gives each its fixed destination (`routeWake`: the main, or the mail lane) | the `mesh-no-reply` rule (ledger) |
-| Reading mail | the mail lane (`routeMailWake`, mailbox tools through `/lanes/mail-tool`: fleet-mail.ts with the agent's credential); what it cannot judge it hands to the main | the main on a wake (it gets only the digest) |
+| Duty | Owner |
+|---|---|
+| Routing a waiting Item | `routeEvent` in the Telegram daemon selects the main, a lane, or the ledger. |
+| Writing into the main session | M1 in `lanes-main.ts` offers when idle or binds work at a turn boundary. |
+| Taking an Item | The Item receiver takes its ID for the selected session. Onsen owns waiting Items across daemon restarts. |
+| Recording the start and outcome | A binding to a session reports `in_session` under the claim. The terminal Item report supplies the outcome for the server projections. |
+| Reading mail | The mail lane uses `/lanes/mail-tool` and hands decisions to the main. |
 
 ## lanes-topics: work topics in Joey's private chat (1.35.0)
 

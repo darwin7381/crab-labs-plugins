@@ -100,7 +100,7 @@ for (const cfg of [{ GENESIS_LANES: '0' }, { ONSEN_RECORD: '0' }, { CHANNEL_INBO
 test('take starts by default and owns the observation; the old hand-over routes and local stores are gone', async () => {
   const d = await daemon({ ONSEN_OBSERVATION: '' })
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
-  for (const route of ['/onsen/person', '/onsen/action']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
+  for (const route of ['/onsen/person', '/onsen/action', '/inject']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
   for (const path of ['inbox/pending', 'inbox/undeliverable', 'onsen-inbox.json', 'onsen/inbound-store.json'])
     expect(existsSync(join(d.state, path))).toBe(false)
 })
@@ -398,7 +398,7 @@ test('roamer stays on its local mock bot and never probes items', async () => {
   const bot = startBotApiMock()
   clean.push(() => bot.stop())
   const d = await daemon({ ROAMER_MODE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url })
-  await waitFor(() => d.log().includes('staying on pull: ROAMER'))
+  await waitFor(() => bot.calls.some(c => c.method === 'getMe'))
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(0)
 })
 

@@ -1,4 +1,4 @@
-// WO-175 item 2, the agent-inbox daemon's half end to end: a real agent-inbox daemon (server.ts, lanes on, ONSEN_SEND) against a stand-in Onsen (onsen5.py's
+// WO-175 item 2, the agent-inbox daemon's half end to end: a real agent-inbox daemon (server.ts, lanes on) against a stand-in Onsen (onsen5.py's
 // /send: refs is a key → value object; an Onsen that does not know a key answers 400 「unknown field … in refs」) and a stand-in Telegram daemon (its
 // router's /lanes/call-answered, the one place that knows which Call a reply_to names). No BTCC here: an item answered has no BTCC number, as on the lab.
 //   a lane's reply (the router's /lanes/send with `call`): /send's refs.call is that call id; reply_to an event id (not a number) gives no
@@ -47,14 +47,13 @@ beforeAll(async () => {
   } })
   const home = join(root, 'home'), ws = join(root, 'ws'), stateDir = join(ws, '.agent-inbox-state')
   for (const d of [home, ws, stateDir, join(root, 'tok')]) mkdirSync(d, { recursive: true })
-  writeFileSync(join(stateDir, 'mesh-credential'), CRED + '\n')
   writeFileSync(join(root, 'registry.json'), JSON.stringify({ chiron: { url: 'http://127.0.0.1:9/inject' }, eve: { url: 'http://127.0.0.1:9/inject' }, adam: { url: 'http://127.0.0.1:9/inject' } }))
   port = await freePort()
-  proc = Bun.spawn(['bun', join(import.meta.dir, 'server.ts')], {
+  proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', join(import.meta.dir, 'test-fixtures/item-daemon.ts'), join(import.meta.dir, 'server.ts')], {
     cwd: import.meta.dir,
-    env: { PATH: process.env.PATH ?? '', HOME: home, CHANNEL_INBOX_ONLY: '1', TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: stateDir, AGENT_WORKSPACE_DIR: ws,
-      MCP_READY_DELAY_MS: '200', CRAB_LABS_PLUGINS_ENV: join(root, 'no-machine-config'), HUB_SYNC: '0', USAGE_WALL_READ: '0', TYPESAFE_KEY_FILE: '/nonexistent/typesafe.env',
-      ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_SEND: 'adam', AGENT_INBOX_SELF: 'adam', GENESIS_LANES: '1', LANES_AGENT: 'adam',
+    env: { GIT_ALLOW_PROTOCOL: 'file', FIXTURE_MEMBER_TOKEN: CRED, PATH: process.env.PATH ?? '', HOME: home, CHANNEL_INBOX_ONLY: '1', TELEGRAM_HTTP_PORT: String(port), TELEGRAM_STATE_DIR: stateDir, AGENT_WORKSPACE_DIR: ws,
+      MCP_READY_DELAY_MS: '200', CRAB_LABS_PLUGINS_ENV: join(root, 'no-machine-config'), HUB_SYNC: '0', USAGE_WALL_READ: '0', TYPESAFE_KEY_FILE: join(root, 'no-key'),
+      ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, AGENT_INBOX_SELF: 'adam', GENESIS_LANES: '1', LANES_AGENT: 'adam',
       LANES_TG_PORT: String(tg.port), LANES_DIR: join(root, 'lanes'), MCP_TOKEN_DIR: join(root, 'tok'), AGENT_INBOX_REGISTRY: join(root, 'registry.json') },
     stdout: 'ignore', stderr: 'ignore',
   })
@@ -66,8 +65,7 @@ afterAll(async () => { try { await client?.close() } catch {}; try { proc?.kill(
 
 /** what the Telegram daemon's router sends for a lane's reply_agent (lanes.ts reply_agent → laneMeshSend → /lanes/send) */
 async function laneSend(body: Record<string, unknown>): Promise<any> {
-  const tok = readFileSync(join(root, 'tok', String(port)), 'utf8').trim()
-  const r = await fetch(`http://127.0.0.1:${port}/lanes/send`, { method: 'POST', headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+  const r = await fetch(`http://127.0.0.1:${port}/lanes/send`, { method: 'POST', headers: { authorization: 'Bearer test-loopback', 'content-type': 'application/json' },
     body: JSON.stringify({ lane: 'adam.reflex.38', owner: 'adam.reflex.38', thread: 'adam#t-0cc100', hop: 1, turn_id: 'adam.reflex.38.r1', line: 'call', ...body }) })
   expect(r.status).toBe(200)
   return r.json()

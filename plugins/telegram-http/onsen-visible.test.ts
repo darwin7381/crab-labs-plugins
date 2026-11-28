@@ -3,7 +3,7 @@
 //   statusLine / pendingLine (the exact texts); SinceTracker; PendingTracker (Onsen's /pending from the spool's lines); StatusPin (send + pin silently once,
 //   edit on a change ≥ 5 s apart, last value wins, unpinned / deleted → off with a marker file, a restart keeps the message);
 //   rewriteFormLinks / withKey / formTitle (query, fragment, markdown, punctuation, timeout) and the record without the key (outboundRecord + redact);
-//   formBodyText / formEchoText; FormInbox (deliver → echo → ack; delivered once across a restart; ack spooled; 404); the spool's form ack line.
+//   form answer formatting and one-time links.
 import { test, expect, describe } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'

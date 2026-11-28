@@ -2,7 +2,7 @@
 //
 // Before: Onsen recorded the edit (onsen-client.ts inboundEdit), but the agent only ever had the original text. Now, when an allowlisted person edits a
 // message that this daemon delivered into the conversation:
-//   - the original still waits unseen (lanes on: its M1 item still queued, never offered; lanes off: a session's in-memory queue, or inbox/pending): that
+//   - the original still waits unseen (lanes on: its M1 item still queued, never offered; lanes off: a session's in-memory queue): that
 //     copy gets the new text instead (meta edited="true"), so the main reads it once, already corrected;
 //   - otherwise a new inbound goes the way a normal message goes (dispatchInbound: the router / the wake / the queues), its text the full new text under
 //     one line: 〔Joey 改了他 HH:MMZ 那一則（tg:N）〕. The time is the ORIGINAL message's, UTC with a Z as the <channel ts> and chat_history say it

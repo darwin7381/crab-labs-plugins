@@ -39,14 +39,11 @@ test('C3: the router binds scheduled work to the main turn', async () => {
   await L.lanesCommand('/lanes on', 'test')
 })
 
-test('C3 server.ts: the lanes /inject branch goes to the router (no hub doorbell since 1.52.0), disk replay retired', () => {
+test('C3 server.ts: peer Items carry their claim reference into the router', () => {
   const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
   // WO-157: the sender's wake facts (item kind, urgency) ride along as an argument, never in the meta
-  expect(src).toContain('const d = await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body as unknown as Record<string, unknown>), ...(item ? { onsen_items: [item] } : {}) })')   // WO-213 C1: a taken Item rides the delivery
-  expect(src).not.toContain('replayPendingFromDisk')
-  // WO-158: hub sync is gone (no 30 s sync, no doorbell); an older process's parked doorbells are handed on once at start
-  for (const gone of ['HubSync', 'hubSyncMode', 'laneHubPush', 'rememberHubMeta', 'hub.doorbell', "hub?.kick(", '/api/mesh/inbox/pending']) expect(src).not.toContain(gone)
-  expect(src).toContain('void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)')
+  expect(src).toContain('laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body), onsen_items: [item] })')
+  for (const gone of ['replayPendingFromDisk', 'drainLeftoverDoorbells', '/api/mesh/inbox/pending']) expect(src).not.toContain(gone)
   const doc = readFileSync(join(import.meta.dir, 'docs', 'state-journal.md'), 'utf8')
   expect(doc).toContain('## lanes-golive: who owns what on the fleet (one entrance into the main)')
 })

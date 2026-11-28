@@ -13,7 +13,6 @@
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
 
-import { drainLeftoverDoorbells } from './hub-sync.ts'
 import { callInboxTool, feedPath, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, isReplyRef, laneOpenQuery, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { ONSEN_TEXT_DEFAULT, withOnsenFormat } from './fleet-text.ts'
 import { MailEvents, decisionEvent, WITHIN_S as MAIL_DUE_WITHIN_S } from './mail-events.ts'
@@ -82,7 +81,7 @@ import { topicLink } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
-import { bearerIdentity, claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
+import { claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
 import { OnsenSender, isMailboxInject, recipientNote, switchOn } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
@@ -141,11 +140,7 @@ try {
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 
-// CHANNEL_INBOX_ONLY=1 — standalone local-inbox daemon (oncall-inbox plugin).
-// No Telegram at all: no token, no polling, no TG tools. Serves ONLY the MCP
-// channel transport + POST /inject, so locally-originated deliveries (alert dispatcher, scheduler, Comms)
-// get their own process/port/state/queue, fully decoupled from the Telegram
-// daemon's fate (Joey 4557: 喚醒通道不能跟 TG 共命運).
+// The standalone agent-inbox daemon serves the MCP channel and mailbox tools. The Telegram daemon receives Items.
 const INBOX_ONLY = process.env.CHANNEL_INBOX_ONLY === '1'
 
 // WO-197 final (1.59.0, Chiron's ruling A): a roamer (ROAMER_MODE=1) polls its own bot through roamer-telegram.ts, as a daemon did before with
@@ -380,7 +375,7 @@ const ONSEN_VISIBLE = { forms: visibleOn('ONSEN_FORM_LINKS') }
 const ONSEN_FORM_HOSTS = OnsenVisible.formHosts(process.env)
 if (ONSEN_VISIBLE.forms) log('info', `onsen: form links on for ${ONSEN_AGENT} (${[...ONSEN_FORM_HOSTS].join(', ')})`)
 /** WO-145: a page answer's id (form-<Onsen message id>): not a Telegram message */
-const FORM_REF = /^form-\d+$/
+const FORM_REF = /^form-.+$/
 /** WO-145 (ONSEN_FORM_LINKS): a reply's links to our pages get their one-time form keys (POST /forms, 3 s at most; without one in time the link goes as
  *  written). Telegram gets the keyed text; `redact` makes Onsen record the text without the keys (Onsen.withSender's extra). */
 async function formLinks(chat: string, text: string, who: string): Promise<{ text: string; redact: Array<[string, string]> }> {
@@ -1556,31 +1551,16 @@ function fleetRunId(notif: { method: string; params: unknown }): string | undefi
   if (p.meta?.run_id) return String(p.meta.run_id)
   return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
 }
-const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
-const onsenReq = ONSEN_SEND_ON ? (() => {
+const onsenReq = INBOX_ONLY ? (() => {
   const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
-const onsenSender: OnsenSender | null = ONSEN_SEND_ON && onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
-/** The roster (agent-registry-sync's copy of agent-registry.json). WO-158: with ONSEN_SEND on only the names are needed (send_to_agent's name check,
- *  the lanes' peer list); `url` is read only for a mailbox-type identity (BTCC's mailbox inject) and, with ONSEN_SEND off, for the push. */
+const onsenSender: OnsenSender | null = onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
+/** Only BTCC mailbox identities use their roster URL. Other entries supply peer names. */
 function loadInboxRegistry(): Record<string, { url?: string; desc?: string }> {
   try { return JSON.parse(readFileSync(INBOX_REGISTRY_PATH, 'utf8')) } catch { return {} }
 }
-
-// Inbound /inject shared token (legacy path; constant-time). One value only — a rotation
-// is a hard cutover, never an overlap.
-function injectTokenOk(presented: string | undefined): boolean {
-  const t = process.env.CHANNEL_INJECT_TOKEN
-  if (!presented || !t) return false
-  const got = Buffer.from(presented), want = Buffer.from(t)
-  return want.length === got.length && timingSafeEqual(want, got)
-}
-
-// MESH_REQUIRE_SIGNED=1 (machine config): every /inject must carry a valid per-identity
-// credential; the shared token alone is refused and nothing unsigned is delivered.
-const MESH_REQUIRE_SIGNED = process.env.MESH_REQUIRE_SIGNED === '1'
 
 // What this daemon refuses is filed in BTCC's suspicious-message mailbox for Joey's review
 // (Joey TG 6772: suspicious mail is collected, not silently dropped). Fire-and-forget with
@@ -1774,7 +1754,7 @@ async function inboxDecide(args: Record<string, unknown>): Promise<{ text: strin
   }
 }
 
-// lanes-golive: the router's event for a mesh notification (an /inject or an Onsen item, a wake-up line of this daemon's own). Every field comes from the
+// lanes-golive: the router's event for a peer Item or a wake-up line of this daemon's own. Every field comes from the
 // notification's meta, which the delivery (or the keep-warm) filled from the body; nothing is read from the text except what has no
 // field yet (wakeKind: the watchdog's marker).
 /** WO-157: what the sender wrote as fields for the receiver's decideWake (an Onsen item's kind, the urgency of a daemon's own notice). Never put in the
@@ -1784,9 +1764,9 @@ const URGENCY_FIELDS = new Set(['interrupt', 'ordered', 'silent'])
 function wakeFactsOf(body: Record<string, unknown> | null | undefined): WakeFacts {
   const k = typeof body?.item_kind === 'string' && /^[a-z_]{1,24}$/.test(body.item_kind) ? body.item_kind : undefined
   const u = typeof body?.urgency === 'string' && URGENCY_FIELDS.has(body.urgency) ? body.urgency as WakeFacts['urgency'] : undefined
-  // WO-164: the sender's thread-key fields (an Onsen item's refs, an /inject body's refs): the router reads them, never the session (not in the meta)
+  // WO-164: the sender's thread-key fields in the Item refs: the router reads them, never the session (not in the meta)
   const refs = threadRefsOf(body?.refs)
-  // WO-175: the Call the item is (Onsen's call id on the pulled item, when it carries one): it rides the event into the router and the lane
+  // WO-175: the Call the item is (Onsen's call id on the Item, when it carries one): it rides the event into the router and the lane
   // 1.58.32: an answer that names the Call it answers (refs.call; Onsen 0.33.1 takes it only for a Call this agent made) carries that Call's id too,
   // but it is no Call of this agent's: its state is the recipient's (a caller's PUT …/state is 403); the event keeps answers_call, not call_id
   const answers = Onsen.answeredCall(body?.refs) ?? undefined
@@ -1835,7 +1815,7 @@ async function laneDeliverMesh(n: { method: string; params: unknown }, verified?
 const OP_REF_RE = /^[A-Za-z0-9#-]{1,48}$/
 
 // `extra` is only ever passed with lanes on (002): thread / hop / sending-lane marker ride along
-// in the comms log and the /inject body, and `minted` reports the BTCC id + delivery outcome.
+// in the comms log and the peer message, and `minted` reports the BTCC id + delivery outcome.
 type LaneSendExtra = { thread?: string; hop?: number; lane?: string; owner?: string; minted?: (id: number | undefined, delivered: boolean) => void
   /** WO-157 (decision 1): a notice of the daemon's own (the router's interim, a thread-stop notice, the flood reply): the receiver records it only */
   urgency?: 'silent'
@@ -1883,11 +1863,11 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   const reg = loadInboxRegistry()
   if (target === INBOX_SELF) return 'send failed: that is your own inbox'
   const entry = reg[target]
-  // WO-158 (1.52.0): with ONSEN_SEND on the roster is the list of who exists (the name check), and a call goes into the recipient's Onsen inbox only: the
+  // WO-158: the roster is the list of who exists (the name check), and a call goes into the recipient's Onsen inbox only: the
   // roster url is not used, except for a mailbox-type identity (its url is BTCC's own mailbox inject: no daemon takes from Onsen for it), which keeps
-  // the push to that url. ONSEN_SEND off (the stop switch): the push to the roster url for everyone, as before Onsen.
-  const pushUrl = entry?.url && (!onsenSender || isMailboxInject(entry.url)) ? entry.url : null
-  if (!entry || (!onsenSender && !pushUrl)) return `send failed: unknown agent "${target}" — registry has: ${Object.keys(reg).join(', ') || '(empty)'}`
+  // the push to that mailbox url.
+  const pushUrl = entry?.url && isMailboxInject(entry.url) ? entry.url : null
+  if (!entry) return `send failed: unknown agent "${target}" — registry has: ${Object.keys(reg).join(', ') || '(empty)'}`
   // log FIRST to mint the message id — it travels with the delivery so the
   // receiver can quote-reply to this message (Telegram reply_to semantics)
   let msgId: number | undefined
@@ -2484,7 +2464,7 @@ if (INBOX_ONLY && keepwarmMode() !== 'off') {
         return mine ? { on: true, n: Number(mine.n ?? 0), oldestS: mine.oldest_s ?? null } : { on: false, n: 0, oldestS: null }
       } catch { return null }
     },
-    // the same line the Mac mini watchdog sends through /inject: sender fleet-watchdog, no_reply
+    // Keep the watchdog sender and no_reply metadata on the local wake.
     deliver: async (text) => {
       if (activeServers.size === 0) return false
       const chatId = String(loadAccess().allowFrom[0] ?? 'local-inject')
@@ -2966,7 +2946,7 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
     const p = notification.params as { content?: string; meta?: Record<string, string> }
     const meta = p.meta ?? {}
     // lanes-golive (C1): only a Telegram message of Joey's is a Telegram event. What else comes down this path (the agent-inbox daemon's keep-warm and
-    // mailbox lines, a doorbell an older process parked, a local inject) is a mesh event for the router; building a Telegram event from it made the daemon's own keep-warm
+    // mailbox lines) is a mesh event for the router; building a Telegram event from it made the daemon's own keep-warm
     // a message from Joey that the main owed a reply.
     if (INBOX_ONLY || meta.via === 'local-inject') { await laneDeliverMesh(notification); return }
     const ev: Lanes.InEvent = {
@@ -3027,11 +3007,8 @@ async function dispatchInbound(chat_id: string, notification: { method: string; 
 // A failed item keeps its position: image_error[_k] + attachment_file_id[_k].
 // Base meta (message_id/ts/reply/forward context) comes from the FIRST item.
 const ALBUM_WINDOW_MS = 1500
-// WO-197 (lab 17:12Z, Chiron mesh 12823): an album that comes back from Onsen comes one person_message at a time, each handed over when the one before
-// is (its photo fetched from Onsen: ~1.4 s for a large PNG), so 1.5 s after the last item split one album into three tags. Where the path knows the
-// album's size (the connector: the bridge's client_meta.media_group_count; kept facts from before 1.59.0: the count their arrival stamped on the
-// kept facts, albumCount), the album waits until that many items are in, then goes as one tag, however far apart they come; at most
-// ALBUM_CAP_MS (10 s) from its first item, then it goes with what came (logged). The count not known: the window, as before
+// A bridge-supplied count keeps staggered Item downloads in the same album. With no count, use the arrival window.
+// Cap the wait for a missing part and deliver the available photos.
 const ALBUM_CAP_MS = Number(process.env.TELEGRAM_ALBUM_CAP_MS) || 10_000
 
 type AlbumEntry = {
@@ -3355,7 +3332,7 @@ if (tg) {
   void reportCommands().catch(() => {})
   setInterval(() => { if (!commandsPut && Date.now() - commandsTriedAt > 60_000) void reportCommands().catch(() => {}) }, 5_000).unref?.()
 } else {
-  log('info', 'agent-inbox mode: Telegram polling disabled — serving /mcp + /inject only')
+  log('info', 'agent-inbox: serving mailbox and fleet tools')
 }
 
 // ============================================================================
@@ -3937,7 +3914,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
 }
 /** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
  *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
- *  not allowlisted (logged and dismissed). */
+ *  not allowlisted (logged and left waiting). */
 async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main', personIds?: string[], refs?: ItemRef[]): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && CONNECTOR))) {
@@ -3960,7 +3937,7 @@ async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rul
   const notification = { method: 'notifications/claude/channel', params: { content: it.say ? it.body : OnsenVisible.formBodyText(it.body), meta } }
   // Onsen step 3: the daemon took it in (Onsen keys a page answer's delivery facts by form-<id>); seen / turn_end come from the same taps as Joey's messages
   if (onsenFacts) { try { onsenFacts.delivered(chat, ref) } catch {} }
-  // WO-194: a page message that came as a person_message with ONSEN_INBOUND on goes the way a Telegram message goes (the router's rules)
+  // WO-194: a page message that came as a person_message goes the way a Telegram message goes (the router's rules)
   if (Lanes.LANES_ON && route === 'main') {
     const ev: Lanes.InEvent = { id: `tg-${chat}-${ref}`, source: 'telegram', from: uid, text: String(notification.params.content), meta, notif: notification, verified: true, person_message_ids: personIds, ...(refs ? { onsen_items: refs } : {}) }
     if (Lanes.toMainForm(ev)) return true
@@ -3982,6 +3959,11 @@ function pageReplyMeta(r: NonNullable<OnsenVisible.FormItem['reply_to']>): Recor
   return out
 }
 async function receivePerson(p: Record<string, any>, item: ItemRef): Promise<void> {
+  if (p.form_id != null && p.say !== true) {
+    await deliverFormAnswer({ id: String(p.message_id), form_id: p.form_id, chat: String(p.chat ?? p.client?.chat ?? (p.conversation_id != null ? 'onsen:' + p.conversation_id : '')),
+      title: String(p.title ?? ''), body: String(p.body ?? p.text ?? ''), at: p.at ?? p.sent_at }, 'main', [String(p.message_id)], [item])
+    return
+  }
   let c = p.client && typeof p.client === 'object' ? p.client : null
   // WO-197: a person with no app account (client null) says it in Onsen only: in connector mode its chat is the Onsen conversation (onsen:<id>), its
   // number form-<id> (as a page message's), delivered as a page message
@@ -4004,7 +3986,7 @@ async function receivePerson(p: Record<string, any>, item: ItemRef): Promise<voi
     return
   }
   if (p.via === 'web' || Connector.ONSEN_CHAT.test(chat)) {
-    const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
+    const fi: OnsenVisible.FormItem = { id: String(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
       ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
       ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
     await deliverFormAnswer(fi, item.main ? 'main' : 'rules', [String(p.message_id)], [item])
@@ -4068,29 +4050,6 @@ function factsFromPayload(p: any, chat: string, ref: string, thread?: number): O
 type InboundBody = { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
   msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
   no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown; call_id?: string }
-type InboundAnswer = { code: number; json: Record<string, unknown> }
-async function deliverInbound(body: InboundBody | null, verdict: Verdict, holdUnsigned: boolean, item?: ItemRef): Promise<InboundAnswer> {
-  const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
-  const opRef = body?.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
-  if (!text) return { code: 400, json: { error: 'text required' } }
-  // Forged = unsigned, but the claimed name is an identity that DOES sign. That can only
-  // be impersonation (the real sender would have signed), so it is never a legitimate
-  // not-yet-migrated sender — dropping it loses no task (distinct from Joey 6231, which
-  // protects forged=false unsigned senders). Default-drop so defence does not depend on
-  // every agent reading the tag (steropes 5831: attacker 156.240.236.28 kept reaching
-  // inboxes as ⚠️unverified labels). MESH_ALLOW_FORGED=1 reverts to deliver+label.
-  if (verdict.forged && process.env.MESH_ALLOW_FORGED !== '1') {
-    log('warn', `DROPPED forged inject (filed for review): claimed=${verdict.sender} relay=${verdict.relay} text=${text.slice(0, 80)}`)
-    fileHeld(verdict.sender, verdict.relay, text, 'forged-unsigned')
-    return { code: 200, json: { injected: false, dropped: 'forged-unsigned', held: true } }
-  }
-  if (holdUnsigned) {
-    log('warn', `HELD unsigned inject (MESH_REQUIRE_SIGNED): claimed=${verdict.sender} text=${text.slice(0, 80)}`)
-    fileHeld(verdict.sender, verdict.relay, text, 'unsigned')
-    return { code: 200, json: { injected: false, held: true } }
-  }
-  return deliverInboundTaken(body!, text, opRef, verdict, item)
-}
 async function logPeerArrival(row: Record<string, unknown>): Promise<number | undefined> {
   if (!BTCC_API_BASE) return
   const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, { method: 'POST',
@@ -4098,7 +4057,18 @@ async function logPeerArrival(row: Record<string, unknown>): Promise<number | un
     body: JSON.stringify({ ...row, to_agent: INBOX_SELF }), signal: AbortSignal.timeout(6000) }).catch(() => null)
   if (r?.ok) { const j = await r.json().catch(() => ({})) as { id?: number }; return j.id }
 }
-async function deliverInboundTaken(body: InboundBody, text: string, opRef: string, verdict: Verdict, item?: ItemRef): Promise<InboundAnswer> {
+async function routePeerItem(body: InboundBody & Record<string, unknown>, verdict: Verdict, item: ItemRef): Promise<void> {
+  const text = typeof body.text === 'string' ? body.text.slice(0, 4000) : ''
+  if (!text) throw new Error('missing peer message text for ' + item.onsen_item_id)
+  if (verdict.forged && process.env.MESH_ALLOW_FORGED !== '1') {
+    if ((await itemReceiver!.receive([item])).given.has(item.onsen_item_id)) {
+      log('warn', `onsen: dropped forged sender ${verdict.sender} for ${item.onsen_item_id}`)
+      fileHeld(verdict.sender, verdict.relay, text, 'forged-unsigned')
+      itemReceiver!.report([item], 'completed')
+    }
+    return
+  }
+  const opRef = body.op != null && OP_REF_RE.test(String(body.op).trim()) ? String(body.op).trim() : ''
   const from = verdict.sender
   // WO-141 phase 2: BTCC's mailbox ring (body ring:true with wake=mail, through the oncall receiver). It wakes the agent's mail lane and
   // nothing else: never a BTCC comms row (a ring is not a message), never the main. Lanes off: dropped and logged here (the watchdog's
@@ -4110,7 +4080,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
   // Receiver-side comms logging (Joey 4616: one-sided threads): EVERY inbound
   // delivery gets a BTCC row unless the sender declares logged:true (senders
   // that already log with richer context: fleet call, BTCC /send, Argus wake).
-  if ((INBOX_ONLY || item) && body?.logged !== true && (BTCC_API_BASE || item) && !ring) {
+  if (body.logged !== true && !ring) {
     // PARSE rather than strip (codex r3): wake handoffs keep their priority
     // and get kind='wake' so BTCC history/UI retain the on-call semantics;
     // only bare legacy identity prefixes (【a → b】) are dropped as noise.
@@ -4130,57 +4100,20 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
       // awaited (not fire-and-forget): the minted row id travels in the channel
       // meta as btcc_msg_id so the receiving agent can quote-reply to this message
       const row = { from_agent: from, to_agent: INBOX_SELF, kind, body: logBody.slice(0, 4000), delivery: 'delivered', reply_to_id: body?.reply_to_id ?? null, sender_verified: verdict.verified, ...(opRef ? { op: opRef } : {}) }
-      const id = item ? (await Lanes.inboxPost('/lanes/inbound-log', row))?.id : await logPeerArrival(row)
+      const id = (await Lanes.inboxPost('/lanes/inbound-log', row))?.id
       if (typeof id === 'number') btccMsgId = id
     } catch {}
   }
   // Default chat_id = first allowFrom (the owner): if the agent finishes and
   // reports via the reply tool, the report lands with the boss per contract.
   const chatId = String(body?.chat_id ?? loadAccess().allowFrom[0] ?? 'local-inject')
-  if (Lanes.LANES_ON) {
-    // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
-    // sender (it is stamped by the sender's own daemon, never by message text).
-    const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
-    const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
-    const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
-    const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
-    const notification = {
-      method: 'notifications/claude/channel',
-      params: {
-        content: text,
-        meta: {
-          chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
-          ...verdictMeta(verdict),
-          ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
-          ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
-          ...(opRef ? { op: opRef } : {}),
-          ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
-          ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
-          ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
-          ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
-          // lanes-golive (C1/C2): what the router reads as fields: the wake-up kind (body.wake, else the watchdog's sender and marker) and the line
-          // (body.line / body.tier; a push without one is a call)
-          ...((w => w ? { wake: w } : {})(Lanes.wakeKind(from, text, body?.wake))),
-          line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call',
-          // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
-          ...((body as any)?.run_id != null && /^\d+$/.test(String((body as any).run_id)) ? { run_id: String((body as any).run_id) } : {}),
-          ...(typeof (body as any)?.frequency === 'string' && (body as any).frequency ? { frequency: String((body as any).frequency).slice(0, 16) } : {}),
-          ...(ring ? { ring: 'true' } : {}),          // WO-141: the router reads it (lanes switched off: a ring is recorded, not the main's)
-        },
-      },
-    }
-    // lanes-golive (C3): one entrance into the main: the router (1.52.0, WO-158: no hub doorbell any more)
-    const d = await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body as unknown as Record<string, unknown>), ...(item ? { onsen_items: [item] } : {}) })
-    if (!d) {
-      return { code: 503, json: { injected: false, error: 'lanes router unreachable' } }
-    }
-    return { code: 200, json: { injected: true, routed: d?.target ?? 'main', lane: d?.lane ?? null, rule: d?.rule ?? 'router-unreachable' } }
-  }
-  if (ring) {
-    log('info', `ring from ${from} dropped: lanes off here (no mail lane to wake; the mailbox stays as it is, the watchdog reminds): ${text.slice(0, 60)}`)
-    return { code: 200, json: { injected: false, ignored: 'ring: lanes off here; the mailbox stays as it is' } }
-  }
-  const notif = {
+  // 002: thread / hop / sender-lane marker. The marker is only believed from a verified
+  // sender (it is stamped by the sender's own daemon, never by message text).
+  const b2 = body as unknown as { thread?: unknown; hop?: unknown; lane?: unknown }
+  const thread = typeof b2?.thread === 'string' && /^[a-z0-9_-]{1,32}#t-[0-9a-f]{4,16}$/i.test(b2.thread) ? b2.thread : undefined
+  const hop = Number.isFinite(Number(b2?.hop)) && Number(b2?.hop) > 0 ? Math.floor(Number(b2?.hop)) : undefined
+  const laneMarker = verdict.verified && typeof b2?.lane === 'string' ? String(b2.lane).slice(0, 48) : undefined
+  const notification = {
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -4188,20 +4121,25 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
         chat_id: chatId, user: from, user_id: 'local-inject', ts: new Date().toISOString(), via: 'local-inject',
         ...verdictMeta(verdict),
         ...(btccMsgId != null ? { btcc_msg_id: String(btccMsgId) } : {}),
-        // Terminal-ack flag (Athena's a2a ack-loop fix): a no_reply delivery is
-        // tagged no_reply="true" so check_tg_reply lets the receiver's turn close
-        // WITHOUT forcing a reply — breaks the two-agent forced-ack loop at source.
         ...(body?.no_reply === true ? { no_reply: 'true' } : {}),
-        // ops room (BTCC WO-35): which 戰情室 this message belongs to; reply with the same op
         ...(opRef ? { op: opRef } : {}),
         ...(body?.reply_to_id != null ? { reply_to_id: String(body.reply_to_id) } : {}),
         ...(body?.reply_to_from ? { reply_to_from: String(body.reply_to_from).slice(0, 64) } : {}),
         ...(body?.reply_to_text ? { reply_to_text: String(body.reply_to_text).slice(0, 120) } : {}),
+        ...(thread ? { thread } : {}), ...(hop ? { hop: String(hop) } : {}), ...(laneMarker ? { sender_lane: laneMarker } : {}),
+        // lanes-golive (C1/C2): what the router reads as fields: the wake-up kind (body.wake, else the watchdog's sender and marker) and the line
+        // (body.line / body.tier; a push without one is a call)
+        ...((w => w ? { wake: w } : {})(Lanes.wakeKind(from, text, body?.wake))),
+        line: Lanes.lineOf((body as any)?.line ?? (body as any)?.tier) ?? 'call',
+        // PL5: the scheduler's run id and frequency are structured fields of the inject body (the router reads them; no text is parsed)
+        ...((body as any)?.run_id != null && /^\d+$/.test(String((body as any).run_id)) ? { run_id: String((body as any).run_id) } : {}),
+        ...(typeof (body as any)?.frequency === 'string' && (body as any).frequency ? { frequency: String((body as any).frequency).slice(0, 16) } : {}),
+        ...(ring ? { ring: 'true' } : {}),          // WO-141: the router reads it (lanes switched off: a ring is recorded, not the main's)
       },
     },
   }
-  await dispatchInbound(chatId, notif)
-  return { code: 200, json: { injected: true, active_sessions: activeServers.size } }
+  const routed = await laneDeliverMesh(notification, verdict.verified, { ...wakeFactsOf(body), onsen_items: [item] })
+  if (!routed) throw new Error('peer delivery did not reach the router for ' + item.onsen_item_id)
 }
 async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   // A page may omit the event history. Resolve the hand-over note before putting the row into M1.
@@ -4223,7 +4161,7 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
     if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
-    await receivePerson(payload, item)
+    await receivePerson({ ...payload, message_id: row.message_id ?? payload.message_id, from: row.from }, item)
     return
   }
   if (row.kind === 'control') {
@@ -4241,11 +4179,10 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const relay = !row.relay ? 'direct' : row.relay === 'oncall-receiver' ? 'oncall-receiver' : 'btcc'
   const body = { ...payload, item_kind: payload.item_kind ?? kinds[row.kind] ?? row.kind,
     refs: Object.fromEntries(row.refs.map(r => [r.kind, r.value])) }
-  const out = await deliverInbound(body, { sender: row.from, verified: true, forged: false, relay }, false, item)
-  if (!out.json.injected && !out.json.ignored) throw new Error('peer delivery failed for ' + row.id)
+  const unverified = row.unverified === true
+  const forged = unverified && resolveInbound(undefined, row.from, undefined, loadTable()).forged
+  await routePeerItem(body, { sender: row.from, verified: !unverified, forged, relay }, item)
 }
-
-
 
 log('info', `mcp loopback token: ${mcpToken ? 'ready' : 'MISSING'}; ${MCP_REQUIRE_TOKEN ? 'required' : 'report-first (MCP_REQUIRE_TOKEN unset)'}`)
 const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -4282,7 +4219,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         last_update_id: tg?.lastUpdateId ?? 0,
         mcp_auth: mcpGate.stats,
         polling: tg?.polling ?? false,  // a roamer: its long poll's onStart has run; false = not polling (yet), and always for a connector
-        // WO-151 3a / 3b: the Onsen pull (taken, handed on, duplicates dropped on either path) and this agent's sends into Onsen (WO-158: the only path)
+        // The mailbox daemon sends outbound peer messages through Onsen.
         ...(INBOX_ONLY ? {
           onsen_send: { on: !!onsenSender, ...(onsenSender ? onsenSender.stats : {}) },
         } : {}),
@@ -4309,40 +4246,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
       if (isSystemAlertEnabled() && body) handleOtlpLogs(body)
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end('{}')
-      return
-    }
-
-    // /inject — localhost agent-wake inbox (2026-07-12, comms rethink after Joey 4554).
-    // Delivers a locally-originated message through the SAME durable channel path as a
-    // Telegram inbound (memQueue + disk pending replay + delete-on-delivery), replacing
-    // fragile tmux send-keys: survives TUI busy/menus/restarts, no shell-execution risk,
-    // and delivery is confirmed rather than fire-and-forget keystrokes.
-    // Callers: peers, oncall-receiver, BTCC, local system senders. Auth: with
-    // MESH_REQUIRE_SIGNED a valid per-identity credential is required; otherwise the shared
-    // X-Inject-Token (when CHANNEL_INJECT_TOKEN is set) or a valid credential. The
-    // 127.0.0.1 bind is the outer wall either way.
-    if (u.pathname === '/inject' && req.method === 'POST') {
-      const meshTable = loadTable()
-      const authz = req.headers['authorization'] as string | undefined
-      const signedCaller = bearerIdentity(authz, meshTable)
-      const tokenOk = !!process.env.CHANNEL_INJECT_TOKEN && injectTokenOk(req.headers['x-inject-token'] as string | undefined)
-      // An authorized local caller without a credential under MESH_REQUIRE_SIGNED is held
-      // for review below, not refused here (a refusal would drop its task, Joey 6231).
-      const holdUnsigned = MESH_REQUIRE_SIGNED && !signedCaller && tokenOk
-      if (MESH_REQUIRE_SIGNED ? (!signedCaller && !holdUnsigned)
-          : (process.env.CHANNEL_INJECT_TOKEN && !tokenOk && !signedCaller)) {
-        res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"bad token"}')
-        return
-      }
-      const body = (await readJsonBody(req).catch(() => null)) as InboundBody | null
-      // Who really sent it: decided by the presented credential, never by the body alone
-      // (access design v1.1 §5.3). Unsigned senders still deliver, marked verified=false.
-      const verdict = resolveInbound(authz,
-        typeof body?.from === 'string' ? body.from : undefined,
-        typeof body?.verified_from === 'string' ? body.verified_from : undefined, meshTable)
-      const out = await deliverInbound(body, verdict, holdUnsigned)
-      res.writeHead(out.code, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(out.json))
       return
     }
 
@@ -4690,8 +4593,6 @@ function startListen(): void {
     // + freshness vs origin/main at every boot (fail-open, see version-check.ts).
     void checkVersion().then(() => log('info', versionLine())).catch(() => {})
 
-    // WO-158: hub sync is gone; a doorbell an older process (≤ 1.51.0) parked waiting for a sync is handed to the delivery once, so none is stranded
-    void drainLeftoverDoorbells(STATE_DIR, (chatId, n) => dispatchInbound(chatId, n), log)
     // Roamer cross-protocol auto-discovery: announce ourselves so partner-
     // protocol roamer daemons can find us when they spawn target claudes.
     // Safe no-op when ROAMER_MODE is unset (channel-bot deployments).

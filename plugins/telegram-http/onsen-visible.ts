@@ -10,8 +10,7 @@
 //                     daemon's own spool: works with Onsen down). Edited only when the text changes, at least 5 s apart. Joey unpins or deletes it: that
 //                     chat is off (a marker file, status-pin-off-<chat>.json; delete it to start again).
 //   ONSEN_FORM_LINKS  rewriteFormLinks: in a reply's text (the main's, a lane's line), every link to one of our pages (ONSEN_FORM_HOSTS) gets a one-time
-//                     form key `k` (POST /forms); Telegram gets the keyed text, Onsen records it without the keys (SendCtx.redact). FormInbox: the answers
-//                     (GET /forms/inbox long poll) go to the main as Joey's message would, are echoed in the chat without a notification, then acked.
+//                     form key `k` (POST /forms). Answers arrive as message Items.
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { DeliveryFact, OnsenItem, SpoolLine } from './onsen-client.ts'
@@ -481,7 +480,7 @@ export async function rewriteFormLinks(text: string, o: { hosts: Set<string>; ch
   return { text: out, redact, forms: [...keyed].map(([u, k]) => ({ id: Number(k.f.id), url: u })), missed: found.size - keyed.size, why }
 }
 
-export type FormItem = { id: number; form_id: number; chat: string; title: string; body: string; at?: string; say?: boolean   // say (WO-159): Joey wrote it in Onsen
+export type FormItem = { id: string | number; form_id: string | number; chat: string; title: string; body: string; at?: string; say?: boolean   // say (WO-159): Joey wrote it in Onsen
   /** WO-189: the files of a `say` item (Onsen's Message.attachments: kind, name, mime, bytes, url) */
   attachments?: Array<{ kind?: string | null; name?: string | null; mime?: string | null; bytes?: number | null; url?: string | null }>
   /** WO-194 (Chiron, mesh 12695): the message a page message (person_message via web) replies to, as Onsen gives it */

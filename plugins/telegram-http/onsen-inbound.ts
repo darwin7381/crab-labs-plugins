@@ -26,23 +26,17 @@ export type Facts = {
    *  it): each key an attribute of the tag of the same name, as is; it overrides what the tag derived from the person_message (reply_to_*, forward_*,
    *  attachment_*, voice_transcript, …), except the attributes of CLIENT_META_FIXED; a key the tag does not have comes last */
   clientMeta?: Record<string, string>
-  /** WO-197 (lab 17:12Z, Chiron mesh 12823): how many items the album this message belongs to had when Telegram brought them to this daemon (the
-   *  switch off, ONSEN_INBOUND on: stamped on every item's kept facts when the album's arrival window closed). When they come back from Onsen one by
-   *  one, the album is delivered as one tag once that many are in (server.ts bufferAlbumItem), however far apart they are handed over */
-  albumCount?: number
   /** WO-197 segment 2: a connector's message in a topic: inTopic is Onsen's thread (the router's, the lanes'); the tag's topic stays the one the
    *  person's message carried (client.thread) and its name (person_message.topic_name) */
   clientTopic?: string
   topicName?: string
-  /** WO-197 (Chiron mesh 12852): a connector's album item kept until its album is delivered (server.ts personArrived): where Onsen keeps each of its
-   *  files, by the Telegram file id the tag carries (the attachment's client_ref), so a restart takes them from Onsen again */
 }
 /** WO-197: an item of an album (photos or documents sharing a media_group_id; never a replied-to message's file): buffered, delivered with its album */
 export const albumItem = (f: Pick<Facts, 'mgid' | 'image' | 'attachment' | 'fromReply'>): boolean => !!(f.mgid && (f.image || f.attachment) && !f.fromReply)
-/** WO-197: an album's size as a path knows it: the count its arrival stamped on the kept facts (albumCount), else the bridge's client_meta
- *  media_group_count (connector); a Telegram album has 2 to 10 items. null: not known (the album waits the window, as before) */
-export function albumCountOf(f: Pick<Facts, 'albumCount' | 'clientMeta'>): number | null {
-  const n = f.albumCount ?? (f.clientMeta?.media_group_count != null && /^\d{1,2}$/.test(f.clientMeta.media_group_count) ? Number(f.clientMeta.media_group_count) : NaN)
+/** Telegram albums contain 2–10 items. The bridge supplies the count when it has one. */
+export function albumCountOf(f: Pick<Facts, 'clientMeta'>): number | null {
+  const count = f.clientMeta?.media_group_count
+  const n = count && /^\d{1,2}$/.test(count) ? Number(count) : NaN
   return Number.isInteger(n) && n >= 2 && n <= 10 ? n : null
 }
 
