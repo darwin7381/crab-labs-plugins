@@ -29,6 +29,7 @@ export class ItemPeek {
   private routed = false
   private previous = new Map<string, number>()
   private seen = new Map<string, number>()
+  private failures = new Map<string, { at: number; delay: number }>()
   private wakeAt = Infinity
   private due?: ReturnType<typeof setTimeout>
   private timer?: ReturnType<typeof setTimeout>
@@ -62,7 +63,10 @@ export class ItemPeek {
   }
 
   dueAt(time: string): void {
-    const ms = Date.parse(time)
+    this.wake(Date.parse(time))
+  }
+
+  private wake(ms: number): void {
     if (!(ms > Date.now() && ms < this.wakeAt)) return
     clearTimeout(this.due)
     this.wakeAt = ms
@@ -99,10 +103,21 @@ export class ItemPeek {
         if (it.not_before && Date.parse(it.not_before) > Date.now()) { this.dueAt(it.not_before); continue }
         const version = known.get(it.id)
         if (version === undefined || it.version > version) {
-          if (this.previous.get(it.id) !== it.version && this.seen.get(it.id) !== it.version) {
-            await this.route(it, version !== undefined)
-            if (g !== this.generation) return
-            this.routed = true
+          const failure = this.failures.get(it.id)
+          if (failure && failure.at > Date.now()) this.wake(failure.at)
+          else if ((failure || this.previous.get(it.id) !== it.version) && this.seen.get(it.id) !== it.version) {
+            try {
+              await this.route(it, version !== undefined)
+              this.failures.delete(it.id)
+              if (g !== this.generation) return
+              this.routed = true
+            } catch (error) {
+              const delay = Math.min(30_000, (failure?.delay ?? 500) * 2)
+              const at = Date.now() + delay
+              this.failures.set(it.id, { at, delay })
+              this.wake(at)
+              this.mode.log('onsen take: routing ' + it.id + ' failed: ' + error)
+            }
           }
         }
         if (g !== this.generation) return
@@ -112,6 +127,7 @@ export class ItemPeek {
       if (g !== this.generation) return
       this.page = r.json.next_cursor || undefined
       if (!this.page) {
+        if (!this.changedAfter) for (const id of this.failures.keys()) if (!this.seen.has(id)) this.failures.delete(id)
         this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined
         this.previous = this.seen; this.seen = new Map()
         if (r.json.items.length) delay = this.routed ? 100 : 1000

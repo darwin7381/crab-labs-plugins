@@ -126,6 +126,26 @@ test('peek waits without claiming and reads a gated row again on release', async
   expect(r.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
 })
 
+test('a routing failure retries its waiting row after the cursor advances without blocking the page', async () => {
+  const r = rig(), routed: string[] = [], held = new Map<string, number>()
+  for (const id of ['one', 'two', 'three']) r.f.add(id)
+  await r.mode.probe()
+  const peek = new ItemPeek(r.mode, () => held, async row => {
+    routed.push(row.id)
+    if (row.id === 'two' && routed.filter(id => id === 'two').length < 3) throw Error('delivery failed')
+    held.set(row.id, row.version)
+  }, () => true)
+  clean.push(() => peek.stop())
+  await peek.poll()
+  expect(routed).toEqual(['one', 'two', 'three'])
+  r.f.advance(10_000)
+  r.f.add('four')
+  await until(() => held.has('four'))
+  await until(() => held.has('two'), 5500)
+  expect(routed).toEqual(['one', 'two', 'three', 'four', 'two', 'two'])
+  expect(r.f.calls.some(c => c.query.has('changed_after'))).toBe(true)
+}, 7000)
+
 test('an unchanged row in the overlap produces about one peek per second over ten seconds', async () => {
   const r = rig()
   r.f.add('overlap')
