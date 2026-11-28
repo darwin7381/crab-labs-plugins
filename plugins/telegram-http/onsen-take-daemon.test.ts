@@ -91,15 +91,22 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
 
 for (const cfg of [{ GENESIS_LANES: '0' }, { ONSEN_RECORD: '0' }, { CHANNEL_INBOX_ONLY: '1' }]) {
   test('daemon does not receive Items with ' + JSON.stringify(cfg), async () => {
-    const d = await daemon(cfg)
+    const d = await daemon({ ...cfg, ONSEN_OWNER: 'test-ops' })
     await Bun.sleep(100)
     expect(d.f.calls.filter(c => c.path.endsWith('/items') || c.path === '/inbox')).toHaveLength(0)
+    const reason = cfg.CHANNEL_INBOX_ONLY ? 'inbox_only' : cfg.ONSEN_RECORD ? 'recording_off' : 'lanes_off'
+    const health = await (await fetch(d.base + '/healthz')).json()
+    expect(health.take).toEqual({ state: 'off', active: false, reason })
+    const alerts = d.f.calls.filter(c => c.path === '/v1/messages' && c.body.sender === 'system:alert')
+    if (cfg.CHANNEL_INBOX_ONLY) expect(alerts).toHaveLength(0)
+    else expect(alerts.map(c => c.body)).toEqual([expect.objectContaining({ to: 'test-ops', body: expect.stringContaining(reason) })])
   })
 }
 
 test('take starts by default and owns the observation; the old hand-over routes and local stores are gone', async () => {
   const d = await daemon({ ONSEN_OBSERVATION: '' })
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
+  expect((await (await fetch(d.base + '/healthz')).json()).take).toEqual({ state: 'take', active: true, reason: null })
   for (const route of ['/onsen/person', '/onsen/action']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
   const old = await fetch(d.base + '/lanes/route', { method: 'POST', headers: { authorization: 'Bearer test-loopback' },
     body: JSON.stringify({ source: 'mesh', from: 'eve', text: 'old hand-over' }) })
@@ -578,7 +585,7 @@ for (const [reason, outcome, code] of [
 })
 
 for (const code of [404, 409, 0]) test('daemon waits for the Item endpoint after probe ' + (code || 'network error'), async () => {
-  const cfg: Record<string, string> = {}
+  const cfg: Record<string, string> = { ONSEN_OWNER: 'test-ops' }
   if (!code) cfg.ONSEN_BASE = 'http://127.0.0.1:' + await freePort()
   const d = await daemon(cfg, code || 200)
   await waitFor(() => d.log().includes('retry in 60s'))
@@ -586,6 +593,13 @@ for (const code of [404, 409, 0]) test('daemon waits for the Item endpoint after
   expect(d.f.calls.filter(c => c.query.has('wait') || c.path.endsWith('/take'))).toHaveLength(0)
   expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(code ? 1 : 0)
   expect(d.f.calls.some(c => c.path.startsWith('/inbox'))).toBe(false)
+  if (code === 409) {
+    expect((await (await fetch(d.base + '/healthz')).json()).take).toEqual({ state: 'pull-refused', active: false, reason: 'not_take_member' })
+    await waitFor(() => d.f.calls.some(c => c.body.sender === 'system:alert'))
+    expect(d.f.calls.filter(c => c.body.sender === 'system:alert').map(c => c.body)).toEqual([
+      expect.objectContaining({ to: 'test-ops', body: expect.stringContaining('mac-mini/adam') }),
+    ])
+  }
 })
 
 test('the mail lane takes its two coalesced events together and completes both', async () => {

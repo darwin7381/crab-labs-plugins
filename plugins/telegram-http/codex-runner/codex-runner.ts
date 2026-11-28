@@ -6,10 +6,11 @@ import { promisify } from 'node:util'
 import { homedir, hostname } from 'node:os'
 import { basename, dirname, extname, join, relative } from 'node:path'
 import { Claims } from '../onsen-claims.ts'
-import { OnsenClient, refusedForGood } from '../onsen-client.ts'
+import { memberOfTg, OnsenClient, recordFor, refusedForGood } from '../onsen-client.ts'
+import { opsRecipients } from '../ops-recipients.ts'
 import { ItemPeek, itemRef, type InboxItem } from '../onsen-items.ts'
 import { ItemReceiver } from '../onsen-receive.ts'
-import { TakeMode, machineName } from '../onsen-take.ts'
+import { TakeMode, machineName, takeAlert, takeOff } from '../onsen-take.ts'
 import { ObservationPut } from '../onsen-observation.ts'
 import type { Observation } from '../screen-status.ts'
 
@@ -24,6 +25,7 @@ const SAY_MAX = 100_000               // an answer recorded in Joey's conversati
 
 export type Cfg = {
   agent: string; base: string; credentialFile: string; host: string; root: string; stateDir: string; logFile: string
+  record: boolean; owner: string | null; healthPort: number
   codexBin: string; sandbox: string; max: number; timeoutMs: number; killGraceMs: number; waitS: number
   maxFiles: number; maxFileBytes: number; retryMs: number; adoptPollMs: number
   /** Codex's own home (CODEX_HOME for the child) and the HOME it runs with; null: the inherited ones (CODEX_RUNNER_CODEX_HOME=inherit) */
@@ -66,12 +68,21 @@ export function devAsk(text: string): { repo: string; branch: string | null } | 
 const num = (v: string | undefined, d: number): number => { const n = Number(v); return v != null && v.trim() !== '' && Number.isFinite(n) && n > 0 ? n : d }
 /** the reasoning efforts the Codex CLI lists (models_cache.json, CLI 0.169.0: low, medium, high, xhigh, max, ultra; minimal older); null: not set or unknown */
 export const effortOf = (v: string | undefined): string | null => /^(minimal|low|medium|high|xhigh|max|ultra)$/.test((v ?? '').trim()) ? v!.trim() : null
+function opsOwner(env: NodeJS.ProcessEnv, home: string): string | null {
+  if (env.ONSEN_OWNER?.trim()) return env.ONSEN_OWNER.trim()
+  try {
+    const state = env.TELEGRAM_STATE_DIR ?? join(home, '.claude', 'channels', 'telegram')
+    const access = JSON.parse(readFileSync(join(state, 'access.json'), 'utf8'))
+    return opsRecipients(access).map(memberOfTg).find(name => !!name) ?? null
+  } catch { return null }
+}
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Cfg {
   const home = env.HOME || homedir()
   const root = (env.CODEX_RUNNER_ROOT || join(home, 'onsen-codex')).replace(/\/+$/, '')
   const stateDir = env.CODEX_RUNNER_STATE_DIR || join(root, '.runner')
+  const agent = (env.CODEX_RUNNER_AGENT || 'codex').trim()
   return {
-    agent: (env.CODEX_RUNNER_AGENT || 'codex').trim(),
+    agent, record: recordFor(env, agent), owner: opsOwner(env, home), healthPort: Number(env.CODEX_RUNNER_HEALTH_PORT || 0),
     base: ((env.ONSEN_BASE ?? '').trim() || 'https://core.kbro.ai/api/onsen').replace(/\/+$/, ''),
     credentialFile: env.CODEX_RUNNER_CREDENTIAL_FILE || join(home, '.config/mesh/codex.credential'),
     host: (env.ONSEN_HOST || '').trim() || hostname().replace(/\.local$/, ''),
@@ -368,6 +379,7 @@ export class CodexRunner {
   private procs = new Map<string, ChildProcess | null>()
   private timers = new Set<ReturnType<typeof setTimeout>>()
   private reporting = new Set<string>()
+  private healthServer?: ReturnType<typeof Bun.serve>
   private stopped = false
   readonly stats = { taken: 0, ignored: 0, runs: 0, completed: 0, failed: 0, reports_retried: 0, last_error: null as string | null }
 
@@ -386,6 +398,7 @@ export class CodexRunner {
       this.changed()
       this.peek.reset()
     }, msg => this.log('info', msg), machineName(cfg.host))
+    this.mode.onUnavailable = reason => this.intakeAlert(reason)
     this.peek = new ItemPeek(this.mode, () => new Map(), it => this.pendingTake = this.take(it),
       () => !this.claims.blocked() && this.busy().length < cfg.max, cfg.waitS)
     this.receiver = new ItemReceiver(this.mode, this.claims, at => this.peek.dueAt(at))
@@ -395,6 +408,20 @@ export class CodexRunner {
   }
   private now(): number { return (this.cfg.now ?? Date.now)() }
   private iso(ms = this.now()): string { return new Date(ms).toISOString() }
+  private intakeAlert(reason: string): void {
+    takeAlert(this.mode.connector, reason, text => {
+      const owner = this.cfg.owner
+      if (!owner) {
+        this.stats.last_error = `Cannot send the ${reason} ops alert: set ONSEN_OWNER for ${this.cfg.agent}`
+        this.log('error', this.stats.last_error)
+        return
+      }
+      const message = { to: owner, sender: 'system:alert', kind: 'text', body: text, sent_at: this.iso(), idem_key: 'codex:take-alert:' + crypto.randomUUID() }
+      void this.onsen.req('POST', '/v1/messages', message).then(r => {
+        if (!r || r.status < 200 || r.status >= 300) throw new Error(r ? 'HTTP ' + r.status : 'no credential')
+      }).catch(e => { this.stats.last_error = 'ops alert to ' + owner + ' failed: ' + e; this.log('error', this.stats.last_error) })
+    })
+  }
   log(level: 'info' | 'warn' | 'error', msg: string): void {
     if (this.cfg.log) { this.cfg.log(level, msg); return }
     const line = `${this.iso()} ${level} ${msg}`
@@ -430,6 +457,9 @@ export class CodexRunner {
       throw new Error('Drain unfinished jobs with the previous codex-runner before switching this member to take.')
     }
     mkdirSync(this.cfg.root, { recursive: true, mode: 0o700 })
+    this.healthServer = Bun.serve({ hostname: '127.0.0.1', port: this.cfg.healthPort, fetch: req =>
+      req.method === 'GET' && new URL(req.url).pathname === '/healthz' ? Response.json(this.health()) : new Response(null, { status: 404 }) })
+    writeFileSync(join(this.cfg.stateDir, 'health-port'), String(this.healthServer.port), { mode: 0o600 })
     this.state.idle_since ??= this.iso()
     this.log('info', `codex-runner up: ${this.cfg.agent} on ${this.cfg.host}, Onsen ${this.cfg.base}, at most ${this.cfg.max} at once, timeout ${this.cfg.timeoutMs / 1000} s, folders under ${this.cfg.root}`)
     if (!this.onsen.token()) this.log('warn', `no mesh credential in ${this.cfg.credentialFile}: nothing is taken until it is there (read again on every request)`)
@@ -440,6 +470,11 @@ export class CodexRunner {
     this.claims.start()
     this.recover()
     if (this.claims.held().length) this.changed()
+    if (!this.cfg.record) {
+      this.log('warn', 'onsen take: recording_off')
+      this.intakeAlert('recording_off')
+      return
+    }
     await this.mode.probe()
     this.later(1_000, () => void this.declareWork(0))
   }
@@ -458,6 +493,10 @@ export class CodexRunner {
   async stop(o: { offline?: boolean } = {}): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    if (this.healthServer) {
+      await this.healthServer.stop(true)
+      rmSync(join(this.cfg.stateDir, 'health-port'), { force: true })
+    }
     this.obs.stop()
     for (const t of this.timers) clearTimeout(t)
     this.timers.clear()
@@ -1044,7 +1083,9 @@ export class CodexRunner {
       last_activity_at: s.last_activity_at, reported_at: reported, evidence: { source: 'runtime', confidence: null } } as Observation
   }
   health(): Record<string, unknown> {
-    return { ...this.stats, busy: this.busy().map(j => j.id), queued: this.state.jobs.filter(j => j.state === 'queued').length, take: { active: this.mode.active, held: this.claims.held() }, observation: this.obs.health() }
+    const take = this.cfg.record ? this.mode.health() : takeOff('recording_off')
+    return { ...this.stats, busy: this.busy().map(j => j.id), queued: this.state.jobs.filter(j => j.state === 'queued').length,
+      take: { ...take, held: this.claims.held() }, observation: this.obs.health() }
   }
 }
 

@@ -729,13 +729,20 @@ describe('restart', () => {
   })
 })
 
-test('a pull-mode Codex member logs its refusal and takes no work', async () => {
-  const { cfg, onsen, log } = setup()
+for (const recording of [true, false]) test('a Codex intake outage alerts the owner and is visible over /healthz, recording=' + recording, async () => {
+  const { cfg, onsen, log } = setup({ record: recording, owner: 'test-ops' })
   onsen.items.mode(409)
   onsen.items.add('unclaimed')
-  await runner(cfg).start()
-  expect(log.some(line => line.includes('not_take_member') && line.includes('retry'))).toBe(true)
-  expect(onsen.paths).toEqual(['/v1/members/codex/items'])
+  const r = runner(cfg)
+  await r.start()
+  const reason = recording ? 'not_take_member' : 'recording_off'
+  await until(() => onsen.records.length > 0)
+  expect(log.some(line => line.includes(reason))).toBe(true)
+  const port = readFileSync(join(cfg.stateDir, 'health-port'), 'utf8')
+  const health = await (await fetch('http://127.0.0.1:' + port + '/healthz')).json()
+  expect(health.take).toEqual({ state: recording ? 'pull-refused' : 'off', active: false, reason, held: [] })
+  expect(onsen.records).toEqual([expect.objectContaining({ to: 'test-ops', sender: 'system:alert', body: expect.stringContaining(reason) })])
+  expect(onsen.paths.filter(p => p.endsWith('/items'))).toHaveLength(recording ? 1 : 0)
   expect(onsen.items.rows.get('unclaimed')!.state).toBe('waiting')
 })
 
@@ -909,5 +916,13 @@ describe('the folder', () => {
       root: '/h/onsen-codex', stateDir: '/h/onsen-codex/.runner', max: 3, timeoutMs: 1_800_000, killGraceMs: 10_000, sandbox: 'workspace-write', codexBin: 'codex' })
     const d = configFromEnv({ HOME: '/h', CODEX_RUNNER_MAX: '2', CODEX_RUNNER_TIMEOUT_S: '60', ONSEN_BASE: 'http://x/api/onsen/', CODEX_RUNNER_CREDENTIAL_FILE: '/c' })
     expect(d).toMatchObject({ max: 2, timeoutMs: 60_000, base: 'http://x/api/onsen', credentialFile: '/c' })
+  })
+
+  test('ops alerts use the configured owner or a mapped, allowlisted ops recipient', () => {
+    const { dir } = setup()
+    writeFileSync(join(dir, 'access.json'), JSON.stringify({ allowFrom: ['1828173984', '6736970916'], alertTo: ['6736970916'] }))
+    const env = { HOME: dir, TELEGRAM_STATE_DIR: dir }
+    expect(configFromEnv(env).owner).toBe('joey-test')
+    expect(configFromEnv({ ...env, ONSEN_OWNER: 'test-ops' }).owner).toBe('test-ops')
   })
 })

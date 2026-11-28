@@ -58,7 +58,7 @@ import {
   handleModelCallbackForCurrentTarget,
   roamerCurrentTranscript,
 } from './roamer-control.ts'
-import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
+import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs } from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
@@ -66,7 +66,7 @@ import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudg
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
-import { machineName, TakeMode } from './onsen-take.ts'
+import { machineName, takeAlert, takeOff, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards } from './onsen-mentions.ts'
 import { JevJudge, QUESTIONS_PATH_DEFAULT } from './screen-judge-jev.ts'
@@ -349,8 +349,10 @@ let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
 let itemClaims: Claims | undefined
 let registryStatusChanged: (() => void) | undefined
+const takeOffReason = INBOX_ONLY ? 'inbox_only' : ROAMER ? 'roamer'
+  : [!Lanes.LANES_ON && 'lanes_off', !onsen?.cfg.record && 'recording_off'].filter(Boolean).join(', ')
 if (CONNECTOR && onsen) {
-  if (!Lanes.LANES_ON || !onsen.cfg.record) {
+  if (takeOffReason) {
     log('warn', 'onsen take: receiving requires lanes and recording')
   } else {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
@@ -3684,7 +3686,11 @@ function liveSetting(k: LiveKey): string | undefined {
   }
   return liveFile.v[k]
 }
-void takeMode?.probe()
+if (CONNECTOR) {
+  const unavailable = (reason: string) => takeAlert(machineName() + '/' + ONSEN_AGENT, reason, text => { void ownerSay('system:alert', text) })
+  if (takeMode) { takeMode.onUnavailable = unavailable; void takeMode.probe() }
+  else unavailable(takeOffReason)
+}
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
@@ -4183,6 +4189,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         uptime_s: Math.floor(process.uptime()),
         mem_rss_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
         active_sessions: activeServers.size,
+        take: takeMode?.health() ?? takeOff(takeOffReason),
         sessions_with_open_sse: [...sseOpen.values()].filter(Boolean).length,  // issue #3: live vs zombie
         ...(Lanes.LANES_ON && !INBOX_ONLY ? { mailbox_decide_listed: decideListed } : {}),   // WO-126: the main listed mailbox_decide (when, which session)
         // Onsen (WO-139): recording on, bytes waiting in the spool, last sync; step 3 (WO-143): deliveries_recorded, status_recorded, the status now

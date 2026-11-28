@@ -70,12 +70,21 @@ test('a pull member retries only the Item probe and starts when Onsen accepts th
     return setTimeout(() => {}, ms).unref()
   })
   clean.push(() => mode.stop())
+  const alerts: string[] = []
+  mode.onUnavailable = reason => alerts.push(reason)
   r.f.mode(409); await mode.probe()
   expect(mode.active).toBe(false)
+  expect(mode.health()).toEqual({ state: 'pull-refused', active: false, reason: 'not_take_member' })
+  mode.pause('not_take_member', 60_000)
+  await mode.probe()
+  expect(alerts).toEqual(['not_take_member'])
   expect(interval).toBe(60_000)
   expect(r.logs.some(l => l.includes('not_take_member'))).toBe(true)
   r.f.mode(200); retry(); await until(() => mode.active)
-  expect(r.f.calls.map(c => [c.path, c.query.get('connector')])).toEqual(Array(2).fill([mode.path, 'mac-mini/adam']))
+  expect(mode.health()).toEqual({ state: 'take', active: true, reason: null })
+  mode.pause('not_take_member', 60_000)
+  expect(alerts).toEqual(['not_take_member', 'not_take_member'])
+  expect(r.f.calls.map(c => [c.path, c.query.get('connector')])).toEqual(Array(3).fill([mode.path, 'mac-mini/adam']))
 })
 
 test('peek waits without claiming and reads a gated row again on release', async () => {
