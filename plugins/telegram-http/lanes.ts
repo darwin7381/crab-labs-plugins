@@ -851,7 +851,7 @@ type Incident = { lane: string; thread: string; event: string; alerts: string[];
  *  WO-132 (item 2): `merged` = an alert of the run's incident handed to it the same way (not Joey's message: it rides in the run's `extra`) */
 type SteerRec = { ev: InEvent; sent: number; run: string; merged?: boolean }
 /** 002k (H14): a peer's admission state: a token bucket of new threads, the tokens its lane runs spent lately, and the flood episode in progress */
-type PeerFlood = { bucket: number; bucket_at: number; usage: Array<[number, number]>; admits?: number[]
+type PeerFlood = { bucket: number; bucket_at: number; usage: Array<[number, number]>; admits?: number[]; counted?: Record<string, string>
   episode?: { start: string; last_at: number; count: number; first: string; last: string; samples: string[]; answered: number; reasons: Record<string, number>; replied_at: number } }
 type PeerHold = { peer: string; since: string; until: number | null; reason: string; by: string; count: number; first?: string; last?: string; samples: string[] }
 let S: State
@@ -2013,7 +2013,13 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
     if (asked) triageRecord(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier }, asked)
     else void triageShadow(LANES_DIR, tev, { rule: d.rule, target: d.target, cls, base_tier })
   }
-  if (D.role === 'tg' && S) { noteAdmitted(ev, d); noteInbound(ev, d) }
+  if (D.role === 'tg' && S) {
+    const counted = S.flood?.[ev.from.toLowerCase()]?.counted
+    if (counted && (d.target === 'lane' || d.target === 'main')) {
+      for (const ref of ev.onsen_items ?? []) delete counted['item:' + ref.onsen_item_id]
+    }
+    noteAdmitted(ev, d); noteInbound(ev, d)
+  }
   toMain(ev, d)
   recordRoute(ev, d)
   return d
@@ -2991,6 +2997,10 @@ function peerGate(ev: InEvent): { rule: string; note: string; episode: string; h
   S.flood ??= {}
   const perMin = num('LANES_PEER_NEW_PER_MIN', 5), maxOpen = num('LANES_PEER_MAX_OPEN', 8)
   const f = (S.flood[peer] ??= { bucket: perMin, bucket_at: now, usage: [] })
+  // A full peek replays waiting Items. Charge each to its original episode just once.
+  const item = ev.onsen_items?.[0], key = item && 'item:' + item.onsen_item_id
+  const episode = key && f.counted?.[key]
+  if (episode) return f.episode?.first === episode ? { rule: 'peer-flood', note: 'already counted in this episode', episode } : null
   if (f.usage?.length) f.usage = []                                   // 002l (D1): the old per-peer token tally is not used any more
   f.bucket = Math.min(perMin, f.bucket + ((now - f.bucket_at) / 60_000) * perMin); f.bucket_at = now
   const open = [...queue.values()].filter(i => i.state !== 'done' && i.ev.source === 'mesh' && String(i.ev.from).toLowerCase() === peer).length
@@ -3012,6 +3022,7 @@ function peerGate(ev: InEvent): { rule: string; note: string; episode: string; h
     logos('lane.peer_flood', { peer, phase: 'start', reason, open })
     void pushJoey(undefined, text, false).then(id => logos('lane.notify', { escalated: true, tier: 'push', tier_rule: 'peer-flood', message_id: id }))
   }
+  if (key) (f.counted ??= {})[key] = e.first
   e.count++; e.last = ev.id; e.last_at = now; e.reasons[reason] = (e.reasons[reason] ?? 0) + 1; sampleOf(e.samples, ev)
   if (now - e.replied_at >= num('LANES_FLOOD_REPLY_WINDOW_S', 60) * 1000) {
     e.replied_at = now
