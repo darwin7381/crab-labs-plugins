@@ -38,7 +38,7 @@ test('Registry.backgroundAgents: background sub-agent transcripts written in the
   }
   const reg = new Registry({ dir: join(dir, 'sessions'), workspace: dir, transcripts: () => dir, connected: () => true, changed: () => {}, log: () => {} } as any)
   expect(reg.backgroundAgents(sid)).toBe(3)                              // a1, a2, a5 (no meta)
-  expect(reg.backgroundAgents('99999999-0000-0000-0000-000000000000')).toBeNull()
+  expect(reg.backgroundAgents('99999999-0000-0000-0000-000000000000')).toBe(0)
 })
 
 test('status-latency-lab 6: within 3 s of the final Stop a busy file is not stale yet: idle, no background_agents claimed', () => {

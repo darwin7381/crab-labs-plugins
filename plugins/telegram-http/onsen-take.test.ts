@@ -11,7 +11,7 @@ import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { createMain, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
-import { REGISTRY_SETTLE_MS } from './onsen-status.ts'
+import { Registry, REGISTRY_SETTLE_MS } from './onsen-status.ts'
 
 const clean: Array<() => void> = []
 afterEach(() => { while (clean.length) clean.pop()!() })
@@ -214,6 +214,18 @@ test('idle main takes before offer, binds, completes only after final Stop and i
   await r.sync()
   expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
   expect(row.response_message_ids).toEqual(['message-91']); expect(r.claims.held()).toEqual([])
+})
+
+test('a main session with no subagents directory completes at its settled Stop', async () => {
+  const r = await mainRig()
+  const registry = new Registry({ dir: r.dir, workspace: r.dir, transcripts: () => r.dir, connected: () => true, log: () => {} })
+  const row = r.f.add('without-subagents')
+  await r.bind(row)
+  await r.hook('Stop', { phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS)
+  r.claims.statusRecord('idle', sid => registry.backgroundAgents(sid), REGISTRY_SETTLE_MS)
+  await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
 })
 
 test('while busy mail waits, a person binds inside PostToolUse, pre-switch work finishes without an item report', async () => {
