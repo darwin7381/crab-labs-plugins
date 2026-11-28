@@ -4995,6 +4995,10 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
+  if (row.kind === 'resume') {
+    Lanes.routeResume(item, String(payload.text ?? ''))
+    return
+  }
   if (row.kind === 'message' || row.message_id) {
     if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })

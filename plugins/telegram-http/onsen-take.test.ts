@@ -35,13 +35,14 @@ function rig() {
   return { f, client, mode, claims, file, receiver, dir, logs, misses, deadlines, outcomes, sync: () => client.syncNow(true),
     attach(m: MainApi) { main = m } }
 }
-async function mainRig() {
+async function mainRig(backoff = 300_000) {
   const r = rig()
   await r.mode.probe()
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
   const sid = crypto.randomUUID(), pid = 1051
   let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
   const m = createMain({ journal, agent: 'adam', itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return true },
+    wallBackoff: () => backoff, registry: { mainForAdoption: () => null, backgroundAgents: () => bg },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: () => true, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {}, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
     mainOwed: ids => owes ? ids.map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })) : [], usageWall: () => wall })
@@ -61,6 +62,66 @@ async function mainRig() {
   return { ...r, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
     owing(value: boolean) { owes = value } }
 }
+
+test('C4 a bare model error writes one resume; the normal peek takes it when due, with the WO-209 sentence', async () => {
+  const r = await mainRig(250)
+  await r.hook('UserPromptSubmit')
+  const earliest = Date.now() + 250
+  await r.hook('StopFailure', { error: 'overloaded' })
+  const latest = Date.now() + 250
+  await until(() => r.f.rows.size === 1)
+  const row = [...r.f.rows.values()][0]!
+  const writes = () => r.f.calls.filter(c => c.path === r.mode.path && c.body.kind === 'resume')
+  expect(writes()).toHaveLength(1)
+  expect(writes()[0]!.key).toBeTruthy()
+  expect(row).toMatchObject({ kind: 'resume', session_id: 'main', state: 'waiting' })
+  const due = Date.parse(row.not_before!)
+  expect(due).toBeGreaterThanOrEqual(earliest)
+  expect(due).toBeLessThanOrEqual(latest)
+  const hhmm = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Taipei' }).format(due - 250)
+  const sentence = `上一回合 ${hhmm}（台北）被打斷（模型回應錯誤 overloaded），接著做沒做完的；沒有要接的就直接結束這一回合。`
+  expect(row.payload.text).toBe(sentence)
+  const peek = new ItemPeek(r.mode, () => new Map(), async it => r.m.routeResume(itemRef(it), it.payload.text), () => true)
+  clean.push(() => peek.stop())
+  await peek.poll()
+  await r.m.pump()
+  expect(r.offers).toHaveLength(0)
+  expect(r.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
+  r.f.advance(due - r.f.now())
+  await until(() => r.offers.length === 1)
+  const { content, meta } = r.offers[0].params
+  expect(content).toBe(sentence)
+  expect(meta).toMatchObject({ chat_id: 'lanes', user: 'lanes', via: 'lanes', no_reply: 'true' })
+  expect(row.state).toBe('claimed')
+  await r.hook('UserPromptSubmit', { prompt_id: 'resume', dids: [meta.did] })
+  await r.hook('Stop', { prompt_id: 'resume', phase: 'final' })
+  r.f.advance(3100); r.status('idle'); await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
+  await r.m.tick()
+  expect([writes().length, r.offers.length]).toEqual([1, 1])
+  expect(r.m.currentGen()?.resume_sent).toBeUndefined()
+})
+
+test('C4 a process cut records the old background count; an item failure and an asked restart create no resume', async () => {
+  const d = await mainRig()
+  d.status('busy', 2)
+  await d.hook('UserPromptSubmit')
+  await d.hook('SessionEnd')
+  await until(() => d.f.rows.size === 1)
+  const row = [...d.f.rows.values()][0]!
+  expect(row.payload.text).toContain('（對話結束），接著做沒做完的；沒有要接的就直接結束這一回合。當時有 2 個背景工作在跑，重開後已經不在。')
+  expect(row.not_before).toBeNull()
+
+  const other = await mainRig()
+  const message = other.f.add('work')
+  await other.bind(message)
+  await other.hook('StopFailure', { error: 'server_error' }); await other.sync()
+  await other.hook('UserPromptSubmit', { prompt_id: 'typing' })
+  other.m.markEnd('asked')
+  await other.hook('SessionEnd')
+  expect(other.outcomes('work')).toContain('error')
+  expect([...other.f.rows.keys()]).toEqual(['work'])
+})
 
 test('switch, prerequisites, stable machine/member and all probe refusals', async () => {
   const r = rig()
