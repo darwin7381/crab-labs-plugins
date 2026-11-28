@@ -1,6 +1,6 @@
 # WO-213 C6 · 漫遊者接上成員連接器
 
-分支 `wo213-c6`，基底 `ef79d7a`。依據為共用 brief、`TICKET-connector-facts.md` §2–5、`ANCHOR.md` 第 4 點①、`roamer-facts.md`、設計 v3 與 C1 驗收記錄。開工時 `CONTRACT.md` 的 MD5 為 `74677ba677142a0feef8551eb96a5713`，§4b 到已定 56。下列程式行號相對於基底的 `plugins/telegram-http/`。
+分支 `wo213-c6` 已依審查要求 rebase 到 C1 修正版 `1160d2a`。依據為共用 brief、`TICKET-connector-facts.md` §2–5、`ANCHOR.md` 第 4 點①、`roamer-facts.md`、設計 v3 與 C1 驗收記錄。開工時 `CONTRACT.md` 的 MD5 為 `74677ba677142a0feef8551eb96a5713`，§4b 到已定 56。原規格的程式行號相對於 `ef79d7a` 的 `plugins/telegram-http/`。
 
 ## Epeius 的註冊清單
 
@@ -25,7 +25,7 @@ Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照
 
 - `roamer-control.ts:103` 的 `current_target.session_id` 是 Claude session UUID。`:373` 解出的是可用來送通知的 MCP transport session ID。接收前確認目前選取的 target、其存活的 Claude 行程以及對應的開啟中 stream。換 target 時後續交入重新取目標。曾經連過的其他 session 不得收到。
 - 在 `server.ts:3507`、`:3873`、`:4965` 的收件路徑接入共同 receiver。先 peek，一到該 target 可收的時刻才 take。離線、無 target 或連線未明時，普通列保持 waiting。連接器仍須能處理選擇第一個 target 的 `/roam` 控制件。照已定 14，`POST …/items/take` 只帶 connector、item_ids、wait 和 limit。target 真正收下時才回報其 Claude session UUID。
-- 對非艦隊 session，用確切 target 的回合證據判斷收下與結束。證據來源已有 `roamerCurrentTranscript`（`roamer-control.ts:1435`）及 `TurnWatch`（`onsen-status.ts:745`）。成功寫入 SSE 只代表送到通道。20 秒未收下沿用 `not_taken`，回覆只計 Onsen 收下的 ID。續約列出仍持有的 Item ID。已領的綁回原本那段，target 行程死亡回報 `cut`；回線先補 spool。等待與恢復的通知屬 S4。
+- 對非艦隊 session，用確切 target 的回合證據判斷收下與結束。證據來源已有 `roamerCurrentTranscript`（`roamer-control.ts:1435`）及 `TurnWatch`（`onsen-status.ts:745`）。成功寫入 SSE 只代表送到通道。20 秒未收下回報 `not_taken`。帳本保留列 ID、接收 UUID 與當時的 registry 狀態和回合。重新 peek 或重啟後，同一段要等狀態或回合改變才再領。另一段可立即領。續約列出仍持有的 Item ID。若 target 死亡或同一 PID 換了 UUID，先讀完原 transcript。已有 final Stop 的列回報 `completed` 並帶已送達的回覆 ID。其餘列回報 `cut`，收到後已有模型輸出或回覆時帶 `half_done: true`。等待與恢復的通知屬 S4。
 - `server.ts:564`、`:581`、`:1824`、`:3234` 共用既有指令登錄、選單 Action 和回派。`roamer-control.ts:1442` 的 17 個名稱為 `roam`、`roam_status`、`resume_list`、`resume`、`resume_previous`、`restart`、`kill_stuck`、`clear`、`agents`、`mcp`、`help`、`init`、`compact`、`model`、`effort`、`codexgate`、`sigint`。`/help` 亦是橋接內建指令。按鈕只有一件 `source:"menu"` 的 Action，`roam:`、`resume:`、`model:`、`effort:` 經 `kind:control` 使用原有 handler。WO-215 的兩個 /resume 呼叫點由 `95b51e7` 提供。
 
 ## 退休範圍與依賴
@@ -36,7 +36,7 @@ Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照
 
 - 用本機 stand-in 核對未點名、初次 409、404、斷線、200 與之後切換。觀察 bot 呼叫數、成員名、指令表、spool、observation 和 owner。橋接使用全機 `*` 時，混合已切換與未切換的兩支，逐支核對唯一輪詢者。
 - 用兩條不同的 MCP stream 和兩份 transcript。依序選 A、傳第一則、確認進入回合與回覆 ID，再選 B、傳第二則。包含同一工作目錄的兩段、take 請求中途換 target、已領後行程死亡、斷線再接回、無 target 下的 `/roam`、重複按同一選項。逐項核對目的地、狀態轉移及次數。舊成員用 WO-197 的現有相容測試比對。
-- §5 的 txmonster 台架由驗收人用 lab 成員與 lab bot 操作。在 A 收到第一則並完成、換到 B 後第二則只到 B；殺掉仍持有一列的 target，該列回到 `waiting/cut`，Joey 測試號只收到一則等待通知。現場驗收須能區分寄件時已填 `main` 和原本為 null 的兩種列。
+- §5 的 txmonster 台架由驗收人用 lab 成員與 lab bot 操作。在 A 收到第一則並完成、換到 B 後第二則只到 B；在 final Stop 之前殺掉仍持有一列的 target，該列回到 `waiting/cut`，Joey 測試號只收到一則等待通知。現場驗收須能區分寄件時已填 `main` 和原本為 null 的兩種列。
 
 ## 已定的收件身分
 
@@ -54,7 +54,15 @@ Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照
 
 ## 實作與驗收對照
 
-- 首次切換由 tg daemon 的 C1 probe 決定。收到 200 後，把已交給哪個 connector 記在既有 claims 帳本，排完本機 poll 和更新處理，再在 `/healthz` 宣告 connector。切換過的 daemon 重啟時，以帳本維持橋接所有權，等 Onsen 回線；首次探測失敗的成員仍走本機路徑。
+- 首次切換由 tg daemon 的 C1 probe 決定。首次收到 200 後，先檢查舊 spool 是否有未送出的資料。有資料時保留原檔與 cursor，維持本機輪詢，讓負責人查核。交接時先將待確認的 polling offset 存進帳本，排完本機更新處理並確認最後一筆 offset。收到確認後才登記 connector 並在 `/healthz` 宣告 connector。切換過的 daemon 重啟時，以帳本維持橋接所有權，等 Onsen 回線；首次探測失敗的成員仍走本機路徑。
 - `roamer-items.ts` 使用與主線相同的 receiver、報告與帳本。只接到由 takeover 認領或可用 PID 證明的開啟中 stream；take 返回後再核對一次。送出時把該次 claim ID 放入本機通知，讀取確切 UUID 的 transcript 時才登記 `in_session`。已切離的 target 仍有自己的回合與登錄檔，直到原列結束。台架覆蓋 transcript Stop，以及同一回合確實觀察到的 busy → idle。
 - 主線與當前 target 的狀態觀測都以實際 UUID 呼叫 `Claims.statusRecord`。升級時若舊主線帳本已有 `registry_session`，同一 UUID 也用於重送 spool 中尚未送出的 `in_session`。測試分別檢查預填 `main` 及原為 null 的 Item。
 - 選單台架透過 `/roam` 指令與一件 `source:menu` Action 選到已連線的測試 session。`roam:`、`resume:`、`model:` 和 `effort:` 四種選項均經 `kind:control` 回派；過期選項回報 `not_applied`。現場只有 S4 負責等待通知。
+
+## C6 審查後的驗收條件
+
+- `/clear`、`/resume <n>`、`/resume_previous` 在同一個 PID 內換段時，由 registry 的新 UUID 更新仍選取的 `current_target` 及本機認領紀錄。下一列交給同一個 stream 的新 UUID。主線已見 final Stop 而在 settle 期間離線或換段，也須結束原 claim。
+- 若本機輪詢最後的 offset 確認失敗，health 維持本機所有權。重啟後從帳本確認相同 offset，成功後才能交給 bridge。候選成員啟動時先等 C1 probe，單次上限 5 秒。運作中成功切換也啟動既有 registry CLI 比對。
+- Bridge 逐支辨認安裝單元與 state 設定的 roamer，對明確映射的目錄用 realpath 核對。只有該成員的 daemon 確認已交接、輪詢已停，bridge 才能首次接手。D9 適用已接手的 bridge。
+- 選單 callback 拋錯時，pull 沿用原本 Action 的 `applied`。take 的 Action 取消，控制列回報 `not_applied`。
+- 審查第 6 項與契約缺口 a–c 交 Chiron 裁定。目前忙碌 target 等 idle。若原 Item 的 session 由 Onsen 補入，cut 後沿用目前 target。final Stop 後行程消失依本次裁示回報 `completed`。
