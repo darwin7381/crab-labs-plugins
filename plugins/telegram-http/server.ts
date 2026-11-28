@@ -506,7 +506,8 @@ function commandMenuKind(datas: string[]): string {
   return 'other'
 }
 /** a command's choice asked in Onsen: the Action → the callback data of each option (1…n) and where the command was typed */
-type KeyboardAsk = { h: Onsen.ActionHandle; chat: string; datas: string[]; where?: Lanes.TopicAsk; ended: boolean }
+type CommandWhere = Lanes.TopicAsk & { destination?: string | null }
+type KeyboardAsk = { h: Onsen.ActionHandle; chat: string; datas: string[]; where?: CommandWhere; ended: boolean }
 const keyboardAsks = new Map<string, KeyboardAsk>()
 /** Chiron mesh 12916 point 3: a command's choice is good for 10 minutes (expires_at); Onsen marks it expired then and writes COMMAND_NOT_CHOSEN into its
  *  note (expiry_note, Onsen 0.36.0; not /clear's 5 s one) */
@@ -517,7 +518,7 @@ const COMMAND_NOT_CHOSEN = '沒選：沒有更動'
  *  message the daemon answers itself, so it is that message's response). No Action made (no owner, not a valid Action, Onsen refused it): the text as
  *  that message, with one line that the choice could not be offered (and the handler's own `/cmd <arg>` hint, when its text has one), so the person
  *  always gets the answer */
-async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: Lanes.TopicAsk): Promise<void> {
+async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: CommandWhere): Promise<void> {
   const ctx = Onsen.sendCtx()
   const sender = ctx?.sender && ctx.named !== false && !ctx.skip ? ctx.sender : 'system:control'
   const btns = (keyboard ?? []).flat().filter(b => b && b.callback_data)
@@ -539,7 +540,7 @@ function choiceNotOffered(text: string): string {
 }
 /** a command's choice as one Action; false: none made (Actions off, no owner, not a valid Action, or Onsen did not make it: the create's answer is
  *  awaited), the caller writes the answer as a message */
-async function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: Lanes.TopicAsk): Promise<boolean> {
+async function keyboardAsk(chat: string, text: string, btns: InlineButton[], where?: CommandWhere): Promise<boolean> {
   const acts = onsenActions
   if (!acts?.on) { log('warn', `connector: a command's choice in chat ${chat}: no Action (Actions off); the answer sent as a message`); return false }
   const assignees = askees([chat])
@@ -566,12 +567,15 @@ async function keyboardAsk(chat: string, text: string, btns: InlineButton[], whe
   return true
 }
 /** a press in Onsen on a command's choice: what the Telegram tap on that button does (runControlCallback), then applied */
-async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl, taken: boolean): Promise<boolean> {
+async function applyKeyboardControl(ka: KeyboardAsk, h: Onsen.ActionHandle, c: Onsen.ActionControl, taken: boolean, destination?: string | null): Promise<boolean> {
   const acts = onsenActions!
   const idx = /^\d{1,2}$/.test(c.option_id) ? Number(c.option_id) - 1 : -1
   if (ka.ended || idx < 0 || idx >= ka.datas.length) { acts.cancel(h, ka.ended ? '這個選項已經按過了' : `不認得的選項 ${c.option_id}`); return false }
   ka.ended = true
   const here = ka.where                                                       // answered where the command was typed
+  if (taken && here?.destination && (destination !== here.destination || !roamerItems?.selectedFor(here.destination))) {
+    acts.cancel(h, '原本的對話已切換'); return false
+  }
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(ka.chat, msg, opts?.keyboard, here)
   let ok = true
   try { await Onsen.withSender('system:control', () => runControlCallback(ka.datas[idx]!, String(process.env.TELEGRAM_HTTP_PORT ?? HTTP_PORT), reply, taken ? () => { ok = false } : undefined)) }
@@ -604,7 +608,7 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
   const t = ROAMER ? text.trim().replace(/^(\/[\w-]+)@\w+(?=\s|$)/, '$1') : text.trim()
   if (!/^\/[A-Za-z]/.test(t)) return false
   const cmd = t.split(/\s+/)[0]!.toLowerCase().replace(/@\S+$/, '')
-  const here: Lanes.TopicAsk = { chat, ...(topic != null ? { topic } : {}) }
+  const here: CommandWhere = { chat, ...(topic != null ? { topic } : {}) }
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(chat, msg, opts?.keyboard, here)
   const name = user || userId
   if (item) {
@@ -612,7 +616,10 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
     const roamer = isRoamerEnabled() && (roamerCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/list', '/whoami', '/sessions', '/kill-stuck'].includes(cmd))
     if (!control && !roamer && !['/start', '/help', '/status', '/main', '/lanes'].includes(cmd)) return false
     const targetCommand = roamerItems && !['/roam', '/list', '/roam_status', '/whoami', '/start', '/help', '/status'].includes(cmd)
-    if (targetCommand && !roamerItems!.selectedFor(item.destination)) return true
+    if (targetCommand) {
+      if (!roamerItems!.selectedFor(item.destination)) return true
+      here.destination = item.destination
+    }
     if (!itemReceiver || !(await itemReceiver.receive([item])).given.has(item.onsen_item_id)) throw new Error('command item not available')
     if (targetCommand && !roamerItems!.selectedFor(item.destination)) { itemReceiver.report([item], 'not_taken'); return true }
   }
@@ -1090,7 +1097,7 @@ async function sendTextWithMaybeKeyboard(
   text: string,
   keyboardSpec?: InlineButton[][],
   /** lanes-topics: where it answers (the topic a command was typed in, the message a button was on); lanes off: ignored */
-  where?: Lanes.TopicAsk,
+  where?: CommandWhere,
 ): Promise<void> {
   if (!tg) { await connectorAnswer(chatId, text, keyboardSpec, where); return }   // WO-197 segment 2: one Onsen message, or one Action
   const tf = where ? topicFields(where) : {}
@@ -1846,7 +1853,7 @@ function promptOf(h: Onsen.ActionHandle | null | undefined): PermPrompt | undefi
 }
 /** WO-176: Onsen's control item for one of this agent's Actions (a person pressed an option in Onsen), handed over by the agent-inbox daemon
  *  (POST /onsen/action): pressed here as a press in Telegram would be, then reported applied; a prompt that is gone: cancelled, nothing pressed */
-async function applyActionControl(c: Onsen.ActionControl, taken = false): Promise<boolean> {
+async function applyActionControl(c: Onsen.ActionControl, taken = false, destination?: string | null): Promise<boolean> {
   const acts = onsenActions
   if (!acts) return false
   const p = [...permPrompts.values()].find(x => x.action?.id === c.action_id)
@@ -1855,7 +1862,7 @@ async function applyActionControl(c: Onsen.ActionControl, taken = false): Promis
   const pa = [...pickerAsks.values()].find(x => x.h.id === c.action_id)   // WO-197: a screen menu this daemon asked about in Onsen
   if (pa) return applyPickerControl(pa, h, c)
   const ka = [...keyboardAsks.values()].find(x => x.h.id === c.action_id)   // WO-197 segment 2: a command's choice
-  if (ka) return applyKeyboardControl(ka, h, c, taken)
+  if (ka) return applyKeyboardControl(ka, h, c, taken, destination)
   const ca = [...clearAsks.values()].find(x => x.h.id === c.action_id)      // WO-197 segment 2: /clear's 「不要讓它看到之前的」
   if (ca) return applyClearControl(ca, h, c)
   if (dutyOfficer) {
@@ -5063,7 +5070,7 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     let applied = false
     try {
       const c = Onsen.actionControlOf(payload)
-      if (c && c.action_id === row.action_id) applied = await applyActionControl(c, true)
+      if (c && c.action_id === row.action_id) applied = await applyActionControl(c, true, item.destination)
     } finally { receiver.report([item], applied ? 'completed' : 'not_applied') }
     return
   }

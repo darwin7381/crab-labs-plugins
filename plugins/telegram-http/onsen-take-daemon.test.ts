@@ -830,10 +830,14 @@ test('/roam without a target creates one menu Action; a returned choice is handl
     expect(actions.actions.size).toBe(before + 1)
     const picker = [...actions.actions.values()].at(-1)!
     expect(picker).toMatchObject({ source: 'menu', menu_kind: kind })
-    writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: null }))
+    if (slash === '/model') {
+      lab.switchSession() // the same process and tmux still have a valid model picker, for a different conversation
+      await waitFor(() => JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target?.session_id === lab.sid)
+    } else writeFileSync(roamerState(d.root).ROAMER_STATE_FILE, JSON.stringify({ current_target: null }))
     const gone = d.f.add('gone-' + slash.slice(1), 'control', { action_id: picker.id, payload: actions.press(picker.id, '1') })
     await waitFor(() => gone.reason === 'not_applied')
     expect(actions.acalls.filter(c => c.path === '/v1/actions/' + picker.id + '/applied')).toHaveLength(0)
+    expect(actions.acalls.find(c => c.path === '/v1/actions/' + picker.id + '/cancel')?.body.note).toBe('原本的對話已切換')
   }
 }, 15000)
 

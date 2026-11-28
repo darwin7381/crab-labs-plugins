@@ -297,7 +297,7 @@ plugins/telegram-http/onsen-client.ts::m.forward_from ? `轉傳自 ${forwardName
 plugins/telegram-http/onsen-client.ts::let r = await this.call('POST', `/v1/actions/${h.id}/cancel`, { expected_version: h.version, reason: why, note: why })
 plugins/telegram-http/onsen-client.ts::if (a.expires_at) body.expires_at = a.expires_at
 plugins/telegram-http/server.ts::if (!tg) { await connectorAnswer(chatId, text, keyboardSpec, where); return }
-plugins/telegram-http/server.ts::async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: Lanes.TopicAsk): Promise<void> {
+plugins/telegram-http/server.ts::async function connectorAnswer(chat: string, text: string, keyboard?: InlineButton[][], where?: CommandWhere): Promise<void> {
 plugins/telegram-http/server.ts::function commandMenuKind(datas: string[]): string {
 plugins/telegram-http/server.ts::async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
 plugins/telegram-http/server.ts::async function runControlCallback(data: string, httpPort: string, reply: (msg: string, opts?: ReplyOptions) => Promise<void>, notApplied?: () => void): Promise<void> {
