@@ -1,5 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { OnsenClient } from './onsen-client.ts'
+import { ownItem } from './onsen-self.ts'
 
 let fake: ReturnType<typeof fakeItems>
 afterEach(() => fake?.stop())
@@ -53,4 +58,31 @@ test('S2 DELETE checks writer, version, claim and outcome', async () => {
   const claimed = await create('self', 'claimed')
   await request('POST', base + '/take', { connector: 'bench/adam', item_ids: [claimed.id], limit: 1, wait: 0 }, 'take')
   expect((await close(claimed.id, fake.rows.get(claimed.id)!.version, 'completed')).status).toBe(409)
+})
+
+test('self writes survive a disconnected connector and close the same Item on restart', async () => {
+  fake = fakeItems()
+  const dir = mkdtempSync(join(tmpdir(), 'self-spool-'))
+  const client = () => new OnsenClient({ dir, agent: 'adam', base: fake.base, record: true, credential: () => 'test-member', log: () => {} })
+  const write = { key: 'promise-1', item: ownItem('self', 'main', '交報告', fake.now() + 60_000, 'eve', fake.now() + 60_000) }
+  let c = client()
+  try {
+    fake.down(true)
+    c.recordSelfWrite(write)
+    await c.syncNow(true)
+    expect(fake.rows.size).toBe(0)
+    c.stop()
+    fake.down(false)
+    c = client()
+    c.recordSelfWrite(write)
+    await c.syncNow(true)
+    expect(fake.rows.size).toBe(1)
+    const row = [...fake.rows.values()][0]!
+    expect(row).toMatchObject({ state: 'waiting', from: 'adam', waiter: 'eve' })
+    c.recordSelfWrite({ ...write, complete: true })
+    c.recordSelfWrite({ ...write, complete: true })
+    await c.syncNow(true)
+    expect(row.state).toBe('completed')
+    expect(fake.calls.filter(call => call.body.outcome === 'completed')).toHaveLength(1)
+  } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
