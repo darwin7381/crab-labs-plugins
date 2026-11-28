@@ -88,7 +88,10 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     const idem = path + '|' + key
     if (key && writes.has(idem)) return writes.get(idem)!.clone()
     let answer: Response
-    if (path === base + '/take' && req.method === 'POST') {
+    if (path === base && req.method === 'POST') {
+      if (b.kind !== 'self' || b.body?.format !== 'markdown' || typeof b.body.text !== 'string' || !Array.isArray(b.refs)) return error(400, 'invalid_request')
+      answer = detail(add(crypto.randomUUID(), 'self', { from: member, refs: b.refs, payload: { text: b.body.text } }))
+    } else if (path === base + '/take' && req.method === 'POST') {
       if (!b.connector || b.wait !== 0 || !Array.isArray(b.item_ids) || b.limit !== b.item_ids.length || b.limit > 100 || b.session_id !== undefined) return error(400, 'invalid_request')
       const asked: Row[] = b.item_ids.map((id: string) => rows.get(id)).filter(eligible)
       const given = asked.filter(r => r.reason !== 'cut_person' || asked.some(o => o !== r && o.from === r.from && o.kind === 'message' && o.reason !== 'cut_person'))

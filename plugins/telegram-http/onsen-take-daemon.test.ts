@@ -100,7 +100,7 @@ for (const cfg of [{ GENESIS_LANES: '0' }, { ONSEN_RECORD: '0' }, { CHANNEL_INBO
 test('take starts by default and owns the observation; the old hand-over routes and local stores are gone', async () => {
   const d = await daemon({ ONSEN_OBSERVATION: '' })
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
-  for (const route of ['/onsen/person', '/onsen/action', '/inject']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
+  for (const route of ['/onsen/person', '/onsen/action']) expect((await fetch(d.base + route, { method: 'POST' })).status).toBe(404)
   const old = await fetch(d.base + '/lanes/route', { method: 'POST', headers: { authorization: 'Bearer test-loopback' },
     body: JSON.stringify({ source: 'mesh', from: 'eve', text: 'old hand-over' }) })
   expect(old.status).toBe(404)
@@ -109,6 +109,37 @@ test('take starts by default and owns the observation; the old hand-over routes 
   expect(mail.status).toBe(400)
   for (const path of ['inbox/pending', 'inbox/undeliverable', 'onsen-inbox.json', 'onsen/inbound-store.json'])
     expect(existsSync(join(d.state, path))).toBe(false)
+})
+
+for (const inboxOnly of ['0', '1']) test('/inject writes one waiting Item on the member port, inbox-only=' + inboxOnly, async () => {
+  const d = await daemon({ CHANNEL_INBOX_ONLY: inboxOnly, AGENT_INBOX_SELF: 'adam', CHANNEL_INJECT_TOKEN: 'test-local-token' }, 409)
+  const post = (body: object, token = 'test-local-token') => fetch(d.base + '/inject', { method: 'POST',
+    headers: { 'x-inject-token': token }, body: JSON.stringify(body) })
+  const body = { text: 'disk check', from: 'storage-watch', msg_id: 765, to: 'eve' }
+  expect((await post(body, 'wrong')).status).toBe(403)
+  expect((await post({})).status).toBe(400)
+  const result = await (await post(body)).json()
+  expect(result).toEqual({ injected: true, item_id: expect.any(String) })
+  expect(await (await post(body)).json()).toEqual(result)
+  expect([...d.f.rows.values()]).toMatchObject([{ member: 'adam', state: 'waiting', claim: null, kind: 'self',
+    payload: { text: '[/inject unverified sender: storage-watch]\ndisk check' } }])
+  expect(d.journal().some(r => r.onsen_items?.length)).toBe(false)
+  d.f.down(true)
+  const failed = await post({ text: 'second' })
+  expect(failed.status).toBe(503)
+  expect((await failed.json()).injected).toBe(false)
+})
+
+test('/inject keeps signed identity, quarantine and the shared-token gate before writing', async () => {
+  const caller = 'mesh_0123456789012345678901'
+  const d = await daemon({ CHANNEL_INBOX_ONLY: '1', CHANNEL_INJECT_TOKEN: 'local', MESH_REQUIRE_SIGNED: '1', FIXTURE_SIGNED_CALLER: caller })
+  const post = (from: string, headers: Record<string, string>) => fetch(d.base + '/inject',
+    { method: 'POST', headers, body: JSON.stringify({ from, verified_from: 'joey', text: 'check' }) })
+  expect((await post('eve', {})).status).toBe(403)
+  expect(await (await post('eve', { 'x-inject-token': 'local' })).json()).toMatchObject({ injected: false, dropped: 'forged-unsigned' })
+  expect(await (await post('watch', { 'x-inject-token': 'local' })).json()).toEqual({ injected: false, held: true })
+  expect(await (await post('joey', { authorization: 'Bearer ' + caller })).json()).toMatchObject({ injected: true })
+  expect([...d.f.rows.values()].map(r => r.payload.text)).toEqual(['[/inject from: eve]\ncheck'])
 })
 
 test('real daemon routes one unclaimed notification per album at count or 1.5 s and replaces a newer waiting edit', async () => {

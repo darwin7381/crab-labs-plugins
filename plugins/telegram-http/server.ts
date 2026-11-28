@@ -80,7 +80,7 @@ import { topicLink } from './lanes-topics.ts'
 import { startStartupPickerWatchdog, handleStartupPickerCallback, capturePane, detectStartupPicker, driveStartupPicker, rearmStartupPicker, useLanesMenuRules, permissionShaped, type DetectedPicker, type PickerTarget } from './startup-picker.ts'
 import { checkVersion, versionInfo, versionLine } from './version-check.ts'
 import { expandHiddenEntities } from './entities.ts'
-import { claimedIdentity, loadTable, readCredentialFile, readOwnCredential, resolveInbound, verdictMeta, type Verdict } from './mesh-identity.ts'
+import { bearerIdentity, claimedIdentity, FORWARDERS, loadTable, readCredentialFile, readOwnCredential, resolveInbound, sha256hex, verdictMeta, type Verdict } from './mesh-identity.ts'
 import { OnsenSender, isMailboxInject, recipientNote, switchOn } from './onsen-inbox.ts'
 import * as Onsen from './onsen-client.ts'
 import * as OnsenEdit from './onsen-edit.ts'
@@ -1547,12 +1547,9 @@ function fleetRunId(notif: { method: string; params: unknown }): string | undefi
   if (p.meta?.run_id) return String(p.meta.run_id)
   return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
 }
-const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
-const onsenReq = INBOX_ONLY ? (() => {
-  const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
-  return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
-})() : null
-const onsenSender: OnsenSender | null = onsenReq ? new OnsenSender({ req: onsenReq, log }) : null
+const inboxClient = onsen ?? new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: Onsen.onsenBase(process.env),
+  agent: process.env.AGENT_INBOX_SELF || ONSEN_AGENT, record: false, credential: () => readOwnCredential(STATE_DIR), log })
+const onsenSender = INBOX_ONLY ? new OnsenSender({ req: inboxClient.request.bind(inboxClient), log }) : null
 /** Only BTCC mailbox identities use their roster URL. Other entries supply peer names. */
 function loadInboxRegistry(): Record<string, { url?: string; desc?: string }> {
   try { return JSON.parse(readFileSync(INBOX_REGISTRY_PATH, 'utf8')) } catch { return {} }
@@ -3993,6 +3990,40 @@ function factsFromPayload(p: any, chat: string, ref: string, thread?: number): O
 type InboundBody = { text?: string; from?: string; verified_from?: string; chat_id?: string; logged?: boolean;
   msg_id?: number; reply_to_id?: number; reply_to_from?: string; reply_to_text?: string;
   no_reply?: boolean; op?: string | number; wake?: unknown; ring?: unknown; dedupe?: unknown; refs?: unknown; call_id?: string }
+/** Roster callers still POST to the member's local inbox. Only the take receiver delivers the resulting self Item. */
+async function writeInject(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const answer = (status: number, body: object) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+  const table = loadTable(), auth = req.headers.authorization
+  const signed = bearerIdentity(auth, table)
+  const token = process.env.CHANNEL_INJECT_TOKEN
+  const presented = req.headers['x-inject-token']
+  const tokenOk = !!token && typeof presented === 'string' && Buffer.byteLength(presented) === Buffer.byteLength(token)
+    && timingSafeEqual(Buffer.from(presented), Buffer.from(token))
+  const requireSigned = process.env.MESH_REQUIRE_SIGNED === '1'
+  if ((requireSigned || token) && !signed && !tokenOk) { answer(403, { error: 'bad token' }); return }
+  const b = await readJsonBody(req).catch(() => null) as InboundBody & { run_id?: unknown } | null
+  if (typeof b?.text !== 'string' || !b.text) { answer(400, { error: 'text required' }); return }
+  const text = b.text.slice(0, 4000)
+  const v = resolveInbound(auth, typeof b.from === 'string' ? b.from : undefined, typeof b.verified_from === 'string' ? b.verified_from : undefined, table)
+  const forged = v.forged && process.env.MESH_ALLOW_FORGED !== '1'
+  if (forged || (requireSigned && !signed)) {
+    fileHeld(v.sender, v.relay, text, forged ? 'forged-unsigned' : 'unsigned')
+    log('warn', `held /inject from ${v.sender} (${forged ? 'forged' : 'unsigned'})`)
+    answer(200, { injected: false, held: true, ...(forged ? { dropped: 'forged-unsigned' } : {}) }); return
+  }
+  const refs = []
+  if (b.op != null && OP_REF_RE.test(String(b.op))) refs.push({ kind: 'op', value: String(b.op) })
+  if (b.run_id != null && /^\d+$/.test(String(b.run_id))) refs.push({ kind: 'run', value: String(b.run_id) })
+  const key = typeof b.dedupe === 'string' && b.dedupe.trim() || (Number.isSafeInteger(b.msg_id) ? 'msg:' + b.msg_id : '')
+  const trusted = tokenOk || v.verified || FORWARDERS.has(v.relay)
+  const idem = 'inject:' + (key && trusted ? sha256hex(JSON.stringify([v.sender, key])) : randomUUID())
+  const path = '/v1/members/' + encodeURIComponent(inboxClient.cfg.agent) + '/items'
+  const r = await inboxClient.request('POST', path, { kind: 'self', body: { format: 'markdown',
+    text: `[/inject ${v.verified ? 'from' : 'unverified sender'}: ${v.sender}]\n${text}` }, refs }, 10_000, { 'Idempotency-Key': idem }).catch(() => null)
+  const id = r?.json?.data?.id
+  if (r && r.status >= 200 && r.status < 300 && typeof id === 'string' && id) answer(200, { injected: true, item_id: id })
+  else answer(r?.status === 409 ? 409 : 503, { injected: false, error: 'Onsen did not confirm the Item' })
+}
 async function logPeerArrival(row: Record<string, unknown>): Promise<number | undefined> {
   if (!BTCC_API_BASE) return
   const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, { method: 'POST',
@@ -4177,6 +4208,8 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
     }
 
     if (Lanes.LANES_ON && await Lanes.handleLanesHttp(u, req, res)) return
+
+    if (u.pathname === '/inject' && req.method === 'POST') { await writeInject(req, res); return }
 
     // /v1/logs — OTLP/HTTP JSON logs receiver (system-alert primary layer).
     // Claude TUI exports telemetry events here when launched with
