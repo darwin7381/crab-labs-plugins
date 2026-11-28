@@ -363,6 +363,28 @@ test('hook timeout gets nothing; the exact take is replayed and its claim return
   await r.sync(); expect(r.outcomes('slow')).toEqual(['not_taken'])
 }, 6000)
 
+test('a stuck non-report cannot block an item report, including after restarting the spool', async () => {
+  const r = rig(), row = r.f.add('priority')
+  await r.mode.probe()
+  await r.receiver.receive([itemRef(row)])
+  let stuck = true
+  r.client.cfg.fetch = ((url, opts) => String(url).endsWith('/forms/ack') && stuck
+    ? Promise.resolve(new Response('', { status: 503 })) : fetch(url, opts)) as typeof fetch
+  r.client.recordFormAck([123])
+  await r.sync()
+  r.receiver.report([itemRef(row)], 'completed')
+  await r.client.syncNow() // the transient form-ack backoff is still pending
+  expect(r.outcomes(row.id)).toEqual(['completed'])
+  expect(r.client.hasItemReports()).toBe(false)
+  expect(r.client.pendingBytes()).toBeGreaterThan(0)
+  const restored = new OnsenClient(r.client.cfg)
+  restored.watchItemReports(() => { throw Error('replayed an acknowledged report') }, () => {})
+  expect(restored.hasItemReports()).toBe(false)
+  stuck = false; await restored.syncNow(true)
+  expect(restored.pendingBytes()).toBe(0)
+  expect(r.f.calls.filter(c => c.path.endsWith('/report'))).toHaveLength(1)
+})
+
 test('late conflicting report is logged, a permanent 4xx is rejected and the spool advances', async () => {
   const r = rig(), row = r.f.add('settled')
   await r.mode.probe(); await r.receiver.receive([itemRef(row)])
