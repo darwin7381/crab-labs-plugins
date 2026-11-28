@@ -1,3 +1,4 @@
+import { connectorId } from './onsen-take.ts'
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
 import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'fs'
@@ -332,7 +333,7 @@ test('stopped and over-budget threads and a missing lane hand their queued items
       if (id === 'owned-gone') {
         const taken = await fetch(f.base + '/v1/members/adam/items/take', { method: 'POST',
           headers: { Authorization: 'Bearer test-member', 'Idempotency-Key': id },
-          body: JSON.stringify({ connector: 'mac-mini/adam', item_ids: [id], wait: 0, limit: 1 }) })
+          body: JSON.stringify({ connector: connectorId(join(root, 'tg'), 'adam', 'mac-mini'), item_ids: [id], wait: 0, limit: 1 }) })
         expect(taken.status).toBe(200)
         const dir = join(root, 'tg', 'onsen')
         mkdirSync(dir, { recursive: true })
@@ -889,7 +890,7 @@ test('a switched roamer starts with no bot token, registers commands and observe
   const h = await fetch(d.base + '/healthz').then(r => r.json())
   expect(h.connector.on).toBe(true)
   expect(h.polling).toBe(false)
-  await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+  await waitFor(() => d.f.calls.some(c => c.body?.connector === connectorId(d.state, member, 'mac-mini') && c.path.endsWith('/observation')))
   expect(d.f.calls.find(c => c.body?.connector && c.path.endsWith('/observation'))!.body.presence).toBe('offline')
   const names = d.f.calls.find(c => c.path === '/v1/members/' + member + '/commands')!.body.commands.map((c: any) => c.name)
   expect(names).toEqual(expect.arrayContaining(['roam', 'roam_status', 'resume_list', 'resume', 'resume_previous', 'restart', 'kill_stuck',
@@ -985,7 +986,7 @@ test('a failed offset confirmation keeps the bridge out through restart until th
   reject = false
   await waitFor(async () => (await health()).connector.on, 12000)
   expect((await health()).polling).toBe(false)
-  expect(claims().connector).toBe('mac-mini/' + member)
+  expect(claims().connector).toBe(connectorId(d.state, member, 'mac-mini'))
   expect(claims().pollOffset).toBeUndefined()
   expect(new Set(offsets)).toEqual(new Set([42]))
   expect(d.log().match(/inbound u=41 /g)).toHaveLength(1)
@@ -1019,7 +1020,7 @@ test('a later successful probe drains the local poll before the bridge can carry
   const calls = bot.polls.length
   await Bun.sleep(350)
   expect(bot.polls).toHaveLength(calls)
-  await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+  await waitFor(() => d.f.calls.some(c => c.body?.connector === connectorId(d.state, member, 'mac-mini') && c.path.endsWith('/observation')))
 }, 9000)
 
 for (const mode of ['pull', 'take']) test('a command choice that throws follows ' + mode + ' Action semantics', async () => {
@@ -1517,7 +1518,7 @@ test('C2 drains pre-switch deliveries and keeps status, observation and replies 
   })
   const cmd = command(d, 'after-switch', '/help', '300')
   await waitFor(() => cmd.state === 'completed')
-  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === 'mac-mini/adam'))
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.connector === connectorId(d.state, 'adam', 'mac-mini')))
   await waitFor(() => d.f.calls.some(c => c.path === '/status/batch'))
   expect(d.f.calls.filter(c => c.path === '/deliveries/batch').flatMap(c => c.body.items)).toEqual([delivery])
   expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
@@ -1655,7 +1656,7 @@ test('SIGKILL and restart restores the held id on the first observation and drai
   await d.restart()
   await waitFor(() => d.f.calls.slice(before).some(c => c.path.endsWith('/observation')))
   const first = d.f.calls.slice(before).find(c => c.path.endsWith('/observation'))!
-  expect(first.body.connector).toBe('mac-mini/adam'); expect(first.body.held_item_ids).toEqual([row.id])
+  expect(first.body.connector).toBe(connectorId(d.state, 'adam', 'mac-mini')); expect(first.body.held_item_ids).toEqual([row.id])
   expect(d.f.calls.slice(before).some(c => c.query.has('wait') || c.path.endsWith('/take'))).toBe(false)
   d.f.holdReports(false)
   await waitFor(() => row.state === 'completed', 8000)

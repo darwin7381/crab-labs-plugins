@@ -1,8 +1,29 @@
 import { hostname } from 'os'
+import { randomUUID } from 'crypto'
+import { linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
+import { join } from 'path'
 import type { ActionReq, OnsenClient } from './onsen-client.ts'
 
 export function machineName(host = process.env.ONSEN_HOST): string {
   return (host?.trim() || hostname().replace(/\.local$/, '')).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 32) || 'unknown'
+}
+
+export function connectorId(stateDir: string, member: string, machine = machineName()): string {
+  const dir = join(stateDir, 'onsen'), file = join(dir, 'connector-id')
+  let id: string
+  try { id = readFileSync(file, 'utf8').trim() }
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const candidate = randomUUID(), tmp = file + '.' + candidate
+    writeFileSync(tmp, candidate, { mode: 0o600, flag: 'wx' })
+    try { linkSync(tmp, file) }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e }
+    finally { unlinkSync(tmp) }
+    id = readFileSync(file, 'utf8').trim()
+  }
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id)) throw new Error('Invalid Onsen connector-id in ' + dir)
+  return (machine + '/' + member).slice(0, 43) + ':' + id
 }
 
 export function takeRefusal(o: { inbox: boolean; roamer: boolean; targetRouting?: boolean; lanes: boolean; record: boolean; observation: boolean }): string | undefined {
@@ -39,10 +60,10 @@ export class TakeMode {
   readonly now = () => Date.now() + this.offset
 
   constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (canReceive: boolean) => void | Promise<void>,
-    readonly log: (line: string) => void, machine = machineName(),
+    readonly log: (line: string) => void, machine: string | { stateDir: string } = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
-    this.connector = machine + '/' + member
+    this.connector = typeof machine === 'string' ? machine + '/' + member : connectorId(machine.stateDir, member)
   }
 
   get canReceive(): boolean { return this.active && !this.stopped && !this.reason }

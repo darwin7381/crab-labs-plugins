@@ -5,7 +5,7 @@ import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient, roamerMember } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
-import { deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
+import { connectorId, deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
 import { ItemPeek, itemRef, roamerSessionId, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver, type Outcome } from './onsen-receive.ts'
@@ -1964,4 +1964,14 @@ test('a fresh unquoted turn answers only its own Item, and a named background co
   await r.sync()
   expect(a.response_message_ids).toEqual(['for-A'])
   expect(b.response_message_ids).toEqual(['for-B'])
+})
+
+test('distinct state directories on one host register distinct owners and a restart keeps the owner', async () => {
+  const r = rig(), first = connectorId(r.dir, 'adam', 'mac-mini')
+  const second = connectorId(join(r.dir, 'second'), 'adam', 'mac-mini')
+  expect(first).not.toBe(second)
+  expect(connectorId(r.dir, 'adam', 'mac-mini')).toBe(first)
+  expect(connectorId(r.dir, 'm'.repeat(64), 'h'.repeat(32)).length).toBeLessThanOrEqual(80)
+  expect((await deliveryMode(r.mode.req, r.mode.path, first)).take).toBe(true)
+  expect((await deliveryMode(r.mode.req, r.mode.path, second)).mode).toBe('not_current_connector')
 })

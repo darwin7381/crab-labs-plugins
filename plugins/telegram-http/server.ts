@@ -424,9 +424,10 @@ if (ONSEN_TAKE_ON) {
         } else { itemPeek!.stop(); takeKeepwarm?.stop() }
         if (!ROAMER) Lanes.deliveryModeChanged()
         registryStatusChanged?.()
-      }, line => log('info', line))
+      }, line => log('info', line), { stateDir: STATE_DIR })
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(),
       takeMode.now, ROAMER ? undefined : Lanes.unboundOutcome, t => roamerItems?.stateOf(t))
+    if (ROAMER) itemClaims.upgradeCarrier(machineName() + '/' + ONSEN_AGENT, takeMode.connector)
     if (ROAMER && itemClaims.carriedBy(takeMode.connector)) CONNECTOR = onsen.cfg.record = takeMode.observationRequired = true
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok, row) => {
       itemClaims!.acknowledged(line, ok, row)
