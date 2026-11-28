@@ -32,6 +32,11 @@ export class RoamerItems {
     const reg = this.o.registry.entries().find(e => e.pid === t.claude_pid && e.sessionId === t.session_id)
     if (reg && this.watches.has(reg.sessionId)) return this.edge(reg)
   }
+  observeBusy(session: string | null): void {
+    if (!session) return
+    const turn = this.watches.get(session)?.turnFacts()?.id
+    if (turn) this.busyTurns.set(session, turn)
+  }
   private offerTo(): Offer | null {
     const target = this.o.selected()
     if (!target || !this.o.alive(target.claude_pid)) return null
@@ -91,13 +96,15 @@ export class RoamerItems {
         if (!more) this.o.claims.cutTarget(t)
         continue
       }
-      const turn = watch.turnFacts()?.id
-      if (reg?.status === 'busy' && turn) this.busyTurns.set(sid, turn)
-      if (reg?.status === 'idle' && turn && this.busyTurns.get(sid) === turn) {
-        watch.endTurn(new Date().toISOString())
-        this.o.watch.changed()
+      if (reg?.status === 'busy') this.observeBusy(sid)
+      else {
+        const turn = watch.turnFacts()?.id
+        if (reg?.status === 'idle' && turn && this.busyTurns.get(sid) === turn) {
+          watch.endTurn(new Date().toISOString())
+          this.o.watch.changed()
+        }
+        this.busyTurns.delete(sid)
       }
-      if (reg?.status !== 'busy') this.busyTurns.delete(sid)
       if (reg) this.o.claims.observeState(sid, this.edge(reg))
       // The common status feed closes the selected session. A switched-away session still has its own registry facts.
       if (sid !== selected?.session_id && reg?.status === 'idle' && !watch.busy())

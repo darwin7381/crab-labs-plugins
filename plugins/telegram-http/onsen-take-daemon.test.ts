@@ -872,7 +872,7 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
 }
 
 test('roamer switches between two live streams in one cwd, binds on intake and completes only the receiving UUID', async () => {
-  const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10' }, 200, roamerState)
+  const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10', C6_SHORT_BUSY: '1' }, 200, roamerState)
   const one = d.f.add('first', 'message', { session_id: 'main' })
   const a = await target(d), b = await target(d)
   await Bun.sleep(350)
@@ -898,10 +898,16 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'first received' } })
   expect(reply.isError).not.toBe(true)
   const beforeBusy = d.f.calls.length
+  // The registry can publish a complete busy interval between two transcript polls.
+  const turn = JSON.parse(readFileSync(join(d.state, 'onsen', 'claims.json'), 'utf8')).claims[two.id].turn
+  expect(typeof turn).toBe('string')
+  const paused = join(d.root, 'pause-transcript-poll')
+  writeFileSync(paused, '')
   b.status('busy')
   await waitFor(() => d.f.calls.slice(beforeBusy).some(c => c.path.endsWith('/observation') && c.body.held_item_ids?.includes(two.id)
-    && c.body.sessions?.some((s: { activity: string }) => s.activity === 'running')))
+    && c.body.sessions?.some((s: { activity: string; turn?: { id: string } }) => s.activity === 'running' && s.turn?.id === turn)))
   b.status('idle') // Short turn with registry evidence and no transcript turn_duration.
+  unlinkSync(paused)
   await waitFor(() => two.state === 'completed', 9000)
   expect(two.response_message_ids).toEqual([])
   expect(one.claim?.session_id).toBe(a.sid)

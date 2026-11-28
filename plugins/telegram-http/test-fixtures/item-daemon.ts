@@ -24,6 +24,14 @@ if (process.env.ROAMER_MODE === '1') {
   const lanes = await import('../lanes.ts')
   spyOn(lanes, 'claudePidOf').mockImplementation(req => Number(req.headers['x-test-claude-pid']) || null)
 }
+if (process.env.C6_SHORT_BUSY === '1') {
+  const { RoamerItems } = await import('../roamer-items.ts')
+  const tick = RoamerItems.prototype.tick
+  const paused = join(process.env.AGENT_WORKSPACE_DIR!, 'pause-transcript-poll')
+  spyOn(RoamerItems.prototype, 'tick').mockImplementation(function () {
+    if (!existsSync(paused)) tick.call(this)
+  })
+}
 if (process.env.C6_CHOICE_FAILURE === '1') {
   const controls = await import('../channel-bot-control.ts')
   spyOn(controls, 'handleCallbackData').mockImplementation(async () => { throw new Error('fixture choice failed') })

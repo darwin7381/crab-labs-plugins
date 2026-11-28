@@ -62,6 +62,7 @@ Mac mini 的對照來自 `tg-dialogue/roamer-facts.md` §2。MBP 的兩組對照
 ## C6 審查後的驗收條件
 
 - `/clear`、`/resume <n>`、`/resume_previous` 在同一個 PID 內換段時，由 registry 的新 UUID 更新仍選取的 `current_target` 及本機認領紀錄。下一列交給同一個 stream 的新 UUID。主線已見 final Stop 而在 settle 期間離線或換段，也須結束原 claim。
+- 兩次 transcript 輪詢之間若狀態回報讀到短暫的 busy，以該次 registry 的 UUID 與當下回合記住它。之後的 idle 只能結束同一 UUID 的同一回合。
 - 若本機輪詢最後的 offset 確認失敗，health 維持本機所有權。重啟後從帳本確認相同 offset，成功後才能交給 bridge。候選成員啟動時先等 C1 probe，單次上限 5 秒。運作中成功切換也啟動既有 registry CLI 比對。
 - Bridge 逐支辨認安裝單元與 state 設定的 roamer，對明確映射的目錄用 realpath 核對。只有該成員的 daemon 確認已交接、輪詢已停，bridge 才能首次接手。D9 適用已接手的 bridge。
 - 選單 callback 拋錯時，pull 沿用原本 Action 的 `applied`。take 的 Action 取消，控制列回報 `not_applied`。

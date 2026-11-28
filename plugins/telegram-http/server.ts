@@ -4528,6 +4528,8 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
     const wall = w?.walled ? { walled: true, until: w.resets_at, kind: w.kind } : tap?.walled() ?? null
     const inp = source.inputs({ queuedJoey: tap ? Lanes.mainQueuedJoey() : 0, wall,
       turn: tap ? tap.turnDetail() : watch?.busy() ?? null, compacting: tap?.compacting() ?? false, lanes: tap ? Lanes.runningLanes() : [], edges: tap ? tap.turnEdges() : null })
+    // A short registry busy interval may be visible only to this status read between transcript polls.
+    if (inp.main?.status === 'busy') roamerItems?.observeBusy(registry.mainSessionId())
     if (!tap) {
       // WO-162 (1): the registry shows a new turn: the messages written into the main's stream by then are that turn's, not queued (the transcript
       // confirms them a read later; the kick's transcript read (WO-157b) finds them only if Claude Code has flushed it by then)
