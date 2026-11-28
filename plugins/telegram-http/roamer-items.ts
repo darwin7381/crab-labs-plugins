@@ -74,6 +74,8 @@ export class RoamerItems {
         session = sid
       } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'claimed' || e.kind === 'taken')) return null
     }
+    if (!session && row.from === row.member && ['self', 'keepwarm', 'resume'].includes(row.kind))
+      session = receivingUUID(row.member, row.session_id) ?? undefined
     session ??= this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id
     if (session) this.pending.set(row.id, session)
     return session ?? null

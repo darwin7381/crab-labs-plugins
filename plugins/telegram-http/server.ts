@@ -66,6 +66,7 @@ import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.t
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, recordTuiWarning, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, type Observation, type RecordFacts } from './screen-status.ts'
 import { PaneReader, snapPaneLook, type PaneLook } from './pane-look.ts'   // WO-168 stage two: the one capture of the own pane
+import { reportSession } from './onsen-session.ts'
 import { RoamerItems } from './roamer-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
@@ -431,7 +432,7 @@ if (ONSEN_TAKE_ON) {
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       queueMicrotask(() => { if (!ROAMER && takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
     }, line => itemClaims!.reportBody(line, ROAMER ? ONSEN_AGENT : undefined))
-    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
+    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), (due, target) => !!takeKeepwarm?.matchesWindow(due, target))
     itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(),
       ROAMER ? undefined : Lanes.sweepQueue, ROAMER ? waiting => roamerItems?.fullList(waiting) : undefined)
     if (!ROAMER) { onsen.watchItemWrites(Lanes.itemWriteSettled); Lanes.useItemReceiver(itemReceiver, onsen); Lanes.observeItemGates(() => itemPeek!.reset()) }
@@ -3107,7 +3108,10 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
     mode: () => takeMode?.canReceive ? 'live' : takeMode || onsenPuller?.mode.active ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
-    ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
+    ...(ROAMER && takeMode ? { transcript: roamerCurrentTranscript, session: () => {
+      const target = receivingTarget()
+      return target ? reportSession(target.session_id, ONSEN_AGENT) : null
+    } } : Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
     wall: () => { const w = wallReader.state(); return w ? w.walled : null },   // WO-120: the state decides "walled"
     // this agent's own unread count, with its own credential (an agent may read only its own row)
     mail: async () => {
@@ -4555,7 +4559,9 @@ function liveSetting(k: LiveKey): string | undefined {
   return liveFile.v[k]
 }
 connectorReady = true
-if (ROAMER) { if (takeMode?.active) itemPeek!.reset() }
+if (ROAMER) {
+  if (takeMode?.canReceive) { itemPeek!.reset(); takeKeepwarm?.start(); void takeKeepwarm?.run() }
+}
 else void takeMode?.probe()
 const jevScreenValue = (): string | undefined => liveSetting('JEV_SCREEN')
 if (!INBOX_ONLY && !ROAMER && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
@@ -4641,7 +4647,7 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
   if (ROAMER && itemReceiver && itemClaims) {
     roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, selectionWrittenAt, transcript: transcriptPath, refreshSession: refreshTargetSession, alive: pidAlive,
       stream: targetStream, send: notifyStream, watch: { facts, joey: onsenJoeyOf, changed: kick, turnEnded }, revisit: () => itemPeek!.reset() })
-    onRoamerSelection(() => { roamerItems!.recordSelection(); kick() })
+    onRoamerSelection(() => { roamerItems!.recordSelection(); if (takeMode?.canReceive) void takeKeepwarm?.run(); kick() })
   }
   const watch = tap ? null : roamerItems ?? new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
@@ -5168,7 +5174,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
 async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Promise<void> {
   const ownResume = row.kind === 'resume' && row.from === row.member
   const item = itemRef(row)
-  if (change) {
+  if (change && !roamerItems) {
     Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
     return
   }
@@ -5183,14 +5189,14 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     if (!item.destination && row.kind !== 'control' && !/^\s*\/[A-Za-z]/.test(row.payload.text ?? '')) return
   }
   const payload = { ...row.payload }
-  if (row.from === row.member && (row.kind === 'self' || row.kind === 'keepwarm')) {
-    Lanes.routeOwnItem(row, item, [item.note, item.half_done ? '上一回合被打斷，接著做。' : '', payload.text].filter(Boolean).join('\n'))
-    return
-  }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
-  if (ownResume) {
-    Lanes.routeResume(item, String(payload.text ?? ''))
+  if (row.from === row.member && (ownResume || row.kind === 'self' || row.kind === 'keepwarm')) {
+    const content = String(payload.text ?? '')
+    if (roamerItems) await roamerItems.offer([item], { method: 'notifications/claude/channel',
+      params: { content, meta: { kind: row.kind, no_reply: 'true' } } })
+    else if (ownResume) Lanes.routeResume(item, content)
+    else Lanes.routeOwnItem(row, item, content)
     return
   }
   if (row.kind === 'message' || row.message_id) {

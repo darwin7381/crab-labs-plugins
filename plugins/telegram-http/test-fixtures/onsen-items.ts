@@ -62,7 +62,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
   const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
     now++
-    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ at: r.updated_at, kind, claim_id: r.claim?.id ?? lastClaim.get(r.id) ?? null, session_id: r.claim?.session_id ?? r.session_id, state: r.state, reason: r.reason, note: note || null })
+    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ at: r.updated_at, kind, claim_id: r.claim?.id ?? lastClaim.get(r.id) ?? null, session_id: r.session_id, state: r.state, reason: r.reason, note: note || null })
     for (const wake of waiters) wake()
   }
   const expire = () => {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import type { InboxItem, ItemRef } from './onsen-items.ts'
+import type { InboxItem, ItemRef, ReceivingTarget } from './onsen-items.ts'
 import type { TakeMode } from './onsen-take.ts'
 import type { Journal } from './lanes-state.ts'
 
@@ -30,7 +30,7 @@ export class ItemReceiver {
   private refused = new Map<string, { version: number; rides: boolean }>()
   private requesting = new Set<string>()
   constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void,
-    readonly currentKeepwarm?: (due?: string) => boolean) {}
+    readonly currentKeepwarm?: (due?: string, target?: ReceivingTarget) => boolean) {}
   taking(id: string): boolean { return this.requesting.has(id) }
 
   /** Number of owned claims with this outcome durably recorded. */
@@ -55,7 +55,7 @@ export class ItemReceiver {
       && !this.claims.owns(r.onsen_item_id) && r.onsen_version > (this.refused.get(r.onsen_item_id)?.version ?? -1)).map(r => r.from))
     const need = ids.filter(id => {
       const ref = byId.get(id)!, refusal = this.refused.get(id)
-      if (ref.kind === 'keepwarm' && this.currentKeepwarm && !this.currentKeepwarm(ref.not_before)) {
+      if (ref.kind === 'keepwarm' && this.currentKeepwarm && !this.currentKeepwarm(ref.not_before, ref.target)) {
         result.gone.add(id)
         return false
       }

@@ -23,6 +23,8 @@
 import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ownItem, type ItemWriter } from './onsen-item-writes.ts'
+import { reportSession } from './onsen-session.ts'
+import type { ReceivingTarget } from './onsen-items.ts'
 import type { TakeMode } from './onsen-take.ts'
 import type { InboxItem } from './onsen-items.ts'
 
@@ -218,6 +220,7 @@ export interface LocalKeepwarmDeps {
   projectsDir(): string | null
   mail(): Promise<MailCount>
   /** lanes-golive (C4): the session's transcript when it is known by id (a lanes main); absent = the newest .jsonl of projectsDir (fleet). null = none */
+  session?(): string | null
   transcript?(): string | null
   deliver(text: string): Promise<boolean>
   log(level: 'info' | 'warn' | 'error', msg: string): void
@@ -260,13 +263,16 @@ export class LocalKeepwarm {
   private timer?: ReturnType<typeof setInterval>
   constructor(private readonly d: LocalKeepwarmDeps) {}
   private now(): number { return this.d.now ? this.d.now() : Date.now() / 1000 }
-  private statePath() { return join(this.d.stateDir, 'keepwarm-local.json') }
-  private state(): KState {
-    try { return JSON.parse(readFileSync(this.statePath(), 'utf8')) } catch { return {} }
+  private session(): string | null { return this.d.session ? this.d.session() : 'main' }
+  private statePath(session: string) {
+    return join(this.d.stateDir, session === 'main' ? 'keepwarm-local.json' : 'keepwarm-local-' + encodeURIComponent(session) + '.json')
   }
-  private transcript(st: KState) {
+  private state(session: string): KState {
+    try { return JSON.parse(readFileSync(this.statePath(session), 'utf8')) } catch { return {} }
+  }
+  private transcript(st: KState, targetPath?: string) {
     const dir = this.d.projectsDir()
-    const named = this.d.transcript ? this.d.transcript() : undefined
+    const named = targetPath ?? this.d.transcript?.()
     const path = named !== undefined ? (named && existsSync(named) ? named : null) : dir ? newestJsonl(dir) : null
     const text = path ? readTail(path) : ''
     const s = path ? scan(text, !!this.d.take) : null
@@ -277,10 +283,12 @@ export class LocalKeepwarm {
   }
 
   /** A model action since the minute pass invalidates its previous window, even if that row just became due. */
-  matchesWindow(due?: string): boolean {
-    const st = this.state()
+  matchesWindow(due?: string, target?: ReceivingTarget): boolean {
+    const session = target ? reportSession(target.session_id, this.d.name) : this.session()
+    if (!session) return false
+    const st = this.state(session)
     try {
-      const { s } = this.transcript(st)
+      const { s } = this.transcript(st, target?.transcript)
       return !!s?.last_req && sameKeepwarmTime(due, (s.last_req + KEEPWARM_AFTER_S) * 1000)
         && decide(s, st, this.now(), true)[0] === 'poke'
     } catch { return false }
@@ -289,20 +297,21 @@ export class LocalKeepwarm {
   /** A queued withdrawal may drain in a later turn or after another idle window has begun. */
   mayWithdraw(row: InboxItem): boolean {
     const take = this.d.take
-    if (!take?.mode.canReceive || row.kind !== 'keepwarm' || row.from !== take.mode.member || row.session_id !== 'main') return false
-    const st = this.state(), { s } = this.transcript(st)
+    const session = this.session()
+    if (!take?.mode.canReceive || !session || row.kind !== 'keepwarm' || row.from !== take.mode.member || row.session_id !== session) return false
+    const st = this.state(session), { s } = this.transcript(st)
     if (s?.turn_open) return false
     const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
     return decide(s, st, this.now(), true)[0] !== 'poke' || !sameKeepwarmTime(row.not_before, due)
   }
 
   /** Reconcile the warm window with waiting Items. A new model action moves the window, including across restarts. */
-  private async schedule({ mode, write }: NonNullable<LocalKeepwarmDeps['take']>, s: KScan | null, st: KState, now: number): Promise<void> {
+  private async schedule({ mode, write }: NonNullable<LocalKeepwarmDeps['take']>, s: KScan | null, st: KState, now: number, session: string): Promise<void> {
     if (s?.turn_open) return
     const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
     const expires = ((s?.last_req ?? 0) + CACHE_TTL_S) * 1000
     const wanted = decide(s, st, now, true)[0] === 'poke' && due < expires
-    const q = new URLSearchParams({ kind: 'keepwarm', session_id: 'main', state: 'waiting', connector: mode.connector, limit: '100' })
+    const q = new URLSearchParams({ kind: 'keepwarm', session_id: session, state: 'waiting', connector: mode.connector, limit: '100' })
     let exists = false
     const obsolete: InboxItem[] = []
     do {
@@ -310,7 +319,7 @@ export class LocalKeepwarm {
       if (!mode.canReceive) return
       if (page?.status !== 200 || !Array.isArray(page.json?.items)) throw new Error('could not read waiting keepwarm Items')
       for (const row of page.json.items as InboxItem[]) {
-        if (row.kind !== 'keepwarm' || row.from !== mode.member || row.session_id !== 'main') continue
+        if (row.kind !== 'keepwarm' || row.from !== mode.member || row.session_id !== session) continue
         if (wanted && sameKeepwarmTime(row.not_before, due)) exists = true
         else obsolete.push(row)
       }
@@ -319,7 +328,7 @@ export class LocalKeepwarm {
     } while (mode.canReceive)
     // The transcript can change while the member listing or a withdrawal is in flight.
     const stillIdle = () => {
-      if (!mode.canReceive) return false
+      if (!mode.canReceive || session !== this.session()) return false
       const current = this.transcript(st).s
       return !current?.turn_open && current?.last_req === s?.last_req
     }
@@ -329,9 +338,9 @@ export class LocalKeepwarm {
         outcome: 'withdrawn', expected_version: row.version })
     }
     if (!wanted || exists || st.poked_for === s!.last_req || !stillIdle()) return
-    const item = ownItem('keepwarm', 'main', POKE_TEXT, due)
+    const item = ownItem('keepwarm', session, POKE_TEXT, due)
     item.expires_at = new Date(expires).toISOString()
-    write({ key: 'keepwarm:main:' + due, item })
+    write({ key: 'keepwarm:' + session + ':' + due, item })
     st.poked_for = s!.last_req
   }
 
@@ -339,11 +348,12 @@ export class LocalKeepwarm {
   async run(): Promise<string[]> {
     const mode = this.d.mode()
     if (mode !== 'live' && mode !== 'dry') return []
-    if (this.running) return []
+    const session = this.session()
+    if (!session || this.running) return []
     this.running = true
     const lines: string[] = []
     const name = this.d.name
-    const st = this.state()
+    const st = this.state(session)
     try {
       const now = this.now()
       const { path, text, s } = this.transcript(st)
@@ -361,7 +371,7 @@ export class LocalKeepwarm {
         }
       }
       if (this.d.take) {
-        if (this.d.take.mode.canReceive) await this.schedule(this.d.take, s, st, now)
+        if (this.d.take.mode.canReceive) await this.schedule(this.d.take, s, st, now, session)
         return lines
       }
       const send = async (text: string, why: string, tag: string): Promise<boolean> => {
@@ -421,7 +431,7 @@ export class LocalKeepwarm {
     } catch (e) {
       lines.push(`KEEPWARM-ERROR ${name}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 300))
     } finally {
-      try { writeFileSync(this.statePath() + '.tmp', JSON.stringify(st, null, 1)); renameSync(this.statePath() + '.tmp', this.statePath()) } catch {}
+      try { writeFileSync(this.statePath(session) + '.tmp', JSON.stringify(st, null, 1)); renameSync(this.statePath(session) + '.tmp', this.statePath(session)) } catch {}
       if (lines.length) {
         const stamp = new Date(this.now() * 1000).toISOString().replace('T', ' ').slice(0, 19)
         try { appendFileSync(join(this.d.stateDir, 'keepwarm-local.log'), lines.map(l => `${stamp} ${l}\n`).join('')) } catch {}
