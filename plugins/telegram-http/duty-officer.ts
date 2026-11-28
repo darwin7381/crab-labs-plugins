@@ -882,6 +882,20 @@ type Look = { state: State; hash: string; lines: string[]; info: PaneInfo; pane:
   /** WO-168 (own pane): the record's detail.input_typed (null: not known) */
   typed?: boolean | null } | null
 
+function appendOfficerEvent(dir: string, record: Record<string, unknown>): void {
+  const path = join(dir, 'log.jsonl')
+  try { if (statSync(path).size > 20 * 1024 * 1024) renameSync(path, path + '.1') } catch {}
+  appendFileSync(path, JSON.stringify(record) + '\n')
+}
+
+/** Non-interactive TUI warnings belong in the officer's journal even on a host without a pane watcher. */
+export function recordTuiWarning(agent: string, message: string, source: string): void {
+  const dir = join(homedir(), '.claude', 'duty-officer')
+  mkdirSync(dir, { recursive: true })
+  appendOfficerEvent(dir, { time: iso(Date.now()), event: 'tui_warning', host: hostname().split('.')[0],
+    pid: process.pid, agent, source, message: message.slice(0, 2000) })
+}
+
 export class DutyOfficer {
   readonly dir: string
   readonly host: string
@@ -1001,9 +1015,7 @@ export class DutyOfficer {
     return true
   }
   event(ev: string, kw: Record<string, unknown> = {}): void {
-    const p = join(this.dir, 'log.jsonl')
-    try { if (statSync(p).size > 20 * 1024 * 1024) renameSync(p, `${p}.1`) } catch {}
-    try { appendFileSync(p, JSON.stringify({ time: iso(this.now()), event: ev, host: this.host, pid: process.pid, ...kw }) + '\n') } catch {}
+    try { appendOfficerEvent(this.dir, { time: iso(this.now()), event: ev, host: this.host, pid: process.pid, ...kw }) } catch {}
   }
 
   // ---- rule files (Chiron's; never copied)

@@ -167,13 +167,15 @@ function sendAlert(msg: string, source: string): void {
 // 002l (D12): design/notify 「同一件事不會連發」. With lanes on, the daemon tells Joey about a model wall itself, once, naming the session that hit it
 // (lanes.ts mainWallUp / wallUp). The TUI relay of the same usage-limit line was a third notice for one wall (G07: #1053 relay, #1055 main wall,
 // #1056 lanes wall). A relayed TUI line that the defer function claims is not sent (and logged); everything else is relayed as before.
-let _defer: ((msg: string) => boolean) | null = null
-export function setSystemAlertDefer(f: ((msg: string) => boolean) | null): void { _defer = f }
+type Defer = (msg: string, source: string) => boolean | 'duty-officer'
+let _defer: Defer | null = null
+export function setSystemAlertDefer(f: Defer | null): void { _defer = f }
 /** the TUI-output layers (jsonl / OTLP) relay through here; ops alerts (sendOpsAlert) never defer */
 export function relayTuiAlert(msg: string, source: string): void {
   if (_defer) {
-    let skip = false
-    try { skip = _defer(msg) } catch {}
+    let skip: ReturnType<Defer> = false
+    try { skip = _defer(msg, source) } catch {}
+    if (skip === 'duty-officer') return
     if (skip) { _log('info', `system-alert deferred to the lanes wall notice: ${dedupeKey(msg).slice(0, 80)} (${source})`); return }
   }
   sendAlert(msg, source)
@@ -343,7 +345,7 @@ export function startSystemAlertWatcher(opts: {
   notify: Notify
   log: Log
   /** 002l (D12): a relayed TUI line this returns true for is told by someone else (the lanes wall notice) and is not sent */
-  defer?: (msg: string) => boolean
+  defer?: Defer
   // Exact session-jsonl resolver — re-called EACH tick. Roamer returns its
   // current target's EXACT transcript (cwd + session_id → one file), so the
   // watcher tails precisely that session and NOT merely the newest jsonl in the

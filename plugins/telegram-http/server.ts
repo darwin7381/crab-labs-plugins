@@ -63,7 +63,7 @@ import {
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
 import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
-import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
+import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, recordTuiWarning, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, type Observation, type RecordFacts } from './screen-status.ts'
 import { PaneReader, snapPaneLook, type PaneLook } from './pane-look.ts'   // WO-168 stage two: the one capture of the own pane
 import { RoamerItems } from './roamer-items.ts'
@@ -3008,6 +3008,7 @@ setInterval(() => {
 // session jsonl for non-AI warnings (401 login expiry, API internal errors,
 // refusals) and DMs them to opsRecipients (alertTo, else allowFrom). Without this, TUI-level
 // API deaths are invisible on Telegram (Joey msg 2218).
+let dutyOfficer: DutyOfficer | null = null
 if (isSystemAlertEnabled()) {
   startSystemAlertWatcher({
     log,
@@ -3017,7 +3018,15 @@ if (isSystemAlertEnabled()) {
     resolveFile: isRoamerEnabled() ? roamerCurrentTranscript : (Lanes.LANES_ON ? () => Lanes.mainTranscriptFile(TRANSCRIPT_DIR) : undefined),
     // 002l (D12): with lanes on, a model wall (usage limit, overload, login, API error) is told once by the lanes wall notice, which names the
     // session that hit it; the TUI's copy of the same line is not relayed as well (design/notify 「同一件事不會連發」)
-    defer: Lanes.LANES_ON && !INBOX_ONLY ? (msg: string) => takeMode?.active || Lanes.wallKind(msg) != null : undefined,
+    defer: !INBOX_ONLY && (Lanes.LANES_ON || takeMode) ? (msg, source) => {
+      if (Lanes.LANES_ON && Lanes.wallKind(msg)) return true
+      if (!takeMode?.active) return false
+      try {
+        recordTuiWarning(takeMode.member, msg, source)
+        void dutyOfficer?.tick().catch(e => log('warn', `duty-officer: checking the pane after a TUI warning failed: ${e}`))
+      } catch (e) { log('error', `duty-officer: could not record TUI warning: ${e}`) }
+      return 'duty-officer'
+    } : undefined,
     // WO-120: usage walls are one state — API errors inside one aren't forwarded one by one; enter + clear alerts (with lanes on these are the
     // main's wall notices too: mainWallNoticeOwned)
     wall: () => wallReader.state(),
@@ -3131,7 +3140,6 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
 // WO-165 A (JEV_SCREEN): Jev reads the bottom of the main's screen (screen-status.ts); set up with the Onsen status below. The duty officer's looks of
 // the main's pane are handed to it, so the screen is not captured twice
 let screenStatus: ScreenStatus | null = null
-let dutyOfficer: DutyOfficer | null = null
 /** WO-176 r4 (Chiron 06:00Z: the test bench needs room to run 「值班員依序按三個權限」 again): DUTY_OFFICER_HOURLY_CAP_AGENTS (plist or machine config,
  *  read at start), `agent:N[,agent:N…]`: this agent's duty officer may judge N times an hour per pane (and the machine-wide count it checks is at least
  *  N); everyone else keeps DEFAULT_LIMITS (6 a pane, 30 a machine) */

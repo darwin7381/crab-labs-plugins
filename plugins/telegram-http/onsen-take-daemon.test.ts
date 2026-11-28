@@ -1878,6 +1878,21 @@ for (const [reason, outcome, code] of [
   expect(d.journal().some(r => r.rec === 'run' && r.state === 'exited' && r.reason === reason)).toBe(true)
 })
 
+test('a take member hands a non-limit TUI warning to the duty officer without an owner message', async () => {
+  const d = await daemon({ SYSTEM_ALERT_FORWARD: '1' })
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  const payload = { resourceLogs: [{ scopeLogs: [{ logRecords: [{
+    attributes: [{ key: 'event.name', value: { stringValue: 'api_refusal' } }],
+  }] }] }] }
+  const res = await fetch(d.base + '/v1/logs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload) })
+  expect(res.status).toBe(200)
+  const journal = join(d.root, 'home', '.claude', 'duty-officer', 'log.jsonl')
+  const event = readFileSync(journal, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(row => row.event === 'tui_warning')
+  expect(event).toMatchObject({ agent: 'adam', message: expect.stringContaining('API refusal') })
+  expect(d.f.calls.filter(c => c.path === '/v1/messages' && JSON.stringify(c.body).includes('API refusal'))).toHaveLength(0)
+})
+
 test('a runtime 409 cannot start due notices; a confirmed pull probe starts them', async () => {
   const id = 'review-c3-due'
   const d = await daemon({}, 200, root => {
