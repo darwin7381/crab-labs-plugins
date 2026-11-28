@@ -3840,7 +3840,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   if (tap) Lanes.observeLanes({ journal: (r, l) => tap.journal(r, l), mainEvent: b => tap.mainEvent(b) })
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
-  const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
+  const watch = tap ? null : new OnsenStatus.TurnWatch({ dir: () => existsSync(TRANSCRIPT_DIR) ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
   mainTurnNow = () => { try { return (tap ? tap.turnFacts()?.id : watch?.turnFacts()?.id) ?? null } catch { return null } }   // WO-172
   onsenPeer = process.env.ONSEN_PEER_LOOKUP === '0' ? null : (sid, req) => streams.note(sid, Lanes.claudePidOf(req, HTTP_PORT!))

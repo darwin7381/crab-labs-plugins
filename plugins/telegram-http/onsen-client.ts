@@ -76,7 +76,8 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
   | { k: 'ir'; r: ItemReport }
-  | { k: 'a' | 'r' | 'd' | 'w' | 'blocked' | 'c'; r: unknown } // historical spool entries, read only
+  | { k: 'd'; r: DeliveryFact } // historical, still readable by the local status view
+  | { k: 'a' | 'r' | 'w' | 'blocked' | 'c'; r: unknown } // historical spool entries, read only
 const SPOOL_KINDS = new Set(['ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
 /** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
@@ -101,7 +102,7 @@ export function answeredCall(refs: unknown): string | null {
   return (typeof v === 'string' || typeof v === 'number') && /^\d{1,18}$/.test(String(v).trim()) ? String(v).trim() : null
 }
 /** a run's Call as Onsen lists it (GET /v1/calls?ref_kind=run&ref_value=<run>), or why there is none to say */
-export type RunCallLookup = { found: { id: string; state: string | null; result: unknown } } | { none: true } | CallLineFate
+export type RunCallLookup = { found: { id: string; state: string | null; result: unknown } } | { none: true } | Exclude<CallLineFate, { fate: 'took' }>
 const CALL_RETRY_AT = [0, 1_000, 3_000, 7_000]
 /** the batch route of each kind that is posted in runs (≤500 a batch) */
 const BATCH_PATH: Record<string, string> = { s: '/status/batch', t: '/threads/events' }
@@ -477,6 +478,7 @@ export class OnsenClient {
     this.fileJobs.set(idem, { at: Date.now(), p })
     this.append({ k: 'm', r: item, fw: 1 })
   }
+  private noCredText(): string { return `no mesh credential${this.cfg.credentialWhere ? ` at ${this.cfg.credentialWhere}` : ''}` }
   private keepIds(idem: string, ids: string[]): void {
     this.fileIds.set(idem, ids)
     if (this.fileIds.size > 2_000) this.fileIds.delete(this.fileIds.keys().next().value!)
