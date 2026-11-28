@@ -1449,7 +1449,10 @@ export async function restartClaudeTUI(exactSession = false): Promise<string> {
   // A registered process can exit before automatic recovery runs. A missing exact target must never match a sibling.
   const targetSession = exactSession ? '=' + TMUX_SESSION : TMUX_SESSION
   const killResult = await runCommand(['tmux', 'kill-session', '-t', targetSession])
-  // killResult.exitCode != 0 may just mean session was already gone — proceed regardless.
+  if (exactSession && killResult.exitCode !== 0) {
+    throw new Error(`tmux kill-session ${targetSession} failed (${killResult.exitCode}): ${killResult.stderr.trim()}`)
+  }
+  // A manual /restart also checks the wrapper when its old session was already gone.
 
   if (SERVICE_MANAGER === 'systemd-user') return ensureWrapperSystemd(killResult.exitCode)
 

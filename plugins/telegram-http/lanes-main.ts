@@ -208,13 +208,16 @@ export function createMain(E: MainEnv) {
   const taking = (): boolean => E.itemReceiver?.()?.mode.active === true
   // S4 owns cannot_move/recovered, parked/cancelled and choose for take members.
   const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!taking()) E.tellJoey(...args) }
-  async function restartForReport(g: Row, reason: 'stuck' | 'usage_limit_probe'): Promise<void> {
+  function retryRestart(g: Row, error: unknown): void {
+    E.log('warn', `lanes: main ${g.id} restart after ${g.item_restart}: ${error}; will retry`)
+    setMain(g, g.state as MainPhase, { item_restart_retry: g.item_restart, item_restart: null, item_restart_at: null })
+  }
+  async function restartForReport(g: Row, reason: 'stuck' | 'usage_limit_probe', now = Date.now()): Promise<void> {
     if (g.item_restart || !E.restartSession) return
-    setMain(g, g.state as MainPhase, { item_restart: reason })
+    setMain(g, g.state as MainPhase, { item_restart: reason, item_restart_at: now, item_restart_retry: null })
     try { await E.restartSession() }
     catch (err) {
-      E.log('error', `lanes: main ${g.id} restart after ${reason}: ${err}`)
-      if (currentGen() === g && E.pidAlive(Number(g.pid))) setMain(g, g.state as MainPhase, { item_restart: null })
+      if (currentGen() === g && g.item_restart_at === now && E.pidAlive(Number(g.pid))) retryRestart(g, err)
     }
   }
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
@@ -751,7 +754,7 @@ export function createMain(E: MainEnv) {
     const back: Row[] = [], held: Row[] = [], capped: Row[] = []
     const again = (r: Row, f: Record<string, unknown> = {}): void => { J().write('msg', r.id, 'queued', { reason: why, gen: null, prompt_id: null, via_pull: null, ...f }); back.push(r) }
     for (const r of rs) {
-      if (endClaim(r, g, 'cut', g.item_restart === 'stuck' ? { note: '卡住重開' } : {})) continue
+      if (endClaim(r, g, 'cut', (g.item_restart ?? g.item_restart_retry) === 'stuck' ? { note: '卡住重開' } : {})) continue
       if (r.state === 'offered') { again(r); continue }
       if (r.state !== 'bound') continue
       const out = outputOf(g, r)
@@ -856,7 +859,7 @@ export function createMain(E: MainEnv) {
     const cutFact = why !== 'asked' && g.prompt_id && (g.state === 'in_turn' || (g.state === 'walled' && !g.cut_turn))
       ? bareCut(g, rs.filter(r => !r.prompt_id || r.prompt_id === g.prompt_id), 'gen_end') : undefined
     const { back, capped } = settle(g, rs, 'gen_end')
-    setMain(g, 'gone', { end_reason: why, item_restart: null, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: cutFact })
+    setMain(g, 'gone', { end_reason: why, item_restart: null, item_restart_retry: null, item_restart_at: null, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: cutFact })
     if (cur === g.id) cur = null
     pendingEnd.delete(g.id); lastEventAt.delete(g.id); work.delete(g.id)
     if (stuck?.gen === g.id && !stuck.undelivered) stuck = null              // 002w (E): what nobody could take is still waiting: that episode goes on
@@ -925,6 +928,8 @@ export function createMain(E: MainEnv) {
     // (the pulled message would land in the subagent). While the main's turn is open (it waits on its Agent call) the subagent's work is the gen's
     // sign of life; an idle main that leaves an offer untaken is not excused by its background agents.
     if (g.item_restart && ev !== 'SessionEnd') return {}
+    if ((g.item_restart || g.item_restart_retry) && ev === 'SessionEnd' && E.pidAlive(pid)) return {}
+    if (g.item_restart_retry === 'stuck' && ev !== 'SessionEnd') setMain(g, g.state as MainPhase, { item_restart_retry: null })
     if (b.sub && g.state !== 'in_turn') return {}
     lastEventAt.set(g.id, Date.now())
     if (stuck && !stuck.undelivered && stuck.gen === g.id) { stuck = null; tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
@@ -1226,12 +1231,18 @@ export function createMain(E: MainEnv) {
     const held = m === 'waiting' || wall.active
     const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
     if (taking()) {
+      // The wrapper can be healthy while the old TUI is still alive. tick already checked its pid above.
+      if (g?.item_restart) {
+        if (now - (g.item_restart_at ?? 0) >= 5_000) retryRestart(g, 'old pid is still alive')
+        return
+      }
+      if (g?.item_restart_retry) { await restartForReport(g, g.item_restart_retry, now); return }
       // An unbound Item uses its 20 s claim deadline. Only a running turn can be stuck.
-      if (g?.state === 'in_turn' && !g.item_restart && (stuck?.gen !== g.id || stuck.undelivered) && !held && m !== 'compacting' && m !== 'starting'
+      if (g?.state === 'in_turn' && (stuck?.gen !== g.id || stuck.undelivered) && !held && m !== 'compacting' && m !== 'starting'
           && m !== 'offline' && now - (lastEventAt.get(g.id) ?? now) > silenceLimit) {
         for (const r of unsettled(g, g.prompt_id)) if (r.state === 'bound' && r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'stuck')
         stuck = { gen: g.id, prompt: g.prompt_id, at: now }
-        await restartForReport(g, 'stuck')
+        await restartForReport(g, 'stuck', now)
       }
       await pump()
       return
