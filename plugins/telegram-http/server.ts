@@ -155,6 +155,21 @@ const roamerMember = Onsen.roamerMember(process.env)
 const CONNECTOR_AGENT = roamerMember && switchOn(process.env.ONSEN_TAKE, roamerMember) ? roamerMember
   : Onsen.agentName(process.env, process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR))
 let CONNECTOR = !INBOX_ONLY && !ROAMER
+const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, CONNECTOR_AGENT)
+const takeReason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, targetRouting: isRoamerEnabled() && !!roamerMember,
+  lanes: Lanes.LANES_ON, record: Onsen.recordFor(process.env, CONNECTOR_AGENT, ROAMER),
+  observation: switchOn(process.env.ONSEN_OBSERVATION, CONNECTOR_AGENT) })
+function requireLocalBotToken(): void {
+  if (!TOKEN && ROAMER && !CONNECTOR) {
+    process.stderr.write(
+      `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
+      `  set in ${ENV_FILE}\n` +
+      `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
+    )
+    process.exit(1)
+  }
+}
+if (!ONSEN_TAKE_ON || takeReason) requireLocalBotToken()
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 /** WO-189: the files of Joey's Onsen messages taken into INBOX_DIR, by their attachment_file_id (onsen:<file id>): download_attachment answers with them */
 const onsenSaved = new Map<string, string>()
@@ -340,7 +355,6 @@ const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClien
   credential: () => readCredentialFile(ONSEN_CRED_FILE), credentialWhere: ONSEN_CRED_FILE, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
 })
-const ONSEN_TAKE_ON = switchOn(process.env.ONSEN_TAKE, ONSEN_AGENT)
 let takeMode: TakeMode | undefined
 let itemPeek: ItemPeek | undefined
 let itemReceiver: ItemReceiver | undefined
@@ -349,9 +363,7 @@ let itemClaims: Claims | undefined
 let registryStatusChanged: (() => void) | undefined
 let connectorReady = false
 if (ONSEN_TAKE_ON) {
-  const reason = takeRefusal({ inbox: INBOX_ONLY, roamer: ROAMER, targetRouting: isRoamerEnabled() && !!roamerMember, lanes: Lanes.LANES_ON, record: Onsen.recordFor(process.env, ONSEN_AGENT, ROAMER),
-    observation: switchOn(process.env.ONSEN_OBSERVATION, ONSEN_AGENT) })
-  if (reason) log('info', `onsen take: staying on pull: ${reason}`)
+  if (takeReason) log('info', `onsen take: staying on pull: ${takeReason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
       async active => {
@@ -373,15 +385,7 @@ if (ONSEN_TAKE_ON) {
     if (!ROAMER) { Lanes.useItemReceiver(itemReceiver); Lanes.observeItemGates(() => itemPeek!.reset()) }
   }
 }
-if (ROAMER) await takeMode?.probe()
-if (!TOKEN && ROAMER && !CONNECTOR) {
-  process.stderr.write(
-    `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
-    `  set in ${ENV_FILE}\n` +
-    `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
-  )
-  process.exit(1)
-}
+if (ROAMER && takeMode) { await takeMode.probe(); requireLocalBotToken() }
 tg = ROAMER && !CONNECTOR
   ? new (await import('./roamer-telegram.ts')).RoamerTelegram({ token: TOKEN!, ...(process.env.TELEGRAM_API_ROOT ? { apiRoot: process.env.TELEGRAM_API_ROOT } : {}), log })
   : null

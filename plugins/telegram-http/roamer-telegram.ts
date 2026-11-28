@@ -916,11 +916,12 @@ export class RoamerTelegram {
 
   /** bot.stop() signals the poll loop to end; the current getUpdates request may take up to its long-poll timeout to return */
   async stop(drain = false): Promise<void> {
+    if (!drain) return this.bot.stop()
     this.stopped = true
     for (const timer of this.timers) clearInterval(timer)
     if (this.bot.isRunning()) {
       try { await this.bot.stop() } catch (err) { this.log('warn', `roamer: last polling offset could not be confirmed: ${err}`) }
     }
-    if (drain) await this.pollTask
+    await this.pollTask
   }
 }
