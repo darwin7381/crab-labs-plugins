@@ -105,6 +105,17 @@ for (const [name, cfg, reason] of [
   if (reason) expect(log[0]).toContain(reason)
 })
 
+test('the inbox daemon follows take_member and serves the take relays with its local switch unset', async () => {
+  const d = await daemon({ CHANNEL_INBOX_ONLY: '1', AGENT_INBOX_SELF: 'adam', ONSEN_PULL: 'adam', ONSEN_TAKE: '' })
+  await waitFor(() => d.log().includes('member is on take'))
+  for (const endpoint of ['inbound-log', 'scheduler-taken']) {
+    const reply = await fetch(d.base + '/lanes/' + endpoint, { method: 'POST', headers: { Authorization: 'Bearer test-loopback' }, body: '{}' })
+    expect(reply.status).toBe(200)
+  }
+  expect(d.f.calls.some(c => c.path.endsWith('/items'))).toBe(false)
+  expect(d.log()).not.toContain('GET /inbox: HTTP 409')
+})
+
 test('daemon probes only once on an old server and keeps observation on the legacy shape', async () => {
   const d = await daemon({}, 400)
   await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation')))

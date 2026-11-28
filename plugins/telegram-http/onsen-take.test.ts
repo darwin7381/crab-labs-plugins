@@ -80,7 +80,7 @@ test('switch, prerequisites, stable machine/member and all probe refusals', asyn
 
 test('agent-inbox reports a pause once, including first start, and can resume pull', async () => {
   const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
-  const pull = new OnsenPuller({ inbox, base: r.f.base, req: r.client.request.bind(r.client), takeEnabled: true, host: 'mac-mini',
+  const pull = new OnsenPuller({ inbox, base: r.f.base, req: r.client.request.bind(r.client), host: 'mac-mini',
     deliver: async () => 'delivered', log: (_lv, m) => r.logs.push(m) })
   await pull.once(); await pull.once()
   expect(r.logs.filter(s => s.includes('member is on take'))).toHaveLength(1)
@@ -94,7 +94,7 @@ test('after the switch the next pull round delivers and acks the pending prefix'
   const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
   const handed: number[] = []
   let ready = false
-  const pull = new OnsenPuller({ inbox, base: r.f.base, takeEnabled: true, host: 'mac-mini', now: r.f.now,
+  const pull = new OnsenPuller({ inbox, base: r.f.base, host: 'mac-mini', now: r.f.now,
     req: r.client.request.bind(r.client), log: () => {},
     deliver: async it => { if (!ready) return 'later'; handed.push(it.seq); return 'delivered' } })
   r.f.mode(409)

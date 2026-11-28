@@ -2078,7 +2078,7 @@ const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
   const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
-const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ takeEnabled: ONSEN_TAKE_ON, req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
+const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
   deliver: (it, again) => deliverPulled(it, again), log, host: (process.env.ONSEN_HOST ?? '').trim() || hostname().replace(/\.local$/, ''),
   ...(Number(process.env.ONSEN_PERSON_RETRY_MS) > 0 ? { laterMs: Number(process.env.ONSEN_PERSON_RETRY_MS) } : {}),   // WO-194 A.2: tests only
   ...(process.env.ONSEN_PULL_WAIT_S ? { waitS: Number(process.env.ONSEN_PULL_WAIT_S) } : {}),
@@ -4264,7 +4264,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      ...(ONSEN_TAKE_ON ? { inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled } : {}),
+      inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled,
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
