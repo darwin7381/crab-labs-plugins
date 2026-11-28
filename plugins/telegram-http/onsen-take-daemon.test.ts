@@ -239,6 +239,50 @@ test('C4 main hooks create a waiting resume; an independent turn after fixture r
   expect(d.f.history).toHaveLength(0)
 }, 15_000)
 
+test('settled 59 in the daemon: only the background turn that receives a carrier withdraws the resume', async () => {
+  const session_id = randomUUID()
+  const d = await daemon({ ONSEN_PEER_LOOKUP: '0' }, 200, root => {
+    writeFileSync(join(root, '.lanes', 'main-expected'), session_id)
+    const sessions = join(root, 'home', '.claude', 'sessions')
+    mkdirSync(sessions, { recursive: true })
+    writeFileSync(join(sessions, process.pid + '.json'), JSON.stringify({ pid: process.pid, sessionId: session_id,
+      cwd: root, startedAt: Date.now(), procStart: '', kind: 'interactive', name: 'adam', status: 'idle', statusUpdatedAt: Date.now() }))
+    return { ONSEN_SESSIONS_DIR: sessions }
+  })
+  const hook = async (event: string, prompt_id: string, extra = {}) => {
+    const r = await fetch(d.base + '/lanes/main-event', { method: 'POST', headers: {
+      'Content-Type': 'application/json', Authorization: 'Bearer test-loopback' },
+      body: JSON.stringify({ event, prompt_id, pid: process.pid, session_id, ...extra }) })
+    expect(r.status).toBe(200)
+    return r.json()
+  }
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  await hook('SessionStart', '', { source: 'startup' })
+  await hook('UserPromptSubmit', 'broken', { dids: [] })
+  await hook('StopFailure', 'broken', { error: 'overloaded' })
+  await waitFor(() => d.f.rows.size === 1)
+  const resume = [...d.f.rows.values()][0]!
+  await hook('UserPromptSubmit', 'untold', { source: 'task-notification', dids: [] })
+  await hook('Stop', 'untold', { phase: 'final' })
+  await d.restart()
+  await waitFor(() => d.log().includes('onsen take: started') && d.f.calls.filter(c => c.query.get('limit') === '1').length >= 2)
+  expect(resume.state).toBe('waiting')
+  await hook('UserPromptSubmit', 'told', { source: 'task-notification', dids: [] })
+  const session = new Client({ name: 'resume-main', version: '1' }, { capabilities: {} })
+  clean.push(() => session.close())
+  await session.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp')))
+  const carrier = d.f.add('deliver-with-line')
+  await waitFor(() => d.journal().some(l => l.rec === 'msg' && l.onsen_items?.[0]?.onsen_item_id === carrier.id))
+  const reply = await hook('PostToolUse', 'told', { tool_name: 'Read' })
+  expect(reply.additionalContext).toContain(resume.payload.text)
+  expect(resume.state).toBe('waiting')
+  await hook('Stop', 'told', { phase: 'final' })
+  await waitFor(() => resume.state === 'cancelled')
+  expect(resume.reason).toBe('withdrawn')
+  expect(d.f.calls.filter(c => c.body.outcome === 'withdrawn')).toHaveLength(1)
+  expect(d.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids?.includes(resume.id))).toBe(false)
+}, 15000)
+
 const worker = 'adam.worker.1'
 test('C5 bench: the main reply tool writes one timed promise for the test account and a report at minute five produces no waiter notice', async () => {
   const jev = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answers: { promises: { type: 'noul', noul: 0.99 } } }) })
