@@ -134,7 +134,7 @@ describe('stage two', () => {
     expect(tg.callsOf(TOK, 'getUpdates').at(-1).allowed_updates).toContain('message_reaction')
   }, T)
 
-  test('groups: a mention goes in with the group as its chat (a stranger as a guest); no mention, dropped; nothing answered in the group; out to the group, an echo names who', async () => {
+  test('groups: every allowed line goes in with its mentions and group title; a stranger becomes a guest; an echo names who', async () => {
     const g = { id: GROUP, type: 'supergroup', title: 'Lab' }
     const before = onsen.messages.length
     tg.push(TOK, { message: { message_id: 501, from: { id: JOEY, is_bot: false, first_name: 'Joey' }, chat: g, date: Math.floor(Date.now() / 1000), text: 'no mention here' } })
@@ -142,7 +142,9 @@ describe('stage two', () => {
     tg.push(TOK, { message: { message_id: 503, from: { id: GUEST, is_bot: false, first_name: 'Guest' }, chat: g, date: Math.floor(Date.now() / 1000), text: '@gamma_bot hi', entities: [{ type: 'mention', offset: 0, length: 10 }] } })
     await until(() => tg.unconfirmed(TOK) === 0, 5000, 'all done')
     const inGroup = onsen.messages.slice(before)
-    expect(inGroup.map(x => [x.client_msg_id, x.chat, x.chat_title])).toEqual([['502', String(GROUP), 'Lab'], ['503', String(GROUP), 'Lab']])   // WO-179: the group's name
+    expect(inGroup.map(x => [x.client_msg_id, x.chat, x.chat_title, x.mentions])).toEqual([
+      ['501', String(GROUP), 'Lab', []], ['502', String(GROUP), 'Lab', ['gamma']], ['503', String(GROUP), 'Lab', ['gamma']],
+    ])
     expect(onsen.identities.get(String(GUEST))).toBe(`tg-${GUEST}`)                            // Onsen made the stranger a guest
     expect(tg.sentTo(TOK, String(GROUP)).length).toBe(0)
     onsen.push({ ...msgItem('g1', 'to the group'), chat: String(GROUP) })

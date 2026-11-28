@@ -21,7 +21,7 @@ export class FakeTelegram {
   /** the rich send is refused (the plain fallback runs) */
   refuseRich = false
   constructor() {
-    this.server = Bun.serve({ port: 0, fetch: req => this.handle(req) })
+    this.server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: req => this.handle(req) })
   }
   get root(): string { return `http://127.0.0.1:${this.server.port}` }
   stop(): void { this.server.stop(true) }
@@ -120,7 +120,7 @@ export class FakeTelegram {
 type Endpoint = { extension: string; records: any[] }
 const BRIDGE_MSG_KEYS = ['member', 'client_user_id', 'client_user', 'chat', 'client_msg_id', 'sent_at', 'text', 'kind', 'attachment_file_ids', 'attachments',
   'reply_to_client_msg_id', 'reply_quote', 'reply_to_text', 'reply_to_user', 'client_thread', 'topic_name', 'forward_from', 'forward_date', 'media_group_id', 'idem_key',
-  'chat_title']
+  'chat_title', 'mentions']
 const NULLABLE = new Set(['reply_to_client_msg_id', 'reply_quote', 'reply_to_text', 'reply_to_user', 'client_thread', 'topic_name', 'forward_from', 'forward_date', 'media_group_id',
   'chat_title'])
 
@@ -147,6 +147,7 @@ export class FakeOnsen {
   resolves: Array<{ id: string; body: any }> = []
   lifts: Array<{ id: string; body: any }> = []
   threads: any[] = []
+  chatWrites: Array<{ path: string; body: any }> = []
   reports: Array<{ id: string; body: any }> = []
   files = new Map<string, { bytes: Uint8Array; name: string | null; mime: string; key: string | null }>()
   feed: any[] = []
@@ -159,7 +160,7 @@ export class FakeOnsen {
   answers: Array<{ path: RegExp; status: number; json: any }> = []
   bad: string[] = []
   requests: Array<{ method: string; path: string; who: string }> = []
-  constructor() { this.server = Bun.serve({ port: 0, fetch: (req, srv) => this.handle(req, srv) }) }
+  constructor() { this.server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: (req, srv) => this.handle(req, srv) }) }
   get base(): string { return `http://127.0.0.1:${this.server.port}/api/onsen` }
   stop(): void { this.server.stop(true) }
   /** a BridgeItem into the feed (seq assigned here) */
@@ -251,6 +252,7 @@ export class FakeOnsen {
       this.check(keys.join(',') === [...BRIDGE_MSG_KEYS].sort().join(','), `bridge message keys ${keys.join(',')}`)
       for (const k of BRIDGE_MSG_KEYS) this.check(body[k] !== undefined && (body[k] !== null || NULLABLE.has(k)), `bridge message ${k} missing or null`)
       this.check(typeof body.text === 'string' && typeof body.kind === 'string' && Array.isArray(body.attachments) && Array.isArray(body.attachment_file_ids), 'bridge message types')
+      this.check(Array.isArray(body.mentions) && body.mentions.every((n: unknown) => typeof n === 'string'), 'mentions')
       this.check(typeof body.client_user === 'object' && 'username' in body.client_user && 'display_name' in body.client_user, 'client_user shape')
       for (const a of body.attachments ?? []) this.check(Object.keys(a).sort().join(',') === 'bytes,client_ref,kind,mime,name', `attachment keys ${Object.keys(a).sort().join(',')}`)
       if (this.holders.get(body.member) !== who) return this.e(404, 'no_endpoint', `${who} 沒有帶 ${body.member}`)
@@ -259,10 +261,15 @@ export class FakeOnsen {
       if (!from) return this.e(403, 'unknown_identity', '不認得這個帳號')
       if (this.notPeople.has(String(body.client_user_id))) return this.e(403, 'not_allowed', '這個帳號是 agent')
       const dup = this.messages.find(x => x.idem_key === body.idem_key)
-      if (dup) return this.d({ message_id: dup.id, conversation_id: `cv_${body.member}`, from, duplicate: true })
+      const conversation_id = `cv_${String(body.chat).startsWith('-') ? body.chat : body.member}`
+      if (dup) return this.d({ message_id: dup.id, conversation_id, from, duplicate: true })
       const id = String(9000 + this.messages.length + 1)
       this.messages.push({ id, ...body, at: Date.now() })
-      return this.d({ message_id: id, conversation_id: `cv_${body.member}`, from, duplicate: false }, 201)
+      return this.d({ message_id: id, conversation_id, from, duplicate: false }, 201)
+    }
+    if (req.method === 'PUT' && /^\/v1\/bridge\/chats\/-\d+(\/members\/[^/]+)?$/.test(p)) {
+      this.chatWrites.push({ path: p, body })
+      return this.d({})
     }
     if (p === '/v1/bridge/messages/edit' && req.method === 'POST') {
       this.check(Object.keys(body ?? {}).sort().join(',') === 'chat,client_msg_id,edited_at,member,text', `edit keys ${Object.keys(body ?? {}).sort().join(',')}`)

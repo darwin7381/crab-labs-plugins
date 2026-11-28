@@ -2,8 +2,7 @@
 // (WO-196 part B: 「過白名單（照舊讀那一隻的 access.json，配對照舊）」). Ported from server.ts 1.58.21 (gate 367-426, dmCommandGate 429-439,
 // isMentioned 441-465, readAccessFile 288-312, pruneExpired 350-360, pairingRemainingMin 513-515, checkApprovals 471-491): server.ts cannot be
 // imported (it starts a bot and exits without a port at load), and once WO-197 makes the daemons connectors this code leaves server.ts; the
-// bridge then holds the only copy. Behaviour kept: the pairing code (6 hex, 30 min, 2 replies at most, 3 pending at most), the group policy
-// (allowFrom, requireMention, mention patterns, a reply to the bot counts), /telegram:access's approved/<id> files.
+// bridge then holds the only copy. The group and sender allowlists govern intake; Onsen chooses the recipients (§4c).
 //
 // One difference, on purpose: a corrupt access.json is not moved aside and replaced (the daemon did that to its own file); the bridge reads
 // another program's file, so it refuses every message of that bot until the file reads again (fail closed), one log line.
@@ -64,31 +63,18 @@ export const pairingRemainingMin = (expiresAt: number, now = Date.now()): number
 export type GateMsg = { from?: { id: number | string } | null; chat?: { id: number | string; type?: string } | null; text?: string; caption?: string
   entities?: any[]; caption_entities?: any[]; reply_to_message?: any }
 
-/** server.ts isMentioned: an @mention of the bot, a text_mention of it, a reply to one of its messages, or a mention pattern */
-export function isMentioned(m: GateMsg, botUsername: string, extraPatterns?: string[]): boolean {
-  const entities = m.entities ?? m.caption_entities ?? []
-  const text = m.text ?? m.caption ?? ''
-  for (const e of entities) {
-    if (e.type === 'mention' && text.slice(e.offset, e.offset + e.length).toLowerCase() === `@${botUsername}`.toLowerCase()) return true
-    if (e.type === 'text_mention' && e.user?.is_bot && e.user.username === botUsername) return true
-  }
-  if (m.reply_to_message?.from?.username === botUsername) return true
-  for (const pat of extraPatterns ?? []) { try { if (new RegExp(pat, 'i').test(text)) return true } catch {} }
-  return false
-}
-
 export type GateResult = { action: 'deliver'; access: Access } | { action: 'drop'; why: string } | { action: 'pair'; code: string; isResend: boolean; expiresAt: number }
 
 /** server.ts gate(): deliver, drop, or the pairing code to send. Writes access.json when it prunes or adds a pending code (as the daemon does). */
-export function gate(stateDir: string, m: GateMsg, botUsername: string, now = Date.now()): GateResult {
+export function gate(stateDir: string, m: GateMsg, now = Date.now()): GateResult {
   const access = readAccess(stateDir)
   if (!access) return { action: 'drop', why: 'access.json does not parse' }
-  if (pruneExpired(access, now)) saveAccess(stateDir, access)
   if (access.dmPolicy === 'disabled') return { action: 'drop', why: 'dmPolicy disabled' }
   if (!m.from) return { action: 'drop', why: 'no sender' }
   const senderId = String(m.from.id)
   const chatType = m.chat?.type
   if (chatType === 'private') {
+    if (pruneExpired(access, now)) saveAccess(stateDir, access)
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
     if (access.dmPolicy === 'allowlist') return { action: 'drop', why: 'not on the allowlist' }
     for (const [code, p] of Object.entries(access.pending)) {
@@ -111,7 +97,6 @@ export function gate(stateDir: string, m: GateMsg, botUsername: string, now = Da
     if (!policy) return { action: 'drop', why: 'group not allowlisted' }
     const groupAllowFrom = (policy.allowFrom ?? []).map(String)
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) return { action: 'drop', why: 'not on the group allowlist' }
-    if ((policy.requireMention ?? true) && !isMentioned(m, botUsername, access.mentionPatterns)) return { action: 'drop', why: 'group: not mentioned' }
     return { action: 'deliver', access }
   }
   return { action: 'drop', why: `chat type ${chatType}` }

@@ -37,9 +37,9 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 
 ## In: Telegram → Onsen (`inbound.ts`)
 
-- **Polling.** `getUpdates` with `allowed_updates` `message, edited_message, callback_query, message_reaction`.
+- **Polling.** `getUpdates` with `allowed_updates` `message, edited_message, callback_query, message_reaction, my_chat_member`.
 - **Confirming.** An update is confirmed to Telegram (the next offset passes it) only once it is done. The first update not done holds the offset, so a restart gets it again.
-- **Gate.** That agent's `access.json`, ported from `server.ts`: DM allowlist, pairing codes (written into `access.json` as before; `approved/<id>` → "Paired! Say hi to Claude."), group policy and mentions. A corrupt `access.json` refuses everything for that bot; it is not moved aside.
+- **Gate.** That agent's `access.json`, ported from `server.ts`: DM allowlist, pairing codes (written into `access.json` as before; `approved/<id>` → "Paired! Say hi to Claude."), group allowlists and allowed senders. The bridge forwards mentions of its bots as member names. Onsen selects recipients. A corrupt `access.json` refuses everything for that bot; it is not moved aside.
 - **A message.**
   1. Its file is fetched from Telegram (≤ 20 MB) and stored with `POST /v1/files`.
   2. A voice note carries the audio and its caption. Without a caption, `text` is the empty string. Onsen transcribes the audio on arrival.
@@ -51,7 +51,7 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
 - **Onsen down** (no answer, 5xx, 429, 401, 404 `no_endpoint`):
   - The write is tried again after 2 s, 4 s, then every 5 s, and every later write of that bot waits behind it.
   - A message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 \<agent\>；連上會自動補交，不用重傳。」 That happens once per message, remembered across restarts.
-  - When Onsen is back, the messages are written once (`idem_key` `tg:<agent>:<chat>:<message id>`), in order, then 👀.
+  - When Onsen is back, each bot resumes writing in order and acknowledges success with 👀. DMs use `tg:<member>:<chat>:<message_id>`. Supergroups use `tg:<chat>:<message_id>`. Basic groups use `tg:<chat>:<from.id>:<date>:<first 16 hex digits of SHA-256(text or caption)>`.
 - **Refused for good.**
   - 403 `not_allowed` (the account is an agent or a system member), or `unknown_identity` (before Onsen 0.35.1; a stranger in a group becomes a guest). The update is done, nothing is answered, and one log line is written.
   - 400. The update isn't tried again; in a DM, one reply says it wasn't handed over.
@@ -106,7 +106,9 @@ One long poll of `GET /v1/bridge/feed?after=<cursor>&wait=50&limit=100`. The cur
 | `PUT /api/onsen/v1/extensions/<name>/collections/endpoints` | `{reported_at, records:[{id, title, line, member, state, attributes}]}` |
 | `GET /api/onsen/v1/members?limit=100[&cursor=]` | — |
 | `POST /api/onsen/v1/files` | the bytes; `Content-Type`, `X-File-Name`, `Idempotency-Key: <idem_key>` |
-| `POST /api/onsen/v1/bridge/messages` | every §7d field, `null` where empty: `{member, client_user_id, client_user:{username, display_name}, chat, client_msg_id, sent_at, text, kind, attachment_file_ids, attachments:[{kind, name, mime, bytes, client_ref}], reply_to_client_msg_id, reply_quote, reply_to_text, reply_to_user, client_thread, topic_name, forward_from, forward_date, media_group_id, idem_key}`; `Idempotency-Key: <idem_key>` |
+| `POST /api/onsen/v1/bridge/messages` | §7d and §4c `{member, mentions, client_user_id, client_user:{username, display_name}, chat, client_msg_id, sent_at, text, kind, attachment_file_ids, attachments:[{kind, name, mime, bytes, client_ref}], reply_to_client_msg_id, reply_quote, reply_to_text, reply_to_user, client_thread, topic_name, forward_from, forward_date, media_group_id, idem_key}`; `Idempotency-Key: <idem_key>` |
+| `PUT /api/onsen/v1/bridge/chats/<chat>/members/<member>` | `{state:"in"/"left", at}` |
+| `PUT /api/onsen/v1/bridge/chats/<old chat>` | `{moved_to:"<new chat>"}` |
 | `POST /api/onsen/v1/bridge/messages/edit` | `{member, chat, client_msg_id, text, edited_at}` |
 | `POST /api/onsen/v1/bridge/reactions` | `{member, chat, client_msg_id, client_user_id, emojis, at}` |
 | `POST /api/onsen/v1/bridge/actions/<id>/resolve` | `{client_user_id, option, at}` |

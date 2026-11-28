@@ -10,7 +10,7 @@ import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
 import { sorryText, START_TEXT } from './inbound.ts'
 import { Drawer } from './outbound.ts'
 import { Bridge, configFromEnv, endpointRecord, takenOf } from './telegram-bridge.ts'
-import { gate, isMentioned, mayAct, readAccess } from './tg-access.ts'
+import { gate, mayAct, readAccess } from './tg-access.ts'
 import { chunk, labelParts } from './tg-format.ts'
 import { SinceTracker } from '../onsen-visible.ts'
 
@@ -127,25 +127,24 @@ describe('which agents', () => {
 })
 
 describe('access.json (ported from server.ts)', () => {
-  test('DM allowlist, pairing (code written, 2 replies, then silent), group mention, mayAct', () => {
+  test('DM allowlist, pairing (code written, 2 replies, then silent), group allowlist, mayAct', () => {
     const dir = join(root, 'acc')
     put(join(dir, 'access.json'), { dmPolicy: 'pairing', allowFrom: ['1'], groups: { '-5': { requireMention: true, allowFrom: [] } }, pending: {} })
-    expect(gate(dir, { from: { id: 1 }, chat: { id: 1, type: 'private' } }, 'bot').action).toBe('deliver')
-    const p1 = gate(dir, { from: { id: 2 }, chat: { id: 2, type: 'private' } }, 'bot') as any
+    expect(gate(dir, { from: { id: 1 }, chat: { id: 1, type: 'private' } }).action).toBe('deliver')
+    const p1 = gate(dir, { from: { id: 2 }, chat: { id: 2, type: 'private' } }) as any
     expect(p1.action).toBe('pair'); expect(p1.code).toMatch(/^[0-9a-f]{6}$/); expect(p1.isResend).toBe(false)
     expect(Object.keys(readAccess(dir)!.pending)).toEqual([p1.code])
-    expect((gate(dir, { from: { id: 2 }, chat: { id: 2, type: 'private' } }, 'bot') as any).isResend).toBe(true)
-    expect(gate(dir, { from: { id: 2 }, chat: { id: 2, type: 'private' } }, 'bot').action).toBe('drop')
-    expect(gate(dir, { from: { id: 3 }, chat: { id: -5, type: 'supergroup' }, text: 'hi' }, 'bot').action).toBe('drop')
-    expect(gate(dir, { from: { id: 3 }, chat: { id: -5, type: 'supergroup' }, text: 'hi @Bot', entities: [{ type: 'mention', offset: 3, length: 4 }] }, 'bot').action).toBe('deliver')
-    expect(isMentioned({ reply_to_message: { from: { username: 'bot' } } }, 'bot')).toBe(true)
-    expect(gate(dir, { from: { id: 3 }, chat: { id: -6, type: 'group' } }, 'bot').action).toBe('drop')
+    expect((gate(dir, { from: { id: 2 }, chat: { id: 2, type: 'private' } }) as any).isResend).toBe(true)
+    expect(gate(dir, { from: { id: 2 }, chat: { id: 2, type: 'private' } }).action).toBe('drop')
+    expect(gate(dir, { from: { id: 3 }, chat: { id: -5, type: 'supergroup' }, text: 'hi' }).action).toBe('deliver')
+    expect(gate(dir, { from: { id: 3 }, chat: { id: -5, type: 'supergroup' }, text: 'hi @Bot', entities: [{ type: 'mention', offset: 3, length: 4 }] }).action).toBe('deliver')
+    expect(gate(dir, { from: { id: 3 }, chat: { id: -6, type: 'group' } }).action).toBe('drop')
     const a = readAccess(dir)!
     expect(mayAct(a, { id: 1, type: 'private' }, '1')).toBe(true)
     expect(mayAct(a, { id: 2, type: 'private' }, '2')).toBe(false)
     expect(mayAct(a, { id: -5, type: 'group' }, '9')).toBe(true)
     put(join(dir, 'access.json'), '{not json')
-    expect(gate(dir, { from: { id: 1 }, chat: { id: 1, type: 'private' } }, 'bot').action).toBe('drop')       // fail closed
+    expect(gate(dir, { from: { id: 1 }, chat: { id: 1, type: 'private' } }).action).toBe('drop')       // fail closed
     expect(readFileSync(join(dir, 'access.json'), 'utf8')).toBe('{not json')                                        // and left as it is
   })
 })

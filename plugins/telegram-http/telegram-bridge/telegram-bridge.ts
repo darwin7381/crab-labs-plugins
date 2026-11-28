@@ -134,6 +134,7 @@ export class Bridge {
   readonly two: StageTwo
   readonly agents = new Map<string, Agent>()
   readonly pollers = new Map<string, Poller>()
+  private readonly unknownChatEndpoints = new Set<string>()
   /** client_meta left out until (an Onsen before 0.35.4 refuses it; shared by every poller) */
   readonly clientMeta = { offUntil: 0 }
   /** listed but not carried (no token, a token Telegram refuses, two daemons): member → why; shown as records with member null */
@@ -262,6 +263,7 @@ export class Bridge {
   private ensurePoller(a: Agent): void {
     if (this.pollers.get(a.member)?.running) return
     const p = new Poller(a, {
+      agents: this.agents, unknownChatEndpoints: this.unknownChatEndpoints,
       onsen: this.onsen, state: this.state, log: (l, msg) => this.log(l, msg), now: this.deps.now, pollTimeoutS: this.cfg.pollTimeoutS,
       buttonKey: k => this.state.data.keys[k] ?? null, reRegister: () => { this.endpointsDirty = true; this.needRegister = true },
       onHandover: ag => { void this.drop(ag.member, 'its daemon polls the bot again (Telegram 409): handed over') },

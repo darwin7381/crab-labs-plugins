@@ -1,0 +1,144 @@
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Agent } from './agent.ts'
+import { FakeOnsen, FakeTelegram, until } from './fakes.ts'
+import { Bridge, configFromEnv } from './telegram-bridge.ts'
+
+const a = '101:lab-a', b = '102:lab-b'
+const supergroup = { id: -100212, type: 'supergroup' }, group = { id: -23, type: 'group' }
+const from = { id: 42, first_name: 'Guest' }, date = 1_700_000_000
+let bridge: Bridge, tg: FakeTelegram, onsen: FakeOnsen, dir: string, logs: string[]
+
+beforeEach(async () => {
+  dir = mkdtempSync(join(tmpdir(), 'wo217-bridge-'))
+  tg = new FakeTelegram()
+  onsen = new FakeOnsen()
+  logs = []
+  const log = (level: string, message: string) => logs.push(level + ' ' + message)
+  const cfg = configFromEnv({ HOME: dir, TELEGRAM_BRIDGE_MACHINE: 'lab', TELEGRAM_BRIDGE_STATE_DIR: dir,
+    TELEGRAM_API_ROOT: tg.root, ONSEN_BASE: onsen.base, TELEGRAM_BRIDGE_POLL_TIMEOUT_S: '1', TELEGRAM_BRIDGE_SORRY_S: '0.1' })
+  bridge = new Bridge(cfg, { log })
+  bridge.onsen.token = () => 'test'
+  onsen.creds.set('test', cfg.name)
+  for (const [member, token, username] of [['lab-a', a, 'lab_a_bot'], ['lab-b', b, 'lab_b_bot']] as const) {
+    const sd = join(dir, member)
+    mkdirSync(sd)
+    writeFileSync(join(sd, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['42'],
+      groups: { [group.id]: { allowFrom: ['42'] }, [supergroup.id]: { requireMention: true, allowFrom: [] } },
+      mentionPatterns: member === 'lab-b' ? ['[', '小乙'] : [] }))
+    tg.addBot(token, username)
+    const agent = new Agent(member, sd, 'test', { token, mtime: 0 }, { bridgeDir: dir, tgOptions: cfg.tg, log })
+    agent.username = username
+    bridge.agents.set(member, agent)
+  }
+  await bridge.register()
+  await bridge.syncEndpoints()
+})
+afterEach(async () => {
+  await bridge.stop()
+  tg.stop()
+  onsen.stop()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+const confirmed = () => until(() => tg.unconfirmed(a) + tg.unconfirmed(b) === 0, 5000, 'both pollers confirmed')
+function memberUpdate(oldStatus: string, newStatus: string, user = 101) {
+  return { my_chat_member: { chat: group, date, old_chat_member: { status: oldStatus, user: { id: user } },
+    new_chat_member: { status: newStatus, user: { id: user } } } }
+}
+
+test('two bots POST one unmentioned group line, confirm both aliases and each ack once', async () => {
+  const requests = spyOn(bridge.onsen, 'req')
+  const message = { message_id: 5, from, chat: supergroup, date, text: '你好' }
+  tg.push(a, { message })
+  await confirmed()
+  tg.push(b, { message })
+  await confirmed()
+  expect(onsen.messages).toHaveLength(1)
+  expect(onsen.messages[0]).toMatchObject({ member: 'lab-a', chat: '-100212', mentions: [], idem_key: 'tg:-100212:5' })
+  const posts = requests.mock.calls.map((call, i) => ({ call, i })).filter(({ call }) => call[1] === '/bridge/messages')
+  expect(posts.map(({ call }) => [(call[2] as any).member, call[3]?.idem])).toEqual([['lab-a', 'tg:-100212:5'], ['lab-b', 'tg:-100212:5']])
+  const result = await requests.mock.results[posts[1]!.i]!.value
+  expect(result.json.data).toMatchObject({ duplicate: true, message_id: onsen.messages[0].id })
+  expect(bridge.agents.get('lab-b')!.stats.duplicates).toBe(1)
+  expect(logs.filter(l => /^(warn|error)/.test(l))).toEqual([])
+  for (const t of [a, b]) expect(tg.callsOf(t, 'setMessageReaction').map(r => r.reaction[0].emoji)).toEqual(['👀'])
+  expect(onsen.bad).toEqual([])
+})
+
+test('basic group dedupes different bot-local ids by person, second and raw caption; the gate still checks the sender', async () => {
+  const m = { from, date, chat: group, caption: '附件' }
+  tg.push(a, { message: { ...m, message_id: 7 } })
+  tg.push(b, { message: { ...m, message_id: 81 } })
+  tg.push(b, { message: { ...m, message_id: 82, date: date + 1 } })
+  tg.push(b, { message: { ...m, message_id: 83, caption: '不同' } })
+  tg.push(b, { message: { ...m, message_id: 84, from: { id: 99 } } })
+  await confirmed()
+  expect(onsen.messages.map(m => m.idem_key).sort()).toEqual([
+    'tg:-23:42:1700000000:c7225dbf105eeed5', 'tg:-23:42:1700000001:c7225dbf105eeed5',
+    'tg:-23:42:1700000000:f2632a784b0d7c93',
+  ].sort())
+})
+
+test('entities, text mentions by id and patterns name carried members even on another bot', async () => {
+  const msg = { from, chat: supergroup, date }
+  const caption = '👋 @LAB_B_BOT @unknown A B'
+  tg.push(a, { message: { ...msg, message_id: 1, caption, caption_entities: [
+    { type: 'mention', offset: 3, length: 10 }, { type: 'mention', offset: 14, length: 8 },
+    { type: 'text_mention', offset: 23, length: 1, user: { id: 101 } }, { type: 'text_mention', offset: 25, length: 1, user: { id: 102 } },
+  ] } })
+  tg.push(a, { message: { ...msg, message_id: 2, text: '@lab_b_bot', entities: [{ type: 'mention', offset: 0, length: 10 }] } })
+  tg.push(a, { message: { ...msg, message_id: 3, text: '小乙' } })
+  tg.push(a, { message: { ...msg, message_id: 4, text: 'reply', reply_to_message: { message_id: 2, from: { username: 'lab_b_bot' } } } })
+  await confirmed()
+  expect(onsen.messages.map(m => m.mentions)).toEqual([['lab-b', 'lab-a'], ['lab-b'], ['lab-b'], []])
+})
+
+test('membership transitions and migration are ordered PUTs; the new chat still needs its own allowlist entry', async () => {
+  for (const u of [memberUpdate('left', 'member'), memberUpdate('member', 'administrator'), memberUpdate('administrator', 'kicked'),
+    memberUpdate('left', 'member', 102), { message: { chat: group, migrate_to_chat_id: -10023, message_id: 6 } },
+    { message: { from, date, chat: { id: -10023, type: 'supergroup' }, text: 'new group', message_id: 3 } }]) tg.push(a, u)
+  await confirmed()
+  const path = '/v1/bridge/chats/-23/members/lab-a', at = new Date(date * 1000).toISOString()
+  expect(onsen.chatWrites).toEqual([{ path, body: { state: 'in', at } }, { path, body: { state: 'left', at } },
+    { path: '/v1/bridge/chats/-23', body: { moved_to: '-10023' } }])
+  expect(tg.callsOf(a, 'getUpdates')[0].allowed_updates).toContain('my_chat_member')
+  expect(onsen.messages).toEqual([])
+  expect(tg.callsOf(a, 'setMessageReaction')).toEqual([])
+})
+
+test('missing chat endpoints log once per kind across bots and the next message is still written', async () => {
+  for (const [token, id] of [[a, 101], [b, 102]] as const) {
+    for (let i = 0; i < 2; i++) onsen.answers.push({ path: /PUT .*\/bridge\/chats\//, status: 404, json: { detail: 'Not Found' } })
+    tg.push(token, memberUpdate('left', 'member', id))
+    tg.push(token, { message: { chat: group, migrate_to_chat_id: -10023 } })
+    tg.text(token, from.id, 'after', { chat: group })
+    await confirmed()
+  }
+  expect(logs.filter(l => l.includes('404'))).toHaveLength(2)
+  expect(onsen.messages.length).toBeGreaterThan(0)
+  expect([...bridge.pollers.values()].map(p => p.stats.failed_tries)).toEqual([0, 0])
+})
+
+test('a basic group gets one outage reply even with different message numbers', async () => {
+  onsen.mode = '503'
+  for (const [token, id] of [[a, 7], [b, 81]] as const) tg.push(token, { message: { chat: group, from, date, text: 'offline', message_id: id } })
+  await until(() => [...bridge.pollers.values()].every(p => p.stats.failed_tries > 0) && tg.sent.length > 0, 3000, 'outage notice')
+  onsen.mode = 'up'
+  await confirmed()
+  expect(tg.sent.filter(r => r.text?.includes('Onsen 現在連不上'))).toHaveLength(1)
+  expect(onsen.messages).toHaveLength(1)
+})
+
+test('supergroup edits share their version key; basic group edits address the bot-local message', async () => {
+  const requests = spyOn(bridge.onsen, 'req')
+  for (const token of [a, b]) {
+    for (const chat of [supergroup, group]) tg.push(token, { edited_message: { chat, from, date, edit_date: date + 1, text: 'edit', message_id: 7 } })
+    await confirmed()
+  }
+  const keys = requests.mock.calls.filter(r => r[1] === '/bridge/messages/edit').map(r => r[3]?.idem)
+  expect(keys).toEqual(['tg:-100212:7:edit:1700000001', 'tg:lab-a:-23:7:edit:1700000001',
+    'tg:-100212:7:edit:1700000001', 'tg:lab-b:-23:7:edit:1700000001'])
+})

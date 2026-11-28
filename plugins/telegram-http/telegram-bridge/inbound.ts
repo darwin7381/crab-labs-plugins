@@ -1,13 +1,12 @@
 // inbound.ts: one bot's long poll inside telegram-bridge (WO-196 part B, ticket item 2): Telegram → Onsen's bridge interface (CONTRACT §7d 「進」).
 //
-//   poll      getUpdates with allowed_updates message, edited_message, callback_query, message_reaction (Telegram sends a person's reactions only
+//   poll      getUpdates with allowed_updates message, edited_message, callback_query, my_chat_member, message_reaction (Telegram sends a person's reactions only
 //             when asked). An update is confirmed to Telegram (the next call's offset passes it) only once it is done: written into Onsen, or
 //             one that needs no write (a button, /start, a pairing reply, a dropped message). The first update not done holds the offset, so
 //             nothing unwritten is ever confirmed: a restart gets it again.
-//   gate      that agent's own access.json, as its daemon reads it (tg-access.ts): DM allowlist and pairing, group policy and mentions.
+//   gate      that agent's own access.json (tg-access.ts): DM allowlist and pairing, group and sender allowlists.
 //   write     a person's message: its file fetched from Telegram (≤ 20 MB, onsen-files.ts telegramFile) and stored with POST /v1/files,
-//             then POST /v1/bridge/messages (idem_key
-//             tg:<agent>:<chat>:<message id>). Only when Onsen took it: 👀 (access.json ackReaction; unset = 👀, '' = none) and done. An edit:
+//             then POST /v1/bridge/messages (§4c group key, bot-local DM key). Only when Onsen took it: 👀 (access.json ackReaction; unset = 👀, '' = none) and done. An edit:
 //             POST /v1/bridge/messages/edit; a reaction: POST /v1/bridge/reactions. Writes go strictly in order, one at a time per bot.
 //   Onsen down a write Onsen does not take (no answer, 5xx, 429, 401, 404 no_endpoint) is tried again (2 s, 4 s, then every 5 s) and holds every
 //             later write of this bot. A person's message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 <agent>；
@@ -21,6 +20,7 @@ import { forwardFrom, inboundShape } from '../onsen-client.ts'
 import { mimeOf, telegramFile, TG_BOT_FILE_MAX } from '../onsen-files.ts'
 import { richToMarkdown } from '../rich-inbound.ts'
 import type { Agent } from './agent.ts'
+import { chatWrite, mentionedMembers, messageKey } from './groups.ts'
 import { errCode, errSaid, retryable, type Answer, type OnsenClient } from './onsen.ts'
 import type { StateStore } from './state.ts'
 import { approvals, dmCommandGate, doneApproval, gate, mayAct, pairingText, PAIRED_TEXT } from './tg-access.ts'
@@ -28,7 +28,7 @@ import { displayName, mediaKindLabel, metaExcerpt, safeName } from './tg-format.
 import { errText, TgError } from './tg.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
-export const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query', 'message_reaction']
+export const ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query', 'message_reaction', 'my_chat_member']
 export const SORRY_MS = 15_000
 export const sorryText = (name: string): string => `Onsen 現在連不上，這一則還沒交給 ${name}；連上會自動補交，不用重傳。`
 export const START_TEXT = `This bot bridges Telegram to a Claude Code session.\n\nTo pair:\n1. DM me anything — you'll get a 6-char code\n2. In Claude Code: /telegram:access pair <code>\n\nAfter that, DMs here reach that session.`
@@ -39,6 +39,8 @@ type Entry = { u: any; id: number; done: boolean; kind: 'write' | 'local'; arriv
 export type PollerDeps = {
   onsen: OnsenClient
   state: StateStore
+  agents: ReadonlyMap<string, Agent>
+  unknownChatEndpoints: Set<string>
   log: Log
   now?: () => number
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
@@ -202,7 +204,7 @@ export class Poller {
     for (const e of this.entries.values()) {
       if (e.done || e.kind !== 'write') continue
       w = Math.min(w, Math.max(200, e.nextAt - t))
-      if (e.u.message && !e.cache.sorry) w = Math.min(w, Math.max(200, e.arrivedAt + (this.d.sorryMs ?? SORRY_MS) - t))
+      if (e.u.message && !e.cache.chatWrite && !e.cache.sorry) w = Math.min(w, Math.max(200, e.arrivedAt + (this.d.sorryMs ?? SORRY_MS) - t))
     }
     return w
   }
@@ -246,6 +248,12 @@ export class Poller {
     const u = e.u, a = this.a
     if (process.env.TELEGRAM_BRIDGE_DEBUG) this.d.log('info', `${a.member}: update ${e.id} keys=${Object.keys(u).join(',')} chat=${u.message?.chat?.id ?? ''} from=${u.message?.from?.id ?? ''} text=${typeof u.message?.text === 'string' ? u.message.text.length : '-'}`)
     if (u.callback_query) { await this.button(u.callback_query); e.done = true; return }
+    if (u.my_chat_member || u.message?.migrate_to_chat_id != null) {
+      e.cache.chatWrite = chatWrite(a, u)
+      if (e.cache.chatWrite) e.kind = 'write'
+      else e.done = true
+      return
+    }
     if (u.edited_message) {
       const m = u.edited_message, acc = a.access()
       if (!m.from || m.from.is_bot || !acc || !mayAct(acc, m.chat, String(m.from.id))) { e.done = true; return }
@@ -268,12 +276,12 @@ export class Poller {
     // WO-196 (Chiron 11-27): the person wrote to the bot in a DM (/start included), so the chat exists: a chat marked gone for the pinned status
     // has it again (pinAllowed still asks allowFrom)
     if (m.chat?.type === 'private') a.chatAlive(String(m.chat.id))
-    if (cmd === 'start' || cmd === 'help') {
+    if (m.chat?.type === 'private' && (cmd === 'start' || cmd === 'help')) {
       // the bridge answers these two itself, in a DM, to whoever the daemon answered (no pairing side effects); never written (as the daemon)
       if (dmCommandGate(a.stateDir, m)) await this.send(String(m.chat.id), cmd === 'start' ? START_TEXT : HELP_TEXT)
       e.done = true; return
     }
-    const g = gate(a.stateDir, m, a.username)
+    const g = gate(a.stateDir, m)
     if (g.action === 'drop') { if (process.env.TELEGRAM_BRIDGE_DEBUG) this.d.log('info', `${a.member}: update ${e.id} dropped by the gate`); e.done = true; return }
     if (g.action === 'pair') {
       a.stats.pairing++
@@ -296,7 +304,11 @@ export class Poller {
     e.tries++
     let ans: Answer | null = null, what = ''
     try {
-      if (e.u.message) { what = 'message'; ans = await this.writeMessage(e) }
+      if (e.cache.chatWrite) {
+        const change = e.cache.chatWrite
+        what = change.kind
+        ans = await this.d.onsen.req('PUT', change.path, change.body)
+      } else if (e.u.message) { what = 'message'; ans = await this.writeMessage(e) }
       else if (e.u.edited_message) { what = 'edit'; ans = await this.writeEdit(e) }
       else if (e.u.message_reaction) { what = 'reaction'; ans = await this.writeReaction(e) }
       else { e.done = true; return }
@@ -305,8 +317,18 @@ export class Poller {
     }
     if (ans.status >= 200 && ans.status < 300) return this.written(e, what, ans)
     const code = errCode(ans)
+    if (e.cache.chatWrite && ans.status === 404 && code !== 'no_endpoint') {
+      if (!this.d.unknownChatEndpoints.has(what)) {
+        this.d.unknownChatEndpoints.add(what)
+        this.d.log('warn', `Onsen answered 404 for the chat ${what} endpoint; skipping this update`)
+      }
+      e.done = true
+      this.ok()
+      return
+    }
     if (ans.status === 409 && what === 'message') {                 // the same idem_key with other content: it is in Onsen already
-      this.d.log('warn', `${this.a.member}: ${this.ref(e)} answered 409 (${errSaid(ans)}); it is in Onsen already, taken as written`)
+      if (!(ans.json?.data?.duplicate && ans.json.data.message_id != null))
+        this.d.log('warn', `${this.a.member}: ${this.ref(e)} answered 409 (${errSaid(ans)}); it is in Onsen already, taken as written`)
       return this.written(e, what, ans)
     }
     if (ans.status === -1 || retryable(ans)) {
@@ -334,6 +356,7 @@ export class Poller {
     if (this.failingSince != null) { this.d.log('info', `${this.a.member}: Onsen takes writes again (after ${Math.round((this.now() - this.failingSince) / 1000)} s)`); this.failingSince = null }
   }
   private ref(e: Entry): string {
+    if (e.cache.chatWrite) return `PUT ${e.cache.chatWrite.path}`
     const m = e.u.message ?? e.u.edited_message ?? e.u.message_reaction
     return `${e.u.message ? 'message' : e.u.edited_message ? 'the edit of' : 'a reaction on'} tg:${m?.message_id} in chat ${m?.chat?.id}`
   }
@@ -356,8 +379,8 @@ export class Poller {
   }
   private async maybeSorry(e: Entry): Promise<void> {
     const m = e.u.message
-    if (!m || e.cache.sorry || this.failingSince == null || this.now() - e.arrivedAt < (this.d.sorryMs ?? SORRY_MS)) return
-    const key = `${this.a.member}:${m.chat.id}:${m.message_id}`
+    if (!m || e.cache.chatWrite || e.cache.sorry || this.failingSince == null || this.now() - e.arrivedAt < (this.d.sorryMs ?? SORRY_MS)) return
+    const key = messageKey(this.a.member, m)
     e.cache.sorry = true
     if (this.d.state.data.sorry[key]) return
     this.d.state.data.sorry[key] = this.now(); this.d.state.dirty()
@@ -390,7 +413,7 @@ export class Poller {
       } else e.cache.photo = shape.kind === 'photo'
       const fo = m.forward_origin
       e.cache.body = {
-        member: a.member, client_user_id: String(m.from.id),
+        member: a.member, client_user_id: String(m.from.id), mentions: mentionedMembers(m, this.d.agents.values()),
         client_user: { username: m.from.username ?? null, display_name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || null },
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
         // WO-179 (Onsen 0.39.5): a group's own name, for display (the conversation's title); null in a DM
@@ -406,7 +429,7 @@ export class Poller {
         forward_from: tagForwardFrom(m),                                   // the daemon tag's value (Chiron 15:40Z ruling, §7d)
         forward_date: fo?.date || m.forward_date ? new Date(Number(fo?.date ?? m.forward_date) * 1000).toISOString() : null,
         media_group_id: m.media_group_id ? String(m.media_group_id) : null,
-        idem_key: `tg:${a.member}:${chat}:${m.message_id}`,
+        idem_key: `tg:${messageKey(a.member, m)}`,
       }
       if (thread && e.cache.body.topic_name) this.d.noteTopic?.(a.member, chat, thread, e.cache.body.topic_name)
     }
@@ -443,10 +466,12 @@ export class Poller {
   }
   async writeEdit(e: Entry): Promise<Answer> {
     const m = e.u.edited_message
+    // In a basic group the edit has only the bot-local number and the new text. Keep the bot's alias for this operation.
+    const key = String(m.chat.id).startsWith('-100') ? `${m.chat.id}:${m.message_id}` : `${this.a.member}:${m.chat.id}:${m.message_id}`
     const text = m.text != null ? expandHiddenEntities(String(m.text), m.entities) : m.caption != null ? expandHiddenEntities(String(m.caption), m.caption_entities)
       : m.rich_message ? (richToMarkdown(m.rich_message) || '') : ''
     const ans = await this.d.onsen.req('POST', '/bridge/messages/edit', { member: this.a.member, chat: String(m.chat.id), client_msg_id: String(m.message_id), text,
-      edited_at: new Date((Number(m.edit_date) || Math.floor(this.now() / 1000)) * 1000).toISOString() }, { idem: `tg:${this.a.member}:${m.chat.id}:${m.message_id}:edit:${m.edit_date ?? ''}` })
+      edited_at: new Date((Number(m.edit_date) || Math.floor(this.now() / 1000)) * 1000).toISOString() }, { idem: `tg:${key}:edit:${m.edit_date ?? ''}` })
     if (ans.status === 404 && errCode(ans) !== 'no_endpoint') return { status: 200, json: { data: { changed: false, unknown: true } } }   // a message Onsen never had
     return ans
   }
