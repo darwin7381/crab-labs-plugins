@@ -9,7 +9,7 @@ import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.t
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver, type Outcome } from './onsen-receive.ts'
-import { createMain, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
+import { createMain, MAIN_IDLE_CONFIRM_MS, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { REGISTRY_SETTLE_MS } from './onsen-status.ts'
 
@@ -466,7 +466,7 @@ test.each([true, false])('settled 59: continuation during the stream write repor
   expect(r.outcomes(r.row.id)).toEqual(written ? ['in_session', 'completed'] : ['superseded'])
 })
 
-test.each(['late receipt', 'session end'])('settled 59: a long independent turn leaves the queued input open for its %s', async end => {
+test.each(['late receipt', 'session end', 'confirmed idle'])('settled 59: a long independent turn leaves the queued input open for its %s', async end => {
   const r = await accountCut()
   r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
   const did = r.offers[0].params.meta.did
@@ -477,19 +477,27 @@ test.each(['late receipt', 'session end'])('settled 59: a long independent turn 
   expect(r.outcomes(r.row.id)).toEqual(['not_taken'])
   if (end === 'late receipt') {
     await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+    r.m.statusIdle(true)
     await r.hook('UserPromptSubmit', { prompt_id: 'queued-text', dids: [did] })
     await r.hook('Stop', { prompt_id: 'queued-text', phase: 'final' })
     r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
     expect(r.outcomes(r.row.id)).toEqual(['not_taken', 'in_session', 'completed'])
     expect(r.row.state).toBe('completed')
   } else {
-    await r.hook('SessionEnd'); await r.sync()
+    if (end === 'confirmed idle') {
+      await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
+      const now = Date.now()
+      r.m.statusIdle(true, now); await r.sync()
+      expect(r.row.state).toBe('waiting')
+      r.m.statusIdle(true, now + MAIN_IDLE_CONFIRM_MS + 1)
+    } else await r.hook('SessionEnd')
+    await r.sync()
     expect(r.row).toMatchObject({ state: 'cancelled', reason: 'superseded' })
   }
   expect(r.offers).toHaveLength(1)
 })
 
-test.each(['waiting', 'already claimed'])('settled 59: after a blocked claim spool the late receipt completes an Item that is %s', async state => {
+test.each(['waiting', 'claimed before the receipt', 'claimed after the receipt'])('settled 59: after a blocked claim spool the late receipt completes an Item that is %s', async state => {
   const r = await accountCut()
   r.client.stop()
   r.mode.writeItem = write => r.client.recordItemWrite(write)
@@ -498,13 +506,17 @@ test.each(['waiting', 'already claimed'])('settled 59: after a blocked claim spo
   await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
   r.f.advance(20_001); r.claims.start(); await until(() => r.claims.blocked())
   await r.hook('Stop', { prompt_id: 'automatic', phase: 'final' })
-  await r.hook('UserPromptSubmit', { prompt_id: 'received-late', dids: [did] })
-  await r.hook('Stop', { prompt_id: 'received-late', phase: 'final' })
+  const receiveAndStop = async () => {
+    await r.hook('UserPromptSubmit', { prompt_id: 'received-late', dids: [did] })
+    await r.hook('Stop', { prompt_id: 'received-late', phase: 'final' })
+  }
+  if (state !== 'claimed before the receipt') await receiveAndStop()
   await r.sync()
-  if (state === 'already claimed') {
+  if (state !== 'waiting') {
     const held = await r.mode.req('POST', r.mode.path + '/take', { connector: r.mode.connector, item_ids: [r.row.id], wait: 0, limit: 1 },
       3000, { 'Idempotency-Key': crypto.randomUUID() })
     expect(held?.json.data.items).toHaveLength(1)
+    if (state === 'claimed before the receipt') await receiveAndStop()
     await r.m.pump()
     const takes = () => r.f.calls.filter(c => c.path.endsWith('/take')).length
     const before = takes()
@@ -519,7 +531,7 @@ test.each(['waiting', 'already claimed'])('settled 59: after a blocked claim spo
   await until(() => r.claims.inSession(r.row.id)); await r.sync()
   r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
   const expected: Outcome[] = ['not_taken', 'in_session', 'completed']
-  if (state === 'already claimed') expected.unshift('not_taken')
+  if (state !== 'waiting') expected.unshift('not_taken')
   expect(r.outcomes(r.row.id)).toEqual(expected)
   expect(r.offers).toHaveLength(1)
 })

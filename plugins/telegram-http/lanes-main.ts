@@ -211,7 +211,7 @@ export function createMain(E: MainEnv) {
     const g = latestMain()
     const row = J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
     if (row) resumeWrites.set(row, (resumeWrites.get(row) ?? 0) + 1)
-  }, () => E.itemReceiver?.(), resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && r.resume_input_gen)
+  }, () => E.itemReceiver?.(), resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && (r.resume_input_gen || inFlight.has(r.id)))
     && r.onsen_items?.[0]?.onsen_item_id === id).length > 0, (id, reason) => {
     for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason })
   }, () => { void pump('resume-ready') })
@@ -1048,11 +1048,12 @@ export function createMain(E: MainEnv) {
       case 'UserPromptSubmit': {
         if (p) {
           const ids = promptRefs((E.itemReceiver?.()?.mode.active ? b.channel_dids ?? b.dids : b.dids) ?? [])
-          if (ids.size) {
-            const late = items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r))
-            if (late.length) await receiveRows(late, true, () => currentGen() === g, true)
-          }
+          const late = ids.size ? items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r)) : []
+          // Record a queued resume's positive receipt before a re-take can find the Item under another claim.
+          const toClaim = late.filter(r => !isResume(r) || !resumes.awaitingInput(r.onsen_items[0].onsen_item_id))
+          if (toClaim.length) await receiveRows(toClaim, true, () => currentGen() === g, true)
           beginTurn(g, p, ids, b.source)
+          if (toClaim.length !== late.length) await pump('resume-ready')
         }
         // lanes-golive (Chiron line8-delivery-20261122: on --resume a SessionStart hook's context reached the conversation in 25 of 334 resumes; startup, clear
         // and compact do get it): the main-only rules go with the session's first prompt (a typed one, or a delivered item's) when its SessionStart could
@@ -1296,9 +1297,10 @@ export function createMain(E: MainEnv) {
   let idleSeen: { gen: string; at: number; ev: number } | null = null
   function statusIdle(isIdle: boolean, now = Date.now(), interruptedAt: number | null = null): boolean {
     const g = currentGen()
-    if (!g || g.state !== 'in_turn' || !isIdle) { idleSeen = null; return false }
+    const released = isIdle && g?.state === 'idle' && g.stopped_prompt && E.itemReceiver?.()?.mode.active ? resumes.inputIds(g.session_id, true) : []
+    if (!g || !isIdle || (g.state !== 'in_turn' && !released.length)) { idleSeen = null; return false }
     const ev = lastEventAt.get(g.id) ?? 0
-    const seen = interruptedAt != null && interruptedAt > ev
+    const seen = !released.length && interruptedAt != null && interruptedAt > ev
     if (seen) idleSeen = { gen: g.id, at: now, ev }
     else {
       if (!idleSeen || idleSeen.gen !== g.id || idleSeen.ev !== ev) { idleSeen = { gen: g.id, at: now, ev }; return false }
@@ -1306,6 +1308,8 @@ export function createMain(E: MainEnv) {
     }
     const heldS = Math.round((now - idleSeen.at) / 1000)
     idleSeen = null
+    // The earlier claim expired during the independent turn. Two idle readings after its Stop confirm no queued input opened another turn.
+    if (released.length) { resumes.endInput(g.session_id, released); return false }
     const back = cutTurn(g).filter(r => owed(r))
     openTools.delete(g.id)
     setMain(g, 'idle', { prompt_id: null, tool_open: null, stopped_prompt: null, ended_by: 'interrupted' })   // WO-172: the turn's end, for its turn_end facts

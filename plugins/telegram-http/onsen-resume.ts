@@ -113,11 +113,19 @@ export class ResumeItems {
     return true
   }
 
-  endInput(session: string): void {
-    const pending = this.entries().filter(e => e.session === session && e.awaitingInput && e.id)
-    if (!pending.length) return
-    for (const { id } of pending) {
-      if (!id) continue
+  inputIds(session: string, releasedOnly = false): string[] {
+    const ids: string[] = [], rx = this.receiver()
+    for (const e of this.entries()) {
+      if (e.session !== session || !e.awaitingInput || !e.id) continue
+      if (releasedOnly && (this.inInput(e.id) || rx?.taking(e.id) || rx?.claims.owns(e.id))) continue
+      ids.push(e.id)
+    }
+    return ids
+  }
+
+  endInput(session: string, ids = this.inputIds(session)): void {
+    if (!ids.length) return
+    for (const id of ids) {
       const reached = this.delivered(id)
       if (!reached) this.receiver()?.claims.report(id, 'superseded')
       this.resolveInput(id, reached)

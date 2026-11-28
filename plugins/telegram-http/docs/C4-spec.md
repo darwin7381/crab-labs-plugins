@@ -14,7 +14,7 @@
 
 1. 還在等的 resume 原句跟著交給同一段 session 的下一列，包含閒置時的 stream 通知、工具邊界的 additionalContext 與 Stop 拉入的列。用交付的 receipt 記下帶的是哪一個 resume。帶過原句的回合正常 final Stop 才以版本化的 DELETE 送 `withdrawn`。沒有交入、Stop 被擋、或回合失敗時仍等。直接領取 resume 則依它自己的 claim 完成。
 2. 背景工作的結束通知會開另一個回合。那個回合本身不作廢原 resume；若它後來收下另一列附帶的提示，適用同一條 final Stop 規則。
-3. 通知已寫進 Claude Code 的輸入佇列時，可能在自行續跑之後才進入回合。收到原句的回合照一般的 `in_session`、`completed` 回報。原 claim 的 20 秒期限到時，若另一回合仍在跑，先以 `not_taken` 釋放。晚到的 delivery id 可重新領取並回報，不再寫入串流。已確認自行續跑且在期限內無回條，或原對話結束時仍未交入，回報 `superseded`。
+3. 通知已寫進 Claude Code 的輸入佇列時，可能在自行續跑之後才進入回合。收到原句的回合照一般的 `in_session`、`completed` 回報。原 claim 的 20 秒期限到時，若另一回合仍在跑，先以 `not_taken` 釋放。晚到的 delivery id 可重新領取並回報，不再寫入串流。若它仍未交入，自行續跑的回合在期限前已結束、釋放後達到 M2 的兩次閒置確認、或原對話結束時，回報 `superseded`。
 4. S2 請求省略選填欄位等同傳 `null`，回應保留可空欄位。POST 的內文讀自 `payload.text`，有格式時讀 `payload.format`。
 
 ## Claude Code 自己繼續
