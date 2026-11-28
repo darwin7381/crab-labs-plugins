@@ -8,7 +8,7 @@ import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
-import { ItemReceiver } from './onsen-receive.ts'
+import { ItemReceiver, type Outcome } from './onsen-receive.ts'
 import { createMain, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { REGISTRY_SETTLE_MS } from './onsen-status.ts'
@@ -168,6 +168,71 @@ test('C4 a refused resume probe belongs to its claimed row even if StopFailure i
   await r.sync()
   expect(r.outcomes(r.row.id)).toEqual(['in_session', 'usage_limit_probe'])
   expect(r.f.rows.size).toBe(1)
+})
+
+test.each(['settling', 'background'])('C4 a later itemless turn lets the delivered resume finish (%s)', async phase => {
+  const background = phase === 'background'
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  await r.hook('UserPromptSubmit', { prompt_id: 'received', dids: [r.offers[0].params.meta.did] })
+  await r.hook('Stop', { prompt_id: 'received', phase: 'final' })
+  r.f.advance(background ? REGISTRY_SETTLE_MS + 1 : 100)
+  r.status('idle', background ? 1 : 0); await r.sync()
+  const prior: Outcome[] = background ? ['in_session', 'background'] : ['in_session']
+  expect(r.outcomes(r.row.id)).toEqual(prior)
+  await r.hook('UserPromptSubmit', { prompt_id: 'notification', dids: [] })
+  await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(prior)
+  await r.hook('Stop', { prompt_id: 'notification', phase: 'final' })
+  r.f.advance(REGISTRY_SETTLE_MS + 1); r.status('idle'); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual([...prior, 'completed'])
+  expect(r.offers).toHaveLength(1)
+})
+
+test.each(['bound', 'done'])('C4 a folded %s M1 delivery protects a resume without a local claim', async state => {
+  const r = await accountCut()
+  const receipt = r.m.items(it => it.onsen_items?.[0]?.onsen_item_id === r.row.id)[0]!
+  r.journal.write('msg', receipt.id, state, { gen: r.m.currentGen()!.id, prompt_id: 'received' })
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] })
+  await r.sync()
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
+})
+
+test('C4 an in-session claim protects a resume before the M1 bound write', async () => {
+  const r = await accountCut()
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 }); await r.m.pump()
+  r.claims.bind(r.row.id, 'main', 'received', r.sid); await r.sync()
+  await r.hook('UserPromptSubmit', { prompt_id: 'automatic', dids: [] }); await r.sync()
+  expect(r.outcomes(r.row.id)).toEqual(['in_session'])
+})
+
+test('C4 a delayed create acknowledgement respects an existing M1 delivery of that Item', async () => {
+  const r = await mainRig()
+  r.mode.writeItem = write => r.client.recordItemWrite(write)
+  r.setWall({ walled: true, clearedMs: null })
+  const request = r.client.request.bind(r.client)
+  let release!: () => void
+  const ack = new Promise<void>(resolve => { release = resolve })
+  spyOn(r.client, 'request').mockImplementation(async (...args) => {
+    const reply = await request(...args)
+    if (args[0] === 'POST' && args[1] === r.mode.path) await ack
+    return reply
+  })
+  await r.hook('UserPromptSubmit')
+  await r.hook('StopFailure', { error: 'rate_limit' })
+  const writing = r.sync()
+  await until(() => r.f.rows.size === 1)
+  const row = [...r.f.rows.values()][0]!
+  r.m.routeResume(itemRef(row), row.payload.text)
+  const receipt = r.m.items(it => it.onsen_items?.[0]?.onsen_item_id === row.id)[0]!
+  r.journal.write('msg', receipt.id, 'bound', { gen: r.m.currentGen()!.id, prompt_id: 'received' })
+  await r.hook('UserPromptSubmit', { prompt_id: 'notification', dids: [] })
+  release()
+  await writing; await r.sync()
+  expect(r.journal.get('msg', receipt.id)?.state).toBe('bound')
+  expect(r.f.calls.some(c => c.body.outcome === 'superseded')).toBe(false)
 })
 
 test('C4 a held claim is marked superseded offline before its offer lease can expire', async () => {

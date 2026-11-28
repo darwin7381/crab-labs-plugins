@@ -207,8 +207,9 @@ export function createMain(E: MainEnv) {
   const J = (): Journal => E.journal
   const resumes = new ResumeItems(latestMain, entries => {
     const g = latestMain()
-    J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
-  }, () => E.itemReceiver?.(), id => {
+    const row = J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
+    if (row) resumeWrites.set(row, (resumeWrites.get(row) ?? 0) + 1)
+  }, () => E.itemReceiver?.(), resumeDelivered, id => {
     for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason: 'superseded' })
   }, () => { void pump() })
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
@@ -344,6 +345,10 @@ export function createMain(E: MainEnv) {
     else if (!canTake(g)) J().write('wake', id, 'no_wake', { reason: `main ${member()} (the status record): offered when the record says it can take it` })   // WO-177 一
     if (kind !== 'digest') void pump(kind === 'joey' ? 'person' : undefined)
     return id
+  }
+  function resumeDelivered(id: string): boolean {
+    return !!E.itemReceiver?.()?.claims.inSession(id) || items(r => (r.state === 'bound' || r.state === 'done')
+      && r.onsen_items?.some((ref: ItemRef) => ref.onsen_item_id === id)).length > 0
   }
   const isResume = (r: Row): boolean => r.onsen_items?.[0]?.kind === 'resume'
   const owed = (r: Row): boolean => isResume(r) ? resumes.canOffer(r.onsen_items[0].onsen_item_id) : (E.owed ? E.owed(r) : r.kind !== 'digest')

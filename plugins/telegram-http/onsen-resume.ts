@@ -31,7 +31,8 @@ export class ResumeItems {
   private sending = new Set<string>()
 
   constructor(readonly current: () => Row | undefined, readonly save: (entries: Resume[]) => void,
-    readonly receiver: () => ItemReceiver | undefined, readonly retire: (id: string) => void, readonly ready: () => void) {}
+    readonly receiver: () => ItemReceiver | undefined, readonly delivered: (id: string) => boolean,
+    readonly retire: (id: string) => void, readonly ready: () => void) {}
 
   private entries(): Resume[] { return this.current()?.resume_items ?? [] }
 
@@ -57,10 +58,10 @@ export class ResumeItems {
 
   supersede(session: string): void {
     const entries = this.entries()
-    const applies = (e: Resume) => !e.superseded && (!e.session || e.session === session)
-    if (!entries.some(applies)) return
-    this.save(entries.map(e => applies(e) ? { ...e, superseded: true } : e))
-    for (const e of entries) if (applies(e) && e.id) {
+    const pending = new Set(entries.filter(e => !e.superseded && (!e.session || e.session === session) && (!e.id || !this.delivered(e.id))))
+    if (!pending.size) return
+    this.save(entries.map(e => pending.has(e) ? { ...e, superseded: true } : e))
+    for (const e of pending) if (e.id) {
       // Spool a held claim before its unbound timer fires, even when Onsen is unreachable.
       this.receiver()?.claims.report(e.id, 'superseded')
       this.retire(e.id)
@@ -81,17 +82,32 @@ export class ResumeItems {
     }
   }
 
-  private async send(e: Resume, receiver: ItemReceiver): Promise<void> {
-    const mode = receiver.mode
-    if (e.create) {
-      const reply = await mode.req('POST', mode.path, e.create, 15_000, { 'Idempotency-Key': e.key })
-      const row = reply?.json?.data
-      if (!reply || ![200, 201].includes(reply.status) || !row?.id) throw Error('creating resume: HTTP ' + reply?.status)
-      const entries = this.entries(), latest = entries.find(entry => entry.key === e.key)
-      if (!latest) return
-      e = { ...latest, id: row.id, create: undefined }
-      this.save(entries.map(entry => entry === latest ? e : entry))
-      if (!e.superseded) { this.ready(); return }
+  /** Called before the spool advances its cursor, including on replay after a restart. */
+  settled(write: ItemWrite, row?: InboxItem): void {
+    const entries = this.entries(), entry = entries.find(e => 'item' in write ? e.key === write.key : e.id === write.id)
+    if (!entry) return
+    if ('item' in write) {
+      if (write.item.kind !== 'resume' || !entry.create) return
+      const other = entries.filter(e => e !== entry && (!row || e.id !== row.id))
+      const seen = row && entries.find(e => e.id === row.id)
+      const delivered = row && (row.in_session_at || this.delivered(row.id))
+      const superseded = seen?.superseded || (delivered ? undefined : entry.superseded)
+      this.save(row ? [...other, { ...seen, ...entry, create: undefined, id: row.id, superseded }] : other)
+      if (superseded && row) this.retire(row.id)
+    } else {
+      if (write.outcome !== 'superseded' || entry.id !== write.id) return
+      const receiver = this.receiver()
+      if (row?.state === 'claimed' && row.claim && !row.in_session_at && !receiver?.claims.inSession(row.id)) {
+        if (!receiver || row.claim.connector !== receiver.mode.connector) {
+          this.save(entries.map(e => e === entry ? { ...e, awaitingRelease: true } : e))
+          return
+        }
+        if (receiver.taking(row.id)) return
+        receiver.claims.taken(row, itemRef(row))
+        receiver.claims.report(row.id, 'superseded')
+      }
+      // A refused DELETE must never let a later peek deliver this cancelled local offer.
+      this.save(row ? entries.filter(e => e !== entry) : entries.map(e => e === entry ? { ...e, rejected: true } : e))
     }
     if (!mode.active || !e.id) return
     const id = e.id, path = '/v1/items/' + encodeURIComponent(id)

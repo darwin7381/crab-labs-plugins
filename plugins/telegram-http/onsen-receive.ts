@@ -14,6 +14,7 @@ export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
 export type ClaimStore = {
   blocked(): boolean
   owns(id: string): boolean
+  inSession(id: string): boolean
   completed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
   bind(id: string, session: string, turn: string, registrySession?: string): void

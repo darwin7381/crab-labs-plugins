@@ -36,6 +36,7 @@ export class Claims implements ClaimStore {
     const row = this.rows[id]
     return !!row && (!row.last_outcome || intermediate.has(row.last_outcome))
   }
+  inSession(id: string): boolean { return !!this.rows[id]?.in_session_at }
   blocked(): boolean { return this.spool.hasItemReports() }
   completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
 
