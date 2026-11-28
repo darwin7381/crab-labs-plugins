@@ -4257,13 +4257,28 @@ function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
   D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
 }
 
-function submitCheck(f: Followup, writer: ItemWriter): void {
+function followupWrite(f: Followup) {
   const event = events.get(f.event)
   const origin: ItemRef | undefined = event?.onsen_items?.[0]
   const waiter = memberWaiter(event?.promised?.at(-1)?.to) ?? origin?.waiter ?? origin?.from ?? S.threads[f.thread]?.peer ?? undefined
   const refs = [{ kind: 'item', value: f.id }, ...(event?.onsen_items ?? []).map((r: ItemRef) => ({ kind: 'item', value: r.onsen_item_id }))]
   if (f.run_id) refs.push({ kind: 'run', value: f.run_id })
-  writer({ key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, waiter, null, refs) })
+  return { key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, waiter, null, refs) }
+}
+
+function withdrawCheck(f: Followup, writer: ItemWriter, row?: InboxItem): void {
+  writer({ ...followupWrite(f), outcome: 'withdrawn', id: row?.id })
+  f.onsen = 'withdrawn'
+  f.withdrawn_version = row?.version
+}
+
+function queuedCheck(f: Followup): QItem | undefined {
+  const run = f.onsen === 'submitted' ? queue.get(f.event) : undefined
+  if (run?.state === 'queued' && run.ev.followup === f.id && run.ev.onsen_items?.some(r => !itemReceiver?.claims.owns(r.onsen_item_id))) return run
+}
+
+function submitCheck(f: Followup, writer: ItemWriter): void {
+  writer(followupWrite(f))
   f.onsen = 'submitted'
 }
 
@@ -4280,6 +4295,7 @@ export function resumeSelfItems(): void {
   const writer = activeSelfWriter()
   if (!writer || !S) return
   for (const f of Object.values(S.followups)) {
+    if (f.state === 'ended' && f.onsen === 'submitted') withdrawCheck(f, writer)
     if (f.state !== 'pending' || f.onsen === 'submitted') continue
     if (f.onsen === 'awaiting_receipt' && queue.get(f.event)?.run === f.run) continue
     submitCheck(f, writer)
@@ -4295,6 +4311,15 @@ const waitingFollowupEvents = new Set<string>()
 /** C1 already checked not_before. Dispatch carries the unclaimed ref into the main or lane that actually receives it. */
 export function routeOwnItem(row: InboxItem, item: ItemRef, text: string): void {
   const f = row.kind === 'self' && row.refs.map(r => r.kind === 'item' && S.followups[r.value]).find(Boolean)
+  if (f && f.state === 'ended') {
+    const writer = activeSelfWriter()
+    // A take in flight can release the row again at a new version after the first withdrawal.
+    if (writer && row.state === 'waiting' && f.withdrawn_version !== row.version) {
+      withdrawCheck(f, writer, row)
+      saveState()
+    }
+    return
+  }
   if (f && row.reason !== 'reassigned') {
     if (queue.has(f.event)) { waitingFollowupEvents.add(f.event); return }
     fireFollowup(f, Date.now(), item)
@@ -5123,6 +5148,10 @@ function receivedRun(it: QItem, given: Set<string>, gone: Set<string>, receiver:
   return readyRun
 }
 function startRun(it: QItem, acquired = false): void {
+  if (it.ev.followup && S.followups[it.ev.followup]?.state === 'ended') {
+    endRun(it, 'dropped', { why: 'followup ended before delivery' })
+    return
+  }
   const lane = S.lanes[it.lane]
   if (!lane) {                                                             // 002w (A, gap 22): what its event set owes goes to the main
     endRun(it, 'died', { why: 'lane gone' })
@@ -6845,9 +6874,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         if (f.thread !== lane.thread) return false
         if (f.state === 'pending') return true
         // A due check queued behind the lane is still a waiting Item until the lane takes it.
-        const run = f.onsen === 'submitted' && itemReceiver?.mode.active ? queue.get(f.event) : undefined
-        return run?.state === 'queued' && run.ev.followup === f.id
-          && run.ev.onsen_items?.some(r => !itemReceiver?.claims.owns(r.onsen_item_id))
+        return itemReceiver?.mode.active && !!queuedCheck(f)
       }).length
       const chk = checkFollowupArgs(a, pending)
       if (!chk.ok) return `followup refused: ${chk.error}`
@@ -6985,8 +7012,15 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         if (th) th.fu_fp = fp
         if (tok.followup && prev && sameOutcome(prev, fp)) {
           tok.unchanged = true
-          const dropped = Object.values(S.followups).filter(f => f.thread === lane.thread && f.state === 'pending' && f.run === tok.runId)
+          const dropped = Object.values(S.followups).filter(f => f.thread === lane.thread && f.run === tok.runId && (f.state === 'pending' || queuedCheck(f)))
           for (const f of dropped) { f.state = 'ended'; f.ended = 'no-change' }
+          if (dropped.length) saveState() // a restart must not dispatch a cancelled check
+          for (const f of dropped) {
+            const queued = queuedCheck(f)
+            if (queued) endRun(queued, 'dropped', { why: 'followup ended before delivery' })
+            const writer = activeSelfWriter()
+            if (writer && f.onsen === 'submitted') withdrawCheck(f, writer)
+          }
           if (dropped.length) { chainEnded(lane, tok, 'no-change', Math.max(...dropped.map(f => f.chain ?? 1)) - 1); chainNote = `; the follow-up you scheduled in this run was cancelled: your outcome is the same as the previous run's, so this thread now waits for a new event or Joey` }
           saveState()
         }

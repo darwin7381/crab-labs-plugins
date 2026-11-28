@@ -10,7 +10,7 @@ export type OwnItem = {
   not_before?: string | null; deadline?: string | null; expires_at?: string | null
 }
 /** The original request stays identical when its response is lost, including across a spool replay. */
-export type ItemWrite = { key: string; item: OwnItem; complete?: true }
+export type ItemWrite = { key: string; item: OwnItem; complete?: true; outcome?: 'withdrawn' | 'completed' | 'superseded'; id?: string }
 export type ItemWriter = (write: ItemWrite) => void
 const epochSecond = (time?: string | null) => time ? Math.floor(Date.parse(time) / 1000) : null
 
@@ -52,7 +52,8 @@ export class ItemWrites {
     })
     const signature = createHash('sha256').update(body).digest('hex')
     const receipt = this.receipt(write.key)
-    if (!write.complete) {
+    const outcome = write.outcome ?? (write.complete ? 'completed' : undefined)
+    if (!outcome) {
       if (receipt) return receipt.signature === signature ? { status: 200, json: { data: { id: receipt.id } } }
         : { status: 409, json: { error: 'Item creation key reused with a different body' } }
       const created = await this.req('POST', path, write.item, undefined, { 'Idempotency-Key': write.key })
@@ -62,7 +63,7 @@ export class ItemWrites {
       this.remember(write.key, id, signature)
       return created
     }
-    let id = receipt?.id
+    let id = write.id ?? receipt?.id
     if (!id) {
       // A row accepted by a pre-receipt connector has no local id. Find its waiting row without creating one.
       const found = await this.findLegacy(path, write)
@@ -73,7 +74,7 @@ export class ItemWrites {
     const detail = '/v1/items/' + encodeURIComponent(id)
     const current = await this.req('GET', detail)
     if (current?.status !== 200 || current.json.data.state !== 'waiting') return current
-    const result = await this.req('DELETE', detail, { expected_version: current.json.data.version, outcome: 'completed' })
+    const result = await this.req('DELETE', detail, { expected_version: current.json.data.version, outcome })
     if (result?.status !== 409) return result
     const latest = await this.req('GET', detail)
     // A concurrent edit left it waiting. The next spool pass reads its new version.

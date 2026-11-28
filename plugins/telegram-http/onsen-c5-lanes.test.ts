@@ -243,3 +243,32 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
   follow.chain = 4
   expect(await L.callLaneTool({ ...next, unchanged: false }, 'followup', { after_minutes: 5, note: '第五趟' })).toContain('cap 4')
 })
+
+test.each([false, true])('no-change withdraws a migrated followup and drops a stale peek (already queued=%s)', async queued => {
+  const s = L.__lanesState(), lane = 'adam.reflex.cancel-' + queued, event = 'cancel-' + queued
+  const thread = 'adam#' + event, runId = 'producer-' + event
+  s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
+  s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
+  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  const tok = { runId, lane, evId: event, trigger: 'peer', cls: 'peer', followup: true, closers: [] } as any
+  L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [] })
+  mode.pause('migration', 60_000)
+  expect(await L.callLaneTool(tok, 'followup', { after_minutes: 5, note: 'check previous result' })).toContain('scheduled')
+  await mode.probe(); L.resumeSelfItems(); await client.syncNow(true)
+  const [row] = selfRows().filter(r => r.session_id === lane)
+  const ref = itemRef(row!), snapshot = structuredClone(row!), follow = s.followups[row!.refs[0]!.value]!
+  if (queued) {
+    L.routeOwnItem(row!, ref, 'check')
+    expect(L.itemIndex().has(row!.id)).toBe(true)
+  }
+  const did = '數量仍是 15 件'
+  s.threads[thread]!.fu_fp = outcomeFingerprint('normal', { did })
+  await L.callLaneTool(tok, 'receipt', { outcome: 'normal', happened: '查了', did, promised: '無', needs_main: '無' })
+  L.routeOwnItem(snapshot, ref, 'already peeked')
+  L.resumeSelfItems(); await client.syncNow(true)
+  expect(follow.state).toBe('ended')
+  expect(L.itemIndex().has(row!.id)).toBe(false)
+  expect(row).toMatchObject({ state: 'cancelled', reason: 'withdrawn', claim: null })
+  expect(selfRows().filter(r => r.session_id === lane)).toHaveLength(1)
+  expect(f.calls.filter(c => c.path === '/v1/items/' + row!.id && c.body.outcome === 'withdrawn')).toHaveLength(1)
+})
