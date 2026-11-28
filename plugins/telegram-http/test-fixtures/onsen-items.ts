@@ -8,16 +8,14 @@ type Row = InboxItem & { failures: number; released: boolean; expires_at: string
 const iso = (ms: number) => new Date(ms).toISOString()
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
-export function fakeItems() {
+export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: Request) => Promise<Response | null>) {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
-  const givenByPull = new Set<Row>()
-  let pullAcked = 0
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
   const issued = new Set<string>(), reports = new Set<string>()
   const history: ItemReport[] = [], waiters = new Set<() => void>()
   let mode = 200, unavailable = false, holdReports = false, delayTake = 0
-  const detail = (data: unknown) => Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, data })
+  const detail = (data: unknown) => Response.json({ api_version: '1', as_of: iso(now), viewer: member, read_by: null, data })
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
   const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
     now++
@@ -38,7 +36,7 @@ export function fakeItems() {
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
-    const row: Row = { id, number, member: 'adam', from: 'joey', session_id: null, kind, refs: [], state: 'waiting', reason: null,
+    const row: Row = { id, number, member: member, from: 'joey', session_id: null, kind, refs: [], state: 'waiting', reason: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
       message_id: kind === 'message' ? 'm' + number : null, action_id: null, call_id: null, mail_id: null,
       answered: null, response_message_ids: [], in_session_at: null, updated_at: iso(now), payload, ...extra }
@@ -48,34 +46,22 @@ export function fakeItems() {
   const eligible = (r?: Row) => !!r && r.state === 'waiting' && !(Date.parse(r.not_before ?? '') > now) && !(r.reason === 'parked' && !r.released)
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 60, async fetch(req) {
     const url = new URL(req.url), path = url.pathname, q = url.searchParams
+    if (req.headers.get('authorization') !== 'Bearer ' + token) return error(401, 'not_authenticated')
+    if (extra) {
+      const response = await extra(req)
+      if (response) return response
+    }
     const b = req.method === 'GET' ? {} : await req.json() as any, key = req.headers.get('Idempotency-Key')
     calls.push({ path, query: q, body: b, key })
-    if (req.headers.get('authorization') !== 'Bearer test-member') return error(401, 'not_authenticated')
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
-    if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
+    if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', member] })
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
-    if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
-    if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
-    if (path === '/inbox' && req.method === 'GET') {
-      if (mode === 200) return error(409, 'take_member')
-      const after = Number(q.get('after'))
-      const given = [...rows.values()].filter(r => r.state === 'waiting' && r.number > after).slice(0, Number(q.get('limit') ?? 100))
-      for (const row of given) givenByPull.add(row)
-      return Response.json({ items: given.map(r => ({ seq: r.number, sender: r.from, kind: r.kind, payload: r.payload })),
-        last_seq: seq, acked_seq: pullAcked })
-    }
-    if (path === '/inbox/ack' && req.method === 'POST') {
-      for (const row of givenByPull) {
-        if (row.number > b.upto) continue
-        row.state = 'completed'; change(row, 'acked'); givenByPull.delete(row)
-      }
-      pullAcked = Math.max(pullAcked, b.upto)
-      return Response.json({ acked: 1 })
-    }
-    const base = '/v1/members/adam/items'
+    if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: member, kind: 'agent' })
+    if (path.endsWith('/commands')) return detail({ name: member, kind: 'agent' })
+    const base = '/v1/members/' + member + '/items'
     const connector = b.connector ?? q.get('connector')
     if (connector && path.startsWith(base) && mode !== 200) return error(mode, mode === 409 ? 'not_take_member' : mode === 400 ? 'invalid_request' : 'not_found')
     if (connector) {
@@ -94,7 +80,7 @@ export function fakeItems() {
         waiters.add(wake); req.signal.addEventListener('abort', wake, { once: true })
       })
       const all = select(), start = Number(q.get('cursor')), end = start + Number(q.get('limit') ?? 50)
-      return Response.json({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null, items: all.slice(start, end),
+      return Response.json({ api_version: '1', as_of: iso(now), viewer: member, read_by: null, items: all.slice(start, end),
         next_cursor: end < all.length ? String(end) : null,
         ...(connector ? { changed_after: iso(now - 1000).replace('Z', '+00:00') } : {}) })
     }
@@ -114,10 +100,10 @@ export function fakeItems() {
       }
       const waiting = [...rows.values()].filter(r => r.state === 'waiting')
       answer = detail({ claim_id, items: given, waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
-    } else if (path === '/v1/members/adam/observation' && req.method === 'PUT') {
+    } else if (path === '/v1/members/' + member + '/observation' && req.method === 'PUT') {
       if (!Array.isArray(b.held_item_ids)) return error(400, 'invalid_request')
       for (const id of b.held_item_ids) { const r = rows.get(id); if (r?.claim?.connector === connector) r.claim.expires_at = iso(now + 45_000) }
-      answer = detail({ name: 'adam', kind: 'agent' })
+      answer = detail({ name: member, kind: 'agent' })
     } else {
       const row = rows.get(decodeURIComponent(path.split('/')[3] ?? ''))
       if (!row) return error(404, 'not_found')

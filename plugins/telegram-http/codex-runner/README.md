@@ -2,56 +2,17 @@
 
 Codex (OpenAI Codex CLI) is the Onsen member `codex`. This program is the part of it that takes work. It is one resident Bun process on the Mac mini, run by launchd as `com.btai.codex-runner`.
 
-- An agent hands Codex work with `send_to_agent(to: "codex", line: "call", …)`. The answer comes back the way every Call's answer does: in the Call's result, and as a reply in the caller's inbox.
+- An agent hands Codex work with `send_to_agent(to: "codex", line: "call", …)`. The answer comes back the way every Call's answer does: as a reply linked to the Call.
 - Joey talks to Codex on the Onsen page. The answer is recorded in his conversation with Codex.
 - In both cases the request, the progress and the result live in Onsen, including the files Codex makes.
 
 ## What it does
 
-1. **Take.** It uses the codex credential and the same pull every daemon uses: `GET /api/onsen/inbox` (long poll) and `POST /inbox/ack`. That pull brings in Calls and replies to Codex's answers. It also polls `GET /api/onsen/forms/inbox` (long poll) for messages Joey writes on the page (items marked `say`).
-   - A person's message comes on the same inbox as an item of kind `person_message` (Onsen 0.33.0, WO-193): a message a bridge carried in from Telegram (`via: telegram`), or one written on the page for an agent Onsen gives page messages this way (`via: web`). It is a job as a page `say` is: the same session (the chat's, or the conversation's when it has no client chat), folder, run and delivery facts. Its text may be empty (a photo with no caption). Attachments with a `url` are downloaded; ones without (a file only Telegram has) are named in the prompt as not available. What it replies to, the quoted passage and where it was forwarded from go into the prompt too. A `person_edit` is logged and acked; it starts nothing.
-   - Each item is first written to the state file, then acked.
-   - Not work, acked and left alone: silent notices, mail bells, Action presses, and anything that is neither a Call nor a reply. A peer_call that arrives without its Call id is looked up by its number once after 35 s. If it still has none, it is a poke.
-2. **Session.** A Codex session belongs to a thread, not to a whole conversation (Chiron's ruling, mesh 12527, 11-26 08:21Z; the same rule as our own agents, where a thread belongs to one session).
-   - An agent's item that carries a thread (`payload.thread` or `refs.thread`) belongs to that thread's session. The first item starts it and the next ones resume it.
-   - An item that carries no thread starts a new session with a new thread `codex#t-<12 hex>`. The answer carries that thread: the reply's `payload.thread` and `refs.thread`, and a line in the Call's result.
-   - So the caller's `reply_to` of the answer resumes that session, because its daemon fills in the thread of the message it answers. A send with `thread=codex#t-…` resumes it too.
-   - With Onsen 0.29.2 such a reply is a Call of its own in that thread, because Codex takes work (`members.takes_work`, declared by the runner at start): it gets accepted, running and completed, and its files on the result. Against an older Onsen it is a follow-up without a Call, and its answer still comes back as a reply.
-   - Joey on the page has one session per DM, ongoing.
-3. **Accept.** For a Call, it PUTs `accepted` to `/v1/calls/<id>/state`.
-   - The session's folder is `~/onsen-codex/<Onsen conversation id>/<sub>/`. `<sub>` is the item's thread, `call-<id>` for a session started by a Call with no thread, or `dm` for Joey's DM. Two sessions never share a folder, so neither sees the other's new files.
-   - The item's attachments are downloaded into that folder with the credential, only from Onsen's own origin.
-4. **Run.** For a Call, it PUTs `running`. Then it runs:
-
-   ```
-   codex exec --skip-git-repo-check -s workspace-write -C <dir> --json -o <dir>/last-<n>.txt [-i <image>…] -- "<text>"   < /dev/null
-   ```
-
-   - The next items of a session use `codex exec --skip-git-repo-check -s workspace-write -C <dir> resume <session> --json -o … -- "<text>"`: `-s` and `-C` before `resume`, `--json`, `-o` and `-i` after it. `<session>` comes from `thread.started.thread_id` in the `--json` events of the session's first run.
-   - stdout and stderr go to `<dir>/.codex-runner/run-<n>.jsonl` and `.stderr`.
-5. **Finish.**
-   - **Completed**: `result.body` is the last message.
-     - Files new or changed in the folder by this run are uploaded with `POST /v1/files` and listed in `result.attachment_file_ids`. Hidden files and `last-<n>.txt` are excluded. At most 20 files, each at most 25 MB. Files over either limit are named in the body.
-     - A peer's item also gets a reply with `POST /send`: kind `peer_call`, `reply_to_id` set to its number (for a follow-up without one, the number of the Call that started the session), the session's thread, the same files attached, and the file URLs and Mac mini paths in the text.
-     - Always. An incoming `no_reply` means the caller owes Codex no answer; it never keeps Codex's answer to that work back (Chiron 08:49Z: a `reply_to` is always sent `no_reply`, and its answer reached no one).
-     - A page message's answer is recorded with `POST /messages` and carries its files. Its delivery facts are delivered, in_session, seen and turn_end.
-     - A person_message's answer is written new-style (Onsen 0.35.0, CONTRACT §7d): `POST /messages` with `{conversation_id, idem_key, sent_at, body, sender: "main", turn_id, attachment_file_ids?}`, no `agent`, `client`, `chat`, `client_msg_id` or `delivery`. Onsen decides which bridge draws it. Its delivery facts are keyed on the message's own client numbers (`via: telegram`: `client.name`, `client.chat`, `client.msg_id`, which Onsen turns into the bridge's receipts; `via: web`: `form-<message id>`), idempotent under `codex:pm-<message id>:<state>`.
-   - **Failed**: the exit code is non-zero, or the run passed `CODEX_RUNNER_TIMEOUT_S`. On timeout the process group gets SIGTERM, then SIGKILL 10 s later. `result.body` holds the error and the last 30 lines of stderr.
-   - However codex ends, its process group gets SIGTERM, then SIGKILL 10 s later, so nothing it started lives on (Chiron 08:49Z note 3).
-6. **Limits.**
-   - At most `CODEX_RUNNER_MAX` items run at once, across sessions. The rest stay `queued` in Onsen. Onsen sets that state itself; the runner sends no PUT until it starts an item.
-   - Two items of one session never run at once, because two resumes would interleave its history. The second waits for the first.
-7. **Status.** It PUTs `/v1/members/codex/observation` at each change and every 15 s.
-   - While alive it is online.
-   - While any item is being worked on, the main session is running with `doing {kind: tool, tool: "codex exec"}`. The member page shows 「執行中・codex exec」.
-   - Otherwise the main session is idle (閒置).
-   - At a clean stop it reports offline.
-8. **Restart.**
-   - The runs in flight keep going in their own process groups, and the next start follows them.
-   - A run whose process is gone is settled from what it left. If its events show the turn completed and the last message is there, it is completed. Otherwise it is failed, with a note.
-   - Reports interrupted by a restart are sent again; each one is idempotent.
-
-Codex never starts anything on its own, never reads a mailbox, and never posts on the wall. Its credential goes only to Onsen and is never logged.
+1. The runner peeks at `GET /v1/members/codex/items`. When a worker and the Item’s thread are free it takes that Item by ID. Other work waits in Onsen. A member still on pull logs the refusal and retries after 60 seconds. A competing connector waits 45 seconds.
+2. Calls use their thread’s Codex session. A Call without a thread starts a new one and its reply carries the new thread. Page and Telegram messages use the chat’s existing session, or the Onsen conversation if the message has no chat. The request, quoted context and attachments come from the Item granted by take.
+3. The runner starts `codex exec` in the session folder, records the PID and reports `in_session` for the claim. Its member observation renews held Item IDs under the machine/member connector every 15 seconds. At most `CODEX_RUNNER_MAX` sessions run concurrently.
+4. The answer and its files go to the caller. A peer reply carries the Call reference and thread. A person’s reply is written to their Onsen conversation. After the reply is stored, the runner reports `completed` and any response message IDs it received. An execution error reports `error`; an interrupted run reports `cut`. Onsen projects the Call and message receipt from these reports.
+5. The report spool and session state survive restart. The runner observes surviving children, checks the saved events and final message for exited children, and retries unfinished replies with the same identity.
 
 ## Codex's own home
 
@@ -90,7 +51,8 @@ tail -f ~/onsen-codex/.runner/runner.log   # "codex-runner up", then its first s
 bun codex-runner.ts --profile       # once: display name Codex, role 外部模型（OpenAI Codex CLI）：審設計、寫程式、生圖, takes_work
 ```
 
-- **Restart after a code update** (git pull of the plugin checkout): `launchctl kickstart -k gui/$(id -u)/com.btai.codex-runner`. Runs in flight are followed by the new process. The first start of a runner with Codex's own home needs `--setup` before it.
+- **First take-only deployment**. Quiesce new codex work and let the previous runner finish its jobs, replies, uploads and acks. Stop it only when its queue, workers and outstanding reports have drained. Keep its state directory. The new runner refuses to take over unfinished jobs from the pull version. See the [C7 cutover](../docs/C7-spec.md).
+- **Subsequent take-only update** (git pull of the plugin checkout): `launchctl kickstart -k gui/$(id -u)/com.btai.codex-runner`. Runs in flight are followed by the new process. The first start of a runner with Codex's own home needs `--setup` before it.
 - **Stop**: `launchctl bootout gui/$(id -u)/com.btai.codex-runner`.
   - Onsen shows Codex offline. Calls sent to it stay queued in Onsen, and the next start takes them.
   - Runs in flight keep going to their end. To stop them as well: `pkill -TERM -f 'codex exec --skip-git-repo-check -s workspace-write -C '"$HOME"'/onsen-codex'`.

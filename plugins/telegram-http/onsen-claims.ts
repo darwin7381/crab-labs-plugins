@@ -32,9 +32,9 @@ export class Claims implements ClaimStore {
   }
 
   held(): string[] { return Object.keys(this.rows) }
-  owns(id: string): boolean {
+  owns(id: string, claimId?: string): boolean {
     const row = this.rows[id]
-    return !!row && (!row.last_outcome || intermediate.has(row.last_outcome))
+    return !!row && (!claimId || row.claim_id === claimId) && (!row.last_outcome || intermediate.has(row.last_outcome))
   }
   blocked(): boolean { return this.spool.hasItemReports() }
   completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }

@@ -13,7 +13,11 @@ export function checkObservation(s: any): string[] {
     const diff = [...got].filter(k => !w.has(k)).concat([...w].filter(k => !got.has(k)))
     check(!diff.length, `${what}: keys differ ${JSON.stringify(diff)}`)
   }
-  keys(s, KEYS, 'observation')
+  if ('connector' in s || 'held_item_ids' in s) {
+    keys(s, KEYS + ' connector held_item_ids', 'observation')
+    check(typeof s.connector === 'string' && s.connector.includes('/'), 'connector')
+    check(Array.isArray(s.held_item_ids) && s.held_item_ids.every((id: unknown) => typeof id === 'string'), 'held_item_ids')
+  } else keys(s, KEYS, 'observation')
   check(['online', 'offline'].includes(s.presence), `presence ${s.presence}`)                 // away is a person's; unknown is Onsen's
   check(['ready', 'starting', 'stopped'].includes(s.lifecycle), `lifecycle ${s.lifecycle}`)
   if (s.presence === 'online') check(s.presence_reason === null, 'online with a reason')

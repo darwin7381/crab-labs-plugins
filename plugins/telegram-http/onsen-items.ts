@@ -36,7 +36,7 @@ export class ItemPeek {
   private request?: AbortController
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
-    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean) {}
+    readonly route: (it: InboxItem, edit: boolean) => Promise<void>, readonly canRead: () => boolean, readonly waitSeconds = 25) {}
 
   reset(): void {
     this.generation++
@@ -76,11 +76,11 @@ export class ItemPeek {
     let delay = 0
     try {
       if (!this.canRead()) { delay = 250; return }
-      const q = new URLSearchParams({ state: 'waiting', wait: '25', connector: this.mode.connector, limit: '100' })
+      const q = new URLSearchParams({ state: 'waiting', wait: String(this.waitSeconds), connector: this.mode.connector, limit: '100' })
       if (this.changedAfter) q.set('changed_after', this.changedAfter)
       if (this.page) q.set('cursor', this.page)
       this.request = new AbortController()
-      const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, 35_000, undefined, this.request.signal)
+      const r = await this.mode.req('GET', this.mode.path + '?' + q, undefined, (this.waitSeconds + 10) * 1000, undefined, this.request.signal)
       if (g !== this.generation || !this.mode.active) return
       if (r?.status === 409) {
         const why = r.json?.error?.code
