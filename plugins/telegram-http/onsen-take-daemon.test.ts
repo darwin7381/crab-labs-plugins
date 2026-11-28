@@ -144,6 +144,21 @@ test('real daemon routes one unclaimed notification per album at count or 1.5 s 
   expect(d.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
 }, 10000)
 
+test('a deferred mail hand-back is reattached as a batched unclaimed M1 item', async () => {
+  const d = await daemon({}, 200, (root, f) => {
+    const row = f.add('mail-deferred', 'mail', { reason: 'reassigned', note: 'Decision for main', from: 'eve' })
+    const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
+    journal.write('event', 'original', 'open', { onsen_items: [itemRef(row)],
+      obligations: [{ id: 'ho-mail', kind: 'main', state: 'open', handoff: 'ho-mail', defer: true }] })
+    return {}
+  })
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.event === 'original'))
+  const local = d.journal().find(r => r.rec === 'msg' && r.event === 'original')
+  expect(local.reason).toBe('batched')
+  expect(local.notif.params.content).toContain('Decision for main')
+  expect(d.f.rows.get('mail-deferred')?.state).toBe('waiting')
+})
+
 test('stopped and over-budget threads and a missing lane hand their queued items back', async () => {
   const ids = ['stopped', 'budget', 'gone']
   const d = await daemon({}, 200, (root, f) => {

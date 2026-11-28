@@ -214,6 +214,21 @@ test('a main session with no subagents directory completes at its settled Stop',
   expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
 })
 
+test('batched mail waits in Onsen and rides the next M1 take or leads after the batch timeout', async () => {
+  for (const timeout of [false, true]) {
+    const r = await mainRig(), mail = r.f.add('mail', 'mail')
+    const did = r.m.enqueue('peer', { method: 'notifications/claude/channel', params: { content: 'mail', meta: {} } },
+      { batched: true, fields: { onsen_items: [itemRef(mail)] } })
+    await r.m.pump()
+    expect(mail.state).toBe('waiting'); expect(r.offers).toHaveLength(0)
+    if (timeout) r.journal.write('msg', did, 'queued', { batched_at: new Date(Date.now() - 2701_000).toISOString() })
+    else r.enqueue(r.f.add('next'))
+    await r.m.pump()
+    await until(() => mail.state === 'claimed')
+    expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([timeout ? ['mail'] : ['next', 'mail']])
+  }
+})
+
 test('while busy mail waits, a person binds inside PostToolUse, pre-switch work finishes without an item report', async () => {
   const r = await mainRig(), old = r.f.add('legacy'), mail = r.f.add('mail', 'mail'), message = r.f.add('person')
   old.state = 'completed'

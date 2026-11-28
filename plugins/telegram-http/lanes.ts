@@ -2573,7 +2573,9 @@ function routeMainItem(ev: InEvent): Decision {
   const waiting = (o: Ob) => o.kind === 'main' && o.state === 'open' && !!o.handoff && !o.item
   const prior = ref.main && events.rows(e => e.onsen_items?.some((r: ItemRef) => r.onsen_item_id === ref.onsen_item_id) && e.obligations?.some(waiting)).at(-1)
   ev.id = prior ? prior.id : itemEventId(ref)
-  const d: Decision = { target: 'main', rule: 'onsen-main' }
+  const verdict = ref.kind === 'mail' ? decideFor(ev, routerCfg()) : null
+  const batch = !!(prior && deferredMain(prior.id)) || !!(verdict && batchRule(verdict.v.rule, routerCfg()))
+  const d: Decision = { target: 'main', rule: 'onsen-main', batch }
   const item = toMain(ev, d)
   if (prior && item) events.set(ev.id, waiting, { item })
   return d
