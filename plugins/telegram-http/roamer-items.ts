@@ -2,12 +2,12 @@ import { statSync } from 'fs'
 import { dirname } from 'path'
 import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
 import type { ItemReceiver } from './onsen-receive.ts'
+import { receivingUUID } from './onsen-session.ts'
 import type { Claims } from './onsen-claims.ts'
 import { REGISTRY_SETTLE_MS, TurnWatch, type RegEntry, type Registry } from './onsen-status.ts'
 
 type Notification = { method: string; params: unknown }
 type Offer = { target: ReceivingTarget; stream: string }
-const sessionUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** Keep watching the original receiving turn across /roam and reconnects. All leases and reports belong to the common receiver. */
 export class RoamerItems {
@@ -66,12 +66,13 @@ export class RoamerItems {
       if (!created) return null
       if (first) {
         // Older events can repeat Item.session_id. A sender preset alone cannot identify a receiver.
-        let sid = first.session_id !== created.session_id ? first.session_id : null
-        if (!sessionUUID.test(sid ?? '') && created.session_id === null) sid = detail.session_id
-        if (!sid || !sessionUUID.test(sid)) return null
+        const member = this.o.receiver.mode.member
+        const received = first.session_id !== created.session_id ? first.session_id : null
+        const sid = receivingUUID(member, received) ?? (created.session_id == null ? receivingUUID(member, detail.session_id) : null)
+        if (!sid) return null
         this.o.claims.recoverReceiver(row.id, sid)
         session = sid
-      } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'taken')) return null
+      } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'claimed' || e.kind === 'taken')) return null
     }
     session ??= this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id
     if (session) this.pending.set(row.id, session)

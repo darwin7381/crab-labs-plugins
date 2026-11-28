@@ -430,7 +430,7 @@ if (ONSEN_TAKE_ON) {
       itemClaims!.acknowledged(line, ok)
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       queueMicrotask(() => { if (!ROAMER && takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
-    }, line => itemClaims!.reportBody(line))
+    }, line => itemClaims!.reportBody(line, ROAMER ? ONSEN_AGENT : undefined))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(),
       ROAMER ? undefined : Lanes.sweepQueue, ROAMER ? waiting => roamerItems?.fullList(waiting) : undefined)

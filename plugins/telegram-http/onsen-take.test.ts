@@ -5,6 +5,7 @@ import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient, roamerMember } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
+import { receivingUUID, reportSession } from './onsen-session.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
@@ -898,6 +899,23 @@ test('a pre-C6 claim and a replayed main wire report retain the original receivi
   expect(r.outcomes('old')).toEqual(['in_session', 'completed'])
 })
 
+test('Onsen conversation numbers preserve the full roamer UUID and belong to one member', () => {
+  for (const [uuid, number] of [
+    ['00000000-0000-0000-0000-000000000001', '1'],
+    ['ffffffff-ffff-ffff-ffff-ffffffffffff', '340282366920938463463374607431768211455'],
+  ]) {
+    const wire = reportSession(uuid!, 'space-roamers')
+    expect(wire).toBe('space-roamers.roam.' + number)
+    expect(receivingUUID('space-roamers', wire)).toBe(uuid)
+    expect(receivingUUID('space-roamers', uuid)).toBe(uuid)
+    expect(receivingUUID('other', wire)).toBeNull()
+    expect(reportSession(uuid!)).toBe('main')
+  }
+  expect(receivingUUID('adam', 'adam.roam.340282366920938463463374607431768211456')).toBeNull()
+  expect(receivingUUID('adam', 'main')).toBeNull()
+  expect(reportSession('adam.reflex.1')).toBe('adam.reflex.1')
+})
+
 test('the four roamer bot names resolve to their registered members without lanes', () => {
   for (const [bot, member] of [['space_roamers', 'space-roamers'], ['time_travelers', 'time-travelers'],
     ['@SpaceX_Roamer_bot', 'spacex-roamer'], ['@SpaceY_Roamer_bot', 'spacey-roamer']]) {
@@ -1535,12 +1553,16 @@ test('a stuck non-report cannot block an item report, including after restarting
 
 test('late conflicting report is logged, a permanent 4xx is rejected and the spool advances', async () => {
   const r = rig(), row = r.f.add('settled')
+  const errors: string[] = [], log = r.client.cfg.log
+  r.client.cfg.log = (level, message) => { log(level, message); if (level === 'error') errors.push(message) }
   await r.mode.probe(); await r.receiver.receive([itemRef(row)])
   const id = row.claim!.id
   r.claims.report(row.id, 'completed'); await r.sync()
   for (const item_id of [row.id, 'missing']) r.client.recordItemReport({ item_id, body: { claim_id: id, at: new Date().toISOString(), outcome: 'cut' } })
   await r.sync()
   expect(r.client.pendingBytes()).toBe(0); expect(r.logs.some(l => l.includes('version_conflict'))).toBe(true)
+  expect(errors.some(message => message.includes('version_conflict'))).toBe(true)
+  expect(errors.some(message => message.includes('missing') && message.includes('404'))).toBe(true)
   expect(readFileSync(r.client.rejected, 'utf8')).toContain('missing')
 })
 
@@ -1580,7 +1602,7 @@ test('a 409 pause keeps the take gate until the probe confirms pull', async () =
   expect(mode.active).toBe(true)
   expect(mode.canReceive).toBe(false)
   r.f.down(false)
-  for (const status of [401, 403, 404, 429]) {
+  for (const status of [401, 403, 429]) {
     r.f.mode(status); await mode.probe()
     expect(mode.active).toBe(true); expect(mode.canReceive).toBe(false)
   }

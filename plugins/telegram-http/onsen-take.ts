@@ -22,7 +22,7 @@ export function reportedDelivery(source: 'items' | 'inbox', status?: number, cod
     if (status === 409 && code === 'take_member') return 'take'
   } else {
     if (status === 200) return 'take'
-    if (status === 409 && code === 'not_take_member') return 'pull'
+    if (status === 400 || status === 404 || (status === 409 && code === 'not_take_member')) return 'pull'
     if (status === 409 && code === 'not_current_connector') return 'foreign'
   }
 }

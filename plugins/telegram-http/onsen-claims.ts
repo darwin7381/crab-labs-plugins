@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
+import { reportSession } from './onsen-session.ts'
 import type { Journal } from './lanes-state.ts'
 import { genuineAssistantAfterFile } from './liveness.ts'
 import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
@@ -214,13 +215,9 @@ export class Claims implements ClaimStore {
       if (row.target && row.session_id && !this.receivers.has(id)) this.receivers.set(id, row.session_id)
     }
   }
-  /** Keep the local receiving UUID for hooks. Fleet Core 0.42.2 names an ordinary main "main" on the wire. */
-  reportBody({ item_id, body }: ItemReport): ItemReport['body'] {
-    const row = this.rows[item_id]
-    if (body.outcome === 'in_session' && row?.claim_id === body.claim_id && !row.target &&
-      /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(body.session_id ?? ''))
-      return { ...body, session_id: 'main' }
-    return body
+  /** Translate at HTTP send time, including reports already durable in an older connector's spool. */
+  reportBody({ body }: ItemReport, roamerMember?: string): ItemReport['body'] {
+    return body.session_id ? { ...body, session_id: reportSession(body.session_id, roamerMember) } : body
   }
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line

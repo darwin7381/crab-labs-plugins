@@ -232,7 +232,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
         Object.assign(row, { state: 'claimed', reason: null, note: null, in_session_at: null, claim: { id: claim_id, connector, session_id: null, taken_at: iso(now), expires_at: iso(now + 45_000) } })
         issued.add(row.id + '/' + claim_id)
         lastClaim.set(row.id, claim_id!)
-        change(row, 'taken')
+        change(row, 'claimed')
       }
       const waiting = [...rows.values()].filter(r => r.member === member && r.state === 'waiting')
       answer = detail({ claim_id, items: given.map(r => view(r, false)), waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
@@ -258,6 +258,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
       history.push({ item_id: row.id, body: b })
       if (['cancelled', 'completed'].includes(row.state) || lastClaim.get(row.id) !== b.claim_id && b.outcome !== 'completed'
         || expired.has(row.id) && intermediate.has(b.outcome)) { change(row, 'late_report', b.note); return detail(view(row)) }
+      if (b.outcome === 'in_session' && /^[a-f0-9-]{36}$/i.test(b.session_id ?? '')) return error(400, 'invalid_request')
       if (b.outcome === 'in_session' && row.claim) { row.claim.session_id = b.session_id; row.session_id ??= b.session_id; row.in_session_at = b.at }
       if (typeof b.half_done === 'boolean') row.half_done = b.half_done
       if (b.outcome === 'error') row.not_before = iso(now + (row.failures + 1) * 300_000)
