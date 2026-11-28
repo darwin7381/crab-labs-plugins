@@ -2234,7 +2234,7 @@ async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown
 // decision (mailbox_decide → mail_decision) and the cards entering the due window (GET /due every minute → mail_due). One the router cannot take
 // now waits in <state>/mail-events.json and goes on the next tick. Lanes off: no events (the main does what it decided itself).
 const mailEvents = INBOX_ONLY && Lanes.LANES_ON
-  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
+  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), onTake: () => !!onsenPuller?.onTake, send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
   : null
 if (mailEvents) {
   const fetchDue = async () => { const r = await btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`).catch(() => null); return r?.status === 200 && Array.isArray(r.json?.due) ? r.json.due : null }

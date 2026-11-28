@@ -72,7 +72,7 @@ export class MailEvents {
   pending: MailEvent[] = []
   dueSent: Record<string, number> = {}
   private flushing: Promise<number> | null = null
-  constructor(private o: { file: string; send: (ev: MailEvent) => Promise<boolean>; log: (level: string, msg: string) => void; now?: () => number }) {
+  constructor(private o: { file: string; send: (ev: MailEvent) => Promise<boolean>; log: (level: string, msg: string) => void; now?: () => number; onTake?: () => boolean }) {
     try {
       const s = JSON.parse(readFileSync(o.file, 'utf8')) as Saved
       this.pending = Array.isArray(s.pending) ? s.pending : []
@@ -92,8 +92,10 @@ export class MailEvents {
     try { return await this.o.send(ev) } catch (e) { this.o.log('warn', `mail-events: ${ev.id}: ${e}`); return false }
   }
   /** hand one event to the router now; if it cannot take it, it waits (in order, one per id) for the next flush */
-  async emit(ev: MailEvent): Promise<'handed' | 'queued'> {
+  async emit(ev: MailEvent): Promise<'handed' | 'queued' | 'item'> {
+    if (this.o.onTake?.()) return 'item'
     await this.flush()                                  // what waits goes first: the router sees events in order
+    if (this.o.onTake?.()) return 'item'
     if (!this.pending.length && await this.tryOne(ev)) return 'handed'
     if (!this.pending.some(p => p.id === ev.id)) {
       this.pending.push(ev)
@@ -108,7 +110,7 @@ export class MailEvents {
     if (this.flushing) return this.flushing
     this.flushing = (async () => {
       let n = 0
-      while (this.pending.length) {
+      while (this.pending.length && !this.o.onTake?.()) {
         if (!await this.tryOne(this.pending[0])) break
         this.pending.shift(); n++
       }
@@ -120,9 +122,10 @@ export class MailEvents {
   /** one tick: the waiting events, then the items new to the due window. fetchDue null = BTCC did not answer (try next tick). */
   async tick(fetchDue: () => Promise<any[] | null>): Promise<{ flushed: number; due: number }> {
     const flushed = await this.flush()
+    if (this.o.onTake?.()) return { flushed, due: 0 }
     const items = await fetchDue().catch(() => null)
     let due = 0
-    if (items) {
+    if (items && !this.o.onTake?.()) {
       const t = this.now()
       for (const it of items) {
         const ev = dueEvent(it)
