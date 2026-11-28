@@ -20,15 +20,19 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled', thr
   const offers: string[][] = [], texts: string[] = [], notices: string[] = []
   const requests: Array<{ method: string; path: string; body: any }> = []
   const logs: string[] = [], threadEvents: Record<string, unknown>[] = []
-  const calls = new Map<string, string>()
+  const calls = new Map<string, string | number>() // Call state or HTTP error status
   const client = new OnsenClient({ agent: 'adam', base: 'http://127.0.0.1', record: true, dir, credential: () => 'test', log: (level, msg) => logs.push(`${level} ${msg}`),
     fetch: (async (input, init) => {
       const path = new URL(String(input)).pathname, body = init?.body ? JSON.parse(String(init.body)) : null
       requests.push({ method: init?.method ?? 'GET', path, body })
       if (path.endsWith('/messages') && body?.type !== 'message') return new Response(null, { status: 400 })
       const id = path.match(/^\/v1\/calls\/(\d+)$/)?.[1]
-      return Response.json(id ? { data: { state: calls.get(id), thread_id: '9', conversation_id: '2', caller: 'scheduler' } }
-        : path === '/deliveries/batch' ? { results: body.items.map(() => ({})) } : {})
+      if (id) {
+        const state = calls.get(id)
+        if (typeof state === 'number') return new Response(null, { status: state })
+        return Response.json({ data: { state, thread_id: '9', conversation_id: '2', caller: 'scheduler' } })
+      }
+      return Response.json(path === '/deliveries/batch' ? { results: body.items.map(() => ({})) } : {})
     }) as typeof fetch })
   client.observe(line => { if (line.k === 't') threadEvents.push(line.r) })
   if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid })
@@ -250,6 +254,21 @@ test('WO-200 offline and restored Calls are checked before a hook can pull them'
       text: cause === 'restart' ? '重新啟動時這件已經是 expired，沒有交給主線' : '主線恢復連線時這件已經是 cancelled，沒有交給主線' } }])
     expect(d.offers).toEqual([])
   }
+})
+
+test.each([401, 404, 425])('a delayed Call whose GET returns HTTP %i closes after one check', async status => {
+  const d = daemon()
+  d.calls.set('8', status)
+  const item = d.add('peer', '8')
+  await d.flush()
+  d.clear(); await d.flush()
+  setSystemTime(T + 5_000)
+  await d.main.tick()
+  expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', call_state: `http_${status}` })
+  expect(d.requests).toEqual([{ method: 'GET', path: '/v1/calls/8', body: null }])
+  expect(d.logs).toEqual([expect.stringMatching(new RegExp(`Call 8.*HTTP ${status}`))])
+  expect(d.offers).toEqual([])
+  expect(d.threadEvents).toEqual([])
 })
 
 test('WO-200 a wall returning during Call lookup keeps the program queued', async () => {
