@@ -172,7 +172,7 @@ async function withMemberMode(take: boolean, run: (puller: OnsenPuller, itemCrea
   const mode = new TakeMode('adam', req, () => {}, () => {})
   const claims = new Claims(join(state, 'claims.json'), client, () => {}, () => {})
   const puller = new OnsenPuller({ req, base: f.base, inbox: new OnsenInbox({ file: join(state, 'inbox.json') }),
-    host: 'fixture', takeEnabled: true, waitS: 0, log: () => {}, deliver: async () => 'delivered' })
+    host: 'fixture', waitS: 0, log: () => {}, deliver: async () => 'delivered' })
   try {
     f.mode(take ? 200 : 409)
     L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), client)
