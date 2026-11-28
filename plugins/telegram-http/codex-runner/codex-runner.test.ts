@@ -22,6 +22,7 @@ class FakeOnsen {
   profiles: any[] = []
   profileStatus: number[] = []
   newStyleStatus: number[] = []
+  replyMessageId?: string
   fileSeq = 900
   paths: string[] = []
   get observations() { return this.items.calls.filter(c => c.path.endsWith('/observation')).map(c => c.body) }
@@ -57,7 +58,7 @@ class FakeOnsen {
     if (m === 'POST' && p === '/send') {
       const b = await req.json() as any
       if (!this.sends.some(send => send.dedupe === b.dedupe)) this.sends.push(b)
-      return this.j(200, { results: [{ to: b.to, seq: this.sends.length }] })
+      return this.j(200, { results: [{ to: b.to, seq: this.sends.length, message_id: this.replyMessageId }] })
     }
     if (m === 'POST' && p === '/v1/messages') {
       const b = await req.json() as any
@@ -283,6 +284,7 @@ describe('a long answer (Chiron mesh 13227: over 4000, the Call never completed 
 describe('a Call', () => {
   test('[2] accepted → running → completed: the attachment in, the picture out, the answer back to the caller', async () => {
     const { onsen, cfg, codexLog } = setup()
+    onsen.replyMessageId = 'cm98765'
     const ref = onsen.file('11', 'ref.png', PNG)
     onsen.push({ sender: 'chiron', payload: { text: '生一張 1024x1024 的圖：水豚泡溫泉 IMG:capy.png', msg_id: 501 }, dedupe: 'msg:501', call_id: '71',
       attachments: [{ kind: 'photo', name: 'ref.png', mime: 'image/png', bytes: PNG.length, url: ref }] })
@@ -290,6 +292,7 @@ describe('a Call', () => {
     await r.start()
     await until(done(onsen, '71'), 10_000, 'Call 71')
     expect(onsen.statesOf('71')).toEqual(['in_session', 'completed'])
+    expect(onsen.items.rows.get('71')!.response_message_ids).toEqual(['cm98765'])
     expect(onsen.items.history[0]!.body.session_id).toBe('main')
     const fin = onsen.sends.at(-1)!
     expect(fin.payload.text).toContain('answer to: 生一張 1024x1024 的圖')
@@ -365,6 +368,7 @@ describe('a Call', () => {
     expect(starts.slice(2).every(x => x.dir === folder)).toBe(true)
     expect(starts[3].at).toBeGreaterThanOrEqual(ends[2].at)                   // one session: never two at once
     expect(onsen.statesOf('83')).toEqual(['in_session', 'completed'])
+    expect(onsen.items.rows.get('83')!.response_message_ids).toEqual([]) // /send accepted the reply with only its inbox sequence
     expect(onsen.statesOf('84')).toEqual(['in_session', 'completed'])
     expect(Object.keys(r.state.sessions)).toEqual([`t:${T}`])
   })

@@ -68,7 +68,7 @@ bun codex-runner.ts --profile       # once: display name Codex, role 外部模�
 | `ONSEN_BASE` | `https://core.kbro.ai/api/onsen` | |
 | `ONSEN_HOST` | the host name | the member's machine in Onsen (the plist sets `macmini`) |
 | `CODEX_RUNNER_ROOT` | `~/onsen-codex` | one folder per conversation |
-| `CODEX_RUNNER_STATE_DIR` | `<root>/.runner` | `state.json`, `onsen-inbox.json`, `runner.pid` |
+| `CODEX_RUNNER_STATE_DIR` | `<root>/.runner` | `state.json`, `item-claims.json`, `onsen/spool.jsonl` and its cursor, `runner.pid` |
 | `CODEX_RUNNER_LOG` | `<state dir>/runner.log` | also on stderr (launchd's err log) |
 | `CODEX_RUNNER_MAX` | `3` | runs at once |
 | `CODEX_RUNNER_TIMEOUT_S` | `1800` | a run's limit; `CODEX_RUNNER_KILL_GRACE_S` (10) between SIGTERM and SIGKILL |

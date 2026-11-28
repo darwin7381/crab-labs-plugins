@@ -554,7 +554,7 @@ export class CodexRunner {
       j.resumed = conv.session_id
       j.before = snapshot(conv.dir, j.dev ? 'repo' : undefined)
       j.started_at = this.iso()
-      if (this.stopped) return                                      // stopping: still 'starting' on disk, queued again at the next start
+      if (this.stopped) return                                      // restart returns this unstarted claim to Onsen
       const notReady = codexHomeReady(this.cfg)                     // Codex's own home missing: this item fails with the note, never runs elsewhere
       if (notReady) throw new Error(notReady)
       if (!this.mode.active || !this.claims.owns(j.item_id, j.claim_id)) {
