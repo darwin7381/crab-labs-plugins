@@ -87,6 +87,23 @@ test('a creation key follows its row, and a take key follows its live claim', as
   expect(fake.rows.size).toBe(1)
 })
 
+test('a roamer retires a keepwarm creation left in the previous connector spool and still sends its self Item', async () => {
+  fake = fakeItems()
+  const dir = mkdtempSync(join(tmpdir(), 'roam-spool-'))
+  const cfg = { dir, agent: 'adam', base: fake.base, record: true, credential: () => 'test-member', log: () => {} }
+  const old = new OnsenClient(cfg)
+  const due = fake.now() + 60_000
+  old.recordItemWrite({ key: 'old-keepwarm', item: ownItem('keepwarm', 'main', '保溫', due) })
+  old.recordItemWrite({ key: 'next-self', item: ownItem('self', 'main', '自己的提醒', due) })
+  old.stop()
+  const current = new OnsenClient({ ...cfg, roamer: true })
+  try {
+    await current.syncNow(true)
+    expect([...fake.rows.values()].map(r => r.kind)).toEqual(['self'])
+    expect(current.pendingBytes()).toBe(0)
+  } finally { current.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('self writes survive a disconnected connector and close the same Item on restart', async () => {
   fake = fakeItems()
   const dir = mkdtempSync(join(tmpdir(), 'self-spool-'))

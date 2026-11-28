@@ -354,6 +354,7 @@ export function outboundRecord(agent: string, ctx: SendCtx, method: string, payl
 // ------------------------------------------------------------------ the client
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
 export type OnsenConfig = {
+  roamer?: boolean
   /** the spool dir (<STATE_DIR>/onsen) */
   dir: string
   base: string
@@ -1126,6 +1127,11 @@ export class OnsenClient {
         continue
       }
       if (t.line.k === 'item' || t.line.k === 'self') {
+        const write = t.line.r
+        if (this.cfg.roamer && write.item.kind === 'keepwarm' && !write.outcome && !write.complete) {
+          this.cfg.log('info', 'onsen: retired queued roamer keepwarm ' + write.key)
+          this.writeCursor(t.end); i++; continue
+        }
         const path = '/v1/members/' + encodeURIComponent(this.cfg.agent) + '/items'
         const r = await this.itemWrites.sync(path, t.line.r, this.mayWithdrawKeepwarm).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (!r) return

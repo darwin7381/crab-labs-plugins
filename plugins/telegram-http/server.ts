@@ -389,7 +389,8 @@ function meshAuth(url: string): Record<string, string> {
   return value ? { Authorization: `Bearer ${value}` } : {}
 }
 
-const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({ fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
+const onsen: Onsen.OnsenClient | null = INBOX_ONLY ? null : new Onsen.OnsenClient({
+  roamer: ROAMER, fastStatus: process.env.ONSEN_STATUS_FAST !== '0',
   dir: join(STATE_DIR, 'onsen'), base: ONSEN_BASE, agent: ONSEN_AGENT, record: Onsen.recordFor(process.env, ONSEN_AGENT),
   credential: () => credentialFor(ONSEN_BASE, () => readCredentialFile(telegramMeshFile)), credentialWhere: ONSEN_CRED_FILE || telegramMeshFile, log,
   joeyChat: () => { try { return String(loadAccess().allowFrom[0] ?? '') } catch { return '' } },
