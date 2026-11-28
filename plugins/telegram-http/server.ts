@@ -2091,7 +2091,10 @@ const ONSEN_SEND_ON = INBOX_ONLY && switchOn(process.env.ONSEN_SEND, INBOX_SELF)
 const onsenInbox: OnsenInbox | null = INBOX_ONLY ? new OnsenInbox({ file: join(STATE_DIR, 'onsen-inbox.json'), log }) : null
 const ONSEN_INBOX_BASE = Onsen.onsenBase(process.env)
 const onsenReq = ONSEN_PULL_ON || ONSEN_SEND_ON ? (() => {
-  const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: () => readOwnCredential(STATE_DIR), log })
+  // WO-212 bench V0 (Chiron's sub-agent 02:43Z): with ONSEN_CREDENTIAL_FILE named (the lab's LAB_ONSEN=bench), the inbox's own pull/send signs with that
+  // file too, as the Telegram daemon's client does (:353); before, it sent the production mesh credential to the bench (401). Unset: as before
+  const inboxCred = (process.env.ONSEN_CREDENTIAL_FILE ?? '').trim() ? () => readCredentialFile(ONSEN_CRED_FILE) : () => readOwnCredential(STATE_DIR)
+  const c = new Onsen.OnsenClient({ dir: join(STATE_DIR, 'onsen'), base: ONSEN_INBOX_BASE, agent: INBOX_SELF, record: false, credential: inboxCred, log })
   return (m: 'GET' | 'POST', path: string, b?: unknown, t?: number) => c.request(m, path, b, t)
 })() : null
 const onsenPuller: OnsenPuller | null = ONSEN_PULL_ON && onsenReq && onsenInbox ? new OnsenPuller({ takeEnabled: ONSEN_TAKE_ON, req: onsenReq, base: ONSEN_INBOX_BASE, inbox: onsenInbox,
