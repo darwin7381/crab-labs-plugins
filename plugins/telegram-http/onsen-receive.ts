@@ -22,6 +22,7 @@ export type ClaimStore = {
 }
 
 export class ItemReceiver {
+  private refused = new Map<string, { version: number; rides: boolean }>()
   private requesting = new Set<string>()
   constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void) {}
 
@@ -40,7 +41,14 @@ export class ItemReceiver {
     const ids = [...byId.keys()]
     if (ids.some(id => this.requesting.has(id))) return result
     if (binding) for (const id of ids) if (this.claims.owns(id)) result.given.add(id)
-    const need = ids.filter(id => !this.claims.owns(id)).slice(0, 100)
+    const leads = new Set(refs.filter(r => r.kind === 'message' && r.reason !== 'cut_person' && r.reason !== 'parked'
+      && !this.claims.owns(r.onsen_item_id) && r.onsen_version > (this.refused.get(r.onsen_item_id)?.version ?? -1)).map(r => r.from))
+    const need = ids.filter(id => {
+      const ref = byId.get(id)!, refusal = this.refused.get(id)
+      if (refusal && ref.onsen_version <= refusal.version && !(refusal.rides && leads.has(ref.from))) return false
+      this.refused.delete(id)
+      return !this.claims.owns(id)
+    }).slice(0, 100)
     if (!need.length) return result
     for (const id of need) this.requesting.add(id)
     const key = randomUUID()
@@ -76,7 +84,11 @@ export class ItemReceiver {
       if (!expired) await Promise.all(need.filter(id => !result.given.has(id)).map(async id => {
         const single = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(id), undefined, 3000).catch(() => null)
         if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
-        if (single?.json?.data?.not_before) this.dueAt(single.json.data.not_before)
+        const row: InboxItem | undefined = single?.json?.data
+        if (row?.state === 'waiting' && (row.reason === 'parked' && !row.released || row.reason === 'cut_person')) {
+          this.refused.set(id, { version: row.version, rides: row.reason === 'cut_person' })
+        }
+        if (row?.not_before) this.dueAt(row.not_before)
       }))
       if (expired || !this.mode.active) {
         for (const id of need) if (result.given.has(id)) this.claims.report(id, 'not_taken')

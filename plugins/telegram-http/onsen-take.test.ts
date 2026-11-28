@@ -284,10 +284,24 @@ test('not_before, rides_next and parked refusals are checked by id; a vanished r
   const r = rig(), later = r.f.add('later', 'mail', { not_before: new Date(r.f.now() + 60000).toISOString() }),
     ride = r.f.add('ride', 'message', { reason: 'cut_person' }), parked = r.f.add('parked', 'call', { reason: 'parked' }),
     gone = r.f.add('gone', 'mail', { state: 'cancelled' })
+  const earlier = itemRef(parked), oldRider = itemRef(ride)
+  delete oldRider.reason // the journal still has the message from before it was cut
+  r.f.change(ride, 'cut_person')
+  r.f.change(parked, 'edited') // the refused detail is newer than the pump's journal snapshot
   await r.mode.probe()
   const result = await r.receiver.receive([later, ride, parked, gone].map(itemRef))
   expect(result.given.size).toBe(0); expect([...result.gone]).toEqual(['gone']); expect(r.deadlines).toContain(later.not_before!)
   expect(r.f.calls.filter(c => /^\/v1\/items\//.test(c.path))).toHaveLength(4)
+  const held = r.f.add('already-held')
+  await r.receiver.receive([itemRef(held)])
+  const before = r.f.calls.length
+  for (let seconds = 0; seconds < 60; seconds += 5) {
+    r.f.advance(5000)
+    await r.receiver.receive([earlier, oldRider, itemRef(held)])
+  }
+  expect(r.f.calls.length).toBe(before)
+  parked.released = true; r.f.change(parked, 'released')
+  expect([...(await r.receiver.receive([itemRef(parked)])).given]).toEqual([parked.id])
   const other = r.f.add('other')
   expect((await r.receiver.receive([ride, other].map(itemRef))).given.size).toBe(2)
 })
