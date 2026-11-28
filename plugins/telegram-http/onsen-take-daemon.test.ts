@@ -135,7 +135,7 @@ async function activePerson(id: string) {
     await Bun.sleep(3100)
     writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
   }
-  return { d, row, client, offers, stop }
+  return { d, row, client, offers, stop, hook, registryFile, entry }
 }
 
 test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
@@ -151,6 +151,20 @@ test('real daemon completes an idle main person item with its reply after the fi
   expect(row.response_message_ids).toEqual([replyId])
   expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
 }, 25000)
+
+for (const edge of ['offline', 'new UUID']) test('a main reply completes when its registry reports ' + edge + ' immediately after Stop', async () => {
+  const { d, row, client, offers, hook, registryFile, entry } = await activePerson('leaving-main')
+  const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'finished' } })
+  const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+  expect(id).toBeTruthy()
+  await hook('Stop', { phase: 'final' })
+  if (edge === 'offline') unlinkSync(registryFile)
+  else writeFileSync(registryFile, JSON.stringify({ ...entry, sessionId: randomUUID(), status: 'busy', statusUpdatedAt: Date.now() }))
+  await waitFor(() => row.state === 'completed')
+  expect(row.response_message_ids).toEqual([id])
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(offers).toHaveLength(1)
+}, 15000)
 
 test('after 45 s without renewal the main completes its original claim with one delivery and no re-take', async () => {
   const { d, row, offers, stop } = await activePerson('lease-expiry')
@@ -710,8 +724,8 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
   const cwd = join(d.root, 'lab-project')
   const home = join(d.root, 'home', '.claude'), regs = join(home, 'sessions'), project = join(home, 'projects', cwd.replaceAll('/', '-'))
   for (const dir of [regs, project]) mkdirSync(dir, { recursive: true })
-  const status = (value: string) => writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({
-    pid: child.pid, sessionId: sid, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
+  const status = (value: string, sessionId = sid) => writeFileSync(join(regs, child.pid + '.json'), JSON.stringify({
+    pid: child.pid, sessionId, cwd, kind: 'interactive', status: value, statusUpdatedAt: Date.now() }))
   status('idle')
   let transcript = join(project, sid + '.jsonl')
   writeFileSync(transcript, '')
@@ -780,6 +794,26 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   expect(a.got).toHaveLength(1)
 }, 45000)
 
+test('a final Stop and reply are completed when the roamer target exits inside the settle window', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
+  a.select()
+  const row = d.f.add('answered-before-exit')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'done' } })
+  const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+  expect(id).toBeTruthy()
+  // The final Stop can be in the next chunk when the process has already exited.
+  appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(5 << 20) } }) + '\n')
+  a.stop()
+  a.child.kill(); await a.child.exited
+  await waitFor(() => row.state === 'completed')
+  expect(row.response_message_ids).toEqual([id])
+  expect(d.f.history.map(r => r.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(a.got).toHaveLength(1)
+}, 12000)
+
 test('a session change inside the same target PID cuts the old claim and delivers to the new UUID', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d)
   a.select()
@@ -789,6 +823,10 @@ test('a session change inside the same target PID cuts the old claim and deliver
   await waitFor(() => first.claim?.session_id === a.sid)
   first.not_before = new Date(Date.now() + 60_000).toISOString()
   const old = a.sid, oldTranscript = a.transcript
+  a.status('idle', '')
+  await Bun.sleep(350)
+  expect(first.claim?.session_id).toBe(old)
+  expect(JSON.parse(readFileSync(roamerState(d.root).ROAMER_STATE_FILE, 'utf8')).current_target.session_id).toBe(old)
   a.switchSession()
   const second = d.f.add('after-clear')
   await waitFor(() => a.got.length === 2)

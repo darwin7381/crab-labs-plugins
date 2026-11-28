@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
+import { genuineAssistantAfterFile } from './liveness.ts'
 import type { InboxItem, ItemRef, ReceivingTarget } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
@@ -8,7 +9,7 @@ const week = 7 * 86400_000
 type Claim = {
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
   turn?: string; registry_session?: string; conversation?: string; replies?: string[]
-  target?: ReceivingTarget
+  intakeAt?: string; target?: ReceivingTarget
   stop?: { turn: string; at: number }
 }
 type Done = { item_id: string; claim_id: string; at: number }
@@ -88,13 +89,22 @@ export class Claims implements ClaimStore {
     return Object.entries(this.rows).flatMap(([id, r]) => this.owns(id) && r.target ? [r.target] : [])
   }
   receipt(id: string): string { return this.rows[id]!.claim_id }
-  accept(session: string, receipts: string[], turn: string): void {
+  accept(session: string, receipts: string[], turn: string, at: string): void {
     for (const [id, r] of Object.entries(this.rows))
-      if (r.target?.session_id === session && !r.in_session_at && receipts.includes(r.claim_id)) this.bind(id, session, turn)
+      if (r.target?.session_id === session && !r.in_session_at && receipts.includes(r.claim_id)) {
+        r.intakeAt = at
+        this.bind(id, session, turn)
+      }
   }
   cutTarget(t: ReceivingTarget): void {
     for (const [id, r] of Object.entries(this.rows)) {
-      if (r.target?.session_id === t.session_id && r.target.claude_pid === t.claude_pid) this.report(id, 'cut')
+      if (!this.owns(id) || r.target?.session_id !== t.session_id || r.target.claude_pid !== t.claude_pid) continue
+      if (r.stop) this.complete(id, r)
+      else {
+        const intake = r.intakeAt ?? r.in_session_at
+        const output = intake && genuineAssistantAfterFile(t.transcript, Date.parse(intake))
+        this.report(id, 'cut', { half_done: !!r.replies?.length || !!output })
+      }
     }
   }
   bind(id: string, session: string, turn: string): void {
@@ -148,7 +158,7 @@ export class Claims implements ClaimStore {
     let updated = false
     for (const row of Object.values(this.rows)) {
       if (row.session_id !== session) continue
-      if (row.turn === turn || row.last_outcome === 'background') { row.stop = { turn, at: this.now() }; updated = true }
+      if (row.stop?.turn !== turn && (row.turn === turn || row.last_outcome === 'background')) { row.stop = { turn, at: this.now() }; updated = true }
     }
     if (updated) this.save()
   }
@@ -157,13 +167,22 @@ export class Claims implements ClaimStore {
     for (const row of Object.values(this.rows)) if (row.session_id === session && row.stop?.turn === turn) { delete row.stop; updated = true }
     if (updated) this.save()
   }
-  statusRecord(session: string | null, member: string, background: (session: string) => number | null, settleMs: number): void {
-    if (!session || ['busy', 'stuck', 'compacting', 'offline'].includes(member)) return
+  private complete(id: string, row: Claim): void {
+    this.report(id, 'completed', { response_message_ids: row.replies ?? [] })
+  }
+  /** A member-wide record can also establish that a stopped main departed. A transcript watcher speaks only for its own UUID. */
+  statusRecord(session: string | null, member: string, background: (session: string) => number | null, settleMs: number, memberRecord = false): void {
     for (const [id, row] of Object.entries(this.rows)) {
-      if (row.session_id !== session || !this.owns(id) || !row.stop || this.now() < row.stop.at + settleMs) continue
+      if (!row.stop || !this.owns(id)) continue
+      if (memberRecord && !row.target && (member === 'offline' || (session && session !== row.session_id))) {
+        this.complete(id, row)
+        continue
+      }
+      if (!session || row.session_id !== session || ['busy', 'stuck', 'compacting'].includes(member) || this.now() < row.stop.at + settleMs) continue
       const count = background(session)
       if (count == null) continue
-      this.report(id, count > 0 ? 'background' : 'completed', count > 0 ? {} : { response_message_ids: row.replies ?? [] })
+      if (count > 0) this.report(id, 'background')
+      else this.complete(id, row)
       delete row.stop
       this.save()
     }

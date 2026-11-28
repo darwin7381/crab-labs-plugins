@@ -764,13 +764,13 @@ export class TurnWatch {
   /** WO-172: a colleague's items the open turn took in (their msg ids), for its bound */
   private peerIds: string[] = []
   constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now
-    session?: () => string | null; exact?: boolean; resumeOffset?: number; channel?: (attrs: Record<string, string>, turn: string) => void; turnEnded?: (t: TurnEnded) => void }) {
+    session?: () => string | null; exact?: boolean; resumeOffset?: number; channel?: (attrs: Record<string, string>, turn: string, at: string) => void; turnEnded?: (t: TurnEnded) => void }) {
     this.bornMs = this.now()
   }
   private now(): number { return (this.o.now ?? Date.now)() }
 
-  /** read what the main's transcript gained since the last tick */
-  tick(): void {
+  /** Read one chunk. True means more transcript bytes were present at this tick. */
+  tick(): boolean | void {
     const dir = this.o.dir()
     if (!dir) return
     // WO-165: the main's own transcript (<its session id>.jsonl, the registry's main) the moment it exists, so a new session's first message is seen at
@@ -789,13 +789,14 @@ export class TurnWatch {
     if (size < this.offset) { this.switchTo(this.file); size = statSync(this.file).size }   // rewritten: read it again from its tail
     if (size <= this.offset) return
     let fd: number | null = null
-    let changed = false
+    let changed = false, more = false
     try {
       fd = openSync(this.file, 'r')
       const len = Math.min(size - this.offset, 4 << 20)
       const buf = Buffer.alloc(len)
       const n = readSync(fd, buf, 0, len, this.offset)
       this.offset += n
+      more = n > 0 && this.offset < size
       const text = this.rest + buf.subarray(0, n).toString('utf8')
       const lines = text.split('\n')
       this.rest = lines.pop() ?? ''
@@ -804,6 +805,7 @@ export class TurnWatch {
       for (const l of lines) { if (!l) continue; let j: any; try { j = JSON.parse(l) } catch { continue } if (this.handle(j)) changed = true }
     } catch {} finally { if (fd != null) try { closeSync(fd) } catch {} }
     if (changed) this.o.changed()
+    return more
   }
   /** a new transcript (a new session, a /clear): its tail is read for the current turn; a seen or turn_end older than 10 min before now is not written
    *  again */
@@ -863,7 +865,7 @@ export class TurnWatch {
   private takeIn(text: string, at: string): void {
     const t = Date.parse(at)
     for (const a of channelTags(text)) {
-      if (this.turnAt) this.o.channel?.(a, turnIdOf(this.turnAt))
+      if (this.turnAt) this.o.channel?.(a, turnIdOf(this.turnAt), at)
       if (!/telegram/.test(a.source ?? '')) { if (a.btcc_msg_id && this.inTurn && !this.peerIds.includes(a.btcc_msg_id)) this.peerIds.push(a.btcc_msg_id); continue }   // WO-172
       const j = this.o.joey(a)
       if (!j) continue

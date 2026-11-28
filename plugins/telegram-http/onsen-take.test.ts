@@ -288,6 +288,41 @@ test('idle main takes before offer, binds, completes only after final Stop and i
   expect(row.response_message_ids).toEqual(['message-91']); expect(r.claims.held()).toEqual([])
 })
 
+test('an unacknowledged final main Stop completes with its replies on offline or replacement UUID', async () => {
+  for (const state of ['offline', 'busy']) {
+    const r = await mainRig(), row = r.f.add('main-' + state)
+    await r.bind(row)
+    r.claims.reply('turn', 'conv', 'my-reply', r.sid)
+    await r.hook('Stop', { phase: 'final' })
+    r.claims.statusRecord(state === 'offline' ? null : crypto.randomUUID(), state, () => null, REGISTRY_SETTLE_MS, true)
+    await r.sync()
+    expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
+    expect(row.response_message_ids).toEqual(['my-reply'])
+    expect(r.claims.held()).toEqual([])
+  }
+})
+
+test('cutting an unfinished target reports half_done for genuine output or a reply after intake', async () => {
+  const r = rig()
+  await r.mode.probe()
+  for (const evidence of ['neither', 'output', 'reply', 'synthetic']) {
+    const sid = crypto.randomUUID(), transcript = join(r.dir, sid + '.jsonl'), row = r.f.add(evidence)
+    const target = { session_id: sid, claude_pid: 53, tmux: 'lab', transcript }
+    await r.receiver.receive([{ ...itemRef(row), target }])
+    const input = new Date().toISOString()
+    r.claims.accept(sid, [row.claim!.id], 'turn', input)
+    const record = (timestamp: string, model: string) => JSON.stringify({ timestamp, type: 'assistant', message: { model, content: 'text' } })
+    const lines = [record(new Date(Date.parse(input) - 1000).toISOString(), 'before-intake')]
+    if (evidence === 'output' || evidence === 'synthetic') lines.push(record(new Date(Date.parse(input) + 1).toISOString(), evidence === 'output' ? 'claude' : '<synthetic>'))
+    writeFileSync(transcript, lines.join('\n') + '\n')
+    if (evidence === 'reply') r.claims.reply('turn', 'conv', 'sent', sid)
+    r.claims.cutTarget(target)
+    await r.sync()
+    expect(r.outcomes(row.id)).toEqual(['in_session', 'cut'])
+    expect(r.f.history.at(-1)!.body.half_done).toBe(['output', 'reply'].includes(evidence))
+  }
+})
+
 test('a main session with no subagents directory completes at its settled Stop', async () => {
   const r = await mainRig()
   const registry = new Registry({ dir: r.dir, workspace: r.dir, transcripts: () => r.dir, connected: () => true, log: () => {} })
