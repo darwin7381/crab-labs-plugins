@@ -177,7 +177,7 @@ async function withMemberMode(take: boolean, run: (puller: OnsenPuller, itemCrea
     f.mode(take ? 200 : 409)
     L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), client)
     await mode.probe(); await puller.once()
-    expect([mode.active, puller.pausedForTake]).toEqual([take, take])
+    expect([mode.active, puller.mode.active]).toEqual([take, take])
     await run(puller, async () => {
       await client.syncNow(true)
       return f.calls.filter(c => c.path === mode.path && c.key !== null).length
@@ -202,7 +202,7 @@ test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the 
   const mt = await mainTurnWith([r.id])
   try {
     const runs = runsOf().length, beforeDecision = await itemCreates()
-    const mail = new MailEvents({ file: join(tmp, 'mail-decisions'), pausedForTake: () => puller.pausedForTake, log: () => {},
+    const mail = new MailEvents({ file: join(tmp, 'mail-decisions'), mode: puller.mode, log: () => {},
       send: async ev => {
         const d = await L.routeEvent(ev as any)
         expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane })

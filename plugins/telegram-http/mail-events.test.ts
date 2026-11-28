@@ -13,7 +13,7 @@ const DUE = { id: 42, title: 'Kot：重開 daemon', deadline: '2026-11-24T12:00:
 
 test('a take member hands off decisions and skips due mail, including a switch during a due query', async () => {
   let take = true, reads = 0, sends = 0
-  const m = new MailEvents({ file: join(mkdtempSync(join(tmpdir(), 'mail-take-')), 'events'), pausedForTake: () => take,
+  const m = new MailEvents({ file: join(mkdtempSync(join(tmpdir(), 'mail-take-')), 'events'), mode: { get active() { return take } },
     send: async () => ++sends > 1, log: () => {} })
   const tick = () => m.tick(async () => { reads++; take = true; return [DUE] })
   expect(await m.emit(decisionEvent(DEC))).toBe('queued')

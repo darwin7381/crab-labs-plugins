@@ -72,7 +72,7 @@ export class MailEvents {
   pending: MailEvent[] = []
   dueSent: Record<string, number> = {}
   private flushing: Promise<number> | null = null
-  constructor(private o: { file: string; send: (ev: MailEvent) => Promise<boolean>; log: (level: string, msg: string) => void; now?: () => number; pausedForTake?: () => boolean }) {
+  constructor(private o: { file: string; send: (ev: MailEvent) => Promise<boolean>; log: (level: string, msg: string) => void; now?: () => number; mode?: Readonly<{ active: boolean }> }) {
     try {
       const s = JSON.parse(readFileSync(o.file, 'utf8')) as Saved
       this.pending = Array.isArray(s.pending) ? s.pending : []
@@ -120,13 +120,13 @@ export class MailEvents {
   /** one tick: the waiting events, then the items new to the due window. fetchDue null = BTCC did not answer (try next tick). */
   async tick(fetchDue: () => Promise<any[] | null>): Promise<{ flushed: number; due: number }> {
     const flushed = await this.flush()
-    if (this.o.pausedForTake?.()) return { flushed, due: 0 }
+    if (this.o.mode?.active) return { flushed, due: 0 }
     const items = await fetchDue().catch(() => null)
     let due = 0
-    if (items && !this.o.pausedForTake?.()) {
+    if (items && !this.o.mode?.active) {
       const t = this.now()
       for (const it of items) {
-        if (this.o.pausedForTake?.()) break
+        if (this.o.mode?.active) break
         const ev = dueEvent(it)
         if (this.dueSent[ev.id]) continue
         this.dueSent[ev.id] = t

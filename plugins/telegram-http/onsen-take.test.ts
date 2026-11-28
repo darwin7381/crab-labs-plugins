@@ -5,7 +5,7 @@ import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient, roamerMember } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
-import { deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
+import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver, type Outcome } from './onsen-receive.ts'
@@ -46,7 +46,7 @@ async function mainRig({ backoff = 300_000, onOffer = async () => true, restart,
   const restarts: string[] = []
   let member = 'idle', bg = 0, owes: boolean | string = false, wall: MainWall | null = null
   const writer = { write: (write: import('./onsen-item-writes.ts').ItemWrite) => { r.client.recordItemWrite(write); r.client.start() } }
-  const m = createMain({ journal, agent: 'adam', takingItems: () => r.mode.active, writeItem: write => writer.write(write), writtenItemId: key => r.client.writtenItemId(key), itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
+  const m = createMain({ journal, agent: 'adam', writeItem: write => writer.write(write), writtenItemId: key => r.client.writtenItemId(key), itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
     wallBackoff: () => backoff, registry: { mainForAdoption: () => null, backgroundAgents: () => bg },
     streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: n => n !== pid || oldPidAlive, context: () => '', info: () => null,
     genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {},
@@ -913,8 +913,8 @@ test('switch, prerequisites, stable machine/member and all probe refusals', asyn
   expect(takeRefusal(valid)).toBeUndefined()
   expect(machineName('  --Mac_Mini  ')).toBe('mac-mini')
   const { path, connector, req } = r.mode
-  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toMatchObject({ take: false, status }) }
-  expect((await deliveryMode(async () => { throw Error('offline') }, path, connector)).take).toBe(false)
+  for (const status of [400, 404, 409]) { r.f.mode(status); expect(await deliveryMode(req, path, connector)).toMatchObject({ status }) }
+  expect((await deliveryMode(async () => { throw Error('offline') }, path, connector)).status).toBeUndefined()
   r.f.mode(200); await r.mode.probe()
   expect(r.mode.active).toBe(true)
   expect(r.f.calls.every(c => c.query.get('connector') === 'mac-mini/adam' && c.query.get('limit') === '1')).toBe(true)
@@ -1555,28 +1555,28 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
   await deliveryMode(mode.req, mode.path, 'other/adam')
   const receiver = new ItemReceiver(mode, r.claims, () => {}), row = r.f.add('ownership')
   await receiver.receive([itemRef(row)])
-  expect(interval).toBe(45_000); expect(takeModeActive(mode)).toBe(true); expect(mode.canReceive).toBe(false); expect(mode.observationRequired).toBe(true)
+  expect(interval).toBe(45_000); expect(mode.active).toBe(true); expect(mode.canReceive).toBe(false); expect(mode.observationRequired).toBe(true)
   const calls = r.f.calls.length
   await receiver.receive([itemRef(row)])
   const peek = new ItemPeek(mode, () => new Map(), async () => {}, () => true)
   await peek.poll(); expect(r.f.calls.length).toBe(calls)
   expect(r.logs.filter(s => s.includes('not_current_connector'))).toHaveLength(1)
   await mode.probe()  // the other connector still owns the take member
-  expect(takeModeActive(mode)).toBe(true); expect(mode.canReceive).toBe(false)
+  expect(mode.active).toBe(true); expect(mode.canReceive).toBe(false)
   r.f.advance(45_001); retry!(); await until(() => mode.canReceive)
   expect([...(await receiver.receive([itemRef(row)])).given]).toEqual(['ownership'])
 })
 
 test('a 409 pause keeps the take gate until the probe confirms pull', async () => {
   const r = rig(), transitions: Array<[boolean, boolean]> = []
-  const mode = new TakeMode('adam', r.mode.req, ready => transitions.push([takeModeActive(mode), ready]), () => {}, 'mac-mini')
+  const mode = new TakeMode('adam', r.mode.req, ready => transitions.push([mode.active, ready]), () => {}, 'mac-mini')
   clean.push(() => mode.stop())
   await mode.probe()
   r.f.mode(409)
   await new ItemReceiver(mode, r.claims, () => {}).receive([itemRef(r.f.add('changed-mode'))])
   expect(transitions).toEqual([[true, true], [true, false]])
   r.f.down(true); await mode.probe()
-  expect(takeModeActive(mode)).toBe(true)
+  expect(mode.active).toBe(true)
   expect(mode.canReceive).toBe(false)
   r.f.down(false); await mode.probe()
   expect(transitions.at(-1)).toEqual([false, false])

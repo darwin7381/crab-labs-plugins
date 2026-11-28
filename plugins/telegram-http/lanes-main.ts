@@ -40,12 +40,10 @@ export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 const SESSION_SWITCH: ReadonlySet<string> = new Set(['clear', 'resume'])
 
 import { callSenders, hasCallFrom, type ItemRef } from './onsen-items.ts'
-import { takeModeActive } from './onsen-take.ts'
 import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 import { ACCOUNT_WALL, ResumeItems, resumeNotification, resumeText, type CutTurn, type ResumeLine } from './onsen-resume.ts'
 
 export type MainEnv = {
-  takingItems?: () => boolean
   writeItem?: import('./onsen-item-writes.ts').ItemWriter
   writtenItemId?: (key: string) => string | undefined
   itemReceiver?: () => ItemReceiver | undefined
@@ -226,17 +224,16 @@ export function createMain(E: MainEnv) {
   // An Item receipt changes the journal version, but does not change the main's ability to accept an offer.
   const resumeWrites = new WeakMap<Row, number>()
   const deliveryVersion = (g: Row): number => g.version - (resumeWrites.get(g) ?? 0)
-  const takingItems = E.takingItems ?? (() => E.itemReceiver?.()?.mode.active === true)
   const resumes = new ResumeItems(latestMain, entries => {
     const g = latestMain()
     const row = J().write('main', g?.id ?? UNREGISTERED, g?.state ?? 'gone', { resume_items: entries.length ? entries : null })
     if (row) resumeWrites.set(row, (resumeWrites.get(row) ?? 0) + 1)
-  }, () => takingItems() ? E.itemReceiver?.() : undefined, resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && (r.resume_input_gen || inFlight.has(r.id)))
+  }, () => E.itemReceiver?.()?.mode.active ? E.itemReceiver?.() : undefined, resumeDelivered, id => items(r => (r.state === 'offered' || r.state === 'queued' && (r.resume_input_gen || inFlight.has(r.id)))
     && r.onsen_items?.[0]?.onsen_item_id === id).length > 0, (id, reason) => {
     for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason })
   }, () => { void pump('resume-ready') }, write => E.writeItem?.(write), key => E.writtenItemId?.(key))
   // S4 owns cannot_move/recovered, parked/cancelled and choose for take members.
-  const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!takeModeActive(E.itemReceiver?.()?.mode)) E.tellJoey(...args) }
+  const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!E.itemReceiver?.()?.mode.active) E.tellJoey(...args) }
   function retryRestart(g: Row, error: unknown): void {
     E.log('warn', `lanes: main ${g.id} restart after ${g.item_restart}: ${error}; will retry`)
     setMain(g, g.state as MainPhase, { item_restart_retry: g.item_restart, item_restart: null })
@@ -520,7 +517,7 @@ export function createMain(E: MainEnv) {
       do {
         pumpAgain = false
         const receiver = E.itemReceiver?.()
-        if (receiver && takingItems() && !receiver.claims.blocked()) {
+        if (receiver && E.itemReceiver?.()?.mode.active && !receiver.claims.blocked()) {
           for (const r of items(r => r.resume_claim && !r.resume_claim.waiting)) await restoreResumeClaim(receiver, r)
         }
         await offerNext()
@@ -602,7 +599,7 @@ export function createMain(E: MainEnv) {
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
     const cut: CutTurn | undefined = g.cut_turn
-    const localResume = () => !takingItems() && !E.itemReceiver?.()?.mode.checking
+    const localResume = () => !E.itemReceiver?.()?.mode.active && !E.itemReceiver?.()?.mode.checking
     const resume = cut && localResume() && g.resume_sent !== cut.at && (probe || !wall.active) && Date.now() >= (cut.retry_at ?? 0)
     // A person's successful turn can end M2's episode while an earlier cut still waits in M1.
     // The keeper timestamps clears to whole seconds, as in statusChanged.
@@ -889,7 +886,7 @@ export function createMain(E: MainEnv) {
   /** WO-201: the line Joey gets about items closed after a second cut (or a parked item that failed again): what they were, and that they are not
    *  given to the main again. It is the line about each (it meets their Joey line, as the asked-restart notice) */
   function tellClosed(rs: Row[], what: (r: Row) => string): void {
-    if (takingItems()) return
+    if (E.itemReceiver?.()?.mode.active) return
     const told = rs.filter(r => r.kind !== 'digest')
     if (!told.length) return
     const lines = Array.from(Map.groupBy(told, what), ([sentence, group]) =>
@@ -948,7 +945,7 @@ export function createMain(E: MainEnv) {
   function bareCut(g: Row, rs: Row[], why: string, at = Date.now()): CutTurn | undefined {
     if (g.resume_sent != null || itemCount(rs)) return
     // A replayed StopFailure can arrive after endClaim closed the prompt's M1 rows.
-    if (g.prompt_id && takingItems() && items(r => r.prompt_id === g.prompt_id && r.onsen_items).length) return
+    if (g.prompt_id && E.itemReceiver?.()?.mode.active && items(r => r.prompt_id === g.prompt_id && r.onsen_items).length) return
     if (why === 'gen_end') {
       let n: number | null | undefined
       try { if (g.session_id) n = E.registry?.backgroundAgents(g.session_id) } catch {}
@@ -958,13 +955,13 @@ export function createMain(E: MainEnv) {
   }
   function setMain(g: Row, state: MainPhase, fields: Record<string, unknown> = {}): void {
     const cut = fields.cut_turn as CutTurn | undefined
-    if (cut && takingItems()) {
+    if (cut && E.itemReceiver?.()?.mode.active) {
       J().write('main', g.id, state, { ...fields, ...resumes.cutFields(g, cut) })
       resumes.sync()
     } else J().write('main', g.id, state, fields)
   }
   function syncResumes(): void {
-    if (!takingItems()) return
+    if (!E.itemReceiver?.()?.mode.active) return
     const g = latestMain()
     // A pull-era cut can survive an upgrade or the startup probe. Transfer only an unsent one.
     if (g?.cut_turn && g.resume_sent !== g.cut_turn.at && localResumeInFlight?.at !== g.cut_turn.at) setMain(g, g.state as MainPhase, { cut_turn: g.cut_turn })
@@ -1017,8 +1014,8 @@ export function createMain(E: MainEnv) {
     if (g.stopped_prompt === prompt && g.prompt_id !== prompt) continueTurn(g, prompt)
     const open = g.prompt_id === prompt
     const receiver = E.itemReceiver?.()
-    const backgroundNotice = takingItems() && source === 'task-notification'
-    if (open && (!ids?.size || !takingItems())) return
+    const backgroundNotice = E.itemReceiver?.()?.mode.active && source === 'task-notification'
+    if (open && (!ids?.size || !E.itemReceiver?.()?.mode.active)) return
     if (open && ids) {
       // A tool hook can bind the offer before the prompt receipt identifies which text arrived.
       for (const r of items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === prompt && r.carried_resume
@@ -1034,7 +1031,7 @@ export function createMain(E: MainEnv) {
       return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id))
         || resume && named && resumes.awaitingInput(r.onsen_items[0].onsen_item_id))
     }
-    if (!open && !backgroundNotice && source !== 'StopFailure' && takingItems()) {
+    if (!open && !backgroundNotice && source !== 'StopFailure' && E.itemReceiver?.()?.mode.active) {
       syncResumes()
       // A named delivery identifies this turn even when re-taking it failed. Without a prompt hook,
       // an offered Item with its current claim identifies the delivery that reached this generation.
@@ -1098,7 +1095,7 @@ export function createMain(E: MainEnv) {
     switch (ev) {
       case 'UserPromptSubmit': {
         if (p) {
-          const ids = promptRefs((takingItems() ? b.channel_dids ?? b.dids : b.dids) ?? [])
+          const ids = promptRefs((E.itemReceiver?.()?.mode.active ? b.channel_dids ?? b.dids : b.dids) ?? [])
           const late = ids.size ? items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r)) : []
           // Record a queued resume's positive receipt before a re-take can find the Item under another claim.
           const toClaim = late.filter(r => !isResume(r) || !resumes.awaitingInput(r.onsen_items[0].onsen_item_id))
@@ -1124,7 +1121,7 @@ export function createMain(E: MainEnv) {
         beginTurn(g, p, undefined, b.source); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         // WO-148 (item 3; lab: the hook sent tool_input only for a btcc-receipt Bash): the hook's tool_brief, the field the call is about (lanes.ts masks it)
         openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_brief ?? b.tool_input ?? null, at: new Date().toISOString() })
-        toolBound.set(g.id, toolSilenceMs(b.tool_timeout_ms, takeModeActive(E.itemReceiver?.()?.mode) ? b.tool_name : undefined))   // the tool's own bound, with a margin
+        toolBound.set(g.id, toolSilenceMs(b.tool_timeout_ms, E.itemReceiver?.()?.mode.active ? b.tool_name : undefined))   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
         let mark: string | undefined, markReplyTo: string | null = null
@@ -1158,7 +1155,7 @@ export function createMain(E: MainEnv) {
       case 'Stop': {
         if (!p) return {}
         if (b.phase === 'owed') {
-          if (!takeModeActive(E.itemReceiver?.()?.mode) || g.state !== 'in_turn' || g.prompt_id !== p) return {}
+          if (!E.itemReceiver?.()?.mode.active || g.state !== 'in_turn' || g.prompt_id !== p) return {}
           const holding = g.owed_hold === p
           const prior: string[] = holding ? g.owed_events ?? [] : []
           const rows = unsettled(g, p).filter(r => r.state === 'bound' && !prior.includes(r.event) && b.owed_mids?.includes(aidItem(r).mid))
@@ -1177,7 +1174,7 @@ export function createMain(E: MainEnv) {
           // (a turn that took in nothing is asked about the work it carries on). One hold per turn (owed_hold on the gen), naming each: the next Stop of
           // the same turn ends it, and what is still owed stays open on its event.
           const gen = J().get('main', g.id)!
-          const take = takeModeActive(E.itemReceiver?.()?.mode)
+          const take = E.itemReceiver?.()?.mode.active
           let block: string | undefined
           if (E.mainOwed && gen.owed_hold !== p && !(take && t.carried)) {
             const owed = E.mainOwed(t.events)
@@ -1224,7 +1221,7 @@ export function createMain(E: MainEnv) {
         const reason = `stop_failure:${err}`
         const back = unsettled(g, p)
         const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
-        const refusedProbe = takeModeActive(E.itemReceiver?.()?.mode) && back.some(r => r.onsen_items && r.keeper_probe)
+        const refusedProbe = E.itemReceiver?.()?.mode.active && back.some(r => r.onsen_items && r.keeper_probe)
         for (const r of back) {
           if (r.onsen_items) {
             if (r.state === 'bound' && r.kind === 'joey') E.blocked?.(r, wall?.resets_at ?? null)
@@ -1300,7 +1297,7 @@ export function createMain(E: MainEnv) {
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const since = ended.map(r => String(r.wall_since)).sort()[0]
-    const refusal = takeModeActive(E.itemReceiver?.()?.mode) && ended.filter(r => r.wall_refused_at).sort((a, b) => b.wall_refused_at - a.wall_refused_at)[0]
+    const refusal = E.itemReceiver?.()?.mode.active && ended.filter(r => r.wall_refused_at).sort((a, b) => b.wall_refused_at - a.wall_refused_at)[0]
     const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     const previous = latestMain()
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, wall_menu: null })
@@ -1369,7 +1366,7 @@ export function createMain(E: MainEnv) {
   let idleSeen: { gen: string; at: number; ev: number } | null = null
   function statusIdle(isIdle: boolean, now = Date.now(), interruptedAt: number | null = null): boolean {
     const g = currentGen()
-    const released = isIdle && g?.state === 'idle' && g.stopped_prompt && takingItems() ? resumes.inputIds(g.session_id, true) : []
+    const released = isIdle && g?.state === 'idle' && g.stopped_prompt && E.itemReceiver?.()?.mode.active ? resumes.inputIds(g.session_id, true) : []
     if (!g || g.item_restart || !isIdle || (g.state !== 'in_turn' && !released.length)) { idleSeen = null; return false }
     const ev = lastEventAt.get(g.id) ?? 0
     const seen = !released.length && interruptedAt != null && interruptedAt > ev
@@ -1405,8 +1402,8 @@ export function createMain(E: MainEnv) {
     const m = member()
     const wall = wallDelivery(g)
     const held = m === 'waiting' || wall.active
-    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? toolSilenceMs(undefined, takeModeActive(E.itemReceiver?.()?.mode) ? g.tool_open : undefined)) : MAIN_STUCK_MS
-    if (takeModeActive(E.itemReceiver?.()?.mode)) {
+    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? toolSilenceMs(undefined, E.itemReceiver?.()?.mode.active ? g.tool_open : undefined)) : MAIN_STUCK_MS
+    if (E.itemReceiver?.()?.mode.active) {
       // The wrapper can be healthy while the old TUI is still alive. tick already checked its pid above.
       if (g?.item_restart) {
         if (now - (g.item_restart_at ?? 0) >= 5_000) retryRestart(g, 'old pid is still alive')

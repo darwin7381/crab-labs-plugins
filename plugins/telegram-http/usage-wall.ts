@@ -8,7 +8,6 @@
 // exist; USAGE_WALL_READ=0 turns reading off. Otherwise wallState() is null and every caller behaves exactly as before
 // WO-120. USAGE_WALL_DIR overrides the directory (tests).
 
-import { takeModeActive } from './onsen-take.ts'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join, resolve } from 'path'
@@ -243,7 +242,7 @@ export class WallAlerts {
   }
 
   tick(w: WallState | null, notify: (text: string) => void = this.o.notify ?? (() => {})): 'enter' | 'clear' | null {
-    if (!w || takeModeActive(this.o.takeMode) || this.o.takeMode?.checking) return null
+    if (!w || this.o.takeMode?.active || this.o.takeMode?.checking) return null
     const now = this.o.now?.() ?? Date.now()
     const db = this.load()
     const rec = db[w.episode]

@@ -27,6 +27,7 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
+import { MemberDelivery } from './onsen-take.ts'
 import { stamp } from './lanes-digest.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -188,8 +189,7 @@ export class OnsenPuller {
   private stopped: Promise<void> | null = null
   private backoffMs = 0
   private warnAt = 0
-  private takeMember = false
-  get pausedForTake(): boolean { return this.takeMember }
+  readonly mode = new MemberDelivery()
   private credWarnAt = 0
   private wake: (() => void) | null = null
   /** WO-194 A.2: the pending items answered `later` (seq → when they are tried again); in memory: a restart tries every pending item at once */
@@ -259,11 +259,11 @@ export class OnsenPuller {
   }
 
   private pullPaused({ status, json }: NonNullable<Answer>): boolean {
-    if (status === 409 && json?.detail?.code !== 'take_member' && json?.error?.code !== 'take_member') return false
-    if (status === 409 && !this.takeMember) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
-    if (status === 200 && this.takeMember) this.o.log('info', 'onsen inbox: member is on pull again')
-    if (status === 200 || status === 409) this.takeMember = status === 409
-    return status === 409
+    const before = this.mode.active
+    const observed = this.mode.observe('inbox', status, json?.detail?.code ?? json?.error?.code)
+    if (observed === true && !before) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
+    if (observed === false && before) this.o.log('info', 'onsen inbox: member is on pull again')
+    return observed === true
   }
 
   /** one round: hand on what is pending, ack, one long poll, take and hand on what it gave, ack. Throws on any failure (the loop backs off). */
@@ -325,7 +325,7 @@ export class OnsenPuller {
     while (this.running) {
       try {
         await this.once()
-        if (this.takeMember && this.running) await this.sleep(60_000)
+        if (this.mode.active && this.running) await this.sleep(60_000)
         if (this.backoffMs) this.o.log('info', `onsen inbox: ${this.o.base} answers again`)
         this.backoffMs = 0
       } catch (e) {

@@ -13,22 +13,32 @@ export function takeRefusal(o: { inbox: boolean; roamer: boolean; targetRouting?
   if (!o.observation) return 'ONSEN_OBSERVATION is off'
 }
 
+// The tg daemon observes the connector probe; the inbox daemon observes its own legacy GET.
+export class MemberDelivery {
+  active = false
+
+  observe(source: 'items' | 'inbox', status?: number, code?: string): boolean | undefined {
+    if (source === 'inbox') {
+      if (status !== 200 && !(status === 409 && code === 'take_member')) return
+      return this.active = status === 409
+    }
+    if (!status || status >= 500) return
+    return this.active = status === 200 || (status === 409 && code === 'not_current_connector')
+  }
+}
+
 /** The connector parameter distinguishes this probe from a normal member inbox read. */
 export async function deliveryMode(req: ActionReq, path: string, connector: string) {
   const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  return { take: r?.status === 200, status: r?.status, code: r?.json?.error?.code, asOf: Date.parse(r?.json?.as_of) }
+  return { status: r?.status, code: r?.json?.error?.code, asOf: Date.parse(r?.json?.as_of) }
 }
 
 export type ItemRequest = OnsenClient['request']
 
-/** The C1 member-mode check used by the local delivery and notification gates. */
-export function takeModeActive(mode?: Pick<TakeMode, 'active'>): boolean { return mode?.active === true }
-
-export class TakeMode {
+export class TakeMode extends MemberDelivery {
   readonly path: string
   readonly connector: string
   checking = true
-  active = false  // member delivery mode; pausing this connector does not switch the member to pull
   observationRequired = false
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
@@ -39,6 +49,7 @@ export class TakeMode {
   constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (canReceive: boolean) => void | Promise<void>,
     readonly log: (line: string) => void, machine = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
+    super()
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
     this.connector = machine + '/' + member
   }
@@ -49,13 +60,12 @@ export class TakeMode {
     const mode = await deliveryMode(this.req, this.path, this.connector)
     if (this.stopped) return
     this.checking = false
+    const observed = this.observe('items', mode.status, mode.code)
     if (mode.status === 409 && mode.code === 'not_current_connector') {
-      this.active = true
       this.pause(mode.code, 45_000)
       return
     }
-    if (this.active && (!mode.status || mode.status >= 500)) { this.pause('mode probe unavailable', 60_000); return }
-    this.active = mode.take
+    if (observed === undefined && this.active) { this.pause('mode probe unavailable', 60_000); return }
     if (!this.active) { this.pause('mode probe: ' + (mode.status ? 'HTTP ' + mode.status : 'no response'), 60_000); return }
     clearTimeout(this.timer)
     this.timer = undefined
