@@ -12,29 +12,32 @@ const sid = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 const T = Date.parse('2026-11-27T03:00:00Z')
 afterEach(() => setSystemTime())
 
-function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
+function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled', thread?: string) {
   setSystemTime(T)
   const dir = mkdtempSync(join(tmpdir(), 'wo200-'))
   const journal = new Journal(join(dir, 'journal'), () => Date.now())
   const wall: MainWall = { walled: true, lastWallMs: T - age, clearedMs: null, resets_at: '2026-12-02T07:00:00Z' }
   const offers: string[][] = [], texts: string[] = [], notices: string[] = []
   const requests: Array<{ method: string; path: string; body: any }> = []
+  const logs: string[] = [], threadEvents: Record<string, unknown>[] = []
   const calls = new Map<string, string>()
-  const client = new OnsenClient({ agent: 'adam', base: 'http://fake', record: true, dir, credential: () => 'test', log: () => {},
+  const client = new OnsenClient({ agent: 'adam', base: 'http://127.0.0.1', record: true, dir, credential: () => 'test', log: (level, msg) => logs.push(`${level} ${msg}`),
     fetch: (async (input, init) => {
       const path = new URL(String(input)).pathname, body = init?.body ? JSON.parse(String(init.body)) : null
       requests.push({ method: init?.method ?? 'GET', path, body })
+      if (path.endsWith('/messages') && body?.type !== 'message') return new Response(null, { status: 400 })
       const id = path.match(/^\/v1\/calls\/(\d+)$/)?.[1]
       return Response.json(id ? { data: { state: calls.get(id), thread_id: '9', conversation_id: '2', caller: 'scheduler' } }
         : path === '/deliveries/batch' ? { results: body.items.map(() => ({})) } : {})
     }) as typeof fetch })
+  client.observe(line => { if (line.k === 't') threadEvents.push(line.r) })
   if (m2 !== 'offline') journal.write('main', '123', m2, { pid: 123, session_id: sid })
   const env: MainEnv = { journal, agent: 'adam', usageWall: () => wall, memberState: () => wall.walled ? 'walled' : 'idle',
     offer: async n => { const p = n.params as any; offers.push(p.meta.did?.split(',') ?? []); texts.push(p.content); return true },
     streamOpen: () => true, pidAlive: () => true, info: () => null, done: () => {}, undone: () => {},
     tellJoey: (_s, rule) => notices.push(rule), log: () => {}, expectedSession: () => [sid], refused: () => {}, genChanged: () => {}, context: () => '',
     blocked: (r, retry_after) => { for (const id of r.person_message_ids) client.recordBlocked({ message_id: id, retry_after }) },
-    checkCall: (id, why) => client.checkWaitingCall(id, why) }
+    checkCall: (id, why) => client.checkWaitingCall(id, why, thread) }
   const main = createMain(env)
   main.initMain()
   const facts = new DeliveryFacts({ agent: 'adam', sink: f => client.recordDelivery(f) })
@@ -46,7 +49,7 @@ function daemon(age = 300_000, m2: 'idle' | 'walled' | 'offline' = 'walled') {
   const flush = async () => { await Bun.sleep(0); await main.pump(); await Bun.sleep(0) }
   const hook = (event: string, prompt_id: string, other: object = {}) => main.mainEvent({ event, prompt_id, session_id: sid, pid: 123, ...other })
   const clear = () => { wall.walled = false; wall.clearedMs = Date.now(); main.statusChanged(wall.clearedMs) }
-  return { env, journal, main, add, wall, offers, texts, notices, requests, calls, client, hook, clear, flush }
+  return { env, journal, main, add, wall, offers, texts, notices, requests, logs, threadEvents, calls, client, hook, clear, flush }
 }
 
 test('WO-200 (a) human probes an old wall immediately', async () => {
@@ -213,7 +216,7 @@ test('WO-200 (e) the keeper clear immediately offers an account cut with the int
 })
 
 test('WO-200 (f) final Call gets one thread line and only the open Call reaches main', async () => {
-  const d = daemon()
+  const d = daemon(300_000, 'walled', 'asker-thread')
   d.calls.set('5', 'failed'); d.calls.set('6', 'accepted')
   const stale = d.add('peer', '5'), open = d.add('peer', '6')
   await d.flush()
@@ -221,13 +224,14 @@ test('WO-200 (f) final Call gets one thread line and only the open Call reaches 
   d.clear(); await d.flush(); await d.main.tick()
   expect(d.offers).toEqual([[open]])
   expect(d.journal.get('msg', stale)).toMatchObject({ state: 'done', reason: 'call_already_final' })
-  expect(d.requests.filter(r => r.method === 'POST')).toEqual([expect.objectContaining({ path: '/v1/conversations/2/messages',
-    body: expect.objectContaining({ thread_ids: ['9'], body: { format: 'markdown', text: '上限解除時這件已經是 failed，沒有交給主線' } }) })])
+  expect(d.threadEvents).toEqual([expect.objectContaining({ thread: 'asker-thread', event: 'item', dedupe: 'waited-call:5:failed',
+    item: expect.objectContaining({ id: 'waited-call:5:failed', kind: 'notice', text: '上限解除時這件已經是 failed，沒有交給主線' }) })])
+  expect(d.requests.filter(r => r.method === 'POST')).toEqual([])
 })
 
 test('WO-200 offline and restored Calls are checked before a hook can pull them', async () => {
   for (const cause of ['offline', 'restart']) {
-    const d = daemon(300_000, cause === 'offline' ? 'offline' : 'idle')
+    const d = daemon(300_000, cause === 'offline' ? 'offline' : 'idle', 'asker-thread')
     d.wall.walled = false
     // A batched Call cannot lead an offer. On restart this is an older journal without wait metadata.
     const item = d.add('peer', '8', true)
@@ -242,9 +246,8 @@ test('WO-200 offline and restored Calls are checked before a hook can pull them'
     expect((await boundary()).additionalContext).toBeUndefined()
     expect((await boundary()).additionalContext).toBeUndefined()
     expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', call_state: d.calls.get('8') })
-    expect(d.requests.filter(r => r.method === 'POST').map(r => r.body.body.text)).toEqual([
-      cause === 'restart' ? '重新啟動時這件已經是 expired，沒有交給主線' : '主線恢復連線時這件已經是 cancelled，沒有交給主線',
-    ])
+    expect(d.threadEvents).toMatchObject([{ thread: 'asker-thread', item: { kind: 'notice',
+      text: cause === 'restart' ? '重新啟動時這件已經是 expired，沒有交給主線' : '主線恢復連線時這件已經是 cancelled，沒有交給主線' } }])
     expect(d.offers).toEqual([])
   }
 })
@@ -331,7 +334,7 @@ test('WO-204 (c) both orders of refusal and account cut reach the same clear off
   }
 })
 
-test('WO-204 (e,g) a waiting Call takes the clear, a cancelled Call gets its thread line and leaves a bare resume', async () => {
+test('WO-204 (e,g) a waiting Call takes the clear, a cancelled Call without a local thread closes once and leaves a bare resume', async () => {
   for (const final of [false, true]) {
     const d = await bareRefusal()
     const item = d.add('peer', '7')
@@ -340,8 +343,12 @@ test('WO-204 (e,g) a waiting Call takes the clear, a cancelled Call gets its thr
     expect(d.offers).toEqual([])
     d.clear(); await Bun.sleep(0)
     if (final) {
-      expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', reason: 'call_already_final' })
-      expect(d.requests.filter(r => r.method === 'POST').map(r => r.body.body.text)).toEqual(['上限解除時這件已經是 cancelled，沒有交給主線'])
+      setSystemTime(T + 5_000)
+      await d.main.tick()
+      expect(d.journal.get('msg', item)).toMatchObject({ state: 'done', reason: 'call_already_final', call_state: 'cancelled' })
+      expect(d.requests).toEqual([{ method: 'GET', path: '/v1/calls/7', body: null }])
+      expect(d.threadEvents).toEqual([])
+      expect(d.logs).toEqual([expect.stringMatching(/^info .*Call 7.*cancelled.*no notice.*no local thread/i)])
       expect(d.texts).toEqual([resumeText])
     } else {
       expect(d.offers).toEqual([[item]])
