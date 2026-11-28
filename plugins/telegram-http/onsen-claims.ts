@@ -21,6 +21,7 @@ type Spool = {
 export class Claims implements ClaimStore {
   private rows: Record<string, Claim> = Object.create(null)
   private done: Done[] = []
+  private connector?: string
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
 
   constructor(readonly file: string, readonly spool: Spool, readonly missed: (id: string) => void,
@@ -34,9 +35,16 @@ export class Claims implements ClaimStore {
         delete row.registry_session
       }
       this.done = data.done ?? []
+      this.connector = data.connector
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
   }
 
+  carriedBy(connector: string): boolean { return this.connector === connector }
+  rememberCarrier(connector: string): void {
+    if (this.carriedBy(connector)) return
+    this.save(connector)
+    this.connector = connector
+  }
   held(): string[] { return Object.keys(this.rows) }
   owns(id: string): boolean {
     const row = this.rows[id]
@@ -45,11 +53,11 @@ export class Claims implements ClaimStore {
   blocked(): boolean { return this.spool.hasItemReports() }
   completed(id: string): boolean { return this.done.some(d => d.item_id === id && d.at > this.now() - week) }
 
-  private save(): void {
+  private save(connector = this.connector): void {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = this.file + '.' + process.pid + '.tmp'
     this.done = this.done.filter(d => d.at > this.now() - week).slice(-5000)
-    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done }), { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector }), { mode: 0o600 })
     renameSync(tmp, this.file)
   }
   private clock(id: string): void {

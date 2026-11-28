@@ -356,7 +356,8 @@ if (ONSEN_TAKE_ON) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
       async active => {
         if (active && ROAMER && !CONNECTOR) {
-          await tg?.stop()
+          itemClaims!.rememberCarrier(takeMode!.connector)
+          await tg?.stop(true)
           tg = null
           CONNECTOR = onsen.cfg.record = true
           if (connectorReady) { onsen.start(); startConnectorCommands(); startOnsenStatus(onsen) }
@@ -365,7 +366,8 @@ if (ONSEN_TAKE_ON) {
         registryStatusChanged?.()
       }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
-    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
+    if (ROAMER && itemClaims.carriedBy(takeMode.connector)) CONNECTOR = onsen.cfg.record = takeMode.observationRequired = true
+    onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok), line => itemClaims!.reportBody(line))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
     itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     if (!ROAMER) { Lanes.useItemReceiver(itemReceiver); Lanes.observeItemGates(() => itemPeek!.reset()) }
@@ -3977,7 +3979,7 @@ if (tg) {
 }
 
 function startConnectorCommands(): void {
-  log('info', `connector mode (${CONNECTOR_AGENT}): all bot traffic goes through Onsen and the Telegram bridge`)
+  log('info', `connector mode (${CONNECTOR_AGENT}): all bot traffic goes through Onsen and the Telegram bridge${TOKEN ? ' (the bot token in the env is not used)' : ''}`)
   void reportCommands().catch(() => {})
   setInterval(() => { if (!commandsPut && Date.now() - commandsTriedAt > 60_000) void reportCommands().catch(() => {}) }, 5_000).unref?.()
 }

@@ -842,6 +842,7 @@ export class RoamerTelegram {
   // returned, and polling stopped permanently while the process stayed alive. 2026-05-13 by Joey: the inner loop wrapped in an outer try/catch so a sync
   // throw in the IIFE itself gets logged and retried instead of silently terminating the loop.
   private stopped = false
+  private pollTask?: Promise<void>
   private timers: ReturnType<typeof setInterval>[] = []
   private async pollLoop(): Promise<void> {
     const h = this.host!
@@ -849,6 +850,7 @@ export class RoamerTelegram {
       try {
         await this.bot.start({
           onStart: info => {
+            if (this.stopped) return
             attempt = 0
             this.botUsername = info.username
             this.log('info', `polling as @${info.username}`)
@@ -899,7 +901,7 @@ export class RoamerTelegram {
       }, PAIRING_PRUNE_INTERVAL_MS).unref())
     }
     this.pollRunning = true
-    void (async () => {
+    this.pollTask = (async () => {
       while (!this.stopped && !host.shuttingDown()) {
         try { await this.pollLoop(); break } catch (err) {
           this.log('error', `pollLoop crashed unexpectedly: ${err} — restarting in 5s`)
@@ -913,9 +915,12 @@ export class RoamerTelegram {
   }
 
   /** bot.stop() signals the poll loop to end; the current getUpdates request may take up to its long-poll timeout to return */
-  async stop(): Promise<void> {
+  async stop(drain = false): Promise<void> {
     this.stopped = true
     for (const timer of this.timers) clearInterval(timer)
-    if (this.bot.isRunning()) await this.bot.stop()
+    if (this.bot.isRunning()) {
+      try { await this.bot.stop() } catch (err) { this.log('warn', `roamer: last polling offset could not be confirmed: ${err}`) }
+    }
+    if (drain) await this.pollTask
   }
 }

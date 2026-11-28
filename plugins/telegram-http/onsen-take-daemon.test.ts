@@ -613,6 +613,11 @@ test('a switched roamer starts with no bot token, registers commands and observe
   const names = d.f.calls.find(c => c.path === '/v1/members/' + member + '/commands')!.body.commands.map((c: any) => c.name)
   expect(names).toEqual(expect.arrayContaining(['roam', 'roam_status', 'resume_list', 'resume', 'resume_previous', 'restart', 'kill_stuck',
     'clear', 'agents', 'mcp', 'init', 'compact', 'model', 'effort', 'codexgate', 'sigint']))
+  d.f.mode(503)
+  await d.restart()
+  const offline = await fetch(d.base + '/healthz').then(r => r.json())
+  expect(offline.connector.on).toBe(true)
+  expect(offline.polling).toBe(false)
 })
 
 for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, true], ['404', 404, true]] as const)
@@ -625,6 +630,19 @@ for (const [name, mode, named] of [['not selected', 200, false], ['409', 409, tr
     expect(d.f.calls.filter(c => c.path.endsWith('/items'))).toHaveLength(named ? 1 : 0)
     expect(d.f.calls.some(c => c.path.endsWith('/commands') || c.path.endsWith('/observation'))).toBe(false)
   })
+
+test('a later successful probe drains the local poll before the bridge can carry the bot', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url }, 409, roamerState)
+  await waitFor(() => bot.polls.length > 0)
+  d.f.mode(200)
+  await waitFor(async () => (await fetch(d.base + '/healthz').then(r => r.json())).connector.on)
+  const calls = bot.polls.length
+  await Bun.sleep(350)
+  expect(bot.polls).toHaveLength(calls)
+  await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+}, 9000)
 
 async function target(d: Awaited<ReturnType<typeof daemon>>) {
   const child = Bun.spawn(['sleep', '300']), sid = randomUUID()

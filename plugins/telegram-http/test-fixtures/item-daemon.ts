@@ -22,6 +22,13 @@ if (process.env.ROAMER_MODE === '1') {
   const lanes = await import('../lanes.ts')
   spyOn(lanes, 'claudePidOf').mockImplementation(req => Number(req.headers['x-test-claude-pid']) || null)
 }
+if (process.env.C6_FAST_PROBE === '1') {
+  const { TakeMode } = await import('../onsen-take.ts')
+  const pause = TakeMode.prototype.pause
+  spyOn(TakeMode.prototype, 'pause').mockImplementation(function (reason, ms) {
+    return pause.call(this, reason, reason === 'mode probe did not return 200' ? 1500 : ms)
+  })
+}
 const transport = globalThis.fetch
 globalThis.fetch = Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
   const url = new URL(input instanceof Request ? input.url : String(input))

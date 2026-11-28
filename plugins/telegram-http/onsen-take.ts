@@ -53,7 +53,8 @@ export class TakeMode {
     this.reason = ''
     this.active = this.observationRequired = true
     this.log('onsen take: started ' + this.connector)
-    await this.changed(true)
+    try { await this.changed(true) }
+    catch (e) { this.pause('could not start ' + this.connector + ': ' + e, 60_000) }
   }
 
   pause(reason: string, ms: number): void {
