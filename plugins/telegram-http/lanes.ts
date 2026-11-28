@@ -1617,7 +1617,8 @@ function routerCfg(): RouterCfg {
   }
 }
 
-function threadOwnerFor(ev: InEvent): { owner: string; thread: string | null; via: string; cls?: string } | null {
+type ThreadOwner = { owner: string; thread: string | null; via: string; cls?: string }
+function threadOwnerFor(ev: InEvent): ThreadOwner | null {
   if (ev.thread && S.threads[ev.thread]?.lane) {
     const t = S.threads[ev.thread]
     if (t.peer && t.peer !== ev.from) return null      // only the thread's peer may speak in it (ID1/MR3)
@@ -2775,6 +2776,20 @@ export function effectiveClass(trigger: string, askedCls: string | undefined | n
   return row?.inherit === 'asking_run' && askedCls ? askedCls : trigger
 }
 
+function toThreadOwner(ev: InEvent, o: ThreadOwner, base: { rule: string }): Decision {
+  const t = o.thread ? S.threads[o.thread] ?? null : null
+  const quiet = stoppedQuiet(ev, t, o.owner)
+  if (quiet) return quiet
+  const gate = threadGate(t, ev)
+  if (gate) return stopThread(ev, t, gate, o.owner)
+  if (o.owner === 'main') {
+    saveState()
+    return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main`, thread: o.thread ?? undefined }
+  }
+  ev.cls = effectiveClass(ev.trigger!, o.cls)
+  return dispatch(ev, S.lanes[o.owner], base)
+}
+
 async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
   ev.trigger = triggerClass(r, ev)
   ev.cls = ev.trigger
@@ -2828,17 +2843,8 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
       const lane = S.lanes[S.topics[ev.message_thread_id!]]
       return dispatch(ev, lane, base)
     }
-    case 'thread_owner': {
-      const o = threadOwnerFor(ev)!
-      const t = o.thread ? S.threads[o.thread] ?? null : null
-      const quiet = stoppedQuiet(ev, t, o.owner)
-      if (quiet) return quiet
-      const gate = threadGate(t, ev)
-      if (gate) return stopThread(ev, t, gate, o.owner)
-      if (o.owner === 'main') { saveState(); return { ...base, target: 'main', note: `thread ${o.thread ?? '-'} belongs to main`, thread: o.thread ?? undefined } }
-      ev.cls = effectiveClass(ev.trigger, o.cls)
-      return dispatch(ev, S.lanes[o.owner], base)
-    }
+    case 'thread_owner':
+      return toThreadOwner(ev, threadOwnerFor(ev)!, base)
     case 'mail_lane': {                                           // lanes-golive (C2): an item of the mail line (pushed because the mailbox was not open)
       ev.trigger = r.trigger ?? 'mail'; ev.cls = ev.trigger
       return dispatch(ev, mailLane(), base)
