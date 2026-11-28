@@ -94,6 +94,54 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
+test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
+  const sid = randomUUID(), pid = process.pid, turn = 'person-prompt'
+  let registryFile = '', transcript = '', entry: Record<string, unknown> = {}
+  const d = await daemon({ MCP_READY_DELAY_MS: '50' }, 200, root => {
+    const sessions = join(root, 'home/.claude/sessions')
+    const projects = join(root, 'home/.claude/projects', root.replace(/[^a-zA-Z0-9]/g, '-'))
+    mkdirSync(sessions, { recursive: true }); mkdirSync(projects, { recursive: true })
+    writeFileSync(join(root, '.lanes/main-expected'), sid)
+    transcript = join(projects, sid + '.jsonl')
+    writeFileSync(transcript, '')
+    registryFile = join(sessions, pid + '.json')
+    entry = { pid, sessionId: sid, cwd: root, kind: 'interactive', entrypoint: 'cli', status: 'idle', statusUpdatedAt: Date.now() }
+    writeFileSync(registryFile, JSON.stringify(entry))
+    return {}
+  })
+  const headers = { Authorization: 'Bearer test-loopback', 'Content-Type': 'application/json' }
+  const hook = async (event: string, more = {}) => {
+    const resp = await fetch(d.base + '/lanes/main-event', { method: 'POST', headers,
+      body: JSON.stringify({ event, pid, session_id: sid, prompt_id: turn, transcript_path: transcript, ...more }) })
+    expect(resp.status).toBe(200)
+    return resp.json()
+  }
+  expect((await hook('SessionStart', { source: 'startup' })).accepted).toBe(true)
+  const offers: any[] = []
+  const client = new Client({ name: 'main-test', version: '1' }, { capabilities: {} })
+  client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') offers.push(n.params) }
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers } }))
+  clean.push(() => client.close())
+  const row = d.f.add('main-happy')
+  expect(await until(() => offers.some(n => n.content.includes(row.id)), 6000), d.log().slice(-2500)).toBe(true)
+  expect(row.state).toBe('claimed')
+  const offer = offers.find(n => n.content.includes(row.id))
+  await hook('UserPromptSubmit', { dids: [offer.meta.did] })
+  await waitFor(() => row.claim?.session_id === 'main')
+  const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'received and done' } })
+  expect(reply.isError, JSON.stringify(reply.content)).toBeFalsy()
+  const replyId = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+  expect(replyId, JSON.stringify(reply.content)).toBeTruthy()
+  expect(row.state).toBe('claimed')
+  await hook('Stop', { phase: 'final' })
+  await Bun.sleep(3100)
+  writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
+  expect(await until(() => row.state === 'completed', 8000), d.log().slice(-2500)).toBe(true)
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(row.response_message_ids).toEqual([replyId])
+  expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
+}, 25000)
+
 for (const [name, cfg, reason] of [
   ['unset', { ONSEN_TAKE: '' }, ''], ['observation off', { ONSEN_OBSERVATION: '' }, 'ONSEN_OBSERVATION'],
   ['lanes off', { GENESIS_LANES: '0' }, 'LANES_ON'], ['recording off', { ONSEN_RECORD: '0' }, 'recording'],
