@@ -90,9 +90,10 @@ export function projectPromises(eventId: string, obs: Ob[], writer: ItemWriter, 
       if (old?.level === 'answer' && old.state === o.state && old.due_at === o.due_at && old.sent === o.sent && old.to === o.to) continue
     }
     const session = commitment ? o.owner ?? 'main' : 'main'
-    const due = o.due_at ?? null
+    const due = o.due_at
+    const hasClosePath = !commitment || o.by === 'commitment' || (session === 'main' && o.by !== 'promise-check')
     o.self = { key: 'promise:' + eventId + ':' + o.id, item: ownItem('self', session,
-      `請向 ${waiter} 回報：${o.what ?? ''}（${eventId}）`, due, waiter, commitment && (o.by === 'promise-check' || session !== 'main') ? null : due,
+      `請向 ${waiter} 回報：${o.what ?? ''}（${eventId}）`, due, waiter, hasClosePath ? due : null,
       refs.map(r => ({ kind: 'item', value: r.onsen_item_id }))) }
     writer(o.self)
   }

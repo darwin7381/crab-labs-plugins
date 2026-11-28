@@ -58,23 +58,41 @@ test('a sent Telegram promise creates one self for the test account and reportin
   expect(pushes).toHaveLength(0)
 })
 
-test('lane notify_joey and commitment leave timed member reminders without waiter deadlines', async () => {
+test('a lane closes its explicit commitment by id; its automatic notify_joey promise has no deadline', async () => {
   const lane = 'adam.reflex.promise', event = 'lane-promise', thread = 'adam#lane-promise', s = L.__lanesState()
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'lilith' } as any
   L.__events().open(event, { class: 'joey', owner: lane, thread, obligations: [{ kind: 'joey', level: 'line' }] })
   const tok = { runId: 'lane-notify', lane, evId: event, trigger: 'joey', cls: 'joey', closers: [] } as any
   expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'changed', text: '10 分鐘後回報' })).toContain('sent to Joey')
-  expect(await L.callLaneTool({ ...tok, runId: 'lane-commit' }, 'commitment', { who: 'lilith', what: '交圖', by: '10 分鐘後' })).toContain('commitment recorded')
+  const by = new Date(f.now() + 600_000).toISOString()
+  const explicit = await L.callLaneTool({ ...tok, runId: 'lane-commit' }, 'commitment', { who: 'lilith', what: '交圖', by })
+  const id = /\(id (cm-[^;]+)/.exec(explicit)![1]!
+  expect(L.laneToolsFor('reflex').map(t => t.name)).toContain('commitment_done')
   const rows = () => selfRows().filter(r => r.session_id === lane)
   for (let i = 0; i < 100 && rows().length < 2; i++) { await Bun.sleep(10); await client.syncNow(true) }
-  expect(rows().map(r => r.waiter).sort()).toEqual(['joey-test', 'lilith'])
-  for (const row of rows()) {
-    expect(row.not_before).toBeTruthy()
-    expect(row.deadline).toBeNull()
-    f.advance(Math.max(0, Date.parse(row.not_before!) - f.now() + 1))
-    expect(notices(row.id)).toHaveLength(0)
-  }
+  expect(rows()).toHaveLength(2)
+  const automatic = rows().find(r => r.waiter === 'joey-test')!, tool = rows().find(r => r.waiter === 'lilith')!
+  expect(automatic.not_before).toBeTruthy()
+  expect(automatic.deadline).toBeNull()
+  expect(tool).toMatchObject({ not_before: by, deadline: by, state: 'waiting' })
+  const sibling = 'adam.reflex.other'
+  s.lanes[sibling] = { ...s.lanes[lane]!, id: sibling }
+  expect(await L.callLaneTool({ ...tok, lane: sibling }, 'commitment_done', { commitment_id: id })).toContain('refused')
+  f.advance(300_000)
+  expect(await L.callLaneTool({ ...tok, runId: 'next-run' }, 'commitment_done', { commitment_id: id })).toContain('marked done')
+  await client.syncNow(true)
+  expect(tool.state).toBe('completed')
+  expect(f.calls.filter(c => c.path === '/v1/items/' + tool.id && c.body.outcome === 'completed')).toHaveLength(1)
+  expect(await L.callLaneTool(tok, 'commitment_done', { commitment_id: id })).toContain('already marked done')
+  f.advance(301_000)
+  expect(notices(automatic.id)).toHaveLength(0)
+  expect(notices(tool.id)).toHaveLength(0)
+  const untimed = await L.callLaneTool(tok, 'commitment', { who: 'lilith', what: '稍後回圖' })
+  const local = /\(id (cm-[^;]+)/.exec(untimed)![1]!
+  expect(await L.callLaneTool(tok, 'commitment_done', { commitment_id: local })).toContain('marked done')
+  await client.syncNow(true)
+  expect(rows()).toHaveLength(2)
 })
 
 test('the main tool and a handed peer answer keep their actual waiter and finish early', async () => {
@@ -195,6 +213,7 @@ test('a pull member keeps a new commitment entirely in M3', async () => {
   try {
     const count = selfRows().length
     const reply = await L.callMainTool('commitment', { who: 'eve', what: 'another report', due: new Date(f.now() + 60_000).toISOString() }, 'test-main')
+    expect(L.laneToolsFor('reflex').map(t => t.name)).not.toContain('commitment_done')
     expect(reply).toContain('Joey is rung once')
     const id = /\(id (cm-[^;]+)/.exec(reply)![1]!
     await client.syncNow(true)
