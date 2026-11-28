@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OnsenClient, answeredCall, credentialRefused, isRoamerEnv, recordFor, refusedForGood } from './onsen-client.ts'
@@ -32,7 +32,7 @@ describe('upgrading a durable report spool', () => {
 
   test('old receipts advance locally, an unacknowledged claim survives two refusals and replays after restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'spool-upgrade-'))
-    const old = ['d', 'w', 'c', 'a', 'r', 'blocked'].map(k => ({ k, r: { id: 'old' } }))
+    const old = ['d', 'w', 'c', 'a', 'r', 'blocked'].map(k => ({ k, r: { id: 'old', body: { state: 'completed' } } }))
     writeFileSync(join(dir, 'spool.jsonl'), old.map(x => JSON.stringify(x)).join('\n') + '\n')
     const requests: Array<{ path: string; method: string; body: unknown; key: string | null }> = []
     const statuses = [401, 403, 200]
@@ -60,6 +60,28 @@ describe('upgrading a durable report spool', () => {
     expect(requests).toEqual(Array(3).fill({ path: '/v1/items/item-1/report', method: 'PUT', body: report.body, key: 'ir:item-1:claim-1:completed' }))
     expect(existsSync(join(dir, 'rejected.jsonl'))).toBe(false)
     client.stop()
+  })
+
+  test('preserves unsupported records in full before advancing to a live report', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'future-spool-'))
+    const unknown = ['iw', 'item', 'self', 'new-kind', 'c'].map(k => ({ k, r: { text: 'x'.repeat(3100) } }))
+    const c = new OnsenClient({ dir, agent: 'adam', base: BASE, record: true, credential: () => 'fixture', log: () => {},
+      fetch: (async () => Response.json({})) as typeof fetch })
+    writeFileSync(c.spool, unknown.map(x => JSON.stringify(x)).join('\n') + '\n')
+    c.recordItemReport(report)
+    mkdirSync(c.rejected) // refusal to store the rejected record must keep the cursor on it
+    const pending = c.pendingBytes()
+    await c.syncNow(true)
+    expect(c.pendingBytes()).toBe(pending)
+    rmdirSync(c.rejected)
+    await c.syncNow(true)
+    const rejected = readFileSync(c.rejected, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(rejected.map(r => r.line)).toEqual(unknown)
+    expect(rejected.every(r => r.why.includes(r.line.k))).toBe(true)
+    expect(c.stats.rejected).toBe(5)
+    expect(c.hasItemReports()).toBe(false)
+    expect(c.pendingBytes()).toBe(0)
+    c.stop()
   })
 
   test('refused for good: every 4xx but the credential (401, 403 not_authenticated), a timeout (408), too early (425), too fast (429)', () => {

@@ -80,7 +80,7 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   | { k: 'd'; r: DeliveryFact } // historical, still readable by the local status view
   | { k: 'c'; r: CallStateLine | CallResultLine }
   | { k: 'a' | 'r' | 'w' | 'blocked'; r: unknown } // historical spool entries, read only
-const SPOOL_KINDS = new Set(['ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
+const RETIRED_SPOOL_KINDS = new Set(['d', 'a', 'r', 'w', 'blocked'])
 /** WO-175 (Onsen contract v1 §4, §9; Onsen 0.24.1: a pulled item carries its `call_id`): the Call a received item is, as the item names it */
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
 export type CallWait = 'wall' | 'offline' | 'restart'
@@ -699,8 +699,8 @@ export class OnsenClient {
   private ok(): void { this.backoffMs = 0; this.nextTryAt = 0; this.stats.last_ok_at = new Date().toISOString(); this.stats.last_error = null }
   /** `skip` (1.58.32): Onsen refused it (a 4xx, an item's own refusal in a batch): counted in `skipped`, the last one kept for /healthz */
   private reject(line: unknown, why: string, skip?: SkippedInfo): void {
+    appendFileSync(this.rejected, JSON.stringify({ at: new Date().toISOString(), why, line }) + '\n', { mode: 0o600 })
     this.stats.rejected++
-    try { appendFileSync(this.rejected, JSON.stringify({ at: new Date().toISOString(), why, line }) + '\n', { mode: 0o600 }) } catch {}
     const key = lineKey(line)
     if (skip) this.noteSkipped(1, skip, key)
     this.cfg.log('warn', `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
@@ -789,7 +789,7 @@ export class OnsenClient {
         if (buf[i] !== 0x0a) continue
         const raw = buf.subarray(from, i).toString('utf8')
         let line: SpoolLine | null = null
-        try { const j = JSON.parse(raw); if (SPOOL_KINDS.has(j.k) && j.r) line = j } catch {}
+        try { const j = JSON.parse(raw); if (typeof j?.k === 'string' && j.r != null) line = j } catch {}
         out.push({ line, raw, end: start + i + 1 })
         from = i + 1
       }
@@ -817,7 +817,7 @@ export class OnsenClient {
     let i = 0
     while (i < todo.length) {
       const t = todo[i]!
-      if (!t.line) { this.reject(t.raw.slice(0, 2000), 'unreadable spool line'); this.writeCursor(t.end); i++; continue }
+      if (!t.line) { this.reject(t.raw, 'unreadable spool line'); this.writeCursor(t.end); i++; continue }
       if (t.line.k === 'l' || t.line.k === 'u') {
         // step 2 (WO-142): a restart line drawn or lifted while Onsen did not answer, in its place in the order
         const done = await this.syncLine(t.line, cred)
@@ -874,9 +874,8 @@ export class OnsenClient {
         this.writeCursor(t.end); this.ok(); i++
         continue
       }
-      // These records were drained before cutover. A restored pre-cutover spool
-      // must advance past them without replaying an obsolete delivery or projection.
-      if (t.line.k !== 'ir' && t.line.k !== 'e' && t.line.k !== 'm') {
+      // Pre-cutover c records projected state. Result-only c records are handled above.
+      if (RETIRED_SPOOL_KINDS.has(t.line.k) || t.line.k === 'c' && ['accepted', 'running', 'completed', 'failed'].includes(t.line.r.body?.state ?? '')) {
         this.writeCursor(t.end); i++
         continue
       }
@@ -906,6 +905,10 @@ export class OnsenClient {
         continue
       }
       // a run of messages: one batch (≤500)
+      if (t.line.k !== 'm') {
+        this.reject(t.line, `unsupported spool record kind or shape: ${t.line.k}`)
+        this.writeCursor(t.end); i++; continue
+      }
       const run: Array<{ line: SpoolLine; end: number }> = []
       while (i < todo.length && run.length < 500 && todo[i]!.line?.k === 'm') { run.push({ line: todo[i]!.line!, end: todo[i]!.end }); i++ }
       const items = await this.withFiles(run.map(x => x.line))         // WO-190: a message's files (attachment_file_ids), once stored
