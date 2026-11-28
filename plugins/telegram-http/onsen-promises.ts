@@ -56,7 +56,7 @@ export function projectPromises(eventId: string, obs: Ob[], writer: SelfWriter, 
       continue
     }
     const waiter = memberWaiter(o.to)
-    if (!waiter || (o.state !== 'open' && o.state !== 'handed')) continue
+    if (!waiter || o.due_at == null || (o.state !== 'open' && o.state !== 'handed')) continue
     const commitment = o.level === 'commitment'
     if (!commitment && !(o.level === 'answer' && o.due_at != null && (!refs.length || o.sent))) continue
     const session = commitment ? o.owner ?? 'main' : 'main'

@@ -6,7 +6,7 @@
 
 - 只在該成員的 C1 take 模式運作。沿用成員的 Onsen client、S2 的 `POST /v1/members/<name>/items`、markdown body、RFC 3339 時間、`Ref[]` 與穩定的 `Idempotency-Key`。Onsen 從認證決定 `from`。提早完成等待中的承諾走 `DELETE /v1/items/<id>`，帶實際版本與 `outcome:"completed"`。已領的列依 C1 的 claim 回報。
 - `lanes.ts:4219,6748,6881` 的 followup 在原 thread／lane 留下 `self`，最早時間沿用工具算出的 due。一般「再看」沒有回覆期限。有明確承諾時，M3 的對象就是 waiter。寫入方保留原事件、鏈長、結果指紋與每串三筆上限，讓同一個結果停止下一筆，一條鏈預設最多四趟。`ItemPeek` 到點分流，既有接收器在交入時才領。既有 pull 的本機 followup 和已保存的排程仍須能處理。
-- `lanes.ts:5810,6160,6740,6898,8045` 的主線／分身工具、已送出的承諾和收尾回執沿用 M3 的記錄與去重。實際收件人來自那次回覆或承諾，包含測試帳號與 peer。答應的時間寫在 `not_before`。主線 commitment 工具可憑識別碼提早結案，因此可帶 deadline。主線回覆、分身通知與分身 commitment 沒有這條結案路徑，deadline 留 null。提早做完的承諾要能按工具給的識別碼收掉。M3 本機到期掃描（`lanes.ts:6023`）對由 Item 處理的等待不再另推一次。
+- `lanes.ts:5810,6160,6740,6898,8045` 的主線／分身工具、已送出的承諾和收尾回執沿用 M3 的記錄與去重。實際收件人來自那次回覆或承諾，包含測試帳號與 peer。沒有約定時間的承諾只記在 M3。答應的時間寫在 `not_before`。主線 commitment 工具可憑識別碼提早結案，因此可帶 deadline。主線回覆、分身通知與分身 commitment 沒有這條結案路徑，deadline 留 null。提早做完的承諾要能按工具給的識別碼收掉。M3 本機到期掃描（`lanes.ts:6023`）對由 Item 處理的等待不再另推一次。
 - 第四表與 §4b「agent 答應人的事」在仍未履約且 deadline 已過時，由 S4 產生一筆 `notice`，`reason=promise_due`、`about_item_id` 指承諾、收件人為 waiter。C5 只寫承諾與完成事實。C3 處理其他 M3 通知與舊催促。
 - 依已定 23，保溫寫入者是連接器。`keepwarm-local.ts:162,248` 沿用主線 transcript 的最後一次動作、上次真正工作、快取及冷卻判斷。以同一個 idle stretch 為鍵寫一筆 `keepwarm` 給 main，`not_before = last_req + 50 分鐘`、`deadline=null`。冷了或距真正工作已達 24 小時不寫。成員自己的憑證完成寫入；交入由 C1 的 idle gate 決定。保溫本身不能重置「真正工作」時鐘。
 - `server.ts:2236,3000` 的舊信箱到期事件、保溫直送與每小時信箱提醒只為 pull 成員保留。主線的 mailbox_decide 仍將決定交回原 lane，路由中斷時留在本機佇列重試。信箱的列與已定 53 處理 take 的再交入。兩支 daemon 沿用 C1 的成員切換事實。agent-inbox 只設 tg 的開關即可辨識 take 這一點依賴平行的 C1 fix D11。收取時間與真資料形狀依賴 C1 的 D2/D4/D14。此步退休 L25、D11、D12、W6–W9 的連接器部分。漫遊者由 C6 接入。

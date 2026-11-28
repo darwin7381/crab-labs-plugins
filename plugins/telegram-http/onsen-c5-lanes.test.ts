@@ -106,6 +106,15 @@ test('the main tool and a handed peer answer keep their actual waiter and finish
   expect(notices(open.id)[0]).toMatchObject({ member: 'sable', reason: 'promise_due' })
 })
 
+test('untimed replies and explicit commitments stay in M3 without waking a member', async () => {
+  const count = selfRows().length
+  expect(await L.promiseCheck({ who: 'main', to: 'cain', text: '我會回報結果', thread: null, ref: 'no-time' })).toBe('written')
+  const reply = await L.callMainTool('commitment', { who: 'eve', what: '稍後回報' }, 'test-main')
+  expect(reply).toContain('commitment recorded')
+  await client.syncNow(true)
+  expect(selfRows()).toHaveLength(count)
+})
+
 test('only definite times become deadlines', () => {
   const at = Date.parse('2026-11-28T23:50:00+08:00')
   expect(promiseTime('12 分鐘後回報', at)).toBe(at + 720_000)
