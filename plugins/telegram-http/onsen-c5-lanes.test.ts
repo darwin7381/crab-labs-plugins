@@ -179,6 +179,17 @@ test('switching a mixed pull-era event publishes only the outstanding future com
   expect(rows[0]!.payload.text).toContain('future')
 })
 
+test('an overdue answer on an inbound Item keeps its single L18 push', async () => {
+  const id = 'item-answer-due', what = '補上 api 日誌', now = Date.now()
+  const before = pushes.length
+  L.__events().open(id, { class: 'peer', owner: 'main', fields: { onsen_items: [itemRef(f.add(id))] },
+    obligations: [{ level: 'answer', kind: 'peer', state: 'handed', to: 'cain', what, due_at: now - 1 }] })
+  L.dueTick(now); L.dueTick(now + 1000)
+  await client.syncNow(true)
+  expect(selfRows().filter(r => r.payload.text.includes(id))).toHaveLength(0)
+  expect(pushes.slice(before).filter(text => text.includes(what))).toHaveLength(1)
+})
+
 test('a pull member keeps a new commitment entirely in M3', async () => {
   f.mode(409); await mode.probe()
   try {

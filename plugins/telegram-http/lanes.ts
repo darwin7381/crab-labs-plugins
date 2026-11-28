@@ -6098,7 +6098,7 @@ export function dueTick(now = Date.now()): void {
   try { batchTick(now) } catch (e) { D.log('warn', `lanes: batch wake sweep: ${e}`) }   // WO-137 甲: the batch wake of cards that can wait
   const down = noteMainDown(now)                                         // WO-201 (point 5)
   for (const { e, o } of events.due(now)) {
-    if (o.self || (activeSelfWriter() && o.level === 'answer' && e.onsen_items?.length)) continue
+    if (o.self) continue
     if (o.kind === 'main') {                                             // 1.38.2: the main is on it (mainOnIt): no push now
       const why = mainOnIt(e, o)
       if (why) { if (!heldDue.has(o.id)) { heldDue.add(o.id); if (heldDue.size > 1000) heldDue.clear(); logos('lane.handoff_due_held', { event: e.id, handoff: o.handoff ?? o.id, why }) } continue }
