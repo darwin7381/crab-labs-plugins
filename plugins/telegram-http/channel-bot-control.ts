@@ -34,7 +34,7 @@ import {
   writeSync, fsyncSync, renameSync, unlinkSync, realpathSync,
 } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
-import { markDeliberateRestart, markSessionSwitch } from './lanes.ts'
+import { holdMainOffers, mainSessionId, markDeliberateRestart } from './lanes.ts'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 
@@ -894,11 +894,6 @@ async function runCodexGate(tmuxName: string, notify: (msg: string) => Promise<v
   }
 }
 
-/** Is claude TUI's `/resume` picker overlay currently rendered? */
-async function isPickerOpen(tmuxName: string = TMUX_SESSION): Promise<boolean> {
-  const pane = await tmuxCapturePane(tmuxName)
-  return /Resume session\s*(\(\d+ of \d+\))?/.test(pane)
-}
 
 /**
  * Busy-marker table (#15, 2026-07-10 — extracted to a constant so the marker
@@ -1283,8 +1278,8 @@ export async function forwardSharedTuiSlash(
   }
 
   if (SHARED_TUI_SENDABLE.has(cmd)) {
-    // /resume with an argument needs Phase-3's resumePickerInlineSwitch (which
-    // drives the picker by tmux arrow keys to reach a specific session).
+    // /resume with an argument goes through resumeSessionSwitch (WO-215: by id; which
+    // types /resume <session-id>, then checks the main lanes registers).
     // The bare send-keys path here only types the command literally — it can't
     // navigate the picker and silently drops the UUID/number arg. Fall through
     // so handleControlSlash's /resume <id> branch gets it. (Joey 2026-05-26 msg
@@ -1736,55 +1731,31 @@ export function currentSessionId(projectsDirOverride?: string): string | null {
  * (pid 31042 → 31042 across switch). Daemon's MCP transport remains
  * connected; in-flight messages don't drop.
  */
-export async function resumePickerInlineSwitch(pickerIdx: number, tmuxOverride?: string): Promise<void> {
+/** WO-215 (Chiron 01:47Z): switch the TUI in `tmuxName` to session `sessionId` with Claude Code's own `/resume <session-id>` (code.claude.com
+ *  commands: "Resume a conversation by ID or name"), not by counting picker rows: the picker's order is not ours (`/resume 423643a9` opened
+ *  e19b6246). It interrupts what is running first (Joey 2026-05-25 msg 1572: a /resume press means switch now). For this agent's own main (no
+ *  tmuxOverride, lanes on): M1 holds its offers meanwhile, so what waits goes to the session switched to; and the switch is done only when the main
+ *  lanes registers is `sessionId` (its SessionStart, source resume, in the same process). ok: true / false (`now` = the session registered instead) /
+ *  null (cannot tell: lanes off, or another agent's TUI) */
+export async function resumeSessionSwitch(sessionId: string, tmuxOverride?: string): Promise<{ ok: boolean | null; now: string | null }> {
   const tmuxName = tmuxOverride ?? TMUX_SESSION
-
-  // Proactive cleanup instead of fragile pane-text busy-detection.
-  // Joey 2026-05-25 (msg 1572): "他們會常常改字吧？為何不就把它打斷就好了？"
-  // — busy-detection by regex on claude TUI output broke when claude
-  // changed its completion-marker format (`✻ Crunched for X` was past-tense
-  // history but my regex treated it as active). Cleaner approach: when the
-  // user clicks a /resume button they explicitly want to switch — interrupt
-  // whatever's in progress and drive the picker. Any mid-turn response is
-  // acceptable collateral; user can re-ask after switch.
-  //
-  // Sequence: Escape (dismiss any open dialog/picker) → wait → Ctrl-C
-  // (interrupt any active turn) → wait → drive picker.
-  // WO-215: this process is about to end its session and start the chosen one: announce the switch so the main follows it (lanes off: nothing)
-  if (!tmuxOverride) markSessionSwitch()
-  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
-  await new Promise(r => setTimeout(r, 200))
-  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-c'])
-  await new Promise(r => setTimeout(r, 600))
-
-  await tmuxSendKeys('/resume', tmuxName)
-
-  let pickerOk = false
-  for (let attempt = 0; attempt < 6; attempt++) {
-    await new Promise(r => setTimeout(r, 500))
-    if (await isPickerOpen(tmuxName)) { pickerOk = true; break }
-  }
-  if (!pickerOk) {
+  const own = !tmuxOverride && !!mainSessionId()
+  const wait = (ms: number) => new Promise(r => setTimeout(r, ms))
+  if (own) holdMainOffers(30_000)
+  try {
     await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
-    throw new Error('picker failed to open after /resume (3s timeout) — Escape sent for safety')
-  }
-
-  for (let i = 0; i < pickerIdx; i++) {
-    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Down'])
-    await new Promise(r => setTimeout(r, 100))
-  }
-  await new Promise(r => setTimeout(r, 200))
-  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Enter'])
-
-  for (let attempt = 0; attempt < 4; attempt++) {
-    await new Promise(r => setTimeout(r, 500))
-    if (!(await isPickerOpen(tmuxName))) return
-  }
-  await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'Escape'])
-  throw new Error(
-    'picker still open 2s after Enter — sent Escape for cleanup. Resume may have not completed.'
-  )
+    await wait(200)
+    await runCommand(['tmux', 'send-keys', '-t', tmuxName, 'C-c'])
+    await wait(600)
+    await tmuxSendKeys(`/resume ${sessionId}`, tmuxName)
+    if (!own) return { ok: null, now: null }
+    for (let i = 0; i < 30; i++) { await wait(500); if (mainSessionId() === sessionId) return { ok: true, now: sessionId } }
+    return { ok: false, now: mainSessionId() }
+  } finally { if (own) holdMainOffers(0) }
 }
+/** WO-215 (2): a switch the main did not take is not reported as done */
+export const resumeNotTaken = (target: string, now: string | null): string =>
+  `⚠️ the switch to \`${target.slice(0, 8)}\` did not take: the main is ${now ? `\`${now.slice(0, 8)}\`` : 'not registered'}. Nothing else changed; try \`/resume_list\` again.`
 
 // ---- /resume_previous chain (walk-back history) --------------------------
 //
@@ -2206,19 +2177,13 @@ export async function handleControlSlash(
       )
       return true
     }
-    // Picker re-sorts on each invocation; target's picker index equals
-    // chain.length - 1 because:
-    //   - all chain.length prior visits sit at the top of mtime-DESC
-    //   - BUT picker excludes the current session (= chain[last])
-    //   - so the remaining chain.length-1 prior visits occupy picker
-    //     indices 0..chain.length-2
-    //   - target = next non-visited = picker idx chain.length - 1
-    const targetPickerIdx = chain.ids.length - 1
     chain.ids.push(targetSession.id)
     chain.ts = Date.now()
 
     await tryRun('resume_previous (chain walk-back)', async () => {
-      await resumePickerInlineSwitch(targetPickerIdx)
+      // WO-215: by the session's id, checked against the main lanes registers after the switch
+      const r = await resumeSessionSwitch(targetSession.id)
+      if (r.ok === false) { await replyToTg(resumeNotTaken(targetSession.id, r.now)); return }
       saveResumeChain(chain)
       await replyToTg(formatResumeReply({
         header: `↩️ walk-back step ${chain.ids.length - 1}`,
@@ -2281,11 +2246,10 @@ export async function handleControlSlash(
       return true
     }
     const target = sessions[targetIdx]
-    await tryRun('resume via picker (tmux inline-switch)', async () => {
-      // Picker excludes current (= sessions[0]) → list idx N maps to
-      // picker idx (N - 1). targetIdx ≥ 1 guaranteed by the
-      // "already the current session" early-return above.
-      await resumePickerInlineSwitch(targetIdx - 1)
+    await tryRun('resume by session id (tmux inline-switch)', async () => {
+      // WO-215: by the session's id, checked against the main lanes registers after the switch
+      const r = await resumeSessionSwitch(target.id)
+      if (r.ok === false) { await replyToTg(resumeNotTaken(target.id, r.now)); return }
       // Explicit pick resets walk-back chain to start fresh from this session.
       saveResumeChain({ ids: [target.id], ts: Date.now() })
       await replyToTg(formatResumeReply({

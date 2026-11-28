@@ -28,7 +28,7 @@ import {
   sharedTuiCommands,
   listClaudeSessions,
   currentSessionId,
-  resumePickerInlineSwitch,
+  resumeSessionSwitch,
   loadResumeChain,
   saveResumeChain,
   formatResumeReply,
@@ -1208,11 +1208,10 @@ async function handleChannelBotCommandsForCurrentTarget(
       await replyToTg(`已走完該 project 全部 ${chain.ids.length} 個 session — 沒更早的。`)
       return 'handled'
     }
-    const targetPickerIdx = chain.ids.length - 1
     chain.ids.push(targetSession.id)
     chain.ts = Date.now()
     try {
-      await resumePickerInlineSwitch(targetPickerIdx, targetTmux)
+      await resumeSessionSwitch(targetSession.id, targetTmux)              // WO-215: by id, not by picker row
       saveResumeChain(chain, targetResumeChainFile)
       await replyToTg(formatResumeReply({
         header: `↩️ walk-back step ${chain.ids.length - 1}`,
@@ -1259,7 +1258,7 @@ async function handleChannelBotCommandsForCurrentTarget(
     if (targetIdx === 0) { await replyToTg('that is already the current session.'); return 'handled' }
     const targetSession = sessions[targetIdx]
     try {
-      await resumePickerInlineSwitch(targetIdx - 1, targetTmux)
+      await resumeSessionSwitch(targetSession.id, targetTmux)              // WO-215: by id, not by picker row
       saveResumeChain({ ids: [targetSession.id], ts: Date.now() }, targetResumeChainFile)
       await replyToTg(formatResumeReply({
         header: `↩️ inline-switched to session #${targetIdx + 1}`,

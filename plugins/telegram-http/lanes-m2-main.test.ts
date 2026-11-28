@@ -574,25 +574,25 @@ test('002v (/clear, Joey TG 7645): the main role belongs to the process: /clear 
   await killed({ ...g, sid: sid2 })
 })
 
-test('WO-215: /resume <n> from the daemon is an announced switch: the chosen session in the same process becomes the main; without the announcement an end is an end; a stray session is still refused', async () => {
+test('WO-215: an in-session /resume (reason resume, typed or the daemon\'s): the chosen session becomes the main; offers held during the daemon\'s switch go to it; another reason ends the gen at once; another process is refused', async () => {
   await drained()
   const g = await startMain()
   const sid2 = randomUUID()
-  L.markSessionSwitch()                                                                    // channel-bot-control resumePickerInlineSwitch, before it drives the picker
-  await hook(g, 'SessionEnd', { reason: 'other' })                                         // /resume ends the session with reason other ...
-  expect(M().mainPhase()).toBe('idle')                                                     // ... which ends no gen while the switch is announced
+  L.holdMainOffers(30_000)                                                                  // resumeSessionSwitch: it is about to interrupt and switch
+  const id = await joey('切過去之後還收得到嗎？')
+  expect(state(id)).toBe('queued')                                                          // held: not offered to the session being left
+  await hook(g, 'SessionEnd', { reason: 'resume' })                                         // Claude Code: "Session switched via interactive /resume"
+  expect(M().mainPhase()).not.toBe('gone')
   const r = await L.__mainEvent({ event: 'SessionStart', pid: g.pid, session_id: sid2, source: 'resume' })
   expect(r.accepted).toBe(true)
   expect(M().mainSession()!.session_id).toBe(sid2)
   expect(readFileSync(join(dir, 'main-expected'), 'utf8').trim()).toBe(sid2)              // the next launch resumes the chosen session
-  const id = await joey('切過去之後還收得到嗎？')
-  expect(state(id)).toBe('offered')                                                         // Joey's message reaches the chosen session
-  // the announcement is spent by that SessionStart: a later end of this process's session is an end, with no grace
-  await hook({ ...g, sid: sid2 }, 'SessionEnd', { reason: 'other' })
-  expect(M().mainPhase()).toBe('gone')
-  // a session from another process that nobody announced or expects is refused, as before
+  await sleep(20)
+  expect(state(id)).toBe('offered')                                                         // the new session's start released the hold: it goes there
   const r2 = await L.__mainEvent({ event: 'SessionStart', pid: g.pid + 7, session_id: randomUUID(), source: 'resume' })
-  expect(r2.accepted).toBe(false)
+  expect(r2.accepted).toBe(false)                                                           // another process nobody expects: refused, as before
+  await hook({ ...g, sid: sid2 }, 'SessionEnd', { reason: 'other' })                       // any other reason is the process ending: at once, as before
+  expect(M().mainPhase()).toBe('gone')
   await killed({ ...g, sid: sid2 })
 })
 

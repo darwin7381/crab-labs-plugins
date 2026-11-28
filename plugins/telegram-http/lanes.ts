@@ -627,8 +627,8 @@ export function mainTranscriptFile(dir: string): string | null {
 }
 /** called by the control commands that kill or restart the TUI on purpose (/restart, /kill_stuck): the gen ends `asked` */
 export function markDeliberateRestart(): void { main?.markEnd('asked') }
-/** WO-215: the daemon switches the main's process to another session for a person (/resume <n>): that session becomes the main (same process) */
-export function markSessionSwitch(): void { main?.markSwitch() }
+/** WO-215 (3): the daemon is switching the main's session for a person (/resume): hold M1's offers for up to `ms` (0 = release now) */
+export function holdMainOffers(ms: number): void { main?.holdOffers(ms) }
 
 // 002y (X-5; the fleet is mostly macOS): every process fact lanes reads comes from ONE platform layer, a function per fact (lanes-proc.ts). Through
 // 002x they were Linux /proc reads here (/proc/net/tcp + /proc/<pid>/fd for a socket's process, stat, cmdline, exe): on a Mac no MCP session was ever
