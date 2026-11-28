@@ -156,6 +156,39 @@ test('daemon handles a control at dispatch and immediately completes a re-served
   expect(d.journal().filter(l => l.onsen_items)).toHaveLength(0)
 })
 
+test('group commands use the Onsen sender: guest /clear is ordinary text and the owner can run /help', async () => {
+  const chat = '-10042'
+  const d = await daemon({ ONSEN_OWNER: 'joey' }, 200, root => {
+    writeFileSync(join(root, 'tg', 'access.json'), JSON.stringify({ allowFrom: ['1'], groups: { [chat]: { allowFrom: [] } }, pending: {} }))
+    return {}
+  })
+  const payload = { conversation_id: '42', kind: 'command', text: '/clear', from: 'joey', message_id: '101',
+    client: { name: 'telegram', chat, msg_id: '101', user: 'Joey', user_id: '1828173984' } }
+  const guest = d.f.add('guest-clear', 'message', { from: 'tg-42', message_id: '101', payload })
+  const notification = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === guest.id)
+  await waitFor(() => !!notification())
+  expect(notification().notif.params.content).toBe('/clear')
+  expect(guest.state).toBe('waiting')
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') || ['/v1/messages', '/v1/actions', '/restart-lines'].includes(c.path))).toHaveLength(0)
+  const owner = d.f.add('owner-help', 'message', { from: 'joey', message_id: '102', payload: { ...payload, message_id: '102', text: '/help', client: { ...payload.client, msg_id: '102' } } })
+  await waitFor(() => owner.state === 'completed')
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(1)
+  expect(guest.state).toBe('waiting')
+})
+
+test('an Onsen-only group command also requires the owner, while a direct chat keeps its command handler', async () => {
+  const d = await daemon({ ONSEN_OWNER: 'joey' })
+  d.f.conversations.set('51', 'group'); d.f.conversations.set('52', 'direct')
+  const command = (id: string) => d.f.add(id, 'message', { from: 'tg-42', message_id: id, payload: {
+    conversation_id: id, message_id: id, from: 'tg-42', via: 'web', kind: 'command', text: '/help', client: null,
+  } })
+  const group = command('51'), direct = command('52')
+  await waitFor(() => direct.state === 'completed')
+  expect(group.state).toBe('waiting')
+  expect(d.journal().find(r => r.onsen_items?.[0]?.onsen_item_id === group.id && r.notif)?.notif.params.content).toBe('/help')
+  expect(d.f.calls.filter(c => c.path === '/v1/messages').map(c => c.body.conversation_id)).toEqual(['52'])
+})
+
 test('an agent’s web group message keeps its author and opaque ids, and reply writes back to that conversation', async () => {
   const d = await daemon(), conversation = 'group-web', id = 'msg-a'
   const row = d.f.add('web-group-item', 'message', { from: 'lab-b', message_id: id, payload: {

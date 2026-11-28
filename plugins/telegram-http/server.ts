@@ -576,14 +576,25 @@ async function reportCommands(): Promise<void> {
   if (r && r.status >= 200 && r.status < 300) { commandsPut = key; log('info', `connector: ${commands.length} command(s) reported to Onsen (the client's command menu)`) }
   else log('warn', `connector: the command list was not taken by Onsen (${Connector.why(r)}); tried again in a minute`)
 }
+/** Telegram identifies groups by chat id. An Onsen-only chat can also be a direct conversation. */
+async function commandChatAllows(chat: string, sender?: string): Promise<boolean> {
+  const web = Connector.ONSEN_CHAT.exec(chat)
+  if (!web && !chat.startsWith('-')) return true
+  if (sender && sender === connectorOwner()) return true
+  if (!web) return false
+  const r = await onsen?.request('GET', `/v1/conversations/${encodeURIComponent(web[1]!)}`, undefined, 3000).catch(() => null)
+  return r?.status === 200 && r.json?.data?.kind === 'direct'
+}
 /** WO-197 segment 2 (CONTRACT §7d 「指令」): a person's slash command that came from Onsen to a connector, run by the handler the Telegram path runs
  *  (bot.command's /start /help /status, /main /lanes with lanes on; then the control plane, then the roamer's). Its answer is one Onsen message, or
  *  one Action when it offers a choice (sendTextWithMaybeKeyboard → connectorAnswer); its receipt goes to the end and the answer is its response
  *  (handledHere). /clear's reply and choice: connectorClearHooks. false: no handler took it (it goes on to the session as a message) */
 async function connectorCommand(text: string, chat: string, ref: string, userId: string, user: string, topic: number | undefined, atIso?: string,
-  via?: string, item?: ItemRef, commandId?: string): Promise<boolean> {
+  via?: string, item?: ItemRef, commandId?: string, sender?: string): Promise<boolean> {
   const t = text.trim()
   if (!/^\/[A-Za-z]/.test(t)) return false
+  if (item?.kind === 'message' && !personMessage(item)) return false
+  if (!await commandChatAllows(chat, item ? item.from : sender)) return false
   const cmd = t.split(/\s+/)[0]!.toLowerCase().replace(/@\S+$/, '')
   const here: Lanes.TopicAsk = { chat, ...(topic != null ? { topic } : {}) }
   const reply = (msg: string, opts?: ReplyOptions) => sendTextWithMaybeKeyboard(chat, msg, opts?.keyboard, here)
@@ -4786,9 +4797,8 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     // WO-197 segment 2 (CONTRACT §7d 「指令」; sonn's ruling 7): a connector runs a person's slash command itself (the bridge's kind command, or a page
     // message whose text is one), with today's handler; one it does not know goes on as a message
     const thread = CONNECTOR ? await connectorThreadOf(p, c, chat) : undefined
-    const personCommand = it.item?.kind !== 'message' || personMessage(it.item)
-    if (CONNECTOR && personCommand && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
-      && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, it.item, String(p.message_id))) {
+    if (CONNECTOR && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
+      && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, it.item, String(p.message_id), p.from)) {
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} is a command; the connector handled it itself`)
       return { code: 200, json: { delivered: true, handled_here: true } }

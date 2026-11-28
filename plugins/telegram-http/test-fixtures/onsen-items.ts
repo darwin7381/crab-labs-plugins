@@ -13,6 +13,7 @@ export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
   const members = new Map<string, MemberKind>([['adam', 'agent'], ['joey', 'human'], ['lab-b', 'agent'], ['tg-42', 'guest']])
+  const conversations = new Map<string, 'direct' | 'group' | 'channel'>()
   const contextAtTake = new Map<string, { context?: ContextMessage[]; context_omitted?: number }>()
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
   const issued = new Set<string>(), reports = new Set<string>()
@@ -59,6 +60,8 @@ export function fakeItems() {
     if (member && req.method === 'GET') return members.has(member) ? detail({ name: member, kind: members.get(member) }) : error(404, 'not_found')
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
     if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
+    const cid = /^\/v1\/conversations\/([^/]+)$/.exec(path)?.[1]
+    if (cid && req.method === 'GET') return conversations.has(cid) ? detail({ id: cid, kind: conversations.get(cid) }) : error(404, 'not_found')
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
     if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
     if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
@@ -138,7 +141,7 @@ export function fakeItems() {
     if (delayTake && path === base + '/take') await Bun.sleep(delayTake)
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, members, contextAtTake, calls, history, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, members, conversations, contextAtTake, calls, history, add, change, now: () => now,
     advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }
