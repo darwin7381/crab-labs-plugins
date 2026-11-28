@@ -21,11 +21,11 @@ function obs(ms: number, tool: string | null = null): Observation {
 }
 type Call = { body: Observation; timeoutMs: number; resolve: (a: PutAnswer) => void; reject: (e: unknown) => void }
 /** a sender with a stand-in put whose answers the test gives (auto: answer 200 at once); counts the requests in flight at once */
-function rig(o: { on?: () => boolean; auto?: PutAnswer | ((b: Observation) => PutAnswer) | null; heartbeatMs?: number; timeoutMs?: number; refresh?: (s: ObservationPut) => void } = {}) {
+function rig(o: { on?: () => boolean; auto?: PutAnswer | ((b: Observation) => PutAnswer) | null; heartbeatMs?: number; timeoutMs?: number; refresh?: (s: ObservationPut) => void; now?: () => number } = {}) {
   const calls: Call[] = [], exceptions: Array<Record<string, unknown>> = [], logs: string[] = []
   let inFlight = 0, maxInFlight = 0
   const ref: { s?: ObservationPut } = {}
-  const s = new ObservationPut({ agent: 'adam', on: o.on ?? (() => true),
+  const s = new ObservationPut({ agent: 'adam', on: o.on ?? (() => true), now: o.now,
     put: (body, timeoutMs) => new Promise<PutAnswer>((resolve, reject) => {
       inFlight++; maxInFlight = Math.max(maxInFlight, inFlight)
       let settled = false
@@ -89,11 +89,13 @@ describe('WO-180 the observation sender', () => {
   })
 
   test('a beat with no fresh record (the compute loop stopped, no refresh) sends nothing: the next update sends at once', async () => {
-    const r = rig({ auto: OK, heartbeatMs: 60 })
-    r.s.update(obs(T0))
+    let now = T0
+    const r = rig({ auto: OK, heartbeatMs: 60, now: () => now })
+    r.s.update(obs(now))
+    now += 200   // The record is already stale when the first real timer fires.
     await sleep(200)
     expect(r.calls).toHaveLength(1)                                           // the one held is 200 ms old: not reported as alive
-    r.s.update(obs(T0 + 200))                                                 // unchanged, but the beat is overdue
+    r.s.update(obs(now))                                                      // unchanged, but the beat is overdue
     expect(r.calls).toHaveLength(2)
     r.s.stop()
   })
