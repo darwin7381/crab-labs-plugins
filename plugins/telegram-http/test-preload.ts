@@ -5,7 +5,27 @@
 // - The key file is not read unless the test names its own key. All files run in one process and some delete TYPESAFE_KEY_FILE when they end, so it is set
 //   again before every test (hook children inherit it too).
 // - A fetch to the real TypeSafe host fails at once, whatever the env says (the code treats it as a failed call: the action goes through).
-import { beforeEach } from 'bun:test'
+import { afterAll, beforeEach } from 'bun:test'
+import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+// - Every run has its own temp folder, removed when the run ends (Hephaestus #200970, 11-28: the suite had left 194k folders, 28 GiB, in the Mac mini's
+//   user TMPDIR: tests mkdtempSync(join(tmpdir(), '<prefix>')) and many never remove them). tmpdir() in this process, and every child given process.env,
+//   lands in it. A run that was killed leaves its folder; the next run removes run folders untouched for 6 h.
+const TMP_ROOT = tmpdir(), RUN_PREFIX = 'tgh-run-'
+try {
+  for (const n of readdirSync(TMP_ROOT)) {
+    if (!n.startsWith(RUN_PREFIX)) continue
+    const p = join(TMP_ROOT, n)
+    try { if (Date.now() - statSync(p).mtimeMs > 6 * 3600_000) rmSync(p, { recursive: true, force: true }) } catch {}
+  }
+} catch {}
+const RUN_TMP = mkdtempSync(join(TMP_ROOT, RUN_PREFIX))
+process.env.TMPDIR = RUN_TMP
+// bun test runs a preload's afterAll once, after the last file (its process 'exit' handlers do not run); 'exit' stays for a plain `bun` run of a test
+const dropRunTmp = (): void => { try { rmSync(RUN_TMP, { recursive: true, force: true }) } catch {} }
+afterAll(dropRunTmp)
+process.on('exit', dropRunTmp)
 const guardKey = (): void => { if (!process.env.TYPESAFE_API_KEY && !process.env.TYPESAFE_KEY_FILE) process.env.TYPESAFE_KEY_FILE = '/nonexistent/typesafe.env' }
 guardKey()
 beforeEach(guardKey)
