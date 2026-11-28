@@ -9,7 +9,7 @@
 //   KID          leave a `sleep 30` behind in its process group and end (its pid in the log)
 // FAKE_CODEX_LIVE: a folder holding one file per running fake (the test counts them).
 import { spawn, spawnSync } from 'node:child_process'
-import { appendFileSync, fstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, fstatSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const argv = process.argv.slice(2)
@@ -43,6 +43,9 @@ console.log(JSON.stringify({ type: 'turn.started' }))
 const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082', 'hex')
 
 async function main(): Promise<void> {
+  if (live && /\bWAIT_FOR_RELEASE\b/.test(text)) {
+    while (!existsSync(join(live, '..', 'release-workers'))) await Bun.sleep(20)
+  }
   if (/\bHANGHARD\b/.test(text)) { process.on('SIGTERM', () => {}); await new Promise(() => setInterval(() => {}, 1000)) }
   if (/\bHANG\b/.test(text)) { process.on('SIGTERM', () => done(143)); await new Promise(() => setInterval(() => {}, 1000)) }
   if (/\bKID\b/.test(text)) { const k = spawn('sleep', ['30'], { stdio: 'ignore' }); k.unref(); log({ ev: 'kid', pid: process.pid, kid: k.pid }) }

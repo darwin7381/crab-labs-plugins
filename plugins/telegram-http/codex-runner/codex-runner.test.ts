@@ -416,9 +416,9 @@ describe('a Call', () => {
   })
 
   test('[5] five Calls at once with no thread, one caller: five sessions, three running, the rest queued (no PUT) until a slot frees; all done', async () => {
-    const { onsen, cfg, codexLog } = setup()
+    const { onsen, cfg, codexLog, dir } = setup()
     const callers = ['chiron', 'chiron', 'chiron', 'chiron', 'chiron']
-    callers.forEach((c, i) => { onsen.push({ sender: c, payload: { text: `SLEEP:0.6 avatar ${i}`, msg_id: 800 + i }, dedupe: `msg:${800 + i}`, call_id: `10${i}` }) })
+    callers.forEach((c, i) => { onsen.push({ sender: c, payload: { text: `WAIT_FOR_RELEASE avatar ${i}`, msg_id: 800 + i }, dedupe: `msg:${800 + i}`, call_id: `10${i}` }) })
     const r = runner(cfg)
     await r.start()
     await until(() => onsen.statesOf('100').includes('in_session') && onsen.statesOf('101').includes('in_session') && onsen.statesOf('102').includes('in_session'), 5_000, 'three running')
@@ -429,6 +429,8 @@ describe('a Call', () => {
     expect(onsen.items.rows.get('103')!.state).toBe('waiting')
     expect(onsen.items.rows.get('104')!.state).toBe('waiting')
     expect(mid.background!.tasks).toBe(3)
+    await until(() => codexLog().filter(x => x.ev === 'start').length === 3, 5_000, 'three worker processes')
+    writeFileSync(join(dir, 'release-workers'), '')
     await until(() => callers.every((_, i) => done(onsen, `10${i}`)()), 15_000, 'all five')
     expect(Math.max(...codexLog().filter(x => x.ev === 'start').map(x => x.live))).toBe(3)
     callers.forEach((_, i) => expect(onsen.statesOf(`10${i}`)).toEqual(['in_session', 'completed']))
