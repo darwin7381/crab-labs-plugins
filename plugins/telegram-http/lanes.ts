@@ -2352,8 +2352,7 @@ function settleBatch(): void {
  *  earliest of them has waited LANES_DEFER_MAX_WAIT_S, the main is woken once (one M1 item of its own) and the digest riding it lists every card waiting
  *  (「信箱有 N 件等你決定」). One batch at a time: while one is open no other is made. The clock is the cards' own placing time and the batch records, both in
  *  the state journal: a daemon restart keeps it. Run by the due sweep (dueTick). */
-export function batchTick(now = Date.now()): void { asWake({ kind: 'batch', rule: 'defer-batch', urgency: 'ordered' }, () => batchTickRun(now)) }   // WO-147
-function batchTickRun(now: number): void {
+export function batchTick(now = Date.now()): void {
   if (!batchWakeOn() || !events || !main || !S || !journal) return
   let open = false
   const batched = new Set<number>(), untold: Array<{ e: Row; w: Wait }> = []
@@ -2370,21 +2369,23 @@ function batchTickRun(now: number): void {
   if (!due.length) return
   const first = Math.min(...due.map(x => Date.parse(x.w.at)).filter(Number.isFinite))
   if (!Number.isFinite(first) || now < first + deferMaxWaitS() * 1000) return
-  const id = `batch-${now.toString(36)}-${shortId()}`
-  const cards = [...new Set(due.map(x => x.w.mail_id))]
-  const mins = Math.max(1, Math.round((now - first) / 60_000))
-  const text = batchWakeText(id, cards.length, new Date(first).toISOString(), mins)
-  events.open(id, { class: 'peer', owner: 'main', from: 'lanes', text: `信箱的一批：${cards.map(m => `#${m}`).join('、')}（最早一件 ${stamp(new Date(first).toISOString())} 放進來，${mins} 分鐘沒告訴主線）`,
-    obligations: [{ kind: 'main', level: 'handed', owner: 'main', handoff: id, woke: 'batch', card: true }],
-    fields: { batch: { cards, first_at: new Date(first).toISOString(), at: new Date(now).toISOString(), waited_s: Math.round((now - first) / 1000) } } })
-  const item = main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: text, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: BATCH_KIND, no_reply: 'true' } } },
-    { event: id, fields: { handoff: id } })
-  events.set(id, o => o.kind === 'main', { item })
-  ledger({ lane: 'router', event: id, kind: 'fyi', text: `信箱有 ${cards.length} 件等得起的事（${cards.map(m => `#${m}`).join('、')}）主線還沒看過，最早一件放進來 ${mins} 分鐘了：叫醒主線一次（一批；沒處理不推 Joey）。`,
-    refs: { batch: id, cards, waited_s: Math.round((now - first) / 1000) } })
-  appendJsonl('lanes.jsonl', { lane: 'main', kind: 'batch_wake', batch: id, cards, first_at: new Date(first).toISOString(), waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
-  { const hw = handWake(); journal.write('wake', id, hw.state, { reason: `cards that can wait (${cards.map(m => `#${m}`).join(', ')}) not told for ${mins} min: the batch wake: ${hw.tail}` }) }
-  logos('lane.batch_wake', { batch: id, cards, waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
+  asWake({ kind: 'batch', rule: 'defer-batch', urgency: 'ordered' }, () => {
+    const id = `batch-${now.toString(36)}-${shortId()}`
+    const cards = [...new Set(due.map(x => x.w.mail_id))]
+    const mins = Math.max(1, Math.round((now - first) / 60_000))
+    const text = batchWakeText(id, cards.length, new Date(first).toISOString(), mins)
+    events.open(id, { class: 'peer', owner: 'main', from: 'lanes', text: `信箱的一批：${cards.map(m => `#${m}`).join('、')}（最早一件 ${stamp(new Date(first).toISOString())} 放進來，${mins} 分鐘沒告訴主線）`,
+      obligations: [{ kind: 'main', level: 'handed', owner: 'main', handoff: id, woke: 'batch', card: true }],
+      fields: { batch: { cards, first_at: new Date(first).toISOString(), at: new Date(now).toISOString(), waited_s: Math.round((now - first) / 1000) } } })
+    const item = main.enqueue('carry', { method: 'notifications/claude/channel', params: { content: text, meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: BATCH_KIND, no_reply: 'true' } } },
+      { event: id, fields: { handoff: id } })
+    events.set(id, o => o.kind === 'main', { item })
+    ledger({ lane: 'router', event: id, kind: 'fyi', text: `信箱有 ${cards.length} 件等得起的事（${cards.map(m => `#${m}`).join('、')}）主線還沒看過，最早一件放進來 ${mins} 分鐘了：叫醒主線一次（一批；沒處理不推 Joey）。`,
+      refs: { batch: id, cards, waited_s: Math.round((now - first) / 1000) } })
+    appendJsonl('lanes.jsonl', { lane: 'main', kind: 'batch_wake', batch: id, cards, first_at: new Date(first).toISOString(), waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
+    { const hw = handWake(); journal.write('wake', id, hw.state, { reason: `cards that can wait (${cards.map(m => `#${m}`).join(', ')}) not told for ${mins} min: the batch wake: ${hw.tail}` }) }
+    logos('lane.batch_wake', { batch: id, cards, waited_s: Math.round((now - first) / 1000), main_phase: main.mainPhase() })
+  })
 }
 /** WO-137 甲: the batch wake's item (the list itself is the digest that rides it: 「信箱有 N 件等你決定」 and one line per card) */
 function batchWakeText(id: string, n: number, firstIso: string, mins: number): string {
