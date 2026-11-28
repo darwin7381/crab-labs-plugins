@@ -31,6 +31,7 @@ import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
 import { OnsenIds } from './onsen-connector.ts'
 import type { Step } from './lanes-boundary.ts'
+import { HISTORY_ID_HINT } from './onsen-tool.ts'
 import type { WakeItem } from './onsen-wake.ts'
 import type { TakeMode } from './onsen-take.ts'
 
@@ -108,6 +109,7 @@ export type DeliveryReportLine = { message_id: number
 export type CallRef = { kind: 'peer_call' | 'scheduled' | 'alert' | 'board'; id: string }
 export type CallWait = 'wall' | 'offline' | 'restart'
 export type CallCheck = { final: string } | 'open' | 'wait'
+type CallDetails = { state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string }
 export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
 /** one PUT /v1/calls/<id>/state, as spooled: the Call, the body Onsen takes (state, session_id, result, at), the event and an idem key (local only:
  *  what moment of which item this is) */
@@ -711,33 +713,39 @@ export class OnsenClient {
     const call = firstRunCall(r.json)
     return call ? { found: { id: String(call.id), state: call.state ?? null, result: call.result ?? null } } : { none: true }
   }
-  /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
-  async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string } | null> {
+  private async lookupCall(id: string, ms = 3_000): Promise<CallDetails | Extract<CallLineFate, { fate: 'refused' }> | null> {
     const r = await this.retried(`/v1/calls/${encodeURIComponent(id)}`, ms).catch(() => null)
-    if (!r || 'fate' in r) return null
+    if (!r) return null
+    if ('fate' in r) return r.fate === 'refused' ? r : null
     const c = r.json?.data ?? r.json
     return c && typeof c === 'object' ? { state: c.state ?? null, result: c.result ?? null,
       thread_id: c.thread_id, conversation_id: c.conversation_id, caller: c.caller } : null
   }
+  /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
+  async getCall(id: string, ms?: number): Promise<CallDetails | null> {
+    const call = await this.lookupCall(id, ms)
+    return call && 'state' in call ? call : null
+  }
   /** Validate a delayed delivery. The stable key also covers a restart between recording the line and closing M1's item. */
   async checkWaitingCall(id: string, why: CallWait, thread?: string): Promise<CallCheck> {
-    const call = await this.getCall(id)
-    if (!call?.state) return 'wait'
+    const call = await this.lookupCall(id)
+    if (!call) return 'wait'
+    if ('fate' in call) {
+      this.cfg.log('warn', `onsen: ending wait for Call ${id} after GET returned HTTP ${call.status}`)
+      return { final: `http_${call.status}` }
+    }
+    if (!call.state) return 'wait'
     if (!['failed', 'cancelled', 'completed', 'expired'].includes(call.state)) return 'open'
+    if (!thread) {
+      this.cfg.log('info', `onsen: waited Call ${id} is ${call.state}. No notice written because no local thread holds the asker.`)
+      return { final: call.state }
+    }
     const when = { wall: '上限解除時', offline: '主線恢復連線時', restart: '重新啟動時' }
     const text = `${when[why]}這件已經是 ${call.state}，沒有交給主線`
     const key = `waited-call:${id}:${call.state}`
-    if (thread) {
-      const at = new Date().toISOString()
-      return this.recordThreads([{ thread, event: 'item', at, dedupe: key,
-        item: { id: key, kind: 'notice', at, text } }]) ? { final: call.state } : 'wait'
-    }
-    if (!call.conversation_id) return 'wait'
-    const r = await this.request('POST', `/v1/conversations/${encodeURIComponent(call.conversation_id)}/messages`, {
-      type: 'system', body: { format: 'markdown', text }, to: call.caller ? [call.caller] : [],
-      thread_ids: call.thread_id ? [call.thread_id] : [], client_message_id: key,
-    })
-    return r && r.status >= 200 && r.status < 300 ? { final: call.state } : 'wait'
+    const at = new Date().toISOString()
+    return this.recordThreads([{ thread, event: 'item', at, dedupe: key,
+      item: { id: key, kind: 'notice', at, text } }]) ? { final: call.state } : 'wait'
   }
   /** a GET tried at CALL_RETRY_AT while Onsen does not answer or answers 5xx (408, 429), all within `ms`: the 2xx answer, or a fate */
   private async retried(path: string, ms: number): Promise<{ status: number; json: any } | CallLineFate> {
@@ -1352,16 +1360,33 @@ export class OnsenClient {
     const joey = this.cfg.joeyChat?.() ?? ''
     const chat = str(a.chat) ?? (joey || undefined)
     const id = str(a.id)?.trim()
+    const telegramId = id?.match(/^(?:tg:)?(\d+)$/i)?.[1]
+    if (telegramId && !chat) return '查這一則需要聊天編號，請把標籤上的 chat_id 填入 chat。'
     const cred = this.cfg.credential()
     let why = ''
     if (!cred) why = '這個 agent 沒有 mesh credential'
     else {
       try {
         if (id) {
-          const row = await this.fetchOne(id, chat, cred, via, tmo)
-          if (row?.__behind) return behindLine(row.__behind)                     // step 2: before Joey's restart line (and nothing after it quotes it)
-          if (row) return formatFull(row, joey)
-          return `Onsen 裡找不到 ${id}${chat ? `（chat ${chat}）` : ''}。`
+          // #N is the list's Onsen id; reply and page tags also use onsen:N and form-N.
+          const onsenId = id.replace(/^(?:#|onsen:|form-)(\d+)$/, '$1')
+          const r = telegramId && chat
+            ? await this.getTelegramMessage(telegramId, chat, cred, via, tmo)
+            : await this.get(`/messages/${encodeURIComponent(onsenId)}`, cred, via, tmo)
+          if (r?.status === 200 && r.json && typeof r.json === 'object') return formatFull(r.json.message ?? r.json, joey)
+          if (r && (r.status === 408 || r.status >= 500)) throw new Error(`HTTP ${r.status}`)
+
+          const ref = telegramId ? `${id}，chat ${chat}` : id
+          let reason: string
+          if (!r || r.status === 404) {
+            const line = r?.json?.detail?.restart_line
+            reason = line ? behindLine(line) : `找不到這一則（${ref}）。`
+          } else if (r.status === 403) {
+            reason = `這一則（${ref}）不在你看得到的對話裡。`
+          } else {
+            reason = `Onsen 回 HTTP ${r.status}，無法查這一則（${ref}）。`
+          }
+          return `${reason}\n${HISTORY_ID_HINT}。`
         }
         const p = new URLSearchParams({ agent: this.cfg.agent, limit: String(limit) })
         if (chat) p.set('chat', chat)
@@ -1378,53 +1403,46 @@ export class OnsenClient {
         }
         why = `Onsen 回 HTTP ${r.status}`
       } catch (e) {
-        why = e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`) ? `Onsen ${Math.round(tmo / 1000)} 秒內沒回應` : `Onsen 連不上（${errText(e).slice(0, 80)}）`
+        if (e instanceof Error && /timeout|abort/i.test(`${e.name} ${e.message}`)) {
+          why = id ? `Onsen 連不上（${tmo / 1000} 秒內沒回應）` : `Onsen ${Math.round(tmo / 1000)} 秒內沒回應`
+        } else {
+          why = `Onsen 連不上（${errText(e).slice(0, 80)}）`
+        }
       }
     }
-    return this.localHistory({ limit, since, until, q, id, chat, cut, inbound: o.inbound }, why, joey)
+    return this.localHistory({ limit, since, until, q, id, telegramId, chat, cut, inbound: o.inbound }, why, joey)
   }
   private async get(path: string, cred: string, via: 'tool' | 'hook' = 'tool', timeoutMs = this.cfg.queryTimeoutMs ?? 4000): Promise<{ status: number; json: any }> {
     const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, { 'X-Onsen-Via': via }), signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
-    try { json = await r.json() } catch {}
+    try { json = await r.json() } catch (e) {
+      if (r.ok && !(e instanceof SyntaxError)) throw e   // a successful lookup can still time out reading the body
+    }
     return { status: r.status, json }
   }
-  /** one message in full: an Onsen id; `tg:<n>` (the Telegram alias in `chat`); a bare number: the Onsen id first, then the alias.
-   *  step 2: `{ __behind: <the line's time> }` when Onsen answers 404 because the message is before Joey's restart line */
-  private async fetchOne(id: string, chat: string | undefined, cred: string, via: 'tool' | 'hook' = 'tool', tmo?: number): Promise<any | null> {
-    const tg = /^tg:(\d+)$/i.exec(id)
-    const behind = (r: { status: number; json: any }): string | null => r.status === 404 && r.json?.detail?.restart_line ? String(r.json.detail.restart_line) : null
-    let onsenBehind: string | null = null
-    if (!tg) {
-      const r = await this.get(`/messages/${encodeURIComponent(id)}`, cred, via, tmo)
-      if (r.status === 200 && r.json && typeof r.json === 'object') return r.json.message ?? r.json
-      if (r.status !== 404 && r.status !== 400) throw new Error(`HTTP ${r.status}`)
-      onsenBehind = behind(r)
-      if (!/^\d+$/.test(id)) return onsenBehind ? { __behind: onsenBehind } : null
-    }
-    if (!chat) return onsenBehind ? { __behind: onsenBehind } : null
-    const msgId = tg ? tg[1]! : id
-    const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${msgId}`, cred, via, tmo)
-    if (r.status === 404) { const b = behind(r) ?? onsenBehind; return b ? { __behind: b } : null }
-    if (r.status !== 200 || !r.json) throw new Error(`HTTP ${r.status}`)
-    const j = r.json.message ?? r.json
-    if (j && (j.body != null || Array.isArray(j.events))) return j
-    const oid = j?.id ?? j?.message_id
-    if (oid == null) return null
-    const full = await this.get(`/messages/${encodeURIComponent(String(oid))}`, cred, via, tmo)
-    if (behind(full)) return { __behind: behind(full) }
-    return full.status === 200 && full.json ? full.json.message ?? full.json : null
+  /** The scoped alias returns either the full message or its Onsen id. */
+  private async getTelegramMessage(id: string, chat: string, cred: string, via: 'tool' | 'hook', tmo: number) {
+    const r = await this.get(`/alias/telegram/${encodeURIComponent(this.cfg.agent)}/${encodeURIComponent(chat)}/${id}`, cred, via, tmo)
+    if (r.status !== 200) return r
+    const row = r.json?.message ?? r.json
+    if (row?.body != null || Array.isArray(row?.events)) return r
+    const onsenId = row?.id ?? row?.message_id
+    if (onsenId == null) return null
+    return this.get(`/messages/${encodeURIComponent(String(onsenId))}`, cred, via, tmo)
   }
 
   /** the local answer: this daemon's spool (and its previous generation), messages with their edits applied */
-  private localHistory(o: { limit: number; since?: string; until?: string; q?: string; id?: string; chat?: string; cut?: number; inbound?: Set<string> }, why: string, joey: string): string {
+  private localHistory(o: { limit: number; since?: string; until?: string; q?: string; id?: string; telegramId?: string; chat?: string; cut?: number; inbound?: Set<string> }, why: string, joey: string): string {
     const lines: SpoolLine[] = []
     for (const p of [this.spoolOld, this.spool]) {
       if (!existsSync(p)) continue
       try { for (const raw of readFileSync(p, 'utf8').split('\n')) { if (!raw) continue; try { lines.push(JSON.parse(raw)) } catch {} } } catch {}
     }
+    const records = o.id
+      ? lines.filter(l => (l.k === 'm' || l.k === 'e') && l.r.agent === this.cfg.agent && l.r.chat === o.chat)
+      : lines
     const msgs = new Map<string, any>()
-    for (const l of lines) {
+    for (const l of records) {
       if (l.k === 'm') {
         const m = l.r
         msgs.set(m.idem_key, { id: null, at: m.sent_at, direction: m.direction, sender: m.sender, kind: m.kind, body: m.body, client_msg_id: m.client_msg_id ?? null,
@@ -1433,7 +1451,7 @@ export class OnsenClient {
     }
     const byTg = new Map<string, any>()
     for (const m of msgs.values()) if (m.client_msg_id) byTg.set(`${m.chat}:${m.client_msg_id}`, m)
-    for (const l of lines) {
+    for (const l of records) {
       if (l.k !== 'e') continue
       const m = byTg.get(`${l.r.chat}:${l.r.target_client_msg_id}`)
       if (!m) continue
@@ -1451,8 +1469,7 @@ export class OnsenClient {
     }
     const after = (m: any): boolean => { const l = lineAt(m.chat); return l == null || Date.parse(m.at) > l }
     if (o.id) {
-      const tg = /^tg:(\d+)$/i.exec(o.id)?.[1] ?? (/^\d+$/.test(o.id) ? o.id : undefined)
-      const m = tg ? [...msgs.values()].find(x => x.client_msg_id === tg && (!o.chat || x.chat === o.chat)) : undefined
+      const m = o.telegramId && o.chat ? byTg.get(`${o.chat}:${o.telegramId}`) : undefined
       if (m && !after(m) && ![...msgs.values()].some(x => x.chat === m.chat && after(x) && x.reply_to_client_msg_id != null && x.reply_to_client_msg_id === m.client_msg_id))
         return `${head}\n${behindLine(new Date(lineAt(m.chat)!).toISOString())}`
       return m ? `${head}\n${formatFull(m, joey)}` : `${head}\n本機暫存裡找不到 ${o.id}。`

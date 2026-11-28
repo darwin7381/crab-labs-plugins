@@ -273,7 +273,26 @@ describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the l
     c.recordCall({ call_id: '353', kind: 'scheduled', event: 'e4', idem: 'k4', body: { state: 'completed', session_id: 'main', at: new Date().toISOString() } })
     expect((await c.callFate('k4')).fate).toBe('nocred')
     expect((await c.findRunCall('7')).fate).toBe('nocred')
+    expect(await c.checkWaitingCall('353', 'wall')).toBe('wait')
     expect(o.log).toEqual([])
+  })
+  test('getCall returns the Call for a receipt and null on a 404', async () => {
+    const data = { state: 'completed', result: { outcome: 'ok' }, thread_id: '9', conversation_id: '2', caller: 'scheduler' }
+    const o = onsen({ one: id => id === '350' ? { status: 200, json: { data } } : { status: 404 } }), c = client(o.f)
+    expect(await c.getCall('350')).toEqual(data)
+    expect(await c.getCall('351')).toBeNull()
+  })
+  test('a final Call with just its state closes a threadless wait', async () => {
+    const o = onsen({ one: () => ({ status: 200, json: { state: 'completed' } }) })
+    expect(await client(o.f).checkWaitingCall('350', 'offline')).toEqual({ final: 'completed' })
+    expect(o.log.map(r => `${r.m} ${r.path}`)).toEqual(['GET /v1/calls/350'])
+  })
+  test.each([408, 429, 503])('a delayed Call still waits on HTTP %i and opens when the GET recovers', async status => {
+    let recovered = false
+    const o = onsen({ one: () => recovered ? { status: 200, json: { state: 'running' } } : { status } }), c = client(o.f)
+    expect(await c.checkWaitingCall('350', 'restart')).toBe('wait')
+    recovered = true
+    expect(await c.checkWaitingCall('350', 'restart')).toBe('open')
   })
   test('a run\'s Call: found, none, a refused lookup, and Onsen not answering (tried again within the wait)', async () => {
     let list = (q: URLSearchParams) => ({ status: 200, json: { items: q.get('ref_value') === '7221' ? [{ id: 374, state: 'running', result: null }] : [], next_cursor: null } }) as any
