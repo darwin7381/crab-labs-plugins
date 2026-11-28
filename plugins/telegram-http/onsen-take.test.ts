@@ -62,6 +62,37 @@ async function mainRig() {
     owing(value: boolean) { owes = value } }
 }
 
+test('loopback list and detail match the captured 0.40.0 envelopes and add the S2 fields', async () => {
+  const captured = (file: string) => JSON.parse(readFileSync(join(import.meta.dir, 'test-fixtures', 'onsen-0.40.0', file + '.json'), 'utf8'))
+  const r = rig(), page = captured('list-completed'), empty = captured('list-waiting')
+  expect(captured('list-cancelled').items).toEqual(empty.items)
+  expect(page.items.filter((row: any) => row.session_id === 'main')).toHaveLength(34)
+  for (const kind of ['message', 'control', 'call']) {
+    const real = captured('detail-' + kind).data
+    const row = r.f.add(kind, kind, { message_id: real.message_id, call_id: real.call_id })
+    const result = (await r.client.request('GET', '/v1/items/' + row.id))!.json.data
+    expect(Object.keys(result).sort()).toEqual([...Object.keys(real), 'note', 'payload'].sort())
+    expect(Object.keys(result.events[0]).sort()).toEqual(Object.keys(real.events[0]).sort())
+    expect(result.takeable.now).toBe(true)
+  }
+  // No mail was captured. Settled 34 preserves the payload from the legacy mail push verbatim.
+  const payload = { text: 'station ready', line: 'mail', logged: true, msg_id: 81 }
+  const mail = r.f.add('mail', 'mail', { from: 'eve', mail_id: '81', payload })
+  r.f.mode(409)
+  const old = (await r.client.request('GET', '/inbox?after=0&limit=100'))!.json.items.find((it: any) => it.seq === mail.number)
+  expect(old.payload).toEqual(payload)
+  r.f.mode(200)
+  const list = (await r.client.request('GET', r.mode.path + '?connector=mac-mini/adam'))!.json
+  expect(Object.keys(list).sort()).toEqual([...Object.keys(empty), 'changed_after'].sort())
+  for (const row of list.items) expect(Object.keys(row).sort()).toEqual([...Object.keys(page.items[0]), 'note', 'payload'].sort())
+  const detail = (await r.client.request('GET', '/v1/items/mail'))!.json.data
+  const take = (await r.client.request('POST', r.mode.path + '/take', { connector: r.mode.connector, item_ids: ['mail'], limit: 1, wait: 0 },
+    3000, { 'Idempotency-Key': 'mail-contract' }))!.json.data.items[0]
+  for (const row of [list.items.find((it: any) => it.id === mail.id), detail, take])
+    expect(row).toMatchObject({ kind: 'mail', mail_id: '81', note: null, payload: old.payload })
+  expect(detail.events).toBeArray()
+})
+
 test('switch, prerequisites, stable machine/member and all probe refusals', async () => {
   const r = rig()
   expect(switchOn(undefined, 'adam')).toBe(false)

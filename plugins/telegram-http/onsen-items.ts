@@ -5,7 +5,7 @@ export type InboxItem = {
   state: string; reason: string | null; note?: string | null; released?: boolean; version: number; updated_at: string; not_before?: string | null
   deadline?: string | null; half_done?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
-  events?: Array<{ kind: string; note: string }>; payload: Record<string, any>
+  events?: Array<{ kind: string; note: string | null; at?: string; claim_id?: string | null; session_id?: string | null; state?: string; reason?: string | null }>; payload: Record<string, any>
   claim?: { id: string; connector: string; taken_at: string; expires_at: string; session_id: string | null } | null
 }
 
