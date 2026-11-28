@@ -611,6 +611,7 @@ test('a switched roamer starts with no bot token, registers commands and observe
   expect(h.connector.on).toBe(true)
   expect(h.polling).toBe(false)
   await waitFor(() => d.f.calls.some(c => c.body?.connector === 'mac-mini/' + member && c.path.endsWith('/observation')))
+  expect(d.f.calls.find(c => c.body?.connector && c.path.endsWith('/observation'))!.body.presence).toBe('offline')
   const names = d.f.calls.find(c => c.path === '/v1/members/' + member + '/commands')!.body.commands.map((c: any) => c.name)
   expect(names).toEqual(expect.arrayContaining(['roam', 'roam_status', 'resume_list', 'resume', 'resume_previous', 'restart', 'kill_stuck',
     'clear', 'agents', 'mcp', 'init', 'compact', 'model', 'effort', 'codexgate', 'sigint']))
@@ -718,7 +719,7 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
   client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') got.push(n.params) }
   await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { 'x-test-claude-pid': String(child.pid) } } }))
   clean.push(() => client.close())
-  return { child, sid, cwd, select, status, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
+  return { child, sid, cwd, transcript, select, status, client, got, accept: (msg: any) => write({ type: 'user', message: { content:
     `<channel source="telegram" chat_id="1" message_id="${msg.meta.message_id}" onsen_claims="${msg.meta.onsen_claims}">hello</channel>` } }),
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
@@ -749,8 +750,10 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   expect(b.got.map(n => n.content)).toEqual(['second'])
   const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'first received' } })
   expect(reply.isError).not.toBe(true)
+  const beforeBusy = d.f.calls.length
   b.status('busy')
-  await Bun.sleep(400)
+  await waitFor(() => d.f.calls.slice(beforeBusy).some(c => c.path.endsWith('/observation') && c.body.held_item_ids?.includes(two.id)
+    && c.body.sessions?.some((s: { activity: string }) => s.activity === 'running')))
   b.status('idle') // Short turn with registry evidence and no transcript turn_duration.
   await waitFor(() => two.state === 'completed', 9000)
   expect(two.response_message_ids).toEqual([])
@@ -768,6 +771,23 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   expect(d.f.history.filter(h => h.item_id === dying.id && h.body.outcome === 'cut')).toHaveLength(1)
   expect(a.got).toHaveLength(1)
 }, 45000)
+
+test('after a daemon restart a long turn still ends on its original target transcript', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.select()
+  const row = d.f.add('carry turn')
+  await waitFor(() => a.got.length === 1)
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  b.select()
+  appendFileSync(a.transcript, JSON.stringify({ type: 'assistant', message: { content: 'x'.repeat(2 << 20) } }) + '\n')
+  await d.restart()
+  a.stop()
+  await waitFor(() => row.state === 'completed', 9000)
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(row.session_id).toBe(a.sid)
+  expect(b.got).toHaveLength(0)
+}, 15000)
 
 test('changing target during take releases that attempt before writing either stream', async () => {
   const d = await daemon(roamerEnv, 200, roamerState)

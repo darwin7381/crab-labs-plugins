@@ -764,7 +764,7 @@ export class TurnWatch {
   /** WO-172: a colleague's items the open turn took in (their msg ids), for its bound */
   private peerIds: string[] = []
   constructor(readonly o: { dir: () => string | null; facts: DeliveryFacts; joey: JoeyOf; changed: () => void; tailBytes?: number; rescanMs?: number; now?: Now
-    session?: () => string | null; exact?: boolean; channel?: (attrs: Record<string, string>, turn: string) => void; turnEnded?: (t: TurnEnded) => void }) {
+    session?: () => string | null; exact?: boolean; resumeOffset?: number; channel?: (attrs: Record<string, string>, turn: string) => void; turnEnded?: (t: TurnEnded) => void }) {
     this.bornMs = this.now()
   }
   private now(): number { return (this.o.now ?? Date.now)() }
@@ -813,7 +813,7 @@ export class TurnWatch {
     this.emitFloor = this.now() - 10 * 60_000
     let size = 0
     try { size = statSync(f).size } catch {}
-    this.offset = Math.max(0, size - (this.o.tailBytes ?? 1 << 20))
+    this.offset = Math.max(0, Math.min(size, this.o.resumeOffset ?? size) - (this.o.tailBytes ?? 1 << 20))
     this.dropFirst = this.offset > 0
   }
   /** one transcript record; true = the turn state changed */

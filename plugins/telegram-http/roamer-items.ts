@@ -1,3 +1,4 @@
+import { statSync } from 'fs'
 import { dirname } from 'path'
 import type { ItemRef, ReceivingTarget } from './onsen-items.ts'
 import type { ItemReceiver } from './onsen-receive.ts'
@@ -35,6 +36,8 @@ export class RoamerItems {
     const dest = this.offerTo()
     if (!dest) return
     const { target, stream } = dest
+    // A long turn may outgrow TurnWatch's ordinary tail before the daemon restarts.
+    try { target.transcriptOffset = statSync(target.transcript).size } catch { target.transcriptOffset = 0 }
     const given = (await this.o.receiver.receive(refs.map(r => ({ ...r, target })))).given
     if (!given.size) return
     const held = refs.filter(r => given.has(r.onsen_item_id))
@@ -52,7 +55,7 @@ export class RoamerItems {
 
   tick(): void {
     const selected = this.o.selected()
-    const all = this.o.claims.targets()
+    const all = this.o.claims.targets().sort((a, b) => (a.transcriptOffset ?? Infinity) - (b.transcriptOffset ?? Infinity))
     if (selected) all.push(selected)
     const live = new Set<string>()
     const entries = this.o.registry.entries()
@@ -64,7 +67,7 @@ export class RoamerItems {
       live.add(sid)
       let watch = this.watches.get(sid)
       if (!watch) {
-        watch = new TurnWatch({ ...this.o.watch, dir: () => dirname(t.transcript), session: () => sid, exact: true,
+        watch = new TurnWatch({ ...this.o.watch, dir: () => dirname(t.transcript), session: () => sid, exact: true, resumeOffset: t.transcriptOffset,
           channel: (a, turn) => { if (a.onsen_claims) this.o.claims.accept(sid, a.onsen_claims.split(','), turn) },
           turnEnded: end => { this.o.claims.finalStop(sid, end.turn_id); this.o.watch.turnEnded?.({ ...end, session: sid }) } })
         this.watches.set(sid, watch)

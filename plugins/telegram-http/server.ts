@@ -362,7 +362,7 @@ if (ONSEN_TAKE_ON) {
           CONNECTOR = onsen.cfg.record = true
           if (connectorReady) { onsen.start(); startConnectorCommands(); startOnsenStatus(onsen) }
         }
-        if (active) { itemClaims!.start(); if (connectorReady) itemPeek!.reset() } else itemPeek!.stop()
+        if (active) { if (connectorReady) { itemClaims!.start(); itemPeek!.reset() } } else itemPeek!.stop()
         registryStatusChanged?.()
       }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, ROAMER ? () => itemPeek!.reset() : Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
@@ -4594,6 +4594,7 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
     const pollMs = Number(process.env.ONSEN_TRANSCRIPT_POLL_MS ?? 250)
     setInterval(() => { try { watch.tick() } catch (e) { log('warn', `onsen: transcript: ${e}`) } }, Number.isFinite(pollMs) && pollMs >= 50 ? pollMs : 250).unref()
   }
+  if (roamerItems) { roamerItems.tick(); itemClaims!.start() } // Read receipts from before a restart before expiring unbound offers.
   setTimeout(kick, 1_000).unref?.()
   onsenStep3Stop = () => { facts.flushLater(); status.stop(); obsPut.stop(); registry.stop(); formInbox?.stop(); screenStatus?.stop() }
   // WO-169 part 2: the observation beside the record it was composed with (the one handed out last; WO-180: the one obsPut sends to Onsen)
