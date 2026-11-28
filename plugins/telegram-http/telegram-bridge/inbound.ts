@@ -20,7 +20,7 @@ import { forwardFrom, inboundShape } from '../onsen-client.ts'
 import { mimeOf, telegramFile, TG_BOT_FILE_MAX } from '../onsen-files.ts'
 import { richToMarkdown } from '../rich-inbound.ts'
 import type { Agent } from './agent.ts'
-import { chatWrite, mentionedMembers, messageKey } from './groups.ts'
+import { chatWrite, isGroup, mentionedMembers, messageKey } from './groups.ts'
 import { errCode, errSaid, retryable, type Answer, type OnsenClient } from './onsen.ts'
 import type { StateStore } from './state.ts'
 import { approvals, dmCommandGate, doneApproval, gate, mayAct, pairingText, PAIRED_TEXT } from './tg-access.ts'
@@ -404,6 +404,10 @@ export class Poller {
       else text = ''
       const rt = m.reply_to_message && !m.reply_to_message.forum_topic_created ? m.reply_to_message : null
       const thread = m.message_thread_id != null && m.is_topic_message !== false ? String(m.message_thread_id) : null
+      const createdName = m.reply_to_message?.forum_topic_created?.name
+      const storedName = thread ? this.d.topicName?.(a.member, chat, thread) : null
+      const group = isGroup(m.chat)
+      const topicName = group ? storedName ?? createdName : createdName ?? storedName
       let att = shape.attachments?.[0] ?? null, attK = attKind(shape.kind)
       // a text (or rich) message with no file of its own that replies to one with a file: that file comes with it (server.ts replyAttachment; the
       // tag then says attachment_origin="reply")
@@ -417,7 +421,7 @@ export class Poller {
         client_user: { username: m.from.username ?? null, display_name: [m.from.first_name, m.from.last_name].filter(Boolean).join(' ') || null },
         chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), text,
         // WO-179 (Onsen 0.39.5): a group's own name, for display (the conversation's title); null in a DM
-        chat_title: (m.chat?.type === 'group' || m.chat?.type === 'supergroup') && typeof m.chat.title === 'string' && m.chat.title.trim() ? m.chat.title : null,
+        chat_title: group && typeof m.chat.title === 'string' && m.chat.title.trim() ? m.chat.title : null,
         kind: shape.kind, attachment_file_ids: [] as string[],
         attachments: att ? [{ kind: attK, name: att.name ?? null, mime: att.mime ?? mimeOf(att.name) ?? null, bytes: att.size ?? null, client_ref: att.file_id ?? null }] : [],
         reply_to_client_msg_id: rt ? String(rt.message_id) : null,
@@ -425,7 +429,7 @@ export class Poller {
         reply_to_text: rt ? ((t => t ? metaExcerpt(t) : null)(rt.text ?? rt.caption ?? (rt.rich_message ? richToMarkdown(rt.rich_message) || undefined : undefined) ?? mediaKindLabel(rt))) : null,
         reply_to_user: rt ? (rt.from ? displayName(rt.from) : rt.sender_chat ? (safeName(rt.sender_chat.title ?? rt.sender_chat.username) || String(rt.sender_chat.id)) : null) : null,
         client_thread: thread,
-        topic_name: thread ? (this.d.topicName?.(a.member, chat, thread) ?? m.reply_to_message?.forum_topic_created?.name ?? null) : null,
+        topic_name: thread ? topicName ?? null : null,
         forward_from: tagForwardFrom(m),                                   // the daemon tag's value (Chiron 15:40Z ruling, §7d)
         forward_date: fo?.date || m.forward_date ? new Date(Number(fo?.date ?? m.forward_date) * 1000).toISOString() : null,
         media_group_id: m.media_group_id ? String(m.media_group_id) : null,

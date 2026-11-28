@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { expandHiddenEntities } from '../entities.ts'
 import type { Agent } from './agent.ts'
 
-function isGroup(chat: { type?: string } | undefined): boolean {
+export function isGroup(chat: { type?: string } | undefined): boolean {
   return chat?.type === 'group' || chat?.type === 'supergroup'
 }
 

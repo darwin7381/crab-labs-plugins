@@ -4695,9 +4695,7 @@ async function deliverFormAnswer(it: Omit<OnsenVisible.FormItem, 'id'> & { id: s
     return false
   }
   const ref = `form-${it.id}`
-  const sender = refs?.find(r => r.kind === 'message')
-  const group = chat.startsWith('-'), account = group ? String(access.allowFrom[0] ?? '') : chat
-  const uid = sender && (group || Connector.ONSEN_CHAT.test(chat) || sender.from_kind === 'agent') ? sender.from : account
+  const uid = chat.startsWith('-') ? (refs?.find(r => r.kind === 'message')?.from ?? String(access.allowFrom[0] ?? '')) : chat
   const ts = it.at && Number.isFinite(Date.parse(it.at)) ? new Date(it.at).toISOString() : new Date().toISOString()
   // WO-159: a message Joey wrote in Onsen: his message as he typed it, with via="onsen" and nothing else added (Chiron: the only difference an agent sees)
   const meta: Record<string, string> = it.say ? { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts, via: 'onsen' }

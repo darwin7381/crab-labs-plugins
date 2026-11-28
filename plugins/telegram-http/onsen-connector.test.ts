@@ -147,13 +147,13 @@ test('the by-client-id lookup encodes both path segments and caches the returned
 
 test('a group reply keeps the shared conversation across Telegram and web', async () => {
   const f = fake({})
-  f.ids.know('-10042', 'group-a')
-  for (const chat of ['-10042', 'onsen:group-a']) {
+  f.ids.know('-10042', '42')
+  for (const chat of ['-10042', 'onsen:42']) {
     await f.say.say({ chat, sender: 'main', text: '@lab-b 看一下' })
   }
   const writes = f.calls.filter(c => c.m === 'POST')
   expect(writes.map(c => [c.p, c.b.conversation_id, c.b.to])).toEqual([
-    ['/v1/messages', 'group-a', undefined], ['/v1/messages', 'group-a', undefined],
+    ['/v1/messages', '42', undefined], ['/v1/messages', '42', undefined],
   ])
   expect(f.calls.some(c => c.p.includes('by-chat'))).toBe(false)
   await expect(f.say.say({ chat: '-10099', sender: 'main', text: '未知群' })).rejects.toThrow('no conversation')

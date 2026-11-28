@@ -212,6 +212,17 @@ test('the speaker draws its message once, only the receiving bot draws in_sessio
   expect(tg.sent).toHaveLength(2)
 })
 
+test('a DM uses the embedded Telegram topic name first and the stored name as fallback', async () => {
+  const chat = { id: from.id, type: 'private' }
+  onsen.identities.set(String(chat.id), 'tg-42')
+  bridge.two.noteTopic('lab-a', String(chat.id), '7', '先前的名稱')
+  const m = { chat, from, date, message_thread_id: 7, text: '私訊' }
+  tg.push(a, { message: { ...m, message_id: 50, reply_to_message: { forum_topic_created: { name: '建立時的名稱' } } } })
+  tg.push(a, { message: { ...m, message_id: 51 } })
+  await confirmed()
+  expect(onsen.messages.map(m => [m.client_msg_id, m.topic_name])).toEqual([['50', '建立時的名稱'], ['51', '建立時的名稱']])
+})
+
 test('one group topic serves both bots in feed order, including its inbound Telegram rename', async () => {
   const chat = String(supergroup.id), thread = 'thread-7'
   const open = { type: 'thread', member: 'lab-b', seq: 'open', chat, client_thread: null, thread, name: '原名', state: 'open' }

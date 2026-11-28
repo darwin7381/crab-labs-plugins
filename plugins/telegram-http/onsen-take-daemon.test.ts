@@ -203,19 +203,25 @@ test('an Onsen-only group command also requires the owner, while a direct chat k
   expect(d.f.calls.filter(c => c.path === '/v1/messages').map(c => c.body.conversation_id)).toEqual(['52'])
 })
 
-test('an agent’s web group message keeps its author and opaque ids, and reply writes back to that conversation', async () => {
-  const d = await daemon(), conversation = 'group-web', id = 'msg-a'
+test('a numeric Onsen chat keeps its original user metadata and replies to the conversation named by the Item', async () => {
+  const d = await daemon(), conversation = '42', id = 'msg-a'
   const row = d.f.add('web-group-item', 'message', { from: 'lab-b', message_id: id, payload: {
     from: 'lab-b', message_id: id, conversation_id: conversation, via: 'web', kind: 'text', text: '/status', client: null,
   } })
   const message = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === row.id)
   await waitFor(() => !!message())
-  expect(message().notif.params).toMatchObject({ content: '/status', meta: { chat_id: 'onsen:group-web', message_id: 'form-msg-a', user: 'lab-b' } })
-  expect(message().onsen_items[0].from_kind).toBe('agent')
+  expect(message().notif.params).toMatchObject({ content: '/status', meta: { chat_id: 'onsen:42', message_id: 'form-msg-a', user: 'onsen:42', user_id: 'onsen:42' } })
+  expect(message().onsen_items[0]).toMatchObject({ from: 'lab-b', from_kind: 'agent' })
   expect(d.f.calls.filter(c => c.path.endsWith('/take') || c.path === '/v1/messages')).toHaveLength(0)
   const client = new Client({ name: 'group-reply-test', version: '1' })
   clean.push(() => client.close())
   await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { Authorization: 'Bearer test-loopback' } } }))
+  const invalid = d.f.add('unlisted-web-chat', 'message', { from: 'lab-b', message_id: 'msg-b',
+    payload: { ...row.payload, conversation_id: 'group-web', message_id: 'msg-b' } })
+  await waitFor(() => d.log().includes('chat onsen:group-web, which is not allowlisted'))
+  expect(d.journal().some(r => r.onsen_items?.[0]?.onsen_item_id === invalid.id)).toBe(false)
+  const refused = await client.callTool({ name: 'reply', arguments: { chat_id: 'onsen:group-web', text: 'hello' } })
+  expect(refused.isError).toBe(true)
   const reply = await client.callTool({ name: 'reply', arguments: { chat_id: 'onsen:' + conversation, text: '@lab-b 好' } })
   expect(reply.isError).not.toBe(true)
   const writes = d.f.calls.filter(c => c.path === '/v1/messages')
