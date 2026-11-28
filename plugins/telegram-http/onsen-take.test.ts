@@ -125,6 +125,7 @@ test('C4 reuses the C5 pending Item line and durable id across client restart', 
   expect(lines().map(line => line.k)).toEqual(['item', 'item'])
   expect(lines()[1].r).toMatchObject({ id: row!.id, outcome: 'superseded' })
   expect(row).toMatchObject({ state: 'cancelled', reason: 'superseded' })
+  expect(restarted.writtenItemId(key)).toBeUndefined()
   expect(r.f.calls.filter(call => call.body.kind === 'resume')).toHaveLength(1)
 })
 
@@ -573,6 +574,7 @@ async function waitingModelCut() {
 
 test('settled 59: the next delivery carries the waiting line once and its normal Stop withdraws that exact resume', async () => {
   const r = await waitingModelCut()
+  const { key } = r.m.currentGen()!.resume_items[0]
   await r.bind(r.f.add('message'))
   const content = r.offers[0].params.content
   expect(content).toContain('message')
@@ -581,8 +583,10 @@ test('settled 59: the next delivery carries the waiting line once and its normal
   expect(r.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids?.includes(r.resume.id))).toBe(false)
   await r.hook('Stop', { phase: 'check' }); await r.sync()
   expect(r.resume.state).toBe('waiting')
+  expect(r.client.writtenItemId(key)).toBe(r.resume.id)
   await r.hook('Stop', { phase: 'final' }); await r.sync()
   expect(r.resume).toMatchObject({ state: 'cancelled', reason: 'withdrawn' })
+  expect(r.client.writtenItemId(key)).toBeUndefined()
   expect(r.f.calls.filter(c => c.path === '/v1/items/' + r.resume.id && c.body.outcome)).toMatchObject([{ body: { expected_version: 1, outcome: 'withdrawn' } }])
 })
 
