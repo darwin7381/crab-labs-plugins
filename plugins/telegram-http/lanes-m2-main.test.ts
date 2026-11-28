@@ -596,6 +596,35 @@ test('WO-215: an in-session /resume (reason resume, typed or the daemon\'s): the
   await killed({ ...g, sid: sid2 })
 })
 
+test('WO-215: /resume typed on the screen (the daemon switches nothing, holds nothing): main-hook.py hands SessionEnd\'s reason on, the gen stays, the chosen session is the main and gets Joey\'s next message', async () => {
+  await drained()
+  const g = await startMain()
+  const sid2 = randomUUID(), seen: any[] = []
+  const srv = Bun.serve({ port: 0, hostname: '127.0.0.1', async fetch(req) { const b = await req.json(); seen.push(b); return Response.json(await L.__mainEvent(b)) } })   // the daemon's /lanes/main-event
+  const HOOK = join(import.meta.dir, 'lanes-hooks', 'main-hook.py')
+  const run = async (p: object): Promise<string> => {                                      // Claude Code runs the hook with the event's JSON on stdin
+    const h = Bun.spawn(['python3', HOOK], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { PATH: process.env.PATH ?? '', TELEGRAM_HTTP_PORT: String(srv.port),
+      CLAUDE_PID: String(g.pid), MCP_TOKEN_DIR: dir, LANES_DIR: dir, TYPESAFE_KEY_FILE: '/nonexistent' } })
+    h.stdin.write(JSON.stringify({ cwd: dir, ...p })); h.stdin.end()
+    const out = await new Response(h.stdout).text(); await h.exited
+    return out
+  }
+  try {
+    await run({ hook_event_name: 'SessionEnd', session_id: g.sid, reason: 'resume' })    // Claude Code: "Session switched via interactive /resume"
+    expect(seen.at(-1)).toMatchObject({ event: 'SessionEnd', session_id: g.sid, pid: g.pid, reason: 'resume' })
+    expect(M().mainPhase()).not.toBe('gone')
+    await run({ hook_event_name: 'SessionStart', session_id: sid2, source: 'resume' })
+    expect(seen.at(-1)).toMatchObject({ event: 'SessionStart', session_id: sid2, pid: g.pid, source: 'resume' })
+    expect(M().mainSession()!.session_id).toBe(sid2)
+    expect(readFileSync(join(dir, 'main-expected'), 'utf8').trim()).toBe(sid2)
+    const id = await joey('畫面上切過去之後還收得到嗎？')
+    expect(state(id)).toBe('offered')                                                         // nothing was held: it goes to the chosen session at once
+    await run({ hook_event_name: 'SessionEnd', session_id: sid2, reason: 'prompt_input_exit' })   // /exit: the process ends: the gen ends, as before
+    expect(M().mainPhase()).toBe('gone')
+  } finally { srv.stop(true) }
+  await killed({ ...g, sid: sid2 })
+})
+
 test('RBU2: a turn ends at its last Stop. After a Stop the gen is idle with stopped_prompt; a later event of that prompt (another Stop hook blocked it) puts it back in_turn; a new prompt is a new turn, nothing interrupted', async () => {
   await drained()
   const g = await startMain()

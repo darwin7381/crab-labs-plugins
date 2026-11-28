@@ -1792,7 +1792,7 @@ export async function resumeSessionSwitch(sessionId: string, tmuxOverride?: stri
 }
 /** WO-215 (2): a switch the main did not take is not reported as done */
 export const resumeNotTaken = (target: string, now: string | null): string =>
-  `⚠️ the switch to \`${target.slice(0, 8)}\` did not take: the main is ${now ? `\`${now.slice(0, 8)}\`` : 'not registered'}. Nothing else changed; try \`/resume_list\` again.`
+  `⚠️ 沒切成 \`${target.slice(0, 8)}\`：主線現在是 ${now ? `\`${now.slice(0, 8)}\`` : '（還沒登記）'}。其他都沒動；用 /resume_list 再選一次。`
 
 // ---- /resume_previous chain (walk-back history) --------------------------
 //
