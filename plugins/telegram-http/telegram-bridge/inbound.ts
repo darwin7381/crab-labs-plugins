@@ -6,7 +6,7 @@
 //             nothing unwritten is ever confirmed: a restart gets it again.
 //   gate      that agent's own access.json (tg-access.ts): DM allowlist and pairing, group and sender allowlists.
 //   write     a person's message: its file fetched from Telegram (≤ 20 MB, onsen-files.ts telegramFile) and stored with POST /v1/files,
-//             then POST /v1/bridge/messages (§4c group key, bot-local DM key). Only when Onsen took it: 👀 (access.json ackReaction; unset = 👀, '' = none) and done. An edit:
+//             then POST /v1/bridge/messages (§4c group key, bot-local DM key). The first successful writer adds the configured 👀. An edit:
 //             POST /v1/bridge/messages/edit; a reaction: POST /v1/bridge/reactions. Writes go strictly in order, one at a time per bot.
 //   Onsen down a write Onsen does not take (no answer, 5xx, 429, 401, 404 no_endpoint) is tried again (2 s, 4 s, then every 5 s) and holds every
 //             later write of this bot. A person's message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 <agent>；
@@ -365,16 +365,17 @@ export class Poller {
     this.stats.written++
     if (what !== 'message') return
     const m = e.u.message, chat = String(m.chat.id)
-    if (ans.json?.data?.duplicate) this.a.stats.duplicates++; else this.a.stats.written++
+    const duplicate = ans.json?.data?.duplicate
+    if (duplicate) this.a.stats.duplicates++; else this.a.stats.written++
     this.a.pending.inbound({ chat, client_msg_id: String(m.message_id), sent_at: new Date((m.date ?? 0) * 1000).toISOString(), kind: e.cache.body?.kind ?? 'text' } as any)
-    // 👀: Onsen has it (the daemon's ackReaction; unset: 👀; '': none)
+    if (e.cache.sorry) this.d.log('info', `${this.a.member}: tg:${m.message_id} in chat ${chat} handed over after the Onsen-down sentence`)
+    if (duplicate || ans.status === 409) return
     const ack = this.a.access()?.ackReaction ?? '👀'
     if (ack) {
       const p = this.a.tg.call('setMessageReaction', { chat_id: chat, message_id: m.message_id, reaction: [{ type: 'emoji', emoji: ack }] })
       this.a.seen.ack(chat, m.message_id, p)
       void p.catch(err => this.d.log('warn', `${this.a.member}: ${ack} on tg:${m.message_id} failed: ${errText(err)}`))
     }
-    if (e.cache.sorry) this.d.log('info', `${this.a.member}: tg:${m.message_id} in chat ${chat} handed over after the Onsen-down sentence`)
   }
   private async maybeSorry(e: Entry): Promise<void> {
     const m = e.u.message

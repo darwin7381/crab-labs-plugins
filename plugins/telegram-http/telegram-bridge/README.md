@@ -46,13 +46,14 @@ The bridge registers as the extension `telegram-bridge-<machine>`, kind `bridge`
   2. A voice note carries the audio and its caption. Without a caption, `text` is the empty string. Onsen transcribes the audio on arrival.
   3. `POST /v1/bridge/messages`.
   4. `client_meta` carries the facts §7d's named fields don't, under the exact attribute names `server.ts` puts on the `<channel>` tag (the connector turns each key into that attribute): `reply_to_user_id`, `attachment_origin` (`reply`: the file is the replied-to message's, which comes with a text reply as the daemon's `replyAttachment` did), `forward_origin`, `forward_from_id`, `forward_from_username`, `forward_channel_message_id`, `image_error` (`download failed`: a photo not stored), `media_group_count` (album items wait 1.5 s after the newest one, as the daemon's album window did). It is sent only when non-empty. Onsen's limit is 4 KB. If Onsen answers 400 naming `client_meta` (before 0.35.4), the message goes again without it, and none is sent for 5 min.
-  5. Only when Onsen answers 2xx: 👀 (`access.json ackReaction`; unset gives 👀, `''` gives none), and the update is done.
+  5. The bot whose write first succeeds adds its configured `ackReaction` (👀 by default, disabled by `''`). A duplicate or a write conflict completes the Telegram update without adding a reaction.
 - **Order.** Writes go strictly in order, one at a time per bot.
 - **Edits and reactions.** An edit goes to `POST /v1/bridge/messages/edit`; the person's reaction to `POST /v1/bridge/reactions`. Onsen answering 404 (a message it never had) drops it.
 - **Onsen down** (no answer, 5xx, 429, 401, 404 `no_endpoint`):
   - The write is tried again after 2 s, 4 s, then every 5 s, and every later write of that bot waits behind it.
   - A message not written 15 s after it came gets one reply: 「Onsen 現在連不上，這一則還沒交給 \<agent\>；連上會自動補交，不用重傳。」 That happens once per message, remembered across restarts.
-  - When Onsen is back, each bot resumes writing in order and acknowledges success with 👀. DMs use `tg:<member>:<chat>:<message_id>`. Supergroups use `tg:<chat>:<message_id>`. Basic groups use `tg:<chat>:<from.id>:<date>:<hash>`. The hash is the first 16 hex digits of SHA-256 over the raw text or caption, including hidden link targets, rich blocks, file unique IDs, album ID, forward origin, location or contact when present.
+  - When Onsen is back, each bot resumes writing in order.
+- **Deduplication.** DMs use `tg:<member>:<chat>:<message_id>`. Supergroups use `tg:<chat>:<message_id>`. Basic groups use `tg:<chat>:<from.id>:<date>:<hash>`. The hash is the first 16 hex digits of SHA-256 over the raw text or caption, including hidden link targets, rich blocks, file unique IDs, album ID, forward origin, location or contact when present.
 - **Refused for good.**
   - 403 `not_allowed` (the account is an agent or a system member), or `unknown_identity` (before Onsen 0.35.1; a stranger in a group becomes a guest). The update is done, nothing is answered, and one log line is written.
   - 400. The update isn't tried again; in a DM, one reply says it wasn't handed over.

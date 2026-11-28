@@ -50,7 +50,7 @@ function memberUpdate(oldStatus: string, newStatus: string, user = 101) {
     new_chat_member: { status: newStatus, user: { id: user } } } }
 }
 
-test('two bots POST one unmentioned group line, confirm both aliases and each ack once', async () => {
+test('both bots confirm a supergroup line and only the first successful writer acknowledges it', async () => {
   const requests = spyOn(bridge.onsen, 'req')
   const message = { message_id: 5, from, chat: supergroup, date, text: '你好' }
   tg.push(a, { message })
@@ -58,15 +58,39 @@ test('two bots POST one unmentioned group line, confirm both aliases and each ac
   tg.push(b, { message })
   await confirmed()
   expect(onsen.messages).toHaveLength(1)
-  expect(onsen.messages[0]).toMatchObject({ member: 'lab-a', chat: '-100212', mentions: [], idem_key: 'tg:-100212:5' })
+  expect(onsen.messages[0]).toMatchObject({ member: 'lab-a', chat: '-100212', mentions: [], idem_key: 'tg:-100212:5',
+    aliases: [{ member: 'lab-a', chat: '-100212', client_msg_id: '5' }, { member: 'lab-b', chat: '-100212', client_msg_id: '5' }] })
   const posts = requests.mock.calls.map((call, i) => ({ call, i })).filter(({ call }) => call[1] === '/bridge/messages')
   expect(posts.map(({ call }) => [(call[2] as any).member, call[3]?.idem])).toEqual([['lab-a', 'tg:-100212:5'], ['lab-b', 'tg:-100212:5']])
   const result = await requests.mock.results[posts[1]!.i]!.value
   expect(result.json.data).toMatchObject({ duplicate: true, message_id: onsen.messages[0].id })
   expect(bridge.agents.get('lab-b')!.stats.duplicates).toBe(1)
   expect(logs.filter(l => /^(warn|error)/.test(l))).toEqual([])
-  for (const t of [a, b]) expect(tg.callsOf(t, 'setMessageReaction').map(r => r.reaction[0].emoji)).toEqual(['👀'])
+  expect(tg.callsOf(a, 'setMessageReaction')).toEqual([{ chat_id: '-100212', message_id: 5, reaction: [{ type: 'emoji', emoji: '👀' }] }])
+  expect(tg.callsOf(b, 'setMessageReaction')).toEqual([])
   expect(onsen.bad).toEqual([])
+})
+
+test('the first basic-group writer acknowledges its local number once across another bot and a replay', async () => {
+  const message = { chat: group, from, date, text: '你好' }
+  tg.push(b, { message: { ...message, message_id: 81 } })
+  await confirmed()
+  tg.push(a, { message: { ...message, message_id: 7 } })
+  tg.push(b, { message: { ...message, message_id: 81 } })
+  await confirmed()
+  expect(onsen.messages).toHaveLength(1)
+  expect(bridge.agents.get('lab-a')!.stats.duplicates).toBe(1)
+  expect(bridge.agents.get('lab-b')!.stats.duplicates).toBe(1)
+  expect(tg.callsOf(b, 'setMessageReaction')).toEqual([{ chat_id: '-23', message_id: 81, reaction: [{ type: 'emoji', emoji: '👀' }] }])
+  expect(tg.callsOf(a, 'setMessageReaction')).toEqual([])
+})
+
+test('an Onsen write conflict finishes the update and only the following fresh message gets an acknowledgment', async () => {
+  onsen.answers.push({ path: /POST .*\/bridge\/messages$/, status: 409, json: { error: { code: 'version_conflict' } } })
+  for (const id of [1, 2]) tg.push(a, { message: { chat: supergroup, from, date, text: 'line', message_id: id } })
+  await confirmed()
+  expect(onsen.messages.map(m => m.client_msg_id)).toEqual(['2'])
+  expect(tg.callsOf(a, 'setMessageReaction').map(r => [r.message_id, r.reaction[0]?.emoji])).toEqual([[2, '👀']])
 })
 
 test('basic group dedupes different bot-local ids by person, second and raw caption; the gate still checks the sender', async () => {
