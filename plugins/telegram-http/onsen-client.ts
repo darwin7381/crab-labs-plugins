@@ -30,6 +30,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { randomUUID } from 'crypto'
 import { basename, join } from 'path'
 import { OnsenIds } from './onsen-connector.ts'
+import type { Step } from './lanes-boundary.ts'
 import type { WakeItem } from './onsen-wake.ts'
 import type { TakeMode } from './onsen-take.ts'
 
@@ -89,7 +90,7 @@ export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEve
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
   /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
-  | { k: 'c'; r: CallStateLine }
+  | { k: 'c'; r: CallStateLine | ScheduledResultLine }
   | { k: 'ir'; r: ItemReport }
   | { k: 'blocked'; r: BlockedReceipt }
   /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
@@ -108,6 +109,9 @@ export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
  *  what moment of which item this is) */
 export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
+/** A take receipt supplements the Call. Only the Item reports the turn's progress. */
+export type ScheduledResultLine = { event: string; idem: string; call_id: string | null; run_id: string
+  body: { state?: never; result: { outcome: string; steps?: Step[]; body?: { format: 'markdown'; text: string } } } }
 /** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): what became of one spooled Call line. took: Onsen answered 2xx (its state then);
  *  refused: a 4xx (Onsen's sentence; the line is in rejected.jsonl); pending: no answer, or 5xx, within the wait (the line stays in the spool and
  *  goes when Onsen answers); nocred: this daemon has no mesh credential (a broken setup) */
@@ -126,6 +130,8 @@ export type RunCallLookup = { found: { id: string; state: string | null; result:
 /** btcc-receipt's budget (Chiron 05:55Z): the first try and three more, all within 10 s */
 export const CALL_RECEIPT_WAIT_MS = 10_000
 const CALL_RETRY_AT = [0, 1_000, 3_000, 7_000]
+const callsForRun = (run: string) => `/v1/calls?ref_kind=run&ref_value=${encodeURIComponent(run)}&limit=5`
+const firstRunCall = (json: any) => Array.isArray(json?.items) ? json.items.find((c: any) => c?.id != null) : undefined
 /** the batch route of each kind that is posted in runs (≤500 a batch) */
 const BATCH_PATH: Record<string, string> = { d: '/deliveries/batch', s: '/status/batch', w: '/wake/batch', t: '/threads/events' }
 
@@ -599,7 +605,7 @@ export class OnsenClient {
   }
   /** WO-175: one moment of a Call (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state when the spool reaches it. false = not spooled */
   recordBlocked(r: BlockedReceipt): boolean { return this.append({ k: 'blocked', r }) }
-  recordCall(c: CallStateLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
+  recordCall(c: CallStateLine | ScheduledResultLine): boolean { const ok = this.append({ k: 'c', r: c }); if (ok) this.stats.calls_spooled++; return ok }
   /** WO-175 (Chiron 05:55Z): wait for what Onsen says to Call line `idem` (spooled already): the spool is tried at once and three more times within
    *  `ms`, whatever its backoff, as btcc-receipt does. A line sent before keeps its fate; one still unsent after `ms` stays in the spool (pending) */
   callFate(idem: string, ms = CALL_RECEIPT_WAIT_MS): Promise<CallLineFate> {
@@ -633,10 +639,10 @@ export class OnsenClient {
   /** WO-175 (Chiron 05:55Z): run `run`'s Call in Onsen (this agent's own Calls), tried again while Onsen does not answer or answers 5xx, within `ms` */
   async findRunCall(run: string, ms = CALL_RECEIPT_WAIT_MS): Promise<RunCallLookup> {
     if (!this.cfg.credential()) return { fate: 'nocred', why: this.noCredText() }
-    const r = await this.retried(`/v1/calls?ref_kind=run&ref_value=${encodeURIComponent(run)}&limit=5`, ms)
+    const r = await this.retried(callsForRun(run), ms)
     if ('fate' in r) return r
-    const items = Array.isArray(r.json?.items) ? r.json.items.filter((c: any) => c && c.id != null) : []
-    return items.length ? { found: { id: String(items[0].id), state: items[0].state ?? null, result: items[0].result ?? null } } : { none: true }
+    const call = firstRunCall(r.json)
+    return call ? { found: { id: String(call.id), state: call.state ?? null, result: call.result ?? null } } : { none: true }
   }
   /** WO-175: one Call as Onsen has it now (GET /v1/calls/<id>), or null */
   async getCall(id: string, ms = 3_000): Promise<{ state: string | null; result: unknown; thread_id?: string; conversation_id?: string; caller?: string } | null> {
@@ -970,18 +976,30 @@ export class OnsenClient {
         this.ok(); i++; continue
       }
       if (t.line.k === 'c') {
-        // WO-175: one moment of a received Call (the id its pulled item carried)
-        const c = t.line.r, id = c.call_id
+        const c = t.line.r
+        let id = c.call_id ?? ''
+        if ('run_id' in c && !id) {
+          // Resolve inside the spool so an outage before the lookup cannot lose the receipt.
+          const path = callsForRun(c.run_id)
+          const lookup = await this.get(path, cred, 'hook').catch(e => ({ status: 0, json: { error: errText(e) } }))
+          if (lookup.status !== 200 && !refusedForGood(lookup)) return this.failStatus(lookup, path)
+          const call = lookup.status === 200 && firstRunCall(lookup.json)
+          if (!call) {
+            this.reject(t.line, `GET ${path}: ${lookup.status === 200 ? 'no Call for this scheduler run' : callSaid(lookup.json)}`)
+            this.writeCursor(t.end); this.ok(); i++; continue
+          }
+          id = String(call.id)
+        }
         const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, c.body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) {
           const st = r.json?.data?.state
-          if (st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++
+          if (c.body.state && st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++
           this.settleCall(c.idem, { fate: 'took', state: st ?? null })
         }
         // a step Onsen already has past (it took a reply, or a lane's exit row, first), a Call that is over, or (1.58.32) one this agent is not the
         // recipient of (403 not_authorized), a Call Onsen does not have (404): refused for good, not retried, nothing behind it held
         else if (refusedForGood(r)) {
-          this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state}: HTTP ${r.status} ${callSaid(r.json)}`,
+          this.reject(t.line, `PUT /v1/calls/${id}/state ${c.body.state ?? 'result'}: HTTP ${r.status} ${callSaid(r.json)}`,
             { kind: 'c', path: `/v1/calls/${id}/state`, status: r.status, code: errCode(r.json) })
           this.settleCall(c.idem, { fate: 'refused', status: r.status, said: callSaid(r.json) })
         }

@@ -225,6 +225,25 @@ describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the l
   const client = (f: typeof fetch, cred: string | null = CRED) => new OnsenClient({ dir: mkdtempSync(join(tmpdir(), 'onsen-calls-r-')), base: 'https://onsen.test/api/onsen',
     agent: 'lab-relay', record: true, credential: () => cred, log: () => {}, fetch: f, intervalMs: 3_600_000 })
   const said = { error: { code: 'invalid_transition', message: '呼叫已經是 failed，不能改成 completed' } }
+  test('a take result survives an unavailable run lookup and replays after restart without a progress write', async () => {
+    let available = false
+    const o = onsen({ list: () => available ? { status: 200, json: { items: [{ id: '350' }] } } : { status: 503 } })
+    const c = client(o.f)
+    const body = { result: { outcome: 'failed', steps: [{ step: 'Verify snapshot', done: false }],
+      body: { format: 'markdown' as const, text: 'No checksum.' } } }
+    expect(c.recordCall({ run_id: '762', call_id: null, event: 'schedule', idem: 'call:run:762:result', body })).toBe(true)
+    await c.syncNow(true)
+    expect(c.pendingBytes()).toBeGreaterThan(0)
+    expect(o.log.filter(r => r.m === 'PUT')).toHaveLength(0)
+
+    available = true
+    const restarted = new OnsenClient(c.cfg)
+    await restarted.syncNow(true)
+    await restarted.syncNow(true)
+    expect(o.log.filter(r => r.m === 'PUT').map(r => [r.path, r.body])).toEqual([['/v1/calls/350/state', body]])
+    expect(restarted.pendingBytes()).toBe(0)
+  })
+
   test('took: the PUT answered 2xx (Onsen\'s state); refused: a 4xx with Onsen\'s sentence; a fate is kept for a line asked about again', async () => {
     let put = (id: string, b: any) => ({ status: 200, json: { data: { id, state: b.state } } }) as { status: number; json: any }
     const o = onsen({ put: (id, b) => put(id, b) }), c = client(o.f)

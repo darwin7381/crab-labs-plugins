@@ -24,7 +24,7 @@ const client = new Client({ name: 'c1-test-lane', version: '1' }, { capabilities
 await client.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:' + process.env.LANES_HTTP_PORT + '/lane-mcp'),
   { requestInit: { headers: { Authorization: 'Bearer ' + process.env.LANE_RUN_TOKEN } } }))
 const call = prompt.includes('C2 scheduled receipt')
-  ? { name: 'receipt', arguments: { run_id: '762', outcome: 'nothing-to-do', summary: 'The scheduled check found no work.' } }
+  ? { name: 'receipt', arguments: JSON.parse(readFileSync('receipt-input.json', 'utf8')) }
   : prompt.includes('explicit handover')
   ? { name: 'handoff_main', arguments: { text: 'The owner needs the original alert and the pending decision.' } }
   : { name: 'notify_joey', arguments: { text: 'The fixture alert was handled.', outcome: 'normal' } }

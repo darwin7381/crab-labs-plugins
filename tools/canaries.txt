@@ -171,7 +171,7 @@ plugins/telegram-http/lanes-events.ts::else if (ob.state === 'handed' || (main &
 plugins/telegram-http/screen-status.ts::const workAt = since('main.work'
 plugins/telegram-http/lanes.ts::r.back ? { thinking_since: r.back }
 plugins/telegram-http/onsen-status.ts::export class CallFacts
-plugins/telegram-http/onsen-client.ts::recordCall(c: CallStateLine): boolean
+plugins/telegram-http/onsen-client.ts::recordCall(c: CallStateLine | ScheduledResultLine): boolean
 plugins/telegram-http/onsen-client.ts::if (t.line.k === 'c') {
 plugins/telegram-http/lanes.ts::export function callRefOf(ev: InEvent): CallRef | null
 plugins/telegram-http/lanes.ts::function callsEnded(laneId: string

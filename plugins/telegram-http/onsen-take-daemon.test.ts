@@ -501,7 +501,13 @@ for (const take of [false, true]) test('C2 inbox scheduler start receipt on ' + 
   expect(acks()).toHaveLength(take ? 0 : 1)
 })
 
-for (const callState of ['0', '1']) test('C2 schedule uses only its Item with legacy Call state ' + callState, async () => {
+for (const [callState, outcome, namedCall] of [
+  ['0', 'failed', true], ['1', 'failed', false], ['1', 'nothing-to-do', true],
+] as const) test(`C2 scheduled receipt ${outcome} supplements the Call, legacy progress ${callState}, named Call ${namedCall}`, async () => {
+  const callId = '8602', runId = '762'
+  const summary = outcome === 'failed' ? 'The snapshot could not be verified.' : 'There was no new snapshot.'
+  const steps = [{ step: 'Read the schedule', done: true }, { step: 'Verify the snapshot', done: outcome !== 'failed', note: summary }]
+  const result = { outcome: outcome === 'nothing-to-do' ? 'nothing_to_do' : outcome, steps, body: { format: 'markdown', text: summary } }
   const relays: string[] = []
   const inbox = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
     await req.text()
@@ -509,7 +515,8 @@ for (const callState of ['0', '1']) test('C2 schedule uses only its Item with le
     return Response.json({ id: 762 })
   } })
   clean.push(() => inbox.stop(true))
-  const d = await daemon({ LANES_INBOX_PORT: String(inbox.port), ONSEN_CALL_STATE: callState, LANES_RECEIPT_STEPS: '0' }, 200, root => {
+  const d = await daemon({ LANES_INBOX_PORT: String(inbox.port), ONSEN_CALL_STATE: callState, LANES_RECEIPT_STEPS: '1' }, 200, root => {
+    writeFileSync(join(root, 'receipt-input.json'), JSON.stringify({ ...(namedCall ? { run_id: runId } : {}), outcome, steps, summary }))
     const dir = join(root, 'tg/lanes')
     mkdirSync(dir, { recursive: true })
     const obligation = { id: 'receipt-previous', kind: 'receipt', level: 'run', run_id: '760', state: 'handed' }
@@ -519,16 +526,23 @@ for (const callState of ['0', '1']) test('C2 schedule uses only its Item with le
     ].map(e => JSON.stringify(e)).join('\n') + '\n')
     return scriptedLane(root)
   })
-  const schedule = d.f.add('schedule', 'schedule', { from: 'scheduler', call_id: '762', refs: [{ kind: 'run', value: '762' }],
+  d.f.scheduleCalls.set(callId, { id: callId, run: runId, result: null })
+  const schedule = d.f.add('schedule', 'schedule', { from: 'scheduler', call_id: namedCall ? callId : null, refs: [{ kind: 'run', value: runId }],
     payload: { text: '[scheduled][check][run:762] C2 scheduled receipt', line: 'call', run_id: '762', frequency: 'high' } })
   await waitFor(() => d.f.history.some(h => h.item_id === schedule.id && h.body.outcome === 'in_session'))
   writeFileSync(join(d.root, 'release-lane'), '')
   await waitFor(() => schedule.state === 'completed')
-  expect(readFileSync(join(d.root, 'scheduler-receipt'), 'utf8')).toContain("Onsen reports run 762's progress from its Item")
-  expect(d.f.history.filter(h => h.item_id === schedule.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(readFileSync(join(d.root, 'scheduler-receipt'), 'utf8')).toContain('Call result queued')
+  expect(d.f.scheduleCalls.get(callId)!.result).toEqual(result)
+  const reports = d.f.history.filter(h => h.item_id === schedule.id)
+  expect(reports.map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+  expect(reports[1]!.body).not.toHaveProperty('note')
+  expect(schedule.failures).toBe(0)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(schedule.id))).toHaveLength(1)
   expect(relays).not.toContain('/lanes/scheduler-taken')
   expect(relays).not.toContain('/lanes/scheduler')
-  expect(d.f.calls.filter(c => c.path.startsWith('/v1/calls'))).toEqual([])
+  expect(d.f.calls.filter(c => c.path === '/v1/calls').map(c => c.query.get('ref_value'))).toEqual(namedCall ? [] : [runId])
+  expect(d.f.calls.filter(c => c.path.endsWith('/state')).map(c => [c.path, c.body])).toEqual([[`/v1/calls/${callId}/state`, { result }]])
   const events = d.journal().filter(r => r.rec === 'event')
   expect(events.filter(r => r.id === 'previous-pull')).toHaveLength(1)
   expect(events.filter(r => r.id === 'c1-take').at(-1).obligations[0].state).toBe('waived')

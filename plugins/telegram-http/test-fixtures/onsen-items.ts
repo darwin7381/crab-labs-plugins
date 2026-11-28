@@ -11,6 +11,7 @@ const iso = (ms: number) => new Date(ms).toISOString()
 export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
+  const scheduleCalls = new Map<string, { id: string; run: string; result: unknown }>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
@@ -54,6 +55,16 @@ export function fakeItems() {
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
+    if (path === '/v1/calls' && req.method === 'GET' && q.get('ref_kind') === 'run')
+      return Response.json({ items: [...scheduleCalls.values()].filter(c => c.run === q.get('ref_value')) })
+    const callId = /^\/v1\/calls\/([^/]+)\/state$/.exec(path)?.[1]
+    if (callId && req.method === 'PUT') {
+      const call = scheduleCalls.get(callId)
+      if (!call) return error(404, 'not_found')
+      if (Object.keys(b).length !== 1 || !b.result) return error(400, 'invalid_request')
+      call.result = b.result
+      return detail(call)
+    }
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
     if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
@@ -153,7 +164,7 @@ export function fakeItems() {
     if (delayTake && path === base + '/take') await Bun.sleep(delayTake)
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, now: () => now,
     advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }

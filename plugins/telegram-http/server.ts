@@ -4166,6 +4166,7 @@ if (Lanes.LANES_ON) {
       rearm: () => rearmStartupPicker(process.env.CHANNEL_BOT_TMUX_SESSION!),
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
+    recordScheduleResult: line => onsen?.recordCall(line) ?? false,
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
     blocked: (item, retryAfter) => {
       if (takeMode?.active) return

@@ -25,7 +25,7 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
-import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
+import type { CallCheck, CallRef, CallWait, ScheduledResultLine } from './onsen-client.ts'
 import { createEvents, matterKey, owed, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
@@ -231,6 +231,7 @@ export interface LanesDeps {
    *  probe_retry) */
   usageWall?: (wallSinceMs: number) => (MainWall & { by?: string | null }) | null
   checkWaitingCall?: (id: string, why: CallWait, thread?: string) => Promise<CallCheck>
+  recordScheduleResult?: (line: ScheduledResultLine) => boolean
   blocked?: (item: Row, retryAfter: string | null) => void
   /** WO-181 (server.ts onsen-mentions.ts MentionCards): the block of this agent's unread mentions for a delivery to the main (resolves null: none, no answer);
    *  null at once: switched off */
@@ -6853,11 +6854,12 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       return 'handed to the main: it gets your text, takes over and reports to Joey. Do not notify Joey about this yourself; close with receipt.' + told
     }
     case 'receipt': {
-      const runIdArg = String(a.run_id ?? '').replace(/\D/g, '')
+      const scheduledRun = itemReceiver?.mode.active && schedRun(tok) ? queue.get(tok.evId)?.ev.meta?.run_id : undefined
+      const runIdArg = String(a.run_id ?? scheduledRun ?? '').replace(/\D/g, '')
       const outcome = String(a.outcome ?? 'done')
       // WO-125 (C, B): checked before anything is recorded; a refused receipt records nothing. C: a step marked not done and a success outcome, in a
       // run that handed nothing to the main. B: a scheduled run's receipt filed as a success while a refused write or command still counts.
-      const parsed = receiptStepsOn() ? parseSteps(a.steps) : null
+      const parsed = receiptStepsOn() || (itemReceiver?.mode.active && runIdArg) ? parseSteps(a.steps) : null
       if (parsed && !Array.isArray(parsed)) return `沒有記錄：${parsed.why}`
       // WO-132 (item 6): this run's notify_joey was dropped by the de-duplication (Joey has that line): a report step marked not done is done, as recorded
       const steps = parsed && tok.notifyDeduped ? dedupedSteps(parsed).steps : parsed
@@ -6915,7 +6917,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
       if (!runIdArg) return `receipt recorded${chainNote}. ${events.openText(tok.evId)}${held}`
       // receipt note (btcc-ack-auth): the scheduler gets the receipt's one line as the ledger keeps it (its summary, else what happened) in BTCC's field `note`
       if (left) { await completeRun(tok, runIdArg, outcome, note, 'receipt'); return `receipt recorded; ${leftForMainText(runIdArg)}${chainNote}${held}` }   // 1.38.2: logged there, not sent
-      return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, note, 'receipt')).text}${chainNote}${held}`
+      return `receipt recorded; scheduler: ${(await completeRun(tok, runIdArg, outcome, note, 'receipt', steps)).text}${chainNote}${held}`
     }
     case 'ledger_query': return ledgerQueryTool(a)          // 002k (B20): read only
     case 'append_file': {                                                // WO-123
@@ -7552,11 +7554,20 @@ function receiptNotRecorded(why: string, fate: 'refused' | 'pending' | 'nocred' 
   if (fate === 'nocred') return `${why}: this daemon cannot reach Onsen (a broken setup); not sent to BTCC`
   return fate === 'refused' ? `${why}; not sent to BTCC` : why
 }
-export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt'): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
-  if (itemReceiver?.mode.active) return { ok: true, text: `Onsen reports run ${runId}'s progress from its Item at session entry and turn end.` }
+export async function completeRun(tok: RunTok, runId: string, outcome: string, note: unknown, via: 'receipt' | 'btcc-receipt', steps?: Step[] | null): Promise<{ ok: boolean; text: string; leftForMain?: boolean }> {
   if (receiptLeftForMain(runId)) {                                       // 1.38.2: the main's to complete (receiptLeftForMain)
     logos('lane.receipt_left_for_main', { lane: tok.lane, run: tok.runId, run_id: runId, via, outcome })
     return { ok: false, leftForMain: true, text: leftForMainText(runId) }
+  }
+  if (itemReceiver?.mode.active) {
+    const event = runEvents(queue.get(tok.evId)).find(ev => ev.item_kind === 'scheduled' && String(ev.meta?.run_id) === runId)
+    const text = stripMarkup((via === 'receipt' && tok.receipt?.text) || String(note ?? ''))
+    const normalized = btccOutcome(outcome)
+    const result = { outcome: normalized === 'nothing-to-do' ? 'nothing_to_do' : normalized,
+      ...(steps ? { steps } : {}), ...(text ? { body: { format: 'markdown' as const, text: text.slice(0, 4000) } } : {}) }
+    const ok = D.recordScheduleResult?.({ event: event?.id ?? tok.evId, call_id: event?.call_id ?? null, run_id: runId,
+      idem: `call:run:${runId}:result`, body: { result } }) ?? false
+    return { ok, text: ok ? `Call result queued for scheduler run ${runId}.` : `Could not queue the Call result for scheduler run ${runId}.` }
   }
   // 1.41.1 (Metis mail #11280): the scheduler takes ok | nothing-to-do | failed; the receipt's `done` went as it was and BTCC answered 422
   // receipt note (btcc-ack-auth): the line goes as `note`, the field BTCC reads (it was sent as `summary`, which BTCC never read: the result sentence was dropped)
