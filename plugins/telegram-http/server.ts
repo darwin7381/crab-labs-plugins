@@ -4171,6 +4171,7 @@ if (Lanes.LANES_ON) {
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
     blocked: (item, retryAfter) => {
+      if (takeMode?.active) return
       const meta = item.notif?.params?.meta ?? {}
       const ids = item.person_message_ids as string[] | undefined
       if (ids?.length) {
@@ -4386,7 +4387,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
   // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
   const calls = CALL_STATE ? new OnsenStatus.CallFacts({ sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)
-  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f),
+  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => { if (!takeMode?.active) onsen.recordDelivery(f) },
     changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
   // ONSEN_STATUS_HEARTBEAT_S (15 s; 0 = none), each carrying detail.heartbeat_s
@@ -4566,6 +4567,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     /** WO-169: a wake row's member_state is the status record at that moment (the one decideWake read), else the one last handed out */
     const recordNow = (): OnsenStatus.StatusView | null => { try { return currentStatus() } catch { return lastView } }
     Lanes.observeRoutes((row, ctx) => {
+      if (takeMode?.active) return
       const now = Date.now(), at = new Date(now).toISOString(), n = ++seq
       const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
       queueMicrotask(() => {
@@ -4578,6 +4580,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // 1.49.1 (Chiron, WO-147 09:56Z): the hand-over decisions (handoff_main, a decision card, the deferred cards' batch, a lane run's end): one row per
     // event-keyed wake line of the state journal (onsen-wake.ts handItem; at = the line's ts)
     Lanes.observeWakes((line, ctx) => {
+      if (takeMode?.active) return
       const now = Date.now(), n = ++seq
       const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
       queueMicrotask(() => {

@@ -3,6 +3,9 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { osProcStart } from './onsen-status.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -412,6 +415,53 @@ function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',
     kind: 'command', text, client: { chat: '1', msg_id: tgId, user: 'joey', user_id: '1' } } })
 }
+
+async function daemonPost(base: string, path: string, body: object) {
+  const response = await fetch(base + path, { method: 'POST',
+    headers: { authorization: 'Bearer test-loopback', 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  expect(response.status).toBe(200)
+  return response.json() as Promise<any>
+}
+
+for (const take of [false, true]) test('C2 message, wall and wake reports on ' + (take ? 'take' : 'pull'), async () => {
+  const sid = randomUUID()
+  const d = await daemon({ ONSEN_WAKE_LOG: 'adam', ONSEN_PEER_LOOKUP: '0' }, take ? 200 : 409, root => {
+    const sessions = join(root, 'home/.claude/sessions')
+    mkdirSync(sessions, { recursive: true })
+    writeFileSync(join(sessions, process.pid + '.json'), JSON.stringify({ sessionId: sid, pid: process.pid, cwd: root,
+      kind: 'interactive', entrypoint: 'cli', status: 'busy', procStart: osProcStart(process.pid) ?? '', startedAt: Date.now(), statusUpdatedAt: Date.now() }))
+    writeFileSync(join(root, '.lanes/main-expected'), sid)
+    return {}
+  })
+  const client = new Client({ name: 'c2-main', version: '1' })
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp')))
+  clean.push(() => client.close())
+  const hook = (event: string, extra = {}) => daemonPost(d.base, '/lanes/main-event',
+    { event, session_id: sid, pid: process.pid, prompt_id: 'c2-turn', ...extra })
+  expect((await hook('SessionStart', { source: 'startup' })).accepted).toBe(true)
+  await hook('UserPromptSubmit')
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.presence === 'online'))
+  const row = d.f.add('wall-message', 'message')
+  if (!take) await daemonPost(d.base, '/onsen/person', { kind: 'person_message', seq: row.number, payload: row.payload })
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.kind === 'joey'))
+  await hook('PostToolUse', { tool_name: 'Read' })
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.state === 'bound' && r.prompt_id === 'c2-turn'))
+  await hook('StopFailure', { error: 'rate_limit' })
+
+  const blocked = '/v1/messages/' + row.message_id + '/receipt'
+  const retired = ['/deliveries/batch', '/wake/batch', blocked]
+  if (take) {
+    await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'usage_limit'))
+    expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'usage_limit'])
+    expect(d.f.calls.filter(c => retired.includes(c.path))).toEqual([])
+    const spool = readFileSync(join(d.state, 'onsen/spool.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l).k)
+    expect(spool.filter(k => ['d', 'w', 'blocked'].includes(k))).toEqual([])
+  } else {
+    await waitFor(() => retired.every(path => d.f.calls.some(c => c.path === path)))
+    expect(d.f.calls.find(c => c.path === blocked)!.body.handling).toMatchObject({ state: 'blocked', blocked_by: 'usage_limit' })
+    expect(d.f.history).toEqual([])
+  }
+}, 12000)
 
 test('closing a queued mail lane releases the same waiting version to the next peek without a claim or handoff', async () => {
   const d = await daemon({ LANES_MAX: '1' }, 200, scriptedLane)
