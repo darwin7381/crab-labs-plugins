@@ -139,7 +139,7 @@ export function carried(s: Settings, d: { found: Map<string, Found> }): Map<stri
   for (const [m, dir] of s.dirs) if (want(m)) {
     const installed = [...d.found.values()].find(f => f.stateDir === dir && f.roamerPort !== undefined)
     if (installed && installed.member !== m) continue
-    out.set(m, { ...installed, member: m, stateDir: dir, source: 'ONSEN_BRIDGE_STATE_DIRS' })
+    out.set(m, { ...d.found.get(m), member: m, stateDir: dir, source: 'ONSEN_BRIDGE_STATE_DIRS' })
   }
   for (const [m, f] of d.found) if (want(m) && !out.has(m)) out.set(m, f)
   return [...out.keys()].sort().reduce((acc, k) => acc.set(k, out.get(k)!), new Map<string, Found>())

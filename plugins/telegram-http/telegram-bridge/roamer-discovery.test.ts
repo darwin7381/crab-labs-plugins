@@ -25,6 +25,9 @@ test('wildcard discovery follows each roamer daemon; an explicit state-dir map p
     const x = want.get('space-roamers')!, y = want.get('time-travelers')!
     expect(await bridgeOwnsBot(x, false)).toBe(true)
     expect(await bridgeOwnsBot(y, true)).toBe(false)
+    const overrides = carried({ list: '*', dirs: new Map([[y.member, join(home, 'other-dir')], ['other-name', y.stateDir]]), errors: [] }, found)
+    expect(await bridgeOwnsBot(overrides.get(y.member)!, false)).toBe(false)
+    expect(overrides.has('other-name')).toBe(false)
     const bot = startBotApiMock({}, { pollHoldMs: 100 })
     const token = spyOn(agents, 'readToken').mockReturnValue({ token: bot.token, mtime: 1 })
     const bridge = new Bridge(configFromEnv({ HOME: home, TELEGRAM_BRIDGE_MACHINE: 'lab', TELEGRAM_BRIDGE_PLATFORM: 'linux',
