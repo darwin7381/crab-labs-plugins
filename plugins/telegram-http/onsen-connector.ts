@@ -109,7 +109,7 @@ export class OnsenIds {
     if (direct) return direct[1]!
     if (!s) return null
     const cid = await this.conversation(chat)
-    const key = `${cid}:${s}`, had = this.msg.get(key)
+    const key = this.messageKey(chat, s), had = this.msg.get(key)
     if (had && this.fresh(had)) return had.id
     const path = `/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`
     const r = await this.o.request('GET', path, undefined, TRY_MS)
@@ -135,10 +135,11 @@ export class OnsenIds {
     this.learnThread(cid, clientThread, String(it.thread))
     return String(it.thread)
   }
-  /** the numbers a message became on its client are known (the bridge's report): each stands for it */
-  learn(cid: string, nums: string[], id: string): void {
+  /** Each connector serves one bot. Distinct Telegram chats can resolve to the same Onsen conversation after migration. */
+  private messageKey(chat: string, n: string): string { return JSON.stringify([chat, n]) }
+  learn(chat: string, nums: string[], id: string): void {
     const at = (this.o.now ?? Date.now)()
-    for (const n of nums) this.msg.set(`${cid}:${n}`, { id, at })
+    for (const n of nums) this.msg.set(this.messageKey(chat, n), { id, at })
   }
   get size(): { conversations: number; messages: number } { return { conversations: this.conv.size, messages: this.msg.size } }
 }
@@ -194,19 +195,20 @@ export class ConnectorSay {
     if (to && conv) this.o.ids.know(a.chat, conv)                        // the owner's conversation, for what follows
     if (d.duplicate) this.stats.duplicates++; else this.stats.written++
     if (d.delivery === 'sent') { this.stats.direct++; return { onsenId: id, conversationId: conv, ids: [], held: false } }   // nothing draws it
-    return this.waitReport(id, conv)
+    return this.waitReport(id, conv, a.chat)
   }
 
   /** the bridge's report: GET /messages/<id> until delivery leaves pending (WAIT_MS at most) */
-  async waitReport(id: string, conv: string): Promise<Said> {
+  async waitReport(id: string, conv: string, chat: string): Promise<Said> {
     const end = Date.now() + (this.o.waitMs ?? WAIT_MS)
     let last = 'pending'
     while (true) {
       const r = await this.o.request('GET', `/messages/${id}`, undefined, Math.max(500, Math.min(TRY_MS, end - Date.now()))).catch(() => null)
       const st = r?.status === 200 ? r.json?.delivery?.state : undefined
       if (st === 'sent') {
-        const nums = numbersOf(r!.json)
-        this.o.ids.learn(conv, nums, id)
+        const reportedChat = ONSEN_CHAT.test(chat) || MEMBER_CHAT.test(chat) ? String(r!.json.chat ?? '') : chat
+        const nums = numbersOf(r!.json, this.o.agent, reportedChat)
+        this.o.ids.learn(reportedChat, nums, id)
         this.stats.delivered++
         return { onsenId: id, conversationId: conv, ids: nums, held: false }
       }
@@ -238,14 +240,16 @@ export class ConnectorSay {
   }
 }
 
-/** the client numbers of a message (GET /messages/<id>: aliases [{client_ref: "<chat>:<n>"}]), in order */
-export function numbersOf(m: any): string[] {
-  const out: string[] = []
+/** GET /messages/<id> can include multiple clients, bots and chats. A Telegram number belongs to exactly one such scope. */
+export function numbersOf(m: any, member: string, chat: string): string[] {
+  if (!chat) return []
+  const out = new Set<string>()
   for (const a of Array.isArray(m?.aliases) ? m.aliases : []) {
-    const ref = String(a?.client_ref ?? ''), n = ref.slice(ref.lastIndexOf(':') + 1)
-    if (n && !out.includes(n)) out.push(n)
+    if (a?.client !== 'telegram' || a.scope !== member || typeof a.client_ref !== 'string') continue
+    const [aliasChat, n, extra] = a.client_ref.split(':')
+    if (aliasChat === chat && n && extra === undefined && /^[1-9]\d*$/.test(n)) out.add(n)
   }
-  return out.sort((x, y) => (/^\d+$/.test(x) && /^\d+$/.test(y) ? Number(x) - Number(y) : x < y ? -1 : x > y ? 1 : 0))
+  return [...out].sort((x, y) => Number(x) - Number(y))
 }
 
 /** WO-197 segment 2 (sonn's ruling 4): Onsen draws a lane's or the router's label itself (fleet-core onsen_bridge.author_label of the sender part:

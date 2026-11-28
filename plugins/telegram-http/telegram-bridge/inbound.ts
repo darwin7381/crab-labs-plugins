@@ -469,8 +469,8 @@ export class Poller {
   }
   async writeEdit(e: Entry): Promise<Answer> {
     const m = e.u.edited_message
-    // In a basic group the edit has only the bot-local number and the new text. Keep the bot's alias for this operation.
-    const key = String(m.chat.id).startsWith('-100') ? `${m.chat.id}:${m.message_id}` : `${this.a.member}:${m.chat.id}:${m.message_id}`
+    // Edits address the receiving bot's alias, even when supergroup numbers coincide.
+    const key = `${this.a.member}:${m.chat.id}:${m.message_id}`
     const text = m.text != null ? expandHiddenEntities(String(m.text), m.entities) : m.caption != null ? expandHiddenEntities(String(m.caption), m.caption_entities)
       : m.rich_message ? (richToMarkdown(m.rich_message) || '') : ''
     const ans = await this.d.onsen.req('POST', '/bridge/messages/edit', { member: this.a.member, chat: String(m.chat.id), client_msg_id: String(m.message_id), text,

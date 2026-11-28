@@ -278,7 +278,8 @@ export class Drawer {
   async drawReceipt(a: Agent, item: any): Promise<void> {
     const age = this.now() - Date.parse(item.at)
     const chat = String(item.chat), id = String(item.client_msg_id ?? '')
-    if (!(age <= OLD_MS) || !id) return
+    // Onsen supplies this recipient's Telegram alias only if its bot received the group message.
+    if (!(age <= OLD_MS) || !id || (chat.startsWith('-') && !/^[1-9]\d*$/.test(id))) return
     const fresh = age <= 10_000
     const typing = () => a.tg.call('sendChatAction', { chat_id: chat, action: 'typing' }).catch(() => {})
     await this.retryUnblock(a, chat)

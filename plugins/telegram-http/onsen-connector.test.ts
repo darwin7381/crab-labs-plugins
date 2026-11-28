@@ -99,7 +99,30 @@ test('react / edit: the Telegram number turned into Onsen\'s message, then POST 
   expect(f.calls.find(c => c.m === 'PUT' && c.p === '/v1/messages/4001')!.b).toEqual({ text: '新的字' })
   expect(await f.say.react('1828', 'onsen:4002', '👍')).toBe('4002')
   await expect(f.say.edit('1828', '1', 'x')).rejects.toThrow(/not a message Onsen knows/)
-  expect(numbersOf({ aliases: [{ client_ref: '1:12' }, { client_ref: '1:3' }, { client_ref: '1:12' }] })).toEqual(['3', '12'])
+})
+
+test('only this bot’s aliases in the same chat can seed replies and reactions after migration', async () => {
+  const alias = (scope: string, client_ref: string, client = 'telegram') => ({ client, scope, client_ref })
+  const report = { delivery: { state: 'sent' }, aliases: [alias('adam', '-23:12'), alias('adam', '-23:3'), alias('adam', '-23:12'),
+    alias('lab-b', '-23:81'), alias('adam', '-10023:12'), alias('adam', '-23:2', 'other')] }
+  expect(numbersOf(report, 'adam', '-23')).toEqual(['3', '12'])
+  expect(numbersOf(report, 'lab-b', '-23')).toEqual(['81'])
+  expect(numbersOf(report, 'adam', '-10023')).toEqual(['12'])
+  const calls: string[] = []
+  const request: Request = async (_method, path) => {
+    calls.push(path)
+    if (path === '/v1/messages') return { status: 201, json: { data: { id: '501', conversation_id: '77', delivery: 'pending' } } }
+    if (path === '/messages/501') return { status: 200, json: report }
+    return { status: 404, json: {} }
+  }
+  const ids = new OnsenIds({ request })
+  ids.know('-23', '77'); ids.know('-10023', '77')
+  const say = new ConnectorSay({ request, ids, agent: 'adam', log: noLog })
+  expect((await say.say({ chat: '-23', sender: 'main', text: 'sent' })).ids).toEqual(['3', '12'])
+  expect(await ids.message('-23', '12')).toBe('501')
+  expect(await ids.message('-23', '81')).toBeNull()
+  expect(await ids.message('-10023', '12')).toBeNull()
+  expect(calls.slice(2)).toEqual(['/v1/conversations/77/messages/by-client-id/81', '/v1/conversations/77/messages/by-client-id/12'])
 })
 
 test('WO-197 segment 2: the machine config key is the reader\'s own (ONSEN_OWNER), read again as ONSEN_BRIDGE is; the plist\'s wins', () => {

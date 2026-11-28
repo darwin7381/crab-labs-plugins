@@ -262,10 +262,12 @@ export class FakeOnsen {
       if (this.notPeople.has(String(body.client_user_id))) return this.e(403, 'not_allowed', '這個帳號是 agent')
       const dup = this.messages.find(x => x.idem_key === body.idem_key)
       const conversation_id = `cv_${String(body.chat).startsWith('-') ? body.chat : body.member}`
-      if (dup) return this.d({ message_id: dup.id, conversation_id, from, duplicate: true })
-      const id = String(9000 + this.messages.length + 1)
-      this.messages.push({ id, ...body, at: Date.now() })
-      return this.d({ message_id: id, conversation_id, from, duplicate: false }, 201)
+      const message = dup ?? { ...body, id: String(9000 + this.messages.length + 1), aliases: [], at: Date.now() }
+      const { member, chat, client_msg_id } = body
+      if (!message.aliases.some((a: any) => a.member === member && a.chat === chat && a.client_msg_id === client_msg_id))
+        message.aliases.push({ member, chat, client_msg_id })
+      if (!dup) this.messages.push(message)
+      return this.d({ message_id: message.id, conversation_id, from, duplicate: !!dup }, dup ? 200 : 201)
     }
     if (req.method === 'PUT' && /^\/v1\/bridge\/chats\/-\d+(\/members\/[^/]+)?$/.test(p)) {
       this.chatWrites.push({ path: p, body })
@@ -273,7 +275,7 @@ export class FakeOnsen {
     }
     if (p === '/v1/bridge/messages/edit' && req.method === 'POST') {
       this.check(Object.keys(body ?? {}).sort().join(',') === 'chat,client_msg_id,edited_at,member,text', `edit keys ${Object.keys(body ?? {}).sort().join(',')}`)
-      const msg = this.messages.find(x => x.member === body.member && x.chat === body.chat && x.client_msg_id === body.client_msg_id)
+      const msg = this.messages.find(x => x.aliases.some((a: any) => a.member === body.member && a.chat === body.chat && a.client_msg_id === body.client_msg_id))
       if (!msg) return this.e(404, 'not_found', 'no such message')
       this.edits.push(body)
       return this.d({ message_id: msg.id, changed: true })

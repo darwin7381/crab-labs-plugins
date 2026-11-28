@@ -221,15 +221,45 @@ test('a basic group gets one outage reply even with different message numbers', 
   expect(onsen.messages).toHaveLength(1)
 })
 
-test('supergroup edits share their version key; basic group edits address the bot-local message', async () => {
+test('edits address each bot and its local number even when both supergroup numbers match', async () => {
   const requests = spyOn(bridge.onsen, 'req')
-  for (const token of [a, b]) {
-    for (const chat of [supergroup, group]) tg.push(token, { edited_message: { chat, from, date, edit_date: date + 1, text: 'edit', message_id: 7 } })
+  for (const [token, basicId] of [[a, 7], [b, 81]] as const) {
+    for (const [chat, id] of [[supergroup, 7], [group, basicId]] as const) {
+      const message = { chat, from, date, text: 'before', message_id: id }
+      tg.push(token, { message })
+      tg.push(token, { edited_message: { ...message, edit_date: date + 1, text: 'edit' } })
+    }
     await confirmed()
   }
   const keys = requests.mock.calls.filter(r => r[1] === '/bridge/messages/edit').map(r => r[3]?.idem)
-  expect(keys).toEqual(['tg:-100212:7:edit:1700000001', 'tg:lab-a:-23:7:edit:1700000001',
-    'tg:-100212:7:edit:1700000001', 'tg:lab-b:-23:7:edit:1700000001'])
+  expect(keys).toEqual(['tg:lab-a:-100212:7:edit:1700000001', 'tg:lab-a:-23:7:edit:1700000001',
+    'tg:lab-b:-100212:7:edit:1700000001', 'tg:lab-b:-23:81:edit:1700000001'])
+  expect(onsen.messages).toHaveLength(2)
+  expect(onsen.edits.map(e => [e.member, e.chat, e.client_msg_id])).toEqual([
+    ['lab-a', '-100212', '7'], ['lab-a', '-23', '7'], ['lab-b', '-100212', '7'], ['lab-b', '-23', '81']])
+})
+
+test('group receipts use only the addressed bot’s own alias; a privacy-filtered message gets no reaction from that bot', async () => {
+  const message = { chat: group, from, date, text: 'both' }
+  tg.push(a, { message: { ...message, message_id: 7 } })
+  tg.push(a, { message: { ...message, text: 'only A saw this', message_id: 8 } })
+  tg.push(b, { message: { ...message, message_id: 81 } })
+  await confirmed()
+  const at = new Date().toISOString(), chat = String(group.id)
+  const receipt = (member: string, text: string) => {
+    const row = onsen.messages.find(m => m.text === text)
+    const alias = row.aliases.find((a: any) => a.member === member && a.chat === chat)
+    return { type: 'receipt', seq: member + row.id, member, chat, at, state: 'in_session', message_id: row.id, client_msg_id: alias?.client_msg_id ?? null }
+  }
+  const missing = receipt('lab-b', 'only A saw this')
+  expect(missing.client_msg_id).toBeNull()
+  await bridge.drawBatch([receipt('lab-a', 'both'), receipt('lab-b', 'both'), receipt('lab-a', 'only A saw this'), missing])
+  const seen = (token: string) => tg.callsOf(token, 'setMessageReaction').filter(r => r.reaction[0]?.emoji === '✍').map(r => r.message_id)
+  await until(() => seen(a).length === 2 && seen(b).length === 1, 1500, 'recipient reactions')
+  expect(seen(a)).toEqual([7, 8])
+  expect(seen(b)).toEqual([81])
+  expect(tg.callsOf(b, 'sendChatAction')).toHaveLength(1)
+  expect(logs.filter(l => /^(warn|error)/.test(l))).toEqual([])
 })
 
 const feedMessage = (member: string, id: string, text: string) => ({
