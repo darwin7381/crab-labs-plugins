@@ -258,7 +258,7 @@ export class OnsenPuller {
   }
 
   private pullPaused({ status, json }: NonNullable<Answer>): boolean {
-    if (status === 409 && json?.error?.code !== 'take_member') return false
+    if (status === 409 && json?.detail?.code !== 'take_member' && json?.error?.code !== 'take_member') return false
     if (status === 409 && !this.takeMember) this.o.log('info', 'onsen inbox: member is on take; checking again in 60 s')
     if (status === 200 && this.takeMember) this.o.log('info', 'onsen inbox: member is on pull again')
     if (status === 200 || status === 409) this.takeMember = status === 409

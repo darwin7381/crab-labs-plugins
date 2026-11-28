@@ -80,7 +80,7 @@ export function fakeItems() {
     if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
     if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
     if (path === '/inbox' && req.method === 'GET') {
-      if (mode === 200) return error(409, 'take_member')
+      if (mode === 200) return Response.json({ detail: { code: 'take_member' } }, { status: 409 })
       const after = Number(q.get('after'))
       const given = [...rows.values()].filter(r => r.state === 'waiting' && r.number > after).slice(0, Number(q.get('limit') ?? 100))
       for (const row of given) givenByPull.add(row)

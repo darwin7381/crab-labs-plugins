@@ -109,16 +109,39 @@ test('switch, prerequisites, stable machine/member and all probe refusals', asyn
   expect(r.f.calls.every(c => c.query.get('connector') === 'mac-mini/adam' && c.query.get('limit') === '1')).toBe(true)
 })
 
-test('agent-inbox reports a pause once, including first start, and can resume pull', async () => {
+for (const envelope of ['detail', 'error']) test('old pull pauses once and resumes for 409 ' + envelope + '.code', async () => {
   const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
-  const pull = new OnsenPuller({ inbox, base: r.f.base, req: r.client.request.bind(r.client), host: 'mac-mini',
-    deliver: async () => 'delivered', log: (_lv, m) => r.logs.push(m) })
-  await pull.once(); await pull.once()
+  const pull = new OnsenPuller({ inbox, base: r.f.base, host: 'mac-mini',
+    req: async (...args) => {
+      const response = await r.client.request(...args)
+      if (envelope === 'error' && response?.status === 409) return { status: 409, json: { error: response.json.detail } }
+      return response
+    }, deliver: async () => 'delivered', log: (_lv, m) => r.logs.push(m) })
+  pull.start()
+  try {
+    await until(() => r.logs.some(s => s.includes('member is on take')))
+    expect(pull.health()).toMatchObject({ errors: 0, backoff_s: 0, last_error: null })
+  } finally { await pull.stop() }
+  await pull.once()
   expect(r.logs.filter(s => s.includes('member is on take'))).toHaveLength(1)
   expect(inbox.based).toBe(false)
   r.f.mode(409); await pull.once()
   expect(inbox.based).toBe(true)
   expect(r.logs.filter(s => s.includes('on pull again'))).toHaveLength(1)
+  r.f.mode(200); await pull.once()
+  expect(r.logs.filter(s => s.includes('member is on take'))).toHaveLength(2)
+})
+
+test('other 409s from old pull still back off as errors', async () => {
+  const r = rig(), inbox = new OnsenInbox({ file: join(r.dir, 'inbox.json') })
+  const pull = new OnsenPuller({ inbox, base: r.f.base, host: 'mac-mini', req: async () => ({ status: 409, json: { detail: { code: 'conflict' } } }),
+    deliver: async () => 'delivered', log: (_lv, m) => r.logs.push(m) })
+  pull.start()
+  try {
+    await until(() => pull.stats.errors > 0)
+    expect(pull.health()).toMatchObject({ errors: 1, backoff_s: 2 })
+    expect(r.logs.some(s => s.includes('member is on take'))).toBe(false)
+  } finally { await pull.stop() }
 })
 
 test('after the switch the next pull round delivers and acks the pending prefix', async () => {

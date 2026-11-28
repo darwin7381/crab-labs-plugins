@@ -244,7 +244,9 @@ test('the inbox daemon follows take_member and serves the take relays with its l
     expect(reply.status).toBe(200)
   }
   expect(d.f.calls.some(c => c.path.endsWith('/items'))).toBe(false)
-  expect(d.log()).not.toContain('GET /inbox: HTTP 409')
+  expect(d.f.calls.filter(c => c.path === '/inbox')).toHaveLength(1)
+  const health = await fetch(d.base + '/healthz').then(r => r.json())
+  expect(health.onsen_pull).toMatchObject({ on: true, errors: 0, backoff_s: 0, last_error: null })
 })
 
 test('daemon probes only once on an old server and keeps observation on the legacy shape', async () => {
