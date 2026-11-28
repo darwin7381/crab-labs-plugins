@@ -1,7 +1,7 @@
 import type { InboxItem } from '../onsen-items.ts'
 import type { ItemReport, Outcome } from '../onsen-receive.ts'
 
-const intermediate = new Set<Outcome>(['in_session', 'background', 'owed', 'stuck'])
+const intermediate = new Set<Outcome | 'deferred'>(['in_session', 'background', 'owed', 'stuck', 'deferred'])
 const failures = new Set<Outcome>(['cut', 'cut_person', 'not_taken', 'error', 'stuck'])
 type Row = InboxItem & { waiter: string; preview: string; line: string; created_at: string; completed_at: string | null; cancelled_at: string | null;
   about_item_id: string | null; edit_of_item_id: string | null; failures: number; released: boolean; expires_at: string | null; in_session_at: string | null
@@ -24,7 +24,7 @@ function validCreate(b: any): boolean {
 function writtenFields(row: Row, now: number, online: boolean) {
   const preview = String(row.payload.text ?? '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/[*_`#]/g, '').replace(/\s+/g, ' ').trim()
   const stage = ({ waiting: '等著', claimed: '領走', completed: '做完', cancelled: '作廢' } as Record<string, string>)[row.state]
-  const why = row.reason && ({ withdrawn: '寄件方撤回', expired: '過了作廢時間', superseded: '自己接著做了' } as Record<string, string>)[row.reason]
+  const why = row.reason && ({ withdrawn: '寄件方撤回', expired: '過了作廢時間', superseded: 'Claude Code 自己接著跑了' } as Record<string, string>)[row.reason]
   const kind = ({ self: '自己留的', keepwarm: '保溫', resume: '接著做' } as Record<string, string>)[row.kind]
   const line = [`收件 #${row.number}`, row.member + '/' + (row.session_id ?? '未定'), kind, row.from + ' → 等的人 ' + row.waiter,
     stage + (why ? '（' + why + '）' : ''), '失敗 ' + row.failures, preview]
@@ -40,10 +40,12 @@ function writtenFields(row: Row, now: number, online: boolean) {
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
 export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
-  const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
+  const rows = new Map<string, Row>(), writes = new Map<string, { body: unknown; response: Response }>(), terminal = new Map<string, string>()
   const scheduleCalls = new Map<string, { id: string; run: string; result: unknown }>()
   const creates = new Map<string, { id: string; body: unknown; result: Response }>()
   const takes = new Map<string, { claim: string; body: unknown; result: Response }>()
+  // lastClaim: the claim a row's later events and late reports belong to; expired: a lease ran out (true = without a stuck report, settled 55)
+  const lastClaim = new Map<string, string>(), expired = new Map<string, boolean>()
   // written: rows the member wrote itself (S2 POST); elsewhere: notices the fake writes into another member's inbox
   const overdue = new Set<string>(), written = new Set<string>(), elsewhere = new Set<string>()
   const givenByPull = new Set<Row>()
@@ -55,12 +57,13 @@ export function fakeItems() {
   const error = (status: number, code: string, extra = {}) => Response.json({ error: { code, message: code, retryable: status >= 500, ...extra } }, { status })
   const change = (r: Row, kind: string, note = '', updatedAt?: string) => {
     now++
-    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ at: r.updated_at, kind, claim_id: r.claim?.id ?? null, session_id: r.session_id, state: r.state, reason: r.reason, note: note || null })
+    r.version++; r.updated_at = updatedAt ?? iso(now); r.events!.push({ at: r.updated_at, kind, claim_id: r.claim?.id ?? lastClaim.get(r.id) ?? null, session_id: r.session_id, state: r.state, reason: r.reason, note: note || null })
     for (const wake of waiters) wake()
   }
   const expire = () => {
     for (const row of rows.values()) {
       if (row.state === 'claimed' && Date.parse(row.claim!.expires_at) <= now) {
+        expired.set(row.id, !reports.has(row.id + '/' + row.claim!.id + '/stuck'))
         Object.assign(row, { claim: null, state: 'waiting', reason: 'cut' }); change(row, 'lease_expired')
       }
       if (row.state === 'waiting' && Date.parse(row.expires_at ?? '') <= now) {
@@ -97,13 +100,14 @@ export function fakeItems() {
   }
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 60, async fetch(req) {
     const url = new URL(req.url), path = url.pathname, q = url.searchParams
-    const b = req.method === 'GET' ? {} : await req.json() as any, key = req.headers.get('Idempotency-Key')
-    const connector = b.connector ?? q.get('connector')
+    const b = req.method === 'GET' ? {} : await req.json().catch(() => null) as any, key = req.headers.get('Idempotency-Key')
+    const connector = b?.connector ?? q.get('connector')
     const envelope = () => ({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null,
       ...(connector ? { changed_after: iso(now - 1000).replace('Z', '+00:00') } : {}) })
-    const detail = (data: unknown) => Response.json({ ...envelope(), data })
+    const detail = (data: unknown, status = 200) => Response.json({ ...envelope(), data }, { status })
     calls.push({ path, query: q, body: b, key })
     if (req.headers.get('authorization') !== 'Bearer test-member') return error(401, 'not_authenticated')
+    if (!b || typeof b !== 'object' || Array.isArray(b)) return error(400, 'invalid_request')
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
@@ -155,7 +159,7 @@ export function fakeItems() {
       const row = add(id, b.kind, { from: 'adam', waiter: b.waiter ?? 'adam', session_id: b.session_id ?? null,
         refs: b.refs, not_before: b.not_before ?? null, deadline: b.deadline ?? null, expires_at: b.expires_at ?? null,
         payload: b.body ? { text: b.body.text, format: b.body.format } : { text: '' } })
-      const result = detail(view(row))
+      const result = detail(view(row), 201)
       creates.set(key, { id: row.id, body: b, result: result.clone() })
       return result
     }
@@ -164,7 +168,7 @@ export function fakeItems() {
       if (!row) return error(404, 'not_found')
       if (row.from !== 'adam') return error(403, 'not_authorized')
       if (!b || Object.keys(b).some(k => k !== 'outcome' && k !== 'expected_version')) return error(400, 'invalid_request')
-      const outcome = b.outcome ?? 'withdrawn'
+      const outcome = b.outcome === undefined ? 'withdrawn' : b.outcome
       if (!Number.isInteger(b.expected_version) || !['withdrawn', 'superseded', 'completed'].includes(outcome)
         || outcome === 'completed' && row.kind !== 'self' || outcome === 'superseded' && row.kind !== 'resume') return error(400, 'invalid_request')
       if (row.version !== b.expected_version || row.state !== 'waiting') return error(409, 'version_conflict')
@@ -182,7 +186,7 @@ export function fakeItems() {
       const after = q.get('changed_after')
       const since = after === null ? -Infinity : Date.parse(after)
       const select = () => [...rows.values()].filter(r => !elsewhere.has(r.id) && (q.get('state') === 'all' || r.state === (q.get('state') ?? 'waiting'))
-        && (!q.has('kind') || r.kind === q.get('kind')) && (!q.has('session_id') || r.session_id === q.get('session_id')) && Date.parse(r.updated_at) >= since)
+        && ['kind', 'reason', 'session_id'].every(k => !q.has(k) || r[k as keyof Row] === q.get(k)) && Date.parse(r.updated_at) >= since)
       const wait = Number(q.get('wait'))
       const until = Date.now() + wait * 1000
       while (!select().length && Date.now() < until && !req.signal.aborted) await new Promise<void>(resolve => {
@@ -195,8 +199,9 @@ export function fakeItems() {
         next_cursor: end < all.length ? String(end) : null })
     }
     if (req.method !== 'GET' && !key) return error(400, 'invalid_request')
-    const idem = path + '|' + key
-    if (key && writes.has(idem)) return writes.get(idem)!.clone()
+    const idem = req.method + '|' + path + '|' + key
+    const cached = key && writes.get(idem)
+    if (cached) return Bun.deepEquals(b, cached.body) ? cached.response.clone() : error(409, 'version_conflict')
     let answer: Response
     if (path === base + '/take' && req.method === 'POST') {
       if (!b.connector || b.wait !== 0 || !Array.isArray(b.item_ids) || b.limit !== b.item_ids.length || b.limit > 100 || b.session_id !== undefined) return error(400, 'invalid_request')
@@ -207,11 +212,21 @@ export function fakeItems() {
       }
       takes.delete(idem)
       const asked: Row[] = b.item_ids.map((id: string) => rows.get(id)).filter(eligible).filter((r: Row) => !elsewhere.has(r.id))
-      const given = asked.filter(r => r.reason !== 'cut_person' || asked.some(o => o !== r && o.from === r.from && o.kind === 'message' && o.reason !== 'cut_person'))
+      const given = asked.filter(r => {
+        if (r.reason === 'cut_person' && !asked.some(o => o !== r && o.from === r.from && o.kind === 'message' && o.reason !== 'cut_person')) return false
+        const missed = expired.get(r.id)
+        expired.delete(r.id)
+        if (missed && ++r.failures >= 3) {
+          Object.assign(r, r.released ? { state: 'cancelled', reason: 'gave_up', cancelled_at: iso(now) } : { reason: 'parked' })
+          change(r, r.reason!); return false
+        }
+        return true
+      })
       const claim_id = given.length ? 'claim-' + ++claimSeq : null
       for (const row of given) {
         Object.assign(row, { state: 'claimed', reason: null, note: null, in_session_at: null, claim: { id: claim_id, connector, session_id: null, taken_at: iso(now), expires_at: iso(now + 45_000) } })
         issued.add(row.id + '/' + claim_id)
+        lastClaim.set(row.id, claim_id!)
         change(row, 'taken')
       }
       const waiting = [...rows.values()].filter(r => !elsewhere.has(r.id) && r.state === 'waiting')
@@ -229,13 +244,15 @@ export function fakeItems() {
       if (!row) return error(404, 'not_found')
       if (req.method === 'GET') return detail(view(row))
       if (req.method !== 'PUT' || !path.endsWith('/report') || !b.claim_id || !b.at || 'answered' in b) return error(400, 'invalid_request')
+      if (b.outcome === 'superseded' && row.kind !== 'resume') return error(400, 'invalid_request')
       const k = row.id + '/' + b.claim_id, prior = terminal.get(k)
       if (prior) return prior === b.outcome ? detail(view(row)) : error(409, 'version_conflict')
       if (!issued.has(k)) return error(400, 'invalid_request')
       if (reports.has(k + '/' + b.outcome)) return detail(view(row))
       reports.add(k + '/' + b.outcome)
       history.push({ item_id: row.id, body: b })
-      if (row.claim && row.claim.id !== b.claim_id && b.outcome !== 'completed') { change(row, 'late_report', b.note); return detail(view(row)) }
+      if (['cancelled', 'completed'].includes(row.state) || lastClaim.get(row.id) !== b.claim_id && b.outcome !== 'completed'
+        || expired.has(row.id) && intermediate.has(b.outcome)) { change(row, 'late_report', b.note); return detail(view(row)) }
       if (b.outcome === 'in_session' && row.claim) { row.claim.session_id = b.session_id; row.session_id ??= b.session_id; row.in_session_at = b.at }
       if (typeof b.half_done === 'boolean') row.half_done = b.half_done
       if (b.outcome === 'error') row.not_before = iso(now + (row.failures + 1) * 300_000)
@@ -243,20 +260,22 @@ export function fakeItems() {
       if (intermediate.has(b.outcome)) row.reason = b.outcome === 'in_session' ? null : b.outcome
       else {
         terminal.set(k, b.outcome); row.claim = null
+        expired.delete(row.id)
         if (b.outcome === 'completed') {
-          row.state = 'completed'; row.completed_at = iso(now); row.response_message_ids = b.response_message_ids ?? []; row.answered = row.response_message_ids.length > 0
+          row.state = 'completed'; row.completed_at = b.at; row.response_message_ids = b.response_message_ids ?? []
+          row.answered = ['resume', 'self', 'keepwarm'].includes(row.kind) ? null : row.response_message_ids.length > 0
           row.reason = row.reason === 'owed' && !row.answered ? 'not_answered' : null
           for (const p of rows.values()) if (p.reason === 'parked' && !p.released) { p.reason = null; p.released = true; change(p, 'released') }
-        } else if (['stopped', 'not_applied'].includes(b.outcome)) { row.state = 'cancelled'; row.reason = b.outcome; row.cancelled_at = iso(now) }
+        } else if (['stopped', 'not_applied', 'superseded'].includes(b.outcome)) { row.state = 'cancelled'; row.reason = b.outcome; row.cancelled_at = b.at }
         else { row.state = 'waiting'; row.reason = b.outcome; if (b.outcome === 'reassigned') Object.assign(row, { session_id: 'main', note: b.note }) }
       }
       if (failures.has(b.outcome) && row.failures >= 3) {
         row.state = row.released ? 'cancelled' : 'waiting'; row.reason = row.released ? 'gave_up' : 'parked'; row.claim = null
-        if (row.state === 'cancelled') row.cancelled_at = iso(now)
+        if (row.state === 'cancelled') row.cancelled_at ??= iso(now)
       }
       change(row, b.outcome, b.note); answer = detail(view(row))
     }
-    writes.set(idem, answer.clone())
+    if (key) writes.set(idem, { body: b, response: answer.clone() })
     return answer
   } })
   return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, now: () => now,

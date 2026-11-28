@@ -390,7 +390,7 @@ plugins/telegram-http/lanes.ts::function mainCannotAct(): boolean
 # WO-200 (1.59.2): a person's message reaches a walled main; a refused one is reported blocked; a delayed Call is checked against Onsen first
 plugins/telegram-http/lanes-main.ts::function wallDelivery(
 plugins/telegram-http/lanes-main.ts::return wall.person && r.kind === 'joey' && !refused
-plugins/telegram-http/lanes-main.ts::if (wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) wallWakePending = true
+plugins/telegram-http/lanes-main.ts::if (wake === 'resume-ready' || wake === 'wall-clear' || (wake === 'person' && wallDelivery().person)) pumpAgain = true
 # WO-204 part 2 (1.59.4)
 plugins/telegram-http/lanes-main.ts::ready.filter(r => (!heldCut(r) || releasedCut(r))
 # WO-205 (1.59.5)
@@ -401,6 +401,9 @@ plugins/telegram-http/lanes.ts::p === '/lanes/registry-alert'
 plugins/telegram-http/server.ts::/api/fleet/main-registry
 # WO-209 (1.59.5): the receipt belongs to the interrupted turn across gens
 plugins/telegram-http/lanes-main.ts::resume_sent: cut.at
+# WO-213 C4: take members write the WO-209 sentence into their own resume Item
+plugins/telegram-http/onsen-resume.ts::body: { format: 'markdown', text: resumeText(cut) }
+plugins/telegram-http/onsen-resume.ts::id: e.id, outcome: e.withdrawn ? 'withdrawn' : 'superseded'
 plugins/telegram-http/lanes-main.ts::const probe = g?.state === 'walled' && (clear ?? 0) > Number(g.uw_clear_used ?? 0)
 plugins/telegram-http/lanes-main.ts::undelivered_since: previous?.undelivered_since ?? null
 # WO-215: SessionEnd reasons clear/resume keep the gen (the process goes on); /resume switches by session id

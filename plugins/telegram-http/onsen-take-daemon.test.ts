@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomUUID } from 'crypto'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -392,6 +392,111 @@ function scriptedLane(root: string) {
 
 import capturedPage from './test-fixtures/onsen-0.40.0/list-completed.json'
 const capturedPerson = capturedPage.items.find(it => it.kind === 'message')!
+test('C4 routes only the member’s own resumes to M1 across all session targets', async () => {
+  const d = await daemon()
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  const add = (id: string, from: string, session_id: string | null) =>
+    d.f.add(id, 'resume', { from, session_id, payload: { text: id }, created_at: new Date(d.f.now()).toISOString() })
+  add('foreign-resume', 'eve', 'main')
+  add('worker-target', 'adam', 'adam.worker.7')
+  add('unknown-target', 'adam', null)
+  add('main-target', 'adam', 'main')
+  const native = () => new Set(d.journal().filter(r => r.rec === 'msg' && r.kind === 'carry' && r.notif?.params.meta.user === 'lanes')
+    .map(r => r.onsen_items?.[0]?.onsen_item_id))
+  await waitFor(() => native().has('main-target'))
+  expect([...native()].sort()).toEqual(['main-target', 'unknown-target', 'worker-target'])
+  expect(d.f.calls.some(c => c.path === '/v1/items/main-target')).toBe(false)
+  expect(d.f.calls.some(c => c.path.endsWith('/take'))).toBe(false)
+})
+
+test('member-authored Items read their body only from payload.text', async () => {
+  const d = await daemon()
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  d.f.add('flat-resume', 'resume', { from: 'adam', payload: { format: 'markdown', text: '正本內文', body: { text: '巢狀副本' } } })
+  d.f.add('nested-self', 'self', { from: 'adam', payload: { body: { text: '巢狀副本' } } })
+  const delivery = (id: string) => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === id && r.notif)
+  await waitFor(() => !!delivery('flat-resume') && !!delivery('nested-self'))
+  expect(delivery('flat-resume').notif.params.content).toBe('正本內文')
+  expect(delivery('nested-self').notif.params.content).not.toContain('巢狀副本')
+})
+
+test('C4 main hooks create a waiting resume; an independent turn after fixture restart cancels it without a take', async () => {
+  const session_id = randomUUID()
+  const d = await daemon({}, 200, root => {
+    writeFileSync(join(root, '.lanes', 'main-expected'), session_id)
+    return {}
+  })
+  const hook = async (event: string, prompt_id: string, extra = {}) => {
+    const res = await fetch(d.base + '/lanes/main-event', { method: 'POST', headers: {
+      'Content-Type': 'application/json', Authorization: 'Bearer test-loopback' },
+      body: JSON.stringify({ event, prompt_id, pid: process.pid, session_id, ...extra }) })
+    expect(res.status).toBe(200)
+  }
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  await hook('SessionStart', '', { source: 'startup' })
+  await hook('UserPromptSubmit', 'typing', { dids: [] })
+  await hook('StopFailure', 'typing', { error: 'rate_limit' })
+  await waitFor(() => d.f.rows.size === 1)
+  const row = [...d.f.rows.values()][0]!
+  await waitFor(() => d.journal().some(l => l.rec === 'msg' && l.onsen_items?.[0]?.onsen_item_id === row.id))
+  expect(row).toMatchObject({ state: 'waiting', kind: 'resume', not_before: null, session_id: 'main' })
+  expect(d.journal().find(l => l.onsen_items)?.notif.params.content).toBe(row.payload.text)
+  const probes = () => d.f.calls.filter(c => c.query.has('connector') && c.query.get('limit') === '1').length
+  const first = probes()
+  await d.restart()
+  await waitFor(() => probes() > first && d.log().includes('onsen take: started'))
+  await hook('PreToolUse', 'typing', { tool_name: 'Read' })
+  await waitFor(() => row.reason === 'superseded')
+  expect(row.state).toBe('cancelled')
+  expect(d.f.calls.filter(c => c.body.kind === 'resume')).toHaveLength(1)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take'))).toHaveLength(0)
+  expect(d.f.history).toHaveLength(0)
+}, 15_000)
+
+test('settled 59 in the daemon: only the background turn that receives a carrier withdraws the resume', async () => {
+  const session_id = randomUUID()
+  const d = await daemon({ ONSEN_PEER_LOOKUP: '0' }, 200, root => {
+    writeFileSync(join(root, '.lanes', 'main-expected'), session_id)
+    const sessions = join(root, 'home', '.claude', 'sessions')
+    mkdirSync(sessions, { recursive: true })
+    writeFileSync(join(sessions, process.pid + '.json'), JSON.stringify({ pid: process.pid, sessionId: session_id,
+      cwd: root, startedAt: Date.now(), procStart: '', kind: 'interactive', name: 'adam', status: 'idle', statusUpdatedAt: Date.now() }))
+    return { ONSEN_SESSIONS_DIR: sessions }
+  })
+  const hook = async (event: string, prompt_id: string, extra = {}) => {
+    const r = await fetch(d.base + '/lanes/main-event', { method: 'POST', headers: {
+      'Content-Type': 'application/json', Authorization: 'Bearer test-loopback' },
+      body: JSON.stringify({ event, prompt_id, pid: process.pid, session_id, ...extra }) })
+    expect(r.status).toBe(200)
+    return r.json()
+  }
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  await hook('SessionStart', '', { source: 'startup' })
+  await hook('UserPromptSubmit', 'broken', { dids: [] })
+  await hook('StopFailure', 'broken', { error: 'overloaded' })
+  await waitFor(() => d.f.rows.size === 1)
+  const resume = [...d.f.rows.values()][0]!
+  await hook('UserPromptSubmit', 'untold', { source: 'task-notification', dids: [] })
+  await hook('Stop', 'untold', { phase: 'final' })
+  await d.restart()
+  await waitFor(() => d.log().includes('onsen take: started') && d.f.calls.filter(c => c.query.get('limit') === '1').length >= 2)
+  expect(resume.state).toBe('waiting')
+  await hook('UserPromptSubmit', 'told', { source: 'task-notification', dids: [] })
+  const session = new Client({ name: 'resume-main', version: '1' }, { capabilities: {} })
+  clean.push(() => session.close())
+  await session.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp')))
+  const carrier = d.f.add('deliver-with-line')
+  await waitFor(() => d.journal().some(l => l.rec === 'msg' && l.onsen_items?.[0]?.onsen_item_id === carrier.id))
+  const reply = await hook('PostToolUse', 'told', { tool_name: 'Read' })
+  expect(reply.additionalContext).toContain(resume.payload.text)
+  expect(resume.state).toBe('waiting')
+  await hook('Stop', 'told', { phase: 'final' })
+  await waitFor(() => resume.state === 'cancelled')
+  expect(resume.reason).toBe('withdrawn')
+  expect(d.f.calls.filter(c => c.body.outcome === 'withdrawn')).toHaveLength(1)
+  expect(d.f.calls.some(c => c.path.endsWith('/take') && c.body.item_ids?.includes(resume.id))).toBe(false)
+}, 15000)
+
 const worker = 'adam.worker.1'
 test('C5 bench: the main reply tool writes one timed promise for the test account and a report at minute five produces no waiter notice', async () => {
   const jev = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answers: { promises: { type: 'noul', noul: 0.99 } } }) })
@@ -452,6 +557,8 @@ test('C5 active connector schedules its own keepwarm with the legacy local switc
   await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'keepwarm'))
   const [row] = d.f.rows.values()
   expect(row).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', not_before: ts(1000 + 50 * 60_000), deadline: null })
+  // The server can expose the row before the connector acknowledges the POST. A crash in that gap legitimately replays the same key.
+  await waitFor(async () => (await (await fetch(d.base + '/healthz')).json()).onsen.pending_bytes === 0)
   await d.restart()
   await waitFor(() => d.f.calls.filter(c => c.query.get('kind') === 'keepwarm').length >= 2)
   expect(d.f.calls.filter(c => c.body.kind === 'keepwarm')).toHaveLength(1)
@@ -489,7 +596,8 @@ test('C5 converts a saved followup and delivers its self Item once to the origin
 
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
-  writeFileSync(file, event)
+  writeFileSync(file + '.tmp', event)
+  renameSync(file + '.tmp', file)
   await waitFor(() => existsSync(file + '.out'))
   return readFileSync(file + '.out', 'utf8').trim()
 }

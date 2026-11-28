@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -14,7 +14,8 @@ while (!existsSync('release-lane') && Date.now() < end) {
       stdin: Buffer.from(JSON.stringify({ hook_event_name: event, tool_name: 'Bash', session_id: 'fixture-session' })),
     })
     if (result.exitCode !== 0) throw Error(result.stderr.toString())
-    writeFileSync(file + '.out', result.stdout)
+    writeFileSync(file + '.out.tmp', result.stdout)
+    renameSync(file + '.out.tmp', file + '.out')
     boundary++
   }
   await Bun.sleep(30)

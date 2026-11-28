@@ -4,18 +4,20 @@ import type { TakeMode } from './onsen-take.ts'
 import type { Journal } from './lanes-state.ts'
 
 export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied'
-  | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned'
+  | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned' | 'superseded'
 export type ReportFields = { session_id?: string; response_message_ids?: string[]; retry_after?: string | null
   half_done?: boolean; command_message_id?: string; note?: string }
 export type ItemReport = { item_id: string; body: { claim_id: string; at: string; outcome: Outcome } & ReportFields }
-export type ReceiveResult = { given: Set<string>; gone: Set<string> }
-const empty = (): ReceiveResult => ({ given: new Set(), gone: new Set() })
+export type ReceiveResult = { given: Set<string>; gone: Set<string>; claimed: Set<string> }
+const empty = (): ReceiveResult => ({ given: new Set(), gone: new Set(), claimed: new Set() })
 export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
 
 export type ClaimStore = {
   restoreMessageIds(journal: Journal): void
   blocked(): boolean
   owns(id: string): boolean
+  inSession(id: string): boolean
+  completed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
   bind(id: string, session: string, turn: string, registrySession?: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): void
@@ -28,6 +30,7 @@ export class ItemReceiver {
   private requesting = new Set<string>()
   constructor(readonly mode: TakeMode, readonly claims: ClaimStore, readonly dueAt: (time: string) => void, readonly revisit?: () => void,
     readonly currentKeepwarm?: (due?: string) => boolean) {}
+  taking(id: string): boolean { return this.requesting.has(id) }
 
   report(refs: ItemRef[], outcome: Outcome, fields?: ReportFields): void {
     for (const ref of refs) this.claims.report(ref.onsen_item_id, outcome, fields)
@@ -37,7 +40,8 @@ export class ItemReceiver {
     for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
   }
 
-  async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void): Promise<ReceiveResult> {
+  async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void,
+    superseded?: (id: string) => boolean): Promise<ReceiveResult> {
     const result = empty()
     if (!this.mode.active || this.claims.blocked()) return result
     const byId = new Map(refs.map(r => [r.onsen_item_id, r]))
@@ -95,6 +99,7 @@ export class ItemReceiver {
           const single = await this.mode.req('GET', '/v1/items/' + encodeURIComponent(id), undefined, 3000).catch(() => null)
           if (single?.status === 404 || (single?.status === 200 && single.json.data.state !== 'waiting')) result.gone.add(id)
           const row: InboxItem | undefined = single?.json?.data
+          if (row?.state === 'claimed') result.claimed.add(id)
           if (row?.state === 'waiting' && (row.reason === 'parked' && !row.released || row.reason === 'cut_person')) {
             this.refused.set(id, { version: row.version, rides: row.reason === 'cut_person' })
           }
@@ -103,11 +108,12 @@ export class ItemReceiver {
         if (result.gone.size) onGone?.(result.gone)
       }
       if (expired || !this.mode.active) {
-        for (const id of need) if (result.given.has(id)) this.claims.report(id, 'not_taken')
+        for (const id of need) if (result.given.has(id)) this.claims.report(id, superseded?.(id) ? 'superseded' : 'not_taken')
         return empty()
       }
+      // A hook caller learns what is gone through onGone after it returns; a caller without one reads gone and claimed in the result.
       if (refused.length) {
-        if (hook) setTimeout(() => void inspect(), 0)
+        if (hook && onGone) setTimeout(() => void inspect(), 0)
         else await inspect()
       }
       return result

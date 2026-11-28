@@ -413,9 +413,10 @@ if (ONSEN_TAKE_ON) {
         } else { itemPeek!.stop(); takeKeepwarm?.stop() }
         registryStatusChanged?.()
       }, line => log('info', line))
-    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
+    itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now, Lanes.unboundOutcome)
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
+    onsen.watchItemWrites(Lanes.itemWriteSettled)
     Lanes.useItemReceiver(itemReceiver, onsen)
     itemPeek = new ItemPeek(takeMode, Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
     Lanes.observeItemGates(() => itemPeek!.reset())
@@ -5073,6 +5074,7 @@ async function deliverInboundTaken(body: InboundBody, text: string, opRef: strin
  *  the verdict the same message pushed through BTCC unverified gets today (mesh-identity.ts resolveInbound, a forwarder without verified_from):
  *  verified=false, and forged when the name is an identity that signs (dropped and filed, as on /inject). */
 async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Promise<void> {
+  const ownResume = row.kind === 'resume' && row.from === row.member
   const item = itemRef(row)
   if (change) {
     Lanes.updateWaitingItem(item, change === 'edited' ? { content: String(row.payload.text ?? ''), at: row.updated_at } : undefined)
@@ -5090,6 +5092,10 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
   }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
+  if (ownResume) {
+    Lanes.routeResume(item, String(payload.text ?? ''))
+    return
+  }
   if (row.kind === 'message' || row.message_id) {
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)
