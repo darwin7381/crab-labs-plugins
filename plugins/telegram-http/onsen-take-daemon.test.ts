@@ -727,6 +727,24 @@ test('a failed offset confirmation keeps the bridge out through restart until th
   expect(d.log().match(/inbound u=41 /g)).toHaveLength(1)
 }, 22000)
 
+test('a roamer starts the shared registry CLI comparison only after a runtime switch', async () => {
+  const bot = startBotApiMock({}, { pollHoldMs: 100 })
+  clean.push(() => bot.stop())
+  const d = await daemon({ ...roamerEnv, C6_FAST_PROBE: '1', TELEGRAM_BOT_TOKEN: bot.token, TELEGRAM_API_ROOT: bot.url,
+    ONSEN_REGISTRY_CLI: '1', ONSEN_REGISTRY_FIRST_CHECK_MS: '50' }, 409, root => {
+    const cli = join(root, 'fixture-registry')
+    writeFileSync(cli, '#!/bin/sh\n[ "$1 $2" = "agents --json" ] || exit 1\ntouch "$AGENT_WORKSPACE_DIR/cli-ran"\necho "[]"\n', { mode: 0o700 })
+    return { ...roamerState(root), ONSEN_CLAUDE_BIN: cli }
+  })
+  const ran = join(d.root, 'cli-ran')
+  await waitFor(() => bot.polls.length > 0)
+  await Bun.sleep(200)
+  expect(existsSync(ran)).toBe(false)
+  d.f.mode(200)
+  await waitFor(() => existsSync(ran))
+  expect((await fetch(d.base + '/healthz').then(r => r.json())).connector.on).toBe(true)
+}, 9000)
+
 test('a later successful probe drains the local poll before the bridge can carry the bot', async () => {
   const bot = startBotApiMock({}, { pollHoldMs: 100 })
   clean.push(() => bot.stop())

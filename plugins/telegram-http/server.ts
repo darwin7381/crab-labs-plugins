@@ -4174,7 +4174,7 @@ const registry = new OnsenStatus.Registry({
   // files disagree). 1.48.3: one run at a time on the whole machine, shared by every daemon (~/.claude/onsen-shared), killed at 15 s (1.48.4: by its own
   // deadline too, so a run whose daemon died still ends).
   // ONSEN_REGISTRY_CLI=0: never run it (the files only, no comparison)
-  ...(!onsen?.cfg.record || INBOX_ONLY || process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
+  ...(!(onsen?.cfg.record || (ROAMER && takeMode)) || INBOX_ONLY || process.env.ONSEN_REGISTRY_CLI === '0' ? {} : { cli: (() => {
     const claudeBin = process.env.ONSEN_CLAUDE_BIN || [join(homedir(), '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'].find(p => existsSync(p)) || 'claude'
     const shared = new OnsenStatus.SharedCli({ dir: process.env.ONSEN_SHARED_DIR || join(homedir(), '.claude', 'onsen-shared'),
       // the run's own deadline (perl alarm, 15 s) holds even if this daemon dies mid-run; this daemon's SIGKILL at 18 s is the second line
