@@ -363,3 +363,49 @@ test('C1 TakeMode.active gates the lane even before its spool writer is attached
     expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('commitment recorded')
   } finally { L.useItemReceiver(receiver, client); await mode.probe() }
 })
+
+test.each([false, true])('a refused followup and promise each use their local timer once (replay=%s)', async replay => {
+  await client.syncNow(true)
+  const s = L.__lanesState(), event = 'refused:' + replay, lane = 'adam.reflex.refused-' + replay, thread = 'adam#' + event
+  s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
+  s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
+  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [] })
+  const tok = { runId: event, lane, evId: event, trigger: 'peer', cls: 'peer', closers: [] } as any
+  const due = Date.now() + 600_000
+  const original = client.cfg.fetch
+  let status = 503, attempts = 0
+  client.cfg.fetch = (async (url, init) => {
+    if (init?.method === 'POST' && String(url).endsWith('/members/adam/items')) {
+      attempts++
+      return Response.json({ error: { code: 'invalid_request' } }, { status })
+    }
+    return fetch(url, init)
+  }) as typeof fetch
+  try {
+    expect(await L.callLaneTool(tok, 'followup', { after_minutes: 10, note: event })).toContain('scheduled')
+    const follow = Object.values(s.followups).find(f => f.lane === lane)!
+    const reply = await L.callMainTool('commitment', { who: 'refusal-test-' + replay, what: event, due: new Date(due).toISOString() }, 'test-main')
+    const id = /\(id (cm-[^;]+)/.exec(reply)![1]!
+    const ob = () => L.__events().get(id)!.obligations[0]
+    await client.syncNow(true)
+    expect(follow.onsen).toBe('submitted')
+    expect(ob().self).toBeDefined()
+    if (replay) L.useItemReceiver(receiver)
+    status = 422
+    await client.syncNow(true)
+    if (replay) L.useItemReceiver(receiver, client)
+    expect(follow.onsen).toBeUndefined()
+    expect(ob().self).toBeUndefined()
+    expect(attempts).toBe(3)
+    L.resumeSelfItems(); L.__events().note(id, {})
+    follow.due = Date.now() - 1
+    L.followupTick(); L.followupTick()
+    L.dueTick(due + 1); L.dueTick(due + 2)
+    await client.syncNow(true)
+    expect(follow.state).toBe('fired')
+    expect(ob().told).toBe(true)
+    expect(pushes.filter(p => p.includes(id))).toHaveLength(1)
+    expect(attempts).toBe(3)
+  } finally { client.cfg.fetch = original; L.useItemReceiver(receiver, client) }
+})

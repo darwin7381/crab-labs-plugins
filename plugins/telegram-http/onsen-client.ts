@@ -468,6 +468,17 @@ export class OnsenClient {
     }
     return false
   }
+  *rejectedSelfCreates(): Generator<string> {
+    let lines: string
+    try { lines = readFileSync(this.rejected, 'utf8') }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return; throw e }
+    for (const raw of lines.split('\n')) {
+      if (!raw) continue
+      let line: SpoolLine | undefined
+      try { line = JSON.parse(raw).line } catch { continue }
+      if ((line?.k === 'item' || line?.k === 'self') && line.r.item.kind === 'self' && !line.r.outcome && !line.r.complete) yield line.r.key
+    }
+  }
   writtenItemId(key: string): string | undefined { return this.itemWrites.id(key) }
   recordItemWrite(write: ItemWrite): void {
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
@@ -978,8 +989,8 @@ export class OnsenClient {
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })
         else return this.failStatus(r, path)
+        if (!t.line.r.outcome && !t.line.r.complete) this.onItemCreateSettled?.(t.line.r.key, r.status < 300 ? r.json?.data?.id : this.itemWrites.id(t.line.r.key))
         this.writeCursor(t.end)
-        if (!t.line.r.outcome && !t.line.r.complete) this.onItemCreateSettled?.(t.line.r.key, r.status < 300 ? r.json?.data?.id : undefined)
         this.ok(); i++; continue
       }
       if (t.line.k === 'ir') {

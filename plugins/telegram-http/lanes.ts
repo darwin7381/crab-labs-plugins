@@ -319,6 +319,7 @@ export function lanesInit(deps: LanesDeps): void {
     events = createEvents(journal, writeOpenHandoffs, (id, obs, refs, previous) => {
       if (takingItems() && itemWriter) projectPromises(id, obs, itemWriter, refs, previous)
     })
+    restoreRejectedReminders()
     restoreReceipts()                               // 1.41.1 (Metis mail #11280): a receipt recorded met on a scheduler refusal is owed again
     writeOpenHandoffs()
     writeLaneSettings()
@@ -3522,7 +3523,7 @@ function threadSummary(thread: string): string {
 // ================================================================== lane queue + runner
 let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
 let itemWriter: ItemWriter | undefined
-type ItemClient = Pick<OnsenClient, 'recordItemWrite' | 'writtenItemId' | 'hasPendingItemCreate' | 'onItemCreateSettled'>
+type ItemClient = Pick<OnsenClient, 'recordItemWrite' | 'writtenItemId' | 'hasPendingItemCreate' | 'onItemCreateSettled' | 'rejectedSelfCreates'>
 let itemClient: ItemClient | undefined
 let waitingForFollowupId = false
 export function useItemReceiver(receiver: typeof itemReceiver, client?: ItemClient): void {
@@ -3532,10 +3533,30 @@ export function useItemReceiver(receiver: typeof itemReceiver, client?: ItemClie
   itemWriter = client?.recordItemWrite.bind(client)
   if (client) client.onItemCreateSettled = (key, id) => {
     const f = S?.followups[key]
+    if (!id) useLocalReminder(key)
     if (!f) return
     if (id && id !== f.onsen_item_id) { f.onsen_item_id = id; saveState() }
     if (waitingForFollowupId) { waitingForFollowupId = false; onGateOpen?.() }
   }
+  restoreRejectedReminders()
+}
+
+function useLocalReminder(key: string): void {
+  const f = S?.followups[key]
+  if (f?.onsen === 'submitted' && f.state === 'pending' && !f.onsen_item_id) {
+    delete f.onsen
+    f.local_reminder = true
+    saveState()
+  }
+  if (!events || !key.startsWith('promise:')) return
+  const event = key.slice('promise:'.length, key.lastIndexOf(':'))
+  const ob = events.get(event)?.obligations?.find((o: Ob) => o.self?.key === key)
+  if (ob) events.set(event, ob.id, { self: undefined, local_reminder: true })
+}
+
+function restoreRejectedReminders(): void {
+  if (!S || !events || !itemClient) return
+  for (const key of itemClient.rejectedSelfCreates()) if (!itemClient.writtenItemId(key)) useLocalReminder(key)
 }
 export function offerMissed(id: string): void { main.offerMissed(id) }
 let onGateOpen: (() => void) | undefined
@@ -4243,12 +4264,13 @@ function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = [], boundary?: 
  *  the thread's lane session (a fresh lane with the ledger summary when that lane is gone or too old). Cap, queue and
  *  the lane permission (no irreversible actions) are the ordinary lane ones. */
 export function followupTick(): void {
-  if (!S?.followups || itemReceiver?.mode.checking || takingItems()) return
+  if (!S?.followups) return
+  const take = itemReceiver?.mode.checking || takingItems()
   const now = Date.now()
   let changed = false
   for (const f of duePending(S.followups, now)) {
     // PL3: a follow-up is another run on its ORIGIN event's record (its line is a raise or it is refused, M3), not a new matter
-    if (f.onsen || queue.has(f.event)) continue
+    if (f.onsen || (take && !f.local_reminder) || queue.has(f.event)) continue
     fireFollowup(f, now)
     changed = true
   }
@@ -4307,7 +4329,7 @@ export function resumeSelfItems(): void {
   for (const f of Object.values(S.followups)) {
     if (f.onsen && !f.onsen_item_id) f.onsen_item_id = itemClient?.writtenItemId(f.id)
     if (f.state === 'ended' && f.onsen === 'submitted') withdrawCheck(f, itemWriter)
-    if (f.state !== 'pending' || f.onsen === 'submitted') continue
+    if (f.state !== 'pending' || f.local_reminder || f.onsen === 'submitted') continue
     if (f.onsen === 'awaiting_receipt' && queue.get(f.event)?.run === f.run) continue
     submitCheck(f, itemWriter)
   }

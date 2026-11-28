@@ -70,6 +70,7 @@ function timeInPhrase(words: string, at: number): number | null {
 }
 
 export function resumablePromise(o: Ob, now: number): boolean {
+  if (o.local_reminder) return false
   if (o.self) return o.state === 'met' && !o.self.complete
   return o.level === 'commitment' && o.state === 'open' && !!memberWaiter(o.to)
     && !o.told && !o.rang && o.due_at != null && o.due_at >= now
@@ -78,6 +79,7 @@ export function resumablePromise(o: Ob, now: number): boolean {
 /** Called at the M3 journal transition. The writer resolves completion to the original Item id after restart. */
 export function projectPromises(eventId: string, obs: Ob[], writer: ItemWriter, refs: ItemRef[] = [], previous: Ob[] = []): void {
   for (const o of obs) {
+    if (o.local_reminder) continue
     if (o.self) {
       if (o.state === 'met' && !o.self.complete) {
         o.self = { ...o.self, complete: true }
