@@ -131,7 +131,7 @@ async function activePerson(id: string) {
   expect(row.state).toBe('claimed')
   const offer = offers.find(n => n.content.includes(row.id))
   await hook('UserPromptSubmit', { dids: [offer.meta.did] })
-  await waitFor(() => row.claim?.session_id === sid)
+  await waitFor(() => row.claim?.session_id === 'main')
   expect(row.session_id).toBe('main')
   const stop = async () => {
     await hook('Stop', { phase: 'final' })

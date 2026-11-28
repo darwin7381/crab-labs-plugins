@@ -125,7 +125,7 @@ describe('the pull', () => {
   test('the legacy inbox exposes the member mode to reminders, including when only the tg daemon opted in', async () => {
     let status = 409
     const p = new OnsenPuller({ inbox: new OnsenInbox({ file: join(dir(), 'i.json') }), base: 'test', host: 'h', log: quiet,
-      req: async () => ({ status, json: { acked_seq: 0 } }), deliver: async () => 'delivered' })
+      req: async () => ({ status, json: status === 409 ? { detail: { code: 'take_member' } } : { acked_seq: 0 } }), deliver: async () => 'delivered' })
     await p.once().catch(() => {})
     expect(p.mode.active).toBe(true)
     status = 200

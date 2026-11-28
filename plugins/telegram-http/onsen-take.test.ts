@@ -200,11 +200,11 @@ async function accountCut(onOffer?: () => Promise<boolean>) {
 
 test('C4 switch to take imports an unsent pull cut, and waits for a pull stream write already in flight', async () => {
   const pending = await mainRig()
-  pending.mode.pause('pull', 60_000)
+  pending.f.mode(409); await pending.mode.probe()
   await pending.hook('UserPromptSubmit')
   await pending.hook('StopFailure', { error: 'overloaded' })
   const retry = pending.m.currentGen()!.cut_turn.retry_at
-  await pending.mode.probe(); await pending.m.pump()
+  pending.f.mode(200); await pending.mode.probe(); await pending.m.pump()
   await until(() => pending.f.rows.size === 1)
   expect([...pending.f.rows.values()][0]!.not_before).toBe(new Date(retry).toISOString())
   expect(pending.m.currentGen()?.cut_turn).toBeUndefined()
@@ -212,12 +212,12 @@ test('C4 switch to take imports an unsent pull cut, and waits for a pull stream 
 
   let finish!: (sent: boolean) => void
   const writing = await mainRig({ backoff: 0, onOffer: () => new Promise(resolve => { finish = resolve }) })
-  writing.mode.pause('pull', 60_000)
+  writing.f.mode(409); await writing.mode.probe()
   await writing.hook('UserPromptSubmit')
   await writing.hook('StopFailure', { error: 'overloaded' })
   const receipt = writing.m.pump()
   await until(() => writing.offers.length === 1)
-  await writing.mode.probe(); await writing.m.pump()
+  writing.f.mode(200); await writing.mode.probe(); await writing.m.pump()
   finish(true); await receipt; await writing.m.pump()
   expect(writing.m.currentGen()!.resumes).toBe(1)
   expect(writing.f.calls.filter(c => c.body.kind === 'resume')).toHaveLength(0)
@@ -1817,7 +1817,7 @@ test('one album offer acquires its three rows in one request and sends one notif
   await until(() => r.offers.length === 1)
   expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([['a','b','c']])
   await r.hook('UserPromptSubmit', { dids: [did] }); await r.sync()
-  expect(album.every(row => row.claim?.session_id === r.sid)).toBe(true)
+  expect(album.every(row => row.claim?.session_id === 'main')).toBe(true)
 })
 
 for (const take of [false, true]) test('both closed-work notices on inherited rows, take=' + take, async () => {
