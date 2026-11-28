@@ -17,7 +17,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
-import { agentName } from '../onsen-client.ts'
+import { agentName, isRoamerEnv, roamerMember } from '../onsen-client.ts'
 
 export const MEMBER_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 
@@ -94,7 +94,7 @@ export function unitEnv(text: string, home: string, into: Record<string, string>
   return into
 }
 
-export type Found = { member: string; stateDir: string; source: string }
+export type Found = { member: string; stateDir: string; source: string; roamerPort?: number }
 
 /** the Telegram daemons installed on this machine: member → its state dir (see the header); `dupes`: members two units claim (not carried) */
 export function discover(home: string, platform: string): { found: Map<string, Found>; dupes: string[] } {
@@ -120,13 +120,13 @@ export function discover(home: string, platform: string): { found: Map<string, F
     if (!sd || !isAbsolute(sd) || u.env.CHANNEL_INBOX_ONLY === '1') continue
     // an agent-inbox unit sets TELEGRAM_STATE_DIR too (its own .agent-inbox-state): only a unit whose state dir holds a bot token is a
     // Telegram daemon (the Mac mini canary found every member "claimed twice": its telegram-daemon and its agent-inbox plist)
-    // a roamer's daemon (telegram-daemon.roamer-*) carries a bot lent to any session, not a member's: not this bridge's (not this wave)
-    if (/agent-inbox/.test(u.source) || /roamer/.test(u.source) || !readToken(sd)) continue
-    const member = agentName(u.env, (u.env.AGENT_WORKSPACE_DIR ?? '').trim() || dirname(sd))
-    if (!MEMBER_RE.test(member)) continue
+    const roamer = isRoamerEnv(u.env)
+    if (/agent-inbox/.test(u.source) || (!roamer && !readToken(sd))) continue
+    const member = roamer ? roamerMember(u.env) : agentName(u.env, (u.env.AGENT_WORKSPACE_DIR ?? '').trim() || dirname(sd))
+    if (!member || !MEMBER_RE.test(member)) continue
     const had = found.get(member)
     if (had && had.stateDir !== sd) { dupes.add(member); continue }
-    found.set(member, { member, stateDir: sd, source: u.source })
+    found.set(member, { member, stateDir: sd, source: u.source, ...(roamer ? { roamerPort: Number(u.env.TELEGRAM_HTTP_PORT) || 0 } : {}) })
   }
   for (const d of dupes) found.delete(d)
   return { found, dupes: [...dupes].sort() }
@@ -136,9 +136,26 @@ export function discover(home: string, platform: string): { found: Map<string, F
 export function carried(s: Settings, d: { found: Map<string, Found> }): Map<string, Found> {
   const out = new Map<string, Found>()
   const want = (m: string) => s.list === '*' || s.list.has(m)
-  for (const [m, dir] of s.dirs) if (want(m)) out.set(m, { member: m, stateDir: dir, source: 'ONSEN_BRIDGE_STATE_DIRS' })
+  for (const [m, dir] of s.dirs) if (want(m)) {
+    const installed = [...d.found.values()].find(f => f.stateDir === dir && f.roamerPort !== undefined)
+    if (installed && installed.member !== m) continue
+    out.set(m, { ...installed, member: m, stateDir: dir, source: 'ONSEN_BRIDGE_STATE_DIRS' })
+  }
   for (const [m, f] of d.found) if (want(m) && !out.has(m)) out.set(m, f)
   return [...out.keys()].sort().reduce((acc, k) => acc.set(k, out.get(k)!), new Map<string, Found>())
+}
+
+/** Initial handover requires confirmation from this bot's daemon. A previously accepted bridge keeps its bot during an outage (D9). */
+export async function bridgeOwnsBot(f: Found, accepted: boolean, get = fetch): Promise<boolean> {
+  const port = f.roamerPort
+  if (port === undefined) return true
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return false
+  try {
+    const r = await get(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1500), redirect: 'error' })
+    if (!r.ok) return accepted
+    const h = await r.json()
+    return h.agent === f.member && h.connector?.roamer === true && h.connector.on === true && h.polling === false
+  } catch { return accepted }
 }
 
 /** TELEGRAM_BOT_TOKEN from <state dir>/.env, parsed as the daemon parses it (KEY=value lines; the value as written). Never logged.

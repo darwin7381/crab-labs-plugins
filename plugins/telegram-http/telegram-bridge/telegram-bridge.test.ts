@@ -48,9 +48,9 @@ beforeAll(() => {
   // as the Mac mini's really are (11-26 canary): an agent-inbox plist with TELEGRAM_STATE_DIR and no CHANNEL_INBOX_ONLY; its dir has no bot token
   put(join(home, 'Library', 'LaunchAgents', 'com.btai.agent-inbox.beta.plist'), plist('com.btai.agent-inbox.beta', { TELEGRAM_STATE_DIR: join(ws('beta'), '.agent-inbox-state'), LANES_AGENT: 'beta', AGENT_WORKSPACE_DIR: ws('beta') }))
   put(join(ws('beta'), '.agent-inbox-state', 'access.json'), { dmPolicy: 'allowlist', allowFrom: [], groups: {}, pending: {} })
-  // a roamer's daemon: its own bot, lent to sessions; not a member's
+  // Installed roamer; its local daemon has to confirm it stopped polling before the bridge can carry it.
   put(join(home, '.claude', 'channels', 'roamer-x', '.env'), 'TELEGRAM_BOT_TOKEN=7000000021:RRroamSECRETroamSECRETroam00\n')
-  put(join(home, 'Library', 'LaunchAgents', 'com.btai.telegram-daemon.roamer-x.plist'), plist('com.btai.telegram-daemon.roamer-x', { TELEGRAM_STATE_DIR: join(home, '.claude', 'channels', 'roamer-x') }))
+  put(join(home, 'Library', 'LaunchAgents', 'com.btai.telegram-daemon.roamer-x.plist'), plist('com.btai.telegram-daemon.roamer-x', { ROAMER_MODE: '1', ROAMER_BOT_NAME: 'roamer_x', TELEGRAM_STATE_DIR: join(home, '.claude', 'channels', 'roamer-x') }))
   put(join(ws('moved'), '.cc-agent.json'), { name: 'claude-moved', enabled: false, channels: { telegram: { state_dir: sd('moved') } } })
   tg.addBot(TOK.alpha, 'alpha_bot'); tg.addBot(TOK.beta, 'beta_bot'); tg.addBot(TOK.codex, 'lab_test_bot')
   put(join(home, '.config', 'mesh', 'telegram-bridge-macmini.credential'), CRED.mac + '\n')
@@ -90,13 +90,13 @@ describe('which agents', () => {
   })
   test('discovery: the installed daemons (not agent-inbox, not a moved manifest); the map first; only the listed', () => {
     const d = discover(home, 'darwin')
-    expect([...d.found.keys()].sort()).toEqual(['alpha', 'beta'])
+    expect([...d.found.keys()].sort()).toEqual(['alpha', 'beta', 'roamer-x'])
     expect(d.found.get('alpha')!.stateDir).toBe(sd('alpha'))
     const s = { list: new Set(['alpha', 'codex']), dirs: new Map([['codex', join(root, 'lab-state')], ['beta', '/elsewhere']]), errors: [] }
     const c = carried(s, d)
     expect([...c.keys()]).toEqual(['alpha', 'codex'])                 // beta mapped but not listed: not carried
     expect(c.get('codex')!.source).toBe('ONSEN_BRIDGE_STATE_DIRS')
-    expect([...carried({ ...s, list: '*' }, d).keys()]).toEqual(['alpha', 'beta', 'codex'])
+    expect([...carried({ ...s, list: '*' }, d).keys()]).toEqual(['alpha', 'beta', 'codex', 'roamer-x'])
     expect(carried({ ...s, list: '*' }, d).get('beta')!.stateDir).toBe('/elsewhere')   // the map wins over discovery
   })
   test('systemd units and drop-ins; two units for one member: neither', () => {
