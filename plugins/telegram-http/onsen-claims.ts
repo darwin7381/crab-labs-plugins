@@ -27,6 +27,7 @@ export class Claims implements ClaimStore {
   private rows: Record<string, Claim> = Object.create(null)
   private done: Done[] = []
   private waits = new Map<string, { state: ReceivingState; ids: string[] }>()
+  private selections: Array<{ at: number; target: ReceivingTarget | null }> = []
   pollOffset: number | null = null
   private connector?: string
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -42,6 +43,7 @@ export class Claims implements ClaimStore {
         delete row.registry_session
       }
       this.waits = new Map(data.waits ?? [])
+      this.selections = data.selections ?? []
       this.done = data.done ?? []
       this.connector = data.connector
       this.pollOffset = data.pollOffset ?? null
@@ -72,10 +74,23 @@ export class Claims implements ClaimStore {
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
     const tmp = this.file + '.' + process.pid + '.tmp'
     this.done = this.done.filter(d => d.at > this.now() - week).slice(-5000)
-    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector, pollOffset: pollOffset ?? undefined, waits: [...this.waits] }), { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify({ claims: this.rows, done: this.done, connector, pollOffset: pollOffset ?? undefined, waits: [...this.waits],
+      selections: this.selections.length ? this.selections : undefined }), { mode: 0o600 })
     renameSync(tmp, this.file)
   }
   waitingSessions() { return this.waits.keys() }
+  recordSelection(target: ReceivingTarget | null, at: number): void {
+    const last = this.selections.at(-1)
+    if (last?.target?.session_id === target?.session_id && last?.target?.claude_pid === target?.claude_pid) return
+    this.selections.push({ at: Math.max(last?.at ?? 0, at), target })
+    this.save()
+  }
+  selectedAt(at: number): ReceivingTarget | null {
+    return this.selections.findLast(s => s.at <= at)?.target ?? null
+  }
+  lastTarget(session: string): ReceivingTarget | null {
+    return this.selections.findLast(s => s.target?.session_id === session)?.target ?? null
+  }
   waitingForState(session: string, id: string): boolean { return this.waits.get(session)?.ids.includes(id) ?? false }
   observeState(session: string, state: ReceivingState): void {
     const wait = this.waits.get(session)

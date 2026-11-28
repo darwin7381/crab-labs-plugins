@@ -1,6 +1,6 @@
 import { statSync } from 'fs'
 import { dirname } from 'path'
-import type { ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
+import type { InboxItem, ItemRef, ReceivingState, ReceivingTarget } from './onsen-items.ts'
 import type { ItemReceiver } from './onsen-receive.ts'
 import type { Claims } from './onsen-claims.ts'
 import { REGISTRY_SETTLE_MS, TurnWatch, type RegEntry, type Registry } from './onsen-status.ts'
@@ -13,8 +13,11 @@ export class RoamerItems {
   private watches = new Map<string, TurnWatch>()
   private gate = ''
   private busyTurns = new Map<string, string>()
+  private pending = new Map<string, string>()
   constructor(readonly o: {
     selected(): ReceivingTarget | null
+    selectionWrittenAt(): number
+    transcript(cwd: string, session: string): string
     refreshSession(target: ReceivingTarget, sessionId: string): void
     alive(pid: number): boolean
     stream(t: ReceivingTarget): string | undefined
@@ -37,18 +40,49 @@ export class RoamerItems {
     const turn = this.watches.get(session)?.turnFacts()?.id
     if (turn) this.busyTurns.set(session, turn)
   }
-  private offerTo(): Offer | null {
+  recordSelection(selected = this.o.selected(), entries = this.o.registry.entries()): void {
+    let target = selected, at = this.o.selectionWrittenAt()
+    const reg = selected && entries.find(e => e.pid === selected.claude_pid && e.sessionId)
+    if (selected && reg && reg.sessionId !== selected.session_id) {
+      target = { ...selected, session_id: reg.sessionId, transcript: this.o.transcript(reg.cwd, reg.sessionId) }
+      at = Math.max(at, reg.statusAt ?? Date.now())
+    }
+    // Both the selection and Item.created_at use Onsen's clock, including on a delayed first peek.
+    this.o.claims.recordSelection(target, at + (this.o.claims.now() - Date.now()))
+  }
+  destination(row: InboxItem): string | null {
+    this.recordSelection()
+    const session = this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id ?? null
+    if (session) this.pending.set(row.id, session)
+    return session
+  }
+  fullList(waiting: ReadonlyMap<string, number>): void {
+    for (const id of this.pending.keys()) if (!waiting.has(id)) this.pending.delete(id)
+  }
+  selectedFor(session: string | null | undefined): boolean {
     const target = this.o.selected()
-    if (!target || !this.o.alive(target.claude_pid)) return null
-    const reg = this.o.registry.main()
-    if (!reg || reg.sessionId !== target.session_id || reg.pid !== target.claude_pid || reg.status !== 'idle') return null
-    if (!this.watches.has(reg.sessionId)) return null
+    if (!target || target.session_id !== session) return false
+    const reg = this.o.registry.entries().find(e => e.pid === target.claude_pid)
+    return !reg || reg.sessionId === session
+  }
+  private targetFor(reg: RegEntry): ReceivingTarget {
+    const last = this.o.claims.lastTarget(reg.sessionId)
+    return { session_id: reg.sessionId, claude_pid: reg.pid, transcript: this.o.transcript(reg.cwd, reg.sessionId),
+      tmux: reg.tmux ?? (last?.claude_pid === reg.pid ? last.tmux : '') }
+  }
+  private offerTo(session: string, entries = this.o.registry.entries()): Offer | null {
+    const matches = entries.filter(e => e.sessionId === session && this.o.alive(e.pid))
+    const reg = matches[0]
+    if (matches.length !== 1 || reg.status !== 'idle' || !this.watches.has(session)) return null
+    const target = this.targetFor(reg)
     const stream = this.o.stream(target)
     return stream ? { target: { ...target, stateAtOffer: this.edge(reg) }, stream } : null
   }
 
   async offer(refs: ItemRef[], notification: Notification): Promise<void> {
-    const dest = this.offerTo()
+    const session = refs[0]?.destination
+    if (!session || refs.some(ref => ref.destination !== session)) return
+    const dest = this.offerTo(session)
     if (!dest) return
     const { target, stream } = dest
     if (refs.some(ref => this.o.claims.waitingForState(target.session_id, ref.onsen_item_id))) return
@@ -58,7 +92,7 @@ export class RoamerItems {
     if (!given.size) return
     const held = refs.filter(r => given.has(r.onsen_item_id))
     if (!this.o.alive(target.claude_pid)) { this.o.receiver.report(held, 'cut', { half_done: false }); return }
-    const next = this.offerTo()
+    const next = this.offerTo(session)
     if (held.length !== refs.length || next?.stream !== stream || next.target.session_id !== target.session_id || next.target.claude_pid !== target.claude_pid) {
       this.o.receiver.report(held, 'not_taken')
       return
@@ -67,6 +101,7 @@ export class RoamerItems {
     const receipts = held.map(r => this.o.claims.receipt(r.onsen_item_id))
     const sent = await this.o.send(stream, { ...notification, params: { ...p, meta: { ...p.meta, onsen_claims: receipts.join(',') } } })
     if (!sent) this.o.receiver.report(held, 'not_taken')
+    else for (const ref of held) this.pending.delete(ref.onsen_item_id)
   }
 
   tick(): void {
@@ -74,9 +109,12 @@ export class RoamerItems {
     const all = this.o.claims.targets().sort((a, b) => (a.transcriptOffset ?? Infinity) - (b.transcriptOffset ?? Infinity))
     // An incomplete registry write is not evidence that the selected UUID has gone away.
     const entries = this.o.registry.entries().filter(e => e.sessionId)
+    this.recordSelection(selected, entries)
     const selectedEntry = selected && entries.find(e => e.pid === selected.claude_pid)
     const switched = selected && selectedEntry && selectedEntry.sessionId !== selected.session_id
     if (selected && !switched && this.o.alive(selected.claude_pid)) all.push(selected)
+    const wanted = new Set(this.pending.values())
+    for (const reg of entries) if (wanted.has(reg.sessionId) && this.o.alive(reg.pid)) all.push(this.targetFor(reg))
     const live = new Set<string>()
     for (const t of all) {
       const sid = t.session_id
@@ -118,8 +156,11 @@ export class RoamerItems {
     if (selected && switched && this.o.alive(selected.claude_pid) && !this.o.claims.targets().some(t => t.session_id === selected.session_id))
       this.o.refreshSession(selected, selectedEntry.sessionId)
     for (const sid of this.watches.keys()) if (!live.has(sid)) { this.watches.delete(sid); this.busyTurns.delete(sid) }
-    const dest = this.offerTo()
-    const gate = dest ? JSON.stringify([dest.target.session_id, dest.stream, dest.target.stateAtOffer]) : ''
+    if (selected) wanted.add(selected.session_id)
+    const gate = JSON.stringify([selected?.session_id, ...[...wanted].sort().map(sid => {
+      const dest = this.offerTo(sid, entries)
+      return dest ? [sid, dest.stream, dest.target.stateAtOffer] : null
+    })])
     if (gate !== this.gate) { this.gate = gate; this.o.revisit(); this.o.watch.changed() }
   }
   private current() { return this.watches.get(this.o.selected()?.session_id ?? '') }

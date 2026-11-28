@@ -57,7 +57,7 @@ import {
   registerSelfAsDaemon as roamerRegisterSelfAsDaemon,
   unregisterSelfAsDaemon as roamerUnregisterSelfAsDaemon,
   handleModelCallbackForCurrentTarget,
-  roamerCurrentTranscript, receivingTarget, refreshTargetSession, takeoverStream, pidAlive,
+  roamerCurrentTranscript, receivingTarget, refreshTargetSession, takeoverStream, pidAlive, onRoamerSelection, selectionWrittenAt, transcriptPath,
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
@@ -383,7 +383,8 @@ if (ONSEN_TAKE_ON) {
     if (ROAMER && itemClaims.carriedBy(takeMode.connector)) CONNECTOR = onsen.cfg.record = takeMode.observationRequired = true
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok), line => itemClaims!.reportBody(line))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
-    itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked())
+    itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(),
+      ROAMER ? waiting => roamerItems?.fullList(waiting) : undefined)
     if (!ROAMER) { Lanes.useItemReceiver(itemReceiver); Lanes.observeItemGates(() => itemPeek!.reset()) }
   }
 }
@@ -610,7 +611,10 @@ async function connectorCommand(text: string, chat: string, ref: string, userId:
     const control = isControlEnabled() && (sharedTuiCommands().includes(cmd) || controlCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/kill-stuck', '/sessions', '/list'].includes(cmd))
     const roamer = isRoamerEnabled() && (roamerCommandsForBotApi().some(c => '/' + c.command === cmd) || ['/list', '/whoami', '/sessions', '/kill-stuck'].includes(cmd))
     if (!control && !roamer && !['/start', '/help', '/status', '/main', '/lanes'].includes(cmd)) return false
+    const targetCommand = roamerItems && !['/roam', '/list', '/roam_status', '/whoami', '/start', '/help', '/status'].includes(cmd)
+    if (targetCommand && !roamerItems!.selectedFor(item.destination)) return true
     if (!itemReceiver || !(await itemReceiver.receive([item])).given.has(item.onsen_item_id)) throw new Error('command item not available')
+    if (targetCommand && !roamerItems!.selectedFor(item.destination)) { itemReceiver.report([item], 'not_taken'); return true }
   }
   let handled = false
   try {
@@ -3515,7 +3519,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
             docMime: attachment!.mime, docName: attachment!.name }),
       item: f.item, onsenId: f.onsenId, meta, ...(f.clientMeta ? { clientMeta: f.clientMeta } : {}), keys, ...(inTopic != null ? { routeTopic: String(inTopic) } : {}),
     }, OnsenInbound.albumCountOf(f))
-    restartAlbumItems(chat_id, String(mgid))
+    if (!f.item?.destination) restartAlbumItems(chat_id, String(mgid))
     return true
   }
 
@@ -3650,7 +3654,7 @@ function bufferAlbumItem(
           docKind?: string; docMime?: string; docName?: string; meta: Record<string, string>; clientMeta?: Record<string, string>; keys?: string[]; routeTopic?: string },
   count: number | null = null,
 ): void {
-  const key = `${chatId}:${mgid}`
+  const key = item.item?.destination ? JSON.stringify([chatId, mgid, item.item.destination]) : `${chatId}:${mgid}`
   let entry = albumBuffers.get(key)
   if (!entry) {
     entry = { chatId, ids: [], captions: [], items: [], baseMeta: item.meta, ...(item.clientMeta ? { clientMeta: item.clientMeta } : {}), timer: null,
@@ -3686,7 +3690,7 @@ function albumWait(key: string, entry: AlbumEntry): void {
 /** WO-197 (lab 19:24Z): the items of this album whose facts this daemon keeps and that are not in it (not back from the inbox yet, or left by a
  *  restart): added now, in its buffer (finishInbound with their keys: finished when the album goes); one being handed over right now is left to it */
 async function albumHeldItems(entry: AlbumEntry, key: string): Promise<void> {
-  if (!inboundStore) return
+  if (!inboundStore || entry.items[0]?.item?.destination) return
   const mgid = key.slice(entry.chatId.length + 1)
   const mine = (k: string): OnsenInbound.Facts | undefined => {
     const f = inboundStore!.get(k)
@@ -4513,8 +4517,9 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
   // WO-165: seen (lanes off) comes from this read; it follows the registry's main session (its <session id>.jsonl) at once, so a new session's first
   // message is not seen only at the next 10 s rescan (registry is set up below: read only once the block has run)
   if (ROAMER && itemReceiver && itemClaims) {
-    roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, refreshSession: refreshTargetSession, alive: pidAlive,
+    roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, selectionWrittenAt, transcript: transcriptPath, refreshSession: refreshTargetSession, alive: pidAlive,
       stream: targetStream, send: notifyStream, watch: { facts, joey: onsenJoeyOf, changed: kick, turnEnded }, revisit: () => itemPeek!.reset() })
+    onRoamerSelection(() => { roamerItems!.recordSelection(); kick() })
   }
   const watch = tap ? null : roamerItems ?? new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })
@@ -5033,6 +5038,10 @@ async function routeInboxItem(row: InboxItem, change?: 'edited' | 'version'): Pr
     const result = await itemReceiver!.receive([item])
     if (result.given.has(row.id)) itemReceiver!.report([item], 'completed')
     return
+  }
+  if (roamerItems) {
+    item.destination = roamerItems.destination(row)
+    if (!item.destination && row.kind !== 'control' && !/^\s*\/[A-Za-z]/.test(row.payload.text ?? '')) return
   }
   const payload = { ...row.payload }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')

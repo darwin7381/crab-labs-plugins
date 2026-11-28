@@ -9,8 +9,10 @@ type Row = InboxItem & { waiter: string; preview: string; line: string; created_
 const iso = (ms: number) => new Date(ms).toISOString()
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
-export function fakeItems(member = 'adam', actionPort?: number) {
+export function fakeItems(member = 'adam', actionPort?: number, clock?: () => number) {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
+  let skew = 0
+  const syncTime = () => { if (clock) now = Math.max(now, clock() + skew) }
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
   const givenByPull = new Set<Row>()
   let pullAcked = 0
@@ -35,6 +37,7 @@ export function fakeItems(member = 'adam', actionPort?: number) {
     }
   }
   const add = (id: string, kind = 'message', extra: Partial<Row> = {}): Row => {
+    syncTime()
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
@@ -58,6 +61,7 @@ export function fakeItems(member = 'adam', actionPort?: number) {
     return { ...row, takeable: { now: row.state === 'waiting' && !why, why } }
   }
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 60, async fetch(req) {
+    syncTime()
     const url = new URL(req.url), path = url.pathname, q = url.searchParams
     const b = req.method === 'GET' ? {} : await req.json() as any, key = req.headers.get('Idempotency-Key')
     const connector = b.connector ?? q.get('connector')
@@ -169,6 +173,6 @@ export function fakeItems(member = 'adam', actionPort?: number) {
     return answer
   } })
   return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,
-    advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
+    advance(ms: number) { now += ms; skew += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }

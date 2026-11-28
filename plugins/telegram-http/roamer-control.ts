@@ -291,8 +291,14 @@ function readState(): RoamerState {
   catch { return { current_target: null } }
 }
 
+let selectionChanged: (() => void) | undefined
+export function onRoamerSelection(change: () => void): void { selectionChanged = change }
+export function selectionWrittenAt(): number {
+  try { return Math.floor(statSync(ROAMER_STATE_FILE).mtimeMs) } catch { return Date.now() }
+}
 function writeState(state: RoamerState): void {
   atomicWriteJson(ROAMER_STATE_FILE, state)
+  selectionChanged?.()
 }
 
 // ---- MCP session ↔ tmux mapping ----------------------------------------
@@ -544,7 +550,7 @@ const PROJECTS_ROOT = join(homedir(), '.claude', 'projects')
 function cwdSlug(cwd: string): string {
   return '-' + cwd.replace(/\//g, '-').replace(/^-+/, '')
 }
-function transcriptPath(cwd: string, sessionId: string): string {
+export function transcriptPath(cwd: string, sessionId: string): string {
   return join(PROJECTS_ROOT, cwdSlug(cwd), `${sessionId}.jsonl`)
 }
 

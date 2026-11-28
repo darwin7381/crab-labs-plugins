@@ -45,7 +45,7 @@ async function waitFor(ok: () => boolean | Promise<boolean>, ms = 5000) {
   expect(await ok()).toBe(true)
 }
 async function daemon(env: Record<string, string> = {}, initialMode = 200, setup?: (root: string, f: ReturnType<typeof fakeItems>) => Record<string, string> | Promise<Record<string, string>>, actionPort?: number) {
-  const f = fakeItems(env.LANES_AGENT || 'adam', actionPort), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
+  const f = fakeItems(env.LANES_AGENT || 'adam', actionPort, env.ROAMER_MODE === '1' ? Date.now : undefined), root = mkdtempSync(join(tmpdir(), 'take-daemon-')), state = join(root, 'tg'), lanes = join(root, '.lanes')
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
@@ -873,12 +873,13 @@ async function target(d: Awaited<ReturnType<typeof daemon>>) {
 
 test('roamer switches between two live streams in one cwd, binds on intake and completes only the receiving UUID', async () => {
   const d = await daemon({ ...roamerEnv, ONSEN_BRIDGE_WAIT_MS: '10', C6_SHORT_BUSY: '1' }, 200, roamerState)
-  const one = d.f.add('first', 'message', { session_id: 'main' })
+  const unaddressed = d.f.add('before-any-target')
   const a = await target(d), b = await target(d)
   await Bun.sleep(350)
-  expect(one.claim).toBeNull()
+  expect(unaddressed.claim).toBeNull()
   expect(a.got).toHaveLength(0); expect(b.got).toHaveLength(0)
   a.select()
+  const one = d.f.add('first', 'message', { session_id: 'main' })
   await waitFor(() => a.got.length === 1)
   expect(one.claim!.session_id).toBeNull()
   b.accept(a.got[0]); b.stop()
@@ -895,6 +896,7 @@ test('roamer switches between two live streams in one cwd, binds on intake and c
   expect(two.session_id).toBe(b.sid)
   expect(a.got.map(n => n.content)).toEqual(['first'])
   expect(b.got.map(n => n.content)).toEqual(['second'])
+  expect(unaddressed.state).toBe('waiting')
   const reply = await a.client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'first received' } })
   expect(reply.isError).not.toBe(true)
   const beforeBusy = d.f.calls.length
@@ -996,8 +998,9 @@ test('a missed item waits through fresh peeks and restart until its session chan
   a.select()
   // Server-stamped taken_at leaves one second of the normal 20 s acceptance window.
   d.f.advance(-19_000)
-  const row = d.f.add('unseen')
+  const row = d.f.add('unseen', 'message', { created_at: new Date().toISOString() })
   await waitFor(() => row.reason === 'not_taken')
+  d.f.advance(Date.now() - d.f.now()) // later arrivals and the restarted probe share the selection clock
   expect(a.got.filter(n => n.content === row.id)).toHaveLength(1)
   a.status('idle') // refreshing the same status timestamp is not a state change
   await Bun.sleep(1300)
@@ -1023,7 +1026,7 @@ test('a missed session can change state while a different busy target is selecte
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   a.select(); b.status('busy')
   d.f.advance(-19_000)
-  const row = d.f.add('await-edge')
+  const row = d.f.add('await-edge', 'message', { created_at: new Date().toISOString() })
   await waitFor(() => row.reason === 'not_taken')
   d.f.advance(Date.now() - d.f.now()) // the next take gets a fresh acceptance window
   b.select()
@@ -1040,7 +1043,7 @@ test('a missed session can change state while a different busy target is selecte
   expect(row.failures).toBe(1)
 }, 12000)
 
-test('changing target during take releases that attempt before writing either stream', async () => {
+test('changing target during take delivers only to the UUID selected at arrival', async () => {
   const d = await daemon(roamerEnv, 200, roamerState)
   const a = await target(d), b = await target(d)
   a.select()
@@ -1048,11 +1051,37 @@ test('changing target during take releases that attempt before writing either st
   const row = d.f.add('moves')
   await waitFor(() => !!row.claim)
   b.select()
-  await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'not_taken'))
-  expect(a.got).toHaveLength(0)
-  await waitFor(() => b.got.length === 1)
-  expect(b.got[0].content).toBe('moves')
+  await waitFor(() => a.got.length === 1)
+  expect(a.got[0].content).toBe('moves')
+  a.accept(a.got[0])
+  await waitFor(() => row.claim?.session_id === a.sid)
+  expect(b.got).toHaveLength(0)
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(1)
 }, 12000)
+
+test('a busy arrival and a late first peek keep A across a switch to B and a daemon restart', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  a.status('busy'); a.select()
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.sessions?.some((s: any) => s.activity === 'running')))
+  const arrived = new Date().toISOString()
+  const deferred = d.f.add('deferred-for-A', 'mail', { not_before: new Date(Date.now() + 1200).toISOString() })
+  await Bun.sleep(30)
+  b.select()
+  const fresh = d.f.add('fresh-for-B')
+  await waitFor(() => b.got.length === 1)
+  expect(b.got[0].content).toBe(fresh.id)
+  b.accept(b.got[0]); await waitFor(() => fresh.claim?.session_id === b.sid)
+  await d.restart(); await a.connect(); await b.connect()
+  const delayed = d.f.add('late-first-peek-for-A', 'message', { created_at: arrived, session_id: 'main' })
+  await Bun.sleep(400)
+  expect([deferred.claim, delayed.claim]).toEqual([null, null])
+  a.status('idle')
+  await waitFor(() => a.got.length === 2)
+  expect(a.got.map(n => n.content).sort()).toEqual([deferred.id, delayed.id].sort())
+  for (const msg of a.got) a.accept(msg)
+  await waitFor(() => [deferred, delayed].every(row => row.claim?.session_id === a.sid))
+  expect(b.got.map(n => n.content)).toEqual([fresh.id])
+}, 16000)
 
 function command(d: Awaited<ReturnType<typeof daemon>>, id: string, text: string, tgId: string) {
   return d.f.add(id, 'control', { message_id: 'm-' + id, payload: { message_id: 'm-' + id, from: 'joey', conversation_id: 'conv',
