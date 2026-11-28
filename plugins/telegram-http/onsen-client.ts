@@ -116,6 +116,12 @@ export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: str
 /** A take receipt supplements the Call. Only the Item reports the turn's progress. */
 export type ScheduledResultLine = { event: string; idem: string; call_id: string | null; run_id: string
   body: { state?: never; result: { outcome: string; steps?: Step[]; body?: { format: 'markdown'; text: string } } } }
+// Older queued receipts included result.steps. Fleet Core accepts the checklist as Markdown in result.body.
+export function scheduledResult(outcome: string, summary: string, steps?: Step[] | null) {
+  const checklist = steps?.map(s => `- [${s.done ? 'x' : ' '}] ${s.step}${s.note ? ' — ' + s.note : ''}`).join('\n')
+  const text = [summary, checklist].filter(Boolean).join('\n\n')
+  return { outcome, ...(text ? { body: { format: 'markdown' as const, text: Array.from(text).slice(0, 4000).join('') } } : {}) }
+}
 /** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): what became of one spooled Call line. took: Onsen answered 2xx (its state then);
  *  refused: a 4xx (Onsen's sentence; the line is in rejected.jsonl); pending: no answer, or 5xx, within the wait (the line stays in the spool and
  *  goes when Onsen answers); nocred: this daemon has no mesh credential (a broken setup) */
@@ -1083,7 +1089,12 @@ export class OnsenClient {
           }
           id = String(call.id)
         }
-        const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, c.body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        let body = c.body
+        if ('run_id' in c && c.body.result.steps) {
+          const old = c.body.result
+          body = { result: scheduledResult(old.outcome, old.body?.text ?? '', old.steps) }
+        }
+        const r = await this.put(`/v1/calls/${encodeURIComponent(id)}/state`, body, cred).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (r.status >= 200 && r.status < 300) {
           const st = r.json?.data?.state
           if (c.body.state && st && st !== c.body.state) this.stats.calls_unchanged++; else this.stats.calls_put++

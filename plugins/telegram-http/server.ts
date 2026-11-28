@@ -363,7 +363,7 @@ const readMeshCredential = cachedCredentialFile(join(STATE_DIR, 'mesh-credential
 // A gateway can serve both backends. Match the most specific mounted path, including
 // the two BTCC mail routes that a mail URL or roster entry can address on that gateway.
 const authBases = [
-  ...['mail', 'mailbox'].map(route => ({ base: BTCC_API_BASE ? URL.parse(`${BTCC_API_BASE}/api/mesh/${route}`) : null, bench: false })),
+  ...['mesh/mail', 'mesh/mailbox', 'scheduler', 'comms', 'fleet/main-registry'].map(route => ({ base: BTCC_API_BASE ? URL.parse(`${BTCC_API_BASE}/api/${route}`) : null, bench: false })),
   { base: URL.parse(ONSEN_BASE), bench: true },
   { base: URL.parse(FLEET_CORE_BASE), bench: true },
   { base: URL.parse(BTCC_API_BASE), bench: false },
@@ -384,7 +384,7 @@ function credentialFor(url: string | null, fallback = readMeshCredential): strin
   return fallback()
 }
 
-function meshAuth(url: string | null = null): Record<string, string> {
+function meshAuth(url: string): Record<string, string> {
   const value = credentialFor(url)
   return value ? { Authorization: `Bearer ${value}` } : {}
 }
@@ -2135,9 +2135,10 @@ function maybeAutoAckScheduled(runId: string | undefined): void {
     if (autoAckedRuns.has(rid)) return
     autoAckedRuns.add(rid)
     if (autoAckedRuns.size > 500) autoAckedRuns.clear()  // unbounded-growth guard
-    void fetch(`${BTCC_API_BASE}/api/scheduler/runs/${rid}/ack`, {
+    const url = `${BTCC_API_BASE}/api/scheduler/runs/${rid}/ack`
+    void fetch(url, {
       method: 'POST',
-      headers: meshAuth(),
+      headers: meshAuth(url),
       signal: AbortSignal.timeout(6000),
     }).then(r => log('info', `scheduler auto-ack run ${rid}: ${r.status}`))
       .catch(err => log('warn', `scheduler auto-ack run ${rid} failed (agent can still ack manually): ${err}`))
@@ -2189,14 +2190,16 @@ const MESH_REQUIRE_SIGNED = process.env.MESH_REQUIRE_SIGNED === '1'
 // this daemon's own credential; without BTCC or a credential the refusal and its log line
 // stand on their own.
 function fileHeld(claimed: string, relay: string, text: string, reason: string): void {
-  const auth = meshAuth()
-  if (!BTCC_API_BASE || !auth.Authorization) return
+  if (!BTCC_API_BASE) return
+  const url = `${BTCC_API_BASE}/api/comms/quarantine`
+  const auth = meshAuth(url)
+  if (!auth.Authorization) return
   // the mailbox shows the identity the claim names; the claim as given, if different,
   // stays visible at the top of the text
   const named = claimedIdentity(claimed)
   const shown = named === claimed ? text : `[claimed as: ${claimed.slice(0, 80)}]
 ${text}`
-  void fetch(`${BTCC_API_BASE}/api/comms/quarantine`, {
+  void fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...auth },
     body: JSON.stringify({ to_agent: INBOX_SELF, claimed_from: named.slice(0, 64), text: shown.slice(0, 4000), reason, relay }),
@@ -2469,12 +2472,13 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   if (target === 'joey' || target === 'joey (btcc)') {
     if (!BTCC_API_BASE) return 'send to joey FAILED: "joey" is a log-only target and BTCC_API_BASE is not configured on this machine — nothing was sent. Use reply to tell Joey directly.'
     try {
-      const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
+      const url = `${BTCC_API_BASE}/api/comms/log`
+      const r = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-          ...meshAuth(),
+          ...meshAuth(url),
         },
         body: JSON.stringify({ from_agent: INBOX_SELF, to_agent: 'Joey (BTCC)', kind: 'message', body, delivery: 'delivered', reply_to_id: replyTo ?? null, ...(opRef ? { op: opRef } : {}) }),
         signal: AbortSignal.timeout(8000),
@@ -2499,12 +2503,13 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   let opWarn = ''
   let held = ''
   if (BTCC_API_BASE) try {
-    const lr = await fetch(`${BTCC_API_BASE}/api/comms/log`, {
+    const url = `${BTCC_API_BASE}/api/comms/log`
+    const lr = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-        ...meshAuth(),
+        ...meshAuth(url),
         // one thing, one owner (Joey TG 970): we honour BTCC's hold, so BTCC may hold us (409)
         'X-Mesh-Fanout': '1',
       },
@@ -2571,12 +2576,13 @@ async function sendToAgent(to: string, text: string, replyTo?: number, noReply?:
   // settle the delivery status on the minted row (best effort)
   if (msgId != null) {
     try {
-      void fetch(`${BTCC_API_BASE}/api/comms/log-status`, {
+      const url = `${BTCC_API_BASE}/api/comms/log-status`
+      void fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}),
-          ...meshAuth(),
+          ...meshAuth(url),
         },
         body: JSON.stringify({ id: msgId, delivery }),
         signal: AbortSignal.timeout(6000),
@@ -4411,8 +4417,9 @@ if (Lanes.LANES_ON) {
       schedulerCall: async (runId, action, outcome, note) => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         try {
-          const r = await fetch(`${BTCC_API_BASE}/api/scheduler/runs/${runId}/${action}`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() },
+          const url = `${BTCC_API_BASE}/api/scheduler/runs/${runId}/${action}`
+          const r = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth(url) },
             // 1.41.1: BTCC's outcomes are ok | nothing-to-do | failed. Receipt note (btcc-ack-auth): the line is `note` (bt-control-center scheduler.py complete_run reads note only)
             body: JSON.stringify(action === 'complete' ? { outcome: outcome ?? 'ok', ...(note ? { note } : {}) } : {}),
             signal: AbortSignal.timeout(6000),
@@ -4428,8 +4435,9 @@ if (Lanes.LANES_ON) {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
         try {
-          const r = await fetch(`${BTCC_API_BASE}/api/fleet/main-registry`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth() }, body: JSON.stringify({ machine, ...a }), signal: AbortSignal.timeout(6000) })
+          const url = `${BTCC_API_BASE}/api/fleet/main-registry`
+          const r = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...meshAuth(url) }, body: JSON.stringify({ machine, ...a }), signal: AbortSignal.timeout(6000) })
           return `HTTP ${r.status}${r.ok ? '' : ` ${(await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200)}`}`
         } catch (e) { return `failed: ${e}` }
       },
@@ -5030,8 +5038,9 @@ async function deliverInbound(body: InboundBody | null, verdict: Verdict, o: { h
 }
 async function logPeerArrival(row: Record<string, unknown>): Promise<number | undefined> {
   if (!BTCC_API_BASE) return
-  const r = await fetch(`${BTCC_API_BASE}/api/comms/log`, { method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}), ...meshAuth() },
+  const url = `${BTCC_API_BASE}/api/comms/log`
+  const r = await fetch(url, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(process.env.CHANNEL_INJECT_TOKEN ? { 'X-Alert-Token': process.env.CHANNEL_INJECT_TOKEN } : {}), ...meshAuth(url) },
     body: JSON.stringify({ ...row, to_agent: INBOX_SELF }), signal: AbortSignal.timeout(6000) }).catch(() => null)
   if (r?.ok) { const j = await r.json().catch(() => ({})) as { id?: number }; return j.id }
 }

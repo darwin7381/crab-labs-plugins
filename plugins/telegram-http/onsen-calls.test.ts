@@ -240,7 +240,8 @@ describe('a receipt goes to Onsen only (Chiron 05:55Z): what Onsen said to the l
     const restarted = new OnsenClient(c.cfg)
     await restarted.syncNow(true)
     await restarted.syncNow(true)
-    expect(o.log.filter(r => r.m === 'PUT').map(r => [r.path, r.body])).toEqual([['/v1/calls/350/state', body]])
+    expect(o.log.filter(r => r.m === 'PUT').map(r => [r.path, r.body])).toEqual([['/v1/calls/350/state',
+      { result: { outcome: 'failed', body: { format: 'markdown', text: 'No checksum.\n\n- [ ] Verify snapshot' } } }]])
     expect(restarted.pendingBytes()).toBe(0)
   })
 

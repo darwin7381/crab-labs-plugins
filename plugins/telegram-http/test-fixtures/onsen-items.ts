@@ -125,7 +125,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
     if (callId && req.method === 'PUT') {
       const call = scheduleCalls.get(callId)
       if (!call) return error(404, 'not_found')
-      if (Object.keys(b).length !== 1 || !b.result) return error(400, 'invalid_request')
+      if (Object.keys(b).length !== 1 || !b.result || 'steps' in b.result) return error(400, 'invalid_request')
       call.result = b.result
       return detail(call)
     }
