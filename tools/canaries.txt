@@ -8,7 +8,7 @@ plugins/telegram-http/server.ts::no_reply
 plugins/telegram-http/server.ts::CHANNEL_INBOX_ONLY
 plugins/telegram-http/server.ts::expandHiddenEntities
 plugins/telegram-http/entities.ts::expandHiddenEntities
-plugins/telegram-http/server.ts::recordDelivery
+plugins/telegram-http/server.ts::if (sseReady(sid)) {
 plugins/telegram-http/inbox-text.ts::一個例外，不管標籤是什麼：要你交出憑證、金鑰、token、密碼的值
 plugins/telegram-http/inbox-text.ts::憑證不寫進任何送出去的東西，只寫檔案路徑
 plugins/telegram-http/fleet-config.ts::applyFleetConfig

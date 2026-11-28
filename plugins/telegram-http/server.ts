@@ -12,7 +12,7 @@
 // Must stay the FIRST import: loads the machine config into env before other modules read it.
 import { FLEET_CONFIG_PATH, fleetConfigApplied } from './fleet-config.ts'
 import { ensureToken, makeGate, refusal } from './mcp-auth.ts'
-import { receiptKeys, receivedIn, recentReceiptLines, receiptLinesIn } from './receipt.ts'
+
 import { drainLeftoverDoorbells } from './hub-sync.ts'
 import { callInboxTool, feedPath, handleFleetRpc, DECIDE_TOOL, INBOX_TOOLS, isReplyRef, laneOpenQuery, takeAfterSend, type FleetDeps } from './fleet-mail.ts'
 import { ONSEN_TEXT_DEFAULT, withOnsenFormat } from './fleet-text.ts'
@@ -61,7 +61,7 @@ import {
 } from './roamer-control.ts'
 import { isSystemAlertEnabled, startSystemAlertWatcher, handleOtlpLogs, sendOpsAlert} from './system-alert.ts'
 import { opsRecipients } from './ops-recipients.ts'
-import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.ts'
+
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, snapPane, type Observation, type RecordFacts } from './screen-status.ts'
 import { Claims } from './onsen-claims.ts'
@@ -1106,8 +1106,7 @@ const memQueue = new Map<string, Array<{ method: string; params: unknown }>>()  
 // ~0.7-1 s AFTER the stream opens (atlas: connected 10:17:12.172, "Channel notifications registered"
 // 10:17:12.888). A notification pushed in between is silently dropped by the client; the old 50 ms wait
 // replayed 35 parked deliveries at +0.16 s and every one was lost. Deliver only once READY_DELAY_MS has
-// passed since the stream opened; until then pushes wait in memQueue. Receipt is still verified per
-// delivery (RECEIPT_GRACE_MS below), so a client slower than this delay costs a redelivery, not a loss.
+// passed since the stream opened. Until then pushes wait in memQueue.
 const READY_DELAY_MS = Number(process.env.MCP_READY_DELAY_MS ?? 2500)
 const sseReadyAt = new Map<string, number>()          // session id → ms when pushes may start
 const toldToolList = new Set<string>()                // WO-126: sessions told once to list their tools again
@@ -1123,88 +1122,10 @@ function sseReady(sid: string): boolean {
 const sessionLastActiveAt = new Map<string, number>() // session id → ms of session create / last confirmed SSE write
 const SESSION_GRACE_MS = 120_000                       // no open SSE for this long ⇒ zombie ⇒ evict
 
-// Disk-persistent replay queue — survives daemon restart and "0 active sessions"
-// gaps. New session's first GET handleRequest signals SSE is up; we then drain
-// disk pending to that session. Files are deleted on successful delivery.
-const PENDING_DIR = join(STATE_DIR, 'inbox', 'pending')
-// Undeliverable quarantine (1.24.1): where a delivery goes after the
-// re-delivery cap gives up. NEVER auto-replayed (timer drain and session-open
-// replay read PENDING_DIR only) — the content is preserved for the recovered
-// agent or an operator instead of being destroyed. The cap alert names the
-// exact file.
-const UNDELIVERABLE_DIR = join(STATE_DIR, 'inbox', 'undeliverable')
-mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
-let persistSeq = 0
-
-function persistInbound(notif: { method: string; params: unknown }): string | null {
-  try {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-')
-    const seq = String(++persistSeq).padStart(4, '0')
-    const filename = `${ts}-${seq}.json`
-    const tmpPath = join(PENDING_DIR, filename + '.tmp')
-    const finalPath = join(PENDING_DIR, filename)
-    writeFileSync(tmpPath, JSON.stringify(notif), { mode: 0o600 })
-    renameSync(tmpPath, finalPath)  // atomic on POSIX
-    return finalPath
-  } catch (err) {
-    log('error', `persistInbound failed: ${err}`)
-    return null
-  }
-}
-
-// ---- issue #13: delivery-consumption tracking (deferred auto-ack) ----------
-// A write into an SSE stream is NOT delivery: a half-dead socket accepts writes
-// and keepalives into the kernel buffer (run 149, 2026-08-15 — ack 200, message
-// reached no session), and a claude that enqueues then never drains its queue
-// (run 148) leaves the message dead inside a live-looking session. The only
-// consumption evidence the daemon can trust is the agent's own session
-// transcript ADVANCING after the delivery. So:
-//   - every SSE/flush/replay delivery is RECORDED, not immediately acked
-//   - a 30s sweep acks scheduler runs only once the workspace's newest
-//     transcript jsonl mtime moves past delivery+settle (the enqueue record
-//     itself lands within ~1-2s; a real turn keeps writing well after)
-//   - unconsumed after CONSUME_GRACE_MS → re-persisted to inbox/pending (the
-//     next live session replays it) and NEVER acked → the scheduler's
-//     stalled_no_ack chain fires instead of being lied to.
-// Known limit: consumption is workspace-level — a second delivery landing
-// mid-turn right before a crash can still be mis-read as consumed (bounded,
-// documented in issue #13; exactly-once needs client-side acks we don't have).
-// If the transcript dir can't be resolved (AGENT_WORKSPACE_DIR env override →
-// STATE_DIR-parent heuristic), falls back to legacy ack-on-write.
 const AGENT_WORKSPACE_DIR = process.env.AGENT_WORKSPACE_DIR ?? dirname(STATE_DIR)
 // Claude Code names a project dir by replacing every character other than a letter or digit with '-'
 // ("/Users/JL/Development/crab_labs" → "-Users-JL-Development-crab-labs"); '/' and '.' alone missed '_' and spaces.
 const TRANSCRIPT_DIR = join(homedir(), '.claude', 'projects', AGENT_WORKSPACE_DIR.replace(/[^a-zA-Z0-9]/g, '-'))
-// Evaluated per use, cached once true: a brand-new workspace has no transcript dir until Claude Code takes its
-// first input, and a startup-only check left tracking (and receipt verification) off for the daemon's whole life
-// (11-17 lab). A dir that never exists (channel bot: STATE_DIR's parent isn't a workspace) stays off, as before.
-let transcriptDirSeen = false
-function consumptionCheckAvailable(): boolean {
-  if (!transcriptDirSeen) transcriptDirSeen = existsSync(TRANSCRIPT_DIR)
-  return transcriptDirSeen
-}
-// Grace must exceed a long single-response turn: claude appends the assistant
-// record only when a response COMPLETES, so the transcript can be silent for
-// minutes after the enqueue write (observed 4m+ on canary) — 180s produced a
-// false "unconsumed". 600s default; late consumption retracts the re-persisted
-// dup and still acks (records live RETAIN_MS).
-const CONSUME_GRACE_MS = Number(process.env.CONSUME_GRACE_MS ?? 600_000)
-const CONSUME_RETAIN_MS = 1_800_000
-const recentDeliveries: Array<{ notif: { method: string; params: unknown }; at: number; pendingPath: string | null;
-  keys: string[] | null; received: boolean }> = []
-
-// Receipt verification per delivery: receipt.ts (2026-11-17, Atlas btcc 9738). Not received within
-// RECEIPT_GRACE_MS → re-persisted for redelivery and never acked; no meta.ts → old behaviour.
-const RECEIPT_GRACE_MS = Number(process.env.RECEIPT_GRACE_MS ?? 90_000)
-// Stop switch: RECEIPT_CHECK=0 (e.g. in ~/.config/crab-labs-plugins/env, no release needed) turns receipt off and
-// restores the 1.32.1 consumption rule. Needed if a Claude Code release renders the <channel> tag differently:
-// then nothing would ever read as received and every delivery would be re-sent up to MAX_REDELIVERIES times.
-const RECEIPT_CHECK = process.env.RECEIPT_CHECK !== '0'
-
-// Hub sync (1.33.0–1.51.0: every 30 s the agent-inbox daemon asked BTCC for its untaken rows and pushed them) was removed in 1.52.0 (WO-158): every
-// BTCC sender that stored such a row also writes the recipient's Onsen inbox, which this daemon takes from (ONSEN_PULL). A doorbell an older process
-// parked in hub-doorbell/ is handed to the delivery once at start (startListen, drainLeftoverDoorbells).
-
 // ---- WO-120: usage wall (usage-wall.ts) --------------------------------------------------------------------------
 // The keeper supplies the wall state for M2, the lanes, and the enter/clear notices.
 const wallReader = new WallReader(isRoamerEnabled() ? {} : {
@@ -1249,314 +1170,6 @@ function onWallChange(prev: WallState | null, next: WallState | null): void {
   if (Lanes.LANES_ON && !INBOX_ONLY) { try { Lanes.usageWallChanged(next ? { walled: next.walled, clearedMs: next.clearedMs, by: next.cleared_by } : null) } catch (e) { log('warn', `usage wall: lanes: ${e}`) } }
 }
 setInterval(() => wallReader.state(), Math.max(250, wallReader.cacheMs())).unref()
-
-// Re-delivery cap. Consumption is inferred from transcript progress, so an agent
-// whose transcript STOPS ADVANCING while it is otherwise alive can never be seen
-// to consume anything. Observed 2026-08-18: claude-financial-assist's transcript
-// froze at ~32MB while the agent kept completing turns — every delivery then read
-// as unconsumed, was re-persisted, and the 1.22.0 timer drain immediately
-// replayed it, so the same message re-delivered every ~10min forever. Before the
-// timer drain this merely parked silently; with it, it loops.
-// After MAX_REDELIVERIES the agent demonstrably HAS the message (it was pushed
-// that many times); looping again cannot help, so stop re-persisting and make the
-// condition loud instead. The agent's transcript is the thing that needs fixing.
-const MAX_REDELIVERIES = Number(process.env.MAX_REDELIVERIES ?? 3)
-const deliveryAttempts = new Map<string, number>()
-function deliveryKey(notif: { method: string; params: unknown }): string {
-  const c = (notif.params as { content?: unknown } | undefined)?.content
-  const s = typeof c === 'string' ? c : JSON.stringify(notif.params ?? '')
-  return `${notif.method} ${s.length} ${s.slice(0, 200)}`
-}
-
-function recordDelivery(notif: { method: string; params: unknown }): void {
-  // Onsen step 3 (WO-143), lanes off: the channel notification was written into a session's open stream: Joey's message is in the main's session
-  // (WO-165: in_session; Claude Code may hold it in its queue, seen waits for the transcript to show it in a turn). Lanes on, M1 says it: the lanes
-  // journal tap. Recorded only; a re-delivery is the same fact.
-  if (onsenFacts && !Lanes.LANES_ON) { try { const j = onsenJoeyOf((notif.params as any)?.meta); if (j) onsenFacts.inSession(j.chat, j.id, 'main') } catch {} }
-  if (!consumptionCheckAvailable()) { maybeAutoAckScheduled(fleetRunId(notif)); return }
-  if (recentDeliveries.some(d => d.notif === notif)) return  // one record per broadcast (multi-session fan-out)
-  recentDeliveries.push({ notif, at: Date.now(), pendingPath: null, keys: RECEIPT_CHECK ? receiptKeys(notif) : null, received: false })
-  if (recentDeliveries.length > 200) recentDeliveries.shift()
-  const k = deliveryKey(notif)
-  deliveryAttempts.set(k, (deliveryAttempts.get(k) ?? 0) + 1)
-  if (deliveryAttempts.size > 500) deliveryAttempts.clear()  // unbounded-growth guard
-}
-
-// Consumption evidence = the newest GENUINE assistant record's own timestamp.
-//
-// It used to be the newest jsonl's mtime, which is a lie in two directions
-// (2026-08-18, Chiron rubric I6 — his own 5h Fable-quota blackout was auto-acked
-// as "working" while nothing ran):
-//   1. A quota / API-error turn WRITES to the transcript. The literal record:
-//        type=assistant  model=<synthetic>  stop_reason=stop_sequence
-//        isApiErrorMessage=true
-//        "You're out of usage credits. Run /usage-credits to keep using Fable 5…"
-//      mtime advances; ZERO work happened. Discriminate on `isApiErrorMessage`,
-//      a first-class boolean — NOT on stop_reason (stop_sequence is also a
-//      legitimate value for a real turn, so keying on it would misread real work
-//      as an error) and NOT on message text (breaks on any rewording, and misses
-//      non-quota API errors).
-//   2. The enqueue ITSELF writes `user` / `queue-operation` records — that is the
-//      delivery, not consumption of it. CONSUME_SETTLE_MS existed as a crude
-//      timing guard against this; anchoring on an `assistant` record removes the
-//      need, because claude only appends one when a response COMPLETES, which is
-//      exactly the event we mean by "consumed".
-// The `> deliveredAt` comparison is load-bearing, not an optimisation: without it
-// a tail-read would happily find an assistant record from BEFORE the delivery and
-// count it as evidence — false-ack resurrected by another route.
-// Consumption predicate now lives in liveness.ts (ONE shared implementation —
-// supervisor/wrapper import the same file; see that module's header for the
-// full rationale recorded here through 1.22.x). This wrapper just binds it to
-// this daemon's TRANSCRIPT_DIR.
-function newestGenuineAssistantAt(): number {
-  // lanes-golive (C4): with lanes on, the main's own transcript (by its session id); a lane's newer one is not the main's consumption
-  if (Lanes.LANES_ON) { const f = Lanes.mainTranscriptFile(TRANSCRIPT_DIR); return f ? genuineAssistantAtFile(f) : 0 }
-  return newestGenuineAssistantAtIn(TRANSCRIPT_DIR)
-}
-/** receipt lines since `since`: the newest transcripts (fleet), or the main's own with lanes on (C4) */
-function receiptLines(since: number): string[] {
-  if (Lanes.LANES_ON) { const f = Lanes.mainTranscriptFile(TRANSCRIPT_DIR); return f ? receiptLinesIn([f]) : [] }
-  return recentReceiptLines(TRANSCRIPT_DIR, since)
-}
-
-
-function sweepDeliveries(): void {
-  if (!consumptionCheckAvailable() || recentDeliveries.length === 0) return
-  const now = Date.now()
-  const newest = newestGenuineAssistantAt()
-  // Receipt evidence (receipt.ts): read the transcripts once per sweep, for deliveries not yet seen.
-  const unseen = recentDeliveries.filter(d => d.keys && !d.received)
-  const lines = unseen.length ? receiptLines(Math.min(...unseen.map(d => d.at))) : []
-  for (const d of unseen) if (receivedIn(lines, d.keys!)) d.received = true
-  for (let i = recentDeliveries.length - 1; i >= 0; i--) {
-    const d = recentDeliveries[i]
-    const notReceived = !!d.keys && !d.received
-    // Consumed = the client took THIS delivery (receipt; skipped when it has no meta.ts) and then a
-    // genuine (non-API-error) assistant record came strictly after it. An assistant record alone is not
-    // enough: on 11-17 it acked 35 deliveries the client had dropped (Atlas btcc 9738).
-    if (!notReceived && newest > d.at) {
-      // transcript advanced after delivery ⇒ consumed. If we had already
-      // re-persisted a dup (long-turn false negative), retract it.
-      if (d.pendingPath) {
-        try { rmSync(d.pendingPath); log('info', `late consumption — retracted re-persisted dup ${d.pendingPath} (issue #13)`) } catch {}
-      }
-      maybeAutoAckScheduled(fleetRunId(d.notif))
-      recentDeliveries.splice(i, 1)
-    } else if (!d.pendingPath && now - d.at > (notReceived ? RECEIPT_GRACE_MS : CONSUME_GRACE_MS)) {
-      if (notReceived) {
-        log('warn', `delivery not received: no transcript record of ${d.keys![0]} ${Math.round((now - d.at) / 1000)}s ` +
-          `after the push (the client dropped it?) — handled as unconsumed below, NOT acked`)
-      }
-      const attempts = deliveryAttempts.get(deliveryKey(d.notif)) ?? 1
-      if (attempts >= MAX_REDELIVERIES) {
-        // Stop the loop — but do NOT destroy the message. The 1.22.3 wording
-        // here claimed "the agent demonstrably has it (it was pushed N times)";
-        // Chiron's SIGSTOP wedge (2026-08-23) disproved that: SSE writes to a
-        // stopped process sit unread in a socket buffer, and after the drain's
-        // rmSync no disk copy remained — his probe message was simply GONE,
-        // tombstoned only by the alert. Pushed ≠ received (the same lie-family
-        // as write≠delivery). Quarantine the payload instead: preserved on
-        // disk, never auto-replayed, named in the alert for whoever recovers
-        // the session.
-        let qpath: string | null = null
-        try {
-          mkdirSync(UNDELIVERABLE_DIR, { recursive: true })
-          const qname = `${new Date().toISOString().replace(/[:.]/g, '-')}-capped.json`
-          qpath = join(UNDELIVERABLE_DIR, qname)
-          writeFileSync(qpath, JSON.stringify(d.notif), { mode: 0o600 })
-        } catch (err) {
-          qpath = null
-          log('error', `quarantine write failed (content survives ONLY in this log line): ${err} :: ${JSON.stringify(d.notif).slice(0, 800)}`)
-        }
-        log('warn', `delivery still unconsumed after ${attempts} deliveries — quarantined to ${qpath ?? '(write failed, see error above)'} and NOT re-persisting (would loop). Transcript is not advancing for this agent; investigate the SESSION, not the queue (issue #13 / 32MB-transcript class)`)
-        // This is the "process alive but not actually working" signal — it
-        // detected the channel-bot's 7h quota blackout (2026-08-23) and said
-        // nothing. Route it to a human via the shared dedupe/notify pipeline.
-        sendOpsAlert(
-          `agent 疑似卡死（行程活著但沒在工作）：訊息推送 ${attempts} 次都未被消化，transcript 不再前進 — 常見原因：撞額度、session 凍結。需要人看 SESSION 本身。原訊息已保存於 inbox/undeliverable/（不會自動重投，處理完 session 後手動取回）。`,
-          'delivery-watchdog')
-        recentDeliveries.splice(i, 1)
-      } else {
-        log('warn', `delivery unconsumed for ${Math.round((now - d.at) / 1000)}s (no transcript progress, attempt ${attempts}/${MAX_REDELIVERIES}) — re-persisting to inbox/pending, NOT acking (issue #13)`)
-        d.pendingPath = persistInbound(d.notif)
-        if (!d.pendingPath) recentDeliveries.splice(i, 1)  // persist failed; nothing to track
-      }
-    } else if (now - d.at > CONSUME_RETAIN_MS) {
-      recentDeliveries.splice(i, 1)
-    }
-  }
-}
-
-/** lanes-golive (C3): a parked notification, given to the router again (true = it took it): a Telegram message of Joey's in the tg daemon through
- *  dispatchInbound (routeEvent, and the main through the one builder if the router throws); anything else as a mesh event */
-async function laneRedeliver(notif: { method: string; params: unknown }): Promise<boolean> {
-  const meta = ((notif.params ?? {}) as { meta?: Record<string, string> }).meta ?? {}
-  if (!INBOX_ONLY && meta.via !== 'local-inject') { await dispatchInbound(String(meta.chat_id ?? loadAccess().allowFrom[0] ?? ''), notif); return true }
-  return (await laneDeliverMesh(notif, undefined, false)) != null
-}
-let replayRunning = false
-// Lanes off: allow the ordinary disk replay to recover from a stalled stream write.
-const REPLAY_LOCK_MS = 60_000
-let replayBusySince = 0
-async function replayPendingFromDisk(server: Server): Promise<number> {
-  if (!Lanes.LANES_ON) {
-    if (Date.now() - replayBusySince < REPLAY_LOCK_MS) return 0
-    replayBusySince = Date.now()
-    try { return await replayPendingFromDiskLocked(server) } finally { replayBusySince = 0 }
-  }
-  // 002j: one replay at a time. The SSE-open replay, the timer drain and the post-open sweep can overlap, and two runs
-  // would each read the same parked file before either removed it: the same message delivered twice (fleet record
-  // 2026-11-11: one scheduler run enqueued twice, 6 ms apart). A skipped run loses nothing; the next drain takes the files.
-  if (replayRunning) return 0
-  replayRunning = true
-  try { return await replayPendingFromDiskLocked(server) } finally { replayRunning = false }
-}
-async function replayPendingFromDiskLocked(server: Server): Promise<number> {
-  // 🔴 SSE-open gate. `server.notification()` RESOLVES even when the SSE stream
-  // is not yet open — the write lands in a stream nobody is reading — and this
-  // function then rmSync's the durable file on that false success, destroying
-  // the message. The session-open handler calls us ~0.2s after "session opened
-  // (SSE pending)", i.e. squarely inside that window.
-  // Measured 2026-08-18 on the lab canary: a 6.5h-old parked delivery was
-  // "disk-replayed" at session-open+0.24s, the file was deleted, and the content
-  // never reached the agent's transcript — twice, on two separate session-opens.
-  // The same 30s later via the timer (which checks sseOpen) landed and was read.
-  // broadcastNotification has always gated on sseOpen; this path never did.
-  // If SSE isn't up yet, leave everything parked — the timer drain will take it.
-  const sid = serverSessionId.get(server)
-  if (!sid || !sseReady(sid)) return 0    // open AND past the client-ready delay (READY_DELAY_MS)
-  let files: string[]
-  try { files = readdirSync(PENDING_DIR) } catch { return 0 }
-  const pending = files.filter(f => f.endsWith('.json')).sort()
-  let replayed = 0
-  for (const file of pending) {
-    const fullPath = join(PENDING_DIR, file)
-    let notif: { method: string; params: unknown }
-    try {
-      notif = JSON.parse(readFileSync(fullPath, 'utf8'))
-    } catch (err) {
-      log('warn', `pending unreadable, removing: ${file}: ${err}`)
-      try { rmSync(fullPath) } catch {}
-      continue
-    }
-    try {
-      if (Lanes.LANES_ON) {
-        // lanes-golive (C3): a parked delivery goes back through the one entrance (the router), never straight into whichever session is open
-        if (!(await laneRedeliver(notif))) break
-      } else {
-        await server.notification(notif as Parameters<Server['notification']>[0])
-        recordDelivery(notif)
-      }
-      try { rmSync(fullPath) } catch {}
-      replayed++
-    } catch (err) {
-      log('warn', `disk-replay failed for ${file}: ${err} — keeping for retry`)
-      break  // preserve order; retry on next session
-    }
-  }
-  if (replayed > 0) log('info', `disk-replayed ${replayed} pending notification(s)`)
-  return replayed
-}
-
-// ---- parked-delivery recovery: drain periodically, never silently -----------
-// Until 2026-08-18 the ONLY caller of replayPendingFromDisk was the SSE
-// session-open handler, so a parked delivery waited for an event that a healthy,
-// long-lived session never generates. That is not theoretical: a message from
-// the principal was delivered 4s after a session opened (too early to be
-// consumed), parked 600s later, and then sat undelivered for 5.5h while every
-// indicator read green — agent alive, daemon alive, queue depth 0, no alert. It
-// had already missed its only drain opportunity at the moment it was parked.
-// Draining on a timer instead removes the dependency on that event. It also
-// makes any zombie duplicate FRESHER (~grace+30s old rather than hours), which
-// is what makes a replay safe to act on — a stale duplicate is dangerous mainly
-// because the receiving agent can no longer tell it already handled it.
-const PARK_ALERT_AFTER_MS = Number(process.env.PARK_ALERT_AFTER_MS ?? 900_000)  // 15min
-let parkAlerted = new Set<string>()
-
-function liveSessionServer(): Server | null {
-  for (const server of activeServers) {
-    const sid = serverSessionId.get(server)
-    if (sid && sseReady(sid)) return server
-  }
-  return null
-}
-
-async function drainPendingIfLive(): Promise<void> {
-  let files: string[]
-  try { files = readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')) } catch { return }
-  if (files.length === 0) { if (parkAlerted.size) parkAlerted = new Set(); return }
-
-  // Parking is acceptable; parking SILENTLY is not. Warn once per file so a
-  // stuck queue is visible without waiting for someone to stat the directory.
-  const now = Date.now()
-  for (const f of files) {
-    if (parkAlerted.has(f)) continue
-    let ageMs = 0
-    try { ageMs = now - statSync(join(PENDING_DIR, f)).mtimeMs } catch {}
-    if (ageMs > PARK_ALERT_AFTER_MS) {
-      parkAlerted.add(f)
-      log('warn', `PARKED DELIVERY STUCK: ${f} unrecovered for ${Math.round(ageMs / 60000)}min — no live session has drained it (issue #13 / rubric I9)`)
-      // Parking is acceptable; parking SILENTLY is not (the prometheus lost-
-      // message incident). Same shared pipeline; dedupe keeps it to one ping.
-      sendOpsAlert(
-        `有訊息停放超過 ${Math.round(ageMs / 60000)} 分鐘未送達（無活 session 可 drain）：${f} — agent 的 session 可能沒起來。`,
-        'park-watchdog')
-    }
-  }
-
-  const server = liveSessionServer()
-  if (!server) return   // nothing to deliver into; the age warning above is the signal
-  try {
-    const n = await replayPendingFromDisk(server)
-    if (n > 0) {
-      log('info', `timer-drain replayed ${n} parked delivery(ies) into a live session`)
-      parkAlerted = new Set()
-    }
-  } catch (err) {
-    log('warn', `timer-drain failed: ${err}`)
-  }
-}
-
-function gcPendingDisk(): void {
-  const MAX_AGE_MS = 7 * 24 * 3600 * 1000
-  const MAX_FILES = 1000
-  let files: string[]
-  try { files = readdirSync(PENDING_DIR) } catch { return }
-  type Item = { f: string; mtime: number; path: string }
-  const items: Item[] = []
-  for (const f of files) {
-    if (!f.endsWith('.json')) continue
-    const path = join(PENDING_DIR, f)
-    try { items.push({ f, mtime: statSync(path).mtimeMs, path }) } catch {}
-  }
-  const now = Date.now()
-  // Every entry here is a message NO session has consumed. Same rule as the
-  // re-delivery cap (1.24.1): move it to inbox/undeliverable/ and say so —
-  // never destroy it. (This used to rmSync silently while BTCC Comms still
-  // showed the row as delivered; chiron 3947.)
-  const moved: string[] = []
-  const quarantine = (it: Item) => {
-    try {
-      mkdirSync(UNDELIVERABLE_DIR, { recursive: true })
-      renameSync(it.path, join(UNDELIVERABLE_DIR, `gc-${it.f}`))
-      moved.push(it.f)
-    } catch (err) {
-      log('error', `gc: could not quarantine ${it.f} (left in pending): ${err}`)
-    }
-  }
-  for (const it of items) {
-    if (now - it.mtime > MAX_AGE_MS) quarantine(it)
-  }
-  const fresh = items.filter(i => now - i.mtime <= MAX_AGE_MS).sort((a, b) => b.mtime - a.mtime)
-  for (const it of fresh.slice(MAX_FILES)) quarantine(it)
-  if (moved.length > 0) {
-    log('warn', `gc: ${moved.length} unconsumed pending entr${moved.length === 1 ? 'y' : 'ies'} (older than 7d or past the 1000-file cap) moved to inbox/undeliverable/: ${moved.slice(0, 5).join(', ')}${moved.length > 5 ? ' …' : ''}`)
-    sendOpsAlert(
-      `收件匣有 ${moved.length} 則訊息超過 7 天（或超過 1000 則上限）一直沒有 session 收下，已移到 inbox/undeliverable/ 保存，不會自動重投。這個 agent 的 session 可能長期沒起來；BTCC Comms 上這些訊息仍顯示已送達。`,
-      'pending-gc')
-  }
-}
-setInterval(gcPendingDisk, 3600 * 1000).unref()
 
 // pendingPermissions tracks the originating server for each permission request
 // so the inline-button / yes-xxxxx reply path can route the answer back to the
@@ -3178,7 +2791,7 @@ async function deliverEditedMessage(m: any, personIds?: string[]): Promise<void>
   })
 }
 /** Onsen step 2 (WO-142): rewrite every copy of Telegram message `id` of `chat` that still waits unseen: lanes on, the main's M1 item (queued, never
- *  offered); a session's in-memory queue (SSE not open yet); inbox/pending (parked, not a re-delivery copy of a push). true = at least one */
+ *  offered) or a session’s in-memory queue before its SSE stream is ready. */
 function replaceQueuedEdit(chat: string, id: string, rw: (p: OnsenEdit.Params) => OnsenEdit.Params): boolean {
   let n = 0
   const rewrite = (notif: { method: string; params: unknown }): { method: string; params: unknown } => {
@@ -3187,30 +2800,13 @@ function replaceQueuedEdit(chat: string, id: string, rw: (p: OnsenEdit.Params) =
     return { method: notif.method, params: { ...p, content: nw.content, meta: nw.meta } }
   }
   if (Lanes.LANES_ON && !INBOX_ONLY && Lanes.replaceQueuedMain(chat, id, rw)) n++
-  const pushed = (notif: unknown): boolean => recentDeliveries.some(d => d.notif === notif)
   for (const [sid, q] of memQueue) {
     for (let i = 0; i < q.length; i++) {
-      if (!OnsenEdit.carries(q[i]!, chat, id) || pushed(q[i])) continue
+      if (!OnsenEdit.carries(q[i]!, chat, id)) continue
       q[i] = rewrite(q[i]!); n++
       log('info', `onsen: edit of tg:${id} replaced in the in-memory queue of session ${sid}`)
     }
   }
-  try {
-    const repersisted = new Set(recentDeliveries.map(d => d.pendingPath).filter(Boolean))
-    for (const f of readdirSync(PENDING_DIR)) {
-      if (!f.endsWith('.json')) continue
-      const full = join(PENDING_DIR, f)
-      if (repersisted.has(full)) continue                    // a copy of something already pushed into the session: the main may have read it
-      let notif: { method: string; params: unknown }
-      try { notif = JSON.parse(readFileSync(full, 'utf8')) } catch { continue }
-      if (!OnsenEdit.carries(notif, chat, id)) continue
-      const tmp = `${full}.edit.tmp`
-      writeFileSync(tmp, JSON.stringify(rewrite(notif)), { mode: 0o600 })
-      renameSync(tmp, full)
-      n++
-      log('info', `onsen: edit of tg:${id} replaced in parked delivery ${f}`)
-    }
-  } catch {}
   return n > 0
 }
 
@@ -3749,12 +3345,6 @@ async function flushAlbum(key: string, why: 'window' | 'all' | 'cap'): Promise<v
 // Voice transcription (#12, opt-in, CHANNEL_BOT_VOICE_TRANSCRIBE=1) is the roamer's (roamer-telegram.ts): it takes the audio from Telegram. A connector's
 // person_message carries the bridge's transcript as its text.
 
-// Route B fan-out (replay-queue-aware):
-//   1. No active session → persist to disk; replay on next session's first GET
-//   2. Session active but SSE GET not yet open → queue in memory; flush when GET arrives
-//   3. Session active AND SSE open → deliver directly
-//   4. If no session had SSE open, also persist to disk as safety net (covers
-//      daemon restart between broadcast and SSE open)
 // 002j: every delivery can be recognised in the transcript. Telegram messages carry message_id and mesh messages
 // btcc_msg_id; system notices, digests and locally injected messages carried nothing (fleet replay 2026-11-14: 337 of
 // about 4,500 deliveries), so the daemon could not tell whether they were read and fell back to the time rule. Those get
@@ -3771,41 +3361,21 @@ function stampDid(notif: { method: string; params: unknown }): void {
 }
 function broadcastNotification(notif: { method: string; params: unknown }): void {
   if (Lanes.LANES_ON) stampDid(notif)      // lanes-golive: lanes only; lanes off, the <channel> tag carries exactly the fleet's meta
-  if (activeServers.size === 0) {
-    log('warn', `no active session — persisting to inbox/pending: ${notif.method}`)
-    persistInbound(notif)
-    return
-  }
-  const now = Date.now()
-  let anySseOpen = false
-  let parkedForReady = false
   for (const server of [...activeServers]) {  // snapshot: evictZombieSession mutates activeServers
     const sid = serverSessionId.get(server)
     if (!sid) continue
-    if (sseOpen.get(sid) && !sseReady(sid)) {
-      // Stream open, client handler not registered yet (READY_DELAY_MS). Park on DISK, not memQueue: the
-      // ready-time replay delivers it in order, and it survives the session closing before ready
-      // (onclose deletes memQueue). Persist once even if several sessions are in this state.
-      if (!parkedForReady) {
-        parkedForReady = true
-        persistInbound(notif)
-        log('info', `parked for session ${sid} (SSE open, client not ready yet) — replayed at ready`)
-      }
-    } else if (sseOpen.get(sid)) {
-      anySseOpen = true
-      void server.notification(notif as Parameters<Server['notification']>[0]).then(() => {
-        recordDelivery(notif)
-      }).catch(err => {
+    if (sseReady(sid)) {
+      void server.notification(notif as Parameters<Server['notification']>[0]).catch(err => {
         log('error', `notify session ${sid} failed, removing from registry: ${err}`)
         activeServers.delete(server)
       })
     } else {
-      // SSE not open. issue #3: if it's been absent past the grace window this is a
+      // SSE not ready. issue #3: if it's been absent past the grace window this is a
       // zombie (transport.onclose never fired) — evict it instead of queuing inbound
       // into a dead session forever. Within grace, the SSE GET may still be in flight.
       const last = sessionLastActiveAt.get(sid) ?? 0
-      if (now - last > SESSION_GRACE_MS) {
-        evictZombieSession(sid, `broadcast: no open SSE for ${Math.round((now - last) / 1000)}s`)
+      if (Date.now() - last > SESSION_GRACE_MS) {
+        evictZombieSession(sid, `broadcast: no open SSE for ${Math.round((Date.now() - last) / 1000)}s`)
       } else {
         const q = memQueue.get(sid) ?? []
         q.push(notif)
@@ -3814,10 +3384,7 @@ function broadcastNotification(notif: { method: string; params: unknown }): void
       }
     }
   }
-  if (!anySseOpen && !parkedForReady) {
-    log('warn', `no SSE-open session at broadcast — also persisting to disk: ${notif.method}`)
-    persistInbound(notif)
-  }
+
 }
 
 function parkMemQueue(sid: string): void {
@@ -3861,8 +3428,6 @@ setInterval(() => {
       evictZombieSession(sid, `gc-timer: no open SSE for ${Math.round((now - last) / 1000)}s`)
     }
   }
-  sweepDeliveries()  // issue #13: ack-on-consumption + orphan re-persist
-  void drainPendingIfLive()  // recover parked deliveries without waiting for a session-open event
 }, 30_000).unref()
 
 /**
@@ -5135,10 +4700,6 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         last_update_id: tg?.lastUpdateId ?? 0,
         mcp_auth: mcpGate.stats,
         polling: tg?.polling ?? false,  // a roamer: its long poll's onStart has run; false = not polling (yet), and always for a connector
-        pending_disk_count: (() => {
-          try { return readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')).length }
-          catch { return 0 }
-        })(),
         // WO-151 3a / 3b: the Onsen pull (taken, handed on, duplicates dropped on either path) and this agent's sends into Onsen (WO-158: the only path)
         ...(INBOX_ONLY ? {
           onsen_pull: { on: !!onsenPuller, ...(onsenPuller ? onsenPuller.health() : { last_seq: onsenInbox?.lastSeq ?? 0, acked_seq: onsenInbox?.ackedSeq ?? 0 }),
@@ -5473,8 +5034,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // ever trip, each keepalive refreshes sessionLastActiveAt, @hono/node-server
         // (which only listens for res 'close') never cancels the SDK stream,
         // handleRequest never settles, and the dead session reads sseOpen=true
-        // forever: the N/N zombies in /healthz, and liveSessionServer() picking a
-        // zombie for parked-delivery drains. The socket DOES report it: req.socket
+        // forever, leaving zombies in /healthz. The socket DOES report it: req.socket
         // emits 'close' (and .destroyed flips) the instant the peer goes away —
         // kill -9, tmux kill-session, or claude's own MCP reconnect (which closes
         // the old GET before initializing a new session). Bridge that signal: mark
@@ -5498,7 +5058,7 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
         // Wait until the CLIENT is ready, not just the SDK stream: Claude Code registers its channel
         // handler ~0.7-1 s after the stream opens and drops anything pushed before that (READY_DELAY_MS;
         // the old 50 ms here lost 35 replayed deliveries for atlas on 11-17, and the same for every agent
-        // reconnected that day). Receipt is verified per delivery afterwards (RECEIPT_GRACE_MS).
+        // reconnected that day).
         await new Promise(r => setTimeout(r, Math.max(50, (sseReadyAt.get(sessionId) ?? 0) - Date.now())))
         // lanes: which claude process owns this session (socket → pid). Told only now that the SDK holds the stream (streamLive) and the client
         // is ready: a starting main becomes offerable at this point and not before, so its first offer is never written into a stream that drops it.
@@ -5516,17 +5076,10 @@ const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResp
             for (const notif of queued) {
               try {
                 await boundServer.notification(notif as Parameters<Server['notification']>[0])
-                recordDelivery(notif)
               } catch (err) {
                 log('error', `mem-flush failed: ${err}`)
               }
             }
-          }
-          // Disk-pending drain (covers daemon restart and "0 active session" gap).
-          // Fire-and-forget; preserves order via sorted filenames + break-on-failure.
-          // lanes: nothing is parked for the main here (the tg daemon's delivery ledger holds it)
-          if (!Lanes.LANES_ON) {
-            void replayPendingFromDisk(boundServer).catch(err => log('error', `disk-replay error: ${err}`))
           }
         }
         // Now await the SSE request to keep the response open until client disconnects.
@@ -5610,11 +5163,6 @@ function startListen(): void {
   })
 }
 
-// Entry-point guard, so a test can import this module and exercise
-// newestGenuineAssistantAt() against fixture transcripts without booting a real
-// daemon — i.e. the consumption predicate is testable on the REAL code path
-// rather than on a copy of it.
-//
 // 🔴 CHANNEL_INBOX_ONLY is load-bearing here, do not drop it. This engine has a
 // SECOND legitimate entry point: plugins/agent-inbox/server.ts is a shim that
 // sets CHANNEL_INBOX_ONLY=1 and `await import`s this file ("獨立 = instance, not
@@ -5625,4 +5173,3 @@ function startListen(): void {
 // /healthz went dark) before it reached a second agent; blast radius one.
 if (import.meta.main || process.env.CHANNEL_INBOX_ONLY === '1') startListen()
 
-export { newestGenuineAssistantAt }
