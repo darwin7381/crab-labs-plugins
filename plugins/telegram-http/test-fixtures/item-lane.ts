@@ -1,8 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
+const prompt = process.argv[process.argv.indexOf('-p') + 1] ?? ''
+appendFileSync('fixture-prompts.jsonl', JSON.stringify(prompt) + '\n')
 const end = Date.now() + 10_000
 let boundary = 1
 while (!existsSync('release-lane') && Date.now() < end) {
@@ -19,7 +21,6 @@ while (!existsSync('release-lane') && Date.now() < end) {
   }
   await Bun.sleep(30)
 }
-const prompt = process.argv[process.argv.indexOf('-p') + 1] ?? ''
 const client = new Client({ name: 'c1-test-lane', version: '1' }, { capabilities: {} })
 await client.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:' + process.env.LANES_HTTP_PORT + '/lane-mcp'),
   { requestInit: { headers: { Authorization: 'Bearer ' + process.env.LANE_RUN_TOKEN } } }))

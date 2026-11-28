@@ -1,4 +1,5 @@
 import type { TakeMode } from './onsen-take.ts'
+import { contextMessageLine, type MemberKind } from './onsen-client.ts'
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string
@@ -12,7 +13,7 @@ export type InboxItem = {
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
 export type ItemRef = {
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true
-  note?: string; reason?: string; half_done?: true; conversation?: string
+  note?: string; reason?: string; half_done?: true; conversation?: string; from_kind?: MemberKind
 }
 export function itemRef(it: InboxItem): ItemRef {
   const note = it.events?.findLast(e => e.kind === 'reassigned')?.note
@@ -20,6 +21,23 @@ export function itemRef(it: InboxItem): ItemRef {
     ...(it.session_id === 'main' ? { main: true, note } : {}), ...(it.deadline ? { deadline: it.deadline } : {}),
     ...(it.reason ? { reason: it.reason } : {}), ...(it.half_done ? { half_done: true } : {}),
     ...(it.payload.conversation_id != null ? { conversation: String(it.payload.conversation_id) } : {}) }
+}
+
+/** Old message references predate agent senders. Their person-message eligibility survives a restart. */
+export function personMessage(ref: ItemRef): boolean {
+  return ref.kind === 'message' && (ref.from_kind == null || ref.from_kind === 'human' || ref.from_kind === 'guest')
+}
+export function mayTakeItem(ref: ItemRef, phase: 'in_turn' | 'usage_limit'): boolean {
+  return personMessage(ref) || (phase === 'in_turn' && (ref.kind === 'call' || ref.kind === 'control' || Date.parse(ref.deadline ?? '') <= Date.now()))
+}
+
+/** The server supplies these rows oldest first on the claim that advances this member's read position. */
+export function messageContext(it: InboxItem): string {
+  if (it.kind !== 'message') return ''
+  const { context, context_omitted } = it.payload
+  const lines = context_omitted > 0 ? [`還有 ${context_omitted} 則較早的，用 chat_history 查`] : []
+  if (Array.isArray(context)) lines.push(...context.map(contextMessageLine))
+  return lines.join('\n')
 }
 
 export class ItemPeek {

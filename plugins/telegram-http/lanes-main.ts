@@ -38,7 +38,7 @@ export type StopCommand = { from: string; message_id: string }
 export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 type CutTurn = { at: number; why: string; retry_at?: number; background_agents?: number }
 
-import type { ItemRef } from './onsen-items.ts'
+import { mayTakeItem, personMessage, type ItemRef } from './onsen-items.ts'
 import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 
 export type MainEnv = {
@@ -281,7 +281,7 @@ export function createMain(E: MainEnv) {
     if (!wall.active || probe) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
     const refused = accountFailure(r.reason) || accountCut(r)
-    return wall.person && r.kind === 'joey' && !refused
+    return wall.person && r.kind === 'joey' && !refused && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => mayTakeItem(ref, 'usage_limit')))
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
   function mainCanTake(): boolean { const g = currentGen(); return !!g && canTake(g) }
@@ -451,7 +451,7 @@ export function createMain(E: MainEnv) {
   }
   function readyInTurn(r: Row): boolean {
     const refs: ItemRef[] | undefined = r.onsen_items
-    return !refs || refs.every(ref => ref.kind === 'message' || ref.kind === 'call' || ref.kind === 'control' || Date.parse(ref.deadline ?? '') <= Date.now())
+    return !refs || refs.every(ref => mayTakeItem(ref, 'in_turn'))
   }
 
   /** An album is one notification. If just some of its rows were given, return the claims without writing it. */
@@ -488,7 +488,7 @@ export function createMain(E: MainEnv) {
       return currentGen() === g && g.version === version && fresh.active === wall.active && fresh.person === wall.person
         && fresh.probe === probe && mayOffer()
     }
-    const eligible = (r: Row) => wallAllows(r, wall, probe) && (!r.onsen_items || !wall.active || probe || r.onsen_items.every((ref: ItemRef) => ref.kind === 'message'))
+    const eligible = (r: Row) => wallAllows(r, wall, probe)
     if (items(r => r.state === 'offered' && r.gen === g.id).length) return            // one offer opens one turn
     // 002w (E, gap 4): the oldest owed item whose own stream (its `via`) can take it. An item whose stream is down waits without holding the rest:
     // 2a936a7 tried only the oldest, so a mesh item behind a closed inbox stream held every later one, Joey's Telegram messages included.
@@ -541,7 +541,7 @@ export function createMain(E: MainEnv) {
       const dg = wall.active && !probe ? null : attachInfo(mb)
       const ids = [it.id, ...riders.map(r => r.id), ...(dg ? [dg.id] : [])]
       const p = (it.notif?.params ?? {}) as Record<string, any>
-      const own = [cutText(it, String(p.content ?? '')), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
+      const own = [cutText(it, deliveryText(it, String(p.content ?? ''))), ...riders.map(r => cutText(r, renderItem(r)))].join('\n')
       const content = dg ? `${contentOf(dg)}\n〔以上是系統附上的車道摘要，只附這一次；以下才是這則訊息本身〕\n${own}` : own
       const notif = { method: it.notif.method, params: { ...p, content, meta: { ...(p.meta ?? {}), did: ids.join(','), ...(dg ? { lane_digest: 'rides' } : {}) } } }
       let ok = false
@@ -632,17 +632,20 @@ export function createMain(E: MainEnv) {
     return all.map(r => J().get('msg', r.id)!)
   }
   const SRC: Record<string, string> = { tg: 'telegram', inbox: 'agent-inbox' }
+  function deliveryText(r: Row, text: string): string {
+    return (E.itemReceiver?.()?.claims.contextPrefix(r.onsen_items) ?? '') + text
+  }
   function renderItem(r: Row): string {
     const m = metaOf(r.notif)
     const attrs = Object.entries({ ...m, did: r.id }).filter(([, v]) => v != null && v !== '').map(([k, v]) => `${k}="${String(v).replace(/"/g, '&quot;')}"`).join(' ')
-    return `<channel source="${SRC[r.via] ?? r.via}" ${attrs}>\n${contentOf(r).slice(0, BODY_MAX)}\n</channel>`
+    return `<channel source="${SRC[r.via] ?? r.via}" ${attrs}>\n${deliveryText(r, contentOf(r).slice(0, BODY_MAX))}\n</channel>`
   }
   function renderPulled(rs: Row[]): string {
     // a notice (Onsen's mention item, kind mention on the lanes' own chat) is told as the digest is: only for the main to know
     const isInfo = (r: Row): boolean => r.kind === 'digest' || metaOf(r.notif).kind === 'mention'
     const info = rs.filter(isInfo), msgs = rs.filter(r => !isInfo(r))
-    return ['〔交給主線｜這一回合進行中送到的訊息，交給你接著處理。來源已驗證（這段對話只收白名單裡的人，這就是 Joey 本人；mesh 訊息看 verified）。'
-      + '照平常處理：問的就回答，交代的就照做（能馬上做的現在做，其餘接在手上這一步之後），Joey 用 reply 回，同事用 send_to_agent 回；已經處理過的不用重做。〕',
+    return ['〔交給主線｜這一回合進行中送到的訊息，交給你接著處理。每則訊息的寄件人看 user，mesh 訊息看 verified。'
+      + '照平常處理：問的就回答，交代的就照做（能馬上做的現在做，其餘接在手上這一步之後），對話裡用 reply 回，mesh 用 send_to_agent 回；已經處理過的不用重做。〕',
       ...msgs.map(r => cutText(r, renderItem(r))), ...info.map(r => r.kind === 'digest' ? `〔車道摘要（只讓你知道，不是新的指示）〕\n${contentOf(r)}` : contentOf(r))].join('\n')
   }
   function requeue(pred: (r: Row) => boolean, reason: string, fields: Record<string, unknown> = {}): Row[] {
@@ -660,7 +663,7 @@ export function createMain(E: MainEnv) {
       if (command && (outcome === 'cut' || outcome === 'cut_person')) {
         if (ref.from === command.from) receiver?.report([ref], 'stopped', { command_message_id: command.message_id })
         else receiver?.report([ref], 'cut', { half_done: hasOutput(outputOf(g, r)) })
-      } else receiver?.report([ref], outcome, { half_done: hasOutput(outputOf(g, r)), ...fields })
+      } else receiver?.report([ref], outcome === 'cut_person' && !personMessage(ref) ? 'cut' : outcome, { half_done: hasOutput(outputOf(g, r)), ...fields })
     }
     closeItem(r, { reason: outcome, gen: null })
     return true

@@ -940,7 +940,7 @@ export class OnsenClient {
       }
       if (t.line.k === 'blocked') {
         const receipt = t.line.r
-        const ids = new OnsenIds({ request: (m, p, b, ms) => this.request(m, p, b, ms) })
+        const ids = new OnsenIds({ agent: this.cfg.agent, request: this.request.bind(this) })
         const id = 'message_id' in receipt ? receipt.message_id : /^form-(\d+)$/.exec(receipt.client_msg_id)?.[1] ?? await ids.message(receipt.chat, receipt.client_msg_id)
         const path = id ? `/v1/messages/${encodeURIComponent(id)}/receipt` : ''
         const r = id ? await this.put(path, { handling: { state: 'blocked', blocked_by: 'usage_limit', retry_after: receipt.retry_after } }, cred)
@@ -1398,6 +1398,16 @@ function lineOf(m: any, joey: string, cutAt = CUT): string {
   const flags = `${m.status === 'failed' ? '（沒送出）' : ''}${m.edited ? '（改過）' : ''}`
   return `${whenUtc(m.at)}｜${whoOf(m, joey)}｜${ref(m)}｜${flags}${body}${m.truncated || over ? '…（全文用 id 取）' : ''}`
 }
+type AttachmentLabel = { name?: string | null; mime?: string | null; file_id?: string | null; kind?: string; id?: string }
+export type ContextMessage = { message_id: string; from: string; created_at: string; preview: string; attachments?: AttachmentLabel[] }
+function attachmentNames(attachments: AttachmentLabel[]): string {
+  return attachments.map(a => oneLine(String(a.name ?? a.mime ?? a.file_id ?? a.kind ?? a.id ?? '?'))).join('、')
+}
+/** A §4c context entry uses the message history line, with its attachments on that same line. */
+export function contextMessageLine(m: ContextMessage): string {
+  const line = lineOf({ id: m.message_id, sender: m.from, at: m.created_at, body: m.preview }, '', Infinity)
+  return m.attachments?.length ? line + '｜附件：' + attachmentNames(m.attachments) : line
+}
 /** step 2 (WO-142): the line at the top of a list the restart line cut */
 export function restartHead(at: unknown): string { return `Joey 在 ${whenUtc(at)} 叫你重新開始：線之前的對話不顯示（他引用的那則照樣看得到）` }
 /** step 2: an id lookup of a message before the line */
@@ -1434,7 +1444,7 @@ export function formatFull(m: any, joey = ''): string {
   const extra = [m.kind && m.kind !== 'text' ? m.kind : '', m.status === 'failed' ? `沒送出${m.error ? `：${m.error}` : ''}` : '', m.edited ? '改過' : '',
     m.reply_to_client_msg_id != null ? `回覆 tg:${m.reply_to_client_msg_id}` : '', m.forward_from ? `轉傳自 ${forwardName(m.forward_from)}` : '', m.thread ? `話題 ${m.thread}` : '']
     .filter(Boolean).join('，')
-  const att = Array.isArray(m.attachments) && m.attachments.length ? `\n附件：${m.attachments.map((x: any) => x.name ?? x.mime ?? x.file_id ?? '?').join('、')}` : ''
+  const att = Array.isArray(m.attachments) && m.attachments.length ? `\n附件：${attachmentNames(m.attachments)}` : ''
   const evs = Array.isArray(m.events) ? m.events : []
   const evLines = evs.map((e: any) => {
     const who = whoOf({ sender: e.actor, sender_part: e.actor_part }, joey)
@@ -1502,31 +1512,49 @@ export type ActionControl = { action_id: string; option_id: string; version: num
 /** Telegram user ids → Onsen member names (fleet-core onsen.py HUMAN_ALIASES); anyone else has no name Onsen knows */
 export const TG_MEMBERS: Readonly<Record<string, string>> = { '1828173984': 'joey', '6736970916': 'joey-test' }
 export const memberOfTg = (id: unknown): string | null => TG_MEMBERS[String(id ?? '')] ?? null
+export type MemberKind = 'human' | 'guest' | 'agent' | 'system'
 /** 1.58.13: the person on a Telegram account, for a DM thread's title (lanes-threads.ts): the Onsen member that account is (memberOfTg, the mapping the
  *  blockers' person and every Action's assignees go through; an account that is no member: Onsen's guest name tg-<id>), by its display name (GET
  *  /v1/members/<name>), else its member name. personOf → null while it is not known yet: asked once per member; when the answer (or no answer) is in,
  *  `changed` runs (server.ts: Lanes.refreshDmTitles) */
 export class MemberNames {
-  private names = new Map<string, string | null>()                      // member → display name ('' none, or not answered; null: being asked)
+  private members = new Map<string, { display: string; kind?: MemberKind }>()
+  private requests = new Map<string, Promise<void>>()
   constructor(readonly o: { get: (name: string) => Promise<{ status: number; json: any } | null>; changed: () => void; log?: (m: string) => void }) {}
+
+  private lookup(member: string): Promise<void> {
+    const pending = this.requests.get(member)
+    if (pending) return pending
+    const request = this.read(member).finally(() => this.requests.delete(member))
+    this.requests.set(member, request)
+    return request
+  }
+
+  private async read(member: string): Promise<void> {
+    let m
+    try {
+      const r = await this.o.get(member)
+      if (r?.status === 200) m = r.json?.data ?? r.json
+    } catch (e) { this.o.log?.(`onsen: member ${member}: no answer (${errText(e)})`) }
+    const display = typeof m?.display_name === 'string' ? m.display_name.replace(/\s+/g, ' ').trim().slice(0, 40) : ''
+    const kind = ['human', 'guest', 'agent', 'system'].includes(m?.kind) ? m.kind : undefined
+    this.members.set(member, { display, kind })
+    try { this.o.changed() } catch {}
+  }
+
   personOf(chat: string): string | null {
     const member = memberOfTg(chat) ?? `tg-${chat}`
-    if (!this.names.has(member)) {
-      this.names.set(member, null)
-      void (async () => {
-        let d = ''
-        try {
-          const r = await this.o.get(member)
-          const m = r && r.status === 200 ? (r.json?.data ?? r.json) : null
-          if (m && typeof m.display_name === 'string') d = m.display_name.replace(/\s+/g, ' ').trim().slice(0, 40)
-        } catch (e) { this.o.log?.(`onsen: the display name of ${member}: no answer (${errText(e)}); its member name is used`) }
-        this.names.set(member, d)
-        try { this.o.changed() } catch {}
-      })()
-      return null
-    }
-    const d = this.names.get(member)
-    return d == null ? null : (d || member)
+    const record = this.members.get(member)
+    if (record) return record.display || member
+    void this.lookup(member)
+    return null
+  }
+
+  async kindOf(member: string): Promise<MemberKind> {
+    if (!this.members.get(member)?.kind) await this.lookup(member)
+    const kind = this.members.get(member)?.kind
+    if (!kind) throw new Error(`Onsen did not give the member kind for ${member}`)
+    return kind
   }
 }
 /** the assignees of a question sent to these Telegram chats: the members among them (in order, once each), else joey */

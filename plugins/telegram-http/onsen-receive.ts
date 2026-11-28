@@ -15,6 +15,7 @@ export type ClaimStore = {
   blocked(): boolean
   owns(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
+  contextPrefix(refs?: ItemRef[]): string
   bind(id: string, session: string, turn: string, registrySession?: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): void
   finalStop(session: string, turn: string): void

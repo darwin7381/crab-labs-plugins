@@ -25,7 +25,7 @@ import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
 import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
-import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
+import { whoOf, type CallCheck, type CallRef, type CallWait } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
 import { anchorSlug, plainTopicName, topicLink, topicMode, type TopicVerdict } from './lanes-topics.ts'
 import { APPEND_MAX, APPENDABLE_FILE, appendText, declaredFor, readDeclared } from './lanes-append.ts'
@@ -258,7 +258,7 @@ export type MainPicker = {
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
-import type { ItemRef } from './onsen-items.ts'
+import { mayTakeItem, type ItemRef } from './onsen-items.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -913,7 +913,7 @@ function lastMainItem(id: string): { id: string; n: number } | null {
 function personTarget(ev: InEvent | null | undefined, state: string, ready: boolean, offered: boolean): WakeState['personTarget'] {
   if (ev?.source !== 'telegram' || ev.synthetic) return undefined
   if (state === 'starting') return 'held:starting'
-  if (!ready) return 'held:wall'
+  if (!ready || ev.onsen_items?.some(ref => !mayTakeItem(ref, 'usage_limit'))) return 'held:wall'
   return state === 'in_turn' || offered ? 'main_after_step' : 'main_now'
 }
 function tapRoute(row: Record<string, unknown>, ev?: InEvent): void {
@@ -3312,11 +3312,12 @@ function incidentMerge(ev: InEvent, critical: boolean): Decision | null {
 const steerFile = (lane: string, k: 'in' | 'out'): string => join(LANES_DIR, 'run', 'steer', `${lane.replace(/[^A-Za-z0-9_.-]/g, '_')}.${k}.jsonl`)
 function steerable(ev: InEvent, lane: Lane): boolean {
   return process.env.LANES_STEER_MIDTURN !== '0' && D.role === 'tg' && ev.source === 'telegram' && !ev.synthetic && !ev.fanout && !S.master_off
+    && (!ev.onsen_items || ev.onsen_items.every(ref => mayTakeItem(ref, 'in_turn')))
     && lane.kind !== 'synthesis' && lane.kind !== 'curator' && running.has(lane.id)
 }
 function steerMessage(ev: InEvent, run: string, merged = false) {
   if (merged) return { id: ev.id, kind: 'merged', ts: nowIso(), from: ev.from, text: `${incidentHead([ev], true)}\n${renderEvent(ev)}`, run }
-  return { id: ev.id, ts: nowIso(), from: ev.from, text: ev.text, message_id: ev.meta?.message_id ?? null, quote: ev.reply_to_text ?? null, run }
+  return { id: ev.id, ts: nowIso(), from: ev.onsen_items?.[0]?.from ?? ev.from, text: ev.text, context: eventContext(ev), message_id: ev.meta?.message_id ?? null, quote: ev.reply_to_text ?? null, run }
 }
 function writeSteer(lane: string, ev: InEvent, run: string, merged = false): void {
   // The hook gets an Item's content from the daemon only once its take succeeds.
@@ -4871,15 +4872,19 @@ function noteMailSeen(tok: RunTok, name: string, a: any, text: string): void {
   }
 }
 
+function eventContext(ev: InEvent): string {
+  return itemReceiver?.claims.contextPrefix(ev.onsen_items) ?? ''
+}
 function renderEvent(ev: InEvent): string {
   if (ev.synthetic) return ev.synthetic
   if (ev.source === 'telegram') {
-    const head = [`[車道事件 ${ev.id}｜來源 Telegram｜Joey`]
+    const sender = whoOf({ sender: ev.onsen_items?.find(r => r.kind === 'message')?.from ?? 'joey' })
+    const head = [`[車道事件 ${ev.id}｜來源 Telegram｜${sender}`]
     if (ev.reply_to_message_id && S.botmsgs[ev.reply_to_message_id]) head.push(`引用了你先前發的訊息（message_id ${ev.reply_to_message_id}）回覆`)
     if (ev.message_thread_id) { const name = topicName(ev.message_thread_id); head.push(`在話題 #${ev.message_thread_id}${name ? `「${name}」` : ''} 裡`) }
     const lines = [head.join('｜') + ']']
     if (ev.reply_to_text) lines.push(`引用的內容：${ev.reply_to_text}`)
-    lines.push(`Joey：${ev.text}`)
+    lines.push(eventContext(ev) + `${sender}：${ev.text}`)
     return lines.join('\n')
   }
   const tags = [`來源 mesh`, `寄件者 ${ev.from}（verified=${ev.verified ? 'true' : 'false'}${ev.meta?.relay ? ' relay=' + ev.meta.relay : ''}）`]

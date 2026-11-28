@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
-import type { InboxItem, ItemRef } from './onsen-items.ts'
+import { messageContext, type InboxItem, type ItemRef } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
 const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuck'])
@@ -8,6 +8,7 @@ const week = 7 * 86400_000
 type Claim = {
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
   turn?: string; registry_session?: string; conversation?: string; replies?: string[]
+  context?: string
   stop?: { turn: string; at: number }
 }
 type Done = { item_id: string; claim_id: string; at: number }
@@ -66,8 +67,13 @@ export class Claims implements ClaimStore {
   taken(row: InboxItem, ref: ItemRef): void {
     const claim = row.claim!
     if (this.rows[row.id]?.claim_id === claim.id) return
-    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation }
+    const context = messageContext(row)
+    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation, ...(context ? { context } : {}) }
     this.save(); this.clock(row.id); this.changed()
+  }
+  contextPrefix(refs?: ItemRef[]): string {
+    const context = refs?.map(r => this.rows[r.onsen_item_id]?.context).filter(Boolean).join('\n')
+    return context ? context + '\n' : ''
   }
   bind(id: string, session: string, turn: string, registrySession?: string): void {
     if (!this.owns(id)) return

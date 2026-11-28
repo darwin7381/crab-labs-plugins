@@ -1,4 +1,5 @@
 import type { InboxItem } from '../onsen-items.ts'
+import type { ContextMessage, MemberKind } from '../onsen-client.ts'
 import type { ItemReport, Outcome } from '../onsen-receive.ts'
 
 const intermediate = new Set<Outcome>(['in_session', 'background', 'owed', 'stuck'])
@@ -11,6 +12,8 @@ const iso = (ms: number) => new Date(ms).toISOString()
 export function fakeItems() {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
   const rows = new Map<string, Row>(), writes = new Map<string, Response>(), terminal = new Map<string, string>()
+  const members = new Map<string, MemberKind>([['adam', 'agent'], ['joey', 'human'], ['lab-b', 'agent'], ['tg-42', 'guest']])
+  const contextAtTake = new Map<string, { context?: ContextMessage[]; context_omitted?: number }>()
   const calls: Array<{ path: string; query: URLSearchParams; body: any; key: string | null }> = []
   const issued = new Set<string>(), reports = new Set<string>()
   const history: ItemReport[] = [], waiters = new Set<() => void>()
@@ -34,7 +37,7 @@ export function fakeItems() {
   }
   const add = (id: string, kind = 'message', extra: Partial<Row> = {}): Row => {
     const number = ++seq
-    const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
+    const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: extra.from ?? 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
     const row: Row = { id, number, member: 'adam', from: 'joey', session_id: null, kind, refs: [], state: 'waiting', reason: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
@@ -52,6 +55,8 @@ export function fakeItems() {
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
+    const member = /^\/v1\/members\/([^/]+)$/.exec(path)?.[1]
+    if (member && req.method === 'GET') return members.has(member) ? detail({ name: member, kind: members.get(member) }) : error(404, 'not_found')
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
     if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
@@ -92,7 +97,8 @@ export function fakeItems() {
         change(row, 'taken')
       }
       const waiting = [...rows.values()].filter(r => r.state === 'waiting')
-      answer = detail({ claim_id, items: given, waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
+      const items = given.map(r => ({ ...r, payload: { ...r.payload, ...contextAtTake.get(r.id) } }))
+      answer = detail({ claim_id, items, waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })
     } else if (path === '/v1/members/adam/observation' && req.method === 'PUT') {
       if (!Array.isArray(b.held_item_ids)) return error(400, 'invalid_request')
       for (const id of b.held_item_ids) { const r = rows.get(id); if (r?.claim?.connector === connector) r.claim.expires_at = iso(now + 45_000) }
@@ -132,7 +138,7 @@ export function fakeItems() {
     if (delayTake && path === base + '/take') await Bun.sleep(delayTake)
     return answer
   } })
-  return { base: 'http://127.0.0.1:' + server.port, rows, calls, history, add, change, now: () => now,
+  return { base: 'http://127.0.0.1:' + server.port, rows, members, contextAtTake, calls, history, add, change, now: () => now,
     advance(ms: number) { now += ms; expire() }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
 }

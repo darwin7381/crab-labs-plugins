@@ -68,7 +68,7 @@ import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudg
 import { PaneReader, snapPaneLook, type PaneLook } from './pane-look.ts'   // WO-168 stage two: the one capture of the own pane
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
-import { ItemPeek, itemRef, type ItemRef, type InboxItem } from './onsen-items.ts'
+import { ItemPeek, itemRef, personMessage, type ItemRef, type InboxItem } from './onsen-items.ts'
 import { machineName, takeRefusal, TakeMode } from './onsen-take.ts'
 import { ObservationPut } from './onsen-observation.ts'
 import { MentionCards, mentionItemText } from './onsen-mentions.ts'
@@ -418,7 +418,7 @@ const onsenVersion: OnsenFirst.OnsenVersion | null = onsen && onsen.cfg.record &
 const msList = (v: string | undefined): number[] | undefined => { const l = String(v ?? '').split(',').map(x => Number(x.trim())).filter(x => Number.isFinite(x) && x >= 0); return l.length ? l : undefined }
 /** WO-197 (onsen-connector.ts): the connector's way into Onsen: the agent's Telegram numbers turned into Onsen's ids (asked, cached), what it says
  *  written with conversation_id and the bridge's report waited for (ONSEN_BRIDGE_WAIT_MS, 3 s); ONSEN_BRIDGE_RETRY_MS (tests) the write's retries */
-const connectorIds: Connector.OnsenIds | null = onsen ? new Connector.OnsenIds({ request: (m, p, b, t) => onsen!.request(m, p, b, t) }) : null
+const connectorIds: Connector.OnsenIds | null = onsen ? new Connector.OnsenIds({ agent: ONSEN_AGENT, request: onsen.request.bind(onsen) }) : null
 const connectorSay: Connector.ConnectorSay | null = connectorIds ? new Connector.ConnectorSay({ request: (m, p, b, t) => onsen!.request(m, p, b, t),
   ids: connectorIds, agent: ONSEN_AGENT, log, waitMs: Number(process.env.ONSEN_BRIDGE_WAIT_MS ?? Connector.WAIT_MS), retryMs: msList(process.env.ONSEN_BRIDGE_RETRY_MS) }) : null
 /** WO-197 (connector mode): one thing the agent says (the main's reply, a lane's line, a router notice), written into Onsen with conversation_id: its
@@ -473,7 +473,7 @@ function askees(chats: unknown[]): string[] {
   const o = connectorOwner()
   return o ? [o] : []
 }
-/** what has no chat of its own and went to the owner's Telegram chats (system warnings, the login watchdog, ops notices): one Onsen message with `to` */
+/** System warnings, login watchdog and ops notices belong to the owner's direct conversation. */
 async function ownerSay(sender: string, text: string): Promise<void> {
   const o = connectorOwner()
   if (!o) { log('error', `connector: ${sender} not written into Onsen (no owner): ${text.replace(/\s+/g, ' ').slice(0, 160)}`); return }
@@ -636,7 +636,7 @@ async function connectorConversation(chat: string): Promise<string> {
  *  bridge draws it (createForumTopic) or, when it cannot, puts its messages in the main chat with its name first. Never fails for Telegram */
 async function connectorOpenThread(chat: string, name: string): Promise<number> {
   const cid = await connectorConversation(chat)
-  const r = await onsen!.request('POST', `/v1/conversations/${cid}/threads`, { name: name.slice(0, 128) }, 10_000)
+  const r = await onsen!.request('POST', `/v1/conversations/${encodeURIComponent(cid)}/threads`, { name: name.slice(0, 128) }, 10_000)
   const t = r && r.status < 300 ? (r.json?.data?.thread ?? r.json?.thread) : undefined
   if (t == null || !/^\d+$/.test(String(t))) throw new Error(`Onsen did not open the thread (${Connector.why(r)})`)
   log('info', `connector: thread ${t} 「${name}」 opened in conversation ${cid} (the bridge draws it)`)
@@ -644,7 +644,7 @@ async function connectorOpenThread(chat: string, name: string): Promise<number> 
 }
 async function connectorThreadState(chat: string, thread: number, state: 'open' | 'closed', name?: string): Promise<string> {
   const cid = await connectorConversation(chat)
-  const r = await onsen!.request('PUT', `/v1/conversations/${cid}/threads/${thread}`, { state, ...(name ? { name: name.slice(0, 128) } : {}) }, 10_000)
+  const r = await onsen!.request('PUT', `/v1/conversations/${encodeURIComponent(cid)}/threads/${thread}`, { state, ...(name ? { name: name.slice(0, 128) } : {}) }, 10_000)
   if (!r || r.status >= 300) throw new Error(`Onsen did not take the thread's ${state} (${Connector.why(r)})`)
   return `thread ${thread} ${state} in Onsen (the bridge sets the topic's icon)`
 }
@@ -668,13 +668,13 @@ async function connectorThreadLink(chat: string, thread: number): Promise<string
   const end = Date.now() + 3_000
   const bot = botName() || await bridgeBotName()
   while (bot) {
-    const r = await onsen!.request('GET', `/v1/conversations/${cid}/threads?limit=100`, undefined, 3_000).catch(() => null)
+    const r = await onsen!.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/threads?limit=100`, undefined, 3_000).catch(() => null)
     const it = (r?.json?.items ?? r?.json?.data?.items ?? []).find((x: any) => String(x?.thread) === String(thread))
     if (it?.client_thread) return topicLink(bot, Number(it.client_thread))
     if (Date.now() + 500 > end) break
     await new Promise(res => setTimeout(res, 500))
   }
-  return `${Onsen.onsenBase(process.env).replace(/\/api\/onsen$/, '')}/onsen/next/#/conversation/${cid}`
+  return `${Onsen.onsenBase(process.env).replace(/\/api\/onsen$/, '')}/onsen/next/#/conversation/${encodeURIComponent(cid)}`
 }
 /** WO-194 (onsen-inbound.ts; ONSEN_INBOUND: a comma list of agent names or `*`; unset, empty or 0 = off; the plist, else the machine config read again at
  *  most every 30 s). 1.59.0: no Telegram message is written into Onsen here any more (a connector's come from the bridge, a roamer records nothing): the
@@ -3484,7 +3484,7 @@ async function finishInbound(f: OnsenInbound.Facts, how: 'local' | 'onsen', got?
   const meta: Record<string, string> = {
     chat_id,
     ...(msgId != null ? { message_id: String(msgId) } : {}),
-    user: f.from.username ?? String(f.from.id),
+    user: f.item?.from_kind === 'agent' ? f.item.from : f.from.username ?? String(f.from.id),
     user_id: String(f.from.id),
     ts: new Date((f.date ?? 0) * 1000).toISOString(),
     ...(imagePath ? { image_path: imagePath } : {}),
@@ -4383,8 +4383,7 @@ if (Lanes.LANES_ON) {
       botUsername: botName,
       topicDone: async (chat, thread) => tg ? tg.topicDone(chat, thread) : connectorThreadState(chat, thread, 'closed'),   // WO-197 segment 2: the bridge sets the ✅ icon
       topicLinkFor: async (chat, thread) => tg ? topicLink(botName(), thread) : connectorThreadLink(chat, thread),
-      // WO-197 segment 2 (Chiron mesh 12869 point 1): the first allowlisted chat while access.json has one (by-chat gives the DM `to` would); a connector
-      // without one writes to its owner (member:<owner>, `to`)
+      // Use the first allowlisted chat when present, otherwise the owner's direct conversation.
       joeyChatId: () => { const c = String(loadAccess().allowFrom[0] ?? ''); if (c || !CONNECTOR) return c; const o = connectorOwner(); return o ? Connector.memberChat(o) : '' },
       chatHistory: (a: Record<string, unknown>) => onsen ? onsen.queryHistory(a) : Promise.resolve('chat_history：這個常駐程式沒有接上 Onsen。'),   // Onsen (WO-139)
       ...(onsen?.cfg.record ? { formClose: async (a: Record<string, unknown>) => (await Onsen.formClose((m, p, b, t) => onsen.request(m, p, b, t), a)).text } : {}),   // WO-153
@@ -4678,13 +4677,16 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
 /** WO-145: a page answer to the main, as Joey's Telegram message in that chat would go (lanes on: the one builder, never a lane; lanes off: the same
  *  delivery as his message). Its id is form-<Onsen message id> (no Telegram id can collide); meta via=web-form, form_title, form_id. false = its chat is
  *  not allowlisted (acked and dropped, logged). */
-async function deliverFormAnswer(it: OnsenVisible.FormItem, route: 'main' | 'rules' = 'main', personIds?: string[], refs?: ItemRef[]): Promise<boolean> {
+async function deliverFormAnswer(it: Omit<OnsenVisible.FormItem, 'id'> & { id: string | number }, route: 'main' | 'rules' = 'main', personIds?: string[], refs?: ItemRef[]): Promise<boolean> {
   const access = loadAccess(), chat = String(it.chat)
   if (!(access.allowFrom.map(String).includes(chat) || chat in (access.groups ?? {}) || (Connector.ONSEN_CHAT.test(chat) && CONNECTOR))) {
     log('warn', `onsen: page answer ${it.id} is for chat ${chat}, which is not allowlisted: not delivered (acked)`)
     return false
   }
-  const ref = `form-${it.id}`, uid = chat.startsWith('-') ? String(access.allowFrom[0] ?? '') : chat
+  const ref = `form-${it.id}`
+  const sender = refs?.find(r => r.kind === 'message')
+  const group = chat.startsWith('-'), account = group ? String(access.allowFrom[0] ?? '') : chat
+  const uid = sender && (group || Connector.ONSEN_CHAT.test(chat) || sender.from_kind === 'agent') ? sender.from : account
   const ts = it.at && Number.isFinite(Date.parse(it.at)) ? new Date(it.at).toISOString() : new Date().toISOString()
   // WO-159: a message Joey wrote in Onsen: his message as he typed it, with via="onsen" and nothing else added (Chiron: the only difference an agent sees)
   const meta: Record<string, string> = it.say ? { chat_id: chat, message_id: ref, user: uid, user_id: uid, ts, via: 'onsen' }
@@ -4745,6 +4747,7 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     return { code: 200, json: { dropped: 'chat not allowlisted' } }
   }
   const edit = it.kind === 'person_edit'
+  if (it.item && p.conversation_id != null) connectorIds?.know(chat, String(p.conversation_id))
   const key = `${chat}:${ref}`, own = String(it.dedupe || (edit ? `pe:${p.message_id}:${p.edited_at}` : `pm:${p.message_id}`))
   const shown = p.via === 'web' ? ref : `tg:${ref}`
   if (!it.item && (inboundStore.isDone(own) || (!edit && inboundStore.isDone(key)))) {
@@ -4783,14 +4786,15 @@ async function personArrived(it: { item?: ItemRef; kind?: string; seq?: number; 
     // WO-197 segment 2 (CONTRACT §7d 「指令」; sonn's ruling 7): a connector runs a person's slash command itself (the bridge's kind command, or a page
     // message whose text is one), with today's handler; one it does not know goes on as a message
     const thread = CONNECTOR ? await connectorThreadOf(p, c, chat) : undefined
-    if (CONNECTOR && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
+    const personCommand = it.item?.kind !== 'message' || personMessage(it.item)
+    if (CONNECTOR && personCommand && (p.kind === 'command' || /^\/[A-Za-z]/.test(String(p.text ?? '').trim()))
       && await connectorCommand(String(p.text ?? ''), chat, ref, String(c.user_id ?? ''), c.user != null ? String(c.user) : '', thread, p.sent_at, p.via === 'web' ? 'onsen' : undefined, it.item, String(p.message_id))) {
       inboundStore.finish([key, own])
       log('info', `onsen inbound: ${shown} is a command; the connector handled it itself`)
       return { code: 200, json: { delivered: true, handled_here: true } }
     }
     if (p.via === 'web' || Connector.ONSEN_CHAT.test(chat)) {
-      const fi: OnsenVisible.FormItem = { id: Number(ref.replace(/^form-/, '')) || Number(p.message_id), form_id: 0, chat, title: '', body: String(p.text ?? ''),
+      const fi = { id: ref.replace(/^form-/, ''), form_id: 0, chat, title: '', body: String(p.text ?? ''),
         ...(p.sent_at ? { at: String(p.sent_at) } : {}), say: true, ...(Array.isArray(p.attachments) && p.attachments.length ? { attachments: p.attachments } : {}),
         ...(p.reply_to && typeof p.reply_to === 'object' ? { reply_to: p.reply_to } : {}) }
       await deliverFormAnswer(fi, it.item?.main || !await onsenInboundNow() ? 'main' : 'rules', [String(p.message_id)], it.item ? [it.item] : undefined)
@@ -5058,6 +5062,7 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
+    if (row.kind === 'message') item.from_kind = await dmNames.kindOf(row.from)
     if (edit && row.reason !== 'reassigned') { Lanes.editWaitingItem(item, String(payload.text ?? ''), row.updated_at); return }
     const arrived = await personArrived({ item, kind: 'person_message', seq: row.number, dedupe: 'item:' + row.id, payload })
     if (arrived.code !== 200) throw new Error('person delivery: HTTP ' + arrived.code)

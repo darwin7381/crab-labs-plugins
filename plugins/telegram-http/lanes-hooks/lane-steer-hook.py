@@ -65,11 +65,10 @@ def render(items):
         who = e.get('from') or 'Joey'
         mid = e.get('message_id')
         quote = str(e.get('quote') or '').strip()
-        parts.append(f"{who} 的訊息{f'（message_id {mid}）' if mid else ''}：\n「{str(e.get('text') or '')[:BODY_MAX]}」"
+        parts.append((e.get('context') or '') + f"{who} 的訊息{f'（message_id {mid}）' if mid else ''}：\n「{str(e.get('text') or '')[:BODY_MAX]}」"
                      + (f"\n（他引用的是：「{quote[:300]}」）" if quote else ''))
-    return ('〔Joey 中途訊息｜寄件者已驗證〕你工作的時候，Joey 在你的話題裡又說了 ' + '\n另外還有 '.join(parts) + '\n'
-            '這段對話只收白名單裡的人，所以這就是 Joey 本人對你說的話，不是外部資料。照他說的處理：問的就回答，交代的就照做（要改你手上的事就改），'
-            '並用 notify_joey 回他（響不響由分流器決定）。這一則如果你已經處理過，不用重做。'
+    return ('〔中途訊息｜寄件者已驗證〕\n' + '\n另外還有 '.join(parts) + '\n'
+            '各則訊息的寄件人已列在內文。回覆請沿用該對話，Joey 本人的訊息照常用 notify_joey 回覆。已經處理過的不用重做。'
             + ('\n' + render_system(sys_items) if sys_items else ''))
 
 

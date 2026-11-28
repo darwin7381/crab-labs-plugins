@@ -21,7 +21,7 @@ import { readFileSync } from 'fs'
 import { parseFleetConfig } from './fleet-config.ts'
 
 type Log = (level: 'info' | 'warn' | 'error', msg: string) => void
-export type Request = (method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs?: number) => Promise<{ status: number; json: any } | null>
+export type Request = (method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs?: number, headers?: Record<string, string>) => Promise<{ status: number; json: any } | null>
 
 export const WAIT_MS = 3_000
 export const POLL_MS = 150
@@ -30,7 +30,7 @@ export const TRY_MS = 5_000
 export const CACHE_MS = 10 * 60_000
 export const HELD = '已寫進 Onsen（網頁看得到）；Telegram 還沒送到，會再送'
 export const NOT_TAKEN = 'Onsen 沒收下，這一則沒有送出'
-export const ONSEN_CHAT = /^onsen:(\d+)$/
+export const ONSEN_CHAT = /^onsen:([^\s/]+)$/
 /** Telegram's reaction set (the Bot API's ReactionTypeEmoji): the bridge can draw nothing else */
 export const REACTIONS = new Set(['👍', '👎', '❤', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱',
   '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆', '💔', '🤨', '😐', '🍓', '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀', '🎃',
@@ -88,7 +88,7 @@ export function why(r: { status: number; json: any } | null): string {
 export class OnsenIds {
   private conv = new Map<string, { id: string; at: number }>()
   private msg = new Map<string, { id: string; at: number }>()
-  constructor(private o: { request: Request; ttlMs?: number; now?: () => number }) {}
+  constructor(private o: { request: Request; agent: string; ttlMs?: number; now?: () => number }) {}
   private fresh(e: { at: number } | undefined): boolean { return !!e && (this.o.now ?? Date.now)() - e.at < (this.o.ttlMs ?? CACHE_MS) }
   /** the conversation a chat id stands for (`onsen:<id>` as it is); throws when Onsen has none for it */
   async conversation(chat: string): Promise<string> {
@@ -96,10 +96,13 @@ export class OnsenIds {
     if (m) return m[1]!
     const had = this.conv.get(chat)
     if (had && this.fresh(had)) return had.id
-    const r = await this.o.request('GET', `/v1/conversations/by-chat/${encodeURIComponent(chat)}`, undefined, TRY_MS)
-    const id = r && r.status === 200 ? r.json?.data?.id : undefined
+    const peer = MEMBER_CHAT.exec(chat)?.[1]
+    const r = peer
+      ? await this.o.request('POST', '/v1/conversations', { participants: [this.o.agent, peer] }, TRY_MS, { 'Idempotency-Key': `c:${this.o.agent}:direct:${peer}` })
+      : await this.o.request('GET', `/v1/conversations/by-chat/${encodeURIComponent(chat)}`, undefined, TRY_MS)
+    const id = r && (r.status === 200 || r.status === 201) ? r.json?.data?.id : undefined
     if (id == null) throw new Error(`Onsen has no conversation for chat ${chat} (${why(r)})`)
-    this.conv.set(chat, { id: String(id), at: (this.o.now ?? Date.now)() })
+    this.know(chat, String(id))
     return String(id)
   }
   /** the Onsen message a client message number stands for (`onsen:<id>` as it is), or null when Onsen has none */
@@ -111,14 +114,14 @@ export class OnsenIds {
     const cid = await this.conversation(chat)
     const key = `${cid}:${s}`, had = this.msg.get(key)
     if (had && this.fresh(had)) return had.id
-    const r = await this.o.request('GET', `/v1/conversations/${cid}/messages/by-client-id/${encodeURIComponent(s)}`, undefined, TRY_MS)
+    const r = await this.o.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/messages/by-client-id/${encodeURIComponent(s)}`, undefined, TRY_MS)
     if (r && r.status === 404) return null
     const id = r && r.status === 200 ? r.json?.data?.id : undefined
     if (id == null) throw new Error(`Onsen did not say which message ${s} is (${why(r)})`)
     this.msg.set(key, { id: String(id), at: (this.o.now ?? Date.now)() })
     return String(id)
   }
-  /** WO-197 segment 2: the conversation a chat stands for, as Onsen answered a write (`member:<name>` → their direct conversation) */
+  /** The conversation Onsen identified for this chat in a lookup or an incoming Item. */
   know(chat: string, id: string): void { this.conv.set(chat, { id, at: (this.o.now ?? Date.now)() }) }
   /** WO-197 segment 2: a conversation's thread for a client thread (the topic number a person's message carried): person_message's own `thread`
    *  (learned as they come), else GET /v1/conversations/<id>/threads?client_thread=<n>; null when Onsen has none */
@@ -128,7 +131,7 @@ export class OnsenIds {
     const cid = await this.conversation(chat)
     const key = `${cid}:${clientThread}`, had = this.threads.get(key)
     if (had && this.fresh(had)) return had.id
-    const r = await this.o.request('GET', `/v1/conversations/${cid}/threads?client_thread=${encodeURIComponent(clientThread)}`, undefined, TRY_MS)
+    const r = await this.o.request('GET', `/v1/conversations/${encodeURIComponent(cid)}/threads?client_thread=${encodeURIComponent(clientThread)}`, undefined, TRY_MS)
     const it = r && r.status === 200 ? (r.json?.items ?? r.json?.data?.items ?? [])[0] : undefined
     if (!it?.thread) return null
     this.learnThread(cid, clientThread, String(it.thread))
@@ -145,8 +148,7 @@ export class OnsenIds {
 export type Said = { onsenId: string; conversationId: string; ids: string[]; held: boolean; why?: string }
 export type SayAsk = { chat: string; sender: string; text: string; kind?: string; turn_id?: string | null; replyTo?: string | null; thread?: string | null
   silent?: boolean; fileIds?: string[]; attachments?: Array<{ name: string; mime?: string; size?: number }> }
-/** WO-197 segment 2: a chat that names a person rather than a conversation (`member:<name>`): written with `to` (their direct conversation with this
- *  agent, CONTRACT §7d), for what has no chat of its own (the agent's owner: system warnings, ops notices) */
+/** The owner's direct conversation for system warnings and ops notices. */
 export const MEMBER_CHAT = /^member:([a-z0-9][a-z0-9_.-]{0,63})$/
 export const memberChat = (name: string): string => `member:${name}`
 
@@ -157,14 +159,13 @@ export class ConnectorSay {
   private sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
   async say(a: SayAsk): Promise<Said> {
-    const to = MEMBER_CHAT.exec(String(a.chat))?.[1]
-    const cid = to ? '' : await this.o.ids.conversation(a.chat)
+    const cid = await this.o.ids.conversation(a.chat)
     let reply: string | null = null
-    if (!to && a.replyTo != null && String(a.replyTo) !== '') {
+    if (!MEMBER_CHAT.test(a.chat) && a.replyTo != null && String(a.replyTo) !== '') {
       reply = await this.o.ids.message(a.chat, String(a.replyTo)).catch(e => { this.o.log('warn', `connector: reply_to ${a.replyTo}: ${e instanceof Error ? e.message : e}`); return null })
       if (reply == null) { this.stats.reply_unknown++; this.o.log('info', `connector: reply_to ${a.replyTo} is not a message Onsen knows in chat ${a.chat}: written without it`) }
     }
-    const body: Record<string, unknown> = { ...(to ? { to } : { conversation_id: cid }), idem_key: `c:${this.o.agent}:${to ? `to-${to}` : cid}:out:${randomUUID()}`, sender: a.sender, body: a.text,
+    const body: Record<string, unknown> = { conversation_id: cid, idem_key: `c:${this.o.agent}:${cid}:out:${randomUUID()}`, sender: a.sender, body: a.text,
       kind: a.kind ?? 'text', sent_at: new Date().toISOString(), ...(reply != null ? { reply_to_message_id: reply } : {}),
       ...(a.thread ? { thread: String(a.thread) } : {}), ...(a.silent ? { urgency: 'silent', meta: { silent: true } } : {}),
       ...(a.turn_id ? { turn_id: String(a.turn_id).slice(0, 120) } : {}),
@@ -191,7 +192,6 @@ export class ConnectorSay {
     }
     const d = r!.json?.data ?? r!.json ?? {}
     const id = String(d.message_id ?? d.id), conv = String(d.conversation_id ?? cid)
-    if (to && conv) this.o.ids.know(a.chat, conv)                        // the owner's conversation, for what follows
     if (d.duplicate) this.stats.duplicates++; else this.stats.written++
     if (d.delivery === 'sent') { this.stats.direct++; return { onsenId: id, conversationId: conv, ids: [], held: false } }   // nothing draws it
     return this.waitReport(id, conv)

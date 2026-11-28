@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -61,7 +63,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
     return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   }
   const spawn = () => {
-    const child = Bun.spawn([process.execPath, '--no-env-file', '--preload', join(import.meta.dir, 'test-fixtures', 'item-daemon.ts'), join(import.meta.dir, 'server.ts')], {
+    const child = Bun.spawn([process.execPath, '--no-env-file', '--no-install', '--preload', join(import.meta.dir, 'test-fixtures', 'item-daemon.ts'), join(import.meta.dir, 'server.ts')], {
       cwd: import.meta.dir, stdout: 'ignore', stderr: 'pipe', env: childEnv, detached: true,
     })
     clean.push(async () => {
@@ -154,6 +156,27 @@ test('daemon handles a control at dispatch and immediately completes a re-served
   expect(d.journal().filter(l => l.onsen_items)).toHaveLength(0)
 })
 
+test('an agent’s web group message keeps its author and opaque ids, and reply writes back to that conversation', async () => {
+  const d = await daemon(), conversation = 'group-web', id = 'msg-a'
+  const row = d.f.add('web-group-item', 'message', { from: 'lab-b', message_id: id, payload: {
+    from: 'lab-b', message_id: id, conversation_id: conversation, via: 'web', kind: 'text', text: '/status', client: null,
+  } })
+  const message = () => d.journal().find(r => r.rec === 'msg' && r.onsen_items?.[0]?.onsen_item_id === row.id)
+  await waitFor(() => !!message())
+  expect(message().notif.params).toMatchObject({ content: '/status', meta: { chat_id: 'onsen:group-web', message_id: 'form-msg-a', user: 'lab-b' } })
+  expect(message().onsen_items[0].from_kind).toBe('agent')
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') || c.path === '/v1/messages')).toHaveLength(0)
+  const client = new Client({ name: 'group-reply-test', version: '1' })
+  clean.push(() => client.close())
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers: { Authorization: 'Bearer test-loopback' } } }))
+  const reply = await client.callTool({ name: 'reply', arguments: { chat_id: 'onsen:' + conversation, text: '@lab-b 好' } })
+  expect(reply.isError).not.toBe(true)
+  const writes = d.f.calls.filter(c => c.path === '/v1/messages')
+  expect(writes).toHaveLength(1)
+  expect(writes[0]!.body).toMatchObject({ conversation_id: conversation, body: '@lab-b 好' })
+  expect(writes[0]!.body.to).toBeUndefined()
+})
+
 test('take uses the existing 30 s menu-owner heartbeat and removes only its own file on exit', async () => {
   const d = await daemon({ CHANNEL_BOT_TMUX_SESSION: 'wo213-test-pane' })
   const file = join(d.root, 'home', '.claude/lanes/menu-owner/wo213-test-pane.json')
@@ -170,7 +193,7 @@ test('take uses the existing 30 s menu-owner heartbeat and removes only its own 
 function scriptedLane(root: string) {
   const bin = join(root, 'fixture-lane')
   const entry = join(import.meta.dir, 'test-fixtures', 'item-lane.ts')
-  writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" --no-env-file "${entry}" "$@"\n`)
+  writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" --no-env-file --no-install "${entry}" "$@"\n`)
   chmodSync(bin, 0o700)
   return { LANES_CLAUDE_BIN: bin }
 }
@@ -182,8 +205,9 @@ async function laneHook(root: string, n: number, event: string) {
   await waitFor(() => existsSync(file + '.out'))
   return readFileSync(file + '.out', 'utf8').trim()
 }
-async function runningWorker() {
+async function runningWorker(chat = '1') {
   const d = await daemon({}, 200, root => {
+    if (chat.startsWith('-')) writeFileSync(join(root, 'tg', 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: { [chat]: {} }, pending: {}, ackReaction: '' }))
     const thread = 'adam#worker', last = new Date().toISOString()
     writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({
       lanes: { [worker]: { id: worker, kind: 'worker', n: 1, session_id: randomUUID(),
@@ -192,9 +216,9 @@ async function runningWorker() {
     }))
     return scriptedLane(root)
   })
-  const person = (id: string, tg: string) => d.f.add(id, 'message', { message_id: id, payload: {
-    message_id: id, from: 'joey', conversation_id: 'conv', kind: 'text', thread: 555, text: id,
-    client: { name: 'telegram', chat: '1', msg_id: tg, user_id: '1', user: 'Joey', thread: '555' },
+  const person = (id: string, tg: string, from = 'joey') => d.f.add(id, 'message', { message_id: id, from, payload: {
+    message_id: id, from, conversation_id: 'conv', kind: 'text', thread: 555, text: id,
+    client: { name: 'telegram', chat, msg_id: tg, user_id: '1', user: from, thread: '555' },
   } })
   person('start-worker', '550')
   await waitFor(() => d.f.history.some(h => h.item_id === 'start-worker' && h.body.session_id === worker))
@@ -228,6 +252,28 @@ for (const event of ['PostToolUse', 'Stop']) test('the running worker takes a pe
   expect(reports().map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
   expect(d.journal().filter(r => r.rec === 'run' && r.state === 'leased' && r.lane === worker)).toHaveLength(1)
 }, 13000)
+
+test('in a group the running worker receives human context at its hook and the other agent on its next run', async () => {
+  const { d, person, row, hook } = await runningWorker('-10042')
+  const peer = person('@adam 請確認', '552', 'lab-b')
+  const line = { from: 'tg-42', created_at: '2026-11-28T01:02:00Z', preview: '舊'.repeat(100), attachments: [] }
+  d.f.contextAtTake.set(row.id, { context: Array.from({ length: 20 }, (_, n) => ({ ...line, message_id: 'prev-' + n })), context_omitted: 1 })
+  d.f.contextAtTake.set(peer.id, { context: [{ ...line, message_id: 'last', preview: '最後一項', attachments: [{ name: 'map.png' }] }] })
+  await waitFor(() => d.journal().some(r => r.state === 'queued' && r.event === 'item-' + peer.id + '-v1'))
+  const ctx = JSON.parse(await hook(1, 'PostToolUse')).hookSpecificOutput.additionalContext
+  expect(ctx).toContain('還有 1 則較早的，用 chat_history 查\n11-28 01:02Z｜tg-42｜#prev-0')
+  expect(ctx.indexOf('#prev-19')).toBeGreaterThan(1500)
+  expect(ctx.indexOf(row.id)).toBeGreaterThan(ctx.indexOf('#prev-19'))
+  expect(ctx).not.toContain(peer.id)
+  expect(peer.state).toBe('waiting')
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(peer.id))).toHaveLength(0)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => peer.state === 'completed')
+  const prompts = readFileSync(join(d.root, 'fixture-prompts.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain('11-28 01:02Z｜tg-42｜#last｜最後一項｜附件：map.png\nlab-b：' + peer.id)
+  expect(d.f.history.filter(h => h.item_id === peer.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+}, 15000)
 
 test('a late lane hook take renders nothing, retries the same key and returns the claim', async () => {
   const { d, row, hook, reports, takes } = await runningWorker()

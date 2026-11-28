@@ -3,10 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
-import { OnsenClient } from './onsen-client.ts'
+import { MemberNames, OnsenClient, type MemberKind } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
-import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
+import { ItemPeek, itemRef, messageContext, mayTakeItem, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
 import { createMain, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
@@ -48,9 +48,9 @@ async function mainRig() {
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
   await hook('SessionStart', { source: 'startup' })
-  const enqueue = (row: InboxItem, old = false) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
+  const enqueue = (row: InboxItem, old = false, fromKind?: MemberKind) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
     { method: 'notifications/claude/channel', params: { content: row.payload.text, meta: { chat_id: '1', message_id: String(row.number), user: row.from } } },
-    { event: row.id, fields: old ? {} : { onsen_items: [itemRef(row)] } })
+    { event: row.id, fields: old ? {} : { onsen_items: [{ ...itemRef(row), from_kind: fromKind }] } })
   const bind = async (row: InboxItem) => {
     const did = enqueue(row)
     await until(() => m.items(x => x.id === did)[0]?.state === 'offered')
@@ -132,6 +132,77 @@ test('while busy mail waits, a person binds inside PostToolUse, pre-switch work 
   expect(mail.claim).toBeNull(); expect(r.outcomes('legacy')).toEqual([])
   expect(message.claim?.session_id).toBe('main')
   for (const id of r.claims.held()) { const it = r.f.rows.get(id)!; expect(!!it.in_session_at || r.f.now() - Date.parse(it.claim!.taken_at) < 20_000).toBe(true) }
+})
+
+test('an idle mention delivers the three earlier messages and the current one in one notification from one claim', async () => {
+  const r = await mainRig(), row = r.f.add('@adam 現在輪你')
+  r.f.contextAtTake.set(row.id, { context_omitted: 4, context: [
+    { message_id: 'm-10', from: 'joey', created_at: '2026-11-28T01:02:00Z', preview: '先談時間', attachments: [] },
+    { message_id: 'm-11', from: 'lab-b', created_at: '2026-11-28T01:03:00Z', preview: '看一下\n附件', attachments: [{ name: 'plan.pdf' }] },
+    { message_id: 'm-12', from: 'tg-42', created_at: '2026-11-28T01:04:00Z', preview: '同意', attachments: [] },
+  ] })
+  await r.bind(row)
+  expect(r.offers.map(n => n.params.content)).toEqual([[
+    '還有 4 則較早的，用 chat_history 查', '11-28 01:02Z｜Joey｜#m-10｜先談時間',
+    '11-28 01:03Z｜lab-b｜#m-11｜看一下 ⏎ 附件｜附件：plan.pdf', '11-28 01:04Z｜tg-42｜#m-12｜同意', row.payload.text,
+  ].join('\n')])
+  expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([[row.id]])
+  expect(r.outcomes(row.id)).toEqual(['in_session'])
+  expect(messageContext(row)).toBe('')
+  expect(messageContext({ ...row, payload: { context: [], context_omitted: 0 } })).toBe('')
+  expect(messageContext({ ...row, kind: 'call', payload: { context_omitted: 5 } })).toBe('')
+})
+
+test('during a turn a guest reaches the hook while an agent mention waits for the next idle offer', async () => {
+  const r = await mainRig(), peer = r.f.add('@adam 下一回合', 'message', { from: 'lab-b' }), guest = r.f.add('訪客提問', 'message', { from: 'tg-42' })
+  const names = new MemberNames({ get: member => r.client.request('GET', '/v1/members/' + member), changed: () => {} })
+  await r.hook('UserPromptSubmit'); r.status('busy')
+  r.enqueue(peer, false, await names.kindOf(peer.from))
+  r.enqueue(guest, false, await names.kindOf(guest.from))
+  r.f.contextAtTake.set(guest.id, { context_omitted: 2 })
+  const hook = await r.hook('PostToolUse'); await r.sync()
+  expect(hook.additionalContext).toContain('還有 2 則較早的，用 chat_history 查\n訪客提問')
+  expect(hook.additionalContext).not.toContain(peer.id)
+  expect(guest.claim?.session_id).toBe('main')
+  expect(peer.claim).toBeNull()
+  expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([[guest.id]])
+  await r.hook('Stop', { phase: 'final' }); r.status('idle'); await r.m.pump()
+  await until(() => r.offers.length === 1)
+  expect(r.offers[0].params.content).toBe(peer.id)
+  expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([[guest.id], [peer.id]])
+})
+
+test('the member registry classifies senders once and retries a missing member before giving it person privileges', async () => {
+  const r = rig(), names = new MemberNames({ get: member => r.client.request('GET', '/v1/members/' + member), changed: () => {} })
+  await expect(names.kindOf('newcomer')).rejects.toThrow('member kind')
+  r.f.members.set('newcomer', 'agent')
+  expect(await Promise.all([names.kindOf('newcomer'), names.kindOf('newcomer')])).toEqual(['agent', 'agent'])
+  expect(await names.kindOf('newcomer')).toBe('agent')
+  expect(r.f.calls.filter(c => c.path === '/v1/members/newcomer')).toHaveLength(2)
+  const ref = itemRef(r.f.add('msg'))
+  for (const from_kind of ['human', 'guest', 'agent', 'system'] as const) {
+    const person = from_kind === 'guest' || from_kind === 'human'
+    expect(mayTakeItem({ ...ref, from_kind }, 'in_turn')).toBe(person)
+    expect(mayTakeItem({ ...ref, from_kind }, 'usage_limit')).toBe(person)
+  }
+})
+
+test('after the wall’s 60 seconds only a person probes, and an interrupted agent message reports cut', async () => {
+  const r = await mainRig(), peer = r.f.add('peer-mention', 'message', { from: 'lab-b' }), guest = r.f.add('guest-probe', 'message', { from: 'tg-42' })
+  r.setWall({ walled: true, clearedMs: null, lastWallMs: Date.now() - 61_000, resets_at: null })
+  const did = r.enqueue(peer, false, 'agent')
+  r.enqueue(guest, false, 'guest')
+  await until(() => r.offers.length === 1)
+  expect(r.offers[0].params.content).toBe(guest.id)
+  expect(peer.claim).toBeNull()
+  await r.hook('UserPromptSubmit', { dids: [r.offers[0].params.meta.did] }); await r.sync()
+  r.setWall(null)
+  await r.hook('Stop', { phase: 'final' })
+  await until(() => r.offers.length === 2)
+  await r.hook('UserPromptSubmit', { dids: [did], prompt_id: 'agent-turn' })
+  await r.hook('UserPromptSubmit', { prompt_id: 'later-turn' }); await r.sync()
+  expect(r.outcomes(peer.id)).toEqual(['in_session', 'cut'])
+  expect(peer.reason).toBe('cut')
 })
 
 test('20 s without a bind returns the offer, the same did can bind once on a new claim', async () => {
