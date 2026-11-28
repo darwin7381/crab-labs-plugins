@@ -80,11 +80,31 @@ test('self writes survive a disconnected connector and close the same Item on re
     expect(fake.rows.size).toBe(1)
     const row = [...fake.rows.values()][0]!
     expect(row).toMatchObject({ state: 'waiting', from: 'adam', waiter: 'eve' })
+    expect(c.writtenItemId(write.key)).toBe(row.id)
+    const otherMember = new OnsenClient({ ...c.cfg, agent: 'eve' })
+    expect(otherMember.writtenItemId(write.key)).toBeUndefined()
+    otherMember.stop()
+    c.stop()
+    c = client()
+    expect(c.writtenItemId(write.key)).toBe(row.id)
+    const posted = fake.calls.filter(call => call.key === write.key).length
     c.recordItemWrite({ ...write, complete: true })
     c.recordItemWrite({ ...write, complete: true })
     await c.syncNow(true)
     expect(row.state).toBe('completed')
-    expect(fake.calls.filter(call => call.body.outcome === 'completed')).toHaveLength(1)
+    expect(fake.calls.filter(call => call.key === write.key)).toHaveLength(posted)
+    expect(fake.calls.find(call => call.body.outcome === 'completed')?.path).toBe('/v1/items/' + row.id)
+    c.recordItemWrite({ ...write, item: { ...write.item, waiter: 'ken' } })
+    await c.syncNow(true)
+    expect(c.stats.rejected).toBe(1)
+    const offline = { key: 'finished-before-ack', item: write.item }
+    fake.down(true)
+    c.recordItemWrite(offline); c.recordItemWrite({ ...offline, complete: true })
+    await c.syncNow(true)
+    c.stop(); c = client(); fake.down(false)
+    await c.syncNow(true)
+    expect(fake.rows.get(c.writtenItemId(offline.key)!)!.state).toBe('completed')
+    expect(fake.calls.filter(call => call.path === '/v1/items/' + row.id && call.body.outcome === 'completed')).toHaveLength(1)
   } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -105,4 +125,21 @@ test('one ordered spool reads legacy self lines, drops a permanent refusal once 
     expect(logs.filter(l => l.includes('invalid-waiter') && l.includes('HTTP 400'))).toHaveLength(1)
     expect(client.stats.rejected).toBe(1)
   } finally { client.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('a pre-receipt commitment closes by matching its original waiting Item without a second POST', async () => {
+  fake = fakeItems()
+  const dir = mkdtempSync(join(tmpdir(), 'item-upgrade-'))
+  const c = new OnsenClient({ dir, agent: 'adam', base: fake.base, record: true, credential: () => 'test-member', log: () => {} })
+  try {
+    const item = ownItem('self', 'main', '回報（old-event）', fake.now() + 60_000, 'eve')
+    const row = (await (await request('POST', base, item, 'pre-upgrade')).json()).data
+    const other = (await (await request('POST', base, { ...item, waiter: 'cain' }, 'other')).json()).data
+    c.recordItemWrite({ key: 'pre-upgrade', item, complete: true })
+    await c.syncNow(true)
+    expect(c.writtenItemId('pre-upgrade')).toBe(row.id)
+    expect(fake.rows.get(row.id)!.state).toBe('completed')
+    expect(fake.rows.get(other.id)!.state).toBe('waiting')
+    expect(fake.calls.filter(call => call.key === 'pre-upgrade')).toHaveLength(1)
+  } finally { c.stop(); rmSync(dir, { recursive: true, force: true }) }
 })

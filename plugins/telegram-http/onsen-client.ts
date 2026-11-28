@@ -83,7 +83,7 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
 import type { ItemReport } from './onsen-receive.ts'
-import { syncItemWrite, type ItemWrite } from './onsen-item-writes.ts'
+import { ItemWrites, type ItemWrite } from './onsen-item-writes.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
@@ -422,6 +422,7 @@ export class OnsenClient {
   readonly spoolOld: string
   readonly cursorFile: string
   readonly rejected: string
+  private readonly itemWrites: ItemWrites
   readonly linesFile: string
   private running = false
   private again = false
@@ -456,6 +457,7 @@ export class OnsenClient {
     }
   }
   hasItemReports(): boolean { return this.itemReports > 0 }
+  writtenItemId(key: string): string | undefined { return this.itemWrites.id(key) }
   recordItemWrite(write: ItemWrite): void {
     if (!this.append({ k: 'item', r: write })) throw new Error('could not record the Onsen Item')
   }
@@ -485,6 +487,7 @@ export class OnsenClient {
     this.cursorFile = join(cfg.dir, 'cursor.json')
     this.rejected = join(cfg.dir, 'rejected.jsonl')
     this.linesFile = join(cfg.dir, 'lines.json')
+    this.itemWrites = new ItemWrites(join(cfg.dir, 'item-ids'), cfg.agent, this.request.bind(this))
   }
   private get f(): typeof fetch { return this.cfg.fetch ?? fetch }
 
@@ -959,7 +962,7 @@ export class OnsenClient {
       }
       if (t.line.k === 'item' || t.line.k === 'self') {
         const path = '/v1/members/' + encodeURIComponent(this.cfg.agent) + '/items'
-        const r = await syncItemWrite(this.request.bind(this), path, t.line.r).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        const r = await this.itemWrites.sync(path, t.line.r).catch(e => ({ status: 0, json: { error: errText(e) } }))
         if (!r) return
         if (r.status >= 200 && r.status < 300) this.stats.posted++
         else if (refusedForGood(r)) this.reject(t.line, `${t.line.r.item.kind} Item: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'item', path, status: r.status, code: errCode(r.json) })

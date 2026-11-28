@@ -68,7 +68,7 @@ export function resumablePromise(o: Ob, now: number): boolean {
     && !o.told && !o.rang && o.due_at != null && o.due_at >= now
 }
 
-/** Called at the M3 journal transition. The same saved creation request identifies early completion after restart. */
+/** Called at the M3 journal transition. The writer resolves completion to the original Item id after restart. */
 export function projectPromises(eventId: string, obs: Ob[], writer: ItemWriter, refs: ItemRef[] = [], previous: Ob[] = []): void {
   for (const o of obs) {
     if (o.self) {
