@@ -8,9 +8,16 @@
 - S2 的 `POST /v1/members/<member>/items` 寫 `kind:"resume"`、`session_id:"main"`、`body:{format:"markdown",text:…}` 和 `refs:[]`。非上限錯誤的 `not_before` 是原本的 `cut.retry_at`。上限等待 keeper 解除，行程中斷等待可接收的主線，兩者省略這個欄位。同一段對話一次只等一列 resume。新的 prompt 在上限解除前又被拒時，沿用尚未交入的列。該列的建立請求保留同一把 Idempotency-Key，包含回應遺失、程式重新啟動的情況。
 - `lanes-main.ts:579` 的台北時間、錯誤原因、正數背景工作數和不用回覆的通知共用同一個產生處。C1 的 peek（`onsen-items.ts:88`）按到期時間取得參照，經 `server.ts:4965` 依 kind 與寄件成員辨認自己的 resume，將它送到主線，M1 在可交入時才 take（`lanes-main.ts:462,539`），用既有的綁定、續約與完成回報。pull 成員繼續使用 WO-209 的本機通知及 receipt。切換時尚未交出的舊 cut 只能走一次。
 
+## 已定 59 與 04:25Z 裁決
+
+1. 還在等的 resume 原句跟著交給同一段 session 的下一列，包含閒置時的 stream 通知、工具邊界的 additionalContext 與 Stop 拉入的列。用交付的 receipt 記下帶的是哪一個 resume。帶過原句的回合正常 final Stop 才以版本化的 DELETE 送 `withdrawn`。沒有交入、Stop 被擋、或回合失敗時仍等。直接領取 resume 則依它自己的 claim 完成。
+2. 背景工作的結束通知會開另一個回合。那個回合本身不作廢原 resume；若它後來收下另一列附帶的提示，適用同一條 final Stop 規則。
+3. 通知已寫進 Claude Code 的輸入佇列時，可能再交入一次。保留原 claim 等交付證據：原句進了回合，照一般的 `in_session`、`completed` 回報；真正自行續跑、原句未交入才報 `superseded`。
+4. S2 請求省略選填欄位等同傳 `null`，回應保留可空欄位。POST 的內文讀自 `payload.text`，有格式時讀 `payload.format`。
+
 ## Claude Code 自己繼續
 
-`lanes-main.ts:857,914` 能分辨主線開了回合，以及哪一列實際交入。對同一段對話，沒有交入 item 的新回合會作廢還沒做完的 resume。子代理的 hook、session 註冊、重複錯誤通知都不足以證明主線自己繼續。claim 已有 in_session_at，或 M1 有 bound、done 記錄的 resume 已交入。背景通知回合與 final Stop 後等待 registry 結算的幾秒，都讓原 claim 正常完成。prompt 帶的 delivery id 可追到同一個 Onsen item id。補領失敗時仍能辨認是哪一列開的回合。若第一個 hook 是工具或 Stop，則以該代已交出的列和持有的 claim 綁定。
+`lanes-main.ts:857,914` 能分辨主線開了回合，以及哪一列實際交入。同一段對話自行續跑被打斷的工作時，會作廢尚未交入的 resume。子代理的 hook、session 註冊、背景通知、重複錯誤通知都不足以證明主線自己繼續。claim 已有 in_session_at，或 M1 有 bound、done 記錄的 resume 已交入。背景通知回合與 final Stop 後等待 registry 結算的幾秒，都讓原 claim 正常完成。prompt 帶的 delivery id 可追到同一個 Onsen item id。補領失敗時仍能辨認是哪一列開的回合。若第一個 hook 是工具或 Stop，則以該代已交出的列和持有的 claim 綁定。
 
 保留中斷與 Onsen 列的關聯，以及尚未送達的寫入意圖。等待中的列用 `DELETE /v1/items/<id>`，送 `expected_version` 與 `outcome:"superseded"`。版本衝突時重讀該列。已領的用 C1 的 claim 與 report spool 送同一 outcome。兩者都成為 `cancelled/superseded`。建立、領走與 hook 可以交錯，重連後仍要保留作廢的決定。已定 55 的失敗數由 Onsen 計算，逾期後才到的中途回報只記事件。
 
