@@ -23,7 +23,7 @@
  */
 import { Journal, type Row } from './lanes-state.ts'
 import { procFactsFor, type ProcFacts } from './lanes-proc.ts'
-import { createMain, mainContext, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
+import { createMain, mainContext, MAIN_STUCK_MS, type MainApi, type MainEnv, type MainWall, type ItemKind, type Via } from './lanes-main.ts'
 import { pidAlive, type CallFacts, type TurnTrigger } from './onsen-status.ts'
 import type { CallCheck, CallRef, CallWait } from './onsen-client.ts'
 import { createEvents, matterKey, type EventsApi, type EvClass, type Ob, type Outcome } from './lanes-events.ts'
@@ -343,7 +343,7 @@ export function lanesInit(deps: LanesDeps): void {
     }
     if (S.steering) { S.steering = {}; saveState() }
     deliveryModeChanged()
-    setInterval(() => { void main.tick() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
+    setInterval(() => { void main.tick(); checkLaneStalls() }, 5_000).unref()       // M2: kill -0, the stuck rule; M1: the offer
     setInterval(() => idleCheck(), 2_000).unref()                // WO-157b: a turn statusOf shows ended with no Stop (Esc) is closed as interrupted
     // lanes-topics (item 4): a worker closed before the previous daemon stopped, its topic not finished yet (only `pending` ones: older closed lanes untouched)
     setTimeout(() => { for (const l of Object.values(S.lanes)) if (l.status === 'closed' && l.topic_close === 'pending' && !l.topic_done && !running.has(l.id)) void finishTopic(l, '關閉時 daemon 重啟，開機後補上') },
@@ -3565,7 +3565,7 @@ export function itemIndex(): Map<string, number> {
 /** the in-memory view of an event's current run record (M5): the journal is its state; this is what pump and the tools read */
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; attempts: number; priority: number; summary?: string; enqueued: string
   /** the M5 record id of this event's current run; the process and lane run of a leased one */
-  rid?: string; pid?: number; run?: string; keeperProbe?: number
+  rid?: string; pid?: number; run?: string; keeperProbe?: number; stuckRestart?: boolean
   /** after a death the next run waits until then (002f backoff) */
   not_before?: number
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
@@ -3609,8 +3609,25 @@ export function failedHandoffText(it: { attempts: number; ev: { from: string; te
 }
 const queue = new Map<string, QItem>()          // event id → item
 /** WO-177 六: the tool calls of a run whose result has not come back yet (its stream's tool_use → tool_result): tool_use id → name, since when */
-type OpenTools = Map<string, { name: string; since: string }>
-const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string; tools?: OpenTools; back?: string }>()  // lane id → run (WO-132: `at` = when it started; WO-177: `back` = when its last open tool came back)
+type OpenTools = Map<string, { name: string; since: string; timeoutMs?: number }>
+const running = new Map<string, { child: ChildProcess; evId: string; runId: string; tok: RunTok; at: string; progressAt?: number; tools?: OpenTools; back?: string }>()  // lane id → run (WO-132: `at` = when it started; WO-177: `back` = when its last open tool came back)
+function checkLaneStalls(now = Date.now()): void {
+  if (!takingItems()) return
+  for (const run of running.values()) {
+    const it = queue.get(run.evId)
+    if (!it || it.stuckRestart || run.child.killed || run.child.exitCode != null) continue
+    const last = run.progressAt ?? Date.parse(run.at)
+    const toolEnds = Array.from(run.tools?.values() ?? [], tool => Date.parse(tool.since) + (tool.timeoutMs ?? 0) * 1.25)
+    if (now <= Math.max(last + MAIN_STUCK_MS, ...toolEnds)) continue
+    syncSteer(it.lane)
+    const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+    if (!refs.length) continue
+    itemReceiver!.report(refs, 'stuck')
+    it.stuckRestart = true
+    runRec(it, 'running', { stuck_restart: true })
+    run.child.kill('SIGKILL')
+  }
+}
 type RunTok = { runId: string; lane: string; evId: string; closers: string[]; critical: boolean; trigger: string; cls: string; commitments?: number
   /** lanes-golive (C2): how many mails this mail-lane run opened (an opened mail owes Joey the run's one line) */
   mailOpened?: number
@@ -3744,7 +3761,7 @@ function restoreRuns(): void {
     if (r.state === 'exited' || !r.ev) continue
     const it: QItem = { ev: r.ev, lane: String(r.lane), state: 'queued', attempts: r.state === 'queued' ? Number(r.attempt) - 1 : Number(r.attempt), priority: Number(r.priority ?? 5),
       summary: r.summary ?? undefined, enqueued: String(r.enqueued ?? r.created), rid: r.id, ...(r.extra ? { extra: r.extra } : {}), ...(r.deaths ? { deaths: r.deaths } : {}),
-      ...(r.steered ? { steered: r.steered } : {}) }
+      ...(r.steered ? { steered: r.steered } : {}), stuckRestart: r.stuck_restart === true }
     if (r.state === 'queued') {
       if (S.lanes[it.lane]?.status === 'closed' && releaseClosedQueue(it)) continue
       queue.set(it.ev.id, it); continue
@@ -3818,7 +3835,7 @@ const endWords = (reason: string, it: QItem): string => reason === 'normal' ? '�
  *    not an attempt (the event is queued again as it was);
  *  - the lanes' wall: up on a wall; down on any other exit of a run that reached the model (it wrote a result record or made a model call);
  *  - otherwise, and after MAX_ATTEMPTS, the run's work has ended: a task lane's own duty (endTask), then the exit rule over the set. */
-function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; processExit?: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
+function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; processExit?: string; said?: string; reached?: string; reachedModel?: boolean; halfDone?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
   const wall = e.reason.startsWith('wall:') ? e.reason.slice(5) : null
   const retryable = !!wall || e.reason === 'died' || e.reason === 'timeout' || e.reason === 'restore'
   if (wall) it.attempts = Math.max(0, it.attempts - 1)                      // nothing was tried: not an attempt
@@ -3833,11 +3850,12 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; proces
   if (wall && !(takingItems() && apiError)) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
   else if (!wall && S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
   if (again) return
-  const outcome = itemExit === 'normal' ? 'completed' : apiError ? 'error'
+  const outcome = it.stuckRestart ? 'cut' : itemExit === 'normal' ? 'completed' : apiError ? 'error'
     : wall ? (it.keeperProbe ? 'usage_limit_probe' : 'usage_limit') : 'cut'
   if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) {
     const limit = outcome === 'usage_limit' || outcome === 'usage_limit_probe'
-    itemReceiver?.report(refs, outcome, limit ? { retry_after: D.usageWall?.(0)?.resets_at ?? null } : undefined)
+    itemReceiver?.report(refs, outcome, { ...(limit ? { retry_after: D.usageWall?.(0)?.resets_at ?? null } : {}),
+      ...(it.stuckRestart ? { note: '卡住重開' } : {}), ...(e.halfDone ? { half_done: true } : {}) })
   }
   releaseScheduleThread(lane, it)                                           // WO-164 point 4: a schedule's run is over: its thread lets the lane go
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
@@ -5198,7 +5216,8 @@ function startRun(it: QItem, acquired = false): void {
   }, LANE_MAX_RUN_MS)
   const openTools: OpenTools = new Map()                                // WO-177 六: what the run is doing now (runningLanes: the observation's doing)
   if (refs.length) itemReceiver?.bind(refs, lane.id, runId)
-  running.set(lane.id, { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools })
+  const liveRun = { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools, progressAt: Date.now() }
+  running.set(lane.id, liveRun)
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
   appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'spawn', run: runId, event: it.ev.id, session_id: lane.session_id,
@@ -5234,6 +5253,7 @@ function startRun(it: QItem, acquired = false): void {
       const line = buf.slice(0, i); buf = buf.slice(i + 1)
       if (!line.trim()) continue
       let j: any; try { j = JSON.parse(line) } catch { continue }
+      if (j.type === 'assistant' || j.type === 'user' || j.type === 'tool_progress' || j.type === 'result') liveRun.progressAt = Date.now()
       if (j.type === 'system' && j.subtype === 'init' && j.session_id) sessionSeen = j.session_id
       if (j.type === 'assistant' && j.message) {
         const u = j.message.usage ?? {}
@@ -5243,7 +5263,8 @@ function startRun(it: QItem, acquired = false): void {
         for (const c of j.message.content ?? []) {
           if (c?.type === 'tool_use') {
             tools.push({ id: c.id ? String(c.id) : undefined, name: c.name, input: c.input })
-            if (c.id) openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso() })
+            if (c.id) openTools.set(String(c.id), { name: String(c.name ?? 'tool'), since: nowIso(),
+              timeoutMs: c.name === 'Bash' ? Number(c.input?.timeout ?? process.env.BASH_DEFAULT_TIMEOUT_MS ?? 120000) || 0 : 0 })
             if (!String(c.name).startsWith('mcp__lane__')) (tok.calls ??= []).push({ name: c.name, input: c.input })   // the lane stop's model aid (its lane tools: callLaneTool)
             const rs = c.name === 'Bash' ? restartCommand(String(c.input?.command ?? '')) : null
             if (c.name === 'Bash' && prodChangeOn()) for (const pc of remoteChanges(String(c.input?.command ?? ''))) prodChanges.push({ ...pc, cmd: clip(String(c.input?.command ?? ''), 300) })
@@ -5423,7 +5444,7 @@ function startRun(it: QItem, acquired = false): void {
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
         text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
     }
-    runEnded(lane, it, { reason, processExit, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
+    runEnded(lane, it, { reason, processExit, said, reached, reachedModel: !!resultJson || usage.size > 0, halfDone: !!lastText || tools.length > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
     saveState()
     pump()
   }

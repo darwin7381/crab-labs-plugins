@@ -505,6 +505,25 @@ test('a real peer hold leaves no M1 or lane reference; release starts a full pee
   expect(d.f.calls.slice(since).some(c => c.query.has('wait') && !c.query.has('changed_after'))).toBe(true)
 }, 12000)
 
+test('a silent Item lane reports stuck and is stopped once; its cut names the restart', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'stalled-lane')
+    writeFileSync(bin, `#!/bin/sh
+echo '{"type":"assistant","message":{"id":"step","content":[{"type":"text","text":"started work"}]}}'
+exec sleep 20
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin, LANES_MAIN_STUCK_MS: '100', LANES_MAX_RUN_MS: '15000' }
+  })
+  const row = d.f.add('stalled', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] stalled', line: 'call' } })
+  const reports = () => d.f.history.filter(r => r.item_id === row.id)
+  await waitFor(() => reports().some(r => r.body.outcome === 'cut'), 8000)
+  const first = reports().filter(r => r.body.claim_id === reports()[0].body.claim_id)
+  expect(first.map(r => r.body.outcome)).toEqual(['in_session', 'stuck', 'cut'])
+  expect(first[2].body).toMatchObject({ note: '卡住重開', half_done: true })
+  expect(row.failures).toBe(1)
+}, 10000)
+
 test('a lane behind an account limit only probes on real input, once per keeper clear', async () => {
   const d = await daemon({}, 200, root => {
     const bin = join(root, 'limited-lane'), dir = join(root, 'walls')
