@@ -1,5 +1,7 @@
 # WO-213 C6 · 漫遊者接上成員連接器
 
+本檔記錄 C6 開發當時的決議。2026-11-28 的契約 §4b 已定 80 更新了對話編號。從 `v2-fix1` 起，主線向 Onsen 回報 `main`，分身回報完整編號。漫遊目標用小寫 Claude session UUID 的 SHA-256 前 128 位轉成十進位，對外編號為 `<成員>.roam.<十進位數>`。連接器以原 UUID 比對本機的回合、行程和逐字稿。[Fleet Core 0.42.2 本機事件與 HTTP 回報](v2-fix1-events.jsonl)
+
 分支 `wo213-c6` 已依審查要求 rebase 到 C1 修正版 `1160d2a`。依據為共用 brief、`TICKET-connector-facts.md` §2–5、`ANCHOR.md` 第 4 點①、`roamer-facts.md`、設計 v3 與 C1 驗收記錄。開工時 `CONTRACT.md` 的 MD5 為 `74677ba677142a0feef8551eb96a5713`，§4b 到已定 56。原規格的程式行號相對於 `ef79d7a` 的 `plugins/telegram-http/`。
 
 ## Epeius 的註冊清單
