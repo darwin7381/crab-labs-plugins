@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto'
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -44,6 +46,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   clean.push(async () => { try { await f.stop() } finally { rmSync(root, { recursive: true, force: true }) } })
   f.mode(initialMode)
   for (const dir of [state, lanes, join(root, 'home')]) mkdirSync(dir)
+  writeFileSync(join(root, 'no-config'), '')
   writeFileSync(join(state, 'access.json'), JSON.stringify({ dmPolicy: 'allowlist', allowFrom: ['1'], groups: {}, pending: {}, ackReaction: '' }))
   copyFileSync(join(import.meta.dir, 'lanes-router.fleet.json'), join(lanes, 'router.json'))
   const port = await freePort()
@@ -176,6 +179,36 @@ function scriptedLane(root: string) {
 }
 
 const worker = 'adam.worker.1'
+test('C5 bench: the main reply tool writes one timed promise for the test account and one notice goes to its inbox', async () => {
+  const jev = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answers: { promises: { type: 'noul', noul: 0.99 } } }) })
+  clean.push(async () => { await jev.stop(true) })
+  const chat = '6736970916', said = '10 分鐘後回報'
+  const d = await daemon({ TYPESAFE_API_KEY: 'test', TYPESAFE_BASE_URL: 'http://127.0.0.1:' + jev.port }, 200, root => {
+    writeFileSync(join(root, 'tg', 'access.json'), JSON.stringify({ allowFrom: [chat], groups: {}, pending: {} }))
+    return {}
+  })
+  await waitFor(() => d.log().includes('onsen take: started'))
+  const client = new Client({ name: 'c5-test-main', version: '1' }, { capabilities: {} })
+  clean.push(() => client.close())
+  await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp')))
+  const at = Date.now()
+  const r = await client.callTool({ name: 'reply', arguments: { chat_id: chat, text: said } })
+  expect(r.isError).not.toBe(true)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages' && c.body.body === said)).toHaveLength(1)
+  await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'self'))
+  const promises = [...d.f.rows.values()].filter(r => r.kind === 'self')
+  expect(promises).toHaveLength(1)
+  const row = promises[0]!
+  expect(row).toMatchObject({ from: 'adam', waiter: 'joey-test', session_id: 'main', deadline: row.not_before, state: 'waiting' })
+  const due = Date.parse(row.deadline!)
+  expect(due).toBeGreaterThanOrEqual(at + 600_000)
+  expect(due).toBeLessThanOrEqual(Date.now() + 600_000)
+  d.f.advance(due - d.f.now() + 1); d.f.advance(60_000)
+  const notices = [...d.f.rows.values()].filter(r => r.about_item_id === row.id)
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toMatchObject({ kind: 'notice', member: 'joey-test', reason: 'promise_due' })
+})
+
 test('C5 active connector schedules its own keepwarm with the legacy local switch off, including across restart', async () => {
   const at = Date.now() - 120_000, sid = randomUUID(), ts = (ms: number) => new Date(at + ms).toISOString()
   const d = await daemon({}, 200, root => {

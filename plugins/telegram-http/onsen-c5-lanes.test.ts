@@ -19,7 +19,7 @@ const env = { LANES_DIR: dir, TYPESAFE_API_KEY: 'test', TYPESAFE_BASE_URL: 'http
 const saved = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]]))
 Object.assign(process.env, env)
 copyFileSync(process.env.LANES_TEST_ROUTER!, join(dir, 'router.json'))
-const L = await import('./lanes.ts?onsen-c5') as typeof import('./lanes.ts')
+const L: typeof import('./lanes.ts') = await import(new URL('./lanes.ts?onsen-c5', import.meta.url).href)
 const pushes: string[] = []
 L.lanesInit({ role: 'tg', agent: 'adam', workspaceDir: dir, transcriptDir: dir, httpPort: 0, log: () => {},
   authOk: () => false, registryNames: () => ['eve'], joeyChatId: () => '6736970916',

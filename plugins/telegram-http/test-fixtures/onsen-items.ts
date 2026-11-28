@@ -94,6 +94,7 @@ export function fakeItems() {
     // Existing resources used by the real tg daemon alongside the Item API.
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
     if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
+    if (path === '/v1/conversations/by-chat/6736970916') return detail({ id: 'test-account-dm', participants: ['joey-test', 'adam'] })
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
     if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
     if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
