@@ -1091,6 +1091,30 @@ test('changing target during take delivers only to the UUID selected at arrival'
   expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(row.id))).toHaveLength(1)
 }, 12000)
 
+test('album parts arriving on opposite sides of a roam stay in their respective sessions', async () => {
+  const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
+  const part = (id: string) => {
+    const row = d.f.add(id)
+    Object.assign(row.payload, { media_group_id: 'split-album', kind: 'document',
+      attachments: [{ kind: 'document', name: id + '.pdf', client_ref: id, mime: 'application/pdf' }] })
+    return row
+  }
+  a.select()
+  const left = part('left')
+  await waitFor(() => d.log().includes('handed to the'))
+  expect(a.got).toHaveLength(0)
+  b.select()
+  const right = part('right')
+  await waitFor(() => a.got.length === 1 && b.got.length === 1)
+  for (const [target, row] of [[a, left], [b, right]] as const) {
+    expect(target.got[0].meta.attachment_name).toBe(row.id + '.pdf')
+    expect(target.got[0].meta.attachment_name_2).toBeUndefined()
+    target.accept(target.got[0])
+    await waitFor(() => row.claim?.session_id === target.sid)
+  }
+  expect(d.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids).sort()).toEqual([['left'], ['right']])
+}, 12000)
+
 test('a busy arrival and a late first peek keep A across a switch to B and a daemon restart', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   a.status('busy'); a.select()
