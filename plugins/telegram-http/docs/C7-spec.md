@@ -35,6 +35,6 @@ Use the existing loopback Item fixture and a fake Codex executable. Exercise aut
 
 Route map station 14 — connector and Codex runtime callers of Onsen's database directly **0** and callers of retired inbox, form-poll, hand-over or §2d projection endpoints **0**. Item take/report, member observations, outbound messages and the connector's read of current Call content use supported HTTP APIs.
 
-Settled 58 retains `PUT /v1/calls/<id>/state` with a `{result}` body. Onsen derives Call progress from Item reports. A scheduled receipt writes its outcome, steps and text through the spool, resolving the run's Call when the Item did not name it.
+Settled 58 retains `PUT /v1/calls/<id>/state` with a `{result}` body. Onsen derives Call progress from Item reports. Under settled 79, a scheduled receipt carries its outcome, Markdown body and plain-text preview. The body includes the ordered checklist and its notes. The spool resolves the run’s Call when the Item did not name it.
 
 An answer outside Onsen closes the existing menu Action when the connector observes the menu has gone. The cancellation carries `在別處按了` in both `reason` and `note`. Its `applied_at` stays null. An external keypress creates no Action or Item.

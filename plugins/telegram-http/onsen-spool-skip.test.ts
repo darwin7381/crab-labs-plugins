@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { OnsenClient, answeredCall, credentialRefused, isRoamerEnv, recordFor, refusedForGood } from './onsen-client.ts'
+import { callResult, OnsenClient, answeredCall, credentialRefused, isRoamerEnv, recordFor, refusedForGood } from './onsen-client.ts'
 import type { ItemReport } from './onsen-receive.ts'
 
 const BASE = 'http://127.0.0.1:1'
@@ -18,7 +18,7 @@ describe('upgrading a durable report spool', () => {
         requests.push({ path: new URL(url).pathname, method: init.method!, body: JSON.parse(String(init.body)), key: new Headers(init.headers).get('Idempotency-Key') })
         return Response.json({}, { status: statuses.shift() })
       }) as typeof fetch }
-    const result = { outcome: 'failed', body: { format: 'markdown' as const, text: 'disk full' } }
+    const result = { ...callResult('failed', 'disk full', [{ step: 'Copy', done: false, note: 'ENOSPC' }], ['file-1']), preview: 'Disk copy failed' }
     const c = new OnsenClient(cfg)
     expect(c.recordCall({ call_id: '71', run_id: '93', event: 's', idem: 'call:run:93:result', body: { result } })).toBe(true)
     expect(c.recordItemReport(report)).toBe(true)
@@ -28,6 +28,31 @@ describe('upgrading a durable report spool', () => {
     const put = { path: '/v1/calls/71/state', method: 'PUT', body: { result }, key: 'call:run:93:result' }
     expect(requests).toEqual([put, put, { path: '/v1/items/item-1/report', method: 'PUT', body: report.body, key: 'ir:item-1:claim-1:completed' }])
     expect(restarted.pendingBytes()).toBe(0)
+  })
+
+  test('a pending C7 result with steps replays as Markdown and keeps its attachments and key', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'result-upgrade-'))
+    const result = { outcome: 'ok', steps: [{ step: 'Read', done: true, note: '2 files' }], attachment_file_ids: ['file-1'] }
+    const line = { k: 'c', r: { call_id: '65', event: 's', idem: 'call:run:82:result', body: { result } } }
+    writeFileSync(join(dir, 'spool.jsonl'), JSON.stringify(line) + '\n')
+    const puts: any[] = []
+    const c = new OnsenClient({ dir, agent: 'adam', base: BASE, record: true, credential: () => 'fixture', log: () => {},
+      fetch: (async (_url: string, init: RequestInit) => {
+        puts.push([new Headers(init.headers).get('Idempotency-Key'), JSON.parse(String(init.body))])
+        return Response.json({})
+      }) as typeof fetch })
+    await c.syncNow(true); c.stop()
+    expect(puts).toEqual([['call:run:82:result', { result: { outcome: 'ok', body: { format: 'markdown', text: '- [x] Read — 2 files' },
+      preview: 'Read — 2 files', attachment_file_ids: ['file-1'] } }]])
+    expect(c.pendingBytes()).toBe(0)
+  })
+
+  test('the result reserves room for all steps within the 4000-character body', () => {
+    const steps = [{ step: 'Verify', done: false, note: 'offline' }]
+    const { body } = callResult('failed', '🌊'.repeat(4000), steps)
+    expect(Array.from(body.text)).toHaveLength(4000)
+    expect(body.text.endsWith('\n\n- [ ] Verify — offline')).toBe(true)
+    expect(() => callResult('ok', '', [{ step: 'x'.repeat(4000), done: true }])).toThrow('Shorten the steps')
   })
 
   test('old receipts advance locally, an unacknowledged claim survives two refusals and replays after restart', async () => {

@@ -6,7 +6,7 @@ import { promisify } from 'node:util'
 import { homedir, hostname } from 'node:os'
 import { basename, dirname, extname, join, relative } from 'node:path'
 import { Claims } from '../onsen-claims.ts'
-import { OnsenClient, recordFor, refusedForGood } from '../onsen-client.ts'
+import { OnsenClient, callResult, recordFor, refusedForGood } from '../onsen-client.ts'
 import { ItemPeek, itemRef, type InboxItem } from '../onsen-items.ts'
 import { ItemReceiver } from '../onsen-receive.ts'
 import { TakeMode, machineName, takeOff } from '../onsen-take.ts'
@@ -911,8 +911,7 @@ export class CodexRunner {
     if ((j.call_id || j.run_id) && !j.steps.result) {
       const ids = (j.files ?? []).map(rel => j.uploads?.[rel]).filter((id): id is string => !!id && id !== '-')
       const text = this.answerBody(j, SEND_TEXT_MAX)
-      const result = { outcome: j.outcome === 'failed' ? 'failed' : 'ok', body: { format: 'markdown' as const, text },
-        ...(ids.length ? { attachment_file_ids: ids } : {}) }
+      const result = callResult(j.outcome === 'failed' ? 'failed' : 'ok', text, [], ids.length ? ids : undefined)
       if (!this.items.recordCall({ event: j.item_id, idem: 'codex:result:' + j.item_id, call_id: j.call_id ?? null, run_id: j.run_id, body: { result } }))
         throw new Error('could not spool Call result for ' + j.item_id)
       j.steps.result = true; this.save()

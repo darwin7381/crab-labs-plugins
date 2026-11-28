@@ -27,6 +27,10 @@ const call = existsSync('receipt-input.json') ? { name: 'receipt', arguments: JS
   : prompt.includes('explicit handover')
   ? { name: 'handoff_main', arguments: { text: 'The owner needs the original alert and the pending decision.' } }
   : { name: 'notify_joey', arguments: { text: 'The fixture alert was handled.', outcome: 'normal' } }
+if (existsSync('receipt-first.json')) {
+  const first = await client.callTool({ name: 'receipt', arguments: JSON.parse(readFileSync('receipt-first.json', 'utf8')) })
+  writeFileSync('receipt-first-answer.json', JSON.stringify(first))
+}
 const result = await client.callTool(call)
 if (call.name === 'receipt') writeFileSync('scheduler-receipt', JSON.stringify(result.content))
 if (result.isError) throw Error('fixture lane tool failed')

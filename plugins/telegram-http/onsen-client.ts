@@ -90,9 +90,31 @@ export type CallStateName = 'accepted' | 'running' | 'completed' | 'failed'
  *  what moment of which item this is) */
 export type CallStateLine = { call_id: string; kind: CallRef['kind']; event: string; idem: string
   body: { state: CallStateName; session_id: string | null; result?: { outcome?: string; body?: { format: 'markdown'; text: string } }; at: string } }
-/** Settled 58. Progress comes from Item reports. A result can arrive before or after the terminal report. */
+export type CallResult = { outcome?: string; body: { format: 'markdown'; text: string }; preview: string; attachment_file_ids?: string[] }
+/** Fleet Core accepts 4000 Unicode characters. Reserve room for every step before shortening the summary. */
+export function callResult(outcome: string | undefined, summary: string, steps: Step[] = [], files?: string[]): CallResult {
+  const list = steps.map(s => `- [${s.done ? 'x' : ' '}] ${s.step}${s.note ? ' — ' + s.note : ''}`).join('\n')
+  const room = 4000 - Array.from(list).length
+  if (room < 0) throw new Error('The receipt steps exceed the 4000-character Call result limit. Shorten the steps and submit the receipt again.')
+  const lead = Array.from(summary).slice(0, Math.max(0, room - (list ? 2 : 0))).join('')
+  const text = [lead, list].filter(Boolean).join('\n\n')
+  const spaced = (s: string) => s + ' '
+  const plain = Bun.markdown.render(text, { paragraph: spaced, heading: spaced, listItem: spaced, code: spaced, th: spaced, td: spaced,
+    html: html => html.replace(/<\/?[A-Za-z][^>]*>/g, '') })
+  const chars = Array.from(plain.replace(/\s+/g, ' ').trim())
+  const preview = chars.length <= 60 ? chars.join('') : chars.slice(0, 59).join('') + '…'
+  return { ...(outcome != null ? { outcome } : {}), body: { format: 'markdown', text }, preview,
+    ...(files ? { attachment_file_ids: files } : {}) }
+}
+/** A C7 spool may predate the Markdown checklist. Keep the saved preview on a current record. */
+function storedCallResult(saved: Partial<CallResult> & { steps?: Step[] }): CallResult {
+  const { outcome, body, preview, attachment_file_ids, steps } = saved
+  if (body && typeof preview === 'string' && !steps) return { outcome, body, preview, attachment_file_ids }
+  return callResult(outcome, body?.text ?? '', steps, attachment_file_ids)
+}
+/** Settled 58 and 79. Item reports carry progress. The spool sends only the Call result. */
 export type CallResultLine = { event: string; idem: string; call_id: string | null; run_id?: string
-  body: { state?: never; result: { outcome: string; steps?: Step[]; body?: { format: 'markdown'; text: string }; attachment_file_ids?: string[] } } }
+  body: { state?: never; result: CallResult } }
 export type ScheduledResultLine = CallResultLine & { run_id: string }
 /** WO-175 (Chiron 05:55Z: a receipt goes to Onsen only): what became of one spooled Call line. took: Onsen answered 2xx (its state then);
  *  refused: a 4xx (Onsen's sentence; the line is in rejected.jsonl); pending: no answer, or 5xx, within the wait (the line stays in the spool and
@@ -865,7 +887,13 @@ export class OnsenClient {
         } else if (!id) this.reject(t.line, 'Call result has no call_id or run_id')
         if (id) {
           const path = '/v1/calls/' + encodeURIComponent(id) + '/state'
-          const r = await this.put(path, { result: c.body.result }, cred, undefined, { 'Idempotency-Key': c.idem })
+          let result: CallResult
+          try { result = storedCallResult(c.body.result) }
+          catch (err) {
+            this.reject(t.line, errText(err)); this.writeCursor(t.end); i++
+            continue
+          }
+          const r = await this.put(path, { result }, cred, undefined, { 'Idempotency-Key': c.idem })
             .catch(e => ({ status: 0, json: { error: errText(e) } }))
           if (r.status >= 200 && r.status < 300) this.stats.posted++
           else if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'c', path, status: r.status, code: errCode(r.json) })

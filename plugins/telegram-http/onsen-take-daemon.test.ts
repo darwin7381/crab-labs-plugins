@@ -285,8 +285,9 @@ function scriptedLane(root: string) {
 
 const worker = 'adam.worker.1'
 for (const named of [false, true]) test('scheduled receipt writes only Call.result, named Call=' + named, async () => {
-  const summary = 'The snapshot could not be verified.', steps = [{ step: 'Verify snapshot', done: false, note: summary }]
+  const summary = 'Snapshot check.', steps = [{ step: 'Read index', done: true }, { step: 'Verify copy', done: false, note: 'Offline' }]
   const d = await daemon({ LANES_RECEIPT_STEPS: '1' }, 200, root => {
+    if (!named) writeFileSync(join(root, 'receipt-first.json'), JSON.stringify({ outcome: 'done', steps: [{ step: 'x'.repeat(4000), done: true }] }))
     writeFileSync(join(root, 'receipt-input.json'), JSON.stringify({ outcome: 'failed', steps, summary }))
     return scriptedLane(root)
   })
@@ -297,8 +298,17 @@ for (const named of [false, true]) test('scheduled receipt writes only Call.resu
   writeFileSync(join(d.root, 'release-lane'), '')
   await waitFor(() => !!d.f.scheduleCalls.get('806')!.result)
   expect(readFileSync(join(d.root, 'scheduler-receipt'), 'utf8')).toContain('Call result queued')
-  expect(d.f.calls.filter(c => c.path.endsWith('/state')).map(c => c.body)).toEqual([{ result: { outcome: 'failed', steps, body: { format: 'markdown', text: summary } } }])
+  expect(d.f.calls.filter(c => c.path.endsWith('/state')).map(c => c.body)).toEqual([{ result: { outcome: 'failed',
+    body: { format: 'markdown', text: 'Snapshot check.\n\n- [x] Read index\n- [ ] Verify copy — Offline' },
+    preview: 'Snapshot check. Read index Verify copy — Offline' } }])
   expect(d.f.calls.filter(c => c.path === '/v1/calls').map(c => c.query.get('ref_value'))).toEqual(named ? [] : ['762'])
+  if (!named) {
+    const first = JSON.parse(readFileSync(join(d.root, 'receipt-first-answer.json'), 'utf8'))
+    expect(first.isError).toBe(true)
+    expect(first.content[0].text).toContain('Shorten the steps')
+    const ledger = readFileSync(join(d.lanes, 'ledger.jsonl'), 'utf8').trim().split('\n').map(s => JSON.parse(s))
+    expect(ledger.filter(r => r.kind === 'receipt')).toHaveLength(1)
+  }
 })
 
 async function laneHook(root: string, n: number, event: string) {

@@ -64,7 +64,7 @@ export function fakeItems(member = 'adam', token = 'test-member', extra?: (req: 
     if (path.startsWith('/v1/calls/') && path.endsWith('/state') && req.method === 'PUT') {
       const call = scheduleCalls.get(path.split('/')[3]!)
       if (!call) return error(404, 'not_found')
-      if (!b.result || Object.keys(b).length !== 1) return error(400, 'invalid_request')
+      if (!b.result || Object.keys(b).length !== 1 || Object.keys(b.result).some(k => !['outcome', 'body', 'preview', 'attachment_file_ids'].includes(k))) return error(400, 'invalid_request')
       call.result = b.result; return detail(call)
     }
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
