@@ -24,6 +24,8 @@ export type Followup = {
   state: 'pending' | 'fired' | 'ended'; fired?: string; fired_event?: string
   /** 002k (C6): how many follow-up runs the chain has had once this one fires (1 = scheduled by an ordinary run); ended = why it was cancelled */
   chain?: number; ended?: string
+  /** Writer bookkeeping for take members. A follow-up run's receipt decides whether there is another check to publish. */
+  onsen?: 'awaiting_receipt' | 'submitted'
 }
 
 // ------------------------------------------------------------------ 002k (C6): a follow-up chain stops by program

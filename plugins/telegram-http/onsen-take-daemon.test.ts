@@ -176,6 +176,32 @@ function scriptedLane(root: string) {
 }
 
 const worker = 'adam.worker.1'
+test('C5 converts a saved followup and delivers its self Item once to the original worker', async () => {
+  const thread = 'adam#check', event = 'prior-run', id = 'fu-old', due = Date.now() + 2500
+  const d = await daemon({}, 200, root => {
+    const last = new Date().toISOString()
+    writeFileSync(join(root, '.lanes', 'state.json'), JSON.stringify({
+      lanes: { [worker]: { id: worker, kind: 'worker', n: 1, session_id: randomUUID(), thread, status: 'idle',
+        created: last, last, transcript: join(root, 'worker.jsonl'), runs: 0, tokens_in: 0, tokens_out: 0 } },
+      threads: { [thread]: { id: thread, lane: worker, peer: 'eve', hops: 0, tokens: 0, created: last, last } },
+      followups: { [id]: { id, thread, lane: worker, event, from: 'eve', cls: 'peer', trigger: 'peer', run_id: null,
+        after_minutes: 10, note: '重查狀態', created: last, due, due_iso: new Date(due).toISOString(), state: 'pending', chain: 1 } },
+    }))
+    return scriptedLane(root)
+  })
+  await waitFor(() => [...d.f.rows.values()].some(r => r.kind === 'self'))
+  const rows = [...d.f.rows.values()].filter(r => r.kind === 'self')
+  expect(rows).toHaveLength(1)
+  const row = rows[0]!
+  expect(row).toMatchObject({ session_id: worker, waiter: 'eve', not_before: new Date(due).toISOString(), deadline: null, state: 'waiting' })
+  d.f.advance(due - d.f.now() + 1)
+  await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'in_session'))
+  expect(d.journal().filter(r => r.rec === 'run' && r.state === 'queued' && r.ev?.followup === id)).toHaveLength(1)
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state === 'completed')
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
+}, 15000)
+
 async function laneHook(root: string, n: number, event: string) {
   const file = join(root, 'hook-' + n)
   writeFileSync(file, event)

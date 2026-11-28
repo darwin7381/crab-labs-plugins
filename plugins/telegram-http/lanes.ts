@@ -258,9 +258,9 @@ export type MainPicker = {
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
-import type { ItemRef } from './onsen-items.ts'
+import type { InboxItem, ItemRef } from './onsen-items.ts'
 import { chatWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
-import type { SelfWriter } from './onsen-self.ts'
+import { ownItem, type SelfWriter } from './onsen-self.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
@@ -2551,8 +2551,8 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   // Onsen's mention item (WO-181) is a notice, as the lanes digest is: it owes nobody anything (no Joey line, no answer) and is not a call. It reaches the
   // main as the lanes' own message (chat lanes, no_reply), its mention block riding with it. As a peer's call it carried a Joey line, and the main answered
   // Joey 「沒有要我做的事」 (Chiron's WO-175 lab, 08:42Z, lab-relay msg 881): fleet-wide, every comment naming an agent would have made it write to Joey
-  const notice = ev.item_kind === 'mention'
-  const p = (notice ? { content: String(ev.text ?? ''), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'mention', no_reply: 'true' } }
+  const notice = ev.item_kind === 'mention' || ev.item_kind === 'self' || ev.item_kind === 'keepwarm'
+  const p = (notice ? { content: String(ev.text ?? ''), meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: ev.item_kind!, no_reply: 'true' } }
     : ev.notif?.params ?? {}) as { content?: string; meta?: Record<string, string> }
   const notif = d.warn ? { method: ev.notif.method || 'notifications/claude/channel', params: { ...p, content: `${d.warn}\n\n${String(p.content ?? ev.text)}`, meta: { ...(p.meta ?? {}), screened: 'instructions-to-agent' } } }
     : { method: ev.notif?.method || 'notifications/claude/channel', params: { ...p, content: String(p.content ?? ev.text ?? ''), meta: { ...(p.meta ?? {}) } } }
@@ -3698,6 +3698,8 @@ function endRun(it: QItem, reason: string, f: Record<string, unknown> = {}): voi
   if (it.rid) runRec(it, 'exited', { reason, ...f })
   it.state = 'done'
   if (queue.get(it.ev.id) === it) queue.delete(it.ev.id)
+  if (it.run && activeSelfWriter()) submitStagedChecks(it.run)
+  if (waitingFollowupEvents.delete(it.ev.id)) onGateOpen?.()
 }
 function releaseLaneItem(ev: InEvent, lane: string): void {
   // A recovered take or a steer grant may already own the row without a delivery receipt.
@@ -4227,25 +4229,80 @@ function runPrompt(it: QItem, lane: Lane, cardUpdate: string[] = [], boundary?: 
  *  the thread's lane session (a fresh lane with the ledger summary when that lane is gone or too old). Cap, queue and
  *  the lane permission (no irreversible actions) are the ordinary lane ones. */
 export function followupTick(): void {
-  if (!S?.followups) return
+  if (!S?.followups || itemReceiver?.mode.checking || activeSelfWriter()) return
   const now = Date.now()
   let changed = false
   for (const f of duePending(S.followups, now)) {
     // PL3: a follow-up is another run on its ORIGIN event's record (its line is a raise or it is refused, M3), not a new matter
-    if (queue.has(f.event)) continue                                         // that event has a run queued or running: the follow-up waits for it
-    f.state = 'fired'; f.fired = nowIso(); f.fired_event = f.event; changed = true
-    const th = S.threads[f.thread]
-    let lane = th?.lane ? S.lanes[th.lane] : undefined
-    if (!lane || lane.status === 'closed') lane = newLane('reflex', { thread: f.thread })
-    const rec = events?.get(f.event)
-    const ev: InEvent = { id: f.event, source: 'mesh', from: f.from, text: String(rec?.text ?? f.note), meta: {}, notif: { method: '', params: {} },
-      thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id, synthetic: followupEventText(f, now) }
-    routeRow({ event: f.event, source: 'followup', from: f.from, ...ownTag('followup', lane.id), target: 'lane', lane: lane.id, thread: f.thread, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` }, ev)
-    logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: f.event, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
-    const d = dispatch(ev, lane, { rule: 'followup' })
-    D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
+    if (f.onsen || queue.has(f.event)) continue
+    fireFollowup(f, now)
+    changed = true
   }
   if (changed) saveState()
+}
+
+function fireFollowup(f: Followup, now: number, item?: ItemRef): void {
+  const th = S.threads[f.thread]
+  let lane = th?.lane ? S.lanes[th.lane] : undefined
+  if (!lane || lane.status === 'closed') lane = newLane('reflex', { thread: f.thread })
+  const rec = events?.get(f.event)
+  const ev: InEvent = { id: f.event, source: 'mesh', from: f.from, text: String(rec?.text ?? f.note), meta: {}, notif: { method: '', params: {} },
+    thread: f.thread, trigger: f.trigger, cls: f.cls, followup: f.id, synthetic: followupEventText(f, now), ...(item ? { onsen_items: [item] } : {}) }
+  routeRow({ event: f.event, source: 'followup', from: f.from, ...ownTag('followup', lane.id), target: 'lane', lane: lane.id, thread: f.thread, followup: f.id, note: `follow-up ${f.id} of ${f.event} (due ${f.due_iso})` }, ev)
+  logos('lane.followup.fire', { lane: lane.id, thread: f.thread, followup: f.id, origin_event: f.event, event: f.event, due: f.due_iso, late_s: Math.round((now - f.due) / 1000) })
+  const d = dispatch(ev, lane, { rule: 'followup' })
+  f.state = 'fired'; f.fired = nowIso(); f.fired_event = f.event
+  D.log('info', `lanes: follow-up ${f.id} due ${f.due_iso} → ${d.target} ${d.lane ?? ''} (${d.note ?? ''})`)
+}
+
+function submitCheck(f: Followup, writer: SelfWriter): void {
+  const event = events.get(f.event)
+  const origin: ItemRef | undefined = event?.onsen_items?.[0]
+  const waiter = event?.promised?.at(-1)?.to ?? origin?.waiter ?? origin?.from ?? S.threads[f.thread]?.peer ?? undefined
+  const refs = [{ kind: 'item', value: f.id }]
+  if (f.run_id) refs.push({ kind: 'run', value: f.run_id })
+  writer({ key: f.id, item: ownItem('self', f.lane, followupEventText(f, f.due), f.due, waiter, null, refs) })
+  f.onsen = 'submitted'
+}
+
+function submitStagedChecks(run: string): void {
+  const writer = activeSelfWriter()
+  if (!writer) return
+  const staged = Object.values(S.followups).filter(f => f.run === run && f.onsen === 'awaiting_receipt' && f.state === 'pending')
+  for (const f of staged) submitCheck(f, writer)
+  if (staged.length) saveState()
+}
+
+/** Publish existing local work exactly once when C1 switches this member, including after a restart. */
+export function resumeSelfItems(): void {
+  const writer = activeSelfWriter()
+  if (!writer || !S) return
+  for (const f of Object.values(S.followups)) {
+    if (f.state !== 'pending' || f.onsen === 'submitted') continue
+    if (f.onsen === 'awaiting_receipt' && queue.get(f.event)?.run === f.run) continue
+    submitCheck(f, writer)
+  }
+  saveState()
+  for (const e of events.rows(e => e.state === 'open' && e.obligations?.some((o: Ob) => !o.self && o.to && (o.level === 'commitment' || o.level === 'answer' && o.due_at != null)))) {
+    events.note(e.id, {})
+  }
+}
+
+const waitingFollowupEvents = new Set<string>()
+/** C1 already checked not_before. Dispatch carries the unclaimed ref into the main or lane that actually receives it. */
+export function routeOwnItem(row: InboxItem, item: ItemRef, text: string): void {
+  const f = row.kind === 'self' && row.refs.map(r => r.kind === 'item' && S.followups[r.value]).find(Boolean)
+  if (f && row.reason !== 'reassigned') {
+    if (queue.has(f.event)) { waitingFollowupEvents.add(f.event); return }
+    fireFollowup(f, Date.now(), item)
+    saveState()
+    return
+  }
+  const ev: InEvent = { id: itemEventId(item), source: 'mesh', from: row.from, text, no_reply: true, item_kind: row.kind,
+    meta: {}, notif: { method: 'notifications/claude/channel', params: { content: text } }, onsen_items: [item] }
+  const lane = row.session_id && S.lanes[row.session_id]
+  if (lane && lane.status !== 'closed' && row.reason !== 'reassigned') dispatch(ev, lane, { rule: 'onsen-self' })
+  else toMain(ev, { target: 'main', rule: 'onsen-' + row.kind }, { owesOnlyMain: true })
 }
 
 /** the queue is the journal's run records (M5); a death is retried by the exit handler itself (with its backoff), so this only pumps */
@@ -6794,7 +6851,10 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
         run_id: ((events.get(tok.evId)?.obligations ?? []) as Ob[]).find(o => o.kind === 'receipt')?.run_id ?? null,
         trigger: tok.trigger, cls: tok.cls, from: q?.ev.from ?? 'scheduler', after_minutes: chk.after, note: chk.note, created: nowIso(),
         due, due_iso: new Date(due).toISOString(), state: 'pending', chain }
+      const writer = activeSelfWriter()
+      if (writer && tok.followup && !tok.receipt) f.onsen = 'awaiting_receipt'
       S.followups[f.id] = f; saveState()
+      if (writer && !f.onsen) { submitCheck(f, writer); saveState() }
       ledger({ lane: lane.id, thread: lane.thread, event: tok.evId, kind: 'action',
         text: `排了後續檢查 ${f.id}：${chk.after} 分鐘後（${simTime(due)}）再查：${chk.note}`, refs: { followup: f.id, due: f.due_iso, after_minutes: chk.after } })
       logos('lane.followup', { lane: lane.id, thread: lane.thread, event: tok.evId, followup: f.id, after_minutes: chk.after, due: f.due_iso, note: chk.note.slice(0, 200) })
@@ -6912,6 +6972,7 @@ export async function callLaneTool(tok: RunTok, name: string, a: any): Promise<s
           if (dropped.length) { chainEnded(lane, tok, 'no-change', Math.max(...dropped.map(f => f.chain ?? 1)) - 1); chainNote = `; the follow-up you scheduled in this run was cancelled: your outcome is the same as the previous run's, so this thread now waits for a new event or Joey` }
           saveState()
         }
+        submitStagedChecks(tok.runId)
       }
       const note = a.summary ? stripMarkup(String(a.summary)).slice(0, 200) : rep?.happened.slice(0, 200)
       const undone = notDone ? `沒做：${notDone}` : ''                     // WO-125 (C): the receipt says which steps were not done (and so does the digest)

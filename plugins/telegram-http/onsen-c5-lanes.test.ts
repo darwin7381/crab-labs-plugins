@@ -8,6 +8,8 @@ import { ItemReceiver } from './onsen-receive.ts'
 import { Claims } from './onsen-claims.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { promiseTime } from './onsen-promises.ts'
+import { itemRef } from './onsen-items.ts'
+import { outcomeFingerprint } from './lanes-followup.ts'
 
 const dir = mkdtempSync(join(tmpdir(), 'c5-lanes-'))
 const f = fakeItems()
@@ -82,4 +84,42 @@ test('only definite times become deadlines', () => {
   expect(promiseTime('明天 10:15 前回報', at)).toBe(Date.parse('2026-11-29T10:15:00+08:00'))
   expect(promiseTime('稍後回報', at)).toBeNull()
   expect(promiseTime('第 1 點', at)).toBeNull()
+})
+
+test('followup keeps the origin lane and sender limits, and only a due Item enters the lane queue', async () => {
+  const s = L.__lanesState(), lane = 'adam.reflex.25', thread = 'adam#checks', event = 'check-25'
+  s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
+  s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
+  const tok = { runId: 'check-r1', lane, evId: event, trigger: 'peer', cls: 'peer', closers: [] } as any
+  L.__events().open(event, { class: 'peer', owner: lane, thread, obligations: [] })
+  const schedule = (note: string) => L.callLaneTool(tok, 'followup', { after_minutes: 10, note })
+  for (const note of ['重查 A', '重查 B', '重查 C']) expect(await schedule(note)).toContain('scheduled')
+  expect(await schedule('第四個')).toContain('max 3')
+  await client.syncNow(true)
+  const rows = selfRows().filter(r => r.session_id === lane)
+  expect(rows).toHaveLength(3)
+  const row = rows[0]!, follow = s.followups[row.refs[0]!.value]!
+  expect(row).toMatchObject({ waiter: 'eve', deadline: null, not_before: follow.due_iso, state: 'waiting' })
+  expect(row.payload.text).toContain(follow.note)
+  // Make the old local tick see an overdue check. Only the Item route can dispatch it.
+  follow.due = Date.now() - 1
+  L.followupTick()
+  L.resumeSelfItems()
+  expect(follow.state).toBe('pending')
+  s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
+  L.routeOwnItem(row, itemRef(row), row.payload.text)
+  expect(follow.state).toBe('fired')
+  expect(follow.fired_event).toBe(event)
+  expect(L.itemIndex().get(row.id)).toBe(row.version)
+  expect(row.claim).toBeNull()
+  const next = { ...tok, runId: 'check-r2', followup: true, followupId: follow.id }
+  const did = '數量仍是 12 件'
+  s.threads[thread]!.fu_fp = outcomeFingerprint('normal', { did })
+  expect(await L.callLaneTool(next, 'followup', { after_minutes: 5, note: '再看一次' })).toContain('scheduled')
+  await L.callLaneTool(next, 'receipt', { outcome: 'normal', happened: '查了', did, promised: '無', needs_main: '無' })
+  await client.syncNow(true)
+  expect(selfRows().filter(r => r.session_id === lane)).toHaveLength(3)
+  expect(Object.values(s.followups).filter(f => f.ended === 'no-change')).toHaveLength(1)
+  follow.chain = 4
+  expect(await L.callLaneTool({ ...next, unchanged: false }, 'followup', { after_minutes: 5, note: '第五趟' })).toContain('cap 4')
 })

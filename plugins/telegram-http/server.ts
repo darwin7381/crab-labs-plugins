@@ -366,7 +366,7 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+      active => { if (active) { Lanes.resumeSelfItems(); itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.())
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
@@ -4978,6 +4978,10 @@ async function routeInboxItem(row: InboxItem, edit: boolean): Promise<void> {
     return
   }
   const payload = { ...row.payload }
+  if (row.from === row.member && (row.kind === 'self' || row.kind === 'keepwarm')) {
+    Lanes.routeOwnItem(row, item, [item.note, item.half_done ? '上一回合被打斷，接著做。' : '', payload.text ?? payload.body?.text].filter(Boolean).join('\n'))
+    return
+  }
   const prefix = [item.note, item.half_done ? '上一回合被打斷，接著做。' : ''].filter(Boolean).join('\n')
   if (prefix) payload.text = prefix + '\n' + (payload.text ?? '')
   if (row.kind === 'message' || row.message_id) {
