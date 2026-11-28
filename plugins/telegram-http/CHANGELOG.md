@@ -1,3 +1,9 @@
+## 1.59.11 — 2026-11-28 (WO-213 C1, shipped dark: a member takes its own work from Onsen; off everywhere)
+
+- **The connector half of "one delivery mechanism"** (WO-213 C1, contract §4b settled 14–36): with `ONSEN_TAKE` listing the agent *and* Onsen answering 200 to the take probe, the tg daemon peeks its Onsen items without claiming them (`onsen-items.ts`), takes a row only when the target conversation can receive it (`onsen-receive.ts`, `onsen-take.ts`), keeps one local ledger of what it holds (`onsen-claims.ts`) and reports once how the turn ended. **Off by default and off on every machine**: unset, the daemon is the 1.59.10 daemon (Chiron's acceptance, 11-28 02:19Z: no hunk outside the take conditions changes a pull member; on the bench 0 `/items` requests). Set against today's Onsen (0.40.0) the probe gets 400: one log line, the member stays on pull.
+- Merged onto 1.59.10: `applyPickerControl` answers `false` (nothing pressed) when the pane could not be read, so a take-mode control reports `not_applied` there.
+- Not to switch on yet: Chiron's nine points before S2 (`C1-ACCEPT.md` §D) are in progress on `wo213-c1`.
+
 ## 1.59.10 — 2026-11-28 (WO-168 stage two: Chiron's lab check of 1.59.9, three fixes)
 
 - **A menu taller than 40 rows is read up to its own border** (`screenFacts`, Chiron 00:27Z item 1): on a 50-row pane the resume picker's title 「Resume session (1 of 37)」 sits on row 7, outside the 40 rows above the footer, so the record said `other` and `/resume <n>` (`isPickerOpen` reads the record's kind since 1.59.9) would have sent Escape and failed. The window now reaches the menu's top border on the visible screen when the border is further up; menus within 40 rows read as before.

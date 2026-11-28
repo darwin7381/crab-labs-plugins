@@ -73,6 +73,27 @@ def render(items):
             + ('\n' + render_system(sys_items) if sys_items else ''))
 
 
+def take_at_boundary(entries):
+    import http.client
+
+    # The file contains only a reference for these messages. This run's token and
+    # the daemon's pending list determine which content the hook may receive.
+    conn = None
+    try:
+        conn = http.client.HTTPConnection('127.0.0.1', int(os.environ['LANES_HTTP_PORT']), timeout=3)
+        conn.request('POST', '/lane-steer', json.dumps({'ids': [e['id'] for e in entries]}),
+                     {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + os.environ['LANE_RUN_TOKEN']})
+        response = conn.getresponse()
+        if response.status == 200:
+            return {(e['id'], e['run']): dict(e, take=True) for e in json.load(response)['items']}
+    except (KeyError, ValueError, OSError, http.client.HTTPException):
+        pass
+    finally:
+        if conn:
+            conn.close()
+    return {}
+
+
 def deliver(p):
     """The text to hand to the model for the messages not handed over yet (and mark them handed over), or ''."""
     lane = os.environ.get('LANE_ID') or ''
@@ -84,17 +105,25 @@ def deliver(p):
     if not inbox:
         return ''
     out_path = os.path.join(d, f'{lane}.out.jsonl')
-    done = {str(j.get('id')) for j in read_jsonl(out_path)}
-    fresh = [e for e in inbox if str(e.get('id')) not in done]
+    done = {(str(j.get('id')), j.get('run')) for j in read_jsonl(out_path)}
+    fresh = [e for e in inbox if (str(e.get('id')), e.get('run') if e.get('take') else None) not in done]
     event = p.get('hook_event_name') or ''
     if event == 'Stop':
         fresh = [e for e in fresh if e.get('kind') != 'system']   # 002l: a limit notice never holds a run that is ending anyway
+    pending = [e for e in fresh if e.get('take')]
+    if pending:
+        received = take_at_boundary(pending)
+        resolved = (received.get((e['id'], e['run'])) if e.get('take') else e for e in fresh)
+        fresh = [e for e in resolved if e]
     if not fresh:
         return ''
     try:
         with open(out_path, 'a', encoding='utf-8') as f:
             for e in fresh:
-                f.write(json.dumps({'id': e.get('id'), 'at': int(time.time() * 1000), 'event': event, 'tool': p.get('tool_name') or '', 'session': p.get('session_id') or ''}, ensure_ascii=False) + '\n')
+                receipt = {'id': e.get('id'), 'at': int(time.time() * 1000), 'event': event, 'tool': p.get('tool_name') or '', 'session': p.get('session_id') or ''}
+                if e.get('take'):
+                    receipt['run'] = e['run']
+                f.write(json.dumps(receipt, ensure_ascii=False) + '\n')
     except OSError:
         return ''                                 # cannot mark = would hand it over again at every call: say nothing instead
     return render(fresh)

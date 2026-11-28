@@ -211,6 +211,8 @@ export interface LanesDeps {
   /** receipt note (btcc-ack-auth): `note` is the run's one line, BTCC's field (scheduler.py complete_run reads note, stores outcome_note; it never read summary) */
   schedulerCall?: (runId: string, action: 'ack' | 'complete', outcome?: string, note?: string) => Promise<string>
   /** inbox role, WO-205 (Chiron mesh-13475): M2's registry disagreement as a BTCC page alert (POST /api/fleet/main-registry, this daemon's mesh credential) */
+  inboundLog?: (body: Record<string, unknown>) => Promise<number | undefined>
+  schedulerTaken?: (runId?: string) => void
   registryAlert?: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }) => Promise<string>
   /** inbox role, WO-128 (item 4): the cards that wait on the main's decision (BTCC /due over its longest window, the past due included), for the context the
    *  main gets back after a /clear, a compaction or a restart */
@@ -256,6 +258,8 @@ export type MainPicker = {
 
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
+import type { ItemRef } from './onsen-items.ts'
+
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
 let LANES_DIR = ''
 const nowIso = () => new Date().toISOString()
@@ -313,10 +317,11 @@ export function lanesInit(deps: LanesDeps): void {
     writeOpenHandoffs()
     writeLaneSettings()
     rotateMailLanesAtBoot()                         // WO-131: a mail lane over its renewal thresholds is closed now; its restored runs move at their start
+    const steeringAtBoot = Object.keys(S.steering ?? {})
     restoreRuns()
-    for (const [id, list] of Object.entries(S.steering ?? {})) {                 // 002k (E18): messages that were with a run when the daemon stopped: that run is gone, they are the lane's next run
+    for (const id of steeringAtBoot) {                 // restoreRuns folds any Item receipts before the remaining messages become the lane's next run
       const lane = S.lanes[id]
-      if (lane) queueSteering(lane, list, 'was cut off when the daemon restarted')
+      if (lane) queueSteering(lane, S.steering?.[id] ?? [], 'was cut off when the daemon restarted')
       for (const k of ['in', 'out'] as const) { try { rmSync(steerFile(id, k)) } catch {} }
     }
     if (S.steering) { S.steering = {}; saveState() }
@@ -340,7 +345,7 @@ let main: MainApi
 /** M1 + M2 (lanes-main.ts) in this daemon: how they reach the main, Joey and the wall */
 function mainEnv() {
   return {
-    journal, agent: D.agent, log: D.log, registry: D.registry,
+    journal, agent: D.agent, log: D.log, registry: D.registry, itemReceiver: () => itemReceiver,
     // WO-205: the tg daemon holds no BTCC credential; its agent-inbox daemon sends the alert with its own
     registryAlert: (a: { state: 'open' | 'clear'; session?: string; pid?: number; why?: string }): void => {
       void inboxPost('/lanes/registry-alert', a).then(r => D.log(r?.ok ? 'info' : 'warn', `lanes: registry alert ${a.state}: ${r?.text ?? 'the agent-inbox daemon did not answer'}`))
@@ -626,7 +631,7 @@ export function mainTranscriptFile(dir: string): string | null {
   return sid ? join(dir, `${sid}.jsonl`) : null
 }
 /** called by the control commands that kill or restart the TUI on purpose (/restart, /kill_stuck): the gen ends `asked` */
-export function markDeliberateRestart(): void { main?.markEnd('asked') }
+export function markDeliberateRestart(command?: import('./lanes-main.ts').StopCommand, signalOnly = false): void { main?.markEnd('asked', command, signalOnly) }
 
 // 002y (X-5; the fleet is mostly macOS): every process fact lanes reads comes from ONE platform layer, a function per fact (lanes-proc.ts). Through
 // 002x they were Linux /proc reads here (/proc/net/tcp + /proc/<pid>/fd for a socket's process, stat, cmdline, exe): on a Mac no MCP session was ever
@@ -1486,6 +1491,7 @@ function runBoundary(): BoundaryCard | null { return boundaryCardOn() ? boundary
 
 // ================================================================== router
 export type InEvent = {
+  onsen_items?: ItemRef[]
   id: string; source: 'telegram' | 'mesh' | 'mail'; from: string; text: string
   meta: Record<string, string>; notif: Notif
   verified?: boolean; thread?: string; hop?: number; lane_marker?: string
@@ -1879,6 +1885,10 @@ function recordOnlyRow(ev: InEvent, v: WakeVerdict): Decision {
 
 /** Router: rules from router.json, in order, first match wins. No model call. */
 export async function routeEvent(ev: InEvent): Promise<Decision> {
+  if (ev.onsen_items?.some(r => r.main)) {
+    return routeMainItem(ev)
+  }
+  if (ev.onsen_items?.length) ev.id = itemEventId(ev.onsen_items[0]!)
   const cfg = routerCfg()
   // lanes-topics (item 2): where Joey's message is (a topic, or outside topics): a reply to it goes there (targetTopic)
   if (D.role === 'tg' && S && ev.source === 'telegram' && !ev.synthetic) noteMsgTopic(ev.meta?.chat_id, ev.meta?.message_id, ev.message_thread_id ?? null)
@@ -1927,7 +1937,7 @@ export async function routeEvent(ev: InEvent): Promise<Decision> {
       D.log('info', `lanes: route ${ev.id} (${ev.source} from ${ev.from}) rule=${g.rule} → ledger — ${g.note}`)
       noteInbound(ev, { rule: g.rule, target: 'ledger' })
       // M3 (PL1): a gated message has its record too: information (no obligations), riding on its episode's head, which carries the episode
-      recordInbound(ev, { owner: 'router', fields: { gate: g.rule, episode: g.episode, ...(g.head ?? {}) } })
+      if (!ev.onsen_items) recordInbound(ev, { owner: 'router', fields: { gate: g.rule, episode: g.episode, ...(g.head ?? {}) } })
       return { rule: g.rule, target: 'ledger', note: g.note }
     }
   }
@@ -2531,7 +2541,7 @@ export function mailChecked(m: number, by: string): number {
 
 /** M1: an event the router gives the main is an item for it (the screen's warning in front). The digest is not attached here: it rides whatever M1
  *  offers or the main's hook pulls next (lanes-main.ts). `owesOnlyMain`: the item is all it owes (a wake-up line: no Joey line, no answer, no receipt). */
-function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}): void {
+function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}): string | undefined {
   if (d.target !== 'main' || D.role !== 'tg' || !main) return
   // Onsen's mention item (WO-181) is a notice, as the lanes digest is: it owes nobody anything (no Joey line, no answer) and is not a call. It reaches the
   // main as the lanes' own message (chat lanes, no_reply), its mention block riding with it. As a peer's call it carried a Joey line, and the main answered
@@ -2549,8 +2559,26 @@ function toMain(ev: InEvent, d: Decision, opt: { owesOnlyMain?: boolean } = {}):
   const cls = evClassOf(ev)
   recordInbound(ev, { owner: 'main', class: cls, obligations: [{ kind: 'main', level: 'handed', owner: 'main' }, ...(opt.owesOnlyMain || notice ? [] : eventObligations(ev, cls)).map(o => ({ ...o, state: 'handed',
     ...(o.kind === 'peer' ? { due_at: Date.now() + PROMISE_MIN * 60_000, what: String(ev.text ?? '').slice(0, 160) } : {}) }))] })   // 002w (B, gap 9): the answer is due
-  main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
+  return main.enqueue(kind, notif, { via: ev.source === 'telegram' || notice ? 'tg' : 'inbox', event: ev.id, ...(ev.person_message_ids?.length ? { fields: { person_message_ids: ev.person_message_ids } } : {}), ...(ev.onsen_items ? { fields: { person_message_ids: ev.person_message_ids, onsen_items: ev.onsen_items } } : {}), ...(d.batch ? { batched: true } : {}) })   // WO-164: batched
 }
+function itemEventId(ref: ItemRef): string {
+  const id = 'item-' + ref.onsen_item_id + '-v' + ref.onsen_version
+  // A full peek can route this same version again. Its former lane's obligations are closed.
+  const previous = events?.get(id)?.lane
+  return S.lanes[previous]?.status === 'closed' ? id + '-' + shortId() : id
+}
+function routeMainItem(ev: InEvent): Decision {
+  const ref = ev.onsen_items![0]!
+  // Reattach the original lane's open obligations to the notification Onsen hands back.
+  const waiting = (o: Ob) => o.kind === 'main' && o.state === 'open' && !!o.handoff && !o.item
+  const prior = ref.main && events.rows(e => e.onsen_items?.some((r: ItemRef) => r.onsen_item_id === ref.onsen_item_id) && e.obligations?.some(waiting)).at(-1)
+  ev.id = prior ? prior.id : itemEventId(ref)
+  const d: Decision = { target: 'main', rule: 'onsen-main' }
+  const item = toMain(ev, d)
+  if (prior && item) events.set(ev.id, waiting, { item })
+  return d
+}
+
 /** Onsen step 2 (WO-142, server.ts): Joey edited Telegram message `messageId` in `chat` and the main has not seen it yet (its M1 item still queued, never
  *  offered): that item is rewritten (lanes-main.ts replaceQueued; server.ts gives the new text). true = replaced; false = the edit goes as a new message. */
 export function replaceQueuedMain(chat: string, messageId: string, rewrite: Parameters<MainApi['replaceQueued']>[2]): boolean {
@@ -2575,6 +2603,7 @@ export function toMainDirect(ev: InEvent): void {
 export function toMainForm(ev: InEvent): Decision | null {
   if (D?.role !== 'tg' || !main) return null
   // WO-159: a message Joey wrote in Onsen (via=onsen) goes the same way as a page answer: his message, to the main
+  if (ev.onsen_items?.length) return routeMainItem(ev)
   const onsen = ev.meta?.via === 'onsen'
   const did = onsen ? 'onsen' : 'web-form'
   // WO-157: on the new path decideWake's joey rule (a page answer is joey_form; a message he wrote in Onsen is joey_tg)
@@ -2904,7 +2933,7 @@ const sampleOf = (arr: string[], ev: InEvent): void => { if (arr.length < 3) arr
 function endHold(peer: string, how: string): PeerHold | null {
   const h = S.holds?.[peer]
   if (!h) return null
-  delete S.holds![peer]; saveState()
+  delete S.holds![peer]; saveState(); onGateOpen?.()
   if (h.first) events?.note(h.first, { hold: { peer, count: h.count, reason: h.reason, ended: how, last: h.last ?? null } })   // M3 (PL1): the episode's head says how it ended
   ledger({ lane: 'router', kind: 'fyi',
     text: `peer_hold ${peer} 結束（${how}）：暫停期間擋下 ${h.count} 則${h.first ? `（第一則 ${h.first}、最後一則 ${h.last}）` : ''}；樣本：${h.samples.join(' ｜ ') || '（沒有）'}。原因：${h.reason}`,
@@ -2997,6 +3026,7 @@ export function floodTick(now = Date.now()): void {
     ledger({ lane: 'router', kind: 'fyi',
       text: `peer_flood ${peer}：${e.count} 則超過限制的訊息被合併（${windowS} 秒內，${stamp(e.start)} 起），第一則 ${e.first}、最後一則 ${e.last}；樣本：${e.samples.join(' ｜ ')}。同一段時間有 ${e.answered} 則照常開了車道，${e.count} 則只進帳本，估計省下約 ${avoided} token。`,
       refs: { peer_flood: peer, count: e.count, window_s: windowS, start: e.start, first: e.first, last: e.last, samples: e.samples, answered: e.answered, ledger_only: e.count, tokens_avoided: avoided, reasons: e.reasons } })
+    onGateOpen?.()
     logos('lane.peer_flood', { peer, phase: 'end', count: e.count, answered: e.answered, tokens_avoided: avoided })
     void pushJoey(undefined, `〔流量管制結束〕${peer} 安靜下來了：${windowS} 秒內共 ${e.count + e.answered} 則，${e.answered} 則開了車道回覆，${e.count} 則只進帳本，估計省下約 ${avoided} token。細節在帳本 peer_flood ${peer}。`, notifyProfile() === 'tiered')
   }
@@ -3034,7 +3064,7 @@ export function alertFingerprint(from: string, text: string): string {
 const alertSeverity = (ev: InEvent): string => `${ev.trigger ?? ''}|${(ev.text.match(/\[P[0-4]\]/i)?.[0] ?? '').toUpperCase()}`
 const isAlertEvent = (ev: InEvent): boolean => ev.source === 'mesh' && !ev.synthetic && routerCfg().alert_senders.includes(ev.from)
 const lightEvent = (ev: InEvent, of: string): InEvent => ({ id: ev.id, source: ev.source, from: ev.from, text: ev.text, meta: {}, notif: { method: '', params: {} },
-  verified: ev.verified, btcc_msg_id: ev.btcc_msg_id, repeat_of: of })
+  verified: ev.verified, btcc_msg_id: ev.btcc_msg_id, repeat_of: of, ...(ev.onsen_items ? { onsen_items: ev.onsen_items } : {}) })
 // 002m (LACDE1): notify 「分流器同時管頻率上限與去重，同一件事不會連發」. 002l reran a finished owner on the first repeat in the window and compared nothing
 // (E05: 「numbers not worse, no restart」 84 s after the run ended, and Joey got that line). Now the router compares the values the fingerprint masks with
 // the ones the owner last saw: only a repeat that is WORSE, and only once the owner's last run is LANES_ALERT_RERUN_GAP_S behind it, makes it run again.
@@ -3237,8 +3267,7 @@ function incidentMerge(ev: InEvent, critical: boolean): Decision | null {
     recordInbound(ev, { owner: lane.id, lane: lane.id, thread: lane.thread, class: critical ? 'critical' : 'alert', obligations: critical && !raised ? eventObligations(ev, 'critical') : [],
       fields: { incident_of: rec.event, incident: key } })
     try {
-      mkdirSync(join(LANES_DIR, 'run', 'steer'), { recursive: true, mode: 0o700 })
-      appendFileSync(steerFile(lane.id, 'in'), JSON.stringify({ id: ev.id, kind: 'merged', ts: nowIso(), from: ev.from, text: `${incidentHead([ev], true)}\n${renderEvent(ev)}`, run: run.runId }) + '\n')
+      writeSteer(lane.id, ev, run.runId, true)
     } catch (e) {
       D.log('warn', `lanes: incident merge of ${ev.id} could not be written (${e}): it is ${lane.id}'s next run`)
       if (!events.openObs(ev.id).some(o => o.kind === 'joey')) events.add(ev.id, { kind: 'joey', level: 'line' })   // its own run owes its line (the record exists already)
@@ -3285,13 +3314,21 @@ function steerable(ev: InEvent, lane: Lane): boolean {
   return process.env.LANES_STEER_MIDTURN !== '0' && D.role === 'tg' && ev.source === 'telegram' && !ev.synthetic && !ev.fanout && !S.master_off
     && lane.kind !== 'synthesis' && lane.kind !== 'curator' && running.has(lane.id)
 }
+function steerMessage(ev: InEvent, run: string, merged = false) {
+  if (merged) return { id: ev.id, kind: 'merged', ts: nowIso(), from: ev.from, text: `${incidentHead([ev], true)}\n${renderEvent(ev)}`, run }
+  return { id: ev.id, ts: nowIso(), from: ev.from, text: ev.text, message_id: ev.meta?.message_id ?? null, quote: ev.reply_to_text ?? null, run }
+}
+function writeSteer(lane: string, ev: InEvent, run: string, merged = false): void {
+  // The hook gets an Item's content from the daemon only once its take succeeds.
+  const row = ev.onsen_items?.length ? { id: ev.id, run, take: true } : steerMessage(ev, run, merged)
+  mkdirSync(join(LANES_DIR, 'run', 'steer'), { recursive: true, mode: 0o700 })
+  appendFileSync(steerFile(lane, 'in'), JSON.stringify(row) + '\n')
+}
 function steerRun(ev: InEvent, lane: Lane, base: { rule: string; critical?: boolean }): Decision | null {
   const run = running.get(lane.id)
   if (!run) return null
   try {
-    mkdirSync(join(LANES_DIR, 'run', 'steer'), { recursive: true, mode: 0o700 })
-    appendFileSync(steerFile(lane.id, 'in'), JSON.stringify({ id: ev.id, ts: nowIso(), from: ev.from, text: ev.text, message_id: ev.meta?.message_id ?? null,
-      quote: ev.reply_to_text ?? null, run: run.runId }) + '\n')
+    writeSteer(lane.id, ev, run.runId)
   } catch (e) { D.log('warn', `lanes: steering ${ev.id} could not be written (${e}): it queues behind the run`); return null }
   S.steering ??= {}
   ;(S.steering[lane.id] ??= []).push({ ev, sent: Date.now(), run: run.runId })
@@ -3307,35 +3344,86 @@ function steerRun(ev: InEvent, lane: Lane, base: { rule: string; critical?: bool
 function readJsonlFile(path: string): any[] {
   try { return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean) } catch { return [] }
 }
+function setPendingSteer(lane: string, pending: SteerRec[]): void {
+  if (pending.length) S.steering![lane] = pending
+  else delete S.steering![lane]
+}
+/** The lane token identifies the receiving run. Only its own pending event IDs can be requested. */
+async function takeSteering(tok: RunTok, ids: string[], res: ServerResponse) {
+  const receiver = itemReceiver, lane = S.lanes[tok.lane]
+  const live = () => running.get(tok.lane)?.tok === tok && lane.status !== 'closed'
+  if (!receiver?.mode.active || !live()) return []
+  const requested = new Set(ids)
+  const pending = (S.steering?.[tok.lane] ?? []).filter(s => s.run === tok.runId && s.ev.onsen_items?.length && requested.has(s.ev.id))
+  const refs = pending.flatMap(s => s.ev.onsen_items!)
+  if (!refs.length) return []
+  // A lane can accumulate multiple peek pages between two tool calls. All takes share this hook's 3 s window.
+  const batches = []
+  for (let start = 0; start < refs.length; start += 100) batches.push(receiver.receive(refs.slice(start, start + 100), true))
+  const results = await Promise.all(batches)
+  const given = new Set(results.flatMap(r => [...r.given]))
+  const gone = new Set(results.flatMap(r => [...r.gone]))
+  const taken = refs.filter(r => given.has(r.onsen_item_id))
+  if (!live() || res.destroyed) {
+    if (lane.status === 'closed') receiver.report(taken, 'reassigned', { note: `${lane.id} 在收下這件事之前已關閉。` })
+    else receiver.report(taken, 'not_taken')
+    return []
+  }
+  const messages = [], dropped = new Set<string>()
+  for (const s of pending) {
+    const group = s.ev.onsen_items!
+    if (group.every(r => given.has(r.onsen_item_id))) messages.push(steerMessage(s.ev, s.run, s.merged))
+    else {
+      receiver.report(group.filter(r => given.has(r.onsen_item_id)), 'not_taken')
+      if (group.some(r => gone.has(r.onsen_item_id))) {
+        dropped.add(s.ev.id)
+        events.settleUnrun(s.ev.id, 'dropped', 'Onsen item no longer waiting')
+      }
+    }
+  }
+  if (dropped.size) {
+    setPendingSteer(tok.lane, (S.steering?.[tok.lane] ?? []).filter(s => !dropped.has(s.ev.id)))
+    saveState()
+    if (pending.some(s => dropped.has(s.ev.id) && s.ev.onsen_items!.length > 1)) onGateOpen?.()
+  }
+  return messages
+}
 /** the messages the hook has handed over by now: each gets its ledger line (with the wait, on the daemon's clock) and leaves the pending list */
-function syncSteer(laneId: string): void {
+function syncSteer(laneId: string, restored?: QItem): void {
   const list = S?.steering?.[laneId]
   if (!list?.length) return
   const got = new Map(readJsonlFile(steerFile(laneId, 'out')).map(r => [String(r.id), r]))
+  const run = running.get(laneId)
+  const current = restored ?? (run && queue.get(run.evId))
   const left: SteerRec[] = []
   for (const s of list) {
     const m = got.get(s.ev.id)
-    if (!m) { left.push(s); continue }
+    const q = current?.run === s.run ? current : undefined
+    const refs = s.ev.onsen_items
+    const delivered = refs?.length
+      ? q && m?.run === s.run && refs.every(r => itemReceiver?.claims.owns(r.onsen_item_id))
+      : !restored && m
+    if (!delivered) { left.push(s); continue }
     const waitMs = Date.now() - s.sent
     if (s.merged) {                                                  // WO-132 (item 2): an alert of the run's incident: it rides in the run's event set (extra)
       ledger({ lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, kind: 'action',
         text: `incident merge delivered：${s.ev.from} 的警報在 ${Math.round(waitMs / 100) / 10} 秒後交給 ${s.run} 正在跑的那一趟（${m.event === 'Stop' ? '它要結束時攔下來' : `工具 ${m.tool || '-'} 之後`}）：${clip(s.ev.text, 160)}`,
         refs: { incident: 'delivered', id: s.ev.id, run: s.run, wait_ms: waitMs, via: m.event ?? null, tool: m.tool || null } })
-      const r = running.get(laneId), q = r && r.runId === s.run ? queue.get(r.evId) : undefined
-      if (q && !q.extra?.some(e => e.id === s.ev.id)) { q.extra = [...(q.extra ?? []), lightEv(s.ev)]; runRec(q, 'running', { extra: q.extra.map(lightEv) }) }
-      continue
+    } else {
+      ledger({ lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, kind: 'action',
+        text: `steering delivered：${s.ev.from} 的訊息在 ${Math.round(waitMs / 100) / 10} 秒後交給 ${s.run} 正在跑的那一趟（${m.event === 'Stop' ? '它要結束時攔下來' : `工具 ${m.tool || '-'} 之後`}）：${clip(s.ev.text, 160)}`,
+        refs: { steer: 'delivered', id: s.ev.id, run: s.run, wait_ms: waitMs, via: m.event ?? null, tool: m.tool || null, message_id: s.ev.meta?.message_id ?? null } })
+      logos('lane.steer', { lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, run: s.run, phase: 'delivered', wait_ms: waitMs, via: m.event ?? null })
     }
-    ledger({ lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, kind: 'action',
-      text: `steering delivered：${s.ev.from} 的訊息在 ${Math.round(waitMs / 100) / 10} 秒後交給 ${s.run} 正在跑的那一趟（${m.event === 'Stop' ? '它要結束時攔下來' : `工具 ${m.tool || '-'} 之後`}）：${clip(s.ev.text, 160)}`,
-      refs: { steer: 'delivered', id: s.ev.id, run: s.run, wait_ms: waitMs, via: m.event ?? null, tool: m.tool || null, message_id: s.ev.meta?.message_id ?? null } })
-    logos('lane.steer', { lane: laneId, thread: S.lanes[laneId]?.thread ?? null, event: s.ev.id, run: s.run, phase: 'delivered', wait_ms: waitMs, via: m.event ?? null })
-    const r = running.get(laneId), q = r && r.runId === s.run ? queue.get(r.evId) : undefined
-    if (q && !q.steered?.some(e => e.id === s.ev.id)) {           // 002w (A): on the run's record, so a re-run and a restart keep it in the event set
-      q.steered = [...(q.steered ?? []), s.ev]
-      runRec(q, 'running', { steered: q.steered.map(lightEv) })
+    const field = s.merged ? 'extra' : 'steered'
+    if (q && !q[field]?.some(e => e.id === s.ev.id)) {
+      const members = [...(q[field] ?? []), s.merged ? lightEv(s.ev) : s.ev]
+      q[field] = members
+      runRec(q, 'running', { [field]: members.map(lightEv) })
     }
+    itemReceiver?.bind(refs, laneId, s.run)
   }
-  if (left.length !== list.length) { if (left.length) S.steering![laneId] = left; else delete S.steering![laneId]; saveState() }
+  if (left.length !== list.length) { setPendingSteer(laneId, left); saveState() }
 }
 /** the run is over: whatever the hook handed over is recorded, and what it did not is returned (the files are removed) */
 function settleSteering(lane: Lane): SteerRec[] {
@@ -3345,9 +3433,21 @@ function settleSteering(lane: Lane): SteerRec[] {
   for (const k of ['in', 'out'] as const) { try { rmSync(steerFile(lane.id, k)) } catch {} }
   return left
 }
-/** messages that were not delivered become the lane's next run, first in line (the first is the event, the rest ride along in it); no pump here: the caller's comes after its own bookkeeping */
+function releaseClosedSteering(lane: Lane, pending: SteerRec[]): SteerRec[] {
+  const keep = pending.filter(s => {
+    if (!s.ev.onsen_items?.length) return true
+    releaseLaneItem(s.ev, lane.id)
+    return false
+  })
+  if (keep.length !== pending.length) onGateOpen?.()
+  return keep
+}
+/** Undelivered messages become the lane's next run, first in line. */
 function queueSteering(lane: Lane, left: SteerRec[], why: string): void {
+  if (lane.status === 'closed') left = releaseClosedSteering(lane, left)
   if (!left.length) return
+  // A take with no hook receipt must be returned before a future run takes it again.
+  for (const s of left) itemReceiver?.report(s.ev.onsen_items ?? [], 'not_taken')
   // WO-132 (item 2): a merged alert the run never reached was looked at by nobody: it owes Joey its line now (ringing when critical), as its own run would
   for (const s of left) if (s.merged && events?.get(s.ev.id) && !events.openObs(s.ev.id).some(o => o.kind === 'joey')) {
     const crit = events.get(s.ev.id)!.class === 'critical'
@@ -3411,6 +3511,40 @@ function threadSummary(thread: string): string {
 }
 
 // ================================================================== lane queue + runner
+let itemReceiver: import('./onsen-receive.ts').ItemReceiver | undefined
+export function useItemReceiver(receiver: typeof itemReceiver): void { itemReceiver = receiver }
+export function offerMissed(id: string): void { main.offerMissed(id) }
+let onGateOpen: (() => void) | undefined
+export function observeItemGates(open?: () => void): void { onGateOpen = open }
+
+export function editWaitingItem(item: ItemRef, content: string, at: string): void {
+  if (main.replaceQueued('', '', p => ({ content, meta: { ...p.meta, edited_at: at } }), item).length) return
+  const replace = (ev: InEvent): boolean => {
+    const ref = ev.onsen_items?.find(r => r.onsen_item_id === item.onsen_item_id)
+    if (!ref) return false
+    Object.assign(ref, item)
+    ev.text = content
+    return true
+  }
+  for (const run of queue.values()) {
+    if (run.state === 'queued' && runEvents(run).some(replace)) {
+      runRec(run, 'queued', { ev: lightEv(run.ev), extra: run.extra?.map(lightEv) })
+      return
+    }
+  }
+  if (Object.values(S.steering ?? {}).some(list => list.some(s => replace(s.ev)))) saveState()
+}
+
+/** initMain and restoreRuns have folded these two journals before the first peek. */
+export function itemIndex(): Map<string, number> {
+  const known = new Map<string, number>()
+  const add = (refs?: ItemRef[]) => { for (const ref of refs ?? []) known.set(ref.onsen_item_id, ref.onsen_version) }
+  for (const row of main.items(r => ['queued', 'offered', 'bound'].includes(r.state))) add(row.onsen_items)
+  for (const run of queue.values()) for (const ev of runEvents(run)) add(ev.onsen_items)
+  for (const list of Object.values(S.steering ?? {})) for (const record of list) add(record.ev.onsen_items)
+  return known
+}
+
 /** the in-memory view of an event's current run record (M5): the journal is its state; this is what pump and the tools read */
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; attempts: number; priority: number; summary?: string; enqueued: string
   /** the M5 record id of this event's current run; the process and lane run of a leased one */
@@ -3555,6 +3689,24 @@ function endRun(it: QItem, reason: string, f: Record<string, unknown> = {}): voi
   it.state = 'done'
   if (queue.get(it.ev.id) === it) queue.delete(it.ev.id)
 }
+function releaseLaneItem(ev: InEvent, lane: string): void {
+  // A recovered take or a steer grant may already own the row without a delivery receipt.
+  const taken = ev.onsen_items!.filter(r => itemReceiver?.claims.owns(r.onsen_item_id))
+  if (taken.length) itemReceiver!.report(taken, 'reassigned', { note: `${lane} 在收下這件事之前已關閉。` })
+  events.settleUnrun(ev.id, 'dropped', 'lane closed before delivery')
+}
+/** Retire this local route while the original Items are still waiting in Onsen. */
+function releaseClosedQueue(it: QItem): boolean {
+  const members = runEvents(it)
+  const released = members.filter(ev => ev.onsen_items?.length)
+  if (!released.length) return false
+  endRun(it, 'closed', { why: 'lane closed before take' })
+  for (const ev of released) releaseLaneItem(ev, it.lane)
+  const [ev, ...extra] = members.filter(ev => !ev.onsen_items?.length)
+  if (ev) queueRun({ ...it, ev, extra, steered: undefined })
+  onGateOpen?.()
+  return true
+}
 /** M5: how a run ended, from its result JSON and its exit code */
 const statusKind = (s: unknown): string => { const n = Number(s); return n === 429 ? 'rate_limit' : n === 401 || n === 403 ? 'authentication_failed' : n >= 500 ? 'server_error' : 'api_error' }
 export function exitReason(r: { result: any; code: number | null; signal: string | null; timedOut?: boolean; budget?: boolean }): string {
@@ -3576,10 +3728,17 @@ function restoreRuns(): void {
     const it: QItem = { ev: r.ev, lane: String(r.lane), state: 'queued', attempts: r.state === 'queued' ? Number(r.attempt) - 1 : Number(r.attempt), priority: Number(r.priority ?? 5),
       summary: r.summary ?? undefined, enqueued: String(r.enqueued ?? r.created), rid: r.id, ...(r.extra ? { extra: r.extra } : {}), ...(r.deaths ? { deaths: r.deaths } : {}),
       ...(r.steered ? { steered: r.steered } : {}) }
-    if (r.state === 'queued') { queue.set(it.ev.id, it); continue }
+    if (r.state === 'queued') {
+      if (S.lanes[it.lane]?.status === 'closed' && releaseClosedQueue(it)) continue
+      queue.set(it.ev.id, it); continue
+    }
     // 002f, 002k G11: it was running under the previous daemon: that run cannot report any more. Its process is stopped, it gets the exit
     // row it never could write, and the event is run again (an attempt like any death).
     reapOrphan(Number(r.pid), String(r.run ?? ''))
+    if (S.steering?.[it.lane]?.some(s => s.run === r.run && s.ev.onsen_items?.length)) {
+      it.run = r.run
+      syncSteer(it.lane, it)
+    }
     const lane = S.lanes[it.lane]
     // 002y (X-2): a restart that run had sent with no result yet: its record is settled, 結果不明 (the daemon stopped with the run)
     for (const p of (Array.isArray(r.restarts) ? r.restarts : []) as PendingRestart[])
@@ -3642,11 +3801,12 @@ const endWords = (reason: string, it: QItem): string => reason === 'normal' ? '�
  *    not an attempt (the event is queued again as it was);
  *  - the lanes' wall: up on a wall; down on any other exit of a run that reached the model (it wrote a result record or made a model call);
  *  - otherwise, and after MAX_ATTEMPTS, the run's work has ended: a task lane's own duty (endTask), then the exit rule over the set. */
-function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
+function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; processExit?: string; said?: string; reached?: string; reachedModel?: boolean; wallText?: string; runId?: string; receipt?: { outcome: string } }): void {
   const wall = e.reason.startsWith('wall:') ? e.reason.slice(5) : null
   const retryable = !!wall || e.reason === 'died' || e.reason === 'timeout' || e.reason === 'restore'
   if (wall) it.attempts = Math.max(0, it.attempts - 1)                      // nothing was tried: not an attempt
-  const again = retryable && it.attempts < MAX_ATTEMPTS && runAgain(it)
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  const again = !refs.length && retryable && it.attempts < MAX_ATTEMPTS && runAgain(it)
   if (again) {
     if (e.reason === 'died' || e.reason === 'timeout') { it.not_before = Date.now() + RETRY_BACKOFF_MS * it.attempts; setTimeout(pump, RETRY_BACKOFF_MS * it.attempts + 20) }   // 002f backoff
     queueRun(it)
@@ -3654,12 +3814,17 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; said?:
   if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
   else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
   if (again) return
+  const itemExit = e.processExit ?? e.reason
+  const outcome = itemExit === 'normal' ? 'completed' : itemExit.startsWith('wall:') ? (['wall:server_error', 'wall:api_error'].includes(itemExit) ? 'error' : 'usage_limit') : 'cut'
+  if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) itemReceiver?.report(refs, outcome)
   releaseScheduleThread(lane, it)                                           // WO-164 point 4: a schedule's run is over: its thread lets the lane go
   const gaveUp = retryable && it.attempts >= MAX_ATTEMPTS
   asWake({ kind: 'lane_exit', rule: gaveUp ? 'exit-failed' : 'exit-owes', urgency: 'ordered', lane: lane?.id ?? it.lane }, () => {   // WO-147
     endTask(it, lane, endWords(e.reason, it), e.reached ?? '')
     exitRule(lane, it, gaveUp ? failedHandoffText(it) : e.said ?? '', gaveUp ? HANDOVER_RECORD_MAX : 1000)
   })
+  // A bound row follows its run's actual exit unless exitRule handed it to main.
+  if (refs.length && (e.reason === 'normal' || e.reason === 'closed')) itemReceiver?.report(refs, outcome)
   callsEnded(lane?.id ?? it.lane, it, e.receipt)
 }
 /** WO-175 (Chiron 02:58Z): the run's work is over (runEnded, past the re-run): the Call of each item it ran ends here — unless the item is the main's now
@@ -3988,6 +4153,7 @@ export function laneSlots(): number {
   }
   return n
 }
+const startingItems = new Set<string>()
 function pump(): void {
   if (S.wall && Date.now() < S.wall.probe_at) return      // the wall is up: nothing runs until the next probe
   if (S.wall && daemonWall()?.walled) return              // WO-141 follow-up: the daemon's usage wall is up: its keeper probes, no run is one
@@ -3995,15 +4161,15 @@ function pump(): void {
   const waiting = [...queue.values()].filter(i => i.state === 'queued')
     .sort((a, b) => a.priority - b.priority || a.enqueued.localeCompare(b.enqueued))
   for (const it of waiting) {
-    if (running.has(it.lane) || chatFetching.has(it.lane)) continue    // one process per lane; this event waits for it (WO-144: or for the block of its run)
+    if (it.state !== 'queued' || startingItems.has(it.lane) || running.has(it.lane) || chatFetching.has(it.lane)) continue    // one process per lane; this event waits for it (WO-144: or for the block of its run)
     if (it.not_before && Date.now() < it.not_before) { setTimeout(pump, it.not_before - Date.now() + 10); continue }   // 002f: the backoff after a death
-    if (running.size + chatFetching.size >= slots) {                    // WO-144: a run whose block is being fetched holds its slot
+    if (running.size + chatFetching.size + startingItems.size >= slots) {                    // WO-144: a run whose block is being fetched holds its slot
       D.log('info', `lanes: ${slots} slot(s) in use (cap ${MAX_RUNNING}${slots < MAX_RUNNING ? `, quota ${Math.round((quotaUsed() ?? 0) * 100)}%` : ''}) — ${it.ev.id} for ${it.lane} waits in queue`)
       break
     }
     if (sessionBusy(it)) continue                        // 002l (S0 item 2): never a second process on one session id
     if (S.wall) {                                         // the probe: exactly one run; its result decides (startRun's exit handler)
-      if (running.size > 0 || chatFetching.size > 0) return
+      if (running.size > 0 || chatFetching.size > 0 || startingItems.size > 0) return
       if (mainChatPending(it)) return                     // WO-144: its block first; the fetch's end pumps again
       S.wall.probe_at = Date.now() + wallBackoffMs(S.wall.kind, S.wall.probes + 1); saveState()
       startRun(it)
@@ -4857,7 +5023,36 @@ function sessionBusy(it: QItem): boolean {
   if (!busyRetry) { busyRetry = setTimeout(() => { busyRetry = null; pump() }, SESSION_BUSY_RETRY_MS()); (busyRetry as any).unref?.() }
   return true
 }
-function startRun(it: QItem): void {
+/** Keep refused rows on their queue record when a coalesced take gave only part of a run. */
+function receivedRun(it: QItem, given: Set<string>, gone: Set<string>, receiver: NonNullable<typeof itemReceiver>): QItem | undefined {
+  const events = runEvents(it)
+  const ready: InEvent[] = [], waiting: InEvent[] = []
+  for (const ev of events) {
+    const refs = ev.onsen_items ?? []
+    if (refs.every(r => given.has(r.onsen_item_id))) { ready.push(ev); continue }
+    receiver.report(refs.filter(r => given.has(r.onsen_item_id)), 'not_taken')
+    if (!refs.some(r => gone.has(r.onsen_item_id))) waiting.push(ev)
+    else if (refs.length > 1) onGateOpen?.()  // surviving members of an album need a fresh notification
+  }
+  if (ready.length === events.length) return it
+  if (waiting.length === events.length) return
+  const group = (members: InEvent[]): QItem | undefined => {
+    const [ev, ...extra] = members
+    if (!ev) return
+    if (ev === it.ev) {
+      it.extra = extra; it.steered = undefined
+      runRec(it, 'queued', { extra: extra.map(lightEv), steered: null })
+      return it
+    }
+    const part = { ...it, ev, extra, steered: undefined }
+    queueRun(part)
+    return part
+  }
+  const readyRun = group(ready), waitingRun = group(waiting)
+  if (readyRun !== it && waitingRun !== it) endRun(it, 'dropped', { why: 'Onsen item no longer waiting' })
+  return readyRun
+}
+function startRun(it: QItem, acquired = false): void {
   const lane = S.lanes[it.lane]
   if (!lane) {                                                             // 002w (A, gap 22): what its event set owes goes to the main
     endRun(it, 'died', { why: 'lane gone' })
@@ -4882,9 +5077,27 @@ function startRun(it: QItem): void {
   }
   if (th?.stopped && peerEventOf(it)) { dropQueued(it, th.id, th.stopped); saveState(); return }     // 002k (C5): the thread was stopped while this waited
   if (lane.status === 'closed') {                                          // PL7 (P21): its lane was closed while it waited: closed, and the one end
+    if (releaseClosedQueue(it)) return
     endRun(it, 'closed', { why: 'its lane was closed before it ran' })
     runEnded(lane, it, { reason: 'closed', said: `${lane.id} 在這件事開始處理之前被關閉了` })
     saveState(); return
+  }
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  if (refs.length && !acquired) {
+    if (!itemReceiver?.mode.active) return
+    const receiver = itemReceiver
+    startingItems.add(lane.id)
+    void receiver.receive(refs).then(({ given, gone }) => {
+      if (it.state === 'queued' && lane.status !== 'closed' && !th?.stopped && !sessionBusy(it)) {
+        const received = receivedRun(it, given, gone, receiver)
+        if (received) startRun(received, true)
+      } else {
+        const taken = refs.filter(ref => given.has(ref.onsen_item_id))
+        if (lane.status === 'closed' || th?.stopped) receiver.report(taken, 'reassigned', { note: `${lane.id} 在收下這件事之前已關閉。` })
+        else receiver.report(taken, 'not_taken')
+      }
+    }).catch(e => D.log('warn', 'lanes: item take: ' + e)).finally(() => { startingItems.delete(lane.id) })
+    return
   }
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
@@ -4931,6 +5144,7 @@ function startRun(it: QItem): void {
     try { child.kill('SIGKILL') } catch {}
   }, LANE_MAX_RUN_MS)
   const openTools: OpenTools = new Map()                                // WO-177 六: what the run is doing now (runningLanes: the observation's doing)
+  if (refs.length) itemReceiver?.bind(refs, lane.id, runId)
   running.set(lane.id, { child, evId: it.ev.id, runId, tok, at: nowIso(), tools: openTools })
   lane.status = 'running'; lane.last = nowIso(); saveState()
   const started = Date.now()
@@ -5074,7 +5288,8 @@ function startRun(it: QItem): void {
       'mcp__lane__report_result', 'mcp__lane__deliver_synthesis', 'mcp__lane__curator_done'].includes(t.name))
       .map(t => t.name.replace('mcp__lane__', ''))
     // PL7 (P21): a run whose lane was closed while it ran ends `closed`, an exit reason like the others: the exit rule below handles it
-    const reason = lane.status === 'closed' ? 'closed' : exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
+    const processExit = exitReason({ result: resultJson, code, signal: signal ?? null, timedOut, budget: !!budgetStop })
+    const reason = lane.status === 'closed' ? 'closed' : processExit
     // WO-125 (observation points, ticket item 8): per run, what the guard refused (still counting at the end), the steps the receipt marked, the card's length
     const bf = blockFactsOn() ? blockedFacts(tok.blocked) : null
     if (blockFactsOn()) noteBlocked(tok)                                // the run's line in the main's digest carries the final count
@@ -5084,7 +5299,7 @@ function startRun(it: QItem): void {
     const CLOSING = ['receipt', 'notify_joey', 'ask_joey', 'handoff_main']
     const cut = reason === 'budget' || reason === 'cap_turns' || reason === 'cap_usd'
     const workDone = !!tok.receipt || !!tok.handedOver || closers.some(c => CLOSING.includes(c)) || tok.closers.some(c => CLOSING.includes(c))
-    const requeue = reason === 'budget' && lane.kind === 'mail' && !workDone && !it.ev.budget_requeued
+    const requeue = reason === 'budget' && lane.kind === 'mail' && !workDone && !it.ev.budget_requeued && !runEvents(it).some(ev => ev.onsen_items?.length)
     appendJsonl('lanes.jsonl', { lane: lane.id, kind: 'exit', run: runId, event: it.ev.id, session_id: lane.session_id,
       transcript: lane.transcript, exit_code: code, signal, reason, duration_s: Math.round((Date.now() - started) / 100) / 10,
       calls: usage.size, tokens_in: tin, tokens_out: tout, tokens_fresh: tfresh, tools: names, closers,
@@ -5155,7 +5370,7 @@ function startRun(it: QItem): void {
       ledger({ lane: lane.id, thread: lane.thread, event: it.ev.id, kind: 'action',
         text: `分身線結果：${result.slice(0, 400) || '(無文字結果)'}`, detail: lane.transcript })
     }
-    runEnded(lane, it, { reason, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
+    runEnded(lane, it, { reason, processExit, said, reached, reachedModel: !!resultJson || usage.size > 0, wallText: result.slice(0, 200), runId, ...(tok.receipt ? { receipt: { outcome: tok.receipt.outcome } } : {}) })
     saveState()
     pump()
   }
@@ -5331,7 +5546,7 @@ export async function callForReply(to: string, replyTo: unknown): Promise<string
   return r && typeof r.call === 'string' && /^\d{1,18}$/.test(r.call) ? r.call : null
 }
 /** what the router marked on an event, as fields of its record (PL1) */
-const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
+const evFields = (ev: InEvent): Record<string, unknown> => ({ ...(ev.onsen_items ? { onsen_items: ev.onsen_items } : {}), ...(ev.flags?.length ? { flags: [...new Set(ev.flags)] } : {}), ...(ev.claim ? { claim: ev.claim } : {}),
   ...(ev.call_id && !ev.answers_call ? { call_id: ev.call_id } : {}),
   ...((c => c ? { call: c } : {})(callRefOf(ev))),                                           // WO-175: the Call it is, on its record
   ...(ev.screen_p != null ? { screen_p: ev.screen_p } : {}),
@@ -5426,6 +5641,8 @@ const proposalWords = (e: Row, p: Proposal, oneLine = false): string => joeyWord
  *  An event already handed (an open main obligation) keeps that hand-over: no second item. */
 function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `ho-${shortId()}`, cls?: string, max = 1000, row = true, carry?: { content: string; meta: Record<string, string> },
   request = false, w: HandWake = {}): string {
+  const refs: ItemRef[] | undefined = events?.get(evId)?.onsen_items
+  if (refs?.length && !refs.some(r => itemReceiver?.claims.owns(r.onsen_item_id))) return hid
   // 002t (station 4, I03 live): Joey ordered an irreversible step inside a worker's topic; the worker handed it to the main in its own words, and the
   // main rightly would not act on a lane's retelling (「我看不到你在話題的原話，帳本只有工作線的轉述」). A hand-over of Joey's own Telegram message
   // carries his words as the router received them, marked as such: the main reads Joey, not the lane.
@@ -5439,12 +5656,13 @@ function handToMain(evId: string, lane: Lane | undefined, text: string, hid = `h
   if (!ob) { D.log('error', `lanes: hand-over of ${evId}: the event has no record (the router records every event); nothing handed`); return hid }
   if (ob.id !== hid) return ob.handoff ?? ob.id                                     // already handed: that hand-over stands
   if (row) ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, ...(cls ? { class: cls } : {}), ...(w.defer ? { defer: true } : {}), ...(w.woke ? { woke: w.woke } : {}) }, detail: lane?.transcript })
+  if (refs?.length) itemReceiver?.report(refs, 'reassigned', { note: body })
   if (w.defer) {
     journal.write('wake', evId, 'no_wake', { reason: `owed to the main (${hid}), but it can wait: it waits in the main's mailbox, rides the main's next digest and wakes it alone when it is due` })
     logos('lane.handoff', { lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, handoff: hid, main_phase: main.mainPhase(), defer: true })
     return hid
   }
-  const item = carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
+  const item = refs?.length ? undefined : carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
     : main.enqueue('handoff', { method: 'notifications/claude/channel', params: { content: handoffContent(evId, hid, body),
       meta: { chat_id: 'lanes', user: 'lanes', user_id: 'lanes', via: 'lanes', kind: 'handoff', handoff: hid } } }, { event: evId, fields: { handoff: hid } })
   events.set(evId, o => o.id === hid, { item, ...(w.woke ? { woke: w.woke, woke_at: nowIso() } : {}) })
@@ -5470,6 +5688,7 @@ function wakeDeferred(evId: string, cause: 'urgent' | 'due', lane: Lane | undefi
   const o = deferredMain(evId)
   if (!o) return null
   const hid = String(o.handoff ?? o.id)
+  if (events.get(evId)?.onsen_items) return hid
   const said = carry ? '' : joeyWords(events.get(evId))
   const body = text.slice(0, HANDOVER_RECORD_MAX) + (said ? `\n${said}` : '')
   ledger({ lane: lane?.id ?? 'router', thread: lane?.thread ?? null, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, woke: cause }, detail: lane?.transcript })
@@ -5488,6 +5707,7 @@ const wokenMain = (evId: string): Ob | undefined => ((events?.get(evId)?.obligat
  *  (itemDone meets the obligation whose `item` it is); its due time stays the first wake's. */
 function addToMain(evId: string, o: Ob, lane: Lane, text: string, carry?: { content: string; meta: Record<string, string> }): string {
   const hid = String(o.handoff ?? o.id)
+  if (events.get(evId)?.onsen_items) return hid
   const body = text.slice(0, HANDOVER_RECORD_MAX)
   ledger({ lane: lane.id, thread: lane.thread, event: evId, kind: 'escalation', text: `〔${hid}〕${body}`, refs: { handoff: hid, woke: 'urgent', added: true }, detail: lane.transcript })
   const item = carry ? main.enqueue('carry', { method: 'notifications/claude/channel', params: carry }, { event: evId, fields: { handoff: hid } })
@@ -7926,10 +8146,15 @@ function closeLane(l: Lane, who: string, via: 'joey' | 'main'): { running: boole
   const last = (events?.rows(e => e.lane === l.id) ?? []).slice(-3).map(e => digestLine(e).line.replace(/^• /, ''))   // M3 (PL1): its events' lines
   const run = running.get(l.id)
   l.status = 'closed'
+  if (S.steering?.[l.id]?.some(s => s.ev.onsen_items?.length)) {
+    syncSteer(l.id)
+    setPendingSteer(l.id, releaseClosedSteering(l, S.steering?.[l.id] ?? []))
+  }
   for (const [k, v] of Object.entries(S.topics)) if (v === l.id) delete S.topics[k]
   for (const [k, v] of Object.entries(S.tickets)) if (v === l.id) delete S.tickets[k]
   if (l.kind === 'worker' && l.topic != null && !l.topic_done) l.topic_close = 'pending'      // lanes-topics (item 4): its topic is finished (now, or when the run ends)
   saveState()
+  for (const it of [...queue.values()]) if (it.lane === l.id && it.state === 'queued') releaseClosedQueue(it)
   appendJsonl('lanes.jsonl', { lane: l.id, kind: 'closed', by: who, was_running: !!run, title: l.title ?? null, grace_ms: run ? CLOSE_GRACE_MS() : 0 })
   const who2 = via === 'joey' ? 'Joey 用 /lanes close' : '主線用 lane_close'
   if (!run) void finishTopic(l, who2)
@@ -8023,7 +8248,7 @@ export async function lanesCommand(text: string, who: string): Promise<string> {
   if (sub === 'off' || sub === 'on') {
     if (sub === 'off') {
       if (!S.master_off) S.master_off = { since: nowIso(), by: who }
-    } else delete S.master_off
+    } else { delete S.master_off; onGateOpen?.() }
     saveState()
     const n = running.size
     // M3 (PL1): Joey's command is an inbound event too: its record tells the main the lanes are off (information, nobody owes anything)
@@ -8194,7 +8419,7 @@ async function peerCall(port: number | undefined, path: string, method: 'GET' | 
 }
 const TG_PORT = Number(process.env.LANES_TG_PORT ?? 0) || undefined
 const INBOX_PORT = Number(process.env.LANES_INBOX_PORT ?? 0) || undefined
-const inboxPost = (p: string, b: unknown) => peerCall(INBOX_PORT, p, 'POST', b)
+export const inboxPost = (p: string, b: unknown) => peerCall(INBOX_PORT, p, 'POST', b)
 const inboxGet = (p: string) => peerCall(INBOX_PORT, p, 'GET')
 
 /** inbox role: ask the tg router what to do with a mesh inbound. null = router unreachable → main. */
@@ -8320,6 +8545,14 @@ export const mainCommitmentCheck = (m: { msgId: unknown; to: string; text: strin
 /** Returns true when the request was handled. Both roles; each endpoint checks its role. */
 export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   if (u.pathname === '/lane-mcp' && D.role === 'tg') { await handleLaneMcp(req, res); return true }
+  if (u.pathname === '/lane-steer' && itemReceiver?.mode.active && D.role === 'tg' && req.method === 'POST') {
+    const token = laneBearer(req), tok = token && runTokens.get(token)
+    if (!tok) { sendJson(res, 403, { error: 'lane token required' }); return true }
+    const b = await readBody(req)
+    const items = await takeSteering(tok, Array.isArray(b?.ids) ? b.ids : [], res)
+    if (!res.destroyed) sendJson(res, 200, { items })
+    return true
+  }
   if (u.pathname === '/lane-stop' && D.role === 'tg' && req.method === 'POST') {                // M3: the lane's stop hook, with the run's own token
     const token = laneBearer(req)
     if (!token) { sendJson(res, 403, { error: 'lane token required' }); return true }
@@ -8464,6 +8697,14 @@ export async function handleLanesHttp(u: URL, req: IncomingMessage, res: ServerR
       const sid = sessionOfPid(Number(b.pid))
       const offered = !!sid && !!b.notif && !!D.notifySession && await D.notifySession(sid, b.notif)
       sendJson(res, 200, { offered }); return true
+    }
+    if (D.inboundLog && p === '/lanes/inbound-log' && req.method === 'POST') {
+      const body = await readBody(req)
+      sendJson(res, 200, { id: await D.inboundLog?.(body) }); return true
+    }
+    if (D.schedulerTaken && p === '/lanes/scheduler-taken' && req.method === 'POST') {
+      D.schedulerTaken?.((await readBody(req)).run_id)
+      sendJson(res, 200, { ok: true }); return true
     }
     if (p === '/lanes/registry-alert' && req.method === 'POST') {       // WO-205: M2's registry disagreement → BTCC (this daemon's credential)
       const b = await readBody(req)

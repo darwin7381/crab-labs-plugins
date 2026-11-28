@@ -82,17 +82,19 @@ export type StatusFact = { idem_key: string; agent: string; state: StatusState; 
 /** WO-145: the form answers this daemon queued for the main (POST /forms/ack), when Onsen did not take the ack directly */
 export type FormAck = { ids: number[]; at: string }
 /** fw (WO-190, local only, never posted): this message's files are being stored in Onsen; the sync joins their ids when it sends the line */
+import type { ItemReport } from './onsen-receive.ts'
 export type SpoolLine = { k: 'm'; r: OnsenItem; fw?: 1 } | { k: 'e'; r: OnsenEvent } | { k: 'l'; r: RestartLineDraw } | { k: 'u'; r: RestartLineLift }
   | { k: 'd'; r: DeliveryFact } | { k: 's'; r: StatusFact } | { k: 'a'; r: FormAck } | { k: 'w'; r: WakeItem }
   /** WO-164: one thread event (lanes-threads.ts OnsenThreadEvent), POST /threads/events */
   | { k: 't'; r: Record<string, unknown> & { thread: string; dedupe: string } }
   /** WO-175: one moment of a Call this agent received (onsen-status.ts CallFacts), PUT /v1/calls/<id>/state */
   | { k: 'c'; r: CallStateLine }
+  | { k: 'ir'; r: ItemReport }
   | { k: 'blocked'; r: BlockedReceipt }
   /** WO-192: what Telegram did with a reply written into Onsen first (onsen-first.ts), POST /messages/<message_id>/delivery */
   | { k: 'r'; r: DeliveryReportLine }
 type BlockedReceipt = ({ message_id: string } | { chat: string; client_msg_id: string }) & { retry_after: string | null }
-const SPOOL_KINDS = new Set(['blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
+const SPOOL_KINDS = new Set(['ir', 'blocked', 'm', 'e', 'l', 'u', 'd', 's', 'a', 'w', 't', 'c', 'r'])
 /** WO-192 (Onsen 0.31.0, WO-191 B): one delivery report: the Onsen message A wrote, and the body Onsen takes */
 export type DeliveryReportLine = { message_id: number
   body: { client: 'telegram'; state: 'sent' | 'failed'; client_msg_ids: string[]; at: string; error?: string } }
@@ -437,6 +439,27 @@ export class OnsenClient {
   private authWarnAt = 0
   private observers: Array<(line: SpoolLine) => void> = []
   /** WO-175: what became of the Call lines sent lately (idem → fate), and who waits for one not sent yet */
+  private itemReports = 0
+  private itemAck?: (line: ItemReport, ok: boolean) => void
+
+  watchItemReports(replay: (line: ItemReport) => void, ack: (line: ItemReport, ok: boolean) => void): void {
+    this.itemAck = ack
+    this.itemReports = 0
+    let offset = this.readCursor()
+    for (;;) {
+      const lines = this.unsent(offset)
+      if (!lines.length) break
+      for (const { line } of lines) if (line?.k === 'ir') { this.itemReports++; replay(line.r) }
+      offset = lines[lines.length - 1]!.end
+    }
+  }
+  hasItemReports(): boolean { return this.itemReports > 0 }
+  recordItemReport(line: ItemReport): boolean {
+    if (!this.append({ k: 'ir', r: line })) return false
+    this.itemReports++
+    return true
+  }
+
   private callFates = new Map<string, CallLineFate>()
   private callWaits = new Map<string, Array<(f: CallLineFate) => void>>()
   /** WO-190: a message's files being stored (its idem_key → when the upload started, and its end), and the ids once known ([] = none: failed, late,
@@ -774,21 +797,22 @@ export class OnsenClient {
   }
   /** WO-145: one call to Onsen with this agent's credential (null: no credential); throws on a network error or the timeout. `headers` (WO-176): extra
    *  request headers (an Idempotency-Key) */
-  async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>): Promise<{ status: number; json: any } | null> {
+  async request(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown, timeoutMs = 15_000, headers?: Record<string, string>, cancel?: AbortSignal): Promise<{ status: number; json: any } | null> {
     const cred = this.cfg.credential()
     if (!cred) return null
     if (method === 'POST') return this.post(path, body ?? {}, cred, timeoutMs, headers)
     if (method === 'PUT') return this.put(path, body ?? {}, cred, timeoutMs)      // WO-197: the connector's edit (PUT /v1/messages/<id>)
-    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, headers), signal: AbortSignal.timeout(timeoutMs) })
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const r = await this.f(`${this.cfg.base}${path}`, { headers: this.headers(cred, headers), signal: cancel ? AbortSignal.any([cancel, timeout]) : timeout })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
   }
   /** WO-172: a PUT whose body is bytes (an avatar), with this agent's credential; null: no credential; throws on a network error or the timeout */
-  async putBytes(path: string, bytes: Uint8Array, contentType: string, timeoutMs = 20_000): Promise<{ status: number; json: any } | null> {
+  async putBytes(path: string, bytes: Uint8Array, contentType: string, timeoutMs = 20_000, headers?: Record<string, string>): Promise<{ status: number; json: any } | null> {
     const cred = this.cfg.credential()
     if (!cred) return null
-    const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred, { 'Content-Type': contentType }), body: bytes, signal: AbortSignal.timeout(timeoutMs) })
+    const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred, { 'Content-Type': contentType, ...headers }), body: bytes, signal: AbortSignal.timeout(timeoutMs) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
@@ -812,8 +836,8 @@ export class OnsenClient {
     return { status: r.status, bytes, mime }
   }
   /** WO-175: a JSON PUT with this agent's credential (a Call's state) */
-  private async put(path: string, body: unknown, cred: string, timeoutMs?: number): Promise<{ status: number; json: any }> {
-    const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
+  private async put(path: string, body: unknown, cred: string, timeoutMs?: number, headers?: Record<string, string>): Promise<{ status: number; json: any }> {
+    const r = await this.f(`${this.cfg.base}${path}`, { method: 'PUT', headers: this.headers(cred, headers), body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs ?? this.cfg.postTimeoutMs ?? 15_000) })
     let json: any = null
     try { json = await r.json() } catch {}
     return { status: r.status, json }
@@ -826,9 +850,8 @@ export class OnsenClient {
   }
 
   /** the lines after the cursor (complete lines only), each with the offset just past it */
-  private unsent(): Array<{ line: SpoolLine | null; raw: string; end: number }> {
+  private unsent(start = this.readCursor()): Array<{ line: SpoolLine | null; raw: string; end: number }> {
     let fd: number | null = null
-    const start = this.readCursor()
     try {
       const size = statSync(this.spool).size
       if (size <= start) return []
@@ -927,6 +950,23 @@ export class OnsenClient {
         else return this.failStatus(r, path)
         this.writeCursor(t.end); this.ok(); i++
         continue
+      }
+      if (t.line.k === 'ir') {
+        const line = t.line.r, body = line.body
+        const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
+        const key = ['ir', line.item_id, body.claim_id, body.outcome].map(encodeURIComponent).join(':')
+        const r = await this.put(path, body, cred, undefined, { 'Idempotency-Key': key }).catch(e => ({ status: 0, json: { error: errText(e) } }))
+        const ok = r.status === 200
+        if (!ok) {
+          const code = errCode(r.json)
+          if (r.status === 409 && code === 'version_conflict') this.cfg.log('info', `onsen: late item report ${key}: version_conflict`)
+          else if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'ir', path, status: r.status, code })
+          else return this.failStatus(r, path)
+        }
+        this.itemAck?.(line, ok)
+        this.writeCursor(t.end)
+        this.itemReports = Math.max(0, this.itemReports - 1)
+        this.ok(); i++; continue
       }
       if (t.line.k === 'c') {
         // WO-175: one moment of a received Call (the id its pulled item carried)

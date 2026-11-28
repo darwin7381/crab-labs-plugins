@@ -1265,6 +1265,7 @@ async function forwardInputPassthrough(
  * absent: roamer, Onsen off): the plain reply. A failed /clear gets the failure line only. (WO-142's beforeClear, which drew the line first, is gone.)
  */
 export type ClearHooks = {
+  command?: { from: string; message_id: string }
   afterClear?: (okText: string) => Promise<boolean>
 }
 
@@ -1310,6 +1311,7 @@ export async function forwardSharedTuiSlash(
 
   if (cmd in SHARED_TUI_CTRL_KEY) {
     try {
+      if (hooks?.command) markDeliberateRestart(hooks.command, true)
       await tmuxSendCtrlKey(SHARED_TUI_CTRL_KEY[cmd], tmuxName)
       await replyToTg(`✅ 已送 ${SHARED_TUI_CTRL_KEY[cmd]}（${cmd}）到 ${tmuxName}`)
     } catch (err) {
@@ -1328,6 +1330,7 @@ export async function forwardSharedTuiSlash(
     if (cmd === '/resume' && args) return false
     let typed = false
     try {
+      if (cmd === '/clear' && hooks?.command) markDeliberateRestart(hooks.command, true)
       await tmuxSendKeys(cmd, tmuxName, true)  // clearFirst: drop any draft so the command isn't polluted
       typed = true
     } catch (err) {
@@ -2124,7 +2127,7 @@ export async function handleControlSlash(
   // ---- Phase 2: system-level control ------------------------------------
   if (cmd === '/restart') {
     await tryRun('restart claude TUI', async () => {
-      markDeliberateRestart()
+      markDeliberateRestart(hooks?.command)
       const how = await restartClaudeTUI()
       await replyToTg(`🔁 restarting — tmux session 已砍，${how}。TUI 回線約 30–60s（監控 tick + 啟動等待）。`)
     })
@@ -2132,7 +2135,7 @@ export async function handleControlSlash(
   }
   if (cmd === '/kill-stuck' || cmd === '/kill_stuck') {
     await tryRun('pkill -9 claude TUI', async () => {
-      markDeliberateRestart()
+      markDeliberateRestart(hooks?.command)
       const r = await killStuckClaude()
       await replyToTg(
         r.killed > 0
