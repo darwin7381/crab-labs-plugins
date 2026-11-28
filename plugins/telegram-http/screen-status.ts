@@ -147,7 +147,7 @@ const NUM_OPT = /^(\s*)([❯›▶>])?(\s*)(\d+)\.\s+(.*?)\s*$/
 const CUR_OPT = /^(\s*)❯\s+(\S.*?)\s*$/
 const RATE_LIMIT_MENU = /Stop and wait|Switch to usage credits|Upgrade your plan/     // duty-officer.ts isRateLimitMenu, ratelimit-modal-guard.sh
 const RATE_LIMIT_FOOTER = /Esc.*cancel|Enter.*confirm/
-const RESUME_MENU = /Resume session/                                                 // channel-bot-control.ts isPickerOpen
+const RESUME_MENU = /Resume session/                                                 // the record's resume_picker kind
 const indentOf = (r: string): number => r.length - r.trimStart().length
 const tidy = (s: string): string => s.replace(/[│╮╯╰╭]+\s*$/, '').replace(/^\s*[│]\s?/, '').trim()
 // WO-168 (Chiron 11-28 00:27Z, item 7): a list longer than the screen draws its scroll arrow in the cursor's gutter (「   ↓ /clear」, the resume picker,

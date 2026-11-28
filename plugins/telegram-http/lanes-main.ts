@@ -36,6 +36,8 @@ export type Via = 'tg' | 'inbox'
 export type MainPhase = 'starting' | 'idle' | 'in_turn' | 'walled' | 'gone'
 export type StopCommand = { from: string; message_id: string }
 export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
+/** WO-215: SessionEnd reasons that end a session while its process goes on (Claude Code hooks: /clear, an in-session /resume) */
+const SESSION_SWITCH: ReadonlySet<string> = new Set(['clear', 'resume'])
 type CutTurn = { at: number; why: string; retry_at?: number; background_agents?: number }
 
 import type { ItemRef } from './onsen-items.ts'
@@ -245,6 +247,10 @@ export function createMain(E: MainEnv) {
     if (g && command && g.prompt_id) J().write('main', g.id, g.state, { stop_command: { ...command, prompt: g.prompt_id } })
     if (cur && !signalOnly) pendingEnd.set(cur, reason)
   }
+  // WO-215 (3): while the daemon switches the main's session for a person (it interrupted the turn, Joey msg 1572), M1 offers nothing: what waits
+  // goes to the session he switched to. Released by that session's start, or by the switch itself when it ends either way
+  let offersHeldUntil = 0
+  function holdOffers(ms: number): void { offersHeldUntil = ms > 0 ? Date.now() + ms : 0; if (ms <= 0) void pump() }
 
   // ------------------------------------------------------------------ WO-177 一: can the main take an item now (the status record)
   /** the status record's member state now (null: no record here) */
@@ -476,7 +482,7 @@ export function createMain(E: MainEnv) {
   }
   async function offerNext(): Promise<void> {
     const g = currentGen()
-    if (!g) return
+    if (!g || Date.now() < offersHeldUntil) return
     // A keeper clear can wake the walled gen. Drive its limit menu first (002k G16a).
     const wall = wallDelivery(g)
     const probe = wall.probe
@@ -1052,7 +1058,10 @@ export function createMain(E: MainEnv) {
         // one (SessionStart source clear, a new session id). The process is the main ("a SessionStart from the process of the live gen is accepted").
         // Ending the gen here left no live gen: the new session was refused ("not the registered main") and nobody was the main until the TUI
         // restarted. A session that ends while its process goes on ends no gen; the end of an older session of this process is ignored.
-        if (String(b.reason ?? '') === 'clear' || (b.session_id && g.session_id && String(b.session_id) !== String(g.session_id))) return {}
+        // WO-215 (Chiron 01:47Z): one rule, the process goes on, read from the hook itself. Claude Code's SessionEnd reasons (code.claude.com hooks):
+        // `clear` and `resume` ("Session switched via interactive /resume", typed or the daemon's) are a switch inside the process; every other reason
+        // (logout, prompt_input_exit, other) is the process ending, and the gen ends at once, as before
+        if (SESSION_SWITCH.has(String(b.reason ?? '')) || (b.session_id && g.session_id && String(b.session_id) !== String(g.session_id))) return {}
         endGen(g, pendingEnd.get(g.id) ?? 'exited'); return {}
       }
     }
@@ -1086,6 +1095,7 @@ export function createMain(E: MainEnv) {
     // another session in the same process while a turn was open (a /clear, a /resume): the turn is over; its items are settled as at a gen's end
     if (same && same.state === 'in_turn' && same.prompt_id && !goesOn) capped = settle(same, items(r => (r.state === 'offered' || r.state === 'bound') && r.gen === same.id && r.prompt_id === same.prompt_id), 'session_start').capped
     const id = String(pid)
+    offersHeldUntil = 0                                                     // WO-215 (3): the process has its next session; a switch's hold is over
     if (b.source === 'clear') work.delete(id)                               // 002w (B, 24a): the new session never saw that work
     // 002w (E, gap 13): the main's wall is an episode of the AGENT: a gen that ended walled hands its open episode to this one, whose first final Stop
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
@@ -1305,7 +1315,7 @@ export function createMain(E: MainEnv) {
       J().write('msg', r.id, 'queued', { reason: 'offer_untaken', gen: null, prompt_id: null, missed_state: deliveryNow(), missed_gen: g?.id })
     }
   }
-  return { offerMissed, wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
+  return { offerMissed, wallDelivery, initMain, currentGen, mainPid, mainPhase, mainUp, mainSession, markEnd, holdOffers, enqueue, pump, renderPulled, mainEvent, streamOpened, tick, registryChanged, statusIdle, turnWork, turnStart, openTool,
     replaceQueued, mainCanTake, deliveryNow, statusChanged, items: (pred: (r: Row) => boolean = () => true) => items(pred) }
 }
 
