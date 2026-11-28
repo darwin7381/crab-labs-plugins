@@ -58,6 +58,10 @@ function timeInPhrase(words: string, at: number): number | null {
   if (hour > 23 || minute > 59) return null
   const due = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + day, hour - 8, minute)
   if (due >= at) return due
+  // At 15:00, a bare 「3 點半」 can still refer to the hour in progress.
+  const afternoon = due + 12 * 3600_000
+  if ((!clock[1] || clock[1] === '今天') && !clock[2] && /[點時]/.test(clock[0])
+    && local.getUTCHours() === hour + 12 && afternoon >= at) return afternoon
   if (weekday) return due + 7 * 86400_000
   return clock[1] ? null : due + 86400_000
 }
