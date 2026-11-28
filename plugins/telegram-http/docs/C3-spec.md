@@ -6,6 +6,20 @@
 
 以 C1 動態探測成功的 `TakeMode.active` 決定本機交付方式。切換者先交完既有 pull 收件，保留這些工作的內容。新 Item 使用同一份 claim 與 spool。Onsen 決定失敗次數、退避、第三次停領、完成正常一件後放回一次、放回後再失敗作廢。連接器繼續提供狀態、回報和 keeper 的上限事實。S4 與 C3 的測試台驗收是第一隻正式成員切換的前提。
 
+## d503fc6 審查修訂
+
+本次重讀 §4b，契約 MD5 為 `fbee7e7295a1e0e90e1b64ee753af7d9`。以下依 review-c3 的行號與裁定驗收。
+
+1. `lanes.ts:3956,4219` 各車道保存自己的拒絕時間。keeper 未顯示該車道的牆時，60 秒後放一筆真實工作探測。成功清除，再拒就從該次重算。主線的牆只適用於相符模型。
+2. `lanes-main.ts:211` 自動重開以舊 PID 退出為準。舊 PID 過數秒仍活著就解除 hook 封鎖，交給後續 tick 重試。同一次卡住只報一次。
+3. `lanes-main.ts:1228` 卡住時至少要成功記錄一筆持有中 claim 的 `stuck` 才重開。手打回合、本地列、過期 claim 均以回歸測試驗證。
+4. `main-hook.py:190` 保留逐則漏答與工具結果未送出的內容判斷，同一次 Stop 合併提醒，對應的 claim 報 `owed`。本機及切換前的列也保留內容檢查。
+5. `onsen-claims.ts` 每筆 `completed` 附上屬於該 claim 的回覆訊息 ID，涵蓋車道直接完成與提醒後完成。
+6. `lanes.ts:3623,5281` 車道的工具等待依主線 hook 的工具 timeout 來源計時，涵蓋 MCP、WebFetch 與 Bash；工具結果進來後從最後活動重新計算沉默時間。
+7. `onsen-take.ts` 以 C1 的 `TakeMode.active` 統一判斷成員的模式。收件 409 暫停領件，等模式探測確認 pull 才啟動舊計時器。測試包含暫停期間已到期的列。
+
+測試台另驗 relayed TUI alert 交值班員、main-menu 的 choose Action。已定 37 的寄件人模式由 Chiron 裁定。
+
 ## 逐項盤點
 
 | inventory | 入口（基準行號） | take 成員的處理與通知歸屬 |

@@ -771,6 +771,7 @@ type Lane = {
   status: 'new' | 'running' | 'idle' | 'closed'
   created: string; last: string; transcript: string; runs: number
   last_limit_refusal?: number
+  keeper_clear_used?: number
   tokens_in: number; tokens_out: number; topic?: number; title?: string; critical?: boolean
   fork_from?: string
   /** lanes-topics (item 4): a worker's topic name as stored (= shown); its finish: pending at the close, done (time) once the ✅ and the closing line went */
@@ -2877,6 +2878,9 @@ async function applyRule(r: Rule, ev: InEvent): Promise<Decision> {
     }
     case 'reflex': {
       const critical = !!(r.critical_regex && new RegExp(r.critical_regex, 'i').test(ev.text))
+      const prior = ev.onsen_items?.[0]?.refused_lane
+      const refusedLane = prior && S.lanes[prior]
+      if (refusedLane && refusedLane.status !== 'closed') return dispatch(ev, refusedLane, { ...base, critical })
       const rep = alertRepeat(ev, critical)                  // 002k (B12): a repeat of an alert that is already being handled opens no lane
       if (rep) return rep
       const inc = incidentMerge(ev, critical)                // WO-132 (item 2): an alert of an incident a lane already handles goes to that lane
@@ -3369,6 +3373,7 @@ function setPendingSteer(lane: string, pending: SteerRec[]): void {
 /** The lane token identifies the receiving run. Only its own pending event IDs can be requested. */
 async function takeSteering(tok: RunTok, ids: string[], res: ServerResponse) {
   const receiver = itemReceiver, lane = S.lanes[tok.lane]
+  if (queue.get(tok.evId)?.wallProbe) return []
   const live = () => running.get(tok.lane)?.tok === tok && lane.status !== 'closed'
   if (!receiver?.mode.active || !live()) return []
   syncSteer(tok.lane)
@@ -3574,7 +3579,7 @@ export function itemIndex(): Map<string, number> {
 /** the in-memory view of an event's current run record (M5): the journal is its state; this is what pump and the tools read */
 type QItem = { ev: InEvent; lane: string; state: 'queued' | 'leased' | 'done'; attempts: number; priority: number; summary?: string; enqueued: string
   /** the M5 record id of this event's current run; the process and lane run of a leased one */
-  rid?: string; pid?: number; run?: string; keeperProbe?: number; stuckRestart?: boolean
+  rid?: string; pid?: number; run?: string; wallProbe?: boolean; keeperProbe?: number; stuckRestart?: boolean
   /** after a death the next run waits until then (002f backoff) */
   not_before?: number
   /** 002k: later messages of the same peer that queued for this lane while it was busy; handled in the same run */
@@ -3856,17 +3861,22 @@ function runEnded(lane: Lane | undefined, it: QItem, e: { reason: string; proces
   }
   const itemExit = e.processExit ?? e.reason
   const apiError = ['wall:server_error', 'wall:api_error', 'wall:overload'].includes(itemExit)
-  if (wall && !(takingItems() && apiError)) {
-    if (takingItems() && lane) lane.last_limit_refusal = Date.now()
-    wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
-  }
-  else if (!wall && S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')       // the first run that gets through takes the wall down, however it ended
+  if (takingItems()) {
+    if (lane && wall && !apiError) {
+      lane.last_limit_refusal = Date.now()
+      const clear = keeperForLane(lane)?.clearedMs
+      if (clear) lane.keeper_clear_used = Math.max(clear, lane.keeper_clear_used ?? 0)
+      saveState()
+    }
+    else if (lane?.last_limit_refusal && !wall && e.reachedModel) { delete lane.last_limit_refusal; saveState() }
+  } else if (wall) wallUp({ kind: wall, text: e.wallText ?? '' }, e.runId ?? it.run ?? '?')
+  else if (S.wall && e.reachedModel) void wallDown(e.runId ?? it.run ?? '?')
   if (again) return
   const outcome = it.stuckRestart ? 'cut' : itemExit === 'normal' ? 'completed' : apiError ? 'error'
     : wall ? (it.keeperProbe ? 'usage_limit_probe' : 'usage_limit') : 'cut'
   if (refs.length && !['normal', 'closed', 'gone'].includes(e.reason)) {
     const limit = outcome === 'usage_limit' || outcome === 'usage_limit_probe'
-    itemReceiver?.report(refs, outcome, { ...(limit ? { retry_after: D.usageWall?.(0)?.resets_at ?? null } : {}),
+    itemReceiver?.report(refs, outcome, { ...(limit ? { retry_after: (lane && keeperForLane(lane))?.resets_at ?? null } : {}),
       ...(it.stuckRestart ? { note: '卡住重開' } : {}), ...(e.halfDone ? { half_done: true } : {}) })
   }
   // A lane that saw its one owed prompt and still ended normally has completed that row.
@@ -3952,12 +3962,6 @@ export function wallKind(text: string): string | null {
 const WALL_WORD: Record<string, string> = { usage: '模型額度用完了', overload: '模型服務過載', error: '模型連線出錯', auth: '模型登入失效',
   rate_limit: '模型額度用完了', authentication_failed: '模型登入失效', billing_error: '模型帳務出錯', server_error: '模型服務出錯', account_on_hold: '模型帳號被暫停' }
 function wallUp(w: { kind: string; text: string }, by: string): void {
-  if (takingItems()) {
-    // The time of a real refusal gates the next person. Only the keeper measures recovery.
-    S.wall = { since: nowIso(), kind: w.kind, text: w.text, probe_at: 0, probes: 0 }
-    saveState()
-    return
-  }
   if (S.wall) {                                           // a probe hit the wall again
     S.wall.probes += 1
     const next = wallBackoffMs(S.wall.kind, S.wall.probes)            // 002l (S0 item 4): back off while it stays up
@@ -4215,23 +4219,34 @@ export function laneSlots(): number {
   }
   return n
 }
-/** A real row can probe after a new keeper clear; a fresh human message can also probe a minute after refusal. */
+function keeperForLane(lane: Lane): MainWall | null {
+  const keeper = D.usageWall?.(lane.last_limit_refusal ?? 0)
+  if (!keeper?.walled && !(lane.last_limit_refusal && keeper?.clearedMs)) return null
+  const transcript = mainTranscriptFile(D.transcriptDir)
+  const model = transcript && genuineAssistantModelFile(transcript)
+  return model && laneModelFor(lane.kind).model === model ? keeper : null
+}
+
+/** pump already serializes starts for this lane. Only a real waiting Item can probe its refusal. */
 function laneMayTake(it: QItem): boolean {
-  const since = Date.parse(S.wall?.since ?? '') || 0
-  const keeper = D.usageWall?.(since)
+  const lane = S.lanes[it.lane]
+  if (!lane) return false
+  const last = lane.last_limit_refusal
+  const keeper = keeperForLane(lane)
   it.keeperProbe = undefined
-  if (!keeper?.walled && !S.wall) return true
-  if (running.size || startingItems.size) return false
-  const clear = keeper?.clearedMs ?? 0
-  if (!keeper?.walled && clear >= Math.floor(since / 1000) * 1000 && clear > (S.wall_clear_used ?? 0)) {
+  it.wallProbe = !!last || !!keeper?.walled
+  if (!it.wallProbe) return true
+  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
+  if (!refs.length) return false
+  const clear = keeper?.clearedMs
+  if (!keeper?.walled && last && clear && clear >= Math.floor(last / 1000) * 1000 && clear > (lane.keeper_clear_used ?? 0)) {
     it.keeperProbe = clear
     return true
   }
-  const refs = runEvents(it).flatMap(ev => ev.onsen_items ?? [])
-  if (!refs.length || !refs.every(r => r.kind === 'message' && !r.reason?.startsWith('usage_limit'))) return false
-  const last = S.lanes[it.lane]?.last_limit_refusal ?? 0
-  if (personCanProbe(last)) return true
-  itemReceiver!.dueAt(new Date(last + 60_000).toISOString())
+  if (keeper?.walled && !refs.every(r => r.kind === 'message' && !r.reason?.startsWith('usage_limit'))) return false
+  const refused = Math.max(last ?? 0, keeper?.lastWallMs ?? 0)
+  if (personCanProbe(refused)) return true
+  itemReceiver!.dueAt(new Date(refused + 60_000).toISOString())
   return false
 }
 
@@ -4260,7 +4275,7 @@ function pump(): void {
       return
     }
     if (mainChatPending(it)) continue                     // WO-144: the block of its run is fetched first (≤ LANES_MAIN_CHAT_TIMEOUT_MS); its end pumps again
-    coalesce(it, waiting)
+    if (!it.wallProbe) coalesce(it, waiting)
     startRun(it)
   }
 }
@@ -5171,10 +5186,14 @@ function startRun(it: QItem, acquired = false): void {
     if (!itemReceiver?.mode.active) return
     const receiver = itemReceiver
     startingItems.add(lane.id)
-    void receiver.receive(refs).then(({ given, gone }) => {
+    // A waiting incident can already have riders. Keep those waiting while its first real event probes.
+    const probeEvent = it.wallProbe && runEvents(it).find(ev => ev.onsen_items?.length)
+    const requested = probeEvent ? probeEvent.onsen_items! : refs
+    void receiver.receive(requested).then(({ given, gone }) => {
       if (it.state === 'queued' && lane.status !== 'closed' && !th?.stopped && !sessionBusy(it)) {
         const received = receivedRun(it, given, gone, receiver)
         if (received) startRun(received, true)
+        else if (gone.size) setTimeout(pump, 0).unref()
       } else {
         const taken = refs.filter(ref => given.has(ref.onsen_item_id))
         if (lane.status === 'closed' || th?.stopped) receiver.report(taken, 'reassigned', { note: `${lane.id} 在收下這件事之前已關閉。` })
@@ -5183,7 +5202,7 @@ function startRun(it: QItem, acquired = false): void {
     }).catch(e => D.log('warn', 'lanes: item take: ' + e)).finally(() => { startingItems.delete(lane.id) })
     return
   }
-  if (it.keeperProbe) S.wall_clear_used = it.keeperProbe
+  if (it.keeperProbe) lane.keeper_clear_used = it.keeperProbe
   const runId = `${lane.id}.r${lane.runs + 1}`
   const token = randomBytes(24).toString('base64url')
   const critical = !!lane.critical

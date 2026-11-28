@@ -86,7 +86,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
     return health?.pid === proc.pid
   })
   await ready()
-  const restart = async () => { proc.kill('SIGKILL'); await proc.exited; proc = spawn(); await ready() }
+  const restart = async (whileStopped?: () => void) => { proc.kill('SIGKILL'); await proc.exited; whileStopped?.(); proc = spawn(); await ready() }
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
@@ -543,34 +543,92 @@ exec sleep 20
   expect(row.failures).toBe(1)
 }, 10000)
 
-test('a lane behind an account limit only probes on real input, once per keeper clear', async () => {
-  const d = await daemon({}, 200, root => {
-    const bin = join(root, 'limited-lane'), dir = join(root, 'walls')
-    mkdirSync(dir)
-    writeFileSync(bin, `#!/bin/sh
+function wallFixture(root: string, mainModel: string) {
+  const dir = join(root, 'walls'), bin = join(root, 'limited-lane'), sid = randomUUID()
+  const transcripts = join(root, 'home', '.claude', 'projects', root.replace(/[^a-zA-Z0-9]/g, '-'))
+  mkdirSync(dir); mkdirSync(transcripts, { recursive: true })
+  writeFileSync(join(root, '.lanes', 'main-expected'), sid)
+  writeFileSync(join(transcripts, sid + '.jsonl'), JSON.stringify({ type: 'assistant', message: { model: mainModel } }))
+  writeFileSync(bin, `#!/bin/sh
 echo run >> ./lane-starts
-echo '{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":429}'
+if [ -f ./refuse ]; then
+  echo '{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":429}'
+else
+  echo '{"type":"assistant","message":{"id":"answer","content":[{"type":"text","text":"finished"}]}}'
+  echo '{"type":"result","subtype":"success","result":"finished"}'
+fi
 `)
-    chmodSync(bin, 0o700)
-    return { LANES_CLAUDE_BIN: bin, AGENT_INBOX_SELF: 'adam', LANES_WALL_PROBE_MS: '60', USAGE_WALL_READ: '1', USAGE_WALL_CACHE_MS: '0', USAGE_WALL_DIR: dir }
-  })
-  const alert = (id: string) => d.f.add(id, 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] ' + id, line: 'call' } })
-  const row = alert('account-refusal')
+  chmodSync(bin, 0o700)
+  writeFileSync(join(root, 'refuse'), '')
+  return { LANES_CLAUDE_BIN: bin, LANES_MODEL: 'lane-model', AGENT_INBOX_SELF: 'adam', USAGE_WALL_READ: '1', USAGE_WALL_CACHE_MS: '0', USAGE_WALL_DIR: dir }
+}
+
+function incident(d: Awaited<ReturnType<typeof daemon>>, id: string, host = 'lab') {
+  return d.f.add(id, 'alert', { from: 'alert-dispatcher', refs: [{ kind: 'incident', value: host }],
+    payload: { text: 'alert ' + id + ': load/' + host + '/cpu = high', line: 'call' } })
+}
+function keeperWall(root: string, walled: boolean, at = new Date().toISOString()) {
+  writeFileSync(join(root, 'walls', 'adam.json'), JSON.stringify({ agent: 'adam', episode: 'limited', in_wall: walled,
+    cleared_at: walled ? null : at, last_wall_at: walled ? at : null, updated_at: new Date().toISOString(), cleared_by: 'probe_after_reset' }))
+}
+
+test('a lane on the keeper model probes once per fresh clear', async () => {
+  const d = await daemon({}, 200, root => wallFixture(root, 'lane-model'))
+  const row = incident(d, '101')
   await waitFor(() => row.reason === 'usage_limit')
-  alert('program-waits')
   const starts = () => readFileSync(join(d.root, 'lane-starts'), 'utf8').trim().split('\n').length
+  incident(d, '102')
   await Bun.sleep(300)
   expect(starts()).toBe(1)
-  const at = new Date().toISOString()
-  writeFileSync(join(d.root, 'walls', 'adam.json'), JSON.stringify({ agent: 'adam', episode: 'limited', in_wall: false,
-    cleared_at: at, updated_at: at, cleared_by: 'probe_after_reset' }))
-  alert('after-clear')
+  keeperWall(d.root, false)
+  incident(d, '103')
   await waitFor(() => d.f.history.some(h => h.body.outcome === 'usage_limit_probe'))
   await Bun.sleep(300)
   expect(starts()).toBe(2)
-  expect(d.f.history.filter(h => h.body.outcome === 'usage_limit_probe')).toHaveLength(1)
   expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
 })
+
+test('a lane-only 429 lets a real alert probe after 60 s and clears only that lane on success', async () => {
+  const d = await daemon({}, 200, root => {
+    const env = wallFixture(root, 'other-model')
+    keeperWall(root, false, new Date(Date.now() - 3600_000).toISOString())
+    return env
+  })
+  const row = incident(d, '201')
+  await waitFor(() => row.reason === 'usage_limit')
+  const target = row.session_id!
+  row.state = 'cancelled'; d.f.change(row, 'withdrawn')
+  const next = incident(d, '202'), rider = incident(d, '205')
+  await Bun.sleep(250)
+  expect(next.state).toBe('waiting')
+  const statePath = join(d.lanes, 'state.json')
+  const state = () => JSON.parse(readFileSync(statePath, 'utf8'))
+  const nearProbe = () => {
+    const saved = state()
+    saved.lanes[target].last_limit_refusal = Date.now() - 59_000
+    writeFileSync(statePath, JSON.stringify(saved))
+  }
+  await d.restart(nearProbe)
+  await waitFor(() => next.reason === 'usage_limit')
+  expect(next.session_id).toBe(target)
+  expect(rider.state).toBe('waiting')
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(next.id)).map(c => c.body.item_ids)).toEqual([[next.id]])
+  const refused = state().lanes[target].last_limit_refusal
+  expect(Date.now() - refused).toBeLessThan(5000)
+  rmSync(join(d.root, 'refuse'))
+  keeperWall(d.root, true)
+  const independent = incident(d, '203', 'second-host')
+  await waitFor(() => independent.in_session_at != null)
+  expect(independent.session_id).not.toBe(target)
+  expect(state().lanes[target].last_limit_refusal).toBe(refused)
+  const recovery = incident(d, '204')
+  expect(recovery.state).toBe('waiting')
+  await d.restart(nearProbe)
+  await waitFor(() => d.f.history.some(h => h.item_id === recovery.id && h.body.outcome === 'in_session'))
+  await waitFor(() => !state().lanes[target].last_limit_refusal)
+  expect(recovery.session_id).toBe(target)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+}, 20_000)
 
 for (const [reason, outcome, code] of [
   ['cap_turns', 'cut', 0], ['cap_usd', 'cut', 0], ['died', 'cut', 1], ['timeout', 'cut', 0], ['budget', 'cut', 0],
