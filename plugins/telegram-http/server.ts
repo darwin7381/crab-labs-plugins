@@ -443,7 +443,8 @@ async function connectorReply(o: { chat: string; sender: string; text: string; r
   const kind = body.trim() || !o.files.length ? (o.rich ? 'rich' : 'text') : PHOTO_EXTS.has(extname(o.files[0]!).toLowerCase()) ? 'photo' : 'document'
   const said = await connectorSay.say({ chat: o.chat, sender: o.sender, text: body, kind, turn_id: o.turn_id, replyTo: o.replyTo != null ? String(o.replyTo) : null,
     silent: o.silent, ...(o.topic != null ? { thread: String(o.topic) } : {}), ...(ids.length ? { fileIds: ids, attachments: rows } : {}) })
-  if (o.turn_id && said.onsenId) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId, mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined)
+  if (said.onsenId && (o.turn_id || said.replyToMessageId)) itemClaims?.reply(o.turn_id, said.conversationId, said.onsenId,
+    o.turn_id && mainTurnNow?.() === o.turn_id ? Lanes.mainSessionId() : undefined, said.replyToMessageId)
   return said
 }
 // ---- WO-197 segment 2 (Chiron; CONTRACT §7d 「連接器這一頭」, the rulings of mesh 12869): what the daemon still said on Telegram goes through Onsen ----

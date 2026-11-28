@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
@@ -50,7 +50,7 @@ async function mainRig() {
   await hook('SessionStart', { source: 'startup' })
   const enqueue = (row: InboxItem, old = false) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
     { method: 'notifications/claude/channel', params: { content: row.payload.text, meta: { chat_id: '1', message_id: String(row.number), user: row.from } } },
-    { event: row.id, fields: old ? {} : { onsen_items: [itemRef(row)] } })
+    { event: row.id, fields: old ? {} : { onsen_items: [itemRef(row)], person_message_ids: row.message_id ? [row.message_id] : [] } })
   const bind = async (row: InboxItem) => {
     const did = enqueue(row)
     await until(() => m.items(x => x.id === did)[0]?.state === 'offered')
@@ -250,6 +250,31 @@ test('idle main takes before offer, binds, completes only after final Stop and i
   await r.sync()
   expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
   expect(row.response_message_ids).toEqual(['message-91']); expect(r.claims.held()).toEqual([])
+})
+
+test('claim attribution survives restart and follows the quote or the conversation and turn', async () => {
+  const r = await mainRig()
+  const first = r.f.add('one', 'message', { message_id: '23' }), second = r.f.add('two', 'message', { message_id: '24' })
+  await r.bind(first)
+  r.enqueue(second); await r.hook('PostToolUse'); await r.sync()
+  expect(second.claim?.session_id).toBe('main')
+  const oldLedger = JSON.parse(readFileSync(r.file, 'utf8'))
+  delete oldLedger.claims[first.id].message_id
+  writeFileSync(r.file, JSON.stringify(oldLedger))
+  const restored = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
+  restored.restoreMessageIds(r.journal)
+  expect(JSON.parse(readFileSync(r.file, 'utf8')).claims[first.id].message_id).toBe('23')
+  restored.reply('turn', 'conv', '25', null, '23')
+  restored.reply('turn', 'conv', '25', null, '23')
+  restored.reply('another turn', 'conv', '26', null, '24')
+  restored.reply('turn', 'conv', 'shared')
+  restored.reply('turn', 'conv', 'other-target', null, '100')
+  restored.reply('turn', 'other conversation', 'wrong-conversation', null, '23')
+  restored.reply('another turn', 'conv', 'wrong-turn')
+  for (const row of [first, second]) restored.report(row.id, 'completed')
+  await r.sync()
+  expect(first.response_message_ids).toEqual(['25', 'shared'])
+  expect(second.response_message_ids).toEqual(['26', 'shared'])
 })
 
 test('a main session with no subagents directory completes at its settled Stop', async () => {

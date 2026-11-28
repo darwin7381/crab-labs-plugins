@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import type { InboxItem, ItemRef } from './onsen-items.ts'
 import type { TakeMode } from './onsen-take.ts'
+import type { Journal } from './lanes-state.ts'
 
 export type Outcome = 'in_session' | 'not_taken' | 'completed' | 'owed' | 'background' | 'not_applied'
   | 'usage_limit' | 'usage_limit_probe' | 'error' | 'cut' | 'cut_person' | 'stopped' | 'stuck' | 'reassigned'
@@ -12,6 +13,7 @@ const empty = (): ReceiveResult => ({ given: new Set(), gone: new Set() })
 export const itemIds = (refs: ItemRef[]) => refs.map(r => r.onsen_item_id)
 
 export type ClaimStore = {
+  restoreMessageIds(journal: Journal): void
   blocked(): boolean
   owns(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void

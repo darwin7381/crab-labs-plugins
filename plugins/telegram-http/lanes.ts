@@ -308,6 +308,7 @@ export function lanesInit(deps: LanesDeps): void {
     if (retitleThreads('start')) saveState()        // WO-164 titles: the open threads get their titles from the key (Onsen: at the handshake's sync)
     journal = new Journal(join(deps.stateDir ?? LANES_DIR, 'lanes', 'state.jsonl'))
     journal.load()
+    itemReceiver?.claims.restoreMessageIds(journal)
     if (onsenTap?.journal) journal.observe(onsenTap.journal)          // Onsen step 3 (WO-143): read-only
     journal.observeLines(l => { if (wakeTap && l.rec === 'wake') tapWake(l) })   // WO-147: the hand-over decisions' wake lines (read only; nothing without a tap)
     main = createMain(mainEnv())

@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { dirname } from 'path'
+import type { Journal } from './lanes-state.ts'
 import type { InboxItem, ItemRef } from './onsen-items.ts'
 import type { ClaimStore, ItemReport, Outcome, ReportFields } from './onsen-receive.ts'
 
@@ -7,7 +8,7 @@ const intermediate = new Set<Outcome>(['in_session', 'owed', 'background', 'stuc
 const week = 7 * 86400_000
 type Claim = {
   claim_id: string; taken_at: string; session_id?: string; in_session_at?: string; last_outcome?: Outcome
-  turn?: string; registry_session?: string; conversation?: string; replies?: string[]
+  turn?: string; registry_session?: string; conversation?: string; message_id?: string; replies?: string[]
   stop?: { turn: string; at: number }
 }
 type Done = { item_id: string; claim_id: string; at: number }
@@ -29,6 +30,25 @@ export class Claims implements ClaimStore {
       this.rows = Object.assign(Object.create(null), data.claims)
       this.done = data.done ?? []
     } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
+  }
+
+  /** Older claim ledgers omitted message_id. The original delivery recorded its Item and message ids together, in album order. */
+  restoreMessageIds(journal: Journal): void {
+    const missing = new Set(this.held().filter(id => this.rows[id]!.conversation && !this.rows[id]!.message_id))
+    const count = missing.size
+    if (!count) return
+    const restore = (delivery?: { onsen_items?: ItemRef[]; person_message_ids?: string[] }) => {
+      const refs = delivery?.onsen_items, ids = delivery?.person_message_ids
+      if (!refs || !ids || refs.length !== ids.length) return
+      refs.forEach((ref, i) => {
+        if (ids[i] && missing.delete(ref.onsen_item_id)) this.rows[ref.onsen_item_id]!.message_id = ids[i]
+      })
+    }
+    for (const msg of journal.rows('msg', r => !!r.onsen_items)) restore({ onsen_items: msg.onsen_items, person_message_ids: msg.person_message_ids })
+    if (missing.size) for (const run of journal.rows('run')) {
+      for (const event of [run.ev, ...(run.extra ?? []), ...(run.steered ?? [])]) restore(event)
+    }
+    if (missing.size < count) this.save()
   }
 
   held(): string[] { return Object.keys(this.rows) }
@@ -66,7 +86,9 @@ export class Claims implements ClaimStore {
   taken(row: InboxItem, ref: ItemRef): void {
     const claim = row.claim!
     if (this.rows[row.id]?.claim_id === claim.id) return
-    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation }
+    const message = row.message_id ?? row.payload?.message_id
+    this.rows[row.id] = { claim_id: claim.id, taken_at: claim.taken_at, conversation: ref.conversation,
+      ...(message != null ? { message_id: String(message) } : {}) }
     this.save(); this.clock(row.id); this.changed()
   }
   bind(id: string, session: string, turn: string, registrySession?: string): void {
@@ -78,7 +100,8 @@ export class Claims implements ClaimStore {
   report(id: string, outcome: Outcome, fields: ReportFields = {}): void {
     const row = this.rows[id]
     if (!this.owns(id) || row.last_outcome === outcome) return
-    const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(), ...fields }
+    const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(),
+      ...(outcome === 'completed' && (row.replies || row.session_id === 'main') ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
     if (!this.spool.recordItemReport({ item_id: id, body })) throw new Error('could not spool item report for ' + id)
     this.replay({ item_id: id, body })
     this.save(); this.clock(id)
@@ -98,11 +121,13 @@ export class Claims implements ClaimStore {
     if (this.rows[id]?.claim_id === body.claim_id) delete this.rows[id]
     this.save(); this.clock(id); this.changed()
   }
-  reply(turn: string, conversation: string, message: string, registrySession?: string | null): void {
+  reply(turn: string | null | undefined, conversation: string, message: string, registrySession?: string | null, replyToMessageId?: string): void {
     let updated = false
     for (const row of Object.values(this.rows)) {
       const continued = row.last_outcome === 'background' && registrySession && row.registry_session === registrySession
-      if ((!continued && row.turn !== turn) || row.conversation !== conversation) continue
+      if (row.conversation !== conversation) continue
+      // Receipts match an explicit quote by its Onsen message id. Unquoted replies belong to the work of this turn.
+      if (replyToMessageId != null ? row.message_id !== replyToMessageId : !turn || (!continued && row.turn !== turn)) continue
       const replies = row.replies ??= []
       if (!replies.includes(message)) { replies.push(message); updated = true }
     }
@@ -127,7 +152,7 @@ export class Claims implements ClaimStore {
       if (!this.owns(id) || !row.stop || this.now() < row.stop.at + settleMs) continue
       const count = background(row.registry_session!)
       if (count == null) continue
-      this.report(id, count > 0 ? 'background' : 'completed', count > 0 ? {} : { response_message_ids: row.replies ?? [] })
+      this.report(id, count > 0 ? 'background' : 'completed')
       delete row.stop
       this.save()
     }

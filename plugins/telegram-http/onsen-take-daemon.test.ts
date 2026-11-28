@@ -133,7 +133,7 @@ async function activePerson(id: string) {
     await Bun.sleep(3100)
     writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
   }
-  return { d, row, client, offers, stop }
+  return { d, row, client, offers, hook, stop }
 }
 
 test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
@@ -148,6 +148,30 @@ test('real daemon completes an idle main person item with its reply after the fi
   expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
   expect(row.response_message_ids).toEqual([replyId])
   expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
+}, 25000)
+
+test('a mid-turn arrival and the original message each complete with only their own quote-reply', async () => {
+  const { d, row: first, client, hook, stop } = await activePerson('original-message')
+  const second = d.f.add('mid-turn-message', 'message', { message_id: '24', payload: { message_id: '24', conversation_id: 'conv', kind: 'text',
+    from: 'joey', via: 'web', text: 'mid-turn-message', client: { chat: '1', msg_id: 'form-24', user_id: '1', user: 'Joey' } } })
+  await waitFor(() => d.journal().some(r => r.rec === 'msg' && r.onsen_items?.some((i: any) => i.onsen_item_id === second.id)))
+  await hook('PostToolUse', { tool_name: 'Bash' })
+  await waitFor(() => second.claim?.session_id === 'main')
+  const responseIds: string[] = []
+  for (const row of [first, second]) {
+    const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', reply_to: row.payload.client.msg_id, text: 'answer to ' + row.id } })
+    expect(reply.isError, JSON.stringify(reply.content)).toBeFalsy()
+    const id = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
+    expect(id).toBeTruthy()
+    responseIds.push(id!)
+  }
+  const writes = d.f.calls.filter(c => c.path === '/v1/messages' && String(c.body.body).startsWith('answer to '))
+  expect(writes.map(w => w.body.reply_to_message_id)).toEqual([first.message_id, second.message_id])
+  expect(new Set(writes.map(w => w.body.turn_id)).size).toBe(1)
+  expect(responseIds[0]).not.toBe(responseIds[1])
+  await stop()
+  await waitFor(() => [first, second].every(row => row.state === 'completed'), 8000)
+  expect([first.response_message_ids, second.response_message_ids]).toEqual(responseIds.map(id => [id]))
 }, 25000)
 
 test('after 45 s without renewal the main completes its original claim with one delivery and no re-take', async () => {
