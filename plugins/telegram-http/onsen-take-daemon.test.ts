@@ -179,7 +179,7 @@ function scriptedLane(root: string) {
 }
 
 const worker = 'adam.worker.1'
-test('C5 bench: the main reply tool writes one timed promise for the test account and one notice goes to its inbox', async () => {
+test('C5 bench: the main reply tool writes one timed promise for the test account and a report at minute five produces no waiter notice', async () => {
   const jev = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ answers: { promises: { type: 'noul', noul: 0.99 } } }) })
   clean.push(async () => { await jev.stop(true) })
   const chat = '6736970916', said = '10 分鐘後回報'
@@ -199,14 +199,16 @@ test('C5 bench: the main reply tool writes one timed promise for the test accoun
   const promises = [...d.f.rows.values()].filter(r => r.kind === 'self')
   expect(promises).toHaveLength(1)
   const row = promises[0]!
-  expect(row).toMatchObject({ from: 'adam', waiter: 'joey-test', session_id: 'main', deadline: row.not_before, state: 'waiting' })
-  const due = Date.parse(row.deadline!)
+  expect(row).toMatchObject({ from: 'adam', waiter: 'joey-test', session_id: 'main', deadline: null, state: 'waiting' })
+  const due = Date.parse(row.not_before!)
   expect(due).toBeGreaterThanOrEqual(at + 600_000)
   expect(due).toBeLessThanOrEqual(Date.now() + 600_000)
-  d.f.advance(due - d.f.now() + 1); d.f.advance(60_000)
+  d.f.advance(due - d.f.now() - 300_000)
+  const report = await client.callTool({ name: 'reply', arguments: { chat_id: chat, text: '已經完成，這是結果。' } })
+  expect(report.isError).not.toBe(true)
+  d.f.advance(300_001); d.f.advance(60_000)
   const notices = [...d.f.rows.values()].filter(r => r.about_item_id === row.id)
-  expect(notices).toHaveLength(1)
-  expect(notices[0]).toMatchObject({ kind: 'notice', member: 'joey-test', reason: 'promise_due' })
+  expect(notices).toHaveLength(0)
 })
 
 test('C5 active connector schedules its own keepwarm with the legacy local switch off, including across restart', async () => {

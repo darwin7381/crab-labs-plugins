@@ -40,23 +40,41 @@ afterAll(() => {
 const selfRows = () => [...f.rows.values()].filter(r => r.kind === 'self')
 const notices = (id: string) => [...f.rows.values()].filter(r => r.kind === 'notice' && r.about_item_id === id)
 
-test('a sent Telegram promise creates one self for the test account and only Onsen notifies that waiter', async () => {
+test('a sent Telegram promise creates one self for the test account and reporting at minute five yields no notice', async () => {
   const at = Date.now()
   L.mainReplied(null, 'onsen:42', undefined, '10 分鐘後回報', '6736970916')
   L.mainReplied(null, 'onsen:42', undefined, '10 分鐘後回報', '6736970916')
   for (let i = 0; i < 100 && !selfRows().length; i++) { await Bun.sleep(10); await client.syncNow(true) }
   expect(selfRows()).toHaveLength(1)
   const row = selfRows()[0]!
-  expect(row).toMatchObject({ from: 'adam', waiter: 'joey-test', session_id: 'main', deadline: row.not_before })
-  expect(Date.parse(row.deadline!)).toBeGreaterThanOrEqual(at + 600_000)
-  expect(Date.parse(row.deadline!)).toBeLessThanOrEqual(Date.now() + 600_000)
-  f.advance(Date.parse(row.deadline!) - f.now() - 1)
-  expect(notices(row.id)).toHaveLength(0)
-  f.advance(2); L.dueTick(f.now())
+  expect(row).toMatchObject({ from: 'adam', waiter: 'joey-test', session_id: 'main', deadline: null })
+  expect(Date.parse(row.not_before!)).toBeGreaterThanOrEqual(at + 600_000)
+  expect(Date.parse(row.not_before!)).toBeLessThanOrEqual(Date.now() + 600_000)
+  f.advance(Date.parse(row.not_before!) - f.now() - 300_000)
+  L.mainReplied(null, 'onsen:43', undefined, '已經完成，這是結果。', '6736970916')
+  f.advance(300_001); L.dueTick(f.now())
   f.advance(60_000); L.dueTick(f.now())
-  expect(notices(row.id)).toHaveLength(1)
-  expect(notices(row.id)[0]).toMatchObject({ member: 'joey-test', reason: 'promise_due' })
+  expect(notices(row.id)).toHaveLength(0)
   expect(pushes).toHaveLength(0)
+})
+
+test('lane notify_joey and commitment leave timed member reminders without waiter deadlines', async () => {
+  const lane = 'adam.reflex.promise', event = 'lane-promise', thread = 'adam#lane-promise', s = L.__lanesState()
+  s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
+  s.threads[thread] = { id: thread, lane, peer: 'lilith' } as any
+  L.__events().open(event, { class: 'joey', owner: lane, thread, obligations: [{ kind: 'joey', level: 'line' }] })
+  const tok = { runId: 'lane-notify', lane, evId: event, trigger: 'joey', cls: 'joey', closers: [] } as any
+  expect(await L.callLaneTool(tok, 'notify_joey', { outcome: 'changed', text: '10 分鐘後回報' })).toContain('sent to Joey')
+  expect(await L.callLaneTool({ ...tok, runId: 'lane-commit' }, 'commitment', { who: 'lilith', what: '交圖', by: '10 分鐘後' })).toContain('commitment recorded')
+  const rows = () => selfRows().filter(r => r.session_id === lane)
+  for (let i = 0; i < 100 && rows().length < 2; i++) { await Bun.sleep(10); await client.syncNow(true) }
+  expect(rows().map(r => r.waiter).sort()).toEqual(['joey-test', 'lilith'])
+  for (const row of rows()) {
+    expect(row.not_before).toBeTruthy()
+    expect(row.deadline).toBeNull()
+    f.advance(Math.max(0, Date.parse(row.not_before!) - f.now() + 1))
+    expect(notices(row.id)).toHaveLength(0)
+  }
 })
 
 test('the main tool and a handed peer answer keep their actual waiter and finish early', async () => {
@@ -78,6 +96,14 @@ test('the main tool and a handed peer answer keep their actual waiter and finish
   f.advance(700_000)
   expect(notices(row.id)).toHaveLength(0)
   expect(notices(peer.id)).toHaveLength(0)
+
+  const missed = new Date(f.now() + 60_000).toISOString()
+  await L.callMainTool('commitment', { who: 'sable', what: '交付分析', due: missed }, 'test-main')
+  await client.syncNow(true)
+  const open = selfRows().find(r => r.waiter === 'sable')!
+  f.advance(60_001); f.advance(60_000)
+  expect(notices(open.id)).toHaveLength(1)
+  expect(notices(open.id)[0]).toMatchObject({ member: 'sable', reason: 'promise_due' })
 })
 
 test('only definite times become deadlines', () => {

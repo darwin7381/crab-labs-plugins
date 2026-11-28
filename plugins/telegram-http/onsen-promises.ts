@@ -62,7 +62,7 @@ export function projectPromises(eventId: string, obs: Ob[], writer: SelfWriter, 
     const session = commitment ? o.owner ?? 'main' : 'main'
     const due = o.due_at ?? null
     o.self = { key: 'promise:' + eventId + ':' + o.id, item: ownItem('self', session,
-      `請向 ${waiter} 回報：${o.what ?? ''}（${eventId}）`, due, waiter, due,
+      `請向 ${waiter} 回報：${o.what ?? ''}（${eventId}）`, due, waiter, commitment && (o.by === 'promise-check' || session !== 'main') ? null : due,
       refs.map(r => ({ kind: 'item', value: r.onsen_item_id }))) }
     writer(o.self)
   }
