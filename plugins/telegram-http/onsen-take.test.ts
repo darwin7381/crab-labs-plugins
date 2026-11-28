@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
@@ -261,6 +261,19 @@ test('20 s without a bind returns the offer, the same did can bind once on a new
   await r.m.pump(); expect(r.offers.length).toBe(1)
   await r.hook('UserPromptSubmit', { dids: [did] }); await r.sync()
   expect(row.claim!.id).not.toBe(first); expect(r.outcomes(row.id)).toEqual(['not_taken', 'in_session']); expect(r.offers.length).toBe(1)
+})
+
+test('automatic restart addresses only the exact configured tmux session and checks its wrapper', () => {
+  const { dir } = rig(), args = join(dir, 'tmux-args')
+  writeFileSync(join(dir, 'tmux'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$C3_ARGS"\n', { mode: 0o700 })
+  writeFileSync(join(dir, 'launchctl'), '#!/bin/sh\ntest "$1" = print && echo "state = running"\n', { mode: 0o700 })
+  const proc = Bun.spawnSync([process.execPath, '--no-env-file', '-e',
+    "import { restartClaudeTUI } from './channel-bot-control.ts'; await restartClaudeTUI(true)"], {
+    cwd: import.meta.dir, env: { ...process.env, PATH: dir, C3_ARGS: args, CHANNEL_BOT_TMUX_SESSION: 'test-c3',
+      CHANNEL_BOT_SERVICE_MANAGER: 'launchd', CHANNEL_BOT_WRAPPER_LABEL: 'fixture-only' },
+  })
+  expect(proc.stderr.toString()).toBe(''); expect(proc.exitCode).toBe(0)
+  expect(readFileSync(args, 'utf8').trim().split('\n')).toEqual(['kill-session', '-t', '=test-c3'])
 })
 
 test('the last-result check and open obligations share one owed prompt on the bound Item', async () => {
