@@ -51,6 +51,7 @@ export class Claims implements ClaimStore {
     if (missing.size < count) this.save()
   }
 
+  wasOwed(id: string): boolean { return this.rows[id]?.last_outcome === 'owed' }
   held(): string[] { return Object.keys(this.rows) }
   owns(id: string): boolean {
     const row = this.rows[id]
@@ -99,14 +100,16 @@ export class Claims implements ClaimStore {
     Object.assign(row, { session_id: session, turn, registry_session: registrySession })
     if (!row.in_session_at) this.report(id, 'in_session', { session_id: session })
   }
-  report(id: string, outcome: Outcome, fields: ReportFields = {}): void {
+  report(id: string, outcome: Outcome, fields: ReportFields = {}): boolean {
     const row = this.rows[id]
-    if (!this.owns(id) || row.last_outcome === outcome) return
+    if (!this.owns(id)) return false
+    if (row.last_outcome === outcome) return true
     const body = { claim_id: row.claim_id, outcome, at: new Date(this.now()).toISOString(),
-      ...(outcome === 'completed' && (row.replies || row.session_id === 'main') ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
+      ...(outcome === 'completed' ? { response_message_ids: row.replies ?? [] } : {}), ...fields }
     if (!this.spool.recordItemReport({ item_id: id, body })) throw new Error('could not spool item report for ' + id)
     this.replay({ item_id: id, body })
     this.save(); this.clock(id)
+    return true
   }
   /** Restore a line appended before a crash between the spool append and ledger rename. */
   replay({ item_id: id, body }: ItemReport): void {

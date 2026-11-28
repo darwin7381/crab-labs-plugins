@@ -16,16 +16,19 @@ export function takeRefusal(o: { inbox: boolean; roamer: boolean; lanes: boolean
 /** The connector parameter distinguishes this probe from a normal member inbox read. */
 export async function deliveryMode(req: ActionReq, path: string, connector: string) {
   const r = await req('GET', path + '?' + new URLSearchParams({ limit: '1', connector }), undefined, 5000).catch(() => null)
-  return { take: r?.status === 200, status: r?.status, asOf: Date.parse(r?.json?.as_of) }
+  return { take: r?.status === 200, status: r?.status, code: r?.json?.error?.code, asOf: Date.parse(r?.json?.as_of) }
 }
 
 export type ItemRequest = OnsenClient['request']
+
+/** The C1 member-mode check used by the local delivery and notification gates. */
+export function takeModeActive(mode?: Pick<TakeMode, 'active'>): boolean { return mode?.active === true }
 
 export class TakeMode {
   readonly path: string
   readonly connector: string
   checking = true
-  active = false
+  active = false  // member delivery mode; pausing this connector does not switch the member to pull
   observationRequired = false
   private stopped = false
   private timer?: ReturnType<typeof setTimeout>
@@ -33,25 +36,32 @@ export class TakeMode {
   private offset = 0
   readonly now = () => Date.now() + this.offset
 
-  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (active: boolean) => void,
+  constructor(readonly member: string, readonly req: ItemRequest, readonly changed: (canReceive: boolean) => void,
     readonly log: (line: string) => void, machine = machineName(),
     readonly later = (fn: () => void, ms: number) => setTimeout(fn, ms)) {
     this.path = '/v1/members/' + encodeURIComponent(member) + '/items'
     this.connector = machine + '/' + member
   }
 
+  get canReceive(): boolean { return this.active && !this.stopped && !this.reason }
+
   async probe(): Promise<void> {
     const mode = await deliveryMode(this.req, this.path, this.connector)
     if (this.stopped) return
     this.checking = false
-    if (!mode.take) {
-      if (this.reason === 'not_current_connector') this.pause(this.reason, 45_000)
-      else this.pause('mode probe: ' + (mode.status ? 'HTTP ' + mode.status : 'no response'), 60_000)
+    if (mode.status === 409 && mode.code === 'not_current_connector') {
+      this.active = true
+      this.pause(mode.code, 45_000)
       return
     }
+    if (this.active && (!mode.status || mode.status >= 500)) { this.pause('mode probe unavailable', 60_000); return }
+    this.active = mode.take
+    if (!this.active) { this.pause('mode probe: ' + (mode.status ? 'HTTP ' + mode.status : 'no response'), 60_000); return }
+    clearTimeout(this.timer)
+    this.timer = undefined
     if (Number.isFinite(mode.asOf)) this.offset = mode.asOf - Date.now()
     this.reason = ''
-    this.active = this.observationRequired = true
+    this.observationRequired = true
     this.log('onsen take: started ' + this.connector)
     this.changed(true)
   }
@@ -59,16 +69,18 @@ export class TakeMode {
   pause(reason: string, ms: number): void {
     if (this.stopped) return
     if (this.reason === reason && this.timer) return
-    if (reason !== this.reason) this.log('onsen take: ' + reason)
-    this.reason = reason
-    if (this.active) { this.active = false; this.changed(false) }
+    if (reason !== this.reason) {
+      this.log('onsen take: ' + reason)
+      this.reason = reason
+      this.changed(false)
+    }
     clearTimeout(this.timer)
     this.timer = this.later(() => { this.timer = undefined; void this.probe() }, ms)
     this.timer.unref()
   }
 
   stop(): void {
-    this.stopped = true
+    this.stopped = this.checking = true
     clearTimeout(this.timer)
     if (this.active) { this.active = false; this.changed(false) }
   }

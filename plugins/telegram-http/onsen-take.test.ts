@@ -1,15 +1,15 @@
 import { afterEach, expect, spyOn, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
-import { deliveryMode, machineName, takeRefusal, TakeMode } from './onsen-take.ts'
+import { deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
 import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver, type Outcome } from './onsen-receive.ts'
-import { createMain, MAIN_IDLE_CONFIRM_MS, MAIN_STUCK_MS, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
+import { createMain, MAIN_IDLE_CONFIRM_MS, MAIN_STUCK_MS, toolSilenceMs, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
 import { Journal } from './lanes-state.ts'
 import { Registry, REGISTRY_SETTLE_MS } from './onsen-status.ts'
 
@@ -35,18 +35,23 @@ function rig() {
   return { f, client, mode, claims, file, receiver, dir, logs, misses, deadlines, outcomes, sync: () => client.syncNow(true),
     attach(m: MainApi) { main = m } }
 }
-async function mainRig(backoff = 300_000, onOffer = async () => true) {
+async function mainRig({ backoff = 300_000, onOffer = async () => true, restart, pid = 1051 }: {
+  backoff?: number; onOffer?: () => Promise<boolean>; restart?: (retryPid?: number) => Promise<void>; pid?: number
+} = {}) {
   const r = rig()
   await r.mode.probe()
   const journal = new Journal(join(r.dir, 'state.jsonl')), offers: any[] = [], notices: string[] = []
-  const sid = crypto.randomUUID(), pid = 1051
-  let member = 'idle', bg = 0, owes = false, wall: MainWall | null = null
+  const sid = crypto.randomUUID()
+  let oldPidAlive = true
+  const restarts: string[] = []
+  let member = 'idle', bg = 0, owes: boolean | string = false, wall: MainWall | null = null
   const writer = { write: (write: import('./onsen-item-writes.ts').ItemWrite) => { r.client.recordItemWrite(write); r.client.start() } }
   const m = createMain({ journal, agent: 'adam', takingItems: () => r.mode.active, writeItem: write => writer.write(write), writtenItemId: key => r.client.writtenItemId(key), itemReceiver: () => r.receiver, log: () => {}, offer: async n => { offers.push(n); return onOffer() },
     wallBackoff: () => backoff, registry: { mainForAdoption: () => null, backgroundAgents: () => bg },
-    streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: () => true, context: () => '', info: () => null,
-    genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {}, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
-    mainOwed: ids => owes ? ids.map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })) : [], usageWall: () => wall })
+    streamOpen: () => true, memberState: () => member, expectedSession: () => [sid], pidAlive: n => n !== pid || oldPidAlive, context: () => '', info: () => null,
+    genChanged: () => {}, refused: () => {}, done: () => {}, undone: () => {},
+    restartSession: async retryPid => { restarts.push(sid); await restart?.(retryPid); return sid }, tellJoey: (_s, rule) => notices.push(rule), genuineAfter: () => 1,
+    mainOwed: ids => ids.filter(id => owes === true || owes === id).map(id => ({ id, from: 'joey', text: id, owes: ['reply'] })), usageWall: () => wall })
   r.client.watchItemWrites(m.itemWriteSettled)
   m.initMain(); r.attach(m)
   const hook = (event: string, data: Partial<MainEvent> = {}) => m.mainEvent({ event, pid, session_id: sid, prompt_id: 'turn', ...data })
@@ -54,15 +59,15 @@ async function mainRig(backoff = 300_000, onOffer = async () => true) {
   const enqueue = (row: InboxItem, old = false) => m.enqueue(row.kind === 'message' ? 'joey' : 'peer',
     { method: 'notifications/claude/channel', params: { content: row.payload.text, meta: { chat_id: '1', message_id: String(row.number), user: row.from } } },
     { event: row.id, fields: old ? {} : { onsen_items: [itemRef(row)], person_message_ids: row.message_id ? [row.message_id] : [] } })
-  const bind = async (row: InboxItem) => {
+  const bind = async (row: InboxItem, prompt = 'turn') => {
     const did = enqueue(row)
     await until(() => m.items(x => x.id === did)[0]?.state === 'offered')
-    await hook('UserPromptSubmit', { dids: [did] }); await r.sync()
+    await hook('UserPromptSubmit', { dids: [did], prompt_id: prompt }); await r.sync()
     expect(r.outcomes(row.id)).toContain('in_session')
     return did
   }
-  return { ...r, writer, m, journal, offers, notices, hook, enqueue, bind, sid, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
-    owing(value: boolean) { owes = value } }
+  return { ...r, writer, m, journal, offers, notices, restarts, hook, enqueue, bind, sid, oldPidExited() { oldPidAlive = false }, setWall(value: MainWall | null) { wall = value }, status(s: string, n = 0) { member = s; bg = n; r.claims.statusRecord(s, () => bg, REGISTRY_SETTLE_MS) },
+    owing(value: boolean | string) { owes = value } }
 }
 
 test('loopback list and detail match the captured 0.40.0 envelopes and add the S2 fields', async () => {
@@ -97,7 +102,7 @@ test('loopback list and detail match the captured 0.40.0 envelopes and add the S
 })
 
 test('C4 a bare model error writes one resume; the normal peek takes it when due, with the WO-209 sentence', async () => {
-  const r = await mainRig(250)
+  const r = await mainRig({ backoff: 250 })
   await r.hook('UserPromptSubmit')
   const earliest = Date.now() + 250
   await r.hook('StopFailure', { error: 'overloaded' })
@@ -183,7 +188,7 @@ test('C4 a process cut records the old background count; an item failure and an 
 })
 
 async function accountCut(onOffer?: () => Promise<boolean>) {
-  const r = await mainRig(undefined, onOffer)
+  const r = await mainRig({ onOffer })
   r.setWall({ walled: true, clearedMs: null })
   await r.hook('UserPromptSubmit')
   await r.hook('StopFailure', { error: 'rate_limit' })
@@ -206,7 +211,7 @@ test('C4 switch to take imports an unsent pull cut, and waits for a pull stream 
   expect(pending.offers).toHaveLength(0)
 
   let finish!: (sent: boolean) => void
-  const writing = await mainRig(0, () => new Promise(resolve => { finish = resolve }))
+  const writing = await mainRig({ backoff: 0, onOffer: () => new Promise(resolve => { finish = resolve }) })
   writing.mode.pause('pull', 60_000)
   await writing.hook('UserPromptSubmit')
   await writing.hook('StopFailure', { error: 'overloaded' })
@@ -1103,6 +1108,25 @@ test('batched mail waits in Onsen and rides the next M1 take or leads after the 
   }
 })
 
+test('a peer’s waiting calls share one take; its later call waits for the next main turn', async () => {
+  const r = await mainRig()
+  r.status('busy')
+  const calls = ['first', 'second', 'later'].map(id => r.f.add(id, 'call', { from: 'eve' }))
+  const dids = calls.slice(0, 2).map(row => r.enqueue(row))
+  await r.sync()
+  r.status('idle'); await r.m.pump()
+  await until(() => r.m.items(row => row.state === 'offered').length === 2)
+  expect(r.f.calls.filter(c => c.path.endsWith('/take')).map(c => c.body.item_ids)).toEqual([['first', 'second']])
+  await r.hook('UserPromptSubmit', { dids }); await r.sync()
+  r.enqueue(calls[2]); r.status('busy')
+  await r.hook('PostToolUse', { tool_name: 'Read' }); await r.sync()
+  expect(calls[2].state).toBe('waiting')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(calls.slice(0, 2).map(row => row.state)).toEqual(['completed', 'completed'])
+  await r.m.pump()
+  await until(() => r.f.calls.some(c => c.body.item_ids?.includes('later')))
+})
+
 test('while busy mail waits, a person binds inside PostToolUse, pre-switch work finishes without an item report', async () => {
   const r = await mainRig(), old = r.f.add('legacy'), mail = r.f.add('mail', 'mail'), message = r.f.add('person')
   old.state = 'completed'
@@ -1180,6 +1204,116 @@ test('20 s without a bind returns the offer, the same did can bind once on a new
   await r.m.pump(); expect(r.offers.length).toBe(1)
   await r.hook('UserPromptSubmit', { dids: [did] }); await r.sync()
   expect(row.claim!.id).not.toBe(first); expect(r.outcomes(row.id)).toEqual(['not_taken', 'in_session']); expect(r.offers.length).toBe(1)
+})
+
+test('automatic restart addresses only the exact configured tmux session and checks its wrapper', () => {
+  const { dir } = rig(), args = join(dir, 'tmux-args')
+  writeFileSync(join(dir, 'tmux'), '#!/bin/sh\nprintf "%s\\n" "$@" > "$C3_ARGS"\n', { mode: 0o700 })
+  writeFileSync(join(dir, 'launchctl'), '#!/bin/sh\ntest "$1" = print && echo "state = running"\n', { mode: 0o700 })
+  const proc = Bun.spawnSync([process.execPath, '--no-env-file', '-e',
+    "import { restartClaudeTUI } from './channel-bot-control.ts'; await restartClaudeTUI(true)"], {
+    cwd: import.meta.dir, env: { ...process.env, PATH: dir, C3_ARGS: args, CHANNEL_BOT_TMUX_SESSION: 'test-c3',
+      CHANNEL_BOT_SERVICE_MANAGER: 'launchd', CHANNEL_BOT_WRAPPER_LABEL: 'fixture-only' },
+  })
+  expect(proc.stderr.toString()).toBe(''); expect(proc.exitCode).toBe(0)
+  expect(readFileSync(args, 'utf8').trim().split('\n')).toEqual(['kill-session', '-t', '=test-c3'])
+  writeFileSync(join(dir, 'tmux'), '#!/bin/sh\nexit 1\n')
+  const missing = Bun.spawnSync([process.execPath, '--no-env-file', '-e',
+    "import { restartClaudeTUI } from './channel-bot-control.ts'; await restartClaudeTUI(true)"], {
+    cwd: import.meta.dir, env: { ...process.env, PATH: dir, CHANNEL_BOT_TMUX_SESSION: 'test-c3', CHANNEL_BOT_WRAPPER_LABEL: 'fixture-only' },
+  })
+  expect(missing.exitCode).not.toBe(0)
+  expect(missing.stderr.toString()).toContain('tmux kill-session =test-c3 failed (1)')
+
+})
+
+test('the last-result check and open obligations share one owed prompt on the bound Item', async () => {
+  const r = await mainRig(), row = r.f.add('work-after-reply')
+  await r.bind(row)
+  const check = await r.hook('Stop')
+  expect(check.item_stop).toBe('check')
+  const owed = { phase: 'owed' as const, owed_mids: [check.items![0].mid] }
+  expect((await r.hook('Stop', { ...owed, owed_mids: ['not-this-turn'] })).accepted).toBeUndefined()
+  expect((await r.hook('Stop', owed)).accepted).toBe(true)
+  expect((await r.hook('Stop', owed)).accepted).toBeUndefined()
+  r.owing(true)
+  const next = await r.hook('Stop')
+  expect(next.block).toBeUndefined(); expect(next.item_stop).toBe('done')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'owed', 'completed'])
+  expect(row.reason).toBe('not_answered')
+  await r.hook('UserPromptSubmit', { prompt_id: 'empty' })
+  expect((await r.hook('Stop', { prompt_id: 'empty' })).block).toBeUndefined()
+})
+
+for (const structural of [false, true]) test('the Stop hook combines a missed answer and an unsent result, existing hold=' + structural, () => {
+  const r = rig()
+  const script = `
+import importlib.util, io, json, os, sys
+from unittest.mock import patch
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, 'lanes-hooks/' + name + '.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+hook, gate = load('main-hook'), load('main-answered-gate')
+items = [{'mid': name, 'user': name, 'kind': 'tg', 'no_reply': False, 'system': False, 'body': body}
+         for name, body in [('eve', 'report the result'), ('adam', 'when is the deadline?')]]
+turn = {'prompt_id': 'p', 'calls': [{'name': 'mcp__reply'}, {'name': 'Read'}]}
+payload = {'hook_event_name': 'Stop', 'session_id': 's', 'prompt_id': 'p',
+           'last_assistant_message': 'There were 194 failed requests in the logs across twenty pages.'}
+phases, printed = [], []
+def post(b, timeout):
+    phases.append(b['phase'])
+    if b['phase'] == 'owed':
+        assert b['owed_mids'] == ['adam', 'eve']
+        return {} if ${structural ? 'True' : 'False'} else {'accepted': True}
+    return {'block': 'existing obligation' if ${structural ? 'True' : 'False'} and 'owed' not in phases else None,
+            'item_stop': 'done' if 'owed' in phases else 'check', 'items': items,
+            'turn': turn, 'outputs': [{'to': 'eve', 'reply_to': 'eve', 'text': 'Looking up the logs.'}]}
+def aid(file, fn, *args):
+    return gate.take_owed(*args) if fn == 'take_owed' else None
+with patch.object(hook, 'post', post), patch.object(hook, 'out', printed.append), patch.object(hook, 'aid', aid), \\
+     patch.object(gate, 'ask', lambda state, questions: {k: {'noul': 1 if k.endswith('reply_needed') else 0} for k in questions}), \
+     patch.object(gate, 'unsent_p', lambda msgs, outs, final: 1 if msgs[0]['user'] == 'eve' else 0):
+    for _ in range(2):
+        with patch.object(sys, 'stdin', io.StringIO(json.dumps(payload))):
+            hook.main()
+assert 'when is the deadline?' in printed[0]['reason'] and gate.UNSENT_WORDS in printed[0]['reason']
+assert ('existing obligation' in printed[0]['reason']) == ${structural ? 'True' : 'False'}
+print(json.dumps([phases, len(printed), bool(os.path.exists(os.path.join(os.environ['LANES_DIR'], 'run', 'answered-gate.json')))]))
+`
+  const proc = Bun.spawnSync(['python3', '-B', '-c', script], { cwd: import.meta.dir, env: { ...process.env, LANES_DIR: r.dir } })
+  expect(proc.stderr.toString()).toBe('')
+  expect(proc.exitCode).toBe(0)
+  expect(JSON.parse(proc.stdout.toString())).toEqual([['check', 'owed', 'check', 'final'], 1, false])
+})
+
+test('the content check adds the missed claim to an existing obligation in the same Stop', async () => {
+  const r = await mainRig(), a = r.f.add('explicit-obligation'), b = r.f.add('missed-content')
+  await r.bind(a); r.status('busy'); r.enqueue(b); await r.hook('PostToolUse')
+  r.owing(a.id)
+  const check = await r.hook('Stop')
+  expect(check.block).toContain(a.id)
+  expect(check.item_stop).toBe('check')
+  await r.hook('Stop', { phase: 'owed', owed_mids: [String(b.number)] })
+  expect((await r.hook('Stop')).item_stop).toBe('done')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  for (const row of [a, b]) expect(r.outcomes(row.id)).toEqual(['in_session', 'owed', 'completed'])
+})
+
+test('a missed pre-switch message can hold one Stop without claiming it', async () => {
+  const r = await mainRig(), local = r.f.add('legacy'), owned = r.f.add('owned')
+  await r.bind(owned)
+  r.status('busy'); r.enqueue(local, true); await r.hook('PostToolUse')
+  const check = await r.hook('Stop')
+  expect(check.items?.length).toBe(2)
+  const mids = [String(local.number)]
+  expect((await r.hook('Stop', { phase: 'owed', owed_mids: mids })).accepted).toBe(true)
+  expect((await r.hook('Stop')).item_stop).toBe('done')
+  await r.hook('Stop', { phase: 'final' }); r.f.advance(4000); r.status('idle'); await r.sync()
+  expect(r.outcomes(local.id)).toEqual([])
+  expect(r.outcomes(owned.id)).toEqual(['in_session', 'completed'])
 })
 
 test('a later hook reopens a final Stop; owed and background remain claimed through the next session Stop', async () => {
@@ -1350,27 +1484,234 @@ test('a foreign connector pauses all receives for 45 s and keeps the observation
   await deliveryMode(mode.req, mode.path, 'other/adam')
   const receiver = new ItemReceiver(mode, r.claims, () => {}), row = r.f.add('ownership')
   await receiver.receive([itemRef(row)])
-  expect(interval).toBe(45_000); expect(mode.active).toBe(false); expect(mode.observationRequired).toBe(true)
+  expect(interval).toBe(45_000); expect(takeModeActive(mode)).toBe(true); expect(mode.canReceive).toBe(false); expect(mode.observationRequired).toBe(true)
   const calls = r.f.calls.length
   await receiver.receive([itemRef(row)])
   const peek = new ItemPeek(mode, () => new Map(), async () => {}, () => true)
   await peek.poll(); expect(r.f.calls.length).toBe(calls)
   expect(r.logs.filter(s => s.includes('not_current_connector'))).toHaveLength(1)
-  r.f.advance(45_001); retry!(); await until(() => mode.active)
+  await mode.probe()  // the other connector still owns the take member
+  expect(takeModeActive(mode)).toBe(true); expect(mode.canReceive).toBe(false)
+  r.f.advance(45_001); retry!(); await until(() => mode.canReceive)
   expect([...(await receiver.receive([itemRef(row)])).given]).toEqual(['ownership'])
 })
 
-test('M2 stuck is intermediate, the lease remains open and the final Stop completes it', async () => {
-  const r = await mainRig(), row = r.f.add('stuck')
-  await r.bind(row); r.status('busy')
-  await r.m.tick(Date.now() + MAIN_STUCK_MS + 1000); await r.sync()
-  expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck']); expect(r.claims.held()).toEqual(['stuck'])
-  await r.hook('Stop', { phase: 'final' }); r.f.advance(3100); r.status('idle'); await r.sync()
+test('a 409 pause keeps the take gate until the probe confirms pull', async () => {
+  const r = rig(), transitions: Array<[boolean, boolean]> = []
+  const mode = new TakeMode('adam', r.mode.req, ready => transitions.push([takeModeActive(mode), ready]), () => {}, 'mac-mini')
+  clean.push(() => mode.stop())
+  await mode.probe()
+  r.f.mode(409)
+  await new ItemReceiver(mode, r.claims, () => {}).receive([itemRef(r.f.add('changed-mode'))])
+  expect(transitions).toEqual([[true, true], [true, false]])
+  r.f.down(true); await mode.probe()
+  expect(takeModeActive(mode)).toBe(true)
+  expect(mode.canReceive).toBe(false)
+  r.f.down(false); await mode.probe()
+  expect(transitions.at(-1)).toEqual([false, false])
+  r.f.mode(200); await mode.probe()
+  expect(transitions.at(-1)).toEqual([true, true])
+})
+
+test('take tools respect declared timeouts and open remote calls remain active until their result', () => {
+  expect(toolSilenceMs(24000, 'mcp__lab__read')).toBe(30000)
+  expect(toolSilenceMs(800, 'WebFetch')).toBe(1000)
+  expect(toolSilenceMs(undefined, 'mcp__lab__read')).toBe(Infinity)
+  expect(toolSilenceMs(undefined, 'WebFetch')).toBe(Infinity)
+  expect(toolSilenceMs(undefined, 'Read')).toBe(0)
+})
+
+test('one stuck turn reports each claim, restarts once, then cuts with one failure per Item', async () => {
+  const r = await mainRig(), a = r.f.add('stuck'), b = r.f.add('rider', 'call')
+  await r.bind(a)
+  r.status('busy'); r.enqueue(b); await r.hook('PostToolUse')
+  const late = Date.now() + MAIN_STUCK_MS + 1000
+  for (const blocker of ['waiting', 'compacting', 'starting']) {
+    r.status(blocker); await r.m.tick(late)
+  }
+  expect(r.restarts).toHaveLength(0)
+  r.status('stuck')
+  await Promise.all([r.m.tick(late), r.m.tick(late + 1)])
+  await r.sync()
+  expect(r.restarts).toEqual([r.sid])
+  expect(r.claims.held().sort()).toEqual(['rider', 'stuck'])
+  await r.hook('SessionEnd'); expect(r.m.currentGen()?.item_restart).toBe('stuck')
+  r.oldPidExited(); await r.m.tick(late + 5000); await r.sync()
+  for (const row of [a, b]) {
+    expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck', 'cut'])
+    expect(r.f.history.find(h => h.item_id === row.id && h.body.outcome === 'cut')?.body.note).toBe('卡住重開')
+    expect(row.failures).toBe(1)
+  }
+  expect(r.notices).toEqual([])
+})
+
+test('a surviving pid unlocks hooks and a failed restart retries until the old pid exits', async () => {
+  const targets: (number | undefined)[] = []
+  let failWrapper!: (reason: Error) => void
+  const r = await mainRig({ restart: async pid => {
+    targets.push(pid)
+    if (pid === undefined) await new Promise<void>((_, reject) => { failWrapper = reject })
+    if (targets.length === 2) throw Error('signal failed')
+  } })
+  const row = r.f.add('surviving-pid')
+  await r.bind(row)
+  const late = Date.now() + MAIN_STUCK_MS + 100
+  const first = r.m.tick(late)
+  await until(() => targets.length === 1)
+  await r.m.tick(late + 4999)
+  expect(r.m.currentGen()?.item_restart).toBe('stuck')
+  await r.m.tick(late + 5000)
+  expect(r.m.currentGen()?.item_restart).toBeUndefined()
+  failWrapper(Error('wrapper check failed after the session closed')); await first
+  expect(r.m.currentGen()?.item_restart_retry).toBe('stuck')
+  await r.m.tick(late + 10000)
+  await r.hook('SessionEnd')
+  expect(r.m.currentGen()?.item_restart_retry).toBe('stuck')
+  expect(r.m.currentGen()?.item_restart).toBeUndefined()
+  await r.m.tick(late + 15000)
+  expect(targets).toEqual([undefined, 1051, 1051])
+  r.oldPidExited(); await r.m.tick(late + 20000); await r.sync()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck', 'cut'])
+  expect(r.f.history.at(-1)?.body.note).toBe('卡住重開')
+})
+
+test('a restart retry sends TERM then KILL to the lingering PID and leaves the replacement tmux session alive', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'restart-retry-'))
+  const signals = join(dir, 'signals'), pane = join(dir, 'pane-pid'), kills = join(dir, 'session-kills')
+  const old = Bun.spawn([process.execPath, '--no-env-file', '-e', `
+    import { appendFileSync } from 'fs'
+    const log = text => appendFileSync(process.env.SIGNAL_LOG, text + '\\n')
+    for (const signal of ['SIGHUP', 'SIGTERM']) process.on(signal, () => log(signal))
+    log('ready')
+    setInterval(() => {}, 60_000)
+  `], { env: { ...process.env, SIGNAL_LOG: signals } })
+  const fresh = Bun.spawn(['sleep', '60'])
+  try {
+    await until(() => existsSync(signals))
+    writeFileSync(pane, old.pid + '\n')
+    writeFileSync(join(dir, 'tmux'), `#!/bin/sh
+set -eu
+test "$*" = 'kill-session -t =test-c3'
+read -r pid < "$PANE"
+echo "$pid" >> "$KILLS"
+kill -HUP "$pid"
+echo "$FRESH" > "$PANE"
+`, { mode: 0o700 })
+    const wrapperChecks = join(dir, 'wrapper-checks')
+    writeFileSync(join(dir, 'launchctl'), '#!/bin/sh\ntest "$1" = print || exit 1\necho "$1" >> "$CHECKS"\necho "state = running"\n', { mode: 0o700 })
+    const r = await mainRig({ restart: async retryPid => {
+      const proc = Bun.spawn([process.execPath, '--no-env-file', '-e',
+        "import { restartClaudeTUI } from './channel-bot-control.ts'; await restartClaudeTUI(true, " + retryPid + ")"], {
+        cwd: import.meta.dir, stderr: 'pipe', env: { ...process.env, PATH: dir, PANE: pane, KILLS: kills, FRESH: String(fresh.pid), CHECKS: wrapperChecks,
+          CHANNEL_BOT_TMUX_SESSION: 'test-c3', CHANNEL_BOT_SERVICE_MANAGER: 'launchd', CHANNEL_BOT_WRAPPER_LABEL: 'fixture-only' },
+      })
+      if (await proc.exited !== 0) throw Error(await new Response(proc.stderr).text())
+    }, pid: old.pid })
+    const row = r.f.add('lingering-pid')
+    await r.bind(row)
+    const late = Date.now() + MAIN_STUCK_MS + 100
+    await r.m.tick(late)
+    await until(() => readFileSync(signals, 'utf8').includes('SIGHUP'))
+    expect(readFileSync(pane, 'utf8').trim()).toBe(String(fresh.pid))
+    expect(old.exitCode).toBeNull()
+    await r.m.tick(late + 5000)
+    const retryAt = Date.now(), exitedAt = old.exited.then(() => Date.now())
+    const retry = r.m.tick(late + 10000)
+    await until(() => readFileSync(signals, 'utf8').includes('SIGTERM'))
+    await r.hook('SessionStart', { pid: fresh.pid, source: 'startup' })
+    expect(old.exitCode).toBeNull()
+    await retry
+    await until(() => old.signalCode === 'SIGKILL')
+    expect((await exitedAt) - retryAt).toBeGreaterThanOrEqual(3_000)
+    expect(readFileSync(kills, 'utf8').trim()).toBe(String(old.pid))
+    expect(readFileSync(wrapperChecks, 'utf8').trim().split('\n')).toEqual(['print', 'print'])
+    expect(fresh.exitCode).toBeNull()
+    expect(r.m.currentGen()?.pid).toBe(fresh.pid)
+    r.oldPidExited(); await r.m.tick(late + 15000); await r.sync()
+    expect(r.outcomes(row.id)).toEqual(['in_session', 'stuck', 'cut'])
+  } finally {
+    old.kill('SIGKILL'); fresh.kill('SIGKILL')
+    await Promise.all([old.exited, fresh.exited])
+    rmSync(dir, { recursive: true, force: true })
+  }
+}, 12000)
+
+test('the surviving main can make progress after the failed restart', async () => {
+  const targets: (number | undefined)[] = []
+  const r = await mainRig({ restart: async pid => { targets.push(pid) } }), row = r.f.add('still-working')
+  await r.bind(row)
+  const late = Date.now() + MAIN_STUCK_MS + 100
+  await r.m.tick(late); await r.m.tick(late + 5000)
+  await r.hook('PreToolUse', { tool_name: 'Read' })
+  expect(r.m.currentGen()?.tool_open).toBe('Read')
+  await r.m.tick()
+  expect(targets).toEqual([undefined])
+  await r.m.tick(late + 10000)
+  expect(targets).toEqual([undefined, 1051])
+})
+
+for (const source of ['typed', 'pull', 'returned'] as const) test('a silent main with no claim to report stays alive: ' + source, async () => {
+  const r = await mainRig(), row = r.f.add('unowned')
+  if (source === 'returned') {
+    await r.bind(row)
+    r.receiver.report([itemRef(row)], 'reassigned')
+    await r.sync()
+  } else {
+    const dids = source === 'pull' ? [r.enqueue(row, true)] : []
+    if (dids.length) await until(() => r.m.items(x => x.id === dids[0])[0]?.state === 'offered')
+    await r.hook('UserPromptSubmit', { dids })
+  }
+  expect(r.m.currentGen()?.state).toBe('in_turn')
+  await r.m.tick(Date.now() + MAIN_STUCK_MS + 1_000); await r.sync()
+  expect(r.restarts).toHaveLength(0)
+  expect(r.outcomes(row.id)).not.toContain('stuck')
+  expect(r.m.currentGen()?.item_restart).toBeUndefined()
+})
+
+test('Onsen parks on the third error and releases once after another Item completes', async () => {
+  const r = await mainRig(), row = r.f.add('failing')
+  for (let i = 1; i <= 3; i++) {
+    const prompt_id = 'failure-' + i
+    await r.bind(row, prompt_id); await r.hook('StopFailure', { prompt_id, error: 'server_error' }); await r.sync()
+    expect(row.failures).toBe(i)
+    expect(r.m.items(m => m.fails || m.fail_retry_at || m.fail_released)).toHaveLength(0)
+    r.f.advance(i * 300_000 + 1)
+  }
+  expect(row.reason).toBe('parked')
+  expect((await r.receiver.receive([itemRef(row)])).given.size).toBe(0)
+  const good = r.f.add('good')
+  await r.bind(good); await r.hook('Stop', { phase: 'final' })
+  r.f.advance(3100); r.status('idle'); await r.sync()
+  expect(row.released).toBe(true)
+  await r.bind(row, 'released'); await r.hook('StopFailure', { prompt_id: 'released', error: 'server_error' }); await r.sync()
+  expect(row.reason).toBe('gave_up')
+  expect(row.events.filter(e => e.kind === 'released')).toHaveLength(1)
+  expect(r.notices).toEqual([])
+})
+
+test('a waiting person’s original row records one limit and completes after recovery with zero connector notices', async () => {
+  const r = await mainRig(), row = r.f.add('person-at-limit')
+  await r.bind(row)
+  r.setWall({ walled: true, clearedMs: null, lastWallMs: Date.now() })
+  await r.hook('StopFailure', { error: 'rate_limit' }); await r.sync()
+  expect([row.state, row.reason, row.failures]).toEqual(['waiting', 'usage_limit', 0])
+  const did = r.enqueue(row)
+  await r.m.tick(); await r.m.tick()
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'usage_limit'])
+  r.setWall({ walled: false, clearedMs: Date.now() + 1000 })
+  await r.m.pump()
+  await until(() => r.m.items(x => x.id === did)[0].state === 'offered')
+  await r.hook('UserPromptSubmit', { dids: [did], prompt_id: 'recovered' })
+  await r.hook('Stop', { phase: 'final', prompt_id: 'recovered' })
+  r.f.advance(4000); r.status('idle'); await r.sync()
   expect(row.state).toBe('completed')
+  expect(r.outcomes(row.id)).toEqual(['in_session', 'usage_limit', 'in_session', 'completed'])
+  expect(r.notices).toEqual([])
 })
 
 test('walled main leaves mail and person waiting, keeper-clear probe reports the reset time when refused', async () => {
-  const r = await mainRig(), first = r.f.add('first'), mail = r.f.add('blocked-mail', 'mail'), person = r.f.add('probe')
+  const targets: (number | undefined)[] = []
+  const r = await mainRig({ restart: async pid => { targets.push(pid) } }), first = r.f.add('first'), mail = r.f.add('blocked-mail', 'mail'), person = r.f.add('probe')
   await r.bind(first)
   const reset = new Date(r.f.now() + 60_000).toISOString()
   r.setWall({ walled: true, clearedMs: null, lastWallMs: Date.now(), resets_at: reset })
@@ -1382,7 +1723,19 @@ test('walled main leaves mail and person waiting, keeper-clear probe reports the
   await r.m.pump(); await r.hook('UserPromptSubmit', { dids: [did], prompt_id: 'probe' })
   await r.hook('StopFailure', { prompt_id: 'probe', error: 'rate_limit' }); await r.sync()
   expect(r.outcomes(person.id)).toEqual(['in_session', 'usage_limit_probe'])
+  expect(r.restarts).toEqual([r.sid]); expect(r.notices).toEqual([])
   expect(r.f.history.at(-1)!.body.retry_after).toBe(reset); expect(mail.state).toBe('waiting')
+  const restartAt = r.m.currentGen()!.item_restart_at
+  await r.m.tick(restartAt + 5000); await r.m.tick(restartAt + 10000)
+  expect(targets).toEqual([undefined, 1051])
+  r.oldPidExited(); await r.m.tick()
+  await r.hook('SessionStart', { pid: 1052, source: 'startup' })
+  await r.m.pump(); await r.sync()
+  expect(r.m.currentGen()?.state).toBe('walled')
+  expect(mail.claim).toBeNull()
+  r.setWall({ walled: false, clearedMs: Date.now() + 5000 })
+  await r.m.pump()
+  await until(() => !!mail.claim)
 })
 
 test('one album offer acquires its three rows in one request and sends one notification', async () => {

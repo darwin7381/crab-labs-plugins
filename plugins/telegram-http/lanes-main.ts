@@ -39,7 +39,8 @@ export type EndReason = 'asked' | 'killed' | 'exited' | 'replaced'
 /** WO-215: SessionEnd reasons that end a session while its process goes on (Claude Code hooks: /clear, an in-session /resume) */
 const SESSION_SWITCH: ReadonlySet<string> = new Set(['clear', 'resume'])
 
-import type { ItemRef } from './onsen-items.ts'
+import { callSenders, hasCallFrom, type ItemRef } from './onsen-items.ts'
+import { takeModeActive } from './onsen-take.ts'
 import type { ItemReceiver, Outcome, ReportFields } from './onsen-receive.ts'
 import { ACCOUNT_WALL, ResumeItems, resumeNotification, resumeText, type CutTurn, type ResumeLine } from './onsen-resume.ts'
 
@@ -48,6 +49,7 @@ export type MainEnv = {
   writeItem?: import('./onsen-item-writes.ts').ItemWriter
   writtenItemId?: (key: string) => string | undefined
   itemReceiver?: () => ItemReceiver | undefined
+  restartSession?: (retryPid?: number) => Promise<string>
   journal: Journal
   agent: string
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
@@ -135,7 +137,7 @@ export type MainEvent = {
   event: string; session_id?: string; prompt_id?: string; pid?: number; transcript_path?: string; source?: string
   /** Delivery ids outside the text of a task notification, when the prompt contains one. */
   channel_dids?: string[]
-  error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_brief?: Record<string, string>; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'final'; reason?: string
+  error?: string; tool_name?: string; tool_timeout_ms?: number; tool_input?: any; tool_brief?: Record<string, string>; tool_response?: string; tool_error?: boolean; dids?: string[]; phase?: 'check' | 'owed' | 'final'; owed_mids?: string[]; reason?: string
   /** 002r: the event fired inside a subagent of the main (the hook input's agent_id): not the main's turn */
   sub?: boolean
 }
@@ -144,9 +146,18 @@ export type MainEvent = {
 export type Turn = { prompt_id: string; started_at: string | null; prev_started_at: string | null
   items: Array<{ id: string; kind: string; content: string; user: string }>; calls: Array<{ name: string; input: any; result: string; error: boolean }> }
 type AidItem = { mid: string; kind: string; user: string; no_reply: boolean; system: boolean; body: string }
-export type MainReply = { accepted?: boolean; additionalContext?: string; block?: string; turn?: Turn; proposals?: unknown[]; curator?: boolean
+export type MainReply = { item_stop?: 'check' | 'done'; accepted?: boolean; additionalContext?: string; block?: string; turn?: Turn; proposals?: unknown[]; curator?: boolean
   items?: AidItem[]; outputs?: Output[]; context?: { items: AidItem[]; outputs: Output[] }; mark_no_reply?: string; mark_reply_to?: string; deny?: string }
 type Output = { to: string; reply_to: string; text: string }
+
+/** Silence allowed by an open tool's own deadline, including its completion margin. */
+export function toolSilenceMs(declared: unknown, takeTool?: string): number {
+  const mcp = takeTool?.startsWith('mcp__')
+  const timeout = Number(declared ?? (mcp ? process.env.MCP_TOOL_TIMEOUT : undefined))
+  if (Number.isFinite(timeout) && timeout > 0) return Math.round(timeout * 1.25)
+  // These calls can be working off-process without emitting stream output until the result.
+  return mcp || takeTool === 'WebFetch' ? Infinity : 0
+}
 
 const num = (k: string, d: number): number => { const n = Number(process.env[k] ?? d); return Number.isFinite(n) ? n : d }
 /** 疑似卡死: a gen that owes a hook event (a turn open, or an offer unbound) has sent none for this long */
@@ -190,7 +201,7 @@ export function createMain(E: MainEnv) {
   let registryGap: { since: number; told: boolean } | null = null
   let registryAlertOpen: boolean | null = null              // WO-205: the registry alert is open; null = not known since this daemon started
   const lastEventAt = new Map<string, number>()          // gen → ms of its last hook event (silence = the stuck rule)
-  const toolBound = new Map<string, number>()            // gen → ms the open tool may stay silent: its own declared timeout (0 = it declares none)
+  const toolBound = new Map<string, number>()            // gen → permitted silence while its tool is in flight
   const pendingEnd = new Map<string, EndReason>()        // gen → why it is about to end (asked: /restart; replaced: /main renew)
   const outputs = new Map<string, Output[]>()            // prompt id → the reply / send_to_agent calls of that turn (answered gate)
   const calls = new Map<string, Turn['calls']>()          // prompt id → every tool call of that turn with its result (the summary gate)
@@ -224,6 +235,22 @@ export function createMain(E: MainEnv) {
     && r.onsen_items?.[0]?.onsen_item_id === id).length > 0, (id, reason) => {
     for (const r of items(r => r.state !== 'done' && r.onsen_items?.[0]?.onsen_item_id === id)) closeItem(r, { reason })
   }, () => { void pump('resume-ready') }, write => E.writeItem?.(write), key => E.writtenItemId?.(key))
+  // S4 owns cannot_move/recovered, parked/cancelled and choose for take members.
+  const tellJoey: MainEnv['tellJoey'] = (...args) => { if (!takeModeActive(E.itemReceiver?.()?.mode)) E.tellJoey(...args) }
+  function retryRestart(g: Row, error: unknown): void {
+    E.log('warn', `lanes: main ${g.id} restart after ${g.item_restart}: ${error}; will retry`)
+    setMain(g, g.state as MainPhase, { item_restart_retry: g.item_restart, item_restart: null })
+  }
+  async function restartForReport(g: Row, reason: 'stuck' | 'usage_limit_probe', now = Date.now()): Promise<void> {
+    if (g.item_restart || !E.restartSession) return
+    // The wrapper may already have reused the tmux name. Keep the last attempt time until this PID's generation ends.
+    const retryPid = g.item_restart_at != null || g.item_restart_retry ? Number(g.pid) : undefined
+    setMain(g, g.state as MainPhase, { item_restart: reason, item_restart_at: now, item_restart_retry: null })
+    try { await E.restartSession(retryPid) }
+    catch (err) {
+      if (currentGen() === g && g.item_restart === reason && g.item_restart_at === now && E.pidAlive(Number(g.pid))) retryRestart(g, err)
+    }
+  }
   const aidItem = (r: Row): AidItem => { const m = metaOf(r.notif); return { mid: m.message_id || m.btcc_msg_id || r.id, kind: m.message_id ? 'tg' : m.btcc_msg_id ? 'mesh' : 'sys',
     user: String(m.user ?? ''), no_reply: m.no_reply === 'true', system: m.user === 'lanes' || r.kind === 'handoff' || r.kind === 'carry', body: contentOf(r).slice(0, BODY_MAX) } }
   /** boot: fold done by the caller (journal.load); pick the live gen */
@@ -306,7 +333,7 @@ export function createMain(E: MainEnv) {
     if (!wall.active || probe) return true
     // A queued refusal from an older journal only carries its stop_failure reason.
     const refused = accountFailure(r.reason) || accountCut(r)
-    return wall.person && r.kind === 'joey' && !refused
+    return wall.person && r.kind === 'joey' && !refused && !r.onsen_items?.some((ref: ItemRef) => ref.reason?.startsWith('usage_limit'))
   }
   /** WO-177 一: mainCanTake() for the live gen (false: no gen) */
   function mainCanTake(): boolean { const g = currentGen(); return !!g && canTake(g) }
@@ -547,12 +574,18 @@ export function createMain(E: MainEnv) {
       return false
     })
   }
+  function markOwed(g: Row, prompt: string, rows: Row[], eventIds: string[]): void {
+    for (const row of rows) if (row.onsen_items && eventIds.includes(row.event)) E.itemReceiver?.()?.report(row.onsen_items, 'owed')
+    setMain(g, 'in_turn', { owed_hold: prompt, owed_events: eventIds })
+  }
+
   async function offerNext(): Promise<void> {
     const g = currentGen()
     if (!g || Date.now() < offersHeldUntil) return
     // A keeper clear can wake the walled gen. Drive its limit menu first (002k G16a).
     const wall = wallDelivery(g)
     const probe = wall.probe
+    if (g.item_restart) return
     const mayOffer = () => (g.state === 'idle' || g.state === 'walled') && (probe || (wall.active ? wall.person : canTake(g)))
     if (!mayOffer()) return
     const version = deliveryVersion(g)
@@ -591,7 +624,7 @@ export function createMain(E: MainEnv) {
     if (probe && E.menu) {
       menu = await E.menu(true).catch(() => null)
       if (!stillReady()) return
-      if (menu?.asks) E.tellJoey(menu.text, 'main-menu')
+      if (menu?.asks) tellJoey(menu.text, 'main-menu')
     }
     const clearFields = { uw_clear_used: wall.clear, ...(menu && !menu.asks ? { wall_menu: menu.text } : {}) }
     const down = new Set<string>()
@@ -599,7 +632,8 @@ export function createMain(E: MainEnv) {
     for (const it of probe ? candidates() : cands) {
       if (it.state !== 'queued' || down.has(String(it.via))) continue
       // Interrupted and batched items ride the lead, along with every refusal released by this clear.
-      let riders = items(r => r.id !== it.id && r.state === 'queued' && (heldCut(r) || r.reason === 'batched' || r.onsen_items?.some((ref: ItemRef) => ref.reason === 'cut_person' && it.onsen_items?.some((lead: ItemRef) => lead.kind === 'message' && lead.from === ref.from)) || (wall.clear != null && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))
+      const peers = callSenders(it.onsen_items ?? [])
+      let riders = items(r => r.id !== it.id && r.state === 'queued' && (hasCallFrom(r.onsen_items, peers) || heldCut(r) || r.reason === 'batched' || r.onsen_items?.some((ref: ItemRef) => ref.reason === 'cut_person' && it.onsen_items?.some((lead: ItemRef) => lead.kind === 'message' && lead.from === ref.from)) || (wall.clear != null && accountFailure(r.reason))) && owed(r) && forGen(r, g) && eligible(r))
       const checkedGroup = checked([it, ...riders], g, wall.clear)
       if (checkedGroup instanceof Promise) {
         const group = await checkedGroup
@@ -680,7 +714,7 @@ export function createMain(E: MainEnv) {
     if (!stuck?.undelivered) return
     recordUndelivered(null)
     stuck = null
-    E.tellJoey('主線接到訊息了：等著的訊息現在交給它。', 'main-delivered')
+    tellJoey('主線接到訊息了：等著的訊息現在交給它。', 'main-delivered')
   }
   function recordUndelivered(since: number | null): void {
     const g = latestMain()
@@ -711,7 +745,8 @@ export function createMain(E: MainEnv) {
       got = got.filter(r => r.state === 'queued' && wallAllows(r, fresh))
     }
     if (got.some(r => r.onsen_items)) {
-      got = got.filter(r => readyInTurn(r) && !(r.onsen_items && inFlight.has(r.id)))
+      const peers = callSenders(items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === prompt).flatMap(r => r.onsen_items ?? []))
+      got = got.filter(r => !hasCallFrom(r.onsen_items, peers) && readyInTurn(r) && !(r.onsen_items && inFlight.has(r.id)))
       if (got.some(r => r.onsen_items)) got = await receiveRows(got, true, () => currentGen() === g && g.prompt_id === prompt && g.state === 'in_turn' && ['idle', 'busy'].includes(member() ?? ''))
     }
     if (!got.length) return []
@@ -828,7 +863,7 @@ export function createMain(E: MainEnv) {
     const back: Row[] = [], held: Row[] = [], capped: Row[] = []
     const again = (r: Row, f: Record<string, unknown> = {}): void => { J().write('msg', r.id, 'queued', { reason: why, gen: null, prompt_id: null, via_pull: null, ...f }); back.push(r) }
     for (const r of rs) {
-      if (endClaim(r, g, 'cut')) continue
+      if (endClaim(r, g, 'cut', (g.item_restart ?? g.item_restart_retry) === 'stuck' ? { note: '卡住重開' } : {})) continue
       if (r.state === 'offered') { again(r); continue }
       if (r.state !== 'bound') continue
       const out = outputOf(g, r)
@@ -859,7 +894,7 @@ export function createMain(E: MainEnv) {
     if (!told.length) return
     const lines = Array.from(Map.groupBy(told, what), ([sentence, group]) =>
       `${sentence}為了不一直重來，這 ${group.length} 則不會再自動交給主線：${group.map(r => `「${contentOf(r).replace(/\s+/g, ' ').slice(0, 80)}」`).join('；')}。`)
-    E.tellJoey(`${lines.join('\n')}還要處理的話請再說一次（同事的事請對方再送一次）。`,
+    tellJoey(`${lines.join('\n')}還要處理的話請再說一次（同事的事請對方再送一次）。`,
       'main-cut', [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))])
   }
   function tellCut(rs: Row[], why: string): void {
@@ -895,7 +930,7 @@ export function createMain(E: MainEnv) {
     if (parked.length) {
       const queued = items(r => r.state === 'queued' && owed(r)).length
       const text = `主線疑似卡死：${parked.length} 則訊息交給它 ${MAIN_FAIL_MAX} 次，${MAIN_FAIL_MAX} 次回合都以錯誤結束（${err}），先不再交給它：${parked.filter(r => r.kind !== 'digest').map(r => `「${contentOf(r).replace(/\s+/g, ' ').slice(0, 60)}」`).join('、')}。主線下一次正常結束一個回合，我會再交給它一次。有 ${queued} 則訊息等它。`
-      if (!stuck) { stuck = { gen: g.id, prompt: null, at: now }; E.tellJoey(text, 'main-stuck') }
+      if (!stuck) { stuck = { gen: g.id, prompt: null, at: now }; tellJoey(text, 'main-stuck') }
       else E.log('info', `lanes: ${parked.length} item(s) parked at the StopFailure cap during an open stuck episode (Joey was told once): ${parked.map(r => r.id).join(', ')}`)
     }
     if (closed.length) tellClosed(closed, () => `主線回合又以錯誤結束（${err}），這些訊息已經交給它 ${MAIN_FAIL_MAX + 1} 次都沒成功。`)
@@ -949,7 +984,7 @@ export function createMain(E: MainEnv) {
     const cutFact = why !== 'asked' && g.prompt_id && (g.state === 'in_turn' || (g.state === 'walled' && !g.cut_turn))
       ? bareCut(g, rs.filter(r => !r.prompt_id || r.prompt_id === g.prompt_id), 'gen_end') : undefined
     const { back, capped } = settle(g, rs, 'gen_end')
-    setMain(g, 'gone', { end_reason: why, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: cutFact })
+    setMain(g, 'gone', { end_reason: why, item_restart: null, item_restart_retry: null, item_restart_at: null, prompt_id: null, tool_open: null, stopped_prompt: null, cut_turn: cutFact })
     if (cur === g.id) cur = null
     pendingEnd.delete(g.id); lastEventAt.delete(g.id); work.delete(g.id)
     if (stuck?.gen === g.id && !stuck.undelivered) stuck = null              // 002w (E): what nobody could take is still waiting: that episode goes on
@@ -961,7 +996,7 @@ export function createMain(E: MainEnv) {
     const evs = [...new Set(told.map(r => String(r.event ?? '')).filter(Boolean))]
     const owesJoey = E.mainOwed ? new Set(E.mainOwed(evs).filter(x => (x.kinds ?? []).includes('joey')).map(x => x.id)) : null
     const still = owesJoey ? told.filter(r => !r.event || owesJoey.has(String(r.event))) : told
-    if (still.length) E.tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${still.length} 則訊息不會自動交給新的主線：${still.map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart',
+    if (still.length) tellJoey(`主線被指令重啟（/restart 或 /kill_stuck）。重啟時它正在處理的 ${still.length} 則訊息不會自動交給新的主線：${still.map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 80)).join('；')}。還要處理的話請再說一次。`, 'asked-restart',
       [...new Set(still.map(r => String(r.event ?? '')).filter(Boolean))])
     if (still.length < told.length) E.log('info', `lanes: asked restart of gen ${g.id}: ${told.length - still.length} cut message(s) already answered, closed without the notice`)
     E.log('info', `lanes: main gen ${g.id} gone (${why}); ${back.length} item(s) queued again`)
@@ -1050,9 +1085,12 @@ export function createMain(E: MainEnv) {
     // 002r (H05): a subagent's tool call. It starts, continues and ends no turn of the main, opens no tool of the main and is no boundary to pull at
     // (the pulled message would land in the subagent). While the main's turn is open (it waits on its Agent call) the subagent's work is the gen's
     // sign of life; an idle main that leaves an offer untaken is not excused by its background agents.
+    if (g.item_restart && ev !== 'SessionEnd') return {}
+    if ((g.item_restart || g.item_restart_retry) && ev === 'SessionEnd' && E.pidAlive(pid)) return {}
+    if (g.item_restart_retry === 'stuck' && ev !== 'SessionEnd') setMain(g, g.state as MainPhase, { item_restart_retry: null, item_restart_at: g.item_restart_at ?? Date.now() })
     if (b.sub && g.state !== 'in_turn') return {}
     lastEventAt.set(g.id, Date.now())
-    if (stuck && !stuck.undelivered && stuck.gen === g.id) { stuck = null; E.tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
+    if (stuck && !stuck.undelivered && stuck.gen === g.id) { stuck = null; tellJoey('主線又有動靜了（hook 事件恢復），疑似卡死解除。', 'main-unstuck') }
     if (b.sub) return {}                                                    // in an open turn: a sign of life (and the all-clear), nothing else
     const p = String(b.prompt_id ?? '')
     // WO-201 (mesh-13196): before this event binds or pulls anything, the items already bound to this prompt get M2's own output fact (noteOutput)
@@ -1086,7 +1124,7 @@ export function createMain(E: MainEnv) {
         beginTurn(g, p, undefined, b.source); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         // WO-148 (item 3; lab: the hook sent tool_input only for a btcc-receipt Bash): the hook's tool_brief, the field the call is about (lanes.ts masks it)
         openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_brief ?? b.tool_input ?? null, at: new Date().toISOString() })
-        toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
+        toolBound.set(g.id, toolSilenceMs(b.tool_timeout_ms, takeModeActive(E.itemReceiver?.()?.mode) ? b.tool_name : undefined))   // the tool's own bound, with a margin
         { const deny = E.toolGate?.(String(b.tool_name ?? ''), b.tool_input ?? {}); if (deny) return { deny } }     // 002w (D): refused before it runs
         const send = /__send_to_agent$/.test(String(b.tool_name ?? ''))
         let mark: string | undefined, markReplyTo: string | null = null
@@ -1119,6 +1157,15 @@ export function createMain(E: MainEnv) {
       }
       case 'Stop': {
         if (!p) return {}
+        if (b.phase === 'owed') {
+          if (!takeModeActive(E.itemReceiver?.()?.mode) || g.state !== 'in_turn' || g.prompt_id !== p) return {}
+          const holding = g.owed_hold === p
+          const prior: string[] = holding ? g.owed_events ?? [] : []
+          const rows = unsettled(g, p).filter(r => r.state === 'bound' && !prior.includes(r.event) && b.owed_mids?.includes(aidItem(r).mid))
+          if (!rows.length) return {}
+          markOwed(g, p, rows, [...prior, ...rows.map(r => r.event)])
+          return holding ? {} : { accepted: true }
+        }
         beginTurn(g, p, undefined, b.source)
         if (b.phase !== 'final') {
           const mp = pullable(g) ? mentionsNow() : null                                     // WO-181: only when something is pulled now
@@ -1130,16 +1177,19 @@ export function createMain(E: MainEnv) {
           // (a turn that took in nothing is asked about the work it carries on). One hold per turn (owed_hold on the gen), naming each: the next Stop of
           // the same turn ends it, and what is still owed stays open on its event.
           const gen = J().get('main', g.id)!
-          if (E.mainOwed && gen.owed_hold !== p) {
+          const take = takeModeActive(E.itemReceiver?.()?.mode)
+          let block: string | undefined
+          if (E.mainOwed && gen.owed_hold !== p && !(take && t.carried)) {
             const owed = E.mainOwed(t.events)
             if (owed.length) {
-              for (const r of t.items) if (r.onsen_items && owed.some(o => o.id === r.event)) E.itemReceiver?.()?.report(r.onsen_items, 'owed')
-              setMain(gen, 'in_turn', { owed_hold: p, owed_events: owed.map(o => o.id) })
-              return { block: `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ~/.claude/tools/btcc-receipt complete <run> 回執；做完再結束這一輪。` }
+              markOwed(gen, p, t.items, owed.map(o => o.id))
+              block = `這一輪還欠事沒交代，先不要結束：${owed.map(o => `${o.from}「${firstWords(o.text)}」：${o.owes.join('、')}`).join('；')}。Joey 用 reply 回（一則可以回全部），同事用 send_to_agent 回，排程用 ~/.claude/tools/btcc-receipt complete <run> 回執；做完再結束這一輪。`
+              if (!take) return { block }
             }
           }
           const its = t.carried ? [] : t.items.filter(r => r.state === 'bound').map(aidItem), w = t.carried ? work.get(g.id) : undefined
-          return { items: its, outputs: outputs.get(p) ?? [], ...(w ? { context: { items: w.items, outputs: w.outputs } } : {}),
+          const itemStop: MainReply = take ? { item_stop: !block && (gen.owed_hold === p || t.carried) ? 'done' : 'check', block } : {}
+          return { ...itemStop, items: its, outputs: outputs.get(p) ?? [], ...(w ? { context: { items: w.items, outputs: w.outputs } } : {}),
             turn: turnOf(J().get('main', g.id)!, p), ...(E.memory ? E.memory() : { proposals: [], curator: false }) }   // PL5: the memory gate's facts
         }
         { // 002v: the work this turn leaves for the next (the turn's items, or the outputs it adds to the work it carried on)
@@ -1160,7 +1210,7 @@ export function createMain(E: MainEnv) {
         setMain(was, 'idle', { prompt_id: null, tool_open: null, error: null, stopped_prompt: p, cut_turn: null, resume_sent: null, ...(since ? { wall_since: null, wall_refused_at: null, wall_clear_at: null, kind: null, wall_menu: null } : {}) })
         if (since) {
           const n = items(r => queuedForOffer(r, was) && (!heldCut(r) || accountCut(r))).length
-          E.tellJoey(`主線恢復了。這次從 ${hhmmTaipei(Date.parse(since))}（台北）起不能用模型。${n ? `保留的 ${n} 則訊息等著交給它。` : ''}${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')
+          tellJoey(`主線恢復了。這次從 ${hhmmTaipei(Date.parse(since))}（台北）起不能用模型。${n ? `保留的 ${n} 則訊息等著交給它。` : ''}${wmenu ? `期間${wmenu}` : ''}`, 'main-wall-down')
         }
         void pump()
         return {}
@@ -1174,6 +1224,7 @@ export function createMain(E: MainEnv) {
         const reason = `stop_failure:${err}`
         const back = unsettled(g, p)
         const wall = E.usageWall?.(Date.parse(String(g.wall_since ?? '')) || 0)
+        const refusedProbe = takeModeActive(E.itemReceiver?.()?.mode) && back.some(r => r.onsen_items && r.keeper_probe)
         for (const r of back) {
           if (r.onsen_items) {
             if (r.state === 'bound' && r.kind === 'joey') E.blocked?.(r, wall?.resets_at ?? null)
@@ -1194,8 +1245,10 @@ export function createMain(E: MainEnv) {
         const cur = J().get('main', g.id)!
         const first = !cur.wall_since
         setMain(cur, 'walled', { kind: err, error: err, prompt_id: null, tool_open: null, stopped_prompt: null, wall_since: cur.wall_since ?? new Date().toISOString(), wall_refused_at: Date.now(), wall_clear_at: null,
+          ...(refusedProbe ? { uw_clear_used: Math.max(Number(cur.uw_clear_used ?? 0), wall?.clearedMs ?? 0) } : {}),
           cut_turn: bareCut(cur, back, err) })
-        if (first) E.tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
+        if (refusedProbe) await restartForReport(cur, 'usage_limit_probe')
+        if (first) tellJoey(`主線${WALL_WORD[err] ?? '模型無法使用'}（原文：${String(b.reason ?? err).slice(0, 200)}）。給主線的 ${items(r => r.state === 'queued' && owed(r)).length} 則訊息先保留，一件都沒有丟；之後主線一能用就交給它，恢復時我會告訴你。主線要等額度重置、換帳號或換模型才會再動。車道照常處理警報與同事的事。`, 'main-wall-up')
         return {}
       }
       case 'SessionEnd': {
@@ -1247,14 +1300,16 @@ export function createMain(E: MainEnv) {
     // ends it with the one wall-down notice (2a936a7: the episode ended with the gen, and Joey heard main-wall-up and never the recovery)
     const ended = J().rows('main', r => r.state === 'gone' && !!r.wall_since && r.id !== id)
     const since = ended.map(r => String(r.wall_since)).sort()[0]
+    const refusal = takeModeActive(E.itemReceiver?.()?.mode) && ended.filter(r => r.wall_refused_at).sort((a, b) => b.wall_refused_at - a.wall_refused_at)[0]
     const carry = since ? { wall_since: since, wall_menu: ended.map(r => r.wall_menu).filter(Boolean).pop() ?? null } : {}
     const previous = latestMain()
     for (const r of ended) J().write('main', r.id, 'gone', { wall_since: null, wall_menu: null })
     // lanes-golive: the SessionStart context reaches the conversation on startup, clear and compact; on resume it is all but lost (25 of 334, Chiron's
     // measure), so a resumed main gets the rules on its first prompt instead (UserPromptSubmit)
     const carried = ['startup', 'clear', 'compact'].includes(String(b.source ?? ''))
-    J().write('main', id, goesOn ? 'in_turn' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
+    J().write('main', id, goesOn ? 'in_turn' : refusal ? 'walled' : E.streamOpen(pid) ? 'idle' : 'starting', { pid, session_id: sid, transcript_path: b.transcript_path ?? (goesOn ? same!.transcript_path ?? null : null),
       source: b.source ?? null, ...(goesOn ? {} : { prompt_id: null, tool_open: null, stopped_prompt: null }), end_reason: null, rules_shown: carried ? sid : null, ...carry,
+      ...(refusal ? { wall_refused_at: refusal.wall_refused_at, uw_clear_used: refusal.uw_clear_used, kind: refusal.kind } : {}),
       cut_turn: previous?.cut_turn ?? null, resume_sent: previous?.resume_sent ?? null, resumes: previous?.resumes ?? 0,
       resume_items: previous?.resume_items ?? (J().get('main', id)?.resume_items ? null : undefined),
       undelivered_since: previous?.undelivered_since ?? null })
@@ -1315,7 +1370,7 @@ export function createMain(E: MainEnv) {
   function statusIdle(isIdle: boolean, now = Date.now(), interruptedAt: number | null = null): boolean {
     const g = currentGen()
     const released = isIdle && g?.state === 'idle' && g.stopped_prompt && takingItems() ? resumes.inputIds(g.session_id, true) : []
-    if (!g || !isIdle || (g.state !== 'in_turn' && !released.length)) { idleSeen = null; return false }
+    if (!g || g.item_restart || !isIdle || (g.state !== 'in_turn' && !released.length)) { idleSeen = null; return false }
     const ev = lastEventAt.get(g.id) ?? 0
     const seen = !released.length && interruptedAt != null && interruptedAt > ev
     if (seen) idleSeen = { gen: g.id, at: now, ev }
@@ -1350,6 +1405,26 @@ export function createMain(E: MainEnv) {
     const m = member()
     const wall = wallDelivery(g)
     const held = m === 'waiting' || wall.active
+    const silenceLimit = g?.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? toolSilenceMs(undefined, takeModeActive(E.itemReceiver?.()?.mode) ? g.tool_open : undefined)) : MAIN_STUCK_MS
+    if (takeModeActive(E.itemReceiver?.()?.mode)) {
+      // The wrapper can be healthy while the old TUI is still alive. tick already checked its pid above.
+      if (g?.item_restart) {
+        if (now - (g.item_restart_at ?? 0) >= 5_000) retryRestart(g, 'old pid is still alive')
+        return
+      }
+      if (g?.item_restart_retry === 'usage_limit_probe') { await restartForReport(g, 'usage_limit_probe', now); return }
+      // An unbound Item uses its 20 s claim deadline. Only a running turn can be stuck.
+      if (g?.state === 'in_turn' && (g.item_restart_retry || stuck?.gen !== g.id || stuck.undelivered) && !held && m !== 'compacting' && m !== 'starting'
+          && m !== 'offline' && now - (lastEventAt.get(g.id) ?? now) > silenceLimit) {
+        const refs = unsettled(g, g.prompt_id).filter(r => r.state === 'bound').flatMap(r => r.onsen_items ?? [])
+        if (E.itemReceiver?.()?.report(refs, 'stuck')) {
+          stuck = { gen: g.id, prompt: g.prompt_id, at: now }
+          await restartForReport(g, 'stuck', now)
+        }
+      }
+      await pump()
+      return
+    }
     // 002w (E, gaps 4, 11): owed items queued past MAIN_STUCK_MS that nobody could take: no live gen, or a live gen that is neither in a turn (it would
     // pull them), nor walled (its wall notice told Joey), nor holding an offer (an offer it does not take is the silence rule below), and could not be
     // offered them. One alarm per episode, with the count; the next delivery ends it.
@@ -1361,7 +1436,7 @@ export function createMain(E: MainEnv) {
         const mins = Math.max(1, Math.round((now - Math.min(...owedNow.map(r => Date.parse(String(r.ts))))) / 60_000))
         // WO-177 ② (Chiron 03:41Z, verbatim): the record says the main is working (busy, stuck) while M2 has had no turn: the items wait on the record, not on
         // a channel. The push stays; its sentence says that (the channel sentence is for a record that says it can take them and still nothing went in)
-        E.tellJoey(!g ? `主線不在：現在沒有登記中的主線，${owedNow.length} 則訊息等它（最久的等了 ${mins} 分鐘）。警報和同事的事由車道照常處理；主線一登記我就交給它並告訴你。`
+        tellJoey(!g ? `主線不在：現在沒有登記中的主線，${owedNow.length} 則訊息等它（最久的等了 ${mins} 分鐘）。警報和同事的事由車道照常處理；主線一登記我就交給它並告訴你。`
           : m === 'busy' || m === 'stuck' ? `主線的畫面顯示在處理中，但 ${Math.max(1, Math.round(MAIN_STUCK_MS / 60_000))} 分鐘沒有任何回合事件；有 ${owedNow.length} 件排著還沒交進去。`
           : `主線收不到訊息：${owedNow.length} 則訊息送不進主線（它的訊息通道沒有開，最久的等了 ${mins} 分鐘；行程還活著）。警報和同事的事由車道照常處理；一送進去我會告訴你。`, 'main-undelivered')
       }
@@ -1381,7 +1456,7 @@ export function createMain(E: MainEnv) {
       const take = !wall.active && g.state === 'idle' && canTake(g, now)
       const from = take && takeSince?.gen === g.id ? takeSince.at : 0
       const since = Math.max(lastEventAt.get(g.id) ?? now, offeredAt, from)
-      const limit = g.state === 'in_turn' && g.tool_open ? Math.max(MAIN_STUCK_MS, toolBound.get(g.id) ?? 0) : MAIN_STUCK_MS
+      const limit = g.state === 'in_turn' ? silenceLimit : MAIN_STUCK_MS
       // 002x: the offer's own bound. An idle gen's offer still unbound after OFFER_LEASE_MS of silence goes back to `queued` (reason offer_untaken)
       // and the pump below writes it once more. `reoffered` on the item names the gen that got it twice: the lease does it once per gen, and the
       // stuck episode below does not write such an item a third time (a client that is frozen, not deaf, takes every copy when it runs again).
@@ -1395,7 +1470,6 @@ export function createMain(E: MainEnv) {
         // next keeper clear, as the episode below would have put it back
         if (g.state === 'walled') for (const r of offered.filter(r => !r.person_wall_offer)) J().write('msg', r.id, 'queued', { reason: backReason(r, 'probe_untaken'), gen: null, prompt_id: null, via_pull: null })
       } else if (owes && now - since > limit) {
-        if (g.state === 'in_turn') for (const r of unsettled(g, g.prompt_id)) if (r.onsen_items) E.itemReceiver?.()?.report(r.onsen_items, 'stuck')
         stuck = { gen: g.id, prompt: g.prompt_id ?? null, at: now }
         // what the episode writes again: a walled gen's probe item (its next probe), an idle gen's item the lease has not written again yet
         const again = g.state === 'walled' ? offered : g.state === 'idle' ? offered.filter(r => r.reoffered !== g.id) : []
@@ -1405,7 +1479,7 @@ export function createMain(E: MainEnv) {
         const menu = E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null
         const mins = Math.max(1, Math.round((now - since) / 60_000))
         const doing = g.state === 'in_turn' ? items(r => r.state === 'bound' && r.gen === g.id && r.prompt_id === g.prompt_id && r.kind !== 'digest').map(r => contentOf(r).replace(/\s+/g, ' ').slice(0, 60)).filter(Boolean) : []
-        E.tellJoey(g.state === 'in_turn'
+        tellJoey(g.state === 'in_turn'
           ? `主線疑似卡死：它在一個回合裡已經 ${mins} 分鐘沒有任何動靜${g.tool_open ? `（停在工具 ${g.tool_open} 裡沒有回來）` : ''}${doing.length ? `；它正在處理：${doing.map(t => `「${t}」`).join('、')}` : ''}。${menu ?? ''}有 ${queued} 則訊息等它。警報和同事的事由車道照常處理。要停掉可以用 /kill_stuck；它一有動靜我會再告訴你。`
           : untakenText(mins, menu, queued, !!(again.length || !offered.length)), 'main-stuck')
         // 002q (H02, H03): an offer the gen never took (no hook event for it: a notification lost on the client side, under host load) is not left to
@@ -1433,7 +1507,7 @@ export function createMain(E: MainEnv) {
           for (const r of cutOld) J().write('msg', r.id, 'queued', { reason: 'interrupted_untaken' })
           const menu = E.menu ? (await E.menu(false).catch(() => null))?.text ?? null : null
           const mins = Math.max(1, Math.round((now - Math.min(...cutOld.map(r => Date.parse(String(r.cut_at ?? r.ts))))) / 60_000))
-          E.tellJoey(untakenText(mins, menu, items(r => r.state === 'queued' && owed(r)).length, true), 'main-stuck')
+          tellJoey(untakenText(mins, menu, items(r => r.state === 'queued' && owed(r)).length, true), 'main-stuck')
         }
       }
     }

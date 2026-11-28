@@ -8,6 +8,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { Journal } from './lanes-state.ts'
 import { itemRef } from './onsen-items.ts'
 import { osProcStart } from './onsen-status.ts'
+import { createEvents } from './lanes-events.ts'
 import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { startBotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { freePort, until } from './test-fixtures/tg-daemon.ts'
@@ -92,7 +93,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
     return health?.pid === proc.pid
   })
   await ready()
-  const restart = async () => { proc.kill('SIGKILL'); await proc.exited; proc = spawn(); await ready() }
+  const restart = async (whileStopped?: () => void) => { proc.kill('SIGKILL'); await proc.exited; whileStopped?.(); proc = spawn(); await ready() }
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
@@ -822,6 +823,39 @@ test('a busy lane slot leaves the next alert waiting; its run receives the claim
   expect(records().some(r => r.rec === 'msg' && (r.kind === 'handoff' || r.kind === 'carry'))).toBe(false)
 }, 18000)
 
+test('a take router sends handoff and thread-stop notices to the original callers for Onsen to filter', async () => {
+  const notices: Record<string, unknown>[] = []
+  const inbox = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    if (req.method !== 'POST' || new URL(req.url).pathname !== '/lanes/send') return new Response(null, { status: 404 })
+    notices.push(await req.json() as Record<string, unknown>)
+    return Response.json({ delivered: true, msgId: 90000 + notices.length })
+  } })
+  clean.push(() => inbox.stop(true))
+  const d = await daemon({ LANES_INBOX_PORT: String(inbox.port) }, 200, root => {
+    const peers = join(root, 'peers.json')
+    writeFileSync(peers, JSON.stringify({ eve: {}, cain: {} }))
+    return { ...scriptedLane(root), AGENT_INBOX_REGISTRY: peers }
+  })
+  const handoff = d.f.add('handoff-call', 'call', { from: 'eve', call_id: '401',
+    payload: { text: 'explicit handover', line: 'call', msg_id: 801, logged: true } })
+  await waitFor(() => d.f.history.some(h => h.item_id === handoff.id && h.body.outcome === 'in_session'))
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => notices.length > 0 && d.f.history.some(h => h.item_id === handoff.id && h.body.outcome === 'reassigned'))
+
+  d.f.add('stopped-call', 'call', { from: 'cain', call_id: '402',
+    payload: { text: 'one more question', line: 'call', msg_id: 802, logged: true, thread: 'cain#t-ca12', hop: 7 } })
+  await waitFor(() => notices.length >= 2)
+  expect(notices).toMatchObject([
+    { to: 'eve', reply_to: '801', call: '401', no_reply: true, urgency: 'silent', owner: '主線' },
+    { to: 'cain', reply_to: '802', call: '402', no_reply: true, urgency: 'silent', lane: 'router' },
+  ])
+  expect(notices[0].text).toContain('主線會在')
+  expect(notices[1].text).toContain('轉手次數')
+  const memberPaths = d.f.calls.map(c => c.path).filter(path => path.startsWith('/v1/members/'))
+  expect(memberPaths).toContain('/v1/members/adam/items')
+  expect(memberPaths.filter(path => !path.startsWith('/v1/members/adam/'))).toEqual([])
+}, 18000)
+
 test('roamer stays on its local mock bot and never probes items', async () => {
   const bot = startBotApiMock()
   clean.push(() => bot.stop())
@@ -1052,12 +1086,185 @@ test('a real peer hold leaves no M1 or lane reference; release starts a full pee
   await waitFor(() => d.log().includes('peer-hold'))
   expect(row.state).toBe('waiting')
   expect(d.journal().some(r => (r.rec === 'msg' || r.rec === 'run') && (r.onsen_items || r.ev?.onsen_items))).toBe(false)
+  expect(JSON.parse(readFileSync(join(d.lanes, 'state.json'), 'utf8')).holds.eve.count).toBe(0)
   const since = d.f.calls.length
   const release = command(d, 'release', '/lanes release eve', '91')
   await waitFor(() => release.state === 'completed')
   await waitFor(() => d.f.history.some(h => h.item_id === row.id && h.body.outcome === 'in_session'), 9000)
   expect(d.f.calls.slice(since).some(c => c.query.has('wait') && !c.query.has('changed_after'))).toBe(true)
 }, 12000)
+
+test('a lane lists its open Item once and completes it on a normal exit without an answer', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'finish-owing'), hook = join(import.meta.dir, 'lanes-hooks/lane-stop-hook.py')
+    writeFileSync(bin, `#!/bin/sh
+echo '{"hook_event_name":"Stop"}' | python3 -B "${hook}" > ./first-stop
+echo '{"hook_event_name":"Stop"}' | python3 -B "${hook}" > ./second-stop
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin }
+  })
+  const row = d.f.add('unanswered', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] unanswered alert', line: 'call' } })
+  await waitFor(() => row.state === 'completed')
+  expect(JSON.parse(readFileSync(join(d.root, 'first-stop'), 'utf8')).decision).toBe('block')
+  expect(readFileSync(join(d.root, 'second-stop'), 'utf8')).toBe('')
+  expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'owed', 'completed'])
+  expect(row.reason).toBe('not_answered')
+})
+
+for (const owed of [false, true]) test('a lane completion carries the reply sent by its run, owed=' + owed, async () => {
+  const d = await daemon({}, 200, scriptedLane)
+  const row = d.f.add('lane-answer', 'alert', { from: 'alert-dispatcher',
+    payload: { text: '[P2] get status', line: 'call', conversation_id: 'conv' } })
+  await waitFor(() => row.in_session_at != null)
+  if (owed) {
+    expect(JSON.parse(await laneHook(d.root, 1, 'Stop')).decision).toBe('block')
+    await waitFor(() => row.reason === 'owed')
+  }
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => row.state === 'completed')
+  const report = d.f.history.filter(h => h.item_id === row.id).at(-1)!.body
+  expect(report.outcome).toBe('completed')
+  expect(report.response_message_ids).toHaveLength(1)
+  expect(row.response_message_ids).toEqual(report.response_message_ids!)
+  expect(row.answered).toBe(true)
+  expect(row.reason).toBeNull()
+})
+
+test('a silent Item lane reports stuck and is stopped once; its cut names the restart', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'stalled-lane')
+    writeFileSync(bin, `#!/bin/sh
+echo '{"type":"assistant","message":{"id":"step","content":[{"type":"text","text":"started work"}]}}'
+exec sleep 20
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin, LANES_MAIN_STUCK_MS: '100', LANES_MAX_RUN_MS: '15000' }
+  })
+  const row = d.f.add('stalled', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] stalled', line: 'call' } })
+  const reports = () => d.f.history.filter(r => r.item_id === row.id)
+  await waitFor(() => reports().some(r => r.body.outcome === 'cut'), 8000)
+  const first = reports().filter(r => r.body.claim_id === reports()[0].body.claim_id)
+  expect(first.map(r => r.body.outcome)).toEqual(['in_session', 'stuck', 'cut'])
+  expect(first[2].body).toMatchObject({ note: '卡住重開', half_done: true })
+  expect(row.failures).toBe(1)
+}, 10000)
+
+test('a quiet lane with MCP and WebFetch in flight stays claimed until its last tool returns', async () => {
+  const d = await daemon({}, 200, root => {
+    const bin = join(root, 'waiting-tools')
+    writeFileSync(bin, `#!/bin/sh
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"m","name":"mcp__lab__lookup","input":{"timeout_ms":30000}},{"type":"tool_use","id":"w","name":"WebFetch","input":{}}]}}'
+while [ ! -f ./mcp-finished ]; do sleep 0.1; done
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"m","content":"done"}]}}'
+while [ ! -f ./fetch-finished ]; do sleep 0.1; done
+echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"w","content":"done"}]}}'
+exec sleep 20
+`)
+    chmodSync(bin, 0o700)
+    return { LANES_CLAUDE_BIN: bin, LANES_MAIN_STUCK_MS: '100', LANES_MAX_RUN_MS: '30000' }
+  })
+  const row = d.f.add('tool-lane', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] check tools', line: 'call' } })
+  await waitFor(() => row.in_session_at != null)
+  const claim = row.claim!.id
+  const outcomes = () => d.f.history.filter(h => h.body.claim_id === claim).map(h => h.body.outcome)
+  await Bun.sleep(5200)
+  expect(outcomes()).toEqual(['in_session'])
+  writeFileSync(join(d.root, 'mcp-finished'), '')
+  await Bun.sleep(5200)
+  expect(outcomes()).toEqual(['in_session'])
+  writeFileSync(join(d.root, 'fetch-finished'), '')
+  await waitFor(() => outcomes().includes('cut'), 6500)
+  expect(outcomes()).toEqual(['in_session', 'stuck', 'cut'])
+}, 20000)
+
+function wallFixture(root: string, mainModel: string) {
+  const dir = join(root, 'walls'), bin = join(root, 'limited-lane'), sid = randomUUID()
+  const transcripts = join(root, 'home', '.claude', 'projects', root.replace(/[^a-zA-Z0-9]/g, '-'))
+  mkdirSync(dir); mkdirSync(transcripts, { recursive: true })
+  writeFileSync(join(root, '.lanes', 'main-expected'), sid)
+  writeFileSync(join(transcripts, sid + '.jsonl'), JSON.stringify({ type: 'assistant', message: { model: mainModel } }))
+  writeFileSync(bin, `#!/bin/sh
+echo run >> ./lane-starts
+if [ -f ./refuse ]; then
+  echo '{"type":"result","is_error":true,"terminal_reason":"api_error","api_error_status":429}'
+else
+  echo '{"type":"assistant","message":{"id":"answer","content":[{"type":"text","text":"finished"}]}}'
+  echo '{"type":"result","subtype":"success","result":"finished"}'
+fi
+`)
+  chmodSync(bin, 0o700)
+  writeFileSync(join(root, 'refuse'), '')
+  return { LANES_CLAUDE_BIN: bin, LANES_MODEL: 'lane-model', AGENT_INBOX_SELF: 'adam', USAGE_WALL_READ: '1', USAGE_WALL_CACHE_MS: '0', USAGE_WALL_DIR: dir }
+}
+
+function incident(d: Awaited<ReturnType<typeof daemon>>, id: string, host = 'lab') {
+  return d.f.add(id, 'alert', { from: 'alert-dispatcher', refs: [{ kind: 'incident', value: host }],
+    payload: { text: 'alert ' + id + ': load/' + host + '/cpu = high', line: 'call' } })
+}
+function keeperWall(root: string, walled: boolean, at = new Date().toISOString()) {
+  writeFileSync(join(root, 'walls', 'adam.json'), JSON.stringify({ agent: 'adam', episode: 'limited', in_wall: walled,
+    cleared_at: walled ? null : at, last_wall_at: walled ? at : null, updated_at: new Date().toISOString(), cleared_by: 'probe_after_reset' }))
+}
+
+test('a lane on the keeper model probes once per fresh clear', async () => {
+  const d = await daemon({}, 200, root => wallFixture(root, 'lane-model'))
+  const row = incident(d, '101')
+  await waitFor(() => row.reason === 'usage_limit')
+  const starts = () => readFileSync(join(d.root, 'lane-starts'), 'utf8').trim().split('\n').length
+  incident(d, '102')
+  await Bun.sleep(300)
+  expect(starts()).toBe(1)
+  keeperWall(d.root, false)
+  incident(d, '103')
+  await waitFor(() => d.f.history.some(h => h.body.outcome === 'usage_limit_probe'))
+  await Bun.sleep(300)
+  expect(starts()).toBe(2)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+})
+
+test('a lane-only 429 lets a real alert probe after 60 s and clears only that lane on success', async () => {
+  const d = await daemon({}, 200, root => {
+    const env = wallFixture(root, 'other-model')
+    keeperWall(root, false, new Date(Date.now() - 3600_000).toISOString())
+    return env
+  })
+  const row = incident(d, '201')
+  await waitFor(() => row.reason === 'usage_limit')
+  const target = row.session_id!
+  row.state = 'cancelled'; d.f.change(row, 'withdrawn')
+  const next = incident(d, '202'), rider = incident(d, '205')
+  await Bun.sleep(250)
+  expect(next.state).toBe('waiting')
+  const statePath = join(d.lanes, 'state.json')
+  const state = () => JSON.parse(readFileSync(statePath, 'utf8'))
+  const nearProbe = () => {
+    const saved = state()
+    saved.lanes[target].last_limit_refusal = Date.now() - 59_000
+    writeFileSync(statePath, JSON.stringify(saved))
+  }
+  await d.restart(nearProbe)
+  await waitFor(() => next.reason === 'usage_limit')
+  expect(next.session_id).toBe(target)
+  expect(rider.state).toBe('waiting')
+  expect(d.f.calls.filter(c => c.path.endsWith('/take') && c.body.item_ids.includes(next.id)).map(c => c.body.item_ids)).toEqual([[next.id]])
+  const refused = state().lanes[target].last_limit_refusal
+  expect(Date.now() - refused).toBeLessThan(5000)
+  rmSync(join(d.root, 'refuse'))
+  keeperWall(d.root, true)
+  const independent = incident(d, '203', 'second-host')
+  await waitFor(() => independent.in_session_at != null)
+  expect(independent.session_id).not.toBe(target)
+  expect(state().lanes[target].last_limit_refusal).toBe(refused)
+  const recovery = incident(d, '204')
+  expect(recovery.state).toBe('waiting')
+  await d.restart(nearProbe)
+  await waitFor(() => d.f.history.some(h => h.item_id === recovery.id && h.body.outcome === 'in_session'))
+  await waitFor(() => !state().lanes[target].last_limit_refusal)
+  expect(recovery.session_id).toBe(target)
+  expect(d.f.calls.filter(c => c.path === '/v1/messages')).toHaveLength(0)
+}, 20_000)
 
 for (const [reason, outcome, code] of [
   ['cap_turns', 'cut', 0], ['cap_usd', 'cut', 0], ['died', 'cut', 1], ['timeout', 'cut', 0], ['budget', 'cut', 0],
@@ -1083,6 +1290,28 @@ for (const [reason, outcome, code] of [
   expect(d.f.history.filter(h => h.item_id === row.id).slice(0,2).map(h => h.body.outcome)).toEqual(['in_session', outcome])
   expect(d.journal().some(r => r.rec === 'run' && r.state === 'exited' && r.reason === reason)).toBe(true)
 })
+
+test('a runtime 409 cannot start due notices; a confirmed pull probe starts them', async () => {
+  const id = 'review-c3-due'
+  const d = await daemon({}, 200, root => {
+    const journal = new Journal(join(root, 'tg', 'lanes', 'state.jsonl'))
+    createEvents(journal, () => {}).open(id, { class: 'critical', owner: 'router', from: 'alert-dispatcher', text: id,
+      fields: { onsen_items: [{ onsen_item_id: id, onsen_version: 1, kind: 'alert', from: 'alert-dispatcher' }] },
+      obligations: [{ kind: 'joey', level: 'line', ring: true, due_at: Date.now() - 1000 }] })
+    return {}
+  })
+  await waitFor(() => d.f.calls.some(c => c.query.has('wait')))
+  d.f.mode(409)
+  d.f.add('wake-peek', 'alert', { from: 'alert-dispatcher', payload: { text: '[P2] wake', line: 'call' } })
+  await waitFor(() => d.log().includes('onsen take: not_take_member'))
+  const rings = () => d.journal().filter(r => r.id === id && r.obligations?.some((o: any) => o.rang))
+  const notices = () => d.f.calls.filter(c => c.path === '/v1/messages' && JSON.stringify(c.body).includes(id))
+  await Bun.sleep(1500)
+  expect(rings()).toHaveLength(0); expect(notices()).toHaveLength(0)
+  await d.restart()
+  await waitFor(() => d.log().includes('mode probe did not return 200') && notices().length > 0)
+  expect(rings()).toHaveLength(1); expect(notices()).toHaveLength(1)
+}, 10000)
 
 for (const code of [404, 409, 0]) test('daemon stays on pull after probe ' + (code || 'network error'), async () => {
   const cfg: Record<string, string> = {}
