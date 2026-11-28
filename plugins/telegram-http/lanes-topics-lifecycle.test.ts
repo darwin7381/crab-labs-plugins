@@ -20,8 +20,9 @@ const GO = join(dir, 'go'), bin = join(dir, 'lane.py')
 writeFileSync(bin, `#!/usr/bin/env python3
 import json, os, time
 t0 = time.time()
-while time.time() - t0 < 30 and not os.path.exists('${GO}'): time.sleep(0.02)
-try: os.remove('${GO}')
+gate = '${GO}-' + os.environ['LANE_ID']
+while time.time() - t0 < 30 and not os.path.exists(gate) and not os.path.exists('${GO}'): time.sleep(0.02)
+try: os.remove(gate)
 except OSError: pass
 print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'ok'}), flush=True)
 `)
@@ -41,7 +42,7 @@ afterAll(() => { try { writeFileSync(GO, 'ok') } catch {}; L.__setClaudeBin(rest
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 async function until(f: () => boolean, ms = 8000) { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (f()) return true; await sleep(20) } return f() }
 const laneOf = (topic: number) => Object.values(L.__lanesState().lanes).find(l => l.topic === topic)!
-const release = async (id: string) => { writeFileSync(GO, 'ok'); expect(await until(() => !L.__runTok(id))).toBe(true); await sleep(40) }
+const release = async (id: string) => { writeFileSync(`${GO}-${id}`, 'ok'); expect(await until(() => !L.__runTok(id))).toBe(true); await sleep(40) }
 
 test('names: emoji dropped (the server drops them), whitespace folded, a fallback when nothing is left; the link', () => {
   expect(plainTopicName('✅ 工作：示範', 'x')).toBe('工作：示範')
