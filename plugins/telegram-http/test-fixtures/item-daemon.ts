@@ -1,4 +1,6 @@
 // Child of the C1 HTTP tests. Both identities live entirely in memory.
+import { existsSync, readFileSync } from 'fs'
+import { join } from 'path'
 import { mock, spyOn } from 'bun:test'
 import * as identity from '../mesh-identity.ts'
 import * as mcpAuth from '../mcp-auth.ts'
@@ -17,6 +19,38 @@ mock.module('../mcp-auth.ts', () => auth)
 if (process.env.C1_COMMAND_FAILURE === '1') {
   const lanes = await import('../lanes.ts')
   spyOn(lanes, 'lanesCommand').mockImplementation(async () => { throw new Error('fixture command failed') })
+}
+if (process.env.ROAMER_MODE === '1') {
+  const lanes = await import('../lanes.ts')
+  spyOn(lanes, 'claudePidOf').mockImplementation(req => Number(req.headers['x-test-claude-pid']) || null)
+}
+if (process.env.C6_SHORT_BUSY === '1') {
+  const { RoamerItems } = await import('../roamer-items.ts')
+  const tick = RoamerItems.prototype.tick
+  const paused = join(process.env.AGENT_WORKSPACE_DIR!, 'pause-transcript-poll')
+  spyOn(RoamerItems.prototype, 'tick').mockImplementation(function () {
+    if (!existsSync(paused)) tick.call(this)
+  })
+}
+if (process.env.C6_CHOICE_FAILURE === '1') {
+  const controls = await import('../channel-bot-control.ts')
+  spyOn(controls, 'handleCallbackData').mockImplementation(async () => { throw new Error('fixture choice failed') })
+}
+if (process.env.C6_ROAMER_MENU === '1') {
+  const finder = await import('../session-finder.ts')
+  const dir = process.env.AGENT_WORKSPACE_DIR!
+  const roamer = await import('../roamer-control.ts')
+  roamer.startTakeoverWait('lab-tmux')
+  const listing = join(dir, 'lab-target')
+  spyOn(finder, 'claudeAgents').mockImplementation(async () => existsSync(listing) ? [JSON.parse(readFileSync(listing, 'utf8'))] : [])
+  spyOn(finder, 'findTmuxForPid').mockResolvedValue('lab-tmux')
+}
+if (process.env.C6_FAST_PROBE === '1') {
+  const { TakeMode } = await import('../onsen-take.ts')
+  const pause = TakeMode.prototype.pause
+  spyOn(TakeMode.prototype, 'pause').mockImplementation(function (reason, ms) {
+    return pause.call(this, reason, (reason.startsWith('mode probe:') || reason.startsWith('could not start ')) ? 1500 : ms)
+  })
 }
 const transport = globalThis.fetch
 globalThis.fetch = Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {

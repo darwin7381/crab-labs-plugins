@@ -2,7 +2,7 @@ import type { TakeMode } from './onsen-take.ts'
 
 export type InboxItem = {
   id: string; number: number; member: string; session_id: string | null; kind: string; from: string; waiter?: string
-  state: string; reason: string | null; note?: string | null; released?: boolean; version: number; updated_at: string; not_before?: string | null
+  state: string; reason: string | null; note?: string | null; released?: boolean; failures?: number; version: number; created_at?: string; updated_at: string; not_before?: string | null
   in_session_at?: string | null; deadline?: string | null; half_done?: boolean; relay?: string | null; refs: Array<{ kind: string; value: string }>
   message_id?: string | null; action_id?: string | null; call_id?: string | null; mail_id?: string | null
   events?: Array<{ kind: string; note: string | null; at?: string; claim_id?: string | null; session_id?: string | null; state?: string; reason?: string | null }>; payload: Record<string, any>
@@ -10,7 +10,11 @@ export type InboxItem = {
 }
 
 /** Only references travel in the M1 and lane journals. A waiting reference owns no claim. */
+export type ReceivingState = { status: string; turn?: string | null; lastTurn?: string | null }
+export type ReceivingTarget = { session_id: string; claude_pid: number; tmux: string; transcript: string; transcriptOffset?: number; stateAtOffer?: ReceivingState }
 export type ItemRef = {
+  destination?: string | null
+  target?: ReceivingTarget
   onsen_item_id: string; onsen_version: number; kind: string; from: string; deadline?: string; main?: true; refused_lane?: string
   note?: string; reason?: string; half_done?: true; conversation?: string; waiter?: string; not_before?: string
 }
@@ -47,7 +51,7 @@ export class ItemPeek {
 
   constructor(readonly mode: TakeMode, readonly index: () => Map<string, number>,
     readonly route: (it: InboxItem, change?: 'edited' | 'version') => Promise<void>, readonly canRead: () => boolean,
-    readonly waitingReady?: () => void) {}
+    readonly waitingReady?: () => void, readonly fullList?: (waiting: ReadonlyMap<string, number>) => void) {}
 
   reset(): void {
     this.generation++
@@ -149,7 +153,10 @@ export class ItemPeek {
       if (queued) this.waitingReady?.()
       this.page = r.json.next_cursor || undefined
       if (!this.page) {
-        if (!this.changedAfter) for (const id of this.failures.keys()) if (!this.seen.has(id)) this.failures.delete(id)
+        if (!this.changedAfter) {
+          for (const id of this.failures.keys()) if (!this.seen.has(id)) this.failures.delete(id)
+          this.fullList?.(this.seen)
+        }
         this.changedAfter = this.nextChangedAfter; this.nextChangedAfter = undefined
         this.previous = this.seen; this.seen = new Map()
         if (r.json.items.length) delay = this.routed ? 100 : 1000

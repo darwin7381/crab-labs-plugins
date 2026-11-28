@@ -20,10 +20,10 @@ export type ClaimStore = {
   completed(id: string): boolean
   wasOwed(id: string): boolean
   taken(row: InboxItem, ref: ItemRef): void
-  bind(id: string, session: string, turn: string, registrySession?: string): void
+  bind(id: string, session: string, turn: string): void
   report(id: string, outcome: Outcome, fields?: ReportFields): boolean
   finalStop(session: string, turn: string): void
-  continued(turn: string): void
+  continued(session: string, turn: string): void
 }
 
 export class ItemReceiver {
@@ -40,8 +40,8 @@ export class ItemReceiver {
     return reported
   }
 
-  bind(refs: ItemRef[] | undefined, session: string, turn: string, registrySession?: string): void {
-    for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn, registrySession)
+  bind(refs: ItemRef[] | undefined, session: string, turn: string): void {
+    for (const ref of refs ?? []) this.claims.bind(ref.onsen_item_id, session, turn)
   }
 
   async receive(refs: ItemRef[], hook = false, binding = false, onGone?: (ids: Set<string>) => void,

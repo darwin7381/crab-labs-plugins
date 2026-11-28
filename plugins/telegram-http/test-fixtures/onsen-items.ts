@@ -38,8 +38,10 @@ function writtenFields(row: Row, now: number, online: boolean) {
 }
 
 /** A disposable member inbox. Server time, ownership, versions and idempotency live on this side of HTTP. */
-export function fakeItems() {
+export function fakeItems(member = 'adam', actionPort?: number, clock?: () => number) {
   let now = Date.now(), seq = 0, claimSeq = 0, owner = '', seen = 0
+  let skew = 0
+  const syncTime = () => { if (clock) now = Math.max(now, clock() + skew) }
   const rows = new Map<string, Row>(), writes = new Map<string, { body: unknown; response: Response }>(), terminal = new Map<string, string>()
   const scheduleCalls = new Map<string, { id: string; run: string; result: unknown }>()
   const creates = new Map<string, { id: string; body: unknown; result: Response }>()
@@ -72,10 +74,11 @@ export function fakeItems() {
     }
   }
   const add = (id: string, kind = 'message', extra: Partial<Row> = {}): Row => {
+    syncTime()
     const number = ++seq
     const payload = kind === 'message' ? { message_id: 'm' + number, conversation_id: 'conv', kind: 'text', from: 'joey',
       via: 'telegram', text: id, client: { name: 'telegram', chat: '1', msg_id: String(number), user_id: '1', user: 'Joey' }, sent_at: iso(now) } : { text: id }
-    const row: Row = { id, number, member: 'adam', from: 'joey', session_id: kind === 'message' || extra.message_id ? 'main' : null, note: null, kind, refs: [], state: 'waiting', reason: null,
+    const row: Row = { id, number, member, from: 'joey', session_id: kind === 'message' || extra.message_id ? 'main' : null, note: null, kind, refs: [], state: 'waiting', reason: null,
       waiter: extra.from ?? 'joey', relay: null, preview: String(extra.payload?.text ?? payload.text), line: id,
       created_at: iso(now), completed_at: null, cancelled_at: null, about_item_id: null, edit_of_item_id: null,
       half_done: false, not_before: null, deadline: null, expires_at: null, failures: 0, released: false, version: 0, events: [], claim: null,
@@ -99,15 +102,18 @@ export function fakeItems() {
     return { ...item, takeable: { now: row.state === 'waiting' && !why, why }, ...(history ? { events } : {}) }
   }
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 60, async fetch(req) {
+    syncTime()
     const url = new URL(req.url), path = url.pathname, q = url.searchParams
     const b = req.method === 'GET' ? {} : await req.json().catch(() => null) as any, key = req.headers.get('Idempotency-Key')
     const connector = b?.connector ?? q.get('connector')
-    const envelope = () => ({ api_version: '1', as_of: iso(now), viewer: 'adam', read_by: null,
+    const envelope = () => ({ api_version: '1', as_of: iso(now), viewer: member, read_by: null,
       ...(connector ? { changed_after: iso(now - 1000).replace('Z', '+00:00') } : {}) })
     const detail = (data: unknown, status = 200) => Response.json({ ...envelope(), data }, { status })
     calls.push({ path, query: q, body: b, key })
     if (req.headers.get('authorization') !== 'Bearer test-member') return error(401, 'not_authenticated')
     if (!b || typeof b !== 'object' || Array.isArray(b)) return error(400, 'invalid_request')
+    if (actionPort && path.startsWith('/v1/actions')) return fetch(`http://127.0.0.1:${actionPort}${url.pathname}${url.search}`, {
+      method: req.method, headers: req.headers, ...(req.method !== 'GET' ? { body: JSON.stringify(b) } : {}) })
     if (unavailable || holdReports && path.endsWith('/report')) return error(503, 'service_unavailable')
     expire()
     // Existing resources used by the real tg daemon alongside the Item API.
@@ -122,16 +128,16 @@ export function fakeItems() {
       return detail(call)
     }
     if (path.endsWith('/batch')) return Response.json({ results: (b.items ?? []).map(() => ({ id: ++seq })) })
-    if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', 'adam'] })
-    if (path === '/v1/conversations/by-chat/6736970916') return detail({ id: 'test-account-dm', participants: ['joey-test', 'adam'] })
+    if (path === '/v1/conversations/by-chat/1') return detail({ id: 'conv', members: ['joey', member] })
+    if (path === '/v1/conversations/by-chat/6736970916') return detail({ id: 'test-account-dm', participants: ['joey-test', member] })
     const quoted = /^\/v1\/conversations\/([^/]+)\/messages\/by-client-id\/(.+)$/.exec(path)
     if (quoted) {
       const match = [...rows.values()].find(r => r.payload.conversation_id === quoted[1] && r.payload.client?.msg_id === decodeURIComponent(quoted[2]!))
       return match ? detail({ id: match.message_id }) : error(404, 'not_found')
     }
     if (path === '/v1/messages' && req.method === 'POST') return detail({ id: String(++seq), delivery: 'sent' })
-    if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: 'adam', kind: 'agent' })
-    if (path.endsWith('/commands')) return detail({ name: 'adam', kind: 'agent' })
+    if (path.endsWith('/observation') && b.connector === undefined) return detail({ name: member, kind: 'agent' })
+    if (path.endsWith('/commands')) return detail({ name: member, kind: 'agent' })
     if (path === '/inbox' && req.method === 'GET') {
       if (mode === 200) return Response.json({ detail: { code: 'take_member' } }, { status: 409 })
       const after = Number(q.get('after'))
@@ -148,7 +154,7 @@ export function fakeItems() {
       pullAcked = Math.max(pullAcked, b.upto)
       return Response.json({ acked: 1 })
     }
-    const base = '/v1/members/adam/items'
+    const base = `/v1/members/${member}/items`
     if (req.method === 'POST' && /^\/v1\/members\/[^/]+\/items$/.test(path)) {
       if (path !== base) return error(403, 'not_authorized')
       if (!key || !validCreate(b)) return error(400, 'invalid_request')
@@ -156,7 +162,7 @@ export function fakeItems() {
       if (old && rows.has(old.id)) return Bun.deepEquals(old.body, b) ? old.result.clone() : error(409, 'version_conflict')
       const id = crypto.randomUUID()
       written.add(id)
-      const row = add(id, b.kind, { from: 'adam', waiter: b.waiter ?? 'adam', session_id: b.session_id ?? null,
+      const row = add(id, b.kind, { from: member, waiter: b.waiter ?? member, session_id: b.session_id ?? null,
         refs: b.refs, not_before: b.not_before ?? null, deadline: b.deadline ?? null, expires_at: b.expires_at ?? null,
         payload: b.body ? { text: b.body.text, format: b.body.format } : { text: '' } })
       const result = detail(view(row), 201)
@@ -166,7 +172,7 @@ export function fakeItems() {
     if (req.method === 'DELETE' && /^\/v1\/items\/[^/]+$/.test(path)) {
       const row = rows.get(decodeURIComponent(path.slice('/v1/items/'.length)))
       if (!row) return error(404, 'not_found')
-      if (row.from !== 'adam') return error(403, 'not_authorized')
+      if (row.from !== member) return error(403, 'not_authorized')
       if (!b || Object.keys(b).some(k => k !== 'outcome' && k !== 'expected_version')) return error(400, 'invalid_request')
       const outcome = b.outcome === undefined ? 'withdrawn' : b.outcome
       if (!Number.isInteger(b.expected_version) || !['withdrawn', 'superseded', 'completed'].includes(outcome)
@@ -234,11 +240,11 @@ export function fakeItems() {
       if (claim_id) takes.set(idem, { claim: claim_id, body: b, result: answer.clone() })
       if (delayTake) await Bun.sleep(delayTake)
       return answer
-    } else if (path === '/v1/members/adam/observation' && req.method === 'PUT') {
+    } else if (path === `/v1/members/${member}/observation` && req.method === 'PUT') {
       if (!Array.isArray(b.held_item_ids)) return error(400, 'invalid_request')
       observedAt = now
       for (const id of b.held_item_ids) { const r = rows.get(id); if (r?.claim?.connector === connector) r.claim.expires_at = iso(now + 45_000) }
-      answer = detail({ name: 'adam', kind: 'agent' })
+      answer = detail({ name: member, kind: 'agent' })
     } else {
       const row = rows.get(decodeURIComponent(path.split('/')[3] ?? ''))
       if (!row) return error(404, 'not_found')
@@ -280,15 +286,15 @@ export function fakeItems() {
   } })
   return { base: 'http://127.0.0.1:' + server.port, rows, calls, scheduleCalls, history, add, change, now: () => now,
     advance(ms: number) {
-      now += ms; expire()
+      now += ms; skew += ms; expire()
       // The S4 promise_due notice to the waiter of a self row whose deadline passed while it was still open.
       for (const row of rows.values()) {
         if (row.kind !== 'self' || !row.deadline || Date.parse(row.deadline) >= now || overdue.has(row.id)
           || (row.state !== 'waiting' && row.state !== 'claimed')) continue
         overdue.add(row.id)
-        const id = crypto.randomUUID(), member = row.waiter ?? row.from
-        if (member !== 'adam') elsewhere.add(id)
-        add(id, 'notice', { member, from: 'system', about_item_id: row.id, reason: 'promise_due' })
+        const id = crypto.randomUUID(), to = row.waiter ?? row.from
+        if (to !== member) elsewhere.add(id)
+        add(id, 'notice', { member: to, from: 'system', about_item_id: row.id, reason: 'promise_due' })
       }
     }, mode(status: number) { mode = status }, down(on: boolean) { unavailable = on },
     holdReports(on: boolean) { holdReports = on }, delayTake(ms: number) { delayTake = ms }, stop() { for (const wake of waiters) wake(); return server.stop(true) } }
