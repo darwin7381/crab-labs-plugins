@@ -1048,7 +1048,7 @@ export class OnsenClient {
         const line = t.line.r
         // A C6 spool may outlive both its local claim and take mode. Migrate its wire body even without a watcher.
         const sid = line.body.session_id
-        const body = claudeSessionId(sid) ? { ...line.body, session_id: this.cfg.roamer ? roamerSessionId(this.cfg.agent, sid) : 'main' } : line.body
+        const body = sid && claudeSessionId(sid) ? { ...line.body, session_id: this.cfg.roamer ? roamerSessionId(this.cfg.agent, sid) : 'main' } : line.body
         const path = '/v1/items/' + encodeURIComponent(line.item_id) + '/report'
         const key = ['ir', line.item_id, body.claim_id, body.outcome].map(encodeURIComponent).join(':')
         const r = await this.put(path, body, cred, undefined, { 'Idempotency-Key': key }).catch(e => ({ status: 0, json: { error: errText(e) } }))

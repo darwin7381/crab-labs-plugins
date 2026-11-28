@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { TakeMode } from './onsen-take.ts'
 
-export const claudeSessionId = (id?: string | null): id is string =>
+export const claudeSessionId = (id?: string | null): boolean =>
   !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
 
 /** Onsen accepts a decimal suffix. The transcript's UUID survives a new PID, tmux pane or connector. */

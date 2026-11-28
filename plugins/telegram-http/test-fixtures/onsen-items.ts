@@ -237,7 +237,7 @@ export function fakeItems(member = 'adam', actionPort?: number, clock?: () => nu
         Object.assign(row, { state: 'claimed', reason: null, note: null, in_session_at: null, claim: { id: claim_id, connector, session_id: null, taken_at: iso(now), expires_at: iso(now + 45_000) } })
         issued.add(row.id + '/' + claim_id)
         lastClaim.set(row.id, claim_id!)
-        change(row, 'taken')
+        change(row, 'claimed')
       }
       const waiting = [...rows.values()].filter(r => !elsewhere.has(r.id) && r.state === 'waiting')
       answer = detail({ claim_id, items: given.map(r => view(r, false)), waiting: waiting.length, next_not_before: waiting.map(r => r.not_before).filter(Boolean).sort()[0] ?? null })

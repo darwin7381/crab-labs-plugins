@@ -44,7 +44,7 @@ export class Claims implements ClaimStore {
       const data = JSON.parse(readFileSync(file, 'utf8'))
       this.rows = Object.assign(Object.create(null), data.claims)
       // C6 persisted the registry UUID in session_id. Earlier ledgers already kept the two identities apart.
-      for (const row of Object.values(this.rows)) if (claudeSessionId(row.session_id)) {
+      for (const row of Object.values(this.rows)) if (row.session_id && claudeSessionId(row.session_id)) {
         row.registry_session = row.session_id
         row.session_id = row.target ? roamerSessionId(spool.cfg.agent, row.registry_session) : 'main'
       }
@@ -197,7 +197,7 @@ export class Claims implements ClaimStore {
     if (outcome === 'in_session' && row.turn) line.binding = { turn: row.turn, registry_session: row.registry_session }
     if (!this.spool.recordItemReport(line)) throw new Error('could not spool item report for ' + id)
     this.replay(line)
-    this.save(); this.clock(id)
+    this.clock(id)
     return true
   }
   /** Restore a line appended before a crash between the spool append and ledger rename. */
@@ -223,6 +223,7 @@ export class Claims implements ClaimStore {
       row.session_id ??= legacy ? (row.target ? roamerSessionId(this.spool.cfg.agent, legacy) : 'main') : body.session_id
       if (row.target && !this.receivers.has(id)) this.receivers.set(id, row.target.session_id)
     }
+    this.save()
   }
   acknowledged(line: ItemReport, accepted: boolean): void {
     const { item_id: id, body } = line

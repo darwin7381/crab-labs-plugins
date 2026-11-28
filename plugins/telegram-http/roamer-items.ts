@@ -67,13 +67,14 @@ export class RoamerItems {
       if (first) {
         // Older events can repeat Item.session_id. A sender preset alone cannot identify a receiver.
         let sid = first.session_id !== created.session_id ? first.session_id : null
+        const prefix = member + '.roam.'
         const receiverId = (s?: string | null) => claudeSessionId(s) ||
-          (s?.startsWith(member + '.roam.') && /^\d{1,39}$/.test(s.slice(member.length + 6)))
+          (s?.startsWith(prefix) && /^\d{1,39}$/.test(s.slice(prefix.length)))
         if (!receiverId(sid) && created.session_id === null) sid = detail.session_id
         if (!sid || !receiverId(sid)) return null
         this.o.claims.recoverReceiver(row.id, sid)
         session = sid
-      } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'taken')) return null
+      } else if (detail.reason === 'cut' && !detail.events?.some(e => e.kind === 'claimed' || e.kind === 'taken')) return null
     }
     session ??= this.o.claims.selectedAt(Date.parse(row.created_at ?? ''))?.session_id
     if (!session) return null

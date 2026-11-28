@@ -6,7 +6,7 @@ import { fakeItems } from './test-fixtures/onsen-items.ts'
 import { OnsenClient, roamerMember } from './onsen-client.ts'
 import { OnsenInbox, OnsenPuller, switchOn } from './onsen-inbox.ts'
 import { deliveryMode, machineName, takeRefusal, TakeMode, takeModeActive } from './onsen-take.ts'
-import { ItemPeek, itemRef, type InboxItem } from './onsen-items.ts'
+import { ItemPeek, itemRef, roamerSessionId, type InboxItem } from './onsen-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver, type Outcome } from './onsen-receive.ts'
 import { createMain, MAIN_IDLE_CONFIRM_MS, MAIN_STUCK_MS, toolSilenceMs, type MainApi, type MainEvent, type MainWall } from './lanes-main.ts'
@@ -905,6 +905,10 @@ test('an intake spooled just before a crash restores its local turn without send
   const beforeBind = readFileSync(r.file)
   r.receiver.bind([itemRef(row)], 'main', 'receiving-turn', sid)
   writeFileSync(r.file, beforeBind)
+  const recovered = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
+  r.client.watchItemReports(l => recovered.replay(l), (l, ok) => recovered.acknowledged(l, ok))
+  await r.sync()
+  // A second restart has only the ledger. The acknowledged intake has left the spool.
   const restored = new Claims(r.file, r.client, () => {}, () => {}, r.f.now)
   r.client.watchItemReports(l => restored.replay(l), (l, ok) => restored.acknowledged(l, ok))
   restored.finalStop(sid, 'receiving-turn')
@@ -913,6 +917,16 @@ test('an intake spooled just before a crash restores its local turn without send
   expect(r.outcomes(row.id)).toEqual(['in_session', 'completed'])
   expect(r.f.history.map(h => h.body.session_id)).toEqual(['main', 'main'])
   expect(JSON.stringify(r.f.history)).not.toContain(sid)
+})
+
+test.each([false, true])('a C6 report drains without a claim watcher, roamer=%s', async roamer => {
+  const r = rig(), row = r.f.add('old-spool'), sid = crypto.randomUUID()
+  await r.mode.probe(); await r.receiver.receive([itemRef(row)])
+  const client = new OnsenClient({ ...r.client.cfg, roamer })
+  client.recordItemReport({ item_id: row.id, body: { claim_id: row.claim!.id, at: new Date().toISOString(), outcome: 'in_session', session_id: sid } })
+  await client.syncNow(true)
+  expect(row.claim!.session_id).toBe(roamer ? roamerSessionId('adam', sid) : 'main')
+  expect(row.in_session_at).toBeTruthy()
 })
 
 test('the four roamer bot names resolve to their registered members without lanes', () => {
