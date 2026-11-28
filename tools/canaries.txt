@@ -243,7 +243,7 @@ plugins/telegram-http/onsen-connector-actions-daemon.test.ts::no ONSEN_BRIDGE (t
 plugins/telegram-http/server.ts::const OFFICER_ON_SCREEN = 'on the screen by the duty officer'
 plugins/telegram-http/onsen-client.ts::resolved ${option_id} by ${who} (pressed ${where})
 plugins/telegram-http/onsen-inbound.ts::export const albumItem = (f: Pick<Facts, 'mgid' | 'image' | 'attachment' | 'fromReply'>): boolean =>
-plugins/telegram-http/onsen-album-restart-daemon.test.ts::killed while their photos are fetched; restarted: one tag with the three, once
+plugins/telegram-http/onsen-album-restart-daemon.test.ts::a connector killed during photo download routes one album across two restarts
 plugins/telegram-http/startup-picker.ts::hot?: () => Iterable<string>
 plugins/telegram-http/server.ts::hot: hotPanes,
 plugins/telegram-http/server.ts::function hotPanes(): string[] {

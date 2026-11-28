@@ -17,7 +17,7 @@ import { join } from 'path'
 import { spawnSync } from 'child_process'
 import { startBotApiMock, type BotApiMock } from './test-fixtures/tg-bot-api-mock.ts'
 import { startOnsenStandin, type OnsenStandin } from './test-fixtures/onsen-standin.ts'
-import { startTgDaemon, freePort, until, sleep, type TgDaemon } from './test-fixtures/tg-daemon.ts'
+import { actionRow, personRow, startTgDaemon, freePort, until, sleep, type TgDaemon } from './test-fixtures/tg-daemon.ts'
 
 const JOEY = 1828
 const CRED = { k: 'mesh_SEG2connectorSECRETsecretSECRETsec01', n: 'mesh_SEG2noownerSECRETsecretSECRETsecr01' }
@@ -25,13 +25,16 @@ let root = '', sock = '', pane = '', apiK: BotApiMock, apiN: BotApiMock, onsen: 
 const tmuxEnv = (): Record<string, string> => { const e = { ...process.env, TMUX_TMPDIR: sock } as Record<string, string>; delete e.TMUX; return e }
 const tm = (...a: string[]) => spawnSync('tmux', a, { env: tmuxEnv(), encoding: 'utf8' })
 const health = (d: TgDaemon) => fetch(`http://127.0.0.1:${d.port}/healthz`).then(r => r.json()) as Promise<any>
-const hand = async (d: TgDaemon, payload: Record<string, unknown>, seq: number) => {
-  const r = await fetch(`http://127.0.0.1:${d.port}/onsen/person`, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ kind: 'person_message', seq, dedupe: `pm:${payload.message_id}`, payload }) })
-  return { status: r.status, json: await r.json() as any }
+const hand = async (d: TgDaemon, payload: Record<string, unknown>, _seq: number) => {
+  const row = personRow(d, payload)
+  await until(() => row.state === 'completed' || !!queuedTag(d, String((payload.client as any)?.msg_id)), 10000)
+  return row
 }
-const control = async (d: TgDaemon, c: unknown) => (await fetch(`http://127.0.0.1:${d.port}/onsen/action`, { method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify(c) })).status
+const control = async (d: TgDaemon, c: ReturnType<OnsenStandin['press']>) => {
+  const row = actionRow(d, c)
+  await until(() => row.state === 'completed' || row.state === 'cancelled', 10000)
+  return row.state
+}
 const cmd = (n: number, text: string, extra: Record<string, unknown> = {}) => ({ message_id: String(6000 + n), conversation_id: onsen.conv(String(JOEY)), from: 'joey',
   via: 'telegram', text, kind: 'command', sent_at: new Date().toISOString(), attachments: [], reply_to: null,
   client: { name: 'telegram', chat: String(JOEY), msg_id: String(n), user: 'joey', user_id: String(JOEY) }, ...extra })
@@ -44,7 +47,6 @@ const journal = (d: TgDaemon): any[] => {
   return existsSync(f) ? readFileSync(f, 'utf8').trim().split('\n').map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean) : []
 }
 const queuedTag = (d: TgDaemon, id: string) => journal(d).find(l => l.rec === 'msg' && l.notif?.params?.meta?.message_id === id)
-const factsOf = (id: string) => onsen.seen.filter(s => s.who === 'k' && s.path === '/deliveries/batch').flatMap(s => s.body?.items ?? []).filter((f: any) => f.client_msg_id === id)
 
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), 'onsen-connector-seg2-'))
@@ -55,15 +57,14 @@ beforeAll(async () => {
   onsen = startOnsenStandin({ [CRED.k]: 'k', [CRED.n]: 'n' }, await freePort())
   onsen.st.version.k = '0.35.8'; onsen.st.version.n = '0.35.8'
   onsen.st.bridge.k = { on: true, delayMs: 50, next: 3000 }
-  writeFileSync(join(root, 'cred-k'), CRED.k + '\n'); writeFileSync(join(root, 'cred-n'), CRED.n + '\n')
   apiK = startBotApiMock({}, { pollHoldMs: 200 }); apiN = startBotApiMock({}, { pollHoldMs: 200 })
   const env = { ONSEN_BASE: `http://127.0.0.1:${onsen.port}/api/onsen`, ONSEN_PEER_LOOKUP: '0', ONSEN_CLAUDE_BIN: '/nonexistent/claude', TELEGRAM_BOT_TOKEN: '',
     ONSEN_BRIDGE: 'adam' }
   ;[k, n] = await Promise.all([
-    startTgDaemon(apiK, join(root, 'k'), JOEY, { ...env, ONSEN_OWNER: 'joey', ONSEN_CREDENTIAL_FILE: join(root, 'cred-k'), CHANNEL_BOT_TMUX_SESSION: pane, TMUX_TMPDIR: sock,
+    startTgDaemon(apiK, join(root, 'k'), JOEY, { ...env, ONSEN_OWNER: 'joey', FIXTURE_MEMBER_TOKEN: CRED.k, CHANNEL_BOT_TMUX_SESSION: pane, TMUX_TMPDIR: sock,
       SYSTEM_ALERT_FORWARD: '1' }, h => h?.ok === true),
     // no ONSEN_OWNER, and access.json's person (1828) maps to no Onsen member (TG_MEMBERS): no owner
-    startTgDaemon(apiN, join(root, 'n'), JOEY, { ...env, GENESIS_LANES: '0', ONSEN_CREDENTIAL_FILE: join(root, 'cred-n') }, h => h?.ok === true),
+    startTgDaemon(apiN, join(root, 'n'), JOEY, { ...env, GENESIS_LANES: '0', FIXTURE_MEMBER_TOKEN: CRED.n }, h => h?.ok === true),
   ])
 }, 60000)
 afterAll(async () => { await Promise.all([k?.stop(), n?.stop()]); apiK?.stop(); apiN?.stop(); onsen?.stop(); tm('kill-server'); try { rmSync(sock, { recursive: true }) } catch {} })
@@ -83,21 +84,20 @@ test('1. the command list: PUT /v1/members/adam/commands at start, the list setM
 
 test('2. /status from Onsen (kind command): today\'s handler answers it with one Onsen message in the command\'s turn; nothing reaches a session; its receipt goes to the end', async () => {
   const r = await hand(k, cmd(2001, '/status'), 1)
-  expect(r).toMatchObject({ status: 200, json: { delivered: true, handled_here: true } })
+  expect(r.state).toBe('completed')
   expect(await until(() => said().some(b => String(b.body).startsWith('Paired as @joey.')), 8000)).toBe(true)
   const b = said().find(x => String(x.body).startsWith('Paired as @joey.'))!
   expect(b).toMatchObject({ conversation_id: onsen.conv(String(JOEY)), sender: 'system:control', turn_id: `daemon:${JOEY}:2001` })
   expect(b.body).toContain('📊 channel-bot status')
   await sleep(500)
   expect(queuedTag(k, '2001')).toBeUndefined()
-  expect(await until(() => factsOf('2001').some((f: any) => f.state === 'turn_end'), 8000)).toBe(true)
-  expect(factsOf('2001').find((f: any) => f.state === 'turn_end')).toMatchObject({ by: 'daemon', outcome: 'done', turn_id: `daemon:${JOEY}:2001` })
+  expect(k.items.calls.some(c => c.path.endsWith('/report') && c.body?.outcome === 'completed')).toBe(true)
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
 })
 
 test('3. bare /model: one Action (source menu, menu_kind model_picker, the answer its body, its buttons the options, the owner asked, expires_at 10 min ahead), no second message; a press runs the tap\'s /model <value>', async () => {
   const before = said().length
-  expect((await hand(k, cmd(2002, '/model'), 2)).json.handled_here).toBe(true)
+  expect((await hand(k, cmd(2002, '/model'), 2)).state).toBe('completed')
   expect(await until(() => made('k', a => a.menu_kind === 'model_picker').length === 1, 8000)).toBe(true)
   const a = made('k', x => x.menu_kind === 'model_picker')[0]!
   expect(a).toMatchObject({ source: 'menu', session_id: 'main', assignees: ['joey'], state: 'open' })
@@ -112,8 +112,8 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
   expect(sent.body.expiry_note).toBe('沒選：沒有更動')                     // Onsen 0.36.0: what Onsen writes into its note when it expires
   await sleep(500)
   expect(said().length).toBe(before)                                       // CONTRACT §7d: no second message
-  expect(await control(k, onsen.press(a.id, '2'))).toBe(202)
-  expect(await until(() => acall(a.id, 'applied').length === 1, 20000)).toBe(true)
+  expect(await control(k, onsen.press(a.id, '2'))).toBe('completed')
+  expect(acall(a.id, 'applied')).toHaveLength(0)
   expect(said().length).toBeGreaterThan(before)                            // what /model <value> answers (as the tap's) is an Onsen message
   expect(k.log()).toContain(`connector: action ${a.id} (a command's choice): option 2 pressed in Onsen, done as a tap on it`)
   expect(apiK.calls).toEqual([]); expect((await health(k)).connector.bot_api_refused).toEqual({})
@@ -122,7 +122,7 @@ test('3. bare /model: one Action (source menu, menu_kind model_picker, the answe
 test('3b. bare /model with no Action (Onsen refused it): the answer is one Onsen message in the command\'s turn, with the line that the choice could not be offered and the handler\'s own `/model <id>`', async () => {
   onsen.st.actionRefuse = { k: 400 }
   try {
-    expect((await hand(k, cmd(2042, '/model'), 42)).json.handled_here).toBe(true)
+    expect((await hand(k, cmd(2042, '/model'), 42)).state).toBe('completed')
     expect(await until(() => said().some(b => b.turn_id === `daemon:${JOEY}:2042`), 10000)).toBe(true)
     const mine = said().filter(b => b.turn_id === `daemon:${JOEY}:2042`)
     expect(mine).toHaveLength(1)
@@ -138,7 +138,7 @@ test('3b. bare /model with no Action (Onsen refused it): the answer is one Onsen
 test('4. /clear: typed on the pane; ONE message: 「不要讓它看到之前的」 an Action whose body is the reply, no reply message beside it; expiring in 5 s with its expiry_note, no cancel from the daemon (expiry is Onsen\'s); pressed inside: the line by conversation_id at the /clear\'s time', async () => {
   const t0 = new Date().toISOString()
   const replies = () => said().filter(b => String(b.body).includes('已送 `/clear`'))
-  expect((await hand(k, cmd(2003, '/clear', { sent_at: t0 }), 3)).json.handled_here).toBe(true)
+  expect((await hand(k, cmd(2003, '/clear', { sent_at: t0 }), 3)).state).toBe('completed')
   expect(await until(() => made('k', x => x.options?.[0]?.id === 'line').length === 1, 8000)).toBe(true)
   const a = made('k', x => x.options?.[0]?.id === 'line')[0]!
   expect(a).toMatchObject({ source: 'menu', menu_kind: 'other', options: [{ id: 'line', label: '不要讓它看到之前的' }], assignees: ['joey'] })
@@ -159,7 +159,7 @@ test('4. /clear: typed on the pane; ONE message: 「不要讓它看到之前的�
   expect(onsen.actions.get(a.id)!.state).toBe('open')                     // the stand-in has no expiry sweep: nobody but Onsen ends it
   expect(onsen.lines.filter(l => l.who === 'k')).toHaveLength(0)
   // a press whose control comes after the window (+1 s): as today, no line; cancelled with what stands
-  expect(await control(k, onsen.press(a.id, 'line'))).toBe(202)
+  expect(await control(k, onsen.press(a.id, 'line'))).toBe('cancelled')
   expect(await until(() => acall(a.id, 'cancel').length === 1, 5000)).toBe(true)
   expect(acall(a.id, 'cancel')[0]!.body).toMatchObject({ note: '沒按：新的一段看得到之前的對話' })
   expect(onsen.lines.filter(l => l.who === 'k')).toHaveLength(0)
@@ -168,12 +168,12 @@ test('4. /clear: typed on the pane; ONE message: 「不要讓它看到之前的�
   await hand(k, cmd(2004, '/clear', { sent_at: t1 }), 4)
   expect(await until(() => made('k', x => x.options?.[0]?.id === 'line' && x.id !== a.id).length === 1, 8000)).toBe(true)
   const b = made('k', x => x.options?.[0]?.id === 'line' && x.id !== a.id)[0]!
-  expect(await control(k, onsen.press(b.id, 'line'))).toBe(202)
+  expect(await control(k, onsen.press(b.id, 'line'))).toBe('completed')
   expect(await until(() => onsen.lines.some(l => l.who === 'k'), 5000)).toBe(true)
   const line = onsen.lines.find(l => l.who === 'k')!.body
   expect(line).toMatchObject({ conversation_id: onsen.conv(String(JOEY)), client_msg_id: '2004', at: t1, by: `tg:${JOEY}` })
   for (const x of ['agent', 'client', 'chat']) expect(x in line).toBe(false)
-  expect(await until(() => acall(b.id, 'applied').length === 1, 5000)).toBe(true)
+  expect(acall(b.id, 'applied')).toHaveLength(0)
   await sleep(5500)
   expect(acall(b.id, 'cancel')).toHaveLength(0)
   expect(b.body.text).toContain('已送 `/clear`')
@@ -186,7 +186,7 @@ test('4b. /clear with no Action (Onsen refused it): the reply is one Onsen messa
   // a connector's Actions are on whatever ONSEN_ACTIONS says (connectorNow): the no-Action path a connector meets is Onsen refusing (or no owner)
   onsen.st.actionRefuse = { k: 400 }
   try {
-    expect((await hand(k, cmd(2041, '/clear'), 41)).json.handled_here).toBe(true)
+    expect((await hand(k, cmd(2041, '/clear'), 41)).state).toBe('completed')
     expect(await until(() => said().some(b => String(b.body).includes('已送 `/clear`') && b.turn_id === `daemon:${JOEY}:2041`), 10000)).toBe(true)
     expect(said().find(b => b.turn_id === `daemon:${JOEY}:2041`)!.body).toContain('它還查得到之前的對話。')
     expect(onsen.acalls.some(c => c.who === 'k' && c.method === 'POST' && c.path === '/v1/actions' && String(c.body?.body?.text ?? '').includes('已送 `/clear`'))).toBe(true)
@@ -198,10 +198,10 @@ test('4b. /clear with no Action (Onsen refused it): the reply is one Onsen messa
 
 test('5. a page message "/status" (via web, kind text) is a command too; "/nosuch x" goes on to the session as a message', async () => {
   const web = { ...cmd(2005, '/status'), via: 'web', kind: 'text', client: { name: 'telegram', chat: String(JOEY), msg_id: 'form-6105', user: 'joey', user_id: String(JOEY) } }
-  expect((await hand(k, web, 5)).json.handled_here).toBe(true)
+  expect((await hand(k, web, 5)).state).toBe('completed')
   expect(await until(() => said().filter(b => String(b.body).startsWith('Paired as')).length >= 2, 8000)).toBe(true)
   const r = await hand(k, cmd(2006, '/nosuch x'), 6)
-  expect(r.json.handled_here).toBeUndefined()
+  expect(r.state).toBe('waiting')
   expect(await until(() => !!queuedTag(k, '2006'), 8000)).toBe(true)
   expect(queuedTag(k, '2006').notif.params.content).toBe('/nosuch x')
 })
@@ -211,13 +211,13 @@ test('6. a person\'s message in a thread: the tag\'s topic / topic_name as the m
   onsen.threads.push({ who: 'k', cid, thread: '301', name: '整理月報', state: 'open', client_thread: '7001', history: [] })
   const m = { ...cmd(2007, '月報的進度？'), kind: 'text', thread: '301', topic_name: '整理月報',
     client: { name: 'telegram', chat: String(JOEY), msg_id: '2007', user: 'joey', user_id: String(JOEY), thread: '7001' } }
-  expect((await hand(k, m, 7)).status).toBe(200)
+  expect((await hand(k, m, 7)).state).toBe('waiting')
   expect(await until(() => !!queuedTag(k, '2007'), 8000)).toBe(true)
   const q = queuedTag(k, '2007')
   expect(q.notif.params.meta).toMatchObject({ topic: '7001', topic_name: '整理月報' })
-  const ev = journal(k).find(l => l.rec === 'event' && l.id === `tg-${JOEY}-2007`)
+  const ev = journal(k).find(l => l.rec === 'event' && l.id.startsWith('item-8007-v'))
   expect(ev?.tg?.topic).toBe('301')                                           // the router's (and the lanes') topic: Onsen's thread
-  expect(k.log()).toContain(`lanes: route tg-${JOEY}-2007`)
+  expect(k.log()).toContain(`lanes: route item-8007-v`)
   const r1 = await k.call('reply', { chat_id: String(JOEY), text: '在做了', topic: '7001' })
   expect(r1.isError).toBe(false)
   expect(said().at(-1)).toMatchObject({ body: '在做了', thread: '301', sender: 'main' })

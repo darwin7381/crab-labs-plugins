@@ -94,11 +94,10 @@ beforeAll(async () => {
     state: { type: 'choice', instructions: 'x', criteria: { working: 'a', idle: 'b', waiting_for_human: 'c', other: 'd' } }, fits_any: { type: 'noul', instructions: 'y' },
     menu: { type: 'choice', instructions: 'z', criteria: { none: 'n', model_picker: 'm', other: 'o' } } } }
   writeFileSync(join(root, 'questions.json'), JSON.stringify(q))
-  mkdirSync(join(root, 'cred'), { recursive: true }); writeFileSync(join(root, 'cred', 'mesh-credential'), CRED + '\n')
   // the duty officer off for every pane; the stand-in pane runs `sleep`, which counts as Claude Code here (its config's claude_cmds)
   mkdirSync(join(root, 'd', 'home', '.claude', 'duty-officer'), { recursive: true })
   writeFileSync(join(root, 'd', 'home', '.claude', 'duty-officer', 'config.json'), JSON.stringify({ enabled: [], claude_cmds: ['sleep'] }))
-  d = await startTgDaemon(api, join(root, 'd'), TEST_ACCOUNT, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'),
+  d = await startTgDaemon(api, join(root, 'd'), TEST_ACCOUNT, { GENESIS_LANES: '0', ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, FIXTURE_MEMBER_TOKEN: CRED,
     ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0', CHANNEL_BOT_TMUX_SESSION: 'jevtest-adam', ...tmuxEnv, JEV_SCREEN: 'adam', JEV_SCREEN_QUESTIONS: join(root, 'questions.json'),
     TYPESAFE_API_KEY: 'test-key-not-real', TYPESAFE_KEY_FILE: '', TYPESAFE_BASE_URL: `http://127.0.0.1:${jevPort}` })
 }, 40000)
@@ -170,7 +169,7 @@ test.skipIf(!HAS_TMUX)("JEV_SCREEN on: Onsen gets Jev's reading of the pane, it 
   expect(bank()[1].screen.screen_bottom).toContain('Select model')
 }, 40000)
 
-test.skipIf(!HAS_TMUX)("lanes on (LANES_WAKE_DECIDE, ONSEN_WAKE_LOG): a menu on the pane → a colleague's call is decided by the record (waiting) and its wake row says member_state waiting", async () => {
+test.skipIf(!HAS_TMUX)("lanes on: a menu on the pane keeps a colleague's call waiting without a wake projection", async () => {
   writeFileSync(join(root, 'bea-screen.txt'), MENU)
   expect(tmux('new-session', '-d', '-s', 'jevtest-bea', '-x', '100', '-y', '30', `cat ${join(root, 'bea-screen.txt')}; exec sleep 3600`).status).toBe(0)
   const api2 = startBotApiMock({}, { pollHoldMs: 300 })
@@ -180,12 +179,12 @@ test.skipIf(!HAS_TMUX)("lanes on (LANES_WAKE_DECIDE, ONSEN_WAKE_LOG): a menu on 
   register(join(root, 'bea'))                                                        // registered (not connected): past "starting"
   const b = await startTgDaemon(api2, join(root, 'bea'), JOEY, { GENESIS_LANES: '1', LANES_AGENT: 'bea', AGENT_INBOX_SELF: 'bea', LANES_WAKE_DECIDE: 'bea', ONSEN_WAKE_LOG: 'bea',
     AGENT_INBOX_REGISTRY: join(root, 'registry.json'),
-    ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'), ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0',
+    ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, FIXTURE_MEMBER_TOKEN: CRED, ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0',
     CHANNEL_BOT_TMUX_SESSION: 'jevtest-bea', ...tmuxEnv, JEV_SCREEN: 'bea', JEV_SCREEN_QUESTIONS: join(root, 'questions.json'),
     TYPESAFE_API_KEY: 'test-key-not-real', TYPESAFE_KEY_FILE: '', TYPESAFE_BASE_URL: `http://127.0.0.1:${jevPort}` }).catch(e => { api2.stop(); throw e })
   try {
     expect(await until(() => statuses('bea').some(s => s.state === 'waiting' && s.detail?.waitingFor === 'model_picker'), 15000)).toBe(true)
-    const tok = await (async () => { for (let i = 0; i < 100; i++) { try { const t = readFileSync(join(root, 'bea', 'tok', String(b.port)), 'utf8').trim(); if (t) return t } catch {} await new Promise(r => setTimeout(r, 100)) } return '' })()
+    const tok = 'test-loopback'
     const route = (ev: any) => fetch(`http://127.0.0.1:${b.port}/lanes/route`, { method: 'POST', headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' }, body: JSON.stringify(ev) }).then(r => r.json())
     const mesh = (id: string, from: string, text: string, verified: boolean) => ({ id, source: 'mesh', from, text, meta: { user: from }, verified, line: 'call', btcc_msg_id: id.slice(5),
       notif: { method: 'notifications/claude/channel', params: { content: text, meta: { user: from } } } })
@@ -194,8 +193,7 @@ test.skipIf(!HAS_TMUX)("lanes on (LANES_WAKE_DECIDE, ONSEN_WAKE_LOG): a menu on 
     const routing = () => lines(join(b.ws, '.lanes', 'routing.jsonl'))
     expect(await until(() => routing().some(r => r.event === 'mesh-61001') && routing().some(r => r.event === 'mesh-61002'), 8000)).toBe(true)
     expect(routing().find(r => r.event === 'mesh-61001')).toMatchObject({ rule: 'wake:unverified', decided_by: 'new', wake_target: 'held:waiting' })
-    expect(await until(() => wakes.filter(w => w.agent === 'bea' && w.source_kind === 'peer_call').length >= 2, 15000)).toBe(true)
-    for (const w of wakes.filter(w => w.agent === 'bea' && w.source_kind === 'peer_call')) expect(w.member_state).toBe('waiting')
+    expect(wakes).toEqual([])
     expect(onsenNow('bea')).toMatchObject({ state: 'waiting' })
     // WO-169 part 2: the observation of the lanes daemon: the held call is in the main's queue, the main blocked by the menu
     await b.client()
@@ -219,7 +217,7 @@ test.skipIf(!HAS_TMUX)('SCREEN_JUDGE=program: no judge; Jev never asked; the rec
   register(join(root, 'cyd'))                                                        // registered (not connected): past "starting"
   const n0 = asked.length
   const c = await startTgDaemon(api3, join(root, 'cyd'), JOEY, { GENESIS_LANES: '0', LANES_AGENT: 'cyd', AGENT_INBOX_SELF: 'cyd', SCREEN_JUDGE: 'program',
-    ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, ONSEN_CREDENTIAL_FILE: join(root, 'cred', 'mesh-credential'), ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0',
+    ONSEN_BASE: `http://127.0.0.1:${onsenPort}/api/onsen`, FIXTURE_MEMBER_TOKEN: CRED, ONSEN_PEER_LOOKUP: '0', ONSEN_REGISTRY_CLI: '0',
     CHANNEL_BOT_TMUX_SESSION: 'jevtest-cyd', ...tmuxEnv, JEV_SCREEN: 'cyd', JEV_SCREEN_QUESTIONS: join(root, 'questions.json'),
     TYPESAFE_API_KEY: 'test-key-not-real', TYPESAFE_KEY_FILE: '', TYPESAFE_BASE_URL: `http://127.0.0.1:${jevPort}` }).catch(e => { api3.stop(); throw e })
   try {

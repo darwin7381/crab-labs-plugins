@@ -99,7 +99,7 @@ describe('CallFacts: the moments, only forward', () => {
 describe('which items are Calls (callRefOf): the four kinds, by the call id the pulled item carries', () => {
   const ev = (o: Record<string, unknown>) => ({ id: 'mesh-x', source: 'mesh', from: 'chiron', text: 't', meta: {}, notif: { method: '', params: {} }, ...o }) as any
   test('a peer call, a scheduled run, a paged alert, an urgent board item: the id it carries', () => {
-    for (const k of ['peer_call', 'scheduled', 'alert', 'board']) expect(L.callRefOf(ev({ item_kind: k, call_id: '344' }))).toEqual({ kind: k, id: '344' })
+    for (const k of ['peer_call', 'scheduled', 'alert', 'board'] as const) expect(L.callRefOf(ev({ item_kind: k, call_id: '344' }))).toEqual({ kind: k, id: '344' })
   })
   test('nothing to report: no call id (before its Call exists), a reply, a daemon\'s silent notice, a watchdog wake line, a mail, Joey, a synthetic run', () => {
     expect(L.callRefOf(ev({ item_kind: 'peer_call', btcc_msg_id: '1' }))).toBeNull()
