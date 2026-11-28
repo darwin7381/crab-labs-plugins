@@ -189,6 +189,7 @@ export class OnsenPuller {
   private backoffMs = 0
   private warnAt = 0
   private takeMember = false
+  get pausedForTake(): boolean { return this.takeMember }
   private credWarnAt = 0
   private wake: (() => void) | null = null
   /** WO-194 A.2: the pending items answered `later` (seq → when they are tried again); in memory: a restart tries every pending item at once */

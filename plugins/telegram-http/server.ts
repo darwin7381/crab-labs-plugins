@@ -368,7 +368,7 @@ if (ONSEN_TAKE_ON) {
   if (reason) log('info', `onsen take: staying on pull: ${reason}`)
   else if (onsen) {
     takeMode = new TakeMode(ONSEN_AGENT, (m, p, b, t, h, signal) => onsen.request(m, p, b, t, h, signal),
-      active => { if (active) { itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
+      active => { if (active) { Lanes.retireItemReceipts(); itemClaims!.start(); itemPeek!.reset() } else itemPeek!.stop(); registryStatusChanged?.() }, line => log('info', line))
     itemClaims = new Claims(join(STATE_DIR, 'onsen', 'claims.json'), onsen, Lanes.offerMissed, () => registryStatusChanged?.(), takeMode.now)
     onsen.watchItemReports(line => itemClaims!.replay(line), (line, ok) => itemClaims!.acknowledged(line, ok))
     itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset())
@@ -1581,7 +1581,7 @@ type PermPrompt = { request_id: string; tool_name: string; preview: string; copi
 const permPrompts = new Map<string, PermPrompt>()
 // WO-197 (Chiron mesh 12852, 「不靠第二張名單對齊」): a connector (1.59.0: every Telegram daemon but a roamer) has its Actions on, whatever ONSEN_ACTIONS
 // says: a connector asks people only through Actions. A roamer, as before: ONSEN_ACTIONS
-const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log,
+const onsenActions: Onsen.OnsenActions | null = onsen ? new Onsen.OnsenActions({ req: (m, p, b, t, h) => onsen.request(m, p, b, t, h), log, takeMode,
   on: () => CONNECTOR || Onsen.actionsOn(process.env, ONSEN_AGENT) }) : null
 // A prompt lives only in this process (Claude Code's channel answer goes to the session that asked): after a restart the channel cannot answer it any
 // more. The open ones' Action ids are kept in a file. The next start keeps them for ONSEN_PERM_RESTART_GRACE_MS (180 s): a duty officer that asks
@@ -2065,7 +2065,7 @@ function fleetRunId(notif: { method: string; params: unknown }): string | undefi
   return typeof p.content === 'string' ? p.content.match(/^\[scheduled\]\[[^\]]*\]\[run:(\d+)\]/)?.[1] : undefined
 }
 function maybeAutoAckScheduled(runId: string | undefined): void {
-  if (!INBOX_ONLY) return
+  if (!INBOX_ONLY || onsenPuller?.pausedForTake) return
   try {
     if (!runId || !/^\d+$/.test(runId)) return
     const rid = runId
@@ -2372,10 +2372,7 @@ async function laneDeliverMesh(n: { method: string; params: unknown }, verified?
   // a router failure inside the tg daemon is the main's there (002w D: /lanes/route answers target main); null = the tg daemon itself could not be
   // reached: there is no M1 to queue into, the fleet path (any open session of this agent) is what is left
   if (!d) { if (fallback) broadcastNotification(n) }
-  else if (d.target === 'lane' && !CALL_STATE) {
-    if (facts.onsen_items && ev.meta?.run_id) await Lanes.inboxPost('/lanes/scheduler-taken', { run_id: ev.meta.run_id })
-    else maybeAutoAckScheduled(ev.meta?.run_id)
-  }    // 開工回執: a lane took the scheduled run (WO-175: the Call's running, when on)
+  else if (d.target === 'lane' && !CALL_STATE) maybeAutoAckScheduled(ev.meta?.run_id)
   return d
 }
 
@@ -4237,8 +4234,10 @@ if (Lanes.LANES_ON) {
       },
     } } : {}),
     registryNames: () => Object.keys(loadInboxRegistry()).filter(n => n !== (process.env.LANES_AGENT ?? INBOX_SELF)),
+    recordScheduleResult: line => onsen?.recordCall(line) ?? false,
     checkWaitingCall: onsen ? (id, why, thread) => onsen!.checkWaitingCall(id, why, thread) : undefined,
     blocked: (item, retryAfter) => {
+      if (takeMode?.active) return
       const meta = item.notif?.params?.meta ?? {}
       const ids = item.person_message_ids as string[] | undefined
       if (ids?.length) {
@@ -4332,7 +4331,7 @@ if (Lanes.LANES_ON) {
       },
       // WO-205 (Chiron mesh-13475): M2's registry disagreement (the tg daemon relays it here) as a BTCC page alert to the connector's maintainer;
       // BTCC names the agent from this daemon's mesh credential
-      inboundLog: logPeerArrival, schedulerTaken: maybeAutoAckScheduled,
+      inboundLog: logPeerArrival,
       registryAlert: async a => {
         if (!BTCC_API_BASE) return 'BTCC_API_BASE not set'
         const machine = machineName()
@@ -4453,8 +4452,8 @@ if (!INBOX_ONLY && (Lanes.LANES_ON || onsen?.cfg.record)) registry.start()
 if (onsen && onsen.cfg.record && !INBOX_ONLY) {
   // WO-175 (ONSEN_CALL_STATE, on unless 0; lanes on): the Calls this agent received (the call id its pulled item carries, Onsen 0.24.1), their moments
   // as PUT /v1/calls/<id>/state through the spool. The router's and a lane run's end come from lanes.ts, the turn moments from the journal tap
-  const calls = CALL_STATE ? new OnsenStatus.CallFacts({ sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)
-  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => onsen.recordDelivery(f),
+  const calls = CALL_STATE ? new OnsenStatus.CallFacts({ takeMode, sink: line => { onsen.recordCall(line) }, client: onsen }) : null   // client: a receipt waits for Onsen's answer (WO-175, Chiron 05:55Z)
+  const facts = new OnsenStatus.DeliveryFacts({ agent: ONSEN_AGENT, sink: f => { if (!takeMode?.active) onsen.recordDelivery(f) },
     changed: () => kick() })                                            // WO-162: the queued count moved: computed now, not at the next tick
   // WO-162: a detail change is written at once, last_activity_at alone at most every ONSEN_STATUS_THROTTLE_MS (1 s); a report at least every
   // ONSEN_STATUS_HEARTBEAT_S (15 s; 0 = none), each carrying detail.heartbeat_s
@@ -4646,6 +4645,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     /** WO-169: a wake row's member_state is the status record at that moment (the one decideWake read), else the one last handed out */
     const recordNow = (): OnsenStatus.StatusView | null => { try { return currentStatus() } catch { return lastView } }
     Lanes.observeRoutes((row, ctx) => {
+      if (takeMode?.active) return
       const now = Date.now(), at = new Date(now).toISOString(), n = ++seq
       const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
       queueMicrotask(() => {
@@ -4658,6 +4658,7 @@ if (onsen && onsen.cfg.record && !INBOX_ONLY) {
     // 1.49.1 (Chiron, WO-147 09:56Z): the hand-over decisions (handoff_main, a decision card, the deferred cards' batch, a lane run's end): one row per
     // event-keyed wake line of the state journal (onsen-wake.ts handItem; at = the line's ts)
     Lanes.observeWakes((line, ctx) => {
+      if (takeMode?.active) return
       const now = Date.now(), n = ++seq
       const memberState = OnsenWake.memberStateOf(recordNow(), ctx.main)
       queueMicrotask(() => {
