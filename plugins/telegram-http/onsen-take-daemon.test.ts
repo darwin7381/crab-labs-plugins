@@ -402,6 +402,39 @@ test('a busy lane slot leaves the next alert waiting; its run receives the claim
   expect(records().some(r => r.rec === 'msg' && (r.kind === 'handoff' || r.kind === 'carry'))).toBe(false)
 }, 18000)
 
+test('a take router sends handoff and thread-stop notices to the original callers for Onsen to filter', async () => {
+  const notices: Record<string, unknown>[] = []
+  const inbox = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    if (req.method !== 'POST' || new URL(req.url).pathname !== '/lanes/send') return new Response(null, { status: 404 })
+    notices.push(await req.json() as Record<string, unknown>)
+    return Response.json({ delivered: true, msgId: 90000 + notices.length })
+  } })
+  clean.push(() => inbox.stop(true))
+  const d = await daemon({ LANES_INBOX_PORT: String(inbox.port) }, 200, root => {
+    const peers = join(root, 'peers.json')
+    writeFileSync(peers, JSON.stringify({ eve: {}, cain: {} }))
+    return { ...scriptedLane(root), AGENT_INBOX_REGISTRY: peers }
+  })
+  const handoff = d.f.add('handoff-call', 'call', { from: 'eve', call_id: '401',
+    payload: { text: 'explicit handover', line: 'call', msg_id: 801, logged: true } })
+  await waitFor(() => d.f.history.some(h => h.item_id === handoff.id && h.body.outcome === 'in_session'))
+  writeFileSync(join(d.root, 'release-lane'), '')
+  await waitFor(() => notices.length > 0 && d.f.history.some(h => h.item_id === handoff.id && h.body.outcome === 'reassigned'))
+
+  d.f.add('stopped-call', 'call', { from: 'cain', call_id: '402',
+    payload: { text: 'one more question', line: 'call', msg_id: 802, logged: true, thread: 'cain#t-ca12', hop: 7 } })
+  await waitFor(() => notices.length >= 2)
+  expect(notices).toMatchObject([
+    { to: 'eve', reply_to: '801', call: '401', no_reply: true, urgency: 'silent', owner: '主線' },
+    { to: 'cain', reply_to: '802', call: '402', no_reply: true, urgency: 'silent', lane: 'router' },
+  ])
+  expect(notices[0].text).toContain('主線會在')
+  expect(notices[1].text).toContain('轉手次數')
+  const memberPaths = d.f.calls.map(c => c.path).filter(path => path.startsWith('/v1/members/'))
+  expect(memberPaths).toContain('/v1/members/adam/items')
+  expect(memberPaths.filter(path => !path.startsWith('/v1/members/adam/'))).toEqual([])
+}, 18000)
+
 test('roamer stays on its local mock bot and never probes items', async () => {
   const bot = startBotApiMock()
   clean.push(() => bot.stop())
