@@ -65,7 +65,7 @@ describe('scan', () => {
 
 test('take keepwarm uses the member credential, replaces a stale warm window and survives loss of its POST reply', async () => {
   const f = fakeItems(), dir = mkdtempSync(join(tmpdir(), 'kw-take-')), file = join(dir, 'main.jsonl')
-  const at = Math.floor(f.now() / 1000)
+  const at = Math.floor(f.now() / 1000) + 0.789
   let lost = true, clock = at + 10, mail = 0, delivered = 0
   const client = new OnsenClient({ dir, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {},
     fetch: (async (url, init) => {
@@ -90,6 +90,14 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     expect(first).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', deadline: null,
       not_before: iso(at + 1 + 50 * 60), expires_at: iso(at + 1 + 60 * 60), state: 'waiting' })
     expect(check.matchesWindow(first.not_before!)).toBe(true)
+    const dueSecond = Math.floor(Date.parse(first.not_before!) / 1000)
+    first.not_before = iso(dueSecond)
+    expect(check.matchesWindow(first.not_before)).toBe(true)
+    expect(check.matchesWindow(iso(dueSecond + 1))).toBe(true)
+    expect(check.matchesWindow(iso(dueSecond + 2))).toBe(false)
+    await check.run(); await client.syncNow(true)
+    expect(first.state).toBe('waiting')
+    expect(f.rows.size).toBe(1)
     const count = f.calls.length
     for (const elapsed of [60, 120, 180]) {
       writeFileSync(file, lines(...turnAt(at), joey(at + 40), req(at + elapsed)))
@@ -134,6 +142,12 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     try { await check.run(); await client.syncNow(true) } finally { peek.mockRestore() }
     expect(old.state).toBe('waiting')
     expect(f.rows.size).toBe(3)
+    // Onsen returns the new idle window at whole seconds. C1 can take it at that time.
+    writeFileSync(file, lines(...turnAt(raceAt)))
+    old.not_before = iso(Math.floor(raceAt + 1 + 50 * 60))
+    f.advance(Date.parse(old.not_before) - f.now() + 1)
+    clock = f.now() / 1000
+    expect((await receiver.receive([itemRef(old)])).given.has(old.id)).toBe(true)
     expect([mail, delivered]).toEqual([0, 0])
   } finally { mode.stop(); f.stop(); client.stop(); rmSync(dir, { recursive: true, force: true }) }
 })

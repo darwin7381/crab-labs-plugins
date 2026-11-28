@@ -252,6 +252,9 @@ function readTail(path: string, max = TAIL_BYTES): string {
   } finally { closeSync(fd) }
 }
 
+// Onsen may return a whole-second RFC 3339 time for a millisecond transcript timestamp.
+const sameKeepwarmTime = (rowTime: string | null | undefined, dueMs: number) => Math.abs(Date.parse(rowTime ?? '') - dueMs) <= 1000
+
 export class LocalKeepwarm {
   private running = false
   private timer?: ReturnType<typeof setInterval>
@@ -278,7 +281,7 @@ export class LocalKeepwarm {
     const st = this.state()
     try {
       const { s } = this.transcript(st)
-      return !!s?.last_req && (s.last_req + KEEPWARM_AFTER_S) * 1000 === Date.parse(due ?? '')
+      return !!s?.last_req && sameKeepwarmTime(due, (s.last_req + KEEPWARM_AFTER_S) * 1000)
         && decide(s, st, this.now(), true)[0] === 'poke'
     } catch { return false }
   }
@@ -298,7 +301,7 @@ export class LocalKeepwarm {
       if (page?.status !== 200 || !Array.isArray(page.json?.items)) throw new Error('could not read waiting keepwarm Items')
       for (const row of page.json.items as InboxItem[]) {
         if (row.kind !== 'keepwarm' || row.from !== mode.member || row.session_id !== 'main') continue
-        if (wanted && Date.parse(row.not_before ?? '') === due) exists = true
+        if (wanted && sameKeepwarmTime(row.not_before, due)) exists = true
         else obsolete.push(row)
       }
       if (!page.json.next_cursor) break
