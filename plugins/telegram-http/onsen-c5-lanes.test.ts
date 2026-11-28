@@ -161,6 +161,24 @@ test('a promise marked done while the connector is paused closes its original It
   expect(row.state).toBe('completed')
 })
 
+test('switching a mixed pull-era event publishes only the outstanding future commitment', async () => {
+  const id = 'switch-mixed', now = Date.now(), due = now + 300_000
+  mode.pause('test first switch', 60_000)
+  const base = { kind: 'peer' as const, level: 'commitment', to: 'ken', due_at: due }
+  L.__events().open(id, { class: 'peer', owner: 'main', obligations: [
+    { ...base, what: 'future' }, { ...base, what: 'overdue', due_at: now - 1 },
+    { ...base, what: 'told', told: true }, { ...base, what: 'rung', rang: true },
+    { ...base, what: 'terminal', state: 'met' }, { ...base, what: 'handed', state: 'handed' },
+    { ...base, what: 'old answer', level: 'answer', state: 'handed' }
+  ] })
+  await mode.probe()
+  L.resumeSelfItems(); L.__events().note(id, { did: 'updated digest' }); L.resumeSelfItems()
+  await client.syncNow(true)
+  const rows = selfRows().filter(r => r.payload.text.includes(id))
+  expect(rows).toHaveLength(1)
+  expect(rows[0]!.payload.text).toContain('future')
+})
+
 test('a pull member keeps a new commitment entirely in M3', async () => {
   f.mode(409); await mode.probe()
   try {

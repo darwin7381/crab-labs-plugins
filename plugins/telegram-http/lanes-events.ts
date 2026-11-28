@@ -67,7 +67,7 @@ export const owed = (o: Ob): boolean => owing(o) || (o.state === 'handed' && (o.
 
 export type EventsApi = ReturnType<typeof createEvents>
 /** `changed`: called after every write of an event record (lanes-golive: the open-handoffs file follows the main's obligations). Never throws into a write. */
-export function createEvents(J: Journal, changed?: () => void, promises?: (id: string, obs: Ob[], refs?: import('./onsen-items.ts').ItemRef[]) => void) {
+export function createEvents(J: Journal, changed?: () => void, promises?: (id: string, obs: Ob[], refs: import('./onsen-items.ts').ItemRef[] | undefined, previous?: Ob[]) => void) {
   let k = 0
   const obId = (kind: string): string => `${kind}-${Date.now().toString(36)}-${(++k).toString(36)}`
   const get = (id: string): Row | undefined => J.get('event', id)
@@ -86,7 +86,7 @@ export function createEvents(J: Journal, changed?: () => void, promises?: (id: s
    *  closed at once. 002q: a Joey line handed to the main keeps its event open until the main's line meets it (002p closed it when the hand-over's
    *  M1 item was done, with the line still owed). */
   function write(e: Row | { id: string }, obs: Ob[], f: Record<string, unknown> = {}): Row {
-    promises?.(e.id, obs, (f.onsen_items ?? (e as Row).onsen_items) as import('./onsen-items.ts').ItemRef[] | undefined)
+    promises?.(e.id, obs, (f.onsen_items ?? (e as Row).onsen_items) as import('./onsen-items.ts').ItemRef[] | undefined, (e as Row).obligations)
     const row = J.write('event', e.id, obs.some(owed) ? 'open' : 'closed', { obligations: obs, ...f })!
     try { changed?.() } catch {}
     return row

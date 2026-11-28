@@ -259,7 +259,7 @@ export type MainPicker = {
 let D: LanesDeps
 /** lanes-golive (C2): what a lane's send carries besides to / text (the three lines of send_to_agent) */
 import type { InboxItem, ItemRef } from './onsen-items.ts'
-import { chatWaiter, memberWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
+import { resumablePromise, chatWaiter, memberWaiter, projectPromises, promiseTime } from './onsen-promises.ts'
 import { ownItem, type SelfWriter } from './onsen-self.ts'
 
 export type LaneSendFields = { line: Line; title?: string; ask?: string; because?: string; deadline?: string; touches?: string[]; ref?: string }
@@ -314,9 +314,9 @@ export function lanesInit(deps: LanesDeps): void {
     journal.observeLines(l => { if (wakeTap && l.rec === 'wake') tapWake(l) })   // WO-147: the hand-over decisions' wake lines (read only; nothing without a tap)
     main = createMain(mainEnv())
     main.initMain()
-    events = createEvents(journal, writeOpenHandoffs, (id, obs, refs) => {
+    events = createEvents(journal, writeOpenHandoffs, (id, obs, refs, previous) => {
       const writer = activeSelfWriter()
-      if (writer) projectPromises(id, obs, writer, refs)
+      if (writer) projectPromises(id, obs, writer, refs, previous)
     })
     restoreReceipts()                               // 1.41.1 (Metis mail #11280): a receipt recorded met on a scheduler refusal is owed again
     writeOpenHandoffs()
@@ -4285,9 +4285,8 @@ export function resumeSelfItems(): void {
     submitCheck(f, writer)
   }
   saveState()
-  for (const e of events.rows(e => e.obligations?.some((o: Ob) => o.self
-    ? o.state === 'met' && !o.self.complete
-    : e.state === 'open' && o.to && (o.level === 'commitment' || o.level === 'answer' && o.due_at != null)))) {
+  const now = Date.now()
+  for (const e of events.rows(e => e.obligations?.some((o: Ob) => resumablePromise(o, now)))) {
     events.note(e.id, {})
   }
 }

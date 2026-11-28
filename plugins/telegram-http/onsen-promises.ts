@@ -62,8 +62,14 @@ function timeInPhrase(words: string, at: number): number | null {
   return clock[1] ? null : due + 86400_000
 }
 
+export function resumablePromise(o: Ob, now: number): boolean {
+  if (o.self) return o.state === 'met' && !o.self.complete
+  return o.level === 'commitment' && o.state === 'open' && !!memberWaiter(o.to)
+    && !o.told && !o.rang && o.due_at != null && o.due_at >= now
+}
+
 /** Called at the M3 journal transition. The same saved creation request identifies early completion after restart. */
-export function projectPromises(eventId: string, obs: Ob[], writer: SelfWriter, refs: ItemRef[] = []): void {
+export function projectPromises(eventId: string, obs: Ob[], writer: SelfWriter, refs: ItemRef[] = [], previous: Ob[] = []): void {
   for (const o of obs) {
     if (o.self) {
       if (o.state === 'met' && !o.self.complete) {
@@ -75,7 +81,14 @@ export function projectPromises(eventId: string, obs: Ob[], writer: SelfWriter, 
     const waiter = memberWaiter(o.to)
     if (!waiter || o.due_at == null || (o.state !== 'open' && o.state !== 'handed')) continue
     const commitment = o.level === 'commitment'
-    if (!commitment && !(o.level === 'answer' && o.due_at != null && (!refs.length || o.sent))) continue
+    if (commitment) {
+      if (!resumablePromise(o, Date.now())) continue
+    } else {
+      if (o.level !== 'answer' || o.told || o.rang || (refs.length && !o.sent)) continue
+      // Only a new or changed answer is a live hand-off. Editing a pull-era journal entry must not publish old answers.
+      const old = previous.find(p => p.id === o.id)
+      if (old?.level === 'answer' && old.state === o.state && old.due_at === o.due_at && old.sent === o.sent && old.to === o.to) continue
+    }
     const session = commitment ? o.owner ?? 'main' : 'main'
     const due = o.due_at ?? null
     o.self = { key: 'promise:' + eventId + ':' + o.id, item: ownItem('self', session,
