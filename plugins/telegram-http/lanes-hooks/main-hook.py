@@ -35,6 +35,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DID = re.compile(r'\bdid="([^"]+)"')
+TASK_NOTICE = re.compile(r'<task-notification\b[^>]*>.*?</task-notification>', re.DOTALL)
 
 
 def token(port):
@@ -126,7 +127,11 @@ def main():
     body = {'event': ev, 'session_id': p.get('session_id'), 'prompt_id': p.get('prompt_id'), 'pid': int(pid) if pid.isdigit() else None,
             'transcript_path': p.get('transcript_path'), 'source': p.get('source'), 'tool_name': p.get('tool_name'), 'error': p.get('error')}
     if ev == 'UserPromptSubmit':
-        body['dids'] = DID.findall(str(p.get('prompt') or ''))
+        prompt = str(p.get('prompt') or '').lstrip()
+        if TASK_NOTICE.match(prompt):
+            body['source'] = 'task-notification'
+            prompt = TASK_NOTICE.sub('', prompt)
+        body['dids'] = DID.findall(prompt)
     if ev == 'PreToolUse' and p.get('tool_name') == 'Bash':   # the tool's own bound (M2's stuck rule): a Bash runs at most its timeout
         ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
         if not ti.get('run_in_background'):

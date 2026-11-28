@@ -911,22 +911,24 @@ export function createMain(E: MainEnv) {
   function identifies(ids: Set<string>, r: Row): boolean {
     return ids.has(r.id) || !!r.onsen_items?.some((ref: ItemRef) => ids.has(ref.onsen_item_id))
   }
-  function beginTurn(g: Row, prompt: string, ids?: Set<string>, failed = false): void {
+  function beginTurn(g: Row, prompt: string, ids?: Set<string>, source?: string): void {
     if (g.prompt_id === prompt) return
     if (g.stopped_prompt === prompt) return continueTurn(g, prompt)
     const receiver = E.itemReceiver?.()
     const canBind = (r: Row) => {
       const named = ids && identifies(ids, r), resume = isResume(r)
+      if (source === 'task-notification' && !named) return false
       if (resume && (ids && !named || resumes.cancelling(r.onsen_items[0].onsen_item_id))) return false
       const offered = r.state === 'offered' && r.gen === g.id
       const queued = r.state === 'queued' && forGen(r, g) && (named || !ids && resume && inFlight.has(r.id))
       return (offered || queued) && (!r.onsen_items || r.onsen_items.every((ref: ItemRef) => receiver?.claims.owns(ref.onsen_item_id)))
     }
-    if (!failed && receiver) {
+    if (source !== 'task-notification' && source !== 'StopFailure' && receiver) {
       syncResumes()
       // A named delivery identifies this turn even when re-taking it failed. Without a prompt hook,
       // an offered Item with its current claim identifies the delivery that reached this generation.
-      if (g.resume_items && !items(r => r.kind !== 'digest' && (ids ? identifies(ids, r) : canBind(r))).length) resumes.supersede(g.session_id)
+      if (g.resume_items && !items(r => r.kind !== 'digest' && (ids ? identifies(ids, r) : canBind(r))).length)
+        resumes.supersede(g.session_id, ids ? undefined : prompt)
     }
     if (g.prompt_id) cutTurn(g)                                     // a turn that never got Stop or StopFailure: its items ride this turn (pull, WO-157c)
     outputs.clear(); calls.clear(); openTools.delete(g.id)                                          // the aids look at this prompt's calls only
@@ -982,7 +984,7 @@ export function createMain(E: MainEnv) {
             const late = items(r => r.state === 'queued' && r.onsen_items && identifies(ids, r))
             if (late.length) await receiveRows(late, true, () => currentGen() === g, true)
           }
-          beginTurn(g, p, ids)
+          beginTurn(g, p, ids, b.source)
         }
         // lanes-golive (Chiron line8-delivery-20261122: on --resume a SessionStart hook's context reached the conversation in 25 of 334 resumes; startup, clear
         // and compact do get it): the main-only rules go with the session's first prompt (a typed one, or a delivered item's) when its SessionStart could
@@ -999,7 +1001,7 @@ export function createMain(E: MainEnv) {
       }
       case 'PreToolUse': {
         if (!p) return {}
-        beginTurn(g, p); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
+        beginTurn(g, p, undefined, b.source); setMain(J().get('main', g.id)!, 'in_turn', { tool_open: String(b.tool_name ?? 'tool') })
         // WO-148 (item 3; lab: the hook sent tool_input only for a btcc-receipt Bash): the hook's tool_brief, the field the call is about (lanes.ts masks it)
         openTools.set(g.id, { name: String(b.tool_name ?? 'tool'), input: b.tool_brief ?? b.tool_input ?? null, at: new Date().toISOString() })
         toolBound.set(g.id, Number(b.tool_timeout_ms) > 0 ? Math.round(Number(b.tool_timeout_ms) * 1.25) : 0)   // the tool's own bound, with a margin
@@ -1022,7 +1024,7 @@ export function createMain(E: MainEnv) {
       }
       case 'PostToolUse': {
         if (!p) return {}
-        beginTurn(g, p)
+        beginTurn(g, p, undefined, b.source)
         const n = String(b.tool_name ?? '')
         if (/(__reply|__send_to_agent)$/.test(n) && b.tool_input?.text) (outputs.get(p) ?? outputs.set(p, []).get(p)!).push({
           to: String(b.tool_input.to ?? (n.endsWith('__reply') ? 'Joey' : '')), reply_to: String(b.tool_input.reply_to ?? ''), text: String(b.tool_input.text) })
@@ -1035,7 +1037,7 @@ export function createMain(E: MainEnv) {
       }
       case 'Stop': {
         if (!p) return {}
-        beginTurn(g, p)
+        beginTurn(g, p, undefined, b.source)
         if (b.phase !== 'final') {
           const mp = pullable(g) ? mentionsNow() : null                                     // WO-181: only when something is pulled now
           const got = await pull(J().get('main', g.id)!, p, mp ? await mp : null)
@@ -1081,7 +1083,7 @@ export function createMain(E: MainEnv) {
         return {}
       }
       case 'StopFailure': {
-        if (p) beginTurn(g, p, undefined, true)
+        if (p) beginTurn(g, p, undefined, 'StopFailure')
         openTools.delete(g.id)
         const err = String(b.error ?? 'unknown')
         // WO-201 (point 4): not a wall: idle; the turn's items are offered again after a backoff, with a cap (failTurn). The account wall below is unchanged

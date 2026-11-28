@@ -295,6 +295,22 @@ test('C4 a same-prompt independent turn supersedes the waiting row at its latest
   expect(r.offers).toEqual([])
 })
 
+test.each(['UserPromptSubmit', 'PreToolUse', 'Stop'])('C4 a background notification first seen at %s preserves the waiting resume', async event => {
+  const r = await accountCut()
+  await r.hook(event, { prompt_id: 'notification', source: 'task-notification', dids: [], phase: 'final' })
+  if (event !== 'Stop') await r.hook('Stop', { prompt_id: 'notification', phase: 'final' })
+  await r.sync()
+  expect(r.row.state).toBe('waiting')
+  expect(r.f.calls.filter(c => c.body.outcome)).toHaveLength(0)
+})
+
+test('C4 a new prompt first seen at a tool with no origin cannot discard the interrupted prompt', async () => {
+  const r = await accountCut()
+  await r.hook('PreToolUse', { prompt_id: 'unidentified', tool_name: 'Read' })
+  await r.hook('Stop', { prompt_id: 'unidentified', phase: 'final' }); await r.sync()
+  expect(r.row.state).toBe('waiting')
+})
+
 test('C4 auto-resume between the server take and its response spools superseded without a stream write', async () => {
   const r = await accountCut()
   r.f.delayTake(100)
@@ -302,7 +318,7 @@ test('C4 auto-resume between the server take and its response spools superseded 
   const offer = r.m.pump()
   await until(() => r.row.state === 'claimed')
   const claim = r.row.claim!.id
-  await r.hook('PreToolUse', { prompt_id: 'automatic', tool_name: 'Read' })
+  await r.hook('PreToolUse', { prompt_id: 'turn', tool_name: 'Read' })
   await offer
   await r.sync()
   expect(r.f.history).toMatchObject([{ item_id: r.row.id, body: { claim_id: claim, outcome: 'superseded' } }])
@@ -319,7 +335,7 @@ test('C4 a take recovered by its idempotency key reports the intervening auto-re
     const reply = await request(...args)
     if (!lost && args[1].endsWith('/take')) {
       lost = true
-      await r.hook('PreToolUse', { prompt_id: 'automatic', tool_name: 'Read' })
+      await r.hook('PreToolUse', { prompt_id: 'turn', tool_name: 'Read' })
       throw Error('take response lost')
     }
     return reply
