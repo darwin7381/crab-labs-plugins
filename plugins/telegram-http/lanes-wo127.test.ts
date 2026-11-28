@@ -12,6 +12,12 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { createServer } from 'http'
 import { MailEvents, decisionEvent, dueEvent } from './mail-events.ts'
+import { OnsenClient } from './onsen-client.ts'
+import { OnsenInbox, OnsenPuller } from './onsen-inbox.ts'
+import { TakeMode } from './onsen-take.ts'
+import { Claims } from './onsen-claims.ts'
+import { ItemReceiver } from './onsen-receive.ts'
+import { fakeItems } from './test-fixtures/onsen-items.ts'
 process.env.LANES_FLOOD_CONTROL = '0'
 process.env.LANES_DEFER_DECISIONS = '0'                                     // WO-128 (1.39.0): these tests pin 1.38's behaviour (every card wakes the main); lanes-wo128 tests the switch on
 // the tg daemon's own HTTP routes, for the agent-inbox side's calls into it (/lanes/mail-checked)
@@ -158,8 +164,26 @@ async function asked(text = 'api-gw 5xx 一直高，可以重啟嗎？'): Promis
   return { r, m, out }
 }
 
+// Both daemons learn the mode from the same member through their normal HTTP probes.
+async function withMemberMode(take: boolean, run: (puller: OnsenPuller) => Promise<void>) {
+  const f = fakeItems(), state = mkdtempSync(join(tmp, 'member-'))
+  const client = new OnsenClient({ dir: state, agent: 'adam', base: f.base, record: true, credential: () => 'test-member', log: () => {} })
+  const req = client.request.bind(client)
+  const mode = new TakeMode('adam', req, () => {}, () => {})
+  const claims = new Claims(join(state, 'claims.json'), client, () => {}, () => {})
+  const puller = new OnsenPuller({ req, base: f.base, inbox: new OnsenInbox({ file: join(state, 'inbox.json') }),
+    host: 'fixture', takeEnabled: true, waitS: 0, log: () => {}, deliver: async () => 'delivered' })
+  try {
+    f.mode(take ? 200 : 409)
+    L.useItemReceiver(new ItemReceiver(mode, claims, () => {}), w => client.recordItemWrite(w))
+    await mode.probe(); await puller.once()
+    expect([mode.active, puller.pausedForTake]).toEqual([take, take])
+    await run(puller)
+  } finally { L.useItemReceiver(undefined); mode.stop(); claims.stop(); client.stop(); f.stop() }
+}
+
 // ------------------------------------------------------------------ 1-3: the decision comes back, the lane finishes, Joey gets one line
-test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the main with the card; mailbox_decide → the same thread\'s lane resumes and finishes; one line to Joey, the system\'s words in front; the main owes nothing and its Stop check is not held', async take => {
+test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the main with the card; mailbox_decide → the same thread\'s lane resumes and finishes; one line to Joey, the system\'s words in front; the main owes nothing and its Stop check is not held', take => withMemberMode(take, async puller => {
   const before = sent.length
   const { r, m, out } = await asked()
   expect(out).toContain(`放進主線的信箱了（#${m}`); expect(out).toContain('The main was woken with your card')
@@ -175,7 +199,7 @@ test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the 
   const mt = await mainTurnWith([r.id])
   try {
     const runs = runsOf().length
-    const mail = new MailEvents({ file: join(tmp, 'mail-decisions'), onTake: () => take, log: () => {},
+    const mail = new MailEvents({ file: join(tmp, 'mail-decisions'), pausedForTake: () => puller.pausedForTake, log: () => {},
       send: async ev => {
         const d = await L.routeEvent(ev as any)
         expect(d).toMatchObject({ rule: 'mail-decision', target: 'lane', lane: r.lane })
@@ -208,7 +232,7 @@ test.each([false, true])('WO-127 #1 照建議 (take=%s): decide_later wakes the 
     expect(await until(() => mailCalls.some(c => c.name === 'mailbox_check' && c.args.id === m))).toBe(true)   // the decided lane item is checked off for the lane
     expect(handoffs()).not.toContain(`信箱 #${m}`)
   } finally { await mt.stop() }
-}, 40000)
+}), 40000)
 
 test('WO-127 #2 改成… (and #7 of the ticket\'s items): the note reaches the lane; its line says what the main changed it to; WO-125\'s 〔系統〕 line still rides it', async () => {
   const before = sent.length

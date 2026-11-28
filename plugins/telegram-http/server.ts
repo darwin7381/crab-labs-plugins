@@ -2241,7 +2241,7 @@ async function laneMainCore(method: 'GET' | 'POST', path: string, body?: unknown
 // decision (mailbox_decide → mail_decision) and the cards entering the due window (GET /due every minute → mail_due). One the router cannot take
 // now waits in <state>/mail-events.json and goes on the next tick. Lanes off: no events (the main does what it decided itself).
 const mailEvents = INBOX_ONLY && Lanes.LANES_ON
-  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), onTake: () => !!onsenPuller?.onTake, send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
+  ? new MailEvents({ file: join(STATE_DIR, 'mail-events.json'), pausedForTake: () => !!onsenPuller?.pausedForTake, send: async ev => !!(await Lanes.routeRemote(ev as unknown as Lanes.InEvent)), log: (l, m) => log(l as 'info' | 'warn' | 'error', m) })
   : null
 if (mailEvents) {
   const fetchDue = async () => { const r = await btccMail('GET', `/api/mesh/mail/due?within=${MAIL_DUE_WITHIN_S}`).catch(() => null); return r?.status === 200 && Array.isArray(r.json?.due) ? r.json.due : null }
@@ -3008,7 +3008,7 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
     name: takeMode?.member ?? INBOX_SELF,
     stateDir: STATE_DIR,
     take: takeMode && onsen ? { mode: takeMode, write: write => onsen.recordItemWrite(write) } : undefined,
-    mode: () => takeMode?.active ? 'live' : takeMode || onsenPuller?.onTake ? 'off' : keepwarmMode(),
+    mode: () => takeMode?.active ? 'live' : takeMode || onsenPuller?.pausedForTake ? 'off' : keepwarmMode(),
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
     ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
@@ -3024,7 +3024,7 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
     },
     // the same line the Mac mini watchdog sends through /inject: sender fleet-watchdog, no_reply
     deliver: async (text) => {
-      if (onsenPuller?.onTake || activeServers.size === 0) return false
+      if (onsenPuller?.pausedForTake || activeServers.size === 0) return false
       const chatId = String(loadAccess().allowFrom[0] ?? 'local-inject')
       await dispatchInbound(chatId, {
         method: 'notifications/claude/channel',

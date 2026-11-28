@@ -189,8 +189,7 @@ export class OnsenPuller {
   private backoffMs = 0
   private warnAt = 0
   private takeMember = false
-  /** The inbox daemon's existing GET /inbox is the member-mode signal for its legacy timers (settled 32/44). */
-  get onTake(): boolean { return this.takeMember }
+  get pausedForTake(): boolean { return this.takeMember }
   private credWarnAt = 0
   private wake: (() => void) | null = null
   /** WO-194 A.2: the pending items answered `later` (seq → when they are tried again); in memory: a restart tries every pending item at once */

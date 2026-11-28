@@ -282,3 +282,13 @@ test.each([false, true])('a new lane commitment during the Jev await suppresses 
     expect(await check).toBe(take ? 'dup' : 'written')
   } finally { if (!take) await mode.probe() }
 })
+
+test('C1 TakeMode.active gates the lane even before its spool writer is attached', async () => {
+  L.useItemReceiver(receiver)
+  try {
+    expect(mode.active).toBe(true)
+    expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('who must identify')
+    mode.pause('test pull', 60_000)
+    expect(await L.callMainTool('commitment', { who: '未知？', what: '回報' }, 'test-main')).toContain('commitment recorded')
+  } finally { L.useItemReceiver(receiver, w => client.recordItemWrite(w)); await mode.probe() }
+})
