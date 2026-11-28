@@ -94,7 +94,7 @@ async function daemon(env: Record<string, string> = {}, initialMode = 200, setup
   return { f, root, lanes, state, proc, base, journal, log, restart }
 }
 
-test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
+async function activePerson(id: string) {
   const sid = randomUUID(), pid = process.pid, turn = 'person-prompt'
   let registryFile = '', transcript = '', entry: Record<string, unknown> = {}
   const d = await daemon({ MCP_READY_DELAY_MS: '50' }, 200, root => {
@@ -122,25 +122,54 @@ test('real daemon completes an idle main person item with its reply after the fi
   client.fallbackNotificationHandler = async n => { if (n.method === 'notifications/claude/channel') offers.push(n.params) }
   await client.connect(new StreamableHTTPClientTransport(new URL(d.base + '/mcp'), { requestInit: { headers } }))
   clean.push(() => client.close())
-  const row = d.f.add('main-happy')
+  const row = d.f.add(id)
   expect(await until(() => offers.some(n => n.content.includes(row.id)), 6000), d.log().slice(-2500)).toBe(true)
   expect(row.state).toBe('claimed')
   const offer = offers.find(n => n.content.includes(row.id))
   await hook('UserPromptSubmit', { dids: [offer.meta.did] })
   await waitFor(() => row.claim?.session_id === 'main')
+  const stop = async () => {
+    await hook('Stop', { phase: 'final' })
+    await Bun.sleep(3100)
+    writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
+  }
+  return { d, row, client, offers, stop }
+}
+
+test('real daemon completes an idle main person item with its reply after the final Stop', async () => {
+  const { d, row, client, offers, stop } = await activePerson('main-happy')
   const reply = await client.callTool({ name: 'reply', arguments: { chat_id: '1', text: 'received and done' } })
   expect(reply.isError, JSON.stringify(reply.content)).toBeFalsy()
   const replyId = /onsen:(\d+)/.exec(JSON.stringify(reply.content))?.[1]
   expect(replyId, JSON.stringify(reply.content)).toBeTruthy()
   expect(row.state).toBe('claimed')
-  await hook('Stop', { phase: 'final' })
-  await Bun.sleep(3100)
-  writeFileSync(registryFile, JSON.stringify({ ...entry, statusUpdatedAt: Date.now() }))
+  await stop()
   expect(await until(() => row.state === 'completed', 8000), d.log().slice(-2500)).toBe(true)
   expect(d.f.history.filter(h => h.item_id === row.id).map(h => h.body.outcome)).toEqual(['in_session', 'completed'])
   expect(row.response_message_ids).toEqual([replyId])
   expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
 }, 25000)
+
+test('a bound item whose observation stops for 45 s is not delivered twice or reported to an expired claim', async () => {
+  const { d, row, offers, stop } = await activePerson('lease-expiry')
+  await waitFor(() => d.f.calls.some(c => c.path.endsWith('/observation') && c.body.held_item_ids?.includes(row.id)))
+  const claim = row.claim!.id, last = d.f.calls.length
+  // Server time advances with no observation in the interval.
+  const untilExpiry = Date.parse(row.claim!.expires_at) - d.f.now()
+  d.f.advance(untilExpiry - 1)
+  expect(row.state).toBe('claimed')
+  d.f.advance(1)
+  expect(row).toMatchObject({ state: 'waiting', reason: 'cut', claim: null })
+  expect(row.events!.at(-1)?.kind).toBe('lease_expired')
+  expect(d.f.calls.slice(last).some(c => c.path.endsWith('/observation'))).toBe(false)
+  await waitFor(() => d.f.calls.slice(last).some(c => c.path === '/v1/items/' + row.id))
+  const beforeStop = d.f.calls.length
+  await stop()
+  await waitFor(() => row.state === 'completed' || d.f.calls.slice(beforeStop).some(c =>
+    c.path.endsWith('/observation') && Array.isArray(c.body.held_item_ids) && !c.body.held_item_ids.includes(row.id)), 18_000)
+  expect(offers.filter(n => n.content.includes(row.id))).toHaveLength(1)
+  expect(d.f.calls.slice(last).filter(c => c.path.endsWith('/report') && c.body.claim_id === claim).map(c => c.body.outcome)).toEqual([])
+}, 35_000)
 
 for (const [name, cfg, reason] of [
   ['unset', { ONSEN_TAKE: '' }, ''], ['observation off', { ONSEN_OBSERVATION: '' }, 'ONSEN_OBSERVATION'],
