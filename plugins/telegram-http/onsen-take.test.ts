@@ -23,7 +23,7 @@ async function until(ok: () => boolean, ms = 1500) {
 function rig() {
   const f = fakeItems(), dir = mkdtempSync(join(tmpdir(), 'wo213-'))
   const logs: string[] = [], misses: string[] = [], deadlines: string[] = []
-  const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base, credential: () => 'test-member', log: (_lv, m) => logs.push(m) })
+  const client = new OnsenClient({ dir, agent: 'adam', record: true, base: f.base, credential: () => 'test-member', log: (level, m) => logs.push(`[${level}] ${m}`) })
   const mode = new TakeMode('adam', client.request.bind(client), () => {}, line => logs.push(line), 'mac-mini')
   const file = join(dir, 'claims.json')
   let main: MainApi | undefined
@@ -1556,9 +1556,15 @@ test('late conflicting report is logged, a permanent 4xx is rejected and the spo
   const id = row.claim!.id
   r.claims.report(row.id, 'completed'); await r.sync()
   for (const item_id of [row.id, 'missing']) r.client.recordItemReport({ item_id, body: { claim_id: id, at: new Date().toISOString(), outcome: 'cut' } })
-  await r.sync()
+  r.client.recordItemReport({ item_id: row.id, body: { claim_id: id, at: new Date().toISOString(), outcome: 'in_session', session_id: 'another.worker.1' } })
+  await r.sync(); await r.sync()
   expect(r.client.pendingBytes()).toBe(0); expect(r.logs.some(l => l.includes('version_conflict'))).toBe(true)
-  expect(readFileSync(r.client.rejected, 'utf8')).toContain('missing')
+  const errors = r.logs.filter(l => l.startsWith('[error]'))
+  expect(errors).toHaveLength(3)
+  expect(errors[0]).toMatch(/Item settled cut .*409 version_conflict/)
+  expect(errors[1]).toMatch(/Item missing cut .*404 not_found/)
+  expect(errors[2]).toMatch(/Item settled in_session .*400 session_id 是收件成員的對話編號/)
+  expect(readFileSync(r.client.rejected, 'utf8').trim().split('\n').map(l => JSON.parse(l).line.r.item_id)).toEqual(['settled', 'missing', 'settled'])
 })
 
 test('a foreign connector pauses all receives for 45 s and keeps the observation latched', async () => {

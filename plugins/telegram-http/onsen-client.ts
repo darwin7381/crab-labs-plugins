@@ -420,12 +420,13 @@ const headerName = (name: string): string => encodeURIComponent(name.replace(/[\
 /** a spool line's key for a log line: its record's idem_key (a Call state's `idem`; a delivery report's Onsen message), never its content */
 function lineKey(line: unknown): string {
   const l = line as any
+  if (l?.k === 'ir') return `Item ${l.r.item_id} ${l.r.body.outcome}`
   return String(l?.r?.idem_key ?? l?.r?.idem ?? l?.r?.key ?? (l?.r?.message_id != null ? `delivery:${l.r.message_id}` : '?')).slice(0, 200)
 }
 /** what Onsen said in an error answer ({error: {code, message}}, or older shapes) */
 function callSaid(j: any): string {
-  const e = j?.error
-  return String((e && typeof e === 'object' ? e.message ?? e.code : e) ?? j?.detail ?? '').slice(0, 300) || 'no reason given'
+  const e = j?.error ?? j?.detail
+  return String((e && typeof e === 'object' ? e.message ?? e.code ?? JSON.stringify(e) : e) ?? '').replace(/\s+/g, ' ').slice(0, 300) || 'no reason given'
 }
 export class OnsenClient {
   readonly spool: string
@@ -851,7 +852,7 @@ export class OnsenClient {
     try { appendFileSync(this.rejected, JSON.stringify({ at: new Date().toISOString(), why, line }) + '\n', { mode: 0o600 }) } catch {}
     const key = lineKey(line)
     if (skip) this.noteSkipped(1, skip, key)
-    this.cfg.log('warn', `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
+    this.cfg.log(skip?.kind === 'ir' ? 'error' : 'warn', `onsen: rejected ${key} (${why}); moved to rejected.jsonl, not retried`)
   }
   /** step 3: a whole batch refused: each line to rejected.jsonl, one log line for the lot */
   private rejectRun(lines: unknown[], why: string, skip?: SkippedInfo): void {
@@ -1054,8 +1055,7 @@ export class OnsenClient {
         const ok = r.status === 200
         if (!ok) {
           const code = errCode(r.json)
-          if (r.status === 409 && code === 'version_conflict') this.cfg.log('info', `onsen: late item report ${key}: version_conflict`)
-          else if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'ir', path, status: r.status, code })
+          if (refusedForGood(r)) this.reject(t.line, `PUT ${path}: HTTP ${r.status} ${callSaid(r.json)}`, { kind: 'ir', path, status: r.status, code })
           else return this.failStatus(r, path)
         }
         if (ok) this.itemWrites.observe(r.json?.data)
