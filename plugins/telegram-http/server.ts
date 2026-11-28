@@ -66,7 +66,6 @@ import { newestGenuineAssistantAtIn, genuineAssistantAtFile } from './liveness.t
 import { DEFAULT_LIMITS, DutyOfficer, askModelCli, hourlyCapFor, isClaudeCmd, isRateLimitMenu, optionIdOf, realTmux, recordTuiWarning, type ActionRef, type Limits, type MenuActions } from './duty-officer.ts'
 import { ScreenStatus, Since, composeRecord, isVerdictMenu, judgeFor, screenJudgeName, type Observation, type RecordFacts } from './screen-status.ts'
 import { PaneReader, snapPaneLook, type PaneLook } from './pane-look.ts'   // WO-168 stage two: the one capture of the own pane
-import { reportSession } from './onsen-session.ts'
 import { RoamerItems } from './roamer-items.ts'
 import { Claims } from './onsen-claims.ts'
 import { ItemReceiver } from './onsen-receive.ts'
@@ -432,7 +431,7 @@ if (ONSEN_TAKE_ON) {
       // The spool advances its cursor after this callback. A waiting lane can take as soon as it drains.
       queueMicrotask(() => { if (!ROAMER && takeMode!.canReceive && !itemClaims!.blocked()) Lanes.sweepQueue() })
     }, line => itemClaims!.reportBody(line, ROAMER ? ONSEN_AGENT : undefined))
-    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), (due, target) => !!takeKeepwarm?.matchesWindow(due, target))
+    itemReceiver = new ItemReceiver(takeMode, itemClaims, at => itemPeek!.dueAt(at), () => itemPeek!.reset(), due => !!takeKeepwarm?.matchesWindow(due))
     itemPeek = new ItemPeek(takeMode, ROAMER ? () => new Map() : Lanes.itemIndex, routeInboxItem, () => !itemClaims!.blocked(),
       ROAMER ? undefined : Lanes.sweepQueue, ROAMER ? waiting => roamerItems?.fullList(waiting) : undefined)
     if (!ROAMER) { onsen.watchItemWrites(Lanes.itemWriteSettled); Lanes.useItemReceiver(itemReceiver, onsen); Lanes.observeItemGates(() => itemPeek!.reset()) }
@@ -3100,7 +3099,7 @@ function keepwarmMode(): 'live' | 'dry' | 'off' {
   v = v.trim()
   return v === 'live' || v === 'dry' ? v : 'off'
 }
-if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
+if (takeMode ? !ROAMER : INBOX_ONLY && keepwarmMode() !== 'off') {
   const keepwarm = new LocalKeepwarm({
     name: takeMode?.member ?? INBOX_SELF,
     stateDir: STATE_DIR,
@@ -3109,10 +3108,6 @@ if (takeMode || INBOX_ONLY && keepwarmMode() !== 'off') {
     projectsDir: () => (process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR,
     // lanes-golive (C4): with lanes on the main's transcript by its session id (lane transcripts share the dir); lanes off: the newest, as before
     ...(Lanes.LANES_ON ? { transcript: () => Lanes.mainTranscriptFile((process.env.KEEPWARM_PROJECTS_DIR || '').trim() || TRANSCRIPT_DIR) } : {}),
-    ...(ROAMER && takeMode ? { transcript: roamerCurrentTranscript, session: () => {
-      const target = receivingTarget()
-      return target ? reportSession(target.session_id, ONSEN_AGENT) : null
-    } } : {}),
     wall: () => { const w = wallReader.state(); return w ? w.walled : null },   // WO-120: the state decides "walled"
     // this agent's own unread count, with its own credential (an agent may read only its own row)
     mail: async () => {
@@ -4648,7 +4643,7 @@ function startOnsenStatus(onsen: Onsen.OnsenClient): void {
   if (ROAMER && itemReceiver && itemClaims) {
     roamerItems = new RoamerItems({ receiver: itemReceiver, claims: itemClaims, registry, selected: receivingTarget, selectionWrittenAt, transcript: transcriptPath, refreshSession: refreshTargetSession, alive: pidAlive,
       stream: targetStream, send: notifyStream, watch: { facts, joey: onsenJoeyOf, changed: kick, turnEnded }, revisit: () => itemPeek!.reset() })
-    onRoamerSelection(() => { roamerItems!.recordSelection(); if (takeMode?.canReceive) void takeKeepwarm?.run(); kick() })
+    onRoamerSelection(() => { roamerItems!.recordSelection(); kick() })
   }
   const watch = tap ? null : roamerItems ?? new OnsenStatus.TurnWatch({ dir: () => consumptionCheckAvailable() ? TRANSCRIPT_DIR : null, facts, joey: onsenJoeyOf, changed: kick,
     session: () => { try { return registry.mainSessionId() } catch { return null } }, turnEnded })

@@ -1138,7 +1138,7 @@ async function target(d: Awaited<ReturnType<typeof daemon>>, resumed?: string) {
     stop: () => write({ type: 'system', subtype: 'turn_duration' }) }
 }
 
-test('a roamer warms its selected transcript and keeps its own self and resume Items on the addressed target', async () => {
+test('a roamer leaves keepwarm to the target owner and delivers its own self and resume to the addressed target', async () => {
   const d = await daemon(roamerEnv, 200, roamerState), a = await target(d), b = await target(d)
   const time = Date.now() - 51 * 60_000
   writeFileSync(a.transcript, [
@@ -1148,19 +1148,15 @@ test('a roamer warms its selected transcript and keeps its own self and resume I
     { type: 'system', subtype: 'turn_duration' },
   ].map((record, i) => JSON.stringify({ timestamp: new Date(time + i * 1000).toISOString(), ...record })).join('\n') + '\n')
   a.select(); await d.restart(); await a.connect(); await b.connect()
-  const warm = () => [...d.f.rows.values()].find(r => r.kind === 'keepwarm')
-  await waitFor(() => !!warm()?.claim && a.got.length === 1)
-  expect(warm()!.session_id).toBe(a.onsenSession)
-  a.accept(a.got[0]); a.stop()
-  await waitFor(() => warm()!.state === 'completed', 10000)
   b.select()
   const ownRows = ['self', 'resume'].map(kind => d.f.add('addressed-' + kind, kind as 'self' | 'resume',
     { from: member, session_id: a.onsenSession, payload: { text: 'addressed ' + kind } }))
-  await waitFor(() => a.got.length === 3)
-  expect(a.got.slice(1).map(m => m.content).sort()).toEqual(['addressed resume', 'addressed self'])
+  await waitFor(() => a.got.length === 2)
+  expect(a.got.map(m => m.content).sort()).toEqual(['addressed resume', 'addressed self'])
   expect(b.got).toHaveLength(0)
-  for (const msg of a.got.slice(1)) a.accept(msg)
+  for (const msg of a.got) a.accept(msg)
   await waitFor(() => ownRows.every(r => r.claim?.session_id === a.onsenSession))
+  expect([...d.f.rows.values()].filter(row => row.kind === 'keepwarm')).toHaveLength(0)
 }, 20000)
 
 test('roamer switches between two live streams in one cwd, binds on intake and completes only the receiving UUID', async () => {
