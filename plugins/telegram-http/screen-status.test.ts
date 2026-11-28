@@ -9,6 +9,7 @@ import { ScreenStatus, VERDICT_MENUS, VERDICT_STATES, programView, publishView, 
 import { JevJudge, answerExceptions, decide, parseQuestions, readAnswers, verdictOf, type JevAnswer, type JevJudgeDeps } from './screen-judge-jev.ts'
 import { jevAsk } from './lanes-triage.ts'
 import type { StatusView } from './onsen-status.ts'
+import { until } from './test-fixtures/tg-daemon.ts'
 
 const R = '─'.repeat(80)
 const screen = (above: string[], below: string[] = ['  Opus 5.5 · 7d 71%', '  ⏵⏵ bypass permissions on (shift+tab to cycle)'], box = '❯ ') =>
@@ -378,10 +379,14 @@ describe('the reader', () => {
   })
   test('p below the threshold, a failed call: statusOf with judged_by program, and an exception line with the screen', async () => {
     const r = rig({ answer: s => s.counted_by_program.shells ? { error: 'TimeoutError: timed out', ms: 3000 } : jevIdle(0.5) })
+    let now = Date.now()
+    r.deps.now = () => now
     r.s.active()
-    r.s.sample(IDLE, '2.1.322'); await wait(15)
+    r.s.sample(IDLE, '2.1.322')
+    expect(await until(() => r.exceptions().length === 1)).toBe(true)
     expect(r.s.view(r.program)).toEqual({ ...r.program, detail: { ...r.program.detail, judged_by: 'program' } })
-    r.s.sample(IDLE_SHELL, '2.1.322'); await wait(15)
+    r.s.sample(IDLE_SHELL, '2.1.322')
+    expect(await until(() => !r.s.health().in_flight)).toBe(true)
     expect(r.s.view(r.program).detail!.judged_by).toBe('program')
     const ex = r.exceptions()
     expect(ex.map(e => e.kinds)).toEqual([['state_p_low'], ['call_failed']])
@@ -391,8 +396,13 @@ describe('the reader', () => {
     expect(ex[1].jev.error).toContain('timed out')
     // a failed screen is asked once more after retryMs, then only every refreshMs (WO-169 criterion 13: 60 s here, not within the next 35 ms)
     r.s.sample(IDLE_SHELL, '2.1.322'); expect(r.calls).toHaveLength(2)
-    await wait(35); r.s.sample(IDLE_SHELL, '2.1.322'); await wait(2); expect(r.calls).toHaveLength(3)
-    await wait(35); r.s.sample(IDLE_SHELL, '2.1.322'); await wait(2); expect(r.calls).toHaveLength(3)
+    now += 35
+    r.s.sample(IDLE_SHELL, '2.1.322')
+    expect(await until(() => !r.s.health().in_flight)).toBe(true)
+    expect(r.calls).toHaveLength(3)
+    now += 35
+    r.s.sample(IDLE_SHELL, '2.1.322')
+    expect(r.calls).toHaveLength(3)
   })
   test('429: a pause before the next call', async () => {
     let n = 0
