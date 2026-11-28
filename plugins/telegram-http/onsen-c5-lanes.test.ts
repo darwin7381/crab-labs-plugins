@@ -59,7 +59,7 @@ test('a sent Telegram promise creates one self for the test account and reportin
 })
 
 test('a lane closes its explicit commitment by id; its automatic notify_joey promise has no deadline', async () => {
-  const lane = 'adam.reflex.promise', event = 'lane-promise', thread = 'adam#lane-promise', s = L.__lanesState()
+  const lane = 'adam.reflex.21', event = 'lane-promise', thread = 'adam#lane-promise', s = L.__lanesState()
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'lilith' } as any
   L.__events().open(event, { class: 'joey', owner: lane, thread, obligations: [{ kind: 'joey', level: 'line' }] })
@@ -76,7 +76,7 @@ test('a lane closes its explicit commitment by id; its automatic notify_joey pro
   expect(automatic.not_before).toBeTruthy()
   expect(automatic.deadline).toBeNull()
   expect(tool).toMatchObject({ not_before: by, deadline: by, state: 'waiting' })
-  const sibling = 'adam.reflex.other'
+  const sibling = 'adam.reflex.22'
   s.lanes[sibling] = { ...s.lanes[lane]!, id: sibling }
   expect(await L.callLaneTool({ ...tok, lane: sibling }, 'commitment_done', { commitment_id: id })).toContain('refused')
   f.advance(300_000)
@@ -284,7 +284,7 @@ test('followup keeps the origin lane and sender limits, and only a due Item ente
 })
 
 test('a followup waits for its creation response and ignores connector ids presented as refs', async () => {
-  const s = L.__lanesState(), lane = 'adam.reflex.ack', event = 'ack-event', thread = 'adam#ack'
+  const s = L.__lanesState(), lane = 'adam.reflex.26', event = 'ack-event', thread = 'adam#ack'
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
   s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
@@ -321,7 +321,7 @@ test('a followup waits for its creation response and ignores connector ids prese
 })
 
 test.each([false, true])('no-change withdraws a migrated followup and drops a stale peek (already queued=%s)', async queued => {
-  const s = L.__lanesState(), lane = 'adam.reflex.cancel-' + queued, event = 'cancel-' + queued
+  const s = L.__lanesState(), lane = queued ? 'adam.reflex.28' : 'adam.reflex.27', event = 'cancel-' + queued
   const thread = 'adam#' + event, runId = 'producer-' + event
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
@@ -372,7 +372,7 @@ test('C1 TakeMode.active gates the lane even before its spool writer is attached
 
 test.each([false, true])('a refused followup and promise each use their local timer once (replay=%s)', async replay => {
   await client.syncNow(true)
-  const s = L.__lanesState(), event = 'refused:' + replay, lane = 'adam.reflex.refused-' + replay, thread = 'adam#' + event
+  const s = L.__lanesState(), event = 'refused:' + replay, lane = replay ? 'adam.reflex.30' : 'adam.reflex.29', thread = 'adam#' + event
   s.lanes[lane] = { id: lane, kind: 'reflex', thread, status: 'idle', runs: 0, last: new Date().toISOString() } as any
   s.threads[thread] = { id: thread, lane, peer: 'eve' } as any
   s.wall = { kind: 'usage', probe_at: Date.now() + 3600_000 } as any
