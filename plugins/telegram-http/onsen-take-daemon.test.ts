@@ -137,6 +137,26 @@ for (const inboxOnly of ['0', '1']) test('/inject writes one waiting Item on the
   expect((await failed.json()).injected).toBe(false)
 })
 
+test('startup counts retired delivery stores without replaying or changing their contents', async () => {
+  const dirs = ['inbox/pending', 'inbox/undeliverable', 'hub-doorbell'], files = ['onsen-inbox.json', 'onsen/inbound-store.json']
+  const d = await daemon({}, 409, root => {
+    for (const name of dirs) {
+      const path = join(root, 'tg', name)
+      mkdirSync(path, { recursive: true }); writeFileSync(join(path, 'old.json'), 'private text')
+    }
+    mkdirSync(join(root, 'tg/onsen'), { recursive: true })
+    for (const name of files) writeFileSync(join(root, 'tg', name), 'private text')
+    return {}
+  })
+  const lines = d.log().split('\n').filter(s => s.includes('retired delivery stores'))
+  expect(lines).toHaveLength(1)
+  for (const name of dirs) expect(lines[0]).toContain(name + '=1 files')
+  for (const name of files) expect(lines[0]).toContain(name + '=12 bytes')
+  for (const name of [...dirs.map(dir => dir + '/old.json'), ...files]) expect(readFileSync(join(d.state, name), 'utf8')).toBe('private text')
+  expect(d.log()).not.toContain('private text')
+  expect(d.f.rows.size).toBe(0)
+})
+
 test('/inject keeps signed identity, quarantine and the shared-token gate before writing', async () => {
   const caller = 'mesh_0123456789012345678901'
   const d = await daemon({ CHANNEL_INBOX_ONLY: '1', CHANNEL_INJECT_TOKEN: 'local', MESH_REQUIRE_SIGNED: '1', FIXTURE_SIGNED_CALLER: caller })

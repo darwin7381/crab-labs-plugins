@@ -4565,12 +4565,29 @@ httpServer.on('error', err => {
   log('error', `http server error: ${err}`)
 })
 
+function logRetiredStores(): void {
+  const counts: string[] = []
+  for (const name of ['inbox/pending', 'inbox/undeliverable', 'hub-doorbell', 'onsen-inbox.json', 'onsen/inbound-store.json']) {
+    const path = join(STATE_DIR, name)
+    try {
+      const size = name.endsWith('.json') ? statSync(path).size + ' bytes'
+        : readdirSync(path, { withFileTypes: true }).filter(e => e.isFile()).length + ' files'
+      counts.push(name + '=' + size)
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT') counts.push(name + '=' + (code ?? 'unreadable'))
+    }
+  }
+  if (counts.length) log('info', 'retired delivery stores at ' + STATE_DIR + ' — ' + counts.join(', '))
+}
+
 function startListen(): void {
   httpServer.listen(HTTP_PORT!, HTTP_HOST, () => {
     if (bindAttempts > 0) {
       log('info', `port ${HTTP_PORT} acquired after ${bindAttempts} retry attempt(s)`)
     }
     log('info', `MCP HTTP daemon listening on http://${HTTP_HOST}:${HTTP_PORT}/mcp`)
+    logRetiredStores()
     log('info', `machine config ${FLEET_CONFIG_PATH}: ${fleetConfigApplied.length ? 'applied ' + fleetConfigApplied.join(', ') : 'nothing applied (missing, or every key already set)'}`)
     // Joey rule 2026-07-12: never silently run stale code — self-report version
     // + freshness vs origin/main at every boot (fail-open, see version-check.ts).
