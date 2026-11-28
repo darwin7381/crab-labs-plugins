@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -86,6 +86,15 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     expect(first).toMatchObject({ kind: 'keepwarm', from: 'adam', session_id: 'main', deadline: null,
       not_before: iso(at + 1 + 50 * 60), expires_at: iso(at + 1 + 60 * 60), state: 'waiting' })
     expect(check.matchesWindow(first.not_before!)).toBe(true)
+    const count = f.calls.length
+    for (const elapsed of [60, 120, 180]) {
+      writeFileSync(file, lines(...turnAt(at), joey(at + 40), req(at + elapsed)))
+      clock = at + elapsed + 1
+      await monitor().run()
+      expect(check.matchesWindow(iso(at + elapsed + 50 * 60))).toBe(false)
+    }
+    expect(f.calls.length).toBe(count)
+    expect(first.state).toBe('waiting')
     const later = at + 900
     clock = at + 1 + 50 * 60
     writeFileSync(file, lines(...turnAt(later)))
@@ -107,6 +116,19 @@ test('take keepwarm uses the member credential, replaces a stale warm window and
     clock = at + 24 * 3600 + 3
     await check.run()
     expect(f.rows.size).toBe(2)
+    const raceAt = clock + 60
+    const old = f.add('old-warm-window', 'keepwarm', { from: 'adam', session_id: 'main', not_before: iso(clock) })
+    clock = raceAt + 15
+    writeFileSync(file, lines(...turnAt(raceAt)))
+    const request = mode.req
+    const peek = spyOn(mode, 'req').mockImplementationOnce(async (...args) => {
+      const response = await request(...args)
+      writeFileSync(file, lines(...turnAt(raceAt), joey(clock), req(clock + 1)))
+      return response
+    })
+    try { await check.run(); await client.syncNow(true) } finally { peek.mockRestore() }
+    expect(old.state).toBe('waiting')
+    expect(f.rows.size).toBe(3)
     expect([mail, delivered]).toEqual([0, 0])
   } finally { mode.stop(); f.stop(); client.stop(); rmSync(dir, { recursive: true, force: true }) }
 })

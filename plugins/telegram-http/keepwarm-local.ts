@@ -97,7 +97,7 @@ export interface KScan {
   last_req: number | null; turn_open: boolean; compact_after: boolean; walled: boolean
   last_real: number | null; last_joey: number | null; after_req_usage: any
 }
-export function scan(text: string): KScan {
+export function scan(text: string, includeRequest = false): KScan {
   const s: KScan = { last_req: null, turn_open: false, compact_after: false, walled: false, last_real: null, last_joey: null, after_req_usage: null }
   let lastAssistant: number | null = null
   let turnEnd: number | null = null
@@ -137,7 +137,9 @@ export function scan(text: string): KScan {
       if (isJoey(t)) s.last_joey = Math.max(at ?? 0, s.last_joey ?? 0) || s.last_joey
     }
   }
-  s.turn_open = !!(lastAssistant && (turnEnd == null || turnEnd < lastAssistant))
+  // A take member can already be busy on the first request, before any assistant record is written.
+  const activity = Math.max(lastAssistant ?? 0, includeRequest ? s.last_req ?? 0 : 0)
+  s.turn_open = activity > (turnEnd ?? 0)
   return s
 }
 /** Usage of the first genuine main-thread answer after time t (a poke's answer). */
@@ -170,8 +172,8 @@ const hm = (t: number) => { const d = new Date(t * 1000); return `${String(d.get
 export function decide(s: KScan | null, st: KState, now: number, schedule = false): [string, string] {
   if (!s || !s.last_req) return ['skip', 'never called the model in this session']
   const idle = now - s.last_req
+  if (s.turn_open) return ['skip', 'turn running']
   if (!schedule) {
-    if (s.turn_open) return ['skip', 'turn running']
     if (idle < KEEPWARM_AFTER_S) return ['skip', `idle ${(idle / 60).toFixed(1)}m`]
     if (st.poked_for === s.last_req) return ['skip', 'already poked for this idle stretch']
   }
@@ -264,7 +266,7 @@ export class LocalKeepwarm {
     const named = this.d.transcript ? this.d.transcript() : undefined
     const path = named !== undefined ? (named && existsSync(named) ? named : null) : dir ? newestJsonl(dir) : null
     const text = path ? readTail(path) : ''
-    const s = path ? scan(text) : null
+    const s = path ? scan(text, !!this.d.take) : null
     const wall = this.d.wall?.() ?? null
     if (s && wall !== null) s.walled = wall
     if (s?.last_real) st.last_real = Math.max(s.last_real, st.last_real ?? 0)
@@ -283,6 +285,7 @@ export class LocalKeepwarm {
 
   /** Reconcile the warm window with waiting Items. A new model action moves the window, including across restarts. */
   private async schedule(mode: TakeMode, s: KScan | null, st: KState, now: number): Promise<void> {
+    if (s?.turn_open) return
     const due = ((s?.last_req ?? 0) + KEEPWARM_AFTER_S) * 1000
     const expires = Math.min((s?.last_req ?? 0) + CACHE_TTL_S, (st.last_real ?? 0) + STOP_AFTER_S) * 1000
     const wanted = decide(s, st, now, true)[0] === 'poke' && due < expires
@@ -301,13 +304,19 @@ export class LocalKeepwarm {
       if (!page.json.next_cursor) break
       q.set('cursor', page.json.next_cursor)
     } while (mode.active)
+    // The transcript can change while the member listing or a withdrawal is in flight.
+    const stillIdle = () => {
+      if (!mode.active) return false
+      const current = this.transcript(st).s
+      return !current?.turn_open && current?.last_req === s?.last_req
+    }
     for (const row of obsolete) {
-      if (!mode.active) return
+      if (!stillIdle()) return
       const r = await mode.req('DELETE', '/v1/items/' + encodeURIComponent(row.id), { expected_version: row.version, outcome: 'withdrawn' })
       if (r?.status === 409) return // a claim or another version won; read the current row on the next pass
       if (r?.status !== 200 && r?.status !== 404) throw new Error('could not withdraw stale keepwarm Item')
     }
-    if (!mode.active || !wanted || exists || st.poked_for === s!.last_req) return
+    if (!wanted || exists || st.poked_for === s!.last_req || !stillIdle()) return
     const item = ownItem('keepwarm', 'main', POKE_TEXT, due)
     item.expires_at = new Date(expires).toISOString()
     const r = await postOwnItem(mode.req, mode.path, { key: 'keepwarm:main:' + due, item })
